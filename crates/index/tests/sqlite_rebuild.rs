@@ -3,6 +3,8 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::{Arc, Barrier, Mutex},
+    thread,
 };
 
 use rusqlite::{Connection, types::ValueRef};
@@ -13,11 +15,14 @@ use sctx_event_schema::{
     SpaceId,
 };
 use sctx_git_store::{AppendRequest, GitStore};
-use sctx_index::{DB_SCHEMA_VERSION, ProjectionIndex, REDUCER_VERSION, RebuildReason};
+use sctx_index::{
+    DB_SCHEMA_VERSION, IncrementalFallback, IndexUpdateKind, ProjectionIndex, REDUCER_VERSION,
+    RebuildReason,
+};
 use tempfile::TempDir;
 
 struct Fixture {
-    _temporary: TempDir,
+    temporary: TempDir,
     store: GitStore,
     index: ProjectionIndex,
     committed_event_path: PathBuf,
@@ -29,7 +34,7 @@ fn intent(title: &str) -> IntentSnapshot {
         problem: "projection must not become a second source of truth".to_owned(),
         desired_outcome: "deterministic rebuild from HEAD blobs".to_owned(),
         in_scope: vec!["SQLite projection".to_owned()],
-        out_of_scope: vec!["incremental diff".to_owned()],
+        out_of_scope: vec!["tokenizer and ranking".to_owned()],
         acceptance_conditions: vec!["scratch rebuild is stable".to_owned()],
         domain_terms: vec!["generation".to_owned()],
     }
@@ -189,7 +194,7 @@ fn fixture() -> Fixture {
     commit_diagnostic_fixtures(store.repository());
     let index = ProjectionIndex::for_store(&store);
     Fixture {
-        _temporary: temporary,
+        temporary,
         store,
         index,
         committed_event_path,
@@ -398,6 +403,415 @@ fn corrupt_database_is_isolated_before_full_tree_rebuild() {
     assert_eq!(fs::read(quarantined).unwrap(), b"not a SQLite database");
     assert!(fixture.index.quick_check().unwrap().healthy);
     assert_eq!(projection_dump(fixture.index.database_path()), expected);
+}
+
+#[test]
+fn append_uses_incremental_closure_and_matches_scratch_rebuild() {
+    let fixture = fixture();
+    fixture.index.synchronize().unwrap();
+    let connection = Connection::open(fixture.index.database_path()).unwrap();
+    let space_id: String = connection
+        .query_row("SELECT space_id FROM space_projection", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    drop(connection);
+    let event = Event::context_proposed(
+        space_id.parse().unwrap(),
+        context("incremental append reaches its Space closure"),
+        None,
+    )
+    .unwrap();
+    append(&fixture.store, event);
+
+    let incremental = fixture.index.synchronize().unwrap();
+    assert_eq!(incremental.reason, RebuildReason::TreeChanged);
+    assert_eq!(incremental.update_kind, IndexUpdateKind::Incremental);
+    assert!(!incremental.rebuilt);
+    assert!(incremental.incremental_fallback.is_none());
+
+    let scratch_state = fixture.temporary.path().join("scratch-state");
+    let scratch = ProjectionIndex::new(fixture.store.repository(), scratch_state);
+    let rebuilt = scratch.rebuild().unwrap();
+    assert_eq!(rebuilt.update_kind, IndexUpdateKind::FullRebuild);
+    assert_eq!(
+        projection_dump(fixture.index.database_path()),
+        projection_dump(scratch.database_path())
+    );
+}
+
+#[test]
+fn reverse_reference_closure_recovers_dangling_nodes_and_handles_duplicate_append() {
+    let fixture = fixture();
+    fixture.index.synchronize().unwrap();
+    let space_id: SpaceId = Connection::open(fixture.index.database_path())
+        .unwrap()
+        .query_row("SELECT space_id FROM space_projection", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap()
+        .parse()
+        .unwrap();
+    let target = Event::context_proposed(
+        space_id,
+        context("late target for an old dangling review"),
+        None,
+    )
+    .unwrap();
+    let (context_id, revision_id) = context_ids(&target);
+    let review = Event::context_reviewed(
+        space_id,
+        context_id,
+        ReviewDraft {
+            revision_id,
+            verdict: ReviewVerdict::Approve,
+            reason: "arrived before target".to_owned(),
+        },
+        None,
+    )
+    .unwrap();
+    append(&fixture.store, review);
+    let dangling = fixture.index.synchronize().unwrap();
+    assert_eq!(dangling.update_kind, IndexUpdateKind::Incremental);
+    let connection = Connection::open(fixture.index.database_path()).unwrap();
+    assert_eq!(count(&connection, "review"), 1); // the original fixture review only
+    assert!(
+        count_where(
+            &connection,
+            "diagnostic",
+            "code = 'invalid_review_reference'"
+        ) >= 1
+    );
+    drop(connection);
+
+    let target_path = append(&fixture.store, target);
+    let recovered = fixture.index.synchronize().unwrap();
+    assert_eq!(recovered.update_kind, IndexUpdateKind::Incremental);
+    let connection = Connection::open(fixture.index.database_path()).unwrap();
+    assert_eq!(count(&connection, "review"), 2);
+    assert_eq!(
+        count_where(
+            &connection,
+            "diagnostic",
+            "code = 'invalid_review_reference'"
+        ),
+        0
+    );
+    drop(connection);
+
+    let duplicate = fixture.store.repository().join("events/ab/duplicate.json");
+    fs::create_dir_all(duplicate.parent().unwrap()).unwrap();
+    fs::copy(target_path, &duplicate).unwrap();
+    git(
+        fixture.store.repository(),
+        ["add", "--", "events/ab/duplicate.json"],
+    );
+    git(
+        fixture.store.repository(),
+        ["commit", "-m", "Append duplicate event fixture"],
+    );
+    let duplicated = fixture.index.synchronize().unwrap();
+    assert_eq!(duplicated.update_kind, IndexUpdateKind::Incremental);
+    assert!(
+        count_where(
+            &Connection::open(fixture.index.database_path()).unwrap(),
+            "diagnostic",
+            "code = 'duplicate_event_id'"
+        ) >= 1
+    );
+
+    let scratch = ProjectionIndex::new(
+        fixture.store.repository(),
+        fixture.temporary.path().join("reverse-closure-scratch"),
+    );
+    scratch.rebuild().unwrap();
+    assert_eq!(
+        projection_dump(fixture.index.database_path()),
+        projection_dump(scratch.database_path())
+    );
+}
+
+#[test]
+fn manual_modify_delete_and_rename_force_full_equivalent_rebuilds() {
+    for operation in ["modify", "delete", "rename"] {
+        let fixture = fixture();
+        fixture.index.synchronize().unwrap();
+        let relative = fixture
+            .committed_event_path
+            .strip_prefix(fixture.store.repository())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        match operation {
+            "modify" => {
+                let replacement = Event::space_created(intent("manual replacement"), None).unwrap();
+                fs::write(
+                    &fixture.committed_event_path,
+                    serde_json::to_vec(&replacement).unwrap(),
+                )
+                .unwrap();
+                git(fixture.store.repository(), ["add", "--", &relative]);
+            }
+            "delete" => {
+                git(fixture.store.repository(), ["rm", "--", &relative]);
+            }
+            "rename" => {
+                let destination = "events/aa/manually-renamed.json";
+                fs::create_dir_all(fixture.store.repository().join("events/aa")).unwrap();
+                git(
+                    fixture.store.repository(),
+                    ["mv", "--", &relative, destination],
+                );
+            }
+            _ => unreachable!(),
+        }
+        git(
+            fixture.store.repository(),
+            ["commit", "-m", "Bypass append protocol for index test"],
+        );
+
+        let synchronized = fixture.index.synchronize().unwrap();
+        assert_eq!(synchronized.update_kind, IndexUpdateKind::FullRebuild);
+        assert_eq!(
+            synchronized.incremental_fallback,
+            Some(IncrementalFallback::AppendProtocolBypassed)
+        );
+        assert_eq!(synchronized.operational_warnings.len(), 1);
+        assert_eq!(
+            synchronized.operational_warnings[0].code,
+            "APPEND_PROTOCOL_BYPASSED"
+        );
+
+        let scratch_state = fixture
+            .temporary
+            .path()
+            .join(format!("scratch-{operation}"));
+        let scratch = ProjectionIndex::new(fixture.store.repository(), scratch_state);
+        scratch.rebuild().unwrap();
+        assert_eq!(
+            projection_dump(fixture.index.database_path()),
+            projection_dump(scratch.database_path()),
+            "{operation} projection diverged from scratch"
+        );
+    }
+}
+
+#[test]
+fn paginated_query_is_pinned_to_one_tree_and_generation() {
+    let fixture = fixture();
+    fixture.index.synchronize().unwrap();
+    let connection = Connection::open(fixture.index.database_path()).unwrap();
+    let space_id: SpaceId = connection
+        .query_row("SELECT space_id FROM space_projection", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap()
+        .parse()
+        .unwrap();
+    drop(connection);
+    for number in 0..4 {
+        append(
+            &fixture.store,
+            Event::context_proposed(
+                space_id,
+                context(&format!("snapshot context {number}")),
+                None,
+            )
+            .unwrap(),
+        );
+    }
+    let before = fixture.index.synchronize().unwrap().metadata;
+    let expected = context_ids_from_database(fixture.index.database_path());
+    let appended_during_query = Event::context_proposed(
+        space_id,
+        context("must appear only after this snapshot"),
+        None,
+    )
+    .unwrap();
+    let store = fixture.store.clone();
+    let index = fixture.index.clone();
+
+    let snapshot = fixture
+        .index
+        .query_snapshot(move |connection| {
+            let mut combined = query_context_page(connection, 0, 2);
+            let worker = thread::spawn(move || {
+                append(&store, appended_during_query);
+                index.synchronize().unwrap();
+            });
+            worker.join().unwrap();
+            combined.extend(query_context_page(connection, 2, 100));
+            Ok(combined)
+        })
+        .unwrap();
+
+    assert_eq!(snapshot.metadata, before);
+    assert_eq!(snapshot.data, expected);
+    let after = fixture.index.synchronize().unwrap().metadata;
+    assert!(after.projection_generation > snapshot.metadata.projection_generation);
+    assert_ne!(after.indexed_tree_oid, snapshot.metadata.indexed_tree_oid);
+    assert_eq!(
+        context_ids_from_database(fixture.index.database_path()).len(),
+        expected.len() + 1
+    );
+}
+
+#[test]
+fn long_lived_query_connection_reopens_after_corrupt_file_replacement() {
+    let fixture = fixture();
+    fixture.index.synchronize().unwrap();
+    let mut reader = fixture.index.query_connection();
+    let first = reader
+        .snapshot(|connection| Ok(count(connection, "context_item")))
+        .unwrap();
+    let space_id: SpaceId = Connection::open(fixture.index.database_path())
+        .unwrap()
+        .query_row("SELECT space_id FROM space_projection", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap()
+        .parse()
+        .unwrap();
+    append(
+        &fixture.store,
+        Event::context_proposed(
+            space_id,
+            context("visible only in replacement database"),
+            None,
+        )
+        .unwrap(),
+    );
+    fs::write(fixture.index.database_path(), b"intentionally corrupt").unwrap();
+
+    let second = reader
+        .snapshot(|connection| Ok(count(connection, "context_item")))
+        .unwrap();
+    assert_eq!(second.data, first.data + 1);
+    assert_ne!(
+        second.metadata.indexed_tree_oid,
+        first.metadata.indexed_tree_oid
+    );
+    assert!(fixture.index.quick_check().unwrap().healthy);
+    let isolated = fs::read_dir(fixture.index.database_path().parent().unwrap())
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("index.sqlite.corrupt-")
+        });
+    assert!(isolated);
+}
+
+#[test]
+fn concurrent_query_index_rebuild_and_append_converge_without_generation_regression() {
+    let fixture = fixture();
+    fixture.index.synchronize().unwrap();
+    let space_id: SpaceId = Connection::open(fixture.index.database_path())
+        .unwrap()
+        .query_row("SELECT space_id FROM space_projection", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap()
+        .parse()
+        .unwrap();
+    let barrier = Arc::new(Barrier::new(4));
+    let observed_generations = Arc::new(Mutex::new(Vec::new()));
+
+    let append_thread = {
+        let barrier = Arc::clone(&barrier);
+        let store = fixture.store.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            for number in 0..12 {
+                append(
+                    &store,
+                    Event::context_proposed(
+                        space_id,
+                        context(&format!("concurrent append {number}")),
+                        None,
+                    )
+                    .unwrap(),
+                );
+            }
+        })
+    };
+    let index_thread = {
+        let barrier = Arc::clone(&barrier);
+        let index = fixture.index.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..20 {
+                index.synchronize().unwrap();
+            }
+        })
+    };
+    let rebuild_thread = {
+        let barrier = Arc::clone(&barrier);
+        let index = fixture.index.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..6 {
+                index.rebuild().unwrap();
+            }
+        })
+    };
+    let query_thread = {
+        let barrier = Arc::clone(&barrier);
+        let index = fixture.index.clone();
+        let generations = Arc::clone(&observed_generations);
+        thread::spawn(move || {
+            barrier.wait();
+            let mut reader = index.query_connection();
+            for _ in 0..30 {
+                let snapshot = reader
+                    .snapshot(|connection| Ok(count(connection, "context_item")))
+                    .unwrap();
+                generations
+                    .lock()
+                    .unwrap()
+                    .push(snapshot.metadata.projection_generation);
+            }
+        })
+    };
+    for worker in [append_thread, index_thread, rebuild_thread, query_thread] {
+        worker.join().unwrap();
+    }
+
+    let final_outcome = fixture.index.synchronize().unwrap();
+    let head_tree = git(fixture.store.repository(), ["rev-parse", "HEAD^{tree}"]);
+    assert_eq!(final_outcome.metadata.indexed_tree_oid, head_tree);
+    let generations = observed_generations.lock().unwrap();
+    assert!(
+        generations.windows(2).all(|pair| pair[0] <= pair[1]),
+        "query generations regressed: {generations:?}"
+    );
+
+    let scratch = ProjectionIndex::new(
+        fixture.store.repository(),
+        fixture.temporary.path().join("concurrent-scratch"),
+    );
+    scratch.rebuild().unwrap();
+    assert_eq!(
+        projection_dump(fixture.index.database_path()),
+        projection_dump(scratch.database_path())
+    );
+}
+
+fn query_context_page(connection: &Connection, offset: i64, limit: i64) -> Vec<String> {
+    let mut statement = connection
+        .prepare("SELECT context_id FROM context_item ORDER BY context_id LIMIT ?1 OFFSET ?2")
+        .unwrap();
+    statement
+        .query_map([limit, offset], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+fn context_ids_from_database(database: &Path) -> Vec<String> {
+    query_context_page(&Connection::open(database).unwrap(), 0, 10_000)
 }
 
 fn assert_core_tables(connection: &Connection) {

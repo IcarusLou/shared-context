@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use sctx_domain::{DomainProjection, EventId, ReducerDiagnostic, ReducerEvent, reduce};
-use sctx_event_schema::{ParsedEvent, parse_event};
+use sctx_event_schema::{Event, EventPayload, ParsedEvent, parse_event};
 use sha2::{Digest, Sha256};
 
 use crate::git_tree::TreeBlob;
@@ -14,6 +14,15 @@ pub(crate) struct SourceFile {
     pub(crate) event_id: Option<String>,
     pub(crate) diagnostic_code: Option<String>,
     pub(crate) diagnostic_message: Option<String>,
+    pub(crate) content: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EventImpact {
+    pub(crate) path: String,
+    pub(crate) space_id: String,
+    definitions: BTreeSet<String>,
+    references: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -31,6 +40,7 @@ pub(crate) struct BuildInput {
     pub(crate) source_files: Vec<SourceFile>,
     pub(crate) projection: DomainProjection,
     pub(crate) diagnostics: Vec<ProjectionDiagnostic>,
+    pub(crate) impacts: Vec<EventImpact>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -39,6 +49,7 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
     let mut reducer_events = Vec::<ReducerEvent>::new();
     let mut event_paths = BTreeMap::<EventId, Vec<String>>::new();
     let mut diagnostics = BTreeSet::new();
+    let mut impacts = Vec::new();
 
     for blob in blobs {
         if blob.path.starts_with("events/") {
@@ -52,6 +63,7 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
                     if let Some(reducer_event) = event.reducer_event() {
                         reducer_events.push(reducer_event);
                     }
+                    impacts.push(event_impact(&blob.path, &event));
                     source_files.push(SourceFile {
                         path: blob.path.clone(),
                         blob_oid: blob.oid.clone(),
@@ -59,6 +71,7 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
                         event_id: Some(event_id.to_string()),
                         diagnostic_code: None,
                         diagnostic_message: None,
+                        content: blob.bytes.clone(),
                     });
                 }
                 Ok(ParsedEvent::UnknownSchema(event)) => {
@@ -78,6 +91,7 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
                         event_id: event.event_id().map(ToOwned::to_owned),
                         diagnostic_code: Some(code),
                         diagnostic_message: Some(message),
+                        content: blob.bytes.clone(),
                     });
                 }
                 Err(error) => {
@@ -97,6 +111,7 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
                         event_id: None,
                         diagnostic_code: Some(code),
                         diagnostic_message: Some(message),
+                        content: blob.bytes.clone(),
                     });
                 }
             }
@@ -131,6 +146,7 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
                 event_id: None,
                 diagnostic_code: code,
                 diagnostic_message: message,
+                content: blob.bytes.clone(),
             });
         }
     }
@@ -158,7 +174,215 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
         source_files,
         projection,
         diagnostics: diagnostics.into_iter().collect(),
+        impacts,
     }
+}
+
+/// Computes the reverse-reference impact closure for changed event paths. The closure expands in
+/// both directions: definitions reach old dangling referrers, while references reach their target
+/// definitions. Duplicate definitions therefore pull every owner aggregate into the result.
+pub(crate) fn impact_closure(
+    old: &BuildInput,
+    new: &BuildInput,
+    changed_paths: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let facts: Vec<_> = old.impacts.iter().chain(&new.impacts).collect();
+    let mut selected = BTreeSet::new();
+    let mut identities = BTreeSet::new();
+    for (index, fact) in facts.iter().enumerate() {
+        if changed_paths.contains(&fact.path) {
+            selected.insert(index);
+            identities.extend(fact.definitions.iter().cloned());
+            identities.extend(fact.references.iter().cloned());
+        }
+    }
+    loop {
+        let mut expanded = false;
+        for (index, fact) in facts.iter().enumerate() {
+            if selected.contains(&index)
+                || (fact.definitions.is_disjoint(&identities)
+                    && fact.references.is_disjoint(&identities))
+            {
+                continue;
+            }
+            selected.insert(index);
+            identities.extend(fact.definitions.iter().cloned());
+            identities.extend(fact.references.iter().cloned());
+            expanded = true;
+        }
+        if !expanded {
+            break;
+        }
+    }
+    selected
+        .into_iter()
+        .map(|index| facts[index].space_id.clone())
+        .collect()
+}
+
+/// Returns every Space whose effective domain projection changed. The caller uses this as a
+/// conservative proof check for the independently computed reverse-reference closure.
+pub(crate) fn changed_projection_spaces(old: &BuildInput, new: &BuildInput) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    ids.extend(old.projection.spaces.keys().map(ToString::to_string));
+    ids.extend(new.projection.spaces.keys().map(ToString::to_string));
+    ids.into_iter()
+        .filter(|space_id| projection_slice(old, space_id) != projection_slice(new, space_id))
+        .collect()
+}
+
+fn projection_slice(input: &BuildInput, space_id: &str) -> serde_json::Value {
+    let space = input
+        .projection
+        .spaces
+        .iter()
+        .find(|(id, _)| id.to_string() == space_id)
+        .map(|(_, value)| value);
+    let candidates: Vec<_> = input
+        .projection
+        .semantic_conflict_candidates
+        .iter()
+        .filter(|candidate| candidate.space_id.to_string() == space_id)
+        .collect();
+    let conflicts: Vec<_> = input
+        .projection
+        .semantic_conflicts
+        .values()
+        .filter(|conflict| conflict.space_id.to_string() == space_id)
+        .collect();
+    serde_json::json!({
+        "space": space,
+        "semantic_conflict_candidates": candidates,
+        "semantic_conflicts": conflicts,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn event_impact(path: &str, event: &Event) -> EventImpact {
+    let mut definitions = BTreeSet::from([identity("event", &event.event_id())]);
+    let mut references = BTreeSet::new();
+    let space_id = match event.payload() {
+        EventPayload::SpaceCreated {
+            space_id,
+            intent_revision,
+        } => {
+            definitions.insert(identity("space", space_id));
+            definitions.insert(identity("revision", &intent_revision.revision_id));
+            add_references(
+                &mut references,
+                "revision",
+                &intent_revision.parent_revision_ids,
+            );
+            *space_id
+        }
+        EventPayload::SpaceIntentRevisionAdded {
+            space_id,
+            intent_revision,
+        } => {
+            references.insert(identity("space", space_id));
+            definitions.insert(identity("revision", &intent_revision.revision_id));
+            add_references(
+                &mut references,
+                "revision",
+                &intent_revision.parent_revision_ids,
+            );
+            *space_id
+        }
+        EventPayload::ContextRevisionAdded {
+            space_id,
+            context_id,
+            revision,
+        } => {
+            references.insert(identity("space", space_id));
+            definitions.insert(identity("context", context_id));
+            definitions.insert(identity("revision", &revision.revision_id));
+            for evidence in &revision.evidence {
+                definitions.insert(identity("evidence", &evidence.evidence_id));
+            }
+            add_references(&mut references, "revision", &revision.parent_revision_ids);
+            *space_id
+        }
+        EventPayload::ContextReviewed {
+            space_id,
+            context_id,
+            review,
+        } => {
+            references.insert(identity("space", space_id));
+            definitions.insert(identity("context", context_id));
+            definitions.insert(identity("review", &review.review_id));
+            references.insert(identity("revision", &review.revision_id));
+            *space_id
+        }
+        EventPayload::ContextPublicationChanged {
+            space_id,
+            context_id,
+            publication,
+        } => {
+            references.insert(identity("space", space_id));
+            definitions.insert(identity("context", context_id));
+            definitions.insert(identity("publication", &publication.publication_id));
+            references.insert(identity("revision", &publication.revision_id));
+            add_references(
+                &mut references,
+                "publication",
+                &publication.previous_publication_ids,
+            );
+            add_references(&mut references, "event", &publication.review_event_ids);
+            *space_id
+        }
+        EventPayload::SemanticConflictOpened { space_id, conflict } => {
+            references.insert(identity("space", space_id));
+            definitions.insert(identity("conflict", &conflict.conflict_id));
+            for participant in &conflict.participants {
+                references.insert(identity("context", &participant.context_id));
+                references.insert(identity("revision", &participant.revision_id));
+                references.insert(identity("publication", &participant.publication_id));
+            }
+            *space_id
+        }
+        EventPayload::SemanticConflictResolutionAdded {
+            space_id,
+            conflict_id,
+            resolution,
+        } => {
+            references.insert(identity("space", space_id));
+            references.insert(identity("conflict", conflict_id));
+            definitions.insert(identity("resolution", &resolution.resolution_id));
+            add_references(
+                &mut references,
+                "resolution",
+                &resolution.previous_resolution_ids,
+            );
+            add_references(
+                &mut references,
+                "publication",
+                &resolution.related_publication_ids,
+            );
+            for result in &resolution.results {
+                references.insert(identity("context", &result.context_id));
+                references.insert(identity("revision", &result.revision_id));
+            }
+            *space_id
+        }
+    };
+    EventImpact {
+        path: path.to_owned(),
+        space_id: space_id.to_string(),
+        definitions,
+        references,
+    }
+}
+
+fn identity(kind: &str, value: &impl ToString) -> String {
+    format!("{kind}:{}", value.to_string())
+}
+
+fn add_references<T: ToString>(target: &mut BTreeSet<String>, kind: &str, values: &[T]) {
+    target.extend(
+        values
+            .iter()
+            .map(|value| format!("{kind}:{}", value.to_string())),
+    );
 }
 
 fn from_reducer(

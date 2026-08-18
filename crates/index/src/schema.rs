@@ -106,7 +106,8 @@ CREATE TABLE {prefix}source_file (
     parse_status TEXT NOT NULL,
     event_id TEXT,
     diagnostic_code TEXT,
-    diagnostic_message TEXT
+    diagnostic_message TEXT,
+    content BLOB NOT NULL
 ) WITHOUT ROWID;
 CREATE TABLE {prefix}space_projection (
     space_id TEXT PRIMARY KEY,
@@ -275,7 +276,7 @@ fn populate(
     }
 
     let source_sql = format!(
-        "INSERT INTO {prefix}source_file(path, blob_oid, parse_status, event_id, diagnostic_code, diagnostic_message) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+        "INSERT INTO {prefix}source_file(path, blob_oid, parse_status, event_id, diagnostic_code, diagnostic_message, content) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
     );
     for source in &input.source_files {
         transaction
@@ -287,7 +288,8 @@ fn populate(
                     source.parse_status,
                     source.event_id,
                     source.diagnostic_code,
-                    source.diagnostic_message
+                    source.diagnostic_message,
+                    source.content
                 ],
             )
             .map_err(sql_error("write source-file projection"))?;
@@ -601,6 +603,131 @@ fn populate(
     for diagnostic in &input.diagnostics {
         insert_diagnostic(transaction, prefix, diagnostic)?;
     }
+    Ok(())
+}
+
+pub(crate) fn cached_blobs(
+    connection: &rusqlite::Connection,
+) -> crate::Result<Vec<crate::git_tree::TreeBlob>> {
+    let mut statement = connection
+        .prepare("SELECT path, blob_oid, content FROM source_file ORDER BY path")
+        .map_err(sql_error("prepare cached source read"))?;
+    statement
+        .query_map([], |row| {
+            Ok(crate::git_tree::TreeBlob {
+                path: row.get(0)?,
+                oid: row.get(1)?,
+                bytes: row.get(2)?,
+            })
+        })
+        .map_err(sql_error("read cached source rows"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error("collect cached source rows"))
+}
+
+/// Replaces only proven-affected Space aggregates while atomically advancing source metadata and
+/// diagnostics. A complete shadow projection is used as the deterministic source of replacement
+/// rows; readers observe either the old or new generation, never an intermediate mixture.
+pub(crate) fn replace_projection_incremental(
+    transaction: &Transaction<'_>,
+    input: &BuildInput,
+    tree_oid: &str,
+    generation: u64,
+    affected_spaces: &std::collections::BTreeSet<String>,
+) -> crate::Result<()> {
+    drop_tables(transaction, NEXT_PREFIX)?;
+    create_tables(transaction, NEXT_PREFIX)?;
+    populate(transaction, NEXT_PREFIX, input, tree_oid, generation)?;
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _affected_space(space_id TEXT PRIMARY KEY) WITHOUT ROWID;
+             DELETE FROM _affected_space;",
+        )
+        .map_err(sql_error("prepare affected Space closure"))?;
+    for space_id in affected_spaces {
+        transaction
+            .execute(
+                "INSERT INTO _affected_space(space_id) VALUES (?1)",
+                [space_id],
+            )
+            .map_err(sql_error("record affected Space"))?;
+    }
+
+    transaction
+        .execute_batch(
+            "DELETE FROM source_file;
+             INSERT INTO source_file SELECT * FROM _next_source_file;
+             DELETE FROM diagnostic;
+             INSERT INTO diagnostic SELECT * FROM _next_diagnostic;
+
+             DELETE FROM context_fts WHERE revision_id IN (
+                 SELECT revision_id FROM context_revision
+                 WHERE space_id IN (SELECT space_id FROM _affected_space)
+             );
+             DELETE FROM conflict WHERE space_id IN (SELECT space_id FROM _affected_space);
+             DELETE FROM conflict_resolution WHERE conflict_id IN (
+                 SELECT conflict_id FROM semantic_conflict
+                 WHERE space_id IN (SELECT space_id FROM _affected_space)
+             );
+             DELETE FROM semantic_conflict WHERE space_id IN (SELECT space_id FROM _affected_space);
+             DELETE FROM scope WHERE revision_id IN (
+                 SELECT revision_id FROM context_revision
+                 WHERE space_id IN (SELECT space_id FROM _affected_space)
+             );
+             DELETE FROM evidence WHERE space_id IN (SELECT space_id FROM _affected_space);
+             DELETE FROM publication_head WHERE context_id IN (
+                 SELECT context_id FROM context_item
+                 WHERE space_id IN (SELECT space_id FROM _affected_space)
+             );
+             DELETE FROM publication WHERE space_id IN (SELECT space_id FROM _affected_space);
+             DELETE FROM review WHERE space_id IN (SELECT space_id FROM _affected_space);
+             DELETE FROM context_revision WHERE space_id IN (SELECT space_id FROM _affected_space);
+             DELETE FROM context_item WHERE space_id IN (SELECT space_id FROM _affected_space);
+             DELETE FROM intent_head WHERE space_id IN (SELECT space_id FROM _affected_space);
+             DELETE FROM intent_revision WHERE space_id IN (SELECT space_id FROM _affected_space);
+             DELETE FROM space_projection WHERE space_id IN (SELECT space_id FROM _affected_space);
+
+             INSERT INTO space_projection SELECT * FROM _next_space_projection
+                 WHERE space_id IN (SELECT space_id FROM _affected_space);
+             INSERT INTO intent_revision SELECT * FROM _next_intent_revision
+                 WHERE space_id IN (SELECT space_id FROM _affected_space);
+             INSERT INTO intent_head SELECT * FROM _next_intent_head
+                 WHERE space_id IN (SELECT space_id FROM _affected_space);
+             INSERT INTO context_item SELECT * FROM _next_context_item
+                 WHERE space_id IN (SELECT space_id FROM _affected_space);
+             INSERT INTO context_revision SELECT * FROM _next_context_revision
+                 WHERE space_id IN (SELECT space_id FROM _affected_space);
+             INSERT INTO review SELECT * FROM _next_review
+                 WHERE space_id IN (SELECT space_id FROM _affected_space);
+             INSERT INTO publication SELECT * FROM _next_publication
+                 WHERE space_id IN (SELECT space_id FROM _affected_space);
+             INSERT INTO publication_head SELECT next.* FROM _next_publication_head AS next
+                 JOIN _next_context_item AS item USING(context_id)
+                 WHERE item.space_id IN (SELECT space_id FROM _affected_space);
+             INSERT INTO evidence SELECT * FROM _next_evidence
+                 WHERE space_id IN (SELECT space_id FROM _affected_space);
+             INSERT INTO scope SELECT next.* FROM _next_scope AS next
+                 JOIN _next_context_revision AS revision USING(revision_id)
+                 WHERE revision.space_id IN (SELECT space_id FROM _affected_space);
+             INSERT INTO context_fts SELECT next.* FROM _next_context_fts AS next
+                 JOIN _next_context_revision AS revision USING(revision_id)
+                 WHERE revision.space_id IN (SELECT space_id FROM _affected_space);
+             INSERT INTO semantic_conflict SELECT * FROM _next_semantic_conflict
+                 WHERE space_id IN (SELECT space_id FROM _affected_space);
+             INSERT INTO conflict_resolution SELECT next.* FROM _next_conflict_resolution AS next
+                 JOIN _next_semantic_conflict AS conflict USING(conflict_id)
+                 WHERE conflict.space_id IN (SELECT space_id FROM _affected_space);
+             INSERT INTO conflict SELECT * FROM _next_conflict
+                 WHERE space_id IN (SELECT space_id FROM _affected_space);
+
+             DELETE FROM meta;
+             INSERT INTO meta SELECT * FROM _next_meta;",
+        )
+        .map_err(sql_error("replace affected projection closure"))?;
+    drop_tables(transaction, NEXT_PREFIX)?;
+    transaction
+        .execute_batch("DROP TABLE _affected_space;")
+        .map_err(sql_error("drop affected Space closure"))?;
     Ok(())
 }
 

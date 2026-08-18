@@ -6,6 +6,7 @@
 //! `sctx-domain` reducer.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
 };
@@ -20,7 +21,7 @@ mod schema;
 pub use sctx_domain::{Error, ErrorKind, Result};
 
 /// Current physical `SQLite` schema version.
-pub const DB_SCHEMA_VERSION: &str = "1";
+pub const DB_SCHEMA_VERSION: &str = "2";
 /// Event parser implementation version recorded in every projection.
 pub const EVENT_PARSER_VERSION: &str = "1";
 /// Pure reducer implementation version recorded in every projection.
@@ -58,6 +59,37 @@ pub enum RebuildReason {
     Forced,
 }
 
+/// Physical update strategy used for a synchronization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndexUpdateKind {
+    /// No write was needed after the pre-lock or post-lock double check.
+    Current,
+    /// Only the proven reverse-reference impact closure was replaced.
+    Incremental,
+    /// A complete deterministic projection was activated.
+    FullRebuild,
+}
+
+/// Why a Tree change could not safely use the incremental path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IncrementalFallback {
+    /// The prior indexed Tree object is no longer accessible.
+    IndexedTreeUnavailable,
+    /// Cached committed blobs did not exactly represent the indexed Tree.
+    CachedSourceMismatch,
+    /// A managed path was modified, deleted, or renamed outside the append protocol.
+    AppendProtocolBypassed,
+    /// The reverse-reference closure did not cover every observed projection change.
+    ImpactClosureUnproven,
+}
+
+/// Non-projection warning produced by comparing old and new Trees.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationalWarning {
+    pub code: &'static str,
+    pub paths: Vec<String>,
+}
+
 /// Metadata that identifies one atomic projection generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexMetadata {
@@ -79,8 +111,45 @@ pub struct RebuildOutcome {
     pub metadata: IndexMetadata,
     pub source_file_count: u64,
     pub diagnostic_count: u64,
+    pub update_kind: IndexUpdateKind,
+    pub incremental_fallback: Option<IncrementalFallback>,
+    pub operational_warnings: Vec<OperationalWarning>,
     /// Isolated main database path. WAL/SHM companions use the same suffix when present.
     pub quarantined_database: Option<PathBuf>,
+}
+
+/// Data returned from one `SQLite` read transaction together with its exact projection identity.
+#[derive(Debug)]
+pub struct QuerySnapshot<T> {
+    pub metadata: IndexMetadata,
+    pub data: T,
+}
+
+/// Reusable read connection. Before each request it verifies the database file identity and
+/// Generation, reopening automatically after corrupt-file isolation and replacement.
+#[derive(Debug)]
+pub struct QueryConnection {
+    index: ProjectionIndex,
+    connection: Option<Connection>,
+    identity: Option<DatabaseFileIdentity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DatabaseFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+enum UpdatePlan {
+    Incremental {
+        input: project::BuildInput,
+        affected_spaces: BTreeSet<String>,
+    },
+    Full {
+        input: project::BuildInput,
+        fallback: Option<IncrementalFallback>,
+        warnings: Vec<OperationalWarning>,
+    },
 }
 
 /// Result of checking a database file without repairing it.
@@ -198,15 +267,47 @@ impl ProjectionIndex {
         read_pragmas(&connection)
     }
 
+    /// Creates a reusable query connection that reopens itself after database-file replacement.
+    #[must_use]
+    pub fn query_connection(&self) -> QueryConnection {
+        QueryConnection {
+            index: self.clone(),
+            connection: None,
+            identity: None,
+        }
+    }
+
+    /// Synchronizes and executes all caller reads in one `SQLite` read transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when synchronization, identity verification, metadata reading, or the
+    /// caller's query fails.
+    pub fn query_snapshot<T>(
+        &self,
+        query: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<QuerySnapshot<T>> {
+        self.query_connection().snapshot(query)
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn synchronize_inner(&self, forced: bool) -> Result<RebuildOutcome> {
         fs::create_dir_all(&self.state).map_err(io_error("create index state directory"))?;
+        if !forced {
+            if let Some(outcome) = self.current_without_lock()? {
+                return Ok(outcome);
+            }
+        }
         let lock = open_lock(&self.state.join("index.lock"))?;
         lock.lock_exclusive().map_err(io_error("lock index.lock"))?;
 
         let mut isolated_database = None;
         let mut force_next = forced;
+        let mut update_kind = IndexUpdateKind::Current;
+        let mut incremental_fallback = None;
+        let mut operational_warnings = Vec::new();
         let result = loop {
-            let head = git_tree::read_head(&self.repository)?;
+            let (head_oid, head_entries) = git_tree::list_head(&self.repository)?;
             let database_existed = self.database.exists();
             let (mut connection, isolated) = self.open_healthy_or_replace()?;
             if isolated_database.is_none() {
@@ -218,13 +319,15 @@ impl ProjectionIndex {
                 && current_metadata.as_ref().is_some_and(versions_are_current);
             let tree_matches = current_metadata
                 .as_ref()
-                .is_some_and(|metadata| metadata.indexed_tree_oid == head.oid);
+                .is_some_and(|metadata| metadata.indexed_tree_oid == head_oid);
             if !force_next && isolated.is_none() && versions_match && tree_matches {
                 break Ok(outcome_from_database(
                     &connection,
-                    false,
                     RebuildReason::Current,
                     isolated_database,
+                    update_kind,
+                    incremental_fallback,
+                    operational_warnings,
                 )?);
             }
 
@@ -245,26 +348,75 @@ impl ProjectionIndex {
             let generation = previous_generation.checked_add(1).ok_or_else(|| {
                 invariant("projection generation overflowed its u64 representation")
             })?;
-            let input = project::build(&head.blobs);
+
+            let can_attempt_incremental = !force_next
+                && isolated.is_none()
+                && database_existed
+                && versions_match
+                && current_metadata.is_some();
+            let plan = if can_attempt_incremental {
+                self.plan_tree_change(
+                    &connection,
+                    current_metadata.as_ref().expect("checked above"),
+                    &head_oid,
+                    &head_entries,
+                )?
+            } else {
+                UpdatePlan::Full {
+                    input: project::build(&git_tree::read_tree(&self.repository, &head_oid)?.blobs),
+                    fallback: None,
+                    warnings: Vec::new(),
+                }
+            };
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error("begin shadow rebuild transaction"))?;
-            schema::replace_projection(&transaction, &input, &head.oid, generation)?;
+            match plan {
+                UpdatePlan::Incremental {
+                    input,
+                    affected_spaces,
+                } => {
+                    schema::replace_projection_incremental(
+                        &transaction,
+                        &input,
+                        &head_oid,
+                        generation,
+                        &affected_spaces,
+                    )?;
+                    if update_kind == IndexUpdateKind::Current {
+                        update_kind = IndexUpdateKind::Incremental;
+                    }
+                }
+                UpdatePlan::Full {
+                    input,
+                    fallback,
+                    warnings,
+                } => {
+                    schema::replace_projection(&transaction, &input, &head_oid, generation)?;
+                    update_kind = IndexUpdateKind::FullRebuild;
+                    if fallback.is_some() {
+                        incremental_fallback = fallback;
+                    }
+                    operational_warnings.extend(warnings);
+                }
+            }
             transaction
                 .commit()
                 .map_err(sql_error("commit shadow rebuild transaction"))?;
             require_quick_check(&connection)?;
 
             let observed_tree = git_tree::tree_oid(&self.repository)?;
-            if observed_tree != head.oid {
+            if observed_tree != head_oid {
                 force_next = false;
                 continue;
             }
             break Ok(outcome_from_database(
                 &connection,
-                true,
                 reason,
                 isolated_database,
+                update_kind,
+                incremental_fallback,
+                operational_warnings,
             )?);
         };
 
@@ -273,6 +425,118 @@ impl ProjectionIndex {
             (Ok(outcome), Ok(())) => Ok(outcome),
             (Err(error), _) | (Ok(_), Err(error)) => Err(error),
         }
+    }
+
+    fn current_without_lock(&self) -> Result<Option<RebuildOutcome>> {
+        if !self.database.exists() {
+            return Ok(None);
+        }
+        let before = git_tree::tree_oid(&self.repository)?;
+        let Ok(connection) = self.open_read_only() else {
+            return Ok(None);
+        };
+        if !quick_check_connection(&connection).healthy || !schema::is_complete(&connection)? {
+            return Ok(None);
+        }
+        let Some(metadata) = read_metadata(&connection)? else {
+            return Ok(None);
+        };
+        if !versions_are_current(&metadata) || metadata.indexed_tree_oid != before {
+            return Ok(None);
+        }
+        let outcome = outcome_from_database(
+            &connection,
+            RebuildReason::Current,
+            None,
+            IndexUpdateKind::Current,
+            None,
+            Vec::new(),
+        )?;
+        let after = git_tree::tree_oid(&self.repository)?;
+        Ok((before == after).then_some(outcome))
+    }
+
+    fn plan_tree_change(
+        &self,
+        connection: &Connection,
+        metadata: &IndexMetadata,
+        new_tree_oid: &str,
+        new_entries: &[git_tree::TreeEntry],
+    ) -> Result<UpdatePlan> {
+        let full = |fallback, warnings| -> Result<UpdatePlan> {
+            Ok(UpdatePlan::Full {
+                input: project::build(&git_tree::read_tree(&self.repository, new_tree_oid)?.blobs),
+                fallback: Some(fallback),
+                warnings,
+            })
+        };
+        if !git_tree::tree_exists(&self.repository, &metadata.indexed_tree_oid) {
+            return full(IncrementalFallback::IndexedTreeUnavailable, Vec::new());
+        }
+        let Ok(changes) =
+            git_tree::diff_trees(&self.repository, &metadata.indexed_tree_oid, new_tree_oid)
+        else {
+            return full(IncrementalFallback::IndexedTreeUnavailable, Vec::new());
+        };
+        if changes.iter().any(|change| !change.is_addition()) {
+            let paths = changes
+                .iter()
+                .filter(|change| !change.is_addition())
+                .map(|change| match change {
+                    git_tree::TreeChange::Renamed { old_path, new_path } => {
+                        format!("{old_path} -> {new_path}")
+                    }
+                    _ => change.path().to_owned(),
+                })
+                .collect();
+            return full(
+                IncrementalFallback::AppendProtocolBypassed,
+                vec![OperationalWarning {
+                    code: "APPEND_PROTOCOL_BYPASSED",
+                    paths,
+                }],
+            );
+        }
+
+        let old_blobs = schema::cached_blobs(connection)?;
+        let mut new_blobs = old_blobs.clone();
+        for change in &changes {
+            if let git_tree::TreeChange::Added { path, oid } = change {
+                new_blobs.push(git_tree::TreeBlob {
+                    path: path.clone(),
+                    oid: oid.clone(),
+                    bytes: git_tree::read_blob(&self.repository, oid)?,
+                });
+            }
+        }
+        new_blobs.sort_by(|left, right| left.path.cmp(&right.path));
+        let expected: BTreeMap<_, _> = new_entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.oid.as_str()))
+            .collect();
+        let cached: BTreeMap<_, _> = new_blobs
+            .iter()
+            .map(|blob| (blob.path.as_str(), blob.oid.as_str()))
+            .collect();
+        if expected != cached || expected.len() != new_blobs.len() {
+            return full(IncrementalFallback::CachedSourceMismatch, Vec::new());
+        }
+
+        let old_input = project::build(&old_blobs);
+        let new_input = project::build(&new_blobs);
+        let changed_paths: BTreeSet<_> = changes
+            .iter()
+            .map(|change| change.path().to_owned())
+            .collect();
+        let affected_spaces = project::impact_closure(&old_input, &new_input, &changed_paths);
+        let observed_changes = project::changed_projection_spaces(&old_input, &new_input);
+        if !observed_changes.is_subset(&affected_spaces) {
+            return full(IncrementalFallback::ImpactClosureUnproven, Vec::new());
+        }
+        Ok(UpdatePlan::Incremental {
+            input: new_input,
+            affected_spaces,
+        })
     }
 
     fn open_healthy_or_replace(&self) -> Result<(Connection, Option<PathBuf>)> {
@@ -306,6 +570,68 @@ impl ProjectionIndex {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(sql_error("open projection database read-only"))
+    }
+}
+
+impl QueryConnection {
+    /// Synchronizes first, then runs `query` after pinning metadata and all page reads to one
+    /// read-only `SQLite` transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when synchronization, connection reopening, transaction control, or the
+    /// caller query fails.
+    pub fn snapshot<T>(
+        &mut self,
+        query: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<QuerySnapshot<T>> {
+        loop {
+            let synchronized = self.index.synchronize()?;
+            let disk_identity = database_file_identity(&self.index.database)?;
+            if self.identity.as_ref() != Some(&disk_identity) {
+                self.connection = None;
+                self.connection = Some(self.index.open_read_only()?);
+                self.identity = Some(disk_identity.clone());
+            }
+            let connection = self
+                .connection
+                .as_ref()
+                .ok_or_else(|| invariant("query connection was not opened"))?;
+            connection
+                .execute_batch("BEGIN DEFERRED TRANSACTION;")
+                .map_err(sql_error("begin query snapshot"))?;
+            let metadata = read_metadata(connection)?;
+            let still_same_file = database_file_identity(&self.index.database)
+                .is_ok_and(|identity| identity == disk_identity);
+            let synchronized_generation = metadata
+                .as_ref()
+                .is_some_and(|value| value == &synchronized.metadata);
+            if !still_same_file || !synchronized_generation {
+                let _ = connection.execute_batch("ROLLBACK;");
+                self.connection = None;
+                self.identity = None;
+                continue;
+            }
+            let Some(metadata) = metadata else {
+                let _ = connection.execute_batch("ROLLBACK;");
+                self.connection = None;
+                self.identity = None;
+                continue;
+            };
+            let result = query(connection);
+            match result {
+                Ok(data) => {
+                    connection
+                        .execute_batch("COMMIT;")
+                        .map_err(sql_error("commit query snapshot"))?;
+                    return Ok(QuerySnapshot { metadata, data });
+                }
+                Err(error) => {
+                    let _ = connection.execute_batch("ROLLBACK;");
+                    return Err(error);
+                }
+            }
+        }
     }
 }
 
@@ -477,21 +803,51 @@ fn versions_are_current(metadata: &IndexMetadata) -> bool {
 
 fn outcome_from_database(
     connection: &Connection,
-    rebuilt: bool,
     reason: RebuildReason,
     quarantined_database: Option<PathBuf>,
+    update_kind: IndexUpdateKind,
+    incremental_fallback: Option<IncrementalFallback>,
+    operational_warnings: Vec<OperationalWarning>,
 ) -> Result<RebuildOutcome> {
     let metadata = read_metadata(connection)?
         .ok_or_else(|| invariant("rebuilt projection is missing metadata"))?;
     let source_file_count = count(connection, "source_file")?;
     let diagnostic_count = count(connection, "diagnostic")?;
     Ok(RebuildOutcome {
-        rebuilt,
+        rebuilt: update_kind == IndexUpdateKind::FullRebuild,
         reason,
         metadata,
         source_file_count,
         diagnostic_count,
+        update_kind,
+        incremental_fallback,
+        operational_warnings,
         quarantined_database,
+    })
+}
+
+#[cfg(unix)]
+fn database_file_identity(path: &Path) -> Result<DatabaseFileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = fs::metadata(path).map_err(io_error("inspect projection database identity"))?;
+    Ok(DatabaseFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn database_file_identity(path: &Path) -> Result<DatabaseFileIdentity> {
+    let metadata = fs::metadata(path).map_err(io_error("inspect projection database identity"))?;
+    let modified = metadata
+        .modified()
+        .map_err(io_error("inspect projection database modification time"))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| invariant(format!("projection database predates Unix epoch: {error}")))?;
+    Ok(DatabaseFileIdentity {
+        device: metadata.len(),
+        inode: modified.as_nanos() as u64,
     })
 }
 
