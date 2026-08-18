@@ -10,6 +10,7 @@ use std::{
 use fs2::FileExt;
 use sctx_domain::{Error, ErrorKind, EventId, Result};
 use sctx_event_schema::{Event, ParsedEvent, parse_event};
+use sctx_local_state::{PrivacyScan, PrivacyScanner, UserConfigStore};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -165,8 +166,9 @@ impl GitStore {
     /// Returns an error if filesystem or Git initialization fails.
     pub fn initialize(root: impl AsRef<Path>) -> Result<Self> {
         let root = absolute(root.as_ref())?;
+        let config = UserConfigStore::initialize(&root)?;
         let state = root.join("state");
-        let repository = root.join("repository");
+        let repository = config.repository().to_path_buf();
         fs::create_dir_all(state.join("pending")).map_err(io_error("create pending root"))?;
         fs::create_dir_all(&state).map_err(io_error("create state root"))?;
         let lock = open_lock(&state.join("writer.lock"))?;
@@ -343,6 +345,8 @@ impl GitStore {
             objects: text_objects,
         } = request;
         let event_bytes = serialize_event(&event)?;
+        let scanner = PrivacyScanner::default();
+        reject_sensitive(&scanner, "event", &event_bytes)?;
         let event_id = event.event_id();
         let event_text = event_id.to_string();
         let event_prefix = &event_text[EventId::PREFIX.len()..EventId::PREFIX.len() + 2];
@@ -355,8 +359,9 @@ impl GitStore {
 
         let mut payloads = vec![(PendingFileKind::Event, event_path, event_bytes)];
         let mut unique_objects = BTreeMap::<String, Vec<u8>>::new();
-        for object in text_objects {
+        for (index, object) in text_objects.into_iter().enumerate() {
             let bytes = object.text.into_bytes();
+            reject_sensitive(&scanner, &format!("evidence object {index}"), &bytes)?;
             unique_objects.entry(sha256(&bytes)).or_insert(bytes);
         }
         let mut object_refs = Vec::with_capacity(unique_objects.len());
@@ -885,6 +890,31 @@ fn serialize_event(event: &Event) -> Result<Vec<u8>> {
             "serialized event did not validate as the same V1 event",
         )),
     }
+}
+
+fn reject_sensitive(scanner: &PrivacyScanner, boundary: &str, bytes: &[u8]) -> Result<()> {
+    let text = std::str::from_utf8(bytes).map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("privacy gate requires UTF-8 {boundary}: {error}"),
+        )
+    })?;
+    let scan = scanner.scan(text)?;
+    if scan.is_clean() {
+        Ok(())
+    } else {
+        Err(privacy_error(boundary, &scan))
+    }
+}
+
+fn privacy_error(boundary: &str, scan: &PrivacyScan) -> Error {
+    Error::new(
+        ErrorKind::InvalidInput,
+        format!(
+            "privacy gate rejected {boundary}: {}",
+            scan.diagnostic_codes().join(",")
+        ),
+    )
 }
 
 fn outcome(

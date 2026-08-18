@@ -1,6 +1,6 @@
 [package]
-name = "sctx-git-store"
-description = "Shared Context append-only Git storage boundary"
+name = "sctx-local-state"
+description = "Shared Context local configuration, capture, and privacy boundary"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,13 +10,12 @@ publish.workspace = true
 fs2 = "0.4"
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 sctx-domain.workspace = true
-sctx-event-schema.workspace = true
-sctx-local-state.workspace = true
+toml.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+sctx-event-schema.workspace = true
 tempfile = "3.20"
 
 [lints]

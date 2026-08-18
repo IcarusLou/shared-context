@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/domain",
+    "crates/local-state",
     "crates/event-schema",
     "crates/git-store",
     "crates/index",
@@ -30,9 +31,11 @@ sctx-event-schema = { path = "crates/event-schema" }
 sctx-git-store = { path = "crates/git-store" }
 sctx-index = { path = "crates/index" }
 sctx-installer = { path = "crates/installer" }
+sctx-local-state = { path = "crates/local-state" }
 sctx-mcp = { path = "crates/mcp" }
 sctx-search = { path = "crates/search" }
 uuid = { version = "1.18", features = ["v4"] }
+toml = "0.9"
 
 [workspace.lints.rust]
 rust_2018_idioms = { level = "deny", priority = -1 }
