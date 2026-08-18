@@ -3,8 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use crate::{
-    ContextId, ContextRevision, EventId, EvidenceId, IntentRevision, Publication,
-    PublicationAction, PublicationId, Review, ReviewId, ReviewVerdict, RevisionId, SpaceId,
+    Applicability, ConflictId, ConflictParticipant, ConflictResolution, ContextId, ContextKind,
+    ContextRevision, EventId, EvidenceId, IntentRevision, Publication, PublicationAction,
+    PublicationId, ResolutionId, Review, ReviewId, ReviewVerdict, RevisionId, SemanticConflict,
+    SpaceId,
 };
 
 /// Authoritative event input understood by the V1 domain reducer.
@@ -14,7 +16,7 @@ pub struct ReducerEvent {
     pub payload: ReducerPayload,
 }
 
-/// The five V1 payloads in the pure Context/Intent/Review/Publication boundary.
+/// The seven V1 payloads in the pure domain projection boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReducerPayload {
     SpaceCreated {
@@ -40,6 +42,15 @@ pub enum ReducerPayload {
         context_id: ContextId,
         publication: Publication,
     },
+    SemanticConflictOpened {
+        space_id: SpaceId,
+        conflict: SemanticConflict,
+    },
+    SemanticConflictResolutionAdded {
+        space_id: SpaceId,
+        conflict_id: ConflictId,
+        resolution: ConflictResolution,
+    },
 }
 
 /// Stable reducer diagnostic classifications.
@@ -51,6 +62,8 @@ pub enum ReducerDiagnosticCode {
     DuplicateReviewId,
     DuplicatePublicationId,
     DuplicateEvidenceId,
+    DuplicateConflictId,
+    DuplicateResolutionId,
     DuplicateSpaceCreation,
     AmbiguousContextOwner,
     MissingSpace,
@@ -59,6 +72,9 @@ pub enum ReducerDiagnosticCode {
     InvalidReviewReference,
     InvalidPublicationReference,
     PublicationCycle,
+    InvalidSemanticConflictReference,
+    InvalidResolutionReference,
+    ResolutionCycle,
 }
 
 /// A deterministic explanation for quarantined input.
@@ -108,6 +124,22 @@ pub enum ContextGovernanceStatus {
     },
 }
 
+/// Stable reasons why a Context is excluded from automatic injection.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoInjectionBlocker {
+    NotAccepted,
+    GovernanceConflict,
+    UnresolvedSemanticConflict(ConflictId),
+}
+
+/// Explicit eligibility projection; an empty blocker set is the only eligible state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AutoInjectionEligibility {
+    pub eligible: bool,
+    pub blockers: BTreeSet<AutoInjectionBlocker>,
+}
+
 /// Projection of one immutable Context revision.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RevisionProjection {
@@ -128,6 +160,47 @@ pub struct ContextProjection {
     pub publications: BTreeMap<PublicationId, Publication>,
     pub publication_heads: BTreeSet<PublicationId>,
     pub governance: ContextGovernanceStatus,
+    pub auto_injection: AutoInjectionEligibility,
+}
+
+/// Deterministic pair of accepted Contexts requiring human semantic review.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct SemanticConflictCandidate {
+    pub space_id: SpaceId,
+    pub topic_key: String,
+    pub participants: Vec<ConflictParticipant>,
+}
+
+/// Reasons a confirmed semantic conflict is still open.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticConflictOpenReason {
+    NoResolution,
+    ResolutionConflict,
+    PublicationHeadsNotConverged,
+    ResolutionDoesNotCoverCurrentPublicationHeads,
+}
+
+/// Current state of one confirmed semantic conflict.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SemanticConflictStatus {
+    Open {
+        reasons: BTreeSet<SemanticConflictOpenReason>,
+    },
+    Resolved {
+        resolution_id: ResolutionId,
+    },
+}
+
+/// Confirmed conflict plus its independently reduced Resolution DAG.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SemanticConflictProjection {
+    pub space_id: SpaceId,
+    pub conflict: SemanticConflict,
+    pub resolutions: BTreeMap<ResolutionId, ConflictResolution>,
+    pub resolution_heads: BTreeSet<ResolutionId>,
+    pub status: SemanticConflictStatus,
 }
 
 /// Intent DAG projection for a `ContextSpace`.
@@ -149,6 +222,9 @@ pub struct ContextSpaceProjection {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct DomainProjection {
     pub spaces: BTreeMap<SpaceId, ContextSpaceProjection>,
+    pub semantic_conflict_candidates: Vec<SemanticConflictCandidate>,
+    pub semantic_conflicts: BTreeMap<ConflictId, SemanticConflictProjection>,
+    pub quarantined_event_ids: BTreeSet<EventId>,
     pub diagnostics: Vec<ReducerDiagnostic>,
 }
 
@@ -181,6 +257,21 @@ struct PublicationNode {
     space_id: SpaceId,
     context_id: ContextId,
     publication: Publication,
+}
+
+#[derive(Clone)]
+struct ConflictNode {
+    event_id: EventId,
+    space_id: SpaceId,
+    conflict: SemanticConflict,
+}
+
+#[derive(Clone)]
+struct ResolutionNode {
+    event_id: EventId,
+    space_id: SpaceId,
+    conflict_id: ConflictId,
+    resolution: ConflictResolution,
 }
 
 struct DagNode<K> {
@@ -285,6 +376,82 @@ where
     valid.difference(&referenced).copied().collect()
 }
 
+fn scope_dimension_overlaps(left: &[String], right: &[String]) -> bool {
+    // An omitted dimension is intentionally unrestricted. Otherwise V1 only claims overlap
+    // when the self-contained snapshots share an exact value; no mutable taxonomy or NLP is read.
+    left.is_empty()
+        || right.is_empty()
+        || left
+            .iter()
+            .any(|left| right.iter().any(|right| left == right))
+}
+
+fn applicability_overlaps(left: &Applicability, right: &Applicability) -> bool {
+    scope_dimension_overlaps(&left.domains, &right.domains)
+        && scope_dimension_overlaps(&left.platforms, &right.platforms)
+        && scope_dimension_overlaps(&left.conditions, &right.conditions)
+}
+
+fn semantic_candidate_participant(
+    context: &ContextProjection,
+) -> Option<(ConflictParticipant, &ContextRevision)> {
+    let ContextGovernanceStatus::Accepted {
+        publication_id,
+        revision_id,
+    } = context.governance
+    else {
+        return None;
+    };
+    let revision = &context.revisions.get(&revision_id)?.revision;
+    if !matches!(revision.kind, ContextKind::Decision | ContextKind::Contract) {
+        return None;
+    }
+    Some((
+        ConflictParticipant {
+            context_id: context.context_id,
+            revision_id,
+            publication_id,
+        },
+        revision,
+    ))
+}
+
+fn conflict_candidates(
+    spaces: &BTreeMap<SpaceId, ContextSpaceProjection>,
+) -> Vec<SemanticConflictCandidate> {
+    let mut candidates = BTreeSet::new();
+    for (space_id, space) in spaces {
+        let accepted: Vec<_> = space
+            .contexts
+            .values()
+            .filter_map(semantic_candidate_participant)
+            .collect();
+        for (index, (left_participant, left_revision)) in accepted.iter().enumerate() {
+            for (right_participant, right_revision) in accepted.iter().skip(index + 1) {
+                let (Some(left_topic), Some(right_topic)) = (
+                    left_revision.topic_key.as_ref(),
+                    right_revision.topic_key.as_ref(),
+                ) else {
+                    continue;
+                };
+                if left_topic == right_topic
+                    && applicability_overlaps(
+                        &left_revision.applicability,
+                        &right_revision.applicability,
+                    )
+                {
+                    candidates.insert(SemanticConflictCandidate {
+                        space_id: *space_id,
+                        topic_key: left_topic.clone(),
+                        participants: vec![left_participant.clone(), right_participant.clone()],
+                    });
+                }
+            }
+        }
+    }
+    candidates.into_iter().collect()
+}
+
 /// Reduces a complete in-memory V1 event multiset without consulting storage or a clock.
 ///
 /// Input order has no semantic effect. Duplicate definitions, ambiguous ownership,
@@ -308,6 +475,8 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
     let mut review_definitions: BTreeMap<ReviewId, Vec<ReviewNode>> = BTreeMap::new();
     let mut publication_definitions: BTreeMap<PublicationId, Vec<PublicationNode>> =
         BTreeMap::new();
+    let mut conflict_definitions: BTreeMap<ConflictId, Vec<ConflictNode>> = BTreeMap::new();
+    let mut resolution_definitions: BTreeMap<ResolutionId, Vec<ResolutionNode>> = BTreeMap::new();
     let mut evidence_definitions: BTreeMap<EvidenceId, Vec<EventId>> = BTreeMap::new();
     let mut context_owners: BTreeMap<ContextId, BTreeSet<SpaceId>> = BTreeMap::new();
 
@@ -409,6 +578,43 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
                         publication: publication.clone(),
                     });
             }
+            ReducerPayload::SemanticConflictOpened { space_id, conflict } => {
+                for participant in &conflict.participants {
+                    context_owners
+                        .entry(participant.context_id)
+                        .or_default()
+                        .insert(*space_id);
+                }
+                conflict_definitions
+                    .entry(conflict.conflict_id)
+                    .or_default()
+                    .push(ConflictNode {
+                        event_id: event.event_id,
+                        space_id: *space_id,
+                        conflict: conflict.clone(),
+                    });
+            }
+            ReducerPayload::SemanticConflictResolutionAdded {
+                space_id,
+                conflict_id,
+                resolution,
+            } => {
+                for result in &resolution.results {
+                    context_owners
+                        .entry(result.context_id)
+                        .or_default()
+                        .insert(*space_id);
+                }
+                resolution_definitions
+                    .entry(resolution.resolution_id)
+                    .or_default()
+                    .push(ResolutionNode {
+                        event_id: event.event_id,
+                        space_id: *space_id,
+                        conflict_id: *conflict_id,
+                        resolution: resolution.clone(),
+                    });
+            }
         }
     }
 
@@ -500,6 +706,30 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
             );
         }
     }
+    for (id, definitions) in &conflict_definitions {
+        if definitions.len() > 1 {
+            invalid_event_ids.extend(definitions.iter().map(|node| node.event_id));
+            push_diagnostic(
+                &mut diagnostics,
+                ReducerDiagnosticCode::DuplicateConflictId,
+                id.to_string(),
+                event_ids(definitions, |node| node.event_id),
+                format!("conflict ID {id} has multiple definitions"),
+            );
+        }
+    }
+    for (id, definitions) in &resolution_definitions {
+        if definitions.len() > 1 {
+            invalid_event_ids.extend(definitions.iter().map(|node| node.event_id));
+            push_diagnostic(
+                &mut diagnostics,
+                ReducerDiagnosticCode::DuplicateResolutionId,
+                id.to_string(),
+                event_ids(definitions, |node| node.event_id),
+                format!("resolution ID {id} has multiple definitions"),
+            );
+        }
+    }
 
     let mut invalid_spaces = BTreeSet::new();
     for (space_id, definitions) in &space_creations {
@@ -534,6 +764,22 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
                         context_id: candidate,
                         ..
                     } if candidate == context_id => Some(event.event_id),
+                    ReducerPayload::SemanticConflictOpened { conflict, .. }
+                        if conflict
+                            .participants
+                            .iter()
+                            .any(|participant| participant.context_id == *context_id) =>
+                    {
+                        Some(event.event_id)
+                    }
+                    ReducerPayload::SemanticConflictResolutionAdded { resolution, .. }
+                        if resolution
+                            .results
+                            .iter()
+                            .any(|result| result.context_id == *context_id) =>
+                    {
+                        Some(event.event_id)
+                    }
                     _ => None,
                 })
                 .collect();
@@ -563,15 +809,18 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
             | ReducerPayload::SpaceIntentRevisionAdded { space_id, .. }
             | ReducerPayload::ContextRevisionAdded { space_id, .. }
             | ReducerPayload::ContextReviewed { space_id, .. }
-            | ReducerPayload::ContextPublicationChanged { space_id, .. } => *space_id,
+            | ReducerPayload::ContextPublicationChanged { space_id, .. }
+            | ReducerPayload::SemanticConflictOpened { space_id, .. }
+            | ReducerPayload::SemanticConflictResolutionAdded { space_id, .. } => *space_id,
         };
-        if !space_creations.contains_key(&space_id) {
+        let is_space_creation = matches!(event.payload, ReducerPayload::SpaceCreated { .. });
+        if !valid_spaces.contains(&space_id) && !is_space_creation {
             push_diagnostic(
                 &mut diagnostics,
                 ReducerDiagnosticCode::MissingSpace,
                 space_id.to_string(),
                 BTreeSet::from([event.event_id]),
-                format!("event references space {space_id} without a creation event"),
+                format!("event references missing or quarantined space {space_id}"),
             );
         }
     }
@@ -713,6 +962,26 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
     > = BTreeMap::new();
     let mut publication_heads: BTreeMap<(SpaceId, ContextId), BTreeSet<PublicationId>> =
         BTreeMap::new();
+    for definitions in publication_definitions
+        .values()
+        .filter(|items| items.len() == 1)
+    {
+        let node = &definitions[0];
+        if !invalid_event_ids.contains(&node.event_id)
+            && !valid_contexts.contains_key(&(node.space_id, node.context_id))
+        {
+            push_diagnostic(
+                &mut diagnostics,
+                ReducerDiagnosticCode::InvalidPublicationReference,
+                node.publication.publication_id.to_string(),
+                BTreeSet::from([node.event_id]),
+                format!(
+                    "publication {} belongs to a missing or quarantined context",
+                    node.publication.publication_id
+                ),
+            );
+        }
+    }
     for key in valid_contexts.keys() {
         let candidates: BTreeMap<_, _> = publication_definitions
             .iter()
@@ -892,6 +1161,22 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
                         .map(|(id, node)| (id, node.publication))
                         .collect(),
                     publication_heads: heads,
+                    auto_injection: {
+                        let blockers = match &governance {
+                            ContextGovernanceStatus::Accepted { .. } => BTreeSet::new(),
+                            ContextGovernanceStatus::GovernanceConflict { .. } => {
+                                BTreeSet::from([AutoInjectionBlocker::GovernanceConflict])
+                            }
+                            ContextGovernanceStatus::Unpublished
+                            | ContextGovernanceStatus::Deprecated { .. } => {
+                                BTreeSet::from([AutoInjectionBlocker::NotAccepted])
+                            }
+                        };
+                        AutoInjectionEligibility {
+                            eligible: blockers.is_empty(),
+                            blockers,
+                        }
+                    },
                     governance,
                 },
             );
@@ -906,8 +1191,271 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
         );
     }
 
+    let semantic_conflict_candidates = conflict_candidates(&spaces);
+    let mut valid_conflicts = BTreeMap::new();
+    for (conflict_id, definitions) in &conflict_definitions {
+        if definitions.len() != 1 {
+            continue;
+        }
+        let node = definitions[0].clone();
+        if invalid_event_ids.contains(&node.event_id) {
+            continue;
+        }
+
+        let mut participant_revisions = Vec::new();
+        let mut references_are_valid = true;
+        if let Some(space) = spaces.get(&node.space_id) {
+            for participant in &node.conflict.participants {
+                let Some(context) = space.contexts.get(&participant.context_id) else {
+                    references_are_valid = false;
+                    break;
+                };
+                let Some(publication) = context.publications.get(&participant.publication_id)
+                else {
+                    references_are_valid = false;
+                    break;
+                };
+                let Some(revision) = context.revisions.get(&participant.revision_id) else {
+                    references_are_valid = false;
+                    break;
+                };
+                if publication.action != PublicationAction::Publish
+                    || publication.revision_id != participant.revision_id
+                    || !matches!(
+                        revision.revision.kind,
+                        ContextKind::Decision | ContextKind::Contract
+                    )
+                {
+                    references_are_valid = false;
+                    break;
+                }
+                participant_revisions.push(&revision.revision);
+            }
+        } else {
+            references_are_valid = false;
+        }
+
+        let same_topic_and_overlapping = references_are_valid
+            && participant_revisions
+                .iter()
+                .enumerate()
+                .all(|(index, left)| {
+                    participant_revisions.iter().skip(index + 1).all(|right| {
+                        left.topic_key == right.topic_key
+                            && applicability_overlaps(&left.applicability, &right.applicability)
+                    })
+                })
+            && participant_revisions.iter().all(|revision| {
+                applicability_overlaps(&node.conflict.applicability, &revision.applicability)
+            });
+        if !same_topic_and_overlapping {
+            push_diagnostic(
+                &mut diagnostics,
+                ReducerDiagnosticCode::InvalidSemanticConflictReference,
+                conflict_id.to_string(),
+                BTreeSet::from([node.event_id]),
+                format!(
+                    "semantic conflict {conflict_id} must reference valid same-space publish nodes with one overlapping topic"
+                ),
+            );
+            continue;
+        }
+        valid_conflicts.insert(*conflict_id, node);
+    }
+
+    for definitions in resolution_definitions
+        .values()
+        .filter(|items| items.len() == 1)
+    {
+        let node = &definitions[0];
+        if invalid_event_ids.contains(&node.event_id) {
+            continue;
+        }
+        if valid_conflicts
+            .get(&node.conflict_id)
+            .is_none_or(|conflict| conflict.space_id != node.space_id)
+        {
+            push_diagnostic(
+                &mut diagnostics,
+                ReducerDiagnosticCode::InvalidResolutionReference,
+                node.resolution.resolution_id.to_string(),
+                BTreeSet::from([node.event_id]),
+                format!(
+                    "resolution {} references a missing, quarantined, or cross-space conflict",
+                    node.resolution.resolution_id
+                ),
+            );
+        }
+    }
+
+    let mut semantic_conflicts = BTreeMap::new();
+    for (conflict_id, conflict_node) in &valid_conflicts {
+        let participant_contexts: BTreeSet<_> = conflict_node
+            .conflict
+            .participants
+            .iter()
+            .map(|participant| participant.context_id)
+            .collect();
+        let space = &spaces[&conflict_node.space_id];
+        let publication_owners: BTreeMap<_, _> = participant_contexts
+            .iter()
+            .flat_map(|context_id| {
+                space.contexts[context_id]
+                    .publications
+                    .keys()
+                    .map(|publication_id| (*publication_id, *context_id))
+            })
+            .collect();
+
+        let candidates: BTreeMap<_, _> = resolution_definitions
+            .iter()
+            .filter(|(_, definitions)| definitions.len() == 1)
+            .map(|(id, definitions)| (*id, definitions[0].clone()))
+            .filter(|(_, node)| {
+                node.conflict_id == *conflict_id
+                    && node.space_id == conflict_node.space_id
+                    && !invalid_event_ids.contains(&node.event_id)
+            })
+            .filter(|(_, node)| {
+                let result_contexts: BTreeSet<_> = node
+                    .resolution
+                    .results
+                    .iter()
+                    .map(|result| result.context_id)
+                    .collect();
+                let results_are_valid = result_contexts == participant_contexts
+                    && node.resolution.results.iter().all(|result| {
+                        space.contexts.get(&result.context_id).is_some_and(|context| {
+                            context.revisions.contains_key(&result.revision_id)
+                        })
+                    });
+                let publications_are_valid = node
+                    .resolution
+                    .related_publication_ids
+                    .iter()
+                    .all(|publication_id| publication_owners.contains_key(publication_id));
+                if !results_are_valid || !publications_are_valid {
+                    push_diagnostic(
+                        &mut diagnostics,
+                        ReducerDiagnosticCode::InvalidResolutionReference,
+                        node.resolution.resolution_id.to_string(),
+                        BTreeSet::from([node.event_id]),
+                        format!(
+                            "resolution {} must cover every participant with valid same-conflict revisions and publications",
+                            node.resolution.resolution_id
+                        ),
+                    );
+                }
+                results_are_valid && publications_are_valid
+            })
+            .collect();
+        let dag: BTreeMap<_, _> = candidates
+            .iter()
+            .map(|(id, node)| {
+                (
+                    *id,
+                    DagNode {
+                        event_id: node.event_id,
+                        parents: node.resolution.previous_resolution_ids.clone(),
+                    },
+                )
+            })
+            .collect();
+        let valid = validate_dag(
+            &dag,
+            ReducerDiagnosticCode::InvalidResolutionReference,
+            ReducerDiagnosticCode::ResolutionCycle,
+            "semantic conflict resolution",
+            &mut diagnostics,
+        );
+        let resolution_heads = heads(&dag, &valid);
+        let current_publication_heads: BTreeSet<_> = participant_contexts
+            .iter()
+            .flat_map(|context_id| space.contexts[context_id].publication_heads.iter().copied())
+            .collect();
+        let publications_converged = participant_contexts
+            .iter()
+            .all(|context_id| space.contexts[context_id].publication_heads.len() == 1);
+
+        let status = if resolution_heads.len() == 1 {
+            let resolution_id = *resolution_heads
+                .first()
+                .expect("one resolution head exists");
+            let resolution = &candidates[&resolution_id].resolution;
+            let related: BTreeSet<_> = resolution.related_publication_ids.iter().copied().collect();
+            let mut reasons = BTreeSet::new();
+            if !publications_converged {
+                reasons.insert(SemanticConflictOpenReason::PublicationHeadsNotConverged);
+            }
+            if related != current_publication_heads {
+                reasons.insert(
+                    SemanticConflictOpenReason::ResolutionDoesNotCoverCurrentPublicationHeads,
+                );
+            }
+            if reasons.is_empty() {
+                SemanticConflictStatus::Resolved { resolution_id }
+            } else {
+                SemanticConflictStatus::Open { reasons }
+            }
+        } else {
+            let mut reasons = BTreeSet::new();
+            if resolution_heads.is_empty() {
+                reasons.insert(SemanticConflictOpenReason::NoResolution);
+            } else {
+                reasons.insert(SemanticConflictOpenReason::ResolutionConflict);
+            }
+            if !publications_converged {
+                reasons.insert(SemanticConflictOpenReason::PublicationHeadsNotConverged);
+            }
+            SemanticConflictStatus::Open { reasons }
+        };
+
+        semantic_conflicts.insert(
+            *conflict_id,
+            SemanticConflictProjection {
+                space_id: conflict_node.space_id,
+                conflict: conflict_node.conflict.clone(),
+                resolutions: candidates
+                    .into_iter()
+                    .filter(|(id, _)| valid.contains(id))
+                    .map(|(id, node)| (id, node.resolution))
+                    .collect(),
+                resolution_heads,
+                status,
+            },
+        );
+    }
+
+    for (conflict_id, conflict) in &semantic_conflicts {
+        if !matches!(conflict.status, SemanticConflictStatus::Open { .. }) {
+            continue;
+        }
+        for participant in &conflict.conflict.participants {
+            let eligibility = &mut spaces
+                .get_mut(&conflict.space_id)
+                .expect("valid conflict space exists")
+                .contexts
+                .get_mut(&participant.context_id)
+                .expect("valid conflict participant exists")
+                .auto_injection;
+            eligibility
+                .blockers
+                .insert(AutoInjectionBlocker::UnresolvedSemanticConflict(
+                    *conflict_id,
+                ));
+            eligibility.eligible = false;
+        }
+    }
+
+    let quarantined_event_ids = diagnostics
+        .iter()
+        .flat_map(|diagnostic| diagnostic.event_ids.iter().copied())
+        .collect();
     DomainProjection {
         spaces,
+        semantic_conflict_candidates,
+        semantic_conflicts,
+        quarantined_event_ids,
         diagnostics: diagnostics.into_iter().collect(),
     }
 }

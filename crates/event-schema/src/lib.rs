@@ -12,15 +12,17 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 pub use sctx_domain::{
-    Applicability, ConflictId, ConflictParticipant, ConflictResolution, ConflictResolutionDraft,
-    ConflictResolutionResult, ContextGovernanceStatus, ContextId, ContextKind, ContextProjection,
-    ContextRevision, ContextRevisionDraft, ContextSpaceProjection, DomainProjection, Error,
-    ErrorKind, EventId, EvidenceId, EvidenceSnapshot, EvidenceSnapshotDraft, EvidenceType,
-    IdParseError, IntentProjection, IntentRevision, IntentSnapshot, Publication, PublicationAction,
-    PublicationDraft, PublicationId, ReducerDiagnostic, ReducerDiagnosticCode, ReducerEvent,
-    ReducerPayload, ResolutionId, ResolutionOutcome, Result, Review, ReviewDraft, ReviewId,
-    ReviewSummary, ReviewVerdict, RevisionId, RevisionLifecycle, RevisionProjection,
-    SemanticConflict, SemanticConflictDraft, SpaceId, reduce,
+    Applicability, AutoInjectionBlocker, AutoInjectionEligibility, ConflictId, ConflictParticipant,
+    ConflictResolution, ConflictResolutionDraft, ConflictResolutionResult, ContextGovernanceStatus,
+    ContextId, ContextKind, ContextProjection, ContextRevision, ContextRevisionDraft,
+    ContextSpaceProjection, DomainProjection, Error, ErrorKind, EventId, EvidenceId,
+    EvidenceSnapshot, EvidenceSnapshotDraft, EvidenceType, IdParseError, IntentProjection,
+    IntentRevision, IntentSnapshot, Publication, PublicationAction, PublicationDraft,
+    PublicationId, ReducerDiagnostic, ReducerDiagnosticCode, ReducerEvent, ReducerPayload,
+    ResolutionId, ResolutionOutcome, Result, Review, ReviewDraft, ReviewId, ReviewSummary,
+    ReviewVerdict, RevisionId, RevisionLifecycle, RevisionProjection, SemanticConflict,
+    SemanticConflictCandidate, SemanticConflictDraft, SemanticConflictOpenReason,
+    SemanticConflictProjection, SemanticConflictStatus, SpaceId, reduce,
 };
 
 /// Immutable identifier for the bundled V1 JSON Schema.
@@ -449,10 +451,7 @@ impl Event {
         self.annotations.as_ref()
     }
 
-    /// Converts events in the pure domain-reducer boundary into owned reducer input.
-    ///
-    /// Semantic-conflict events intentionally return `None`; their cross-Context
-    /// projection is outside the Context/Intent/Review/Publication reducer.
+    /// Converts every supported event into owned pure-reducer input.
     #[must_use]
     pub fn reducer_event(&self) -> Option<ReducerEvent> {
         let payload = match &self.payload {
@@ -497,8 +496,21 @@ impl Event {
                 context_id: *context_id,
                 publication: publication.clone(),
             },
-            EventPayload::SemanticConflictOpened { .. }
-            | EventPayload::SemanticConflictResolutionAdded { .. } => return None,
+            EventPayload::SemanticConflictOpened { space_id, conflict } => {
+                ReducerPayload::SemanticConflictOpened {
+                    space_id: *space_id,
+                    conflict: conflict.clone(),
+                }
+            }
+            EventPayload::SemanticConflictResolutionAdded {
+                space_id,
+                conflict_id,
+                resolution,
+            } => ReducerPayload::SemanticConflictResolutionAdded {
+                space_id: *space_id,
+                conflict_id: *conflict_id,
+                resolution: resolution.clone(),
+            },
         };
         Some(ReducerEvent {
             event_id: self.event_id,

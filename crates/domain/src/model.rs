@@ -465,7 +465,7 @@ impl Publication {
 }
 
 /// One accepted Context/Revision/Publication head involved in a semantic conflict.
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConflictParticipant {
     pub context_id: ContextId,

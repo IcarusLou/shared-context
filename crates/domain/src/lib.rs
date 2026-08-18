@@ -20,9 +20,11 @@ pub use model::{
     SemanticConflict, SemanticConflictDraft,
 };
 pub use reducer::{
-    ContextGovernanceStatus, ContextProjection, ContextSpaceProjection, DomainProjection,
-    IntentProjection, ReducerDiagnostic, ReducerDiagnosticCode, ReducerEvent, ReducerPayload,
-    ReviewSummary, RevisionLifecycle, RevisionProjection, reduce,
+    AutoInjectionBlocker, AutoInjectionEligibility, ContextGovernanceStatus, ContextProjection,
+    ContextSpaceProjection, DomainProjection, IntentProjection, ReducerDiagnostic,
+    ReducerDiagnosticCode, ReducerEvent, ReducerPayload, ReviewSummary, RevisionLifecycle,
+    RevisionProjection, SemanticConflictCandidate, SemanticConflictOpenReason,
+    SemanticConflictProjection, SemanticConflictStatus, reduce,
 };
 
 /// Broad categories used to route recoverable errors across crate boundaries.

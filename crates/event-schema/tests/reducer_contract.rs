@@ -2,8 +2,9 @@ use std::{fs, path::Path, str::FromStr};
 
 use proptest::prelude::*;
 use sctx_event_schema::{
-    ContextGovernanceStatus, ContextId, Event, ReducerDiagnosticCode, ReducerEvent, ReviewSummary,
-    RevisionId, RevisionLifecycle, SpaceId, reduce,
+    AutoInjectionBlocker, ConflictId, ContextGovernanceStatus, ContextId, Event,
+    ReducerDiagnosticCode, ReducerEvent, ResolutionId, ReviewSummary, RevisionId,
+    RevisionLifecycle, SemanticConflictOpenReason, SemanticConflictStatus, SpaceId, reduce,
 };
 use serde_json::Value;
 
@@ -46,7 +47,7 @@ fn reducer_events(name: &str) -> Vec<ReducerEvent> {
         .map(|event| {
             event
                 .reducer_event()
-                .expect("reducer fixture must not contain semantic-conflict events")
+                .expect("every V1 fixture event must be reducible")
         })
         .collect()
 }
@@ -57,6 +58,7 @@ fn all_reducer_events() -> Vec<ReducerEvent> {
         "context-branch-merge.json",
         "review-summaries.json",
         "publication-lifecycle.json",
+        "semantic-conflicts.json",
     ]
     .into_iter()
     .flat_map(reducer_events)
@@ -405,12 +407,258 @@ fn annotations_do_not_participate_in_reduction() {
     );
 }
 
+#[test]
+fn topic_and_scope_overlap_produce_only_the_expected_candidate() {
+    let projection = reduce(&reducer_events("semantic-conflicts.json"));
+
+    assert_eq!(projection.semantic_conflict_candidates.len(), 1);
+    let candidate = &projection.semantic_conflict_candidates[0];
+    assert_eq!(candidate.topic_key, "search/result-visibility");
+    assert_eq!(
+        candidate
+            .participants
+            .iter()
+            .map(|participant| participant.context_id)
+            .collect::<Vec<_>>(),
+        vec![
+            context("ctx_00000000-0000-4000-8000-000000000501"),
+            context("ctx_00000000-0000-4000-8000-000000000502"),
+        ]
+    );
+    assert!(projection.diagnostics.is_empty());
+}
+
+#[test]
+fn confirmed_open_conflict_blocks_both_participants_until_one_resolution_head() {
+    let mut events = reducer_events("semantic-conflicts.json");
+    events.pop();
+    let projection = reduce(&events);
+    let conflict_id = ConflictId::from_str("cnf_00000000-0000-4000-8000-000000000531").unwrap();
+    let conflict = &projection.semantic_conflicts[&conflict_id];
+
+    assert!(matches!(
+        &conflict.status,
+        SemanticConflictStatus::Open { reasons }
+            if reasons.contains(&SemanticConflictOpenReason::NoResolution)
+    ));
+    for context_id in [
+        context("ctx_00000000-0000-4000-8000-000000000501"),
+        context("ctx_00000000-0000-4000-8000-000000000502"),
+    ] {
+        let eligibility = &projection.spaces[&space("spc_00000000-0000-4000-8000-000000000005")]
+            .contexts[&context_id]
+            .auto_injection;
+        assert!(!eligibility.eligible);
+        assert!(
+            eligibility
+                .blockers
+                .contains(&AutoInjectionBlocker::UnresolvedSemanticConflict(
+                    conflict_id
+                ))
+        );
+    }
+
+    let resolved = reduce(&reducer_events("semantic-conflicts.json"));
+    assert!(matches!(
+        resolved.semantic_conflicts[&conflict_id].status,
+        SemanticConflictStatus::Resolved { resolution_id }
+            if resolution_id
+                == ResolutionId::from_str("rsl_00000000-0000-4000-8000-000000000541").unwrap()
+    ));
+    assert!(
+        resolved.spaces[&space("spc_00000000-0000-4000-8000-000000000005")].contexts
+            [&context("ctx_00000000-0000-4000-8000-000000000501")]
+            .auto_injection
+            .eligible
+    );
+}
+
+#[test]
+fn concurrent_resolution_heads_keep_the_conflict_open() {
+    let mut values = fixture_values("semantic-conflicts.json");
+    let mut concurrent = values.last().unwrap().clone();
+    concurrent["event_id"] = serde_json::json!("evt_00000000-0000-4000-8000-000000000062");
+    concurrent["resolution"]["resolution_id"] =
+        serde_json::json!("rsl_00000000-0000-4000-8000-000000000542");
+    values.push(concurrent);
+    let projection = reduce(&values_to_reducer_events(values));
+    let conflict = &projection.semantic_conflicts
+        [&ConflictId::from_str("cnf_00000000-0000-4000-8000-000000000531").unwrap()];
+
+    assert_eq!(conflict.resolution_heads.len(), 2);
+    assert!(matches!(
+        &conflict.status,
+        SemanticConflictStatus::Open { reasons }
+            if reasons.contains(&SemanticConflictOpenReason::ResolutionConflict)
+    ));
+}
+
+#[test]
+fn unconverged_publications_block_resolution_even_when_all_heads_are_cited() {
+    let mut values = fixture_values("semantic-conflicts.json");
+    for (event_id, publication_id) in [
+        (
+            "evt_00000000-0000-4000-8000-000000000063",
+            "pub_00000000-0000-4000-8000-000000000525",
+        ),
+        (
+            "evt_00000000-0000-4000-8000-000000000064",
+            "pub_00000000-0000-4000-8000-000000000526",
+        ),
+    ] {
+        values.push(serde_json::json!({
+            "schema_version": "1",
+            "event_id": event_id,
+            "event_type": "context.publication_changed",
+            "space_id": "spc_00000000-0000-4000-8000-000000000005",
+            "context_id": "ctx_00000000-0000-4000-8000-000000000501",
+            "publication": {
+                "publication_id": publication_id,
+                "previous_publication_ids": ["pub_00000000-0000-4000-8000-000000000521"],
+                "action": "publish",
+                "revision_id": "rev_00000000-0000-4000-8000-000000000511",
+                "review_event_ids": []
+            }
+        }));
+    }
+    values.push(serde_json::json!({
+        "schema_version": "1",
+        "event_id": "evt_00000000-0000-4000-8000-000000000065",
+        "event_type": "semantic_conflict.resolution_added",
+        "space_id": "spc_00000000-0000-4000-8000-000000000005",
+        "conflict_id": "cnf_00000000-0000-4000-8000-000000000531",
+        "resolution": {
+            "resolution_id": "rsl_00000000-0000-4000-8000-000000000543",
+            "previous_resolution_ids": ["rsl_00000000-0000-4000-8000-000000000541"],
+            "related_publication_ids": [
+                "pub_00000000-0000-4000-8000-000000000525",
+                "pub_00000000-0000-4000-8000-000000000526",
+                "pub_00000000-0000-4000-8000-000000000522"
+            ],
+            "results": [
+                {"context_id":"ctx_00000000-0000-4000-8000-000000000501","revision_id":"rev_00000000-0000-4000-8000-000000000511","outcome":"retained"},
+                {"context_id":"ctx_00000000-0000-4000-8000-000000000502","revision_id":"rev_00000000-0000-4000-8000-000000000512","outcome":"revised"}
+            ],
+            "rationale": "Cite all current heads without hiding governance divergence"
+        }
+    }));
+    let projection = reduce(&values_to_reducer_events(values));
+    let conflict = &projection.semantic_conflicts
+        [&ConflictId::from_str("cnf_00000000-0000-4000-8000-000000000531").unwrap()];
+
+    assert_eq!(conflict.resolution_heads.len(), 1);
+    assert!(matches!(
+        &conflict.status,
+        SemanticConflictStatus::Open { reasons }
+            if reasons == &[
+                SemanticConflictOpenReason::PublicationHeadsNotConverged
+            ].into_iter().collect()
+    ));
+}
+
+#[test]
+fn quarantine_closure_reaches_publications_conflict_and_resolution() {
+    let mut values = fixture_values("semantic-conflicts.json");
+    values[3]["revision"]["evidence"][0]["evidence_id"] =
+        values[1]["revision"]["evidence"][0]["evidence_id"].clone();
+    let projection = reduce(&values_to_reducer_events(values));
+
+    for code in [
+        ReducerDiagnosticCode::DuplicateEvidenceId,
+        ReducerDiagnosticCode::InvalidPublicationReference,
+        ReducerDiagnosticCode::InvalidSemanticConflictReference,
+        ReducerDiagnosticCode::InvalidResolutionReference,
+    ] {
+        assert!(
+            projection
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == code)
+        );
+    }
+    for event_id in [52, 53, 54, 55, 60, 61] {
+        let id = format!("evt_00000000-0000-4000-8000-{event_id:012}");
+        assert!(
+            projection
+                .quarantined_event_ids
+                .contains(&sctx_event_schema::EventId::from_str(&id).unwrap())
+        );
+    }
+    assert!(projection.semantic_conflicts.is_empty());
+}
+
+#[test]
+fn duplicate_conflict_and_resolution_ids_quarantine_every_definition() {
+    let mut conflict_values = fixture_values("semantic-conflicts.json");
+    let mut duplicate_conflict = conflict_values[9].clone();
+    duplicate_conflict["event_id"] = serde_json::json!("evt_00000000-0000-4000-8000-000000000066");
+    conflict_values.push(duplicate_conflict);
+    let conflict_projection = reduce(&values_to_reducer_events(conflict_values));
+    assert!(conflict_projection.semantic_conflicts.is_empty());
+    assert!(
+        conflict_projection
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == ReducerDiagnosticCode::DuplicateConflictId })
+    );
+    assert!(conflict_projection.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == ReducerDiagnosticCode::InvalidResolutionReference
+    }));
+
+    let mut resolution_values = fixture_values("semantic-conflicts.json");
+    let mut duplicate_resolution = resolution_values[10].clone();
+    duplicate_resolution["event_id"] =
+        serde_json::json!("evt_00000000-0000-4000-8000-000000000067");
+    resolution_values.push(duplicate_resolution);
+    let resolution_projection = reduce(&values_to_reducer_events(resolution_values));
+    let conflict = &resolution_projection.semantic_conflicts
+        [&ConflictId::from_str("cnf_00000000-0000-4000-8000-000000000531").unwrap()];
+    assert!(conflict.resolution_heads.is_empty());
+    assert!(matches!(
+        &conflict.status,
+        SemanticConflictStatus::Open { reasons }
+            if reasons.contains(&SemanticConflictOpenReason::NoResolution)
+    ));
+    assert!(
+        resolution_projection
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == ReducerDiagnosticCode::DuplicateResolutionId })
+    );
+}
+
+#[test]
+fn resolution_cycles_and_their_dependants_never_become_heads() {
+    let mut values = fixture_values("semantic-conflicts.json");
+    values[10]["resolution"]["previous_resolution_ids"] =
+        serde_json::json!(["rsl_00000000-0000-4000-8000-000000000542"]);
+    let mut second = values[10].clone();
+    second["event_id"] = serde_json::json!("evt_00000000-0000-4000-8000-000000000068");
+    second["resolution"]["resolution_id"] =
+        serde_json::json!("rsl_00000000-0000-4000-8000-000000000542");
+    second["resolution"]["previous_resolution_ids"] =
+        serde_json::json!(["rsl_00000000-0000-4000-8000-000000000541"]);
+    values.push(second);
+    let projection = reduce(&values_to_reducer_events(values));
+    let conflict = &projection.semantic_conflicts
+        [&ConflictId::from_str("cnf_00000000-0000-4000-8000-000000000531").unwrap()];
+
+    assert!(conflict.resolutions.is_empty());
+    assert!(conflict.resolution_heads.is_empty());
+    assert!(
+        projection
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == ReducerDiagnosticCode::ResolutionCycle)
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
     #[test]
     fn arbitrary_event_permutations_have_byte_identical_projection(
-        keys in prop::collection::vec(any::<u64>(), 36)
+        keys in prop::collection::vec(any::<u64>(), 47)
     ) {
         let events = all_reducer_events();
         let expected = serde_json::to_vec(&reduce(&events)).unwrap();
@@ -423,10 +671,27 @@ proptest! {
 
     #[test]
     fn quarantine_is_also_permutation_invariant(
-        keys in prop::collection::vec(any::<u64>(), 37)
+        keys in prop::collection::vec(any::<u64>(), 48)
     ) {
         let mut events = all_reducer_events();
         events.push(events[1].clone());
+        let expected = serde_json::to_vec(&reduce(&events)).unwrap();
+        let mut keyed: Vec<_> = events.into_iter().zip(keys).enumerate().collect();
+        keyed.sort_by_key(|(original_index, (_, key))| (*key, *original_index));
+        let permuted: Vec<_> = keyed.into_iter().map(|(_, (event, _))| event).collect();
+
+        prop_assert_eq!(serde_json::to_vec(&reduce(&permuted)).unwrap(), expected);
+    }
+
+    #[test]
+    fn full_conflict_quarantine_closure_is_permutation_invariant(
+        keys in prop::collection::vec(any::<u64>(), 47)
+    ) {
+        let mut values = fixture_values("semantic-conflicts.json");
+        let duplicate_evidence = values[1]["revision"]["evidence"][0]["evidence_id"].clone();
+        values[3]["revision"]["evidence"][0]["evidence_id"] = duplicate_evidence;
+        let mut events = all_reducer_events();
+        events.splice(36.., values_to_reducer_events(values));
         let expected = serde_json::to_vec(&reduce(&events)).unwrap();
         let mut keyed: Vec<_> = events.into_iter().zip(keys).enumerate().collect();
         keyed.sort_by_key(|(original_index, (_, key))| (*key, *original_index));
