@@ -478,16 +478,31 @@ dependencies = [
 name = "sctx-adapter-codex"
 version = "0.1.0"
 dependencies = [
+ "sctx-agent-adapter",
  "sctx-domain",
- "sctx-search",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
 name = "sctx-adapter-cursor"
 version = "0.1.0"
 dependencies = [
+ "sctx-agent-adapter",
+ "sctx-domain",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "sctx-agent-adapter"
+version = "0.1.0"
+dependencies = [
  "sctx-domain",
  "sctx-search",
+ "semver",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -496,6 +511,7 @@ version = "0.1.0"
 dependencies = [
  "sctx-adapter-codex",
  "sctx-adapter-cursor",
+ "sctx-agent-adapter",
  "sctx-domain",
  "sctx-event-schema",
  "sctx-git-store",
@@ -613,6 +629,12 @@ dependencies = [
  "sha2",
  "tempfile",
 ]
+
+[[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "serde"

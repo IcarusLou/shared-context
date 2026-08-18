@@ -3,10 +3,21 @@
 mod args;
 
 use std::{
-    collections::BTreeSet, env, ffi::OsString, fs, path::PathBuf, process::ExitCode, str::FromStr,
+    collections::BTreeSet,
+    env,
+    ffi::OsString,
+    fs,
+    io::{self, Read},
+    path::{Path, PathBuf},
+    process::{Command, ExitCode},
+    str::FromStr,
 };
 
 use args::Options;
+use sctx_agent_adapter::{
+    AgentCapabilities, CanonicalAgentAction, CanonicalAgentEvent, CanonicalBreadcrumbKind,
+    ResolvedAgentAction, TrustState, plan_action, render_untrusted_context_pack,
+};
 use sctx_domain::{
     Applicability, ConflictParticipant, ConflictResolutionDraft, ConflictResolutionResult,
     ContextGovernanceStatus, ContextId, ContextKind, ContextRevisionDraft, DomainProjection, Error,
@@ -19,7 +30,7 @@ use sctx_git_store::{AppendOutcome, AppendRequest, BatchId, GitStore};
 use sctx_index::{
     DomainSnapshot, IndexMetadata, ProjectionDiagnosticView, ProjectionIndex, RebuildOutcome,
 };
-use sctx_local_state::UserConfigStore;
+use sctx_local_state::{Breadcrumb, BreadcrumbKind, CaptureStore, UserConfigStore};
 use sctx_search::{
     ContextPackMode, ContextPackRequest, ContextStatus, ScopeFilter, SearchEngine, SearchFilters,
     SearchRequest,
@@ -41,6 +52,8 @@ Commands:
   index rebuild|status
   pending list|commit|move-aside
   validate --staged
+  hook --agent cursor|codex
+  hook --agent cursor|codex --capabilities [probe options]
   mcp serve --client cursor|codex
 
 Global options:
@@ -120,8 +133,205 @@ fn run(args: &[String], json_output: bool) -> Result<()> {
         [group, rest @ ..] if group == "index" => run_index(rest, json_output),
         [group, rest @ ..] if group == "pending" => run_pending(rest, json_output),
         [command, rest @ ..] if command == "validate" => run_validate(rest, json_output),
+        [command, rest @ ..] if command == "hook" => run_hook(rest),
         [group, rest @ ..] if group == "mcp" => run_mcp(rest),
         _ => Err(invalid(format!("unknown command\n\n{HELP}"))),
+    }
+}
+
+fn run_hook(args: &[String]) -> Result<()> {
+    let options = Options::parse(args, &["--capabilities"])?;
+    options.allow_only(
+        &["--agent", "--agent-version", "--hook-available", "--trust"],
+        &["--capabilities"],
+    )?;
+    let agent = options.required("--agent")?;
+    if !matches!(agent, "cursor" | "codex") {
+        return Err(invalid(format!(
+            "unsupported hook agent {agent:?}; expected cursor or codex"
+        )));
+    }
+
+    if options.has("--capabilities") {
+        let version = options
+            .optional("--agent-version")?
+            .map(str::to_owned)
+            .or_else(|| detect_agent_version(agent));
+        let hook_available = options
+            .optional("--hook-available")?
+            .map(parse_bool)
+            .transpose()?
+            .unwrap_or_else(|| version.is_some());
+        let trust = parse_trust(agent, options.optional("--trust")?, false)?;
+        let report = agent_capabilities(agent, version.as_deref(), hook_available, trust);
+        println!(
+            "{}",
+            serde_json::to_string(&report).map_err(json_error("serialize Agent capabilities"))?
+        );
+        return Ok(());
+    }
+
+    if options.optional("--hook-available")?.is_some() || options.optional("--trust")?.is_some() {
+        return Err(invalid(
+            "--hook-available and --trust are probe-only options used with --capabilities",
+        ));
+    }
+    let mut input = Vec::new();
+    io::stdin()
+        .read_to_end(&mut input)
+        .map_err(|error| Error::new(ErrorKind::Io, format!("read hook stdin: {error}")))?;
+    if input.is_empty() {
+        return Err(invalid("hook stdin must contain one JSON payload"));
+    }
+
+    let (event, version) = if agent == "cursor" {
+        let (event, payload_version) = sctx_adapter_cursor::decode_hook_input(&input)?;
+        (event, Some(payload_version))
+    } else {
+        let event = sctx_adapter_codex::decode_hook_input(&input)?;
+        let version = options
+            .optional("--agent-version")?
+            .map(str::to_owned)
+            .or_else(|| detect_agent_version(agent));
+        (event, version)
+    };
+    let trust = parse_trust(agent, None, true)?;
+    let capabilities = agent_capabilities(agent, version.as_deref(), true, trust);
+    let action = plan_action(&event, &capabilities);
+    let resolved = resolve_hook_action(&event, action)?;
+    let output = if agent == "cursor" {
+        sctx_adapter_cursor::encode_hook_output(event.kind(), &resolved)?
+    } else {
+        sctx_adapter_codex::encode_hook_output(event.kind(), &resolved)?
+    };
+    println!(
+        "{}",
+        String::from_utf8(output).map_err(|error| {
+            Error::new(ErrorKind::Io, format!("hook output is not UTF-8: {error}"))
+        })?
+    );
+    if !capabilities.hooks_verified() {
+        eprintln!("{}", capabilities.diagnostic);
+    }
+    Ok(())
+}
+
+fn agent_capabilities(
+    agent: &str,
+    version: Option<&str>,
+    hook_available: bool,
+    trust: TrustState,
+) -> AgentCapabilities {
+    if agent == "cursor" {
+        sctx_adapter_cursor::capabilities(version, hook_available)
+    } else {
+        sctx_adapter_codex::capabilities(version, hook_available, trust)
+    }
+}
+
+fn resolve_hook_action(
+    event: &CanonicalAgentEvent,
+    action: CanonicalAgentAction,
+) -> Result<ResolvedAgentAction> {
+    if let Some(breadcrumb) = action.breadcrumb {
+        CaptureStore::initialize(installation_root()?)?.capture(&Breadcrumb {
+            kind: match breadcrumb.kind {
+                CanonicalBreadcrumbKind::ToolOutcome => BreadcrumbKind::ToolOutcome,
+                CanonicalBreadcrumbKind::Checkpoint => BreadcrumbKind::Checkpoint,
+            },
+            summary: breadcrumb.summary,
+            workspace_hint: breadcrumb.workspace_hint,
+            file_hints: breadcrumb.file_hints,
+        })?;
+    }
+    let additional_context = action
+        .context_query
+        .map(|query| automatic_hook_context(event, query))
+        .transpose()?;
+    Ok(ResolvedAgentAction {
+        additional_context,
+        system_message: action.system_message,
+    })
+}
+
+fn automatic_hook_context(event: &CanonicalAgentEvent, query: String) -> Result<String> {
+    let root = installation_root()?;
+    let runtime = Runtime::open()?;
+    let preferred_space_id = preferred_space_for_event(&root, event)?;
+    let pack = SearchEngine::new(runtime.index).context_pack(&ContextPackRequest::automatic(
+        SearchRequest {
+            query,
+            filters: SearchFilters::default(),
+            preferred_space_id,
+            page_size: 100,
+            cursor: None,
+        },
+        2_000,
+    ))?;
+    let pack = render_untrusted_context_pack(&pack)?;
+    Ok(format!(
+        concat!(
+            "Shared Context MCP is available for explicit search/get/propose; use context_for_task for additional task-specific retrieval.\n",
+            "{}"
+        ),
+        pack
+    ))
+}
+
+fn preferred_space_for_event(root: &Path, event: &CanonicalAgentEvent) -> Result<Option<SpaceId>> {
+    let config = UserConfigStore::initialize(root)?;
+    for workspace in event
+        .context()
+        .workspace_roots
+        .iter()
+        .chain(std::iter::once(&event.context().cwd))
+    {
+        if workspace.exists() {
+            if let Some(hint) = config.query_hint(workspace)? {
+                return Ok(Some(hint.space_id()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn detect_agent_version(agent: &str) -> Option<String> {
+    let executable = if agent == "cursor" { "cursor" } else { "codex" };
+    let output = Command::new(executable).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_bool(value: &str) -> Result<bool> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(invalid(format!(
+            "invalid boolean {value:?}; expected true or false"
+        ))),
+    }
+}
+
+fn parse_trust(agent: &str, value: Option<&str>, running_hook: bool) -> Result<TrustState> {
+    if agent == "cursor" {
+        if value.is_some() {
+            return Err(invalid("--trust applies only to Codex"));
+        }
+        return Ok(TrustState::NotRequired);
+    }
+    match value {
+        Some("confirmed") => Ok(TrustState::Confirmed),
+        Some("unconfirmed") => Ok(TrustState::Unconfirmed),
+        Some(value) => Err(invalid(format!(
+            "invalid Codex trust state {value:?}; expected confirmed or unconfirmed"
+        ))),
+        None if running_hook => Ok(TrustState::Confirmed),
+        None => Ok(TrustState::Unconfirmed),
     }
 }
 

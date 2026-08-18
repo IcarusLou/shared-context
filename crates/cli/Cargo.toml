@@ -11,6 +11,7 @@ name = "sctx"
 path = "src/main.rs"
 
 [dependencies]
+sctx-agent-adapter.workspace = true
 sctx-adapter-codex.workspace = true
 sctx-adapter-cursor.workspace = true
 sctx-domain.workspace = true

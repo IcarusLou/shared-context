@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fs, path::PathBuf, process::Command};
 
-const MEMBERS: [(&str, u8); 11] = [
+const MEMBERS: [(&str, u8); 12] = [
     ("domain", 0),
     ("local-state", 1),
     ("event-schema", 1),
@@ -8,10 +8,11 @@ const MEMBERS: [(&str, u8); 11] = [
     ("index", 3),
     ("search", 4),
     ("mcp", 5),
-    ("adapter-cursor", 5),
-    ("adapter-codex", 5),
-    ("installer", 6),
-    ("cli", 7),
+    ("agent-adapter", 5),
+    ("adapter-cursor", 6),
+    ("adapter-codex", 6),
+    ("installer", 7),
+    ("cli", 8),
 ];
 
 fn workspace_root() -> PathBuf {
@@ -76,6 +77,8 @@ fn source_asset_trees_are_not_ignored() {
     for path in [
         "schemas/README.md",
         "fixtures/README.md",
+        "fixtures/agents/cursor-3.13.json",
+        "fixtures/agents/codex-0.147.json",
         "npm/packages/README.md",
     ] {
         let status = Command::new("git")

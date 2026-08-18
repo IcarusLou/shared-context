@@ -1,16 +1,17 @@
 [package]
-name = "sctx-adapter-codex"
-description = "Shared Context Codex hook and configuration adapter boundary"
+name = "sctx-agent-adapter"
+description = "Shared canonical Agent event, capability, action, and safe Context Pack boundary"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sctx-agent-adapter.workspace = true
 sctx-domain.workspace = true
+sctx-search.workspace = true
 
 [lints]
 workspace = true

@@ -1,0 +1,62 @@
+[
+  {
+    "session_id": "thr_real_shape_01",
+    "transcript_path": "/workspace/.codex/rollout.jsonl",
+    "cwd": "/workspace/shared context",
+    "hook_event_name": "SessionStart",
+    "model": "gpt-5.6-sol",
+    "permission_mode": "default",
+    "source": "startup"
+  },
+  {
+    "session_id": "thr_real_shape_01",
+    "transcript_path": "/workspace/.codex/rollout.jsonl",
+    "cwd": "/workspace/shared context",
+    "hook_event_name": "UserPromptSubmit",
+    "model": "gpt-5.6-sol",
+    "permission_mode": "default",
+    "turn_id": "turn_01",
+    "prompt": "implement the adapter"
+  },
+  {
+    "session_id": "thr_real_shape_01",
+    "transcript_path": "/workspace/.codex/rollout.jsonl",
+    "cwd": "/workspace/shared context",
+    "hook_event_name": "PostToolUse",
+    "model": "gpt-5.6-sol",
+    "permission_mode": "default",
+    "turn_id": "turn_01",
+    "tool_name": "apply_patch",
+    "tool_use_id": "call_01",
+    "tool_input": {"command":"*** Begin Patch","file_path":"/workspace/shared context/src/lib.rs"},
+    "tool_response": {"output":"Done!"}
+  },
+  {
+    "session_id": "thr_real_shape_01",
+    "transcript_path": "/workspace/.codex/rollout.jsonl",
+    "cwd": "/workspace/shared context",
+    "hook_event_name": "PreCompact",
+    "model": "gpt-5.6-sol",
+    "turn_id": "turn_01",
+    "trigger": "auto"
+  },
+  {
+    "session_id": "thr_real_shape_01",
+    "transcript_path": "/workspace/.codex/rollout.jsonl",
+    "cwd": "/workspace/shared context",
+    "hook_event_name": "Stop",
+    "model": "gpt-5.6-sol",
+    "permission_mode": "default",
+    "turn_id": "turn_01",
+    "stop_hook_active": false,
+    "last_assistant_message": "Implemented and tested."
+  },
+  {
+    "session_id": "thr_real_shape_01",
+    "transcript_path": "/workspace/.codex/rollout.jsonl",
+    "cwd": "/workspace/shared context",
+    "hook_event_name": "SessionEnd",
+    "model": "gpt-5.6-sol",
+    "reason": "other"
+  }
+]
