@@ -7,9 +7,18 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+fs2 = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 sctx-domain.workspace = true
 sctx-event-schema.workspace = true
 sctx-git-store.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.20"
 
 [lints]
 workspace = true
