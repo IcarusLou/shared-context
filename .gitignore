@@ -1,0 +1,12 @@
+# Rust build output.
+/target/
+**/*.rs.bk
+
+# Local editor and operating-system metadata.
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Keep schemas/, fixtures/, and npm/ source trees tracked. Add narrow build-output
+# rules here when those trees gain generated artifacts; do not ignore them wholesale.

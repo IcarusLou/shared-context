@@ -1,0 +1,14 @@
+[package]
+name = "sctx-search"
+description = "Shared Context structured search and context-pack boundary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sctx-domain.workspace = true
+sctx-index.workspace = true
+
+[lints]
+workspace = true

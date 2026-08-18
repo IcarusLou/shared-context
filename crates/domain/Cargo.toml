@@ -1,0 +1,10 @@
+[package]
+name = "sctx-domain"
+description = "Shared Context domain primitives and cross-workspace error types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

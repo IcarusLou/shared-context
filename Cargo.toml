@@ -1,0 +1,41 @@
+[workspace]
+members = [
+    "crates/domain",
+    "crates/event-schema",
+    "crates/git-store",
+    "crates/index",
+    "crates/search",
+    "crates/mcp",
+    "crates/adapter-cursor",
+    "crates/adapter-codex",
+    "crates/installer",
+    "crates/cli",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+sctx-adapter-codex = { path = "crates/adapter-codex" }
+sctx-adapter-cursor = { path = "crates/adapter-cursor" }
+sctx-domain = { path = "crates/domain" }
+sctx-event-schema = { path = "crates/event-schema" }
+sctx-git-store = { path = "crates/git-store" }
+sctx-index = { path = "crates/index" }
+sctx-installer = { path = "crates/installer" }
+sctx-mcp = { path = "crates/mcp" }
+sctx-search = { path = "crates/search" }
+
+[workspace.lints.rust]
+rust_2018_idioms = { level = "deny", priority = -1 }
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"

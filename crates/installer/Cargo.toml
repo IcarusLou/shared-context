@@ -1,0 +1,15 @@
+[package]
+name = "sctx-installer"
+description = "Shared Context setup, doctor, backup, and uninstall boundary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sctx-adapter-codex.workspace = true
+sctx-adapter-cursor.workspace = true
+sctx-domain.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "sctx-cli"
+description = "Shared Context command-line entry point"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "sctx"
+path = "src/main.rs"
+
+[dependencies]
+sctx-adapter-codex.workspace = true
+sctx-adapter-cursor.workspace = true
+sctx-domain.workspace = true
+sctx-event-schema.workspace = true
+sctx-git-store.workspace = true
+sctx-index.workspace = true
+sctx-installer.workspace = true
+sctx-mcp.workspace = true
+sctx-search.workspace = true
+
+[lints]
+workspace = true

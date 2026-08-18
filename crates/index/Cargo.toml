@@ -1,0 +1,15 @@
+[package]
+name = "sctx-index"
+description = "Shared Context rebuildable SQLite projection boundary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sctx-domain.workspace = true
+sctx-event-schema.workspace = true
+sctx-git-store.workspace = true
+
+[lints]
+workspace = true
