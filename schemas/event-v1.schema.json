@@ -1,0 +1,406 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://shared-context.local/schemas/event-v1.schema.json",
+  "title": "Shared Context V1 Event",
+  "description": "Immutable Shared Context event envelope. Annotations are explicitly non-authoritative.",
+  "type": "object",
+  "required": ["schema_version", "event_id", "event_type"],
+  "properties": {
+    "schema_version": { "const": "1" },
+    "event_id": { "$ref": "#/$defs/event_id" },
+    "event_type": {
+      "enum": [
+        "space.created",
+        "space.intent_revision_added",
+        "context.revision_added",
+        "context.reviewed",
+        "context.publication_changed",
+        "semantic_conflict.opened",
+        "semantic_conflict.resolution_added"
+      ]
+    },
+    "annotations": { "$ref": "#/$defs/annotations" }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "event_type": { "const": "space.created" },
+        "space_id": { "$ref": "#/$defs/space_id" },
+        "intent_revision": { "$ref": "#/$defs/initial_intent_revision" }
+      },
+      "required": ["space_id", "intent_revision"]
+    },
+    {
+      "properties": {
+        "event_type": { "const": "space.intent_revision_added" },
+        "space_id": { "$ref": "#/$defs/space_id" },
+        "intent_revision": { "$ref": "#/$defs/added_intent_revision" }
+      },
+      "required": ["space_id", "intent_revision"]
+    },
+    {
+      "properties": {
+        "event_type": { "const": "context.revision_added" },
+        "space_id": { "$ref": "#/$defs/space_id" },
+        "context_id": { "$ref": "#/$defs/context_id" },
+        "revision": { "$ref": "#/$defs/context_revision" }
+      },
+      "required": ["space_id", "context_id", "revision"]
+    },
+    {
+      "properties": {
+        "event_type": { "const": "context.reviewed" },
+        "space_id": { "$ref": "#/$defs/space_id" },
+        "context_id": { "$ref": "#/$defs/context_id" },
+        "review": { "$ref": "#/$defs/review" }
+      },
+      "required": ["space_id", "context_id", "review"]
+    },
+    {
+      "properties": {
+        "event_type": { "const": "context.publication_changed" },
+        "space_id": { "$ref": "#/$defs/space_id" },
+        "context_id": { "$ref": "#/$defs/context_id" },
+        "publication": { "$ref": "#/$defs/publication" }
+      },
+      "required": ["space_id", "context_id", "publication"]
+    },
+    {
+      "properties": {
+        "event_type": { "const": "semantic_conflict.opened" },
+        "space_id": { "$ref": "#/$defs/space_id" },
+        "conflict": { "$ref": "#/$defs/semantic_conflict" }
+      },
+      "required": ["space_id", "conflict"]
+    },
+    {
+      "properties": {
+        "event_type": { "const": "semantic_conflict.resolution_added" },
+        "space_id": { "$ref": "#/$defs/space_id" },
+        "conflict_id": { "$ref": "#/$defs/conflict_id" },
+        "resolution": { "$ref": "#/$defs/conflict_resolution" }
+      },
+      "required": ["space_id", "conflict_id", "resolution"]
+    }
+  ],
+  "unevaluatedProperties": false,
+  "$defs": {
+    "non_empty_string": {
+      "type": "string",
+      "minLength": 1
+    },
+    "string_list": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/non_empty_string" }
+    },
+    "space_id": {
+      "type": "string",
+      "pattern": "^spc_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "context_id": {
+      "type": "string",
+      "pattern": "^ctx_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "revision_id": {
+      "type": "string",
+      "pattern": "^rev_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "event_id": {
+      "type": "string",
+      "pattern": "^evt_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "publication_id": {
+      "type": "string",
+      "pattern": "^pub_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "evidence_id": {
+      "type": "string",
+      "pattern": "^evd_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "review_id": {
+      "type": "string",
+      "pattern": "^rvw_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "conflict_id": {
+      "type": "string",
+      "pattern": "^cnf_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "resolution_id": {
+      "type": "string",
+      "pattern": "^rsl_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "origin_hint": {
+      "type": "object",
+      "description": "Non-authoritative and extensible development-location hints.",
+      "additionalProperties": true
+    },
+    "annotations": {
+      "type": "object",
+      "description": "Non-authoritative metadata excluded from semantic hashes and projection semantics.",
+      "properties": {
+        "created_at": { "type": "string" },
+        "producer": { "type": "string" },
+        "origin_hint": { "$ref": "#/$defs/origin_hint" }
+      },
+      "additionalProperties": true
+    },
+    "intent": {
+      "type": "object",
+      "required": [
+        "title",
+        "problem",
+        "desired_outcome",
+        "in_scope",
+        "out_of_scope",
+        "acceptance_conditions",
+        "domain_terms"
+      ],
+      "properties": {
+        "title": { "$ref": "#/$defs/non_empty_string" },
+        "problem": { "$ref": "#/$defs/non_empty_string" },
+        "desired_outcome": { "$ref": "#/$defs/non_empty_string" },
+        "in_scope": {
+          "allOf": [
+            { "$ref": "#/$defs/string_list" },
+            { "minItems": 1 }
+          ]
+        },
+        "out_of_scope": { "$ref": "#/$defs/string_list" },
+        "acceptance_conditions": {
+          "allOf": [
+            { "$ref": "#/$defs/string_list" },
+            { "minItems": 1 }
+          ]
+        },
+        "domain_terms": { "$ref": "#/$defs/string_list" }
+      },
+      "additionalProperties": false
+    },
+    "initial_intent_revision": {
+      "type": "object",
+      "required": ["revision_id", "parent_revision_ids", "intent"],
+      "properties": {
+        "revision_id": { "$ref": "#/$defs/revision_id" },
+        "parent_revision_ids": {
+          "type": "array",
+          "maxItems": 0,
+          "items": { "$ref": "#/$defs/revision_id" }
+        },
+        "intent": { "$ref": "#/$defs/intent" }
+      },
+      "additionalProperties": false
+    },
+    "added_intent_revision": {
+      "type": "object",
+      "required": ["revision_id", "parent_revision_ids", "intent"],
+      "properties": {
+        "revision_id": { "$ref": "#/$defs/revision_id" },
+        "parent_revision_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/revision_id" }
+        },
+        "intent": { "$ref": "#/$defs/intent" }
+      },
+      "additionalProperties": false
+    },
+    "applicability": {
+      "type": "object",
+      "required": ["domains", "platforms", "conditions"],
+      "properties": {
+        "domains": { "$ref": "#/$defs/string_list" },
+        "platforms": { "$ref": "#/$defs/string_list" },
+        "conditions": { "$ref": "#/$defs/string_list" }
+      },
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "required": [
+        "evidence_id",
+        "kind",
+        "supports",
+        "content",
+        "interpretation",
+        "limitations"
+      ],
+      "properties": {
+        "evidence_id": { "$ref": "#/$defs/evidence_id" },
+        "kind": {
+          "enum": ["source_snapshot", "experiment_record", "artifact_snapshot"]
+        },
+        "supports": { "$ref": "#/$defs/non_empty_string" },
+        "content": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": true
+        },
+        "interpretation": { "$ref": "#/$defs/non_empty_string" },
+        "limitations": { "$ref": "#/$defs/string_list" }
+      },
+      "additionalProperties": false
+    },
+    "context_revision": {
+      "type": "object",
+      "required": [
+        "revision_id",
+        "parent_revision_ids",
+        "kind",
+        "statement",
+        "rationale",
+        "applicability",
+        "assumptions",
+        "recheck_when",
+        "evidence"
+      ],
+      "properties": {
+        "revision_id": { "$ref": "#/$defs/revision_id" },
+        "parent_revision_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/revision_id" }
+        },
+        "kind": {
+          "enum": [
+            "decision",
+            "contract",
+            "issue",
+            "risk",
+            "validation",
+            "discovery",
+            "progress"
+          ]
+        },
+        "topic_key": { "$ref": "#/$defs/non_empty_string" },
+        "statement": { "$ref": "#/$defs/non_empty_string" },
+        "rationale": { "$ref": "#/$defs/non_empty_string" },
+        "applicability": { "$ref": "#/$defs/applicability" },
+        "assumptions": { "$ref": "#/$defs/string_list" },
+        "recheck_when": { "$ref": "#/$defs/string_list" },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/evidence" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": { "enum": ["decision", "contract"] }
+            },
+            "required": ["kind"]
+          },
+          "then": { "required": ["topic_key"] }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "review": {
+      "type": "object",
+      "required": ["review_id", "revision_id", "verdict", "reason"],
+      "properties": {
+        "review_id": { "$ref": "#/$defs/review_id" },
+        "revision_id": { "$ref": "#/$defs/revision_id" },
+        "verdict": { "enum": ["approve", "reject"] },
+        "reason": { "$ref": "#/$defs/non_empty_string" }
+      },
+      "additionalProperties": false
+    },
+    "publication": {
+      "type": "object",
+      "required": [
+        "publication_id",
+        "previous_publication_ids",
+        "action",
+        "revision_id",
+        "review_event_ids"
+      ],
+      "properties": {
+        "publication_id": { "$ref": "#/$defs/publication_id" },
+        "previous_publication_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/publication_id" }
+        },
+        "action": { "enum": ["publish", "withdraw"] },
+        "revision_id": { "$ref": "#/$defs/revision_id" },
+        "review_event_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/event_id" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "conflict_participant": {
+      "type": "object",
+      "required": ["context_id", "revision_id", "publication_id"],
+      "properties": {
+        "context_id": { "$ref": "#/$defs/context_id" },
+        "revision_id": { "$ref": "#/$defs/revision_id" },
+        "publication_id": { "$ref": "#/$defs/publication_id" }
+      },
+      "additionalProperties": false
+    },
+    "semantic_conflict": {
+      "type": "object",
+      "required": ["conflict_id", "participants", "reason", "applicability"],
+      "properties": {
+        "conflict_id": { "$ref": "#/$defs/conflict_id" },
+        "participants": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/conflict_participant" }
+        },
+        "reason": { "$ref": "#/$defs/non_empty_string" },
+        "applicability": { "$ref": "#/$defs/applicability" }
+      },
+      "additionalProperties": false
+    },
+    "resolution_result": {
+      "type": "object",
+      "required": ["context_id", "revision_id", "outcome"],
+      "properties": {
+        "context_id": { "$ref": "#/$defs/context_id" },
+        "revision_id": { "$ref": "#/$defs/revision_id" },
+        "outcome": { "enum": ["retained", "revised", "withdrawn", "scope_split"] }
+      },
+      "additionalProperties": false
+    },
+    "conflict_resolution": {
+      "type": "object",
+      "required": [
+        "resolution_id",
+        "previous_resolution_ids",
+        "related_publication_ids",
+        "results",
+        "rationale"
+      ],
+      "properties": {
+        "resolution_id": { "$ref": "#/$defs/resolution_id" },
+        "previous_resolution_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/resolution_id" }
+        },
+        "related_publication_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/publication_id" }
+        },
+        "results": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/resolution_result" }
+        },
+        "rationale": { "$ref": "#/$defs/non_empty_string" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

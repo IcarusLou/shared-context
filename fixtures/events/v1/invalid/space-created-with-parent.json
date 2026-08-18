@@ -1,0 +1,19 @@
+{
+  "schema_version": "1",
+  "event_id": "evt_00000000-0000-4000-8000-000000000010",
+  "event_type": "space.created",
+  "space_id": "spc_11111111-1111-4111-8111-111111111111",
+  "intent_revision": {
+    "revision_id": "rev_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+    "parent_revision_ids": ["rev_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa9"],
+    "intent": {
+      "title": "Invalid initial intent",
+      "problem": "Initial intent claims a parent",
+      "desired_outcome": "Reject the event",
+      "in_scope": ["validation"],
+      "out_of_scope": [],
+      "acceptance_conditions": ["parse fails"],
+      "domain_terms": []
+    }
+  }
+}

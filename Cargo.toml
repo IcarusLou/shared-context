@@ -20,6 +20,9 @@ rust-version = "1.85"
 publish = false
 
 [workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
 sctx-adapter-codex = { path = "crates/adapter-codex" }
 sctx-adapter-cursor = { path = "crates/adapter-cursor" }
 sctx-domain = { path = "crates/domain" }
@@ -29,6 +32,7 @@ sctx-index = { path = "crates/index" }
 sctx-installer = { path = "crates/installer" }
 sctx-mcp = { path = "crates/mcp" }
 sctx-search = { path = "crates/search" }
+uuid = { version = "1.18", features = ["v4"] }
 
 [workspace.lints.rust]
 rust_2018_idioms = { level = "deny", priority = -1 }

@@ -1,8 +1,23 @@
-//! Domain primitives shared by every Shared Context component.
+//! Stable identifiers and authoritative V1 domain snapshots.
 //!
-//! The workspace skeleton intentionally defines no domain events or reducers yet.
+//! This crate deliberately contains no storage, reducer, Git, or `SQLite` behavior.
 
 use std::fmt;
+
+mod ids;
+mod model;
+
+pub use ids::{
+    ConflictId, ContextId, EventId, EvidenceId, IdParseError, PublicationId, ResolutionId,
+    ReviewId, RevisionId, SpaceId,
+};
+pub use model::{
+    Applicability, ConflictParticipant, ConflictResolution, ConflictResolutionDraft,
+    ConflictResolutionResult, ContextKind, ContextRevision, ContextRevisionDraft, EvidenceSnapshot,
+    EvidenceSnapshotDraft, EvidenceType, IntentRevision, IntentSnapshot, Publication,
+    PublicationAction, PublicationDraft, ResolutionOutcome, Review, ReviewDraft, ReviewVerdict,
+    SemanticConflict, SemanticConflictDraft,
+};
 
 /// Broad categories used to route recoverable errors across crate boundaries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

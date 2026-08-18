@@ -1,0 +1,28 @@
+{
+  "schema_version": "1",
+  "event_id": "evt_00000000-0000-4000-8000-000000000001",
+  "event_type": "space.created",
+  "space_id": "spc_11111111-1111-4111-8111-111111111111",
+  "intent_revision": {
+    "revision_id": "rev_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+    "parent_revision_ids": [],
+    "intent": {
+      "title": "Share verified engineering context",
+      "problem": "Agents repeatedly rediscover the same facts",
+      "desired_outcome": "Verified context survives workspaces and sessions",
+      "in_scope": ["immutable event contract"],
+      "out_of_scope": ["external issue identity"],
+      "acceptance_conditions": ["events remain self-contained"],
+      "domain_terms": ["ContextSpace", "IntentRevision"]
+    }
+  },
+  "annotations": {
+    "created_at": "2026-08-18T12:00:00+08:00",
+    "producer": "fixture",
+    "origin_hint": {
+      "workspace_alias": "shared-context",
+      "development_commit": "not-authoritative"
+    },
+    "trace_label": "ignored-by-domain"
+  }
+}

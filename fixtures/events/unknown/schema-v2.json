@@ -1,0 +1,9 @@
+{
+  "schema_version": "2",
+  "event_id": "evt_future-format-is-not-v1-validated",
+  "event_type": "context.reimagined",
+  "future_payload": {
+    "must_be_preserved": true,
+    "unknown_shape": [1, 2, 3]
+  }
+}

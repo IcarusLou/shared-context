@@ -1,5 +1,9 @@
 # Fixtures
 
-此目录保留跨 crate 的契约测试输入。后续事件、Cursor Hook 和 Codex Hook fixture 应按来源建立子目录，并作为只读输入提交；测试不得修改 fixture 原文件。
+此目录保留跨 crate 的只读契约测试输入；测试不得修改原文件。
 
-当前阶段不添加领域事件或真实 Agent payload，以免在对应 schema/adapter 设计完成前固化错误格式。
+- `events/v1/valid/`：V1 七类事件各一个合法、可 round-trip 的样例。
+- `events/v1/invalid/`：缺失必填字段、未知权威字段、非法 ID 与 payload 局部不变量。
+- `events/unknown/`：Reader 必须原样保留并隔离的未知 Schema 输入。
+
+后续协议演进应新增版本目录，不得改写已经发布的 fixture 合同。
