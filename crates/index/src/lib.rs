@@ -17,21 +17,23 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 mod git_tree;
 mod project;
 mod schema;
+mod tokenizer;
 
 pub use sctx_domain::{Error, ErrorKind, Result};
+pub use tokenizer::{normalize_search_text, search_tokens};
 
 /// Current physical `SQLite` schema version.
-pub const DB_SCHEMA_VERSION: &str = "2";
+pub const DB_SCHEMA_VERSION: &str = "3";
 /// Event parser implementation version recorded in every projection.
 pub const EVENT_PARSER_VERSION: &str = "1";
 /// Pure reducer implementation version recorded in every projection.
 pub const REDUCER_VERSION: &str = "1";
 /// Conflict detector implementation version recorded in every projection.
 pub const CONFLICT_DETECTOR_VERSION: &str = "1";
-/// Token normalization is intentionally deferred; `0` makes that boundary explicit.
-pub const NORMALIZER_TOKENIZER_VERSION: &str = "0";
-/// Search ranking is intentionally deferred; `0` makes that boundary explicit.
-pub const SEARCH_RANKING_VERSION: &str = "0";
+/// NFKC, full Unicode case-folding, identifier splitting, and CJK bigram implementation.
+pub const NORMALIZER_TOKENIZER_VERSION: &str = "1";
+/// Structured-filter, weighted-BM25, evidence, and stable-ID ranking implementation.
+pub const SEARCH_RANKING_VERSION: &str = "1";
 
 pub(crate) const IMPLEMENTATION_VERSIONS: [(&str, &str); 6] = [
     ("db_schema_version", DB_SCHEMA_VERSION),

@@ -15,6 +15,8 @@ sha2.workspace = true
 sctx-domain.workspace = true
 sctx-event-schema.workspace = true
 sctx-git-store.workspace = true
+unicode-casefold = "0.2"
+unicode-normalization = "0.1"
 uuid.workspace = true
 
 [dev-dependencies]

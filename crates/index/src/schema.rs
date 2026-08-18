@@ -5,7 +5,7 @@ use sctx_domain::{
 use sctx_event_schema::{EvidenceType, ReviewVerdict};
 
 use crate::{
-    IMPLEMENTATION_VERSIONS,
+    IMPLEMENTATION_VERSIONS, normalize_search_text,
     project::{BuildInput, ProjectionDiagnostic},
     sql_error,
 };
@@ -65,6 +65,7 @@ pub(crate) fn replace_projection(
             ))
             .map_err(sql_error("activate shadow projection table"))?;
     }
+    create_indexes(transaction)?;
     Ok(())
 }
 
@@ -152,6 +153,7 @@ CREATE TABLE {prefix}context_revision (
     recheck_when_json TEXT NOT NULL,
     review_summary TEXT NOT NULL,
     lifecycle TEXT NOT NULL,
+    evidence_completeness INTEGER NOT NULL CHECK (evidence_completeness BETWEEN 0 AND 1000),
     is_head INTEGER NOT NULL CHECK (is_head IN (0, 1))
 ) WITHOUT ROWID;
 CREATE TABLE {prefix}review (
@@ -249,6 +251,35 @@ fn drop_tables(transaction: &Transaction<'_>, prefix: &str) -> crate::Result<()>
             .map_err(sql_error("drop projection table"))?;
     }
     Ok(())
+}
+
+fn create_indexes(transaction: &Transaction<'_>) -> crate::Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE INDEX context_revision_context_status_idx
+                 ON context_revision(context_id, lifecycle, revision_id);
+             CREATE INDEX context_revision_space_kind_status_idx
+                 ON context_revision(space_id, kind, lifecycle, revision_id);
+             CREATE INDEX context_revision_lifecycle_idx
+                 ON context_revision(lifecycle, revision_id);
+             CREATE INDEX context_revision_stable_rank_idx
+                 ON context_revision(
+                   lifecycle, evidence_completeness DESC, context_id, revision_id
+                 );
+             CREATE INDEX context_item_space_governance_idx
+                 ON context_item(space_id, governance_status, auto_injection_eligible, context_id);
+             CREATE INDEX evidence_revision_idx
+                 ON evidence(revision_id, evidence_id);
+             CREATE INDEX scope_lookup_idx
+                 ON scope(dimension, value, revision_id);
+             CREATE INDEX semantic_conflict_status_idx
+                 ON semantic_conflict(status, conflict_id);
+             CREATE INDEX conflict_context_status_idx
+                 ON conflict(context_id, kind, status, conflict_key);
+             CREATE INDEX publication_head_context_idx
+                 ON publication_head(context_id, publication_id);",
+        )
+        .map_err(sql_error("create projection query indexes"))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -392,7 +423,7 @@ fn populate(
                 transaction
                     .execute(
                         &format!(
-                            "INSERT INTO {prefix}context_revision(revision_id, context_id, space_id, parent_revision_ids_json, kind, topic_key, statement, rationale, applicability_json, assumptions_json, recheck_when_json, review_summary, lifecycle, is_head) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+                            "INSERT INTO {prefix}context_revision(revision_id, context_id, space_id, parent_revision_ids_json, kind, topic_key, statement, rationale, applicability_json, assumptions_json, recheck_when_json, review_summary, lifecycle, evidence_completeness, is_head) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
                         ),
                         params![
                             revision_id.to_string(),
@@ -408,6 +439,7 @@ fn populate(
                             json(&revision.recheck_when)?,
                             enum_text(revision_projection.review_summary),
                             lifecycle_text(revision_projection.lifecycle),
+                            evidence_completeness(&revision.evidence),
                             i64::from(revision_projection.is_head)
                         ],
                     )
@@ -466,10 +498,10 @@ fn populate(
                         params![
                             context_id.to_string(),
                             revision_id.to_string(),
-                            fts_title,
-                            revision.statement,
-                            revision.rationale,
-                            evidence_search.join(" ")
+                            normalize_search_text(&fts_title),
+                            normalize_search_text(&revision.statement),
+                            normalize_search_text(&revision.rationale),
+                            normalize_search_text(&evidence_search.join(" "))
                         ],
                     )
                     .map_err(sql_error("write FTS5 projection"))?;
@@ -830,6 +862,26 @@ fn evidence_text(value: EvidenceType) -> &'static str {
         EvidenceType::ExperimentRecord => "experiment_record",
         EvidenceType::ArtifactSnapshot => "artifact_snapshot",
     }
+}
+
+fn evidence_completeness(evidence: &[sctx_domain::EvidenceSnapshot]) -> i64 {
+    if evidence.is_empty() {
+        return 0;
+    }
+    let total = evidence
+        .iter()
+        .map(|item| {
+            i64::from(!item.supports.trim().is_empty()) * 250
+                + i64::from(
+                    item.content
+                        .as_object()
+                        .is_some_and(|value| !value.is_empty()),
+                ) * 250
+                + i64::from(!item.interpretation.trim().is_empty()) * 250
+                + i64::from(!item.limitations.is_empty()) * 250
+        })
+        .sum::<i64>();
+    total / i64::try_from(evidence.len()).expect("Evidence count fits i64")
 }
 
 fn semantic_status(value: &SemanticConflictStatus) -> &'static str {
