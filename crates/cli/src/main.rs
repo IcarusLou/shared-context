@@ -9,8 +9,10 @@ use std::{
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
-    process::{Command, ExitCode},
+    process::{Command, ExitCode, Stdio},
     str::FromStr,
+    thread,
+    time::{Duration, Instant},
 };
 
 use args::Options;
@@ -43,7 +45,8 @@ const HELP: &str = r"Shared Context command-line interface
 Usage: sctx [--json] <COMMAND>
 
 Commands:
-  setup [--agents cursor,codex] [--root PATH] [--runtime-source PATH]
+  setup [--demo] [--agents cursor,codex] [--root PATH] [--runtime-source PATH]
+  demo [--workspace PATH]
   doctor [--fix] [--root PATH]
   upgrade [--agents cursor,codex] [--root PATH] [--runtime-source PATH]
   uninstall [--root PATH]
@@ -129,6 +132,7 @@ fn run(args: &[String], json_output: bool) -> Result<()> {
         [command, rest @ ..] if command == "setup" => {
             run_install_lifecycle("setup", rest, json_output)
         }
+        [command, rest @ ..] if command == "demo" => run_demo(rest, json_output),
         [command, rest @ ..] if command == "doctor" => run_doctor(rest, json_output),
         [command, rest @ ..] if command == "upgrade" => {
             run_install_lifecycle("upgrade", rest, json_output)
@@ -154,7 +158,7 @@ fn run(args: &[String], json_output: bool) -> Result<()> {
 }
 
 fn run_install_lifecycle(command: &str, args: &[String], json_output: bool) -> Result<()> {
-    let options = Options::parse(args, &["--yes"])?;
+    let options = Options::parse(args, &["--yes", "--demo"])?;
     options.allow_only(
         &[
             "--agents",
@@ -162,8 +166,11 @@ fn run_install_lifecycle(command: &str, args: &[String], json_output: bool) -> R
             "--runtime-source",
             "--runtime-version",
         ],
-        &["--yes"],
+        &["--yes", "--demo"],
     )?;
+    if command != "setup" && options.has("--demo") {
+        return Err(invalid("--demo applies only to setup"));
+    }
     let installer = installer_from_options(&options)?;
     let setup = setup_options(&options)?;
     let report = if command == "setup" {
@@ -171,7 +178,27 @@ fn run_install_lifecycle(command: &str, args: &[String], json_output: bool) -> R
     } else {
         installer.upgrade(&setup)?
     };
-    emit_lifecycle(&report, json_output)
+    if options.has("--demo") {
+        let workspace = env::current_dir().map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("resolve current workspace for demo: {error}"),
+            )
+        })?;
+        let (demo, metadata) = complete_demo(&workspace, &report.root)?;
+        emit(
+            "setup.demo",
+            &metadata,
+            json!({
+                "setup": serde_json::to_value(report)
+                    .map_err(json_error("serialize setup report"))?,
+                "demo": demo,
+            }),
+            json_output,
+        )
+    } else {
+        emit_lifecycle(&report, json_output)
+    }
 }
 
 fn run_doctor(args: &[String], json_output: bool) -> Result<()> {
@@ -299,6 +326,328 @@ fn emit_lifecycle(value: &impl Serialize, json_output: bool) -> Result<()> {
             serde_json::to_string_pretty(value)
                 .map_err(json_error("serialize lifecycle output"))?
         );
+    }
+    Ok(())
+}
+
+const DEMO_MARKER: &str = "sctx.demo.v1";
+const DEMO_TITLE: &str = "Shared Context 三分钟 Demo";
+const DEMO_TOPIC: &str = "shared-context/demo-v1";
+const DEMO_STATEMENT: &str = "Published demo context is searchable through CLI and MCP.";
+const DEMO_QUERY: &str = "searchable CLI MCP";
+
+fn run_demo(args: &[String], json_output: bool) -> Result<()> {
+    let options = Options::parse(args, &[])?;
+    options.allow_only(&["--workspace"], &[])?;
+    let workspace = options
+        .optional("--workspace")?
+        .map_or_else(env::current_dir, |path| Ok(PathBuf::from(path)))
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("resolve current workspace for demo: {error}"),
+            )
+        })?;
+    let root = installation_root()?;
+    let (report, metadata) = complete_demo(&workspace, &root)?;
+    emit("demo", &metadata, report, json_output)
+}
+
+fn demo_intent() -> IntentSnapshot {
+    IntentSnapshot {
+        title: DEMO_TITLE.to_owned(),
+        problem: "New contributors repeatedly rediscover already verified engineering context."
+            .to_owned(),
+        desired_outcome: "A published fact is retrievable from the CLI and both MCP clients."
+            .to_owned(),
+        in_scope: vec!["Space to publication and retrieval loop".to_owned()],
+        out_of_scope: vec!["Remote synchronization".to_owned()],
+        acceptance_conditions: vec![
+            "The fixed demo statement is accepted and searchable.".to_owned(),
+        ],
+        domain_terms: vec![DEMO_MARKER.to_owned()],
+    }
+}
+
+fn demo_context() -> ContextRevisionDraft {
+    ContextRevisionDraft {
+        kind: ContextKind::Validation,
+        topic_key: Some(DEMO_TOPIC.to_owned()),
+        statement: DEMO_STATEMENT.to_owned(),
+        rationale: "The local append-only workflow completed without external services.".to_owned(),
+        applicability: Applicability {
+            domains: vec!["shared-context".to_owned()],
+            platforms: vec!["macos".to_owned()],
+            conditions: vec!["local-demo".to_owned()],
+        },
+        assumptions: vec!["The local Git executable remains available.".to_owned()],
+        recheck_when: vec!["The demo fixture version changes.".to_owned()],
+        evidence: vec![EvidenceSnapshotDraft {
+            kind: EvidenceType::ExperimentRecord,
+            supports: "The demo lifecycle is independently reproducible.".to_owned(),
+            content: json!({
+                "fixture": DEMO_MARKER,
+                "expected_event_types": [
+                    "space.created",
+                    "context.revision_added",
+                    "context.reviewed",
+                    "context.publication_changed"
+                ]
+            }),
+            interpretation: "A fixed black-box oracle can inspect the resulting Git Tree."
+                .to_owned(),
+            limitations: vec!["This demo does not prove remote distribution.".to_owned()],
+        }],
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn complete_demo(workspace: &Path, root: &Path) -> Result<(Value, IndexMetadata)> {
+    let runtime = Runtime::open_at(root)?;
+    let mut created_event_count = 0_usize;
+    let mut snapshot = runtime.domain_snapshot()?;
+    let matching_spaces = snapshot
+        .projection
+        .spaces
+        .values()
+        .filter(|space| {
+            space.intent.revisions.values().any(|revision| {
+                revision.intent.title == DEMO_TITLE
+                    && revision
+                        .intent
+                        .domain_terms
+                        .iter()
+                        .any(|term| term == DEMO_MARKER)
+            })
+        })
+        .map(|space| space.space_id)
+        .collect::<Vec<_>>();
+    let space_id = match matching_spaces.as_slice() {
+        [] => {
+            let event = Event::space_created(demo_intent(), None)?;
+            let space_id = match event.payload() {
+                EventPayload::SpaceCreated { space_id, .. } => *space_id,
+                _ => unreachable!(),
+            };
+            runtime.append(event)?;
+            created_event_count += 1;
+            snapshot = runtime.domain_snapshot()?;
+            space_id
+        }
+        [space_id] => *space_id,
+        _ => {
+            return Err(invariant(format!(
+                "multiple Spaces carry the reserved demo marker {DEMO_MARKER}; remove the ambiguity before retrying"
+            )));
+        }
+    };
+
+    let config = UserConfigStore::initialize(runtime.store.root())?;
+    let binding = config.bind(workspace, space_id)?;
+
+    let space = snapshot
+        .projection
+        .spaces
+        .get(&space_id)
+        .ok_or_else(|| invariant("demo Space disappeared from the current Tree"))?;
+    let matching_revisions = space
+        .contexts
+        .values()
+        .flat_map(|context| {
+            context.revisions.values().filter_map(move |revision| {
+                let value = &revision.revision;
+                (value.topic_key.as_deref() == Some(DEMO_TOPIC)
+                    && value.statement == DEMO_STATEMENT)
+                    .then_some((context.context_id, value.revision_id))
+            })
+        })
+        .collect::<Vec<_>>();
+    let (context_id, revision_id) = match matching_revisions.as_slice() {
+        [] => {
+            let event = Event::context_proposed(space_id, demo_context(), None)?;
+            let identities = context_identity(&event);
+            runtime.append(event)?;
+            created_event_count += 1;
+            snapshot = runtime.domain_snapshot()?;
+            identities
+        }
+        [identities] => *identities,
+        _ => {
+            return Err(invariant(format!(
+                "multiple revisions carry the reserved demo topic {DEMO_TOPIC}; remove the ambiguity before retrying"
+            )));
+        }
+    };
+
+    let revision = require_revision(
+        require_context(&snapshot.projection, space_id, context_id)?,
+        context_id,
+        revision_id,
+    )?;
+    match revision.review_summary {
+        ReviewSummary::Unreviewed => {
+            let event = Event::context_reviewed(
+                space_id,
+                context_id,
+                ReviewDraft {
+                    revision_id,
+                    verdict: ReviewVerdict::Approve,
+                    reason: "The fixed demo fixture matches its independent oracle.".to_owned(),
+                },
+                None,
+            )?;
+            runtime.append(event)?;
+            created_event_count += 1;
+            snapshot = runtime.domain_snapshot()?;
+        }
+        ReviewSummary::Approved => {}
+        ReviewSummary::Rejected | ReviewSummary::Mixed => {
+            return Err(invariant(
+                "the reserved demo revision has a rejecting review; demo will not override governance",
+            ));
+        }
+    }
+
+    let context = require_context(&snapshot.projection, space_id, context_id)?;
+    let revision = require_revision(context, context_id, revision_id)?;
+    match &context.governance {
+        ContextGovernanceStatus::Unpublished => {
+            if !context.publication_heads.is_empty() {
+                return Err(invariant(
+                    "the reserved demo Context has unexpected Publication Heads",
+                ));
+            }
+            let event = Event::publication_changed(
+                space_id,
+                context_id,
+                PublicationDraft {
+                    previous_publication_ids: Vec::new(),
+                    action: PublicationAction::Publish,
+                    revision_id,
+                    review_event_ids: revision.review_event_ids.iter().copied().collect(),
+                },
+                None,
+            )?;
+            runtime.append(event)?;
+            created_event_count += 1;
+            snapshot = runtime.domain_snapshot()?;
+        }
+        ContextGovernanceStatus::Accepted {
+            revision_id: accepted,
+            ..
+        } if *accepted == revision_id => {}
+        state => {
+            return Err(invariant(format!(
+                "the reserved demo Context is not safely publishable: {state:?}"
+            )));
+        }
+    }
+
+    let response = SearchEngine::new(runtime.index.clone()).search(&SearchRequest {
+        query: DEMO_QUERY.to_owned(),
+        filters: SearchFilters {
+            space_ids: vec![space_id],
+            statuses: vec![ContextStatus::Accepted],
+            ..SearchFilters::default()
+        },
+        page_size: 20,
+        ..SearchRequest::default()
+    })?;
+    if !response
+        .results
+        .iter()
+        .any(|result| result.context_id == context_id && result.revision_id == revision_id)
+    {
+        return Err(invariant(
+            "published demo Context was not returned by the fixed CLI search",
+        ));
+    }
+    for client in [sctx_mcp::ClientKind::Cursor, sctx_mcp::ClientKind::Codex] {
+        verify_demo_mcp(runtime.store.root(), client, space_id, context_id)?;
+    }
+
+    let context = require_context(&snapshot.projection, space_id, context_id)?;
+    let revision = require_revision(context, context_id, revision_id)?;
+    Ok((
+        json!({
+            "repository": runtime.store.repository(),
+            "workspace": binding.workspace(),
+            "space_id": space_id,
+            "context_id": context_id,
+            "revision_id": revision_id,
+            "review_event_ids": revision.review_event_ids,
+            "publication_head_ids": context.publication_heads,
+            "query": DEMO_QUERY,
+            "search_match_count": response.results.len(),
+            "mcp_clients": ["cursor", "codex"],
+            "created_event_count": created_event_count,
+        }),
+        snapshot.metadata,
+    ))
+}
+
+fn verify_demo_mcp(
+    root: &Path,
+    client: sctx_mcp::ClientKind,
+    space_id: SpaceId,
+    context_id: ContextId,
+) -> Result<()> {
+    let requests = [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "protocolVersion":"2024-11-05","capabilities":{},
+            "clientInfo":{"name":format!("{client:?}"),"version":"demo"}
+        }}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+            "name":"context_search","arguments":{
+                "query":DEMO_QUERY,"space_ids":[space_id],"statuses":["accepted"]
+            }
+        }}),
+    ];
+    let mut input = Vec::new();
+    for request in requests {
+        serde_json::to_writer(&mut input, &request).map_err(json_error("serialize demo MCP"))?;
+        input.push(b'\n');
+    }
+    let mut output = Vec::new();
+    let mut reader = io::BufReader::new(input.as_slice());
+    sctx_mcp::McpServer::new(root, client)?
+        .serve(&mut reader, &mut output)
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::External,
+                format!("demo MCP transport {:?}: {}", error.kind(), error.message()),
+            )
+        })?;
+    let responses = output
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_slice::<Value>(line)
+                .map_err(|error| invariant(format!("invalid demo MCP response: {error}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let tools = responses
+        .get(1)
+        .and_then(|response| response.pointer("/result/tools"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| invariant("demo MCP tools/list response is missing"))?;
+    if tools.len() != 5 {
+        return Err(invariant(
+            "demo MCP tools/list did not return five V1 tools",
+        ));
+    }
+    let results = responses
+        .get(2)
+        .and_then(|response| response.pointer("/result/structuredContent/results"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| invariant("demo MCP context_search response is missing"))?;
+    if !results.iter().any(|result| {
+        result.get("context_id").and_then(Value::as_str) == Some(&context_id.to_string())
+    }) {
+        return Err(invariant(
+            "published demo Context was not returned by MCP search",
+        ));
     }
     Ok(())
 }
@@ -461,14 +810,32 @@ fn preferred_space_for_event(root: &Path, event: &CanonicalAgentEvent) -> Result
 
 fn detect_agent_version(agent: &str) -> Option<String> {
     let executable = if agent == "cursor" { "cursor" } else { "codex" };
-    let output = Command::new(executable).arg("--version").output().ok()?;
-    if !output.status.success() {
-        return None;
+    let mut child = Command::new(executable)
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait().ok()? {
+            Some(status) => {
+                let output = child.wait_with_output().ok()?;
+                return status
+                    .success()
+                    .then(|| String::from_utf8(output.stdout).ok())
+                    .flatten()
+                    .map(|value| value.trim().to_owned())
+                    .filter(|value| !value.is_empty());
+            }
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            None => thread::sleep(Duration::from_millis(10)),
+        }
     }
-    String::from_utf8(output.stdout)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
 }
 
 fn parse_bool(value: &str) -> Result<bool> {
@@ -518,7 +885,11 @@ struct Runtime {
 
 impl Runtime {
     fn open() -> Result<Self> {
-        let store = GitStore::initialize(installation_root()?)?;
+        Self::open_at(&installation_root()?)
+    }
+
+    fn open_at(root: &Path) -> Result<Self> {
+        let store = GitStore::initialize(root)?;
         let index = ProjectionIndex::for_store(&store);
         Ok(Self { store, index })
     }

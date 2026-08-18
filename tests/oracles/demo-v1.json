@@ -1,0 +1,29 @@
+{
+  "event_count": 4,
+  "event_types": {
+    "space.created": 1,
+    "context.revision_added": 1,
+    "context.reviewed": 1,
+    "context.publication_changed": 1
+  },
+  "space": {
+    "title": "Shared Context 三分钟 Demo",
+    "domain_term": "sctx.demo.v1"
+  },
+  "context": {
+    "topic_key": "shared-context/demo-v1",
+    "statement": "Published demo context is searchable through CLI and MCP.",
+    "search_query": "searchable CLI MCP",
+    "status": "accepted",
+    "evidence_supports": "The demo lifecycle is independently reproducible.",
+    "evidence_fixture": "sctx.demo.v1"
+  },
+  "mcp_tools": [
+    "context_for_task",
+    "context_search",
+    "context_get",
+    "context_propose",
+    "space_list"
+  ],
+  "mcp_clients": ["cursor", "codex"]
+}

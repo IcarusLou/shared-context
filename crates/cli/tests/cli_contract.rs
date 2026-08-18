@@ -228,7 +228,8 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
     let stdout = String::from_utf8_lossy(&help.stdout);
     assert!(help.status.success());
     for command in [
-        "setup [--agents cursor,codex]",
+        "setup [--demo] [--agents cursor,codex]",
+        "demo [--workspace PATH]",
         "doctor [--fix]",
         "upgrade [--agents cursor,codex]",
         "uninstall [--root PATH]",

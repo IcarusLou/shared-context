@@ -181,7 +181,7 @@ test(
 );
 
 test(
-  'arm64 real CLI smoke installs offline without postinstall configuration side effects',
+  'arm64 real CLI completes the offline setup --demo loop without Registry access',
   { skip: process.platform !== 'darwin' || process.arch !== 'arm64', timeout: 600_000 },
   (context) => {
     const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sctx-offline-smoke-'));
@@ -214,6 +214,14 @@ test(
     );
     assert.equal(fs.existsSync(path.join(home, '.cursor/mcp.json')), false);
     assert.equal(fs.existsSync(path.join(home, '.codex/config.toml')), false);
+    fs.mkdirSync(path.join(home, '.cursor'), { recursive: true });
+    fs.writeFileSync(
+      path.join(home, '.cursor/mcp.json'),
+      `${JSON.stringify({
+        userSetting: { 中文: true },
+        mcpServers: { existing: { command: 'keep user MCP' } },
+      }, null, 2)}\n`,
+    );
 
     const version = run(path.join(built.bundleDirectory, 'node_modules/.bin/sctx'), ['--version'], {
       cwd: built.bundleDirectory,
@@ -221,9 +229,10 @@ test(
     });
     assert.match(version, /^sctx 0\.1\.0$/);
 
+    const started = Date.now();
     const result = spawnSync(
       path.join(built.bundleDirectory, 'install'),
-      ['--agents', 'cursor', '--root', root, '--yes'],
+      ['--demo', '--agents', 'cursor', '--root', root, '--yes'],
       {
         cwd: built.bundleDirectory,
         encoding: 'utf8',
@@ -231,10 +240,49 @@ test(
       },
     );
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.ok(Date.now() - started < 180_000, 'offline setup --demo exceeded three minutes');
     assert.ok(fs.existsSync(path.join(root, 'bin/current/sctx')));
+    const eventPaths = run(
+      'git',
+      ['-C', path.join(root, 'repository'), 'ls-tree', '-r', '--name-only', 'HEAD'],
+    ).split('\n').filter((entry) => entry.startsWith('events/'));
+    assert.equal(eventPaths.length, 4);
+    const search = JSON.parse(run(
+      path.join(built.bundleDirectory, 'node_modules/.bin/sctx'),
+      ['--json', 'search', '--query', 'searchable CLI MCP', '--status', 'accepted'],
+      { cwd: built.bundleDirectory, env: installEnvironment },
+    ));
+    assert.equal(search.data.results.length, 1);
+    assert.equal(
+      search.data.results[0].statement,
+      'Published demo context is searchable through CLI and MCP.',
+    );
     const cursor = readJson(path.join(home, '.cursor/mcp.json'));
     assert.equal(cursor.mcpServers['shared-context'].command, path.join(root, 'bin/current/sctx'));
     assert.match(fs.readFileSync(path.join(built.bundleDirectory, 'install'), 'utf8'), /--offline/);
+
+    const rebuilt = JSON.parse(run(
+      path.join(built.bundleDirectory, 'node_modules/.bin/sctx'),
+      ['--json', 'index', 'rebuild'],
+      { cwd: built.bundleDirectory, env: installEnvironment },
+    ));
+    assert.equal(rebuilt.command, 'index.rebuild');
+    assert.equal(rebuilt.data.rebuilt, true);
+    assert.match(rebuilt.tree, /^[0-9a-f]{40}$/);
+    assert.ok(Number.isSafeInteger(rebuilt.generation) && rebuilt.generation > 0);
+
+    const uninstalled = JSON.parse(run(
+      path.join(built.bundleDirectory, 'node_modules/.bin/sctx'),
+      ['--json', 'uninstall', '--root', root],
+      { cwd: built.bundleDirectory, env: installEnvironment },
+    ));
+    assert.equal(uninstalled.repository_retained, true);
+    assert.ok(fs.existsSync(path.join(root, 'repository/.git')));
+    assert.equal(fs.existsSync(path.join(root, 'bin/current')), false);
+    const restoredCursor = readJson(path.join(home, '.cursor/mcp.json'));
+    assert.equal(restoredCursor.mcpServers['shared-context'], undefined);
+    assert.equal(restoredCursor.mcpServers.existing.command, 'keep user MCP');
+    assert.equal(restoredCursor.userSetting.中文, true);
   },
 );
 

@@ -13,8 +13,10 @@ use std::{
     io::{BufReader, Cursor, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::Arc,
+    thread,
+    time::{Duration, Instant},
 };
 
 use fs2::FileExt;
@@ -33,6 +35,7 @@ use uuid::Uuid;
 const JOURNAL_VERSION: u32 = 1;
 const MANIFEST_VERSION: u32 = 1;
 const MINIMUM_FREE_SPACE_BYTES: u64 = 64 * 1024 * 1024;
+const AGENT_VERSION_TIMEOUT: Duration = Duration::from_secs(2);
 const PRODUCT_KEY: &str = "shared-context";
 const HOOK_EVENTS_CURSOR: [&str; 6] = [
     "sessionStart",
@@ -186,14 +189,38 @@ impl Host for SystemHost {
             Agent::Cursor => "cursor",
             Agent::Codex => "codex",
         };
-        Command::new(executable)
-            .arg("--version")
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .map(|version| version.trim().to_owned())
-            .filter(|version| !version.is_empty())
+        command_stdout_with_timeout(
+            Command::new(executable).arg("--version"),
+            AGENT_VERSION_TIMEOUT,
+        )
+    }
+}
+
+fn command_stdout_with_timeout(command: &mut Command, timeout: Duration) -> Option<String> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait().ok()? {
+            Some(status) => {
+                let output = child.wait_with_output().ok()?;
+                return status
+                    .success()
+                    .then(|| String::from_utf8(output.stdout).ok())
+                    .flatten()
+                    .map(|value| value.trim().to_owned())
+                    .filter(|value| !value.is_empty());
+            }
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            None => thread::sleep(Duration::from_millis(10)),
+        }
     }
 }
 
@@ -2237,4 +2264,24 @@ fn external_error(operation: &'static str) -> impl FnOnce(std::io::Error) -> Err
 
 fn io_value(operation: &'static str, error: impl std::fmt::Display) -> Error {
     Error::new(ErrorKind::Io, format!("failed to {operation}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{process::Command, time::Duration};
+
+    use super::command_stdout_with_timeout;
+
+    #[test]
+    fn agent_version_probe_has_a_hard_timeout() {
+        let started = std::time::Instant::now();
+        assert!(
+            command_stdout_with_timeout(
+                Command::new("/bin/sleep").arg("10"),
+                Duration::from_millis(25),
+            )
+            .is_none()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 }

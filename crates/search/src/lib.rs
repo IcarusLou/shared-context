@@ -1261,6 +1261,7 @@ mod tests {
     fn warm_search_benchmark_baseline() {
         const ROWS: usize = 100_000;
         const ITERATIONS: usize = 30;
+        const P95_LIMIT: Duration = Duration::from_millis(100);
         let mut connection = rusqlite::Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
@@ -1413,6 +1414,10 @@ mod tests {
             let p50 = percentile(&samples, 50);
             let p95 = percentile(&samples, 95);
             println!("rows={ROWS} query={query:?} warm_p50={p50:?} warm_p95={p95:?}");
+            assert!(
+                p95 < P95_LIMIT,
+                "100k-row warm Search P95 for {query:?} was {p95:?}, limit {P95_LIMIT:?}"
+            );
         }
     }
 
