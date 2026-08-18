@@ -13,11 +13,14 @@ use sha2::{Digest, Sha256};
 
 pub use sctx_domain::{
     Applicability, ConflictId, ConflictParticipant, ConflictResolution, ConflictResolutionDraft,
-    ConflictResolutionResult, ContextId, ContextKind, ContextRevision, ContextRevisionDraft, Error,
+    ConflictResolutionResult, ContextGovernanceStatus, ContextId, ContextKind, ContextProjection,
+    ContextRevision, ContextRevisionDraft, ContextSpaceProjection, DomainProjection, Error,
     ErrorKind, EventId, EvidenceId, EvidenceSnapshot, EvidenceSnapshotDraft, EvidenceType,
-    IdParseError, IntentRevision, IntentSnapshot, Publication, PublicationAction, PublicationDraft,
-    PublicationId, ResolutionId, ResolutionOutcome, Result, Review, ReviewDraft, ReviewId,
-    ReviewVerdict, RevisionId, SemanticConflict, SemanticConflictDraft, SpaceId,
+    IdParseError, IntentProjection, IntentRevision, IntentSnapshot, Publication, PublicationAction,
+    PublicationDraft, PublicationId, ReducerDiagnostic, ReducerDiagnosticCode, ReducerEvent,
+    ReducerPayload, ResolutionId, ResolutionOutcome, Result, Review, ReviewDraft, ReviewId,
+    ReviewSummary, ReviewVerdict, RevisionId, RevisionLifecycle, RevisionProjection,
+    SemanticConflict, SemanticConflictDraft, SpaceId, reduce,
 };
 
 /// Immutable identifier for the bundled V1 JSON Schema.
@@ -444,6 +447,63 @@ impl Event {
     #[must_use]
     pub const fn annotations(&self) -> Option<&Annotations> {
         self.annotations.as_ref()
+    }
+
+    /// Converts events in the pure domain-reducer boundary into owned reducer input.
+    ///
+    /// Semantic-conflict events intentionally return `None`; their cross-Context
+    /// projection is outside the Context/Intent/Review/Publication reducer.
+    #[must_use]
+    pub fn reducer_event(&self) -> Option<ReducerEvent> {
+        let payload = match &self.payload {
+            EventPayload::SpaceCreated {
+                space_id,
+                intent_revision,
+            } => ReducerPayload::SpaceCreated {
+                space_id: *space_id,
+                intent_revision: intent_revision.clone(),
+            },
+            EventPayload::SpaceIntentRevisionAdded {
+                space_id,
+                intent_revision,
+            } => ReducerPayload::SpaceIntentRevisionAdded {
+                space_id: *space_id,
+                intent_revision: intent_revision.clone(),
+            },
+            EventPayload::ContextRevisionAdded {
+                space_id,
+                context_id,
+                revision,
+            } => ReducerPayload::ContextRevisionAdded {
+                space_id: *space_id,
+                context_id: *context_id,
+                revision: revision.clone(),
+            },
+            EventPayload::ContextReviewed {
+                space_id,
+                context_id,
+                review,
+            } => ReducerPayload::ContextReviewed {
+                space_id: *space_id,
+                context_id: *context_id,
+                review: review.clone(),
+            },
+            EventPayload::ContextPublicationChanged {
+                space_id,
+                context_id,
+                publication,
+            } => ReducerPayload::ContextPublicationChanged {
+                space_id: *space_id,
+                context_id: *context_id,
+                publication: publication.clone(),
+            },
+            EventPayload::SemanticConflictOpened { .. }
+            | EventPayload::SemanticConflictResolutionAdded { .. } => return None,
+        };
+        Some(ReducerEvent {
+            event_id: self.event_id,
+            payload,
+        })
     }
 
     /// Validates all V1 field and payload-local invariants.

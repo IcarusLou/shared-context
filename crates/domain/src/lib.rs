@@ -1,11 +1,12 @@
-//! Stable identifiers and authoritative V1 domain snapshots.
+//! Stable identifiers, authoritative V1 snapshots, and the pure in-memory reducer.
 //!
-//! This crate deliberately contains no storage, reducer, Git, or `SQLite` behavior.
+//! The reducer deliberately has no storage, Git, clock, or `SQLite` dependency.
 
 use std::fmt;
 
 mod ids;
 mod model;
+mod reducer;
 
 pub use ids::{
     ConflictId, ContextId, EventId, EvidenceId, IdParseError, PublicationId, ResolutionId,
@@ -17,6 +18,11 @@ pub use model::{
     EvidenceSnapshotDraft, EvidenceType, IntentRevision, IntentSnapshot, Publication,
     PublicationAction, PublicationDraft, ResolutionOutcome, Review, ReviewDraft, ReviewVerdict,
     SemanticConflict, SemanticConflictDraft,
+};
+pub use reducer::{
+    ContextGovernanceStatus, ContextProjection, ContextSpaceProjection, DomainProjection,
+    IntentProjection, ReducerDiagnostic, ReducerDiagnosticCode, ReducerEvent, ReducerPayload,
+    ReviewSummary, RevisionLifecycle, RevisionProjection, reduce,
 };
 
 /// Broad categories used to route recoverable errors across crate boundaries.
