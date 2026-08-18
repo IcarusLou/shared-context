@@ -35,7 +35,7 @@ use sctx_search::{
     ContextPackMode, ContextPackRequest, ContextStatus, ScopeFilter, SearchEngine, SearchFilters,
     SearchRequest,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const HELP: &str = r"Shared Context command-line interface
@@ -43,6 +43,11 @@ const HELP: &str = r"Shared Context command-line interface
 Usage: sctx [--json] <COMMAND>
 
 Commands:
+  setup [--agents cursor,codex] [--root PATH] [--runtime-source PATH]
+  doctor [--fix] [--root PATH]
+  upgrade [--agents cursor,codex] [--root PATH] [--runtime-source PATH]
+  uninstall [--root PATH]
+  knowledge delete --confirm-path PATH --confirm DELETE-SHARED-CONTEXT-KNOWLEDGE
   space create|intent revise|list|get
   context propose|revise|review|publish|withdraw|get
   semantic conflict open|resolve
@@ -121,6 +126,15 @@ fn run(args: &[String], json_output: bool) -> Result<()> {
             println!("sctx {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        [command, rest @ ..] if command == "setup" => {
+            run_install_lifecycle("setup", rest, json_output)
+        }
+        [command, rest @ ..] if command == "doctor" => run_doctor(rest, json_output),
+        [command, rest @ ..] if command == "upgrade" => {
+            run_install_lifecycle("upgrade", rest, json_output)
+        }
+        [command, rest @ ..] if command == "uninstall" => run_uninstall(rest, json_output),
+        [group, rest @ ..] if group == "knowledge" => run_knowledge(rest, json_output),
         [group, rest @ ..] if group == "space" => run_space(rest, json_output),
         [group, command, rest @ ..] if group == "context" && command == "pack" => {
             run_context_pack(rest, json_output)
@@ -137,6 +151,156 @@ fn run(args: &[String], json_output: bool) -> Result<()> {
         [group, rest @ ..] if group == "mcp" => run_mcp(rest),
         _ => Err(invalid(format!("unknown command\n\n{HELP}"))),
     }
+}
+
+fn run_install_lifecycle(command: &str, args: &[String], json_output: bool) -> Result<()> {
+    let options = Options::parse(args, &["--yes"])?;
+    options.allow_only(
+        &[
+            "--agents",
+            "--root",
+            "--runtime-source",
+            "--runtime-version",
+        ],
+        &["--yes"],
+    )?;
+    let installer = installer_from_options(&options)?;
+    let setup = setup_options(&options)?;
+    let report = if command == "setup" {
+        installer.setup(&setup)?
+    } else {
+        installer.upgrade(&setup)?
+    };
+    emit_lifecycle(&report, json_output)
+}
+
+fn run_doctor(args: &[String], json_output: bool) -> Result<()> {
+    let options = Options::parse(args, &["--fix"])?;
+    options.allow_only(
+        &[
+            "--root",
+            "--runtime-source",
+            "--runtime-version",
+            "--agents",
+        ],
+        &["--fix"],
+    )?;
+    let installer = installer_from_options(&options)?;
+    let report = if options.has("--fix") {
+        installer.doctor_fix(&setup_options(&options)?)?
+    } else {
+        installer.doctor()
+    };
+    emit_lifecycle(&report, json_output)
+}
+
+fn run_uninstall(args: &[String], json_output: bool) -> Result<()> {
+    let options = Options::parse(args, &[])?;
+    options.allow_only(&["--root", "--runtime-source", "--runtime-version"], &[])?;
+    let report = installer_from_options(&options)?.uninstall()?;
+    emit_lifecycle(&report, json_output)
+}
+
+fn run_knowledge(args: &[String], json_output: bool) -> Result<()> {
+    let [command, rest @ ..] = args else {
+        return Err(invalid(
+            "Usage: sctx knowledge delete --confirm-path <ABSOLUTE_PATH> --confirm DELETE-SHARED-CONTEXT-KNOWLEDGE",
+        ));
+    };
+    if command != "delete" {
+        return Err(invalid("knowledge command must be delete"));
+    }
+    let options = Options::parse(rest, &[])?;
+    options.allow_only(
+        &[
+            "--root",
+            "--runtime-source",
+            "--runtime-version",
+            "--confirm-path",
+            "--confirm",
+        ],
+        &[],
+    )?;
+    let confirmed_path = PathBuf::from(options.required("--confirm-path")?);
+    let confirmation = options.required("--confirm")?;
+    let deleted =
+        installer_from_options(&options)?.delete_knowledge(&confirmed_path, confirmation)?;
+    emit_lifecycle(
+        &json!({"repository": deleted, "deleted": true}),
+        json_output,
+    )
+}
+
+fn installer_from_options(options: &Options) -> Result<sctx_installer::Installer> {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| invalid("HOME is not set"))?;
+    let root = options
+        .optional("--root")?
+        .map_or_else(|| home.join(".shared-context"), PathBuf::from);
+    let runtime_source = options
+        .optional("--runtime-source")?
+        .map(PathBuf::from)
+        .map_or_else(
+            || {
+                env::current_exe().map_err(|error| {
+                    Error::new(
+                        ErrorKind::Io,
+                        format!("resolve current executable: {error}"),
+                    )
+                })
+            },
+            Ok,
+        )?;
+    let version = options
+        .optional("--runtime-version")?
+        .unwrap_or(env!("CARGO_PKG_VERSION"));
+    Ok(sctx_installer::Installer::new(
+        sctx_installer::InstallContext::injected(home, root, runtime_source, version),
+        std::sync::Arc::new(sctx_installer::SystemHost),
+    ))
+}
+
+fn setup_options(options: &Options) -> Result<sctx_installer::SetupOptions> {
+    let Some(value) = options.optional("--agents")? else {
+        return Ok(sctx_installer::SetupOptions::default());
+    };
+    let mut agents = BTreeSet::new();
+    for agent in value.split(',') {
+        match agent.trim() {
+            "cursor" => {
+                agents.insert(sctx_installer::Agent::Cursor);
+            }
+            "codex" => {
+                agents.insert(sctx_installer::Agent::Codex);
+            }
+            value => {
+                return Err(invalid(format!(
+                    "unsupported setup Agent {value:?}; expected cursor,codex"
+                )));
+            }
+        }
+    }
+    if agents.is_empty() {
+        return Err(invalid("--agents must select cursor and/or codex"));
+    }
+    Ok(sctx_installer::SetupOptions { agents })
+}
+
+fn emit_lifecycle(value: &impl Serialize, json_output: bool) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(value).map_err(json_error("serialize lifecycle output"))?
+        );
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(value)
+                .map_err(json_error("serialize lifecycle output"))?
+        );
+    }
+    Ok(())
 }
 
 fn run_hook(args: &[String]) -> Result<()> {

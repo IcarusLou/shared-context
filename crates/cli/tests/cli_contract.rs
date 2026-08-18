@@ -228,6 +228,11 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
     let stdout = String::from_utf8_lossy(&help.stdout);
     assert!(help.status.success());
     for command in [
+        "setup [--agents cursor,codex]",
+        "doctor [--fix]",
+        "upgrade [--agents cursor,codex]",
+        "uninstall [--root PATH]",
+        "knowledge delete --confirm-path PATH",
         "space create|intent revise|list|get",
         "context propose|revise|review|publish|withdraw|get",
         "semantic conflict open|resolve",
