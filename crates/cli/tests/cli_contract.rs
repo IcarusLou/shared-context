@@ -1,7 +1,8 @@
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     str::FromStr,
     sync::Arc,
 };
@@ -215,6 +216,7 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
         "context-pack",
         "pending list|commit|move-aside",
         "validate --staged",
+        "mcp serve --client cursor|codex",
     ] {
         assert!(stdout.contains(command), "missing help surface: {command}");
     }
@@ -227,6 +229,53 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
         String::from_utf8_lossy(&version.stdout),
         format!("sctx {}\n", env!("CARGO_PKG_VERSION"))
     );
+}
+
+#[test]
+fn mcp_stdio_entry_serves_cursor_and_codex_without_extra_stdout() {
+    for client in ["cursor", "codex"] {
+        let harness = Harness::new();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_sctx"))
+            .args(["mcp", "serve", "--client", client])
+            .env("HOME", &harness.home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let initialize = serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05"}
+        }))
+        .unwrap();
+        let list = serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .unwrap();
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, "{initialize}").unwrap();
+        writeln!(stdin, "{list}").unwrap();
+        drop(child.stdin.take());
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{client}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let responses = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 5);
+    }
 }
 
 #[test]

@@ -590,7 +590,13 @@ name = "sctx-mcp"
 version = "0.1.0"
 dependencies = [
  "sctx-domain",
+ "sctx-event-schema",
+ "sctx-git-store",
+ "sctx-index",
  "sctx-search",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

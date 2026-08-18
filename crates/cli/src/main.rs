@@ -41,6 +41,7 @@ Commands:
   index rebuild|status
   pending list|commit|move-aside
   validate --staged
+  mcp serve --client cursor|codex
 
 Global options:
   --json        Emit a stable JSON envelope
@@ -119,8 +120,21 @@ fn run(args: &[String], json_output: bool) -> Result<()> {
         [group, rest @ ..] if group == "index" => run_index(rest, json_output),
         [group, rest @ ..] if group == "pending" => run_pending(rest, json_output),
         [command, rest @ ..] if command == "validate" => run_validate(rest, json_output),
+        [group, rest @ ..] if group == "mcp" => run_mcp(rest),
         _ => Err(invalid(format!("unknown command\n\n{HELP}"))),
     }
+}
+
+fn run_mcp(args: &[String]) -> Result<()> {
+    let [command, option, client] = args else {
+        return Err(invalid("Usage: sctx mcp serve --client cursor|codex"));
+    };
+    if command != "serve" || option != "--client" {
+        return Err(invalid("Usage: sctx mcp serve --client cursor|codex"));
+    }
+    let client = sctx_mcp::ClientKind::from_str(client)?;
+    let _outcome = sctx_mcp::serve_stdio(installation_root()?, client)?;
+    Ok(())
 }
 
 struct Runtime {
