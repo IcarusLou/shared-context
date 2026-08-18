@@ -13,6 +13,7 @@ use std::{
 
 use fs2::FileExt;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+use sctx_domain::DomainProjection;
 
 mod git_tree;
 mod project;
@@ -125,6 +126,27 @@ pub struct RebuildOutcome {
 pub struct QuerySnapshot<T> {
     pub metadata: IndexMetadata,
     pub data: T,
+}
+
+/// One deterministic domain projection read from the exact Git tree named by
+/// [`metadata`](Self::metadata). This is a thin read boundary for governance
+/// clients that need causal heads rather than SQL implementation details.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DomainSnapshot {
+    pub metadata: IndexMetadata,
+    pub projection: DomainProjection,
+    pub diagnostics: Vec<ProjectionDiagnosticView>,
+}
+
+/// Stable, user-presentable projection diagnostic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectionDiagnosticView {
+    pub key: String,
+    pub source_path: Option<String>,
+    pub code: String,
+    pub entity_id: String,
+    pub event_ids_json: String,
+    pub message: String,
 }
 
 /// Reusable read connection. Before each request it verifies the database file identity and
@@ -290,6 +312,35 @@ impl ProjectionIndex {
         query: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<QuerySnapshot<T>> {
         self.query_connection().snapshot(query)
+    }
+
+    /// Synchronizes the index and reduces events from that generation's exact
+    /// committed Git tree. The returned projection never reads the working tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when synchronization, Git object access, parsing, or
+    /// deterministic reduction cannot complete.
+    pub fn domain_snapshot(&self) -> Result<DomainSnapshot> {
+        let outcome = self.synchronize()?;
+        let tree = git_tree::read_tree(&self.repository, &outcome.metadata.indexed_tree_oid)?;
+        let input = project::build(&tree.blobs);
+        Ok(DomainSnapshot {
+            metadata: outcome.metadata,
+            projection: input.projection,
+            diagnostics: input
+                .diagnostics
+                .into_iter()
+                .map(|diagnostic| ProjectionDiagnosticView {
+                    key: diagnostic.key,
+                    source_path: diagnostic.source_path,
+                    code: diagnostic.code,
+                    entity_id: diagnostic.entity_id,
+                    event_ids_json: diagnostic.event_ids_json,
+                    message: diagnostic.message,
+                })
+                .collect(),
+        })
     }
 
     #[allow(clippy::too_many_lines)]

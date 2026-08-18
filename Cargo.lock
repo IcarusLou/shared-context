@@ -504,6 +504,8 @@ dependencies = [
  "sctx-local-state",
  "sctx-mcp",
  "sctx-search",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 

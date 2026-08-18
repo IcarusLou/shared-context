@@ -93,6 +93,36 @@ impl<'a> Git<'a> {
         self.output_text(["rev-parse", "--verify", "HEAD"])
     }
 
+    pub(crate) fn staged_tree_oid(&self) -> Result<String> {
+        self.output_text(["write-tree"])
+    }
+
+    pub(crate) fn head_paths(&self, root: &str) -> Result<Vec<String>> {
+        let bytes = self.output_bytes([
+            OsString::from("ls-tree"),
+            OsString::from("-r"),
+            OsString::from("-z"),
+            OsString::from("--name-only"),
+            OsString::from("HEAD"),
+            OsString::from("--"),
+            OsString::from(root),
+        ])?;
+        bytes
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                std::str::from_utf8(path)
+                    .map(ToOwned::to_owned)
+                    .map_err(|error| {
+                        Error::new(
+                            ErrorKind::External,
+                            format!("git returned a non-UTF-8 path: {error}"),
+                        )
+                    })
+            })
+            .collect()
+    }
+
     pub(crate) fn head_file(&self, path: &str) -> Result<Option<Vec<u8>>> {
         self.file_at("HEAD", path)
     }

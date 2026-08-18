@@ -8,7 +8,7 @@ use std::{
 };
 
 use fs2::FileExt;
-use sctx_domain::{Error, ErrorKind, EventId, Result};
+use sctx_domain::{Error, ErrorKind, EventId, ReducerEvent, Result, reduce};
 use sctx_event_schema::{Event, ParsedEvent, parse_event};
 use sctx_local_state::{PrivacyScan, PrivacyScanner, UserConfigStore};
 use sha2::{Digest, Sha256};
@@ -78,6 +78,14 @@ pub struct AppendOutcome {
     pub commit_oid: String,
     pub objects: Vec<ObjectRef>,
     pub recovered: bool,
+}
+
+/// Result of validating the exact staged tree used by a manual Git commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StagedValidation {
+    pub tree_oid: String,
+    pub added_paths: Vec<String>,
+    pub event_count: usize,
 }
 
 /// Durable boundaries exposed for deterministic crash testing.
@@ -337,6 +345,114 @@ impl GitStore {
         sync_directory(&aside_root)?;
         FileExt::unlock(&lock).map_err(io_error("unlock writer.lock"))?;
         Ok(destination)
+    }
+
+    /// Validates staged changes as append-only additions and reduces the exact
+    /// staged event set before a manual commit.
+    ///
+    /// # Errors
+    ///
+    /// Rejects modified/deleted/renamed managed paths, foreign staged paths,
+    /// invalid staged events or objects, and any staged event quarantined by the
+    /// reducer. Pre-existing quarantined input remains isolated and does not
+    /// block an unrelated valid addition.
+    pub fn validate_staged(&self) -> Result<StagedValidation> {
+        let git = Git::new(&self.repository);
+        let staged = git.staged_from_head()?;
+        let mut added_paths = Vec::new();
+        for entry in &staged {
+            if entry.status != "A" {
+                return Err(invariant(format!(
+                    "staged change {} is not append-only; revise or withdraw by adding a new event",
+                    entry.status
+                )));
+            }
+            for path in &entry.paths {
+                let path = path_string(path.clone())?;
+                if !MANAGED_ROOTS
+                    .iter()
+                    .any(|root| path == *root || path.starts_with(&format!("{root}/")))
+                {
+                    return Err(invariant(format!(
+                        "foreign staged path is not part of the Shared Context store: {path}"
+                    )));
+                }
+                added_paths.push(path);
+            }
+        }
+        added_paths.sort();
+
+        let added: BTreeSet<_> = added_paths.iter().cloned().collect();
+        let mut event_paths = git.head_paths("events")?;
+        event_paths.extend(
+            added_paths
+                .iter()
+                .filter(|path| path.starts_with("events/"))
+                .cloned(),
+        );
+        event_paths.sort();
+        event_paths.dedup();
+        let mut reducer_events = Vec::<ReducerEvent>::new();
+        let mut staged_event_ids = BTreeSet::new();
+        for path in &event_paths {
+            let bytes = if added.contains(path) {
+                git.index_file(path)?
+            } else {
+                git.head_file(path)?
+            }
+            .ok_or_else(|| invariant(format!("event disappeared while validating: {path}")))?;
+            match parse_event(&bytes) {
+                Ok(ParsedEvent::Known(event)) => {
+                    if added.contains(path) {
+                        staged_event_ids.insert(event.event_id());
+                    }
+                    if let Some(event) = event.reducer_event() {
+                        reducer_events.push(event);
+                    }
+                }
+                Err(error) if added.contains(path) => {
+                    return Err(invariant(format!(
+                        "staged event is invalid at {path}: {error}"
+                    )));
+                }
+                Ok(ParsedEvent::UnknownSchema(_)) | Err(_) => {}
+            }
+        }
+        for path in added_paths
+            .iter()
+            .filter(|path| path.starts_with("objects/"))
+        {
+            let bytes = git
+                .index_file(path)?
+                .ok_or_else(|| invariant(format!("object disappeared while validating: {path}")))?;
+            let digest = path.rsplit('/').next().unwrap_or_default();
+            if digest.len() != 64 || sha256(&bytes) != digest || object_path(digest) != *path {
+                return Err(invariant(format!(
+                    "staged object path or digest does not match content: {path}"
+                )));
+            }
+        }
+        let projection = reduce(&reducer_events);
+        if let Some(event_id) = projection
+            .quarantined_event_ids
+            .intersection(&staged_event_ids)
+            .next()
+        {
+            let diagnostic = projection
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.event_ids.contains(event_id))
+                .ok_or_else(|| invariant("staged event was quarantined without a diagnostic"))?;
+            return Err(invariant(format!(
+                "staged event set is invalid ({:?}, {}): {}",
+                diagnostic.code, diagnostic.entity_id, diagnostic.message
+            )));
+        }
+        Ok(StagedValidation {
+            tree_oid: git.staged_tree_oid()?,
+            added_paths,
+            event_count: reducer_events.len(),
+        })
     }
 
     fn prepare(&self, request: AppendRequest) -> Result<(Journal, Vec<ObjectRef>)> {

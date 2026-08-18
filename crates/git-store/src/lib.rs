@@ -12,7 +12,7 @@ pub use journal::{BatchId, JournalPhase, PendingBatch, PendingFile, PendingFileK
 pub use sctx_domain::{Error, ErrorKind, Result};
 pub use store::{
     AppendOutcome, AppendRequest, CommitObserver, CrashInjector, CrashSeam, GitStore,
-    NoopCommitObserver, NoopCrashInjector, ObjectRef, TextObject,
+    NoopCommitObserver, NoopCrashInjector, ObjectRef, StagedValidation, TextObject,
 };
 
 /// Stable marker used for the retryable case where an object exists outside
