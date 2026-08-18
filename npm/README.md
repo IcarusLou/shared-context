@@ -1,0 +1,58 @@
+# Shared Context NPM packaging
+
+This directory contains the unpublished source for:
+
+- `@company/shared-context`: a thin JavaScript launcher.
+- `@company/shared-context-darwin-arm64`: a signed arm64 Mach-O platform package.
+- `@company/shared-context-darwin-x64`: a signed x64 Mach-O platform package.
+
+There is no `postinstall` lifecycle script. Installing any package leaves Cursor and Codex
+configuration untouched. The launcher selects the current Darwin CPU package, verifies the
+packaged `sctx` SHA-256 and macOS code signature, and forwards argv, stdio, signals, and exit code.
+
+## Build local artifacts
+
+Both builders require an explicit path to an already-signed, thin binary. They validate the code
+signature and Mach-O architecture before packing and never publish or upload anything.
+
+```bash
+node npm/scripts/build-platform-package.js \
+  --arch arm64 \
+  --binary /absolute/path/to/signed/arm64/sctx \
+  --output-dir /absolute/path/to/artifacts
+
+node npm/scripts/build-offline-bundle.js \
+  --arch arm64 \
+  --binary /absolute/path/to/signed/arm64/sctx \
+  --output-dir /absolute/path/to/artifacts
+```
+
+Use `--arch x64` with a signed, thin x86_64 binary for the Intel artifacts. Each offline builder
+output contains the main tgz and exactly one platform tgz, a local-only root package/lock,
+`MANIFEST.json`, `SHA256SUMS`, an `install` entrypoint, and a reproducible `.tar.gz` archive.
+
+## Offline install
+
+After transferring the matching archive to the target Mac:
+
+```bash
+tar -xzf shared-context-0.1.0-darwin-arm64-offline.tar.gz
+./shared-context-0.1.0-darwin-arm64-offline/install \
+  --agents cursor,codex --yes
+```
+
+`install` verifies `SHA256SUMS`, runs npm in offline mode with lifecycle scripts disabled, and then
+always invokes `sctx setup` with the supplied options. Calling `./install` with no options therefore
+still starts setup with its defaults; callers must not include an extra `setup` argument.
+
+## Tests
+
+```bash
+cd npm
+npm test
+```
+
+On an arm64 Mac the suite runs the real signed `sctx` arm64 package through an offline install and
+setup smoke. The x64 suite cross-builds and signs a real x86_64 Mach-O, then proves package/bundle
+structure and npm CPU contracts only; native x64 execution remains `NOT_PROVEN` until run on Intel
+hardware.

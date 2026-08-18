@@ -1,0 +1,21 @@
+{
+  "name": "@company/shared-context",
+  "version": "0.1.0",
+  "description": "Shared Context native CLI launcher",
+  "license": "UNLICENSED",
+  "bin": {
+    "sctx": "bin/sctx.js"
+  },
+  "files": [
+    "bin/sctx.js",
+    "lib/launcher.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@company/shared-context-darwin-arm64": "0.1.0",
+    "@company/shared-context-darwin-x64": "0.1.0"
+  }
+}

@@ -43,6 +43,24 @@ cargo test --workspace --locked
 
 这些目录不得被 `.gitignore` 整体排除。构建产物必须使用精确到产物目录的忽略规则。
 
+## NPM 打包检查
+
+NPM 层没有第三方 JavaScript 运行时依赖，使用 Node.js 18 或更新版本：
+
+```bash
+cd npm
+npm test
+```
+
+macOS 测试会为 `aarch64-apple-darwin` 和 `x86_64-apple-darwin` 构建真实 CLI，因此两种
+Rust target 都必须安装。arm64 主机执行当前架构真实二进制的 launcher、offline install
+和显式 setup smoke；x64 在没有 Intel 主机时只验证 Mach-O、签名、包内容、`os/cpu`、
+离线 lock 和 checksum 契约，不将交叉产物或 Rosetta 当作原生执行证据。
+
+本地 artifact builder 的输入必须是显式路径指定的、已签名、单架构 Mach-O。命令和离线
+安装方法见 [`npm/README.md`](./npm/README.md)。构建脚本只写本地输出，不执行 publish
+或 upload。
+
 ## 设计不变量
 
 任何后续实现都必须保持 [`technical-design.md`](./technical-design.md) 第 20 节的核心不变量。骨架中的 crate 边界不是对领域模型的替代定义。
