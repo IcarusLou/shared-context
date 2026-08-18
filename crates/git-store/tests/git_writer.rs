@@ -17,6 +17,24 @@ use sctx_git_store::{
 };
 use tempfile::TempDir;
 
+#[derive(serde::Deserialize)]
+struct PrivacyFixture {
+    cases: Vec<PrivacyCase>,
+}
+
+#[derive(serde::Deserialize)]
+struct PrivacyCase {
+    kind: String,
+    value: String,
+}
+
+fn privacy_fixture() -> PrivacyFixture {
+    serde_json::from_str(include_str!(
+        "../../../fixtures/privacy/common-sensitive.json"
+    ))
+    .unwrap()
+}
+
 struct Fixture {
     _temporary: TempDir,
     home: PathBuf,
@@ -70,6 +88,54 @@ fn event(label: &str) -> Event {
         None,
     )
     .unwrap()
+}
+
+#[test]
+fn git_append_boundary_rejects_sensitive_event_and_evidence_without_pending_residue() {
+    let fixture = Fixture::new();
+    let sensitive_event = event("alice@example.com");
+    let event_error = fixture
+        .store
+        .append_event(AppendRequest::event(sensitive_event))
+        .unwrap_err();
+    let object_value = "password=correct-horse-battery-staple";
+    let object_error = fixture
+        .store
+        .append_event(
+            AppendRequest::event(event("safe")).with_object(TextObject::new(object_value)),
+        )
+        .unwrap_err();
+
+    assert_eq!(event_error.kind(), ErrorKind::InvalidInput);
+    assert!(event_error.message().contains("email_address"));
+    assert!(!event_error.message().contains("alice@example.com"));
+    assert_eq!(object_error.kind(), ErrorKind::InvalidInput);
+    assert!(object_error.message().contains("assigned_credential"));
+    assert!(!object_error.message().contains(object_value));
+    assert!(fixture.store.list_pending().unwrap().is_empty());
+    assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), "1");
+}
+
+#[test]
+fn git_append_boundary_rejects_every_shared_privacy_fixture() {
+    let fixture = Fixture::new();
+
+    for case in privacy_fixture().cases {
+        let error = fixture
+            .store
+            .append_event(AppendRequest::event(event(&case.value)))
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidInput, "{}", case.kind);
+        assert!(
+            error.message().contains(&case.kind),
+            "{}: {error}",
+            case.kind
+        );
+        assert!(!error.message().contains(&case.value), "{}", case.kind);
+    }
+    assert!(fixture.store.list_pending().unwrap().is_empty());
+    assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), "1");
 }
 
 #[test]

@@ -18,8 +18,12 @@ sctx-event-schema.workspace = true
 sctx-git-store.workspace = true
 sctx-index.workspace = true
 sctx-installer.workspace = true
+sctx-local-state.workspace = true
 sctx-mcp.workspace = true
 sctx-search.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.20"

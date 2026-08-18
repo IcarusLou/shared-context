@@ -1,0 +1,20 @@
+{
+  "cases": [
+    { "kind": "aws_access_key", "value": "AKIAIOSFODNN7EXAMPLE" },
+    { "kind": "github_token", "value": "ghp_1234567890abcdefghijklmnopqrst" },
+    { "kind": "gitlab_token", "value": "glpat-abcdefghijklmnopqrstuvwxyz123456" },
+    { "kind": "google_api_key", "value": "AIzaabcdefghijklmnopqrstuvwxyz123456789" },
+    { "kind": "npm_token", "value": "npm_abcdefghijklmnopqrstuvwxyz123456" },
+    { "kind": "openai_key", "value": "sk-abcdefghijklmnopqrstuvwxyz123456" },
+    { "kind": "openai_key", "value": "sk-proj-abcdefghijklmnopqrstuvwxyz123456" },
+    { "kind": "stripe_live_key", "value": "sk-live_abcdefghijklmnopqrstuvwxyz123456" },
+    { "kind": "slack_token", "value": "xoxb-123456789012-123456789012-abcdefghijklmnop" },
+    { "kind": "jwt", "value": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmaXh0dXJlIn0.signature" },
+    { "kind": "bearer_credential", "value": "Bearer abcdefghijklmnopqrstuvwxyz123456" },
+    { "kind": "assigned_credential", "value": "password=correct-horse-battery-staple" },
+    { "kind": "private_key", "value": "-----BEGIN PRIVATE KEY-----\nZmFrZS1maXh0dXJl\n-----END PRIVATE KEY-----" },
+    { "kind": "email_address", "value": "alice@example.com" },
+    { "kind": "phone_number", "value": "+86 138-0013-8000" },
+    { "kind": "china_national_id", "value": "11010519491231002X" }
+  ]
+}
