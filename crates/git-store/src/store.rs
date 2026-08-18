@@ -118,6 +118,10 @@ impl CrashInjector for NoopCrashInjector {
 }
 
 /// Hook for the rebuildable index to observe a committed `HEAD`.
+///
+/// Recovery may call the observer more than once for the same or a later
+/// `HEAD`, so implementations must be idempotent and synchronize derived state
+/// from Git rather than treating the callback as an exactly-once event.
 pub trait CommitObserver: Send + Sync {
     /// Updates derived state after Git has committed the batch.
     ///
@@ -610,8 +614,8 @@ impl GitStore {
             Ok(())
         } else {
             Err(invariant(format!(
-                "append-only guard rejected managed M/D/R or foreign change: {}",
-                violations.join(", ")
+                "append-only guard rejected managed M/D/R or foreign change: {}; use `sctx context revise` to replace content or `sctx context withdraw` to retire it via a new event",
+                violations.join(", "),
             )))
         }
     }

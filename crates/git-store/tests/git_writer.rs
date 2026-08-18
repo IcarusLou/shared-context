@@ -10,10 +10,13 @@ use std::{
     thread,
 };
 
-use sctx_event_schema::{Event, IntentSnapshot};
+use sctx_event_schema::{
+    Applicability, ContextKind, ContextRevisionDraft, Event, EventPayload, EvidenceSnapshotDraft,
+    EvidenceType, IntentSnapshot, SpaceId,
+};
 use sctx_git_store::{
-    AppendRequest, CrashInjector, CrashSeam, Error, ErrorKind, GitStore, OBJECT_PENDING,
-    PendingFileKind, Result, TextObject,
+    AppendRequest, CommitObserver, CrashInjector, CrashSeam, Error, ErrorKind, GitStore,
+    OBJECT_PENDING, PendingFileKind, Result, TextObject,
 };
 use tempfile::TempDir;
 
@@ -72,6 +75,35 @@ fn event(label: &str) -> Event {
     .unwrap()
 }
 
+fn proposal(space_id: SpaceId, label: &str) -> Event {
+    Event::context_proposed(
+        space_id,
+        ContextRevisionDraft {
+            kind: ContextKind::Decision,
+            topic_key: Some(format!("git-writer/{label}")),
+            statement: format!("Proposal {label} is append-only"),
+            rationale: "Concurrent proposals must retain distinct identities".to_owned(),
+            applicability: Applicability {
+                domains: vec!["git-store".to_owned()],
+                platforms: vec!["macos".to_owned()],
+                conditions: vec!["concurrent append".to_owned()],
+            },
+            assumptions: vec!["Git is available".to_owned()],
+            recheck_when: vec!["writer protocol changes".to_owned()],
+            evidence: vec![EvidenceSnapshotDraft {
+                kind: EvidenceType::ExperimentRecord,
+                supports: "The proposal is committed independently".to_owned(),
+                content: serde_json::json!({"label": label}),
+                interpretation: "A unique event file demonstrates non-overwrite behavior"
+                    .to_owned(),
+                limitations: vec!["Local repository fixture".to_owned()],
+            }],
+        },
+        None,
+    )
+    .unwrap()
+}
+
 #[test]
 fn initialization_is_idempotent_and_uses_one_fixed_repository() {
     let fixture = Fixture::new();
@@ -94,6 +126,15 @@ fn initialization_is_idempotent_and_uses_one_fixed_repository() {
 #[test]
 fn one_hundred_concurrent_proposals_create_distinct_files_without_overwrite() {
     let fixture = Fixture::new();
+    let created = event("concurrent proposal root");
+    let space_id = match created.payload() {
+        EventPayload::SpaceCreated { space_id, .. } => *space_id,
+        _ => unreachable!(),
+    };
+    fixture
+        .store
+        .append_event(AppendRequest::event(created))
+        .unwrap();
     let store = Arc::new(fixture.store.clone());
     let outcomes = Arc::new(Mutex::new(Vec::new()));
     let mut threads = Vec::new();
@@ -103,7 +144,7 @@ fn one_hundred_concurrent_proposals_create_distinct_files_without_overwrite() {
         let outcomes = Arc::clone(&outcomes);
         threads.push(thread::spawn(move || {
             let outcome = store
-                .append_event(AppendRequest::event(event(&index.to_string())))
+                .append_event(AppendRequest::event(proposal(space_id, &index.to_string())))
                 .unwrap();
             outcomes.lock().unwrap().push(outcome);
         }));
@@ -125,7 +166,7 @@ fn one_hundred_concurrent_proposals_create_distinct_files_without_overwrite() {
             .is_file()
     }));
     assert_eq!(fixture.git(&["status", "--porcelain"]), "");
-    assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), "101");
+    assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), "102");
 }
 
 #[test]
@@ -216,6 +257,8 @@ fn modified_deleted_and_renamed_managed_files_are_each_rejected_untouched() {
             error.message().contains("append-only guard"),
             "{mode}: {error}"
         );
+        assert!(error.message().contains("sctx context revise"), "{mode}");
+        assert!(error.message().contains("sctx context withdraw"), "{mode}");
         assert_eq!(fixture.git(&["rev-parse", "HEAD"]), before);
         match mode {
             "modified" => assert_eq!(fs::read(&path).unwrap(), b"user modification"),
@@ -264,6 +307,15 @@ fn object_is_reused_only_from_head_and_pending_worktree_object_is_rejected() {
         .join(format!("objects/sha256/{}/{digest}", &digest[..2]));
     fs::create_dir_all(pending_path.parent().unwrap()).unwrap();
     fs::write(&pending_path, pending_text).unwrap();
+    fixture.git(&[
+        "add",
+        "--",
+        pending_path
+            .strip_prefix(fixture.store.repository())
+            .unwrap()
+            .to_str()
+            .unwrap(),
+    ]);
     let error = fixture
         .store
         .append_event(
@@ -273,6 +325,80 @@ fn object_is_reused_only_from_head_and_pending_worktree_object_is_rejected() {
         .unwrap_err();
     assert!(error.message().contains(OBJECT_PENDING), "{error}");
     assert_eq!(fs::read_to_string(pending_path).unwrap(), pending_text);
+    assert!(
+        fixture
+            .git(&["diff", "--cached", "--name-only"])
+            .contains(&digest)
+    );
+}
+
+#[test]
+fn create_new_refuses_an_existing_generated_event_path_without_overwrite() {
+    let fixture = Fixture::new();
+    let event = event("create-new-collision");
+    let event_id = event.event_id().to_string();
+    let prefix = &event_id["evt_".len().."evt_".len() + 2];
+    let relative = format!("events/{prefix}/{event_id}.json");
+    let target = fixture.store.repository().join(&relative);
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let mut bytes = serde_json::to_vec_pretty(&event).unwrap();
+    bytes.push(b'\n');
+    fs::write(&target, &bytes).unwrap();
+    let before = fixture.git(&["rev-parse", "HEAD"]);
+
+    let error = fixture
+        .store
+        .append_event(AppendRequest::event(event))
+        .unwrap_err();
+
+    assert!(error.message().contains("create_new refused"), "{error}");
+    assert_eq!(fs::read(&target).unwrap(), bytes);
+    assert_eq!(fixture.git(&["rev-parse", "HEAD"]), before);
+    assert!(
+        !fixture
+            .git(&["ls-tree", "-r", "--name-only", "HEAD"])
+            .contains(&relative)
+    );
+}
+
+#[test]
+fn concurrent_batches_with_the_same_object_commit_the_object_once() {
+    let fixture = Fixture::new();
+    let store = Arc::new(fixture.store.clone());
+    let evidence = "shared concurrent evidence";
+    let mut handles = Vec::new();
+    for label in ["same-object-a", "same-object-b"] {
+        let store = Arc::clone(&store);
+        handles.push(thread::spawn(move || {
+            store
+                .append_event(
+                    AppendRequest::event(event(label)).with_object(TextObject::new(evidence)),
+                )
+                .unwrap()
+        }));
+    }
+    let outcomes: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+
+    assert_eq!(outcomes[0].objects, outcomes[1].objects);
+    let object_path = &outcomes[0].objects[0].path;
+    assert_eq!(
+        fixture
+            .git(&["log", "--format=%H", "--", object_path])
+            .lines()
+            .count(),
+        1
+    );
+    assert!(outcomes.iter().all(|outcome| {
+        fixture
+            .git(&["log", "--format=%H", "--", &outcome.event_path])
+            .lines()
+            .count()
+            == 1
+    }));
+    assert_eq!(fixture.git(&["status", "--porcelain"]), "");
 }
 
 struct FailOnce {
@@ -295,6 +421,30 @@ impl CrashInjector for FailOnce {
             return Err(Error::new(
                 ErrorKind::Io,
                 format!("injected crash at {seam:?}"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct FailFirstIndexUpdate {
+    calls: AtomicUsize,
+}
+
+impl FailFirstIndexUpdate {
+    const fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl CommitObserver for FailFirstIndexUpdate {
+    fn committed(&self, _repository: &Path, _commit_oid: &str) -> Result<()> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(Error::new(
+                ErrorKind::Io,
+                "injected derived-index update failure",
             ));
         }
         Ok(())
@@ -360,6 +510,38 @@ fn every_crash_seam_recovers_stable_content_with_at_most_one_semantic_commit() {
         );
         assert_eq!(fixture.git(&["status", "--porcelain"]), "", "{seam:?}");
     }
+}
+
+#[test]
+fn index_update_failure_is_retried_without_repeating_the_git_commit() {
+    let fixture = Fixture::new();
+    let observer = Arc::new(FailFirstIndexUpdate::new());
+    let indexed_store = fixture.store.clone().with_commit_observer(observer.clone());
+    indexed_store
+        .append_event(AppendRequest::event(event("index-retry")))
+        .unwrap_err();
+    let pending = indexed_store.list_pending().unwrap();
+    assert_eq!(pending.len(), 1);
+    let event_path = pending[0]
+        .files
+        .iter()
+        .find(|file| file.kind == PendingFileKind::Event)
+        .unwrap()
+        .target_path
+        .clone();
+
+    indexed_store.recover_pending().unwrap();
+
+    assert_eq!(observer.calls.load(Ordering::SeqCst), 2);
+    assert!(indexed_store.list_pending().unwrap().is_empty());
+    assert_eq!(
+        fixture
+            .git(&["log", "--format=%H", "--", &event_path])
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(fixture.git(&["status", "--porcelain"]), "");
 }
 
 #[test]
