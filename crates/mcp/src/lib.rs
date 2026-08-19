@@ -21,6 +21,7 @@ use sctx_domain::{
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::{DomainSnapshot, ProjectionIndex};
+use sctx_local_state::UserConfigStore;
 use sctx_search::{
     ConflictView, ContextPackMode, ContextPackRequest, ContextStatus, ScopeFilter, SearchEngine,
     SearchFilters, SearchRequest,
@@ -124,13 +125,19 @@ struct Frame {
 struct Runtime {
     store: GitStore,
     index: ProjectionIndex,
+    config: UserConfigStore,
 }
 
 impl Runtime {
     fn open(root: &Path) -> Result<Self> {
         let store = GitStore::initialize(root)?;
         let index = ProjectionIndex::for_store(&store);
-        Ok(Self { store, index })
+        let config = UserConfigStore::initialize(store.root())?;
+        Ok(Self {
+            store,
+            index,
+            config,
+        })
     }
 
     fn snapshot(&self) -> Result<DomainSnapshot> {
@@ -338,7 +345,9 @@ impl McpServer {
 
     fn context_for_task(&self, arguments: Value) -> ToolResult {
         let input: TaskInput = decode_arguments(arguments)?;
-        let request = input.into_request()?;
+        let routing =
+            self.resolve_routing(input.space_id.as_deref(), input.workspace.as_deref())?;
+        let request = input.into_request(routing.resolved_space_id)?;
         let response = SearchEngine::new(self.runtime.index.clone()).context_pack(&request)?;
         let conflicts = response
             .items
@@ -354,6 +363,7 @@ impl McpServer {
                     serde_json::to_value(conflicts).map_err(serialization_failure)?,
                 ),
                 ("match_reason", json!("task_text_and_structured_hints")),
+                ("routing", routing.into_value()),
             ],
         )?;
         Ok(data)
@@ -433,13 +443,9 @@ impl McpServer {
 
     fn context_propose(&mut self, arguments: Value) -> ToolResult {
         let input: ProposeInput = decode_arguments(arguments)?;
-        let space_id = parse_id::<SpaceId>(&input.space_id, "space_id")?;
-        let before = self.runtime.snapshot()?;
-        if !before.projection.spaces.contains_key(&space_id) {
-            return Err(ToolFailure::from(invalid(format!(
-                "space does not exist: {space_id}"
-            ))));
-        }
+        let routing =
+            self.resolve_routing(input.space_id.as_deref(), input.workspace.as_deref())?;
+        let space_id = routing.resolved_space_id;
         let event = Event::context_proposed(space_id, input.into_draft(), None)?;
         let (context_id, revision_id) = match event.payload() {
             EventPayload::ContextRevisionAdded {
@@ -471,7 +477,73 @@ impl McpServer {
             "commit_oid": append.commit_oid,
             "conflicts": context_conflicts(&snapshot, context_id),
             "match_reason": "new_candidate_created",
+            "routing": routing.into_value(),
         }))
+    }
+
+    fn resolve_routing(
+        &self,
+        explicit_space_id: Option<&str>,
+        workspace: Option<&str>,
+    ) -> std::result::Result<Routing, ToolFailure> {
+        let routing = if let Some(space_id) = explicit_space_id {
+            Routing {
+                resolved_space_id: parse_id(space_id, "space_id")?,
+                source: RoutingSource::ExplicitSpaceId,
+            }
+        } else {
+            let workspace = workspace.ok_or_else(ToolFailure::routing_unresolved)?;
+            let workspace_path = Path::new(workspace);
+            if !workspace_path.is_absolute() {
+                return Err(invalid("workspace must be an absolute path").into());
+            }
+            let hint = self
+                .runtime
+                .config
+                .query_hint(workspace_path)?
+                .ok_or_else(ToolFailure::workspace_unbound)?;
+            Routing {
+                resolved_space_id: hint.space_id(),
+                source: RoutingSource::WorkspaceBinding,
+            }
+        };
+
+        let snapshot = self.runtime.snapshot()?;
+        if !snapshot
+            .projection
+            .spaces
+            .contains_key(&routing.resolved_space_id)
+        {
+            return Err(ToolFailure::routing_space_not_found(
+                routing.resolved_space_id,
+            ));
+        }
+        Ok(routing)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RoutingSource {
+    ExplicitSpaceId,
+    WorkspaceBinding,
+}
+
+#[derive(Clone, Copy)]
+struct Routing {
+    resolved_space_id: SpaceId,
+    source: RoutingSource,
+}
+
+impl Routing {
+    fn into_value(self) -> Value {
+        let source = match self.source {
+            RoutingSource::ExplicitSpaceId => "explicit_space_id",
+            RoutingSource::WorkspaceBinding => "workspace_binding",
+        };
+        json!({
+            "resolved_space_id": self.resolved_space_id,
+            "source": source,
+        })
     }
 }
 
@@ -503,6 +575,27 @@ struct ToolFailure {
 }
 
 impl ToolFailure {
+    fn routing_unresolved() -> Self {
+        Self {
+            code: "routing_unresolved",
+            error: invalid("space routing requires space_id or workspace"),
+        }
+    }
+
+    fn workspace_unbound() -> Self {
+        Self {
+            code: "workspace_unbound",
+            error: invalid("workspace has no exact WorkspaceBinding"),
+        }
+    }
+
+    fn routing_space_not_found(space_id: SpaceId) -> Self {
+        Self {
+            code: "routing_space_not_found",
+            error: invalid(format!("resolved space does not exist: {space_id}")),
+        }
+    }
+
     fn writer_rejected(error: Error) -> Self {
         Self {
             code: "writer_rejected",
@@ -615,6 +708,8 @@ struct TaskInput {
     #[serde(default)]
     space_id: Option<String>,
     #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
     domains: Vec<String>,
     #[serde(default)]
     platforms: Vec<String>,
@@ -629,19 +724,18 @@ struct TaskInput {
 }
 
 impl TaskInput {
-    fn into_request(self) -> std::result::Result<ContextPackRequest, ToolFailure> {
+    fn into_request(
+        self,
+        resolved_space_id: SpaceId,
+    ) -> std::result::Result<ContextPackRequest, ToolFailure> {
         if self.task.trim().is_empty() {
             return Err(invalid("task must not be empty").into());
         }
-        let preferred_space_id = self
-            .space_id
-            .as_deref()
-            .map(|value| parse_id(value, "space_id"))
-            .transpose()?;
         Ok(ContextPackRequest {
             search: SearchRequest {
                 query: self.task,
                 filters: SearchFilters {
+                    space_ids: vec![resolved_space_id],
                     scope: ScopeFilter {
                         domains: self.domains,
                         platforms: self.platforms,
@@ -650,7 +744,7 @@ impl TaskInput {
                     kinds: self.kinds,
                     ..SearchFilters::default()
                 },
-                preferred_space_id,
+                preferred_space_id: Some(resolved_space_id),
                 page_size: self.candidate_limit,
                 ..SearchRequest::default()
             },
@@ -664,7 +758,10 @@ impl TaskInput {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProposeInput {
-    space_id: String,
+    #[serde(default)]
+    space_id: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
     kind: ContextKind,
     #[serde(default)]
     topic_key: Option<String>,
@@ -726,9 +823,14 @@ fn tools_list() -> Value {
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["task"],
+                "anyOf": [
+                    {"required": ["space_id"]},
+                    {"required": ["workspace"]}
+                ],
                 "properties": {
                     "task": {"type": "string", "minLength": 1},
                     "space_id": id_schema("spc_"),
+                    "workspace": workspace_schema(),
                     "domains": string_array_schema(),
                     "platforms": string_array_schema(),
                     "conditions": string_array_schema(),
@@ -798,9 +900,14 @@ fn propose_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["space_id", "kind", "statement", "rationale", "evidence"],
+        "required": ["kind", "statement", "rationale", "evidence"],
+        "anyOf": [
+            {"required": ["space_id"]},
+            {"required": ["workspace"]}
+        ],
         "properties": {
             "space_id": id_schema("spc_"),
+            "workspace": workspace_schema(),
             "kind": kind_schema(),
             "topic_key": {"type": "string", "minLength": 1},
             "statement": {"type": "string", "minLength": 1},
@@ -847,6 +954,10 @@ fn kind_array_schema() -> Value {
 
 fn string_array_schema() -> Value {
     json!({"type": "array", "items": {"type": "string", "minLength": 1}})
+}
+
+fn workspace_schema() -> Value {
+    json!({"type": "string", "minLength": 1, "pattern": "^/"})
 }
 
 fn id_schema(prefix: &str) -> Value {

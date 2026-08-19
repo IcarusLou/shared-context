@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     io::{BufReader, Cursor},
     path::Path,
@@ -11,6 +12,7 @@ use sctx_domain::{
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
+use sctx_local_state::UserConfigStore;
 use sctx_mcp::{ClientKind, DisconnectReason, McpServer, TransportErrorKind};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -22,7 +24,7 @@ enum FixtureFraming {
 }
 
 struct Fixture {
-    _temporary: TempDir,
+    temporary: TempDir,
     root: std::path::PathBuf,
     store: GitStore,
     space_id: SpaceId,
@@ -61,7 +63,7 @@ impl Fixture {
             .unwrap(),
         );
         Self {
-            _temporary: temporary,
+            temporary,
             root,
             store,
             space_id,
@@ -72,6 +74,13 @@ impl Fixture {
 
     fn server(&self, client: ClientKind) -> McpServer {
         McpServer::new(&self.root, client).unwrap()
+    }
+
+    fn bind(&self, workspace: &Path, space_id: SpaceId) {
+        UserConfigStore::initialize(&self.root)
+            .unwrap()
+            .bind(workspace, space_id)
+            .unwrap();
     }
 }
 
@@ -128,6 +137,57 @@ fn proposal_arguments(space_id: SpaceId, statement: &str) -> Value {
             "limitations": []
         }]
     })
+}
+
+fn workspace_proposal_arguments(workspace: &Path, statement: &str) -> Value {
+    let mut arguments = proposal_arguments(SpaceId::new(), statement);
+    let object = arguments.as_object_mut().unwrap();
+    object.remove("space_id");
+    object.insert(
+        "workspace".to_owned(),
+        Value::String(workspace.to_str().unwrap().to_owned()),
+    );
+    arguments
+}
+
+fn proposal_without_routing(statement: &str) -> Value {
+    let mut arguments = proposal_arguments(SpaceId::new(), statement);
+    arguments.as_object_mut().unwrap().remove("space_id");
+    arguments
+}
+
+fn create_space(store: &GitStore, title: &str) -> SpaceId {
+    let mut space_intent = intent();
+    title.clone_into(&mut space_intent.title);
+    let created = Event::space_created(space_intent, None).unwrap();
+    let space_id = match created.payload() {
+        EventPayload::SpaceCreated { space_id, .. } => *space_id,
+        _ => unreachable!(),
+    };
+    append(store, created);
+    space_id
+}
+
+fn publish_context(store: &GitStore, space_id: SpaceId, statement: &str) -> ContextId {
+    let proposed = Event::context_proposed(space_id, draft(statement), None).unwrap();
+    let (context_id, revision_id) = context_identity(&proposed);
+    append(store, proposed);
+    append(
+        store,
+        Event::publication_changed(
+            space_id,
+            context_id,
+            PublicationDraft {
+                previous_publication_ids: Vec::new(),
+                action: PublicationAction::Publish,
+                revision_id,
+                review_event_ids: Vec::new(),
+            },
+            None,
+        )
+        .unwrap(),
+    );
+    context_id
 }
 
 fn append(store: &GitStore, event: Event) {
@@ -307,6 +367,14 @@ fn cursor_and_codex_fixtures_initialize_list_search_get_propose_and_list_spaces(
             );
         }
         assert_eq!(proposal_schema["additionalProperties"], false);
+        let task_schema = &tools
+            .iter()
+            .find(|tool| tool["name"] == "context_for_task")
+            .unwrap()["inputSchema"];
+        for schema in [task_schema, proposal_schema] {
+            assert_eq!(schema["properties"]["workspace"]["pattern"], "^/");
+            assert_eq!(schema["anyOf"].as_array().unwrap().len(), 2);
+        }
 
         for response in &responses[2..] {
             assert_eq!(response["result"]["isError"], false, "{response:#}");
@@ -326,12 +394,210 @@ fn cursor_and_codex_fixtures_initialize_list_search_get_propose_and_list_spaces(
         assert_eq!(get["context_id"], fixture.context_id.to_string());
         let pack = &responses[4]["result"]["structuredContent"];
         assert_eq!(pack["mode"], "automatic_injection");
+        assert_eq!(
+            pack["routing"],
+            json!({
+                "resolved_space_id": fixture.space_id,
+                "source": "explicit_space_id"
+            })
+        );
         let proposal = &responses[5]["result"]["structuredContent"];
         assert_eq!(proposal["status"], "candidate");
+        assert_eq!(proposal["routing"], pack["routing"]);
         assert_eq!(event_count(fixture.store.repository()), before_count + 1);
         let spaces = &responses[6]["result"]["structuredContent"];
         assert_eq!(spaces["spaces"].as_array().unwrap().len(), 1);
     }
+}
+
+#[test]
+fn exact_workspace_binding_routes_task_and_proposal_without_persisting_workspace() {
+    let fixture = Fixture::new();
+    let workspace = fixture.temporary.path().join("业务 workspace 中文");
+    fs::create_dir_all(&workspace).unwrap();
+    fixture.bind(&workspace, fixture.space_id);
+    let before_paths = event_paths(fixture.store.repository());
+
+    let responses = run_session(
+        &mut fixture.server(ClientKind::Cursor),
+        FixtureFraming::Newline,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(
+                2,
+                "context_for_task",
+                json!({"task": "stdio MCP contract", "workspace": workspace}),
+            ),
+            tool_call(
+                3,
+                "context_propose",
+                workspace_proposal_arguments(&workspace, "workspace-routed candidate"),
+            ),
+        ],
+    );
+
+    for response in &responses[1..] {
+        assert_eq!(response["result"]["isError"], false, "{response:#}");
+        let data = &response["result"]["structuredContent"];
+        assert_eq!(
+            data["routing"],
+            json!({
+                "resolved_space_id": fixture.space_id,
+                "source": "workspace_binding"
+            })
+        );
+        assert!(!data.to_string().contains(workspace.to_str().unwrap()));
+    }
+    let pack_items = responses[1]["result"]["structuredContent"]["items"]
+        .as_array()
+        .unwrap();
+    assert!(!pack_items.is_empty());
+    assert!(
+        pack_items
+            .iter()
+            .all(|item| item["space_id"] == fixture.space_id.to_string())
+    );
+
+    let after_paths = event_paths(fixture.store.repository());
+    let new_paths = after_paths.difference(&before_paths).collect::<Vec<_>>();
+    assert_eq!(new_paths.len(), 1);
+    let event_text = git(
+        fixture.store.repository(),
+        &["show", &format!("HEAD:{}", new_paths[0])],
+    );
+    let event: Value = serde_json::from_str(&event_text).unwrap();
+    assert!(event.get("annotations").is_none());
+    assert!(!event_text.contains(workspace.to_str().unwrap()));
+}
+
+#[test]
+fn routing_fails_closed_for_unbound_invalid_and_missing_inputs() {
+    let fixture = Fixture::new();
+    let bound = fixture.temporary.path().join("bound workspace");
+    let child = bound.join("child");
+    let unbound = fixture.temporary.path().join("unbound workspace");
+    fs::create_dir_all(&child).unwrap();
+    fs::create_dir_all(&unbound).unwrap();
+    fixture.bind(&bound, fixture.space_id);
+    let missing = fixture.temporary.path().join("missing workspace");
+    let before_count = event_count(fixture.store.repository());
+
+    let responses = run_session(
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::ContentLength,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(
+                2,
+                "context_for_task",
+                json!({"task": "no prefix routing", "workspace": child}),
+            ),
+            tool_call(
+                3,
+                "context_propose",
+                workspace_proposal_arguments(&unbound, "unbound must fail"),
+            ),
+            tool_call(
+                4,
+                "context_for_task",
+                json!({"task": "relative must fail", "workspace": "."}),
+            ),
+            tool_call(
+                5,
+                "context_propose",
+                workspace_proposal_arguments(&missing, "missing must fail"),
+            ),
+            tool_call(6, "context_for_task", json!({"task": "do not guess"})),
+            tool_call(
+                7,
+                "context_propose",
+                proposal_without_routing("do not guess the only Space"),
+            ),
+        ],
+    );
+
+    let error_codes = responses[1..]
+        .iter()
+        .map(|response| {
+            assert_eq!(response["result"]["isError"], true, "{response:#}");
+            response["result"]["structuredContent"]["error"]["code"]
+                .as_str()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        error_codes,
+        [
+            "workspace_unbound",
+            "workspace_unbound",
+            "invalid_input",
+            "invalid_input",
+            "routing_unresolved",
+            "routing_unresolved",
+        ]
+    );
+    assert_eq!(event_count(fixture.store.repository()), before_count);
+}
+
+#[test]
+fn explicit_space_wins_over_a_conflicting_workspace_binding() {
+    let fixture = Fixture::new();
+    let workspace = fixture.temporary.path().join("conflicting workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    fixture.bind(&workspace, fixture.space_id);
+    let explicit_space_id = create_space(&fixture.store, "Explicit routing target");
+    publish_context(
+        &fixture.store,
+        explicit_space_id,
+        "explicit routing target contract",
+    );
+
+    let mut proposal = proposal_arguments(explicit_space_id, "explicit proposal wins");
+    proposal.as_object_mut().unwrap().insert(
+        "workspace".to_owned(),
+        Value::String(workspace.to_str().unwrap().to_owned()),
+    );
+    let responses = run_session(
+        &mut fixture.server(ClientKind::Cursor),
+        FixtureFraming::Newline,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(
+                2,
+                "context_for_task",
+                json!({
+                    "task": "explicit routing target contract",
+                    "space_id": explicit_space_id,
+                    "workspace": workspace,
+                }),
+            ),
+            tool_call(3, "context_propose", proposal),
+        ],
+    );
+
+    for response in &responses[1..] {
+        assert_eq!(response["result"]["isError"], false, "{response:#}");
+        assert_eq!(
+            response["result"]["structuredContent"]["routing"],
+            json!({
+                "resolved_space_id": explicit_space_id,
+                "source": "explicit_space_id"
+            })
+        );
+    }
+    let items = responses[1]["result"]["structuredContent"]["items"]
+        .as_array()
+        .unwrap();
+    assert!(!items.is_empty());
+    assert!(
+        items
+            .iter()
+            .all(|item| item["space_id"] == explicit_space_id.to_string())
+    );
+    assert_eq!(
+        responses[2]["result"]["structuredContent"]["space_id"],
+        explicit_space_id.to_string()
+    );
 }
 
 #[test]
@@ -439,6 +705,14 @@ fn event_count(repository: &Path) -> usize {
         .lines()
         .filter(|path| path.starts_with("events/"))
         .count()
+}
+
+fn event_paths(repository: &Path) -> BTreeSet<String> {
+    git(repository, &["ls-tree", "-r", "--name-only", "HEAD"])
+        .lines()
+        .filter(|path| path.starts_with("events/"))
+        .map(str::to_owned)
+        .collect()
 }
 
 fn dirty_first_event(repository: &Path) {
