@@ -18,6 +18,7 @@ use sctx_domain::{
     Applicability, ContextId, ContextKind, ContextRevisionDraft, Error, ErrorKind,
     EvidenceSnapshotDraft, EvidenceType, Result, RevisionId, SpaceId,
 };
+use sctx_event_schema::{Annotations, OriginHint};
 use sctx_git_store::GitStore;
 use sctx_index::{DomainSnapshot, ProjectionIndex};
 use sctx_local_state::UserConfigStore;
@@ -445,10 +446,11 @@ impl McpServer {
         let routing =
             self.resolve_routing(input.space_id.as_deref(), input.workspace.as_deref())?;
         let space_id = routing.resolved_space_id;
+        let annotations = self.proposal_annotations();
         let proposal = self
             .runtime
             .store
-            .propose_context_idempotently(space_id, input.into_draft(), None)
+            .propose_context_idempotently(space_id, input.into_draft(), Some(annotations))
             .map_err(ToolFailure::writer_rejected)?;
         let existing = proposal.existing();
         let identity = proposal.identity;
@@ -520,6 +522,24 @@ impl McpServer {
             ));
         }
         Ok(routing)
+    }
+
+    fn proposal_annotations(&self) -> Annotations {
+        Annotations {
+            producer: Some("shared-context-mcp".to_owned()),
+            origin_hint: Some(OriginHint {
+                values: [(
+                    "client".to_owned(),
+                    json!(match self.client {
+                        ClientKind::Cursor => "cursor",
+                        ClientKind::Codex => "codex",
+                    }),
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            ..Annotations::default()
+        }
     }
 }
 

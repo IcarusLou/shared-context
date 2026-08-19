@@ -467,8 +467,37 @@ fn exact_workspace_binding_routes_task_and_proposal_without_persisting_workspace
         &["show", &format!("HEAD:{}", new_paths[0])],
     );
     let event: Value = serde_json::from_str(&event_text).unwrap();
-    assert!(event.get("annotations").is_none());
+    assert_eq!(
+        event["annotations"],
+        json!({
+            "producer": "shared-context-mcp",
+            "origin_hint": {"client": "cursor"}
+        })
+    );
     assert!(!event_text.contains(workspace.to_str().unwrap()));
+
+    let created = &responses[2]["result"]["structuredContent"];
+    let retry = run_session(
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::ContentLength,
+        &[
+            request(4, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(
+                5,
+                "context_propose",
+                proposal_arguments(fixture.space_id, "workspace-routed candidate"),
+            ),
+        ],
+    );
+    let existing = &retry[1]["result"]["structuredContent"];
+    assert_eq!(existing["deduplicated"], true);
+    for id in ["event_id", "context_id", "revision_id"] {
+        assert_eq!(existing[id], created[id], "{id}");
+    }
+    assert_eq!(
+        event_count(fixture.store.repository()),
+        before_paths.len() + 1
+    );
 }
 
 #[test]
