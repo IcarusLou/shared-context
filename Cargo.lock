@@ -621,6 +621,7 @@ dependencies = [
  "sctx-event-schema",
  "sctx-git-store",
  "sctx-index",
+ "sctx-local-state",
  "sctx-search",
  "serde",
  "serde_json",
