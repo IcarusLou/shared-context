@@ -65,6 +65,16 @@ test('binary verification enforces checksum before code signature', (context) =>
 
   const digest = require('node:crypto').createHash('sha256').update('signed fixture').digest('hex');
   fs.writeFileSync(`${binary}.sha256`, `${digest}  sctx\n`);
+  assert.throws(
+    () =>
+      verifyBinary(binary, {
+        spawn() {
+          signatureChecks += 1;
+          return { status: 1, stderr: 'code object is not signed at all' };
+        },
+      }),
+    /signature verification failed.*code object is not signed at all/,
+  );
   verifyBinary(binary, {
     spawn(command, args) {
       signatureChecks += 1;
@@ -73,7 +83,7 @@ test('binary verification enforces checksum before code signature', (context) =>
       return { status: 0 };
     },
   });
-  assert.equal(signatureChecks, 1);
+  assert.equal(signatureChecks, 2);
 });
 
 test('launcher forwards argv, inherited stdio, and native exit code unchanged', () => {
