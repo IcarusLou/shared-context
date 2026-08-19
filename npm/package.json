@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
+    "install:local": "node scripts/install-local.js",
     "test": "node --test tests/*.test.js"
   },
   "engines": {

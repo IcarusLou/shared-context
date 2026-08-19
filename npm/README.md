@@ -31,6 +31,27 @@ Use `--arch x64` with a signed, thin x86_64 binary for the Intel artifacts. Each
 output contains the main tgz and exactly one platform tgz, a local-only root package/lock,
 `MANIFEST.json`, `SHA256SUMS`, an `install` entrypoint, and a reproducible `.tar.gz` archive.
 
+## One-command local install
+
+For end-to-end testing on the current Mac, build the Rust CLI from source, ad-hoc sign it, pack the
+launcher and matching platform package, and install both local tgz files with:
+
+```bash
+cd npm
+npm run install:local
+```
+
+The command defaults to a release build and the repository-local `target/npm-local` NPM prefix. It
+prints the absolute `sctx` path and a `PATH` export after verifying the installed binary checksum,
+code signature, and version. The NPM install uses an empty temporary cache in offline mode, ignores
+lifecycle scripts, and does not run `sctx setup` or change Cursor/Codex configuration.
+
+Use a debug build or a different dedicated prefix when needed:
+
+```bash
+npm run install:local -- --profile debug --prefix /absolute/path/to/prefix
+```
+
 ## Offline install
 
 After transferring the matching archive to the target Mac:

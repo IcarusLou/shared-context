@@ -61,6 +61,16 @@ Rust target 都必须安装。arm64 主机执行当前架构真实二进制的 l
 安装方法见 [`npm/README.md`](./npm/README.md)。构建脚本只写本地输出，不执行 publish
 或 upload。
 
+需要在当前 Mac 上测试源码到本地 NPM 安装的完整链路时，运行：
+
+```bash
+cd npm
+npm run install:local
+```
+
+脚本默认执行 release 编译、临时 ad-hoc 签名、当前架构双 tgz 打包，并以 offline 模式安装
+到 `target/npm-local`。它只验证安装后的 `sctx`，不会执行 Setup 或修改 Agent 配置。
+
 ## 设计不变量
 
 任何后续实现都必须保持 [`technical-design.md`](./technical-design.md) 第 20 节的核心不变量。骨架中的 crate 边界不是对领域模型的替代定义。
