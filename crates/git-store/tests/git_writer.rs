@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -10,7 +10,10 @@ use std::{
     thread,
 };
 
-use sctx_event_schema::{Event, IntentSnapshot};
+use sctx_event_schema::{
+    Annotations, Applicability, ContextKind, ContextRevisionDraft, Event, EventPayload,
+    EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, SpaceId,
+};
 use sctx_git_store::{
     AppendRequest, CrashInjector, CrashSeam, Error, ErrorKind, GitStore, OBJECT_PENDING,
     PendingFileKind, Result, TextObject,
@@ -88,6 +91,62 @@ fn event(label: &str) -> Event {
         None,
     )
     .unwrap()
+}
+
+fn context_space(store: &GitStore, label: &str) -> SpaceId {
+    let created = event(label);
+    let space_id = match created.payload() {
+        EventPayload::SpaceCreated { space_id, .. } => *space_id,
+        _ => unreachable!(),
+    };
+    store
+        .append_event(AppendRequest::event(created))
+        .expect("append ContextSpace");
+    space_id
+}
+
+fn proposal_draft() -> ContextRevisionDraft {
+    ContextRevisionDraft {
+        kind: ContextKind::Decision,
+        topic_key: Some("writer/idempotency".to_owned()),
+        statement: "Identical MCP retries reuse the first proposal".to_owned(),
+        rationale: "The writer lock is the atomic comparison boundary".to_owned(),
+        applicability: Applicability {
+            domains: vec!["storage".to_owned(), "mcp".to_owned()],
+            platforms: vec!["macos".to_owned(), "linux".to_owned()],
+            conditions: vec!["retry".to_owned(), "concurrent".to_owned()],
+        },
+        assumptions: vec![
+            "Git HEAD is readable".to_owned(),
+            "IDs are opaque".to_owned(),
+        ],
+        recheck_when: vec![
+            "the writer changes".to_owned(),
+            "the schema changes".to_owned(),
+        ],
+        evidence: vec![
+            EvidenceSnapshotDraft {
+                kind: EvidenceType::ExperimentRecord,
+                supports: "one Event is committed".to_owned(),
+                content: serde_json::json!({
+                    "attempts": ["first", "retry"],
+                    "result": {"events": 1}
+                }),
+                interpretation: "the retry reused generated identities".to_owned(),
+                limitations: vec!["local Git".to_owned(), "single store".to_owned()],
+            },
+            EvidenceSnapshotDraft {
+                kind: EvidenceType::SourceSnapshot,
+                supports: "the lock covers comparison and append".to_owned(),
+                content: serde_json::json!({
+                    "boundary": "writer.lock",
+                    "steps": ["recover", "compare", "append"]
+                }),
+                interpretation: "separate MCP processes serialize proposals".to_owned(),
+                limitations: vec!["filesystem locking".to_owned()],
+            },
+        ],
+    }
 }
 
 #[test]
@@ -192,6 +251,203 @@ fn one_hundred_concurrent_proposals_create_distinct_files_without_overwrite() {
     }));
     assert_eq!(fixture.git(&["status", "--porcelain"]), "");
     assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), "101");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn idempotent_context_proposal_compares_every_authoritative_field_and_array_order() {
+    let fixture = Fixture::new();
+    let space_id = context_space(&fixture.store, "strict proposal identity");
+    let another_space_id = context_space(&fixture.store, "Space boundary");
+    let draft = proposal_draft();
+    let first = fixture
+        .store
+        .propose_context_idempotently(
+            space_id,
+            draft.clone(),
+            Some(Annotations {
+                producer: Some("first producer".to_owned()),
+                ..Annotations::default()
+            }),
+        )
+        .unwrap();
+    assert!(!first.existing());
+
+    let retry = fixture
+        .store
+        .propose_context_idempotently(
+            space_id,
+            draft.clone(),
+            Some(Annotations {
+                producer: Some("retry producer".to_owned()),
+                ..Annotations::default()
+            }),
+        )
+        .unwrap();
+    assert!(retry.existing());
+    assert_eq!(retry.identity, first.identity);
+
+    let mut variants = Vec::new();
+    let mut changed = draft.clone();
+    changed.kind = ContextKind::Risk;
+    variants.push(("kind", changed));
+    let mut changed = draft.clone();
+    changed.topic_key = Some("writer/idempotency-v2".to_owned());
+    variants.push(("topic_key", changed));
+    let mut changed = draft.clone();
+    changed.statement.push(' ');
+    variants.push(("statement whitespace", changed));
+    let mut changed = draft.clone();
+    changed.statement = changed.statement.to_uppercase();
+    variants.push(("statement case", changed));
+    let mut changed = draft.clone();
+    changed.rationale.push_str(" across processes");
+    variants.push(("rationale", changed));
+    let mut changed = draft.clone();
+    changed.applicability.domains.swap(0, 1);
+    variants.push(("applicability domain order", changed));
+    let mut changed = draft.clone();
+    changed.applicability.platforms[0] = "windows".to_owned();
+    variants.push(("applicability platform", changed));
+    let mut changed = draft.clone();
+    changed.applicability.conditions.swap(0, 1);
+    variants.push(("applicability condition order", changed));
+    let mut changed = draft.clone();
+    changed.assumptions.swap(0, 1);
+    variants.push(("assumption order", changed));
+    let mut changed = draft.clone();
+    changed.recheck_when.swap(0, 1);
+    variants.push(("recheck_when order", changed));
+    let mut changed = draft.clone();
+    changed.evidence.swap(0, 1);
+    variants.push(("Evidence order", changed));
+    let mut changed = draft.clone();
+    changed.evidence[0].kind = EvidenceType::ArtifactSnapshot;
+    variants.push(("Evidence kind", changed));
+    let mut changed = draft.clone();
+    changed.evidence[0].supports.push_str(" exactly");
+    variants.push(("Evidence supports", changed));
+    let mut changed = draft.clone();
+    changed.evidence[0].content = serde_json::json!({
+        "attempts": ["retry", "first"],
+        "result": {"events": 1}
+    });
+    variants.push(("Evidence content array order", changed));
+    let mut changed = draft.clone();
+    changed.evidence[0].interpretation.push_str(" unchanged");
+    variants.push(("Evidence interpretation", changed));
+    let mut changed = draft.clone();
+    changed.evidence[0].limitations.swap(0, 1);
+    variants.push(("Evidence limitation order", changed));
+
+    let mut identities = HashSet::from([first.identity.context_id]);
+    for (field, variant) in &variants {
+        let outcome = fixture
+            .store
+            .propose_context_idempotently(space_id, variant.clone(), None)
+            .unwrap_or_else(|error| panic!("{field}: {error}"));
+        assert!(!outcome.existing(), "{field}");
+        assert!(identities.insert(outcome.identity.context_id), "{field}");
+    }
+
+    let other_space = fixture
+        .store
+        .propose_context_idempotently(another_space_id, draft, None)
+        .unwrap();
+    assert!(!other_space.existing());
+    assert_ne!(other_space.identity.context_id, first.identity.context_id);
+    assert_eq!(
+        fixture
+            .git(&["ls-tree", "-r", "--name-only", "HEAD", "--", "events"])
+            .lines()
+            .count(),
+        2 + 1 + variants.len() + 1
+    );
+}
+
+#[test]
+fn idempotent_context_proposal_recovers_a_pending_retry_before_comparing() {
+    let fixture = Fixture::new();
+    let space_id = context_space(&fixture.store, "pending proposal");
+    let crashing = fixture
+        .store
+        .clone()
+        .with_crash_injector(Arc::new(FailOnce::at(CrashSeam::AfterJournal)));
+    crashing
+        .propose_context_idempotently(space_id, proposal_draft(), None)
+        .unwrap_err();
+    assert_eq!(fixture.store.list_pending().unwrap().len(), 1);
+
+    let retry = fixture
+        .store
+        .propose_context_idempotently(space_id, proposal_draft(), None)
+        .unwrap();
+    assert!(retry.existing());
+    assert!(fixture.store.list_pending().unwrap().is_empty());
+    assert_eq!(
+        fixture
+            .git(&["ls-tree", "-r", "--name-only", "HEAD", "--", "events"])
+            .lines()
+            .count(),
+        2
+    );
+}
+
+const PROPOSAL_PROCESS_ROOT: &str = "SCTX_PROPOSAL_PROCESS_ROOT";
+const PROPOSAL_PROCESS_SPACE: &str = "SCTX_PROPOSAL_PROCESS_SPACE";
+
+#[test]
+fn idempotent_proposal_process_worker() {
+    let Some(root) = env::var_os(PROPOSAL_PROCESS_ROOT) else {
+        return;
+    };
+    let space_id = env::var(PROPOSAL_PROCESS_SPACE)
+        .unwrap()
+        .parse::<SpaceId>()
+        .unwrap();
+    GitStore::initialize(root)
+        .unwrap()
+        .propose_context_idempotently(space_id, proposal_draft(), None)
+        .unwrap();
+}
+
+#[test]
+fn concurrent_identical_proposals_from_separate_processes_append_at_most_one_event() {
+    let fixture = Fixture::new();
+    let space_id = context_space(&fixture.store, "process proposal race");
+    let current_executable = env::current_exe().unwrap();
+    let mut children = Vec::new();
+    for _ in 0..12 {
+        children.push(
+            Command::new(&current_executable)
+                .args([
+                    "--exact",
+                    "idempotent_proposal_process_worker",
+                    "--nocapture",
+                ])
+                .env(PROPOSAL_PROCESS_ROOT, fixture.store.root())
+                .env(PROPOSAL_PROCESS_SPACE, space_id.to_string())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for mut child in children {
+        assert!(child.wait().unwrap().success());
+    }
+
+    let observed = fixture
+        .store
+        .propose_context_idempotently(space_id, proposal_draft(), None)
+        .unwrap();
+    assert!(observed.existing());
+    assert_eq!(
+        fixture
+            .git(&["ls-tree", "-r", "--name-only", "HEAD", "--", "events"])
+            .lines()
+            .count(),
+        2
+    );
+    assert_eq!(fixture.git(&["status", "--porcelain"]), "");
 }
 
 #[test]

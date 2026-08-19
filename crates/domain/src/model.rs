@@ -310,21 +310,12 @@ impl ContextRevision {
         })
     }
 
-    /// Validates parsed revision content and local uniqueness.
+    /// Reconstructs the complete caller-authored content of this revision.
     ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorKind::InvalidInput`] for invalid content or duplicate IDs.
-    pub fn validate(&self) -> Result<()> {
-        require_unique(&self.parent_revision_ids, "revision.parent_revision_ids")?;
-        require_unique(
-            &self
-                .evidence
-                .iter()
-                .map(|evidence| evidence.evidence_id)
-                .collect::<Vec<_>>(),
-            "revision.evidence evidence_id",
-        )?;
+    /// Generated Revision/Evidence IDs and causal parent IDs are deliberately
+    /// absent because none of them are fields of [`ContextRevisionDraft`].
+    #[must_use]
+    pub fn draft(&self) -> ContextRevisionDraft {
         ContextRevisionDraft {
             kind: self.kind,
             topic_key: self.topic_key.clone(),
@@ -345,7 +336,24 @@ impl ContextRevision {
                 })
                 .collect(),
         }
-        .validate()
+    }
+
+    /// Validates parsed revision content and local uniqueness.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] for invalid content or duplicate IDs.
+    pub fn validate(&self) -> Result<()> {
+        require_unique(&self.parent_revision_ids, "revision.parent_revision_ids")?;
+        require_unique(
+            &self
+                .evidence
+                .iter()
+                .map(|evidence| evidence.evidence_id)
+                .collect::<Vec<_>>(),
+            "revision.evidence evidence_id",
+        )?;
+        self.draft().validate()
     }
 }
 

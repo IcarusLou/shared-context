@@ -18,8 +18,7 @@ use sctx_domain::{
     Applicability, ContextId, ContextKind, ContextRevisionDraft, Error, ErrorKind,
     EvidenceSnapshotDraft, EvidenceType, Result, RevisionId, SpaceId,
 };
-use sctx_event_schema::{Event, EventPayload};
-use sctx_git_store::{AppendRequest, GitStore};
+use sctx_git_store::GitStore;
 use sctx_index::{DomainSnapshot, ProjectionIndex};
 use sctx_local_state::UserConfigStore;
 use sctx_search::{
@@ -446,21 +445,18 @@ impl McpServer {
         let routing =
             self.resolve_routing(input.space_id.as_deref(), input.workspace.as_deref())?;
         let space_id = routing.resolved_space_id;
-        let event = Event::context_proposed(space_id, input.into_draft(), None)?;
-        let (context_id, revision_id) = match event.payload() {
-            EventPayload::ContextRevisionAdded {
-                context_id,
-                revision,
-                ..
-            } => (*context_id, revision.revision_id),
-            _ => unreachable!(),
-        };
-        let event_id = event.event_id();
-        let append = self
+        let proposal = self
             .runtime
             .store
-            .append_event(AppendRequest::event(event))
+            .propose_context_idempotently(space_id, input.into_draft(), None)
             .map_err(ToolFailure::writer_rejected)?;
+        let existing = proposal.existing();
+        let identity = proposal.identity;
+        let batch_id = proposal.append.as_ref().map(|append| &append.batch_id);
+        let commit_oid = proposal
+            .append
+            .as_ref()
+            .map(|append| append.commit_oid.as_str());
         let snapshot = self
             .runtime
             .snapshot()
@@ -469,14 +465,19 @@ impl McpServer {
             "indexed_tree_oid": snapshot.metadata.indexed_tree_oid,
             "projection_generation": snapshot.metadata.projection_generation,
             "space_id": space_id,
-            "context_id": context_id,
-            "revision_id": revision_id,
-            "event_id": event_id,
-            "status": "candidate",
-            "batch_id": append.batch_id,
-            "commit_oid": append.commit_oid,
-            "conflicts": context_conflicts(&snapshot, context_id),
-            "match_reason": "new_candidate_created",
+            "context_id": identity.context_id,
+            "revision_id": identity.revision_id,
+            "event_id": identity.event_id,
+            "status": if existing { "existing" } else { "candidate" },
+            "deduplicated": existing,
+            "batch_id": batch_id,
+            "commit_oid": commit_oid,
+            "conflicts": context_conflicts(&snapshot, identity.context_id),
+            "match_reason": if existing {
+                "exact_context_revision_draft_match"
+            } else {
+                "new_candidate_created"
+            },
             "routing": routing.into_value(),
         }))
     }
