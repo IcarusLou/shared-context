@@ -200,6 +200,7 @@ test(
       npm_config_cache: cache,
       npm_config_registry: 'http://127.0.0.1:9',
     };
+    const skillRoot = path.join(home, '.agents/skills/shared-context');
     run(
       'npm',
       [
@@ -214,6 +215,7 @@ test(
     );
     assert.equal(fs.existsSync(path.join(home, '.cursor/mcp.json')), false);
     assert.equal(fs.existsSync(path.join(home, '.codex/config.toml')), false);
+    assert.equal(fs.existsSync(skillRoot), false);
     fs.mkdirSync(path.join(home, '.cursor'), { recursive: true });
     fs.writeFileSync(
       path.join(home, '.cursor/mcp.json'),
@@ -242,6 +244,14 @@ test(
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
     assert.ok(Date.now() - started < 180_000, 'offline setup --demo exceeded three minutes');
     assert.ok(fs.existsSync(path.join(root, 'bin/current/sctx')));
+    assert.deepEqual(
+      fs.readFileSync(path.join(skillRoot, 'SKILL.md')),
+      fs.readFileSync(path.resolve(__dirname, '../../skills/shared-context/SKILL.md')),
+    );
+    assert.deepEqual(
+      fs.readFileSync(path.join(skillRoot, 'agents/openai.yaml')),
+      fs.readFileSync(path.resolve(__dirname, '../../skills/shared-context/agents/openai.yaml')),
+    );
     const eventPaths = run(
       'git',
       ['-C', path.join(root, 'repository'), 'ls-tree', '-r', '--name-only', 'HEAD'],
@@ -279,6 +289,8 @@ test(
     assert.equal(uninstalled.repository_retained, true);
     assert.ok(fs.existsSync(path.join(root, 'repository/.git')));
     assert.equal(fs.existsSync(path.join(root, 'bin/current')), false);
+    assert.equal(fs.existsSync(path.join(skillRoot, 'SKILL.md')), false);
+    assert.equal(fs.existsSync(path.join(skillRoot, 'agents/openai.yaml')), false);
     const restoredCursor = readJson(path.join(home, '.cursor/mcp.json'));
     assert.equal(restoredCursor.mcpServers['shared-context'], undefined);
     assert.equal(restoredCursor.mcpServers.existing.command, 'keep user MCP');

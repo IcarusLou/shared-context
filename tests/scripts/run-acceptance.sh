@@ -21,6 +21,7 @@ cargo test --locked -p sctx-adapter-cursor --test payload_contract
 cargo test --locked -p sctx-adapter-codex --test payload_contract
 cargo test --locked -p sctx-installer --test installer_matrix
 cargo test --locked -p sctx-cli --test cli_contract
+cargo test --locked -p sctx-cli --test proactive_skill_e2e
 
 # 18.1 and the end-to-end loop: the Python oracle reads Git/config directly and
 # speaks MCP itself; it never derives expected values from production output.

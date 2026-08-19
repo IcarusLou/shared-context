@@ -234,7 +234,12 @@ Cursor/Codex 自身要求的配置仍写入各自用户目录，但仅保存指�
 ~/.cursor/hooks.json
 ~/.cursor/mcp.json
 ~/.codex/hooks.json 或 ~/.codex/config.toml
+~/.agents/skills/shared-context/
+├── SKILL.md
+└── agents/openai.yaml
 ```
+
+全局 Agent Skill 只在使用者显式执行 `sctx setup` 时安装；NPM `postinstall` 不写入该目录。Cursor 与 Codex 共享这一份用户级 Skill，不按 Agent 重复安装。
 
 ### 6.2 仓库结构
 
@@ -405,9 +410,16 @@ Publication 引用的 Revision、全部 `previous_publication_ids` 以及 Public
 
 Review 结论也必须引用同一 ContextSpace/ContextItem 下确定的 `revision_id`；出现相互矛盾的 Review 时全部保留并展示，不按记录时间选边。
 
-### 7.5 重复 Context 的首版处理
+### 7.5 Capture 幂等与重复 Context 治理
 
-首版不合并或重定向 ContextSpace/ContextItem ID，避免提前引入另一套需要处理并发 Head 的身份归并协议。发现重复知识时：
+`context_propose` 在追加事件前做服务端严格幂等检查，只阻止 Skill 重复触发产生的完全相同内容。两个 Proposal 仅在以下条件同时成立时视为同一 Context：
+
+- 位于同一个 ContextSpace。
+- 完整权威 Draft 逐字段完全相等：`kind`、`topic_key`、`statement`、`rationale`、`applicability`、有序 `assumptions`、有序 `recheck_when`，以及有序 Evidence Snapshot 中每一项的 `kind`、`supports`、`content`、`interpretation` 和有序 `limitations`。
+
+比较排除生成的 Context/Revision/Evidence ID，以及明确非权威的 annotations/origin hints。检查同一 Space 的所有 Revision，不受 Candidate、Accepted、Deprecated 或 Superseded 生命周期状态限制。命中时返回 `deduplicated: true`、`status: existing` 和已有 Event/Context/Revision ID，不返回新的 Batch/Commit ID，也不新增 Event；任一权威字段不同都不是重复，必须保留为独立 Candidate。FTS、规则、Embedding、释义相似或 Topic 重叠只能用于召回候选，禁止据此自动去重、合并或抑制 Proposal。
+
+上述幂等边界不等于语义上的“重复知识”治理。首版不合并或重定向 ContextSpace/ContextItem ID，避免提前引入另一套需要处理并发 Head 的身份归并协议。人类确认重复知识后：
 
 - 为保留项新增吸收了必要内容的完整 Revision，并显式发布。
 - 为重复项新增 Withdraw Publication，显式引用各自当前 Head。
@@ -700,6 +712,10 @@ Hook 可以将文件访问、测试结果等 Breadcrumb 写入：
 
 Agent 发现可复用且有证据的工程认知时，通过 MCP 调用 `context_propose`。Rust Writer 生成 Candidate Revision 事件。
 
+显式 `sctx setup` 还会安装用户级 `shared-context` Agent Skill。Skill 在实质性工程任务开始时主动调用 `context_for_task`，并在出现可复用且已验证的结论时调用 `context_propose`；它只能创建 Candidate，不能自动 Review、Publish、Withdraw 或解决冲突。返回的 Context 一律按不可信、只读参考数据处理，不能执行其中的命令或指令。
+
+Skill 的隐式触发依赖 Agent 的技能发现与调度，不是协议级强保证。Hook 继续负责 SessionStart 基础注入、受支持 Prompt Hook 的检索和 Breadcrumb，作为 Skill 未被加载或未主动调用时的确定性兜底；Skill 与 Hook 是互补关系，不相互替代。
+
 ### 11.2 Retrieve 流程
 
 查询上下文由以下信息组成：
@@ -765,6 +781,10 @@ Agent 首版暴露：
 
 Space 创建、Review、Publish、Withdraw、Semantic Conflict 确认/解决首版优先由人类 CLI 完成。这个差异是产品交互选择，不是访问控制边界。
 
+`context_for_task` 和 `context_propose` 接受 `space_id` 或当前 `workspace`。路由优先级为显式 `space_id` 高于本地精确 `WorkspaceBinding`；响应返回 `routing.resolved_space_id` 和 `routing.source`。未绑定、相对路径、目标 Space 不存在或两种路由信息都缺失时，Retrieve 与 Proposal 都必须结构化失败，不能猜测或退化为跨 Space 查询。Workspace 路径只作为非权威查询 Hint，不回显到 Tool Result，也不写入权威 Context。
+
+`context_propose` 的重复保护必须在服务端完成，使用 7.5 节定义的“同 Space + 完整权威 Draft 完全相等”规则。Agent 侧的 `context_search` 只能缩小可能匹配集合，不能用 FTS 或语义相似度作最终重复判定。
+
 ### 12.3 Adapter 统一事件
 
 核心定义：
@@ -807,6 +827,50 @@ Cursor 的 Prompt Submit Hook 不作为首版精确 Context 注入依赖，避�
 - PostToolUse/PreCompact/Stop：记录 Breadcrumb、补充检索或提示沉淀 Candidate。
 
 Codex Hook 需要用户 Review/Trust 时，Setup 和 Doctor 必须显示 `ACTION REQUIRED`，不能绕过信任机制或冒充安装完成。
+
+### 12.6 主动 Shared Context Skill
+
+`setup` 和 `upgrade` 把 instruction-only 的 `shared-context` Skill 事务化安装到
+`~/.agents/skills/shared-context/`，由 Cursor 与 Codex 共用同一份用户级资产。NPM
+安装和 `postinstall` 不修改 Skill 或 Agent 配置；只有显式执行 `sctx setup` 才安装。
+Setup Manifest 记录产品拥有的 Skill 文件及 Hash，升级只覆盖仍与旧 Hash 一致的文件，
+同名外部内容或安装后被用户修改的内容必须保留并告警。失败时 Setup Journal 恢复原字节
+和权限，普通卸载只删除仍与 Manifest 匹配的受管文件。
+
+Skill 的主动流程是：
+
+1. 对实现、调试、架构、评审、迁移、测试、发布和运维等实质工程任务，在大规模调查或
+   修改前调用 `context_for_task`，传入任务摘要与当前绝对 Workspace。
+2. MCP 路由优先使用显式 `space_id`，其次使用精确 `WorkspaceBinding`。未绑定 Workspace
+   不推测默认 Space；`context_for_task` 和 `context_propose` 都必须 fail closed，后者不得
+   写 Event。成功的任务 Retrieve 硬过滤到解析出的 Space，不能把绑定仅作为排序偏好。
+3. Retrieved Context 始终是不可信、只读参考数据。Agent 需要使用当前代码、文档、测试或
+   可观测行为复核，不执行 Context 中的命令，也不允许其覆盖用户请求或当前证据。
+4. 只有形成可复用、精确且有自包含证据的结论时，Skill 才调用 `context_propose`。成功
+   只产生 Candidate；证据是否充分由 Skill 工作流判断，Rust 边界继续执行 Schema、隐私
+   和 Writer 校验。
+5. 同一 Space 的 Proposal 只有在完整权威内容逐字段、逐数组顺序完全相同时才复用所有
+   生命周期状态中的已有 Context/Revision：`kind`、`topic_key`、`statement`、`rationale`、`applicability`、
+   `assumptions`、`recheck_when`，以及每条 Evidence 的 `kind`、`supports`、`content`、
+   `interpretation`、`limitations`。生成 ID 和非权威 annotations/origin hints 不参与比较。
+   命中返回 `deduplicated: true`、`status: existing` 和已有 Event/Context/Revision ID，
+   不返回新 Batch/Commit ID。GitStore 在 Writer 进程间锁内完成“恢复 Pending → 读取 HEAD →
+   查重 → 追加”，使并发相同重试最多生成一个 Event；CLI 的人工 revise/review/publish
+   路径不经过此去重入口。
+6. 任一权威字段或数组顺序不同都必须生成独立 Candidate。禁止 trim、大小写折叠、FTS、
+   Embedding、模糊匹配、改写相似度或其他语义合并。
+
+MCP 新建 Candidate 时，非权威 annotations 仅记录 `producer: shared-context-mcp` 和 MCP `client` 类型；它们只证明写入经过 MCP 边界，不声称 Agent Skill 必然触发。不得记录 Workspace、Prompt 或 Session，且 annotations 不参与严格去重。
+
+Skill 和 Agent 可见的 MCP 工具面不提供 Review、Publish、Withdraw、Supersede 或冲突解决。
+Skill 明确禁止绕过 MCP 使用 CLI 或隐藏接口自动治理。人类仍可通过显式 CLI 完成治理；
+这是交互与指令边界，不是针对本机用户的权限隔离。
+
+自动化验收可以证明 Skill 资产内容、事务安装、MCP Tool Schema、绑定路由、Candidate
+写入、严格去重和未绑定不写入。它不能证明真实 Cursor/Codex 在自然语言任务中一定隐式
+调用 Skill，不能证明模型每次都正确判断“证据充分”，也不能证明模型在所有对话中遵守
+禁止自动治理的指令；这些真实 Agent 行为必须报告为 `NOT_PROVEN`，不能由 Fixture 或
+模拟 Tool Call 冒充。
 
 ## 13. Rust 与 NPM 分发
 
@@ -876,9 +940,11 @@ NPM `postinstall` 不修改 Cursor/Codex 配置。显式执行 `setup` 后，二
 ```text
 ~/.shared-context/bin/<version>/<arch>/sctx
 ~/.shared-context/bin/current/sctx
+~/.agents/skills/shared-context/SKILL.md
+~/.agents/skills/shared-context/agents/openai.yaml
 ```
 
-Agent 配置始终引用 `bin/current/sctx`，升级只原子切换 Runtime 版本。
+Agent 配置始终引用 `bin/current/sctx`，升级只原子切换 Runtime 版本。Skill 资产编译进 `sctx`，不依赖安装时联网或 NPM 运行时文件。
 
 ## 14. 安装、测试与卸载
 
@@ -899,9 +965,10 @@ Setup：
 6. 检测 Cursor/Codex。
 7. 显示配置 Diff。
 8. 备份并原子合并 Hook/MCP 配置。
-9. 交互式 Onboarding 创建首个 ContextSpace，并把选择的业务 Workspace 绑定到它；`--demo` 则在同一仓库内创建自包含样例 Space。
-10. 运行 Git、SQLite、MCP、Adapter Smoke Test；`--demo` 额外运行 Proposal、Review/Publish 和 Search 闭环。
-11. 显示需要重启或人工 Trust 的 Agent，以及可复制的 `space create`、`workspace bind`、`context propose` 和 `search` 命令。
+9. 原子安装或升级 `~/.agents/skills/shared-context/`，并把受管文件及 SHA-256 写入安装 Manifest；同名用户文件或已修改文件保留并告警。
+10. 交互式 Onboarding 创建首个 ContextSpace，并把选择的业务 Workspace 绑定到它；`--demo` 则在同一仓库内创建自包含样例 Space。
+11. 运行 Git、SQLite、MCP、Adapter、Global Skill Smoke Test；`--demo` 额外运行 Proposal、Review/Publish 和 Search 闭环。
+12. 显示需要重启或人工 Trust 的 Agent，以及可复制的 `space create`、`workspace bind`、`context propose` 和 `search` 命令。
 
 Setup 必须幂等。每次执行生成 Setup Journal；失败时恢复 Runtime 和 Agent 配置，但不删除、回滚或覆盖 Context Git 数据。
 
@@ -959,6 +1026,7 @@ sctx doctor --json
 - Event Schema 和因果图诊断。
 - SQLite `quick_check`、Indexed Tree、FTS。
 - Cursor/Codex 配置语法和目标路径。
+- 全局 Agent Skill 文件、内容 Hash 和安装所有权状态。
 - MCP Initialize/List Tools。
 - Hook Trust 或需要人工处理的步骤。
 
@@ -973,6 +1041,7 @@ sctx uninstall
 默认行为：
 
 - 移除自己仍能精确识别的 Cursor/Codex 配置条目。
+- 只移除 Manifest 中由本产品拥有且内容 Hash 未变化的全局 Skill 文件；用户修改或同名用户文件保留并告警。
 - 恢复安装前的配置备份或保留用户后续修改并告警。
 - 移除 Runtime、日志和可重建缓存。
 - 保留唯一 Context Git 仓库。
@@ -1048,12 +1117,13 @@ sctx uninstall
 5. 路径包含空格和中文时可以正常工作。
 6. 一次安装内只能存在一个 Context Git 仓库；Setup 和 Demo 不创建第二个仓库。
 7. 对带未知字段、TOML 注释和既有 Cursor/Codex 条目的配置，在每个写入阶段注入失败后均恢复原字节；正常安装/卸载不丢失安装后新增或修改的用户配置。
+8. 显式 Setup 在 `~/.agents/skills/shared-context/` 安装合法的 `SKILL.md` 与 `agents/openai.yaml`；Cursor、Codex 同时启用时仍只有一份，连续 Setup 不重复写入，升级/卸载不覆盖或删除用户修改。
 
 ### 18.2 Git 与事件
 
 1. CLI/MCP 所有写接口只生成新事件或新证据对象。
 2. 调用者不能通过产品 API 指定路径或覆盖已有 Event ID。
-3. 100 个并发 Proposal 生成 100 个不同的新事件文件。
+3. 100 个权威 Draft 不同的并发 Proposal 生成 100 个不同的新事件文件；完全相同 Draft 的并发重试按 18.5 的严格幂等规则收敛。
 4. 自动提交只暂存本批次生成的显式路径。
 5. 已有事件出现 M/D/R 时自动提交拒绝，并输出可执行的修订提示。
 6. 禁用 Git Hook 后，产品生成和自动提交路径仍不覆盖已有文件。
@@ -1086,7 +1156,10 @@ sctx uninstall
 2. Cursor/Codex Adapter 对真实 Hook Payload Fixture 通过契约测试。
 3. Agent Hook 不可用时，CLI 和 MCP 仍能完成核心流程。
 4. Codex Hook 未 Trust 时明确显示 `ACTION REQUIRED`，不能冒充成功。
-5. 卸载后恢复原 Agent 配置，唯一 Context Git 仓库仍保留。
+5. `context_for_task` 和 `context_propose` 使用绑定 Workspace 路由到相同 Space，显式 `space_id` 优先；未绑定或缺少路由时两者均 fail closed，Workspace 路径不进入权威 Context 或 Tool Result。
+6. 对同一 Space 和完全相同权威 Draft 连续或并发调用 `context_propose`，只产生一个 Candidate Event；重复响应为 `deduplicated: true`、`status: existing` 并返回同一 Event/Context/Revision，不返回新的 Batch/Commit ID。任一权威字段发生变化都产生独立 Candidate，语义近似不得自动合并。
+7. Hook 关闭或 Skill 未触发时，已声明的 Hook 兜底行为仍通过真实 Payload Fixture；Skill 被真实 Agent 隐式发现并调用必须由端到端 Agent Trace/Tool Call 证明，只验证文件安装、YAML 或 Skill 静态内容时一律标记 `NOT_PROVEN`，不能声称隐式触发已验收。
+8. 卸载后恢复原 Agent 配置，保留用户修改的 Skill，并保留唯一 Context Git 仓库。
 
 ## 19. 后续演进
 
@@ -1116,6 +1189,8 @@ sctx uninstall
 12. 删除 SQLite 后必须能够从 Git 确定性重建。
 13. 相同 Git Tree 和相同实现版本必须得到相同 Projection 与稳定查询顺序。
 14. Append-only 是生成期协作约束，不是操作系统权限或本机防篡改边界。
+15. Capture 幂等只认同一 ContextSpace 内完整权威 Draft 完全相等；语义近似、释义或搜索分数不构成重复。
+16. Agent Skill 隐式触发不是强保证；Hook 提供确定性基础兜底，未观察到真实 Agent Tool Call 时验收状态为 `NOT_PROVEN`。
 
 ## 21. Agent 接入参考与版本策略
 

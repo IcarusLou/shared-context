@@ -1,12 +1,12 @@
-# Issue #96 Acceptance Report
+# Shared Context Acceptance Report
 
 Date: 2026-08-19
-Baseline: `main@d3f48de`
-Branch: `issue/96-acceptance`
+Issue #96 baseline: `main@d3f48de`, branch `issue/96-acceptance`
+Issue #100 baseline: `main@673dd1b`, branch `issue/100-proactive-skill-acceptance`
 
 ## Verdict
 
-All acceptance claims that can be automated on this Apple Silicon host are proven. No known P0/P1 defect remains. Claims requiring native Intel hardware, production signing/notarization, or publication to a real Registry are explicitly `NOT_PROVEN` below.
+All acceptance claims that can be automated on this Apple Silicon host are proven. No known P0/P1 defect remains. Claims requiring native Intel hardware, production signing/notarization, publication to a real Registry, or observation of a real Agent's implicit Skill decision are explicitly `NOT_PROVEN` below.
 
 ## Independent harness and oracle
 
@@ -106,6 +106,30 @@ Worst measured P95: **75.114 ms**, 24.886 ms below the 100 ms gate. The benchmar
 | A hanging `cursor/codex --version` cannot block setup | PROVEN | production probes now have a two-second hard timeout; `agent_version_probe_has_a_hard_timeout` prevents regression |
 | Uninstall restores only owned Agent config and retains repository | PROVEN | installer uninstall matrix including post-setup user edits |
 
+## Issue #100: proactive Skill integration
+
+The cross-crate black-box test is
+`setup_skill_mcp_workspace_and_candidate_boundaries_hold_end_to_end`. It starts with an injected
+macOS Host but uses the production Installer, on-disk Git/SQLite/configuration, the real `sctx`
+test binary, CLI governance commands, and a stdio Codex-style MCP session. The test does not call
+Rust MCP internals and does not treat an LLM simulation as evidence of real Agent behavior.
+
+| Claim | Result | Evidence |
+|---|---|---|
+| Explicit Setup installs one user-level Skill shared by Cursor and Codex | PROVEN | E2E compares both installed files byte-for-byte with the compiled assets; `cursor_and_codex_share_one_global_skill_installation`; arm64 offline NPM smoke verifies NPM install alone leaves the path absent and explicit Setup installs it |
+| Skill setup/upgrade/rollback/uninstall ownership is transactional and conservative | PROVEN | installer matrix covers three-run idempotency, every write seam, external same-name content, user modification, old-manifest compatibility, upgrade replacement, exact uninstall and Doctor modified/missing states |
+| Installed MCP is available and exposes only the five V1 tools | PROVEN | Setup MCP smoke plus E2E stdio Initialize/List Tools; tool list has Retrieve/Search/Get/Propose/List and no Review/Publish/governance tool |
+| Bound Workspace actively routes `context_for_task` to its exact Space | PROVEN | E2E creates and publishes an accepted Context with human CLI governance, binds a Unicode/space path, and retrieves it through stdio MCP with `routing.source=workspace_binding`; MCP focused routing contract also proves the path is not persisted or echoed |
+| A Skill-shaped proposal with self-contained evidence creates only a Candidate | PROVEN | E2E submits the complete evidence payload through stdio `context_propose`, observes `deduplicated=false`, `status=candidate`, and exactly one new Event |
+| An identical retry creates no Event and reuses the existing Event/Context/Revision IDs | PROVEN | E2E count/ID oracle; `repeated_identical_workspace_routed_proposal_returns_existing_ids_without_an_event` |
+| Any authoritative field or array-order difference remains a distinct Candidate | PROVEN | `idempotent_context_proposal_compares_every_authoritative_field_and_array_order` mutates every authoritative scalar/array/Evidence boundary; E2E independently changes limitations order and observes a second Event/Context |
+| Concurrent identical MCP retries append at most one Event | PROVEN | `concurrent_identical_proposals_from_separate_processes_append_at_most_one_event` exercises the GitStore Writer lock across processes |
+| Unbound Workspace Retrieve/Proposal fails closed and Proposal writes no Event | PROVEN | E2E before/after Git Tree event count plus `routing_fails_closed_for_unbound_invalid_and_missing_inputs` |
+| MCP Candidate provenance is minimal and does not affect exact deduplication | PROVEN | `exact_workspace_binding_routes_task_and_proposal_without_persisting_workspace` verifies only `producer=shared-context-mcp` and client type are recorded; a cross-client exact retry reuses the existing IDs and writes no Event |
+| Skill cannot automatically review or publish through its declared workflow/tool surface | PROVEN | installed Skill bytes explicitly prohibit governance; stdio tool list contains no Review/Publish; Candidate E2E has no automatic governance Event |
+| Real Cursor/Codex implicitly invokes the Skill for a natural substantive task | NOT_PROVEN | no supported live Agent session or runtime trace was exercised; deterministic fixtures and direct MCP calls cannot prove model/tool selection |
+| A real Agent always judges evidence sufficiency correctly and always obeys the no-governance instruction | NOT_PROVEN | instruction text and least-authority MCP surface are proven, but universal model behavior is outside deterministic repository acceptance |
+
 ## claims_proven
 
 - `18.1.arm64_offline_setup_demo_under_180s`
@@ -133,12 +157,23 @@ Worst measured P95: **75.114 ms**, 24.886 ms below the 100 ms gate. The benchmar
 - `18.5.hook_fallback_and_codex_action_required`
 - `18.5.uninstall_retains_repository`
 - `p1.agent_version_probe_timeout_and_fallback`
+- `active_skill.global_install_lifecycle`
+- `active_skill.mcp_workspace_routing`
+- `active_skill.evidence_backed_candidate_only`
+- `active_skill.strict_idempotent_deduplication`
+- `active_skill.authoritative_difference_preservation`
+- `active_skill.concurrent_retry_atomicity`
+- `active_skill.unbound_workspace_no_write`
+- `active_skill.minimal_mcp_provenance`
+- `active_skill.no_governance_tool_surface`
 
 ## claims_not_proven
 
 - `18.1.intel_x64_native_offline_execution`: `NOT_PROVEN` — no native Intel x64 Mac was available. Cross-built x64 thin Mach-O structure, signature-verification behavior, package metadata, checksums and offline lockfile are proven; Rosetta/cross-build is not reported as native evidence.
 - `18.1.production_developer_id_signature_and_notarization`: `NOT_PROVEN` — tests use local ad-hoc signing. No production Developer ID, notarization, Gatekeeper distribution, or release certificate was exercised.
 - `18.1.registry_publish_and_clean_registry_install`: `NOT_PROVEN` — no package was published to a real Registry and no production Registry install was performed. Local pack and an offline install with the Registry forced to unreachable loopback are proven.
+- `active_skill.real_agent_implicit_invocation`: `NOT_PROVEN` — no live Cursor/Codex session was observed deciding to invoke the Skill implicitly. The repository proves only the installed instruction contract and direct MCP behavior.
+- `active_skill.real_agent_evidence_and_governance_judgment`: `NOT_PROVEN` — deterministic tests cannot prove that an LLM will always recognize sufficient evidence or obey the instruction never to review/publish. The MCP surface itself exposes no governance tool.
 
 ## Reproduction commands
 
@@ -151,6 +186,12 @@ cargo build --locked -p sctx-cli
 python3 tests/scripts/demo_acceptance.py --binary target/debug/sctx
 
 # Full workspace gates
+cargo fmt --check
+cargo clippy --workspace --all-targets
+cargo test --workspace --locked
+(cd npm && npm test)
+
+# Additional Issue #96 gates
 cargo fmt --all -- --check
 cargo metadata --no-deps --format-version 1
 cargo check --workspace --all-targets --locked
