@@ -11,8 +11,9 @@ mod store;
 pub use journal::{BatchId, JournalPhase, PendingBatch, PendingFile, PendingFileKind};
 pub use sctx_domain::{Error, ErrorKind, Result};
 pub use store::{
-    AppendOutcome, AppendRequest, CommitObserver, CrashInjector, CrashSeam, GitStore,
-    NoopCommitObserver, NoopCrashInjector, ObjectRef, StagedValidation, TextObject,
+    AppendOutcome, AppendRequest, CommitObserver, ContextProposalIdentity, ContextProposalOutcome,
+    CrashInjector, CrashSeam, GitStore, NoopCommitObserver, NoopCrashInjector, ObjectRef,
+    StagedValidation, TextObject,
 };
 
 /// Stable marker used for the retryable case where an object exists outside

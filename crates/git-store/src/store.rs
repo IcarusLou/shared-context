@@ -8,8 +8,11 @@ use std::{
 };
 
 use fs2::FileExt;
-use sctx_domain::{Error, ErrorKind, EventId, ReducerEvent, Result, reduce};
-use sctx_event_schema::{Event, ParsedEvent, parse_event};
+use sctx_domain::{
+    ContextId, ContextRevisionDraft, Error, ErrorKind, EventId, ReducerEvent, Result, RevisionId,
+    SpaceId, reduce,
+};
+use sctx_event_schema::{Annotations, Event, EventPayload, ParsedEvent, parse_event};
 use sctx_local_state::{PrivacyScan, PrivacyScanner, UserConfigStore};
 use sha2::{Digest, Sha256};
 
@@ -78,6 +81,32 @@ pub struct AppendOutcome {
     pub commit_oid: String,
     pub objects: Vec<ObjectRef>,
     pub recovered: bool,
+}
+
+/// Stable identities of an existing or newly appended Context proposal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextProposalIdentity {
+    pub space_id: SpaceId,
+    pub context_id: ContextId,
+    pub revision_id: RevisionId,
+    pub event_id: EventId,
+}
+
+/// Result of an idempotent Context proposal attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextProposalOutcome {
+    pub identity: ContextProposalIdentity,
+    /// Present only when this call appended the proposal. `None` means an
+    /// identical authoritative draft already existed in the same Space.
+    pub append: Option<AppendOutcome>,
+}
+
+impl ContextProposalOutcome {
+    /// Whether an existing proposal/revision was returned without appending an Event.
+    #[must_use]
+    pub const fn existing(&self) -> bool {
+        self.append.is_none()
+    }
 }
 
 /// Result of validating the exact staged tree used by a manual Git commit.
@@ -278,6 +307,46 @@ impl GitStore {
         FileExt::unlock(&lock).map_err(io_error("unlock writer.lock"))?;
         outcome.objects = object_refs;
         Ok(outcome)
+    }
+
+    /// Returns an identical Context revision in `space_id`, or atomically appends a proposal.
+    ///
+    /// Identity comparison is exact [`ContextRevisionDraft`] equality. Generated IDs,
+    /// causal parent IDs, and non-authoritative annotations do not participate. The check,
+    /// pending-batch recovery, and append all run under the process-shared writer lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid content, a missing Space, repository read failures,
+    /// append-only violations, privacy rejection, Git failures, or injected crash seams.
+    pub fn propose_context_idempotently(
+        &self,
+        space_id: SpaceId,
+        draft: ContextRevisionDraft,
+        annotations: Option<Annotations>,
+    ) -> Result<ContextProposalOutcome> {
+        draft.validate()?;
+        let lock = self.writer_lock()?;
+        self.recover_all_locked(None)?;
+        if let Some(identity) = self.find_identical_context_locked(space_id, &draft)? {
+            FileExt::unlock(&lock).map_err(io_error("unlock writer.lock"))?;
+            return Ok(ContextProposalOutcome {
+                identity,
+                append: None,
+            });
+        }
+
+        let event = Event::context_proposed(space_id, draft, annotations)?;
+        let identity = context_proposal_identity(&event)?;
+        let (journal, object_refs) = self.prepare(AppendRequest::event(event))?;
+        self.crash.check(CrashSeam::AfterJournal)?;
+        let mut append = self.commit_journal_locked(&journal, false)?;
+        FileExt::unlock(&lock).map_err(io_error("unlock writer.lock"))?;
+        append.objects = object_refs;
+        Ok(ContextProposalOutcome {
+            identity,
+            append: Some(append),
+        })
     }
 
     /// Lists valid durable pending journals without changing Git state.
@@ -517,6 +586,57 @@ impl GitStore {
         self.write_journal(&journal)?;
         sync_directory(&self.state.join("pending"))?;
         Ok((journal, object_refs))
+    }
+
+    fn find_identical_context_locked(
+        &self,
+        space_id: SpaceId,
+        draft: &ContextRevisionDraft,
+    ) -> Result<Option<ContextProposalIdentity>> {
+        let git = Git::new(&self.repository);
+        let mut paths = git.head_paths("events")?;
+        paths.sort_unstable();
+        let mut events = Vec::new();
+        for path in paths {
+            let bytes = git
+                .head_file(&path)?
+                .ok_or_else(|| invariant(format!("HEAD event disappeared: {path}")))?;
+            if let Ok(ParsedEvent::Known(event)) = parse_event(&bytes) {
+                events.push(event);
+            }
+        }
+        let reducer_events = events
+            .iter()
+            .filter_map(|event| event.reducer_event())
+            .collect::<Vec<_>>();
+        let projection = reduce(&reducer_events);
+        if !projection.spaces.contains_key(&space_id) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("space does not exist: {space_id}"),
+            ));
+        }
+
+        Ok(events.iter().find_map(|event| {
+            if projection.quarantined_event_ids.contains(&event.event_id()) {
+                return None;
+            }
+            match event.payload() {
+                EventPayload::ContextRevisionAdded {
+                    space_id: existing_space_id,
+                    context_id,
+                    revision,
+                } if *existing_space_id == space_id && revision.draft() == *draft => {
+                    Some(ContextProposalIdentity {
+                        space_id,
+                        context_id: *context_id,
+                        revision_id: revision.revision_id,
+                        event_id: event.event_id(),
+                    })
+                }
+                _ => None,
+            }
+        }))
     }
 
     fn recover_all_locked(&self, exclude: Option<&BatchId>) -> Result<Vec<AppendOutcome>> {
@@ -1004,6 +1124,24 @@ fn serialize_event(event: &Event) -> Result<Vec<u8>> {
         ParsedEvent::Known(parsed) if parsed.event_id() == event.event_id() => Ok(bytes),
         _ => Err(invariant(
             "serialized event did not validate as the same V1 event",
+        )),
+    }
+}
+
+fn context_proposal_identity(event: &Event) -> Result<ContextProposalIdentity> {
+    match event.payload() {
+        EventPayload::ContextRevisionAdded {
+            space_id,
+            context_id,
+            revision,
+        } => Ok(ContextProposalIdentity {
+            space_id: *space_id,
+            context_id: *context_id,
+            revision_id: revision.revision_id,
+            event_id: event.event_id(),
+        }),
+        _ => Err(invariant(
+            "context proposal constructor returned another event type",
         )),
     }
 }

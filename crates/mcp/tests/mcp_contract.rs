@@ -404,6 +404,7 @@ fn cursor_and_codex_fixtures_initialize_list_search_get_propose_and_list_spaces(
         let proposal = &responses[5]["result"]["structuredContent"];
         assert_eq!(proposal["status"], "candidate");
         assert_eq!(proposal["routing"], pack["routing"]);
+        assert_eq!(proposal["deduplicated"], false);
         assert_eq!(event_count(fixture.store.repository()), before_count + 1);
         let spaces = &responses[6]["result"]["structuredContent"];
         assert_eq!(spaces["spaces"].as_array().unwrap().len(), 1);
@@ -598,6 +599,66 @@ fn explicit_space_wins_over_a_conflicting_workspace_binding() {
         responses[2]["result"]["structuredContent"]["space_id"],
         explicit_space_id.to_string()
     );
+}
+
+#[test]
+fn repeated_identical_workspace_routed_proposal_returns_existing_ids_without_an_event() {
+    let fixture = Fixture::new();
+    let workspace = fixture.temporary.path().join("idempotent workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    fixture.bind(&workspace, fixture.space_id);
+    let before_count = event_count(fixture.store.repository());
+    let arguments = workspace_proposal_arguments(&workspace, "strictly identical proposal");
+    let responses = run_session(
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::Newline,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(2, "context_propose", arguments.clone()),
+            tool_call(3, "context_propose", arguments),
+        ],
+    );
+    let created = &responses[1]["result"]["structuredContent"];
+    let existing = &responses[2]["result"]["structuredContent"];
+
+    assert_eq!(created["status"], "candidate");
+    assert_eq!(created["deduplicated"], false);
+    assert!(created["batch_id"].as_str().is_some());
+    assert!(created["commit_oid"].as_str().is_some());
+    assert_eq!(existing["status"], "existing");
+    assert_eq!(existing["deduplicated"], true);
+    assert_eq!(
+        existing["match_reason"],
+        "exact_context_revision_draft_match"
+    );
+    assert!(existing["batch_id"].is_null());
+    assert!(existing["commit_oid"].is_null());
+    for id in ["space_id", "context_id", "revision_id", "event_id"] {
+        assert_eq!(existing[id], created[id], "{id}");
+    }
+    assert_eq!(
+        existing["routing"],
+        json!({
+            "resolved_space_id": fixture.space_id,
+            "source": "workspace_binding"
+        })
+    );
+    assert_eq!(event_count(fixture.store.repository()), before_count + 1);
+
+    let mut changed = workspace_proposal_arguments(&workspace, "strictly identical proposal");
+    changed["evidence"][0]["content"]["actual"] = json!("different candidate");
+    let changed_response = run_session(
+        &mut fixture.server(ClientKind::Cursor),
+        FixtureFraming::ContentLength,
+        &[
+            request(4, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(5, "context_propose", changed),
+        ],
+    );
+    let changed = &changed_response[1]["result"]["structuredContent"];
+    assert_eq!(changed["status"], "candidate");
+    assert_ne!(changed["context_id"], created["context_id"]);
+    assert_eq!(event_count(fixture.store.repository()), before_count + 2);
 }
 
 #[test]
