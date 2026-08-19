@@ -1,0 +1,7 @@
+interface:
+  display_name: "Shared Context"
+  short_description: "Retrieve context and propose durable findings"
+  default_prompt: "Use $shared-context to retrieve relevant engineering context before this task and propose any reusable evidence-backed findings."
+
+policy:
+  allow_implicit_invocation: true
