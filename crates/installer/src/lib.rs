@@ -37,6 +37,17 @@ const MANIFEST_VERSION: u32 = 1;
 const MINIMUM_FREE_SPACE_BYTES: u64 = 64 * 1024 * 1024;
 const AGENT_VERSION_TIMEOUT: Duration = Duration::from_secs(2);
 const PRODUCT_KEY: &str = "shared-context";
+const GLOBAL_SKILL_DIRECTORY: &str = ".agents/skills/shared-context";
+const SKILL_ASSETS: [(&str, &[u8]); 2] = [
+    (
+        "SKILL.md",
+        include_bytes!("../../../skills/shared-context/SKILL.md"),
+    ),
+    (
+        "agents/openai.yaml",
+        include_bytes!("../../../skills/shared-context/agents/openai.yaml"),
+    ),
+];
 const HOOK_EVENTS_CURSOR: [&str; 6] = [
     "sessionStart",
     "beforeSubmitPrompt",
@@ -83,6 +94,7 @@ pub enum SetupStage {
     CursorHooksWritten,
     CodexMcpWritten,
     CodexHooksWritten,
+    GlobalSkillWritten,
     ManifestWritten,
     SmokeTested,
 }
@@ -317,7 +329,26 @@ pub struct SetupReport {
     pub changed: bool,
     pub preflight: PreflightReport,
     pub capabilities: Vec<sctx_agent_adapter::AgentCapabilities>,
+    pub skill: SkillReport,
     pub notices: Vec<String>,
+}
+
+/// Result of installing the shared user-level Agent Skill.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SkillReport {
+    pub path: PathBuf,
+    pub status: SkillStatus,
+}
+
+/// User-level Agent Skill state observed by setup or upgrade.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillStatus {
+    Installed,
+    Current,
+    Modified,
+    Conflict,
+    Missing,
 }
 
 /// Doctor severity.
@@ -455,6 +486,7 @@ impl Installer {
         result
     }
 
+    #[allow(clippy::too_many_lines)]
     fn install_locked(
         &self,
         operation: Operation,
@@ -490,6 +522,9 @@ impl Installer {
         let mut ownership = prior_manifest
             .as_ref()
             .map_or_else(Vec::new, |manifest| manifest.configs.clone());
+        let prior_skill_ownership = prior_manifest
+            .as_ref()
+            .map_or_else(Vec::new, |manifest| manifest.skills.clone());
         let mut notices = Vec::new();
         let mut config_changed = false;
 
@@ -534,11 +569,20 @@ impl Installer {
 
         finalize_ownership(transaction, &mut ownership)?;
 
+        let skill_install = install_global_skill(
+            transaction,
+            &self.context.home,
+            &prior_skill_ownership,
+            &mut notices,
+        )?;
+        self.fail(SetupStage::GlobalSkillWritten)?;
+
         let manifest = InstallManifest {
             version: MANIFEST_VERSION,
             installed_version: self.context.version.clone(),
             architecture,
             configs: ownership,
+            skills: skill_install.ownership,
         };
         let manifest_changed = write_manifest(transaction, &self.context.root, &manifest)?;
         self.fail(SetupStage::ManifestWritten)?;
@@ -558,9 +602,17 @@ impl Installer {
             repository: store.repository().to_path_buf(),
             runtime: stable_binary,
             journal: transaction.journal_path.clone(),
-            changed: changed_runtime || changed_current || config_changed || manifest_changed,
+            changed: changed_runtime
+                || changed_current
+                || config_changed
+                || skill_install.changed
+                || manifest_changed,
             preflight,
             capabilities,
+            skill: SkillReport {
+                path: global_skill_root(&self.context.home),
+                status: skill_install.status,
+            },
             notices,
         })
     }
@@ -575,6 +627,7 @@ impl Installer {
         check_repository(root, &mut checks);
         check_index(root, &mut checks);
         check_configs(root, &self.context.home, &mut checks);
+        check_global_skill(root, &self.context.home, &mut checks);
         if root.join("repository/.git").is_dir() && root.join("bin/current/sctx").is_file() {
             match mcp_smoke(root) {
                 Ok(()) => checks.push(ok(
@@ -673,9 +726,33 @@ impl Installer {
                 let config_lock = config_lock_path(&config.path)?;
                 remove_path_if_exists(&config_lock, &mut report.removed)?;
             }
+            let mut had_expected_skill_ownership = false;
+            for skill in &manifest.skills {
+                if is_expected_skill_path(&self.context.home, &skill.path) {
+                    had_expected_skill_ownership = true;
+                    uninstall_owned_skill(&self.context.home, skill, &mut report)?;
+                } else {
+                    report.warnings.push(format!(
+                        "preserved unexpected manifest global Agent Skill path: {}",
+                        skill.path.display()
+                    ));
+                    report.preserved.push(skill.path.clone());
+                }
+            }
+            if had_expected_skill_ownership {
+                for directory in [
+                    global_skill_root(&self.context.home).join("agents"),
+                    global_skill_root(&self.context.home),
+                ] {
+                    if remove_empty_directory(&directory)? {
+                        report.removed.push(directory);
+                    }
+                }
+            }
         } else {
             report.warnings.push(
-                "installation manifest is missing; Agent configuration was preserved".to_owned(),
+                "installation manifest is missing; Agent configuration and global Agent Skill were preserved"
+                    .to_owned(),
             );
         }
         for path in [
@@ -849,6 +926,8 @@ struct SetupJournal {
 struct Snapshot {
     path: PathBuf,
     original: Original,
+    #[serde(default)]
+    cleanup_empty_dirs: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -894,6 +973,10 @@ impl Transaction {
     }
 
     fn record(&mut self, path: &Path) -> Result<()> {
+        self.record_with_cleanup(path, Vec::new())
+    }
+
+    fn record_with_cleanup(&mut self, path: &Path, cleanup_empty_dirs: Vec<PathBuf>) -> Result<()> {
         if self.journal.entries.iter().any(|entry| entry.path == path) {
             return Ok(());
         }
@@ -925,6 +1008,7 @@ impl Transaction {
         self.journal.entries.push(Snapshot {
             path: path.to_path_buf(),
             original,
+            cleanup_empty_dirs,
         });
         self.persist()
     }
@@ -968,6 +1052,14 @@ struct InstallManifest {
     installed_version: String,
     architecture: Architecture,
     configs: Vec<OwnedConfig>,
+    #[serde(default)]
+    skills: Vec<OwnedSkill>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OwnedSkill {
+    path: PathBuf,
+    sha256: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -996,6 +1088,275 @@ struct OwnedEntry {
     selector: String,
     hash: String,
     original_index: Option<usize>,
+}
+
+struct SkillInstall {
+    changed: bool,
+    status: SkillStatus,
+    ownership: Vec<OwnedSkill>,
+}
+
+#[derive(Default)]
+struct SkillAssetInstall {
+    changed: bool,
+    modified: bool,
+    conflict: bool,
+}
+
+fn global_skill_root(home: &Path) -> PathBuf {
+    home.join(GLOBAL_SKILL_DIRECTORY)
+}
+
+fn global_skill_assets(home: &Path) -> Vec<(PathBuf, &'static [u8])> {
+    let root = global_skill_root(home);
+    SKILL_ASSETS
+        .iter()
+        .map(|(relative, bytes)| (root.join(relative), *bytes))
+        .collect()
+}
+
+fn absent_parent_directories(path: &Path, stop_at: &Path) -> Result<Vec<PathBuf>> {
+    let mut directories = Vec::new();
+    let mut current = path.parent();
+    while let Some(directory) = current {
+        if directory == stop_at {
+            break;
+        }
+        match fs::symlink_metadata(directory) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                directories.push(directory.to_path_buf());
+                current = directory.parent();
+            }
+            Err(error) => {
+                return Err(io_error("inspect global Agent Skill parent for rollback")(
+                    error,
+                ));
+            }
+        }
+    }
+    Ok(directories)
+}
+
+fn install_global_skill(
+    transaction: &mut Transaction,
+    home: &Path,
+    prior_ownership: &[OwnedSkill],
+    notices: &mut Vec<String>,
+) -> Result<SkillInstall> {
+    let root = global_skill_root(home);
+    let assets = global_skill_assets(home);
+    let expected_paths = assets.iter().map(|(path, _)| path).collect::<BTreeSet<_>>();
+    let mut ownership = prior_ownership.to_vec();
+
+    for owned in prior_ownership {
+        if !expected_paths.contains(&owned.path) {
+            notices.push(format!(
+                "preserved unexpected global Agent Skill ownership path: {}",
+                owned.path.display()
+            ));
+        }
+    }
+
+    let owns_expected_file = prior_ownership
+        .iter()
+        .any(|owned| expected_paths.contains(&owned.path));
+    if let Some(status) = global_skill_location_conflict(home, &root, owns_expected_file, notices)?
+    {
+        return Ok(SkillInstall {
+            changed: false,
+            status,
+            ownership,
+        });
+    }
+
+    let mut aggregate = SkillAssetInstall::default();
+    for (path, desired) in assets {
+        let prior = prior_ownership.iter().find(|owned| owned.path == path);
+        let result = install_global_skill_asset(
+            transaction,
+            home,
+            path,
+            desired,
+            prior,
+            &mut ownership,
+            notices,
+        )?;
+        aggregate.changed |= result.changed;
+        aggregate.modified |= result.modified;
+        aggregate.conflict |= result.conflict;
+    }
+
+    let status = if aggregate.modified {
+        SkillStatus::Modified
+    } else if aggregate.conflict {
+        SkillStatus::Conflict
+    } else if aggregate.changed {
+        SkillStatus::Installed
+    } else {
+        SkillStatus::Current
+    };
+    Ok(SkillInstall {
+        changed: aggregate.changed,
+        status,
+        ownership,
+    })
+}
+
+fn global_skill_location_conflict(
+    home: &Path,
+    root: &Path,
+    owns_expected_file: bool,
+    notices: &mut Vec<String>,
+) -> Result<Option<SkillStatus>> {
+    match fs::symlink_metadata(root) {
+        Ok(_) if !owns_expected_file => {
+            notices.push(format!(
+                "preserved user-owned global Agent Skill at {}; Shared Context did not overwrite or claim it",
+                root.display()
+            ));
+            return Ok(Some(SkillStatus::Conflict));
+        }
+        Ok(metadata)
+            if owns_expected_file && (!metadata.is_dir() || metadata.file_type().is_symlink()) =>
+        {
+            notices.push(format!(
+                "preserved managed global Agent Skill because its directory is no longer a non-symlink directory: {}",
+                root.display()
+            ));
+            return Ok(Some(SkillStatus::Modified));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error("inspect global Agent Skill")(error)),
+        _ => {}
+    }
+    for ancestor in [home.join(".agents"), home.join(".agents/skills")] {
+        match fs::symlink_metadata(&ancestor) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                notices.push(format!(
+                    "preserved global Agent Skill because its parent is not a non-symlink directory: {}",
+                    ancestor.display()
+                ));
+                return Ok(Some(SkillStatus::Conflict));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("inspect global Agent Skill parent")(error)),
+        }
+    }
+    Ok(None)
+}
+
+fn install_global_skill_asset(
+    transaction: &mut Transaction,
+    home: &Path,
+    path: PathBuf,
+    desired: &'static [u8],
+    prior: Option<&OwnedSkill>,
+    ownership: &mut Vec<OwnedSkill>,
+    notices: &mut Vec<String>,
+) -> Result<SkillAssetInstall> {
+    if let Some(parent) = path.parent() {
+        match fs::symlink_metadata(parent) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                notices.push(format!(
+                    "preserved global Agent Skill file because its parent is not a non-symlink directory: {}",
+                    parent.display()
+                ));
+                return Ok(SkillAssetInstall {
+                    modified: prior.is_some(),
+                    conflict: prior.is_none(),
+                    ..SkillAssetInstall::default()
+                });
+            }
+            Err(error) => return Err(io_error("inspect global Agent Skill file parent")(error)),
+        }
+    }
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            install_existing_skill_asset(transaction, path, desired, prior, ownership, notices)
+        }
+        Ok(_) => {
+            notices.push(format!(
+                "preserved global Agent Skill path because it is not a regular file: {}",
+                path.display()
+            ));
+            Ok(SkillAssetInstall {
+                modified: prior.is_some(),
+                conflict: prior.is_none(),
+                ..SkillAssetInstall::default()
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let cleanup_empty_dirs = absent_parent_directories(&path, home)?;
+            transaction.record_with_cleanup(&path, cleanup_empty_dirs)?;
+            atomic_write(&path, desired, 0o644)?;
+            transaction.phase("global_skill_installed")?;
+            upsert_owned_skill(ownership, path, sha256(desired));
+            Ok(SkillAssetInstall {
+                changed: true,
+                ..SkillAssetInstall::default()
+            })
+        }
+        Err(error) => Err(io_error("inspect global Agent Skill file")(error)),
+    }
+}
+
+fn install_existing_skill_asset(
+    transaction: &mut Transaction,
+    path: PathBuf,
+    desired: &'static [u8],
+    prior: Option<&OwnedSkill>,
+    ownership: &mut Vec<OwnedSkill>,
+    notices: &mut Vec<String>,
+) -> Result<SkillAssetInstall> {
+    let current = fs::read(&path).map_err(io_error("read global Agent Skill file"))?;
+    match prior {
+        Some(owned) if sha256(&current) == owned.sha256 => {
+            let changed = current != desired;
+            if changed {
+                transaction.record(&path)?;
+                atomic_write(&path, desired, existing_mode(&path, 0o644)?)?;
+                transaction.phase("global_skill_updated")?;
+            }
+            upsert_owned_skill(ownership, path, sha256(desired));
+            Ok(SkillAssetInstall {
+                changed,
+                ..SkillAssetInstall::default()
+            })
+        }
+        Some(_) => {
+            notices.push(format!(
+                "preserved user-modified global Agent Skill file: {}",
+                path.display()
+            ));
+            Ok(SkillAssetInstall {
+                modified: true,
+                ..SkillAssetInstall::default()
+            })
+        }
+        None => {
+            notices.push(format!(
+                "preserved user-owned global Agent Skill file: {}; Shared Context did not overwrite or claim it",
+                path.display()
+            ));
+            Ok(SkillAssetInstall {
+                conflict: true,
+                ..SkillAssetInstall::default()
+            })
+        }
+    }
+}
+
+fn upsert_owned_skill(ownership: &mut Vec<OwnedSkill>, path: PathBuf, hash: String) {
+    if let Some(owned) = ownership.iter_mut().find(|owned| owned.path == path) {
+        owned.sha256 = hash;
+    } else {
+        ownership.push(OwnedSkill { path, sha256: hash });
+    }
+    ownership.sort_by(|left, right| left.path.cmp(&right.path));
 }
 
 fn install_runtime(transaction: &mut Transaction, source: &Path, target: &Path) -> Result<bool> {
@@ -1442,6 +1803,74 @@ fn preserve_modified(config: &OwnedConfig, report: &mut UninstallReport, reason:
         .push(format!("preserved {}: {reason}", config.path.display()));
 }
 
+fn is_expected_skill_path(home: &Path, path: &Path) -> bool {
+    global_skill_assets(home)
+        .iter()
+        .any(|(expected, _)| expected == path)
+}
+
+fn skill_parent_directories_are_safe(home: &Path, path: &Path) -> Result<bool> {
+    let mut current = path.parent();
+    while let Some(directory) = current {
+        if directory == home {
+            return Ok(true);
+        }
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("inspect global Agent Skill parent")(error)),
+        }
+        current = directory.parent();
+    }
+    Ok(false)
+}
+
+fn uninstall_owned_skill(
+    home: &Path,
+    skill: &OwnedSkill,
+    report: &mut UninstallReport,
+) -> Result<()> {
+    if !skill_parent_directories_are_safe(home, &skill.path)? {
+        report.preserved.push(skill.path.clone());
+        report.warnings.push(format!(
+            "preserved global Agent Skill file because a parent is not a non-symlink directory: {}",
+            skill.path.display()
+        ));
+        return Ok(());
+    }
+    match fs::symlink_metadata(&skill.path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            let bytes = fs::read(&skill.path).map_err(io_error("read global Agent Skill file"))?;
+            if sha256(&bytes) == skill.sha256 {
+                fs::remove_file(&skill.path)
+                    .map_err(io_error("remove installer-owned global Agent Skill file"))?;
+                report.removed.push(skill.path.clone());
+            } else {
+                report.preserved.push(skill.path.clone());
+                report.warnings.push(format!(
+                    "preserved user-modified global Agent Skill file: {}",
+                    skill.path.display()
+                ));
+            }
+        }
+        Ok(_) => {
+            report.preserved.push(skill.path.clone());
+            report.warnings.push(format!(
+                "preserved global Agent Skill path because it is not a regular file: {}",
+                skill.path.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(io_error("inspect global Agent Skill file for uninstall")(
+                error,
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn write_manifest(
     transaction: &mut Transaction,
     root: &Path,
@@ -1704,8 +2133,11 @@ fn restore_journal(journal: &SetupJournal) -> Result<()> {
                 atomic_write(&snapshot.path, &bytes, *mode)?;
             }
         }
-        if let Some(parent) = snapshot.path.parent() {
+        if let Some(parent) = snapshot.path.parent().filter(|parent| parent.is_dir()) {
             sync_directory(parent)?;
+        }
+        for directory in &snapshot.cleanup_empty_dirs {
+            remove_empty_directory(directory)?;
         }
     }
     Ok(())
@@ -1887,6 +2319,133 @@ fn check_index(root: &Path, checks: &mut Vec<DoctorCheck>) {
     }
 }
 
+fn check_global_skill(root: &Path, home: &Path, checks: &mut Vec<DoctorCheck>) {
+    let manifest = match read_manifest(root) {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => {
+            checks.push(failed(
+                "global_skill",
+                "global Agent Skill ownership cannot be verified because the install manifest is missing",
+            ));
+            return;
+        }
+        Err(error) => {
+            checks.push(failed("global_skill", error.to_string()));
+            return;
+        }
+    };
+    let assets = global_skill_assets(home);
+    let expected_paths = assets.iter().map(|(path, _)| path).collect::<BTreeSet<_>>();
+    for owned in &manifest.skills {
+        if !expected_paths.contains(&owned.path) {
+            checks.push(action_required(
+                "global_skill.ownership",
+                format!(
+                    "manifest contains an unexpected global Agent Skill path; it will be preserved: {}",
+                    owned.path.display()
+                ),
+            ));
+        }
+    }
+    if manifest
+        .skills
+        .iter()
+        .all(|owned| !expected_paths.contains(&owned.path))
+    {
+        let skill_root = global_skill_root(home);
+        let message = if skill_root.exists() {
+            format!(
+                "{} exists but is not installer-owned; setup will preserve it",
+                skill_root.display()
+            )
+        } else {
+            format!("{} is missing", skill_root.display())
+        };
+        checks.push(if skill_root.exists() {
+            action_required("global_skill", message)
+        } else {
+            failed("global_skill", message)
+        });
+        return;
+    }
+
+    for (path, desired) in assets {
+        let name = if path.ends_with("SKILL.md") {
+            "global_skill.skill_md"
+        } else {
+            "global_skill.openai_yaml"
+        };
+        let Some(owned) = manifest.skills.iter().find(|owned| owned.path == path) else {
+            checks.push(action_required(
+                name,
+                format!(
+                    "{} is not installer-owned and was preserved",
+                    path.display()
+                ),
+            ));
+            continue;
+        };
+        check_global_skill_asset(home, name, &path, desired, owned, checks);
+    }
+}
+
+fn check_global_skill_asset(
+    home: &Path,
+    name: &str,
+    path: &Path,
+    desired: &[u8],
+    owned: &OwnedSkill,
+    checks: &mut Vec<DoctorCheck>,
+) {
+    match skill_parent_directories_are_safe(home, path) {
+        Ok(true) => {}
+        Ok(false) => {
+            checks.push(action_required(
+                name,
+                format!(
+                    "{} was preserved because a parent is not a non-symlink directory",
+                    path.display()
+                ),
+            ));
+            return;
+        }
+        Err(error) => {
+            checks.push(failed(name, error.to_string()));
+            return;
+        }
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            match fs::read(path) {
+                Ok(bytes) if sha256(&bytes) != owned.sha256 => checks.push(action_required(
+                    name,
+                    format!("{} was modified after setup and was preserved", path.display()),
+                )),
+                Ok(bytes) if bytes.as_slice() != desired => checks.push(warning(
+                    name,
+                    format!(
+                        "{} is an unchanged managed file from another version; run setup or upgrade",
+                        path.display()
+                    ),
+                )),
+                Ok(_) => checks.push(ok(
+                    name,
+                    format!("{} is current and installer-owned", path.display()),
+                )),
+                Err(error) => checks.push(failed(name, error.to_string())),
+            }
+        }
+        Ok(_) => checks.push(action_required(
+            name,
+            format!("{} is no longer a regular managed file", path.display()),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            checks.push(failed(name, format!("{} is missing", path.display())));
+        }
+        Err(error) => checks.push(failed(name, error.to_string())),
+    }
+}
+
 fn check_configs(root: &Path, home: &Path, checks: &mut Vec<DoctorCheck>) {
     let stable = root.join("bin/current/sctx");
     for (name, path) in [
@@ -1976,6 +2535,14 @@ fn warning(name: impl Into<String>, message: impl Into<String>) -> DoctorCheck {
     DoctorCheck {
         name: name.into(),
         status: CheckStatus::Warning,
+        message: message.into(),
+    }
+}
+
+fn action_required(name: impl Into<String>, message: impl Into<String>) -> DoctorCheck {
+    DoctorCheck {
+        name: name.into(),
+        status: CheckStatus::ActionRequired,
         message: message.into(),
     }
 }
@@ -2194,6 +2761,28 @@ fn remove_any(path: &Path) -> Result<()> {
         Ok(_) => fs::remove_file(path).map_err(io_error("remove rollback path")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(io_error("inspect rollback path")(error)),
+    }
+}
+
+fn remove_empty_directory(path: &Path) -> Result<bool> {
+    match fs::remove_dir(path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                sync_directory(parent)?;
+            }
+            Ok(true)
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::DirectoryNotEmpty
+                    | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(io_error("remove empty installer directory")(error)),
     }
 }
 

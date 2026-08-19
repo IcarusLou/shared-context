@@ -1,13 +1,15 @@
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use sctx_installer::{
-    Agent, Architecture, Host, InstallContext, Installer, SetupOptions, SetupStage,
+    Agent, Architecture, CheckStatus, Host, InstallContext, Installer, SetupOptions, SetupStage,
+    SkillStatus,
 };
+use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 
 #[derive(Clone)]
@@ -110,6 +112,10 @@ impl Harness {
         Installer::new(self.context(version), Arc::new(FakeHost::default()))
     }
 
+    fn skill_root(&self) -> PathBuf {
+        self.home.join(".agents/skills/shared-context")
+    }
+
     fn seed_configs(&self) -> Vec<(PathBuf, Vec<u8>, u32)> {
         let fixtures = [
             (
@@ -171,6 +177,20 @@ fn hook_count(path: &Path, events: &[&str]) -> usize {
         .sum()
 }
 
+fn replace_owned_skill_bytes(path: &Path, bytes: &[u8], manifest_path: &Path) {
+    fs::write(path, bytes).unwrap();
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+    let owned = manifest["skills"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|owned| owned["path"] == path.to_string_lossy().as_ref())
+        .unwrap();
+    owned["sha256"] = format!("{:x}", Sha256::digest(bytes)).into();
+    fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+}
+
 #[test]
 fn setup_three_times_is_idempotent_and_preserves_existing_configuration() {
     let harness = Harness::new();
@@ -182,6 +202,18 @@ fn setup_three_times_is_idempotent_and_preserves_existing_configuration() {
     let third = installer.setup(&SetupOptions::default()).unwrap();
     assert!(!second.changed);
     assert!(!third.changed);
+    assert_eq!(first.skill.status, SkillStatus::Installed);
+    assert_eq!(second.skill.status, SkillStatus::Current);
+    assert_eq!(third.skill.status, SkillStatus::Current);
+    assert_eq!(first.skill.path, harness.skill_root());
+    assert_eq!(
+        fs::read(harness.skill_root().join("SKILL.md")).unwrap(),
+        include_bytes!("../../../skills/shared-context/SKILL.md")
+    );
+    assert_eq!(
+        fs::read(harness.skill_root().join("agents/openai.yaml")).unwrap(),
+        include_bytes!("../../../skills/shared-context/agents/openai.yaml")
+    );
 
     let cursor_mcp: serde_json::Value =
         serde_json::from_slice(&fs::read(harness.home.join(".cursor/mcp.json")).unwrap()).unwrap();
@@ -228,6 +260,56 @@ fn setup_three_times_is_idempotent_and_preserves_existing_configuration() {
 }
 
 #[test]
+fn cursor_and_codex_share_one_global_skill_installation() {
+    let harness = Harness::new();
+    let cursor = SetupOptions {
+        agents: [Agent::Cursor].into_iter().collect(),
+    };
+    let codex = SetupOptions {
+        agents: [Agent::Codex].into_iter().collect(),
+    };
+    let first = harness.installer("1.0.0").setup(&cursor).unwrap();
+    let second = harness.installer("1.0.0").setup(&codex).unwrap();
+
+    assert_eq!(first.skill.status, SkillStatus::Installed);
+    assert_eq!(second.skill.status, SkillStatus::Current);
+    assert_eq!(first.skill.path, second.skill.path);
+    assert!(harness.skill_root().join("SKILL.md").is_file());
+    assert!(harness.skill_root().join("agents/openai.yaml").is_file());
+}
+
+#[test]
+fn setup_preserves_and_does_not_claim_an_external_same_name_skill() {
+    let harness = Harness::new();
+    let skill = harness.skill_root();
+    fs::create_dir_all(skill.join("agents")).unwrap();
+    fs::write(skill.join("SKILL.md"), b"user skill\n").unwrap();
+    fs::write(skill.join("agents/openai.yaml"), b"user: metadata\n").unwrap();
+
+    let installer = harness.installer("1.0.0");
+    let report = installer.setup(&SetupOptions::default()).unwrap();
+    assert_eq!(report.skill.status, SkillStatus::Conflict);
+    assert!(report.notices.iter().any(|notice| {
+        notice.contains("user-owned global Agent Skill") && notice.contains("did not overwrite")
+    }));
+    assert_eq!(fs::read(skill.join("SKILL.md")).unwrap(), b"user skill\n");
+    assert_eq!(
+        fs::read(skill.join("agents/openai.yaml")).unwrap(),
+        b"user: metadata\n"
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(harness.root.join("state/install-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["skills"].as_array().unwrap().len(), 0);
+
+    let uninstall = installer.uninstall().unwrap();
+    assert!(skill.join("SKILL.md").is_file());
+    assert!(skill.join("agents/openai.yaml").is_file());
+    assert!(!uninstall.removed.contains(&skill));
+}
+
+#[test]
 fn every_setup_write_seam_restores_exact_agent_bytes_and_permissions() {
     let stages = [
         SetupStage::RuntimeInstalled,
@@ -238,6 +320,7 @@ fn every_setup_write_seam_restores_exact_agent_bytes_and_permissions() {
         SetupStage::CursorHooksWritten,
         SetupStage::CodexMcpWritten,
         SetupStage::CodexHooksWritten,
+        SetupStage::GlobalSkillWritten,
         SetupStage::ManifestWritten,
         SetupStage::SmokeTested,
     ];
@@ -276,6 +359,11 @@ fn every_setup_write_seam_restores_exact_agent_bytes_and_permissions() {
             "runtime at {stage:?}"
         );
         assert!(!harness.root.join("state/install-manifest.json").exists());
+        assert!(!harness.skill_root().exists(), "skill root at {stage:?}");
+        assert!(
+            !harness.home.join(".agents").exists(),
+            "new global Skill parents at {stage:?}"
+        );
         if stage >= SetupStage::RepositoryInitialized {
             assert!(harness.root.join("repository/.git").is_dir());
         }
@@ -368,6 +456,186 @@ fn upgrade_switches_atomically_and_failed_upgrade_restores_previous_runtime() {
 }
 
 #[test]
+fn upgrade_and_uninstall_preserve_only_the_user_modified_skill_file() {
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let skill_md = harness.skill_root().join("SKILL.md");
+    let openai_yaml = harness.skill_root().join("agents/openai.yaml");
+    fs::write(&skill_md, b"user modified skill\n").unwrap();
+    fs::write(&harness.runtime, b"signed-runtime-v2").unwrap();
+
+    let installer = harness.installer("2.0.0");
+    let upgrade = installer.upgrade(&SetupOptions::default()).unwrap();
+    assert_eq!(upgrade.skill.status, SkillStatus::Modified);
+    assert_eq!(fs::read(&skill_md).unwrap(), b"user modified skill\n");
+    assert!(openai_yaml.is_file());
+    assert!(
+        upgrade
+            .notices
+            .iter()
+            .any(|notice| notice.contains("user-modified global Agent Skill file"))
+    );
+
+    let uninstall = installer.uninstall().unwrap();
+    assert!(skill_md.is_file());
+    assert!(!openai_yaml.exists());
+    assert!(harness.skill_root().is_dir());
+    assert!(uninstall.preserved.contains(&skill_md));
+    assert!(uninstall.removed.contains(&openai_yaml));
+    assert!(
+        uninstall
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("user-modified global Agent Skill file"))
+    );
+}
+
+#[test]
+fn uninstall_never_follows_a_replaced_skill_parent_symlink() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.0.0");
+    installer.setup(&SetupOptions::default()).unwrap();
+    let skill = harness.skill_root();
+    let displaced = harness.home.join("displaced-managed-skill");
+    let outside = harness.home.join("outside-symlink-target");
+    fs::rename(&skill, &displaced).unwrap();
+    fs::create_dir_all(outside.join("agents")).unwrap();
+    fs::write(
+        outside.join("SKILL.md"),
+        include_bytes!("../../../skills/shared-context/SKILL.md"),
+    )
+    .unwrap();
+    fs::write(
+        outside.join("agents/openai.yaml"),
+        include_bytes!("../../../skills/shared-context/agents/openai.yaml"),
+    )
+    .unwrap();
+    symlink(&outside, &skill).unwrap();
+
+    let report = installer.uninstall().unwrap();
+    assert!(skill.is_symlink());
+    assert!(outside.join("SKILL.md").is_file());
+    assert!(outside.join("agents/openai.yaml").is_file());
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("parent is not a non-symlink directory"))
+    );
+}
+
+#[test]
+fn upgrade_replaces_an_unchanged_managed_skill_from_an_older_build() {
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let skill_md = harness.skill_root().join("SKILL.md");
+    let manifest = harness.root.join("state/install-manifest.json");
+    replace_owned_skill_bytes(&skill_md, b"older managed skill\n", &manifest);
+    fs::set_permissions(&skill_md, fs::Permissions::from_mode(0o640)).unwrap();
+    fs::write(&harness.runtime, b"signed-runtime-v2").unwrap();
+
+    let report = harness
+        .installer("2.0.0")
+        .upgrade(&SetupOptions::default())
+        .unwrap();
+    assert_eq!(report.skill.status, SkillStatus::Installed);
+    assert_eq!(
+        fs::read(&skill_md).unwrap(),
+        include_bytes!("../../../skills/shared-context/SKILL.md")
+    );
+    assert_eq!(
+        fs::metadata(&skill_md).unwrap().permissions().mode() & 0o7777,
+        0o640
+    );
+}
+
+#[test]
+fn failed_upgrade_restores_managed_skill_bytes_and_permissions() {
+    for stage in [
+        SetupStage::GlobalSkillWritten,
+        SetupStage::ManifestWritten,
+        SetupStage::SmokeTested,
+    ] {
+        let harness = Harness::new();
+        harness
+            .installer("1.0.0")
+            .setup(&SetupOptions::default())
+            .unwrap();
+        let manifest = harness.root.join("state/install-manifest.json");
+        let originals = [
+            (
+                harness.skill_root().join("SKILL.md"),
+                b"old skill\n".as_slice(),
+                0o640,
+            ),
+            (
+                harness.skill_root().join("agents/openai.yaml"),
+                b"old: metadata\n".as_slice(),
+                0o604,
+            ),
+        ];
+        for (path, bytes, mode) in &originals {
+            replace_owned_skill_bytes(path, bytes, &manifest);
+            fs::set_permissions(path, fs::Permissions::from_mode(*mode)).unwrap();
+        }
+        fs::set_permissions(&manifest, fs::Permissions::from_mode(0o640)).unwrap();
+        let original_manifest = fs::read(&manifest).unwrap();
+        fs::write(&harness.runtime, b"signed-runtime-v2").unwrap();
+
+        let result = harness
+            .installer("2.0.0")
+            .with_failure_after(stage)
+            .upgrade(&SetupOptions::default());
+        assert!(result.is_err());
+        for (path, bytes, mode) in &originals {
+            assert_eq!(fs::read(path).unwrap(), *bytes, "bytes at {stage:?}");
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+                *mode,
+                "mode at {stage:?}"
+            );
+        }
+        assert_eq!(fs::read(&manifest).unwrap(), original_manifest);
+        assert_eq!(
+            fs::metadata(&manifest).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
+    }
+}
+
+#[test]
+fn old_manifest_without_skill_ownership_is_accepted_without_claiming_existing_files() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.0.0");
+    installer.setup(&SetupOptions::default()).unwrap();
+    let manifest_path = harness.root.join("state/install-manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest.as_object_mut().unwrap().remove("skills");
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let report = installer.setup(&SetupOptions::default()).unwrap();
+    assert_eq!(report.skill.status, SkillStatus::Conflict);
+    let rewritten: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(rewritten["skills"].as_array().unwrap().len(), 0);
+
+    installer.uninstall().unwrap();
+    assert!(harness.skill_root().join("SKILL.md").is_file());
+    assert!(harness.skill_root().join("agents/openai.yaml").is_file());
+}
+
+#[test]
 fn doctor_reports_codex_trust_as_action_required() {
     let harness = Harness::new();
     harness
@@ -384,6 +652,32 @@ fn doctor_reports_codex_trust_as_action_required() {
     assert!(codex.diagnostic.starts_with("ACTION REQUIRED:"));
     assert!(report.checks.iter().any(|check| {
         check.name == "codex_hook_trust.codex" && format!("{:?}", check.status) == "ActionRequired"
+    }));
+    assert!(
+        report.checks.iter().any(|check| {
+            check.name == "global_skill.skill_md" && check.status == CheckStatus::Ok
+        })
+    );
+    assert!(report.checks.iter().any(|check| {
+        check.name == "global_skill.openai_yaml" && check.status == CheckStatus::Ok
+    }));
+}
+
+#[test]
+fn doctor_distinguishes_modified_and_missing_managed_skill_files() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.0.0");
+    installer.setup(&SetupOptions::default()).unwrap();
+    fs::write(harness.skill_root().join("SKILL.md"), b"modified\n").unwrap();
+    fs::remove_file(harness.skill_root().join("agents/openai.yaml")).unwrap();
+
+    let report = installer.doctor();
+    assert!(!report.healthy);
+    assert!(report.checks.iter().any(|check| {
+        check.name == "global_skill.skill_md" && check.status == CheckStatus::ActionRequired
+    }));
+    assert!(report.checks.iter().any(|check| {
+        check.name == "global_skill.openai_yaml" && check.status == CheckStatus::Error
     }));
 }
 
@@ -409,6 +703,7 @@ fn uninstall_removes_only_exact_owned_entries_and_retains_repository() {
     assert!(report.repository_retained);
     assert!(harness.root.join("repository/.git").is_dir());
     assert!(!harness.root.join("bin").exists());
+    assert!(!harness.skill_root().exists());
     assert!(
         report
             .warnings
