@@ -9,10 +9,10 @@ use std::{
 
 use rusqlite::{Connection, types::ValueRef};
 use sctx_event_schema::{
-    Applicability, ConflictParticipant, ContextId, ContextKind, ContextRevisionDraft, Event,
-    EventPayload, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, PublicationAction,
-    PublicationDraft, PublicationId, ReviewDraft, ReviewVerdict, RevisionId, SemanticConflictDraft,
-    SpaceId,
+    Applicability, ConflictParticipant, ConflictResolutionDraft, ConflictResolutionResult,
+    ContextId, ContextKind, ContextRevisionDraft, Event, EventPayload, EvidenceSnapshotDraft,
+    EvidenceType, IntentSnapshot, PublicationAction, PublicationDraft, PublicationId,
+    ResolutionOutcome, ReviewDraft, ReviewVerdict, RevisionId, SemanticConflictDraft, SpaceId,
 };
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::{
@@ -529,6 +529,164 @@ fn reverse_reference_closure_recovers_dangling_nodes_and_handles_duplicate_appen
         projection_dump(fixture.index.database_path()),
         projection_dump(scratch.database_path())
     );
+}
+
+#[test]
+fn every_prefix_of_causal_reverse_and_interleaved_event_arrival_matches_scratch() {
+    let events = complete_event_graph();
+    let orders = [
+        vec![0, 1, 2, 3, 4, 5, 6, 7, 8],
+        vec![8, 7, 6, 5, 4, 3, 2, 1, 0],
+        vec![4, 8, 2, 7, 0, 6, 3, 1, 5],
+    ];
+
+    for (order_number, order) in orders.iter().enumerate() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = GitStore::initialize(temporary.path().join("installation")).unwrap();
+        let incremental = ProjectionIndex::for_store(&store);
+        let scratch =
+            ProjectionIndex::new(store.repository(), temporary.path().join("scratch-state"));
+
+        for (prefix, event_index) in order.iter().enumerate() {
+            append(&store, events[*event_index].clone());
+            let synchronized = incremental.synchronize().unwrap();
+            if prefix == 0 {
+                assert_eq!(synchronized.update_kind, IndexUpdateKind::FullRebuild);
+            } else {
+                assert_eq!(
+                    synchronized.update_kind,
+                    IndexUpdateKind::Incremental,
+                    "order {order_number}, prefix {prefix} unexpectedly fell back"
+                );
+            }
+            scratch.rebuild().unwrap();
+            assert_eq!(
+                projection_dump(incremental.database_path()),
+                projection_dump(scratch.database_path()),
+                "order {order_number}, prefix {prefix} diverged from scratch"
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn complete_event_graph() -> Vec<Event> {
+    let space = Event::space_created(intent("arbitrary arrival graph"), None).unwrap();
+    let (space_id, initial_intent_revision_id) = space_ids(&space);
+    let intent_revision = Event::intent_revision_added(
+        space_id,
+        vec![initial_intent_revision_id],
+        intent("arbitrary arrival graph revision"),
+        None,
+    )
+    .unwrap();
+    let first_context =
+        Event::context_proposed(space_id, context("arbitrary graph first context"), None).unwrap();
+    let (first_context_id, first_revision_id) = context_ids(&first_context);
+    let review = Event::context_reviewed(
+        space_id,
+        first_context_id,
+        ReviewDraft {
+            revision_id: first_revision_id,
+            verdict: ReviewVerdict::Approve,
+            reason: "arbitrary arrival review".to_owned(),
+        },
+        None,
+    )
+    .unwrap();
+    let first_publication = Event::publication_changed(
+        space_id,
+        first_context_id,
+        PublicationDraft {
+            previous_publication_ids: Vec::new(),
+            action: PublicationAction::Publish,
+            revision_id: first_revision_id,
+            review_event_ids: vec![review.event_id()],
+        },
+        None,
+    )
+    .unwrap();
+    let first_publication_id = publication_id(&first_publication);
+    let second_context =
+        Event::context_proposed(space_id, context("arbitrary graph second context"), None).unwrap();
+    let (second_context_id, second_revision_id) = context_ids(&second_context);
+    let second_publication = Event::publication_changed(
+        space_id,
+        second_context_id,
+        PublicationDraft {
+            previous_publication_ids: Vec::new(),
+            action: PublicationAction::Publish,
+            revision_id: second_revision_id,
+            review_event_ids: Vec::new(),
+        },
+        None,
+    )
+    .unwrap();
+    let second_publication_id = publication_id(&second_publication);
+    let semantic_conflict = Event::semantic_conflict_opened(
+        space_id,
+        SemanticConflictDraft {
+            participants: vec![
+                ConflictParticipant {
+                    context_id: first_context_id,
+                    revision_id: first_revision_id,
+                    publication_id: first_publication_id,
+                },
+                ConflictParticipant {
+                    context_id: second_context_id,
+                    revision_id: second_revision_id,
+                    publication_id: second_publication_id,
+                },
+            ],
+            reason: "arbitrary arrival conflict".to_owned(),
+            applicability: Applicability {
+                domains: vec!["index".to_owned()],
+                platforms: vec!["macos".to_owned()],
+                conditions: vec!["offline".to_owned()],
+            },
+        },
+        None,
+    )
+    .unwrap();
+    let conflict_id = match semantic_conflict.payload() {
+        EventPayload::SemanticConflictOpened { conflict, .. } => conflict.conflict_id,
+        _ => unreachable!(),
+    };
+    let resolution = Event::semantic_conflict_resolution_added(
+        space_id,
+        conflict_id,
+        ConflictResolutionDraft {
+            previous_resolution_ids: Vec::new(),
+            related_publication_ids: vec![first_publication_id, second_publication_id],
+            results: vec![
+                ConflictResolutionResult {
+                    context_id: first_context_id,
+                    revision_id: first_revision_id,
+                    outcome: ResolutionOutcome::Retained,
+                },
+                ConflictResolutionResult {
+                    context_id: second_context_id,
+                    revision_id: second_revision_id,
+                    outcome: ResolutionOutcome::Withdrawn,
+                },
+            ],
+            rationale: "exercise complete reverse-reference closure".to_owned(),
+        },
+        None,
+    )
+    .unwrap();
+
+    vec![
+        space,
+        intent_revision,
+        first_context,
+        review,
+        first_publication,
+        second_context,
+        second_publication,
+        semantic_conflict,
+        resolution,
+    ]
 }
 
 #[test]
