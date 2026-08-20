@@ -4,14 +4,18 @@
 
 use std::fmt;
 
+mod episode;
 mod ids;
 mod model;
 mod reducer;
 mod task;
 
+pub use episode::{
+    ArtifactAction, ContextCandidate, ContextUseDisposition, WorkEpisode, WorkObservation,
+};
 pub use ids::{
-    ConflictId, ContextId, EventId, EvidenceId, IdParseError, PublicationId, ResolutionId,
-    ReviewId, RevisionId, SpaceId, TaskId,
+    CandidateId, ConflictId, ContextId, EventId, EvidenceId, IdParseError, PublicationId,
+    ResolutionId, ReviewId, RevisionId, SpaceId, TaskId, WorkEpisodeId,
 };
 pub use model::{
     Applicability, ConflictParticipant, ConflictResolution, ConflictResolutionDraft,

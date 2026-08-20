@@ -125,6 +125,16 @@ opaque_id!(
     "tsk_",
     "Opaque identity of an Agent engineering task."
 );
+opaque_id!(
+    WorkEpisodeId,
+    "wep_",
+    "Opaque identity of one Task's aggregated work episode."
+);
+opaque_id!(
+    CandidateId,
+    "cnd_",
+    "Opaque identity of a local `ContextCandidate`."
+);
 opaque_id!(ContextId, "ctx_", "Opaque identity of a `ContextItem`.");
 opaque_id!(
     RevisionId,
@@ -161,8 +171,8 @@ mod tests {
     use uuid::{Variant, Version};
 
     use super::{
-        ConflictId, ContextId, EventId, EvidenceId, PublicationId, ResolutionId, ReviewId,
-        RevisionId, SpaceId, TaskId,
+        CandidateId, ConflictId, ContextId, EventId, EvidenceId, PublicationId, ResolutionId,
+        ReviewId, RevisionId, SpaceId, TaskId, WorkEpisodeId,
     };
 
     #[test]
@@ -200,6 +210,8 @@ mod tests {
 
         assert_generated_id!(SpaceId::new(), "spc_");
         assert_generated_id!(TaskId::new(), "tsk_");
+        assert_generated_id!(WorkEpisodeId::new(), "wep_");
+        assert_generated_id!(CandidateId::new(), "cnd_");
         assert_generated_id!(ContextId::new(), "ctx_");
         assert_generated_id!(RevisionId::new(), "rev_");
         assert_generated_id!(EventId::new(), "evt_");

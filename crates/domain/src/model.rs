@@ -146,7 +146,8 @@ pub enum EvidenceType {
 }
 
 /// Caller-authored evidence content before an opaque Evidence ID is assigned.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceSnapshotDraft {
     pub kind: EvidenceType,
     pub supports: String,
@@ -216,7 +217,8 @@ impl EvidenceSnapshot {
 }
 
 /// Caller-authored Context content before generated revision and evidence IDs are assigned.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextRevisionDraft {
     pub kind: ContextKind,
     pub topic_key: Option<String>,
