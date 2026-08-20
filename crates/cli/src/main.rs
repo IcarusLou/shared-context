@@ -36,8 +36,8 @@ use sctx_index::{
 use sctx_local_state::{Breadcrumb, BreadcrumbKind, CaptureStore};
 use sctx_mcp::{TaskContextInput, TaskContextResponse};
 use sctx_search::{
-    ContextPackMode, ContextPackRequest, ContextStatus, ScopeFilter, SearchEngine, SearchFilters,
-    SearchRequest, TaskContextPack,
+    ContextPackMode, ContextStatus, ScopeFilter, SearchEngine, SearchFilters, SearchRequest,
+    TaskContextPack,
 };
 use sctx_task_runtime::TaskRuntime;
 use serde::{Deserialize, Serialize};
@@ -60,7 +60,6 @@ Commands:
   semantic conflict open|resolve
   task context
   search
-  context-pack
   index rebuild|status
   pending list|commit|move-aside
   validate --staged
@@ -144,15 +143,11 @@ fn run(args: &[String], json_output: bool) -> Result<()> {
         [command, rest @ ..] if command == "uninstall" => run_uninstall(rest, json_output),
         [group, rest @ ..] if group == "knowledge" => run_knowledge(rest, json_output),
         [group, rest @ ..] if group == "space" => run_space(rest, json_output),
-        [group, command, rest @ ..] if group == "context" && command == "pack" => {
-            run_context_pack(rest, json_output)
-        }
         [group, rest @ ..] if group == "candidate" => run_candidate(rest, json_output),
         [group, rest @ ..] if group == "context" => run_context(rest, json_output),
         [group, rest @ ..] if group == "semantic" => run_semantic(rest, json_output),
         [group, rest @ ..] if group == "task" => run_task(rest, json_output),
         [command, rest @ ..] if command == "search" => run_search(rest, json_output),
-        [command, rest @ ..] if command == "context-pack" => run_context_pack(rest, json_output),
         [group, rest @ ..] if group == "index" => run_index(rest, json_output),
         [group, rest @ ..] if group == "pending" => run_pending(rest, json_output),
         [command, rest @ ..] if command == "validate" => run_validate(rest, json_output),
@@ -1735,43 +1730,6 @@ fn run_task(args: &[String], json_output: bool) -> Result<()> {
         "task.context",
         &response.tree,
         response.generation,
-        &data,
-        json_output,
-    )
-}
-
-fn run_context_pack(args: &[String], json_output: bool) -> Result<()> {
-    let options = Options::parse(args, &["--automatic"])?;
-    allow_search_options(
-        &options,
-        &["--token-budget", "--candidate-limit", "--automatic"],
-    )?;
-    let search = search_request(&options)?;
-    let token_budget = parse_usize(
-        options.optional("--token-budget")?.unwrap_or("2000"),
-        "token budget",
-    )?;
-    let candidate_limit = parse_usize(
-        options.optional("--candidate-limit")?.unwrap_or("100"),
-        "candidate limit",
-    )?;
-    let request = ContextPackRequest {
-        search,
-        token_budget,
-        candidate_limit,
-        mode: if options.has("--automatic") {
-            ContextPackMode::AutomaticInjection
-        } else {
-            ContextPackMode::Explicit
-        },
-    };
-    let runtime = Runtime::open()?;
-    let response = SearchEngine::new(runtime.index).context_pack(&request)?;
-    let data = serde_json::to_value(&response).map_err(json_error("serialize Context Pack"))?;
-    emit_raw(
-        "context-pack",
-        &response.indexed_tree_oid,
-        response.projection_generation,
         &data,
         json_output,
     )

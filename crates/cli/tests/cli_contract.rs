@@ -271,7 +271,6 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
         "semantic conflict open|resolve",
         "task context",
         "search",
-        "context-pack",
         "pending list|commit|move-aside",
         "validate --staged",
         "hook --agent cursor|codex",
@@ -695,10 +694,16 @@ fn candidate_create_is_unassigned_idempotent_and_absent_from_retrieval() {
     ]);
     assert!(search["data"]["results"].as_array().unwrap().is_empty());
     let pack = harness.success(&[
-        "context-pack",
-        "--query",
+        "task",
+        "context",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        "candidate-retrieval-isolation",
+        "--goal",
         "hidden episode discovery",
-        "--automatic",
+        "--desired-change",
+        "retrieve confirmed knowledge only",
         "--token-budget",
         "1000",
     ]);
@@ -1022,16 +1027,23 @@ fn lifecycle_commands_share_stable_json_tree_and_generation_envelopes() {
     ]);
     assert_eq!(search["data"]["results"][0]["context_id"], context_id);
     let pack = harness.success(&[
-        "context-pack",
-        "--query",
+        "task",
+        "context",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        "accepted-context-retrieval",
+        "--goal",
         "stable",
-        "--space-id",
-        &space_id,
-        "--automatic",
+        "--desired-change",
+        "retrieve stable accepted Context",
         "--token-budget",
         "1000",
     ]);
-    assert_eq!(pack["data"]["items"][0]["context_id"], context_id);
+    assert_eq!(
+        pack["data"]["items"][0]["context"]["context_id"],
+        context_id
+    );
     harness.success(&[
         "context",
         "get",

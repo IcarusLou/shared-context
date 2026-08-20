@@ -10,18 +10,18 @@
 
 本项目尚未上线，本文直接定义目标模型、接口和存储结构。
 
-### 1.1 当前实现状态（Mew #124）
+### 1.1 当前实现状态（Mew #125）
 
 本文的大部分章节描述目标架构，不代表代码已经全部实现。当前里程碑边界如下：
 
 | 里程碑 | 状态 | 当前代码事实 |
 |---|---|---|
 | **M1：Task-first 领域与入口基础** | **已实现** | `TaskIntent` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；CLI/MCP 通过 `candidate_create` 创建无 Space Candidate；Candidate 不可自动注入 |
-| **M2：Task Runtime 与多 Space Retrieval** | **部分实现** | TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 召回、多 Space 关联、TaskContextPack、显式 `task_context` 和 Codex 动态 Hook Session 已实现；阶段总验收尚未完成 |
+| **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、TaskContextPack、显式 `task_context` 和 Codex 动态 Hook Session 已通过跨 crate/E2E 验收 |
 | **M3：Engineering Graph** | **未实现** | 尚无工程对象扫描、ContextArtifactAssociation、移动/改名重解析或关系图扩展 |
 | **M4：Low-tax Capture** | **未实现** | 尚无 WorkEpisode 自动聚合、AgentCheckpoint、Candidate Builder、去重/冲突、Space 推荐或 Candidate Confirm/List/Discard |
 
-当前 `task_context` 已通过外部 Session Locator 续接本地 TaskSession，修订 TaskIntent、合并 TaskSignals，并生成可解释的多 Space TaskContextPack。受支持的 Codex PromptSubmit 已复用这条共享路径；PostToolUse 只把可证明的本地 File Hint 和结构化 Test outcome 合并到同一 Session。Cursor Prompt Hook 仍保持只可观察，依赖显式 MCP；当前接入不扫描代码、不解析关系图。当前 `candidate_create` 是手工、无归属的 M1 可执行入口，不等同于 M4 的自动 Capture。
+当前 `task_context` 已通过外部 Session Locator 续接本地 TaskSession，修订 TaskIntent、合并 TaskSignals，并生成可解释的多 Space TaskContextPack。受支持的 Codex PromptSubmit 已复用这条共享路径；PostToolUse 只把可证明的本地 File Hint 和结构化 Test outcome 合并到同一 Session。Cursor Prompt Hook 仍保持只可观察，依赖显式 MCP；这是 Agent 能力差异，不是第二套检索模型。非 Task 的裸 query 自动 Context Pack 入口已经删除，`context_search.space_ids` 只保留为显式探索硬过滤。当前接入不扫描代码、不解析关系图。当前 `candidate_create` 是手工、无归属的 M1 可执行入口，不等同于 M4 的自动 Capture。
 
 ## 2. 背景与目标
 
@@ -1214,14 +1214,16 @@ sctx doctor --json
 
 M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命周期、CLI/MCP、Agent Adapter、安装器与 NPM 基础设施。复用这些基础设施不表示下面的目标里程碑已经完成。
 
-### M2：Task Runtime 与多 Space Retrieval — 部分实现
+### M2：Task Runtime 与多 Space Retrieval — 已实现
 
 - `runtime.sqlite`、TaskSession、TaskIntent Revision 及并发线性 Head 已实现。
 - 完整 Space Intent FTS、Task 多路召回、Space 关联推断、解释路径和 Session 隔离已实现。
 - 显式 `task_context` 已按 external Session Locator 更新 Runtime，并返回固定 Task Revision 与知识 Projection 上的 TaskContextPack。
 - Codex PromptSubmit 已通过 vendor-neutral typed Task operation 接入同一 Runtime；Prompt、Workspace 和本地 Git Repository 作为 TaskSignals。
 - PostToolUse 已按 locator 合并经存在性与 Workspace 边界校验的 File Hint，以及结构化 Test outcome；后续 Prompt 能观察新的检索路径。
-- Cursor Prompt 仍为显式 MCP；Symbol/Diff/API/Schema 的动态推导和 M2 阶段总验收尚未完成。
+- M2 跨 crate/E2E oracle 已证明无 Space 路由输入、`0/1/N` Space、多 Space FE Task、同 Workspace Session 隔离、PostTool File/Test 增量路径、安全自动注入，以及 Tree/Generation/fingerprint 一致性。
+- Workspace 与本地 Repository 绝对路径作为位置 observation 保留在 Session，但不参与 FTS 相关性或 Task fingerprint，避免 checkout 路径偶然形成 Space prior。
+- Cursor Prompt 仍为显式 MCP；Symbol/Diff/API/Schema 的代码扫描、解析和关系扩展属于 M3，不冒充 M2 RetrievalPath。
 
 ### M3：Engineering Graph — 未实现
 
@@ -1235,6 +1237,10 @@ M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命�
 - Candidate Builder、Evidence 组装、去重、冲突和 Space 推荐尚未实现。
 - Candidate List/Confirm/Discard 以及 PreCompact/TurnStop 自动触发尚未实现。
 - 当前手工 `candidate_create` 只验证无归属 Candidate 的入口与安全边界。
+- Mandatory Gate #114/#117 必须在 Candidate Builder 落地时一起完成：Builder 为一次创建操作生成稳定 `submission_id`，首次提交由服务端生成 `candidate_id` 并持久化 `submission_id → candidate_id`；重试复用同一 `submission_id`。
+- 相同 `submission_id` 加相同内容返回 `already_exists`；相同 `submission_id` 加不同内容返回 `IdempotencyKeyConflict`；不同 `submission_id` 创建新的 Candidate，即使文本相似。语义相近去重属于知识聚合，不由幂等键处理。
+- `submission_id` 必须进入 Git Event，并在 SQLite 建唯一索引，使删除数据库后可从 Git 重建；写路径不得全量扫描 Event、依赖 commit subject，或因无关坏 Event 阻断重复检查。#114 的隔离修复依赖这条 #117 设计。
+- M4 同时必须建立可查询的 WorkEpisode，使 `source_episode_id` 在 Candidate 写入前可验证。
 
 ## 19. 验收标准
 

@@ -115,10 +115,16 @@ fn candidate_create_is_the_unassigned_main_path_and_never_auto_injects() {
     let pack = Command::new(binary)
         .arg("--json")
         .args([
-            "context-pack",
-            "--query",
+            "task",
+            "context",
+            "--agent-kind",
+            "codex",
+            "--external-session-id",
+            "m1-candidate-isolation",
+            "--goal",
             "M1 Candidate",
-            "--automatic",
+            "--desired-change",
+            "retrieve confirmed Context only",
             "--token-budget",
             "1000",
         ])
@@ -131,7 +137,6 @@ fn candidate_create_is_the_unassigned_main_path_and_never_auto_injects() {
         String::from_utf8_lossy(&pack.stderr)
     );
     let pack: Value = serde_json::from_slice(&pack.stdout).unwrap();
-    assert_eq!(pack["data"]["mode"], "automatic_injection");
     assert_eq!(pack["data"]["items"], json!([]));
 
     let help = Command::new(binary).arg("--help").output().unwrap();

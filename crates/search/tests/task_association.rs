@@ -437,16 +437,22 @@ fn fe_task_associates_requirement_protocol_compatibility_and_analytics_spaces() 
 }
 
 #[test]
-fn workspace_location_never_adds_a_space_prior_and_unrelated_task_returns_zero() {
+fn workspace_and_repository_locations_never_add_space_priors() {
     let fixture = fixture();
     let unrelated = task("unrelatedtaskneedle");
     let response = SearchEngine::new(fixture.index)
         .task_space_associations(
             &unrelated,
-            &[TaskSignal {
-                kind: TaskSignalKind::Workspace,
-                content: "pageintentneedle SearchV2Endpoint analyticsdomain".to_owned(),
-            }],
+            &[
+                TaskSignal {
+                    kind: TaskSignalKind::Workspace,
+                    content: "pageintentneedle SearchV2Endpoint analyticsdomain".to_owned(),
+                },
+                TaskSignal {
+                    kind: TaskSignalKind::Repository,
+                    content: "protocolintentonly LegacyCompatibilityTest".to_owned(),
+                },
+            ],
         )
         .unwrap();
     assert!(response.associations.is_empty());
@@ -624,6 +630,10 @@ fn task_context_order_budget_and_fingerprint_are_stable() {
     reordered.push(TaskSignal {
         kind: TaskSignalKind::Workspace,
         content: "/different/local/checkout".to_owned(),
+    });
+    reordered.push(TaskSignal {
+        kind: TaskSignalKind::Repository,
+        content: "/different/local/repository".to_owned(),
     });
     let reordered_pack = SearchEngine::new(index.clone())
         .task_context_pack(&TaskContextRequest::automatic(

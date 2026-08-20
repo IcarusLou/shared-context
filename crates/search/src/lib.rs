@@ -328,27 +328,6 @@ pub enum ContextPackMode {
     AutomaticInjection,
 }
 
-/// Context Pack construction request.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ContextPackRequest {
-    pub search: SearchRequest,
-    pub token_budget: usize,
-    pub candidate_limit: usize,
-    pub mode: ContextPackMode,
-}
-
-impl ContextPackRequest {
-    #[must_use]
-    pub fn automatic(search: SearchRequest, token_budget: usize) -> Self {
-        Self {
-            search,
-            token_budget,
-            candidate_limit: DEFAULT_CANDIDATE_LIMIT,
-            mode: ContextPackMode::AutomaticInjection,
-        }
-    }
-}
-
 /// One budget omission, including enough identity to fetch the Context explicitly.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ContextPackOmitted {
@@ -385,18 +364,6 @@ pub struct ContextPackItem {
     pub auto_injection_eligible: bool,
     pub match_reason: MatchReason,
     pub detail: ContextPackDetail,
-}
-
-/// Context Pack response. Items retain match reasons and both sides of every expanded conflict.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ContextPack {
-    pub indexed_tree_oid: String,
-    pub projection_generation: u64,
-    pub token_budget: usize,
-    pub estimated_tokens: usize,
-    pub mode: ContextPackMode,
-    pub items: Vec<ContextPackItem>,
-    pub omitted: Vec<ContextPackOmitted>,
 }
 
 /// Query boundary that always delegates reads to one [`sctx_index::QuerySnapshot`] transaction.
@@ -443,8 +410,8 @@ impl SearchEngine {
     /// textual artifact hints. It deliberately leaves `relation_paths` empty because code graph
     /// resolution belongs to the later Engineering Graph stage.
     ///
-    /// Workspace signals are location observations only and are excluded from both matching and
-    /// scoring.
+    /// Workspace and Repository signals are location observations only in M2 and are excluded
+    /// from both matching and scoring.
     ///
     /// # Errors
     ///
@@ -581,48 +548,6 @@ impl SearchEngine {
             next_cursor: snapshot.data.1,
         })
     }
-
-    /// Constructs a deterministic Context Pack without leaving the `QuerySnapshot` transaction.
-    /// Automatic mode hard-filters to Accepted, evidence-backed, conflict-free rows.
-    ///
-    /// # Errors
-    ///
-    /// Returns an input error for a zero budget/limit or invalid search request, and storage errors
-    /// propagated by index synchronization and snapshot reads.
-    pub fn context_pack(&self, request: &ContextPackRequest) -> Result<ContextPack> {
-        validate_search_request(&request.search)?;
-        if request.token_budget == 0 {
-            return Err(invalid(
-                "context pack token_budget must be greater than zero",
-            ));
-        }
-        if request.candidate_limit == 0 || request.candidate_limit > MAX_PAGE_SIZE {
-            return Err(invalid(format!(
-                "context pack candidate_limit must be between 1 and {MAX_PAGE_SIZE}"
-            )));
-        }
-        let mut search = request.search.clone();
-        search.page_size = request.candidate_limit;
-        search.cursor = None;
-        if request.mode == ContextPackMode::AutomaticInjection {
-            search.filters.statuses = vec![ContextStatus::Accepted];
-        }
-        let automatic = request.mode == ContextPackMode::AutomaticInjection;
-        let snapshot = self.index.query_snapshot(|connection| {
-            let tree_oid = meta(connection, "indexed_tree_oid")?;
-            let page = search_in_snapshot(connection, &search, &tree_oid, automatic)?;
-            Ok(pack_page(page, request.token_budget))
-        })?;
-        Ok(ContextPack {
-            indexed_tree_oid: snapshot.metadata.indexed_tree_oid,
-            projection_generation: snapshot.metadata.projection_generation,
-            token_budget: request.token_budget,
-            estimated_tokens: snapshot.data.estimated_tokens,
-            mode: request.mode,
-            items: snapshot.data.items,
-            omitted: snapshot.data.omitted,
-        })
-    }
 }
 
 #[derive(Debug)]
@@ -656,7 +581,12 @@ fn task_query_tokens(intent: &TaskIntent, signals: &[TaskSignal]) -> Vec<String>
     .flat_map(|values| values.iter().map(String::as_str));
     let signal_text = signals
         .iter()
-        .filter(|signal| signal.kind != TaskSignalKind::Workspace)
+        .filter(|signal| {
+            !matches!(
+                signal.kind,
+                TaskSignalKind::Workspace | TaskSignalKind::Repository
+            )
+        })
         .map(|signal| signal.content.as_str());
     [intent.goal.as_str(), intent.desired_change.as_str()]
         .into_iter()
@@ -671,12 +601,7 @@ fn task_query_tokens(intent: &TaskIntent, signals: &[TaskSignal]) -> Vec<String>
 fn association_query_tokens(intent: &TaskIntent, signals: &[TaskSignal]) -> Vec<String> {
     let non_artifact_signals = signals
         .iter()
-        .filter(|signal| {
-            matches!(
-                signal.kind,
-                TaskSignalKind::Prompt | TaskSignalKind::Repository | TaskSignalKind::Diff
-            )
-        })
+        .filter(|signal| matches!(signal.kind, TaskSignalKind::Prompt | TaskSignalKind::Diff))
         .cloned()
         .collect::<Vec<_>>();
     task_query_tokens(intent, &non_artifact_signals)
@@ -1447,7 +1372,12 @@ fn task_fingerprint(intent: &TaskIntent, signals: &[TaskSignal]) -> Result<Strin
     }
     let mut signals = signals
         .iter()
-        .filter(|signal| signal.kind != TaskSignalKind::Workspace)
+        .filter(|signal| {
+            !matches!(
+                signal.kind,
+                TaskSignalKind::Workspace | TaskSignalKind::Repository
+            )
+        })
         .cloned()
         .collect::<Vec<_>>();
     signals.sort_by(|left, right| {
@@ -1811,13 +1741,6 @@ struct SearchPage {
     results: Vec<SearchResult>,
     next_cursor: Option<String>,
     omitted: Vec<SearchOmitted>,
-}
-
-#[derive(Debug)]
-struct PackedPage {
-    estimated_tokens: usize,
-    items: Vec<ContextPackItem>,
-    omitted: Vec<ContextPackOmitted>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2379,80 +2302,6 @@ fn explain_match(
         bm25,
         evidence_completeness: u16::try_from(evidence_completeness).unwrap_or(u16::MAX),
         structured_filter_match: true,
-    }
-}
-
-fn pack_page(page: SearchPage, token_budget: usize) -> PackedPage {
-    let mut estimated_tokens: usize = 0;
-    let mut items = Vec::new();
-    let mut omitted = Vec::new();
-    for item in page.results {
-        let context_id = item.context_id;
-        let revision_id = item.revision_id;
-        let full = pack_item(item, ContextPackDetail::Full);
-        let full_tokens = serialized_tokens(&full);
-        if estimated_tokens.saturating_add(full_tokens) <= token_budget {
-            estimated_tokens += full_tokens;
-            items.push(full);
-            continue;
-        }
-        let summary = ContextPackItem {
-            rationale: None,
-            evidence: Vec::new(),
-            detail: ContextPackDetail::Summary,
-            ..full
-        };
-        let summary_tokens = serialized_tokens(&summary);
-        if estimated_tokens.saturating_add(summary_tokens) <= token_budget {
-            estimated_tokens += summary_tokens;
-            items.push(summary);
-            omitted.push(ContextPackOmitted {
-                context_id: Some(context_id),
-                revision_id: Some(revision_id),
-                reason: "detail_token_budget".to_owned(),
-                estimated_tokens: full_tokens.saturating_sub(summary_tokens),
-                count: 1,
-            });
-        } else {
-            omitted.push(ContextPackOmitted {
-                context_id: Some(context_id),
-                revision_id: Some(revision_id),
-                reason: "token_budget".to_owned(),
-                estimated_tokens: summary_tokens,
-                count: 1,
-            });
-        }
-    }
-    omitted.extend(page.omitted.into_iter().map(|item| ContextPackOmitted {
-        context_id: None,
-        revision_id: None,
-        reason: item.reason,
-        estimated_tokens: 0,
-        count: item.count,
-    }));
-    PackedPage {
-        estimated_tokens,
-        items,
-        omitted,
-    }
-}
-
-fn pack_item(item: SearchResult, detail: ContextPackDetail) -> ContextPackItem {
-    ContextPackItem {
-        space_id: item.space_id,
-        context_id: item.context_id,
-        revision_id: item.revision_id,
-        title: item.title,
-        kind: item.kind,
-        status: item.status,
-        statement: item.statement,
-        rationale: Some(item.rationale),
-        applicability: item.applicability,
-        evidence: item.evidence,
-        conflicts: item.conflicts,
-        auto_injection_eligible: item.auto_injection_eligible,
-        match_reason: item.match_reason,
-        detail,
     }
 }
 

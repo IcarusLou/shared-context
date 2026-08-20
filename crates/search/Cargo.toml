@@ -1,6 +1,6 @@
 [package]
 name = "sctx-search"
-description = "Shared Context structured search and context-pack boundary"
+description = "Shared Context structured search and task retrieval boundary"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

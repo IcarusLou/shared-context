@@ -32,6 +32,14 @@ _Avoid_: Space binding, routing key
 A derived, explainable relevance between one Task and one ContextSpace. A Task may have no associations or multiple associations, and their ordering may change as new signals arrive.
 _Avoid_: Active Space, default Space
 
+**TaskContextPack**:
+A budgeted, automatically safe retrieval result for one TaskIntent revision and one exact knowledge-projection snapshot. It contains zero or more TaskSpaceAssociations and links every returned Context to one of those associations through typed RetrievalPaths.
+_Avoid_: Space-scoped search result, manually routed Context Pack
+
+**RetrievalPath**:
+A typed explanation of how TaskIntent or a TaskSignal made one Context relevant. M2 paths describe Intent FTS, Context FTS, exact Applicability, or exact textual engineering hints; they must not claim an Engineering Graph edge that has not been resolved.
+_Avoid_: opaque relevance score, inferred code relation
+
 **Workspace**:
 A location containing code or a repository that supplies TaskSignals about the current engineering scene. It does not identify a requirement, select a ContextSpace, or carry durable knowledge ownership.
 _Avoid_: Requirement, Space binding

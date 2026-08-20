@@ -7,8 +7,7 @@ use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::ProjectionIndex;
 use sctx_search::{
-    ContextPackDetail, ContextPackMode, ContextPackRequest, ContextStatus, ScopeFilter,
-    SearchEngine, SearchFilters, SearchRequest, SpaceIntentField,
+    ContextStatus, ScopeFilter, SearchEngine, SearchFilters, SearchRequest, SpaceIntentField,
 };
 use tempfile::TempDir;
 
@@ -18,7 +17,6 @@ struct Fixture {
     safe_context_id: ContextId,
     safe_revision_id: RevisionId,
     conflict_context_ids: [ContextId; 2],
-    excluded_context_ids: [ContextId; 3],
 }
 
 fn intent(title: &str) -> sctx_domain::IntentSnapshot {
@@ -227,7 +225,7 @@ fn fixture() -> Fixture {
         .unwrap(),
     );
 
-    let (candidate, _) = add_context(
+    let (_candidate, _) = add_context(
         &store,
         space_id,
         revision(
@@ -330,7 +328,6 @@ fn fixture() -> Fixture {
         safe_context_id,
         safe_revision_id,
         conflict_context_ids: [conflict_a, conflict_b],
-        excluded_context_ids: [candidate, deprecated, governance],
     }
 }
 
@@ -423,7 +420,7 @@ fn cursor_pages_and_rebuild_ranking_are_stable() {
 }
 
 #[test]
-fn conflicts_show_both_sides_and_automatic_pack_excludes_all_unsafe_states() {
+fn conflicts_show_both_sides_and_disable_automatic_injection() {
     let fixture = fixture();
     let engine = SearchEngine::new(fixture.index);
     let explicit = engine.search(&request("semantic policy")).unwrap();
@@ -443,85 +440,6 @@ fn conflicts_show_both_sides_and_automatic_pack_excludes_all_unsafe_states() {
         );
         assert!(!result.auto_injection_eligible);
     }
-
-    let pack = engine
-        .context_pack(&ContextPackRequest {
-            search: request(""),
-            token_budget: 100_000,
-            candidate_limit: 100,
-            mode: ContextPackMode::AutomaticInjection,
-        })
-        .unwrap();
-    assert!(pack.items.iter().all(|item| {
-        item.status == ContextStatus::Accepted
-            && item.auto_injection_eligible
-            && item.conflicts.is_empty()
-    }));
-    assert!(
-        fixture
-            .excluded_context_ids
-            .iter()
-            .all(|excluded| { pack.items.iter().all(|item| item.context_id != *excluded) })
-    );
-    assert!(
-        fixture
-            .conflict_context_ids
-            .iter()
-            .all(|excluded| { pack.items.iter().all(|item| item.context_id != *excluded) })
-    );
-}
-
-#[test]
-fn context_pack_respects_budget_and_reports_omissions() {
-    let fixture = fixture();
-    let engine = SearchEngine::new(fixture.index);
-    let pack = engine
-        .context_pack(&ContextPackRequest {
-            search: request("policy"),
-            token_budget: 32,
-            candidate_limit: 50,
-            mode: ContextPackMode::Explicit,
-        })
-        .unwrap();
-    assert!(pack.estimated_tokens <= pack.token_budget);
-    assert!(pack.items.is_empty());
-    assert_eq!(
-        pack.omitted
-            .iter()
-            .filter(|item| item.reason == "token_budget")
-            .count(),
-        5
-    );
-    assert!(!pack.indexed_tree_oid.is_empty());
-    assert!(pack.projection_generation > 0);
-
-    let full = engine
-        .context_pack(&ContextPackRequest {
-            search: request("general_tab_visibility"),
-            token_budget: 100_000,
-            candidate_limit: 50,
-            mode: ContextPackMode::Explicit,
-        })
-        .unwrap();
-    assert_eq!(full.items.len(), 1);
-    assert_eq!(full.items[0].detail, ContextPackDetail::Full);
-    let summary = engine
-        .context_pack(&ContextPackRequest {
-            search: request("general_tab_visibility"),
-            token_budget: full.estimated_tokens - 1,
-            candidate_limit: 50,
-            mode: ContextPackMode::Explicit,
-        })
-        .unwrap();
-    assert_eq!(summary.items.len(), 1);
-    assert_eq!(summary.items[0].detail, ContextPackDetail::Summary);
-    assert!(summary.items[0].evidence.is_empty());
-    assert!(
-        summary
-            .omitted
-            .iter()
-            .any(|item| item.reason == "detail_token_budget")
-    );
 }
 
 struct IntentFixture {

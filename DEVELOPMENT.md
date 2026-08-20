@@ -2,20 +2,27 @@
 
 ## 当前实现边界
 
-仓库已完成 **M1：Task-first 领域与入口基础**，并正在实现 M2：
+仓库已完成 **M1：Task-first 领域与入口基础** 和 **M2：Task Runtime 与多 Space Retrieval**：
 
 - `TaskIntent` 不包含 Space 路由；Task 与 Space 的相关性由独立的 `TaskSpaceAssociation` 表达，并允许 `0..N` 个结果。
 - 不存在 Workspace-to-Space 绑定类型、全局 Active Space、对应配置或绑定命令。
 - 显式 `context_search` 可以用 `space_ids` 做硬过滤；`task_context` 只接受 Session、Intent 和 TaskSignals，不接受 Space/Workspace 路由。
+- 非 Task 的裸 query 自动 Context Pack 入口已经删除；自动注入只能通过 `task_context` 生成的 TaskContextPack。
+- `TaskContextPack` 在同一 Tree/Generation 上推断 `0..N` 个 Space，且每个 Context 都链接到 Association 和 typed M2 RetrievalPath。
+- 同一 Workspace 下的 external Session 独立持有 TaskIntent 与 TaskSignals；Codex PostToolUse 的受控 File/Test observation 会改变后续检索路径。
+- M2 中 Workspace 与本地 Repository 路径只作为位置 observation 持久化，不进入相关性文本或 Task fingerprint；稳定 Repository identity 和代码关系解析属于 M3。
 - `WorkEpisode` 和无 Space 的 `ContextCandidate` 领域类型已经存在。
 - `candidate_create` 是当前 Candidate 写入主入口；CLI 与 MCP 都生成服务端 ID，且未确认 Candidate 不参与自动注入。
 - 既有 Git Writer、事件校验、SQLite 投影、Context 生命周期、CLI/MCP、Agent Adapter、安装器和 NPM 分发能力继续作为 M1 的基础设施。
 
 以下能力**尚未实现**，不得在代码、测试报告或评审中宣称已经具备：
 
-- **M2：部分实现** — TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 检索、多 Space 推断、可解释 TaskContextPack、显式 `task_context` 及 Codex 动态 Session 已实现；Cursor 仍显式 MCP，阶段总验收尚未完成。
 - **M3：未实现** — Engineering Graph、Repository/File/Symbol/API/Schema/Test 关联、重新解析与关系扩展。
 - **M4：未实现** — WorkEpisode 自动聚合、AgentCheckpoint、Candidate Builder、去重/冲突/Space 推荐和 Candidate confirm/list/discard。
+
+Cursor 当前通过显式 MCP/CLI 调用相同的 `task_context` 主链路；它没有可验证的 prompt-aware Hook 能力。这个 Agent 能力差异不改变 M2 领域和检索契约。
+
+M4 必须通过 Mandatory Gate #114/#117：以写入 Git Event、可由 Git 重建到 SQLite 唯一索引的稳定 `submission_id` 实现 Candidate 创建幂等，避免扫描全量 Event、依赖 commit subject，或被无关坏 Event 阻断。M4 还必须让 `source_episode_id` 可验证；M2 不提前实现这些 Capture 责任。
 
 M1 的手工 `candidate_create` 是领域和安全边界的可执行入口，不等同于 M4 的 Low-tax Capture。
 
@@ -23,7 +30,7 @@ M1 的手工 `candidate_create` 是领域和安全边界的可执行入口，不
 
 需要 Rust stable（最低 Rust 1.85）、`rustfmt`、`clippy`、Git，以及 Node.js 18 或更新版本。
 
-M1 提交门禁：
+提交门禁：
 
 ```bash
 cargo fmt --all -- --check
@@ -32,11 +39,12 @@ cargo test --workspace --locked
 (cd npm && npm test)
 ```
 
-定向执行 M1 跨 crate 验收：
+定向执行里程碑验收：
 
 ```bash
 cargo test --locked -p sctx-cli --test milestone_one_contract
 cargo test --locked -p sctx-mcp --test mcp_contract
+cargo test --locked -p sctx-cli --test milestone_two_contract
 ```
 
 提交 `Cargo.lock`，确保 CLI workspace 的本地与 CI 构建使用相同依赖解析结果。
@@ -82,4 +90,4 @@ macOS 测试会为 `aarch64-apple-darwin` 和 `x86_64-apple-darwin` 构建真实
 
 ## 设计不变量
 
-实现必须遵守 [`technical-design.md`](./technical-design.md) 的核心不变量。M1 契约尤其禁止重新引入 Workspace 路由、Task 请求中的 Space 路由、Space 偏好排序，或让未确认 Candidate 进入自动注入。
+实现必须遵守 [`technical-design.md`](./technical-design.md) 的核心不变量。M1/M2 契约尤其禁止重新引入 Workspace 路由、Task 请求中的 Space 路由、Space 偏好排序、裸 query 自动注入，或让未确认 Candidate 进入自动注入。
