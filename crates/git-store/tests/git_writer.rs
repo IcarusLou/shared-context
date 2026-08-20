@@ -10,7 +10,10 @@ use std::{
     thread,
 };
 
-use sctx_event_schema::{Event, IntentSnapshot};
+use sctx_event_schema::{
+    Applicability, ContextKind, ContextRevisionDraft, Event, EventPayload, EvidenceSnapshotDraft,
+    EvidenceType, IntentSnapshot, WorkEpisodeId,
+};
 use sctx_git_store::{
     AppendRequest, CrashInjector, CrashSeam, Error, ErrorKind, GitStore, OBJECT_PENDING,
     PendingFileKind, Result, TextObject,
@@ -90,6 +93,30 @@ fn event(label: &str) -> Event {
     .unwrap()
 }
 
+fn candidate_event(source_episode_id: WorkEpisodeId, statement: &str) -> Event {
+    Event::context_candidate_created(
+        source_episode_id,
+        ContextRevisionDraft {
+            kind: ContextKind::Discovery,
+            topic_key: None,
+            statement: statement.to_owned(),
+            rationale: "The append-once contract needs authoritative provenance".to_owned(),
+            applicability: Applicability::default(),
+            assumptions: Vec::new(),
+            recheck_when: Vec::new(),
+            evidence: vec![EvidenceSnapshotDraft {
+                kind: EvidenceType::ExperimentRecord,
+                supports: "The concurrent request completed".to_owned(),
+                content: serde_json::json!({"result": "observed"}),
+                interpretation: "The Writer serialized candidate creation".to_owned(),
+                limitations: Vec::new(),
+            }],
+        },
+        None,
+    )
+    .unwrap()
+}
+
 #[test]
 fn git_append_boundary_rejects_sensitive_event_and_evidence_without_pending_residue() {
     let fixture = Fixture::new();
@@ -158,7 +185,7 @@ fn initialization_is_idempotent_and_uses_one_fixed_repository() {
 }
 
 #[test]
-fn one_hundred_concurrent_proposals_create_distinct_files_without_overwrite() {
+fn one_hundred_concurrent_appends_create_distinct_files_without_overwrite() {
     let fixture = Fixture::new();
     let store = Arc::new(fixture.store.clone());
     let outcomes = Arc::new(Mutex::new(Vec::new()));
@@ -192,6 +219,59 @@ fn one_hundred_concurrent_proposals_create_distinct_files_without_overwrite() {
     }));
     assert_eq!(fixture.git(&["status", "--porcelain"]), "");
     assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), "101");
+}
+
+#[test]
+fn identical_candidate_retries_converge_but_authoritative_differences_append() {
+    let fixture = Fixture::new();
+    let store = Arc::new(fixture.store.clone());
+    let episode_id = WorkEpisodeId::new();
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let mut threads = Vec::new();
+
+    for _ in 0..20 {
+        let store = Arc::clone(&store);
+        let outcomes = Arc::clone(&outcomes);
+        threads.push(thread::spawn(move || {
+            let outcome = store
+                .append_candidate_once(AppendRequest::event(candidate_event(
+                    episode_id,
+                    "one authoritative discovery",
+                )))
+                .unwrap();
+            outcomes.lock().unwrap().push(outcome);
+        }));
+    }
+    for handle in threads {
+        handle.join().unwrap();
+    }
+
+    let outcomes = outcomes.lock().unwrap();
+    let event_ids = outcomes
+        .iter()
+        .map(|outcome| outcome.event.event_id())
+        .collect::<HashSet<_>>();
+    let candidate_ids = outcomes
+        .iter()
+        .map(|outcome| match outcome.event.payload() {
+            EventPayload::ContextCandidateCreated { candidate } => candidate.candidate_id,
+            _ => unreachable!(),
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(event_ids.len(), 1);
+    assert_eq!(candidate_ids.len(), 1);
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.created).count(), 1);
+    drop(outcomes);
+
+    let different = fixture
+        .store
+        .append_candidate_once(AppendRequest::event(candidate_event(
+            episode_id,
+            "a different authoritative discovery",
+        )))
+        .unwrap();
+    assert!(different.created);
+    assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), "3");
 }
 
 #[test]

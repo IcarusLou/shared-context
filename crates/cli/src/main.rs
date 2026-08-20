@@ -25,10 +25,10 @@ use sctx_domain::{
     ContextGovernanceStatus, ContextId, ContextKind, ContextRevisionDraft, DomainProjection, Error,
     ErrorKind, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, PublicationAction,
     PublicationDraft, ResolutionOutcome, Result, ReviewDraft, ReviewSummary, ReviewVerdict,
-    RevisionId, SemanticConflictDraft, SpaceId,
+    RevisionId, SemanticConflictDraft, SpaceId, WorkEpisodeId,
 };
 use sctx_event_schema::{Event, EventPayload};
-use sctx_git_store::{AppendOutcome, AppendRequest, BatchId, GitStore};
+use sctx_git_store::{AppendOutcome, AppendRequest, BatchId, CandidateAppendOutcome, GitStore};
 use sctx_index::{
     DomainSnapshot, IndexMetadata, ProjectionDiagnosticView, ProjectionIndex, RebuildOutcome,
 };
@@ -52,7 +52,8 @@ Commands:
   uninstall [--root PATH]
   knowledge delete --confirm-path PATH --confirm DELETE-SHARED-CONTEXT-KNOWLEDGE
   space create|intent revise|list|get
-  context propose|revise|review|publish|withdraw|get
+  candidate create
+  context revise|review|publish|withdraw|get
   semantic conflict open|resolve
   search
   context-pack
@@ -142,6 +143,7 @@ fn run(args: &[String], json_output: bool) -> Result<()> {
         [group, command, rest @ ..] if group == "context" && command == "pack" => {
             run_context_pack(rest, json_output)
         }
+        [group, rest @ ..] if group == "candidate" => run_candidate(rest, json_output),
         [group, rest @ ..] if group == "context" => run_context(rest, json_output),
         [group, rest @ ..] if group == "semantic" => run_semantic(rest, json_output),
         [command, rest @ ..] if command == "search" => run_search(rest, json_output),
@@ -860,6 +862,17 @@ impl Runtime {
         let metadata = self.index.synchronize()?.metadata;
         Ok((outcome, metadata))
     }
+
+    fn append_candidate_once(
+        &self,
+        event: Event,
+    ) -> Result<(CandidateAppendOutcome, IndexMetadata)> {
+        let outcome = self
+            .store
+            .append_candidate_once(AppendRequest::event(event))?;
+        let metadata = self.index.synchronize()?.metadata;
+        Ok((outcome, metadata))
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -987,35 +1000,50 @@ fn run_space(args: &[String], json_output: bool) -> Result<()> {
     }
 }
 
-fn run_context(args: &[String], json_output: bool) -> Result<()> {
+fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
     match args {
-        [command, rest @ ..] if command == "propose" => {
+        [command, rest @ ..] if command == "create" => {
             if is_help(rest) {
                 print!(
-                    "Usage: sctx context propose --space-id <ID> [content options]\n\n{CONTEXT_WRITE_HELP}"
+                    "Usage: sctx candidate create --source-episode-id <ID> [content options]\n\n{CONTEXT_WRITE_HELP}"
                 );
                 return Ok(());
             }
             let options = Options::parse(rest, &[])?;
-            allow_context_options(&options, &["--space-id"])?;
-            let space_id = parse_id(options.required("--space-id")?, "space ID")?;
+            allow_context_options(&options, &["--source-episode-id"])?;
+            let source_episode_id = parse_id::<WorkEpisodeId>(
+                options.required("--source-episode-id")?,
+                "source episode ID",
+            )?;
             let draft = context_draft(&options)?;
             let runtime = Runtime::open()?;
-            let snapshot = runtime.domain_snapshot()?;
-            require_space(&snapshot.projection, space_id)?;
-            let event = Event::context_proposed(space_id, draft, None)?;
-            let (context_id, revision_id) = context_identity(&event);
-            let event_id = event.event_id();
-            let (append, metadata) = runtime.append(event)?;
+            let event = Event::context_candidate_created(source_episode_id, draft, None)?;
+            let (outcome, metadata) = runtime.append_candidate_once(event)?;
+            let (candidate_id, source_episode_id) = match outcome.event.payload() {
+                EventPayload::ContextCandidateCreated { candidate } => {
+                    (candidate.candidate_id, candidate.source_episode_id)
+                }
+                _ => unreachable!(),
+            };
             emit(
-                "context.propose",
+                "candidate.create",
                 &metadata,
-                json!({"space_id": space_id, "context_id": context_id,
-                       "revision_id": revision_id, "event_id": event_id,
-                       "batch_id": append.batch_id, "commit_oid": append.commit_oid}),
+                json!({"candidate_id": candidate_id,
+                       "source_episode_id": source_episode_id,
+                       "event_id": outcome.event.event_id(), "status": "candidate",
+                       "created": outcome.created, "batch_id": outcome.append.batch_id,
+                       "commit_oid": outcome.append.commit_oid}),
                 json_output,
             )
         }
+        _ => Err(invalid(format!(
+            "invalid candidate command; expected create\n\n{CONTEXT_WRITE_HELP}"
+        ))),
+    }
+}
+
+fn run_context(args: &[String], json_output: bool) -> Result<()> {
+    match args {
         [command, rest @ ..] if command == "revise" => {
             let options = Options::parse(rest, &[])?;
             allow_context_options(
@@ -1084,7 +1112,7 @@ fn run_context(args: &[String], json_output: bool) -> Result<()> {
             emit("context.get", &snapshot.metadata, data, json_output)
         }
         _ => Err(invalid(format!(
-            "invalid context command; expected propose|revise|review|publish|withdraw|get\n\n{CONTEXT_WRITE_HELP}"
+            "invalid context command; expected revise|review|publish|withdraw|get\n\n{CONTEXT_WRITE_HELP}"
         ))),
     }
 }
@@ -1801,14 +1829,6 @@ fn reject_content_flags_with_input(options: &Options, names: &[&str]) -> Result<
         return Err(invalid(format!("{name} cannot be combined with --input")));
     }
     Ok(())
-}
-
-fn require_space(projection: &DomainProjection, space_id: SpaceId) -> Result<()> {
-    if projection.spaces.contains_key(&space_id) {
-        Ok(())
-    } else {
-        Err(invalid(format!("space does not exist: {space_id}")))
-    }
 }
 
 fn require_context(

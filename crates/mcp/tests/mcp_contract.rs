@@ -8,6 +8,7 @@ use std::{
 use sctx_domain::{
     Applicability, ContextId, ContextKind, ContextRevisionDraft, EvidenceSnapshotDraft,
     EvidenceType, IntentSnapshot, PublicationAction, PublicationDraft, RevisionId, SpaceId,
+    WorkEpisodeId,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
@@ -110,11 +111,11 @@ fn draft(statement: &str) -> ContextRevisionDraft {
     }
 }
 
-fn proposal_arguments(space_id: SpaceId, statement: &str) -> Value {
+fn candidate_arguments(source_episode_id: WorkEpisodeId, statement: &str) -> Value {
     json!({
-        "space_id": space_id,
+        "source_episode_id": source_episode_id,
         "kind": "decision",
-        "topic_key": "mcp/proposal",
+        "topic_key": "mcp/candidate",
         "statement": statement,
         "rationale": "candidate IDs and paths remain server-owned",
         "applicability": {"domains": ["mcp"], "platforms": ["macos"], "conditions": ["stdio"]},
@@ -122,8 +123,8 @@ fn proposal_arguments(space_id: SpaceId, statement: &str) -> Value {
         "recheck_when": ["the Writer contract changes"],
         "evidence": [{
             "kind": "experiment_record",
-            "supports": "the proposal fixture called the Writer",
-            "content": {"fixture": "context_propose", "actual": "candidate"},
+            "supports": "the Candidate fixture called the Writer",
+            "content": {"fixture": "candidate_create", "actual": "candidate"},
             "interpretation": "the candidate was appended",
             "limitations": []
         }]
@@ -224,13 +225,14 @@ fn decode_frames(bytes: &[u8], framing: FixtureFraming) -> Vec<Value> {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn cursor_and_codex_fixtures_initialize_list_search_get_propose_and_list_spaces() {
+fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() {
     for (client, framing) in [
         (ClientKind::Cursor, FixtureFraming::Newline),
         (ClientKind::Codex, FixtureFraming::ContentLength),
     ] {
         let fixture = Fixture::new();
         let before_count = event_count(fixture.store.repository());
+        let source_episode_id = WorkEpisodeId::new();
         let requests = vec![
             request(
                 1,
@@ -264,8 +266,8 @@ fn cursor_and_codex_fixtures_initialize_list_search_get_propose_and_list_spaces(
             ),
             tool_call(
                 6,
-                "context_propose",
-                proposal_arguments(fixture.space_id, "new MCP candidate"),
+                "candidate_create",
+                candidate_arguments(source_episode_id, "new MCP candidate"),
             ),
             tool_call(7, "space_list", json!({})),
         ];
@@ -285,28 +287,38 @@ fn cursor_and_codex_fixtures_initialize_list_search_get_propose_and_list_spaces(
                 "context_for_task",
                 "context_search",
                 "context_get",
-                "context_propose",
+                "candidate_create",
                 "space_list"
             ]
         );
-        let proposal_schema = &tools
+        let candidate_schema = &tools
             .iter()
-            .find(|tool| tool["name"] == "context_propose")
+            .find(|tool| tool["name"] == "candidate_create")
             .unwrap()["inputSchema"];
-        let schema_text = proposal_schema.to_string();
+        let schema_text = candidate_schema.to_string();
         for forbidden in [
             "event_id",
             "context_id",
             "revision_id",
             "path",
             "publication",
+            "space_id",
+            "preferred_space_id",
+            "workspace",
         ] {
             assert!(
                 !schema_text.contains(forbidden),
-                "forbidden proposal field: {forbidden}"
+                "forbidden Candidate field: {forbidden}"
             );
         }
-        assert_eq!(proposal_schema["additionalProperties"], false);
+        assert_eq!(candidate_schema["additionalProperties"], false);
+        assert!(
+            candidate_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "source_episode_id")
+        );
 
         for response in &responses[2..] {
             assert_eq!(response["result"]["isError"], false, "{response:#}");
@@ -326,12 +338,86 @@ fn cursor_and_codex_fixtures_initialize_list_search_get_propose_and_list_spaces(
         assert_eq!(get["context_id"], fixture.context_id.to_string());
         let pack = &responses[4]["result"]["structuredContent"];
         assert_eq!(pack["mode"], "automatic_injection");
-        let proposal = &responses[5]["result"]["structuredContent"];
-        assert_eq!(proposal["status"], "candidate");
+        let candidate = &responses[5]["result"]["structuredContent"];
+        assert_eq!(candidate["status"], "candidate");
+        assert_eq!(
+            candidate["source_episode_id"],
+            source_episode_id.to_string()
+        );
+        assert!(candidate["candidate_id"].as_str().is_some());
+        assert!(candidate.get("space_id").is_none());
         assert_eq!(event_count(fixture.store.repository()), before_count + 1);
         let spaces = &responses[6]["result"]["structuredContent"];
         assert_eq!(spaces["spaces"].as_array().unwrap().len(), 1);
     }
+}
+
+#[test]
+fn candidate_create_retries_are_strict_and_unassigned_candidates_are_not_retrieved() {
+    let fixture = Fixture::new();
+    let source_episode_id = WorkEpisodeId::new();
+    let before_count = event_count(fixture.store.repository());
+    let responses = run_session(
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::Newline,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(
+                2,
+                "candidate_create",
+                candidate_arguments(source_episode_id, "hidden MCP episode knowledge"),
+            ),
+            tool_call(
+                3,
+                "candidate_create",
+                candidate_arguments(source_episode_id, "hidden MCP episode knowledge"),
+            ),
+            tool_call(
+                4,
+                "candidate_create",
+                candidate_arguments(source_episode_id, "different MCP episode knowledge"),
+            ),
+            tool_call(
+                5,
+                "context_search",
+                json!({"query": "hidden MCP episode knowledge", "statuses": ["candidate"]}),
+            ),
+            tool_call(
+                6,
+                "context_for_task",
+                json!({"task": "hidden MCP episode knowledge"}),
+            ),
+        ],
+    );
+    let created = &responses[1]["result"]["structuredContent"];
+    let retry = &responses[2]["result"]["structuredContent"];
+    let different = &responses[3]["result"]["structuredContent"];
+    assert_eq!(created["created"], true);
+    assert_eq!(retry["created"], false);
+    for field in [
+        "candidate_id",
+        "source_episode_id",
+        "event_id",
+        "batch_id",
+        "commit_oid",
+    ] {
+        assert_eq!(created[field], retry[field]);
+    }
+    assert_ne!(created["candidate_id"], different["candidate_id"]);
+    assert_eq!(different["created"], true);
+    assert_eq!(event_count(fixture.store.repository()), before_count + 2);
+    assert!(
+        responses[4]["result"]["structuredContent"]["results"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        responses[5]["result"]["structuredContent"]["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -343,10 +429,11 @@ fn malformed_json_invalid_arguments_and_writer_rejection_are_typed() {
             request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
             tool_call(
                 2,
-                "context_propose",
+                "candidate_create",
                 json!({
                     "context_id": fixture.context_id,
                     "space_id": fixture.space_id,
+                    "source_episode_id": WorkEpisodeId::new(),
                     "kind": "decision",
                     "statement": "caller supplied identity",
                     "rationale": "must fail",
@@ -379,8 +466,11 @@ fn malformed_json_invalid_arguments_and_writer_rejection_are_typed() {
             request(4, "initialize", json!({"protocolVersion": "2024-11-05"})),
             tool_call(
                 5,
-                "context_propose",
-                proposal_arguments(fixture.space_id, "Writer must reject dirty managed input"),
+                "candidate_create",
+                candidate_arguments(
+                    WorkEpisodeId::new(),
+                    "Writer must reject dirty managed input",
+                ),
             ),
         ],
     );

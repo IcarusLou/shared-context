@@ -16,7 +16,7 @@ use std::{
 
 use sctx_domain::{
     Applicability, ContextId, ContextKind, ContextRevisionDraft, Error, ErrorKind,
-    EvidenceSnapshotDraft, EvidenceType, Result, RevisionId, SpaceId,
+    EvidenceSnapshotDraft, EvidenceType, Result, RevisionId, SpaceId, WorkEpisodeId,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
@@ -304,7 +304,7 @@ impl McpServer {
             "context_for_task" => self.context_for_task(call.arguments),
             "context_search" => self.context_search(call.arguments),
             "context_get" => self.context_get(call.arguments),
-            "context_propose" => self.context_propose(call.arguments),
+            "candidate_create" => self.candidate_create(call.arguments),
             "space_list" => self.space_list(call.arguments),
             _ => return Err(invalid(format!("unknown tool: {}", call.name))),
         };
@@ -431,30 +431,23 @@ impl McpServer {
         }))
     }
 
-    fn context_propose(&mut self, arguments: Value) -> ToolResult {
-        let input: ProposeInput = decode_arguments(arguments)?;
-        let space_id = parse_id::<SpaceId>(&input.space_id, "space_id")?;
-        let before = self.runtime.snapshot()?;
-        if !before.projection.spaces.contains_key(&space_id) {
-            return Err(ToolFailure::from(invalid(format!(
-                "space does not exist: {space_id}"
-            ))));
-        }
-        let event = Event::context_proposed(space_id, input.into_draft(), None)?;
-        let (context_id, revision_id) = match event.payload() {
-            EventPayload::ContextRevisionAdded {
-                context_id,
-                revision,
-                ..
-            } => (*context_id, revision.revision_id),
-            _ => unreachable!(),
-        };
-        let event_id = event.event_id();
-        let append = self
+    fn candidate_create(&mut self, arguments: Value) -> ToolResult {
+        let input: CandidateCreateInput = decode_arguments(arguments)?;
+        let source_episode_id =
+            parse_id::<WorkEpisodeId>(&input.source_episode_id, "source_episode_id")?;
+        let event = Event::context_candidate_created(source_episode_id, input.into_draft(), None)?;
+        let outcome = self
             .runtime
             .store
-            .append_event(AppendRequest::event(event))
+            .append_candidate_once(AppendRequest::event(event))
             .map_err(ToolFailure::writer_rejected)?;
+        let (candidate_id, source_episode_id) = match outcome.event.payload() {
+            EventPayload::ContextCandidateCreated { candidate } => {
+                (candidate.candidate_id, candidate.source_episode_id)
+            }
+            _ => unreachable!(),
+        };
+        let event_id = outcome.event.event_id();
         let snapshot = self
             .runtime
             .snapshot()
@@ -462,15 +455,15 @@ impl McpServer {
         Ok(json!({
             "indexed_tree_oid": snapshot.metadata.indexed_tree_oid,
             "projection_generation": snapshot.metadata.projection_generation,
-            "space_id": space_id,
-            "context_id": context_id,
-            "revision_id": revision_id,
+            "candidate_id": candidate_id,
+            "source_episode_id": source_episode_id,
             "event_id": event_id,
             "status": "candidate",
-            "batch_id": append.batch_id,
-            "commit_oid": append.commit_oid,
-            "conflicts": context_conflicts(&snapshot, context_id),
-            "match_reason": "new_candidate_created",
+            "created": outcome.created,
+            "batch_id": outcome.append.batch_id,
+            "commit_oid": outcome.append.commit_oid,
+            "conflicts": [],
+            "match_reason": if outcome.created { "new_candidate_created" } else { "identical_candidate_reused" },
         }))
     }
 }
@@ -663,8 +656,8 @@ impl TaskInput {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ProposeInput {
-    space_id: String,
+struct CandidateCreateInput {
+    source_episode_id: String,
     kind: ContextKind,
     #[serde(default)]
     topic_key: Option<String>,
@@ -679,7 +672,7 @@ struct ProposeInput {
     evidence: Vec<EvidenceInput>,
 }
 
-impl ProposeInput {
+impl CandidateCreateInput {
     fn into_draft(self) -> ContextRevisionDraft {
         ContextRevisionDraft {
             kind: self.kind,
@@ -758,9 +751,9 @@ fn tools_list() -> Value {
             })
         ),
         tool_schema(
-            "context_propose",
-            "Create one new Candidate Context through the append-only Writer. IDs, paths, and Publication are generated or governed internally.",
-            propose_schema()
+            "candidate_create",
+            "Create one unassigned Context Candidate from a source Work Episode. Complete authoritative retries are idempotent; IDs and paths remain server-owned.",
+            candidate_create_schema()
         ),
         tool_schema(
             "space_list",
@@ -794,13 +787,13 @@ fn search_schema() -> Value {
     })
 }
 
-fn propose_schema() -> Value {
+fn candidate_create_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["space_id", "kind", "statement", "rationale", "evidence"],
+        "required": ["source_episode_id", "kind", "statement", "rationale", "evidence"],
         "properties": {
-            "space_id": id_schema("spc_"),
+            "source_episode_id": id_schema("wep_"),
             "kind": kind_schema(),
             "topic_key": {"type": "string", "minLength": 1},
             "statement": {"type": "string", "minLength": 1},

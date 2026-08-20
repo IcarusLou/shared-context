@@ -9,7 +9,7 @@ use std::{
 
 use fs2::FileExt;
 use sctx_domain::{Error, ErrorKind, EventId, ReducerEvent, Result, reduce};
-use sctx_event_schema::{Event, ParsedEvent, parse_event};
+use sctx_event_schema::{Event, EventType, ParsedEvent, parse_event};
 use sctx_local_state::{PrivacyScan, PrivacyScanner, UserConfigStore};
 use sha2::{Digest, Sha256};
 
@@ -78,6 +78,14 @@ pub struct AppendOutcome {
     pub commit_oid: String,
     pub objects: Vec<ObjectRef>,
     pub recovered: bool,
+}
+
+/// Result of an idempotent Candidate append keyed by complete authoritative semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateAppendOutcome {
+    pub append: AppendOutcome,
+    pub event: Event,
+    pub created: bool,
 }
 
 /// Result of validating the exact staged tree used by a manual Git commit.
@@ -278,6 +286,76 @@ impl GitStore {
         FileExt::unlock(&lock).map_err(io_error("unlock writer.lock"))?;
         outcome.objects = object_refs;
         Ok(outcome)
+    }
+
+    /// Appends one Candidate event at most once for its complete authoritative semantics.
+    ///
+    /// Generated identity fields and annotations are excluded by [`Event::semantic_hash`].
+    /// The lock spans pending recovery, the current-Tree lookup, and append, so process and
+    /// thread retries converge on the same committed Event. Requests with any authoritative
+    /// difference retain distinct hashes and append distinct facts.
+    ///
+    /// # Errors
+    ///
+    /// Rejects requests containing objects, sensitive data, malformed prior events, or an
+    /// existing matching event whose introducing commit lacks Writer batch metadata.
+    pub fn append_candidate_once(&self, request: AppendRequest) -> Result<CandidateAppendOutcome> {
+        if request.event.event_type() != EventType::ContextCandidateCreated {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "candidate append requires context_candidate.created",
+            ));
+        }
+        if !request.objects.is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "candidate append does not accept text objects",
+            ));
+        }
+        let event_bytes = serialize_event(&request.event)?;
+        reject_sensitive(&PrivacyScanner::default(), "event", &event_bytes)?;
+        let lock = open_lock(&self.state.join("candidate-writer.lock"))?;
+        lock.lock_exclusive()
+            .map_err(io_error("lock candidate-writer.lock"))?;
+        self.recover_pending()?;
+        if let Some((event, event_path)) = self.find_semantic_event(&request.event)? {
+            let git = Git::new(&self.repository);
+            let (commit_oid, subject) = git.introducing_commit(&event_path)?;
+            let batch = subject
+                .strip_prefix("Append Shared Context batch ")
+                .ok_or_else(|| {
+                    invariant(format!(
+                        "existing Candidate event {event_path} has no Writer batch metadata"
+                    ))
+                })?;
+            let batch_id = BatchId::from_str(batch).map_err(|error| {
+                invariant(format!(
+                    "existing Candidate event {event_path} has invalid Writer batch metadata: {error}"
+                ))
+            })?;
+            let append = AppendOutcome {
+                batch_id,
+                event_id: event.event_id(),
+                event_path,
+                commit_oid,
+                objects: Vec::new(),
+                recovered: true,
+            };
+            FileExt::unlock(&lock).map_err(io_error("unlock candidate-writer.lock"))?;
+            return Ok(CandidateAppendOutcome {
+                append,
+                event,
+                created: false,
+            });
+        }
+        let event = request.event.clone();
+        let append = self.append_event(request)?;
+        FileExt::unlock(&lock).map_err(io_error("unlock candidate-writer.lock"))?;
+        Ok(CandidateAppendOutcome {
+            append,
+            event,
+            created: true,
+        })
     }
 
     /// Lists valid durable pending journals without changing Git state.
@@ -542,6 +620,23 @@ impl GitStore {
             outcomes.push(self.commit_journal_locked(&journal, true)?);
         }
         Ok(outcomes)
+    }
+
+    fn find_semantic_event(&self, requested: &Event) -> Result<Option<(Event, String)>> {
+        let git = Git::new(&self.repository);
+        let requested_type = requested.event_type();
+        let requested_hash = requested.semantic_hash();
+        for path in git.head_paths("events")? {
+            let bytes = git
+                .head_file(&path)?
+                .ok_or_else(|| invariant(format!("HEAD event disappeared: {path}")))?;
+            if let ParsedEvent::Known(event) = parse_event(&bytes)? {
+                if event.event_type() == requested_type && event.semantic_hash() == requested_hash {
+                    return Ok(Some((*event, path)));
+                }
+            }
+        }
+        Ok(None)
     }
 
     #[allow(clippy::too_many_lines)]

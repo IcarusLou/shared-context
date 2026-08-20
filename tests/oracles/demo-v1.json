@@ -22,7 +22,7 @@
     "context_for_task",
     "context_search",
     "context_get",
-    "context_propose",
+    "candidate_create",
     "space_list"
   ],
   "mcp_clients": ["cursor", "codex"]

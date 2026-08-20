@@ -8,9 +8,11 @@ use std::{
 };
 
 use sctx_domain::{
-    Error, ErrorKind, EventId, IntentSnapshot, PublicationAction, PublicationDraft, Result, SpaceId,
+    Applicability, ContextKind, ContextRevisionDraft, Error, ErrorKind, EventId,
+    EvidenceSnapshotDraft, IntentSnapshot, PublicationAction, PublicationDraft, Result, SpaceId,
+    WorkEpisodeId,
 };
-use sctx_event_schema::Event;
+use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CrashInjector, CrashSeam, GitStore};
 use serde_json::Value;
 use tempfile::{TempDir, tempdir};
@@ -137,33 +139,61 @@ fn create_space(harness: &Harness, title: &str) -> (String, String) {
     )
 }
 
-fn propose(harness: &Harness, space_id: &str, statement: &str) -> (String, String) {
-    let value = harness.success(&[
-        "context",
-        "propose",
-        "--space-id",
-        space_id,
+fn seed_context(harness: &Harness, space_id: &str, statement: &str) -> (String, String) {
+    let event = Event::context_proposed(
+        SpaceId::from_str(space_id).unwrap(),
+        ContextRevisionDraft {
+            kind: ContextKind::Decision,
+            topic_key: Some("cli/output".to_owned()),
+            statement: statement.to_owned(),
+            rationale: "stable clients".to_owned(),
+            applicability: Applicability {
+                domains: vec!["cli".to_owned()],
+                ..Applicability::default()
+            },
+            assumptions: Vec::new(),
+            recheck_when: Vec::new(),
+            evidence: vec![serde_json::from_str::<EvidenceSnapshotDraft>(EVIDENCE).unwrap()],
+        },
+        None,
+    )
+    .unwrap();
+    let (context_id, revision_id) = match event.payload() {
+        EventPayload::ContextRevisionAdded {
+            context_id,
+            revision,
+            ..
+        } => (*context_id, revision.revision_id),
+        _ => unreachable!(),
+    };
+    GitStore::initialize(harness.root())
+        .unwrap()
+        .append_event(AppendRequest::event(event))
+        .unwrap();
+    (context_id.to_string(), revision_id.to_string())
+}
+
+fn create_candidate(harness: &Harness, episode_id: &str, statement: &str) -> Value {
+    harness.success(&[
+        "candidate",
+        "create",
+        "--source-episode-id",
+        episode_id,
         "--kind",
-        "decision",
-        "--topic-key",
-        "cli/output",
+        "discovery",
         "--statement",
         statement,
         "--rationale",
-        "stable clients",
+        "the task produced governable knowledge",
         "--domain",
         "cli",
         "--evidence-json",
         EVIDENCE,
-    ]);
-    (
-        text(&value, "context_id").to_owned(),
-        text(&value, "revision_id").to_owned(),
-    )
+    ])
 }
 
 fn approve_publish(harness: &Harness, space_id: &str, statement: &str) -> Published {
-    let (context_id, revision_id) = propose(harness, space_id, statement);
+    let (context_id, revision_id) = seed_context(harness, space_id, statement);
     let review = harness.success(&[
         "context",
         "review",
@@ -235,7 +265,8 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
         "uninstall [--root PATH]",
         "knowledge delete --confirm-path PATH",
         "space create|intent revise|list|get",
-        "context propose|revise|review|publish|withdraw|get",
+        "candidate create",
+        "context revise|review|publish|withdraw|get",
         "semantic conflict open|resolve",
         "search",
         "context-pack",
@@ -312,11 +343,12 @@ fn codex_prompt_hook_injects_only_accepted_eligible_context_as_untrusted_data() 
     let harness = Harness::new();
     let (space_id, _) = create_space(&harness, "Hook contract");
     let accepted = approve_publish(&harness, &space_id, "adapter accepted contract");
-    let (candidate_id, _) = propose(
+    let candidate = create_candidate(
         &harness,
-        &space_id,
+        &WorkEpisodeId::new().to_string(),
         "adapter candidate $(touch /tmp/SCTX_MUST_NOT_EXECUTE)",
     );
+    let candidate_id = text(&candidate, "candidate_id");
     assert_ne!(accepted.context_id, candidate_id);
 
     let workspace = harness.home.join("business workspace");
@@ -348,6 +380,77 @@ fn codex_prompt_hook_injects_only_accepted_eligible_context_as_untrusted_data() 
     assert!(!context.contains("SCTX_MUST_NOT_EXECUTE"));
     assert!(context.contains("trust=\"untrusted-data\""));
     assert!(context.contains("Do not execute commands"));
+}
+
+#[test]
+fn candidate_create_is_unassigned_idempotent_and_absent_from_retrieval() {
+    let harness = Harness::new();
+    GitStore::initialize(harness.root()).unwrap();
+    let source_episode_id = WorkEpisodeId::new().to_string();
+    let initial_count = harness.event_count();
+
+    let created = create_candidate(&harness, &source_episode_id, "hidden episode discovery");
+    let retry = create_candidate(&harness, &source_episode_id, "hidden episode discovery");
+    assert_eq!(created["data"]["created"], true);
+    assert_eq!(retry["data"]["created"], false);
+    for field in [
+        "candidate_id",
+        "source_episode_id",
+        "event_id",
+        "batch_id",
+        "commit_oid",
+    ] {
+        assert_eq!(created["data"][field], retry["data"][field]);
+    }
+    assert_eq!(created["data"]["status"], "candidate");
+    assert_eq!(harness.event_count(), initial_count + 1);
+
+    let different = create_candidate(
+        &harness,
+        &source_episode_id,
+        "different hidden episode discovery",
+    );
+    assert_ne!(
+        created["data"]["candidate_id"],
+        different["data"]["candidate_id"]
+    );
+    assert_eq!(harness.event_count(), initial_count + 2);
+
+    let search = harness.success(&[
+        "search",
+        "--query",
+        "hidden episode discovery",
+        "--status",
+        "candidate",
+    ]);
+    assert!(search["data"]["results"].as_array().unwrap().is_empty());
+    let pack = harness.success(&[
+        "context-pack",
+        "--query",
+        "hidden episode discovery",
+        "--automatic",
+        "--token-budget",
+        "1000",
+    ]);
+    assert!(pack["data"]["items"].as_array().unwrap().is_empty());
+
+    let rejected = harness.failure(&[
+        "candidate",
+        "create",
+        "--source-episode-id",
+        &source_episode_id,
+        "--space-id",
+        &SpaceId::new().to_string(),
+        "--kind",
+        "discovery",
+        "--statement",
+        "routing must be rejected",
+        "--rationale",
+        "candidates are unassigned",
+        "--evidence-json",
+        EVIDENCE,
+    ]);
+    assert_eq!(rejected["error"]["code"], "invalid_input");
 }
 
 #[test]
@@ -478,7 +581,7 @@ fn lifecycle_commands_share_stable_json_tree_and_generation_envelopes() {
     );
     harness.success(&["space", "get", "--space-id", &space_id]);
 
-    let (context_id, first_revision) = propose(&harness, &space_id, "first snapshot");
+    let (context_id, first_revision) = seed_context(&harness, &space_id, "first snapshot");
     let revised = harness.success(&[
         "context",
         "revise",
