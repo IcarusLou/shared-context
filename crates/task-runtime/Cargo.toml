@@ -1,0 +1,18 @@
+[package]
+name = "sctx-task-runtime"
+description = "Local SQLite runtime for isolated Shared Context task sessions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json.workspace = true
+sctx-domain.workspace = true
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[lints]
+workspace = true

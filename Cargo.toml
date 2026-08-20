@@ -6,6 +6,7 @@ members = [
     "crates/git-store",
     "crates/index",
     "crates/search",
+    "crates/task-runtime",
     "crates/mcp",
     "crates/agent-adapter",
     "crates/adapter-cursor",
@@ -39,6 +40,7 @@ sctx-installer = { path = "crates/installer" }
 sctx-local-state = { path = "crates/local-state" }
 sctx-mcp = { path = "crates/mcp" }
 sctx-search = { path = "crates/search" }
+sctx-task-runtime = { path = "crates/task-runtime" }
 uuid = { version = "1.18", features = ["v4"] }
 toml = "0.9"
 
