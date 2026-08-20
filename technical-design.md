@@ -990,7 +990,7 @@ Adapter 只翻译厂商 Payload。TaskIntent、Git Diff、代码扫描、检索�
 
 ### 13.4 动态检索策略
 
-- SessionStart：注入系统能力说明，不注入假定 Space 摘要。
+- SessionStart：仅注入系统能力说明；不得构造或执行空查询 Context Pack，也不注入任何知识项或假定 Space 摘要。
 - PromptSubmit：创建/更新 TaskIntent，执行初始 Task Retrieval。
 - PostToolUse：记录结构化信号；关键 Artifact 或 Diff 变化达到阈值时增量刷新 Context Pack。
 - PreCompact：生成 Checkpoint，刷新并压缩当前最相关 Context。

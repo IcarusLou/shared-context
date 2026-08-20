@@ -282,10 +282,14 @@ pub fn encode_hook_output(
     action: &ResolvedAgentAction,
 ) -> Result<Vec<u8>> {
     let value = match event {
-        CanonicalAgentEventKind::SessionStart => action.additional_context.as_ref().map_or_else(
-            || json!({}),
-            |context| json!({"additional_context": context}),
-        ),
+        CanonicalAgentEventKind::SessionStart => action
+            .additional_context
+            .as_ref()
+            .or(action.system_message.as_ref())
+            .map_or_else(
+                || json!({}),
+                |context| json!({"additional_context": context}),
+            ),
         CanonicalAgentEventKind::PostToolUse => action.additional_context.as_ref().map_or_else(
             || json!({}),
             |context| json!({"additional_context": context}),

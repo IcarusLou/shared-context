@@ -746,6 +746,11 @@ fn resolve_hook_action(action: CanonicalAgentAction) -> Result<ResolvedAgentActi
 }
 
 fn automatic_hook_context(query: String) -> Result<String> {
+    if query.trim().is_empty() {
+        return Err(invariant(
+            "automatic Hook Context query must contain a task prompt",
+        ));
+    }
     let runtime = Runtime::open()?;
     let pack = SearchEngine::new(runtime.index).context_pack(&ContextPackRequest::automatic(
         SearchRequest {

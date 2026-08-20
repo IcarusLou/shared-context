@@ -1,12 +1,14 @@
 # M1 Task-first Integration Acceptance Report
 
 Date: 2026-08-20
-Scope: Mew #112
+Scope: Mew #112 and #113
 Baseline: `main@e7f48f8`
 
 ## Verdict
 
 M1 closes the Task-first domain and entry-point foundation. The executable product surface no longer asks a caller or Workspace to choose a preferred Space, and unassigned Candidate creation is the only new-knowledge entry path exposed to Agents.
+
+Session startup is capability-only: it does not run an empty automatic knowledge query. Task-aware automatic retrieval begins only from a supported PromptSubmit event.
 
 This report does **not** claim M2, M3, or M4:
 
@@ -33,6 +35,7 @@ The current `context_for_task` tool is a route-free task-text Context Pack over 
 | `candidate_create` is the Agent-facing Candidate main path | PROVEN | CLI help, MCP tool list, CLI milestone test, and MCP client fixtures |
 | Unconfirmed Candidate cannot enter automatic injection | PROVEN | Candidate projection is outside Context FTS; CLI/MCP candidate retrieval tests and Codex hook test return only Accepted eligible Context |
 | Existing confirmed Context fixtures use neutral revision terminology | PROVEN | Event constructor is `context_revision_added`; no Context-Propose API or constructor remains |
+| SessionStart emits capability guidance without knowledge retrieval | PROVEN | Shared lifecycle policy returns no Context query; the CLI adversarial contract seeds two Spaces with Accepted eligible Context and proves startup emits neither item before a supported PromptSubmit retrieves only its task match |
 
 ## Residue gates
 

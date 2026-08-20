@@ -270,7 +270,7 @@ pub struct CanonicalAgentAction {
     /// A query to resolve as an automatic Context Pack. `None` means no injection.
     pub context_query: Option<String>,
     pub breadcrumb: Option<CanonicalBreadcrumb>,
-    /// Adapter-specific user-visible diagnostic. Never contains Context data.
+    /// User-visible capability guidance or diagnostic. Never contains Context data.
     pub system_message: Option<String>,
 }
 
@@ -296,9 +296,12 @@ pub fn plan_action(
     }
     match event {
         CanonicalAgentEvent::SessionStart { .. } => CanonicalAgentAction {
-            context_query: Some(String::new()),
+            context_query: None,
             breadcrumb: None,
-            system_message: None,
+            system_message: Some(
+                "Shared Context capabilities: MCP and CLI are available. Task-aware knowledge retrieval starts only from a supported prompt."
+                    .to_owned(),
+            ),
         },
         CanonicalAgentEvent::PromptSubmit { prompt, .. } if capabilities.prompt_aware_injection => {
             CanonicalAgentAction {
@@ -519,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_policy_queries_only_start_and_supported_prompt_events() {
+    fn lifecycle_policy_never_queries_on_start_and_preserves_supported_prompt_queries() {
         let context = AgentEventContext {
             session_id: "session".to_owned(),
             cwd: PathBuf::from("/workspace"),
@@ -544,19 +547,23 @@ mod tests {
         let start = CanonicalAgentEvent::SessionStart {
             context: context.clone(),
         };
-        assert_eq!(
-            plan_action(&start, &cursor).context_query.as_deref(),
-            Some("")
+        let start_action = plan_action(&start, &cursor);
+        assert!(start_action.context_query.is_none());
+        assert!(
+            start_action
+                .system_message
+                .as_deref()
+                .is_some_and(|message| message.contains("MCP and CLI"))
         );
         let prompt = CanonicalAgentEvent::PromptSubmit {
             context: context.clone(),
             prompt: "task".to_owned(),
         };
         assert!(plan_action(&prompt, &cursor).context_query.is_none());
-        assert_eq!(
-            plan_action(&prompt, &codex).context_query.as_deref(),
-            Some("task")
-        );
+        let prompt_action = plan_action(&prompt, &codex);
+        assert_eq!(prompt_action.context_query.as_deref(), Some("task"));
+        assert!(prompt_action.system_message.is_none());
+        assert!(prompt_action.breadcrumb.is_none());
 
         for event in [
             CanonicalAgentEvent::PreCompact {

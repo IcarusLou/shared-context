@@ -62,15 +62,15 @@ fn cursor_output_uses_only_documented_snake_case_context_field() {
     let output = encode_hook_output(
         CanonicalAgentEventKind::SessionStart,
         &ResolvedAgentAction {
-            additional_context: Some("read-only pack".to_owned()),
-            system_message: None,
+            additional_context: None,
+            system_message: Some("capability guidance".to_owned()),
         },
     )
     .unwrap();
     let output: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(
         output,
-        serde_json::json!({"additional_context":"read-only pack"})
+        serde_json::json!({"additional_context":"capability guidance"})
     );
 }
 
