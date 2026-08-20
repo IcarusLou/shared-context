@@ -7,10 +7,11 @@ use std::fmt;
 mod ids;
 mod model;
 mod reducer;
+mod task;
 
 pub use ids::{
     ConflictId, ContextId, EventId, EvidenceId, IdParseError, PublicationId, ResolutionId,
-    ReviewId, RevisionId, SpaceId,
+    ReviewId, RevisionId, SpaceId, TaskId,
 };
 pub use model::{
     Applicability, ConflictParticipant, ConflictResolution, ConflictResolutionDraft,
@@ -26,6 +27,7 @@ pub use reducer::{
     RevisionProjection, SemanticConflictCandidate, SemanticConflictOpenReason,
     SemanticConflictProjection, SemanticConflictStatus, reduce,
 };
+pub use task::{TaskIntent, TaskSignal, TaskSignalKind, TaskSpaceAssociation};
 
 /// Broad categories used to route recoverable errors across crate boundaries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

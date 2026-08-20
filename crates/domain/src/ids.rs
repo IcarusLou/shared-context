@@ -120,6 +120,11 @@ macro_rules! opaque_id {
 }
 
 opaque_id!(SpaceId, "spc_", "Opaque identity of a `ContextSpace`.");
+opaque_id!(
+    TaskId,
+    "tsk_",
+    "Opaque identity of an Agent engineering task."
+);
 opaque_id!(ContextId, "ctx_", "Opaque identity of a `ContextItem`.");
 opaque_id!(
     RevisionId,
@@ -157,7 +162,7 @@ mod tests {
 
     use super::{
         ConflictId, ContextId, EventId, EvidenceId, PublicationId, ResolutionId, ReviewId,
-        RevisionId, SpaceId,
+        RevisionId, SpaceId, TaskId,
     };
 
     #[test]
@@ -194,6 +199,7 @@ mod tests {
         }
 
         assert_generated_id!(SpaceId::new(), "spc_");
+        assert_generated_id!(TaskId::new(), "tsk_");
         assert_generated_id!(ContextId::new(), "ctx_");
         assert_generated_id!(RevisionId::new(), "rev_");
         assert_generated_id!(EventId::new(), "evt_");
