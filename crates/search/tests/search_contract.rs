@@ -1,14 +1,14 @@
 use sctx_domain::{
     Applicability, ConflictParticipant, ContextId, ContextKind, ContextRevisionDraft,
     EvidenceSnapshotDraft, EvidenceType, PublicationAction, PublicationDraft, RevisionId,
-    SemanticConflictDraft, SpaceId,
+    SemanticConflictDraft, SpaceId, TaskId, TaskIntent, TaskSignal, TaskSignalKind,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::ProjectionIndex;
 use sctx_search::{
     ContextPackDetail, ContextPackMode, ContextPackRequest, ContextStatus, ScopeFilter,
-    SearchEngine, SearchFilters, SearchRequest,
+    SearchEngine, SearchFilters, SearchRequest, SpaceIntentField,
 };
 use tempfile::TempDir;
 
@@ -80,6 +80,18 @@ fn context_ids(event: &Event) -> (ContextId, RevisionId) {
             ..
         } => (*context_id, revision.revision_id),
         _ => panic!("expected context.revision_added"),
+    }
+}
+
+fn intent_revision_id(event: &Event) -> RevisionId {
+    match event.payload() {
+        EventPayload::SpaceCreated {
+            intent_revision, ..
+        }
+        | EventPayload::SpaceIntentRevisionAdded {
+            intent_revision, ..
+        } => intent_revision.revision_id,
+        _ => panic!("expected Space Intent event"),
     }
 }
 
@@ -510,4 +522,266 @@ fn context_pack_respects_budget_and_reports_omissions() {
             .iter()
             .any(|item| item.reason == "detail_token_budget")
     );
+}
+
+struct IntentFixture {
+    _temporary: TempDir,
+    index: ProjectionIndex,
+    rich_space_id: SpaceId,
+    shared_space_ids: [SpaceId; 2],
+    conflicted_space_id: SpaceId,
+    conflicted_head_ids: [RevisionId; 2],
+}
+
+fn rich_intent() -> sctx_domain::IntentSnapshot {
+    sctx_domain::IntentSnapshot {
+        title: "EnglishTitleNeedle".to_owned(),
+        problem: "中文检索必须恢复历史意图".to_owned(),
+        desired_outcome: "MultilingualOutcome".to_owned(),
+        in_scope: vec!["GeneralTabVisibility".to_owned()],
+        out_of_scope: vec!["LegacyRouterBoundary".to_owned()],
+        acceptance_conditions: vec!["SearchV2Endpoint remains stable".to_owned()],
+        domain_terms: vec!["RequirementIntent".to_owned()],
+    }
+}
+
+fn minimal_intent(title: &str, domain_term: &str) -> sctx_domain::IntentSnapshot {
+    sctx_domain::IntentSnapshot {
+        title: title.to_owned(),
+        problem: format!("{title} has a distinct problem"),
+        desired_outcome: format!("{title} has a distinct outcome"),
+        in_scope: vec![format!("{title}Scope")],
+        out_of_scope: vec![format!("{title}Excluded")],
+        acceptance_conditions: vec![format!("{title}Accepted")],
+        domain_terms: vec![domain_term.to_owned()],
+    }
+}
+
+fn intent_fixture() -> IntentFixture {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::initialize(temporary.path().join("intent-installation")).unwrap();
+
+    let rich = Event::space_created(rich_intent(), None).unwrap();
+    let rich_space_id = space_id(&rich);
+    append(&store, rich);
+
+    let shared_alpha = Event::space_created(
+        minimal_intent("AlphaSpace", "sharedassociationneedle"),
+        None,
+    )
+    .unwrap();
+    let shared_alpha_id = space_id(&shared_alpha);
+    append(&store, shared_alpha);
+    let shared_bravo = Event::space_created(
+        minimal_intent("BravoSpace", "sharedassociationneedle"),
+        None,
+    )
+    .unwrap();
+    let shared_bravo_id = space_id(&shared_bravo);
+    append(&store, shared_bravo);
+
+    let conflict_base =
+        Event::space_created(minimal_intent("ConflictBase", "conflictbase"), None).unwrap();
+    let conflicted_space_id = space_id(&conflict_base);
+    let conflict_parent_id = intent_revision_id(&conflict_base);
+    append(&store, conflict_base);
+    let left = Event::intent_revision_added(
+        conflicted_space_id,
+        vec![conflict_parent_id],
+        minimal_intent("forkmatchneedle leftonlyneedle", "leftbranch"),
+        None,
+    )
+    .unwrap();
+    let left_id = intent_revision_id(&left);
+    append(&store, left);
+    let right = Event::intent_revision_added(
+        conflicted_space_id,
+        vec![conflict_parent_id],
+        minimal_intent("forkmatchneedle rightonlyneedle", "rightbranch"),
+        None,
+    )
+    .unwrap();
+    let right_id = intent_revision_id(&right);
+    append(&store, right);
+
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    IntentFixture {
+        _temporary: temporary,
+        index,
+        rich_space_id,
+        shared_space_ids: [shared_alpha_id, shared_bravo_id],
+        conflicted_space_id,
+        conflicted_head_ids: [left_id, right_id],
+    }
+}
+
+fn task_query(text: &str) -> TaskIntent {
+    TaskIntent {
+        task_id: TaskId::new(),
+        goal: text.to_owned(),
+        desired_change: text.to_owned(),
+        in_scope: Vec::new(),
+        out_of_scope: Vec::new(),
+        domains: Vec::new(),
+        platforms: Vec::new(),
+        constraints: Vec::new(),
+        acceptance_conditions: Vec::new(),
+        artifacts: Vec::new(),
+        interfaces: Vec::new(),
+        unknowns: Vec::new(),
+    }
+}
+
+#[test]
+fn task_intent_and_signals_match_chinese_english_code_and_api_tokens() {
+    let fixture = intent_fixture();
+    let engine = SearchEngine::new(fixture.index);
+    for (task, signals, expected_field) in [
+        (
+            task_query("中文检索"),
+            Vec::new(),
+            SpaceIntentField::Problem,
+        ),
+        (
+            task_query("multilingualoutcome"),
+            Vec::new(),
+            SpaceIntentField::DesiredOutcome,
+        ),
+        (
+            task_query("unmatchedcodesignal"),
+            vec![TaskSignal {
+                kind: TaskSignalKind::Symbol,
+                content: "GeneralTabVisibility".to_owned(),
+            }],
+            SpaceIntentField::InScope,
+        ),
+        (
+            task_query("unmatchedapisignal"),
+            vec![TaskSignal {
+                kind: TaskSignalKind::Api,
+                content: "SearchV2Endpoint".to_owned(),
+            }],
+            SpaceIntentField::AcceptanceConditions,
+        ),
+    ] {
+        let response = engine.space_intent_candidates(&task, &signals).unwrap();
+        assert_eq!(response.task_id, task.task_id);
+        assert_eq!(response.candidates.len(), 1);
+        assert_eq!(response.candidates[0].space_id, fixture.rich_space_id);
+        assert!(
+            response.candidates[0]
+                .matched_fields
+                .contains(&expected_field)
+        );
+        assert!(!response.candidates[0].matched_tokens.is_empty());
+        assert!(response.candidates[0].bm25.is_finite());
+    }
+}
+
+#[test]
+fn full_task_query_explains_all_current_intent_fields() {
+    let fixture = intent_fixture();
+    let engine = SearchEngine::new(fixture.index);
+    let task = TaskIntent {
+        task_id: TaskId::new(),
+        goal: "englishtitleneedle".to_owned(),
+        desired_change: "multilingualoutcome".to_owned(),
+        in_scope: vec!["中文检索".to_owned()],
+        out_of_scope: vec!["legacyrouterboundary".to_owned()],
+        domains: vec!["requirementintent".to_owned()],
+        platforms: Vec::new(),
+        constraints: Vec::new(),
+        acceptance_conditions: vec!["searchv2endpoint".to_owned()],
+        artifacts: vec!["generaltabvisibility".to_owned()],
+        interfaces: Vec::new(),
+        unknowns: Vec::new(),
+    };
+    let response = engine.space_intent_candidates(&task, &[]).unwrap();
+    assert_eq!(response.candidates.len(), 1);
+    assert_eq!(response.candidates[0].space_id, fixture.rich_space_id);
+    assert_eq!(
+        response.candidates[0].matched_fields,
+        vec![
+            SpaceIntentField::Title,
+            SpaceIntentField::Problem,
+            SpaceIntentField::DesiredOutcome,
+            SpaceIntentField::InScope,
+            SpaceIntentField::OutOfScope,
+            SpaceIntentField::AcceptanceConditions,
+            SpaceIntentField::DomainTerms,
+        ]
+    );
+}
+
+#[test]
+fn candidate_query_returns_zero_one_or_many_with_stable_id_ties() {
+    let fixture = intent_fixture();
+    let index = fixture.index.clone();
+    let engine = SearchEngine::new(fixture.index);
+
+    let none = engine
+        .space_intent_candidates(&task_query("totallyabsenttoken"), &[])
+        .unwrap();
+    assert!(none.candidates.is_empty());
+
+    let one = engine
+        .space_intent_candidates(&task_query("EnglishTitleNeedle"), &[])
+        .unwrap();
+    assert_eq!(one.candidates.len(), 1);
+    assert_eq!(one.candidates[0].space_id, fixture.rich_space_id);
+
+    let task = task_query("sharedassociationneedle");
+    let many = engine.space_intent_candidates(&task, &[]).unwrap();
+    let mut expected = fixture.shared_space_ids.to_vec();
+    expected.sort();
+    let actual = many
+        .candidates
+        .iter()
+        .map(|candidate| candidate.space_id)
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected, "equal BM25 values must use Space ID ties");
+    assert_eq!(
+        many.candidates[0].bm25.to_bits(),
+        many.candidates[1].bm25.to_bits()
+    );
+
+    index.rebuild().unwrap();
+    let rebuilt = SearchEngine::new(index)
+        .space_intent_candidates(&task, &[])
+        .unwrap();
+    assert_eq!(rebuilt.candidates, many.candidates);
+}
+
+#[test]
+fn conflicted_intent_returns_every_head_without_silently_selecting_one() {
+    let fixture = intent_fixture();
+    let engine = SearchEngine::new(fixture.index);
+    let both = engine
+        .space_intent_candidates(&task_query("forkmatchneedle"), &[])
+        .unwrap();
+    assert_eq!(both.candidates.len(), 1);
+    let candidate = &both.candidates[0];
+    assert_eq!(candidate.space_id, fixture.conflicted_space_id);
+    assert!(candidate.intent_conflicted);
+    let mut expected_heads = fixture.conflicted_head_ids.to_vec();
+    expected_heads.sort();
+    assert_eq!(candidate.head_revision_ids, expected_heads);
+    assert_eq!(candidate.matching_heads.len(), 2);
+    assert_eq!(
+        candidate
+            .matching_heads
+            .iter()
+            .map(|head| head.revision_id)
+            .collect::<Vec<_>>(),
+        expected_heads
+    );
+
+    let one_side = engine
+        .space_intent_candidates(&task_query("leftonlyneedle"), &[])
+        .unwrap();
+    assert_eq!(one_side.candidates.len(), 1);
+    assert!(one_side.candidates[0].intent_conflicted);
+    assert_eq!(one_side.candidates[0].head_revision_ids, expected_heads);
+    assert_eq!(one_side.candidates[0].matching_heads.len(), 1);
 }

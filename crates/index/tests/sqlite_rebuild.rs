@@ -17,7 +17,7 @@ use sctx_event_schema::{
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::{
     DB_SCHEMA_VERSION, IncrementalFallback, IndexUpdateKind, ProjectionIndex, REDUCER_VERSION,
-    RebuildReason,
+    RebuildReason, normalize_search_text,
 };
 use tempfile::TempDir;
 
@@ -333,6 +333,7 @@ fn deletion_rebuilds_complete_projection_and_dirty_tree_is_never_read() {
     );
     assert_eq!(count(&connection, "evidence"), 2);
     assert_eq!(count(&connection, "context_fts"), 2);
+    assert_eq!(count(&connection, "space_fts"), 1);
     assert_eq!(
         count_where(&connection, "diagnostic", "code = 'UNKNOWN_SCHEMA_VERSION'"),
         1
@@ -347,14 +348,8 @@ fn deletion_rebuilds_complete_projection_and_dirty_tree_is_never_read() {
         })
         .unwrap();
     assert_eq!(foreign_key_violations, 0);
-    let fts_hits: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM context_fts WHERE context_fts MATCH 'SQLite'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(fts_hits, 2);
+    assert_eq!(count_fts_matches(&connection, "context_fts", "SQLite"), 2);
+    assert_eq!(count_fts_matches(&connection, "space_fts", "SQLite"), 1);
     assert_core_tables(&connection);
 
     let pragmas = fixture.index.pragmas().unwrap();
@@ -454,6 +449,108 @@ fn append_uses_incremental_closure_and_matches_scratch_rebuild() {
     let scratch = ProjectionIndex::new(fixture.store.repository(), scratch_state);
     let rebuilt = scratch.rebuild().unwrap();
     assert_eq!(rebuilt.update_kind, IndexUpdateKind::FullRebuild);
+    assert_eq!(
+        projection_dump(fixture.index.database_path()),
+        projection_dump(scratch.database_path())
+    );
+}
+
+#[test]
+fn intent_append_refreshes_every_space_fts_field_and_matches_scratch_rebuild() {
+    let fixture = fixture();
+    fixture.index.synchronize().unwrap();
+    let connection = Connection::open(fixture.index.database_path()).unwrap();
+    let (space_id, parent_revision_id): (SpaceId, RevisionId) = connection
+        .query_row("SELECT space_id, revision_id FROM intent_head", [], |row| {
+            Ok((
+                row.get::<_, String>(0)?.parse().unwrap(),
+                row.get::<_, String>(1)?.parse().unwrap(),
+            ))
+        })
+        .unwrap();
+    drop(connection);
+    let revised_intent = IntentSnapshot {
+        title: "任务意图检索".to_owned(),
+        problem: "orphanedknowledge must be recovered".to_owned(),
+        desired_outcome: "multispaceassociation is deterministic".to_owned(),
+        in_scope: vec!["SearchResultRenderer".to_owned()],
+        out_of_scope: vec!["legacyrouter".to_owned()],
+        acceptance_conditions: vec!["SearchV2Endpoint remains stable".to_owned()],
+        domain_terms: vec!["RequirementIntent".to_owned()],
+    };
+    append(
+        &fixture.store,
+        Event::intent_revision_added(
+            space_id,
+            vec![parent_revision_id],
+            revised_intent.clone(),
+            None,
+        )
+        .unwrap(),
+    );
+
+    let incremental = fixture.index.synchronize().unwrap();
+    assert_eq!(incremental.reason, RebuildReason::TreeChanged);
+    assert_eq!(incremental.update_kind, IndexUpdateKind::Incremental);
+    let connection = Connection::open(fixture.index.database_path()).unwrap();
+    assert_eq!(count(&connection, "space_fts"), 1);
+    let indexed_fields: (String, String, String, String, String, String, String) = connection
+        .query_row(
+            "SELECT title, problem, desired_outcome, in_scope, out_of_scope,
+                    acceptance_conditions, domain_terms FROM space_fts",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        indexed_fields,
+        (
+            normalize_search_text(&revised_intent.title),
+            normalize_search_text(&revised_intent.problem),
+            normalize_search_text(&revised_intent.desired_outcome),
+            normalize_search_text(&revised_intent.in_scope.join(" ")),
+            normalize_search_text(&revised_intent.out_of_scope.join(" ")),
+            normalize_search_text(&revised_intent.acceptance_conditions.join(" ")),
+            normalize_search_text(&revised_intent.domain_terms.join(" ")),
+        )
+    );
+    for token in [
+        "意图",
+        "orphanedknowledge",
+        "multispaceassociation",
+        "searchresultrenderer",
+        "legacyrouter",
+        "searchv2endpoint",
+        "requirementintent",
+    ] {
+        assert_eq!(
+            count_fts_matches(&connection, "space_fts", token),
+            1,
+            "missing current Intent token {token}"
+        );
+    }
+    assert_eq!(
+        count_fts_matches(&connection, "space_fts", "SQLite"),
+        0,
+        "non-head Intent must leave the FTS"
+    );
+    drop(connection);
+
+    let scratch = ProjectionIndex::new(
+        fixture.store.repository(),
+        fixture.temporary.path().join("intent-fts-scratch-state"),
+    );
+    scratch.rebuild().unwrap();
     assert_eq!(
         projection_dump(fixture.index.database_path()),
         projection_dump(scratch.database_path())
@@ -884,6 +981,7 @@ fn assert_core_tables(connection: &Connection) {
         "conflict",
         "diagnostic",
         "context_fts",
+        "space_fts",
     ];
     for table in expected {
         let exists: bool = connection
@@ -915,6 +1013,16 @@ fn count_where(connection: &Connection, table: &str, condition: &str) -> i64 {
         .unwrap()
 }
 
+fn count_fts_matches(connection: &Connection, table: &str, query: &str) -> i64 {
+    connection
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE {table} MATCH ?1"),
+            [query],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 fn projection_dump(database: &Path) -> Vec<String> {
     let connection = Connection::open(database).unwrap();
     [
@@ -936,6 +1044,7 @@ fn projection_dump(database: &Path) -> Vec<String> {
         "SELECT * FROM conflict ORDER BY conflict_key",
         "SELECT * FROM diagnostic ORDER BY diagnostic_key",
         "SELECT context_id, revision_id, title, statement, rationale, evidence FROM context_fts ORDER BY context_id, revision_id",
+        "SELECT space_id, revision_id, title, problem, desired_outcome, in_scope, out_of_scope, acceptance_conditions, domain_terms FROM space_fts ORDER BY space_id, revision_id",
     ]
     .into_iter()
     .map(|query| dump_query(&connection, query))

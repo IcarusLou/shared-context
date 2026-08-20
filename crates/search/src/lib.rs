@@ -1,9 +1,15 @@
 //! Structured FTS5 search and deterministic, token-budgeted Context Packs.
 
-use std::{collections::BTreeSet, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
 use rusqlite::{Connection, params_from_iter, types::Value as SqlValue};
-use sctx_domain::{Applicability, ContextId, ContextKind, EvidenceId, RevisionId, SpaceId};
+use sctx_domain::{
+    Applicability, ContextId, ContextKind, EvidenceId, RevisionId, SpaceId, TaskId, TaskIntent,
+    TaskSignal,
+};
 use sctx_index::{IndexMetadata, ProjectionIndex, search_tokens};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -162,6 +168,52 @@ pub struct SearchResponse {
     pub omitted: Vec<SearchOmitted>,
 }
 
+/// Searchable field in one current `ContextSpace` Intent head.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpaceIntentField {
+    Title,
+    Problem,
+    DesiredOutcome,
+    InScope,
+    OutOfScope,
+    AcceptanceConditions,
+    DomainTerms,
+}
+
+/// Explainable match against one current Intent head.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SpaceIntentHeadMatch {
+    pub revision_id: RevisionId,
+    pub matched_fields: Vec<SpaceIntentField>,
+    pub matched_tokens: Vec<String>,
+    pub bm25: f64,
+}
+
+/// One Task-derived Space candidate. Every current head identity is included, while
+/// `matching_heads` contains every head that matched the Task query. This keeps a conflicted
+/// Intent explicit even when only one side contains the matching terms.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SpaceIntentCandidate {
+    pub space_id: SpaceId,
+    pub intent_conflicted: bool,
+    pub head_revision_ids: Vec<RevisionId>,
+    pub matching_heads: Vec<SpaceIntentHeadMatch>,
+    pub matched_fields: Vec<SpaceIntentField>,
+    pub matched_tokens: Vec<String>,
+    /// Best (lowest) FTS5 BM25 value among the matching current heads.
+    pub bm25: f64,
+}
+
+/// Deterministically ranked Space Intent candidates from one exact projection snapshot.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SpaceIntentCandidatesResponse {
+    pub indexed_tree_oid: String,
+    pub projection_generation: u64,
+    pub task_id: TaskId,
+    pub candidates: Vec<SpaceIntentCandidate>,
+}
+
 /// Several cursor pages materialized under one pinned `QuerySnapshot` transaction.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SearchPagesResponse {
@@ -269,6 +321,33 @@ impl SearchEngine {
         Self { index }
     }
 
+    /// Finds zero or more current Space Intent candidates from a Task Intent and its observed
+    /// signals. Every current head is searched independently; conflicts are returned rather than
+    /// resolved by ranking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input error for an invalid Task Intent or signal collection, and storage errors
+    /// propagated by index synchronization and snapshot reads.
+    pub fn space_intent_candidates(
+        &self,
+        intent: &TaskIntent,
+        signals: &[TaskSignal],
+    ) -> Result<SpaceIntentCandidatesResponse> {
+        intent.validate()?;
+        TaskSignal::validate_collection(signals)?;
+        let query_tokens = task_query_tokens(intent, signals);
+        let snapshot = self.index.query_snapshot(|connection| {
+            query_space_intent_candidates(connection, &query_tokens)
+        })?;
+        Ok(SpaceIntentCandidatesResponse {
+            indexed_tree_oid: snapshot.metadata.indexed_tree_oid,
+            projection_generation: snapshot.metadata.projection_generation,
+            task_id: intent.task_id,
+            candidates: snapshot.data,
+        })
+    }
+
     /// Searches and expands Evidence/conflicts within one read transaction.
     ///
     /// # Errors
@@ -367,6 +446,198 @@ impl SearchEngine {
             omitted: snapshot.data.omitted,
         })
     }
+}
+
+#[derive(Debug)]
+struct RawIntentHeadMatch {
+    space_id: SpaceId,
+    intent_conflicted: bool,
+    head_match: SpaceIntentHeadMatch,
+}
+
+struct StoredIntentFtsMatch {
+    space_id: String,
+    revision_id: String,
+    intent_conflicted: bool,
+    bm25: f64,
+    fields: [String; 7],
+}
+
+fn task_query_tokens(intent: &TaskIntent, signals: &[TaskSignal]) -> Vec<String> {
+    let list_text = [
+        &intent.in_scope,
+        &intent.out_of_scope,
+        &intent.domains,
+        &intent.platforms,
+        &intent.constraints,
+        &intent.acceptance_conditions,
+        &intent.artifacts,
+        &intent.interfaces,
+        &intent.unknowns,
+    ]
+    .into_iter()
+    .flat_map(|values| values.iter().map(String::as_str));
+    let signal_text = signals.iter().map(|signal| signal.content.as_str());
+    [intent.goal.as_str(), intent.desired_change.as_str()]
+        .into_iter()
+        .chain(list_text)
+        .chain(signal_text)
+        .flat_map(search_tokens)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn query_space_intent_candidates(
+    connection: &Connection,
+    query_tokens: &[String],
+) -> Result<Vec<SpaceIntentCandidate>> {
+    let Some(match_expression) = fts_or_match_expression(query_tokens) else {
+        return Ok(Vec::new());
+    };
+    let mut statement = connection
+        .prepare(
+            "SELECT space_fts.space_id, space_fts.revision_id,
+                    space.intent_conflicted,
+                    bm25(space_fts, 0.0, 0.0, 10.0, 8.0, 8.0, 4.0, 1.0, 6.0, 5.0),
+                    space_fts.title, space_fts.problem, space_fts.desired_outcome,
+                    space_fts.in_scope, space_fts.out_of_scope,
+                    space_fts.acceptance_conditions, space_fts.domain_terms
+             FROM space_fts
+             JOIN intent_head
+               ON intent_head.space_id = space_fts.space_id
+              AND intent_head.revision_id = space_fts.revision_id
+             JOIN space_projection AS space USING(space_id)
+             WHERE space_fts MATCH ?1
+             ORDER BY 4 ASC, space_fts.space_id ASC, space_fts.revision_id ASC",
+        )
+        .map_err(sql_error("prepare Space Intent candidate query"))?;
+    let raw = statement
+        .query_map([match_expression], read_intent_fts_match)
+        .map_err(sql_error("execute Space Intent candidate query"))?
+        .map(|row| {
+            parse_intent_fts_match(
+                &row.map_err(sql_error("collect Space Intent candidate row"))?,
+                query_tokens,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    drop(statement);
+
+    let mut grouped = BTreeMap::<SpaceId, (bool, Vec<SpaceIntentHeadMatch>)>::new();
+    for row in raw {
+        let entry = grouped
+            .entry(row.space_id)
+            .or_insert_with(|| (row.intent_conflicted, Vec::new()));
+        entry.1.push(row.head_match);
+    }
+
+    let mut candidates = Vec::with_capacity(grouped.len());
+    for (space_id, (intent_conflicted, mut matching_heads)) in grouped {
+        matching_heads.sort_by_key(|head| head.revision_id);
+        let head_revision_ids = load_intent_head_ids(connection, space_id)?;
+        let mut matched_fields = BTreeSet::new();
+        let mut matched_tokens = BTreeSet::new();
+        let mut bm25 = f64::INFINITY;
+        for head in &matching_heads {
+            matched_fields.extend(head.matched_fields.iter().copied());
+            matched_tokens.extend(head.matched_tokens.iter().cloned());
+            bm25 = bm25.min(head.bm25);
+        }
+        candidates.push(SpaceIntentCandidate {
+            space_id,
+            intent_conflicted,
+            head_revision_ids,
+            matching_heads,
+            matched_fields: matched_fields.into_iter().collect(),
+            matched_tokens: matched_tokens.into_iter().collect(),
+            bm25,
+        });
+    }
+    candidates.sort_by(|left, right| {
+        left.bm25
+            .total_cmp(&right.bm25)
+            .then_with(|| left.space_id.cmp(&right.space_id))
+    });
+    Ok(candidates)
+}
+
+fn read_intent_fts_match(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredIntentFtsMatch> {
+    Ok(StoredIntentFtsMatch {
+        space_id: row.get(0)?,
+        revision_id: row.get(1)?,
+        intent_conflicted: row.get::<_, i64>(2)? != 0,
+        bm25: row.get(3)?,
+        fields: [
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+            row.get(9)?,
+            row.get(10)?,
+        ],
+    })
+}
+
+fn parse_intent_fts_match(
+    row: &StoredIntentFtsMatch,
+    query_tokens: &[String],
+) -> Result<RawIntentHeadMatch> {
+    let field_names = [
+        SpaceIntentField::Title,
+        SpaceIntentField::Problem,
+        SpaceIntentField::DesiredOutcome,
+        SpaceIntentField::InScope,
+        SpaceIntentField::OutOfScope,
+        SpaceIntentField::AcceptanceConditions,
+        SpaceIntentField::DomainTerms,
+    ];
+    let fields: [(SpaceIntentField, &str); 7] =
+        std::array::from_fn(|index| (field_names[index], row.fields[index].as_str()));
+    let (matched_fields, matched_tokens) = explain_intent_match(query_tokens, fields);
+    Ok(RawIntentHeadMatch {
+        space_id: parse_id(&row.space_id)?,
+        intent_conflicted: row.intent_conflicted,
+        head_match: SpaceIntentHeadMatch {
+            revision_id: parse_id(&row.revision_id)?,
+            matched_fields,
+            matched_tokens,
+            bm25: row.bm25,
+        },
+    })
+}
+
+fn load_intent_head_ids(connection: &Connection, space_id: SpaceId) -> Result<Vec<RevisionId>> {
+    let mut statement = connection
+        .prepare("SELECT revision_id FROM intent_head WHERE space_id = ?1 ORDER BY revision_id ASC")
+        .map_err(sql_error("prepare Space Intent head expansion"))?;
+    statement
+        .query_map([space_id.to_string()], |row| row.get::<_, String>(0))
+        .map_err(sql_error("read Space Intent heads"))?
+        .map(|row| {
+            let revision_id = row.map_err(sql_error("collect Space Intent head"))?;
+            parse_id(&revision_id)
+        })
+        .collect()
+}
+
+fn explain_intent_match<const N: usize>(
+    query_tokens: &[String],
+    fields: [(SpaceIntentField, &str); N],
+) -> (Vec<SpaceIntentField>, Vec<String>) {
+    let wanted = query_tokens.iter().cloned().collect::<BTreeSet<_>>();
+    let mut matched_fields = Vec::new();
+    let mut matched_tokens = BTreeSet::new();
+    for (field, text) in fields {
+        let available = search_tokens(text).into_iter().collect::<BTreeSet<_>>();
+        let intersection = wanted.intersection(&available).cloned().collect::<Vec<_>>();
+        if !intersection.is_empty() {
+            matched_fields.push(field);
+            matched_tokens.extend(intersection);
+        }
+    }
+    (matched_fields, matched_tokens.into_iter().collect())
 }
 
 #[derive(Debug)]
@@ -1054,6 +1325,16 @@ fn fts_match_expression(tokens: &[String]) -> Option<String> {
             .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" AND ")
+    })
+}
+
+fn fts_or_match_expression(tokens: &[String]) -> Option<String> {
+    (!tokens.is_empty()).then(|| {
+        tokens
+            .iter()
+            .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR ")
     })
 }
 

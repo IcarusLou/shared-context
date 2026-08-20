@@ -12,7 +12,7 @@ use crate::{
 
 pub(crate) const NEXT_PREFIX: &str = "_next_";
 
-const TABLES: [&str; 18] = [
+const TABLES: [&str; 19] = [
     "meta",
     "source_file",
     "context_candidate",
@@ -31,6 +31,7 @@ const TABLES: [&str; 18] = [
     "conflict",
     "diagnostic",
     "context_fts",
+    "space_fts",
 ];
 
 pub(crate) fn is_complete(connection: &rusqlite::Connection) -> crate::Result<bool> {
@@ -253,6 +254,17 @@ CREATE VIRTUAL TABLE {prefix}context_fts USING fts5(
     rationale,
     evidence
 );
+CREATE VIRTUAL TABLE {prefix}space_fts USING fts5(
+    space_id UNINDEXED,
+    revision_id UNINDEXED,
+    title,
+    problem,
+    desired_outcome,
+    in_scope,
+    out_of_scope,
+    acceptance_conditions,
+    domain_terms
+);
 "
     );
     transaction
@@ -415,6 +427,29 @@ fn populate(
                     params![space_id.to_string(), revision_id.to_string()],
                 )
                 .map_err(sql_error("write Intent head"))?;
+            let revision = space
+                .intent
+                .revisions
+                .get(revision_id)
+                .expect("the reducer only projects resolvable Intent heads");
+            transaction
+                .execute(
+                    &format!(
+                        "INSERT INTO {prefix}space_fts(space_id, revision_id, title, problem, desired_outcome, in_scope, out_of_scope, acceptance_conditions, domain_terms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+                    ),
+                    params![
+                        space_id.to_string(),
+                        revision_id.to_string(),
+                        normalize_search_text(&revision.intent.title),
+                        normalize_search_text(&revision.intent.problem),
+                        normalize_search_text(&revision.intent.desired_outcome),
+                        normalize_search_text(&revision.intent.in_scope.join(" ")),
+                        normalize_search_text(&revision.intent.out_of_scope.join(" ")),
+                        normalize_search_text(&revision.intent.acceptance_conditions.join(" ")),
+                        normalize_search_text(&revision.intent.domain_terms.join(" ")),
+                    ],
+                )
+                .map_err(sql_error("write Space Intent FTS5 projection"))?;
         }
         if space.intent.heads.len() > 1 {
             insert_conflict(
@@ -737,6 +772,7 @@ pub(crate) fn replace_projection_incremental(
              DELETE FROM diagnostic;
              INSERT INTO diagnostic SELECT * FROM _next_diagnostic;
 
+             DELETE FROM space_fts WHERE space_id IN (SELECT space_id FROM _affected_space);
              DELETE FROM context_fts WHERE revision_id IN (
                  SELECT revision_id FROM context_revision
                  WHERE space_id IN (SELECT space_id FROM _affected_space)
@@ -769,6 +805,8 @@ pub(crate) fn replace_projection_incremental(
              INSERT INTO intent_revision SELECT * FROM _next_intent_revision
                  WHERE space_id IN (SELECT space_id FROM _affected_space);
              INSERT INTO intent_head SELECT * FROM _next_intent_head
+                 WHERE space_id IN (SELECT space_id FROM _affected_space);
+             INSERT INTO space_fts SELECT * FROM _next_space_fts
                  WHERE space_id IN (SELECT space_id FROM _affected_space);
              INSERT INTO context_item SELECT * FROM _next_context_item
                  WHERE space_id IN (SELECT space_id FROM _affected_space);
