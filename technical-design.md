@@ -1,132 +1,115 @@
-# 团队共享 Context 技术方案
+# Shared Context 技术方案
 
 ## 1. 文档信息
 
-- 状态：首版技术方案基线
+- 状态：目标技术方案
 - 目标平台：macOS（Apple Silicon / Intel）
 - 分发方式：Rust 原生二进制 + NPM 包
 - 首版 Agent：Cursor、Codex
-- 后续 Agent：Claude Code
-- 配套产品目标：[团队共享 Context：预期效果](./readme.md)
+- 配套产品目标：[Shared Context：预期效果](./readme.md)
+
+本项目尚未上线，本文直接定义目标模型、接口和存储结构。
 
 ## 2. 背景与目标
 
-本项目希望把个人或 Agent 在工程过程中形成的有效理解、判断和验证，沉淀为可以由团队成员和后续 Agent 继承的工程 Context，从而降低跨人员、跨端、跨 Agent、跨 Session 的冷启动成本。
+本项目希望让 Agent 在工程过程中形成的有效理解、判断和验证，低成本地沉淀为后续任务可以直接继承的工程 Context，从而降低跨端、跨仓库、跨 Agent 和跨 Session 的冷启动成本。
 
-系统要同时完成两件事：
+系统需要完成一条连续链路：
 
 ```text
-Capture
-  将已验证、可复用的工程认知沉淀为 Candidate Context
-
-Retrieve
-  根据当前工作目标和工作区，在合适时机返回相关 Context
+理解当前 Task
+    ↓
+连接历史 Intent、Context 与工程对象
+    ↓
+注入当前真正相关的 Context
+    ↓
+持续观察开发过程
+    ↓
+自动形成新的 Context Candidate
 ```
 
-首版重点解决：
+核心目标：
 
-1. 使用 Git 保存可审计、可迁移的最终知识文件。
-2. 使用 SQLite 在本地建立可删除、可重建的查询投影。
-3. 使用 Cursor/Codex Hook 和 MCP 降低 Capture、Retrieve 的额外操作成本。
-4. 通过生成阶段的追加保护，尽量避免多人或多 Agent 修改已有知识文件。
-5. 不依赖外部需求系统、开发期 Git Commit 或其他容易失效的数据维持领域正确性。
-6. 提供无需远端服务、无需管理员权限的友好安装和测试流程。
+1. 以 `TaskIntent` 作为默认检索入口，不要求调用者提前选择 Space。
+2. 自动推断一个 Task 与多个 `ContextSpace` 的关联，并返回匹配原因。
+3. 建立 Context 与 Repository、Module、File、Symbol、API、Schema、Test 的可重建关联。
+4. 从 Prompt、代码访问、Diff、测试和 Agent 结论中自动生成 `ContextCandidate`。
+5. 使用 Git 保存稳定、可审计的 Context 事实，使用 SQLite 保存可删除、可重建的投影和工程关联。
+6. 保持自动注入安全：只有有效、已激活、证据充分且无阻断冲突的 Context 可以自动进入 Agent 上下文。
 
-## 3. 约束与非目标
+## 3. 范围与非目标
 
 ### 3.1 已确认约束
 
-- 每次安装只维护一个 Shared Context Git 仓库。
-- 所有 Requirement/ContextSpace 都是该仓库内的逻辑聚合。
-- 产品配置、Runtime、SQLite、日志等文件放在当前用户目录。
-- Git 是共享 Context 的最终载体。
-- SQLite 仅作为本地查询投影，不能成为第二事实源。
-- 面向项目使用者和 Agent 的写入接口只生成新文件，不提供修改、删除或重命名已有事件的能力。
-- “项目使用者”是产品用户概念，不代表操作系统权限或 RBAC 角色。
-- 首版不依赖外部 Requirement、Issue、PR 或文档系统。
-- 首版只支持 macOS，通过 NPM 分发 Rust 二进制。
-- 首版接入 Cursor 和 Codex，Adapter 边界需要支持后续接入 Claude Code。
+- 一次安装维护一个本地 `ContextStore`，对应唯一 Git 仓库。
+- `ContextSpace` 表示一项内部 Requirement 或长期工作目标，不依赖外部需求系统维持身份。
+- Workspace 只说明代码位置和当前工程现场，不能决定当前 Task 属于哪个 Space。
+- 一个 Task 可以同时关联零个、一个或多个 Space。
+- `ContextCandidate` 在形成时可以没有 Space；Space 归属是 Candidate 的后续确认结果。
+- 文件路径、Symbol 位置、Commit、Branch 等不能成为领域身份，但必须能参与检索和关联重建。
+- Git 中只保存稳定 Context 事实和自包含 Evidence；Task、Capture、置信度和当前代码解析结果保存在本地状态中。
+- SQLite 不是事实源；删除后必须能够从 Context Git Tree 和当前可访问的业务代码仓库重建相应投影。
+- 产品写接口只创建新事件和对象，不修改、删除或重命名已有知识文件。
+- 首版支持 Cursor 和 Codex，Adapter 边界支持后续新增其他 Agent。
 
-### 3.2 首版非目标
+### 3.2 非目标
 
-- 不实现本地防恶意篡改、专用系统账号、root Helper 或权限隔离。
-- 不实现 Contributor、Reviewer、Maintainer 等访问控制角色。
-- 不把完整 Conversation、Transcript 或原始 Tool Output 提交到 Git。
-- 不依赖远端 Git、PR、Merge Queue 或服务端检查完成首版验收。
+- 不依赖外部 Requirement、Issue、PR 或文档系统完成核心流程。
+- 不把完整 Conversation、Transcript 或原始 Tool Output 写入 Git。
 - 不实现独立 GUI 或 IDE Extension。
-- 不引入向量数据库或本地 Embedding 模型。
-- 不承诺对使用者绕过 CLI、直接执行任意 Git 命令的行为提供安全防护。
+- 首版不依赖向量数据库或本地 Embedding 模型；先以结构化关联、FTS 和可解释规则完成召回。
+- 不实现本地防恶意篡改、专用系统账号、root Helper 或权限隔离。
+- 不承诺对使用者绕过产品、直接执行任意 Git 命令的行为提供安全防护。
 
-## 4. 核心设计原则
+## 4. 总体架构
 
-### 4.1 一个物理 Store，多个逻辑 Space
-
-一次安装只有一个 `ContextStore`，对应唯一 Git 仓库。仓库内可以包含多个 `ContextSpace`，每个 `ContextSpace` 表示一项内部 Requirement 或长期工作目标。
-
-```text
-ContextStore（唯一 Git Repo）
-├── ContextSpace A
-│   ├── Intent Revisions
-│   └── Context Items
-├── ContextSpace B
-│   ├── Intent Revisions
-│   └── Context Items
-└── Shared Evidence Objects
-```
-
-ContextSpace 是逻辑聚合，不对应独立目录、独立数据库或独立 Git 仓库。
-
-### 4.2 Git 保存不可变事件，SQLite 保存派生状态
-
-Git 中只保存不可变事件和自包含证据。知识的当前状态由 SQLite 根据事件间的显式因果关系计算。
+### 4.1 四层结构
 
 ```text
-Git Event Set
-    │
-    ├── Intent Revision
-    ├── Context Revision
-    ├── Evidence Snapshot
-    └── Publication Transition
-            │
-            ▼
-       SQLite Projection
-            │
-            ├── Current Intent
-            ├── Accepted Context
-            ├── Conflict
-            └── Search Index
+┌─────────────────────────────────────────────────────────────┐
+│ Agent Integration                                           │
+│ Prompt / Tool / Diff / File / Symbol / API / Test Signals   │
+└──────────────────────────────┬──────────────────────────────┘
+                               ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Task Runtime                                                │
+│ TaskSession / TaskIntent / WorkEpisode / ContextCandidate   │
+└───────────────────────┬──────────────────────┬──────────────┘
+                        ↓                      ↓
+┌───────────────────────────────┐  ┌──────────────────────────┐
+│ Association & Retrieval       │  │ Candidate Builder        │
+│ Space Inference               │  │ Claim / Evidence / Scope │
+│ Engineering Graph             │  │ Dedup / Conflict         │
+│ Multi-source Ranking          │  │ Space Recommendation     │
+└───────────────────┬───────────┘  └─────────────┬────────────┘
+                    ↓                            ↓ confirm
+┌─────────────────────────────────────────────────────────────┐
+│ Context Repository                                          │
+│ Space Intent / Context / Evidence / Lifecycle / Conflict    │
+│ Git Events + Objects                                        │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-删除 SQLite 后，系统必须能够只依赖当前 Git Tree 中的事件内容重建同样的领域状态。
+### 4.2 两类状态
 
-### 4.3 领域语义与开发现场解耦
+稳定事实：
 
-以下信息可以作为辅助定位或展示信息，但不能参与领域身份、因果顺序和状态归约：
+- ContextSpace 与 Intent Revision。
+- ContextItem 与 Context Revision。
+- Context 与 Space 的显式组织关系。
+- Evidence Snapshot。
+- Context 生命周期和语义冲突。
 
-- 开发期 Commit SHA、Branch、Tag。
-- PR、Issue、外部 Requirement ID 或 URL。
-- 文件路径、行号、Symbol 位置。
-- Agent Session、Agent 版本。
-- 用户名、邮箱。
-- 时间戳。
-- Git Commit 顺序、事件文件路径。
-- Confidence、相似度和排序分数。
+派生或短期状态：
 
-这些字段应放入明确标记为非权威的 `annotations` 或 `origin_hint`。它们全部丢失后，Context 仍应可以理解和治理。
+- TaskIntent。
+- Task 与 Space 的相关性分数。
+- 当前文件、Symbol、API 和 Schema 的解析位置。
+- Context 与工程对象的当前匹配结果。
+- WorkEpisode、ContextCandidate 和候选置信度。
+- FTS、排序分数、分页游标和 Token Budget 结果。
 
-### 4.4 追加保护是产品行为，不是权限安全
-
-Append-only 的含义是：
-
-- 产品写 API 只创建新事件。
-- 修订、发布、撤回、合并和冲突解决都生成新事件。
-- 产品自动提交前检测已有文件是否被修改、删除或重命名。
-
-它不表示：
-
-- 当前用户无法直接修改本地文件。
-- Git Hook 不可绕过。
-- 本地仓库具备安全防篡改能力。
+稳定事实进入 Git；派生或短期状态进入 SQLite 或有 TTL 的本地 Capture 存储。
 
 ## 5. 领域模型
 
@@ -134,22 +117,32 @@ Append-only 的含义是：
 
 | 术语 | 定义 |
 |---|---|
-| `ContextStore` | 一次安装唯一的 Git 知识仓库 |
-| `ContextSpace` | 一项内部 Requirement 或工作目标的持续 Context 容器 |
-| `IntentRevision` | ContextSpace 的目标、范围和验收条件的一版完整快照 |
-| `ContextItem` | 一条逻辑工程认知，例如 Decision、Contract、Risk、Validation |
+| `ContextStore` | 一次安装唯一的本地 Git 知识仓库 |
+| `ContextSpace` | 一项内部 Requirement 或长期工作目标的 Intent 与 Context 组织容器 |
+| `IntentRevision` | ContextSpace 目标、范围和验收条件的一版完整快照 |
+| `TaskSession` | 一次 Agent 工程任务的本地运行实例，与 Agent Session 隔离 |
+| `TaskIntent` | 系统对当前 Task 目标、范围、约束和未知项的动态理解 |
+| `TaskSignal` | Prompt、Repository、File、Symbol、Diff、API、Schema、Test 等任务信号 |
+| `TaskSpaceAssociation` | Task 与多个 Space 的派生相关性、置信度和匹配依据 |
+| `WorkEpisode` | 一次 Task 内被聚合的探索、修改、验证和结论 |
+| `ContextCandidate` | 从 WorkEpisode 自动生成、尚未进入知识事实层的 Context 草稿 |
+| `ContextItem` | 一条稳定工程认知，例如 Decision、Contract、Risk 或 Validation |
 | `ContextRevision` | ContextItem 的一版完整内容快照，不是文本 Patch |
+| `SpaceAssociation` | Context 与一个 Primary Space 及若干 Related Space 的可修订显式关系 |
+| `ContextRelation` | Context 之间的依赖、约束、实现、验证或冲突关系 |
 | `EvidenceSnapshot` | 可以脱离开发现场独立阅读的最小充分证据 |
-| `Publication` | 某个 ContextRevision 当前是否对团队生效的治理节点 |
+| `EngineeringReference` | Context 中保存的非权威工程定位观察，例如 Symbol、API 或路径 Hint |
+| `EngineeringArtifact` | 当前代码树中可解析的 Repository、Module、File、Symbol、API、Schema 或 Test |
+| `ContextArtifactAssociation` | Context 与 EngineeringArtifact 的派生、可失效、可重建关联 |
+| `LifecycleTransition` | Context 激活、废弃或替代的不可变因果节点 |
 | `Event` | Git 中实际保存的不可变 JSON 文件 |
-| `Projection` | SQLite 根据 Event 计算出的当前状态和查询索引 |
-| `WorkspaceBinding` | 本地业务工作区到默认 ContextSpace 的便利映射，不属于知识事实 |
+| `Projection` | SQLite 根据 Event 和当前工程快照计算出的查询状态 |
 
 ### 5.2 ContextSpace 与 Intent
 
-不再存在外部 `RequirementRef`。ContextSpace 自身就是内部 Requirement 容器，使用内部随机 ID 标识。
+`ContextSpace` 是稳定 Requirement Intent 与 Context 组织容器，不是检索分区键，也不是 Workspace 的属性。
 
-初始 Intent 至少包含：
+Intent 至少包含：
 
 ```yaml
 title:
@@ -161,13 +154,93 @@ acceptance_conditions:
 domain_terms:
 ```
 
-Intent 发生变化时新增完整的 `IntentRevision`，旧 Revision 不修改。
+Intent 变化时新增完整 `IntentRevision`。Revision 使用显式 Parent DAG；多个 Head 表示 Intent Conflict，必须通过引用全部 Head 的新完整 Revision 收敛。
 
-`space.created` 同时携带首个 IntentRevision 完整快照；后续 `space.intent_revision_added` 必须引用同一 Space 的一个或多个 Intent Head。这样 ContextSpace 不会依赖另一个可能尚未到达的“创建清单”。
+完整 Intent 字段都进入 `space_intent_fts`，作为 Task 多路召回的一种信号，并与 Context、Scope 和工程关联共同推断候选 Space。
 
-### 5.3 ContextItem 类型
+### 5.3 TaskIntent
 
-首版支持：
+`TaskIntent` 是本地、会话级、可重算对象，不进入 Git。它不是用户 Prompt 的原样副本，而是对当前任务的结构化理解：
+
+```yaml
+goal:
+desired_change:
+in_scope:
+out_of_scope:
+domains:
+platforms:
+constraints:
+acceptance_conditions:
+artifacts:
+interfaces:
+unknowns:
+```
+
+每次 Prompt、关键文件访问、Diff 变化、测试结果或 Agent Checkpoint 都可以生成新的 TaskIntent Revision。旧 Revision 在 Task 生命周期内保留，用于解释检索结果为何发生变化。
+
+同一个业务仓库中的不同 Agent Session 使用不同 `task_id`，互不覆盖当前 Intent 或候选 Space。
+
+### 5.4 TaskSpaceAssociation
+
+`TaskSpaceAssociation` 是检索结果，不是知识事实。一个关联至少包含：
+
+```yaml
+task_id:
+space_id:
+score:
+matched_intent_fields:
+matched_artifacts:
+matched_contexts:
+relation_paths:
+reasons:
+```
+
+系统允许：
+
+- 没有任何高置信度 Space；此时仍可按 Context 和工程关系检索。
+- 同时关联多个 Space；不得强制选出唯一 Active Space。
+- 同一个 Task 在开发过程中改变候选 Space 排序。
+- 用户为当前 Task 提供显式修正；修正只写入 TaskSession，不形成 Workspace 全局配置。
+
+### 5.5 ContextCandidate 与 ContextItem
+
+`ContextCandidate` 保存在本地 Runtime 中，可以没有 Space。它至少包含：
+
+```yaml
+candidate_id:
+task_id:
+kind:
+topic_key:
+statement:
+rationale:
+applicability:
+assumptions:
+recheck_when:
+evidence:
+engineering_references:
+related_contexts:
+space_candidates:
+novelty:
+conflicts:
+```
+
+`space_candidates` 可以同时包含已有 Space 和一个系统生成的 `proposed_new_space_intent`。不存在合理的已有 Space 时，系统不得要求用户先退出当前流程手工创建 Space。
+
+确认 Candidate 时：
+
+1. 选择已有 Primary Space，或确认系统生成的新 Space Intent；可附加 Related Spaces。
+2. 应用用户对内容的可选修正。
+3. 如果选择新 Space，在同一个 Writer Batch 中先生成 `space.created`。
+4. 在该 Batch 中生成 `context.created`、初始 `context.space_association_changed` 和 `context.lifecycle_changed(action=activate)`。
+5. Candidate 本地状态标记为 Confirmed，随后按 TTL 清理。
+
+Candidate 未确认前不进入 Git，也不能自动注入。
+
+`ContextItem` 的身份独立于 Space。Space 组织关系由 `SpaceAssociation` 表达，因此错误归属可以通过新关联事件修正，而不需要改写 Context 历史或创建重复知识。
+
+### 5.6 Context 类型与关系
+
+Context 类型：
 
 - `decision`
 - `contract`
@@ -177,597 +250,706 @@ Intent 发生变化时新增完整的 `IntentRevision`，旧 Revision 不修改�
 - `discovery`
 - `progress`
 
-其中 Decision、Contract 应包含明确的主题与适用范围，以支持冲突识别。
+`ContextRevision` 可以包含稳定的 `ContextRelation`：
 
-### 5.4 稳定 ID
+```yaml
+relations:
+  - kind: depends_on | constrains | implements | validated_by | contradicts | related_to
+    target_context_id:
+    rationale:
+```
 
-所有领域实体使用 CSPRNG 生成的随机、不透明 ID，例如 UUIDv4：
+ContextRelation 属于工程认知的一部分，参与 Revision 语义和检索图扩展。文件路径、Symbol 和 Commit 不属于 ContextRelation，而属于非权威 EngineeringReference。
+
+### 5.7 Applicability
+
+Applicability 是 Revision 内自包含的适用范围：
+
+```yaml
+domains:
+platforms:
+conditions:
+```
+
+它不引用用户配置或外部可变分类表。Scope 用于：
+
+- Task Context 过滤和排序。
+- 跨端 Context 发现。
+- 相同 Topic 的潜在语义冲突检测。
+- Candidate Space 推荐。
+
+### 5.8 稳定 ID
+
+领域实体使用随机、不透明 ID：
 
 ```text
 spc_<random>   ContextSpace
 ctx_<random>   ContextItem
-rev_<random>   Revision
+rev_<random>   Intent 或 Context Revision
 evt_<random>   Event
-pub_<random>   Publication
 evd_<random>   Evidence
+asc_<random>   SpaceAssociation
+trn_<random>   LifecycleTransition
+cnf_<random>   SemanticConflict
+rsl_<random>   ConflictResolution
+```
+
+本地对象使用独立前缀：
+
+```text
+tsk_<random>   TaskSession
+cnd_<random>   ContextCandidate
+wep_<random>   WorkEpisode
 ```
 
 禁止使用标题、路径、时间、用户名、外部单号或内容 Hash 作为领域 ID。
 
-内容 Hash 只用于：
+## 6. 事件与生命周期模型
 
-- 数据完整性校验。
-- 内容寻址对象。
-- 精确重复提示。
+### 6.1 事件类型
 
-内容 Hash 不承担领域身份，因为规范化算法和 Schema 会演进。用于重复提示的语义 Hash 必须排除 `annotations`、`origin_hint`、记录时间和生产者等非权威字段，避免开发现场变化制造伪差异。
-
-## 6. Git 数据设计
-
-### 6.1 用户目录布局
-
-```text
-~/.shared-context/
-├── config.toml
-├── bin/
-│   └── current/sctx
-├── repository/                 # 唯一 Git 仓库
-│   ├── .git/
-│   ├── events/
-│   ├── objects/
-│   └── schemas/
-├── state/
-│   ├── index.sqlite
-│   ├── writer.lock
-│   ├── index.lock
-│   ├── pending/
-│   └── capture/
-├── backups/
-└── logs/
-```
-
-只有 `repository/` 是 Git 仓库。SQLite、配置、日志、锁和临时 Capture 数据都位于仓库外。
-
-Cursor/Codex 自身要求的配置仍写入各自用户目录，但仅保存指向稳定二进制的 Hook/MCP 注册项：
-
-```text
-~/.cursor/hooks.json
-~/.cursor/mcp.json
-~/.codex/hooks.json 或 ~/.codex/config.toml
-```
-
-### 6.2 仓库结构
-
-```text
-repository/
-├── events/
-│   └── <id-prefix>/
-│       └── evt_<random>.json
-├── objects/
-│   └── sha256/
-│       └── <hash-prefix>/
-│           └── <digest>
-└── schemas/
-    └── <schema-id>.json
-```
-
-设计约束：
-
-- 每个事件一个文件。
-- 事件路径由 Writer 生成，调用者不能传入。
-- 文件路径只负责物理分片，不表达 ContextSpace、状态或事件顺序。
-- 不维护可修改的全局清单、计数器、当前状态文件或 Requirement 目录索引。
-- ContextSpace 改名，以及未来引入的合并操作，都不得移动任何历史文件。
-- Schema 使用不可变版本文件；升级只新增新 Schema，Reader 保留对已写版本的解析能力。
-- 大型文本证据可以存为内容寻址对象；首版不保存二进制附件。
-
-## 7. 事件模型
-
-### 7.1 事件类型
-
-首版事件：
+目标事件集合：
 
 ```text
 space.created
 space.intent_revision_added
+context.created
 context.revision_added
-context.reviewed
-context.publication_changed
+context.space_association_changed
+context.lifecycle_changed
 semantic_conflict.opened
 semantic_conflict.resolution_added
 ```
 
-Review 是领域动作，不代表访问控制角色。项目使用者可以通过 CLI 发起 Review/Publish；Agent 默认只使用 Propose 能力，以降低误发布概率。
+TaskSession、TaskIntent、WorkEpisode 和 ContextCandidate 不属于 Event。
 
-`context.reviewed` 是对确定 Revision 的不可变评审记录，包含随机 `review_id`、`revision_id`、`verdict: approve|reject` 和理由，本身不改变 Publication Head。Reducer 聚合该 Revision 的全部合法 Review：无记录为 Unreviewed，仅有 Approve 为 Approved，仅有 Reject 为 Rejected，两类同时存在为 Mixed；不按时间选一个。Publish 时可以由本地治理规则检查所引用的 Review，但规则只控制新事件能否生成；Reducer 不使用当前配置重新解释已经存在的 Publication。
-
-### 7.2 Context Revision 示例
+### 6.2 Context 创建示例
 
 ```json
 {
   "schema_version": "1",
   "event_id": "evt_7cc4...",
-  "event_type": "context.revision_added",
-  "space_id": "spc_38b1...",
+  "event_type": "context.created",
   "context_id": "ctx_aa91...",
   "revision": {
     "revision_id": "rev_a2f0...",
-    "parent_revision_ids": ["rev_older..."],
+    "parent_revision_ids": [],
     "kind": "decision",
     "topic_key": "search-result/general-tab-visibility",
     "statement": "General Tab 的可见性由服务端响应字段决定",
     "rationale": "客户端本地推导会导致多端结果不一致",
     "applicability": {
       "domains": ["search-result"],
-      "platforms": ["ios", "android"],
+      "platforms": ["fe", "ios", "android"],
       "conditions": ["响应包含 general_tab_visible 字段"]
     },
-    "assumptions": [
-      "响应仍包含 general_tab_visible 字段"
-    ],
-    "recheck_when": [
-      "服务端重新定义字段语义",
-      "客户端切换到新的导航协议"
-    ],
+    "assumptions": ["响应仍包含 general_tab_visible 字段"],
+    "recheck_when": ["服务端重新定义字段语义"],
+    "relations": [],
     "evidence": [
       {
         "evidence_id": "evd_1234...",
         "kind": "source_snapshot",
         "supports": "客户端直接消费响应字段",
         "content": {
-          "response_fragment": {
-            "general_tab_visible": false
-          },
+          "response_fragment": {"general_tab_visible": false},
           "consumer_logic": "UI directly maps the field to tab visibility"
         },
         "interpretation": "未发现客户端本地计算规则",
-        "limitations": [
-          "不证明未来协议不会变化"
-        ]
+        "limitations": ["不证明未来协议不会变化"]
       }
     ]
   },
   "annotations": {
-    "created_at": "2026-08-18T12:00:00+08:00",
     "producer": "codex",
-    "origin_hint": {
-      "workspace_alias": "mobile",
-      "path": "optional",
-      "development_commit": "optional"
-    }
+    "engineering_references": [
+      {
+        "kind": "api",
+        "logical_name": "search-v2.general_tab_visible",
+        "relation": "consumes"
+      },
+      {
+        "kind": "symbol",
+        "path_hint": "src/search/SearchResult.tsx",
+        "symbol_fqn": "SearchResult.renderTabs",
+        "content_fingerprint": "sha256:...",
+        "relation": "implements"
+      }
+    ]
   }
 }
 ```
 
-`annotations` 不参与领域归约，索引器可以完全忽略该对象而不影响结果。
+`annotations.engineering_references` 不参与 Context 身份、Revision 因果关系或生命周期归约，但索引器必须将其标准化为工程关联观察。
 
-`applicability` 是 Revision 内的自包含 Scope Snapshot，不引用用户配置或外部可变分类表。WorkspaceBinding 只能为查询提供 Hint，不能参与 Scope 重叠或冲突判定。
+### 6.3 SpaceAssociation 因果图
 
-### 7.3 完整 Revision，而不是 Patch
-
-- 新 Revision 保存完整快照。
-- `parent_revision_ids` 表达内容演进关系。
-- 单父 Revision 表示修订。
-- 多父 Revision 表示显式合并。
-- 新 Candidate 不会自动替代已发布 Revision。
-- Revision 的父关系不等于 Publication 状态。
-
-Intent 与 Context 内容均按 Revision DAG 归约：未被其他 Revision 作为父节点引用的 Revision 是内容 Head。一个 Head 表示当前唯一内容分支；多个 Head 表示并发修订冲突，必须新增一个引用全部 Head 的完整多父 Revision 才能收敛。该计算不读取时间或 Git 顺序。Publication 始终指向一个确定的 `revision_id`，不会用“当前最新 Revision”这类易变查询间接定位内容。
-
-所有 Revision Parent 必须已经存在，并属于同一个聚合：Intent Parent 与子节点属于同一 ContextSpace，ContextRevision Parent 与子节点属于同一 ContextItem 和 ContextSpace。任何跨聚合父引用或关系环都进入 Diagnostic，不参与有效 Projection。
-
-### 7.4 Publication 因果图
-
-Publication 显式引用它认为的前置状态：
+Context 与 Space 的组织关系通过独立事件表达：
 
 ```json
 {
   "schema_version": "1",
-  "event_id": "evt_publish_2",
-  "event_type": "context.publication_changed",
-  "space_id": "spc_38b1...",
+  "event_id": "evt_assoc...",
+  "event_type": "context.space_association_changed",
   "context_id": "ctx_aa91...",
-  "publication": {
-    "publication_id": "pub_2",
-    "previous_publication_ids": ["pub_1"],
-    "action": "publish",
-    "revision_id": "rev_a2f0...",
-    "review_event_ids": ["evt_review_2"]
+  "association": {
+    "association_id": "asc_1234...",
+    "previous_association_ids": [],
+    "primary_space_id": "spc_search_ui...",
+    "related_space_ids": ["spc_search_protocol..."],
+    "reason": "该结论由搜索结果页需求产生，同时受搜索协议约束"
   }
 }
 ```
 
-Projection 通过因果关系计算 Publication Heads：
+Projection 规则：
 
-- 没有 Head：尚未发布。
-- 一个 `publish` Head：对应 Revision 为 Accepted。
-- 一个 `withdraw` Head：Context 为 Deprecated。
-- 多个 Head：Governance Conflict。
-- Publication 被后继节点引用：对应 Revision 被后继状态替代。
+- 一个合法 Head：当前 SpaceAssociation。
+- 多个 Head：Association Conflict，阻止自动注入但不使 Context 内容失效。
+- 新关联必须显式引用全部当前 Head 才能收敛冲突。
+- Primary Space 可以修正；Context ID 和 Revision 历史不改变。
+- Related Spaces 不表示复制或多份 Context，只用于组织、检索和解释。
 
-并发操作形成多个 Head 时必须展示冲突，禁止按时间、Event ID、文件名或 Git Commit 顺序执行 Last-Write-Wins。
+### 6.4 LifecycleTransition 因果图
 
-解决冲突时生成一个同时引用所有冲突 Head 的新 Publication；如果内容也发生合并，同时生成多父 ContextRevision。
+生命周期动作：
 
-Publication 引用的 Revision、全部 `previous_publication_ids` 以及 Publication 自身必须属于同一 ContextItem 和 ContextSpace，且 Publication 因果图必须无环。违反约束的节点不参与 Head 计算。
+```text
+activate
+deprecate
+```
 
-生命周期投影按 Revision 与 Publication 两个维度呈现，避免用一个可修改的 `status` 字段覆盖历史：
+Transition 显式引用：
 
-| 状态 | 确定性来源 |
-|---|---|
-| Candidate | Revision 已存在，但没有唯一有效的 Publish Head 指向它 |
-| Rejected | 该 Revision 的 Review Summary 仅包含 Reject；不删除 Revision |
-| Review Mixed | 同一 Revision 同时存在 Approve 与 Reject Review；全部展示 |
-| Accepted | 唯一 Publication Head 的 action 为 `publish`，并指向该 Revision |
-| Deprecated | 唯一 Publication Head 的 action 为 `withdraw` |
-| Superseded | 后继 Publication 显式引用旧 Head，并发布另一 Revision |
-| Conflicted | 同一前置状态产生多个未被引用的 Publication Head |
+- `context_id`
+- `revision_id`
+- `previous_transition_ids`
+- `action`
+- 可选 `superseded_by_context_id`
 
-Review 结论也必须引用同一 ContextSpace/ContextItem 下确定的 `revision_id`；出现相互矛盾的 Review 时全部保留并展示，不按记录时间选边。
+Projection 规则：
 
-### 7.5 重复 Context 的首版处理
+- 没有 Transition：未激活。
+- 唯一 `activate` Head：该 Revision 为 Active。
+- 唯一 `deprecate` Head：Context 为 Deprecated。
+- 多个 Head：Lifecycle Conflict。
+- 旧 Active Revision 被后继 Transition 替代时显示为 Superseded。
+- 禁止按时间、Event ID、文件名或 Git Commit 顺序执行 Last-Write-Wins。
 
-首版不合并或重定向 ContextSpace/ContextItem ID，避免提前引入另一套需要处理并发 Head 的身份归并协议。发现重复知识时：
+Candidate 确认生成首个 Activate Transition。
 
-- 为保留项新增吸收了必要内容的完整 Revision，并显式发布。
-- 为重复项新增 Withdraw Publication，显式引用各自当前 Head。
-- 重复项仍可按 ID 查询，不删除、不改名、不自动跳转。
+### 6.5 完整 Revision
 
-通用 Context/Space Consolidation 留作后续事件协议；在定义其前置 Head、并发分支和合并规则之前，不进入首版状态机。
+- 新 Revision 保存完整快照，不保存文本 Patch。
+- `parent_revision_ids` 表达内容演进关系。
+- 单父 Revision 表示修订。
+- 多父 Revision 表示显式合并。
+- Revision Parent 必须属于同一 ContextItem。
+- 一个 Revision Head 表示内容收敛；多个 Head 表示 Revision Conflict。
+- Lifecycle 始终引用确定的 Revision ID，不引用“最新 Revision”。
 
-### 7.6 跨 Context 的语义冲突
+### 6.6 语义冲突
 
-Publication Head 只能发现同一 ContextItem 的并发治理，无法自动判断两段自然语言是否矛盾。为 Decision、Contract 强制保存 `topic_key` 与完整 Applicability Snapshot，SQLite 对“相同 Topic 且适用范围重叠”的多个 Accepted Revision 生成冲突候选。
+系统对相同 `topic_key`、适用范围重叠且结论可能矛盾的 Active Context 生成冲突候选。FTS、规则或后续语义模型只能提出候选，不能直接改变生命周期。
 
-- FTS、规则或后续 Embedding 只能提出冲突候选，不能自动裁决。
-- 人类确认后新增 `semantic_conflict.opened`，使用新的稳定 `conflict_id`，显式引用涉及的 Context、Revision 和 Publication Head，并保存冲突理由与范围快照。
-- 解决时新增 `semantic_conflict.resolution_added`。Resolution 使用独立随机 ID，并显式引用 `conflict_id`、全部前置 Resolution Head、所有仍有效的相关 Publication Head，以及保留、修订或按范围拆分的结果。
-- 未解决的已确认语义冲突会阻止相关 Context 自动注入；查询必须同时展示各方，不得静默选择“更新”的一方。
+确认后的语义冲突使用稳定 `conflict_id`，显式引用参与 Context、Revision 和 Lifecycle Head。未解决冲突阻止相关 Context 自动注入；查询必须同时展示各方及匹配原因。
 
-`topic_key` 是 Revision 内容的一部分，不是实体身份。它的修正同样通过完整新 Revision 表达。
+Conflict Resolution 形成独立 DAG。只有唯一合法 Resolution Head 且覆盖所有当前相关 Lifecycle Head 时，冲突才能投影为 Resolved。
 
-Semantic Conflict 的 Resolution 同样形成 DAG：无 Resolution Head 表示 Open；唯一合法 Head 表示 Resolved；多个并发 Head 表示 Resolution Conflict，仍按 Open 处理。Resolution 只关闭这条语义冲突记录，不能替代 Publication 的因果收敛；如果涉及的 Publication 仍有多个 Head，Validator 拒绝将冲突投影为 Resolved。
+### 6.7 确定性校验
 
-### 7.7 确定性校验与隔离
+- 同一个稳定 ID 出现在多个定义中时，所有冲突定义一并失效。
+- 一个 `context_id` 必须且只能有一个合法 `context.created`。
+- SpaceAssociation、Lifecycle 和 Revision 的父引用必须存在并无环。
+- ContextRelation 的目标 Context 必须存在；关系图允许普通环，但 `depends_on` 等需要无环的关系类型单独诊断。
+- Evidence ID 在仓库内全局唯一。
+- Quarantine 集合由完整事件集合确定，不依赖文件遍历顺序、SQLite RowID 或 Git Commit 顺序。
+- 未知 Schema 事件保留在 Git 中并报告 Diagnostic，在 Reader 支持前不参与有效 Projection。
 
-- 同一个 `event_id`、Revision ID、Review ID、Publication ID 或 Conflict/Resolution ID 出现在多个文件中时，所有冲突定义一并失效；禁止按扫描顺序保留第一个。
-- 一个 `space_id` 必须且只能对应一个合法 `space.created`；多个创建定义会使该 Space 及依赖它的事件整体失效。
-- 一个 `context_id` 只能属于一个 `space_id`；若完整事件集合给出多个 Owner，涉及该 Context 的全部定义和依赖节点失效。
-- `evidence_id` 在首版定义为仓库内全局唯一；内容复用依赖 Object Digest，不复用 Evidence ID。Evidence ID 碰撞按其他唯一 ID 同样整体失效。
-- Reducer 先基于完整事件集合构建 `entity_id → owner aggregate` 映射，只有映射单值后才处理因果边，不能用数据库首条插入结果决定归属。
-- 对每类因果图检查同聚合引用、引用存在性和无环性；非法节点及依赖它的节点进入 Diagnostic。
-- Quarantine 集合由完整事件集合确定，不能依赖文件遍历顺序、SQLite RowID 或 Git Commit 顺序。
-- 未知 Schema 事件保留在 Git 中并报告 Diagnostic，在 Reader 支持该版本前不参与有效 Projection。
+## 7. Evidence 与 Engineering Reference
 
-## 8. Evidence 设计
+### 7.1 Evidence 自包含原则
 
-### 8.1 自包含原则
-
-Evidence 必须在开发分支、开发 Commit、原始代码仓库或 Agent Session 消失后仍能表达：
+Evidence 必须在开发分支、Commit、业务代码仓库或 Agent Session 消失后仍能表达：
 
 - 观察到了什么。
 - 如何得到这个结果。
 - 它支持哪条结论。
 - 证据有哪些限制。
 
-首版支持：
+支持：
 
 - `source_snapshot`：最小充分的代码、配置、协议或文档片段。
 - `experiment_record`：实验前提、输入、步骤、期望和实际结果。
 - `artifact_snapshot`：接口响应、测试结果或其他结构化材料。
 
-### 8.2 外部定位只能作为 Hint
+### 7.2 EngineeringReference
 
-下面的形式不能单独构成 Evidence：
+路径、行号、Symbol 和 Commit 可以帮助重建关联，但不能单独构成 Evidence。
+
+标准 EngineeringReference：
 
 ```yaml
-commit: abc123
-path: src/foo.kt
-line: 123
+kind: repository | module | file | symbol | api | schema | test
+repository_hint:
+logical_name:
+path_hint:
+symbol_fqn:
+api_or_schema_key:
+content_fingerprint:
+relation: implements | consumes | defines | validates | affected_by
+observed_snapshot:
 ```
 
-它们可以放在 `origin_hint`，用于帮助当前使用者跳转，但不能成为必填引用或状态依赖。
+原则：
 
-### 8.3 大型证据对象
+- `logical_name`、`symbol_fqn`、协议 Key 和内容 Fingerprint 可以组合定位。
+- `path_hint` 只是最近一次观察位置。
+- Reference 失效只影响检索能力，不影响 Context 内容和生命周期。
+- 当前解析结果不得写回覆盖旧事件。
 
-较大的文本证据以内容寻址对象保存：
+### 7.3 大型 Evidence 对象
+
+大型文本证据保存在内容寻址对象：
 
 ```text
 objects/sha256/ab/<digest>
 ```
 
-事件引用对象的：
+事件引用 SHA-256、Media Type、Size、解释和限制。Writer 在提交前校验对象内容与摘要一致；新对象与引用它的 Event 必须在同一个 Batch 中提交。
 
-- SHA-256。
-- Media Type。
-- Size。
-- 对证据的解释与限制。
+## 8. Engineering Graph
 
-Writer 必须在提交前校验对象内容与摘要一致。对象已存在且内容一致时可以直接复用。
+### 8.1 图节点
 
-“可以复用”严格限定为：该 Object Path 已经存在于当前 HEAD Tree，且 Git Blob 内容与 Digest 一致。若 Path 只存在于 Working Tree/Index 或另一个 Batch Journal 中，它仍是 Pending，新的 Batch 不得只引用而漏提该对象；首版返回可重试的 `OBJECT_PENDING`，先恢复或显式处理原 Batch。新对象与引用它的 Event 必须记录在同一个 Batch Journal，并在同一个 Git Commit 中显式暂存。两个并发 Batch 产生相同 Digest 时，后取得 Writer Lock 的一方重新检查 HEAD：前一方已提交则复用，仍 Pending 则等待/报错，绝不覆盖或盲目接管。
+Engineering Graph 是派生查询结构，节点包括：
 
-## 9. 生成期追加保护
+- ContextSpace
+- ContextItem / ContextRevision
+- Repository
+- Module
+- File
+- Symbol
+- API
+- Schema
+- Test
 
-### 9.1 唯一写入口
+边包括：
 
-CLI、MCP、Hook 最终统一调用 Rust：
+- ContextRelation：稳定知识关系。
+- ContextArtifactAssociation：派生工程关系。
+- Artifact-to-Artifact：contains、calls、implements、consumes、defines、validates。
+- Context-to-Space：当前有效 SpaceAssociation。
 
-```rust
-append_event(payload)
+### 8.2 Artifact 解析
+
+业务代码仓库只读扫描生成 `EngineeringArtifact`：
+
+```yaml
+repository_snapshot:
+artifact_id:
+kind:
+logical_name:
+current_path:
+symbol_fqn:
+api_or_schema_key:
+content_fingerprint:
+language:
 ```
 
-调用者不能指定：
+`artifact_id` 只在一个 `artifact_generation` 内标识当前解析节点，不是领域 ID，也不保证跨重建保持不变；稳定检索依赖 Reference、逻辑名称、协议 Key 和 Fingerprint 的重新匹配。
 
-- 文件路径。
-- Event ID。
-- Git Parent、Tree、Commit 或 Ref。
-- Update、Delete、Rename 操作。
+解析顺序：
 
-Writer 负责：
+1. Repository 与 API/Schema Key 精确匹配。
+2. Symbol FQN 与语言级签名匹配。
+3. 内容 Fingerprint 匹配。
+4. Logical Name、Module 和 Path Hint 组合匹配。
+5. 无法唯一解析时保留多个候选并降低置信度。
 
-1. 生成随机 Batch/Event ID 和目标路径。
-2. 在 `state/pending/<batch_id>/files/` 生成并 fsync 完整内容，执行 Schema、引用和领域不变量校验。
-3. 原子写入 `state/pending/<batch_id>/journal.json`，记录每个 Pending File、目标 Path、内容 Hash 和处理阶段。
-4. 获取全局 Writer Lock，检查已有受管文件和 Git Index。
-5. 使用 `create_new(true)` 创建目标文件。
-6. 只暂存本批次明确生成的文件。
-7. 提交前复核 Staged Diff 与 Batch Journal 完全一致，且状态全部为 A。
-8. Commit 成功后记录 Commit OID，更新 SQLite，最后完成并清理 Journal。
+文件移动或 Symbol 改名后，通过当前代码树重新扫描生成新的 Resolution；旧 Reference 保留不变。
 
-禁止使用：
+### 8.3 ContextArtifactAssociation
 
-```bash
-git add .
-git add -A
+派生关联至少包含：
+
+```yaml
+context_id:
+revision_id:
+artifact_id:
+relation:
+confidence:
+sources:
+resolution_reason:
+repository_snapshot:
 ```
 
-### 9.2 提交前检查
+`sources` 可以来自：
 
-自动提交前检查知识目录相对 HEAD 的状态：
+- Context Event 中的 EngineeringReference。
+- WorkEpisode 中的文件和 Symbol 观察。
+- 当前 Task Diff。
+- API、Schema 和调用关系传播。
+- 多个独立信号的一致匹配。
+
+关联置信度只参与召回和排序，不能改变 Context 生命周期或自动注入资格。
+
+### 8.4 图扩展边界
+
+Task Retrieval 默认只扩展一至两跳：
 
 ```text
-A  允许：新增事件或对象
-M  拒绝：已有文件被修改
-D  拒绝：已有文件被删除
-R  拒绝：已有文件被重命名
+当前 Symbol
+→ API / Schema
+→ Contract Context
+→ Validation / Decision Context
 ```
 
-检测到 M/D/R 时：
+每条返回结果必须携带完整 `retrieval_path`。无路径解释的远距离关联不得自动注入。
 
-- 停止本次产品自动提交。
-- 不自动覆盖或恢复用户文件。
-- 输出受影响路径。
-- 提示使用 `sctx context revise`、`sctx context withdraw` 等追加式命令。
+## 9. Git Store
 
-检测到不属于本批次的 Staged Path 时同样拒绝提交，防止一次自动 Commit 顺带吸收使用者的手动暂存内容。
-
-Batch Journal 是仓库外的恢复凭证，不是领域事实。恢复时不信任 Journal 的阶段字段或 Commit OID，而是先用当前 HEAD、Index、Working Tree 与 Journal 中的 Path/Blob Hash 对账：
-
-1. 所有目标 Path 已在当前 HEAD 且 Blob Hash 一致：即使 Journal 还写着 `prepared/staged`，也把 Batch 认定为已 Commit，只补 SQLite 并完成 Journal，绝不重复 Commit。
-2. HEAD 尚无目标 Path，Working Tree/Index 已与 Journal 完全一致：继续提交同一批 ID 和内容，不生成替代 Event。
-3. HEAD 和 Working Tree 尚无目标 Path，但 Journal 管理的 `files/` 内容完整且 Hash 一致：用 `create_new(true)` 恢复相同目标 Path，再按第 2 类继续。
-4. 部分已提交、Hash 不一致、Journal Payload 缺失或混入其他 Staged Path：停止自动恢复并要求显式人工处理。
-
-其他未跟踪文件只由 Doctor 报告，不能猜测其来源或自动提交。人类可以显式执行 `sctx pending commit <batch_id>` 或 `sctx pending move-aside <batch_id>`。因此即使进程在 `git commit` 已成功但返回前、或 Commit OID 写回 Journal 前崩溃，同一 Batch 也最多产生一次语义提交。
-
-### 9.3 并发与失败恢复
-
-- UUID 降低并发路径冲突概率。
-- `create_new(true)` 保证生成阶段不覆盖已有路径。
-- Writer Lock 只串行化 Git Index/Commit，不阻塞 SQLite 读取。
-- 文件创建成功、Git Commit 失败时，新文件保持 Pending；`sctx doctor` 校验并报告对应 Batch Journal，由下次 Writer 恢复或由使用者显式处理。
-- Git Commit 成功、SQLite 更新失败时，下次查询根据 Git HEAD 自动补建索引。
-- 自动提交只包含 Writer 本次生成的显式路径，不吸收仓库中的其他变化。
-
-### 9.4 本地 Git Hook
-
-Setup 可以安装可选的 Context Repo `pre-commit`：
+### 9.1 用户目录布局
 
 ```text
-pre-commit → sctx validate --staged
+~/.shared-context/
+├── config.toml
+├── bin/
+│   └── current/sctx
+├── repository/
+│   ├── .git/
+│   ├── events/
+│   ├── objects/
+│   └── schemas/
+├── state/
+│   ├── index.sqlite
+│   ├── runtime.sqlite
+│   ├── writer.lock
+│   ├── index.lock
+│   ├── runtime.lock
+│   ├── pending/
+│   └── capture/
+├── backups/
+└── logs/
 ```
 
-Hook 复用相同 Validator，用于给手动 Git 操作提供更早反馈。Hook 是 UX 保护，可以被绕过，不属于正确性的信任根。
+只有 `repository/` 是 Git 仓库。
 
-## 10. SQLite 本地投影
+- `index.sqlite`：可从 Git 和当前工程快照重建的知识及关联投影。
+- `runtime.sqlite`：Task、WorkEpisode 和 Candidate 短期状态，不是知识事实。
+- `capture/`：受 TTL 和容量限制的临时 Evidence/Observation 材料。
+- `config.toml`：Store 和 Agent 配置，不包含 Workspace-to-Space 映射。
 
-### 10.1 数据库位置与职责
+### 9.2 仓库结构
 
 ```text
-~/.shared-context/state/index.sqlite
+repository/
+├── events/
+│   └── <id-prefix>/evt_<random>.json
+├── objects/
+│   └── sha256/<hash-prefix>/<digest>
+└── schemas/
+    └── <schema-id>.json
 ```
 
-SQLite 负责：
+约束：
 
-- 解析和校验诊断。
-- 当前 Intent、Publication 和 Conflict 投影。
-- ContextSpace Intent、Scope、Kind、Status 等结构化索引。
-- FTS5 全文检索。
-- Workspace、Capture 等本地便利信息的查询缓存；其持久配置仍在 `config.toml` 或对应的用户目录文件中。
+- 每个 Event 一个文件。
+- Event 路径由 Writer 生成，调用者不能传入。
+- 路径只负责物理分片，不表达 Space、状态或事件顺序。
+- 不维护可修改的全局清单、计数器或当前状态文件。
+- Schema 使用不可变版本文件。
 
-SQLite 不负责：
+## 10. SQLite 与本地 Runtime
 
-- 保存唯一知识副本。
-- 决定事件身份。
-- 通过写数据库改变知识治理状态。
+### 10.1 index.sqlite
 
-### 10.2 核心表
+核心表：
 
 | 表 | 用途 |
 |---|---|
-| `meta` | Indexed Tree、Projection Generation 及全部实现版本 |
+| `meta` | Context Tree、Projection Generation 和实现版本 |
 | `source_file` | Git Path、Blob OID、解析状态 |
-| `space_projection` | ContextSpace 当前 Intent 投影 |
-| `intent_revision` | Intent 完整 Revision |
-| `intent_head` | 当前 Intent Head；多行表示 Intent Conflict |
+| `space_projection` | 当前 Space Intent 投影 |
+| `intent_revision` / `intent_head` | Intent Revision DAG |
+| `space_intent_fts` | 完整 Intent 全文索引 |
 | `context_item` | Context 逻辑实体 |
-| `context_revision` | Context 完整 Revision |
-| `review` | 对确定 Revision 的不可变 Review 与聚合摘要 |
-| `publication` | Publication 因果节点 |
-| `publication_head` | 当前有效 Head |
+| `context_revision` / `context_head` | Context Revision DAG |
+| `space_association` / `space_association_head` | Context 的 Space 组织关系 |
+| `lifecycle_transition` / `lifecycle_head` | Context 生命周期因果图 |
+| `context_relation` | ContextRevision 中的稳定关系 |
 | `evidence` | Evidence Snapshot 和对象引用 |
-| `scope` | 结构化适用范围 |
-| `semantic_conflict` | 已确认的跨 Context 冲突 |
-| `conflict_resolution` | Semantic Conflict Resolution DAG 与 Head |
-| `conflict` | Intent、Publication、Resolution 等派生冲突总览 |
-| `diagnostic` | 仅由当前 Tree 推导的非法事件、悬空引用、重复 ID、关系环；不存历史 Operational Warning |
-| `context_fts` | 标题、结论、理由、证据的 FTS5 索引 |
+| `scope` | Applicability 结构化索引 |
+| `semantic_conflict` / `conflict_resolution` | 语义冲突与 Resolution DAG |
+| `engineering_reference` | Git Event 中的非权威工程定位观察 |
+| `engineering_artifact` | 当前业务代码快照中的工程对象 |
+| `artifact_resolution` | EngineeringReference 的当前解析结果 |
+| `context_artifact_association` | Context 与工程对象的派生关联 |
+| `context_fts` | Statement、Rationale、Evidence、Relation 的 FTS5 索引 |
+| `diagnostic` | 可由当前输入重建的非法事件、悬空引用和关系环 |
 
-建议参数：
+### 10.2 runtime.sqlite
 
-```text
-journal_mode=WAL
-synchronous=NORMAL
-foreign_keys=ON
-busy_timeout=3000
-```
+核心表：
 
-使用 Rust bundled SQLite + FTS5，避免依赖不同 macOS 版本自带的 SQLite 特性。
+| 表 | 用途 |
+|---|---|
+| `task_session` | Agent Session 对应的 Task 状态 |
+| `task_intent_revision` | TaskIntent 演进快照 |
+| `task_signal` | Prompt、文件、Symbol、Diff、API、Schema、Test 信号 |
+| `task_space_association` | 当前多 Space 推断结果和原因 |
+| `work_episode` | 聚合后的任务过程 |
+| `agent_checkpoint` | Agent 提交的结构化工程结论 |
+| `context_candidate` | 自动生成的 Candidate 草稿 |
+| `candidate_evidence_ref` | Candidate 使用的临时 Evidence 引用 |
+| `runtime_diagnostic` | Capture、提取和解析失败诊断 |
 
-### 10.3 增量索引
+Runtime 表设置 TTL。删除 `runtime.sqlite` 只会丢失未确认 Task/Candidate，不改变 Context 知识事实。
 
-`meta` 保存 `indexed_tree_oid`、`projection_generation`、`db_schema_version`、`event_parser_version`、`reducer_version`、`conflict_detector_version`、`normalizer/tokenizer_version` 和 `search/ranking_version`。这些值仅用于投影同步与升级，不进入事件语义；任一实现版本不匹配时都必须重建对应投影。
+### 10.3 投影 Generation
 
-所有 SQLite 写入使用独立的 `state/index.lock` 串行化，不能只依赖 WAL。查询或写入后的同步流程为：
-
-1. 获取当前 HEAD Tree OID；若与 `indexed_tree_oid` 相同且实现版本一致，直接查询。
-2. 获取 `index.lock`，再次读取 HEAD、`indexed_tree_oid` 和实现版本，防止基于过期游标更新。
-3. 比较旧、新 Tree，并只通过 Git Blob 读取已提交内容，避免读取 Dirty Working Tree。
-4. 解析变化事件，利用反向引用索引计算受影响闭包；新加入的目标可能让旧悬空引用恢复，因此也要纳入依赖它的节点。
-5. 对受影响的整个 ContextSpace/ContextItem/Conflict 和同 Topic 候选集重算重复 ID、引用、环、Head、Scope Conflict 与 FTS。无法证明闭包完整时直接全量重建。
-6. 在一个 SQLite 事务中用临时表替换受影响闭包，最后更新全部版本、`projection_generation` 和 `indexed_tree_oid`。
-7. 提交后再次观察 HEAD；若写入期间 HEAD 已前进，则循环同步到新的 Tree 后再为本次请求返回结果。
-
-未提交的 Pending 文件不进入 Projection。若 Tree Diff 出现已有受管路径的 M/D/R，安全的首版实现直接对新 Tree 全量重建，并在本次同步输出“追加协议被手工绕过”的 Operational Warning。该 Warning 可以进入日志/Doctor 输出，但不写入可重建 Projection 的 `diagnostic` 表，因为仅看当前 Tree 无法证明历史 M/D/R。Indexer 仍以新的当前 Tree 为事实，重新解析被修改的 Blob、移除已删除 Path 的事件，并传播由此产生的悬空引用或冲突。产品 Writer 随后拒绝自动提交，但这不被表述为本机安全防护。对同一个当前 Tree，增量索引与全量重建必须得到相同领域 Projection；Operational Warning 不属于这一等价性断言。
-
-以下情况执行全量重建：
-
-- 首次运行。
-- SQLite `quick_check` 失败。
-- 任一 DB Schema、Parser、Reducer、Conflict Detector、Normalizer/Tokenizer 或 Search/Ranking 版本变化。
-- Indexed Tree 不可访问。
-- 用户执行 `sctx index rebuild`。
-
-重建只读取当前 Git Tree 和事件因果关系，不依赖 Git Commit 历史顺序。健康数据库优先在同一个 SQLite 文件中构建 Shadow Tables，并在持有 `index.lock` 时用单一事务切换，让已有 WAL Reader 完成旧快照后自然看到新 Generation，避免替换文件导致长驻 MCP 继续读取旧 Inode。
-
-只有 SQLite 文件已经损坏、无法开启事务时才隔离旧文件并创建新 DB。CLI/MCP 每次请求前必须比较已打开连接与 `index.sqlite` 当前文件标识/Generation；发生替换时关闭并重开连接。首版也可以直接采用“每次请求打开连接”的简单实现。
-
-一次 Query/Context Pack 请求必须在一个 SQLite 只读事务中完成：在开启事务前完成文件标识检查与必要的索引同步，随后在同一 Snapshot 中读取 `projection_generation`、`indexed_tree_oid`、Context、Conflict、Evidence 和分页结果，并把该 Generation/Tree 随响应返回。禁止用多次独立自动提交的 SELECT 拼装一个可能跨 Generation 的响应。
-
-### 10.4 中文与代码搜索
-
-首版使用结构化过滤 + FTS5。Rust 写入 FTS 前生成搜索 Token：
-
-- Unicode 归一化、大小写折叠。
-- 拆分 `snake_case`、`camelCase` 和文件样式标识符。
-- 中文生成二元词组。
-- 标题、Statement、Rationale、Evidence 分列并使用不同 BM25 权重。
-
-查询优先级：
-
-1. 当前 ContextSpace 精确匹配。
-2. Scope、Kind、状态过滤。
-3. FTS5 BM25 相关度。
-4. Evidence 完整度。
-5. `context_id ASC, revision_id ASC` 作为最终稳定 Tie-breaker。
-
-默认不让“创建时间较新”压过已经验证的知识。
-
-所有分页与 Context Pack 生成必须使用完整稳定排序键，不能依赖 SQLite RowID 或插入顺序；因此相同事件集合即使以不同顺序重建，结果顺序也一致。
-
-## 11. Capture 与 Retrieve
-
-### 11.1 Capture 分层
+查询响应同时携带：
 
 ```text
-Agent Session
-    │
-    ├── Breadcrumb / Trace
-    │      本地短期保存，不进入 Git
-    │
-    └── Candidate Context
-           结构化、自包含、写入 Git
+context_tree_oid
+projection_generation
+artifact_generation
+task_intent_revision_id
+task_signal_fingerprint
 ```
 
-Hook 可以将文件访问、测试结果等 Breadcrumb 写入：
+一次 TaskContextPack 必须在一个固定的知识投影 Snapshot 和一个固定的 TaskIntent Revision 上生成，禁止用多个自动提交查询拼装跨 Generation 结果。
+
+### 10.4 重建
+
+`index.sqlite` 重建输入分为：
+
+1. Context Git 当前 Tree：重建稳定 Projection、FTS、EngineeringReference。
+2. 当前可访问业务代码仓库：重建 EngineeringArtifact、Resolution 和 Association。
+
+业务仓库不可访问时，知识 Projection 仍必须可用；Artifact Resolution 标记为 unavailable，检索退化到 Intent、Context、Scope 和稳定 ContextRelation。
+
+## 11. Task-first Retrieval
+
+### 11.1 TaskContextRequest
+
+默认检索接口接收 Task，而不是 Space：
+
+```yaml
+task_id:
+prompt:
+intent_snapshot:
+repository_roots:
+changed_files:
+active_files:
+active_symbols:
+diff_summary:
+api_schema_hints:
+test_observations:
+platform_hints:
+domain_hints:
+token_budget:
+```
+
+`prompt` 是唯一必需的语义输入；`task_id` 由 Runtime 根据 Agent Session 创建或续接。Agent 在具备任务理解后提交结构化 `intent_snapshot`，Adapter 和 Runtime 自动补充 Repository、Diff、Artifact 和 Test 信号。调用者不提供 `space_id`。
+
+### 11.2 TaskIntent 更新
+
+更新触发点：
+
+- 第一个 Prompt：创建 TaskSession，并用 Prompt 和已有工程信号形成 Provisional TaskIntent。
+- Agent 调用 `task_context`：提交结构化 Intent Snapshot，Runtime 校验并补强工程信号。
+- 后续 Prompt：修订目标、范围和约束。
+- 访问或修改关键文件：增加 Artifact Signal。
+- Diff 变化：修订受影响范围。
+- API、Schema 或测试信号出现：增加跨模块、跨端线索。
+- PreCompact、TurnStop：固化一次 TaskIntent Revision 和 WorkEpisode Checkpoint。
+
+如果 Prompt 明显切换目标且与当前 Diff/Artifact 信号无连续性，Runtime 创建新 `task_id`；不确定时沿用当前 Task 并记录边界诊断。用户可以显式执行 `task reset`，只影响当前 Session。
+
+### 11.3 多路召回
+
+候选来源：
+
+1. EngineeringArtifact 直接关联的 Active Context。
+2. API/Schema、调用关系和 ContextRelation 扩展的 Context。
+3. TaskIntent 与 Space Intent 的结构化和 FTS 匹配。
+4. TaskIntent 与 Context Statement、Rationale、Evidence 的 FTS 匹配。
+5. Platform、Domain、Condition、Kind 的结构化匹配。
+
+候选 Space 由上述 Context 和 Intent 信号共同推断，不能先选 Space 再搜索。
+
+### 11.4 排序
+
+排序优先级：
 
 ```text
-~/.shared-context/state/capture/
+工程对象直接关联
+> API / Schema / Contract 关联
+> 稳定 ContextRelation
+> Space Intent 匹配
+> Applicability 匹配
+> Context FTS
+> Evidence 完整度
+> 稳定 ID Tie-breaker
 ```
 
-该目录设置 TTL，并在写入前进行 Secret/PII 检查。原始 Transcript 默认不进入 Git。
+创建时间、文件名、Git Commit 顺序和随机置信度不能成为最终 Tie-breaker。
 
-Agent 发现可复用且有证据的工程认知时，通过 MCP 调用 `context_propose`。Rust Writer 生成 Candidate Revision 事件。
+### 11.5 TaskContextPack
 
-### 11.2 Retrieve 流程
+返回：
 
-查询上下文由以下信息组成：
+```yaml
+task_intent:
+candidate_spaces:
+  - space_id:
+    score:
+    reasons:
+contexts:
+  - context_id:
+    revision_id:
+    primary_space_id:
+    related_space_ids:
+    statement:
+    applicability:
+    retrieval_paths:
+    match_reasons:
+    lifecycle:
+    conflicts:
+omitted:
+```
 
-- 当前业务 Workspace。
-- 本地 `WorkspaceBinding`。
-- 当前聚焦的 ContextSpace。
-- 用户 Prompt。
-- 当前或最近访问的文件名、模块 Hint。
+每条 `retrieval_path` 必须说明 Task Signal 如何连接到 Context，例如：
 
-其中 Workspace、Prompt、文件路径仅用于查询，不进入 Context 身份或 Publication 状态。
+```text
+SearchResult.tsx
+→ consumes search-v2.general_tab_visible
+→ Contract ctx_protocol
+→ constrains Decision ctx_visibility
+```
 
-检索流程：
+### 11.6 自动注入
 
-1. 使用 ContextSpace、Scope、Kind、状态缩小候选集。
-2. 使用 FTS5 排序。
-3. 展开直接相关的 Evidence、Relation 和 Conflict。
-4. 在 Token Budget 内优先返回摘要、ID、状态和匹配原因。
-5. Agent 需要完整内容时再调用 `context_get`。
+只有同时满足以下条件的 Context 可以自动注入：
 
-自动注入只包含：
+- 唯一 Active Lifecycle Head。
+- 唯一 SpaceAssociation Head。
+- 无 Revision Conflict。
+- 无未解决且阻断的语义冲突。
+- Evidence 满足最低完整度。
+- Retrieval Path 可解释且达到最小相关性阈值。
 
-- 已发布。
-- 未 Deprecated。
-- 无未解决 Governance Conflict 或已确认的语义 Conflict。
-- Evidence 满足最低要求。
+Candidate、Deprecated Context、Annotation 和原始 Capture 内容只能作为不可信参考数据，不能提升为指令。
 
-Candidate 可以显式查询，但默认不作为高权限指令自动注入。
+## 12. Low-tax Capture
 
-## 12. CLI、MCP 与 Agent Adapter
+### 12.1 WorkEpisode
 
-### 12.1 Rust 单一入口
+WorkEpisode 聚合一次 Task 中的：
 
-首版不要求常驻 Daemon。一个 Rust 二进制提供：
+- TaskIntent Revisions。
+- 检索过的 Context 及采用/忽略原因。
+- 访问和修改的 Artifact。
+- Diff 摘要。
+- API、Schema 和调用关系观察。
+- 测试、实验和验证结果。
+- Agent Checkpoint。
+- 未解决问题。
+
+原始 Transcript 和完整 Tool Output 不进入 WorkEpisode。Runtime 只保存经过 Adapter 归一化、Secret/PII 扫描和容量限制的结构化观察。
+
+### 12.2 AgentCheckpoint
+
+Agent 在 PreCompact、TurnStop 或形成重要结论时调用：
+
+```yaml
+task_id:
+claims:
+  - statement:
+    rationale:
+    applicability:
+    assumptions:
+    recheck_when:
+    evidence_refs:
+    artifact_refs:
+    related_context_ids:
+unknowns:
+```
+
+Checkpoint 表达 Agent 已形成的工程认知，不是“工具执行成功”日志。
+
+### 12.3 Candidate Builder
+
+Pipeline：
+
+```text
+WorkEpisode
+→ 聚合 Claim
+→ 组装最小充分 Evidence
+→ 检索已有 Context
+→ 判断重复、支持、修订、矛盾或新增
+→ 推断 Applicability
+→ 推断候选 Space
+→ 生成 ContextCandidate
+```
+
+Candidate Builder 必须输出：
+
+- 内容来源和 Evidence。
+- 与已有 Context 的相似或冲突关系。
+- 推荐的 Primary/Related Spaces 及原因。
+- 置信度、未知项和需要重新检查的条件。
+
+### 12.4 Candidate 确认
+
+确认接口只要求：
+
+```yaml
+candidate_id:
+confirmed_primary_space:
+  existing_space_id:              # 与 new_space_intent 二选一
+  new_space_intent:
+confirmed_related_space_ids:
+optional_edits:
+```
+
+用户不需要重新填写 Statement、Rationale、Applicability 和 Evidence。确认新 Space 时，Writer 在同一 Batch 中原子生成 Space、Context、SpaceAssociation 和 Lifecycle Events；确认失败不得留下部分领域事实。
+
+## 13. CLI、MCP 与 Agent Adapter
+
+### 13.1 CLI
 
 ```text
 sctx setup
 sctx doctor
-sctx space ...
-sctx workspace bind|list|unbind ...
-sctx context ...
-sctx search ...
-sctx index ...
-sctx pending list|commit|move-aside ...
-sctx demo ...
+sctx space create|revise|list|get
+sctx task inspect|reset
+sctx candidate list|get|confirm|discard
+sctx context get|search|revise|deprecate
+sctx association explain|rebuild
+sctx index rebuild
+sctx pending list|commit|move-aside
+sctx demo seed|run
 sctx hook --agent cursor|codex
 sctx mcp serve --client cursor|codex
 ```
 
-Git 写入通过 `writer.lock` 控制，投影写入通过 `index.lock` 控制；多个查询进程通过 SQLite WAL 并行读取。若真实性能数据证明需要常驻进程，再增加用户级 Daemon，不作为首版前置设计。
-
-### 12.2 MCP Tools
-
-Agent 首版暴露：
+### 13.2 MCP Tools
 
 | Tool | 类型 | 说明 |
 |---|---|---|
-| `context_for_task` | 读 | 根据当前任务生成 Context Pack |
-| `context_search` | 读 | 结构化条件 + 全文查询 |
-| `context_get` | 读 | 获取指定 Context 的完整内容和 Evidence |
-| `context_propose` | 写 | 生成新的 Candidate Revision |
-| `space_list` | 读 | 查找可用 ContextSpace |
+| `task_context` | 读/写本地状态 | 更新 TaskIntent 并生成多 Space TaskContextPack |
+| `task_checkpoint` | 写本地状态 | 提交结构化 Claim、Evidence Ref 和未知项 |
+| `candidate_list` | 读 | 查看当前 Task 自动生成的 Candidate |
+| `candidate_confirm` | 写知识事实 | 确认 Candidate、已有或新 Space、组织关系和初始生命周期 |
+| `context_search` | 读 | 面向诊断和显式探索的结构化搜索 |
+| `context_get` | 读 | 获取确定 Context Revision、Evidence 和关系 |
+| `space_search` | 读 | 显式查找 Space，不参与默认 Task 路由 |
 
-Space 创建、Review、Publish、Withdraw、Semantic Conflict 确认/解决首版优先由人类 CLI 完成。这个差异是产品交互选择，不是访问控制边界。
+Candidate 内容由 WorkEpisode 和 AgentCheckpoint 生成。
 
-### 12.3 Adapter 统一事件
-
-核心定义：
+### 13.3 Canonical Agent Event
 
 ```rust
 enum CanonicalAgentEvent {
@@ -780,39 +962,103 @@ enum CanonicalAgentEvent {
 }
 ```
 
-Adapter 负责：
+Canonical Context 至少携带：
 
-- 检测 Agent 是否安装。
-- 合并/卸载 Agent 配置。
-- 将 Agent Hook 输入转为统一事件。
-- 将统一 Action 转为 Agent 对应的 Hook 输出。
-- 声明当前 Agent 版本支持的能力。
+```text
+agent
+session_id
+cwd
+workspace_roots
+prompt（仅 PromptSubmit）
+tool_name / outcome / normalized_file_hints（仅 PostToolUse）
+```
 
-未来 Claude Code 只新增 Adapter 和配置生成器，不修改 Git、事件、SQLite 或 MCP 领域逻辑。
+Adapter 只翻译厂商 Payload。TaskIntent、Git Diff、代码扫描、检索和 Candidate Builder 属于共享 Runtime，不得复制进厂商 Adapter。
 
-### 12.4 Cursor
+### 13.4 动态检索策略
 
-- MCP：注册本地 stdio Server。
-- SessionStart：注入工作区级摘要和 MCP 使用说明。
-- Prompt 级精确检索：由 Agent 调用 `context_for_task`。
-- PostToolUse/Stop：记录 Breadcrumb 或提示沉淀 Candidate。
+- SessionStart：注入系统能力说明，不注入假定 Space 摘要。
+- PromptSubmit：创建/更新 TaskIntent，执行初始 Task Retrieval。
+- PostToolUse：记录结构化信号；关键 Artifact 或 Diff 变化达到阈值时增量刷新 Context Pack。
+- PreCompact：生成 Checkpoint，刷新并压缩当前最相关 Context。
+- TurnStop：固化 WorkEpisode，触发 Candidate Builder。
+- SessionEnd：清理或延长未确认 Candidate TTL。
 
-Cursor 的 Prompt Submit Hook 不作为首版精确 Context 注入依赖，避免将产品正确性绑定到 Agent Hook 的不对称能力。
+Agent Hook 不支持某事件时，通过 MCP 主动调用和 CLI 完成同一核心流程；能力差异只影响自动化程度，不改变领域模型。
 
-### 12.5 Codex
+## 14. Git Writer 与一致性
 
-- MCP：注册本地 stdio Server。
-- SessionStart：注入工作区级摘要和 MCP 使用说明。
-- UserPromptSubmit：在支持时注入 Prompt-aware Context Pack。
-- PostToolUse/PreCompact/Stop：记录 Breadcrumb、补充检索或提示沉淀 Candidate。
+### 14.1 唯一写入口
 
-Codex Hook 需要用户 Review/Trust 时，Setup 和 Doctor 必须显示 `ACTION REQUIRED`，不能绕过信任机制或冒充安装完成。
+所有知识事实写入统一调用 Rust Writer：
 
-## 13. Rust 与 NPM 分发
+```rust
+append_batch(events, objects)
+```
 
-### 13.1 Rust 模块
+调用者不能指定：
 
-建议 Rust Workspace：
+- Event 文件路径或 Event ID。
+- Git Parent、Tree、Commit 或 Ref。
+- Update、Delete、Rename 操作。
+
+Candidate Confirm 需要写入多个事件时，必须处于同一个 Batch Journal 和 Git Commit 中。
+
+### 14.2 追加保护
+
+Writer：
+
+1. 生成随机 Batch/Event ID 和目标路径。
+2. 在 `state/pending/<batch_id>/files/` 生成并 fsync 内容。
+3. 校验 Schema、引用、领域不变量和敏感信息。
+4. 原子写入 Batch Journal。
+5. 获取 Writer Lock，检查受管文件和 Git Index。
+6. 使用 `create_new(true)` 创建目标文件。
+7. 只暂存本 Batch 的明确路径。
+8. 复核 Staged Diff 全部为 A 且与 Journal 一致。
+9. Commit 后更新 Projection，最后清理 Journal。
+
+禁止 `git add .` 和 `git add -A`。
+
+### 14.3 异常恢复
+
+| 场景 | 处理 |
+|---|---|
+| Event 已准备、Commit 失败 | 保留 Pending 和 Journal；下次 Writer 按 Path/Hash 恢复同一批内容 |
+| Commit 成功、Projection 更新失败 | Git 仍为事实；下次查询补建 |
+| 部分文件已提交或 Hash 不一致 | 停止自动恢复并报告 Diagnostic |
+| 已有受管文件 M/D/R | 拒绝产品自动提交，不覆盖用户文件 |
+| SQLite 损坏 | 隔离损坏文件并重建 |
+| 多个 Revision/Association/Lifecycle Head | 显式 Conflict，不使用 Last-Write-Wins |
+| Runtime SQLite 损坏 | 重建空 Runtime；已确认 Context 不受影响 |
+
+### 14.4 索引同步
+
+`index.sqlite` 保存：
+
+- `indexed_tree_oid`
+- `projection_generation`
+- `artifact_generation`
+- DB、Parser、Reducer、Tokenizer、Association、Ranking 实现版本
+
+每次查询前同步 Context Git Tree。知识投影更新在一个 SQLite Transaction 中切换；查询在固定 Snapshot 中完成。当前业务代码仓库变化只推进 Artifact Generation，不改变 Context Projection Generation。
+
+## 15. 安全与隐私
+
+- 原始 Conversation/Transcript 默认不写入 Git 或 Runtime SQLite。
+- 原始 Tool Output 默认不保存，只保留归一化 Observation、最小 Evidence Snapshot 或摘要。
+- Capture、Checkpoint 和 Candidate 写入前执行 Secret/PII 扫描。
+- Event 和 Evidence 进入 Git 前再次扫描。
+- Context 内容按不可信数据处理，不执行其中的命令或脚本。
+- Candidate、Annotation、EngineeringReference 和检索分数不得提升为系统指令。
+- 只有满足自动注入门槛的 Active Context 可以进入 Hook Additional Context。
+- 本地业务代码扫描遵循显式 Allowlist/Denylist，并限制读取范围、文件大小和二进制类型。
+- Capture 使用 TTL、单条大小和总容量上限。
+- Git Store 位于当前用户目录，不宣称抵御当前用户主动篡改。
+
+## 16. Rust 模块与分发
+
+### 16.1 Rust Workspace
 
 ```text
 crates/
@@ -820,29 +1066,37 @@ crates/
 ├── event-schema
 ├── git-store
 ├── index
-├── search
-├── mcp
+├── task-runtime
+├── engineering-graph
+├── retrieval
+├── candidate-builder
+├── local-state
+├── agent-adapter
 ├── adapter-cursor
 ├── adapter-codex
+├── mcp
 ├── installer
 └── cli
 ```
 
-其中：
+职责：
 
-- `domain`：领域对象、因果图和不变量。
-- `event-schema`：JSON 解析、版本和校验。
-- `git-store`：追加写、显式暂存、Commit、状态检查。
-- `index`：SQLite Schema、增量同步、重建。
-- `search`：结构化过滤、FTS、Context Pack。
+- `domain`：Space、Context、Revision、Association、Lifecycle 和 Conflict 不变量。
+- `event-schema`：Event JSON 解析和校验。
+- `git-store`：不可变事件、对象、Batch 和 Git Commit。
+- `index`：知识 Projection、FTS、增量同步和重建。
+- `task-runtime`：TaskSession、TaskIntent、TaskSignal 和 WorkEpisode。
+- `engineering-graph`：Artifact 扫描、Resolution、Association 和图扩展。
+- `retrieval`：Task 多路召回、排序、解释和 Context Pack。
+- `candidate-builder`：Claim/Evidence 聚合、去重、冲突与 Space 推荐。
+- `local-state`：runtime.sqlite、Capture、TTL、隐私扫描和配置。
+- `agent-adapter`：厂商无关的 Canonical Event/Action。
+- `adapter-*`：Cursor/Codex Payload 和配置适配。
 - `mcp`：stdio MCP Server。
-- `adapter-*`：Agent Hook/config 适配。
 - `installer`：Setup、Backup、Doctor、Uninstall。
 - `cli`：统一二进制入口。
 
-调用系统 Git 时必须通过 argv 传参，不拼接 Shell 字符串；这样既可以复用 macOS Git 凭据链，也能避免命令注入。
-
-### 13.2 NPM 包
+### 16.2 NPM 分发
 
 ```text
 @company/shared-context
@@ -851,100 +1105,60 @@ crates/
 ```
 
 - 主包提供极薄的 JavaScript Launcher。
-- 两个平台包通过 `optionalDependencies`、`os`、`cpu` 选择 Mach-O。
-- 不使用 N-API；运行时协议是 CLI、Hook、MCP stdio。
-- 运行期不依赖 Node、Python、Homebrew 或远端下载。
-- 平台二进制需要签名并在包内提供校验摘要。
+- 平台包通过 `optionalDependencies`、`os`、`cpu` 选择 Mach-O。
+- 运行期协议是 CLI、Hook 和 MCP stdio，不依赖 N-API。
+- 运行期不依赖 Python、Homebrew 或远端模型服务。
+- 平台二进制签名并在包内提供摘要。
+- arm64/x64 分别提供自包含离线 Bundle。
 
-发布流水线同时为每个架构生成自包含离线 Bundle，不能假设主包 tgz 能在断网时解析 Registry 中的 `optionalDependencies`：
-
-```text
-shared-context-<version>-darwin-<arch>-offline/
-├── package.json                 # 依赖均指向下列本地 file: tgz
-├── package-lock.json
-├── packages/
-│   ├── shared-context.tgz
-│   └── shared-context-darwin-<arch>.tgz
-├── install                      # 执行 npm --offline 并启动 setup
-└── SHA256SUMS
-```
-
-Bundle 中不包含两个架构的冗余二进制；发布 CI 分别在 arm64/x64 Mac 断网环境验证。`install` 只准备本地 Runtime 并显式调用 Setup，不能绕过 `postinstall` 不修改 Agent 配置的原则。
-
-NPM `postinstall` 不修改 Cursor/Codex 配置。显式执行 `setup` 后，二进制复制到：
+Agent 配置引用：
 
 ```text
-~/.shared-context/bin/<version>/<arch>/sctx
 ~/.shared-context/bin/current/sctx
 ```
 
-Agent 配置始终引用 `bin/current/sctx`，升级只原子切换 Runtime 版本。
+升级通过原子切换 `bin/current` 完成。
 
-## 14. 安装、测试与卸载
+## 17. 安装、Demo 与 Doctor
 
-### 14.1 快速安装
+### 17.1 Setup
 
 ```bash
-npx -y @company/shared-context@<version> \
-  setup --agents cursor,codex --demo
+npx -y @company/shared-context@<version> setup --agents cursor,codex
 ```
 
 Setup：
 
-1. 检查 macOS、CPU、Git、签名、磁盘空间。
-2. 创建或复用 `~/.shared-context/`。
-3. 初始化或验证唯一 `repository/`。
-4. 不允许自动创建第二个 Context Git 仓库。
-5. 创建/重建 SQLite。
-6. 检测 Cursor/Codex。
-7. 显示配置 Diff。
-8. 备份并原子合并 Hook/MCP 配置。
-9. 交互式 Onboarding 创建首个 ContextSpace，并把选择的业务 Workspace 绑定到它；`--demo` 则在同一仓库内创建自包含样例 Space。
-10. 运行 Git、SQLite、MCP、Adapter Smoke Test；`--demo` 额外运行 Proposal、Review/Publish 和 Search 闭环。
-11. 显示需要重启或人工 Trust 的 Agent，以及可复制的 `space create`、`workspace bind`、`context propose` 和 `search` 命令。
+1. 检查 macOS、CPU、Git、签名和磁盘空间。
+2. 创建 `~/.shared-context/` 和唯一 Context Git Store。
+3. 创建或重建 `index.sqlite` 与 `runtime.sqlite`。
+4. 检测 Cursor/Codex 能力。
+5. 展示并原子合并 Hook/MCP 配置。
+6. 运行 Git、SQLite、MCP、Adapter 和 Task Runtime Smoke Test。
+7. 显示需要重启或 Trust 的 Agent。
 
-Setup 必须幂等。每次执行生成 Setup Journal；失败时恢复 Runtime 和 Agent 配置，但不删除、回滚或覆盖 Context Git 数据。
+Setup 不要求选择业务仓库或 Space。业务 Workspace 在 Agent Task 运行时自动成为 TaskSignal。
 
-Agent 配置采用“文件锁 → 解析 → 最小结构合并 → 展示 Diff → 原字节备份 → 临时文件 fsync + rename → 重新解析”的流程。Cursor JSON 保留全部未知字段；Codex TOML 使用保留注释/格式的编辑器。安装 Manifest 记录本产品新增条目的稳定标识和 Hash；卸载只移除仍与记录一致的条目，安装后被使用者修改或新增的配置保留并告警。
-
-非交互测试机可以使用：
-
-```bash
-sctx setup --config ./setup.toml --yes --demo
-```
-
-`--demo` 的成功标准不是空库查询，而是完成 `space create → workspace bind → propose → publish → search` 的本地闭环。
-
-### 14.2 离线安装
-
-```bash
-tar -xzf shared-context-<version>-darwin-<arch>-offline.tar.gz
-./shared-context-<version>-darwin-<arch>-offline/install \
-  setup --agents cursor,codex --demo
-```
-
-离线 Bundle 同时携带主包和当前架构平台包，并使用本地 `file:` 依赖与 npm Offline Mode 安装。Bundle 取得后，Setup、Append、Index、Search、MCP、重建和卸载均不产生网络请求。
-
-### 14.3 Demo
+### 17.2 Demo
 
 ```bash
 sctx demo seed
 sctx demo run
 ```
 
-Demo 在唯一 Git 仓库中创建一个逻辑 `demo` ContextSpace，不创建第二个 Git 仓库。它用于验证：
+Demo 验证：
 
-- Space/Intent 创建。
-- Candidate 提交。
-- Review/Publish。
-- CLI/FTS 查询。
-- MCP Initialize/List Tools/Search/Propose。
-- Cursor/Codex Hook Adapter Fixture。
-- SQLite 删除和重建。
+1. 创建多个具有不同 Intent 的 Space。
+2. 创建跨 Space 的 Contract、Decision 和 Validation Context。
+3. 在不传 Space ID 的情况下提交一个 FE Task。
+4. 根据 Prompt、文件、Symbol 和 API 信号推断多个 Space。
+5. 返回带 Retrieval Path 的 TaskContextPack。
+6. 记录 Checkpoint 和测试观察。
+7. 自动生成未归属 Candidate。
+8. 确认 Candidate 并生成 Context、SpaceAssociation 和 Lifecycle Events。
+9. 删除并重建 SQLite 后得到相同知识 Projection，并重新解析工程关联。
 
-Demo Space 不再需要时可以通过本地 `config.toml` 的显示偏好隐藏；这只是界面偏好，不改变 Git 中的领域状态，也不删除历史事件。
-
-### 14.4 Doctor
+### 17.3 Doctor
 
 ```bash
 sctx doctor
@@ -953,177 +1167,146 @@ sctx doctor --json
 
 检查：
 
-- `~/.shared-context/` 目录和权限。
-- 唯一 Git 仓库及 `git fsck`。
-- 已有文件 M/D/R 和 Pending A。
-- Event Schema 和因果图诊断。
-- SQLite `quick_check`、Indexed Tree、FTS。
-- Cursor/Codex 配置语法和目标路径。
-- MCP Initialize/List Tools。
-- Hook Trust 或需要人工处理的步骤。
+- Context Git Store 和 `git fsck`。
+- 已有受管文件 M/D/R 和 Pending Batch。
+- Event Schema、Revision、Association、Lifecycle 和 Conflict DAG。
+- `index.sqlite`、`runtime.sqlite`、Generation 和 FTS。
+- EngineeringReference 解析率和过期关联。
+- Cursor/Codex 配置、MCP 和 Hook 能力。
+- Capture TTL、容量和隐私扫描状态。
 
-`doctor --fix` 只进行安全且可逆的修复，例如重建 SQLite、恢复缺失注册。它不能 Commit Pending Batch，也不能自动恢复或覆盖使用者手动修改的 Git 文件；Pending 只能由下一次 Writer 按 Journal 恢复，或由使用者显式执行 `sctx pending ...`。
+`doctor --fix` 只执行安全、可重建的修复，例如重建 SQLite 和工程关联；不得自动改写 Git 事实或确认 Candidate。
 
-### 14.5 卸载
+### 17.4 Uninstall
 
-```bash
-sctx uninstall
-```
+默认移除：
 
-默认行为：
+- 自己可精确识别的 Agent 配置条目。
+- Runtime、日志、Capture 和可重建 SQLite。
 
-- 移除自己仍能精确识别的 Cursor/Codex 配置条目。
-- 恢复安装前的配置备份或保留用户后续修改并告警。
-- 移除 Runtime、日志和可重建缓存。
-- 保留唯一 Context Git 仓库。
+默认保留 Context Git Store。删除知识数据使用独立命令，并展示绝对路径和二次确认。
 
-删除知识数据必须使用单独的显式命令，并展示绝对路径和二次确认，不作为普通卸载的一部分。
+## 18. 实施阶段
 
-## 15. 一致性、异常与恢复
+### 阶段一：目标领域与存储基础
 
-| 场景 | 处理 |
-|---|---|
-| Event 已创建、Commit 失败 | 保留 Pending A 与 Batch Journal；下次 Writer 可按 Hash 恢复，Doctor 只报告，手工操作需显式命令 |
-| Commit 成功、SQLite 更新失败 | Git 仍为事实；下次查询增量补建或全量重建 |
-| SQLite 损坏 | 持有 `index.lock` 隔离旧 DB，从当前 Git Tree 重建；各进程检测文件标识/Generation 后重开连接 |
-| 手动修改/删除/重命名已有事件 | 自动提交拒绝；Doctor 报告，不自动覆盖 |
-| 重复 Event/Revision 等唯一 ID | 所有碰撞定义进入 Diagnostic，不按扫描顺序保留任何一个 |
-| 悬空引用或因果环 | 相关事件 Quarantine，不猜测状态 |
-| 多个 Publication Head | 显式 Governance Conflict，不采用 Last-Write-Wins |
-| Agent 配置写入失败 | 根据 Setup Journal 恢复原字节与权限 |
-| 新 Agent 版本能力未知 | 降级为 MCP + CLI，禁用未验证 Hook 能力 |
+- 实现新的 Event Schema。
+- 实现 Context 与 Space 解耦的身份模型。
+- 实现 Intent、Revision、SpaceAssociation、Lifecycle 和 Conflict DAG。
+- 实现 Git Writer、Batch Journal 和确定性 Reducer。
+- 实现新的 `index.sqlite` Schema 和重建。
 
-## 16. 安全与隐私边界
+### 阶段二：Task Runtime 与多 Space Retrieval
 
-- 原始 Conversation/Transcript 默认不进入 Git。
-- Capture 数据设置 TTL，并执行 Secret/PII 检查。
-- Event 和 Evidence 写入 Git 前再次执行敏感信息扫描。
-- Context 内容按不可信数据处理，不执行其中的命令或脚本。
-- 只有已发布、未冲突的 Context 可以自动注入。
-- Candidate、Annotation、外部 Hint 不得提升为系统指令。
-- Git 仓库位于当前用户目录，不宣称抵御当前用户主动篡改。
-- 首版只有一个知识仓库，因此不提供文件级或 ContextSpace 级读取隔离。
+- 实现 `runtime.sqlite`。
+- 实现 TaskSession、TaskIntent Revision 和 TaskSignal。
+- 实现完整 Space Intent FTS。
+- 实现 Task 多路召回、排序、解释和 Token Budget。
+- 实现 `task_context` MCP 与 Session 隔离。
 
-## 17. 实施阶段
+### 阶段三：Engineering Graph
 
-### 阶段一：领域与 Git 基础
+- 实现业务 Repository 只读扫描。
+- 实现 File、Symbol、API、Schema 和 Test Artifact。
+- 实现 EngineeringReference、Resolution 和 ContextArtifactAssociation。
+- 实现文件移动、Symbol 改名后的关联重建。
+- 实现一至两跳关系扩展与 `association explain`。
 
-- Event Schema 与兼容策略。
-- ContextSpace、Intent、ContextRevision、Publication 因果图。
-- 单仓库初始化。
-- Append Writer、显式暂存和生成期保护。
-- Validator 与 Fixture。
+### 阶段四：Low-tax Capture
 
-### 阶段二：SQLite 与查询
+- 实现 WorkEpisode 和 AgentCheckpoint。
+- 实现 Evidence 聚合和最小充分 Snapshot。
+- 实现 Candidate Builder、去重、冲突和 Space 推荐。
+- 实现 Candidate List/Confirm/Discard。
+- 在 PreCompact、TurnStop 和关键结论时自动触发 Capture Pipeline。
 
-- SQLite Schema。
-- Tree-based 增量索引与全量重建。
-- 中文/代码分词。
-- 结构化过滤、FTS 和 Context Pack。
-- Conflict/Diagnostic 投影。
+### 阶段五：Agent 与分发
 
-### 阶段三：CLI 与 MCP
+- 实现 Cursor/Codex Adapter。
+- 实现动态 Hook Retrieval 与 MCP Fallback。
+- 实现 NPM arm64/x64 包和离线 Bundle。
+- 完成 Setup、Doctor、Uninstall、Demo 和端到端测试。
 
-- Space、Context、Review/Publish CLI。
-- MCP Search/Get/Propose。
-- WorkspaceBinding。
-- Capture TTL 和敏感信息检查。
+## 19. 验收标准
 
-### 阶段四：Agent 与分发
+### 19.1 Task-first Retrieval
 
-- Cursor Adapter。
-- Codex Adapter。
-- NPM arm64/x64 平台包。
-- Setup、Doctor、Upgrade、Uninstall。
-- Demo 和端到端测试。
+1. 没有任何 Workspace-to-Space 配置，Task 仍可完成检索。
+2. Task 请求不包含 Space ID，系统仍能返回零个、一个或多个 Space 候选。
+3. 同一仓库中两个 Agent Session 同时执行不同 Task，TaskIntent、Space 候选和 Candidate 互不覆盖。
+4. 一个 FE Task 可以同时召回页面需求、服务端协议、兼容策略和埋点口径等多个 Space 的 Context。
+5. 每个自动注入 Context 都包含至少一条可解释 Retrieval Path。
+6. 关键文件、Symbol、Diff 或测试信号变化后，Context Pack 可以增量更新。
+7. Candidate、Deprecated、冲突或 Evidence 不充分的 Context 不得自动注入。
 
-## 18. 首版验收标准
+### 19.2 Engineering Graph
 
-### 18.1 安装与环境
+1. 打开一个已关联 Symbol 时，可以查询其相关 Requirement Intent、Decision、Contract 和 Validation。
+2. 文件移动后，Path Hint 失效但 Fingerprint/Symbol/API 信号可以恢复关联。
+3. Symbol 改名时，系统保留旧 Reference，并生成可解释的新 Resolution。
+4. FE 消费 API 字段的代码可以通过 API/Schema 节点召回其他平台的 Contract 或 Validation。
+5. 业务代码仓库不可访问时，Context 内容和 FTS 检索仍可使用。
+6. 删除关联投影后，可以从 Git EngineeringReference 和当前代码树重建。
 
-1. 干净 arm64/x64 Mac 从 NPM 或对应架构离线 Bundle 执行 `setup --demo`，到完成首个 Space/Workspace Binding/Publish/Search 闭环不超过 3 分钟。
-2. 全流程不需要 sudo、远端 Git、外部账号或 API Key。
-3. arm64/x64 的离线 Bundle 分别在断网环境完成 Setup、Append、Index、CLI/MCP 查询、重建和卸载；安装过程不访问 Registry。
+### 19.3 Low-tax Capture
+
+1. Agent 完成一次包含代码探索、修改和测试的 Task 后，系统自动生成 ContextCandidate。
+2. Candidate 自动包含 Statement、Rationale、Applicability、Evidence、RecheckWhen 和 Space 推荐。
+3. 用户确认 Candidate 时不需要重新填写完整结构化内容。
+4. Candidate 可以在没有确定 Space 时保存和展示。
+5. Candidate Confirm 在一个 Batch 中原子生成已有/新 Space 所需事件、Context、SpaceAssociation 和 Lifecycle Events。
+6. Candidate 与已有 Context 重复或矛盾时，确认前必须展示关系和证据。
+7. 原始 Transcript 和 Tool Output 不进入 Git。
+
+### 19.4 Git 与 Projection
+
+1. 所有产品写接口只创建新事件或对象。
+2. 调用者不能指定 Event 路径或覆盖已有 ID。
+3. 100 个并发 Candidate Confirm 生成互不覆盖的事件文件。
+4. 禁用 Git Hook 后，Writer 仍不覆盖已有受管文件。
+5. Event 发现顺序不同，Reducer 输出完全一致。
+6. 多个 Revision、Association 或 Lifecycle Head 必须显式投影为 Conflict。
+7. 删除或损坏 `index.sqlite` 后，可以从当前 Git Tree 重建相同知识 Projection。
+8. 每个 TaskContextPack 的 Context、Evidence、Conflict 和 Generation 来自同一查询 Snapshot。
+9. 10 万条 Context Revision 下，纯知识 Warm Query P95 小于 100ms；包含已缓存 Engineering Graph 的 Warm Task Retrieval P95 小于 300ms。
+
+### 19.5 Agent 与安装
+
+1. Cursor、Codex 均完成 MCP Initialize、List Tools、TaskContext、Checkpoint、Candidate List/Confirm 和 Context Get。
+2. Adapter 使用真实 Hook Payload Fixture 通过契约测试。
+3. Hook 不可用时，MCP 和 CLI 仍能完成 Task Retrieval 与 Candidate 流程。
 4. Setup 连续执行三次不产生重复配置。
-5. 路径包含空格和中文时可以正常工作。
-6. 一次安装内只能存在一个 Context Git 仓库；Setup 和 Demo 不创建第二个仓库。
-7. 对带未知字段、TOML 注释和既有 Cursor/Codex 条目的配置，在每个写入阶段注入失败后均恢复原字节；正常安装/卸载不丢失安装后新增或修改的用户配置。
-
-### 18.2 Git 与事件
-
-1. CLI/MCP 所有写接口只生成新事件或新证据对象。
-2. 调用者不能通过产品 API 指定路径或覆盖已有 Event ID。
-3. 100 个并发 Proposal 生成 100 个不同的新事件文件。
-4. 自动提交只暂存本批次生成的显式路径。
-5. 已有事件出现 M/D/R 时自动提交拒绝，并输出可执行的修订提示。
-6. 禁用 Git Hook 后，产品生成和自动提交路径仍不覆盖已有文件。
-7. Revision、Withdraw、Semantic Conflict 确认与解决全部通过新事件完成。
-8. Crash 后只有带有效 Batch Journal 且 Path/Hash 匹配的 Pending 文件能自动恢复；来源不明的新增文件不会被 Doctor 自动提交。
-9. 在 `create_new`、`git add`、`git commit` 返回前/后、Commit OID 写回 Journal、SQLite 更新和 Journal Cleanup 各边界注入崩溃；恢复后同一 Batch 的 Event ID/内容不变，最多一次语义提交，HEAD 与索引最终一致。
-
-### 18.3 领域稳定性
-
-1. 删除原业务 Workspace、开发 Branch 和开发 Commit 后，Context/Evidence 仍可独立阅读。
-2. 对“保留 annotations/origin_hint”与“构造时剥离这些字段”的等价 Event Fixture 分别归约，Projection 结果保持一致；测试不修改已经写入的历史文件。
-3. 事件发现顺序不同，Publication Head 和 Conflict 归约结果保持一致。
-4. 并发 Publication 形成多个 Head 时必须显式报 Conflict。
-5. 不允许通过时间、Git Commit 顺序或文件名隐式解决冲突。
-6. 两条适用范围重叠的 Accepted Decision 被确认矛盾后，默认注入同时阻断，查询同时返回冲突双方。
-
-### 18.4 SQLite 与查询
-
-1. 删除或损坏 SQLite 后，可以从当前 Git Tree 确定性重建。
-2. 重建后的 Space、Accepted Context、Conflict 和排序 Fixture 一致。
-3. 10 万条测试事件下，Warm Search P95 小于 100ms；验收报告必须固定查询集并记录 Mac 型号、CPU、内存、macOS 与文件系统信息。
-4. 查询响应包含 Indexed Tree、Projection 状态、匹配原因和 Conflict 标记。
-5. 对任意追加序列，以及测试中手工提交的 M/D/R，增量数据库与针对同一 Tree 的 Scratch Rebuild 在有效状态、仅由当前 Tree 推导的校验 Diagnostic、FTS 文档和稳定排序上完全一致；依赖旧新 Tree Diff 的 Operational Warning 明确排除。
-6. 并发运行 Query、Index、Rebuild 和 Git Append，最终 `indexed_tree_oid` 与 HEAD Tree 一致，游标不倒退，长驻 MCP 不继续返回已替换旧 DB 的 Projection。
-7. 每个多页 Search/Context Pack 响应中的 Tree、Generation、Context、Conflict 与 Evidence 来自同一 SQLite Read Transaction。
-
-### 18.5 Agent 与配置
-
-1. Cursor、Codex 均完成 MCP Initialize、List Tools、Search、Get、Propose。
-2. Cursor/Codex Adapter 对真实 Hook Payload Fixture 通过契约测试。
-3. Agent Hook 不可用时，CLI 和 MCP 仍能完成核心流程。
-4. Codex Hook 未 Trust 时明确显示 `ACTION REQUIRED`，不能冒充成功。
-5. 卸载后恢复原 Agent 配置，唯一 Context Git 仓库仍保留。
-
-## 19. 后续演进
-
-首版完成后可在不改变领域模型的前提下增加：
-
-- 为唯一 Git 仓库配置一个远端，增加团队同步和远端追加校验。
-- Claude Code Adapter。
-- External System Alias，但外部 ID 仍不能成为领域主键。
-- Embedding 表和混合检索；向量仍然只是派生索引。
-- Review/Conflict 可视化界面。
-- 更细粒度的团队治理策略。
-- 基于真实数据评估是否需要常驻用户级 Daemon。
+5. 路径包含空格和中文时，Task、Artifact 扫描、Git 和 SQLite 流程正常。
+6. 卸载后恢复 Agent 配置并保留 Context Git Store。
 
 ## 20. 核心不变量
 
-1. 一次安装只有一个 ContextStore 和一个 Git 仓库。
-2. ContextSpace 是内部 Requirement 容器，不依赖外部需求系统。
-3. Git 当前 Tree 中的事件与证据是事实源。
-4. SQLite、Capture、WorkspaceBinding 和 Agent 配置都不是事实源。
-5. 所有领域实体使用内部随机稳定 ID。
-6. Revision 保存完整快照，不保存文本 Patch。
-7. Evidence 必须自包含，开发现场引用只能作为 Hint。
-8. Git Commit、时间、文件路径和 Agent Session 不参与状态归约。
-9. Publication 只按显式因果关系归约，并发 Head 必须暴露为冲突。
-10. 产品写入路径只创建新文件，修订与治理都通过新事件完成。
-11. 产品自动提交不得吸收或覆盖仓库中已有文件的变化。
-12. 删除 SQLite 后必须能够从 Git 确定性重建。
-13. 相同 Git Tree 和相同实现版本必须得到相同 Projection 与稳定查询顺序。
-14. Append-only 是生成期协作约束，不是操作系统权限或本机防篡改边界。
+1. ContextSpace 是 Requirement Intent 与 Context 组织容器，不是检索前置条件。
+2. Workspace 只提供 TaskSignal，不能决定 Space。
+3. Task 与 Space 是动态多对多关联，不存在全局 Active Space。
+4. ContextCandidate 可以没有 Space，确认后再形成显式 SpaceAssociation。
+5. ContextItem 的身份独立于 Space；归属修正不改变 Context ID。
+6. Git Event 和 Evidence Object 是稳定 Context 事实源。
+7. TaskIntent、WorkEpisode、Candidate、置信度和当前代码解析结果不是知识事实。
+8. Revision 保存完整快照，不保存文本 Patch。
+9. Evidence 必须自包含；路径、Symbol 和 Commit 只能作为 EngineeringReference。
+10. EngineeringReference 可以失效，ContextArtifactAssociation 必须可重建。
+11. 文件路径、Git Commit、时间和 Agent Session 不参与领域身份或生命周期归约。
+12. Revision、SpaceAssociation、Lifecycle 和 Conflict 只按显式因果关系归约。
+13. 多个 Head 必须暴露为冲突，禁止 Last-Write-Wins。
+14. 关联置信度只能影响检索，不能提升 Context 生命周期或自动注入资格。
+15. Candidate、Annotation 和 Capture 内容不得作为高权限指令注入。
+16. 产品写入路径只创建新文件，自动提交不得吸收或覆盖其他变化。
+17. 相同 Context Git Tree 和实现版本必须得到相同知识 Projection 与稳定查询顺序。
 
-## 21. Agent 接入参考与版本策略
+## 21. Agent 版本策略
 
-以下能力已按 2026-08-18 的官方文档核对：
+Cursor、Codex 等厂商 Hook 和 MCP Payload 属于易变适配能力，不属于领域不变量。
 
-- [Codex MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)：支持本地 stdio Server，配置位于 `~/.codex/config.toml`，并提供 `codex mcp add/list`。
-- [Codex Hooks](https://learn.chatgpt.com/docs/hooks)：支持 `SessionStart`、`UserPromptSubmit`、`PreCompact`、`PostToolUse`、`Stop` 等事件；`UserPromptSubmit` 可返回 `additionalContext`；非 Managed Command Hook 需要使用者 Review/Trust。
-- [Cursor MCP](https://docs.cursor.com/context/model-context-protocol)：支持 stdio MCP，并支持用户级 `~/.cursor/mcp.json`。
-- [Cursor Hooks](https://cursor.com/docs/hooks)：支持 `sessionStart`、`beforeSubmitPrompt`、`preCompact`、`postToolUse`、`stop` 等事件；`sessionStart` 可返回 `additional_context`。
+每个 Adapter 必须：
 
-这些是易变的厂商适配能力，不属于领域核心不变量。每个 Adapter 必须声明已验证的 Agent 版本范围，使用真实 Payload Fixture 做契约测试；遇到未知版本或能力不匹配时降级为 MCP + CLI，并由 `doctor` 给出明确诊断。
+- 声明已验证的 Agent 版本范围。
+- 使用真实 Payload Fixture 做契约测试。
+- 对未知字段严格区分可忽略扩展与协议破坏。
+- 在能力不可用或 Trust 未确认时降级为 MCP + CLI。
+- 不因厂商 Hook 缺失而改变 Task、Context、Space 或 Candidate 领域模型。
