@@ -12,6 +12,7 @@ sctx-event-schema.workspace = true
 sctx-git-store.workspace = true
 sctx-index.workspace = true
 sctx-search.workspace = true
+sctx-task-runtime.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

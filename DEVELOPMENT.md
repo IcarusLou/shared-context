@@ -2,18 +2,18 @@
 
 ## 当前实现边界
 
-仓库当前完成的是 **M1：Task-first 领域与入口基础**：
+仓库已完成 **M1：Task-first 领域与入口基础**，并正在实现 M2：
 
 - `TaskIntent` 不包含 Space 路由；Task 与 Space 的相关性由独立的 `TaskSpaceAssociation` 表达，并允许 `0..N` 个结果。
 - 不存在 Workspace-to-Space 绑定类型、全局 Active Space、对应配置或绑定命令。
-- 显式 `context_search` 可以用 `space_ids` 做硬过滤；`context_for_task` 不接受 Space 路由，Search 排序也没有 Space 偏好分支。
+- 显式 `context_search` 可以用 `space_ids` 做硬过滤；`task_context` 只接受 Session、Intent 和 TaskSignals，不接受 Space/Workspace 路由。
 - `WorkEpisode` 和无 Space 的 `ContextCandidate` 领域类型已经存在。
 - `candidate_create` 是当前 Candidate 写入主入口；CLI 与 MCP 都生成服务端 ID，且未确认 Candidate 不参与自动注入。
 - 既有 Git Writer、事件校验、SQLite 投影、Context 生命周期、CLI/MCP、Agent Adapter、安装器和 NPM 分发能力继续作为 M1 的基础设施。
 
 以下能力**尚未实现**，不得在代码、测试报告或评审中宣称已经具备：
 
-- **M2：未实现** — TaskSession/runtime.sqlite、TaskIntent revision、动态 Task Signal、多 Space 推断、Space Intent 检索和可解释 TaskContextPack。
+- **M2：部分实现** — TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 检索、多 Space 推断、可解释 TaskContextPack 及 `task_context` 已实现；Agent Hook 的动态 Session/TaskSignal 接入和阶段总验收尚未完成。
 - **M3：未实现** — Engineering Graph、Repository/File/Symbol/API/Schema/Test 关联、重新解析与关系扩展。
 - **M4：未实现** — WorkEpisode 自动聚合、AgentCheckpoint、Candidate Builder、去重/冲突/Space 推荐和 Candidate confirm/list/discard。
 
@@ -48,7 +48,7 @@ cargo test --locked -p sctx-mcp --test mcp_contract
 | 层级 | Crate | 允许的 workspace 依赖 |
 |---:|---|---|
 | 0 | `domain` | 无 |
-| 1 | `local-state`, `event-schema` | `domain` |
+| 1 | `local-state`, `event-schema`, `task-runtime` | `domain` |
 | 2 | `git-store` | `domain`, `event-schema`, `local-state` |
 | 3 | `index` | `domain`, `event-schema`, `git-store` |
 | 4 | `search` | `domain`, `index` |

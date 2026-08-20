@@ -15,11 +15,11 @@ This report does **not** claim M2, M3, or M4:
 | Milestone | Status | Boundary |
 |---|---|---|
 | M1 — Task-first primitives and unassigned Candidate entry | IMPLEMENTED | Covered below |
-| M2 — Task Runtime and multi-Space retrieval | NOT IMPLEMENTED | No TaskSession persistence, dynamic association engine, Space Intent retrieval, or association-bearing TaskContextPack |
+| M2 — Task Runtime and multi-Space retrieval | IN PROGRESS | TaskSession persistence, association inference, TaskContextPack, and the explicit `task_context` entry exist; dynamic Agent Hook integration and the M2 milestone gate remain |
 | M3 — Engineering Graph | NOT IMPLEMENTED | No Artifact scanner, Context-to-code association, resolution rebuild, or graph expansion |
 | M4 — Low-tax Capture | NOT IMPLEMENTED | No automatic WorkEpisode aggregation, Candidate Builder, Space recommendation, deduplication, or confirmation workflow |
 
-The current `context_for_task` tool is a route-free task-text Context Pack over the existing knowledge search. It is not the M2 dynamic Task Runtime. The current `candidate_create` tool is a manual, unassigned M1 seam. It is not the M4 automatic Capture pipeline.
+The current `task_context` tool uses the local Task Runtime and explainable multi-Space retrieval without caller routing. The current `candidate_create` tool remains a manual, unassigned M1 seam; it is not the M4 automatic Capture pipeline.
 
 ## M1 acceptance matrix
 
@@ -29,7 +29,7 @@ The current `context_for_task` tool is a route-free task-text Context Pack over 
 | One Task accepts zero or multiple Space associations | PROVEN | `TaskSpaceAssociation::validate_collection` domain contract and the cross-crate milestone test |
 | Search request has no preferred-Space ranking input | PROVEN | `SearchRequest` contract; Search cursor/ranking contains only BM25, Evidence completeness, and stable IDs |
 | Explicit exploration can still hard-filter by Space | PROVEN | MCP contract sends `context_search.space_ids`; `SearchFilters.space_ids` is applied in SQL before ranking |
-| `context_for_task` cannot be routed to a Space by the caller | PROVEN | MCP schema omits Space fields and `context_for_task_rejects_a_caller_supplied_space_route` verifies strict rejection |
+| `task_context` owns Task identity and cannot be routed to a Space or Workspace by the caller | PROVEN | MCP schema omits Task/route identity fields and `task_context_rejects_caller_owned_identity_and_space_or_workspace_routes` verifies strict rejection |
 | Workspace cannot select or persist a Space | PROVEN | `config.toml` contains only `version` and `store`; CLI has no binding command for a Workspace; milestone test verifies both |
 | Candidate creation requires no Space | PROVEN | CLI and MCP `candidate_create` contracts reject Space fields and return an unassigned Candidate ID |
 | `candidate_create` is the Agent-facing Candidate main path | PROVEN | CLI help, MCP tool list, CLI milestone test, and MCP client fixtures |

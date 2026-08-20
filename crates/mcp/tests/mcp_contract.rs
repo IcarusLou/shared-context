@@ -8,11 +8,15 @@ use std::{
 use sctx_domain::{
     Applicability, ContextId, ContextKind, ContextRevisionDraft, EvidenceSnapshotDraft,
     EvidenceType, IntentSnapshot, PublicationAction, PublicationDraft, RevisionId, SpaceId,
-    WorkEpisodeId,
+    TaskSignal, TaskSignalKind, WorkEpisodeId,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
-use sctx_mcp::{ClientKind, DisconnectReason, McpServer, TransportErrorKind};
+use sctx_mcp::{
+    ClientKind, DisconnectReason, McpServer, TaskContextInput, TransportErrorKind,
+    task_context_at_root,
+};
+use sctx_task_runtime::TaskRuntime;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -128,6 +132,20 @@ fn candidate_arguments(source_episode_id: WorkEpisodeId, statement: &str) -> Val
             "interpretation": "the candidate was appended",
             "limitations": []
         }]
+    })
+}
+
+fn task_arguments(agent_kind: &str, external_session_id: &str, goal: &str) -> Value {
+    json!({
+        "agent_kind": agent_kind,
+        "external_session_id": external_session_id,
+        "goal": goal,
+        "desired_change": "Retrieve deterministic MCP Context",
+        "in_scope": ["MCP"],
+        "domains": ["mcp"],
+        "acceptance_conditions": ["The relevant published Context is returned"],
+        "task_signals": [{"kind": "prompt", "content": goal}],
+        "token_budget": 2000
     })
 }
 
@@ -265,8 +283,15 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
             ),
             tool_call(
                 5,
-                "context_for_task",
-                json!({"task": "verify stdio MCP contract"}),
+                "task_context",
+                task_arguments(
+                    match client {
+                        ClientKind::Cursor => "cursor",
+                        ClientKind::Codex => "codex",
+                    },
+                    "stdio-contract",
+                    "verify stdio MCP contract",
+                ),
             ),
             tool_call(
                 6,
@@ -288,7 +313,7 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
         assert_eq!(
             names,
             [
-                "context_for_task",
+                "task_context",
                 "context_search",
                 "context_get",
                 "candidate_create",
@@ -316,9 +341,24 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
         assert!(!schema_text.contains("space"));
         let task_schema = &tools
             .iter()
-            .find(|tool| tool["name"] == "context_for_task")
+            .find(|tool| tool["name"] == "task_context")
             .unwrap()["inputSchema"];
-        assert!(task_schema["properties"].get("task").is_some());
+        for required in [
+            "agent_kind",
+            "external_session_id",
+            "goal",
+            "desired_change",
+        ] {
+            assert!(
+                task_schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|field| field == required)
+            );
+        }
+        assert!(task_schema["properties"].get("task_signals").is_some());
+        assert!(task_schema["properties"].get("task_id").is_none());
         assert!(
             task_schema["properties"]
                 .as_object()
@@ -349,11 +389,6 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
 
         for response in &responses[2..] {
             assert_eq!(response["result"]["isError"], false, "{response:#}");
-            let data = &response["result"]["structuredContent"];
-            assert!(data["indexed_tree_oid"].as_str().is_some());
-            assert!(data["projection_generation"].as_u64().is_some());
-            assert!(!data["conflicts"].is_null());
-            assert!(!data["match_reason"].is_null());
         }
         let search = &responses[2]["result"]["structuredContent"];
         assert_eq!(
@@ -364,7 +399,15 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
         let get = &responses[3]["result"]["structuredContent"];
         assert_eq!(get["context_id"], fixture.context_id.to_string());
         let pack = &responses[4]["result"]["structuredContent"];
-        assert_eq!(pack["mode"], "automatic_injection");
+        assert!(pack["task_session_id"].as_str().is_some());
+        assert!(pack["task_id"].as_str().is_some());
+        assert!(pack["intent_revision_id"].as_str().is_some());
+        assert!(pack["candidate_spaces"].as_array().is_some());
+        assert!(pack["items"].as_array().is_some());
+        assert!(pack["retrieval_paths"].as_array().is_some());
+        assert_eq!(pack["task_fingerprint"].as_str().unwrap().len(), 64);
+        assert!(pack["tree"].as_str().is_some());
+        assert!(pack["generation"].as_u64().is_some());
         let candidate = &responses[5]["result"]["structuredContent"];
         assert_eq!(candidate["status"], "candidate");
         assert_eq!(
@@ -380,17 +423,233 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
 }
 
 #[test]
-fn context_for_task_rejects_a_caller_supplied_space_route() {
+fn task_context_rejects_caller_owned_identity_and_space_or_workspace_routes() {
     let fixture = Fixture::new();
+    for forbidden in [
+        json!({"space_id": fixture.space_id}),
+        json!({"space_ids": [fixture.space_id]}),
+        json!({"workspace": "/work/must-not-route"}),
+        json!({"task_id": "tsk_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}),
+    ] {
+        let mut arguments = task_arguments("codex", "route-rejection", "find task context");
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(forbidden.as_object().unwrap().clone());
+        let responses = run_session(
+            &mut fixture.server(ClientKind::Codex),
+            FixtureFraming::Newline,
+            &[
+                request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+                tool_call(2, "task_context", arguments),
+            ],
+        );
+
+        assert_eq!(responses[1]["result"]["isError"], true);
+        assert_eq!(
+            responses[1]["result"]["structuredContent"]["error"]["code"],
+            "invalid_input"
+        );
+    }
+}
+
+#[test]
+fn task_context_evolves_one_session_without_duplicate_intent_revisions() {
+    let fixture = Fixture::new();
+    let first = task_arguments("codex", "evolving-session", "verify MCP context");
+    let mut same_intent_new_signal = first.clone();
+    same_intent_new_signal["task_signals"] = json!([
+        {"kind": "prompt", "content": "verify MCP context"},
+        {"kind": "file", "content": "src/mcp.rs"}
+    ]);
+    let changed = task_arguments("codex", "evolving-session", "refine MCP context");
     let responses = run_session(
         &mut fixture.server(ClientKind::Codex),
         FixtureFraming::Newline,
         &[
             request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(2, "task_context", first),
+            tool_call(3, "task_context", same_intent_new_signal),
+            tool_call(4, "task_context", changed.clone()),
+            tool_call(5, "task_context", changed),
+        ],
+    );
+    let packs = responses[1..]
+        .iter()
+        .map(|response| &response["result"]["structuredContent"])
+        .collect::<Vec<_>>();
+
+    assert!(
+        packs
+            .iter()
+            .all(|pack| pack["task_session_id"] == packs[0]["task_session_id"])
+    );
+    assert!(
+        packs
+            .iter()
+            .all(|pack| pack["task_id"] == packs[0]["task_id"])
+    );
+    assert_eq!(
+        packs[0]["intent_revision_id"],
+        packs[1]["intent_revision_id"]
+    );
+    assert_ne!(
+        packs[1]["intent_revision_id"],
+        packs[2]["intent_revision_id"]
+    );
+    assert_eq!(
+        packs[2]["intent_revision_id"],
+        packs[3]["intent_revision_id"]
+    );
+}
+
+#[test]
+fn different_sessions_with_the_same_workspace_signal_remain_isolated() {
+    let fixture = Fixture::new();
+    let mut frontend = task_arguments("codex", "frontend-session", "frontend MCP context");
+    frontend["task_signals"] = json!([
+        {"kind": "workspace", "content": "/work/shared"},
+        {"kind": "file", "content": "web/Search.tsx"}
+    ]);
+    let mut backend = task_arguments("codex", "backend-session", "backend MCP context");
+    backend["task_signals"] = json!([
+        {"kind": "workspace", "content": "/work/shared"},
+        {"kind": "api", "content": "search-v2"}
+    ]);
+    let responses = run_session(
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::Newline,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(2, "task_context", frontend),
+            tool_call(3, "task_context", backend),
+        ],
+    );
+    let frontend = &responses[1]["result"]["structuredContent"];
+    let backend = &responses[2]["result"]["structuredContent"];
+
+    assert_ne!(frontend["task_session_id"], backend["task_session_id"]);
+    assert_ne!(frontend["task_id"], backend["task_id"]);
+    let runtime = TaskRuntime::initialize(&fixture.root).unwrap();
+    let frontend_snapshot = runtime
+        .read_snapshot(
+            frontend["task_session_id"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    let backend_snapshot = runtime
+        .read_snapshot(
+            backend["task_session_id"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        frontend_snapshot
+            .task_signals
+            .iter()
+            .any(|signal| signal.kind == TaskSignalKind::File)
+    );
+    assert!(
+        !frontend_snapshot
+            .task_signals
+            .iter()
+            .any(|signal| signal.kind == TaskSignalKind::Api)
+    );
+    assert!(
+        backend_snapshot
+            .task_signals
+            .iter()
+            .any(|signal| signal.kind == TaskSignalKind::Api)
+    );
+}
+
+#[test]
+fn concurrent_same_session_calls_converge_without_lost_signals_or_extra_heads() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let fixture = Fixture::new();
+    let worker_count = 8;
+    let barrier = Arc::new(Barrier::new(worker_count));
+    let root = Arc::new(fixture.root.clone());
+    let mut workers = Vec::new();
+    for index in 0..worker_count {
+        let root = Arc::clone(&root);
+        let barrier = Arc::clone(&barrier);
+        workers.push(thread::spawn(move || {
+            let mut input: TaskContextInput = serde_json::from_value(task_arguments(
+                "codex",
+                "concurrent-session",
+                "concurrent MCP context",
+            ))
+            .unwrap();
+            input.task_signals.push(TaskSignal {
+                kind: TaskSignalKind::Workspace,
+                content: "/work/shared".to_owned(),
+            });
+            input.task_signals.push(TaskSignal {
+                kind: TaskSignalKind::File,
+                content: format!("src/file-{index}.rs"),
+            });
+            barrier.wait();
+            task_context_at_root(root.as_path(), &input).unwrap()
+        }));
+    }
+    let responses = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    let session_id = responses[0].task_session_id;
+    assert!(
+        responses
+            .iter()
+            .all(|response| response.task_session_id == session_id)
+    );
+    assert!(
+        responses
+            .iter()
+            .all(|response| response.task_id == responses[0].task_id)
+    );
+    assert!(
+        responses
+            .iter()
+            .all(|response| response.intent_revision_id == responses[0].intent_revision_id)
+    );
+
+    let snapshot = TaskRuntime::initialize(root.as_path())
+        .unwrap()
+        .read_snapshot(session_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.intent_revisions.len(), 1);
+    assert_eq!(snapshot.task_signals.len(), worker_count + 2);
+    assert!(snapshot.validate().is_ok());
+}
+
+#[test]
+fn task_context_runtime_storage_failure_is_typed() {
+    let fixture = Fixture::new();
+    let mut server = fixture.server(ClientKind::Codex);
+    let runtime_database = fixture.root.join("state/runtime.sqlite");
+    fs::remove_file(&runtime_database).unwrap();
+    fs::create_dir(&runtime_database).unwrap();
+    let responses = run_session(
+        &mut server,
+        FixtureFraming::Newline,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
             tool_call(
                 2,
-                "context_for_task",
-                json!({"task": "find task context", "space_id": fixture.space_id}),
+                "task_context",
+                task_arguments("codex", "storage-failure", "MCP context"),
             ),
         ],
     );
@@ -398,7 +657,11 @@ fn context_for_task_rejects_a_caller_supplied_space_route() {
     assert_eq!(responses[1]["result"]["isError"], true);
     assert_eq!(
         responses[1]["result"]["structuredContent"]["error"]["code"],
-        "invalid_input"
+        "task_context_storage_failed"
+    );
+    assert_eq!(
+        responses[1]["result"]["structuredContent"]["error"]["kind"],
+        "io_error"
     );
 }
 
@@ -434,8 +697,12 @@ fn candidate_create_retries_are_strict_and_unassigned_candidates_are_not_retriev
             ),
             tool_call(
                 6,
-                "context_for_task",
-                json!({"task": "hidden MCP episode knowledge"}),
+                "task_context",
+                task_arguments(
+                    "codex",
+                    "candidate-isolation",
+                    "hidden MCP episode knowledge",
+                ),
             ),
         ],
     );
@@ -462,11 +729,18 @@ fn candidate_create_retries_are_strict_and_unassigned_candidates_are_not_retriev
             .unwrap()
             .is_empty()
     );
+    let task_context = &responses[5]["result"]["structuredContent"];
     assert!(
-        responses[5]["result"]["structuredContent"]["items"]
+        !serde_json::to_string(task_context)
+            .unwrap()
+            .contains(created["candidate_id"].as_str().unwrap())
+    );
+    assert!(
+        task_context["items"]
             .as_array()
             .unwrap()
-            .is_empty()
+            .iter()
+            .all(|item| { item["context"]["statement"] != "hidden MCP episode knowledge" })
     );
 }
 

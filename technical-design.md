@@ -10,18 +10,18 @@
 
 本项目尚未上线，本文直接定义目标模型、接口和存储结构。
 
-### 1.1 当前实现状态（Mew #112）
+### 1.1 当前实现状态（Mew #123）
 
 本文的大部分章节描述目标架构，不代表代码已经全部实现。当前里程碑边界如下：
 
 | 里程碑 | 状态 | 当前代码事实 |
 |---|---|---|
 | **M1：Task-first 领域与入口基础** | **已实现** | `TaskIntent` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；CLI/MCP 通过 `candidate_create` 创建无 Space Candidate；Candidate 不可自动注入 |
-| **M2：Task Runtime 与多 Space Retrieval** | **未实现** | 尚无 TaskSession 持久化、TaskIntent Revision、动态 Task Signal、Space Intent 召回、关联推断或带关联路径的 TaskContextPack |
+| **M2：Task Runtime 与多 Space Retrieval** | **部分实现** | TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 召回、多 Space 关联、TaskContextPack 和显式 `task_context` 已实现；动态 Agent Hook 接入与阶段总验收尚未完成 |
 | **M3：Engineering Graph** | **未实现** | 尚无工程对象扫描、ContextArtifactAssociation、移动/改名重解析或关系图扩展 |
 | **M4：Low-tax Capture** | **未实现** | 尚无 WorkEpisode 自动聚合、AgentCheckpoint、Candidate Builder、去重/冲突、Space 推荐或 Candidate Confirm/List/Discard |
 
-当前 `context_for_task` 只是没有 Space 路由参数的任务文本 Context Pack，不等同于 M2。当前 `candidate_create` 是手工、无归属的 M1 可执行入口，不等同于 M4 的自动 Capture。M1 为验证 Candidate 隔离和 Writer 主路径，使用 `context_candidate.created` 事件及独立投影保存 Candidate；第 5.5、6、9、10、12、13 节中关于完整 Runtime/Candidate Confirm 的描述仍是 M4 目标。
+当前 `task_context` 已通过外部 Session Locator 续接本地 TaskSession，修订 TaskIntent、合并 TaskSignals，并生成可解释的多 Space TaskContextPack；它仍未接入 Agent Hook 的动态事件链。当前 `candidate_create` 是手工、无归属的 M1 可执行入口，不等同于 M4 的自动 Capture。M1 为验证 Candidate 隔离和 Writer 主路径，使用 `context_candidate.created` 事件及独立投影保存 Candidate；第 5.5、6、9、10、12、13 节中关于完整 Runtime/Candidate Confirm 的描述仍是 M4 目标。
 
 ## 2. 背景与目标
 
@@ -1207,19 +1207,19 @@ sctx doctor --json
 - `TaskSpaceAssociation` 已作为独立派生类型建模，集合允许零个或多个 Space。
 - `WorkEpisode` 与无 Space 的 `ContextCandidate` 已建模。
 - 已删除 Workspace-to-Space 配置、绑定命令、preferred-Space 请求字段和对应排序逻辑。
-- `context_for_task` 不接受 Space 路由；`context_search.space_ids` 仅作为显式探索的硬过滤。
+- Task-first 领域不携带 Space 路由；`context_search.space_ids` 仅作为显式探索的硬过滤。
 - CLI/MCP 的 `candidate_create` 已成为 Candidate 创建主入口，服务端生成身份和路径。
 - Candidate 使用独立投影，不进入 Context FTS，也不满足自动注入资格。
 - 跨 crate M1 验收覆盖 TaskIntent、`0..N` 关联、无 Space Candidate、无 Workspace 路由和自动注入隔离。
 
 M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命周期、CLI/MCP、Agent Adapter、安装器与 NPM 基础设施。复用这些基础设施不表示下面的目标里程碑已经完成。
 
-### M2：Task Runtime 与多 Space Retrieval — 未实现
+### M2：Task Runtime 与多 Space Retrieval — 部分实现
 
-- `runtime.sqlite`、TaskSession 和 TaskIntent Revision 尚未实现。
-- Prompt/File/Symbol/Diff/API/Schema/Test 的动态 Task Signal 聚合尚未实现。
-- 完整 Space Intent FTS、Task 多路召回、Space 关联推断、解释路径和 Session 隔离尚未实现。
-- 目标 `task_context`/TaskContextPack 契约尚未实现；当前 `context_for_task` 只是无 Space 路由的文本检索桥接。
+- `runtime.sqlite`、TaskSession、TaskIntent Revision 及并发线性 Head 已实现。
+- 完整 Space Intent FTS、Task 多路召回、Space 关联推断、解释路径和 Session 隔离已实现。
+- 显式 `task_context` 已按 external Session Locator 更新 Runtime，并返回固定 Task Revision 与知识 Projection 上的 TaskContextPack。
+- Prompt/File/Symbol/Diff/API/Schema/Test 从 Agent Hook 动态汇入同一 Session 的接入尚未实现，M2 阶段总验收尚未完成。
 
 ### M3：Engineering Graph — 未实现
 

@@ -268,6 +268,7 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
         "candidate create",
         "context revise|review|publish|withdraw|get",
         "semantic conflict open|resolve",
+        "task context",
         "search",
         "context-pack",
         "pending list|commit|move-aside",
@@ -484,6 +485,112 @@ fn candidate_create_is_unassigned_idempotent_and_absent_from_retrieval() {
         "candidates are unassigned",
         "--evidence-json",
         EVIDENCE,
+    ]);
+    assert_eq!(rejected["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn task_context_cli_entry_owns_task_identity_and_evolves_one_session() {
+    let harness = Harness::new();
+    let (space_id, _) = create_space(&harness, "CLI Task Context");
+    approve_publish(
+        &harness,
+        &space_id,
+        "CLI task context returns published knowledge",
+    );
+    let base = [
+        "task",
+        "context",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        "cli-session",
+        "--goal",
+        "retrieve CLI task context",
+        "--desired-change",
+        "return published CLI knowledge",
+        "--domain",
+        "cli",
+        "--task-signal-json",
+        r#"{"kind":"workspace","content":"/work/shared"}"#,
+        "--token-budget",
+        "2000",
+    ];
+    let first = harness.success(&base);
+    let same = harness.success(&base);
+    let changed = harness.success(&[
+        "task",
+        "context",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        "cli-session",
+        "--goal",
+        "refine CLI task context",
+        "--desired-change",
+        "return refined published CLI knowledge",
+        "--domain",
+        "cli",
+        "--task-signal-json",
+        r#"{"kind":"file","content":"src/main.rs"}"#,
+    ]);
+
+    assert_eq!(first["command"], "task.context");
+    assert_eq!(first["tree"], first["data"]["tree"]);
+    assert_eq!(first["generation"], first["data"]["generation"]);
+    assert!(first["data"]["task_session_id"].as_str().is_some());
+    assert!(first["data"]["task_id"].as_str().is_some());
+    assert!(first["data"]["candidate_spaces"].as_array().is_some());
+    assert!(first["data"]["retrieval_paths"].as_array().is_some());
+    assert_eq!(
+        first["data"]["task_session_id"],
+        changed["data"]["task_session_id"]
+    );
+    assert_eq!(first["data"]["task_id"], changed["data"]["task_id"]);
+    assert_eq!(
+        first["data"]["intent_revision_id"],
+        same["data"]["intent_revision_id"]
+    );
+    assert_ne!(
+        same["data"]["intent_revision_id"],
+        changed["data"]["intent_revision_id"]
+    );
+
+    let other = harness.success(&[
+        "task",
+        "context",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        "other-cli-session",
+        "--goal",
+        "retrieve CLI task context",
+        "--desired-change",
+        "return published CLI knowledge",
+        "--domain",
+        "cli",
+        "--task-signal-json",
+        r#"{"kind":"workspace","content":"/work/shared"}"#,
+    ]);
+    assert_ne!(
+        first["data"]["task_session_id"],
+        other["data"]["task_session_id"]
+    );
+    assert_ne!(first["data"]["task_id"], other["data"]["task_id"]);
+
+    let rejected = harness.failure(&[
+        "task",
+        "context",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        "routed-cli-session",
+        "--goal",
+        "must reject routes",
+        "--desired-change",
+        "do not route",
+        "--space-id",
+        &space_id,
     ]);
     assert_eq!(rejected["error"]["code"], "invalid_input");
 }

@@ -2,9 +2,10 @@
 //!
 //! The transport accepts the newline-delimited framing used by current MCP
 //! clients and the `Content-Length` framing used by older fixtures. Read tools
-//! are pinned to one projection snapshot or one explicitly named Git tree;
-//! the sole write tool delegates ID generation and append-only enforcement to
-//! the domain event constructor and [`sctx_git_store::GitStore`].
+//! are pinned to one projection snapshot or one explicitly named Git tree. The
+//! durable write tool delegates ID generation and append-only enforcement to
+//! the domain event constructor and [`sctx_git_store::GitStore`]; `task_context`
+//! writes only disposable local Task Runtime state.
 
 use std::{
     collections::BTreeMap,
@@ -16,21 +17,25 @@ use std::{
 
 use sctx_domain::{
     Applicability, ContextId, ContextKind, ContextRevisionDraft, Error, ErrorKind,
-    EvidenceSnapshotDraft, EvidenceType, Result, RevisionId, SpaceId, WorkEpisodeId,
+    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, Result, RevisionId, SpaceId,
+    TaskId, TaskIntent, TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignal,
+    TaskSpaceAssociation, WorkEpisodeId,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::{DomainSnapshot, ProjectionIndex};
 use sctx_search::{
-    ConflictView, ContextPackMode, ContextPackRequest, ContextStatus, ScopeFilter, SearchEngine,
-    SearchFilters, SearchRequest,
+    ConflictView, ContextPackOmitted, ContextStatus, ScopeFilter, SearchEngine, SearchFilters,
+    SearchRequest, TaskContextItem, TaskContextRequest, TaskRetrievalPath,
 };
-use serde::Deserialize;
+use sctx_task_runtime::TaskRuntime;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 /// Protocol version advertised when a client does not provide one.
 pub const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_INTENT_CONFLICT_RETRIES: usize = 32;
 
 /// Client fixture selected by the stable CLI entry point.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,6 +70,103 @@ pub enum DisconnectReason {
 pub struct ServeOutcome {
     pub disconnect: DisconnectReason,
     pub requests_handled: u64,
+}
+
+/// Caller-authored Task data accepted by the `task_context` MCP/CLI boundary.
+///
+/// Task identity is intentionally absent: the local runtime owns it. A
+/// Workspace may be supplied only as a [`TaskSignal`], never as a route.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskContextInput {
+    pub agent_kind: String,
+    pub external_session_id: String,
+    pub goal: String,
+    pub desired_change: String,
+    #[serde(default)]
+    pub in_scope: Vec<String>,
+    #[serde(default)]
+    pub out_of_scope: Vec<String>,
+    #[serde(default)]
+    pub domains: Vec<String>,
+    #[serde(default)]
+    pub platforms: Vec<String>,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    #[serde(default)]
+    pub acceptance_conditions: Vec<String>,
+    #[serde(default)]
+    pub artifacts: Vec<String>,
+    #[serde(default)]
+    pub interfaces: Vec<String>,
+    #[serde(default)]
+    pub unknowns: Vec<String>,
+    #[serde(default)]
+    pub task_signals: Vec<TaskSignal>,
+    #[serde(default = "default_token_budget")]
+    pub token_budget: usize,
+}
+
+impl TaskContextInput {
+    fn locator(&self) -> Result<ExternalSessionLocator> {
+        ExternalSessionLocator::new(&self.agent_kind, &self.external_session_id)
+    }
+
+    fn intent(&self, task_id: TaskId) -> TaskIntent {
+        TaskIntent {
+            task_id,
+            goal: self.goal.clone(),
+            desired_change: self.desired_change.clone(),
+            in_scope: self.in_scope.clone(),
+            out_of_scope: self.out_of_scope.clone(),
+            domains: self.domains.clone(),
+            platforms: self.platforms.clone(),
+            constraints: self.constraints.clone(),
+            acceptance_conditions: self.acceptance_conditions.clone(),
+            artifacts: self.artifacts.clone(),
+            interfaces: self.interfaces.clone(),
+            unknowns: self.unknowns.clone(),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        let _locator = self.locator()?;
+        self.intent(TaskId::new()).validate()?;
+        for signal in &self.task_signals {
+            signal.validate()?;
+        }
+        if self.token_budget == 0 {
+            return Err(invalid(
+                "task_context token_budget must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Flattened explanation index for one returned Task Context item.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskContextRetrievalPaths {
+    pub association_space_id: SpaceId,
+    pub context_id: ContextId,
+    pub paths: Vec<TaskRetrievalPath>,
+}
+
+/// Session-aware Task Context result shared by MCP and the CLI test entry.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskContextResponse {
+    pub task_session_id: TaskSessionId,
+    pub task_id: TaskId,
+    pub intent_revision_id: TaskIntentRevisionId,
+    pub candidate_spaces: Vec<TaskSpaceAssociation>,
+    pub items: Vec<TaskContextItem>,
+    pub retrieval_paths: Vec<TaskContextRetrievalPaths>,
+    pub task_fingerprint: String,
+    pub tree: String,
+    pub generation: u64,
+    pub token_budget: usize,
+    pub estimated_tokens: usize,
+    pub omitted: Vec<ContextPackOmitted>,
 }
 
 /// Typed failures for transport state that cannot be represented as a JSON-RPC response.
@@ -124,18 +226,127 @@ struct Frame {
 struct Runtime {
     store: GitStore,
     index: ProjectionIndex,
+    tasks: TaskRuntime,
 }
 
 impl Runtime {
     fn open(root: &Path) -> Result<Self> {
         let store = GitStore::initialize(root)?;
         let index = ProjectionIndex::for_store(&store);
-        Ok(Self { store, index })
+        let tasks = TaskRuntime::initialize(root)?;
+        Ok(Self {
+            store,
+            index,
+            tasks,
+        })
     }
 
     fn snapshot(&self) -> Result<DomainSnapshot> {
         self.index.domain_snapshot()
     }
+
+    fn task_context(&self, input: &TaskContextInput) -> Result<TaskContextResponse> {
+        input.validate()?;
+        let opened = self.tasks.open_or_create(
+            input.locator()?,
+            input.intent(TaskId::new()),
+            input.task_signals.clone(),
+        )?;
+        let desired_intent = input.intent(opened.snapshot.task_id);
+        let task_session_id = opened.snapshot.task_session_id;
+        self.converge_intent(opened.snapshot, &desired_intent)?;
+        let snapshot = self
+            .tasks
+            .merge_signals(task_session_id, input.task_signals.clone())?
+            .snapshot;
+        build_task_context_response(&self.index, &snapshot, input.token_budget)
+    }
+
+    fn converge_intent(
+        &self,
+        mut snapshot: TaskSessionSnapshot,
+        desired_intent: &TaskIntent,
+    ) -> Result<()> {
+        for _ in 0..MAX_INTENT_CONFLICT_RETRIES {
+            let current = snapshot
+                .current_intent_revision()
+                .ok_or_else(|| invariant("Task Session has no current Intent revision"))?;
+            if current.intent == *desired_intent {
+                return Ok(());
+            }
+            match self.tasks.append_intent_revision(
+                snapshot.task_session_id,
+                current.revision_id,
+                desired_intent.clone(),
+            ) {
+                Ok(_) => return Ok(()),
+                Err(error) if error.kind() == ErrorKind::InvalidInput => {
+                    snapshot = self
+                        .tasks
+                        .read_snapshot(snapshot.task_session_id)?
+                        .ok_or_else(|| invariant("Task Session disappeared during Intent retry"))?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::new(
+            ErrorKind::External,
+            "task runtime conflict did not converge after bounded retries",
+        ))
+    }
+}
+
+/// Executes the same session-aware Task Context path used by MCP at an explicit
+/// installation root. This is the stable CLI test entry; it does not invoke an
+/// Agent Hook.
+///
+/// # Errors
+///
+/// Returns typed input, runtime, knowledge projection, or serialization errors.
+pub fn task_context_at_root(
+    root: impl AsRef<Path>,
+    input: &TaskContextInput,
+) -> Result<TaskContextResponse> {
+    Runtime::open(root.as_ref())?.task_context(input)
+}
+
+fn build_task_context_response(
+    index: &ProjectionIndex,
+    snapshot: &TaskSessionSnapshot,
+    token_budget: usize,
+) -> Result<TaskContextResponse> {
+    let current = snapshot
+        .current_intent_revision()
+        .ok_or_else(|| invariant("Task Session has no current Intent revision"))?;
+    let pack =
+        SearchEngine::new(index.clone()).task_context_pack(&TaskContextRequest::automatic(
+            current.intent.clone(),
+            snapshot.task_signals.clone(),
+            token_budget,
+        ))?;
+    let retrieval_paths = pack
+        .items
+        .iter()
+        .map(|item| TaskContextRetrievalPaths {
+            association_space_id: item.association_space_id,
+            context_id: item.context.context_id,
+            paths: item.retrieval_paths.clone(),
+        })
+        .collect();
+    Ok(TaskContextResponse {
+        task_session_id: snapshot.task_session_id,
+        task_id: snapshot.task_id,
+        intent_revision_id: current.revision_id,
+        candidate_spaces: pack.associations,
+        items: pack.items,
+        retrieval_paths,
+        task_fingerprint: pack.task_fingerprint,
+        tree: pack.indexed_tree_oid,
+        generation: pack.projection_generation,
+        token_budget: pack.token_budget,
+        estimated_tokens: pack.estimated_tokens,
+        omitted: pack.omitted,
+    })
 }
 
 /// Stateful MCP request dispatcher for one stdio session.
@@ -146,7 +357,7 @@ pub struct McpServer {
 }
 
 impl McpServer {
-    /// Opens the unique store and its rebuildable projection.
+    /// Opens the unique store, rebuildable projection, and local Task Runtime.
     ///
     /// # Errors
     ///
@@ -301,7 +512,7 @@ impl McpServer {
         let call: ToolCall = serde_json::from_value(params)
             .map_err(|error| invalid(format!("invalid tools/call params: {error}")))?;
         let result = match call.name.as_str() {
-            "context_for_task" => self.context_for_task(call.arguments),
+            "task_context" => self.task_context(call.arguments),
             "context_search" => self.context_search(call.arguments),
             "context_get" => self.context_get(call.arguments),
             "candidate_create" => self.candidate_create(call.arguments),
@@ -336,27 +547,14 @@ impl McpServer {
         Ok(data)
     }
 
-    fn context_for_task(&self, arguments: Value) -> ToolResult {
-        let input: TaskInput = decode_arguments(arguments)?;
-        let request = input.into_request()?;
-        let response = SearchEngine::new(self.runtime.index.clone()).context_pack(&request)?;
-        let conflicts = response
-            .items
-            .iter()
-            .flat_map(|item| item.conflicts.iter().cloned())
-            .collect::<Vec<_>>();
-        let mut data = serde_json::to_value(response).map_err(serialization_failure)?;
-        insert_fields(
-            &mut data,
-            [
-                (
-                    "conflicts",
-                    serde_json::to_value(conflicts).map_err(serialization_failure)?,
-                ),
-                ("match_reason", json!("task_text_and_structured_hints")),
-            ],
-        )?;
-        Ok(data)
+    fn task_context(&self, arguments: Value) -> ToolResult {
+        let input: TaskContextInput = decode_arguments(arguments)?;
+        input.validate()?;
+        let response = self
+            .runtime
+            .task_context(&input)
+            .map_err(ToolFailure::task_context_failed)?;
+        serde_json::to_value(response).map_err(serialization_failure)
     }
 
     fn context_get(&self, arguments: Value) -> ToolResult {
@@ -509,6 +707,18 @@ impl ToolFailure {
             error,
         }
     }
+
+    fn task_context_failed(error: Error) -> Self {
+        let code = match error.kind() {
+            ErrorKind::InvalidInput => "invalid_input",
+            ErrorKind::InvariantViolation => "task_context_invariant",
+            ErrorKind::Io => "task_context_storage_failed",
+            ErrorKind::External => "task_runtime_conflict",
+            ErrorKind::Unsupported => "task_context_unsupported",
+            _ => "task_context_failed",
+        };
+        Self { code, error }
+    }
 }
 
 impl From<Error> for ToolFailure {
@@ -596,51 +806,6 @@ type ToolResultSearch = std::result::Result<SearchRequest, ToolFailure>;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TaskInput {
-    task: String,
-    #[serde(default)]
-    domains: Vec<String>,
-    #[serde(default)]
-    platforms: Vec<String>,
-    #[serde(default)]
-    conditions: Vec<String>,
-    #[serde(default)]
-    kinds: Vec<ContextKind>,
-    #[serde(default = "default_token_budget")]
-    token_budget: usize,
-    #[serde(default = "default_candidate_limit")]
-    candidate_limit: usize,
-}
-
-impl TaskInput {
-    fn into_request(self) -> std::result::Result<ContextPackRequest, ToolFailure> {
-        if self.task.trim().is_empty() {
-            return Err(invalid("task must not be empty").into());
-        }
-        Ok(ContextPackRequest {
-            search: SearchRequest {
-                query: self.task,
-                filters: SearchFilters {
-                    scope: ScopeFilter {
-                        domains: self.domains,
-                        platforms: self.platforms,
-                        conditions: self.conditions,
-                    },
-                    kinds: self.kinds,
-                    ..SearchFilters::default()
-                },
-                page_size: self.candidate_limit,
-                ..SearchRequest::default()
-            },
-            token_budget: self.token_budget,
-            candidate_limit: self.candidate_limit,
-            mode: ContextPackMode::AutomaticInjection,
-        })
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CandidateCreateInput {
     source_episode_id: String,
     kind: ContextKind,
@@ -698,20 +863,28 @@ impl From<EvidenceInput> for EvidenceSnapshotDraft {
 fn tools_list() -> Value {
     json!({"tools": [
         tool_schema(
-            "context_for_task",
-            "Build an automatic-injection Context Pack for a task from one projection snapshot.",
+            "task_context",
+            "Update one isolated Task Session and build an explainable multi-Space automatic Context Pack.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["task"],
+                "required": ["agent_kind", "external_session_id", "goal", "desired_change"],
                 "properties": {
-                    "task": {"type": "string", "minLength": 1},
+                    "agent_kind": {"type": "string", "minLength": 1},
+                    "external_session_id": {"type": "string", "minLength": 1},
+                    "goal": {"type": "string", "minLength": 1},
+                    "desired_change": {"type": "string", "minLength": 1},
+                    "in_scope": string_array_schema(),
+                    "out_of_scope": string_array_schema(),
                     "domains": string_array_schema(),
                     "platforms": string_array_schema(),
-                    "conditions": string_array_schema(),
-                    "kinds": kind_array_schema(),
-                    "token_budget": {"type": "integer", "minimum": 1, "default": 2000},
-                    "candidate_limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 100}
+                    "constraints": string_array_schema(),
+                    "acceptance_conditions": string_array_schema(),
+                    "artifacts": string_array_schema(),
+                    "interfaces": string_array_schema(),
+                    "unknowns": string_array_schema(),
+                    "task_signals": task_signal_array_schema(),
+                    "token_budget": {"type": "integer", "minimum": 1, "default": 2000}
                 }
             })
         ),
@@ -823,6 +996,21 @@ fn kind_array_schema() -> Value {
 
 fn string_array_schema() -> Value {
     json!({"type": "array", "items": {"type": "string", "minLength": 1}})
+}
+
+fn task_signal_array_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "content"],
+            "properties": {
+                "kind": {"type": "string", "enum": ["prompt", "workspace", "repository", "file", "symbol", "diff", "api", "schema", "test"]},
+                "content": {"type": "string", "minLength": 1}
+            }
+        }
+    })
 }
 
 fn id_schema(prefix: &str) -> Value {
@@ -1125,10 +1313,6 @@ const fn default_page_size() -> usize {
 
 const fn default_token_budget() -> usize {
     2_000
-}
-
-const fn default_candidate_limit() -> usize {
-    100
 }
 
 const fn error_code(kind: ErrorKind) -> &'static str {

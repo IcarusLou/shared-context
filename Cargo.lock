@@ -621,6 +621,7 @@ dependencies = [
  "sctx-git-store",
  "sctx-index",
  "sctx-search",
+ "sctx-task-runtime",
  "serde",
  "serde_json",
  "tempfile",

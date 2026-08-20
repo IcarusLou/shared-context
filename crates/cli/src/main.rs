@@ -25,7 +25,7 @@ use sctx_domain::{
     ContextGovernanceStatus, ContextId, ContextKind, ContextRevisionDraft, DomainProjection, Error,
     ErrorKind, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, PublicationAction,
     PublicationDraft, ResolutionOutcome, Result, ReviewDraft, ReviewSummary, ReviewVerdict,
-    RevisionId, SemanticConflictDraft, SpaceId, WorkEpisodeId,
+    RevisionId, SemanticConflictDraft, SpaceId, TaskSignal, WorkEpisodeId,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendOutcome, AppendRequest, BatchId, CandidateAppendOutcome, GitStore};
@@ -33,6 +33,7 @@ use sctx_index::{
     DomainSnapshot, IndexMetadata, ProjectionDiagnosticView, ProjectionIndex, RebuildOutcome,
 };
 use sctx_local_state::{Breadcrumb, BreadcrumbKind, CaptureStore};
+use sctx_mcp::TaskContextInput;
 use sctx_search::{
     ContextPackMode, ContextPackRequest, ContextStatus, ScopeFilter, SearchEngine, SearchFilters,
     SearchRequest,
@@ -55,6 +56,7 @@ Commands:
   candidate create
   context revise|review|publish|withdraw|get
   semantic conflict open|resolve
+  task context
   search
   context-pack
   index rebuild|status
@@ -146,6 +148,7 @@ fn run(args: &[String], json_output: bool) -> Result<()> {
         [group, rest @ ..] if group == "candidate" => run_candidate(rest, json_output),
         [group, rest @ ..] if group == "context" => run_context(rest, json_output),
         [group, rest @ ..] if group == "semantic" => run_semantic(rest, json_output),
+        [group, rest @ ..] if group == "task" => run_task(rest, json_output),
         [command, rest @ ..] if command == "search" => run_search(rest, json_output),
         [command, rest @ ..] if command == "context-pack" => run_context_pack(rest, json_output),
         [group, rest @ ..] if group == "index" => run_index(rest, json_output),
@@ -1482,6 +1485,74 @@ fn run_search(args: &[String], json_output: bool) -> Result<()> {
         "search",
         &response.indexed_tree_oid,
         response.projection_generation,
+        &data,
+        json_output,
+    )
+}
+
+fn run_task(args: &[String], json_output: bool) -> Result<()> {
+    let [command, rest @ ..] = args else {
+        return Err(invalid("Usage: sctx task context [OPTIONS]"));
+    };
+    if command != "context" {
+        return Err(invalid("task command must be context"));
+    }
+    let options = Options::parse(rest, &[])?;
+    options.allow_only(
+        &[
+            "--agent-kind",
+            "--external-session-id",
+            "--goal",
+            "--desired-change",
+            "--in-scope",
+            "--out-of-scope",
+            "--domain",
+            "--platform",
+            "--constraint",
+            "--acceptance-condition",
+            "--artifact",
+            "--interface",
+            "--unknown",
+            "--task-signal-json",
+            "--token-budget",
+        ],
+        &[],
+    )?;
+    let task_signals = options
+        .many("--task-signal-json")
+        .into_iter()
+        .map(|value| {
+            serde_json::from_str::<TaskSignal>(value)
+                .map_err(|error| invalid(format!("invalid Task Signal JSON: {error}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let input = TaskContextInput {
+        agent_kind: options.required("--agent-kind")?.to_owned(),
+        external_session_id: options.required("--external-session-id")?.to_owned(),
+        goal: options.required("--goal")?.to_owned(),
+        desired_change: options.required("--desired-change")?.to_owned(),
+        in_scope: strings(options.many("--in-scope")),
+        out_of_scope: strings(options.many("--out-of-scope")),
+        domains: strings(options.many("--domain")),
+        platforms: strings(options.many("--platform")),
+        constraints: strings(options.many("--constraint")),
+        acceptance_conditions: strings(options.many("--acceptance-condition")),
+        artifacts: strings(options.many("--artifact")),
+        interfaces: strings(options.many("--interface")),
+        unknowns: strings(options.many("--unknown")),
+        task_signals,
+        token_budget: parse_usize(
+            options.optional("--token-budget")?.unwrap_or("2000"),
+            "token budget",
+        )?,
+    };
+    let response = sctx_mcp::task_context_at_root(installation_root()?, &input)?;
+    let data =
+        serde_json::to_value(&response).map_err(json_error("serialize Task Context response"))?;
+    emit_raw(
+        "task.context",
+        &response.tree,
+        response.generation,
         &data,
         json_output,
     )

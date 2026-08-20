@@ -19,7 +19,7 @@
     "evidence_fixture": "sctx.demo.v1"
   },
   "mcp_tools": [
-    "context_for_task",
+    "task_context",
     "context_search",
     "context_get",
     "candidate_create",

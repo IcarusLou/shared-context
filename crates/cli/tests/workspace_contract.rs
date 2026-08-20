@@ -1,9 +1,10 @@
 use std::{collections::HashMap, fs, path::PathBuf, process::Command};
 
-const MEMBERS: [(&str, u8); 12] = [
+const MEMBERS: [(&str, u8); 13] = [
     ("domain", 0),
     ("local-state", 1),
     ("event-schema", 1),
+    ("task-runtime", 1),
     ("git-store", 2),
     ("index", 3),
     ("search", 4),
