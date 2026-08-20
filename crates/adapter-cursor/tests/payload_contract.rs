@@ -41,7 +41,7 @@ fn cursor_prompt_hook_is_observable_but_never_an_injection_dependency() {
     assert_eq!(capability.mode, CapabilityMode::VerifiedHooks);
     assert!(capability.prompt_submit);
     assert!(!capability.prompt_aware_injection);
-    assert!(plan_action(&event, &capability).context_query.is_none());
+    assert!(plan_action(&event, &capability).task_operation.is_none());
 }
 
 #[test]

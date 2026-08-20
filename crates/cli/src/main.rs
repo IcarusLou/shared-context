@@ -17,15 +17,16 @@ use std::{
 
 use args::Options;
 use sctx_agent_adapter::{
-    AgentCapabilities, CanonicalAgentAction, CanonicalBreadcrumbKind, ResolvedAgentAction,
-    TrustState, plan_action, render_untrusted_context_pack,
+    AgentCapabilities, AgentTaskIntentDraft, CanonicalAgentAction, CanonicalBreadcrumbKind,
+    ResolvedAgentAction, TaskRuntimeOperation, ToolOutcome, TrustState, plan_action,
+    render_untrusted_task_context_pack,
 };
 use sctx_domain::{
     Applicability, ConflictParticipant, ConflictResolutionDraft, ConflictResolutionResult,
     ContextGovernanceStatus, ContextId, ContextKind, ContextRevisionDraft, DomainProjection, Error,
     ErrorKind, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, PublicationAction,
     PublicationDraft, ResolutionOutcome, Result, ReviewDraft, ReviewSummary, ReviewVerdict,
-    RevisionId, SemanticConflictDraft, SpaceId, TaskSignal, WorkEpisodeId,
+    RevisionId, SemanticConflictDraft, SpaceId, TaskSignal, TaskSignalKind, WorkEpisodeId,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendOutcome, AppendRequest, BatchId, CandidateAppendOutcome, GitStore};
@@ -33,11 +34,12 @@ use sctx_index::{
     DomainSnapshot, IndexMetadata, ProjectionDiagnosticView, ProjectionIndex, RebuildOutcome,
 };
 use sctx_local_state::{Breadcrumb, BreadcrumbKind, CaptureStore};
-use sctx_mcp::TaskContextInput;
+use sctx_mcp::{TaskContextInput, TaskContextResponse};
 use sctx_search::{
     ContextPackMode, ContextPackRequest, ContextStatus, ScopeFilter, SearchEngine, SearchFilters,
-    SearchRequest,
+    SearchRequest, TaskContextPack,
 };
+use sctx_task_runtime::TaskRuntime;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -727,7 +729,12 @@ fn agent_capabilities(
 }
 
 fn resolve_hook_action(action: CanonicalAgentAction) -> Result<ResolvedAgentAction> {
-    if let Some(breadcrumb) = action.breadcrumb {
+    let CanonicalAgentAction {
+        task_operation,
+        breadcrumb,
+        system_message,
+    } = action;
+    if let Some(breadcrumb) = breadcrumb {
         CaptureStore::initialize(installation_root()?)?.capture(&Breadcrumb {
             kind: match breadcrumb.kind {
                 CanonicalBreadcrumbKind::ToolOutcome => BreadcrumbKind::ToolOutcome,
@@ -738,40 +745,215 @@ fn resolve_hook_action(action: CanonicalAgentAction) -> Result<ResolvedAgentActi
             file_hints: breadcrumb.file_hints,
         })?;
     }
-    let additional_context = action
-        .context_query
-        .map(automatic_hook_context)
-        .transpose()?;
+    let additional_context = task_operation.map(resolve_task_operation).transpose()?;
     Ok(ResolvedAgentAction {
-        additional_context,
-        system_message: action.system_message,
+        additional_context: additional_context.flatten(),
+        system_message,
     })
 }
 
-fn automatic_hook_context(query: String) -> Result<String> {
-    if query.trim().is_empty() {
-        return Err(invariant(
-            "automatic Hook Context query must contain a task prompt",
-        ));
+fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<Option<String>> {
+    match operation {
+        TaskRuntimeOperation::Context {
+            locator,
+            intent,
+            task_signals,
+            token_budget,
+        } => {
+            let input = task_context_input(
+                locator,
+                intent,
+                enrich_local_prompt_signals(task_signals),
+                token_budget,
+            );
+            let response = sctx_mcp::task_context_at_root(installation_root()?, &input)?;
+            let pack = render_untrusted_task_context_pack(&task_pack(response))?;
+            Ok(Some(format!(
+                concat!(
+                    "Shared Context MCP is available for task retrieval, explicit search/get, and candidate_create.\n",
+                    "{}"
+                ),
+                pack
+            )))
+        }
+        TaskRuntimeOperation::MergeObservations {
+            locator,
+            cwd,
+            workspace_roots,
+            file_hints,
+            tool_name,
+            outcome,
+        } => {
+            let signals = normalized_observation_signals(
+                &cwd,
+                &workspace_roots,
+                &file_hints,
+                &tool_name,
+                outcome,
+            );
+            if !signals.is_empty() {
+                let runtime = TaskRuntime::initialize(installation_root()?)?;
+                let _outcome = runtime.merge_signals_by_locator(&locator, signals)?;
+            }
+            Ok(None)
+        }
     }
-    let runtime = Runtime::open()?;
-    let pack = SearchEngine::new(runtime.index).context_pack(&ContextPackRequest::automatic(
-        SearchRequest {
-            query,
-            filters: SearchFilters::default(),
-            page_size: 100,
-            cursor: None,
-        },
-        2_000,
-    ))?;
-    let pack = render_untrusted_context_pack(&pack)?;
-    Ok(format!(
-        concat!(
-            "Shared Context MCP is available for task retrieval, explicit search/get, and candidate_create.\n",
-            "{}"
-        ),
-        pack
-    ))
+}
+
+fn task_context_input(
+    locator: sctx_domain::ExternalSessionLocator,
+    intent: AgentTaskIntentDraft,
+    task_signals: Vec<TaskSignal>,
+    token_budget: usize,
+) -> TaskContextInput {
+    TaskContextInput {
+        agent_kind: locator.agent_kind,
+        external_session_id: locator.external_session_id,
+        goal: intent.goal,
+        desired_change: intent.desired_change,
+        in_scope: intent.in_scope,
+        out_of_scope: intent.out_of_scope,
+        domains: intent.domains,
+        platforms: intent.platforms,
+        constraints: intent.constraints,
+        acceptance_conditions: intent.acceptance_conditions,
+        artifacts: intent.artifacts,
+        interfaces: intent.interfaces,
+        unknowns: intent.unknowns,
+        task_signals,
+        token_budget,
+    }
+}
+
+fn task_pack(response: TaskContextResponse) -> TaskContextPack {
+    TaskContextPack {
+        indexed_tree_oid: response.tree,
+        projection_generation: response.generation,
+        task_id: response.task_id,
+        task_fingerprint: response.task_fingerprint,
+        token_budget: response.token_budget,
+        estimated_tokens: response.estimated_tokens,
+        mode: ContextPackMode::AutomaticInjection,
+        associations: response.candidate_spaces,
+        items: response.items,
+        omitted: response.omitted,
+    }
+}
+
+fn enrich_local_prompt_signals(signals: Vec<TaskSignal>) -> Vec<TaskSignal> {
+    let mut normalized = Vec::new();
+    for signal in signals {
+        match signal.kind {
+            TaskSignalKind::Workspace => {
+                let path = PathBuf::from(&signal.content);
+                let Ok(path) = fs::canonicalize(path) else {
+                    continue;
+                };
+                if !path.is_dir() {
+                    continue;
+                }
+                push_signal(
+                    &mut normalized,
+                    TaskSignalKind::Workspace,
+                    &path.to_string_lossy(),
+                );
+                if let Some(repository) = git_repository_root(&path) {
+                    push_signal(
+                        &mut normalized,
+                        TaskSignalKind::Repository,
+                        &repository.to_string_lossy(),
+                    );
+                }
+            }
+            _ => push_signal(&mut normalized, signal.kind, &signal.content),
+        }
+    }
+    normalized
+}
+
+fn git_repository_root(path: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["-C", path.to_str()?, "rev-parse", "--show-toplevel"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8(output.stdout).ok()?;
+    fs::canonicalize(root.trim()).ok()
+}
+
+fn normalized_observation_signals(
+    cwd: &Path,
+    workspace_roots: &[PathBuf],
+    file_hints: &[PathBuf],
+    tool_name: &str,
+    outcome: ToolOutcome,
+) -> Vec<TaskSignal> {
+    let roots = if workspace_roots.is_empty() {
+        vec![cwd.to_path_buf()]
+    } else {
+        workspace_roots.to_vec()
+    }
+    .into_iter()
+    .filter_map(|root| fs::canonicalize(root).ok())
+    .filter(|root| root.is_dir())
+    .collect::<Vec<_>>();
+    let mut signals = Vec::new();
+    for hint in file_hints {
+        let candidate = if hint.is_absolute() {
+            hint.clone()
+        } else {
+            cwd.join(hint)
+        };
+        let Ok(candidate) = fs::canonicalize(candidate) else {
+            continue;
+        };
+        if !candidate.is_file() {
+            continue;
+        }
+        let Some(root) = roots.iter().find(|root| candidate.starts_with(root)) else {
+            continue;
+        };
+        let Ok(relative) = candidate.strip_prefix(root) else {
+            continue;
+        };
+        push_signal(
+            &mut signals,
+            TaskSignalKind::File,
+            &relative.to_string_lossy(),
+        );
+    }
+    if is_test_tool(tool_name) {
+        let test_outcome = format!(
+            "{} {}",
+            tool_name.trim(),
+            match outcome {
+                ToolOutcome::Succeeded => "succeeded",
+                ToolOutcome::Failed => "failed",
+            }
+        );
+        push_signal(&mut signals, TaskSignalKind::Test, &test_outcome);
+    }
+    signals
+}
+
+fn is_test_tool(tool_name: &str) -> bool {
+    let name = tool_name.trim().to_ascii_lowercase();
+    ["test", "check", "lint"]
+        .iter()
+        .any(|word| name.contains(word))
+}
+
+fn push_signal(signals: &mut Vec<TaskSignal>, kind: TaskSignalKind, content: &str) {
+    let signal = TaskSignal {
+        kind,
+        content: content.trim().to_owned(),
+    };
+    if !signal.content.is_empty() && !signals.contains(&signal) {
+        signals.push(signal);
+    }
 }
 
 fn detect_agent_version(agent: &str) -> Option<String> {

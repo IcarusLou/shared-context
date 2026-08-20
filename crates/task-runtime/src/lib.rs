@@ -254,27 +254,44 @@ impl TaskRuntime {
                 "task_session_id does not identify a runtime Session",
             ));
         }
-
-        let mut inserted = 0;
-        for signal in &signals {
-            inserted += transaction
-                .execute(
-                    "INSERT OR IGNORE INTO task_signal (task_session_id, kind, content)
-                     VALUES (?1, ?2, ?3)",
-                    params![
-                        task_session_id.to_string(),
-                        signal_kind_name(signal.kind),
-                        signal.content,
-                    ],
-                )
-                .map_err(sql_error("merge Task Signal"))?;
-        }
-        let snapshot = read_snapshot_in_transaction(&transaction, task_session_id)?
-            .ok_or_else(|| invariant("Task Session disappeared while merging signals"))?;
+        let outcome = merge_signals_in_transaction(&transaction, task_session_id, &signals)?;
         transaction
             .commit()
             .map_err(sql_error("commit Task Signal transaction"))?;
-        Ok(MergeSignalsOutcome { snapshot, inserted })
+        Ok(outcome)
+    }
+
+    /// Atomically locates one external Agent Session and merges normalized Task Signals.
+    ///
+    /// A missing locator returns `None` and never creates a Task Session because a
+    /// signal-only observation cannot supply the initial Task Intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] for an invalid locator or signal, and
+    /// an I/O or invariant error when runtime persistence fails.
+    pub fn merge_signals_by_locator(
+        &self,
+        locator: &ExternalSessionLocator,
+        signals: Vec<TaskSignal>,
+    ) -> Result<Option<MergeSignalsOutcome>> {
+        locator.validate()?;
+        let signals = normalize_signals(signals)?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error("begin locator Task Signal transaction"))?;
+        let Some(task_session_id) = find_session_by_locator(&transaction, locator)? else {
+            transaction
+                .commit()
+                .map_err(sql_error("commit missing locator transaction"))?;
+            return Ok(None);
+        };
+        let outcome = merge_signals_in_transaction(&transaction, task_session_id, &signals)?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit locator Task Signal transaction"))?;
+        Ok(Some(outcome))
     }
 
     /// Reads one consistent Task Session snapshot.
@@ -298,6 +315,31 @@ impl TaskRuntime {
         Ok(snapshot)
     }
 
+    /// Reads one consistent Task Session snapshot by external Agent locator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] for an invalid locator, or an I/O or
+    /// invariant error when runtime state cannot be read.
+    pub fn read_snapshot_by_locator(
+        &self,
+        locator: &ExternalSessionLocator,
+    ) -> Result<Option<TaskSessionSnapshot>> {
+        locator.validate()?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(sql_error("begin locator Task Session snapshot transaction"))?;
+        let snapshot = find_session_by_locator(&transaction, locator)?
+            .map(|task_session_id| read_snapshot_in_transaction(&transaction, task_session_id))
+            .transpose()?
+            .flatten();
+        transaction.commit().map_err(sql_error(
+            "commit locator Task Session snapshot transaction",
+        ))?;
+        Ok(snapshot)
+    }
+
     fn open_connection(&self) -> Result<Connection> {
         let connection =
             Connection::open(&self.database).map_err(sql_error("open task runtime database"))?;
@@ -316,6 +358,30 @@ impl TaskRuntime {
         ensure_schema(&connection)?;
         Ok(connection)
     }
+}
+
+fn merge_signals_in_transaction(
+    transaction: &Transaction<'_>,
+    task_session_id: TaskSessionId,
+    signals: &[TaskSignal],
+) -> Result<MergeSignalsOutcome> {
+    let mut inserted = 0;
+    for signal in signals {
+        inserted += transaction
+            .execute(
+                "INSERT OR IGNORE INTO task_signal (task_session_id, kind, content)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    task_session_id.to_string(),
+                    signal_kind_name(signal.kind),
+                    signal.content,
+                ],
+            )
+            .map_err(sql_error("merge Task Signal"))?;
+    }
+    let snapshot = read_snapshot_in_transaction(transaction, task_session_id)?
+        .ok_or_else(|| invariant("Task Session disappeared while merging signals"))?;
+    Ok(MergeSignalsOutcome { snapshot, inserted })
 }
 
 fn ensure_schema(connection: &Connection) -> Result<()> {

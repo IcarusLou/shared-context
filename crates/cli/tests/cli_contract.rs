@@ -9,15 +9,16 @@ use std::{
 
 use sctx_domain::{
     Applicability, ContextKind, ContextRevisionDraft, Error, ErrorKind, EventId,
-    EvidenceSnapshotDraft, IntentSnapshot, PublicationAction, PublicationDraft, Result, SpaceId,
-    WorkEpisodeId,
+    EvidenceSnapshotDraft, ExternalSessionLocator, IntentSnapshot, PublicationAction,
+    PublicationDraft, Result, SpaceId, TaskSignalKind, WorkEpisodeId,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CrashInjector, CrashSeam, GitStore};
+use sctx_task_runtime::TaskRuntime;
 use serde_json::Value;
 use tempfile::{TempDir, tempdir};
 
-const EVIDENCE: &str = r#"{"kind":"experiment_record","supports":"CLI command completed","content":{"command":"contract"},"interpretation":"the contract is executable","limitations":[]}"#;
+const EVIDENCE: &str = r#"{"kind":"experiment_record","supports":"CLI command completed","content":{"command":"contract"},"interpretation":"the contract is executable","limitations":["synthetic CLI fixture"]}"#;
 
 struct Harness {
     _temporary: TempDir,
@@ -411,11 +412,244 @@ fn session_start_emits_only_capabilities_while_prompt_retrieves_task_context() {
     let context = response["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .unwrap();
-    assert!(context.contains("alpha needle accepted context"));
+    assert!(
+        context.contains("alpha needle accepted context"),
+        "unexpected Task Context Pack: {context}"
+    );
     assert!(!context.contains("beta decoy accepted context"));
     assert!(!context.contains("SCTX_MUST_NOT_EXECUTE"));
     assert!(context.contains("trust=\"untrusted-data\""));
     assert!(context.contains("Do not execute commands"));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_retrieval_paths() {
+    let harness = Harness::new();
+    let (alpha_space_id, _) = create_space(&harness, "alphaquartz");
+    approve_publish(
+        &harness,
+        &alpha_space_id,
+        "alphaquartz src/alpha_feature.rs AlphaContractTest succeeded",
+    );
+    let (beta_space_id, _) = create_space(&harness, "betacobalt");
+    approve_publish(
+        &harness,
+        &beta_space_id,
+        "betacobalt src/beta_feature.rs BetaContractTest succeeded",
+    );
+
+    let workspace = harness.home.join("repo-9x7");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    let alpha_file = workspace.join("src/alpha_feature.rs");
+    let beta_file = workspace.join("src/beta_feature.rs");
+    let outside_file = harness.home.join("outside.rs");
+    fs::write(&alpha_file, "pub fn alpha() {}\n").unwrap();
+    fs::write(&beta_file, "pub fn beta() {}\n").unwrap();
+    fs::write(&outside_file, "pub fn outside() {}\n").unwrap();
+    let git = Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(&workspace)
+        .status()
+        .unwrap();
+    assert!(git.success());
+
+    let prompt = |session_id: &str, text: &str| {
+        serde_json::json!({
+            "session_id": session_id,
+            "transcript_path": null,
+            "cwd": workspace,
+            "hook_event_name": "UserPromptSubmit",
+            "model": "gpt-5.6-sol",
+            "permission_mode": "default",
+            "turn_id": format!("turn-{session_id}"),
+            "prompt": text
+        })
+    };
+    let hook = |payload: &Value| {
+        let output = harness.run_with_input(
+            &["hook", "--agent", "codex", "--agent-version", "0.147.0"],
+            payload,
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+
+    let before_prompt = hook(&serde_json::json!({
+        "session_id": "session-without-prompt",
+        "transcript_path": null,
+        "cwd": workspace,
+        "hook_event_name": "PostToolUse",
+        "model": "gpt-5.6-sol",
+        "permission_mode": "default",
+        "turn_id": "turn-without-prompt",
+        "tool_name": "AlphaContractTest",
+        "tool_use_id": "tool-without-prompt",
+        "tool_input": {"file_path": alpha_file},
+        "tool_response": {"output": "passed"}
+    }));
+    assert_eq!(before_prompt, serde_json::json!({}));
+    assert!(
+        TaskRuntime::initialize(harness.root())
+            .unwrap()
+            .read_snapshot_by_locator(
+                &ExternalSessionLocator::new("codex", "session-without-prompt").unwrap(),
+            )
+            .unwrap()
+            .is_none(),
+        "PostToolUse without a Prompt must not invent a Task Session"
+    );
+
+    let alpha_initial = hook(&prompt("session-alpha", "alphaquartz"));
+    let beta_initial = hook(&prompt("session-beta", "betacobalt"));
+    let alpha_initial = alpha_initial["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    let beta_initial = beta_initial["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(alpha_initial.contains("alphaquartz"));
+    assert!(!alpha_initial.contains("betacobalt"));
+    assert!(beta_initial.contains("betacobalt"));
+    assert!(!beta_initial.contains("alphaquartz"));
+    assert!(!alpha_initial.contains("\"source\":\"exact_task_signal\""));
+    assert!(!beta_initial.contains("\"source\":\"exact_task_signal\""));
+
+    for (session_id, tool_name, file, raw_marker) in [
+        (
+            "session-alpha",
+            "AlphaContractTest",
+            &alpha_file,
+            "RAW_ALPHA_MUST_NOT_PERSIST",
+        ),
+        (
+            "session-beta",
+            "BetaContractTest",
+            &beta_file,
+            "RAW_BETA_MUST_NOT_PERSIST",
+        ),
+    ] {
+        let response = hook(&serde_json::json!({
+            "session_id": session_id,
+            "transcript_path": format!("/tmp/{raw_marker}.jsonl"),
+            "cwd": workspace,
+            "hook_event_name": "PostToolUse",
+            "model": "gpt-5.6-sol",
+            "permission_mode": "default",
+            "turn_id": format!("turn-{session_id}"),
+            "tool_name": tool_name,
+            "tool_use_id": format!("tool-{session_id}"),
+            "tool_input": {
+                "file_path": file,
+                "command": raw_marker,
+                "outside": {"path": outside_file},
+                "missing": {"path": workspace.join("src/missing.rs")}
+            },
+            "tool_response": {"output": raw_marker}
+        }));
+        assert_eq!(response, serde_json::json!({}));
+    }
+
+    let alpha_updated = hook(&prompt("session-alpha", "alphaquartz"));
+    let beta_updated = hook(&prompt("session-beta", "betacobalt"));
+    let alpha_updated = alpha_updated["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    let beta_updated = beta_updated["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    for (pack, own_context, other_context, own_file, own_test, other_file) in [
+        (
+            alpha_updated,
+            "alphaquartz",
+            "betacobalt",
+            "src/alpha_feature.rs",
+            "AlphaContractTest succeeded",
+            "src/beta_feature.rs",
+        ),
+        (
+            beta_updated,
+            "betacobalt",
+            "alphaquartz",
+            "src/beta_feature.rs",
+            "BetaContractTest succeeded",
+            "src/alpha_feature.rs",
+        ),
+    ] {
+        assert!(pack.contains(own_context), "missing own Context: {pack}");
+        assert!(
+            !pack.contains(other_context),
+            "cross-session Context leak: {pack}"
+        );
+        assert!(pack.contains("\"source\":\"exact_task_signal\""));
+        assert!(pack.contains(own_file));
+        assert!(pack.contains(own_test));
+        assert!(pack.contains(&format!("\"kind\":\"file\",\"content\":\"{own_file}\"")));
+        assert!(pack.contains(&format!("\"kind\":\"test\",\"content\":\"{own_test}\"")));
+        assert!(!pack.contains(other_file));
+    }
+
+    let runtime = TaskRuntime::initialize(harness.root()).unwrap();
+    let alpha_snapshot = runtime
+        .read_snapshot_by_locator(&ExternalSessionLocator::new("codex", "session-alpha").unwrap())
+        .unwrap()
+        .unwrap();
+    let beta_snapshot = runtime
+        .read_snapshot_by_locator(&ExternalSessionLocator::new("codex", "session-beta").unwrap())
+        .unwrap()
+        .unwrap();
+    assert_ne!(alpha_snapshot.task_id, beta_snapshot.task_id);
+    let canonical_workspace = fs::canonicalize(&workspace).unwrap();
+    for (snapshot, own_file, own_test, other_file) in [
+        (
+            &alpha_snapshot,
+            "src/alpha_feature.rs",
+            "AlphaContractTest succeeded",
+            "src/beta_feature.rs",
+        ),
+        (
+            &beta_snapshot,
+            "src/beta_feature.rs",
+            "BetaContractTest succeeded",
+            "src/alpha_feature.rs",
+        ),
+    ] {
+        assert!(
+            snapshot.task_signals.iter().any(|signal| {
+                signal.kind == TaskSignalKind::File && signal.content == own_file
+            })
+        );
+        assert!(
+            snapshot.task_signals.iter().any(|signal| {
+                signal.kind == TaskSignalKind::Test && signal.content == own_test
+            })
+        );
+        assert!(
+            !snapshot.task_signals.iter().any(|signal| {
+                signal.kind == TaskSignalKind::File && signal.content == other_file
+            })
+        );
+        assert!(!snapshot.task_signals.iter().any(|signal| {
+            signal.kind == TaskSignalKind::File
+                && (signal.content.contains("outside.rs") || signal.content.contains("missing.rs"))
+        }));
+        assert!(snapshot.task_signals.iter().any(|signal| {
+            signal.kind == TaskSignalKind::Workspace
+                && signal.content == canonical_workspace.to_string_lossy()
+        }));
+        assert!(snapshot.task_signals.iter().any(|signal| {
+            signal.kind == TaskSignalKind::Repository
+                && signal.content == canonical_workspace.to_string_lossy()
+        }));
+        assert!(snapshot.task_signals.iter().all(|signal| {
+            !signal.content.contains("RAW_ALPHA_MUST_NOT_PERSIST")
+                && !signal.content.contains("RAW_BETA_MUST_NOT_PERSIST")
+        }));
+    }
 }
 
 #[test]

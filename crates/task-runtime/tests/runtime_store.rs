@@ -232,6 +232,60 @@ fn signals_are_normalized_and_merged_without_duplicates() {
 }
 
 #[test]
+fn locator_merge_updates_only_an_existing_session_and_never_creates_one() {
+    let root = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(root.path()).unwrap();
+    assert!(
+        runtime
+            .merge_signals_by_locator(
+                &locator("missing-session"),
+                vec![signal(TaskSignalKind::File, "src/missing.rs")],
+            )
+            .unwrap()
+            .is_none()
+    );
+
+    let session = runtime
+        .open_or_create(
+            locator("session-a"),
+            intent(TaskId::new(), "locator merge"),
+            vec![signal(TaskSignalKind::Prompt, "locator merge")],
+        )
+        .unwrap()
+        .snapshot;
+    let outcome = runtime
+        .merge_signals_by_locator(
+            &locator("session-a"),
+            vec![
+                signal(TaskSignalKind::File, " src/search.rs "),
+                signal(TaskSignalKind::Test, "SearchContractTest succeeded"),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(outcome.snapshot.task_session_id, session.task_session_id);
+    assert_eq!(outcome.inserted, 2);
+    assert!(
+        outcome
+            .snapshot
+            .task_signals
+            .contains(&signal(TaskSignalKind::File, "src/search.rs"))
+    );
+    assert!(outcome.snapshot.task_signals.contains(&signal(
+        TaskSignalKind::Test,
+        "SearchContractTest succeeded"
+    )));
+    assert_eq!(
+        runtime
+            .read_snapshot_by_locator(&locator("session-a"))
+            .unwrap()
+            .unwrap(),
+        outcome.snapshot
+    );
+}
+
+#[test]
 fn same_workspace_signal_does_not_join_external_sessions() {
     let root = TempDir::new().unwrap();
     let runtime = TaskRuntime::initialize(root.path()).unwrap();

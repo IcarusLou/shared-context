@@ -13,7 +13,7 @@
 
 以下能力**尚未实现**，不得在代码、测试报告或评审中宣称已经具备：
 
-- **M2：部分实现** — TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 检索、多 Space 推断、可解释 TaskContextPack 及 `task_context` 已实现；Agent Hook 的动态 Session/TaskSignal 接入和阶段总验收尚未完成。
+- **M2：部分实现** — TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 检索、多 Space 推断、可解释 TaskContextPack、显式 `task_context` 及 Codex 动态 Session 已实现；Cursor 仍显式 MCP，阶段总验收尚未完成。
 - **M3：未实现** — Engineering Graph、Repository/File/Symbol/API/Schema/Test 关联、重新解析与关系扩展。
 - **M4：未实现** — WorkEpisode 自动聚合、AgentCheckpoint、Candidate Builder、去重/冲突/Space 推荐和 Candidate confirm/list/discard。
 

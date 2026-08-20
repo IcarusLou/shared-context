@@ -10,18 +10,18 @@
 
 本项目尚未上线，本文直接定义目标模型、接口和存储结构。
 
-### 1.1 当前实现状态（Mew #123）
+### 1.1 当前实现状态（Mew #124）
 
 本文的大部分章节描述目标架构，不代表代码已经全部实现。当前里程碑边界如下：
 
 | 里程碑 | 状态 | 当前代码事实 |
 |---|---|---|
 | **M1：Task-first 领域与入口基础** | **已实现** | `TaskIntent` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；CLI/MCP 通过 `candidate_create` 创建无 Space Candidate；Candidate 不可自动注入 |
-| **M2：Task Runtime 与多 Space Retrieval** | **部分实现** | TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 召回、多 Space 关联、TaskContextPack 和显式 `task_context` 已实现；动态 Agent Hook 接入与阶段总验收尚未完成 |
+| **M2：Task Runtime 与多 Space Retrieval** | **部分实现** | TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 召回、多 Space 关联、TaskContextPack、显式 `task_context` 和 Codex 动态 Hook Session 已实现；阶段总验收尚未完成 |
 | **M3：Engineering Graph** | **未实现** | 尚无工程对象扫描、ContextArtifactAssociation、移动/改名重解析或关系图扩展 |
 | **M4：Low-tax Capture** | **未实现** | 尚无 WorkEpisode 自动聚合、AgentCheckpoint、Candidate Builder、去重/冲突、Space 推荐或 Candidate Confirm/List/Discard |
 
-当前 `task_context` 已通过外部 Session Locator 续接本地 TaskSession，修订 TaskIntent、合并 TaskSignals，并生成可解释的多 Space TaskContextPack；它仍未接入 Agent Hook 的动态事件链。当前 `candidate_create` 是手工、无归属的 M1 可执行入口，不等同于 M4 的自动 Capture。M1 为验证 Candidate 隔离和 Writer 主路径，使用 `context_candidate.created` 事件及独立投影保存 Candidate；第 5.5、6、9、10、12、13 节中关于完整 Runtime/Candidate Confirm 的描述仍是 M4 目标。
+当前 `task_context` 已通过外部 Session Locator 续接本地 TaskSession，修订 TaskIntent、合并 TaskSignals，并生成可解释的多 Space TaskContextPack。受支持的 Codex PromptSubmit 已复用这条共享路径；PostToolUse 只把可证明的本地 File Hint 和结构化 Test outcome 合并到同一 Session。Cursor Prompt Hook 仍保持只可观察，依赖显式 MCP；当前接入不扫描代码、不解析关系图。当前 `candidate_create` 是手工、无归属的 M1 可执行入口，不等同于 M4 的自动 Capture。
 
 ## 2. 背景与目标
 
@@ -991,8 +991,8 @@ Adapter 只翻译厂商 Payload。TaskIntent、Git Diff、代码扫描、检索�
 ### 13.4 动态检索策略
 
 - SessionStart：仅注入系统能力说明；不得构造或执行空查询 Context Pack，也不注入任何知识项或假定 Space 摘要。
-- PromptSubmit：创建/更新 TaskIntent，执行初始 Task Retrieval。
-- PostToolUse：记录结构化信号；关键 Artifact 或 Diff 变化达到阈值时增量刷新 Context Pack。
+- PromptSubmit：用 `(agent_kind, session_id)` 定位 Session，从 Prompt 形成无 Task ID 的 Intent Draft，并经共享 `task_context` 路径创建/更新 TaskIntent 和 TaskContextPack。
+- PostToolUse：保留 Breadcrumb，并向已存在 Session 合并 Workspace 内真实 File Hint 与可识别 Test/Check/Lint 工具的结构化 outcome；Prompt 前没有 Session 时不隐式创建，不保存原始 Tool Output、Transcript 或命令文本。
 - PreCompact：生成 Checkpoint，刷新并压缩当前最相关 Context。
 - TurnStop：固化 WorkEpisode，触发 Candidate Builder。
 - SessionEnd：清理或延长未确认 Candidate TTL。
@@ -1219,7 +1219,9 @@ M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命�
 - `runtime.sqlite`、TaskSession、TaskIntent Revision 及并发线性 Head 已实现。
 - 完整 Space Intent FTS、Task 多路召回、Space 关联推断、解释路径和 Session 隔离已实现。
 - 显式 `task_context` 已按 external Session Locator 更新 Runtime，并返回固定 Task Revision 与知识 Projection 上的 TaskContextPack。
-- Prompt/File/Symbol/Diff/API/Schema/Test 从 Agent Hook 动态汇入同一 Session 的接入尚未实现，M2 阶段总验收尚未完成。
+- Codex PromptSubmit 已通过 vendor-neutral typed Task operation 接入同一 Runtime；Prompt、Workspace 和本地 Git Repository 作为 TaskSignals。
+- PostToolUse 已按 locator 合并经存在性与 Workspace 边界校验的 File Hint，以及结构化 Test outcome；后续 Prompt 能观察新的检索路径。
+- Cursor Prompt 仍为显式 MCP；Symbol/Diff/API/Schema 的动态推导和 M2 阶段总验收尚未完成。
 
 ### M3：Engineering Graph — 未实现
 
