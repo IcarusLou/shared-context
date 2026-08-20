@@ -229,7 +229,7 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
     assert!(help.status.success());
     for command in [
         "setup [--demo] [--agents cursor,codex]",
-        "demo [--workspace PATH]",
+        "demo",
         "doctor [--fix]",
         "upgrade [--agents cursor,codex]",
         "uninstall [--root PATH]",
@@ -478,24 +478,6 @@ fn lifecycle_commands_share_stable_json_tree_and_generation_envelopes() {
     );
     harness.success(&["space", "get", "--space-id", &space_id]);
 
-    let workspace = harness.home.join("业务 workspace 中文");
-    fs::create_dir_all(&workspace).unwrap();
-    harness.success(&[
-        "workspace",
-        "bind",
-        "--workspace",
-        workspace.to_str().unwrap(),
-        "--space-id",
-        &space_id,
-    ]);
-    assert_eq!(
-        harness.success(&["workspace", "list"])["data"]["bindings"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-
     let (context_id, first_revision) = propose(&harness, &space_id, "first snapshot");
     let revised = harness.success(&[
         "context",
@@ -596,13 +578,6 @@ fn lifecycle_commands_share_stable_json_tree_and_generation_envelopes() {
     harness.success(&["index", "status"]);
     harness.success(&["index", "rebuild"]);
     harness.success(&["validate", "--staged"]);
-    harness.success(&[
-        "workspace",
-        "unbind",
-        "--workspace",
-        workspace.to_str().unwrap(),
-    ]);
-
     let human = Command::new(env!("CARGO_BIN_EXE_sctx"))
         .args(["space", "list"])
         .env("HOME", &harness.home)

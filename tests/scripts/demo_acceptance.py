@@ -155,8 +155,7 @@ def main() -> None:
 
         local_config = tomllib.loads((home / ".shared-context/config.toml").read_text())
         require(Path(local_config["store"]) == repository, "config does not point to the sole repository")
-        bindings = local_config["workspace_bindings"]
-        require(bindings == [{"workspace": str(workspace.resolve()), "space_id": space_id}], "workspace binding differs from oracle")
+        require(set(local_config) == {"version", "store"}, "config contains state beyond the sole repository")
         require("# keep leading comment" in (home / ".codex/config.toml").read_text(), "Codex TOML comment was lost")
 
         shutil.rmtree(workspace)

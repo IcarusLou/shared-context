@@ -17,8 +17,8 @@ use std::{
 
 use args::Options;
 use sctx_agent_adapter::{
-    AgentCapabilities, CanonicalAgentAction, CanonicalAgentEvent, CanonicalBreadcrumbKind,
-    ResolvedAgentAction, TrustState, plan_action, render_untrusted_context_pack,
+    AgentCapabilities, CanonicalAgentAction, CanonicalBreadcrumbKind, ResolvedAgentAction,
+    TrustState, plan_action, render_untrusted_context_pack,
 };
 use sctx_domain::{
     Applicability, ConflictParticipant, ConflictResolutionDraft, ConflictResolutionResult,
@@ -32,7 +32,7 @@ use sctx_git_store::{AppendOutcome, AppendRequest, BatchId, GitStore};
 use sctx_index::{
     DomainSnapshot, IndexMetadata, ProjectionDiagnosticView, ProjectionIndex, RebuildOutcome,
 };
-use sctx_local_state::{Breadcrumb, BreadcrumbKind, CaptureStore, UserConfigStore};
+use sctx_local_state::{Breadcrumb, BreadcrumbKind, CaptureStore};
 use sctx_search::{
     ContextPackMode, ContextPackRequest, ContextStatus, ScopeFilter, SearchEngine, SearchFilters,
     SearchRequest,
@@ -46,7 +46,7 @@ Usage: sctx [--json] <COMMAND>
 
 Commands:
   setup [--demo] [--agents cursor,codex] [--root PATH] [--runtime-source PATH]
-  demo [--workspace PATH]
+  demo
   doctor [--fix] [--root PATH]
   upgrade [--agents cursor,codex] [--root PATH] [--runtime-source PATH]
   uninstall [--root PATH]
@@ -54,7 +54,6 @@ Commands:
   space create|intent revise|list|get
   context propose|revise|review|publish|withdraw|get
   semantic conflict open|resolve
-  workspace bind|list|unbind
   search
   context-pack
   index rebuild|status
@@ -145,7 +144,6 @@ fn run(args: &[String], json_output: bool) -> Result<()> {
         }
         [group, rest @ ..] if group == "context" => run_context(rest, json_output),
         [group, rest @ ..] if group == "semantic" => run_semantic(rest, json_output),
-        [group, rest @ ..] if group == "workspace" => run_workspace(rest, json_output),
         [command, rest @ ..] if command == "search" => run_search(rest, json_output),
         [command, rest @ ..] if command == "context-pack" => run_context_pack(rest, json_output),
         [group, rest @ ..] if group == "index" => run_index(rest, json_output),
@@ -179,13 +177,7 @@ fn run_install_lifecycle(command: &str, args: &[String], json_output: bool) -> R
         installer.upgrade(&setup)?
     };
     if options.has("--demo") {
-        let workspace = env::current_dir().map_err(|error| {
-            Error::new(
-                ErrorKind::Io,
-                format!("resolve current workspace for demo: {error}"),
-            )
-        })?;
-        let (demo, metadata) = complete_demo(&workspace, &report.root)?;
+        let (demo, metadata) = complete_demo(&report.root)?;
         emit(
             "setup.demo",
             &metadata,
@@ -338,18 +330,9 @@ const DEMO_QUERY: &str = "searchable CLI MCP";
 
 fn run_demo(args: &[String], json_output: bool) -> Result<()> {
     let options = Options::parse(args, &[])?;
-    options.allow_only(&["--workspace"], &[])?;
-    let workspace = options
-        .optional("--workspace")?
-        .map_or_else(env::current_dir, |path| Ok(PathBuf::from(path)))
-        .map_err(|error| {
-            Error::new(
-                ErrorKind::Io,
-                format!("resolve current workspace for demo: {error}"),
-            )
-        })?;
+    options.allow_only(&[], &[])?;
     let root = installation_root()?;
-    let (report, metadata) = complete_demo(&workspace, &root)?;
+    let (report, metadata) = complete_demo(&root)?;
     emit("demo", &metadata, report, json_output)
 }
 
@@ -402,7 +385,7 @@ fn demo_context() -> ContextRevisionDraft {
 }
 
 #[allow(clippy::too_many_lines)]
-fn complete_demo(workspace: &Path, root: &Path) -> Result<(Value, IndexMetadata)> {
+fn complete_demo(root: &Path) -> Result<(Value, IndexMetadata)> {
     let runtime = Runtime::open_at(root)?;
     let mut created_event_count = 0_usize;
     let mut snapshot = runtime.domain_snapshot()?;
@@ -441,9 +424,6 @@ fn complete_demo(workspace: &Path, root: &Path) -> Result<(Value, IndexMetadata)
             )));
         }
     };
-
-    let config = UserConfigStore::initialize(runtime.store.root())?;
-    let binding = config.bind(workspace, space_id)?;
 
     let space = snapshot
         .projection
@@ -571,7 +551,6 @@ fn complete_demo(workspace: &Path, root: &Path) -> Result<(Value, IndexMetadata)
     Ok((
         json!({
             "repository": runtime.store.repository(),
-            "workspace": binding.workspace(),
             "space_id": space_id,
             "context_id": context_id,
             "revision_id": revision_id,
@@ -711,7 +690,7 @@ fn run_hook(args: &[String]) -> Result<()> {
     let trust = parse_trust(agent, None, true)?;
     let capabilities = agent_capabilities(agent, version.as_deref(), true, trust);
     let action = plan_action(&event, &capabilities);
-    let resolved = resolve_hook_action(&event, action)?;
+    let resolved = resolve_hook_action(action)?;
     let output = if agent == "cursor" {
         sctx_adapter_cursor::encode_hook_output(event.kind(), &resolved)?
     } else {
@@ -742,10 +721,7 @@ fn agent_capabilities(
     }
 }
 
-fn resolve_hook_action(
-    event: &CanonicalAgentEvent,
-    action: CanonicalAgentAction,
-) -> Result<ResolvedAgentAction> {
+fn resolve_hook_action(action: CanonicalAgentAction) -> Result<ResolvedAgentAction> {
     if let Some(breadcrumb) = action.breadcrumb {
         CaptureStore::initialize(installation_root()?)?.capture(&Breadcrumb {
             kind: match breadcrumb.kind {
@@ -759,7 +735,7 @@ fn resolve_hook_action(
     }
     let additional_context = action
         .context_query
-        .map(|query| automatic_hook_context(event, query))
+        .map(automatic_hook_context)
         .transpose()?;
     Ok(ResolvedAgentAction {
         additional_context,
@@ -767,15 +743,13 @@ fn resolve_hook_action(
     })
 }
 
-fn automatic_hook_context(event: &CanonicalAgentEvent, query: String) -> Result<String> {
-    let root = installation_root()?;
+fn automatic_hook_context(query: String) -> Result<String> {
     let runtime = Runtime::open()?;
-    let preferred_space_id = preferred_space_for_event(&root, event)?;
     let pack = SearchEngine::new(runtime.index).context_pack(&ContextPackRequest::automatic(
         SearchRequest {
             query,
             filters: SearchFilters::default(),
-            preferred_space_id,
+            preferred_space_id: None,
             page_size: 100,
             cursor: None,
         },
@@ -789,23 +763,6 @@ fn automatic_hook_context(event: &CanonicalAgentEvent, query: String) -> Result<
         ),
         pack
     ))
-}
-
-fn preferred_space_for_event(root: &Path, event: &CanonicalAgentEvent) -> Result<Option<SpaceId>> {
-    let config = UserConfigStore::initialize(root)?;
-    for workspace in event
-        .context()
-        .workspace_roots
-        .iter()
-        .chain(std::iter::once(&event.context().cwd))
-    {
-        if workspace.exists() {
-            if let Some(hint) = config.query_hint(workspace)? {
-                return Ok(Some(hint.space_id()));
-            }
-        }
-    }
-    Ok(None)
 }
 
 fn detect_agent_version(agent: &str) -> Option<String> {
@@ -1480,59 +1437,6 @@ fn run_conflict_resolve(args: &[String], json_output: bool) -> Result<()> {
                "batch_id": append.batch_id, "commit_oid": append.commit_oid}),
         json_output,
     )
-}
-
-fn run_workspace(args: &[String], json_output: bool) -> Result<()> {
-    let runtime = Runtime::open()?;
-    let config = UserConfigStore::initialize(runtime.store.root())?;
-    match args {
-        [command, rest @ ..] if command == "bind" => {
-            let options = Options::parse(rest, &[])?;
-            options.allow_only(&["--workspace", "--space-id"], &[])?;
-            let space_id = parse_id(options.required("--space-id")?, "space ID")?;
-            let binding = config.bind(options.required("--workspace")?, space_id)?;
-            let snapshot = runtime.domain_snapshot()?;
-            emit(
-                "workspace.bind",
-                &snapshot.metadata,
-                json!({"workspace": binding.workspace(), "space_id": binding.space_id()}),
-                json_output,
-            )
-        }
-        [command] if command == "list" => {
-            let snapshot = runtime.domain_snapshot()?;
-            let bindings = config
-                .list()?
-                .into_iter()
-                .map(|binding| {
-                    json!({"workspace": binding.workspace(), "space_id": binding.space_id()})
-                })
-                .collect::<Vec<_>>();
-            emit(
-                "workspace.list",
-                &snapshot.metadata,
-                json!({"bindings": bindings}),
-                json_output,
-            )
-        }
-        [command, rest @ ..] if command == "unbind" => {
-            let options = Options::parse(rest, &[])?;
-            options.allow_only(&["--workspace"], &[])?;
-            let workspace = options.required("--workspace")?;
-            let binding = config.unbind(workspace)?;
-            let snapshot = runtime.domain_snapshot()?;
-            emit(
-                "workspace.unbind",
-                &snapshot.metadata,
-                json!({"workspace": workspace, "removed": binding.is_some(),
-                       "space_id": binding.map(|value| value.space_id())}),
-                json_output,
-            )
-        }
-        _ => Err(invalid(
-            "invalid workspace command; expected bind|list|unbind",
-        )),
-    }
 }
 
 fn run_search(args: &[String], json_output: bool) -> Result<()> {

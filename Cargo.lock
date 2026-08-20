@@ -605,7 +605,6 @@ version = "0.1.0"
 dependencies = [
  "fs2",
  "sctx-domain",
- "sctx-event-schema",
  "serde",
  "serde_json",
  "tempfile",

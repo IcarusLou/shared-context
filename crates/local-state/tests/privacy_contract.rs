@@ -1,9 +1,6 @@
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
-use sctx_event_schema::{Event, IntentSnapshot, reduce};
-use sctx_local_state::{
-    Breadcrumb, BreadcrumbKind, CaptureStore, PrivacyScanner, SpaceId, UserConfigStore,
-};
+use sctx_local_state::{Breadcrumb, BreadcrumbKind, CaptureStore, PrivacyScanner, UserConfigStore};
 use serde::Deserialize;
 use tempfile::tempdir;
 
@@ -73,47 +70,18 @@ fn capture_boundary_redacts_every_shared_privacy_fixture() {
 }
 
 #[test]
-fn workspace_binding_is_only_a_query_hint_and_cannot_change_reducer_or_ids() {
+fn configuration_contains_only_the_single_context_store() {
     let temporary = tempdir().unwrap();
     let root = temporary.path().join("用户 配置");
-    let workspace = temporary.path().join("业务 项目中文");
-    fs::create_dir_all(&workspace).unwrap();
+
     let config = UserConfigStore::initialize(&root).unwrap();
-    let event = Event::space_created(
-        IntentSnapshot {
-            title: "Stable identity".to_owned(),
-            problem: "Local mappings change".to_owned(),
-            desired_outcome: "Domain projection does not".to_owned(),
-            in_scope: vec!["Workspace query hints".to_owned()],
-            out_of_scope: vec!["Reducer input".to_owned()],
-            acceptance_conditions: vec!["Projection remains equal".to_owned()],
-            domain_terms: Vec::new(),
-        },
-        None,
-    )
-    .unwrap();
-    let event_id = event.event_id();
-    let reducer_event = event.reducer_event().unwrap();
-    let before = reduce(std::slice::from_ref(&reducer_event));
+    let document = fs::read_to_string(root.join("config.toml")).unwrap();
+    let parsed = document.parse::<toml::Table>().unwrap();
 
-    let first_hint = config
-        .bind(&workspace, SpaceId::new())
-        .unwrap()
-        .query_hint();
-    let second_hint = config
-        .bind(&workspace, SpaceId::new())
-        .unwrap()
-        .query_hint();
-    let after = reduce(&[reducer_event]);
-
-    assert_ne!(first_hint, second_hint);
-    assert_eq!(before, after);
-    assert_eq!(event.event_id(), event_id);
     assert_eq!(config.repository(), root.join("repository"));
-    assert_eq!(
-        config.list().unwrap()[0].workspace(),
-        fs::canonicalize(workspace).unwrap()
-    );
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed["version"].as_integer(), Some(1));
+    assert_eq!(parsed["store"].as_str(), config.repository().to_str());
 }
 
 #[test]

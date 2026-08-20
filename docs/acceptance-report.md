@@ -13,7 +13,7 @@ All acceptance claims that can be automated on this Apple Silicon host are prove
 The black-box harness is `tests/scripts/demo_acceptance.py`; its fixed expected values are in `tests/oracles/demo-v1.json`. The oracle does not turn CLI output into expected data. It independently:
 
 - reads the committed Git Tree and asserts the exact four-event type multiset;
-- validates random UUIDv4 IDs, fixed authoritative fixture text, the sole repository path, and the sole WorkspaceBinding;
+- validates random UUIDv4 IDs, fixed authoritative fixture text, and the sole repository path;
 - preserves seeded unknown Cursor/Codex fields and Codex TOML comments, then compares Agent config bytes across the second and third `setup --demo` runs;
 - drives CLI Search and two independent MCP sessions (Cursor and Codex client selection); distinct framing is covered by the Rust MCP contract;
 - deletes the original business Git workspace, branch, and commit, then proves the published Context remains searchable;
