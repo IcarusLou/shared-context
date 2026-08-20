@@ -42,10 +42,10 @@ impl Fixture {
             _ => unreachable!(),
         };
         append(&store, created);
-        let proposed =
-            Event::context_proposed(space_id, draft("stdio MCP contract"), None).unwrap();
-        let (context_id, revision_id) = context_identity(&proposed);
-        append(&store, proposed);
+        let revision_added =
+            Event::context_revision_added(space_id, draft("stdio MCP contract"), None).unwrap();
+        let (context_id, revision_id) = context_identity(&revision_added);
+        append(&store, revision_added);
         append(
             &store,
             Event::publication_changed(
@@ -248,7 +248,11 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
             tool_call(
                 3,
                 "context_search",
-                json!({"query": "stdio MCP", "statuses": ["accepted"]}),
+                json!({
+                    "query": "stdio MCP",
+                    "space_ids": [fixture.space_id],
+                    "statuses": ["accepted"]
+                }),
             ),
             tool_call(
                 4,
@@ -262,7 +266,7 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
             tool_call(
                 5,
                 "context_for_task",
-                json!({"task": "verify stdio MCP contract", "space_id": fixture.space_id}),
+                json!({"task": "verify stdio MCP contract"}),
             ),
             tool_call(
                 6,
@@ -302,8 +306,6 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
             "revision_id",
             "path",
             "publication",
-            "space_id",
-            "preferred_space_id",
             "workspace",
         ] {
             assert!(
@@ -311,6 +313,31 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
                 "forbidden Candidate field: {forbidden}"
             );
         }
+        assert!(!schema_text.contains("space"));
+        let task_schema = &tools
+            .iter()
+            .find(|tool| tool["name"] == "context_for_task")
+            .unwrap()["inputSchema"];
+        assert!(task_schema["properties"].get("task").is_some());
+        assert!(
+            task_schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|field| !field.contains("space") && !field.contains("workspace"))
+        );
+        let search_schema = &tools
+            .iter()
+            .find(|tool| tool["name"] == "context_search")
+            .unwrap()["inputSchema"];
+        assert!(search_schema["properties"].get("space_ids").is_some());
+        assert!(
+            search_schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|field| !field.starts_with("preferred"))
+        );
         assert_eq!(candidate_schema["additionalProperties"], false);
         assert!(
             candidate_schema["required"]
@@ -350,6 +377,29 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
         let spaces = &responses[6]["result"]["structuredContent"];
         assert_eq!(spaces["spaces"].as_array().unwrap().len(), 1);
     }
+}
+
+#[test]
+fn context_for_task_rejects_a_caller_supplied_space_route() {
+    let fixture = Fixture::new();
+    let responses = run_session(
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::Newline,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(
+                2,
+                "context_for_task",
+                json!({"task": "find task context", "space_id": fixture.space_id}),
+            ),
+        ],
+    );
+
+    assert_eq!(responses[1]["result"]["isError"], true);
+    assert_eq!(
+        responses[1]["result"]["structuredContent"]["error"]["code"],
+        "invalid_input"
+    );
 }
 
 #[test]

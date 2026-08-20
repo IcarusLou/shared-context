@@ -61,8 +61,6 @@ pub struct SearchFilters {
 pub struct SearchRequest {
     pub query: String,
     pub filters: SearchFilters,
-    /// Preferred Space is a ranking boost, while `filters.space_ids` is a hard restriction.
-    pub preferred_space_id: Option<SpaceId>,
     pub page_size: usize,
     pub cursor: Option<String>,
 }
@@ -72,7 +70,6 @@ impl Default for SearchRequest {
         Self {
             query: String::new(),
             filters: SearchFilters::default(),
-            preferred_space_id: None,
             page_size: DEFAULT_PAGE_SIZE,
             cursor: None,
         }
@@ -92,7 +89,6 @@ pub enum MatchField {
 /// Explainable ranking inputs returned with every hit.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MatchReason {
-    pub exact_space: bool,
     pub matched_fields: Vec<MatchField>,
     pub matched_tokens: Vec<String>,
     pub bm25: f64,
@@ -392,7 +388,6 @@ struct CursorPayload {
     version: u8,
     tree_oid: String,
     query_fingerprint: String,
-    space_rank: i64,
     relevance_bits: u64,
     evidence_completeness: i64,
     context_id: String,
@@ -403,7 +398,6 @@ struct CursorPayload {
 #[derive(Debug)]
 struct RankedRow {
     result: SearchResult,
-    space_rank: i64,
     relevance: f64,
     evidence_completeness: i64,
 }
@@ -453,22 +447,13 @@ fn search_in_snapshot(
 
     let status = status_expression();
     let evidence = evidence_expression();
-    let space_rank = if request.preferred_space_id.is_some() {
-        "CASE WHEN revision.space_id = ? THEN 0 ELSE 1 END"
-    } else {
-        "0"
-    };
     let relevance = if match_expression.is_some() {
         "bm25(context_fts, 0.0, 0.0, 10.0, 8.0, 4.0, 2.0)"
     } else {
         "0.0"
     };
-    let mut parameters = Vec::new();
-    if let Some(space_id) = request.preferred_space_id {
-        parameters.push(SqlValue::Text(space_id.to_string()));
-    }
-    parameters.extend(base_parameters);
-    let simple_rank = match_expression.is_none() && request.preferred_space_id.is_none();
+    let mut parameters = base_parameters;
+    let simple_rank = match_expression.is_none();
     let cursor_sql = if let Some(cursor) = &cursor {
         if simple_rank {
             parameters.extend([
@@ -485,27 +470,21 @@ fn search_in_snapshot(
         } else {
             let relevance = f64::from_bits(cursor.relevance_bits);
             parameters.extend([
-                SqlValue::Integer(cursor.space_rank),
-                SqlValue::Integer(cursor.space_rank),
                 SqlValue::Real(relevance),
-                SqlValue::Integer(cursor.space_rank),
                 SqlValue::Real(relevance),
                 SqlValue::Integer(cursor.evidence_completeness),
-                SqlValue::Integer(cursor.space_rank),
                 SqlValue::Real(relevance),
                 SqlValue::Integer(cursor.evidence_completeness),
                 SqlValue::Text(cursor.context_id.clone()),
-                SqlValue::Integer(cursor.space_rank),
                 SqlValue::Real(relevance),
                 SqlValue::Integer(cursor.evidence_completeness),
                 SqlValue::Text(cursor.context_id.clone()),
                 SqlValue::Text(cursor.revision_id.clone()),
             ]);
-            "WHERE space_rank > ?
-          OR (space_rank = ? AND relevance > ?)
-          OR (space_rank = ? AND relevance = ? AND evidence_completeness < ?)
-          OR (space_rank = ? AND relevance = ? AND evidence_completeness = ? AND context_id > ?)
-          OR (space_rank = ? AND relevance = ? AND evidence_completeness = ? AND context_id = ? AND revision_id > ?)"
+            "WHERE relevance > ?
+          OR (relevance = ? AND evidence_completeness < ?)
+          OR (relevance = ? AND evidence_completeness = ? AND context_id > ?)
+          OR (relevance = ? AND evidence_completeness = ? AND context_id = ? AND revision_id > ?)"
         }
     } else {
         ""
@@ -516,8 +495,7 @@ fn search_in_snapshot(
     let order_sql = if simple_rank {
         "evidence_completeness DESC, context_id ASC, revision_id ASC"
     } else {
-        "space_rank ASC, relevance ASC, evidence_completeness DESC,
-         context_id ASC, revision_id ASC"
+        "relevance ASC, evidence_completeness DESC, context_id ASC, revision_id ASC"
     };
     let sql = format!(
         "WITH ranked AS (
@@ -525,8 +503,8 @@ fn search_in_snapshot(
                   COALESCE(space.title, ''), revision.kind, {status} AS result_status,
                   revision.statement, revision.rationale, revision.applicability_json,
                   revision.assumptions_json, revision.recheck_when_json,
-                  item.auto_injection_eligible, {space_rank} AS space_rank,
-                  {relevance} AS relevance, {evidence} AS evidence_completeness
+                  item.auto_injection_eligible, {relevance} AS relevance,
+                  {evidence} AS evidence_completeness
            FROM {from_sql}
            WHERE {where_sql}
          )
@@ -575,10 +553,9 @@ fn search_in_snapshot(
             .get::<_, i64>(11)
             .map_err(sql_error("read injection eligibility"))?
             != 0;
-        let row_space_rank = row.get(12).map_err(sql_error("read Space rank"))?;
-        let row_relevance = row.get(13).map_err(sql_error("read BM25 rank"))?;
+        let row_relevance = row.get(12).map_err(sql_error("read BM25 rank"))?;
         let row_evidence = row
-            .get(14)
+            .get(13)
             .map_err(sql_error("read Evidence completeness"))?;
         let evidence = load_evidence(connection, revision_id)?;
         let conflicts = load_conflicts(connection, context_id, revision_id)?;
@@ -588,7 +565,6 @@ fn search_in_snapshot(
             &statement,
             &rationale,
             &evidence,
-            row_space_rank == 0 && request.preferred_space_id.is_some(),
             row_relevance,
             row_evidence,
         );
@@ -610,7 +586,6 @@ fn search_in_snapshot(
                 auto_injection_eligible,
                 match_reason,
             },
-            space_rank: row_space_rank,
             relevance: row_relevance,
             evidence_completeness: row_evidence,
         });
@@ -625,7 +600,6 @@ fn search_in_snapshot(
                     version: 1,
                     tree_oid: tree_oid.to_owned(),
                     query_fingerprint: fingerprint,
-                    space_rank: row.space_rank,
                     relevance_bits: row.relevance.to_bits(),
                     evidence_completeness: row.evidence_completeness,
                     context_id: row.result.context_id.to_string(),
@@ -920,14 +894,12 @@ fn load_conflicts(
     Ok(conflicts)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn explain_match(
     query_tokens: &[String],
     title: &str,
     statement: &str,
     rationale: &str,
     evidence: &[EvidenceView],
-    exact_space: bool,
     bm25: f64,
     evidence_completeness: i64,
 ) -> MatchReason {
@@ -965,7 +937,6 @@ fn explain_match(
         }
     }
     MatchReason {
-        exact_space,
         matched_fields,
         matched_tokens: matched_tokens.into_iter().collect(),
         bm25,

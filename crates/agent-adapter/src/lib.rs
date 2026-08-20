@@ -602,7 +602,6 @@ mod tests {
                 conflicts: Vec::new(),
                 auto_injection_eligible: eligible,
                 match_reason: MatchReason {
-                    exact_space: true,
                     matched_fields: Vec::new(),
                     matched_tokens: Vec::new(),
                     bm25: 0.0,

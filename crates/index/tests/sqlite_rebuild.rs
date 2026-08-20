@@ -120,7 +120,8 @@ fn fixture() -> Fixture {
     let committed_event_path = append(&store, space_event);
 
     let first_context =
-        Event::context_proposed(space_id, context("SQLite is a derived projection"), None).unwrap();
+        Event::context_revision_added(space_id, context("SQLite is a derived projection"), None)
+            .unwrap();
     let (first_context_id, first_revision_id) = context_ids(&first_context);
     append(&store, first_context);
     let review = Event::context_reviewed(
@@ -151,7 +152,7 @@ fn fixture() -> Fixture {
     let first_publication_id = publication_id(&first_publication);
     append(&store, first_publication);
 
-    let second_context = Event::context_proposed(
+    let second_context = Event::context_revision_added(
         space_id,
         context("Only the current HEAD Tree may be read"),
         None,
@@ -435,7 +436,7 @@ fn append_uses_incremental_closure_and_matches_scratch_rebuild() {
         })
         .unwrap();
     drop(connection);
-    let event = Event::context_proposed(
+    let event = Event::context_revision_added(
         space_id.parse().unwrap(),
         context("incremental append reaches its Space closure"),
         None,
@@ -501,7 +502,7 @@ fn reverse_reference_closure_recovers_dangling_nodes_and_handles_duplicate_appen
         .unwrap()
         .parse()
         .unwrap();
-    let target = Event::context_proposed(
+    let target = Event::context_revision_added(
         space_id,
         context("late target for an old dangling review"),
         None,
@@ -661,7 +662,7 @@ fn paginated_query_is_pinned_to_one_tree_and_generation() {
     for number in 0..4 {
         append(
             &fixture.store,
-            Event::context_proposed(
+            Event::context_revision_added(
                 space_id,
                 context(&format!("snapshot context {number}")),
                 None,
@@ -671,7 +672,7 @@ fn paginated_query_is_pinned_to_one_tree_and_generation() {
     }
     let before = fixture.index.synchronize().unwrap().metadata;
     let expected = context_ids_from_database(fixture.index.database_path());
-    let appended_during_query = Event::context_proposed(
+    let appended_during_query = Event::context_revision_added(
         space_id,
         context("must appear only after this snapshot"),
         None,
@@ -723,7 +724,7 @@ fn long_lived_query_connection_reopens_after_corrupt_file_replacement() {
         .unwrap();
     append(
         &fixture.store,
-        Event::context_proposed(
+        Event::context_revision_added(
             space_id,
             context("visible only in replacement database"),
             None,
@@ -776,7 +777,7 @@ fn concurrent_query_index_rebuild_and_append_converge_without_generation_regress
             for number in 0..12 {
                 append(
                     &store,
-                    Event::context_proposed(
+                    Event::context_revision_added(
                         space_id,
                         context(&format!("concurrent append {number}")),
                         None,

@@ -446,7 +446,7 @@ fn complete_demo(root: &Path) -> Result<(Value, IndexMetadata)> {
         .collect::<Vec<_>>();
     let (context_id, revision_id) = match matching_revisions.as_slice() {
         [] => {
-            let event = Event::context_proposed(space_id, demo_context(), None)?;
+            let event = Event::context_revision_added(space_id, demo_context(), None)?;
             let identities = context_identity(&event);
             runtime.append(event)?;
             created_event_count += 1;
@@ -751,7 +751,6 @@ fn automatic_hook_context(query: String) -> Result<String> {
         SearchRequest {
             query,
             filters: SearchFilters::default(),
-            preferred_space_id: None,
             page_size: 100,
             cursor: None,
         },
@@ -760,7 +759,7 @@ fn automatic_hook_context(query: String) -> Result<String> {
     let pack = render_untrusted_context_pack(&pack)?;
     Ok(format!(
         concat!(
-            "Shared Context MCP is available for explicit search/get/propose; use context_for_task for additional task-specific retrieval.\n",
+            "Shared Context MCP is available for task retrieval, explicit search/get, and candidate_create.\n",
             "{}"
         ),
         pack
@@ -1755,10 +1754,6 @@ fn search_request(options: &Options) -> Result<SearchRequest> {
                 .map(parse_status)
                 .collect::<Result<_>>()?,
         },
-        preferred_space_id: options
-            .optional("--preferred-space-id")?
-            .map(|id| parse_id(id, "preferred space ID"))
-            .transpose()?,
         page_size: parse_usize(
             options.optional("--page-size")?.unwrap_or("20"),
             "page size",
@@ -1809,7 +1804,6 @@ fn allow_search_options(options: &Options, extra: &[&str]) -> Result<()> {
         "--condition",
         "--kind",
         "--status",
-        "--preferred-space-id",
         "--page-size",
         "--cursor",
     ];

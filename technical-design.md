@@ -10,6 +10,19 @@
 
 本项目尚未上线，本文直接定义目标模型、接口和存储结构。
 
+### 1.1 当前实现状态（Mew #112）
+
+本文的大部分章节描述目标架构，不代表代码已经全部实现。当前里程碑边界如下：
+
+| 里程碑 | 状态 | 当前代码事实 |
+|---|---|---|
+| **M1：Task-first 领域与入口基础** | **已实现** | `TaskIntent` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；CLI/MCP 通过 `candidate_create` 创建无 Space Candidate；Candidate 不可自动注入 |
+| **M2：Task Runtime 与多 Space Retrieval** | **未实现** | 尚无 TaskSession 持久化、TaskIntent Revision、动态 Task Signal、Space Intent 召回、关联推断或带关联路径的 TaskContextPack |
+| **M3：Engineering Graph** | **未实现** | 尚无工程对象扫描、ContextArtifactAssociation、移动/改名重解析或关系图扩展 |
+| **M4：Low-tax Capture** | **未实现** | 尚无 WorkEpisode 自动聚合、AgentCheckpoint、Candidate Builder、去重/冲突、Space 推荐或 Candidate Confirm/List/Discard |
+
+当前 `context_for_task` 只是没有 Space 路由参数的任务文本 Context Pack，不等同于 M2。当前 `candidate_create` 是手工、无归属的 M1 可执行入口，不等同于 M4 的自动 Capture。M1 为验证 Candidate 隔离和 Writer 主路径，使用 `context_candidate.created` 事件及独立投影保存 Candidate；第 5.5、6、9、10、12、13 节中关于完整 Runtime/Candidate Confirm 的描述仍是 M4 目标。
+
 ## 2. 背景与目标
 
 本项目希望让 Agent 在工程过程中形成的有效理解、判断和验证，低成本地沉淀为后续任务可以直接继承的工程 Context，从而降低跨端、跨仓库、跨 Agent 和跨 Session 的冷启动成本。
@@ -1186,46 +1199,40 @@ sctx doctor --json
 
 默认保留 Context Git Store。删除知识数据使用独立命令，并展示绝对路径和二次确认。
 
-## 18. 实施阶段
+## 18. 实施里程碑
 
-### 阶段一：目标领域与存储基础
+### M1：Task-first 领域与入口基础 — 已实现
 
-- 实现新的 Event Schema。
-- 实现 Context 与 Space 解耦的身份模型。
-- 实现 Intent、Revision、SpaceAssociation、Lifecycle 和 Conflict DAG。
-- 实现 Git Writer、Batch Journal 和确定性 Reducer。
-- 实现新的 `index.sqlite` Schema 和重建。
+- `TaskIntent` 与 `TaskSignal` 已建模，Task Intent 不携带 Space 或 Workspace 路由。
+- `TaskSpaceAssociation` 已作为独立派生类型建模，集合允许零个或多个 Space。
+- `WorkEpisode` 与无 Space 的 `ContextCandidate` 已建模。
+- 已删除 Workspace-to-Space 配置、绑定命令、preferred-Space 请求字段和对应排序逻辑。
+- `context_for_task` 不接受 Space 路由；`context_search.space_ids` 仅作为显式探索的硬过滤。
+- CLI/MCP 的 `candidate_create` 已成为 Candidate 创建主入口，服务端生成身份和路径。
+- Candidate 使用独立投影，不进入 Context FTS，也不满足自动注入资格。
+- 跨 crate M1 验收覆盖 TaskIntent、`0..N` 关联、无 Space Candidate、无 Workspace 路由和自动注入隔离。
 
-### 阶段二：Task Runtime 与多 Space Retrieval
+M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命周期、CLI/MCP、Agent Adapter、安装器与 NPM 基础设施。复用这些基础设施不表示下面的目标里程碑已经完成。
 
-- 实现 `runtime.sqlite`。
-- 实现 TaskSession、TaskIntent Revision 和 TaskSignal。
-- 实现完整 Space Intent FTS。
-- 实现 Task 多路召回、排序、解释和 Token Budget。
-- 实现 `task_context` MCP 与 Session 隔离。
+### M2：Task Runtime 与多 Space Retrieval — 未实现
 
-### 阶段三：Engineering Graph
+- `runtime.sqlite`、TaskSession 和 TaskIntent Revision 尚未实现。
+- Prompt/File/Symbol/Diff/API/Schema/Test 的动态 Task Signal 聚合尚未实现。
+- 完整 Space Intent FTS、Task 多路召回、Space 关联推断、解释路径和 Session 隔离尚未实现。
+- 目标 `task_context`/TaskContextPack 契约尚未实现；当前 `context_for_task` 只是无 Space 路由的文本检索桥接。
 
-- 实现业务 Repository 只读扫描。
-- 实现 File、Symbol、API、Schema 和 Test Artifact。
-- 实现 EngineeringReference、Resolution 和 ContextArtifactAssociation。
-- 实现文件移动、Symbol 改名后的关联重建。
-- 实现一至两跳关系扩展与 `association explain`。
+### M3：Engineering Graph — 未实现
 
-### 阶段四：Low-tax Capture
+- Repository、File、Symbol、API、Schema 和 Test Artifact 扫描尚未实现。
+- EngineeringReference、ArtifactResolution 和 ContextArtifactAssociation 尚未实现。
+- 文件移动、Symbol 改名后的关联重建和有限跳数关系扩展尚未实现。
 
-- 实现 WorkEpisode 和 AgentCheckpoint。
-- 实现 Evidence 聚合和最小充分 Snapshot。
-- 实现 Candidate Builder、去重、冲突和 Space 推荐。
-- 实现 Candidate List/Confirm/Discard。
-- 在 PreCompact、TurnStop 和关键结论时自动触发 Capture Pipeline。
+### M4：Low-tax Capture — 未实现
 
-### 阶段五：Agent 与分发
-
-- 实现 Cursor/Codex Adapter。
-- 实现动态 Hook Retrieval 与 MCP Fallback。
-- 实现 NPM arm64/x64 包和离线 Bundle。
-- 完成 Setup、Doctor、Uninstall、Demo 和端到端测试。
+- WorkEpisode 自动聚合和 AgentCheckpoint 消费尚未实现。
+- Candidate Builder、Evidence 组装、去重、冲突和 Space 推荐尚未实现。
+- Candidate List/Confirm/Discard 以及 PreCompact/TurnStop 自动触发尚未实现。
+- 当前手工 `candidate_create` 只验证无归属 Candidate 的入口与安全边界。
 
 ## 19. 验收标准
 

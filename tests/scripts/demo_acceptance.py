@@ -99,10 +99,10 @@ def assert_fixed_tree(repository: Path) -> tuple[str, str]:
     created = next(event for event in events if event["event_type"] == "space.created")
     require(created["intent_revision"]["intent"]["title"] == ORACLE["space"]["title"], "space title differs from oracle")
     require(ORACLE["space"]["domain_term"] in created["intent_revision"]["intent"]["domain_terms"], "demo marker absent")
-    proposed = next(event for event in events if event["event_type"] == "context.revision_added")
-    require(proposed["revision"]["topic_key"] == ORACLE["context"]["topic_key"], "topic differs from oracle")
-    require(proposed["revision"]["statement"] == ORACLE["context"]["statement"], "statement differs from oracle")
-    return created["space_id"], proposed["context_id"]
+    revision_added = next(event for event in events if event["event_type"] == "context.revision_added")
+    require(revision_added["revision"]["topic_key"] == ORACLE["context"]["topic_key"], "topic differs from oracle")
+    require(revision_added["revision"]["statement"] == ORACLE["context"]["statement"], "statement differs from oracle")
+    return created["space_id"], revision_added["context_id"]
 
 
 def main() -> None:

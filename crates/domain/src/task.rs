@@ -298,8 +298,13 @@ mod tests {
     fn serialized_task_intent_has_no_space_route() {
         let value = serde_json::to_value(intent()).expect("serialize Task Intent");
 
-        assert_eq!(value.get("space_id"), None);
-        assert_eq!(value.get("preferred_space_id"), None);
+        assert!(
+            value
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|field| !field.contains("space") && !field.contains("workspace"))
+        );
     }
 
     #[test]

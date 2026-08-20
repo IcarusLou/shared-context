@@ -5,7 +5,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$ROOT"
 
 # 18.2-18.3: independent fixtures for metadata equivalence, arbitrary ordering,
-# append-only writer seams, explicit Git paths, and 100 concurrent proposals.
+# append-only writer seams, explicit Git paths, and 100 concurrent appends.
 cargo test --locked -p sctx-event-schema --test reducer_contract
 cargo test --locked -p sctx-git-store --test git_writer
 
@@ -21,6 +21,7 @@ cargo test --locked -p sctx-adapter-cursor --test payload_contract
 cargo test --locked -p sctx-adapter-codex --test payload_contract
 cargo test --locked -p sctx-installer --test installer_matrix
 cargo test --locked -p sctx-cli --test cli_contract
+cargo test --locked -p sctx-cli --test milestone_one_contract
 
 # 18.1 and the end-to-end loop: the Python oracle reads Git/config directly and
 # speaks MCP itself; it never derives expected values from production output.

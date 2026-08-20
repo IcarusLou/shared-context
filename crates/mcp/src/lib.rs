@@ -553,8 +553,6 @@ struct SearchInput {
     #[serde(default)]
     space_ids: Vec<String>,
     #[serde(default)]
-    preferred_space_id: Option<String>,
-    #[serde(default)]
     domains: Vec<String>,
     #[serde(default)]
     platforms: Vec<String>,
@@ -588,11 +586,6 @@ impl SearchInput {
                 kinds: self.kinds,
                 statuses: self.statuses,
             },
-            preferred_space_id: self
-                .preferred_space_id
-                .as_deref()
-                .map(|value| parse_id(value, "preferred_space_id"))
-                .transpose()?,
             page_size: self.page_size,
             cursor: self.cursor,
         })
@@ -605,8 +598,6 @@ type ToolResultSearch = std::result::Result<SearchRequest, ToolFailure>;
 #[serde(deny_unknown_fields)]
 struct TaskInput {
     task: String,
-    #[serde(default)]
-    space_id: Option<String>,
     #[serde(default)]
     domains: Vec<String>,
     #[serde(default)]
@@ -626,11 +617,6 @@ impl TaskInput {
         if self.task.trim().is_empty() {
             return Err(invalid("task must not be empty").into());
         }
-        let preferred_space_id = self
-            .space_id
-            .as_deref()
-            .map(|value| parse_id(value, "space_id"))
-            .transpose()?;
         Ok(ContextPackRequest {
             search: SearchRequest {
                 query: self.task,
@@ -643,7 +629,6 @@ impl TaskInput {
                     kinds: self.kinds,
                     ..SearchFilters::default()
                 },
-                preferred_space_id,
                 page_size: self.candidate_limit,
                 ..SearchRequest::default()
             },
@@ -721,7 +706,6 @@ fn tools_list() -> Value {
                 "required": ["task"],
                 "properties": {
                     "task": {"type": "string", "minLength": 1},
-                    "space_id": id_schema("spc_"),
                     "domains": string_array_schema(),
                     "platforms": string_array_schema(),
                     "conditions": string_array_schema(),
@@ -775,7 +759,6 @@ fn search_schema() -> Value {
         "properties": {
             "query": {"type": "string", "default": ""},
             "space_ids": {"type": "array", "items": id_schema("spc_")},
-            "preferred_space_id": id_schema("spc_"),
             "domains": string_array_schema(),
             "platforms": string_array_schema(),
             "conditions": string_array_schema(),

@@ -324,12 +324,13 @@ impl Event {
         )
     }
 
-    /// Proposes a new `ContextItem`. Context, Revision, Evidence, and Event IDs are generated.
+    /// Adds the initial revision for a new confirmed `ContextItem`.
+    /// Context, Revision, Evidence, and Event IDs are generated.
     ///
     /// # Errors
     ///
     /// Returns [`ErrorKind::InvalidInput`] when required Context content is missing.
-    pub fn context_proposed(
+    pub fn context_revision_added(
         space_id: SpaceId,
         draft: ContextRevisionDraft,
         annotations: Option<Annotations>,

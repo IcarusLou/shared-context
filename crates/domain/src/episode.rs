@@ -212,7 +212,7 @@ impl WorkEpisode {
 
 /// Governable Context content extracted from one Work Episode.
 ///
-/// A Context Candidate is an unconfirmed proposal, not an accepted Context revision.
+/// A Context Candidate is an unconfirmed draft, not an accepted Context revision.
 /// It intentionally contains no Space route or Space recommendation. Derived
 /// recommendations must be represented separately and never imply ownership.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

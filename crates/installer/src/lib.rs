@@ -1877,7 +1877,6 @@ fn check_index(root: &Path, checks: &mut Vec<DoctorCheck>) {
     let request = SearchRequest {
         query: String::new(),
         filters: SearchFilters::default(),
-        preferred_space_id: None,
         page_size: 1,
         cursor: None,
     };

@@ -199,8 +199,9 @@ fn generation_api_assigns_new_ids_and_all_generated_events_parse() {
             .unwrap();
     let candidate =
         Event::context_candidate_created(WorkEpisodeId::new(), context_draft(), None).unwrap();
-    let proposed = Event::context_proposed(space_id, context_draft(), annotations).unwrap();
-    let (context_id, revision_id) = match proposed.payload() {
+    let revision_added =
+        Event::context_revision_added(space_id, context_draft(), annotations).unwrap();
+    let (context_id, revision_id) = match revision_added.payload() {
         EventPayload::ContextRevisionAdded {
             context_id,
             revision,
@@ -291,7 +292,7 @@ fn generation_api_assigns_new_ids_and_all_generated_events_parse() {
         candidate,
         created,
         intent_added,
-        proposed,
+        revision_added,
         reviewed,
         publication,
         conflict,

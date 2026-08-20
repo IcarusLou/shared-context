@@ -140,7 +140,7 @@ fn create_space(harness: &Harness, title: &str) -> (String, String) {
 }
 
 fn seed_context(harness: &Harness, space_id: &str, statement: &str) -> (String, String) {
-    let event = Event::context_proposed(
+    let event = Event::context_revision_added(
         SpaceId::from_str(space_id).unwrap(),
         ContextRevisionDraft {
             kind: ContextKind::Decision,

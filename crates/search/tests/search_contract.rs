@@ -95,7 +95,7 @@ fn add_context(
     space_id: SpaceId,
     draft: ContextRevisionDraft,
 ) -> (ContextId, RevisionId) {
-    let event = Event::context_proposed(space_id, draft, None).unwrap();
+    let event = Event::context_revision_added(space_id, draft, None).unwrap();
     let ids = context_ids(&event);
     append(store, event);
     ids
