@@ -223,6 +223,87 @@ pub struct TaskSpaceAssociationsResponse {
     pub associations: Vec<TaskSpaceAssociation>,
 }
 
+/// Task-first Context retrieval request. No Space identifier is required or accepted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskContextRequest {
+    pub task_intent: TaskIntent,
+    pub task_signals: Vec<TaskSignal>,
+    pub token_budget: usize,
+    pub candidate_limit: usize,
+    pub mode: ContextPackMode,
+}
+
+impl TaskContextRequest {
+    #[must_use]
+    pub fn automatic(
+        task_intent: TaskIntent,
+        task_signals: Vec<TaskSignal>,
+        token_budget: usize,
+    ) -> Self {
+        Self {
+            task_intent,
+            task_signals,
+            token_budget,
+            candidate_limit: DEFAULT_CANDIDATE_LIMIT,
+            mode: ContextPackMode::AutomaticInjection,
+        }
+    }
+}
+
+/// Where an exact textual Task Signal matched. This is not a resolved code-graph edge.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskSignalMatchTarget {
+    SpaceIntent,
+    Context,
+}
+
+/// Explainable M2-only route from the Task to one returned Context.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum TaskRetrievalPath {
+    IntentFts {
+        matched_fields: Vec<String>,
+        matched_tokens: Vec<String>,
+    },
+    ContextFts {
+        matched_fields: Vec<MatchField>,
+        matched_tokens: Vec<String>,
+    },
+    ExactScope {
+        dimension: String,
+        value: String,
+    },
+    ExactTaskSignal {
+        kind: TaskSignalKind,
+        content: String,
+        matched_in: TaskSignalMatchTarget,
+    },
+}
+
+/// One budgeted Context explicitly linked to its Task-to-Space association and retrieval paths.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskContextItem {
+    pub association_space_id: SpaceId,
+    pub context: ContextPackItem,
+    pub retrieval_paths: Vec<TaskRetrievalPath>,
+}
+
+/// Task-first Context Pack produced from one exact index snapshot.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskContextPack {
+    pub indexed_tree_oid: String,
+    pub projection_generation: u64,
+    pub task_id: TaskId,
+    pub task_fingerprint: String,
+    pub token_budget: usize,
+    pub estimated_tokens: usize,
+    pub mode: ContextPackMode,
+    pub associations: Vec<TaskSpaceAssociation>,
+    pub items: Vec<TaskContextItem>,
+    pub omitted: Vec<ContextPackOmitted>,
+}
+
 /// Several cursor pages materialized under one pinned `QuerySnapshot` transaction.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SearchPagesResponse {
@@ -392,7 +473,55 @@ impl SearchEngine {
             indexed_tree_oid: snapshot.metadata.indexed_tree_oid,
             projection_generation: snapshot.metadata.projection_generation,
             task_id: intent.task_id,
-            associations: snapshot.data,
+            associations: snapshot.data.associations,
+        })
+    }
+
+    /// Builds an explainable Task-first Context Pack entirely within one projection snapshot.
+    /// Association inference, Context retrieval, safety filtering, Evidence/Conflict expansion,
+    /// ordering, and token budgeting all observe the returned Tree and Generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input error for an invalid Task, signals, budget, or candidate limit, and
+    /// storage errors propagated by index synchronization and snapshot reads.
+    pub fn task_context_pack(&self, request: &TaskContextRequest) -> Result<TaskContextPack> {
+        validate_task_context_request(request)?;
+        let fingerprint = task_fingerprint(&request.task_intent, &request.task_signals)?;
+        let query_tokens = association_query_tokens(&request.task_intent, &request.task_signals);
+        let artifact_hints = artifact_hints(&request.task_signals);
+        let scope_targets = ScopeTargets::from_intent(&request.task_intent);
+        let snapshot = self.index.query_snapshot(|connection| {
+            let inference = infer_task_space_associations(
+                connection,
+                request.task_intent.task_id,
+                &query_tokens,
+                &artifact_hints,
+                &scope_targets,
+            )?;
+            let candidates = load_task_context_candidates(
+                connection,
+                &inference,
+                request.mode,
+                request.candidate_limit,
+            )?;
+            Ok(pack_task_context_candidates(
+                candidates,
+                request.token_budget,
+                inference,
+            ))
+        })?;
+        Ok(TaskContextPack {
+            indexed_tree_oid: snapshot.metadata.indexed_tree_oid,
+            projection_generation: snapshot.metadata.projection_generation,
+            task_id: request.task_intent.task_id,
+            task_fingerprint: fingerprint,
+            token_budget: request.token_budget,
+            estimated_tokens: snapshot.data.estimated_tokens,
+            mode: request.mode,
+            associations: snapshot.data.associations,
+            items: snapshot.data.items,
+            omitted: snapshot.data.omitted,
         })
     }
 
@@ -691,18 +820,7 @@ fn explain_intent_match<const N: usize>(
     query_tokens: &[String],
     fields: [(SpaceIntentField, &str); N],
 ) -> (Vec<SpaceIntentField>, Vec<String>) {
-    let wanted = query_tokens.iter().cloned().collect::<BTreeSet<_>>();
-    let mut matched_fields = Vec::new();
-    let mut matched_tokens = BTreeSet::new();
-    for (field, text) in fields {
-        let available = search_tokens(text).into_iter().collect::<BTreeSet<_>>();
-        let intersection = wanted.intersection(&available).cloned().collect::<Vec<_>>();
-        if !intersection.is_empty() {
-            matched_fields.push(field);
-            matched_tokens.extend(intersection);
-        }
-    }
-    (matched_fields, matched_tokens.into_iter().collect())
+    explain_token_fields(query_tokens, fields)
 }
 
 #[derive(Clone, Debug)]
@@ -738,18 +856,27 @@ impl ScopeTargets {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ScopeEvidence {
+    dimension: String,
+    value: String,
+}
+
+#[derive(Clone, Debug, Default)]
 struct AcceptedContextEvidence {
     textual_match: bool,
+    matched_fields: BTreeSet<MatchField>,
+    matched_tokens: BTreeSet<String>,
+    bm25: Option<f64>,
     matched_artifacts: BTreeSet<String>,
-    matched_scopes: BTreeSet<String>,
+    matched_scopes: BTreeSet<ScopeEvidence>,
 }
 
 const SAFE_ACCEPTED_CONTEXT_PREDICATE: &str = "item.governance_status = 'accepted'
      AND item.accepted_revision_id = revision.revision_id
      AND item.auto_injection_eligible = 1
      AND revision.lifecycle = 'accepted'
-     AND revision.evidence_completeness >= 750
+     AND revision.evidence_completeness = 1000
      AND EXISTS (
          SELECT 1 FROM evidence AS required_evidence
          WHERE required_evidence.revision_id = revision.revision_id
@@ -758,15 +885,24 @@ const SAFE_ACCEPTED_CONTEXT_PREDICATE: &str = "item.governance_status = 'accepte
            AND required_evidence.content_json <> '{}'
      )";
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct AssociationEvidence {
     intent_fields: BTreeSet<String>,
+    intent_tokens: BTreeSet<String>,
     intent_matched: bool,
     intent_conflicted: bool,
+    intent_artifacts: BTreeSet<String>,
     matched_artifacts: BTreeSet<String>,
     matched_contexts: BTreeSet<ContextId>,
     textual_contexts: BTreeSet<ContextId>,
-    matched_scopes: BTreeSet<String>,
+    matched_scopes: BTreeSet<ScopeEvidence>,
+}
+
+#[derive(Debug)]
+struct TaskAssociationInference {
+    associations: Vec<TaskSpaceAssociation>,
+    evidence: BTreeMap<SpaceId, AssociationEvidence>,
+    contexts: BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>,
 }
 
 fn artifact_hints(signals: &[TaskSignal]) -> Vec<ArtifactHint> {
@@ -827,7 +963,7 @@ fn infer_task_space_associations(
     query_tokens: &[String],
     artifact_hints: &[ArtifactHint],
     scope_targets: &ScopeTargets,
-) -> Result<Vec<TaskSpaceAssociation>> {
+) -> Result<TaskAssociationInference> {
     let intent_candidates = query_space_intent_candidates(connection, query_tokens)?;
     let intent_artifacts = query_exact_intent_artifacts(connection, artifact_hints)?;
     let contexts =
@@ -837,22 +973,25 @@ fn infer_task_space_associations(
     for (space_id, (intent_conflicted, artifacts)) in intent_artifacts {
         let aggregate = evidence.entry(space_id).or_default();
         aggregate.intent_conflicted |= intent_conflicted;
+        aggregate.intent_artifacts.extend(artifacts.iter().cloned());
         aggregate.matched_artifacts.extend(artifacts);
     }
-    for ((space_id, context_id), context) in contexts {
-        let aggregate = evidence.entry(space_id).or_default();
-        aggregate.matched_contexts.insert(context_id);
+    for ((space_id, context_id), context) in &contexts {
+        let aggregate = evidence.entry(*space_id).or_default();
+        aggregate.matched_contexts.insert(*context_id);
         if context.textual_match {
-            aggregate.textual_contexts.insert(context_id);
+            aggregate.textual_contexts.insert(*context_id);
         }
         aggregate
             .matched_artifacts
-            .extend(context.matched_artifacts);
-        aggregate.matched_scopes.extend(context.matched_scopes);
+            .extend(context.matched_artifacts.iter().cloned());
+        aggregate
+            .matched_scopes
+            .extend(context.matched_scopes.iter().cloned());
     }
     let mut associations = evidence
-        .into_iter()
-        .filter_map(|(space_id, evidence)| association(task_id, space_id, evidence))
+        .iter()
+        .filter_map(|(space_id, evidence)| association(task_id, *space_id, evidence))
         .collect::<Vec<_>>();
     associations.sort_by(|left, right| {
         right
@@ -861,7 +1000,11 @@ fn infer_task_space_associations(
             .then_with(|| left.space_id.cmp(&right.space_id))
     });
     TaskSpaceAssociation::validate_collection(task_id, &associations)?;
-    Ok(associations)
+    Ok(TaskAssociationInference {
+        associations,
+        evidence,
+        contexts,
+    })
 }
 
 fn apply_intent_evidence(
@@ -872,6 +1015,7 @@ fn apply_intent_evidence(
         let aggregate = evidence.entry(candidate.space_id).or_default();
         aggregate.intent_matched = true;
         aggregate.intent_conflicted = candidate.intent_conflicted;
+        aggregate.intent_tokens.extend(candidate.matched_tokens);
         aggregate.intent_fields.extend(
             candidate
                 .matched_fields
@@ -1022,7 +1166,10 @@ fn query_accepted_context_text(
     };
     let mut statement = connection
         .prepare(&format!(
-            "SELECT revision.space_id, revision.context_id
+            "SELECT revision.space_id, revision.context_id,
+                    bm25(context_fts, 0.0, 0.0, 10.0, 8.0, 4.0, 2.0),
+                    context_fts.title, context_fts.statement,
+                    context_fts.rationale, context_fts.evidence
              FROM context_fts
              JOIN context_revision AS revision USING(revision_id)
              JOIN context_item AS item USING(context_id)
@@ -1033,18 +1180,68 @@ fn query_accepted_context_text(
         .map_err(sql_error("prepare safe accepted Context association text"))?;
     let rows = statement
         .query_map([match_expression], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f64>(2)?,
+                [
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ],
+            ))
         })
         .map_err(sql_error("read safe accepted Context association text"))?;
     for row in rows {
-        let (space_id, context_id) =
+        let (space_id, context_id, bm25, fields) =
             row.map_err(sql_error("collect accepted Context association text"))?;
+        let (matched_fields, matched_tokens) = explain_context_text_match(query_tokens, &fields);
         let entry = evidence
             .entry((parse_id(&space_id)?, parse_id(&context_id)?))
             .or_default();
         entry.textual_match = true;
+        entry.matched_fields.extend(matched_fields);
+        entry.matched_tokens.extend(matched_tokens);
+        entry.bm25 = Some(entry.bm25.map_or(bm25, |current| current.min(bm25)));
     }
     Ok(())
+}
+
+fn explain_context_text_match(
+    query_tokens: &[String],
+    fields: &[String; 4],
+) -> (Vec<MatchField>, Vec<String>) {
+    let names = [
+        MatchField::Title,
+        MatchField::Statement,
+        MatchField::Rationale,
+        MatchField::Evidence,
+    ];
+    let named_fields: [(MatchField, &str); 4] =
+        std::array::from_fn(|index| (names[index], fields[index].as_str()));
+    explain_token_fields(query_tokens, named_fields)
+}
+
+fn explain_token_fields<T, const N: usize>(
+    query_tokens: &[String],
+    fields: [(T, &str); N],
+) -> (Vec<T>, Vec<String>)
+where
+    T: Copy,
+{
+    let wanted = query_tokens.iter().cloned().collect::<BTreeSet<_>>();
+    let mut matched_fields = Vec::new();
+    let mut matched_tokens = BTreeSet::new();
+    for (field, text) in fields {
+        let available = search_tokens(text).into_iter().collect::<BTreeSet<_>>();
+        let intersection = wanted.intersection(&available).cloned().collect::<Vec<_>>();
+        if !intersection.is_empty() {
+            matched_fields.push(field);
+            matched_tokens.extend(intersection);
+        }
+    }
+    (matched_fields, matched_tokens.into_iter().collect())
 }
 
 fn query_accepted_context_scope(
@@ -1080,7 +1277,7 @@ fn query_accepted_context_scope(
                 .entry((parse_id(&space_id)?, parse_id(&context_id)?))
                 .or_default()
                 .matched_scopes
-                .insert(format!("{dimension}={value}"));
+                .insert(ScopeEvidence { dimension, value });
         }
     }
     Ok(())
@@ -1114,7 +1311,7 @@ fn contains_token_sequence(text: &str, wanted: &[String]) -> bool {
 fn association(
     task_id: TaskId,
     space_id: SpaceId,
-    evidence: AssociationEvidence,
+    evidence: &AssociationEvidence,
 ) -> Option<TaskSpaceAssociation> {
     if !evidence.intent_matched
         && evidence.matched_artifacts.is_empty()
@@ -1123,15 +1320,15 @@ fn association(
     {
         return None;
     }
-    let score = association_score(&evidence);
-    let reasons = association_reasons(&evidence);
+    let score = association_score(evidence);
+    let reasons = association_reasons(evidence);
     Some(TaskSpaceAssociation {
         task_id,
         space_id,
         score,
-        matched_intent_fields: evidence.intent_fields.into_iter().collect(),
-        matched_artifacts: evidence.matched_artifacts.into_iter().collect(),
-        matched_contexts: evidence.matched_contexts.into_iter().collect(),
+        matched_intent_fields: evidence.intent_fields.iter().cloned().collect(),
+        matched_artifacts: evidence.matched_artifacts.iter().cloned().collect(),
+        matched_contexts: evidence.matched_contexts.iter().copied().collect(),
         relation_paths: Vec::new(),
         reasons,
     })
@@ -1188,12 +1385,425 @@ fn association_reasons(evidence: &AssociationEvidence) -> Vec<String> {
             evidence
                 .matched_scopes
                 .iter()
-                .cloned()
+                .map(|scope| format!("{}={}", scope.dimension, scope.value))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
     }
     reasons
+}
+
+#[derive(Debug)]
+struct TaskContextCandidate {
+    association_rank: usize,
+    direct_path_count: usize,
+    item: TaskContextItem,
+}
+
+#[derive(Debug)]
+struct LoadedTaskContexts {
+    candidates: Vec<TaskContextCandidate>,
+    omitted: Vec<ContextPackOmitted>,
+}
+
+#[derive(Debug)]
+struct PackedTaskContexts {
+    estimated_tokens: usize,
+    associations: Vec<TaskSpaceAssociation>,
+    items: Vec<TaskContextItem>,
+    omitted: Vec<ContextPackOmitted>,
+}
+
+fn validate_task_context_request(request: &TaskContextRequest) -> Result<()> {
+    request.task_intent.validate()?;
+    TaskSignal::validate_collection(&request.task_signals)?;
+    if request.token_budget == 0 {
+        return Err(invalid(
+            "task context token_budget must be greater than zero",
+        ));
+    }
+    if request.candidate_limit == 0 || request.candidate_limit > MAX_PAGE_SIZE {
+        return Err(invalid(format!(
+            "task context candidate_limit must be between 1 and {MAX_PAGE_SIZE}"
+        )));
+    }
+    Ok(())
+}
+
+fn task_fingerprint(intent: &TaskIntent, signals: &[TaskSignal]) -> Result<String> {
+    let mut intent = intent.clone();
+    for values in [
+        &mut intent.in_scope,
+        &mut intent.out_of_scope,
+        &mut intent.domains,
+        &mut intent.platforms,
+        &mut intent.constraints,
+        &mut intent.acceptance_conditions,
+        &mut intent.artifacts,
+        &mut intent.interfaces,
+        &mut intent.unknowns,
+    ] {
+        values.sort();
+    }
+    let mut signals = signals
+        .iter()
+        .filter(|signal| signal.kind != TaskSignalKind::Workspace)
+        .cloned()
+        .collect::<Vec<_>>();
+    signals.sort_by(|left, right| {
+        signal_kind_name(left.kind)
+            .cmp(signal_kind_name(right.kind))
+            .then_with(|| left.content.cmp(&right.content))
+    });
+    let bytes = serde_json::to_vec(&(intent, signals))
+        .map_err(|error| invalid(format!("serialize Task fingerprint: {error}")))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+const fn signal_kind_name(kind: TaskSignalKind) -> &'static str {
+    match kind {
+        TaskSignalKind::Prompt => "prompt",
+        TaskSignalKind::Workspace => "workspace",
+        TaskSignalKind::Repository => "repository",
+        TaskSignalKind::File => "file",
+        TaskSignalKind::Symbol => "symbol",
+        TaskSignalKind::Diff => "diff",
+        TaskSignalKind::Api => "api",
+        TaskSignalKind::Schema => "schema",
+        TaskSignalKind::Test => "test",
+    }
+}
+
+fn load_task_context_candidates(
+    connection: &Connection,
+    inference: &TaskAssociationInference,
+    mode: ContextPackMode,
+    candidate_limit: usize,
+) -> Result<LoadedTaskContexts> {
+    if inference.associations.is_empty() {
+        return Ok(LoadedTaskContexts {
+            candidates: Vec::new(),
+            omitted: Vec::new(),
+        });
+    }
+    let association_rank = inference
+        .associations
+        .iter()
+        .enumerate()
+        .map(|(rank, association)| (association.space_id, rank))
+        .collect::<BTreeMap<_, _>>();
+    let placeholders = std::iter::repeat_n("?", association_rank.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let revision_clause = if mode == ContextPackMode::AutomaticInjection {
+        SAFE_ACCEPTED_CONTEXT_PREDICATE.to_owned()
+    } else {
+        "revision.is_head = 1".to_owned()
+    };
+    let sql = format!(
+        "SELECT revision.space_id, revision.context_id, revision.revision_id,
+                COALESCE(space.title, ''), revision.kind, {status} AS result_status,
+                revision.statement, revision.rationale, revision.applicability_json,
+                item.auto_injection_eligible, revision.evidence_completeness
+         FROM context_revision AS revision
+         JOIN context_item AS item USING(context_id)
+         JOIN space_projection AS space USING(space_id)
+         WHERE revision.space_id IN ({placeholders})
+           AND {revision_clause}
+         ORDER BY revision.space_id, revision.context_id, revision.revision_id",
+        status = status_expression(),
+    );
+    let parameters = association_rank
+        .keys()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(sql_error("prepare Task Context candidate retrieval"))?;
+    let mut rows = statement
+        .query(params_from_iter(parameters.iter()))
+        .map_err(sql_error("execute Task Context candidate retrieval"))?;
+    let mut candidates = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(sql_error("read Task Context candidate row"))?
+    {
+        if let Some(candidate) =
+            task_context_candidate_from_row(connection, row, inference, &association_rank, mode)?
+        {
+            candidates.push(candidate);
+        }
+    }
+    candidates.sort_by(|left, right| {
+        left.association_rank
+            .cmp(&right.association_rank)
+            .then_with(|| right.direct_path_count.cmp(&left.direct_path_count))
+            .then_with(|| {
+                left.item
+                    .context
+                    .context_id
+                    .cmp(&right.item.context.context_id)
+            })
+            .then_with(|| {
+                left.item
+                    .context
+                    .revision_id
+                    .cmp(&right.item.context.revision_id)
+            })
+    });
+    let omitted_count = candidates.len().saturating_sub(candidate_limit);
+    candidates.truncate(candidate_limit);
+    let omitted = (omitted_count > 0)
+        .then(|| ContextPackOmitted {
+            context_id: None,
+            revision_id: None,
+            reason: "candidate_limit".to_owned(),
+            estimated_tokens: 0,
+            count: omitted_count,
+        })
+        .into_iter()
+        .collect();
+    Ok(LoadedTaskContexts {
+        candidates,
+        omitted,
+    })
+}
+
+fn task_context_candidate_from_row(
+    connection: &Connection,
+    row: &rusqlite::Row<'_>,
+    inference: &TaskAssociationInference,
+    association_rank: &BTreeMap<SpaceId, usize>,
+    mode: ContextPackMode,
+) -> Result<Option<TaskContextCandidate>> {
+    let space_id: SpaceId = parse_id(
+        &row.get::<_, String>(0)
+            .map_err(sql_error("read Space ID"))?,
+    )?;
+    let context_id: ContextId = parse_id(
+        &row.get::<_, String>(1)
+            .map_err(sql_error("read Context ID"))?,
+    )?;
+    let revision_id: RevisionId = parse_id(
+        &row.get::<_, String>(2)
+            .map_err(sql_error("read Revision ID"))?,
+    )?;
+    let Some(space_evidence) = inference.evidence.get(&space_id) else {
+        return Ok(None);
+    };
+    let context_evidence = inference.contexts.get(&(space_id, context_id));
+    let inherited = space_evidence.intent_matched || !space_evidence.intent_artifacts.is_empty();
+    if context_evidence.is_none() && !inherited {
+        return Ok(None);
+    }
+    let paths = task_retrieval_paths(space_evidence, context_evidence);
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let title = row.get(3).map_err(sql_error("read Task Context title"))?;
+    let kind = parse_kind(
+        &row.get::<_, String>(4)
+            .map_err(sql_error("read Task Context kind"))?,
+    )?;
+    let status = parse_status(
+        &row.get::<_, String>(5)
+            .map_err(sql_error("read Task Context status"))?,
+    )?;
+    let statement = row
+        .get(6)
+        .map_err(sql_error("read Task Context statement"))?;
+    let rationale = row
+        .get(7)
+        .map_err(sql_error("read Task Context rationale"))?;
+    let applicability = from_json(
+        &row.get::<_, String>(8)
+            .map_err(sql_error("read Task Context applicability"))?,
+    )?;
+    let auto_injection_eligible = row
+        .get::<_, i64>(9)
+        .map_err(sql_error("read Task Context injection eligibility"))?
+        != 0;
+    let evidence_completeness = row
+        .get::<_, i64>(10)
+        .map_err(sql_error("read Task Context Evidence completeness"))?;
+    let evidence = load_evidence(connection, revision_id)?;
+    let conflicts = load_conflicts(connection, context_id, revision_id)?;
+    if mode == ContextPackMode::AutomaticInjection
+        && (status != ContextStatus::Accepted
+            || !auto_injection_eligible
+            || evidence.is_empty()
+            || !conflicts.is_empty())
+    {
+        return Ok(None);
+    }
+    let match_reason = context_match_reason(context_evidence, evidence_completeness);
+    let direct_path_count = paths
+        .iter()
+        .filter(|path| !matches!(path, TaskRetrievalPath::IntentFts { .. }))
+        .count();
+    Ok(Some(TaskContextCandidate {
+        association_rank: *association_rank
+            .get(&space_id)
+            .expect("candidate Space comes from association set"),
+        direct_path_count,
+        item: TaskContextItem {
+            association_space_id: space_id,
+            context: ContextPackItem {
+                space_id,
+                context_id,
+                revision_id,
+                title,
+                kind,
+                status,
+                statement,
+                rationale: Some(rationale),
+                applicability,
+                evidence,
+                conflicts,
+                auto_injection_eligible,
+                match_reason,
+                detail: ContextPackDetail::Full,
+            },
+            retrieval_paths: paths,
+        },
+    }))
+}
+
+fn task_retrieval_paths(
+    space: &AssociationEvidence,
+    context: Option<&AcceptedContextEvidence>,
+) -> Vec<TaskRetrievalPath> {
+    let mut paths = Vec::new();
+    if space.intent_matched {
+        paths.push(TaskRetrievalPath::IntentFts {
+            matched_fields: space.intent_fields.iter().cloned().collect(),
+            matched_tokens: space.intent_tokens.iter().cloned().collect(),
+        });
+    }
+    if let Some(context) = context {
+        if context.textual_match {
+            paths.push(TaskRetrievalPath::ContextFts {
+                matched_fields: context.matched_fields.iter().copied().collect(),
+                matched_tokens: context.matched_tokens.iter().cloned().collect(),
+            });
+        }
+        paths.extend(
+            context
+                .matched_scopes
+                .iter()
+                .map(|scope| TaskRetrievalPath::ExactScope {
+                    dimension: scope.dimension.clone(),
+                    value: scope.value.clone(),
+                }),
+        );
+    }
+    paths.extend(
+        space
+            .intent_artifacts
+            .iter()
+            .filter_map(|label| exact_signal_path(label, TaskSignalMatchTarget::SpaceIntent)),
+    );
+    if let Some(context) = context {
+        paths.extend(
+            context
+                .matched_artifacts
+                .iter()
+                .filter_map(|label| exact_signal_path(label, TaskSignalMatchTarget::Context)),
+        );
+    }
+    paths
+}
+
+fn exact_signal_path(label: &str, matched_in: TaskSignalMatchTarget) -> Option<TaskRetrievalPath> {
+    let (kind, content) = label.split_once(':')?;
+    let kind = match kind {
+        "file" => TaskSignalKind::File,
+        "symbol" => TaskSignalKind::Symbol,
+        "api" => TaskSignalKind::Api,
+        "schema" => TaskSignalKind::Schema,
+        "test" => TaskSignalKind::Test,
+        _ => return None,
+    };
+    Some(TaskRetrievalPath::ExactTaskSignal {
+        kind,
+        content: content.to_owned(),
+        matched_in,
+    })
+}
+
+fn context_match_reason(
+    context: Option<&AcceptedContextEvidence>,
+    evidence_completeness: i64,
+) -> MatchReason {
+    MatchReason {
+        matched_fields: context
+            .into_iter()
+            .flat_map(|value| value.matched_fields.iter().copied())
+            .collect(),
+        matched_tokens: context
+            .into_iter()
+            .flat_map(|value| value.matched_tokens.iter().cloned())
+            .collect(),
+        bm25: context.and_then(|value| value.bm25).unwrap_or(0.0),
+        evidence_completeness: u16::try_from(evidence_completeness).unwrap_or(u16::MAX),
+        structured_filter_match: true,
+    }
+}
+
+fn pack_task_context_candidates(
+    loaded: LoadedTaskContexts,
+    token_budget: usize,
+    inference: TaskAssociationInference,
+) -> PackedTaskContexts {
+    let mut estimated_tokens: usize = 0;
+    let mut items = Vec::new();
+    let mut omitted = loaded.omitted;
+    for candidate in loaded.candidates {
+        let full = candidate.item;
+        let full_tokens = serialized_tokens(&full);
+        if estimated_tokens.saturating_add(full_tokens) <= token_budget {
+            estimated_tokens += full_tokens;
+            items.push(full);
+            continue;
+        }
+        let context_id = full.context.context_id;
+        let revision_id = full.context.revision_id;
+        let summary = TaskContextItem {
+            context: ContextPackItem {
+                rationale: None,
+                evidence: Vec::new(),
+                detail: ContextPackDetail::Summary,
+                ..full.context
+            },
+            ..full
+        };
+        let summary_tokens = serialized_tokens(&summary);
+        if estimated_tokens.saturating_add(summary_tokens) <= token_budget {
+            estimated_tokens += summary_tokens;
+            items.push(summary);
+            omitted.push(ContextPackOmitted {
+                context_id: Some(context_id),
+                revision_id: Some(revision_id),
+                reason: "detail_token_budget".to_owned(),
+                estimated_tokens: full_tokens.saturating_sub(summary_tokens),
+                count: 1,
+            });
+        } else {
+            omitted.push(ContextPackOmitted {
+                context_id: Some(context_id),
+                revision_id: Some(revision_id),
+                reason: "token_budget".to_owned(),
+                estimated_tokens: summary_tokens,
+                count: 1,
+            });
+        }
+    }
+    PackedTaskContexts {
+        estimated_tokens,
+        associations: inference.associations,
+        items,
+        omitted,
+    }
 }
 
 #[derive(Debug)]

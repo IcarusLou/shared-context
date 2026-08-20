@@ -7,7 +7,9 @@ use sctx_domain::{
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::ProjectionIndex;
-use sctx_search::SearchEngine;
+use sctx_search::{
+    ContextPackMode, ContextStatus, SearchEngine, TaskContextRequest, TaskRetrievalPath,
+};
 use tempfile::TempDir;
 
 struct AssociationFixture {
@@ -15,7 +17,9 @@ struct AssociationFixture {
     index: ProjectionIndex,
     feature_spaces: [SpaceId; 4],
     feature_contexts: [ContextId; 3],
+    pack_contexts: [ContextId; 4],
     tied_spaces: [SpaceId; 2],
+    unsafe_pack_spaces: [SpaceId; 4],
 }
 
 fn intent(title: &str, intent_text: &str) -> sctx_domain::IntentSnapshot {
@@ -74,8 +78,15 @@ fn add_context(
     statement: &str,
     applicability: Applicability,
 ) -> (ContextId, RevisionId) {
-    let event =
-        Event::context_revision_added(space_id, context(statement, applicability), None).unwrap();
+    add_context_draft(store, space_id, context(statement, applicability))
+}
+
+fn add_context_draft(
+    store: &GitStore,
+    space_id: SpaceId,
+    draft: ContextRevisionDraft,
+) -> (ContextId, RevisionId) {
+    let event = Event::context_revision_added(space_id, draft, None).unwrap();
     let ids = match event.payload() {
         EventPayload::ContextRevisionAdded {
             context_id,
@@ -152,6 +163,12 @@ fn fixture() -> AssociationFixture {
         "PageRequirement",
         "pageintentneedle SearchResultsPage.tsx",
     );
+    let (page_context, _, _) = add_accepted_context(
+        &store,
+        page_space,
+        "the result page keeps its persistent navigation controls",
+        applicability("page-requirement", "browser", "active"),
+    );
     let protocol_space = add_space(&store, "ServerProtocol", "protocolintentonly");
     let (protocol_context, _, _) = add_accepted_context(
         &store,
@@ -189,14 +206,22 @@ fn fixture() -> AssociationFixture {
         applicability("tie-domain", "server", "active"),
     );
 
-    let candidate_space = add_space(&store, "UnsafeCandidate", "candidateintentonly");
+    let candidate_space = add_space(
+        &store,
+        "UnsafeCandidate",
+        "candidateintentonly unsafepackintentneedle",
+    );
     add_context(
         &store,
         candidate_space,
         "unsafeassociationneedle candidate",
         applicability("unsafe", "fe", "active"),
     );
-    let deprecated_space = add_space(&store, "UnsafeDeprecated", "deprecatedintentonly");
+    let deprecated_space = add_space(
+        &store,
+        "UnsafeDeprecated",
+        "deprecatedintentonly unsafepackintentneedle",
+    );
     let (deprecated_context, deprecated_revision, deprecated_publication) = add_accepted_context(
         &store,
         deprecated_space,
@@ -211,7 +236,11 @@ fn fixture() -> AssociationFixture {
         vec![deprecated_publication],
         PublicationAction::Withdraw,
     );
-    let conflict_space = add_space(&store, "UnsafeConflict", "conflictintentonly");
+    let conflict_space = add_space(
+        &store,
+        "UnsafeConflict",
+        "conflictintentonly unsafepackintentneedle",
+    );
     let (conflict_a, revision_a, publication_a) = add_accepted_context(
         &store,
         conflict_space,
@@ -248,6 +277,26 @@ fn fixture() -> AssociationFixture {
         )
         .unwrap(),
     );
+    let incomplete_space = add_space(
+        &store,
+        "IncompleteEvidence",
+        "incompleteintentonly unsafepackintentneedle",
+    );
+    let mut incomplete = context(
+        "incomplete evidence must not enter automatic packs",
+        applicability("unsafe", "fe", "active"),
+    );
+    incomplete.evidence[0].limitations.clear();
+    let (incomplete_context, incomplete_revision) =
+        add_context_draft(&store, incomplete_space, incomplete);
+    publish(
+        &store,
+        incomplete_space,
+        incomplete_context,
+        incomplete_revision,
+        Vec::new(),
+        PublicationAction::Publish,
+    );
 
     let index = ProjectionIndex::for_store(&store);
     index.synchronize().unwrap();
@@ -261,7 +310,19 @@ fn fixture() -> AssociationFixture {
             analytics_space,
         ],
         feature_contexts: [protocol_context, compatibility_context, analytics_context],
+        pack_contexts: [
+            page_context,
+            protocol_context,
+            compatibility_context,
+            analytics_context,
+        ],
         tied_spaces: [tie_alpha, tie_bravo],
+        unsafe_pack_spaces: [
+            candidate_space,
+            deprecated_space,
+            conflict_space,
+            incomplete_space,
+        ],
     }
 }
 
@@ -282,15 +343,18 @@ fn task(goal: &str) -> TaskIntent {
     }
 }
 
-#[test]
-fn fe_task_associates_requirement_protocol_compatibility_and_analytics_spaces() {
-    let fixture = fixture();
+fn feature_task() -> TaskIntent {
     let mut task = task("pageintentneedle");
-    task.desired_change = "featureassociationgoal".to_owned();
+    "featureassociationgoal".clone_into(&mut task.desired_change);
     task.domains = vec!["analyticsdomain".to_owned()];
     task.platforms = vec!["fe".to_owned()];
     task.constraints = vec!["legacyclient".to_owned()];
-    let signals = vec![
+    task.acceptance_conditions = vec!["impression".to_owned()];
+    task
+}
+
+fn feature_signals() -> Vec<TaskSignal> {
+    vec![
         TaskSignal {
             kind: TaskSignalKind::File,
             content: "SearchResultsPage.tsx".to_owned(),
@@ -307,7 +371,14 @@ fn fe_task_associates_requirement_protocol_compatibility_and_analytics_spaces() 
             kind: TaskSignalKind::Test,
             content: "LegacyCompatibilityTest".to_owned(),
         },
-    ];
+    ]
+}
+
+#[test]
+fn fe_task_associates_requirement_protocol_compatibility_and_analytics_spaces() {
+    let fixture = fixture();
+    let task = feature_task();
+    let signals = feature_signals();
     let response = SearchEngine::new(fixture.index)
         .task_space_associations(&task, &signals)
         .unwrap();
@@ -421,5 +492,224 @@ fn unsafe_context_states_cannot_supply_association_or_injection_evidence() {
     assert!(
         response.associations.is_empty(),
         "Candidate, Deprecated, and conflicted Context rows must be excluded"
+    );
+}
+
+#[test]
+fn task_context_pack_supports_zero_one_and_many_spaces_with_explicit_m2_paths() {
+    let fixture = fixture();
+    let engine = SearchEngine::new(fixture.index.clone());
+    let zero = engine
+        .task_context_pack(&TaskContextRequest::automatic(
+            task("unrelatedpackneedle"),
+            Vec::new(),
+            100_000,
+        ))
+        .unwrap();
+    assert!(zero.associations.is_empty());
+    assert!(zero.items.is_empty());
+
+    let one = engine
+        .task_context_pack(&TaskContextRequest::automatic(
+            task("pageintentneedle"),
+            Vec::new(),
+            100_000,
+        ))
+        .unwrap();
+    assert_eq!(one.associations.len(), 1);
+    assert_eq!(one.items.len(), 1);
+    assert!(matches!(
+        one.items[0].retrieval_paths.as_slice(),
+        [TaskRetrievalPath::IntentFts { .. }]
+    ));
+
+    let many = engine
+        .task_context_pack(&TaskContextRequest::automatic(
+            feature_task(),
+            feature_signals(),
+            100_000,
+        ))
+        .unwrap();
+    assert_eq!(many.associations.len(), 4);
+    assert_eq!(many.items.len(), 4);
+    assert_eq!(
+        many.items
+            .iter()
+            .map(|item| item.context.context_id)
+            .collect::<std::collections::BTreeSet<_>>(),
+        fixture.pack_contexts.into_iter().collect()
+    );
+    let association_spaces = many
+        .associations
+        .iter()
+        .map(|association| association.space_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    for item in &many.items {
+        assert_eq!(item.association_space_id, item.context.space_id);
+        assert!(association_spaces.contains(&item.association_space_id));
+        assert!(!item.retrieval_paths.is_empty());
+        assert_eq!(item.context.status, ContextStatus::Accepted);
+        assert!(item.context.auto_injection_eligible);
+        assert!(!item.context.evidence.is_empty());
+        assert!(item.context.conflicts.is_empty());
+    }
+    let paths = many
+        .items
+        .iter()
+        .flat_map(|item| item.retrieval_paths.iter())
+        .collect::<Vec<_>>();
+    assert!(
+        paths
+            .iter()
+            .any(|path| matches!(path, TaskRetrievalPath::IntentFts { .. }))
+    );
+    assert!(
+        paths
+            .iter()
+            .any(|path| matches!(path, TaskRetrievalPath::ContextFts { .. }))
+    );
+    assert!(
+        paths
+            .iter()
+            .any(|path| matches!(path, TaskRetrievalPath::ExactScope { .. }))
+    );
+    assert!(
+        paths
+            .iter()
+            .any(|path| matches!(path, TaskRetrievalPath::ExactTaskSignal { .. }))
+    );
+    let metadata = fixture.index.metadata().unwrap();
+    assert_eq!(many.indexed_tree_oid, metadata.indexed_tree_oid);
+    assert_eq!(many.projection_generation, metadata.projection_generation);
+}
+
+#[test]
+fn task_context_order_budget_and_fingerprint_are_stable() {
+    let fixture = fixture();
+    let index = fixture.index.clone();
+    let task = feature_task();
+    let signals = feature_signals();
+    let full_request = TaskContextRequest::automatic(task.clone(), signals.clone(), 100_000);
+    let full = SearchEngine::new(fixture.index)
+        .task_context_pack(&full_request)
+        .unwrap();
+    assert_eq!(full.task_fingerprint.len(), 64);
+    assert!(full.estimated_tokens <= full.token_budget);
+    let association_rank = full
+        .associations
+        .iter()
+        .enumerate()
+        .map(|(rank, association)| (association.space_id, rank))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let item_ranks = full
+        .items
+        .iter()
+        .map(|item| association_rank[&item.association_space_id])
+        .collect::<Vec<_>>();
+    assert!(item_ranks.windows(2).all(|pair| pair[0] <= pair[1]));
+
+    let limited_request = TaskContextRequest::automatic(task.clone(), signals.clone(), 64);
+    let limited_first = SearchEngine::new(index.clone())
+        .task_context_pack(&limited_request)
+        .unwrap();
+    let limited_second = SearchEngine::new(index.clone())
+        .task_context_pack(&limited_request)
+        .unwrap();
+    assert_eq!(limited_first, limited_second);
+    assert!(limited_first.estimated_tokens <= 64);
+    assert!(!limited_first.omitted.is_empty());
+
+    let mut reordered = signals;
+    reordered.reverse();
+    reordered.push(TaskSignal {
+        kind: TaskSignalKind::Workspace,
+        content: "/different/local/checkout".to_owned(),
+    });
+    let reordered_pack = SearchEngine::new(index.clone())
+        .task_context_pack(&TaskContextRequest::automatic(
+            task.clone(),
+            reordered,
+            100_000,
+        ))
+        .unwrap();
+    assert_eq!(reordered_pack.task_fingerprint, full.task_fingerprint);
+    assert_eq!(reordered_pack.associations, full.associations);
+    assert_eq!(reordered_pack.items, full.items);
+
+    index.rebuild().unwrap();
+    let rebuilt = SearchEngine::new(index)
+        .task_context_pack(&full_request)
+        .unwrap();
+    assert_eq!(rebuilt.task_fingerprint, full.task_fingerprint);
+    assert_eq!(rebuilt.associations, full.associations);
+    assert_eq!(rebuilt.items, full.items);
+    assert_eq!(rebuilt.indexed_tree_oid, full.indexed_tree_oid);
+    assert!(rebuilt.projection_generation > full.projection_generation);
+}
+
+#[test]
+fn automatic_task_pack_excludes_every_unsafe_state_while_explicit_expands_conflicts() {
+    let fixture = fixture();
+    let task = task("unsafepackintentneedle");
+    let automatic = SearchEngine::new(fixture.index.clone())
+        .task_context_pack(&TaskContextRequest::automatic(
+            task.clone(),
+            Vec::new(),
+            100_000,
+        ))
+        .unwrap();
+    assert_eq!(
+        automatic
+            .associations
+            .iter()
+            .map(|association| association.space_id)
+            .collect::<std::collections::BTreeSet<_>>(),
+        fixture.unsafe_pack_spaces.into_iter().collect()
+    );
+    assert!(automatic.items.is_empty());
+
+    let explicit = SearchEngine::new(fixture.index)
+        .task_context_pack(&TaskContextRequest {
+            task_intent: task,
+            task_signals: Vec::new(),
+            token_budget: 100_000,
+            candidate_limit: 100,
+            mode: ContextPackMode::Explicit,
+        })
+        .unwrap();
+    assert_eq!(explicit.task_fingerprint, automatic.task_fingerprint);
+    assert!(
+        explicit
+            .items
+            .iter()
+            .any(|item| item.context.status == ContextStatus::Candidate)
+    );
+    assert!(
+        explicit
+            .items
+            .iter()
+            .any(|item| item.context.status == ContextStatus::Deprecated)
+    );
+    assert!(
+        explicit
+            .items
+            .iter()
+            .any(|item| !item.context.conflicts.is_empty()),
+        "explicit mode must expand both sides of blocking conflicts"
+    );
+    assert!(
+        explicit
+            .items
+            .iter()
+            .flat_map(|item| item.context.conflicts.iter())
+            .all(|conflict| conflict.participants.len() == 2)
+    );
+    assert!(
+        explicit
+            .items
+            .iter()
+            .flat_map(|item| item.context.evidence.iter())
+            .any(|evidence| evidence.limitations.is_empty()),
+        "explicit mode exposes incomplete Evidence without making it automatic"
     );
 }
