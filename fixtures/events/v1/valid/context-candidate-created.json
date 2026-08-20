@@ -1,0 +1,34 @@
+{
+  "schema_version": "1",
+  "event_id": "evt_00000000-0000-4000-8000-000000000801",
+  "event_type": "context_candidate.created",
+  "candidate": {
+    "candidate_id": "cnd_00000000-0000-4000-8000-000000000811",
+    "source_episode_id": "wep_00000000-0000-4000-8000-000000000831",
+    "content": {
+      "kind": "decision",
+      "topic_key": "candidate/space-independent",
+      "statement": "A Candidate can be recorded before Space ownership is decided",
+      "rationale": "Task evidence exists before the correct knowledge container is known",
+      "applicability": {
+        "domains": ["candidate-capture"],
+        "platforms": ["agent"],
+        "conditions": ["unconfirmed knowledge"]
+      },
+      "assumptions": ["Space resolution happens later"],
+      "recheck_when": ["the Candidate is confirmed or discarded"],
+      "evidence": [
+        {
+          "kind": "experiment_record",
+          "supports": "Candidate creation succeeds without a Space",
+          "content": {
+            "scenario": "unassigned candidate",
+            "result": "created"
+          },
+          "interpretation": "Space is not a Candidate creation prerequisite",
+          "limitations": ["Confirmation is outside this event"]
+        }
+      ]
+    }
+  }
+}

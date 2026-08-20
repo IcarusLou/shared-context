@@ -54,6 +54,7 @@ fn reducer_events(name: &str) -> Vec<ReducerEvent> {
 
 fn all_reducer_events() -> Vec<ReducerEvent> {
     [
+        "context-candidates.json",
         "intent-branch-merge.json",
         "context-branch-merge.json",
         "review-summaries.json",
@@ -63,6 +64,56 @@ fn all_reducer_events() -> Vec<ReducerEvent> {
     .into_iter()
     .flat_map(reducer_events)
     .collect()
+}
+
+#[test]
+fn every_candidate_permutation_is_identical_and_remains_outside_context_governance() {
+    fn visit(events: &mut [ReducerEvent], index: usize, expected: &[u8], checked: &mut usize) {
+        if index == events.len() {
+            let projection = reduce(events);
+            assert_eq!(serde_json::to_vec(&projection).unwrap(), expected);
+            assert!(projection.spaces.is_empty());
+            assert!(projection.semantic_conflict_candidates.is_empty());
+            assert!(projection.semantic_conflicts.is_empty());
+            assert!(
+                projection
+                    .candidates
+                    .values()
+                    .all(|candidate| !candidate.candidate.is_auto_injection_eligible())
+            );
+            *checked += 1;
+            return;
+        }
+        for swap_index in index..events.len() {
+            events.swap(index, swap_index);
+            visit(events, index + 1, expected, checked);
+            events.swap(index, swap_index);
+        }
+    }
+
+    let mut events = reducer_events("context-candidates.json");
+    let expected = serde_json::to_vec(&reduce(&events)).unwrap();
+    let mut checked = 0;
+    visit(&mut events, 0, &expected, &mut checked);
+    assert_eq!(checked, 6);
+}
+
+#[test]
+fn duplicate_candidate_ids_quarantine_every_definition() {
+    let mut values = fixture_values("context-candidates.json");
+    let mut duplicate = values[0].clone();
+    duplicate["event_id"] = serde_json::json!("evt_00000000-0000-4000-8000-000000000854");
+    values.push(duplicate);
+
+    let projection = reduce(&values_to_reducer_events(values));
+
+    assert_eq!(projection.candidates.len(), 2);
+    assert!(
+        projection
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == ReducerDiagnosticCode::DuplicateCandidateId })
+    );
 }
 
 fn space(id: &str) -> SpaceId {
@@ -658,7 +709,7 @@ proptest! {
 
     #[test]
     fn arbitrary_event_permutations_have_byte_identical_projection(
-        keys in prop::collection::vec(any::<u64>(), 47)
+        keys in prop::collection::vec(any::<u64>(), 50)
     ) {
         let events = all_reducer_events();
         let expected = serde_json::to_vec(&reduce(&events)).unwrap();
@@ -671,7 +722,7 @@ proptest! {
 
     #[test]
     fn quarantine_is_also_permutation_invariant(
-        keys in prop::collection::vec(any::<u64>(), 48)
+        keys in prop::collection::vec(any::<u64>(), 51)
     ) {
         let mut events = all_reducer_events();
         events.push(events[1].clone());
@@ -685,13 +736,13 @@ proptest! {
 
     #[test]
     fn full_conflict_quarantine_closure_is_permutation_invariant(
-        keys in prop::collection::vec(any::<u64>(), 47)
+        keys in prop::collection::vec(any::<u64>(), 50)
     ) {
         let mut values = fixture_values("semantic-conflicts.json");
         let duplicate_evidence = values[1]["revision"]["evidence"][0]["evidence_id"].clone();
         values[3]["revision"]["evidence"][0]["evidence_id"] = duplicate_evidence;
         let mut events = all_reducer_events();
-        events.splice(36.., values_to_reducer_events(values));
+        events.splice(39.., values_to_reducer_events(values));
         let expected = serde_json::to_vec(&reduce(&events)).unwrap();
         let mut keyed: Vec<_> = events.into_iter().zip(keys).enumerate().collect();
         keyed.sort_by_key(|(original_index, (_, key))| (*key, *original_index));

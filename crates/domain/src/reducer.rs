@@ -3,10 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use crate::{
-    Applicability, ConflictId, ConflictParticipant, ConflictResolution, ContextId, ContextKind,
-    ContextRevision, EventId, EvidenceId, IntentRevision, Publication, PublicationAction,
-    PublicationId, ResolutionId, Review, ReviewId, ReviewVerdict, RevisionId, SemanticConflict,
-    SpaceId,
+    Applicability, CandidateId, ConflictId, ConflictParticipant, ConflictResolution,
+    ContextCandidate, ContextId, ContextKind, ContextRevision, EventId, EvidenceId, IntentRevision,
+    Publication, PublicationAction, PublicationId, ResolutionId, Review, ReviewId, ReviewVerdict,
+    RevisionId, SemanticConflict, SpaceId,
 };
 
 /// Authoritative event input understood by the V1 domain reducer.
@@ -16,9 +16,12 @@ pub struct ReducerEvent {
     pub payload: ReducerPayload,
 }
 
-/// The seven V1 payloads in the pure domain projection boundary.
+/// The eight V1 payloads in the pure domain projection boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReducerPayload {
+    ContextCandidateCreated {
+        candidate: ContextCandidate,
+    },
     SpaceCreated {
         space_id: SpaceId,
         intent_revision: IntentRevision,
@@ -58,6 +61,7 @@ pub enum ReducerPayload {
 #[serde(rename_all = "snake_case")]
 pub enum ReducerDiagnosticCode {
     DuplicateEventId,
+    DuplicateCandidateId,
     DuplicateRevisionId,
     DuplicateReviewId,
     DuplicatePublicationId,
@@ -218,9 +222,20 @@ pub struct ContextSpaceProjection {
     pub contexts: BTreeMap<ContextId, ContextProjection>,
 }
 
+/// Projection of one unassigned Candidate creation event.
+///
+/// Candidate projections deliberately have no Space, publication, conflict, or
+/// automatic-injection state. Confirmation is a later lifecycle operation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CandidateProjection {
+    pub event_id: EventId,
+    pub candidate: ContextCandidate,
+}
+
 /// Complete deterministic result of reducing one event multiset.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct DomainProjection {
+    pub candidates: BTreeMap<CandidateId, CandidateProjection>,
     pub spaces: BTreeMap<SpaceId, ContextSpaceProjection>,
     pub semantic_conflict_candidates: Vec<SemanticConflictCandidate>,
     pub semantic_conflicts: BTreeMap<ConflictId, SemanticConflictProjection>,
@@ -233,6 +248,12 @@ struct IntentNode {
     event_id: EventId,
     space_id: SpaceId,
     revision: IntentRevision,
+}
+
+#[derive(Clone)]
+struct CandidateNode {
+    event_id: EventId,
+    candidate: ContextCandidate,
 }
 
 #[derive(Clone)]
@@ -469,6 +490,7 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
     let mut invalid_event_ids = BTreeSet::new();
 
     let mut events_by_id: BTreeMap<EventId, Vec<&ReducerEvent>> = BTreeMap::new();
+    let mut candidate_definitions: BTreeMap<CandidateId, Vec<CandidateNode>> = BTreeMap::new();
     let mut space_creations: BTreeMap<SpaceId, Vec<IntentNode>> = BTreeMap::new();
     let mut intent_definitions: BTreeMap<RevisionId, Vec<IntentNode>> = BTreeMap::new();
     let mut context_definitions: BTreeMap<RevisionId, Vec<ContextNode>> = BTreeMap::new();
@@ -483,6 +505,15 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
     for event in events {
         events_by_id.entry(event.event_id).or_default().push(event);
         match &event.payload {
+            ReducerPayload::ContextCandidateCreated { candidate } => {
+                candidate_definitions
+                    .entry(candidate.candidate_id)
+                    .or_default()
+                    .push(CandidateNode {
+                        event_id: event.event_id,
+                        candidate: candidate.clone(),
+                    });
+            }
             ReducerPayload::SpaceCreated {
                 space_id,
                 intent_revision,
@@ -640,6 +671,18 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
                 id.to_string(),
                 event_ids(definitions, |node| node.event_id),
                 format!("revision ID {id} has multiple definitions"),
+            );
+        }
+    }
+    for (id, definitions) in &candidate_definitions {
+        if definitions.len() > 1 {
+            invalid_event_ids.extend(definitions.iter().map(|node| node.event_id));
+            push_diagnostic(
+                &mut diagnostics,
+                ReducerDiagnosticCode::DuplicateCandidateId,
+                id.to_string(),
+                event_ids(definitions, |node| node.event_id),
+                format!("candidate ID {id} has multiple definitions"),
             );
         }
     }
@@ -805,6 +848,7 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
 
     for event in events {
         let space_id = match &event.payload {
+            ReducerPayload::ContextCandidateCreated { .. } => continue,
             ReducerPayload::SpaceCreated { space_id, .. }
             | ReducerPayload::SpaceIntentRevisionAdded { space_id, .. }
             | ReducerPayload::ContextRevisionAdded { space_id, .. }
@@ -1451,7 +1495,22 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
         .iter()
         .flat_map(|diagnostic| diagnostic.event_ids.iter().copied())
         .collect();
+    let candidates = candidate_definitions
+        .into_iter()
+        .filter(|(_, definitions)| definitions.len() == 1)
+        .filter_map(|(candidate_id, mut definitions)| {
+            let node = definitions.pop().expect("one Candidate definition exists");
+            (!invalid_event_ids.contains(&node.event_id)).then_some((
+                candidate_id,
+                CandidateProjection {
+                    event_id: node.event_id,
+                    candidate: node.candidate,
+                },
+            ))
+        })
+        .collect();
     DomainProjection {
+        candidates,
         spaces,
         semantic_conflict_candidates,
         semantic_conflicts,

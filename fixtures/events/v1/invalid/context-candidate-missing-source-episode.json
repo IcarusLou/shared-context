@@ -1,0 +1,29 @@
+{
+  "schema_version": "1",
+  "event_id": "evt_00000000-0000-4000-8000-000000000802",
+  "event_type": "context_candidate.created",
+  "candidate": {
+    "candidate_id": "cnd_00000000-0000-4000-8000-000000000812",
+    "content": {
+      "kind": "discovery",
+      "statement": "This Candidate has no source Episode",
+      "rationale": "The fixture must be rejected",
+      "applicability": {
+        "domains": [],
+        "platforms": [],
+        "conditions": []
+      },
+      "assumptions": [],
+      "recheck_when": [],
+      "evidence": [
+        {
+          "kind": "source_snapshot",
+          "supports": "The source is missing",
+          "content": { "source_episode_id": null },
+          "interpretation": "Candidate provenance is incomplete",
+          "limitations": []
+        }
+      ]
+    }
+  }
+}

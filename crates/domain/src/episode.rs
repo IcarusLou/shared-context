@@ -212,14 +212,13 @@ impl WorkEpisode {
 
 /// Governable Context content extracted from one Work Episode.
 ///
-/// A Context Candidate is local runtime state, not an accepted Context revision.
+/// A Context Candidate is an unconfirmed proposal, not an accepted Context revision.
 /// It intentionally contains no Space route or Space recommendation. Derived
 /// recommendations must be represented separately and never imply ownership.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextCandidate {
     pub candidate_id: CandidateId,
-    pub task_id: TaskId,
     pub source_episode_id: WorkEpisodeId,
     pub content: ContextRevisionDraft,
 }
@@ -237,7 +236,6 @@ impl ContextCandidate {
         content.validate()?;
         Ok(Self {
             candidate_id: CandidateId::new(),
-            task_id: episode.task_id(),
             source_episode_id: episode.episode_id,
             content,
         })
@@ -264,11 +262,6 @@ impl ContextCandidate {
         if self.source_episode_id != episode.episode_id {
             return Err(invalid(
                 "context_candidate.source_episode_id must identify the supplied episode",
-            ));
-        }
-        if self.task_id != episode.task_id() {
-            return Err(invalid(
-                "context_candidate.task_id must match its source episode task",
             ));
         }
         Ok(())

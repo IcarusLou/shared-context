@@ -10,6 +10,7 @@
     "event_id": { "$ref": "#/$defs/event_id" },
     "event_type": {
       "enum": [
+        "context_candidate.created",
         "space.created",
         "space.intent_revision_added",
         "context.revision_added",
@@ -22,6 +23,13 @@
     "annotations": { "$ref": "#/$defs/annotations" }
   },
   "oneOf": [
+    {
+      "properties": {
+        "event_type": { "const": "context_candidate.created" },
+        "candidate": { "$ref": "#/$defs/context_candidate" }
+      },
+      "required": ["candidate"]
+    },
     {
       "properties": {
         "event_type": { "const": "space.created" },
@@ -96,6 +104,14 @@
     "space_id": {
       "type": "string",
       "pattern": "^spc_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "work_episode_id": {
+      "type": "string",
+      "pattern": "^wep_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "candidate_id": {
+      "type": "string",
+      "pattern": "^cnd_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
     },
     "context_id": {
       "type": "string",
@@ -238,6 +254,88 @@
         },
         "interpretation": { "$ref": "#/$defs/non_empty_string" },
         "limitations": { "$ref": "#/$defs/string_list" }
+      },
+      "additionalProperties": false
+    },
+    "evidence_draft": {
+      "type": "object",
+      "required": [
+        "kind",
+        "supports",
+        "content",
+        "interpretation",
+        "limitations"
+      ],
+      "properties": {
+        "kind": {
+          "enum": ["source_snapshot", "experiment_record", "artifact_snapshot"]
+        },
+        "supports": { "$ref": "#/$defs/non_empty_string" },
+        "content": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": true
+        },
+        "interpretation": { "$ref": "#/$defs/non_empty_string" },
+        "limitations": { "$ref": "#/$defs/string_list" }
+      },
+      "additionalProperties": false
+    },
+    "context_revision_draft": {
+      "type": "object",
+      "required": [
+        "kind",
+        "statement",
+        "rationale",
+        "applicability",
+        "assumptions",
+        "recheck_when",
+        "evidence"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "decision",
+            "contract",
+            "issue",
+            "risk",
+            "validation",
+            "discovery",
+            "progress"
+          ]
+        },
+        "topic_key": { "$ref": "#/$defs/non_empty_string" },
+        "statement": { "$ref": "#/$defs/non_empty_string" },
+        "rationale": { "$ref": "#/$defs/non_empty_string" },
+        "applicability": { "$ref": "#/$defs/applicability" },
+        "assumptions": { "$ref": "#/$defs/string_list" },
+        "recheck_when": { "$ref": "#/$defs/string_list" },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/evidence_draft" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": { "enum": ["decision", "contract"] }
+            },
+            "required": ["kind"]
+          },
+          "then": { "required": ["topic_key"] }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "context_candidate": {
+      "type": "object",
+      "required": ["candidate_id", "source_episode_id", "content"],
+      "properties": {
+        "candidate_id": { "$ref": "#/$defs/candidate_id" },
+        "source_episode_id": { "$ref": "#/$defs/work_episode_id" },
+        "content": { "$ref": "#/$defs/context_revision_draft" }
       },
       "additionalProperties": false
     },

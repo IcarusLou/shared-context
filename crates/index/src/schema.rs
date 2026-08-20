@@ -12,9 +12,10 @@ use crate::{
 
 pub(crate) const NEXT_PREFIX: &str = "_next_";
 
-const TABLES: [&str; 17] = [
+const TABLES: [&str; 18] = [
     "meta",
     "source_file",
+    "context_candidate",
     "space_projection",
     "intent_revision",
     "intent_head",
@@ -109,6 +110,21 @@ CREATE TABLE {prefix}source_file (
     diagnostic_code TEXT,
     diagnostic_message TEXT,
     content BLOB NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE {prefix}context_candidate (
+    candidate_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL UNIQUE,
+    source_episode_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    topic_key TEXT,
+    statement TEXT NOT NULL,
+    rationale TEXT NOT NULL,
+    applicability_json TEXT NOT NULL,
+    assumptions_json TEXT NOT NULL,
+    recheck_when_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    auto_injection_eligible INTEGER NOT NULL CHECK (auto_injection_eligible = 0),
+    projection_json TEXT NOT NULL
 ) WITHOUT ROWID;
 CREATE TABLE {prefix}space_projection (
     space_id TEXT PRIMARY KEY,
@@ -277,7 +293,9 @@ fn create_indexes(transaction: &Transaction<'_>) -> crate::Result<()> {
              CREATE INDEX conflict_context_status_idx
                  ON conflict(context_id, kind, status, conflict_key);
              CREATE INDEX publication_head_context_idx
-                 ON publication_head(context_id, publication_id);",
+                 ON publication_head(context_id, publication_id);
+             CREATE INDEX context_candidate_source_idx
+                 ON context_candidate(source_episode_id, candidate_id);",
         )
         .map_err(sql_error("create projection query indexes"))
 }
@@ -324,6 +342,31 @@ fn populate(
                 ],
             )
             .map_err(sql_error("write source-file projection"))?;
+    }
+
+    for (candidate_id, projection) in &input.projection.candidates {
+        let content = &projection.candidate.content;
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO {prefix}context_candidate(candidate_id, event_id, source_episode_id, kind, topic_key, statement, rationale, applicability_json, assumptions_json, recheck_when_json, evidence_json, auto_injection_eligible, projection_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12)"
+                ),
+                params![
+                    candidate_id.to_string(),
+                    projection.event_id.to_string(),
+                    projection.candidate.source_episode_id.to_string(),
+                    enum_text(content.kind),
+                    content.topic_key,
+                    content.statement,
+                    content.rationale,
+                    json(&content.applicability)?,
+                    json(&content.assumptions)?,
+                    json(&content.recheck_when)?,
+                    json(&content.evidence)?,
+                    json(projection)?
+                ],
+            )
+            .map_err(sql_error("write Context Candidate projection"))?;
     }
 
     for (space_id, space) in &input.projection.spaces {
@@ -689,6 +732,8 @@ pub(crate) fn replace_projection_incremental(
         .execute_batch(
             "DELETE FROM source_file;
              INSERT INTO source_file SELECT * FROM _next_source_file;
+             DELETE FROM context_candidate;
+             INSERT INTO context_candidate SELECT * FROM _next_context_candidate;
              DELETE FROM diagnostic;
              INSERT INTO diagnostic SELECT * FROM _next_diagnostic;
 

@@ -12,7 +12,7 @@ use sctx_event_schema::{
     Applicability, ConflictParticipant, ContextId, ContextKind, ContextRevisionDraft, Event,
     EventPayload, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, PublicationAction,
     PublicationDraft, PublicationId, ReviewDraft, ReviewVerdict, RevisionId, SemanticConflictDraft,
-    SpaceId,
+    SpaceId, WorkEpisodeId,
 };
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::{
@@ -66,6 +66,11 @@ fn context(statement: &str) -> ContextRevisionDraft {
     }
 }
 
+fn candidate(statement: &str) -> Event {
+    Event::context_candidate_created(WorkEpisodeId::new(), context(statement), None)
+        .expect("valid Candidate event")
+}
+
 fn space_ids(event: &Event) -> (SpaceId, RevisionId) {
     match event.payload() {
         EventPayload::SpaceCreated {
@@ -104,6 +109,11 @@ fn append(store: &GitStore, event: Event) -> PathBuf {
 fn fixture() -> Fixture {
     let temporary = tempfile::tempdir().unwrap();
     let store = GitStore::initialize(temporary.path().join("installation")).unwrap();
+
+    append(
+        &store,
+        candidate("Unassigned Candidates project outside every Space"),
+    );
 
     let space_event = Event::space_created(intent("SQLite deterministic rebuild"), None).unwrap();
     let (space_id, _) = space_ids(&space_event);
@@ -296,6 +306,15 @@ fn deletion_rebuilds_complete_projection_and_dirty_tree_is_never_read() {
 
     let connection = Connection::open(fixture.index.database_path()).unwrap();
     assert_eq!(count(&connection, "space_projection"), 1);
+    assert_eq!(count(&connection, "context_candidate"), 1);
+    assert_eq!(
+        count_where(
+            &connection,
+            "context_candidate",
+            "auto_injection_eligible = 0"
+        ),
+        1
+    );
     assert_eq!(count(&connection, "context_item"), 2);
     assert_eq!(
         count_where(
@@ -434,6 +453,36 @@ fn append_uses_incremental_closure_and_matches_scratch_rebuild() {
     let scratch = ProjectionIndex::new(fixture.store.repository(), scratch_state);
     let rebuilt = scratch.rebuild().unwrap();
     assert_eq!(rebuilt.update_kind, IndexUpdateKind::FullRebuild);
+    assert_eq!(
+        projection_dump(fixture.index.database_path()),
+        projection_dump(scratch.database_path())
+    );
+}
+
+#[test]
+fn unassigned_candidate_incrementally_projects_and_matches_scratch_rebuild() {
+    let fixture = fixture();
+    fixture.index.synchronize().unwrap();
+    append(
+        &fixture.store,
+        candidate("A second Candidate still has no Space route"),
+    );
+
+    let incremental = fixture.index.synchronize().unwrap();
+    assert_eq!(incremental.reason, RebuildReason::TreeChanged);
+    assert_eq!(incremental.update_kind, IndexUpdateKind::Incremental);
+    let connection = Connection::open(fixture.index.database_path()).unwrap();
+    assert_eq!(count(&connection, "context_candidate"), 2);
+    assert_eq!(count(&connection, "space_projection"), 1);
+    assert_eq!(count(&connection, "context_item"), 2);
+    assert_eq!(count(&connection, "context_fts"), 2);
+    drop(connection);
+
+    let scratch = ProjectionIndex::new(
+        fixture.store.repository(),
+        fixture.temporary.path().join("candidate-scratch-state"),
+    );
+    scratch.rebuild().unwrap();
     assert_eq!(
         projection_dump(fixture.index.database_path()),
         projection_dump(scratch.database_path())
@@ -818,6 +867,7 @@ fn assert_core_tables(connection: &Connection) {
     let expected = [
         "meta",
         "source_file",
+        "context_candidate",
         "space_projection",
         "intent_revision",
         "intent_head",
@@ -869,6 +919,7 @@ fn projection_dump(database: &Path) -> Vec<String> {
     [
         "SELECT key, value FROM meta WHERE key <> 'projection_generation' ORDER BY key",
         "SELECT * FROM source_file ORDER BY path",
+        "SELECT * FROM context_candidate ORDER BY candidate_id",
         "SELECT * FROM space_projection ORDER BY space_id",
         "SELECT * FROM intent_revision ORDER BY revision_id",
         "SELECT * FROM intent_head ORDER BY space_id, revision_id",

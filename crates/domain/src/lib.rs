@@ -25,10 +25,10 @@ pub use model::{
     SemanticConflict, SemanticConflictDraft,
 };
 pub use reducer::{
-    AutoInjectionBlocker, AutoInjectionEligibility, ContextGovernanceStatus, ContextProjection,
-    ContextSpaceProjection, DomainProjection, IntentProjection, ReducerDiagnostic,
-    ReducerDiagnosticCode, ReducerEvent, ReducerPayload, ReviewSummary, RevisionLifecycle,
-    RevisionProjection, SemanticConflictCandidate, SemanticConflictOpenReason,
+    AutoInjectionBlocker, AutoInjectionEligibility, CandidateProjection, ContextGovernanceStatus,
+    ContextProjection, ContextSpaceProjection, DomainProjection, IntentProjection,
+    ReducerDiagnostic, ReducerDiagnosticCode, ReducerEvent, ReducerPayload, ReviewSummary,
+    RevisionLifecycle, RevisionProjection, SemanticConflictCandidate, SemanticConflictOpenReason,
     SemanticConflictProjection, SemanticConflictStatus, reduce,
 };
 pub use task::{TaskIntent, TaskSignal, TaskSignalKind, TaskSpaceAssociation};

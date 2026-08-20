@@ -1,0 +1,31 @@
+{
+  "schema_version": "1",
+  "event_id": "evt_00000000-0000-4000-8000-000000000803",
+  "event_type": "context_candidate.created",
+  "candidate": {
+    "candidate_id": "cnd_00000000-0000-4000-8000-000000000813",
+    "source_episode_id": "wep_00000000-0000-4000-8000-000000000833",
+    "space_id": "spc_00000000-0000-4000-8000-000000000843",
+    "content": {
+      "kind": "discovery",
+      "statement": "This Candidate embeds Space ownership",
+      "rationale": "The fixture must be rejected",
+      "applicability": {
+        "domains": [],
+        "platforms": [],
+        "conditions": []
+      },
+      "assumptions": [],
+      "recheck_when": [],
+      "evidence": [
+        {
+          "kind": "source_snapshot",
+          "supports": "The Candidate contains a Space route",
+          "content": { "space_owned": true },
+          "interpretation": "Space ownership is forbidden at Candidate creation",
+          "limitations": []
+        }
+      ]
+    }
+  }
+}

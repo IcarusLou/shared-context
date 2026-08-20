@@ -1,0 +1,92 @@
+[
+  {
+    "schema_version": "1",
+    "event_id": "evt_00000000-0000-4000-8000-000000000851",
+    "event_type": "context_candidate.created",
+    "candidate": {
+      "candidate_id": "cnd_00000000-0000-4000-8000-000000000861",
+      "source_episode_id": "wep_00000000-0000-4000-8000-000000000881",
+      "content": {
+        "kind": "discovery",
+        "statement": "The current task can surface unassigned knowledge",
+        "rationale": "The governing Requirement is not yet certain",
+        "applicability": {
+          "domains": ["capture"],
+          "platforms": ["agent"],
+          "conditions": ["during implementation"]
+        },
+        "assumptions": [],
+        "recheck_when": ["a matching Space is resolved"],
+        "evidence": [
+          {
+            "kind": "source_snapshot",
+            "supports": "The work Episode contains the discovery",
+            "content": { "episode_observation": "discovery" },
+            "interpretation": "The Candidate has task-local provenance",
+            "limitations": []
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": "1",
+    "event_id": "evt_00000000-0000-4000-8000-000000000852",
+    "event_type": "context_candidate.created",
+    "candidate": {
+      "candidate_id": "cnd_00000000-0000-4000-8000-000000000862",
+      "source_episode_id": "wep_00000000-0000-4000-8000-000000000882",
+      "content": {
+        "kind": "validation",
+        "statement": "Candidate order does not change projection output",
+        "rationale": "Candidate identity is stable and independently reduced",
+        "applicability": {
+          "domains": ["reducer"],
+          "platforms": [],
+          "conditions": []
+        },
+        "assumptions": [],
+        "recheck_when": ["Candidate reduction changes"],
+        "evidence": [
+          {
+            "kind": "experiment_record",
+            "supports": "Reducer permutations converge",
+            "content": { "permutations": 6 },
+            "interpretation": "Input discovery order has no semantics",
+            "limitations": []
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": "1",
+    "event_id": "evt_00000000-0000-4000-8000-000000000853",
+    "event_type": "context_candidate.created",
+    "candidate": {
+      "candidate_id": "cnd_00000000-0000-4000-8000-000000000863",
+      "source_episode_id": "wep_00000000-0000-4000-8000-000000000883",
+      "content": {
+        "kind": "risk",
+        "statement": "Treating Candidate content as accepted would be unsafe",
+        "rationale": "Candidate evidence has not passed confirmation and governance",
+        "applicability": {
+          "domains": ["automatic-injection"],
+          "platforms": [],
+          "conditions": ["unconfirmed candidate"]
+        },
+        "assumptions": [],
+        "recheck_when": ["a later lifecycle confirms the content"],
+        "evidence": [
+          {
+            "kind": "artifact_snapshot",
+            "supports": "Candidates are projected outside ContextSpace",
+            "content": { "context_space_membership": false },
+            "interpretation": "Candidate content cannot enter injection queries",
+            "limitations": []
+          }
+        ]
+      }
+    }
+  }
+]

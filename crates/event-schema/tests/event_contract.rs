@@ -9,7 +9,8 @@ use sctx_event_schema::{
     ConflictResolutionResult, ContextId, ContextKind, ContextRevisionDraft, DiagnosticCode, Event,
     EventPayload, EventType, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, OriginHint,
     ParsedEvent, PublicationAction, PublicationDraft, PublicationId, ResolutionOutcome,
-    ReviewDraft, ReviewVerdict, SemanticConflictDraft, V1_JSON_SCHEMA, V1_SCHEMA_ID, parse_event,
+    ReviewDraft, ReviewVerdict, SemanticConflictDraft, V1_JSON_SCHEMA, V1_SCHEMA_ID, WorkEpisodeId,
+    parse_event,
 };
 use serde_json::{Value, json};
 
@@ -73,9 +74,9 @@ fn context_draft() -> ContextRevisionDraft {
 }
 
 #[test]
-fn all_seven_v1_fixtures_round_trip_without_semantic_loss() {
+fn all_eight_v1_fixtures_round_trip_without_semantic_loss() {
     let paths = json_files(&fixture_root().join("events/v1/valid"));
-    assert_eq!(paths.len(), 7);
+    assert_eq!(paths.len(), 8);
 
     let mut event_types = Vec::new();
     for path in paths {
@@ -100,6 +101,7 @@ fn all_seven_v1_fixtures_round_trip_without_semantic_loss() {
             "context.publication_changed",
             "context.reviewed",
             "context.revision_added",
+            "context_candidate.created",
             "semantic_conflict.opened",
             "semantic_conflict.resolution_added",
             "space.created",
@@ -195,6 +197,8 @@ fn generation_api_assigns_new_ids_and_all_generated_events_parse() {
     let intent_added =
         Event::intent_revision_added(space_id, vec![initial_revision_id], intent("Revised"), None)
             .unwrap();
+    let candidate =
+        Event::context_candidate_created(WorkEpisodeId::new(), context_draft(), None).unwrap();
     let proposed = Event::context_proposed(space_id, context_draft(), annotations).unwrap();
     let (context_id, revision_id) = match proposed.payload() {
         EventPayload::ContextRevisionAdded {
@@ -284,6 +288,7 @@ fn generation_api_assigns_new_ids_and_all_generated_events_parse() {
     .unwrap();
 
     let events = [
+        candidate,
         created,
         intent_added,
         proposed,
@@ -404,4 +409,20 @@ fn known_schema_with_unknown_event_type_is_rejected_not_quarantined() {
 fn event_type_getter_matches_payload_variant() {
     let event = Event::space_created(intent("Type"), None).unwrap();
     assert_eq!(event.event_type(), EventType::SpaceCreated);
+}
+
+#[test]
+fn candidate_event_has_source_content_but_no_space_route() {
+    let event = Event::context_candidate_created(WorkEpisodeId::new(), context_draft(), None)
+        .expect("valid Candidate event");
+    let EventPayload::ContextCandidateCreated { candidate } = event.payload() else {
+        panic!("expected context_candidate.created");
+    };
+
+    assert!(!candidate.is_auto_injection_eligible());
+    let serialized = serde_json::to_value(event).expect("serialize Candidate event");
+    assert!(serialized.get("space_id").is_none());
+    assert!(serialized["candidate"].get("space_id").is_none());
+    assert!(serialized["candidate"].get("source_episode_id").is_some());
+    assert!(serialized["candidate"].get("content").is_some());
 }

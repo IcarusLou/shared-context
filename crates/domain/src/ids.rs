@@ -133,7 +133,7 @@ opaque_id!(
 opaque_id!(
     CandidateId,
     "cnd_",
-    "Opaque identity of a local `ContextCandidate`."
+    "Opaque identity of an unassigned `ContextCandidate`."
 );
 opaque_id!(ContextId, "ctx_", "Opaque identity of a `ContextItem`.");
 opaque_id!(

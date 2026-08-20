@@ -12,8 +12,9 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 pub use sctx_domain::{
-    Applicability, AutoInjectionBlocker, AutoInjectionEligibility, ConflictId, ConflictParticipant,
-    ConflictResolution, ConflictResolutionDraft, ConflictResolutionResult, ContextGovernanceStatus,
+    Applicability, AutoInjectionBlocker, AutoInjectionEligibility, CandidateId,
+    CandidateProjection, ConflictId, ConflictParticipant, ConflictResolution,
+    ConflictResolutionDraft, ConflictResolutionResult, ContextCandidate, ContextGovernanceStatus,
     ContextId, ContextKind, ContextProjection, ContextRevision, ContextRevisionDraft,
     ContextSpaceProjection, DomainProjection, Error, ErrorKind, EventId, EvidenceId,
     EvidenceSnapshot, EvidenceSnapshotDraft, EvidenceType, IdParseError, IntentProjection,
@@ -22,7 +23,7 @@ pub use sctx_domain::{
     ResolutionId, ResolutionOutcome, Result, Review, ReviewDraft, ReviewId, ReviewSummary,
     ReviewVerdict, RevisionId, RevisionLifecycle, RevisionProjection, SemanticConflict,
     SemanticConflictCandidate, SemanticConflictDraft, SemanticConflictOpenReason,
-    SemanticConflictProjection, SemanticConflictStatus, SpaceId, reduce,
+    SemanticConflictProjection, SemanticConflictStatus, SpaceId, WorkEpisodeId, reduce,
 };
 
 /// Immutable identifier for the bundled V1 JSON Schema.
@@ -51,6 +52,8 @@ impl SchemaVersion {
 /// Closed set of V1 event kinds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum EventType {
+    #[serde(rename = "context_candidate.created")]
+    ContextCandidateCreated,
     #[serde(rename = "space.created")]
     SpaceCreated,
     #[serde(rename = "space.intent_revision_added")]
@@ -72,6 +75,7 @@ impl EventType {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ContextCandidateCreated => "context_candidate.created",
             Self::SpaceCreated => "space.created",
             Self::SpaceIntentRevisionAdded => "space.intent_revision_added",
             Self::ContextRevisionAdded => "context.revision_added",
@@ -107,6 +111,8 @@ pub struct Annotations {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event_type", deny_unknown_fields)]
 pub enum EventPayload {
+    #[serde(rename = "context_candidate.created")]
+    ContextCandidateCreated { candidate: ContextCandidate },
     #[serde(rename = "space.created")]
     SpaceCreated {
         space_id: SpaceId,
@@ -153,6 +159,7 @@ impl EventPayload {
     #[must_use]
     pub const fn event_type(&self) -> EventType {
         match self {
+            Self::ContextCandidateCreated { .. } => EventType::ContextCandidateCreated,
             Self::SpaceCreated { .. } => EventType::SpaceCreated,
             Self::SpaceIntentRevisionAdded { .. } => EventType::SpaceIntentRevisionAdded,
             Self::ContextRevisionAdded { .. } => EventType::ContextRevisionAdded,
@@ -167,6 +174,7 @@ impl EventPayload {
 
     fn validate(&self) -> Result<()> {
         match self {
+            Self::ContextCandidateCreated { candidate } => candidate.validate(),
             Self::SpaceCreated {
                 intent_revision, ..
             } => {
@@ -245,6 +253,31 @@ impl Event {
         };
         event.validate()?;
         Ok(event)
+    }
+
+    /// Records one unassigned Context Candidate and generates its Candidate/Event IDs.
+    ///
+    /// The source Work Episode is causal provenance, not a Space route.
+    /// This event does not create a Context item or any publication eligibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] when governable Candidate content is incomplete.
+    pub fn context_candidate_created(
+        source_episode_id: WorkEpisodeId,
+        content: ContextRevisionDraft,
+        annotations: Option<Annotations>,
+    ) -> Result<Self> {
+        Self::generated(
+            EventPayload::ContextCandidateCreated {
+                candidate: ContextCandidate {
+                    candidate_id: CandidateId::new(),
+                    source_episode_id,
+                    content,
+                },
+            },
+            annotations,
+        )
     }
 
     /// Creates a Space and its initial full Intent revision. All IDs are generated internally.
@@ -455,6 +488,11 @@ impl Event {
     #[must_use]
     pub fn reducer_event(&self) -> Option<ReducerEvent> {
         let payload = match &self.payload {
+            EventPayload::ContextCandidateCreated { candidate } => {
+                ReducerPayload::ContextCandidateCreated {
+                    candidate: candidate.clone(),
+                }
+            }
             EventPayload::SpaceCreated {
                 space_id,
                 intent_revision,
@@ -563,6 +601,11 @@ impl Event {
 
 fn remove_defined_identity_fields(event_type: EventType, object: &mut Map<String, Value>) {
     match event_type {
+        EventType::ContextCandidateCreated => {
+            if let Some(candidate) = object.get_mut("candidate").and_then(Value::as_object_mut) {
+                candidate.remove("candidate_id");
+            }
+        }
         EventType::SpaceCreated => {
             object.remove("space_id");
             if let Some(revision) = object

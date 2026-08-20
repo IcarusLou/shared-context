@@ -20,7 +20,7 @@ pub(crate) struct SourceFile {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EventImpact {
     pub(crate) path: String,
-    pub(crate) space_id: String,
+    pub(crate) space_id: Option<String>,
     definitions: BTreeSet<String>,
     references: BTreeSet<String>,
 }
@@ -216,7 +216,7 @@ pub(crate) fn impact_closure(
     }
     selected
         .into_iter()
-        .map(|index| facts[index].space_id.clone())
+        .filter_map(|index| facts[index].space_id.clone())
         .collect()
 }
 
@@ -262,6 +262,11 @@ fn event_impact(path: &str, event: &Event) -> EventImpact {
     let mut definitions = BTreeSet::from([identity("event", &event.event_id())]);
     let mut references = BTreeSet::new();
     let space_id = match event.payload() {
+        EventPayload::ContextCandidateCreated { candidate } => {
+            definitions.insert(identity("candidate", &candidate.candidate_id));
+            references.insert(identity("work_episode", &candidate.source_episode_id));
+            None
+        }
         EventPayload::SpaceCreated {
             space_id,
             intent_revision,
@@ -273,7 +278,7 @@ fn event_impact(path: &str, event: &Event) -> EventImpact {
                 "revision",
                 &intent_revision.parent_revision_ids,
             );
-            *space_id
+            Some(*space_id)
         }
         EventPayload::SpaceIntentRevisionAdded {
             space_id,
@@ -286,7 +291,7 @@ fn event_impact(path: &str, event: &Event) -> EventImpact {
                 "revision",
                 &intent_revision.parent_revision_ids,
             );
-            *space_id
+            Some(*space_id)
         }
         EventPayload::ContextRevisionAdded {
             space_id,
@@ -300,7 +305,7 @@ fn event_impact(path: &str, event: &Event) -> EventImpact {
                 definitions.insert(identity("evidence", &evidence.evidence_id));
             }
             add_references(&mut references, "revision", &revision.parent_revision_ids);
-            *space_id
+            Some(*space_id)
         }
         EventPayload::ContextReviewed {
             space_id,
@@ -311,7 +316,7 @@ fn event_impact(path: &str, event: &Event) -> EventImpact {
             definitions.insert(identity("context", context_id));
             definitions.insert(identity("review", &review.review_id));
             references.insert(identity("revision", &review.revision_id));
-            *space_id
+            Some(*space_id)
         }
         EventPayload::ContextPublicationChanged {
             space_id,
@@ -328,7 +333,7 @@ fn event_impact(path: &str, event: &Event) -> EventImpact {
                 &publication.previous_publication_ids,
             );
             add_references(&mut references, "event", &publication.review_event_ids);
-            *space_id
+            Some(*space_id)
         }
         EventPayload::SemanticConflictOpened { space_id, conflict } => {
             references.insert(identity("space", space_id));
@@ -338,7 +343,7 @@ fn event_impact(path: &str, event: &Event) -> EventImpact {
                 references.insert(identity("revision", &participant.revision_id));
                 references.insert(identity("publication", &participant.publication_id));
             }
-            *space_id
+            Some(*space_id)
         }
         EventPayload::SemanticConflictResolutionAdded {
             space_id,
@@ -362,12 +367,12 @@ fn event_impact(path: &str, event: &Event) -> EventImpact {
                 references.insert(identity("context", &result.context_id));
                 references.insert(identity("revision", &result.revision_id));
             }
-            *space_id
+            Some(*space_id)
         }
     };
     EventImpact {
         path: path.to_owned(),
-        space_id: space_id.to_string(),
+        space_id: space_id.map(|space_id| space_id.to_string()),
         definitions,
         references,
     }

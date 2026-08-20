@@ -24,11 +24,11 @@ pub use sctx_domain::{Error, ErrorKind, Result};
 pub use tokenizer::{normalize_search_text, search_tokens};
 
 /// Current physical `SQLite` schema version.
-pub const DB_SCHEMA_VERSION: &str = "3";
+pub const DB_SCHEMA_VERSION: &str = "4";
 /// Event parser implementation version recorded in every projection.
 pub const EVENT_PARSER_VERSION: &str = "1";
 /// Pure reducer implementation version recorded in every projection.
-pub const REDUCER_VERSION: &str = "1";
+pub const REDUCER_VERSION: &str = "2";
 /// Conflict detector implementation version recorded in every projection.
 pub const CONFLICT_DETECTOR_VERSION: &str = "1";
 /// NFKC, full Unicode case-folding, identifier splitting, and CJK bigram implementation.
