@@ -126,6 +126,16 @@ opaque_id!(
     "Opaque identity of an Agent engineering task."
 );
 opaque_id!(
+    TaskSessionId,
+    "tss_",
+    "Opaque identity of one Task's local runtime session."
+);
+opaque_id!(
+    TaskIntentRevisionId,
+    "tir_",
+    "Opaque identity of one immutable Task Intent revision."
+);
+opaque_id!(
     WorkEpisodeId,
     "wep_",
     "Opaque identity of one Task's aggregated work episode."
@@ -172,7 +182,7 @@ mod tests {
 
     use super::{
         CandidateId, ConflictId, ContextId, EventId, EvidenceId, PublicationId, ResolutionId,
-        ReviewId, RevisionId, SpaceId, TaskId, WorkEpisodeId,
+        ReviewId, RevisionId, SpaceId, TaskId, TaskIntentRevisionId, TaskSessionId, WorkEpisodeId,
     };
 
     #[test]
@@ -210,6 +220,8 @@ mod tests {
 
         assert_generated_id!(SpaceId::new(), "spc_");
         assert_generated_id!(TaskId::new(), "tsk_");
+        assert_generated_id!(TaskSessionId::new(), "tss_");
+        assert_generated_id!(TaskIntentRevisionId::new(), "tir_");
         assert_generated_id!(WorkEpisodeId::new(), "wep_");
         assert_generated_id!(CandidateId::new(), "cnd_");
         assert_generated_id!(ContextId::new(), "ctx_");

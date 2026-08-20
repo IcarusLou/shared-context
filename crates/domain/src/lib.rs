@@ -15,7 +15,8 @@ pub use episode::{
 };
 pub use ids::{
     CandidateId, ConflictId, ContextId, EventId, EvidenceId, IdParseError, PublicationId,
-    ResolutionId, ReviewId, RevisionId, SpaceId, TaskId, WorkEpisodeId,
+    ResolutionId, ReviewId, RevisionId, SpaceId, TaskId, TaskIntentRevisionId, TaskSessionId,
+    WorkEpisodeId,
 };
 pub use model::{
     Applicability, ConflictParticipant, ConflictResolution, ConflictResolutionDraft,
@@ -31,7 +32,10 @@ pub use reducer::{
     RevisionLifecycle, RevisionProjection, SemanticConflictCandidate, SemanticConflictOpenReason,
     SemanticConflictProjection, SemanticConflictStatus, reduce,
 };
-pub use task::{TaskIntent, TaskSignal, TaskSignalKind, TaskSpaceAssociation};
+pub use task::{
+    ExternalSessionLocator, TaskIntent, TaskIntentRevision, TaskSessionSnapshot, TaskSignal,
+    TaskSignalKind, TaskSpaceAssociation,
+};
 
 /// Broad categories used to route recoverable errors across crate boundaries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

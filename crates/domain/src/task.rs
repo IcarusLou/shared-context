@@ -2,7 +2,9 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ContextId, Error, ErrorKind, Result, SpaceId, TaskId};
+use crate::{
+    ContextId, Error, ErrorKind, Result, SpaceId, TaskId, TaskIntentRevisionId, TaskSessionId,
+};
 
 fn invalid(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::InvalidInput, message)
@@ -84,6 +86,234 @@ impl TaskIntent {
         validate_text_set(&self.artifacts, "task_intent.artifacts")?;
         validate_text_set(&self.interfaces, "task_intent.interfaces")?;
         validate_text_set(&self.unknowns, "task_intent.unknowns")
+    }
+}
+
+/// External Agent coordinates used only to locate a local Task Session.
+///
+/// The locator is deliberately not a domain identifier. Reusing the same
+/// external session key under a different Agent kind denotes a different
+/// locator, and neither component establishes durable knowledge identity.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalSessionLocator {
+    pub agent_kind: String,
+    pub external_session_id: String,
+}
+
+impl ExternalSessionLocator {
+    /// Creates a validated locator from external Agent coordinates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] when either coordinate is empty.
+    pub fn new(
+        agent_kind: impl Into<String>,
+        external_session_id: impl Into<String>,
+    ) -> Result<Self> {
+        let locator = Self {
+            agent_kind: agent_kind.into(),
+            external_session_id: external_session_id.into(),
+        };
+        locator.validate()?;
+        Ok(locator)
+    }
+
+    /// Validates the external coordinates without treating them as Task identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] when either coordinate is empty.
+    pub fn validate(&self) -> Result<()> {
+        require_text(&self.agent_kind, "external_session_locator.agent_kind")?;
+        require_text(
+            &self.external_session_id,
+            "external_session_locator.external_session_id",
+        )
+    }
+}
+
+/// One immutable version of a Task's structured intent.
+///
+/// Task Intent revisions form a single local parent chain. The initial revision
+/// has no parent; every successor names the immediately preceding revision.
+/// Space and Workspace routing are intentionally absent.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskIntentRevision {
+    pub revision_id: TaskIntentRevisionId,
+    pub parent_revision_id: Option<TaskIntentRevisionId>,
+    pub intent: TaskIntent,
+}
+
+impl TaskIntentRevision {
+    /// Creates the first validated revision for a Task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] when the Task Intent is invalid.
+    pub fn initial(intent: TaskIntent) -> Result<Self> {
+        intent.validate()?;
+        Ok(Self {
+            revision_id: TaskIntentRevisionId::new(),
+            parent_revision_id: None,
+            intent,
+        })
+    }
+
+    /// Creates a validated successor to an existing Task Intent revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] when the new Intent is invalid or
+    /// belongs to a different Task.
+    pub fn successor(parent: &Self, intent: TaskIntent) -> Result<Self> {
+        parent.validate()?;
+        intent.validate()?;
+        if intent.task_id != parent.task_id() {
+            return Err(invalid(
+                "task_intent_revision successor must belong to the parent task",
+            ));
+        }
+        Ok(Self {
+            revision_id: TaskIntentRevisionId::new(),
+            parent_revision_id: Some(parent.revision_id),
+            intent,
+        })
+    }
+
+    /// Returns the Task whose understanding this revision records.
+    #[must_use]
+    pub const fn task_id(&self) -> TaskId {
+        self.intent.task_id
+    }
+
+    /// Validates this revision without consulting a Session history.
+    ///
+    /// Parent existence and chain position are Session-level invariants checked
+    /// by [`TaskSessionSnapshot::validate`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] for an invalid Intent or self-parent.
+    pub fn validate(&self) -> Result<()> {
+        self.intent.validate()?;
+        if self.parent_revision_id == Some(self.revision_id) {
+            return Err(invalid("task_intent_revision cannot name itself as parent"));
+        }
+        Ok(())
+    }
+}
+
+/// Complete local runtime snapshot for one Agent Task Session.
+///
+/// A Task Session owns exactly one Task and a non-empty, linear Task Intent
+/// revision history. Task Signals describe the engineering scene but cannot
+/// route the Session or its Intent to a Context Space.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskSessionSnapshot {
+    pub task_session_id: TaskSessionId,
+    pub task_id: TaskId,
+    pub external_session_locator: ExternalSessionLocator,
+    pub intent_revisions: Vec<TaskIntentRevision>,
+    pub task_signals: Vec<TaskSignal>,
+}
+
+impl TaskSessionSnapshot {
+    /// Starts a validated local Task Session with its initial Intent revision.
+    ///
+    /// Empty Task Signal collections are valid. A Workspace, when present, is
+    /// represented only as a Task Signal and never as a Session route.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] when the locator, Intent, or signals
+    /// are invalid.
+    pub fn from_initial(
+        external_session_locator: ExternalSessionLocator,
+        intent: TaskIntent,
+        task_signals: Vec<TaskSignal>,
+    ) -> Result<Self> {
+        external_session_locator.validate()?;
+        TaskSignal::validate_collection(&task_signals)?;
+        let task_id = intent.task_id;
+        let initial_revision = TaskIntentRevision::initial(intent)?;
+        let snapshot = Self {
+            task_session_id: TaskSessionId::new(),
+            task_id,
+            external_session_locator,
+            intent_revisions: vec![initial_revision],
+            task_signals,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Returns the current Task Intent revision.
+    ///
+    /// A valid snapshot always has a current revision. `None` is possible only
+    /// for an unvalidated value obtained through direct construction.
+    #[must_use]
+    pub fn current_intent_revision(&self) -> Option<&TaskIntentRevision> {
+        self.intent_revisions.last()
+    }
+
+    /// Appends a validated successor as the Session's new current Intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] when the existing Session is invalid,
+    /// the Intent is invalid, or the Intent belongs to another Task.
+    pub fn append_intent(&mut self, intent: TaskIntent) -> Result<TaskIntentRevisionId> {
+        self.validate()?;
+        let parent = self.current_intent_revision().ok_or_else(|| {
+            invalid("task_session.intent_revisions must contain an initial revision")
+        })?;
+        let revision = TaskIntentRevision::successor(parent, intent)?;
+        let revision_id = revision.revision_id;
+        self.intent_revisions.push(revision);
+        Ok(revision_id)
+    }
+
+    /// Validates the Session boundary and complete Task Intent parent chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] when the locator or signals are
+    /// invalid, the chain is empty or disconnected, a revision is repeated, or
+    /// any revision belongs to another Task.
+    pub fn validate(&self) -> Result<()> {
+        self.external_session_locator.validate()?;
+        TaskSignal::validate_collection(&self.task_signals)?;
+        if self.intent_revisions.is_empty() {
+            return Err(invalid(
+                "task_session.intent_revisions must contain an initial revision",
+            ));
+        }
+
+        let mut revision_ids = HashSet::with_capacity(self.intent_revisions.len());
+        let mut expected_parent = None;
+        for (index, revision) in self.intent_revisions.iter().enumerate() {
+            revision.validate()?;
+            if revision.task_id() != self.task_id {
+                return Err(invalid(format!(
+                    "task_session.intent_revisions[{index}] must belong to the session task"
+                )));
+            }
+            if !revision_ids.insert(revision.revision_id) {
+                return Err(invalid(
+                    "task_session.intent_revisions must not repeat a revision",
+                ));
+            }
+            if revision.parent_revision_id != expected_parent {
+                return Err(invalid(format!(
+                    "task_session.intent_revisions[{index}] must continue the parent chain"
+                )));
+            }
+            expected_parent = Some(revision.revision_id);
+        }
+        Ok(())
     }
 }
 
@@ -234,14 +464,21 @@ impl TaskSpaceAssociation {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
-    use super::{TaskIntent, TaskSignal, TaskSignalKind, TaskSpaceAssociation};
+    use super::{
+        ExternalSessionLocator, TaskIntent, TaskIntentRevision, TaskSessionSnapshot, TaskSignal,
+        TaskSignalKind, TaskSpaceAssociation,
+    };
     use crate::{ContextId, ErrorKind, SpaceId, TaskId};
 
     fn intent() -> TaskIntent {
+        intent_for(TaskId::new())
+    }
+
+    fn intent_for(task_id: TaskId) -> TaskIntent {
         TaskIntent {
-            task_id: TaskId::new(),
+            task_id,
             goal: "Make task-first retrieval possible".to_owned(),
             desired_change: "Infer relevant knowledge from the current task".to_owned(),
             in_scope: vec!["Task domain primitives".to_owned()],
@@ -253,6 +490,30 @@ mod tests {
             artifacts: vec!["SearchResult".to_owned()],
             interfaces: vec!["search-v2".to_owned()],
             unknowns: vec!["Historical compatibility limits".to_owned()],
+        }
+    }
+
+    fn locator(external_session_id: &str) -> ExternalSessionLocator {
+        ExternalSessionLocator::new("codex", external_session_id).expect("valid locator")
+    }
+
+    fn assert_has_no_route_fields(value: &Value) {
+        match value {
+            Value::Object(fields) => {
+                for (field, nested) in fields {
+                    assert!(
+                        !field.contains("space") && !field.contains("workspace"),
+                        "serialized Task runtime field must not route through {field}"
+                    );
+                    assert_has_no_route_fields(nested);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    assert_has_no_route_fields(value);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -292,6 +553,163 @@ mod tests {
 
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
         assert!(error.message().contains("task_intent.domains"));
+    }
+
+    #[test]
+    fn task_session_starts_with_one_parentless_intent_revision() {
+        let intent = intent();
+        let task_id = intent.task_id;
+        let session = TaskSessionSnapshot::from_initial(locator("session-a"), intent, vec![])
+            .expect("valid initial Task Session");
+
+        assert_eq!(session.task_id, task_id);
+        assert_eq!(session.intent_revisions.len(), 1);
+        assert_eq!(
+            session
+                .current_intent_revision()
+                .expect("initial revision")
+                .parent_revision_id,
+            None
+        );
+        assert!(session.validate().is_ok());
+    }
+
+    #[test]
+    fn task_intent_revisions_form_a_linear_parent_chain() {
+        let task_id = TaskId::new();
+        let mut session =
+            TaskSessionSnapshot::from_initial(locator("session-a"), intent_for(task_id), vec![])
+                .expect("valid initial Task Session");
+        let initial_id = session.intent_revisions[0].revision_id;
+
+        let mut second_intent = intent_for(task_id);
+        second_intent.unknowns.clear();
+        let second_id = session
+            .append_intent(second_intent)
+            .expect("valid successor");
+
+        assert_eq!(session.intent_revisions[1].revision_id, second_id);
+        assert_eq!(
+            session.intent_revisions[1].parent_revision_id,
+            Some(initial_id)
+        );
+        assert!(session.validate().is_ok());
+    }
+
+    #[test]
+    fn task_session_rejects_mixed_tasks() {
+        let mut session = TaskSessionSnapshot::from_initial(locator("session-a"), intent(), vec![])
+            .expect("valid initial Task Session");
+        let parent = session.intent_revisions[0].clone();
+
+        let error = TaskIntentRevision::successor(&parent, intent())
+            .expect_err("mixed Task successor must fail");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert!(error.message().contains("parent task"));
+
+        session.intent_revisions.push(TaskIntentRevision {
+            revision_id: crate::TaskIntentRevisionId::new(),
+            parent_revision_id: Some(parent.revision_id),
+            intent: intent(),
+        });
+        let error = session
+            .validate()
+            .expect_err("mixed Task history must fail");
+        assert!(error.message().contains("session task"));
+    }
+
+    #[test]
+    fn task_session_rejects_duplicate_or_disconnected_revisions() {
+        let mut duplicate =
+            TaskSessionSnapshot::from_initial(locator("session-a"), intent(), vec![])
+                .expect("valid initial Task Session");
+        duplicate
+            .intent_revisions
+            .push(duplicate.intent_revisions[0].clone());
+        let error = duplicate
+            .validate()
+            .expect_err("duplicate revision must fail");
+        assert!(error.message().contains("must not repeat a revision"));
+
+        let task_id = TaskId::new();
+        let mut disconnected =
+            TaskSessionSnapshot::from_initial(locator("session-b"), intent_for(task_id), vec![])
+                .expect("valid initial Task Session");
+        disconnected.intent_revisions.push(TaskIntentRevision {
+            revision_id: crate::TaskIntentRevisionId::new(),
+            parent_revision_id: None,
+            intent: intent_for(task_id),
+        });
+        let error = disconnected
+            .validate()
+            .expect_err("disconnected revision must fail");
+        assert!(error.message().contains("continue the parent chain"));
+    }
+
+    #[test]
+    fn task_session_rejects_empty_intent_or_external_locator_boundaries() {
+        let mut empty_intent = intent();
+        empty_intent.desired_change = "  ".to_owned();
+        let error = TaskSessionSnapshot::from_initial(locator("session-a"), empty_intent, vec![])
+            .expect_err("empty Intent must fail");
+        assert!(error.message().contains("task_intent.desired_change"));
+
+        for (agent_kind, external_session_id, field) in [
+            (" ", "session-a", "agent_kind"),
+            ("codex", "\t", "external_session_id"),
+        ] {
+            let error = ExternalSessionLocator::new(agent_kind, external_session_id)
+                .expect_err("empty locator coordinate must fail");
+            assert_eq!(error.kind(), ErrorKind::InvalidInput);
+            assert!(error.message().contains(field));
+        }
+    }
+
+    #[test]
+    fn one_workspace_can_supply_signals_to_independent_task_sessions() {
+        let workspace_signal = TaskSignal {
+            kind: TaskSignalKind::Workspace,
+            content: "/work/shared-repository".to_owned(),
+        };
+        let first = TaskSessionSnapshot::from_initial(
+            locator("session-a"),
+            intent(),
+            vec![workspace_signal.clone()],
+        )
+        .expect("first Task Session");
+        let second = TaskSessionSnapshot::from_initial(
+            locator("session-b"),
+            intent(),
+            vec![workspace_signal],
+        )
+        .expect("second Task Session");
+
+        assert_ne!(first.task_session_id, second.task_session_id);
+        assert_ne!(first.task_id, second.task_id);
+        assert_ne!(
+            first.external_session_locator,
+            second.external_session_locator
+        );
+        assert_eq!(first.task_signals, second.task_signals);
+    }
+
+    #[test]
+    fn serialized_task_intent_revision_and_session_have_no_route_fields() {
+        let session = TaskSessionSnapshot::from_initial(
+            locator("session-a"),
+            intent(),
+            vec![TaskSignal {
+                kind: TaskSignalKind::File,
+                content: "src/search.tsx".to_owned(),
+            }],
+        )
+        .expect("valid Task Session");
+        let revision = serde_json::to_value(&session.intent_revisions[0])
+            .expect("serialize Task Intent revision");
+        let session = serde_json::to_value(session).expect("serialize Task Session");
+
+        assert_has_no_route_fields(&revision);
+        assert_has_no_route_fields(&session);
     }
 
     #[test]
