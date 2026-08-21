@@ -729,6 +729,7 @@ fn candidate_create_is_unassigned_idempotent_and_absent_from_retrieval() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn task_context_cli_entry_owns_task_identity_and_evolves_one_session() {
     let harness = Harness::new();
     let (space_id, _) = create_space(&harness, "CLI Task Context");
@@ -754,6 +755,8 @@ fn task_context_cli_entry_owns_task_identity_and_evolves_one_session() {
         r#"{"kind":"workspace","content":"/work/shared"}"#,
         "--token-budget",
         "2000",
+        "--max-spaces",
+        "1",
     ];
     let first = harness.success(&base);
     let same = harness.success(&base);
@@ -780,6 +783,7 @@ fn task_context_cli_entry_owns_task_identity_and_evolves_one_session() {
     assert!(first["data"]["task_session_id"].as_str().is_some());
     assert!(first["data"]["task_id"].as_str().is_some());
     assert!(first["data"]["candidate_spaces"].as_array().is_some());
+    assert!(first["data"]["candidate_spaces"].as_array().unwrap().len() <= 1);
     assert!(first["data"]["retrieval_paths"].as_array().is_some());
     assert_eq!(
         first["data"]["task_session_id"],
@@ -832,6 +836,22 @@ fn task_context_cli_entry_owns_task_identity_and_evolves_one_session() {
         &space_id,
     ]);
     assert_eq!(rejected["error"]["code"], "invalid_input");
+
+    let invalid_max = harness.failure(&[
+        "task",
+        "context",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        "invalid-max-session",
+        "--goal",
+        "reject unsafe top k",
+        "--desired-change",
+        "reject unsafe top k",
+        "--max-spaces",
+        "33",
+    ]);
+    assert_eq!(invalid_max["error"]["code"], "invalid_input");
 }
 
 #[test]

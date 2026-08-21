@@ -25,8 +25,9 @@ use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::{DomainSnapshot, ProjectionIndex};
 use sctx_search::{
-    ConflictView, ContextPackOmitted, ContextStatus, ScopeFilter, SearchEngine, SearchFilters,
-    SearchRequest, TaskContextItem, TaskContextRequest, TaskRetrievalPath,
+    ConflictView, ContextPackOmitted, ContextStatus, DEFAULT_TASK_MAX_SPACES, MAX_TASK_MAX_SPACES,
+    MIN_TASK_CONTEXT_TOKEN_BUDGET, ScopeFilter, SearchEngine, SearchFilters, SearchRequest,
+    TaskContextItem, TaskContextRequest, TaskRetrievalPath,
 };
 use sctx_task_runtime::TaskRuntime;
 use serde::{Deserialize, Serialize};
@@ -105,6 +106,8 @@ pub struct TaskContextInput {
     pub task_signals: Vec<TaskSignal>,
     #[serde(default = "default_token_budget")]
     pub token_budget: usize,
+    #[serde(default = "default_max_spaces")]
+    pub max_spaces: usize,
 }
 
 impl TaskContextInput {
@@ -135,10 +138,15 @@ impl TaskContextInput {
         for signal in &self.task_signals {
             signal.validate()?;
         }
-        if self.token_budget == 0 {
-            return Err(invalid(
-                "task_context token_budget must be greater than zero",
-            ));
+        if self.token_budget < MIN_TASK_CONTEXT_TOKEN_BUDGET {
+            return Err(invalid(format!(
+                "task_context token_budget must be at least {MIN_TASK_CONTEXT_TOKEN_BUDGET}"
+            )));
+        }
+        if self.max_spaces == 0 || self.max_spaces > MAX_TASK_MAX_SPACES {
+            return Err(invalid(format!(
+                "task_context max_spaces must be between 1 and {MAX_TASK_MAX_SPACES}"
+            )));
         }
         Ok(())
     }
@@ -259,7 +267,7 @@ impl Runtime {
             .tasks
             .merge_signals(task_session_id, input.task_signals.clone())?
             .snapshot;
-        build_task_context_response(&self.index, &snapshot, input.token_budget)
+        build_task_context_response(&self.index, &snapshot, input.token_budget, input.max_spaces)
     }
 
     fn converge_intent(
@@ -314,16 +322,18 @@ fn build_task_context_response(
     index: &ProjectionIndex,
     snapshot: &TaskSessionSnapshot,
     token_budget: usize,
+    max_spaces: usize,
 ) -> Result<TaskContextResponse> {
     let current = snapshot
         .current_intent_revision()
         .ok_or_else(|| invariant("Task Session has no current Intent revision"))?;
-    let pack =
-        SearchEngine::new(index.clone()).task_context_pack(&TaskContextRequest::automatic(
-            current.intent.clone(),
-            snapshot.task_signals.clone(),
-            token_budget,
-        ))?;
+    let mut request = TaskContextRequest::automatic(
+        current.intent.clone(),
+        snapshot.task_signals.clone(),
+        token_budget,
+    );
+    request.max_spaces = max_spaces;
+    let pack = SearchEngine::new(index.clone()).task_context_pack(&request)?;
     let retrieval_paths = pack
         .items
         .iter()
@@ -884,7 +894,8 @@ fn tools_list() -> Value {
                     "interfaces": string_array_schema(),
                     "unknowns": string_array_schema(),
                     "task_signals": task_signal_array_schema(),
-                    "token_budget": {"type": "integer", "minimum": 1, "default": 2000}
+                    "token_budget": {"type": "integer", "minimum": MIN_TASK_CONTEXT_TOKEN_BUDGET, "default": 2000},
+                    "max_spaces": {"type": "integer", "minimum": 1, "maximum": MAX_TASK_MAX_SPACES, "default": DEFAULT_TASK_MAX_SPACES}
                 }
             })
         ),
@@ -1313,6 +1324,10 @@ const fn default_page_size() -> usize {
 
 const fn default_token_budget() -> usize {
     2_000
+}
+
+const fn default_max_spaces() -> usize {
+    DEFAULT_TASK_MAX_SPACES
 }
 
 const fn error_code(kind: ErrorKind) -> &'static str {

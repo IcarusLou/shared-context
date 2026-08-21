@@ -827,6 +827,7 @@ fn task_context_input(
         unknowns: intent.unknowns,
         task_signals,
         token_budget,
+        max_spaces: sctx_search::DEFAULT_TASK_MAX_SPACES,
     }
 }
 
@@ -1702,6 +1703,7 @@ fn run_task(args: &[String], json_output: bool) -> Result<()> {
             "--unknown",
             "--task-signal-json",
             "--token-budget",
+            "--max-spaces",
         ],
         &[],
     )?;
@@ -1731,6 +1733,10 @@ fn run_task(args: &[String], json_output: bool) -> Result<()> {
         token_budget: parse_usize(
             options.optional("--token-budget")?.unwrap_or("2000"),
             "token budget",
+        )?,
+        max_spaces: parse_usize(
+            options.optional("--max-spaces")?.unwrap_or("8"),
+            "max spaces",
         )?,
     };
     let response = sctx_mcp::task_context_at_root(installation_root()?, &input)?;

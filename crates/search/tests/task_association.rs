@@ -9,8 +9,9 @@ use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::ProjectionIndex;
 use sctx_search::{
     ContextPackMode, ContextStatus, IntentScopeConflictExplanation, IntentScopeConflictKind,
-    IntentScopeConflictPolicy, SearchEngine, SpaceIntentField, TaskContextRequest,
-    TaskRetrievalPath,
+    IntentScopeConflictPolicy, SearchEngine, SpaceIntentField, TaskAssociationChannel,
+    TaskAssociationFusionExplanation, TaskContextRequest, TaskRetrievalPath,
+    estimate_task_context_payload_tokens,
 };
 use tempfile::TempDir;
 
@@ -29,6 +30,14 @@ struct PolarityFixture {
     index: ProjectionIndex,
     space_id: SpaceId,
     context_id: ContextId,
+}
+
+struct FusionCorpusFixture {
+    _temporary: TempDir,
+    index: ProjectionIndex,
+    precise_space_id: SpaceId,
+    precise_context_id: ContextId,
+    total_spaces: usize,
 }
 
 fn intent(title: &str, intent_text: &str) -> sctx_domain::IntentSnapshot {
@@ -196,6 +205,56 @@ fn polarity_fixture() -> PolarityFixture {
         index,
         space_id,
         context_id,
+    }
+}
+
+fn fusion_corpus_fixture() -> FusionCorpusFixture {
+    const GENERIC_SPACE_COUNT: usize = 40;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::initialize(temporary.path().join("fusion-installation")).unwrap();
+    for index in 0..GENERIC_SPACE_COUNT {
+        add_space(
+            &store,
+            &format!("GenericImplementation{index:02}"),
+            "implement shared workflow",
+        );
+    }
+    let precise = Event::space_created(
+        sctx_domain::IntentSnapshot {
+            title: "PreciseProtocol".to_owned(),
+            problem: "implement rare endpoint SearchV9RareEndpoint ExactResultSchema".to_owned(),
+            desired_outcome: "implement rare endpoint SearchV9RareEndpoint ExactResultSchema"
+                .to_owned(),
+            in_scope: vec![
+                "implement rare endpoint SearchV9RareEndpoint ExactResultSchema".to_owned(),
+            ],
+            out_of_scope: vec!["unrelated payments migration".to_owned()],
+            acceptance_conditions: vec!["rare endpoint remains exact".to_owned()],
+            domain_terms: vec!["precise-protocol".to_owned()],
+        },
+        None,
+    )
+    .unwrap();
+    let precise_space_id = match precise.payload() {
+        EventPayload::SpaceCreated { space_id, .. } => *space_id,
+        _ => unreachable!(),
+    };
+    append(&store, precise);
+    let (precise_context_id, _, _) = add_accepted_context(
+        &store,
+        precise_space_id,
+        "SearchV9RareEndpoint returns ExactResultSchema",
+        applicability("precise-search", "server", "active"),
+    );
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    FusionCorpusFixture {
+        _temporary: temporary,
+        index,
+        precise_space_id,
+        precise_context_id,
+        total_spaces: GENERIC_SPACE_COUNT + 1,
     }
 }
 
@@ -453,6 +512,28 @@ fn fe_task_associates_requirement_protocol_compatibility_and_analytics_spaces() 
                 || !association.matched_contexts.is_empty()
         );
     }
+    let channels = response
+        .associations
+        .iter()
+        .filter_map(|association| {
+            association.reasons.iter().find_map(|reason| {
+                serde_json::from_str::<TaskAssociationFusionExplanation>(reason).ok()
+            })
+        })
+        .flat_map(|explanation| explanation.channels)
+        .map(|feature| feature.channel)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        channels,
+        [
+            TaskAssociationChannel::SpaceIntentBm25,
+            TaskAssociationChannel::AcceptedContextBm25,
+            TaskAssociationChannel::ExactScope,
+            TaskAssociationChannel::ExactTaskSignal,
+        ]
+        .into_iter()
+        .collect()
+    );
     let matched_contexts = response
         .associations
         .iter()
@@ -637,6 +718,160 @@ fn positive_and_out_of_scope_matches_keep_one_penalized_explained_association() 
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn forty_space_corpus_is_rrf_ranked_top_k_bounded_and_fully_budgeted() {
+    let fixture = fusion_corpus_fixture();
+    let engine = SearchEngine::new(fixture.index);
+    let signals = vec![TaskSignal {
+        kind: TaskSignalKind::Api,
+        content: "SearchV9RareEndpoint".to_owned(),
+    }];
+    let mut request = TaskContextRequest::automatic(
+        task("implement rare endpoint SearchV9RareEndpoint ExactResultSchema"),
+        signals,
+        4_000,
+    );
+    request.max_spaces = 5;
+
+    for invalid_max_spaces in [0, sctx_search::MAX_TASK_MAX_SPACES + 1] {
+        let mut invalid = request.clone();
+        invalid.max_spaces = invalid_max_spaces;
+        assert_eq!(
+            engine.task_context_pack(&invalid).unwrap_err().kind(),
+            sctx_search::ErrorKind::InvalidInput
+        );
+    }
+    let mut invalid_budget = request.clone();
+    invalid_budget.token_budget = sctx_search::MIN_TASK_CONTEXT_TOKEN_BUDGET - 1;
+    assert_eq!(
+        engine
+            .task_context_pack(&invalid_budget)
+            .unwrap_err()
+            .kind(),
+        sctx_search::ErrorKind::InvalidInput
+    );
+
+    let first = engine.task_context_pack(&request).unwrap();
+    let second = engine.task_context_pack(&request).unwrap();
+    assert_eq!(
+        first, second,
+        "RRF, top-k, omissions, and budget must be stable"
+    );
+    assert!(!first.associations.is_empty());
+    assert!(first.associations.len() <= request.max_spaces);
+    assert_eq!(first.associations[0].space_id, fixture.precise_space_id);
+    assert!(first.items.iter().any(|item| {
+        item.association_space_id == fixture.precise_space_id
+            && item.context.context_id == fixture.precise_context_id
+    }));
+    assert!(first.estimated_tokens <= request.token_budget);
+    assert_eq!(
+        first.estimated_tokens,
+        estimate_task_context_payload_tokens(&first),
+        "reported tokens must charge Associations, reasons, item paths, and omissions"
+    );
+    assert!(
+        serde_json::to_string(&first).unwrap().len().div_ceil(4) <= first.estimated_tokens,
+        "charged envelope reserve must conservatively cover the complete ASCII fixture response"
+    );
+    let top_k = first
+        .omitted
+        .iter()
+        .find(|omitted| omitted.reason == "space_top_k")
+        .expect("fixed corpus must report top-k Space omissions");
+    assert_eq!(
+        top_k.count,
+        fixture.total_spaces.saturating_sub(request.max_spaces)
+    );
+    assert!(top_k.estimated_tokens > 0);
+
+    let precise_fusion = first.associations[0]
+        .reasons
+        .iter()
+        .find_map(|reason| serde_json::from_str::<TaskAssociationFusionExplanation>(reason).ok())
+        .expect("precise association must expose typed RRF features");
+    assert_eq!(
+        precise_fusion.algorithm,
+        sctx_search::TaskAssociationFusionAlgorithm::ReciprocalRankFusion
+    );
+    assert!(
+        precise_fusion.channels.iter().any(|feature| {
+            feature.channel == TaskAssociationChannel::SpaceIntentBm25
+                && feature.rank == 1
+                && feature.query_token_coverage_basis_points > 0
+                && feature.idf_bm25_contribution_micros > 0
+                && feature.phrase_match
+                && feature.field_weight_points > 0
+        }),
+        "precise fusion features: {precise_fusion:?}"
+    );
+    assert!(precise_fusion.channels.iter().any(|feature| {
+        feature.channel == TaskAssociationChannel::AcceptedContextBm25
+            && feature.rank == 1
+            && feature.bm25_micros.is_some()
+    }));
+    assert!(precise_fusion.channels.iter().any(|feature| {
+        feature.channel == TaskAssociationChannel::ExactTaskSignal
+            && feature.rank == 1
+            && feature.exact_match_strength > 0
+    }));
+    if let Some(generic) = first.associations.get(1) {
+        assert!(first.associations[0].score > generic.score);
+        let generic_fusion = generic
+            .reasons
+            .iter()
+            .find_map(|reason| {
+                serde_json::from_str::<TaskAssociationFusionExplanation>(reason).ok()
+            })
+            .unwrap();
+        let precise_intent = precise_fusion
+            .channels
+            .iter()
+            .find(|feature| feature.channel == TaskAssociationChannel::SpaceIntentBm25)
+            .unwrap();
+        let generic_intent = generic_fusion
+            .channels
+            .iter()
+            .find(|feature| feature.channel == TaskAssociationChannel::SpaceIntentBm25)
+            .unwrap();
+        assert!(
+            precise_intent.query_token_coverage_basis_points
+                > generic_intent.query_token_coverage_basis_points
+        );
+        assert!(
+            precise_intent.idf_bm25_contribution_micros
+                > generic_intent.idf_bm25_contribution_micros
+        );
+    }
+
+    let mut minimum_budget = request.clone();
+    minimum_budget.token_budget = sctx_search::MIN_TASK_CONTEXT_TOKEN_BUDGET;
+    let bounded = engine.task_context_pack(&minimum_budget).unwrap();
+    assert!(bounded.estimated_tokens <= minimum_budget.token_budget);
+    assert_eq!(
+        bounded.estimated_tokens,
+        estimate_task_context_payload_tokens(&bounded)
+    );
+    assert!(!bounded.omitted.is_empty());
+
+    let mut generic_request = TaskContextRequest::automatic(task("implement"), Vec::new(), 900);
+    generic_request.max_spaces = 4;
+    let generic = engine.task_context_pack(&generic_request).unwrap();
+    assert!(generic.associations.len() <= generic_request.max_spaces);
+    assert!(generic.estimated_tokens <= generic_request.token_budget);
+    assert_eq!(
+        generic.estimated_tokens,
+        estimate_task_context_payload_tokens(&generic)
+    );
+    assert!(
+        generic
+            .omitted
+            .iter()
+            .any(|item| item.reason == "space_top_k")
+    );
+}
+
+#[test]
 fn equal_fused_scores_use_stable_space_id_ties() {
     let fixture = fixture();
     let index = fixture.index.clone();
@@ -792,7 +1027,7 @@ fn task_context_order_budget_and_fingerprint_are_stable() {
         .collect::<Vec<_>>();
     assert!(item_ranks.windows(2).all(|pair| pair[0] <= pair[1]));
 
-    let limited_request = TaskContextRequest::automatic(task.clone(), signals.clone(), 64);
+    let limited_request = TaskContextRequest::automatic(task.clone(), signals.clone(), 512);
     let limited_first = SearchEngine::new(index.clone())
         .task_context_pack(&limited_request)
         .unwrap();
@@ -800,7 +1035,7 @@ fn task_context_order_budget_and_fingerprint_are_stable() {
         .task_context_pack(&limited_request)
         .unwrap();
     assert_eq!(limited_first, limited_second);
-    assert!(limited_first.estimated_tokens <= 64);
+    assert!(limited_first.estimated_tokens <= 512);
     assert!(!limited_first.omitted.is_empty());
 
     let mut reordered = signals;
@@ -861,6 +1096,7 @@ fn automatic_task_pack_excludes_every_unsafe_state_while_explicit_expands_confli
             task_intent: task,
             task_signals: Vec::new(),
             token_budget: 100_000,
+            max_spaces: sctx_search::DEFAULT_TASK_MAX_SPACES,
             candidate_limit: 100,
             mode: ContextPackMode::Explicit,
         })

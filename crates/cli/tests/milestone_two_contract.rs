@@ -276,6 +276,7 @@ impl MilestoneTwoFixture {
                 content: self.workspace.to_string_lossy().into_owned(),
             }],
             token_budget: 100_000,
+            max_spaces: sctx_search::DEFAULT_TASK_MAX_SPACES,
         }
     }
 
@@ -556,11 +557,9 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
     let many_input = fixture.feature_input("feature-session");
     let serialized_input = serde_json::to_value(&many_input).unwrap();
     assert!(
-        serialized_input
-            .as_object()
-            .unwrap()
-            .keys()
-            .all(|key| !key.contains("space") && !key.contains("workspace")),
+        serialized_input.as_object().unwrap().keys().all(|key| {
+            key == "max_spaces" || (!key.contains("space") && !key.contains("workspace"))
+        }),
         "Task Context input must not expose a caller-owned route"
     );
     for route in ["space_id", "space_ids", "workspace", "workspace_id"] {
@@ -671,6 +670,7 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
             task_intent: task_intent("hazardpackintent"),
             task_signals: Vec::new(),
             token_budget: 100_000,
+            max_spaces: sctx_search::DEFAULT_TASK_MAX_SPACES,
             candidate_limit: 100,
             mode: ContextPackMode::Explicit,
         })

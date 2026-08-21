@@ -20,6 +20,9 @@ pub use sctx_domain::{Error, ErrorKind, Result};
 const DEFAULT_PAGE_SIZE: usize = 20;
 const MAX_PAGE_SIZE: usize = 200;
 const DEFAULT_CANDIDATE_LIMIT: usize = 100;
+pub const DEFAULT_TASK_MAX_SPACES: usize = 8;
+pub const MAX_TASK_MAX_SPACES: usize = 32;
+pub const MIN_TASK_CONTEXT_TOKEN_BUDGET: usize = 256;
 
 /// Structured applicability filter. Each populated dimension is required; values within one
 /// dimension are alternatives.
@@ -196,6 +199,7 @@ pub struct SpaceIntentHeadMatch {
     pub field_matches: Vec<SpaceIntentFieldMatch>,
     pub matched_fields: Vec<SpaceIntentField>,
     pub matched_tokens: Vec<String>,
+    pub phrase_match: bool,
     pub bm25: f64,
 }
 
@@ -211,6 +215,7 @@ pub struct SpaceIntentCandidate {
     pub field_matches: Vec<SpaceIntentFieldMatch>,
     pub matched_fields: Vec<SpaceIntentField>,
     pub matched_tokens: Vec<String>,
+    pub phrase_match: bool,
     /// Best (lowest) FTS5 BM25 value among the matching current heads.
     pub bm25: f64,
 }
@@ -239,6 +244,7 @@ pub struct TaskContextRequest {
     pub task_intent: TaskIntent,
     pub task_signals: Vec<TaskSignal>,
     pub token_budget: usize,
+    pub max_spaces: usize,
     pub candidate_limit: usize,
     pub mode: ContextPackMode,
 }
@@ -254,6 +260,7 @@ impl TaskContextRequest {
             task_intent,
             task_signals,
             token_budget,
+            max_spaces: DEFAULT_TASK_MAX_SPACES,
             candidate_limit: DEFAULT_CANDIDATE_LIMIT,
             mode: ContextPackMode::AutomaticInjection,
         }
@@ -291,6 +298,48 @@ pub struct IntentScopeConflictExplanation {
     pub matched_task_signals: Vec<String>,
     pub policy: IntentScopeConflictPolicy,
     pub score_multiplier_basis_points: u16,
+}
+
+/// Deterministic candidate channel participating in Reciprocal Rank Fusion.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskAssociationChannel {
+    SpaceIntentBm25,
+    AcceptedContextBm25,
+    ExactScope,
+    ExactTaskSignal,
+}
+
+/// Explainable features and rank contribution from one RRF channel.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskAssociationChannelFeature {
+    pub channel: TaskAssociationChannel,
+    pub rank: usize,
+    pub reciprocal_rank_micros: u32,
+    pub bm25_micros: Option<i64>,
+    pub query_token_coverage_basis_points: u16,
+    pub idf_bm25_contribution_micros: u32,
+    pub phrase_match: bool,
+    pub field_weight_points: u16,
+    pub exact_match_strength: u16,
+}
+
+/// Stable fusion algorithm identifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskAssociationFusionAlgorithm {
+    ReciprocalRankFusion,
+}
+
+/// Typed RRF explanation serialized into a [`TaskSpaceAssociation`] reason.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskAssociationFusionExplanation {
+    pub algorithm: TaskAssociationFusionAlgorithm,
+    pub rrf_k: u16,
+    pub channels: Vec<TaskAssociationChannelFeature>,
+    pub fused_score_basis_points: u16,
+    pub minimum_score_basis_points: u16,
+    pub final_score_basis_points: u16,
 }
 
 /// Explainable M2-only route from the Task to one returned Context.
@@ -429,8 +478,9 @@ impl SearchEngine {
         intent.validate()?;
         TaskSignal::validate_collection(signals)?;
         let query_tokens = task_query_tokens(intent, signals);
+        let query_phrases = task_query_phrases(intent, signals, true);
         let snapshot = self.index.query_snapshot(|connection| {
-            query_space_intent_candidates(connection, &query_tokens)
+            query_space_intent_candidates(connection, &query_tokens, &query_phrases)
         })?;
         Ok(SpaceIntentCandidatesResponse {
             indexed_tree_oid: snapshot.metadata.indexed_tree_oid,
@@ -460,6 +510,7 @@ impl SearchEngine {
         intent.validate()?;
         TaskSignal::validate_collection(signals)?;
         let query_tokens = association_query_tokens(intent, signals);
+        let query_phrases = task_query_phrases(intent, signals, false);
         let artifact_hints = artifact_hints(signals);
         let scope_targets = ScopeTargets::from_intent(intent);
         let snapshot = self.index.query_snapshot(|connection| {
@@ -467,6 +518,7 @@ impl SearchEngine {
                 connection,
                 intent.task_id,
                 &query_tokens,
+                &query_phrases,
                 &artifact_hints,
                 &scope_targets,
             )
@@ -491,16 +543,28 @@ impl SearchEngine {
         validate_task_context_request(request)?;
         let fingerprint = task_fingerprint(&request.task_intent, &request.task_signals)?;
         let query_tokens = association_query_tokens(&request.task_intent, &request.task_signals);
+        let query_phrases = task_query_phrases(&request.task_intent, &request.task_signals, false);
         let artifact_hints = artifact_hints(&request.task_signals);
         let scope_targets = ScopeTargets::from_intent(&request.task_intent);
         let snapshot = self.index.query_snapshot(|connection| {
-            let inference = infer_task_space_associations(
+            let mut inference = infer_task_space_associations(
                 connection,
                 request.task_intent.task_id,
                 &query_tokens,
+                &query_phrases,
                 &artifact_hints,
                 &scope_targets,
             )?;
+            let omitted_spaces = inference
+                .associations
+                .len()
+                .saturating_sub(request.max_spaces);
+            let omitted_space_tokens = inference.associations
+                [request.max_spaces.min(inference.associations.len())..]
+                .iter()
+                .map(serialized_tokens)
+                .sum();
+            inference.associations.truncate(request.max_spaces);
             let candidates = load_task_context_candidates(
                 connection,
                 &inference,
@@ -511,6 +575,8 @@ impl SearchEngine {
                 candidates,
                 request.token_budget,
                 inference,
+                omitted_spaces,
+                omitted_space_tokens,
             ))
         })?;
         Ok(TaskContextPack {
@@ -660,9 +726,47 @@ fn association_query_tokens(intent: &TaskIntent, signals: &[TaskSignal]) -> Vec<
         .collect()
 }
 
+fn task_query_phrases(
+    intent: &TaskIntent,
+    signals: &[TaskSignal],
+    include_out_of_scope: bool,
+) -> Vec<String> {
+    let mut texts = vec![intent.goal.as_str(), intent.desired_change.as_str()];
+    for values in [
+        &intent.in_scope,
+        &intent.domains,
+        &intent.platforms,
+        &intent.constraints,
+        &intent.acceptance_conditions,
+        &intent.artifacts,
+        &intent.interfaces,
+        &intent.unknowns,
+    ] {
+        texts.extend(values.iter().map(String::as_str));
+    }
+    if include_out_of_scope {
+        texts.extend(intent.out_of_scope.iter().map(String::as_str));
+    }
+    texts.extend(
+        signals
+            .iter()
+            .filter(|signal| matches!(signal.kind, TaskSignalKind::Prompt | TaskSignalKind::Diff))
+            .map(|signal| signal.content.as_str()),
+    );
+    texts
+        .into_iter()
+        .filter(|text| search_tokens(text).len() > 1)
+        .map(normalize_search_text)
+        .filter(|phrase| !phrase.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn query_space_intent_candidates(
     connection: &Connection,
     query_tokens: &[String],
+    query_phrases: &[String],
 ) -> Result<Vec<SpaceIntentCandidate>> {
     let Some(match_expression) = fts_or_match_expression(query_tokens) else {
         return Ok(Vec::new());
@@ -691,6 +795,7 @@ fn query_space_intent_candidates(
             parse_intent_fts_match(
                 &row.map_err(sql_error("collect Space Intent candidate row"))?,
                 query_tokens,
+                query_phrases,
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -711,6 +816,7 @@ fn query_space_intent_candidates(
         let mut matched_fields = BTreeSet::new();
         let mut matched_tokens = BTreeSet::new();
         let mut field_tokens = BTreeMap::<SpaceIntentField, BTreeSet<String>>::new();
+        let mut phrase_match = false;
         let mut bm25 = f64::INFINITY;
         for head in &matching_heads {
             matched_fields.extend(head.matched_fields.iter().copied());
@@ -721,6 +827,7 @@ fn query_space_intent_candidates(
                     .or_default()
                     .extend(field_match.matched_tokens.iter().cloned());
             }
+            phrase_match |= head.phrase_match;
             bm25 = bm25.min(head.bm25);
         }
         candidates.push(SpaceIntentCandidate {
@@ -737,6 +844,7 @@ fn query_space_intent_candidates(
                 .collect(),
             matched_fields: matched_fields.into_iter().collect(),
             matched_tokens: matched_tokens.into_iter().collect(),
+            phrase_match,
             bm25,
         });
     }
@@ -769,6 +877,7 @@ fn read_intent_fts_match(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredInte
 fn parse_intent_fts_match(
     row: &StoredIntentFtsMatch,
     query_tokens: &[String],
+    query_phrases: &[String],
 ) -> Result<RawIntentHeadMatch> {
     let field_names = [
         SpaceIntentField::Title,
@@ -782,6 +891,14 @@ fn parse_intent_fts_match(
     let fields: [(SpaceIntentField, &str); 7] =
         std::array::from_fn(|index| (field_names[index], row.fields[index].as_str()));
     let field_matches = explain_intent_match(query_tokens, fields);
+    let positive_fields = [
+        row.fields[0].as_str(),
+        row.fields[1].as_str(),
+        row.fields[2].as_str(),
+        row.fields[3].as_str(),
+        row.fields[5].as_str(),
+        row.fields[6].as_str(),
+    ];
     let matched_fields = field_matches.iter().map(|value| value.field).collect();
     let matched_tokens = field_matches
         .iter()
@@ -797,6 +914,7 @@ fn parse_intent_fts_match(
             field_matches,
             matched_fields,
             matched_tokens,
+            phrase_match: contains_any_phrase(&positive_fields, query_phrases),
             bm25: row.bm25,
         },
     })
@@ -879,6 +997,7 @@ struct AcceptedContextEvidence {
     matched_fields: BTreeSet<MatchField>,
     matched_tokens: BTreeSet<String>,
     bm25: Option<f64>,
+    phrase_match: bool,
     matched_artifacts: BTreeSet<String>,
     matched_scopes: BTreeSet<ScopeEvidence>,
 }
@@ -897,18 +1016,29 @@ const SAFE_ACCEPTED_CONTEXT_PREDICATE: &str = "item.governance_status = 'accepte
      )";
 
 #[derive(Clone, Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
 struct AssociationEvidence {
     intent_fields: BTreeSet<String>,
     intent_tokens: BTreeSet<String>,
     intent_matched: bool,
     intent_conflicted: bool,
     intent_artifacts: BTreeSet<String>,
+    intent_bm25: Option<f64>,
+    intent_phrase_match: bool,
+    intent_field_weight_points: u16,
     excluded_intent_tokens: BTreeSet<String>,
     excluded_intent_artifacts: BTreeSet<String>,
     matched_artifacts: BTreeSet<String>,
     matched_contexts: BTreeSet<ContextId>,
     textual_contexts: BTreeSet<ContextId>,
+    context_tokens: BTreeSet<String>,
+    context_fields: BTreeSet<MatchField>,
+    context_bm25: Option<f64>,
+    context_phrase_match: bool,
+    context_field_weight_points: u16,
     matched_scopes: BTreeSet<ScopeEvidence>,
+    channel_features: Vec<TaskAssociationChannelFeature>,
+    fused_score_basis_points: u16,
 }
 
 #[derive(Debug)]
@@ -981,13 +1111,19 @@ fn infer_task_space_associations(
     connection: &Connection,
     task_id: TaskId,
     query_tokens: &[String],
+    query_phrases: &[String],
     artifact_hints: &[ArtifactHint],
     scope_targets: &ScopeTargets,
 ) -> Result<TaskAssociationInference> {
-    let intent_candidates = query_space_intent_candidates(connection, query_tokens)?;
+    let intent_candidates = query_space_intent_candidates(connection, query_tokens, query_phrases)?;
     let intent_artifacts = query_exact_intent_artifacts(connection, artifact_hints)?;
-    let contexts =
-        query_accepted_context_evidence(connection, query_tokens, artifact_hints, scope_targets)?;
+    let contexts = query_accepted_context_evidence(
+        connection,
+        query_tokens,
+        query_phrases,
+        artifact_hints,
+        scope_targets,
+    )?;
     let mut evidence = BTreeMap::<SpaceId, AssociationEvidence>::new();
     apply_intent_evidence(&mut evidence, intent_candidates);
     for (space_id, artifacts) in intent_artifacts {
@@ -1006,6 +1142,24 @@ fn infer_task_space_associations(
         aggregate.matched_contexts.insert(*context_id);
         if context.textual_match {
             aggregate.textual_contexts.insert(*context_id);
+            aggregate
+                .context_tokens
+                .extend(context.matched_tokens.iter().cloned());
+            if let Some(bm25) = context.bm25 {
+                aggregate.context_bm25 = Some(
+                    aggregate
+                        .context_bm25
+                        .map_or(bm25, |current| current.min(bm25)),
+                );
+            }
+            aggregate.context_phrase_match |= context.phrase_match;
+            for field in &context.matched_fields {
+                if aggregate.context_fields.insert(*field) {
+                    aggregate.context_field_weight_points = aggregate
+                        .context_field_weight_points
+                        .saturating_add(context_field_weight(*field));
+                }
+            }
         }
         aggregate
             .matched_artifacts
@@ -1014,6 +1168,7 @@ fn infer_task_space_associations(
             .matched_scopes
             .extend(context.matched_scopes.iter().cloned());
     }
+    assign_channel_features(&mut evidence, query_tokens);
     let mut associations = evidence
         .iter()
         .filter_map(|(space_id, evidence)| association(task_id, *space_id, evidence))
@@ -1039,6 +1194,12 @@ fn apply_intent_evidence(
     for candidate in candidates {
         let aggregate = evidence.entry(candidate.space_id).or_default();
         aggregate.intent_conflicted = candidate.intent_conflicted;
+        aggregate.intent_bm25 = Some(
+            aggregate
+                .intent_bm25
+                .map_or(candidate.bm25, |current| current.min(candidate.bm25)),
+        );
+        aggregate.intent_phrase_match |= candidate.phrase_match;
         for field_match in candidate.field_matches {
             if field_match.field == SpaceIntentField::OutOfScope {
                 aggregate
@@ -1046,9 +1207,14 @@ fn apply_intent_evidence(
                     .extend(field_match.matched_tokens);
             } else {
                 aggregate.intent_matched = true;
-                aggregate
+                if aggregate
                     .intent_fields
-                    .insert(intent_field_name(field_match.field).to_owned());
+                    .insert(intent_field_name(field_match.field).to_owned())
+                {
+                    aggregate.intent_field_weight_points = aggregate
+                        .intent_field_weight_points
+                        .saturating_add(intent_field_weight(field_match.field));
+                }
                 aggregate.intent_tokens.extend(field_match.matched_tokens);
             }
         }
@@ -1064,6 +1230,26 @@ const fn intent_field_name(field: SpaceIntentField) -> &'static str {
         SpaceIntentField::OutOfScope => "out_of_scope",
         SpaceIntentField::AcceptanceConditions => "acceptance_conditions",
         SpaceIntentField::DomainTerms => "domain_terms",
+    }
+}
+
+const fn intent_field_weight(field: SpaceIntentField) -> u16 {
+    match field {
+        SpaceIntentField::Title => 10,
+        SpaceIntentField::Problem | SpaceIntentField::DesiredOutcome => 8,
+        SpaceIntentField::InScope => 4,
+        SpaceIntentField::OutOfScope => 0,
+        SpaceIntentField::AcceptanceConditions => 6,
+        SpaceIntentField::DomainTerms => 5,
+    }
+}
+
+const fn context_field_weight(field: MatchField) -> u16 {
+    match field {
+        MatchField::Title => 10,
+        MatchField::Statement => 8,
+        MatchField::Rationale => 4,
+        MatchField::Evidence => 2,
     }
 }
 
@@ -1133,11 +1319,12 @@ fn query_exact_intent_artifacts(
 fn query_accepted_context_evidence(
     connection: &Connection,
     query_tokens: &[String],
+    query_phrases: &[String],
     artifact_hints: &[ArtifactHint],
     scope_targets: &ScopeTargets,
 ) -> Result<BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>> {
     let mut evidence = BTreeMap::new();
-    query_accepted_context_text(connection, query_tokens, &mut evidence)?;
+    query_accepted_context_text(connection, query_tokens, query_phrases, &mut evidence)?;
     query_accepted_context_artifacts(connection, artifact_hints, &mut evidence)?;
     query_accepted_context_scope(connection, scope_targets, &mut evidence)?;
     Ok(evidence)
@@ -1197,6 +1384,7 @@ fn query_accepted_context_artifacts(
 fn query_accepted_context_text(
     connection: &Connection,
     query_tokens: &[String],
+    query_phrases: &[String],
     evidence: &mut BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>,
 ) -> Result<()> {
     let Some(match_expression) = fts_or_match_expression(query_tokens) else {
@@ -1241,6 +1429,7 @@ fn query_accepted_context_text(
         entry.textual_match = true;
         entry.matched_fields.extend(matched_fields);
         entry.matched_tokens.extend(matched_tokens);
+        entry.phrase_match |= contains_any_phrase(&fields, query_phrases);
         entry.bm25 = Some(entry.bm25.map_or(bm25, |current| current.min(bm25)));
     }
     Ok(())
@@ -1346,6 +1535,267 @@ fn contains_token_sequence(text: &str, wanted: &[String]) -> bool {
         .any(|window| window == wanted)
 }
 
+fn contains_any_phrase<T, const N: usize>(fields: &[T; N], phrases: &[String]) -> bool
+where
+    T: AsRef<str>,
+{
+    fields.iter().any(|field| {
+        let field = field.as_ref();
+        phrases.iter().any(|phrase| field.contains(phrase))
+    })
+}
+
+const RRF_K: usize = 60;
+const RRF_SCALE: usize = 1_000_000;
+const FUSION_CHANNEL_COUNT: usize = 4;
+const MINIMUM_ASSOCIATION_SCORE_BASIS_POINTS: u16 = 500;
+const TASK_CONTEXT_ENVELOPE_TOKEN_RESERVE: usize = 128;
+
+#[allow(clippy::too_many_lines)]
+fn assign_channel_features(
+    evidence: &mut BTreeMap<SpaceId, AssociationEvidence>,
+    query_tokens: &[String],
+) {
+    let mut intent = evidence
+        .iter()
+        .filter_map(|(space_id, value)| {
+            value.intent_matched.then_some((
+                *space_id,
+                value.intent_bm25.unwrap_or(0.0),
+                token_coverage_basis_points(&value.intent_tokens, query_tokens),
+                value.intent_phrase_match,
+                value.intent_field_weight_points,
+            ))
+        })
+        .collect::<Vec<_>>();
+    intent.sort_by(|left, right| {
+        left.1
+            .total_cmp(&right.1)
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| right.3.cmp(&left.3))
+            .then_with(|| right.4.cmp(&left.4))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let mut previous_intent = None;
+    let mut intent_rank = 0;
+    for (offset, (space_id, bm25, coverage, phrase_match, field_weight_points)) in
+        intent.into_iter().enumerate()
+    {
+        let key = (bm25.to_bits(), coverage, phrase_match, field_weight_points);
+        if previous_intent.as_ref() != Some(&key) {
+            intent_rank = offset + 1;
+            previous_intent = Some(key);
+        }
+        evidence
+            .get_mut(&space_id)
+            .expect("ranked Intent Space exists")
+            .channel_features
+            .push(text_channel_feature(
+                TaskAssociationChannel::SpaceIntentBm25,
+                intent_rank,
+                bm25,
+                coverage,
+                phrase_match,
+                field_weight_points,
+            ));
+    }
+
+    let mut contexts = evidence
+        .iter()
+        .filter_map(|(space_id, value)| {
+            value.context_bm25.map(|bm25| {
+                (
+                    *space_id,
+                    bm25,
+                    token_coverage_basis_points(&value.context_tokens, query_tokens),
+                    value.context_phrase_match,
+                    value.context_field_weight_points,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    contexts.sort_by(|left, right| {
+        left.1
+            .total_cmp(&right.1)
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| right.3.cmp(&left.3))
+            .then_with(|| right.4.cmp(&left.4))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let mut previous_context = None;
+    let mut context_rank = 0;
+    for (offset, (space_id, bm25, coverage, phrase_match, field_weight_points)) in
+        contexts.into_iter().enumerate()
+    {
+        let key = (bm25.to_bits(), coverage, phrase_match, field_weight_points);
+        if previous_context.as_ref() != Some(&key) {
+            context_rank = offset + 1;
+            previous_context = Some(key);
+        }
+        evidence
+            .get_mut(&space_id)
+            .expect("ranked Context Space exists")
+            .channel_features
+            .push(text_channel_feature(
+                TaskAssociationChannel::AcceptedContextBm25,
+                context_rank,
+                bm25,
+                coverage,
+                phrase_match,
+                field_weight_points,
+            ));
+    }
+
+    let mut scopes = evidence
+        .iter()
+        .filter_map(|(space_id, value)| {
+            (!value.matched_scopes.is_empty()).then_some((*space_id, value.matched_scopes.len()))
+        })
+        .collect::<Vec<_>>();
+    scopes.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let mut previous_scope = None;
+    let mut scope_rank = 0;
+    for (offset, (space_id, strength)) in scopes.into_iter().enumerate() {
+        if previous_scope != Some(strength) {
+            scope_rank = offset + 1;
+            previous_scope = Some(strength);
+        }
+        evidence
+            .get_mut(&space_id)
+            .expect("ranked Scope Space exists")
+            .channel_features
+            .push(exact_channel_feature(
+                TaskAssociationChannel::ExactScope,
+                scope_rank,
+                strength,
+            ));
+    }
+
+    let mut signals = evidence
+        .iter()
+        .filter_map(|(space_id, value)| {
+            let strength = exact_signal_strength(&value.matched_artifacts);
+            (strength > 0).then_some((*space_id, strength))
+        })
+        .collect::<Vec<_>>();
+    signals.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let mut previous_signal = None;
+    let mut signal_rank = 0;
+    for (offset, (space_id, strength)) in signals.into_iter().enumerate() {
+        if previous_signal != Some(strength) {
+            signal_rank = offset + 1;
+            previous_signal = Some(strength);
+        }
+        evidence
+            .get_mut(&space_id)
+            .expect("ranked Task Signal Space exists")
+            .channel_features
+            .push(exact_channel_feature(
+                TaskAssociationChannel::ExactTaskSignal,
+                signal_rank,
+                strength,
+            ));
+    }
+
+    let maximum_rrf = FUSION_CHANNEL_COUNT * reciprocal_rank_micros(1) as usize;
+    for value in evidence.values_mut() {
+        value
+            .channel_features
+            .sort_by_key(|feature| feature.channel);
+        let rrf = value
+            .channel_features
+            .iter()
+            .map(|feature| feature.reciprocal_rank_micros as usize)
+            .sum::<usize>();
+        value.fused_score_basis_points = u16::try_from(
+            rrf.saturating_mul(BASIS_POINTS_SCALE)
+                .checked_div(maximum_rrf)
+                .unwrap_or(0)
+                .min(BASIS_POINTS_SCALE),
+        )
+        .expect("basis points fit u16");
+    }
+}
+
+fn text_channel_feature(
+    channel: TaskAssociationChannel,
+    rank: usize,
+    bm25: f64,
+    coverage: u16,
+    phrase_match: bool,
+    field_weight_points: u16,
+) -> TaskAssociationChannelFeature {
+    TaskAssociationChannelFeature {
+        channel,
+        rank,
+        reciprocal_rank_micros: reciprocal_rank_micros(rank),
+        bm25_micros: Some(scale_bm25(bm25)),
+        query_token_coverage_basis_points: coverage,
+        idf_bm25_contribution_micros: scale_idf_bm25_contribution(bm25),
+        phrase_match,
+        field_weight_points,
+        exact_match_strength: 0,
+    }
+}
+
+fn exact_channel_feature(
+    channel: TaskAssociationChannel,
+    rank: usize,
+    strength: usize,
+) -> TaskAssociationChannelFeature {
+    TaskAssociationChannelFeature {
+        channel,
+        rank,
+        reciprocal_rank_micros: reciprocal_rank_micros(rank),
+        bm25_micros: None,
+        query_token_coverage_basis_points: 0,
+        idf_bm25_contribution_micros: 0,
+        phrase_match: false,
+        field_weight_points: 0,
+        exact_match_strength: u16::try_from(strength).unwrap_or(u16::MAX),
+    }
+}
+
+fn reciprocal_rank_micros(rank: usize) -> u32 {
+    u32::try_from(RRF_SCALE / RRF_K.saturating_add(rank)).unwrap_or(u32::MAX)
+}
+
+fn token_coverage_basis_points(matched: &BTreeSet<String>, query_tokens: &[String]) -> u16 {
+    if query_tokens.is_empty() {
+        return 0;
+    }
+    let query = query_tokens.iter().collect::<BTreeSet<_>>();
+    let matched_count = matched.iter().filter(|token| query.contains(token)).count();
+    u16::try_from(
+        matched_count
+            .saturating_mul(BASIS_POINTS_SCALE)
+            .checked_div(query.len())
+            .unwrap_or(0)
+            .min(BASIS_POINTS_SCALE),
+    )
+    .expect("coverage basis points fit u16")
+}
+
+fn exact_signal_strength(labels: &BTreeSet<String>) -> usize {
+    labels
+        .iter()
+        .map(|label| match label.split_once(':').map(|(kind, _)| kind) {
+            Some("api" | "schema" | "symbol") => 4,
+            Some("file" | "test") => 3,
+            _ => 1,
+        })
+        .sum()
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn scale_bm25(value: f64) -> i64 {
+    (value * 1_000_000.0).round() as i64
+}
+
+fn scale_idf_bm25_contribution(value: f64) -> u32 {
+    u32::try_from(scale_bm25(value).saturating_neg()).unwrap_or(u32::MAX)
+}
+
 fn association(
     task_id: TaskId,
     space_id: SpaceId,
@@ -1356,6 +1806,9 @@ fn association(
         && evidence.matched_contexts.is_empty()
         && evidence.matched_scopes.is_empty()
     {
+        return None;
+    }
+    if evidence.fused_score_basis_points < MINIMUM_ASSOCIATION_SCORE_BASIS_POINTS {
         return None;
     }
     let score = association_score(evidence);
@@ -1376,19 +1829,16 @@ const BASIS_POINTS_SCALE: usize = 10_000;
 const SCOPE_CONFLICT_SCORE_MULTIPLIER_BASIS_POINTS: u16 = 5_000;
 
 fn association_score(evidence: &AssociationEvidence) -> f64 {
-    let intent =
-        usize::from(evidence.intent_matched) * (300 + (evidence.intent_fields.len() * 20).min(140));
-    let contexts = usize::from(!evidence.matched_contexts.is_empty())
-        * (220 + (evidence.matched_contexts.len() * 20).min(100));
-    let textual = usize::from(!evidence.textual_contexts.is_empty()) * 80;
-    let artifacts = (evidence.matched_artifacts.len() * 50).min(150);
-    let scopes = (evidence.matched_scopes.len() * 50).min(150);
-    let mut points = (intent + contexts + textual + artifacts + scopes).min(1000);
+    f64::from(final_score_basis_points(evidence)) / 10_000.0
+}
+
+fn final_score_basis_points(evidence: &AssociationEvidence) -> u16 {
+    let mut points = usize::from(evidence.fused_score_basis_points);
     if has_intent_scope_conflict(evidence) {
         points = points.saturating_mul(usize::from(SCOPE_CONFLICT_SCORE_MULTIPLIER_BASIS_POINTS))
             / BASIS_POINTS_SCALE;
     }
-    f64::from(u16::try_from(points).expect("association score points fit u16")) / 1000.0
+    u16::try_from(points).expect("association score basis points fit u16")
 }
 
 fn has_intent_scope_conflict(evidence: &AssociationEvidence) -> bool {
@@ -1406,7 +1856,17 @@ fn intent_scope_conflict(evidence: &AssociationEvidence) -> Option<IntentScopeCo
 }
 
 fn association_reasons(evidence: &AssociationEvidence) -> Vec<String> {
-    let mut reasons = Vec::new();
+    let mut reasons = vec![
+        serde_json::to_string(&TaskAssociationFusionExplanation {
+            algorithm: TaskAssociationFusionAlgorithm::ReciprocalRankFusion,
+            rrf_k: u16::try_from(RRF_K).expect("RRF K fits u16"),
+            channels: evidence.channel_features.clone(),
+            fused_score_basis_points: evidence.fused_score_basis_points,
+            minimum_score_basis_points: MINIMUM_ASSOCIATION_SCORE_BASIS_POINTS,
+            final_score_basis_points: final_score_basis_points(evidence),
+        })
+        .expect("Task Association fusion explanation is always serializable"),
+    ];
     if evidence.intent_matched {
         reasons.push(format!(
             "Task text matched Space Intent fields: {}",
@@ -1482,10 +1942,15 @@ struct PackedTaskContexts {
 fn validate_task_context_request(request: &TaskContextRequest) -> Result<()> {
     request.task_intent.validate()?;
     TaskSignal::validate_collection(&request.task_signals)?;
-    if request.token_budget == 0 {
-        return Err(invalid(
-            "task context token_budget must be greater than zero",
-        ));
+    if request.token_budget < MIN_TASK_CONTEXT_TOKEN_BUDGET {
+        return Err(invalid(format!(
+            "task context token_budget must be at least {MIN_TASK_CONTEXT_TOKEN_BUDGET}"
+        )));
+    }
+    if request.max_spaces == 0 || request.max_spaces > MAX_TASK_MAX_SPACES {
+        return Err(invalid(format!(
+            "task context max_spaces must be between 1 and {MAX_TASK_MAX_SPACES}"
+        )));
     }
     if request.candidate_limit == 0 || request.candidate_limit > MAX_PAGE_SIZE {
         return Err(invalid(format!(
@@ -1622,13 +2087,17 @@ fn load_task_context_candidates(
             })
     });
     let omitted_count = candidates.len().saturating_sub(candidate_limit);
+    let omitted_tokens = candidates[candidate_limit.min(candidates.len())..]
+        .iter()
+        .map(|candidate| serialized_tokens(&candidate.item))
+        .sum();
     candidates.truncate(candidate_limit);
     let omitted = (omitted_count > 0)
         .then(|| ContextPackOmitted {
             context_id: None,
             revision_id: None,
-            reason: "candidate_limit".to_owned(),
-            estimated_tokens: 0,
+            reason: "item_candidate_limit".to_owned(),
+            estimated_tokens: omitted_tokens,
             count: omitted_count,
         })
         .into_iter()
@@ -1830,56 +2299,143 @@ fn pack_task_context_candidates(
     loaded: LoadedTaskContexts,
     token_budget: usize,
     inference: TaskAssociationInference,
+    omitted_space_count: usize,
+    omitted_space_tokens: usize,
 ) -> PackedTaskContexts {
-    let mut estimated_tokens: usize = 0;
-    let mut items = Vec::new();
     let mut omitted = loaded.omitted;
-    for candidate in loaded.candidates {
-        let full = candidate.item;
-        let full_tokens = serialized_tokens(&full);
-        if estimated_tokens.saturating_add(full_tokens) <= token_budget {
-            estimated_tokens += full_tokens;
-            items.push(full);
+    if omitted_space_count > 0 {
+        omitted.push(ContextPackOmitted {
+            context_id: None,
+            revision_id: None,
+            reason: "space_top_k".to_owned(),
+            estimated_tokens: omitted_space_tokens,
+            count: omitted_space_count,
+        });
+    }
+    let mut associations = inference.associations;
+    let mut items = loaded
+        .candidates
+        .into_iter()
+        .map(|candidate| candidate.item)
+        .collect::<Vec<_>>();
+    let mut detail_omitted = OmissionAggregate::default();
+    let mut item_omitted = OmissionAggregate::default();
+    let mut space_omitted = OmissionAggregate::default();
+
+    loop {
+        let current_omitted =
+            task_budget_omissions(&omitted, detail_omitted, item_omitted, space_omitted);
+        let estimated_tokens = charged_task_context_tokens(&associations, &items, &current_omitted);
+        if estimated_tokens <= token_budget {
+            return PackedTaskContexts {
+                estimated_tokens,
+                associations,
+                items,
+                omitted: current_omitted,
+            };
+        }
+
+        if let Some(space_id) = associations.last().map(|association| association.space_id) {
+            if let Some(position) = items.iter().rposition(|item| {
+                item.association_space_id == space_id
+                    && item.context.detail == ContextPackDetail::Full
+            }) {
+                let item = &mut items[position];
+                let before = serialized_tokens(item);
+                item.context.rationale = None;
+                item.context.evidence.clear();
+                item.context.detail = ContextPackDetail::Summary;
+                let after = serialized_tokens(item);
+                detail_omitted.add(before.saturating_sub(after));
+                continue;
+            }
+            if let Some(position) = items
+                .iter()
+                .rposition(|item| item.association_space_id == space_id)
+            {
+                let item = items.remove(position);
+                item_omitted.add(serialized_tokens(&item));
+                continue;
+            }
+            let association = associations.pop().expect("last Association exists");
+            space_omitted.add(serialized_tokens(&association));
             continue;
         }
-        let context_id = full.context.context_id;
-        let revision_id = full.context.revision_id;
-        let summary = TaskContextItem {
-            context: ContextPackItem {
-                rationale: None,
-                evidence: Vec::new(),
-                detail: ContextPackDetail::Summary,
-                ..full.context
-            },
-            ..full
+
+        let count = current_omitted.iter().map(|item| item.count).sum();
+        let compact = vec![ContextPackOmitted {
+            context_id: None,
+            revision_id: None,
+            reason: "omitted".to_owned(),
+            estimated_tokens: current_omitted
+                .iter()
+                .map(|item| item.estimated_tokens)
+                .sum(),
+            count,
+        }];
+        return PackedTaskContexts {
+            estimated_tokens: charged_task_context_tokens(&[], &[], &compact),
+            associations: Vec::new(),
+            items: Vec::new(),
+            omitted: compact,
         };
-        let summary_tokens = serialized_tokens(&summary);
-        if estimated_tokens.saturating_add(summary_tokens) <= token_budget {
-            estimated_tokens += summary_tokens;
-            items.push(summary);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct OmissionAggregate {
+    count: usize,
+    estimated_tokens: usize,
+}
+
+impl OmissionAggregate {
+    fn add(&mut self, estimated_tokens: usize) {
+        self.count += 1;
+        self.estimated_tokens = self.estimated_tokens.saturating_add(estimated_tokens);
+    }
+}
+
+fn task_budget_omissions(
+    base: &[ContextPackOmitted],
+    detail: OmissionAggregate,
+    item: OmissionAggregate,
+    space: OmissionAggregate,
+) -> Vec<ContextPackOmitted> {
+    let mut omitted = base.to_vec();
+    for (reason, aggregate) in [
+        ("detail_token_budget", detail),
+        ("item_token_budget", item),
+        ("space_token_budget", space),
+    ] {
+        if aggregate.count > 0 {
             omitted.push(ContextPackOmitted {
-                context_id: Some(context_id),
-                revision_id: Some(revision_id),
-                reason: "detail_token_budget".to_owned(),
-                estimated_tokens: full_tokens.saturating_sub(summary_tokens),
-                count: 1,
-            });
-        } else {
-            omitted.push(ContextPackOmitted {
-                context_id: Some(context_id),
-                revision_id: Some(revision_id),
-                reason: "token_budget".to_owned(),
-                estimated_tokens: summary_tokens,
-                count: 1,
+                context_id: None,
+                revision_id: None,
+                reason: reason.to_owned(),
+                estimated_tokens: aggregate.estimated_tokens,
+                count: aggregate.count,
             });
         }
     }
-    PackedTaskContexts {
-        estimated_tokens,
-        associations: inference.associations,
+    omitted
+}
+
+fn charged_task_context_tokens(
+    associations: &[TaskSpaceAssociation],
+    items: &[TaskContextItem],
+    omitted: &[ContextPackOmitted],
+) -> usize {
+    TASK_CONTEXT_ENVELOPE_TOKEN_RESERVE.saturating_add(serialized_tokens(&(
+        associations,
         items,
         omitted,
-    }
+    )))
+}
+
+/// Recomputes the charged Association, item/path, omission, and deterministic envelope reserve.
+#[must_use]
+pub fn estimate_task_context_payload_tokens(pack: &TaskContextPack) -> usize {
+    charged_task_context_tokens(&pack.associations, &pack.items, &pack.omitted)
 }
 
 #[derive(Debug)]

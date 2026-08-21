@@ -364,8 +364,15 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
                 .as_object()
                 .unwrap()
                 .keys()
-                .all(|field| !field.contains("space") && !field.contains("workspace"))
+                .all(|field| {
+                    field == "max_spaces"
+                        || (!field.contains("space") && !field.contains("workspace"))
+                })
         );
+        assert_eq!(task_schema["properties"]["max_spaces"]["minimum"], 1);
+        assert_eq!(task_schema["properties"]["max_spaces"]["maximum"], 32);
+        assert_eq!(task_schema["properties"]["max_spaces"]["default"], 8);
+        assert_eq!(task_schema["properties"]["token_budget"]["minimum"], 256);
         let search_schema = &tools
             .iter()
             .find(|tool| tool["name"] == "context_search")
@@ -445,6 +452,35 @@ fn task_context_rejects_caller_owned_identity_and_space_or_workspace_routes() {
             ],
         );
 
+        assert_eq!(responses[1]["result"]["isError"], true);
+        assert_eq!(
+            responses[1]["result"]["structuredContent"]["error"]["code"],
+            "invalid_input"
+        );
+    }
+}
+
+#[test]
+fn task_context_rejects_unsafe_budget_or_space_bounds() {
+    let fixture = Fixture::new();
+    for invalid in [
+        json!({"token_budget": 255}),
+        json!({"max_spaces": 0}),
+        json!({"max_spaces": 33}),
+    ] {
+        let mut arguments = task_arguments("codex", "bound-rejection", "find task context");
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(invalid.as_object().unwrap().clone());
+        let responses = run_session(
+            &mut fixture.server(ClientKind::Codex),
+            FixtureFraming::Newline,
+            &[
+                request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+                tool_call(2, "task_context", arguments),
+            ],
+        );
         assert_eq!(responses[1]["result"]["isError"], true);
         assert_eq!(
             responses[1]["result"]["structuredContent"]["error"]["code"],
