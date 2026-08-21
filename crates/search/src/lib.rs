@@ -300,6 +300,54 @@ pub struct IntentScopeConflictExplanation {
     pub score_multiplier_basis_points: u16,
 }
 
+/// Kind of unresolved Space Intent handoff exposed to the active Agent session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentConflictKind {
+    ContextAndIntentAlternativesConflict,
+}
+
+/// Explicit statement that retrieval did not choose one Intent branch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentConflictSelection {
+    SystemHasNotSelectedWinner,
+}
+
+/// Evidence the session Agent must validate before relying on conflicted alternatives.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentConflictValidation {
+    CurrentCode,
+    Evidence,
+    TaskApplicability,
+}
+
+/// Actor responsible for resolving applicability during the current task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentConflictActor {
+    SessionAgent,
+}
+
+/// Decision explicitly delegated to the active Agent session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentConflictDecision {
+    DecideWhichContextIsMoreSuitable,
+}
+
+/// Typed warning handed to the session Agent without blocking otherwise safe Context retrieval.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IntentConflictHandoffExplanation {
+    pub kind: IntentConflictKind,
+    pub head_revision_ids: Vec<RevisionId>,
+    pub selection: IntentConflictSelection,
+    pub required_actor: IntentConflictActor,
+    pub must_validate: Vec<IntentConflictValidation>,
+    pub required_decision: IntentConflictDecision,
+}
+
 /// Deterministic candidate channel participating in Reciprocal Rank Fusion.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1022,6 +1070,7 @@ struct AssociationEvidence {
     intent_tokens: BTreeSet<String>,
     intent_matched: bool,
     intent_conflicted: bool,
+    intent_head_revision_ids: BTreeSet<RevisionId>,
     intent_artifacts: BTreeSet<String>,
     intent_bm25: Option<f64>,
     intent_phrase_match: bool,
@@ -1051,6 +1100,7 @@ struct TaskAssociationInference {
 #[derive(Debug, Default)]
 struct IntentArtifactEvidence {
     intent_conflicted: bool,
+    head_revision_ids: BTreeSet<RevisionId>,
     positive: BTreeSet<String>,
     excluded: BTreeSet<String>,
 }
@@ -1130,6 +1180,9 @@ fn infer_task_space_associations(
         let aggregate = evidence.entry(space_id).or_default();
         aggregate.intent_conflicted |= artifacts.intent_conflicted;
         aggregate
+            .intent_head_revision_ids
+            .extend(artifacts.head_revision_ids);
+        aggregate
             .intent_artifacts
             .extend(artifacts.positive.iter().cloned());
         aggregate.matched_artifacts.extend(artifacts.positive);
@@ -1168,6 +1221,7 @@ fn infer_task_space_associations(
             .matched_scopes
             .extend(context.matched_scopes.iter().cloned());
     }
+    hydrate_intent_conflict_state(connection, &mut evidence)?;
     assign_channel_features(&mut evidence, query_tokens);
     let mut associations = evidence
         .iter()
@@ -1187,6 +1241,32 @@ fn infer_task_space_associations(
     })
 }
 
+fn hydrate_intent_conflict_state(
+    connection: &Connection,
+    evidence: &mut BTreeMap<SpaceId, AssociationEvidence>,
+) -> Result<()> {
+    let mut statement = connection
+        .prepare(
+            "SELECT space_id FROM space_projection
+             WHERE intent_conflicted = 1
+             ORDER BY space_id",
+        )
+        .map_err(sql_error("prepare conflicted Space hydration"))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(sql_error("read conflicted Spaces"))?;
+    for row in rows {
+        let space_id = parse_id(&row.map_err(sql_error("collect conflicted Space"))?)?;
+        if let Some(aggregate) = evidence.get_mut(&space_id) {
+            aggregate.intent_conflicted = true;
+            aggregate
+                .intent_head_revision_ids
+                .extend(load_intent_head_ids(connection, space_id)?);
+        }
+    }
+    Ok(())
+}
+
 fn apply_intent_evidence(
     evidence: &mut BTreeMap<SpaceId, AssociationEvidence>,
     candidates: Vec<SpaceIntentCandidate>,
@@ -1194,6 +1274,9 @@ fn apply_intent_evidence(
     for candidate in candidates {
         let aggregate = evidence.entry(candidate.space_id).or_default();
         aggregate.intent_conflicted = candidate.intent_conflicted;
+        aggregate
+            .intent_head_revision_ids
+            .extend(candidate.head_revision_ids);
         aggregate.intent_bm25 = Some(
             aggregate
                 .intent_bm25
@@ -1311,6 +1394,13 @@ fn query_exact_intent_artifacts(
             entry.intent_conflicted |= intent_conflicted;
             entry.positive.extend(positive);
             entry.excluded.extend(excluded);
+        }
+    }
+    for (space_id, evidence) in &mut matches {
+        if evidence.intent_conflicted {
+            evidence
+                .head_revision_ids
+                .extend(load_intent_head_ids(connection, *space_id)?);
         }
     }
     Ok(matches)
@@ -1855,6 +1945,25 @@ fn intent_scope_conflict(evidence: &AssociationEvidence) -> Option<IntentScopeCo
     })
 }
 
+fn intent_conflict_handoff(
+    evidence: &AssociationEvidence,
+) -> Option<IntentConflictHandoffExplanation> {
+    evidence
+        .intent_conflicted
+        .then(|| IntentConflictHandoffExplanation {
+            kind: IntentConflictKind::ContextAndIntentAlternativesConflict,
+            head_revision_ids: evidence.intent_head_revision_ids.iter().copied().collect(),
+            selection: IntentConflictSelection::SystemHasNotSelectedWinner,
+            required_actor: IntentConflictActor::SessionAgent,
+            must_validate: vec![
+                IntentConflictValidation::CurrentCode,
+                IntentConflictValidation::Evidence,
+                IntentConflictValidation::TaskApplicability,
+            ],
+            required_decision: IntentConflictDecision::DecideWhichContextIsMoreSuitable,
+        })
+}
+
 fn association_reasons(evidence: &AssociationEvidence) -> Vec<String> {
     let mut reasons = vec![
         serde_json::to_string(&TaskAssociationFusionExplanation {
@@ -1878,8 +1987,11 @@ fn association_reasons(evidence: &AssociationEvidence) -> Vec<String> {
                 .join(", ")
         ));
     }
-    if evidence.intent_conflicted {
-        reasons.push("Space Intent is conflicted; no Intent head was selected".to_owned());
+    if let Some(conflict) = intent_conflict_handoff(evidence) {
+        reasons.push(
+            serde_json::to_string(&conflict)
+                .expect("Intent Conflict handoff explanation is always serializable"),
+        );
     }
     if let Some(conflict) = intent_scope_conflict(evidence) {
         reasons.push(

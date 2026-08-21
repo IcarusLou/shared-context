@@ -8,7 +8,9 @@ use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::ProjectionIndex;
 use sctx_search::{
-    ContextPackMode, ContextStatus, IntentScopeConflictExplanation, IntentScopeConflictKind,
+    ContextPackMode, ContextStatus, IntentConflictActor, IntentConflictDecision,
+    IntentConflictHandoffExplanation, IntentConflictKind, IntentConflictSelection,
+    IntentConflictValidation, IntentScopeConflictExplanation, IntentScopeConflictKind,
     IntentScopeConflictPolicy, SearchEngine, SpaceIntentField, TaskAssociationChannel,
     TaskAssociationFusionExplanation, TaskContextRequest, TaskRetrievalPath,
     estimate_task_context_payload_tokens,
@@ -38,6 +40,15 @@ struct FusionCorpusFixture {
     precise_space_id: SpaceId,
     precise_context_id: ContextId,
     total_spaces: usize,
+}
+
+struct IntentHandoffFixture {
+    _temporary: TempDir,
+    store: GitStore,
+    index: ProjectionIndex,
+    space_id: SpaceId,
+    context_id: ContextId,
+    conflicted_head_ids: [RevisionId; 2],
 }
 
 fn intent(title: &str, intent_text: &str) -> sctx_domain::IntentSnapshot {
@@ -255,6 +266,80 @@ fn fusion_corpus_fixture() -> FusionCorpusFixture {
         precise_space_id,
         precise_context_id,
         total_spaces: GENERIC_SPACE_COUNT + 1,
+    }
+}
+
+fn handoff_intent(title: &str, outcome: &str) -> sctx_domain::IntentSnapshot {
+    sctx_domain::IntentSnapshot {
+        title: title.to_owned(),
+        problem: "handoffsharedneedle has unresolved alternatives".to_owned(),
+        desired_outcome: outcome.to_owned(),
+        in_scope: vec!["handoffsharedneedle".to_owned()],
+        out_of_scope: vec!["unrelated handoff exclusion".to_owned()],
+        acceptance_conditions: vec!["the active Agent validates applicability".to_owned()],
+        domain_terms: vec!["intent-handoff".to_owned()],
+    }
+}
+
+fn intent_handoff_fixture() -> IntentHandoffFixture {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::initialize(temporary.path().join("handoff-installation")).unwrap();
+    let base = Event::space_created(
+        handoff_intent("HandoffBase", "establish the initial handoff boundary"),
+        None,
+    )
+    .unwrap();
+    let (space_id, parent_id) = match base.payload() {
+        EventPayload::SpaceCreated {
+            space_id,
+            intent_revision,
+        } => (*space_id, intent_revision.revision_id),
+        _ => unreachable!(),
+    };
+    append(&store, base);
+    let left = Event::intent_revision_added(
+        space_id,
+        vec![parent_id],
+        handoff_intent("HandoffLeft", "prefer the left Context alternative"),
+        None,
+    )
+    .unwrap();
+    let left_id = match left.payload() {
+        EventPayload::SpaceIntentRevisionAdded {
+            intent_revision, ..
+        } => intent_revision.revision_id,
+        _ => unreachable!(),
+    };
+    append(&store, left);
+    let right = Event::intent_revision_added(
+        space_id,
+        vec![parent_id],
+        handoff_intent("HandoffRight", "prefer the right Context alternative"),
+        None,
+    )
+    .unwrap();
+    let right_id = match right.payload() {
+        EventPayload::SpaceIntentRevisionAdded {
+            intent_revision, ..
+        } => intent_revision.revision_id,
+        _ => unreachable!(),
+    };
+    append(&store, right);
+    let (context_id, _, _) = add_accepted_context(
+        &store,
+        space_id,
+        "contextonlyhandoffneedle Context remains safe but requires Agent validation",
+        applicability("handoff", "server", "active"),
+    );
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    IntentHandoffFixture {
+        _temporary: temporary,
+        store,
+        index,
+        space_id,
+        context_id,
+        conflicted_head_ids: [left_id, right_id],
     }
 }
 
@@ -715,6 +800,119 @@ fn positive_and_out_of_scope_matches_keep_one_penalized_explained_association() 
             } if matched_fields == &["out_of_scope".to_owned()] && !matched_tokens.is_empty()
         )
     }));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn intent_conflict_handoff_is_visible_without_blocking_and_disappears_after_merge() {
+    let fixture = intent_handoff_fixture();
+    let engine = SearchEngine::new(fixture.index.clone());
+    let query = task("handoffsharedneedle");
+    let candidates = engine.space_intent_candidates(&query, &[]).unwrap();
+    assert_eq!(candidates.candidates.len(), 1);
+    let candidate = &candidates.candidates[0];
+    assert!(candidate.intent_conflicted);
+    let mut expected_heads = fixture.conflicted_head_ids.to_vec();
+    expected_heads.sort();
+    assert_eq!(candidate.head_revision_ids, expected_heads);
+
+    let context_only_query = task("contextonlyhandoffneedle");
+    let associations = engine
+        .task_space_associations(&context_only_query, &[])
+        .unwrap();
+    assert_eq!(associations.associations.len(), 1);
+    let warning = associations.associations[0]
+        .reasons
+        .iter()
+        .find_map(|reason| serde_json::from_str::<IntentConflictHandoffExplanation>(reason).ok())
+        .expect("conflicted Space must hand the decision to the session Agent");
+    assert_eq!(
+        warning.kind,
+        IntentConflictKind::ContextAndIntentAlternativesConflict
+    );
+    assert_eq!(warning.head_revision_ids, expected_heads);
+    assert_eq!(
+        warning.selection,
+        IntentConflictSelection::SystemHasNotSelectedWinner
+    );
+    assert_eq!(warning.required_actor, IntentConflictActor::SessionAgent);
+    assert_eq!(
+        warning.must_validate,
+        vec![
+            IntentConflictValidation::CurrentCode,
+            IntentConflictValidation::Evidence,
+            IntentConflictValidation::TaskApplicability,
+        ]
+    );
+    assert_eq!(
+        warning.required_decision,
+        IntentConflictDecision::DecideWhichContextIsMoreSuitable
+    );
+
+    let before = engine
+        .task_context_pack(&TaskContextRequest::automatic(
+            context_only_query.clone(),
+            Vec::new(),
+            100_000,
+        ))
+        .unwrap();
+    assert_eq!(before.associations, associations.associations);
+    assert_eq!(
+        before.items.len(),
+        1,
+        "human decision keeps automatic behavior"
+    );
+    assert_eq!(before.items[0].context.context_id, fixture.context_id);
+    let hook_visible_json = serde_json::to_string(&before).unwrap();
+    for marker in [
+        "context_and_intent_alternatives_conflict",
+        "system_has_not_selected_winner",
+        "session_agent",
+        "current_code",
+        "evidence",
+        "task_applicability",
+        "decide_which_context_is_more_suitable",
+    ] {
+        assert!(
+            hook_visible_json.contains(marker),
+            "Hook-serialized Task Pack must expose {marker}"
+        );
+    }
+
+    append(
+        &fixture.store,
+        Event::intent_revision_added(
+            fixture.space_id,
+            fixture.conflicted_head_ids.to_vec(),
+            handoff_intent(
+                "HandoffResolved",
+                "use the validated merged Context alternative",
+            ),
+            None,
+        )
+        .unwrap(),
+    );
+    let resolved_candidates = engine.space_intent_candidates(&query, &[]).unwrap();
+    assert_eq!(resolved_candidates.candidates.len(), 1);
+    assert!(!resolved_candidates.candidates[0].intent_conflicted);
+    assert_eq!(resolved_candidates.candidates[0].head_revision_ids.len(), 1);
+    let resolved = engine
+        .task_context_pack(&TaskContextRequest::automatic(
+            context_only_query,
+            Vec::new(),
+            100_000,
+        ))
+        .unwrap();
+    assert_eq!(resolved.items.len(), 1);
+    assert_eq!(resolved.items[0].context.context_id, fixture.context_id);
+    assert!(resolved.associations[0].reasons.iter().all(|reason| {
+        serde_json::from_str::<IntentConflictHandoffExplanation>(reason).is_err()
+    }));
+    assert!(
+        !serde_json::to_string(&resolved)
+            .unwrap()
+            .contains("system_has_not_selected_winner")
+    );
 }
 
 #[test]
