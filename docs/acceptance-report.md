@@ -1,8 +1,8 @@
 # Task-first Retrieval Integration Acceptance Report
 
-Date: 2026-08-21
-Scope: Mew #112 through #146
-Implementation head before M3 acceptance: `main@6a02159`
+Date: 2026-08-22
+Scope: Mew #112 through #149, excluding deferred #147 and accepted boundary #150
+Implementation baseline for sparse Graph repair: `main@c84c277`
 
 ## Verdict
 
@@ -16,7 +16,7 @@ This report does **not** claim M4:
 |---|---|---|
 | M1 — Task-first primitives and unassigned Candidate entry | IMPLEMENTED | Covered below |
 | M2 — Task Runtime and multi-Space retrieval | IMPLEMENTED | TaskSession persistence, strict `task_intent_update`, read-only `task_context`, association inference, typed RetrievalPaths, and TaskContextPack pass focused cross-crate/E2E oracles |
-| M3 — Engineering Graph | IMPLEMENTED | Fixed cross-crate/E2E oracle proves multi-language deterministic Artifact locators, move/rename-to-missing behavior, exact graph retrieval, 1–2 hop cross-platform Context, diagnostics, fallback, rebuild equivalence, and snapshot/budget bounds |
+| M3 — Engineering Graph | IMPLEMENTED | Reference-derived bounded ScanPlan, deterministic Artifact locators, move/rename-to-missing behavior, exact graph retrieval, 1–2 hop cross-platform Context, diagnostics, fallback, rebuild equivalence, and snapshot/budget bounds pass fixed cross-crate/E2E oracles |
 | M4 — Low-tax Capture | NOT IMPLEMENTED | No automatic WorkEpisode aggregation, Candidate Builder, Space recommendation, deduplication, or confirmation workflow |
 
 `task_intent_update` is the only Task Intent write path. `task_context` accepts only an external Session locator and output bounds, and reads the already-authoritative ActiveTask without mutating Runtime. PromptSubmit supplies guidance rather than inferred Intent. Explicit `context_search.space_ids` remains available as a hard filter for diagnosis and exploration.
@@ -49,14 +49,20 @@ M4 retains Mandatory Gate #114/#117: stable `submission_id` idempotency must be 
 | Automatic TaskContextPack excludes every unsafe state | PROVEN | The oracle seeds an unassigned Candidate plus Space-associated Candidate, Deprecated, semantic-conflict, and incomplete-Evidence Context; automatic output is empty while a direct SearchEngine diagnostic query proves each fixture state exists |
 | Tree, Generation, and Task fingerprint are consistent | PROVEN | M2 response Tree equals Git `HEAD^{tree}` and index metadata; Generation equals the same projection; identical Session input returns identical fingerprint, associations, items, and paths |
 | Engineering workflows preserve identity, privacy, and ambiguity | PROVEN | Two-Repository/multi-worktree tests execute scan→record→rebuild→explain→Task Pack; concurrent Writer calls produce unique server-owned IDs; unsafe paths, incomplete evidence, and secrets are rejected; ambiguous candidates are returned without selection |
+| Graph build is sparse and Reference-derived | PROVEN | Scanner tests seed 200 unreferenced tracked files plus an unreadable sentinel and prove zero observations/Artifacts for them; duplicate Reference paths collapse to one planned path; public `repository_scan` requires `paths` with `minItems: 1`/`maxItems: 10000`; `association_rebuild` reports the deduplicated planned-path count |
+| Missing and empty plans never broaden scanning | PROVEN | Empty typed ScanPlan and empty MCP/CLI `paths` fail; an explicit missing path returns a typed `missing` skip with zero scanned files/Artifacts and no directory or Repository fallback |
+| Repository discovery accepts subdirectories without sibling recursion | PROVEN | Codex Hook starts from a Chinese/spaced Repository subdirectory, registers its canonical Git top-level, then proves a root refresh keeps the same RepositoryId while two sibling Git repositories remain unregistered |
 | Engineering failure is advisory to Task Retrieval | PROVEN | Rebuild reports unavailable registered Repositories explicitly, Explain reports typed projection availability, and a corrupt Engineering projection degrades Task responses to `artifact_generation: null` instead of blocking Context-only retrieval |
-| Multi-language Artifact discovery has an independent oracle | PROVEN | `milestone-three-v1.json` contains hand-authored IDs/paths/relations and the fixture spans Rust, TS, JS, Swift, Kotlin, JSON, OpenAPI and Proto; expected values are never captured from production output |
+| Multi-language Artifact discovery has an independent bounded oracle | PROVEN | `milestone-three-v1.json` fixes hand-authored IDs/References and the exact Reference-derived path plan; a separate Scanner contract explicitly plans Rust, TS, JS, Swift, Kotlin, JSON, OpenAPI and Proto paths and validates exact API/Schema/Qualified Symbol/Test locators without full-repository enumeration |
 | File move and Symbol rename never trigger guessing | PROVEN | M3 oracle moves a JS file and renames a TS Symbol, then proves both original deterministic locators become `missing`, create no Edge, and remain unchanged without Git-history or Agent repair workflow |
 | Exact Graph retrieval expands cross-platform Context at bounded depth | PROVEN | Symbol→Decision→Contract→iOS/Android and FE API/Schema→Contract→Decision/iOS/Android paths match fixed Context IDs, relation kinds and depths; cycles never repeat a Context and all paths stop at depth two |
 | Ambiguous edges are diagnostic-only | PROVEN | Explicit mode exposes both fixed candidates; automatic mode cannot use the edge to inject or raise Graph relevance |
 | Engineering projection is disposable and generation-consistent | PROVEN | The oracle deletes `engineering.sqlite`, rebuilds byte-equivalent canonical projection, and proves every Graph path shares the returned Context Tree and Artifact Generation |
+| Incremental and scratch scans are equivalent | PROVEN | The Scanner contract runs both paths with the same RepositoryId and deduplicated ScanPlan and asserts byte-for-byte equal RepositorySnapshot output |
 | Associations, paths and omissions obey Token Budget | PROVEN | Full and constrained fixed Graph packs recompute exact charged tokens, stay within budget, obey top-k, and emit omissions when bounded |
 | M3 defines the verifiable Evidence source boundary for deferred #136 | PROVEN | Technical design defines typed TaskSignal, ContextEvidence and EngineeringResolution sources, ownership/snapshot rules, negative statuses, and the M4 persistence boundary without claiming it is implemented |
+
+#147 is not implemented by #149: existing Graph/current-Context-Tree eligibility semantics are unchanged. #150 is an accepted product boundary: untracked files are not scanned, and no ActiveTask untracked scan entry was added.
 
 ## Residue gates
 
@@ -97,7 +103,7 @@ Current repository gate results:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: passed with no warnings.
-- `cargo test --workspace --locked`: 265 passed, 0 failed, 1 ignored manual benchmark.
+- `cargo test --workspace --locked`: 269 passed, 0 failed, 1 ignored manual benchmark.
 - `npm test`: 16 passed, 0 failed, 0 skipped.
 - Shared Context Skill `quick_validate.py`: passed (`Skill is valid!`).
 

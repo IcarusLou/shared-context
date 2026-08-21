@@ -12,7 +12,7 @@ use sctx_domain::{
 };
 use sctx_engineering_graph::{
     EngineeringProjection, EngineeringProjectionStore, EngineeringReferenceResolver,
-    ProjectedEngineeringReference, RepositoryScanOutcome, RepositoryScanner,
+    ProjectedEngineeringReference, RepositoryScanOutcome, RepositoryScanPlan, RepositoryScanner,
     RepositoryScannerLimits, RepositorySnapshot, SourceLanguage,
 };
 use sctx_event_schema::{ParsedEvent, parse_event};
@@ -47,6 +47,7 @@ struct Expected {
     references: BTreeMap<String, String>,
     artifacts: BTreeMap<String, ExpectedArtifact>,
     relations_from_symbol: Vec<ExpectedRelation>,
+    planned_paths: Vec<String>,
     languages: Vec<String>,
     token_budget: usize,
     bounded_token_budget: usize,
@@ -84,6 +85,7 @@ struct MilestoneThreeFixture {
     repository_path: PathBuf,
     oracle: Oracle,
     repository: RepositoryIdentity,
+    scan_plan: RepositoryScanPlan,
     index: ProjectionIndex,
     metadata: IndexMetadata,
     snapshot: RepositorySnapshot,
@@ -141,12 +143,6 @@ impl MilestoneThreeFixture {
             repository_id,
             canonical_name: "milestone-three-multilingual-fixture".to_owned(),
         };
-        let scan = RepositoryScanner::new(RepositoryScannerLimits::default())
-            .scan(&repository, &repository_path)
-            .unwrap();
-        let RepositoryScanOutcome::Available(snapshot) = scan else {
-            panic!("fixture Repository must be available")
-        };
         let projected = domain
             .projection
             .engineering_references
@@ -157,6 +153,29 @@ impl MilestoneThreeFixture {
                 reference: reference.reference.clone(),
             })
             .collect::<Vec<_>>();
+        let scan_plan = RepositoryScanPlan::new(
+            repository_id,
+            projected
+                .iter()
+                .map(|reference| reference.reference.locator.path().clone())
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            scan_plan
+                .paths()
+                .iter()
+                .map(|path| path.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            oracle.expected.planned_paths,
+            "the fixed M3 scan plan is derived only from Reference locator paths"
+        );
+        let scan = RepositoryScanner::new(RepositoryScannerLimits::default())
+            .scan(&repository, &repository_path, &scan_plan)
+            .unwrap();
+        let RepositoryScanOutcome::Available(snapshot) = scan else {
+            panic!("fixture Repository must be available")
+        };
         let projection = EngineeringReferenceResolver
             .resolve(
                 &projected,
@@ -174,6 +193,7 @@ impl MilestoneThreeFixture {
             repository_path,
             oracle,
             repository,
+            scan_plan,
             index,
             metadata,
             snapshot,
@@ -236,12 +256,6 @@ fn fixed_multilanguage_oracle_marks_moves_and_renames_missing_and_rebuilds() {
     let mut fixture = MilestoneThreeFixture::new();
     assert_multilanguage_snapshot(&fixture);
 
-    let initial_file_key = fixture
-        .reference("file")
-        .resolution
-        .resolved_artifact
-        .clone()
-        .expect("fixed File Reference resolves");
     let initial_symbol_key = fixture
         .reference("symbol")
         .resolution
@@ -294,6 +308,7 @@ fn fixed_multilanguage_oracle_marks_moves_and_renames_missing_and_rebuilds() {
             &fixture.snapshot,
             &fixture.repository,
             &fixture.repository_path,
+            &fixture.scan_plan,
         )
         .unwrap();
     let RepositoryScanOutcome::Available(current_snapshot) = rescanned else {
@@ -311,11 +326,10 @@ fn fixed_multilanguage_oracle_marks_moves_and_renames_missing_and_rebuilds() {
     assert!(current_file.resolution.resolved_artifact.is_none());
     assert!(current_file.association.is_none());
     assert!(current_file.artifacts.is_empty());
-    assert!(current_snapshot.artifacts.iter().any(|artifact| {
+    assert!(!current_snapshot.artifacts.iter().any(|artifact| {
         artifact.artifact.artifact_key.kind() == ArtifactKind::File
             && artifact.artifact.artifact_key.locator().path().as_str()
                 == moved.new_path.as_deref().unwrap()
-            && artifact.artifact.artifact_key != initial_file_key
     }));
 
     let current_symbol = resolved(&current, &fixture.oracle.expected.references["symbol"]);
@@ -661,7 +675,7 @@ fn assert_multilanguage_snapshot(fixture: &MilestoneThreeFixture) {
     assert_eq!(
         actual_languages,
         fixture.oracle.expected.languages.iter().cloned().collect(),
-        "Rust/TS/JS/Swift/Kotlin/JSON/OpenAPI/Proto fixture coverage is fixed by the oracle"
+        "only languages reached by the fixed Reference-derived plan are parsed"
     );
     for name in ["symbol", "api", "schema"] {
         let expected = &fixture.oracle.expected.artifacts[name];
@@ -678,24 +692,19 @@ fn assert_multilanguage_snapshot(fixture: &MilestoneThreeFixture) {
                     == expected.path.as_deref()
         }));
     }
-    for (kind, name) in [
-        (ArtifactKind::Symbol, "SearchContract"),
-        (ArtifactKind::Test, "contract_round_trip"),
-        (ArtifactKind::Test, "testLegacySearchFallback"),
-        (ArtifactKind::Test, "legacySearchFallback"),
-        (ArtifactKind::Schema, "search.response.v2.json"),
-        (ArtifactKind::Api, "/v2/search"),
-        (ArtifactKind::Schema, "SearchResponseV2"),
-        (ArtifactKind::Api, "SearchService"),
-    ] {
-        assert!(
-            fixture.snapshot.artifacts.iter().any(|artifact| {
-                artifact.artifact.artifact_key.kind() == kind
-                    && artifact.artifact.display_name == name
-            }),
-            "missing representative {kind:?} {name}"
-        );
-    }
+    let planned_paths = fixture
+        .oracle
+        .expected
+        .planned_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert!(fixture.snapshot.artifacts.iter().all(|artifact| {
+        artifact
+            .observations
+            .iter()
+            .all(|observation| planned_paths.contains(observation.path.as_str()))
+    }));
 }
 
 fn assert_pack_generations_and_budget(fixture: &MilestoneThreeFixture, pack: &TaskContextPack) {

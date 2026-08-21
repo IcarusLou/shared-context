@@ -204,7 +204,7 @@ fn symbol_artifact(repository: &RepositoryIdentity, name: &str) -> SnapshotArtif
             display_name: name.to_owned(),
         },
         snapshot_generation: "repo-current".to_owned(),
-        source_policy: SnapshotSourcePolicy::TrackedHeadWithSafeTrackedModifications,
+        source_policy: SnapshotSourcePolicy::PlannedPathsWithSafeTrackedModifications,
         observations: vec![ArtifactObservation {
             path: "src/search.ts".to_owned(),
             line: Some(10),
@@ -244,12 +244,19 @@ fn snapshot(
     for artifact in &mut artifacts {
         generation.clone_into(&mut artifact.snapshot_generation);
     }
+    let planned_paths = artifacts
+        .iter()
+        .map(|artifact| artifact.artifact.artifact_key.locator().path().clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     RepositoryScanOutcome::Available(RepositorySnapshot {
         repository_id: repository.repository_id,
-        source_policy: SnapshotSourcePolicy::TrackedHeadWithSafeTrackedModifications,
-        policy_version: "tracked-head-plus-safe-tracked-modifications-v1",
+        source_policy: SnapshotSourcePolicy::PlannedPathsWithSafeTrackedModifications,
+        policy_version: "planned-paths-plus-safe-tracked-modifications-v2",
         head_tree_oid: "repo-tree".to_owned(),
         generation: generation.to_owned(),
+        planned_paths,
         artifacts,
         scanned_files: 1,
         scanned_bytes: 100,
@@ -703,7 +710,7 @@ fn exact_file_signal_uses_repository_relative_path_locator() {
             display_name: "src/search.ts".to_owned(),
         },
         snapshot_generation: "repo-file".to_owned(),
-        source_policy: SnapshotSourcePolicy::TrackedHeadWithSafeTrackedModifications,
+        source_policy: SnapshotSourcePolicy::PlannedPathsWithSafeTrackedModifications,
         observations: vec![ArtifactObservation {
             path: "src/search.ts".to_owned(),
             line: None,

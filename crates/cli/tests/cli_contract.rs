@@ -694,15 +694,18 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         "tool_response": {"output": "passed"}
     }));
     assert_eq!(subdirectory_post, serde_json::json!({}));
+    let after_subdirectory = RepositoryRegistry::initialize(harness.root())
+        .unwrap()
+        .resolve_by_locator(&RepositoryLocatorQuery::CheckoutPath(
+            fs::canonicalize(&workspace).unwrap(),
+        ))
+        .unwrap()
+        .expect("a Workspace subdirectory must resolve and refresh its Git top-level");
     assert_eq!(
-        RepositoryRegistry::initialize(harness.root())
-            .unwrap()
-            .list()
-            .unwrap()
-            .len(),
-        1,
-        "a Workspace subdirectory must not be registered as a Repository root"
+        after_subdirectory.identity.repository_id,
+        registered.identity.repository_id
     );
+    assert_eq!(after_subdirectory.locators.len(), 1);
     for (snapshot, own_file, own_test, other_file) in [
         (
             &alpha_snapshot,
@@ -744,6 +747,121 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn hook_repository_discovery_ascends_only_the_explicit_sibling_repository() {
+    let harness = Harness::new();
+    GitStore::initialize(harness.root()).unwrap();
+    let siblings = harness.home.join("三个 sibling repos");
+    let repositories = ["alpha", "明确 beta", "gamma"]
+        .into_iter()
+        .map(|name| siblings.join(name))
+        .collect::<Vec<_>>();
+    for repository in &repositories {
+        fs::create_dir_all(repository.join("src/nested")).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .arg(repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        git_output(repository, &["config", "user.name", "Sparse Graph"]);
+        git_output(
+            repository,
+            &["config", "user.email", "sparse@example.invalid"],
+        );
+        fs::write(repository.join("src/target.rs"), "pub fn target() {}\n").unwrap();
+        git_output(repository, &["add", "--", "."]);
+        git_output(repository, &["commit", "-q", "-m", "fixture"]);
+    }
+    let explicit = &repositories[1];
+    let open_task = |session_id: &str| {
+        task_intent_update_at_root(
+            harness.root(),
+            &TaskIntentUpdateInput {
+                agent_kind: "codex".to_owned(),
+                external_session_id: session_id.to_owned(),
+                task_boundary: TaskBoundary::New,
+                expected_revision_id: ExpectedRevisionId::Null(()),
+                maturity: IntentMaturity::Provisional,
+                intent: TaskIntentDraft {
+                    goal: "Verify sparse Repository discovery".to_owned(),
+                    desired_change: "Refresh only the explicit Repository".to_owned(),
+                    in_scope: Vec::new(),
+                    out_of_scope: Vec::new(),
+                    domains: Vec::new(),
+                    platforms: Vec::new(),
+                    constraints: Vec::new(),
+                    acceptance_conditions: Vec::new(),
+                    artifacts: Vec::new(),
+                    interfaces: Vec::new(),
+                    unknowns: Vec::new(),
+                },
+                evidence_refs: Vec::new(),
+            },
+        )
+        .unwrap();
+    };
+    let post_tool = |session_id: &str, cwd: &Path| {
+        let output = harness.run_with_input(
+            &["hook", "--agent", "codex", "--agent-version", "0.147.0"],
+            &serde_json::json!({
+                "session_id": session_id,
+                "transcript_path": null,
+                "cwd": cwd,
+                "hook_event_name": "PostToolUse",
+                "model": "gpt-5.6-sol",
+                "permission_mode": "default",
+                "turn_id": format!("turn-{session_id}"),
+                "tool_name": "SparseRepositoryTest",
+                "tool_use_id": format!("tool-{session_id}"),
+                "tool_input": {"file_path": explicit.join("src/target.rs")},
+                "tool_response": {"output": "passed"}
+            }),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+            serde_json::json!({})
+        );
+    };
+
+    open_task("subdir-discovery");
+    post_tool("subdir-discovery", &explicit.join("src/nested"));
+    let registry = RepositoryRegistry::initialize(harness.root()).unwrap();
+    let registered = registry.list().unwrap();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0].locators.len(), 1);
+    assert_eq!(
+        registered[0].locators[0].checkout_path,
+        fs::canonicalize(explicit).unwrap()
+    );
+    for sibling in [&repositories[0], &repositories[2]] {
+        assert!(
+            registry
+                .resolve_by_locator(&RepositoryLocatorQuery::CheckoutPath(
+                    fs::canonicalize(sibling).unwrap(),
+                ))
+                .unwrap()
+                .is_none(),
+            "a common parent must not recursively discover sibling Repositories"
+        );
+    }
+
+    let repository_id = registered[0].identity.repository_id;
+    open_task("root-discovery");
+    post_tool("root-discovery", explicit);
+    let refreshed = registry.list().unwrap();
+    assert_eq!(refreshed.len(), 1);
+    assert_eq!(refreshed[0].identity.repository_id, repository_id);
+}
+
+#[test]
 fn engineering_graph_cli_commands_scan_record_rebuild_and_explain() {
     let harness = Harness::new();
     let (space_id, _) = create_space(&harness, "Engineering CLI workflow");
@@ -775,11 +893,26 @@ fn engineering_graph_cli_commands_scan_record_rebuild_and_explain() {
     git_output(&repository, &["add", "--", "."]);
     git_output(&repository, &["commit", "-q", "-m", "fixture"]);
 
+    let empty_plan = harness.failure(&[
+        "repository",
+        "scan",
+        "--checkout-path",
+        repository.to_str().unwrap(),
+    ]);
+    assert_eq!(empty_plan["error"]["code"], "invalid_input");
+    assert!(
+        empty_plan["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("paths")
+    );
     let scan = harness.success(&[
         "repository",
         "scan",
         "--checkout-path",
         repository.to_str().unwrap(),
+        "--path",
+        "src/contract.rs",
     ]);
     assert_eq!(scan["data"]["status"], "available");
     assert!(scan["data"]["artifact_count"].as_u64().unwrap() > 0);

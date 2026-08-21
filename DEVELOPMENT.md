@@ -10,8 +10,9 @@
 - `task_intent_update` 是 Task Intent 的唯一写入口并返回更新后的 TaskContextPack；`task_signal_supersede` 是 Signal 失效入口。
 - `TaskContextPack` 在同一 Context Tree、Projection Generation 和可选 Artifact Generation 上推断 `0..N` 个 Space，且每个 Context 都链接到 Association 和 typed RetrievalPath。
 - 同一 Workspace 下的 external Session 独立持有 TaskIntent 与 TaskSignals；Codex PostToolUse 的受控 File/Test observation 会改变 Task fingerprint，只有当前唯一 resolved Engineering Artifact 才能形成 Graph RetrievalPath。
-- Workspace 不形成 Space prior；已有 ActiveTask 的 canonical Git Workspace root 会刷新本地 Repository Registry。
-- 受限多语言 Scanner、持久 Engineering Reference、kind-specific 确定性 ArtifactLocator、可重建解析投影、ContextRelation 1–2 跳和 Graph RetrievalPath 已通过固定 oracle 与显式 MCP/CLI 工作流验收；move/rename 直接变为 missing，不执行关联猜测。
+- Workspace 不形成 Space prior；已有 ActiveTask 的 Workspace/CWD 即使位于 Git Repository 内部子目录，也只向上解析并刷新该 Repository 的 canonical top-level，不递归发现共同父目录下的 sibling Repository。
+- Engineering Graph 是围绕已有 Context/EngineeringReference 的稀疏图，不是全仓代码搜索引擎。`association_rebuild` 按 RepositoryId 分组并去重 Reference 的精确 repo-relative path，Scanner 只读取该有界计划；显式 `repository_scan` 同样要求至少一个 path，空集合、缺失路径都不得退化为 `git ls-files` 全仓枚举。
+- 受限多语言 Scanner、持久 Engineering Reference、kind-specific 确定性 ArtifactLocator、可重建解析投影、ContextRelation 1–2 跳和 Graph RetrievalPath 已通过固定 oracle 与显式 MCP/CLI 工作流验收；move/rename 直接变为 missing，不执行关联猜测。新建或其他 untracked 文件不进入 Graph（#150 的已确认边界），Task query 也不触发 Repository scan。
 - `WorkEpisode` 和无 Space 的 `ContextCandidate` 领域类型已经存在。
 - `candidate_create` 是当前 Candidate 写入主入口；CLI 与 MCP 都生成服务端 ID，且未确认 Candidate 不参与自动注入。
 - 既有 Git Writer、事件校验、SQLite 投影、Context 生命周期、CLI/MCP、Agent Adapter、安装器和 NPM 分发能力继续作为 M1 的基础设施。
@@ -19,6 +20,7 @@
 以下能力**尚未实现**，不得在代码、测试报告或评审中宣称已经具备：
 
 - **M4：未实现** — WorkEpisode 自动聚合、AgentCheckpoint、Candidate Builder、去重/冲突/Space 推荐和 Candidate confirm/list/discard。
+- **#147：未实现** — 本次稀疏扫描改造不改变 Graph 与当前 Context Tree 的既有一致性/eligibility 语义。
 
 Cursor 与 Codex 都通过显式 `task_intent_update` 建立权威 Task；Prompt Hook 只提供能力提示。已有 ActiveTask 可通过只读 `task_context` 再取 Pack。
 

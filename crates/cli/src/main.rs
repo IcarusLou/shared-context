@@ -833,8 +833,8 @@ fn refresh_registered_repositories(
         let Ok(top_level) = fs::canonicalize(top_level.trim()) else {
             continue;
         };
-        if top_level == candidate {
-            repositories.insert(candidate);
+        if candidate == top_level || candidate.starts_with(&top_level) {
+            repositories.insert(top_level);
         }
     }
     if repositories.is_empty() {
@@ -1727,12 +1727,18 @@ fn run_repository(args: &[String], json_output: bool) -> Result<()> {
             "--checkout-path",
             "--declared-identity",
             "--remote-hint",
+            "--path",
             "--max-artifacts",
         ],
         &[],
     )?;
     let input = RepositoryScanInput {
         checkout_path: options.required("--checkout-path")?.to_owned(),
+        paths: options
+            .many("--path")
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         declared_identity: options.optional("--declared-identity")?.map(str::to_owned),
         remote_hint: options.optional("--remote-hint")?.map(str::to_owned),
         max_artifacts: parse_usize(

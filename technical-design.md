@@ -18,10 +18,10 @@
 |---|---|---|
 | **M1：Task-first 领域与入口基础** | **已实现** | `TaskIntent` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；CLI/MCP 通过 `candidate_create` 创建无 Space Candidate；Candidate 不可自动注入 |
 | **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、严格 `task_intent_update` 与只读 `task_context` 已通过跨 crate/E2E 验收 |
-| **M3：Engineering Graph** | **已实现** | Repository Registry、多语言扫描、持久 Engineering Reference、可重建解析投影、ContextRelation 1–2 跳、Graph RetrievalPath 及 MCP/CLI 工作流已通过固定跨 crate/E2E oracle |
+| **M3：Engineering Graph** | **已实现** | Repository Registry、Reference-derived 有界多语言扫描、持久 Engineering Reference、可重建解析投影、ContextRelation 1–2 跳、Graph RetrievalPath 及 MCP/CLI 工作流已通过固定跨 crate/E2E oracle |
 | **M4：Low-tax Capture** | **未实现** | 尚无 WorkEpisode 自动聚合、AgentCheckpoint、Candidate Builder、去重/冲突、Space 推荐或 Candidate Confirm/List/Discard |
 
-当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订权威 TaskIntent，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示；PostToolUse 仅在 ActiveTask 已存在时合并可证明的 File/Test 信号，并刷新 canonical Git Workspace root 的 Repository Registry。显式 Graph 工具完成 scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。当前 `candidate_create` 仍是手工、无归属的 M1 入口，不等同于 M4 自动 Capture。
+当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订权威 TaskIntent，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示；PostToolUse 仅在 ActiveTask 已存在时合并可证明的 File/Test 信号，并从 Workspace/CWD 的任意内部子目录向上刷新真实 canonical Git top-level。显式 Graph 工具完成 bounded scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。当前 `candidate_create` 仍是手工、无归属的 M1 入口，不等同于 M4 自动 Capture。
 
 ## 2. 背景与目标
 
@@ -572,9 +572,12 @@ Engineering Graph 是派生查询结构，节点包括：
 
 ### 8.2 Artifact 解析
 
-业务代码仓库只读扫描生成 `EngineeringArtifact`：
+业务代码仓库只读扫描生成 `EngineeringArtifact`。Scanner 的输入必须是有界、非空的 `RepositoryScanPlan`：
 
 ```yaml
+scan_plan:
+  repository_id:
+  paths:                         # 去重后的 RepoRelativePath，至少一项
 repository_snapshot:
 artifact_id:
 kind:
@@ -583,6 +586,10 @@ locator:
   path:
   # 其余字段由 Artifact kind 决定
 ```
+
+持久 `EngineeringReference` 的每个 kind-specific `ArtifactLocator` 都包含明确的 `RepoRelativePath`。`association_rebuild` 先按 RepositoryId 分组 Reference，再收集并去重这些 path，最后只读取计划中的文件；不得调用 `git ls-files` 枚举 Repository，不得遍历目录，也不得在空计划或 missing path 时回退为全仓扫描。显式 `repository_scan` 使用相同计划约束。
+
+计划内路径仍依次执行 canonical path、tracked-only、symlink escape、敏感/generated/vendor、单文件大小、文件数和总字节预算检查。新建或其他 untracked 文件不进入 Graph；这属于 #150 的确认边界，不在本改造中扩大。Task Retrieval 只消费已经构建的 Engineering Projection，一次 query 不运行 Scanner。
 
 内部增量解析可以使用私有 Git blob OID 或 file-version digest，但它们不进入领域对象、关联证据、Graph ranking、RetrievalPath 或 MCP response。
 
@@ -970,10 +977,10 @@ sctx mcp serve --client cursor|codex
 | `task_intent_update` | 读/写本地状态 | CAS 更新 TaskIntent 并生成多 Space TaskContextPack |
 | `task_signal_supersede` | 读/写本地状态 | 按稳定 Signal ID 失效当前 Task 信号 |
 | `task_context` | 只读 | 按 external Session locator 重读已有 ActiveTask 的 TaskContextPack |
-| `repository_scan` | 读/写本地状态 | 注册 canonical Git worktree 并返回受限 Artifact 摘要 |
+| `repository_scan` | 读/写本地状态 | 注册 canonical Git worktree，要求显式非空 repo-relative paths，并返回有界 Artifact/skip 摘要 |
 | `engineering_reference_record` | 写知识事实 | 为已有 Context Revision 记录有证据的工程定位观察 |
 | `association_explain` | 只读 | 展示解析状态、证据、歧义候选和 Graph Paths，不代选 |
-| `association_rebuild` | 写派生状态 | 从当前注册 Repository 与 Git References 原子重建或诊断投影 |
+| `association_rebuild` | 写派生状态 | 从 Git References 派生按 Repository 分组去重的 ScanPlan，并据此原子重建或诊断投影 |
 | `task_checkpoint` | 写本地状态 | 提交结构化 Claim、Evidence Ref 和未知项 |
 | `candidate_list` | 读 | 查看当前 Task 自动生成的 Candidate |
 | `candidate_confirm` | 写知识事实 | 确认 Candidate、已有或新 Space、组织关系和初始生命周期 |
@@ -1248,14 +1255,15 @@ M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命�
 
 ### M3：Engineering Graph — 已实现
 
-- 本地 Repository Registry、同一 Git common-dir 的多 worktree 归一和不可用状态已实现。
-- 受限 tracked-source Scanner 已生成 Module/File/Symbol/API/Schema/Test Artifact 摘要，不保存或返回完整源码。
+- 本地 Repository Registry、同一 Git common-dir 的多 worktree 归一和不可用状态已实现；Workspace/CWD 可位于 Repository 任意内部子目录，但只向上注册该真实 top-level，不递归发现 sibling Repository。
+- Reference-derived `RepositoryScanPlan` 按 RepositoryId 分组、按精确 RepoRelativePath 去重；受限 tracked-source Scanner 只解析显式非空计划并生成 Module/File/Symbol/API/Schema/Test Artifact 摘要，不保存或返回完整源码，不执行全仓 `git ls-files` 枚举。
 - 持久 EngineeringReference Event、ArtifactResolution、ContextArtifactAssociation 和 generation-pinned Projection 已实现。
 - `repository_scan`、`engineering_reference_record`、`association_explain`、`association_rebuild`/diagnose 已接入 MCP/CLI；服务端拥有 Reference/Event 身份与路径。
 - Task Retrieval 已消费唯一 resolved Graph edge 和 Context Relation；歧义/不可用不自动选择，Graph 故障降级为 Context-only。
 - 已删除 M2 的文本 TaskSignal 伪工程路径；File/Symbol/API/Schema/Test 信号只有命中同代、唯一 resolved Artifact 时才形成 Engineering Graph 语义，Intent/Context BM25 与 Scope 继续作为非 Graph fallback。
-- 固定跨 crate/E2E oracle 以手工 ID、确定性 locator 和关系验证 Rust、TypeScript、JavaScript、Swift、Kotlin、JSON、OpenAPI 与 Proto；覆盖 Symbol→Requirement/Decision/Contract/Validation、File move/Symbol rename 变为 missing、FE API/Schema→跨端 Context、cycle/depth、歧义诊断、Repository unavailable、投影删除重建、Generation 和 Token Budget。
+- 固定跨 crate/E2E oracle 以手工 ID、Reference-derived path 计划、确定性 locator 和关系验证稀疏 Graph；独立 Scanner contract 用显式计划覆盖 Rust、TypeScript、JavaScript、Swift、Kotlin、JSON、OpenAPI 与 Proto。验收覆盖未引用 tracked 文件零 Artifact、path 去重、missing 无 fallback、API/Schema/Qualified Symbol/Test 精确 locator、Symbol→Requirement/Decision/Contract/Validation、File move/Symbol rename 变为 missing、FE API/Schema→跨端 Context、cycle/depth、歧义诊断、Repository unavailable、增量=scratch、投影删除重建、Generation 和 Token Budget。
 - 固定 expected 位于 `tests/oracles/milestone-three-v1.json`，不得通过序列化生产结果生成或更新；只读源 Fixture 位于 `tests/fixtures/milestone-three/repository/`。
+- 本次改造不实现 #147：Graph 与当前 Context Tree 的既有一致性/eligibility 语义保持不变。新建或其他 untracked 文件不扫描，不实现 #150 范围。
 
 #### M3 EvidenceSource 可验证契约（供延期 #136 使用）
 
@@ -1326,6 +1334,9 @@ EngineeringResolutionSource {
 4. FE 消费 API 字段的代码可以通过 API/Schema 节点召回其他平台的 Contract 或 Validation。
 5. 业务代码仓库不可访问时，Context 内容和 FTS 检索仍可使用。
 6. 删除关联投影后，可以从 Git EngineeringReference 和当前代码树重建。
+7. Rebuild 只读取 EngineeringReference locator 指定并去重的 path；大量未引用 tracked 文件不产生 Artifact。
+8. 空计划与 missing path 不触发目录遍历或全仓 fallback；missing 保持 typed diagnostic。
+9. Repository 根目录和内部子目录收敛到同一 RepositoryId；共同父目录下 sibling Repository 不被递归注册。
 
 ### 19.3 Low-tax Capture
 

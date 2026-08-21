@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Component, Path, PathBuf},
     process::Command,
@@ -11,14 +11,15 @@ use sctx_domain::{
 };
 use sha2::{Digest, Sha256};
 
-const POLICY_VERSION: &str = "tracked-head-plus-safe-tracked-modifications-v1";
+const POLICY_VERSION: &str = "planned-paths-plus-safe-tracked-modifications-v2";
+/// Global hard bound for one explicit Repository scan plan.
+pub const MAX_REPOSITORY_SCAN_PLAN_PATHS: usize = 10_000;
 
 /// Exact source policy used for a `RepositorySnapshot`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SnapshotSourcePolicy {
-    /// Enumerate Git tracked files; read safe current bytes for tracked modifications;
-    /// exclude untracked and deleted files.
-    TrackedHeadWithSafeTrackedModifications,
+    /// Read only explicit planned tracked paths and their safe current modifications.
+    PlannedPathsWithSafeTrackedModifications,
 }
 
 /// Which tracked source supplied one observation.
@@ -61,7 +62,8 @@ pub struct SnapshotArtifact {
 /// Why one tracked path did not enter the source snapshot.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum SkippedFileReason {
-    Deleted,
+    Missing,
+    Untracked,
     IgnoredDirectory,
     Generated,
     UnsupportedLanguage,
@@ -71,7 +73,6 @@ pub enum SkippedFileReason {
     Binary,
     FileLimit,
     TotalByteLimit,
-    InvalidUtf8Path,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,6 +89,7 @@ pub struct RepositorySnapshot {
     pub policy_version: &'static str,
     pub head_tree_oid: String,
     pub generation: String,
+    pub planned_paths: Vec<RepoRelativePath>,
     pub artifacts: Vec<SnapshotArtifact>,
     pub scanned_files: usize,
     pub scanned_bytes: u64,
@@ -110,6 +112,51 @@ pub struct RepositoryScannerLimits {
     pub max_files: usize,
     pub max_file_bytes: u64,
     pub max_total_bytes: u64,
+}
+
+/// Typed, deterministic, bounded set of Repository-relative paths to inspect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryScanPlan {
+    repository_id: sctx_domain::RepositoryId,
+    paths: Vec<RepoRelativePath>,
+}
+
+impl RepositoryScanPlan {
+    /// Creates a stable sorted plan and removes duplicate paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input error for an empty or globally oversized plan.
+    pub fn new(
+        repository_id: sctx_domain::RepositoryId,
+        paths: Vec<RepoRelativePath>,
+    ) -> Result<Self> {
+        let paths = paths.into_iter().collect::<BTreeSet<_>>();
+        if paths.is_empty() {
+            return Err(invalid(
+                "Repository ScanPlan must contain at least one path",
+            ));
+        }
+        if paths.len() > MAX_REPOSITORY_SCAN_PLAN_PATHS {
+            return Err(invalid(format!(
+                "Repository ScanPlan exceeds {MAX_REPOSITORY_SCAN_PLAN_PATHS} paths"
+            )));
+        }
+        Ok(Self {
+            repository_id,
+            paths: paths.into_iter().collect(),
+        })
+    }
+
+    #[must_use]
+    pub const fn repository_id(&self) -> sctx_domain::RepositoryId {
+        self.repository_id
+    }
+
+    #[must_use]
+    pub fn paths(&self) -> &[RepoRelativePath] {
+        &self.paths
+    }
 }
 
 impl Default for RepositoryScannerLimits {
@@ -149,8 +196,14 @@ impl RepositoryScanner {
         &self,
         repository: &RepositoryIdentity,
         checkout_path: &Path,
+        plan: &RepositoryScanPlan,
     ) -> Result<RepositoryScanOutcome> {
         repository.validate()?;
+        if plan.repository_id != repository.repository_id {
+            return Err(invalid(
+                "Repository ScanPlan must belong to the scanned Repository",
+            ));
+        }
         if !checkout_path.exists() {
             return Ok(RepositoryScanOutcome::Unavailable {
                 repository_id: repository.repository_id,
@@ -159,22 +212,11 @@ impl RepositoryScanner {
         }
         let root = validate_checkout_root(checkout_path)?;
         let head_tree_oid = git_text(&root, &["rev-parse", "HEAD^{tree}"])?;
-        let tracked = tracked_paths(&root)?;
-        let modified = modified_paths(&root)?;
         let mut sources = Vec::new();
         let mut skipped_files = Vec::new();
         let mut scanned_bytes = 0_u64;
-        for raw_path in tracked {
-            let relative = match String::from_utf8(raw_path) {
-                Ok(value) => value,
-                Err(error) => {
-                    skipped_files.push(SkippedFile {
-                        path: String::from_utf8_lossy(error.as_bytes()).into_owned(),
-                        reason: SkippedFileReason::InvalidUtf8Path,
-                    });
-                    continue;
-                }
-            };
+        for planned_path in &plan.paths {
+            let relative = planned_path.as_str().to_owned();
             if sources.len() >= self.limits.max_files {
                 skipped_files.push(SkippedFile {
                     path: relative,
@@ -216,7 +258,7 @@ impl RepositoryScanner {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     skipped_files.push(SkippedFile {
                         path: relative,
-                        reason: SkippedFileReason::Deleted,
+                        reason: SkippedFileReason::Missing,
                     });
                     continue;
                 }
@@ -226,6 +268,13 @@ impl RepositoryScanner {
                 skipped_files.push(SkippedFile {
                     path: relative,
                     reason: SkippedFileReason::Symlink,
+                });
+                continue;
+            }
+            if !is_tracked_path(&root, &relative)? {
+                skipped_files.push(SkippedFile {
+                    path: relative,
+                    reason: SkippedFileReason::Untracked,
                 });
                 continue;
             }
@@ -261,11 +310,7 @@ impl RepositoryScanner {
                 continue;
             }
             scanned_bytes = scanned_bytes.saturating_add(bytes.len() as u64);
-            let source_state = if modified.contains(&relative) {
-                ArtifactSourceState::TrackedWorkingModification
-            } else {
-                ArtifactSourceState::TrackedHead
-            };
+            let source_state = tracked_source_state(&root, &relative)?;
             sources.push(SourceFile {
                 path: relative,
                 language,
@@ -276,7 +321,13 @@ impl RepositoryScanner {
         }
         sources.sort_by(|left, right| left.path.cmp(&right.path));
         skipped_files.sort_by(|left, right| left.path.cmp(&right.path));
-        let generation = snapshot_generation(repository, &head_tree_oid, &sources);
+        let generation = snapshot_generation(
+            repository,
+            &head_tree_oid,
+            &plan.paths,
+            &sources,
+            &skipped_files,
+        );
         let mut builder = ArtifactBuilder::new(repository, &generation);
         for source in &sources {
             builder.scan_source(source)?;
@@ -284,10 +335,11 @@ impl RepositoryScanner {
         let artifacts = builder.finish();
         Ok(RepositoryScanOutcome::Available(RepositorySnapshot {
             repository_id: repository.repository_id,
-            source_policy: SnapshotSourcePolicy::TrackedHeadWithSafeTrackedModifications,
+            source_policy: SnapshotSourcePolicy::PlannedPathsWithSafeTrackedModifications,
             policy_version: POLICY_VERSION,
             head_tree_oid,
             generation,
+            planned_paths: plan.paths.clone(),
             artifacts,
             scanned_files: sources.len(),
             scanned_bytes,
@@ -305,8 +357,9 @@ impl RepositoryScanner {
         previous: &RepositorySnapshot,
         repository: &RepositoryIdentity,
         checkout_path: &Path,
+        plan: &RepositoryScanPlan,
     ) -> Result<RepositoryScanOutcome> {
-        let current = self.scan(repository, checkout_path)?;
+        let current = self.scan(repository, checkout_path, plan)?;
         if let RepositoryScanOutcome::Available(snapshot) = &current
             && snapshot.generation == previous.generation
         {
@@ -421,7 +474,7 @@ impl<'a> ArtifactBuilder<'a> {
             SnapshotArtifact {
                 artifact,
                 snapshot_generation: self.generation.to_owned(),
-                source_policy: SnapshotSourcePolicy::TrackedHeadWithSafeTrackedModifications,
+                source_policy: SnapshotSourcePolicy::PlannedPathsWithSafeTrackedModifications,
                 observations: vec![observation],
             },
         );
@@ -887,22 +940,34 @@ fn validate_checkout_root(path: &Path) -> Result<PathBuf> {
     Ok(root)
 }
 
-fn tracked_paths(root: &Path) -> Result<Vec<Vec<u8>>> {
-    Ok(git_bytes(root, &["ls-files", "-z"])?
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(ToOwned::to_owned)
-        .collect())
+fn is_tracked_path(root: &Path, relative: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--error-unmatch", "--", relative])
+        .output()
+        .map_err(io_error("check planned tracked path"))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(invalid("Git failed to inspect planned tracked path")),
+    }
 }
 
-fn modified_paths(root: &Path) -> Result<HashSet<String>> {
-    Ok(
-        git_bytes(root, &["diff", "--name-only", "-z", "HEAD", "--"])?
-            .split(|byte| *byte == 0)
-            .filter(|path| !path.is_empty())
-            .map(|path| String::from_utf8_lossy(path).into_owned())
-            .collect(),
-    )
+fn tracked_source_state(root: &Path, relative: &str) -> Result<ArtifactSourceState> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["diff", "--quiet", "HEAD", "--", relative])
+        .status()
+        .map_err(io_error("check planned tracked modification"))?;
+    match status.code() {
+        Some(0) => Ok(ArtifactSourceState::TrackedHead),
+        Some(1) => Ok(ArtifactSourceState::TrackedWorkingModification),
+        _ => Err(invalid(
+            "Git failed to inspect planned tracked modification",
+        )),
+    }
 }
 
 fn git_text(root: &Path, args: &[&str]) -> Result<String> {
@@ -1079,7 +1144,9 @@ fn schema_version(source: &str) -> String {
 fn snapshot_generation(
     repository: &RepositoryIdentity,
     head_tree_oid: &str,
+    planned_paths: &[RepoRelativePath],
     sources: &[SourceFile],
+    skipped_files: &[SkippedFile],
 ) -> String {
     let mut hasher = Sha256::new();
     for component in [
@@ -1088,6 +1155,9 @@ fn snapshot_generation(
         head_tree_oid.to_owned(),
     ] {
         hash_component(&mut hasher, &component);
+    }
+    for path in planned_paths {
+        hash_component(&mut hasher, path.as_str());
     }
     for source in sources {
         hash_component(&mut hasher, &source.path);
@@ -1100,7 +1170,27 @@ fn snapshot_generation(
             },
         );
     }
+    for skipped in skipped_files {
+        hash_component(&mut hasher, &skipped.path);
+        hash_component(&mut hasher, skipped_reason_name(skipped.reason));
+    }
     format!("snap_{:x}", hasher.finalize())
+}
+
+const fn skipped_reason_name(reason: SkippedFileReason) -> &'static str {
+    match reason {
+        SkippedFileReason::Missing => "missing",
+        SkippedFileReason::Untracked => "untracked",
+        SkippedFileReason::IgnoredDirectory => "ignored_directory",
+        SkippedFileReason::Generated => "generated",
+        SkippedFileReason::UnsupportedLanguage => "unsupported_language",
+        SkippedFileReason::Symlink => "symlink",
+        SkippedFileReason::EscapesRepository => "escapes_repository",
+        SkippedFileReason::Oversized => "oversized",
+        SkippedFileReason::Binary => "binary",
+        SkippedFileReason::FileLimit => "file_limit",
+        SkippedFileReason::TotalByteLimit => "total_byte_limit",
+    }
 }
 
 fn hash_component(hasher: &mut Sha256, value: &str) {

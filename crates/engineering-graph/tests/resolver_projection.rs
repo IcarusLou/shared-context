@@ -83,7 +83,7 @@ fn artifact(
     SnapshotArtifact {
         artifact,
         snapshot_generation: "snap_fixture".to_owned(),
-        source_policy: SnapshotSourcePolicy::TrackedHeadWithSafeTrackedModifications,
+        source_policy: SnapshotSourcePolicy::PlannedPathsWithSafeTrackedModifications,
         observations: (0..occurrences)
             .map(|index| ArtifactObservation {
                 path: "src/search.ts".to_owned(),
@@ -104,12 +104,19 @@ fn snapshot(
     for artifact in &mut artifacts {
         generation.clone_into(&mut artifact.snapshot_generation);
     }
+    let planned_paths = artifacts
+        .iter()
+        .map(|artifact| artifact.artifact.artifact_key.locator().path().clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     RepositoryScanOutcome::Available(RepositorySnapshot {
         repository_id: repository.repository_id,
-        source_policy: SnapshotSourcePolicy::TrackedHeadWithSafeTrackedModifications,
-        policy_version: "tracked-head-plus-safe-tracked-modifications-v1",
+        source_policy: SnapshotSourcePolicy::PlannedPathsWithSafeTrackedModifications,
+        policy_version: "planned-paths-plus-safe-tracked-modifications-v2",
         head_tree_oid: format!("tree-{generation}"),
         generation: generation.to_owned(),
+        planned_paths,
         artifacts,
         scanned_files: 1,
         scanned_bytes: 1,

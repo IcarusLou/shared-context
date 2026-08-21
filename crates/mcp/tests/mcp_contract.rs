@@ -412,6 +412,19 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
         assert_eq!(task_schema["properties"]["max_spaces"]["maximum"], 32);
         assert_eq!(task_schema["properties"]["max_spaces"]["default"], 8);
         assert_eq!(task_schema["properties"]["token_budget"]["minimum"], 256);
+        let repository_scan_schema = &tools
+            .iter()
+            .find(|tool| tool["name"] == "repository_scan")
+            .unwrap()["inputSchema"];
+        assert_eq!(
+            repository_scan_schema["required"],
+            json!(["checkout_path", "paths"])
+        );
+        assert_eq!(repository_scan_schema["properties"]["paths"]["minItems"], 1);
+        assert_eq!(
+            repository_scan_schema["properties"]["paths"]["maxItems"],
+            10_000
+        );
         let reference_schema = &tools
             .iter()
             .find(|tool| tool["name"] == "engineering_reference_record")

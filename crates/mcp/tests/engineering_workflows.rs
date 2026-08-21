@@ -148,9 +148,10 @@ fn accepted_context(root: &Path, statement: &str) -> (ContextId, RevisionId) {
     (context_id, revision_id)
 }
 
-fn scan_input(path: &Path) -> RepositoryScanInput {
+fn scan_input(path: &Path, paths: &[&str]) -> RepositoryScanInput {
     RepositoryScanInput {
         checkout_path: path.to_string_lossy().into_owned(),
+        paths: paths.iter().map(|path| (*path).to_owned()).collect(),
         declared_identity: None,
         remote_hint: None,
         max_artifacts: 500,
@@ -239,12 +240,19 @@ fn scan_record_rebuild_explain_and_task_pack_cross_two_repositories_and_a_worktr
     );
     let (context_id, revision_id) = accepted_context(&root, "alpha graph decision");
 
-    let first_scan = repository_scan_at_root(&root, &scan_input(&first)).unwrap();
-    let worktree_scan = repository_scan_at_root(&root, &scan_input(&worktree)).unwrap();
-    let second_scan = repository_scan_at_root(&root, &scan_input(&second)).unwrap();
+    let first_scan = repository_scan_at_root(
+        &root,
+        &scan_input(&first, &["src/alpha.rs", "src/alpha.rs"]),
+    )
+    .unwrap();
+    let worktree_scan =
+        repository_scan_at_root(&root, &scan_input(&worktree, &["src/alpha.rs"])).unwrap();
+    let second_scan =
+        repository_scan_at_root(&root, &scan_input(&second, &["src/beta.rs"])).unwrap();
     assert_eq!(first_scan.repository_id, worktree_scan.repository_id);
     assert_ne!(first_scan.repository_id, second_scan.repository_id);
     assert!(first_scan.repository_generation.is_some());
+    assert_eq!(first_scan.planned_path_count, 1);
     assert_eq!(
         first_scan.repository_generation,
         first_scan.artifact_generation
@@ -281,7 +289,8 @@ fn scan_record_rebuild_explain_and_task_pack_cross_two_repositories_and_a_worktr
     )
     .unwrap();
     assert!(rebuilt.stored);
-    assert_eq!(rebuilt.repositories.len(), 2);
+    assert_eq!(rebuilt.repositories.len(), 1);
+    assert_eq!(rebuilt.repositories[0].planned_path_count, 1);
     assert_eq!(rebuilt.reference_count, 1);
     assert_eq!(rebuilt.status_counts.resolved, 1);
 
@@ -300,6 +309,10 @@ fn scan_record_rebuild_explain_and_task_pack_cross_two_repositories_and_a_worktr
         path.iter()
             .any(|node| node == &format!("reference:{}", recorded.reference_id))
     }));
+
+    fs::remove_dir_all(&worktree).unwrap();
+    fs::remove_dir_all(&first).unwrap();
+    fs::remove_dir_all(&second).unwrap();
 
     let authoritative = task_intent_update_at_root(
         &root,
@@ -359,6 +372,13 @@ fn scan_record_rebuild_explain_and_task_pack_cross_two_repositories_and_a_worktr
                 .iter()
                 .any(|path| matches!(path, TaskRetrievalPath::EngineeringGraph { .. }))
     }));
+    assert!(
+        rebuilt
+            .repositories
+            .iter()
+            .all(|repository| repository.status == "available"),
+        "Task retrieval consumes the already-built Graph without rescanning now-missing Repositories"
+    );
 }
 
 #[test]
@@ -368,7 +388,18 @@ fn reference_recording_is_concurrent_private_and_rejects_unsafe_or_incomplete_in
     let repo = temporary.path().join("repo");
     init_repo(&repo, &[("src/lib.rs", "pub fn graph_target() {}\n")]);
     let (context_id, revision_id) = accepted_context(&root, "concurrent graph reference");
-    let scan = repository_scan_at_root(&root, &scan_input(&repo)).unwrap();
+    let scan = repository_scan_at_root(&root, &scan_input(&repo, &["src/lib.rs"])).unwrap();
+    assert!(
+        repository_scan_at_root(&root, &scan_input(&repo, &[])).is_err(),
+        "an empty public scan plan must not enumerate the Repository"
+    );
+    let missing = repository_scan_at_root(&root, &scan_input(&repo, &["src/missing.rs"])).unwrap();
+    assert_eq!(missing.artifact_count, 0);
+    assert_eq!(missing.scanned_files, 0);
+    assert_eq!(missing.planned_path_count, 1);
+    assert_eq!(missing.skipped_paths.len(), 1);
+    assert_eq!(missing.skipped_paths[0].path, "src/missing.rs");
+    assert_eq!(missing.skipped_paths[0].reason, "missing");
     let before_rejected = event_count(&root);
 
     assert!(
@@ -376,6 +407,7 @@ fn reference_recording_is_concurrent_private_and_rejects_unsafe_or_incomplete_in
             &root,
             &RepositoryScanInput {
                 checkout_path: "../unsafe".to_owned(),
+                paths: vec!["src/lib.rs".to_owned()],
                 declared_identity: None,
                 remote_hint: None,
                 max_artifacts: 10,
@@ -432,6 +464,7 @@ fn reference_recording_is_concurrent_private_and_rejects_unsafe_or_incomplete_in
         .map(|response| response.reference_id)
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(ids.len(), workers);
+    fs::remove_file(repo.join("src/lib.rs")).unwrap();
     let rebuilt = association_rebuild_at_root(
         &root,
         &AssociationRebuildInput {
@@ -440,6 +473,11 @@ fn reference_recording_is_concurrent_private_and_rejects_unsafe_or_incomplete_in
     )
     .unwrap();
     assert_eq!(rebuilt.reference_count, workers);
+    assert_eq!(rebuilt.repositories.len(), 1);
+    assert_eq!(rebuilt.repositories[0].planned_path_count, 1);
+    assert_eq!(rebuilt.repositories[0].status, "available");
+    assert_eq!(rebuilt.repositories[0].artifact_count, 0);
+    assert_eq!(rebuilt.status_counts.missing, workers);
 }
 
 #[test]
@@ -456,7 +494,7 @@ fn ambiguous_and_unavailable_explanations_never_choose_and_graph_failure_degrade
         )],
     );
     let (context_id, revision_id) = accepted_context(&root, "ambiguous graph reference");
-    let scan = repository_scan_at_root(&root, &scan_input(&repo)).unwrap();
+    let scan = repository_scan_at_root(&root, &scan_input(&repo, &["src/a/one.rs"])).unwrap();
     let locator = scan
         .artifacts
         .iter()

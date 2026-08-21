@@ -71,7 +71,8 @@
         "depth": 2
       }
     ],
-    "languages": ["rust", "typescript-javascript", "swift", "kotlin", "json", "yaml", "proto"],
+    "planned_paths": ["legacy/search_legacy.js", "web/ambiguous.ts", "web/search_results.ts"],
+    "languages": ["typescript-javascript"],
     "token_budget": 7000,
     "bounded_token_budget": 1100
   },

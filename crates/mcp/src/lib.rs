@@ -18,16 +18,16 @@ use std::{
 use sctx_domain::{
     Applicability, ArtifactKey, ArtifactKind, ArtifactLocator, ContextId, ContextKind,
     ContextRevisionDraft, EngineeringReferenceDraft, Error, ErrorKind, EvidenceSnapshotDraft,
-    EvidenceType, ExternalSessionLocator, ReferenceId, ReferenceRelation, RepositoryId,
-    ResolutionStatus, Result, RevisionId, SignalId, SpaceId, TaskId, TaskIntentDraft,
+    EvidenceType, ExternalSessionLocator, ReferenceId, ReferenceRelation, RepoRelativePath,
+    RepositoryId, ResolutionStatus, Result, RevisionId, SignalId, SpaceId, TaskId, TaskIntentDraft,
     TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalLifecycle,
     TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId,
 };
 use sctx_engineering_graph::{
     CandidateMatchEvidence, EngineeringProjectionStore, EngineeringReferenceResolver,
-    ProjectedEngineeringReference, RegisterRepositoryRequest, RegisteredRepository,
-    RepositoryAvailability, RepositoryRegistry, RepositoryScanOutcome, RepositoryScanner,
-    ResolvedReferenceProjection,
+    MAX_REPOSITORY_SCAN_PLAN_PATHS, ProjectedEngineeringReference, RegisterRepositoryRequest,
+    RegisteredRepository, RepositoryAvailability, RepositoryRegistry, RepositoryScanOutcome,
+    RepositoryScanPlan, RepositoryScanner, ResolvedReferenceProjection, SkippedFileReason,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
@@ -219,6 +219,7 @@ pub struct TaskContextResponse {
 #[serde(deny_unknown_fields)]
 pub struct RepositoryScanInput {
     pub checkout_path: String,
+    pub paths: Vec<String>,
     #[serde(default)]
     pub declared_identity: Option<String>,
     #[serde(default)]
@@ -247,13 +248,21 @@ pub struct RepositoryScanResponse {
     pub head_tree_oid: Option<String>,
     pub scanned_files: usize,
     pub scanned_bytes: u64,
+    pub planned_path_count: usize,
     pub artifact_count: usize,
     pub omitted_artifact_count: usize,
     pub skipped_file_count: usize,
+    pub skipped_paths: Vec<SkippedPathSummary>,
     pub artifacts: Vec<ArtifactSummary>,
     pub unavailable_reason: Option<String>,
     pub tree: String,
     pub generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SkippedPathSummary {
+    pub path: String,
+    pub reason: String,
 }
 
 /// Persistent engineering observation input. All new identities remain server-owned.
@@ -319,6 +328,7 @@ pub struct RepositoryRebuildSummary {
     pub repository_id: RepositoryId,
     pub status: String,
     pub checkout_path: Option<PathBuf>,
+    pub planned_path_count: usize,
     pub repository_generation: Option<String>,
     pub artifact_count: usize,
     pub unavailable_reason: Option<String>,
@@ -349,6 +359,11 @@ impl RepositoryScanInput {
     fn validate(&self) -> Result<()> {
         if self.checkout_path.trim().is_empty() {
             return Err(invalid("repository_scan.checkout_path must not be empty"));
+        }
+        if self.paths.is_empty() {
+            return Err(invalid(
+                "repository_scan.paths must contain at least one Repository-relative path",
+            ));
         }
         if self.max_artifacts == 0 || self.max_artifacts > MAX_SCAN_ARTIFACT_LIMIT {
             return Err(invalid(format!(
@@ -594,6 +609,11 @@ impl Runtime {
 
     fn repository_scan(&self, input: &RepositoryScanInput) -> Result<RepositoryScanResponse> {
         input.validate()?;
+        let paths = input
+            .paths
+            .iter()
+            .map(RepoRelativePath::new)
+            .collect::<Result<Vec<_>>>()?;
         let registered = self.repositories.register(&RegisterRepositoryRequest {
             checkout_path: PathBuf::from(&input.checkout_path),
             declared_identity: input.declared_identity.clone(),
@@ -615,8 +635,12 @@ impl Runtime {
                     && locator.checkout_path.exists()
             })
             .ok_or_else(|| invalid("registered Repository has no available local checkout"))?;
-        let outcome = RepositoryScanner::default()
-            .scan(&registered.repository.identity, &locator.checkout_path)?;
+        let plan = RepositoryScanPlan::new(registered.repository.identity.repository_id, paths)?;
+        let outcome = RepositoryScanner::default().scan(
+            &registered.repository.identity,
+            &locator.checkout_path,
+            &plan,
+        )?;
         let metadata = self.index.synchronize()?.metadata;
         Ok(repository_scan_response(
             &registered.repository,
@@ -682,8 +706,6 @@ impl Runtime {
             .as_ref()
             .ok_or_else(|| unavailable("Engineering projection storage is unavailable"))?;
         let snapshot = self.snapshot()?;
-        let repositories = self.repositories.list()?;
-        let (scan_outcomes, repository_summaries) = scan_registered_repositories(&repositories)?;
         let references = snapshot
             .projection
             .engineering_references
@@ -694,6 +716,9 @@ impl Runtime {
                 reference: projection.reference.clone(),
             })
             .collect::<Vec<_>>();
+        let repositories = self.repositories.list()?;
+        let (scan_outcomes, repository_summaries) =
+            scan_registered_repositories(&repositories, &references)?;
         let previous = engineering_graph.read_projection()?;
         let projection = previous.as_ref().map_or_else(
             || EngineeringReferenceResolver.resolve(&references, &scan_outcomes),
@@ -779,9 +804,18 @@ fn repository_scan_response(
                 head_tree_oid: Some(snapshot.head_tree_oid),
                 scanned_files: snapshot.scanned_files,
                 scanned_bytes: snapshot.scanned_bytes,
+                planned_path_count: snapshot.planned_paths.len(),
                 artifact_count,
                 omitted_artifact_count: artifact_count.saturating_sub(artifacts.len()),
                 skipped_file_count: snapshot.skipped_files.len(),
+                skipped_paths: snapshot
+                    .skipped_files
+                    .iter()
+                    .map(|skipped| SkippedPathSummary {
+                        path: skipped.path.clone(),
+                        reason: skipped_reason_name(skipped.reason).to_owned(),
+                    })
+                    .collect(),
                 artifacts,
                 unavailable_reason: None,
                 tree,
@@ -801,9 +835,11 @@ fn repository_scan_response(
             head_tree_oid: None,
             scanned_files: 0,
             scanned_bytes: 0,
+            planned_path_count: 0,
             artifact_count: 0,
             omitted_artifact_count: 0,
             skipped_file_count: 0,
+            skipped_paths: Vec::new(),
             artifacts: Vec::new(),
             unavailable_reason: Some(reason),
             tree,
@@ -823,17 +859,47 @@ fn artifact_summary(artifact: &sctx_engineering_graph::SnapshotArtifact) -> Arti
 
 fn scan_registered_repositories(
     repositories: &[RegisteredRepository],
+    references: &[ProjectedEngineeringReference],
 ) -> Result<(Vec<RepositoryScanOutcome>, Vec<RepositoryRebuildSummary>)> {
     let scanner = RepositoryScanner::default();
-    let mut outcomes = Vec::with_capacity(repositories.len());
-    let mut summaries = Vec::with_capacity(repositories.len());
-    for repository in repositories {
+    let repositories = repositories
+        .iter()
+        .map(|repository| (repository.identity.repository_id, repository))
+        .collect::<BTreeMap<_, _>>();
+    let mut paths_by_repository = BTreeMap::<RepositoryId, Vec<RepoRelativePath>>::new();
+    for reference in references {
+        paths_by_repository
+            .entry(reference.reference.repository_id)
+            .or_default()
+            .push(reference.reference.locator.path().clone());
+    }
+    let mut outcomes = Vec::with_capacity(paths_by_repository.len());
+    let mut summaries = Vec::with_capacity(paths_by_repository.len());
+    for (repository_id, paths) in paths_by_repository {
+        let plan = RepositoryScanPlan::new(repository_id, paths)?;
+        let Some(repository) = repositories.get(&repository_id).copied() else {
+            let reason = "Repository is not registered".to_owned();
+            outcomes.push(RepositoryScanOutcome::Unavailable {
+                repository_id,
+                reason: reason.clone(),
+            });
+            summaries.push(RepositoryRebuildSummary {
+                repository_id,
+                status: "unavailable".to_owned(),
+                checkout_path: None,
+                planned_path_count: plan.paths().len(),
+                repository_generation: None,
+                artifact_count: 0,
+                unavailable_reason: Some(reason),
+            });
+            continue;
+        };
         let locator = repository.locators.iter().find(|locator| {
             locator.availability == RepositoryAvailability::Available
                 && locator.checkout_path.exists()
         });
         let outcome = if let Some(locator) = locator {
-            scanner.scan(&repository.identity, &locator.checkout_path)?
+            scanner.scan(&repository.identity, &locator.checkout_path, &plan)?
         } else {
             RepositoryScanOutcome::Unavailable {
                 repository_id: repository.identity.repository_id,
@@ -845,6 +911,7 @@ fn scan_registered_repositories(
                 repository_id: snapshot.repository_id,
                 status: "available".to_owned(),
                 checkout_path: locator.map(|locator| locator.checkout_path.clone()),
+                planned_path_count: plan.paths().len(),
                 repository_generation: Some(snapshot.generation.clone()),
                 artifact_count: snapshot.artifacts.len(),
                 unavailable_reason: None,
@@ -856,6 +923,7 @@ fn scan_registered_repositories(
                 repository_id: *repository_id,
                 status: "unavailable".to_owned(),
                 checkout_path: None,
+                planned_path_count: plan.paths().len(),
                 repository_generation: None,
                 artifact_count: 0,
                 unavailable_reason: Some(reason.clone()),
@@ -865,6 +933,22 @@ fn scan_registered_repositories(
         summaries.push(summary);
     }
     Ok((outcomes, summaries))
+}
+
+fn skipped_reason_name(reason: SkippedFileReason) -> &'static str {
+    match reason {
+        SkippedFileReason::Missing => "missing",
+        SkippedFileReason::Untracked => "untracked",
+        SkippedFileReason::IgnoredDirectory => "ignored_directory",
+        SkippedFileReason::Generated => "generated",
+        SkippedFileReason::UnsupportedLanguage => "unsupported_language",
+        SkippedFileReason::Symlink => "symlink",
+        SkippedFileReason::EscapesRepository => "escapes_repository",
+        SkippedFileReason::Oversized => "oversized",
+        SkippedFileReason::Binary => "binary",
+        SkippedFileReason::FileLimit => "file_limit",
+        SkippedFileReason::TotalByteLimit => "total_byte_limit",
+    }
 }
 
 fn resolution_status_counts(references: &[ResolvedReferenceProjection]) -> ResolutionStatusCounts {
@@ -1853,9 +1937,15 @@ fn repository_scan_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["checkout_path"],
+        "required": ["checkout_path", "paths"],
         "properties": {
             "checkout_path": {"type": "string", "minLength": 1},
+            "paths": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_REPOSITORY_SCAN_PLAN_PATHS,
+                "items": {"type": "string", "minLength": 1}
+            },
             "declared_identity": {"type": "string", "minLength": 1},
             "remote_hint": {"type": "string", "minLength": 1},
             "max_artifacts": {"type": "integer", "minimum": 1, "maximum": MAX_SCAN_ARTIFACT_LIMIT, "default": DEFAULT_SCAN_ARTIFACT_LIMIT}

@@ -15,9 +15,10 @@ pub use resolver::{
 };
 
 pub use scanner::{
-    ArtifactObservation, ArtifactSourceState, RepositoryScanOutcome, RepositoryScanner,
-    RepositoryScannerLimits, RepositorySnapshot, SkippedFile, SkippedFileReason, SnapshotArtifact,
-    SnapshotSourcePolicy, SourceLanguage,
+    ArtifactObservation, ArtifactSourceState, MAX_REPOSITORY_SCAN_PLAN_PATHS,
+    RepositoryScanOutcome, RepositoryScanPlan, RepositoryScanner, RepositoryScannerLimits,
+    RepositorySnapshot, SkippedFile, SkippedFileReason, SnapshotArtifact, SnapshotSourcePolicy,
+    SourceLanguage,
 };
 
 use std::{
