@@ -137,10 +137,6 @@ fn candidate_create_is_the_unassigned_main_path_and_never_auto_injects() {
             "codex",
             "--external-session-id",
             "m1-candidate-isolation",
-            "--goal",
-            "M1 Candidate",
-            "--desired-change",
-            "retrieve confirmed Context only",
             "--token-budget",
             "1000",
         ])

@@ -17,11 +17,11 @@
 | 里程碑 | 状态 | 当前代码事实 |
 |---|---|---|
 | **M1：Task-first 领域与入口基础** | **已实现** | `TaskIntent` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；CLI/MCP 通过 `candidate_create` 创建无 Space Candidate；Candidate 不可自动注入 |
-| **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、TaskContextPack、显式 `task_context` 和 Codex 动态 Hook Session 已通过跨 crate/E2E 验收 |
+| **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、严格 `task_intent_update` 与只读 `task_context` 已通过跨 crate/E2E 验收 |
 | **M3：Engineering Graph** | **未实现** | 尚无工程对象扫描、ContextArtifactAssociation、移动/改名重解析或关系图扩展 |
 | **M4：Low-tax Capture** | **未实现** | 尚无 WorkEpisode 自动聚合、AgentCheckpoint、Candidate Builder、去重/冲突、Space 推荐或 Candidate Confirm/List/Discard |
 
-当前 `task_context` 已通过外部 Session Locator 续接本地 TaskSession，修订 TaskIntent、合并 TaskSignals，并生成可解释的多 Space TaskContextPack。受支持的 Codex PromptSubmit 已复用这条共享路径；PostToolUse 只把可证明的本地 File Hint 和结构化 Test outcome 合并到同一 Session。Cursor Prompt Hook 仍保持只可观察，依赖显式 MCP；这是 Agent 能力差异，不是第二套检索模型。非 Task 的裸 query 自动 Context Pack 入口已经删除，`context_search.space_ids` 只保留为显式探索硬过滤。当前接入不扫描代码、不解析关系图。当前 `candidate_create` 是手工、无归属的 M1 可执行入口，不等同于 M4 的自动 Capture。
+当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订权威 TaskIntent，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示；PostToolUse 仅在 ActiveTask 已存在时合并可证明的 File/Test 信号。`context_search.space_ids` 只保留为显式探索硬过滤。当前接入不扫描代码、不解析关系图。当前 `candidate_create` 是手工、无归属的 M1 可执行入口，不等同于 M4 的自动 Capture。
 
 ## 2. 背景与目标
 
@@ -770,8 +770,8 @@ token_budget:
 
 更新触发点：
 
-- 第一个 Prompt：创建 TaskSession，并用 Prompt 和已有工程信号形成 Provisional TaskIntent。
-- Agent 调用 `task_context`：提交结构化 Intent Snapshot，Runtime 校验并补强工程信号。
+- 第一次 `task_intent_update`：显式创建 TaskSession，并提交完整 Provisional 或 Grounded TaskIntent。
+- Agent 调用 `task_intent_update`：提交完整 Intent Snapshot、Task boundary、maturity、evidence refs 与 Revision CAS。
 - 后续 Prompt：修订目标、范围和约束。
 - 访问或修改关键文件：增加 Artifact Signal。
 - Diff 变化：修订受影响范围。
@@ -952,7 +952,9 @@ sctx mcp serve --client cursor|codex
 
 | Tool | 类型 | 说明 |
 |---|---|---|
-| `task_context` | 读/写本地状态 | 更新 TaskIntent 并生成多 Space TaskContextPack |
+| `task_intent_update` | 读/写本地状态 | CAS 更新 TaskIntent 并生成多 Space TaskContextPack |
+| `task_signal_supersede` | 读/写本地状态 | 按稳定 Signal ID 失效当前 Task 信号 |
+| `task_context` | 只读 | 按 external Session locator 重读已有 ActiveTask 的 TaskContextPack |
 | `task_checkpoint` | 写本地状态 | 提交结构化 Claim、Evidence Ref 和未知项 |
 | `candidate_list` | 读 | 查看当前 Task 自动生成的 Candidate |
 | `candidate_confirm` | 写知识事实 | 确认 Candidate、已有或新 Space、组织关系和初始生命周期 |
@@ -991,7 +993,7 @@ Adapter 只翻译厂商 Payload。TaskIntent、Git Diff、代码扫描、检索�
 ### 13.4 动态检索策略
 
 - SessionStart：仅注入系统能力说明；不得构造或执行空查询 Context Pack，也不注入任何知识项或假定 Space 摘要。
-- PromptSubmit：用 `(agent_kind, session_id)` 定位 Session，从 Prompt 形成无 Task ID 的 Intent Draft，并经共享 `task_context` 路径创建/更新 TaskIntent 和 TaskContextPack。
+- PromptSubmit：仅作为 PromptEnvelope 返回能力提示，不从 Prompt 文本构造 Intent 或 Signal；工作 Agent 显式调用 `task_intent_update`。
 - PostToolUse：保留 Breadcrumb，并向已存在 Session 合并 Workspace 内真实 File Hint 与可识别 Test/Check/Lint 工具的结构化 outcome；Prompt 前没有 Session 时不隐式创建，不保存原始 Tool Output、Transcript 或命令文本。
 - PreCompact：生成 Checkpoint，刷新并压缩当前最相关 Context。
 - TurnStop：固化 WorkEpisode，触发 Candidate Builder。
@@ -1218,10 +1220,10 @@ M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命�
 
 - `runtime.sqlite`、TaskSession、TaskIntent Revision 及并发线性 Head 已实现。
 - 完整 Space Intent FTS、Task 多路召回、Space 关联推断、解释路径和 Session 隔离已实现。
-- 显式 `task_context` 已按 external Session Locator 更新 Runtime，并返回固定 Task Revision 与知识 Projection 上的 TaskContextPack。
-- Codex PromptSubmit 已通过 vendor-neutral typed Task operation 接入同一 Runtime；Prompt、Workspace 和本地 Git Repository 作为 TaskSignals。
-- PostToolUse 已按 locator 合并经存在性与 Workspace 边界校验的 File Hint，以及结构化 Test outcome；后续 Prompt 能观察新的检索路径。
-- M2 跨 crate/E2E oracle 已证明无 Space 路由输入、`0/1/N` Space、多 Space FE Task、同 Workspace Session 隔离、PostTool File/Test 增量路径、安全自动注入，以及 Tree/Generation/fingerprint 一致性。
+- `task_intent_update` 按 external Session Locator 与 Revision CAS 更新 Runtime；只读 `task_context` 仅重取固定 Task Revision 与知识 Projection 上的 TaskContextPack。
+- PromptSubmit 只返回不含 Prompt 原文的 Skill/工具能力提示，不访问 Runtime 或 Search。
+- PostToolUse 已按 locator 向既有 ActiveTask 合并经存在性与 Workspace 边界校验的 File Hint，以及结构化 Test outcome；后续显式 Intent update 或只读 Context 请求可观察新的检索路径。
+- M2 跨 crate/E2E oracle 已证明严格 Intent 更新、只读 Locator 请求、无 Space 路由、`0/1/N` Space、同 Workspace Session 隔离、PostTool File/Test 增量路径，以及 Tree/Generation/fingerprint 一致性。
 - Workspace 与本地 Repository 绝对路径作为位置 observation 保留在 Session，但不参与 FTS 相关性或 Task fingerprint，避免 checkout 路径偶然形成 Space prior。
 - Cursor Prompt 仍为显式 MCP；Symbol/Diff/API/Schema 的代码扫描、解析和关系扩展属于 M3，不冒充 M2 RetrievalPath。
 

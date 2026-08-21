@@ -18,9 +18,8 @@ use std::{
 use sctx_domain::{
     Applicability, ContextId, ContextKind, ContextRevisionDraft, Error, ErrorKind,
     EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, Result, RevisionId, SignalId,
-    SpaceId, TaskId, TaskIntent, TaskIntentDraft, TaskIntentRevisionId, TaskSessionId,
-    TaskSessionSnapshot, TaskSignal, TaskSignalLifecycle, TaskSignalRecord, TaskSpaceAssociation,
-    WorkEpisodeId,
+    SpaceId, TaskId, TaskIntentDraft, TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot,
+    TaskSignal, TaskSignalLifecycle, TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
@@ -146,71 +145,25 @@ pub struct ServeOutcome {
     pub requests_handled: u64,
 }
 
-/// Caller-authored Task data accepted by the `task_context` MCP/CLI boundary.
-///
-/// Task identity is intentionally absent: the local runtime owns it. A
-/// Workspace may be supplied only as a [`TaskSignal`], never as a route.
+/// Read-only locator and output bounds accepted by `task_context`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TaskContextInput {
+pub struct TaskContextReadInput {
     pub agent_kind: String,
     pub external_session_id: String,
-    pub goal: String,
-    pub desired_change: String,
-    #[serde(default)]
-    pub in_scope: Vec<String>,
-    #[serde(default)]
-    pub out_of_scope: Vec<String>,
-    #[serde(default)]
-    pub domains: Vec<String>,
-    #[serde(default)]
-    pub platforms: Vec<String>,
-    #[serde(default)]
-    pub constraints: Vec<String>,
-    #[serde(default)]
-    pub acceptance_conditions: Vec<String>,
-    #[serde(default)]
-    pub artifacts: Vec<String>,
-    #[serde(default)]
-    pub interfaces: Vec<String>,
-    #[serde(default)]
-    pub unknowns: Vec<String>,
-    #[serde(default)]
-    pub task_signals: Vec<TaskSignal>,
     #[serde(default = "default_token_budget")]
     pub token_budget: usize,
     #[serde(default = "default_max_spaces")]
     pub max_spaces: usize,
 }
 
-impl TaskContextInput {
+impl TaskContextReadInput {
     fn locator(&self) -> Result<ExternalSessionLocator> {
         ExternalSessionLocator::new(&self.agent_kind, &self.external_session_id)
     }
 
-    fn intent(&self, task_id: TaskId) -> TaskIntent {
-        TaskIntent {
-            task_id,
-            goal: self.goal.clone(),
-            desired_change: self.desired_change.clone(),
-            in_scope: self.in_scope.clone(),
-            out_of_scope: self.out_of_scope.clone(),
-            domains: self.domains.clone(),
-            platforms: self.platforms.clone(),
-            constraints: self.constraints.clone(),
-            acceptance_conditions: self.acceptance_conditions.clone(),
-            artifacts: self.artifacts.clone(),
-            interfaces: self.interfaces.clone(),
-            unknowns: self.unknowns.clone(),
-        }
-    }
-
     fn validate(&self) -> Result<()> {
         let _locator = self.locator()?;
-        self.intent(TaskId::new()).validate()?;
-        for signal in &self.task_signals {
-            signal.validate()?;
-        }
         if self.token_budget < MIN_TASK_CONTEXT_TOKEN_BUDGET {
             return Err(invalid(format!(
                 "task_context token_budget must be at least {MIN_TASK_CONTEXT_TOKEN_BUDGET}"
@@ -326,14 +279,15 @@ impl Runtime {
         self.index.domain_snapshot()
     }
 
-    fn task_context_readonly(&self, input: &TaskContextInput) -> Result<TaskContextResponse> {
+    fn task_context_readonly(&self, input: &TaskContextReadInput) -> Result<TaskContextResponse> {
         input.validate()?;
         let locator = input.locator()?;
-        let snapshot = self.tasks.read_snapshot_by_locator(&locator)?.ok_or_else(|| {
-            invalid(
-                "legacy task_context is read-only and requires task_intent_update to establish an ActiveTask",
-            )
-        })?;
+        let snapshot = self
+            .tasks
+            .read_snapshot_by_locator(&locator)?
+            .ok_or_else(|| {
+                invalid("task_context requires task_intent_update to establish an ActiveTask")
+            })?;
         build_task_context_response(&self.index, &snapshot, input.token_budget, input.max_spaces)
     }
 
@@ -547,19 +501,6 @@ fn active_signal_records(
         .collect())
 }
 
-/// Reads the same legacy read-only Task Context path used by MCP at an explicit
-/// installation root. It never creates or updates Task Runtime state.
-///
-/// # Errors
-///
-/// Returns typed input, runtime, knowledge projection, or serialization errors.
-pub fn task_context_at_root(
-    root: impl AsRef<Path>,
-    input: &TaskContextInput,
-) -> Result<TaskContextResponse> {
-    Runtime::open(root.as_ref())?.task_context_readonly(input)
-}
-
 /// Reads a Context Pack for an already-authoritative `ActiveTask` without mutation.
 ///
 /// # Errors
@@ -567,7 +508,7 @@ pub fn task_context_at_root(
 /// Returns an input error when no strict Task Intent update established the Task.
 pub fn task_context_readonly_at_root(
     root: impl AsRef<Path>,
-    input: &TaskContextInput,
+    input: &TaskContextReadInput,
 ) -> Result<TaskContextResponse> {
     Runtime::open(root.as_ref())?.task_context_readonly(input)
 }
@@ -838,7 +779,7 @@ impl McpServer {
     }
 
     fn task_context(&self, arguments: Value) -> ToolResult {
-        let input: TaskContextInput = decode_arguments(arguments)?;
+        let input: TaskContextReadInput = decode_arguments(arguments)?;
         input.validate()?;
         let response = self
             .runtime
@@ -1182,26 +1123,14 @@ fn tools_list() -> Value {
         ),
         tool_schema(
             "task_context",
-            "Legacy read-only Context Pack for an existing authoritative ActiveTask. Use task_intent_update for all updates.",
+            "Read the Context Pack for an existing authoritative ActiveTask without changing runtime state.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["agent_kind", "external_session_id", "goal", "desired_change"],
+                "required": ["agent_kind", "external_session_id"],
                 "properties": {
                     "agent_kind": {"type": "string", "minLength": 1},
                     "external_session_id": {"type": "string", "minLength": 1},
-                    "goal": {"type": "string", "minLength": 1},
-                    "desired_change": {"type": "string", "minLength": 1},
-                    "in_scope": string_array_schema(),
-                    "out_of_scope": string_array_schema(),
-                    "domains": string_array_schema(),
-                    "platforms": string_array_schema(),
-                    "constraints": string_array_schema(),
-                    "acceptance_conditions": string_array_schema(),
-                    "artifacts": string_array_schema(),
-                    "interfaces": string_array_schema(),
-                    "unknowns": string_array_schema(),
-                    "task_signals": task_signal_array_schema(),
                     "token_budget": {"type": "integer", "minimum": MIN_TASK_CONTEXT_TOKEN_BUDGET, "default": 2000},
                     "max_spaces": {"type": "integer", "minimum": 1, "maximum": MAX_TASK_MAX_SPACES, "default": DEFAULT_TASK_MAX_SPACES}
                 }
@@ -1366,21 +1295,6 @@ fn kind_array_schema() -> Value {
 
 fn string_array_schema() -> Value {
     json!({"type": "array", "items": {"type": "string", "minLength": 1}})
-}
-
-fn task_signal_array_schema() -> Value {
-    json!({
-        "type": "array",
-        "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["kind", "content"],
-            "properties": {
-                "kind": {"type": "string", "enum": ["prompt", "workspace", "repository", "file", "symbol", "diff", "api", "schema", "test"]},
-                "content": {"type": "string", "minLength": 1}
-            }
-        }
-    })
 }
 
 fn id_schema(prefix: &str) -> Value {

@@ -17,9 +17,8 @@ use std::{
 
 use args::Options;
 use sctx_agent_adapter::{
-    AgentCapabilities, AgentTaskIntentDraft, CanonicalAgentAction, CanonicalBreadcrumbKind,
-    ResolvedAgentAction, TaskRuntimeOperation, ToolOutcome, TrustState, plan_action,
-    render_untrusted_task_context_pack,
+    AgentCapabilities, CanonicalAgentAction, CanonicalBreadcrumbKind, ResolvedAgentAction,
+    TaskRuntimeOperation, ToolOutcome, TrustState, plan_action,
 };
 use sctx_domain::{
     Applicability, ConflictParticipant, ConflictResolutionDraft, ConflictResolutionResult,
@@ -34,13 +33,8 @@ use sctx_index::{
     DomainSnapshot, IndexMetadata, ProjectionDiagnosticView, ProjectionIndex, RebuildOutcome,
 };
 use sctx_local_state::{Breadcrumb, BreadcrumbKind, CaptureStore};
-use sctx_mcp::{
-    TaskContextInput, TaskContextResponse, TaskIntentUpdateInput, TaskSignalSupersedeInput,
-};
-use sctx_search::{
-    ContextPackMode, ContextStatus, ScopeFilter, SearchEngine, SearchFilters, SearchRequest,
-    TaskContextPack,
-};
+use sctx_mcp::{TaskContextReadInput, TaskIntentUpdateInput, TaskSignalSupersedeInput};
+use sctx_search::{ContextStatus, ScopeFilter, SearchEngine, SearchFilters, SearchRequest};
 use sctx_task_runtime::TaskRuntime;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -62,7 +56,7 @@ Commands:
   candidate create
   context revise|review|publish|withdraw|get
   semantic conflict open|resolve
-  task context (read-only)|intent update|signal supersede
+  task context|intent update|signal supersede
   search
   index rebuild|status
   pending list|commit|move-aside
@@ -759,28 +753,6 @@ fn resolve_hook_action(action: CanonicalAgentAction) -> Result<ResolvedAgentActi
 
 fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<Option<String>> {
     match operation {
-        TaskRuntimeOperation::Context {
-            locator,
-            intent,
-            task_signals,
-            token_budget,
-        } => {
-            let input = task_context_input(
-                locator,
-                intent,
-                enrich_local_prompt_signals(task_signals),
-                token_budget,
-            );
-            let response = sctx_mcp::task_context_readonly_at_root(installation_root()?, &input)?;
-            let pack = render_untrusted_task_context_pack(&task_pack(response))?;
-            Ok(Some(format!(
-                concat!(
-                    "Shared Context MCP is available for task retrieval, explicit search/get, and candidate_create.\n",
-                    "{}"
-                ),
-                pack
-            )))
-        }
         TaskRuntimeOperation::MergeObservations {
             locator,
             cwd,
@@ -803,91 +775,6 @@ fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<Option<Stri
             Ok(None)
         }
     }
-}
-
-fn task_context_input(
-    locator: sctx_domain::ExternalSessionLocator,
-    intent: AgentTaskIntentDraft,
-    task_signals: Vec<TaskSignal>,
-    token_budget: usize,
-) -> TaskContextInput {
-    TaskContextInput {
-        agent_kind: locator.agent_kind,
-        external_session_id: locator.external_session_id,
-        goal: intent.goal,
-        desired_change: intent.desired_change,
-        in_scope: intent.in_scope,
-        out_of_scope: intent.out_of_scope,
-        domains: intent.domains,
-        platforms: intent.platforms,
-        constraints: intent.constraints,
-        acceptance_conditions: intent.acceptance_conditions,
-        artifacts: intent.artifacts,
-        interfaces: intent.interfaces,
-        unknowns: intent.unknowns,
-        task_signals,
-        token_budget,
-        max_spaces: sctx_search::DEFAULT_TASK_MAX_SPACES,
-    }
-}
-
-fn task_pack(response: TaskContextResponse) -> TaskContextPack {
-    TaskContextPack {
-        indexed_tree_oid: response.tree,
-        projection_generation: response.generation,
-        task_id: response.task_id,
-        task_fingerprint: response.task_fingerprint,
-        token_budget: response.token_budget,
-        estimated_tokens: response.estimated_tokens,
-        mode: ContextPackMode::AutomaticInjection,
-        associations: response.candidate_spaces,
-        items: response.items,
-        omitted: response.omitted,
-    }
-}
-
-fn enrich_local_prompt_signals(signals: Vec<TaskSignal>) -> Vec<TaskSignal> {
-    let mut normalized = Vec::new();
-    for signal in signals {
-        match signal.kind {
-            TaskSignalKind::Workspace => {
-                let path = PathBuf::from(&signal.content);
-                let Ok(path) = fs::canonicalize(path) else {
-                    continue;
-                };
-                if !path.is_dir() {
-                    continue;
-                }
-                push_signal(
-                    &mut normalized,
-                    TaskSignalKind::Workspace,
-                    &path.to_string_lossy(),
-                );
-                if let Some(repository) = git_repository_root(&path) {
-                    push_signal(
-                        &mut normalized,
-                        TaskSignalKind::Repository,
-                        &repository.to_string_lossy(),
-                    );
-                }
-            }
-            _ => push_signal(&mut normalized, signal.kind, &signal.content),
-        }
-    }
-    normalized
-}
-
-fn git_repository_root(path: &Path) -> Option<PathBuf> {
-    let output = Command::new("git")
-        .args(["-C", path.to_str()?, "rev-parse", "--show-toplevel"])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let root = String::from_utf8(output.stdout).ok()?;
-    fs::canonicalize(root.trim()).ok()
 }
 
 fn normalized_observation_signals(
@@ -1724,46 +1611,14 @@ fn run_task_context(args: &[String], json_output: bool) -> Result<()> {
         &[
             "--agent-kind",
             "--external-session-id",
-            "--goal",
-            "--desired-change",
-            "--in-scope",
-            "--out-of-scope",
-            "--domain",
-            "--platform",
-            "--constraint",
-            "--acceptance-condition",
-            "--artifact",
-            "--interface",
-            "--unknown",
-            "--task-signal-json",
             "--token-budget",
             "--max-spaces",
         ],
         &[],
     )?;
-    let task_signals = options
-        .many("--task-signal-json")
-        .into_iter()
-        .map(|value| {
-            serde_json::from_str::<TaskSignal>(value)
-                .map_err(|error| invalid(format!("invalid Task Signal JSON: {error}")))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let input = TaskContextInput {
+    let input = TaskContextReadInput {
         agent_kind: options.required("--agent-kind")?.to_owned(),
         external_session_id: options.required("--external-session-id")?.to_owned(),
-        goal: options.required("--goal")?.to_owned(),
-        desired_change: options.required("--desired-change")?.to_owned(),
-        in_scope: strings(options.many("--in-scope")),
-        out_of_scope: strings(options.many("--out-of-scope")),
-        domains: strings(options.many("--domain")),
-        platforms: strings(options.many("--platform")),
-        constraints: strings(options.many("--constraint")),
-        acceptance_conditions: strings(options.many("--acceptance-condition")),
-        artifacts: strings(options.many("--artifact")),
-        interfaces: strings(options.many("--interface")),
-        unknowns: strings(options.many("--unknown")),
-        task_signals,
         token_budget: parse_usize(
             options.optional("--token-budget")?.unwrap_or("2000"),
             "token budget",

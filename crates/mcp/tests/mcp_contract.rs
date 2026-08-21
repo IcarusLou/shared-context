@@ -14,8 +14,8 @@ use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_mcp::{
     ClientKind, DisconnectReason, ExpectedRevisionId, IntentMaturity, McpServer, TaskBoundary,
-    TaskContextInput, TaskIntentUpdateInput, TaskSignalSupersedeInput, TransportErrorKind,
-    task_context_at_root, task_intent_update_at_root, task_signal_supersede_at_root,
+    TaskContextReadInput, TaskIntentUpdateInput, TaskSignalSupersedeInput, TransportErrorKind,
+    task_context_readonly_at_root, task_intent_update_at_root, task_signal_supersede_at_root,
 };
 use sctx_task_runtime::TaskRuntime;
 use serde_json::{Value, json};
@@ -136,16 +136,10 @@ fn candidate_arguments(source_episode_id: WorkEpisodeId, statement: &str) -> Val
     })
 }
 
-fn task_arguments(agent_kind: &str, external_session_id: &str, goal: &str) -> Value {
+fn task_arguments(agent_kind: &str, external_session_id: &str) -> Value {
     json!({
         "agent_kind": agent_kind,
         "external_session_id": external_session_id,
-        "goal": goal,
-        "desired_change": "Retrieve deterministic MCP Context",
-        "in_scope": ["MCP"],
-        "domains": ["mcp"],
-        "acceptance_conditions": ["The relevant published Context is returned"],
-        "task_signals": [{"kind": "prompt", "content": goal}],
         "token_budget": 2000
     })
 }
@@ -390,31 +384,24 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
             .iter()
             .find(|tool| tool["name"] == "task_context")
             .unwrap()["inputSchema"];
-        for required in [
-            "agent_kind",
-            "external_session_id",
-            "goal",
-            "desired_change",
-        ] {
-            assert!(
-                task_schema["required"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|field| field == required)
-            );
-        }
-        assert!(task_schema["properties"].get("task_signals").is_some());
-        assert!(task_schema["properties"].get("task_id").is_none());
-        assert!(
+        assert_eq!(
+            task_schema["required"],
+            json!(["agent_kind", "external_session_id"])
+        );
+        assert_eq!(
             task_schema["properties"]
                 .as_object()
                 .unwrap()
                 .keys()
-                .all(|field| {
-                    field == "max_spaces"
-                        || (!field.contains("space") && !field.contains("workspace"))
-                })
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "agent_kind".to_owned(),
+                "external_session_id".to_owned(),
+                "max_spaces".to_owned(),
+                "token_budget".to_owned(),
+            ]
+            .into()
         );
         assert_eq!(task_schema["properties"]["max_spaces"]["minimum"], 1);
         assert_eq!(task_schema["properties"]["max_spaces"]["maximum"], 32);
@@ -484,8 +471,21 @@ fn task_context_rejects_caller_owned_identity_and_space_or_workspace_routes() {
         json!({"space_ids": [fixture.space_id]}),
         json!({"workspace": "/work/must-not-route"}),
         json!({"task_id": "tsk_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}),
+        json!({"expected_revision_id": "tir_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}),
+        json!({"goal": "must reject Intent"}),
+        json!({"desired_change": "must reject Intent"}),
+        json!({"in_scope": []}),
+        json!({"out_of_scope": []}),
+        json!({"domains": []}),
+        json!({"platforms": []}),
+        json!({"constraints": []}),
+        json!({"acceptance_conditions": []}),
+        json!({"artifacts": []}),
+        json!({"interfaces": []}),
+        json!({"unknowns": []}),
+        json!({"task_signals": []}),
     ] {
-        let mut arguments = task_arguments("codex", "route-rejection", "find task context");
+        let mut arguments = task_arguments("codex", "route-rejection");
         arguments
             .as_object_mut()
             .unwrap()
@@ -515,7 +515,7 @@ fn task_context_rejects_unsafe_budget_or_space_bounds() {
         json!({"max_spaces": 0}),
         json!({"max_spaces": 33}),
     ] {
-        let mut arguments = task_arguments("codex", "bound-rejection", "find task context");
+        let mut arguments = task_arguments("codex", "bound-rejection");
         arguments
             .as_object_mut()
             .unwrap()
@@ -537,7 +537,7 @@ fn task_context_rejects_unsafe_budget_or_space_bounds() {
 }
 
 #[test]
-fn legacy_task_context_is_read_only_for_an_authoritative_session() {
+fn task_context_read_is_stable_for_an_authoritative_session() {
     let fixture = Fixture::new();
     let authoritative = task_intent_update_at_root(
         &fixture.root,
@@ -550,22 +550,16 @@ fn legacy_task_context_is_read_only_for_an_authoritative_session() {
         ),
     )
     .unwrap();
-    let first = task_arguments("codex", "evolving-session", "verify MCP context");
-    let mut same_intent_new_signal = first.clone();
-    same_intent_new_signal["task_signals"] = json!([
-        {"kind": "prompt", "content": "verify MCP context"},
-        {"kind": "file", "content": "src/mcp.rs"}
-    ]);
-    let changed = task_arguments("codex", "evolving-session", "refine MCP context");
+    let first = task_arguments("codex", "evolving-session");
     let responses = run_session(
         &mut fixture.server(ClientKind::Codex),
         FixtureFraming::Newline,
         &[
             request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
-            tool_call(2, "task_context", first),
-            tool_call(3, "task_context", same_intent_new_signal),
-            tool_call(4, "task_context", changed.clone()),
-            tool_call(5, "task_context", changed),
+            tool_call(2, "task_context", first.clone()),
+            tool_call(3, "task_context", first.clone()),
+            tool_call(4, "task_context", first.clone()),
+            tool_call(5, "task_context", first),
         ],
     );
     let packs = responses[1..]
@@ -653,16 +647,8 @@ fn different_sessions_with_the_same_workspace_signal_remain_isolated() {
             ],
         )
         .unwrap();
-    let mut frontend = task_arguments("codex", "frontend-session", "frontend MCP context");
-    frontend["task_signals"] = json!([
-        {"kind": "workspace", "content": "/work/shared"},
-        {"kind": "file", "content": "web/Search.tsx"}
-    ]);
-    let mut backend = task_arguments("codex", "backend-session", "backend MCP context");
-    backend["task_signals"] = json!([
-        {"kind": "workspace", "content": "/work/shared"},
-        {"kind": "api", "content": "search-v2"}
-    ]);
+    let frontend = task_arguments("codex", "frontend-session");
+    let backend = task_arguments("codex", "backend-session");
     let responses = run_session(
         &mut fixture.server(ClientKind::Codex),
         FixtureFraming::Newline,
@@ -718,7 +704,7 @@ fn different_sessions_with_the_same_workspace_signal_remain_isolated() {
 }
 
 #[test]
-fn concurrent_legacy_reads_do_not_mutate_the_authoritative_task() {
+fn concurrent_task_context_reads_do_not_mutate_the_authoritative_task() {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -734,6 +720,21 @@ fn concurrent_legacy_reads_do_not_mutate_the_authoritative_task() {
         ),
     )
     .unwrap();
+    let runtime = TaskRuntime::initialize(&fixture.root).unwrap();
+    let locator = sctx_domain::ExternalSessionLocator::new("codex", "concurrent-session").unwrap();
+    let before_session = serde_json::to_vec(
+        &runtime
+            .read_external_session_by_locator(&locator)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let before_signals = serde_json::to_vec(
+        &runtime
+            .read_signal_history(created.context.task_session_id)
+            .unwrap(),
+    )
+    .unwrap();
     let worker_count = 8;
     let barrier = Arc::new(Barrier::new(worker_count));
     let root = Arc::new(fixture.root.clone());
@@ -742,14 +743,10 @@ fn concurrent_legacy_reads_do_not_mutate_the_authoritative_task() {
         let root = Arc::clone(&root);
         let barrier = Arc::clone(&barrier);
         workers.push(thread::spawn(move || {
-            let input: TaskContextInput = serde_json::from_value(task_arguments(
-                "codex",
-                "concurrent-session",
-                "concurrent MCP context",
-            ))
-            .unwrap();
+            let input: TaskContextReadInput =
+                serde_json::from_value(task_arguments("codex", "concurrent-session")).unwrap();
             barrier.wait();
-            task_context_at_root(root.as_path(), &input).unwrap()
+            task_context_readonly_at_root(root.as_path(), &input).unwrap()
         }));
     }
     let responses = workers
@@ -773,15 +770,25 @@ fn concurrent_legacy_reads_do_not_mutate_the_authoritative_task() {
             .all(|response| response.intent_revision_id == responses[0].intent_revision_id)
     );
 
-    let snapshot = TaskRuntime::initialize(root.as_path())
-        .unwrap()
-        .read_snapshot(session_id)
-        .unwrap()
-        .unwrap();
+    let snapshot = runtime.read_snapshot(session_id).unwrap().unwrap();
     assert_eq!(snapshot.intent_revisions.len(), 1);
     assert!(snapshot.task_signals.is_empty());
     assert_eq!(snapshot.task_id, created.context.task_id);
     assert!(snapshot.validate().is_ok());
+    assert_eq!(
+        serde_json::to_vec(
+            &runtime
+                .read_external_session_by_locator(&locator)
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        before_session
+    );
+    assert_eq!(
+        serde_json::to_vec(&runtime.read_signal_history(session_id).unwrap()).unwrap(),
+        before_signals
+    );
 }
 
 #[test]
@@ -799,7 +806,7 @@ fn task_context_runtime_storage_failure_is_typed() {
             tool_call(
                 2,
                 "task_context",
-                task_arguments("codex", "storage-failure", "MCP context"),
+                task_arguments("codex", "storage-failure"),
             ),
         ],
     );

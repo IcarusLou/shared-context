@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use sctx_domain::{Error, ErrorKind, ExternalSessionLocator, Result, TaskSignal};
+use sctx_domain::{Error, ErrorKind, ExternalSessionLocator, Result};
 use sctx_search::{ContextStatus, TaskContextPack};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -264,33 +264,10 @@ pub struct CanonicalBreadcrumb {
     pub file_hints: Vec<PathBuf>,
 }
 
-/// Caller-authored Task Intent content before the Runtime assigns Task identity.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentTaskIntentDraft {
-    pub goal: String,
-    pub desired_change: String,
-    pub in_scope: Vec<String>,
-    pub out_of_scope: Vec<String>,
-    pub domains: Vec<String>,
-    pub platforms: Vec<String>,
-    pub constraints: Vec<String>,
-    pub acceptance_conditions: Vec<String>,
-    pub artifacts: Vec<String>,
-    pub interfaces: Vec<String>,
-    pub unknowns: Vec<String>,
-}
-
 /// Typed local Task Runtime work planned from one canonical Agent event.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum TaskRuntimeOperation {
-    Context {
-        locator: ExternalSessionLocator,
-        intent: AgentTaskIntentDraft,
-        task_signals: Vec<TaskSignal>,
-        token_budget: usize,
-    },
     MergeObservations {
         locator: ExternalSessionLocator,
         cwd: PathBuf,

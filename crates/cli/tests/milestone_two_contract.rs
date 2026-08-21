@@ -16,8 +16,8 @@ use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::ProjectionIndex;
 use sctx_mcp::{
-    ExpectedRevisionId, IntentMaturity, TaskBoundary, TaskContextInput, TaskContextResponse,
-    TaskIntentUpdateInput, task_context_at_root, task_intent_update_at_root,
+    ExpectedRevisionId, IntentMaturity, TaskBoundary, TaskContextReadInput, TaskContextResponse,
+    TaskIntentUpdateInput, task_context_readonly_at_root, task_intent_update_at_root,
 };
 use sctx_search::{
     ContextPackMode, ContextStatus, SearchEngine, TaskContextRequest, TaskRetrievalPath,
@@ -37,6 +37,15 @@ struct MilestoneTwoFixture {
     feature_contexts: [ContextId; 4],
     unsafe_spaces: [SpaceId; 4],
     unassigned_candidate_id: String,
+}
+
+#[derive(Clone)]
+struct TaskScenario {
+    agent_kind: String,
+    external_session_id: String,
+    intent: TaskIntentDraft,
+    task_signals: Vec<TaskSignal>,
+    max_spaces: usize,
 }
 
 impl MilestoneTwoFixture {
@@ -258,37 +267,38 @@ impl MilestoneTwoFixture {
         }
     }
 
-    fn input(&self, external_session_id: &str, goal: &str) -> TaskContextInput {
-        TaskContextInput {
+    fn input(&self, external_session_id: &str, goal: &str) -> TaskScenario {
+        TaskScenario {
             agent_kind: "codex".to_owned(),
             external_session_id: external_session_id.to_owned(),
-            goal: goal.to_owned(),
-            desired_change: goal.to_owned(),
-            in_scope: Vec::new(),
-            out_of_scope: Vec::new(),
-            domains: Vec::new(),
-            platforms: Vec::new(),
-            constraints: Vec::new(),
-            acceptance_conditions: Vec::new(),
-            artifacts: Vec::new(),
-            interfaces: Vec::new(),
-            unknowns: Vec::new(),
+            intent: TaskIntentDraft {
+                goal: goal.to_owned(),
+                desired_change: goal.to_owned(),
+                in_scope: Vec::new(),
+                out_of_scope: Vec::new(),
+                domains: Vec::new(),
+                platforms: Vec::new(),
+                constraints: Vec::new(),
+                acceptance_conditions: Vec::new(),
+                artifacts: Vec::new(),
+                interfaces: Vec::new(),
+                unknowns: Vec::new(),
+            },
             task_signals: vec![TaskSignal {
                 kind: TaskSignalKind::Workspace,
                 content: self.workspace.to_string_lossy().into_owned(),
             }],
-            token_budget: 100_000,
             max_spaces: sctx_search::DEFAULT_TASK_MAX_SPACES,
         }
     }
 
-    fn feature_input(&self, external_session_id: &str) -> TaskContextInput {
+    fn feature_input(&self, external_session_id: &str) -> TaskScenario {
         let mut input = self.input(external_session_id, "quartzpageintent");
-        "quartzfeaturechange".clone_into(&mut input.desired_change);
-        input.domains = vec!["analyticsdomainconstraint".to_owned()];
-        input.platforms = vec!["fe".to_owned()];
-        input.constraints = vec!["legacyclientconstraint".to_owned()];
-        input.acceptance_conditions = vec!["impressionacceptance".to_owned()];
+        "quartzfeaturechange".clone_into(&mut input.intent.desired_change);
+        input.intent.domains = vec!["analyticsdomainconstraint".to_owned()];
+        input.intent.platforms = vec!["fe".to_owned()];
+        input.intent.constraints = vec!["legacyclientconstraint".to_owned()];
+        input.intent.acceptance_conditions = vec!["impressionacceptance".to_owned()];
         input.task_signals.extend([
             TaskSignal {
                 kind: TaskSignalKind::File,
@@ -468,11 +478,12 @@ fn response_spaces(response: &TaskContextResponse) -> BTreeSet<SpaceId> {
         .collect()
 }
 
-fn establish_task(root: &Path, input: &TaskContextInput) -> TaskContextResponse {
+fn establish_task(root: &Path, input: &TaskScenario) -> TaskContextResponse {
     let evidence_refs = input
+        .intent
         .artifacts
         .iter()
-        .chain(&input.interfaces)
+        .chain(&input.intent.interfaces)
         .cloned()
         .collect();
     let mut update = TaskIntentUpdateInput {
@@ -482,21 +493,21 @@ fn establish_task(root: &Path, input: &TaskContextInput) -> TaskContextResponse 
         expected_revision_id: ExpectedRevisionId::Null(()),
         maturity: IntentMaturity::Provisional,
         intent: TaskIntentDraft {
-            goal: input.goal.clone(),
-            desired_change: if input.desired_change == input.goal {
-                format!("Deliver {}", input.desired_change)
+            goal: input.intent.goal.clone(),
+            desired_change: if input.intent.desired_change == input.intent.goal {
+                format!("Deliver {}", input.intent.desired_change)
             } else {
-                input.desired_change.clone()
+                input.intent.desired_change.clone()
             },
-            in_scope: input.in_scope.clone(),
-            out_of_scope: input.out_of_scope.clone(),
-            domains: input.domains.clone(),
-            platforms: input.platforms.clone(),
-            constraints: input.constraints.clone(),
-            acceptance_conditions: input.acceptance_conditions.clone(),
-            artifacts: input.artifacts.clone(),
-            interfaces: input.interfaces.clone(),
-            unknowns: input.unknowns.clone(),
+            in_scope: input.intent.in_scope.clone(),
+            out_of_scope: input.intent.out_of_scope.clone(),
+            domains: input.intent.domains.clone(),
+            platforms: input.intent.platforms.clone(),
+            constraints: input.intent.constraints.clone(),
+            acceptance_conditions: input.intent.acceptance_conditions.clone(),
+            artifacts: input.intent.artifacts.clone(),
+            interfaces: input.intent.interfaces.clone(),
+            unknowns: input.intent.unknowns.clone(),
         },
         evidence_refs,
     };
@@ -592,20 +603,30 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
     let one_input = fixture.input("page-session", "quartzpageintent");
     let server_input = fixture.input("server-session", "cobaltserverintent");
     let many_input = fixture.feature_input("feature-session");
-    let serialized_input = serde_json::to_value(&many_input).unwrap();
-    assert!(
-        serialized_input.as_object().unwrap().keys().all(|key| {
-            key == "max_spaces" || (!key.contains("space") && !key.contains("workspace"))
-        }),
-        "Task Context input must not expose a caller-owned route"
-    );
-    for route in ["space_id", "space_ids", "workspace", "workspace_id"] {
+    let read_input = TaskContextReadInput {
+        agent_kind: many_input.agent_kind.clone(),
+        external_session_id: many_input.external_session_id.clone(),
+        token_budget: 2_000,
+        max_spaces: many_input.max_spaces,
+    };
+    let serialized_input = serde_json::to_value(&read_input).unwrap();
+    assert_eq!(serialized_input.as_object().unwrap().len(), 4);
+    for route in [
+        "space_id",
+        "space_ids",
+        "workspace",
+        "workspace_id",
+        "task_id",
+        "goal",
+        "desired_change",
+        "task_signals",
+    ] {
         let mut routed = serialized_input.clone();
         routed
             .as_object_mut()
             .unwrap()
             .insert(route.to_owned(), Value::String("forbidden".to_owned()));
-        assert!(serde_json::from_value::<TaskContextInput>(routed).is_err());
+        assert!(serde_json::from_value::<TaskContextReadInput>(routed).is_err());
     }
 
     let zero = establish_task(&fixture.root, &zero_input);
@@ -675,9 +696,7 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
     assert_eq!(many.tree, git_tree(fixture.store.repository()));
     assert_eq!(many.generation, metadata.projection_generation);
     assert_eq!(many.task_fingerprint.len(), 64);
-    let mut readonly_input = many_input.clone();
-    readonly_input.token_budget = 2_000;
-    let repeated = task_context_at_root(&fixture.root, &readonly_input).unwrap();
+    let repeated = task_context_readonly_at_root(&fixture.root, &read_input).unwrap();
     assert_eq!(repeated.task_session_id, many.task_session_id);
     assert_eq!(repeated.task_id, many.task_id);
     assert_eq!(repeated.intent_revision_id, many.intent_revision_id);

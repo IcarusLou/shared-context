@@ -105,10 +105,6 @@ impl Harness {
                 "codex",
                 "--external-session-id",
                 "explicit-session",
-                "--goal",
-                "explicit task",
-                "--desired-change",
-                "explicit task",
             ])
             .env("HOME", &self.home)
             .output()

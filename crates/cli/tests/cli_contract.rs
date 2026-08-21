@@ -780,10 +780,6 @@ fn candidate_create_is_unassigned_idempotent_and_absent_from_retrieval() {
         "codex",
         "--external-session-id",
         "candidate-retrieval-isolation",
-        "--goal",
-        "hidden episode discovery",
-        "--desired-change",
-        "retrieve confirmed knowledge only",
         "--token-budget",
         "1000",
     ]);
@@ -810,7 +806,7 @@ fn candidate_create_is_unassigned_idempotent_and_absent_from_retrieval() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn legacy_task_context_cli_entry_is_read_only_for_authoritative_sessions() {
+fn task_context_cli_entry_is_locator_only_and_read_only() {
     let harness = Harness::new();
     let (space_id, _) = create_space(&harness, "CLI Task Context");
     approve_publish(
@@ -848,14 +844,6 @@ fn legacy_task_context_cli_entry_is_read_only_for_authoritative_sessions() {
         "codex",
         "--external-session-id",
         "cli-session",
-        "--goal",
-        "retrieve CLI task context",
-        "--desired-change",
-        "return published CLI knowledge",
-        "--domain",
-        "cli",
-        "--task-signal-json",
-        r#"{"kind":"workspace","content":"/work/shared"}"#,
         "--token-budget",
         "2000",
         "--max-spaces",
@@ -870,14 +858,6 @@ fn legacy_task_context_cli_entry_is_read_only_for_authoritative_sessions() {
         "codex",
         "--external-session-id",
         "cli-session",
-        "--goal",
-        "refine CLI task context",
-        "--desired-change",
-        "return refined published CLI knowledge",
-        "--domain",
-        "cli",
-        "--task-signal-json",
-        r#"{"kind":"file","content":"src/main.rs"}"#,
     ]);
 
     assert_eq!(first["command"], "task.context");
@@ -909,14 +889,6 @@ fn legacy_task_context_cli_entry_is_read_only_for_authoritative_sessions() {
         "codex",
         "--external-session-id",
         "other-cli-session",
-        "--goal",
-        "retrieve CLI task context",
-        "--desired-change",
-        "return published CLI knowledge",
-        "--domain",
-        "cli",
-        "--task-signal-json",
-        r#"{"kind":"workspace","content":"/work/shared"}"#,
     ]);
     assert_ne!(
         first["data"]["task_session_id"],
@@ -931,10 +903,6 @@ fn legacy_task_context_cli_entry_is_read_only_for_authoritative_sessions() {
         "codex",
         "--external-session-id",
         "routed-cli-session",
-        "--goal",
-        "must reject routes",
-        "--desired-change",
-        "do not route",
         "--space-id",
         &space_id,
     ]);
@@ -947,10 +915,6 @@ fn legacy_task_context_cli_entry_is_read_only_for_authoritative_sessions() {
         "codex",
         "--external-session-id",
         "invalid-max-session",
-        "--goal",
-        "reject unsafe top k",
-        "--desired-change",
-        "reject unsafe top k",
         "--max-spaces",
         "33",
     ]);
@@ -1244,10 +1208,6 @@ fn lifecycle_commands_share_stable_json_tree_and_generation_envelopes() {
         "codex",
         "--external-session-id",
         "accepted-context-retrieval",
-        "--goal",
-        "stable",
-        "--desired-change",
-        "retrieve stable accepted Context",
         "--token-budget",
         "1000",
     ]);

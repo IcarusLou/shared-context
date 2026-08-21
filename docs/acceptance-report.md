@@ -15,11 +15,11 @@ This report does **not** claim M3 or M4:
 | Milestone | Status | Boundary |
 |---|---|---|
 | M1 — Task-first primitives and unassigned Candidate entry | IMPLEMENTED | Covered below |
-| M2 — Task Runtime and multi-Space retrieval | IMPLEMENTED | TaskSession persistence, association inference, typed RetrievalPaths, TaskContextPack, explicit `task_context`, and Codex dynamic Hook sessions pass one focused cross-crate/E2E oracle |
+| M2 — Task Runtime and multi-Space retrieval | IMPLEMENTED | TaskSession persistence, strict `task_intent_update`, read-only `task_context`, association inference, typed RetrievalPaths, and TaskContextPack pass focused cross-crate/E2E oracles |
 | M3 — Engineering Graph | NOT IMPLEMENTED | No Artifact scanner, Context-to-code association, resolution rebuild, or graph expansion |
 | M4 — Low-tax Capture | NOT IMPLEMENTED | No automatic WorkEpisode aggregation, Candidate Builder, Space recommendation, deduplication, or confirmation workflow |
 
-The current `task_context` tool uses the local Task Runtime and explainable multi-Space retrieval without caller routing. The old non-Task query-to-automatic-pack surface is removed. Explicit `context_search.space_ids` remains available as a hard filter for diagnosis and exploration. The current `candidate_create` tool remains a manual, unassigned M1 seam; it is not the M4 automatic Capture pipeline.
+`task_intent_update` is the only Task Intent write path. `task_context` accepts only an external Session locator and output bounds, and reads the already-authoritative ActiveTask without mutating Runtime. PromptSubmit supplies guidance rather than inferred Intent. Explicit `context_search.space_ids` remains available as a hard filter for diagnosis and exploration.
 
 M4 retains Mandatory Gate #114/#117: stable `submission_id` idempotency must be represented in Git and rebuilt into a SQLite unique index so Candidate retries neither scan all Events, depend on Git commit subjects, nor fail because of an unrelated malformed Event. M4 must also make `source_episode_id` verifiable. None of those Capture guarantees are claimed by M2.
 
@@ -31,7 +31,7 @@ M4 retains Mandatory Gate #114/#117: stable `submission_id` idempotency must be 
 | One Task accepts zero or multiple Space associations | PROVEN | `TaskSpaceAssociation::validate_collection` domain contract and the cross-crate milestone test |
 | Search request has no preferred-Space ranking input | PROVEN | `SearchRequest` contract; Search cursor/ranking contains only BM25, Evidence completeness, and stable IDs |
 | Explicit exploration can still hard-filter by Space | PROVEN | MCP contract sends `context_search.space_ids`; `SearchFilters.space_ids` is applied in SQL before ranking |
-| `task_context` owns Task identity and cannot be routed to a Space or Workspace by the caller | PROVEN | MCP schema omits Task/route identity fields and `task_context_rejects_caller_owned_identity_and_space_or_workspace_routes` verifies strict rejection |
+| `task_context` is truthful and read-only | PROVEN | MCP schema accepts only locator/budget/max fields; route, Task, Intent, Workspace and Signal fields are strictly rejected; concurrent reads preserve Task/Revision/Signal bytes |
 | Workspace cannot select or persist a Space | PROVEN | `config.toml` contains only `version` and `store`; CLI has no binding command for a Workspace; milestone test verifies both |
 | Candidate creation requires no Space | PROVEN | CLI and MCP `candidate_create` contracts reject Space fields and return an unassigned Candidate ID |
 | `candidate_create` is the Agent-facing Candidate main path | PROVEN | CLI help, MCP tool list, CLI milestone test, and MCP client fixtures |
