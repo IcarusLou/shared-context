@@ -465,7 +465,7 @@ fn session_start_and_prompt_submit_emit_capabilities_without_inferred_context() 
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_retrieval_paths() {
+fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycle() {
     let harness = Harness::new();
     let (alpha_space_id, _) = create_space(&harness, "alphaquartz");
     approve_publish(
@@ -646,35 +646,16 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_retrieval_paths
     .unwrap();
     let alpha_updated = serde_json::to_string(&alpha_updated.context).unwrap();
     let beta_updated = serde_json::to_string(&beta_updated.context).unwrap();
-    for (pack, own_context, other_context, own_file, own_test, other_file) in [
-        (
-            alpha_updated.as_str(),
-            "alphaquartz",
-            "betacobalt",
-            "src/alpha_feature.rs",
-            "AlphaContractTest succeeded",
-            "src/beta_feature.rs",
-        ),
-        (
-            beta_updated.as_str(),
-            "betacobalt",
-            "alphaquartz",
-            "src/beta_feature.rs",
-            "BetaContractTest succeeded",
-            "src/alpha_feature.rs",
-        ),
+    for (pack, own_context, other_context) in [
+        (alpha_updated.as_str(), "alphaquartz", "betacobalt"),
+        (beta_updated.as_str(), "betacobalt", "alphaquartz"),
     ] {
         assert!(pack.contains(own_context), "missing own Context: {pack}");
         assert!(
             !pack.contains(other_context),
             "cross-session Context leak: {pack}"
         );
-        assert!(pack.contains("\"source\":\"exact_task_signal\""));
-        assert!(pack.contains(own_file));
-        assert!(pack.contains(own_test));
-        assert!(pack.contains(&format!("\"kind\":\"file\",\"content\":\"{own_file}\"")));
-        assert!(pack.contains(&format!("\"kind\":\"test\",\"content\":\"{own_test}\"")));
-        assert!(!pack.contains(other_file));
+        assert!(!pack.contains("\"source\":\"engineering_graph\""));
     }
 
     let runtime = TaskRuntime::initialize(harness.root()).unwrap();

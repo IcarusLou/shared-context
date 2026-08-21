@@ -546,21 +546,6 @@ fn assert_typed_m2_path(path: &TaskRetrievalPath) {
             assert!(!dimension.is_empty());
             assert!(!value.is_empty());
         }
-        TaskRetrievalPath::ExactTaskSignal {
-            kind,
-            content,
-            matched_in: _,
-        } => {
-            assert!(matches!(
-                kind,
-                TaskSignalKind::File
-                    | TaskSignalKind::Symbol
-                    | TaskSignalKind::Api
-                    | TaskSignalKind::Schema
-                    | TaskSignalKind::Test
-            ));
-            assert!(!content.is_empty());
-        }
         TaskRetrievalPath::EngineeringGraph {
             path,
             relation_hops,
@@ -813,9 +798,13 @@ fn post_tool_file_and_test_observations_refresh_an_explicit_active_task() {
     );
     assert_eq!(initial.items.len(), 1);
     assert!(initial.items.iter().all(|item| {
-        item.retrieval_paths
-            .iter()
-            .all(|path| !matches!(path, TaskRetrievalPath::ExactTaskSignal { .. }))
+        item.retrieval_paths.iter().all(|path| {
+            !matches!(
+                path,
+                TaskRetrievalPath::EngineeringGraph { .. }
+                    | TaskRetrievalPath::GraphDiagnostic { .. }
+            )
+        })
     }));
 
     let post_tool = fixture.hook(&serde_json::json!({
@@ -846,8 +835,8 @@ fn post_tool_file_and_test_observations_refresh_an_explicit_active_task() {
     assert_ne!(updated.task_fingerprint, initial.task_fingerprint);
     assert_eq!(updated.tree, initial.tree);
     assert_eq!(updated.generation, initial.generation);
-    assert_eq!(updated.candidate_spaces.len(), 2);
-    assert_eq!(updated.items.len(), 2);
+    assert_eq!(updated.candidate_spaces.len(), 1);
+    assert_eq!(updated.items.len(), 1);
     let paths = updated
         .items
         .iter()
@@ -858,28 +847,10 @@ fn post_tool_file_and_test_observations_refresh_an_explicit_active_task() {
         .read_snapshot_by_locator(&ExternalSessionLocator::new("codex", session_id).unwrap())
         .unwrap()
         .unwrap();
-    assert!(
-        paths.iter().any(|path| {
-            matches!(
-                path,
-                TaskRetrievalPath::ExactTaskSignal {
-                    kind: TaskSignalKind::File,
-                    content,
-                    ..
-                } if content == "src/search_results_page.tsx"
-            )
-        }),
-        "updated paths: {paths:?}; signals: {:?}",
-        snapshot.task_signals
-    );
-    assert!(paths.iter().any(|path| {
-        matches!(
+    assert!(paths.iter().all(|path| {
+        !matches!(
             path,
-            TaskRetrievalPath::ExactTaskSignal {
-                kind: TaskSignalKind::Test,
-                content,
-                ..
-            } if content == "LegacyCompatibilityTest succeeded"
+            TaskRetrievalPath::EngineeringGraph { .. } | TaskRetrievalPath::GraphDiagnostic { .. }
         )
     }));
 

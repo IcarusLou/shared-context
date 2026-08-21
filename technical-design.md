@@ -10,7 +10,7 @@
 
 本项目尚未上线，本文直接定义目标模型、接口和存储结构。
 
-### 1.1 当前实现状态（Mew #145）
+### 1.1 当前实现状态（Mew #146）
 
 本文的大部分章节描述目标架构，不代表代码已经全部实现。当前里程碑边界如下：
 
@@ -18,7 +18,7 @@
 |---|---|---|
 | **M1：Task-first 领域与入口基础** | **已实现** | `TaskIntent` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；CLI/MCP 通过 `candidate_create` 创建无 Space Candidate；Candidate 不可自动注入 |
 | **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、严格 `task_intent_update` 与只读 `task_context` 已通过跨 crate/E2E 验收 |
-| **M3：Engineering Graph** | **部分实现** | Repository Registry、受限扫描、持久 Engineering Reference、可重建解析投影、Graph RetrievalPath 及 MCP/CLI 工作流已实现；阶段总验收尚未完成 |
+| **M3：Engineering Graph** | **已实现** | Repository Registry、多语言扫描、持久 Engineering Reference、可重建解析投影、ContextRelation 1–2 跳、Graph RetrievalPath 及 MCP/CLI 工作流已通过固定跨 crate/E2E oracle |
 | **M4：Low-tax Capture** | **未实现** | 尚无 WorkEpisode 自动聚合、AgentCheckpoint、Candidate Builder、去重/冲突、Space 推荐或 Candidate Confirm/List/Discard |
 
 当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订权威 TaskIntent，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示；PostToolUse 仅在 ActiveTask 已存在时合并可证明的 File/Test 信号，并刷新 canonical Git Workspace root 的 Repository Registry。显式 Graph 工具完成 scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。当前 `candidate_create` 仍是手工、无归属的 M1 入口，不等同于 M4 自动 Capture。
@@ -1228,19 +1228,59 @@ M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命�
 - 完整 Space Intent FTS、Task 多路召回、Space 关联推断、解释路径和 Session 隔离已实现。
 - `task_intent_update` 按 external Session Locator 与 Revision CAS 更新 Runtime；只读 `task_context` 仅重取固定 Task Revision 与知识 Projection 上的 TaskContextPack。
 - PromptSubmit 只返回不含 Prompt 原文的 Skill/工具能力提示，不访问 Runtime 或 Search。
-- PostToolUse 已按 locator 向既有 ActiveTask 合并经存在性与 Workspace 边界校验的 File Hint，以及结构化 Test outcome；后续显式 Intent update 或只读 Context 请求可观察新的检索路径。
-- M2 跨 crate/E2E oracle 已证明严格 Intent 更新、只读 Locator 请求、无 Space 路由、`0/1/N` Space、同 Workspace Session 隔离、PostTool File/Test 增量路径，以及 Tree/Generation/fingerprint 一致性。
+- PostToolUse 已按 locator 向既有 ActiveTask 合并经存在性与 Workspace 边界校验的 File Hint，以及结构化 Test outcome；这些 observation 改变 Task fingerprint，但不独立产生工程关联。
+- M2 跨 crate/E2E oracle 已证明严格 Intent 更新、只读 Locator 请求、无 Space 路由、`0/1/N` Space、同 Workspace Session 隔离、PostTool Signal 生命周期，以及 Tree/Generation/fingerprint 一致性。
 - Workspace 与本地 Repository 绝对路径作为位置 observation 保留在 Session，但不参与 FTS 相关性或 Task fingerprint，避免 checkout 路径偶然形成 Space prior。
 - Cursor Prompt 仍为显式 MCP；Symbol/Diff/API/Schema 的代码扫描、解析和关系扩展属于 M3，不冒充 M2 RetrievalPath。
 
-### M3：Engineering Graph — 部分实现
+### M3：Engineering Graph — 已实现
 
 - 本地 Repository Registry、同一 Git common-dir 的多 worktree 归一和不可用状态已实现。
 - 受限 tracked-source Scanner 已生成 Repository/Module/File/Symbol/API/Schema/Test Artifact 摘要，不保存或返回完整源码。
 - 持久 EngineeringReference Event、ArtifactResolution、ContextArtifactAssociation 和 generation-pinned Projection 已实现。
 - `repository_scan`、`engineering_reference_record`、`association_explain`、`association_rebuild`/diagnose 已接入 MCP/CLI；服务端拥有 Reference/Event 身份与路径。
 - Task Retrieval 已消费唯一 resolved Graph edge 和 Context Relation；歧义/不可用不自动选择，Graph 故障降级为 Context-only。
-- M3 阶段总验收、更多真实语言/仓库规模评测仍未完成。
+- 已删除 M2 的文本 TaskSignal 伪工程路径；File/Symbol/API/Schema/Test 信号只有命中同代、唯一 resolved Artifact 时才形成 Engineering Graph 语义，Intent/Context BM25 与 Scope 继续作为非 Graph fallback。
+- 固定跨 crate/E2E oracle 以手工 ID、路径和关系验证 Rust、TypeScript、JavaScript、Swift、Kotlin、JSON、OpenAPI 与 Proto；覆盖 Symbol→Requirement/Decision/Contract/Validation、File move、Symbol rename、FE API/Schema→跨端 Context、cycle/depth、歧义诊断、Repository unavailable、投影删除重建、Generation 和 Token Budget。
+- 固定 expected 位于 `tests/oracles/milestone-three-v1.json`，不得通过序列化生产结果生成或更新；只读源 Fixture 位于 `tests/fixtures/milestone-three/repository/`。
+
+#### M3 EvidenceSource 可验证契约（供延期 #136 使用）
+
+M3 只定义和验证 Evidence 来源边界，不在 `TaskIntentRevision` 中持久化 maturity 或 EvidenceSource；持久化、去重和 Capture 固化属于 M4 后的 #136 强制验收项。
+
+`task_intent_update.evidence_refs` 的后续类型化形态只能引用以下可解析来源：
+
+```text
+TaskSignalSource {
+  task_id,
+  signal_id
+}
+
+ContextEvidenceSource {
+  context_id,
+  revision_id,
+  evidence_id,
+  context_tree_oid
+}
+
+EngineeringResolutionSource {
+  reference_id,
+  repository_id,
+  artifact_key,
+  context_tree_oid,
+  artifact_generation
+}
+```
+
+验证规则：
+
+1. `TaskSignalSource` 必须属于当前 ActiveTask 且 lifecycle 为 active；superseded、其他 Task 或不存在的 Signal 不可解析。
+2. `ContextEvidenceSource` 的 Context、Revision 和 Evidence 必须在指定 Context Tree 中构成同一所有权链；任一 ID 存在但组合错误仍视为不可解析。
+3. `EngineeringResolutionSource` 必须在同一 `{context_tree_oid, artifact_generation}` 中解析为唯一 `resolved` Artifact 和 ContextArtifactAssociation；ambiguous、stale、unavailable、unresolved 或跨 Generation 目标只能作为诊断，不能使 maturity 成为 grounded。
+4. File/Symbol/API/Schema/Test 声明若以 TaskSignalSource 支撑，还必须能通过同代 Graph 形成上述唯一 Resolution；Prompt、Workspace、Repository 或 Diff 文本本身不能证明 Artifact/Interface 身份。
+5. `grounded` Revision 至少包含一个成功解析的 EvidenceSource，且每个 Artifact/Interface 声明都有来源覆盖；opaque 字符串、自由文本前缀和仅格式合法的 ID 一律不能通过。
+6. #136 实现必须将 maturity 与规范化 typed EvidenceSource 一起纳入 Revision 的持久内容、CAS 和幂等比较；完全相同的重试返回 `already_current`，不得新增 Revision。
+7. M4 新增的 WorkEpisode/Checkpoint observation 只有在定义稳定 ID、所有权、查询和固化规则后，才能新增为第四类 EvidenceSource；当前 `source_episode_id` 不能代替该契约。
 
 ### M4：Low-tax Capture — 未实现
 

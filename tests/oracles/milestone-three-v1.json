@@ -1,0 +1,464 @@
+{
+  "expected": {
+    "repository_id": "rpo_00000000-0000-4000-8000-000000003701",
+    "spaces": {
+      "requirement": "spc_00000000-0000-4000-8000-000000003101",
+      "server": "spc_00000000-0000-4000-8000-000000003102",
+      "ios": "spc_00000000-0000-4000-8000-000000003103",
+      "android": "spc_00000000-0000-4000-8000-000000003104"
+    },
+    "contexts": {
+      "decision": "ctx_00000000-0000-4000-8000-000000003201",
+      "contract": "ctx_00000000-0000-4000-8000-000000003202",
+      "ios_validation": "ctx_00000000-0000-4000-8000-000000003203",
+      "android_validation": "ctx_00000000-0000-4000-8000-000000003204",
+      "ambiguous": "ctx_00000000-0000-4000-8000-000000003205"
+    },
+    "revisions": {
+      "decision": "rev_00000000-0000-4000-8000-000000003301",
+      "contract": "rev_00000000-0000-4000-8000-000000003302",
+      "ios_validation": "rev_00000000-0000-4000-8000-000000003303",
+      "android_validation": "rev_00000000-0000-4000-8000-000000003304",
+      "ambiguous": "rev_00000000-0000-4000-8000-000000003305"
+    },
+    "references": {
+      "symbol": "ref_00000000-0000-4000-8000-000000003601",
+      "api": "ref_00000000-0000-4000-8000-000000003602",
+      "schema": "ref_00000000-0000-4000-8000-000000003603",
+      "file": "ref_00000000-0000-4000-8000-000000003604",
+      "ambiguous": "ref_00000000-0000-4000-8000-000000003605"
+    },
+    "artifacts": {
+      "symbol": {
+        "kind": "symbol",
+        "old_name": "openSearchResults",
+        "new_name": "renderSearchResults",
+        "path": "web/search_results.ts"
+      },
+      "api": {
+        "kind": "api",
+        "name": "/v2/search/client",
+        "path": "web/search_results.ts"
+      },
+      "schema": {
+        "kind": "schema",
+        "name": "SearchEnvelopeClient",
+        "path": "web/search_results.ts"
+      },
+      "file_move": {
+        "kind": "file",
+        "old_path": "legacy/search_legacy.js",
+        "new_path": "web/legacy_search_legacy.js"
+      }
+    },
+    "relations_from_symbol": [
+      {
+        "source": "ctx_00000000-0000-4000-8000-000000003201",
+        "target": "ctx_00000000-0000-4000-8000-000000003202",
+        "kind": "implements",
+        "depth": 1
+      },
+      {
+        "source": "ctx_00000000-0000-4000-8000-000000003202",
+        "target": "ctx_00000000-0000-4000-8000-000000003203",
+        "kind": "validated_by",
+        "depth": 2
+      },
+      {
+        "source": "ctx_00000000-0000-4000-8000-000000003202",
+        "target": "ctx_00000000-0000-4000-8000-000000003204",
+        "kind": "validated_by",
+        "depth": 2
+      }
+    ],
+    "languages": ["rust", "typescript-javascript", "swift", "kotlin", "json", "yaml", "proto"],
+    "token_budget": 7000,
+    "bounded_token_budget": 1100
+  },
+  "events": [
+    {
+      "schema_version": "1",
+      "event_id": "evt_00000000-0000-4000-8000-000000003001",
+      "event_type": "space.created",
+      "space_id": "spc_00000000-0000-4000-8000-000000003101",
+      "intent_revision": {
+        "revision_id": "rev_00000000-0000-4000-8000-000000003311",
+        "parent_revision_ids": [],
+        "intent": {
+          "title": "Search Results Requirement",
+          "problem": "Frontend search results must obey the cross-platform response contract",
+          "desired_outcome": "Render the search response while preserving legacy compatibility",
+          "in_scope": ["web search result rendering"],
+          "out_of_scope": ["recommendation ranking"],
+          "acceptance_conditions": ["iOS and Android validation remain satisfied"],
+          "domain_terms": ["SearchEnvelopeClient", "SearchResponseV2"]
+        }
+      }
+    },
+    {
+      "schema_version": "1",
+      "event_id": "evt_00000000-0000-4000-8000-000000003002",
+      "event_type": "space.created",
+      "space_id": "spc_00000000-0000-4000-8000-000000003102",
+      "intent_revision": {
+        "revision_id": "rev_00000000-0000-4000-8000-000000003312",
+        "parent_revision_ids": [],
+        "intent": {
+          "title": "Server Search Contract",
+          "problem": "The response schema needs stable server semantics",
+          "desired_outcome": "Expose a versioned response contract to every client",
+          "in_scope": ["search API and schema"],
+          "out_of_scope": ["frontend layout"],
+          "acceptance_conditions": ["all clients validate the response"],
+          "domain_terms": ["SearchResponseV2"]
+        }
+      }
+    },
+    {
+      "schema_version": "1",
+      "event_id": "evt_00000000-0000-4000-8000-000000003003",
+      "event_type": "space.created",
+      "space_id": "spc_00000000-0000-4000-8000-000000003103",
+      "intent_revision": {
+        "revision_id": "rev_00000000-0000-4000-8000-000000003313",
+        "parent_revision_ids": [],
+        "intent": {
+          "title": "iOS Search Validation",
+          "problem": "Old iOS clients require a stable fallback",
+          "desired_outcome": "Validate compatibility against the server response",
+          "in_scope": ["ios search compatibility"],
+          "out_of_scope": ["android rendering"],
+          "acceptance_conditions": ["legacy fallback stays valid"],
+          "domain_terms": ["iOS validation"]
+        }
+      }
+    },
+    {
+      "schema_version": "1",
+      "event_id": "evt_00000000-0000-4000-8000-000000003004",
+      "event_type": "space.created",
+      "space_id": "spc_00000000-0000-4000-8000-000000003104",
+      "intent_revision": {
+        "revision_id": "rev_00000000-0000-4000-8000-000000003314",
+        "parent_revision_ids": [],
+        "intent": {
+          "title": "Android Search Validation",
+          "problem": "Android compatibility must follow the shared contract",
+          "desired_outcome": "Validate the response on supported Android clients",
+          "in_scope": ["android search compatibility"],
+          "out_of_scope": ["ios rendering"],
+          "acceptance_conditions": ["contract validation passes"],
+          "domain_terms": ["Android validation"]
+        }
+      }
+    },
+    {
+      "schema_version": "1",
+      "event_id": "evt_00000000-0000-4000-8000-000000003011",
+      "event_type": "context.revision_added",
+      "space_id": "spc_00000000-0000-4000-8000-000000003101",
+      "context_id": "ctx_00000000-0000-4000-8000-000000003201",
+      "revision": {
+        "revision_id": "rev_00000000-0000-4000-8000-000000003301",
+        "parent_revision_ids": [],
+        "kind": "decision",
+        "topic_key": "search/frontend-rendering",
+        "statement": "The frontend renders SearchEnvelopeClient without reinterpreting server-owned fields",
+        "rationale": "Server semantics and old-client behavior must remain aligned",
+        "applicability": {"domains": ["search"], "platforms": ["fe"], "conditions": ["v2 response"]},
+        "assumptions": ["the response contract remains versioned"],
+        "recheck_when": ["SearchEnvelopeClient changes"],
+        "relations": [
+          {
+            "target_context_id": "ctx_00000000-0000-4000-8000-000000003202",
+            "kind": "implements",
+            "rationale": "The frontend decision implements the server contract",
+            "supports": ["The FE consumes the versioned response"]
+          }
+        ],
+        "evidence": [
+          {
+            "evidence_id": "evd_00000000-0000-4000-8000-000000003401",
+            "kind": "source_snapshot",
+            "supports": "The frontend Symbol consumes SearchEnvelopeClient",
+            "content": {"fixture": "web/search_results.ts", "result": "verified"},
+            "interpretation": "The decision is attached to executable frontend code",
+            "limitations": ["synthetic milestone fixture"]
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": "1",
+      "event_id": "evt_00000000-0000-4000-8000-000000003012",
+      "event_type": "context.revision_added",
+      "space_id": "spc_00000000-0000-4000-8000-000000003102",
+      "context_id": "ctx_00000000-0000-4000-8000-000000003202",
+      "revision": {
+        "revision_id": "rev_00000000-0000-4000-8000-000000003302",
+        "parent_revision_ids": [],
+        "kind": "contract",
+        "topic_key": "search/response-contract",
+        "statement": "SearchResponseV2 owns field semantics for every client",
+        "rationale": "A single server contract prevents platform-specific reinterpretation",
+        "applicability": {"domains": ["search"], "platforms": ["server"], "conditions": ["v2 response"]},
+        "assumptions": ["clients consume the versioned contract"],
+        "recheck_when": ["the API version changes"],
+        "relations": [
+          {
+            "target_context_id": "ctx_00000000-0000-4000-8000-000000003201",
+            "kind": "constrains",
+            "rationale": "The server contract constrains frontend interpretation",
+            "supports": ["The frontend consumes server-owned fields"]
+          },
+          {
+            "target_context_id": "ctx_00000000-0000-4000-8000-000000003203",
+            "kind": "validated_by",
+            "rationale": "iOS validates the response fallback",
+            "supports": ["The iOS compatibility test passes"]
+          },
+          {
+            "target_context_id": "ctx_00000000-0000-4000-8000-000000003204",
+            "kind": "validated_by",
+            "rationale": "Android validates the response contract",
+            "supports": ["The Android compatibility test passes"]
+          }
+        ],
+        "evidence": [
+          {
+            "evidence_id": "evd_00000000-0000-4000-8000-000000003402",
+            "kind": "source_snapshot",
+            "supports": "The API and schema are present in the fixture",
+            "content": {"api": "/v2/search/client", "schema": "SearchEnvelopeClient"},
+            "interpretation": "The contract has exact engineering coordinates",
+            "limitations": ["synthetic milestone fixture"]
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": "1",
+      "event_id": "evt_00000000-0000-4000-8000-000000003013",
+      "event_type": "context.revision_added",
+      "space_id": "spc_00000000-0000-4000-8000-000000003103",
+      "context_id": "ctx_00000000-0000-4000-8000-000000003203",
+      "revision": {
+        "revision_id": "rev_00000000-0000-4000-8000-000000003303",
+        "parent_revision_ids": [],
+        "kind": "validation",
+        "topic_key": "search/ios-validation",
+        "statement": "iOS preserves the legacy SearchResponseV2 fallback",
+        "rationale": "Older clients depend on a non-breaking response shape",
+        "applicability": {"domains": ["search"], "platforms": ["ios"], "conditions": ["legacy client"]},
+        "assumptions": ["the compatibility suite represents supported iOS versions"],
+        "recheck_when": ["minimum iOS version changes"],
+        "relations": [],
+        "evidence": [
+          {
+            "evidence_id": "evd_00000000-0000-4000-8000-000000003403",
+            "kind": "experiment_record",
+            "supports": "The iOS validation fixture passes",
+            "content": {"test": "testLegacySearchFallback", "result": "passed"},
+            "interpretation": "The fallback is compatible on iOS",
+            "limitations": ["synthetic milestone fixture"]
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": "1",
+      "event_id": "evt_00000000-0000-4000-8000-000000003014",
+      "event_type": "context.revision_added",
+      "space_id": "spc_00000000-0000-4000-8000-000000003104",
+      "context_id": "ctx_00000000-0000-4000-8000-000000003204",
+      "revision": {
+        "revision_id": "rev_00000000-0000-4000-8000-000000003304",
+        "parent_revision_ids": [],
+        "kind": "validation",
+        "topic_key": "search/android-validation",
+        "statement": "Android validates SearchResponseV2 without client-owned reinterpretation",
+        "rationale": "Android must share the same response semantics as other clients",
+        "applicability": {"domains": ["search"], "platforms": ["android"], "conditions": ["v2 response"]},
+        "assumptions": ["the fixture represents supported Android versions"],
+        "recheck_when": ["the Android contract adapter changes"],
+        "relations": [
+          {
+            "target_context_id": "ctx_00000000-0000-4000-8000-000000003202",
+            "kind": "related_to",
+            "rationale": "The validation remains linked to the server contract",
+            "supports": ["Both refer to SearchResponseV2"]
+          }
+        ],
+        "evidence": [
+          {
+            "evidence_id": "evd_00000000-0000-4000-8000-000000003404",
+            "kind": "experiment_record",
+            "supports": "The Android validation fixture passes",
+            "content": {"test": "legacySearchFallback", "result": "passed"},
+            "interpretation": "The shared response contract is valid on Android",
+            "limitations": ["synthetic milestone fixture"]
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": "1",
+      "event_id": "evt_00000000-0000-4000-8000-000000003015",
+      "event_type": "context.revision_added",
+      "space_id": "spc_00000000-0000-4000-8000-000000003101",
+      "context_id": "ctx_00000000-0000-4000-8000-000000003205",
+      "revision": {
+        "revision_id": "rev_00000000-0000-4000-8000-000000003305",
+        "parent_revision_ids": [],
+        "kind": "discovery",
+        "topic_key": "search/ambiguous-symbol",
+        "statement": "An ambiguous Symbol association requires explicit diagnosis",
+        "rationale": "Equal engineering evidence cannot safely choose one Artifact",
+        "applicability": {"domains": ["search"], "platforms": ["fe"], "conditions": ["diagnostic mode"]},
+        "assumptions": ["duplicate bodies can exist"],
+        "recheck_when": ["the duplicate symbols are removed"],
+        "relations": [],
+        "evidence": [
+          {
+            "evidence_id": "evd_00000000-0000-4000-8000-000000003405",
+            "kind": "source_snapshot",
+            "supports": "Two fixture symbols intentionally share semantic evidence",
+            "content": {"fixture": "web/ambiguous.ts", "candidates": 2},
+            "interpretation": "The resolver must report ambiguity",
+            "limitations": ["synthetic milestone fixture"]
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": "1",
+      "event_id": "evt_00000000-0000-4000-8000-000000003021",
+      "event_type": "context.publication_changed",
+      "space_id": "spc_00000000-0000-4000-8000-000000003101",
+      "context_id": "ctx_00000000-0000-4000-8000-000000003201",
+      "publication": {"publication_id": "pub_00000000-0000-4000-8000-000000003501", "previous_publication_ids": [], "action": "publish", "revision_id": "rev_00000000-0000-4000-8000-000000003301", "review_event_ids": []}
+    },
+    {
+      "schema_version": "1",
+      "event_id": "evt_00000000-0000-4000-8000-000000003022",
+      "event_type": "context.publication_changed",
+      "space_id": "spc_00000000-0000-4000-8000-000000003102",
+      "context_id": "ctx_00000000-0000-4000-8000-000000003202",
+      "publication": {"publication_id": "pub_00000000-0000-4000-8000-000000003502", "previous_publication_ids": [], "action": "publish", "revision_id": "rev_00000000-0000-4000-8000-000000003302", "review_event_ids": []}
+    },
+    {
+      "schema_version": "1",
+      "event_id": "evt_00000000-0000-4000-8000-000000003023",
+      "event_type": "context.publication_changed",
+      "space_id": "spc_00000000-0000-4000-8000-000000003103",
+      "context_id": "ctx_00000000-0000-4000-8000-000000003203",
+      "publication": {"publication_id": "pub_00000000-0000-4000-8000-000000003503", "previous_publication_ids": [], "action": "publish", "revision_id": "rev_00000000-0000-4000-8000-000000003303", "review_event_ids": []}
+    },
+    {
+      "schema_version": "1",
+      "event_id": "evt_00000000-0000-4000-8000-000000003024",
+      "event_type": "context.publication_changed",
+      "space_id": "spc_00000000-0000-4000-8000-000000003104",
+      "context_id": "ctx_00000000-0000-4000-8000-000000003204",
+      "publication": {"publication_id": "pub_00000000-0000-4000-8000-000000003504", "previous_publication_ids": [], "action": "publish", "revision_id": "rev_00000000-0000-4000-8000-000000003304", "review_event_ids": []}
+    },
+    {
+      "schema_version": "1",
+      "event_id": "evt_00000000-0000-4000-8000-000000003025",
+      "event_type": "context.publication_changed",
+      "space_id": "spc_00000000-0000-4000-8000-000000003101",
+      "context_id": "ctx_00000000-0000-4000-8000-000000003205",
+      "publication": {"publication_id": "pub_00000000-0000-4000-8000-000000003505", "previous_publication_ids": [], "action": "publish", "revision_id": "rev_00000000-0000-4000-8000-000000003305", "review_event_ids": []}
+    },
+    {
+      "schema_version": "1",
+      "event_id": "evt_00000000-0000-4000-8000-000000003031",
+      "event_type": "engineering_reference.recorded",
+      "context_id": "ctx_00000000-0000-4000-8000-000000003201",
+      "revision_id": "rev_00000000-0000-4000-8000-000000003301",
+      "reference": {
+        "reference_id": "ref_00000000-0000-4000-8000-000000003601",
+        "repository_id": "rpo_00000000-0000-4000-8000-000000003701",
+        "artifact_kind": "symbol",
+        "relation": "implements",
+        "locator_hints": {"module": "web", "path": "web/search_results.ts", "symbol": "openSearchResults", "language": "typescript-javascript", "api_or_schema": null, "line": 5, "commit": null},
+        "content_fingerprint": null,
+        "semantic_fingerprint": "semantic-v1:d8fdd54cded6b409e02cc25417a72bf408ba626a46f13ff563530eab1c06d38f",
+        "supports": "The frontend Symbol implements the rendering decision",
+        "limitations": ["The Symbol name may change"]
+      }
+    },
+    {
+      "schema_version": "1",
+      "event_id": "evt_00000000-0000-4000-8000-000000003032",
+      "event_type": "engineering_reference.recorded",
+      "context_id": "ctx_00000000-0000-4000-8000-000000003202",
+      "revision_id": "rev_00000000-0000-4000-8000-000000003302",
+      "reference": {
+        "reference_id": "ref_00000000-0000-4000-8000-000000003602",
+        "repository_id": "rpo_00000000-0000-4000-8000-000000003701",
+        "artifact_kind": "api",
+        "relation": "defines",
+        "locator_hints": {"module": "web", "path": "web/search_results.ts", "symbol": null, "language": "typescript-javascript", "api_or_schema": "/v2/search/client", "line": 12, "commit": null},
+        "content_fingerprint": null,
+        "semantic_fingerprint": null,
+        "supports": "The server Contract defines the client-facing API semantics",
+        "limitations": ["The local API observation is rebuildable"]
+      }
+    },
+    {
+      "schema_version": "1",
+      "event_id": "evt_00000000-0000-4000-8000-000000003033",
+      "event_type": "engineering_reference.recorded",
+      "context_id": "ctx_00000000-0000-4000-8000-000000003202",
+      "revision_id": "rev_00000000-0000-4000-8000-000000003302",
+      "reference": {
+        "reference_id": "ref_00000000-0000-4000-8000-000000003603",
+        "repository_id": "rpo_00000000-0000-4000-8000-000000003701",
+        "artifact_kind": "schema",
+        "relation": "defines",
+        "locator_hints": {"module": "web", "path": "web/search_results.ts", "symbol": null, "language": "typescript-javascript", "api_or_schema": "SearchEnvelopeClient", "line": 5, "commit": null},
+        "content_fingerprint": null,
+        "semantic_fingerprint": null,
+        "supports": "The server Contract defines the client schema semantics",
+        "limitations": ["The local schema observation is rebuildable"]
+      }
+    },
+    {
+      "schema_version": "1",
+      "event_id": "evt_00000000-0000-4000-8000-000000003034",
+      "event_type": "engineering_reference.recorded",
+      "context_id": "ctx_00000000-0000-4000-8000-000000003201",
+      "revision_id": "rev_00000000-0000-4000-8000-000000003301",
+      "reference": {
+        "reference_id": "ref_00000000-0000-4000-8000-000000003604",
+        "repository_id": "rpo_00000000-0000-4000-8000-000000003701",
+        "artifact_kind": "file",
+        "relation": "implements",
+        "locator_hints": {"module": "legacy", "path": "legacy/search_legacy.js", "symbol": null, "language": "typescript-javascript", "api_or_schema": null, "line": null, "commit": null},
+        "content_fingerprint": "sha256:fd17ed93e69b7987752e2ddf7636593e548fabb1d9cdceb508d80d93f21aa576",
+        "semantic_fingerprint": null,
+        "supports": "The legacy file implements the compatibility fallback",
+        "limitations": ["The path is only a locator hint"]
+      }
+    },
+    {
+      "schema_version": "1",
+      "event_id": "evt_00000000-0000-4000-8000-000000003035",
+      "event_type": "engineering_reference.recorded",
+      "context_id": "ctx_00000000-0000-4000-8000-000000003205",
+      "revision_id": "rev_00000000-0000-4000-8000-000000003305",
+      "reference": {
+        "reference_id": "ref_00000000-0000-4000-8000-000000003605",
+        "repository_id": "rpo_00000000-0000-4000-8000-000000003701",
+        "artifact_kind": "symbol",
+        "relation": "implements",
+        "locator_hints": {"module": null, "path": "web/ambiguous.ts", "symbol": "removedAmbiguous", "language": "typescript-javascript", "api_or_schema": null, "line": null, "commit": null},
+        "content_fingerprint": null,
+        "semantic_fingerprint": "semantic-v1:58fc37edc5c340245d8d59221c254bdbc26763b32a4196fb668ee144c02c910f",
+        "supports": "The removed Symbol intentionally resolves to equal candidates",
+        "limitations": ["Only explicit diagnostics may expose the candidates"]
+      }
+    }
+  ]
+}

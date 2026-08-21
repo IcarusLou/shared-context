@@ -1,0 +1,11 @@
+openapi: 3.1.0
+paths:
+  /v2/search:
+    get:
+      responses:
+        "200":
+          description: search response
+components:
+  schemas:
+    SearchResponseV2:
+      type: object

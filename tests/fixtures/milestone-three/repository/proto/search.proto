@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+message SearchResponseV2 {
+  repeated string items = 1;
+}
+
+service SearchService {
+  rpc Search(SearchResponseV2) returns (SearchResponseV2);
+}

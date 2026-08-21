@@ -2,23 +2,22 @@
 
 ## 当前实现边界
 
-仓库已完成 **M1：Task-first 领域与入口基础**、**M2：Task Runtime 与多 Space Retrieval**，并正在实现 M3：
+仓库已完成 **M1：Task-first 领域与入口基础**、**M2：Task Runtime 与多 Space Retrieval** 和 **M3：Engineering Graph**：
 
 - `TaskIntent` 不包含 Space 路由；Task 与 Space 的相关性由独立的 `TaskSpaceAssociation` 表达，并允许 `0..N` 个结果。
 - 不存在 Workspace-to-Space 绑定类型、全局 Active Space、对应配置或绑定命令。
 - 显式 `context_search` 可以用 `space_ids` 做硬过滤；只读 `task_context` 只接受 external Session locator、token budget 和 max spaces，不接受 Intent、Signals 或任何 Space/Workspace 路由。
 - `task_intent_update` 是 Task Intent 的唯一写入口并返回更新后的 TaskContextPack；`task_signal_supersede` 是 Signal 失效入口。
-- `TaskContextPack` 在同一 Tree/Generation 上推断 `0..N` 个 Space，且每个 Context 都链接到 Association 和 typed M2 RetrievalPath。
-- 同一 Workspace 下的 external Session 独立持有 TaskIntent 与 TaskSignals；Codex PostToolUse 的受控 File/Test observation 会改变后续检索路径。
+- `TaskContextPack` 在同一 Context Tree、Projection Generation 和可选 Artifact Generation 上推断 `0..N` 个 Space，且每个 Context 都链接到 Association 和 typed RetrievalPath。
+- 同一 Workspace 下的 external Session 独立持有 TaskIntent 与 TaskSignals；Codex PostToolUse 的受控 File/Test observation 会改变 Task fingerprint，只有当前唯一 resolved Engineering Artifact 才能形成 Graph RetrievalPath。
 - Workspace 不形成 Space prior；已有 ActiveTask 的 canonical Git Workspace root 会刷新本地 Repository Registry。
-- 受限 Scanner、持久 Engineering Reference、可重建解析投影和 Graph RetrievalPath 已通过显式 MCP/CLI 工作流接入。
+- 受限多语言 Scanner、持久 Engineering Reference、可重建解析投影、ContextRelation 1–2 跳和 Graph RetrievalPath 已通过固定 oracle 与显式 MCP/CLI 工作流验收。
 - `WorkEpisode` 和无 Space 的 `ContextCandidate` 领域类型已经存在。
 - `candidate_create` 是当前 Candidate 写入主入口；CLI 与 MCP 都生成服务端 ID，且未确认 Candidate 不参与自动注入。
 - 既有 Git Writer、事件校验、SQLite 投影、Context 生命周期、CLI/MCP、Agent Adapter、安装器和 NPM 分发能力继续作为 M1 的基础设施。
 
 以下能力**尚未实现**，不得在代码、测试报告或评审中宣称已经具备：
 
-- **M3：部分实现** — Registry、Scanner、Reference、Resolver、Projection 与 Graph Retrieval 已实现；阶段总验收和更多真实规模评测尚未完成。
 - **M4：未实现** — WorkEpisode 自动聚合、AgentCheckpoint、Candidate Builder、去重/冲突/Space 推荐和 Candidate confirm/list/discard。
 
 Cursor 与 Codex 都通过显式 `task_intent_update` 建立权威 Task；Prompt Hook 只提供能力提示。已有 ActiveTask 可通过只读 `task_context` 再取 Pack。
@@ -46,6 +45,7 @@ cargo test --workspace --locked
 cargo test --locked -p sctx-cli --test milestone_one_contract
 cargo test --locked -p sctx-mcp --test mcp_contract
 cargo test --locked -p sctx-cli --test milestone_two_contract
+cargo test --locked -p sctx-cli --test milestone_three_contract
 ```
 
 提交 `Cargo.lock`，确保 CLI workspace 的本地与 CI 构建使用相同依赖解析结果。
@@ -60,7 +60,7 @@ cargo test --locked -p sctx-cli --test milestone_two_contract
 | 1 | `local-state`, `event-schema`, `task-runtime` | `domain` |
 | 2 | `git-store` | `domain`, `event-schema`, `local-state` |
 | 3 | `index` | `domain`, `event-schema`, `git-store` |
-| 4 | `search` | `domain`, `index` |
+| 4 | `search` | `domain`, `engineering-graph`, `index` |
 | 5 | `mcp`, `agent-adapter` | M1 已声明的更低层 crate |
 | 6 | `adapter-cursor`, `adapter-codex` | `domain`, `agent-adapter` |
 | 7 | `installer` | Adapter、Store、Index、Search 等更低层 crate |
@@ -70,7 +70,7 @@ cargo test --locked -p sctx-cli --test milestone_two_contract
 
 ## Fixtures 与 Schema
 
-- `fixtures/` 保存跨 crate 的只读测试输入，不在测试中原地改写。
+- `fixtures/` 与 `tests/fixtures/` 保存跨 crate 的只读测试输入，不在测试中原地改写；`tests/oracles/` 保存手工编写的固定 expected，不得从生产输出反算。
 - `schemas/` 保存随源码版本控制的 Schema。
 - `npm/` 保存 NPM launcher、平台包和离线 Bundle 源码。
 
@@ -91,4 +91,4 @@ macOS 测试会为 `aarch64-apple-darwin` 和 `x86_64-apple-darwin` 构建真实
 
 ## 设计不变量
 
-实现必须遵守 [`technical-design.md`](./technical-design.md) 的核心不变量。M1/M2 契约尤其禁止重新引入 Workspace 路由、Task 请求中的 Space 路由、Space 偏好排序、裸 query 自动注入，或让未确认 Candidate 进入自动注入。
+实现必须遵守 [`technical-design.md`](./technical-design.md) 的核心不变量。M1–M3 契约尤其禁止重新引入 Workspace 路由、Task 请求中的 Space 路由、Space 偏好排序、裸 query 自动注入、文本 TaskSignal 冒充 Graph edge，或让未确认 Candidate 进入自动注入。

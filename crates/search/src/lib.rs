@@ -272,14 +272,6 @@ impl TaskContextRequest {
     }
 }
 
-/// Where an exact textual Task Signal matched. This is not a resolved code-graph edge.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskSignalMatchTarget {
-    SpaceIntent,
-    Context,
-}
-
 /// Negative Intent field that conflicts with otherwise positive association evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -362,7 +354,6 @@ pub enum TaskAssociationChannel {
     SpaceIntentBm25,
     AcceptedContextBm25,
     ExactScope,
-    ExactTaskSignal,
 }
 
 /// Explainable features and rank contribution from one RRF channel.
@@ -465,11 +456,6 @@ pub enum TaskRetrievalPath {
     ExactScope {
         dimension: String,
         value: String,
-    },
-    ExactTaskSignal {
-        kind: TaskSignalKind,
-        content: String,
-        matched_in: TaskSignalMatchTarget,
     },
 }
 
@@ -620,7 +606,7 @@ impl SearchEngine {
 
     /// Infers zero or more explainable Space associations for a Task. The inference boundary
     /// gives current, uniquely resolved Engineering Artifact associations and stable active
-    /// Context Relations higher RRF weight than Intent/Context text, scope, and textual hints.
+    /// Context Relations higher RRF weight than Intent/Context text and exact scope.
     ///
     /// Workspace signals never add a Space prior. Repository identity signals may expose an
     /// explicit unavailable-resolution diagnostic, but never add ranking or injection evidence.
@@ -1149,7 +1135,6 @@ struct ArtifactHint {
     label: String,
     kind: TaskSignalKind,
     content: String,
-    tokens: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -1219,12 +1204,10 @@ struct AssociationEvidence {
     intent_matched: bool,
     intent_conflicted: bool,
     intent_head_revision_ids: BTreeSet<RevisionId>,
-    intent_artifacts: BTreeSet<String>,
     intent_bm25: Option<f64>,
     intent_phrase_match: bool,
     intent_field_weight_points: u16,
     excluded_intent_tokens: BTreeSet<String>,
-    excluded_intent_artifacts: BTreeSet<String>,
     matched_artifacts: BTreeSet<String>,
     matched_contexts: BTreeSet<ContextId>,
     textual_contexts: BTreeSet<ContextId>,
@@ -1248,25 +1231,15 @@ struct TaskAssociationInference {
     contexts: BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>,
 }
 
-#[derive(Debug, Default)]
-struct IntentArtifactEvidence {
-    intent_conflicted: bool,
-    head_revision_ids: BTreeSet<RevisionId>,
-    positive: BTreeSet<String>,
-    excluded: BTreeSet<String>,
-}
-
 fn artifact_hints(signals: &[TaskSignal]) -> Vec<ArtifactHint> {
     signals
         .iter()
         .filter_map(|signal| {
             let kind = artifact_kind(signal.kind)?;
-            let tokens = search_tokens(&signal.content);
-            (!tokens.is_empty()).then(|| ArtifactHint {
+            (!signal.content.trim().is_empty()).then(|| ArtifactHint {
                 label: format!("{kind}:{}", signal.content),
                 kind: signal.kind,
                 content: signal.content.clone(),
-                tokens,
             })
         })
         .collect()
@@ -1293,23 +1266,6 @@ fn normalized_values(values: &[String]) -> BTreeSet<String> {
         .collect()
 }
 
-fn artifact_match_expression(hints: &[ArtifactHint]) -> Option<String> {
-    let alternatives = hints
-        .iter()
-        .filter(|hint| !hint.tokens.is_empty())
-        .map(|hint| {
-            let required = hint
-                .tokens
-                .iter()
-                .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
-                .collect::<Vec<_>>()
-                .join(" AND ");
-            format!("({required})")
-        })
-        .collect::<Vec<_>>();
-    (!alternatives.is_empty()).then(|| alternatives.join(" OR "))
-}
-
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn infer_task_space_associations(
     connection: &Connection,
@@ -1323,14 +1279,8 @@ fn infer_task_space_associations(
     mode: ContextPackMode,
 ) -> Result<TaskAssociationInference> {
     let intent_candidates = query_space_intent_candidates(connection, query_tokens, query_phrases)?;
-    let intent_artifacts = query_exact_intent_artifacts(connection, artifact_hints)?;
-    let mut contexts = query_accepted_context_evidence(
-        connection,
-        query_tokens,
-        query_phrases,
-        artifact_hints,
-        scope_targets,
-    )?;
+    let mut contexts =
+        query_accepted_context_evidence(connection, query_tokens, query_phrases, scope_targets)?;
     if let Some(graph) = engineering_graph {
         query_graph_context_evidence(
             connection,
@@ -1344,20 +1294,6 @@ fn infer_task_space_associations(
     expand_context_relation_evidence(connection, mode, &mut contexts)?;
     let mut evidence = BTreeMap::<SpaceId, AssociationEvidence>::new();
     apply_intent_evidence(&mut evidence, intent_candidates);
-    for (space_id, artifacts) in intent_artifacts {
-        let aggregate = evidence.entry(space_id).or_default();
-        aggregate.intent_conflicted |= artifacts.intent_conflicted;
-        aggregate
-            .intent_head_revision_ids
-            .extend(artifacts.head_revision_ids);
-        aggregate
-            .intent_artifacts
-            .extend(artifacts.positive.iter().cloned());
-        aggregate.matched_artifacts.extend(artifacts.positive);
-        aggregate
-            .excluded_intent_artifacts
-            .extend(artifacts.excluded);
-    }
     for ((space_id, context_id), context) in &contexts {
         let aggregate = evidence.entry(*space_id).or_default();
         aggregate.matched_contexts.insert(*context_id);
@@ -1532,86 +1468,14 @@ const fn context_field_weight(field: MatchField) -> u16 {
     }
 }
 
-fn query_exact_intent_artifacts(
-    connection: &Connection,
-    artifact_hints: &[ArtifactHint],
-) -> Result<BTreeMap<SpaceId, IntentArtifactEvidence>> {
-    let Some(match_expression) = artifact_match_expression(artifact_hints) else {
-        return Ok(BTreeMap::new());
-    };
-    let mut statement = connection
-        .prepare(
-            "SELECT space_fts.space_id, space.intent_conflicted,
-                    space_fts.title, space_fts.problem,
-                    space_fts.desired_outcome, space_fts.in_scope, space_fts.out_of_scope,
-                    space_fts.acceptance_conditions, space_fts.domain_terms
-             FROM space_fts
-             JOIN intent_head
-              ON intent_head.space_id = space_fts.space_id
-              AND intent_head.revision_id = space_fts.revision_id
-             JOIN space_projection AS space USING(space_id)
-             WHERE space_fts MATCH ?1
-             ORDER BY space_fts.space_id, space_fts.revision_id",
-        )
-        .map_err(sql_error("prepare exact Space Intent artifact matching"))?;
-    let rows = statement
-        .query_map([match_expression], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)? != 0,
-                [
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, String>(8)?,
-                ],
-            ))
-        })
-        .map_err(sql_error("read exact Space Intent artifact candidates"))?;
-    let mut matches = BTreeMap::<SpaceId, IntentArtifactEvidence>::new();
-    for row in rows {
-        let (space_id, intent_conflicted, fields) =
-            row.map_err(sql_error("collect Space Intent artifact row"))?;
-        let positive_fields = [
-            fields[0].clone(),
-            fields[1].clone(),
-            fields[2].clone(),
-            fields[3].clone(),
-            fields[5].clone(),
-            fields[6].clone(),
-        ];
-        let positive = exact_artifact_labels(&positive_fields, artifact_hints);
-        let excluded = exact_artifact_labels(&[fields[4].clone()], artifact_hints);
-        if !positive.is_empty() || !excluded.is_empty() {
-            let entry = matches.entry(parse_id(&space_id)?).or_default();
-            entry.intent_conflicted |= intent_conflicted;
-            entry.positive.extend(positive);
-            entry.excluded.extend(excluded);
-        }
-    }
-    for (space_id, evidence) in &mut matches {
-        if evidence.intent_conflicted {
-            evidence
-                .head_revision_ids
-                .extend(load_intent_head_ids(connection, *space_id)?);
-        }
-    }
-    Ok(matches)
-}
-
 fn query_accepted_context_evidence(
     connection: &Connection,
     query_tokens: &[String],
     query_phrases: &[String],
-    artifact_hints: &[ArtifactHint],
     scope_targets: &ScopeTargets,
 ) -> Result<BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>> {
     let mut evidence = BTreeMap::new();
     query_accepted_context_text(connection, query_tokens, query_phrases, &mut evidence)?;
-    query_accepted_context_artifacts(connection, artifact_hints, &mut evidence)?;
     query_accepted_context_scope(connection, scope_targets, &mut evidence)?;
     Ok(evidence)
 }
@@ -2101,57 +1965,6 @@ fn sort_dedup_paths(paths: &mut Vec<TaskRetrievalPath>) {
     paths.dedup();
 }
 
-fn query_accepted_context_artifacts(
-    connection: &Connection,
-    artifact_hints: &[ArtifactHint],
-    evidence: &mut BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>,
-) -> Result<()> {
-    let Some(match_expression) = artifact_match_expression(artifact_hints) else {
-        return Ok(());
-    };
-    let mut statement = connection
-        .prepare(&format!(
-            "SELECT revision.space_id, revision.context_id, context_fts.title,
-                    context_fts.statement, context_fts.rationale, context_fts.evidence
-             FROM context_fts
-             JOIN context_revision AS revision USING(revision_id)
-             JOIN context_item AS item USING(context_id)
-             WHERE context_fts MATCH ?1
-               AND {SAFE_ACCEPTED_CONTEXT_PREDICATE}
-             ORDER BY revision.space_id, revision.context_id"
-        ))
-        .map_err(sql_error(
-            "prepare safe accepted Context artifact association",
-        ))?;
-    let rows = statement
-        .query_map([match_expression], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                [
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                ],
-            ))
-        })
-        .map_err(sql_error("read safe accepted Context artifact association"))?;
-    for row in rows {
-        let (space_id, context_id, fields) =
-            row.map_err(sql_error("collect accepted Context artifact association"))?;
-        let labels = exact_artifact_labels(&fields, artifact_hints);
-        if !labels.is_empty() {
-            evidence
-                .entry((parse_id(&space_id)?, parse_id(&context_id)?))
-                .or_default()
-                .matched_artifacts
-                .extend(labels);
-        }
-    }
-    Ok(())
-}
-
 fn query_accepted_context_text(
     connection: &Connection,
     query_tokens: &[String],
@@ -2281,31 +2094,6 @@ fn query_accepted_context_scope(
     Ok(())
 }
 
-fn exact_artifact_labels<const N: usize>(
-    fields: &[String; N],
-    artifact_hints: &[ArtifactHint],
-) -> BTreeSet<String> {
-    artifact_hints
-        .iter()
-        .filter(|hint| {
-            fields
-                .iter()
-                .any(|field| contains_token_sequence(field, &hint.tokens))
-        })
-        .map(|hint| hint.label.clone())
-        .collect()
-}
-
-fn contains_token_sequence(text: &str, wanted: &[String]) -> bool {
-    if wanted.is_empty() {
-        return false;
-    }
-    let available = search_tokens(text);
-    available
-        .windows(wanted.len())
-        .any(|window| window == wanted)
-}
-
 fn contains_any_phrase<T, const N: usize>(fields: &[T; N], phrases: &[String]) -> bool
 where
     T: AsRef<str>,
@@ -2322,7 +2110,7 @@ const M2_FUSION_CHANNEL_WEIGHT: usize = 1;
 const GRAPH_ARTIFACT_CHANNEL_WEIGHT: usize = 9;
 const CONTEXT_RELATION_CHANNEL_WEIGHT: usize = 7;
 const FUSION_CHANNEL_WEIGHT: usize =
-    GRAPH_ARTIFACT_CHANNEL_WEIGHT + CONTEXT_RELATION_CHANNEL_WEIGHT + 4;
+    GRAPH_ARTIFACT_CHANNEL_WEIGHT + CONTEXT_RELATION_CHANNEL_WEIGHT + 3;
 const MINIMUM_ASSOCIATION_SCORE_BASIS_POINTS: u16 = 100;
 const TASK_CONTEXT_ENVELOPE_TOKEN_RESERVE: usize = 128;
 
@@ -2443,32 +2231,6 @@ fn assign_channel_features(
             .push(exact_channel_feature(
                 TaskAssociationChannel::ExactScope,
                 scope_rank,
-                strength,
-            ));
-    }
-
-    let mut signals = evidence
-        .iter()
-        .filter_map(|(space_id, value)| {
-            let strength = exact_signal_strength(&value.matched_artifacts);
-            (strength > 0).then_some((*space_id, strength))
-        })
-        .collect::<Vec<_>>();
-    signals.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    let mut previous_signal = None;
-    let mut signal_rank = 0;
-    for (offset, (space_id, strength)) in signals.into_iter().enumerate() {
-        if previous_signal != Some(strength) {
-            signal_rank = offset + 1;
-            previous_signal = Some(strength);
-        }
-        evidence
-            .get_mut(&space_id)
-            .expect("ranked Task Signal Space exists")
-            .channel_features
-            .push(exact_channel_feature(
-                TaskAssociationChannel::ExactTaskSignal,
-                signal_rank,
                 strength,
             ));
     }
@@ -2618,17 +2380,6 @@ fn token_coverage_basis_points(matched: &BTreeSet<String>, query_tokens: &[Strin
     .expect("coverage basis points fit u16")
 }
 
-fn exact_signal_strength(labels: &BTreeSet<String>) -> usize {
-    labels
-        .iter()
-        .map(|label| match label.split_once(':').map(|(kind, _)| kind) {
-            Some("api" | "schema" | "symbol") => 4,
-            Some("file" | "test") => 3,
-            _ => 1,
-        })
-        .sum()
-}
-
 #[allow(clippy::cast_possible_truncation)]
 fn scale_bm25(value: f64) -> i64 {
     (value * 1_000_000.0).round() as i64
@@ -2684,14 +2435,14 @@ fn final_score_basis_points(evidence: &AssociationEvidence) -> u16 {
 }
 
 fn has_intent_scope_conflict(evidence: &AssociationEvidence) -> bool {
-    !evidence.excluded_intent_tokens.is_empty() || !evidence.excluded_intent_artifacts.is_empty()
+    !evidence.excluded_intent_tokens.is_empty()
 }
 
 fn intent_scope_conflict(evidence: &AssociationEvidence) -> Option<IntentScopeConflictExplanation> {
     has_intent_scope_conflict(evidence).then(|| IntentScopeConflictExplanation {
         kind: IntentScopeConflictKind::ContextSpaceOutOfScope,
         matched_tokens: evidence.excluded_intent_tokens.iter().cloned().collect(),
-        matched_task_signals: evidence.excluded_intent_artifacts.iter().cloned().collect(),
+        matched_task_signals: Vec::new(),
         policy: IntentScopeConflictPolicy::PenalizeAssociation,
         score_multiplier_basis_points: SCOPE_CONFLICT_SCORE_MULTIPLIER_BASIS_POINTS,
     })
@@ -2755,17 +2506,6 @@ fn association_reasons(evidence: &AssociationEvidence) -> Vec<String> {
         reasons.push(format!(
             "Task text matched {} accepted, injection-safe Context(s)",
             evidence.textual_contexts.len()
-        ));
-    }
-    if !evidence.matched_artifacts.is_empty() {
-        reasons.push(format!(
-            "Exact textual engineering hints matched: {}",
-            evidence
-                .matched_artifacts
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
         ));
     }
     if !evidence.matched_scopes.is_empty() {
@@ -3007,7 +2747,7 @@ fn task_context_candidate_from_row(
         return Ok(None);
     };
     let context_evidence = inference.contexts.get(&(space_id, context_id));
-    let inherited = space_evidence.intent_matched || !space_evidence.intent_artifacts.is_empty();
+    let inherited = space_evidence.intent_matched;
     if context_evidence.is_none() && !inherited {
         return Ok(None);
     }
@@ -3119,39 +2859,8 @@ fn task_retrieval_paths(
                 }),
         );
     }
-    paths.extend(
-        space
-            .intent_artifacts
-            .iter()
-            .filter_map(|label| exact_signal_path(label, TaskSignalMatchTarget::SpaceIntent)),
-    );
-    if let Some(context) = context {
-        paths.extend(
-            context
-                .matched_artifacts
-                .iter()
-                .filter_map(|label| exact_signal_path(label, TaskSignalMatchTarget::Context)),
-        );
-    }
     sort_dedup_paths(&mut paths);
     paths
-}
-
-fn exact_signal_path(label: &str, matched_in: TaskSignalMatchTarget) -> Option<TaskRetrievalPath> {
-    let (kind, content) = label.split_once(':')?;
-    let kind = match kind {
-        "file" => TaskSignalKind::File,
-        "symbol" => TaskSignalKind::Symbol,
-        "api" => TaskSignalKind::Api,
-        "schema" => TaskSignalKind::Schema,
-        "test" => TaskSignalKind::Test,
-        _ => return None,
-    };
-    Some(TaskRetrievalPath::ExactTaskSignal {
-        kind,
-        content: content.to_owned(),
-        matched_in,
-    })
 }
 
 fn context_match_reason(

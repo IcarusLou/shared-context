@@ -49,8 +49,12 @@ A budgeted, automatically safe retrieval result for one TaskIntent revision and 
 _Avoid_: Space-scoped search result, manually routed Context Pack
 
 **RetrievalPath**:
-A typed explanation of how TaskIntent or a TaskSignal made one Context relevant. M2 paths describe Intent FTS, Context FTS, exact Applicability, or exact textual engineering hints; they must not claim an Engineering Graph edge that has not been resolved.
+A typed explanation of how TaskIntent or a TaskSignal made one Context relevant. Text and Applicability paths remain distinct from Engineering Graph paths; only a current unique Artifact resolution can claim an engineering edge.
 _Avoid_: opaque relevance score, inferred code relation
+
+**EvidenceSource**:
+A typed, resolvable provenance target that can ground a TaskIntent or engineering claim, such as an active TaskSignal, immutable Context Evidence, or a current unique Engineering Resolution. An opaque label or unavailable/ambiguous target is not an EvidenceSource.
+_Avoid_: evidence string, unverified reference
 
 **RepositoryIdentity**:
 A stable identity for one logical source repository across local checkouts and machines. A Workspace path, branch, or Commit is never Repository identity.

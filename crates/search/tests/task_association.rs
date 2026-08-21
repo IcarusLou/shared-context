@@ -585,8 +585,14 @@ fn fe_task_associates_requirement_protocol_compatibility_and_analytics_spaces() 
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         actual_spaces,
-        fixture.feature_spaces.into_iter().collect(),
-        "one Task must retain every independently evidenced Space"
+        [
+            fixture.feature_spaces[0],
+            fixture.feature_spaces[2],
+            fixture.feature_spaces[3],
+        ]
+        .into_iter()
+        .collect(),
+        "only Intent, Context BM25, and Scope evidence may associate without an Engineering Graph"
     );
     for association in &response.associations {
         assert!(association.score > 0.0 && association.score <= 1.0);
@@ -615,7 +621,6 @@ fn fe_task_associates_requirement_protocol_compatibility_and_analytics_spaces() 
             TaskAssociationChannel::SpaceIntentBm25,
             TaskAssociationChannel::AcceptedContextBm25,
             TaskAssociationChannel::ExactScope,
-            TaskAssociationChannel::ExactTaskSignal,
         ]
         .into_iter()
         .collect()
@@ -627,7 +632,9 @@ fn fe_task_associates_requirement_protocol_compatibility_and_analytics_spaces() 
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         matched_contexts,
-        fixture.feature_contexts.into_iter().collect()
+        [fixture.feature_contexts[1], fixture.feature_contexts[2]]
+            .into_iter()
+            .collect()
     );
     let matched_artifacts = response
         .associations
@@ -635,17 +642,9 @@ fn fe_task_associates_requirement_protocol_compatibility_and_analytics_spaces() 
         .flat_map(|association| association.matched_artifacts.iter())
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(
-        matched_artifacts,
-        [
-            "file:SearchResultsPage.tsx".to_owned(),
-            "api:SearchV2Endpoint".to_owned(),
-            "schema:SearchResponseV2".to_owned(),
-            "test:LegacyCompatibilityTest".to_owned(),
-        ]
-        .into_iter()
-        .collect(),
-        "only exact textual engineering hints may be reported"
+    assert!(
+        matched_artifacts.is_empty(),
+        "textual Task Signals must not masquerade as resolved Engineering Artifacts"
     );
 }
 
@@ -777,10 +776,7 @@ fn positive_and_out_of_scope_matches_keep_one_penalized_explained_association() 
     );
     assert_eq!(explanation.score_multiplier_basis_points, 5_000);
     assert!(!explanation.matched_tokens.is_empty());
-    assert_eq!(
-        explanation.matched_task_signals,
-        vec!["symbol:LegacyRouterBoundary".to_owned()]
-    );
+    assert!(explanation.matched_task_signals.is_empty());
 
     let pack = engine
         .task_context_pack(&TaskContextRequest::automatic(
@@ -1009,11 +1005,6 @@ fn forty_space_corpus_is_rrf_ranked_top_k_bounded_and_fully_budgeted() {
             && feature.rank == 1
             && feature.bm25_micros.is_some()
     }));
-    assert!(precise_fusion.channels.iter().any(|feature| {
-        feature.channel == TaskAssociationChannel::ExactTaskSignal
-            && feature.rank == 1
-            && feature.exact_match_strength > 0
-    }));
     if let Some(generic) = first.associations.get(1) {
         assert!(first.associations[0].score > generic.score);
         let generic_fusion = generic
@@ -1148,14 +1139,20 @@ fn task_context_pack_supports_zero_one_and_many_spaces_with_explicit_m2_paths() 
             100_000,
         ))
         .unwrap();
-    assert_eq!(many.associations.len(), 4);
-    assert_eq!(many.items.len(), 4);
+    assert_eq!(many.associations.len(), 3);
+    assert_eq!(many.items.len(), 3);
     assert_eq!(
         many.items
             .iter()
             .map(|item| item.context.context_id)
             .collect::<std::collections::BTreeSet<_>>(),
-        fixture.pack_contexts.into_iter().collect()
+        [
+            fixture.pack_contexts[0],
+            fixture.pack_contexts[2],
+            fixture.pack_contexts[3],
+        ]
+        .into_iter()
+        .collect()
     );
     let association_spaces = many
         .associations
@@ -1191,11 +1188,14 @@ fn task_context_pack_supports_zero_one_and_many_spaces_with_explicit_m2_paths() 
             .iter()
             .any(|path| matches!(path, TaskRetrievalPath::ExactScope { .. }))
     );
-    assert!(
-        paths
-            .iter()
-            .any(|path| matches!(path, TaskRetrievalPath::ExactTaskSignal { .. }))
-    );
+    assert!(paths.iter().all(|path| {
+        matches!(
+            path,
+            TaskRetrievalPath::IntentFts { .. }
+                | TaskRetrievalPath::ContextFts { .. }
+                | TaskRetrievalPath::ExactScope { .. }
+        )
+    }));
     let metadata = fixture.index.metadata().unwrap();
     assert_eq!(many.indexed_tree_oid, metadata.indexed_tree_oid);
     assert_eq!(many.projection_generation, metadata.projection_generation);
