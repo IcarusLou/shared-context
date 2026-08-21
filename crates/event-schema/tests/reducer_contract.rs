@@ -2,9 +2,9 @@ use std::{fs, path::Path, str::FromStr};
 
 use proptest::prelude::*;
 use sctx_event_schema::{
-    ArtifactKind, AutoInjectionBlocker, ConflictId, ContextGovernanceStatus, ContextId,
-    EngineeringReferenceDraft, Event, EventPayload, LocatorHints, ReducerDiagnosticCode,
-    ReducerEvent, ReducerPayload, ReferenceRelation, RepositoryId, ResolutionId, ReviewSummary,
+    ArtifactKind, ArtifactLocator, AutoInjectionBlocker, ConflictId, ContextGovernanceStatus,
+    ContextId, EngineeringReferenceDraft, Event, EventPayload, ReducerDiagnosticCode, ReducerEvent,
+    ReducerPayload, ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionId, ReviewSummary,
     RevisionId, RevisionLifecycle, SemanticConflictOpenReason, SemanticConflictStatus, SpaceId,
     reduce,
 };
@@ -163,12 +163,9 @@ fn reference_event(context_id: ContextId, revision_id: RevisionId, path: &str) -
             repository_id: RepositoryId::new(),
             artifact_kind: ArtifactKind::File,
             relation: ReferenceRelation::Implements,
-            locator_hints: Some(LocatorHints {
-                path: Some(path.to_owned()),
-                ..LocatorHints::default()
-            }),
-            content_fingerprint: None,
-            semantic_fingerprint: None,
+            locator: ArtifactLocator::File {
+                path: RepoRelativePath::new(path).unwrap(),
+            },
             supports: "The observed file implements this Context revision".to_owned(),
             limitations: vec!["The path can become stale".to_owned()],
         },
@@ -446,12 +443,10 @@ fn engineering_reference_is_permutation_invariant_and_never_changes_context_gove
     assert_eq!(
         forward.engineering_references[&reference_id]
             .reference
-            .locator_hints
-            .as_ref()
-            .unwrap()
-            .path
-            .as_deref(),
-        Some("src/path-that-does-not-exist.ts")
+            .locator
+            .path()
+            .as_str(),
+        "src/path-that-does-not-exist.ts"
     );
     assert!(forward.diagnostics.is_empty());
 }
@@ -521,10 +516,9 @@ fn invalid_reference_target_locator_and_relation_never_quarantine_context() {
     else {
         unreachable!();
     };
-    reference.locator_hints = Some(LocatorHints {
-        language: Some("rust".to_owned()),
-        ..LocatorHints::default()
-    });
+    reference.locator = ArtifactLocator::File {
+        path: serde_json::from_value(Value::String("../outside.rs".to_owned())).unwrap(),
+    };
 
     let mut events = baseline_events;
     events.extend([missing, cross_context, invalid_relation, invalid_locator]);

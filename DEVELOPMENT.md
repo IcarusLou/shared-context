@@ -11,7 +11,7 @@
 - `TaskContextPack` 在同一 Context Tree、Projection Generation 和可选 Artifact Generation 上推断 `0..N` 个 Space，且每个 Context 都链接到 Association 和 typed RetrievalPath。
 - 同一 Workspace 下的 external Session 独立持有 TaskIntent 与 TaskSignals；Codex PostToolUse 的受控 File/Test observation 会改变 Task fingerprint，只有当前唯一 resolved Engineering Artifact 才能形成 Graph RetrievalPath。
 - Workspace 不形成 Space prior；已有 ActiveTask 的 canonical Git Workspace root 会刷新本地 Repository Registry。
-- 受限多语言 Scanner、持久 Engineering Reference、可重建解析投影、ContextRelation 1–2 跳和 Graph RetrievalPath 已通过固定 oracle 与显式 MCP/CLI 工作流验收。
+- 受限多语言 Scanner、持久 Engineering Reference、kind-specific 确定性 ArtifactLocator、可重建解析投影、ContextRelation 1–2 跳和 Graph RetrievalPath 已通过固定 oracle 与显式 MCP/CLI 工作流验收；move/rename 直接变为 missing，不执行关联猜测。
 - `WorkEpisode` 和无 Space 的 `ContextCandidate` 领域类型已经存在。
 - `candidate_create` 是当前 Candidate 写入主入口；CLI 与 MCP 都生成服务端 ID，且未确认 Candidate 不参与自动注入。
 - 既有 Git Writer、事件校验、SQLite 投影、Context 生命周期、CLI/MCP、Agent Adapter、安装器和 NPM 分发能力继续作为 M1 的基础设施。

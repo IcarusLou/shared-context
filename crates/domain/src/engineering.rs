@@ -36,7 +36,6 @@ fn require_text_items(values: &[String], field: &str) -> Result<()> {
 pub struct RepositoryIdentity {
     pub repository_id: RepositoryId,
     pub canonical_name: String,
-    pub semantic_fingerprint: SemanticFingerprint,
 }
 
 impl RepositoryIdentity {
@@ -44,51 +43,16 @@ impl RepositoryIdentity {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::InvalidInput`] for empty names or fingerprints.
+    /// Returns [`ErrorKind::InvalidInput`] for an empty canonical name.
     pub fn validate(&self) -> Result<()> {
-        require_text(&self.canonical_name, "repository_identity.canonical_name")?;
-        self.semantic_fingerprint.validate()
+        require_text(&self.canonical_name, "repository_identity.canonical_name")
     }
 }
-
-macro_rules! fingerprint {
-    ($name:ident, $field:literal) => {
-        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-        #[serde(transparent)]
-        pub struct $name(String);
-
-        impl $name {
-            /// Creates a validated opaque fingerprint value.
-            ///
-            /// # Errors
-            ///
-            /// Returns [`ErrorKind::InvalidInput`] when the value is empty.
-            pub fn new(value: impl Into<String>) -> Result<Self> {
-                let value = value.into();
-                require_text(&value, $field)?;
-                Ok(Self(value))
-            }
-
-            #[must_use]
-            pub fn as_str(&self) -> &str {
-                &self.0
-            }
-
-            fn validate(&self) -> Result<()> {
-                require_text(&self.0, $field)
-            }
-        }
-    };
-}
-
-fingerprint!(ContentFingerprint, "engineering content fingerprint");
-fingerprint!(SemanticFingerprint, "engineering semantic fingerprint");
 
 /// Supported engineering object categories.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
-    Repository,
     Module,
     File,
     Symbol,
@@ -100,7 +64,6 @@ pub enum ArtifactKind {
 impl ArtifactKind {
     const fn stable_name(self) -> &'static str {
         match self {
-            Self::Repository => "repository",
             Self::Module => "module",
             Self::File => "file",
             Self::Symbol => "symbol",
@@ -111,49 +74,206 @@ impl ArtifactKind {
     }
 }
 
-/// Stable basis used to derive an `ArtifactKey`.
+/// Canonical repository-relative path used by every deterministic Artifact locator.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(tag = "basis", rename_all = "snake_case")]
-pub enum ArtifactKeyBasis {
-    Logical {
-        namespace: Option<String>,
-        logical_name: String,
+#[serde(transparent)]
+pub struct RepoRelativePath(String);
+
+impl RepoRelativePath {
+    /// Creates a canonical repository-relative path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] for absolute, empty, backslash, or
+    /// dot-segment paths.
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_repo_relative_path(&value)?;
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_repo_relative_path(&self.0)
+    }
+}
+
+fn validate_repo_relative_path(value: &str) -> Result<()> {
+    require_text(value, "artifact_locator.path")?;
+    if value.starts_with('/') || value.contains('\\') {
+        return Err(invalid(
+            "artifact_locator.path must be a canonical repository-relative path",
+        ));
+    }
+    if value
+        .split('/')
+        .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return Err(invalid(
+            "artifact_locator.path must not contain empty or dot segments",
+        ));
+    }
+    Ok(())
+}
+
+/// Kind-specific, deterministic coordinates for an Artifact inside one Repository.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(tag = "locator_kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ArtifactLocator {
+    File {
+        path: RepoRelativePath,
     },
-    ContentFingerprint {
-        fingerprint: ContentFingerprint,
+    Module {
+        path: RepoRelativePath,
     },
-    SemanticFingerprint {
-        fingerprint: SemanticFingerprint,
+    Api {
+        path: RepoRelativePath,
+        protocol: String,
+        operation: String,
+        normalized_route: String,
+    },
+    Schema {
+        path: RepoRelativePath,
+        namespace: String,
+        version: String,
+        qualified_name: String,
+    },
+    Symbol {
+        path: RepoRelativePath,
+        language: String,
+        module: String,
+        enclosing_type: Option<String>,
+        symbol_name: String,
+        signature: String,
+    },
+    Test {
+        path: RepoRelativePath,
+        qualified_test_name: String,
     },
 }
 
-impl ArtifactKeyBasis {
-    fn validate(&self) -> Result<()> {
+impl ArtifactLocator {
+    #[must_use]
+    pub const fn kind(&self) -> ArtifactKind {
         match self {
-            Self::Logical {
-                namespace,
-                logical_name,
-            } => {
-                validate_optional_text(namespace.as_ref(), "artifact_key.namespace")?;
-                require_text(logical_name, "artifact_key.logical_name")
-            }
-            Self::ContentFingerprint { fingerprint } => fingerprint.validate(),
-            Self::SemanticFingerprint { fingerprint } => fingerprint.validate(),
+            Self::File { .. } => ArtifactKind::File,
+            Self::Module { .. } => ArtifactKind::Module,
+            Self::Api { .. } => ArtifactKind::Api,
+            Self::Schema { .. } => ArtifactKind::Schema,
+            Self::Symbol { .. } => ArtifactKind::Symbol,
+            Self::Test { .. } => ArtifactKind::Test,
         }
     }
 
-    fn canonical_components(&self) -> Vec<&str> {
+    #[must_use]
+    pub const fn path(&self) -> &RepoRelativePath {
         match self {
-            Self::Logical {
+            Self::File { path }
+            | Self::Module { path }
+            | Self::Api { path, .. }
+            | Self::Schema { path, .. }
+            | Self::Symbol { path, .. }
+            | Self::Test { path, .. } => path,
+        }
+    }
+
+    /// Validates every required coordinate for this Artifact kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] for an invalid path or incomplete
+    /// kind-specific coordinates.
+    pub fn validate(&self) -> Result<()> {
+        self.path().validate()?;
+        match self {
+            Self::File { .. } | Self::Module { .. } => Ok(()),
+            Self::Api {
+                protocol,
+                operation,
+                normalized_route,
+                ..
+            } => {
+                require_text(protocol, "artifact_locator.protocol")?;
+                require_text(operation, "artifact_locator.operation")?;
+                require_text(normalized_route, "artifact_locator.normalized_route")?;
+                if normalized_route.split_whitespace().count() != 1 {
+                    return Err(invalid(
+                        "artifact_locator.normalized_route must not contain whitespace",
+                    ));
+                }
+                Ok(())
+            }
+            Self::Schema {
                 namespace,
-                logical_name,
-            } => vec!["logical", namespace.as_deref().unwrap_or(""), logical_name],
-            Self::ContentFingerprint { fingerprint } => {
-                vec!["content", fingerprint.as_str()]
+                version,
+                qualified_name,
+                ..
+            } => {
+                require_text(namespace, "artifact_locator.namespace")?;
+                require_text(version, "artifact_locator.version")?;
+                require_text(qualified_name, "artifact_locator.qualified_name")
             }
-            Self::SemanticFingerprint { fingerprint } => {
-                vec!["semantic", fingerprint.as_str()]
+            Self::Symbol {
+                language,
+                module,
+                enclosing_type,
+                symbol_name,
+                signature,
+                ..
+            } => {
+                require_text(language, "artifact_locator.language")?;
+                require_text(module, "artifact_locator.module")?;
+                validate_optional_text(enclosing_type.as_ref(), "artifact_locator.enclosing_type")?;
+                require_text(symbol_name, "artifact_locator.symbol_name")?;
+                require_text(signature, "artifact_locator.signature")
             }
+            Self::Test {
+                qualified_test_name,
+                ..
+            } => require_text(qualified_test_name, "artifact_locator.qualified_test_name"),
+        }
+    }
+
+    /// Stable human-readable key accepted by exact Task Signals.
+    #[must_use]
+    pub fn canonical_key(&self) -> String {
+        match self {
+            Self::File { path } | Self::Module { path } => path.as_str().to_owned(),
+            Self::Api {
+                path,
+                protocol,
+                operation,
+                normalized_route,
+            } => format!(
+                "{}#{protocol}:{operation}:{normalized_route}",
+                path.as_str()
+            ),
+            Self::Schema {
+                path,
+                namespace,
+                version,
+                qualified_name,
+            } => format!("{}#{namespace}@{version}:{qualified_name}", path.as_str()),
+            Self::Symbol {
+                path,
+                language,
+                module,
+                enclosing_type,
+                symbol_name,
+                signature,
+            } => format!(
+                "{}#{language}:{module}:{}:{symbol_name}:{signature}",
+                path.as_str(),
+                enclosing_type.as_deref().unwrap_or("")
+            ),
+            Self::Test {
+                path,
+                qualified_test_name,
+            } => format!("{}#{qualified_test_name}", path.as_str()),
         }
     }
 }
@@ -163,28 +283,22 @@ impl ArtifactKeyBasis {
 #[serde(deny_unknown_fields)]
 pub struct ArtifactKey {
     repository_id: RepositoryId,
-    kind: ArtifactKind,
-    basis: ArtifactKeyBasis,
+    locator: ArtifactLocator,
     digest: String,
 }
 
 impl ArtifactKey {
-    /// Derives a deterministic key from repository, Artifact kind, and stable basis.
+    /// Derives a deterministic key from Repository identity and exact locator.
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::InvalidInput`] for an empty logical/fingerprint basis.
-    pub fn derive(
-        repository_id: RepositoryId,
-        kind: ArtifactKind,
-        basis: ArtifactKeyBasis,
-    ) -> Result<Self> {
-        basis.validate()?;
-        let digest = artifact_digest(repository_id, kind, &basis);
+    /// Returns [`ErrorKind::InvalidInput`] for an invalid locator.
+    pub fn derive(repository_id: RepositoryId, locator: ArtifactLocator) -> Result<Self> {
+        locator.validate()?;
+        let digest = artifact_digest(repository_id, &locator)?;
         Ok(Self {
             repository_id,
-            kind,
-            basis,
+            locator,
             digest,
         })
     }
@@ -196,12 +310,12 @@ impl ArtifactKey {
 
     #[must_use]
     pub const fn kind(&self) -> ArtifactKind {
-        self.kind
+        self.locator.kind()
     }
 
     #[must_use]
-    pub const fn basis(&self) -> &ArtifactKeyBasis {
-        &self.basis
+    pub const fn locator(&self) -> &ArtifactLocator {
+        &self.locator
     }
 
     #[must_use]
@@ -209,118 +323,45 @@ impl ArtifactKey {
         &self.digest
     }
 
-    /// Explains the stable derivation basis without locator hints.
+    /// Explains the deterministic locator identity.
     #[must_use]
-    pub fn basis_explanation(&self) -> String {
-        match &self.basis {
-            ArtifactKeyBasis::Logical {
-                namespace,
-                logical_name,
-            } => format!(
-                "logical identity {}{} in repository {} as {}",
-                namespace
-                    .as_deref()
-                    .map_or_else(String::new, |value| format!("{value}::")),
-                logical_name,
-                self.repository_id,
-                self.kind.stable_name()
-            ),
-            ArtifactKeyBasis::ContentFingerprint { fingerprint } => format!(
-                "content fingerprint {} in repository {} as {}",
-                fingerprint.as_str(),
-                self.repository_id,
-                self.kind.stable_name()
-            ),
-            ArtifactKeyBasis::SemanticFingerprint { fingerprint } => format!(
-                "semantic fingerprint {} in repository {} as {}",
-                fingerprint.as_str(),
-                self.repository_id,
-                self.kind.stable_name()
-            ),
-        }
+    pub fn locator_explanation(&self) -> String {
+        format!(
+            "exact {} locator {} in repository {}",
+            self.kind().stable_name(),
+            self.locator.path().as_str(),
+            self.repository_id
+        )
     }
 
-    /// Validates the stored digest against the complete stable basis.
+    /// Validates the stored digest against the complete deterministic locator.
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::InvalidInput`] for an invalid basis or mismatched digest.
+    /// Returns [`ErrorKind::InvalidInput`] for an invalid locator or mismatched digest.
     pub fn validate(&self) -> Result<()> {
-        self.basis.validate()?;
-        if self.digest != artifact_digest(self.repository_id, self.kind, &self.basis) {
+        self.locator.validate()?;
+        if self.digest != artifact_digest(self.repository_id, &self.locator)? {
             return Err(invalid(
-                "artifact_key.digest must match repository, kind, and stable basis",
+                "artifact_key.digest must match repository and deterministic locator",
             ));
         }
         Ok(())
     }
 }
 
-fn artifact_digest(
-    repository_id: RepositoryId,
-    kind: ArtifactKind,
-    basis: &ArtifactKeyBasis,
-) -> String {
+fn artifact_digest(repository_id: RepositoryId, locator: &ArtifactLocator) -> Result<String> {
     let mut hasher = Sha256::new();
-    for component in std::iter::once(repository_id.to_string())
-        .chain(std::iter::once(kind.stable_name().to_owned()))
-        .chain(
-            basis
-                .canonical_components()
-                .into_iter()
-                .map(ToOwned::to_owned),
-        )
-    {
+    for component in [
+        repository_id.to_string(),
+        locator.kind().stable_name().to_owned(),
+        serde_json::to_string(locator)
+            .map_err(|error| invalid(format!("serialize Artifact locator: {error}")))?,
+    ] {
         hasher.update(component.len().to_be_bytes());
         hasher.update(component.as_bytes());
     }
-    format!("art_{:x}", hasher.finalize())
-}
-
-/// Non-authoritative coordinates observed for an engineering object.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LocatorHints {
-    pub module: Option<String>,
-    pub path: Option<String>,
-    pub symbol: Option<String>,
-    pub language: Option<String>,
-    pub api_or_schema: Option<String>,
-    pub line: Option<u32>,
-    pub commit: Option<String>,
-}
-
-impl LocatorHints {
-    /// Validates that at least one meaningful locator is present.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorKind::InvalidInput`] for empty locators or a line without a path.
-    pub fn validate(&self) -> Result<()> {
-        for (value, field) in [
-            (self.module.as_ref(), "locator_hints.module"),
-            (self.path.as_ref(), "locator_hints.path"),
-            (self.symbol.as_ref(), "locator_hints.symbol"),
-            (self.language.as_ref(), "locator_hints.language"),
-            (self.api_or_schema.as_ref(), "locator_hints.api_or_schema"),
-            (self.commit.as_ref(), "locator_hints.commit"),
-        ] {
-            validate_optional_text(value, field)?;
-        }
-        if self.line.is_some() && self.path.is_none() {
-            return Err(invalid("locator_hints.line requires locator_hints.path"));
-        }
-        if self.module.is_none()
-            && self.path.is_none()
-            && self.symbol.is_none()
-            && self.api_or_schema.is_none()
-        {
-            return Err(invalid(
-                "locator_hints must contain module, path, symbol, or api_or_schema",
-            ));
-        }
-        Ok(())
-    }
+    Ok(format!("art_{:x}", hasher.finalize()))
 }
 
 /// How durable Context knowledge relates to a persistent `EngineeringReference`.
@@ -364,15 +405,13 @@ pub struct EngineeringReferenceDraft {
     pub repository_id: RepositoryId,
     pub artifact_kind: ArtifactKind,
     pub relation: ReferenceRelation,
-    pub locator_hints: Option<LocatorHints>,
-    pub content_fingerprint: Option<ContentFingerprint>,
-    pub semantic_fingerprint: Option<SemanticFingerprint>,
+    pub locator: ArtifactLocator,
     pub supports: String,
     pub limitations: Vec<String>,
 }
 
 impl EngineeringReferenceDraft {
-    /// Validates relation compatibility, locator/fingerprint evidence, and explanatory text.
+    /// Validates relation compatibility, exact locator, and explanatory text.
     ///
     /// # Errors
     ///
@@ -383,9 +422,7 @@ impl EngineeringReferenceDraft {
             repository_id: self.repository_id,
             artifact_kind: self.artifact_kind,
             relation: self.relation,
-            locator_hints: self.locator_hints.clone(),
-            content_fingerprint: self.content_fingerprint.clone(),
-            semantic_fingerprint: self.semantic_fingerprint.clone(),
+            locator: self.locator.clone(),
             supports: self.supports.clone(),
             limitations: self.limitations.clone(),
         }
@@ -401,9 +438,7 @@ pub struct EngineeringReference {
     pub repository_id: RepositoryId,
     pub artifact_kind: ArtifactKind,
     pub relation: ReferenceRelation,
-    pub locator_hints: Option<LocatorHints>,
-    pub content_fingerprint: Option<ContentFingerprint>,
-    pub semantic_fingerprint: Option<SemanticFingerprint>,
+    pub locator: ArtifactLocator,
     pub supports: String,
     pub limitations: Vec<String>,
 }
@@ -420,9 +455,7 @@ impl EngineeringReference {
             repository_id: draft.repository_id,
             artifact_kind: draft.artifact_kind,
             relation: draft.relation,
-            locator_hints: draft.locator_hints,
-            content_fingerprint: draft.content_fingerprint,
-            semantic_fingerprint: draft.semantic_fingerprint,
+            locator: draft.locator,
             supports: draft.supports,
             limitations: draft.limitations,
         };
@@ -441,25 +474,12 @@ impl EngineeringReference {
                 "engineering_reference relation is incompatible with artifact_kind",
             ));
         }
-        if let Some(locator) = &self.locator_hints {
-            locator.validate().map_err(|error| {
-                invalid(format!(
-                    "engineering_reference locator_hints are invalid: {error}"
-                ))
-            })?;
-        }
-        if let Some(fingerprint) = &self.content_fingerprint {
-            fingerprint.validate()?;
-        }
-        if let Some(fingerprint) = &self.semantic_fingerprint {
-            fingerprint.validate()?;
-        }
-        if self.locator_hints.is_none()
-            && self.content_fingerprint.is_none()
-            && self.semantic_fingerprint.is_none()
-        {
+        self.locator.validate().map_err(|error| {
+            invalid(format!("engineering_reference locator is invalid: {error}"))
+        })?;
+        if self.locator.kind() != self.artifact_kind {
             return Err(invalid(
-                "engineering_reference requires locator hints or a fingerprint",
+                "engineering_reference artifact_kind must match locator kind",
             ));
         }
         require_text(&self.supports, "engineering_reference.supports")?;
@@ -474,13 +494,10 @@ pub struct EngineeringArtifact {
     pub repository: RepositoryIdentity,
     pub artifact_key: ArtifactKey,
     pub display_name: String,
-    pub locator_hints: LocatorHints,
-    pub content_fingerprint: Option<ContentFingerprint>,
-    pub semantic_fingerprint: Option<SemanticFingerprint>,
 }
 
 impl EngineeringArtifact {
-    /// Validates repository ownership, `ArtifactKey` basis, and current locators.
+    /// Validates repository ownership and deterministic Artifact identity.
     ///
     /// # Errors
     ///
@@ -489,34 +506,10 @@ impl EngineeringArtifact {
         self.repository.validate()?;
         self.artifact_key.validate()?;
         require_text(&self.display_name, "engineering_artifact.display_name")?;
-        self.locator_hints.validate()?;
-        if let Some(fingerprint) = &self.content_fingerprint {
-            fingerprint.validate()?;
-        }
-        if let Some(fingerprint) = &self.semantic_fingerprint {
-            fingerprint.validate()?;
-        }
         if self.repository.repository_id != self.artifact_key.repository_id() {
             return Err(invalid(
                 "engineering_artifact key and repository identity must match",
             ));
-        }
-        match self.artifact_key.basis() {
-            ArtifactKeyBasis::ContentFingerprint { fingerprint }
-                if self.content_fingerprint.as_ref() != Some(fingerprint) =>
-            {
-                return Err(invalid(
-                    "engineering_artifact content fingerprint must match ArtifactKey basis",
-                ));
-            }
-            ArtifactKeyBasis::SemanticFingerprint { fingerprint }
-                if self.semantic_fingerprint.as_ref() != Some(fingerprint) =>
-            {
-                return Err(invalid(
-                    "engineering_artifact semantic fingerprint must match ArtifactKey basis",
-                ));
-            }
-            _ => {}
         }
         Ok(())
     }
@@ -528,9 +521,8 @@ impl EngineeringArtifact {
 pub enum ResolutionStatus {
     Resolved,
     Ambiguous,
-    Stale,
+    Missing,
     Unavailable,
-    Unresolved,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -581,12 +573,9 @@ impl ArtifactResolution {
                     && self.resolved_artifact.as_ref() == self.candidates.first()
             }
             ResolutionStatus::Ambiguous => {
-                self.resolved_artifact.is_none() && self.candidates.len() >= 2
+                self.resolved_artifact.is_none() && !self.candidates.is_empty()
             }
-            ResolutionStatus::Stale => {
-                self.resolved_artifact.is_some() && self.candidates.is_empty()
-            }
-            ResolutionStatus::Unavailable | ResolutionStatus::Unresolved => {
+            ResolutionStatus::Missing | ResolutionStatus::Unavailable => {
                 self.resolved_artifact.is_none() && self.candidates.is_empty()
             }
         };
@@ -617,7 +606,7 @@ impl ArtifactAssociationKind {
                 ArtifactKind::Module | ArtifactKind::File | ArtifactKind::Symbol
             ),
             Self::DefinesContract => matches!(kind, ArtifactKind::Api | ArtifactKind::Schema),
-            Self::Uses => !matches!(kind, ArtifactKind::Repository),
+            Self::Uses => true,
             Self::ValidatedBy => matches!(kind, ArtifactKind::Test),
             Self::ConstrainedBy => matches!(
                 kind,
@@ -759,10 +748,7 @@ impl EngineeringGraphEdge {
         let compatible = match self.kind {
             ArtifactRelationKind::Contains => {
                 self.source.repository_id() == self.target.repository_id()
-                    && matches!(
-                        self.source.kind(),
-                        ArtifactKind::Repository | ArtifactKind::Module
-                    )
+                    && self.source.kind() == ArtifactKind::Module
             }
             ArtifactRelationKind::Defines => {
                 self.source.repository_id() == self.target.repository_id()
@@ -791,10 +777,7 @@ impl EngineeringGraphEdge {
                     ArtifactKind::Module | ArtifactKind::File | ArtifactKind::Symbol
                 ) && matches!(self.target.kind(), ArtifactKind::Api | ArtifactKind::Schema)
             }
-            ArtifactRelationKind::Validates => {
-                self.source.kind() == ArtifactKind::Test
-                    && self.target.kind() != ArtifactKind::Repository
-            }
+            ArtifactRelationKind::Validates => self.source.kind() == ArtifactKind::Test,
             ArtifactRelationKind::Implements => {
                 matches!(
                     self.source.kind(),
@@ -822,163 +805,130 @@ mod tests {
         RepositoryIdentity {
             repository_id: RepositoryId::new(),
             canonical_name: name.to_owned(),
-            semantic_fingerprint: SemanticFingerprint::new(format!("repo:{name}")).unwrap(),
         }
     }
 
-    fn locator(path: &str, symbol: Option<&str>, language: &str) -> LocatorHints {
-        LocatorHints {
-            path: Some(path.to_owned()),
-            symbol: symbol.map(ToOwned::to_owned),
-            language: Some(language.to_owned()),
-            ..LocatorHints::default()
-        }
+    fn path(value: &str) -> RepoRelativePath {
+        RepoRelativePath::new(value).unwrap()
     }
 
-    fn logical(
-        repository_id: RepositoryId,
-        kind: ArtifactKind,
-        namespace: &str,
-        name: &str,
-    ) -> ArtifactKey {
+    fn module(repository_id: RepositoryId, value: &str) -> ArtifactKey {
+        ArtifactKey::derive(repository_id, ArtifactLocator::Module { path: path(value) }).unwrap()
+    }
+
+    fn api(repository_id: RepositoryId, route: &str) -> ArtifactKey {
         ArtifactKey::derive(
             repository_id,
-            kind,
-            ArtifactKeyBasis::Logical {
-                namespace: Some(namespace.to_owned()),
-                logical_name: name.to_owned(),
+            ArtifactLocator::Api {
+                path: path("api/search.yaml"),
+                protocol: "http".to_owned(),
+                operation: "GET".to_owned(),
+                normalized_route: route.to_owned(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn symbol(repository_id: RepositoryId, module: &str, name: &str) -> ArtifactKey {
+        ArtifactKey::derive(
+            repository_id,
+            ArtifactLocator::Symbol {
+                path: path("src/search.ts"),
+                language: "typescript".to_owned(),
+                module: module.to_owned(),
+                enclosing_type: None,
+                symbol_name: name.to_owned(),
+                signature: format!("{name}()"),
             },
         )
         .unwrap()
     }
 
     #[test]
-    fn file_move_and_symbol_rename_keep_fingerprint_derived_identity() {
+    fn path_move_and_symbol_rename_change_deterministic_identity() {
         let repository = repository("search-web");
-        let content = ContentFingerprint::new("sha256:file-content").unwrap();
         let file_key = ArtifactKey::derive(
             repository.repository_id,
-            ArtifactKind::File,
-            ArtifactKeyBasis::ContentFingerprint {
-                fingerprint: content.clone(),
+            ArtifactLocator::File {
+                path: path("old/search.ts"),
             },
         )
         .unwrap();
         let before = EngineeringArtifact {
             repository: repository.clone(),
-            artifact_key: file_key.clone(),
+            artifact_key: file_key,
             display_name: "old/search.ts".to_owned(),
-            locator_hints: locator("old/search.ts", None, "typescript"),
-            content_fingerprint: Some(content.clone()),
-            semantic_fingerprint: None,
         };
         let after = EngineeringArtifact {
-            locator_hints: locator("new/search.ts", None, "typescript"),
+            artifact_key: ArtifactKey::derive(
+                repository.repository_id,
+                ArtifactLocator::File {
+                    path: path("new/search.ts"),
+                },
+            )
+            .unwrap(),
             display_name: "new/search.ts".to_owned(),
             ..before.clone()
         };
         assert!(before.validate().is_ok());
         assert!(after.validate().is_ok());
-        assert_eq!(before.artifact_key, after.artifact_key);
+        assert_ne!(before.artifact_key, after.artifact_key);
 
-        let semantic = SemanticFingerprint::new("ast:search-handler").unwrap();
-        let symbol_key = ArtifactKey::derive(
-            repository.repository_id,
-            ArtifactKind::Symbol,
-            ArtifactKeyBasis::SemanticFingerprint {
-                fingerprint: semantic.clone(),
-            },
-        )
-        .unwrap();
         let old_symbol = EngineeringArtifact {
             repository: repository.clone(),
-            artifact_key: symbol_key,
+            artifact_key: symbol(repository.repository_id, "search", "oldSearch"),
             display_name: "oldSearch".to_owned(),
-            locator_hints: locator("src/search.ts", Some("oldSearch"), "typescript"),
-            content_fingerprint: None,
-            semantic_fingerprint: Some(semantic),
         };
         let renamed = EngineeringArtifact {
+            artifact_key: symbol(repository.repository_id, "search", "newSearch"),
             display_name: "newSearch".to_owned(),
-            locator_hints: locator("src/search.ts", Some("newSearch"), "typescript"),
             ..old_symbol.clone()
         };
         assert!(old_symbol.validate().is_ok());
         assert!(renamed.validate().is_ok());
-        assert_eq!(old_symbol.artifact_key, renamed.artifact_key);
+        assert_ne!(old_symbol.artifact_key, renamed.artifact_key);
     }
 
     #[test]
-    fn logical_keys_distinguish_modules_but_unify_cross_language_contracts() {
+    fn locator_keys_distinguish_modules_and_normalize_contract_coordinates() {
         let repository = repository("cross-client");
-        let first = logical(
-            repository.repository_id,
-            ArtifactKind::Symbol,
-            "feed",
-            "Result",
-        );
-        let second = logical(
-            repository.repository_id,
-            ArtifactKind::Symbol,
-            "search",
-            "Result",
-        );
+        let first = symbol(repository.repository_id, "feed", "Result");
+        let second = symbol(repository.repository_id, "search", "Result");
         assert_ne!(first, second);
 
-        let api_from_swift = logical(
-            repository.repository_id,
-            ArtifactKind::Api,
-            "search-v2",
-            "SearchEndpoint",
-        );
-        let api_from_typescript = logical(
-            repository.repository_id,
-            ArtifactKind::Api,
-            "search-v2",
-            "SearchEndpoint",
-        );
+        let api_from_swift = api(repository.repository_id, "/v2/search");
+        let api_from_typescript = api(repository.repository_id, "/v2/search");
         assert_eq!(api_from_swift, api_from_typescript);
-        assert!(api_from_swift.basis_explanation().contains("search-v2"));
-    }
-
-    #[test]
-    fn artifact_key_serialization_has_no_locator_identity() {
-        let key = logical(
-            RepositoryId::new(),
-            ArtifactKind::Api,
-            "search-v2",
-            "SearchEndpoint",
-        );
-        let value = serde_json::to_value(key).unwrap();
-        let fields = value.as_object().unwrap();
-        for forbidden in ["path", "line", "commit", "workspace"] {
-            assert!(fields.keys().all(|field| !field.contains(forbidden)));
-        }
-    }
-
-    #[test]
-    fn references_reject_empty_evidence_and_invalid_relation_combinations() {
-        assert!(ContentFingerprint::new(" ").is_err());
-        assert!(SemanticFingerprint::new("").is_err());
-        assert!(LocatorHints::default().validate().is_err());
         assert!(
-            LocatorHints {
-                line: Some(42),
-                symbol: Some("Search".to_owned()),
-                ..LocatorHints::default()
-            }
-            .validate()
-            .is_err()
+            api_from_swift
+                .locator_explanation()
+                .contains("api/search.yaml")
         );
+    }
+
+    #[test]
+    fn artifact_key_serialization_exposes_only_deterministic_locator_identity() {
+        let key = api(RepositoryId::new(), "/v2/search");
+        let value = serde_json::to_value(key).unwrap();
+        assert_eq!(value["locator"]["path"], "api/search.yaml");
+        let encoded = value.to_string();
+        assert!(!encoded.contains("content_"));
+        assert!(!encoded.contains("semantic_"));
+    }
+
+    #[test]
+    fn references_require_canonical_kind_specific_locator_and_compatible_relation() {
+        assert!(RepoRelativePath::new("/absolute/search.ts").is_err());
+        assert!(RepoRelativePath::new("src/../search.ts").is_err());
 
         let invalid = EngineeringReference {
             reference_id: ReferenceId::new(),
             repository_id: RepositoryId::new(),
             artifact_kind: ArtifactKind::File,
             relation: ReferenceRelation::Consumes,
-            locator_hints: Some(locator("src/search.ts", None, "typescript")),
-            content_fingerprint: None,
-            semantic_fingerprint: None,
+            locator: ArtifactLocator::File {
+                path: path("src/search.ts"),
+            },
             supports: "the implementation lives in this file".to_owned(),
             limitations: vec!["the file may move".to_owned()],
         };
@@ -986,8 +936,13 @@ mod tests {
 
         let valid = EngineeringReference {
             artifact_kind: ArtifactKind::Api,
-            locator_hints: None,
-            semantic_fingerprint: Some(SemanticFingerprint::new("api:search-v2").unwrap()),
+            relation: ReferenceRelation::Consumes,
+            locator: ArtifactLocator::Api {
+                path: path("api/search.yaml"),
+                protocol: "http".to_owned(),
+                operation: "GET".to_owned(),
+                normalized_route: "/v2/search".to_owned(),
+            },
             ..invalid
         };
         assert!(valid.validate().is_ok());
@@ -1000,8 +955,8 @@ mod tests {
     #[test]
     fn resolution_models_ambiguity_unavailable_and_mixed_repository_rejection() {
         let repository = RepositoryId::new();
-        let first = logical(repository, ArtifactKind::Symbol, "module-a", "Result");
-        let second = logical(repository, ArtifactKind::Symbol, "module-b", "Result");
+        let first = symbol(repository, "module-a", "Result");
+        let second = symbol(repository, "module-b", "Result");
         let ambiguous = ArtifactResolution {
             reference_id: ReferenceId::new(),
             repository_id: repository,
@@ -1021,15 +976,7 @@ mod tests {
         assert!(unavailable.validate().is_ok());
 
         let mixed = ArtifactResolution {
-            candidates: vec![
-                first,
-                logical(
-                    RepositoryId::new(),
-                    ArtifactKind::Symbol,
-                    "module-c",
-                    "Result",
-                ),
-            ],
+            candidates: vec![first, symbol(RepositoryId::new(), "module-c", "Result")],
             ..ambiguous
         };
         assert!(mixed.validate().is_err());
@@ -1037,12 +984,7 @@ mod tests {
 
     #[test]
     fn derived_associations_validate_sources_confidence_and_artifact_kind() {
-        let key = logical(
-            RepositoryId::new(),
-            ArtifactKind::Api,
-            "search-v2",
-            "SearchEndpoint",
-        );
+        let key = api(RepositoryId::new(), "/v2/search");
         let association = ContextArtifactAssociation {
             context_id: ContextId::new(),
             revision_id: RevisionId::new(),
@@ -1062,8 +1004,8 @@ mod tests {
     #[test]
     fn graph_edges_allow_cycles_but_reject_invalid_typed_combinations() {
         let repository = RepositoryId::new();
-        let a = logical(repository, ArtifactKind::Module, "module", "A");
-        let b = logical(repository, ArtifactKind::Module, "module", "B");
+        let a = module(repository, "src/a");
+        let b = module(repository, "src/b");
         let forward = EngineeringGraphEdge {
             source: a.clone(),
             target: b.clone(),
@@ -1080,8 +1022,14 @@ mod tests {
         assert!(backward.validate().is_ok());
 
         let invalid = EngineeringGraphEdge {
-            source: logical(repository, ArtifactKind::Api, "api", "A"),
-            target: logical(repository, ArtifactKind::File, "file", "B"),
+            source: api(repository, "/a"),
+            target: ArtifactKey::derive(
+                repository,
+                ArtifactLocator::File {
+                    path: path("src/b.rs"),
+                },
+            )
+            .unwrap(),
             kind: ArtifactRelationKind::Calls,
             explanation: "invalid call direction".to_owned(),
         };
@@ -1114,18 +1062,16 @@ mod tests {
     }
 
     #[test]
-    fn arbitrary_deserialized_fingerprint_still_fails_nested_validation() {
-        let empty: ContentFingerprint =
-            serde_json::from_value(Value::String(String::new())).unwrap();
+    fn arbitrary_deserialized_locator_still_fails_nested_validation() {
+        let invalid_path: RepoRelativePath =
+            serde_json::from_value(Value::String("../outside.rs".to_owned())).unwrap();
         let reference = EngineeringReference {
             reference_id: ReferenceId::new(),
             repository_id: RepositoryId::new(),
             artifact_kind: ArtifactKind::File,
             relation: ReferenceRelation::Implements,
-            locator_hints: None,
-            content_fingerprint: Some(empty),
-            semantic_fingerprint: None,
-            supports: "the content fingerprint locates the file".to_owned(),
+            locator: ArtifactLocator::File { path: invalid_path },
+            supports: "the exact path locates the file".to_owned(),
             limitations: Vec::new(),
         };
         assert!(reference.validate().is_err());

@@ -9,11 +9,10 @@
     "repository_id": "repo_00000000-0000-4000-8000-000000000901",
     "artifact_kind": "file",
     "relation": "implements",
-    "locator_hints": {
+    "locator": {
+      "locator_kind": "file",
       "path": "src/search.ts"
     },
-    "content_fingerprint": null,
-    "semantic_fingerprint": null,
     "supports": "Invalid repository identity fixture.",
     "limitations": []
   }

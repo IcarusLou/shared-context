@@ -7,10 +7,9 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value as SqlValue};
 use sctx_domain::{
-    Applicability, ArtifactAssociationKind, ArtifactKey, ArtifactKeyBasis, ArtifactKind, ContextId,
-    ContextKind, ContextRelationKind, EngineeringArtifact, EvidenceId, ReferenceId, RepositoryId,
-    ResolutionStatus, RevisionId, SpaceId, TaskId, TaskIntent, TaskSignal, TaskSignalKind,
-    TaskSpaceAssociation,
+    Applicability, ArtifactAssociationKind, ArtifactKey, ArtifactKind, ContextId, ContextKind,
+    ContextRelationKind, EvidenceId, ReferenceId, RepositoryId, ResolutionStatus, RevisionId,
+    SpaceId, TaskId, TaskIntent, TaskSignal, TaskSignalKind, TaskSpaceAssociation,
 };
 use sctx_engineering_graph::{
     EngineeringProjection, EngineeringProjectionSnapshot, EngineeringProjectionStore, MatchBasis,
@@ -1511,13 +1510,7 @@ fn query_graph_context_evidence(
             .filter_map(|hint| {
                 candidates
                     .iter()
-                    .find(|artifact| {
-                        let observation = resolved
-                            .artifacts
-                            .iter()
-                            .find(|observation| &observation.artifact_key == **artifact);
-                        task_signal_matches_artifact(hint, artifact, observation)
-                    })
+                    .find(|artifact| task_signal_matches_artifact(hint, artifact))
                     .map(|artifact| (hint, *artifact))
             })
             .collect::<Vec<_>>();
@@ -1656,50 +1649,11 @@ fn current_context_space(
         .transpose()
 }
 
-fn task_signal_matches_artifact(
-    hint: &ArtifactHint,
-    artifact: &ArtifactKey,
-    observation: Option<&EngineeringArtifact>,
-) -> bool {
+fn task_signal_matches_artifact(hint: &ArtifactHint, artifact: &ArtifactKey) -> bool {
     if task_signal_artifact_kind(hint.kind) != Some(artifact.kind()) {
         return false;
     }
-    let wanted = normalize_artifact_identity(&hint.content);
-    if observation.is_some_and(|observation| {
-        let hints = &observation.locator_hints;
-        [
-            Some(observation.display_name.as_str()),
-            hints.path.as_deref(),
-            hints.symbol.as_deref(),
-            hints.api_or_schema.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|candidate| wanted == normalize_artifact_identity(candidate))
-            || hints
-                .symbol
-                .as_ref()
-                .zip(hints.module.as_ref())
-                .is_some_and(|(symbol, module)| {
-                    wanted == normalize_artifact_identity(&format!("{module}::{symbol}"))
-                })
-    }) {
-        return true;
-    }
-    let ArtifactKeyBasis::Logical {
-        namespace,
-        logical_name,
-    } = artifact.basis()
-    else {
-        return false;
-    };
-    let logical = normalize_artifact_identity(logical_name);
-    if wanted == logical {
-        return true;
-    }
-    namespace.as_ref().is_some_and(|namespace| {
-        wanted == normalize_artifact_identity(&format!("{namespace}::{logical_name}"))
-    })
+    hint.content.trim() == artifact.locator().canonical_key()
 }
 
 const fn task_signal_artifact_kind(kind: TaskSignalKind) -> Option<ArtifactKind> {

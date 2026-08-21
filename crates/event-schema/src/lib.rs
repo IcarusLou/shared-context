@@ -12,20 +12,20 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 pub use sctx_domain::{
-    Applicability, ArtifactKind, AutoInjectionBlocker, AutoInjectionEligibility, CandidateId,
-    CandidateProjection, ConflictId, ConflictParticipant, ConflictResolution,
-    ConflictResolutionDraft, ConflictResolutionResult, ContentFingerprint, ContextCandidate,
-    ContextGovernanceStatus, ContextId, ContextKind, ContextProjection, ContextRelation,
-    ContextRelationKind, ContextRevision, ContextRevisionDraft, ContextSpaceProjection,
-    DomainProjection, EngineeringReference, EngineeringReferenceDraft, Error, ErrorKind, EventId,
-    EvidenceId, EvidenceSnapshot, EvidenceSnapshotDraft, EvidenceType, IdParseError,
-    IntentProjection, IntentRevision, IntentSnapshot, LocatorHints, Publication, PublicationAction,
-    PublicationDraft, PublicationId, ReducerDiagnostic, ReducerDiagnosticCode, ReducerEvent,
-    ReducerPayload, ReferenceId, ReferenceRelation, RepositoryId, ResolutionId, ResolutionOutcome,
-    Result, Review, ReviewDraft, ReviewId, ReviewSummary, ReviewVerdict, RevisionId,
-    RevisionLifecycle, RevisionProjection, SemanticConflict, SemanticConflictCandidate,
+    Applicability, ArtifactKind, ArtifactLocator, AutoInjectionBlocker, AutoInjectionEligibility,
+    CandidateId, CandidateProjection, ConflictId, ConflictParticipant, ConflictResolution,
+    ConflictResolutionDraft, ConflictResolutionResult, ContextCandidate, ContextGovernanceStatus,
+    ContextId, ContextKind, ContextProjection, ContextRelation, ContextRelationKind,
+    ContextRevision, ContextRevisionDraft, ContextSpaceProjection, DomainProjection,
+    EngineeringReference, EngineeringReferenceDraft, Error, ErrorKind, EventId, EvidenceId,
+    EvidenceSnapshot, EvidenceSnapshotDraft, EvidenceType, IdParseError, IntentProjection,
+    IntentRevision, IntentSnapshot, Publication, PublicationAction, PublicationDraft,
+    PublicationId, ReducerDiagnostic, ReducerDiagnosticCode, ReducerEvent, ReducerPayload,
+    ReferenceId, ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionId,
+    ResolutionOutcome, Result, Review, ReviewDraft, ReviewId, ReviewSummary, ReviewVerdict,
+    RevisionId, RevisionLifecycle, RevisionProjection, SemanticConflict, SemanticConflictCandidate,
     SemanticConflictDraft, SemanticConflictOpenReason, SemanticConflictProjection,
-    SemanticConflictStatus, SemanticFingerprint, SpaceId, WorkEpisodeId, reduce,
+    SemanticConflictStatus, SpaceId, WorkEpisodeId, reduce,
 };
 
 /// Immutable identifier for the bundled V1 JSON Schema.
@@ -300,7 +300,7 @@ impl Event {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::InvalidInput`] for invalid locator, fingerprint, relation, support, or
+    /// Returns [`ErrorKind::InvalidInput`] for invalid locator, relation, support, or
     /// limitation content.
     pub fn engineering_reference_recorded(
         context_id: ContextId,

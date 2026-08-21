@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use sctx_domain::{
-    ArtifactAssociationKind, ArtifactKey, ArtifactKeyBasis, ArtifactKind, ArtifactResolution,
+    ArtifactAssociationKind, ArtifactKey, ArtifactKind, ArtifactLocator, ArtifactResolution,
     ContextArtifactAssociation, ContextId, EngineeringArtifact, EngineeringReference, Error,
     ErrorKind, ReferenceId, ReferenceRelation, RepositoryId, ResolutionStatus, Result, RevisionId,
 };
@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{RepositoryScanOutcome, RepositorySnapshot, SnapshotArtifact};
 
-const RESOLVER_POLICY_VERSION: &str = "engineering-reference-resolution-v1";
+const RESOLVER_POLICY_VERSION: &str = "deterministic-artifact-locator-resolution-v1";
 
 /// Context ownership envelope around one Git-projected persistent Reference.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -30,35 +30,24 @@ impl ProjectedEngineeringReference {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchBasis {
-    PathHint,
-    ContentFingerprint,
-    SemanticFingerprint,
-    QualifiedSymbolLogicalKey,
-    StableApiSchemaLogicalKey,
-    PreviousResolvedArtifact,
+    ExactFilePath,
+    ExactModulePath,
+    ExactApiLocator,
+    ExactSchemaLocator,
+    ExactQualifiedSymbolLocator,
+    ExactQualifiedTestLocator,
     RepositoryUnavailable,
 }
 
 impl MatchBasis {
-    const fn rank(self) -> u8 {
-        match self {
-            Self::PathHint => 1,
-            Self::ContentFingerprint => 2,
-            Self::SemanticFingerprint => 3,
-            Self::QualifiedSymbolLogicalKey => 4,
-            Self::StableApiSchemaLogicalKey => 5,
-            Self::PreviousResolvedArtifact | Self::RepositoryUnavailable => 0,
-        }
-    }
-
     const fn confidence(self) -> f64 {
         match self {
-            Self::StableApiSchemaLogicalKey => 1.0,
-            Self::QualifiedSymbolLogicalKey => 0.95,
-            Self::SemanticFingerprint => 0.90,
-            Self::ContentFingerprint => 0.80,
-            Self::PathHint => 0.40,
-            Self::PreviousResolvedArtifact => 0.30,
+            Self::ExactFilePath
+            | Self::ExactModulePath
+            | Self::ExactApiLocator
+            | Self::ExactSchemaLocator
+            | Self::ExactQualifiedSymbolLocator
+            | Self::ExactQualifiedTestLocator => 1.0,
             Self::RepositoryUnavailable => 0.0,
         }
     }
@@ -139,9 +128,7 @@ impl ResolvedReferenceProjection {
                 .iter()
                 .cloned()
                 .collect::<HashSet<_>>(),
-            ResolutionStatus::Stale
-            | ResolutionStatus::Unavailable
-            | ResolutionStatus::Unresolved => HashSet::new(),
+            ResolutionStatus::Missing | ResolutionStatus::Unavailable => HashSet::new(),
         };
         if artifact_keys != expected {
             return Err(invariant(
@@ -210,21 +197,8 @@ impl EngineeringReferenceResolver {
         &self,
         references: &[ProjectedEngineeringReference],
         snapshots: &[RepositoryScanOutcome],
-        previous: Option<&EngineeringProjection>,
     ) -> Result<EngineeringProjection> {
         let snapshots = snapshot_map(snapshots)?;
-        let previous = previous
-            .map(|projection| {
-                projection.validate().map(|()| {
-                    projection
-                        .references
-                        .iter()
-                        .map(|reference| (reference.reference_id, reference))
-                        .collect::<BTreeMap<_, _>>()
-                })
-            })
-            .transpose()?
-            .unwrap_or_default();
         let mut ordered = references.to_vec();
         ordered.sort_by_key(|reference| reference.reference.reference_id);
         let mut seen = HashSet::with_capacity(ordered.len());
@@ -237,7 +211,6 @@ impl EngineeringReferenceResolver {
             resolved.push(resolve_one(
                 projected,
                 snapshots.get(&projected.reference.repository_id),
-                previous.get(&projected.reference.reference_id).copied(),
             )?);
         }
         let generation = projection_generation(&ordered, &snapshots, &resolved)?;
@@ -264,7 +237,8 @@ impl EngineeringReferenceResolver {
         references: &[ProjectedEngineeringReference],
         snapshots: &[RepositoryScanOutcome],
     ) -> Result<EngineeringProjection> {
-        self.resolve(references, snapshots, Some(previous))
+        previous.validate()?;
+        self.resolve(references, snapshots)
     }
 }
 
@@ -299,7 +273,6 @@ fn snapshot_map(
 fn resolve_one(
     projected: &ProjectedEngineeringReference,
     snapshot: Option<&SnapshotState<'_>>,
-    previous: Option<&ResolvedReferenceProjection>,
 ) -> Result<ResolvedReferenceProjection> {
     let reference = &projected.reference;
     match snapshot {
@@ -334,46 +307,19 @@ fn resolve_one(
         Some(SnapshotState::Available(snapshot)) => {
             let candidates = winning_candidates(reference, &snapshot.artifacts);
             match candidates.as_slice() {
-                [] => {
-                    let previous_artifact = previous.and_then(|previous| {
-                        matches!(
-                            previous.resolution.status,
-                            ResolutionStatus::Resolved | ResolutionStatus::Stale
-                        )
-                        .then(|| previous.resolution.resolved_artifact.clone())
-                        .flatten()
-                    });
-                    if let Some(previous_artifact) = previous_artifact {
-                        projection_for_status(
-                            projected,
-                            Some(snapshot.generation.clone()),
-                            ResolutionStatus::Stale,
-                            Some(previous_artifact.clone()),
-                            vec![],
-                            vec![CandidateMatchEvidence {
-                                artifact_key: Some(previous_artifact),
-                                basis: MatchBasis::PreviousResolvedArtifact,
-                                confidence: MatchBasis::PreviousResolvedArtifact.confidence(),
-                                explanation:
-                                    "previously resolved Artifact is absent from current snapshot"
-                                        .to_owned(),
-                            }],
-                            "Previously resolved Artifact is stale in current Repository snapshot"
-                                .to_owned(),
-                        )
-                    } else {
-                        projection_for_status(
-                            projected,
-                            Some(snapshot.generation.clone()),
-                            ResolutionStatus::Unresolved,
-                            None,
-                            vec![],
-                            vec![],
-                            "No Artifact matched the persistent Reference".to_owned(),
-                        )
-                    }
+                [] => projection_for_status(
+                    projected,
+                    Some(snapshot.generation.clone()),
+                    ResolutionStatus::Missing,
+                    None,
+                    vec![],
+                    vec![],
+                    "The deterministic Artifact locator is missing from the Repository snapshot"
+                        .to_owned(),
+                ),
+                [candidate] if !candidate_is_ambiguous(candidate) => {
+                    projection_for_resolved(projected, snapshot, candidate)
                 }
-                [candidate] => projection_for_resolved(projected, snapshot, candidate),
                 _ => projection_for_ambiguous(projected, snapshot, &candidates),
             }
         }
@@ -390,18 +336,12 @@ fn winning_candidates<'a>(
             artifact.artifact.repository.repository_id == reference.repository_id
                 && artifact.artifact.artifact_key.kind() == reference.artifact_kind
         })
-        .filter_map(|artifact| {
-            match_basis(reference, artifact).map(|basis| Candidate { artifact, basis })
+        .filter(|artifact| artifact.artifact.artifact_key.locator() == &reference.locator)
+        .map(|artifact| Candidate {
+            artifact,
+            basis: locator_match_basis(&reference.locator),
         })
         .collect::<Vec<_>>();
-    let Some(winning_rank) = candidates
-        .iter()
-        .map(|candidate| candidate.basis.rank())
-        .max()
-    else {
-        return Vec::new();
-    };
-    candidates.retain(|candidate| candidate.basis.rank() == winning_rank);
     candidates.sort_by(|left, right| {
         left.artifact
             .artifact
@@ -417,85 +357,21 @@ struct Candidate<'a> {
     basis: MatchBasis,
 }
 
-fn match_basis(
-    reference: &EngineeringReference,
-    candidate: &SnapshotArtifact,
-) -> Option<MatchBasis> {
-    let artifact = &candidate.artifact;
-    if matches!(
-        reference.artifact_kind,
-        ArtifactKind::Api | ArtifactKind::Schema
-    ) && reference
-        .locator_hints
-        .as_ref()
-        .and_then(|hints| hints.api_or_schema.as_deref())
-        .zip(logical_name(&artifact.artifact_key))
-        .is_some_and(|(expected, actual)| normalized(expected) == normalized(actual))
-    {
-        return Some(MatchBasis::StableApiSchemaLogicalKey);
-    }
-    if reference.artifact_kind == ArtifactKind::Symbol
-        && qualified_symbol_matches(reference, artifact)
-    {
-        return Some(MatchBasis::QualifiedSymbolLogicalKey);
-    }
-    if reference
-        .semantic_fingerprint
-        .as_ref()
-        .zip(artifact.semantic_fingerprint.as_ref())
-        .is_some_and(|(expected, actual)| expected == actual)
-    {
-        return Some(MatchBasis::SemanticFingerprint);
-    }
-    if reference
-        .content_fingerprint
-        .as_ref()
-        .zip(artifact.content_fingerprint.as_ref())
-        .is_some_and(|(expected, actual)| expected == actual)
-    {
-        return Some(MatchBasis::ContentFingerprint);
-    }
-    if reference
-        .locator_hints
-        .as_ref()
-        .and_then(|hints| hints.path.as_deref())
-        .zip(artifact.locator_hints.path.as_deref())
-        .is_some_and(|(expected, actual)| normalized_path(expected) == normalized_path(actual))
-    {
-        return Some(MatchBasis::PathHint);
-    }
-    None
+fn candidate_is_ambiguous(candidate: &Candidate<'_>) -> bool {
+    !matches!(
+        candidate.artifact.artifact.artifact_key.kind(),
+        ArtifactKind::File | ArtifactKind::Module
+    ) && candidate.artifact.observations.len() > 1
 }
 
-fn qualified_symbol_matches(
-    reference: &EngineeringReference,
-    artifact: &sctx_domain::EngineeringArtifact,
-) -> bool {
-    let Some(hints) = &reference.locator_hints else {
-        return false;
-    };
-    let Some(expected_symbol) = hints.symbol.as_deref() else {
-        return false;
-    };
-    let Some(expected_module) = hints.module.as_deref() else {
-        return false;
-    };
-    artifact
-        .locator_hints
-        .symbol
-        .as_deref()
-        .zip(artifact.locator_hints.module.as_deref())
-        .is_some_and(|(symbol, module)| {
-            normalized(symbol) == normalized(expected_symbol)
-                && normalized_path(module) == normalized_path(expected_module)
-        })
-}
-
-fn logical_name(key: &ArtifactKey) -> Option<&str> {
-    match key.basis() {
-        ArtifactKeyBasis::Logical { logical_name, .. } => Some(logical_name),
-        ArtifactKeyBasis::ContentFingerprint { .. }
-        | ArtifactKeyBasis::SemanticFingerprint { .. } => None,
+const fn locator_match_basis(locator: &ArtifactLocator) -> MatchBasis {
+    match locator {
+        ArtifactLocator::File { .. } => MatchBasis::ExactFilePath,
+        ArtifactLocator::Module { .. } => MatchBasis::ExactModulePath,
+        ArtifactLocator::Api { .. } => MatchBasis::ExactApiLocator,
+        ArtifactLocator::Schema { .. } => MatchBasis::ExactSchemaLocator,
+        ArtifactLocator::Symbol { .. } => MatchBasis::ExactQualifiedSymbolLocator,
+        ArtifactLocator::Test { .. } => MatchBasis::ExactQualifiedTestLocator,
     }
 }
 
@@ -627,14 +503,14 @@ fn association_kind(relation: ReferenceRelation, kind: ArtifactKind) -> Artifact
 fn match_explanation(basis: MatchBasis, key: &ArtifactKey) -> String {
     format!(
         "matched {} using {}",
-        key.basis_explanation(),
+        key.locator_explanation(),
         match basis {
-            MatchBasis::StableApiSchemaLogicalKey => "stable API/Schema logical key",
-            MatchBasis::QualifiedSymbolLogicalKey => "qualified Symbol logical key",
-            MatchBasis::SemanticFingerprint => "semantic fingerprint",
-            MatchBasis::ContentFingerprint => "content fingerprint",
-            MatchBasis::PathHint => "low-weight path hint",
-            MatchBasis::PreviousResolvedArtifact => "previous resolution",
+            MatchBasis::ExactFilePath => "exact repository-relative File path",
+            MatchBasis::ExactModulePath => "exact repository-relative Module path",
+            MatchBasis::ExactApiLocator => "exact protocol, operation, and route",
+            MatchBasis::ExactSchemaLocator => "exact namespace, version, and qualified Schema",
+            MatchBasis::ExactQualifiedSymbolLocator => "exact qualified Symbol signature",
+            MatchBasis::ExactQualifiedTestLocator => "exact qualified Test name",
             MatchBasis::RepositoryUnavailable => "repository availability",
         }
     )
@@ -678,18 +554,6 @@ fn projection_generation(
 fn hash_component(hasher: &mut Sha256, value: &str) {
     hasher.update(value.len().to_be_bytes());
     hasher.update(value.as_bytes());
-}
-
-fn normalized(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-}
-
-fn normalized_path(value: &str) -> String {
-    normalized(&value.replace('\\', "/"))
 }
 
 fn invalid(message: impl Into<String>) -> Error {

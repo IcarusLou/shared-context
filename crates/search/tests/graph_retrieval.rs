@@ -1,9 +1,9 @@
 use sctx_domain::{
-    Applicability, ArtifactKey, ArtifactKeyBasis, ArtifactKind, ContentFingerprint, ContextId,
-    ContextKind, ContextRelation, ContextRelationKind, ContextRevisionDraft, EngineeringArtifact,
-    EngineeringReference, EvidenceSnapshotDraft, EvidenceType, LocatorHints, PublicationAction,
-    PublicationDraft, ReferenceId, ReferenceRelation, RepositoryId, RepositoryIdentity, RevisionId,
-    SemanticFingerprint, SpaceId, TaskId, TaskIntent, TaskSignal, TaskSignalKind,
+    Applicability, ArtifactKey, ArtifactKind, ArtifactLocator, ContextId, ContextKind,
+    ContextRelation, ContextRelationKind, ContextRevisionDraft, EngineeringArtifact,
+    EngineeringReference, EvidenceSnapshotDraft, EvidenceType, PublicationAction, PublicationDraft,
+    ReferenceId, ReferenceRelation, RepoRelativePath, RepositoryId, RepositoryIdentity, RevisionId,
+    SpaceId, TaskId, TaskIntent, TaskSignal, TaskSignalKind,
 };
 use sctx_engineering_graph::{
     ArtifactObservation, ArtifactSourceState, EngineeringProjectionStore,
@@ -181,38 +181,27 @@ fn repository() -> RepositoryIdentity {
     RepositoryIdentity {
         repository_id: RepositoryId::new(),
         canonical_name: "web-search".to_owned(),
-        semantic_fingerprint: SemanticFingerprint::new("repository:web-search").unwrap(),
     }
 }
 
-fn symbol_artifact(
-    repository: &RepositoryIdentity,
-    name: &str,
-    semantic: &str,
-) -> SnapshotArtifact {
-    let artifact_key = ArtifactKey::derive(
-        repository.repository_id,
-        ArtifactKind::Symbol,
-        ArtifactKeyBasis::Logical {
-            namespace: Some("fe::search".to_owned()),
-            logical_name: name.to_owned(),
-        },
-    )
-    .unwrap();
+fn symbol_locator(name: &str) -> ArtifactLocator {
+    ArtifactLocator::Symbol {
+        path: RepoRelativePath::new("src/search.ts").unwrap(),
+        language: "typescript".to_owned(),
+        module: "fe::search".to_owned(),
+        enclosing_type: None,
+        symbol_name: name.to_owned(),
+        signature: format!("{name}()"),
+    }
+}
+
+fn symbol_artifact(repository: &RepositoryIdentity, name: &str) -> SnapshotArtifact {
+    let artifact_key = ArtifactKey::derive(repository.repository_id, symbol_locator(name)).unwrap();
     SnapshotArtifact {
         artifact: EngineeringArtifact {
             repository: repository.clone(),
             artifact_key,
             display_name: name.to_owned(),
-            locator_hints: LocatorHints {
-                module: Some("src/search.ts".to_owned()),
-                path: Some("src/search.ts".to_owned()),
-                symbol: Some(name.to_owned()),
-                language: Some("typescript".to_owned()),
-                ..LocatorHints::default()
-            },
-            content_fingerprint: None,
-            semantic_fingerprint: Some(SemanticFingerprint::new(semantic).unwrap()),
         },
         snapshot_generation: "repo-current".to_owned(),
         source_policy: SnapshotSourcePolicy::TrackedHeadWithSafeTrackedModifications,
@@ -229,8 +218,7 @@ fn reference(
     repository: &RepositoryIdentity,
     context_id: ContextId,
     revision_id: RevisionId,
-    symbol: Option<&str>,
-    semantic: Option<&str>,
+    symbol: &str,
 ) -> ProjectedEngineeringReference {
     ProjectedEngineeringReference {
         context_id,
@@ -240,15 +228,7 @@ fn reference(
             repository_id: repository.repository_id,
             artifact_kind: ArtifactKind::Symbol,
             relation: ReferenceRelation::Implements,
-            locator_hints: symbol.map(|symbol| LocatorHints {
-                module: Some("src/search.ts".to_owned()),
-                path: None,
-                symbol: Some(symbol.to_owned()),
-                language: Some("typescript".to_owned()),
-                ..LocatorHints::default()
-            }),
-            content_fingerprint: None,
-            semantic_fingerprint: semantic.map(|value| SemanticFingerprint::new(value).unwrap()),
+            locator: symbol_locator(symbol),
             supports: "the FE Symbol implements this Context".to_owned(),
             limitations: vec!["local repository observation".to_owned()],
         },
@@ -352,14 +332,8 @@ fn graph_fixture() -> GraphFixture {
     let metadata = index.synchronize().unwrap().metadata;
     let graph_store = EngineeringProjectionStore::initialize(&root).unwrap();
     let repository = repository();
-    let artifact = symbol_artifact(&repository, "SearchSymbol", "semantic:search-symbol");
-    let reference = reference(
-        &repository,
-        source_context,
-        source_revision,
-        Some("SearchSymbol"),
-        None,
-    );
+    let artifact = symbol_artifact(&repository, "SearchSymbol");
+    let reference = reference(&repository, source_context, source_revision, "SearchSymbol");
     let projection = EngineeringReferenceResolver
         .resolve(
             std::slice::from_ref(&reference),
@@ -368,7 +342,6 @@ fn graph_fixture() -> GraphFixture {
                 "repo-current",
                 vec![artifact.clone()],
             )],
-            None,
         )
         .unwrap();
     graph_store
@@ -410,7 +383,7 @@ fn task_request(mode: ContextPackMode, token_budget: usize) -> TaskContextReques
         },
         task_signals: vec![TaskSignal {
             kind: TaskSignalKind::Symbol,
-            content: "SearchSymbol".to_owned(),
+            content: symbol_locator("SearchSymbol").canonical_key(),
         }],
         token_budget,
         max_spaces: 8,
@@ -571,7 +544,6 @@ fn mismatched_or_unavailable_graph_degrades_without_cross_snapshot_edges() {
                 repository_id: fixture.repository.repository_id,
                 reason: "checkout is offline".to_owned(),
             }],
-            Some(&current),
         )
         .unwrap();
     let tree = fixture.index.metadata().unwrap().indexed_tree_oid;
@@ -620,15 +592,18 @@ fn mismatched_or_unavailable_graph_degrades_without_cross_snapshot_edges() {
 #[test]
 fn ambiguous_edges_are_explicit_diagnostics_only_and_never_raise_automatic_eligibility() {
     let fixture = graph_fixture();
-    let semantic = "semantic:ambiguous-symbol";
-    let left = symbol_artifact(&fixture.repository, "SearchSymbol", semantic);
-    let right = symbol_artifact(&fixture.repository, "SearchSymbolAlternative", semantic);
+    let mut ambiguous_artifact = symbol_artifact(&fixture.repository, "SearchSymbol");
+    ambiguous_artifact.observations.push(ArtifactObservation {
+        path: "src/search.ts".to_owned(),
+        line: Some(20),
+        language: SourceLanguage::TypeScriptJavaScript,
+        source_state: ArtifactSourceState::TrackedHead,
+    });
     let ambiguous_reference = reference(
         &fixture.repository,
         fixture.source_context,
         fixture.source_revision,
-        None,
-        Some(semantic),
+        "SearchSymbol",
     );
     let ambiguous = EngineeringReferenceResolver
         .resolve(
@@ -636,9 +611,8 @@ fn ambiguous_edges_are_explicit_diagnostics_only_and_never_raise_automatic_eligi
             &[snapshot(
                 &fixture.repository,
                 "repo-ambiguous",
-                vec![left, right],
+                vec![ambiguous_artifact],
             )],
-            None,
         )
         .unwrap();
     let tree = fixture.index.metadata().unwrap().indexed_tree_oid;
@@ -715,29 +689,18 @@ fn graph_paths_remain_budgeted_and_top_k_deterministic() {
 }
 
 #[test]
-fn exact_file_signal_uses_current_projection_locator_not_a_path_identity_key() {
+fn exact_file_signal_uses_repository_relative_path_locator() {
     let fixture = graph_fixture();
-    let fingerprint = ContentFingerprint::new("content:file-search").unwrap();
-    let artifact_key = ArtifactKey::derive(
-        fixture.repository.repository_id,
-        ArtifactKind::File,
-        ArtifactKeyBasis::ContentFingerprint {
-            fingerprint: fingerprint.clone(),
-        },
-    )
-    .unwrap();
+    let locator = ArtifactLocator::File {
+        path: RepoRelativePath::new("src/search.ts").unwrap(),
+    };
+    let artifact_key =
+        ArtifactKey::derive(fixture.repository.repository_id, locator.clone()).unwrap();
     let file = SnapshotArtifact {
         artifact: EngineeringArtifact {
             repository: fixture.repository.clone(),
             artifact_key,
             display_name: "src/search.ts".to_owned(),
-            locator_hints: LocatorHints {
-                path: Some("src/search.ts".to_owned()),
-                language: Some("typescript".to_owned()),
-                ..LocatorHints::default()
-            },
-            content_fingerprint: Some(fingerprint),
-            semantic_fingerprint: Some(SemanticFingerprint::new("semantic:file-search").unwrap()),
         },
         snapshot_generation: "repo-file".to_owned(),
         source_policy: SnapshotSourcePolicy::TrackedHeadWithSafeTrackedModifications,
@@ -756,12 +719,7 @@ fn exact_file_signal_uses_current_projection_locator_not_a_path_identity_key() {
             repository_id: fixture.repository.repository_id,
             artifact_kind: ArtifactKind::File,
             relation: ReferenceRelation::Implements,
-            locator_hints: Some(LocatorHints {
-                path: Some("src/search.ts".to_owned()),
-                ..LocatorHints::default()
-            }),
-            content_fingerprint: None,
-            semantic_fingerprint: None,
+            locator: locator.clone(),
             supports: "the FE file implements the source decision".to_owned(),
             limitations: vec!["path is a rebuildable locator".to_owned()],
         },
@@ -770,7 +728,6 @@ fn exact_file_signal_uses_current_projection_locator_not_a_path_identity_key() {
         .resolve(
             &[projected],
             &[snapshot(&fixture.repository, "repo-file", vec![file])],
-            None,
         )
         .unwrap();
     let tree = fixture.index.metadata().unwrap().indexed_tree_oid;
@@ -795,9 +752,6 @@ fn exact_file_signal_uses_current_projection_locator_not_a_path_identity_key() {
         TaskRetrievalPath::EngineeringGraph { path, .. }
             if path.task_signal_kind == TaskSignalKind::File
                 && path.task_signal_content == "src/search.ts"
-                && path.artifact_key.basis()
-                    == &ArtifactKeyBasis::ContentFingerprint {
-                        fingerprint: ContentFingerprint::new("content:file-search").unwrap()
-                    }
+                && path.artifact_key.locator() == &locator
     )));
 }

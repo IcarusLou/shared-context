@@ -1,9 +1,10 @@
+use std::collections::BTreeMap;
 use std::fs;
 
 use sctx_domain::{
-    ArtifactKey, ArtifactKeyBasis, ArtifactKind, ContentFingerprint, ContextId,
-    EngineeringArtifact, EngineeringReference, LocatorHints, ReferenceId, ReferenceRelation,
-    RepositoryId, RepositoryIdentity, RevisionId, SemanticFingerprint,
+    ArtifactKey, ArtifactKind, ArtifactLocator, ContextId, EngineeringArtifact,
+    EngineeringReference, ReferenceId, ReferenceRelation, RepoRelativePath, RepositoryId,
+    RepositoryIdentity, ResolutionStatus, RevisionId,
 };
 use sctx_engineering_graph::{
     ArtifactObservation, ArtifactSourceState, EngineeringProjectionStore,
@@ -16,66 +17,81 @@ fn repository(name: &str) -> RepositoryIdentity {
     RepositoryIdentity {
         repository_id: RepositoryId::new(),
         canonical_name: name.to_owned(),
-        semantic_fingerprint: SemanticFingerprint::new(format!("repo:{name}")).unwrap(),
     }
 }
 
-fn logical_key(
-    repository_id: RepositoryId,
-    kind: ArtifactKind,
-    namespace: &str,
-    name: &str,
-) -> ArtifactKey {
-    ArtifactKey::derive(
-        repository_id,
-        kind,
-        ArtifactKeyBasis::Logical {
-            namespace: Some(namespace.to_owned()),
-            logical_name: name.to_owned(),
-        },
-    )
-    .unwrap()
+fn path(value: &str) -> RepoRelativePath {
+    RepoRelativePath::new(value).unwrap()
 }
 
-#[allow(clippy::too_many_arguments)]
+fn file(value: &str) -> ArtifactLocator {
+    ArtifactLocator::File { path: path(value) }
+}
+
+fn module(value: &str) -> ArtifactLocator {
+    ArtifactLocator::Module { path: path(value) }
+}
+
+fn api(value: &str) -> ArtifactLocator {
+    ArtifactLocator::Api {
+        path: path("api/search.yaml"),
+        protocol: "http".to_owned(),
+        operation: "GET".to_owned(),
+        normalized_route: value.to_owned(),
+    }
+}
+
+fn schema(name: &str) -> ArtifactLocator {
+    ArtifactLocator::Schema {
+        path: path("api/search.yaml"),
+        namespace: "search".to_owned(),
+        version: "v2".to_owned(),
+        qualified_name: format!("search::{name}"),
+    }
+}
+
+fn symbol(name: &str, signature: &str) -> ArtifactLocator {
+    ArtifactLocator::Symbol {
+        path: path("src/search.ts"),
+        language: "typescript".to_owned(),
+        module: "src".to_owned(),
+        enclosing_type: Some("SearchController".to_owned()),
+        symbol_name: name.to_owned(),
+        signature: signature.to_owned(),
+    }
+}
+
+fn test_locator(name: &str) -> ArtifactLocator {
+    ArtifactLocator::Test {
+        path: path("tests/search.rs"),
+        qualified_test_name: format!("search::{name}"),
+    }
+}
+
 fn artifact(
     repository: &RepositoryIdentity,
-    kind: ArtifactKind,
-    namespace: &str,
-    name: &str,
-    path: &str,
-    module: Option<&str>,
-    content: Option<&str>,
-    semantic: Option<&str>,
+    locator: ArtifactLocator,
+    occurrences: usize,
 ) -> SnapshotArtifact {
+    let display_name = locator.path().as_str().to_owned();
     let artifact = EngineeringArtifact {
         repository: repository.clone(),
-        artifact_key: logical_key(repository.repository_id, kind, namespace, name),
-        display_name: name.to_owned(),
-        locator_hints: LocatorHints {
-            module: module.map(ToOwned::to_owned),
-            path: Some(path.to_owned()),
-            symbol: matches!(kind, ArtifactKind::Symbol | ArtifactKind::Test)
-                .then(|| name.to_owned()),
-            language: Some("fixture".to_owned()),
-            api_or_schema: matches!(kind, ArtifactKind::Api | ArtifactKind::Schema)
-                .then(|| name.to_owned()),
-            ..LocatorHints::default()
-        },
-        content_fingerprint: content.map(|value| ContentFingerprint::new(value).unwrap()),
-        semantic_fingerprint: semantic.map(|value| SemanticFingerprint::new(value).unwrap()),
+        artifact_key: ArtifactKey::derive(repository.repository_id, locator).unwrap(),
+        display_name,
     };
     artifact.validate().unwrap();
     SnapshotArtifact {
         artifact,
         snapshot_generation: "snap_fixture".to_owned(),
         source_policy: SnapshotSourcePolicy::TrackedHeadWithSafeTrackedModifications,
-        observations: vec![ArtifactObservation {
-            path: path.to_owned(),
-            line: Some(1),
-            language: SourceLanguage::Rust,
-            source_state: ArtifactSourceState::TrackedHead,
-        }],
+        observations: (0..occurrences)
+            .map(|index| ArtifactObservation {
+                path: "src/search.ts".to_owned(),
+                line: Some(u32::try_from(index + 1).unwrap()),
+                language: SourceLanguage::TypeScriptJavaScript,
+                source_state: ArtifactSourceState::TrackedHead,
+            })
+            .collect(),
     }
 }
 
@@ -84,12 +100,7 @@ fn snapshot(
     generation: &str,
     mut artifacts: Vec<SnapshotArtifact>,
 ) -> RepositoryScanOutcome {
-    artifacts.sort_by(|left, right| {
-        left.artifact
-            .artifact_key
-            .digest()
-            .cmp(right.artifact.artifact_key.digest())
-    });
+    artifacts.sort_by(|left, right| left.artifact.artifact_key.cmp(&right.artifact.artifact_key));
     for artifact in &mut artifacts {
         generation.clone_into(&mut artifact.snapshot_generation);
     }
@@ -102,410 +113,204 @@ fn snapshot(
         artifacts,
         scanned_files: 1,
         scanned_bytes: 1,
-        skipped_files: vec![],
+        skipped_files: Vec::new(),
     })
 }
 
+fn relation(kind: ArtifactKind) -> ReferenceRelation {
+    match kind {
+        ArtifactKind::File | ArtifactKind::Module | ArtifactKind::Symbol => {
+            ReferenceRelation::Implements
+        }
+        ArtifactKind::Api | ArtifactKind::Schema => ReferenceRelation::Defines,
+        ArtifactKind::Test => ReferenceRelation::Validates,
+    }
+}
+
 fn reference(
-    repository_id: RepositoryId,
-    kind: ArtifactKind,
-    relation: ReferenceRelation,
-    locator: LocatorHints,
-    content: Option<&str>,
-    semantic: Option<&str>,
+    repository: &RepositoryIdentity,
+    locator: ArtifactLocator,
 ) -> ProjectedEngineeringReference {
-    let reference = EngineeringReference {
-        reference_id: ReferenceId::new(),
-        repository_id,
-        artifact_kind: kind,
-        relation,
-        locator_hints: Some(locator),
-        content_fingerprint: content.map(|value| ContentFingerprint::new(value).unwrap()),
-        semantic_fingerprint: semantic.map(|value| SemanticFingerprint::new(value).unwrap()),
-        supports: "resolver fixture observation".to_owned(),
-        limitations: vec!["lightweight fixture".to_owned()],
-    };
-    reference.validate().unwrap();
     ProjectedEngineeringReference {
         context_id: ContextId::new(),
         revision_id: RevisionId::new(),
-        reference,
+        reference: EngineeringReference {
+            reference_id: ReferenceId::new(),
+            repository_id: repository.repository_id,
+            artifact_kind: locator.kind(),
+            relation: relation(locator.kind()),
+            locator,
+            supports: "the exact locator was directly inspected".to_owned(),
+            limitations: vec!["moves and renames are not recovered".to_owned()],
+        },
     }
 }
 
 #[test]
-fn matching_precedence_prefers_stable_logical_keys_over_fingerprints() {
-    let repository = repository("precedence");
-    let logical = artifact(
-        &repository,
-        ArtifactKind::Api,
-        "api",
-        "/search/v2",
-        "server/api.rs",
-        None,
-        None,
-        Some("semantic:logical"),
-    );
-    let fingerprint_only = artifact(
-        &repository,
-        ArtifactKind::Api,
-        "api",
-        "/different",
-        "server/other.rs",
-        None,
-        None,
-        Some("semantic:shared"),
-    );
-    let projected = reference(
-        repository.repository_id,
-        ArtifactKind::Api,
-        ReferenceRelation::Consumes,
-        LocatorHints {
-            api_or_schema: Some("/search/v2".to_owned()),
-            path: Some("server/other.rs".to_owned()),
-            ..LocatorHints::default()
-        },
-        None,
-        Some("semantic:shared"),
-    );
+fn all_kind_specific_exact_locators_resolve_with_explainable_basis() {
+    let repository = repository("exact");
+    let locators = vec![
+        (file("src/search.ts"), MatchBasis::ExactFilePath),
+        (module("src/search"), MatchBasis::ExactModulePath),
+        (api("/v2/search"), MatchBasis::ExactApiLocator),
+        (schema("SearchResponse"), MatchBasis::ExactSchemaLocator),
+        (
+            symbol("search", "search(query: string)"),
+            MatchBasis::ExactQualifiedSymbolLocator,
+        ),
+        (
+            test_locator("returns_results"),
+            MatchBasis::ExactQualifiedTestLocator,
+        ),
+    ];
+    let references = locators
+        .iter()
+        .map(|(locator, _)| reference(&repository, locator.clone()))
+        .collect::<Vec<_>>();
+    let artifacts = locators
+        .iter()
+        .map(|(locator, _)| artifact(&repository, locator.clone(), 1))
+        .collect::<Vec<_>>();
+    let expected = references
+        .iter()
+        .zip(&locators)
+        .map(|(reference, (_, basis))| (reference.reference.reference_id, *basis))
+        .collect::<BTreeMap<_, _>>();
     let projection = EngineeringReferenceResolver
         .resolve(
-            &[projected],
-            &[snapshot(
-                &repository,
-                "snap-1",
-                vec![logical.clone(), fingerprint_only],
-            )],
-            None,
+            &references,
+            &[snapshot(&repository, "snap-exact", artifacts)],
         )
         .unwrap();
-    let resolved = &projection.references[0];
-
-    assert_eq!(
-        resolved.resolution.status,
-        sctx_domain::ResolutionStatus::Resolved
-    );
-    assert_eq!(
-        resolved.resolution.resolved_artifact,
-        Some(logical.artifact.artifact_key)
-    );
-    assert_eq!(
-        resolved.evidence[0].basis,
-        MatchBasis::StableApiSchemaLogicalKey
-    );
+    for resolved in &projection.references {
+        assert_eq!(resolved.resolution.status, ResolutionStatus::Resolved);
+        assert!(resolved.association.is_some());
+        assert_eq!(resolved.evidence[0].basis, expected[&resolved.reference_id]);
+        assert!((resolved.evidence[0].confidence - 1.0).abs() < f64::EPSILON);
+    }
 }
 
 #[test]
-fn file_move_and_symbol_rename_re_resolve_through_fingerprints() {
-    let repository = repository("moves");
-    let moved_file = artifact(
-        &repository,
-        ArtifactKind::File,
-        "file",
-        "new/search.rs",
-        "new/search.rs",
-        None,
-        Some("content:file"),
-        Some("semantic:file"),
-    );
-    let renamed_symbol = artifact(
-        &repository,
-        ArtifactKind::Symbol,
-        "src",
-        "new_name",
-        "src/search.rs",
-        Some("src"),
-        Some("content:new"),
-        Some("semantic:body"),
-    );
-    let file_reference = reference(
-        repository.repository_id,
-        ArtifactKind::File,
-        ReferenceRelation::Implements,
-        LocatorHints {
-            path: Some("old/search.rs".to_owned()),
-            ..LocatorHints::default()
-        },
-        Some("content:file"),
-        None,
-    );
-    let symbol_reference = reference(
-        repository.repository_id,
-        ArtifactKind::Symbol,
-        ReferenceRelation::Implements,
-        LocatorHints {
-            module: Some("src".to_owned()),
-            path: Some("src/search.rs".to_owned()),
-            symbol: Some("old_name".to_owned()),
-            ..LocatorHints::default()
-        },
-        None,
-        Some("semantic:body"),
-    );
-    let file_reference_id = file_reference.reference.reference_id;
-    let symbol_reference_id = symbol_reference.reference.reference_id;
-    let projection = EngineeringReferenceResolver
-        .resolve(
-            &[file_reference, symbol_reference],
-            &[snapshot(
-                &repository,
-                "snap-moved",
-                vec![moved_file.clone(), renamed_symbol.clone()],
-            )],
-            None,
-        )
-        .unwrap();
-
-    let file = projection
-        .references
-        .iter()
-        .find(|reference| reference.reference_id == file_reference_id)
-        .unwrap();
-    let symbol = projection
-        .references
-        .iter()
-        .find(|reference| reference.reference_id == symbol_reference_id)
-        .unwrap();
-    assert_eq!(file.evidence[0].basis, MatchBasis::ContentFingerprint);
-    assert_eq!(symbol.evidence[0].basis, MatchBasis::SemanticFingerprint);
-    assert_eq!(
-        symbol.resolution.resolved_artifact,
-        Some(renamed_symbol.artifact.artifact_key)
-    );
-}
-
-#[test]
-fn equal_semantic_matches_remain_ambiguous_even_when_one_path_matches() {
-    let repository = repository("ambiguous");
-    let first = artifact(
-        &repository,
-        ArtifactKind::Symbol,
-        "one",
-        "CandidateA",
-        "src/exact.rs",
-        Some("one"),
-        None,
-        Some("semantic:equal"),
-    );
-    let second = artifact(
-        &repository,
-        ArtifactKind::Symbol,
-        "two",
-        "CandidateB",
-        "src/other.rs",
-        Some("two"),
-        None,
-        Some("semantic:equal"),
-    );
-    let projected = reference(
-        repository.repository_id,
-        ArtifactKind::Symbol,
-        ReferenceRelation::Implements,
-        LocatorHints {
-            path: Some("src/exact.rs".to_owned()),
-            symbol: Some("old-unqualified".to_owned()),
-            ..LocatorHints::default()
-        },
-        None,
-        Some("semantic:equal"),
-    );
+fn move_or_rename_is_missing_and_never_guessed_from_similar_content() {
+    let repository = repository("move");
+    let projected = reference(&repository, file("old/search.ts"));
+    let current = artifact(&repository, file("new/search.ts"), 1);
     let projection = EngineeringReferenceResolver
         .resolve(
             &[projected],
-            &[snapshot(&repository, "snap-ambiguous", vec![second, first])],
-            None,
+            &[snapshot(&repository, "snap-moved", vec![current])],
+        )
+        .unwrap();
+    assert_eq!(
+        projection.references[0].resolution.status,
+        ResolutionStatus::Missing
+    );
+    assert!(projection.references[0].association.is_none());
+    assert!(projection.references[0].evidence.is_empty());
+}
+
+#[test]
+fn same_display_name_at_different_paths_does_not_affect_exact_selection() {
+    let repository = repository("same-content");
+    let wanted = file("src/search.ts");
+    let projected = reference(&repository, wanted.clone());
+    let first = artifact(&repository, wanted, 1);
+    let mut second = artifact(&repository, file("legacy/search.ts"), 1);
+    second
+        .artifact
+        .display_name
+        .clone_from(&first.artifact.display_name);
+    let projection = EngineeringReferenceResolver
+        .resolve(
+            &[projected],
+            &[snapshot(&repository, "snap-same", vec![second, first])],
         )
         .unwrap();
     let resolved = &projection.references[0];
-
+    assert_eq!(resolved.resolution.status, ResolutionStatus::Resolved);
     assert_eq!(
-        resolved.resolution.status,
-        sctx_domain::ResolutionStatus::Ambiguous
-    );
-    assert!(resolved.association.is_none());
-    assert_eq!(resolved.evidence.len(), 2);
-    assert!(
-        resolved
-            .evidence
-            .iter()
-            .all(|evidence| evidence.basis == MatchBasis::SemanticFingerprint)
-    );
-    assert!(
         resolved
             .resolution
-            .candidates
-            .windows(2)
-            .all(|pair| { pair[0].digest() < pair[1].digest() })
+            .resolved_artifact
+            .as_ref()
+            .unwrap()
+            .locator(),
+        &file("src/search.ts")
     );
 }
 
 #[test]
-fn deletion_becomes_stale_and_unavailable_repository_recovers() {
-    let repository = repository("lifecycle");
-    let current = artifact(
-        &repository,
-        ArtifactKind::File,
-        "file",
-        "src/lib.rs",
-        "src/lib.rs",
-        None,
-        Some("content:stable"),
-        None,
-    );
-    let projected = reference(
-        repository.repository_id,
-        ArtifactKind::File,
-        ReferenceRelation::Implements,
-        LocatorHints {
-            path: Some("src/lib.rs".to_owned()),
-            ..LocatorHints::default()
-        },
-        Some("content:stable"),
-        None,
-    );
-    let resolver = EngineeringReferenceResolver;
-    let initial = resolver
+fn duplicate_qualified_occurrences_are_ambiguous_and_never_form_edge() {
+    let repository = repository("ambiguous");
+    let locator = symbol("search", "search(query: string)");
+    let projection = EngineeringReferenceResolver
         .resolve(
-            std::slice::from_ref(&projected),
-            &[snapshot(&repository, "snap-present", vec![current.clone()])],
-            None,
+            &[reference(&repository, locator.clone())],
+            &[snapshot(
+                &repository,
+                "snap-ambiguous",
+                vec![artifact(&repository, locator, 2)],
+            )],
         )
         .unwrap();
-    let stale = resolver
-        .resolve_incremental(
-            &initial,
-            std::slice::from_ref(&projected),
-            &[snapshot(&repository, "snap-deleted", vec![])],
-        )
-        .unwrap();
-    assert_eq!(
-        stale.references[0].resolution.status,
-        sctx_domain::ResolutionStatus::Stale
-    );
+    let ambiguous = &projection.references[0];
+    assert_eq!(ambiguous.resolution.status, ResolutionStatus::Ambiguous);
+    assert!(ambiguous.association.is_none());
+    assert_eq!(ambiguous.resolution.candidates.len(), 1);
+}
 
-    let unavailable = resolver
+#[test]
+fn unavailable_repository_recovers_only_when_exact_locator_returns() {
+    let repository = repository("unavailable");
+    let locator = api("/v2/search");
+    let projected = reference(&repository, locator.clone());
+    let unavailable = EngineeringReferenceResolver
         .resolve(
             std::slice::from_ref(&projected),
             &[RepositoryScanOutcome::Unavailable {
                 repository_id: repository.repository_id,
-                reason: "checkout missing".to_owned(),
+                reason: "checkout offline".to_owned(),
             }],
-            Some(&stale),
         )
         .unwrap();
     assert_eq!(
         unavailable.references[0].resolution.status,
-        sctx_domain::ResolutionStatus::Unavailable
+        ResolutionStatus::Unavailable
     );
-    assert_eq!(
-        unavailable.references[0].evidence[0].basis,
-        MatchBasis::RepositoryUnavailable
-    );
-    let recovered = resolver
-        .resolve(
+    assert!(unavailable.references[0].association.is_none());
+
+    let recovered = EngineeringReferenceResolver
+        .resolve_incremental(
+            &unavailable,
             &[projected],
-            &[snapshot(&repository, "snap-recovered", vec![current])],
-            Some(&unavailable),
+            &[snapshot(
+                &repository,
+                "snap-recovered",
+                vec![artifact(&repository, locator, 1)],
+            )],
         )
         .unwrap();
     assert_eq!(
         recovered.references[0].resolution.status,
-        sctx_domain::ResolutionStatus::Resolved
+        ResolutionStatus::Resolved
     );
 }
 
 #[test]
-fn cross_language_api_and_schema_keys_resolve_logically() {
-    let repository = repository("contracts");
-    let api = artifact(
-        &repository,
-        ArtifactKind::Api,
-        "api",
-        "/search/v2",
-        "web/search.ts",
-        None,
-        None,
-        None,
-    );
-    let schema = artifact(
-        &repository,
-        ArtifactKind::Schema,
-        "schema",
-        "SearchResponse",
-        "proto/search.proto",
-        None,
-        None,
-        None,
-    );
-    let references = [
-        reference(
-            repository.repository_id,
-            ArtifactKind::Api,
-            ReferenceRelation::Consumes,
-            LocatorHints {
-                api_or_schema: Some("/search/v2".to_owned()),
-                language: Some("swift".to_owned()),
-                ..LocatorHints::default()
-            },
-            None,
-            None,
-        ),
-        reference(
-            repository.repository_id,
-            ArtifactKind::Schema,
-            ReferenceRelation::Consumes,
-            LocatorHints {
-                api_or_schema: Some("SearchResponse".to_owned()),
-                language: Some("kotlin".to_owned()),
-                ..LocatorHints::default()
-            },
-            None,
-            None,
-        ),
-    ];
-    let projection = EngineeringReferenceResolver
-        .resolve(
-            &references,
-            &[snapshot(&repository, "snap-contracts", vec![api, schema])],
-            None,
-        )
-        .unwrap();
-    assert!(projection.references.iter().all(|reference| {
-        reference.resolution.status == sctx_domain::ResolutionStatus::Resolved
-            && reference.evidence[0].basis == MatchBasis::StableApiSchemaLogicalKey
-    }));
-}
-
-#[test]
-fn incremental_resolution_equals_scratch_and_projection_rebuild_is_byte_equivalent() {
+fn incremental_resolution_and_tree_pinned_store_equal_scratch() {
     let temporary = TempDir::new().unwrap();
     let root = temporary.path().join("shared-context");
     let repository = repository("projection");
-    let current = artifact(
+    let locator = file("src/lib.rs");
+    let projected = reference(&repository, locator.clone());
+    let snapshots = [snapshot(
         &repository,
-        ArtifactKind::File,
-        "file",
-        "src/lib.rs",
-        "src/lib.rs",
-        None,
-        Some("content:projection"),
-        None,
-    );
-    let projected = reference(
-        repository.repository_id,
-        ArtifactKind::File,
-        ReferenceRelation::Implements,
-        LocatorHints {
-            path: Some("old/lib.rs".to_owned()),
-            ..LocatorHints::default()
-        },
-        Some("content:projection"),
-        None,
-    );
-    let snapshots = [snapshot(&repository, "snap-projection", vec![current])];
+        "snap-projection",
+        vec![artifact(&repository, locator, 1)],
+    )];
     let resolver = EngineeringReferenceResolver;
     let scratch = resolver
-        .resolve(std::slice::from_ref(&projected), &snapshots, None)
+        .resolve(std::slice::from_ref(&projected), &snapshots)
         .unwrap();
     let incremental = resolver
         .resolve_incremental(&scratch, std::slice::from_ref(&projected), &snapshots)
@@ -513,70 +318,35 @@ fn incremental_resolution_equals_scratch_and_projection_rebuild_is_byte_equivale
     assert_eq!(incremental, scratch);
 
     let store = EngineeringProjectionStore::initialize(&root).unwrap();
-    store.rebuild(&scratch).unwrap();
+    store
+        .rebuild_for_context_tree(&scratch, Some("context-tree-a"))
+        .unwrap();
     let first_bytes = store.canonical_bytes().unwrap().unwrap();
+    let pinned = store.read_snapshot().unwrap().unwrap();
+    assert_eq!(pinned.context_tree_oid.as_deref(), Some("context-tree-a"));
+    assert_eq!(pinned.projection, scratch);
     let database = store.database_path().to_path_buf();
     drop(store);
     fs::remove_file(database).unwrap();
     let rebuilt = EngineeringProjectionStore::initialize(&root).unwrap();
-    rebuilt.rebuild(&scratch).unwrap();
-    assert_eq!(rebuilt.canonical_bytes().unwrap().unwrap(), first_bytes);
-    assert_eq!(rebuilt.read_projection().unwrap().unwrap(), scratch);
-
     rebuilt
         .rebuild_for_context_tree(&scratch, Some("context-tree-a"))
         .unwrap();
-    let pinned = rebuilt.read_snapshot().unwrap().unwrap();
-    assert_eq!(pinned.context_tree_oid.as_deref(), Some("context-tree-a"));
-    assert_eq!(pinned.projection, scratch);
-    assert_ne!(rebuilt.canonical_bytes().unwrap().unwrap(), first_bytes);
-    assert!(
-        rebuilt
-            .rebuild_for_context_tree(&scratch, Some("  "))
-            .unwrap_err()
-            .message()
-            .contains("Context Tree")
-    );
-
-    let empty = resolver.resolve(&[], &snapshots, Some(&scratch)).unwrap();
-    rebuilt.rebuild_incremental(&empty).unwrap();
-    let current = rebuilt.read_projection().unwrap().unwrap();
-    assert_eq!(current.artifact_generation, empty.artifact_generation);
-    assert!(current.references.is_empty());
-    assert!(
-        !rebuilt
-            .canonical_bytes()
-            .unwrap()
-            .unwrap()
-            .windows(scratch.artifact_generation.len())
-            .any(|window| window == scratch.artifact_generation.as_bytes())
-    );
+    assert_eq!(rebuilt.canonical_bytes().unwrap().unwrap(), first_bytes);
 }
 
 #[test]
-fn unmatched_reference_without_history_is_unresolved() {
-    let repository = repository("unresolved");
-    let projected = reference(
-        repository.repository_id,
-        ArtifactKind::File,
-        ReferenceRelation::Implements,
-        LocatorHints {
-            path: Some("missing.rs".to_owned()),
-            ..LocatorHints::default()
-        },
-        None,
-        None,
-    );
+fn empty_snapshot_is_missing_without_diagnostic_edge() {
+    let repository = repository("missing");
     let projection = EngineeringReferenceResolver
         .resolve(
-            &[projected],
-            &[snapshot(&repository, "snap-empty", vec![])],
-            None,
+            &[reference(&repository, file("missing.rs"))],
+            &[snapshot(&repository, "snap-empty", Vec::new())],
         )
         .unwrap();
     assert_eq!(
         projection.references[0].resolution.status,
-        sctx_domain::ResolutionStatus::Unresolved
+        ResolutionStatus::Missing
     );
     assert!(projection.references[0].association.is_none());
 }

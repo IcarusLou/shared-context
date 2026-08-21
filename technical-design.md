@@ -144,8 +144,8 @@
 | `SpaceAssociation` | Context 与一个 Primary Space 及若干 Related Space 的可修订显式关系 |
 | `ContextRelation` | Context 之间的依赖、约束、实现、验证或冲突关系 |
 | `EvidenceSnapshot` | 可以脱离开发现场独立阅读的最小充分证据 |
-| `EngineeringReference` | Context 中保存的非权威工程定位观察，例如 Symbol、API 或路径 Hint |
-| `EngineeringArtifact` | 当前代码树中可解析的 Repository、Module、File、Symbol、API、Schema 或 Test |
+| `EngineeringReference` | Context 中保存的非权威工程定位观察，包含 RepositoryId 与完整 kind-specific ArtifactLocator |
+| `EngineeringArtifact` | 当前代码树中可解析的 Module、File、Symbol、API、Schema 或 Test |
 | `ContextArtifactAssociation` | Context 与 EngineeringArtifact 的派生、可失效、可重建关联 |
 | `LifecycleTransition` | Context 激活、废弃或替代的不可变因果节点 |
 | `Event` | Git 中实际保存的不可变 JSON 文件 |
@@ -378,14 +378,26 @@ TaskSession、TaskIntent、WorkEpisode 和 ContextCandidate 不属于 Event。
     "engineering_references": [
       {
         "kind": "api",
-        "logical_name": "search-v2.general_tab_visible",
+        "locator": {
+          "locator_kind": "api",
+          "path": "api/search.yaml",
+          "protocol": "http",
+          "operation": "GET",
+          "normalized_route": "/v2/search"
+        },
         "relation": "consumes"
       },
       {
         "kind": "symbol",
-        "path_hint": "src/search/SearchResult.tsx",
-        "symbol_fqn": "SearchResult.renderTabs",
-        "content_fingerprint": "sha256:...",
+        "locator": {
+          "locator_kind": "symbol",
+          "path": "src/search/SearchResult.tsx",
+          "language": "typescript",
+          "module": "search",
+          "enclosing_type": "SearchResult",
+          "symbol_name": "renderTabs",
+          "signature": "renderTabs(): ReactNode"
+        },
         "relation": "implements"
       }
     ]
@@ -498,26 +510,30 @@ Evidence 必须在开发分支、Commit、业务代码仓库或 Agent Session �
 
 ### 7.2 EngineeringReference
 
-路径、行号、Symbol 和 Commit 可以帮助重建关联，但不能单独构成 Evidence。
+EngineeringReference 必须包含 RepositoryId 与一种 kind-specific、repo-relative 的确定性 ArtifactLocator。它是非权威工程观察，不能单独构成 Evidence。
 
 标准 EngineeringReference：
 
 ```yaml
-kind: repository | module | file | symbol | api | schema | test
-repository_hint:
-logical_name:
-path_hint:
-symbol_fqn:
-api_or_schema_key:
-content_fingerprint:
+kind: module | file | symbol | api | schema | test
+repository_id:
+locator:
+  locator_kind: symbol
+  path: src/search/SearchResult.tsx
+  language: typescript
+  module: search
+  enclosing_type: SearchResult
+  symbol_name: renderTabs
+  signature: "renderTabs(): ReactNode"
 relation: implements | consumes | defines | validates | affected_by
-observed_snapshot:
+supports:
+limitations:
 ```
 
 原则：
 
-- `logical_name`、`symbol_fqn`、协议 Key 和内容 Fingerprint 可以组合定位。
-- `path_hint` 只是最近一次观察位置。
+- File/Module 使用精确 Path；API、Schema、Symbol 与 Test 使用完整 kind-specific locator。
+- locator 不使用内容相似度、版本摘要、Git 历史或重命名猜测。
 - Reference 失效只影响检索能力，不影响 Context 内容和生命周期。
 - 当前解析结果不得写回覆盖旧事件。
 
@@ -562,25 +578,22 @@ Engineering Graph 是派生查询结构，节点包括：
 repository_snapshot:
 artifact_id:
 kind:
-logical_name:
-current_path:
-symbol_fqn:
-api_or_schema_key:
-content_fingerprint:
-language:
+locator:
+  locator_kind:
+  path:
+  # 其余字段由 Artifact kind 决定
 ```
 
-`artifact_id` 只在一个 `artifact_generation` 内标识当前解析节点，不是领域 ID，也不保证跨重建保持不变；稳定检索依赖 Reference、逻辑名称、协议 Key 和 Fingerprint 的重新匹配。
+内部增量解析可以使用私有 Git blob OID 或 file-version digest，但它们不进入领域对象、关联证据、Graph ranking、RetrievalPath 或 MCP response。
 
-解析顺序：
+确定性解析：
 
-1. Repository 与 API/Schema Key 精确匹配。
-2. Symbol FQN 与语言级签名匹配。
-3. 内容 Fingerprint 匹配。
-4. Logical Name、Module 和 Path Hint 组合匹配。
-5. 无法唯一解析时保留多个候选并降低置信度。
+1. Repository 不可访问：`unavailable`。
+2. 完整 ArtifactLocator 无匹配：`missing`。
+3. 完整 ArtifactLocator 对应多个当前对象：`ambiguous`。
+4. 完整 ArtifactLocator 唯一匹配：`resolved`，并且只有该状态建立 ContextArtifactAssociation。
 
-文件移动或 Symbol 改名后，通过当前代码树重新扫描生成新的 Resolution；旧 Reference 保留不变。
+文件移动或 Symbol 改名后，旧 Reference 保留不变并变为 `missing`；系统不查询 Git rename/copy history，不生成 relocation candidate，也不要求会话 Agent 修复关联。
 
 ### 8.3 ContextArtifactAssociation
 
@@ -1236,12 +1249,12 @@ M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命�
 ### M3：Engineering Graph — 已实现
 
 - 本地 Repository Registry、同一 Git common-dir 的多 worktree 归一和不可用状态已实现。
-- 受限 tracked-source Scanner 已生成 Repository/Module/File/Symbol/API/Schema/Test Artifact 摘要，不保存或返回完整源码。
+- 受限 tracked-source Scanner 已生成 Module/File/Symbol/API/Schema/Test Artifact 摘要，不保存或返回完整源码。
 - 持久 EngineeringReference Event、ArtifactResolution、ContextArtifactAssociation 和 generation-pinned Projection 已实现。
 - `repository_scan`、`engineering_reference_record`、`association_explain`、`association_rebuild`/diagnose 已接入 MCP/CLI；服务端拥有 Reference/Event 身份与路径。
 - Task Retrieval 已消费唯一 resolved Graph edge 和 Context Relation；歧义/不可用不自动选择，Graph 故障降级为 Context-only。
 - 已删除 M2 的文本 TaskSignal 伪工程路径；File/Symbol/API/Schema/Test 信号只有命中同代、唯一 resolved Artifact 时才形成 Engineering Graph 语义，Intent/Context BM25 与 Scope 继续作为非 Graph fallback。
-- 固定跨 crate/E2E oracle 以手工 ID、路径和关系验证 Rust、TypeScript、JavaScript、Swift、Kotlin、JSON、OpenAPI 与 Proto；覆盖 Symbol→Requirement/Decision/Contract/Validation、File move、Symbol rename、FE API/Schema→跨端 Context、cycle/depth、歧义诊断、Repository unavailable、投影删除重建、Generation 和 Token Budget。
+- 固定跨 crate/E2E oracle 以手工 ID、确定性 locator 和关系验证 Rust、TypeScript、JavaScript、Swift、Kotlin、JSON、OpenAPI 与 Proto；覆盖 Symbol→Requirement/Decision/Contract/Validation、File move/Symbol rename 变为 missing、FE API/Schema→跨端 Context、cycle/depth、歧义诊断、Repository unavailable、投影删除重建、Generation 和 Token Budget。
 - 固定 expected 位于 `tests/oracles/milestone-three-v1.json`，不得通过序列化生产结果生成或更新；只读源 Fixture 位于 `tests/fixtures/milestone-three/repository/`。
 
 #### M3 EvidenceSource 可验证契约（供延期 #136 使用）
@@ -1276,7 +1289,7 @@ EngineeringResolutionSource {
 
 1. `TaskSignalSource` 必须属于当前 ActiveTask 且 lifecycle 为 active；superseded、其他 Task 或不存在的 Signal 不可解析。
 2. `ContextEvidenceSource` 的 Context、Revision 和 Evidence 必须在指定 Context Tree 中构成同一所有权链；任一 ID 存在但组合错误仍视为不可解析。
-3. `EngineeringResolutionSource` 必须在同一 `{context_tree_oid, artifact_generation}` 中解析为唯一 `resolved` Artifact 和 ContextArtifactAssociation；ambiguous、stale、unavailable、unresolved 或跨 Generation 目标只能作为诊断，不能使 maturity 成为 grounded。
+3. `EngineeringResolutionSource` 必须在同一 `{context_tree_oid, artifact_generation}` 中解析为唯一 `resolved` Artifact 和 ContextArtifactAssociation；ambiguous、missing、unavailable 或跨 Generation 目标只能作为诊断，不能使 maturity 成为 grounded。
 4. File/Symbol/API/Schema/Test 声明若以 TaskSignalSource 支撑，还必须能通过同代 Graph 形成上述唯一 Resolution；Prompt、Workspace、Repository 或 Diff 文本本身不能证明 Artifact/Interface 身份。
 5. `grounded` Revision 至少包含一个成功解析的 EvidenceSource，且每个 Artifact/Interface 声明都有来源覆盖；opaque 字符串、自由文本前缀和仅格式合法的 ID 一律不能通过。
 6. #136 实现必须将 maturity 与规范化 typed EvidenceSource 一起纳入 Revision 的持久内容、CAS 和幂等比较；完全相同的重试返回 `already_current`，不得新增 Revision。
@@ -1308,8 +1321,8 @@ EngineeringResolutionSource {
 ### 19.2 Engineering Graph
 
 1. 打开一个已关联 Symbol 时，可以查询其相关 Requirement Intent、Decision、Contract 和 Validation。
-2. 文件移动后，Path Hint 失效但 Fingerprint/Symbol/API 信号可以恢复关联。
-3. Symbol 改名时，系统保留旧 Reference，并生成可解释的新 Resolution。
+2. 文件移动后，原精确 Path locator 直接变为 `missing`，不自动猜测新位置。
+3. Symbol 改名时，旧 qualified locator 直接变为 `missing`，不生成修复流程。
 4. FE 消费 API 字段的代码可以通过 API/Schema 节点召回其他平台的 Contract 或 Validation。
 5. 业务代码仓库不可访问时，Context 内容和 FTS 检索仍可使用。
 6. 删除关联投影后，可以从 Git EngineeringReference 和当前代码树重建。
@@ -1355,7 +1368,7 @@ EngineeringResolutionSource {
 6. Git Event 和 Evidence Object 是稳定 Context 事实源。
 7. TaskIntent、WorkEpisode、Candidate、置信度和当前代码解析结果不是知识事实。
 8. Revision 保存完整快照，不保存文本 Patch。
-9. Evidence 必须自包含；路径、Symbol 和 Commit 只能作为 EngineeringReference。
+9. Evidence 必须自包含；repo-relative Path 与 qualified Symbol/API/Schema/Test 坐标只能作为 EngineeringReference。
 10. EngineeringReference 可以失效，ContextArtifactAssociation 必须可重建。
 11. 文件路径、Git Commit、时间和 Agent Session 不参与领域身份或生命周期归约。
 12. Revision、SpaceAssociation、Lifecycle 和 Conflict 只按显式因果关系归约。

@@ -9,11 +9,11 @@ use std::{
 
 use rusqlite::{Connection, types::ValueRef};
 use sctx_event_schema::{
-    Applicability, ArtifactKind, ConflictParticipant, ContextId, ContextKind, ContextRelation,
-    ContextRelationKind, ContextRevisionDraft, EngineeringReferenceDraft, Event, EventPayload,
-    EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, LocatorHints, PublicationAction,
-    PublicationDraft, PublicationId, ReferenceRelation, RepositoryId, ReviewDraft, ReviewVerdict,
-    RevisionId, SemanticConflictDraft, SpaceId, WorkEpisodeId,
+    Applicability, ArtifactKind, ArtifactLocator, ConflictParticipant, ContextId, ContextKind,
+    ContextRelation, ContextRelationKind, ContextRevisionDraft, EngineeringReferenceDraft, Event,
+    EventPayload, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, PublicationAction,
+    PublicationDraft, PublicationId, ReferenceRelation, RepoRelativePath, RepositoryId,
+    ReviewDraft, ReviewVerdict, RevisionId, SemanticConflictDraft, SpaceId, WorkEpisodeId,
 };
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::{
@@ -81,12 +81,9 @@ fn engineering_reference(context_id: ContextId, revision_id: RevisionId, path: &
             repository_id: RepositoryId::new(),
             artifact_kind: ArtifactKind::File,
             relation: ReferenceRelation::Implements,
-            locator_hints: Some(LocatorHints {
-                path: Some(path.to_owned()),
-                ..LocatorHints::default()
-            }),
-            content_fingerprint: None,
-            semantic_fingerprint: None,
+            locator: ArtifactLocator::File {
+                path: RepoRelativePath::new(path).unwrap(),
+            },
             supports: "The file implements the indexed Context revision".to_owned(),
             limitations: vec!["The locator may become stale".to_owned()],
         },
@@ -415,7 +412,7 @@ fn engineering_reference_incremental_projection_matches_scratch_and_isolates_bad
     assert_eq!(count(&connection, "engineering_reference"), 1);
     let projected: (String, String, String, String, String) = connection
         .query_row(
-            "SELECT context_id, revision_id, artifact_kind, relation, locator_hints_json
+            "SELECT context_id, revision_id, artifact_kind, relation, locator_json
              FROM engineering_reference WHERE reference_id = ?1",
             [reference_id.to_string()],
             |row| {

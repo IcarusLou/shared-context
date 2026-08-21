@@ -7,9 +7,9 @@ use std::{
 };
 
 use sctx_domain::{
-    Applicability, ArtifactKind, ContextId, ContextKind, ContextRevisionDraft,
-    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot, LocatorHints,
-    PublicationAction, PublicationDraft, ReferenceRelation, ReviewDraft, ReviewVerdict, RevisionId,
+    Applicability, ArtifactKind, ArtifactLocator, ContextId, ContextKind, ContextRevisionDraft,
+    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot, PublicationAction,
+    PublicationDraft, ReferenceRelation, RepoRelativePath, ReviewDraft, ReviewVerdict, RevisionId,
     TaskId, TaskIntent, TaskIntentDraft, TaskSignal, TaskSignalKind,
 };
 use sctx_event_schema::{Event, EventPayload};
@@ -173,7 +173,7 @@ fn reference_input(
     repository_id: sctx_domain::RepositoryId,
     kind: ArtifactKind,
     relation: ReferenceRelation,
-    locator_hints: LocatorHints,
+    locator: ArtifactLocator,
 ) -> EngineeringReferenceRecordInput {
     EngineeringReferenceRecordInput {
         context_id: context_id.to_string(),
@@ -181,9 +181,7 @@ fn reference_input(
         repository_id: repository_id.to_string(),
         artifact_kind: kind,
         relation,
-        locator_hints: Some(locator_hints),
-        content_fingerprint: None,
-        semantic_fingerprint: None,
+        locator,
         supports: "Direct source inspection verified this relationship".to_owned(),
         limitations: vec!["Verified only against the current tracked snapshot".to_owned()],
     }
@@ -269,10 +267,8 @@ fn scan_record_rebuild_explain_and_task_pack_cross_two_repositories_and_a_worktr
             first_scan.repository_id,
             ArtifactKind::File,
             ReferenceRelation::Implements,
-            LocatorHints {
-                path: Some("src/alpha.rs".to_owned()),
-                language: Some("rust".to_owned()),
-                ..LocatorHints::default()
+            ArtifactLocator::File {
+                path: RepoRelativePath::new("src/alpha.rs").unwrap(),
             },
         ),
     )
@@ -393,9 +389,8 @@ fn reference_recording_is_concurrent_private_and_rejects_unsafe_or_incomplete_in
         scan.repository_id,
         ArtifactKind::File,
         ReferenceRelation::Implements,
-        LocatorHints {
-            path: Some("src/lib.rs".to_owned()),
-            ..LocatorHints::default()
+        ArtifactLocator::File {
+            path: RepoRelativePath::new("src/lib.rs").unwrap(),
         },
     );
     incomplete.limitations.clear();
@@ -418,9 +413,8 @@ fn reference_recording_is_concurrent_private_and_rejects_unsafe_or_incomplete_in
             scan.repository_id,
             ArtifactKind::File,
             ReferenceRelation::Implements,
-            LocatorHints {
-                path: Some("src/lib.rs".to_owned()),
-                ..LocatorHints::default()
+            ArtifactLocator::File {
+                path: RepoRelativePath::new("src/lib.rs").unwrap(),
             },
         );
         input.supports = format!("Concurrent verified observation {index}");
@@ -456,35 +450,27 @@ fn ambiguous_and_unavailable_explanations_never_choose_and_graph_failure_degrade
     let repo = temporary.path().join("repo");
     init_repo(
         &repo,
-        &[
-            ("src/a/one.rs", "pub struct SharedGraphSymbol;\n"),
-            ("src/b/two.rs", "pub struct SharedGraphSymbol;\n"),
-        ],
+        &[(
+            "src/a/one.rs",
+            "pub struct SharedGraphSymbol;\npub struct SharedGraphSymbol;\n",
+        )],
     );
     let (context_id, revision_id) = accepted_context(&root, "ambiguous graph reference");
     let scan = repository_scan_at_root(&root, &scan_input(&repo)).unwrap();
-    let semantic = scan
+    let locator = scan
         .artifacts
         .iter()
         .find(|artifact| artifact.kind == ArtifactKind::Symbol)
-        .and_then(|artifact| artifact.semantic_fingerprint.as_ref())
-        .unwrap()
-        .as_str()
-        .to_owned();
-    let mut ambiguous_input = reference_input(
+        .map(|artifact| artifact.locator.clone())
+        .unwrap();
+    let ambiguous_input = reference_input(
         context_id,
         revision_id,
         scan.repository_id,
         ArtifactKind::Symbol,
         ReferenceRelation::Defines,
-        LocatorHints {
-            path: Some("src/a/one.rs".to_owned()),
-            symbol: Some("old-unqualified-symbol".to_owned()),
-            language: Some("rust".to_owned()),
-            ..LocatorHints::default()
-        },
+        locator,
     );
-    ambiguous_input.semantic_fingerprint = Some(semantic);
     let recorded = engineering_reference_record_at_root(&root, &ambiguous_input).unwrap();
     association_rebuild_at_root(
         &root,
@@ -502,7 +488,7 @@ fn ambiguous_and_unavailable_explanations_never_choose_and_graph_failure_degrade
     .unwrap();
     assert_eq!(ambiguous.status, sctx_domain::ResolutionStatus::Ambiguous);
     assert!(ambiguous.resolved_artifact.is_none());
-    assert!(ambiguous.ambiguity_candidates.len() >= 2);
+    assert_eq!(ambiguous.ambiguity_candidates.len(), 1);
     assert_eq!(
         ambiguous.graph_paths.len(),
         ambiguous.ambiguity_candidates.len()

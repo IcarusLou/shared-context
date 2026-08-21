@@ -8,9 +8,9 @@ use sctx_event_schema::{
     Annotations, Applicability, ArtifactKind, ConflictParticipant, ConflictResolutionDraft,
     ConflictResolutionResult, ContextId, ContextKind, ContextRevisionDraft, DiagnosticCode,
     EngineeringReferenceDraft, Event, EventPayload, EventType, EvidenceSnapshotDraft, EvidenceType,
-    IntentSnapshot, LocatorHints, OriginHint, ParsedEvent, PublicationAction, PublicationDraft,
-    PublicationId, ReferenceRelation, RepositoryId, ResolutionOutcome, ReviewDraft, ReviewVerdict,
-    SemanticConflictDraft, V1_JSON_SCHEMA, V1_SCHEMA_ID, WorkEpisodeId, parse_event,
+    IntentSnapshot, OriginHint, ParsedEvent, PublicationAction, PublicationDraft, PublicationId,
+    ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionOutcome, ReviewDraft,
+    ReviewVerdict, SemanticConflictDraft, V1_JSON_SCHEMA, V1_SCHEMA_ID, WorkEpisodeId, parse_event,
 };
 use serde_json::{Value, json};
 
@@ -218,13 +218,9 @@ fn generation_api_assigns_new_ids_and_all_generated_events_parse() {
             repository_id: RepositoryId::new(),
             artifact_kind: ArtifactKind::File,
             relation: ReferenceRelation::Implements,
-            locator_hints: Some(LocatorHints {
-                path: Some("src/search.ts".to_owned()),
-                symbol: Some("SearchResults".to_owned()),
-                ..LocatorHints::default()
-            }),
-            content_fingerprint: None,
-            semantic_fingerprint: None,
+            locator: sctx_event_schema::ArtifactLocator::File {
+                path: RepoRelativePath::new("src/search.ts").unwrap(),
+            },
             supports: "The file implements this Context revision".to_owned(),
             limitations: vec!["The path may move".to_owned()],
         },

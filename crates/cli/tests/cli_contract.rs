@@ -792,7 +792,7 @@ fn engineering_graph_cli_commands_scan_record_rebuild_and_explain() {
             "repository_id": scan["data"]["repository_id"],
             "artifact_kind": "file",
             "relation": "implements",
-            "locator_hints": {"path": "src/contract.rs", "language": "rust"},
+            "locator": {"locator_kind": "file", "path": "src/contract.rs"},
             "supports": "Direct CLI fixture inspection verified the implementation",
             "limitations": ["Synthetic CLI repository"]
         }))

@@ -1,7 +1,7 @@
-export function ambiguousLeft() {
+export function ambiguousDuplicate() {
   return 7;
 }
 
-export function ambiguousRight() {
+export function ambiguousDuplicate() {
   return 7;
 }

@@ -178,25 +178,75 @@
       },
       "additionalProperties": true
     },
-    "locator_hints": {
-      "type": "object",
-      "properties": {
-        "module": { "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }] },
-        "path": { "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }] },
-        "symbol": { "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }] },
-        "language": { "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }] },
-        "api_or_schema": { "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }] },
-        "line": { "anyOf": [{ "type": "integer", "minimum": 0, "maximum": 4294967295 }, { "type": "null" }] },
-        "commit": { "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }] }
-      },
-      "anyOf": [
-        { "required": ["module"], "properties": { "module": { "$ref": "#/$defs/non_empty_string" } } },
-        { "required": ["path"], "properties": { "path": { "$ref": "#/$defs/non_empty_string" } } },
-        { "required": ["symbol"], "properties": { "symbol": { "$ref": "#/$defs/non_empty_string" } } },
-        { "required": ["api_or_schema"], "properties": { "api_or_schema": { "$ref": "#/$defs/non_empty_string" } } }
-      ],
-      "dependentRequired": { "line": ["path"] },
-      "additionalProperties": false
+    "artifact_locator": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["locator_kind", "path"],
+          "properties": {
+            "locator_kind": { "const": "file" },
+            "path": { "$ref": "#/$defs/non_empty_string" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["locator_kind", "path"],
+          "properties": {
+            "locator_kind": { "const": "module" },
+            "path": { "$ref": "#/$defs/non_empty_string" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["locator_kind", "path", "protocol", "operation", "normalized_route"],
+          "properties": {
+            "locator_kind": { "const": "api" },
+            "path": { "$ref": "#/$defs/non_empty_string" },
+            "protocol": { "$ref": "#/$defs/non_empty_string" },
+            "operation": { "$ref": "#/$defs/non_empty_string" },
+            "normalized_route": { "$ref": "#/$defs/non_empty_string" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["locator_kind", "path", "namespace", "version", "qualified_name"],
+          "properties": {
+            "locator_kind": { "const": "schema" },
+            "path": { "$ref": "#/$defs/non_empty_string" },
+            "namespace": { "$ref": "#/$defs/non_empty_string" },
+            "version": { "$ref": "#/$defs/non_empty_string" },
+            "qualified_name": { "$ref": "#/$defs/non_empty_string" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["locator_kind", "path", "language", "module", "enclosing_type", "symbol_name", "signature"],
+          "properties": {
+            "locator_kind": { "const": "symbol" },
+            "path": { "$ref": "#/$defs/non_empty_string" },
+            "language": { "$ref": "#/$defs/non_empty_string" },
+            "module": { "$ref": "#/$defs/non_empty_string" },
+            "enclosing_type": { "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }] },
+            "symbol_name": { "$ref": "#/$defs/non_empty_string" },
+            "signature": { "$ref": "#/$defs/non_empty_string" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["locator_kind", "path", "qualified_test_name"],
+          "properties": {
+            "locator_kind": { "const": "test" },
+            "path": { "$ref": "#/$defs/non_empty_string" },
+            "qualified_test_name": { "$ref": "#/$defs/non_empty_string" }
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "engineering_reference": {
       "type": "object",
@@ -205,9 +255,7 @@
         "repository_id",
         "artifact_kind",
         "relation",
-        "locator_hints",
-        "content_fingerprint",
-        "semantic_fingerprint",
+        "locator",
         "supports",
         "limitations"
       ],
@@ -215,37 +263,15 @@
         "reference_id": { "$ref": "#/$defs/reference_id" },
         "repository_id": { "$ref": "#/$defs/repository_id" },
         "artifact_kind": {
-          "enum": ["repository", "module", "file", "symbol", "api", "schema", "test"]
+          "enum": ["module", "file", "symbol", "api", "schema", "test"]
         },
         "relation": {
           "enum": ["implements", "defines", "consumes", "validates", "constrains", "depends_on"]
         },
-        "locator_hints": {
-          "anyOf": [
-            { "$ref": "#/$defs/locator_hints" },
-            { "type": "null" }
-          ]
-        },
-        "content_fingerprint": {
-          "anyOf": [
-            { "$ref": "#/$defs/non_empty_string" },
-            { "type": "null" }
-          ]
-        },
-        "semantic_fingerprint": {
-          "anyOf": [
-            { "$ref": "#/$defs/non_empty_string" },
-            { "type": "null" }
-          ]
-        },
+        "locator": { "$ref": "#/$defs/artifact_locator" },
         "supports": { "$ref": "#/$defs/non_empty_string" },
         "limitations": { "$ref": "#/$defs/string_list" }
       },
-      "anyOf": [
-        { "properties": { "locator_hints": { "$ref": "#/$defs/locator_hints" } } },
-        { "properties": { "content_fingerprint": { "$ref": "#/$defs/non_empty_string" } } },
-        { "properties": { "semantic_fingerprint": { "$ref": "#/$defs/non_empty_string" } } }
-      ],
       "additionalProperties": false
     },
     "intent": {

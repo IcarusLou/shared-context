@@ -381,9 +381,7 @@
         "repository_id": "rpo_00000000-0000-4000-8000-000000003701",
         "artifact_kind": "symbol",
         "relation": "implements",
-        "locator_hints": {"module": "web", "path": "web/search_results.ts", "symbol": "openSearchResults", "language": "typescript-javascript", "api_or_schema": null, "line": 5, "commit": null},
-        "content_fingerprint": null,
-        "semantic_fingerprint": "semantic-v1:d8fdd54cded6b409e02cc25417a72bf408ba626a46f13ff563530eab1c06d38f",
+        "locator": {"locator_kind": "symbol", "path": "web/search_results.ts", "language": "typescript-javascript", "module": "web", "enclosing_type": null, "symbol_name": "openSearchResults", "signature": "export function openSearchResults(response: SearchResponseV2)"},
         "supports": "The frontend Symbol implements the rendering decision",
         "limitations": ["The Symbol name may change"]
       }
@@ -399,9 +397,7 @@
         "repository_id": "rpo_00000000-0000-4000-8000-000000003701",
         "artifact_kind": "api",
         "relation": "defines",
-        "locator_hints": {"module": "web", "path": "web/search_results.ts", "symbol": null, "language": "typescript-javascript", "api_or_schema": "/v2/search/client", "line": 12, "commit": null},
-        "content_fingerprint": null,
-        "semantic_fingerprint": null,
+        "locator": {"locator_kind": "api", "path": "web/search_results.ts", "protocol": "http", "operation": "GET", "normalized_route": "/v2/search/client"},
         "supports": "The server Contract defines the client-facing API semantics",
         "limitations": ["The local API observation is rebuildable"]
       }
@@ -417,9 +413,7 @@
         "repository_id": "rpo_00000000-0000-4000-8000-000000003701",
         "artifact_kind": "schema",
         "relation": "defines",
-        "locator_hints": {"module": "web", "path": "web/search_results.ts", "symbol": null, "language": "typescript-javascript", "api_or_schema": "SearchEnvelopeClient", "line": 5, "commit": null},
-        "content_fingerprint": null,
-        "semantic_fingerprint": null,
+        "locator": {"locator_kind": "schema", "path": "web/search_results.ts", "namespace": "web", "version": "unversioned", "qualified_name": "web::SearchEnvelopeClient"},
         "supports": "The server Contract defines the client schema semantics",
         "limitations": ["The local schema observation is rebuildable"]
       }
@@ -435,11 +429,9 @@
         "repository_id": "rpo_00000000-0000-4000-8000-000000003701",
         "artifact_kind": "file",
         "relation": "implements",
-        "locator_hints": {"module": "legacy", "path": "legacy/search_legacy.js", "symbol": null, "language": "typescript-javascript", "api_or_schema": null, "line": null, "commit": null},
-        "content_fingerprint": "sha256:fd17ed93e69b7987752e2ddf7636593e548fabb1d9cdceb508d80d93f21aa576",
-        "semantic_fingerprint": null,
+        "locator": {"locator_kind": "file", "path": "legacy/search_legacy.js"},
         "supports": "The legacy file implements the compatibility fallback",
-        "limitations": ["The path is only a locator hint"]
+        "limitations": ["A move or rename makes this locator missing"]
       }
     },
     {
@@ -453,10 +445,8 @@
         "repository_id": "rpo_00000000-0000-4000-8000-000000003701",
         "artifact_kind": "symbol",
         "relation": "implements",
-        "locator_hints": {"module": null, "path": "web/ambiguous.ts", "symbol": "removedAmbiguous", "language": "typescript-javascript", "api_or_schema": null, "line": null, "commit": null},
-        "content_fingerprint": null,
-        "semantic_fingerprint": "semantic-v1:58fc37edc5c340245d8d59221c254bdbc26763b32a4196fb668ee144c02c910f",
-        "supports": "The removed Symbol intentionally resolves to equal candidates",
+        "locator": {"locator_kind": "symbol", "path": "web/ambiguous.ts", "language": "typescript-javascript", "module": "web", "enclosing_type": null, "symbol_name": "ambiguousDuplicate", "signature": "export function ambiguousDuplicate()"},
+        "supports": "The duplicate qualified Symbol intentionally resolves as ambiguous",
         "limitations": ["Only explicit diagnostics may expose the candidates"]
       }
     }

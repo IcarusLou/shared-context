@@ -16,12 +16,12 @@ use std::{
 };
 
 use sctx_domain::{
-    Applicability, ArtifactKey, ArtifactKind, ContentFingerprint, ContextId, ContextKind,
+    Applicability, ArtifactKey, ArtifactKind, ArtifactLocator, ContextId, ContextKind,
     ContextRevisionDraft, EngineeringReferenceDraft, Error, ErrorKind, EvidenceSnapshotDraft,
-    EvidenceType, ExternalSessionLocator, LocatorHints, ReferenceId, ReferenceRelation,
-    RepositoryId, ResolutionStatus, Result, RevisionId, SemanticFingerprint, SignalId, SpaceId,
-    TaskId, TaskIntentDraft, TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignal,
-    TaskSignalLifecycle, TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId,
+    EvidenceType, ExternalSessionLocator, ReferenceId, ReferenceRelation, RepositoryId,
+    ResolutionStatus, Result, RevisionId, SignalId, SpaceId, TaskId, TaskIntentDraft,
+    TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalLifecycle,
+    TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId,
 };
 use sctx_engineering_graph::{
     CandidateMatchEvidence, EngineeringProjectionStore, EngineeringReferenceResolver,
@@ -233,9 +233,7 @@ pub struct ArtifactSummary {
     pub artifact_key: ArtifactKey,
     pub kind: ArtifactKind,
     pub display_name: String,
-    pub locator_hints: LocatorHints,
-    pub content_fingerprint: Option<ContentFingerprint>,
-    pub semantic_fingerprint: Option<SemanticFingerprint>,
+    pub locator: ArtifactLocator,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -267,12 +265,7 @@ pub struct EngineeringReferenceRecordInput {
     pub repository_id: String,
     pub artifact_kind: ArtifactKind,
     pub relation: ReferenceRelation,
-    #[serde(default)]
-    pub locator_hints: Option<LocatorHints>,
-    #[serde(default)]
-    pub content_fingerprint: Option<String>,
-    #[serde(default)]
-    pub semantic_fingerprint: Option<String>,
+    pub locator: ArtifactLocator,
     pub supports: String,
     pub limitations: Vec<String>,
 }
@@ -335,9 +328,8 @@ pub struct RepositoryRebuildSummary {
 pub struct ResolutionStatusCounts {
     pub resolved: usize,
     pub ambiguous: usize,
-    pub stale: usize,
+    pub missing: usize,
     pub unavailable: usize,
-    pub unresolved: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -386,17 +378,7 @@ impl EngineeringReferenceRecordInput {
             repository_id,
             artifact_kind: self.artifact_kind,
             relation: self.relation,
-            locator_hints: self.locator_hints.clone(),
-            content_fingerprint: self
-                .content_fingerprint
-                .as_ref()
-                .map(|value| ContentFingerprint::new(value.clone()))
-                .transpose()?,
-            semantic_fingerprint: self
-                .semantic_fingerprint
-                .as_ref()
-                .map(|value| SemanticFingerprint::new(value.clone()))
-                .transpose()?,
+            locator: self.locator.clone(),
             supports: self.supports.clone(),
             limitations: self.limitations.clone(),
         };
@@ -713,8 +695,16 @@ impl Runtime {
             })
             .collect::<Vec<_>>();
         let previous = engineering_graph.read_projection()?;
-        let projection =
-            EngineeringReferenceResolver.resolve(&references, &scan_outcomes, previous.as_ref())?;
+        let projection = previous.as_ref().map_or_else(
+            || EngineeringReferenceResolver.resolve(&references, &scan_outcomes),
+            |previous| {
+                EngineeringReferenceResolver.resolve_incremental(
+                    previous,
+                    &references,
+                    &scan_outcomes,
+                )
+            },
+        )?;
         if !input.diagnose_only {
             engineering_graph
                 .rebuild_for_context_tree(&projection, Some(&snapshot.metadata.indexed_tree_oid))?;
@@ -827,9 +817,7 @@ fn artifact_summary(artifact: &sctx_engineering_graph::SnapshotArtifact) -> Arti
         artifact_key: artifact.artifact.artifact_key.clone(),
         kind: artifact.artifact.artifact_key.kind(),
         display_name: artifact.artifact.display_name.clone(),
-        locator_hints: artifact.artifact.locator_hints.clone(),
-        content_fingerprint: artifact.artifact.content_fingerprint.clone(),
-        semantic_fingerprint: artifact.artifact.semantic_fingerprint.clone(),
+        locator: artifact.artifact.artifact_key.locator().clone(),
     }
 }
 
@@ -883,17 +871,15 @@ fn resolution_status_counts(references: &[ResolvedReferenceProjection]) -> Resol
     let mut counts = ResolutionStatusCounts {
         resolved: 0,
         ambiguous: 0,
-        stale: 0,
+        missing: 0,
         unavailable: 0,
-        unresolved: 0,
     };
     for reference in references {
         match reference.resolution.status {
             ResolutionStatus::Resolved => counts.resolved += 1,
             ResolutionStatus::Ambiguous => counts.ambiguous += 1,
-            ResolutionStatus::Stale => counts.stale += 1,
+            ResolutionStatus::Missing => counts.missing += 1,
             ResolutionStatus::Unavailable => counts.unavailable += 1,
-            ResolutionStatus::Unresolved => counts.unresolved += 1,
         }
     }
     counts
@@ -1881,36 +1867,69 @@ fn engineering_reference_record_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["context_id", "revision_id", "repository_id", "artifact_kind", "relation", "supports", "limitations"],
+        "required": ["context_id", "revision_id", "repository_id", "artifact_kind", "relation", "locator", "supports", "limitations"],
         "properties": {
             "context_id": id_schema("ctx_"),
             "revision_id": id_schema("rev_"),
             "repository_id": id_schema("rpo_"),
-            "artifact_kind": {"type": "string", "enum": ["repository", "module", "file", "symbol", "api", "schema", "test"]},
+            "artifact_kind": {"type": "string", "enum": ["module", "file", "symbol", "api", "schema", "test"]},
             "relation": {"type": "string", "enum": ["implements", "defines", "consumes", "validates", "constrains", "depends_on"]},
-            "locator_hints": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "module": {"type": "string", "minLength": 1},
-                    "path": {"type": "string", "minLength": 1},
-                    "symbol": {"type": "string", "minLength": 1},
-                    "language": {"type": "string", "minLength": 1},
-                    "api_or_schema": {"type": "string", "minLength": 1},
-                    "line": {"type": "integer", "minimum": 1},
-                    "commit": {"type": "string", "minLength": 1}
-                },
-                "minProperties": 1
-            },
-            "content_fingerprint": {"type": "string", "minLength": 1},
-            "semantic_fingerprint": {"type": "string", "minLength": 1},
+            "locator": artifact_locator_input_schema(),
             "supports": {"type": "string", "minLength": 1},
             "limitations": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
-        },
-        "anyOf": [
-            {"required": ["locator_hints"]},
-            {"required": ["content_fingerprint"]},
-            {"required": ["semantic_fingerprint"]}
+        }
+    })
+}
+
+fn artifact_locator_input_schema() -> Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["locator_kind", "path"],
+                "properties": {"locator_kind": {"const": "file"}, "path": {"type": "string", "minLength": 1}}
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["locator_kind", "path"],
+                "properties": {"locator_kind": {"const": "module"}, "path": {"type": "string", "minLength": 1}}
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["locator_kind", "path", "protocol", "operation", "normalized_route"],
+                "properties": {
+                    "locator_kind": {"const": "api"}, "path": {"type": "string", "minLength": 1},
+                    "protocol": {"type": "string", "minLength": 1}, "operation": {"type": "string", "minLength": 1},
+                    "normalized_route": {"type": "string", "minLength": 1}
+                }
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["locator_kind", "path", "namespace", "version", "qualified_name"],
+                "properties": {
+                    "locator_kind": {"const": "schema"}, "path": {"type": "string", "minLength": 1},
+                    "namespace": {"type": "string", "minLength": 1}, "version": {"type": "string", "minLength": 1},
+                    "qualified_name": {"type": "string", "minLength": 1}
+                }
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["locator_kind", "path", "language", "module", "enclosing_type", "symbol_name", "signature"],
+                "properties": {
+                    "locator_kind": {"const": "symbol"}, "path": {"type": "string", "minLength": 1},
+                    "language": {"type": "string", "minLength": 1}, "module": {"type": "string", "minLength": 1},
+                    "enclosing_type": {"type": ["string", "null"], "minLength": 1},
+                    "symbol_name": {"type": "string", "minLength": 1}, "signature": {"type": "string", "minLength": 1}
+                }
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["locator_kind", "path", "qualified_test_name"],
+                "properties": {
+                    "locator_kind": {"const": "test"}, "path": {"type": "string", "minLength": 1},
+                    "qualified_test_name": {"type": "string", "minLength": 1}
+                }
+            }
         ]
     })
 }

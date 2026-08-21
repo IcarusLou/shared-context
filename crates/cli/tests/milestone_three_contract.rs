@@ -8,10 +8,10 @@ use std::{
 
 use sctx_domain::{
     ArtifactKind, ContextId, ContextRelationKind, ReferenceId, RepositoryIdentity,
-    ResolutionStatus, SemanticFingerprint, SpaceId, TaskIntent, TaskSignal, TaskSignalKind,
+    ResolutionStatus, SpaceId, TaskIntent, TaskSignal, TaskSignalKind,
 };
 use sctx_engineering_graph::{
-    EngineeringProjection, EngineeringProjectionStore, EngineeringReferenceResolver, MatchBasis,
+    EngineeringProjection, EngineeringProjectionStore, EngineeringReferenceResolver,
     ProjectedEngineeringReference, RepositoryScanOutcome, RepositoryScanner,
     RepositoryScannerLimits, RepositorySnapshot, SourceLanguage,
 };
@@ -140,8 +140,6 @@ impl MilestoneThreeFixture {
         let repository = RepositoryIdentity {
             repository_id,
             canonical_name: "milestone-three-multilingual-fixture".to_owned(),
-            semantic_fingerprint: SemanticFingerprint::new("semantic-v1:m3-fixed-repository")
-                .unwrap(),
         };
         let scan = RepositoryScanner::new(RepositoryScannerLimits::default())
             .scan(&repository, &repository_path)
@@ -163,7 +161,6 @@ impl MilestoneThreeFixture {
             .resolve(
                 &projected,
                 &[RepositoryScanOutcome::Available(snapshot.clone())],
-                None,
             )
             .unwrap();
         let graph_store = EngineeringProjectionStore::initialize(&root).unwrap();
@@ -235,7 +232,7 @@ fn task_request(
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn fixed_multilanguage_oracle_recovers_file_moves_and_symbol_renames_and_rebuilds() {
+fn fixed_multilanguage_oracle_marks_moves_and_renames_missing_and_rebuilds() {
     let mut fixture = MilestoneThreeFixture::new();
     assert_multilanguage_snapshot(&fixture);
 
@@ -310,51 +307,38 @@ fn fixed_multilanguage_oracle_recovers_file_moves_and_symbol_renames_and_rebuild
         )
         .unwrap();
     let current_file = resolved(&current, &fixture.oracle.expected.references["file"]);
-    assert_eq!(current_file.resolution.status, ResolutionStatus::Resolved);
-    assert_eq!(
-        current_file.resolution.resolved_artifact.as_ref(),
-        Some(&initial_file_key),
-        "File identity remains content-based after its path moves"
-    );
-    assert_eq!(
-        current_file.artifacts[0].locator_hints.path.as_deref(),
-        moved.new_path.as_deref(),
-        "the current Resolution exposes the hand-authored moved path"
-    );
+    assert_eq!(current_file.resolution.status, ResolutionStatus::Missing);
+    assert!(current_file.resolution.resolved_artifact.is_none());
+    assert!(current_file.association.is_none());
+    assert!(current_file.artifacts.is_empty());
+    assert!(current_snapshot.artifacts.iter().any(|artifact| {
+        artifact.artifact.artifact_key.kind() == ArtifactKind::File
+            && artifact.artifact.artifact_key.locator().path().as_str()
+                == moved.new_path.as_deref().unwrap()
+            && artifact.artifact.artifact_key != initial_file_key
+    }));
 
     let current_symbol = resolved(&current, &fixture.oracle.expected.references["symbol"]);
-    assert_eq!(current_symbol.resolution.status, ResolutionStatus::Resolved);
-    assert_ne!(
-        current_symbol.resolution.resolved_artifact.as_ref(),
-        Some(&initial_symbol_key),
-        "a renamed logical Symbol receives a new rebuildable Artifact key"
-    );
-    assert_eq!(
+    assert_eq!(current_symbol.resolution.status, ResolutionStatus::Missing);
+    assert!(current_symbol.resolution.resolved_artifact.is_none());
+    assert!(current_symbol.association.is_none());
+    assert!(
         fixture
             .references
             .iter()
             .find(|reference| reference.reference.reference_id == current_symbol.reference_id)
             .unwrap()
             .reference
-            .locator_hints
-            .as_ref()
-            .unwrap()
-            .symbol
-            .as_deref(),
-        symbol.old_name.as_deref(),
+            .locator
+            .canonical_key()
+            .contains(symbol.old_name.as_deref().unwrap()),
         "the persistent Reference remains the original observation"
     );
-    assert_eq!(
-        current_symbol.artifacts[0].display_name,
-        symbol.new_name.as_deref().unwrap()
-    );
-    assert_eq!(
-        current_symbol.artifacts[0].locator_hints.path.as_deref(),
-        symbol.path.as_deref()
-    );
-    assert!(current_symbol.evidence.iter().any(|evidence| {
-        evidence.basis == MatchBasis::SemanticFingerprint
-            && evidence.artifact_key == current_symbol.resolution.resolved_artifact
+    assert!(current_symbol.evidence.is_empty());
+    assert!(current_snapshot.artifacts.iter().any(|artifact| {
+        artifact.artifact.artifact_key.kind() == ArtifactKind::Symbol
+            && artifact.artifact.display_name == symbol.new_name.as_deref().unwrap()
+            && artifact.artifact.artifact_key != initial_symbol_key
     }));
 
     fixture
@@ -389,37 +373,59 @@ fn fixed_multilanguage_oracle_recovers_file_moves_and_symbol_renames_and_rebuild
             "zxq moved implementation",
         ))
         .unwrap();
-    assert_direct_graph_reference(
-        &moved_file_pack,
-        &fixture.oracle.expected.contexts["decision"],
-        &fixture.oracle.expected.references["file"],
+    assert!(
+        moved_file_pack
+            .items
+            .iter()
+            .flat_map(|item| &item.retrieval_paths)
+            .all(|path| { !matches!(path, TaskRetrievalPath::EngineeringGraph { .. }) })
     );
+    let renamed_locator = fixture
+        .snapshot
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.artifact.display_name == symbol.new_name.as_deref().unwrap())
+        .unwrap()
+        .artifact
+        .artifact_key
+        .locator()
+        .canonical_key();
     let renamed_symbol_pack = fixture
         .engine()
         .task_context_pack(&task_request(
             TaskSignalKind::Symbol,
-            symbol.new_name.as_deref().unwrap(),
+            &renamed_locator,
             ContextPackMode::AutomaticInjection,
             fixture.oracle.expected.token_budget,
             "zxr renamed implementation",
         ))
         .unwrap();
-    assert_direct_graph_reference(
-        &renamed_symbol_pack,
-        &fixture.oracle.expected.contexts["decision"],
-        &fixture.oracle.expected.references["symbol"],
+    assert!(
+        renamed_symbol_pack
+            .items
+            .iter()
+            .flat_map(|item| &item.retrieval_paths)
+            .all(|path| { !matches!(path, TaskRetrievalPath::EngineeringGraph { .. }) })
     );
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn fixed_graph_oracle_opens_requirement_decision_contract_and_cross_platform_validation() {
     let fixture = MilestoneThreeFixture::new();
-    let symbol = &fixture.oracle.expected.artifacts["symbol"];
+    let symbol_signal = fixture
+        .reference("symbol")
+        .resolution
+        .resolved_artifact
+        .as_ref()
+        .unwrap()
+        .locator()
+        .canonical_key();
     let pack = fixture
         .engine()
         .task_context_pack(&task_request(
             TaskSignalKind::Symbol,
-            symbol.old_name.as_deref().unwrap(),
+            &symbol_signal,
             ContextPackMode::AutomaticInjection,
             fixture.oracle.expected.token_budget,
             "zxq inspect current implementation",
@@ -462,16 +468,23 @@ fn fixed_graph_oracle_opens_requirement_decision_contract_and_cross_platform_val
     }
     assert_cycle_safe_and_bounded(&pack);
 
-    for (artifact_name, signal_kind, reference_name) in [
-        ("api", TaskSignalKind::Api, "api"),
-        ("schema", TaskSignalKind::Schema, "schema"),
+    for (signal_kind, reference_name) in [
+        (TaskSignalKind::Api, "api"),
+        (TaskSignalKind::Schema, "schema"),
     ] {
-        let artifact = &fixture.oracle.expected.artifacts[artifact_name];
+        let exact_signal = fixture
+            .reference(reference_name)
+            .resolution
+            .resolved_artifact
+            .as_ref()
+            .unwrap()
+            .locator()
+            .canonical_key();
         let cross_end = fixture
             .engine()
             .task_context_pack(&task_request(
                 signal_kind,
-                artifact.name.as_deref().unwrap(),
+                &exact_signal,
                 ContextPackMode::AutomaticInjection,
                 fixture.oracle.expected.token_budget,
                 "zxs opaque route",
@@ -497,7 +510,7 @@ fn fixed_graph_oracle_opens_requirement_decision_contract_and_cross_platform_val
 
     let mut bounded_request = task_request(
         TaskSignalKind::Symbol,
-        symbol.old_name.as_deref().unwrap(),
+        &symbol_signal,
         ContextPackMode::AutomaticInjection,
         fixture.oracle.expected.bounded_token_budget,
         "zxt budget graph output",
@@ -522,14 +535,15 @@ fn ambiguous_and_unavailable_edges_diagnose_or_fall_back_without_automatic_graph
     let fixture = MilestoneThreeFixture::new();
     let ambiguous = fixture.reference("ambiguous");
     assert_eq!(ambiguous.resolution.status, ResolutionStatus::Ambiguous);
-    assert_eq!(ambiguous.resolution.candidates.len(), 2);
+    assert_eq!(ambiguous.resolution.candidates.len(), 1);
     assert!(ambiguous.association.is_none());
+    let ambiguous_signal = ambiguous.resolution.candidates[0].locator().canonical_key();
 
     let explicit = fixture
         .engine()
         .task_context_pack(&task_request(
             TaskSignalKind::Symbol,
-            "ambiguousLeft",
+            &ambiguous_signal,
             ContextPackMode::Explicit,
             fixture.oracle.expected.token_budget,
             "ambiguous Symbol association",
@@ -542,14 +556,14 @@ fn ambiguous_and_unavailable_edges_diagnose_or_fall_back_without_automatic_graph
             if diagnostic.reference_id
                 == parse_id::<ReferenceId>(&fixture.oracle.expected.references["ambiguous"])
                 && diagnostic.resolution_status == ResolutionStatus::Ambiguous
-                && diagnostic.candidate_artifact_keys.len() == 2
+                && diagnostic.candidate_artifact_keys.len() == 1
     )));
 
     let automatic = fixture
         .engine()
         .task_context_pack(&task_request(
             TaskSignalKind::Symbol,
-            "ambiguousLeft",
+            &ambiguous_signal,
             ContextPackMode::AutomaticInjection,
             fixture.oracle.expected.token_budget,
             "zxu no textual fallback",
@@ -588,7 +602,6 @@ fn ambiguous_and_unavailable_edges_diagnose_or_fall_back_without_automatic_graph
                 repository_id: fixture.repository.repository_id,
                 reason: "fixed oracle checkout unavailable".to_owned(),
             }],
-            Some(&fixture.projection),
         )
         .unwrap();
     assert!(unavailable.references.iter().all(|reference| {
@@ -661,7 +674,8 @@ fn assert_multilanguage_snapshot(fixture: &MilestoneThreeFixture) {
                         .as_deref()
                         .or(expected.old_name.as_deref())
                         .unwrap()
-                && artifact.artifact.locator_hints.path.as_deref() == expected.path.as_deref()
+                && Some(artifact.artifact.artifact_key.locator().path().as_str())
+                    == expected.path.as_deref()
         }));
     }
     for (kind, name) in [

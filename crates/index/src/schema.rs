@@ -195,9 +195,7 @@ CREATE TABLE {prefix}engineering_reference (
     repository_id TEXT NOT NULL,
     artifact_kind TEXT NOT NULL,
     relation TEXT NOT NULL,
-    locator_hints_json TEXT,
-    content_fingerprint TEXT,
-    semantic_fingerprint TEXT,
+    locator_json TEXT NOT NULL,
     supports TEXT NOT NULL,
     limitations_json TEXT NOT NULL,
     projection_json TEXT NOT NULL
@@ -733,7 +731,7 @@ fn populate(
         transaction
             .execute(
                 &format!(
-                    "INSERT INTO {prefix}engineering_reference(reference_id, event_id, space_id, context_id, revision_id, repository_id, artifact_kind, relation, locator_hints_json, content_fingerprint, semantic_fingerprint, supports, limitations_json, projection_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+                    "INSERT INTO {prefix}engineering_reference(reference_id, event_id, space_id, context_id, revision_id, repository_id, artifact_kind, relation, locator_json, supports, limitations_json, projection_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
                 ),
                 params![
                     reference_id.to_string(),
@@ -744,19 +742,7 @@ fn populate(
                     reference.repository_id.to_string(),
                     enum_text(reference.artifact_kind),
                     enum_text(reference.relation),
-                    reference
-                        .locator_hints
-                        .as_ref()
-                        .map(json)
-                        .transpose()?,
-                    reference
-                        .content_fingerprint
-                        .as_ref()
-                        .map(sctx_domain::ContentFingerprint::as_str),
-                    reference
-                        .semantic_fingerprint
-                        .as_ref()
-                        .map(sctx_domain::SemanticFingerprint::as_str),
+                    json(&reference.locator)?,
                     reference.supports,
                     json(&reference.limitations)?,
                     json(projection)?

@@ -12,11 +12,10 @@ mod reducer;
 mod task;
 
 pub use engineering::{
-    ArtifactAssociationKind, ArtifactKey, ArtifactKeyBasis, ArtifactKind, ArtifactRelationKind,
-    ArtifactResolution, ContentFingerprint, ContextArtifactAssociation, ContextRelation,
-    ContextRelationKind, EngineeringArtifact, EngineeringGraphEdge, EngineeringReference,
-    EngineeringReferenceDraft, LocatorHints, ReferenceRelation, RepositoryIdentity,
-    ResolutionStatus, SemanticFingerprint,
+    ArtifactAssociationKind, ArtifactKey, ArtifactKind, ArtifactLocator, ArtifactRelationKind,
+    ArtifactResolution, ContextArtifactAssociation, ContextRelation, ContextRelationKind,
+    EngineeringArtifact, EngineeringGraphEdge, EngineeringReference, EngineeringReferenceDraft,
+    ReferenceRelation, RepoRelativePath, RepositoryIdentity, ResolutionStatus,
 };
 pub use episode::{
     ArtifactAction, ContextCandidate, ContextUseDisposition, WorkEpisode, WorkObservation,

@@ -9,12 +9,10 @@
     "repository_id": "rpo_00000000-0000-4000-8000-000000000901",
     "artifact_kind": "file",
     "relation": "implements",
-    "locator_hints": {
-      "language": "rust",
-      "line": 10
+    "locator": {
+      "locator_kind": "file",
+      "path": "../outside.rs"
     },
-    "content_fingerprint": null,
-    "semantic_fingerprint": null,
     "supports": "Invalid locator fixture.",
     "limitations": []
   }

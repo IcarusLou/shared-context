@@ -9,7 +9,7 @@ use sctx_domain::{Error, ErrorKind, Result};
 
 use crate::EngineeringProjection;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Disposable local projection store for resolved Engineering Graph state.
@@ -283,7 +283,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 artifact_generation TEXT NOT NULL,
                 payload_json TEXT NOT NULL CHECK (json_valid(payload_json))
             ) STRICT;
-            PRAGMA user_version = 2;",
+            PRAGMA user_version = 3;",
         )
         .map_err(sql_error("initialize Engineering projection schema"))
 }

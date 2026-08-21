@@ -29,11 +29,9 @@ use std::{
 };
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use sctx_domain::{
-    Error, ErrorKind, RepositoryId, RepositoryIdentity, Result, SemanticFingerprint,
-};
+use sctx_domain::{Error, ErrorKind, RepositoryId, RepositoryIdentity, Result};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Current local accessibility of a registered Repository.
@@ -581,7 +579,6 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
             "CREATE TABLE IF NOT EXISTS repository_identity (
                 repository_id TEXT PRIMARY KEY,
                 canonical_name TEXT NOT NULL,
-                semantic_fingerprint TEXT NOT NULL,
                 available INTEGER NOT NULL CHECK (available IN (0, 1))
             ) STRICT;
             CREATE TABLE IF NOT EXISTS repository_declared_identity (
@@ -604,7 +601,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 ON repository_locator (git_common_dir_identity);
             CREATE INDEX IF NOT EXISTS repository_locator_remote
                 ON repository_locator (remote_hint);
-            PRAGMA user_version = 1;",
+            PRAGMA user_version = 2;",
         )
         .map_err(sql_error("initialize Repository Registry schema"))
 }
@@ -674,26 +671,17 @@ fn insert_repository(
                 .map(|name| name.to_string_lossy().into_owned())
         })
         .ok_or_else(|| invalid("Repository checkout has no canonical name"))?;
-    let semantic = observation.declared_identity.as_ref().map_or_else(
-        || format!("git-common:{}", observation.git_common_dir_identity),
-        |declared| format!("declared:{declared}"),
-    );
     let identity = RepositoryIdentity {
         repository_id,
         canonical_name,
-        semantic_fingerprint: SemanticFingerprint::new(semantic)?,
     };
     identity.validate()?;
     transaction
         .execute(
             "INSERT INTO repository_identity (
-                repository_id, canonical_name, semantic_fingerprint, available
-             ) VALUES (?1, ?2, ?3, 1)",
-            params![
-                identity.repository_id.to_string(),
-                identity.canonical_name,
-                identity.semantic_fingerprint.as_str(),
-            ],
+                repository_id, canonical_name, available
+             ) VALUES (?1, ?2, 1)",
+            params![identity.repository_id.to_string(), identity.canonical_name,],
         )
         .map_err(sql_error("insert Repository identity"))?;
     Ok(())
@@ -858,26 +846,19 @@ fn read_repository(
 ) -> Result<Option<RegisteredRepository>> {
     let row = connection
         .query_row(
-            "SELECT canonical_name, semantic_fingerprint, available
+            "SELECT canonical_name, available
              FROM repository_identity WHERE repository_id = ?1",
             [repository_id.to_string()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, bool>(2)?,
-                ))
-            },
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
         )
         .optional()
         .map_err(sql_error("read Repository identity"))?;
-    let Some((canonical_name, fingerprint, available)) = row else {
+    let Some((canonical_name, available)) = row else {
         return Ok(None);
     };
     let identity = RepositoryIdentity {
         repository_id,
         canonical_name,
-        semantic_fingerprint: SemanticFingerprint::new(fingerprint)?,
     };
     identity.validate()?;
     let mut statement = connection

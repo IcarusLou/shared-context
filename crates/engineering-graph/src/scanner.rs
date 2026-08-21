@@ -6,8 +6,8 @@ use std::{
 };
 
 use sctx_domain::{
-    ArtifactKey, ArtifactKeyBasis, ArtifactKind, ContentFingerprint, EngineeringArtifact, Error,
-    ErrorKind, LocatorHints, RepositoryIdentity, Result, SemanticFingerprint,
+    ArtifactKey, ArtifactKind, ArtifactLocator, EngineeringArtifact, Error, ErrorKind,
+    RepoRelativePath, RepositoryIdentity, Result,
 };
 use sha2::{Digest, Sha256};
 
@@ -143,7 +143,7 @@ impl RepositoryScanner {
     ///
     /// # Errors
     ///
-    /// Returns typed validation, local Git, filesystem, or fingerprint errors.
+    /// Returns typed validation, local Git, filesystem, or parsing errors.
     #[allow(clippy::too_many_lines)]
     pub fn scan(
         &self,
@@ -270,7 +270,7 @@ impl RepositoryScanner {
                 path: relative,
                 language,
                 source_state,
-                content_fingerprint: content_fingerprint(&bytes)?,
+                version_digest: file_version_digest(&bytes),
                 bytes,
             });
         }
@@ -326,7 +326,7 @@ struct SourceFile {
     path: String,
     language: SourceLanguage,
     source_state: ArtifactSourceState,
-    content_fingerprint: ContentFingerprint,
+    version_digest: String,
     bytes: Vec<u8>,
 }
 
@@ -352,83 +352,55 @@ impl<'a> ArtifactBuilder<'a> {
         self.insert(
             artifact(
                 self.repository,
-                ArtifactKind::File,
-                ArtifactKeyBasis::ContentFingerprint {
-                    fingerprint: source.content_fingerprint.clone(),
+                ArtifactLocator::File {
+                    path: repo_path(&source.path)?,
                 },
                 &source.path,
-                LocatorHints {
-                    path: Some(source.path.clone()),
-                    language: Some(language_name(source.language).to_owned()),
-                    ..LocatorHints::default()
-                },
-                Some(source.content_fingerprint.clone()),
-                Some(semantic_fingerprint(text)?),
             )?,
             observation(source, None),
         );
-        self.insert(
-            artifact(
-                self.repository,
-                ArtifactKind::Module,
-                logical_basis("module", &module),
-                &module,
-                LocatorHints {
-                    module: Some(module.clone()),
-                    path: Some(module_path(&source.path)),
-                    language: Some(language_name(source.language).to_owned()),
-                    ..LocatorHints::default()
-                },
-                None,
-                None,
-            )?,
-            observation(source, None),
-        );
-        for discovery in extract(source.language, &source.path, text) {
-            let (namespace, locator) = match discovery.kind {
-                ArtifactKind::Symbol | ArtifactKind::Test => (
-                    module.as_str(),
-                    LocatorHints {
-                        module: Some(module.clone()),
-                        path: Some(source.path.clone()),
-                        symbol: Some(discovery.name.clone()),
-                        language: Some(language_name(source.language).to_owned()),
-                        line: Some(discovery.line),
-                        ..LocatorHints::default()
-                    },
-                ),
-                ArtifactKind::Api => (
-                    "api",
-                    LocatorHints {
-                        path: Some(source.path.clone()),
-                        language: Some(language_name(source.language).to_owned()),
-                        api_or_schema: Some(discovery.name.clone()),
-                        line: Some(discovery.line),
-                        ..LocatorHints::default()
-                    },
-                ),
-                ArtifactKind::Schema => (
-                    "schema",
-                    LocatorHints {
-                        path: Some(source.path.clone()),
-                        language: Some(language_name(source.language).to_owned()),
-                        api_or_schema: Some(discovery.name.clone()),
-                        line: Some(discovery.line),
-                        ..LocatorHints::default()
-                    },
-                ),
-                _ => continue,
-            };
+        if let Some(module_path) = module_path(&source.path) {
             self.insert(
                 artifact(
                     self.repository,
-                    discovery.kind,
-                    logical_basis(namespace, &discovery.name),
-                    &discovery.name,
-                    locator,
-                    Some(content_fingerprint(discovery.source.as_bytes())?),
-                    Some(semantic_fingerprint(&discovery.semantic_source)?),
+                    ArtifactLocator::Module {
+                        path: repo_path(&module_path)?,
+                    },
+                    &module,
                 )?,
+                observation(source, None),
+            );
+        }
+        for discovery in extract(source.language, &source.path, text) {
+            let locator = match discovery.kind {
+                ArtifactKind::Symbol => ArtifactLocator::Symbol {
+                    path: repo_path(&source.path)?,
+                    language: language_name(source.language).to_owned(),
+                    module: module.clone(),
+                    enclosing_type: None,
+                    symbol_name: discovery.name.clone(),
+                    signature: normalize_signature(&discovery.source),
+                },
+                ArtifactKind::Test => ArtifactLocator::Test {
+                    path: repo_path(&source.path)?,
+                    qualified_test_name: format!("{module}::{}", discovery.name),
+                },
+                ArtifactKind::Api => ArtifactLocator::Api {
+                    path: repo_path(&source.path)?,
+                    protocol: api_protocol(&discovery.source).to_owned(),
+                    operation: api_operation(&discovery.source).to_owned(),
+                    normalized_route: normalize_api_key(&discovery.name),
+                },
+                ArtifactKind::Schema => ArtifactLocator::Schema {
+                    path: repo_path(&source.path)?,
+                    namespace: module.clone(),
+                    version: schema_version(&discovery.source),
+                    qualified_name: format!("{module}::{}", discovery.name),
+                },
+                _ => continue,
+            };
+            self.insert(
+                artifact(self.repository, locator, &discovery.name)?,
                 observation(source, Some(discovery.line)),
             );
         }
@@ -462,20 +434,13 @@ impl<'a> ArtifactBuilder<'a> {
 
 fn artifact(
     repository: &RepositoryIdentity,
-    kind: ArtifactKind,
-    basis: ArtifactKeyBasis,
+    locator: ArtifactLocator,
     display_name: &str,
-    locator_hints: LocatorHints,
-    content: Option<ContentFingerprint>,
-    semantic: Option<SemanticFingerprint>,
 ) -> Result<EngineeringArtifact> {
     let artifact = EngineeringArtifact {
         repository: repository.clone(),
-        artifact_key: ArtifactKey::derive(repository.repository_id, kind, basis)?,
+        artifact_key: ArtifactKey::derive(repository.repository_id, locator)?,
         display_name: display_name.to_owned(),
-        locator_hints,
-        content_fingerprint: content,
-        semantic_fingerprint: semantic,
     };
     artifact.validate()?;
     Ok(artifact)
@@ -496,7 +461,6 @@ struct Discovery {
     name: String,
     line: u32,
     source: String,
-    semantic_source: String,
 }
 
 fn extract(language: SourceLanguage, path: &str, text: &str) -> Vec<Discovery> {
@@ -536,7 +500,6 @@ fn extract_code(
             let source = declaration_source(&lines, index);
             discoveries.push(Discovery {
                 kind,
-                semantic_source: normalized_semantic(&source.replace(&name, "_symbol_")),
                 source,
                 name,
                 line: line_number(index),
@@ -549,7 +512,6 @@ fn extract_code(
                 name: api.clone(),
                 line: line_number(index),
                 source: trimmed.to_owned(),
-                semantic_source: format!("api:{api}"),
             });
         }
         if matches!(language, SourceLanguage::TypeScriptJavaScript)
@@ -560,7 +522,6 @@ fn extract_code(
                 name: name.clone(),
                 line: line_number(index),
                 source: trimmed.to_owned(),
-                semantic_source: format!("test:{name}"),
             });
         }
     }
@@ -787,11 +748,23 @@ fn extract_json(path: &str, text: &str) -> Vec<Discovery> {
     )];
     if value.get("openapi").is_some() {
         if let Some(paths) = value.get("paths").and_then(serde_json::Value::as_object) {
-            discoveries.extend(
-                paths
-                    .keys()
-                    .map(|name| discovery(ArtifactKind::Api, name, 1)),
-            );
+            for (route, operations) in paths {
+                if let Some(operations) = operations.as_object() {
+                    for operation in operations.keys().filter(|operation| {
+                        matches!(
+                            operation.to_ascii_lowercase().as_str(),
+                            "get" | "post" | "put" | "patch" | "delete" | "head" | "options"
+                        )
+                    }) {
+                        discoveries.push(Discovery {
+                            kind: ArtifactKind::Api,
+                            name: route.clone(),
+                            line: 1,
+                            source: format!("{operation}({route})"),
+                        });
+                    }
+                }
+            }
         }
         if let Some(schemas) = value
             .pointer("/components/schemas")
@@ -810,6 +783,7 @@ fn extract_json(path: &str, text: &str) -> Vec<Discovery> {
 fn extract_yaml(path: &str, text: &str) -> Vec<Discovery> {
     let mut discoveries = vec![discovery(ArtifactKind::Schema, file_stem(path), 1)];
     let mut section = "";
+    let mut current_route = None::<String>;
     for (index, line) in text.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed == "paths:" {
@@ -832,7 +806,20 @@ fn extract_yaml(path: &str, text: &str) -> Vec<Discovery> {
             continue;
         };
         if section == "paths" && key.starts_with('/') {
-            discoveries.push(discovery(ArtifactKind::Api, key, line_number(index)));
+            current_route = Some(key.to_owned());
+        } else if section == "paths"
+            && matches!(
+                key.to_ascii_lowercase().as_str(),
+                "get" | "post" | "put" | "patch" | "delete" | "head" | "options"
+            )
+            && let Some(route) = &current_route
+        {
+            discoveries.push(Discovery {
+                kind: ArtifactKind::Api,
+                name: route.clone(),
+                line: line_number(index),
+                source: format!("{key}({route})"),
+            });
         } else if section == "schemas" && !key.is_empty() {
             discoveries.push(discovery(ArtifactKind::Schema, key, line_number(index)));
         }
@@ -851,7 +838,12 @@ fn extract_proto(text: &str) -> Vec<Discovery> {
             ("rpc ", ArtifactKind::Api),
         ] {
             if let Some(name) = trimmed.strip_prefix(prefix).and_then(identifier) {
-                discoveries.push(discovery(kind, name, line_number(index)));
+                discoveries.push(Discovery {
+                    kind,
+                    name: name.to_owned(),
+                    line: line_number(index),
+                    source: trimmed.to_owned(),
+                });
             }
         }
     }
@@ -864,7 +856,6 @@ fn discovery(kind: ArtifactKind, name: &str, line: u32) -> Discovery {
         name: name.to_owned(),
         line,
         source: name.to_owned(),
-        semantic_source: format!("{}:{name}", kind_name(kind)),
     }
 }
 
@@ -1016,11 +1007,11 @@ fn module_name(path: &str) -> String {
         )
 }
 
-fn module_path(path: &str) -> String {
-    Path::new(path).parent().map_or_else(
-        || ".".to_owned(),
-        |parent| parent.to_string_lossy().into_owned(),
-    )
+fn module_path(path: &str) -> Option<String> {
+    Path::new(path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.to_string_lossy().into_owned())
 }
 
 fn file_stem(path: &str) -> &str {
@@ -1030,35 +1021,59 @@ fn file_stem(path: &str) -> &str {
         .unwrap_or("schema")
 }
 
-fn logical_basis(namespace: &str, logical_name: &str) -> ArtifactKeyBasis {
-    ArtifactKeyBasis::Logical {
-        namespace: Some(namespace.to_owned()),
-        logical_name: logical_name.to_owned(),
+fn repo_path(value: &str) -> Result<RepoRelativePath> {
+    RepoRelativePath::new(value)
+}
+
+fn file_version_digest(bytes: &[u8]) -> String {
+    format!("version:{:x}", Sha256::digest(bytes))
+}
+
+fn normalize_signature(value: &str) -> String {
+    value
+        .lines()
+        .next()
+        .unwrap_or(value)
+        .split(['{', '='])
+        .next()
+        .unwrap_or(value)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn api_protocol(source: &str) -> &'static str {
+    if source.to_ascii_lowercase().contains("rpc ") {
+        "grpc"
+    } else {
+        "http"
     }
 }
 
-fn content_fingerprint(bytes: &[u8]) -> Result<ContentFingerprint> {
-    ContentFingerprint::new(format!("sha256:{:x}", Sha256::digest(bytes)))
+fn api_operation(source: &str) -> &'static str {
+    let lower = source.to_ascii_lowercase();
+    for (needle, operation) in [
+        ("post(", "POST"),
+        ("put(", "PUT"),
+        ("patch(", "PATCH"),
+        ("delete(", "DELETE"),
+        ("get(", "GET"),
+        ("fetch", "GET"),
+        ("rpc ", "RPC"),
+    ] {
+        if lower.contains(needle) {
+            return operation;
+        }
+    }
+    "ANY"
 }
 
-fn semantic_fingerprint(text: &str) -> Result<SemanticFingerprint> {
-    SemanticFingerprint::new(format!(
-        "semantic-v1:{:x}",
-        Sha256::digest(normalized_semantic(text).as_bytes())
-    ))
-}
-
-fn normalized_semantic(text: &str) -> String {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| {
-            !line.is_empty()
-                && !line.starts_with("//")
-                && !line.starts_with('#')
-                && !line.starts_with("/*")
-        })
-        .flat_map(str::split_whitespace)
-        .collect::<String>()
+fn schema_version(source: &str) -> String {
+    source
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '.')
+        .find(|part| part.starts_with('v') && part[1..].chars().all(|value| value.is_ascii_digit()))
+        .unwrap_or("unversioned")
+        .to_owned()
 }
 
 fn snapshot_generation(
@@ -1076,7 +1091,7 @@ fn snapshot_generation(
     }
     for source in sources {
         hash_component(&mut hasher, &source.path);
-        hash_component(&mut hasher, source.content_fingerprint.as_str());
+        hash_component(&mut hasher, &source.version_digest);
         hash_component(
             &mut hasher,
             match source.source_state {
@@ -1091,18 +1106,6 @@ fn snapshot_generation(
 fn hash_component(hasher: &mut Sha256, value: &str) {
     hasher.update(value.len().to_be_bytes());
     hasher.update(value.as_bytes());
-}
-
-fn kind_name(kind: ArtifactKind) -> &'static str {
-    match kind {
-        ArtifactKind::Repository => "repository",
-        ArtifactKind::Module => "module",
-        ArtifactKind::File => "file",
-        ArtifactKind::Symbol => "symbol",
-        ArtifactKind::Api => "api",
-        ArtifactKind::Schema => "schema",
-        ArtifactKind::Test => "test",
-    }
 }
 
 fn invalid(message: impl Into<String>) -> Error {

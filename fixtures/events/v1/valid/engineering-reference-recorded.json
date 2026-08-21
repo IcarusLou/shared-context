@@ -9,19 +9,12 @@
     "repository_id": "rpo_00000000-0000-4000-8000-000000000901",
     "artifact_kind": "file",
     "relation": "implements",
-    "locator_hints": {
-      "module": "search",
-      "path": "src/search.ts",
-      "symbol": "SearchResults",
-      "language": "typescript",
-      "api_or_schema": null,
-      "line": 42,
-      "commit": "0123456789abcdef"
+    "locator": {
+      "locator_kind": "file",
+      "path": "src/search.ts"
     },
-    "content_fingerprint": "sha256:reference-fixture",
-    "semantic_fingerprint": null,
     "supports": "This file implements the referenced Context revision.",
-    "limitations": ["The path and line may become stale after a refactor."]
+    "limitations": ["A move or rename makes this locator missing."]
   },
   "annotations": {
     "producer": "fixture",

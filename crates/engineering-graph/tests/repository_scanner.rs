@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, fs, path::Path, process::Command};
 
-use sctx_domain::{ArtifactKind, RepositoryId, RepositoryIdentity, SemanticFingerprint};
+use sctx_domain::{ArtifactKind, RepositoryId, RepositoryIdentity};
 use sctx_engineering_graph::{
     ArtifactSourceState, RepositoryScanOutcome, RepositoryScanner, RepositoryScannerLimits,
     RepositorySnapshot, SkippedFileReason, SourceLanguage,
@@ -48,7 +48,6 @@ fn identity(name: &str) -> RepositoryIdentity {
     RepositoryIdentity {
         repository_id: RepositoryId::new(),
         canonical_name: name.to_owned(),
-        semantic_fingerprint: SemanticFingerprint::new(format!("repo:{name}")).unwrap(),
     }
 }
 
@@ -158,52 +157,49 @@ fn discovers_bounded_cross_language_artifacts_in_stable_order() {
     ] {
         assert!(kinds.contains(&expected), "missing {expected:?}");
     }
-    let api = first
+    let apis = first
         .artifacts
         .iter()
-        .find(|artifact| {
+        .filter(|artifact| {
             artifact.artifact.artifact_key.kind() == ArtifactKind::Api
                 && artifact.artifact.display_name == "/api/search"
         })
-        .unwrap();
-    assert!(
-        api.observations
-            .iter()
-            .map(|observation| observation.language)
+        .collect::<Vec<_>>();
+    assert!(!apis.is_empty());
+    assert_eq!(
+        apis.iter()
+            .map(|artifact| &artifact.artifact.artifact_key)
             .collect::<BTreeSet<_>>()
-            .is_superset(
-                &[
-                    SourceLanguage::Rust,
-                    SourceLanguage::TypeScriptJavaScript,
-                    SourceLanguage::Swift,
-                    SourceLanguage::Kotlin,
-                    SourceLanguage::Json,
-                ]
-                .into()
-            )
+            .len(),
+        apis.len(),
+        "same route in different repository-relative files remains distinct"
     );
-    let schema = first
+    assert!(
+        apis.iter()
+            .all(|artifact| !artifact.observations.is_empty())
+    );
+    let schemas = first
         .artifacts
         .iter()
-        .find(|artifact| {
+        .filter(|artifact| {
             artifact.artifact.artifact_key.kind() == ArtifactKind::Schema
                 && artifact.artifact.display_name == "SearchResponse"
         })
-        .unwrap();
-    assert!(
-        schema
-            .observations
+        .collect::<Vec<_>>();
+    assert!(!schemas.is_empty());
+    assert_eq!(
+        schemas
             .iter()
-            .map(|observation| observation.language)
+            .map(|artifact| &artifact.artifact.artifact_key)
             .collect::<BTreeSet<_>>()
-            .is_superset(
-                &[
-                    SourceLanguage::TypeScriptJavaScript,
-                    SourceLanguage::Json,
-                    SourceLanguage::Proto,
-                ]
-                .into()
-            )
+            .len(),
+        schemas.len(),
+        "same Schema name in different files remains distinct"
+    );
+    assert!(
+        schemas
+            .iter()
+            .all(|artifact| !artifact.observations.is_empty())
     );
     let test_languages = first
         .artifacts
@@ -296,7 +292,7 @@ fn tracked_modifications_are_included_while_untracked_and_unsafe_files_are_skipp
 }
 
 #[test]
-fn file_move_keeps_file_key_and_fingerprints() {
+fn file_move_changes_exact_path_key_without_relocation_guessing() {
     let temporary = TempDir::new().unwrap();
     let repo = temporary.path().join("move repo");
     init_repo(&repo);
@@ -323,22 +319,14 @@ fn file_move_keeps_file_key_and_fingerprints() {
         .find(|artifact| artifact.artifact.artifact_key.kind() == ArtifactKind::File)
         .unwrap();
 
-    assert_eq!(
+    assert_ne!(
         before_file.artifact.artifact_key,
         after_file.artifact.artifact_key
-    );
-    assert_eq!(
-        before_file.artifact.content_fingerprint,
-        after_file.artifact.content_fingerprint
-    );
-    assert_eq!(
-        before_file.artifact.semantic_fingerprint,
-        after_file.artifact.semantic_fingerprint
     );
 }
 
 #[test]
-fn symbol_rename_changes_logical_key_but_keeps_body_semantic_fingerprint() {
+fn symbol_rename_changes_qualified_locator_key() {
     let temporary = TempDir::new().unwrap();
     let repo = temporary.path().join("rename repo");
     init_repo(&repo);
@@ -361,10 +349,38 @@ fn symbol_rename_changes_logical_key_but_keeps_body_semantic_fingerprint() {
         .unwrap();
 
     assert_ne!(old.artifact.artifact_key, new.artifact.artifact_key);
-    assert_eq!(
-        old.artifact.semantic_fingerprint,
-        new.artifact.semantic_fingerprint
-    );
+}
+
+#[test]
+fn content_change_at_same_path_and_signature_keeps_locator_identity() {
+    let temporary = TempDir::new().unwrap();
+    let repo = temporary.path().join("content change repo");
+    init_repo(&repo);
+    write(&repo, "src/lib.rs", "pub fn stable() { before(); }\n");
+    commit_all(&repo);
+    let repository = identity("content-change");
+    let scanner = RepositoryScanner::default();
+    let before = available(scanner.scan(&repository, &repo).unwrap());
+    write(&repo, "src/lib.rs", "pub fn stable() { after(); }\n");
+    let after = available(scanner.scan(&repository, &repo).unwrap());
+    assert_ne!(before.generation, after.generation);
+    for kind in [ArtifactKind::File, ArtifactKind::Symbol] {
+        let before_key = &before
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact.artifact_key.kind() == kind)
+            .unwrap()
+            .artifact
+            .artifact_key;
+        let after_key = &after
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact.artifact_key.kind() == kind)
+            .unwrap()
+            .artifact
+            .artifact_key;
+        assert_eq!(before_key, after_key);
+    }
 }
 
 #[test]

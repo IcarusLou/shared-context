@@ -61,15 +61,19 @@ A stable identity for one logical source repository across local checkouts and m
 _Avoid_: checkout path, repository URL as identity
 
 **EngineeringReference**:
-A persistent, non-authoritative observation that Context relates to an engineering object through locator or fingerprint hints. It survives resolution failure and never claims that a current Artifact was found.
+A persistent, non-authoritative observation that Context relates to an engineering object at one deterministic repository-relative ArtifactLocator. It survives resolution failure and never claims that a current Artifact was found.
 _Avoid_: resolved Artifact, file identity
 
+**ArtifactLocator**:
+The canonical, kind-specific identity of an engineering object within one RepositoryIdentity: exact Path for File/Module, protocol coordinates for API, qualified coordinates for Schema/Symbol/Test. It never uses content similarity or version digests.
+_Avoid_: Locator Hint, version digest, relocation candidate
+
 **EngineeringArtifact**:
-A currently discovered Repository, Module, File, Symbol, API, Schema, or Test in an available engineering snapshot. It is derived state identified by a deterministic ArtifactKey and can be rebuilt.
+A currently discovered File, Module, API, Schema, Symbol, or Test in an available Repository snapshot. It is derived state identified by RepositoryIdentity and an exact ArtifactLocator and can be rebuilt.
 _Avoid_: Context fact, path identity
 
 **ArtifactResolution**:
-The current resolved, ambiguous, stale, unavailable, or unresolved interpretation of one EngineeringReference. It is derived state and may change without changing the Reference.
+The current resolved, missing, ambiguous, or unavailable interpretation of one EngineeringReference. Only a unique exact locator match is resolved; resolution never guesses after a move or rename.
 _Avoid_: permanent link, knowledge fact
 
 **ContextArtifactAssociation**:

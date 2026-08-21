@@ -11,9 +11,9 @@ use std::{
 };
 
 use sctx_event_schema::{
-    Applicability, ArtifactKind, ContextId, ContextKind, ContextRevisionDraft,
+    Applicability, ArtifactKind, ArtifactLocator, ContextId, ContextKind, ContextRevisionDraft,
     EngineeringReferenceDraft, Event, EventPayload, EvidenceSnapshotDraft, EvidenceType,
-    IntentSnapshot, LocatorHints, ReferenceRelation, RepositoryId, RevisionId, WorkEpisodeId,
+    IntentSnapshot, ReferenceRelation, RepoRelativePath, RepositoryId, RevisionId, WorkEpisodeId,
 };
 use sctx_git_store::{
     AppendRequest, CrashInjector, CrashSeam, Error, ErrorKind, GitStore, OBJECT_PENDING,
@@ -127,12 +127,9 @@ fn reference_event(supports: &str) -> Event {
             repository_id: RepositoryId::new(),
             artifact_kind: ArtifactKind::File,
             relation: ReferenceRelation::Implements,
-            locator_hints: Some(LocatorHints {
-                path: Some("src/search.ts".to_owned()),
-                ..LocatorHints::default()
-            }),
-            content_fingerprint: None,
-            semantic_fingerprint: None,
+            locator: ArtifactLocator::File {
+                path: RepoRelativePath::new("src/search.ts").unwrap(),
+            },
             supports: supports.to_owned(),
             limitations: vec!["The path may move".to_owned()],
         },
