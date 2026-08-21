@@ -1,26 +1,32 @@
+use std::{fs, path::PathBuf, sync::Arc, thread};
+
 use sctx_domain::{
-    Applicability, ArtifactKey, ArtifactKind, ArtifactLocator, ContextId, ContextKind,
-    ContextRelation, ContextRelationKind, ContextRevisionDraft, EngineeringArtifact,
-    EngineeringReference, EvidenceSnapshotDraft, EvidenceType, PublicationAction, PublicationDraft,
-    ReferenceId, ReferenceRelation, RepoRelativePath, RepositoryId, RepositoryIdentity, RevisionId,
-    SpaceId, TaskId, TaskIntent, TaskSignal, TaskSignalKind,
+    Applicability, ArtifactKey, ArtifactKind, ArtifactLocator, ConflictParticipant, ContextId,
+    ContextKind, ContextRelation, ContextRelationKind, ContextRevisionDraft, EngineeringArtifact,
+    EngineeringReference, EngineeringReferenceDraft, EvidenceSnapshotDraft, EvidenceType,
+    PublicationAction, PublicationDraft, ReferenceId, ReferenceRelation, RepoRelativePath,
+    RepositoryId, RepositoryIdentity, RevisionId, SemanticConflictDraft, SpaceId, TaskId,
+    TaskIntent, TaskSignal, TaskSignalKind, WorkEpisodeId,
 };
 use sctx_engineering_graph::{
     ArtifactObservation, ArtifactSourceState, EngineeringProjectionStore,
-    EngineeringReferenceResolver, ProjectedEngineeringReference, RepositoryScanOutcome,
-    RepositorySnapshot, SnapshotArtifact, SnapshotSourcePolicy, SourceLanguage,
+    EngineeringReferenceResolver, GraphContextSnapshot, ProjectedEngineeringReference,
+    RepositoryScanOutcome, RepositorySnapshot, SnapshotArtifact, SnapshotSourcePolicy,
+    SourceLanguage, build_graph_context_snapshots,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::ProjectionIndex;
 use sctx_search::{
-    ContextPackMode, SearchEngine, TaskAssociationChannel, TaskAssociationFusionExplanation,
-    TaskContextRequest, TaskRetrievalPath, estimate_task_context_payload_tokens,
+    ContextPackMode, ContextSafetySource, SearchEngine, TaskAssociationChannel,
+    TaskAssociationFusionExplanation, TaskContextRequest, TaskRetrievalPath,
+    estimate_task_context_payload_tokens,
 };
 use tempfile::TempDir;
 
 struct GraphFixture {
     _temporary: TempDir,
+    store: GitStore,
     index: ProjectionIndex,
     graph_store: EngineeringProjectionStore,
     source_space: SpaceId,
@@ -31,8 +37,10 @@ struct GraphFixture {
     contract_context: ContextId,
     validation_context: ContextId,
     source_revision: RevisionId,
+    source_publication: sctx_domain::PublicationId,
     repository: RepositoryIdentity,
     reference: ProjectedEngineeringReference,
+    context_snapshots: Vec<GraphContextSnapshot>,
 }
 
 fn append(store: &GitStore, event: Event) {
@@ -116,6 +124,25 @@ fn add_context(
     (context_id, revision_id, publication)
 }
 
+fn add_unpublished_context(
+    store: &GitStore,
+    space_id: SpaceId,
+    draft: ContextRevisionDraft,
+) -> (ContextId, RevisionId) {
+    let event = Event::context_revision_added(space_id, draft, None).unwrap();
+    let EventPayload::ContextRevisionAdded {
+        context_id,
+        revision,
+        ..
+    } = event.payload()
+    else {
+        unreachable!();
+    };
+    let ids = (*context_id, revision.revision_id);
+    append(store, event);
+    ids
+}
+
 fn revise_context(
     store: &GitStore,
     space_id: SpaceId,
@@ -166,6 +193,30 @@ fn publish(
     let publication_id = publication.publication_id;
     append(store, event);
     publication_id
+}
+
+fn withdraw(
+    store: &GitStore,
+    space_id: SpaceId,
+    context_id: ContextId,
+    revision_id: RevisionId,
+    previous_publication_id: sctx_domain::PublicationId,
+) {
+    append(
+        store,
+        Event::publication_changed(
+            space_id,
+            context_id,
+            PublicationDraft {
+                previous_publication_ids: vec![previous_publication_id],
+                action: PublicationAction::Withdraw,
+                revision_id,
+                review_event_ids: Vec::new(),
+            },
+            None,
+        )
+        .unwrap(),
+    );
 }
 
 fn relation(target_context_id: ContextId, kind: ContextRelationKind) -> ContextRelation {
@@ -311,7 +362,7 @@ fn graph_fixture() -> GraphFixture {
             )],
         ),
     );
-    let (source_revision, _) = revise_context(
+    let (source_revision, source_publication) = revise_context(
         &store,
         source_space,
         source_context,
@@ -341,6 +392,11 @@ fn graph_fixture() -> GraphFixture {
     let repository = repository();
     let artifact = symbol_artifact(&repository, "SearchSymbol");
     let reference = reference(&repository, source_context, source_revision, "SearchSymbol");
+    let context_snapshots = build_graph_context_snapshots(
+        &index.domain_snapshot().unwrap().projection,
+        std::slice::from_ref(&reference),
+    )
+    .unwrap();
     let projection = EngineeringReferenceResolver
         .resolve(
             std::slice::from_ref(&reference),
@@ -349,6 +405,7 @@ fn graph_fixture() -> GraphFixture {
                 "repo-current",
                 vec![artifact.clone()],
             )],
+            &context_snapshots,
         )
         .unwrap();
     graph_store
@@ -357,6 +414,7 @@ fn graph_fixture() -> GraphFixture {
 
     GraphFixture {
         _temporary: temporary,
+        store,
         index,
         graph_store,
         source_space,
@@ -367,8 +425,10 @@ fn graph_fixture() -> GraphFixture {
         contract_context,
         validation_context,
         source_revision,
+        source_publication,
         repository,
         reference,
+        context_snapshots,
     }
 }
 
@@ -511,7 +571,7 @@ fn exact_graph_priority_reaches_cross_end_contexts_in_two_cycle_safe_hops() {
 }
 
 #[test]
-fn mismatched_or_unavailable_graph_degrades_without_cross_snapshot_edges() {
+fn context_tree_mismatch_preserves_historical_graph_while_unavailable_artifacts_fall_back() {
     let fixture = graph_fixture();
     let current = fixture.graph_store.read_projection().unwrap().unwrap();
     fixture
@@ -523,19 +583,30 @@ fn mismatched_or_unavailable_graph_degrades_without_cross_snapshot_edges() {
     let mismatched = engine
         .task_context_pack(&task_request(ContextPackMode::AutomaticInjection, 8_000))
         .unwrap();
-    assert_eq!(mismatched.artifact_generation, None);
-    assert!(mismatched.associations.iter().all(|item| {
+    assert_eq!(
+        mismatched.artifact_generation.as_deref(),
+        Some(current.artifact_generation.as_str())
+    );
+    assert_eq!(
+        mismatched.graph_context_tree_oid.as_deref(),
+        Some("different-context-tree")
+    );
+    assert_ne!(
+        mismatched.graph_context_tree_oid.as_deref(),
+        Some(mismatched.indexed_tree_oid.as_str())
+    );
+    assert!(mismatched.associations.iter().any(|item| {
         fusion(item)
             .channels
             .iter()
-            .all(|feature| feature.channel != TaskAssociationChannel::ResolvedArtifactExact)
+            .any(|feature| feature.channel == TaskAssociationChannel::ResolvedArtifactExact)
     }));
     assert!(
         mismatched
             .items
             .iter()
             .flat_map(|item| &item.retrieval_paths)
-            .all(|path| { !matches!(path, TaskRetrievalPath::EngineeringGraph { .. }) })
+            .any(|path| { matches!(path, TaskRetrievalPath::EngineeringGraph { .. }) })
     );
     assert!(
         mismatched
@@ -551,6 +622,7 @@ fn mismatched_or_unavailable_graph_degrades_without_cross_snapshot_edges() {
                 repository_id: fixture.repository.repository_id,
                 reason: "checkout is offline".to_owned(),
             }],
+            &fixture.context_snapshots,
         )
         .unwrap();
     let tree = fixture.index.metadata().unwrap().indexed_tree_oid;
@@ -597,6 +669,452 @@ fn mismatched_or_unavailable_graph_degrades_without_cross_snapshot_edges() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn historical_graph_revision_survives_append_new_revision_withdraw_and_index_rebuild() {
+    let fixture = graph_fixture();
+    let built = fixture.graph_store.read_snapshot().unwrap().unwrap();
+    let built_bytes = fixture.graph_store.canonical_bytes().unwrap().unwrap();
+    let built_tree = built.context_tree_oid.clone().unwrap();
+    let built_generation = built.projection.artifact_generation.clone();
+
+    append(
+        &fixture.store,
+        Event::context_candidate_created(
+            WorkEpisodeId::new(),
+            draft(
+                ContextKind::Discovery,
+                "unrelated Candidate does not mutate an existing Graph",
+                "shared",
+                Vec::new(),
+            ),
+            None,
+        )
+        .unwrap(),
+    );
+    append(
+        &fixture.store,
+        Event::engineering_reference_recorded(
+            fixture.source_context,
+            fixture.source_revision,
+            EngineeringReferenceDraft {
+                repository_id: fixture.repository.repository_id,
+                artifact_kind: ArtifactKind::Symbol,
+                relation: ReferenceRelation::Implements,
+                locator: symbol_locator("SearchSymbol"),
+                supports: "an appended Reference is not an implicit Graph rebuild".to_owned(),
+                limitations: vec!["the Graph remains an explicit snapshot".to_owned()],
+            },
+            None,
+        )
+        .unwrap(),
+    );
+    add_context(
+        &fixture.store,
+        fixture.generic_space,
+        draft(
+            ContextKind::Discovery,
+            "unrelatedcurrentneedle Context and Publication are append-only",
+            "shared",
+            Vec::new(),
+        ),
+    );
+    let (new_revision, new_publication) = revise_context(
+        &fixture.store,
+        fixture.source_space,
+        fixture.source_context,
+        fixture.source_revision,
+        fixture.source_publication,
+        draft(
+            ContextKind::Decision,
+            "newcurrentneedle frontend behavior is the current revision",
+            "fe",
+            Vec::new(),
+        ),
+    );
+    fixture.index.synchronize().unwrap();
+
+    let engine =
+        SearchEngine::with_engineering_graph(fixture.index.clone(), fixture.graph_store.clone());
+    let mut collision_request = task_request(ContextPackMode::AutomaticInjection, 20_000);
+    collision_request.task_intent.goal = "newcurrentneedle".to_owned();
+    collision_request.task_intent.desired_change =
+        "compare current text with frozen implementation".to_owned();
+    let collision = engine.task_context_pack(&collision_request).unwrap();
+    assert_eq!(
+        collision.graph_context_tree_oid.as_deref(),
+        Some(built_tree.as_str())
+    );
+    assert_ne!(collision.indexed_tree_oid, built_tree);
+    assert_eq!(
+        collision.artifact_generation.as_deref(),
+        Some(built_generation.as_str())
+    );
+    let same_context = collision
+        .items
+        .iter()
+        .filter(|item| item.context.context_id == fixture.source_context)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        same_context.len(),
+        2,
+        "old Graph and current FTS revisions must coexist"
+    );
+    let historical = same_context
+        .iter()
+        .find(|item| item.context.revision_id == fixture.source_revision)
+        .unwrap();
+    assert!(
+        historical
+            .retrieval_paths
+            .iter()
+            .any(|path| matches!(path, TaskRetrievalPath::EngineeringGraph { .. }))
+    );
+    assert!(matches!(
+        historical.context.safety_source,
+        ContextSafetySource::EngineeringGraphSnapshot { revision_id, .. }
+            if revision_id == fixture.source_revision
+    ));
+    let current = same_context
+        .iter()
+        .find(|item| item.context.revision_id == new_revision)
+        .unwrap();
+    assert!(
+        current
+            .retrieval_paths
+            .iter()
+            .any(|path| matches!(path, TaskRetrievalPath::ContextFts { .. }))
+    );
+    assert!(
+        current
+            .retrieval_paths
+            .iter()
+            .all(|path| !matches!(path, TaskRetrievalPath::EngineeringGraph { .. }))
+    );
+    assert_eq!(
+        current.context.safety_source,
+        ContextSafetySource::CurrentProjection
+    );
+
+    withdraw(
+        &fixture.store,
+        fixture.source_space,
+        fixture.source_context,
+        new_revision,
+        new_publication,
+    );
+    fixture.index.synchronize().unwrap();
+    let after_withdraw = engine.task_context_pack(&collision_request).unwrap();
+    let source_items = after_withdraw
+        .items
+        .iter()
+        .filter(|item| item.context.context_id == fixture.source_context)
+        .collect::<Vec<_>>();
+    assert_eq!(source_items.len(), 1);
+    assert_eq!(source_items[0].context.revision_id, fixture.source_revision);
+    assert_eq!(
+        source_items[0].context.status,
+        sctx_search::ContextStatus::Accepted
+    );
+    assert!(source_items[0].context.auto_injection_eligible);
+    assert!(matches!(
+        source_items[0].context.safety_source,
+        ContextSafetySource::EngineeringGraphSnapshot { .. }
+    ));
+    let frozen_relation_target = after_withdraw
+        .items
+        .iter()
+        .find(|item| item.context.context_id == fixture.contract_context)
+        .unwrap();
+    assert!(
+        frozen_relation_target
+            .retrieval_paths
+            .iter()
+            .any(|path| matches!(
+                path,
+                TaskRetrievalPath::EngineeringGraph { relation_hops, .. }
+                    if relation_hops.first().is_some_and(|hop| {
+                        hop.source_context_id == fixture.source_context
+                            && hop.source_revision_id == fixture.source_revision
+                            && hop.target_context_id == fixture.contract_context
+                    })
+            ))
+    );
+
+    let database = fixture.index.database_path().to_path_buf();
+    remove_file_if_present(&database);
+    remove_file_if_present(&PathBuf::from(format!("{}-wal", database.display())));
+    remove_file_if_present(&PathBuf::from(format!("{}-shm", database.display())));
+    fixture.index.synchronize().unwrap();
+    let rebuilt = engine.task_context_pack(&collision_request).unwrap();
+    assert!(rebuilt.items.iter().any(|item| {
+        item.context.context_id == fixture.source_context
+            && item.context.revision_id == fixture.source_revision
+            && item
+                .retrieval_paths
+                .iter()
+                .any(|path| matches!(path, TaskRetrievalPath::EngineeringGraph { .. }))
+    }));
+    assert_eq!(
+        fixture.graph_store.canonical_bytes().unwrap().unwrap(),
+        built_bytes
+    );
+
+    let graph_store = Arc::new(fixture.graph_store.clone());
+    let projection = Arc::new(built.projection);
+    let provenance = Arc::new(built_tree);
+    let writer_store = Arc::clone(&graph_store);
+    let writer_projection = Arc::clone(&projection);
+    let writer_provenance = Arc::clone(&provenance);
+    let writer = thread::spawn(move || {
+        for _ in 0..20 {
+            writer_store
+                .rebuild_for_context_tree(&writer_projection, Some(&writer_provenance))
+                .unwrap();
+        }
+    });
+    let readers = (0..8)
+        .map(|_| {
+            let engine = engine.clone();
+            let request = collision_request.clone();
+            let expected_generation = built_generation.clone();
+            let expected_revision = fixture.source_revision;
+            thread::spawn(move || {
+                for _ in 0..10 {
+                    let pack = engine.task_context_pack(&request).unwrap();
+                    assert_eq!(
+                        pack.artifact_generation.as_deref(),
+                        Some(expected_generation.as_str())
+                    );
+                    assert!(pack.items.iter().any(|item| {
+                        item.context.revision_id == expected_revision
+                            && item.retrieval_paths.iter().any(|path| {
+                                matches!(path, TaskRetrievalPath::EngineeringGraph { .. })
+                            })
+                    }));
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    writer.join().unwrap();
+    for reader in readers {
+        reader.join().unwrap();
+    }
+}
+
+fn remove_file_if_present(path: &std::path::Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("remove {}: {error}", path.display()),
+    }
+}
+
+#[test]
+fn sparse_graph_builder_excludes_large_unrelated_context_corpus_from_projection_and_generation() {
+    let fixture = graph_fixture();
+    let before = fixture.graph_store.read_snapshot().unwrap().unwrap();
+    assert_eq!(before.projection.contexts.len(), 3);
+    for index in 0..64 {
+        let space = add_space(
+            &fixture.store,
+            &format!("Unrelated Space {index}"),
+            &format!("unrelated-space-{index}"),
+        );
+        add_context(
+            &fixture.store,
+            space,
+            draft(
+                ContextKind::Discovery,
+                &format!("unrelated-corpus-{index} must not enter Engineering Graph"),
+                "shared",
+                Vec::new(),
+            ),
+        );
+    }
+    let domain = fixture.index.domain_snapshot().unwrap();
+    let contexts =
+        build_graph_context_snapshots(&domain.projection, std::slice::from_ref(&fixture.reference))
+            .unwrap();
+    assert_eq!(contexts, before.projection.contexts);
+    assert!(
+        contexts
+            .iter()
+            .all(|context| { !context.revision.statement.contains("unrelated-corpus-") })
+    );
+    let rebuilt = EngineeringReferenceResolver
+        .resolve(
+            std::slice::from_ref(&fixture.reference),
+            &[snapshot(
+                &fixture.repository,
+                "repo-current",
+                vec![symbol_artifact(&fixture.repository, "SearchSymbol")],
+            )],
+            &contexts,
+        )
+        .unwrap();
+    assert_eq!(
+        rebuilt.artifact_generation, before.projection.artifact_generation,
+        "unreachable Context append must not alter Graph generation"
+    );
+    let current_tree = domain.metadata.indexed_tree_oid;
+    assert_ne!(
+        before.context_tree_oid.as_deref(),
+        Some(current_tree.as_str())
+    );
+    fixture
+        .graph_store
+        .rebuild_for_context_tree(&rebuilt, Some(&current_tree))
+        .unwrap();
+    let stored = fixture.graph_store.read_snapshot().unwrap().unwrap();
+    assert_eq!(stored.projection.contexts.len(), 3);
+    assert_eq!(stored.projection, rebuilt);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn build_time_candidate_incomplete_and_conflicted_contexts_never_cross_automatic_graph_boundary() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("unsafe-graph");
+    let store = GitStore::initialize(&root).unwrap();
+    let space = add_space(&store, "Unsafe Graph", "unsafe graph diagnostics");
+    let (candidate_context, candidate_revision) = add_unpublished_context(
+        &store,
+        space,
+        draft(
+            ContextKind::Decision,
+            "candidate Graph Context must remain explicit only",
+            "fe",
+            Vec::new(),
+        ),
+    );
+    let mut incomplete = draft(
+        ContextKind::Decision,
+        "incomplete Graph Context must remain explicit only",
+        "fe",
+        Vec::new(),
+    );
+    incomplete.evidence[0].limitations.clear();
+    let (incomplete_context, incomplete_revision, _) = add_context(&store, space, incomplete);
+    let (conflict_context, conflict_revision, conflict_publication) = add_context(
+        &store,
+        space,
+        draft(
+            ContextKind::Decision,
+            "conflicted Graph Context must remain explicit only",
+            "fe",
+            Vec::new(),
+        ),
+    );
+    let (other_context, other_revision, other_publication) = add_context(
+        &store,
+        space,
+        draft(
+            ContextKind::Decision,
+            "opposing conflicted Graph Context",
+            "fe",
+            Vec::new(),
+        ),
+    );
+    append(
+        &store,
+        Event::semantic_conflict_opened(
+            space,
+            SemanticConflictDraft {
+                participants: vec![
+                    ConflictParticipant {
+                        context_id: conflict_context,
+                        revision_id: conflict_revision,
+                        publication_id: conflict_publication,
+                    },
+                    ConflictParticipant {
+                        context_id: other_context,
+                        revision_id: other_revision,
+                        publication_id: other_publication,
+                    },
+                ],
+                reason: "the two accepted decisions intentionally conflict".to_owned(),
+                applicability: Applicability {
+                    domains: vec!["search".to_owned()],
+                    platforms: vec!["fe".to_owned()],
+                    conditions: vec!["active".to_owned()],
+                },
+            },
+            None,
+        )
+        .unwrap(),
+    );
+
+    let repository = repository();
+    let roots = [
+        (candidate_context, candidate_revision, "CandidateSymbol"),
+        (incomplete_context, incomplete_revision, "IncompleteSymbol"),
+        (conflict_context, conflict_revision, "ConflictSymbol"),
+    ]
+    .into_iter()
+    .map(|(context_id, revision_id, symbol)| {
+        reference(&repository, context_id, revision_id, symbol)
+    })
+    .collect::<Vec<_>>();
+    let index = ProjectionIndex::for_store(&store);
+    let domain = index.domain_snapshot().unwrap();
+    let contexts = build_graph_context_snapshots(&domain.projection, &roots).unwrap();
+    assert_eq!(contexts.len(), 3);
+    assert!(contexts.iter().all(|context| {
+        !context.safety.automatic_injection_eligible && !context.safety.blockers.is_empty()
+    }));
+    let projection = EngineeringReferenceResolver
+        .resolve(
+            &roots,
+            &[snapshot(
+                &repository,
+                "unsafe-repository",
+                ["CandidateSymbol", "IncompleteSymbol", "ConflictSymbol"]
+                    .into_iter()
+                    .map(|symbol| symbol_artifact(&repository, symbol))
+                    .collect(),
+            )],
+            &contexts,
+        )
+        .unwrap();
+    let graph_store = EngineeringProjectionStore::initialize(&root).unwrap();
+    graph_store
+        .rebuild_for_context_tree(&projection, Some(&domain.metadata.indexed_tree_oid))
+        .unwrap();
+    let engine = SearchEngine::with_engineering_graph(index, graph_store);
+    for (context_id, symbol) in [
+        (candidate_context, "CandidateSymbol"),
+        (incomplete_context, "IncompleteSymbol"),
+        (conflict_context, "ConflictSymbol"),
+    ] {
+        let mut automatic = task_request(ContextPackMode::AutomaticInjection, 8_000);
+        automatic.task_intent.goal = "opaque unsafe graph lookup".to_owned();
+        automatic.task_intent.desired_change = "inspect without text fallback".to_owned();
+        automatic.task_signals[0].content = symbol_locator(symbol).canonical_key();
+        let automatic_pack = engine.task_context_pack(&automatic).unwrap();
+        assert!(
+            automatic_pack
+                .items
+                .iter()
+                .all(|item| item.context.context_id != context_id)
+        );
+
+        automatic.mode = ContextPackMode::Explicit;
+        let explicit = engine.task_context_pack(&automatic).unwrap();
+        let item = explicit
+            .items
+            .iter()
+            .find(|item| item.context.context_id == context_id)
+            .unwrap();
+        assert!(!item.context.auto_injection_eligible);
+        assert!(matches!(
+            &item.context.safety_source,
+            ContextSafetySource::EngineeringGraphSnapshot { safety, .. }
+                if !safety.automatic_injection_eligible && !safety.blockers.is_empty()
+        ));
+    }
+}
+
+#[test]
 fn ambiguous_edges_are_explicit_diagnostics_only_and_never_raise_automatic_eligibility() {
     let fixture = graph_fixture();
     let mut ambiguous_artifact = symbol_artifact(&fixture.repository, "SearchSymbol");
@@ -612,6 +1130,7 @@ fn ambiguous_edges_are_explicit_diagnostics_only_and_never_raise_automatic_eligi
         fixture.source_revision,
         "SearchSymbol",
     );
+    let context_snapshots = fixture.context_snapshots.clone();
     let ambiguous = EngineeringReferenceResolver
         .resolve(
             &[ambiguous_reference],
@@ -620,6 +1139,7 @@ fn ambiguous_edges_are_explicit_diagnostics_only_and_never_raise_automatic_eligi
                 "repo-ambiguous",
                 vec![ambiguous_artifact],
             )],
+            &context_snapshots,
         )
         .unwrap();
     let tree = fixture.index.metadata().unwrap().indexed_tree_oid;
@@ -731,10 +1251,12 @@ fn exact_file_signal_uses_repository_relative_path_locator() {
             limitations: vec!["path is a rebuildable locator".to_owned()],
         },
     };
+    let context_snapshots = fixture.context_snapshots.clone();
     let projection = EngineeringReferenceResolver
         .resolve(
             &[projected],
             &[snapshot(&fixture.repository, "repo-file", vec![file])],
+            &context_snapshots,
         )
         .unwrap();
     let tree = fixture.index.metadata().unwrap().indexed_tree_oid;

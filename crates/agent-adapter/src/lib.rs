@@ -445,6 +445,36 @@ pub fn render_untrusted_task_context_pack(pack: &TaskContextPack) -> Result<Stri
             "hook injection requires every Task Context item to link to its Task Space association through a Retrieval Path",
         ));
     }
+    if pack.items.iter().any(|item| {
+        let has_graph_path = item.retrieval_paths.iter().any(|path| {
+            matches!(
+                path,
+                sctx_search::TaskRetrievalPath::EngineeringGraph { .. }
+            )
+        });
+        match &item.context.safety_source {
+            sctx_search::ContextSafetySource::CurrentProjection => has_graph_path,
+            sctx_search::ContextSafetySource::EngineeringGraphSnapshot {
+                context_tree_oid,
+                artifact_generation,
+                context_id,
+                revision_id,
+                safety,
+            } => {
+                !has_graph_path
+                    || context_tree_oid != &pack.graph_context_tree_oid
+                    || Some(artifact_generation.as_str()) != pack.artifact_generation.as_deref()
+                    || *context_id != item.context.context_id
+                    || *revision_id != item.context.revision_id
+                    || !safety.automatic_injection_eligible
+                    || !safety.blockers.is_empty()
+            }
+        }
+    }) {
+        return Err(invariant(
+            "hook injection requires Graph Context items to carry matching build-time snapshot safety and provenance",
+        ));
+    }
     let data = serde_json::to_string(pack).map_err(|error| {
         Error::new(
             ErrorKind::Io,
@@ -515,8 +545,8 @@ mod tests {
         TaskSpaceAssociation,
     };
     use sctx_search::{
-        ContextPackDetail, ContextPackItem, ContextPackMode, EvidenceView, MatchReason,
-        TaskContextItem, TaskRetrievalPath,
+        ContextPackDetail, ContextPackItem, ContextPackMode, ContextSafetySource, EvidenceView,
+        MatchReason, TaskContextItem, TaskRetrievalPath,
     };
 
     #[test]
@@ -694,6 +724,7 @@ mod tests {
             indexed_tree_oid: "tree".to_owned(),
             projection_generation: 1,
             artifact_generation: None,
+            graph_context_tree_oid: None,
             task_id,
             task_fingerprint: "fingerprint".to_owned(),
             token_budget: 2_000,
@@ -731,6 +762,7 @@ mod tests {
                     }],
                     conflicts: Vec::new(),
                     auto_injection_eligible: eligible,
+                    safety_source: ContextSafetySource::CurrentProjection,
                     match_reason: MatchReason {
                         matched_fields: Vec::new(),
                         matched_tokens: Vec::new(),

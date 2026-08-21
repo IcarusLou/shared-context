@@ -1,16 +1,344 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use sctx_domain::{
     ArtifactAssociationKind, ArtifactKey, ArtifactKind, ArtifactLocator, ArtifactResolution,
-    ContextArtifactAssociation, ContextId, EngineeringArtifact, EngineeringReference, Error,
-    ErrorKind, ReferenceId, ReferenceRelation, RepositoryId, ResolutionStatus, Result, RevisionId,
+    AutoInjectionBlocker, ConflictId, ContextArtifactAssociation, ContextGovernanceStatus,
+    ContextId, ContextRelationKind, ContextRevision, DomainProjection, EngineeringArtifact,
+    EngineeringReference, Error, ErrorKind, ReferenceId, ReferenceRelation, RepositoryId,
+    ResolutionStatus, Result, RevisionId, RevisionLifecycle, SpaceId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{RepositoryScanOutcome, RepositorySnapshot, SnapshotArtifact};
 
-const RESOLVER_POLICY_VERSION: &str = "deterministic-artifact-locator-resolution-v1";
+const RESOLVER_POLICY_VERSION: &str = "historical-context-snapshot-resolution-v2";
+
+/// Build-time lifecycle/governance state of one immutable Context revision.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphContextStatus {
+    Candidate,
+    Accepted,
+    Deprecated,
+    Superseded,
+    GovernanceConflict,
+}
+
+/// Typed reason why one build-time Context snapshot cannot cross automatic injection.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GraphContextSafetyBlocker {
+    NotAccepted,
+    GovernanceConflict,
+    UnresolvedSemanticConflict { conflict_id: ConflictId },
+    IncompleteEvidence,
+}
+
+/// Immutable automatic-injection decision made when the Graph was built.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GraphContextSafety {
+    pub automatic_injection_eligible: bool,
+    pub blockers: BTreeSet<GraphContextSafetyBlocker>,
+}
+
+/// One `ContextRelation` with its build-time target revision fixed explicitly.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct GraphContextRelation {
+    pub target_space_id: SpaceId,
+    pub target_context_id: ContextId,
+    pub target_revision_id: RevisionId,
+    pub kind: ContextRelationKind,
+    pub rationale: String,
+    pub supports: Vec<String>,
+}
+
+/// Self-contained immutable Context content and safety decision captured by one Graph build.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GraphContextSnapshot {
+    pub space_id: SpaceId,
+    pub space_title: String,
+    pub context_id: ContextId,
+    pub revision: ContextRevision,
+    pub status: GraphContextStatus,
+    pub evidence_completeness: u16,
+    pub safety: GraphContextSafety,
+    pub relations: Vec<GraphContextRelation>,
+}
+
+impl GraphContextSnapshot {
+    fn validate(&self) -> Result<()> {
+        if self.space_title.trim().is_empty() {
+            return Err(invariant("Graph Context snapshot Space title is empty"));
+        }
+        self.revision.validate()?;
+        let completeness = context_evidence_completeness(&self.revision);
+        if self.evidence_completeness != completeness {
+            return Err(invariant(
+                "Graph Context snapshot Evidence completeness is not derived from its Revision",
+            ));
+        }
+        let expected_eligible = self.status == GraphContextStatus::Accepted
+            && completeness == 1_000
+            && !self.revision.evidence.is_empty()
+            && self.safety.blockers.is_empty();
+        if self.safety.automatic_injection_eligible != expected_eligible {
+            return Err(invariant(
+                "Graph Context snapshot safety decision is inconsistent",
+            ));
+        }
+        if !expected_eligible && self.safety.blockers.is_empty() {
+            return Err(invariant(
+                "unsafe Graph Context snapshot requires a typed safety blocker",
+            ));
+        }
+        if self.relations.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(invariant(
+                "Graph Context snapshot Relations are duplicated or unsorted",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Captures immutable Context revisions, build-time safety, and relation target revisions.
+///
+/// # Errors
+///
+/// Returns an invariant error when a reduced projection has inconsistent ownership.
+#[allow(clippy::too_many_lines)]
+pub fn build_graph_context_snapshots(
+    projection: &DomainProjection,
+    references: &[ProjectedEngineeringReference],
+) -> Result<Vec<GraphContextSnapshot>> {
+    const MAX_RELATION_DEPTH: u8 = 2;
+    let owners = projection
+        .spaces
+        .iter()
+        .flat_map(|(space_id, space)| {
+            space
+                .contexts
+                .values()
+                .map(move |context| (context.context_id, (*space_id, space, context)))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let accepted_targets = projection
+        .spaces
+        .iter()
+        .flat_map(|(space_id, space)| {
+            space.contexts.values().filter_map(move |context| {
+                let ContextGovernanceStatus::Accepted { revision_id, .. } = context.governance
+                else {
+                    return None;
+                };
+                Some((context.context_id, (*space_id, revision_id)))
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut depths = BTreeMap::<(SpaceId, ContextId, RevisionId), u8>::new();
+    let mut roots = references
+        .iter()
+        .map(|reference| {
+            let Some((space_id, _space, context)) = owners.get(&reference.context_id) else {
+                return Err(invariant(
+                    "projected Engineering Reference Context owner is missing",
+                ));
+            };
+            if !context.revisions.contains_key(&reference.revision_id) {
+                return Err(invariant(
+                    "projected Engineering Reference Revision is missing from its Context",
+                ));
+            }
+            Ok((*space_id, reference.context_id, reference.revision_id))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    roots.sort();
+    roots.dedup();
+    let mut queue = std::collections::VecDeque::from(roots);
+    for root in &queue {
+        depths.insert(*root, 0);
+    }
+    while let Some((space_id, context_id, revision_id)) = queue.pop_front() {
+        let depth = depths[&(space_id, context_id, revision_id)];
+        if depth >= MAX_RELATION_DEPTH {
+            continue;
+        }
+        let (_owner_space_id, _space, context) = owners[&context_id];
+        let revision = context
+            .revisions
+            .get(&revision_id)
+            .ok_or_else(|| invariant("Graph relation source Revision disappeared during build"))?;
+        if graph_context_status(context, revision.lifecycle) != GraphContextStatus::Accepted {
+            continue;
+        }
+        for relation in &revision.revision.relations {
+            let Some((target_space_id, target_revision_id)) =
+                accepted_targets.get(&relation.target_context_id)
+            else {
+                continue;
+            };
+            let target = (
+                *target_space_id,
+                relation.target_context_id,
+                *target_revision_id,
+            );
+            let next_depth = depth + 1;
+            if depths
+                .get(&target)
+                .is_none_or(|existing| next_depth < *existing)
+            {
+                depths.insert(target, next_depth);
+                queue.push_back(target);
+            }
+        }
+    }
+    let included = depths.keys().copied().collect::<BTreeSet<_>>();
+    let mut snapshots = Vec::with_capacity(included.len());
+    for ((space_id, context_id, revision_id), depth) in depths {
+        let (_owner_space_id, space, context) = owners[&context_id];
+        let revision = context
+            .revisions
+            .get(&revision_id)
+            .ok_or_else(|| invariant("Graph Context Revision disappeared during snapshot build"))?;
+        let status = graph_context_status(context, revision.lifecycle);
+        let (evidence_completeness, safety) =
+            graph_context_safety(context, &revision.revision, status);
+        let relations = if status == GraphContextStatus::Accepted && depth < MAX_RELATION_DEPTH {
+            revision
+                .revision
+                .relations
+                .iter()
+                .filter_map(|relation| {
+                    let (target_space_id, target_revision_id) =
+                        accepted_targets.get(&relation.target_context_id)?;
+                    included
+                        .contains(&(
+                            *target_space_id,
+                            relation.target_context_id,
+                            *target_revision_id,
+                        ))
+                        .then(|| GraphContextRelation {
+                            target_space_id: *target_space_id,
+                            target_context_id: relation.target_context_id,
+                            target_revision_id: *target_revision_id,
+                            kind: relation.kind,
+                            rationale: relation.rationale.clone(),
+                            supports: relation.supports.clone(),
+                        })
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let snapshot = GraphContextSnapshot {
+            space_id,
+            space_title: graph_space_title(space)?,
+            context_id,
+            revision: revision.revision.clone(),
+            status,
+            evidence_completeness,
+            safety,
+            relations,
+        };
+        snapshot.validate()?;
+        snapshots.push(snapshot);
+    }
+    snapshots.sort_by_key(|snapshot| (snapshot.context_id, snapshot.revision.revision_id));
+    Ok(snapshots)
+}
+
+fn graph_context_safety(
+    context: &sctx_domain::ContextProjection,
+    revision: &ContextRevision,
+    status: GraphContextStatus,
+) -> (u16, GraphContextSafety) {
+    let mut blockers = context
+        .auto_injection
+        .blockers
+        .iter()
+        .map(|blocker| match blocker {
+            AutoInjectionBlocker::NotAccepted => GraphContextSafetyBlocker::NotAccepted,
+            AutoInjectionBlocker::GovernanceConflict => {
+                GraphContextSafetyBlocker::GovernanceConflict
+            }
+            AutoInjectionBlocker::UnresolvedSemanticConflict(conflict_id) => {
+                GraphContextSafetyBlocker::UnresolvedSemanticConflict {
+                    conflict_id: *conflict_id,
+                }
+            }
+        })
+        .collect::<BTreeSet<_>>();
+    if status != GraphContextStatus::Accepted {
+        blockers.insert(GraphContextSafetyBlocker::NotAccepted);
+    }
+    let evidence_completeness = context_evidence_completeness(revision);
+    if evidence_completeness != 1_000 || revision.evidence.is_empty() {
+        blockers.insert(GraphContextSafetyBlocker::IncompleteEvidence);
+    }
+    (
+        evidence_completeness,
+        GraphContextSafety {
+            automatic_injection_eligible: status == GraphContextStatus::Accepted
+                && blockers.is_empty(),
+            blockers,
+        },
+    )
+}
+
+fn graph_space_title(space: &sctx_domain::ContextSpaceProjection) -> Result<String> {
+    let titles = space
+        .intent
+        .heads
+        .iter()
+        .filter_map(|revision_id| space.intent.revisions.get(revision_id))
+        .map(|revision| revision.intent.title.clone())
+        .collect::<BTreeSet<_>>();
+    if titles.is_empty() {
+        return Err(invariant("Graph Context Space has no Intent title"));
+    }
+    Ok(titles.into_iter().collect::<Vec<_>>().join(" | "))
+}
+
+fn graph_context_status(
+    context: &sctx_domain::ContextProjection,
+    lifecycle: RevisionLifecycle,
+) -> GraphContextStatus {
+    if matches!(
+        context.governance,
+        ContextGovernanceStatus::GovernanceConflict { .. }
+    ) {
+        return GraphContextStatus::GovernanceConflict;
+    }
+    match lifecycle {
+        RevisionLifecycle::Candidate => GraphContextStatus::Candidate,
+        RevisionLifecycle::Accepted => GraphContextStatus::Accepted,
+        RevisionLifecycle::Deprecated => GraphContextStatus::Deprecated,
+        RevisionLifecycle::Superseded => GraphContextStatus::Superseded,
+    }
+}
+
+fn context_evidence_completeness(revision: &ContextRevision) -> u16 {
+    if revision.evidence.is_empty() {
+        return 0;
+    }
+    let total = revision
+        .evidence
+        .iter()
+        .map(|item| {
+            usize::from(!item.supports.trim().is_empty()) * 250
+                + usize::from(
+                    item.content
+                        .as_object()
+                        .is_some_and(|content| !content.is_empty()),
+                ) * 250
+                + usize::from(!item.interpretation.trim().is_empty()) * 250
+                + usize::from(!item.limitations.is_empty()) * 250
+        })
+        .sum::<usize>();
+    u16::try_from(total / revision.evidence.len()).unwrap_or(u16::MAX)
+}
 
 /// Context ownership envelope around one Git-projected persistent Reference.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -144,6 +472,7 @@ impl ResolvedReferenceProjection {
 pub struct EngineeringProjection {
     pub policy_version: String,
     pub artifact_generation: String,
+    pub contexts: Vec<GraphContextSnapshot>,
     pub references: Vec<ResolvedReferenceProjection>,
 }
 
@@ -157,6 +486,40 @@ impl EngineeringProjection {
         if self.artifact_generation.trim().is_empty() {
             return Err(invariant("Engineering projection generation is empty"));
         }
+        let mut context_keys = BTreeMap::new();
+        for context in &self.contexts {
+            context.validate()?;
+            if context_keys
+                .insert(
+                    (context.context_id, context.revision.revision_id),
+                    context.space_id,
+                )
+                .is_some()
+            {
+                return Err(invariant(
+                    "Engineering projection repeats a Context Revision snapshot",
+                ));
+            }
+        }
+        if self.contexts.windows(2).any(|pair| {
+            (pair[0].context_id, pair[0].revision.revision_id)
+                > (pair[1].context_id, pair[1].revision.revision_id)
+        }) {
+            return Err(invariant(
+                "Engineering projection Context snapshots are not sorted",
+            ));
+        }
+        for context in &self.contexts {
+            for relation in &context.relations {
+                if context_keys.get(&(relation.target_context_id, relation.target_revision_id))
+                    != Some(&relation.target_space_id)
+                {
+                    return Err(invariant(
+                        "Engineering projection Relation target snapshot is missing",
+                    ));
+                }
+            }
+        }
         let mut ids = HashSet::with_capacity(self.references.len());
         for reference in &self.references {
             reference.validate()?;
@@ -167,6 +530,11 @@ impl EngineeringProjection {
             }
             if !ids.insert(reference.reference_id) {
                 return Err(invariant("Engineering projection repeats a ReferenceId"));
+            }
+            if !context_keys.contains_key(&(reference.context_id, reference.revision_id)) {
+                return Err(invariant(
+                    "resolved Reference lacks its immutable Context Revision snapshot",
+                ));
             }
         }
         if self
@@ -197,7 +565,13 @@ impl EngineeringReferenceResolver {
         &self,
         references: &[ProjectedEngineeringReference],
         snapshots: &[RepositoryScanOutcome],
+        contexts: &[GraphContextSnapshot],
     ) -> Result<EngineeringProjection> {
+        let mut contexts = contexts.to_vec();
+        contexts.sort_by_key(|snapshot| (snapshot.context_id, snapshot.revision.revision_id));
+        for context in &contexts {
+            context.validate()?;
+        }
         let snapshots = snapshot_map(snapshots)?;
         let mut ordered = references.to_vec();
         ordered.sort_by_key(|reference| reference.reference.reference_id);
@@ -213,13 +587,14 @@ impl EngineeringReferenceResolver {
                 snapshots.get(&projected.reference.repository_id),
             )?);
         }
-        let generation = projection_generation(&ordered, &snapshots, &resolved)?;
+        let generation = projection_generation(&ordered, &snapshots, &contexts, &resolved)?;
         for reference in &mut resolved {
             generation.clone_into(&mut reference.artifact_generation);
         }
         let projection = EngineeringProjection {
             policy_version: RESOLVER_POLICY_VERSION.to_owned(),
             artifact_generation: generation,
+            contexts,
             references: resolved,
         };
         projection.validate()?;
@@ -236,9 +611,10 @@ impl EngineeringReferenceResolver {
         previous: &EngineeringProjection,
         references: &[ProjectedEngineeringReference],
         snapshots: &[RepositoryScanOutcome],
+        contexts: &[GraphContextSnapshot],
     ) -> Result<EngineeringProjection> {
         previous.validate()?;
-        self.resolve(references, snapshots)
+        self.resolve(references, snapshots, contexts)
     }
 }
 
@@ -519,6 +895,7 @@ fn match_explanation(basis: MatchBasis, key: &ArtifactKey) -> String {
 fn projection_generation(
     references: &[ProjectedEngineeringReference],
     snapshots: &BTreeMap<RepositoryId, SnapshotState<'_>>,
+    contexts: &[GraphContextSnapshot],
     resolved: &[ResolvedReferenceProjection],
 ) -> Result<String> {
     let mut hasher = Sha256::new();
@@ -529,6 +906,13 @@ fn projection_generation(
             &mut hasher,
             &serde_json::to_string(reference)
                 .map_err(|error| invariant(format!("serialize projected Reference: {error}")))?,
+        );
+    }
+    for context in contexts {
+        hash_component(
+            &mut hasher,
+            &serde_json::to_string(context)
+                .map_err(|error| invariant(format!("serialize Graph Context snapshot: {error}")))?,
         );
     }
     for (repository_id, snapshot) in snapshots {

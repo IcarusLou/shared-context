@@ -73,7 +73,7 @@
     ],
     "planned_paths": ["legacy/search_legacy.js", "web/ambiguous.ts", "web/search_results.ts"],
     "languages": ["typescript-javascript"],
-    "token_budget": 7000,
+    "token_budget": 12000,
     "bounded_token_budget": 1100
   },
   "events": [

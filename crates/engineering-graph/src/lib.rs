@@ -10,8 +10,10 @@ mod scanner;
 
 pub use projection::{EngineeringProjectionSnapshot, EngineeringProjectionStore};
 pub use resolver::{
-    CandidateMatchEvidence, EngineeringProjection, EngineeringReferenceResolver, MatchBasis,
-    ProjectedEngineeringReference, ResolvedReferenceProjection,
+    CandidateMatchEvidence, EngineeringProjection, EngineeringReferenceResolver,
+    GraphContextRelation, GraphContextSafety, GraphContextSafetyBlocker, GraphContextSnapshot,
+    GraphContextStatus, MatchBasis, ProjectedEngineeringReference, ResolvedReferenceProjection,
+    build_graph_context_snapshots,
 };
 
 pub use scanner::{

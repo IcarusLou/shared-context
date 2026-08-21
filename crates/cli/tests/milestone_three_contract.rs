@@ -7,20 +7,22 @@ use std::{
 };
 
 use sctx_domain::{
-    ArtifactKind, ContextId, ContextRelationKind, ReferenceId, RepositoryIdentity,
-    ResolutionStatus, SpaceId, TaskIntent, TaskSignal, TaskSignalKind,
+    Applicability, ArtifactKind, ContextGovernanceStatus, ContextId, ContextKind,
+    ContextRelationKind, ContextRevisionDraft, EvidenceSnapshotDraft, EvidenceType,
+    PublicationAction, PublicationDraft, ReferenceId, RepositoryIdentity, ResolutionStatus,
+    SpaceId, TaskIntent, TaskSignal, TaskSignalKind,
 };
 use sctx_engineering_graph::{
     EngineeringProjection, EngineeringProjectionStore, EngineeringReferenceResolver,
     ProjectedEngineeringReference, RepositoryScanOutcome, RepositoryScanPlan, RepositoryScanner,
-    RepositoryScannerLimits, RepositorySnapshot, SourceLanguage,
+    RepositoryScannerLimits, RepositorySnapshot, SourceLanguage, build_graph_context_snapshots,
 };
-use sctx_event_schema::{ParsedEvent, parse_event};
-use sctx_git_store::GitStore;
+use sctx_event_schema::{Event, EventPayload, ParsedEvent, parse_event};
+use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::{IndexMetadata, ProjectionIndex};
 use sctx_search::{
-    ContextPackMode, SearchEngine, TaskContextPack, TaskContextRequest, TaskRetrievalPath,
-    estimate_task_context_payload_tokens,
+    ContextPackMode, ContextSafetySource, SearchEngine, TaskContextPack, TaskContextRequest,
+    TaskRetrievalPath, estimate_task_context_payload_tokens,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -80,7 +82,7 @@ struct ExpectedRelation {
 
 struct MilestoneThreeFixture {
     _temporary: TempDir,
-    _store: GitStore,
+    store: GitStore,
     root: PathBuf,
     repository_path: PathBuf,
     oracle: Oracle,
@@ -176,10 +178,13 @@ impl MilestoneThreeFixture {
         let RepositoryScanOutcome::Available(snapshot) = scan else {
             panic!("fixture Repository must be available")
         };
+        let context_snapshots =
+            build_graph_context_snapshots(&domain.projection, &projected).unwrap();
         let projection = EngineeringReferenceResolver
             .resolve(
                 &projected,
                 &[RepositoryScanOutcome::Available(snapshot.clone())],
+                &context_snapshots,
             )
             .unwrap();
         let graph_store = EngineeringProjectionStore::initialize(&root).unwrap();
@@ -188,7 +193,7 @@ impl MilestoneThreeFixture {
             .unwrap();
         Self {
             _temporary: temporary,
-            _store: store,
+            store,
             root,
             repository_path,
             oracle,
@@ -319,6 +324,7 @@ fn fixed_multilanguage_oracle_marks_moves_and_renames_missing_and_rebuilds() {
             &fixture.projection,
             &fixture.references,
             &[RepositoryScanOutcome::Available(current_snapshot.clone())],
+            &fixture.projection.contexts,
         )
         .unwrap();
     let current_file = resolved(&current, &fixture.oracle.expected.references["file"]);
@@ -616,6 +622,7 @@ fn ambiguous_and_unavailable_edges_diagnose_or_fall_back_without_automatic_graph
                 repository_id: fixture.repository.repository_id,
                 reason: "fixed oracle checkout unavailable".to_owned(),
             }],
+            &fixture.projection.contexts,
         )
         .unwrap();
     assert!(unavailable.references.iter().all(|reference| {
@@ -662,6 +669,146 @@ fn ambiguous_and_unavailable_edges_diagnose_or_fall_back_without_automatic_graph
         estimate_task_context_payload_tokens(&fallback)
     );
     assert!(fallback.estimated_tokens <= fallback.token_budget);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn adapter_injects_frozen_safe_revision_after_current_revision_is_withdrawn() {
+    let fixture = MilestoneThreeFixture::new();
+    let decision_space = parse_id::<SpaceId>(&fixture.oracle.expected.spaces["requirement"]);
+    let decision_context = parse_id::<ContextId>(&fixture.oracle.expected.contexts["decision"]);
+    let decision_revision = parse_id(&fixture.oracle.expected.revisions["decision"]);
+    let before = fixture.index.domain_snapshot().unwrap();
+    let context = &before.projection.spaces[&decision_space].contexts[&decision_context];
+    let ContextGovernanceStatus::Accepted {
+        publication_id: previous_publication,
+        ..
+    } = context.governance
+    else {
+        panic!("fixed decision must be accepted before Graph build")
+    };
+    let revision_event = Event::context_revised(
+        decision_space,
+        decision_context,
+        vec![decision_revision],
+        ContextRevisionDraft {
+            kind: ContextKind::Decision,
+            topic_key: Some("search/frontend-rendering".to_owned()),
+            statement: "withdrawncurrentneedle replaces the historical Graph decision".to_owned(),
+            rationale: "The current Store moves independently from an explicit Graph build"
+                .to_owned(),
+            applicability: Applicability {
+                domains: vec!["search".to_owned()],
+                platforms: vec!["fe".to_owned()],
+                conditions: vec!["v2 response".to_owned()],
+            },
+            assumptions: vec!["the Graph is not rebuilt".to_owned()],
+            recheck_when: vec!["an explicit association rebuild occurs".to_owned()],
+            relations: Vec::new(),
+            evidence: vec![EvidenceSnapshotDraft {
+                kind: EvidenceType::ExperimentRecord,
+                supports: "The replacement Revision was appended".to_owned(),
+                content: serde_json::json!({"result": "appended"}),
+                interpretation: "Current governance can advance independently".to_owned(),
+                limitations: vec!["synthetic #147 fixture".to_owned()],
+            }],
+        },
+        None,
+    )
+    .unwrap();
+    let EventPayload::ContextRevisionAdded { revision, .. } = revision_event.payload() else {
+        unreachable!()
+    };
+    let current_revision = revision.revision_id;
+    fixture
+        .store
+        .append_event(AppendRequest::event(revision_event))
+        .unwrap();
+    let publish_event = Event::publication_changed(
+        decision_space,
+        decision_context,
+        PublicationDraft {
+            previous_publication_ids: vec![previous_publication],
+            action: PublicationAction::Publish,
+            revision_id: current_revision,
+            review_event_ids: Vec::new(),
+        },
+        None,
+    )
+    .unwrap();
+    let EventPayload::ContextPublicationChanged { publication, .. } = publish_event.payload()
+    else {
+        unreachable!()
+    };
+    let current_publication = publication.publication_id;
+    fixture
+        .store
+        .append_event(AppendRequest::event(publish_event))
+        .unwrap();
+    fixture
+        .store
+        .append_event(AppendRequest::event(
+            Event::publication_changed(
+                decision_space,
+                decision_context,
+                PublicationDraft {
+                    previous_publication_ids: vec![current_publication],
+                    action: PublicationAction::Withdraw,
+                    revision_id: current_revision,
+                    review_event_ids: Vec::new(),
+                },
+                None,
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    fixture.index.synchronize().unwrap();
+    let after = fixture.index.domain_snapshot().unwrap();
+    assert!(matches!(
+        after.projection.spaces[&decision_space].contexts[&decision_context].governance,
+        ContextGovernanceStatus::Deprecated { revision_id, .. }
+            if revision_id == current_revision
+    ));
+
+    let signal = fixture
+        .reference("symbol")
+        .resolution
+        .resolved_artifact
+        .as_ref()
+        .unwrap()
+        .locator()
+        .canonical_key();
+    let pack = fixture
+        .engine()
+        .task_context_pack(&task_request(
+            TaskSignalKind::Symbol,
+            &signal,
+            ContextPackMode::AutomaticInjection,
+            fixture.oracle.expected.token_budget,
+            "opaque historical graph injection",
+        ))
+        .unwrap();
+    let item = pack
+        .items
+        .iter()
+        .find(|item| item.context.context_id == decision_context)
+        .unwrap();
+    assert_eq!(item.context.revision_id, decision_revision);
+    assert_eq!(item.context.status, sctx_search::ContextStatus::Accepted);
+    assert!(item.context.auto_injection_eligible);
+    assert!(matches!(
+        item.context.safety_source,
+        ContextSafetySource::EngineeringGraphSnapshot { revision_id, .. }
+            if revision_id == decision_revision
+    ));
+    let rendered = sctx_agent_adapter::render_untrusted_task_context_pack(&pack).unwrap();
+    assert!(rendered.contains("frontend renders SearchEnvelopeClient"));
+    assert!(!rendered.contains("withdrawncurrentneedle"));
+    let mut mismatched_provenance = pack.clone();
+    mismatched_provenance.graph_context_tree_oid = Some("wrong-build-tree".to_owned());
+    assert!(
+        sctx_agent_adapter::render_untrusted_task_context_pack(&mismatched_provenance).is_err()
+    );
 }
 
 fn assert_multilanguage_snapshot(fixture: &MilestoneThreeFixture) {
@@ -722,6 +869,7 @@ fn assert_pack_generations_and_budget(fixture: &MilestoneThreeFixture, pack: &Ta
         snapshot.context_tree_oid.as_deref(),
         Some(pack.indexed_tree_oid.as_str())
     );
+    assert_eq!(pack.graph_context_tree_oid, snapshot.context_tree_oid);
     assert_eq!(
         snapshot.projection.artifact_generation,
         pack.artifact_generation.as_deref().unwrap()

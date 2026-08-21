@@ -10,7 +10,7 @@
 
 本项目尚未上线，本文直接定义目标模型、接口和存储结构。
 
-### 1.1 当前实现状态（Mew #146）
+### 1.1 当前实现状态（Mew #147）
 
 本文的大部分章节描述目标架构，不代表代码已经全部实现。当前里程碑边界如下：
 
@@ -18,7 +18,7 @@
 |---|---|---|
 | **M1：Task-first 领域与入口基础** | **已实现** | `TaskIntent` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；CLI/MCP 通过 `candidate_create` 创建无 Space Candidate；Candidate 不可自动注入 |
 | **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、严格 `task_intent_update` 与只读 `task_context` 已通过跨 crate/E2E 验收 |
-| **M3：Engineering Graph** | **已实现** | Repository Registry、Reference-derived 有界多语言扫描、持久 Engineering Reference、可重建解析投影、ContextRelation 1–2 跳、Graph RetrievalPath 及 MCP/CLI 工作流已通过固定跨 crate/E2E oracle |
+| **M3：Engineering Graph** | **已实现** | Repository Registry、Reference-derived 有界扫描、build-time immutable Context/safety snapshot、历史 Graph Retrieval、ContextRelation 1–2 跳及 MCP/CLI 工作流已通过固定跨 crate/E2E oracle |
 | **M4：Low-tax Capture** | **未实现** | 尚无 WorkEpisode 自动聚合、AgentCheckpoint、Candidate Builder、去重/冲突、Space 推荐或 Candidate Confirm/List/Discard |
 
 当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订权威 TaskIntent，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示；PostToolUse 仅在 ActiveTask 已存在时合并可证明的 File/Test 信号，并从 Workspace/CWD 的任意内部子目录向上刷新真实 canonical Git top-level。显式 Graph 工具完成 bounded scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。当前 `candidate_create` 仍是手工、无归属的 M1 入口，不等同于 M4 自动 Capture。
@@ -570,6 +570,18 @@ Engineering Graph 是派生查询结构，节点包括：
 - Artifact-to-Artifact：contains、calls、implements、consumes、defines、validates。
 - Context-to-Space：当前有效 SpaceAssociation。
 
+Engineering Graph 由显式 build 产生，是独立于当前 Context Projection 的稀疏历史知识快照。Builder 从 EngineeringReference 的精确 `(ContextId, RevisionId)` 出发，只收录 roots 与 build-time ContextRelation 最多两跳的 closure；无 Reference 且不可达的 Context/历史 Revision 不进入 Graph SQLite 或 Artifact Generation。
+
+每个 `GraphContextSnapshot` 固化：
+
+- SpaceId 与构建时 Space title；
+- immutable ContextId + 完整 ContextRevision；
+- 构建时 lifecycle/governance status、Evidence completeness；
+- typed automatic-safety blockers 与 eligibility；
+- ContextRelation 的 build-time target SpaceId + ContextId + accepted RevisionId。
+
+未接受、Evidence 不完整或存在治理/语义冲突的 Revision 可以保留给显式诊断，但 `automatic_injection_eligible=false`。Search 与 Agent Adapter 必须消费该 build-time safety，不得用当前 `context_item` 的 head、accepted、withdrawn 或 conflict 状态重新解释 Graph item。
+
 ### 8.2 Artifact 解析
 
 业务代码仓库只读扫描生成 `EngineeringArtifact`。Scanner 的输入必须是有界、非空的 `RepositoryScanPlan`：
@@ -589,7 +601,7 @@ locator:
 
 持久 `EngineeringReference` 的每个 kind-specific `ArtifactLocator` 都包含明确的 `RepoRelativePath`。`association_rebuild` 先按 RepositoryId 分组 Reference，再收集并去重这些 path，最后只读取计划中的文件；不得调用 `git ls-files` 枚举 Repository，不得遍历目录，也不得在空计划或 missing path 时回退为全仓扫描。显式 `repository_scan` 使用相同计划约束。
 
-计划内路径仍依次执行 canonical path、tracked-only、symlink escape、敏感/generated/vendor、单文件大小、文件数和总字节预算检查。新建或其他 untracked 文件不进入 Graph；这属于 #150 的确认边界，不在本改造中扩大。Task Retrieval 只消费已经构建的 Engineering Projection，一次 query 不运行 Scanner。
+计划内路径仍依次执行 canonical path、tracked-only、symlink escape、敏感/generated/vendor、单文件大小、文件数和总字节预算检查。新建或其他 untracked 文件不进入 Graph；这属于 #150 的确认边界。Task Retrieval 只消费已经构建的 Engineering Projection，一次 query 不运行 Scanner 或 `association_rebuild`。
 
 内部增量解析可以使用私有 Git blob OID 或 file-version digest，但它们不进入领域对象、关联证据、Graph ranking、RetrievalPath 或 MCP response。
 
@@ -751,7 +763,7 @@ task_intent_revision_id
 task_signal_fingerprint
 ```
 
-一次 TaskContextPack 必须在一个固定的知识投影 Snapshot 和一个固定的 TaskIntent Revision 上生成，禁止用多个自动提交查询拼装跨 Generation 结果。
+一次 TaskContextPack 必须在一个固定的当前知识 Projection、一个固定 TaskIntent Revision 和至多一个固定 EngineeringGraphSnapshot 上生成，禁止拼装多个 Graph Generation。`indexed_tree_oid` 是当前 Context Tree；`graph_context_tree_oid` 是 Graph build provenance；二者允许不同。`context_tree_oid` mismatch 不影响 Graph eligibility，也不触发自动 rebuild。
 
 ### 10.4 重建
 
@@ -1257,13 +1269,15 @@ M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命�
 
 - 本地 Repository Registry、同一 Git common-dir 的多 worktree 归一和不可用状态已实现；Workspace/CWD 可位于 Repository 任意内部子目录，但只向上注册该真实 top-level，不递归发现 sibling Repository。
 - Reference-derived `RepositoryScanPlan` 按 RepositoryId 分组、按精确 RepoRelativePath 去重；受限 tracked-source Scanner 只解析显式非空计划并生成 Module/File/Symbol/API/Schema/Test Artifact 摘要，不保存或返回完整源码，不执行全仓 `git ls-files` 枚举。
-- 持久 EngineeringReference Event、ArtifactResolution、ContextArtifactAssociation 和 generation-pinned Projection 已实现。
+- 持久 EngineeringReference Event、ArtifactResolution、ContextArtifactAssociation 和 generation-stable historical Projection 已实现。
 - `repository_scan`、`engineering_reference_record`、`association_explain`、`association_rebuild`/diagnose 已接入 MCP/CLI；服务端拥有 Reference/Event 身份与路径。
 - Task Retrieval 已消费唯一 resolved Graph edge 和 Context Relation；歧义/不可用不自动选择，Graph 故障降级为 Context-only。
+- Graph Builder 只固化 Reference roots 与最多两跳的 frozen ContextRelation closure；Graph item 使用 build-time immutable Revision/safety。后续 Candidate/Reference/Context/Publication append、新 Revision 或 Withdraw 不关闭旧 Graph，查询也不隐式 rebuild。
+- Graph Retrieval 与当前 Intent/Context/Scope fallback 使用 revision-aware candidate key；同一 ContextId 的 frozen old Revision 与 current FTS Revision 可以同时返回，Graph path 不得重绑到当前 Revision。Graph relation traversal 只使用 frozen relation targets；当前 fallback relation 不混入 EngineeringGraph path。
 - 已删除 M2 的文本 TaskSignal 伪工程路径；File/Symbol/API/Schema/Test 信号只有命中同代、唯一 resolved Artifact 时才形成 Engineering Graph 语义，Intent/Context BM25 与 Scope 继续作为非 Graph fallback。
 - 固定跨 crate/E2E oracle 以手工 ID、Reference-derived path 计划、确定性 locator 和关系验证稀疏 Graph；独立 Scanner contract 用显式计划覆盖 Rust、TypeScript、JavaScript、Swift、Kotlin、JSON、OpenAPI 与 Proto。验收覆盖未引用 tracked 文件零 Artifact、path 去重、missing 无 fallback、API/Schema/Qualified Symbol/Test 精确 locator、Symbol→Requirement/Decision/Contract/Validation、File move/Symbol rename 变为 missing、FE API/Schema→跨端 Context、cycle/depth、歧义诊断、Repository unavailable、增量=scratch、投影删除重建、Generation 和 Token Budget。
 - 固定 expected 位于 `tests/oracles/milestone-three-v1.json`，不得通过序列化生产结果生成或更新；只读源 Fixture 位于 `tests/fixtures/milestone-three/repository/`。
-- 本次改造不实现 #147：Graph 与当前 Context Tree 的既有一致性/eligibility 语义保持不变。新建或其他 untracked 文件不扫描，不实现 #150 范围。
+- `context_tree_oid` 仅保留 Graph build provenance；不作为启用谓词。新建或其他 untracked 文件仍不扫描，不实现 #150 范围。
 
 #### M3 EvidenceSource 可验证契约（供延期 #136 使用）
 

@@ -28,6 +28,7 @@ use sctx_engineering_graph::{
     MAX_REPOSITORY_SCAN_PLAN_PATHS, ProjectedEngineeringReference, RegisterRepositoryRequest,
     RegisteredRepository, RepositoryAvailability, RepositoryRegistry, RepositoryScanOutcome,
     RepositoryScanPlan, RepositoryScanner, ResolvedReferenceProjection, SkippedFileReason,
+    build_graph_context_snapshots,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
@@ -209,6 +210,7 @@ pub struct TaskContextResponse {
     pub tree: String,
     pub generation: u64,
     pub artifact_generation: Option<String>,
+    pub graph_context_tree_oid: Option<String>,
     pub token_budget: usize,
     pub estimated_tokens: usize,
     pub omitted: Vec<ContextPackOmitted>,
@@ -719,14 +721,22 @@ impl Runtime {
         let repositories = self.repositories.list()?;
         let (scan_outcomes, repository_summaries) =
             scan_registered_repositories(&repositories, &references)?;
+        let context_snapshots = build_graph_context_snapshots(&snapshot.projection, &references)?;
         let previous = engineering_graph.read_projection()?;
         let projection = previous.as_ref().map_or_else(
-            || EngineeringReferenceResolver.resolve(&references, &scan_outcomes),
+            || {
+                EngineeringReferenceResolver.resolve(
+                    &references,
+                    &scan_outcomes,
+                    &context_snapshots,
+                )
+            },
             |previous| {
                 EngineeringReferenceResolver.resolve_incremental(
                     previous,
                     &references,
                     &scan_outcomes,
+                    &context_snapshots,
                 )
             },
         )?;
@@ -1255,6 +1265,7 @@ fn build_task_context_response(
         tree: pack.indexed_tree_oid,
         generation: pack.projection_generation,
         artifact_generation: pack.artifact_generation,
+        graph_context_tree_oid: pack.graph_context_tree_oid,
         token_budget: pack.token_budget,
         estimated_tokens: pack.estimated_tokens,
         omitted: pack.omitted,

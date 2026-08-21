@@ -1,8 +1,8 @@
 # Task-first Retrieval Integration Acceptance Report
 
 Date: 2026-08-22
-Scope: Mew #112 through #149, excluding deferred #147 and accepted boundary #150
-Implementation baseline for sparse Graph repair: `main@c84c277`
+Scope: Mew #112 through #149, including historical Graph repair #147 and accepted boundary #150
+Implementation baseline for historical Graph repair: `main@8044f56`
 
 ## Verdict
 
@@ -16,7 +16,7 @@ This report does **not** claim M4:
 |---|---|---|
 | M1 — Task-first primitives and unassigned Candidate entry | IMPLEMENTED | Covered below |
 | M2 — Task Runtime and multi-Space retrieval | IMPLEMENTED | TaskSession persistence, strict `task_intent_update`, read-only `task_context`, association inference, typed RetrievalPaths, and TaskContextPack pass focused cross-crate/E2E oracles |
-| M3 — Engineering Graph | IMPLEMENTED | Reference-derived bounded ScanPlan, deterministic Artifact locators, move/rename-to-missing behavior, exact graph retrieval, 1–2 hop cross-platform Context, diagnostics, fallback, rebuild equivalence, and snapshot/budget bounds pass fixed cross-crate/E2E oracles |
+| M3 — Engineering Graph | IMPLEMENTED | Reference-derived bounded ScanPlan, deterministic Artifact locators, sparse build-time Context/safety snapshots, historical exact retrieval, frozen 1–2 hop relations, diagnostics, fallback, rebuild equivalence, and budget bounds pass cross-crate/E2E oracles |
 | M4 — Low-tax Capture | NOT IMPLEMENTED | No automatic WorkEpisode aggregation, Candidate Builder, Space recommendation, deduplication, or confirmation workflow |
 
 `task_intent_update` is the only Task Intent write path. `task_context` accepts only an external Session locator and output bounds, and reads the already-authoritative ActiveTask without mutating Runtime. PromptSubmit supplies guidance rather than inferred Intent. Explicit `context_search.space_ids` remains available as a hard filter for diagnosis and exploration.
@@ -57,12 +57,18 @@ M4 retains Mandatory Gate #114/#117: stable `submission_id` idempotency must be 
 | File move and Symbol rename never trigger guessing | PROVEN | M3 oracle moves a JS file and renames a TS Symbol, then proves both original deterministic locators become `missing`, create no Edge, and remain unchanged without Git-history or Agent repair workflow |
 | Exact Graph retrieval expands cross-platform Context at bounded depth | PROVEN | Symbol→Decision→Contract→iOS/Android and FE API/Schema→Contract→Decision/iOS/Android paths match fixed Context IDs, relation kinds and depths; cycles never repeat a Context and all paths stop at depth two |
 | Ambiguous edges are diagnostic-only | PROVEN | Explicit mode exposes both fixed candidates; automatic mode cannot use the edge to inject or raise Graph relevance |
-| Engineering projection is disposable and generation-consistent | PROVEN | The oracle deletes `engineering.sqlite`, rebuilds byte-equivalent canonical projection, and proves every Graph path shares the returned Context Tree and Artifact Generation |
+| Engineering projection is disposable and generation-consistent | PROVEN | The oracle deletes `engineering.sqlite`, rebuilds byte-equivalent canonical projection, and proves every Graph path shares one Artifact Generation while Graph build Tree remains explicit provenance |
 | Incremental and scratch scans are equivalent | PROVEN | The Scanner contract runs both paths with the same RepositoryId and deduplicated ScanPlan and asserts byte-for-byte equal RepositorySnapshot output |
 | Associations, paths and omissions obey Token Budget | PROVEN | Full and constrained fixed Graph packs recompute exact charged tokens, stay within budget, obey top-k, and emit omissions when bounded |
 | M3 defines the verifiable Evidence source boundary for deferred #136 | PROVEN | Technical design defines typed TaskSignal, ContextEvidence and EngineeringResolution sources, ownership/snapshot rules, negative statuses, and the M4 persistence boundary without claiming it is implemented |
+| Historical Graph remains active across current Tree changes | PROVEN | Tree mismatch plus unrelated Candidate/Reference/Context/Publication append, new Revision and Withdraw preserve the old Graph path and exact frozen Revision without implicit rebuild |
+| Graph safety is decided at build time | PROVEN | Candidate, incomplete-Evidence and semantic-conflict roots remain explicit-only; withdrawn-after-build safe Revision passes Agent Adapter only with matching Graph provenance, generation, identity and empty blockers |
+| Current and historical revisions never collide | PROVEN | One Task returns the same ContextId's frozen old Graph Revision and current FTS Revision as separate revision-aware items; each path remains attached to its exact Revision |
+| Graph ContextRelation traversal is historical | PROVEN | Frozen source/target Revision IDs survive a new current Revision with different relations; current fallback relations never extend an EngineeringGraph path |
+| Sparse Context snapshot closure excludes unrelated corpus | PROVEN | Adding 64 unrelated Spaces/Contexts leaves Graph snapshot row count and Artifact Generation unchanged; only Reference roots plus two-hop closure are persisted |
+| Concurrent Graph reads observe one stable generation | PROVEN | Concurrent repeated Graph rebuilds and Task reads return one Artifact Generation and the exact frozen historical Revision |
 
-#147 is not implemented by #149: existing Graph/current-Context-Tree eligibility semantics are unchanged. #150 is an accepted product boundary: untracked files are not scanned, and no ActiveTask untracked scan entry was added.
+#150 remains an accepted product boundary: untracked files are not scanned, and no ActiveTask untracked scan entry was added.
 
 ## Residue gates
 
@@ -103,7 +109,7 @@ Current repository gate results:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: passed with no warnings.
-- `cargo test --workspace --locked`: 269 passed, 0 failed, 1 ignored manual benchmark.
+- `cargo test --workspace --locked`: 273 passed, 0 failed, 1 ignored manual benchmark.
 - `npm test`: 16 passed, 0 failed, 0 skipped.
 - Shared Context Skill `quick_validate.py`: passed (`Skill is valid!`).
 

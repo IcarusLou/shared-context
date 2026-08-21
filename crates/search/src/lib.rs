@@ -8,11 +8,12 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value as SqlValue};
 use sctx_domain::{
     Applicability, ArtifactAssociationKind, ArtifactKey, ArtifactKind, ContextId, ContextKind,
-    ContextRelationKind, EvidenceId, ReferenceId, RepositoryId, ResolutionStatus, RevisionId,
-    SpaceId, TaskId, TaskIntent, TaskSignal, TaskSignalKind, TaskSpaceAssociation,
+    ContextRelationKind, EvidenceId, EvidenceType, ReferenceId, RepositoryId, ResolutionStatus,
+    RevisionId, SpaceId, TaskId, TaskIntent, TaskSignal, TaskSignalKind, TaskSpaceAssociation,
 };
 use sctx_engineering_graph::{
-    EngineeringProjection, EngineeringProjectionSnapshot, EngineeringProjectionStore, MatchBasis,
+    EngineeringProjection, EngineeringProjectionSnapshot, EngineeringProjectionStore,
+    GraphContextSafety, GraphContextSnapshot, GraphContextStatus, MatchBasis,
 };
 use sctx_index::{IndexMetadata, ProjectionIndex, normalize_search_text, search_tokens};
 use serde::{Deserialize, Serialize};
@@ -466,13 +467,14 @@ pub struct TaskContextItem {
     pub retrieval_paths: Vec<TaskRetrievalPath>,
 }
 
-/// Task-first Context Pack produced from one exact Context snapshot and an
-/// optional Engineering snapshot pinned to the same Context Tree.
+/// Task-first Context Pack produced from the current Context projection and an optional,
+/// independently built historical Engineering Graph snapshot.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TaskContextPack {
     pub indexed_tree_oid: String,
     pub projection_generation: u64,
     pub artifact_generation: Option<String>,
+    pub graph_context_tree_oid: Option<String>,
     pub task_id: TaskId,
     pub task_fingerprint: String,
     pub token_budget: usize,
@@ -541,8 +543,23 @@ pub struct ContextPackItem {
     pub evidence: Vec<EvidenceView>,
     pub conflicts: Vec<ConflictView>,
     pub auto_injection_eligible: bool,
+    pub safety_source: ContextSafetySource,
     pub match_reason: MatchReason,
     pub detail: ContextPackDetail,
+}
+
+/// Authoritative origin of the automatic-injection decision carried by one Context item.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum ContextSafetySource {
+    CurrentProjection,
+    EngineeringGraphSnapshot {
+        context_tree_oid: Option<String>,
+        artifact_generation: String,
+        context_id: ContextId,
+        revision_id: RevisionId,
+        safety: GraphContextSafety,
+    },
 }
 
 /// Query boundary that always delegates reads to one [`sctx_index::QuerySnapshot`] transaction.
@@ -628,8 +645,7 @@ impl SearchEngine {
         for _attempt in 0..3 {
             let graph_snapshot = self.read_graph_snapshot();
             let snapshot = self.index.query_snapshot(|connection| {
-                let tree_oid = meta(connection, "indexed_tree_oid")?;
-                let graph = graph_for_tree(graph_snapshot.as_ref(), &tree_oid);
+                let graph = graph_projection(graph_snapshot.as_ref());
                 infer_task_space_associations(
                     connection,
                     intent.task_id,
@@ -639,11 +655,13 @@ impl SearchEngine {
                     &scope_targets,
                     signals,
                     graph,
+                    graph_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.context_tree_oid.as_deref()),
                     ContextPackMode::AutomaticInjection,
                 )
             })?;
-            let used_graph =
-                graph_for_tree(graph_snapshot.as_ref(), &snapshot.metadata.indexed_tree_oid);
+            let used_graph = graph_projection(graph_snapshot.as_ref());
             if used_graph.is_some() && !self.graph_snapshot_unchanged(graph_snapshot.as_ref()) {
                 continue;
             }
@@ -660,9 +678,9 @@ impl SearchEngine {
     }
 
     /// Builds an explainable Task-first Context Pack from one Context `QuerySnapshot` and, when
-    /// available, one generation-stable Engineering projection explicitly pinned to that Tree.
-    /// Association inference, Context retrieval, safety filtering, Evidence/Conflict expansion,
-    /// ordering, and token budgeting all observe those returned generations.
+    /// available, one generation-stable historical Engineering projection. Its Context Tree is
+    /// provenance only; build-time immutable revisions and safety remain authoritative until an
+    /// explicit Graph rebuild.
     ///
     /// # Errors
     ///
@@ -678,8 +696,7 @@ impl SearchEngine {
         for _attempt in 0..3 {
             let graph_snapshot = self.read_graph_snapshot();
             let snapshot = self.index.query_snapshot(|connection| {
-                let tree_oid = meta(connection, "indexed_tree_oid")?;
-                let graph = graph_for_tree(graph_snapshot.as_ref(), &tree_oid);
+                let graph = graph_projection(graph_snapshot.as_ref());
                 let mut inference = infer_task_space_associations(
                     connection,
                     request.task_intent.task_id,
@@ -689,6 +706,9 @@ impl SearchEngine {
                     &scope_targets,
                     &request.task_signals,
                     graph,
+                    graph_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.context_tree_oid.as_deref()),
                     request.mode,
                 )?;
                 let omitted_spaces = inference
@@ -715,8 +735,7 @@ impl SearchEngine {
                     omitted_space_tokens,
                 ))
             })?;
-            let used_graph =
-                graph_for_tree(graph_snapshot.as_ref(), &snapshot.metadata.indexed_tree_oid);
+            let used_graph = graph_projection(graph_snapshot.as_ref());
             if used_graph.is_some() && !self.graph_snapshot_unchanged(graph_snapshot.as_ref()) {
                 continue;
             }
@@ -724,6 +743,9 @@ impl SearchEngine {
                 indexed_tree_oid: snapshot.metadata.indexed_tree_oid,
                 projection_generation: snapshot.metadata.projection_generation,
                 artifact_generation: used_graph.map(|graph| graph.artifact_generation.clone()),
+                graph_context_tree_oid: graph_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.context_tree_oid.clone()),
                 task_id: request.task_intent.task_id,
                 task_fingerprint: fingerprint,
                 token_budget: request.token_budget,
@@ -808,13 +830,10 @@ impl SearchEngine {
     }
 }
 
-fn graph_for_tree<'a>(
-    snapshot: Option<&'a EngineeringProjectionSnapshot>,
-    tree_oid: &str,
-) -> Option<&'a EngineeringProjection> {
-    snapshot
-        .filter(|snapshot| snapshot.context_tree_oid.as_deref() == Some(tree_oid))
-        .map(|snapshot| &snapshot.projection)
+fn graph_projection(
+    snapshot: Option<&EngineeringProjectionSnapshot>,
+) -> Option<&EngineeringProjection> {
+    snapshot.map(|snapshot| &snapshot.projection)
 }
 
 fn graph_snapshot_identity(
@@ -1182,6 +1201,14 @@ struct AcceptedContextEvidence {
     relation_depth: Option<u8>,
 }
 
+#[derive(Clone, Debug)]
+struct GraphContextEvidence {
+    snapshot: GraphContextSnapshot,
+    evidence: AcceptedContextEvidence,
+}
+
+type GraphContextKey = (SpaceId, ContextId, RevisionId);
+
 const SAFE_ACCEPTED_CONTEXT_PREDICATE: &str = "item.governance_status = 'accepted'
      AND item.accepted_revision_id = revision.revision_id
      AND item.auto_injection_eligible = 1
@@ -1228,6 +1255,9 @@ struct TaskAssociationInference {
     associations: Vec<TaskSpaceAssociation>,
     evidence: BTreeMap<SpaceId, AssociationEvidence>,
     contexts: BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>,
+    graph_contexts: BTreeMap<GraphContextKey, GraphContextEvidence>,
+    graph_context_tree_oid: Option<String>,
+    graph_artifact_generation: Option<String>,
 }
 
 fn artifact_hints(signals: &[TaskSignal]) -> Vec<ArtifactHint> {
@@ -1275,81 +1305,34 @@ fn infer_task_space_associations(
     scope_targets: &ScopeTargets,
     task_signals: &[TaskSignal],
     engineering_graph: Option<&EngineeringProjection>,
+    graph_context_tree_oid: Option<&str>,
     mode: ContextPackMode,
 ) -> Result<TaskAssociationInference> {
     let intent_candidates = query_space_intent_candidates(connection, query_tokens, query_phrases)?;
     let mut contexts =
         query_accepted_context_evidence(connection, query_tokens, query_phrases, scope_targets)?;
+    let mut graph_contexts = BTreeMap::new();
     if let Some(graph) = engineering_graph {
         query_graph_context_evidence(
-            connection,
             graph,
             artifact_hints,
             task_signals,
             mode,
-            &mut contexts,
-        )?;
+            &mut graph_contexts,
+        );
+        expand_graph_context_relation_evidence(graph, mode, &mut graph_contexts)?;
     }
-    expand_context_relation_evidence(connection, mode, &mut contexts)?;
+    expand_current_context_relation_evidence(connection, mode, &mut contexts)?;
     let mut evidence = BTreeMap::<SpaceId, AssociationEvidence>::new();
     apply_intent_evidence(&mut evidence, intent_candidates);
     for ((space_id, context_id), context) in &contexts {
-        let aggregate = evidence.entry(*space_id).or_default();
-        aggregate.matched_contexts.insert(*context_id);
-        if context.textual_match {
-            aggregate.textual_contexts.insert(*context_id);
-            aggregate
-                .context_tokens
-                .extend(context.matched_tokens.iter().cloned());
-            if let Some(bm25) = context.bm25 {
-                aggregate.context_bm25 = Some(
-                    aggregate
-                        .context_bm25
-                        .map_or(bm25, |current| current.min(bm25)),
-                );
-            }
-            aggregate.context_phrase_match |= context.phrase_match;
-            for field in &context.matched_fields {
-                if aggregate.context_fields.insert(*field) {
-                    aggregate.context_field_weight_points = aggregate
-                        .context_field_weight_points
-                        .saturating_add(context_field_weight(*field));
-                }
-            }
-        }
-        aggregate
-            .matched_artifacts
-            .extend(context.matched_artifacts.iter().cloned());
-        aggregate
-            .matched_scopes
-            .extend(context.matched_scopes.iter().cloned());
-        if context
-            .graph_paths
-            .iter()
-            .any(|path| matches!(path, TaskRetrievalPath::EngineeringGraph { relation_hops, .. } if relation_hops.is_empty()))
-        {
-            aggregate.graph_exact_contexts.insert(*context_id);
-        }
-        if context.relation_depth.is_some() {
-            aggregate.relation_contexts.insert(*context_id);
-        }
-        aggregate.relation_paths.extend(
-            context
-                .graph_paths
-                .iter()
-                .filter(|path| {
-                    matches!(
-                        path,
-                        TaskRetrievalPath::EngineeringGraph { .. }
-                            | TaskRetrievalPath::ContextRelation { .. }
-                    )
-                })
-                .map(|path| {
-                    vec![
-                        serde_json::to_string(path)
-                            .expect("typed Graph RetrievalPath is always serializable"),
-                    ]
-                }),
+        aggregate_context_evidence(evidence.entry(*space_id).or_default(), *context_id, context);
+    }
+    for ((space_id, context_id, _revision_id), graph) in &graph_contexts {
+        aggregate_context_evidence(
+            evidence.entry(*space_id).or_default(),
+            *context_id,
+            &graph.evidence,
         );
     }
     hydrate_intent_conflict_state(connection, &mut evidence)?;
@@ -1369,7 +1352,73 @@ fn infer_task_space_associations(
         associations,
         evidence,
         contexts,
+        graph_contexts,
+        graph_context_tree_oid: graph_context_tree_oid.map(ToOwned::to_owned),
+        graph_artifact_generation: engineering_graph.map(|graph| graph.artifact_generation.clone()),
     })
+}
+
+fn aggregate_context_evidence(
+    aggregate: &mut AssociationEvidence,
+    context_id: ContextId,
+    context: &AcceptedContextEvidence,
+) {
+    aggregate.matched_contexts.insert(context_id);
+    if context.textual_match {
+        aggregate.textual_contexts.insert(context_id);
+        aggregate
+            .context_tokens
+            .extend(context.matched_tokens.iter().cloned());
+        if let Some(bm25) = context.bm25 {
+            aggregate.context_bm25 = Some(
+                aggregate
+                    .context_bm25
+                    .map_or(bm25, |current| current.min(bm25)),
+            );
+        }
+        aggregate.context_phrase_match |= context.phrase_match;
+        for field in &context.matched_fields {
+            if aggregate.context_fields.insert(*field) {
+                aggregate.context_field_weight_points = aggregate
+                    .context_field_weight_points
+                    .saturating_add(context_field_weight(*field));
+            }
+        }
+    }
+    aggregate
+        .matched_artifacts
+        .extend(context.matched_artifacts.iter().cloned());
+    aggregate
+        .matched_scopes
+        .extend(context.matched_scopes.iter().cloned());
+    if context
+        .graph_paths
+        .iter()
+        .any(|path| matches!(path, TaskRetrievalPath::EngineeringGraph { relation_hops, .. } if relation_hops.is_empty()))
+    {
+        aggregate.graph_exact_contexts.insert(context_id);
+    }
+    if context.relation_depth.is_some() {
+        aggregate.relation_contexts.insert(context_id);
+    }
+    aggregate.relation_paths.extend(
+        context
+            .graph_paths
+            .iter()
+            .filter(|path| {
+                matches!(
+                    path,
+                    TaskRetrievalPath::EngineeringGraph { .. }
+                        | TaskRetrievalPath::ContextRelation { .. }
+                )
+            })
+            .map(|path| {
+                vec![
+                    serde_json::to_string(path)
+                        .expect("typed Graph RetrievalPath is always serializable"),
+                ]
+            }),
+    );
 }
 
 fn hydrate_intent_conflict_state(
@@ -1481,13 +1530,12 @@ fn query_accepted_context_evidence(
 
 #[allow(clippy::too_many_lines)]
 fn query_graph_context_evidence(
-    connection: &Connection,
     graph: &EngineeringProjection,
     artifact_hints: &[ArtifactHint],
     task_signals: &[TaskSignal],
     mode: ContextPackMode,
-    contexts: &mut BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>,
-) -> Result<()> {
+    contexts: &mut BTreeMap<GraphContextKey, GraphContextEvidence>,
+) {
     let repository_ids = task_signals
         .iter()
         .filter(|signal| signal.kind == TaskSignalKind::Repository)
@@ -1527,11 +1575,22 @@ fn query_graph_context_evidence(
         if matches.is_empty() && repository_diagnostics.is_empty() {
             continue;
         }
-        let Some(space_id) =
-            current_context_space(connection, resolved.context_id, resolved.revision_id, mode)?
-        else {
+        let Some(snapshot) = graph.contexts.iter().find(|snapshot| {
+            snapshot.context_id == resolved.context_id
+                && snapshot.revision.revision_id == resolved.revision_id
+        }) else {
             continue;
         };
+        if mode == ContextPackMode::AutomaticInjection
+            && !snapshot.safety.automatic_injection_eligible
+        {
+            continue;
+        }
+        let key = (
+            snapshot.space_id,
+            snapshot.context_id,
+            snapshot.revision.revision_id,
+        );
         if resolved.resolution.status == ResolutionStatus::Resolved {
             let Some(association) = &resolved.association else {
                 continue;
@@ -1563,18 +1622,23 @@ fn query_graph_context_evidence(
                     confidence_basis_points: confidence_basis_points(association.confidence),
                     artifact_generation: graph.artifact_generation.clone(),
                 };
-                let context = contexts.entry((space_id, resolved.context_id)).or_default();
-                context.matched_artifacts.insert(hint.label.clone());
+                let context = contexts.entry(key).or_insert_with(|| GraphContextEvidence {
+                    snapshot: snapshot.clone(),
+                    evidence: AcceptedContextEvidence::default(),
+                });
                 context
+                    .evidence
+                    .matched_artifacts
+                    .insert(hint.label.clone());
+                context
+                    .evidence
                     .graph_paths
                     .push(TaskRetrievalPath::EngineeringGraph {
                         path,
                         relation_hops: Vec::new(),
                     });
             }
-        } else if mode == ContextPackMode::Explicit
-            && contexts.contains_key(&(space_id, resolved.context_id))
-        {
+        } else if mode == ContextPackMode::Explicit {
             let diagnostics = matches
                 .iter()
                 .map(|(hint, _artifact)| (hint.kind, hint.content.as_str()))
@@ -1593,8 +1657,12 @@ fn query_graph_context_evidence(
                 bases.sort();
                 bases.dedup();
                 contexts
-                    .get_mut(&(space_id, resolved.context_id))
-                    .expect("diagnostic Context evidence exists")
+                    .entry(key)
+                    .or_insert_with(|| GraphContextEvidence {
+                        snapshot: snapshot.clone(),
+                        evidence: AcceptedContextEvidence::default(),
+                    })
+                    .evidence
                     .graph_paths
                     .push(TaskRetrievalPath::GraphDiagnostic {
                         diagnostic: GraphResolutionDiagnosticPath {
@@ -1615,9 +1683,8 @@ fn query_graph_context_evidence(
         }
     }
     for context in contexts.values_mut() {
-        sort_dedup_paths(&mut context.graph_paths);
+        sort_dedup_paths(&mut context.evidence.graph_paths);
     }
-    Ok(())
 }
 
 fn current_context_space(
@@ -1644,7 +1711,7 @@ fn current_context_space(
             |row| row.get::<_, String>(0),
         )
         .optional()
-        .map_err(sql_error("read current Graph Context revision"))?
+        .map_err(sql_error("read current fallback Context revision"))?
         .map(|space_id| parse_id(&space_id))
         .transpose()
 }
@@ -1718,7 +1785,119 @@ struct IndexedContextRelation {
 
 const DEFAULT_CONTEXT_RELATION_DEPTH: u8 = 2;
 
-fn expand_context_relation_evidence(
+#[allow(clippy::too_many_lines)]
+fn expand_graph_context_relation_evidence(
+    graph: &EngineeringProjection,
+    mode: ContextPackMode,
+    contexts: &mut BTreeMap<GraphContextKey, GraphContextEvidence>,
+) -> Result<()> {
+    if contexts.is_empty() {
+        return Ok(());
+    }
+    let snapshots = graph
+        .contexts
+        .iter()
+        .map(|snapshot| {
+            (
+                (
+                    snapshot.space_id,
+                    snapshot.context_id,
+                    snapshot.revision.revision_id,
+                ),
+                snapshot,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let seeds = contexts
+        .iter()
+        .flat_map(|(key, context)| {
+            context.evidence.graph_paths.iter().filter_map(move |path| {
+                let TaskRetrievalPath::EngineeringGraph {
+                    path,
+                    relation_hops,
+                } = path
+                else {
+                    return None;
+                };
+                relation_hops.is_empty().then_some((*key, path.clone()))
+            })
+        })
+        .collect::<Vec<_>>();
+    for (seed_key, graph_path) in seeds {
+        let mut queue = VecDeque::from([(seed_key, Vec::new(), BTreeSet::from([seed_key.1]))]);
+        while let Some((current_key, hops, visited)) = queue.pop_front() {
+            if hops.len() >= usize::from(DEFAULT_CONTEXT_RELATION_DEPTH) {
+                continue;
+            }
+            let Some(current) = snapshots.get(&current_key) else {
+                return Err(invariant(
+                    "Graph relation traversal lost a frozen source Context snapshot",
+                ));
+            };
+            for relation in &current.relations {
+                if visited.contains(&relation.target_context_id) {
+                    continue;
+                }
+                let target_key = (
+                    relation.target_space_id,
+                    relation.target_context_id,
+                    relation.target_revision_id,
+                );
+                let Some(target_snapshot) = snapshots.get(&target_key) else {
+                    return Err(invariant(
+                        "Graph relation traversal lost a frozen target Context snapshot",
+                    ));
+                };
+                if mode == ContextPackMode::AutomaticInjection
+                    && !target_snapshot.safety.automatic_injection_eligible
+                {
+                    continue;
+                }
+                let depth =
+                    u8::try_from(hops.len() + 1).expect("Context Relation depth is bounded by two");
+                let mut next_hops = hops.clone();
+                next_hops.push(ContextRelationRetrievalPath {
+                    source_context_id: current.context_id,
+                    source_revision_id: current.revision.revision_id,
+                    target_context_id: target_snapshot.context_id,
+                    target_revision_id: target_snapshot.revision.revision_id,
+                    kind: relation.kind,
+                    rationale: relation.rationale.clone(),
+                    supports: relation.supports.clone(),
+                    depth,
+                });
+                let target = contexts
+                    .entry(target_key)
+                    .or_insert_with(|| GraphContextEvidence {
+                        snapshot: (*target_snapshot).clone(),
+                        evidence: AcceptedContextEvidence::default(),
+                    });
+                target.evidence.relation_depth = Some(
+                    target
+                        .evidence
+                        .relation_depth
+                        .map_or(depth, |current| current.min(depth)),
+                );
+                target
+                    .evidence
+                    .graph_paths
+                    .push(TaskRetrievalPath::EngineeringGraph {
+                        path: graph_path.clone(),
+                        relation_hops: next_hops.clone(),
+                    });
+                let mut next_visited = visited.clone();
+                next_visited.insert(target_snapshot.context_id);
+                queue.push_back((target_key, next_hops, next_visited));
+            }
+        }
+    }
+    for context in contexts.values_mut() {
+        sort_dedup_paths(&mut context.evidence.graph_paths);
+    }
+    Ok(())
+}
+
+fn expand_current_context_relation_evidence(
     connection: &Connection,
     mode: ContextPackMode,
     contexts: &mut BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>,
@@ -1737,76 +1916,49 @@ fn expand_context_relation_evidence(
     let seeds = contexts
         .iter()
         .filter(|(_, evidence)| context_is_positive_seed(evidence))
-        .map(|((space_id, context_id), evidence)| {
-            let graph = evidence
-                .graph_paths
-                .iter()
-                .filter_map(|path| match path {
-                    TaskRetrievalPath::EngineeringGraph {
-                        path,
-                        relation_hops,
-                    } if relation_hops.is_empty() => Some(path.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            (*space_id, *context_id, graph)
-        })
+        .map(|((space_id, context_id), _evidence)| (*space_id, *context_id))
         .collect::<Vec<_>>();
-    for (_space_id, seed_context_id, graph_paths) in seeds {
-        let routes = if graph_paths.is_empty() {
-            vec![None]
-        } else {
-            graph_paths.into_iter().map(Some).collect()
-        };
-        for graph_path in routes {
-            let mut queue = VecDeque::from([(
-                seed_context_id,
-                Vec::new(),
-                BTreeSet::from([seed_context_id]),
-            )]);
-            while let Some((current, hops, route_visited)) = queue.pop_front() {
-                if hops.len() >= usize::from(DEFAULT_CONTEXT_RELATION_DEPTH) {
+    for (_space_id, seed_context_id) in seeds {
+        let mut queue = VecDeque::from([(
+            seed_context_id,
+            Vec::new(),
+            BTreeSet::from([seed_context_id]),
+        )]);
+        while let Some((current, hops, route_visited)) = queue.pop_front() {
+            if hops.len() >= usize::from(DEFAULT_CONTEXT_RELATION_DEPTH) {
+                continue;
+            }
+            for edge in outgoing.get(&current).into_iter().flatten() {
+                if route_visited.contains(&edge.target_context_id) {
                     continue;
                 }
-                for edge in outgoing.get(&current).into_iter().flatten() {
-                    if route_visited.contains(&edge.target_context_id) {
-                        continue;
-                    }
-                    let depth = u8::try_from(hops.len() + 1)
-                        .expect("Context Relation depth is bounded by two");
-                    let mut next_hops = hops.clone();
-                    next_hops.push(ContextRelationRetrievalPath {
-                        source_context_id: edge.source_context_id,
-                        source_revision_id: edge.source_revision_id,
-                        target_context_id: edge.target_context_id,
-                        target_revision_id: edge.target_revision_id,
-                        kind: edge.kind,
-                        rationale: edge.rationale.clone(),
-                        supports: edge.supports.clone(),
-                        depth,
-                    });
-                    let path = graph_path.as_ref().map_or_else(
-                        || TaskRetrievalPath::ContextRelation {
-                            hops: next_hops.clone(),
-                        },
-                        |path| TaskRetrievalPath::EngineeringGraph {
-                            path: path.clone(),
-                            relation_hops: next_hops.clone(),
-                        },
-                    );
-                    let target = contexts
-                        .entry((edge.target_space_id, edge.target_context_id))
-                        .or_default();
-                    target.relation_depth = Some(
-                        target
-                            .relation_depth
-                            .map_or(depth, |current| current.min(depth)),
-                    );
-                    target.graph_paths.push(path);
-                    let mut next_visited = route_visited.clone();
-                    next_visited.insert(edge.target_context_id);
-                    queue.push_back((edge.target_context_id, next_hops, next_visited));
-                }
+                let depth =
+                    u8::try_from(hops.len() + 1).expect("Context Relation depth is bounded by two");
+                let mut next_hops = hops.clone();
+                next_hops.push(ContextRelationRetrievalPath {
+                    source_context_id: edge.source_context_id,
+                    source_revision_id: edge.source_revision_id,
+                    target_context_id: edge.target_context_id,
+                    target_revision_id: edge.target_revision_id,
+                    kind: edge.kind,
+                    rationale: edge.rationale.clone(),
+                    supports: edge.supports.clone(),
+                    depth,
+                });
+                let target = contexts
+                    .entry((edge.target_space_id, edge.target_context_id))
+                    .or_default();
+                target.relation_depth = Some(
+                    target
+                        .relation_depth
+                        .map_or(depth, |current| current.min(depth)),
+                );
+                target.graph_paths.push(TaskRetrievalPath::ContextRelation {
+                    hops: next_hops.clone(),
+                });
+                let mut next_visited = route_visited.clone();
+                next_visited.insert(edge.target_context_id);
+                queue.push_back((edge.target_context_id, next_hops, next_visited));
             }
         }
     }
@@ -2481,7 +2633,7 @@ fn association_reasons(evidence: &AssociationEvidence) -> Vec<String> {
     }
     if !evidence.relation_contexts.is_empty() {
         reasons.push(format!(
-            "Stable active Context Relations reached {} Context(s) within depth {}",
+            "Bounded Context Relations reached {} Context(s) within depth {}",
             evidence.relation_contexts.len(),
             DEFAULT_CONTEXT_RELATION_DEPTH
         ));
@@ -2579,6 +2731,7 @@ const fn signal_kind_name(kind: TaskSignalKind) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn load_task_context_candidates(
     connection: &Connection,
     inference: &TaskAssociationInference,
@@ -2639,6 +2792,46 @@ fn load_task_context_candidates(
             candidates.push(candidate);
         }
     }
+    for graph in inference.graph_contexts.values() {
+        if let Some(candidate) = graph_context_candidate(inference, &association_rank, graph, mode)?
+        {
+            candidates.push(candidate);
+        }
+    }
+    let mut revision_aware =
+        BTreeMap::<(SpaceId, ContextId, RevisionId), TaskContextCandidate>::new();
+    for mut candidate in candidates {
+        let key = (
+            candidate.item.context.space_id,
+            candidate.item.context.context_id,
+            candidate.item.context.revision_id,
+        );
+        if let Some(existing) = revision_aware.remove(&key) {
+            let graph_is_candidate = matches!(
+                candidate.item.context.safety_source,
+                ContextSafetySource::EngineeringGraphSnapshot { .. }
+            );
+            let (mut preferred, other) = if graph_is_candidate {
+                (candidate, existing)
+            } else {
+                (existing, candidate)
+            };
+            preferred
+                .item
+                .retrieval_paths
+                .extend(other.item.retrieval_paths);
+            sort_dedup_paths(&mut preferred.item.retrieval_paths);
+            preferred.direct_path_count = preferred
+                .item
+                .retrieval_paths
+                .iter()
+                .filter(|path| !matches!(path, TaskRetrievalPath::IntentFts { .. }))
+                .count();
+            candidate = preferred;
+        }
+        revision_aware.insert(key, candidate);
+    }
+    let mut candidates = revision_aware.into_values().collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
         left.association_rank
             .cmp(&right.association_rank)
@@ -2676,6 +2869,106 @@ fn load_task_context_candidates(
         candidates,
         omitted,
     })
+}
+
+fn graph_context_candidate(
+    inference: &TaskAssociationInference,
+    association_rank: &BTreeMap<SpaceId, usize>,
+    graph: &GraphContextEvidence,
+    mode: ContextPackMode,
+) -> Result<Option<TaskContextCandidate>> {
+    let snapshot = &graph.snapshot;
+    let Some(rank) = association_rank.get(&snapshot.space_id) else {
+        return Ok(None);
+    };
+    if mode == ContextPackMode::AutomaticInjection && !snapshot.safety.automatic_injection_eligible
+    {
+        return Ok(None);
+    }
+    let Some(artifact_generation) = inference.graph_artifact_generation.clone() else {
+        return Err(invariant(
+            "Graph Context candidate is missing its Artifact Generation",
+        ));
+    };
+    let paths = task_retrieval_paths(
+        inference
+            .evidence
+            .get(&snapshot.space_id)
+            .ok_or_else(|| invariant("Graph Context candidate has no Space association"))?,
+        Some(&graph.evidence),
+    );
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let evidence = snapshot
+        .revision
+        .evidence
+        .iter()
+        .map(|evidence| EvidenceView {
+            evidence_id: evidence.evidence_id,
+            kind: evidence_type_name(evidence.kind).to_owned(),
+            supports: evidence.supports.clone(),
+            content: evidence.content.clone(),
+            interpretation: evidence.interpretation.clone(),
+            limitations: evidence.limitations.clone(),
+        })
+        .collect::<Vec<_>>();
+    let direct_path_count = paths
+        .iter()
+        .filter(|path| !matches!(path, TaskRetrievalPath::IntentFts { .. }))
+        .count();
+    Ok(Some(TaskContextCandidate {
+        association_rank: *rank,
+        direct_path_count,
+        item: TaskContextItem {
+            association_space_id: snapshot.space_id,
+            context: ContextPackItem {
+                space_id: snapshot.space_id,
+                context_id: snapshot.context_id,
+                revision_id: snapshot.revision.revision_id,
+                title: snapshot.space_title.clone(),
+                kind: snapshot.revision.kind,
+                status: graph_context_status(snapshot.status),
+                statement: snapshot.revision.statement.clone(),
+                rationale: Some(snapshot.revision.rationale.clone()),
+                applicability: snapshot.revision.applicability.clone(),
+                evidence,
+                conflicts: Vec::new(),
+                auto_injection_eligible: snapshot.safety.automatic_injection_eligible,
+                safety_source: ContextSafetySource::EngineeringGraphSnapshot {
+                    context_tree_oid: inference.graph_context_tree_oid.clone(),
+                    artifact_generation,
+                    context_id: snapshot.context_id,
+                    revision_id: snapshot.revision.revision_id,
+                    safety: snapshot.safety.clone(),
+                },
+                match_reason: context_match_reason(
+                    Some(&graph.evidence),
+                    i64::from(snapshot.evidence_completeness),
+                ),
+                detail: ContextPackDetail::Full,
+            },
+            retrieval_paths: paths,
+        },
+    }))
+}
+
+const fn graph_context_status(status: GraphContextStatus) -> ContextStatus {
+    match status {
+        GraphContextStatus::Candidate => ContextStatus::Candidate,
+        GraphContextStatus::Accepted => ContextStatus::Accepted,
+        GraphContextStatus::Deprecated => ContextStatus::Deprecated,
+        GraphContextStatus::Superseded => ContextStatus::Superseded,
+        GraphContextStatus::GovernanceConflict => ContextStatus::GovernanceConflict,
+    }
+}
+
+const fn evidence_type_name(kind: EvidenceType) -> &'static str {
+    match kind {
+        EvidenceType::SourceSnapshot => "source_snapshot",
+        EvidenceType::ExperimentRecord => "experiment_record",
+        EvidenceType::ArtifactSnapshot => "artifact_snapshot",
+    }
 }
 
 fn task_context_candidate_from_row(
@@ -2770,6 +3063,7 @@ fn task_context_candidate_from_row(
                 evidence,
                 conflicts,
                 auto_injection_eligible,
+                safety_source: ContextSafetySource::CurrentProjection,
                 match_reason,
                 detail: ContextPackDetail::Full,
             },

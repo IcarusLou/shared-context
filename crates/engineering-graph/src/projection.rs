@@ -9,7 +9,7 @@ use sctx_domain::{Error, ErrorKind, Result};
 
 use crate::EngineeringProjection;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Disposable local projection store for resolved Engineering Graph state.
@@ -20,8 +20,8 @@ pub struct EngineeringProjectionStore {
     database: PathBuf,
 }
 
-/// One atomically-read Engineering projection and the Context Tree from which
-/// its persistent References were projected.
+/// One atomically-read historical Engineering projection and provenance Tree from which its
+/// persistent References, Context revisions, relations, and safety decisions were built.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EngineeringProjectionSnapshot {
     pub context_tree_oid: Option<String>,
@@ -72,11 +72,8 @@ impl EngineeringProjectionStore {
         self.rebuild_for_context_tree(projection, None)
     }
 
-    /// Atomically replaces every derived row and binds it to the exact Context
-    /// Tree used to load its persistent Engineering References.
-    ///
-    /// A missing Tree is retained for compatibility with graph-only callers,
-    /// but Task Retrieval deliberately treats such a projection as unpinned.
+    /// Atomically replaces every derived row and records the Context Tree used by this explicit
+    /// build. The Tree is provenance only and never an eligibility or query-time rebuild trigger.
     ///
     /// # Errors
     ///
@@ -99,6 +96,9 @@ impl EngineeringProjectionStore {
             .execute("DELETE FROM resolved_reference", [])
             .map_err(sql_error("clear Engineering Reference projection"))?;
         transaction
+            .execute("DELETE FROM graph_context_snapshot", [])
+            .map_err(sql_error("clear Graph Context snapshot projection"))?;
+        transaction
             .execute("DELETE FROM projection_meta", [])
             .map_err(sql_error("clear Engineering projection metadata"))?;
         transaction
@@ -113,6 +113,23 @@ impl EngineeringProjectionStore {
                 ],
             )
             .map_err(sql_error("write Engineering projection metadata"))?;
+        for context in &projection.contexts {
+            let payload = serde_json::to_string(context)
+                .map_err(json_error("serialize Graph Context snapshot"))?;
+            transaction
+                .execute(
+                    "INSERT INTO graph_context_snapshot (
+                        context_id, revision_id, artifact_generation, payload_json
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        context.context_id.to_string(),
+                        context.revision.revision_id.to_string(),
+                        projection.artifact_generation,
+                        payload,
+                    ],
+                )
+                .map_err(sql_error("write Graph Context snapshot"))?;
+        }
         for reference in &projection.references {
             let payload = serde_json::to_string(reference)
                 .map_err(json_error("serialize resolved Engineering Reference"))?;
@@ -152,8 +169,8 @@ impl EngineeringProjectionStore {
         Ok(self.read_snapshot()?.map(|snapshot| snapshot.projection))
     }
 
-    /// Reads one generation-consistent projection and its optional Context Tree
-    /// binding from a single `SQLite` transaction.
+    /// Reads one generation-consistent projection and optional build provenance Tree from a
+    /// single `SQLite` transaction.
     ///
     /// # Errors
     ///
@@ -184,6 +201,31 @@ impl EngineeringProjectionStore {
                 .map_err(sql_error("commit empty Engineering projection read"))?;
             return Ok(None);
         };
+        let mut context_statement = transaction
+            .prepare(
+                "SELECT artifact_generation, payload_json
+                 FROM graph_context_snapshot
+                 ORDER BY context_id ASC, revision_id ASC",
+            )
+            .map_err(sql_error("prepare Graph Context snapshot read"))?;
+        let context_rows = context_statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sql_error("query Graph Context snapshots"))?;
+        let mut contexts = Vec::new();
+        for row in context_rows {
+            let (row_generation, payload) =
+                row.map_err(sql_error("read Graph Context snapshot row"))?;
+            if row_generation != artifact_generation {
+                return Err(invariant("Graph Context snapshot leaked an old generation"));
+            }
+            contexts.push(
+                serde_json::from_str(&payload)
+                    .map_err(json_error("parse Graph Context snapshot"))?,
+            );
+        }
+        drop(context_statement);
         let mut statement = transaction
             .prepare(
                 "SELECT artifact_generation, payload_json
@@ -213,6 +255,7 @@ impl EngineeringProjectionStore {
         let projection = EngineeringProjection {
             policy_version,
             artifact_generation,
+            contexts,
             references,
         };
         projection.validate()?;
@@ -278,12 +321,19 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 artifact_generation TEXT NOT NULL,
                 context_tree_oid TEXT
             ) STRICT;
+            CREATE TABLE IF NOT EXISTS graph_context_snapshot (
+                context_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL,
+                artifact_generation TEXT NOT NULL,
+                payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+                PRIMARY KEY(context_id, revision_id)
+            ) STRICT;
             CREATE TABLE IF NOT EXISTS resolved_reference (
                 reference_id TEXT PRIMARY KEY,
                 artifact_generation TEXT NOT NULL,
                 payload_json TEXT NOT NULL CHECK (json_valid(payload_json))
             ) STRICT;
-            PRAGMA user_version = 3;",
+            PRAGMA user_version = 4;",
         )
         .map_err(sql_error("initialize Engineering projection schema"))
 }

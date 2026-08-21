@@ -45,12 +45,20 @@ A derived, explainable relevance between one Task and one ContextSpace. A Task m
 _Avoid_: Active Space, default Space
 
 **TaskContextPack**:
-A budgeted, automatically safe retrieval result for one TaskIntent revision and one exact knowledge-projection snapshot. It contains zero or more TaskSpaceAssociations and links every returned Context to one of those associations through typed RetrievalPaths.
+A budgeted retrieval result for one TaskIntent revision, one current Context projection, and at most one historical EngineeringGraphSnapshot. It keeps their identities distinct and links every returned Context through typed RetrievalPaths and a safety source.
 _Avoid_: Space-scoped search result, manually routed Context Pack
 
 **RetrievalPath**:
-A typed explanation of how TaskIntent or a TaskSignal made one Context relevant. Text and Applicability paths remain distinct from Engineering Graph paths; only a current unique Artifact resolution can claim an engineering edge.
+A typed explanation of how TaskIntent or a TaskSignal made one Context relevant. Text and Applicability paths remain distinct from Engineering Graph paths; only a unique Artifact resolution captured by that Graph Snapshot can claim an engineering edge.
 _Avoid_: opaque relevance score, inferred code relation
+
+**EngineeringGraphSnapshot**:
+An explicitly built, sparse historical knowledge view rooted at EngineeringReferences and their bounded ContextRelation closure. Its Context revisions and safety decisions remain immutable until another explicit Graph build, independently of later Context Store appends.
+_Avoid_: current Context view, automatic index refresh
+
+**GraphContextSnapshot**:
+One immutable Context revision, its fixed relation targets, and its automatic-safety decision as included by an EngineeringGraphSnapshot. Its source Context Tree is provenance, not a current-validity condition.
+_Avoid_: current Context head, live governance lookup
 
 **EvidenceSource**:
 A typed, resolvable provenance target that can ground a TaskIntent or engineering claim, such as an active TaskSignal, immutable Context Evidence, or a current unique Engineering Resolution. An opaque label or unavailable/ambiguous target is not an EvidenceSource.

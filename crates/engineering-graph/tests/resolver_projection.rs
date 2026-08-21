@@ -1,15 +1,17 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
 use sctx_domain::{
-    ArtifactKey, ArtifactKind, ArtifactLocator, ContextId, EngineeringArtifact,
-    EngineeringReference, ReferenceId, ReferenceRelation, RepoRelativePath, RepositoryId,
-    RepositoryIdentity, ResolutionStatus, RevisionId,
+    Applicability, ArtifactKey, ArtifactKind, ArtifactLocator, ContextId, ContextKind,
+    ContextRevision, EngineeringArtifact, EngineeringReference, EvidenceId, EvidenceSnapshot,
+    EvidenceType, ReferenceId, ReferenceRelation, RepoRelativePath, RepositoryId,
+    RepositoryIdentity, ResolutionStatus, RevisionId, SpaceId,
 };
 use sctx_engineering_graph::{
     ArtifactObservation, ArtifactSourceState, EngineeringProjectionStore,
-    EngineeringReferenceResolver, MatchBasis, ProjectedEngineeringReference, RepositoryScanOutcome,
-    RepositorySnapshot, SnapshotArtifact, SnapshotSourcePolicy, SourceLanguage,
+    EngineeringReferenceResolver, GraphContextSafety, GraphContextSnapshot, GraphContextStatus,
+    MatchBasis, ProjectedEngineeringReference, RepositoryScanOutcome, RepositorySnapshot,
+    SnapshotArtifact, SnapshotSourcePolicy, SourceLanguage,
 };
 use tempfile::TempDir;
 
@@ -153,6 +155,44 @@ fn reference(
     }
 }
 
+fn graph_contexts(references: &[ProjectedEngineeringReference]) -> Vec<GraphContextSnapshot> {
+    references
+        .iter()
+        .map(|reference| GraphContextSnapshot {
+            space_id: SpaceId::new(),
+            space_title: "Resolver fixture".to_owned(),
+            context_id: reference.context_id,
+            revision: ContextRevision {
+                revision_id: reference.revision_id,
+                parent_revision_ids: Vec::new(),
+                kind: ContextKind::Decision,
+                topic_key: Some("resolver/fixture".to_owned()),
+                statement: "The exact Artifact locator is authoritative".to_owned(),
+                rationale: "The resolver fixture exercises one immutable Context".to_owned(),
+                applicability: Applicability::default(),
+                assumptions: Vec::new(),
+                recheck_when: vec!["the exact locator changes".to_owned()],
+                relations: Vec::new(),
+                evidence: vec![EvidenceSnapshot {
+                    evidence_id: EvidenceId::new(),
+                    kind: EvidenceType::ExperimentRecord,
+                    supports: "The resolver fixture passed".to_owned(),
+                    content: serde_json::json!({"result": "passed"}),
+                    interpretation: "The Context is complete".to_owned(),
+                    limitations: vec!["synthetic fixture".to_owned()],
+                }],
+            },
+            status: GraphContextStatus::Accepted,
+            evidence_completeness: 1_000,
+            safety: GraphContextSafety {
+                automatic_injection_eligible: true,
+                blockers: BTreeSet::default(),
+            },
+            relations: Vec::new(),
+        })
+        .collect()
+}
+
 #[test]
 fn all_kind_specific_exact_locators_resolve_with_explainable_basis() {
     let repository = repository("exact");
@@ -187,6 +227,7 @@ fn all_kind_specific_exact_locators_resolve_with_explainable_basis() {
         .resolve(
             &references,
             &[snapshot(&repository, "snap-exact", artifacts)],
+            &graph_contexts(&references),
         )
         .unwrap();
     for resolved in &projection.references {
@@ -204,8 +245,9 @@ fn move_or_rename_is_missing_and_never_guessed_from_similar_content() {
     let current = artifact(&repository, file("new/search.ts"), 1);
     let projection = EngineeringReferenceResolver
         .resolve(
-            &[projected],
+            std::slice::from_ref(&projected),
             &[snapshot(&repository, "snap-moved", vec![current])],
+            &graph_contexts(std::slice::from_ref(&projected)),
         )
         .unwrap();
     assert_eq!(
@@ -229,8 +271,9 @@ fn same_display_name_at_different_paths_does_not_affect_exact_selection() {
         .clone_from(&first.artifact.display_name);
     let projection = EngineeringReferenceResolver
         .resolve(
-            &[projected],
+            std::slice::from_ref(&projected),
             &[snapshot(&repository, "snap-same", vec![second, first])],
+            &graph_contexts(std::slice::from_ref(&projected)),
         )
         .unwrap();
     let resolved = &projection.references[0];
@@ -250,14 +293,16 @@ fn same_display_name_at_different_paths_does_not_affect_exact_selection() {
 fn duplicate_qualified_occurrences_are_ambiguous_and_never_form_edge() {
     let repository = repository("ambiguous");
     let locator = symbol("search", "search(query: string)");
+    let projected = reference(&repository, locator.clone());
     let projection = EngineeringReferenceResolver
         .resolve(
-            &[reference(&repository, locator.clone())],
+            std::slice::from_ref(&projected),
             &[snapshot(
                 &repository,
                 "snap-ambiguous",
                 vec![artifact(&repository, locator, 2)],
             )],
+            &graph_contexts(std::slice::from_ref(&projected)),
         )
         .unwrap();
     let ambiguous = &projection.references[0];
@@ -278,6 +323,7 @@ fn unavailable_repository_recovers_only_when_exact_locator_returns() {
                 repository_id: repository.repository_id,
                 reason: "checkout offline".to_owned(),
             }],
+            &graph_contexts(std::slice::from_ref(&projected)),
         )
         .unwrap();
     assert_eq!(
@@ -289,12 +335,13 @@ fn unavailable_repository_recovers_only_when_exact_locator_returns() {
     let recovered = EngineeringReferenceResolver
         .resolve_incremental(
             &unavailable,
-            &[projected],
+            std::slice::from_ref(&projected),
             &[snapshot(
                 &repository,
                 "snap-recovered",
                 vec![artifact(&repository, locator, 1)],
             )],
+            &graph_contexts(std::slice::from_ref(&projected)),
         )
         .unwrap();
     assert_eq!(
@@ -304,7 +351,7 @@ fn unavailable_repository_recovers_only_when_exact_locator_returns() {
 }
 
 #[test]
-fn incremental_resolution_and_tree_pinned_store_equal_scratch() {
+fn incremental_resolution_and_tree_provenance_store_equal_scratch() {
     let temporary = TempDir::new().unwrap();
     let root = temporary.path().join("shared-context");
     let repository = repository("projection");
@@ -316,11 +363,17 @@ fn incremental_resolution_and_tree_pinned_store_equal_scratch() {
         vec![artifact(&repository, locator, 1)],
     )];
     let resolver = EngineeringReferenceResolver;
+    let contexts = graph_contexts(std::slice::from_ref(&projected));
     let scratch = resolver
-        .resolve(std::slice::from_ref(&projected), &snapshots)
+        .resolve(std::slice::from_ref(&projected), &snapshots, &contexts)
         .unwrap();
     let incremental = resolver
-        .resolve_incremental(&scratch, std::slice::from_ref(&projected), &snapshots)
+        .resolve_incremental(
+            &scratch,
+            std::slice::from_ref(&projected),
+            &snapshots,
+            &contexts,
+        )
         .unwrap();
     assert_eq!(incremental, scratch);
 
@@ -345,10 +398,12 @@ fn incremental_resolution_and_tree_pinned_store_equal_scratch() {
 #[test]
 fn empty_snapshot_is_missing_without_diagnostic_edge() {
     let repository = repository("missing");
+    let projected = reference(&repository, file("missing.rs"));
     let projection = EngineeringReferenceResolver
         .resolve(
-            &[reference(&repository, file("missing.rs"))],
+            std::slice::from_ref(&projected),
             &[snapshot(&repository, "snap-empty", Vec::new())],
+            &graph_contexts(std::slice::from_ref(&projected)),
         )
         .unwrap();
     assert_eq!(
