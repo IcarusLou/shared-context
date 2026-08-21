@@ -12,18 +12,20 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 pub use sctx_domain::{
-    Applicability, AutoInjectionBlocker, AutoInjectionEligibility, CandidateId,
+    Applicability, ArtifactKind, AutoInjectionBlocker, AutoInjectionEligibility, CandidateId,
     CandidateProjection, ConflictId, ConflictParticipant, ConflictResolution,
-    ConflictResolutionDraft, ConflictResolutionResult, ContextCandidate, ContextGovernanceStatus,
-    ContextId, ContextKind, ContextProjection, ContextRevision, ContextRevisionDraft,
-    ContextSpaceProjection, DomainProjection, Error, ErrorKind, EventId, EvidenceId,
-    EvidenceSnapshot, EvidenceSnapshotDraft, EvidenceType, IdParseError, IntentProjection,
-    IntentRevision, IntentSnapshot, Publication, PublicationAction, PublicationDraft,
-    PublicationId, ReducerDiagnostic, ReducerDiagnosticCode, ReducerEvent, ReducerPayload,
-    ResolutionId, ResolutionOutcome, Result, Review, ReviewDraft, ReviewId, ReviewSummary,
-    ReviewVerdict, RevisionId, RevisionLifecycle, RevisionProjection, SemanticConflict,
-    SemanticConflictCandidate, SemanticConflictDraft, SemanticConflictOpenReason,
-    SemanticConflictProjection, SemanticConflictStatus, SpaceId, WorkEpisodeId, reduce,
+    ConflictResolutionDraft, ConflictResolutionResult, ContentFingerprint, ContextCandidate,
+    ContextGovernanceStatus, ContextId, ContextKind, ContextProjection, ContextRevision,
+    ContextRevisionDraft, ContextSpaceProjection, DomainProjection, EngineeringReference,
+    EngineeringReferenceDraft, Error, ErrorKind, EventId, EvidenceId, EvidenceSnapshot,
+    EvidenceSnapshotDraft, EvidenceType, IdParseError, IntentProjection, IntentRevision,
+    IntentSnapshot, LocatorHints, Publication, PublicationAction, PublicationDraft, PublicationId,
+    ReducerDiagnostic, ReducerDiagnosticCode, ReducerEvent, ReducerPayload, ReferenceId,
+    ReferenceRelation, RepositoryId, ResolutionId, ResolutionOutcome, Result, Review, ReviewDraft,
+    ReviewId, ReviewSummary, ReviewVerdict, RevisionId, RevisionLifecycle, RevisionProjection,
+    SemanticConflict, SemanticConflictCandidate, SemanticConflictDraft, SemanticConflictOpenReason,
+    SemanticConflictProjection, SemanticConflictStatus, SemanticFingerprint, SpaceId,
+    WorkEpisodeId, reduce,
 };
 
 /// Immutable identifier for the bundled V1 JSON Schema.
@@ -68,6 +70,8 @@ pub enum EventType {
     SemanticConflictOpened,
     #[serde(rename = "semantic_conflict.resolution_added")]
     SemanticConflictResolutionAdded,
+    #[serde(rename = "engineering_reference.recorded")]
+    EngineeringReferenceRecorded,
 }
 
 impl EventType {
@@ -83,6 +87,7 @@ impl EventType {
             Self::ContextPublicationChanged => "context.publication_changed",
             Self::SemanticConflictOpened => "semantic_conflict.opened",
             Self::SemanticConflictResolutionAdded => "semantic_conflict.resolution_added",
+            Self::EngineeringReferenceRecorded => "engineering_reference.recorded",
         }
     }
 }
@@ -152,6 +157,12 @@ pub enum EventPayload {
         conflict_id: ConflictId,
         resolution: ConflictResolution,
     },
+    #[serde(rename = "engineering_reference.recorded")]
+    EngineeringReferenceRecorded {
+        context_id: ContextId,
+        revision_id: RevisionId,
+        reference: EngineeringReference,
+    },
 }
 
 impl EventPayload {
@@ -169,6 +180,7 @@ impl EventPayload {
             Self::SemanticConflictResolutionAdded { .. } => {
                 EventType::SemanticConflictResolutionAdded
             }
+            Self::EngineeringReferenceRecorded { .. } => EventType::EngineeringReferenceRecorded,
         }
     }
 
@@ -200,6 +212,7 @@ impl EventPayload {
             Self::ContextPublicationChanged { publication, .. } => publication.validate(),
             Self::SemanticConflictOpened { conflict, .. } => conflict.validate(),
             Self::SemanticConflictResolutionAdded { resolution, .. } => resolution.validate(),
+            Self::EngineeringReferenceRecorded { reference, .. } => reference.validate(),
         }
     }
 }
@@ -275,6 +288,31 @@ impl Event {
                     source_episode_id,
                     content,
                 },
+            },
+            annotations,
+        )
+    }
+
+    /// Records one persistent, non-authoritative engineering observation for a Context revision.
+    ///
+    /// Reference and Event identities are generated internally. Target ownership is deliberately
+    /// validated by the reducer against the complete Event set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] for invalid locator, fingerprint, relation, support, or
+    /// limitation content.
+    pub fn engineering_reference_recorded(
+        context_id: ContextId,
+        revision_id: RevisionId,
+        draft: EngineeringReferenceDraft,
+        annotations: Option<Annotations>,
+    ) -> Result<Self> {
+        Self::generated(
+            EventPayload::EngineeringReferenceRecorded {
+                context_id,
+                revision_id,
+                reference: EngineeringReference::from_draft(draft)?,
             },
             annotations,
         )
@@ -550,6 +588,15 @@ impl Event {
                 conflict_id: *conflict_id,
                 resolution: resolution.clone(),
             },
+            EventPayload::EngineeringReferenceRecorded {
+                context_id,
+                revision_id,
+                reference,
+            } => ReducerPayload::EngineeringReferenceRecorded {
+                context_id: *context_id,
+                revision_id: *revision_id,
+                reference: reference.clone(),
+            },
         };
         Some(ReducerEvent {
             event_id: self.event_id,
@@ -658,6 +705,11 @@ fn remove_defined_identity_fields(event_type: EventType, object: &mut Map<String
         EventType::SemanticConflictResolutionAdded => {
             if let Some(resolution) = object.get_mut("resolution").and_then(Value::as_object_mut) {
                 resolution.remove("resolution_id");
+            }
+        }
+        EventType::EngineeringReferenceRecorded => {
+            if let Some(reference) = object.get_mut("reference").and_then(Value::as_object_mut) {
+                reference.remove("reference_id");
             }
         }
     }

@@ -12,7 +12,7 @@ use crate::{
 
 pub(crate) const NEXT_PREFIX: &str = "_next_";
 
-const TABLES: [&str; 19] = [
+const TABLES: [&str; 20] = [
     "meta",
     "source_file",
     "context_candidate",
@@ -21,6 +21,7 @@ const TABLES: [&str; 19] = [
     "intent_head",
     "context_item",
     "context_revision",
+    "engineering_reference",
     "review",
     "publication",
     "publication_head",
@@ -173,6 +174,22 @@ CREATE TABLE {prefix}context_revision (
     evidence_completeness INTEGER NOT NULL CHECK (evidence_completeness BETWEEN 0 AND 1000),
     is_head INTEGER NOT NULL CHECK (is_head IN (0, 1))
 ) WITHOUT ROWID;
+CREATE TABLE {prefix}engineering_reference (
+    reference_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL UNIQUE,
+    space_id TEXT NOT NULL REFERENCES {prefix}space_projection(space_id),
+    context_id TEXT NOT NULL REFERENCES {prefix}context_item(context_id),
+    revision_id TEXT NOT NULL REFERENCES {prefix}context_revision(revision_id),
+    repository_id TEXT NOT NULL,
+    artifact_kind TEXT NOT NULL,
+    relation TEXT NOT NULL,
+    locator_hints_json TEXT,
+    content_fingerprint TEXT,
+    semantic_fingerprint TEXT,
+    supports TEXT NOT NULL,
+    limitations_json TEXT NOT NULL,
+    projection_json TEXT NOT NULL
+) WITHOUT ROWID;
 CREATE TABLE {prefix}review (
     event_id TEXT PRIMARY KEY,
     review_id TEXT NOT NULL UNIQUE,
@@ -307,7 +324,11 @@ fn create_indexes(transaction: &Transaction<'_>) -> crate::Result<()> {
              CREATE INDEX publication_head_context_idx
                  ON publication_head(context_id, publication_id);
              CREATE INDEX context_candidate_source_idx
-                 ON context_candidate(source_episode_id, candidate_id);",
+                 ON context_candidate(source_episode_id, candidate_id);
+             CREATE INDEX engineering_reference_context_idx
+                 ON engineering_reference(context_id, revision_id, reference_id);
+             CREATE INDEX engineering_reference_repository_idx
+                 ON engineering_reference(repository_id, artifact_kind, reference_id);",
         )
         .map_err(sql_error("create projection query indexes"))
 }
@@ -645,6 +666,43 @@ fn populate(
         }
     }
 
+    for (reference_id, projection) in &input.projection.engineering_references {
+        let reference = &projection.reference;
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO {prefix}engineering_reference(reference_id, event_id, space_id, context_id, revision_id, repository_id, artifact_kind, relation, locator_hints_json, content_fingerprint, semantic_fingerprint, supports, limitations_json, projection_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+                ),
+                params![
+                    reference_id.to_string(),
+                    projection.event_id.to_string(),
+                    projection.space_id.to_string(),
+                    projection.context_id.to_string(),
+                    projection.revision_id.to_string(),
+                    reference.repository_id.to_string(),
+                    enum_text(reference.artifact_kind),
+                    enum_text(reference.relation),
+                    reference
+                        .locator_hints
+                        .as_ref()
+                        .map(json)
+                        .transpose()?,
+                    reference
+                        .content_fingerprint
+                        .as_ref()
+                        .map(sctx_domain::ContentFingerprint::as_str),
+                    reference
+                        .semantic_fingerprint
+                        .as_ref()
+                        .map(sctx_domain::SemanticFingerprint::as_str),
+                    reference.supports,
+                    json(&reference.limitations)?,
+                    json(projection)?
+                ],
+            )
+            .map_err(sql_error("write Engineering Reference projection"))?;
+    }
+
     for candidate in &input.projection.semantic_conflict_candidates {
         let participants = json(&candidate.participants)?;
         let key = format!(
@@ -778,6 +836,8 @@ pub(crate) fn replace_projection_incremental(
                  WHERE space_id IN (SELECT space_id FROM _affected_space)
              );
              DELETE FROM conflict WHERE space_id IN (SELECT space_id FROM _affected_space);
+             DELETE FROM engineering_reference
+                 WHERE space_id IN (SELECT space_id FROM _affected_space);
              DELETE FROM conflict_resolution WHERE conflict_id IN (
                  SELECT conflict_id FROM semantic_conflict
                  WHERE space_id IN (SELECT space_id FROM _affected_space)
@@ -811,6 +871,8 @@ pub(crate) fn replace_projection_incremental(
              INSERT INTO context_item SELECT * FROM _next_context_item
                  WHERE space_id IN (SELECT space_id FROM _affected_space);
              INSERT INTO context_revision SELECT * FROM _next_context_revision
+                 WHERE space_id IN (SELECT space_id FROM _affected_space);
+             INSERT INTO engineering_reference SELECT * FROM _next_engineering_reference
                  WHERE space_id IN (SELECT space_id FROM _affected_space);
              INSERT INTO review SELECT * FROM _next_review
                  WHERE space_id IN (SELECT space_id FROM _affected_space);

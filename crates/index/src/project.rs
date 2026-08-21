@@ -250,8 +250,15 @@ fn projection_slice(input: &BuildInput, space_id: &str) -> serde_json::Value {
         .values()
         .filter(|conflict| conflict.space_id.to_string() == space_id)
         .collect();
+    let engineering_references: Vec<_> = input
+        .projection
+        .engineering_references
+        .values()
+        .filter(|reference| reference.space_id.to_string() == space_id)
+        .collect();
     serde_json::json!({
         "space": space,
+        "engineering_references": engineering_references,
         "semantic_conflict_candidates": candidates,
         "semantic_conflicts": conflicts,
     })
@@ -368,6 +375,17 @@ fn event_impact(path: &str, event: &Event) -> EventImpact {
                 references.insert(identity("revision", &result.revision_id));
             }
             Some(*space_id)
+        }
+        EventPayload::EngineeringReferenceRecorded {
+            context_id,
+            revision_id,
+            reference,
+        } => {
+            definitions.insert(identity("reference", &reference.reference_id));
+            references.insert(identity("context", context_id));
+            references.insert(identity("revision", revision_id));
+            references.insert(identity("repository", &reference.repository_id));
+            None
         }
     };
     EventImpact {

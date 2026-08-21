@@ -16,6 +16,7 @@
         "context.revision_added",
         "context.reviewed",
         "context.publication_changed",
+        "engineering_reference.recorded",
         "semantic_conflict.opened",
         "semantic_conflict.resolution_added"
       ]
@@ -23,6 +24,15 @@
     "annotations": { "$ref": "#/$defs/annotations" }
   },
   "oneOf": [
+    {
+      "properties": {
+        "event_type": { "const": "engineering_reference.recorded" },
+        "context_id": { "$ref": "#/$defs/context_id" },
+        "revision_id": { "$ref": "#/$defs/revision_id" },
+        "reference": { "$ref": "#/$defs/engineering_reference" }
+      },
+      "required": ["context_id", "revision_id", "reference"]
+    },
     {
       "properties": {
         "event_type": { "const": "context_candidate.created" },
@@ -117,6 +127,14 @@
       "type": "string",
       "pattern": "^ctx_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
     },
+    "repository_id": {
+      "type": "string",
+      "pattern": "^rpo_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "reference_id": {
+      "type": "string",
+      "pattern": "^ref_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{12}$"
+    },
     "revision_id": {
       "type": "string",
       "pattern": "^rev_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
@@ -159,6 +177,76 @@
         "origin_hint": { "$ref": "#/$defs/origin_hint" }
       },
       "additionalProperties": true
+    },
+    "locator_hints": {
+      "type": "object",
+      "properties": {
+        "module": { "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }] },
+        "path": { "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }] },
+        "symbol": { "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }] },
+        "language": { "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }] },
+        "api_or_schema": { "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }] },
+        "line": { "anyOf": [{ "type": "integer", "minimum": 0, "maximum": 4294967295 }, { "type": "null" }] },
+        "commit": { "anyOf": [{ "$ref": "#/$defs/non_empty_string" }, { "type": "null" }] }
+      },
+      "anyOf": [
+        { "required": ["module"], "properties": { "module": { "$ref": "#/$defs/non_empty_string" } } },
+        { "required": ["path"], "properties": { "path": { "$ref": "#/$defs/non_empty_string" } } },
+        { "required": ["symbol"], "properties": { "symbol": { "$ref": "#/$defs/non_empty_string" } } },
+        { "required": ["api_or_schema"], "properties": { "api_or_schema": { "$ref": "#/$defs/non_empty_string" } } }
+      ],
+      "dependentRequired": { "line": ["path"] },
+      "additionalProperties": false
+    },
+    "engineering_reference": {
+      "type": "object",
+      "required": [
+        "reference_id",
+        "repository_id",
+        "artifact_kind",
+        "relation",
+        "locator_hints",
+        "content_fingerprint",
+        "semantic_fingerprint",
+        "supports",
+        "limitations"
+      ],
+      "properties": {
+        "reference_id": { "$ref": "#/$defs/reference_id" },
+        "repository_id": { "$ref": "#/$defs/repository_id" },
+        "artifact_kind": {
+          "enum": ["repository", "module", "file", "symbol", "api", "schema", "test"]
+        },
+        "relation": {
+          "enum": ["implements", "defines", "consumes", "validates", "constrains", "depends_on"]
+        },
+        "locator_hints": {
+          "anyOf": [
+            { "$ref": "#/$defs/locator_hints" },
+            { "type": "null" }
+          ]
+        },
+        "content_fingerprint": {
+          "anyOf": [
+            { "$ref": "#/$defs/non_empty_string" },
+            { "type": "null" }
+          ]
+        },
+        "semantic_fingerprint": {
+          "anyOf": [
+            { "$ref": "#/$defs/non_empty_string" },
+            { "type": "null" }
+          ]
+        },
+        "supports": { "$ref": "#/$defs/non_empty_string" },
+        "limitations": { "$ref": "#/$defs/string_list" }
+      },
+      "anyOf": [
+        { "properties": { "locator_hints": { "$ref": "#/$defs/locator_hints" } } },
+        { "properties": { "content_fingerprint": { "$ref": "#/$defs/non_empty_string" } } },
+        { "properties": { "semantic_fingerprint": { "$ref": "#/$defs/non_empty_string" } } }
+      ],
+      "additionalProperties": false
     },
     "intent": {
       "type": "object",

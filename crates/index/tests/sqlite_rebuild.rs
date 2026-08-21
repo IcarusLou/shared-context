@@ -9,9 +9,10 @@ use std::{
 
 use rusqlite::{Connection, types::ValueRef};
 use sctx_event_schema::{
-    Applicability, ConflictParticipant, ContextId, ContextKind, ContextRevisionDraft, Event,
-    EventPayload, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, PublicationAction,
-    PublicationDraft, PublicationId, ReviewDraft, ReviewVerdict, RevisionId, SemanticConflictDraft,
+    Applicability, ArtifactKind, ConflictParticipant, ContextId, ContextKind, ContextRevisionDraft,
+    EngineeringReferenceDraft, Event, EventPayload, EvidenceSnapshotDraft, EvidenceType,
+    IntentSnapshot, LocatorHints, PublicationAction, PublicationDraft, PublicationId,
+    ReferenceRelation, RepositoryId, ReviewDraft, ReviewVerdict, RevisionId, SemanticConflictDraft,
     SpaceId, WorkEpisodeId,
 };
 use sctx_git_store::{AppendRequest, GitStore};
@@ -69,6 +70,28 @@ fn context(statement: &str) -> ContextRevisionDraft {
 fn candidate(statement: &str) -> Event {
     Event::context_candidate_created(WorkEpisodeId::new(), context(statement), None)
         .expect("valid Candidate event")
+}
+
+fn engineering_reference(context_id: ContextId, revision_id: RevisionId, path: &str) -> Event {
+    Event::engineering_reference_recorded(
+        context_id,
+        revision_id,
+        EngineeringReferenceDraft {
+            repository_id: RepositoryId::new(),
+            artifact_kind: ArtifactKind::File,
+            relation: ReferenceRelation::Implements,
+            locator_hints: Some(LocatorHints {
+                path: Some(path.to_owned()),
+                ..LocatorHints::default()
+            }),
+            content_fingerprint: None,
+            semantic_fingerprint: None,
+            supports: "The file implements the indexed Context revision".to_owned(),
+            limitations: vec!["The locator may become stale".to_owned()],
+        },
+        None,
+    )
+    .unwrap()
 }
 
 fn space_ids(event: &Event) -> (SpaceId, RevisionId) {
@@ -357,6 +380,134 @@ fn deletion_rebuilds_complete_projection_and_dirty_tree_is_never_read() {
     assert_eq!(pragmas.synchronous, 1);
     assert!(pragmas.foreign_keys);
     assert_eq!(pragmas.busy_timeout_ms, 3_000);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn engineering_reference_incremental_projection_matches_scratch_and_isolates_bad_targets() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::initialize(temporary.path().join("reference-installation")).unwrap();
+    let space_event = Event::space_created(intent("Reference projection"), None).unwrap();
+    let (space_id, _) = space_ids(&space_event);
+    append(&store, space_event);
+    let first_context =
+        Event::context_revision_added(space_id, context("Reference target"), None).unwrap();
+    let (first_context_id, first_revision_id) = context_ids(&first_context);
+    append(&store, first_context);
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    let before = index.domain_snapshot().unwrap();
+
+    let reference = engineering_reference(
+        first_context_id,
+        first_revision_id,
+        "src/removed-after-observation.ts",
+    );
+    let reference_id = match reference.payload() {
+        EventPayload::EngineeringReferenceRecorded { reference, .. } => reference.reference_id,
+        _ => unreachable!(),
+    };
+    append(&store, reference);
+    let incremental = index.synchronize().unwrap();
+    assert_eq!(incremental.update_kind, IndexUpdateKind::Incremental);
+    let connection = Connection::open(index.database_path()).unwrap();
+    assert_eq!(count(&connection, "engineering_reference"), 1);
+    let projected: (String, String, String, String, String) = connection
+        .query_row(
+            "SELECT context_id, revision_id, artifact_kind, relation, locator_hints_json
+             FROM engineering_reference WHERE reference_id = ?1",
+            [reference_id.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(projected.0, first_context_id.to_string());
+    assert_eq!(projected.1, first_revision_id.to_string());
+    assert_eq!(projected.2, "file");
+    assert_eq!(projected.3, "implements");
+    assert!(projected.4.contains("src/removed-after-observation.ts"));
+    drop(connection);
+    let after = index.domain_snapshot().unwrap();
+    assert_eq!(after.projection.spaces, before.projection.spaces);
+    assert_eq!(after.projection.engineering_references.len(), 1);
+
+    let second_context =
+        Event::context_revision_added(space_id, context("Cross target"), None).unwrap();
+    let (_, second_revision_id) = context_ids(&second_context);
+    append(&store, second_context);
+    append(
+        &store,
+        engineering_reference(first_context_id, second_revision_id, "src/cross-context.ts"),
+    );
+    index.synchronize().unwrap();
+    let connection = Connection::open(index.database_path()).unwrap();
+    assert_eq!(count(&connection, "engineering_reference"), 1);
+    assert_eq!(
+        count_where(
+            &connection,
+            "diagnostic",
+            "code = 'invalid_engineering_reference_target'"
+        ),
+        1
+    );
+    assert_eq!(count(&connection, "context_item"), 2);
+    drop(connection);
+
+    for (relative, bytes) in [
+        (
+            "events/fa/invalid-reference-locator.json",
+            include_bytes!(
+                "../../../fixtures/events/v1/invalid/engineering-reference-invalid-locator.json"
+            )
+            .as_slice(),
+        ),
+        (
+            "events/fb/invalid-reference-relation.json",
+            include_bytes!(
+                "../../../fixtures/events/v1/invalid/engineering-reference-invalid-relation.json"
+            )
+            .as_slice(),
+        ),
+    ] {
+        let path = store.repository().join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+        git(store.repository(), ["add", "--", relative]);
+    }
+    git(
+        store.repository(),
+        ["commit", "-m", "Add invalid Reference diagnostics"],
+    );
+    index.synchronize().unwrap();
+    let connection = Connection::open(index.database_path()).unwrap();
+    assert_eq!(count(&connection, "engineering_reference"), 1);
+    assert_eq!(
+        count_where(
+            &connection,
+            "diagnostic",
+            "code = 'EVENT_PARSE_ERROR' AND message LIKE '%engineering_reference%'"
+        ),
+        2
+    );
+    assert_eq!(count(&connection, "context_item"), 2);
+    drop(connection);
+
+    let scratch = ProjectionIndex::new(
+        store.repository(),
+        temporary.path().join("reference-scratch"),
+    );
+    scratch.rebuild().unwrap();
+    assert_eq!(
+        projection_dump(index.database_path()),
+        projection_dump(scratch.database_path())
+    );
 }
 
 #[test]
@@ -971,6 +1122,7 @@ fn assert_core_tables(connection: &Connection) {
         "intent_head",
         "context_item",
         "context_revision",
+        "engineering_reference",
         "review",
         "publication",
         "publication_head",
@@ -1034,6 +1186,7 @@ fn projection_dump(database: &Path) -> Vec<String> {
         "SELECT * FROM intent_head ORDER BY space_id, revision_id",
         "SELECT * FROM context_item ORDER BY context_id",
         "SELECT * FROM context_revision ORDER BY revision_id",
+        "SELECT * FROM engineering_reference ORDER BY reference_id",
         "SELECT * FROM review ORDER BY event_id",
         "SELECT * FROM publication ORDER BY publication_id",
         "SELECT * FROM publication_head ORDER BY context_id, publication_id",

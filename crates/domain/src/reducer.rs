@@ -4,9 +4,9 @@ use serde::Serialize;
 
 use crate::{
     Applicability, CandidateId, ConflictId, ConflictParticipant, ConflictResolution,
-    ContextCandidate, ContextId, ContextKind, ContextRevision, EventId, EvidenceId, IntentRevision,
-    Publication, PublicationAction, PublicationId, ResolutionId, Review, ReviewId, ReviewVerdict,
-    RevisionId, SemanticConflict, SpaceId,
+    ContextCandidate, ContextId, ContextKind, ContextRevision, EngineeringReference, EventId,
+    EvidenceId, IntentRevision, Publication, PublicationAction, PublicationId, ReferenceId,
+    ResolutionId, Review, ReviewId, ReviewVerdict, RevisionId, SemanticConflict, SpaceId,
 };
 
 /// Authoritative event input understood by the V1 domain reducer.
@@ -16,7 +16,7 @@ pub struct ReducerEvent {
     pub payload: ReducerPayload,
 }
 
-/// The eight V1 payloads in the pure domain projection boundary.
+/// The V1 payloads in the pure domain projection boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReducerPayload {
     ContextCandidateCreated {
@@ -54,6 +54,11 @@ pub enum ReducerPayload {
         conflict_id: ConflictId,
         resolution: ConflictResolution,
     },
+    EngineeringReferenceRecorded {
+        context_id: ContextId,
+        revision_id: RevisionId,
+        reference: EngineeringReference,
+    },
 }
 
 /// Stable reducer diagnostic classifications.
@@ -68,6 +73,7 @@ pub enum ReducerDiagnosticCode {
     DuplicateEvidenceId,
     DuplicateConflictId,
     DuplicateResolutionId,
+    DuplicateReferenceId,
     DuplicateSpaceCreation,
     AmbiguousContextOwner,
     MissingSpace,
@@ -79,6 +85,8 @@ pub enum ReducerDiagnosticCode {
     InvalidSemanticConflictReference,
     InvalidResolutionReference,
     ResolutionCycle,
+    InvalidEngineeringReference,
+    InvalidEngineeringReferenceTarget,
 }
 
 /// A deterministic explanation for quarantined input.
@@ -232,11 +240,22 @@ pub struct CandidateProjection {
     pub candidate: ContextCandidate,
 }
 
+/// One valid persistent engineering observation and its resolved Context owner.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EngineeringReferenceProjection {
+    pub event_id: EventId,
+    pub space_id: SpaceId,
+    pub context_id: ContextId,
+    pub revision_id: RevisionId,
+    pub reference: EngineeringReference,
+}
+
 /// Complete deterministic result of reducing one event multiset.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct DomainProjection {
     pub candidates: BTreeMap<CandidateId, CandidateProjection>,
     pub spaces: BTreeMap<SpaceId, ContextSpaceProjection>,
+    pub engineering_references: BTreeMap<ReferenceId, EngineeringReferenceProjection>,
     pub semantic_conflict_candidates: Vec<SemanticConflictCandidate>,
     pub semantic_conflicts: BTreeMap<ConflictId, SemanticConflictProjection>,
     pub quarantined_event_ids: BTreeSet<EventId>,
@@ -293,6 +312,14 @@ struct ResolutionNode {
     space_id: SpaceId,
     conflict_id: ConflictId,
     resolution: ConflictResolution,
+}
+
+#[derive(Clone)]
+struct EngineeringReferenceNode {
+    event_id: EventId,
+    context_id: ContextId,
+    revision_id: RevisionId,
+    reference: EngineeringReference,
 }
 
 struct DagNode<K> {
@@ -499,6 +526,8 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
         BTreeMap::new();
     let mut conflict_definitions: BTreeMap<ConflictId, Vec<ConflictNode>> = BTreeMap::new();
     let mut resolution_definitions: BTreeMap<ResolutionId, Vec<ResolutionNode>> = BTreeMap::new();
+    let mut reference_definitions: BTreeMap<ReferenceId, Vec<EngineeringReferenceNode>> =
+        BTreeMap::new();
     let mut evidence_definitions: BTreeMap<EvidenceId, Vec<EventId>> = BTreeMap::new();
     let mut context_owners: BTreeMap<ContextId, BTreeSet<SpaceId>> = BTreeMap::new();
 
@@ -646,6 +675,21 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
                         resolution: resolution.clone(),
                     });
             }
+            ReducerPayload::EngineeringReferenceRecorded {
+                context_id,
+                revision_id,
+                reference,
+            } => {
+                reference_definitions
+                    .entry(reference.reference_id)
+                    .or_default()
+                    .push(EngineeringReferenceNode {
+                        event_id: event.event_id,
+                        context_id: *context_id,
+                        revision_id: *revision_id,
+                        reference: reference.clone(),
+                    });
+            }
         }
     }
 
@@ -773,6 +817,17 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
             );
         }
     }
+    for (id, definitions) in &reference_definitions {
+        if definitions.len() > 1 {
+            push_diagnostic(
+                &mut diagnostics,
+                ReducerDiagnosticCode::DuplicateReferenceId,
+                id.to_string(),
+                event_ids(definitions, |node| node.event_id),
+                format!("engineering reference ID {id} has multiple definitions"),
+            );
+        }
+    }
 
     let mut invalid_spaces = BTreeSet::new();
     for (space_id, definitions) in &space_creations {
@@ -848,7 +903,8 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
 
     for event in events {
         let space_id = match &event.payload {
-            ReducerPayload::ContextCandidateCreated { .. } => continue,
+            ReducerPayload::ContextCandidateCreated { .. }
+            | ReducerPayload::EngineeringReferenceRecorded { .. } => continue,
             ReducerPayload::SpaceCreated { space_id, .. }
             | ReducerPayload::SpaceIntentRevisionAdded { space_id, .. }
             | ReducerPayload::ContextRevisionAdded { space_id, .. }
@@ -1235,6 +1291,69 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
         );
     }
 
+    let mut engineering_references = BTreeMap::new();
+    for (reference_id, definitions) in &reference_definitions {
+        if definitions.len() != 1 {
+            continue;
+        }
+        let node = &definitions[0];
+        if invalid_event_ids.contains(&node.event_id) {
+            continue;
+        }
+        if let Err(error) = node.reference.validate() {
+            push_diagnostic(
+                &mut diagnostics,
+                ReducerDiagnosticCode::InvalidEngineeringReference,
+                reference_id.to_string(),
+                BTreeSet::from([node.event_id]),
+                format!("engineering reference {reference_id} is invalid: {error}"),
+            );
+            continue;
+        }
+        let owner = spaces.iter().find_map(|(space_id, space)| {
+            space
+                .contexts
+                .get(&node.context_id)
+                .map(|context| (*space_id, context))
+        });
+        let Some((space_id, context)) = owner else {
+            push_diagnostic(
+                &mut diagnostics,
+                ReducerDiagnosticCode::InvalidEngineeringReferenceTarget,
+                reference_id.to_string(),
+                BTreeSet::from([node.event_id]),
+                format!(
+                    "engineering reference {reference_id} targets missing or quarantined context {}",
+                    node.context_id
+                ),
+            );
+            continue;
+        };
+        if !context.revisions.contains_key(&node.revision_id) {
+            push_diagnostic(
+                &mut diagnostics,
+                ReducerDiagnosticCode::InvalidEngineeringReferenceTarget,
+                reference_id.to_string(),
+                BTreeSet::from([node.event_id]),
+                format!(
+                    "engineering reference {reference_id} revision {} does not belong to context {}",
+                    node.revision_id, node.context_id
+                ),
+            );
+            continue;
+        }
+        engineering_references.insert(
+            *reference_id,
+            EngineeringReferenceProjection {
+                event_id: node.event_id,
+                space_id,
+                context_id: node.context_id,
+                revision_id: node.revision_id,
+                reference: node.reference.clone(),
+            },
+        );
+    }
+
     let semantic_conflict_candidates = conflict_candidates(&spaces);
     let mut valid_conflicts = BTreeMap::new();
     for (conflict_id, definitions) in &conflict_definitions {
@@ -1512,6 +1631,7 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
     DomainProjection {
         candidates,
         spaces,
+        engineering_references,
         semantic_conflict_candidates,
         semantic_conflicts,
         quarantined_event_ids,

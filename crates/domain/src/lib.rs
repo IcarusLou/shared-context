@@ -15,7 +15,8 @@ pub use engineering::{
     ArtifactAssociationKind, ArtifactKey, ArtifactKeyBasis, ArtifactKind, ArtifactRelationKind,
     ArtifactResolution, ContentFingerprint, ContextArtifactAssociation, ContextRelation,
     ContextRelationKind, EngineeringArtifact, EngineeringGraphEdge, EngineeringReference,
-    LocatorHints, ReferenceRelation, RepositoryIdentity, ResolutionStatus, SemanticFingerprint,
+    EngineeringReferenceDraft, LocatorHints, ReferenceRelation, RepositoryIdentity,
+    ResolutionStatus, SemanticFingerprint,
 };
 pub use episode::{
     ArtifactAction, ContextCandidate, ContextUseDisposition, WorkEpisode, WorkObservation,
@@ -34,10 +35,10 @@ pub use model::{
 };
 pub use reducer::{
     AutoInjectionBlocker, AutoInjectionEligibility, CandidateProjection, ContextGovernanceStatus,
-    ContextProjection, ContextSpaceProjection, DomainProjection, IntentProjection,
-    ReducerDiagnostic, ReducerDiagnosticCode, ReducerEvent, ReducerPayload, ReviewSummary,
-    RevisionLifecycle, RevisionProjection, SemanticConflictCandidate, SemanticConflictOpenReason,
-    SemanticConflictProjection, SemanticConflictStatus, reduce,
+    ContextProjection, ContextSpaceProjection, DomainProjection, EngineeringReferenceProjection,
+    IntentProjection, ReducerDiagnostic, ReducerDiagnosticCode, ReducerEvent, ReducerPayload,
+    ReviewSummary, RevisionLifecycle, RevisionProjection, SemanticConflictCandidate,
+    SemanticConflictOpenReason, SemanticConflictProjection, SemanticConflictStatus, reduce,
 };
 pub use task::{
     ExternalSessionLocator, ExternalSessionSnapshot, TaskIntent, TaskIntentDraft,

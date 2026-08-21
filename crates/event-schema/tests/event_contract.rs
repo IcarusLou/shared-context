@@ -5,12 +5,12 @@ use std::{
 };
 
 use sctx_event_schema::{
-    Annotations, Applicability, ConflictParticipant, ConflictResolutionDraft,
-    ConflictResolutionResult, ContextId, ContextKind, ContextRevisionDraft, DiagnosticCode, Event,
-    EventPayload, EventType, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, OriginHint,
-    ParsedEvent, PublicationAction, PublicationDraft, PublicationId, ResolutionOutcome,
-    ReviewDraft, ReviewVerdict, SemanticConflictDraft, V1_JSON_SCHEMA, V1_SCHEMA_ID, WorkEpisodeId,
-    parse_event,
+    Annotations, Applicability, ArtifactKind, ConflictParticipant, ConflictResolutionDraft,
+    ConflictResolutionResult, ContextId, ContextKind, ContextRevisionDraft, DiagnosticCode,
+    EngineeringReferenceDraft, Event, EventPayload, EventType, EvidenceSnapshotDraft, EvidenceType,
+    IntentSnapshot, LocatorHints, OriginHint, ParsedEvent, PublicationAction, PublicationDraft,
+    PublicationId, ReferenceRelation, RepositoryId, ResolutionOutcome, ReviewDraft, ReviewVerdict,
+    SemanticConflictDraft, V1_JSON_SCHEMA, V1_SCHEMA_ID, WorkEpisodeId, parse_event,
 };
 use serde_json::{Value, json};
 
@@ -74,9 +74,9 @@ fn context_draft() -> ContextRevisionDraft {
 }
 
 #[test]
-fn all_eight_v1_fixtures_round_trip_without_semantic_loss() {
+fn all_nine_v1_fixtures_round_trip_without_semantic_loss() {
     let paths = json_files(&fixture_root().join("events/v1/valid"));
-    assert_eq!(paths.len(), 8);
+    assert_eq!(paths.len(), 9);
 
     let mut event_types = Vec::new();
     for path in paths {
@@ -102,6 +102,7 @@ fn all_eight_v1_fixtures_round_trip_without_semantic_loss() {
             "context.reviewed",
             "context.revision_added",
             "context_candidate.created",
+            "engineering_reference.recorded",
             "semantic_conflict.opened",
             "semantic_conflict.resolution_added",
             "space.created",
@@ -209,6 +210,26 @@ fn generation_api_assigns_new_ids_and_all_generated_events_parse() {
         } => (*context_id, revision.revision_id),
         _ => panic!("wrong payload"),
     };
+    let engineering_reference = Event::engineering_reference_recorded(
+        context_id,
+        revision_id,
+        EngineeringReferenceDraft {
+            repository_id: RepositoryId::new(),
+            artifact_kind: ArtifactKind::File,
+            relation: ReferenceRelation::Implements,
+            locator_hints: Some(LocatorHints {
+                path: Some("src/search.ts".to_owned()),
+                symbol: Some("SearchResults".to_owned()),
+                ..LocatorHints::default()
+            }),
+            content_fingerprint: None,
+            semantic_fingerprint: None,
+            supports: "The file implements this Context revision".to_owned(),
+            limitations: vec!["The path may move".to_owned()],
+        },
+        None,
+    )
+    .unwrap();
     let reviewed = Event::context_reviewed(
         space_id,
         context_id,
@@ -293,6 +314,7 @@ fn generation_api_assigns_new_ids_and_all_generated_events_parse() {
         created,
         intent_added,
         revision_added,
+        engineering_reference,
         reviewed,
         publication,
         conflict,
@@ -375,6 +397,28 @@ fn semantic_hash_excludes_annotations_origin_hints_and_production_envelope() {
     changed_metadata["revision"]["statement"] = json!("A different authoritative statement");
     let semantic_variant = parse_known(&serde_json::to_vec(&changed_metadata).unwrap());
     assert_ne!(baseline.semantic_hash(), semantic_variant.semantic_hash());
+}
+
+#[test]
+fn reference_hash_excludes_generated_identity_but_includes_observation_semantics() {
+    let input =
+        fs::read(fixture_root().join("events/v1/valid/engineering-reference-recorded.json"))
+            .unwrap();
+    let baseline = parse_known(&input);
+    let mut variant: Value = serde_json::from_slice(&input).unwrap();
+    variant["event_id"] = json!("evt_99999999-9999-4999-8999-999999999901");
+    variant["reference"]["reference_id"] = json!("ref_99999999-9999-4999-8999-999999999901");
+    variant["annotations"] = json!({"producer": "different", "origin_hint": {"path": "x"}});
+    assert_eq!(
+        baseline.semantic_hash(),
+        parse_known(&serde_json::to_vec(&variant).unwrap()).semantic_hash()
+    );
+
+    variant["reference"]["supports"] = json!("Different authoritative support statement");
+    assert_ne!(
+        baseline.semantic_hash(),
+        parse_known(&serde_json::to_vec(&variant).unwrap()).semantic_hash()
+    );
 }
 
 #[test]

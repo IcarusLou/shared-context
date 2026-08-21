@@ -1,0 +1,32 @@
+{
+  "schema_version": "1",
+  "event_id": "evt_00000000-0000-4000-8000-000000000901",
+  "event_type": "engineering_reference.recorded",
+  "context_id": "ctx_00000000-0000-4000-8000-000000000201",
+  "revision_id": "rev_00000000-0000-4000-8000-000000000211",
+  "reference": {
+    "reference_id": "ref_00000000-0000-4000-8000-000000000901",
+    "repository_id": "rpo_00000000-0000-4000-8000-000000000901",
+    "artifact_kind": "file",
+    "relation": "implements",
+    "locator_hints": {
+      "module": "search",
+      "path": "src/search.ts",
+      "symbol": "SearchResults",
+      "language": "typescript",
+      "api_or_schema": null,
+      "line": 42,
+      "commit": "0123456789abcdef"
+    },
+    "content_fingerprint": "sha256:reference-fixture",
+    "semantic_fingerprint": null,
+    "supports": "This file implements the referenced Context revision.",
+    "limitations": ["The path and line may become stale after a refactor."]
+  },
+  "annotations": {
+    "producer": "fixture",
+    "origin_hint": {
+      "workspace": "non-authoritative"
+    }
+  }
+}

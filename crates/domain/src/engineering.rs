@@ -23,6 +23,13 @@ fn validate_optional_text(value: Option<&String>, field: &str) -> Result<()> {
     Ok(())
 }
 
+fn require_text_items(values: &[String], field: &str) -> Result<()> {
+    for (index, value) in values.iter().enumerate() {
+        require_text(value, &format!("{field}[{index}]"))?;
+    }
+    Ok(())
+}
+
 /// Stable identity of one logical repository, independent of a local checkout.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -350,6 +357,42 @@ impl ReferenceRelation {
     }
 }
 
+/// Caller-authored content for one persistent, non-authoritative engineering observation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineeringReferenceDraft {
+    pub repository_id: RepositoryId,
+    pub artifact_kind: ArtifactKind,
+    pub relation: ReferenceRelation,
+    pub locator_hints: Option<LocatorHints>,
+    pub content_fingerprint: Option<ContentFingerprint>,
+    pub semantic_fingerprint: Option<SemanticFingerprint>,
+    pub supports: String,
+    pub limitations: Vec<String>,
+}
+
+impl EngineeringReferenceDraft {
+    /// Validates relation compatibility, locator/fingerprint evidence, and explanatory text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] for an invalid engineering observation.
+    pub fn validate(&self) -> Result<()> {
+        EngineeringReference {
+            reference_id: ReferenceId::new(),
+            repository_id: self.repository_id,
+            artifact_kind: self.artifact_kind,
+            relation: self.relation,
+            locator_hints: self.locator_hints.clone(),
+            content_fingerprint: self.content_fingerprint.clone(),
+            semantic_fingerprint: self.semantic_fingerprint.clone(),
+            supports: self.supports.clone(),
+            limitations: self.limitations.clone(),
+        }
+        .validate()
+    }
+}
+
 /// Persistent, non-authoritative observation connecting Context to engineering coordinates.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -361,9 +404,32 @@ pub struct EngineeringReference {
     pub locator_hints: Option<LocatorHints>,
     pub content_fingerprint: Option<ContentFingerprint>,
     pub semantic_fingerprint: Option<SemanticFingerprint>,
+    pub supports: String,
+    pub limitations: Vec<String>,
 }
 
 impl EngineeringReference {
+    /// Generates a stable Reference identity for validated observation content.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] for an invalid draft.
+    pub fn from_draft(draft: EngineeringReferenceDraft) -> Result<Self> {
+        let reference = Self {
+            reference_id: ReferenceId::new(),
+            repository_id: draft.repository_id,
+            artifact_kind: draft.artifact_kind,
+            relation: draft.relation,
+            locator_hints: draft.locator_hints,
+            content_fingerprint: draft.content_fingerprint,
+            semantic_fingerprint: draft.semantic_fingerprint,
+            supports: draft.supports,
+            limitations: draft.limitations,
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+
     /// Validates relation compatibility and observation evidence.
     ///
     /// # Errors
@@ -376,7 +442,11 @@ impl EngineeringReference {
             ));
         }
         if let Some(locator) = &self.locator_hints {
-            locator.validate()?;
+            locator.validate().map_err(|error| {
+                invalid(format!(
+                    "engineering_reference locator_hints are invalid: {error}"
+                ))
+            })?;
         }
         if let Some(fingerprint) = &self.content_fingerprint {
             fingerprint.validate()?;
@@ -392,7 +462,8 @@ impl EngineeringReference {
                 "engineering_reference requires locator hints or a fingerprint",
             ));
         }
-        Ok(())
+        require_text(&self.supports, "engineering_reference.supports")?;
+        require_text_items(&self.limitations, "engineering_reference.limitations")
     }
 }
 
@@ -902,6 +973,8 @@ mod tests {
             locator_hints: Some(locator("src/search.ts", None, "typescript")),
             content_fingerprint: None,
             semantic_fingerprint: None,
+            supports: "the implementation lives in this file".to_owned(),
+            limitations: vec!["the file may move".to_owned()],
         };
         assert!(invalid.validate().is_err());
 
@@ -912,6 +985,10 @@ mod tests {
             ..invalid
         };
         assert!(valid.validate().is_ok());
+
+        let mut invalid_support = valid;
+        invalid_support.supports = " ".to_owned();
+        assert!(invalid_support.validate().is_err());
     }
 
     #[test]
@@ -1045,6 +1122,8 @@ mod tests {
             locator_hints: None,
             content_fingerprint: Some(empty),
             semantic_fingerprint: None,
+            supports: "the content fingerprint locates the file".to_owned(),
+            limitations: Vec::new(),
         };
         assert!(reference.validate().is_err());
     }

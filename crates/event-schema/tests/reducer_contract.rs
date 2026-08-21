@@ -2,9 +2,11 @@ use std::{fs, path::Path, str::FromStr};
 
 use proptest::prelude::*;
 use sctx_event_schema::{
-    AutoInjectionBlocker, ConflictId, ContextGovernanceStatus, ContextId, Event,
-    ReducerDiagnosticCode, ReducerEvent, ResolutionId, ReviewSummary, RevisionId,
-    RevisionLifecycle, SemanticConflictOpenReason, SemanticConflictStatus, SpaceId, reduce,
+    ArtifactKind, AutoInjectionBlocker, ConflictId, ContextGovernanceStatus, ContextId,
+    EngineeringReferenceDraft, Event, EventPayload, LocatorHints, ReducerDiagnosticCode,
+    ReducerEvent, ReducerPayload, ReferenceRelation, RepositoryId, ResolutionId, ReviewSummary,
+    RevisionId, RevisionLifecycle, SemanticConflictOpenReason, SemanticConflictStatus, SpaceId,
+    reduce,
 };
 use serde_json::Value;
 
@@ -128,6 +130,28 @@ fn revision(id: &str) -> RevisionId {
     RevisionId::from_str(id).unwrap()
 }
 
+fn reference_event(context_id: ContextId, revision_id: RevisionId, path: &str) -> Event {
+    Event::engineering_reference_recorded(
+        context_id,
+        revision_id,
+        EngineeringReferenceDraft {
+            repository_id: RepositoryId::new(),
+            artifact_kind: ArtifactKind::File,
+            relation: ReferenceRelation::Implements,
+            locator_hints: Some(LocatorHints {
+                path: Some(path.to_owned()),
+                ..LocatorHints::default()
+            }),
+            content_fingerprint: None,
+            semantic_fingerprint: None,
+            supports: "The observed file implements this Context revision".to_owned(),
+            limitations: vec!["The path can become stale".to_owned()],
+        },
+        None,
+    )
+    .unwrap()
+}
+
 #[test]
 fn intent_branch_converges_only_through_the_explicit_multi_parent_merge() {
     let mut events = reducer_events("intent-branch-merge.json");
@@ -212,6 +236,138 @@ fn every_permutation_of_the_intent_fixture_is_structurally_identical() {
     let mut checked = 0;
     visit(&mut events, 0, &expected, &mut checked);
     assert_eq!(checked, 24);
+}
+
+#[test]
+fn engineering_reference_is_permutation_invariant_and_never_changes_context_governance() {
+    let mut events = reducer_events("context-branch-merge.json");
+    let baseline = reduce(&events);
+    let reference = reference_event(
+        context("ctx_00000000-0000-4000-8000-000000000201"),
+        revision("rev_00000000-0000-4000-8000-000000000211"),
+        "src/path-that-does-not-exist.ts",
+    );
+    let reference_id = match reference.payload() {
+        EventPayload::EngineeringReferenceRecorded { reference, .. } => reference.reference_id,
+        _ => unreachable!(),
+    };
+    events.push(reference.reducer_event().unwrap());
+    let forward = reduce(&events);
+    events.reverse();
+    let reversed = reduce(&events);
+
+    assert_eq!(forward, reversed);
+    assert_eq!(forward.spaces, baseline.spaces);
+    assert_eq!(forward.semantic_conflicts, baseline.semantic_conflicts);
+    assert_eq!(forward.engineering_references.len(), 1);
+    assert_eq!(
+        forward.engineering_references[&reference_id]
+            .reference
+            .locator_hints
+            .as_ref()
+            .unwrap()
+            .path
+            .as_deref(),
+        Some("src/path-that-does-not-exist.ts")
+    );
+    assert!(forward.diagnostics.is_empty());
+}
+
+#[test]
+fn duplicate_reference_ids_quarantine_only_the_reference_events() {
+    let baseline_events = reducer_events("context-branch-merge.json");
+    let baseline = reduce(&baseline_events);
+    let context_id = context("ctx_00000000-0000-4000-8000-000000000201");
+    let revision_id = revision("rev_00000000-0000-4000-8000-000000000211");
+    let first = reference_event(context_id, revision_id, "src/first.ts");
+    let second = reference_event(context_id, revision_id, "src/second.ts");
+    let first_id = match first.payload() {
+        EventPayload::EngineeringReferenceRecorded { reference, .. } => reference.reference_id,
+        _ => unreachable!(),
+    };
+    let mut second_json = serde_json::to_value(second).unwrap();
+    second_json["reference"]["reference_id"] = serde_json::json!(first_id);
+    let second: Event = serde_json::from_value(second_json).unwrap();
+    let mut events = baseline_events;
+    events.extend([
+        first.reducer_event().unwrap(),
+        second.reducer_event().unwrap(),
+    ]);
+    let projection = reduce(&events);
+
+    assert_eq!(projection.spaces, baseline.spaces);
+    assert!(projection.engineering_references.is_empty());
+    assert!(projection.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == ReducerDiagnosticCode::DuplicateReferenceId
+            && diagnostic.event_ids.len() == 2
+    }));
+}
+
+#[test]
+fn invalid_reference_target_locator_and_relation_never_quarantine_context() {
+    let baseline_events = reducer_events("publication-lifecycle.json");
+    let baseline = reduce(&baseline_events);
+    let context_id = context("ctx_00000000-0000-4000-8000-000000000401");
+    let valid_revision = revision("rev_00000000-0000-4000-8000-000000000411");
+
+    let missing = reference_event(ContextId::new(), RevisionId::new(), "src/missing.ts")
+        .reducer_event()
+        .unwrap();
+    let cross_context = reference_event(
+        context_id,
+        revision("rev_00000000-0000-4000-8000-000000000413"),
+        "src/cross.ts",
+    )
+    .reducer_event()
+    .unwrap();
+    let mut invalid_relation = reference_event(context_id, valid_revision, "src/relation.ts")
+        .reducer_event()
+        .unwrap();
+    let ReducerPayload::EngineeringReferenceRecorded { reference, .. } =
+        &mut invalid_relation.payload
+    else {
+        unreachable!();
+    };
+    reference.relation = ReferenceRelation::Consumes;
+
+    let mut invalid_locator = reference_event(context_id, valid_revision, "src/locator.ts")
+        .reducer_event()
+        .unwrap();
+    let ReducerPayload::EngineeringReferenceRecorded { reference, .. } =
+        &mut invalid_locator.payload
+    else {
+        unreachable!();
+    };
+    reference.locator_hints = Some(LocatorHints {
+        language: Some("rust".to_owned()),
+        ..LocatorHints::default()
+    });
+
+    let mut events = baseline_events;
+    events.extend([missing, cross_context, invalid_relation, invalid_locator]);
+    let projection = reduce(&events);
+    assert_eq!(projection.spaces, baseline.spaces);
+    assert!(projection.engineering_references.is_empty());
+    assert_eq!(
+        projection
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == ReducerDiagnosticCode::InvalidEngineeringReferenceTarget
+            })
+            .count(),
+        2
+    );
+    assert_eq!(
+        projection
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == ReducerDiagnosticCode::InvalidEngineeringReference
+            })
+            .count(),
+        2
+    );
 }
 
 #[test]

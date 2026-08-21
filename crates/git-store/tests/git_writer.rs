@@ -11,8 +11,9 @@ use std::{
 };
 
 use sctx_event_schema::{
-    Applicability, ContextKind, ContextRevisionDraft, Event, EventPayload, EvidenceSnapshotDraft,
-    EvidenceType, IntentSnapshot, WorkEpisodeId,
+    Applicability, ArtifactKind, ContextId, ContextKind, ContextRevisionDraft,
+    EngineeringReferenceDraft, Event, EventPayload, EvidenceSnapshotDraft, EvidenceType,
+    IntentSnapshot, LocatorHints, ReferenceRelation, RepositoryId, RevisionId, WorkEpisodeId,
 };
 use sctx_git_store::{
     AppendRequest, CrashInjector, CrashSeam, Error, ErrorKind, GitStore, OBJECT_PENDING,
@@ -117,6 +118,28 @@ fn candidate_event(source_episode_id: WorkEpisodeId, statement: &str) -> Event {
     .unwrap()
 }
 
+fn reference_event(supports: &str) -> Event {
+    Event::engineering_reference_recorded(
+        ContextId::new(),
+        RevisionId::new(),
+        EngineeringReferenceDraft {
+            repository_id: RepositoryId::new(),
+            artifact_kind: ArtifactKind::File,
+            relation: ReferenceRelation::Implements,
+            locator_hints: Some(LocatorHints {
+                path: Some("src/search.ts".to_owned()),
+                ..LocatorHints::default()
+            }),
+            content_fingerprint: None,
+            semantic_fingerprint: None,
+            supports: supports.to_owned(),
+            limitations: vec!["The path may move".to_owned()],
+        },
+        None,
+    )
+    .unwrap()
+}
+
 #[test]
 fn git_append_boundary_rejects_sensitive_event_and_evidence_without_pending_residue() {
     let fixture = Fixture::new();
@@ -139,6 +162,22 @@ fn git_append_boundary_rejects_sensitive_event_and_evidence_without_pending_resi
     assert_eq!(object_error.kind(), ErrorKind::InvalidInput);
     assert!(object_error.message().contains("assigned_credential"));
     assert!(!object_error.message().contains(object_value));
+    assert!(fixture.store.list_pending().unwrap().is_empty());
+    assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), "1");
+}
+
+#[test]
+fn git_append_boundary_scans_engineering_reference_observations() {
+    let fixture = Fixture::new();
+    let sensitive = "alice@example.com";
+    let error = fixture
+        .store
+        .append_event(AppendRequest::event(reference_event(sensitive)))
+        .unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(error.message().contains("email_address"));
+    assert!(!error.message().contains(sensitive));
     assert!(fixture.store.list_pending().unwrap().is_empty());
     assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), "1");
 }
