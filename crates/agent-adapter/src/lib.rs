@@ -693,6 +693,7 @@ mod tests {
         TaskContextPack {
             indexed_tree_oid: "tree".to_owned(),
             projection_generation: 1,
+            artifact_generation: None,
             task_id,
             task_fingerprint: "fingerprint".to_owned(),
             token_budget: 2_000,

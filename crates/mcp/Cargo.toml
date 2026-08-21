@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 sctx-domain.workspace = true
+sctx-engineering-graph.workspace = true
 sctx-event-schema.workspace = true
 sctx-git-store.workspace = true
 sctx-index.workspace = true

@@ -523,6 +523,21 @@ fn incremental_resolution_equals_scratch_and_projection_rebuild_is_byte_equivale
     assert_eq!(rebuilt.canonical_bytes().unwrap().unwrap(), first_bytes);
     assert_eq!(rebuilt.read_projection().unwrap().unwrap(), scratch);
 
+    rebuilt
+        .rebuild_for_context_tree(&scratch, Some("context-tree-a"))
+        .unwrap();
+    let pinned = rebuilt.read_snapshot().unwrap().unwrap();
+    assert_eq!(pinned.context_tree_oid.as_deref(), Some("context-tree-a"));
+    assert_eq!(pinned.projection, scratch);
+    assert_ne!(rebuilt.canonical_bytes().unwrap().unwrap(), first_bytes);
+    assert!(
+        rebuilt
+            .rebuild_for_context_tree(&scratch, Some("  "))
+            .unwrap_err()
+            .message()
+            .contains("Context Tree")
+    );
+
     let empty = resolver.resolve(&[], &snapshots, Some(&scratch)).unwrap();
     rebuilt.rebuild_incremental(&empty).unwrap();
     let current = rebuilt.read_projection().unwrap().unwrap();

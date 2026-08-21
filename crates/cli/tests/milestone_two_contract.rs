@@ -561,6 +561,22 @@ fn assert_typed_m2_path(path: &TaskRetrievalPath) {
             ));
             assert!(!content.is_empty());
         }
+        TaskRetrievalPath::EngineeringGraph {
+            path,
+            relation_hops,
+        } => {
+            assert!(!path.task_signal_content.is_empty());
+            assert!(!path.artifact_generation.is_empty());
+            assert!(relation_hops.len() <= 2);
+        }
+        TaskRetrievalPath::ContextRelation { hops } => {
+            assert!(!hops.is_empty());
+            assert!(hops.len() <= 2);
+        }
+        TaskRetrievalPath::GraphDiagnostic { diagnostic } => {
+            assert!(!diagnostic.task_signal_content.is_empty());
+            assert!(!diagnostic.artifact_generation.is_empty());
+        }
     }
 }
 

@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashSet};
 
 use sctx_domain::{
     ArtifactAssociationKind, ArtifactKey, ArtifactKeyBasis, ArtifactKind, ArtifactResolution,
-    ContextArtifactAssociation, ContextId, EngineeringReference, Error, ErrorKind, ReferenceId,
-    ReferenceRelation, RepositoryId, ResolutionStatus, Result, RevisionId,
+    ContextArtifactAssociation, ContextId, EngineeringArtifact, EngineeringReference, Error,
+    ErrorKind, ReferenceId, ReferenceRelation, RepositoryId, ResolutionStatus, Result, RevisionId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -83,6 +83,7 @@ pub struct ResolvedReferenceProjection {
     pub artifact_generation: String,
     pub resolution: ArtifactResolution,
     pub association: Option<ContextArtifactAssociation>,
+    pub artifacts: Vec<EngineeringArtifact>,
     pub evidence: Vec<CandidateMatchEvidence>,
 }
 
@@ -115,6 +116,37 @@ impl ResolvedReferenceProjection {
                 || evidence.confidence > 1.0
         }) {
             return Err(invariant("resolution evidence confidence is invalid"));
+        }
+        let mut artifact_keys = HashSet::with_capacity(self.artifacts.len());
+        for artifact in &self.artifacts {
+            artifact.validate()?;
+            if !artifact_keys.insert(artifact.artifact_key.clone()) {
+                return Err(invariant(
+                    "resolved Engineering projection repeats an Artifact",
+                ));
+            }
+        }
+        let expected = match self.resolution.status {
+            ResolutionStatus::Resolved => self
+                .resolution
+                .resolved_artifact
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>(),
+            ResolutionStatus::Ambiguous => self
+                .resolution
+                .candidates
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>(),
+            ResolutionStatus::Stale
+            | ResolutionStatus::Unavailable
+            | ResolutionStatus::Unresolved => HashSet::new(),
+        };
+        if artifact_keys != expected {
+            return Err(invariant(
+                "resolved Engineering Artifacts differ from ArtifactResolution",
+            ));
         }
         Ok(())
     }
@@ -276,6 +308,7 @@ fn resolve_one(
             None,
             ResolutionStatus::Unavailable,
             None,
+            vec![],
             vec![CandidateMatchEvidence {
                 artifact_key: None,
                 basis: MatchBasis::RepositoryUnavailable,
@@ -289,6 +322,7 @@ fn resolve_one(
             None,
             ResolutionStatus::Unavailable,
             None,
+            vec![],
             vec![CandidateMatchEvidence {
                 artifact_key: None,
                 basis: MatchBasis::RepositoryUnavailable,
@@ -315,6 +349,7 @@ fn resolve_one(
                             Some(snapshot.generation.clone()),
                             ResolutionStatus::Stale,
                             Some(previous_artifact.clone()),
+                            vec![],
                             vec![CandidateMatchEvidence {
                                 artifact_key: Some(previous_artifact),
                                 basis: MatchBasis::PreviousResolvedArtifact,
@@ -332,6 +367,7 @@ fn resolve_one(
                             Some(snapshot.generation.clone()),
                             ResolutionStatus::Unresolved,
                             None,
+                            vec![],
                             vec![],
                             "No Artifact matched the persistent Reference".to_owned(),
                         )
@@ -491,6 +527,7 @@ fn projection_for_resolved(
         Some(snapshot.generation.clone()),
         ResolutionStatus::Resolved,
         Some(key),
+        vec![candidate.artifact.artifact.clone()],
         vec![evidence],
         "Reference resolved from highest-precedence stable evidence".to_owned(),
     )
@@ -522,6 +559,10 @@ fn projection_for_ambiguous(
         Some(snapshot.generation.clone()),
         ResolutionStatus::Ambiguous,
         None,
+        candidates
+            .iter()
+            .map(|candidate| candidate.artifact.artifact.clone())
+            .collect(),
         evidence,
         "Multiple Artifacts share equal highest-precedence evidence; lower path/time hints were not used to choose"
             .to_owned(),
@@ -533,6 +574,7 @@ fn projection_for_status(
     repository_generation: Option<String>,
     status: ResolutionStatus,
     resolved_artifact: Option<ArtifactKey>,
+    artifacts: Vec<EngineeringArtifact>,
     evidence: Vec<CandidateMatchEvidence>,
     explanation: String,
 ) -> Result<ResolvedReferenceProjection> {
@@ -561,6 +603,7 @@ fn projection_for_status(
             explanation,
         },
         association: None,
+        artifacts,
         evidence,
     };
     projection.resolution.validate()?;

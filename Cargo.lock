@@ -631,6 +631,7 @@ name = "sctx-mcp"
 version = "0.1.0"
 dependencies = [
  "sctx-domain",
+ "sctx-engineering-graph",
  "sctx-event-schema",
  "sctx-git-store",
  "sctx-index",
@@ -647,6 +648,7 @@ version = "0.1.0"
 dependencies = [
  "rusqlite",
  "sctx-domain",
+ "sctx-engineering-graph",
  "sctx-event-schema",
  "sctx-git-store",
  "sctx-index",

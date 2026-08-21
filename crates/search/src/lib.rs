@@ -1,14 +1,19 @@
 //! Structured FTS5 search, Task-to-Space association, and deterministic Context Packs.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     str::FromStr,
 };
 
-use rusqlite::{Connection, params_from_iter, types::Value as SqlValue};
+use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value as SqlValue};
 use sctx_domain::{
-    Applicability, ContextId, ContextKind, EvidenceId, RevisionId, SpaceId, TaskId, TaskIntent,
-    TaskSignal, TaskSignalKind, TaskSpaceAssociation,
+    Applicability, ArtifactAssociationKind, ArtifactKey, ArtifactKeyBasis, ArtifactKind, ContextId,
+    ContextKind, ContextRelationKind, EngineeringArtifact, EvidenceId, ReferenceId, RepositoryId,
+    ResolutionStatus, RevisionId, SpaceId, TaskId, TaskIntent, TaskSignal, TaskSignalKind,
+    TaskSpaceAssociation,
+};
+use sctx_engineering_graph::{
+    EngineeringProjection, EngineeringProjectionSnapshot, EngineeringProjectionStore, MatchBasis,
 };
 use sctx_index::{IndexMetadata, ProjectionIndex, normalize_search_text, search_tokens};
 use serde::{Deserialize, Serialize};
@@ -352,6 +357,8 @@ pub struct IntentConflictHandoffExplanation {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskAssociationChannel {
+    ResolvedArtifactExact,
+    ContextRelation,
     SpaceIntentBm25,
     AcceptedContextBm25,
     ExactScope,
@@ -390,10 +397,63 @@ pub struct TaskAssociationFusionExplanation {
     pub final_score_basis_points: u16,
 }
 
-/// Explainable M2-only route from the Task to one returned Context.
+/// One exact Task Signal to current Engineering Artifact and Context association.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GraphArtifactRetrievalPath {
+    pub task_signal_kind: TaskSignalKind,
+    pub task_signal_content: String,
+    pub repository_id: RepositoryId,
+    pub artifact_key: ArtifactKey,
+    pub artifact_kind: ArtifactKind,
+    pub reference_id: ReferenceId,
+    pub association_id: String,
+    pub association_kind: ArtifactAssociationKind,
+    pub match_basis: MatchBasis,
+    pub resolution_status: ResolutionStatus,
+    pub confidence_basis_points: u16,
+    pub artifact_generation: String,
+}
+
+/// One stable, authoritative Context Relation hop from a retrieved Context.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContextRelationRetrievalPath {
+    pub source_context_id: ContextId,
+    pub source_revision_id: RevisionId,
+    pub target_context_id: ContextId,
+    pub target_revision_id: RevisionId,
+    pub kind: ContextRelationKind,
+    pub rationale: String,
+    pub supports: Vec<String>,
+    pub depth: u8,
+}
+
+/// Explicit-only diagnostic for an Artifact edge that was not safe to resolve.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GraphResolutionDiagnosticPath {
+    pub task_signal_kind: TaskSignalKind,
+    pub task_signal_content: String,
+    pub repository_id: RepositoryId,
+    pub reference_id: ReferenceId,
+    pub resolution_status: ResolutionStatus,
+    pub candidate_artifact_keys: Vec<ArtifactKey>,
+    pub match_bases: Vec<MatchBasis>,
+    pub artifact_generation: String,
+}
+
+/// Explainable route from the Task to one returned Context.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
 pub enum TaskRetrievalPath {
+    EngineeringGraph {
+        path: GraphArtifactRetrievalPath,
+        relation_hops: Vec<ContextRelationRetrievalPath>,
+    },
+    ContextRelation {
+        hops: Vec<ContextRelationRetrievalPath>,
+    },
+    GraphDiagnostic {
+        diagnostic: GraphResolutionDiagnosticPath,
+    },
     IntentFts {
         matched_fields: Vec<String>,
         matched_tokens: Vec<String>,
@@ -421,11 +481,13 @@ pub struct TaskContextItem {
     pub retrieval_paths: Vec<TaskRetrievalPath>,
 }
 
-/// Task-first Context Pack produced from one exact index snapshot.
+/// Task-first Context Pack produced from one exact Context snapshot and an
+/// optional Engineering snapshot pinned to the same Context Tree.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TaskContextPack {
     pub indexed_tree_oid: String,
     pub projection_generation: u64,
+    pub artifact_generation: Option<String>,
     pub task_id: TaskId,
     pub task_fingerprint: String,
     pub token_budget: usize,
@@ -502,12 +564,30 @@ pub struct ContextPackItem {
 #[derive(Clone, Debug)]
 pub struct SearchEngine {
     index: ProjectionIndex,
+    engineering_graph: Option<EngineeringProjectionStore>,
 }
 
 impl SearchEngine {
     #[must_use]
     pub const fn new(index: ProjectionIndex) -> Self {
-        Self { index }
+        Self {
+            index,
+            engineering_graph: None,
+        }
+    }
+
+    /// Adds the optional local Engineering Graph projection used for exact
+    /// Artifact retrieval. The Graph is advisory and Task retrieval degrades
+    /// to Context-only channels when it is missing, unpinned, or behind HEAD.
+    #[must_use]
+    pub const fn with_engineering_graph(
+        index: ProjectionIndex,
+        engineering_graph: EngineeringProjectionStore,
+    ) -> Self {
+        Self {
+            index,
+            engineering_graph: Some(engineering_graph),
+        }
     }
 
     /// Finds zero or more current Space Intent candidates from a Task Intent and its observed
@@ -538,13 +618,12 @@ impl SearchEngine {
         })
     }
 
-    /// Infers zero or more explainable Space associations for a Task. The M2 inference boundary
-    /// fuses current Space Intent text, automatic-injection-safe Context text and scope, and exact
-    /// textual artifact hints. It deliberately leaves `relation_paths` empty because code graph
-    /// resolution belongs to the later Engineering Graph stage.
+    /// Infers zero or more explainable Space associations for a Task. The inference boundary
+    /// gives current, uniquely resolved Engineering Artifact associations and stable active
+    /// Context Relations higher RRF weight than Intent/Context text, scope, and textual hints.
     ///
-    /// Workspace and Repository signals are location observations only in M2 and are excluded
-    /// from both matching and scoring.
+    /// Workspace signals never add a Space prior. Repository identity signals may expose an
+    /// explicit unavailable-resolution diagnostic, but never add ranking or injection evidence.
     ///
     /// # Errors
     ///
@@ -561,27 +640,44 @@ impl SearchEngine {
         let query_phrases = task_query_phrases(intent, signals, false);
         let artifact_hints = artifact_hints(signals);
         let scope_targets = ScopeTargets::from_intent(intent);
-        let snapshot = self.index.query_snapshot(|connection| {
-            infer_task_space_associations(
-                connection,
-                intent.task_id,
-                &query_tokens,
-                &query_phrases,
-                &artifact_hints,
-                &scope_targets,
-            )
-        })?;
-        Ok(TaskSpaceAssociationsResponse {
-            indexed_tree_oid: snapshot.metadata.indexed_tree_oid,
-            projection_generation: snapshot.metadata.projection_generation,
-            task_id: intent.task_id,
-            associations: snapshot.data.associations,
-        })
+        for _attempt in 0..3 {
+            let graph_snapshot = self.read_graph_snapshot()?;
+            let snapshot = self.index.query_snapshot(|connection| {
+                let tree_oid = meta(connection, "indexed_tree_oid")?;
+                let graph = graph_for_tree(graph_snapshot.as_ref(), &tree_oid);
+                infer_task_space_associations(
+                    connection,
+                    intent.task_id,
+                    &query_tokens,
+                    &query_phrases,
+                    &artifact_hints,
+                    &scope_targets,
+                    signals,
+                    graph,
+                    ContextPackMode::AutomaticInjection,
+                )
+            })?;
+            let used_graph =
+                graph_for_tree(graph_snapshot.as_ref(), &snapshot.metadata.indexed_tree_oid);
+            if used_graph.is_some() && !self.graph_snapshot_unchanged(graph_snapshot.as_ref())? {
+                continue;
+            }
+            return Ok(TaskSpaceAssociationsResponse {
+                indexed_tree_oid: snapshot.metadata.indexed_tree_oid,
+                projection_generation: snapshot.metadata.projection_generation,
+                task_id: intent.task_id,
+                associations: snapshot.data.associations,
+            });
+        }
+        Err(invariant(
+            "Engineering Graph generation changed during Task association retrieval",
+        ))
     }
 
-    /// Builds an explainable Task-first Context Pack entirely within one projection snapshot.
+    /// Builds an explainable Task-first Context Pack from one Context `QuerySnapshot` and, when
+    /// available, one generation-stable Engineering projection explicitly pinned to that Tree.
     /// Association inference, Context retrieval, safety filtering, Evidence/Conflict expansion,
-    /// ordering, and token budgeting all observe the returned Tree and Generation.
+    /// ordering, and token budgeting all observe those returned generations.
     ///
     /// # Errors
     ///
@@ -594,51 +690,84 @@ impl SearchEngine {
         let query_phrases = task_query_phrases(&request.task_intent, &request.task_signals, false);
         let artifact_hints = artifact_hints(&request.task_signals);
         let scope_targets = ScopeTargets::from_intent(&request.task_intent);
-        let snapshot = self.index.query_snapshot(|connection| {
-            let mut inference = infer_task_space_associations(
-                connection,
-                request.task_intent.task_id,
-                &query_tokens,
-                &query_phrases,
-                &artifact_hints,
-                &scope_targets,
-            )?;
-            let omitted_spaces = inference
-                .associations
-                .len()
-                .saturating_sub(request.max_spaces);
-            let omitted_space_tokens = inference.associations
-                [request.max_spaces.min(inference.associations.len())..]
-                .iter()
-                .map(serialized_tokens)
-                .sum();
-            inference.associations.truncate(request.max_spaces);
-            let candidates = load_task_context_candidates(
-                connection,
-                &inference,
-                request.mode,
-                request.candidate_limit,
-            )?;
-            Ok(pack_task_context_candidates(
-                candidates,
-                request.token_budget,
-                inference,
-                omitted_spaces,
-                omitted_space_tokens,
-            ))
-        })?;
-        Ok(TaskContextPack {
-            indexed_tree_oid: snapshot.metadata.indexed_tree_oid,
-            projection_generation: snapshot.metadata.projection_generation,
-            task_id: request.task_intent.task_id,
-            task_fingerprint: fingerprint,
-            token_budget: request.token_budget,
-            estimated_tokens: snapshot.data.estimated_tokens,
-            mode: request.mode,
-            associations: snapshot.data.associations,
-            items: snapshot.data.items,
-            omitted: snapshot.data.omitted,
-        })
+        for _attempt in 0..3 {
+            let graph_snapshot = self.read_graph_snapshot()?;
+            let snapshot = self.index.query_snapshot(|connection| {
+                let tree_oid = meta(connection, "indexed_tree_oid")?;
+                let graph = graph_for_tree(graph_snapshot.as_ref(), &tree_oid);
+                let mut inference = infer_task_space_associations(
+                    connection,
+                    request.task_intent.task_id,
+                    &query_tokens,
+                    &query_phrases,
+                    &artifact_hints,
+                    &scope_targets,
+                    &request.task_signals,
+                    graph,
+                    request.mode,
+                )?;
+                let omitted_spaces = inference
+                    .associations
+                    .len()
+                    .saturating_sub(request.max_spaces);
+                let omitted_space_tokens = inference.associations
+                    [request.max_spaces.min(inference.associations.len())..]
+                    .iter()
+                    .map(serialized_tokens)
+                    .sum();
+                inference.associations.truncate(request.max_spaces);
+                let candidates = load_task_context_candidates(
+                    connection,
+                    &inference,
+                    request.mode,
+                    request.candidate_limit,
+                )?;
+                Ok(pack_task_context_candidates(
+                    candidates,
+                    request.token_budget,
+                    inference,
+                    omitted_spaces,
+                    omitted_space_tokens,
+                ))
+            })?;
+            let used_graph =
+                graph_for_tree(graph_snapshot.as_ref(), &snapshot.metadata.indexed_tree_oid);
+            if used_graph.is_some() && !self.graph_snapshot_unchanged(graph_snapshot.as_ref())? {
+                continue;
+            }
+            return Ok(TaskContextPack {
+                indexed_tree_oid: snapshot.metadata.indexed_tree_oid,
+                projection_generation: snapshot.metadata.projection_generation,
+                artifact_generation: used_graph.map(|graph| graph.artifact_generation.clone()),
+                task_id: request.task_intent.task_id,
+                task_fingerprint: fingerprint,
+                token_budget: request.token_budget,
+                estimated_tokens: snapshot.data.estimated_tokens,
+                mode: request.mode,
+                associations: snapshot.data.associations,
+                items: snapshot.data.items,
+                omitted: snapshot.data.omitted,
+            });
+        }
+        Err(invariant(
+            "Engineering Graph generation changed during Task Context retrieval",
+        ))
+    }
+
+    fn read_graph_snapshot(&self) -> Result<Option<EngineeringProjectionSnapshot>> {
+        self.engineering_graph
+            .as_ref()
+            .map(EngineeringProjectionStore::read_snapshot)
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    fn graph_snapshot_unchanged(
+        &self,
+        before: Option<&EngineeringProjectionSnapshot>,
+    ) -> Result<bool> {
+        let after = self.read_graph_snapshot()?;
+        Ok(graph_snapshot_identity(before) == graph_snapshot_identity(after.as_ref()))
     }
 
     /// Searches and expands Evidence/conflicts within one read transaction.
@@ -697,6 +826,26 @@ impl SearchEngine {
             next_cursor: snapshot.data.1,
         })
     }
+}
+
+fn graph_for_tree<'a>(
+    snapshot: Option<&'a EngineeringProjectionSnapshot>,
+    tree_oid: &str,
+) -> Option<&'a EngineeringProjection> {
+    snapshot
+        .filter(|snapshot| snapshot.context_tree_oid.as_deref() == Some(tree_oid))
+        .map(|snapshot| &snapshot.projection)
+}
+
+fn graph_snapshot_identity(
+    snapshot: Option<&EngineeringProjectionSnapshot>,
+) -> Option<(&str, Option<&str>)> {
+    snapshot.map(|snapshot| {
+        (
+            snapshot.projection.artifact_generation.as_str(),
+            snapshot.context_tree_oid.as_deref(),
+        )
+    })
 }
 
 #[derive(Debug)]
@@ -1003,6 +1152,8 @@ fn explain_intent_match<const N: usize>(
 #[derive(Clone, Debug)]
 struct ArtifactHint {
     label: String,
+    kind: TaskSignalKind,
+    content: String,
     tokens: Vec<String>,
 }
 
@@ -1048,6 +1199,8 @@ struct AcceptedContextEvidence {
     phrase_match: bool,
     matched_artifacts: BTreeSet<String>,
     matched_scopes: BTreeSet<ScopeEvidence>,
+    graph_paths: Vec<TaskRetrievalPath>,
+    relation_depth: Option<u8>,
 }
 
 const SAFE_ACCEPTED_CONTEXT_PREDICATE: &str = "item.governance_status = 'accepted'
@@ -1086,6 +1239,9 @@ struct AssociationEvidence {
     context_phrase_match: bool,
     context_field_weight_points: u16,
     matched_scopes: BTreeSet<ScopeEvidence>,
+    graph_exact_contexts: BTreeSet<ContextId>,
+    relation_contexts: BTreeSet<ContextId>,
+    relation_paths: BTreeSet<Vec<String>>,
     channel_features: Vec<TaskAssociationChannelFeature>,
     fused_score_basis_points: u16,
 }
@@ -1113,6 +1269,8 @@ fn artifact_hints(signals: &[TaskSignal]) -> Vec<ArtifactHint> {
             let tokens = search_tokens(&signal.content);
             (!tokens.is_empty()).then(|| ArtifactHint {
                 label: format!("{kind}:{}", signal.content),
+                kind: signal.kind,
+                content: signal.content.clone(),
                 tokens,
             })
         })
@@ -1157,6 +1315,7 @@ fn artifact_match_expression(hints: &[ArtifactHint]) -> Option<String> {
     (!alternatives.is_empty()).then(|| alternatives.join(" OR "))
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn infer_task_space_associations(
     connection: &Connection,
     task_id: TaskId,
@@ -1164,16 +1323,30 @@ fn infer_task_space_associations(
     query_phrases: &[String],
     artifact_hints: &[ArtifactHint],
     scope_targets: &ScopeTargets,
+    task_signals: &[TaskSignal],
+    engineering_graph: Option<&EngineeringProjection>,
+    mode: ContextPackMode,
 ) -> Result<TaskAssociationInference> {
     let intent_candidates = query_space_intent_candidates(connection, query_tokens, query_phrases)?;
     let intent_artifacts = query_exact_intent_artifacts(connection, artifact_hints)?;
-    let contexts = query_accepted_context_evidence(
+    let mut contexts = query_accepted_context_evidence(
         connection,
         query_tokens,
         query_phrases,
         artifact_hints,
         scope_targets,
     )?;
+    if let Some(graph) = engineering_graph {
+        query_graph_context_evidence(
+            connection,
+            graph,
+            artifact_hints,
+            task_signals,
+            mode,
+            &mut contexts,
+        )?;
+    }
+    expand_context_relation_evidence(connection, mode, &mut contexts)?;
     let mut evidence = BTreeMap::<SpaceId, AssociationEvidence>::new();
     apply_intent_evidence(&mut evidence, intent_candidates);
     for (space_id, artifacts) in intent_artifacts {
@@ -1220,6 +1393,34 @@ fn infer_task_space_associations(
         aggregate
             .matched_scopes
             .extend(context.matched_scopes.iter().cloned());
+        if context
+            .graph_paths
+            .iter()
+            .any(|path| matches!(path, TaskRetrievalPath::EngineeringGraph { relation_hops, .. } if relation_hops.is_empty()))
+        {
+            aggregate.graph_exact_contexts.insert(*context_id);
+        }
+        if context.relation_depth.is_some() {
+            aggregate.relation_contexts.insert(*context_id);
+        }
+        aggregate.relation_paths.extend(
+            context
+                .graph_paths
+                .iter()
+                .filter(|path| {
+                    matches!(
+                        path,
+                        TaskRetrievalPath::EngineeringGraph { .. }
+                            | TaskRetrievalPath::ContextRelation { .. }
+                    )
+                })
+                .map(|path| {
+                    vec![
+                        serde_json::to_string(path)
+                            .expect("typed Graph RetrievalPath is always serializable"),
+                    ]
+                }),
+        );
     }
     hydrate_intent_conflict_state(connection, &mut evidence)?;
     assign_channel_features(&mut evidence, query_tokens);
@@ -1418,6 +1619,491 @@ fn query_accepted_context_evidence(
     query_accepted_context_artifacts(connection, artifact_hints, &mut evidence)?;
     query_accepted_context_scope(connection, scope_targets, &mut evidence)?;
     Ok(evidence)
+}
+
+#[allow(clippy::too_many_lines)]
+fn query_graph_context_evidence(
+    connection: &Connection,
+    graph: &EngineeringProjection,
+    artifact_hints: &[ArtifactHint],
+    task_signals: &[TaskSignal],
+    mode: ContextPackMode,
+    contexts: &mut BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>,
+) -> Result<()> {
+    let repository_ids = task_signals
+        .iter()
+        .filter(|signal| signal.kind == TaskSignalKind::Repository)
+        .filter_map(|signal| RepositoryId::from_str(signal.content.trim()).ok())
+        .collect::<BTreeSet<_>>();
+    for resolved in &graph.references {
+        if !repository_ids.is_empty()
+            && !repository_ids.contains(&resolved.resolution.repository_id)
+        {
+            continue;
+        }
+        let candidates = resolved
+            .resolution
+            .resolved_artifact
+            .iter()
+            .chain(resolved.resolution.candidates.iter())
+            .collect::<Vec<_>>();
+        let matches = artifact_hints
+            .iter()
+            .filter_map(|hint| {
+                candidates
+                    .iter()
+                    .find(|artifact| {
+                        let observation = resolved
+                            .artifacts
+                            .iter()
+                            .find(|observation| &observation.artifact_key == **artifact);
+                        task_signal_matches_artifact(hint, artifact, observation)
+                    })
+                    .map(|artifact| (hint, *artifact))
+            })
+            .collect::<Vec<_>>();
+        let repository_diagnostics = task_signals
+            .iter()
+            .filter(|signal| {
+                signal.kind == TaskSignalKind::Repository
+                    && normalize_artifact_identity(&signal.content)
+                        == normalize_artifact_identity(
+                            &resolved.resolution.repository_id.to_string(),
+                        )
+            })
+            .collect::<Vec<_>>();
+        if matches.is_empty() && repository_diagnostics.is_empty() {
+            continue;
+        }
+        let Some(space_id) =
+            current_context_space(connection, resolved.context_id, resolved.revision_id, mode)?
+        else {
+            continue;
+        };
+        if resolved.resolution.status == ResolutionStatus::Resolved {
+            let Some(association) = &resolved.association else {
+                continue;
+            };
+            let Some(match_evidence) = resolved
+                .evidence
+                .iter()
+                .find(|evidence| evidence.artifact_key.as_ref() == Some(&association.artifact_key))
+            else {
+                continue;
+            };
+            for (hint, artifact) in matches {
+                let path = GraphArtifactRetrievalPath {
+                    task_signal_kind: hint.kind,
+                    task_signal_content: hint.content.clone(),
+                    repository_id: artifact.repository_id(),
+                    artifact_key: artifact.clone(),
+                    artifact_kind: artifact.kind(),
+                    reference_id: resolved.reference_id,
+                    association_id: context_artifact_association_id(
+                        resolved.reference_id,
+                        resolved.context_id,
+                        resolved.revision_id,
+                        artifact,
+                    ),
+                    association_kind: association.kind,
+                    match_basis: match_evidence.basis,
+                    resolution_status: resolved.resolution.status,
+                    confidence_basis_points: confidence_basis_points(association.confidence),
+                    artifact_generation: graph.artifact_generation.clone(),
+                };
+                let context = contexts.entry((space_id, resolved.context_id)).or_default();
+                context.matched_artifacts.insert(hint.label.clone());
+                context
+                    .graph_paths
+                    .push(TaskRetrievalPath::EngineeringGraph {
+                        path,
+                        relation_hops: Vec::new(),
+                    });
+            }
+        } else if mode == ContextPackMode::Explicit
+            && contexts.contains_key(&(space_id, resolved.context_id))
+        {
+            let diagnostics = matches
+                .iter()
+                .map(|(hint, _artifact)| (hint.kind, hint.content.as_str()))
+                .chain(
+                    repository_diagnostics
+                        .iter()
+                        .map(|signal| (signal.kind, signal.content.as_str())),
+                )
+                .collect::<Vec<_>>();
+            for (signal_kind, signal_content) in diagnostics {
+                let mut bases = resolved
+                    .evidence
+                    .iter()
+                    .map(|evidence| evidence.basis)
+                    .collect::<Vec<_>>();
+                bases.sort();
+                bases.dedup();
+                contexts
+                    .get_mut(&(space_id, resolved.context_id))
+                    .expect("diagnostic Context evidence exists")
+                    .graph_paths
+                    .push(TaskRetrievalPath::GraphDiagnostic {
+                        diagnostic: GraphResolutionDiagnosticPath {
+                            task_signal_kind: signal_kind,
+                            task_signal_content: signal_content.to_owned(),
+                            repository_id: resolved.resolution.repository_id,
+                            reference_id: resolved.reference_id,
+                            resolution_status: resolved.resolution.status,
+                            candidate_artifact_keys: candidates
+                                .iter()
+                                .map(|artifact| (*artifact).clone())
+                                .collect(),
+                            match_bases: bases,
+                            artifact_generation: graph.artifact_generation.clone(),
+                        },
+                    });
+            }
+        }
+    }
+    for context in contexts.values_mut() {
+        sort_dedup_paths(&mut context.graph_paths);
+    }
+    Ok(())
+}
+
+fn current_context_space(
+    connection: &Connection,
+    context_id: ContextId,
+    revision_id: RevisionId,
+    mode: ContextPackMode,
+) -> Result<Option<SpaceId>> {
+    let predicate = if mode == ContextPackMode::AutomaticInjection {
+        SAFE_ACCEPTED_CONTEXT_PREDICATE
+    } else {
+        "revision.is_head = 1"
+    };
+    connection
+        .query_row(
+            &format!(
+                "SELECT revision.space_id
+                 FROM context_revision AS revision
+                 JOIN context_item AS item USING(context_id)
+                 WHERE revision.context_id = ?1 AND revision.revision_id = ?2
+                   AND {predicate}"
+            ),
+            [context_id.to_string(), revision_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(sql_error("read current Graph Context revision"))?
+        .map(|space_id| parse_id(&space_id))
+        .transpose()
+}
+
+fn task_signal_matches_artifact(
+    hint: &ArtifactHint,
+    artifact: &ArtifactKey,
+    observation: Option<&EngineeringArtifact>,
+) -> bool {
+    if task_signal_artifact_kind(hint.kind) != Some(artifact.kind()) {
+        return false;
+    }
+    let wanted = normalize_artifact_identity(&hint.content);
+    if observation.is_some_and(|observation| {
+        let hints = &observation.locator_hints;
+        [
+            Some(observation.display_name.as_str()),
+            hints.path.as_deref(),
+            hints.symbol.as_deref(),
+            hints.api_or_schema.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|candidate| wanted == normalize_artifact_identity(candidate))
+            || hints
+                .symbol
+                .as_ref()
+                .zip(hints.module.as_ref())
+                .is_some_and(|(symbol, module)| {
+                    wanted == normalize_artifact_identity(&format!("{module}::{symbol}"))
+                })
+    }) {
+        return true;
+    }
+    let ArtifactKeyBasis::Logical {
+        namespace,
+        logical_name,
+    } = artifact.basis()
+    else {
+        return false;
+    };
+    let logical = normalize_artifact_identity(logical_name);
+    if wanted == logical {
+        return true;
+    }
+    namespace.as_ref().is_some_and(|namespace| {
+        wanted == normalize_artifact_identity(&format!("{namespace}::{logical_name}"))
+    })
+}
+
+const fn task_signal_artifact_kind(kind: TaskSignalKind) -> Option<ArtifactKind> {
+    match kind {
+        TaskSignalKind::File => Some(ArtifactKind::File),
+        TaskSignalKind::Symbol => Some(ArtifactKind::Symbol),
+        TaskSignalKind::Api => Some(ArtifactKind::Api),
+        TaskSignalKind::Schema => Some(ArtifactKind::Schema),
+        TaskSignalKind::Test => Some(ArtifactKind::Test),
+        TaskSignalKind::Prompt
+        | TaskSignalKind::Workspace
+        | TaskSignalKind::Repository
+        | TaskSignalKind::Diff => None,
+    }
+}
+
+fn normalize_artifact_identity(value: &str) -> String {
+    value
+        .trim()
+        .replace('\\', "/")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn context_artifact_association_id(
+    reference_id: ReferenceId,
+    context_id: ContextId,
+    revision_id: RevisionId,
+    artifact: &ArtifactKey,
+) -> String {
+    let mut hasher = Sha256::new();
+    for value in [
+        reference_id.to_string(),
+        context_id.to_string(),
+        revision_id.to_string(),
+        artifact.digest().to_owned(),
+    ] {
+        hasher.update(value.len().to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("caa_{:x}", hasher.finalize())
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn confidence_basis_points(confidence: f64) -> u16 {
+    (confidence * 10_000.0).round().clamp(0.0, 10_000.0) as u16
+}
+
+#[derive(Clone, Debug)]
+struct IndexedContextRelation {
+    source_context_id: ContextId,
+    source_revision_id: RevisionId,
+    target_context_id: ContextId,
+    target_revision_id: RevisionId,
+    target_space_id: SpaceId,
+    kind: ContextRelationKind,
+    rationale: String,
+    supports: Vec<String>,
+}
+
+const DEFAULT_CONTEXT_RELATION_DEPTH: u8 = 2;
+
+fn expand_context_relation_evidence(
+    connection: &Connection,
+    mode: ContextPackMode,
+    contexts: &mut BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>,
+) -> Result<()> {
+    let edges = load_active_context_relations(connection, mode)?;
+    if edges.is_empty() || contexts.is_empty() {
+        return Ok(());
+    }
+    let mut outgoing = BTreeMap::<ContextId, Vec<IndexedContextRelation>>::new();
+    for edge in edges {
+        outgoing
+            .entry(edge.source_context_id)
+            .or_default()
+            .push(edge);
+    }
+    let seeds = contexts
+        .iter()
+        .filter(|(_, evidence)| context_is_positive_seed(evidence))
+        .map(|((space_id, context_id), evidence)| {
+            let graph = evidence
+                .graph_paths
+                .iter()
+                .filter_map(|path| match path {
+                    TaskRetrievalPath::EngineeringGraph {
+                        path,
+                        relation_hops,
+                    } if relation_hops.is_empty() => Some(path.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (*space_id, *context_id, graph)
+        })
+        .collect::<Vec<_>>();
+    for (_space_id, seed_context_id, graph_paths) in seeds {
+        let routes = if graph_paths.is_empty() {
+            vec![None]
+        } else {
+            graph_paths.into_iter().map(Some).collect()
+        };
+        for graph_path in routes {
+            let mut queue = VecDeque::from([(
+                seed_context_id,
+                Vec::new(),
+                BTreeSet::from([seed_context_id]),
+            )]);
+            while let Some((current, hops, route_visited)) = queue.pop_front() {
+                if hops.len() >= usize::from(DEFAULT_CONTEXT_RELATION_DEPTH) {
+                    continue;
+                }
+                for edge in outgoing.get(&current).into_iter().flatten() {
+                    if route_visited.contains(&edge.target_context_id) {
+                        continue;
+                    }
+                    let depth = u8::try_from(hops.len() + 1)
+                        .expect("Context Relation depth is bounded by two");
+                    let mut next_hops = hops.clone();
+                    next_hops.push(ContextRelationRetrievalPath {
+                        source_context_id: edge.source_context_id,
+                        source_revision_id: edge.source_revision_id,
+                        target_context_id: edge.target_context_id,
+                        target_revision_id: edge.target_revision_id,
+                        kind: edge.kind,
+                        rationale: edge.rationale.clone(),
+                        supports: edge.supports.clone(),
+                        depth,
+                    });
+                    let path = graph_path.as_ref().map_or_else(
+                        || TaskRetrievalPath::ContextRelation {
+                            hops: next_hops.clone(),
+                        },
+                        |path| TaskRetrievalPath::EngineeringGraph {
+                            path: path.clone(),
+                            relation_hops: next_hops.clone(),
+                        },
+                    );
+                    let target = contexts
+                        .entry((edge.target_space_id, edge.target_context_id))
+                        .or_default();
+                    target.relation_depth = Some(
+                        target
+                            .relation_depth
+                            .map_or(depth, |current| current.min(depth)),
+                    );
+                    target.graph_paths.push(path);
+                    let mut next_visited = route_visited.clone();
+                    next_visited.insert(edge.target_context_id);
+                    queue.push_back((edge.target_context_id, next_hops, next_visited));
+                }
+            }
+        }
+    }
+    for context in contexts.values_mut() {
+        sort_dedup_paths(&mut context.graph_paths);
+    }
+    Ok(())
+}
+
+fn context_is_positive_seed(evidence: &AcceptedContextEvidence) -> bool {
+    evidence.textual_match
+        || !evidence.matched_artifacts.is_empty()
+        || !evidence.matched_scopes.is_empty()
+        || evidence.graph_paths.iter().any(|path| {
+            matches!(
+                path,
+                TaskRetrievalPath::EngineeringGraph { relation_hops, .. }
+                    if relation_hops.is_empty()
+            )
+        })
+}
+
+fn load_active_context_relations(
+    connection: &Connection,
+    mode: ContextPackMode,
+) -> Result<Vec<IndexedContextRelation>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT relation.source_context_id, relation.source_revision_id,
+                    relation.target_context_id, target_item.accepted_revision_id,
+                    relation.target_space_id, relation.kind, relation.rationale,
+                    relation.supports_json
+             FROM context_relation AS relation
+             JOIN context_item AS source_item
+               ON source_item.context_id = relation.source_context_id
+             JOIN context_item AS target_item
+               ON target_item.context_id = relation.target_context_id
+             WHERE source_item.accepted_revision_id = relation.source_revision_id
+               AND target_item.accepted_revision_id IS NOT NULL
+             ORDER BY relation.source_context_id, relation.target_context_id,
+                      relation.kind, relation.source_revision_id",
+        )
+        .map_err(sql_error("prepare active Context Relation retrieval"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })
+        .map_err(sql_error("read active Context Relations"))?;
+    let mut edges = Vec::new();
+    for row in rows {
+        let (
+            source,
+            source_revision,
+            target,
+            target_revision,
+            target_space,
+            kind,
+            rationale,
+            supports,
+        ) = row.map_err(sql_error("collect active Context Relation"))?;
+        let source_context_id = parse_id(&source)?;
+        let source_revision_id = parse_id(&source_revision)?;
+        let target_context_id = parse_id(&target)?;
+        let target_revision_id = parse_id(&target_revision)?;
+        if current_context_space(connection, source_context_id, source_revision_id, mode)?.is_none()
+            || current_context_space(connection, target_context_id, target_revision_id, mode)?
+                .is_none()
+        {
+            continue;
+        }
+        edges.push(IndexedContextRelation {
+            source_context_id,
+            source_revision_id,
+            target_context_id,
+            target_revision_id,
+            target_space_id: parse_id(&target_space)?,
+            kind: parse_context_relation_kind(&kind)?,
+            rationale,
+            supports: from_json(&supports)?,
+        });
+    }
+    Ok(edges)
+}
+
+fn parse_context_relation_kind(value: &str) -> Result<ContextRelationKind> {
+    match value {
+        "depends_on" => Ok(ContextRelationKind::DependsOn),
+        "constrains" => Ok(ContextRelationKind::Constrains),
+        "implements" => Ok(ContextRelationKind::Implements),
+        "validated_by" => Ok(ContextRelationKind::ValidatedBy),
+        "contradicts" => Ok(ContextRelationKind::Contradicts),
+        "related_to" => Ok(ContextRelationKind::RelatedTo),
+        _ => Err(invariant(format!(
+            "unknown indexed Context Relation kind {value}"
+        ))),
+    }
+}
+
+fn sort_dedup_paths(paths: &mut Vec<TaskRetrievalPath>) {
+    paths.sort_by_cached_key(|path| serde_json::to_string(path).unwrap_or_default());
+    paths.dedup();
 }
 
 fn query_accepted_context_artifacts(
@@ -1637,8 +2323,12 @@ where
 
 const RRF_K: usize = 60;
 const RRF_SCALE: usize = 1_000_000;
-const FUSION_CHANNEL_COUNT: usize = 4;
-const MINIMUM_ASSOCIATION_SCORE_BASIS_POINTS: u16 = 500;
+const M2_FUSION_CHANNEL_WEIGHT: usize = 1;
+const GRAPH_ARTIFACT_CHANNEL_WEIGHT: usize = 9;
+const CONTEXT_RELATION_CHANNEL_WEIGHT: usize = 7;
+const FUSION_CHANNEL_WEIGHT: usize =
+    GRAPH_ARTIFACT_CHANNEL_WEIGHT + CONTEXT_RELATION_CHANNEL_WEIGHT + 4;
+const MINIMUM_ASSOCIATION_SCORE_BASIS_POINTS: u16 = 100;
 const TASK_CONTEXT_ENVELOPE_TOKEN_RESERVE: usize = 128;
 
 #[allow(clippy::too_many_lines)]
@@ -1646,6 +2336,7 @@ fn assign_channel_features(
     evidence: &mut BTreeMap<SpaceId, AssociationEvidence>,
     query_tokens: &[String],
 ) {
+    assign_graph_channel_features(evidence);
     let mut intent = evidence
         .iter()
         .filter_map(|(space_id, value)| {
@@ -1787,7 +2478,7 @@ fn assign_channel_features(
             ));
     }
 
-    let maximum_rrf = FUSION_CHANNEL_COUNT * reciprocal_rank_micros(1) as usize;
+    let maximum_rrf = FUSION_CHANNEL_WEIGHT * reciprocal_rank_micros(1) as usize;
     for value in evidence.values_mut() {
         value
             .channel_features
@@ -1804,6 +2495,62 @@ fn assign_channel_features(
                 .min(BASIS_POINTS_SCALE),
         )
         .expect("basis points fit u16");
+    }
+}
+
+fn assign_graph_channel_features(evidence: &mut BTreeMap<SpaceId, AssociationEvidence>) {
+    let mut artifacts = evidence
+        .iter()
+        .filter_map(|(space_id, value)| {
+            (!value.graph_exact_contexts.is_empty())
+                .then_some((*space_id, value.graph_exact_contexts.len()))
+        })
+        .collect::<Vec<_>>();
+    artifacts.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let mut previous = None;
+    let mut rank = 0;
+    for (offset, (space_id, strength)) in artifacts.into_iter().enumerate() {
+        if previous != Some(strength) {
+            rank = offset + 1;
+            previous = Some(strength);
+        }
+        evidence
+            .get_mut(&space_id)
+            .expect("ranked Graph Artifact Space exists")
+            .channel_features
+            .push(weighted_exact_channel_feature(
+                TaskAssociationChannel::ResolvedArtifactExact,
+                rank,
+                strength,
+                GRAPH_ARTIFACT_CHANNEL_WEIGHT,
+            ));
+    }
+
+    let mut relations = evidence
+        .iter()
+        .filter_map(|(space_id, value)| {
+            (!value.relation_contexts.is_empty())
+                .then_some((*space_id, value.relation_contexts.len()))
+        })
+        .collect::<Vec<_>>();
+    relations.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    previous = None;
+    rank = 0;
+    for (offset, (space_id, strength)) in relations.into_iter().enumerate() {
+        if previous != Some(strength) {
+            rank = offset + 1;
+            previous = Some(strength);
+        }
+        evidence
+            .get_mut(&space_id)
+            .expect("ranked Context Relation Space exists")
+            .channel_features
+            .push(weighted_exact_channel_feature(
+                TaskAssociationChannel::ContextRelation,
+                rank,
+                strength,
+                CONTEXT_RELATION_CHANNEL_WEIGHT,
+            ));
     }
 }
 
@@ -1833,10 +2580,20 @@ fn exact_channel_feature(
     rank: usize,
     strength: usize,
 ) -> TaskAssociationChannelFeature {
+    weighted_exact_channel_feature(channel, rank, strength, M2_FUSION_CHANNEL_WEIGHT)
+}
+
+fn weighted_exact_channel_feature(
+    channel: TaskAssociationChannel,
+    rank: usize,
+    strength: usize,
+    weight: usize,
+) -> TaskAssociationChannelFeature {
     TaskAssociationChannelFeature {
         channel,
         rank,
-        reciprocal_rank_micros: reciprocal_rank_micros(rank),
+        reciprocal_rank_micros: reciprocal_rank_micros(rank)
+            .saturating_mul(u32::try_from(weight).unwrap_or(u32::MAX)),
         bm25_micros: None,
         query_token_coverage_basis_points: 0,
         idf_bm25_contribution_micros: 0,
@@ -1910,7 +2667,7 @@ fn association(
         matched_intent_fields: evidence.intent_fields.iter().cloned().collect(),
         matched_artifacts: evidence.matched_artifacts.iter().cloned().collect(),
         matched_contexts: evidence.matched_contexts.iter().copied().collect(),
-        relation_paths: Vec::new(),
+        relation_paths: evidence.relation_paths.iter().cloned().collect(),
         reasons,
     })
 }
@@ -2027,6 +2784,19 @@ fn association_reasons(evidence: &AssociationEvidence) -> Vec<String> {
                 .join(", ")
         ));
     }
+    if !evidence.graph_exact_contexts.is_empty() {
+        reasons.push(format!(
+            "Resolved current-generation Engineering Artifact associations matched {} Context(s)",
+            evidence.graph_exact_contexts.len()
+        ));
+    }
+    if !evidence.relation_contexts.is_empty() {
+        reasons.push(format!(
+            "Stable active Context Relations reached {} Context(s) within depth {}",
+            evidence.relation_contexts.len(),
+            DEFAULT_CONTEXT_RELATION_DEPTH
+        ));
+    }
     reasons
 }
 
@@ -2090,10 +2860,9 @@ fn task_fingerprint(intent: &TaskIntent, signals: &[TaskSignal]) -> Result<Strin
     let mut signals = signals
         .iter()
         .filter(|signal| {
-            !matches!(
-                signal.kind,
-                TaskSignalKind::Workspace | TaskSignalKind::Repository
-            )
+            signal.kind != TaskSignalKind::Workspace
+                && (signal.kind != TaskSignalKind::Repository
+                    || RepositoryId::from_str(signal.content.trim()).is_ok())
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -2338,6 +3107,7 @@ fn task_retrieval_paths(
         });
     }
     if let Some(context) = context {
+        paths.extend(context.graph_paths.iter().cloned());
         if context.textual_match {
             paths.push(TaskRetrievalPath::ContextFts {
                 matched_fields: context.matched_fields.iter().copied().collect(),
@@ -2368,6 +3138,7 @@ fn task_retrieval_paths(
                 .filter_map(|label| exact_signal_path(label, TaskSignalMatchTarget::Context)),
         );
     }
+    sort_dedup_paths(&mut paths);
     paths
 }
 

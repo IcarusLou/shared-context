@@ -21,6 +21,7 @@ use sctx_domain::{
     SpaceId, TaskId, TaskIntentDraft, TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot,
     TaskSignal, TaskSignalLifecycle, TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId,
 };
+use sctx_engineering_graph::EngineeringProjectionStore;
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::{DomainSnapshot, ProjectionIndex};
@@ -198,6 +199,7 @@ pub struct TaskContextResponse {
     pub task_fingerprint: String,
     pub tree: String,
     pub generation: u64,
+    pub artifact_generation: Option<String>,
     pub token_budget: usize,
     pub estimated_tokens: usize,
     pub omitted: Vec<ContextPackOmitted>,
@@ -260,6 +262,7 @@ struct Frame {
 struct Runtime {
     store: GitStore,
     index: ProjectionIndex,
+    engineering_graph: EngineeringProjectionStore,
     tasks: TaskRuntime,
 }
 
@@ -267,10 +270,12 @@ impl Runtime {
     fn open(root: &Path) -> Result<Self> {
         let store = GitStore::initialize(root)?;
         let index = ProjectionIndex::for_store(&store);
+        let engineering_graph = EngineeringProjectionStore::initialize(root)?;
         let tasks = TaskRuntime::initialize(root)?;
         Ok(Self {
             store,
             index,
+            engineering_graph,
             tasks,
         })
     }
@@ -288,7 +293,13 @@ impl Runtime {
             .ok_or_else(|| {
                 invalid("task_context requires task_intent_update to establish an ActiveTask")
             })?;
-        build_task_context_response(&self.index, &snapshot, input.token_budget, input.max_spaces)
+        build_task_context_response(
+            &self.index,
+            &self.engineering_graph,
+            &snapshot,
+            input.token_budget,
+            input.max_spaces,
+        )
     }
 
     fn task_intent_update(
@@ -340,6 +351,7 @@ impl Runtime {
         };
         let context = build_task_context_response(
             &self.index,
+            &self.engineering_graph,
             &snapshot,
             default_token_budget(),
             default_max_spaces(),
@@ -539,6 +551,7 @@ pub fn task_signal_supersede_at_root(
 
 fn build_task_context_response(
     index: &ProjectionIndex,
+    engineering_graph: &EngineeringProjectionStore,
     snapshot: &TaskSessionSnapshot,
     token_budget: usize,
     max_spaces: usize,
@@ -552,7 +565,8 @@ fn build_task_context_response(
         token_budget,
     );
     request.max_spaces = max_spaces;
-    let pack = SearchEngine::new(index.clone()).task_context_pack(&request)?;
+    let pack = SearchEngine::with_engineering_graph(index.clone(), engineering_graph.clone())
+        .task_context_pack(&request)?;
     let retrieval_paths = pack
         .items
         .iter()
@@ -572,6 +586,7 @@ fn build_task_context_response(
         task_fingerprint: pack.task_fingerprint,
         tree: pack.indexed_tree_oid,
         generation: pack.projection_generation,
+        artifact_generation: pack.artifact_generation,
         token_budget: pack.token_budget,
         estimated_tokens: pack.estimated_tokens,
         omitted: pack.omitted,

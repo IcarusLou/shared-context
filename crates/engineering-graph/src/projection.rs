@@ -9,7 +9,7 @@ use sctx_domain::{Error, ErrorKind, Result};
 
 use crate::EngineeringProjection;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Disposable local projection store for resolved Engineering Graph state.
@@ -18,6 +18,14 @@ pub struct EngineeringProjectionStore {
     root: PathBuf,
     state: PathBuf,
     database: PathBuf,
+}
+
+/// One atomically-read Engineering projection and the Context Tree from which
+/// its persistent References were projected.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EngineeringProjectionSnapshot {
+    pub context_tree_oid: Option<String>,
+    pub projection: EngineeringProjection,
 }
 
 impl EngineeringProjectionStore {
@@ -61,7 +69,28 @@ impl EngineeringProjectionStore {
     /// Returns an invariant error for invalid/stale projection content and
     /// typed storage errors for transaction failures.
     pub fn rebuild(&self, projection: &EngineeringProjection) -> Result<()> {
+        self.rebuild_for_context_tree(projection, None)
+    }
+
+    /// Atomically replaces every derived row and binds it to the exact Context
+    /// Tree used to load its persistent Engineering References.
+    ///
+    /// A missing Tree is retained for compatibility with graph-only callers,
+    /// but Task Retrieval deliberately treats such a projection as unpinned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invariant error for an empty Tree or invalid/stale projection
+    /// content and typed storage errors for transaction failures.
+    pub fn rebuild_for_context_tree(
+        &self,
+        projection: &EngineeringProjection,
+        context_tree_oid: Option<&str>,
+    ) -> Result<()> {
         projection.validate()?;
+        if context_tree_oid.is_some_and(|tree| tree.trim().is_empty()) {
+            return Err(invariant("Engineering projection Context Tree is empty"));
+        }
         let mut connection = self.open_connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -74,9 +103,14 @@ impl EngineeringProjectionStore {
             .map_err(sql_error("clear Engineering projection metadata"))?;
         transaction
             .execute(
-                "INSERT INTO projection_meta (singleton, policy_version, artifact_generation)
-                 VALUES (1, ?1, ?2)",
-                params![projection.policy_version, projection.artifact_generation],
+                "INSERT INTO projection_meta (
+                    singleton, policy_version, artifact_generation, context_tree_oid
+                 ) VALUES (1, ?1, ?2, ?3)",
+                params![
+                    projection.policy_version,
+                    projection.artifact_generation,
+                    context_tree_oid
+                ],
             )
             .map_err(sql_error("write Engineering projection metadata"))?;
         for reference in &projection.references {
@@ -115,20 +149,36 @@ impl EngineeringProjectionStore {
     ///
     /// Returns an invariant error if any row carries an old generation.
     pub fn read_projection(&self) -> Result<Option<EngineeringProjection>> {
+        Ok(self.read_snapshot()?.map(|snapshot| snapshot.projection))
+    }
+
+    /// Reads one generation-consistent projection and its optional Context Tree
+    /// binding from a single `SQLite` transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invariant error if any row carries an old generation.
+    pub fn read_snapshot(&self) -> Result<Option<EngineeringProjectionSnapshot>> {
         let mut connection = self.open_connection()?;
         let transaction = connection
             .transaction()
             .map_err(sql_error("begin Engineering projection read"))?;
         let meta = transaction
             .query_row(
-                "SELECT policy_version, artifact_generation
+                "SELECT policy_version, artifact_generation, context_tree_oid
                  FROM projection_meta WHERE singleton = 1",
                 [],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .optional()
             .map_err(sql_error("read Engineering projection metadata"))?;
-        let Some((policy_version, artifact_generation)) = meta else {
+        let Some((policy_version, artifact_generation, context_tree_oid)) = meta else {
             transaction
                 .commit()
                 .map_err(sql_error("commit empty Engineering projection read"))?;
@@ -169,7 +219,10 @@ impl EngineeringProjectionStore {
         transaction
             .commit()
             .map_err(sql_error("commit Engineering projection read"))?;
-        Ok(Some(projection))
+        Ok(Some(EngineeringProjectionSnapshot {
+            context_tree_oid,
+            projection,
+        }))
     }
 
     /// Returns deterministic bytes for rebuild equivalence checks and diagnostics.
@@ -178,9 +231,9 @@ impl EngineeringProjectionStore {
     ///
     /// Returns typed projection read or serialization errors.
     pub fn canonical_bytes(&self) -> Result<Option<Vec<u8>>> {
-        self.read_projection()?
-            .map(|projection| {
-                serde_json::to_vec(&projection)
+        self.read_snapshot()?
+            .map(|snapshot| {
+                serde_json::to_vec(&(snapshot.context_tree_oid, snapshot.projection))
                     .map_err(json_error("serialize canonical Engineering projection"))
             })
             .transpose()
@@ -222,14 +275,15 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
             "CREATE TABLE IF NOT EXISTS projection_meta (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 policy_version TEXT NOT NULL,
-                artifact_generation TEXT NOT NULL
+                artifact_generation TEXT NOT NULL,
+                context_tree_oid TEXT
             ) STRICT;
             CREATE TABLE IF NOT EXISTS resolved_reference (
                 reference_id TEXT PRIMARY KEY,
                 artifact_generation TEXT NOT NULL,
                 payload_json TEXT NOT NULL CHECK (json_valid(payload_json))
             ) STRICT;
-            PRAGMA user_version = 1;",
+            PRAGMA user_version = 2;",
         )
         .map_err(sql_error("initialize Engineering projection schema"))
 }

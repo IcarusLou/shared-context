@@ -8,7 +8,7 @@ mod projection;
 mod resolver;
 mod scanner;
 
-pub use projection::EngineeringProjectionStore;
+pub use projection::{EngineeringProjectionSnapshot, EngineeringProjectionStore};
 pub use resolver::{
     CandidateMatchEvidence, EngineeringProjection, EngineeringReferenceResolver, MatchBasis,
     ProjectedEngineeringReference, ResolvedReferenceProjection,
