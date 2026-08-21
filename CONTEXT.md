@@ -52,6 +52,30 @@ _Avoid_: Space-scoped search result, manually routed Context Pack
 A typed explanation of how TaskIntent or a TaskSignal made one Context relevant. M2 paths describe Intent FTS, Context FTS, exact Applicability, or exact textual engineering hints; they must not claim an Engineering Graph edge that has not been resolved.
 _Avoid_: opaque relevance score, inferred code relation
 
+**RepositoryIdentity**:
+A stable identity for one logical source repository across local checkouts and machines. A Workspace path, branch, or Commit is never Repository identity.
+_Avoid_: checkout path, repository URL as identity
+
+**EngineeringReference**:
+A persistent, non-authoritative observation that Context relates to an engineering object through locator or fingerprint hints. It survives resolution failure and never claims that a current Artifact was found.
+_Avoid_: resolved Artifact, file identity
+
+**EngineeringArtifact**:
+A currently discovered Repository, Module, File, Symbol, API, Schema, or Test in an available engineering snapshot. It is derived state identified by a deterministic ArtifactKey and can be rebuilt.
+_Avoid_: Context fact, path identity
+
+**ArtifactResolution**:
+The current resolved, ambiguous, stale, unavailable, or unresolved interpretation of one EngineeringReference. It is derived state and may change without changing the Reference.
+_Avoid_: permanent link, knowledge fact
+
+**ContextArtifactAssociation**:
+A derived, explainable link between a Context revision and a resolved EngineeringArtifact. It can disappear or be recomputed without changing durable Context knowledge.
+_Avoid_: Context ownership, immutable relation
+
+**ContextRelation**:
+A stable knowledge edge between two Context revisions, such as dependency, constraint, implementation, validation, conflict, or supersession. Unlike engineering associations, it remains meaningful without access to source repositories.
+_Avoid_: inferred code edge, retrieval score
+
 **Workspace**:
 A location containing code or a repository that supplies TaskSignals about the current engineering scene. It does not identify a requirement, select a ContextSpace, or carry durable knowledge ownership.
 _Avoid_: Requirement, Space binding

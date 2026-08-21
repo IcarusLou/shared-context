@@ -4,19 +4,26 @@
 
 use std::fmt;
 
+mod engineering;
 mod episode;
 mod ids;
 mod model;
 mod reducer;
 mod task;
 
+pub use engineering::{
+    ArtifactAssociationKind, ArtifactKey, ArtifactKeyBasis, ArtifactKind, ArtifactRelationKind,
+    ArtifactResolution, ContentFingerprint, ContextArtifactAssociation, ContextRelation,
+    ContextRelationKind, EngineeringArtifact, EngineeringGraphEdge, EngineeringReference,
+    LocatorHints, ReferenceRelation, RepositoryIdentity, ResolutionStatus, SemanticFingerprint,
+};
 pub use episode::{
     ArtifactAction, ContextCandidate, ContextUseDisposition, WorkEpisode, WorkObservation,
 };
 pub use ids::{
     CandidateId, ConflictId, ContextId, EventId, EvidenceId, ExternalSessionId, IdParseError,
-    PublicationId, ResolutionId, ReviewId, RevisionId, SignalId, SpaceId, TaskId,
-    TaskIntentRevisionId, TaskSessionId, WorkEpisodeId,
+    PublicationId, ReferenceId, RepositoryId, ResolutionId, ReviewId, RevisionId, SignalId,
+    SpaceId, TaskId, TaskIntentRevisionId, TaskSessionId, WorkEpisodeId,
 };
 pub use model::{
     Applicability, ConflictParticipant, ConflictResolution, ConflictResolutionDraft,

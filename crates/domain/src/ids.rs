@@ -121,6 +121,16 @@ macro_rules! opaque_id {
 
 opaque_id!(SpaceId, "spc_", "Opaque identity of a `ContextSpace`.");
 opaque_id!(
+    RepositoryId,
+    "rpo_",
+    "Opaque identity of one logical source repository."
+);
+opaque_id!(
+    ReferenceId,
+    "ref_",
+    "Opaque identity of one persistent Engineering Reference observation."
+);
+opaque_id!(
     TaskId,
     "tsk_",
     "Opaque identity of an Agent engineering task."
@@ -192,8 +202,8 @@ mod tests {
 
     use super::{
         CandidateId, ConflictId, ContextId, EventId, EvidenceId, ExternalSessionId, PublicationId,
-        ResolutionId, ReviewId, RevisionId, SignalId, SpaceId, TaskId, TaskIntentRevisionId,
-        TaskSessionId, WorkEpisodeId,
+        ReferenceId, RepositoryId, ResolutionId, ReviewId, RevisionId, SignalId, SpaceId, TaskId,
+        TaskIntentRevisionId, TaskSessionId, WorkEpisodeId,
     };
 
     #[test]
@@ -230,6 +240,8 @@ mod tests {
         }
 
         assert_generated_id!(SpaceId::new(), "spc_");
+        assert_generated_id!(RepositoryId::new(), "rpo_");
+        assert_generated_id!(ReferenceId::new(), "ref_");
         assert_generated_id!(TaskId::new(), "tsk_");
         assert_generated_id!(TaskSessionId::new(), "tss_");
         assert_generated_id!(ExternalSessionId::new(), "xss_");
