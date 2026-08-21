@@ -1,6 +1,10 @@
 use std::{fs, process::Command};
 
-use sctx_domain::{ContextId, SpaceId, TaskId, TaskIntent, TaskSpaceAssociation, WorkEpisodeId};
+use sctx_domain::{
+    ContextId, ExternalSessionLocator, SpaceId, TaskId, TaskIntent, TaskSpaceAssociation,
+    WorkEpisodeId,
+};
+use sctx_task_runtime::TaskRuntime;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
@@ -111,6 +115,18 @@ fn candidate_create_is_the_unassigned_main_path_and_never_auto_injects() {
         .filter_map(|line| line.split_once('=').map(|(key, _)| key.trim()))
         .collect::<Vec<_>>();
     assert_eq!(config_keys, vec!["version", "store"]);
+
+    let mut authoritative = task_intent(TaskId::new());
+    authoritative.goal = "M1 Candidate".to_owned();
+    authoritative.desired_change = "retrieve confirmed Context only".to_owned();
+    TaskRuntime::initialize(home.join(".shared-context"))
+        .unwrap()
+        .open_or_create(
+            ExternalSessionLocator::new("codex", "m1-candidate-isolation").unwrap(),
+            authoritative,
+            vec![],
+        )
+        .unwrap();
 
     let pack = Command::new(binary)
         .arg("--json")

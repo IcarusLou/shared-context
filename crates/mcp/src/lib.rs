@@ -8,7 +8,7 @@
 //! writes only disposable local Task Runtime state.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fmt,
     io::{self, BufRead, Write},
     path::Path,
@@ -17,9 +17,10 @@ use std::{
 
 use sctx_domain::{
     Applicability, ContextId, ContextKind, ContextRevisionDraft, Error, ErrorKind,
-    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, Result, RevisionId, SpaceId,
-    TaskId, TaskIntent, TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignal,
-    TaskSpaceAssociation, WorkEpisodeId,
+    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, Result, RevisionId, SignalId,
+    SpaceId, TaskId, TaskIntent, TaskIntentDraft, TaskIntentRevisionId, TaskSessionId,
+    TaskSessionSnapshot, TaskSignal, TaskSignalLifecycle, TaskSignalRecord, TaskSpaceAssociation,
+    WorkEpisodeId,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
@@ -36,7 +37,79 @@ use serde_json::{Map, Value, json};
 /// Protocol version advertised when a client does not provide one.
 pub const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
-const MAX_INTENT_CONFLICT_RETRIES: usize = 32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskBoundary {
+    Continue,
+    New,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentMaturity {
+    Provisional,
+    Grounded,
+}
+
+/// Required nullable CAS field. Unlike `Option<T>`, an omitted field fails deserialization.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ExpectedRevisionId {
+    Revision(String),
+    Null(()),
+}
+
+impl ExpectedRevisionId {
+    fn as_deref(&self) -> Option<&str> {
+        match self {
+            Self::Revision(value) => Some(value),
+            Self::Null(()) => None,
+        }
+    }
+}
+
+/// Complete authoritative Task Intent update. Every field is required by transport.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskIntentUpdateInput {
+    pub agent_kind: String,
+    pub external_session_id: String,
+    pub task_boundary: TaskBoundary,
+    pub expected_revision_id: ExpectedRevisionId,
+    pub maturity: IntentMaturity,
+    pub intent: TaskIntentDraft,
+    pub evidence_refs: Vec<String>,
+}
+
+/// Stable-ID Signal lifecycle update guarded by active Task and Intent revision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskSignalSupersedeInput {
+    pub agent_kind: String,
+    pub external_session_id: String,
+    pub task_id: String,
+    pub expected_revision_id: String,
+    pub signal_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskIntentUpdateResponse {
+    #[serde(flatten)]
+    pub context: TaskContextResponse,
+    pub maturity: IntentMaturity,
+    pub evidence_refs: Vec<String>,
+    pub active_signals: Vec<TaskSignalRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskSignalSupersedeResponse {
+    pub task_session_id: TaskSessionId,
+    pub task_id: TaskId,
+    pub intent_revision_id: TaskIntentRevisionId,
+    pub superseded_signal_ids: Vec<SignalId>,
+    pub active_signals: Vec<TaskSignalRecord>,
+}
 
 /// Client fixture selected by the stable CLI entry point.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -253,60 +326,229 @@ impl Runtime {
         self.index.domain_snapshot()
     }
 
-    fn task_context(&self, input: &TaskContextInput) -> Result<TaskContextResponse> {
+    fn task_context_readonly(&self, input: &TaskContextInput) -> Result<TaskContextResponse> {
         input.validate()?;
-        let opened = self.tasks.open_or_create(
-            input.locator()?,
-            input.intent(TaskId::new()),
-            input.task_signals.clone(),
-        )?;
-        let desired_intent = input.intent(opened.snapshot.task_id);
-        let task_session_id = opened.snapshot.task_session_id;
-        self.converge_intent(opened.snapshot, &desired_intent)?;
-        let snapshot = self
-            .tasks
-            .merge_signals(task_session_id, input.task_signals.clone())?
-            .snapshot;
+        let locator = input.locator()?;
+        let snapshot = self.tasks.read_snapshot_by_locator(&locator)?.ok_or_else(|| {
+            invalid(
+                "legacy task_context is read-only and requires task_intent_update to establish an ActiveTask",
+            )
+        })?;
         build_task_context_response(&self.index, &snapshot, input.token_budget, input.max_spaces)
     }
 
-    fn converge_intent(
+    fn task_intent_update(
         &self,
-        mut snapshot: TaskSessionSnapshot,
-        desired_intent: &TaskIntent,
-    ) -> Result<()> {
-        for _ in 0..MAX_INTENT_CONFLICT_RETRIES {
-            let current = snapshot
-                .current_intent_revision()
-                .ok_or_else(|| invariant("Task Session has no current Intent revision"))?;
-            if current.intent == *desired_intent {
-                return Ok(());
+        input: &TaskIntentUpdateInput,
+    ) -> Result<TaskIntentUpdateResponse> {
+        let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
+        let active = self.tasks.read_snapshot_by_locator(&locator)?;
+        let snapshot = match input.task_boundary {
+            TaskBoundary::Continue => {
+                let active = active.ok_or_else(|| {
+                    invalid("task_boundary=continue requires an existing ActiveTask")
+                })?;
+                require_expected_revision(&active, input.expected_revision_id.as_deref())?;
+                validate_intent_update(input, &active.task_signals)?;
+                let parent = active
+                    .current_intent_revision()
+                    .ok_or_else(|| invariant("ActiveTask has no Intent Head"))?
+                    .revision_id;
+                self.tasks.append_intent_revision(
+                    active.task_session_id,
+                    parent,
+                    input.intent.bind(active.task_id),
+                )?;
+                self.tasks
+                    .read_snapshot(active.task_session_id)?
+                    .ok_or_else(|| invariant("updated ActiveTask disappeared"))?
             }
-            match self.tasks.append_intent_revision(
-                snapshot.task_session_id,
-                current.revision_id,
-                desired_intent.clone(),
-            ) {
-                Ok(_) => return Ok(()),
-                Err(error) if error.kind() == ErrorKind::InvalidInput => {
-                    snapshot = self
-                        .tasks
-                        .read_snapshot(snapshot.task_session_id)?
-                        .ok_or_else(|| invariant("Task Session disappeared during Intent retry"))?;
+            TaskBoundary::New => {
+                if let Some(active) = active {
+                    require_expected_revision(&active, input.expected_revision_id.as_deref())?;
+                    validate_intent_update(input, &[])?;
+                    self.tasks
+                        .start_new_task(&locator, active.task_id, &input.intent, Vec::new())?
+                        .snapshot
+                } else {
+                    if input.expected_revision_id.as_deref().is_some() {
+                        return Err(invalid(
+                            "expected_revision_id must be null when no ExternalSession exists",
+                        ));
+                    }
+                    validate_intent_update(input, &[])?;
+                    let task_id = TaskId::new();
+                    self.tasks
+                        .open_or_create(locator, input.intent.bind(task_id), Vec::new())?
+                        .snapshot
                 }
-                Err(error) => return Err(error),
             }
+        };
+        let context = build_task_context_response(
+            &self.index,
+            &snapshot,
+            default_token_budget(),
+            default_max_spaces(),
+        )?;
+        Ok(TaskIntentUpdateResponse {
+            active_signals: active_signal_records(&self.tasks, snapshot.task_session_id)?,
+            context,
+            maturity: input.maturity,
+            evidence_refs: input.evidence_refs.clone(),
+        })
+    }
+
+    fn task_signal_supersede(
+        &self,
+        input: &TaskSignalSupersedeInput,
+    ) -> Result<TaskSignalSupersedeResponse> {
+        let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
+        let active = self
+            .tasks
+            .read_snapshot_by_locator(&locator)?
+            .ok_or_else(|| invalid("ExternalSession has no ActiveTask"))?;
+        let task_id = input
+            .task_id
+            .parse::<TaskId>()
+            .map_err(|error| invalid(format!("invalid task_id: {error}")))?;
+        if task_id != active.task_id {
+            return Err(invalid("task_id does not identify the ActiveTask"));
         }
-        Err(Error::new(
-            ErrorKind::External,
-            "task runtime conflict did not converge after bounded retries",
-        ))
+        require_expected_revision(&active, Some(&input.expected_revision_id))?;
+        let signal_ids = input
+            .signal_ids
+            .iter()
+            .map(|value| {
+                value
+                    .parse::<SignalId>()
+                    .map_err(|error| invalid(format!("invalid signal_id: {error}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let outcome =
+            self.tasks
+                .supersede_signals(active.task_session_id, active.task_id, signal_ids)?;
+        let revision_id = outcome
+            .snapshot
+            .current_intent_revision()
+            .ok_or_else(|| invariant("ActiveTask has no Intent Head"))?
+            .revision_id;
+        Ok(TaskSignalSupersedeResponse {
+            task_session_id: active.task_session_id,
+            task_id: active.task_id,
+            intent_revision_id: revision_id,
+            superseded_signal_ids: outcome.superseded_signal_ids,
+            active_signals: active_signal_records(&self.tasks, active.task_session_id)?,
+        })
     }
 }
 
-/// Executes the same session-aware Task Context path used by MCP at an explicit
-/// installation root. This is the stable CLI test entry; it does not invoke an
-/// Agent Hook.
+fn require_expected_revision(
+    snapshot: &TaskSessionSnapshot,
+    expected: Option<&str>,
+) -> Result<TaskIntentRevisionId> {
+    let expected = expected.ok_or_else(|| {
+        invalid("expected_revision_id must be non-null when an ActiveTask exists")
+    })?;
+    let expected = expected
+        .parse::<TaskIntentRevisionId>()
+        .map_err(|error| invalid(format!("invalid expected_revision_id: {error}")))?;
+    let actual = snapshot
+        .current_intent_revision()
+        .ok_or_else(|| invariant("ActiveTask has no Intent Head"))?
+        .revision_id;
+    if expected != actual {
+        return Err(invalid(format!(
+            "expected_revision_id is stale; current Intent Head is {actual}"
+        )));
+    }
+    Ok(actual)
+}
+
+fn validate_intent_update(
+    input: &TaskIntentUpdateInput,
+    active_signals: &[TaskSignal],
+) -> Result<()> {
+    input.intent.validate()?;
+    if normalize_semantic(&input.intent.goal) == normalize_semantic(&input.intent.desired_change) {
+        return Err(invalid(
+            "intent.goal and intent.desired_change must be semantically distinct",
+        ));
+    }
+    let in_scope = normalized_values(&input.intent.in_scope);
+    let out_of_scope = normalized_values(&input.intent.out_of_scope);
+    if let Some(overlap) = in_scope.intersection(&out_of_scope).next() {
+        return Err(invalid(format!(
+            "intent.in_scope and intent.out_of_scope overlap: {overlap}"
+        )));
+    }
+    let evidence = validate_evidence_refs(&input.evidence_refs)?;
+    if input.maturity == IntentMaturity::Grounded && evidence.is_empty() {
+        return Err(invalid(
+            "maturity=grounded requires at least one evidence_ref",
+        ));
+    }
+    let signal_support = active_signals
+        .iter()
+        .map(|signal| normalize_semantic(&signal.content))
+        .collect::<HashSet<_>>();
+    for (field, values) in [
+        ("intent.artifacts", &input.intent.artifacts),
+        ("intent.interfaces", &input.intent.interfaces),
+    ] {
+        for value in values {
+            let normalized = normalize_semantic(value);
+            if !signal_support.contains(&normalized) && !evidence.contains(&normalized) {
+                return Err(invalid(format!(
+                    "{field} item lacks active TaskSignal or evidence_ref support: {value}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_evidence_refs(values: &[String]) -> Result<HashSet<String>> {
+    let mut normalized = HashSet::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let value = normalize_semantic(value);
+        if value.is_empty() {
+            return Err(invalid(format!("evidence_refs[{index}] must not be empty")));
+        }
+        if !normalized.insert(value) {
+            return Err(invalid("evidence_refs must not contain duplicates"));
+        }
+    }
+    Ok(normalized)
+}
+
+fn normalized_values(values: &[String]) -> HashSet<String> {
+    values
+        .iter()
+        .map(|value| normalize_semantic(value))
+        .collect()
+}
+
+fn normalize_semantic(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn active_signal_records(
+    runtime: &TaskRuntime,
+    task_session_id: TaskSessionId,
+) -> Result<Vec<TaskSignalRecord>> {
+    Ok(runtime
+        .read_signal_history(task_session_id)?
+        .into_iter()
+        .filter(|record| record.lifecycle == TaskSignalLifecycle::Active)
+        .collect())
+}
+
+/// Reads the same legacy read-only Task Context path used by MCP at an explicit
+/// installation root. It never creates or updates Task Runtime state.
 ///
 /// # Errors
 ///
@@ -315,7 +557,43 @@ pub fn task_context_at_root(
     root: impl AsRef<Path>,
     input: &TaskContextInput,
 ) -> Result<TaskContextResponse> {
-    Runtime::open(root.as_ref())?.task_context(input)
+    Runtime::open(root.as_ref())?.task_context_readonly(input)
+}
+
+/// Reads a Context Pack for an already-authoritative `ActiveTask` without mutation.
+///
+/// # Errors
+///
+/// Returns an input error when no strict Task Intent update established the Task.
+pub fn task_context_readonly_at_root(
+    root: impl AsRef<Path>,
+    input: &TaskContextInput,
+) -> Result<TaskContextResponse> {
+    Runtime::open(root.as_ref())?.task_context_readonly(input)
+}
+
+/// Applies an authoritative Task Intent CAS update and returns its new Context Pack.
+///
+/// # Errors
+///
+/// Returns typed validation, CAS, runtime, or Search errors.
+pub fn task_intent_update_at_root(
+    root: impl AsRef<Path>,
+    input: &TaskIntentUpdateInput,
+) -> Result<TaskIntentUpdateResponse> {
+    Runtime::open(root.as_ref())?.task_intent_update(input)
+}
+
+/// Supersedes active Signal IDs under exact Task and Intent CAS guards.
+///
+/// # Errors
+///
+/// Returns typed validation, CAS, or runtime errors.
+pub fn task_signal_supersede_at_root(
+    root: impl AsRef<Path>,
+    input: &TaskSignalSupersedeInput,
+) -> Result<TaskSignalSupersedeResponse> {
+    Runtime::open(root.as_ref())?.task_signal_supersede(input)
 }
 
 fn build_task_context_response(
@@ -522,6 +800,8 @@ impl McpServer {
         let call: ToolCall = serde_json::from_value(params)
             .map_err(|error| invalid(format!("invalid tools/call params: {error}")))?;
         let result = match call.name.as_str() {
+            "task_intent_update" => self.task_intent_update(call.arguments),
+            "task_signal_supersede" => self.task_signal_supersede(call.arguments),
             "task_context" => self.task_context(call.arguments),
             "context_search" => self.context_search(call.arguments),
             "context_get" => self.context_get(call.arguments),
@@ -562,7 +842,25 @@ impl McpServer {
         input.validate()?;
         let response = self
             .runtime
-            .task_context(&input)
+            .task_context_readonly(&input)
+            .map_err(ToolFailure::task_context_failed)?;
+        serde_json::to_value(response).map_err(serialization_failure)
+    }
+
+    fn task_intent_update(&self, arguments: Value) -> ToolResult {
+        let input: TaskIntentUpdateInput = decode_arguments(arguments)?;
+        let response = self
+            .runtime
+            .task_intent_update(&input)
+            .map_err(ToolFailure::task_context_failed)?;
+        serde_json::to_value(response).map_err(serialization_failure)
+    }
+
+    fn task_signal_supersede(&self, arguments: Value) -> ToolResult {
+        let input: TaskSignalSupersedeInput = decode_arguments(arguments)?;
+        let response = self
+            .runtime
+            .task_signal_supersede(&input)
             .map_err(ToolFailure::task_context_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
     }
@@ -873,8 +1171,18 @@ impl From<EvidenceInput> for EvidenceSnapshotDraft {
 fn tools_list() -> Value {
     json!({"tools": [
         tool_schema(
+            "task_intent_update",
+            "CAS-update a complete Task Intent, optionally start a new explicit Task, and return its TaskContextPack.",
+            task_intent_update_schema()
+        ),
+        tool_schema(
+            "task_signal_supersede",
+            "Supersede stable active Signal IDs under exact Task and Intent CAS guards.",
+            task_signal_supersede_schema()
+        ),
+        tool_schema(
             "task_context",
-            "Update one isolated Task Session and build an explainable multi-Space automatic Context Pack.",
+            "Legacy read-only Context Pack for an existing authoritative ActiveTask. Use task_intent_update for all updates.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -929,6 +1237,57 @@ fn tools_list() -> Value {
             json!({"type": "object", "additionalProperties": false, "properties": {}})
         )
     ]})
+}
+
+fn task_intent_update_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["agent_kind", "external_session_id", "task_boundary", "expected_revision_id", "maturity", "intent", "evidence_refs"],
+        "properties": {
+            "agent_kind": {"type": "string", "minLength": 1},
+            "external_session_id": {"type": "string", "minLength": 1},
+            "task_boundary": {"type": "string", "enum": ["continue", "new"]},
+            "expected_revision_id": {
+                "anyOf": [id_schema("tir_"), {"type": "null"}]
+            },
+            "maturity": {"type": "string", "enum": ["provisional", "grounded"]},
+            "intent": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["goal", "desired_change", "in_scope", "out_of_scope", "domains", "platforms", "constraints", "acceptance_conditions", "artifacts", "interfaces", "unknowns"],
+                "properties": {
+                    "goal": {"type": "string", "minLength": 1},
+                    "desired_change": {"type": "string", "minLength": 1},
+                    "in_scope": string_array_schema(),
+                    "out_of_scope": string_array_schema(),
+                    "domains": string_array_schema(),
+                    "platforms": string_array_schema(),
+                    "constraints": string_array_schema(),
+                    "acceptance_conditions": string_array_schema(),
+                    "artifacts": string_array_schema(),
+                    "interfaces": string_array_schema(),
+                    "unknowns": string_array_schema()
+                }
+            },
+            "evidence_refs": string_array_schema()
+        }
+    })
+}
+
+fn task_signal_supersede_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["agent_kind", "external_session_id", "task_id", "expected_revision_id", "signal_ids"],
+        "properties": {
+            "agent_kind": {"type": "string", "minLength": 1},
+            "external_session_id": {"type": "string", "minLength": 1},
+            "task_id": id_schema("tsk_"),
+            "expected_revision_id": id_schema("tir_"),
+            "signal_ids": {"type": "array", "minItems": 1, "items": id_schema("sig_")}
+        }
+    })
 }
 
 #[allow(clippy::needless_pass_by_value)]

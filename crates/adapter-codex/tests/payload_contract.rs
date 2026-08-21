@@ -2,7 +2,7 @@ use sctx_adapter_codex::{
     CanonicalAgentEventKind, ResolvedAgentAction, TrustState, capabilities, decode_hook_input,
     encode_hook_output,
 };
-use sctx_agent_adapter::{CapabilityMode, TaskRuntimeOperation, plan_action};
+use sctx_agent_adapter::{CapabilityMode, plan_action};
 use serde_json::Value;
 
 fn fixtures() -> Vec<Value> {
@@ -33,29 +33,16 @@ fn documented_codex_0_147_shapes_map_to_all_canonical_events() {
 }
 
 #[test]
-fn verified_and_trusted_codex_is_prompt_aware() {
+fn verified_and_trusted_codex_prompt_is_guidance_only() {
     let event = decode_hook_input(&serde_json::to_vec(&fixtures().remove(1)).unwrap()).unwrap();
     let capability = capabilities(Some("codex-cli 0.147.0"), true, TrustState::Confirmed);
     assert_eq!(capability.mode, CapabilityMode::VerifiedHooks);
     assert!(capability.prompt_aware_injection);
     let action = plan_action(&event, &capability);
-    let Some(TaskRuntimeOperation::Context {
-        locator,
-        intent,
-        task_signals,
-        ..
-    }) = action.task_operation
-    else {
-        panic!("verified Codex prompt must plan Task Context");
-    };
-    assert_eq!(locator.agent_kind, "codex");
-    assert_eq!(locator.external_session_id, "thr_real_shape_01");
-    assert_eq!(intent.goal, "implement the adapter");
-    assert!(
-        task_signals
-            .iter()
-            .any(|signal| signal.content == "implement the adapter")
-    );
+    assert!(action.task_operation.is_none());
+    assert!(action.system_message.as_deref().is_some_and(|message| {
+        message.contains("task_intent_update") && !message.contains("implement the adapter")
+    }));
 }
 
 #[test]

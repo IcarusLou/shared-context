@@ -41,7 +41,14 @@ fn cursor_prompt_hook_is_observable_but_never_an_injection_dependency() {
     assert_eq!(capability.mode, CapabilityMode::VerifiedHooks);
     assert!(capability.prompt_submit);
     assert!(!capability.prompt_aware_injection);
-    assert!(plan_action(&event, &capability).task_operation.is_none());
+    let action = plan_action(&event, &capability);
+    assert!(action.task_operation.is_none());
+    assert!(
+        action
+            .system_message
+            .as_deref()
+            .is_some_and(|message| message.contains("task_intent_update"))
+    );
 }
 
 #[test]

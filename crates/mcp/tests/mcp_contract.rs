@@ -7,14 +7,15 @@ use std::{
 
 use sctx_domain::{
     Applicability, ContextId, ContextKind, ContextRevisionDraft, EvidenceSnapshotDraft,
-    EvidenceType, IntentSnapshot, PublicationAction, PublicationDraft, RevisionId, SpaceId,
-    TaskSignal, TaskSignalKind, WorkEpisodeId,
+    EvidenceType, IntentSnapshot, PublicationAction, PublicationDraft, RevisionId, SpaceId, TaskId,
+    TaskIntentDraft, TaskSignal, TaskSignalKind, WorkEpisodeId,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_mcp::{
-    ClientKind, DisconnectReason, McpServer, TaskContextInput, TransportErrorKind,
-    task_context_at_root,
+    ClientKind, DisconnectReason, ExpectedRevisionId, IntentMaturity, McpServer, TaskBoundary,
+    TaskContextInput, TaskIntentUpdateInput, TaskSignalSupersedeInput, TransportErrorKind,
+    task_context_at_root, task_intent_update_at_root, task_signal_supersede_at_root,
 };
 use sctx_task_runtime::TaskRuntime;
 use serde_json::{Value, json};
@@ -147,6 +148,37 @@ fn task_arguments(agent_kind: &str, external_session_id: &str, goal: &str) -> Va
         "task_signals": [{"kind": "prompt", "content": goal}],
         "token_budget": 2000
     })
+}
+
+fn update_input(
+    external_session_id: &str,
+    task_boundary: TaskBoundary,
+    expected_revision_id: Option<String>,
+    maturity: IntentMaturity,
+    goal: &str,
+) -> TaskIntentUpdateInput {
+    TaskIntentUpdateInput {
+        agent_kind: "codex".to_owned(),
+        external_session_id: external_session_id.to_owned(),
+        task_boundary,
+        expected_revision_id: expected_revision_id
+            .map_or(ExpectedRevisionId::Null(()), ExpectedRevisionId::Revision),
+        maturity,
+        intent: TaskIntentDraft {
+            goal: goal.to_owned(),
+            desired_change: format!("Deliver verified {goal}"),
+            in_scope: vec!["MCP".to_owned()],
+            out_of_scope: vec![],
+            domains: vec!["mcp".to_owned()],
+            platforms: vec![],
+            constraints: vec![],
+            acceptance_conditions: vec!["The Task Context Pack is returned".to_owned()],
+            artifacts: vec![],
+            interfaces: vec![],
+            unknowns: vec![],
+        },
+        evidence_refs: vec![],
+    }
 }
 
 fn append(store: &GitStore, event: Event) {
@@ -283,15 +315,15 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
             ),
             tool_call(
                 5,
-                "task_context",
-                task_arguments(
-                    match client {
-                        ClientKind::Cursor => "cursor",
-                        ClientKind::Codex => "codex",
-                    },
+                "task_intent_update",
+                serde_json::to_value(update_input(
                     "stdio-contract",
+                    TaskBoundary::New,
+                    None,
+                    IntentMaturity::Provisional,
                     "verify stdio MCP contract",
-                ),
+                ))
+                .unwrap(),
             ),
             tool_call(
                 6,
@@ -305,7 +337,7 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
 
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 7);
         let names = tools
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
@@ -313,12 +345,27 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
         assert_eq!(
             names,
             [
+                "task_intent_update",
+                "task_signal_supersede",
                 "task_context",
                 "context_search",
                 "context_get",
                 "candidate_create",
                 "space_list"
             ]
+        );
+        let update_schema = &tools
+            .iter()
+            .find(|tool| tool["name"] == "task_intent_update")
+            .unwrap()["inputSchema"];
+        assert_eq!(update_schema["additionalProperties"], false);
+        assert_eq!(update_schema["required"].as_array().unwrap().len(), 7);
+        assert_eq!(
+            update_schema["properties"]["intent"]["required"]
+                .as_array()
+                .unwrap()
+                .len(),
+            11
         );
         let candidate_schema = &tools
             .iter()
@@ -490,8 +537,19 @@ fn task_context_rejects_unsafe_budget_or_space_bounds() {
 }
 
 #[test]
-fn task_context_evolves_one_session_without_duplicate_intent_revisions() {
+fn legacy_task_context_is_read_only_for_an_authoritative_session() {
     let fixture = Fixture::new();
+    let authoritative = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            "evolving-session",
+            TaskBoundary::New,
+            None,
+            IntentMaturity::Provisional,
+            "verify MCP context",
+        ),
+    )
+    .unwrap();
     let first = task_arguments("codex", "evolving-session", "verify MCP context");
     let mut same_intent_new_signal = first.clone();
     same_intent_new_signal["task_signals"] = json!([
@@ -529,19 +587,72 @@ fn task_context_evolves_one_session_without_duplicate_intent_revisions() {
         packs[0]["intent_revision_id"],
         packs[1]["intent_revision_id"]
     );
-    assert_ne!(
-        packs[1]["intent_revision_id"],
-        packs[2]["intent_revision_id"]
-    );
     assert_eq!(
-        packs[2]["intent_revision_id"],
-        packs[3]["intent_revision_id"]
+        packs[0]["intent_revision_id"],
+        authoritative.context.intent_revision_id.to_string()
     );
+    assert!(packs.iter().all(|pack| {
+        pack["intent_revision_id"] == authoritative.context.intent_revision_id.to_string()
+    }));
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn different_sessions_with_the_same_workspace_signal_remain_isolated() {
     let fixture = Fixture::new();
+    let frontend_authoritative = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            "frontend-session",
+            TaskBoundary::New,
+            None,
+            IntentMaturity::Provisional,
+            "frontend MCP context",
+        ),
+    )
+    .unwrap();
+    let backend_authoritative = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            "backend-session",
+            TaskBoundary::New,
+            None,
+            IntentMaturity::Provisional,
+            "backend MCP context",
+        ),
+    )
+    .unwrap();
+    let runtime = TaskRuntime::initialize(&fixture.root).unwrap();
+    runtime
+        .merge_signals(
+            frontend_authoritative.context.task_session_id,
+            vec![
+                TaskSignal {
+                    kind: TaskSignalKind::Workspace,
+                    content: "/work/shared".to_owned(),
+                },
+                TaskSignal {
+                    kind: TaskSignalKind::File,
+                    content: "web/Search.tsx".to_owned(),
+                },
+            ],
+        )
+        .unwrap();
+    runtime
+        .merge_signals(
+            backend_authoritative.context.task_session_id,
+            vec![
+                TaskSignal {
+                    kind: TaskSignalKind::Workspace,
+                    content: "/work/shared".to_owned(),
+                },
+                TaskSignal {
+                    kind: TaskSignalKind::Api,
+                    content: "search-v2".to_owned(),
+                },
+            ],
+        )
+        .unwrap();
     let mut frontend = task_arguments("codex", "frontend-session", "frontend MCP context");
     frontend["task_signals"] = json!([
         {"kind": "workspace", "content": "/work/shared"},
@@ -566,7 +677,6 @@ fn different_sessions_with_the_same_workspace_signal_remain_isolated() {
 
     assert_ne!(frontend["task_session_id"], backend["task_session_id"]);
     assert_ne!(frontend["task_id"], backend["task_id"]);
-    let runtime = TaskRuntime::initialize(&fixture.root).unwrap();
     let frontend_snapshot = runtime
         .read_snapshot(
             frontend["task_session_id"]
@@ -608,33 +718,36 @@ fn different_sessions_with_the_same_workspace_signal_remain_isolated() {
 }
 
 #[test]
-fn concurrent_same_session_calls_converge_without_lost_signals_or_extra_heads() {
+fn concurrent_legacy_reads_do_not_mutate_the_authoritative_task() {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
     let fixture = Fixture::new();
+    let created = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            "concurrent-session",
+            TaskBoundary::New,
+            None,
+            IntentMaturity::Provisional,
+            "concurrent MCP context",
+        ),
+    )
+    .unwrap();
     let worker_count = 8;
     let barrier = Arc::new(Barrier::new(worker_count));
     let root = Arc::new(fixture.root.clone());
     let mut workers = Vec::new();
-    for index in 0..worker_count {
+    for _ in 0..worker_count {
         let root = Arc::clone(&root);
         let barrier = Arc::clone(&barrier);
         workers.push(thread::spawn(move || {
-            let mut input: TaskContextInput = serde_json::from_value(task_arguments(
+            let input: TaskContextInput = serde_json::from_value(task_arguments(
                 "codex",
                 "concurrent-session",
                 "concurrent MCP context",
             ))
             .unwrap();
-            input.task_signals.push(TaskSignal {
-                kind: TaskSignalKind::Workspace,
-                content: "/work/shared".to_owned(),
-            });
-            input.task_signals.push(TaskSignal {
-                kind: TaskSignalKind::File,
-                content: format!("src/file-{index}.rs"),
-            });
             barrier.wait();
             task_context_at_root(root.as_path(), &input).unwrap()
         }));
@@ -666,7 +779,8 @@ fn concurrent_same_session_calls_converge_without_lost_signals_or_extra_heads() 
         .unwrap()
         .unwrap();
     assert_eq!(snapshot.intent_revisions.len(), 1);
-    assert_eq!(snapshot.task_signals.len(), worker_count + 2);
+    assert!(snapshot.task_signals.is_empty());
+    assert_eq!(snapshot.task_id, created.context.task_id);
     assert!(snapshot.validate().is_ok());
 }
 
@@ -702,6 +816,347 @@ fn task_context_runtime_storage_failure_is_typed() {
 }
 
 #[test]
+fn task_intent_update_supports_provisional_grounded_continue_and_explicit_new() {
+    let fixture = Fixture::new();
+    let provisional = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            "intent-lifecycle",
+            TaskBoundary::New,
+            None,
+            IntentMaturity::Provisional,
+            "MCP provisional intent",
+        ),
+    )
+    .unwrap();
+    assert_eq!(provisional.maturity, IntentMaturity::Provisional);
+    assert_eq!(provisional.context.tree.len(), 40);
+
+    let mut grounded_input = update_input(
+        "intent-lifecycle",
+        TaskBoundary::Continue,
+        Some(provisional.context.intent_revision_id.to_string()),
+        IntentMaturity::Grounded,
+        "MCP grounded intent",
+    );
+    grounded_input.evidence_refs = vec!["validation:mcp-contract".to_owned()];
+    let grounded = task_intent_update_at_root(&fixture.root, &grounded_input).unwrap();
+    assert_eq!(grounded.context.task_id, provisional.context.task_id);
+    assert_ne!(
+        grounded.context.intent_revision_id,
+        provisional.context.intent_revision_id
+    );
+    assert_eq!(grounded.maturity, IntentMaturity::Grounded);
+
+    let next = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            "intent-lifecycle",
+            TaskBoundary::New,
+            Some(grounded.context.intent_revision_id.to_string()),
+            IntentMaturity::Provisional,
+            "unrelated banana task",
+        ),
+    )
+    .unwrap();
+    assert_ne!(next.context.task_id, grounded.context.task_id);
+    assert!(next.active_signals.is_empty());
+    let external = TaskRuntime::initialize(&fixture.root)
+        .unwrap()
+        .read_external_session_by_locator(
+            &sctx_domain::ExternalSessionLocator::new("codex", "intent-lifecycle").unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(external.tasks.len(), 2);
+    assert_eq!(external.active_task_id, next.context.task_id);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn task_intent_update_enforces_cas_complete_shape_and_semantic_evidence() {
+    let fixture = Fixture::new();
+    let complete = serde_json::to_value(update_input(
+        "shape-validation",
+        TaskBoundary::New,
+        None,
+        IntentMaturity::Provisional,
+        "complete shape",
+    ))
+    .unwrap();
+    for field in [
+        "in_scope",
+        "out_of_scope",
+        "domains",
+        "platforms",
+        "constraints",
+        "acceptance_conditions",
+        "artifacts",
+        "interfaces",
+        "unknowns",
+    ] {
+        let mut missing = complete.clone();
+        missing["intent"].as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<TaskIntentUpdateInput>(missing).is_err());
+    }
+    let mut missing_expected = complete;
+    missing_expected
+        .as_object_mut()
+        .unwrap()
+        .remove("expected_revision_id");
+    assert!(serde_json::from_value::<TaskIntentUpdateInput>(missing_expected).is_err());
+
+    let created = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            "intent-validation",
+            TaskBoundary::New,
+            None,
+            IntentMaturity::Provisional,
+            "validated goal",
+        ),
+    )
+    .unwrap();
+    let stale = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            "intent-validation",
+            TaskBoundary::Continue,
+            Some(sctx_domain::TaskIntentRevisionId::new().to_string()),
+            IntentMaturity::Provisional,
+            "retry goal",
+        ),
+    )
+    .unwrap_err();
+    assert!(stale.message().contains("stale"));
+
+    let mut duplicate = update_input(
+        "intent-validation",
+        TaskBoundary::Continue,
+        Some(created.context.intent_revision_id.to_string()),
+        IntentMaturity::Provisional,
+        " Same   Goal ",
+    );
+    duplicate.intent.desired_change = "same goal".to_owned();
+    assert!(
+        task_intent_update_at_root(&fixture.root, &duplicate)
+            .unwrap_err()
+            .message()
+            .contains("semantically distinct")
+    );
+
+    let mut overlap = duplicate.clone();
+    overlap.intent.goal = "different goal".to_owned();
+    overlap.intent.desired_change = "different change".to_owned();
+    overlap.intent.in_scope = vec![" Search API ".to_owned()];
+    overlap.intent.out_of_scope = vec!["search   api".to_owned()];
+    assert!(
+        task_intent_update_at_root(&fixture.root, &overlap)
+            .unwrap_err()
+            .message()
+            .contains("overlap")
+    );
+
+    let mut unsupported = overlap;
+    unsupported.intent.out_of_scope.clear();
+    unsupported.intent.artifacts = vec!["symbol:Missing".to_owned()];
+    unsupported.intent.interfaces = vec!["api:Missing".to_owned()];
+    assert!(
+        task_intent_update_at_root(&fixture.root, &unsupported)
+            .unwrap_err()
+            .message()
+            .contains("lacks active TaskSignal")
+    );
+    unsupported.evidence_refs = vec!["symbol:Missing".to_owned(), "api:Missing".to_owned()];
+    assert!(task_intent_update_at_root(&fixture.root, &unsupported).is_ok());
+
+    let missing_array = json!({
+        "agent_kind": "codex",
+        "external_session_id": "missing-field",
+        "task_boundary": "new",
+        "expected_revision_id": null,
+        "maturity": "provisional",
+        "intent": {
+            "goal": "missing arrays",
+            "desired_change": "reject incomplete shape",
+            "in_scope": [], "out_of_scope": [], "domains": [], "platforms": [],
+            "constraints": [], "acceptance_conditions": [], "artifacts": [],
+            "interfaces": []
+        },
+        "evidence_refs": []
+    });
+    let responses = run_session(
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::Newline,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(2, "task_intent_update", missing_array),
+        ],
+    );
+    assert_eq!(responses[1]["result"]["isError"], true);
+    assert_eq!(
+        responses[1]["result"]["structuredContent"]["error"]["code"],
+        "invalid_input"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn signal_supersede_is_cas_guarded_and_removed_from_paths_but_retained_in_history() {
+    let fixture = Fixture::new();
+    let created = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            "signal-supersede",
+            TaskBoundary::New,
+            None,
+            IntentMaturity::Provisional,
+            "MCP Signal Context",
+        ),
+    )
+    .unwrap();
+    let runtime = TaskRuntime::initialize(&fixture.root).unwrap();
+    let merged = runtime
+        .merge_signals(
+            created.context.task_session_id,
+            vec![TaskSignal {
+                kind: TaskSignalKind::File,
+                content: "MCP Contract".to_owned(),
+            }],
+        )
+        .unwrap();
+    let signal_id = merged.inserted_signal_ids[0];
+    let superseded = task_signal_supersede_at_root(
+        &fixture.root,
+        &TaskSignalSupersedeInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: "signal-supersede".to_owned(),
+            task_id: created.context.task_id.to_string(),
+            expected_revision_id: created.context.intent_revision_id.to_string(),
+            signal_ids: vec![signal_id.to_string()],
+        },
+    )
+    .unwrap();
+    assert!(superseded.active_signals.is_empty());
+    let history = runtime
+        .read_signal_history(created.context.task_session_id)
+        .unwrap();
+    assert_eq!(history[0].signal_id, signal_id);
+    assert_eq!(
+        history[0].lifecycle,
+        sctx_domain::TaskSignalLifecycle::Superseded
+    );
+
+    let wrong_task = task_signal_supersede_at_root(
+        &fixture.root,
+        &TaskSignalSupersedeInput {
+            task_id: TaskId::new().to_string(),
+            ..TaskSignalSupersedeInput {
+                agent_kind: "codex".to_owned(),
+                external_session_id: "signal-supersede".to_owned(),
+                task_id: created.context.task_id.to_string(),
+                expected_revision_id: created.context.intent_revision_id.to_string(),
+                signal_ids: vec![signal_id.to_string()],
+            }
+        },
+    )
+    .unwrap_err();
+    assert!(wrong_task.message().contains("ActiveTask"));
+
+    let other = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            "other-signal-session",
+            TaskBoundary::New,
+            None,
+            IntentMaturity::Provisional,
+            "other signal task",
+        ),
+    )
+    .unwrap();
+    let other_signal = runtime
+        .merge_signals(
+            other.context.task_session_id,
+            vec![TaskSignal {
+                kind: TaskSignalKind::File,
+                content: "src/other.rs".to_owned(),
+            }],
+        )
+        .unwrap()
+        .inserted_signal_ids[0];
+    let wrong_signal = task_signal_supersede_at_root(
+        &fixture.root,
+        &TaskSignalSupersedeInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: "signal-supersede".to_owned(),
+            task_id: created.context.task_id.to_string(),
+            expected_revision_id: created.context.intent_revision_id.to_string(),
+            signal_ids: vec![other_signal.to_string()],
+        },
+    )
+    .unwrap_err();
+    assert!(wrong_signal.message().contains("supplied Task Session"));
+
+    let after = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            "signal-supersede",
+            TaskBoundary::Continue,
+            Some(created.context.intent_revision_id.to_string()),
+            IntentMaturity::Provisional,
+            "MCP Signal Context after supersede",
+        ),
+    )
+    .unwrap();
+    let encoded_paths = serde_json::to_string(&after.context.retrieval_paths).unwrap();
+    assert!(!encoded_paths.contains("MCP Contract"));
+}
+
+#[test]
+fn shared_context_skill_contract_drives_mcp_runtime_and_search_response() {
+    let fixture = Fixture::new();
+    let skill = fs::read_to_string("../../skills/shared-context/SKILL.md")
+        .or_else(|_| fs::read_to_string("skills/shared-context/SKILL.md"))
+        .unwrap();
+    for required in [
+        "expected_revision_id",
+        "maturity",
+        "evidence_refs",
+        "active_signals",
+    ] {
+        assert!(skill.contains(required));
+    }
+    let arguments = serde_json::to_value(update_input(
+        "skill-e2e",
+        TaskBoundary::New,
+        None,
+        IntentMaturity::Provisional,
+        "MCP Contract",
+    ))
+    .unwrap();
+    let responses = run_session(
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::Newline,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(2, "task_intent_update", arguments),
+        ],
+    );
+    let data = &responses[1]["result"]["structuredContent"];
+    assert_eq!(responses[1]["result"]["isError"], false);
+    assert!(data["task_id"].as_str().unwrap().starts_with("tsk_"));
+    assert!(
+        data["intent_revision_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("tir_")
+    );
+    assert!(data["candidate_spaces"].as_array().is_some());
+    assert!(data["items"].as_array().is_some());
+    assert!(data["tree"].as_str().is_some());
+}
+
+#[test]
 fn candidate_create_retries_are_strict_and_unassigned_candidates_are_not_retrieved() {
     let fixture = Fixture::new();
     let source_episode_id = WorkEpisodeId::new();
@@ -733,12 +1188,15 @@ fn candidate_create_retries_are_strict_and_unassigned_candidates_are_not_retriev
             ),
             tool_call(
                 6,
-                "task_context",
-                task_arguments(
-                    "codex",
+                "task_intent_update",
+                serde_json::to_value(update_input(
                     "candidate-isolation",
+                    TaskBoundary::New,
+                    None,
+                    IntentMaturity::Provisional,
                     "hidden MCP episode knowledge",
-                ),
+                ))
+                .unwrap(),
             ),
         ],
     );

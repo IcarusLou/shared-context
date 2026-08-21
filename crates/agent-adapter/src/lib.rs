@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use sctx_domain::{Error, ErrorKind, ExternalSessionLocator, Result, TaskSignal, TaskSignalKind};
+use sctx_domain::{Error, ErrorKind, ExternalSessionLocator, Result, TaskSignal};
 use sctx_search::{ContextStatus, TaskContextPack};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -281,25 +281,6 @@ pub struct AgentTaskIntentDraft {
     pub unknowns: Vec<String>,
 }
 
-impl AgentTaskIntentDraft {
-    fn from_prompt(prompt: &str) -> Self {
-        let prompt = prompt.trim().to_owned();
-        Self {
-            goal: prompt.clone(),
-            desired_change: prompt,
-            in_scope: Vec::new(),
-            out_of_scope: Vec::new(),
-            domains: Vec::new(),
-            platforms: Vec::new(),
-            constraints: Vec::new(),
-            acceptance_conditions: Vec::new(),
-            artifacts: Vec::new(),
-            interfaces: Vec::new(),
-            unknowns: Vec::new(),
-        }
-    }
-}
-
 /// Typed local Task Runtime work planned from one canonical Agent event.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
@@ -359,24 +340,13 @@ pub fn plan_action(
                     .to_owned(),
             ),
         },
-        CanonicalAgentEvent::PromptSubmit { context, prompt }
-            if capabilities.prompt_aware_injection =>
-        {
-            CanonicalAgentAction {
-                task_operation: Some(TaskRuntimeOperation::Context {
-                    locator: task_locator(capabilities.agent, context),
-                    intent: AgentTaskIntentDraft::from_prompt(prompt),
-                    task_signals: prompt_task_signals(context, prompt),
-                    token_budget: 2_000,
-                }),
-                breadcrumb: None,
-                system_message: None,
-            }
-        }
         CanonicalAgentEvent::PromptSubmit { .. } => CanonicalAgentAction {
             task_operation: None,
             breadcrumb: None,
-            system_message: None,
+            system_message: Some(
+                "Shared Context PromptEnvelope received. No Task Intent was inferred from prompt text. Use $shared-context and task_intent_update before precise retrieval."
+                    .to_owned(),
+            ),
         },
         CanonicalAgentEvent::PostToolUse {
             context,
@@ -441,26 +411,6 @@ fn task_locator(agent: AgentKind, context: &AgentEventContext) -> ExternalSessio
         .to_owned(),
         external_session_id: context.session_id.clone(),
     }
-}
-
-fn prompt_task_signals(context: &AgentEventContext, prompt: &str) -> Vec<TaskSignal> {
-    let mut signals = vec![TaskSignal {
-        kind: TaskSignalKind::Prompt,
-        content: prompt.trim().to_owned(),
-    }];
-    let roots = if context.workspace_roots.is_empty() {
-        std::slice::from_ref(&context.cwd)
-    } else {
-        &context.workspace_roots
-    };
-    signals.extend(roots.iter().filter_map(|root| {
-        let workspace = root.to_string_lossy().trim().to_owned();
-        (!workspace.is_empty()).then_some(TaskSignal {
-            kind: TaskSignalKind::Workspace,
-            content: workspace,
-        })
-    }));
-    signals
 }
 
 fn workspace_hint(context: &AgentEventContext) -> Option<PathBuf> {
@@ -667,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_policy_never_queries_on_start_and_preserves_supported_prompt_queries() {
+    fn lifecycle_policy_never_infers_task_intent_from_prompt_envelopes() {
         let context = AgentEventContext {
             session_id: "session".to_owned(),
             cwd: PathBuf::from("/workspace"),
@@ -706,27 +656,18 @@ mod tests {
         };
         assert!(plan_action(&prompt, &cursor).task_operation.is_none());
         let prompt_action = plan_action(&prompt, &codex);
-        let Some(TaskRuntimeOperation::Context {
-            locator,
-            intent,
-            task_signals,
-            ..
-        }) = prompt_action.task_operation.as_ref()
-        else {
-            panic!("supported Codex PromptSubmit must plan Task Context");
-        };
-        assert_eq!(locator.agent_kind, "codex");
-        assert_eq!(locator.external_session_id, "session");
-        assert_eq!(intent.goal, "task");
-        assert!(task_signals.contains(&TaskSignal {
-            kind: TaskSignalKind::Prompt,
-            content: "task".to_owned(),
-        }));
-        assert!(task_signals.contains(&TaskSignal {
-            kind: TaskSignalKind::Workspace,
-            content: "/workspace".to_owned(),
-        }));
-        assert!(prompt_action.system_message.is_none());
+        assert!(prompt_action.task_operation.is_none());
+        assert!(
+            prompt_action
+                .system_message
+                .as_deref()
+                .is_some_and(|message| {
+                    message.contains("PromptEnvelope")
+                        && message.contains("$shared-context")
+                        && message.contains("task_intent_update")
+                        && !message.contains("\"task\"")
+                })
+        );
         assert!(prompt_action.breadcrumb.is_none());
 
         let post_tool = CanonicalAgentEvent::PostToolUse {

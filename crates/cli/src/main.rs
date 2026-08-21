@@ -34,7 +34,9 @@ use sctx_index::{
     DomainSnapshot, IndexMetadata, ProjectionDiagnosticView, ProjectionIndex, RebuildOutcome,
 };
 use sctx_local_state::{Breadcrumb, BreadcrumbKind, CaptureStore};
-use sctx_mcp::{TaskContextInput, TaskContextResponse};
+use sctx_mcp::{
+    TaskContextInput, TaskContextResponse, TaskIntentUpdateInput, TaskSignalSupersedeInput,
+};
 use sctx_search::{
     ContextPackMode, ContextStatus, ScopeFilter, SearchEngine, SearchFilters, SearchRequest,
     TaskContextPack,
@@ -60,7 +62,7 @@ Commands:
   candidate create
   context revise|review|publish|withdraw|get
   semantic conflict open|resolve
-  task context
+  task context (read-only)|intent update|signal supersede
   search
   index rebuild|status
   pending list|commit|move-aside
@@ -615,10 +617,8 @@ fn verify_demo_mcp(
         .and_then(|response| response.pointer("/result/tools"))
         .and_then(Value::as_array)
         .ok_or_else(|| invariant("demo MCP tools/list response is missing"))?;
-    if tools.len() != 5 {
-        return Err(invariant(
-            "demo MCP tools/list did not return five V1 tools",
-        ));
+    if tools.len() != 7 {
+        return Err(invariant("demo MCP tools/list did not return seven tools"));
     }
     let results = responses
         .get(2)
@@ -771,7 +771,7 @@ fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<Option<Stri
                 enrich_local_prompt_signals(task_signals),
                 token_budget,
             );
-            let response = sctx_mcp::task_context_at_root(installation_root()?, &input)?;
+            let response = sctx_mcp::task_context_readonly_at_root(installation_root()?, &input)?;
             let pack = render_untrusted_task_context_pack(&task_pack(response))?;
             Ok(Some(format!(
                 concat!(
@@ -1679,13 +1679,47 @@ fn run_search(args: &[String], json_output: bool) -> Result<()> {
 }
 
 fn run_task(args: &[String], json_output: bool) -> Result<()> {
-    let [command, rest @ ..] = args else {
-        return Err(invalid("Usage: sctx task context [OPTIONS]"));
-    };
-    if command != "context" {
-        return Err(invalid("task command must be context"));
+    match args {
+        [command, rest @ ..] if command == "context" => run_task_context(rest, json_output),
+        [group, command, rest @ ..] if group == "intent" && command == "update" => {
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(&["--input"], &[])?;
+            let input: TaskIntentUpdateInput =
+                read_json(options.required("--input")?, "Task Intent update")?;
+            let response = sctx_mcp::task_intent_update_at_root(installation_root()?, &input)?;
+            let data = serde_json::to_value(&response)
+                .map_err(json_error("serialize Task Intent update response"))?;
+            emit_raw(
+                "task.intent.update",
+                &response.context.tree,
+                response.context.generation,
+                &data,
+                json_output,
+            )
+        }
+        [group, command, rest @ ..] if group == "signal" && command == "supersede" => {
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(&["--input"], &[])?;
+            let input: TaskSignalSupersedeInput =
+                read_json(options.required("--input")?, "Task Signal supersede")?;
+            let response = sctx_mcp::task_signal_supersede_at_root(installation_root()?, &input)?;
+            let active = sctx_task_runtime::TaskRuntime::initialize(installation_root()?)?
+                .read_snapshot(response.task_session_id)?
+                .ok_or_else(|| invariant("updated ActiveTask disappeared"))?;
+            let metadata = Runtime::open()?.index.synchronize()?.metadata;
+            let data = serde_json::to_value(&response)
+                .map_err(json_error("serialize Task Signal supersede response"))?;
+            debug_assert_eq!(active.task_id, response.task_id);
+            emit("task.signal.supersede", &metadata, data, json_output)
+        }
+        _ => Err(invalid(
+            "Usage: sctx task context|intent update|signal supersede [OPTIONS]",
+        )),
     }
-    let options = Options::parse(rest, &[])?;
+}
+
+fn run_task_context(args: &[String], json_output: bool) -> Result<()> {
+    let options = Options::parse(args, &[])?;
     options.allow_only(
         &[
             "--agent-kind",
@@ -1739,7 +1773,7 @@ fn run_task(args: &[String], json_output: bool) -> Result<()> {
             "max spaces",
         )?,
     };
-    let response = sctx_mcp::task_context_at_root(installation_root()?, &input)?;
+    let response = sctx_mcp::task_context_readonly_at_root(installation_root()?, &input)?;
     let data =
         serde_json::to_value(&response).map_err(json_error("serialize Task Context response"))?;
     emit_raw(

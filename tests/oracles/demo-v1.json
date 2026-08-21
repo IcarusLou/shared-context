@@ -19,6 +19,8 @@
     "evidence_fixture": "sctx.demo.v1"
   },
   "mcp_tools": [
+    "task_intent_update",
+    "task_signal_supersede",
     "task_context",
     "context_search",
     "context_get",

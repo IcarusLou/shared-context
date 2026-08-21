@@ -10,10 +10,14 @@ use std::{
 use sctx_domain::{
     Applicability, ContextKind, ContextRevisionDraft, Error, ErrorKind, EventId,
     EvidenceSnapshotDraft, ExternalSessionLocator, IntentSnapshot, PublicationAction,
-    PublicationDraft, Result, SpaceId, TaskSignalKind, WorkEpisodeId,
+    PublicationDraft, Result, SpaceId, TaskIntentDraft, TaskSignalKind, WorkEpisodeId,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CrashInjector, CrashSeam, GitStore};
+use sctx_mcp::{
+    ExpectedRevisionId, IntentMaturity, TaskBoundary, TaskIntentUpdateInput,
+    task_intent_update_at_root,
+};
 use sctx_task_runtime::TaskRuntime;
 use serde_json::Value;
 use tempfile::{TempDir, tempdir};
@@ -193,6 +197,34 @@ fn create_candidate(harness: &Harness, episode_id: &str, statement: &str) -> Val
     ])
 }
 
+fn establish_cli_task(harness: &Harness, session: &str, goal: &str, desired_change: &str) {
+    task_intent_update_at_root(
+        harness.root(),
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            task_boundary: TaskBoundary::New,
+            expected_revision_id: ExpectedRevisionId::Null(()),
+            maturity: IntentMaturity::Provisional,
+            intent: TaskIntentDraft {
+                goal: goal.to_owned(),
+                desired_change: desired_change.to_owned(),
+                in_scope: vec![],
+                out_of_scope: vec![],
+                domains: vec![],
+                platforms: vec![],
+                constraints: vec![],
+                acceptance_conditions: vec![],
+                artifacts: vec![],
+                interfaces: vec![],
+                unknowns: vec![],
+            },
+            evidence_refs: vec![],
+        },
+    )
+    .unwrap();
+}
+
 fn approve_publish(harness: &Harness, space_id: &str, statement: &str) -> Published {
     let (context_id, revision_id) = seed_context(harness, space_id, statement);
     let review = harness.success(&[
@@ -340,7 +372,7 @@ fn hook_capabilities_expose_version_fallback_and_codex_trust_action() {
 }
 
 #[test]
-fn session_start_emits_only_capabilities_while_prompt_retrieves_task_context() {
+fn session_start_and_prompt_submit_emit_capabilities_without_inferred_context() {
     let harness = Harness::new();
     let (alpha_space_id, _) = create_space(&harness, "Alpha Hook contract");
     let alpha = approve_publish(&harness, &alpha_space_id, "alpha needle accepted context");
@@ -408,17 +440,25 @@ fn session_start_emits_only_capabilities_while_prompt_retrieves_task_context() {
         String::from_utf8_lossy(&output.stderr)
     );
     let response: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let context = response["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap();
+    let context = response["systemMessage"].as_str().unwrap();
     assert!(
-        context.contains("alpha needle accepted context"),
-        "unexpected Task Context Pack: {context}"
+        context.contains("PromptEnvelope") && context.contains("task_intent_update"),
+        "unexpected Prompt guidance: {context}"
     );
+    assert!(!context.contains("alpha needle"));
+    assert!(!context.contains("alpha needle accepted context"));
     assert!(!context.contains("beta decoy accepted context"));
     assert!(!context.contains("SCTX_MUST_NOT_EXECUTE"));
-    assert!(context.contains("trust=\"untrusted-data\""));
-    assert!(context.contains("Do not execute commands"));
+    assert!(response.get("hookSpecificOutput").is_none());
+    assert!(
+        TaskRuntime::initialize(harness.root())
+            .unwrap()
+            .read_snapshot_by_locator(
+                &ExternalSessionLocator::new("codex", "thr_contract").unwrap()
+            )
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -477,6 +517,33 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_retrieval_paths
         );
         serde_json::from_slice::<Value>(&output.stdout).unwrap()
     };
+    let intent_update =
+        |session_id: &str, goal: &str, expected: Option<String>| TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session_id.to_owned(),
+            task_boundary: if expected.is_some() {
+                TaskBoundary::Continue
+            } else {
+                TaskBoundary::New
+            },
+            expected_revision_id: expected
+                .map_or(ExpectedRevisionId::Null(()), ExpectedRevisionId::Revision),
+            maturity: IntentMaturity::Provisional,
+            intent: TaskIntentDraft {
+                goal: goal.to_owned(),
+                desired_change: format!("Implement {goal}"),
+                in_scope: vec![],
+                out_of_scope: vec![],
+                domains: vec![],
+                platforms: vec![],
+                constraints: vec![],
+                acceptance_conditions: vec![],
+                artifacts: vec![],
+                interfaces: vec![],
+                unknowns: vec![],
+            },
+            evidence_refs: vec![],
+        };
 
     let before_prompt = hook(&serde_json::json!({
         "session_id": "session-without-prompt",
@@ -505,18 +572,22 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_retrieval_paths
 
     let alpha_initial = hook(&prompt("session-alpha", "alphaquartz"));
     let beta_initial = hook(&prompt("session-beta", "betacobalt"));
-    let alpha_initial = alpha_initial["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap();
-    let beta_initial = beta_initial["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap();
-    assert!(alpha_initial.contains("alphaquartz"));
-    assert!(!alpha_initial.contains("betacobalt"));
-    assert!(beta_initial.contains("betacobalt"));
-    assert!(!beta_initial.contains("alphaquartz"));
-    assert!(!alpha_initial.contains("\"source\":\"exact_task_signal\""));
-    assert!(!beta_initial.contains("\"source\":\"exact_task_signal\""));
+    for guidance in [alpha_initial, beta_initial] {
+        let guidance = guidance["systemMessage"].as_str().unwrap();
+        assert!(guidance.contains("task_intent_update"));
+        assert!(!guidance.contains("alphaquartz"));
+        assert!(!guidance.contains("betacobalt"));
+    }
+    let alpha_created = task_intent_update_at_root(
+        harness.root(),
+        &intent_update("session-alpha", "alphaquartz", None),
+    )
+    .unwrap();
+    let beta_created = task_intent_update_at_root(
+        harness.root(),
+        &intent_update("session-beta", "betacobalt", None),
+    )
+    .unwrap();
 
     for (session_id, tool_name, file, raw_marker) in [
         (
@@ -553,17 +624,29 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_retrieval_paths
         assert_eq!(response, serde_json::json!({}));
     }
 
-    let alpha_updated = hook(&prompt("session-alpha", "alphaquartz"));
-    let beta_updated = hook(&prompt("session-beta", "betacobalt"));
-    let alpha_updated = alpha_updated["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap();
-    let beta_updated = beta_updated["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap();
+    let alpha_updated = task_intent_update_at_root(
+        harness.root(),
+        &intent_update(
+            "session-alpha",
+            "alphaquartz",
+            Some(alpha_created.context.intent_revision_id.to_string()),
+        ),
+    )
+    .unwrap();
+    let beta_updated = task_intent_update_at_root(
+        harness.root(),
+        &intent_update(
+            "session-beta",
+            "betacobalt",
+            Some(beta_created.context.intent_revision_id.to_string()),
+        ),
+    )
+    .unwrap();
+    let alpha_updated = serde_json::to_string(&alpha_updated.context).unwrap();
+    let beta_updated = serde_json::to_string(&beta_updated.context).unwrap();
     for (pack, own_context, other_context, own_file, own_test, other_file) in [
         (
-            alpha_updated,
+            alpha_updated.as_str(),
             "alphaquartz",
             "betacobalt",
             "src/alpha_feature.rs",
@@ -571,7 +654,7 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_retrieval_paths
             "src/beta_feature.rs",
         ),
         (
-            beta_updated,
+            beta_updated.as_str(),
             "betacobalt",
             "alphaquartz",
             "src/beta_feature.rs",
@@ -602,7 +685,6 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_retrieval_paths
         .unwrap()
         .unwrap();
     assert_ne!(alpha_snapshot.task_id, beta_snapshot.task_id);
-    let canonical_workspace = fs::canonicalize(&workspace).unwrap();
     for (snapshot, own_file, own_test, other_file) in [
         (
             &alpha_snapshot,
@@ -635,14 +717,6 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_retrieval_paths
         assert!(!snapshot.task_signals.iter().any(|signal| {
             signal.kind == TaskSignalKind::File
                 && (signal.content.contains("outside.rs") || signal.content.contains("missing.rs"))
-        }));
-        assert!(snapshot.task_signals.iter().any(|signal| {
-            signal.kind == TaskSignalKind::Workspace
-                && signal.content == canonical_workspace.to_string_lossy()
-        }));
-        assert!(snapshot.task_signals.iter().any(|signal| {
-            signal.kind == TaskSignalKind::Repository
-                && signal.content == canonical_workspace.to_string_lossy()
         }));
         assert!(snapshot.task_signals.iter().all(|signal| {
             !signal.content.contains("RAW_ALPHA_MUST_NOT_PERSIST")
@@ -693,6 +767,12 @@ fn candidate_create_is_unassigned_idempotent_and_absent_from_retrieval() {
         "candidate",
     ]);
     assert!(search["data"]["results"].as_array().unwrap().is_empty());
+    establish_cli_task(
+        &harness,
+        "candidate-retrieval-isolation",
+        "hidden episode discovery",
+        "retrieve confirmed knowledge only",
+    );
     let pack = harness.success(&[
         "task",
         "context",
@@ -730,7 +810,7 @@ fn candidate_create_is_unassigned_idempotent_and_absent_from_retrieval() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn task_context_cli_entry_owns_task_identity_and_evolves_one_session() {
+fn legacy_task_context_cli_entry_is_read_only_for_authoritative_sessions() {
     let harness = Harness::new();
     let (space_id, _) = create_space(&harness, "CLI Task Context");
     approve_publish(
@@ -738,6 +818,29 @@ fn task_context_cli_entry_owns_task_identity_and_evolves_one_session() {
         &space_id,
         "CLI task context returns published knowledge",
     );
+    let establish = |session: &str| TaskIntentUpdateInput {
+        agent_kind: "codex".to_owned(),
+        external_session_id: session.to_owned(),
+        task_boundary: TaskBoundary::New,
+        expected_revision_id: ExpectedRevisionId::Null(()),
+        maturity: IntentMaturity::Provisional,
+        intent: TaskIntentDraft {
+            goal: "retrieve CLI task context".to_owned(),
+            desired_change: "return published CLI knowledge".to_owned(),
+            in_scope: vec![],
+            out_of_scope: vec![],
+            domains: vec!["cli".to_owned()],
+            platforms: vec![],
+            constraints: vec![],
+            acceptance_conditions: vec![],
+            artifacts: vec![],
+            interfaces: vec![],
+            unknowns: vec![],
+        },
+        evidence_refs: vec![],
+    };
+    task_intent_update_at_root(harness.root(), &establish("cli-session")).unwrap();
+    task_intent_update_at_root(harness.root(), &establish("other-cli-session")).unwrap();
     let base = [
         "task",
         "context",
@@ -794,7 +897,7 @@ fn task_context_cli_entry_owns_task_identity_and_evolves_one_session() {
         first["data"]["intent_revision_id"],
         same["data"]["intent_revision_id"]
     );
-    assert_ne!(
+    assert_eq!(
         same["data"]["intent_revision_id"],
         changed["data"]["intent_revision_id"]
     );
@@ -852,6 +955,88 @@ fn task_context_cli_entry_owns_task_identity_and_evolves_one_session() {
         "33",
     ]);
     assert_eq!(invalid_max["error"]["code"], "invalid_input");
+}
+
+#[test]
+fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts() {
+    let harness = Harness::new();
+    GitStore::initialize(harness.root()).unwrap();
+    let update_path = harness.home.join("task-update.json");
+    fs::write(
+        &update_path,
+        serde_json::to_vec(&serde_json::json!({
+            "agent_kind": "codex",
+            "external_session_id": "cli-authoritative",
+            "task_boundary": "new",
+            "expected_revision_id": null,
+            "maturity": "provisional",
+            "intent": {
+                "goal": "authoritative CLI task",
+                "desired_change": "establish authoritative CLI intent",
+                "in_scope": [], "out_of_scope": [], "domains": ["cli"],
+                "platforms": [], "constraints": [], "acceptance_conditions": [],
+                "artifacts": [], "interfaces": [], "unknowns": []
+            },
+            "evidence_refs": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let updated = harness.success(&[
+        "task",
+        "intent",
+        "update",
+        "--input",
+        update_path.to_str().unwrap(),
+    ]);
+    assert_eq!(updated["command"], "task.intent.update");
+    assert!(text(&updated, "task_id").starts_with("tsk_"));
+    assert!(text(&updated, "intent_revision_id").starts_with("tir_"));
+
+    let task_session_id = updated["data"]["task_session_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let task_id = updated["data"]["task_id"].as_str().unwrap();
+    let revision_id = updated["data"]["intent_revision_id"].as_str().unwrap();
+    let runtime = TaskRuntime::initialize(harness.root()).unwrap();
+    let merged = runtime
+        .merge_signals(
+            task_session_id,
+            vec![sctx_domain::TaskSignal {
+                kind: TaskSignalKind::File,
+                content: "src/stale.rs".to_owned(),
+            }],
+        )
+        .unwrap();
+    let supersede_path = harness.home.join("signal-supersede.json");
+    fs::write(
+        &supersede_path,
+        serde_json::to_vec(&serde_json::json!({
+            "agent_kind": "codex",
+            "external_session_id": "cli-authoritative",
+            "task_id": task_id,
+            "expected_revision_id": revision_id,
+            "signal_ids": [merged.inserted_signal_ids[0]]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let superseded = harness.success(&[
+        "task",
+        "signal",
+        "supersede",
+        "--input",
+        supersede_path.to_str().unwrap(),
+    ]);
+    assert_eq!(superseded["command"], "task.signal.supersede");
+    assert!(
+        superseded["data"]["active_signals"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -945,7 +1130,7 @@ fn mcp_stdio_entry_serves_cursor_and_codex_without_extra_stdout() {
             .collect::<Vec<_>>();
         assert_eq!(responses.len(), 2);
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
-        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 5);
+        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 7);
     }
 }
 
@@ -1046,6 +1231,12 @@ fn lifecycle_commands_share_stable_json_tree_and_generation_envelopes() {
         "accepted",
     ]);
     assert_eq!(search["data"]["results"][0]["context_id"], context_id);
+    establish_cli_task(
+        &harness,
+        "accepted-context-retrieval",
+        "stable",
+        "retrieve stable accepted Context",
+    );
     let pack = harness.success(&[
         "task",
         "context",

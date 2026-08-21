@@ -2166,7 +2166,7 @@ fn mcp_smoke(root: &Path) -> Result<()> {
             .map_err(|error| invalid(format!("invalid MCP smoke response: {error}")))?;
         if values.len() != 2
             || values.iter().any(|value| value.get("error").is_some())
-            || values[1]["result"]["tools"].as_array().map_or(0, Vec::len) != 5
+            || values[1]["result"]["tools"].as_array().map_or(0, Vec::len) != 7
         {
             return Err(Error::new(
                 ErrorKind::InvariantViolation,

@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 
 const DIAGNOSTIC: &str = "Shared Context task retrieval is temporarily unavailable. Coding can continue; retry through MCP or CLI later.";
+const PROMPT_GUIDANCE: &str = "Shared Context PromptEnvelope received. No Task Intent was inferred from prompt text. Use $shared-context and task_intent_update before precise retrieval.";
 
 struct SqliteLock {
     child: Child,
@@ -147,7 +148,13 @@ fn cursor_post_tool(cwd: &Path, file: &Path, raw_marker: &str) -> Value {
     })
 }
 
-fn assert_fail_open(output: &std::process::Output, field: &str, root: &Path, secret: &str) {
+fn assert_fail_open(
+    output: &std::process::Output,
+    field: &str,
+    expected: &str,
+    root: &Path,
+    secret: &str,
+) {
     assert!(
         output.status.success(),
         "Hook must fail open: {}",
@@ -155,7 +162,7 @@ fn assert_fail_open(output: &std::process::Output, field: &str, root: &Path, sec
     );
     let response: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(response.as_object().unwrap().len(), 1);
-    assert_eq!(response[field], DIAGNOSTIC);
+    assert_eq!(response[field], expected);
     let observable = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -192,7 +199,13 @@ fn codex_hook_fails_open_when_runtime_database_path_cannot_open() {
     let secret = "PROMPT_SECRET_RUNTIME_OPEN";
 
     let output = harness.hook("codex", &codex_prompt(&harness.home, "open-fault", secret));
-    assert_fail_open(&output, "systemMessage", &harness.root(), secret);
+    assert_fail_open(
+        &output,
+        "systemMessage",
+        PROMPT_GUIDANCE,
+        &harness.root(),
+        secret,
+    );
 
     let explicit = harness.explicit_task_context();
     assert_eq!(explicit.status.code(), Some(2));
@@ -214,7 +227,13 @@ fn codex_hook_fails_open_when_runtime_database_is_corrupt() {
         "codex",
         &codex_prompt(&harness.home, "corrupt-fault", secret),
     );
-    assert_fail_open(&output, "systemMessage", &harness.root(), secret);
+    assert_fail_open(
+        &output,
+        "systemMessage",
+        PROMPT_GUIDANCE,
+        &harness.root(),
+        secret,
+    );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("RAW_CORRUPT_DATABASE_MESSAGE"));
 }
 
@@ -227,7 +246,13 @@ fn codex_hook_fails_open_when_runtime_database_is_busy() {
     let secret = "PROMPT_SECRET_RUNTIME_BUSY";
 
     let output = harness.hook("codex", &codex_prompt(&harness.home, "busy-fault", secret));
-    assert_fail_open(&output, "systemMessage", &harness.root(), secret);
+    assert_fail_open(
+        &output,
+        "systemMessage",
+        PROMPT_GUIDANCE,
+        &harness.root(),
+        secret,
+    );
 }
 
 #[test]
@@ -255,7 +280,13 @@ fn codex_hook_fails_open_when_index_update_is_busy() {
     let secret = "PROMPT_SECRET_INDEX_BUSY";
 
     let output = harness.hook("codex", &codex_prompt(&harness.home, "index-fault", secret));
-    assert_fail_open(&output, "systemMessage", &harness.root(), secret);
+    assert_fail_open(
+        &output,
+        "systemMessage",
+        PROMPT_GUIDANCE,
+        &harness.root(),
+        secret,
+    );
 }
 
 #[test]
@@ -270,5 +301,11 @@ fn cursor_post_tool_hook_fails_open_when_runtime_is_unavailable() {
     let secret = "CURSOR_RAW_SECRET_MUST_NOT_LEAK";
 
     let output = harness.hook("cursor", &cursor_post_tool(&workspace, &file, secret));
-    assert_fail_open(&output, "additional_context", &harness.root(), secret);
+    assert_fail_open(
+        &output,
+        "additional_context",
+        DIAGNOSTIC,
+        &harness.root(),
+        secret,
+    );
 }
