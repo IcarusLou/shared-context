@@ -359,6 +359,7 @@ fn complete_context(statement: &str, applicability: Applicability) -> ContextRev
         applicability,
         assumptions: vec!["the synthetic fixture remains stable".to_owned()],
         recheck_when: vec!["the retrieval contract changes".to_owned()],
+        relations: Vec::new(),
         evidence: vec![EvidenceSnapshotDraft {
             kind: EvidenceType::ExperimentRecord,
             supports: "the retrieval contract is executable".to_owned(),

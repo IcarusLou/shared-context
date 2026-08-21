@@ -78,6 +78,8 @@ pub enum ReducerDiagnosticCode {
     AmbiguousContextOwner,
     MissingSpace,
     InvalidRevisionReference,
+    InvalidContextRelation,
+    InvalidContextRelationTarget,
     RevisionCycle,
     InvalidReviewReference,
     InvalidPublicationReference,
@@ -498,6 +500,109 @@ fn conflict_candidates(
         }
     }
     candidates.into_iter().collect()
+}
+
+fn validate_context_relations(
+    contexts: &mut BTreeMap<(SpaceId, ContextId), BTreeMap<RevisionId, ContextNode>>,
+    context_heads: &mut BTreeMap<(SpaceId, ContextId), BTreeSet<RevisionId>>,
+    diagnostics: &mut BTreeSet<ReducerDiagnostic>,
+) {
+    let mut invalid = BTreeSet::<(SpaceId, ContextId, RevisionId)>::new();
+    loop {
+        let existing_contexts = contexts
+            .iter()
+            .filter(|((space_id, context_id), revisions)| {
+                revisions
+                    .keys()
+                    .any(|revision_id| !invalid.contains(&(*space_id, *context_id, *revision_id)))
+            })
+            .map(|((_, context_id), _)| *context_id)
+            .collect::<BTreeSet<_>>();
+        let mut newly_invalid = Vec::new();
+        for ((space_id, context_id), revisions) in contexts.iter() {
+            for (revision_id, node) in revisions {
+                let key = (*space_id, *context_id, *revision_id);
+                if invalid.contains(&key) {
+                    continue;
+                }
+                let invalid_relation = node.revision.relations.iter().find_map(|relation| {
+                    relation
+                        .validate()
+                        .err()
+                        .map(|error| (ReducerDiagnosticCode::InvalidContextRelation, error.to_string()))
+                        .or_else(|| {
+                            (relation.target_context_id == *context_id
+                                || !existing_contexts.contains(&relation.target_context_id))
+                            .then(|| {
+                                (
+                                    ReducerDiagnosticCode::InvalidContextRelationTarget,
+                                    format!(
+                                        "target Context {} is self-referential, missing, or quarantined",
+                                        relation.target_context_id
+                                    ),
+                                )
+                            })
+                        })
+                });
+                if let Some((code, reason)) = invalid_relation {
+                    newly_invalid.push((key, node.event_id, code, reason));
+                    continue;
+                }
+                if node
+                    .revision
+                    .parent_revision_ids
+                    .iter()
+                    .any(|parent| invalid.contains(&(*space_id, *context_id, *parent)))
+                {
+                    newly_invalid.push((
+                        key,
+                        node.event_id,
+                        ReducerDiagnosticCode::InvalidRevisionReference,
+                        "revision depends on a relation-quarantined parent".to_owned(),
+                    ));
+                }
+            }
+        }
+        if newly_invalid.is_empty() {
+            break;
+        }
+        for ((space_id, context_id, revision_id), event_id, code, reason) in newly_invalid {
+            if invalid.insert((space_id, context_id, revision_id)) {
+                push_diagnostic(
+                    diagnostics,
+                    code,
+                    revision_id.to_string(),
+                    BTreeSet::from([event_id]),
+                    format!("context revision {revision_id} has an invalid relation: {reason}"),
+                );
+            }
+        }
+    }
+
+    let keys = contexts.keys().copied().collect::<Vec<_>>();
+    for key @ (space_id, context_id) in keys {
+        let revisions = contexts.get_mut(&key).expect("Context key exists");
+        revisions.retain(|revision_id, _| !invalid.contains(&(space_id, context_id, *revision_id)));
+        if revisions.is_empty() {
+            contexts.remove(&key);
+            context_heads.remove(&key);
+            continue;
+        }
+        let valid_ids = revisions.keys().copied().collect::<BTreeSet<_>>();
+        let dag = revisions
+            .iter()
+            .map(|(revision_id, node)| {
+                (
+                    *revision_id,
+                    DagNode {
+                        event_id: node.event_id,
+                        parents: node.revision.parent_revision_ids.clone(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        context_heads.insert(key, heads(&dag, &valid_ids));
+    }
 }
 
 /// Reduces a complete in-memory V1 event multiset without consulting storage or a clock.
@@ -1021,6 +1126,8 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
                 .collect(),
         );
     }
+
+    validate_context_relations(&mut valid_contexts, &mut context_heads, &mut diagnostics);
 
     let mut valid_reviews: BTreeMap<(SpaceId, ContextId), BTreeMap<EventId, ReviewNode>> =
         BTreeMap::new();

@@ -17,6 +17,7 @@
         },
         "assumptions": [],
         "recheck_when": ["a matching Space is resolved"],
+        "relations": [],
         "evidence": [
           {
             "kind": "source_snapshot",
@@ -47,6 +48,7 @@
         },
         "assumptions": [],
         "recheck_when": ["Candidate reduction changes"],
+        "relations": [],
         "evidence": [
           {
             "kind": "experiment_record",
@@ -77,6 +79,7 @@
         },
         "assumptions": [],
         "recheck_when": ["a later lifecycle confirms the content"],
+        "relations": [],
         "evidence": [
           {
             "kind": "artifact_snapshot",

@@ -12,7 +12,7 @@ use crate::{
 
 pub(crate) const NEXT_PREFIX: &str = "_next_";
 
-const TABLES: [&str; 20] = [
+const TABLES: [&str; 21] = [
     "meta",
     "source_file",
     "context_candidate",
@@ -21,6 +21,7 @@ const TABLES: [&str; 20] = [
     "intent_head",
     "context_item",
     "context_revision",
+    "context_relation",
     "engineering_reference",
     "review",
     "publication",
@@ -173,6 +174,17 @@ CREATE TABLE {prefix}context_revision (
     lifecycle TEXT NOT NULL,
     evidence_completeness INTEGER NOT NULL CHECK (evidence_completeness BETWEEN 0 AND 1000),
     is_head INTEGER NOT NULL CHECK (is_head IN (0, 1))
+) WITHOUT ROWID;
+CREATE TABLE {prefix}context_relation (
+    source_context_id TEXT NOT NULL REFERENCES {prefix}context_item(context_id),
+    source_revision_id TEXT NOT NULL REFERENCES {prefix}context_revision(revision_id),
+    source_space_id TEXT NOT NULL REFERENCES {prefix}space_projection(space_id),
+    target_context_id TEXT NOT NULL REFERENCES {prefix}context_item(context_id),
+    target_space_id TEXT NOT NULL REFERENCES {prefix}space_projection(space_id),
+    kind TEXT NOT NULL,
+    rationale TEXT NOT NULL,
+    supports_json TEXT NOT NULL,
+    PRIMARY KEY (source_revision_id, target_context_id, kind)
 ) WITHOUT ROWID;
 CREATE TABLE {prefix}engineering_reference (
     reference_id TEXT PRIMARY KEY,
@@ -328,7 +340,11 @@ fn create_indexes(transaction: &Transaction<'_>) -> crate::Result<()> {
              CREATE INDEX engineering_reference_context_idx
                  ON engineering_reference(context_id, revision_id, reference_id);
              CREATE INDEX engineering_reference_repository_idx
-                 ON engineering_reference(repository_id, artifact_kind, reference_id);",
+                 ON engineering_reference(repository_id, artifact_kind, reference_id);
+             CREATE INDEX context_relation_target_idx
+                 ON context_relation(target_context_id, kind, source_revision_id);
+             CREATE INDEX context_relation_source_idx
+                 ON context_relation(source_context_id, source_revision_id, kind);",
         )
         .map_err(sql_error("create projection query indexes"))
 }
@@ -573,6 +589,15 @@ fn populate(
                         )
                         .map_err(sql_error("write Evidence projection"))?;
                 }
+                evidence_search.extend(revision.relations.iter().map(|relation| {
+                    format!(
+                        "{} {} {} {}",
+                        enum_text(relation.kind),
+                        relation.target_context_id,
+                        relation.rationale,
+                        relation.supports.join(" ")
+                    )
+                }));
                 for (dimension, values) in [
                     ("domain", &revision.applicability.domains),
                     ("platform", &revision.applicability.platforms),
@@ -662,6 +687,43 @@ fn populate(
                     "open",
                     &json(&context.publication_heads)?,
                 )?;
+            }
+        }
+    }
+
+    for (source_space_id, space) in &input.projection.spaces {
+        for (source_context_id, context) in &space.contexts {
+            for (source_revision_id, revision) in &context.revisions {
+                for relation in &revision.revision.relations {
+                    let target_space_id = input
+                        .projection
+                        .spaces
+                        .iter()
+                        .find(|(_, target_space)| {
+                            target_space
+                                .contexts
+                                .contains_key(&relation.target_context_id)
+                        })
+                        .map(|(space_id, _)| *space_id)
+                        .expect("Reducer only projects relations to valid Contexts");
+                    transaction
+                        .execute(
+                            &format!(
+                                "INSERT INTO {prefix}context_relation(source_context_id, source_revision_id, source_space_id, target_context_id, target_space_id, kind, rationale, supports_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+                            ),
+                            params![
+                                source_context_id.to_string(),
+                                source_revision_id.to_string(),
+                                source_space_id.to_string(),
+                                relation.target_context_id.to_string(),
+                                target_space_id.to_string(),
+                                enum_text(relation.kind),
+                                relation.rationale,
+                                json(&relation.supports)?
+                            ],
+                        )
+                        .map_err(sql_error("write Context Relation projection"))?;
+                }
             }
         }
     }
@@ -796,6 +858,7 @@ pub(crate) fn cached_blobs(
 /// Replaces only proven-affected Space aggregates while atomically advancing source metadata and
 /// diagnostics. A complete shadow projection is used as the deterministic source of replacement
 /// rows; readers observe either the old or new generation, never an intermediate mixture.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn replace_projection_incremental(
     transaction: &Transaction<'_>,
     input: &BuildInput,
@@ -836,6 +899,9 @@ pub(crate) fn replace_projection_incremental(
                  WHERE space_id IN (SELECT space_id FROM _affected_space)
              );
              DELETE FROM conflict WHERE space_id IN (SELECT space_id FROM _affected_space);
+             DELETE FROM context_relation
+                 WHERE source_space_id IN (SELECT space_id FROM _affected_space)
+                    OR target_space_id IN (SELECT space_id FROM _affected_space);
              DELETE FROM engineering_reference
                  WHERE space_id IN (SELECT space_id FROM _affected_space);
              DELETE FROM conflict_resolution WHERE conflict_id IN (
@@ -872,6 +938,9 @@ pub(crate) fn replace_projection_incremental(
                  WHERE space_id IN (SELECT space_id FROM _affected_space);
              INSERT INTO context_revision SELECT * FROM _next_context_revision
                  WHERE space_id IN (SELECT space_id FROM _affected_space);
+             INSERT INTO context_relation SELECT * FROM _next_context_relation
+                 WHERE source_space_id IN (SELECT space_id FROM _affected_space)
+                    OR target_space_id IN (SELECT space_id FROM _affected_space);
              INSERT INTO engineering_reference SELECT * FROM _next_engineering_reference
                  WHERE space_id IN (SELECT space_id FROM _affected_space);
              INSERT INTO review SELECT * FROM _next_review

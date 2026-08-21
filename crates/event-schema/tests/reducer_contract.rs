@@ -43,6 +43,31 @@ fn values_to_reducer_events(values: Vec<Value>) -> Vec<ReducerEvent> {
         .collect()
 }
 
+fn set_revision_relations(values: &mut [Value], revision_id: &str, relations: Value) {
+    let revision = values
+        .iter_mut()
+        .find(|value| value["revision"]["revision_id"] == revision_id)
+        .expect("revision fixture exists");
+    revision["revision"]["relations"] = relations;
+}
+
+fn set_revision_kind(values: &mut [Value], revision_id: &str, kind: &str, topic_key: Option<&str>) {
+    let revision = values
+        .iter_mut()
+        .find(|value| value["revision"]["revision_id"] == revision_id)
+        .expect("revision fixture exists");
+    revision["revision"]["kind"] = serde_json::json!(kind);
+    match topic_key {
+        Some(topic_key) => revision["revision"]["topic_key"] = serde_json::json!(topic_key),
+        None => {
+            revision["revision"]
+                .as_object_mut()
+                .unwrap()
+                .remove("topic_key");
+        }
+    }
+}
+
 fn reducer_events(name: &str) -> Vec<ReducerEvent> {
     fixture_events(name)
         .iter()
@@ -214,6 +239,164 @@ fn context_branch_converges_only_through_the_explicit_multi_parent_merge() {
         1
     );
     assert!(merged.diagnostics.is_empty());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn cross_space_relations_preserve_cycles_concurrent_heads_and_historical_snapshots() {
+    let mut values = fixture_values("context-branch-merge.json");
+    values.extend(fixture_values("publication-lifecycle.json"));
+    values.extend(fixture_values("semantic-conflicts.json"));
+    set_revision_kind(
+        &mut values,
+        "rev_00000000-0000-4000-8000-000000000211",
+        "contract",
+        Some("relation/contract"),
+    );
+    set_revision_kind(
+        &mut values,
+        "rev_00000000-0000-4000-8000-000000000411",
+        "decision",
+        Some("relation/decision"),
+    );
+    set_revision_kind(
+        &mut values,
+        "rev_00000000-0000-4000-8000-000000000513",
+        "validation",
+        None,
+    );
+    set_revision_relations(
+        &mut values,
+        "rev_00000000-0000-4000-8000-000000000211",
+        serde_json::json!([{
+            "target_context_id": "ctx_00000000-0000-4000-8000-000000000401",
+            "kind": "depends_on",
+            "rationale": "The root depends on the lifecycle Contract",
+            "supports": ["The lifecycle Context defines the required behavior"]
+        }]),
+    );
+    set_revision_relations(
+        &mut values,
+        "rev_00000000-0000-4000-8000-000000000411",
+        serde_json::json!([{
+            "target_context_id": "ctx_00000000-0000-4000-8000-000000000503",
+            "kind": "implements",
+            "rationale": "The lifecycle Contract implements the visibility Decision",
+            "supports": ["Both Contexts describe the same visible behavior"]
+        }]),
+    );
+    set_revision_relations(
+        &mut values,
+        "rev_00000000-0000-4000-8000-000000000513",
+        serde_json::json!([{
+            "target_context_id": "ctx_00000000-0000-4000-8000-000000000201",
+            "kind": "validated_by",
+            "rationale": "The visibility Decision is validated by the branch Context",
+            "supports": ["The branch fixture records the validation"]
+        }]),
+    );
+    set_revision_relations(
+        &mut values,
+        "rev_00000000-0000-4000-8000-000000000212",
+        serde_json::json!([{
+            "target_context_id": "ctx_00000000-0000-4000-8000-000000000502",
+            "kind": "contradicts",
+            "rationale": "Branch A contradicts the hidden-result Contract",
+            "supports": ["The two statements prescribe opposite visibility"]
+        }]),
+    );
+    set_revision_relations(
+        &mut values,
+        "rev_00000000-0000-4000-8000-000000000213",
+        serde_json::json!([{
+            "target_context_id": "ctx_00000000-0000-4000-8000-000000000503",
+            "kind": "related_to",
+            "rationale": "Branch B is related to the billing-only Context",
+            "supports": ["Both branches retain result state"]
+        }]),
+    );
+    set_revision_relations(
+        &mut values,
+        "rev_00000000-0000-4000-8000-000000000214",
+        serde_json::json!([{
+            "target_context_id": "ctx_00000000-0000-4000-8000-000000000504",
+            "kind": "constrains",
+            "rationale": "The merged revision constrains ranking behavior",
+            "supports": ["The merged snapshot fixes the allowed rank"]
+        }]),
+    );
+    let projection = reduce(&values_to_reducer_events(values));
+    assert!(!projection.diagnostics.iter().any(|diagnostic| {
+        matches!(
+            diagnostic.code,
+            ReducerDiagnosticCode::InvalidContextRelation
+                | ReducerDiagnosticCode::InvalidContextRelationTarget
+        )
+    }));
+    let source = &projection.spaces[&space("spc_00000000-0000-4000-8000-000000000002")].contexts
+        [&context("ctx_00000000-0000-4000-8000-000000000201")];
+    assert_eq!(source.revision_heads.len(), 1);
+    for revision_id in [
+        "rev_00000000-0000-4000-8000-000000000211",
+        "rev_00000000-0000-4000-8000-000000000212",
+        "rev_00000000-0000-4000-8000-000000000213",
+        "rev_00000000-0000-4000-8000-000000000214",
+    ] {
+        assert_eq!(
+            source.revisions[&revision(revision_id)]
+                .revision
+                .relations
+                .len(),
+            1,
+            "historical Revision relations must remain traceable"
+        );
+    }
+}
+
+#[test]
+fn dangling_relation_quarantines_only_owning_revision_and_causal_children() {
+    let mut base_values = fixture_values("context-branch-merge.json");
+    base_values.extend(fixture_values("publication-lifecycle.json"));
+    let baseline = reduce(&values_to_reducer_events(base_values.clone()));
+    let source_space = space("spc_00000000-0000-4000-8000-000000000002");
+    let unaffected_space = space("spc_00000000-0000-4000-8000-000000000004");
+    for invalid_target in [
+        "ctx_99999999-9999-4999-8999-999999999999",
+        "ctx_00000000-0000-4000-8000-000000000201",
+    ] {
+        let mut values = base_values.clone();
+        set_revision_relations(
+            &mut values,
+            "rev_00000000-0000-4000-8000-000000000211",
+            serde_json::json!([{
+                "target_context_id": invalid_target,
+                "kind": "depends_on",
+                "rationale": "The missing or self target makes this relation invalid",
+                "supports": ["The target must be another Context in the current Event set"]
+            }]),
+        );
+        let projection = reduce(&values_to_reducer_events(values));
+        assert!(projection.spaces[&source_space].contexts.is_empty());
+        assert_eq!(
+            projection.spaces[&unaffected_space],
+            baseline.spaces[&unaffected_space]
+        );
+        assert!(projection.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ReducerDiagnosticCode::InvalidContextRelationTarget
+                && diagnostic.entity_id == "rev_00000000-0000-4000-8000-000000000211"
+        }));
+        assert_eq!(
+            projection
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code == ReducerDiagnosticCode::InvalidRevisionReference
+                })
+                .count(),
+            3,
+            "concurrent children and merge must follow the invalid parent into quarantine"
+        );
+    }
 }
 
 #[test]

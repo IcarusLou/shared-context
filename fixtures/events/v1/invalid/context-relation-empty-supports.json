@@ -1,0 +1,35 @@
+{
+  "schema_version": "1",
+  "event_id": "evt_00000000-0000-4000-8000-000000000905",
+  "event_type": "context.revision_added",
+  "space_id": "spc_00000000-0000-4000-8000-000000000001",
+  "context_id": "ctx_00000000-0000-4000-8000-000000000201",
+  "revision": {
+    "revision_id": "rev_00000000-0000-4000-8000-000000000905",
+    "parent_revision_ids": [],
+    "kind": "progress",
+    "statement": "Invalid relation support fixture",
+    "rationale": "Relations require explicit support statements.",
+    "applicability": {"domains": [], "platforms": [], "conditions": []},
+    "assumptions": [],
+    "recheck_when": [],
+    "relations": [
+      {
+        "target_context_id": "ctx_00000000-0000-4000-8000-000000000299",
+        "kind": "depends_on",
+        "rationale": "The target contract is required.",
+        "supports": []
+      }
+    ],
+    "evidence": [
+      {
+        "evidence_id": "evd_00000000-0000-4000-8000-000000000905",
+        "kind": "source_snapshot",
+        "supports": "The fixture is structurally complete.",
+        "content": {"fixture": "invalid relation"},
+        "interpretation": "Only relation support is invalid.",
+        "limitations": []
+      }
+    ]
+  }
+}

@@ -18,6 +18,14 @@
     },
     "assumptions": ["Git preserves the original event bytes"],
     "recheck_when": ["a new parser version is released"],
+    "relations": [
+      {
+        "target_context_id": "ctx_00000000-0000-4000-8000-000000000299",
+        "kind": "depends_on",
+        "rationale": "The parser decision depends on the stable reader contract.",
+        "supports": ["The reader contract defines the accepted envelope."]
+      }
+    ],
     "evidence": [
       {
         "evidence_id": "evd_eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1",

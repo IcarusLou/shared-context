@@ -324,6 +324,7 @@ mod tests {
             },
             assumptions: vec!["The response contract remains versioned".to_owned()],
             recheck_when: vec!["search-v3 removes the fallback field".to_owned()],
+            relations: Vec::new(),
             evidence: vec![evidence()],
         }
     }

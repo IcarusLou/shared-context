@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    ConflictId, ContextId, Error, ErrorKind, EventId, EvidenceId, PublicationId, ResolutionId,
-    Result, ReviewId, RevisionId,
+    ConflictId, ContextId, ContextRelation, Error, ErrorKind, EventId, EvidenceId, PublicationId,
+    ResolutionId, Result, ReviewId, RevisionId,
 };
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -227,6 +227,7 @@ pub struct ContextRevisionDraft {
     pub applicability: Applicability,
     pub assumptions: Vec<String>,
     pub recheck_when: Vec<String>,
+    pub relations: Vec<ContextRelation>,
     pub evidence: Vec<EvidenceSnapshotDraft>,
 }
 
@@ -253,6 +254,21 @@ impl ContextRevisionDraft {
             .validate("context revision applicability")?;
         require_text_items(&self.assumptions, "context revision assumptions")?;
         require_text_items(&self.recheck_when, "context revision recheck_when")?;
+        for (index, relation) in self.relations.iter().enumerate() {
+            relation.validate().map_err(|error| {
+                invalid(format!(
+                    "context revision relations[{index}] is invalid: {error}"
+                ))
+            })?;
+        }
+        require_unique(
+            &self
+                .relations
+                .iter()
+                .map(|relation| (relation.target_context_id, relation.kind))
+                .collect::<Vec<_>>(),
+            "context revision relations target/kind",
+        )?;
         if self.evidence.is_empty() {
             return Err(invalid(
                 "context revision evidence must contain at least one snapshot",
@@ -279,6 +295,7 @@ pub struct ContextRevision {
     pub applicability: Applicability,
     pub assumptions: Vec<String>,
     pub recheck_when: Vec<String>,
+    pub relations: Vec<ContextRelation>,
     pub evidence: Vec<EvidenceSnapshot>,
 }
 
@@ -304,6 +321,7 @@ impl ContextRevision {
             applicability: draft.applicability,
             assumptions: draft.assumptions,
             recheck_when: draft.recheck_when,
+            relations: draft.relations,
             evidence: draft
                 .evidence
                 .into_iter()
@@ -335,6 +353,7 @@ impl ContextRevision {
             applicability: self.applicability.clone(),
             assumptions: self.assumptions.clone(),
             recheck_when: self.recheck_when.clone(),
+            relations: self.relations.clone(),
             evidence: self
                 .evidence
                 .iter()

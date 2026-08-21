@@ -1,7 +1,8 @@
 use sctx_domain::{
-    Applicability, ConflictParticipant, ContextId, ContextKind, ContextRevisionDraft,
-    EvidenceSnapshotDraft, EvidenceType, PublicationAction, PublicationDraft, RevisionId,
-    SemanticConflictDraft, SpaceId, TaskId, TaskIntent, TaskSignal, TaskSignalKind,
+    Applicability, ConflictParticipant, ContextId, ContextKind, ContextRelation,
+    ContextRelationKind, ContextRevisionDraft, EvidenceSnapshotDraft, EvidenceType,
+    PublicationAction, PublicationDraft, RevisionId, SemanticConflictDraft, SpaceId, TaskId,
+    TaskIntent, TaskSignal, TaskSignalKind,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
@@ -44,6 +45,7 @@ fn revision(statement: &str, rationale: &str, evidence: &str) -> ContextRevision
         },
         assumptions: vec!["the current Tree is readable".to_owned()],
         recheck_when: vec!["the tokenizer version changes".to_owned()],
+        relations: Vec::new(),
         evidence: vec![EvidenceSnapshotDraft {
             kind: EvidenceType::ExperimentRecord,
             supports: evidence.to_owned(),
@@ -356,6 +358,51 @@ fn chinese_english_unicode_and_code_identifiers_hit_normalized_fts() {
         assert!(!response.results[0].match_reason.matched_fields.is_empty());
         assert!(!response.indexed_tree_oid.is_empty());
         assert!(response.projection_generation > 0);
+    }
+}
+
+#[test]
+fn relation_kind_rationale_support_and_target_id_are_searchable_from_source_revision() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::initialize(temporary.path().join("relation-search")).unwrap();
+    let target_space_event = Event::space_created(intent("Relation Target"), None).unwrap();
+    let target_space_id = space_id(&target_space_event);
+    append(&store, target_space_event);
+    let (target_context_id, _) = add_context(
+        &store,
+        target_space_id,
+        revision("Target Contract", "target rationale", "target evidence"),
+    );
+
+    let source_space_event = Event::space_created(intent("Relation Source"), None).unwrap();
+    let source_space_id = space_id(&source_space_event);
+    append(&store, source_space_event);
+    let mut source = revision("Source Decision", "source rationale", "source evidence");
+    source.relations = vec![ContextRelation {
+        target_context_id,
+        kind: ContextRelationKind::ValidatedBy,
+        rationale: "relationrationaleneedle links the validation Contract".to_owned(),
+        supports: vec!["relationsupportneedle proves the stable edge".to_owned()],
+    }];
+    let (source_context_id, source_revision_id) = add_context(&store, source_space_id, source);
+    let engine = SearchEngine::new(ProjectionIndex::for_store(&store));
+
+    for query in [
+        "validated_by".to_owned(),
+        "relationrationaleneedle".to_owned(),
+        "relationsupportneedle".to_owned(),
+        target_context_id.to_string(),
+    ] {
+        let response = engine
+            .search(&SearchRequest {
+                query,
+                page_size: 20,
+                ..SearchRequest::default()
+            })
+            .unwrap();
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].context_id, source_context_id);
+        assert_eq!(response.results[0].revision_id, source_revision_id);
     }
 }
 

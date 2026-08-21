@@ -677,27 +677,24 @@ impl ContextArtifactAssociation {
 }
 
 /// Stable knowledge edge between two Context revisions.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextRelationKind {
     DependsOn,
     Constrains,
     Implements,
-    Validates,
-    ConflictsWith,
-    Supersedes,
+    ValidatedBy,
+    Contradicts,
     RelatedTo,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextRelation {
-    pub source_context_id: ContextId,
-    pub source_revision_id: RevisionId,
     pub target_context_id: ContextId,
-    pub target_revision_id: RevisionId,
     pub kind: ContextRelationKind,
     pub rationale: String,
+    pub supports: Vec<String>,
 }
 
 impl ContextRelation {
@@ -705,12 +702,21 @@ impl ContextRelation {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::InvalidInput`] for self-relations or empty rationale.
+    /// Returns [`ErrorKind::InvalidInput`] for empty rationale or support statements.
     pub fn validate(&self) -> Result<()> {
-        if self.source_context_id == self.target_context_id {
-            return Err(invalid("context_relation cannot target the same Context"));
+        require_text(&self.rationale, "context_relation.rationale")?;
+        if self.supports.is_empty() {
+            return Err(invalid(
+                "context_relation.supports must contain at least one statement",
+            ));
         }
-        require_text(&self.rationale, "context_relation.rationale")
+        require_text_items(&self.supports, "context_relation.supports")?;
+        if self.supports.iter().collect::<HashSet<_>>().len() != self.supports.len() {
+            return Err(invalid(
+                "context_relation.supports must not contain duplicates",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1087,15 +1093,12 @@ mod tests {
         let first = ContextId::new();
         let second = ContextId::new();
         let forward = ContextRelation {
-            source_context_id: first,
-            source_revision_id: RevisionId::new(),
             target_context_id: second,
-            target_revision_id: RevisionId::new(),
             kind: ContextRelationKind::DependsOn,
             rationale: "first requires the second Contract".to_owned(),
+            supports: vec!["the first Context consumes the second contract".to_owned()],
         };
         let backward = ContextRelation {
-            source_context_id: second,
             target_context_id: first,
             rationale: "second validates the first Decision".to_owned(),
             ..forward.clone()
@@ -1103,11 +1106,11 @@ mod tests {
         assert!(forward.validate().is_ok());
         assert!(backward.validate().is_ok());
 
-        let self_edge = ContextRelation {
-            target_context_id: first,
+        let invalid = ContextRelation {
+            supports: Vec::new(),
             ..forward
         };
-        assert!(self_edge.validate().is_err());
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

@@ -365,6 +365,7 @@ fn demo_context() -> ContextRevisionDraft {
         },
         assumptions: vec!["The local Git executable remains available.".to_owned()],
         recheck_when: vec!["The demo fixture version changes.".to_owned()],
+        relations: Vec::new(),
         evidence: vec![EvidenceSnapshotDraft {
             kind: EvidenceType::ExperimentRecord,
             supports: "The demo lifecycle is independently reproducible.".to_owned(),
@@ -1762,6 +1763,7 @@ impl From<ContextDraftInput> for ContextRevisionDraft {
             applicability: input.applicability,
             assumptions: input.assumptions,
             recheck_when: input.recheck_when,
+            relations: Vec::new(),
             evidence: input.evidence.into_iter().map(Into::into).collect(),
         }
     }
@@ -1842,6 +1844,7 @@ fn context_draft(options: &Options) -> Result<ContextRevisionDraft> {
         applicability: applicability(options),
         assumptions: strings(options.many("--assumption")),
         recheck_when: strings(options.many("--recheck-when")),
+        relations: Vec::new(),
         evidence,
     })
 }

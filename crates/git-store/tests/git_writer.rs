@@ -105,6 +105,7 @@ fn candidate_event(source_episode_id: WorkEpisodeId, statement: &str) -> Event {
             applicability: Applicability::default(),
             assumptions: Vec::new(),
             recheck_when: Vec::new(),
+            relations: Vec::new(),
             evidence: vec![EvidenceSnapshotDraft {
                 kind: EvidenceType::ExperimentRecord,
                 supports: "The concurrent request completed".to_owned(),

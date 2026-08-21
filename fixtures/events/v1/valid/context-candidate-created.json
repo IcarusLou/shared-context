@@ -17,6 +17,7 @@
       },
       "assumptions": ["Space resolution happens later"],
       "recheck_when": ["the Candidate is confirmed or discarded"],
+      "relations": [],
       "evidence": [
         {
           "kind": "experiment_record",

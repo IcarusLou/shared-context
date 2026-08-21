@@ -106,6 +106,7 @@ fn draft(statement: &str) -> ContextRevisionDraft {
         },
         assumptions: vec!["the committed Git tree is readable".to_owned()],
         recheck_when: vec!["the MCP protocol changes".to_owned()],
+        relations: Vec::new(),
         evidence: vec![EvidenceSnapshotDraft {
             kind: EvidenceType::ExperimentRecord,
             supports: "the client fixture completed".to_owned(),

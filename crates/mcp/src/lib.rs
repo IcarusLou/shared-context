@@ -1081,6 +1081,7 @@ impl CandidateCreateInput {
             applicability: self.applicability,
             assumptions: self.assumptions,
             recheck_when: self.recheck_when,
+            relations: Vec::new(),
             evidence: self.evidence.into_iter().map(Into::into).collect(),
         }
     }

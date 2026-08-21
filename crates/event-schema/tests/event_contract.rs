@@ -63,6 +63,7 @@ fn context_draft() -> ContextRevisionDraft {
         },
         assumptions: vec!["raw JSON remains available".to_owned()],
         recheck_when: vec!["parser support changes".to_owned()],
+        relations: Vec::new(),
         evidence: vec![EvidenceSnapshotDraft {
             kind: EvidenceType::SourceSnapshot,
             supports: "Parser checks the version first".to_owned(),
@@ -397,6 +398,14 @@ fn semantic_hash_excludes_annotations_origin_hints_and_production_envelope() {
     changed_metadata["revision"]["statement"] = json!("A different authoritative statement");
     let semantic_variant = parse_known(&serde_json::to_vec(&changed_metadata).unwrap());
     assert_ne!(baseline.semantic_hash(), semantic_variant.semantic_hash());
+
+    let mut relation_variant: Value = serde_json::from_slice(&input).unwrap();
+    relation_variant["revision"]["relations"][0]["rationale"] =
+        json!("A different authoritative relation rationale");
+    assert_ne!(
+        baseline.semantic_hash(),
+        parse_known(&serde_json::to_vec(&relation_variant).unwrap()).semantic_hash()
+    );
 }
 
 #[test]

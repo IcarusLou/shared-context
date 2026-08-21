@@ -369,6 +369,31 @@
       },
       "additionalProperties": false
     },
+    "context_relation": {
+      "type": "object",
+      "required": ["target_context_id", "kind", "rationale", "supports"],
+      "properties": {
+        "target_context_id": { "$ref": "#/$defs/context_id" },
+        "kind": {
+          "enum": [
+            "depends_on",
+            "constrains",
+            "implements",
+            "validated_by",
+            "contradicts",
+            "related_to"
+          ]
+        },
+        "rationale": { "$ref": "#/$defs/non_empty_string" },
+        "supports": {
+          "allOf": [
+            { "$ref": "#/$defs/string_list" },
+            { "minItems": 1, "uniqueItems": true }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "context_revision_draft": {
       "type": "object",
       "required": [
@@ -378,6 +403,7 @@
         "applicability",
         "assumptions",
         "recheck_when",
+        "relations",
         "evidence"
       ],
       "properties": {
@@ -398,6 +424,11 @@
         "applicability": { "$ref": "#/$defs/applicability" },
         "assumptions": { "$ref": "#/$defs/string_list" },
         "recheck_when": { "$ref": "#/$defs/string_list" },
+        "relations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/context_relation" }
+        },
         "evidence": {
           "type": "array",
           "minItems": 1,
@@ -438,6 +469,7 @@
         "applicability",
         "assumptions",
         "recheck_when",
+        "relations",
         "evidence"
       ],
       "properties": {
@@ -464,6 +496,11 @@
         "applicability": { "$ref": "#/$defs/applicability" },
         "assumptions": { "$ref": "#/$defs/string_list" },
         "recheck_when": { "$ref": "#/$defs/string_list" },
+        "relations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/context_relation" }
+        },
         "evidence": {
           "type": "array",
           "minItems": 1,

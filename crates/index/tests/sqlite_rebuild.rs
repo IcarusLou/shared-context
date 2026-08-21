@@ -9,11 +9,11 @@ use std::{
 
 use rusqlite::{Connection, types::ValueRef};
 use sctx_event_schema::{
-    Applicability, ArtifactKind, ConflictParticipant, ContextId, ContextKind, ContextRevisionDraft,
-    EngineeringReferenceDraft, Event, EventPayload, EvidenceSnapshotDraft, EvidenceType,
-    IntentSnapshot, LocatorHints, PublicationAction, PublicationDraft, PublicationId,
-    ReferenceRelation, RepositoryId, ReviewDraft, ReviewVerdict, RevisionId, SemanticConflictDraft,
-    SpaceId, WorkEpisodeId,
+    Applicability, ArtifactKind, ConflictParticipant, ContextId, ContextKind, ContextRelation,
+    ContextRelationKind, ContextRevisionDraft, EngineeringReferenceDraft, Event, EventPayload,
+    EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, LocatorHints, PublicationAction,
+    PublicationDraft, PublicationId, ReferenceRelation, RepositoryId, ReviewDraft, ReviewVerdict,
+    RevisionId, SemanticConflictDraft, SpaceId, WorkEpisodeId,
 };
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::{
@@ -54,6 +54,7 @@ fn context(statement: &str) -> ContextRevisionDraft {
         },
         assumptions: vec!["HEAD resolves to a tree".to_owned()],
         recheck_when: vec!["event schema changes".to_owned()],
+        relations: Vec::new(),
         evidence: vec![EvidenceSnapshotDraft {
             kind: EvidenceType::ExperimentRecord,
             supports: "the same Tree produces the same projection".to_owned(),
@@ -502,6 +503,101 @@ fn engineering_reference_incremental_projection_matches_scratch_and_isolates_bad
     let scratch = ProjectionIndex::new(
         store.repository(),
         temporary.path().join("reference-scratch"),
+    );
+    scratch.rebuild().unwrap();
+    assert_eq!(
+        projection_dump(index.database_path()),
+        projection_dump(scratch.database_path())
+    );
+}
+
+#[test]
+fn context_relations_keep_cross_space_history_and_fts_across_incremental_and_scratch() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::initialize(temporary.path().join("relation-installation")).unwrap();
+    let target_space_event = Event::space_created(intent("Target Space"), None).unwrap();
+    let (target_space_id, _) = space_ids(&target_space_event);
+    append(&store, target_space_event);
+    let target_context_event =
+        Event::context_revision_added(target_space_id, context("Target Contract"), None).unwrap();
+    let (target_context_id, _) = context_ids(&target_context_event);
+    append(&store, target_context_event);
+
+    let source_space_event = Event::space_created(intent("Source Space"), None).unwrap();
+    let (source_space_id, _) = space_ids(&source_space_event);
+    append(&store, source_space_event);
+    let mut first_draft = context("Source Decision");
+    first_draft.relations = vec![ContextRelation {
+        target_context_id,
+        kind: ContextRelationKind::DependsOn,
+        rationale: "firstrelationneedle depends on the cross-Space Contract".to_owned(),
+        supports: vec!["The target Contract defines the source input".to_owned()],
+    }];
+    let first_source = Event::context_revision_added(source_space_id, first_draft, None).unwrap();
+    let (source_context_id, first_revision_id) = context_ids(&first_source);
+    append(&store, first_source);
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+
+    let mut second_draft = context("Updated Source Decision");
+    second_draft.relations = vec![ContextRelation {
+        target_context_id,
+        kind: ContextRelationKind::ValidatedBy,
+        rationale: "secondrelationneedle is validated by the cross-Space Contract".to_owned(),
+        supports: vec!["The target records the validation result".to_owned()],
+    }];
+    let revised = Event::context_revised(
+        source_space_id,
+        source_context_id,
+        vec![first_revision_id],
+        second_draft,
+        None,
+    )
+    .unwrap();
+    let second_revision_id = match revised.payload() {
+        EventPayload::ContextRevisionAdded { revision, .. } => revision.revision_id,
+        _ => unreachable!(),
+    };
+    append(&store, revised);
+    let incremental = index.synchronize().unwrap();
+    assert_eq!(incremental.update_kind, IndexUpdateKind::Incremental);
+    let connection = Connection::open(index.database_path()).unwrap();
+    assert_eq!(count(&connection, "context_relation"), 2);
+    assert_eq!(
+        count_where(
+            &connection,
+            "context_relation",
+            &format!(
+                "source_context_id = '{source_context_id}' AND target_context_id = '{target_context_id}'"
+            )
+        ),
+        2
+    );
+    assert_eq!(
+        count_where(
+            &connection,
+            "context_relation",
+            &format!("source_revision_id = '{first_revision_id}' AND kind = 'depends_on'")
+        ),
+        1
+    );
+    assert_eq!(
+        count_where(
+            &connection,
+            "context_relation",
+            &format!("source_revision_id = '{second_revision_id}' AND kind = 'validated_by'")
+        ),
+        1
+    );
+    assert_eq!(
+        count_fts_matches(&connection, "context_fts", "secondrelationneedle"),
+        1
+    );
+    drop(connection);
+
+    let scratch = ProjectionIndex::new(
+        store.repository(),
+        temporary.path().join("relation-scratch"),
     );
     scratch.rebuild().unwrap();
     assert_eq!(
@@ -1122,6 +1218,7 @@ fn assert_core_tables(connection: &Connection) {
         "intent_head",
         "context_item",
         "context_revision",
+        "context_relation",
         "engineering_reference",
         "review",
         "publication",
@@ -1186,6 +1283,7 @@ fn projection_dump(database: &Path) -> Vec<String> {
         "SELECT * FROM intent_head ORDER BY space_id, revision_id",
         "SELECT * FROM context_item ORDER BY context_id",
         "SELECT * FROM context_revision ORDER BY revision_id",
+        "SELECT * FROM context_relation ORDER BY source_revision_id, target_context_id, kind",
         "SELECT * FROM engineering_reference ORDER BY reference_id",
         "SELECT * FROM review ORDER BY event_id",
         "SELECT * FROM publication ORDER BY publication_id",

@@ -311,6 +311,9 @@ fn event_impact(path: &str, event: &Event) -> EventImpact {
             for evidence in &revision.evidence {
                 definitions.insert(identity("evidence", &evidence.evidence_id));
             }
+            for relation in &revision.relations {
+                references.insert(identity("context", &relation.target_context_id));
+            }
             add_references(&mut references, "revision", &revision.parent_revision_ids);
             Some(*space_id)
         }

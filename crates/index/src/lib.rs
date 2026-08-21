@@ -24,7 +24,7 @@ pub use sctx_domain::{Error, ErrorKind, Result};
 pub use tokenizer::{normalize_search_text, search_tokens};
 
 /// Current physical `SQLite` schema version.
-pub const DB_SCHEMA_VERSION: &str = "6";
+pub const DB_SCHEMA_VERSION: &str = "7";
 /// Event parser implementation version recorded in every projection.
 pub const EVENT_PARSER_VERSION: &str = "1";
 /// Pure reducer implementation version recorded in every projection.

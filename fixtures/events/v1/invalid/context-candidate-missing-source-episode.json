@@ -15,6 +15,7 @@
       },
       "assumptions": [],
       "recheck_when": [],
+      "relations": [],
       "evidence": [
         {
           "kind": "source_snapshot",

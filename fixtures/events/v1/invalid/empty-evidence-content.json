@@ -13,6 +13,7 @@
     "applicability": { "domains": [], "platforms": [], "conditions": [] },
     "assumptions": [],
     "recheck_when": [],
+    "relations": [],
     "evidence": [
       {
         "evidence_id": "evd_eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1",

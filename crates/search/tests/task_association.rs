@@ -72,6 +72,7 @@ fn context(statement: &str, applicability: Applicability) -> ContextRevisionDraf
         applicability,
         assumptions: vec!["fixture inputs remain stable".to_owned()],
         recheck_when: vec!["the fixture contract changes".to_owned()],
+        relations: Vec::new(),
         evidence: vec![EvidenceSnapshotDraft {
             kind: EvidenceType::ExperimentRecord,
             supports: "the association fixture is safe for retrieval".to_owned(),
