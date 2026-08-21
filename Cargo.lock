@@ -542,6 +542,8 @@ version = "0.1.0"
 dependencies = [
  "rusqlite",
  "sctx-domain",
+ "serde_json",
+ "sha2",
  "tempfile",
 ]
 

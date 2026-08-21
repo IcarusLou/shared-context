@@ -4,6 +4,14 @@
 //! Git common-dir observations, declared names, and remotes are matching hints;
 //! the generated [`RepositoryId`] remains the sole Repository identity.
 
+mod scanner;
+
+pub use scanner::{
+    ArtifactObservation, ArtifactSourceState, RepositoryScanOutcome, RepositoryScanner,
+    RepositoryScannerLimits, RepositorySnapshot, SkippedFile, SkippedFileReason, SnapshotArtifact,
+    SnapshotSourcePolicy, SourceLanguage,
+};
+
 use std::{
     collections::HashSet,
     fs,
