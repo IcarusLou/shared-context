@@ -9,19 +9,26 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
-    fmt,
+    fmt, fs,
     io::{self, BufRead, Write},
-    path::Path,
+    path::{Path, PathBuf},
     str::FromStr,
 };
 
 use sctx_domain::{
-    Applicability, ContextId, ContextKind, ContextRevisionDraft, Error, ErrorKind,
-    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, Result, RevisionId, SignalId,
-    SpaceId, TaskId, TaskIntentDraft, TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot,
-    TaskSignal, TaskSignalLifecycle, TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId,
+    Applicability, ArtifactKey, ArtifactKind, ContentFingerprint, ContextId, ContextKind,
+    ContextRevisionDraft, EngineeringReferenceDraft, Error, ErrorKind, EvidenceSnapshotDraft,
+    EvidenceType, ExternalSessionLocator, LocatorHints, ReferenceId, ReferenceRelation,
+    RepositoryId, ResolutionStatus, Result, RevisionId, SemanticFingerprint, SignalId, SpaceId,
+    TaskId, TaskIntentDraft, TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignal,
+    TaskSignalLifecycle, TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId,
 };
-use sctx_engineering_graph::EngineeringProjectionStore;
+use sctx_engineering_graph::{
+    CandidateMatchEvidence, EngineeringProjectionStore, EngineeringReferenceResolver,
+    ProjectedEngineeringReference, RegisterRepositoryRequest, RegisteredRepository,
+    RepositoryAvailability, RepositoryRegistry, RepositoryScanOutcome, RepositoryScanner,
+    ResolvedReferenceProjection,
+};
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::{DomainSnapshot, ProjectionIndex};
@@ -37,6 +44,8 @@ use serde_json::{Map, Value, json};
 /// Protocol version advertised when a client does not provide one.
 pub const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_SCAN_ARTIFACT_LIMIT: usize = 200;
+const MAX_SCAN_ARTIFACT_LIMIT: usize = 1_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -205,6 +214,197 @@ pub struct TaskContextResponse {
     pub omitted: Vec<ContextPackOmitted>,
 }
 
+/// Register-and-scan request for one canonical local Git worktree root.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryScanInput {
+    pub checkout_path: String,
+    #[serde(default)]
+    pub declared_identity: Option<String>,
+    #[serde(default)]
+    pub remote_hint: Option<String>,
+    #[serde(default = "default_scan_artifact_limit")]
+    pub max_artifacts: usize,
+}
+
+/// Bounded derived Artifact description. Full source is never retained or returned.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactSummary {
+    pub artifact_key: ArtifactKey,
+    pub kind: ArtifactKind,
+    pub display_name: String,
+    pub locator_hints: LocatorHints,
+    pub content_fingerprint: Option<ContentFingerprint>,
+    pub semantic_fingerprint: Option<SemanticFingerprint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RepositoryScanResponse {
+    pub repository_id: RepositoryId,
+    pub canonical_name: String,
+    pub checkout_path: PathBuf,
+    pub status: String,
+    pub repository_generation: Option<String>,
+    pub artifact_generation: Option<String>,
+    pub head_tree_oid: Option<String>,
+    pub scanned_files: usize,
+    pub scanned_bytes: u64,
+    pub artifact_count: usize,
+    pub omitted_artifact_count: usize,
+    pub skipped_file_count: usize,
+    pub artifacts: Vec<ArtifactSummary>,
+    pub unavailable_reason: Option<String>,
+    pub tree: String,
+    pub generation: u64,
+}
+
+/// Persistent engineering observation input. All new identities remain server-owned.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineeringReferenceRecordInput {
+    pub context_id: String,
+    pub revision_id: String,
+    pub repository_id: String,
+    pub artifact_kind: ArtifactKind,
+    pub relation: ReferenceRelation,
+    #[serde(default)]
+    pub locator_hints: Option<LocatorHints>,
+    #[serde(default)]
+    pub content_fingerprint: Option<String>,
+    #[serde(default)]
+    pub semantic_fingerprint: Option<String>,
+    pub supports: String,
+    pub limitations: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EngineeringReferenceRecordResponse {
+    pub context_id: ContextId,
+    pub revision_id: RevisionId,
+    pub repository_id: RepositoryId,
+    pub reference_id: ReferenceId,
+    pub event_id: sctx_domain::EventId,
+    pub batch_id: String,
+    pub commit_oid: String,
+    pub tree: String,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssociationExplainInput {
+    pub reference_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AssociationExplainResponse {
+    pub context_id: ContextId,
+    pub revision_id: RevisionId,
+    pub reference_id: ReferenceId,
+    pub repository_id: RepositoryId,
+    pub status: ResolutionStatus,
+    pub resolved_artifact: Option<ArtifactKey>,
+    pub ambiguity_candidates: Vec<ArtifactKey>,
+    pub evidence: Vec<CandidateMatchEvidence>,
+    pub graph_paths: Vec<Vec<String>>,
+    pub explanation: String,
+    pub artifact_generation: String,
+    pub context_tree_oid: Option<String>,
+    pub tree: String,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssociationRebuildInput {
+    #[serde(default)]
+    pub diagnose_only: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RepositoryRebuildSummary {
+    pub repository_id: RepositoryId,
+    pub status: String,
+    pub checkout_path: Option<PathBuf>,
+    pub repository_generation: Option<String>,
+    pub artifact_count: usize,
+    pub unavailable_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResolutionStatusCounts {
+    pub resolved: usize,
+    pub ambiguous: usize,
+    pub stale: usize,
+    pub unavailable: usize,
+    pub unresolved: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AssociationRebuildResponse {
+    pub diagnose_only: bool,
+    pub stored: bool,
+    pub artifact_generation: String,
+    pub context_tree_oid: String,
+    pub reference_count: usize,
+    pub repositories: Vec<RepositoryRebuildSummary>,
+    pub status_counts: ResolutionStatusCounts,
+    pub tree: String,
+    pub generation: u64,
+}
+
+impl RepositoryScanInput {
+    fn validate(&self) -> Result<()> {
+        if self.checkout_path.trim().is_empty() {
+            return Err(invalid("repository_scan.checkout_path must not be empty"));
+        }
+        if self.max_artifacts == 0 || self.max_artifacts > MAX_SCAN_ARTIFACT_LIMIT {
+            return Err(invalid(format!(
+                "repository_scan.max_artifacts must be between 1 and {MAX_SCAN_ARTIFACT_LIMIT}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl EngineeringReferenceRecordInput {
+    fn ids(&self) -> Result<(ContextId, RevisionId, RepositoryId)> {
+        Ok((
+            parse_id_value(&self.context_id, "context_id")?,
+            parse_id_value(&self.revision_id, "revision_id")?,
+            parse_id_value(&self.repository_id, "repository_id")?,
+        ))
+    }
+
+    fn draft(&self, repository_id: RepositoryId) -> Result<EngineeringReferenceDraft> {
+        if self.limitations.is_empty() {
+            return Err(invalid(
+                "engineering_reference_record.limitations must contain at least one limitation",
+            ));
+        }
+        let draft = EngineeringReferenceDraft {
+            repository_id,
+            artifact_kind: self.artifact_kind,
+            relation: self.relation,
+            locator_hints: self.locator_hints.clone(),
+            content_fingerprint: self
+                .content_fingerprint
+                .as_ref()
+                .map(|value| ContentFingerprint::new(value.clone()))
+                .transpose()?,
+            semantic_fingerprint: self
+                .semantic_fingerprint
+                .as_ref()
+                .map(|value| SemanticFingerprint::new(value.clone()))
+                .transpose()?,
+            supports: self.supports.clone(),
+            limitations: self.limitations.clone(),
+        };
+        draft.validate()?;
+        Ok(draft)
+    }
+}
+
 /// Typed failures for transport state that cannot be represented as a JSON-RPC response.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportErrorKind {
@@ -262,7 +462,8 @@ struct Frame {
 struct Runtime {
     store: GitStore,
     index: ProjectionIndex,
-    engineering_graph: EngineeringProjectionStore,
+    repositories: RepositoryRegistry,
+    engineering_graph: Option<EngineeringProjectionStore>,
     tasks: TaskRuntime,
 }
 
@@ -270,11 +471,13 @@ impl Runtime {
     fn open(root: &Path) -> Result<Self> {
         let store = GitStore::initialize(root)?;
         let index = ProjectionIndex::for_store(&store);
-        let engineering_graph = EngineeringProjectionStore::initialize(root)?;
+        let repositories = RepositoryRegistry::initialize(root)?;
+        let engineering_graph = EngineeringProjectionStore::initialize(root).ok();
         let tasks = TaskRuntime::initialize(root)?;
         Ok(Self {
             store,
             index,
+            repositories,
             engineering_graph,
             tasks,
         })
@@ -295,7 +498,7 @@ impl Runtime {
             })?;
         build_task_context_response(
             &self.index,
-            &self.engineering_graph,
+            self.engineering_graph.as_ref(),
             &snapshot,
             input.token_budget,
             input.max_spaces,
@@ -351,7 +554,7 @@ impl Runtime {
         };
         let context = build_task_context_response(
             &self.index,
-            &self.engineering_graph,
+            self.engineering_graph.as_ref(),
             &snapshot,
             default_token_budget(),
             default_max_spaces(),
@@ -405,6 +608,349 @@ impl Runtime {
             superseded_signal_ids: outcome.superseded_signal_ids,
             active_signals: active_signal_records(&self.tasks, active.task_session_id)?,
         })
+    }
+
+    fn repository_scan(&self, input: &RepositoryScanInput) -> Result<RepositoryScanResponse> {
+        input.validate()?;
+        let registered = self.repositories.register(&RegisterRepositoryRequest {
+            checkout_path: PathBuf::from(&input.checkout_path),
+            declared_identity: input.declared_identity.clone(),
+            remote_hint: input.remote_hint.clone(),
+        })?;
+        let requested = fs::canonicalize(&input.checkout_path).map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("canonicalize scan checkout: {error}"),
+            )
+        })?;
+        let locator = registered
+            .repository
+            .locators
+            .iter()
+            .find(|locator| {
+                locator.availability == RepositoryAvailability::Available
+                    && locator.checkout_path == requested
+                    && locator.checkout_path.exists()
+            })
+            .ok_or_else(|| invalid("registered Repository has no available local checkout"))?;
+        let outcome = RepositoryScanner::default()
+            .scan(&registered.repository.identity, &locator.checkout_path)?;
+        let metadata = self.index.synchronize()?.metadata;
+        Ok(repository_scan_response(
+            &registered.repository,
+            &locator.checkout_path,
+            outcome,
+            input.max_artifacts,
+            metadata.indexed_tree_oid,
+            metadata.projection_generation,
+        ))
+    }
+
+    fn engineering_reference_record(
+        &self,
+        input: &EngineeringReferenceRecordInput,
+    ) -> Result<EngineeringReferenceRecordResponse> {
+        let (context_id, revision_id, repository_id) = input.ids()?;
+        let snapshot = self.snapshot()?;
+        let (space_id, context) =
+            find_context(&snapshot, None, context_id).map_err(|failure| failure.error)?;
+        if !context.revisions.contains_key(&revision_id) {
+            return Err(invalid(format!(
+                "revision {revision_id} does not belong to Context {context_id}"
+            )));
+        }
+        if self.repositories.resolve_by_id(repository_id)?.is_none() {
+            return Err(invalid(format!(
+                "Repository does not exist: {repository_id}"
+            )));
+        }
+        let event = Event::engineering_reference_recorded(
+            context_id,
+            revision_id,
+            input.draft(repository_id)?,
+            None,
+        )?;
+        let reference_id = match event.payload() {
+            EventPayload::EngineeringReferenceRecorded { reference, .. } => reference.reference_id,
+            _ => unreachable!(),
+        };
+        let event_id = event.event_id();
+        let append = self.store.append_event(AppendRequest::event(event))?;
+        let metadata = self.index.synchronize()?.metadata;
+        debug_assert!(snapshot.projection.spaces.contains_key(&space_id));
+        Ok(EngineeringReferenceRecordResponse {
+            context_id,
+            revision_id,
+            repository_id,
+            reference_id,
+            event_id,
+            batch_id: append.batch_id.to_string(),
+            commit_oid: append.commit_oid,
+            tree: metadata.indexed_tree_oid,
+            generation: metadata.projection_generation,
+        })
+    }
+
+    fn association_rebuild(
+        &self,
+        input: &AssociationRebuildInput,
+    ) -> Result<AssociationRebuildResponse> {
+        let engineering_graph = self
+            .engineering_graph
+            .as_ref()
+            .ok_or_else(|| unavailable("Engineering projection storage is unavailable"))?;
+        let snapshot = self.snapshot()?;
+        let repositories = self.repositories.list()?;
+        let (scan_outcomes, repository_summaries) = scan_registered_repositories(&repositories)?;
+        let references = snapshot
+            .projection
+            .engineering_references
+            .values()
+            .map(|projection| ProjectedEngineeringReference {
+                context_id: projection.context_id,
+                revision_id: projection.revision_id,
+                reference: projection.reference.clone(),
+            })
+            .collect::<Vec<_>>();
+        let previous = engineering_graph.read_projection()?;
+        let projection =
+            EngineeringReferenceResolver.resolve(&references, &scan_outcomes, previous.as_ref())?;
+        if !input.diagnose_only {
+            engineering_graph
+                .rebuild_for_context_tree(&projection, Some(&snapshot.metadata.indexed_tree_oid))?;
+        }
+        let status_counts = resolution_status_counts(&projection.references);
+        Ok(AssociationRebuildResponse {
+            diagnose_only: input.diagnose_only,
+            stored: !input.diagnose_only,
+            artifact_generation: projection.artifact_generation,
+            context_tree_oid: snapshot.metadata.indexed_tree_oid.clone(),
+            reference_count: projection.references.len(),
+            repositories: repository_summaries,
+            status_counts,
+            tree: snapshot.metadata.indexed_tree_oid,
+            generation: snapshot.metadata.projection_generation,
+        })
+    }
+
+    fn association_explain(
+        &self,
+        input: &AssociationExplainInput,
+    ) -> Result<AssociationExplainResponse> {
+        let reference_id = parse_id_value(&input.reference_id, "reference_id")?;
+        let graph = self
+            .engineering_graph
+            .as_ref()
+            .ok_or_else(|| unavailable("Engineering projection storage is unavailable"))?
+            .read_snapshot()?
+            .ok_or_else(|| {
+                unavailable("Engineering projection is unavailable; run association_rebuild")
+            })?;
+        let projected = graph
+            .projection
+            .references
+            .iter()
+            .find(|reference| reference.reference_id == reference_id)
+            .ok_or_else(|| invalid(format!("Reference is not projected: {reference_id}")))?;
+        let metadata = self.index.synchronize()?.metadata;
+        Ok(association_explain_response(
+            projected,
+            graph.context_tree_oid,
+            metadata.indexed_tree_oid,
+            metadata.projection_generation,
+        ))
+    }
+}
+
+fn repository_scan_response(
+    repository: &RegisteredRepository,
+    checkout_path: &Path,
+    outcome: RepositoryScanOutcome,
+    max_artifacts: usize,
+    tree: String,
+    generation: u64,
+) -> RepositoryScanResponse {
+    match outcome {
+        RepositoryScanOutcome::Available(snapshot) => {
+            let artifact_count = snapshot.artifacts.len();
+            let artifacts = snapshot
+                .artifacts
+                .iter()
+                .take(max_artifacts)
+                .map(artifact_summary)
+                .collect::<Vec<_>>();
+            RepositoryScanResponse {
+                repository_id: repository.identity.repository_id,
+                canonical_name: repository.identity.canonical_name.clone(),
+                checkout_path: checkout_path.to_path_buf(),
+                status: "available".to_owned(),
+                repository_generation: Some(snapshot.generation.clone()),
+                artifact_generation: Some(snapshot.generation),
+                head_tree_oid: Some(snapshot.head_tree_oid),
+                scanned_files: snapshot.scanned_files,
+                scanned_bytes: snapshot.scanned_bytes,
+                artifact_count,
+                omitted_artifact_count: artifact_count.saturating_sub(artifacts.len()),
+                skipped_file_count: snapshot.skipped_files.len(),
+                artifacts,
+                unavailable_reason: None,
+                tree,
+                generation,
+            }
+        }
+        RepositoryScanOutcome::Unavailable {
+            repository_id,
+            reason,
+        } => RepositoryScanResponse {
+            repository_id,
+            canonical_name: repository.identity.canonical_name.clone(),
+            checkout_path: checkout_path.to_path_buf(),
+            status: "unavailable".to_owned(),
+            repository_generation: None,
+            artifact_generation: None,
+            head_tree_oid: None,
+            scanned_files: 0,
+            scanned_bytes: 0,
+            artifact_count: 0,
+            omitted_artifact_count: 0,
+            skipped_file_count: 0,
+            artifacts: Vec::new(),
+            unavailable_reason: Some(reason),
+            tree,
+            generation,
+        },
+    }
+}
+
+fn artifact_summary(artifact: &sctx_engineering_graph::SnapshotArtifact) -> ArtifactSummary {
+    ArtifactSummary {
+        artifact_key: artifact.artifact.artifact_key.clone(),
+        kind: artifact.artifact.artifact_key.kind(),
+        display_name: artifact.artifact.display_name.clone(),
+        locator_hints: artifact.artifact.locator_hints.clone(),
+        content_fingerprint: artifact.artifact.content_fingerprint.clone(),
+        semantic_fingerprint: artifact.artifact.semantic_fingerprint.clone(),
+    }
+}
+
+fn scan_registered_repositories(
+    repositories: &[RegisteredRepository],
+) -> Result<(Vec<RepositoryScanOutcome>, Vec<RepositoryRebuildSummary>)> {
+    let scanner = RepositoryScanner::default();
+    let mut outcomes = Vec::with_capacity(repositories.len());
+    let mut summaries = Vec::with_capacity(repositories.len());
+    for repository in repositories {
+        let locator = repository.locators.iter().find(|locator| {
+            locator.availability == RepositoryAvailability::Available
+                && locator.checkout_path.exists()
+        });
+        let outcome = if let Some(locator) = locator {
+            scanner.scan(&repository.identity, &locator.checkout_path)?
+        } else {
+            RepositoryScanOutcome::Unavailable {
+                repository_id: repository.identity.repository_id,
+                reason: "Repository has no available registered checkout".to_owned(),
+            }
+        };
+        let summary = match &outcome {
+            RepositoryScanOutcome::Available(snapshot) => RepositoryRebuildSummary {
+                repository_id: snapshot.repository_id,
+                status: "available".to_owned(),
+                checkout_path: locator.map(|locator| locator.checkout_path.clone()),
+                repository_generation: Some(snapshot.generation.clone()),
+                artifact_count: snapshot.artifacts.len(),
+                unavailable_reason: None,
+            },
+            RepositoryScanOutcome::Unavailable {
+                repository_id,
+                reason,
+            } => RepositoryRebuildSummary {
+                repository_id: *repository_id,
+                status: "unavailable".to_owned(),
+                checkout_path: None,
+                repository_generation: None,
+                artifact_count: 0,
+                unavailable_reason: Some(reason.clone()),
+            },
+        };
+        outcomes.push(outcome);
+        summaries.push(summary);
+    }
+    Ok((outcomes, summaries))
+}
+
+fn resolution_status_counts(references: &[ResolvedReferenceProjection]) -> ResolutionStatusCounts {
+    let mut counts = ResolutionStatusCounts {
+        resolved: 0,
+        ambiguous: 0,
+        stale: 0,
+        unavailable: 0,
+        unresolved: 0,
+    };
+    for reference in references {
+        match reference.resolution.status {
+            ResolutionStatus::Resolved => counts.resolved += 1,
+            ResolutionStatus::Ambiguous => counts.ambiguous += 1,
+            ResolutionStatus::Stale => counts.stale += 1,
+            ResolutionStatus::Unavailable => counts.unavailable += 1,
+            ResolutionStatus::Unresolved => counts.unresolved += 1,
+        }
+    }
+    counts
+}
+
+fn association_explain_response(
+    projected: &ResolvedReferenceProjection,
+    context_tree_oid: Option<String>,
+    tree: String,
+    generation: u64,
+) -> AssociationExplainResponse {
+    let candidates = if projected.resolution.candidates.is_empty() {
+        projected
+            .resolution
+            .resolved_artifact
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        projected.resolution.candidates.clone()
+    };
+    let graph_paths = if candidates.is_empty() {
+        vec![vec![
+            format!("reference:{}", projected.reference_id),
+            format!("repository:{}", projected.resolution.repository_id),
+            format!("context:{}", projected.context_id),
+            format!("revision:{}", projected.revision_id),
+        ]]
+    } else {
+        candidates
+            .iter()
+            .map(|artifact| {
+                vec![
+                    format!("reference:{}", projected.reference_id),
+                    format!("repository:{}", projected.resolution.repository_id),
+                    format!("artifact:{:?}:{}", artifact.kind(), artifact.digest()),
+                    format!("context:{}", projected.context_id),
+                    format!("revision:{}", projected.revision_id),
+                ]
+            })
+            .collect()
+    };
+    AssociationExplainResponse {
+        context_id: projected.context_id,
+        revision_id: projected.revision_id,
+        reference_id: projected.reference_id,
+        repository_id: projected.resolution.repository_id,
+        status: projected.resolution.status,
+        resolved_artifact: projected.resolution.resolved_artifact.clone(),
+        ambiguity_candidates: projected.resolution.candidates.clone(),
+        evidence: projected.evidence.clone(),
+        graph_paths,
+        explanation: projected.resolution.explanation.clone(),
+        artifact_generation: projected.artifact_generation.clone(),
+        context_tree_oid,
+        tree,
+        generation,
     }
 }
 
@@ -549,9 +1095,57 @@ pub fn task_signal_supersede_at_root(
     Runtime::open(root.as_ref())?.task_signal_supersede(input)
 }
 
+/// Registers and scans one canonical local Git Repository without returning source text.
+///
+/// # Errors
+///
+/// Returns typed validation, Registry, scanner, or projection errors.
+pub fn repository_scan_at_root(
+    root: impl AsRef<Path>,
+    input: &RepositoryScanInput,
+) -> Result<RepositoryScanResponse> {
+    Runtime::open(root.as_ref())?.repository_scan(input)
+}
+
+/// Appends one server-identified persistent Engineering Reference Event.
+///
+/// # Errors
+///
+/// Returns typed target, Repository, privacy, Writer, or projection errors.
+pub fn engineering_reference_record_at_root(
+    root: impl AsRef<Path>,
+    input: &EngineeringReferenceRecordInput,
+) -> Result<EngineeringReferenceRecordResponse> {
+    Runtime::open(root.as_ref())?.engineering_reference_record(input)
+}
+
+/// Rebuilds or diagnoses the current Engineering projection from registered Repositories.
+///
+/// # Errors
+///
+/// Returns typed Registry, scanner, resolver, projection, or Context snapshot errors.
+pub fn association_rebuild_at_root(
+    root: impl AsRef<Path>,
+    input: &AssociationRebuildInput,
+) -> Result<AssociationRebuildResponse> {
+    Runtime::open(root.as_ref())?.association_rebuild(input)
+}
+
+/// Explains one current Reference resolution without selecting ambiguous candidates.
+///
+/// # Errors
+///
+/// Returns typed projection availability, identity, or storage errors.
+pub fn association_explain_at_root(
+    root: impl AsRef<Path>,
+    input: &AssociationExplainInput,
+) -> Result<AssociationExplainResponse> {
+    Runtime::open(root.as_ref())?.association_explain(input)
+}
+
 fn build_task_context_response(
     index: &ProjectionIndex,
-    engineering_graph: &EngineeringProjectionStore,
+    engineering_graph: Option<&EngineeringProjectionStore>,
     snapshot: &TaskSessionSnapshot,
     token_budget: usize,
     max_spaces: usize,
@@ -565,8 +1159,12 @@ fn build_task_context_response(
         token_budget,
     );
     request.max_spaces = max_spaces;
-    let pack = SearchEngine::with_engineering_graph(index.clone(), engineering_graph.clone())
-        .task_context_pack(&request)?;
+    let pack = if let Some(engineering_graph) = engineering_graph {
+        SearchEngine::with_engineering_graph(index.clone(), engineering_graph.clone())
+            .task_context_pack(&request)?
+    } else {
+        SearchEngine::new(index.clone()).task_context_pack(&request)?
+    };
     let retrieval_paths = pack
         .items
         .iter()
@@ -759,6 +1357,10 @@ impl McpServer {
             "task_intent_update" => self.task_intent_update(call.arguments),
             "task_signal_supersede" => self.task_signal_supersede(call.arguments),
             "task_context" => self.task_context(call.arguments),
+            "repository_scan" => self.repository_scan(call.arguments),
+            "engineering_reference_record" => self.engineering_reference_record(call.arguments),
+            "association_explain" => self.association_explain(call.arguments),
+            "association_rebuild" => self.association_rebuild(call.arguments),
             "context_search" => self.context_search(call.arguments),
             "context_get" => self.context_get(call.arguments),
             "candidate_create" => self.candidate_create(call.arguments),
@@ -818,6 +1420,42 @@ impl McpServer {
             .runtime
             .task_signal_supersede(&input)
             .map_err(ToolFailure::task_context_failed)?;
+        serde_json::to_value(response).map_err(serialization_failure)
+    }
+
+    fn repository_scan(&self, arguments: Value) -> ToolResult {
+        let input: RepositoryScanInput = decode_arguments(arguments)?;
+        let response = self
+            .runtime
+            .repository_scan(&input)
+            .map_err(ToolFailure::engineering_graph_failed)?;
+        serde_json::to_value(response).map_err(serialization_failure)
+    }
+
+    fn engineering_reference_record(&self, arguments: Value) -> ToolResult {
+        let input: EngineeringReferenceRecordInput = decode_arguments(arguments)?;
+        let response = self
+            .runtime
+            .engineering_reference_record(&input)
+            .map_err(ToolFailure::engineering_graph_failed)?;
+        serde_json::to_value(response).map_err(serialization_failure)
+    }
+
+    fn association_explain(&self, arguments: Value) -> ToolResult {
+        let input: AssociationExplainInput = decode_arguments(arguments)?;
+        let response = self
+            .runtime
+            .association_explain(&input)
+            .map_err(ToolFailure::engineering_graph_failed)?;
+        serde_json::to_value(response).map_err(serialization_failure)
+    }
+
+    fn association_rebuild(&self, arguments: Value) -> ToolResult {
+        let input: AssociationRebuildInput = decode_arguments(arguments)?;
+        let response = self
+            .runtime
+            .association_rebuild(&input)
+            .map_err(ToolFailure::engineering_graph_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
     }
 
@@ -980,6 +1618,18 @@ impl ToolFailure {
             ErrorKind::External => "task_runtime_conflict",
             ErrorKind::Unsupported => "task_context_unsupported",
             _ => "task_context_failed",
+        };
+        Self { code, error }
+    }
+
+    fn engineering_graph_failed(error: Error) -> Self {
+        let code = match error.kind() {
+            ErrorKind::InvalidInput => "invalid_input",
+            ErrorKind::InvariantViolation => "engineering_graph_invariant",
+            ErrorKind::Io => "engineering_graph_storage_failed",
+            ErrorKind::External => "engineering_graph_unavailable",
+            ErrorKind::Unsupported => "engineering_graph_unsupported",
+            _ => "engineering_graph_failed",
         };
         Self { code, error }
     }
@@ -1153,6 +1803,35 @@ fn tools_list() -> Value {
             })
         ),
         tool_schema(
+            "repository_scan",
+            "Register and scan one canonical local Git Repository, returning bounded Artifact summaries without source text.",
+            repository_scan_schema()
+        ),
+        tool_schema(
+            "engineering_reference_record",
+            "Record one verified engineering observation for an existing Context revision; Reference/Event identity and storage path are server-owned.",
+            engineering_reference_record_schema()
+        ),
+        tool_schema(
+            "association_explain",
+            "Explain one current Engineering Reference resolution, evidence, ambiguity candidates, and graph paths without selecting a candidate.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["reference_id"],
+                "properties": {"reference_id": id_schema("ref_")}
+            })
+        ),
+        tool_schema(
+            "association_rebuild",
+            "Rebuild or diagnose Engineering Reference resolution from current registered local Repositories.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {"diagnose_only": {"type": "boolean", "default": false}}
+            })
+        ),
+        tool_schema(
             "context_search",
             "Search Context revisions with stable filters, pagination, conflicts, and match reasons.",
             search_schema()
@@ -1182,6 +1861,58 @@ fn tools_list() -> Value {
             json!({"type": "object", "additionalProperties": false, "properties": {}})
         )
     ]})
+}
+
+fn repository_scan_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["checkout_path"],
+        "properties": {
+            "checkout_path": {"type": "string", "minLength": 1},
+            "declared_identity": {"type": "string", "minLength": 1},
+            "remote_hint": {"type": "string", "minLength": 1},
+            "max_artifacts": {"type": "integer", "minimum": 1, "maximum": MAX_SCAN_ARTIFACT_LIMIT, "default": DEFAULT_SCAN_ARTIFACT_LIMIT}
+        }
+    })
+}
+
+fn engineering_reference_record_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["context_id", "revision_id", "repository_id", "artifact_kind", "relation", "supports", "limitations"],
+        "properties": {
+            "context_id": id_schema("ctx_"),
+            "revision_id": id_schema("rev_"),
+            "repository_id": id_schema("rpo_"),
+            "artifact_kind": {"type": "string", "enum": ["repository", "module", "file", "symbol", "api", "schema", "test"]},
+            "relation": {"type": "string", "enum": ["implements", "defines", "consumes", "validates", "constrains", "depends_on"]},
+            "locator_hints": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "module": {"type": "string", "minLength": 1},
+                    "path": {"type": "string", "minLength": 1},
+                    "symbol": {"type": "string", "minLength": 1},
+                    "language": {"type": "string", "minLength": 1},
+                    "api_or_schema": {"type": "string", "minLength": 1},
+                    "line": {"type": "integer", "minimum": 1},
+                    "commit": {"type": "string", "minLength": 1}
+                },
+                "minProperties": 1
+            },
+            "content_fingerprint": {"type": "string", "minLength": 1},
+            "semantic_fingerprint": {"type": "string", "minLength": 1},
+            "supports": {"type": "string", "minLength": 1},
+            "limitations": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+        },
+        "anyOf": [
+            {"required": ["locator_hints"]},
+            {"required": ["content_fingerprint"]},
+            {"required": ["semantic_fingerprint"]}
+        ]
+    })
 }
 
 fn task_intent_update_schema() -> Value {
@@ -1619,6 +2350,10 @@ const fn default_max_spaces() -> usize {
     DEFAULT_TASK_MAX_SPACES
 }
 
+const fn default_scan_artifact_limit() -> usize {
+    DEFAULT_SCAN_ARTIFACT_LIMIT
+}
+
 const fn error_code(kind: ErrorKind) -> &'static str {
     match kind {
         ErrorKind::InvalidInput => "invalid_input",
@@ -1634,6 +2369,20 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::InvalidInput, message)
 }
 
+fn unavailable(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::External, message)
+}
+
 fn invariant(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::InvariantViolation, message)
+}
+
+fn parse_id_value<T>(value: &str, field: &str) -> Result<T>
+where
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    value
+        .parse()
+        .map_err(|error| invalid(format!("invalid {field}: {error}")))
 }

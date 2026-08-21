@@ -641,7 +641,7 @@ impl SearchEngine {
         let artifact_hints = artifact_hints(signals);
         let scope_targets = ScopeTargets::from_intent(intent);
         for _attempt in 0..3 {
-            let graph_snapshot = self.read_graph_snapshot()?;
+            let graph_snapshot = self.read_graph_snapshot();
             let snapshot = self.index.query_snapshot(|connection| {
                 let tree_oid = meta(connection, "indexed_tree_oid")?;
                 let graph = graph_for_tree(graph_snapshot.as_ref(), &tree_oid);
@@ -659,7 +659,7 @@ impl SearchEngine {
             })?;
             let used_graph =
                 graph_for_tree(graph_snapshot.as_ref(), &snapshot.metadata.indexed_tree_oid);
-            if used_graph.is_some() && !self.graph_snapshot_unchanged(graph_snapshot.as_ref())? {
+            if used_graph.is_some() && !self.graph_snapshot_unchanged(graph_snapshot.as_ref()) {
                 continue;
             }
             return Ok(TaskSpaceAssociationsResponse {
@@ -691,7 +691,7 @@ impl SearchEngine {
         let artifact_hints = artifact_hints(&request.task_signals);
         let scope_targets = ScopeTargets::from_intent(&request.task_intent);
         for _attempt in 0..3 {
-            let graph_snapshot = self.read_graph_snapshot()?;
+            let graph_snapshot = self.read_graph_snapshot();
             let snapshot = self.index.query_snapshot(|connection| {
                 let tree_oid = meta(connection, "indexed_tree_oid")?;
                 let graph = graph_for_tree(graph_snapshot.as_ref(), &tree_oid);
@@ -732,7 +732,7 @@ impl SearchEngine {
             })?;
             let used_graph =
                 graph_for_tree(graph_snapshot.as_ref(), &snapshot.metadata.indexed_tree_oid);
-            if used_graph.is_some() && !self.graph_snapshot_unchanged(graph_snapshot.as_ref())? {
+            if used_graph.is_some() && !self.graph_snapshot_unchanged(graph_snapshot.as_ref()) {
                 continue;
             }
             return Ok(TaskContextPack {
@@ -754,20 +754,15 @@ impl SearchEngine {
         ))
     }
 
-    fn read_graph_snapshot(&self) -> Result<Option<EngineeringProjectionSnapshot>> {
+    fn read_graph_snapshot(&self) -> Option<EngineeringProjectionSnapshot> {
         self.engineering_graph
             .as_ref()
-            .map(EngineeringProjectionStore::read_snapshot)
-            .transpose()
-            .map(Option::flatten)
+            .and_then(|store| store.read_snapshot().ok().flatten())
     }
 
-    fn graph_snapshot_unchanged(
-        &self,
-        before: Option<&EngineeringProjectionSnapshot>,
-    ) -> Result<bool> {
-        let after = self.read_graph_snapshot()?;
-        Ok(graph_snapshot_identity(before) == graph_snapshot_identity(after.as_ref()))
+    fn graph_snapshot_unchanged(&self, before: Option<&EngineeringProjectionSnapshot>) -> bool {
+        let after = self.read_graph_snapshot();
+        graph_snapshot_identity(before) == graph_snapshot_identity(after.as_ref())
     }
 
     /// Searches and expands Evidence/conflicts within one read transaction.

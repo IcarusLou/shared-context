@@ -27,13 +27,17 @@ use sctx_domain::{
     PublicationDraft, ResolutionOutcome, Result, ReviewDraft, ReviewSummary, ReviewVerdict,
     RevisionId, SemanticConflictDraft, SpaceId, TaskSignal, TaskSignalKind, WorkEpisodeId,
 };
+use sctx_engineering_graph::{RegisterRepositoryRequest, RepositoryRegistry};
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendOutcome, AppendRequest, BatchId, CandidateAppendOutcome, GitStore};
 use sctx_index::{
     DomainSnapshot, IndexMetadata, ProjectionDiagnosticView, ProjectionIndex, RebuildOutcome,
 };
 use sctx_local_state::{Breadcrumb, BreadcrumbKind, CaptureStore};
-use sctx_mcp::{TaskContextReadInput, TaskIntentUpdateInput, TaskSignalSupersedeInput};
+use sctx_mcp::{
+    AssociationExplainInput, AssociationRebuildInput, EngineeringReferenceRecordInput,
+    RepositoryScanInput, TaskContextReadInput, TaskIntentUpdateInput, TaskSignalSupersedeInput,
+};
 use sctx_search::{ContextStatus, ScopeFilter, SearchEngine, SearchFilters, SearchRequest};
 use sctx_task_runtime::TaskRuntime;
 use serde::{Deserialize, Serialize};
@@ -57,6 +61,9 @@ Commands:
   context revise|review|publish|withdraw|get
   semantic conflict open|resolve
   task context|intent update|signal supersede
+  repository scan
+  engineering-reference record
+  association explain|rebuild
   search
   index rebuild|status
   pending list|commit|move-aside
@@ -145,6 +152,11 @@ fn run(args: &[String], json_output: bool) -> Result<()> {
         [group, rest @ ..] if group == "context" => run_context(rest, json_output),
         [group, rest @ ..] if group == "semantic" => run_semantic(rest, json_output),
         [group, rest @ ..] if group == "task" => run_task(rest, json_output),
+        [group, rest @ ..] if group == "repository" => run_repository(rest, json_output),
+        [group, rest @ ..] if group == "engineering-reference" => {
+            run_engineering_reference(rest, json_output)
+        }
+        [group, rest @ ..] if group == "association" => run_association(rest, json_output),
         [command, rest @ ..] if command == "search" => run_search(rest, json_output),
         [group, rest @ ..] if group == "index" => run_index(rest, json_output),
         [group, rest @ ..] if group == "pending" => run_pending(rest, json_output),
@@ -612,8 +624,8 @@ fn verify_demo_mcp(
         .and_then(|response| response.pointer("/result/tools"))
         .and_then(Value::as_array)
         .ok_or_else(|| invariant("demo MCP tools/list response is missing"))?;
-    if tools.len() != 7 {
-        return Err(invariant("demo MCP tools/list did not return seven tools"));
+    if tools.len() != 11 {
+        return Err(invariant("demo MCP tools/list did not return eleven tools"));
     }
     let results = responses
         .get(2)
@@ -762,6 +774,12 @@ fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<Option<Stri
             tool_name,
             outcome,
         } => {
+            let root = installation_root()?;
+            let runtime = TaskRuntime::initialize(&root)?;
+            if runtime.read_snapshot_by_locator(&locator)?.is_none() {
+                return Ok(None);
+            }
+            refresh_registered_repositories(&root, &cwd, &workspace_roots)?;
             let signals = normalized_observation_signals(
                 &cwd,
                 &workspace_roots,
@@ -770,12 +788,67 @@ fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<Option<Stri
                 outcome,
             );
             if !signals.is_empty() {
-                let runtime = TaskRuntime::initialize(installation_root()?)?;
                 let _outcome = runtime.merge_signals_by_locator(&locator, signals)?;
             }
             Ok(None)
         }
     }
+}
+
+fn refresh_registered_repositories(
+    root: &Path,
+    cwd: &Path,
+    workspace_roots: &[PathBuf],
+) -> Result<()> {
+    let candidates = if workspace_roots.is_empty() {
+        vec![cwd.to_path_buf()]
+    } else {
+        workspace_roots.to_vec()
+    };
+    let mut repositories = BTreeSet::new();
+    for candidate in candidates {
+        let Ok(metadata) = fs::symlink_metadata(&candidate) else {
+            continue;
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let Ok(candidate) = fs::canonicalize(candidate) else {
+            continue;
+        };
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&candidate)
+            .args(["rev-parse", "--show-toplevel"])
+            .output();
+        let Ok(output) = output else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let Ok(top_level) = String::from_utf8(output.stdout) else {
+            continue;
+        };
+        let Ok(top_level) = fs::canonicalize(top_level.trim()) else {
+            continue;
+        };
+        if top_level == candidate {
+            repositories.insert(candidate);
+        }
+    }
+    if repositories.is_empty() {
+        return Ok(());
+    }
+    let registry = RepositoryRegistry::initialize(root.to_path_buf())?;
+    for checkout_path in repositories {
+        registry.register(&RegisterRepositoryRequest {
+            checkout_path,
+            declared_identity: None,
+            remote_hint: None,
+        })?;
+    }
+    Ok(())
 }
 
 fn normalized_observation_signals(
@@ -1639,6 +1712,116 @@ fn run_task_context(args: &[String], json_output: bool) -> Result<()> {
         &data,
         json_output,
     )
+}
+
+fn run_repository(args: &[String], json_output: bool) -> Result<()> {
+    let [command, rest @ ..] = args else {
+        return Err(invalid("Usage: sctx repository scan [OPTIONS]"));
+    };
+    if command != "scan" {
+        return Err(invalid("repository command must be scan"));
+    }
+    let options = Options::parse(rest, &[])?;
+    options.allow_only(
+        &[
+            "--checkout-path",
+            "--declared-identity",
+            "--remote-hint",
+            "--max-artifacts",
+        ],
+        &[],
+    )?;
+    let input = RepositoryScanInput {
+        checkout_path: options.required("--checkout-path")?.to_owned(),
+        declared_identity: options.optional("--declared-identity")?.map(str::to_owned),
+        remote_hint: options.optional("--remote-hint")?.map(str::to_owned),
+        max_artifacts: parse_usize(
+            options.optional("--max-artifacts")?.unwrap_or("200"),
+            "max artifacts",
+        )?,
+    };
+    let response = sctx_mcp::repository_scan_at_root(installation_root()?, &input)?;
+    let data = serde_json::to_value(&response).map_err(json_error("serialize Repository scan"))?;
+    emit_raw(
+        "repository.scan",
+        &response.tree,
+        response.generation,
+        &data,
+        json_output,
+    )
+}
+
+fn run_engineering_reference(args: &[String], json_output: bool) -> Result<()> {
+    let [command, rest @ ..] = args else {
+        return Err(invalid(
+            "Usage: sctx engineering-reference record --input <JSON>",
+        ));
+    };
+    if command != "record" {
+        return Err(invalid("engineering-reference command must be record"));
+    }
+    let options = Options::parse(rest, &[])?;
+    options.allow_only(&["--input"], &[])?;
+    let input: EngineeringReferenceRecordInput =
+        read_json(options.required("--input")?, "Engineering Reference record")?;
+    let response = sctx_mcp::engineering_reference_record_at_root(installation_root()?, &input)?;
+    let data = serde_json::to_value(&response)
+        .map_err(json_error("serialize Engineering Reference record"))?;
+    emit_raw(
+        "engineering-reference.record",
+        &response.tree,
+        response.generation,
+        &data,
+        json_output,
+    )
+}
+
+fn run_association(args: &[String], json_output: bool) -> Result<()> {
+    match args {
+        [command, rest @ ..] if command == "explain" => {
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(&["--reference-id"], &[])?;
+            let response = sctx_mcp::association_explain_at_root(
+                installation_root()?,
+                &AssociationExplainInput {
+                    reference_id: options.required("--reference-id")?.to_owned(),
+                },
+            )?;
+            let data = serde_json::to_value(&response)
+                .map_err(json_error("serialize Association explanation"))?;
+            emit_raw(
+                "association.explain",
+                &response.tree,
+                response.generation,
+                &data,
+                json_output,
+            )
+        }
+        [command, rest @ ..] if command == "rebuild" => {
+            let options = Options::parse(rest, &["--diagnose"])?;
+            options.allow_only(&[], &["--diagnose"])?;
+            let response = sctx_mcp::association_rebuild_at_root(
+                installation_root()?,
+                &AssociationRebuildInput {
+                    diagnose_only: options.has("--diagnose"),
+                },
+            )?;
+            let data = serde_json::to_value(&response)
+                .map_err(json_error("serialize Association rebuild"))?;
+            emit_raw(
+                if response.diagnose_only {
+                    "association.diagnose"
+                } else {
+                    "association.rebuild"
+                },
+                &response.tree,
+                response.generation,
+                &data,
+                json_output,
+            )
+        }
+        _ => Err(invalid("Usage: sctx association explain|rebuild [OPTIONS]")),
+    }
 }
 
 fn run_index(args: &[String], json_output: bool) -> Result<()> {

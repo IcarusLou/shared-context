@@ -5,7 +5,7 @@ use std::{
     process::{Child, Command, Stdio},
 };
 
-use sctx_domain::IntentSnapshot;
+use sctx_domain::{ExternalSessionLocator, IntentSnapshot, TaskId, TaskIntent};
 use sctx_event_schema::Event;
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::ProjectionIndex;
@@ -187,6 +187,23 @@ fn initialize_store(harness: &Harness) -> GitStore {
     GitStore::initialize(harness.root()).unwrap()
 }
 
+fn task_intent(task_id: TaskId) -> TaskIntent {
+    TaskIntent {
+        task_id,
+        goal: "Refresh the registered engineering repository".to_owned(),
+        desired_change: "Observe verified local Git repository state".to_owned(),
+        in_scope: Vec::new(),
+        out_of_scope: Vec::new(),
+        domains: Vec::new(),
+        platforms: Vec::new(),
+        constraints: Vec::new(),
+        acceptance_conditions: Vec::new(),
+        artifacts: Vec::new(),
+        interfaces: Vec::new(),
+        unknowns: Vec::new(),
+    }
+}
+
 #[test]
 fn codex_hook_fails_open_when_runtime_database_path_cannot_open() {
     let harness = Harness::new();
@@ -295,6 +312,43 @@ fn cursor_post_tool_hook_fails_open_when_runtime_is_unavailable() {
     fs::write(&file, "fn contract() {}\n").unwrap();
     fs::create_dir(harness.root().join("state/runtime.sqlite")).unwrap();
     let secret = "CURSOR_RAW_SECRET_MUST_NOT_LEAK";
+
+    let output = harness.hook("cursor", &cursor_post_tool(&workspace, &file, secret));
+    assert_fail_open(
+        &output,
+        "additional_context",
+        DIAGNOSTIC,
+        &harness.root(),
+        secret,
+    );
+}
+
+#[test]
+fn cursor_post_tool_hook_fails_open_when_repository_registry_is_unavailable() {
+    let harness = Harness::new();
+    initialize_store(&harness);
+    let workspace = harness.home.join("registry workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&workspace)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let file = workspace.join("contract.rs");
+    fs::write(&file, "fn contract() {}\n").unwrap();
+    TaskRuntime::initialize(harness.root())
+        .unwrap()
+        .open_or_create(
+            ExternalSessionLocator::new("cursor", "cursor-fail-open").unwrap(),
+            task_intent(TaskId::new()),
+            Vec::new(),
+        )
+        .unwrap();
+    fs::create_dir(harness.root().join("state/repository-registry.sqlite")).unwrap();
+    let secret = "CURSOR_REGISTRY_SECRET_MUST_NOT_LEAK";
 
     let output = harness.hook("cursor", &cursor_post_tool(&workspace, &file, secret));
     assert_fail_open(

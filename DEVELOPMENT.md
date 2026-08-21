@@ -2,7 +2,7 @@
 
 ## 当前实现边界
 
-仓库已完成 **M1：Task-first 领域与入口基础** 和 **M2：Task Runtime 与多 Space Retrieval**：
+仓库已完成 **M1：Task-first 领域与入口基础**、**M2：Task Runtime 与多 Space Retrieval**，并正在实现 M3：
 
 - `TaskIntent` 不包含 Space 路由；Task 与 Space 的相关性由独立的 `TaskSpaceAssociation` 表达，并允许 `0..N` 个结果。
 - 不存在 Workspace-to-Space 绑定类型、全局 Active Space、对应配置或绑定命令。
@@ -10,14 +10,15 @@
 - `task_intent_update` 是 Task Intent 的唯一写入口并返回更新后的 TaskContextPack；`task_signal_supersede` 是 Signal 失效入口。
 - `TaskContextPack` 在同一 Tree/Generation 上推断 `0..N` 个 Space，且每个 Context 都链接到 Association 和 typed M2 RetrievalPath。
 - 同一 Workspace 下的 external Session 独立持有 TaskIntent 与 TaskSignals；Codex PostToolUse 的受控 File/Test observation 会改变后续检索路径。
-- M2 中 Workspace 与本地 Repository 路径只作为位置 observation 持久化，不进入相关性文本或 Task fingerprint；稳定 Repository identity 和代码关系解析属于 M3。
+- Workspace 不形成 Space prior；已有 ActiveTask 的 canonical Git Workspace root 会刷新本地 Repository Registry。
+- 受限 Scanner、持久 Engineering Reference、可重建解析投影和 Graph RetrievalPath 已通过显式 MCP/CLI 工作流接入。
 - `WorkEpisode` 和无 Space 的 `ContextCandidate` 领域类型已经存在。
 - `candidate_create` 是当前 Candidate 写入主入口；CLI 与 MCP 都生成服务端 ID，且未确认 Candidate 不参与自动注入。
 - 既有 Git Writer、事件校验、SQLite 投影、Context 生命周期、CLI/MCP、Agent Adapter、安装器和 NPM 分发能力继续作为 M1 的基础设施。
 
 以下能力**尚未实现**，不得在代码、测试报告或评审中宣称已经具备：
 
-- **M3：未实现** — Engineering Graph、Repository/File/Symbol/API/Schema/Test 关联、重新解析与关系扩展。
+- **M3：部分实现** — Registry、Scanner、Reference、Resolver、Projection 与 Graph Retrieval 已实现；阶段总验收和更多真实规模评测尚未完成。
 - **M4：未实现** — WorkEpisode 自动聚合、AgentCheckpoint、Candidate Builder、去重/冲突/Space 推荐和 Candidate confirm/list/discard。
 
 Cursor 与 Codex 都通过显式 `task_intent_update` 建立权威 Task；Prompt Hook 只提供能力提示。已有 ActiveTask 可通过只读 `task_context` 再取 Pack。

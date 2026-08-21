@@ -83,6 +83,7 @@ fn linked_worktrees_converge_through_verified_common_dir() {
         second.repository.locators[0].git_common_dir_identity,
         second.repository.locators[1].git_common_dir_identity
     );
+    assert_eq!(registry.list().unwrap(), vec![second.repository]);
 }
 
 #[test]
@@ -102,6 +103,9 @@ fn different_repositories_with_same_basename_and_remote_never_auto_merge() {
         first.repository.identity.repository_id,
         second.repository.identity.repository_id
     );
+    let listed = registry.list().unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(listed[0].identity.repository_id < listed[1].identity.repository_id);
     let error = registry
         .resolve_by_locator(&RepositoryLocatorQuery::RemoteHint(remote.to_owned()))
         .unwrap_err();

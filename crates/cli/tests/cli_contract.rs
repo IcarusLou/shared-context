@@ -12,6 +12,7 @@ use sctx_domain::{
     EvidenceSnapshotDraft, ExternalSessionLocator, IntentSnapshot, PublicationAction,
     PublicationDraft, Result, SpaceId, TaskIntentDraft, TaskSignalKind, WorkEpisodeId,
 };
+use sctx_engineering_graph::{RepositoryLocatorQuery, RepositoryRegistry};
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CrashInjector, CrashSeam, GitStore};
 use sctx_mcp::{
@@ -686,6 +687,41 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_retrieval_paths
         .unwrap()
         .unwrap();
     assert_ne!(alpha_snapshot.task_id, beta_snapshot.task_id);
+    let canonical_workspace = fs::canonicalize(&workspace).unwrap();
+    let registered = RepositoryRegistry::initialize(harness.root())
+        .unwrap()
+        .resolve_by_locator(&RepositoryLocatorQuery::CheckoutPath(canonical_workspace))
+        .unwrap()
+        .expect("ActiveTask PostToolUse must register its canonical Git Workspace root");
+    assert_eq!(registered.locators.len(), 1);
+    task_intent_update_at_root(
+        harness.root(),
+        &intent_update("session-subdir", "subdirectory task", None),
+    )
+    .unwrap();
+    let subdirectory_post = hook(&serde_json::json!({
+        "session_id": "session-subdir",
+        "transcript_path": null,
+        "cwd": workspace.join("src"),
+        "hook_event_name": "PostToolUse",
+        "model": "gpt-5.6-sol",
+        "permission_mode": "default",
+        "turn_id": "turn-subdir",
+        "tool_name": "ContractTest",
+        "tool_use_id": "tool-subdir",
+        "tool_input": {"file_path": alpha_file},
+        "tool_response": {"output": "passed"}
+    }));
+    assert_eq!(subdirectory_post, serde_json::json!({}));
+    assert_eq!(
+        RepositoryRegistry::initialize(harness.root())
+            .unwrap()
+            .list()
+            .unwrap()
+            .len(),
+        1,
+        "a Workspace subdirectory must not be registered as a Repository root"
+    );
     for (snapshot, own_file, own_test, other_file) in [
         (
             &alpha_snapshot,
@@ -724,6 +760,89 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_retrieval_paths
                 && !signal.content.contains("RAW_BETA_MUST_NOT_PERSIST")
         }));
     }
+}
+
+#[test]
+fn engineering_graph_cli_commands_scan_record_rebuild_and_explain() {
+    let harness = Harness::new();
+    let (space_id, _) = create_space(&harness, "Engineering CLI workflow");
+    let published = approve_publish(
+        &harness,
+        &space_id,
+        "Engineering CLI workflow uses src/contract.rs",
+    );
+    let repository = harness.home.join("工程 repo");
+    fs::create_dir_all(repository.join("src")).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&repository)
+            .status()
+            .unwrap()
+            .success()
+    );
+    git_output(&repository, &["config", "user.name", "CLI Graph"]);
+    git_output(
+        &repository,
+        &["config", "user.email", "cli-graph@example.invalid"],
+    );
+    fs::write(
+        repository.join("src/contract.rs"),
+        "pub fn cli_graph_contract() {}\n",
+    )
+    .unwrap();
+    git_output(&repository, &["add", "--", "."]);
+    git_output(&repository, &["commit", "-q", "-m", "fixture"]);
+
+    let scan = harness.success(&[
+        "repository",
+        "scan",
+        "--checkout-path",
+        repository.to_str().unwrap(),
+    ]);
+    assert_eq!(scan["data"]["status"], "available");
+    assert!(scan["data"]["artifact_count"].as_u64().unwrap() > 0);
+    let reference_input = harness.home.join("reference.json");
+    fs::write(
+        &reference_input,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "context_id": published.context_id,
+            "revision_id": published.revision_id,
+            "repository_id": scan["data"]["repository_id"],
+            "artifact_kind": "file",
+            "relation": "implements",
+            "locator_hints": {"path": "src/contract.rs", "language": "rust"},
+            "supports": "Direct CLI fixture inspection verified the implementation",
+            "limitations": ["Synthetic CLI repository"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let recorded = harness.success(&[
+        "engineering-reference",
+        "record",
+        "--input",
+        reference_input.to_str().unwrap(),
+    ]);
+    assert!(recorded["data"]["reference_id"].as_str().is_some());
+    let rebuilt = harness.success(&["association", "rebuild"]);
+    assert_eq!(rebuilt["data"]["status_counts"]["resolved"], 1);
+    let explained = harness.success(&[
+        "association",
+        "explain",
+        "--reference-id",
+        recorded["data"]["reference_id"].as_str().unwrap(),
+    ]);
+    assert_eq!(explained["data"]["status"], "resolved");
+    assert!(
+        !explained["data"]["graph_paths"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let diagnosed = harness.success(&["association", "rebuild", "--diagnose"]);
+    assert_eq!(diagnosed["command"], "association.diagnose");
+    assert_eq!(diagnosed["data"]["stored"], false);
 }
 
 #[test]
@@ -1095,7 +1214,10 @@ fn mcp_stdio_entry_serves_cursor_and_codex_without_extra_stdout() {
             .collect::<Vec<_>>();
         assert_eq!(responses.len(), 2);
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
-        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(
+            responses[1]["result"]["tools"].as_array().unwrap().len(),
+            11
+        );
     }
 }
 

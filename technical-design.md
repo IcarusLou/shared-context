@@ -10,7 +10,7 @@
 
 本项目尚未上线，本文直接定义目标模型、接口和存储结构。
 
-### 1.1 当前实现状态（Mew #125）
+### 1.1 当前实现状态（Mew #145）
 
 本文的大部分章节描述目标架构，不代表代码已经全部实现。当前里程碑边界如下：
 
@@ -18,10 +18,10 @@
 |---|---|---|
 | **M1：Task-first 领域与入口基础** | **已实现** | `TaskIntent` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；CLI/MCP 通过 `candidate_create` 创建无 Space Candidate；Candidate 不可自动注入 |
 | **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、严格 `task_intent_update` 与只读 `task_context` 已通过跨 crate/E2E 验收 |
-| **M3：Engineering Graph** | **未实现** | 尚无工程对象扫描、ContextArtifactAssociation、移动/改名重解析或关系图扩展 |
+| **M3：Engineering Graph** | **部分实现** | Repository Registry、受限扫描、持久 Engineering Reference、可重建解析投影、Graph RetrievalPath 及 MCP/CLI 工作流已实现；阶段总验收尚未完成 |
 | **M4：Low-tax Capture** | **未实现** | 尚无 WorkEpisode 自动聚合、AgentCheckpoint、Candidate Builder、去重/冲突、Space 推荐或 Candidate Confirm/List/Discard |
 
-当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订权威 TaskIntent，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示；PostToolUse 仅在 ActiveTask 已存在时合并可证明的 File/Test 信号。`context_search.space_ids` 只保留为显式探索硬过滤。当前接入不扫描代码、不解析关系图。当前 `candidate_create` 是手工、无归属的 M1 可执行入口，不等同于 M4 的自动 Capture。
+当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订权威 TaskIntent，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示；PostToolUse 仅在 ActiveTask 已存在时合并可证明的 File/Test 信号，并刷新 canonical Git Workspace root 的 Repository Registry。显式 Graph 工具完成 scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。当前 `candidate_create` 仍是手工、无归属的 M1 入口，不等同于 M4 自动 Capture。
 
 ## 2. 背景与目标
 
@@ -940,6 +940,8 @@ sctx space create|revise|list|get
 sctx task inspect|reset
 sctx candidate list|get|confirm|discard
 sctx context get|search|revise|deprecate
+sctx repository scan
+sctx engineering-reference record
 sctx association explain|rebuild
 sctx index rebuild
 sctx pending list|commit|move-aside
@@ -955,6 +957,10 @@ sctx mcp serve --client cursor|codex
 | `task_intent_update` | 读/写本地状态 | CAS 更新 TaskIntent 并生成多 Space TaskContextPack |
 | `task_signal_supersede` | 读/写本地状态 | 按稳定 Signal ID 失效当前 Task 信号 |
 | `task_context` | 只读 | 按 external Session locator 重读已有 ActiveTask 的 TaskContextPack |
+| `repository_scan` | 读/写本地状态 | 注册 canonical Git worktree 并返回受限 Artifact 摘要 |
+| `engineering_reference_record` | 写知识事实 | 为已有 Context Revision 记录有证据的工程定位观察 |
+| `association_explain` | 只读 | 展示解析状态、证据、歧义候选和 Graph Paths，不代选 |
+| `association_rebuild` | 写派生状态 | 从当前注册 Repository 与 Git References 原子重建或诊断投影 |
 | `task_checkpoint` | 写本地状态 | 提交结构化 Claim、Evidence Ref 和未知项 |
 | `candidate_list` | 读 | 查看当前 Task 自动生成的 Candidate |
 | `candidate_confirm` | 写知识事实 | 确认 Candidate、已有或新 Space、组织关系和初始生命周期 |
@@ -1227,11 +1233,14 @@ M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命�
 - Workspace 与本地 Repository 绝对路径作为位置 observation 保留在 Session，但不参与 FTS 相关性或 Task fingerprint，避免 checkout 路径偶然形成 Space prior。
 - Cursor Prompt 仍为显式 MCP；Symbol/Diff/API/Schema 的代码扫描、解析和关系扩展属于 M3，不冒充 M2 RetrievalPath。
 
-### M3：Engineering Graph — 未实现
+### M3：Engineering Graph — 部分实现
 
-- Repository、File、Symbol、API、Schema 和 Test Artifact 扫描尚未实现。
-- EngineeringReference、ArtifactResolution 和 ContextArtifactAssociation 尚未实现。
-- 文件移动、Symbol 改名后的关联重建和有限跳数关系扩展尚未实现。
+- 本地 Repository Registry、同一 Git common-dir 的多 worktree 归一和不可用状态已实现。
+- 受限 tracked-source Scanner 已生成 Repository/Module/File/Symbol/API/Schema/Test Artifact 摘要，不保存或返回完整源码。
+- 持久 EngineeringReference Event、ArtifactResolution、ContextArtifactAssociation 和 generation-pinned Projection 已实现。
+- `repository_scan`、`engineering_reference_record`、`association_explain`、`association_rebuild`/diagnose 已接入 MCP/CLI；服务端拥有 Reference/Event 身份与路径。
+- Task Retrieval 已消费唯一 resolved Graph edge 和 Context Relation；歧义/不可用不自动选择，Graph 故障降级为 Context-only。
+- M3 阶段总验收、更多真实语言/仓库规模评测仍未完成。
 
 ### M4：Low-tax Capture — 未实现
 

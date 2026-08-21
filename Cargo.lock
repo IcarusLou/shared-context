@@ -513,6 +513,7 @@ dependencies = [
  "sctx-adapter-cursor",
  "sctx-agent-adapter",
  "sctx-domain",
+ "sctx-engineering-graph",
  "sctx-event-schema",
  "sctx-git-store",
  "sctx-index",

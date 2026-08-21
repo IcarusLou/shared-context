@@ -332,7 +332,7 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
 
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 11);
         let names = tools
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
@@ -343,6 +343,10 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
                 "task_intent_update",
                 "task_signal_supersede",
                 "task_context",
+                "repository_scan",
+                "engineering_reference_record",
+                "association_explain",
+                "association_rebuild",
                 "context_search",
                 "context_get",
                 "candidate_create",
@@ -408,6 +412,34 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
         assert_eq!(task_schema["properties"]["max_spaces"]["maximum"], 32);
         assert_eq!(task_schema["properties"]["max_spaces"]["default"], 8);
         assert_eq!(task_schema["properties"]["token_budget"]["minimum"], 256);
+        let reference_schema = &tools
+            .iter()
+            .find(|tool| tool["name"] == "engineering_reference_record")
+            .unwrap()["inputSchema"];
+        assert_eq!(reference_schema["additionalProperties"], false);
+        let reference_properties = reference_schema["properties"].as_object().unwrap();
+        for forbidden in ["event_id", "reference_id", "event_path"] {
+            assert!(
+                !reference_properties.contains_key(forbidden),
+                "caller-owned Reference/Event field leaked into schema: {forbidden}"
+            );
+        }
+        assert_eq!(reference_schema["properties"]["limitations"]["minItems"], 1);
+        assert_eq!(
+            tools
+                .iter()
+                .find(|tool| tool["name"] == "association_explain")
+                .unwrap()["inputSchema"]["required"],
+            json!(["reference_id"])
+        );
+        assert!(
+            tools
+                .iter()
+                .find(|tool| tool["name"] == "association_rebuild")
+                .unwrap()["inputSchema"]["properties"]
+                .get("diagnose_only")
+                .is_some()
+        );
         let search_schema = &tools
             .iter()
             .find(|tool| tool["name"] == "context_search")
@@ -462,6 +494,24 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
         let spaces = &responses[6]["result"]["structuredContent"];
         assert_eq!(spaces["spaces"].as_array().unwrap().len(), 1);
     }
+}
+
+#[test]
+fn engineering_graph_tool_dispatch_uses_a_distinct_diagnose_contract() {
+    let fixture = Fixture::new();
+    let responses = run_session(
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::Newline,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(2, "association_rebuild", json!({"diagnose_only": true})),
+        ],
+    );
+    let response = &responses[1]["result"]["structuredContent"];
+    assert_eq!(response["diagnose_only"], true);
+    assert_eq!(response["stored"], false);
+    assert_eq!(response["reference_count"], 0);
+    assert!(response["artifact_generation"].as_str().is_some());
 }
 
 #[test]

@@ -208,6 +208,31 @@ impl RepositoryRegistry {
         read_repository(&self.open_connection()?, repository_id)
     }
 
+    /// Lists every retained Repository identity in stable ID order.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed Registry read or invariant errors.
+    pub fn list(&self) -> Result<Vec<RegisteredRepository>> {
+        let connection = self.open_connection()?;
+        let mut statement = connection
+            .prepare("SELECT repository_id FROM repository_identity ORDER BY repository_id ASC")
+            .map_err(sql_error("prepare Repository list"))?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sql_error("query Repository list"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error("read Repository list row"))?;
+        drop(statement);
+        ids.into_iter()
+            .map(|value| {
+                let repository_id = parse_repository_id(&value)?;
+                read_repository(&connection, repository_id)?
+                    .ok_or_else(|| invariant("listed Repository identity disappeared during read"))
+            })
+            .collect()
+    }
+
     /// Resolves a Repository through one local hint.
     ///
     /// Remote hints resolve only when unique and never create or merge identities.

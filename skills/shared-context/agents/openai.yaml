@@ -1,4 +1,4 @@
 interface:
   display_name: "Shared Context"
-  short_description: "Keep engineering Task Intent and signals current"
-  default_prompt: "Use $shared-context to keep this engineering Task Intent and its signals current as you work."
+  short_description: "Maintain Task Intent, signals, and verified references"
+  default_prompt: "Use $shared-context to keep Task Intent, signals, and verified engineering references current."
