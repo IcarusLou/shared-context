@@ -5,7 +5,8 @@ use std::{
 };
 
 use sctx_domain::{
-    ErrorKind, ExternalSessionLocator, TaskId, TaskIntent, TaskSignal, TaskSignalKind,
+    ErrorKind, ExternalSessionLocator, TaskId, TaskIntent, TaskIntentDraft, TaskSignal,
+    TaskSignalKind, TaskSignalLifecycle,
 };
 use sctx_task_runtime::TaskRuntime;
 use tempfile::TempDir;
@@ -36,6 +37,10 @@ fn signal(kind: TaskSignalKind, content: &str) -> TaskSignal {
         kind,
         content: content.to_owned(),
     }
+}
+
+fn intent_draft(goal: &str) -> TaskIntentDraft {
+    TaskIntentDraft::from(&intent(TaskId::new(), goal))
 }
 
 #[test]
@@ -418,6 +423,241 @@ fn concurrent_same_session_updates_preserve_signals_and_one_intent_head() {
     assert_eq!(snapshot.intent_revisions.len(), 2);
     assert_eq!(snapshot.task_signals.len(), worker_count);
     assert!(snapshot.validate().is_ok());
+}
+
+#[test]
+fn explicit_new_task_boundary_keeps_history_and_excludes_old_signals_from_active_snapshot() {
+    let root = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(root.path()).unwrap();
+    let external_locator = locator("multi-task-session");
+    let first = runtime
+        .open_or_create(
+            external_locator.clone(),
+            intent(TaskId::new(), "alpha requirement"),
+            vec![
+                signal(TaskSignalKind::Prompt, "alpha requirement"),
+                signal(TaskSignalKind::File, "src/alpha.rs"),
+            ],
+        )
+        .unwrap()
+        .snapshot;
+
+    let second = runtime
+        .start_new_task(
+            &external_locator,
+            first.task_id,
+            &intent_draft("banana requirement"),
+            vec![signal(TaskSignalKind::Prompt, "banana requirement")],
+        )
+        .unwrap()
+        .snapshot;
+
+    assert_ne!(first.task_id, second.task_id);
+    assert_ne!(first.task_session_id, second.task_session_id);
+    assert_eq!(
+        second.task_signals,
+        vec![signal(TaskSignalKind::Prompt, "banana requirement")]
+    );
+    assert!(
+        second
+            .task_signals
+            .iter()
+            .all(|value| !value.content.contains("alpha"))
+    );
+    assert_eq!(
+        runtime
+            .read_snapshot_by_locator(&external_locator)
+            .unwrap()
+            .unwrap(),
+        second
+    );
+    assert_eq!(
+        runtime
+            .read_snapshot(first.task_session_id)
+            .unwrap()
+            .unwrap(),
+        first
+    );
+    let external = runtime
+        .read_external_session_by_locator(&external_locator)
+        .unwrap()
+        .unwrap();
+    assert_eq!(external.tasks.len(), 2);
+    assert_eq!(external.active_task_id, second.task_id);
+    assert_eq!(external.active_task(), Some(&second));
+
+    let error = runtime
+        .merge_signals(
+            first.task_session_id,
+            vec![signal(TaskSignalKind::Test, "old task test")],
+        )
+        .unwrap_err();
+    assert!(error.message().contains("ActiveTask"));
+}
+
+#[test]
+fn explicit_switch_restores_only_the_target_tasks_own_active_signals() {
+    let root = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(root.path()).unwrap();
+    let external_locator = locator("switch-session");
+    let first = runtime
+        .open_or_create(
+            external_locator.clone(),
+            intent(TaskId::new(), "first task"),
+            vec![signal(TaskSignalKind::File, "src/first.rs")],
+        )
+        .unwrap()
+        .snapshot;
+    let second = runtime
+        .start_new_task(
+            &external_locator,
+            first.task_id,
+            &intent_draft("second task"),
+            vec![signal(TaskSignalKind::Api, "second-v2")],
+        )
+        .unwrap()
+        .snapshot;
+
+    let switched = runtime
+        .switch_active_task(&external_locator, second.task_id, first.task_id)
+        .unwrap();
+
+    assert!(switched.switched);
+    assert_eq!(switched.snapshot.task_id, first.task_id);
+    assert_eq!(switched.snapshot.task_signals, first.task_signals);
+    assert!(
+        switched
+            .snapshot
+            .task_signals
+            .iter()
+            .all(|value| value.kind != TaskSignalKind::Api)
+    );
+    assert_eq!(
+        runtime
+            .read_snapshot(second.task_session_id)
+            .unwrap()
+            .unwrap()
+            .task_signals,
+        second.task_signals
+    );
+}
+
+#[test]
+fn signal_supersede_hides_active_input_but_retains_queryable_history_and_identity() {
+    let root = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(root.path()).unwrap();
+    let session = runtime
+        .open_or_create(
+            locator("signal-lifecycle"),
+            intent(TaskId::new(), "signal lifecycle"),
+            vec![
+                signal(TaskSignalKind::Prompt, "signal lifecycle"),
+                signal(TaskSignalKind::File, "src/obsolete.rs"),
+            ],
+        )
+        .unwrap()
+        .snapshot;
+    let history = runtime
+        .read_signal_history(session.task_session_id)
+        .unwrap();
+    let obsolete = history
+        .iter()
+        .find(|record| record.signal.kind == TaskSignalKind::File)
+        .unwrap();
+
+    let superseded = runtime
+        .supersede_signals(
+            session.task_session_id,
+            session.task_id,
+            vec![obsolete.signal_id],
+        )
+        .unwrap();
+    assert!(
+        superseded
+            .snapshot
+            .task_signals
+            .iter()
+            .all(|value| value.kind != TaskSignalKind::File)
+    );
+    let retained = runtime
+        .read_signal_history(session.task_session_id)
+        .unwrap();
+    assert_eq!(retained.len(), 2);
+    let retained_obsolete = retained
+        .iter()
+        .find(|record| record.signal_id == obsolete.signal_id)
+        .unwrap();
+    assert_eq!(retained_obsolete.lifecycle, TaskSignalLifecycle::Superseded);
+
+    let readded = runtime
+        .merge_signals(
+            session.task_session_id,
+            vec![signal(TaskSignalKind::File, "src/obsolete.rs")],
+        )
+        .unwrap();
+    assert_eq!(readded.inserted, 1);
+    assert_ne!(readded.inserted_signal_ids[0], obsolete.signal_id);
+    let final_history = runtime
+        .read_signal_history(session.task_session_id)
+        .unwrap();
+    assert_eq!(final_history.len(), 3);
+    assert_eq!(
+        final_history
+            .iter()
+            .filter(|record| record.lifecycle == TaskSignalLifecycle::Active)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn concurrent_new_task_cas_creates_exactly_one_history_entry() {
+    let root = TempDir::new().unwrap();
+    let runtime = Arc::new(TaskRuntime::initialize(root.path()).unwrap());
+    let external_locator = locator("task-cas");
+    let initial = runtime
+        .open_or_create(
+            external_locator.clone(),
+            intent(TaskId::new(), "initial task"),
+            vec![],
+        )
+        .unwrap()
+        .snapshot;
+    let barrier = Arc::new(Barrier::new(2));
+    let mut workers = Vec::new();
+    for goal in ["competing task a", "competing task b"] {
+        let runtime = Arc::clone(&runtime);
+        let barrier = Arc::clone(&barrier);
+        let external_locator = external_locator.clone();
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            runtime.start_new_task(
+                &external_locator,
+                initial.task_id,
+                &intent_draft(goal),
+                vec![signal(TaskSignalKind::Prompt, goal)],
+            )
+        }));
+    }
+    let outcomes = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes.iter().filter(|value| value.is_ok()).count(), 1);
+    assert!(
+        outcomes
+            .iter()
+            .filter_map(|value| value.as_ref().err())
+            .all(|error| error.kind() == ErrorKind::InvalidInput
+                && error.message().contains("expected_active_task_id"))
+    );
+    let external = runtime
+        .read_external_session_by_locator(&external_locator)
+        .unwrap()
+        .unwrap();
+    assert_eq!(external.tasks.len(), 2);
+    assert_ne!(external.active_task_id, initial.task_id);
+    assert!(external.validate().is_ok());
 }
 
 #[test]

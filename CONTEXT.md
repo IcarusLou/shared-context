@@ -13,20 +13,32 @@ The current structured understanding of a Task's goal, desired change, scope, co
 _Avoid_: Prompt, Space selection
 
 **TaskSession**:
-The local runtime boundary for one Agent Task. Multiple independent TaskSessions may observe the same Workspace without sharing Task identity or knowledge ownership.
-_Avoid_: Workspace session, Active Space
+The local runtime boundary for one explicit Agent Task. An ExternalSession may retain multiple historical TaskSessions while selecting exactly one as active.
+_Avoid_: External Session, Active Space
+
+**ExternalSession**:
+A local container corresponding to one external Agent session, with exactly one ActiveTask and zero or more historical Tasks. It preserves task history but does not infer when one Task should end and another should begin.
+_Avoid_: Task, Workspace, knowledge owner
+
+**ActiveTask**:
+The one TaskSession currently selected for new Intent revisions, TaskSignals, and retrieval within an ExternalSession. Changing it is an explicit task-boundary decision, not a Workspace-derived guess.
+_Avoid_: Active Space, latest Prompt
 
 **TaskIntentRevision**:
 One immutable version of a TaskIntent in a TaskSession's parent chain. It records how task understanding evolves without selecting or owning a ContextSpace.
 _Avoid_: Space revision, Prompt history
 
 **ExternalSessionLocator**:
-An Agent kind and its external session key used only to find the corresponding local TaskSession. It is neither Task identity nor durable knowledge identity.
+An Agent kind and its external session key used only to find the corresponding local ExternalSession. It is neither Task identity nor durable knowledge identity.
 _Avoid_: TaskSessionId, knowledge identifier
 
 **TaskSignal**:
 An observable input that informs TaskIntent or knowledge retrieval, such as a Prompt, Workspace, Repository, File, Symbol, Diff, API, Schema, or Test observation. A signal is evidence about the current Task, not a declaration of Space membership.
 _Avoid_: Space binding, routing key
+
+**TaskSignalLifecycle**:
+The current relevance of one identified TaskSignal within its Task: Active signals participate in retrieval, while Superseded signals remain historical evidence but do not participate.
+_Avoid_: deletion, global signal state
 
 **TaskSpaceAssociation**:
 A derived, explainable relevance between one Task and one ContextSpace. A Task may have no associations or multiple associations, and their ordering may change as new signals arrive.

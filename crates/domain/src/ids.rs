@@ -131,9 +131,19 @@ opaque_id!(
     "Opaque identity of one Task's local runtime session."
 );
 opaque_id!(
+    ExternalSessionId,
+    "xss_",
+    "Opaque local identity of one external Agent session container."
+);
+opaque_id!(
     TaskIntentRevisionId,
     "tir_",
     "Opaque identity of one immutable Task Intent revision."
+);
+opaque_id!(
+    SignalId,
+    "sig_",
+    "Opaque identity of one Task Signal record."
 );
 opaque_id!(
     WorkEpisodeId,
@@ -181,8 +191,9 @@ mod tests {
     use uuid::{Variant, Version};
 
     use super::{
-        CandidateId, ConflictId, ContextId, EventId, EvidenceId, PublicationId, ResolutionId,
-        ReviewId, RevisionId, SpaceId, TaskId, TaskIntentRevisionId, TaskSessionId, WorkEpisodeId,
+        CandidateId, ConflictId, ContextId, EventId, EvidenceId, ExternalSessionId, PublicationId,
+        ResolutionId, ReviewId, RevisionId, SignalId, SpaceId, TaskId, TaskIntentRevisionId,
+        TaskSessionId, WorkEpisodeId,
     };
 
     #[test]
@@ -221,7 +232,9 @@ mod tests {
         assert_generated_id!(SpaceId::new(), "spc_");
         assert_generated_id!(TaskId::new(), "tsk_");
         assert_generated_id!(TaskSessionId::new(), "tss_");
+        assert_generated_id!(ExternalSessionId::new(), "xss_");
         assert_generated_id!(TaskIntentRevisionId::new(), "tir_");
+        assert_generated_id!(SignalId::new(), "sig_");
         assert_generated_id!(WorkEpisodeId::new(), "wep_");
         assert_generated_id!(CandidateId::new(), "cnd_");
         assert_generated_id!(ContextId::new(), "ctx_");

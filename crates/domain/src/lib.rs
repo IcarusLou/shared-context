@@ -14,9 +14,9 @@ pub use episode::{
     ArtifactAction, ContextCandidate, ContextUseDisposition, WorkEpisode, WorkObservation,
 };
 pub use ids::{
-    CandidateId, ConflictId, ContextId, EventId, EvidenceId, IdParseError, PublicationId,
-    ResolutionId, ReviewId, RevisionId, SpaceId, TaskId, TaskIntentRevisionId, TaskSessionId,
-    WorkEpisodeId,
+    CandidateId, ConflictId, ContextId, EventId, EvidenceId, ExternalSessionId, IdParseError,
+    PublicationId, ResolutionId, ReviewId, RevisionId, SignalId, SpaceId, TaskId,
+    TaskIntentRevisionId, TaskSessionId, WorkEpisodeId,
 };
 pub use model::{
     Applicability, ConflictParticipant, ConflictResolution, ConflictResolutionDraft,
@@ -33,8 +33,9 @@ pub use reducer::{
     SemanticConflictProjection, SemanticConflictStatus, reduce,
 };
 pub use task::{
-    ExternalSessionLocator, TaskIntent, TaskIntentRevision, TaskSessionSnapshot, TaskSignal,
-    TaskSignalKind, TaskSpaceAssociation,
+    ExternalSessionLocator, ExternalSessionSnapshot, TaskIntent, TaskIntentDraft,
+    TaskIntentRevision, TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle,
+    TaskSignalRecord, TaskSpaceAssociation,
 };
 
 /// Broad categories used to route recoverable errors across crate boundaries.

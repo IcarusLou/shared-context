@@ -3,7 +3,8 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ContextId, Error, ErrorKind, Result, SpaceId, TaskId, TaskIntentRevisionId, TaskSessionId,
+    ContextId, Error, ErrorKind, ExternalSessionId, Result, SignalId, SpaceId, TaskId,
+    TaskIntentRevisionId, TaskSessionId,
 };
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -86,6 +87,72 @@ impl TaskIntent {
         validate_text_set(&self.artifacts, "task_intent.artifacts")?;
         validate_text_set(&self.interfaces, "task_intent.interfaces")?;
         validate_text_set(&self.unknowns, "task_intent.unknowns")
+    }
+}
+
+/// Caller-authored Task Intent content before the runtime assigns Task identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskIntentDraft {
+    pub goal: String,
+    pub desired_change: String,
+    pub in_scope: Vec<String>,
+    pub out_of_scope: Vec<String>,
+    pub domains: Vec<String>,
+    pub platforms: Vec<String>,
+    pub constraints: Vec<String>,
+    pub acceptance_conditions: Vec<String>,
+    pub artifacts: Vec<String>,
+    pub interfaces: Vec<String>,
+    pub unknowns: Vec<String>,
+}
+
+impl TaskIntentDraft {
+    /// Binds this content to a runtime-owned Task identity.
+    #[must_use]
+    pub fn bind(&self, task_id: TaskId) -> TaskIntent {
+        TaskIntent {
+            task_id,
+            goal: self.goal.clone(),
+            desired_change: self.desired_change.clone(),
+            in_scope: self.in_scope.clone(),
+            out_of_scope: self.out_of_scope.clone(),
+            domains: self.domains.clone(),
+            platforms: self.platforms.clone(),
+            constraints: self.constraints.clone(),
+            acceptance_conditions: self.acceptance_conditions.clone(),
+            artifacts: self.artifacts.clone(),
+            interfaces: self.interfaces.clone(),
+            unknowns: self.unknowns.clone(),
+        }
+    }
+
+    /// Validates Task content before identity is assigned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] under the same content invariants as
+    /// [`TaskIntent::validate`].
+    pub fn validate(&self) -> Result<()> {
+        self.bind(TaskId::new()).validate()
+    }
+}
+
+impl From<&TaskIntent> for TaskIntentDraft {
+    fn from(intent: &TaskIntent) -> Self {
+        Self {
+            goal: intent.goal.clone(),
+            desired_change: intent.desired_change.clone(),
+            in_scope: intent.in_scope.clone(),
+            out_of_scope: intent.out_of_scope.clone(),
+            domains: intent.domains.clone(),
+            platforms: intent.platforms.clone(),
+            constraints: intent.constraints.clone(),
+            acceptance_conditions: intent.acceptance_conditions.clone(),
+            artifacts: intent.artifacts.clone(),
+            interfaces: intent.interfaces.clone(),
+            unknowns: intent.unknowns.clone(),
+        }
     }
 }
 
@@ -317,6 +384,107 @@ impl TaskSessionSnapshot {
     }
 }
 
+/// Lifecycle of one identified Task Signal record.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskSignalLifecycle {
+    Active,
+    Superseded,
+}
+
+/// One stable Task Signal record retained for active use or historical diagnosis.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskSignalRecord {
+    pub signal_id: SignalId,
+    pub task_session_id: TaskSessionId,
+    pub task_id: TaskId,
+    pub signal: TaskSignal,
+    pub lifecycle: TaskSignalLifecycle,
+}
+
+impl TaskSignalRecord {
+    /// Validates the Signal content and its ownership of a Task Session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] when Signal content is invalid or
+    /// the supplied owner identities differ.
+    pub fn validate_for_task(&self, task_session_id: TaskSessionId, task_id: TaskId) -> Result<()> {
+        if self.task_session_id != task_session_id || self.task_id != task_id {
+            return Err(invalid(
+                "task_signal_record must belong to the supplied Task Session",
+            ));
+        }
+        self.signal.validate()
+    }
+}
+
+/// Complete local view of one external Agent Session and all retained Tasks.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalSessionSnapshot {
+    pub external_session_id: ExternalSessionId,
+    pub locator: ExternalSessionLocator,
+    pub active_task_session_id: TaskSessionId,
+    pub active_task_id: TaskId,
+    pub tasks: Vec<TaskSessionSnapshot>,
+}
+
+impl ExternalSessionSnapshot {
+    /// Returns the Task currently selected for updates and retrieval.
+    #[must_use]
+    pub fn active_task(&self) -> Option<&TaskSessionSnapshot> {
+        self.tasks.iter().find(|task| {
+            task.task_session_id == self.active_task_session_id
+                && task.task_id == self.active_task_id
+        })
+    }
+
+    /// Validates Task ownership, uniqueness, and the single `ActiveTask` pointer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] when the locator is invalid, no Task
+    /// exists, identities repeat, a Task belongs to another locator, or the
+    /// `ActiveTask` does not identify exactly one retained Task.
+    pub fn validate(&self) -> Result<()> {
+        self.locator.validate()?;
+        if self.tasks.is_empty() {
+            return Err(invalid(
+                "external_session.tasks must contain at least one Task Session",
+            ));
+        }
+        let mut session_ids = HashSet::with_capacity(self.tasks.len());
+        let mut task_ids = HashSet::with_capacity(self.tasks.len());
+        let mut active_matches = 0;
+        for task in &self.tasks {
+            task.validate()?;
+            if task.external_session_locator != self.locator {
+                return Err(invalid(
+                    "external_session Tasks must share its ExternalSessionLocator",
+                ));
+            }
+            if !session_ids.insert(task.task_session_id) || !task_ids.insert(task.task_id) {
+                return Err(invalid(
+                    "external_session Tasks must have unique Session and Task identities",
+                ));
+            }
+            if task.task_session_id == self.active_task_session_id
+                && task.task_id == self.active_task_id
+            {
+                active_matches += 1;
+            }
+        }
+        if active_matches != 1 {
+            return Err(invalid(
+                "external_session ActiveTask must identify exactly one retained Task",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Kinds of observable input that can inform an engineering Task.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -467,10 +635,13 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        ExternalSessionLocator, TaskIntent, TaskIntentRevision, TaskSessionSnapshot, TaskSignal,
-        TaskSignalKind, TaskSpaceAssociation,
+        ExternalSessionLocator, ExternalSessionSnapshot, TaskIntent, TaskIntentDraft,
+        TaskIntentRevision, TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle,
+        TaskSignalRecord, TaskSpaceAssociation,
     };
-    use crate::{ContextId, ErrorKind, SpaceId, TaskId};
+    use crate::{
+        ContextId, ErrorKind, ExternalSessionId, SignalId, SpaceId, TaskId, TaskSessionId,
+    };
 
     fn intent() -> TaskIntent {
         intent_for(TaskId::new())
@@ -491,6 +662,10 @@ mod tests {
             interfaces: vec!["search-v2".to_owned()],
             unknowns: vec!["Historical compatibility limits".to_owned()],
         }
+    }
+
+    fn intent_draft() -> TaskIntentDraft {
+        TaskIntentDraft::from(&intent())
     }
 
     fn locator(external_session_id: &str) -> ExternalSessionLocator {
@@ -553,6 +728,24 @@ mod tests {
 
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
         assert!(error.message().contains("task_intent.domains"));
+    }
+
+    #[test]
+    fn task_intent_draft_binds_the_same_content_to_runtime_owned_identity() {
+        let draft = intent_draft();
+        let first_id = TaskId::new();
+        let second_id = TaskId::new();
+
+        let first = draft.bind(first_id);
+        let second = draft.bind(second_id);
+
+        assert!(draft.validate().is_ok());
+        assert_eq!(first.task_id, first_id);
+        assert_eq!(second.task_id, second_id);
+        assert_eq!(
+            TaskIntentDraft::from(&first),
+            TaskIntentDraft::from(&second)
+        );
     }
 
     #[test]
@@ -691,6 +884,90 @@ mod tests {
             second.external_session_locator
         );
         assert_eq!(first.task_signals, second.task_signals);
+    }
+
+    #[test]
+    fn external_session_retains_history_and_selects_exactly_one_active_task() {
+        let shared_locator = locator("external-session");
+        let first = TaskSessionSnapshot::from_initial(
+            shared_locator.clone(),
+            intent(),
+            vec![TaskSignal {
+                kind: TaskSignalKind::Prompt,
+                content: "first task".to_owned(),
+            }],
+        )
+        .unwrap();
+        let second = TaskSessionSnapshot::from_initial(
+            shared_locator.clone(),
+            intent(),
+            vec![TaskSignal {
+                kind: TaskSignalKind::Prompt,
+                content: "second task".to_owned(),
+            }],
+        )
+        .unwrap();
+        let external = ExternalSessionSnapshot {
+            external_session_id: ExternalSessionId::new(),
+            locator: shared_locator,
+            active_task_session_id: second.task_session_id,
+            active_task_id: second.task_id,
+            tasks: vec![first.clone(), second.clone()],
+        };
+
+        assert!(external.validate().is_ok());
+        assert_eq!(external.active_task(), Some(&second));
+
+        let mut missing_active = external.clone();
+        missing_active.active_task_session_id = TaskSessionId::new();
+        assert!(
+            missing_active
+                .validate()
+                .expect_err("missing ActiveTask must fail")
+                .message()
+                .contains("exactly one")
+        );
+
+        let mut mixed_locator = external;
+        mixed_locator.tasks[0].external_session_locator = locator("other-session");
+        assert!(
+            mixed_locator
+                .validate()
+                .expect_err("mixed locator history must fail")
+                .message()
+                .contains("share")
+        );
+    }
+
+    #[test]
+    fn task_signal_record_keeps_stable_identity_across_lifecycle() {
+        let task_session_id = TaskSessionId::new();
+        let task_id = TaskId::new();
+        let active = TaskSignalRecord {
+            signal_id: SignalId::new(),
+            task_session_id,
+            task_id,
+            signal: TaskSignal {
+                kind: TaskSignalKind::File,
+                content: "src/search.rs".to_owned(),
+            },
+            lifecycle: TaskSignalLifecycle::Active,
+        };
+        let superseded = TaskSignalRecord {
+            lifecycle: TaskSignalLifecycle::Superseded,
+            ..active.clone()
+        };
+
+        assert!(active.validate_for_task(task_session_id, task_id).is_ok());
+        assert_eq!(active.signal_id, superseded.signal_id);
+        assert_eq!(superseded.lifecycle, TaskSignalLifecycle::Superseded);
+        assert!(
+            active
+                .validate_for_task(TaskSessionId::new(), task_id)
+                .expect_err("mixed owner must fail")
+                .message()
+                .contains("supplied Task Session")
+        );
     }
 
     #[test]
