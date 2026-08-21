@@ -4,7 +4,15 @@
 //! Git common-dir observations, declared names, and remotes are matching hints;
 //! the generated [`RepositoryId`] remains the sole Repository identity.
 
+mod projection;
+mod resolver;
 mod scanner;
+
+pub use projection::EngineeringProjectionStore;
+pub use resolver::{
+    CandidateMatchEvidence, EngineeringProjection, EngineeringReferenceResolver, MatchBasis,
+    ProjectedEngineeringReference, ResolvedReferenceProjection,
+};
 
 pub use scanner::{
     ArtifactObservation, ArtifactSourceState, RepositoryScanOutcome, RepositoryScanner,
