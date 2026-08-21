@@ -75,6 +75,23 @@ fn cursor_output_uses_only_documented_snake_case_context_field() {
 }
 
 #[test]
+fn cursor_post_tool_fail_open_diagnostic_uses_documented_context_field() {
+    let output = encode_hook_output(
+        CanonicalAgentEventKind::PostToolUse,
+        &ResolvedAgentAction {
+            additional_context: None,
+            system_message: Some("task retrieval temporarily unavailable".to_owned()),
+        },
+    )
+    .unwrap();
+    let output: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        output,
+        serde_json::json!({"additional_context":"task retrieval temporarily unavailable"})
+    );
+}
+
+#[test]
 fn malformed_or_unknown_cursor_payload_fails_strictly() {
     let mut payload = fixtures().remove(0);
     payload["hook_event_name"] = Value::String("futureHook".to_owned());

@@ -43,6 +43,8 @@ use sctx_task_runtime::TaskRuntime;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+const HOOK_TASK_UNAVAILABLE: &str = "Shared Context task retrieval is temporarily unavailable. Coding can continue; retry through MCP or CLI later.";
+
 const HELP: &str = r"Shared Context command-line interface
 
 Usage: sctx [--json] <COMMAND>
@@ -740,9 +742,17 @@ fn resolve_hook_action(action: CanonicalAgentAction) -> Result<ResolvedAgentActi
             file_hints: breadcrumb.file_hints,
         })?;
     }
-    let additional_context = task_operation.map(resolve_task_operation).transpose()?;
+    let additional_context = match task_operation.map(resolve_task_operation).transpose() {
+        Ok(context) => context.flatten(),
+        Err(_) => {
+            return Ok(ResolvedAgentAction {
+                additional_context: None,
+                system_message: Some(HOOK_TASK_UNAVAILABLE.to_owned()),
+            });
+        }
+    };
     Ok(ResolvedAgentAction {
-        additional_context: additional_context.flatten(),
+        additional_context,
         system_message,
     })
 }

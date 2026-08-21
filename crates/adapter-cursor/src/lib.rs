@@ -290,10 +290,14 @@ pub fn encode_hook_output(
                 || json!({}),
                 |context| json!({"additional_context": context}),
             ),
-        CanonicalAgentEventKind::PostToolUse => action.additional_context.as_ref().map_or_else(
-            || json!({}),
-            |context| json!({"additional_context": context}),
-        ),
+        CanonicalAgentEventKind::PostToolUse => action
+            .additional_context
+            .as_ref()
+            .or(action.system_message.as_ref())
+            .map_or_else(
+                || json!({}),
+                |context| json!({"additional_context": context}),
+            ),
         CanonicalAgentEventKind::PreCompact => action
             .system_message
             .as_ref()

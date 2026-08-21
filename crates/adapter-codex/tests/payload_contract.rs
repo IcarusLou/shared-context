@@ -95,6 +95,24 @@ fn codex_output_uses_hook_specific_additional_context_without_control_fields() {
 }
 
 #[test]
+fn codex_fail_open_diagnostic_uses_only_system_message() {
+    let output = encode_hook_output(
+        CanonicalAgentEventKind::PromptSubmit,
+        &ResolvedAgentAction {
+            additional_context: None,
+            system_message: Some("task retrieval temporarily unavailable".to_owned()),
+        },
+    )
+    .unwrap();
+    let output: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        output,
+        serde_json::json!({"systemMessage": "task retrieval temporarily unavailable"})
+    );
+    assert!(output.get("hookSpecificOutput").is_none());
+}
+
+#[test]
 fn malformed_or_unknown_codex_payload_fails_strictly() {
     let mut payload = fixtures().remove(0);
     payload["hook_event_name"] = Value::String("FutureHook".to_owned());
