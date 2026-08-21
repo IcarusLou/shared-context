@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/domain",
+    "crates/engineering-graph",
     "crates/local-state",
     "crates/event-schema",
     "crates/git-store",
@@ -33,6 +34,7 @@ sctx-agent-adapter = { path = "crates/agent-adapter" }
 sctx-adapter-codex = { path = "crates/adapter-codex" }
 sctx-adapter-cursor = { path = "crates/adapter-cursor" }
 sctx-domain = { path = "crates/domain" }
+sctx-engineering-graph = { path = "crates/engineering-graph" }
 sctx-event-schema = { path = "crates/event-schema" }
 sctx-git-store = { path = "crates/git-store" }
 sctx-index = { path = "crates/index" }

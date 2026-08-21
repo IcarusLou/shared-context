@@ -537,6 +537,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sctx-engineering-graph"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "sctx-domain",
+ "tempfile",
+]
+
+[[package]]
 name = "sctx-event-schema"
 version = "0.1.0"
 dependencies = [
