@@ -181,10 +181,19 @@ pub enum SpaceIntentField {
     DomainTerms,
 }
 
+/// Tokens matched in one exact Space Intent field. Field-level matches preserve polarity and
+/// remain diagnostic even when a negative-only candidate is not promoted to an association.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SpaceIntentFieldMatch {
+    pub field: SpaceIntentField,
+    pub matched_tokens: Vec<String>,
+}
+
 /// Explainable match against one current Intent head.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SpaceIntentHeadMatch {
     pub revision_id: RevisionId,
+    pub field_matches: Vec<SpaceIntentFieldMatch>,
     pub matched_fields: Vec<SpaceIntentField>,
     pub matched_tokens: Vec<String>,
     pub bm25: f64,
@@ -199,6 +208,7 @@ pub struct SpaceIntentCandidate {
     pub intent_conflicted: bool,
     pub head_revision_ids: Vec<RevisionId>,
     pub matching_heads: Vec<SpaceIntentHeadMatch>,
+    pub field_matches: Vec<SpaceIntentFieldMatch>,
     pub matched_fields: Vec<SpaceIntentField>,
     pub matched_tokens: Vec<String>,
     /// Best (lowest) FTS5 BM25 value among the matching current heads.
@@ -256,6 +266,31 @@ impl TaskContextRequest {
 pub enum TaskSignalMatchTarget {
     SpaceIntent,
     Context,
+}
+
+/// Negative Intent field that conflicts with otherwise positive association evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentScopeConflictKind {
+    ContextSpaceOutOfScope,
+}
+
+/// Deterministic policy applied when positive evidence also crosses a Space exclusion boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentScopeConflictPolicy {
+    PenalizeAssociation,
+}
+
+/// Typed explanation embedded in one [`TaskSpaceAssociation`] reason. Search owns this structure
+/// while the domain association retains its stable string-reason boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IntentScopeConflictExplanation {
+    pub kind: IntentScopeConflictKind,
+    pub matched_tokens: Vec<String>,
+    pub matched_task_signals: Vec<String>,
+    pub policy: IntentScopeConflictPolicy,
+    pub score_multiplier_basis_points: u16,
 }
 
 /// Explainable M2-only route from the Task to one returned Context.
@@ -599,12 +634,30 @@ fn task_query_tokens(intent: &TaskIntent, signals: &[TaskSignal]) -> Vec<String>
 }
 
 fn association_query_tokens(intent: &TaskIntent, signals: &[TaskSignal]) -> Vec<String> {
-    let non_artifact_signals = signals
+    let list_text = [
+        &intent.in_scope,
+        &intent.domains,
+        &intent.platforms,
+        &intent.constraints,
+        &intent.acceptance_conditions,
+        &intent.artifacts,
+        &intent.interfaces,
+        &intent.unknowns,
+    ]
+    .into_iter()
+    .flat_map(|values| values.iter().map(String::as_str));
+    let signal_text = signals
         .iter()
         .filter(|signal| matches!(signal.kind, TaskSignalKind::Prompt | TaskSignalKind::Diff))
-        .cloned()
-        .collect::<Vec<_>>();
-    task_query_tokens(intent, &non_artifact_signals)
+        .map(|signal| signal.content.as_str());
+    [intent.goal.as_str(), intent.desired_change.as_str()]
+        .into_iter()
+        .chain(list_text)
+        .chain(signal_text)
+        .flat_map(search_tokens)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn query_space_intent_candidates(
@@ -657,10 +710,17 @@ fn query_space_intent_candidates(
         let head_revision_ids = load_intent_head_ids(connection, space_id)?;
         let mut matched_fields = BTreeSet::new();
         let mut matched_tokens = BTreeSet::new();
+        let mut field_tokens = BTreeMap::<SpaceIntentField, BTreeSet<String>>::new();
         let mut bm25 = f64::INFINITY;
         for head in &matching_heads {
             matched_fields.extend(head.matched_fields.iter().copied());
             matched_tokens.extend(head.matched_tokens.iter().cloned());
+            for field_match in &head.field_matches {
+                field_tokens
+                    .entry(field_match.field)
+                    .or_default()
+                    .extend(field_match.matched_tokens.iter().cloned());
+            }
             bm25 = bm25.min(head.bm25);
         }
         candidates.push(SpaceIntentCandidate {
@@ -668,6 +728,13 @@ fn query_space_intent_candidates(
             intent_conflicted,
             head_revision_ids,
             matching_heads,
+            field_matches: field_tokens
+                .into_iter()
+                .map(|(field, matched_tokens)| SpaceIntentFieldMatch {
+                    field,
+                    matched_tokens: matched_tokens.into_iter().collect(),
+                })
+                .collect(),
             matched_fields: matched_fields.into_iter().collect(),
             matched_tokens: matched_tokens.into_iter().collect(),
             bm25,
@@ -714,12 +781,20 @@ fn parse_intent_fts_match(
     ];
     let fields: [(SpaceIntentField, &str); 7] =
         std::array::from_fn(|index| (field_names[index], row.fields[index].as_str()));
-    let (matched_fields, matched_tokens) = explain_intent_match(query_tokens, fields);
+    let field_matches = explain_intent_match(query_tokens, fields);
+    let matched_fields = field_matches.iter().map(|value| value.field).collect();
+    let matched_tokens = field_matches
+        .iter()
+        .flat_map(|value| value.matched_tokens.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     Ok(RawIntentHeadMatch {
         space_id: parse_id(&row.space_id)?,
         intent_conflicted: row.intent_conflicted,
         head_match: SpaceIntentHeadMatch {
             revision_id: parse_id(&row.revision_id)?,
+            field_matches,
             matched_fields,
             matched_tokens,
             bm25: row.bm25,
@@ -744,8 +819,19 @@ fn load_intent_head_ids(connection: &Connection, space_id: SpaceId) -> Result<Ve
 fn explain_intent_match<const N: usize>(
     query_tokens: &[String],
     fields: [(SpaceIntentField, &str); N],
-) -> (Vec<SpaceIntentField>, Vec<String>) {
-    explain_token_fields(query_tokens, fields)
+) -> Vec<SpaceIntentFieldMatch> {
+    let wanted = query_tokens.iter().cloned().collect::<BTreeSet<_>>();
+    fields
+        .into_iter()
+        .filter_map(|(field, text)| {
+            let available = search_tokens(text).into_iter().collect::<BTreeSet<_>>();
+            let matched_tokens = wanted.intersection(&available).cloned().collect::<Vec<_>>();
+            (!matched_tokens.is_empty()).then_some(SpaceIntentFieldMatch {
+                field,
+                matched_tokens,
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -817,6 +903,8 @@ struct AssociationEvidence {
     intent_matched: bool,
     intent_conflicted: bool,
     intent_artifacts: BTreeSet<String>,
+    excluded_intent_tokens: BTreeSet<String>,
+    excluded_intent_artifacts: BTreeSet<String>,
     matched_artifacts: BTreeSet<String>,
     matched_contexts: BTreeSet<ContextId>,
     textual_contexts: BTreeSet<ContextId>,
@@ -828,6 +916,13 @@ struct TaskAssociationInference {
     associations: Vec<TaskSpaceAssociation>,
     evidence: BTreeMap<SpaceId, AssociationEvidence>,
     contexts: BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>,
+}
+
+#[derive(Debug, Default)]
+struct IntentArtifactEvidence {
+    intent_conflicted: bool,
+    positive: BTreeSet<String>,
+    excluded: BTreeSet<String>,
 }
 
 fn artifact_hints(signals: &[TaskSignal]) -> Vec<ArtifactHint> {
@@ -895,11 +990,16 @@ fn infer_task_space_associations(
         query_accepted_context_evidence(connection, query_tokens, artifact_hints, scope_targets)?;
     let mut evidence = BTreeMap::<SpaceId, AssociationEvidence>::new();
     apply_intent_evidence(&mut evidence, intent_candidates);
-    for (space_id, (intent_conflicted, artifacts)) in intent_artifacts {
+    for (space_id, artifacts) in intent_artifacts {
         let aggregate = evidence.entry(space_id).or_default();
-        aggregate.intent_conflicted |= intent_conflicted;
-        aggregate.intent_artifacts.extend(artifacts.iter().cloned());
-        aggregate.matched_artifacts.extend(artifacts);
+        aggregate.intent_conflicted |= artifacts.intent_conflicted;
+        aggregate
+            .intent_artifacts
+            .extend(artifacts.positive.iter().cloned());
+        aggregate.matched_artifacts.extend(artifacts.positive);
+        aggregate
+            .excluded_intent_artifacts
+            .extend(artifacts.excluded);
     }
     for ((space_id, context_id), context) in &contexts {
         let aggregate = evidence.entry(*space_id).or_default();
@@ -938,15 +1038,20 @@ fn apply_intent_evidence(
 ) {
     for candidate in candidates {
         let aggregate = evidence.entry(candidate.space_id).or_default();
-        aggregate.intent_matched = true;
         aggregate.intent_conflicted = candidate.intent_conflicted;
-        aggregate.intent_tokens.extend(candidate.matched_tokens);
-        aggregate.intent_fields.extend(
-            candidate
-                .matched_fields
-                .into_iter()
-                .map(|field| intent_field_name(field).to_owned()),
-        );
+        for field_match in candidate.field_matches {
+            if field_match.field == SpaceIntentField::OutOfScope {
+                aggregate
+                    .excluded_intent_tokens
+                    .extend(field_match.matched_tokens);
+            } else {
+                aggregate.intent_matched = true;
+                aggregate
+                    .intent_fields
+                    .insert(intent_field_name(field_match.field).to_owned());
+                aggregate.intent_tokens.extend(field_match.matched_tokens);
+            }
+        }
     }
 }
 
@@ -965,7 +1070,7 @@ const fn intent_field_name(field: SpaceIntentField) -> &'static str {
 fn query_exact_intent_artifacts(
     connection: &Connection,
     artifact_hints: &[ArtifactHint],
-) -> Result<BTreeMap<SpaceId, (bool, BTreeSet<String>)>> {
+) -> Result<BTreeMap<SpaceId, IntentArtifactEvidence>> {
     let Some(match_expression) = artifact_match_expression(artifact_hints) else {
         return Ok(BTreeMap::new());
     };
@@ -1001,17 +1106,25 @@ fn query_exact_intent_artifacts(
             ))
         })
         .map_err(sql_error("read exact Space Intent artifact candidates"))?;
-    let mut matches = BTreeMap::<SpaceId, (bool, BTreeSet<String>)>::new();
+    let mut matches = BTreeMap::<SpaceId, IntentArtifactEvidence>::new();
     for row in rows {
         let (space_id, intent_conflicted, fields) =
             row.map_err(sql_error("collect Space Intent artifact row"))?;
-        let labels = exact_artifact_labels(&fields, artifact_hints);
-        if !labels.is_empty() {
-            let entry = matches
-                .entry(parse_id(&space_id)?)
-                .or_insert_with(|| (intent_conflicted, BTreeSet::new()));
-            entry.0 |= intent_conflicted;
-            entry.1.extend(labels);
+        let positive_fields = [
+            fields[0].clone(),
+            fields[1].clone(),
+            fields[2].clone(),
+            fields[3].clone(),
+            fields[5].clone(),
+            fields[6].clone(),
+        ];
+        let positive = exact_artifact_labels(&positive_fields, artifact_hints);
+        let excluded = exact_artifact_labels(&[fields[4].clone()], artifact_hints);
+        if !positive.is_empty() || !excluded.is_empty() {
+            let entry = matches.entry(parse_id(&space_id)?).or_default();
+            entry.intent_conflicted |= intent_conflicted;
+            entry.positive.extend(positive);
+            entry.excluded.extend(excluded);
         }
     }
     Ok(matches)
@@ -1259,6 +1372,9 @@ fn association(
     })
 }
 
+const BASIS_POINTS_SCALE: usize = 10_000;
+const SCOPE_CONFLICT_SCORE_MULTIPLIER_BASIS_POINTS: u16 = 5_000;
+
 fn association_score(evidence: &AssociationEvidence) -> f64 {
     let intent =
         usize::from(evidence.intent_matched) * (300 + (evidence.intent_fields.len() * 20).min(140));
@@ -1267,8 +1383,26 @@ fn association_score(evidence: &AssociationEvidence) -> f64 {
     let textual = usize::from(!evidence.textual_contexts.is_empty()) * 80;
     let artifacts = (evidence.matched_artifacts.len() * 50).min(150);
     let scopes = (evidence.matched_scopes.len() * 50).min(150);
-    let points = (intent + contexts + textual + artifacts + scopes).min(1000);
+    let mut points = (intent + contexts + textual + artifacts + scopes).min(1000);
+    if has_intent_scope_conflict(evidence) {
+        points = points.saturating_mul(usize::from(SCOPE_CONFLICT_SCORE_MULTIPLIER_BASIS_POINTS))
+            / BASIS_POINTS_SCALE;
+    }
     f64::from(u16::try_from(points).expect("association score points fit u16")) / 1000.0
+}
+
+fn has_intent_scope_conflict(evidence: &AssociationEvidence) -> bool {
+    !evidence.excluded_intent_tokens.is_empty() || !evidence.excluded_intent_artifacts.is_empty()
+}
+
+fn intent_scope_conflict(evidence: &AssociationEvidence) -> Option<IntentScopeConflictExplanation> {
+    has_intent_scope_conflict(evidence).then(|| IntentScopeConflictExplanation {
+        kind: IntentScopeConflictKind::ContextSpaceOutOfScope,
+        matched_tokens: evidence.excluded_intent_tokens.iter().cloned().collect(),
+        matched_task_signals: evidence.excluded_intent_artifacts.iter().cloned().collect(),
+        policy: IntentScopeConflictPolicy::PenalizeAssociation,
+        score_multiplier_basis_points: SCOPE_CONFLICT_SCORE_MULTIPLIER_BASIS_POINTS,
+    })
 }
 
 fn association_reasons(evidence: &AssociationEvidence) -> Vec<String> {
@@ -1286,6 +1420,12 @@ fn association_reasons(evidence: &AssociationEvidence) -> Vec<String> {
     }
     if evidence.intent_conflicted {
         reasons.push("Space Intent is conflicted; no Intent head was selected".to_owned());
+    }
+    if let Some(conflict) = intent_scope_conflict(evidence) {
+        reasons.push(
+            serde_json::to_string(&conflict)
+                .expect("Intent Scope Conflict explanation is always serializable"),
+        );
     }
     if !evidence.textual_contexts.is_empty() {
         reasons.push(format!(
@@ -1608,6 +1748,12 @@ fn task_retrieval_paths(
         paths.push(TaskRetrievalPath::IntentFts {
             matched_fields: space.intent_fields.iter().cloned().collect(),
             matched_tokens: space.intent_tokens.iter().cloned().collect(),
+        });
+    }
+    if !space.excluded_intent_tokens.is_empty() {
+        paths.push(TaskRetrievalPath::IntentFts {
+            matched_fields: vec![intent_field_name(SpaceIntentField::OutOfScope).to_owned()],
+            matched_tokens: space.excluded_intent_tokens.iter().cloned().collect(),
         });
     }
     if let Some(context) = context {

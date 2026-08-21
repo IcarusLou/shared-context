@@ -582,6 +582,11 @@ fn task_intent_and_signals_match_chinese_english_code_and_api_tokens() {
             }],
             SpaceIntentField::AcceptanceConditions,
         ),
+        (
+            task_query("LegacyRouterBoundary"),
+            Vec::new(),
+            SpaceIntentField::OutOfScope,
+        ),
     ] {
         let response = engine.space_intent_candidates(&task, &signals).unwrap();
         assert_eq!(response.task_id, task.task_id);
@@ -629,6 +634,14 @@ fn full_task_query_explains_all_current_intent_fields() {
             SpaceIntentField::AcceptanceConditions,
             SpaceIntentField::DomainTerms,
         ]
+    );
+    assert_eq!(
+        response.candidates[0]
+            .field_matches
+            .iter()
+            .map(|field_match| field_match.field)
+            .collect::<Vec<_>>(),
+        response.candidates[0].matched_fields
     );
 }
 
@@ -686,6 +699,13 @@ fn conflicted_intent_returns_every_head_without_silently_selecting_one() {
     expected_heads.sort();
     assert_eq!(candidate.head_revision_ids, expected_heads);
     assert_eq!(candidate.matching_heads.len(), 2);
+    assert!(candidate.matching_heads.iter().all(|head| {
+        !head.field_matches.is_empty()
+            && head
+                .field_matches
+                .iter()
+                .all(|field_match| !field_match.matched_tokens.is_empty())
+    }));
     assert_eq!(
         candidate
             .matching_heads

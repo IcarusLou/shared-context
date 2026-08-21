@@ -8,7 +8,9 @@ use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::ProjectionIndex;
 use sctx_search::{
-    ContextPackMode, ContextStatus, SearchEngine, TaskContextRequest, TaskRetrievalPath,
+    ContextPackMode, ContextStatus, IntentScopeConflictExplanation, IntentScopeConflictKind,
+    IntentScopeConflictPolicy, SearchEngine, SpaceIntentField, TaskContextRequest,
+    TaskRetrievalPath,
 };
 use tempfile::TempDir;
 
@@ -20,6 +22,13 @@ struct AssociationFixture {
     pack_contexts: [ContextId; 4],
     tied_spaces: [SpaceId; 2],
     unsafe_pack_spaces: [SpaceId; 4],
+}
+
+struct PolarityFixture {
+    _temporary: TempDir,
+    index: ProjectionIndex,
+    space_id: SpaceId,
+    context_id: ContextId,
 }
 
 fn intent(title: &str, intent_text: &str) -> sctx_domain::IntentSnapshot {
@@ -150,6 +159,43 @@ fn applicability(domain: &str, platform: &str, condition: &str) -> Applicability
         domains: vec![domain.to_owned()],
         platforms: vec![platform.to_owned()],
         conditions: vec![condition.to_owned()],
+    }
+}
+
+fn polarity_fixture() -> PolarityFixture {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::initialize(temporary.path().join("polarity-installation")).unwrap();
+    let event = Event::space_created(
+        sctx_domain::IntentSnapshot {
+            title: "RankingRequirement".to_owned(),
+            problem: "Search ranking needs stable behavior".to_owned(),
+            desired_outcome: "Ranking remains deterministic".to_owned(),
+            in_scope: vec!["SearchRankingEngine 搜索排序".to_owned()],
+            out_of_scope: vec!["支付迁移 LegacyRouterBoundary".to_owned()],
+            acceptance_conditions: vec!["ranking tests remain stable".to_owned()],
+            domain_terms: vec!["ranking".to_owned()],
+        },
+        None,
+    )
+    .unwrap();
+    let space_id = match event.payload() {
+        EventPayload::SpaceCreated { space_id, .. } => *space_id,
+        _ => unreachable!(),
+    };
+    append(&store, event);
+    let (context_id, _, _) = add_accepted_context(
+        &store,
+        space_id,
+        "SearchRankingEngine keeps the ranking order stable",
+        applicability("ranking", "server", "active"),
+    );
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    PolarityFixture {
+        _temporary: temporary,
+        index,
+        space_id,
+        context_id,
     }
 }
 
@@ -456,6 +502,138 @@ fn workspace_and_repository_locations_never_add_space_priors() {
         )
         .unwrap();
     assert!(response.associations.is_empty());
+}
+
+#[test]
+fn out_of_scope_only_text_or_code_signal_stays_diagnostic_and_never_associates() {
+    let fixture = polarity_fixture();
+    let engine = SearchEngine::new(fixture.index);
+    let excluded_task = task("支付迁移 LegacyRouterBoundary");
+
+    let candidates = engine.space_intent_candidates(&excluded_task, &[]).unwrap();
+    assert_eq!(candidates.candidates.len(), 1);
+    let candidate = &candidates.candidates[0];
+    assert_eq!(candidate.space_id, fixture.space_id);
+    assert_eq!(candidate.matched_fields, vec![SpaceIntentField::OutOfScope]);
+    assert_eq!(candidate.field_matches.len(), 1);
+    assert_eq!(
+        candidate.field_matches[0].field,
+        SpaceIntentField::OutOfScope
+    );
+    assert!(!candidate.field_matches[0].matched_tokens.is_empty());
+
+    let associations = engine.task_space_associations(&excluded_task, &[]).unwrap();
+    assert!(associations.associations.is_empty());
+    let automatic = engine
+        .task_context_pack(&TaskContextRequest::automatic(
+            excluded_task,
+            Vec::new(),
+            100_000,
+        ))
+        .unwrap();
+    assert!(automatic.associations.is_empty());
+    assert!(automatic.items.is_empty());
+
+    let code_signal_only = engine
+        .task_space_associations(
+            &task("unrelated positive query"),
+            &[TaskSignal {
+                kind: TaskSignalKind::Symbol,
+                content: "LegacyRouterBoundary".to_owned(),
+            }],
+        )
+        .unwrap();
+    assert!(code_signal_only.associations.is_empty());
+}
+
+#[test]
+fn positive_and_out_of_scope_matches_keep_one_penalized_explained_association() {
+    let fixture = polarity_fixture();
+    let engine = SearchEngine::new(fixture.index);
+    let positive_task = task("SearchRankingEngine 搜索排序");
+    let positive = engine.task_space_associations(&positive_task, &[]).unwrap();
+    assert_eq!(positive.associations.len(), 1);
+    let positive_score = positive.associations[0].score;
+
+    let mut task_declares_exclusion = positive_task;
+    task_declares_exclusion.out_of_scope = vec!["支付迁移 LegacyRouterBoundary".to_owned()];
+    let declared_exclusion = engine
+        .task_space_associations(&task_declares_exclusion, &[])
+        .unwrap();
+    assert_eq!(declared_exclusion.associations.len(), 1);
+    assert_eq!(
+        declared_exclusion.associations[0].score.to_bits(),
+        positive_score.to_bits()
+    );
+    assert!(
+        declared_exclusion.associations[0]
+            .reasons
+            .iter()
+            .all(|reason| {
+                serde_json::from_str::<IntentScopeConflictExplanation>(reason).is_err()
+            })
+    );
+
+    let conflict_task = task("SearchRankingEngine 搜索排序 支付迁移 LegacyRouterBoundary");
+    let conflict_signals = vec![TaskSignal {
+        kind: TaskSignalKind::Symbol,
+        content: "LegacyRouterBoundary".to_owned(),
+    }];
+    let conflicted = engine
+        .task_space_associations(&conflict_task, &conflict_signals)
+        .unwrap();
+    assert_eq!(conflicted.associations.len(), 1);
+    let association = &conflicted.associations[0];
+    assert_eq!(association.space_id, fixture.space_id);
+    assert_eq!(
+        association.score.to_bits(),
+        (positive_score / 2.0).to_bits()
+    );
+    assert!(
+        !association
+            .matched_intent_fields
+            .iter()
+            .any(|field| field == "out_of_scope")
+    );
+    let explanation = association
+        .reasons
+        .iter()
+        .find_map(|reason| serde_json::from_str::<IntentScopeConflictExplanation>(reason).ok())
+        .expect("association must expose a typed Intent Scope Conflict");
+    assert_eq!(
+        explanation.kind,
+        IntentScopeConflictKind::ContextSpaceOutOfScope
+    );
+    assert_eq!(
+        explanation.policy,
+        IntentScopeConflictPolicy::PenalizeAssociation
+    );
+    assert_eq!(explanation.score_multiplier_basis_points, 5_000);
+    assert!(!explanation.matched_tokens.is_empty());
+    assert_eq!(
+        explanation.matched_task_signals,
+        vec!["symbol:LegacyRouterBoundary".to_owned()]
+    );
+
+    let pack = engine
+        .task_context_pack(&TaskContextRequest::automatic(
+            conflict_task,
+            conflict_signals,
+            100_000,
+        ))
+        .unwrap();
+    assert_eq!(pack.associations, conflicted.associations);
+    assert_eq!(pack.items.len(), 1);
+    assert_eq!(pack.items[0].context.context_id, fixture.context_id);
+    assert!(pack.items[0].retrieval_paths.iter().any(|path| {
+        matches!(
+            path,
+            TaskRetrievalPath::IntentFts {
+                matched_fields,
+                matched_tokens,
+            } if matched_fields == &["out_of_scope".to_owned()] && !matched_tokens.is_empty()
+        )
+    }));
 }
 
 #[test]
