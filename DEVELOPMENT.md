@@ -31,7 +31,7 @@
 
 Cursor 与 Codex 都通过显式 `task_intent_update` 建立权威 Task；Prompt Hook 只提供能力提示。已有 ActiveTask 可通过只读 `task_context` 再取 Pack。
 
-Mandatory Gate #117 已完成：稳定 `submission_id` 写入 Git Event 并可重建到 SQLite submission/conflict 索引；Candidate lock 覆盖索引同步、lookup、pending recovery 和 append，主写路径不扫描全量 Event，也不依赖 commit subject。`candidate_create` 同时使用 #156 的 Runtime existence/owner/status 与 Task/Intent CAS 验证 source Episode。#114 的无关 malformed Event 隔离仍未实现。
+Mandatory Gate #114/#117 已完成：稳定 `submission_id` 写入 Git Event 并可重建到 SQLite submission/conflict 索引；Candidate lock 覆盖索引同步、lookup、pending recovery 和 append，主写路径不扫描全量 Event，也不依赖 commit subject。known-v1 malformed Candidate 只有在可安全提取合法 SubmissionId 时形成 submission-local conflict；unknown schema、无 hint 或其他 submission 的坏 Event 只保留 diagnostic。`candidate_create` 同时使用 #156 的 Runtime existence/owner/status 与 Task/Intent CAS 验证 source Episode。
 
 M1 的手工 `candidate_create` 是领域和安全边界的可执行入口，不等同于 M4 的 Low-tax Capture。
 

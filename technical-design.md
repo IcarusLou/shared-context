@@ -1360,7 +1360,7 @@ EngineeringResolutionSource {
 - 当前显式 `candidate_create` 验证无归属 Candidate 的入口、安全边界、Task/Intent CAS 与 closed WorkEpisode 精确所有权；自动 Candidate Builder 仍未实现。
 - Mandatory Gate #117 已完成：一次创建操作携带稳定 `submission_id`，首次提交由服务端生成 `candidate_id`/`event_id`/路径并持久化 submission mapping；重试复用同一 `submission_id`。
 - 相同 `submission_id` 加相同权威内容返回原 Candidate；相同 `submission_id` 加不同内容返回 `IdempotencyKeyConflict`；不同 `submission_id` 创建新的 Candidate，即使完整草稿相同。语义相近去重属于知识聚合，不由幂等键处理。
-- `submission_id`、closed Episode ownership 和 writer batch annotation 进入 Git Event；SQLite 建 submission/conflict 投影并从 Git Tree 与引入 commit 重建。Candidate 主写路径使用索引 lookup，不扫描 Event 或读取 commit subject。#114 的无关 malformed Event 隔离仍未实现。
+- `submission_id`、closed Episode ownership 和 writer batch annotation 进入 Git Event；SQLite 建 submission/conflict 投影并从 Git Tree 与引入 commit 重建。Candidate 主写路径使用索引 lookup，不扫描 Event 或读取 commit subject。known-v1 malformed Candidate 仅在有界解析出合法 SubmissionId 时合并到该 ID 的 conflict；unknown schema、无 hint 和其他 ID 只保留 diagnostic，不形成全局阻断。
 - #156 的 WorkEpisode query 已接入 Candidate admission；不存在、Open、跨 Task 或 stale Intent 的来源在任何 Git 写入前拒绝。
 
 ## 19. 验收标准

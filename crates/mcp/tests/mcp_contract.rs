@@ -6,11 +6,11 @@ use std::{
 };
 
 use sctx_domain::{
-    Applicability, ArtifactLocator, ArtifactRef, CaptureUnknown, ContextId, ContextKind,
-    ContextRevisionDraft, ContextRevisionRef, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot,
-    PublicationAction, PublicationDraft, RepoRelativePath, RepositoryId, RevisionId, SpaceId,
-    SubmissionId, TaskId, TaskIntentDraft, TaskIntentRevisionId, TaskSignal, TaskSignalKind,
-    WorkEpisodeId,
+    Applicability, ArtifactLocator, ArtifactRef, CandidateId, CaptureUnknown, ContextId,
+    ContextKind, ContextRevisionDraft, ContextRevisionRef, EventId, EvidenceSnapshotDraft,
+    EvidenceType, IntentSnapshot, PublicationAction, PublicationDraft, RepoRelativePath,
+    RepositoryId, RevisionId, SpaceId, SubmissionId, TaskId, TaskIntentDraft, TaskIntentRevisionId,
+    TaskSignal, TaskSignalKind, WorkEpisodeId,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
@@ -1871,6 +1871,87 @@ fn candidate_create_retries_are_strict_and_unassigned_candidates_are_not_retriev
 }
 
 #[test]
+fn candidate_create_ignores_unrelated_bad_events_but_blocks_its_malformed_submission() {
+    let fixture = Fixture::new();
+    let owner = closed_candidate_owner(&fixture, "codex", "candidate-malformed-isolation");
+    commit_raw_event(
+        fixture.store.repository(),
+        "unrelated-missing-required",
+        &serde_json::from_str(include_str!(
+            "../../../fixtures/events/v1/invalid/missing-required-field.json"
+        ))
+        .unwrap(),
+    );
+    let blocked_submission = SubmissionId::new();
+    commit_raw_event(
+        fixture.store.repository(),
+        "same-submission-malformed",
+        &json!({
+            "schema_version": "1",
+            "event_type": "context_candidate.created",
+            "event_id": EventId::new(),
+            "candidate": {
+                "candidate_id": CandidateId::new(),
+                "submission_id": blocked_submission
+            }
+        }),
+    );
+    let responses = run_session(
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::Newline,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(
+                2,
+                "candidate_create",
+                candidate_arguments(
+                    SubmissionId::new(),
+                    &owner,
+                    "unrelated malformed Events remain isolated",
+                ),
+            ),
+            tool_call(
+                3,
+                "candidate_create",
+                candidate_arguments(
+                    blocked_submission,
+                    &owner,
+                    "same malformed submission is blocked",
+                ),
+            ),
+            tool_call(
+                4,
+                "candidate_create",
+                candidate_arguments(
+                    SubmissionId::new(),
+                    &owner,
+                    "another submission remains writable",
+                ),
+            ),
+        ],
+    );
+    assert_eq!(responses[1]["result"]["isError"], false);
+    assert_eq!(responses[1]["result"]["structuredContent"]["created"], true);
+    assert_eq!(responses[2]["result"]["isError"], true);
+    assert_eq!(
+        responses[2]["result"]["structuredContent"]["error"]["code"],
+        "idempotency_key_conflict"
+    );
+    assert_eq!(responses[3]["result"]["isError"], false);
+    let diagnostics = ProjectionIndex::for_store(&fixture.store)
+        .domain_snapshot()
+        .unwrap()
+        .diagnostics;
+    assert!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "EVENT_PARSE_ERROR")
+            .count()
+            >= 2
+    );
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn candidate_create_rejects_missing_open_cross_task_and_stale_ownership_without_git_writes() {
     let fixture = Fixture::new();
@@ -2100,6 +2181,18 @@ fn event_count(repository: &Path) -> usize {
         .lines()
         .filter(|path| path.starts_with("events/"))
         .count()
+}
+
+fn commit_raw_event(repository: &Path, label: &str, value: &Value) {
+    let relative = format!("events/ab/{label}.json");
+    let path = repository.join(&relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    git(repository, &["add", "--", &relative]);
+    git(
+        repository,
+        &["commit", "-m", &format!("Add {label} fixture")],
+    );
 }
 
 fn dirty_first_event(repository: &Path) {

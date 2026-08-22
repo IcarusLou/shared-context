@@ -35,6 +35,51 @@ pub const V1_SCHEMA_ID: &str = "https://shared-context.local/schemas/event-v1.sc
 /// Bundled JSON Schema text. Schema evolution adds a new file and constant.
 pub const V1_JSON_SCHEMA: &str = include_str!("../../../schemas/event-v1.schema.json");
 
+/// Maximum malformed Event size inspected for a Candidate submission hint.
+pub const MAX_CANDIDATE_SUBMISSION_HINT_BYTES: usize = 256 * 1024;
+
+/// Safely extracted identity hints from a known-V1 Candidate Event envelope.
+///
+/// A hint is diagnostic-only: it never makes a malformed Event projectable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CandidateSubmissionHint {
+    pub submission_id: SubmissionId,
+    pub event_id: Option<EventId>,
+    pub candidate_id: Option<CandidateId>,
+}
+
+/// Best-effort extraction used only to isolate malformed Candidate submissions.
+///
+/// The input must be bounded, valid JSON, exact known schema V1, exact
+/// `context_candidate.created`, and contain a strictly valid `SubmissionId`.
+/// Every other parse error remains outside this hint channel.
+#[must_use]
+pub fn candidate_submission_hint(bytes: &[u8]) -> Option<CandidateSubmissionHint> {
+    if bytes.len() > MAX_CANDIDATE_SUBMISSION_HINT_BYTES {
+        return None;
+    }
+    let value = serde_json::from_slice::<Value>(bytes).ok()?;
+    let envelope = value.as_object()?;
+    if envelope.get("schema_version")?.as_str()? != SchemaVersion::V1.as_str()
+        || envelope.get("event_type")?.as_str()? != EventType::ContextCandidateCreated.as_str()
+    {
+        return None;
+    }
+    let candidate = envelope.get("candidate")?.as_object()?;
+    let submission_id = candidate.get("submission_id")?.as_str()?.parse().ok()?;
+    Some(CandidateSubmissionHint {
+        submission_id,
+        event_id: envelope
+            .get("event_id")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse().ok()),
+        candidate_id: candidate
+            .get("candidate_id")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse().ok()),
+    })
+}
+
 /// Schema versions that this parser can project.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SchemaVersion {

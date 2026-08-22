@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use sctx_domain::{
-    CandidateId, DomainProjection, EventId, ReducerDiagnostic, ReducerEvent, SubmissionId, reduce,
+    CandidateId, CandidateSubmissionConflict, DomainProjection, EventId, ReducerDiagnostic,
+    ReducerEvent, SubmissionId, reduce,
 };
-use sctx_event_schema::{Event, EventPayload, ParsedEvent, parse_event};
+use sctx_event_schema::{
+    CandidateSubmissionHint, Event, EventPayload, ParsedEvent, candidate_submission_hint,
+    parse_event,
+};
 use sha2::{Digest, Sha256};
 
 use crate::git_tree::TreeBlob;
@@ -63,6 +67,7 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
     let mut diagnostics = BTreeSet::new();
     let mut impacts = Vec::new();
     let mut candidate_events = BTreeMap::new();
+    let mut malformed_candidate_hints = Vec::new();
 
     for blob in blobs {
         if blob.path.starts_with("events/") {
@@ -120,12 +125,19 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
                     });
                 }
                 Err(error) => {
+                    let hint = candidate_submission_hint(&blob.bytes);
+                    if let Some(hint) = hint {
+                        malformed_candidate_hints.push(hint);
+                    }
                     let code = "EVENT_PARSE_ERROR".to_owned();
                     let message = error.to_string();
+                    let diagnostic_entity = hint
+                        .and_then(|hint| hint.event_id)
+                        .map_or_else(|| blob.path.clone(), |event_id| event_id.to_string());
                     diagnostics.insert(diagnostic(
                         Some(&blob.path),
                         &code,
-                        &blob.path,
+                        &diagnostic_entity,
                         "[]",
                         &message,
                     ));
@@ -133,7 +145,7 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
                         path: blob.path.clone(),
                         blob_oid: blob.oid.clone(),
                         parse_status: "invalid".to_owned(),
-                        event_id: None,
+                        event_id: hint.and_then(|hint| hint.event_id).map(|id| id.to_string()),
                         diagnostic_code: Some(code),
                         diagnostic_message: Some(message),
                         content: blob.bytes.clone(),
@@ -176,7 +188,8 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
         }
     }
 
-    let projection = reduce(&reducer_events);
+    let mut projection = reduce(&reducer_events);
+    merge_malformed_candidate_hints(&mut projection, malformed_candidate_hints);
     for reducer_diagnostic in &projection.diagnostics {
         diagnostics.insert(from_reducer(reducer_diagnostic, &event_paths));
     }
@@ -201,6 +214,44 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
         diagnostics: diagnostics.into_iter().collect(),
         impacts,
         candidate_events,
+    }
+}
+
+fn merge_malformed_candidate_hints(
+    projection: &mut DomainProjection,
+    hints: Vec<CandidateSubmissionHint>,
+) {
+    for hint in hints {
+        let valid = projection
+            .candidate_submissions
+            .get(&hint.submission_id)
+            .map(|submission| {
+                (
+                    submission.event_id,
+                    submission.candidate_id,
+                    submission.content_hash.clone(),
+                )
+            });
+        let conflict = projection
+            .candidate_submission_conflicts
+            .entry(hint.submission_id)
+            .or_insert_with(|| CandidateSubmissionConflict {
+                submission_id: hint.submission_id,
+                event_ids: BTreeSet::new(),
+                candidate_ids: BTreeSet::new(),
+                content_hashes: BTreeSet::new(),
+            });
+        if let Some(event_id) = hint.event_id {
+            conflict.event_ids.insert(event_id);
+        }
+        if let Some(candidate_id) = hint.candidate_id {
+            conflict.candidate_ids.insert(candidate_id);
+        }
+        if let Some((event_id, candidate_id, content_hash)) = valid {
+            conflict.event_ids.insert(event_id);
+            conflict.candidate_ids.insert(candidate_id);
+            conflict.content_hashes.insert(content_hash);
+        }
     }
 }
 

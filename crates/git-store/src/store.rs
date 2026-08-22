@@ -12,7 +12,7 @@ use sctx_domain::{
     CandidateId, ContextRevisionDraft, Error, ErrorKind, EventId, ReducerEvent, Result,
     SubmissionId, WorkEpisodeRef, candidate_submission_content_hash, reduce,
 };
-use sctx_event_schema::{Event, EventType, ParsedEvent, parse_event};
+use sctx_event_schema::{Event, EventType, ParsedEvent, candidate_submission_hint, parse_event};
 use sctx_local_state::{PrivacyScan, PrivacyScanner, UserConfigStore};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -609,22 +609,13 @@ impl GitStore {
                 git.head_file(path)?
             }
             .ok_or_else(|| invariant(format!("event disappeared while validating: {path}")))?;
-            match parse_event(&bytes) {
-                Ok(ParsedEvent::Known(event)) => {
-                    if added.contains(path) {
-                        staged_event_ids.insert(event.event_id());
-                    }
-                    if let Some(event) = event.reducer_event() {
-                        reducer_events.push(event);
-                    }
-                }
-                Err(error) if added.contains(path) => {
-                    return Err(invariant(format!(
-                        "staged event is invalid at {path}: {error}"
-                    )));
-                }
-                Ok(ParsedEvent::UnknownSchema(_)) | Err(_) => {}
-            }
+            collect_staged_event(
+                path,
+                &bytes,
+                added.contains(path),
+                &mut reducer_events,
+                &mut staged_event_ids,
+            )?;
         }
         for path in added_paths
             .iter()
@@ -1298,6 +1289,43 @@ fn outcome(
         objects,
         recovered,
     })
+}
+
+fn collect_staged_event(
+    path: &str,
+    bytes: &[u8],
+    added: bool,
+    reducer_events: &mut Vec<ReducerEvent>,
+    staged_event_ids: &mut BTreeSet<EventId>,
+) -> Result<()> {
+    match parse_event(bytes) {
+        Ok(ParsedEvent::Known(event)) => {
+            if added && event.event_type() == EventType::ContextCandidateCreated {
+                return Err(invariant(format!(
+                    "staged Candidate event at {path} requires the Candidate submission service"
+                )));
+            }
+            if added {
+                staged_event_ids.insert(event.event_id());
+            }
+            if let Some(event) = event.reducer_event() {
+                reducer_events.push(event);
+            }
+        }
+        Err(error) if added => {
+            if let Some(hint) = candidate_submission_hint(bytes) {
+                return Err(invariant(format!(
+                    "staged malformed Candidate event at {path} for {} requires the Candidate submission service",
+                    hint.submission_id
+                )));
+            }
+            return Err(invariant(format!(
+                "staged event is invalid at {path}: {error}"
+            )));
+        }
+        Ok(ParsedEvent::UnknownSchema(_)) | Err(_) => {}
+    }
+    Ok(())
 }
 
 fn append_from_submission_record(

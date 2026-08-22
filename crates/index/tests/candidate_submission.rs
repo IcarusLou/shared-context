@@ -11,15 +11,15 @@ use std::{
 
 use rusqlite::{Connection, params};
 use sctx_domain::{
-    Applicability, ContextKind, ContextRevisionDraft, EvidenceSnapshotDraft, EvidenceType,
-    SubmissionId, TaskId, TaskSessionId, WorkEpisodeId, WorkEpisodeRef,
+    Applicability, CandidateId, ContextKind, ContextRevisionDraft, EventId, EvidenceSnapshotDraft,
+    EvidenceType, SubmissionId, TaskId, TaskSessionId, WorkEpisodeId, WorkEpisodeRef,
 };
 use sctx_event_schema::Event;
 use sctx_git_store::{
     CandidateSubmissionIndex, CandidateSubmissionLookup, CandidateSubmissionRequest, CrashInjector,
     CrashSeam, Error, ErrorKind, GitStore, Result,
 };
-use sctx_index::ProjectionIndex;
+use sctx_index::{IndexUpdateKind, ProjectionIndex};
 
 fn request(submission_id: SubmissionId, statement: &str) -> CandidateSubmissionRequest {
     CandidateSubmissionRequest {
@@ -59,6 +59,204 @@ fn configured_store() -> (tempfile::TempDir, GitStore, ProjectionIndex) {
     let index = ProjectionIndex::for_store(&base);
     let store = base.with_candidate_submission_index(Arc::new(index.clone()));
     (temporary, store, index)
+}
+
+fn commit_raw_event(store: &GitStore, label: &str, value: &serde_json::Value) -> String {
+    let relative = format!("events/aa/{label}.json");
+    let path = store.repository().join(&relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    let add = Command::new("git")
+        .arg("-C")
+        .arg(store.repository())
+        .args(["add", "--", &relative])
+        .output()
+        .unwrap();
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let commit = Command::new("git")
+        .arg("-C")
+        .arg(store.repository())
+        .args(["commit", "-m", &format!("Add {label} fixture")])
+        .output()
+        .unwrap();
+    assert!(
+        commit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    relative
+}
+
+fn malformed_candidate(submission_id: SubmissionId) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": "1",
+        "event_type": "context_candidate.created",
+        "event_id": EventId::new(),
+        "candidate": {
+            "candidate_id": CandidateId::new(),
+            "submission_id": submission_id,
+            "content": {"statement": "missing required Candidate fields"}
+        }
+    })
+}
+
+#[test]
+fn malformed_candidate_hints_block_only_their_submission_and_rebuild_deterministically() {
+    let (_temporary, store, index) = configured_store();
+    index.synchronize().unwrap();
+
+    let malformed_submission = SubmissionId::new();
+    let malformed = malformed_candidate(malformed_submission);
+    let malformed_event_id = malformed["event_id"].as_str().unwrap().to_owned();
+    let malformed_candidate_id = malformed["candidate"]["candidate_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let malformed_path = commit_raw_event(&store, "malformed-candidate", &malformed);
+    let incremental = index.synchronize().unwrap();
+    assert_eq!(incremental.update_kind, IndexUpdateKind::Incremental);
+    let expected = CandidateSubmissionIndex::lookup(&index, malformed_submission).unwrap();
+    let CandidateSubmissionLookup::Conflict {
+        event_ids,
+        candidate_ids,
+        content_hashes,
+        ..
+    } = &expected
+    else {
+        panic!("expected malformed submission conflict: {expected:?}");
+    };
+    assert_eq!(
+        event_ids.iter().next().unwrap().to_string(),
+        malformed_event_id
+    );
+    assert_eq!(
+        candidate_ids.iter().next().unwrap().to_string(),
+        malformed_candidate_id
+    );
+    assert!(content_hashes.is_empty());
+    assert_eq!(
+        store
+            .submit_candidate(request(
+                malformed_submission,
+                "the malformed definition must block this operation",
+            ))
+            .unwrap_err()
+            .kind(),
+        ErrorKind::IdempotencyKeyConflict
+    );
+
+    let unrelated = store
+        .submit_candidate(request(
+            SubmissionId::new(),
+            "an unrelated submission remains writable",
+        ))
+        .unwrap();
+    assert!(unrelated.created());
+    let connection = Connection::open(index.database_path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT diagnostic_code FROM source_file WHERE path = ?1",
+                [&malformed_path],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "EVENT_PARSE_ERROR"
+    );
+    drop(connection);
+
+    fs::remove_file(index.database_path()).unwrap();
+    index.synchronize().unwrap();
+    assert_eq!(
+        CandidateSubmissionIndex::lookup(&index, malformed_submission).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn unknown_or_unidentifiable_bad_events_never_create_submission_conflicts() {
+    let (_temporary, store, index) = configured_store();
+    let unknown_submission = SubmissionId::new();
+    commit_raw_event(
+        &store,
+        "unknown-candidate-schema",
+        &serde_json::json!({
+            "schema_version": "future",
+            "event_type": "context_candidate.created",
+            "event_id": EventId::new(),
+            "candidate": {"submission_id": unknown_submission}
+        }),
+    );
+    commit_raw_event(
+        &store,
+        "invalid-without-submission",
+        &serde_json::from_str(include_str!(
+            "../../../fixtures/events/v1/invalid/missing-required-field.json"
+        ))
+        .unwrap(),
+    );
+    let created = store
+        .submit_candidate(request(
+            unknown_submission,
+            "unknown schema text cannot reserve a SubmissionId",
+        ))
+        .unwrap();
+    assert!(created.created());
+    let diagnostics = index.domain_snapshot().unwrap().diagnostics;
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "UNKNOWN_SCHEMA_VERSION")
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "EVENT_PARSE_ERROR")
+    );
+}
+
+#[test]
+fn malformed_hint_merges_with_an_existing_valid_mapping_and_blocks_only_that_id() {
+    let (_temporary, store, index) = configured_store();
+    let submission_id = SubmissionId::new();
+    let valid = store
+        .submit_candidate(request(
+            submission_id,
+            "valid Candidate before malformed history",
+        ))
+        .unwrap();
+    commit_raw_event(
+        &store,
+        "malformed-after-valid",
+        &malformed_candidate(submission_id),
+    );
+    index.synchronize().unwrap();
+    let conflict = CandidateSubmissionIndex::lookup(&index, submission_id).unwrap();
+    let CandidateSubmissionLookup::Conflict {
+        event_ids,
+        candidate_ids,
+        content_hashes,
+        ..
+    } = conflict
+    else {
+        panic!("expected merged valid/malformed conflict");
+    };
+    assert!(event_ids.contains(&valid.record.event_id));
+    assert!(candidate_ids.contains(&valid.record.candidate_id));
+    assert!(content_hashes.contains(&valid.record.content_hash));
+    assert!(
+        store
+            .submit_candidate(request(
+                SubmissionId::new(),
+                "another submission bypasses the local conflict",
+            ))
+            .unwrap()
+            .created()
+    );
 }
 
 #[test]

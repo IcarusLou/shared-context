@@ -132,6 +132,18 @@ impl Harness {
     }
 }
 
+fn commit_raw_event(harness: &Harness, label: &str, value: &Value) {
+    let relative = format!("events/ac/{label}.json");
+    let path = harness.repository().join(&relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    git_output(&harness.repository(), &["add", "--", &relative]);
+    git_output(
+        &harness.repository(),
+        &["commit", "-m", &format!("Add {label} fixture")],
+    );
+}
+
 #[allow(clippy::struct_field_names)]
 struct Published {
     context_id: String,
@@ -1275,6 +1287,14 @@ fn candidate_create_is_unassigned_idempotent_and_absent_from_retrieval() {
     GitStore::initialize(harness.root()).unwrap();
     let owner = closed_candidate_owner(&harness, "cli-candidate-retry");
     let submission_id = SubmissionId::new();
+    commit_raw_event(
+        &harness,
+        "unrelated-missing-required",
+        &serde_json::from_str(include_str!(
+            "../../../fixtures/events/v1/invalid/missing-required-field.json"
+        ))
+        .unwrap(),
+    );
     let initial_count = harness.event_count();
 
     let created = create_candidate(&harness, submission_id, &owner, "hidden episode discovery");

@@ -5,13 +5,15 @@ use std::{
 };
 
 use sctx_event_schema::{
-    Annotations, Applicability, ArtifactKind, ConflictParticipant, ConflictResolutionDraft,
-    ConflictResolutionResult, ContextId, ContextKind, ContextRevisionDraft, DiagnosticCode,
-    EngineeringReferenceDraft, Event, EventPayload, EventType, EvidenceSnapshotDraft, EvidenceType,
-    IntentSnapshot, OriginHint, ParsedEvent, PublicationAction, PublicationDraft, PublicationId,
-    ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionOutcome, ReviewDraft,
-    ReviewVerdict, SemanticConflictDraft, SubmissionId, TaskId, TaskSessionId, V1_JSON_SCHEMA,
-    V1_SCHEMA_ID, WorkEpisodeId, WorkEpisodeRef, parse_event,
+    Annotations, Applicability, ArtifactKind, CandidateId, ConflictParticipant,
+    ConflictResolutionDraft, ConflictResolutionResult, ContextId, ContextKind,
+    ContextRevisionDraft, DiagnosticCode, EngineeringReferenceDraft, Event, EventId, EventPayload,
+    EventType, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot,
+    MAX_CANDIDATE_SUBMISSION_HINT_BYTES, OriginHint, ParsedEvent, PublicationAction,
+    PublicationDraft, PublicationId, ReferenceRelation, RepoRelativePath, RepositoryId,
+    ResolutionOutcome, ReviewDraft, ReviewVerdict, SemanticConflictDraft, SubmissionId, TaskId,
+    TaskSessionId, V1_JSON_SCHEMA, V1_SCHEMA_ID, WorkEpisodeId, WorkEpisodeRef,
+    candidate_submission_hint, parse_event,
 };
 use serde_json::{Value, json};
 
@@ -45,6 +47,37 @@ fn parse_known(bytes: &[u8]) -> Event {
         ParsedEvent::Known(event) => *event,
         ParsedEvent::UnknownSchema(_) => panic!("V1 fixture must not be quarantined"),
     }
+}
+
+#[test]
+fn malformed_candidate_hint_requires_bounded_exact_known_v1_identity() {
+    let submission_id = SubmissionId::new();
+    let event_id = EventId::new();
+    let candidate_id = CandidateId::new();
+    let malformed = json!({
+        "schema_version": "1",
+        "event_type": "context_candidate.created",
+        "event_id": event_id,
+        "candidate": {
+            "candidate_id": candidate_id,
+            "submission_id": submission_id
+        }
+    });
+    let hint = candidate_submission_hint(&serde_json::to_vec(&malformed).unwrap()).unwrap();
+    assert_eq!(hint.submission_id, submission_id);
+    assert_eq!(hint.event_id, Some(event_id));
+    assert_eq!(hint.candidate_id, Some(candidate_id));
+    for value in [
+        json!({"schema_version": "future", "event_type": "context_candidate.created", "candidate": {"submission_id": submission_id}}),
+        json!({"schema_version": "1", "event_type": "space.created", "candidate": {"submission_id": submission_id}}),
+        json!({"schema_version": "1", "event_type": "context_candidate.created", "candidate": {"submission_id": "not-a-submission"}}),
+        json!({"schema_version": "1", "event_type": "context_candidate.created"}),
+    ] {
+        assert!(candidate_submission_hint(&serde_json::to_vec(&value).unwrap()).is_none());
+    }
+    assert!(
+        candidate_submission_hint(&vec![b' '; MAX_CANDIDATE_SUBMISSION_HINT_BYTES + 1]).is_none()
+    );
 }
 
 fn intent(title: &str) -> IntentSnapshot {

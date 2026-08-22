@@ -11,10 +11,10 @@ use std::{
 };
 
 use sctx_event_schema::{
-    Applicability, ArtifactKind, ArtifactLocator, ContextId, ContextKind, ContextRevisionDraft,
-    EngineeringReferenceDraft, Event, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot,
-    ReferenceRelation, RepoRelativePath, RepositoryId, RevisionId, SubmissionId, TaskId,
-    TaskSessionId, WorkEpisodeId, WorkEpisodeRef,
+    Applicability, ArtifactKind, ArtifactLocator, CandidateId, ContextId, ContextKind,
+    ContextRevisionDraft, EngineeringReferenceDraft, Event, EventId, EvidenceSnapshotDraft,
+    EvidenceType, IntentSnapshot, ReferenceRelation, RepoRelativePath, RepositoryId, RevisionId,
+    SubmissionId, TaskId, TaskSessionId, WorkEpisodeId, WorkEpisodeRef,
 };
 use sctx_git_store::{
     AppendRequest, CrashInjector, CrashSeam, Error, ErrorKind, GitStore, OBJECT_PENDING,
@@ -278,6 +278,60 @@ fn generic_append_event_rejects_candidate_submission_bypass() {
         .unwrap_err();
     assert!(error.message().contains("Candidate submission service"));
     assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), before);
+}
+
+fn stage_raw_event(fixture: &Fixture, label: &str, bytes: &[u8]) {
+    let relative = format!("events/aa/{label}.json");
+    let path = fixture.store.repository().join(&relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, bytes).unwrap();
+    fixture.git(&["add", "--", &relative]);
+}
+
+#[test]
+fn staged_known_or_identifiable_malformed_candidate_requires_submission_service() {
+    let known = Fixture::new();
+    stage_raw_event(
+        &known,
+        "known-candidate",
+        &serde_json::to_vec(&candidate_event(
+            SubmissionId::new(),
+            "manual staged Candidate must be rejected",
+        ))
+        .unwrap(),
+    );
+    let error = known.store.validate_staged().unwrap_err();
+    assert!(error.message().contains("Candidate submission service"));
+
+    let malformed = Fixture::new();
+    let submission_id = SubmissionId::new();
+    stage_raw_event(
+        &malformed,
+        "malformed-candidate",
+        &serde_json::to_vec(&serde_json::json!({
+            "schema_version": "1",
+            "event_type": "context_candidate.created",
+            "event_id": EventId::new(),
+            "candidate": {
+                "candidate_id": CandidateId::new(),
+                "submission_id": submission_id
+            }
+        }))
+        .unwrap(),
+    );
+    let error = malformed.store.validate_staged().unwrap_err();
+    assert!(error.message().contains("Candidate submission service"));
+    assert!(error.message().contains(&submission_id.to_string()));
+
+    let no_hint = Fixture::new();
+    stage_raw_event(
+        &no_hint,
+        "invalid-space",
+        br#"{"schema_version":"1","event_type":"space.created"}"#,
+    );
+    let error = no_hint.store.validate_staged().unwrap_err();
+    assert!(error.message().contains("staged event is invalid"));
+    assert!(!error.message().contains("Candidate submission service"));
 }
 
 #[test]

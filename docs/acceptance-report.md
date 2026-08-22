@@ -1,8 +1,8 @@
 # Task-first Retrieval Integration Acceptance Report
 
 Date: 2026-08-22
-Scope: Mew #112 through #157, excluding deferred #158/#163 and accepted boundary #150
-Implementation baseline before public AgentCheckpoint: `main@1356ec6`
+Scope: Mew #112 through #157, including Mandatory Gates #114/#117, excluding deferred #158/#163 and accepted boundary #150
+Implementation baseline before malformed Candidate isolation: `main@e9d0358`
 
 ## Verdict
 
@@ -21,7 +21,7 @@ This report does **not** claim M4:
 
 `task_intent_update` is the only Task Intent write path. `task_context` accepts only an external Session locator and output bounds, and reads the already-authoritative ActiveTask without mutating Runtime. PromptSubmit supplies guidance rather than inferred Intent. Explicit `context_search.space_ids` remains available as a hard filter for diagnosis and exploration.
 
-Mandatory Gate #117 is implemented: stable `submission_id` and exact closed Episode ownership are represented in Git, rebuilt into SQLite submission/conflict indexes, and admitted only after Task/Intent/source Episode verification. Same-ID retries reuse the original Candidate while conflicting content is rejected; different IDs remain distinct. The write path uses indexed lookup rather than Event scans or commit subjects. #114 malformed-Event isolation remains deferred.
+Mandatory Gates #114/#117 are implemented: stable `submission_id` and exact closed Episode ownership are represented in Git, rebuilt into SQLite submission/conflict indexes, and admitted only after Task/Intent/source Episode verification. Same-ID retries reuse the original Candidate while conflicting or identifiable malformed same-ID Events fail closed; different IDs and unrelated invalid/unknown Events remain isolated. The write path uses indexed lookup rather than Event scans or commit subjects.
 
 ## Acceptance matrix
 
@@ -36,6 +36,8 @@ Mandatory Gate #117 is implemented: stable `submission_id` and exact closed Epis
 | Candidate creation requires no Space | PROVEN | CLI and MCP `candidate_create` contracts reject Space fields and return an unassigned Candidate ID |
 | `candidate_create` is the Agent-facing Candidate main path | PROVEN | CLI help, MCP tool list, CLI milestone test, and MCP client fixtures |
 | Candidate submission retry is exact and rebuildable | PROVEN | 20-thread and 20-process concurrency converge to one Candidate; all writer crash seams recover stable batch/commit metadata; deleting SQLite rebuilds the same submission mapping; same-ID/different-content is typed conflict while different IDs never deduplicate |
+| Malformed Candidate Events are submission-local | PROVEN | Bounded known-v1 hint extraction accepts only exact Candidate envelopes with a valid SubmissionId; same-ID malformed/duplicate/conflicting Events populate only that submission's conflict row, while unknown schema, missing hint and different IDs retain diagnostics without blocking valid creation; incremental, scratch and DB-deletion rebuilds agree |
+| Manual Candidate staging cannot bypass submission admission | PROVEN | Generic append rejects valid Candidate Events, while `validate_staged` explicitly rejects both known Candidate additions and identifiable malformed Candidate additions as requiring the Candidate submission service; unrelated parse errors remain strict rather than swallowed |
 | Candidate admission verifies source ownership before Git | PROVEN | MCP adversarial coverage rejects missing, open, cross-Task and stale-Intent Episode sources with zero Event writes |
 | Unconfirmed Candidate cannot enter automatic injection | PROVEN | Candidate projection is outside Context FTS; CLI/MCP candidate retrieval tests and Codex hook test return only Accepted eligible Context |
 | Existing confirmed Context fixtures use neutral revision terminology | PROVEN | Event constructor is `context_revision_added`; no Context-Propose API or constructor remains |
@@ -97,7 +99,7 @@ Mandatory Gate #117 is implemented: stable `submission_id` and exact closed Epis
 
 #154 replaces the unlaunched #151/#152 persistence model: `task_artifact_focus` is a read-only ArtifactFocusQuery, Catalog supplies a request-local `ResolvedFocus`, and Search consumes only that value for the current Pack. Runtime owns no Focus state, and later Focus queries, ordinary `task_context`, MCP restart, Task switch, or compaction restore nothing. Repository Catalog remains local-only; team synchronization is not claimed.
 
-#157 exposes explicit AgentCheckpoint through MCP/CLI/Skill without Hook-authored Claims. #117 connects explicit `candidate_create` to closed Episode verification and submission-idempotent Git admission. #158/#163 and #114/#136 remain deferred.
+#157 exposes explicit AgentCheckpoint through MCP/CLI/Skill without Hook-authored Claims. #114/#117 connect explicit `candidate_create` to closed Episode verification, submission-idempotent Git admission, and malformed-Event isolation. #158/#163/#136 remain deferred.
 
 ## Residue gates
 
