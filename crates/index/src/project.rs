@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use sctx_domain::{DomainProjection, EventId, ReducerDiagnostic, ReducerEvent, reduce};
+use sctx_domain::{
+    CandidateId, DomainProjection, EventId, ReducerDiagnostic, ReducerEvent, SubmissionId, reduce,
+};
 use sctx_event_schema::{Event, EventPayload, ParsedEvent, parse_event};
 use sha2::{Digest, Sha256};
 
@@ -41,6 +43,16 @@ pub(crate) struct BuildInput {
     pub(crate) projection: DomainProjection,
     pub(crate) diagnostics: Vec<ProjectionDiagnostic>,
     pub(crate) impacts: Vec<EventImpact>,
+    pub(crate) candidate_events: BTreeMap<EventId, CandidateEventMetadata>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CandidateEventMetadata {
+    pub(crate) submission_id: SubmissionId,
+    pub(crate) candidate_id: CandidateId,
+    pub(crate) event_path: String,
+    pub(crate) batch_id: Option<String>,
+    pub(crate) commit_oid: Option<String>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -50,12 +62,25 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
     let mut event_paths = BTreeMap::<EventId, Vec<String>>::new();
     let mut diagnostics = BTreeSet::new();
     let mut impacts = Vec::new();
+    let mut candidate_events = BTreeMap::new();
 
     for blob in blobs {
         if blob.path.starts_with("events/") {
             match parse_event(&blob.bytes) {
                 Ok(ParsedEvent::Known(event)) => {
                     let event_id = event.event_id();
+                    if let EventPayload::ContextCandidateCreated { candidate } = event.payload() {
+                        candidate_events.insert(
+                            event_id,
+                            CandidateEventMetadata {
+                                submission_id: candidate.submission_id,
+                                candidate_id: candidate.candidate_id,
+                                event_path: blob.path.clone(),
+                                batch_id: event.writer_batch_id().map(str::to_owned),
+                                commit_oid: None,
+                            },
+                        );
+                    }
                     event_paths
                         .entry(event_id)
                         .or_default()
@@ -175,6 +200,7 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
         projection,
         diagnostics: diagnostics.into_iter().collect(),
         impacts,
+        candidate_events,
     }
 }
 
@@ -271,7 +297,7 @@ fn event_impact(path: &str, event: &Event) -> EventImpact {
     let space_id = match event.payload() {
         EventPayload::ContextCandidateCreated { candidate } => {
             definitions.insert(identity("candidate", &candidate.candidate_id));
-            references.insert(identity("work_episode", &candidate.source_episode_id));
+            references.insert(identity("work_episode", &candidate.source_episode_id()));
             None
         }
         EventPayload::SpaceCreated {

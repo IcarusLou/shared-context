@@ -8,9 +8,13 @@ use std::{
 };
 
 use fs2::FileExt;
-use sctx_domain::{Error, ErrorKind, EventId, ReducerEvent, Result, reduce};
+use sctx_domain::{
+    CandidateId, ContextRevisionDraft, Error, ErrorKind, EventId, ReducerEvent, Result,
+    SubmissionId, WorkEpisodeRef, candidate_submission_content_hash, reduce,
+};
 use sctx_event_schema::{Event, EventType, ParsedEvent, parse_event};
 use sctx_local_state::{PrivacyScan, PrivacyScanner, UserConfigStore};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -80,12 +84,104 @@ pub struct AppendOutcome {
     pub recovered: bool,
 }
 
-/// Result of an idempotent Candidate append keyed by complete authoritative semantics.
+/// Candidate submission request after Runtime verified a closed Episode owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CandidateAppendOutcome {
+pub struct CandidateSubmissionRequest {
+    pub submission_id: SubmissionId,
+    pub source_episode: WorkEpisodeRef,
+    pub content: ContextRevisionDraft,
+}
+
+impl CandidateSubmissionRequest {
+    #[must_use]
+    pub fn content_hash(&self) -> String {
+        candidate_submission_content_hash(&self.source_episode, &self.content)
+    }
+}
+
+/// Complete indexed metadata for one unique committed Candidate submission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateSubmissionRecord {
+    pub submission_id: SubmissionId,
+    pub candidate_id: CandidateId,
+    pub event_id: EventId,
+    pub source_episode: WorkEpisodeRef,
+    pub content_hash: String,
+    pub batch_id: BatchId,
+    pub commit_oid: String,
+    pub event_path: String,
+}
+
+/// Typed indexed lookup that isolates submission-local authoritative conflicts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CandidateSubmissionLookup {
+    NotFound,
+    Found(CandidateSubmissionRecord),
+    Conflict {
+        submission_id: SubmissionId,
+        event_ids: Vec<EventId>,
+        candidate_ids: Vec<CandidateId>,
+        content_hashes: Vec<String>,
+    },
+}
+
+/// Rebuildable Candidate idempotency index implemented by the Index crate.
+pub trait CandidateSubmissionIndex: Send + Sync {
+    /// Synchronizes derived state to the current committed Git `HEAD`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed storage or projection error when synchronization is unavailable.
+    fn synchronize(&self) -> Result<()>;
+
+    /// Performs one indexed `SubmissionId` lookup without scanning Git Events.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed storage or projection error when lookup is unavailable or corrupt.
+    fn lookup(&self, submission_id: SubmissionId) -> Result<CandidateSubmissionLookup>;
+}
+
+#[derive(Debug, Default)]
+pub struct UnavailableCandidateSubmissionIndex;
+
+impl CandidateSubmissionIndex for UnavailableCandidateSubmissionIndex {
+    fn synchronize(&self) -> Result<()> {
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "Candidate submission index is not configured",
+        ))
+    }
+
+    fn lookup(&self, _submission_id: SubmissionId) -> Result<CandidateSubmissionLookup> {
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "Candidate submission index is not configured",
+        ))
+    }
+}
+
+/// Result of one submission-idempotent Candidate operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateSubmissionOutcome {
     pub append: AppendOutcome,
-    pub event: Event,
-    pub created: bool,
+    pub record: CandidateSubmissionRecord,
+    pub status: CandidateSubmissionStatus,
+}
+
+/// Exact result of one Candidate submission operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateSubmissionStatus {
+    Created,
+    AlreadyExists,
+}
+
+impl CandidateSubmissionOutcome {
+    #[must_use]
+    pub const fn created(&self) -> bool {
+        matches!(self.status, CandidateSubmissionStatus::Created)
+    }
 }
 
 /// Result of validating the exact staged tree used by a manual Git commit.
@@ -162,6 +258,7 @@ pub struct GitStore {
     state: PathBuf,
     crash: Arc<dyn CrashInjector>,
     observer: Arc<dyn CommitObserver>,
+    candidate_index: Arc<dyn CandidateSubmissionIndex>,
 }
 
 impl GitStore {
@@ -236,6 +333,7 @@ impl GitStore {
             state,
             crash: Arc::new(NoopCrashInjector),
             observer: Arc::new(NoopCommitObserver),
+            candidate_index: Arc::new(UnavailableCandidateSubmissionIndex),
         })
     }
 
@@ -250,6 +348,16 @@ impl GitStore {
     #[must_use]
     pub fn with_commit_observer(mut self, observer: Arc<dyn CommitObserver>) -> Self {
         self.observer = observer;
+        self
+    }
+
+    /// Configures the rebuildable Candidate submission index.
+    #[must_use]
+    pub fn with_candidate_submission_index(
+        mut self,
+        index: Arc<dyn CandidateSubmissionIndex>,
+    ) -> Self {
+        self.candidate_index = index;
         self
     }
 
@@ -278,6 +386,12 @@ impl GitStore {
     /// Rejects invalid payloads, append-only violations, foreign staged paths,
     /// pending object collisions, Git failures, and injected crash seams.
     pub fn append_event(&self, request: AppendRequest) -> Result<AppendOutcome> {
+        if request.event.event_type() == EventType::ContextCandidateCreated {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "context_candidate.created requires the Candidate submission service",
+            ));
+        }
         let (journal, object_refs) = self.prepare(request)?;
         self.crash.check(CrashSeam::AfterJournal)?;
         let lock = self.writer_lock()?;
@@ -288,73 +402,89 @@ impl GitStore {
         Ok(outcome)
     }
 
-    /// Appends one Candidate event at most once for its complete authoritative semantics.
+    /// Submits one Candidate creation operation under `SubmissionId` idempotency.
     ///
-    /// Generated identity fields and annotations are excluded by [`Event::semantic_hash`].
-    /// The lock spans pending recovery, the current-Tree lookup, and append, so process and
-    /// thread retries converge on the same committed Event. Requests with any authoritative
-    /// difference retain distinct hashes and append distinct facts.
+    /// The Candidate lock spans index synchronization/lookup, pending recovery,
+    /// append, and final index synchronization. No Git Event scan participates.
     ///
     /// # Errors
     ///
-    /// Rejects requests containing objects, sensitive data, malformed prior events, or an
-    /// existing matching event whose introducing commit lacks Writer batch metadata.
-    pub fn append_candidate_once(&self, request: AppendRequest) -> Result<CandidateAppendOutcome> {
-        if request.event.event_type() != EventType::ContextCandidateCreated {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "candidate append requires context_candidate.created",
-            ));
-        }
-        if !request.objects.is_empty() {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "candidate append does not accept text objects",
-            ));
-        }
-        let event_bytes = serialize_event(&request.event)?;
-        reject_sensitive(&PrivacyScanner::default(), "event", &event_bytes)?;
+    /// Rejects content conflicts, unavailable index state, privacy violations,
+    /// pending recovery failures, and injected crash seams.
+    pub fn submit_candidate(
+        &self,
+        request: CandidateSubmissionRequest,
+    ) -> Result<CandidateSubmissionOutcome> {
+        request.content.validate()?;
+        let requested_hash = request.content_hash();
         let lock = open_lock(&self.state.join("candidate-writer.lock"))?;
         lock.lock_exclusive()
             .map_err(io_error("lock candidate-writer.lock"))?;
-        self.recover_pending()?;
-        if let Some((event, event_path)) = self.find_semantic_event(&request.event)? {
-            let git = Git::new(&self.repository);
-            let (commit_oid, subject) = git.introducing_commit(&event_path)?;
-            let batch = subject
-                .strip_prefix("Append Shared Context batch ")
-                .ok_or_else(|| {
-                    invariant(format!(
-                        "existing Candidate event {event_path} has no Writer batch metadata"
-                    ))
-                })?;
-            let batch_id = BatchId::from_str(batch).map_err(|error| {
-                invariant(format!(
-                    "existing Candidate event {event_path} has invalid Writer batch metadata: {error}"
-                ))
-            })?;
-            let append = AppendOutcome {
-                batch_id,
-                event_id: event.event_id(),
-                event_path,
-                commit_oid,
-                objects: Vec::new(),
-                recovered: true,
-            };
-            FileExt::unlock(&lock).map_err(io_error("unlock candidate-writer.lock"))?;
-            return Ok(CandidateAppendOutcome {
-                append,
-                event,
-                created: false,
-            });
+        self.candidate_index.synchronize()?;
+        let writer_lock = self.writer_lock()?;
+        self.recover_all_locked(None)?;
+        FileExt::unlock(&writer_lock).map_err(io_error("unlock writer.lock"))?;
+        self.candidate_index.synchronize()?;
+        match self.candidate_index.lookup(request.submission_id)? {
+            CandidateSubmissionLookup::Found(record) => {
+                if record.content_hash != requested_hash {
+                    return Err(Error::new(
+                        ErrorKind::IdempotencyKeyConflict,
+                        "SubmissionId was reused with different authoritative Candidate content",
+                    ));
+                }
+                let append = append_from_submission_record(&record, true);
+                FileExt::unlock(&lock).map_err(io_error("unlock candidate-writer.lock"))?;
+                return Ok(CandidateSubmissionOutcome {
+                    append,
+                    record,
+                    status: CandidateSubmissionStatus::AlreadyExists,
+                });
+            }
+            CandidateSubmissionLookup::Conflict { .. } => {
+                return Err(Error::new(
+                    ErrorKind::IdempotencyKeyConflict,
+                    "SubmissionId has conflicting authoritative Candidate Events",
+                ));
+            }
+            CandidateSubmissionLookup::NotFound => {}
         }
-        let event = request.event.clone();
-        let append = self.append_event(request)?;
+        let batch_id = BatchId::new();
+        let event = Event::context_candidate_created(
+            request.submission_id,
+            request.source_episode,
+            request.content,
+            batch_id.as_str(),
+            None,
+        )?;
+        let (journal, object_refs) = self.prepare_candidate_with_batch(&event, batch_id)?;
+        debug_assert!(object_refs.is_empty());
+        self.crash.check(CrashSeam::AfterJournal)?;
+        let writer_lock = self.writer_lock()?;
+        self.recover_all_locked(Some(&journal.batch_id))?;
+        let append = self.commit_journal_locked(&journal, false)?;
+        FileExt::unlock(&writer_lock).map_err(io_error("unlock writer.lock"))?;
+        self.candidate_index.synchronize()?;
+        let record = match self.candidate_index.lookup(request.submission_id)? {
+            CandidateSubmissionLookup::Found(record) if record.content_hash == requested_hash => {
+                record
+            }
+            CandidateSubmissionLookup::Found(_) | CandidateSubmissionLookup::Conflict { .. } => {
+                return Err(invariant(
+                    "committed Candidate submission projected conflicting content",
+                ));
+            }
+            CandidateSubmissionLookup::NotFound => {
+                return Err(invariant(
+                    "committed Candidate submission is absent from synchronized index",
+                ));
+            }
+        };
         FileExt::unlock(&lock).map_err(io_error("unlock candidate-writer.lock"))?;
-        Ok(CandidateAppendOutcome {
+        Ok(CandidateSubmissionOutcome {
             append,
-            event,
-            created: true,
+            record,
+            status: CandidateSubmissionStatus::Created,
         })
     }
 
@@ -534,18 +664,44 @@ impl GitStore {
     }
 
     fn prepare(&self, request: AppendRequest) -> Result<(Journal, Vec<ObjectRef>)> {
+        self.prepare_with_batch(request, BatchId::new())
+    }
+
+    fn prepare_with_batch(
+        &self,
+        request: AppendRequest,
+        batch_id: BatchId,
+    ) -> Result<(Journal, Vec<ObjectRef>)> {
         let AppendRequest {
             event,
             objects: text_objects,
         } = request;
         let event_bytes = serialize_event(&event)?;
+        self.prepare_serialized_with_batch(&event, text_objects, batch_id, event_bytes)
+    }
+
+    fn prepare_candidate_with_batch(
+        &self,
+        event: &Event,
+        batch_id: BatchId,
+    ) -> Result<(Journal, Vec<ObjectRef>)> {
+        let event_bytes = serialize_generated_event(event)?;
+        self.prepare_serialized_with_batch(event, Vec::new(), batch_id, event_bytes)
+    }
+
+    fn prepare_serialized_with_batch(
+        &self,
+        event: &Event,
+        text_objects: Vec<TextObject>,
+        batch_id: BatchId,
+        event_bytes: Vec<u8>,
+    ) -> Result<(Journal, Vec<ObjectRef>)> {
         let scanner = PrivacyScanner::default();
         reject_sensitive(&scanner, "event", &event_bytes)?;
         let event_id = event.event_id();
         let event_text = event_id.to_string();
         let event_prefix = &event_text[EventId::PREFIX.len()..EventId::PREFIX.len() + 2];
         let event_path = format!("events/{event_prefix}/{event_text}.json");
-        let batch_id = BatchId::new();
         let batch_dir = self.pending_dir(&batch_id);
         let files_dir = batch_dir.join("files");
         fs::create_dir(&batch_dir).map_err(io_error("create pending batch"))?;
@@ -620,23 +776,6 @@ impl GitStore {
             outcomes.push(self.commit_journal_locked(&journal, true)?);
         }
         Ok(outcomes)
-    }
-
-    fn find_semantic_event(&self, requested: &Event) -> Result<Option<(Event, String)>> {
-        let git = Git::new(&self.repository);
-        let requested_type = requested.event_type();
-        let requested_hash = requested.semantic_hash();
-        for path in git.head_paths("events")? {
-            let bytes = git
-                .head_file(&path)?
-                .ok_or_else(|| invariant(format!("HEAD event disappeared: {path}")))?;
-            if let ParsedEvent::Known(event) = parse_event(&bytes)? {
-                if event.event_type() == requested_type && event.semantic_hash() == requested_hash {
-                    return Ok(Some((*event, path)));
-                }
-            }
-        }
-        Ok(None)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1091,16 +1230,21 @@ fn validate_journal(journal: &Journal) -> Result<()> {
 }
 
 fn serialize_event(event: &Event) -> Result<Vec<u8>> {
-    let mut bytes = serde_json::to_vec_pretty(event).map_err(|error| {
-        Error::new(ErrorKind::InvalidInput, format!("serialize event: {error}"))
-    })?;
-    bytes.push(b'\n');
+    let bytes = serialize_generated_event(event)?;
     match parse_event(&bytes)? {
         ParsedEvent::Known(parsed) if parsed.event_id() == event.event_id() => Ok(bytes),
         _ => Err(invariant(
             "serialized event did not validate as the same V1 event",
         )),
     }
+}
+
+fn serialize_generated_event(event: &Event) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(event).map_err(|error| {
+        Error::new(ErrorKind::InvalidInput, format!("serialize event: {error}"))
+    })?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 fn reject_sensitive(scanner: &PrivacyScanner, boundary: &str, bytes: &[u8]) -> Result<()> {
@@ -1154,6 +1298,20 @@ fn outcome(
         objects,
         recovered,
     })
+}
+
+fn append_from_submission_record(
+    record: &CandidateSubmissionRecord,
+    recovered: bool,
+) -> AppendOutcome {
+    AppendOutcome {
+        batch_id: record.batch_id.clone(),
+        event_id: record.event_id,
+        event_path: record.event_path.clone(),
+        commit_oid: record.commit_oid.clone(),
+        objects: Vec::new(),
+        recovered,
+    }
 }
 
 fn event_path(journal: &Journal) -> Result<String> {

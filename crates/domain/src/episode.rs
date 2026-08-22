@@ -1,13 +1,14 @@
 use std::collections::{BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     AgentCheckpointId, Applicability, ArtifactLocator, CandidateBuildId, CandidateId, CaptureId,
     CheckpointClaimId, ContextId, ContextRevisionDraft, Error, ErrorKind, EvidenceId,
     EvidenceSnapshotDraft, IntentSnapshot, RepositoryId, Result, RevisionId, SignalId, SpaceId,
-    SpaceRecommendationId, TaskId, TaskIntentRevisionId, TaskSessionId, TaskSignalKind,
-    WorkEpisodeId, WorkObservationId,
+    SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId,
+    TaskSignalKind, WorkEpisodeId, WorkObservationId,
 };
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -1155,24 +1156,68 @@ impl AutomaticContextCandidate {
 #[serde(deny_unknown_fields)]
 pub struct ContextCandidate {
     pub candidate_id: CandidateId,
-    pub source_episode_id: WorkEpisodeId,
+    pub submission_id: SubmissionId,
+    pub source_episode: WorkEpisodeRef,
     pub content: ContextRevisionDraft,
 }
 
 impl ContextCandidate {
-    /// Creates an unowned legacy Candidate from one validated Episode.
+    /// Creates an unowned Candidate for one stable submission operation.
     ///
     /// # Errors
     ///
     /// Returns an input error when the Episode or Candidate content is invalid.
-    pub fn from_episode(episode: &WorkEpisode, content: ContextRevisionDraft) -> Result<Self> {
+    pub fn from_episode(
+        submission_id: SubmissionId,
+        episode: &WorkEpisode,
+        content: ContextRevisionDraft,
+    ) -> Result<Self> {
         episode.validate()?;
+        if !matches!(episode.status, WorkEpisodeStatus::Closed { .. }) {
+            return Err(invalid("Context Candidate requires a closed Work Episode"));
+        }
         content.validate()?;
         Ok(Self {
             candidate_id: CandidateId::new(),
-            source_episode_id: episode.episode_id,
+            submission_id,
+            source_episode: episode.ownership(),
             content,
         })
+    }
+
+    /// Creates an Event Candidate after the service verified its closed Episode.
+    /// Candidate identity remains server-generated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input error when the complete Context draft is invalid.
+    pub fn from_verified_submission(
+        submission_id: SubmissionId,
+        source_episode: WorkEpisodeRef,
+        content: ContextRevisionDraft,
+    ) -> Result<Self> {
+        content.validate()?;
+        Ok(Self {
+            candidate_id: CandidateId::new(),
+            submission_id,
+            source_episode,
+            content,
+        })
+    }
+
+    /// Authoritative retry hash excluding Submission/Candidate IDs and annotations.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if serializing validated domain content unexpectedly fails.
+    #[must_use]
+    pub fn submission_content_hash(&self) -> String {
+        candidate_submission_content_hash(&self.source_episode, &self.content)
+    }
+
+    #[must_use]
+    pub const fn source_episode_id(&self) -> WorkEpisodeId {
+        self.source_episode.episode_id
     }
 
     /// Validates the Candidate content.
@@ -1192,9 +1237,9 @@ impl ContextCandidate {
     pub fn validate_against_episode(&self, episode: &WorkEpisode) -> Result<()> {
         self.validate()?;
         episode.validate()?;
-        if self.source_episode_id != episode.episode_id {
+        if self.source_episode != episode.ownership() {
             return Err(invalid(
-                "context_candidate.source_episode_id must identify the supplied episode",
+                "context_candidate.source_episode must identify the supplied episode owner",
             ));
         }
         Ok(())
@@ -1204,6 +1249,21 @@ impl ContextCandidate {
     pub const fn is_auto_injection_eligible(&self) -> bool {
         false
     }
+}
+
+/// Hashes exactly the closed Episode ownership and complete authoritative draft.
+///
+/// # Panics
+///
+/// Panics only if serialization of these JSON-backed domain values unexpectedly fails.
+#[must_use]
+pub fn candidate_submission_content_hash(
+    source_episode: &WorkEpisodeRef,
+    content: &ContextRevisionDraft,
+) -> String {
+    let bytes = serde_json::to_vec(&(source_episode, content))
+        .expect("serializing Candidate submission content cannot fail");
+    format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
 #[cfg(test)]
@@ -1831,7 +1891,9 @@ mod tests {
     #[test]
     fn legacy_git_candidate_remains_unowned_and_noninjectable() {
         let fixture = capture_fixture();
-        let candidate = ContextCandidate::from_episode(&fixture.episode, content()).unwrap();
+        let candidate =
+            ContextCandidate::from_episode(SubmissionId::new(), &fixture.episode, content())
+                .unwrap();
         assert!(candidate.validate_against_episode(&fixture.episode).is_ok());
         assert!(!candidate.is_auto_injection_eligible());
         let mut encoded = serde_json::to_value(candidate).unwrap();

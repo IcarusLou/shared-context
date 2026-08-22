@@ -24,13 +24,13 @@ pub use episode::{
     CheckpointClaim, ContextCandidate, ContextRevisionRef, ContextUseDisposition,
     IntentRevisionRange, NonLocatingSignalRef, NormalizedBreadcrumbKind, NormalizedWorkObservation,
     RecommendedSpaceRole, TestOutcomeStatus, WorkEpisode, WorkEpisodeRef, WorkEpisodeStatus,
-    WorkObservation, WorkSourceRef,
+    WorkObservation, WorkSourceRef, candidate_submission_content_hash,
 };
 pub use ids::{
     AgentCheckpointId, CandidateBuildId, CandidateId, CaptureId, CheckpointClaimId, ConflictId,
     ContextId, EventId, EvidenceId, ExternalSessionId, IdParseError, PublicationId, ReferenceId,
     RepositoryId, ResolutionId, ReviewId, RevisionId, SignalId, SpaceId, SpaceRecommendationId,
-    TaskId, TaskIntentRevisionId, TaskSessionId, WorkEpisodeId, WorkObservationId,
+    SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId, WorkEpisodeId, WorkObservationId,
 };
 pub use model::{
     Applicability, ConflictParticipant, ConflictResolution, ConflictResolutionDraft,
@@ -40,7 +40,8 @@ pub use model::{
     SemanticConflict, SemanticConflictDraft,
 };
 pub use reducer::{
-    AutoInjectionBlocker, AutoInjectionEligibility, CandidateProjection, ContextGovernanceStatus,
+    AutoInjectionBlocker, AutoInjectionEligibility, CandidateProjection,
+    CandidateSubmissionConflict, CandidateSubmissionProjection, ContextGovernanceStatus,
     ContextProjection, ContextSpaceProjection, DomainProjection, EngineeringReferenceProjection,
     IntentProjection, ReducerDiagnostic, ReducerDiagnosticCode, ReducerEvent, ReducerPayload,
     ReviewSummary, RevisionLifecycle, RevisionProjection, SemanticConflictCandidate,
@@ -74,6 +75,8 @@ pub enum ErrorKind {
     Unsupported,
     /// An absolute engineering path is outside the explicit local Repository Catalog.
     RepositoryNotConfigured,
+    /// A stable idempotency key was reused with different authoritative content.
+    IdempotencyKeyConflict,
 }
 
 /// The shared, user-presentable error type for workspace crates.

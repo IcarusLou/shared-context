@@ -11,6 +11,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
     str::FromStr,
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -23,13 +24,16 @@ use sctx_agent_adapter::{
 use sctx_domain::{
     Applicability, ConflictParticipant, ConflictResolutionDraft, ConflictResolutionResult,
     ContextGovernanceStatus, ContextId, ContextKind, ContextRevisionDraft, DomainProjection, Error,
-    ErrorKind, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, PublicationAction,
-    PublicationDraft, RepositoryId, ResolutionOutcome, Result, ReviewDraft, ReviewSummary,
-    ReviewVerdict, RevisionId, SemanticConflictDraft, SpaceId, TaskSignal, TaskSignalKind,
-    WorkEpisodeId,
+    ErrorKind, EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot,
+    PublicationAction, PublicationDraft, RepositoryId, ResolutionOutcome, Result, ReviewDraft,
+    ReviewSummary, ReviewVerdict, RevisionId, SemanticConflictDraft, SpaceId, SubmissionId, TaskId,
+    TaskIntentRevisionId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkEpisodeStatus,
 };
 use sctx_event_schema::{Event, EventPayload};
-use sctx_git_store::{AppendOutcome, AppendRequest, BatchId, CandidateAppendOutcome, GitStore};
+use sctx_git_store::{
+    AppendOutcome, AppendRequest, BatchId, CandidateSubmissionOutcome, CandidateSubmissionRequest,
+    GitStore,
+};
 use sctx_index::{
     DomainSnapshot, IndexMetadata, ProjectionDiagnosticView, ProjectionIndex, RebuildOutcome,
 };
@@ -957,8 +961,9 @@ impl Runtime {
     }
 
     fn open_at(root: &Path) -> Result<Self> {
-        let store = GitStore::initialize(root)?;
-        let index = ProjectionIndex::for_store(&store);
+        let base_store = GitStore::initialize(root)?;
+        let index = ProjectionIndex::for_store(&base_store);
+        let store = base_store.with_candidate_submission_index(Arc::new(index.clone()));
         Ok(Self { store, index })
     }
 
@@ -972,13 +977,11 @@ impl Runtime {
         Ok((outcome, metadata))
     }
 
-    fn append_candidate_once(
+    fn submit_candidate(
         &self,
-        event: Event,
-    ) -> Result<(CandidateAppendOutcome, IndexMetadata)> {
-        let outcome = self
-            .store
-            .append_candidate_once(AppendRequest::event(event))?;
+        request: CandidateSubmissionRequest,
+    ) -> Result<(CandidateSubmissionOutcome, IndexMetadata)> {
+        let outcome = self.store.submit_candidate(request)?;
         let metadata = self.index.synchronize()?.metadata;
         Ok((outcome, metadata))
     }
@@ -1114,33 +1117,79 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
         [command, rest @ ..] if command == "create" => {
             if is_help(rest) {
                 print!(
-                    "Usage: sctx candidate create --source-episode-id <ID> [content options]\n\n{CONTEXT_WRITE_HELP}"
+                    "Usage: sctx candidate create --submission-id <ID> --agent-kind <KIND> --external-session-id <ID> --expected-task-id <ID> --expected-intent-revision-id <ID> --source-episode-id <ID> [content options]\n\n{CONTEXT_WRITE_HELP}"
                 );
                 return Ok(());
             }
             let options = Options::parse(rest, &[])?;
-            allow_context_options(&options, &["--source-episode-id"])?;
+            allow_context_options(
+                &options,
+                &[
+                    "--submission-id",
+                    "--agent-kind",
+                    "--external-session-id",
+                    "--expected-task-id",
+                    "--expected-intent-revision-id",
+                    "--source-episode-id",
+                ],
+            )?;
+            let submission_id =
+                parse_id::<SubmissionId>(options.required("--submission-id")?, "submission ID")?;
             let source_episode_id = parse_id::<WorkEpisodeId>(
                 options.required("--source-episode-id")?,
                 "source episode ID",
             )?;
+            let locator = ExternalSessionLocator::new(
+                options.required("--agent-kind")?,
+                options.required("--external-session-id")?,
+            )?;
+            let expected_task_id =
+                parse_id::<TaskId>(options.required("--expected-task-id")?, "expected Task ID")?;
+            let expected_revision_id = parse_id::<TaskIntentRevisionId>(
+                options.required("--expected-intent-revision-id")?,
+                "expected Intent revision ID",
+            )?;
             let draft = context_draft(&options)?;
             let runtime = Runtime::open()?;
-            let event = Event::context_candidate_created(source_episode_id, draft, None)?;
-            let (outcome, metadata) = runtime.append_candidate_once(event)?;
-            let (candidate_id, source_episode_id) = match outcome.event.payload() {
-                EventPayload::ContextCandidateCreated { candidate } => {
-                    (candidate.candidate_id, candidate.source_episode_id)
-                }
-                _ => unreachable!(),
-            };
+            let tasks = TaskRuntime::initialize(installation_root()?)?;
+            let active = tasks
+                .read_snapshot_by_locator(&locator)?
+                .ok_or_else(|| invalid("ExternalSession has no ActiveTask"))?;
+            if active.task_id != expected_task_id
+                || active
+                    .current_intent_revision()
+                    .is_none_or(|revision| revision.revision_id != expected_revision_id)
+            {
+                return Err(invalid("Candidate Task/Intent ownership CAS is stale"));
+            }
+            let source = tasks
+                .verify_source_episode(source_episode_id)?
+                .ok_or_else(|| invalid("source Work Episode does not exist"))?;
+            if source.ownership.task_session_id != active.task_session_id
+                || source.ownership.task_id != active.task_id
+                || !matches!(source.status, WorkEpisodeStatus::Closed { .. })
+            {
+                return Err(invalid(
+                    "source Work Episode must be closed and owned by the exact ActiveTask",
+                ));
+            }
+            let (outcome, metadata) = runtime.submit_candidate(CandidateSubmissionRequest {
+                submission_id,
+                source_episode: source.ownership,
+                content: draft,
+            })?;
+            let candidate_id = outcome.record.candidate_id;
+            let source_episode_id = outcome.record.source_episode.episode_id;
+            let created = outcome.created();
             emit(
                 "candidate.create",
                 &metadata,
                 json!({"candidate_id": candidate_id,
+                       "submission_id": submission_id,
                        "source_episode_id": source_episode_id,
-                       "event_id": outcome.event.event_id(), "status": "candidate",
-                       "created": outcome.created, "batch_id": outcome.append.batch_id,
+                       "event_id": outcome.record.event_id, "status": "candidate",
+                       "submission_status": outcome.status, "created": created,
+                       "batch_id": outcome.append.batch_id,
                        "commit_oid": outcome.append.commit_oid}),
                 json_output,
             )
@@ -2458,6 +2507,7 @@ const fn error_code(kind: ErrorKind) -> &'static str {
         ErrorKind::External => "external_error",
         ErrorKind::Unsupported => "unsupported",
         ErrorKind::RepositoryNotConfigured => "repository_not_configured",
+        ErrorKind::IdempotencyKeyConflict => "idempotency_key_conflict",
         _ => "unknown_error",
     }
 }

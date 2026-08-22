@@ -6,7 +6,7 @@ use sctx_domain::{
     EngineeringReference, EngineeringReferenceDraft, EvidenceSnapshotDraft, EvidenceType,
     PublicationAction, PublicationDraft, ReferenceId, ReferenceRelation, RepoRelativePath,
     RepositoryId, RepositoryIdentity, ResolvedFocus, RevisionId, SemanticConflictDraft, SpaceId,
-    TaskId, TaskIntent, WorkEpisodeId,
+    SubmissionId, TaskId, TaskIntent, TaskSessionId, WorkEpisodeId, WorkEpisodeRef,
 };
 use sctx_engineering_graph::{
     ArtifactObservation, ArtifactSourceState, EngineeringProjectionStore,
@@ -15,7 +15,7 @@ use sctx_engineering_graph::{
     SourceLanguage, build_graph_context_snapshots,
 };
 use sctx_event_schema::{Event, EventPayload};
-use sctx_git_store::{AppendRequest, GitStore};
+use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
 use sctx_index::ProjectionIndex;
 use sctx_search::{
     ContextPackMode, ContextSafetySource, SearchEngine, TaskAssociationChannel,
@@ -388,6 +388,7 @@ fn graph_fixture() -> GraphFixture {
 
     let index = ProjectionIndex::for_store(&store);
     let metadata = index.synchronize().unwrap().metadata;
+    let store = store.with_candidate_submission_index(Arc::new(index.clone()));
     let graph_store = EngineeringProjectionStore::initialize(&root).unwrap();
     let repository = repository();
     let artifact = symbol_artifact(&repository, "SearchSymbol");
@@ -900,20 +901,23 @@ fn historical_graph_revision_survives_append_new_revision_withdraw_and_index_reb
     let built_tree = built.context_tree_oid.clone().unwrap();
     let built_generation = built.projection.artifact_generation.clone();
 
-    append(
-        &fixture.store,
-        Event::context_candidate_created(
-            WorkEpisodeId::new(),
-            draft(
+    fixture
+        .store
+        .submit_candidate(CandidateSubmissionRequest {
+            submission_id: SubmissionId::new(),
+            source_episode: WorkEpisodeRef {
+                episode_id: WorkEpisodeId::new(),
+                task_session_id: TaskSessionId::new(),
+                task_id: TaskId::new(),
+            },
+            content: draft(
                 ContextKind::Discovery,
                 "unrelated Candidate does not mutate an existing Graph",
                 "shared",
                 Vec::new(),
             ),
-            None,
-        )
-        .unwrap(),
-    );
+        })
+        .unwrap();
     append(
         &fixture.store,
         Event::engineering_reference_recorded(

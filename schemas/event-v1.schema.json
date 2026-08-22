@@ -119,6 +119,18 @@
       "type": "string",
       "pattern": "^wep_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
     },
+    "task_session_id": {
+      "type": "string",
+      "pattern": "^tss_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "task_id": {
+      "type": "string",
+      "pattern": "^tsk_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "submission_id": {
+      "type": "string",
+      "pattern": "^sub_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
     "candidate_id": {
       "type": "string",
       "pattern": "^cnd_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
@@ -476,10 +488,20 @@
     },
     "context_candidate": {
       "type": "object",
-      "required": ["candidate_id", "source_episode_id", "content"],
+      "required": ["candidate_id", "submission_id", "source_episode", "content"],
       "properties": {
         "candidate_id": { "$ref": "#/$defs/candidate_id" },
-        "source_episode_id": { "$ref": "#/$defs/work_episode_id" },
+        "submission_id": { "$ref": "#/$defs/submission_id" },
+        "source_episode": {
+          "type": "object",
+          "required": ["episode_id", "task_session_id", "task_id"],
+          "properties": {
+            "episode_id": { "$ref": "#/$defs/work_episode_id" },
+            "task_session_id": { "$ref": "#/$defs/task_session_id" },
+            "task_id": { "$ref": "#/$defs/task_id" }
+          },
+          "additionalProperties": false
+        },
         "content": { "$ref": "#/$defs/context_revision_draft" }
       },
       "additionalProperties": false

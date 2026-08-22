@@ -25,7 +25,8 @@ pub use sctx_domain::{
     ResolutionOutcome, Result, Review, ReviewDraft, ReviewId, ReviewSummary, ReviewVerdict,
     RevisionId, RevisionLifecycle, RevisionProjection, SemanticConflict, SemanticConflictCandidate,
     SemanticConflictDraft, SemanticConflictOpenReason, SemanticConflictProjection,
-    SemanticConflictStatus, SpaceId, WorkEpisodeId, reduce,
+    SemanticConflictStatus, SpaceId, SubmissionId, TaskId, TaskSessionId, WorkEpisodeId,
+    WorkEpisodeRef, reduce,
 };
 
 /// Immutable identifier for the bundled V1 JSON Schema.
@@ -251,6 +252,15 @@ impl<'de> Deserialize<'de> for Event {
             payload: wire.payload,
             annotations: wire.annotations,
         };
+        if event.event_type() == EventType::ContextCandidateCreated
+            && event
+                .writer_batch_id()
+                .is_none_or(|value| !valid_batch_id(value))
+        {
+            return Err(de::Error::custom(
+                "context_candidate.created requires valid writer_batch_id annotation",
+            ));
+        }
         event.validate().map_err(de::Error::custom)?;
         Ok(event)
     }
@@ -277,20 +287,46 @@ impl Event {
     ///
     /// Returns [`ErrorKind::InvalidInput`] when governable Candidate content is incomplete.
     pub fn context_candidate_created(
-        source_episode_id: WorkEpisodeId,
+        submission_id: SubmissionId,
+        source_episode: WorkEpisodeRef,
         content: ContextRevisionDraft,
+        writer_batch_id: &str,
         annotations: Option<Annotations>,
     ) -> Result<Self> {
+        if !valid_batch_id(writer_batch_id) {
+            return Err(invalid("writer batch ID must be a canonical bat_ UUIDv4"));
+        }
+        let mut annotations = annotations.unwrap_or_default();
+        if annotations
+            .additional
+            .insert(
+                "writer_batch_id".to_owned(),
+                Value::String(writer_batch_id.to_owned()),
+            )
+            .is_some()
+        {
+            return Err(invalid("writer batch ID is already present"));
+        }
         Self::generated(
             EventPayload::ContextCandidateCreated {
-                candidate: ContextCandidate {
-                    candidate_id: CandidateId::new(),
-                    source_episode_id,
+                candidate: ContextCandidate::from_verified_submission(
+                    submission_id,
+                    source_episode,
                     content,
-                },
+                )?,
             },
-            annotations,
+            Some(annotations),
         )
+    }
+
+    /// Server-owned Writer batch provenance, if present and well-typed.
+    #[must_use]
+    pub fn writer_batch_id(&self) -> Option<&str> {
+        self.annotations
+            .as_ref()?
+            .additional
+            .get("writer_batch_id")?
+            .as_str()
     }
 
     /// Records one persistent, non-authoritative engineering observation for a Context revision.
@@ -888,6 +924,22 @@ fn optional_probe_string(object: &Map<String, Value>, field: &str) -> Option<Str
         .get(field)
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn valid_batch_id(value: &str) -> bool {
+    let Some(uuid) = value.strip_prefix("bat_") else {
+        return false;
+    };
+    let bytes = uuid.as_bytes();
+    bytes.len() == 36
+        && [8, 13, 18, 23]
+            .into_iter()
+            .all(|index| bytes[index] == b'-')
+        && bytes[14] == b'4'
+        && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            [8, 13, 18, 23].contains(&index) || byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+        })
 }
 
 fn invalid(message: impl Into<String>) -> Error {

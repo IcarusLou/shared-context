@@ -4,6 +4,7 @@
   "event_type": "context_candidate.created",
   "candidate": {
     "candidate_id": "cnd_00000000-0000-4000-8000-000000000812",
+    "submission_id": "sub_00000000-0000-4000-8000-000000000822",
     "content": {
       "kind": "discovery",
       "statement": "This Candidate has no source Episode",
@@ -26,5 +27,8 @@
         }
       ]
     }
+  },
+  "annotations": {
+    "writer_batch_id": "bat_00000000-0000-4000-8000-000000000862"
   }
 }

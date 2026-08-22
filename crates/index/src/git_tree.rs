@@ -100,6 +100,35 @@ pub(crate) fn read_blob(repository: &Path, oid: &str) -> Result<Vec<u8>> {
     .stdout)
 }
 
+/// Resolves the unique commit that added one append-only Event path.
+///
+/// This rebuild-only metadata lookup never reads commit subjects.
+pub(crate) fn introducing_commit_oid(repository: &Path, path: &str) -> Result<String> {
+    let output = output_text(
+        repository,
+        [
+            OsString::from("log"),
+            OsString::from("--format=%H"),
+            OsString::from("--diff-filter=A"),
+            OsString::from("--"),
+            OsString::from(path),
+        ],
+    )?;
+    let commits = output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    match commits.as_slice() {
+        [commit] => Ok((*commit).to_owned()),
+        [] => Err(external(format!(
+            "Candidate event has no introducing commit: {path}"
+        ))),
+        _ => Err(external(format!(
+            "Candidate event has multiple introducing commits: {path}"
+        ))),
+    }
+}
+
 pub(crate) fn diff_trees(
     repository: &Path,
     old_oid: &str,

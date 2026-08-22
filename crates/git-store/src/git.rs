@@ -127,47 +127,6 @@ impl<'a> Git<'a> {
         self.file_at("HEAD", path)
     }
 
-    pub(crate) fn introducing_commit(&self, path: &str) -> Result<(String, String)> {
-        let bytes = self.output_bytes([
-            OsString::from("log"),
-            OsString::from("-1"),
-            OsString::from("--format=%H%x00%s"),
-            OsString::from("--"),
-            OsString::from(path),
-        ])?;
-        let Some(separator) = bytes.iter().position(|byte| *byte == 0) else {
-            return Err(Error::new(
-                ErrorKind::InvariantViolation,
-                format!("Git log metadata is malformed for {path}"),
-            ));
-        };
-        let commit_oid = std::str::from_utf8(&bytes[..separator])
-            .map_err(|error| {
-                Error::new(
-                    ErrorKind::External,
-                    format!("Git returned a non-UTF-8 commit OID: {error}"),
-                )
-            })?
-            .trim()
-            .to_owned();
-        let subject = std::str::from_utf8(&bytes[separator + 1..])
-            .map_err(|error| {
-                Error::new(
-                    ErrorKind::External,
-                    format!("Git returned a non-UTF-8 commit subject: {error}"),
-                )
-            })?
-            .trim()
-            .to_owned();
-        if commit_oid.is_empty() || subject.is_empty() {
-            return Err(Error::new(
-                ErrorKind::InvariantViolation,
-                format!("Git log metadata is missing for {path}"),
-            ));
-        }
-        Ok((commit_oid, subject))
-    }
-
     pub(crate) fn file_at(&self, revision: &str, path: &str) -> Result<Option<Vec<u8>>> {
         let spec = format!("{revision}:{path}");
         let exists = Command::new("git")

@@ -4,16 +4,17 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::Arc,
 };
 
 use sctx_domain::{
     Applicability, ConflictParticipant, ContextId, ContextKind, ContextRevisionDraft,
     EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot, PublicationAction,
-    PublicationDraft, SemanticConflictDraft, SpaceId, TaskId, TaskIntent, TaskIntentDraft,
-    TaskSignal, TaskSignalKind, WorkEpisodeId,
+    PublicationDraft, SemanticConflictDraft, SpaceId, SubmissionId, TaskId, TaskIntent,
+    TaskIntentDraft, TaskSessionId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkEpisodeRef,
 };
 use sctx_event_schema::{Event, EventPayload};
-use sctx_git_store::{AppendRequest, GitStore};
+use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
 use sctx_index::ProjectionIndex;
 use sctx_local_state::UserConfigStore;
 use sctx_mcp::{
@@ -225,24 +226,24 @@ impl MilestoneTwoFixture {
             PublicationAction::Publish,
         );
 
-        let candidate_event = Event::context_candidate_created(
-            WorkEpisodeId::new(),
-            complete_context(
-                "hazardpackintent unassigned Candidate",
-                applicability("unsafe", "fe", "active"),
-            ),
-            None,
-        )
-        .unwrap();
-        let unassigned_candidate_id = match candidate_event.payload() {
-            EventPayload::ContextCandidateCreated { candidate } => {
-                candidate.candidate_id.to_string()
-            }
-            _ => unreachable!(),
-        };
-        append(&store, candidate_event);
-
         let index = ProjectionIndex::for_store(&store);
+        let store = store.with_candidate_submission_index(Arc::new(index.clone()));
+        let candidate = store
+            .submit_candidate(CandidateSubmissionRequest {
+                submission_id: SubmissionId::new(),
+                source_episode: WorkEpisodeRef {
+                    episode_id: WorkEpisodeId::new(),
+                    task_session_id: TaskSessionId::new(),
+                    task_id: TaskId::new(),
+                },
+                content: complete_context(
+                    "hazardpackintent unassigned Candidate",
+                    applicability("unsafe", "fe", "active"),
+                ),
+            })
+            .unwrap();
+        let unassigned_candidate_id = candidate.record.candidate_id.to_string();
+
         index.synchronize().unwrap();
         Self {
             _temporary: temporary,

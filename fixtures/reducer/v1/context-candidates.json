@@ -5,7 +5,12 @@
     "event_type": "context_candidate.created",
     "candidate": {
       "candidate_id": "cnd_00000000-0000-4000-8000-000000000861",
-      "source_episode_id": "wep_00000000-0000-4000-8000-000000000881",
+      "submission_id": "sub_00000000-0000-4000-8000-000000000871",
+      "source_episode": {
+        "episode_id": "wep_00000000-0000-4000-8000-000000000881",
+        "task_session_id": "tss_00000000-0000-4000-8000-000000000891",
+        "task_id": "tsk_00000000-0000-4000-8000-000000000901"
+      },
       "content": {
         "kind": "discovery",
         "statement": "The current task can surface unassigned knowledge",
@@ -28,6 +33,9 @@
           }
         ]
       }
+    },
+    "annotations": {
+      "writer_batch_id": "bat_00000000-0000-4000-8000-000000000911"
     }
   },
   {
@@ -36,7 +44,12 @@
     "event_type": "context_candidate.created",
     "candidate": {
       "candidate_id": "cnd_00000000-0000-4000-8000-000000000862",
-      "source_episode_id": "wep_00000000-0000-4000-8000-000000000882",
+      "submission_id": "sub_00000000-0000-4000-8000-000000000872",
+      "source_episode": {
+        "episode_id": "wep_00000000-0000-4000-8000-000000000882",
+        "task_session_id": "tss_00000000-0000-4000-8000-000000000892",
+        "task_id": "tsk_00000000-0000-4000-8000-000000000902"
+      },
       "content": {
         "kind": "validation",
         "statement": "Candidate order does not change projection output",
@@ -59,6 +72,9 @@
           }
         ]
       }
+    },
+    "annotations": {
+      "writer_batch_id": "bat_00000000-0000-4000-8000-000000000912"
     }
   },
   {
@@ -67,7 +83,12 @@
     "event_type": "context_candidate.created",
     "candidate": {
       "candidate_id": "cnd_00000000-0000-4000-8000-000000000863",
-      "source_episode_id": "wep_00000000-0000-4000-8000-000000000883",
+      "submission_id": "sub_00000000-0000-4000-8000-000000000873",
+      "source_episode": {
+        "episode_id": "wep_00000000-0000-4000-8000-000000000883",
+        "task_session_id": "tss_00000000-0000-4000-8000-000000000893",
+        "task_id": "tsk_00000000-0000-4000-8000-000000000903"
+      },
       "content": {
         "kind": "risk",
         "statement": "Treating Candidate content as accepted would be unsafe",
@@ -90,6 +111,9 @@
           }
         ]
       }
+    },
+    "annotations": {
+      "writer_batch_id": "bat_00000000-0000-4000-8000-000000000913"
     }
   }
 ]

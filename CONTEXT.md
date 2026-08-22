@@ -80,6 +80,14 @@ _Avoid_: unsupported conclusion, free-form note
 The typed ownership and exact Checkpoint and WorkObservation inputs of one automatic Candidate build. It makes the source WorkEpisode verifiable without retaining raw Agent payloads.
 _Avoid_: opaque source_episode_id, transcript pointer
 
+**SubmissionId**:
+The stable identity of one Candidate creation operation, reused only when retrying that operation. Equal Candidate content under different SubmissionIds represents distinct creation operations and must not converge.
+_Avoid_: content hash, CandidateId, semantic deduplication key
+
+**CandidateSubmission**:
+One SubmissionId paired with exact closed WorkEpisode ownership and a complete Context draft. Its authoritative content hash detects conflicting retries of that SubmissionId but never deduplicates different submissions.
+_Avoid_: similarity match, content-addressed Candidate, Candidate analysis
+
 **AutomaticContextCandidate**:
 An unowned, non-injectable Context draft produced from one Closed WorkEpisode. It carries CandidateAnalysis, Space recommendations, confidence, Unknowns, and Builder provenance, but no selected ContextSpace.
 _Avoid_: published Context, accepted Candidate, automatically injected knowledge

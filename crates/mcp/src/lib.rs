@@ -13,6 +13,7 @@ use std::{
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
 };
 
 use sctx_domain::{
@@ -21,9 +22,9 @@ use sctx_domain::{
     ContextRevisionDraft, ContextRevisionRef, EngineeringReferenceDraft, Error, ErrorKind,
     EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, ReferenceId, ReferenceRelation,
     RepoRelativePath, RepositoryId, ResolutionStatus, ResolvedFocus, Result, RevisionId, SignalId,
-    SpaceId, TaskId, TaskIntentDraft, TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot,
-    TaskSignalLifecycle, TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId, WorkEpisodeStatus,
-    WorkObservationId,
+    SpaceId, SubmissionId, TaskId, TaskIntentDraft, TaskIntentRevisionId, TaskSessionId,
+    TaskSessionSnapshot, TaskSignalLifecycle, TaskSignalRecord, TaskSpaceAssociation,
+    WorkEpisodeId, WorkEpisodeStatus, WorkObservationId,
 };
 use sctx_engineering_graph::{
     CandidateMatchEvidence, CatalogRepositorySpec, EngineeringProjectionStore,
@@ -33,7 +34,7 @@ use sctx_engineering_graph::{
     SkippedFileReason, build_graph_context_snapshots,
 };
 use sctx_event_schema::{Event, EventPayload};
-use sctx_git_store::{AppendRequest, GitStore};
+use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
 use sctx_index::{DomainSnapshot, ProjectionIndex};
 use sctx_local_state::{PrivacyScanner, RepositoryCatalogSnapshot, UserConfigStore};
 use sctx_search::{
@@ -695,8 +696,9 @@ struct Runtime {
 
 impl Runtime {
     fn open(root: &Path) -> Result<Self> {
-        let store = GitStore::initialize(root)?;
-        let index = ProjectionIndex::for_store(&store);
+        let base_store = GitStore::initialize(root)?;
+        let index = ProjectionIndex::for_store(&base_store);
+        let store = base_store.with_candidate_submission_index(Arc::new(index.clone()));
         let repositories = RepositoryRegistry::initialize(root)?;
         let catalog = UserConfigStore::open_existing(root)?.repository_catalog_wait()?;
         sync_repository_catalog_snapshot(&repositories, &catalog)?;
@@ -2083,21 +2085,57 @@ impl McpServer {
 
     fn candidate_create(&mut self, arguments: Value) -> ToolResult {
         let input: CandidateCreateInput = decode_arguments(arguments)?;
+        let submission_id = parse_id::<SubmissionId>(&input.submission_id, "submission_id")?;
         let source_episode_id =
             parse_id::<WorkEpisodeId>(&input.source_episode_id, "source_episode_id")?;
-        let event = Event::context_candidate_created(source_episode_id, input.into_draft(), None)?;
+        let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
+        let expected_task_id = parse_id::<TaskId>(&input.expected_task_id, "expected_task_id")?;
+        let expected_revision_id = parse_id::<TaskIntentRevisionId>(
+            &input.expected_intent_revision_id,
+            "expected_intent_revision_id",
+        )?;
+        let active = self
+            .runtime
+            .tasks
+            .read_snapshot_by_locator(&locator)
+            .map_err(ToolFailure::task_context_failed)?
+            .ok_or_else(|| ToolFailure::invalid("ExternalSession has no ActiveTask"))?;
+        if active.task_id != expected_task_id
+            || active
+                .current_intent_revision()
+                .is_none_or(|revision| revision.revision_id != expected_revision_id)
+        {
+            return Err(ToolFailure::invalid(
+                "Candidate Task/Intent ownership CAS is stale",
+            ));
+        }
+        let source = self
+            .runtime
+            .tasks
+            .verify_source_episode(source_episode_id)
+            .map_err(ToolFailure::task_context_failed)?
+            .ok_or_else(|| ToolFailure::invalid("source Work Episode does not exist"))?;
+        if source.ownership.task_session_id != active.task_session_id
+            || source.ownership.task_id != active.task_id
+            || !matches!(source.status, WorkEpisodeStatus::Closed { .. })
+        {
+            return Err(ToolFailure::invalid(
+                "source Work Episode must be closed and owned by the exact ActiveTask",
+            ));
+        }
         let outcome = self
             .runtime
             .store
-            .append_candidate_once(AppendRequest::event(event))
+            .submit_candidate(CandidateSubmissionRequest {
+                submission_id,
+                source_episode: source.ownership,
+                content: input.draft(),
+            })
             .map_err(ToolFailure::writer_rejected)?;
-        let (candidate_id, source_episode_id) = match outcome.event.payload() {
-            EventPayload::ContextCandidateCreated { candidate } => {
-                (candidate.candidate_id, candidate.source_episode_id)
-            }
-            _ => unreachable!(),
-        };
-        let event_id = outcome.event.event_id();
+        let candidate_id = outcome.record.candidate_id;
+        let source_episode_id = outcome.record.source_episode.episode_id;
+        let event_id = outcome.record.event_id;
+        let created = outcome.created();
         let snapshot = self
             .runtime
             .snapshot()
@@ -2106,14 +2144,16 @@ impl McpServer {
             "indexed_tree_oid": snapshot.metadata.indexed_tree_oid,
             "projection_generation": snapshot.metadata.projection_generation,
             "candidate_id": candidate_id,
+            "submission_id": submission_id,
             "source_episode_id": source_episode_id,
             "event_id": event_id,
             "status": "candidate",
-            "created": outcome.created,
+            "submission_status": outcome.status,
+            "created": created,
             "batch_id": outcome.append.batch_id,
             "commit_oid": outcome.append.commit_oid,
             "conflicts": [],
-            "match_reason": if outcome.created { "new_candidate_created" } else { "identical_candidate_reused" },
+            "match_reason": if created { "new_candidate_created" } else { "already_exists" },
         }))
     }
 }
@@ -2147,9 +2187,18 @@ struct ToolFailure {
 
 impl ToolFailure {
     fn writer_rejected(error: Error) -> Self {
+        let code = if error.kind() == ErrorKind::IdempotencyKeyConflict {
+            "idempotency_key_conflict"
+        } else {
+            "writer_rejected"
+        };
+        Self { code, error }
+    }
+
+    fn invalid(message: impl Into<String>) -> Self {
         Self {
-            code: "writer_rejected",
-            error,
+            code: "invalid_input",
+            error: invalid(message),
         }
     }
 
@@ -2275,6 +2324,11 @@ type ToolResultSearch = std::result::Result<SearchRequest, ToolFailure>;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CandidateCreateInput {
+    submission_id: String,
+    agent_kind: String,
+    external_session_id: String,
+    expected_task_id: String,
+    expected_intent_revision_id: String,
     source_episode_id: String,
     kind: ContextKind,
     #[serde(default)]
@@ -2291,22 +2345,22 @@ struct CandidateCreateInput {
 }
 
 impl CandidateCreateInput {
-    fn into_draft(self) -> ContextRevisionDraft {
+    fn draft(&self) -> ContextRevisionDraft {
         ContextRevisionDraft {
             kind: self.kind,
-            topic_key: self.topic_key,
-            statement: self.statement,
-            rationale: self.rationale,
-            applicability: self.applicability,
-            assumptions: self.assumptions,
-            recheck_when: self.recheck_when,
+            topic_key: self.topic_key.clone(),
+            statement: self.statement.clone(),
+            rationale: self.rationale.clone(),
+            applicability: self.applicability.clone(),
+            assumptions: self.assumptions.clone(),
+            recheck_when: self.recheck_when.clone(),
             relations: Vec::new(),
-            evidence: self.evidence.into_iter().map(Into::into).collect(),
+            evidence: self.evidence.iter().cloned().map(Into::into).collect(),
         }
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EvidenceInput {
     kind: EvidenceType,
@@ -2776,8 +2830,13 @@ fn candidate_create_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["source_episode_id", "kind", "statement", "rationale", "evidence"],
+        "required": ["submission_id", "agent_kind", "external_session_id", "expected_task_id", "expected_intent_revision_id", "source_episode_id", "kind", "statement", "rationale", "evidence"],
         "properties": {
+            "submission_id": id_schema("sub_"),
+            "agent_kind": {"type": "string", "minLength": 1},
+            "external_session_id": {"type": "string", "minLength": 1},
+            "expected_task_id": id_schema("tsk_"),
+            "expected_intent_revision_id": id_schema("tir_"),
             "source_episode_id": id_schema("wep_"),
             "kind": kind_schema(),
             "topic_key": {"type": "string", "minLength": 1},
@@ -3148,6 +3207,7 @@ const fn error_code(kind: ErrorKind) -> &'static str {
         ErrorKind::PrivacyRejected => "privacy_rejected",
         ErrorKind::Unsupported => "unsupported",
         ErrorKind::RepositoryNotConfigured => "repository_not_configured",
+        ErrorKind::IdempotencyKeyConflict => "idempotency_key_conflict",
         _ => "unknown_error",
     }
 }

@@ -1,8 +1,12 @@
 use std::{fs, process::Command};
 
 use sctx_domain::{
-    ContextId, ExternalSessionLocator, SpaceId, TaskId, TaskIntent, TaskSpaceAssociation,
-    WorkEpisodeId,
+    CaptureUnknown, ContextId, ExternalSessionLocator, SpaceId, SubmissionId, TaskId, TaskIntent,
+    TaskIntentDraft, TaskSpaceAssociation,
+};
+use sctx_mcp::{
+    ExpectedRevisionId, IntentMaturity, TaskBoundary, TaskCheckpointBoundary, TaskCheckpointInput,
+    TaskIntentUpdateInput, task_checkpoint_at_root, task_intent_update_at_root,
 };
 use sctx_task_runtime::TaskRuntime;
 use serde_json::{Value, json};
@@ -66,11 +70,59 @@ fn task_intent_has_no_route_and_accepts_zero_or_many_space_associations() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn candidate_create_is_the_unassigned_main_path_and_never_auto_injects() {
     let temporary = tempdir().unwrap();
     let home = temporary.path().join("M1 home");
     fs::create_dir_all(&home).unwrap();
-    let episode_id = WorkEpisodeId::new().to_string();
+    let root = home.join(".shared-context");
+    let task = task_intent_update_at_root(
+        &root,
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: "m1-candidate-create".to_owned(),
+            task_boundary: TaskBoundary::New,
+            expected_revision_id: ExpectedRevisionId::Null(()),
+            maturity: IntentMaturity::Provisional,
+            intent: TaskIntentDraft {
+                goal: "Close milestone one".to_owned(),
+                desired_change: "Create a source-verifiable unassigned Candidate".to_owned(),
+                in_scope: vec!["M1 integration".to_owned()],
+                out_of_scope: Vec::new(),
+                domains: vec!["shared-context".to_owned()],
+                platforms: Vec::new(),
+                constraints: Vec::new(),
+                acceptance_conditions: vec!["Candidate stays non-injectable".to_owned()],
+                artifacts: Vec::new(),
+                interfaces: Vec::new(),
+                unknowns: Vec::new(),
+            },
+            evidence_refs: Vec::new(),
+        },
+    )
+    .unwrap();
+    let episode = task_checkpoint_at_root(
+        &root,
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: "m1-candidate-create".to_owned(),
+            expected_task_id: task.context.task_id.to_string(),
+            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+            expected_episode_version: 0,
+            boundary: TaskCheckpointBoundary::Close,
+            claims: Vec::new(),
+            unknowns: vec![CaptureUnknown {
+                statement: "Candidate governance remains pending".to_owned(),
+                blocking: false,
+                recheck_when: Vec::new(),
+            }],
+        },
+    )
+    .unwrap();
+    let submission_id = SubmissionId::new().to_string();
+    let task_id = task.context.task_id.to_string();
+    let intent_revision_id = task.context.intent_revision_id.to_string();
+    let episode_id = episode.episode_id.to_string();
     let binary = env!("CARGO_BIN_EXE_sctx");
 
     let created = Command::new(binary)
@@ -78,6 +130,16 @@ fn candidate_create_is_the_unassigned_main_path_and_never_auto_injects() {
         .args([
             "candidate",
             "create",
+            "--submission-id",
+            &submission_id,
+            "--agent-kind",
+            "codex",
+            "--external-session-id",
+            "m1-candidate-create",
+            "--expected-task-id",
+            &task_id,
+            "--expected-intent-revision-id",
+            &intent_revision_id,
             "--source-episode-id",
             &episode_id,
             "--kind",

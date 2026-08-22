@@ -13,9 +13,10 @@ use sctx_event_schema::{
     ContextRelation, ContextRelationKind, ContextRevisionDraft, EngineeringReferenceDraft, Event,
     EventPayload, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, PublicationAction,
     PublicationDraft, PublicationId, ReferenceRelation, RepoRelativePath, RepositoryId,
-    ReviewDraft, ReviewVerdict, RevisionId, SemanticConflictDraft, SpaceId, WorkEpisodeId,
+    ReviewDraft, ReviewVerdict, RevisionId, SemanticConflictDraft, SpaceId, SubmissionId, TaskId,
+    TaskSessionId, WorkEpisodeId, WorkEpisodeRef,
 };
-use sctx_git_store::{AppendRequest, GitStore};
+use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
 use sctx_index::{
     DB_SCHEMA_VERSION, IncrementalFallback, IndexUpdateKind, ProjectionIndex, REDUCER_VERSION,
     RebuildReason, normalize_search_text,
@@ -68,9 +69,16 @@ fn context(statement: &str) -> ContextRevisionDraft {
     }
 }
 
-fn candidate(statement: &str) -> Event {
-    Event::context_candidate_created(WorkEpisodeId::new(), context(statement), None)
-        .expect("valid Candidate event")
+fn candidate(statement: &str) -> CandidateSubmissionRequest {
+    CandidateSubmissionRequest {
+        submission_id: SubmissionId::new(),
+        source_episode: WorkEpisodeRef {
+            episode_id: WorkEpisodeId::new(),
+            task_session_id: TaskSessionId::new(),
+            task_id: TaskId::new(),
+        },
+        content: context(statement),
+    }
 }
 
 fn engineering_reference(context_id: ContextId, revision_id: RevisionId, path: &str) -> Event {
@@ -127,11 +135,20 @@ fn append(store: &GitStore, event: Event) -> PathBuf {
     store.repository().join(outcome.event_path)
 }
 
+fn submit_candidate(store: &GitStore, request: CandidateSubmissionRequest) -> PathBuf {
+    let outcome = store
+        .submit_candidate(request)
+        .expect("submit Candidate fixture");
+    store.repository().join(outcome.append.event_path)
+}
+
 fn fixture() -> Fixture {
     let temporary = tempfile::tempdir().unwrap();
-    let store = GitStore::initialize(temporary.path().join("installation")).unwrap();
+    let base_store = GitStore::initialize(temporary.path().join("installation")).unwrap();
+    let index = ProjectionIndex::for_store(&base_store);
+    let store = base_store.with_candidate_submission_index(Arc::new(index.clone()));
 
-    append(
+    submit_candidate(
         &store,
         candidate("Unassigned Candidates project outside every Space"),
     );
@@ -224,7 +241,6 @@ fn fixture() -> Fixture {
     append(&store, conflict);
 
     commit_diagnostic_fixtures(store.repository());
-    let index = ProjectionIndex::for_store(&store);
     Fixture {
         temporary,
         store,
@@ -282,8 +298,8 @@ fn git<const N: usize>(repository: &Path, args: [&str; N]) -> String {
 fn deletion_rebuilds_complete_projection_and_dirty_tree_is_never_read() {
     let fixture = fixture();
     let first = fixture.index.synchronize().unwrap();
-    assert_eq!(first.reason, RebuildReason::MissingDatabase);
-    assert_eq!(first.metadata.projection_generation, 1);
+    assert_eq!(first.reason, RebuildReason::TreeChanged);
+    assert_eq!(first.update_kind, IndexUpdateKind::Incremental);
     assert!(fixture.index.quick_check().unwrap().healthy);
     let expected = projection_dump(fixture.index.database_path());
 
@@ -300,7 +316,10 @@ fn deletion_rebuilds_complete_projection_and_dirty_tree_is_never_read() {
 
     let forced = fixture.index.rebuild().unwrap();
     assert_eq!(forced.reason, RebuildReason::Forced);
-    assert_eq!(forced.metadata.projection_generation, 2);
+    assert_eq!(
+        forced.metadata.projection_generation,
+        first.metadata.projection_generation + 1
+    );
     assert_eq!(projection_dump(fixture.index.database_path()), expected);
     let connection = Connection::open(fixture.index.database_path()).unwrap();
     let dirty_count: i64 = connection
@@ -805,14 +824,14 @@ fn intent_append_refreshes_every_space_fts_field_and_matches_scratch_rebuild() {
 fn unassigned_candidate_incrementally_projects_and_matches_scratch_rebuild() {
     let fixture = fixture();
     fixture.index.synchronize().unwrap();
-    append(
+    submit_candidate(
         &fixture.store,
         candidate("A second Candidate still has no Space route"),
     );
 
     let incremental = fixture.index.synchronize().unwrap();
-    assert_eq!(incremental.reason, RebuildReason::TreeChanged);
-    assert_eq!(incremental.update_kind, IndexUpdateKind::Incremental);
+    assert_eq!(incremental.reason, RebuildReason::Current);
+    assert_eq!(incremental.update_kind, IndexUpdateKind::Current);
     let connection = Connection::open(fixture.index.database_path()).unwrap();
     assert_eq!(count(&connection, "context_candidate"), 2);
     assert_eq!(count(&connection, "space_projection"), 1);

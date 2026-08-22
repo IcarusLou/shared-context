@@ -195,6 +195,11 @@ opaque_id!(
     "cnd_",
     "Opaque identity of an unassigned `ContextCandidate`."
 );
+opaque_id!(
+    SubmissionId,
+    "sub_",
+    "Opaque identity of one Candidate creation operation."
+);
 opaque_id!(ContextId, "ctx_", "Opaque identity of a `ContextItem`.");
 opaque_id!(
     RevisionId,
@@ -234,7 +239,8 @@ mod tests {
         AgentCheckpointId, CandidateBuildId, CandidateId, CaptureId, CheckpointClaimId, ConflictId,
         ContextId, EventId, EvidenceId, ExternalSessionId, PublicationId, ReferenceId,
         RepositoryId, ResolutionId, ReviewId, RevisionId, SignalId, SpaceId, SpaceRecommendationId,
-        TaskId, TaskIntentRevisionId, TaskSessionId, WorkEpisodeId, WorkObservationId,
+        SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId, WorkEpisodeId,
+        WorkObservationId,
     };
 
     #[test]
@@ -286,6 +292,7 @@ mod tests {
         assert_generated_id!(CandidateBuildId::new(), "bld_");
         assert_generated_id!(SpaceRecommendationId::new(), "rec_");
         assert_generated_id!(CandidateId::new(), "cnd_");
+        assert_generated_id!(SubmissionId::new(), "sub_");
         assert_generated_id!(ContextId::new(), "ctx_");
         assert_generated_id!(RevisionId::new(), "rev_");
         assert_generated_id!(EventId::new(), "evt_");

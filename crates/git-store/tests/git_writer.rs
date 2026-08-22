@@ -12,8 +12,9 @@ use std::{
 
 use sctx_event_schema::{
     Applicability, ArtifactKind, ArtifactLocator, ContextId, ContextKind, ContextRevisionDraft,
-    EngineeringReferenceDraft, Event, EventPayload, EvidenceSnapshotDraft, EvidenceType,
-    IntentSnapshot, ReferenceRelation, RepoRelativePath, RepositoryId, RevisionId, WorkEpisodeId,
+    EngineeringReferenceDraft, Event, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot,
+    ReferenceRelation, RepoRelativePath, RepositoryId, RevisionId, SubmissionId, TaskId,
+    TaskSessionId, WorkEpisodeId, WorkEpisodeRef,
 };
 use sctx_git_store::{
     AppendRequest, CrashInjector, CrashSeam, Error, ErrorKind, GitStore, OBJECT_PENDING,
@@ -94,9 +95,14 @@ fn event(label: &str) -> Event {
     .unwrap()
 }
 
-fn candidate_event(source_episode_id: WorkEpisodeId, statement: &str) -> Event {
+fn candidate_event(submission_id: SubmissionId, statement: &str) -> Event {
     Event::context_candidate_created(
-        source_episode_id,
+        submission_id,
+        WorkEpisodeRef {
+            episode_id: WorkEpisodeId::new(),
+            task_session_id: TaskSessionId::new(),
+            task_id: TaskId::new(),
+        },
         ContextRevisionDraft {
             kind: ContextKind::Discovery,
             topic_key: None,
@@ -114,6 +120,7 @@ fn candidate_event(source_episode_id: WorkEpisodeId, statement: &str) -> Event {
                 limitations: Vec::new(),
             }],
         },
+        "bat_00000000-0000-4000-8000-000000000901",
         None,
     )
     .unwrap()
@@ -259,56 +266,18 @@ fn one_hundred_concurrent_appends_create_distinct_files_without_overwrite() {
 }
 
 #[test]
-fn identical_candidate_retries_converge_but_authoritative_differences_append() {
+fn generic_append_event_rejects_candidate_submission_bypass() {
     let fixture = Fixture::new();
-    let store = Arc::new(fixture.store.clone());
-    let episode_id = WorkEpisodeId::new();
-    let outcomes = Arc::new(Mutex::new(Vec::new()));
-    let mut threads = Vec::new();
-
-    for _ in 0..20 {
-        let store = Arc::clone(&store);
-        let outcomes = Arc::clone(&outcomes);
-        threads.push(thread::spawn(move || {
-            let outcome = store
-                .append_candidate_once(AppendRequest::event(candidate_event(
-                    episode_id,
-                    "one authoritative discovery",
-                )))
-                .unwrap();
-            outcomes.lock().unwrap().push(outcome);
-        }));
-    }
-    for handle in threads {
-        handle.join().unwrap();
-    }
-
-    let outcomes = outcomes.lock().unwrap();
-    let event_ids = outcomes
-        .iter()
-        .map(|outcome| outcome.event.event_id())
-        .collect::<HashSet<_>>();
-    let candidate_ids = outcomes
-        .iter()
-        .map(|outcome| match outcome.event.payload() {
-            EventPayload::ContextCandidateCreated { candidate } => candidate.candidate_id,
-            _ => unreachable!(),
-        })
-        .collect::<HashSet<_>>();
-    assert_eq!(event_ids.len(), 1);
-    assert_eq!(candidate_ids.len(), 1);
-    assert_eq!(outcomes.iter().filter(|outcome| outcome.created).count(), 1);
-    drop(outcomes);
-
-    let different = fixture
+    let before = fixture.git(&["rev-list", "--count", "HEAD"]);
+    let error = fixture
         .store
-        .append_candidate_once(AppendRequest::event(candidate_event(
-            episode_id,
-            "a different authoritative discovery",
+        .append_event(AppendRequest::event(candidate_event(
+            SubmissionId::new(),
+            "one authoritative discovery",
         )))
-        .unwrap();
-    assert!(different.created);
-    assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), "3");
+        .unwrap_err();
+    assert!(error.message().contains("Candidate submission service"));
+    assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), before);
 }
 
 #[test]

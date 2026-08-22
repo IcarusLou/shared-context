@@ -9,11 +9,18 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use fs2::FileExt;
-use rusqlite::{Connection, OpenFlags, TransactionBehavior};
-use sctx_domain::DomainProjection;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use sctx_domain::{
+    CandidateId, DomainProjection, EventId, SubmissionId, TaskId, TaskSessionId, WorkEpisodeId,
+    WorkEpisodeRef,
+};
+use sctx_git_store::{
+    BatchId, CandidateSubmissionIndex, CandidateSubmissionLookup, CandidateSubmissionRecord,
+};
 
 mod git_tree;
 mod project;
@@ -24,7 +31,7 @@ pub use sctx_domain::{Error, ErrorKind, Result};
 pub use tokenizer::{normalize_search_text, search_tokens};
 
 /// Current physical `SQLite` schema version.
-pub const DB_SCHEMA_VERSION: &str = "8";
+pub const DB_SCHEMA_VERSION: &str = "9";
 /// Event parser implementation version recorded in every projection.
 pub const EVENT_PARSER_VERSION: &str = "1";
 /// Pure reducer implementation version recorded in every projection.
@@ -324,7 +331,7 @@ impl ProjectionIndex {
     pub fn domain_snapshot(&self) -> Result<DomainSnapshot> {
         let outcome = self.synchronize()?;
         let tree = git_tree::read_tree(&self.repository, &outcome.metadata.indexed_tree_oid)?;
-        let input = project::build(&tree.blobs);
+        let input = self.build_input(&tree.blobs)?;
         Ok(DomainSnapshot {
             metadata: outcome.metadata,
             projection: input.projection,
@@ -416,7 +423,8 @@ impl ProjectionIndex {
                 )?
             } else {
                 UpdatePlan::Full {
-                    input: project::build(&git_tree::read_tree(&self.repository, &head_oid)?.blobs),
+                    input: self
+                        .build_input(&git_tree::read_tree(&self.repository, &head_oid)?.blobs)?,
                     fallback: None,
                     warnings: Vec::new(),
                 }
@@ -518,7 +526,8 @@ impl ProjectionIndex {
     ) -> Result<UpdatePlan> {
         let full = |fallback, warnings| -> Result<UpdatePlan> {
             Ok(UpdatePlan::Full {
-                input: project::build(&git_tree::read_tree(&self.repository, new_tree_oid)?.blobs),
+                input: self
+                    .build_input(&git_tree::read_tree(&self.repository, new_tree_oid)?.blobs)?,
                 fallback: Some(fallback),
                 warnings,
             })
@@ -575,8 +584,8 @@ impl ProjectionIndex {
             return full(IncrementalFallback::CachedSourceMismatch, Vec::new());
         }
 
-        let old_input = project::build(&old_blobs);
-        let new_input = project::build(&new_blobs);
+        let old_input = self.build_input(&old_blobs)?;
+        let new_input = self.build_input(&new_blobs)?;
         let changed_paths: BTreeSet<_> = changes
             .iter()
             .map(|change| change.path().to_owned())
@@ -590,6 +599,17 @@ impl ProjectionIndex {
             input: new_input,
             affected_spaces,
         })
+    }
+
+    fn build_input(&self, blobs: &[git_tree::TreeBlob]) -> Result<project::BuildInput> {
+        let mut input = project::build(blobs);
+        for metadata in input.candidate_events.values_mut() {
+            metadata.commit_oid = Some(git_tree::introducing_commit_oid(
+                &self.repository,
+                &metadata.event_path,
+            )?);
+        }
+        Ok(input)
     }
 
     fn open_healthy_or_replace(&self) -> Result<(Connection, Option<PathBuf>)> {
@@ -701,6 +721,102 @@ impl sctx_git_store::CommitObserver for ProjectionIndex {
             )));
         }
         self.synchronize().map(|_| ())
+    }
+}
+
+impl CandidateSubmissionIndex for ProjectionIndex {
+    fn synchronize(&self) -> Result<()> {
+        ProjectionIndex::synchronize(self).map(|_| ())
+    }
+
+    fn lookup(&self, submission_id: SubmissionId) -> Result<CandidateSubmissionLookup> {
+        let connection = self.open_read_only()?;
+        if let Some((event_ids_json, candidate_ids_json, content_hashes_json)) = connection
+            .query_row(
+                "SELECT event_ids_json, candidate_ids_json, content_hashes_json
+                 FROM candidate_submission_conflict WHERE submission_id = ?1",
+                [submission_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(sql_error("read Candidate submission conflict"))?
+        {
+            return Ok(CandidateSubmissionLookup::Conflict {
+                submission_id,
+                event_ids: serde_json::from_str(&event_ids_json)
+                    .map_err(json_error("parse Candidate conflict Event IDs"))?,
+                candidate_ids: serde_json::from_str(&candidate_ids_json)
+                    .map_err(json_error("parse Candidate conflict Candidate IDs"))?,
+                content_hashes: serde_json::from_str(&content_hashes_json)
+                    .map_err(json_error("parse Candidate conflict content hashes"))?,
+            });
+        }
+        let row = connection
+            .query_row(
+                "SELECT candidate_id, event_id, source_episode_id,
+                        source_task_session_id, source_task_id, content_hash,
+                        batch_id, commit_oid, event_path
+                 FROM candidate_submission WHERE submission_id = ?1",
+                [submission_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(sql_error("read Candidate submission"))?;
+        let Some((
+            candidate_id,
+            event_id,
+            episode_id,
+            task_session_id,
+            task_id,
+            content_hash,
+            batch_id,
+            commit_oid,
+            event_path,
+        )) = row
+        else {
+            return Ok(CandidateSubmissionLookup::NotFound);
+        };
+        Ok(CandidateSubmissionLookup::Found(
+            CandidateSubmissionRecord {
+                submission_id,
+                candidate_id: CandidateId::from_str(&candidate_id)
+                    .map_err(|error| invariant(format!("invalid indexed CandidateId: {error}")))?,
+                event_id: EventId::from_str(&event_id)
+                    .map_err(|error| invariant(format!("invalid indexed EventId: {error}")))?,
+                source_episode: WorkEpisodeRef {
+                    episode_id: WorkEpisodeId::from_str(&episode_id).map_err(|error| {
+                        invariant(format!("invalid indexed WorkEpisodeId: {error}"))
+                    })?,
+                    task_session_id: TaskSessionId::from_str(&task_session_id).map_err(
+                        |error| invariant(format!("invalid indexed TaskSessionId: {error}")),
+                    )?,
+                    task_id: TaskId::from_str(&task_id)
+                        .map_err(|error| invariant(format!("invalid indexed TaskId: {error}")))?,
+                },
+                content_hash,
+                batch_id: BatchId::from_str(&batch_id)?,
+                commit_oid,
+                event_path,
+            },
+        ))
     }
 }
 
@@ -954,6 +1070,10 @@ fn open_lock(path: &Path) -> Result<File> {
 
 pub(crate) fn sql_error(context: &'static str) -> impl FnOnce(rusqlite::Error) -> Error {
     move |error| Error::new(ErrorKind::Io, format!("{context}: {error}"))
+}
+
+fn json_error(context: &'static str) -> impl FnOnce(serde_json::Error) -> Error {
+    move |error| Error::new(ErrorKind::InvariantViolation, format!("{context}: {error}"))
 }
 
 fn invariant(message: impl Into<String>) -> Error {

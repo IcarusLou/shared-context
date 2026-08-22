@@ -19,7 +19,7 @@
 | **M1：Task-first 领域与入口基础** | **已实现** | `TaskIntent` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；CLI/MCP 通过 `candidate_create` 创建无 Space Candidate；Candidate 不可自动注入 |
 | **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、严格 `task_intent_update` 与只读 `task_context` 已通过跨 crate/E2E 验收 |
 | **M3：Engineering Graph** | **已实现** | 稳定本机 Repository Catalog、可重建 Registry、Reference-derived 有界扫描、build-time immutable Context/safety snapshot、历史 Graph Retrieval、ContextRelation 1–2 跳及 MCP/CLI 工作流已通过固定跨 crate/E2E oracle |
-| **M4：Low-tax Capture** | **基础部分已实现** | #156/#157 已持久化可验证 WorkEpisode、normalized Observation、typed Capture 与显式 AgentCheckpoint；尚无自动聚合、Candidate Builder、去重/冲突、Space 推荐或 Candidate Confirm/List/Discard |
+| **M4：Low-tax Capture** | **基础部分已实现** | #117 已实现 submission-idempotent Candidate admission；#156/#157 已持久化可验证 WorkEpisode、normalized Observation、typed Capture 与显式 AgentCheckpoint；尚无自动聚合、Candidate Builder、知识语义去重/冲突、Space 推荐或 Candidate Confirm/List/Discard |
 
 当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订权威 TaskIntent，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示。PostToolUse 的 File observation 只形成带 Session/optional Task owner 的 redacted Capture Breadcrumb，可识别测试工具只形成非定位 TestOutcome；Hook 不运行 Git、Scanner、Registry sync、Graph rebuild、Focus 提交或 Episode open/ingest。显式 Graph 工具完成 bounded scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。当前 `candidate_create` 仍是手工、无归属的 M1 入口，不等同于 M4 自动 Capture。
 
@@ -1357,11 +1357,11 @@ EngineeringResolutionSource {
 - WorkEpisode/Capture 显式持久 API和 AgentCheckpoint MCP/CLI/Skill 已实现；WorkEpisode 自动聚合（#163）尚未实现。
 - Candidate Builder、Evidence 组装、去重、冲突和 Space 推荐尚未实现。
 - Candidate List/Confirm/Discard 以及 PreCompact/TurnStop 自动写入/Builder 触发尚未实现；当前 Hook 仅给出显式 Checkpoint 能力提示。
-- 当前手工 `candidate_create` 只验证无归属 Candidate 的入口与安全边界。
-- Mandatory Gate #114/#117 必须在 Candidate Builder 落地时一起完成：Builder 为一次创建操作生成稳定 `submission_id`，首次提交由服务端生成 `candidate_id` 并持久化 `submission_id → candidate_id`；重试复用同一 `submission_id`。
-- 相同 `submission_id` 加相同内容返回 `already_exists`；相同 `submission_id` 加不同内容返回 `IdempotencyKeyConflict`；不同 `submission_id` 创建新的 Candidate，即使文本相似。语义相近去重属于知识聚合，不由幂等键处理。
-- `submission_id` 必须进入 Git Event，并在 SQLite 建唯一索引，使删除数据库后可从 Git 重建；写路径不得全量扫描 Event、依赖 commit subject，或因无关坏 Event 阻断重复检查。#114 的隔离修复依赖这条 #117 设计。
-- #156 已建立可查询的 WorkEpisode，使 `source_episode_id` 的 existence/owner/status 可验证；Candidate admission 接线仍属于 #158，不在本阶段创建 Candidate。
+- 当前显式 `candidate_create` 验证无归属 Candidate 的入口、安全边界、Task/Intent CAS 与 closed WorkEpisode 精确所有权；自动 Candidate Builder 仍未实现。
+- Mandatory Gate #117 已完成：一次创建操作携带稳定 `submission_id`，首次提交由服务端生成 `candidate_id`/`event_id`/路径并持久化 submission mapping；重试复用同一 `submission_id`。
+- 相同 `submission_id` 加相同权威内容返回原 Candidate；相同 `submission_id` 加不同内容返回 `IdempotencyKeyConflict`；不同 `submission_id` 创建新的 Candidate，即使完整草稿相同。语义相近去重属于知识聚合，不由幂等键处理。
+- `submission_id`、closed Episode ownership 和 writer batch annotation 进入 Git Event；SQLite 建 submission/conflict 投影并从 Git Tree 与引入 commit 重建。Candidate 主写路径使用索引 lookup，不扫描 Event 或读取 commit subject。#114 的无关 malformed Event 隔离仍未实现。
+- #156 的 WorkEpisode query 已接入 Candidate admission；不存在、Open、跨 Task 或 stale Intent 的来源在任何 Git 写入前拒绝。
 
 ## 19. 验收标准
 

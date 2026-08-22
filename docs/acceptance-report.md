@@ -17,11 +17,11 @@ This report does **not** claim M4:
 | M1 — Task-first primitives and unassigned Candidate entry | IMPLEMENTED | Covered below |
 | M2 — Task Runtime and multi-Space retrieval | IMPLEMENTED | TaskSession persistence, strict `task_intent_update`, read-only `task_context`, association inference, typed RetrievalPaths, and TaskContextPack pass focused cross-crate/E2E oracles |
 | M3 — Engineering Graph | IMPLEMENTED | Reference-derived bounded ScanPlan, deterministic Artifact locators, sparse build-time Context/safety snapshots, historical exact retrieval, frozen 1–2 hop relations, diagnostics, fallback, rebuild equivalence, and budget bounds pass cross-crate/E2E oracles |
-| M4 — Low-tax Capture | FOUNDATION ONLY | #156/#157 persist verifiable WorkEpisode/Capture state and explicit AgentCheckpoint; no automatic aggregation, Candidate Builder, Space recommendation, deduplication, or confirmation workflow |
+| M4 — Low-tax Capture | FOUNDATION ONLY | #117 provides submission-idempotent Candidate admission; #156/#157 persist verifiable WorkEpisode/Capture state and explicit AgentCheckpoint; no automatic aggregation, Candidate Builder, Space recommendation, semantic deduplication, or confirmation workflow |
 
 `task_intent_update` is the only Task Intent write path. `task_context` accepts only an external Session locator and output bounds, and reads the already-authoritative ActiveTask without mutating Runtime. PromptSubmit supplies guidance rather than inferred Intent. Explicit `context_search.space_ids` remains available as a hard filter for diagnosis and exploration.
 
-M4 retains Mandatory Gate #114/#117: stable `submission_id` idempotency must be represented in Git and rebuilt into a SQLite unique index so Candidate retries neither scan all Events, depend on Git commit subjects, nor fail because of an unrelated malformed Event. #156 makes source Episode existence/owner/status verifiable in local Runtime, but does not create or admit a Candidate.
+Mandatory Gate #117 is implemented: stable `submission_id` and exact closed Episode ownership are represented in Git, rebuilt into SQLite submission/conflict indexes, and admitted only after Task/Intent/source Episode verification. Same-ID retries reuse the original Candidate while conflicting content is rejected; different IDs remain distinct. The write path uses indexed lookup rather than Event scans or commit subjects. #114 malformed-Event isolation remains deferred.
 
 ## Acceptance matrix
 
@@ -35,6 +35,8 @@ M4 retains Mandatory Gate #114/#117: stable `submission_id` idempotency must be 
 | Workspace cannot select or persist a Space | PROVEN | `config.toml` contains the fixed Store and local Repository Catalog only; Repository entries contain IDs/paths but no Space, Requirement, Task, or ranking route |
 | Candidate creation requires no Space | PROVEN | CLI and MCP `candidate_create` contracts reject Space fields and return an unassigned Candidate ID |
 | `candidate_create` is the Agent-facing Candidate main path | PROVEN | CLI help, MCP tool list, CLI milestone test, and MCP client fixtures |
+| Candidate submission retry is exact and rebuildable | PROVEN | 20-thread and 20-process concurrency converge to one Candidate; all writer crash seams recover stable batch/commit metadata; deleting SQLite rebuilds the same submission mapping; same-ID/different-content is typed conflict while different IDs never deduplicate |
+| Candidate admission verifies source ownership before Git | PROVEN | MCP adversarial coverage rejects missing, open, cross-Task and stale-Intent Episode sources with zero Event writes |
 | Unconfirmed Candidate cannot enter automatic injection | PROVEN | Candidate projection is outside Context FTS; CLI/MCP candidate retrieval tests and Codex hook test return only Accepted eligible Context |
 | Existing confirmed Context fixtures use neutral revision terminology | PROVEN | Event constructor is `context_revision_added`; no Context-Propose API or constructor remains |
 | SessionStart emits capability guidance without knowledge retrieval | PROVEN | Shared lifecycle policy returns no Task Runtime operation; the CLI adversarial contract seeds two Spaces with Accepted eligible Context and proves startup emits neither item before a supported PromptSubmit retrieves only its task match |
@@ -95,7 +97,7 @@ M4 retains Mandatory Gate #114/#117: stable `submission_id` idempotency must be 
 
 #154 replaces the unlaunched #151/#152 persistence model: `task_artifact_focus` is a read-only ArtifactFocusQuery, Catalog supplies a request-local `ResolvedFocus`, and Search consumes only that value for the current Pack. Runtime owns no Focus state, and later Focus queries, ordinary `task_context`, MCP restart, Task switch, or compaction restore nothing. Repository Catalog remains local-only; team synchronization is not claimed.
 
-#157 exposes explicit AgentCheckpoint through MCP/CLI/Skill without Candidate creation or Hook-authored Claims. #158/#163 and #114/#117/#136 remain deferred.
+#157 exposes explicit AgentCheckpoint through MCP/CLI/Skill without Hook-authored Claims. #117 connects explicit `candidate_create` to closed Episode verification and submission-idempotent Git admission. #158/#163 and #114/#136 remain deferred.
 
 ## Residue gates
 

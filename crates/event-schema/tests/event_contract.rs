@@ -10,12 +10,21 @@ use sctx_event_schema::{
     EngineeringReferenceDraft, Event, EventPayload, EventType, EvidenceSnapshotDraft, EvidenceType,
     IntentSnapshot, OriginHint, ParsedEvent, PublicationAction, PublicationDraft, PublicationId,
     ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionOutcome, ReviewDraft,
-    ReviewVerdict, SemanticConflictDraft, V1_JSON_SCHEMA, V1_SCHEMA_ID, WorkEpisodeId, parse_event,
+    ReviewVerdict, SemanticConflictDraft, SubmissionId, TaskId, TaskSessionId, V1_JSON_SCHEMA,
+    V1_SCHEMA_ID, WorkEpisodeId, WorkEpisodeRef, parse_event,
 };
 use serde_json::{Value, json};
 
 fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures")
+}
+
+fn episode_ref() -> WorkEpisodeRef {
+    WorkEpisodeRef {
+        episode_id: WorkEpisodeId::new(),
+        task_session_id: TaskSessionId::new(),
+        task_id: TaskId::new(),
+    }
 }
 
 fn json_files(path: &Path) -> Vec<PathBuf> {
@@ -199,8 +208,14 @@ fn generation_api_assigns_new_ids_and_all_generated_events_parse() {
     let intent_added =
         Event::intent_revision_added(space_id, vec![initial_revision_id], intent("Revised"), None)
             .unwrap();
-    let candidate =
-        Event::context_candidate_created(WorkEpisodeId::new(), context_draft(), None).unwrap();
+    let candidate = Event::context_candidate_created(
+        SubmissionId::new(),
+        episode_ref(),
+        context_draft(),
+        "bat_00000000-0000-4000-8000-000000000902",
+        None,
+    )
+    .unwrap();
     let revision_added =
         Event::context_revision_added(space_id, context_draft(), annotations).unwrap();
     let (context_id, revision_id) = match revision_added.payload() {
@@ -463,8 +478,14 @@ fn event_type_getter_matches_payload_variant() {
 
 #[test]
 fn candidate_event_has_source_content_but_no_space_route() {
-    let event = Event::context_candidate_created(WorkEpisodeId::new(), context_draft(), None)
-        .expect("valid Candidate event");
+    let event = Event::context_candidate_created(
+        SubmissionId::new(),
+        episode_ref(),
+        context_draft(),
+        "bat_00000000-0000-4000-8000-000000000903",
+        None,
+    )
+    .expect("valid Candidate event");
     let EventPayload::ContextCandidateCreated { candidate } = event.payload() else {
         panic!("expected context_candidate.created");
     };
@@ -473,6 +494,7 @@ fn candidate_event_has_source_content_but_no_space_route() {
     let serialized = serde_json::to_value(event).expect("serialize Candidate event");
     assert!(serialized.get("space_id").is_none());
     assert!(serialized["candidate"].get("space_id").is_none());
-    assert!(serialized["candidate"].get("source_episode_id").is_some());
+    assert!(serialized["candidate"].get("submission_id").is_some());
+    assert!(serialized["candidate"].get("source_episode").is_some());
     assert!(serialized["candidate"].get("content").is_some());
 }

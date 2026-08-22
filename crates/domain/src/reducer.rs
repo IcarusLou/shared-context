@@ -7,6 +7,7 @@ use crate::{
     ContextCandidate, ContextId, ContextKind, ContextRevision, EngineeringReference, EventId,
     EvidenceId, IntentRevision, Publication, PublicationAction, PublicationId, ReferenceId,
     ResolutionId, Review, ReviewId, ReviewVerdict, RevisionId, SemanticConflict, SpaceId,
+    SubmissionId, WorkEpisodeRef,
 };
 
 /// Authoritative event input understood by the V1 domain reducer.
@@ -67,6 +68,7 @@ pub enum ReducerPayload {
 pub enum ReducerDiagnosticCode {
     DuplicateEventId,
     DuplicateCandidateId,
+    DuplicateSubmissionId,
     DuplicateRevisionId,
     DuplicateReviewId,
     DuplicatePublicationId,
@@ -242,6 +244,25 @@ pub struct CandidateProjection {
     pub candidate: ContextCandidate,
 }
 
+/// Unique valid Candidate submission used by the idempotency index.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CandidateSubmissionProjection {
+    pub submission_id: SubmissionId,
+    pub candidate_id: CandidateId,
+    pub event_id: EventId,
+    pub source_episode: WorkEpisodeRef,
+    pub content_hash: String,
+}
+
+/// Submission-local authoritative conflict; unrelated submissions remain usable.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CandidateSubmissionConflict {
+    pub submission_id: SubmissionId,
+    pub event_ids: BTreeSet<EventId>,
+    pub candidate_ids: BTreeSet<CandidateId>,
+    pub content_hashes: BTreeSet<String>,
+}
+
 /// One valid persistent engineering observation and its resolved Context owner.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EngineeringReferenceProjection {
@@ -256,6 +277,8 @@ pub struct EngineeringReferenceProjection {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct DomainProjection {
     pub candidates: BTreeMap<CandidateId, CandidateProjection>,
+    pub candidate_submissions: BTreeMap<SubmissionId, CandidateSubmissionProjection>,
+    pub candidate_submission_conflicts: BTreeMap<SubmissionId, CandidateSubmissionConflict>,
     pub spaces: BTreeMap<SpaceId, ContextSpaceProjection>,
     pub engineering_references: BTreeMap<ReferenceId, EngineeringReferenceProjection>,
     pub semantic_conflict_candidates: Vec<SemanticConflictCandidate>,
@@ -623,6 +646,7 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
 
     let mut events_by_id: BTreeMap<EventId, Vec<&ReducerEvent>> = BTreeMap::new();
     let mut candidate_definitions: BTreeMap<CandidateId, Vec<CandidateNode>> = BTreeMap::new();
+    let mut submission_definitions: BTreeMap<SubmissionId, Vec<CandidateNode>> = BTreeMap::new();
     let mut space_creations: BTreeMap<SpaceId, Vec<IntentNode>> = BTreeMap::new();
     let mut intent_definitions: BTreeMap<RevisionId, Vec<IntentNode>> = BTreeMap::new();
     let mut context_definitions: BTreeMap<RevisionId, Vec<ContextNode>> = BTreeMap::new();
@@ -640,13 +664,18 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
         events_by_id.entry(event.event_id).or_default().push(event);
         match &event.payload {
             ReducerPayload::ContextCandidateCreated { candidate } => {
+                let node = CandidateNode {
+                    event_id: event.event_id,
+                    candidate: candidate.clone(),
+                };
                 candidate_definitions
                     .entry(candidate.candidate_id)
                     .or_default()
-                    .push(CandidateNode {
-                        event_id: event.event_id,
-                        candidate: candidate.clone(),
-                    });
+                    .push(node.clone());
+                submission_definitions
+                    .entry(candidate.submission_id)
+                    .or_default()
+                    .push(node);
             }
             ReducerPayload::SpaceCreated {
                 space_id,
@@ -832,6 +861,18 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
                 id.to_string(),
                 event_ids(definitions, |node| node.event_id),
                 format!("candidate ID {id} has multiple definitions"),
+            );
+        }
+    }
+    for (id, definitions) in &submission_definitions {
+        if definitions.len() > 1 {
+            invalid_event_ids.extend(definitions.iter().map(|node| node.event_id));
+            push_diagnostic(
+                &mut diagnostics,
+                ReducerDiagnosticCode::DuplicateSubmissionId,
+                id.to_string(),
+                event_ids(definitions, |node| node.event_id),
+                format!("submission ID {id} has multiple Candidate definitions"),
             );
         }
     }
@@ -1721,6 +1762,39 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
         .iter()
         .flat_map(|diagnostic| diagnostic.event_ids.iter().copied())
         .collect();
+    let mut candidate_submissions = BTreeMap::new();
+    let mut candidate_submission_conflicts = BTreeMap::new();
+    for (submission_id, definitions) in submission_definitions {
+        if definitions.len() == 1 && !invalid_event_ids.contains(&definitions[0].event_id) {
+            let node = &definitions[0];
+            candidate_submissions.insert(
+                submission_id,
+                CandidateSubmissionProjection {
+                    submission_id,
+                    candidate_id: node.candidate.candidate_id,
+                    event_id: node.event_id,
+                    source_episode: node.candidate.source_episode,
+                    content_hash: node.candidate.submission_content_hash(),
+                },
+            );
+        } else {
+            candidate_submission_conflicts.insert(
+                submission_id,
+                CandidateSubmissionConflict {
+                    submission_id,
+                    event_ids: definitions.iter().map(|node| node.event_id).collect(),
+                    candidate_ids: definitions
+                        .iter()
+                        .map(|node| node.candidate.candidate_id)
+                        .collect(),
+                    content_hashes: definitions
+                        .iter()
+                        .map(|node| node.candidate.submission_content_hash())
+                        .collect(),
+                },
+            );
+        }
+    }
     let candidates = candidate_definitions
         .into_iter()
         .filter(|(_, definitions)| definitions.len() == 1)
@@ -1737,6 +1811,8 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
         .collect();
     DomainProjection {
         candidates,
+        candidate_submissions,
+        candidate_submission_conflicts,
         spaces,
         engineering_references,
         semantic_conflict_candidates,

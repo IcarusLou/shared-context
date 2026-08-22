@@ -6,10 +6,11 @@ use std::{
 };
 
 use sctx_domain::{
-    Applicability, ArtifactLocator, ArtifactRef, ContextId, ContextKind, ContextRevisionDraft,
-    ContextRevisionRef, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, PublicationAction,
-    PublicationDraft, RepoRelativePath, RepositoryId, RevisionId, SpaceId, TaskId, TaskIntentDraft,
-    TaskSignal, TaskSignalKind, WorkEpisodeId,
+    Applicability, ArtifactLocator, ArtifactRef, CaptureUnknown, ContextId, ContextKind,
+    ContextRevisionDraft, ContextRevisionRef, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot,
+    PublicationAction, PublicationDraft, RepoRelativePath, RepositoryId, RevisionId, SpaceId,
+    SubmissionId, TaskId, TaskIntentDraft, TaskIntentRevisionId, TaskSignal, TaskSignalKind,
+    WorkEpisodeId,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
@@ -122,9 +123,69 @@ fn draft(statement: &str) -> ContextRevisionDraft {
     }
 }
 
-fn candidate_arguments(source_episode_id: WorkEpisodeId, statement: &str) -> Value {
+struct CandidateOwner {
+    agent_kind: String,
+    external_session_id: String,
+    task_id: TaskId,
+    intent_revision_id: TaskIntentRevisionId,
+    source_episode_id: WorkEpisodeId,
+}
+
+fn closed_candidate_owner(fixture: &Fixture, agent_kind: &str, session: &str) -> CandidateOwner {
+    let task = task_intent_update_at_root(
+        &fixture.root,
+        &TaskIntentUpdateInput {
+            agent_kind: agent_kind.to_owned(),
+            external_session_id: session.to_owned(),
+            ..update_input(
+                session,
+                TaskBoundary::New,
+                None,
+                IntentMaturity::Provisional,
+                "create a verified Candidate",
+            )
+        },
+    )
+    .unwrap();
+    let closed = task_checkpoint_at_root(
+        &fixture.root,
+        &TaskCheckpointInput {
+            agent_kind: agent_kind.to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: task.context.task_id.to_string(),
+            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+            expected_episode_version: 0,
+            boundary: TaskCheckpointBoundary::Close,
+            claims: Vec::new(),
+            unknowns: vec![CaptureUnknown {
+                statement: "Candidate confirmation remains outside this operation".to_owned(),
+                blocking: false,
+                recheck_when: Vec::new(),
+            }],
+        },
+    )
+    .unwrap();
+    CandidateOwner {
+        agent_kind: agent_kind.to_owned(),
+        external_session_id: session.to_owned(),
+        task_id: task.context.task_id,
+        intent_revision_id: task.context.intent_revision_id,
+        source_episode_id: closed.episode_id,
+    }
+}
+
+fn candidate_arguments(
+    submission_id: SubmissionId,
+    owner: &CandidateOwner,
+    statement: &str,
+) -> Value {
     json!({
-        "source_episode_id": source_episode_id,
+        "submission_id": submission_id,
+        "agent_kind": owner.agent_kind,
+        "external_session_id": owner.external_session_id,
+        "expected_task_id": owner.task_id,
+        "expected_intent_revision_id": owner.intent_revision_id,
+        "source_episode_id": owner.source_episode_id,
         "kind": "decision",
         "topic_key": "mcp/candidate",
         "statement": statement,
@@ -670,13 +731,15 @@ fn codex_and_cursor_checkpoint_inline_evidence_and_close_without_hook_or_candida
 #[test]
 #[allow(clippy::too_many_lines)]
 fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() {
-    for (client, framing) in [
-        (ClientKind::Cursor, FixtureFraming::Newline),
-        (ClientKind::Codex, FixtureFraming::ContentLength),
+    for (client, framing, agent_kind) in [
+        (ClientKind::Cursor, FixtureFraming::Newline, "cursor"),
+        (ClientKind::Codex, FixtureFraming::ContentLength, "codex"),
     ] {
         let fixture = Fixture::new();
         let before_count = event_count(fixture.store.repository());
-        let source_episode_id = WorkEpisodeId::new();
+        let owner =
+            closed_candidate_owner(&fixture, agent_kind, &format!("candidate-{agent_kind}"));
+        let submission_id = SubmissionId::new();
         let requests = vec![
             request(
                 1,
@@ -722,7 +785,7 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
             tool_call(
                 6,
                 "candidate_create",
-                candidate_arguments(source_episode_id, "new MCP candidate"),
+                candidate_arguments(submission_id, &owner, "new MCP candidate"),
             ),
             tool_call(7, "space_list", json!({})),
         ];
@@ -772,6 +835,7 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
             .find(|tool| tool["name"] == "candidate_create")
             .unwrap()["inputSchema"];
         let schema_text = candidate_schema.to_string();
+        let candidate_properties = candidate_schema["properties"].as_object().unwrap();
         for forbidden in [
             "event_id",
             "context_id",
@@ -781,7 +845,7 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
             "workspace",
         ] {
             assert!(
-                !schema_text.contains(forbidden),
+                !candidate_properties.contains_key(forbidden),
                 "forbidden Candidate field: {forbidden}"
             );
         }
@@ -972,8 +1036,9 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
         assert_eq!(candidate["status"], "candidate");
         assert_eq!(
             candidate["source_episode_id"],
-            source_episode_id.to_string()
+            owner.source_episode_id.to_string()
         );
+        assert_eq!(candidate["submission_id"], submission_id.to_string());
         assert!(candidate["candidate_id"].as_str().is_some());
         assert!(candidate.get("space_id").is_none());
         assert_eq!(event_count(fixture.store.repository()), before_count + 1);
@@ -1707,7 +1772,9 @@ fn shared_context_skill_contract_drives_mcp_runtime_and_search_response() {
 #[test]
 fn candidate_create_retries_are_strict_and_unassigned_candidates_are_not_retrieved() {
     let fixture = Fixture::new();
-    let source_episode_id = WorkEpisodeId::new();
+    let owner = closed_candidate_owner(&fixture, "codex", "candidate-create-retry");
+    let submission_id = SubmissionId::new();
+    let distinct_submission_id = SubmissionId::new();
     let before_count = event_count(fixture.store.repository());
     let responses = run_session(
         &mut fixture.server(ClientKind::Codex),
@@ -1717,25 +1784,34 @@ fn candidate_create_retries_are_strict_and_unassigned_candidates_are_not_retriev
             tool_call(
                 2,
                 "candidate_create",
-                candidate_arguments(source_episode_id, "hidden MCP episode knowledge"),
+                candidate_arguments(submission_id, &owner, "hidden MCP episode knowledge"),
             ),
             tool_call(
                 3,
                 "candidate_create",
-                candidate_arguments(source_episode_id, "hidden MCP episode knowledge"),
+                candidate_arguments(submission_id, &owner, "hidden MCP episode knowledge"),
             ),
             tool_call(
                 4,
                 "candidate_create",
-                candidate_arguments(source_episode_id, "different MCP episode knowledge"),
+                candidate_arguments(submission_id, &owner, "different MCP episode knowledge"),
             ),
             tool_call(
                 5,
+                "candidate_create",
+                candidate_arguments(
+                    distinct_submission_id,
+                    &owner,
+                    "hidden MCP episode knowledge",
+                ),
+            ),
+            tool_call(
+                6,
                 "context_search",
                 json!({"query": "hidden MCP episode knowledge", "statuses": ["candidate"]}),
             ),
             tool_call(
-                6,
+                7,
                 "task_intent_update",
                 serde_json::to_value(update_input(
                     "candidate-isolation",
@@ -1750,11 +1826,16 @@ fn candidate_create_retries_are_strict_and_unassigned_candidates_are_not_retriev
     );
     let created = &responses[1]["result"]["structuredContent"];
     let retry = &responses[2]["result"]["structuredContent"];
-    let different = &responses[3]["result"]["structuredContent"];
+    let conflict = &responses[3]["result"]["structuredContent"];
+    let distinct = &responses[4]["result"]["structuredContent"];
     assert_eq!(created["created"], true);
     assert_eq!(retry["created"], false);
+    assert_eq!(created["submission_status"], "created");
+    assert_eq!(retry["submission_status"], "already_exists");
+    assert_eq!(retry["match_reason"], "already_exists");
     for field in [
         "candidate_id",
+        "submission_id",
         "source_episode_id",
         "event_id",
         "batch_id",
@@ -1762,16 +1843,19 @@ fn candidate_create_retries_are_strict_and_unassigned_candidates_are_not_retriev
     ] {
         assert_eq!(created[field], retry[field]);
     }
-    assert_ne!(created["candidate_id"], different["candidate_id"]);
-    assert_eq!(different["created"], true);
+    assert_eq!(responses[3]["result"]["isError"], true);
+    assert_eq!(conflict["error"]["code"], "idempotency_key_conflict");
+    assert_ne!(created["candidate_id"], distinct["candidate_id"]);
+    assert_ne!(created["submission_id"], distinct["submission_id"]);
+    assert_eq!(distinct["created"], true);
     assert_eq!(event_count(fixture.store.repository()), before_count + 2);
     assert!(
-        responses[4]["result"]["structuredContent"]["results"]
+        responses[5]["result"]["structuredContent"]["results"]
             .as_array()
             .unwrap()
             .is_empty()
     );
-    let task_context = &responses[5]["result"]["structuredContent"];
+    let task_context = &responses[6]["result"]["structuredContent"];
     assert!(
         !serde_json::to_string(task_context)
             .unwrap()
@@ -1784,6 +1868,125 @@ fn candidate_create_retries_are_strict_and_unassigned_candidates_are_not_retriev
             .iter()
             .all(|item| { item["context"]["statement"] != "hidden MCP episode knowledge" })
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn candidate_create_rejects_missing_open_cross_task_and_stale_ownership_without_git_writes() {
+    let fixture = Fixture::new();
+    let before_events = event_count(fixture.store.repository());
+
+    let missing_task = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            "candidate-missing-episode",
+            TaskBoundary::New,
+            None,
+            IntentMaturity::Provisional,
+            "reject a missing source Episode",
+        ),
+    )
+    .unwrap();
+    let missing_owner = CandidateOwner {
+        agent_kind: "codex".to_owned(),
+        external_session_id: "candidate-missing-episode".to_owned(),
+        task_id: missing_task.context.task_id,
+        intent_revision_id: missing_task.context.intent_revision_id,
+        source_episode_id: WorkEpisodeId::new(),
+    };
+
+    let open_task = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            "candidate-open-episode",
+            TaskBoundary::New,
+            None,
+            IntentMaturity::Provisional,
+            "reject an open source Episode",
+        ),
+    )
+    .unwrap();
+    let open_checkpoint = task_checkpoint_at_root(
+        &fixture.root,
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: "candidate-open-episode".to_owned(),
+            expected_task_id: open_task.context.task_id.to_string(),
+            expected_intent_revision_id: open_task.context.intent_revision_id.to_string(),
+            expected_episode_version: 0,
+            boundary: TaskCheckpointBoundary::Continue,
+            claims: Vec::new(),
+            unknowns: vec![CaptureUnknown {
+                statement: "Episode intentionally remains open".to_owned(),
+                blocking: false,
+                recheck_when: Vec::new(),
+            }],
+        },
+    )
+    .unwrap();
+    let open_owner = CandidateOwner {
+        agent_kind: "codex".to_owned(),
+        external_session_id: "candidate-open-episode".to_owned(),
+        task_id: open_task.context.task_id,
+        intent_revision_id: open_task.context.intent_revision_id,
+        source_episode_id: open_checkpoint.episode_id,
+    };
+
+    let source_owner = closed_candidate_owner(&fixture, "codex", "candidate-source-task");
+    let target_owner = closed_candidate_owner(&fixture, "codex", "candidate-target-task");
+    let cross_task_owner = CandidateOwner {
+        source_episode_id: source_owner.source_episode_id,
+        ..target_owner
+    };
+
+    let stale_owner = closed_candidate_owner(&fixture, "codex", "candidate-stale-intent");
+    task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            &stale_owner.external_session_id,
+            TaskBoundary::Continue,
+            Some(stale_owner.intent_revision_id.to_string()),
+            IntentMaturity::Provisional,
+            "advance the Candidate owner Intent",
+        ),
+    )
+    .unwrap();
+
+    let responses = run_session(
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::Newline,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(
+                2,
+                "candidate_create",
+                candidate_arguments(SubmissionId::new(), &missing_owner, "missing source"),
+            ),
+            tool_call(
+                3,
+                "candidate_create",
+                candidate_arguments(SubmissionId::new(), &open_owner, "open source"),
+            ),
+            tool_call(
+                4,
+                "candidate_create",
+                candidate_arguments(SubmissionId::new(), &cross_task_owner, "cross Task source"),
+            ),
+            tool_call(
+                5,
+                "candidate_create",
+                candidate_arguments(SubmissionId::new(), &stale_owner, "stale Intent owner"),
+            ),
+        ],
+    );
+    for response in &responses[1..] {
+        assert_eq!(response["result"]["isError"], true, "{response:#}");
+        assert_eq!(
+            response["result"]["structuredContent"]["error"]["code"],
+            "invalid_input"
+        );
+    }
+    assert_eq!(event_count(fixture.store.repository()), before_events);
 }
 
 #[test]
@@ -1824,6 +2027,7 @@ fn malformed_json_invalid_arguments_and_writer_rejection_are_typed() {
         "invalid_input"
     );
 
+    let owner = closed_candidate_owner(&fixture, "codex", "candidate-writer-rejection");
     dirty_first_event(fixture.store.repository());
     let writer_responses = run_session(
         &mut fixture.server(ClientKind::Codex),
@@ -1834,7 +2038,8 @@ fn malformed_json_invalid_arguments_and_writer_rejection_are_typed() {
                 5,
                 "candidate_create",
                 candidate_arguments(
-                    WorkEpisodeId::new(),
+                    SubmissionId::new(),
+                    &owner,
                     "Writer must reject dirty managed input",
                 ),
             ),

@@ -4,7 +4,12 @@
   "event_type": "context_candidate.created",
   "candidate": {
     "candidate_id": "cnd_00000000-0000-4000-8000-000000000813",
-    "source_episode_id": "wep_00000000-0000-4000-8000-000000000833",
+    "submission_id": "sub_00000000-0000-4000-8000-000000000823",
+    "source_episode": {
+      "episode_id": "wep_00000000-0000-4000-8000-000000000833",
+      "task_session_id": "tss_00000000-0000-4000-8000-000000000843",
+      "task_id": "tsk_00000000-0000-4000-8000-000000000853"
+    },
     "space_id": "spc_00000000-0000-4000-8000-000000000843",
     "content": {
       "kind": "discovery",
@@ -28,5 +33,8 @@
         }
       ]
     }
+  },
+  "annotations": {
+    "writer_batch_id": "bat_00000000-0000-4000-8000-000000000863"
   }
 }

@@ -4,7 +4,12 @@
   "event_type": "context_candidate.created",
   "candidate": {
     "candidate_id": "cnd_00000000-0000-4000-8000-000000000811",
-    "source_episode_id": "wep_00000000-0000-4000-8000-000000000831",
+    "submission_id": "sub_00000000-0000-4000-8000-000000000821",
+    "source_episode": {
+      "episode_id": "wep_00000000-0000-4000-8000-000000000831",
+      "task_session_id": "tss_00000000-0000-4000-8000-000000000841",
+      "task_id": "tsk_00000000-0000-4000-8000-000000000851"
+    },
     "content": {
       "kind": "decision",
       "topic_key": "candidate/space-independent",
@@ -31,5 +36,8 @@
         }
       ]
     }
+  },
+  "annotations": {
+    "writer_batch_id": "bat_00000000-0000-4000-8000-000000000861"
   }
 }

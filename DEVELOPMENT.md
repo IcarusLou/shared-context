@@ -21,17 +21,17 @@
 - `CaptureStore` 使用 typed `CaptureId` 保存带 ExternalSessionLocator 与 optional exact ActiveTask owner 的 redacted TTL Breadcrumb；bounded read/list/claim/cleanup、claim 与 Runtime commit 双重幂等、Catalog File→ArtifactRef 映射已实现。无 ActiveTask 或未配置/unsafe File 只保留 typed diagnostic，绝不猜 owner/Repository。
 - Hook 只写 owned/diagnostic Capture 和原有非定位 TestOutcome，不 open/advance/ingest Episode 或伪造 Claim；PreCompact/TurnStop 只提示工作 Agent 显式调用 `task_checkpoint`，自动聚合属于 #163。
 - 无 Space 的 `ContextCandidate` 领域类型已经存在。
-- `candidate_create` 是当前 Candidate 写入主入口；CLI 与 MCP 都生成服务端 ID，且未确认 Candidate 不参与自动注入。
+- `candidate_create` 是当前 Candidate 写入主入口；CLI 与 MCP 要求调用方提供稳定 `submission_id` 与精确 ActiveTask/Intent/closed WorkEpisode 所有权，服务端生成 Candidate/Event 身份和路径，且未确认 Candidate 不参与自动注入。
 - 既有 Git Writer、事件校验、SQLite 投影、Context 生命周期、CLI/MCP、Agent Adapter、安装器和 NPM 分发能力继续作为 M1 的基础设施。
 
 以下能力**尚未实现**，不得在代码、测试报告或评审中宣称已经具备：
 
-- **M4 完整链路：未实现** — #156/#157 已完成可验证 WorkEpisode/Capture 与显式 AgentCheckpoint；Candidate Builder（#158）、自动聚合（#163）、去重/冲突/Space 推荐和 Candidate confirm/list/discard 尚未实现。
+- **M4 完整链路：未实现** — #117 已完成 Candidate submission 幂等门禁，#156/#157 已完成可验证 WorkEpisode/Capture 与显式 AgentCheckpoint；Candidate Builder（#158）、自动聚合（#163）、知识语义去重/冲突/Space 推荐和 Candidate confirm/list/discard 尚未实现。
 - **团队同步：未实现** — Repository Catalog 是单机显式配置，不是团队事实或知识 Store。
 
 Cursor 与 Codex 都通过显式 `task_intent_update` 建立权威 Task；Prompt Hook 只提供能力提示。已有 ActiveTask 可通过只读 `task_context` 再取 Pack。
 
-M4 必须通过 Mandatory Gate #114/#117：以写入 Git Event、可由 Git 重建到 SQLite 唯一索引的稳定 `submission_id` 实现 Candidate 创建幂等，避免扫描全量 Event、依赖 commit subject，或被无关坏 Event 阻断。#156 已提供 `source_episode_id` 的 Runtime existence/owner/status verification，但尚未把它接入 Candidate admission 或 Git 幂等事实。
+Mandatory Gate #117 已完成：稳定 `submission_id` 写入 Git Event 并可重建到 SQLite submission/conflict 索引；Candidate lock 覆盖索引同步、lookup、pending recovery 和 append，主写路径不扫描全量 Event，也不依赖 commit subject。`candidate_create` 同时使用 #156 的 Runtime existence/owner/status 与 Task/Intent CAS 验证 source Episode。#114 的无关 malformed Event 隔离仍未实现。
 
 M1 的手工 `candidate_create` 是领域和安全边界的可执行入口，不等同于 M4 的 Low-tax Capture。
 

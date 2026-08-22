@@ -12,10 +12,12 @@ use crate::{
 
 pub(crate) const NEXT_PREFIX: &str = "_next_";
 
-const TABLES: [&str; 21] = [
+const TABLES: [&str; 23] = [
     "meta",
     "source_file",
     "context_candidate",
+    "candidate_submission",
+    "candidate_submission_conflict",
     "space_projection",
     "intent_revision",
     "intent_head",
@@ -117,7 +119,11 @@ CREATE TABLE {prefix}source_file (
 CREATE TABLE {prefix}context_candidate (
     candidate_id TEXT PRIMARY KEY,
     event_id TEXT NOT NULL UNIQUE,
+    submission_id TEXT NOT NULL UNIQUE,
     source_episode_id TEXT NOT NULL,
+    source_task_session_id TEXT NOT NULL,
+    source_task_id TEXT NOT NULL,
+    submission_content_hash TEXT NOT NULL,
     kind TEXT NOT NULL,
     topic_key TEXT,
     statement TEXT NOT NULL,
@@ -128,6 +134,24 @@ CREATE TABLE {prefix}context_candidate (
     evidence_json TEXT NOT NULL,
     auto_injection_eligible INTEGER NOT NULL CHECK (auto_injection_eligible = 0),
     projection_json TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE {prefix}candidate_submission (
+    submission_id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL UNIQUE REFERENCES {prefix}context_candidate(candidate_id),
+    event_id TEXT NOT NULL UNIQUE,
+    source_episode_id TEXT NOT NULL,
+    source_task_session_id TEXT NOT NULL,
+    source_task_id TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    commit_oid TEXT NOT NULL,
+    event_path TEXT NOT NULL UNIQUE
+) WITHOUT ROWID;
+CREATE TABLE {prefix}candidate_submission_conflict (
+    submission_id TEXT PRIMARY KEY,
+    event_ids_json TEXT NOT NULL,
+    candidate_ids_json TEXT NOT NULL,
+    content_hashes_json TEXT NOT NULL
 ) WITHOUT ROWID;
 CREATE TABLE {prefix}space_projection (
     space_id TEXT PRIMARY KEY,
@@ -335,6 +359,8 @@ fn create_indexes(transaction: &Transaction<'_>) -> crate::Result<()> {
                  ON publication_head(context_id, publication_id);
              CREATE INDEX context_candidate_source_idx
                  ON context_candidate(source_episode_id, candidate_id);
+             CREATE INDEX candidate_submission_candidate_idx
+                 ON candidate_submission(candidate_id, submission_id);
              CREATE INDEX engineering_reference_context_idx
                  ON engineering_reference(context_id, revision_id, reference_id);
              CREATE INDEX engineering_reference_repository_idx
@@ -393,15 +419,58 @@ fn populate(
 
     for (candidate_id, projection) in &input.projection.candidates {
         let content = &projection.candidate.content;
+        let submission = input
+            .projection
+            .candidate_submissions
+            .get(&projection.candidate.submission_id)
+            .ok_or_else(|| {
+                crate::Error::new(
+                    crate::ErrorKind::InvariantViolation,
+                    "valid Candidate lacks submission projection",
+                )
+            })?;
+        let metadata = input
+            .candidate_events
+            .get(&projection.event_id)
+            .ok_or_else(|| {
+                crate::Error::new(
+                    crate::ErrorKind::InvariantViolation,
+                    "valid Candidate lacks Event metadata",
+                )
+            })?;
+        if metadata.submission_id != submission.submission_id
+            || metadata.candidate_id != submission.candidate_id
+        {
+            return Err(crate::Error::new(
+                crate::ErrorKind::InvariantViolation,
+                "Candidate submission metadata identity mismatch",
+            ));
+        }
+        let batch_id = metadata.batch_id.as_deref().ok_or_else(|| {
+            crate::Error::new(
+                crate::ErrorKind::InvariantViolation,
+                "Candidate Event lacks Writer batch metadata",
+            )
+        })?;
+        let commit_oid = metadata.commit_oid.as_deref().ok_or_else(|| {
+            crate::Error::new(
+                crate::ErrorKind::InvariantViolation,
+                "Candidate Event lacks introducing commit metadata",
+            )
+        })?;
         transaction
             .execute(
                 &format!(
-                    "INSERT INTO {prefix}context_candidate(candidate_id, event_id, source_episode_id, kind, topic_key, statement, rationale, applicability_json, assumptions_json, recheck_when_json, evidence_json, auto_injection_eligible, projection_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12)"
+                    "INSERT INTO {prefix}context_candidate(candidate_id, event_id, submission_id, source_episode_id, source_task_session_id, source_task_id, submission_content_hash, kind, topic_key, statement, rationale, applicability_json, assumptions_json, recheck_when_json, evidence_json, auto_injection_eligible, projection_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0, ?16)"
                 ),
                 params![
                     candidate_id.to_string(),
                     projection.event_id.to_string(),
-                    projection.candidate.source_episode_id.to_string(),
+                    submission.submission_id.to_string(),
+                    submission.source_episode.episode_id.to_string(),
+                    submission.source_episode.task_session_id.to_string(),
+                    submission.source_episode.task_id.to_string(),
+                    submission.content_hash,
                     enum_text(content.kind),
                     content.topic_key,
                     content.statement,
@@ -414,6 +483,40 @@ fn populate(
                 ],
             )
             .map_err(sql_error("write Context Candidate projection"))?;
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO {prefix}candidate_submission(submission_id, candidate_id, event_id, source_episode_id, source_task_session_id, source_task_id, content_hash, batch_id, commit_oid, event_path) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+                ),
+                params![
+                    submission.submission_id.to_string(),
+                    submission.candidate_id.to_string(),
+                    submission.event_id.to_string(),
+                    submission.source_episode.episode_id.to_string(),
+                    submission.source_episode.task_session_id.to_string(),
+                    submission.source_episode.task_id.to_string(),
+                    submission.content_hash,
+                    batch_id,
+                    commit_oid,
+                    metadata.event_path,
+                ],
+            )
+            .map_err(sql_error("write Candidate submission projection"))?;
+    }
+    for (submission_id, conflict) in &input.projection.candidate_submission_conflicts {
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO {prefix}candidate_submission_conflict(submission_id, event_ids_json, candidate_ids_json, content_hashes_json) VALUES (?1, ?2, ?3, ?4)"
+                ),
+                params![
+                    submission_id.to_string(),
+                    json(&conflict.event_ids)?,
+                    json(&conflict.candidate_ids)?,
+                    json(&conflict.content_hashes)?,
+                ],
+            )
+            .map_err(sql_error("write Candidate submission conflict"))?;
     }
 
     for (space_id, space) in &input.projection.spaces {
@@ -874,8 +977,12 @@ pub(crate) fn replace_projection_incremental(
         .execute_batch(
             "DELETE FROM source_file;
              INSERT INTO source_file SELECT * FROM _next_source_file;
+             DELETE FROM candidate_submission;
              DELETE FROM context_candidate;
              INSERT INTO context_candidate SELECT * FROM _next_context_candidate;
+             INSERT INTO candidate_submission SELECT * FROM _next_candidate_submission;
+             DELETE FROM candidate_submission_conflict;
+             INSERT INTO candidate_submission_conflict SELECT * FROM _next_candidate_submission_conflict;
              DELETE FROM diagnostic;
              INSERT INTO diagnostic SELECT * FROM _next_diagnostic;
 
