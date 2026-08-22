@@ -12,7 +12,10 @@ use sctx_domain::{
     CandidateId, ContextRevisionDraft, Error, ErrorKind, EventId, ReducerEvent, Result,
     SubmissionId, WorkEpisodeRef, candidate_submission_content_hash, reduce,
 };
-use sctx_event_schema::{Event, EventType, ParsedEvent, candidate_submission_hint, parse_event};
+use sctx_event_schema::{
+    ContextSpaceAssociationOrigin, Event, EventPayload, EventType, ParsedEvent,
+    candidate_submission_hint, parse_event,
+};
 use sctx_local_state::{PrivacyScan, PrivacyScanner, UserConfigStore};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -390,6 +393,12 @@ impl GitStore {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "context_candidate.created requires the Candidate submission service",
+            ));
+        }
+        if requires_candidate_confirmation_service(&request.event) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Candidate confirmation facts require the atomic confirmation service",
             ));
         }
         let (journal, object_refs) = self.prepare(request)?;
@@ -1305,6 +1314,11 @@ fn collect_staged_event(
                     "staged Candidate event at {path} requires the Candidate submission service"
                 )));
             }
+            if added && requires_candidate_confirmation_service(&event) {
+                return Err(invariant(format!(
+                    "staged Candidate confirmation fact at {path} requires the atomic confirmation service"
+                )));
+            }
             if added {
                 staged_event_ids.insert(event.event_id());
             }
@@ -1326,6 +1340,18 @@ fn collect_staged_event(
         Ok(ParsedEvent::UnknownSchema(_)) | Err(_) => {}
     }
     Ok(())
+}
+
+fn requires_candidate_confirmation_service(event: &Event) -> bool {
+    matches!(event.payload(), EventPayload::CandidateConfirmed { .. })
+        || matches!(
+            event.payload(),
+            EventPayload::ContextSpaceAssociationChanged { association }
+                if matches!(
+                    association.origin,
+                    ContextSpaceAssociationOrigin::CandidateConfirmation { .. }
+                )
+        )
 }
 
 fn append_from_submission_record(

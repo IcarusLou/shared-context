@@ -19,7 +19,7 @@
 | **M1：Task-first 领域与入口基础** | **已实现** | `TaskIntent` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；CLI/MCP 通过 `candidate_create` 创建无 Space Candidate；Candidate 不可自动注入 |
 | **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、严格 `task_intent_update` 与只读 `task_context` 已通过跨 crate/E2E 验收 |
 | **M3：Engineering Graph** | **已实现** | 稳定本机 Repository Catalog、可重建 Registry、Reference-derived 有界扫描、build-time immutable Context/safety snapshot、历史 Graph Retrieval、ContextRelation 1–2 跳及 MCP/CLI 工作流已通过固定跨 crate/E2E oracle |
-| **M4：Low-tax Capture** | **基础部分已实现** | #117 已实现 submission-idempotent Candidate admission；#156/#157/#158/#159/#160 已持久化可验证 WorkEpisode、normalized Observation、typed Capture、显式 AgentCheckpoint、确定性 Candidate Builder、derived analysis 与 Task-local Review lifecycle；尚无自动聚合或 Candidate Confirm |
+| **M4：Low-tax Capture** | **基础部分已实现** | #117 已实现 submission-idempotent Candidate admission；#156–#161 已定义并验证 WorkEpisode、Candidate Builder/analysis/Review 及 CandidateConfirmation/ContextSpaceAssociation 事实；尚无自动聚合或 Candidate Confirm Writer/MCP 执行 |
 
 当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订权威 TaskIntent，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示。PostToolUse 的 File observation 只形成带 Session/optional Task owner 的 redacted Capture Breadcrumb，可识别测试工具只形成非定位 TestOutcome；Hook 不运行 Git、Scanner、Registry sync、Graph rebuild、Focus 提交或 Episode open/ingest。显式 Graph 工具完成 bounded scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。当前 `candidate_create` 仍是手工、无归属的 M1 入口，不等同于 M4 自动 Capture。
 
@@ -1365,6 +1365,8 @@ EngineeringResolutionSource {
 - Existing Space 推荐融合 assessment targets、source Task associations 与 Space Intent；conflicted Intent/unsafe Context 只作诊断或 Related，无安全 Primary 时生成一个完整 system-suggested Intent。分析可由 `candidate analyze` 重跑替换，不写 Git、不改变 Candidate submission/content/ID，不参与 Context Search、Hook 或自动注入。
 - Runtime v9 只在 finalized Builder item 同事务初始化 Pending Candidate Review；list/get 以 ExternalSession ActiveTask 为发现边界，返回完整 draft/Evidence/provenance/analysis/Space 推荐并标记为不可信数据。手工或孤立 Git Candidate 不进入 Review，runtime 删除后也不会从 Git 复活。
 - Review list 使用稳定 cursor、limit 和 whole-summary token budget；analysis pending/failed 以 typed diagnostic 可见但不 ready。discard 使用 Task/Intent/Review version CAS，同 reason timeout retry幂等，默认 list 隐藏 Discarded。
+- CandidateConfirmation 与 ContextSpaceAssociation 的领域/Event/Reducer/Index 契约已实现：确认 input 只选择 existing/new Primary、Related 与 field-level edits；事实闭包引用 exact Candidate、Revision、Association、causal Publish 和 final draft hash。Association 是独立因果 DAG，不写入 ContextRelation；初始确认仍强制 result Context 的嵌套 owner 等于 Primary，未来 correction 不改变当前 Search owner。
+- 一个 Candidate 的重复确认不论内容相同或不同都形成显式 conflict；Association 多 Head 同样显式 conflict。确认只验证其 causal Publication Event 为 exact Publish，后续 Withdraw/Supersede 不使历史 Confirmation 失效，当前检索继续服从现有 lifecycle。
 - TTL cleanup 只删除重型 Runtime analysis并保留 terminal Expired tombstone；后续 Builder retry不得重新初始化 Pending。Candidate Confirm（#162）与 PreCompact/TurnStop 自动写入/Builder 触发（#163）尚未实现；当前 Hook 仅给出显式 Checkpoint 能力提示。
 - 当前显式 `candidate_create` 继续作为手工入口；自动 Builder 复用相同 #117 admission，并提供内部 CLI `candidate build-closed-episode` 重试边界。Review discovery不扫描该手工入口产生的 Git-only Candidate。
 - Mandatory Gate #117 已完成：一次创建操作携带稳定 `submission_id`，首次提交由服务端生成 `candidate_id`/`event_id`/路径并持久化 submission mapping；重试复用同一 `submission_id`。

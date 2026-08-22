@@ -9,12 +9,14 @@ use std::{
 
 use rusqlite::{Connection, types::ValueRef};
 use sctx_event_schema::{
-    Applicability, ArtifactKind, ArtifactLocator, ConflictParticipant, ContextId, ContextKind,
-    ContextRelation, ContextRelationKind, ContextRevisionDraft, EngineeringReferenceDraft, Event,
-    EventPayload, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, PublicationAction,
+    Applicability, ArtifactKind, ArtifactLocator, CandidateConfirmationCausalRefs,
+    CandidateConfirmationDraft, ConflictParticipant, ContextId, ContextKind, ContextRelation,
+    ContextRelationKind, ContextRevisionDraft, ContextSpaceAssociationDraft,
+    ContextSpaceAssociationOrigin, EngineeringReferenceDraft, Event, EventPayload,
+    EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, OptionalCandidateEdits, PublicationAction,
     PublicationDraft, PublicationId, ReferenceRelation, RepoRelativePath, RepositoryId,
     ReviewDraft, ReviewVerdict, RevisionId, SemanticConflictDraft, SpaceId, SubmissionId, TaskId,
-    TaskSessionId, WorkEpisodeId, WorkEpisodeRef,
+    TaskSessionId, WorkEpisodeId, WorkEpisodeRef, context_revision_content_hash,
 };
 use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
 use sctx_index::{
@@ -133,6 +135,36 @@ fn append(store: &GitStore, event: Event) -> PathBuf {
         .append_event(AppendRequest::event(event))
         .expect("append fixture event");
     store.repository().join(outcome.event_path)
+}
+
+fn commit_atomic_fact_events(store: &GitStore, events: &[Event], message: &str) {
+    let mut paths = Vec::new();
+    for event in events {
+        let event_id = event.event_id().to_string();
+        let prefix = &event_id[sctx_event_schema::EventId::PREFIX.len()
+            ..sctx_event_schema::EventId::PREFIX.len() + 2];
+        let relative = format!("events/{prefix}/{event_id}.json");
+        let path = store.repository().join(&relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut bytes = serde_json::to_vec_pretty(event).unwrap();
+        bytes.push(b'\n');
+        fs::write(path, bytes).unwrap();
+        paths.push(relative);
+    }
+    let status = Command::new("git")
+        .arg("add")
+        .arg("--")
+        .args(&paths)
+        .current_dir(store.repository())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let status = Command::new("git")
+        .args(["commit", "-m", message])
+        .current_dir(store.repository())
+        .status()
+        .unwrap();
+    assert!(status.success());
 }
 
 fn submit_candidate(store: &GitStore, request: CandidateSubmissionRequest) -> PathBuf {
@@ -1288,6 +1320,236 @@ fn count_fts_matches(connection: &Connection, table: &str, query: &str) -> i64 {
         .unwrap()
 }
 
+#[test]
+#[allow(clippy::too_many_lines)]
+fn candidate_confirmation_projection_is_incremental_scratch_and_deletion_equivalent() {
+    let temporary = tempfile::tempdir().unwrap();
+    let base_store = GitStore::initialize(temporary.path().join("confirmation-index")).unwrap();
+    let index = ProjectionIndex::for_store(&base_store);
+    let store = base_store.with_candidate_submission_index(Arc::new(index.clone()));
+    let request = candidate("Confirmed Candidate content");
+    let source_episode = request.source_episode;
+    let final_content = request.content.clone();
+    let submission_id = request.submission_id;
+    let candidate = store.submit_candidate(request).unwrap();
+    let candidate_id = candidate.record.candidate_id;
+
+    let primary_event = Event::space_created(intent("Confirmation Primary"), None).unwrap();
+    let (primary_space_id, _) = space_ids(&primary_event);
+    append(&store, primary_event);
+    let related_events = [
+        Event::space_created(intent("Confirmation Related A"), None).unwrap(),
+        Event::space_created(intent("Confirmation Related B"), None).unwrap(),
+    ];
+    let related_space_ids = related_events
+        .iter()
+        .map(|event| space_ids(event).0)
+        .collect::<Vec<_>>();
+    for event in related_events {
+        append(&store, event);
+    }
+    let revision_event =
+        Event::context_revision_added(primary_space_id, final_content.clone(), None).unwrap();
+    let (context_id, revision_id) = context_ids(&revision_event);
+    let revision_event_id = revision_event.event_id();
+    append(&store, revision_event);
+    let association_event = Event::candidate_space_association_changed(
+        ContextSpaceAssociationDraft {
+            context_id,
+            primary_space_id,
+            related_space_ids: related_space_ids.clone(),
+            previous_association_ids: Vec::new(),
+            origin: ContextSpaceAssociationOrigin::CandidateConfirmation { candidate_id },
+        },
+        "bat_00000000-0000-4000-8000-000000000811",
+        None,
+    )
+    .unwrap();
+    let association_id = match association_event.payload() {
+        EventPayload::ContextSpaceAssociationChanged { association } => association.association_id,
+        _ => unreachable!(),
+    };
+    let publication_event = Event::publication_changed(
+        primary_space_id,
+        context_id,
+        PublicationDraft {
+            previous_publication_ids: Vec::new(),
+            action: PublicationAction::Publish,
+            revision_id,
+            review_event_ids: Vec::new(),
+        },
+        None,
+    )
+    .unwrap();
+    let publication_id = publication_id(&publication_event);
+    let confirmation_event = Event::candidate_confirmed(
+        CandidateConfirmationDraft {
+            candidate_id,
+            submission_id,
+            source_episode,
+            result_context_id: context_id,
+            result_revision_id: revision_id,
+            primary_space_id,
+            related_space_ids: related_space_ids.clone(),
+            space_association_id: association_id,
+            publication_id,
+            created_space_id: None,
+            edits: OptionalCandidateEdits::default(),
+            final_content_hash: context_revision_content_hash(&final_content),
+            causal_refs: CandidateConfirmationCausalRefs {
+                space_created_event_id: None,
+                context_revision_event_id: revision_event_id,
+                space_association_event_id: association_event.event_id(),
+                publication_event_id: publication_event.event_id(),
+            },
+        },
+        "bat_00000000-0000-4000-8000-000000000811",
+        None,
+    )
+    .unwrap();
+    let confirmation_fact = match confirmation_event.payload() {
+        EventPayload::CandidateConfirmed { confirmation } => confirmation.clone(),
+        _ => unreachable!(),
+    };
+    commit_atomic_fact_events(
+        &store,
+        &[
+            association_event,
+            publication_event.clone(),
+            confirmation_event,
+        ],
+        "Add Candidate confirmation facts",
+    );
+    index.synchronize().unwrap();
+    let connection = Connection::open(index.database_path()).unwrap();
+    for table in [
+        "context_space_association",
+        "context_space_association_head",
+        "candidate_confirmation",
+    ] {
+        assert_eq!(
+            connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+    }
+    drop(connection);
+
+    append(
+        &store,
+        Event::publication_changed(
+            primary_space_id,
+            context_id,
+            PublicationDraft {
+                previous_publication_ids: vec![publication_id],
+                action: PublicationAction::Withdraw,
+                revision_id,
+                review_event_ids: Vec::new(),
+            },
+            None,
+        )
+        .unwrap(),
+    );
+    index.synchronize().unwrap();
+    let snapshot = index.domain_snapshot().unwrap();
+    assert_eq!(snapshot.projection.candidate_confirmations.len(), 1);
+    assert!(matches!(
+        snapshot.projection.spaces[&primary_space_id].contexts[&context_id].governance,
+        sctx_event_schema::ContextGovernanceStatus::Deprecated { .. }
+    ));
+    let corrections = [Vec::new(), vec![related_space_ids[0]]]
+        .into_iter()
+        .map(|related_space_ids| {
+            Event::context_space_association_changed(
+                ContextSpaceAssociationDraft {
+                    context_id,
+                    primary_space_id,
+                    related_space_ids,
+                    previous_association_ids: vec![association_id],
+                    origin: ContextSpaceAssociationOrigin::Correction,
+                },
+                None,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let duplicate_confirmation = Event::candidate_confirmed(
+        CandidateConfirmationDraft {
+            candidate_id: confirmation_fact.candidate_id,
+            submission_id: confirmation_fact.submission_id,
+            source_episode: confirmation_fact.source_episode,
+            result_context_id: confirmation_fact.result_context_id,
+            result_revision_id: confirmation_fact.result_revision_id,
+            primary_space_id: confirmation_fact.primary_space_id,
+            related_space_ids: confirmation_fact.related_space_ids,
+            space_association_id: confirmation_fact.space_association_id,
+            publication_id: confirmation_fact.publication_id,
+            created_space_id: confirmation_fact.created_space_id,
+            edits: confirmation_fact.edits,
+            final_content_hash: confirmation_fact.final_content_hash,
+            causal_refs: confirmation_fact.causal_refs,
+        },
+        "bat_00000000-0000-4000-8000-000000000812",
+        None,
+    )
+    .unwrap();
+    let mut conflict_events = corrections;
+    conflict_events.push(duplicate_confirmation);
+    commit_atomic_fact_events(&store, &conflict_events, "Add confirmation conflicts");
+    index.synchronize().unwrap();
+    let conflict_snapshot = index.domain_snapshot().unwrap();
+    assert!(
+        conflict_snapshot
+            .projection
+            .candidate_confirmations
+            .is_empty()
+    );
+    assert_eq!(
+        conflict_snapshot
+            .projection
+            .candidate_confirmation_conflicts
+            .len(),
+        1
+    );
+    assert_eq!(
+        conflict_snapshot.projection.context_space_association_heads[&context_id].len(),
+        2
+    );
+    assert_eq!(
+        conflict_snapshot
+            .projection
+            .context_space_association_conflicts
+            .len(),
+        1
+    );
+    let connection = Connection::open(index.database_path()).unwrap();
+    for (table, expected_count) in [
+        ("candidate_confirmation", 0_i64),
+        ("candidate_confirmation_conflict", 1),
+        ("context_space_association_head", 2),
+        ("context_space_association_conflict", 1),
+    ] {
+        assert_eq!(
+            connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            expected_count
+        );
+    }
+    drop(connection);
+    let expected = projection_dump(index.database_path());
+    index.rebuild().unwrap();
+    assert_eq!(projection_dump(index.database_path()), expected);
+    remove_database(index.database_path());
+    index.synchronize().unwrap();
+    assert_eq!(projection_dump(index.database_path()), expected);
+}
+
 fn projection_dump(database: &Path) -> Vec<String> {
     let connection = Connection::open(database).unwrap();
     [
@@ -1304,6 +1566,11 @@ fn projection_dump(database: &Path) -> Vec<String> {
         "SELECT * FROM review ORDER BY event_id",
         "SELECT * FROM publication ORDER BY publication_id",
         "SELECT * FROM publication_head ORDER BY context_id, publication_id",
+        "SELECT * FROM context_space_association ORDER BY association_id",
+        "SELECT * FROM context_space_association_head ORDER BY context_id, association_id",
+        "SELECT * FROM context_space_association_conflict ORDER BY context_id",
+        "SELECT * FROM candidate_confirmation ORDER BY confirmation_id",
+        "SELECT * FROM candidate_confirmation_conflict ORDER BY candidate_id",
         "SELECT * FROM evidence ORDER BY evidence_id",
         "SELECT * FROM scope ORDER BY revision_id, dimension, value",
         "SELECT * FROM semantic_conflict ORDER BY conflict_id",

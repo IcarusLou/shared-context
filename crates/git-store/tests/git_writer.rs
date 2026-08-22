@@ -11,9 +11,11 @@ use std::{
 };
 
 use sctx_event_schema::{
-    Applicability, ArtifactKind, ArtifactLocator, CandidateId, ContextId, ContextKind,
-    ContextRevisionDraft, EngineeringReferenceDraft, Event, EventId, EvidenceSnapshotDraft,
-    EvidenceType, IntentSnapshot, ReferenceRelation, RepoRelativePath, RepositoryId, RevisionId,
+    Applicability, ArtifactKind, ArtifactLocator, CandidateConfirmationCausalRefs,
+    CandidateConfirmationDraft, CandidateId, ContextId, ContextKind, ContextRevisionDraft,
+    ContextSpaceAssociationDraft, ContextSpaceAssociationOrigin, EngineeringReferenceDraft, Event,
+    EventId, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, OptionalCandidateEdits,
+    PublicationId, ReferenceRelation, RepoRelativePath, RepositoryId, RevisionId, SpaceId,
     SubmissionId, TaskId, TaskSessionId, WorkEpisodeId, WorkEpisodeRef,
 };
 use sctx_git_store::{
@@ -278,6 +280,92 @@ fn generic_append_event_rejects_candidate_submission_bypass() {
         .unwrap_err();
     assert!(error.message().contains("Candidate submission service"));
     assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), before);
+}
+
+#[test]
+fn generic_append_rejects_candidate_confirmation_and_candidate_origin_association() {
+    let fixture = Fixture::new();
+    let before = fixture.git(&["rev-list", "--count", "HEAD"]);
+    let candidate_id = CandidateId::new();
+    let association = Event::candidate_space_association_changed(
+        ContextSpaceAssociationDraft {
+            context_id: ContextId::new(),
+            primary_space_id: SpaceId::new(),
+            related_space_ids: Vec::new(),
+            previous_association_ids: Vec::new(),
+            origin: ContextSpaceAssociationOrigin::CandidateConfirmation { candidate_id },
+        },
+        "bat_00000000-0000-4000-8000-000000000821",
+        None,
+    )
+    .unwrap();
+    let staged_association = association.clone();
+    let association_id = match association.payload() {
+        sctx_event_schema::EventPayload::ContextSpaceAssociationChanged { association } => {
+            association.association_id
+        }
+        _ => unreachable!(),
+    };
+    let error = fixture
+        .store
+        .append_event(AppendRequest::event(association))
+        .unwrap_err();
+    assert!(error.message().contains("atomic confirmation service"));
+
+    let confirmation = Event::candidate_confirmed(
+        CandidateConfirmationDraft {
+            candidate_id,
+            submission_id: SubmissionId::new(),
+            source_episode: WorkEpisodeRef {
+                episode_id: WorkEpisodeId::new(),
+                task_session_id: TaskSessionId::new(),
+                task_id: TaskId::new(),
+            },
+            result_context_id: ContextId::new(),
+            result_revision_id: RevisionId::new(),
+            primary_space_id: SpaceId::new(),
+            related_space_ids: Vec::new(),
+            space_association_id: association_id,
+            publication_id: PublicationId::new(),
+            created_space_id: None,
+            edits: OptionalCandidateEdits::default(),
+            final_content_hash: format!("sha256:{}", "0".repeat(64)),
+            causal_refs: CandidateConfirmationCausalRefs {
+                space_created_event_id: None,
+                context_revision_event_id: EventId::new(),
+                space_association_event_id: EventId::new(),
+                publication_event_id: EventId::new(),
+            },
+        },
+        "bat_00000000-0000-4000-8000-000000000821",
+        None,
+    )
+    .unwrap();
+    let staged_confirmation = confirmation.clone();
+    let error = fixture
+        .store
+        .append_event(AppendRequest::event(confirmation))
+        .unwrap_err();
+    assert!(error.message().contains("atomic confirmation service"));
+    assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), before);
+
+    let staged = Fixture::new();
+    stage_raw_event(
+        &staged,
+        "candidate-origin-association",
+        &serde_json::to_vec(&staged_association).unwrap(),
+    );
+    let error = staged.store.validate_staged().unwrap_err();
+    assert!(error.message().contains("atomic confirmation service"));
+
+    let staged = Fixture::new();
+    stage_raw_event(
+        &staged,
+        "candidate-confirmed",
+        &serde_json::to_vec(&staged_confirmation).unwrap(),
+    );
+    let error = staged.store.validate_staged().unwrap_err();
+    assert!(error.message().contains("atomic confirmation service"));
 }
 
 fn stage_raw_event(fixture: &Fixture, label: &str, bytes: &[u8]) {

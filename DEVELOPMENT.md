@@ -22,13 +22,14 @@
 - Hook 只写 owned/diagnostic Capture 和原有非定位 TestOutcome，不 open/advance/ingest Episode 或伪造 Claim；PreCompact/TurnStop 只提示工作 Agent 显式调用 `task_checkpoint`，自动聚合属于 #163。
 - Candidate Builder 读取 exact closed Episode、final/相关 Checkpoint 和一个 Index snapshot，逐 Claim 组装最小充分 Evidence；Runtime 在任何 Git 写入前固化 BuildId/SubmissionId/content hash，#117 返回的 CandidateId/EventId 再原子回填。无 Claim、Unknown-only 或 Evidence 不充分均为零 Candidate；无 kind hint固定降级 Discovery。
 - #159 Candidate Analysis 是 Runtime derived review state：Search 以完整草稿等值、显式 related Context、exact Artifact Graph、topic/scope 与 BM25 多路 RRF 生成 typed assessment，明确区分 exact duplicate、supports、revises、potential contradiction、unresolved related 和 novel。Space 推荐融合 assessment target、source Task association 与 Space Intent；冲突 Intent/unsafe Context 不自动成为 Primary，无安全 Primary 时给出完整 system-suggested Space Intent。分析不写 Git、不进入 Search/Hook/自动注入；`candidate analyze` 可重跑并替换当前结果。
+- #161 已定义 CandidateConfirmation 与 ContextSpaceAssociation 的严格 Event/Reducer/Index 事实：确认引用 exact Candidate/source、Primary/Related、结果 Revision、initial Association、causal Publish Event 和 final content hash；后续 Withdraw 不反向抹除历史确认。Association 独立成可修订 DAG，多 Head 与重复 Confirmation 都显式 conflict；当前嵌套 Context owner 与 Search ranking 不变。
 - 无 Space 的 `ContextCandidate` 领域类型已经存在，Builder Candidate 仍不可自动注入。
 - `candidate_create` 是当前 Candidate 写入主入口；CLI 与 MCP 要求调用方提供稳定 `submission_id` 与精确 ActiveTask/Intent/closed WorkEpisode 所有权，服务端生成 Candidate/Event 身份和路径，且未确认 Candidate 不参与自动注入。
 - 既有 Git Writer、事件校验、SQLite 投影、Context 生命周期、CLI/MCP、Agent Adapter、安装器和 NPM 分发能力继续作为 M1 的基础设施。
 
 以下能力**尚未实现**，不得在代码、测试报告或评审中宣称已经具备：
 
-- **M4 完整链路：未实现** — #117 已完成 Candidate submission 幂等门禁，#156/#157/#158/#159/#160 已完成可验证 WorkEpisode/Capture、显式 AgentCheckpoint、确定性 Candidate Builder、非权威分析/Space 推荐与 Task-local Review list/get/discard；自动聚合（#163）和 Candidate confirm（#162）尚未实现。
+- **M4 完整链路：未实现** — #117 已完成 Candidate submission 幂等门禁，#156/#157/#158/#159/#160/#161 已完成可验证 WorkEpisode/Capture、显式 AgentCheckpoint、确定性 Candidate Builder、非权威分析/Space 推荐、Task-local Review 与确认事实模型；自动聚合（#163）和 Candidate confirm Writer/MCP 执行（#162）尚未实现。
 - **团队同步：未实现** — Repository Catalog 是单机显式配置，不是团队事实或知识 Store。
 
 Cursor 与 Codex 都通过显式 `task_intent_update` 建立权威 Task；Prompt Hook 只提供能力提示。已有 ActiveTask 可通过只读 `task_context` 再取 Pack。

@@ -4,6 +4,7 @@
 
 use std::fmt;
 
+mod confirmation;
 mod engineering;
 mod episode;
 mod ids;
@@ -11,6 +12,12 @@ mod model;
 mod reducer;
 mod task;
 
+pub use confirmation::{
+    CandidateConfirmation, CandidateConfirmationCausalRefs, CandidateConfirmationDraft,
+    CandidateConfirmationRequest, CandidatePrimarySelection, ContextSpaceAssociation,
+    ContextSpaceAssociationDraft, ContextSpaceAssociationOrigin, OptionalCandidateEdits,
+    TopicKeyEdit, context_revision_as_draft, context_revision_content_hash,
+};
 pub use engineering::{
     ArtifactAssociationKind, ArtifactKey, ArtifactKind, ArtifactLocator, ArtifactRelationKind,
     ArtifactResolution, ContextArtifactAssociation, ContextRelation, ContextRelationKind,
@@ -30,10 +37,11 @@ pub use episode::{
     WorkObservation, WorkSourceRef, candidate_submission_content_hash,
 };
 pub use ids::{
-    AgentCheckpointId, CandidateBuildId, CandidateId, CaptureId, CheckpointClaimId, ConflictId,
-    ContextId, EventId, EvidenceId, ExternalSessionId, IdParseError, PublicationId, ReferenceId,
-    RepositoryId, ResolutionId, ReviewId, RevisionId, SignalId, SpaceId, SpaceRecommendationId,
-    SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId, WorkEpisodeId, WorkObservationId,
+    AgentCheckpointId, CandidateBuildId, CandidateId, CaptureId, CheckpointClaimId, ConfirmationId,
+    ConflictId, ContextId, EventId, EvidenceId, ExternalSessionId, IdParseError, PublicationId,
+    ReferenceId, RepositoryId, ResolutionId, ReviewId, RevisionId, SignalId, SpaceAssociationId,
+    SpaceId, SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId,
+    WorkEpisodeId, WorkObservationId,
 };
 pub use model::{
     Applicability, ConflictParticipant, ConflictResolution, ConflictResolutionDraft,
@@ -43,12 +51,14 @@ pub use model::{
     SemanticConflict, SemanticConflictDraft,
 };
 pub use reducer::{
-    AutoInjectionBlocker, AutoInjectionEligibility, CandidateProjection,
-    CandidateSubmissionConflict, CandidateSubmissionProjection, ContextGovernanceStatus,
-    ContextProjection, ContextSpaceProjection, DomainProjection, EngineeringReferenceProjection,
-    IntentProjection, ReducerDiagnostic, ReducerDiagnosticCode, ReducerEvent, ReducerPayload,
-    ReviewSummary, RevisionLifecycle, RevisionProjection, SemanticConflictCandidate,
-    SemanticConflictOpenReason, SemanticConflictProjection, SemanticConflictStatus, reduce,
+    AutoInjectionBlocker, AutoInjectionEligibility, CandidateConfirmationConflict,
+    CandidateConfirmationProjection, CandidateProjection, CandidateSubmissionConflict,
+    CandidateSubmissionProjection, ContextGovernanceStatus, ContextProjection,
+    ContextSpaceAssociationConflict, ContextSpaceAssociationProjection, ContextSpaceProjection,
+    DomainProjection, EngineeringReferenceProjection, IntentProjection, ReducerDiagnostic,
+    ReducerDiagnosticCode, ReducerEvent, ReducerPayload, ReviewSummary, RevisionLifecycle,
+    RevisionProjection, SemanticConflictCandidate, SemanticConflictOpenReason,
+    SemanticConflictProjection, SemanticConflictStatus, reduce,
 };
 pub use task::{
     ExternalSessionLocator, ExternalSessionSnapshot, TaskIntent, TaskIntentDraft,

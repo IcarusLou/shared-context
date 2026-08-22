@@ -116,6 +116,14 @@ _Avoid_: Context fact, Candidate approval, Git Candidate browser
 The human disposition of a CandidateReview: Pending remains available for a decision, Discarded records an explicit decision not to retain it, Expired is a terminal local-retention tombstone, and Confirmed is reserved for a later knowledge-governance transition.
 _Avoid_: analysis status, readiness status, publication status
 
+**CandidateConfirmation**:
+An immutable fact that one unconflicted Candidate produced one exact published Context revision, its Primary and Related Space organization, and the causal facts that created them. It records the final edited content without turning the Candidate itself into injectable knowledge.
+_Avoid_: CandidateReview decision, Candidate activation, Candidate mutation
+
+**ContextSpaceAssociation**:
+A causally revisable knowledge-organization snapshot linking one Context to exactly one Primary ContextSpace and zero or more Related ContextSpaces. It is independent of ContextRelation and does not by itself relocate the Context’s current nested owner.
+_Avoid_: TaskSpaceAssociation, ContextRelation, Workspace binding
+
 **TaskSpaceAssociation**:
 A derived, explainable relevance between one Task and one ContextSpace. A Task may have no associations or multiple associations, and their ordering may change as new signals arrive.
 _Avoid_: Active Space, default Space

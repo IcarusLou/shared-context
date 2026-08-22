@@ -11,11 +11,13 @@
     "event_type": {
       "enum": [
         "context_candidate.created",
+        "candidate.confirmed",
         "space.created",
         "space.intent_revision_added",
         "context.revision_added",
         "context.reviewed",
         "context.publication_changed",
+        "context.space_association_changed",
         "engineering_reference.recorded",
         "semantic_conflict.opened",
         "semantic_conflict.resolution_added"
@@ -39,6 +41,13 @@
         "candidate": { "$ref": "#/$defs/context_candidate" }
       },
       "required": ["candidate"]
+    },
+    {
+      "properties": {
+        "event_type": { "const": "candidate.confirmed" },
+        "confirmation": { "$ref": "#/$defs/candidate_confirmation" }
+      },
+      "required": ["confirmation"]
     },
     {
       "properties": {
@@ -82,6 +91,13 @@
         "publication": { "$ref": "#/$defs/publication" }
       },
       "required": ["space_id", "context_id", "publication"]
+    },
+    {
+      "properties": {
+        "event_type": { "const": "context.space_association_changed" },
+        "association": { "$ref": "#/$defs/context_space_association" }
+      },
+      "required": ["association"]
     },
     {
       "properties": {
@@ -134,6 +150,14 @@
     "candidate_id": {
       "type": "string",
       "pattern": "^cnd_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "confirmation_id": {
+      "type": "string",
+      "pattern": "^cfm_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "space_association_id": {
+      "type": "string",
+      "pattern": "^asc_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
     },
     "context_id": {
       "type": "string",
@@ -492,6 +516,174 @@
           "additionalProperties": false
         },
         "content": { "$ref": "#/$defs/context_revision_draft" }
+      },
+      "additionalProperties": false
+    },
+    "optional_candidate_edits": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "enum": ["decision", "contract", "issue", "risk", "validation", "discovery", "progress"]
+        },
+        "topic_key": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["action", "value"],
+              "properties": {
+                "action": { "const": "set" },
+                "value": { "$ref": "#/$defs/non_empty_string" }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": ["action"],
+              "properties": { "action": { "const": "clear" } },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "statement": { "$ref": "#/$defs/non_empty_string" },
+        "rationale": { "$ref": "#/$defs/non_empty_string" },
+        "applicability": { "$ref": "#/$defs/applicability" },
+        "assumptions": { "$ref": "#/$defs/string_list" },
+        "recheck_when": { "$ref": "#/$defs/string_list" },
+        "relations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/context_relation" }
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/evidence_draft" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "context_space_association_origin": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "candidate_id"],
+          "properties": {
+            "kind": { "const": "candidate_confirmation" },
+            "candidate_id": { "$ref": "#/$defs/candidate_id" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": { "kind": { "const": "correction" } },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "context_space_association": {
+      "type": "object",
+      "required": [
+        "association_id",
+        "context_id",
+        "primary_space_id",
+        "related_space_ids",
+        "previous_association_ids",
+        "origin"
+      ],
+      "properties": {
+        "association_id": { "$ref": "#/$defs/space_association_id" },
+        "context_id": { "$ref": "#/$defs/context_id" },
+        "primary_space_id": { "$ref": "#/$defs/space_id" },
+        "related_space_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/space_id" }
+        },
+        "previous_association_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/space_association_id" }
+        },
+        "origin": { "$ref": "#/$defs/context_space_association_origin" }
+      },
+      "additionalProperties": false
+    },
+    "candidate_confirmation_causal_refs": {
+      "type": "object",
+      "required": [
+        "space_created_event_id",
+        "context_revision_event_id",
+        "space_association_event_id",
+        "publication_event_id"
+      ],
+      "properties": {
+        "space_created_event_id": {
+          "anyOf": [
+            { "$ref": "#/$defs/event_id" },
+            { "type": "null" }
+          ]
+        },
+        "context_revision_event_id": { "$ref": "#/$defs/event_id" },
+        "space_association_event_id": { "$ref": "#/$defs/event_id" },
+        "publication_event_id": { "$ref": "#/$defs/event_id" }
+      },
+      "additionalProperties": false
+    },
+    "candidate_confirmation": {
+      "type": "object",
+      "required": [
+        "confirmation_id",
+        "candidate_id",
+        "submission_id",
+        "source_episode",
+        "result_context_id",
+        "result_revision_id",
+        "primary_space_id",
+        "related_space_ids",
+        "space_association_id",
+        "publication_id",
+        "created_space_id",
+        "edits",
+        "final_content_hash",
+        "causal_refs"
+      ],
+      "properties": {
+        "confirmation_id": { "$ref": "#/$defs/confirmation_id" },
+        "candidate_id": { "$ref": "#/$defs/candidate_id" },
+        "submission_id": { "$ref": "#/$defs/submission_id" },
+        "source_episode": {
+          "type": "object",
+          "required": ["episode_id", "task_session_id", "task_id"],
+          "properties": {
+            "episode_id": { "$ref": "#/$defs/work_episode_id" },
+            "task_session_id": { "$ref": "#/$defs/task_session_id" },
+            "task_id": { "$ref": "#/$defs/task_id" }
+          },
+          "additionalProperties": false
+        },
+        "result_context_id": { "$ref": "#/$defs/context_id" },
+        "result_revision_id": { "$ref": "#/$defs/revision_id" },
+        "primary_space_id": { "$ref": "#/$defs/space_id" },
+        "related_space_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/space_id" }
+        },
+        "space_association_id": { "$ref": "#/$defs/space_association_id" },
+        "publication_id": { "$ref": "#/$defs/publication_id" },
+        "created_space_id": {
+          "anyOf": [
+            { "$ref": "#/$defs/space_id" },
+            { "type": "null" }
+          ]
+        },
+        "edits": { "$ref": "#/$defs/optional_candidate_edits" },
+        "final_content_hash": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "causal_refs": { "$ref": "#/$defs/candidate_confirmation_causal_refs" }
       },
       "additionalProperties": false
     },

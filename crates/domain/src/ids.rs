@@ -200,6 +200,16 @@ opaque_id!(
     "sub_",
     "Opaque identity of one Candidate creation operation."
 );
+opaque_id!(
+    ConfirmationId,
+    "cfm_",
+    "Opaque identity of one Candidate confirmation fact."
+);
+opaque_id!(
+    SpaceAssociationId,
+    "asc_",
+    "Opaque identity of one Context-to-Space association snapshot."
+);
 opaque_id!(ContextId, "ctx_", "Opaque identity of a `ContextItem`.");
 opaque_id!(
     RevisionId,
@@ -236,11 +246,11 @@ mod tests {
     use uuid::{Variant, Version};
 
     use super::{
-        AgentCheckpointId, CandidateBuildId, CandidateId, CaptureId, CheckpointClaimId, ConflictId,
-        ContextId, EventId, EvidenceId, ExternalSessionId, PublicationId, ReferenceId,
-        RepositoryId, ResolutionId, ReviewId, RevisionId, SignalId, SpaceId, SpaceRecommendationId,
-        SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId, WorkEpisodeId,
-        WorkObservationId,
+        AgentCheckpointId, CandidateBuildId, CandidateId, CaptureId, CheckpointClaimId,
+        ConfirmationId, ConflictId, ContextId, EventId, EvidenceId, ExternalSessionId,
+        PublicationId, ReferenceId, RepositoryId, ResolutionId, ReviewId, RevisionId, SignalId,
+        SpaceAssociationId, SpaceId, SpaceRecommendationId, SubmissionId, TaskId,
+        TaskIntentRevisionId, TaskSessionId, WorkEpisodeId, WorkObservationId,
     };
 
     #[test]
@@ -293,6 +303,8 @@ mod tests {
         assert_generated_id!(SpaceRecommendationId::new(), "rec_");
         assert_generated_id!(CandidateId::new(), "cnd_");
         assert_generated_id!(SubmissionId::new(), "sub_");
+        assert_generated_id!(ConfirmationId::new(), "cfm_");
+        assert_generated_id!(SpaceAssociationId::new(), "asc_");
         assert_generated_id!(ContextId::new(), "ctx_");
         assert_generated_id!(RevisionId::new(), "rev_");
         assert_generated_id!(EventId::new(), "evt_");

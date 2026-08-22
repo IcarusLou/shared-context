@@ -333,9 +333,37 @@ fn projection_slice(input: &BuildInput, space_id: &str) -> serde_json::Value {
         .values()
         .filter(|reference| reference.space_id.to_string() == space_id)
         .collect();
+    let candidate_confirmations: Vec<_> = input
+        .projection
+        .candidate_confirmations
+        .values()
+        .filter(|confirmation| {
+            confirmation.confirmation.primary_space_id.to_string() == space_id
+                || confirmation
+                    .confirmation
+                    .related_space_ids
+                    .iter()
+                    .any(|related| related.to_string() == space_id)
+        })
+        .collect();
+    let space_associations: Vec<_> = input
+        .projection
+        .context_space_associations
+        .values()
+        .filter(|association| {
+            association.association.primary_space_id.to_string() == space_id
+                || association
+                    .association
+                    .related_space_ids
+                    .iter()
+                    .any(|related| related.to_string() == space_id)
+        })
+        .collect();
     serde_json::json!({
         "space": space,
         "engineering_references": engineering_references,
+        "candidate_confirmations": candidate_confirmations,
+        "space_associations": space_associations,
         "semantic_conflict_candidates": candidates,
         "semantic_conflicts": conflicts,
     })
@@ -350,6 +378,28 @@ fn event_impact(path: &str, event: &Event) -> EventImpact {
             definitions.insert(identity("candidate", &candidate.candidate_id));
             references.insert(identity("work_episode", &candidate.source_episode_id()));
             None
+        }
+        EventPayload::CandidateConfirmed { confirmation } => {
+            definitions.insert(identity("confirmation", &confirmation.confirmation_id));
+            references.insert(identity("candidate", &confirmation.candidate_id));
+            references.insert(identity("context", &confirmation.result_context_id));
+            references.insert(identity("revision", &confirmation.result_revision_id));
+            references.insert(identity("association", &confirmation.space_association_id));
+            references.insert(identity("publication", &confirmation.publication_id));
+            references.insert(identity("space", &confirmation.primary_space_id));
+            add_references(&mut references, "space", &confirmation.related_space_ids);
+            for causal_event in [
+                confirmation.causal_refs.space_created_event_id,
+                Some(confirmation.causal_refs.context_revision_event_id),
+                Some(confirmation.causal_refs.space_association_event_id),
+                Some(confirmation.causal_refs.publication_event_id),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                references.insert(identity("event", &causal_event));
+            }
+            Some(confirmation.primary_space_id)
         }
         EventPayload::SpaceCreated {
             space_id,
@@ -421,6 +471,24 @@ fn event_impact(path: &str, event: &Event) -> EventImpact {
             );
             add_references(&mut references, "event", &publication.review_event_ids);
             Some(*space_id)
+        }
+        EventPayload::ContextSpaceAssociationChanged { association } => {
+            definitions.insert(identity("association", &association.association_id));
+            references.insert(identity("context", &association.context_id));
+            references.insert(identity("space", &association.primary_space_id));
+            add_references(&mut references, "space", &association.related_space_ids);
+            add_references(
+                &mut references,
+                "association",
+                &association.previous_association_ids,
+            );
+            if let sctx_event_schema::ContextSpaceAssociationOrigin::CandidateConfirmation {
+                candidate_id,
+            } = association.origin
+            {
+                references.insert(identity("candidate", &candidate_id));
+            }
+            Some(association.primary_space_id)
         }
         EventPayload::SemanticConflictOpened { space_id, conflict } => {
             references.insert(identity("space", space_id));

@@ -5,15 +5,17 @@ use std::{
 };
 
 use sctx_event_schema::{
-    Annotations, Applicability, ArtifactKind, CandidateId, ConflictParticipant,
-    ConflictResolutionDraft, ConflictResolutionResult, ContextId, ContextKind,
-    ContextRevisionDraft, DiagnosticCode, EngineeringReferenceDraft, Event, EventId, EventPayload,
-    EventType, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot,
-    MAX_CANDIDATE_SUBMISSION_HINT_BYTES, OriginHint, ParsedEvent, PublicationAction,
-    PublicationDraft, PublicationId, ReferenceRelation, RepoRelativePath, RepositoryId,
-    ResolutionOutcome, ReviewDraft, ReviewVerdict, SemanticConflictDraft, SubmissionId, TaskId,
-    TaskSessionId, V1_JSON_SCHEMA, V1_SCHEMA_ID, WorkEpisodeId, WorkEpisodeRef,
-    candidate_submission_hint, parse_event,
+    Annotations, Applicability, ArtifactKind, CandidateConfirmationCausalRefs,
+    CandidateConfirmationDraft, CandidateId, ConflictParticipant, ConflictResolutionDraft,
+    ConflictResolutionResult, ContextId, ContextKind, ContextRevisionDraft,
+    ContextSpaceAssociationDraft, ContextSpaceAssociationOrigin, DiagnosticCode,
+    EngineeringReferenceDraft, Event, EventId, EventPayload, EventType, EvidenceSnapshotDraft,
+    EvidenceType, IntentSnapshot, MAX_CANDIDATE_SUBMISSION_HINT_BYTES, OptionalCandidateEdits,
+    OriginHint, ParsedEvent, PublicationAction, PublicationDraft, PublicationId, ReferenceRelation,
+    RepoRelativePath, RepositoryId, ResolutionOutcome, ReviewDraft, ReviewVerdict,
+    SemanticConflictDraft, SpaceId, SubmissionId, TaskId, TaskSessionId, V1_JSON_SCHEMA,
+    V1_SCHEMA_ID, WorkEpisodeId, WorkEpisodeRef, candidate_submission_hint,
+    context_revision_content_hash, parse_event,
 };
 use serde_json::{Value, json};
 
@@ -117,9 +119,9 @@ fn context_draft() -> ContextRevisionDraft {
 }
 
 #[test]
-fn all_nine_v1_fixtures_round_trip_without_semantic_loss() {
+fn all_eleven_v1_fixtures_round_trip_without_semantic_loss() {
     let paths = json_files(&fixture_root().join("events/v1/valid"));
-    assert_eq!(paths.len(), 9);
+    assert_eq!(paths.len(), 11);
 
     let mut event_types = Vec::new();
     for path in paths {
@@ -141,9 +143,11 @@ fn all_nine_v1_fixtures_round_trip_without_semantic_loss() {
     assert_eq!(
         event_types,
         vec![
+            "candidate.confirmed",
             "context.publication_changed",
             "context.reviewed",
             "context.revision_added",
+            "context.space_association_changed",
             "context_candidate.created",
             "engineering_reference.recorded",
             "semantic_conflict.opened",
@@ -249,6 +253,10 @@ fn generation_api_assigns_new_ids_and_all_generated_events_parse() {
         None,
     )
     .unwrap();
+    let candidate_fact = match candidate.payload() {
+        EventPayload::ContextCandidateCreated { candidate } => candidate.clone(),
+        _ => panic!("wrong payload"),
+    };
     let revision_added =
         Event::context_revision_added(space_id, context_draft(), annotations).unwrap();
     let (context_id, revision_id) = match revision_added.payload() {
@@ -302,6 +310,50 @@ fn generation_api_assigns_new_ids_and_all_generated_events_parse() {
         EventPayload::ContextPublicationChanged { publication, .. } => publication.publication_id,
         _ => panic!("wrong payload"),
     };
+    let related_space_id = SpaceId::new();
+    let association = Event::candidate_space_association_changed(
+        ContextSpaceAssociationDraft {
+            context_id,
+            primary_space_id: space_id,
+            related_space_ids: vec![related_space_id],
+            previous_association_ids: Vec::new(),
+            origin: ContextSpaceAssociationOrigin::CandidateConfirmation {
+                candidate_id: candidate_fact.candidate_id,
+            },
+        },
+        "bat_00000000-0000-4000-8000-000000000903",
+        None,
+    )
+    .unwrap();
+    let association_id = match association.payload() {
+        EventPayload::ContextSpaceAssociationChanged { association } => association.association_id,
+        _ => panic!("wrong payload"),
+    };
+    let confirmation = Event::candidate_confirmed(
+        CandidateConfirmationDraft {
+            candidate_id: candidate_fact.candidate_id,
+            submission_id: candidate_fact.submission_id,
+            source_episode: candidate_fact.source_episode,
+            result_context_id: context_id,
+            result_revision_id: revision_id,
+            primary_space_id: space_id,
+            related_space_ids: vec![related_space_id],
+            space_association_id: association_id,
+            publication_id,
+            created_space_id: None,
+            edits: OptionalCandidateEdits::default(),
+            final_content_hash: context_revision_content_hash(&candidate_fact.content),
+            causal_refs: CandidateConfirmationCausalRefs {
+                space_created_event_id: None,
+                context_revision_event_id: revision_added.event_id(),
+                space_association_event_id: association.event_id(),
+                publication_event_id: publication.event_id(),
+            },
+        },
+        "bat_00000000-0000-4000-8000-000000000903",
+        None,
+    )
+    .unwrap();
     let other_context = ContextId::new();
     let other_revision = sctx_event_schema::RevisionId::new();
     let other_publication = PublicationId::new();
@@ -356,9 +408,11 @@ fn generation_api_assigns_new_ids_and_all_generated_events_parse() {
 
     let events = [
         candidate,
+        confirmation,
         created,
         intent_added,
         revision_added,
+        association,
         engineering_reference,
         reviewed,
         publication,
@@ -471,6 +525,44 @@ fn reference_hash_excludes_generated_identity_but_includes_observation_semantics
     assert_ne!(
         baseline.semantic_hash(),
         parse_known(&serde_json::to_vec(&variant).unwrap()).semantic_hash()
+    );
+}
+
+#[test]
+fn confirmation_hashes_exclude_generated_identity_but_keep_causal_semantics() {
+    for (file, entity, id_field, replacement) in [
+        (
+            "candidate-confirmed.json",
+            "confirmation",
+            "confirmation_id",
+            "cfm_99999999-9999-4999-8999-999999999901",
+        ),
+        (
+            "context-space-association-changed.json",
+            "association",
+            "association_id",
+            "asc_99999999-9999-4999-8999-999999999901",
+        ),
+    ] {
+        let input = fs::read(fixture_root().join("events/v1/valid").join(file)).unwrap();
+        let baseline = parse_known(&input);
+        let mut identity_variant: Value = serde_json::from_slice(&input).unwrap();
+        identity_variant["event_id"] = json!("evt_99999999-9999-4999-8999-999999999901");
+        identity_variant[entity][id_field] = json!(replacement);
+        assert_eq!(
+            baseline.semantic_hash(),
+            parse_known(&serde_json::to_vec(&identity_variant).unwrap()).semantic_hash()
+        );
+    }
+
+    let input = fs::read(fixture_root().join("events/v1/valid/candidate-confirmed.json")).unwrap();
+    let baseline = parse_known(&input);
+    let mut causal_variant: Value = serde_json::from_slice(&input).unwrap();
+    causal_variant["confirmation"]["causal_refs"]["publication_event_id"] =
+        json!("evt_99999999-9999-4999-8999-999999999902");
+    assert_ne!(
+        baseline.semantic_hash(),
+        parse_known(&serde_json::to_vec(&causal_variant).unwrap()).semantic_hash()
     );
 }
 

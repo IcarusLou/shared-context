@@ -1,6 +1,7 @@
 use rusqlite::{OptionalExtension, Transaction, params};
 use sctx_domain::{
-    ContextGovernanceStatus, PublicationAction, RevisionLifecycle, SemanticConflictStatus,
+    ContextGovernanceStatus, ContextSpaceAssociationOrigin, PublicationAction, RevisionLifecycle,
+    SemanticConflictStatus,
 };
 use sctx_event_schema::{EvidenceType, ReviewVerdict};
 
@@ -12,7 +13,7 @@ use crate::{
 
 pub(crate) const NEXT_PREFIX: &str = "_next_";
 
-const TABLES: [&str; 23] = [
+const TABLES: [&str; 28] = [
     "meta",
     "source_file",
     "context_candidate",
@@ -28,6 +29,11 @@ const TABLES: [&str; 23] = [
     "review",
     "publication",
     "publication_head",
+    "context_space_association",
+    "context_space_association_head",
+    "context_space_association_conflict",
+    "candidate_confirmation",
+    "candidate_confirmation_conflict",
     "evidence",
     "scope",
     "semantic_conflict",
@@ -247,6 +253,57 @@ CREATE TABLE {prefix}publication_head (
     publication_id TEXT NOT NULL REFERENCES {prefix}publication(publication_id),
     PRIMARY KEY (context_id, publication_id)
 ) WITHOUT ROWID;
+CREATE TABLE {prefix}context_space_association (
+    association_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL UNIQUE,
+    context_id TEXT NOT NULL REFERENCES {prefix}context_item(context_id),
+    primary_space_id TEXT NOT NULL REFERENCES {prefix}space_projection(space_id),
+    related_space_ids_json TEXT NOT NULL,
+    previous_association_ids_json TEXT NOT NULL,
+    origin TEXT NOT NULL CHECK (origin IN ('candidate_confirmation', 'correction')),
+    origin_candidate_id TEXT REFERENCES {prefix}context_candidate(candidate_id),
+    projection_json TEXT NOT NULL,
+    CHECK (
+        (origin = 'candidate_confirmation' AND origin_candidate_id IS NOT NULL) OR
+        (origin = 'correction' AND origin_candidate_id IS NULL)
+    )
+) WITHOUT ROWID;
+CREATE TABLE {prefix}context_space_association_head (
+    context_id TEXT NOT NULL REFERENCES {prefix}context_item(context_id),
+    association_id TEXT NOT NULL REFERENCES {prefix}context_space_association(association_id),
+    PRIMARY KEY (context_id, association_id)
+) WITHOUT ROWID;
+CREATE TABLE {prefix}context_space_association_conflict (
+    context_id TEXT PRIMARY KEY REFERENCES {prefix}context_item(context_id),
+    head_ids_json TEXT NOT NULL,
+    projection_json TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE {prefix}candidate_confirmation (
+    confirmation_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL UNIQUE,
+    candidate_id TEXT NOT NULL UNIQUE REFERENCES {prefix}context_candidate(candidate_id),
+    submission_id TEXT NOT NULL,
+    source_episode_id TEXT NOT NULL,
+    source_task_session_id TEXT NOT NULL,
+    source_task_id TEXT NOT NULL,
+    result_context_id TEXT NOT NULL REFERENCES {prefix}context_item(context_id),
+    result_revision_id TEXT NOT NULL REFERENCES {prefix}context_revision(revision_id),
+    primary_space_id TEXT NOT NULL REFERENCES {prefix}space_projection(space_id),
+    related_space_ids_json TEXT NOT NULL,
+    space_association_id TEXT NOT NULL REFERENCES {prefix}context_space_association(association_id),
+    publication_id TEXT NOT NULL REFERENCES {prefix}publication(publication_id),
+    created_space_id TEXT REFERENCES {prefix}space_projection(space_id),
+    edits_json TEXT NOT NULL,
+    final_content_hash TEXT NOT NULL,
+    causal_refs_json TEXT NOT NULL,
+    projection_json TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE {prefix}candidate_confirmation_conflict (
+    candidate_id TEXT PRIMARY KEY,
+    confirmation_ids_json TEXT NOT NULL,
+    event_ids_json TEXT NOT NULL,
+    projection_json TEXT NOT NULL
+) WITHOUT ROWID;
 CREATE TABLE {prefix}evidence (
     evidence_id TEXT PRIMARY KEY,
     revision_id TEXT NOT NULL REFERENCES {prefix}context_revision(revision_id),
@@ -357,6 +414,12 @@ fn create_indexes(transaction: &Transaction<'_>) -> crate::Result<()> {
                  ON conflict(context_id, kind, status, conflict_key);
              CREATE INDEX publication_head_context_idx
                  ON publication_head(context_id, publication_id);
+             CREATE INDEX context_space_association_context_idx
+                 ON context_space_association(context_id, association_id);
+             CREATE INDEX context_space_association_primary_idx
+                 ON context_space_association(primary_space_id, context_id, association_id);
+             CREATE INDEX candidate_confirmation_result_idx
+                 ON candidate_confirmation(result_context_id, result_revision_id, confirmation_id);
              CREATE INDEX context_candidate_source_idx
                  ON context_candidate(source_episode_id, candidate_id);
              CREATE INDEX candidate_submission_candidate_idx
@@ -829,6 +892,104 @@ fn populate(
         }
     }
 
+    for (association_id, projection) in &input.projection.context_space_associations {
+        let (origin, origin_candidate_id) = match projection.association.origin {
+            ContextSpaceAssociationOrigin::CandidateConfirmation { candidate_id } => {
+                ("candidate_confirmation", Some(candidate_id.to_string()))
+            }
+            ContextSpaceAssociationOrigin::Correction => ("correction", None),
+        };
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO {prefix}context_space_association(association_id, event_id, context_id, primary_space_id, related_space_ids_json, previous_association_ids_json, origin, origin_candidate_id, projection_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+                ),
+                params![
+                    association_id.to_string(),
+                    projection.event_id.to_string(),
+                    projection.association.context_id.to_string(),
+                    projection.association.primary_space_id.to_string(),
+                    json(&projection.association.related_space_ids)?,
+                    json(&projection.association.previous_association_ids)?,
+                    origin,
+                    origin_candidate_id,
+                    json(projection)?,
+                ],
+            )
+            .map_err(sql_error("write Context Space Association projection"))?;
+    }
+    for (context_id, head_ids) in &input.projection.context_space_association_heads {
+        for association_id in head_ids {
+            transaction
+                .execute(
+                    &format!(
+                        "INSERT INTO {prefix}context_space_association_head(context_id, association_id) VALUES (?1, ?2)"
+                    ),
+                    params![context_id.to_string(), association_id.to_string()],
+                )
+                .map_err(sql_error("write Context Space Association head"))?;
+        }
+    }
+    for (context_id, conflict) in &input.projection.context_space_association_conflicts {
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO {prefix}context_space_association_conflict(context_id, head_ids_json, projection_json) VALUES (?1, ?2, ?3)"
+                ),
+                params![
+                    context_id.to_string(),
+                    json(&conflict.head_ids)?,
+                    json(conflict)?,
+                ],
+            )
+            .map_err(sql_error("write Context Space Association conflict"))?;
+    }
+    for (confirmation_id, projection) in &input.projection.candidate_confirmations {
+        let confirmation = &projection.confirmation;
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO {prefix}candidate_confirmation(confirmation_id, event_id, candidate_id, submission_id, source_episode_id, source_task_session_id, source_task_id, result_context_id, result_revision_id, primary_space_id, related_space_ids_json, space_association_id, publication_id, created_space_id, edits_json, final_content_hash, causal_refs_json, projection_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
+                ),
+                params![
+                    confirmation_id.to_string(),
+                    projection.event_id.to_string(),
+                    confirmation.candidate_id.to_string(),
+                    confirmation.submission_id.to_string(),
+                    confirmation.source_episode.episode_id.to_string(),
+                    confirmation.source_episode.task_session_id.to_string(),
+                    confirmation.source_episode.task_id.to_string(),
+                    confirmation.result_context_id.to_string(),
+                    confirmation.result_revision_id.to_string(),
+                    confirmation.primary_space_id.to_string(),
+                    json(&confirmation.related_space_ids)?,
+                    confirmation.space_association_id.to_string(),
+                    confirmation.publication_id.to_string(),
+                    confirmation.created_space_id.map(|id| id.to_string()),
+                    json(&confirmation.edits)?,
+                    confirmation.final_content_hash,
+                    json(&confirmation.causal_refs)?,
+                    json(projection)?,
+                ],
+            )
+            .map_err(sql_error("write Candidate Confirmation projection"))?;
+    }
+    for (candidate_id, conflict) in &input.projection.candidate_confirmation_conflicts {
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO {prefix}candidate_confirmation_conflict(candidate_id, confirmation_ids_json, event_ids_json, projection_json) VALUES (?1, ?2, ?3, ?4)"
+                ),
+                params![
+                    candidate_id.to_string(),
+                    json(&conflict.confirmation_ids)?,
+                    json(&conflict.event_ids)?,
+                    json(conflict)?,
+                ],
+            )
+            .map_err(sql_error("write Candidate Confirmation conflict"))?;
+    }
+
     for (reference_id, projection) in &input.projection.engineering_references {
         let reference = &projection.reference;
         transaction
@@ -977,6 +1138,11 @@ pub(crate) fn replace_projection_incremental(
         .execute_batch(
             "DELETE FROM source_file;
              INSERT INTO source_file SELECT * FROM _next_source_file;
+             DELETE FROM candidate_confirmation_conflict;
+             DELETE FROM candidate_confirmation;
+             DELETE FROM context_space_association_conflict;
+             DELETE FROM context_space_association_head;
+             DELETE FROM context_space_association;
              DELETE FROM candidate_submission;
              DELETE FROM context_candidate;
              INSERT INTO context_candidate SELECT * FROM _next_context_candidate;
@@ -1058,6 +1224,16 @@ pub(crate) fn replace_projection_incremental(
                  WHERE conflict.space_id IN (SELECT space_id FROM _affected_space);
              INSERT INTO conflict SELECT * FROM _next_conflict
                  WHERE space_id IN (SELECT space_id FROM _affected_space);
+
+             INSERT INTO context_space_association
+                 SELECT * FROM _next_context_space_association;
+             INSERT INTO context_space_association_head
+                 SELECT * FROM _next_context_space_association_head;
+             INSERT INTO context_space_association_conflict
+                 SELECT * FROM _next_context_space_association_conflict;
+             INSERT INTO candidate_confirmation SELECT * FROM _next_candidate_confirmation;
+             INSERT INTO candidate_confirmation_conflict
+                 SELECT * FROM _next_candidate_confirmation_conflict;
 
              DELETE FROM meta;
              INSERT INTO meta SELECT * FROM _next_meta;",

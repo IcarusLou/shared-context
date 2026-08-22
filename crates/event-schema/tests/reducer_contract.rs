@@ -2,11 +2,16 @@ use std::{fs, path::Path, str::FromStr};
 
 use proptest::prelude::*;
 use sctx_event_schema::{
-    ArtifactKind, ArtifactLocator, AutoInjectionBlocker, ConflictId, ContextGovernanceStatus,
-    ContextId, EngineeringReferenceDraft, Event, EventPayload, ReducerDiagnosticCode, ReducerEvent,
-    ReducerPayload, ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionId, ReviewSummary,
-    RevisionId, RevisionLifecycle, SemanticConflictOpenReason, SemanticConflictStatus, SpaceId,
-    reduce,
+    Applicability, ArtifactKind, ArtifactLocator, AutoInjectionBlocker,
+    CandidateConfirmationCausalRefs, CandidateConfirmationDraft, CandidateId, ConflictId,
+    ContextGovernanceStatus, ContextId, ContextKind, ContextRevisionDraft,
+    ContextSpaceAssociationDraft, ContextSpaceAssociationOrigin, EngineeringReferenceDraft, Event,
+    EventPayload, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, OptionalCandidateEdits,
+    PublicationAction, PublicationDraft, ReducerDiagnosticCode, ReducerEvent, ReducerPayload,
+    ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionId, ReviewSummary, RevisionId,
+    RevisionLifecycle, SemanticConflictOpenReason, SemanticConflictStatus, SpaceAssociationId,
+    SpaceId, SubmissionId, TaskId, TaskSessionId, TopicKeyEdit, WorkEpisodeId, WorkEpisodeRef,
+    context_revision_content_hash, reduce,
 };
 use serde_json::Value;
 
@@ -91,6 +96,374 @@ fn all_reducer_events() -> Vec<ReducerEvent> {
     .into_iter()
     .flat_map(reducer_events)
     .collect()
+}
+
+fn confirmation_intent(title: &str) -> IntentSnapshot {
+    IntentSnapshot {
+        title: title.to_owned(),
+        problem: "Candidate knowledge needs governance".to_owned(),
+        desired_outcome: "Publish one exact Context revision".to_owned(),
+        in_scope: vec!["Candidate confirmation".to_owned()],
+        out_of_scope: Vec::new(),
+        acceptance_conditions: vec!["The result is causally complete".to_owned()],
+        domain_terms: Vec::new(),
+    }
+}
+
+fn confirmation_content(statement: &str) -> ContextRevisionDraft {
+    ContextRevisionDraft {
+        kind: ContextKind::Decision,
+        topic_key: Some("confirmation/fact".to_owned()),
+        statement: statement.to_owned(),
+        rationale: "The Candidate carries self-contained Evidence".to_owned(),
+        applicability: Applicability::default(),
+        assumptions: Vec::new(),
+        recheck_when: Vec::new(),
+        relations: Vec::new(),
+        evidence: vec![EvidenceSnapshotDraft {
+            kind: EvidenceType::ExperimentRecord,
+            supports: "The confirmation fixture passed".to_owned(),
+            content: serde_json::json!({"actual": "passed"}),
+            interpretation: "The draft may be published".to_owned(),
+            limitations: Vec::new(),
+        }],
+    }
+}
+
+struct ConfirmationFixture {
+    events: Vec<Event>,
+    candidate_id: CandidateId,
+    context_id: ContextId,
+    revision_id: RevisionId,
+    primary_space_id: SpaceId,
+    association_id: SpaceAssociationId,
+    confirmation_id: sctx_event_schema::ConfirmationId,
+}
+
+#[allow(clippy::too_many_lines)]
+fn confirmation_fixture(new_primary: bool, withdraw_after: bool) -> ConfirmationFixture {
+    let primary = Event::space_created(confirmation_intent("Primary"), None).unwrap();
+    let primary_space_id = match primary.payload() {
+        EventPayload::SpaceCreated { space_id, .. } => *space_id,
+        _ => unreachable!(),
+    };
+    let related_first = Event::space_created(confirmation_intent("Related one"), None).unwrap();
+    let related_second = Event::space_created(confirmation_intent("Related two"), None).unwrap();
+    let related_space_ids = [&related_first, &related_second]
+        .map(|event| match event.payload() {
+            EventPayload::SpaceCreated { space_id, .. } => *space_id,
+            _ => unreachable!(),
+        })
+        .to_vec();
+    let source = WorkEpisodeRef {
+        episode_id: WorkEpisodeId::new(),
+        task_session_id: TaskSessionId::new(),
+        task_id: TaskId::new(),
+    };
+    let candidate = Event::context_candidate_created(
+        SubmissionId::new(),
+        source,
+        confirmation_content("Candidate statement"),
+        "bat_00000000-0000-4000-8000-000000000801",
+        None,
+    )
+    .unwrap();
+    let candidate_fact = match candidate.payload() {
+        EventPayload::ContextCandidateCreated { candidate } => candidate.clone(),
+        _ => unreachable!(),
+    };
+    let edits = OptionalCandidateEdits {
+        statement: Some("Confirmed edited statement".to_owned()),
+        topic_key: Some(TopicKeyEdit::Clear),
+        ..OptionalCandidateEdits::default()
+    };
+    let final_content = edits.apply(&candidate_fact.content).unwrap();
+    let revision =
+        Event::context_revision_added(primary_space_id, final_content.clone(), None).unwrap();
+    let (context_id, revision_id) = match revision.payload() {
+        EventPayload::ContextRevisionAdded {
+            context_id,
+            revision,
+            ..
+        } => (*context_id, revision.revision_id),
+        _ => unreachable!(),
+    };
+    let association = Event::candidate_space_association_changed(
+        ContextSpaceAssociationDraft {
+            context_id,
+            primary_space_id,
+            related_space_ids: related_space_ids.clone(),
+            previous_association_ids: Vec::new(),
+            origin: ContextSpaceAssociationOrigin::CandidateConfirmation {
+                candidate_id: candidate_fact.candidate_id,
+            },
+        },
+        "bat_00000000-0000-4000-8000-000000000802",
+        None,
+    )
+    .unwrap();
+    let association_id = match association.payload() {
+        EventPayload::ContextSpaceAssociationChanged { association } => association.association_id,
+        _ => unreachable!(),
+    };
+    let publication = Event::publication_changed(
+        primary_space_id,
+        context_id,
+        PublicationDraft {
+            previous_publication_ids: Vec::new(),
+            action: PublicationAction::Publish,
+            revision_id,
+            review_event_ids: Vec::new(),
+        },
+        None,
+    )
+    .unwrap();
+    let publication_id = match publication.payload() {
+        EventPayload::ContextPublicationChanged { publication, .. } => publication.publication_id,
+        _ => unreachable!(),
+    };
+    let confirmation = Event::candidate_confirmed(
+        CandidateConfirmationDraft {
+            candidate_id: candidate_fact.candidate_id,
+            submission_id: candidate_fact.submission_id,
+            source_episode: candidate_fact.source_episode,
+            result_context_id: context_id,
+            result_revision_id: revision_id,
+            primary_space_id,
+            related_space_ids,
+            space_association_id: association_id,
+            publication_id,
+            created_space_id: new_primary.then_some(primary_space_id),
+            edits,
+            final_content_hash: context_revision_content_hash(&final_content),
+            causal_refs: CandidateConfirmationCausalRefs {
+                space_created_event_id: new_primary.then_some(primary.event_id()),
+                context_revision_event_id: revision.event_id(),
+                space_association_event_id: association.event_id(),
+                publication_event_id: publication.event_id(),
+            },
+        },
+        "bat_00000000-0000-4000-8000-000000000802",
+        None,
+    )
+    .unwrap();
+    let confirmation_id = match confirmation.payload() {
+        EventPayload::CandidateConfirmed { confirmation } => confirmation.confirmation_id,
+        _ => unreachable!(),
+    };
+    let mut events = vec![
+        primary,
+        related_first,
+        related_second,
+        candidate,
+        revision,
+        association,
+        publication,
+        confirmation,
+    ];
+    if withdraw_after {
+        events.push(
+            Event::publication_changed(
+                primary_space_id,
+                context_id,
+                PublicationDraft {
+                    previous_publication_ids: vec![publication_id],
+                    action: PublicationAction::Withdraw,
+                    revision_id,
+                    review_event_ids: Vec::new(),
+                },
+                None,
+            )
+            .unwrap(),
+        );
+    }
+    ConfirmationFixture {
+        events,
+        candidate_id: candidate_fact.candidate_id,
+        context_id,
+        revision_id,
+        primary_space_id,
+        association_id,
+        confirmation_id,
+    }
+}
+
+#[test]
+fn candidate_confirmation_existing_new_edits_related_permutation_and_withdraw_history() {
+    for new_primary in [false, true] {
+        let fixture = confirmation_fixture(new_primary, true);
+        let reducer_events = fixture
+            .events
+            .iter()
+            .map(|event| event.reducer_event().unwrap())
+            .collect::<Vec<_>>();
+        let projection = reduce(&reducer_events);
+        assert!(
+            projection
+                .candidate_confirmations
+                .contains_key(&fixture.confirmation_id)
+        );
+        assert!(
+            projection
+                .context_space_associations
+                .contains_key(&fixture.association_id)
+        );
+        assert_eq!(
+            projection.context_space_association_heads[&fixture.context_id],
+            std::collections::BTreeSet::from([fixture.association_id])
+        );
+        assert!(
+            !projection
+                .context_space_association_conflicts
+                .contains_key(&fixture.context_id)
+        );
+        let context = &projection.spaces[&fixture.primary_space_id].contexts[&fixture.context_id];
+        let revision = &context.revisions[&fixture.revision_id].revision;
+        assert_eq!(revision.statement, "Confirmed edited statement");
+        assert_eq!(revision.topic_key, None);
+        assert!(matches!(
+            context.governance,
+            ContextGovernanceStatus::Deprecated { .. }
+        ));
+        assert!(
+            !projection.candidates[&fixture.candidate_id]
+                .candidate
+                .is_auto_injection_eligible()
+        );
+
+        let mut reversed = reducer_events;
+        reversed.reverse();
+        assert_eq!(
+            serde_json::to_vec(&reduce(&reversed)).unwrap(),
+            serde_json::to_vec(&projection).unwrap(),
+            "Event order must not affect Candidate Confirmation facts"
+        );
+    }
+}
+
+#[test]
+fn duplicate_confirmations_and_association_heads_are_explicit_conflicts() {
+    let mut fixture = confirmation_fixture(false, false);
+    let confirmation = fixture
+        .events
+        .iter()
+        .find_map(|event| match event.payload() {
+            EventPayload::CandidateConfirmed { confirmation } => Some(confirmation.clone()),
+            _ => None,
+        })
+        .unwrap();
+    fixture.events.push(
+        Event::candidate_confirmed(
+            CandidateConfirmationDraft {
+                candidate_id: confirmation.candidate_id,
+                submission_id: confirmation.submission_id,
+                source_episode: confirmation.source_episode,
+                result_context_id: confirmation.result_context_id,
+                result_revision_id: confirmation.result_revision_id,
+                primary_space_id: confirmation.primary_space_id,
+                related_space_ids: confirmation.related_space_ids.clone(),
+                space_association_id: confirmation.space_association_id,
+                publication_id: confirmation.publication_id,
+                created_space_id: confirmation.created_space_id,
+                edits: confirmation.edits.clone(),
+                final_content_hash: confirmation.final_content_hash.clone(),
+                causal_refs: confirmation.causal_refs,
+            },
+            "bat_00000000-0000-4000-8000-000000000803",
+            None,
+        )
+        .unwrap(),
+    );
+    let duplicated = reduce(
+        &fixture
+            .events
+            .iter()
+            .map(|event| event.reducer_event().unwrap())
+            .collect::<Vec<_>>(),
+    );
+    assert!(duplicated.candidate_confirmations.is_empty());
+    assert!(
+        duplicated
+            .candidate_confirmation_conflicts
+            .contains_key(&fixture.candidate_id)
+    );
+    assert!(duplicated.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == ReducerDiagnosticCode::CandidateConfirmationConflict
+    }));
+
+    let mut association_fixture = confirmation_fixture(false, false);
+    let extra_space =
+        Event::space_created(confirmation_intent("Correction related"), None).unwrap();
+    let extra_space_id = match extra_space.payload() {
+        EventPayload::SpaceCreated { space_id, .. } => *space_id,
+        _ => unreachable!(),
+    };
+    association_fixture.events.push(extra_space);
+    for related_space_ids in [Vec::new(), vec![extra_space_id]] {
+        association_fixture.events.push(
+            Event::context_space_association_changed(
+                ContextSpaceAssociationDraft {
+                    context_id: association_fixture.context_id,
+                    primary_space_id: association_fixture.primary_space_id,
+                    related_space_ids,
+                    previous_association_ids: vec![association_fixture.association_id],
+                    origin: ContextSpaceAssociationOrigin::Correction,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+    }
+    let association_projection = reduce(
+        &association_fixture
+            .events
+            .iter()
+            .map(|event| event.reducer_event().unwrap())
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        association_projection.context_space_association_heads[&association_fixture.context_id]
+            .len(),
+        2
+    );
+    assert!(
+        association_projection
+            .context_space_association_conflicts
+            .contains_key(&association_fixture.context_id)
+    );
+}
+
+#[test]
+fn dangling_mismatched_hash_and_non_publish_confirmation_facts_are_rejected() {
+    let fixture = confirmation_fixture(false, false);
+    let baseline = fixture
+        .events
+        .iter()
+        .map(|event| event.reducer_event().unwrap())
+        .collect::<Vec<_>>();
+    for mutation in 0..4 {
+        let mut events = baseline.clone();
+        for event in &mut events {
+            match &mut event.payload {
+                ReducerPayload::CandidateConfirmed { confirmation } => match mutation {
+                    0 => confirmation.space_association_id = SpaceAssociationId::new(),
+                    1 => confirmation.result_context_id = ContextId::new(),
+                    2 => confirmation.final_content_hash = format!("sha256:{}", "f".repeat(64)),
+                    3 => {}
+                    _ => unreachable!(),
+                },
+                ReducerPayload::ContextPublicationChanged { publication, .. } if mutation == 3 => {
+                    publication.action = PublicationAction::Withdraw;
+                }
+                _ => {}
+            }
+        }
+        let projection = reduce(&events);
+        assert!(projection.candidate_confirmations.is_empty());
+        assert!(projection.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ReducerDiagnosticCode::InvalidCandidateConfirmation
+        }));
+    }
 }
 
 #[test]

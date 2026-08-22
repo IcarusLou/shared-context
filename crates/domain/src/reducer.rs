@@ -3,11 +3,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use crate::{
-    Applicability, CandidateId, ConflictId, ConflictParticipant, ConflictResolution,
-    ContextCandidate, ContextId, ContextKind, ContextRevision, EngineeringReference, EventId,
-    EvidenceId, IntentRevision, Publication, PublicationAction, PublicationId, ReferenceId,
-    ResolutionId, Review, ReviewId, ReviewVerdict, RevisionId, SemanticConflict, SpaceId,
-    SubmissionId, WorkEpisodeRef,
+    Applicability, CandidateConfirmation, CandidateId, ConfirmationId, ConflictId,
+    ConflictParticipant, ConflictResolution, ContextCandidate, ContextId, ContextKind,
+    ContextRevision, ContextSpaceAssociation, ContextSpaceAssociationOrigin, EngineeringReference,
+    EventId, EvidenceId, IntentRevision, Publication, PublicationAction, PublicationId,
+    ReferenceId, ResolutionId, Review, ReviewId, ReviewVerdict, RevisionId, SemanticConflict,
+    SpaceAssociationId, SpaceId, SubmissionId, WorkEpisodeRef, context_revision_as_draft,
+    context_revision_content_hash,
 };
 
 /// Authoritative event input understood by the V1 domain reducer.
@@ -22,6 +24,9 @@ pub struct ReducerEvent {
 pub enum ReducerPayload {
     ContextCandidateCreated {
         candidate: ContextCandidate,
+    },
+    CandidateConfirmed {
+        confirmation: Box<CandidateConfirmation>,
     },
     SpaceCreated {
         space_id: SpaceId,
@@ -46,6 +51,9 @@ pub enum ReducerPayload {
         context_id: ContextId,
         publication: Publication,
     },
+    ContextSpaceAssociationChanged {
+        association: ContextSpaceAssociation,
+    },
     SemanticConflictOpened {
         space_id: SpaceId,
         conflict: SemanticConflict,
@@ -69,6 +77,9 @@ pub enum ReducerDiagnosticCode {
     DuplicateEventId,
     DuplicateCandidateId,
     DuplicateSubmissionId,
+    DuplicateConfirmationId,
+    DuplicateSpaceAssociationId,
+    CandidateConfirmationConflict,
     DuplicateRevisionId,
     DuplicateReviewId,
     DuplicatePublicationId,
@@ -86,6 +97,9 @@ pub enum ReducerDiagnosticCode {
     InvalidReviewReference,
     InvalidPublicationReference,
     PublicationCycle,
+    InvalidSpaceAssociationReference,
+    SpaceAssociationCycle,
+    InvalidCandidateConfirmation,
     InvalidSemanticConflictReference,
     InvalidResolutionReference,
     ResolutionCycle,
@@ -263,6 +277,35 @@ pub struct CandidateSubmissionConflict {
     pub content_hashes: BTreeSet<String>,
 }
 
+/// One valid Candidate confirmation fact and its defining Event.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CandidateConfirmationProjection {
+    pub event_id: EventId,
+    pub confirmation: CandidateConfirmation,
+}
+
+/// Multiple Confirmation Events for one Candidate; no winner is selected.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CandidateConfirmationConflict {
+    pub candidate_id: CandidateId,
+    pub confirmation_ids: BTreeSet<ConfirmationId>,
+    pub event_ids: BTreeSet<EventId>,
+}
+
+/// One valid Context-to-Space association fact and its defining Event.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ContextSpaceAssociationProjection {
+    pub event_id: EventId,
+    pub association: ContextSpaceAssociation,
+}
+
+/// Multiple causal Association Heads for one Context; no winner is selected.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ContextSpaceAssociationConflict {
+    pub context_id: ContextId,
+    pub head_ids: BTreeSet<SpaceAssociationId>,
+}
+
 /// One valid persistent engineering observation and its resolved Context owner.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct EngineeringReferenceProjection {
@@ -279,6 +322,11 @@ pub struct DomainProjection {
     pub candidates: BTreeMap<CandidateId, CandidateProjection>,
     pub candidate_submissions: BTreeMap<SubmissionId, CandidateSubmissionProjection>,
     pub candidate_submission_conflicts: BTreeMap<SubmissionId, CandidateSubmissionConflict>,
+    pub candidate_confirmations: BTreeMap<ConfirmationId, CandidateConfirmationProjection>,
+    pub candidate_confirmation_conflicts: BTreeMap<CandidateId, CandidateConfirmationConflict>,
+    pub context_space_associations: BTreeMap<SpaceAssociationId, ContextSpaceAssociationProjection>,
+    pub context_space_association_heads: BTreeMap<ContextId, BTreeSet<SpaceAssociationId>>,
+    pub context_space_association_conflicts: BTreeMap<ContextId, ContextSpaceAssociationConflict>,
     pub spaces: BTreeMap<SpaceId, ContextSpaceProjection>,
     pub engineering_references: BTreeMap<ReferenceId, EngineeringReferenceProjection>,
     pub semantic_conflict_candidates: Vec<SemanticConflictCandidate>,
@@ -298,6 +346,18 @@ struct IntentNode {
 struct CandidateNode {
     event_id: EventId,
     candidate: ContextCandidate,
+}
+
+#[derive(Clone)]
+struct CandidateConfirmationNode {
+    event_id: EventId,
+    confirmation: CandidateConfirmation,
+}
+
+#[derive(Clone)]
+struct ContextSpaceAssociationNode {
+    event_id: EventId,
+    association: ContextSpaceAssociation,
 }
 
 #[derive(Clone)]
@@ -647,6 +707,14 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
     let mut events_by_id: BTreeMap<EventId, Vec<&ReducerEvent>> = BTreeMap::new();
     let mut candidate_definitions: BTreeMap<CandidateId, Vec<CandidateNode>> = BTreeMap::new();
     let mut submission_definitions: BTreeMap<SubmissionId, Vec<CandidateNode>> = BTreeMap::new();
+    let mut confirmation_definitions: BTreeMap<ConfirmationId, Vec<CandidateConfirmationNode>> =
+        BTreeMap::new();
+    let mut confirmations_by_candidate: BTreeMap<CandidateId, Vec<CandidateConfirmationNode>> =
+        BTreeMap::new();
+    let mut association_definitions: BTreeMap<
+        SpaceAssociationId,
+        Vec<ContextSpaceAssociationNode>,
+    > = BTreeMap::new();
     let mut space_creations: BTreeMap<SpaceId, Vec<IntentNode>> = BTreeMap::new();
     let mut intent_definitions: BTreeMap<RevisionId, Vec<IntentNode>> = BTreeMap::new();
     let mut context_definitions: BTreeMap<RevisionId, Vec<ContextNode>> = BTreeMap::new();
@@ -674,6 +742,20 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
                     .push(node.clone());
                 submission_definitions
                     .entry(candidate.submission_id)
+                    .or_default()
+                    .push(node);
+            }
+            ReducerPayload::CandidateConfirmed { confirmation } => {
+                let node = CandidateConfirmationNode {
+                    event_id: event.event_id,
+                    confirmation: confirmation.as_ref().clone(),
+                };
+                confirmation_definitions
+                    .entry(confirmation.confirmation_id)
+                    .or_default()
+                    .push(node.clone());
+                confirmations_by_candidate
+                    .entry(confirmation.candidate_id)
                     .or_default()
                     .push(node);
             }
@@ -770,6 +852,15 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
                         space_id: *space_id,
                         context_id: *context_id,
                         publication: publication.clone(),
+                    });
+            }
+            ReducerPayload::ContextSpaceAssociationChanged { association } => {
+                association_definitions
+                    .entry(association.association_id)
+                    .or_default()
+                    .push(ContextSpaceAssociationNode {
+                        event_id: event.event_id,
+                        association: association.clone(),
                     });
             }
             ReducerPayload::SemanticConflictOpened { space_id, conflict } => {
@@ -873,6 +964,44 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
                 id.to_string(),
                 event_ids(definitions, |node| node.event_id),
                 format!("submission ID {id} has multiple Candidate definitions"),
+            );
+        }
+    }
+    for (id, definitions) in &confirmation_definitions {
+        if definitions.len() > 1 {
+            invalid_event_ids.extend(definitions.iter().map(|node| node.event_id));
+            push_diagnostic(
+                &mut diagnostics,
+                ReducerDiagnosticCode::DuplicateConfirmationId,
+                id.to_string(),
+                event_ids(definitions, |node| node.event_id),
+                format!("confirmation ID {id} has multiple definitions"),
+            );
+        }
+    }
+    for (candidate_id, definitions) in &confirmations_by_candidate {
+        if definitions.len() > 1 {
+            invalid_event_ids.extend(definitions.iter().map(|node| node.event_id));
+            push_diagnostic(
+                &mut diagnostics,
+                ReducerDiagnosticCode::CandidateConfirmationConflict,
+                candidate_id.to_string(),
+                event_ids(definitions, |node| node.event_id),
+                format!(
+                    "candidate {candidate_id} has multiple Confirmation Events; no result is selected"
+                ),
+            );
+        }
+    }
+    for (id, definitions) in &association_definitions {
+        if definitions.len() > 1 {
+            invalid_event_ids.extend(definitions.iter().map(|node| node.event_id));
+            push_diagnostic(
+                &mut diagnostics,
+                ReducerDiagnosticCode::DuplicateSpaceAssociationId,
+                id.to_string(),
+                event_ids(definitions, |node| node.event_id),
+                format!("Space Association ID {id} has multiple definitions"),
             );
         }
     }
@@ -1048,8 +1177,38 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
         .collect();
 
     for event in events {
+        let referenced_spaces = match &event.payload {
+            ReducerPayload::CandidateConfirmed { confirmation } => Some(
+                std::iter::once(confirmation.primary_space_id)
+                    .chain(confirmation.related_space_ids.iter().copied())
+                    .chain(confirmation.created_space_id)
+                    .collect::<BTreeSet<_>>(),
+            ),
+            ReducerPayload::ContextSpaceAssociationChanged { association } => Some(
+                std::iter::once(association.primary_space_id)
+                    .chain(association.related_space_ids.iter().copied())
+                    .collect::<BTreeSet<_>>(),
+            ),
+            _ => None,
+        };
+        if let Some(referenced_spaces) = referenced_spaces {
+            for space_id in referenced_spaces {
+                if !valid_spaces.contains(&space_id) {
+                    push_diagnostic(
+                        &mut diagnostics,
+                        ReducerDiagnosticCode::MissingSpace,
+                        space_id.to_string(),
+                        BTreeSet::from([event.event_id]),
+                        format!("event references missing or quarantined space {space_id}"),
+                    );
+                }
+            }
+            continue;
+        }
         let space_id = match &event.payload {
             ReducerPayload::ContextCandidateCreated { .. }
+            | ReducerPayload::CandidateConfirmed { .. }
+            | ReducerPayload::ContextSpaceAssociationChanged { .. }
             | ReducerPayload::EngineeringReferenceRecorded { .. } => continue,
             ReducerPayload::SpaceCreated { space_id, .. }
             | ReducerPayload::SpaceIntentRevisionAdded { space_id, .. }
@@ -1292,8 +1451,122 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
         );
     }
 
+    let mut context_space_associations = BTreeMap::new();
+    let mut context_space_association_heads = BTreeMap::new();
+    let mut context_space_association_conflicts = BTreeMap::new();
+    let association_context_ids = association_definitions
+        .values()
+        .flatten()
+        .map(|node| node.association.context_id)
+        .collect::<BTreeSet<_>>();
+    for context_id in association_context_ids {
+        let owner = context_owners
+            .get(&context_id)
+            .filter(|owners| owners.len() == 1)
+            .and_then(BTreeSet::first)
+            .copied();
+        let candidates = association_definitions
+            .iter()
+            .filter(|(_, definitions)| definitions.len() == 1)
+            .map(|(id, definitions)| (*id, definitions[0].clone()))
+            .filter(|(_, node)| {
+                node.association.context_id == context_id
+                    && !invalid_event_ids.contains(&node.event_id)
+            })
+            .filter(|(_, node)| {
+                let spaces_exist = valid_spaces.contains(&node.association.primary_space_id)
+                    && node
+                        .association
+                        .related_space_ids
+                        .iter()
+                        .all(|space_id| valid_spaces.contains(space_id));
+                let context_exists = owner.is_some_and(|space_id| {
+                    valid_contexts.contains_key(&(space_id, context_id))
+                });
+                let initial_owner_matches = !matches!(
+                    node.association.origin,
+                    ContextSpaceAssociationOrigin::CandidateConfirmation { .. }
+                ) || owner == Some(node.association.primary_space_id);
+                let origin_candidate_exists = match node.association.origin {
+                    ContextSpaceAssociationOrigin::CandidateConfirmation { candidate_id } => {
+                        candidate_definitions
+                            .get(&candidate_id)
+                            .is_some_and(|definitions| {
+                                definitions.len() == 1
+                                    && !invalid_event_ids.contains(&definitions[0].event_id)
+                                    && submission_definitions
+                                        .get(&definitions[0].candidate.submission_id)
+                                        .is_some_and(|submissions| submissions.len() == 1)
+                            })
+                    }
+                    ContextSpaceAssociationOrigin::Correction => true,
+                };
+                if !spaces_exist
+                    || !context_exists
+                    || !initial_owner_matches
+                    || !origin_candidate_exists
+                {
+                    push_diagnostic(
+                        &mut diagnostics,
+                        ReducerDiagnosticCode::InvalidSpaceAssociationReference,
+                        node.association.association_id.to_string(),
+                        BTreeSet::from([node.event_id]),
+                        format!(
+                            "Space Association {} does not reference valid Spaces and an owned Context",
+                            node.association.association_id
+                        ),
+                    );
+                }
+                spaces_exist && context_exists && initial_owner_matches && origin_candidate_exists
+            })
+            .collect::<BTreeMap<_, _>>();
+        let dag = candidates
+            .iter()
+            .map(|(id, node)| {
+                (
+                    *id,
+                    DagNode {
+                        event_id: node.event_id,
+                        parents: node.association.previous_association_ids.clone(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let valid = validate_dag(
+            &dag,
+            ReducerDiagnosticCode::InvalidSpaceAssociationReference,
+            ReducerDiagnosticCode::SpaceAssociationCycle,
+            "Context Space Association",
+            &mut diagnostics,
+        );
+        let current_heads = heads(&dag, &valid);
+        for (association_id, node) in candidates {
+            if valid.contains(&association_id) {
+                context_space_associations.insert(
+                    association_id,
+                    ContextSpaceAssociationProjection {
+                        event_id: node.event_id,
+                        association: node.association,
+                    },
+                );
+            }
+        }
+        if current_heads.len() > 1 {
+            context_space_association_conflicts.insert(
+                context_id,
+                ContextSpaceAssociationConflict {
+                    context_id,
+                    head_ids: current_heads.clone(),
+                },
+            );
+        }
+        if !current_heads.is_empty() {
+            context_space_association_heads.insert(context_id, current_heads);
+        }
+    }
+
     let mut spaces = BTreeMap::new();
-    for space_id in valid_spaces {
+    for space_id in valid_spaces.clone() {
         let intent_nodes = valid_intents.remove(&space_id).unwrap_or_default();
         let intent = IntentProjection {
             revisions: intent_nodes
@@ -1437,6 +1710,156 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
                 contexts,
             },
         );
+    }
+
+    let candidate_confirmation_conflicts = confirmations_by_candidate
+        .iter()
+        .filter(|(_, definitions)| definitions.len() > 1)
+        .map(|(candidate_id, definitions)| {
+            (
+                *candidate_id,
+                CandidateConfirmationConflict {
+                    candidate_id: *candidate_id,
+                    confirmation_ids: definitions
+                        .iter()
+                        .map(|node| node.confirmation.confirmation_id)
+                        .collect(),
+                    event_ids: definitions.iter().map(|node| node.event_id).collect(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let valid_candidate_nodes = candidate_definitions
+        .iter()
+        .filter(|(_, definitions)| definitions.len() == 1)
+        .filter_map(|(candidate_id, definitions)| {
+            let node = &definitions[0];
+            let submission_is_unique = submission_definitions
+                .get(&node.candidate.submission_id)
+                .is_some_and(|submissions| {
+                    submissions.len() == 1 && submissions[0].candidate.candidate_id == *candidate_id
+                });
+            (!invalid_event_ids.contains(&node.event_id) && submission_is_unique)
+                .then_some((*candidate_id, node))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut candidate_confirmations = BTreeMap::new();
+    for (candidate_id, definitions) in &confirmations_by_candidate {
+        if definitions.len() != 1 {
+            continue;
+        }
+        let node = &definitions[0];
+        if invalid_event_ids.contains(&node.event_id) {
+            continue;
+        }
+        let confirmation = &node.confirmation;
+        let candidate = valid_candidate_nodes
+            .get(candidate_id)
+            .map(|node| &node.candidate);
+        let association = context_space_associations.get(&confirmation.space_association_id);
+        let result_context = spaces
+            .get(&confirmation.primary_space_id)
+            .and_then(|space| space.contexts.get(&confirmation.result_context_id));
+        let result_revision = result_context
+            .and_then(|context| context.revisions.get(&confirmation.result_revision_id));
+        let publication = result_context
+            .and_then(|context| context.publications.get(&confirmation.publication_id));
+        let candidate_matches = candidate.is_some_and(|candidate| {
+            candidate.submission_id == confirmation.submission_id
+                && candidate.source_episode == confirmation.source_episode
+        });
+        let related = confirmation
+            .related_space_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let association_matches = association.is_some_and(|projection| {
+            projection.event_id == confirmation.causal_refs.space_association_event_id
+                && projection.association.context_id == confirmation.result_context_id
+                && projection.association.primary_space_id == confirmation.primary_space_id
+                && projection
+                    .association
+                    .related_space_ids
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    == related
+                && matches!(
+                    projection.association.origin,
+                    ContextSpaceAssociationOrigin::CandidateConfirmation {
+                        candidate_id: origin_candidate
+                    } if origin_candidate == *candidate_id
+                )
+        });
+        let revision_event_matches = context_definitions
+            .get(&confirmation.result_revision_id)
+            .is_some_and(|definitions| {
+                definitions.len() == 1
+                    && definitions[0].event_id == confirmation.causal_refs.context_revision_event_id
+                    && definitions[0].space_id == confirmation.primary_space_id
+                    && definitions[0].context_id == confirmation.result_context_id
+            });
+        let publication_event_matches = publication_definitions
+            .get(&confirmation.publication_id)
+            .is_some_and(|definitions| {
+                definitions.len() == 1
+                    && definitions[0].event_id == confirmation.causal_refs.publication_event_id
+                    && definitions[0].space_id == confirmation.primary_space_id
+                    && definitions[0].context_id == confirmation.result_context_id
+            });
+        let causal_publication_matches = publication.is_some_and(|publication| {
+            publication.action == PublicationAction::Publish
+                && publication.revision_id == confirmation.result_revision_id
+        });
+        let created_space_matches = match confirmation.created_space_id {
+            Some(space_id) => space_creations.get(&space_id).is_some_and(|definitions| {
+                definitions.len() == 1
+                    && Some(definitions[0].event_id)
+                        == confirmation.causal_refs.space_created_event_id
+            }),
+            None => confirmation.causal_refs.space_created_event_id.is_none(),
+        };
+        let content_matches = candidate
+            .and_then(|candidate| confirmation.edits.apply(&candidate.content).ok())
+            .zip(result_revision)
+            .is_some_and(|(edited, revision)| {
+                let result = context_revision_as_draft(&revision.revision);
+                context_revision_content_hash(&edited) == confirmation.final_content_hash
+                    && context_revision_content_hash(&result) == confirmation.final_content_hash
+            });
+        let spaces_match = valid_spaces.contains(&confirmation.primary_space_id)
+            && related
+                .iter()
+                .all(|space_id| valid_spaces.contains(space_id));
+        if candidate_matches
+            && association_matches
+            && result_revision.is_some()
+            && revision_event_matches
+            && causal_publication_matches
+            && publication_event_matches
+            && created_space_matches
+            && content_matches
+            && spaces_match
+        {
+            candidate_confirmations.insert(
+                confirmation.confirmation_id,
+                CandidateConfirmationProjection {
+                    event_id: node.event_id,
+                    confirmation: confirmation.clone(),
+                },
+            );
+        } else {
+            push_diagnostic(
+                &mut diagnostics,
+                ReducerDiagnosticCode::InvalidCandidateConfirmation,
+                confirmation.confirmation_id.to_string(),
+                BTreeSet::from([node.event_id]),
+                format!(
+                    "Candidate Confirmation {} does not match its Candidate, causal association, revision, publication, Space, or final content",
+                    confirmation.confirmation_id
+                ),
+            );
+        }
     }
 
     let mut engineering_references = BTreeMap::new();
@@ -1813,6 +2236,11 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
         candidates,
         candidate_submissions,
         candidate_submission_conflicts,
+        candidate_confirmations,
+        candidate_confirmation_conflicts,
+        context_space_associations,
+        context_space_association_heads,
+        context_space_association_conflicts,
         spaces,
         engineering_references,
         semantic_conflict_candidates,

@@ -13,20 +13,23 @@ use sha2::{Digest, Sha256};
 
 pub use sctx_domain::{
     Applicability, ArtifactKind, ArtifactLocator, AutoInjectionBlocker, AutoInjectionEligibility,
-    CandidateId, CandidateProjection, ConflictId, ConflictParticipant, ConflictResolution,
-    ConflictResolutionDraft, ConflictResolutionResult, ContextCandidate, ContextGovernanceStatus,
-    ContextId, ContextKind, ContextProjection, ContextRelation, ContextRelationKind,
-    ContextRevision, ContextRevisionDraft, ContextSpaceProjection, DomainProjection,
-    EngineeringReference, EngineeringReferenceDraft, Error, ErrorKind, EventId, EvidenceId,
-    EvidenceSnapshot, EvidenceSnapshotDraft, EvidenceType, IdParseError, IntentProjection,
-    IntentRevision, IntentSnapshot, Publication, PublicationAction, PublicationDraft,
-    PublicationId, ReducerDiagnostic, ReducerDiagnosticCode, ReducerEvent, ReducerPayload,
-    ReferenceId, ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionId,
-    ResolutionOutcome, Result, Review, ReviewDraft, ReviewId, ReviewSummary, ReviewVerdict,
-    RevisionId, RevisionLifecycle, RevisionProjection, SemanticConflict, SemanticConflictCandidate,
-    SemanticConflictDraft, SemanticConflictOpenReason, SemanticConflictProjection,
-    SemanticConflictStatus, SpaceId, SubmissionId, TaskId, TaskSessionId, WorkEpisodeId,
-    WorkEpisodeRef, reduce,
+    CandidateConfirmation, CandidateConfirmationCausalRefs, CandidateConfirmationDraft,
+    CandidateId, CandidateProjection, ConfirmationId, ConflictId, ConflictParticipant,
+    ConflictResolution, ConflictResolutionDraft, ConflictResolutionResult, ContextCandidate,
+    ContextGovernanceStatus, ContextId, ContextKind, ContextProjection, ContextRelation,
+    ContextRelationKind, ContextRevision, ContextRevisionDraft, ContextSpaceAssociation,
+    ContextSpaceAssociationDraft, ContextSpaceAssociationOrigin, ContextSpaceProjection,
+    DomainProjection, EngineeringReference, EngineeringReferenceDraft, Error, ErrorKind, EventId,
+    EvidenceId, EvidenceSnapshot, EvidenceSnapshotDraft, EvidenceType, IdParseError,
+    IntentProjection, IntentRevision, IntentSnapshot, OptionalCandidateEdits, Publication,
+    PublicationAction, PublicationDraft, PublicationId, ReducerDiagnostic, ReducerDiagnosticCode,
+    ReducerEvent, ReducerPayload, ReferenceId, ReferenceRelation, RepoRelativePath, RepositoryId,
+    ResolutionId, ResolutionOutcome, Result, Review, ReviewDraft, ReviewId, ReviewSummary,
+    ReviewVerdict, RevisionId, RevisionLifecycle, RevisionProjection, SemanticConflict,
+    SemanticConflictCandidate, SemanticConflictDraft, SemanticConflictOpenReason,
+    SemanticConflictProjection, SemanticConflictStatus, SpaceAssociationId, SpaceId, SubmissionId,
+    TaskId, TaskSessionId, TopicKeyEdit, WorkEpisodeId, WorkEpisodeRef,
+    context_revision_content_hash, reduce,
 };
 
 /// Immutable identifier for the bundled V1 JSON Schema.
@@ -102,6 +105,8 @@ impl SchemaVersion {
 pub enum EventType {
     #[serde(rename = "context_candidate.created")]
     ContextCandidateCreated,
+    #[serde(rename = "candidate.confirmed")]
+    CandidateConfirmed,
     #[serde(rename = "space.created")]
     SpaceCreated,
     #[serde(rename = "space.intent_revision_added")]
@@ -112,6 +117,8 @@ pub enum EventType {
     ContextReviewed,
     #[serde(rename = "context.publication_changed")]
     ContextPublicationChanged,
+    #[serde(rename = "context.space_association_changed")]
+    ContextSpaceAssociationChanged,
     #[serde(rename = "semantic_conflict.opened")]
     SemanticConflictOpened,
     #[serde(rename = "semantic_conflict.resolution_added")]
@@ -126,11 +133,13 @@ impl EventType {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ContextCandidateCreated => "context_candidate.created",
+            Self::CandidateConfirmed => "candidate.confirmed",
             Self::SpaceCreated => "space.created",
             Self::SpaceIntentRevisionAdded => "space.intent_revision_added",
             Self::ContextRevisionAdded => "context.revision_added",
             Self::ContextReviewed => "context.reviewed",
             Self::ContextPublicationChanged => "context.publication_changed",
+            Self::ContextSpaceAssociationChanged => "context.space_association_changed",
             Self::SemanticConflictOpened => "semantic_conflict.opened",
             Self::SemanticConflictResolutionAdded => "semantic_conflict.resolution_added",
             Self::EngineeringReferenceRecorded => "engineering_reference.recorded",
@@ -164,6 +173,10 @@ pub struct Annotations {
 pub enum EventPayload {
     #[serde(rename = "context_candidate.created")]
     ContextCandidateCreated { candidate: ContextCandidate },
+    #[serde(rename = "candidate.confirmed")]
+    CandidateConfirmed {
+        confirmation: Box<CandidateConfirmation>,
+    },
     #[serde(rename = "space.created")]
     SpaceCreated {
         space_id: SpaceId,
@@ -192,6 +205,10 @@ pub enum EventPayload {
         context_id: ContextId,
         publication: Publication,
     },
+    #[serde(rename = "context.space_association_changed")]
+    ContextSpaceAssociationChanged {
+        association: ContextSpaceAssociation,
+    },
     #[serde(rename = "semantic_conflict.opened")]
     SemanticConflictOpened {
         space_id: SpaceId,
@@ -217,11 +234,15 @@ impl EventPayload {
     pub const fn event_type(&self) -> EventType {
         match self {
             Self::ContextCandidateCreated { .. } => EventType::ContextCandidateCreated,
+            Self::CandidateConfirmed { .. } => EventType::CandidateConfirmed,
             Self::SpaceCreated { .. } => EventType::SpaceCreated,
             Self::SpaceIntentRevisionAdded { .. } => EventType::SpaceIntentRevisionAdded,
             Self::ContextRevisionAdded { .. } => EventType::ContextRevisionAdded,
             Self::ContextReviewed { .. } => EventType::ContextReviewed,
             Self::ContextPublicationChanged { .. } => EventType::ContextPublicationChanged,
+            Self::ContextSpaceAssociationChanged { .. } => {
+                EventType::ContextSpaceAssociationChanged
+            }
             Self::SemanticConflictOpened { .. } => EventType::SemanticConflictOpened,
             Self::SemanticConflictResolutionAdded { .. } => {
                 EventType::SemanticConflictResolutionAdded
@@ -233,6 +254,7 @@ impl EventPayload {
     fn validate(&self) -> Result<()> {
         match self {
             Self::ContextCandidateCreated { candidate } => candidate.validate(),
+            Self::CandidateConfirmed { confirmation } => confirmation.validate(),
             Self::SpaceCreated {
                 intent_revision, ..
             } => {
@@ -256,6 +278,7 @@ impl EventPayload {
             Self::ContextRevisionAdded { revision, .. } => revision.validate(),
             Self::ContextReviewed { review, .. } => review.validate(),
             Self::ContextPublicationChanged { publication, .. } => publication.validate(),
+            Self::ContextSpaceAssociationChanged { association } => association.validate(),
             Self::SemanticConflictOpened { conflict, .. } => conflict.validate(),
             Self::SemanticConflictResolutionAdded { resolution, .. } => resolution.validate(),
             Self::EngineeringReferenceRecorded { reference, .. } => reference.validate(),
@@ -297,13 +320,13 @@ impl<'de> Deserialize<'de> for Event {
             payload: wire.payload,
             annotations: wire.annotations,
         };
-        if event.event_type() == EventType::ContextCandidateCreated
+        if event.requires_writer_batch()
             && event
                 .writer_batch_id()
                 .is_none_or(|value| !valid_batch_id(value))
         {
             return Err(de::Error::custom(
-                "context_candidate.created requires valid writer_batch_id annotation",
+                "Candidate-origin Event requires valid writer_batch_id annotation",
             ));
         }
         event.validate().map_err(de::Error::custom)?;
@@ -364,6 +387,76 @@ impl Event {
         )
     }
 
+    /// Records an initial Candidate-origin Context-to-Space organization snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Rejects correction origin, invalid membership/causality, or a non-canonical Writer batch.
+    pub fn candidate_space_association_changed(
+        draft: ContextSpaceAssociationDraft,
+        writer_batch_id: &str,
+        annotations: Option<Annotations>,
+    ) -> Result<Self> {
+        if !matches!(
+            draft.origin,
+            ContextSpaceAssociationOrigin::CandidateConfirmation { .. }
+        ) {
+            return Err(invalid(
+                "candidate Space Association Event requires CandidateConfirmation origin",
+            ));
+        }
+        let annotations = annotations_with_writer_batch(writer_batch_id, annotations)?;
+        Self::generated(
+            EventPayload::ContextSpaceAssociationChanged {
+                association: ContextSpaceAssociation::from_draft(draft)?,
+            },
+            Some(annotations),
+        )
+    }
+
+    /// Records a future causal correction to Context-to-Space organization.
+    ///
+    /// This constructor is domain-only; authorization is a later application boundary.
+    ///
+    /// # Errors
+    ///
+    /// Rejects Candidate origin or invalid membership/causality.
+    pub fn context_space_association_changed(
+        draft: ContextSpaceAssociationDraft,
+        annotations: Option<Annotations>,
+    ) -> Result<Self> {
+        if draft.origin != ContextSpaceAssociationOrigin::Correction {
+            return Err(invalid(
+                "ordinary Space Association change requires correction origin",
+            ));
+        }
+        Self::generated(
+            EventPayload::ContextSpaceAssociationChanged {
+                association: ContextSpaceAssociation::from_draft(draft)?,
+            },
+            annotations,
+        )
+    }
+
+    /// Records the immutable fact closure of one Candidate confirmation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid local Confirmation content or a non-canonical Writer batch.
+    pub fn candidate_confirmed(
+        draft: CandidateConfirmationDraft,
+        writer_batch_id: &str,
+        annotations: Option<Annotations>,
+    ) -> Result<Self> {
+        let annotations = annotations_with_writer_batch(writer_batch_id, annotations)?;
+        Self::generated(
+            EventPayload::CandidateConfirmed {
+                confirmation: Box::new(CandidateConfirmation::from_draft(draft)?),
+            },
+            Some(annotations),
+        )
+    }
+
     /// Server-owned Writer batch provenance, if present and well-typed.
     #[must_use]
     pub fn writer_batch_id(&self) -> Option<&str> {
@@ -372,6 +465,17 @@ impl Event {
             .additional
             .get("writer_batch_id")?
             .as_str()
+    }
+
+    fn requires_writer_batch(&self) -> bool {
+        matches!(
+            self.payload,
+            EventPayload::ContextCandidateCreated { .. } | EventPayload::CandidateConfirmed { .. }
+        ) || matches!(
+            &self.payload,
+            EventPayload::ContextSpaceAssociationChanged { association }
+                if matches!(association.origin, ContextSpaceAssociationOrigin::CandidateConfirmation { .. })
+        )
     }
 
     /// Records one persistent, non-authoritative engineering observation for a Context revision.
@@ -613,6 +717,11 @@ impl Event {
                     candidate: candidate.clone(),
                 }
             }
+            EventPayload::CandidateConfirmed { confirmation } => {
+                ReducerPayload::CandidateConfirmed {
+                    confirmation: Box::new(confirmation.as_ref().clone()),
+                }
+            }
             EventPayload::SpaceCreated {
                 space_id,
                 intent_revision,
@@ -654,6 +763,11 @@ impl Event {
                 context_id: *context_id,
                 publication: publication.clone(),
             },
+            EventPayload::ContextSpaceAssociationChanged { association } => {
+                ReducerPayload::ContextSpaceAssociationChanged {
+                    association: association.clone(),
+                }
+            }
             EventPayload::SemanticConflictOpened { space_id, conflict } => {
                 ReducerPayload::SemanticConflictOpened {
                     space_id: *space_id,
@@ -735,6 +849,14 @@ fn remove_defined_identity_fields(event_type: EventType, object: &mut Map<String
                 candidate.remove("candidate_id");
             }
         }
+        EventType::CandidateConfirmed => {
+            if let Some(confirmation) = object
+                .get_mut("confirmation")
+                .and_then(Value::as_object_mut)
+            {
+                confirmation.remove("confirmation_id");
+            }
+        }
         EventType::SpaceCreated => {
             object.remove("space_id");
             if let Some(revision) = object
@@ -776,6 +898,12 @@ fn remove_defined_identity_fields(event_type: EventType, object: &mut Map<String
             if let Some(publication) = object.get_mut("publication").and_then(Value::as_object_mut)
             {
                 publication.remove("publication_id");
+            }
+        }
+        EventType::ContextSpaceAssociationChanged => {
+            if let Some(association) = object.get_mut("association").and_then(Value::as_object_mut)
+            {
+                association.remove("association_id");
             }
         }
         EventType::SemanticConflictOpened => {
@@ -969,6 +1097,27 @@ fn optional_probe_string(object: &Map<String, Value>, field: &str) -> Option<Str
         .get(field)
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn annotations_with_writer_batch(
+    writer_batch_id: &str,
+    annotations: Option<Annotations>,
+) -> Result<Annotations> {
+    if !valid_batch_id(writer_batch_id) {
+        return Err(invalid("writer batch ID must be a canonical bat_ UUIDv4"));
+    }
+    let mut annotations = annotations.unwrap_or_default();
+    if annotations
+        .additional
+        .insert(
+            "writer_batch_id".to_owned(),
+            Value::String(writer_batch_id.to_owned()),
+        )
+        .is_some()
+    {
+        return Err(invalid("writer batch ID is already present"));
+    }
+    Ok(annotations)
 }
 
 fn valid_batch_id(value: &str) -> bool {
