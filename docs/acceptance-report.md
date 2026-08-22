@@ -1,8 +1,8 @@
 # Task-first Retrieval Integration Acceptance Report
 
 Date: 2026-08-22
-Scope: Mew #112 through #154, including query-scoped Artifact Focus and accepted boundary #150
-Implementation baseline before the query-scoped correction: `main@a662e6a`
+Scope: Mew #112 through #156, excluding deferred #157/#158/#163 and accepted boundary #150
+Implementation baseline for verifiable WorkEpisode persistence: `main@1a48576`
 
 ## Verdict
 
@@ -17,11 +17,11 @@ This report does **not** claim M4:
 | M1 — Task-first primitives and unassigned Candidate entry | IMPLEMENTED | Covered below |
 | M2 — Task Runtime and multi-Space retrieval | IMPLEMENTED | TaskSession persistence, strict `task_intent_update`, read-only `task_context`, association inference, typed RetrievalPaths, and TaskContextPack pass focused cross-crate/E2E oracles |
 | M3 — Engineering Graph | IMPLEMENTED | Reference-derived bounded ScanPlan, deterministic Artifact locators, sparse build-time Context/safety snapshots, historical exact retrieval, frozen 1–2 hop relations, diagnostics, fallback, rebuild equivalence, and budget bounds pass cross-crate/E2E oracles |
-| M4 — Low-tax Capture | NOT IMPLEMENTED | No automatic WorkEpisode aggregation, Candidate Builder, Space recommendation, deduplication, or confirmation workflow |
+| M4 — Low-tax Capture | FOUNDATION ONLY | #156 persists verifiable WorkEpisode/Capture state; no automatic aggregation, AgentCheckpoint, Candidate Builder, Space recommendation, deduplication, or confirmation workflow |
 
 `task_intent_update` is the only Task Intent write path. `task_context` accepts only an external Session locator and output bounds, and reads the already-authoritative ActiveTask without mutating Runtime. PromptSubmit supplies guidance rather than inferred Intent. Explicit `context_search.space_ids` remains available as a hard filter for diagnosis and exploration.
 
-M4 retains Mandatory Gate #114/#117: stable `submission_id` idempotency must be represented in Git and rebuilt into a SQLite unique index so Candidate retries neither scan all Events, depend on Git commit subjects, nor fail because of an unrelated malformed Event. M4 must also make `source_episode_id` verifiable. None of those Capture guarantees are claimed by M2.
+M4 retains Mandatory Gate #114/#117: stable `submission_id` idempotency must be represented in Git and rebuilt into a SQLite unique index so Candidate retries neither scan all Events, depend on Git commit subjects, nor fail because of an unrelated malformed Event. #156 makes source Episode existence/owner/status verifiable in local Runtime, but does not create or admit a Candidate.
 
 ## Acceptance matrix
 
@@ -53,6 +53,13 @@ M4 retains Mandatory Gate #114/#117: stable `submission_id` idempotency must be 
 | Unreachable Focus has typed zero-result semantics | PROVEN | Wrong-Repository and unavailable-Graph Focuses return no Graph Context and a budgeted `artifact_not_reachable_in_graph` diagnostic; they never claim current-code `missing` |
 | Reachability reflects actual selected-mode output | PROVEN | Unsafe/ambiguous automatic Focus remains unreachable; Explicit marks reachable only after a GraphDiagnostic, preventing false suppression of `artifact_not_reachable_in_graph` |
 | PostTool observations never fabricate Artifact identity | PROVEN | A real Codex Hook Prompt→PostTool sequence retains one Task ID, keeps File data out of engineering Signals/Focus, records TestOutcome as non-locating, and creates no Graph edge |
+| Capture identity and ownership are verifiable | PROVEN | Typed `CaptureId`, ExternalSessionLocator and optional exact ActiveTask/Intent owner are stored after redaction; pre-Task Capture remains TTL-bound with `no_active_task` and cannot be claimed or attributed elsewhere |
+| Capture storage is bounded, private and retryable | PROVEN | CaptureStore read/list/claim/cleanup enforce limits, 0700/0600, privacy redaction, TTL, symlink/invalid preservation, same-owner claim idempotency and cross-Task/Episode rejection; no transcript/command/tool output is accepted |
+| WorkEpisode persistence is Task-isolated and CAS-guarded | PROVEN | Runtime v5 enforces one Open Episode per TaskSession, server IDs, ordered Intent/Signal refs, normalized Observation sources, Episode version CAS, inactive-Task rejection and same-Workspace dual-Session isolation |
+| Capture ingestion survives claim/commit races | PROVEN | `capture_ingestion.capture_id` is unique; concurrent/retried ingestion returns one Observation, changed retry content/cross owner is rejected, and claim-before-failed-commit remains retryable without source deletion |
+| Capture File hints never guess Repository | PROVEN | Catalog maps only safe existing Workspace-allowed configured paths to File ArtifactRef; unconfigured/unsafe paths retain Capture source/summary plus typed Runtime diagnostic |
+| Source Episode is query-verifiable without Candidate creation | PROVEN | Explicit Runtime open/read/list/advance/append/ingest/close-prepare/verify APIs return exact Episode owner/version/status/observation count; deleting runtime loses Episode only while Git/Index/Capture bytes remain |
+| Hook does not start M4 automation | PROVEN | Real Hook E2E writes owned/diagnostic Capture and existing TestOutcome only, then asserts Episode list remains empty until the test explicitly calls Runtime open/claim/ingest; #163 is not implemented |
 | Automatic TaskContextPack excludes every unsafe state | PROVEN | The oracle seeds an unassigned Candidate plus Space-associated Candidate, Deprecated, semantic-conflict, and incomplete-Evidence Context; automatic output is empty while a direct SearchEngine diagnostic query proves each fixture state exists |
 | Tree, Generation, and Task fingerprint are consistent | PROVEN | M2 response Tree equals Git `HEAD^{tree}` and index metadata; Generation equals the same projection; identical Session input returns identical fingerprint, associations, items, and paths |
 | Engineering workflows preserve identity, privacy, and ambiguity | PROVEN | Two-Repository/multi-worktree tests execute scan→record→rebuild→explain→Task Pack; concurrent Writer calls produce unique server-owned IDs; unsafe paths, incomplete evidence, and secrets are rejected; ambiguous candidates are returned without selection |
@@ -84,6 +91,8 @@ M4 retains Mandatory Gate #114/#117: stable `submission_id` idempotency must be 
 
 #154 replaces the unlaunched #151/#152 persistence model: `task_artifact_focus` is a read-only ArtifactFocusQuery, Catalog supplies a request-local `ResolvedFocus`, and Search consumes only that value for the current Pack. Runtime owns no Focus state, and later Focus queries, ordinary `task_context`, MCP restart, Task switch, or compaction restore nothing. Repository Catalog remains local-only; team synchronization is not claimed.
 
+#156 does not implement #157/#158/#163: there is no public Checkpoint tool, no Candidate Builder/admission change, and no Hook-triggered Episode aggregation. #114/#117/#136 remain deferred.
+
 ## Residue gates
 
 The M1–M3 gate searches product code, tests, fixtures, scripts, and docs (excluding build output and the user-owned `readme.md`) for:
@@ -97,6 +106,8 @@ The M1–M3 gate searches product code, tests, fixtures, scripts, and docs (excl
 - the removed Repository auto-registration types, remote/declared/common-dir merge hints, and Hook `git rev-parse` discovery path;
 - caller-supplied RepositoryId, RepoRelativePath, ArtifactKey, Generation, Workspace, Hook or corroboration fields in `task_artifact_focus`.
 - persistent Focus records, Signal IDs, active/superseded Focus state, canonical Focus identities, Runtime Focus tables, and Focus fields in Task snapshots or fingerprints.
+- bare-string Capture IDs, raw transcript/command/tool-output fields in Capture/Observation state, or ownerless Capture ingestion;
+- public Checkpoint/Candidate Builder tools and Hook calls to Episode open/advance/append/ingest deferred to #157/#158/#163.
 
 Expected result: zero matches. Generic target-design language such as a proposed new Space Intent is not a Context-Propose API. `context_search` and its explicit `space_ids` hard filter are intentionally present.
 
@@ -111,8 +122,10 @@ cargo test --locked -p sctx-mcp --test engineering_workflows
 cargo test --locked -p sctx-engineering-graph
 cargo test --locked -p sctx-local-state --test repository_catalog
 cargo test --locked -p sctx-task-runtime --test runtime_store
+cargo test --locked -p sctx-task-runtime --test work_episode_store
 cargo test --locked -p sctx-cli --test cli_contract
 cargo test --locked -p sctx-cli --test hook_fail_open
+cargo test --locked -p sctx-cli --test work_episode_capture
 cargo test --locked -p sctx-cli --test milestone_one_contract
 cargo test --locked -p sctx-cli --test milestone_two_contract
 cargo test --locked -p sctx-cli --test milestone_three_contract
@@ -128,7 +141,7 @@ Current repository gate results:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: passed with no warnings.
-- `cargo test --workspace --locked`: 289 passed, 0 failed, 1 ignored manual benchmark.
+- `cargo test --workspace --locked`: 295 passed, 0 failed, 1 ignored manual benchmark.
 - `npm test`: 16 passed, 0 failed, 0 skipped.
 - Shared Context Skill `quick_validate.py`: passed (`Skill is valid!`).
 

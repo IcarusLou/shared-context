@@ -156,6 +156,11 @@ opaque_id!(
     "Opaque identity of one Task Signal record."
 );
 opaque_id!(
+    CaptureId,
+    "cap_",
+    "Opaque identity of one redacted local Capture record."
+);
+opaque_id!(
     WorkEpisodeId,
     "wep_",
     "Opaque identity of one Task's aggregated work episode."
@@ -226,10 +231,10 @@ mod tests {
     use uuid::{Variant, Version};
 
     use super::{
-        AgentCheckpointId, CandidateBuildId, CandidateId, CheckpointClaimId, ConflictId, ContextId,
-        EventId, EvidenceId, ExternalSessionId, PublicationId, ReferenceId, RepositoryId,
-        ResolutionId, ReviewId, RevisionId, SignalId, SpaceId, SpaceRecommendationId, TaskId,
-        TaskIntentRevisionId, TaskSessionId, WorkEpisodeId, WorkObservationId,
+        AgentCheckpointId, CandidateBuildId, CandidateId, CaptureId, CheckpointClaimId, ConflictId,
+        ContextId, EventId, EvidenceId, ExternalSessionId, PublicationId, ReferenceId,
+        RepositoryId, ResolutionId, ReviewId, RevisionId, SignalId, SpaceId, SpaceRecommendationId,
+        TaskId, TaskIntentRevisionId, TaskSessionId, WorkEpisodeId, WorkObservationId,
     };
 
     #[test]
@@ -273,6 +278,7 @@ mod tests {
         assert_generated_id!(ExternalSessionId::new(), "xss_");
         assert_generated_id!(TaskIntentRevisionId::new(), "tir_");
         assert_generated_id!(SignalId::new(), "sig_");
+        assert_generated_id!(CaptureId::new(), "cap_");
         assert_generated_id!(WorkEpisodeId::new(), "wep_");
         assert_generated_id!(WorkObservationId::new(), "wob_");
         assert_generated_id!(AgentCheckpointId::new(), "ckp_");

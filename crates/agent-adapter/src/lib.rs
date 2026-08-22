@@ -258,6 +258,7 @@ pub enum CanonicalBreadcrumbKind {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalBreadcrumb {
+    pub external_session_locator: ExternalSessionLocator,
     pub kind: CanonicalBreadcrumbKind,
     pub summary: String,
     pub workspace_hint: Option<PathBuf>,
@@ -341,6 +342,7 @@ pub fn plan_action(
                 outcome: *outcome,
             }),
             breadcrumb: Some(CanonicalBreadcrumb {
+                external_session_locator: task_locator(capabilities.agent, context),
                 kind: CanonicalBreadcrumbKind::ToolOutcome,
                 summary: format!(
                     "tool {tool_name} {}",
@@ -356,20 +358,37 @@ pub fn plan_action(
         },
         CanonicalAgentEvent::PreCompact {
             context, trigger, ..
-        } => checkpoint(context, format!("context compaction requested ({trigger})")),
+        } => checkpoint(
+            capabilities.agent,
+            context,
+            format!("context compaction requested ({trigger})"),
+        ),
         CanonicalAgentEvent::TurnStop {
             context, status, ..
-        } => checkpoint(context, format!("agent turn stopped ({status})")),
+        } => checkpoint(
+            capabilities.agent,
+            context,
+            format!("agent turn stopped ({status})"),
+        ),
         CanonicalAgentEvent::SessionEnd {
             context, reason, ..
-        } => checkpoint(context, format!("agent session ended ({reason})")),
+        } => checkpoint(
+            capabilities.agent,
+            context,
+            format!("agent session ended ({reason})"),
+        ),
     }
 }
 
-fn checkpoint(context: &AgentEventContext, summary: String) -> CanonicalAgentAction {
+fn checkpoint(
+    agent: AgentKind,
+    context: &AgentEventContext,
+    summary: String,
+) -> CanonicalAgentAction {
     CanonicalAgentAction {
         task_operation: None,
         breadcrumb: Some(CanonicalBreadcrumb {
+            external_session_locator: task_locator(agent, context),
             kind: CanonicalBreadcrumbKind::Checkpoint,
             summary,
             workspace_hint: workspace_hint(context),
@@ -624,6 +643,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn lifecycle_policy_never_infers_task_intent_from_prompt_envelopes() {
         let context = AgentEventContext {
             session_id: "session".to_owned(),
@@ -693,6 +713,13 @@ mod tests {
             post_action.breadcrumb.as_ref().map(|value| &value.kind),
             Some(&CanonicalBreadcrumbKind::ToolOutcome)
         );
+        assert_eq!(
+            post_action
+                .breadcrumb
+                .as_ref()
+                .map(|value| value.external_session_locator.external_session_id.as_str()),
+            Some("session")
+        );
 
         for event in [
             CanonicalAgentEvent::PreCompact {
@@ -713,6 +740,13 @@ mod tests {
             assert_eq!(
                 action.breadcrumb.as_ref().map(|value| &value.kind),
                 Some(&CanonicalBreadcrumbKind::Checkpoint)
+            );
+            assert_eq!(
+                action
+                    .breadcrumb
+                    .as_ref()
+                    .map(|value| value.external_session_locator.external_session_id.as_str()),
+                Some("session")
             );
         }
     }

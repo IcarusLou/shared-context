@@ -34,8 +34,8 @@ use sctx_index::{
     DomainSnapshot, IndexMetadata, ProjectionDiagnosticView, ProjectionIndex, RebuildOutcome,
 };
 use sctx_local_state::{
-    Breadcrumb, BreadcrumbKind, CaptureStore, CatalogCheckoutStatus, RepositoryCatalogSnapshot,
-    UserConfigStore,
+    Breadcrumb, BreadcrumbKind, CaptureDiagnosticKind, CaptureStore, CaptureTaskOwner,
+    CatalogCheckoutStatus, RepositoryCatalogSnapshot, UserConfigStore,
 };
 use sctx_mcp::{
     ArtifactFocusQuery, AssociationExplainInput, AssociationRebuildInput,
@@ -743,15 +743,13 @@ fn resolve_hook_action(action: CanonicalAgentAction) -> Result<ResolvedAgentActi
         system_message,
     } = action;
     if let Some(breadcrumb) = breadcrumb {
-        CaptureStore::initialize(installation_root()?)?.capture(&Breadcrumb {
-            kind: match breadcrumb.kind {
-                CanonicalBreadcrumbKind::ToolOutcome => BreadcrumbKind::ToolOutcome,
-                CanonicalBreadcrumbKind::Checkpoint => BreadcrumbKind::Checkpoint,
-            },
-            summary: breadcrumb.summary,
-            workspace_hint: breadcrumb.workspace_hint,
-            file_hints: breadcrumb.file_hints,
-        })?;
+        let root = installation_root()?;
+        if capture_breadcrumb(&root, breadcrumb).is_err() {
+            return Ok(ResolvedAgentAction {
+                additional_context: None,
+                system_message: Some(HOOK_TASK_UNAVAILABLE.to_owned()),
+            });
+        }
     }
     let additional_context = match task_operation.map(resolve_task_operation).transpose() {
         Ok(context) => context.flatten(),
@@ -766,6 +764,42 @@ fn resolve_hook_action(action: CanonicalAgentAction) -> Result<ResolvedAgentActi
         additional_context,
         system_message,
     })
+}
+
+fn capture_breadcrumb(
+    root: &Path,
+    breadcrumb: sctx_agent_adapter::CanonicalBreadcrumb,
+) -> Result<()> {
+    let (task_owner, diagnostics) = match TaskRuntime::initialize(root)
+        .and_then(|runtime| runtime.read_snapshot_by_locator(&breadcrumb.external_session_locator))
+    {
+        Ok(Some(snapshot)) => (
+            Some(CaptureTaskOwner {
+                task_session_id: snapshot.task_session_id,
+                task_id: snapshot.task_id,
+                intent_revision_id: snapshot
+                    .current_intent_revision()
+                    .ok_or_else(|| invariant("ActiveTask has no Intent Head"))?
+                    .revision_id,
+            }),
+            Vec::new(),
+        ),
+        Ok(None) => (None, vec![CaptureDiagnosticKind::NoActiveTask]),
+        Err(_) => (None, vec![CaptureDiagnosticKind::RuntimeUnavailable]),
+    };
+    CaptureStore::initialize(root)?.capture(&Breadcrumb {
+        external_session_locator: breadcrumb.external_session_locator,
+        task_owner,
+        kind: match breadcrumb.kind {
+            CanonicalBreadcrumbKind::ToolOutcome => BreadcrumbKind::ToolOutcome,
+            CanonicalBreadcrumbKind::Checkpoint => BreadcrumbKind::Checkpoint,
+        },
+        summary: breadcrumb.summary,
+        workspace_hint: breadcrumb.workspace_hint,
+        file_hints: breadcrumb.file_hints,
+        diagnostics,
+    })?;
+    Ok(())
 }
 
 fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<Option<String>> {

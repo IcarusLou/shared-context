@@ -11,7 +11,10 @@ mod config;
 mod privacy;
 
 pub use capture::{
-    Breadcrumb, BreadcrumbKind, CapturePolicy, CaptureReceipt, CaptureStore, CleanupReport,
+    Breadcrumb, BreadcrumbKind, CaptureArtifactMapping, CaptureClaim, CaptureClaimOutcome,
+    CaptureDiagnosticKind, CaptureListReport, CapturePolicy, CaptureRead, CaptureReceipt,
+    CaptureRecord, CaptureRecordVersion, CaptureStore, CaptureStoreDiagnostic,
+    CaptureStoreDiagnosticKind, CaptureTaskOwner, CleanupReport, map_capture_artifacts,
 };
 pub use config::{
     CatalogCheckoutStatus, RepositoryCatalogAddOutcome, RepositoryCatalogCheckoutCheck,

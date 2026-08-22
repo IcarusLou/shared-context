@@ -5,7 +5,7 @@
 //! explicit: the runtime never guesses a new Task from Prompt or Workspace text.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     fs,
     path::{Path, PathBuf},
     str::FromStr,
@@ -14,14 +14,17 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sctx_domain::{
-    Error, ErrorKind, ExternalSessionId, ExternalSessionLocator, ExternalSessionSnapshot, Result,
-    SignalId, TaskId, TaskIntent, TaskIntentDraft, TaskIntentRevision, TaskIntentRevisionId,
-    TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle,
-    TaskSignalRecord,
+    CaptureId, CaptureSourceRef, Error, ErrorKind, ExternalSessionId, ExternalSessionLocator,
+    ExternalSessionSnapshot, IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation,
+    Result, SignalId, TaskId, TaskIntent, TaskIntentDraft, TaskIntentRevision,
+    TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalKind,
+    TaskSignalLifecycle, TaskSignalRecord, WorkEpisode, WorkEpisodeId, WorkEpisodeRef,
+    WorkEpisodeStatus, WorkObservation, WorkObservationId, WorkSourceRef,
 };
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_EPISODE_LIST_LIMIT: usize = 256;
 
 /// Result of atomically locating or creating one `ExternalSession`'s first Task.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,6 +63,89 @@ pub struct SwitchActiveTaskOutcome {
 pub struct SupersedeSignalsOutcome {
     pub snapshot: TaskSessionSnapshot,
     pub superseded_signal_ids: Vec<SignalId>,
+}
+
+/// Persisted Work Episode plus safe runtime diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkEpisodeView {
+    pub episode: WorkEpisode,
+    pub diagnostics: Vec<WorkEpisodeDiagnostic>,
+}
+
+/// Result of explicitly opening at most one Episode for an `ActiveTask`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenWorkEpisodeOutcome {
+    pub episode: WorkEpisodeView,
+    pub created: bool,
+}
+
+/// Result of explicitly advancing ordered Intent/Signal references.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdvanceWorkEpisodeOutcome {
+    pub episode: WorkEpisodeView,
+    pub added_intent_revisions: usize,
+    pub added_signal_refs: usize,
+}
+
+/// Result of one CAS-guarded normalized Observation append.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppendWorkObservationOutcome {
+    pub episode: WorkEpisodeView,
+    pub observation_id: WorkObservationId,
+}
+
+/// Safe diagnostic category stored with an Episode.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum WorkEpisodeDiagnosticKind {
+    CaptureRepositoryNotConfigured,
+    CaptureUnsafeArtifactPath,
+}
+
+/// One persisted safe Episode diagnostic; it never contains source payload text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkEpisodeDiagnostic {
+    pub capture_id: CaptureId,
+    pub kind: WorkEpisodeDiagnosticKind,
+}
+
+/// Normalized, already-redacted Capture ingestion request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureIngestion {
+    pub capture_id: CaptureId,
+    pub episode_id: WorkEpisodeId,
+    pub expected_episode_version: u64,
+    pub task_session_id: TaskSessionId,
+    pub task_id: TaskId,
+    pub intent_revision_id: TaskIntentRevisionId,
+    pub additional_sources: Vec<WorkSourceRef>,
+    pub observation: NormalizedWorkObservation,
+    pub diagnostics: Vec<WorkEpisodeDiagnosticKind>,
+}
+
+/// Idempotent Capture-to-Observation commit result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IngestCaptureOutcome {
+    pub episode: WorkEpisodeView,
+    pub observation_id: WorkObservationId,
+    pub inserted: bool,
+}
+
+/// Prepared close boundary consumed later by Checkpoint persistence (#157).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EpisodeClosePreparation {
+    pub ownership: WorkEpisodeRef,
+    pub version: u64,
+    pub final_intent_revision_id: TaskIntentRevisionId,
+    pub observation_ids: Vec<WorkObservationId>,
+}
+
+/// Verifiable source-Episode status for later Candidate admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceEpisodeVerification {
+    pub ownership: WorkEpisodeRef,
+    pub version: u64,
+    pub status: WorkEpisodeStatus,
+    pub observation_count: usize,
 }
 
 /// Owner of the installation-local `state/runtime.sqlite` database.
@@ -425,6 +511,378 @@ impl TaskRuntime {
         })
     }
 
+    /// Explicitly opens the `ActiveTask`'s sole open Work Episode.
+    ///
+    /// Repeated and concurrent calls converge on the existing open Episode.
+    /// Hook ingestion never calls this method implicitly.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing/stale/cross-Task ownership or storage failures.
+    pub fn open_work_episode(
+        &self,
+        locator: &ExternalSessionLocator,
+        expected_task_id: TaskId,
+        expected_intent_revision_id: TaskIntentRevisionId,
+    ) -> Result<OpenWorkEpisodeOutcome> {
+        locator.validate()?;
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Work Episode open transaction")?;
+        let external = read_external_identity(&transaction, locator)?
+            .ok_or_else(|| invalid("ExternalSession has no ActiveTask for Work Episode"))?;
+        require_expected_active(external.active_task_id, expected_task_id)?;
+        let (task_id, current_revision_id) =
+            read_active_task_head(&transaction, external.active_task_session_id)?
+                .ok_or_else(|| invariant("located ActiveTask is not active"))?;
+        if current_revision_id != expected_intent_revision_id {
+            return Err(invalid("expected Intent revision is stale"));
+        }
+        if let Some(episode_id) = find_open_episode(&transaction, external.active_task_session_id)?
+        {
+            let episode = require_episode_view(&transaction, episode_id)?;
+            transaction
+                .commit()
+                .map_err(sql_error("commit existing Work Episode transaction"))?;
+            return Ok(OpenWorkEpisodeOutcome {
+                episode,
+                created: false,
+            });
+        }
+        let episode_id = WorkEpisodeId::new();
+        let episode_ordinal = next_episode_ordinal(&transaction, external.active_task_session_id)?;
+        transaction
+            .execute(
+                "INSERT INTO work_episode (
+                    episode_id, task_session_id, task_id, version, status,
+                    final_checkpoint_id, episode_ordinal
+                 ) VALUES (?1, ?2, ?3, 0, 'open', NULL, ?4)",
+                params![
+                    episode_id.to_string(),
+                    external.active_task_session_id.to_string(),
+                    task_id.to_string(),
+                    episode_ordinal,
+                ],
+            )
+            .map_err(sql_error("insert Work Episode"))?;
+        insert_all_missing_episode_refs(
+            &transaction,
+            episode_id,
+            external.active_task_session_id,
+            task_id,
+        )?;
+        let episode = require_episode_view(&transaction, episode_id)?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit Work Episode open transaction"))?;
+        Ok(OpenWorkEpisodeOutcome {
+            episode,
+            created: true,
+        })
+    }
+
+    /// Explicitly advances one open Episode to every currently persisted Intent
+    /// revision and Signal reference of its exact Task.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale Episode version, closed/missing Episode, or storage failures.
+    pub fn advance_work_episode_refs(
+        &self,
+        episode_id: WorkEpisodeId,
+        expected_version: u64,
+    ) -> Result<AdvanceWorkEpisodeOutcome> {
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Work Episode ref advance")?;
+        let (task_session_id, task_id, version, status) =
+            require_episode_head(&transaction, episode_id)?;
+        require_open_episode_version(version, &status, expected_version)?;
+        require_task_is_active(&transaction, task_session_id, task_id)?;
+        let (added_intent_revisions, added_signal_refs) =
+            insert_all_missing_episode_refs(&transaction, episode_id, task_session_id, task_id)?;
+        if added_intent_revisions > 0 || added_signal_refs > 0 {
+            advance_episode_version(&transaction, episode_id, expected_version)?;
+        }
+        let episode = require_episode_view(&transaction, episode_id)?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit Work Episode ref advance"))?;
+        Ok(AdvanceWorkEpisodeOutcome {
+            episode,
+            added_intent_revisions,
+            added_signal_refs,
+        })
+    }
+
+    /// Appends a normalized non-Capture observation under Episode-version CAS.
+    ///
+    /// Capture sources must use [`Self::ingest_capture`] so `CaptureId`
+    /// idempotency cannot be bypassed.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale/closed ownership, Capture sources, invalid meaning, or storage failures.
+    pub fn append_work_observation(
+        &self,
+        episode_id: WorkEpisodeId,
+        expected_version: u64,
+        intent_revision_id: TaskIntentRevisionId,
+        source_refs: Vec<WorkSourceRef>,
+        observation: NormalizedWorkObservation,
+    ) -> Result<AppendWorkObservationOutcome> {
+        if source_refs
+            .iter()
+            .any(|source| matches!(source, WorkSourceRef::Capture(_)))
+        {
+            return Err(invalid(
+                "Capture sources require the idempotent ingest_capture API",
+            ));
+        }
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Work Observation append")?;
+        let observation_id = append_observation_in_transaction(
+            &transaction,
+            episode_id,
+            expected_version,
+            intent_revision_id,
+            source_refs,
+            observation,
+        )?;
+        let episode = require_episode_view(&transaction, episode_id)?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit Work Observation append"))?;
+        Ok(AppendWorkObservationOutcome {
+            episode,
+            observation_id,
+        })
+    }
+
+    /// Atomically and idempotently converts one already-claimed redacted Capture
+    /// into one server-identified Work Observation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale/closed/cross-Task input or conflicting Capture reuse.
+    #[allow(clippy::too_many_lines)]
+    pub fn ingest_capture(&self, input: &CaptureIngestion) -> Result<IngestCaptureOutcome> {
+        if input
+            .additional_sources
+            .iter()
+            .any(|source| matches!(source, WorkSourceRef::Capture(_)))
+        {
+            return Err(invalid(
+                "Capture ingestion supplies its Capture source server-side",
+            ));
+        }
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Capture ingestion")?;
+        if let Some((episode_id, observation_id, task_session_id, task_id)) =
+            read_capture_ingestion(&transaction, input.capture_id)?
+        {
+            if episode_id != input.episode_id
+                || task_session_id != input.task_session_id
+                || task_id != input.task_id
+            {
+                return Err(invalid(
+                    "CaptureId is already ingested by another Task/Episode",
+                ));
+            }
+            let episode = require_episode_view(&transaction, episode_id)?;
+            let observation = episode
+                .episode
+                .observations
+                .iter()
+                .find(|observation| observation.observation_id == observation_id)
+                .ok_or_else(|| invariant("Capture ingestion Observation disappeared"))?;
+            let mut expected_sources = Vec::with_capacity(input.additional_sources.len() + 1);
+            expected_sources.push(WorkSourceRef::Capture(CaptureSourceRef {
+                capture_id: input.capture_id,
+                task_session_id: input.task_session_id,
+                task_id: input.task_id,
+            }));
+            expected_sources.extend(input.additional_sources.clone());
+            let actual_diagnostics = episode
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.capture_id == input.capture_id)
+                .map(|diagnostic| diagnostic.kind)
+                .collect::<BTreeSet<_>>();
+            let expected_diagnostics = input.diagnostics.iter().copied().collect::<BTreeSet<_>>();
+            if observation.intent_revision_id != input.intent_revision_id
+                || observation.source_refs != expected_sources
+                || observation.observation != input.observation
+                || actual_diagnostics != expected_diagnostics
+            {
+                return Err(invalid(
+                    "CaptureId retry content differs from persisted ingestion",
+                ));
+            }
+            transaction
+                .commit()
+                .map_err(sql_error("commit idempotent Capture ingestion"))?;
+            return Ok(IngestCaptureOutcome {
+                episode,
+                observation_id,
+                inserted: false,
+            });
+        }
+        let (task_session_id, task_id, version, status) =
+            require_episode_head(&transaction, input.episode_id)?;
+        require_open_episode_version(version, &status, input.expected_episode_version)?;
+        if task_session_id != input.task_session_id || task_id != input.task_id {
+            return Err(invalid("Capture ingestion owner differs from Work Episode"));
+        }
+        let mut source_refs = Vec::with_capacity(input.additional_sources.len() + 1);
+        source_refs.push(WorkSourceRef::Capture(CaptureSourceRef {
+            capture_id: input.capture_id,
+            task_session_id,
+            task_id,
+        }));
+        source_refs.extend(input.additional_sources.clone());
+        let observation_id = append_observation_in_transaction(
+            &transaction,
+            input.episode_id,
+            input.expected_episode_version,
+            input.intent_revision_id,
+            source_refs,
+            input.observation.clone(),
+        )?;
+        transaction
+            .execute(
+                "INSERT INTO capture_ingestion (
+                    capture_id, episode_id, observation_id, task_session_id, task_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    input.capture_id.to_string(),
+                    input.episode_id.to_string(),
+                    observation_id.to_string(),
+                    task_session_id.to_string(),
+                    task_id.to_string(),
+                ],
+            )
+            .map_err(sql_error("record Capture ingestion"))?;
+        insert_episode_diagnostics(
+            &transaction,
+            input.episode_id,
+            input.capture_id,
+            &input.diagnostics,
+        )?;
+        let episode = require_episode_view(&transaction, input.episode_id)?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit Capture ingestion"))?;
+        Ok(IngestCaptureOutcome {
+            episode,
+            observation_id,
+            inserted: true,
+        })
+    }
+
+    /// Reads one persisted Work Episode by server-owned ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage or invariant errors.
+    pub fn read_work_episode(&self, episode_id: WorkEpisodeId) -> Result<Option<WorkEpisodeView>> {
+        read_episode_view(&self.open_connection()?, episode_id)
+    }
+
+    /// Lists a bounded ordered Task-local Episode history.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid bounds or storage failures.
+    pub fn list_work_episodes(
+        &self,
+        task_session_id: TaskSessionId,
+        limit: usize,
+    ) -> Result<Vec<WorkEpisodeView>> {
+        if limit == 0 || limit > MAX_EPISODE_LIST_LIMIT {
+            return Err(invalid(format!(
+                "Work Episode list limit must be between 1 and {MAX_EPISODE_LIST_LIMIT}"
+            )));
+        }
+        let connection = self.open_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT episode_id FROM work_episode
+                 WHERE task_session_id = ?1 ORDER BY episode_ordinal ASC LIMIT ?2",
+            )
+            .map_err(sql_error("prepare Work Episode list"))?;
+        let limit = i64::try_from(limit).map_err(|_| invalid("Episode list limit overflow"))?;
+        let ids = statement
+            .query_map(params![task_session_id.to_string(), limit], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(sql_error("query Work Episode list"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error("read Work Episode list row"))?;
+        drop(statement);
+        ids.into_iter()
+            .map(|value| {
+                let episode_id = parse_id(&value, "work_episode.episode_id")?;
+                read_episode_view(&connection, episode_id)?
+                    .ok_or_else(|| invariant("listed Work Episode disappeared"))
+            })
+            .collect()
+    }
+
+    /// Prepares, but does not commit, the final Checkpoint close boundary.
+    /// Checkpoint persistence and actual close belong to #157.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale/closed/empty Episodes.
+    pub fn prepare_work_episode_close(
+        &self,
+        episode_id: WorkEpisodeId,
+        expected_version: u64,
+    ) -> Result<EpisodeClosePreparation> {
+        let view = self
+            .read_work_episode(episode_id)?
+            .ok_or_else(|| invalid("Work Episode does not exist"))?;
+        if view.episode.version != expected_version
+            || view.episode.status != WorkEpisodeStatus::Open
+        {
+            return Err(invalid("Work Episode close version/status is stale"));
+        }
+        if view.episode.observations.is_empty() {
+            return Err(invalid(
+                "Work Episode requires observations before close preparation",
+            ));
+        }
+        Ok(EpisodeClosePreparation {
+            ownership: view.episode.ownership(),
+            version: view.episode.version,
+            final_intent_revision_id: view.episode.intent_revisions.last(),
+            observation_ids: view
+                .episode
+                .observations
+                .iter()
+                .map(|observation| observation.observation_id)
+                .collect(),
+        })
+    }
+
+    /// Verifies that a later Candidate source Episode exists with typed owner/status.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage/invariant errors; absence remains `None`.
+    pub fn verify_source_episode(
+        &self,
+        episode_id: WorkEpisodeId,
+    ) -> Result<Option<SourceEpisodeVerification>> {
+        Ok(self
+            .read_work_episode(episode_id)?
+            .map(|view| SourceEpisodeVerification {
+                ownership: view.episode.ownership(),
+                version: view.episode.version,
+                status: view.episode.status,
+                observation_count: view.episode.observations.len(),
+            }))
+    }
+
     /// Reads any retained Task by `TaskSessionId`.
     ///
     /// # Errors
@@ -536,6 +994,7 @@ fn immediate<'a>(connection: &'a mut Connection, context: &'static str) -> Resul
         .map_err(sql_error(context))
 }
 
+#[allow(clippy::too_many_lines)]
 fn ensure_schema(connection: &Connection) -> Result<()> {
     let version = connection
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
@@ -603,7 +1062,88 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
             CREATE UNIQUE INDEX IF NOT EXISTS task_signal_one_active_semantic
                 ON task_signal (task_session_id, kind, content)
                 WHERE lifecycle = 'active';
-            PRAGMA user_version = 4;",
+            CREATE TABLE IF NOT EXISTS work_episode (
+                episode_id TEXT PRIMARY KEY,
+                task_session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                version INTEGER NOT NULL CHECK (version >= 0),
+                status TEXT NOT NULL CHECK (status IN ('open', 'closed')),
+                final_checkpoint_id TEXT,
+                episode_ordinal INTEGER NOT NULL CHECK (episode_ordinal >= 0),
+                UNIQUE (task_session_id, episode_ordinal),
+                UNIQUE (episode_id, task_session_id, task_id),
+                CHECK (
+                    (status = 'open' AND final_checkpoint_id IS NULL) OR
+                    (status = 'closed' AND final_checkpoint_id IS NOT NULL)
+                ),
+                FOREIGN KEY (task_session_id) REFERENCES task_session (task_session_id)
+            ) STRICT;
+            CREATE UNIQUE INDEX IF NOT EXISTS work_episode_one_open_per_task
+                ON work_episode (task_session_id) WHERE status = 'open';
+            CREATE TABLE IF NOT EXISTS work_episode_intent_ref (
+                episode_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL,
+                ref_ordinal INTEGER NOT NULL CHECK (ref_ordinal >= 0),
+                PRIMARY KEY (episode_id, revision_id),
+                UNIQUE (episode_id, ref_ordinal),
+                FOREIGN KEY (episode_id) REFERENCES work_episode (episode_id),
+                FOREIGN KEY (revision_id) REFERENCES task_intent_revision (revision_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS work_episode_signal_ref (
+                episode_id TEXT NOT NULL,
+                signal_id TEXT NOT NULL,
+                ref_ordinal INTEGER NOT NULL CHECK (ref_ordinal >= 0),
+                PRIMARY KEY (episode_id, signal_id),
+                UNIQUE (episode_id, ref_ordinal),
+                FOREIGN KEY (episode_id) REFERENCES work_episode (episode_id),
+                FOREIGN KEY (signal_id) REFERENCES task_signal (signal_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS work_observation (
+                observation_id TEXT PRIMARY KEY,
+                episode_id TEXT NOT NULL,
+                task_session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                intent_revision_id TEXT NOT NULL,
+                observation_ordinal INTEGER NOT NULL CHECK (observation_ordinal >= 0),
+                observation_json TEXT NOT NULL CHECK (json_valid(observation_json)),
+                UNIQUE (episode_id, observation_ordinal),
+                UNIQUE (observation_id, episode_id),
+                FOREIGN KEY (episode_id, task_session_id, task_id)
+                    REFERENCES work_episode (episode_id, task_session_id, task_id),
+                FOREIGN KEY (intent_revision_id)
+                    REFERENCES task_intent_revision (revision_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS work_observation_source (
+                observation_id TEXT NOT NULL,
+                source_ordinal INTEGER NOT NULL CHECK (source_ordinal >= 0),
+                source_json TEXT NOT NULL CHECK (json_valid(source_json)),
+                PRIMARY KEY (observation_id, source_ordinal),
+                FOREIGN KEY (observation_id) REFERENCES work_observation (observation_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS capture_ingestion (
+                capture_id TEXT PRIMARY KEY,
+                episode_id TEXT NOT NULL,
+                observation_id TEXT NOT NULL UNIQUE,
+                task_session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                FOREIGN KEY (observation_id, episode_id)
+                    REFERENCES work_observation (observation_id, episode_id),
+                FOREIGN KEY (episode_id, task_session_id, task_id)
+                    REFERENCES work_episode (episode_id, task_session_id, task_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS work_episode_diagnostic (
+                episode_id TEXT NOT NULL,
+                diagnostic_ordinal INTEGER NOT NULL CHECK (diagnostic_ordinal >= 0),
+                capture_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN (
+                    'capture_repository_not_configured',
+                    'capture_unsafe_artifact_path'
+                )),
+                PRIMARY KEY (episode_id, diagnostic_ordinal),
+                UNIQUE (episode_id, capture_id, kind),
+                FOREIGN KEY (episode_id) REFERENCES work_episode (episode_id)
+            ) STRICT;
+            PRAGMA user_version = 5;",
         )
         .map_err(sql_error("initialize task runtime schema"))
 }
@@ -734,6 +1274,608 @@ fn merge_signals_in_transaction(
         inserted: inserted_signal_ids.len(),
         inserted_signal_ids,
     })
+}
+
+fn find_open_episode(
+    connection: &Connection,
+    task_session_id: TaskSessionId,
+) -> Result<Option<WorkEpisodeId>> {
+    connection
+        .query_row(
+            "SELECT episode_id FROM work_episode
+             WHERE task_session_id = ?1 AND status = 'open'",
+            [task_session_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(sql_error("find open Work Episode"))?
+        .map(|value| parse_id(&value, "work_episode.episode_id"))
+        .transpose()
+}
+
+fn next_episode_ordinal(
+    transaction: &Transaction<'_>,
+    task_session_id: TaskSessionId,
+) -> Result<i64> {
+    next_ordinal(
+        transaction,
+        "SELECT COALESCE(MAX(episode_ordinal), -1) + 1
+         FROM work_episode WHERE task_session_id = ?1",
+        task_session_id.to_string(),
+        "read next Work Episode ordinal",
+    )
+}
+
+fn insert_all_missing_episode_refs(
+    transaction: &Transaction<'_>,
+    episode_id: WorkEpisodeId,
+    task_session_id: TaskSessionId,
+    task_id: TaskId,
+) -> Result<(usize, usize)> {
+    let mut next_intent_ordinal = next_episode_ref_ordinal(
+        transaction,
+        "work_episode_intent_ref",
+        episode_id,
+        "read next Episode Intent ref ordinal",
+    )?;
+    let mut intent_statement = transaction
+        .prepare(
+            "SELECT revision_id FROM task_intent_revision
+             WHERE task_session_id = ?1 AND task_id = ?2
+             ORDER BY revision_ordinal ASC",
+        )
+        .map_err(sql_error("prepare Task Intent refs"))?;
+    let intent_ids = intent_statement
+        .query_map(
+            params![task_session_id.to_string(), task_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(sql_error("query Task Intent refs"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error("read Task Intent ref"))?;
+    drop(intent_statement);
+    let mut added_intent_revisions = 0_usize;
+    for revision_id in intent_ids {
+        let changed = transaction
+            .execute(
+                "INSERT OR IGNORE INTO work_episode_intent_ref (
+                    episode_id, revision_id, ref_ordinal
+                 ) VALUES (?1, ?2, ?3)",
+                params![episode_id.to_string(), revision_id, next_intent_ordinal],
+            )
+            .map_err(sql_error("insert Episode Intent ref"))?;
+        if changed == 1 {
+            added_intent_revisions = added_intent_revisions.saturating_add(1);
+            next_intent_ordinal = next_intent_ordinal
+                .checked_add(1)
+                .ok_or_else(|| invariant("Episode Intent ref ordinal overflow"))?;
+        }
+    }
+
+    let mut next_signal_ref_ordinal = next_episode_ref_ordinal(
+        transaction,
+        "work_episode_signal_ref",
+        episode_id,
+        "read next Episode Signal ref ordinal",
+    )?;
+    let mut signal_statement = transaction
+        .prepare(
+            "SELECT signal_id FROM task_signal
+             WHERE task_session_id = ?1 AND task_id = ?2
+             ORDER BY signal_ordinal ASC",
+        )
+        .map_err(sql_error("prepare Task Signal refs"))?;
+    let signal_ids = signal_statement
+        .query_map(
+            params![task_session_id.to_string(), task_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(sql_error("query Task Signal refs"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error("read Task Signal ref"))?;
+    drop(signal_statement);
+    let mut added_signal_refs = 0_usize;
+    for signal_id in signal_ids {
+        let changed = transaction
+            .execute(
+                "INSERT OR IGNORE INTO work_episode_signal_ref (
+                    episode_id, signal_id, ref_ordinal
+                 ) VALUES (?1, ?2, ?3)",
+                params![episode_id.to_string(), signal_id, next_signal_ref_ordinal],
+            )
+            .map_err(sql_error("insert Episode Signal ref"))?;
+        if changed == 1 {
+            added_signal_refs = added_signal_refs.saturating_add(1);
+            next_signal_ref_ordinal = next_signal_ref_ordinal
+                .checked_add(1)
+                .ok_or_else(|| invariant("Episode Signal ref ordinal overflow"))?;
+        }
+    }
+    Ok((added_intent_revisions, added_signal_refs))
+}
+
+fn next_episode_ref_ordinal(
+    transaction: &Transaction<'_>,
+    table: &str,
+    episode_id: WorkEpisodeId,
+    context: &'static str,
+) -> Result<i64> {
+    if !matches!(table, "work_episode_intent_ref" | "work_episode_signal_ref") {
+        return Err(invariant("unsupported Episode ref table"));
+    }
+    transaction
+        .query_row(
+            &format!(
+                "SELECT COALESCE(MAX(ref_ordinal), -1) + 1 FROM {table} WHERE episode_id = ?1"
+            ),
+            [episode_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(sql_error(context))
+}
+
+fn require_episode_head(
+    connection: &Connection,
+    episode_id: WorkEpisodeId,
+) -> Result<(TaskSessionId, TaskId, u64, String)> {
+    connection
+        .query_row(
+            "SELECT task_session_id, task_id, version, status
+             FROM work_episode WHERE episode_id = ?1",
+            [episode_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error("read Work Episode head"))?
+        .map(|(task_session_id, task_id, version, status)| {
+            Ok((
+                parse_id(&task_session_id, "work_episode.task_session_id")?,
+                parse_id(&task_id, "work_episode.task_id")?,
+                u64::try_from(version).map_err(|_| invariant("negative Work Episode version"))?,
+                status,
+            ))
+        })
+        .transpose()?
+        .ok_or_else(|| invalid("Work Episode does not exist"))
+}
+
+fn require_open_episode_version(actual: u64, status: &str, expected: u64) -> Result<()> {
+    if status != "open" {
+        return Err(invalid("Work Episode is not open"));
+    }
+    if actual != expected {
+        return Err(invalid("expected Work Episode version is stale"));
+    }
+    Ok(())
+}
+
+fn require_task_is_active(
+    connection: &Connection,
+    task_session_id: TaskSessionId,
+    task_id: TaskId,
+) -> Result<()> {
+    let active = connection
+        .query_row(
+            "SELECT 1 FROM external_session
+             WHERE active_task_session_id = ?1 AND active_task_id = ?2",
+            params![task_session_id.to_string(), task_id.to_string()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(sql_error("verify Work Episode ActiveTask owner"))?;
+    if active.is_none() {
+        return Err(invalid(
+            "Work Episode Task is not the ExternalSession ActiveTask",
+        ));
+    }
+    Ok(())
+}
+
+fn advance_episode_version(
+    transaction: &Transaction<'_>,
+    episode_id: WorkEpisodeId,
+    expected_version: u64,
+) -> Result<()> {
+    let expected = i64::try_from(expected_version)
+        .map_err(|_| invalid("Work Episode version exceeds SQLite range"))?;
+    let changed = transaction
+        .execute(
+            "UPDATE work_episode SET version = version + 1
+             WHERE episode_id = ?1 AND version = ?2 AND status = 'open'",
+            params![episode_id.to_string(), expected],
+        )
+        .map_err(sql_error("advance Work Episode version"))?;
+    if changed != 1 {
+        return Err(invalid("expected Work Episode version became stale"));
+    }
+    Ok(())
+}
+
+fn append_observation_in_transaction(
+    transaction: &Transaction<'_>,
+    episode_id: WorkEpisodeId,
+    expected_version: u64,
+    intent_revision_id: TaskIntentRevisionId,
+    source_refs: Vec<WorkSourceRef>,
+    normalized: NormalizedWorkObservation,
+) -> Result<WorkObservationId> {
+    let (task_session_id, task_id, version, status) =
+        require_episode_head(transaction, episode_id)?;
+    require_open_episode_version(version, &status, expected_version)?;
+    require_task_is_active(transaction, task_session_id, task_id)?;
+    let mut episode = require_episode_view(transaction, episode_id)?.episode;
+    let observation = WorkObservation::from_parts(
+        task_session_id,
+        task_id,
+        intent_revision_id,
+        source_refs,
+        normalized,
+    )?;
+    episode.add_observation(observation.clone())?;
+    let observation_ordinal = next_observation_ordinal(transaction, episode_id)?;
+    let observation_json = serde_json::to_string(&observation.observation)
+        .map_err(json_error("serialize normalized Work Observation"))?;
+    transaction
+        .execute(
+            "INSERT INTO work_observation (
+                observation_id, episode_id, task_session_id, task_id,
+                intent_revision_id, observation_ordinal, observation_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                observation.observation_id.to_string(),
+                episode_id.to_string(),
+                task_session_id.to_string(),
+                task_id.to_string(),
+                intent_revision_id.to_string(),
+                observation_ordinal,
+                observation_json,
+            ],
+        )
+        .map_err(sql_error("insert Work Observation"))?;
+    for (ordinal, source) in observation.source_refs.iter().enumerate() {
+        let source_json = serde_json::to_string(source)
+            .map_err(json_error("serialize Work Observation source"))?;
+        transaction
+            .execute(
+                "INSERT INTO work_observation_source (
+                    observation_id, source_ordinal, source_json
+                 ) VALUES (?1, ?2, ?3)",
+                params![
+                    observation.observation_id.to_string(),
+                    i64::try_from(ordinal)
+                        .map_err(|_| invariant("Observation source ordinal overflow"))?,
+                    source_json,
+                ],
+            )
+            .map_err(sql_error("insert Work Observation source"))?;
+    }
+    advance_episode_version(transaction, episode_id, expected_version)?;
+    Ok(observation.observation_id)
+}
+
+fn next_observation_ordinal(
+    transaction: &Transaction<'_>,
+    episode_id: WorkEpisodeId,
+) -> Result<i64> {
+    next_ordinal(
+        transaction,
+        "SELECT COALESCE(MAX(observation_ordinal), -1) + 1
+         FROM work_observation WHERE episode_id = ?1",
+        episode_id.to_string(),
+        "read next Work Observation ordinal",
+    )
+}
+
+fn read_capture_ingestion(
+    connection: &Connection,
+    capture_id: CaptureId,
+) -> Result<Option<(WorkEpisodeId, WorkObservationId, TaskSessionId, TaskId)>> {
+    connection
+        .query_row(
+            "SELECT episode_id, observation_id, task_session_id, task_id
+             FROM capture_ingestion WHERE capture_id = ?1",
+            [capture_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error("read Capture ingestion"))?
+        .map(|(episode_id, observation_id, task_session_id, task_id)| {
+            Ok((
+                parse_id(&episode_id, "capture_ingestion.episode_id")?,
+                parse_id(&observation_id, "capture_ingestion.observation_id")?,
+                parse_id(&task_session_id, "capture_ingestion.task_session_id")?,
+                parse_id(&task_id, "capture_ingestion.task_id")?,
+            ))
+        })
+        .transpose()
+}
+
+fn insert_episode_diagnostics(
+    transaction: &Transaction<'_>,
+    episode_id: WorkEpisodeId,
+    capture_id: CaptureId,
+    diagnostics: &[WorkEpisodeDiagnosticKind],
+) -> Result<()> {
+    let mut next_ordinal: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(diagnostic_ordinal), -1) + 1
+             FROM work_episode_diagnostic WHERE episode_id = ?1",
+            [episode_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(sql_error("read next Episode diagnostic ordinal"))?;
+    let mut unique = HashSet::new();
+    for diagnostic in diagnostics.iter().copied() {
+        if !unique.insert(diagnostic) {
+            continue;
+        }
+        let changed = transaction
+            .execute(
+                "INSERT OR IGNORE INTO work_episode_diagnostic (
+                    episode_id, diagnostic_ordinal, capture_id, kind
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    episode_id.to_string(),
+                    next_ordinal,
+                    capture_id.to_string(),
+                    episode_diagnostic_kind_name(diagnostic),
+                ],
+            )
+            .map_err(sql_error("insert Work Episode diagnostic"))?;
+        if changed == 1 {
+            next_ordinal = next_ordinal
+                .checked_add(1)
+                .ok_or_else(|| invariant("Episode diagnostic ordinal overflow"))?;
+        }
+    }
+    Ok(())
+}
+
+fn read_episode_view(
+    connection: &Connection,
+    episode_id: WorkEpisodeId,
+) -> Result<Option<WorkEpisodeView>> {
+    let row = connection
+        .query_row(
+            "SELECT task_session_id, task_id, version, status, final_checkpoint_id
+             FROM work_episode WHERE episode_id = ?1",
+            [episode_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error("read Work Episode"))?;
+    let Some((task_session_id, task_id, version, status, final_checkpoint_id)) = row else {
+        return Ok(None);
+    };
+    let task_session_id = parse_id(&task_session_id, "work_episode.task_session_id")?;
+    let task_id = parse_id(&task_id, "work_episode.task_id")?;
+    let status = match status.as_str() {
+        "open" if final_checkpoint_id.is_none() => WorkEpisodeStatus::Open,
+        "closed" => WorkEpisodeStatus::Closed {
+            final_checkpoint_id: parse_id(
+                final_checkpoint_id
+                    .as_deref()
+                    .ok_or_else(|| invariant("closed Episode lacks final Checkpoint"))?,
+                "work_episode.final_checkpoint_id",
+            )?,
+        },
+        _ => return Err(invariant("persisted Work Episode status is invalid")),
+    };
+    let episode = WorkEpisode {
+        episode_id,
+        version: u64::try_from(version).map_err(|_| invariant("negative Work Episode version"))?,
+        task_session_id,
+        task_id,
+        intent_revisions: IntentRevisionRange::new(read_episode_intent_refs(
+            connection, episode_id,
+        )?)?,
+        signal_refs: read_episode_signal_refs(connection, episode_id)?,
+        observations: read_episode_observations(connection, episode_id, task_session_id, task_id)?,
+        status,
+    };
+    episode.validate().map_err(|error| {
+        invariant(format!(
+            "persisted Work Episode violates contract: {}",
+            error.message()
+        ))
+    })?;
+    Ok(Some(WorkEpisodeView {
+        episode,
+        diagnostics: read_episode_diagnostics(connection, episode_id)?,
+    }))
+}
+
+fn require_episode_view(
+    connection: &Connection,
+    episode_id: WorkEpisodeId,
+) -> Result<WorkEpisodeView> {
+    read_episode_view(connection, episode_id)?
+        .ok_or_else(|| invariant("Work Episode disappeared inside transaction"))
+}
+
+fn read_episode_intent_refs(
+    connection: &Connection,
+    episode_id: WorkEpisodeId,
+) -> Result<Vec<TaskIntentRevisionId>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT revision_id FROM work_episode_intent_ref
+             WHERE episode_id = ?1 ORDER BY ref_ordinal ASC",
+        )
+        .map_err(sql_error("prepare Episode Intent refs"))?;
+    let rows = statement
+        .query_map([episode_id.to_string()], |row| row.get::<_, String>(0))
+        .map_err(sql_error("query Episode Intent refs"))?;
+    rows.map(|row| {
+        parse_id(
+            &row.map_err(sql_error("read Episode Intent ref"))?,
+            "work_episode_intent_ref.revision_id",
+        )
+    })
+    .collect()
+}
+
+fn read_episode_signal_refs(
+    connection: &Connection,
+    episode_id: WorkEpisodeId,
+) -> Result<Vec<NonLocatingSignalRef>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT signal.signal_id, signal.task_session_id, signal.task_id, signal.kind
+             FROM work_episode_signal_ref episode_ref
+             JOIN task_signal signal ON signal.signal_id = episode_ref.signal_id
+             WHERE episode_ref.episode_id = ?1 ORDER BY episode_ref.ref_ordinal ASC",
+        )
+        .map_err(sql_error("prepare Episode Signal refs"))?;
+    let rows = statement
+        .query_map([episode_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(sql_error("query Episode Signal refs"))?;
+    rows.map(|row| {
+        let (signal_id, task_session_id, task_id, kind) =
+            row.map_err(sql_error("read Episode Signal ref"))?;
+        Ok(NonLocatingSignalRef {
+            signal_id: parse_id(&signal_id, "work_episode_signal_ref.signal_id")?,
+            task_session_id: parse_id(&task_session_id, "work_episode_signal_ref.task_session_id")?,
+            task_id: parse_id(&task_id, "work_episode_signal_ref.task_id")?,
+            kind: parse_signal_kind(&kind)?,
+        })
+    })
+    .collect()
+}
+
+fn read_episode_observations(
+    connection: &Connection,
+    episode_id: WorkEpisodeId,
+    task_session_id: TaskSessionId,
+    task_id: TaskId,
+) -> Result<Vec<WorkObservation>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT observation_id, intent_revision_id, observation_json
+             FROM work_observation WHERE episode_id = ?1
+             ORDER BY observation_ordinal ASC",
+        )
+        .map_err(sql_error("prepare Work Observations"))?;
+    let rows = statement
+        .query_map([episode_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(sql_error("query Work Observations"))?;
+    let mut observations = Vec::new();
+    for row in rows {
+        let (observation_id, intent_revision_id, observation_json) =
+            row.map_err(sql_error("read Work Observation"))?;
+        observations.push(WorkObservation {
+            observation_id: parse_id(&observation_id, "work_observation.observation_id")?,
+            task_session_id,
+            task_id,
+            intent_revision_id: parse_id(
+                &intent_revision_id,
+                "work_observation.intent_revision_id",
+            )?,
+            source_refs: read_observation_sources(connection, &observation_id)?,
+            observation: serde_json::from_str(&observation_json)
+                .map_err(json_error("parse normalized Work Observation"))?,
+        });
+    }
+    Ok(observations)
+}
+
+fn read_observation_sources(
+    connection: &Connection,
+    observation_id: &str,
+) -> Result<Vec<WorkSourceRef>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT source_json FROM work_observation_source
+             WHERE observation_id = ?1 ORDER BY source_ordinal ASC",
+        )
+        .map_err(sql_error("prepare Work Observation sources"))?;
+    let rows = statement
+        .query_map([observation_id], |row| row.get::<_, String>(0))
+        .map_err(sql_error("query Work Observation sources"))?;
+    rows.map(|row| {
+        serde_json::from_str(&row.map_err(sql_error("read Work Observation source"))?)
+            .map_err(json_error("parse Work Observation source"))
+    })
+    .collect()
+}
+
+fn read_episode_diagnostics(
+    connection: &Connection,
+    episode_id: WorkEpisodeId,
+) -> Result<Vec<WorkEpisodeDiagnostic>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT capture_id, kind FROM work_episode_diagnostic
+             WHERE episode_id = ?1 ORDER BY diagnostic_ordinal ASC",
+        )
+        .map_err(sql_error("prepare Work Episode diagnostics"))?;
+    let rows = statement
+        .query_map([episode_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(sql_error("query Work Episode diagnostics"))?;
+    rows.map(|row| {
+        let (capture_id, kind) = row.map_err(sql_error("read Work Episode diagnostic"))?;
+        Ok(WorkEpisodeDiagnostic {
+            capture_id: parse_id(&capture_id, "work_episode_diagnostic.capture_id")?,
+            kind: parse_episode_diagnostic_kind(&kind)?,
+        })
+    })
+    .collect()
+}
+
+const fn episode_diagnostic_kind_name(kind: WorkEpisodeDiagnosticKind) -> &'static str {
+    match kind {
+        WorkEpisodeDiagnosticKind::CaptureRepositoryNotConfigured => {
+            "capture_repository_not_configured"
+        }
+        WorkEpisodeDiagnosticKind::CaptureUnsafeArtifactPath => "capture_unsafe_artifact_path",
+    }
+}
+
+fn parse_episode_diagnostic_kind(value: &str) -> Result<WorkEpisodeDiagnosticKind> {
+    match value {
+        "capture_repository_not_configured" => {
+            Ok(WorkEpisodeDiagnosticKind::CaptureRepositoryNotConfigured)
+        }
+        "capture_unsafe_artifact_path" => Ok(WorkEpisodeDiagnosticKind::CaptureUnsafeArtifactPath),
+        _ => Err(invariant("unknown persisted Work Episode diagnostic kind")),
+    }
 }
 
 fn find_active_signal(

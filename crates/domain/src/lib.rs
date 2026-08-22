@@ -20,17 +20,17 @@ pub use engineering::{
 pub use episode::{
     AgentCheckpoint, ArtifactAction, ArtifactRef, AutomaticCandidateStatus,
     AutomaticContextCandidate, CandidateAnalysis, CandidateBuilderProvenance, CandidateConfidence,
-    CandidateSpaceRecommendation, CaptureEvidenceRef, CaptureUnknown, CheckpointClaim,
-    ContextCandidate, ContextRevisionRef, ContextUseDisposition, IntentRevisionRange,
-    NonLocatingSignalRef, NormalizedBreadcrumbKind, NormalizedWorkObservation,
+    CandidateSpaceRecommendation, CaptureEvidenceRef, CaptureSourceRef, CaptureUnknown,
+    CheckpointClaim, ContextCandidate, ContextRevisionRef, ContextUseDisposition,
+    IntentRevisionRange, NonLocatingSignalRef, NormalizedBreadcrumbKind, NormalizedWorkObservation,
     RecommendedSpaceRole, TestOutcomeStatus, WorkEpisode, WorkEpisodeRef, WorkEpisodeStatus,
     WorkObservation, WorkSourceRef,
 };
 pub use ids::{
-    AgentCheckpointId, CandidateBuildId, CandidateId, CheckpointClaimId, ConflictId, ContextId,
-    EventId, EvidenceId, ExternalSessionId, IdParseError, PublicationId, ReferenceId, RepositoryId,
-    ResolutionId, ReviewId, RevisionId, SignalId, SpaceId, SpaceRecommendationId, TaskId,
-    TaskIntentRevisionId, TaskSessionId, WorkEpisodeId, WorkObservationId,
+    AgentCheckpointId, CandidateBuildId, CandidateId, CaptureId, CheckpointClaimId, ConflictId,
+    ContextId, EventId, EvidenceId, ExternalSessionId, IdParseError, PublicationId, ReferenceId,
+    RepositoryId, ResolutionId, ReviewId, RevisionId, SignalId, SpaceId, SpaceRecommendationId,
+    TaskId, TaskIntentRevisionId, TaskSessionId, WorkEpisodeId, WorkObservationId,
 };
 pub use model::{
     Applicability, ConflictParticipant, ConflictResolution, ConflictResolutionDraft,

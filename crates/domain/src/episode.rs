@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentCheckpointId, Applicability, ArtifactLocator, CandidateBuildId, CandidateId,
+    AgentCheckpointId, Applicability, ArtifactLocator, CandidateBuildId, CandidateId, CaptureId,
     CheckpointClaimId, ContextId, ContextRevisionDraft, Error, ErrorKind, EvidenceId,
     IntentSnapshot, RepositoryId, Result, RevisionId, SignalId, SpaceId, SpaceRecommendationId,
     TaskId, TaskIntentRevisionId, TaskSessionId, TaskSignalKind, WorkEpisodeId, WorkObservationId,
@@ -123,6 +123,26 @@ pub struct ArtifactRef {
     pub locator: ArtifactLocator,
 }
 
+/// Exact Task ownership carried by one redacted Capture source.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureSourceRef {
+    pub capture_id: CaptureId,
+    pub task_session_id: TaskSessionId,
+    pub task_id: TaskId,
+}
+
+impl CaptureSourceRef {
+    fn validate_owner(&self, task_session_id: TaskSessionId, task_id: TaskId) -> Result<()> {
+        if self.task_session_id != task_session_id || self.task_id != task_id {
+            return Err(invalid(
+                "capture_source_ref must belong to the Work Episode Task",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl ArtifactRef {
     fn validate(&self) -> Result<()> {
         self.locator.validate()
@@ -156,8 +176,9 @@ pub enum CaptureEvidenceRef {
 
 /// Typed source coordinates for one normalized Work Observation.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "source_kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkSourceRef {
+    Capture(CaptureSourceRef),
     TaskSignal(NonLocatingSignalRef),
     Artifact(ArtifactRef),
     ContextRevision(ContextRevisionRef),
@@ -171,6 +192,7 @@ pub enum WorkSourceRef {
 impl WorkSourceRef {
     fn validate_owner(&self, task_session_id: TaskSessionId, task_id: TaskId) -> Result<()> {
         match self {
+            Self::Capture(capture) => capture.validate_owner(task_session_id, task_id),
             Self::TaskSignal(signal) => signal.validate_owner(task_session_id, task_id),
             Self::Artifact(artifact) => artifact.validate(),
             Self::ContextRevision(_) | Self::ContextEvidence { .. } => Ok(()),
@@ -377,6 +399,7 @@ pub enum WorkEpisodeStatus {
 #[serde(deny_unknown_fields)]
 pub struct WorkEpisode {
     pub episode_id: WorkEpisodeId,
+    pub version: u64,
     pub task_session_id: TaskSessionId,
     pub task_id: TaskId,
     pub intent_revisions: IntentRevisionRange,
@@ -399,6 +422,7 @@ impl WorkEpisode {
     ) -> Result<Self> {
         let episode = Self {
             episode_id: WorkEpisodeId::new(),
+            version: 0,
             task_session_id,
             task_id,
             intent_revisions,
@@ -440,6 +464,10 @@ impl WorkEpisode {
             ));
         }
         self.observations.push(observation);
+        self.version = self
+            .version
+            .checked_add(1)
+            .ok_or_else(|| invalid("Work Episode version overflow"))?;
         Ok(())
     }
 
@@ -461,6 +489,10 @@ impl WorkEpisode {
         self.status = WorkEpisodeStatus::Closed {
             final_checkpoint_id: checkpoint.checkpoint_id,
         };
+        self.version = self
+            .version
+            .checked_add(1)
+            .ok_or_else(|| invalid("Work Episode version overflow"))?;
         self.validate()
     }
 

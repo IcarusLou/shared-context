@@ -52,12 +52,20 @@ _Avoid_: Test Artifact, qualified Test locator
 The current relevance of one identified non-locating TaskSignal within its Task: Active signals participate in retrieval, while Superseded signals remain historical evidence but do not participate.
 _Avoid_: deletion, global signal state
 
+**CaptureRecord**:
+A redacted, TTL-bounded local Breadcrumb identified by CaptureId and carrying its ExternalSessionLocator plus any exactly resolved ActiveTask owner. It is an ingestion source, not yet a WorkObservation or durable knowledge.
+_Avoid_: transcript, tool log, ownerless Task evidence
+
+**CaptureClaim**:
+An idempotent reservation of one CaptureRecord for its exact Task owner. It neither deletes the CaptureRecord nor proves that Runtime ingestion committed.
+_Avoid_: Observation commit, Capture deletion, cross-Task handoff
+
 **WorkEpisode**:
 A server-identified, TaskSession- and Task-owned interval that aggregates normalized engineering observations across an explicit range of TaskIntentRevisions. It remains Open while work is accumulating and becomes Closed at a final AgentCheckpoint; it never embeds raw Prompt, transcript, tool output, or Space routing.
 _Avoid_: chat transcript, tool log, Workspace-to-Space binding
 
 **WorkObservation**:
-A server-identified, normalized statement about engineering work under one WorkEpisode, owned by an exact TaskIntentRevision and grounded by typed source references. It preserves extracted meaning rather than raw source payloads.
+A server-identified, normalized statement about engineering work under one WorkEpisode, owned by an exact TaskIntentRevision and grounded by typed source references such as CaptureId. It preserves extracted meaning rather than raw source payloads.
 _Avoid_: raw Breadcrumb, terminal output, untyped artifact string
 
 **AgentCheckpoint**:

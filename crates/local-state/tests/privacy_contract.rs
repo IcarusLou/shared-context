@@ -1,5 +1,6 @@
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
+use sctx_domain::ExternalSessionLocator;
 use sctx_local_state::{Breadcrumb, BreadcrumbKind, CaptureStore, PrivacyScanner, UserConfigStore};
 use serde::Deserialize;
 use tempfile::tempdir;
@@ -48,10 +49,14 @@ fn capture_boundary_redacts_every_shared_privacy_fixture() {
     for case in fixture().cases {
         let receipt = store
             .capture(&Breadcrumb {
+                external_session_locator: ExternalSessionLocator::new("codex", "privacy-fixture")
+                    .unwrap(),
+                task_owner: None,
                 kind: BreadcrumbKind::Checkpoint,
                 summary: format!("observed {}", case.value),
                 workspace_hint: None,
                 file_hints: Vec::new(),
+                diagnostics: Vec::new(),
             })
             .unwrap();
         let stored = fs::read_to_string(receipt.path).unwrap();

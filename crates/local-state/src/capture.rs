@@ -8,12 +8,22 @@ use std::{
 };
 
 use fs2::FileExt;
-use sctx_domain::{Error, ErrorKind, Result};
+use sctx_domain::{
+    ArtifactLocator, ArtifactRef, CaptureId, Error, ErrorKind, ExternalSessionLocator, Result,
+    TaskId, TaskIntentRevisionId, TaskSessionId, WorkEpisodeId,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::{PrivacyFindingKind, PrivacyScanner};
+use crate::{PrivacyFindingKind, PrivacyScanner, RepositoryCatalogSnapshot};
 
-const CAPTURE_VERSION: u32 = 1;
+const MAX_LIST_LIMIT: usize = 256;
+
+/// Typed on-disk Capture schema version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureRecordVersion {
+    V2,
+}
 
 /// Normalized breadcrumb categories. There is intentionally no Transcript kind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -25,13 +35,35 @@ pub enum BreadcrumbKind {
     Checkpoint,
 }
 
-/// A short, structured observation. Raw Agent payloads and transcripts are not accepted.
+/// Exact active Task ownership resolved when a Breadcrumb was captured.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureTaskOwner {
+    pub task_session_id: TaskSessionId,
+    pub task_id: TaskId,
+    pub intent_revision_id: TaskIntentRevisionId,
+}
+
+/// Safe diagnostic retained with a Capture instead of guessing ownership/path identity.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureDiagnosticKind {
+    NoActiveTask,
+    RuntimeUnavailable,
+    RepositoryNotConfigured,
+    UnsafeArtifactPath,
+}
+
+/// A short structured input. Raw Agent payloads and transcripts are not accepted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Breadcrumb {
+    pub external_session_locator: ExternalSessionLocator,
+    pub task_owner: Option<CaptureTaskOwner>,
     pub kind: BreadcrumbKind,
     pub summary: String,
     pub workspace_hint: Option<PathBuf>,
     pub file_hints: Vec<PathBuf>,
+    pub diagnostics: Vec<CaptureDiagnosticKind>,
 }
 
 /// TTL and byte ceilings for local capture state.
@@ -69,38 +101,179 @@ impl CapturePolicy {
     }
 }
 
+/// Exact Episode/Task reservation for one Capture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureClaim {
+    pub episode_id: WorkEpisodeId,
+    pub task_session_id: TaskSessionId,
+    pub task_id: TaskId,
+}
+
+/// Safe redacted Capture record returned only through local APIs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureRecord {
+    pub version: CaptureRecordVersion,
+    pub capture_id: CaptureId,
+    pub recorded_at_unix_seconds: u64,
+    pub expires_at_unix_seconds: u64,
+    pub external_session_locator: ExternalSessionLocator,
+    pub task_owner: Option<CaptureTaskOwner>,
+    pub kind: BreadcrumbKind,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_hints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub privacy_findings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<CaptureDiagnosticKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<CaptureClaim>,
+}
+
+impl CaptureRecord {
+    fn validate(&self) -> Result<()> {
+        self.external_session_locator.validate()?;
+        if self.summary.trim().is_empty() {
+            return Err(invalid("capture summary must not be empty"));
+        }
+        if self.expires_at_unix_seconds <= self.recorded_at_unix_seconds {
+            return Err(invalid("capture expiry must follow its recorded time"));
+        }
+        if self.task_owner.is_none()
+            && !self.diagnostics.iter().any(|diagnostic| {
+                matches!(
+                    diagnostic,
+                    CaptureDiagnosticKind::NoActiveTask | CaptureDiagnosticKind::RuntimeUnavailable
+                )
+            })
+        {
+            return Err(invalid(
+                "ownerless Capture requires a typed ownership diagnostic",
+            ));
+        }
+        if let Some(claim) = self.claim {
+            let owner = self
+                .task_owner
+                .ok_or_else(|| invalid("ownerless Capture cannot be claimed"))?;
+            if owner.task_session_id != claim.task_session_id || owner.task_id != claim.task_id {
+                return Err(invalid("Capture claim must match its exact Task owner"));
+            }
+        }
+        if self.file_hints.iter().any(|path| path.trim().is_empty()) {
+            return Err(invalid("capture file hints must not be empty"));
+        }
+        Ok(())
+    }
+}
+
 /// Safe metadata returned after storing a breadcrumb.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaptureReceipt {
-    pub capture_id: String,
+    pub capture_id: CaptureId,
     pub path: PathBuf,
     pub expires_at_unix_seconds: u64,
     pub finding_kinds: Vec<PrivacyFindingKind>,
+    pub diagnostics: Vec<CaptureDiagnosticKind>,
+}
+
+/// One bounded Capture read with explicit TTL state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureRead {
+    pub record: CaptureRecord,
+    pub expired: bool,
+}
+
+/// Typed diagnosis for an unsafe/invalid entry preserved by list/cleanup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureStoreDiagnostic {
+    pub capture_id: Option<CaptureId>,
+    pub kind: CaptureStoreDiagnosticKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureStoreDiagnosticKind {
+    InvalidRecord,
+    UnsafeEntry,
+    Oversized,
+}
+
+/// Bounded deterministic Capture listing.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CaptureListReport {
+    pub captures: Vec<CaptureRead>,
+    pub diagnostics: Vec<CaptureStoreDiagnostic>,
+    pub truncated: bool,
+}
+
+/// Idempotent result of reserving one Capture for an Episode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureClaimOutcome {
+    pub record: CaptureRecord,
+    pub newly_claimed: bool,
+}
+
+/// Safe `ArtifactRefs` and typed path diagnostics derived from Capture file hints.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CaptureArtifactMapping {
+    pub artifact_refs: Vec<ArtifactRef>,
+    pub diagnostics: Vec<CaptureDiagnosticKind>,
+}
+
+/// Maps only existing safe Capture file hints through the explicit Repository Catalog.
+///
+/// Unconfigured or unsafe hints remain Capture provenance plus typed diagnostics;
+/// no Repository identity is guessed.
+#[must_use]
+pub fn map_capture_artifacts(
+    record: &CaptureRecord,
+    catalog: &RepositoryCatalogSnapshot,
+) -> CaptureArtifactMapping {
+    let mut mapping = CaptureArtifactMapping::default();
+    let Some(workspace_hint) = record.workspace_hint.as_deref().map(PathBuf::from) else {
+        if !record.file_hints.is_empty() {
+            mapping
+                .diagnostics
+                .push(CaptureDiagnosticKind::UnsafeArtifactPath);
+        }
+        return mapping;
+    };
+    for file_hint in &record.file_hints {
+        match catalog.resolve_file_path(Path::new(file_hint), std::slice::from_ref(&workspace_hint))
+        {
+            Ok(resolved) => {
+                let artifact = ArtifactRef {
+                    repository_id: resolved.repository_id,
+                    locator: ArtifactLocator::File {
+                        path: resolved.relative_path,
+                    },
+                };
+                if !mapping.artifact_refs.contains(&artifact) {
+                    mapping.artifact_refs.push(artifact);
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::RepositoryNotConfigured => mapping
+                .diagnostics
+                .push(CaptureDiagnosticKind::RepositoryNotConfigured),
+            Err(_) => mapping
+                .diagnostics
+                .push(CaptureDiagnosticKind::UnsafeArtifactPath),
+        }
+    }
+    mapping.diagnostics.sort();
+    mapping.diagnostics.dedup();
+    mapping
 }
 
 /// Result of TTL cleanup. Invalid/symlink entries are diagnosed and preserved.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CleanupReport {
     pub removed: Vec<PathBuf>,
-    pub skipped: Vec<PathBuf>,
+    pub diagnostics: Vec<CaptureStoreDiagnostic>,
     pub reclaimed_bytes: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StoredBreadcrumb {
-    version: u32,
-    capture_id: String,
-    recorded_at_unix_seconds: u64,
-    expires_at_unix_seconds: u64,
-    kind: BreadcrumbKind,
-    summary: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    workspace_hint: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    file_hints: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    privacy_findings: Vec<String>,
 }
 
 /// Private, bounded `state/capture` storage outside the Git repository.
@@ -144,7 +317,6 @@ impl CaptureStore {
         })
     }
 
-    /// Capture directory. It is always outside `<root>/repository`.
     #[must_use]
     pub fn directory(&self) -> &Path {
         &self.directory
@@ -154,13 +326,82 @@ impl CaptureStore {
     ///
     /// # Errors
     ///
-    /// Rejects oversized entries/aggregate state, invalid paths, or unsafe
-    /// filesystem entries. Raw input is never included in error diagnostics.
+    /// Rejects oversized entries/aggregate state, invalid ownership, or unsafe
+    /// filesystem entries. Raw input is never included in diagnostics.
     pub fn capture(&self, breadcrumb: &Breadcrumb) -> Result<CaptureReceipt> {
         self.capture_at(breadcrumb, SystemTime::now())
     }
 
-    /// Removes only expired, valid capture records from `state/capture`.
+    /// Reads one typed Capture by ID without following filesystem input.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing, unsafe, oversized, mismatched, or invalid records.
+    pub fn read(&self, capture_id: CaptureId) -> Result<CaptureRead> {
+        let lock = self.lock()?;
+        let read = self.read_at(capture_id, SystemTime::now())?;
+        FileExt::unlock(&lock).map_err(io_error("unlock capture.lock"))?;
+        Ok(read)
+    }
+
+    /// Lists at most `limit` valid Capture records plus typed unsafe diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid bound or inaccessible directory.
+    pub fn list(&self, limit: usize) -> Result<CaptureListReport> {
+        if limit == 0 || limit > MAX_LIST_LIMIT {
+            return Err(invalid(format!(
+                "capture list limit must be between 1 and {MAX_LIST_LIMIT}"
+            )));
+        }
+        let lock = self.lock()?;
+        let report = self.list_at(limit, SystemTime::now())?;
+        FileExt::unlock(&lock).map_err(io_error("unlock capture.lock"))?;
+        Ok(report)
+    }
+
+    /// Idempotently reserves a Capture for its exact owned Work Episode.
+    ///
+    /// A claim is retained after crashes and never removes the source record.
+    /// Runtime ingestion remains independently idempotent by `CaptureId`.
+    ///
+    /// # Errors
+    ///
+    /// Rejects expiry, ownerless, cross-Task, cross-Episode, or unsafe records.
+    pub fn claim(&self, capture_id: CaptureId, claim: CaptureClaim) -> Result<CaptureClaimOutcome> {
+        let lock = self.lock()?;
+        let mut read = self.read_at(capture_id, SystemTime::now())?;
+        if read.expired {
+            return Err(invalid("expired Capture cannot be claimed"));
+        }
+        let owner = read
+            .record
+            .task_owner
+            .ok_or_else(|| invalid("Capture has no ActiveTask owner"))?;
+        if owner.task_session_id != claim.task_session_id || owner.task_id != claim.task_id {
+            return Err(invalid("Capture cannot be claimed by another Task"));
+        }
+        let newly_claimed = match read.record.claim {
+            None => {
+                read.record.claim = Some(claim);
+                true
+            }
+            Some(existing) if existing == claim => false,
+            Some(_) => return Err(invalid("Capture is already claimed by another Episode")),
+        };
+        if newly_claimed {
+            read.record.validate()?;
+            self.replace_record(&read.record)?;
+        }
+        FileExt::unlock(&lock).map_err(io_error("unlock capture.lock"))?;
+        Ok(CaptureClaimOutcome {
+            record: read.record,
+            newly_claimed,
+        })
+    }
+
+    /// Removes only expired valid capture records from `state/capture`.
     ///
     /// # Errors
     ///
@@ -173,10 +414,11 @@ impl CaptureStore {
     }
 
     fn capture_at(&self, breadcrumb: &Breadcrumb, now: SystemTime) -> Result<CaptureReceipt> {
-        let lock = self.lock()?;
+        breadcrumb.external_session_locator.validate()?;
         if breadcrumb.summary.trim().is_empty() {
             return Err(invalid("breadcrumb summary must not be empty"));
         }
+        let lock = self.lock()?;
         let now_seconds = unix_seconds(now)?;
         let expires_at = now
             .checked_add(self.policy.ttl)
@@ -199,13 +441,24 @@ impl CaptureStore {
                 self.redact_field(&path, &mut finding_kinds)
             })
             .collect::<Result<Vec<_>>>()?;
-
-        let capture_id = format!("cap_{}", uuid::Uuid::new_v4().hyphenated());
-        let record = StoredBreadcrumb {
-            version: CAPTURE_VERSION,
-            capture_id: capture_id.clone(),
+        let mut diagnostics = breadcrumb
+            .diagnostics
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if breadcrumb.task_owner.is_none()
+            && !diagnostics.contains(&CaptureDiagnosticKind::RuntimeUnavailable)
+        {
+            diagnostics.insert(CaptureDiagnosticKind::NoActiveTask);
+        }
+        let capture_id = CaptureId::new();
+        let record = CaptureRecord {
+            version: CaptureRecordVersion::V2,
+            capture_id,
             recorded_at_unix_seconds: now_seconds,
             expires_at_unix_seconds: expires_at_seconds,
+            external_session_locator: breadcrumb.external_session_locator.clone(),
+            task_owner: breadcrumb.task_owner,
             kind: breadcrumb.kind,
             summary,
             workspace_hint,
@@ -214,22 +467,11 @@ impl CaptureStore {
                 .iter()
                 .map(|kind| kind.code().to_owned())
                 .collect(),
+            diagnostics: diagnostics.into_iter().collect(),
+            claim: None,
         };
-        let mut bytes = serde_json::to_vec_pretty(&record).map_err(|error| {
-            Error::new(
-                ErrorKind::InvalidInput,
-                format!("serialize capture record: {error}"),
-            )
-        })?;
-        bytes.push(b'\n');
-        if bytes.len() > self.policy.max_entry_bytes {
-            return Err(invalid(format!(
-                "capture record is {} bytes; entry limit is {} bytes",
-                bytes.len(),
-                self.policy.max_entry_bytes
-            )));
-        }
-
+        record.validate()?;
+        let bytes = self.serialize_record(&record)?;
         self.cleanup_expired_at(now)?;
         let current_size = self.current_size()?;
         if current_size.saturating_add(bytes.len() as u64) > self.policy.max_total_bytes {
@@ -238,7 +480,7 @@ impl CaptureStore {
                 self.policy.max_total_bytes
             )));
         }
-        let path = self.directory.join(format!("{capture_id}.json"));
+        let path = self.capture_path(capture_id);
         write_private_new(&path, &bytes)?;
         sync_directory(&self.directory)?;
         FileExt::unlock(&lock).map_err(io_error("unlock capture.lock"))?;
@@ -247,41 +489,63 @@ impl CaptureStore {
             path,
             expires_at_unix_seconds: expires_at_seconds,
             finding_kinds: finding_kinds.into_iter().collect(),
+            diagnostics: record.diagnostics,
         })
     }
 
-    fn redact_field(
-        &self,
-        value: &str,
-        findings: &mut BTreeSet<PrivacyFindingKind>,
-    ) -> Result<String> {
-        let redacted = self.scanner.redact(value)?;
-        findings.extend(redacted.finding_kinds);
-        Ok(redacted.text)
+    fn read_at(&self, capture_id: CaptureId, now: SystemTime) -> Result<CaptureRead> {
+        let path = self.capture_path(capture_id);
+        let record = self.read_record_path(&path)?;
+        if record.capture_id != capture_id {
+            return Err(invariant("Capture filename and record identity differ"));
+        }
+        Ok(CaptureRead {
+            expired: record.expires_at_unix_seconds <= unix_seconds(now)?,
+            record,
+        })
+    }
+
+    fn list_at(&self, limit: usize, now: SystemTime) -> Result<CaptureListReport> {
+        let mut entries = sorted_entries(&self.directory)?;
+        let truncated = entries.len() > limit;
+        entries.truncate(limit);
+        let now = unix_seconds(now)?;
+        let mut report = CaptureListReport {
+            truncated,
+            ..CaptureListReport::default()
+        };
+        for entry in entries {
+            let path = entry.path();
+            let capture_id = capture_id_from_path(&path);
+            match self.read_record_path(&path) {
+                Ok(record) => report.captures.push(CaptureRead {
+                    expired: record.expires_at_unix_seconds <= now,
+                    record,
+                }),
+                Err(error) => report.diagnostics.push(CaptureStoreDiagnostic {
+                    capture_id,
+                    kind: diagnostic_kind(&path, self.policy.max_entry_bytes, &error),
+                }),
+            }
+        }
+        Ok(report)
     }
 
     fn cleanup_expired_at(&self, now: SystemTime) -> Result<CleanupReport> {
         let now = unix_seconds(now)?;
         let mut report = CleanupReport::default();
-        let mut entries = fs::read_dir(&self.directory)
-            .map_err(io_error("read capture directory"))?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(io_error("read capture entry"))?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
+        for entry in sorted_entries(&self.directory)? {
             let path = entry.path();
             let metadata =
                 fs::symlink_metadata(&path).map_err(io_error("inspect capture entry"))?;
-            if !metadata.file_type().is_file()
-                || path.extension().and_then(|extension| extension.to_str()) != Some("json")
-            {
-                report.skipped.push(path);
-                continue;
-            }
-            let record = match read_record(&path) {
-                Ok(record) if record.version == CAPTURE_VERSION => record,
-                Ok(_) | Err(_) => {
-                    report.skipped.push(path);
+            let capture_id = capture_id_from_path(&path);
+            let record = match self.read_record_path(&path) {
+                Ok(record) => record,
+                Err(error) => {
+                    report.diagnostics.push(CaptureStoreDiagnostic {
+                        capture_id,
+                        kind: diagnostic_kind(&path, self.policy.max_entry_bytes, &error),
+                    });
                     continue;
                 }
             };
@@ -295,6 +559,73 @@ impl CaptureStore {
             sync_directory(&self.directory)?;
         }
         Ok(report)
+    }
+
+    fn read_record_path(&self, path: &Path) -> Result<CaptureRecord> {
+        let metadata = fs::symlink_metadata(path).map_err(io_error("inspect capture record"))?;
+        if !metadata.file_type().is_file()
+            || path.extension().and_then(|extension| extension.to_str()) != Some("json")
+        {
+            return Err(invalid("unsafe capture entry"));
+        }
+        if metadata.len() > self.policy.max_entry_bytes as u64 {
+            return Err(invalid("oversized capture entry"));
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(invalid("capture entry permissions are not private"));
+        }
+        let mut file = File::open(path).map_err(io_error("open capture record"))?;
+        let capacity = usize::try_from(metadata.len())
+            .map_err(|_| invalid("capture entry length exceeds platform bounds"))?;
+        let mut bytes = Vec::with_capacity(capacity);
+        file.read_to_end(&mut bytes)
+            .map_err(io_error("read capture record"))?;
+        let record: CaptureRecord =
+            serde_json::from_slice(&bytes).map_err(|_| invalid("capture record is invalid"))?;
+        record.validate()?;
+        Ok(record)
+    }
+
+    fn replace_record(&self, record: &CaptureRecord) -> Result<()> {
+        let path = self.capture_path(record.capture_id);
+        reject_symlink(&path)?;
+        let bytes = self.serialize_record(record)?;
+        let temporary = self.directory.join(format!(
+            ".{}.{}.tmp",
+            record.capture_id,
+            uuid::Uuid::new_v4()
+        ));
+        write_private_new(&temporary, &bytes)?;
+        fs::rename(&temporary, &path).map_err(io_error("replace capture record"))?;
+        sync_directory(&self.directory)
+    }
+
+    fn serialize_record(&self, record: &CaptureRecord) -> Result<Vec<u8>> {
+        let mut bytes =
+            serde_json::to_vec_pretty(record).map_err(|_| invalid("serialize capture record"))?;
+        bytes.push(b'\n');
+        if bytes.len() > self.policy.max_entry_bytes {
+            return Err(invalid(format!(
+                "capture record is {} bytes; entry limit is {} bytes",
+                bytes.len(),
+                self.policy.max_entry_bytes
+            )));
+        }
+        Ok(bytes)
+    }
+
+    fn redact_field(
+        &self,
+        value: &str,
+        findings: &mut BTreeSet<PrivacyFindingKind>,
+    ) -> Result<String> {
+        let redacted = self.scanner.redact(value)?;
+        findings.extend(redacted.finding_kinds);
+        Ok(redacted.text)
+    }
+
+    fn capture_path(&self, capture_id: CaptureId) -> PathBuf {
+        self.directory.join(format!("{capture_id}.json"))
     }
 
     fn current_size(&self) -> Result<u64> {
@@ -328,17 +659,31 @@ impl CaptureStore {
     }
 }
 
-fn read_record(path: &Path) -> Result<StoredBreadcrumb> {
-    let mut file = File::open(path).map_err(io_error("open capture record"))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(io_error("read capture record"))?;
-    serde_json::from_slice(&bytes).map_err(|error| {
-        Error::new(
-            ErrorKind::InvalidInput,
-            format!("parse capture record {}: {error}", path.display()),
-        )
-    })
+fn sorted_entries(directory: &Path) -> Result<Vec<fs::DirEntry>> {
+    let mut entries = fs::read_dir(directory)
+        .map_err(io_error("read capture directory"))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(io_error("read capture entry"))?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+    Ok(entries)
+}
+
+fn capture_id_from_path(path: &Path) -> Option<CaptureId> {
+    path.file_stem()?.to_str()?.parse().ok()
+}
+
+fn diagnostic_kind(
+    path: &Path,
+    max_entry_bytes: usize,
+    _error: &Error,
+) -> CaptureStoreDiagnosticKind {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.len() > max_entry_bytes as u64 => {
+            CaptureStoreDiagnosticKind::Oversized
+        }
+        Ok(metadata) if !metadata.file_type().is_file() => CaptureStoreDiagnosticKind::UnsafeEntry,
+        _ => CaptureStoreDiagnosticKind::InvalidRecord,
+    }
 }
 
 fn ensure_private_directory(path: &Path) -> Result<()> {
@@ -419,32 +764,68 @@ fn io_error(operation: &'static str) -> impl FnOnce(std::io::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, time::Duration};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        path::PathBuf,
+        sync::{Arc, Barrier},
+        thread,
+        time::Duration,
+    };
 
+    use sctx_domain::{
+        ExternalSessionLocator, TaskId, TaskIntentRevisionId, TaskSessionId, WorkEpisodeId,
+    };
     use tempfile::tempdir;
 
-    use super::{Breadcrumb, BreadcrumbKind, CapturePolicy, CaptureStore};
+    use super::{
+        Breadcrumb, BreadcrumbKind, CaptureClaim, CaptureDiagnosticKind, CapturePolicy,
+        CaptureStore, CaptureStoreDiagnosticKind, CaptureTaskOwner,
+    };
+
+    fn locator(key: &str) -> ExternalSessionLocator {
+        ExternalSessionLocator::new("codex", key).unwrap()
+    }
+
+    fn owned_breadcrumb(summary: &str) -> Breadcrumb {
+        Breadcrumb {
+            external_session_locator: locator("capture-test"),
+            task_owner: Some(CaptureTaskOwner {
+                task_session_id: TaskSessionId::new(),
+                task_id: TaskId::new(),
+                intent_revision_id: TaskIntentRevisionId::new(),
+            }),
+            kind: BreadcrumbKind::TestResult,
+            summary: summary.to_owned(),
+            workspace_hint: Some(PathBuf::from("/tmp/项目 空格")),
+            file_hints: vec![PathBuf::from("src/模块.rs")],
+            diagnostics: Vec::new(),
+        }
+    }
 
     #[test]
-    fn capture_redacts_and_uses_private_permissions_without_transcript_field() {
+    fn capture_redacts_and_uses_typed_identity_private_permissions_and_no_raw_fields() {
         let temporary = tempdir().unwrap();
         let root = temporary.path().join("Shared Context 空格");
         let store = CaptureStore::initialize(&root).unwrap();
         let receipt = store
-            .capture(&Breadcrumb {
-                kind: BreadcrumbKind::TestResult,
-                summary: "passed; contact alice@example.com; password=not-a-real-password"
-                    .to_owned(),
-                workspace_hint: Some(PathBuf::from("/tmp/项目 空格")),
-                file_hints: vec![PathBuf::from("src/模块.rs")],
-            })
+            .capture(&owned_breadcrumb(
+                "passed; contact alice@example.com; password=not-a-real-password",
+            ))
             .unwrap();
         let stored = fs::read_to_string(&receipt.path).unwrap();
 
+        assert!(receipt.capture_id.to_string().starts_with("cap_"));
         assert!(!stored.contains("alice@example.com"));
         assert!(!stored.contains("not-a-real-password"));
         assert!(stored.contains("[REDACTED:email_address]"));
-        assert!(!stored.contains("transcript"));
+        for forbidden in ["transcript", "command", "tool_output", "tool_response"] {
+            assert!(!stored.contains(forbidden));
+        }
+        assert_eq!(
+            store.read(receipt.capture_id).unwrap().record.capture_id,
+            receipt.capture_id
+        );
         assert_eq!(
             fs::metadata(store.directory())
                 .unwrap()
@@ -460,7 +841,129 @@ mod tests {
     }
 
     #[test]
-    fn expired_cleanup_stays_inside_capture_directory() {
+    fn ownerless_capture_is_diagnostic_and_cannot_be_claimed() {
+        let temporary = tempdir().unwrap();
+        let store = CaptureStore::initialize(temporary.path()).unwrap();
+        let receipt = store
+            .capture(&Breadcrumb {
+                external_session_locator: locator("no-task"),
+                task_owner: None,
+                kind: BreadcrumbKind::Checkpoint,
+                summary: "session existed before Task".to_owned(),
+                workspace_hint: None,
+                file_hints: Vec::new(),
+                diagnostics: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            receipt.diagnostics,
+            vec![CaptureDiagnosticKind::NoActiveTask]
+        );
+        assert!(
+            store
+                .claim(
+                    receipt.capture_id,
+                    CaptureClaim {
+                        episode_id: WorkEpisodeId::new(),
+                        task_session_id: TaskSessionId::new(),
+                        task_id: TaskId::new(),
+                    },
+                )
+                .is_err()
+        );
+        store
+            .capture(&Breadcrumb {
+                external_session_locator: locator("no-task-2"),
+                task_owner: None,
+                kind: BreadcrumbKind::Checkpoint,
+                summary: "second ownerless Capture".to_owned(),
+                workspace_hint: None,
+                file_hints: Vec::new(),
+                diagnostics: Vec::new(),
+            })
+            .unwrap();
+        let bounded = store.list(1).unwrap();
+        assert_eq!(bounded.captures.len(), 1);
+        assert!(bounded.truncated);
+        assert!(store.list(0).is_err());
+        assert!(store.list(257).is_err());
+    }
+
+    #[test]
+    fn claim_is_idempotent_for_same_episode_and_rejects_cross_task_or_episode() {
+        let temporary = tempdir().unwrap();
+        let store = CaptureStore::initialize(temporary.path()).unwrap();
+        let breadcrumb = owned_breadcrumb("verified result");
+        let owner = breadcrumb.task_owner.unwrap();
+        let receipt = store.capture(&breadcrumb).unwrap();
+        let claim = CaptureClaim {
+            episode_id: WorkEpisodeId::new(),
+            task_session_id: owner.task_session_id,
+            task_id: owner.task_id,
+        };
+        assert!(
+            store
+                .claim(receipt.capture_id, claim)
+                .unwrap()
+                .newly_claimed
+        );
+        assert!(
+            !store
+                .claim(receipt.capture_id, claim)
+                .unwrap()
+                .newly_claimed
+        );
+        assert!(
+            store
+                .claim(
+                    receipt.capture_id,
+                    CaptureClaim {
+                        episode_id: WorkEpisodeId::new(),
+                        ..claim
+                    },
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .claim(
+                    receipt.capture_id,
+                    CaptureClaim {
+                        task_id: TaskId::new(),
+                        ..claim
+                    },
+                )
+                .is_err()
+        );
+
+        let concurrent_receipt = store.capture(&breadcrumb).unwrap();
+        let store = Arc::new(store);
+        let workers = 8;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut threads = Vec::new();
+        for _ in 0..workers {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            threads.push(thread::spawn(move || {
+                barrier.wait();
+                store.claim(concurrent_receipt.capture_id, claim).unwrap()
+            }));
+        }
+        let outcomes = threads
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| outcome.newly_claimed)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn expired_cleanup_and_invalid_symlink_entries_are_bounded_and_preserved() {
         let temporary = tempdir().unwrap();
         let root = temporary.path().join("home");
         let repository = root.join("repository");
@@ -478,72 +981,48 @@ mod tests {
         .unwrap();
         let recorded_at = std::time::UNIX_EPOCH + Duration::from_secs(100);
         let receipt = store
-            .capture_at(
-                &Breadcrumb {
-                    kind: BreadcrumbKind::Checkpoint,
-                    summary: "short lived".to_owned(),
-                    workspace_hint: None,
-                    file_hints: Vec::new(),
-                },
-                recorded_at,
-            )
+            .capture_at(&owned_breadcrumb("short lived"), recorded_at)
             .unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&git_fact, store.directory().join("unsafe.json")).unwrap();
+        }
 
         let report = store
             .cleanup_expired_at(recorded_at + Duration::from_secs(2))
             .unwrap();
 
         assert_eq!(report.removed, vec![receipt.path]);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.kind == CaptureStoreDiagnosticKind::UnsafeEntry })
+        );
         assert_eq!(fs::read_to_string(git_fact).unwrap(), "immutable");
+        assert!(store.directory().join("unsafe.json").exists());
     }
 
     #[test]
-    fn byte_limits_are_enforced_before_write() {
+    fn entry_and_aggregate_byte_limits_are_enforced_before_write() {
         let temporary = tempdir().unwrap();
         let store = CaptureStore::with_policy(
             temporary.path(),
             CapturePolicy {
                 ttl: Duration::from_secs(60),
-                max_entry_bytes: 180,
-                max_total_bytes: 300,
+                max_entry_bytes: 700,
+                max_total_bytes: 850,
             },
         )
         .unwrap();
         let error = store
-            .capture(&Breadcrumb {
-                kind: BreadcrumbKind::ToolOutcome,
-                summary: "x".repeat(256),
-                workspace_hint: None,
-                file_hints: Vec::new(),
-            })
+            .capture(&owned_breadcrumb(&"x".repeat(2_000)))
             .unwrap_err();
-
         assert!(error.message().contains("entry limit"));
         assert_eq!(fs::read_dir(store.directory()).unwrap().count(), 0);
-    }
 
-    #[test]
-    fn aggregate_byte_limit_is_enforced() {
-        let temporary = tempdir().unwrap();
-        let store = CaptureStore::with_policy(
-            temporary.path(),
-            CapturePolicy {
-                ttl: Duration::from_secs(60),
-                max_entry_bytes: 600,
-                max_total_bytes: 600,
-            },
-        )
-        .unwrap();
-        let breadcrumb = Breadcrumb {
-            kind: BreadcrumbKind::Checkpoint,
-            summary: "x".repeat(100),
-            workspace_hint: None,
-            file_hints: Vec::new(),
-        };
+        let breadcrumb = owned_breadcrumb(&"x".repeat(60));
         store.capture(&breadcrumb).unwrap();
-
-        let error = store.capture(&breadcrumb).unwrap_err();
-
-        assert!(error.message().contains("aggregate limit"));
+        assert!(store.capture(&breadcrumb).is_err());
     }
 }
