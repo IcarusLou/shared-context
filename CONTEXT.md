@@ -97,11 +97,15 @@ An unowned, non-injectable Context draft produced from one Closed WorkEpisode. I
 _Avoid_: published Context, accepted Candidate, automatically injected knowledge
 
 **CandidateAnalysis**:
-A typed comparison of an AutomaticContextCandidate with existing immutable Context revisions: duplicate, supporting, revising, contradicting, or novel. Novel and duplicate classifications are exclusive; revision may coexist with support or contradiction when the relationship is partial.
-_Avoid_: similarity score, implicit deduplication
+A non-authoritative, generation-pinned review assessment comparing an AutomaticContextCandidate with existing immutable Context revisions. It distinguishes exact duplicate, support, revision, potential contradiction, unresolved relatedness, and novelty through typed evidence paths; retrieval similarity alone never becomes a knowledge fact.
+_Avoid_: confirmed conflict, BM25 fact, automatic governance decision
+
+**CandidateRelationAssessment**:
+One target-scoped conclusion inside CandidateAnalysis, carrying a confidence basis, typed comparison paths, and human-readable reasons. Exact duplicate requires full canonical draft equality, while potential contradiction and unresolved relatedness explicitly remain review hypotheses.
+_Avoid_: similarity label, authoritative ContextRelation
 
 **CandidateSpaceRecommendation**:
-A non-binding recommendation that an AutomaticContextCandidate is Primary or Related to an existing ContextSpace, or that a new Space Intent may be needed. Recommendations never create or select a Space.
+A non-binding, path-explained assessment that an AutomaticContextCandidate may be Primary or Related to an existing ContextSpace, or that a complete system-suggested new Space Intent may be needed. Recommendations never create, select, or resolve a conflicted Space Intent.
 _Avoid_: Candidate ownership, Active Space, automatic Space creation
 
 **TaskSpaceAssociation**:

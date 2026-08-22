@@ -4,11 +4,16 @@ use std::{
     thread,
 };
 
+use rusqlite::Connection;
 use sctx_domain::{
-    Applicability, CandidateId, CaptureEvidenceRef, CaptureId, CaptureUnknown, ErrorKind, EventId,
-    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, NormalizedBreadcrumbKind,
-    NormalizedWorkObservation, TaskId, TaskIntent, TaskIntentDraft, TaskSignal, TaskSignalKind,
-    TestOutcomeStatus, WorkEpisodeStatus, WorkSourceRef,
+    Applicability, AutomaticCandidateStatus, AutomaticContextCandidate, CandidateAnalysis,
+    CandidateAnalysisStatus, CandidateAssessmentPath, CandidateAssessmentRelation,
+    CandidateBuilderProvenance, CandidateConfidence, CandidateId, CandidateRelationAssessment,
+    CaptureEvidenceRef, CaptureId, CaptureUnknown, ContextCandidate, ContextKind,
+    ContextRevisionDraft, ErrorKind, EventId, EvidenceSnapshotDraft, EvidenceType,
+    ExternalSessionLocator, NormalizedBreadcrumbKind, NormalizedWorkObservation, TaskId,
+    TaskIntent, TaskIntentDraft, TaskSignal, TaskSignalKind, TestOutcomeStatus, WorkEpisodeStatus,
+    WorkSourceRef,
 };
 use sctx_task_runtime::{
     AgentCheckpointWrite, CandidateBuildItemPreparation, CandidateBuildItemStatus,
@@ -101,6 +106,26 @@ fn checkpoint_claim(statement: &str) -> CheckpointClaimDraft {
         }],
         artifact_refs: Vec::new(),
         related_contexts: Vec::new(),
+    }
+}
+
+fn candidate_content(statement: &str) -> ContextRevisionDraft {
+    ContextRevisionDraft {
+        kind: ContextKind::Discovery,
+        topic_key: Some("candidate/runtime-analysis".to_owned()),
+        statement: statement.to_owned(),
+        rationale: "Runtime-derived analysis is replaceable".to_owned(),
+        applicability: Applicability::default(),
+        assumptions: Vec::new(),
+        recheck_when: vec!["the analysis projection changes".to_owned()],
+        relations: Vec::new(),
+        evidence: vec![EvidenceSnapshotDraft {
+            kind: EvidenceType::ExperimentRecord,
+            supports: "the analysis replacement completed".to_owned(),
+            content: serde_json::json!({"actual": "stored"}),
+            interpretation: "derived review state is recoverable".to_owned(),
+            limitations: Vec::new(),
+        }],
     }
 }
 
@@ -378,6 +403,108 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
             )
             .is_err()
     );
+
+    let persisted = ContextCandidate {
+        candidate_id,
+        submission_id: first.submission_id,
+        source_episode: closed.episode.episode.ownership(),
+        content: candidate_content("Runtime Candidate analysis"),
+    };
+    let observation_ids = closed.checkpoint.claims[0]
+        .evidence_refs
+        .iter()
+        .filter_map(|evidence| match evidence {
+            CaptureEvidenceRef::Observation { observation_id } => Some(*observation_id),
+            _ => None,
+        })
+        .collect();
+    let automatic = AutomaticContextCandidate::from_persisted_candidate(
+        &persisted,
+        &closed.episode.episode,
+        &closed.episode.checkpoints,
+        CandidateBuilderProvenance {
+            build_id: promoted.build_id,
+            source_episode: closed.episode.episode.ownership(),
+            checkpoint_ids: vec![closed.checkpoint.checkpoint_id],
+            observation_ids,
+        },
+        CandidateAnalysis {
+            status: CandidateAnalysisStatus::Complete,
+            assessments: vec![CandidateRelationAssessment {
+                relation: CandidateAssessmentRelation::Novel,
+                target: None,
+                confidence: CandidateConfidence {
+                    basis_points: 6_000,
+                    rationale: "No target Context was retrieved".to_owned(),
+                },
+                paths: vec![CandidateAssessmentPath::NoSufficientCandidate],
+                reasons: vec!["No target Context was retrieved".to_owned()],
+            }],
+            context_tree_oid: Some("tree".to_owned()),
+            context_generation: Some(1),
+            graph_context_tree_oid: None,
+            artifact_generation: None,
+            token_budget: 1_024,
+            estimated_tokens: 100,
+            omitted_target_count: 0,
+            error_code: None,
+        },
+        Vec::new(),
+        CandidateConfidence {
+            basis_points: 6_000,
+            rationale: "Novel review result".to_owned(),
+        },
+        Vec::new(),
+        AutomaticCandidateStatus::NeedsSpaceReview,
+    )
+    .unwrap();
+    let mut failed = automatic.clone();
+    failed.analysis = CandidateAnalysis {
+        status: CandidateAnalysisStatus::Failed,
+        error_code: Some("analysis_dependency_unavailable".to_owned()),
+        ..CandidateAnalysis::default()
+    };
+    failed.confidence = CandidateConfidence {
+        basis_points: 0,
+        rationale: "Analysis failed and remains retryable".to_owned(),
+    };
+    failed.status = AutomaticCandidateStatus::Draft;
+    let first_analysis = runtime.replace_candidate_analysis(&failed).unwrap();
+    assert_eq!(first_analysis.analysis_generation, 1);
+    assert_eq!(
+        first_analysis.candidate.analysis.status,
+        CandidateAnalysisStatus::Failed
+    );
+    let completed = runtime.replace_candidate_analysis(&automatic).unwrap();
+    assert_eq!(completed.analysis_generation, 2);
+    let replaced = runtime.replace_candidate_analysis(&automatic).unwrap();
+    assert_eq!(replaced.analysis_generation, 3);
+    assert_eq!(
+        replaced.candidate.analysis.status,
+        CandidateAnalysisStatus::Complete
+    );
+    assert_eq!(
+        runtime
+            .read_candidate_analysis(candidate_id)
+            .unwrap()
+            .unwrap(),
+        replaced
+    );
+    Connection::open(runtime.database_path())
+        .unwrap()
+        .execute(
+            "DELETE FROM candidate_analysis WHERE candidate_id = ?1",
+            [candidate_id.to_string()],
+        )
+        .unwrap();
+    assert!(
+        runtime
+            .read_candidate_analysis(candidate_id)
+            .unwrap()
+            .is_none()
+    );
+    let recomputed = runtime.replace_candidate_analysis(&automatic).unwrap();
+    assert_eq!(recomputed.analysis_generation, 1);
 }
 
 #[test]

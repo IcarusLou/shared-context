@@ -1740,6 +1740,26 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
         rebuilt["data"]["items"][0]["submission_id"],
         closed["data"]["candidate_build"]["items"][0]["submission_id"]
     );
+    let candidate_id = closed["data"]["candidate_build"]["items"][0]["candidate_id"]
+        .as_str()
+        .unwrap();
+    let analyzed = harness.success(&[
+        "candidate",
+        "analyze",
+        "--candidate-id",
+        candidate_id,
+        "--token-budget",
+        "4096",
+        "--top-k",
+        "8",
+    ]);
+    assert_eq!(analyzed["command"], "candidate.analyze");
+    assert!(analyzed["data"]["analysis_generation"].as_u64().unwrap() >= 2);
+    assert_eq!(
+        analyzed["data"]["candidate"]["analysis"]["status"],
+        "complete"
+    );
+    assert_eq!(analyzed["data"]["candidate"]["candidate_id"], candidate_id);
 
     let business_repository = harness.home.join("business repository");
     fs::create_dir_all(&business_repository).unwrap();

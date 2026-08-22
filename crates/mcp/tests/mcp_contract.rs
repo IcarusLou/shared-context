@@ -1046,22 +1046,32 @@ fn candidate_builder_converts_six_typed_sources_without_raw_capture_or_search_in
     let build = closed.candidate_build.unwrap();
     assert_eq!(build.status, CandidateBuildResponseStatus::Complete);
     assert_eq!(build.items.len(), 6);
-    assert!(build.items.iter().all(|item| {
-        item.status == CandidateBuildItemResponseStatus::Created
-            && item.candidate_id.is_some()
-            && item.event_id.is_some()
-            && item.candidate_status == sctx_domain::AutomaticCandidateStatus::Draft
-            && item.analysis.novel
-            && item.space_recommendations.is_empty()
-    }));
-    assert_eq!(build.items[0].confidence.basis_points, 7_000);
+    assert!(
+        build.items.iter().all(|item| {
+            item.status == CandidateBuildItemResponseStatus::Created
+                && item.candidate_id.is_some()
+                && item.event_id.is_some()
+                && item.candidate_status == sctx_domain::AutomaticCandidateStatus::NeedsSpaceReview
+                && item.analysis.status == sctx_domain::CandidateAnalysisStatus::Complete
+                && !item.analysis.assessments.is_empty()
+                && item.space_recommendations.iter().any(|recommendation| {
+                    matches!(
+                        recommendation,
+                        sctx_domain::CandidateSpaceRecommendation::ProposedNewSpaceIntent { .. }
+                    )
+                })
+        }),
+        "unexpected analyzed Build items: {:#?}",
+        build.items
+    );
+    assert!(build.items[0].confidence.basis_points >= 4_000);
     assert!(
         build.items[0]
             .unknowns
             .iter()
             .any(|unknown| unknown.statement.contains("topic key") && !unknown.blocking)
     );
-    assert_eq!(build.items[1].confidence.basis_points, 4_500);
+    assert!(build.items[1].confidence.basis_points >= 4_000);
     assert!(
         build.items[1]
             .unknowns

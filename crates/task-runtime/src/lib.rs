@@ -14,18 +14,18 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sctx_domain::{
-    AgentCheckpoint, AgentCheckpointId, Applicability, ArtifactRef, CandidateBuildId, CandidateId,
-    CaptureEvidenceRef, CaptureId, CaptureSourceRef, CaptureUnknown, CheckpointClaim,
-    CheckpointClaimId, ContextRevisionRef, Error, ErrorKind, EventId, EvidenceSnapshotDraft,
-    ExternalSessionId, ExternalSessionLocator, ExternalSessionSnapshot, IntentRevisionRange,
-    NonLocatingSignalRef, NormalizedWorkObservation, Result, SignalId, SubmissionId, TaskId,
-    TaskIntent, TaskIntentDraft, TaskIntentRevision, TaskIntentRevisionId, TaskSessionId,
-    TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord,
-    WorkEpisode, WorkEpisodeId, WorkEpisodeRef, WorkEpisodeStatus, WorkObservation,
-    WorkObservationId, WorkSourceRef,
+    AgentCheckpoint, AgentCheckpointId, Applicability, ArtifactRef, AutomaticContextCandidate,
+    CandidateBuildId, CandidateId, CaptureEvidenceRef, CaptureId, CaptureSourceRef, CaptureUnknown,
+    CheckpointClaim, CheckpointClaimId, ContextRevisionRef, Error, ErrorKind, EventId,
+    EvidenceSnapshotDraft, ExternalSessionId, ExternalSessionLocator, ExternalSessionSnapshot,
+    IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation, Result, SignalId,
+    SubmissionId, TaskId, TaskIntent, TaskIntentDraft, TaskIntentRevision, TaskIntentRevisionId,
+    TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle,
+    TaskSignalRecord, WorkEpisode, WorkEpisodeId, WorkEpisodeRef, WorkEpisodeStatus,
+    WorkObservation, WorkObservationId, WorkSourceRef,
 };
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_EPISODE_LIST_LIMIT: usize = 256;
 
@@ -127,6 +127,13 @@ pub struct AgentCheckpointOutcome {
     pub episode: WorkEpisodeView,
     pub created: bool,
     pub inline_observation_ids: Vec<WorkObservationId>,
+}
+
+/// Current rebuildable Candidate analysis stored outside Git knowledge facts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateAnalysisView {
+    pub candidate: AutomaticContextCandidate,
+    pub analysis_generation: u64,
 }
 
 /// Aggregate state of one deterministic build over an immutable closed Episode.
@@ -1317,6 +1324,119 @@ impl TaskRuntime {
             .transpose()
     }
 
+    /// Atomically replaces the current rebuildable review analysis for one persisted Candidate.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a Candidate absent from the finalized Builder result, mismatched Episode sources,
+    /// invalid derived review state, or storage failures.
+    pub fn replace_candidate_analysis(
+        &self,
+        candidate: &AutomaticContextCandidate,
+    ) -> Result<CandidateAnalysisView> {
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Candidate analysis replacement")?;
+        let episode_id = transaction
+            .query_row(
+                "SELECT build.episode_id
+                 FROM candidate_build_item AS item
+                 JOIN candidate_build AS build ON build.build_id = item.build_id
+                 WHERE item.candidate_id = ?1
+                   AND item.status IN ('created', 'already_exists')",
+                [candidate.candidate_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sql_error("locate Candidate analysis Builder source"))?
+            .ok_or_else(|| invalid("Candidate analysis target is not a finalized Builder item"))?;
+        let episode_id = parse_id(&episode_id, "candidate_analysis.episode_id")?;
+        let episode = require_episode_view(&transaction, episode_id)?;
+        candidate.validate_against_sources(&episode.episode, &episode.checkpoints)?;
+        let prior_generation = transaction
+            .query_row(
+                "SELECT analysis_generation FROM candidate_analysis WHERE candidate_id = ?1",
+                [candidate.candidate_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(sql_error("read Candidate analysis generation"))?
+            .unwrap_or(0);
+        let analysis_generation = prior_generation
+            .checked_add(1)
+            .ok_or_else(|| invariant("Candidate analysis generation overflow"))?;
+        let candidate_json = serde_json::to_string(candidate)
+            .map_err(json_error("serialize derived Candidate analysis"))?;
+        transaction
+            .execute(
+                "INSERT INTO candidate_analysis (
+                    candidate_id, episode_id, analysis_generation, analysis_status,
+                    context_tree_oid, context_generation, graph_context_tree_oid,
+                    artifact_generation, candidate_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(candidate_id) DO UPDATE SET
+                    episode_id = excluded.episode_id,
+                    analysis_generation = excluded.analysis_generation,
+                    analysis_status = excluded.analysis_status,
+                    context_tree_oid = excluded.context_tree_oid,
+                    context_generation = excluded.context_generation,
+                    graph_context_tree_oid = excluded.graph_context_tree_oid,
+                    artifact_generation = excluded.artifact_generation,
+                    candidate_json = excluded.candidate_json",
+                params![
+                    candidate.candidate_id.to_string(),
+                    episode_id.to_string(),
+                    analysis_generation,
+                    candidate_analysis_status_name(candidate.analysis.status),
+                    candidate.analysis.context_tree_oid,
+                    candidate
+                        .analysis
+                        .context_generation
+                        .map(|value| value.to_string()),
+                    candidate.analysis.graph_context_tree_oid,
+                    candidate.analysis.artifact_generation,
+                    candidate_json,
+                ],
+            )
+            .map_err(sql_error("replace Candidate analysis"))?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit Candidate analysis replacement"))?;
+        Ok(CandidateAnalysisView {
+            candidate: candidate.clone(),
+            analysis_generation: u64::try_from(analysis_generation)
+                .map_err(|_| invariant("negative Candidate analysis generation"))?,
+        })
+    }
+
+    /// Reads the current rebuildable Candidate analysis by Candidate identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed parse or storage failures; absence remains `None`.
+    pub fn read_candidate_analysis(
+        &self,
+        candidate_id: CandidateId,
+    ) -> Result<Option<CandidateAnalysisView>> {
+        self.open_connection()?
+            .query_row(
+                "SELECT candidate_json, analysis_generation
+                 FROM candidate_analysis WHERE candidate_id = ?1",
+                [candidate_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(sql_error("read Candidate analysis"))?
+            .map(|(candidate_json, generation)| {
+                Ok(CandidateAnalysisView {
+                    candidate: serde_json::from_str(&candidate_json)
+                        .map_err(json_error("parse Candidate analysis"))?,
+                    analysis_generation: u64::try_from(generation)
+                        .map_err(|_| invariant("negative Candidate analysis generation"))?,
+                })
+            })
+            .transpose()
+    }
+
     /// Reads any retained Task by `TaskSessionId`.
     ///
     /// # Errors
@@ -1625,6 +1745,20 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 FOREIGN KEY (build_id) REFERENCES candidate_build (build_id),
                 FOREIGN KEY (checkpoint_id) REFERENCES agent_checkpoint (checkpoint_id)
             ) STRICT;
+            CREATE TABLE IF NOT EXISTS candidate_analysis (
+                candidate_id TEXT PRIMARY KEY,
+                episode_id TEXT NOT NULL,
+                analysis_generation INTEGER NOT NULL CHECK (analysis_generation > 0),
+                analysis_status TEXT NOT NULL CHECK (
+                    analysis_status IN ('pending', 'complete', 'failed')
+                ),
+                context_tree_oid TEXT,
+                context_generation TEXT,
+                graph_context_tree_oid TEXT,
+                artifact_generation TEXT,
+                candidate_json TEXT NOT NULL CHECK (json_valid(candidate_json)),
+                FOREIGN KEY (episode_id) REFERENCES work_episode (episode_id)
+            ) STRICT;
             CREATE TABLE IF NOT EXISTS work_episode_diagnostic (
                 episode_id TEXT NOT NULL,
                 diagnostic_ordinal INTEGER NOT NULL CHECK (diagnostic_ordinal >= 0),
@@ -1637,7 +1771,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 UNIQUE (episode_id, capture_id, kind),
                 FOREIGN KEY (episode_id) REFERENCES work_episode (episode_id)
             ) STRICT;
-            PRAGMA user_version = 7;",
+            PRAGMA user_version = 8;",
         )
         .map_err(sql_error("initialize task runtime schema"))
 }
@@ -2289,6 +2423,16 @@ fn parse_candidate_build_item_status(value: &str) -> Result<CandidateBuildItemSt
         _ => Err(invariant(
             "persisted Candidate Build item status is invalid",
         )),
+    }
+}
+
+const fn candidate_analysis_status_name(
+    status: sctx_domain::CandidateAnalysisStatus,
+) -> &'static str {
+    match status {
+        sctx_domain::CandidateAnalysisStatus::Pending => "pending",
+        sctx_domain::CandidateAnalysisStatus::Complete => "complete",
+        sctx_domain::CandidateAnalysisStatus::Failed => "failed",
     }
 }
 

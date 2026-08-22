@@ -19,12 +19,14 @@ pub use engineering::{
 };
 pub use episode::{
     AgentCheckpoint, ArtifactAction, ArtifactRef, AutomaticCandidateStatus,
-    AutomaticContextCandidate, CandidateAnalysis, CandidateBuilderProvenance, CandidateConfidence,
-    CandidateSpaceRecommendation, CaptureEvidenceRef, CaptureSourceRef, CaptureUnknown,
-    CheckpointClaim, ContextCandidate, ContextRevisionRef, ContextUseDisposition,
-    IntentRevisionRange, NonLocatingSignalRef, NormalizedBreadcrumbKind, NormalizedWorkObservation,
-    RecommendedSpaceRole, TestOutcomeStatus, WorkEpisode, WorkEpisodeRef, WorkEpisodeStatus,
-    WorkObservation, WorkSourceRef, candidate_submission_content_hash,
+    AutomaticContextCandidate, CandidateAnalysis, CandidateAnalysisStatus, CandidateAssessmentPath,
+    CandidateAssessmentRelation, CandidateBuilderProvenance, CandidateConfidence,
+    CandidateRelationAssessment, CandidateSpaceRecommendation, CandidateSpaceRecommendationPath,
+    CaptureEvidenceRef, CaptureSourceRef, CaptureUnknown, CheckpointClaim, ContextCandidate,
+    ContextRevisionRef, ContextUseDisposition, IntentRevisionRange, NonLocatingSignalRef,
+    NormalizedBreadcrumbKind, NormalizedWorkObservation, RecommendedSpaceRole, TestOutcomeStatus,
+    WorkEpisode, WorkEpisodeRef, WorkEpisodeStatus, WorkObservation, WorkSourceRef,
+    candidate_submission_content_hash,
 };
 pub use ids::{
     AgentCheckpointId, CandidateBuildId, CandidateId, CaptureId, CheckpointClaimId, ConflictId,

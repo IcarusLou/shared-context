@@ -42,7 +42,7 @@ use sctx_local_state::{
     CatalogCheckoutStatus, RepositoryCatalogSnapshot, UserConfigStore,
 };
 use sctx_mcp::{
-    ArtifactFocusQuery, AssociationExplainInput, AssociationRebuildInput,
+    ArtifactFocusQuery, AssociationExplainInput, AssociationRebuildInput, CandidateAnalyzeInput,
     EngineeringReferenceRecordInput, RepositoryScanInput, TaskCheckpointInput,
     TaskContextReadInput, TaskIntentUpdateInput, TaskSignalSupersedeInput,
 };
@@ -65,7 +65,7 @@ Commands:
   uninstall [--root PATH]
   knowledge delete --confirm-path PATH --confirm DELETE-SHARED-CONTEXT-KNOWLEDGE
   space create|intent revise|list|get
-  candidate create|build-closed-episode
+  candidate create|build-closed-episode|analyze
   context revise|review|publish|withdraw|get
   semantic conflict open|resolve
   task context|artifact-focus|checkpoint|intent update|signal supersede
@@ -1115,6 +1115,33 @@ fn run_space(args: &[String], json_output: bool) -> Result<()> {
 #[allow(clippy::too_many_lines)]
 fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
     match args {
+        [command, rest @ ..] if command == "analyze" => {
+            if is_help(rest) {
+                println!(
+                    "Usage: sctx candidate analyze --candidate-id <ID> [--token-budget <N>] [--top-k <N>]"
+                );
+                return Ok(());
+            }
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(&["--candidate-id", "--token-budget", "--top-k"], &[])?;
+            let input = CandidateAnalyzeInput {
+                candidate_id: options.required("--candidate-id")?.to_owned(),
+                token_budget: parse_usize(
+                    options.optional("--token-budget")?.unwrap_or("4096"),
+                    "token budget",
+                )?,
+                top_k: parse_usize(options.optional("--top-k")?.unwrap_or("16"), "top k")?,
+            };
+            let response = sctx_mcp::candidate_analyze_at_root(installation_root()?, &input)?;
+            let metadata = Runtime::open()?.index.synchronize()?.metadata;
+            emit(
+                "candidate.analyze",
+                &metadata,
+                serde_json::to_value(response)
+                    .map_err(json_error("serialize Candidate analysis response"))?,
+                json_output,
+            )
+        }
         [command, rest @ ..] if command == "build-closed-episode" => {
             if is_help(rest) {
                 println!("Usage: sctx candidate build-closed-episode --episode-id <ID>");
@@ -1216,7 +1243,7 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
             )
         }
         _ => Err(invalid(format!(
-            "invalid candidate command; expected create|build-closed-episode\n\n{CONTEXT_WRITE_HELP}"
+            "invalid candidate command; expected create|build-closed-episode|analyze\n\n{CONTEXT_WRITE_HELP}"
         ))),
     }
 }

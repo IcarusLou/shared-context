@@ -5,10 +5,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AgentCheckpointId, Applicability, ArtifactLocator, CandidateBuildId, CandidateId, CaptureId,
-    CheckpointClaimId, ContextId, ContextRevisionDraft, Error, ErrorKind, EvidenceId,
-    EvidenceSnapshotDraft, IntentSnapshot, RepositoryId, Result, RevisionId, SignalId, SpaceId,
-    SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId,
-    TaskSignalKind, WorkEpisodeId, WorkObservationId,
+    CheckpointClaimId, ContextId, ContextRelationKind, ContextRevisionDraft, Error, ErrorKind,
+    EvidenceId, EvidenceSnapshotDraft, IntentSnapshot, RepositoryId, Result, RevisionId, SignalId,
+    SpaceId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId, TaskSignalKind,
+    WorkEpisodeId, WorkObservationId,
 };
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -797,62 +797,231 @@ impl CandidateBuilderProvenance {
     }
 }
 
-/// Relationship analysis between a Candidate and existing Context revisions.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Lifecycle of one rebuildable Candidate review analysis.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateAnalysisStatus {
+    Pending,
+    Complete,
+    Failed,
+}
+
+/// Non-authoritative relationship assessed against one immutable Context revision.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateAssessmentRelation {
+    ExactDuplicate,
+    Supports,
+    Revises,
+    PotentialContradiction,
+    UnresolvedRelated,
+    Novel,
+}
+
+/// Typed comparison or retrieval evidence supporting one Candidate assessment.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CandidateAssessmentPath {
+    CanonicalDraftEquality,
+    StatementEquality,
+    TopicEquality {
+        topic_key: String,
+    },
+    ExplicitRelatedContext,
+    ExactArtifactGraph {
+        artifact: ArtifactRef,
+    },
+    ContextRelationHop {
+        relation: ContextRelationKind,
+        depth: u8,
+    },
+    ContextFullText {
+        matched_terms: Vec<String>,
+    },
+    ScopeOverlap {
+        domains: Vec<String>,
+        platforms: Vec<String>,
+        conditions: Vec<String>,
+    },
+    SafetyDiagnostic {
+        reason: String,
+    },
+    NoSufficientCandidate,
+}
+
+impl CandidateAssessmentPath {
+    fn validate(&self, field: &str) -> Result<()> {
+        match self {
+            Self::CanonicalDraftEquality
+            | Self::StatementEquality
+            | Self::ExplicitRelatedContext
+            | Self::NoSufficientCandidate => Ok(()),
+            Self::TopicEquality { topic_key } => {
+                require_text(topic_key, &format!("{field}.topic_key"))
+            }
+            Self::ExactArtifactGraph { artifact } => artifact.validate(),
+            Self::ContextRelationHop { depth, .. } => {
+                if *depth == 0 || *depth > 2 {
+                    return Err(invalid(format!("{field}.depth must be one or two")));
+                }
+                Ok(())
+            }
+            Self::ContextFullText { matched_terms } => {
+                if matched_terms.is_empty() {
+                    return Err(invalid(format!("{field}.matched_terms must not be empty")));
+                }
+                require_text_items(matched_terms, &format!("{field}.matched_terms"))
+            }
+            Self::ScopeOverlap {
+                domains,
+                platforms,
+                conditions,
+            } => {
+                if domains.is_empty() && platforms.is_empty() && conditions.is_empty() {
+                    return Err(invalid(format!("{field} requires an overlapping scope")));
+                }
+                require_text_items(domains, &format!("{field}.domains"))?;
+                require_text_items(platforms, &format!("{field}.platforms"))?;
+                require_text_items(conditions, &format!("{field}.conditions"))
+            }
+            Self::SafetyDiagnostic { reason } => require_text(reason, &format!("{field}.reason")),
+        }
+    }
+}
+
+/// One evidence-linked review assessment; it never creates an authoritative Context relation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateRelationAssessment {
+    pub relation: CandidateAssessmentRelation,
+    pub target: Option<ContextRevisionRef>,
+    pub confidence: CandidateConfidence,
+    pub paths: Vec<CandidateAssessmentPath>,
+    pub reasons: Vec<String>,
+}
+
+impl CandidateRelationAssessment {
+    fn validate(&self, field: &str) -> Result<()> {
+        match (self.relation, self.target) {
+            (CandidateAssessmentRelation::Novel, Some(_)) => {
+                return Err(invalid(format!("{field}.novel must not have a target")));
+            }
+            (CandidateAssessmentRelation::Novel, None) | (_, Some(_)) => {}
+            (_, None) => return Err(invalid(format!("{field} requires a target"))),
+        }
+        self.confidence.validate(&format!("{field}.confidence"))?;
+        if self.paths.is_empty() || self.reasons.is_empty() {
+            return Err(invalid(format!("{field} requires typed paths and reasons")));
+        }
+        require_unique(&self.paths, &format!("{field}.paths"))?;
+        for (index, path) in self.paths.iter().enumerate() {
+            path.validate(&format!("{field}.paths[{index}]"))?;
+        }
+        require_text_items(&self.reasons, &format!("{field}.reasons"))?;
+        if self.relation == CandidateAssessmentRelation::ExactDuplicate
+            && !self
+                .paths
+                .contains(&CandidateAssessmentPath::CanonicalDraftEquality)
+        {
+            return Err(invalid(format!(
+                "{field}.exact_duplicate requires canonical draft equality"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Generation-pinned, rebuildable Candidate review assessment.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateAnalysis {
-    pub duplicate_of: Vec<ContextRevisionRef>,
-    pub supports: Vec<ContextRevisionRef>,
-    pub revises: Vec<ContextRevisionRef>,
-    pub contradicts: Vec<ContextRevisionRef>,
-    pub novel: bool,
+    pub status: CandidateAnalysisStatus,
+    pub assessments: Vec<CandidateRelationAssessment>,
+    pub context_tree_oid: Option<String>,
+    pub context_generation: Option<u64>,
+    pub graph_context_tree_oid: Option<String>,
+    pub artifact_generation: Option<String>,
+    pub token_budget: usize,
+    pub estimated_tokens: usize,
+    pub omitted_target_count: usize,
+    pub error_code: Option<String>,
+}
+
+impl Default for CandidateAnalysis {
+    fn default() -> Self {
+        Self {
+            status: CandidateAnalysisStatus::Pending,
+            assessments: Vec::new(),
+            context_tree_oid: None,
+            context_generation: None,
+            graph_context_tree_oid: None,
+            artifact_generation: None,
+            token_budget: 0,
+            estimated_tokens: 0,
+            omitted_target_count: 0,
+            error_code: None,
+        }
+    }
 }
 
 impl CandidateAnalysis {
-    /// Validates analysis exclusivity and supported coexistence rules.
-    ///
-    /// Novel is exclusive. Duplicate is exclusive per target. Supports and Contradicts may not
-    /// name the same target; Revises may coexist with either to express partial continuity.
+    /// Validates analysis lifecycle, provenance and target uniqueness.
     ///
     /// # Errors
     ///
-    /// Returns an input error for an empty, duplicate, or contradictory classification.
+    /// Returns an input error for incomplete provenance, duplicate targets, or an invalid Novel
+    /// assessment.
     pub fn validate(&self) -> Result<()> {
-        for (values, field) in [
-            (&self.duplicate_of, "candidate_analysis.duplicate_of"),
-            (&self.supports, "candidate_analysis.supports"),
-            (&self.revises, "candidate_analysis.revises"),
-            (&self.contradicts, "candidate_analysis.contradicts"),
-        ] {
-            require_unique(values, field)?;
+        match self.status {
+            CandidateAnalysisStatus::Pending => {
+                if !self.assessments.is_empty() || self.error_code.is_some() {
+                    return Err(invalid(
+                        "pending Candidate analysis cannot contain results or an error",
+                    ));
+                }
+                return Ok(());
+            }
+            CandidateAnalysisStatus::Failed => {
+                if !self.assessments.is_empty()
+                    || self.error_code.as_deref().is_none_or(str::is_empty)
+                {
+                    return Err(invalid(
+                        "failed Candidate analysis requires only a typed error code",
+                    ));
+                }
+                return Ok(());
+            }
+            CandidateAnalysisStatus::Complete => {}
         }
-        let has_relationship = !self.duplicate_of.is_empty()
-            || !self.supports.is_empty()
-            || !self.revises.is_empty()
-            || !self.contradicts.is_empty();
-        if self.novel == has_relationship {
+        if self.context_tree_oid.as_deref().is_none_or(str::is_empty)
+            || self.context_generation.is_none()
+            || self.assessments.is_empty()
+            || self.error_code.is_some()
+        {
             return Err(invalid(
-                "candidate_analysis must be novel or contain relationships, but not both",
+                "complete Candidate analysis requires Context provenance and assessments",
             ));
         }
-        let duplicates = self.duplicate_of.iter().copied().collect::<BTreeSet<_>>();
-        let others = self
-            .supports
-            .iter()
-            .chain(&self.revises)
-            .chain(&self.contradicts)
-            .copied()
-            .collect::<BTreeSet<_>>();
-        if !duplicates.is_disjoint(&others) {
+        if self.estimated_tokens > self.token_budget {
             return Err(invalid(
-                "candidate_analysis duplicate targets cannot have another classification",
+                "Candidate analysis estimated tokens exceed its budget",
             ));
         }
-        let supports = self.supports.iter().copied().collect::<BTreeSet<_>>();
-        let contradicts = self.contradicts.iter().copied().collect::<BTreeSet<_>>();
-        if !supports.is_disjoint(&contradicts) {
+        let mut targets = HashSet::new();
+        let mut novel = 0_usize;
+        for (index, assessment) in self.assessments.iter().enumerate() {
+            assessment.validate(&format!("candidate_analysis.assessments[{index}]"))?;
+            if assessment.relation == CandidateAssessmentRelation::Novel {
+                novel = novel.saturating_add(1);
+            } else if !targets.insert(assessment.target) {
+                return Err(invalid(
+                    "candidate_analysis must not assess one target more than once",
+                ));
+            }
+        }
+        if novel > 0 && (novel != 1 || self.assessments.len() != 1) {
             return Err(invalid(
-                "candidate_analysis target cannot be both supports and contradicts",
+                "novel Candidate analysis must be one exclusive assessment",
             ));
         }
         Ok(())
@@ -886,22 +1055,74 @@ pub enum RecommendedSpaceRole {
     Related,
 }
 
+/// Typed evidence for a non-binding Candidate Space recommendation.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CandidateSpaceRecommendationPath {
+    CandidateTarget {
+        relation: CandidateAssessmentRelation,
+        target: ContextRevisionRef,
+    },
+    SourceTaskAssociation {
+        reason: String,
+    },
+    SpaceIntentMatch {
+        matched_terms: Vec<String>,
+    },
+    IntentConflict {
+        head_count: usize,
+    },
+    ProposedFromCandidate,
+    ManualReview,
+}
+
+impl CandidateSpaceRecommendationPath {
+    fn validate(&self, field: &str) -> Result<()> {
+        match self {
+            Self::CandidateTarget { relation, .. } => {
+                if *relation == CandidateAssessmentRelation::Novel {
+                    return Err(invalid(format!(
+                        "{field}.candidate_target cannot use novel"
+                    )));
+                }
+                Ok(())
+            }
+            Self::SourceTaskAssociation { reason } => {
+                require_text(reason, &format!("{field}.reason"))
+            }
+            Self::SpaceIntentMatch { matched_terms } => {
+                if matched_terms.is_empty() {
+                    return Err(invalid(format!("{field}.matched_terms must not be empty")));
+                }
+                require_text_items(matched_terms, &format!("{field}.matched_terms"))
+            }
+            Self::IntentConflict { head_count } => {
+                if *head_count < 2 {
+                    return Err(invalid(format!("{field}.head_count must be at least two")));
+                }
+                Ok(())
+            }
+            Self::ProposedFromCandidate | Self::ManualReview => Ok(()),
+        }
+    }
+}
+
 /// Candidate Space recommendation; it never establishes ownership.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CandidateSpaceRecommendation {
     Existing {
-        recommendation_id: SpaceRecommendationId,
         space_id: SpaceId,
         role: RecommendedSpaceRole,
         rationale: String,
         confidence: CandidateConfidence,
+        paths: Vec<CandidateSpaceRecommendationPath>,
     },
     ProposedNewSpaceIntent {
-        recommendation_id: SpaceRecommendationId,
         proposed_new_space_intent: IntentSnapshot,
         rationale: String,
         confidence: CandidateConfidence,
+        paths: Vec<CandidateSpaceRecommendationPath>,
     },
 }
 
@@ -914,11 +1135,11 @@ impl CandidateSpaceRecommendation {
         confidence: CandidateConfidence,
     ) -> Self {
         Self::Existing {
-            recommendation_id: SpaceRecommendationId::new(),
             space_id,
             role,
             rationale: rationale.into(),
             confidence,
+            paths: vec![CandidateSpaceRecommendationPath::ManualReview],
         }
     }
 
@@ -929,10 +1150,42 @@ impl CandidateSpaceRecommendation {
         confidence: CandidateConfidence,
     ) -> Self {
         Self::ProposedNewSpaceIntent {
-            recommendation_id: SpaceRecommendationId::new(),
             proposed_new_space_intent: intent,
             rationale: rationale.into(),
             confidence,
+            paths: vec![CandidateSpaceRecommendationPath::ProposedFromCandidate],
+        }
+    }
+
+    /// Recommends an existing Space with explicit derived paths.
+    pub fn existing_with_paths(
+        space_id: SpaceId,
+        role: RecommendedSpaceRole,
+        rationale: impl Into<String>,
+        confidence: CandidateConfidence,
+        paths: Vec<CandidateSpaceRecommendationPath>,
+    ) -> Self {
+        Self::Existing {
+            space_id,
+            role,
+            rationale: rationale.into(),
+            confidence,
+            paths,
+        }
+    }
+
+    /// Recommends a complete proposed Space Intent with explicit derived paths.
+    pub fn proposed_new_with_paths(
+        intent: IntentSnapshot,
+        rationale: impl Into<String>,
+        confidence: CandidateConfidence,
+        paths: Vec<CandidateSpaceRecommendationPath>,
+    ) -> Self {
+        Self::ProposedNewSpaceIntent {
+            proposed_new_space_intent: intent,
+            rationale: rationale.into(),
+            confidence,
+            paths,
         }
     }
 
@@ -941,48 +1194,49 @@ impl CandidateSpaceRecommendation {
             Self::Existing {
                 rationale,
                 confidence,
+                paths,
                 ..
             } => {
                 require_text(rationale, &format!("{field}.rationale"))?;
-                confidence.validate(&format!("{field}.confidence"))
+                confidence.validate(&format!("{field}.confidence"))?;
+                validate_recommendation_paths(paths, field)
             }
             Self::ProposedNewSpaceIntent {
                 proposed_new_space_intent,
                 rationale,
                 confidence,
+                paths,
                 ..
             } => {
                 proposed_new_space_intent.validate()?;
                 require_text(rationale, &format!("{field}.rationale"))?;
-                confidence.validate(&format!("{field}.confidence"))
+                confidence.validate(&format!("{field}.confidence"))?;
+                validate_recommendation_paths(paths, field)
             }
-        }
-    }
-
-    const fn recommendation_id(&self) -> SpaceRecommendationId {
-        match self {
-            Self::Existing {
-                recommendation_id, ..
-            }
-            | Self::ProposedNewSpaceIntent {
-                recommendation_id, ..
-            } => *recommendation_id,
         }
     }
 }
 
+fn validate_recommendation_paths(
+    paths: &[CandidateSpaceRecommendationPath],
+    field: &str,
+) -> Result<()> {
+    if paths.is_empty() {
+        return Err(invalid(format!("{field}.paths must not be empty")));
+    }
+    require_unique(paths, &format!("{field}.paths"))?;
+    for (index, path) in paths.iter().enumerate() {
+        path.validate(&format!("{field}.paths[{index}]"))?;
+    }
+    Ok(())
+}
+
 fn validate_recommendations(values: &[CandidateSpaceRecommendation]) -> Result<()> {
-    let mut ids = HashSet::with_capacity(values.len());
     let mut existing_spaces = HashSet::new();
     let mut primary_count = 0_usize;
     let mut proposed_count = 0_usize;
     for (index, recommendation) in values.iter().enumerate() {
         recommendation.validate(&format!("space_recommendations[{index}]"))?;
-        if !ids.insert(recommendation.recommendation_id()) {
-            return Err(invalid(
-                "space_recommendations must not repeat RecommendationId",
-            ));
-        }
         match recommendation {
             CandidateSpaceRecommendation::Existing { space_id, role, .. } => {
                 if !existing_spaces.insert(*space_id) {
@@ -1012,6 +1266,8 @@ pub enum AutomaticCandidateStatus {
     Draft,
     NeedsEvidence,
     NeedsSpaceReview,
+    ExactDuplicateReview,
+    PotentialContradictionReview,
     ReadyForReview,
 }
 
@@ -1380,6 +1636,43 @@ mod tests {
         }
     }
 
+    fn assessment(
+        relation: CandidateAssessmentRelation,
+        target: Option<ContextRevisionRef>,
+        paths: Vec<CandidateAssessmentPath>,
+    ) -> CandidateRelationAssessment {
+        CandidateRelationAssessment {
+            relation,
+            target,
+            confidence: confidence(8_000),
+            paths,
+            reasons: vec!["Typed Candidate review assessment".to_owned()],
+        }
+    }
+
+    fn complete_analysis(assessments: Vec<CandidateRelationAssessment>) -> CandidateAnalysis {
+        CandidateAnalysis {
+            status: CandidateAnalysisStatus::Complete,
+            assessments,
+            context_tree_oid: Some("tree".to_owned()),
+            context_generation: Some(1),
+            graph_context_tree_oid: None,
+            artifact_generation: None,
+            token_budget: 1_000,
+            estimated_tokens: 100,
+            omitted_target_count: 0,
+            error_code: None,
+        }
+    }
+
+    fn novel_analysis() -> CandidateAnalysis {
+        complete_analysis(vec![assessment(
+            CandidateAssessmentRelation::Novel,
+            None,
+            vec![CandidateAssessmentPath::NoSufficientCandidate],
+        )])
+    }
+
     fn proposed_intent(title: &str) -> IntentSnapshot {
         IntentSnapshot {
             title: title.to_owned(),
@@ -1628,10 +1921,7 @@ mod tests {
             std::slice::from_ref(&fixture.checkpoint),
             content(),
             provenance(&fixture),
-            CandidateAnalysis {
-                novel: true,
-                ..CandidateAnalysis::default()
-            },
+            novel_analysis(),
             vec![recommendation.clone(), recommendation],
             confidence(9_000),
             Vec::new(),
@@ -1644,10 +1934,7 @@ mod tests {
             std::slice::from_ref(&fixture.checkpoint),
             content(),
             provenance(&fixture),
-            CandidateAnalysis {
-                novel: true,
-                ..CandidateAnalysis::default()
-            },
+            novel_analysis(),
             vec![
                 CandidateSpaceRecommendation::existing(
                     SpaceId::new(),
@@ -1691,10 +1978,7 @@ mod tests {
                 std::slice::from_ref(&alternate_checkpoint),
                 content(),
                 without_final_checkpoint,
-                CandidateAnalysis {
-                    novel: true,
-                    ..CandidateAnalysis::default()
-                },
+                novel_analysis(),
                 Vec::new(),
                 confidence(8_000),
                 Vec::new(),
@@ -1731,10 +2015,7 @@ mod tests {
                 std::slice::from_ref(&fixture.checkpoint),
                 missing,
                 provenance(&fixture),
-                CandidateAnalysis {
-                    novel: true,
-                    ..CandidateAnalysis::default()
-                },
+                novel_analysis(),
                 Vec::new(),
                 confidence(5_000),
                 vec![unknown(true)],
@@ -1752,10 +2033,7 @@ mod tests {
             std::slice::from_ref(&fixture.checkpoint),
             content(),
             provenance(&fixture),
-            CandidateAnalysis {
-                novel: true,
-                ..CandidateAnalysis::default()
-            },
+            novel_analysis(),
             Vec::new(),
             confidence(7_000),
             Vec::new(),
@@ -1792,10 +2070,7 @@ mod tests {
             std::slice::from_ref(&fixture.checkpoint),
             content(),
             provenance(&fixture),
-            CandidateAnalysis {
-                novel: true,
-                ..CandidateAnalysis::default()
-            },
+            novel_analysis(),
             recommendations,
             confidence(9_000),
             Vec::new(),
@@ -1819,57 +2094,55 @@ mod tests {
             context_id: ContextId::new(),
             revision_id: RevisionId::new(),
         };
+        assert!(novel_analysis().validate().is_ok());
+        assert!(CandidateAnalysis::default().validate().is_ok());
         assert!(
-            CandidateAnalysis {
-                novel: true,
-                ..CandidateAnalysis::default()
-            }
-            .validate()
-            .is_ok()
-        );
-        assert!(CandidateAnalysis::default().validate().is_err());
-        assert!(
-            CandidateAnalysis {
-                supports: vec![target],
-                novel: true,
-                ..CandidateAnalysis::default()
-            }
-            .validate()
-            .is_err()
-        );
-        assert!(
-            CandidateAnalysis {
-                duplicate_of: vec![target],
-                revises: vec![target],
-                ..CandidateAnalysis::default()
-            }
+            complete_analysis(vec![
+                assessment(
+                    CandidateAssessmentRelation::Novel,
+                    None,
+                    vec![CandidateAssessmentPath::NoSufficientCandidate],
+                ),
+                assessment(
+                    CandidateAssessmentRelation::Supports,
+                    Some(target),
+                    vec![CandidateAssessmentPath::StatementEquality],
+                ),
+            ])
             .validate()
             .is_err()
         );
         assert!(
-            CandidateAnalysis {
-                supports: vec![target],
-                contradicts: vec![target],
-                ..CandidateAnalysis::default()
-            }
+            complete_analysis(vec![assessment(
+                CandidateAssessmentRelation::ExactDuplicate,
+                Some(target),
+                vec![CandidateAssessmentPath::StatementEquality],
+            )])
             .validate()
             .is_err()
         );
         assert!(
-            CandidateAnalysis {
-                supports: vec![target],
-                revises: vec![target],
-                ..CandidateAnalysis::default()
-            }
+            complete_analysis(vec![
+                assessment(
+                    CandidateAssessmentRelation::Supports,
+                    Some(target),
+                    vec![CandidateAssessmentPath::StatementEquality],
+                ),
+                assessment(
+                    CandidateAssessmentRelation::Revises,
+                    Some(target),
+                    vec![CandidateAssessmentPath::ExplicitRelatedContext],
+                ),
+            ])
             .validate()
-            .is_ok()
+            .is_err()
         );
         assert!(
-            CandidateAnalysis {
-                contradicts: vec![target],
-                revises: vec![target],
-                ..CandidateAnalysis::default()
-            }
+            complete_analysis(vec![assessment(
+                CandidateAssessmentRelation::Supports,
+                Some(target),
+                vec![CandidateAssessmentPath::StatementEquality],
+            )])
             .validate()
             .is_ok()
         );
@@ -1889,10 +2162,7 @@ mod tests {
             &fixture.episode,
             std::slice::from_ref(&fixture.checkpoint),
             provenance(&fixture),
-            CandidateAnalysis {
-                novel: true,
-                ..CandidateAnalysis::default()
-            },
+            novel_analysis(),
             Vec::new(),
             confidence(7_000),
             Vec::new(),
@@ -1906,10 +2176,7 @@ mod tests {
             std::slice::from_ref(&fixture.checkpoint),
             content(),
             provenance(&fixture),
-            CandidateAnalysis {
-                novel: true,
-                ..CandidateAnalysis::default()
-            },
+            novel_analysis(),
             Vec::new(),
             confidence(9_000),
             Vec::new(),
@@ -1931,10 +2198,7 @@ mod tests {
             std::slice::from_ref(&fixture.checkpoint),
             content(),
             provenance(&fixture),
-            CandidateAnalysis {
-                novel: true,
-                ..CandidateAnalysis::default()
-            },
+            novel_analysis(),
             Vec::new(),
             confidence(9_000),
             vec![unknown(false)],

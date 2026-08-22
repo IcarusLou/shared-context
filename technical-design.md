@@ -19,7 +19,7 @@
 | **M1：Task-first 领域与入口基础** | **已实现** | `TaskIntent` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；CLI/MCP 通过 `candidate_create` 创建无 Space Candidate；Candidate 不可自动注入 |
 | **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、严格 `task_intent_update` 与只读 `task_context` 已通过跨 crate/E2E 验收 |
 | **M3：Engineering Graph** | **已实现** | 稳定本机 Repository Catalog、可重建 Registry、Reference-derived 有界扫描、build-time immutable Context/safety snapshot、历史 Graph Retrieval、ContextRelation 1–2 跳及 MCP/CLI 工作流已通过固定跨 crate/E2E oracle |
-| **M4：Low-tax Capture** | **基础部分已实现** | #117 已实现 submission-idempotent Candidate admission；#156/#157/#158 已持久化可验证 WorkEpisode、normalized Observation、typed Capture、显式 AgentCheckpoint 与确定性 Candidate Builder；尚无自动聚合、知识语义去重/冲突、Space 推荐或 Candidate Confirm/List/Discard |
+| **M4：Low-tax Capture** | **基础部分已实现** | #117 已实现 submission-idempotent Candidate admission；#156/#157/#158/#159 已持久化可验证 WorkEpisode、normalized Observation、typed Capture、显式 AgentCheckpoint、确定性 Candidate Builder 与derived Candidate review analysis；尚无自动聚合或 Candidate Confirm/List/Get/Discard |
 
 当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订权威 TaskIntent，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示。PostToolUse 的 File observation 只形成带 Session/optional Task owner 的 redacted Capture Breadcrumb，可识别测试工具只形成非定位 TestOutcome；Hook 不运行 Git、Scanner、Registry sync、Graph rebuild、Focus 提交或 Episode open/ingest。显式 Graph 工具完成 bounded scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。当前 `candidate_create` 仍是手工、无归属的 M1 入口，不等同于 M4 自动 Capture。
 
@@ -766,6 +766,8 @@ repository/
 | `work_observation` / `work_observation_source` | server-owned normalized meaning 与 typed sources |
 | `capture_ingestion` | `CaptureId → Episode/Observation` 唯一幂等记录 |
 | `agent_checkpoint` | Episode parent-version 语义幂等的完整 Claims/Unknowns、server IDs 与 continue/close boundary |
+| `candidate_build` / `candidate_build_item` | closed Episode/Claim-scoped Builder reservation、submission identity 与#117结果 |
+| `candidate_analysis` | 可删除重算、按CandidateId替换的current derived review JSON与固定Context/Graph generations |
 | `work_episode_diagnostic` | unconfigured/unsafe Capture Artifact 映射诊断 |
 
 Capture 文件设置 TTL；Runtime Episode 不进入 Git。删除 `runtime.sqlite` 只会丢失 Task/Episode，不改变 Context Git、Index 或 `state/capture`。
@@ -1356,8 +1358,9 @@ EngineeringResolutionSource {
 
 - WorkEpisode/Capture 显式持久 API和 AgentCheckpoint MCP/CLI/Skill 已实现；WorkEpisode 自动聚合（#163）尚未实现。
 - Candidate Builder 与最小充分 Evidence 组装已实现：closed Episode 的每个充分 Claim 形成一个无 Space Draft；Inline Validation 原样复用，normalized Observation/Task Signal 转为 self-contained snapshot，Context Evidence 从一个 exact Index snapshot 复用；原始 Capture 不进 Git。
-- Builder 在 Git 前用 Runtime v7 固化 BuildId、Claim-scoped SubmissionId 和 content hash，#117 后回填 CandidateId/EventId；两个 crash window、语义重试和并发 close/build 均复用同一操作身份。缺 Claim、Unknown-only、Evidence 不充分为零 Git 写；kind 无 hint 固定 Discovery，topic 缺失保留 Unknown，不做关键词推断。
-- 知识语义去重、冲突和 Space 推荐尚未实现；初始分析仅为 provisional Novel/Draft，推荐为空。
+- Builder 在 Git 前用 Runtime v8 固化 BuildId、Claim-scoped SubmissionId 和 content hash，#117 后回填 CandidateId/EventId；两个 crash window、语义重试和并发 close/build 均复用同一操作身份。缺 Claim、Unknown-only、Evidence 不充分为零 Git 写；kind 无 hint 固定 Discovery，topic 缺失保留 Unknown，不做关键词推断。
+- Candidate relationship assessment 与 Space 推荐已实现为 Runtime derived review state：只有完整 canonical draft equality 是 exact duplicate；same statement/different Evidence 是 supports；same topic 加 explicit Context 或 exact Artifact Graph 是 revises；topic/scope 不同 statement 只是 potential contradiction；纯 FTS 是 unresolved related；无候选才 novel。所有结果固定 Context/Graph generation、typed path、confidence、RRF/top-k/token budget 与 stable target tie。
+- Existing Space 推荐融合 assessment targets、source Task associations 与 Space Intent；conflicted Intent/unsafe Context 只作诊断或 Related，无安全 Primary 时生成一个完整 system-suggested Intent。分析可由 `candidate analyze` 重跑替换，不写 Git、不改变 Candidate submission/content/ID，不参与 Context Search、Hook 或自动注入。
 - Candidate List/Confirm/Discard 以及 PreCompact/TurnStop 自动写入/Builder 触发尚未实现；当前 Hook 仅给出显式 Checkpoint 能力提示。
 - 当前显式 `candidate_create` 继续作为手工入口；自动 Builder 复用相同 #117 admission，并提供内部 CLI `candidate build-closed-episode` 重试边界，不新增 list/confirm/discard。
 - Mandatory Gate #117 已完成：一次创建操作携带稳定 `submission_id`，首次提交由服务端生成 `candidate_id`/`event_id`/路径并持久化 submission mapping；重试复用同一 `submission_id`。

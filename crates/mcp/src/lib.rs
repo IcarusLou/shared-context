@@ -19,15 +19,16 @@ use std::{
 use sctx_domain::{
     AgentCheckpointId, Applicability, ArtifactKey, ArtifactKind, ArtifactLocator, ArtifactRef,
     AutomaticCandidateStatus, AutomaticContextCandidate, CandidateAnalysis,
-    CandidateBuilderProvenance, CandidateConfidence, CandidateSpaceRecommendation,
-    CaptureEvidenceRef, CaptureUnknown, CheckpointClaim, CheckpointClaimId, ContextCandidate,
-    ContextId, ContextKind, ContextRevisionDraft, ContextRevisionRef, EngineeringReferenceDraft,
-    Error, ErrorKind, EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator,
-    NormalizedWorkObservation, ReferenceId, ReferenceRelation, RepoRelativePath, RepositoryId,
-    ResolutionStatus, ResolvedFocus, Result, RevisionId, SignalId, SpaceId, SubmissionId, TaskId,
-    TaskIntentDraft, TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignalKind,
-    TaskSignalLifecycle, TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId, WorkEpisodeStatus,
-    WorkObservation, WorkObservationId, WorkSourceRef,
+    CandidateAnalysisStatus, CandidateBuilderProvenance, CandidateConfidence,
+    CandidateSpaceRecommendation, CaptureEvidenceRef, CaptureUnknown, CheckpointClaim,
+    CheckpointClaimId, ContextId, ContextKind, ContextRevisionDraft, ContextRevisionRef,
+    EngineeringReferenceDraft, Error, ErrorKind, EvidenceSnapshotDraft, EvidenceType,
+    ExternalSessionLocator, NormalizedWorkObservation, ReferenceId, ReferenceRelation,
+    RepoRelativePath, RepositoryId, ResolutionStatus, ResolvedFocus, Result, RevisionId, SignalId,
+    SpaceId, SubmissionId, TaskId, TaskIntentDraft, TaskIntentRevisionId, TaskSessionId,
+    TaskSessionSnapshot, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord,
+    TaskSpaceAssociation, WorkEpisodeId, WorkEpisodeStatus, WorkObservation, WorkObservationId,
+    WorkSourceRef,
 };
 use sctx_engineering_graph::{
     CandidateMatchEvidence, CatalogRepositorySpec, EngineeringProjectionStore,
@@ -43,9 +44,11 @@ use sctx_git_store::{
 use sctx_index::{DomainSnapshot, ProjectionIndex};
 use sctx_local_state::{PrivacyScanner, RepositoryCatalogSnapshot, UserConfigStore};
 use sctx_search::{
-    ConflictView, ContextPackOmitted, ContextStatus, DEFAULT_TASK_MAX_SPACES, MAX_TASK_MAX_SPACES,
-    MIN_TASK_CONTEXT_TOKEN_BUDGET, ScopeFilter, SearchEngine, SearchFilters, SearchRequest,
-    TaskContextItem, TaskContextRequest, TaskGraphDiagnostic, TaskRetrievalPath,
+    CandidateAnalysisRequest, ConflictView, ContextPackOmitted, ContextStatus,
+    DEFAULT_TASK_MAX_SPACES, MAX_CANDIDATE_ANALYSIS_TOKEN_BUDGET, MAX_CANDIDATE_ANALYSIS_TOP_K,
+    MAX_TASK_MAX_SPACES, MIN_CANDIDATE_ANALYSIS_TOKEN_BUDGET, MIN_TASK_CONTEXT_TOKEN_BUDGET,
+    ScopeFilter, SearchEngine, SearchFilters, SearchRequest, TaskContextItem, TaskContextRequest,
+    TaskGraphDiagnostic, TaskRetrievalPath,
 };
 use sctx_task_runtime::{
     AgentCheckpointWrite, CandidateBuildItemPreparation, CandidateBuildItemStatus,
@@ -249,6 +252,24 @@ pub struct CandidateBuildItemSummary {
     pub confidence: CandidateConfidence,
     pub unknowns: Vec<CaptureUnknown>,
     pub space_recommendations: Vec<CandidateSpaceRecommendation>,
+}
+
+/// Internal/CLI request to recompute one Candidate's derived review state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateAnalyzeInput {
+    pub candidate_id: String,
+    #[serde(default = "default_candidate_analysis_token_budget")]
+    pub token_budget: usize,
+    #[serde(default = "default_candidate_analysis_top_k")]
+    pub top_k: usize,
+}
+
+/// Current Runtime-derived Candidate analysis; no field is a Git knowledge fact.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateAnalyzeResponse {
+    pub analysis_generation: u64,
+    pub candidate: AutomaticContextCandidate,
 }
 
 /// Public Claim-scoped submission state.
@@ -780,8 +801,6 @@ struct ClaimBuildMaterial {
     checkpoint_id: AgentCheckpointId,
     claim_id: CheckpointClaimId,
     draft: Option<ContextRevisionDraft>,
-    observation_ids: Vec<WorkObservationId>,
-    checkpoint_ids: Vec<AgentCheckpointId>,
     confidence: CandidateConfidence,
     unknowns: Vec<CaptureUnknown>,
     error_code: Option<&'static str>,
@@ -1189,8 +1208,19 @@ impl Runtime {
             .map(|material| (material.claim_id, material))
             .collect::<BTreeMap<_, _>>();
         for item in build.items.clone() {
-            if item.status.is_finalized() || item.status == CandidateBuildItemStatus::NeedsEvidence
-            {
+            if item.status.is_finalized() {
+                if let Some(candidate_id) = item.candidate_id
+                    && self.tasks.read_candidate_analysis(candidate_id)?.is_none()
+                {
+                    self.analyze_candidate(&CandidateAnalyzeInput {
+                        candidate_id: candidate_id.to_string(),
+                        token_budget: default_candidate_analysis_token_budget(),
+                        top_k: default_candidate_analysis_top_k(),
+                    })?;
+                }
+                continue;
+            }
+            if item.status == CandidateBuildItemStatus::NeedsEvidence {
                 continue;
             }
             let material = materials
@@ -1212,32 +1242,6 @@ impl Runtime {
                             CandidateBuildItemStatus::AlreadyExists
                         }
                     };
-                    let persisted = ContextCandidate {
-                        candidate_id: outcome.record.candidate_id,
-                        submission_id: item.submission_id,
-                        source_episode: outcome.record.source_episode,
-                        content: draft.clone(),
-                    };
-                    let provenance = CandidateBuilderProvenance {
-                        build_id: build.build_id,
-                        source_episode: episode.episode.ownership(),
-                        checkpoint_ids: material.checkpoint_ids.clone(),
-                        observation_ids: material.observation_ids.clone(),
-                    };
-                    let _candidate = AutomaticContextCandidate::from_persisted_candidate(
-                        &persisted,
-                        &episode.episode,
-                        &episode.checkpoints,
-                        provenance,
-                        CandidateAnalysis {
-                            novel: true,
-                            ..CandidateAnalysis::default()
-                        },
-                        Vec::new(),
-                        material.confidence.clone(),
-                        material.unknowns.clone(),
-                        AutomaticCandidateStatus::Draft,
-                    )?;
                     build = self.tasks.record_candidate_build_item_result(
                         build.build_id,
                         item.submission_id,
@@ -1246,6 +1250,11 @@ impl Runtime {
                         Some(outcome.record.event_id),
                         None,
                     )?;
+                    self.analyze_candidate(&CandidateAnalyzeInput {
+                        candidate_id: outcome.record.candidate_id.to_string(),
+                        token_budget: default_candidate_analysis_token_budget(),
+                        top_k: default_candidate_analysis_top_k(),
+                    })?;
                 }
                 Err(error) => {
                     let error_code = candidate_builder_error_code(&error);
@@ -1260,7 +1269,167 @@ impl Runtime {
                 }
             }
         }
-        candidate_build_response(build, &materials)
+        let mut response = candidate_build_response(build, &materials)?;
+        for item in &mut response.items {
+            let Some(candidate_id) = item.candidate_id else {
+                continue;
+            };
+            if let Some(view) = self.tasks.read_candidate_analysis(candidate_id)? {
+                item.candidate_status = view.candidate.status;
+                item.analysis = view.candidate.analysis;
+                item.confidence = view.candidate.confidence;
+                item.unknowns = view.candidate.unknowns;
+                item.space_recommendations = view.candidate.space_recommendations;
+            }
+        }
+        Ok(response)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn analyze_candidate(&self, input: &CandidateAnalyzeInput) -> Result<CandidateAnalyzeResponse> {
+        if input.token_budget < MIN_CANDIDATE_ANALYSIS_TOKEN_BUDGET
+            || input.token_budget > MAX_CANDIDATE_ANALYSIS_TOKEN_BUDGET
+            || input.top_k == 0
+            || input.top_k > MAX_CANDIDATE_ANALYSIS_TOP_K
+        {
+            return Err(invalid("Candidate analysis bounds are unsafe"));
+        }
+        let candidate_id = parse_id_value(&input.candidate_id, "candidate_id")?;
+        let snapshot = self.snapshot()?;
+        let persisted = snapshot
+            .projection
+            .candidates
+            .get(&candidate_id)
+            .map(|projection| projection.candidate.clone())
+            .ok_or_else(|| invalid(format!("Candidate does not exist: {candidate_id}")))?;
+        let episode = self
+            .tasks
+            .read_work_episode(persisted.source_episode.episode_id)?
+            .ok_or_else(|| invalid("Candidate source Work Episode does not exist"))?;
+        if episode.episode.ownership() != persisted.source_episode {
+            return Err(invariant("Candidate source Episode ownership changed"));
+        }
+        let build = self
+            .tasks
+            .read_candidate_build(episode.episode.episode_id)?
+            .ok_or_else(|| invalid("Candidate has no Builder provenance"))?;
+        let item = build
+            .items
+            .iter()
+            .find(|item| item.candidate_id == Some(candidate_id))
+            .ok_or_else(|| invalid("Candidate is not a finalized Builder item"))?;
+        let checkpoint = episode
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.checkpoint_id == item.checkpoint_id)
+            .ok_or_else(|| invariant("Candidate source Checkpoint disappeared"))?;
+        let claim = checkpoint
+            .claims
+            .iter()
+            .find(|claim| claim.claim_id == item.claim_id)
+            .ok_or_else(|| invariant("Candidate source Claim disappeared"))?;
+        let final_checkpoint = episode
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.checkpoint_id == build.final_checkpoint_id)
+            .ok_or_else(|| invariant("Candidate final Checkpoint disappeared"))?;
+        let task = self
+            .tasks
+            .read_snapshot(episode.episode.task_session_id)?
+            .ok_or_else(|| invalid("Candidate source Task disappeared"))?;
+        let source_intent_id = episode.episode.intent_revisions.last();
+        let source_intent = task
+            .intent_revisions
+            .iter()
+            .find(|revision| revision.revision_id == source_intent_id)
+            .map(|revision| revision.intent.clone())
+            .ok_or_else(|| invariant("Candidate source Intent revision disappeared"))?;
+        let signal_history = self
+            .tasks
+            .read_signal_history(episode.episode.task_session_id)?;
+        let material = build_claim_material(
+            &episode,
+            final_checkpoint,
+            checkpoint,
+            claim,
+            &signal_history,
+            &snapshot,
+        );
+        let engine = self.engineering_graph.as_ref().map_or_else(
+            || SearchEngine::new(self.index.clone()),
+            |graph| SearchEngine::with_engineering_graph(self.index.clone(), graph.clone()),
+        );
+        let derived = engine.analyze_candidate(&CandidateAnalysisRequest {
+            candidate: persisted.clone(),
+            source_task_intent: source_intent,
+            source_task_signals: task.task_signals.clone(),
+            explicit_related_contexts: claim.related_contexts.clone(),
+            artifact_refs: claim.artifact_refs.clone(),
+            token_budget: input.token_budget,
+            top_k: input.top_k,
+        });
+        let mut checkpoint_ids = vec![item.checkpoint_id];
+        if !checkpoint_ids.contains(&build.final_checkpoint_id) {
+            checkpoint_ids.push(build.final_checkpoint_id);
+        }
+        let observation_ids = claim
+            .evidence_refs
+            .iter()
+            .filter_map(|evidence| match evidence {
+                CaptureEvidenceRef::Observation { observation_id } => Some(*observation_id),
+                CaptureEvidenceRef::TaskSignal { .. }
+                | CaptureEvidenceRef::ContextEvidence { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let provenance = CandidateBuilderProvenance {
+            build_id: build.build_id,
+            source_episode: episode.episode.ownership(),
+            checkpoint_ids,
+            observation_ids,
+        };
+        let unknowns = material.unknowns;
+        let (analysis, recommendations, confidence, mut status) = match derived {
+            Ok(result) => (
+                result.analysis,
+                result.space_recommendations,
+                result.confidence,
+                result.candidate_status,
+            ),
+            Err(error) => (
+                CandidateAnalysis {
+                    status: CandidateAnalysisStatus::Failed,
+                    error_code: Some(candidate_analysis_error_code(&error).to_owned()),
+                    ..CandidateAnalysis::default()
+                },
+                Vec::new(),
+                CandidateConfidence {
+                    basis_points: 0,
+                    rationale: "Candidate analysis failed and remains retryable".to_owned(),
+                },
+                AutomaticCandidateStatus::Draft,
+            ),
+        };
+        if unknowns.iter().any(|unknown| unknown.blocking)
+            && status == AutomaticCandidateStatus::ReadyForReview
+        {
+            status = AutomaticCandidateStatus::NeedsEvidence;
+        }
+        let candidate = AutomaticContextCandidate::from_persisted_candidate(
+            &persisted,
+            &episode.episode,
+            &episode.checkpoints,
+            provenance,
+            analysis,
+            recommendations,
+            confidence,
+            unknowns,
+            status,
+        )?;
+        let view = self.tasks.replace_candidate_analysis(&candidate)?;
+        Ok(CandidateAnalyzeResponse {
+            analysis_generation: view.analysis_generation,
+            candidate: view.candidate,
+        })
     }
 
     fn repository_scan(&self, input: &RepositoryScanInput) -> Result<RepositoryScanResponse> {
@@ -1859,16 +2028,10 @@ fn build_claim_material(
         relations: Vec::new(),
         evidence,
     });
-    let mut checkpoint_ids = vec![final_checkpoint.checkpoint_id];
-    if checkpoint.checkpoint_id != final_checkpoint.checkpoint_id {
-        checkpoint_ids.push(checkpoint.checkpoint_id);
-    }
     ClaimBuildMaterial {
         checkpoint_id: checkpoint.checkpoint_id,
         claim_id: claim.claim_id,
         draft,
-        observation_ids,
-        checkpoint_ids,
         confidence: CandidateConfidence {
             basis_points: confidence,
             rationale: if claim.context_kind_hint.is_some() {
@@ -2101,6 +2264,18 @@ fn candidate_builder_error_code(error: &Error) -> &'static str {
     }
 }
 
+fn candidate_analysis_error_code(error: &Error) -> &'static str {
+    match error.kind() {
+        ErrorKind::StaleState => "analysis_projection_changed",
+        ErrorKind::InvalidInput => "analysis_invalid_input",
+        ErrorKind::Io => "analysis_storage_failed",
+        ErrorKind::External => "analysis_dependency_unavailable",
+        ErrorKind::InvariantViolation => "analysis_invariant",
+        ErrorKind::RepositoryNotConfigured => "analysis_repository_unavailable",
+        _ => "analysis_failed",
+    }
+}
+
 fn candidate_build_response(
     view: CandidateBuildView,
     materials: &BTreeMap<CheckpointClaimId, &ClaimBuildMaterial>,
@@ -2129,10 +2304,7 @@ fn candidate_build_response(
                     } else {
                         AutomaticCandidateStatus::Draft
                     },
-                    analysis: CandidateAnalysis {
-                        novel: true,
-                        ..CandidateAnalysis::default()
-                    },
+                    analysis: CandidateAnalysis::default(),
                     confidence: material.confidence.clone(),
                     unknowns: material.unknowns.clone(),
                     space_recommendations: Vec::new(),
@@ -2250,6 +2422,18 @@ pub fn build_closed_episode_at_root(
     episode_id: WorkEpisodeId,
 ) -> Result<CandidateBuildResponse> {
     Runtime::open(root.as_ref())?.build_closed_episode(episode_id)
+}
+
+/// Recomputes and replaces one Candidate's Runtime-derived review analysis.
+///
+/// # Errors
+///
+/// Returns typed Candidate, Builder provenance, retrieval, Graph, budget, or storage errors.
+pub fn candidate_analyze_at_root(
+    root: impl AsRef<Path>,
+    input: &CandidateAnalyzeInput,
+) -> Result<CandidateAnalyzeResponse> {
+    Runtime::open(root.as_ref())?.analyze_candidate(input)
 }
 
 /// Registers and scans one canonical local Git Repository without returning source text.
@@ -3822,6 +4006,14 @@ const fn default_max_spaces() -> usize {
 
 const fn default_scan_artifact_limit() -> usize {
     DEFAULT_SCAN_ARTIFACT_LIMIT
+}
+
+const fn default_candidate_analysis_token_budget() -> usize {
+    4_096
+}
+
+const fn default_candidate_analysis_top_k() -> usize {
+    16
 }
 
 const fn error_code(kind: ErrorKind) -> &'static str {

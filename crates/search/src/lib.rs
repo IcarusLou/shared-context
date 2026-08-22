@@ -21,6 +21,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
+mod candidate;
+
+pub use candidate::{
+    CandidateAnalysisRequest, CandidateAnalysisResult, MAX_CANDIDATE_ANALYSIS_TOKEN_BUDGET,
+    MAX_CANDIDATE_ANALYSIS_TOP_K, MIN_CANDIDATE_ANALYSIS_TOKEN_BUDGET,
+};
+
 pub use sctx_domain::{Error, ErrorKind, Result};
 
 const DEFAULT_PAGE_SIZE: usize = 20;
