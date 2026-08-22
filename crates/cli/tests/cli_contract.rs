@@ -20,7 +20,8 @@ use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CrashInjector, CrashSeam, GitStore};
 use sctx_local_state::UserConfigStore;
 use sctx_mcp::{
-    ExpectedRevisionId, IntentMaturity, TaskBoundary, TaskCheckpointBoundary, TaskCheckpointInput,
+    ExpectedRevisionId, IntentMaturity, TaskBoundary, TaskCheckpointBoundary,
+    TaskCheckpointClaimInput, TaskCheckpointEvidenceInput, TaskCheckpointInput,
     TaskIntentUpdateInput, task_checkpoint_at_root, task_intent_update_at_root,
 };
 use sctx_task_runtime::TaskRuntime;
@@ -403,7 +404,7 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
         "uninstall [--root PATH]",
         "knowledge delete --confirm-path PATH",
         "space create|intent revise|list|get",
-        "candidate list|get|discard|create",
+        "candidate list|get|discard|confirm|create",
         "context revise|review|publish|withdraw|get",
         "semantic conflict open|resolve",
         "task context",
@@ -1486,6 +1487,145 @@ fn twenty_cli_processes_share_one_submission_without_duplicate_candidate_events(
 
 #[test]
 #[allow(clippy::too_many_lines)]
+fn twenty_cli_processes_confirm_one_review_in_one_atomic_commit() {
+    let harness = Harness::new();
+    let (primary_space_id, _) = create_space(&harness, "CLI Confirmation Primary");
+    let session = "cli-confirm-multiprocess";
+    let task = task_intent_update_at_root(
+        harness.root(),
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            task_boundary: TaskBoundary::New,
+            expected_revision_id: ExpectedRevisionId::Null(()),
+            maturity: IntentMaturity::Provisional,
+            intent: TaskIntentDraft {
+                goal: "confirm one CLI Candidate".to_owned(),
+                desired_change: "write one atomic confirmation".to_owned(),
+                in_scope: Vec::new(),
+                out_of_scope: Vec::new(),
+                domains: Vec::new(),
+                platforms: Vec::new(),
+                constraints: Vec::new(),
+                acceptance_conditions: Vec::new(),
+                artifacts: Vec::new(),
+                interfaces: Vec::new(),
+                unknowns: Vec::new(),
+            },
+            evidence_refs: Vec::new(),
+        },
+    )
+    .unwrap();
+    let closed = task_checkpoint_at_root(
+        harness.root(),
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: task.context.task_id.to_string(),
+            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+            expected_episode_version: 0,
+            boundary: TaskCheckpointBoundary::Close,
+            claims: vec![TaskCheckpointClaimInput {
+                context_kind_hint: Some(ContextKind::Decision),
+                topic_key_hint: Some("cli/confirmation".to_owned()),
+                statement: "CLI processes share one Confirmation operation".to_owned(),
+                rationale: "The Writer lock and Runtime reservation converge".to_owned(),
+                applicability: Applicability::default(),
+                assumptions: Vec::new(),
+                recheck_when: Vec::new(),
+                evidence: vec![TaskCheckpointEvidenceInput::InlineValidation {
+                    evidence: EvidenceSnapshotDraft {
+                        kind: sctx_domain::EvidenceType::ExperimentRecord,
+                        supports: "The CLI confirmation fixture passed".to_owned(),
+                        content: serde_json::json!({"actual": "passed"}),
+                        interpretation: "The Candidate is confirmable".to_owned(),
+                        limitations: Vec::new(),
+                    },
+                }],
+                artifact_refs: Vec::new(),
+                related_contexts: Vec::new(),
+            }],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap();
+    let candidate_id = closed.candidate_build.unwrap().items[0]
+        .candidate_id
+        .unwrap();
+    let input_path = harness.home.join("candidate-confirm.json");
+    fs::write(
+        &input_path,
+        serde_json::to_vec(&serde_json::json!({
+            "agent_kind": "codex",
+            "external_session_id": session,
+            "expected_task_id": task.context.task_id,
+            "expected_intent_revision_id": task.context.intent_revision_id,
+            "candidate_id": candidate_id,
+            "expected_review_version": 1,
+            "primary": {"existing_space_id": primary_space_id},
+            "related_space_ids": [],
+            "edits": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let before = harness.event_count();
+    let barrier = Arc::new(Barrier::new(20));
+    let outputs = (0..20)
+        .map(|_| {
+            let barrier = Arc::clone(&barrier);
+            let home = harness.home.clone();
+            let input_path = input_path.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                Command::new(env!("CARGO_BIN_EXE_sctx"))
+                    .args([
+                        "--json",
+                        "candidate",
+                        "confirm",
+                        "--input",
+                        input_path.to_str().unwrap(),
+                    ])
+                    .env("HOME", home)
+                    .output()
+                    .unwrap()
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    let values = outputs
+        .iter()
+        .map(|output| {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            serde_json::from_slice::<Value>(&output.stdout).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        values
+            .iter()
+            .filter(|value| value["data"]["created"] == true)
+            .count(),
+        1
+    );
+    assert_eq!(
+        values
+            .iter()
+            .map(|value| value["data"]["context_id"].as_str().unwrap())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        1
+    );
+    assert_eq!(harness.event_count(), before + 4);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn task_context_cli_entry_is_locator_only_and_read_only() {
     let harness = Harness::new();
     let (space_id, _) = create_space(&harness, "CLI Task Context");
@@ -2043,9 +2183,14 @@ fn mcp_stdio_entry_serves_cursor_and_codex_without_extra_stdout() {
         assert_eq!(responses.len(), 2);
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
         assert!(tools.iter().any(|tool| tool["name"] == "task_checkpoint"));
-        for name in ["candidate_list", "candidate_get", "candidate_discard"] {
+        for name in [
+            "candidate_list",
+            "candidate_get",
+            "candidate_discard",
+            "candidate_confirm",
+        ] {
             assert!(tools.iter().any(|tool| tool["name"] == name));
         }
     }

@@ -296,6 +296,12 @@ CREATE TABLE {prefix}candidate_confirmation (
     edits_json TEXT NOT NULL,
     final_content_hash TEXT NOT NULL,
     causal_refs_json TEXT NOT NULL,
+    operation_hash TEXT NOT NULL,
+    plan_hash TEXT NOT NULL,
+    batch_id TEXT NOT NULL,
+    commit_oid TEXT NOT NULL,
+    event_ids_json TEXT NOT NULL,
+    event_paths_json TEXT NOT NULL,
     projection_json TEXT NOT NULL
 ) WITHOUT ROWID;
 CREATE TABLE {prefix}candidate_confirmation_conflict (
@@ -946,10 +952,14 @@ fn populate(
     }
     for (confirmation_id, projection) in &input.projection.candidate_confirmations {
         let confirmation = &projection.confirmation;
+        let metadata = input
+            .confirmation_events
+            .get(&projection.event_id)
+            .ok_or_else(|| crate::invariant("valid Candidate Confirmation lacks Event metadata"))?;
         transaction
             .execute(
                 &format!(
-                    "INSERT INTO {prefix}candidate_confirmation(confirmation_id, event_id, candidate_id, submission_id, source_episode_id, source_task_session_id, source_task_id, result_context_id, result_revision_id, primary_space_id, related_space_ids_json, space_association_id, publication_id, created_space_id, edits_json, final_content_hash, causal_refs_json, projection_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
+                    "INSERT INTO {prefix}candidate_confirmation(confirmation_id, event_id, candidate_id, submission_id, source_episode_id, source_task_session_id, source_task_id, result_context_id, result_revision_id, primary_space_id, related_space_ids_json, space_association_id, publication_id, created_space_id, edits_json, final_content_hash, causal_refs_json, operation_hash, plan_hash, batch_id, commit_oid, event_ids_json, event_paths_json, projection_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)"
                 ),
                 params![
                     confirmation_id.to_string(),
@@ -969,6 +979,20 @@ fn populate(
                     json(&confirmation.edits)?,
                     confirmation.final_content_hash,
                     json(&confirmation.causal_refs)?,
+                    metadata.operation_hash.as_ref().ok_or_else(|| crate::invariant(
+                        "Candidate Confirmation lacks operation hash"
+                    ))?,
+                    metadata.plan_hash.as_ref().ok_or_else(|| crate::invariant(
+                        "Candidate Confirmation lacks plan hash"
+                    ))?,
+                    metadata.batch_id.as_ref().ok_or_else(|| crate::invariant(
+                        "Candidate Confirmation lacks batch ID"
+                    ))?,
+                    metadata.commit_oid.as_ref().ok_or_else(|| crate::invariant(
+                        "Candidate Confirmation lacks introducing commit"
+                    ))?,
+                    json(&metadata.batch_event_ids)?,
+                    json(&metadata.batch_event_paths)?,
                     json(projection)?,
                 ],
             )

@@ -120,6 +120,14 @@ _Avoid_: analysis status, readiness status, publication status
 An immutable fact that one unconflicted Candidate produced one exact published Context revision, its Primary and Related Space organization, and the causal facts that created them. It records the final edited content without turning the Candidate itself into injectable knowledge.
 _Avoid_: CandidateReview decision, Candidate activation, Candidate mutation
 
+**CandidateConfirmationOperation**:
+One recoverable human confirmation decision bound to an exact Pending CandidateReview version, analysis generation, Space selection, Related Spaces, and optional field edits.
+_Avoid_: content deduplication, automatic confirmation, Candidate mutation
+
+**CandidateConfirmationPlan**:
+The complete server-owned fact closure reserved for one CandidateConfirmationOperation, including stable identities and causal references for every knowledge fact it will create.
+_Avoid_: caller-authored Event batch, mutable execution plan, partial confirmation
+
 **ContextSpaceAssociation**:
 A causally revisable knowledge-organization snapshot linking one Context to exactly one Primary ContextSpace and zero or more Related ContextSpaces. It is independent of ContextRelation and does not by itself relocate the Context’s current nested owner.
 _Avoid_: TaskSpaceAssociation, ContextRelation, Workspace binding

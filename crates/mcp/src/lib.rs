@@ -8,7 +8,7 @@
 //! writes only disposable local Task Runtime state.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt, fs,
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
@@ -20,16 +20,18 @@ use sctx_domain::{
     AgentCheckpointId, Applicability, ArtifactKey, ArtifactKind, ArtifactLocator, ArtifactRef,
     AutomaticCandidateStatus, AutomaticContextCandidate, CandidateAnalysis,
     CandidateAnalysisStatus, CandidateBuilderProvenance, CandidateConfidence,
+    CandidateConfirmationOperation, CandidateConfirmationPlan,
+    CandidateConfirmationPrimaryReference, CandidatePrimarySelection, CandidateRelationAssessment,
     CandidateReviewDiagnostic, CandidateReviewStatus, CandidateReviewSummary, CandidateReviewView,
     CandidateSpaceRecommendation, CaptureEvidenceRef, CaptureUnknown, CheckpointClaim,
     CheckpointClaimId, ContextId, ContextKind, ContextRevisionDraft, ContextRevisionRef,
     EngineeringReferenceDraft, Error, ErrorKind, EvidenceSnapshotDraft, EvidenceType,
-    ExternalSessionLocator, NormalizedWorkObservation, ReferenceId, ReferenceRelation,
-    RepoRelativePath, RepositoryId, ResolutionStatus, ResolvedFocus, Result, RevisionId, SignalId,
-    SpaceId, SubmissionId, TaskId, TaskIntentDraft, TaskIntentRevisionId, TaskSessionId,
-    TaskSessionSnapshot, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord,
-    TaskSpaceAssociation, WorkEpisodeId, WorkEpisodeStatus, WorkObservation, WorkObservationId,
-    WorkSourceRef,
+    ExternalSessionLocator, NormalizedWorkObservation, OptionalCandidateEdits, ReferenceId,
+    ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionStatus, ResolvedFocus, Result,
+    RevisionId, SignalId, SpaceId, SpaceRecommendationId, SubmissionId, TaskId, TaskIntentDraft,
+    TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignalKind, TaskSignalLifecycle,
+    TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId, WorkEpisodeStatus, WorkObservation,
+    WorkObservationId, WorkSourceRef,
 };
 use sctx_engineering_graph::{
     CandidateMatchEvidence, CatalogRepositorySpec, EngineeringProjectionStore,
@@ -40,7 +42,8 @@ use sctx_engineering_graph::{
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{
-    AppendRequest, CandidateSubmissionRequest, CandidateSubmissionStatus, GitStore,
+    AppendRequest, CandidateConfirmationWriteStatus, CandidateSubmissionRequest,
+    CandidateSubmissionStatus, GitStore,
 };
 use sctx_index::{DomainSnapshot, ProjectionIndex};
 use sctx_local_state::{PrivacyScanner, RepositoryCatalogSnapshot, UserConfigStore};
@@ -354,6 +357,71 @@ pub enum CandidateDiscardResponseStatus {
 pub struct CandidateDiscardResponse {
     pub status: CandidateDiscardResponseStatus,
     pub review: CandidateReviewView,
+}
+
+/// Existing Primary Space selection accepted by `candidate_confirm`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExistingCandidatePrimaryInput {
+    pub existing_space_id: String,
+}
+
+/// Server-owned proposed Space recommendation selection accepted by `candidate_confirm`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewCandidatePrimaryInput {
+    pub new_space_recommendation_id: String,
+}
+
+/// Exactly one existing or proposed Primary selection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CandidateConfirmPrimaryInput {
+    Existing(ExistingCandidatePrimaryInput),
+    Proposed(NewCandidatePrimaryInput),
+}
+
+/// Strict explicit human Candidate confirmation request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateConfirmInput {
+    pub agent_kind: String,
+    pub external_session_id: String,
+    pub expected_task_id: String,
+    pub expected_intent_revision_id: String,
+    pub candidate_id: String,
+    pub expected_review_version: u64,
+    pub primary: CandidateConfirmPrimaryInput,
+    pub related_space_ids: Vec<String>,
+    #[serde(default)]
+    pub edits: OptionalCandidateEdits,
+}
+
+/// Exact idempotent Candidate Confirmation result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateConfirmResponseStatus {
+    Confirmed,
+    AlreadyConfirmed,
+}
+
+/// Public confirmation result and explicit assessment acknowledgment.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateConfirmResponse {
+    pub status: CandidateConfirmResponseStatus,
+    pub created: bool,
+    pub candidate_id: sctx_domain::CandidateId,
+    pub confirmation_id: sctx_domain::ConfirmationId,
+    pub context_id: ContextId,
+    pub revision_id: RevisionId,
+    pub primary_space_id: SpaceId,
+    pub related_space_ids: Vec<SpaceId>,
+    pub batch_id: sctx_git_store::BatchId,
+    pub commit_oid: String,
+    pub event_ids: Vec<sctx_domain::EventId>,
+    pub indexed_tree_oid: String,
+    pub projection_generation: u64,
+    pub assessment_acknowledgments: Vec<CandidateRelationAssessment>,
 }
 
 /// Public Claim-scoped submission state.
@@ -921,7 +989,9 @@ impl Runtime {
     fn open(root: &Path) -> Result<Self> {
         let base_store = GitStore::initialize(root)?;
         let index = ProjectionIndex::for_store(&base_store);
-        let store = base_store.with_candidate_submission_index(Arc::new(index.clone()));
+        let store = base_store
+            .with_candidate_submission_index(Arc::new(index.clone()))
+            .with_candidate_confirmation_index(Arc::new(index.clone()));
         let repositories = RepositoryRegistry::initialize(root)?;
         let catalog = UserConfigStore::open_existing(root)?.repository_catalog_wait()?;
         sync_repository_catalog_snapshot(&repositories, &catalog)?;
@@ -1622,6 +1692,173 @@ impl Runtime {
     }
 
     #[allow(clippy::too_many_lines)]
+    fn candidate_confirm(&self, input: &CandidateConfirmInput) -> Result<CandidateConfirmResponse> {
+        let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
+        let expected_task_id = parse_id_value(&input.expected_task_id, "expected_task_id")?;
+        let expected_intent_revision_id = parse_id_value(
+            &input.expected_intent_revision_id,
+            "expected_intent_revision_id",
+        )?;
+        let candidate_id = parse_id_value(&input.candidate_id, "candidate_id")?;
+        let review_record = self
+            .tasks
+            .read_candidate_review(&locator, candidate_id)?
+            .ok_or_else(|| invalid("Candidate Review does not exist for the ActiveTask"))?;
+        if !matches!(
+            review_record.status,
+            CandidateReviewStatus::Pending | CandidateReviewStatus::Confirmed
+        ) {
+            return Err(Error::new(
+                ErrorKind::Conflict,
+                "Only an owned Pending Candidate Review can be confirmed",
+            ));
+        }
+        let snapshot = self.snapshot()?;
+        let review = self.candidate_review_view(&review_record, &snapshot)?;
+        if review.analysis.status != CandidateAnalysisStatus::Complete
+            || review.analysis_generation.is_none()
+            || matches!(
+                review.candidate_status,
+                AutomaticCandidateStatus::Draft | AutomaticCandidateStatus::NeedsEvidence
+            )
+        {
+            return Err(invalid(
+                "Candidate Confirmation requires complete current analysis and reviewable Evidence",
+            ));
+        }
+        let (primary_reference, resolved_primary, primary_space_id) = match &input.primary {
+            CandidateConfirmPrimaryInput::Existing(existing) => {
+                let space_id = parse_id_value(&existing.existing_space_id, "existing_space_id")?;
+                if !snapshot.projection.spaces.contains_key(&space_id) {
+                    return Err(invalid(
+                        "Candidate Confirmation Primary Space does not exist",
+                    ));
+                }
+                (
+                    CandidateConfirmationPrimaryReference::ExistingSpace { space_id },
+                    CandidatePrimarySelection::Existing { space_id },
+                    Some(space_id),
+                )
+            }
+            CandidateConfirmPrimaryInput::Proposed(proposed) => {
+                let recommendation_id = parse_id_value::<SpaceRecommendationId>(
+                    &proposed.new_space_recommendation_id,
+                    "new_space_recommendation_id",
+                )?;
+                let intent = review
+                    .space_recommendations
+                    .iter()
+                    .find_map(|recommendation| match recommendation {
+                        CandidateSpaceRecommendation::ProposedNewSpaceIntent {
+                            recommendation_id: actual,
+                            proposed_new_space_intent,
+                            ..
+                        } if *actual == recommendation_id => {
+                            Some(proposed_new_space_intent.clone())
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        invalid(
+                            "new_space_recommendation_id is not an exact current proposed recommendation",
+                        )
+                    })?;
+                (
+                    CandidateConfirmationPrimaryReference::ProposedRecommendation {
+                        recommendation_id,
+                    },
+                    CandidatePrimarySelection::ProposedNew { intent },
+                    None,
+                )
+            }
+        };
+        let related_space_ids = input
+            .related_space_ids
+            .iter()
+            .map(|value| parse_id_value::<SpaceId>(value, "related_space_ids"))
+            .collect::<Result<Vec<_>>>()?;
+        if related_space_ids.iter().collect::<BTreeSet<_>>().len() != related_space_ids.len() {
+            return Err(invalid("related_space_ids must be unique"));
+        }
+        if primary_space_id.is_some_and(|primary| related_space_ids.contains(&primary)) {
+            return Err(invalid("Related Spaces must not include Primary"));
+        }
+        if related_space_ids
+            .iter()
+            .any(|space_id| !snapshot.projection.spaces.contains_key(space_id))
+        {
+            return Err(invalid(
+                "Candidate Confirmation Related Space does not exist",
+            ));
+        }
+        let persisted = snapshot
+            .projection
+            .candidates
+            .get(&candidate_id)
+            .map(|projection| &projection.candidate)
+            .ok_or_else(|| invalid("Candidate Confirmation payload is unavailable"))?;
+        let final_draft = input.edits.apply(&persisted.content)?;
+        let final_json = serde_json::to_string(&final_draft).map_err(|error| {
+            Error::new(ErrorKind::Io, format!("serialize final draft: {error}"))
+        })?;
+        let scan = PrivacyScanner::default().scan(&final_json)?;
+        if !scan.is_clean() {
+            return Err(Error::new(
+                ErrorKind::PrivacyRejected,
+                "Candidate Confirmation final draft failed the privacy boundary",
+            ));
+        }
+        let operation = CandidateConfirmationOperation {
+            candidate_id,
+            review_parent_version: input.expected_review_version,
+            analysis_generation: review.analysis_generation.unwrap_or_default(),
+            primary: primary_reference,
+            related_space_ids,
+            edits: input.edits.clone(),
+        };
+        let proposed_plan =
+            CandidateConfirmationPlan::reserve(persisted, operation, resolved_primary)?;
+        let reservation = self.tasks.reserve_candidate_confirmation(
+            &locator,
+            expected_task_id,
+            expected_intent_revision_id,
+            &proposed_plan,
+        )?;
+        let plan = reservation.operation.plan;
+        let write = self.store.confirm_candidate(&plan)?;
+        let finalized = self.tasks.finalize_candidate_confirmation(
+            candidate_id,
+            &plan.operation_hash,
+            write.record.confirmation_id,
+            write.record.result_context_id,
+        )?;
+        let snapshot = self.snapshot()?;
+        let status = if finalized.already_confirmed
+            || write.status == CandidateConfirmationWriteStatus::AlreadyExists
+        {
+            CandidateConfirmResponseStatus::AlreadyConfirmed
+        } else {
+            CandidateConfirmResponseStatus::Confirmed
+        };
+        Ok(CandidateConfirmResponse {
+            status,
+            created: status == CandidateConfirmResponseStatus::Confirmed,
+            candidate_id,
+            confirmation_id: plan.confirmation.confirmation_id,
+            context_id: plan.result_context_id,
+            revision_id: plan.result_revision.revision_id,
+            primary_space_id: plan.confirmation.primary_space_id,
+            related_space_ids: plan.confirmation.related_space_ids,
+            batch_id: write.append.batch_id,
+            commit_oid: write.append.commit_oid,
+            event_ids: write.append.event_ids,
+            indexed_tree_oid: snapshot.metadata.indexed_tree_oid,
+            projection_generation: snapshot.metadata.projection_generation,
+            assessment_acknowledgments: review.analysis.assessments,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn candidate_review_view(
         &self,
         record: &CandidateReviewRecord,
@@ -1745,6 +1982,8 @@ impl Runtime {
             discarded_at_unix_seconds: record.discarded_at_unix_seconds,
             expired_at_unix_seconds: record.expired_at_unix_seconds,
             discard_reason: record.discard_reason.clone(),
+            confirmation_id: record.confirmation_id,
+            result_context_id: record.result_context_id,
             ready_for_review,
             diagnostics,
             untrusted_data: true,
@@ -2793,6 +3032,18 @@ pub fn candidate_discard_at_root(
     Runtime::open(root.as_ref())?.candidate_discard(input)
 }
 
+/// Confirms one owned Pending Candidate Review into an atomic knowledge fact closure.
+///
+/// # Errors
+///
+/// Returns typed ownership, CAS, analysis, selection, privacy, Writer, index, or recovery errors.
+pub fn candidate_confirm_at_root(
+    root: impl AsRef<Path>,
+    input: &CandidateConfirmInput,
+) -> Result<CandidateConfirmResponse> {
+    Runtime::open(root.as_ref())?.candidate_confirm(input)
+}
+
 /// Registers and scans one canonical local Git Repository without returning source text.
 ///
 /// # Errors
@@ -3070,6 +3321,7 @@ impl McpServer {
             "candidate_list" => self.candidate_list(call.arguments),
             "candidate_get" => self.candidate_get(call.arguments),
             "candidate_discard" => self.candidate_discard(call.arguments),
+            "candidate_confirm" => self.candidate_confirm(call.arguments),
             "candidate_create" => self.candidate_create(call.arguments),
             "space_list" => self.space_list(call.arguments),
             _ => return Err(invalid(format!("unknown tool: {}", call.name))),
@@ -3369,6 +3621,21 @@ impl McpServer {
                     Error::new(
                         ErrorKind::Io,
                         format!("serialize Candidate discard response: {error}"),
+                    )
+                })
+            })
+            .map_err(ToolFailure::candidate_review_failed)
+    }
+
+    fn candidate_confirm(&self, arguments: Value) -> ToolResult {
+        let input: CandidateConfirmInput = decode_arguments(arguments)?;
+        self.runtime
+            .candidate_confirm(&input)
+            .and_then(|response| {
+                serde_json::to_value(response).map_err(|error| {
+                    Error::new(
+                        ErrorKind::Io,
+                        format!("serialize Candidate Confirmation response: {error}"),
                     )
                 })
             })
@@ -3714,6 +3981,11 @@ fn tools_list() -> Value {
             "candidate_discard",
             "Explicitly discard one Pending automatic Candidate Review under Task, Intent, and Review-version CAS. This never confirms or publishes Context.",
             candidate_discard_schema()
+        ),
+        tool_schema(
+            "candidate_confirm",
+            "Explicitly confirm one owned Pending Candidate Review into one atomic Context/Space fact closure. All generated identities and any proposed new Space Intent are server-owned.",
+            candidate_confirm_schema()
         ),
         tool_schema(
             "candidate_create",
@@ -4133,6 +4405,113 @@ fn candidate_discard_schema() -> Value {
             "candidate_id": id_schema("cnd_"),
             "expected_review_version": {"type": "integer", "minimum": 1},
             "reason": {"type": "string", "minLength": 1, "maxLength": 512}
+        }
+    })
+}
+
+fn candidate_confirm_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "agent_kind", "external_session_id", "expected_task_id",
+            "expected_intent_revision_id", "candidate_id", "expected_review_version",
+            "primary", "related_space_ids"
+        ],
+        "properties": {
+            "agent_kind": {"type": "string", "minLength": 1},
+            "external_session_id": {"type": "string", "minLength": 1},
+            "expected_task_id": id_schema("tsk_"),
+            "expected_intent_revision_id": id_schema("tir_"),
+            "candidate_id": id_schema("cnd_"),
+            "expected_review_version": {"type": "integer", "minimum": 1},
+            "primary": {
+                "oneOf": [
+                    {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["existing_space_id"],
+                        "properties": {"existing_space_id": id_schema("spc_")}
+                    },
+                    {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["new_space_recommendation_id"],
+                        "properties": {
+                            "new_space_recommendation_id": id_schema("rec_")
+                        }
+                    }
+                ]
+            },
+            "related_space_ids": {
+                "type": "array", "uniqueItems": true,
+                "items": id_schema("spc_")
+            },
+            "edits": candidate_edits_schema()
+        }
+    })
+}
+
+fn candidate_edits_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "kind": kind_schema(),
+            "topic_key": {
+                "oneOf": [
+                    {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["action", "value"],
+                        "properties": {
+                            "action": {"const": "set"},
+                            "value": {"type": "string", "minLength": 1}
+                        }
+                    },
+                    {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["action"],
+                        "properties": {"action": {"const": "clear"}}
+                    }
+                ]
+            },
+            "statement": {"type": "string", "minLength": 1},
+            "rationale": {"type": "string", "minLength": 1},
+            "applicability": {
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "domains": string_array_schema(),
+                    "platforms": string_array_schema(),
+                    "conditions": string_array_schema()
+                }
+            },
+            "assumptions": string_array_schema(),
+            "recheck_when": string_array_schema(),
+            "relations": {
+                "type": "array",
+                "items": {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["target_context_id", "kind", "rationale", "supports"],
+                    "properties": {
+                        "target_context_id": id_schema("ctx_"),
+                        "kind": {"type": "string", "enum": ["depends_on", "supersedes", "contradicts", "related_to"]},
+                        "rationale": {"type": "string", "minLength": 1},
+                        "supports": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+                    }
+                }
+            },
+            "evidence": {
+                "type": "array", "minItems": 1,
+                "items": {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["kind", "supports", "content", "interpretation", "limitations"],
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["source_snapshot", "experiment_record", "artifact_snapshot"]},
+                        "supports": {"type": "string", "minLength": 1},
+                        "content": {"type": "object", "minProperties": 1},
+                        "interpretation": {"type": "string", "minLength": 1},
+                        "limitations": string_array_schema()
+                    }
+                }
+            }
         }
     })
 }

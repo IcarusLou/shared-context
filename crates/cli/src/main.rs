@@ -44,9 +44,9 @@ use sctx_local_state::{
 };
 use sctx_mcp::{
     ArtifactFocusQuery, AssociationExplainInput, AssociationRebuildInput, CandidateAnalyzeInput,
-    CandidateDiscardInput, CandidateGetInput, CandidateListInput, EngineeringReferenceRecordInput,
-    RepositoryScanInput, TaskCheckpointInput, TaskContextReadInput, TaskIntentUpdateInput,
-    TaskSignalSupersedeInput,
+    CandidateConfirmInput, CandidateDiscardInput, CandidateGetInput, CandidateListInput,
+    EngineeringReferenceRecordInput, RepositoryScanInput, TaskCheckpointInput,
+    TaskContextReadInput, TaskIntentUpdateInput, TaskSignalSupersedeInput,
 };
 use sctx_search::{ContextStatus, ScopeFilter, SearchEngine, SearchFilters, SearchRequest};
 use sctx_task_runtime::TaskRuntime;
@@ -67,7 +67,7 @@ Commands:
   uninstall [--root PATH]
   knowledge delete --confirm-path PATH --confirm DELETE-SHARED-CONTEXT-KNOWLEDGE
   space create|intent revise|list|get
-  candidate list|get|discard|create|build-closed-episode|analyze
+  candidate list|get|discard|confirm|create|build-closed-episode|analyze
   context revise|review|publish|withdraw|get
   semantic conflict open|resolve
   task context|artifact-focus|checkpoint|intent update|signal supersede
@@ -634,12 +634,13 @@ fn verify_demo_mcp(
         .and_then(|response| response.pointer("/result/tools"))
         .and_then(Value::as_array)
         .ok_or_else(|| invariant("demo MCP tools/list response is missing"))?;
-    if tools.len() != 16
+    if tools.len() != 17
         || [
             "task_checkpoint",
             "candidate_list",
             "candidate_get",
             "candidate_discard",
+            "candidate_confirm",
         ]
         .iter()
         .any(|name| !tools.iter().any(|tool| tool["name"] == *name))
@@ -974,7 +975,9 @@ impl Runtime {
     fn open_at(root: &Path) -> Result<Self> {
         let base_store = GitStore::initialize(root)?;
         let index = ProjectionIndex::for_store(&base_store);
-        let store = base_store.with_candidate_submission_index(Arc::new(index.clone()));
+        let store = base_store
+            .with_candidate_submission_index(Arc::new(index.clone()))
+            .with_candidate_confirmation_index(Arc::new(index.clone()));
         Ok(Self { store, index })
     }
 
@@ -1238,6 +1241,25 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
                 json_output,
             )
         }
+        [command, rest @ ..] if command == "confirm" => {
+            if is_help(rest) {
+                println!("Usage: sctx candidate confirm --input <JSON_FILE>");
+                return Ok(());
+            }
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(&["--input"], &[])?;
+            let input: CandidateConfirmInput =
+                read_json(options.required("--input")?, "Candidate Confirmation input")?;
+            let response = sctx_mcp::candidate_confirm_at_root(installation_root()?, &input)?;
+            let metadata = Runtime::open()?.index.synchronize()?.metadata;
+            emit(
+                "candidate.confirm",
+                &metadata,
+                serde_json::to_value(response)
+                    .map_err(json_error("serialize Candidate Confirmation response"))?,
+                json_output,
+            )
+        }
         [command, rest @ ..] if command == "analyze" => {
             if is_help(rest) {
                 println!(
@@ -1366,7 +1388,7 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
             )
         }
         _ => Err(invalid(format!(
-            "invalid candidate command; expected list|get|discard|create|build-closed-episode|analyze\n\n{CONTEXT_WRITE_HELP}"
+            "invalid candidate command; expected list|get|discard|confirm|create|build-closed-episode|analyze\n\n{CONTEXT_WRITE_HELP}"
         ))),
     }
 }

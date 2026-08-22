@@ -11,13 +11,15 @@ use std::{
 
 use rusqlite::{Connection, params};
 use sctx_domain::{
-    Applicability, CandidateId, ContextKind, ContextRevisionDraft, EventId, EvidenceSnapshotDraft,
-    EvidenceType, SubmissionId, TaskId, TaskSessionId, WorkEpisodeId, WorkEpisodeRef,
+    Applicability, CandidateConfirmationOperation, CandidateConfirmationPlan,
+    CandidateConfirmationPrimaryReference, CandidateId, CandidatePrimarySelection, ContextKind,
+    ContextRevisionDraft, EventId, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot,
+    OptionalCandidateEdits, SubmissionId, TaskId, TaskSessionId, WorkEpisodeId, WorkEpisodeRef,
 };
 use sctx_event_schema::Event;
 use sctx_git_store::{
-    CandidateSubmissionIndex, CandidateSubmissionLookup, CandidateSubmissionRequest, CrashInjector,
-    CrashSeam, Error, ErrorKind, GitStore, Result,
+    CandidateConfirmationWriteStatus, CandidateSubmissionIndex, CandidateSubmissionLookup,
+    CandidateSubmissionRequest, CrashInjector, CrashSeam, Error, ErrorKind, GitStore, Result,
 };
 use sctx_index::{IndexUpdateKind, ProjectionIndex};
 
@@ -57,8 +59,55 @@ fn configured_store() -> (tempfile::TempDir, GitStore, ProjectionIndex) {
     let temporary = tempfile::tempdir().unwrap();
     let base = GitStore::initialize(temporary.path().join("installation")).unwrap();
     let index = ProjectionIndex::for_store(&base);
-    let store = base.with_candidate_submission_index(Arc::new(index.clone()));
+    let store = base
+        .with_candidate_submission_index(Arc::new(index.clone()))
+        .with_candidate_confirmation_index(Arc::new(index.clone()));
     (temporary, store, index)
+}
+
+fn confirmation_plan(store: &GitStore, index: &ProjectionIndex) -> CandidateConfirmationPlan {
+    let space = Event::space_created(
+        IntentSnapshot {
+            title: "Confirmation Space".to_owned(),
+            problem: "A Candidate needs a Primary Space".to_owned(),
+            desired_outcome: "Publish the confirmed Candidate".to_owned(),
+            in_scope: vec!["Candidate confirmation".to_owned()],
+            out_of_scope: Vec::new(),
+            acceptance_conditions: vec!["One atomic fact closure".to_owned()],
+            domain_terms: Vec::new(),
+        },
+        None,
+    )
+    .unwrap();
+    let sctx_event_schema::EventPayload::SpaceCreated { space_id, .. } = space.payload() else {
+        unreachable!()
+    };
+    let space_id = *space_id;
+    store
+        .append_event(sctx_git_store::AppendRequest::event(space))
+        .unwrap();
+    let submission = request(
+        SubmissionId::new(),
+        "Confirmation Writer preserves one atomic closure",
+    );
+    let submitted = store.submit_candidate(submission).unwrap();
+    let candidate = index.domain_snapshot().unwrap().projection.candidates
+        [&submitted.record.candidate_id]
+        .candidate
+        .clone();
+    CandidateConfirmationPlan::reserve(
+        &candidate,
+        CandidateConfirmationOperation {
+            candidate_id: candidate.candidate_id,
+            review_parent_version: 1,
+            analysis_generation: 1,
+            primary: CandidateConfirmationPrimaryReference::ExistingSpace { space_id },
+            related_space_ids: Vec::new(),
+            edits: OptionalCandidateEdits::default(),
+        },
+        CandidatePrimarySelection::Existing { space_id },
+    )
+    .unwrap()
 }
 
 fn commit_raw_event(store: &GitStore, label: &str, value: &serde_json::Value) -> String {
@@ -540,4 +589,144 @@ fn valid_duplicate_submission_events_project_a_typed_conflict_after_index_rebuil
         CandidateSubmissionIndex::lookup(&index, submission_id).unwrap(),
         expected
     );
+}
+
+#[test]
+fn one_hundred_concurrent_confirmation_retries_converge_to_one_atomic_commit() {
+    let (_temporary, store, index) = configured_store();
+    let plan = confirmation_plan(&store, &index);
+    let before = Command::new("git")
+        .arg("-C")
+        .arg(store.repository())
+        .args(["rev-list", "--count", "HEAD"])
+        .output()
+        .unwrap();
+    let before: usize = String::from_utf8(before.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let store = Arc::new(store);
+    let barrier = Arc::new(Barrier::new(100));
+    let outcomes = (0..100)
+        .map(|_| {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let plan = plan.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                store.confirm_candidate(&plan).unwrap()
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| outcome.status == CandidateConfirmationWriteStatus::Created)
+            .count(),
+        1
+    );
+    assert!(outcomes.iter().all(|outcome| {
+        outcome.record.confirmation_id == outcomes[0].record.confirmation_id
+            && outcome.record.result_context_id == outcomes[0].record.result_context_id
+            && outcome.record.batch_id == outcomes[0].record.batch_id
+            && outcome.record.commit_oid == outcomes[0].record.commit_oid
+            && outcome.record.event_ids.len() == 4
+    }));
+    let after = Command::new("git")
+        .arg("-C")
+        .arg(store.repository())
+        .args(["rev-list", "--count", "HEAD"])
+        .output()
+        .unwrap();
+    let after: usize = String::from_utf8(after.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(after, before + 1);
+}
+
+#[test]
+fn confirmation_crash_seams_recover_all_events_and_index_deletion_rebuilds_mapping() {
+    for seam in [
+        CrashSeam::AfterJournal,
+        CrashSeam::BeforeCreate,
+        CrashSeam::AfterCreate,
+        CrashSeam::BeforeAdd,
+        CrashSeam::AfterAdd,
+        CrashSeam::BeforeCommit,
+        CrashSeam::AfterCommit,
+        CrashSeam::BeforeCommitOid,
+        CrashSeam::AfterCommitOid,
+        CrashSeam::BeforeIndex,
+        CrashSeam::AfterIndex,
+        CrashSeam::BeforeCleanup,
+        CrashSeam::AfterCleanup,
+    ] {
+        let (_temporary, store, index) = configured_store();
+        let plan = confirmation_plan(&store, &index);
+        let crashing = store
+            .clone()
+            .with_crash_injector(Arc::new(FailOnce::at(seam)));
+        assert!(crashing.confirm_candidate(&plan).is_err(), "{seam:?}");
+        let recovered = store.confirm_candidate(&plan).unwrap();
+        assert_eq!(recovered.record.event_ids.len(), 4, "{seam:?}");
+        assert_eq!(recovered.record.event_paths.len(), 4, "{seam:?}");
+        assert!(store.list_pending().unwrap().is_empty(), "{seam:?}");
+        let record = recovered.record;
+        fs::remove_file(index.database_path()).unwrap();
+        let rebuilt = store.confirm_candidate(&plan).unwrap();
+        assert_eq!(
+            rebuilt.status,
+            CandidateConfirmationWriteStatus::AlreadyExists
+        );
+        assert_eq!(rebuilt.record, record, "{seam:?}");
+    }
+}
+
+#[test]
+fn confirmation_privacy_failure_writes_no_event_or_pending_journal() {
+    let (_temporary, store, index) = configured_store();
+    let mut plan = confirmation_plan(&store, &index);
+    let candidate = index.domain_snapshot().unwrap().projection.candidates
+        [&plan.operation.candidate_id]
+        .candidate
+        .clone();
+    let primary_space_id = plan.confirmation.primary_space_id;
+    plan = CandidateConfirmationPlan::reserve(
+        &candidate,
+        CandidateConfirmationOperation {
+            edits: OptionalCandidateEdits {
+                statement: Some("AKIAIOSFODNN7EXAMPLE".to_owned()),
+                ..OptionalCandidateEdits::default()
+            },
+            ..plan.operation
+        },
+        CandidatePrimarySelection::Existing {
+            space_id: primary_space_id,
+        },
+    )
+    .unwrap();
+    let before = Command::new("git")
+        .arg("-C")
+        .arg(store.repository())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap()
+        .stdout;
+    let error = store.confirm_candidate(&plan).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput, "{error}");
+    assert!(store.list_pending().unwrap().is_empty());
+    let after = Command::new("git")
+        .arg("-C")
+        .arg(store.repository())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(after, before);
 }

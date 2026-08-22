@@ -15,11 +15,12 @@ use std::{
 use fs2::FileExt;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use sctx_domain::{
-    CandidateId, DomainProjection, EventId, SubmissionId, TaskId, TaskSessionId, WorkEpisodeId,
-    WorkEpisodeRef,
+    CandidateId, ConfirmationId, ContextId, DomainProjection, EventId, SubmissionId, TaskId,
+    TaskSessionId, WorkEpisodeId, WorkEpisodeRef,
 };
 use sctx_git_store::{
-    BatchId, CandidateSubmissionIndex, CandidateSubmissionLookup, CandidateSubmissionRecord,
+    BatchId, CandidateConfirmationIndex, CandidateConfirmationLookup, CandidateConfirmationRecord,
+    CandidateSubmissionIndex, CandidateSubmissionLookup, CandidateSubmissionRecord,
 };
 
 mod git_tree;
@@ -31,7 +32,7 @@ pub use sctx_domain::{Error, ErrorKind, Result};
 pub use tokenizer::{normalize_search_text, search_tokens};
 
 /// Current physical `SQLite` schema version.
-pub const DB_SCHEMA_VERSION: &str = "10";
+pub const DB_SCHEMA_VERSION: &str = "11";
 /// Event parser implementation version recorded in every projection.
 pub const EVENT_PARSER_VERSION: &str = "1";
 /// Pure reducer implementation version recorded in every projection.
@@ -609,6 +610,12 @@ impl ProjectionIndex {
                 &metadata.event_path,
             )?);
         }
+        for metadata in input.confirmation_events.values_mut() {
+            metadata.commit_oid = Some(git_tree::introducing_commit_oid(
+                &self.repository,
+                &metadata.event_path,
+            )?);
+        }
         Ok(input)
     }
 
@@ -815,6 +822,86 @@ impl CandidateSubmissionIndex for ProjectionIndex {
                 batch_id: BatchId::from_str(&batch_id)?,
                 commit_oid,
                 event_path,
+            },
+        ))
+    }
+}
+
+impl CandidateConfirmationIndex for ProjectionIndex {
+    fn synchronize(&self) -> Result<()> {
+        ProjectionIndex::synchronize(self).map(|_| ())
+    }
+
+    fn lookup(&self, candidate_id: CandidateId) -> Result<CandidateConfirmationLookup> {
+        let connection = self.open_read_only()?;
+        if let Some((confirmation_ids_json, event_ids_json)) = connection
+            .query_row(
+                "SELECT confirmation_ids_json, event_ids_json
+                 FROM candidate_confirmation_conflict WHERE candidate_id = ?1",
+                [candidate_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(sql_error("read Candidate Confirmation conflict"))?
+        {
+            return Ok(CandidateConfirmationLookup::Conflict {
+                candidate_id,
+                confirmation_ids: serde_json::from_str(&confirmation_ids_json)
+                    .map_err(json_error("parse Confirmation conflict IDs"))?,
+                event_ids: serde_json::from_str(&event_ids_json)
+                    .map_err(json_error("parse Confirmation conflict Event IDs"))?,
+            });
+        }
+        let row = connection
+            .query_row(
+                "SELECT confirmation_id, result_context_id, operation_hash, plan_hash,
+                        batch_id, commit_oid, event_ids_json, event_paths_json
+                 FROM candidate_confirmation WHERE candidate_id = ?1",
+                [candidate_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(sql_error("read Candidate Confirmation mapping"))?;
+        let Some((
+            confirmation_id,
+            result_context_id,
+            operation_hash,
+            plan_hash,
+            batch_id,
+            commit_oid,
+            event_ids_json,
+            event_paths_json,
+        )) = row
+        else {
+            return Ok(CandidateConfirmationLookup::NotFound);
+        };
+        Ok(CandidateConfirmationLookup::Found(
+            CandidateConfirmationRecord {
+                candidate_id,
+                confirmation_id: ConfirmationId::from_str(&confirmation_id).map_err(|error| {
+                    invariant(format!("invalid indexed ConfirmationId: {error}"))
+                })?,
+                result_context_id: ContextId::from_str(&result_context_id)
+                    .map_err(|error| invariant(format!("invalid indexed ContextId: {error}")))?,
+                operation_hash,
+                plan_hash,
+                batch_id: BatchId::from_str(&batch_id)?,
+                commit_oid,
+                event_ids: serde_json::from_str(&event_ids_json)
+                    .map_err(json_error("parse Confirmation batch Event IDs"))?,
+                event_paths: serde_json::from_str(&event_paths_json)
+                    .map_err(json_error("parse Confirmation batch Event paths"))?,
             },
         ))
     }

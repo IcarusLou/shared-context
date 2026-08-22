@@ -9,11 +9,11 @@ use sctx_domain::{
     Applicability, AutomaticCandidateStatus, AutomaticContextCandidate, CandidateAnalysis,
     CandidateAnalysisStatus, CandidateAssessmentPath, CandidateAssessmentRelation,
     CandidateBuilderProvenance, CandidateConfidence, CandidateId, CandidateRelationAssessment,
-    CandidateReviewStatus, CaptureEvidenceRef, CaptureId, CaptureUnknown, ContextCandidate,
-    ContextKind, ContextRevisionDraft, ErrorKind, EventId, EvidenceSnapshotDraft, EvidenceType,
-    ExternalSessionLocator, NormalizedBreadcrumbKind, NormalizedWorkObservation, TaskId,
-    TaskIntent, TaskIntentDraft, TaskSignal, TaskSignalKind, TestOutcomeStatus, WorkEpisodeStatus,
-    WorkSourceRef,
+    CandidateReviewStatus, CaptureEvidenceRef, CaptureId, CaptureUnknown, ConfirmationId,
+    ContextCandidate, ContextId, ContextKind, ContextRevisionDraft, ErrorKind, EventId,
+    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, NormalizedBreadcrumbKind,
+    NormalizedWorkObservation, TaskId, TaskIntent, TaskIntentDraft, TaskSignal, TaskSignalKind,
+    TestOutcomeStatus, WorkEpisodeStatus, WorkSourceRef,
 };
 use sctx_task_runtime::{
     AgentCheckpointWrite, CandidateBuildItemPreparation, CandidateBuildItemStatus,
@@ -858,8 +858,14 @@ fn candidate_reviews_isolate_sessions_episodes_stale_and_reserved_confirmed_stat
     Connection::open(runtime.database_path())
         .unwrap()
         .execute(
-            "UPDATE candidate_review SET status = 'confirmed' WHERE candidate_id = ?1",
-            [later_review.candidate_id.to_string()],
+            "UPDATE candidate_review
+             SET status = 'confirmed', confirmation_id = ?1, result_context_id = ?2
+             WHERE candidate_id = ?3",
+            [
+                ConfirmationId::new().to_string(),
+                ContextId::new().to_string(),
+                later_review.candidate_id.to_string(),
+            ],
         )
         .unwrap();
     assert_eq!(

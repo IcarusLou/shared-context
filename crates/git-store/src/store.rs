@@ -9,8 +9,9 @@ use std::{
 
 use fs2::FileExt;
 use sctx_domain::{
-    CandidateId, ContextRevisionDraft, Error, ErrorKind, EventId, ReducerEvent, Result,
-    SubmissionId, WorkEpisodeRef, candidate_submission_content_hash, reduce,
+    CandidateConfirmationPlan, CandidateId, ConfirmationId, ContextId, ContextRevisionDraft, Error,
+    ErrorKind, EventId, ReducerEvent, Result, SubmissionId, WorkEpisodeRef,
+    candidate_submission_content_hash, reduce,
 };
 use sctx_event_schema::{
     ContextSpaceAssociationOrigin, Event, EventPayload, EventType, ParsedEvent,
@@ -84,6 +85,16 @@ pub struct AppendOutcome {
     pub event_path: String,
     pub commit_oid: String,
     pub objects: Vec<ObjectRef>,
+    pub recovered: bool,
+}
+
+/// Successful atomic internal multi-Event append/recovery result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppendBatchOutcome {
+    pub batch_id: BatchId,
+    pub event_ids: Vec<EventId>,
+    pub event_paths: Vec<String>,
+    pub commit_oid: String,
     pub recovered: bool,
 }
 
@@ -180,6 +191,84 @@ pub enum CandidateSubmissionStatus {
     AlreadyExists,
 }
 
+/// Complete indexed metadata for one unique Candidate Confirmation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateConfirmationRecord {
+    pub candidate_id: CandidateId,
+    pub confirmation_id: ConfirmationId,
+    pub result_context_id: ContextId,
+    pub operation_hash: String,
+    pub plan_hash: String,
+    pub batch_id: BatchId,
+    pub commit_oid: String,
+    pub event_ids: Vec<EventId>,
+    pub event_paths: Vec<String>,
+}
+
+/// Typed indexed lookup isolating confirmation-local conflicts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CandidateConfirmationLookup {
+    NotFound,
+    Found(CandidateConfirmationRecord),
+    Conflict {
+        candidate_id: CandidateId,
+        confirmation_ids: Vec<ConfirmationId>,
+        event_ids: Vec<EventId>,
+    },
+}
+
+/// Rebuildable Candidate Confirmation index implemented by the Index crate.
+pub trait CandidateConfirmationIndex: Send + Sync {
+    /// Synchronizes derived state to current committed Git `HEAD`.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage or projection errors.
+    fn synchronize(&self) -> Result<()>;
+
+    /// Looks up one Candidate without walking Git Events.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage, parse, or conflict-projection errors.
+    fn lookup(&self, candidate_id: CandidateId) -> Result<CandidateConfirmationLookup>;
+}
+
+#[derive(Debug, Default)]
+pub struct UnavailableCandidateConfirmationIndex;
+
+impl CandidateConfirmationIndex for UnavailableCandidateConfirmationIndex {
+    fn synchronize(&self) -> Result<()> {
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "Candidate Confirmation index is not configured",
+        ))
+    }
+
+    fn lookup(&self, _candidate_id: CandidateId) -> Result<CandidateConfirmationLookup> {
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "Candidate Confirmation index is not configured",
+        ))
+    }
+}
+
+/// Exact result of one atomic Candidate Confirmation write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateConfirmationWriteStatus {
+    Created,
+    AlreadyExists,
+}
+
+/// Fact mapping and atomic batch returned by Confirmation Writer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateConfirmationOutcome {
+    pub append: AppendBatchOutcome,
+    pub record: CandidateConfirmationRecord,
+    pub status: CandidateConfirmationWriteStatus,
+}
+
 impl CandidateSubmissionOutcome {
     #[must_use]
     pub const fn created(&self) -> bool {
@@ -262,6 +351,7 @@ pub struct GitStore {
     crash: Arc<dyn CrashInjector>,
     observer: Arc<dyn CommitObserver>,
     candidate_index: Arc<dyn CandidateSubmissionIndex>,
+    confirmation_index: Arc<dyn CandidateConfirmationIndex>,
 }
 
 impl GitStore {
@@ -337,6 +427,7 @@ impl GitStore {
             crash: Arc::new(NoopCrashInjector),
             observer: Arc::new(NoopCommitObserver),
             candidate_index: Arc::new(UnavailableCandidateSubmissionIndex),
+            confirmation_index: Arc::new(UnavailableCandidateConfirmationIndex),
         })
     }
 
@@ -361,6 +452,16 @@ impl GitStore {
         index: Arc<dyn CandidateSubmissionIndex>,
     ) -> Self {
         self.candidate_index = index;
+        self
+    }
+
+    /// Configures the rebuildable Candidate Confirmation index.
+    #[must_use]
+    pub fn with_candidate_confirmation_index(
+        mut self,
+        index: Arc<dyn CandidateConfirmationIndex>,
+    ) -> Self {
+        self.confirmation_index = index;
         self
     }
 
@@ -494,6 +595,102 @@ impl GitStore {
             append,
             record,
             status: CandidateSubmissionStatus::Created,
+        })
+    }
+
+    /// Atomically appends one reserved Candidate Confirmation fact closure.
+    ///
+    /// The Confirmation lock spans index synchronization, pending recovery, the four/five Event
+    /// commit, and post-commit lookup. Public generic append remains single-Event only.
+    ///
+    /// # Errors
+    ///
+    /// Rejects plan/hash conflicts, privacy failures, unavailable index state, pending recovery,
+    /// Git failures, and injected crash seams.
+    pub fn confirm_candidate(
+        &self,
+        plan: &CandidateConfirmationPlan,
+    ) -> Result<CandidateConfirmationOutcome> {
+        plan.validate()?;
+        let operation_hash = plan.operation_hash.clone();
+        let plan_hash = plan.plan_hash();
+        let candidate_id = plan.operation.candidate_id;
+        let lock = open_lock(&self.state.join("candidate-confirmation.lock"))?;
+        lock.lock_exclusive()
+            .map_err(io_error("lock candidate-confirmation.lock"))?;
+        self.confirmation_index.synchronize()?;
+        let writer_lock = self.writer_lock()?;
+        self.recover_all_locked(None)?;
+        FileExt::unlock(&writer_lock).map_err(io_error("unlock writer.lock"))?;
+        self.confirmation_index.synchronize()?;
+        match self.confirmation_index.lookup(candidate_id)? {
+            CandidateConfirmationLookup::Found(record) => {
+                if record.operation_hash != operation_hash || record.plan_hash != plan_hash {
+                    return Err(Error::new(
+                        ErrorKind::Conflict,
+                        "Candidate already has a different Confirmation operation",
+                    ));
+                }
+                let append = append_batch_from_confirmation_record(&record, true);
+                FileExt::unlock(&lock).map_err(io_error("unlock candidate-confirmation.lock"))?;
+                return Ok(CandidateConfirmationOutcome {
+                    append,
+                    record,
+                    status: CandidateConfirmationWriteStatus::AlreadyExists,
+                });
+            }
+            CandidateConfirmationLookup::Conflict { .. } => {
+                return Err(Error::new(
+                    ErrorKind::Conflict,
+                    "Candidate has conflicting Confirmation facts",
+                ));
+            }
+            CandidateConfirmationLookup::NotFound => {}
+        }
+        let batch_id = BatchId::new();
+        let events = Event::from_candidate_confirmation_plan(plan, batch_id.as_str())?;
+        if !matches!(events.len(), 4 | 5) {
+            return Err(invariant(
+                "Candidate Confirmation plan must materialize four or five Events",
+            ));
+        }
+        let journal = self.prepare_internal_event_batch(&events, batch_id)?;
+        self.crash.check(CrashSeam::AfterJournal)?;
+        let writer_lock = self.writer_lock()?;
+        self.recover_all_locked(Some(&journal.batch_id))?;
+        let primary = self.commit_journal_locked(&journal, false)?;
+        FileExt::unlock(&writer_lock).map_err(io_error("unlock writer.lock"))?;
+        self.confirmation_index.synchronize()?;
+        let record = match self.confirmation_index.lookup(candidate_id)? {
+            CandidateConfirmationLookup::Found(record)
+                if record.operation_hash == operation_hash && record.plan_hash == plan_hash =>
+            {
+                record
+            }
+            CandidateConfirmationLookup::Found(_)
+            | CandidateConfirmationLookup::Conflict { .. } => {
+                return Err(invariant(
+                    "committed Candidate Confirmation projected conflicting semantics",
+                ));
+            }
+            CandidateConfirmationLookup::NotFound => {
+                return Err(invariant(
+                    "committed Candidate Confirmation is absent from synchronized index",
+                ));
+            }
+        };
+        let append = AppendBatchOutcome {
+            batch_id: primary.batch_id,
+            event_ids: record.event_ids.clone(),
+            event_paths: record.event_paths.clone(),
+            commit_oid: primary.commit_oid,
+            recovered: primary.recovered,
+        };
+        FileExt::unlock(&lock).map_err(io_error("unlock candidate-confirmation.lock"))?;
+        Ok(CandidateConfirmationOutcome {
+            append,
+            record,
+            status: CandidateConfirmationWriteStatus::Created,
         })
     }
 
@@ -689,6 +886,62 @@ impl GitStore {
         self.prepare_serialized_with_batch(event, Vec::new(), batch_id, event_bytes)
     }
 
+    fn prepare_internal_event_batch(&self, events: &[Event], batch_id: BatchId) -> Result<Journal> {
+        if events.is_empty() || events.len() > 64 {
+            return Err(invariant(
+                "internal Event batch requires between one and 64 Events",
+            ));
+        }
+        let scanner = PrivacyScanner::default();
+        let mut ordered = events.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|event| event.event_type() != EventType::CandidateConfirmed);
+        let primary = ordered[0];
+        let serialized = ordered
+            .iter()
+            .enumerate()
+            .map(|(index, event)| {
+                let bytes = serialize_generated_event(event)?;
+                reject_sensitive(&scanner, &format!("internal event {index}"), &bytes)?;
+                Ok((*event, bytes))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let batch_dir = self.pending_dir(&batch_id);
+        let files_dir = batch_dir.join("files");
+        fs::create_dir(&batch_dir).map_err(io_error("create confirmation pending batch"))?;
+        fs::create_dir(&files_dir).map_err(io_error("create confirmation pending files"))?;
+        let mut files = Vec::with_capacity(serialized.len());
+        for (index, (event, bytes)) in serialized.into_iter().enumerate() {
+            let target_path = generated_event_path(event.event_id());
+            let payload_file = format!("{index:04}.payload");
+            write_new_synced(&files_dir.join(&payload_file), &bytes)?;
+            files.push(PendingFile {
+                kind: PendingFileKind::Event,
+                target_path,
+                payload_file,
+                sha256: sha256(&bytes),
+                size: bytes.len() as u64,
+            });
+        }
+        sync_directory(&files_dir)?;
+        let journal = Journal {
+            version: JOURNAL_VERSION,
+            batch_id,
+            event_id: primary.event_id().to_string(),
+            additional_event_ids: ordered[1..]
+                .iter()
+                .map(|event| event.event_id().to_string())
+                .collect(),
+            base_head_oid: None,
+            phase: JournalPhase::Prepared,
+            commit_oid: None,
+            files,
+        };
+        validate_journal(&journal)?;
+        self.write_journal(&journal)?;
+        sync_directory(&self.state.join("pending"))?;
+        Ok(journal)
+    }
+
     fn prepare_serialized_with_batch(
         &self,
         event: &Event,
@@ -743,6 +996,7 @@ impl GitStore {
             version: JOURNAL_VERSION,
             batch_id,
             event_id: event_text,
+            additional_event_ids: Vec::new(),
             base_head_oid: None,
             phase: JournalPhase::Prepared,
             commit_oid: None,
@@ -1174,6 +1428,14 @@ fn validate_journal(journal: &Journal) -> Result<()> {
     BatchId::from_str(journal.batch_id.as_str())?;
     let event_id = EventId::from_str(&journal.event_id)
         .map_err(|error| invariant(format!("invalid journal event ID: {error}")))?;
+    let mut expected_event_ids = BTreeSet::from([event_id]);
+    for value in &journal.additional_event_ids {
+        let id = EventId::from_str(value)
+            .map_err(|error| invariant(format!("invalid additional journal event ID: {error}")))?;
+        if !expected_event_ids.insert(id) {
+            return Err(invariant("journal contains duplicate Event IDs"));
+        }
+    }
     if journal.files.is_empty() {
         return Err(invariant("journal must contain an event"));
     }
@@ -1188,7 +1450,7 @@ fn validate_journal(journal: &Journal) -> Result<()> {
     }
     let mut targets = BTreeSet::new();
     let mut payloads = BTreeSet::new();
-    let mut event_count = 0;
+    let mut observed_event_ids = BTreeSet::new();
     for file in &journal.files {
         if !targets.insert(&file.target_path) || !payloads.insert(&file.payload_file) {
             return Err(invariant("journal contains duplicate paths"));
@@ -1209,8 +1471,18 @@ fn validate_journal(journal: &Journal) -> Result<()> {
         }
         match file.kind {
             PendingFileKind::Event => {
-                event_count += 1;
-                if file.target_path != generated_event_path(event_id) {
+                let file_name = file
+                    .target_path
+                    .rsplit('/')
+                    .next()
+                    .and_then(|name| name.strip_suffix(".json"))
+                    .ok_or_else(|| invariant("journal event target is malformed"))?;
+                let file_event_id = EventId::from_str(file_name).map_err(|error| {
+                    invariant(format!("invalid journal target Event ID: {error}"))
+                })?;
+                if file.target_path != generated_event_path(file_event_id)
+                    || !observed_event_ids.insert(file_event_id)
+                {
                     return Err(invariant(
                         "journal event target is not generated from event ID",
                     ));
@@ -1223,8 +1495,10 @@ fn validate_journal(journal: &Journal) -> Result<()> {
             }
         }
     }
-    if event_count != 1 {
-        return Err(invariant("journal must contain exactly one event"));
+    if observed_event_ids != expected_event_ids {
+        return Err(invariant(
+            "journal Event files do not match its declared Event IDs",
+        ));
     }
     Ok(())
 }
@@ -1364,6 +1638,19 @@ fn append_from_submission_record(
         event_path: record.event_path.clone(),
         commit_oid: record.commit_oid.clone(),
         objects: Vec::new(),
+        recovered,
+    }
+}
+
+fn append_batch_from_confirmation_record(
+    record: &CandidateConfirmationRecord,
+    recovered: bool,
+) -> AppendBatchOutcome {
+    AppendBatchOutcome {
+        batch_id: record.batch_id.clone(),
+        event_ids: record.event_ids.clone(),
+        event_paths: record.event_paths.clone(),
+        commit_oid: record.commit_oid.clone(),
         recovered,
     }
 }

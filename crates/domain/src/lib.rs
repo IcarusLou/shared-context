@@ -14,6 +14,8 @@ mod task;
 
 pub use confirmation::{
     CandidateConfirmation, CandidateConfirmationCausalRefs, CandidateConfirmationDraft,
+    CandidateConfirmationNewSpace, CandidateConfirmationOperation, CandidateConfirmationPlan,
+    CandidateConfirmationPlanEventIds, CandidateConfirmationPrimaryReference,
     CandidateConfirmationRequest, CandidatePrimarySelection, ContextSpaceAssociation,
     ContextSpaceAssociationDraft, ContextSpaceAssociationOrigin, OptionalCandidateEdits,
     TopicKeyEdit, context_revision_as_draft, context_revision_content_hash,

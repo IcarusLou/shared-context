@@ -90,6 +90,8 @@ pub(crate) struct Journal {
     pub(crate) batch_id: BatchId,
     pub(crate) event_id: String,
     #[serde(default)]
+    pub(crate) additional_event_ids: Vec<String>,
+    #[serde(default)]
     pub(crate) base_head_oid: Option<String>,
     pub(crate) phase: JournalPhase,
     pub(crate) commit_oid: Option<String>,
@@ -101,6 +103,7 @@ pub(crate) struct Journal {
 pub struct PendingBatch {
     pub batch_id: BatchId,
     pub event_id: String,
+    pub additional_event_ids: Vec<String>,
     pub phase: JournalPhase,
     pub commit_oid: Option<String>,
     pub files: Vec<PendingFile>,
@@ -111,6 +114,7 @@ impl From<&Journal> for PendingBatch {
         Self {
             batch_id: journal.batch_id.clone(),
             event_id: journal.event_id.clone(),
+            additional_event_ids: journal.additional_event_ids.clone(),
             phase: journal.phase,
             commit_oid: journal.commit_oid.clone(),
             files: journal.files.clone(),

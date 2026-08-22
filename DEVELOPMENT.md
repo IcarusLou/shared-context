@@ -29,7 +29,7 @@
 
 以下能力**尚未实现**，不得在代码、测试报告或评审中宣称已经具备：
 
-- **M4 完整链路：未实现** — #117 已完成 Candidate submission 幂等门禁，#156/#157/#158/#159/#160/#161 已完成可验证 WorkEpisode/Capture、显式 AgentCheckpoint、确定性 Candidate Builder、非权威分析/Space 推荐、Task-local Review 与确认事实模型；自动聚合（#163）和 Candidate confirm Writer/MCP 执行（#162）尚未实现。
+- **M4 完整链路：未实现** — #117 已完成 Candidate submission 幂等门禁，#156–#162 已完成可验证 WorkEpisode/Capture、显式 AgentCheckpoint、确定性 Candidate Builder、非权威分析/Space 推荐、Task-local Review 与可恢复原子确认；仅自动聚合（#163）尚未实现。
 - **团队同步：未实现** — Repository Catalog 是单机显式配置，不是团队事实或知识 Store。
 
 Cursor 与 Codex 都通过显式 `task_intent_update` 建立权威 Task；Prompt Hook 只提供能力提示。已有 ActiveTask 可通过只读 `task_context` 再取 Pack。

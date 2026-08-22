@@ -9,27 +9,31 @@ use std::{
 
 use rusqlite::Connection;
 use sctx_domain::{
-    Applicability, ArtifactAction, ArtifactLocator, ArtifactRef, CandidateId,
-    CandidateReviewDiagnostic, CandidateReviewStatus, CaptureId, CaptureUnknown, ContextId,
-    ContextKind, ContextRevisionDraft, ContextRevisionRef, ContextUseDisposition, EventId,
-    EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, NormalizedBreadcrumbKind,
-    NormalizedWorkObservation, PublicationAction, PublicationDraft, RepoRelativePath, RepositoryId,
-    RevisionId, SpaceId, SubmissionId, TaskId, TaskIntentDraft, TaskIntentRevisionId, TaskSignal,
-    TaskSignalKind, WorkEpisodeId, WorkSourceRef, candidate_submission_content_hash,
+    Applicability, ArtifactAction, ArtifactLocator, ArtifactRef, CandidateConfirmationOperation,
+    CandidateConfirmationPlan, CandidateConfirmationPrimaryReference, CandidateId,
+    CandidatePrimarySelection, CandidateReviewDiagnostic, CandidateReviewStatus, CaptureId,
+    CaptureUnknown, ContextId, ContextKind, ContextRevisionDraft, ContextRevisionRef,
+    ContextUseDisposition, EventId, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot,
+    NormalizedBreadcrumbKind, NormalizedWorkObservation, OptionalCandidateEdits, PublicationAction,
+    PublicationDraft, RepoRelativePath, RepositoryId, RevisionId, SpaceId, SubmissionId, TaskId,
+    TaskIntentDraft, TaskIntentRevisionId, TaskSignal, TaskSignalKind, WorkEpisodeId,
+    WorkSourceRef, candidate_submission_content_hash,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
 use sctx_index::ProjectionIndex;
 use sctx_local_state::UserConfigStore;
 use sctx_mcp::{
-    CandidateBuildItemResponseStatus, CandidateBuildResponseStatus, CandidateDiscardInput,
+    CandidateBuildItemResponseStatus, CandidateBuildResponseStatus, CandidateConfirmInput,
+    CandidateConfirmPrimaryInput, CandidateConfirmResponseStatus, CandidateDiscardInput,
     CandidateDiscardResponseStatus, CandidateGetInput, CandidateListInput, ClientKind,
-    DisconnectReason, ExpectedRevisionId, IntentMaturity, McpServer, TaskBoundary,
-    TaskCheckpointBoundary, TaskCheckpointClaimInput, TaskCheckpointEvidenceInput,
-    TaskCheckpointInput, TaskContextReadInput, TaskIntentUpdateInput, TaskSignalSupersedeInput,
-    TransportErrorKind, build_closed_episode_at_root, candidate_discard_at_root,
-    candidate_get_at_root, candidate_list_at_root, task_checkpoint_at_root,
-    task_context_readonly_at_root, task_intent_update_at_root, task_signal_supersede_at_root,
+    DisconnectReason, ExistingCandidatePrimaryInput, ExpectedRevisionId, IntentMaturity, McpServer,
+    NewCandidatePrimaryInput, TaskBoundary, TaskCheckpointBoundary, TaskCheckpointClaimInput,
+    TaskCheckpointEvidenceInput, TaskCheckpointInput, TaskContextReadInput, TaskIntentUpdateInput,
+    TaskSignalSupersedeInput, TransportErrorKind, build_closed_episode_at_root,
+    candidate_confirm_at_root, candidate_discard_at_root, candidate_get_at_root,
+    candidate_list_at_root, task_checkpoint_at_root, task_context_readonly_at_root,
+    task_intent_update_at_root, task_signal_supersede_at_root,
 };
 use sctx_task_runtime::{
     AgentCheckpointWrite, CandidateBuildItemPreparation, CandidateBuildItemStatus,
@@ -183,6 +187,61 @@ fn closed_candidate_owner(fixture: &Fixture, agent_kind: &str, session: &str) ->
         intent_revision_id: task.context.intent_revision_id,
         source_episode_id: closed.episode_id,
     }
+}
+
+fn build_review_candidate(
+    fixture: &Fixture,
+    session: &str,
+    statement: &str,
+) -> (sctx_mcp::TaskIntentUpdateResponse, CandidateId) {
+    let task = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            session,
+            TaskBoundary::New,
+            None,
+            IntentMaturity::Provisional,
+            statement,
+        ),
+    )
+    .unwrap();
+    let closed = task_checkpoint_at_root(
+        &fixture.root,
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: task.context.task_id.to_string(),
+            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+            expected_episode_version: 0,
+            boundary: TaskCheckpointBoundary::Close,
+            claims: vec![TaskCheckpointClaimInput {
+                context_kind_hint: Some(ContextKind::Decision),
+                topic_key_hint: Some(format!("confirmation/{session}")),
+                statement: statement.to_owned(),
+                rationale: "Verified Candidate confirmation fixture".to_owned(),
+                applicability: Applicability::default(),
+                assumptions: Vec::new(),
+                recheck_when: vec!["the confirmation contract changes".to_owned()],
+                evidence: vec![TaskCheckpointEvidenceInput::InlineValidation {
+                    evidence: EvidenceSnapshotDraft {
+                        kind: EvidenceType::ExperimentRecord,
+                        supports: "The Candidate confirmation fixture passed".to_owned(),
+                        content: json!({"fixture": session, "actual": "passed"}),
+                        interpretation: "The Candidate has self-contained Evidence".to_owned(),
+                        limitations: vec!["local fixture".to_owned()],
+                    },
+                }],
+                artifact_refs: Vec::new(),
+                related_contexts: Vec::new(),
+            }],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap();
+    let candidate_id = closed.candidate_build.unwrap().items[0]
+        .candidate_id
+        .unwrap();
+    (task, candidate_id)
 }
 
 fn candidate_arguments(
@@ -1444,6 +1503,71 @@ fn candidate_builder_converts_six_typed_sources_without_raw_capture_or_search_in
         private_reason.kind(),
         sctx_domain::ErrorKind::PrivacyRejected
     );
+
+    let before_negative_confirms = event_count(fixture.store.repository());
+    let confirm_for = |candidate_id: CandidateId| CandidateConfirmInput {
+        agent_kind: "codex".to_owned(),
+        external_session_id: session.to_owned(),
+        expected_task_id: active.task_id.to_string(),
+        expected_intent_revision_id: active
+            .current_intent_revision()
+            .unwrap()
+            .revision_id
+            .to_string(),
+        candidate_id: candidate_id.to_string(),
+        expected_review_version: 1,
+        primary: CandidateConfirmPrimaryInput::Existing(ExistingCandidatePrimaryInput {
+            existing_space_id: fixture.space_id.to_string(),
+        }),
+        related_space_ids: Vec::new(),
+        edits: OptionalCandidateEdits::default(),
+    };
+    assert!(candidate_confirm_at_root(&fixture.root, &confirm_for(failed_candidate_id)).is_err());
+    assert!(candidate_confirm_at_root(&fixture.root, &confirm_for(missing_candidate_id)).is_err());
+    assert!(candidate_confirm_at_root(&fixture.root, &confirm_for(review_candidate_id)).is_err());
+    let pending_candidate_id = build.items[3].candidate_id.unwrap();
+    let mut invalid_recommendation = confirm_for(pending_candidate_id);
+    invalid_recommendation.primary =
+        CandidateConfirmPrimaryInput::Proposed(NewCandidatePrimaryInput {
+            new_space_recommendation_id: sctx_domain::SpaceRecommendationId::new().to_string(),
+        });
+    assert!(candidate_confirm_at_root(&fixture.root, &invalid_recommendation).is_err());
+    let mut stale = confirm_for(pending_candidate_id);
+    stale.expected_review_version = 99;
+    assert_eq!(
+        candidate_confirm_at_root(&fixture.root, &stale)
+            .unwrap_err()
+            .kind(),
+        sctx_domain::ErrorKind::StaleState
+    );
+    let mut cross_task = confirm_for(pending_candidate_id);
+    cross_task.external_session_id = "candidate-review-other-session".to_owned();
+    cross_task.expected_task_id = other.context.task_id.to_string();
+    cross_task.expected_intent_revision_id = other.context.intent_revision_id.to_string();
+    assert!(candidate_confirm_at_root(&fixture.root, &cross_task).is_err());
+    let mut private_edit = confirm_for(pending_candidate_id);
+    private_edit.edits.statement = Some("AKIAIOSFODNN7EXAMPLE".to_owned());
+    assert_eq!(
+        candidate_confirm_at_root(&fixture.root, &private_edit)
+            .unwrap_err()
+            .kind(),
+        sctx_domain::ErrorKind::PrivacyRejected
+    );
+    let pending_record = tasks
+        .read_candidate_review(
+            &sctx_domain::ExternalSessionLocator::new("codex", session).unwrap(),
+            pending_candidate_id,
+        )
+        .unwrap()
+        .unwrap();
+    tasks
+        .cleanup_expired_candidate_reviews_at(pending_record.expires_at_unix_seconds + 1)
+        .unwrap();
+    assert!(candidate_confirm_at_root(&fixture.root, &confirm_for(pending_candidate_id)).is_err());
+    assert_eq!(
+        event_count(fixture.store.repository()),
+        before_negative_confirms
+    );
 }
 
 #[test]
@@ -1642,6 +1766,387 @@ fn cursor_and_codex_candidate_review_tools_list_get_and_discard_without_confirma
             assert!(!response_text.contains(forbidden));
         }
     }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn candidate_confirm_existing_and_recommended_new_space_are_atomic_idempotent_and_searchable() {
+    let fixture = Fixture::new();
+    let related_space = |title: &str| {
+        let mut snapshot = intent();
+        snapshot.title = title.to_owned();
+        let event = Event::space_created(snapshot, None).unwrap();
+        let EventPayload::SpaceCreated { space_id, .. } = event.payload() else {
+            unreachable!()
+        };
+        let space_id = *space_id;
+        append(&fixture.store, event);
+        space_id
+    };
+    let related_one = related_space("Confirmation Related One");
+    let related_two = related_space("Confirmation Related Two");
+
+    let (existing_task, existing_candidate) = build_review_candidate(
+        &fixture,
+        "confirm-existing",
+        "Original Candidate statement for existing Space",
+    );
+    let existing_input = CandidateConfirmInput {
+        agent_kind: "codex".to_owned(),
+        external_session_id: "confirm-existing".to_owned(),
+        expected_task_id: existing_task.context.task_id.to_string(),
+        expected_intent_revision_id: existing_task.context.intent_revision_id.to_string(),
+        candidate_id: existing_candidate.to_string(),
+        expected_review_version: 1,
+        primary: CandidateConfirmPrimaryInput::Existing(ExistingCandidatePrimaryInput {
+            existing_space_id: fixture.space_id.to_string(),
+        }),
+        related_space_ids: vec![related_one.to_string(), related_two.to_string()],
+        edits: OptionalCandidateEdits {
+            statement: Some("Edited Candidate statement accepted atomically".to_owned()),
+            ..OptionalCandidateEdits::default()
+        },
+    };
+    let created = candidate_confirm_at_root(&fixture.root, &existing_input).unwrap();
+    assert_eq!(created.status, CandidateConfirmResponseStatus::Confirmed);
+    assert!(created.created);
+    assert_eq!(created.event_ids.len(), 4);
+    assert_eq!(created.primary_space_id, fixture.space_id);
+    assert_eq!(created.related_space_ids, vec![related_one, related_two]);
+    assert!(!created.assessment_acknowledgments.is_empty());
+    let retry = candidate_confirm_at_root(&fixture.root, &existing_input).unwrap();
+    assert_eq!(
+        retry.status,
+        CandidateConfirmResponseStatus::AlreadyConfirmed
+    );
+    assert!(!retry.created);
+    assert_eq!(retry.confirmation_id, created.confirmation_id);
+    assert_eq!(retry.context_id, created.context_id);
+    assert_eq!(retry.batch_id, created.batch_id);
+    assert_eq!(retry.commit_oid, created.commit_oid);
+
+    let confirmed_review = candidate_get_at_root(
+        &fixture.root,
+        &CandidateGetInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: "confirm-existing".to_owned(),
+            candidate_id: existing_candidate.to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        confirmed_review.review_status,
+        CandidateReviewStatus::Confirmed
+    );
+    assert_eq!(
+        confirmed_review.confirmation_id,
+        Some(created.confirmation_id)
+    );
+    assert_eq!(confirmed_review.result_context_id, Some(created.context_id));
+    assert!(
+        candidate_list_at_root(
+            &fixture.root,
+            &CandidateListInput {
+                agent_kind: "codex".to_owned(),
+                external_session_id: "confirm-existing".to_owned(),
+                status: CandidateReviewStatus::Pending,
+                limit: 10,
+                cursor: None,
+                token_budget: 32_768,
+            },
+        )
+        .unwrap()
+        .reviews
+        .is_empty()
+    );
+    assert_eq!(
+        candidate_list_at_root(
+            &fixture.root,
+            &CandidateListInput {
+                agent_kind: "codex".to_owned(),
+                external_session_id: "confirm-existing".to_owned(),
+                status: CandidateReviewStatus::Confirmed,
+                limit: 10,
+                cursor: None,
+                token_budget: 32_768,
+            },
+        )
+        .unwrap()
+        .reviews[0]
+            .0
+            .confirmation_id,
+        Some(created.confirmation_id)
+    );
+
+    let search = run_session(
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::Newline,
+        &[
+            request(50, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(
+                51,
+                "context_search",
+                json!({
+                    "query": "Edited Candidate statement accepted atomically",
+                    "statuses": ["accepted"]
+                }),
+            ),
+        ],
+    );
+    assert_eq!(
+        search[1]["result"]["structuredContent"]["results"][0]["context_id"],
+        created.context_id.to_string()
+    );
+
+    let (new_task, new_candidate) = build_review_candidate(
+        &fixture,
+        "confirm-new",
+        "Novel Candidate requiring its proposed Space",
+    );
+    let new_review = candidate_get_at_root(
+        &fixture.root,
+        &CandidateGetInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: "confirm-new".to_owned(),
+            candidate_id: new_candidate.to_string(),
+        },
+    )
+    .unwrap();
+    let recommendation_id = new_review
+        .space_recommendations
+        .iter()
+        .find_map(|recommendation| match recommendation {
+            sctx_domain::CandidateSpaceRecommendation::ProposedNewSpaceIntent {
+                recommendation_id,
+                ..
+            } => Some(*recommendation_id),
+            sctx_domain::CandidateSpaceRecommendation::Existing { .. } => None,
+        })
+        .unwrap();
+    let new_confirmed = candidate_confirm_at_root(
+        &fixture.root,
+        &CandidateConfirmInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: "confirm-new".to_owned(),
+            expected_task_id: new_task.context.task_id.to_string(),
+            expected_intent_revision_id: new_task.context.intent_revision_id.to_string(),
+            candidate_id: new_candidate.to_string(),
+            expected_review_version: 1,
+            primary: CandidateConfirmPrimaryInput::Proposed(NewCandidatePrimaryInput {
+                new_space_recommendation_id: recommendation_id.to_string(),
+            }),
+            related_space_ids: Vec::new(),
+            edits: OptionalCandidateEdits::default(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        new_confirmed.status,
+        CandidateConfirmResponseStatus::Confirmed
+    );
+    assert_eq!(new_confirmed.event_ids.len(), 5);
+    assert_ne!(new_confirmed.primary_space_id, fixture.space_id);
+    let snapshot = ProjectionIndex::for_store(&fixture.store)
+        .domain_snapshot()
+        .unwrap();
+    assert!(
+        snapshot
+            .projection
+            .spaces
+            .contains_key(&new_confirmed.primary_space_id)
+    );
+    assert!(
+        snapshot
+            .projection
+            .candidate_confirmations
+            .contains_key(&new_confirmed.confirmation_id)
+    );
+
+    let confirmation = snapshot.projection.candidate_confirmations[&created.confirmation_id]
+        .confirmation
+        .clone();
+    append(
+        &fixture.store,
+        Event::publication_changed(
+            confirmation.primary_space_id,
+            confirmation.result_context_id,
+            PublicationDraft {
+                previous_publication_ids: vec![confirmation.publication_id],
+                action: PublicationAction::Withdraw,
+                revision_id: confirmation.result_revision_id,
+                review_event_ids: Vec::new(),
+            },
+            None,
+        )
+        .unwrap(),
+    );
+    assert!(
+        ProjectionIndex::for_store(&fixture.store)
+            .domain_snapshot()
+            .unwrap()
+            .projection
+            .candidate_confirmations
+            .contains_key(&created.confirmation_id),
+        "later Withdraw must not erase the historical Confirmation fact"
+    );
+}
+
+#[test]
+fn cursor_and_codex_candidate_confirm_tool_is_strict_and_idempotent() {
+    for (client, framing, agent_kind) in [
+        (ClientKind::Cursor, FixtureFraming::Newline, "cursor"),
+        (ClientKind::Codex, FixtureFraming::ContentLength, "codex"),
+    ] {
+        let fixture = Fixture::new();
+        let session = format!("confirm-tool-{agent_kind}");
+        let (task, candidate_id) = build_review_candidate(
+            &fixture,
+            &session,
+            "MCP candidate_confirm writes one atomic fact closure",
+        );
+        let arguments = json!({
+            "agent_kind": "codex",
+            "external_session_id": session,
+            "expected_task_id": task.context.task_id,
+            "expected_intent_revision_id": task.context.intent_revision_id,
+            "candidate_id": candidate_id,
+            "expected_review_version": 1,
+            "primary": {"existing_space_id": fixture.space_id},
+            "related_space_ids": [],
+            "edits": {}
+        });
+        let responses = run_session(
+            &mut fixture.server(client),
+            framing,
+            &[
+                request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+                tool_call(2, "candidate_confirm", arguments.clone()),
+                tool_call(3, "candidate_confirm", arguments),
+            ],
+        );
+        assert_eq!(responses[1]["result"]["isError"], false);
+        assert_eq!(
+            responses[1]["result"]["structuredContent"]["status"],
+            "confirmed"
+        );
+        assert_eq!(
+            responses[2]["result"]["structuredContent"]["status"],
+            "already_confirmed"
+        );
+        assert_eq!(
+            responses[1]["result"]["structuredContent"]["context_id"],
+            responses[2]["result"]["structuredContent"]["context_id"]
+        );
+        assert_eq!(
+            responses[1]["result"]["structuredContent"]["event_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+    }
+}
+
+#[test]
+fn candidate_confirm_recovers_reserved_before_git_and_git_before_runtime_finalize() {
+    let fixture = Fixture::new();
+    let tasks = TaskRuntime::initialize(&fixture.root).unwrap();
+    let prepare = |session: &str, statement: &str| {
+        let (task, candidate_id) = build_review_candidate(&fixture, session, statement);
+        let review = candidate_get_at_root(
+            &fixture.root,
+            &CandidateGetInput {
+                agent_kind: "codex".to_owned(),
+                external_session_id: session.to_owned(),
+                candidate_id: candidate_id.to_string(),
+            },
+        )
+        .unwrap();
+        let snapshot = ProjectionIndex::for_store(&fixture.store)
+            .domain_snapshot()
+            .unwrap();
+        let candidate = &snapshot.projection.candidates[&candidate_id].candidate;
+        let operation = CandidateConfirmationOperation {
+            candidate_id,
+            review_parent_version: 1,
+            analysis_generation: review.analysis_generation.unwrap(),
+            primary: CandidateConfirmationPrimaryReference::ExistingSpace {
+                space_id: fixture.space_id,
+            },
+            related_space_ids: Vec::new(),
+            edits: OptionalCandidateEdits::default(),
+        };
+        let plan = CandidateConfirmationPlan::reserve(
+            candidate,
+            operation,
+            CandidatePrimarySelection::Existing {
+                space_id: fixture.space_id,
+            },
+        )
+        .unwrap();
+        let input = CandidateConfirmInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: task.context.task_id.to_string(),
+            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+            candidate_id: candidate_id.to_string(),
+            expected_review_version: 1,
+            primary: CandidateConfirmPrimaryInput::Existing(ExistingCandidatePrimaryInput {
+                existing_space_id: fixture.space_id.to_string(),
+            }),
+            related_space_ids: Vec::new(),
+            edits: OptionalCandidateEdits::default(),
+        };
+        (task, candidate_id, plan, input)
+    };
+
+    let (first_task, first_candidate, first_plan, first_input) = prepare(
+        "confirm-reserved-before-git",
+        "Runtime reservation survives before Git",
+    );
+    tasks
+        .reserve_candidate_confirmation(
+            &sctx_domain::ExternalSessionLocator::new("codex", "confirm-reserved-before-git")
+                .unwrap(),
+            first_task.context.task_id,
+            first_task.context.intent_revision_id,
+            &first_plan,
+        )
+        .unwrap();
+    let recovered = candidate_confirm_at_root(&fixture.root, &first_input).unwrap();
+    assert_eq!(recovered.status, CandidateConfirmResponseStatus::Confirmed);
+    assert_eq!(recovered.candidate_id, first_candidate);
+
+    let (second_task, second_candidate, second_plan, second_input) = prepare(
+        "confirm-git-before-runtime",
+        "Git confirmation survives before Runtime finalize",
+    );
+    tasks
+        .reserve_candidate_confirmation(
+            &sctx_domain::ExternalSessionLocator::new("codex", "confirm-git-before-runtime")
+                .unwrap(),
+            second_task.context.task_id,
+            second_task.context.intent_revision_id,
+            &second_plan,
+        )
+        .unwrap();
+    let base = GitStore::initialize(&fixture.root).unwrap();
+    let index = ProjectionIndex::for_store(&base);
+    let store = base
+        .with_candidate_submission_index(Arc::new(index.clone()))
+        .with_candidate_confirmation_index(Arc::new(index));
+    let committed = store.confirm_candidate(&second_plan).unwrap();
+    assert_eq!(
+        committed.status,
+        sctx_git_store::CandidateConfirmationWriteStatus::Created
+    );
+    let finalized = candidate_confirm_at_root(&fixture.root, &second_input).unwrap();
+    assert_eq!(
+        finalized.status,
+        CandidateConfirmResponseStatus::AlreadyConfirmed
+    );
+    assert_eq!(finalized.candidate_id, second_candidate);
+    assert_eq!(finalized.confirmation_id, committed.record.confirmation_id);
 }
 
 #[test]
@@ -2009,7 +2514,7 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
 
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
         let names = tools
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
@@ -2031,6 +2536,7 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
                 "candidate_list",
                 "candidate_get",
                 "candidate_discard",
+                "candidate_confirm",
                 "candidate_create",
                 "space_list"
             ]
@@ -2271,6 +2777,34 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
             assert!(
                 !discard_schema_text.contains(forbidden),
                 "Candidate discard schema leaked governance field: {forbidden}"
+            );
+        }
+        let confirm_schema = &tools
+            .iter()
+            .find(|tool| tool["name"] == "candidate_confirm")
+            .unwrap()["inputSchema"];
+        assert_eq!(confirm_schema["additionalProperties"], false);
+        assert_eq!(
+            confirm_schema["properties"]["primary"]["oneOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let confirm_properties = confirm_schema["properties"].as_object().unwrap();
+        for forbidden in [
+            "new_space_intent",
+            "confirmation_id",
+            "context_id",
+            "revision_id",
+            "event_id",
+            "batch_id",
+            "commit_oid",
+            "git",
+        ] {
+            assert!(
+                !confirm_properties.contains_key(forbidden),
+                "Candidate Confirmation schema leaked server-owned field: {forbidden}"
             );
         }
 

@@ -15,17 +15,18 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sctx_domain::{
     AgentCheckpoint, AgentCheckpointId, Applicability, ArtifactRef, AutomaticContextCandidate,
-    CandidateBuildId, CandidateId, CandidateReviewStatus, CaptureEvidenceRef, CaptureId,
-    CaptureSourceRef, CaptureUnknown, CheckpointClaim, CheckpointClaimId, ContextRevisionRef,
-    Error, ErrorKind, EventId, EvidenceSnapshotDraft, ExternalSessionId, ExternalSessionLocator,
-    ExternalSessionSnapshot, IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation,
-    Result, SignalId, SubmissionId, TaskId, TaskIntent, TaskIntentDraft, TaskIntentRevision,
-    TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalKind,
-    TaskSignalLifecycle, TaskSignalRecord, WorkEpisode, WorkEpisodeId, WorkEpisodeRef,
-    WorkEpisodeStatus, WorkObservation, WorkObservationId, WorkSourceRef,
+    CandidateBuildId, CandidateConfirmationPlan, CandidateId, CandidateReviewStatus,
+    CaptureEvidenceRef, CaptureId, CaptureSourceRef, CaptureUnknown, CheckpointClaim,
+    CheckpointClaimId, ConfirmationId, ContextId, ContextRevisionRef, Error, ErrorKind, EventId,
+    EvidenceSnapshotDraft, ExternalSessionId, ExternalSessionLocator, ExternalSessionSnapshot,
+    IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation, Result, SignalId,
+    SubmissionId, TaskId, TaskIntent, TaskIntentDraft, TaskIntentRevision, TaskIntentRevisionId,
+    TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle,
+    TaskSignalRecord, WorkEpisode, WorkEpisodeId, WorkEpisodeRef, WorkEpisodeStatus,
+    WorkObservation, WorkObservationId, WorkSourceRef,
 };
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_EPISODE_LIST_LIMIT: usize = 256;
 pub const DEFAULT_CANDIDATE_REVIEW_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -156,6 +157,8 @@ pub struct CandidateReviewRecord {
     pub expires_at_unix_seconds: u64,
     pub discarded_at_unix_seconds: Option<u64>,
     pub expired_at_unix_seconds: Option<u64>,
+    pub confirmation_id: Option<sctx_domain::ConfirmationId>,
+    pub result_context_id: Option<sctx_domain::ContextId>,
 }
 
 /// Bounded stable page of Review records owned by one exact `ActiveTask`.
@@ -195,6 +198,38 @@ pub struct CandidateReviewDiscardOutcome {
 pub struct CandidateReviewCleanup {
     pub expired_candidate_ids: Vec<CandidateId>,
     pub removed_analysis_count: usize,
+}
+
+/// Durable recovery state of one exact Candidate Confirmation operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CandidateConfirmationOperationStatus {
+    Reserved,
+    Committed,
+}
+
+/// Persisted server-owned Confirmation operation and complete stable plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateConfirmationOperationView {
+    pub candidate_id: CandidateId,
+    pub review_parent_version: u64,
+    pub operation_hash: String,
+    pub plan: CandidateConfirmationPlan,
+    pub status: CandidateConfirmationOperationStatus,
+}
+
+/// Result of reserving or re-reading one Confirmation operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateConfirmationReservation {
+    pub operation: CandidateConfirmationOperationView,
+    pub created: bool,
+}
+
+/// Result of finalizing Runtime after the Git fact closure is committed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateConfirmationFinalizeOutcome {
+    pub operation: CandidateConfirmationOperationView,
+    pub review: CandidateReviewRecord,
+    pub already_confirmed: bool,
 }
 
 /// Aggregate state of one deterministic build over an immutable closed Episode.
@@ -1402,11 +1437,12 @@ impl TaskRuntime {
                         build_id, final_checkpoint_id, checkpoint_id, claim_id,
                         review_version, status, discard_reason, created_at_unix_seconds,
                         expires_at_unix_seconds, discarded_at_unix_seconds,
-                        expired_at_unix_seconds
+                        expired_at_unix_seconds, confirmation_id, result_context_id
                      )
                      SELECT ?1, item.submission_id, build.episode_id, build.task_session_id,
                             build.task_id, build.build_id, build.final_checkpoint_id,
-                            item.checkpoint_id, item.claim_id, 1, 'pending', NULL, ?2, ?3, NULL, NULL
+                            item.checkpoint_id, item.claim_id, 1, 'pending', NULL, ?2, ?3,
+                            NULL, NULL, NULL, NULL
                      FROM candidate_build_item AS item
                      JOIN candidate_build AS build ON build.build_id = item.build_id
                      WHERE item.build_id = ?4 AND item.submission_id = ?5
@@ -1414,8 +1450,9 @@ impl TaskRuntime {
                        AND item.status IN ('created', 'already_exists')",
                     params![
                         candidate_id.to_string(),
-                        i64::try_from(now_unix_seconds)
-                            .map_err(|_| invalid("Candidate Review timestamp exceeds SQLite range"))?,
+                        i64::try_from(now_unix_seconds).map_err(|_| invalid(
+                            "Candidate Review timestamp exceeds SQLite range"
+                        ))?,
                         i64::try_from(expires_at_unix_seconds).map_err(|_| invalid(
                             "Candidate Review expiration exceeds SQLite range"
                         ))?,
@@ -1601,7 +1638,7 @@ impl TaskRuntime {
                         build_id, final_checkpoint_id, checkpoint_id, claim_id,
                         review_version, status, discard_reason, created_at_unix_seconds,
                         expires_at_unix_seconds, discarded_at_unix_seconds,
-                        expired_at_unix_seconds
+                        expired_at_unix_seconds, confirmation_id, result_context_id
                  FROM candidate_review
                  WHERE task_session_id = ?1 AND task_id = ?2 AND status = ?3
                    AND (created_at_unix_seconds > ?4 OR
@@ -1794,6 +1831,214 @@ impl TaskRuntime {
         Ok(CandidateReviewDiscardOutcome {
             record,
             status: CandidateReviewDiscardStatus::Discarded,
+        })
+    }
+
+    /// Reserves one complete server-owned Confirmation plan before any Git write.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed Task/Intent/Review CAS, analysis-generation, conflict, or storage errors.
+    #[allow(clippy::too_many_lines)]
+    pub fn reserve_candidate_confirmation(
+        &self,
+        locator: &ExternalSessionLocator,
+        expected_task_id: TaskId,
+        expected_intent_revision_id: TaskIntentRevisionId,
+        plan: &CandidateConfirmationPlan,
+    ) -> Result<CandidateConfirmationReservation> {
+        locator.validate()?;
+        plan.validate()?;
+        self.cleanup_expired_candidate_reviews()?;
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Candidate Confirmation reservation")?;
+        let task_session_id = find_active_task_by_locator(&transaction, locator)?
+            .ok_or_else(|| invalid("ExternalSession has no ActiveTask"))?;
+        let task = require_snapshot(&transaction, task_session_id)?;
+        if task.task_id != expected_task_id
+            || task
+                .current_intent_revision()
+                .is_none_or(|revision| revision.revision_id != expected_intent_revision_id)
+        {
+            return Err(Error::new(
+                ErrorKind::StaleState,
+                "Candidate Confirmation Task/Intent ownership CAS is stale",
+            ));
+        }
+        let review = read_candidate_review_record(&transaction, plan.operation.candidate_id)?
+            .ok_or_else(|| invalid("Candidate Review does not exist for the ActiveTask"))?;
+        if review.source_episode.task_session_id != task.task_session_id
+            || review.source_episode.task_id != task.task_id
+        {
+            return Err(invalid(
+                "Candidate Review does not belong to the ExternalSession ActiveTask",
+            ));
+        }
+        if let Some(existing) =
+            read_candidate_confirmation_operation(&transaction, plan.operation.candidate_id)?
+        {
+            if existing.operation_hash != plan.operation_hash {
+                return Err(Error::new(
+                    ErrorKind::Conflict,
+                    "Candidate Confirmation operation already has different semantics",
+                ));
+            }
+            transaction.commit().map_err(sql_error(
+                "commit existing Candidate Confirmation reservation",
+            ))?;
+            return Ok(CandidateConfirmationReservation {
+                operation: existing,
+                created: false,
+            });
+        }
+        if review.status != CandidateReviewStatus::Pending {
+            return Err(Error::new(
+                ErrorKind::Conflict,
+                "Only a Pending Candidate Review can be confirmed",
+            ));
+        }
+        if review.review_version != plan.operation.review_parent_version {
+            return Err(Error::new(
+                ErrorKind::StaleState,
+                "Candidate Review version is stale for confirmation",
+            ));
+        }
+        let analysis = transaction
+            .query_row(
+                "SELECT analysis_generation, analysis_status FROM candidate_analysis
+                 WHERE candidate_id = ?1",
+                [plan.operation.candidate_id.to_string()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(sql_error("read Confirmation Candidate analysis"))?
+            .ok_or_else(|| invalid("Candidate Confirmation requires completed analysis"))?;
+        if analysis.1 != "complete"
+            || nonnegative_u64(analysis.0, "candidate_analysis.analysis_generation")?
+                != plan.operation.analysis_generation
+        {
+            return Err(Error::new(
+                ErrorKind::StaleState,
+                "Candidate Confirmation analysis generation is not current and complete",
+            ));
+        }
+        let plan_json = serde_json::to_string(plan)
+            .map_err(json_error("serialize Candidate Confirmation plan"))?;
+        transaction
+            .execute(
+                "INSERT INTO candidate_confirmation_operation (
+                    candidate_id, review_parent_version, operation_hash, plan_hash,
+                    plan_json, status
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved')",
+                params![
+                    plan.operation.candidate_id.to_string(),
+                    i64::try_from(plan.operation.review_parent_version)
+                        .map_err(|_| invalid("Candidate Review version exceeds SQLite range"))?,
+                    plan.operation_hash,
+                    plan.plan_hash(),
+                    plan_json,
+                ],
+            )
+            .map_err(sql_error("reserve Candidate Confirmation operation"))?;
+        let operation =
+            read_candidate_confirmation_operation(&transaction, plan.operation.candidate_id)?
+                .ok_or_else(|| {
+                    invariant("reserved Candidate Confirmation operation disappeared")
+                })?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit Candidate Confirmation reservation"))?;
+        Ok(CandidateConfirmationReservation {
+            operation,
+            created: true,
+        })
+    }
+
+    /// Marks a Git-committed Confirmation operation and its Review terminal in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed operation-hash, plan-identity, Review CAS, or storage errors.
+    pub fn finalize_candidate_confirmation(
+        &self,
+        candidate_id: CandidateId,
+        operation_hash: &str,
+        confirmation_id: ConfirmationId,
+        result_context_id: ContextId,
+    ) -> Result<CandidateConfirmationFinalizeOutcome> {
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Candidate Confirmation finalize")?;
+        let operation = read_candidate_confirmation_operation(&transaction, candidate_id)?
+            .ok_or_else(|| invalid("Candidate Confirmation operation is not reserved"))?;
+        if operation.operation_hash != operation_hash
+            || operation.plan.confirmation.confirmation_id != confirmation_id
+            || operation.plan.result_context_id != result_context_id
+        {
+            return Err(Error::new(
+                ErrorKind::Conflict,
+                "Committed Candidate Confirmation does not match the reserved operation",
+            ));
+        }
+        if operation.status == CandidateConfirmationOperationStatus::Committed {
+            let review = read_candidate_review_record(&transaction, candidate_id)?
+                .ok_or_else(|| invariant("confirmed Candidate Review disappeared"))?;
+            if review.status != CandidateReviewStatus::Confirmed
+                || review.confirmation_id != Some(confirmation_id)
+                || review.result_context_id != Some(result_context_id)
+            {
+                return Err(invariant(
+                    "committed Candidate Confirmation and Review audit disagree",
+                ));
+            }
+            transaction.commit().map_err(sql_error(
+                "commit idempotent Candidate Confirmation finalize",
+            ))?;
+            return Ok(CandidateConfirmationFinalizeOutcome {
+                operation,
+                review,
+                already_confirmed: true,
+            });
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE candidate_review
+                 SET status = 'confirmed', review_version = review_version + 1,
+                     confirmation_id = ?1, result_context_id = ?2
+                 WHERE candidate_id = ?3 AND status = 'pending' AND review_version = ?4",
+                params![
+                    confirmation_id.to_string(),
+                    result_context_id.to_string(),
+                    candidate_id.to_string(),
+                    i64::try_from(operation.review_parent_version).map_err(|_| invalid(
+                        "Candidate Review parent version exceeds SQLite range"
+                    ))?,
+                ],
+            )
+            .map_err(sql_error("confirm Candidate Review"))?;
+        if changed != 1 {
+            return Err(Error::new(
+                ErrorKind::StaleState,
+                "Candidate Review changed before Confirmation finalized",
+            ));
+        }
+        transaction
+            .execute(
+                "UPDATE candidate_confirmation_operation SET status = 'committed'
+                 WHERE candidate_id = ?1 AND status = 'reserved'",
+                [candidate_id.to_string()],
+            )
+            .map_err(sql_error("commit Candidate Confirmation operation status"))?;
+        let operation = read_candidate_confirmation_operation(&transaction, candidate_id)?
+            .ok_or_else(|| invariant("committed Candidate Confirmation operation disappeared"))?;
+        let review = read_candidate_review_record(&transaction, candidate_id)?
+            .ok_or_else(|| invariant("confirmed Candidate Review disappeared"))?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit Candidate Confirmation finalize"))?;
+        Ok(CandidateConfirmationFinalizeOutcome {
+            operation,
+            review,
+            already_confirmed: false,
         })
     }
 
@@ -2208,16 +2453,25 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 ),
                 discarded_at_unix_seconds INTEGER,
                 expired_at_unix_seconds INTEGER,
+                confirmation_id TEXT,
+                result_context_id TEXT,
                 UNIQUE (build_id, claim_id),
                 CHECK (
-                    (status IN ('pending', 'confirmed') AND discard_reason IS NULL
+                    (status = 'pending' AND discard_reason IS NULL
                         AND discarded_at_unix_seconds IS NULL
-                        AND expired_at_unix_seconds IS NULL) OR
+                        AND expired_at_unix_seconds IS NULL
+                        AND confirmation_id IS NULL AND result_context_id IS NULL) OR
                     (status = 'discarded' AND discard_reason IS NOT NULL
                         AND length(trim(discard_reason)) > 0
                         AND discarded_at_unix_seconds IS NOT NULL
-                        AND expired_at_unix_seconds IS NULL) OR
-                    (status = 'expired' AND expired_at_unix_seconds IS NOT NULL)
+                        AND expired_at_unix_seconds IS NULL
+                        AND confirmation_id IS NULL AND result_context_id IS NULL) OR
+                    (status = 'expired' AND expired_at_unix_seconds IS NOT NULL
+                        AND confirmation_id IS NULL AND result_context_id IS NULL) OR
+                    (status = 'confirmed' AND discard_reason IS NULL
+                        AND discarded_at_unix_seconds IS NULL
+                        AND expired_at_unix_seconds IS NULL
+                        AND confirmation_id IS NOT NULL AND result_context_id IS NOT NULL)
                 ),
                 FOREIGN KEY (episode_id, task_session_id, task_id)
                     REFERENCES work_episode (episode_id, task_session_id, task_id),
@@ -2232,6 +2486,16 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 ON candidate_review (
                     task_session_id, task_id, status, created_at_unix_seconds, candidate_id
                 );
+            CREATE TABLE IF NOT EXISTS candidate_confirmation_operation (
+                candidate_id TEXT PRIMARY KEY,
+                review_parent_version INTEGER NOT NULL CHECK (review_parent_version > 0),
+                operation_hash TEXT NOT NULL,
+                plan_hash TEXT NOT NULL,
+                plan_json TEXT NOT NULL CHECK (json_valid(plan_json)),
+                status TEXT NOT NULL CHECK (status IN ('reserved', 'committed')),
+                UNIQUE (candidate_id, review_parent_version),
+                FOREIGN KEY (candidate_id) REFERENCES candidate_review (candidate_id)
+            ) STRICT;
             CREATE TABLE IF NOT EXISTS work_episode_diagnostic (
                 episode_id TEXT NOT NULL,
                 diagnostic_ordinal INTEGER NOT NULL CHECK (diagnostic_ordinal >= 0),
@@ -2244,7 +2508,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 UNIQUE (episode_id, capture_id, kind),
                 FOREIGN KEY (episode_id) REFERENCES work_episode (episode_id)
             ) STRICT;
-            PRAGMA user_version = 9;",
+            PRAGMA user_version = 10;",
         )
         .map_err(sql_error("initialize task runtime schema"))
 }
@@ -2926,6 +3190,8 @@ type CandidateReviewRow = (
     i64,
     Option<i64>,
     Option<i64>,
+    Option<String>,
+    Option<String>,
 );
 
 fn candidate_review_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CandidateReviewRow> {
@@ -2946,6 +3212,8 @@ fn candidate_review_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CandidateRe
         row.get(13)?,
         row.get(14)?,
         row.get(15)?,
+        row.get(16)?,
+        row.get(17)?,
     ))
 }
 
@@ -2981,6 +3249,16 @@ fn parse_candidate_review_record(row: CandidateReviewRow) -> Result<CandidateRev
             .15
             .map(|value| nonnegative_u64(value, "candidate_review.expired_at_unix_seconds"))
             .transpose()?,
+        confirmation_id: row
+            .16
+            .as_deref()
+            .map(|value| parse_id(value, "candidate_review.confirmation_id"))
+            .transpose()?,
+        result_context_id: row
+            .17
+            .as_deref()
+            .map(|value| parse_id(value, "candidate_review.result_context_id"))
+            .transpose()?,
     })
 }
 
@@ -2994,7 +3272,7 @@ fn read_candidate_review_record(
                     build_id, final_checkpoint_id, checkpoint_id, claim_id,
                     review_version, status, discard_reason, created_at_unix_seconds,
                     expires_at_unix_seconds, discarded_at_unix_seconds,
-                    expired_at_unix_seconds
+                    expired_at_unix_seconds, confirmation_id, result_context_id
              FROM candidate_review WHERE candidate_id = ?1",
             [candidate_id.to_string()],
             candidate_review_row,
@@ -3022,6 +3300,65 @@ fn parse_candidate_review_status(value: &str) -> Result<CandidateReviewStatus> {
         "confirmed" => Ok(CandidateReviewStatus::Confirmed),
         _ => Err(invariant("persisted Candidate Review status is invalid")),
     }
+}
+
+fn read_candidate_confirmation_operation(
+    connection: &Connection,
+    candidate_id: CandidateId,
+) -> Result<Option<CandidateConfirmationOperationView>> {
+    connection
+        .query_row(
+            "SELECT review_parent_version, operation_hash, plan_hash, plan_json, status
+             FROM candidate_confirmation_operation WHERE candidate_id = ?1",
+            [candidate_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error("read Candidate Confirmation operation"))?
+        .map(
+            |(review_parent_version, operation_hash, plan_hash, plan_json, status)| {
+                let plan: CandidateConfirmationPlan = serde_json::from_str(&plan_json)
+                    .map_err(json_error("parse Candidate Confirmation plan"))?;
+                plan.validate()?;
+                if plan.operation_hash != operation_hash
+                    || plan.plan_hash() != plan_hash
+                    || plan.operation.candidate_id != candidate_id
+                    || plan.operation.review_parent_version
+                        != nonnegative_u64(
+                            review_parent_version,
+                            "candidate_confirmation_operation.review_parent_version",
+                        )?
+                {
+                    return Err(invariant(
+                        "persisted Candidate Confirmation operation metadata disagrees with plan",
+                    ));
+                }
+                Ok(CandidateConfirmationOperationView {
+                    candidate_id,
+                    review_parent_version: plan.operation.review_parent_version,
+                    operation_hash,
+                    plan,
+                    status: match status.as_str() {
+                        "reserved" => CandidateConfirmationOperationStatus::Reserved,
+                        "committed" => CandidateConfirmationOperationStatus::Committed,
+                        _ => {
+                            return Err(invariant(
+                                "persisted Candidate Confirmation operation status is invalid",
+                            ));
+                        }
+                    },
+                })
+            },
+        )
+        .transpose()
 }
 
 fn candidate_review_cursor(record: &CandidateReviewRecord) -> String {

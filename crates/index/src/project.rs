@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use sctx_domain::{
-    CandidateId, CandidateSubmissionConflict, DomainProjection, EventId, ReducerDiagnostic,
-    ReducerEvent, SubmissionId, reduce,
+    CandidateId, CandidateSubmissionConflict, ConfirmationId, ContextId, DomainProjection, EventId,
+    ReducerDiagnostic, ReducerEvent, SubmissionId, reduce,
 };
 use sctx_event_schema::{
     CandidateSubmissionHint, Event, EventPayload, ParsedEvent, candidate_submission_hint,
@@ -48,6 +48,7 @@ pub(crate) struct BuildInput {
     pub(crate) diagnostics: Vec<ProjectionDiagnostic>,
     pub(crate) impacts: Vec<EventImpact>,
     pub(crate) candidate_events: BTreeMap<EventId, CandidateEventMetadata>,
+    pub(crate) confirmation_events: BTreeMap<EventId, ConfirmationEventMetadata>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,6 +60,20 @@ pub(crate) struct CandidateEventMetadata {
     pub(crate) commit_oid: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ConfirmationEventMetadata {
+    pub(crate) candidate_id: CandidateId,
+    pub(crate) confirmation_id: ConfirmationId,
+    pub(crate) result_context_id: ContextId,
+    pub(crate) event_path: String,
+    pub(crate) batch_id: Option<String>,
+    pub(crate) operation_hash: Option<String>,
+    pub(crate) plan_hash: Option<String>,
+    pub(crate) batch_event_ids: Vec<EventId>,
+    pub(crate) batch_event_paths: Vec<String>,
+    pub(crate) commit_oid: Option<String>,
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
     let mut source_files = Vec::with_capacity(blobs.len());
@@ -67,6 +82,8 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
     let mut diagnostics = BTreeSet::new();
     let mut impacts = Vec::new();
     let mut candidate_events = BTreeMap::new();
+    let mut confirmation_events = BTreeMap::new();
+    let mut event_batches = BTreeMap::<String, Vec<(EventId, String)>>::new();
     let mut malformed_candidate_hints = Vec::new();
 
     for blob in blobs {
@@ -82,6 +99,37 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
                                 candidate_id: candidate.candidate_id,
                                 event_path: blob.path.clone(),
                                 batch_id: event.writer_batch_id().map(str::to_owned),
+                                commit_oid: None,
+                            },
+                        );
+                    }
+                    if let Some(batch_id) = event.writer_batch_id() {
+                        event_batches
+                            .entry(batch_id.to_owned())
+                            .or_default()
+                            .push((event_id, blob.path.clone()));
+                    }
+                    if let EventPayload::CandidateConfirmed { confirmation } = event.payload() {
+                        let hashes = event.confirmation_hashes();
+                        let fallback_hash = format!("sha256:{}", hex_digest(&blob.bytes));
+                        confirmation_events.insert(
+                            event_id,
+                            ConfirmationEventMetadata {
+                                candidate_id: confirmation.candidate_id,
+                                confirmation_id: confirmation.confirmation_id,
+                                result_context_id: confirmation.result_context_id,
+                                event_path: blob.path.clone(),
+                                batch_id: event.writer_batch_id().map(str::to_owned),
+                                operation_hash: Some(hashes.map_or_else(
+                                    || fallback_hash.clone(),
+                                    |value| value.0.to_owned(),
+                                )),
+                                plan_hash: Some(hashes.map_or_else(
+                                    || fallback_hash.clone(),
+                                    |value| value.1.to_owned(),
+                                )),
+                                batch_event_ids: Vec::new(),
+                                batch_event_paths: Vec::new(),
                                 commit_oid: None,
                             },
                         );
@@ -207,6 +255,18 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
         }
     }
     source_files.sort_by(|left, right| left.path.cmp(&right.path));
+    for metadata in confirmation_events.values_mut() {
+        if let Some(batch) = metadata
+            .batch_id
+            .as_ref()
+            .and_then(|batch_id| event_batches.get(batch_id))
+        {
+            let mut batch = batch.clone();
+            batch.sort();
+            metadata.batch_event_ids = batch.iter().map(|value| value.0).collect();
+            metadata.batch_event_paths = batch.into_iter().map(|value| value.1).collect();
+        }
+    }
 
     BuildInput {
         source_files,
@@ -214,6 +274,7 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
         diagnostics: diagnostics.into_iter().collect(),
         impacts,
         candidate_events,
+        confirmation_events,
     }
 }
 

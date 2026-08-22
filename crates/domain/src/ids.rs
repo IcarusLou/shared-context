@@ -1,6 +1,7 @@
 use std::{error, fmt, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use sha2::{Digest, Sha256};
 use uuid::{Uuid, Variant, Version};
 
 /// Error returned when an opaque domain identifier is malformed.
@@ -190,6 +191,17 @@ opaque_id!(
     "rec_",
     "Opaque identity of one Candidate Space recommendation."
 );
+
+impl SpaceRecommendationId {
+    pub(crate) fn from_stable_seed(seed: &[u8]) -> Self {
+        let digest = Sha256::digest(seed);
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Self(Uuid::from_bytes(bytes))
+    }
+}
 opaque_id!(
     CandidateId,
     "cnd_",

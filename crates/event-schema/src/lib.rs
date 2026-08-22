@@ -14,19 +14,19 @@ use sha2::{Digest, Sha256};
 pub use sctx_domain::{
     Applicability, ArtifactKind, ArtifactLocator, AutoInjectionBlocker, AutoInjectionEligibility,
     CandidateConfirmation, CandidateConfirmationCausalRefs, CandidateConfirmationDraft,
-    CandidateId, CandidateProjection, ConfirmationId, ConflictId, ConflictParticipant,
-    ConflictResolution, ConflictResolutionDraft, ConflictResolutionResult, ContextCandidate,
-    ContextGovernanceStatus, ContextId, ContextKind, ContextProjection, ContextRelation,
-    ContextRelationKind, ContextRevision, ContextRevisionDraft, ContextSpaceAssociation,
-    ContextSpaceAssociationDraft, ContextSpaceAssociationOrigin, ContextSpaceProjection,
-    DomainProjection, EngineeringReference, EngineeringReferenceDraft, Error, ErrorKind, EventId,
-    EvidenceId, EvidenceSnapshot, EvidenceSnapshotDraft, EvidenceType, IdParseError,
-    IntentProjection, IntentRevision, IntentSnapshot, OptionalCandidateEdits, Publication,
-    PublicationAction, PublicationDraft, PublicationId, ReducerDiagnostic, ReducerDiagnosticCode,
-    ReducerEvent, ReducerPayload, ReferenceId, ReferenceRelation, RepoRelativePath, RepositoryId,
-    ResolutionId, ResolutionOutcome, Result, Review, ReviewDraft, ReviewId, ReviewSummary,
-    ReviewVerdict, RevisionId, RevisionLifecycle, RevisionProjection, SemanticConflict,
-    SemanticConflictCandidate, SemanticConflictDraft, SemanticConflictOpenReason,
+    CandidateConfirmationPlan, CandidateId, CandidateProjection, ConfirmationId, ConflictId,
+    ConflictParticipant, ConflictResolution, ConflictResolutionDraft, ConflictResolutionResult,
+    ContextCandidate, ContextGovernanceStatus, ContextId, ContextKind, ContextProjection,
+    ContextRelation, ContextRelationKind, ContextRevision, ContextRevisionDraft,
+    ContextSpaceAssociation, ContextSpaceAssociationDraft, ContextSpaceAssociationOrigin,
+    ContextSpaceProjection, DomainProjection, EngineeringReference, EngineeringReferenceDraft,
+    Error, ErrorKind, EventId, EvidenceId, EvidenceSnapshot, EvidenceSnapshotDraft, EvidenceType,
+    IdParseError, IntentProjection, IntentRevision, IntentSnapshot, OptionalCandidateEdits,
+    Publication, PublicationAction, PublicationDraft, PublicationId, ReducerDiagnostic,
+    ReducerDiagnosticCode, ReducerEvent, ReducerPayload, ReferenceId, ReferenceRelation,
+    RepoRelativePath, RepositoryId, ResolutionId, ResolutionOutcome, Result, Review, ReviewDraft,
+    ReviewId, ReviewSummary, ReviewVerdict, RevisionId, RevisionLifecycle, RevisionProjection,
+    SemanticConflict, SemanticConflictCandidate, SemanticConflictDraft, SemanticConflictOpenReason,
     SemanticConflictProjection, SemanticConflictStatus, SpaceAssociationId, SpaceId, SubmissionId,
     TaskId, TaskSessionId, TopicKeyEdit, WorkEpisodeId, WorkEpisodeRef,
     context_revision_content_hash, reduce,
@@ -455,6 +455,105 @@ impl Event {
             },
             Some(annotations),
         )
+    }
+
+    /// Materializes one reserved Confirmation plan into its exact four/five immutable Events.
+    ///
+    /// All IDs come from the server-owned plan; the caller supplies only the Writer batch.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid plan, batch ID, or any locally invalid Event payload.
+    pub fn from_candidate_confirmation_plan(
+        plan: &CandidateConfirmationPlan,
+        writer_batch_id: &str,
+    ) -> Result<Vec<Self>> {
+        plan.validate()?;
+        let base_annotations = annotations_with_writer_batch(writer_batch_id, None)?;
+        let exact = |event_id: EventId, payload: EventPayload, annotations: Annotations| {
+            let event = Self {
+                schema_version: SchemaVersion::V1,
+                event_id,
+                payload,
+                annotations: Some(annotations),
+            };
+            event.validate()?;
+            Ok(event)
+        };
+        let mut events = Vec::with_capacity(if plan.new_space.is_some() { 5 } else { 4 });
+        if let Some(new_space) = &plan.new_space {
+            events.push(exact(
+                plan.event_ids
+                    .space_created_event_id
+                    .ok_or_else(|| invalid("Confirmation plan lacks new Space Event ID"))?,
+                EventPayload::SpaceCreated {
+                    space_id: new_space.space_id,
+                    intent_revision: new_space.intent_revision.clone(),
+                },
+                base_annotations.clone(),
+            )?);
+        }
+        events.push(exact(
+            plan.event_ids.context_revision_event_id,
+            EventPayload::ContextRevisionAdded {
+                space_id: plan.confirmation.primary_space_id,
+                context_id: plan.result_context_id,
+                revision: plan.result_revision.clone(),
+            },
+            base_annotations.clone(),
+        )?);
+        events.push(exact(
+            plan.event_ids.space_association_event_id,
+            EventPayload::ContextSpaceAssociationChanged {
+                association: plan.space_association.clone(),
+            },
+            base_annotations.clone(),
+        )?);
+        events.push(exact(
+            plan.event_ids.publication_event_id,
+            EventPayload::ContextPublicationChanged {
+                space_id: plan.confirmation.primary_space_id,
+                context_id: plan.result_context_id,
+                publication: plan.publication.clone(),
+            },
+            base_annotations.clone(),
+        )?);
+        let mut confirmation_annotations = base_annotations;
+        confirmation_annotations.additional.insert(
+            "confirmation_operation_hash".to_owned(),
+            Value::String(plan.operation_hash.clone()),
+        );
+        confirmation_annotations.additional.insert(
+            "confirmation_plan_hash".to_owned(),
+            Value::String(plan.plan_hash()),
+        );
+        events.push(exact(
+            plan.event_ids.confirmation_event_id,
+            EventPayload::CandidateConfirmed {
+                confirmation: Box::new(plan.confirmation.clone()),
+            },
+            confirmation_annotations,
+        )?);
+        Ok(events)
+    }
+
+    /// Returns server envelope hashes for a Candidate Confirmation Event.
+    #[must_use]
+    pub fn confirmation_hashes(&self) -> Option<(&str, &str)> {
+        if self.event_type() != EventType::CandidateConfirmed {
+            return None;
+        }
+        let annotations = self.annotations.as_ref()?;
+        Some((
+            annotations
+                .additional
+                .get("confirmation_operation_hash")?
+                .as_str()?,
+            annotations
+                .additional
+                .get("confirmation_plan_hash")?
+                .as_str()?,
+        ))
     }
 
     /// Server-owned Writer batch provenance, if present and well-typed.

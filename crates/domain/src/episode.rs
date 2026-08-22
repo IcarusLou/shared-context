@@ -5,10 +5,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AgentCheckpointId, Applicability, ArtifactLocator, CandidateBuildId, CandidateId, CaptureId,
-    CheckpointClaimId, ContextId, ContextRelationKind, ContextRevisionDraft, Error, ErrorKind,
-    EvidenceId, EvidenceSnapshotDraft, IntentSnapshot, RepositoryId, Result, RevisionId, SignalId,
-    SpaceId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId, TaskSignalKind,
-    WorkEpisodeId, WorkObservationId,
+    CheckpointClaimId, ConfirmationId, ContextId, ContextRelationKind, ContextRevisionDraft, Error,
+    ErrorKind, EvidenceId, EvidenceSnapshotDraft, IntentSnapshot, RepositoryId, Result, RevisionId,
+    SignalId, SpaceId, SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId,
+    TaskSessionId, TaskSignalKind, WorkEpisodeId, WorkObservationId,
 };
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -1112,6 +1112,7 @@ impl CandidateSpaceRecommendationPath {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CandidateSpaceRecommendation {
     Existing {
+        recommendation_id: SpaceRecommendationId,
         space_id: SpaceId,
         role: RecommendedSpaceRole,
         rationale: String,
@@ -1119,6 +1120,7 @@ pub enum CandidateSpaceRecommendation {
         paths: Vec<CandidateSpaceRecommendationPath>,
     },
     ProposedNewSpaceIntent {
+        recommendation_id: SpaceRecommendationId,
         proposed_new_space_intent: IntentSnapshot,
         rationale: String,
         confidence: CandidateConfidence,
@@ -1134,12 +1136,23 @@ impl CandidateSpaceRecommendation {
         rationale: impl Into<String>,
         confidence: CandidateConfidence,
     ) -> Self {
-        Self::Existing {
+        let rationale = rationale.into();
+        let paths = vec![CandidateSpaceRecommendationPath::ManualReview];
+        let recommendation_id = stable_recommendation_id(&(
+            "existing",
             space_id,
             role,
-            rationale: rationale.into(),
+            &rationale,
+            &confidence,
+            &paths,
+        ));
+        Self::Existing {
+            recommendation_id,
+            space_id,
+            role,
+            rationale,
             confidence,
-            paths: vec![CandidateSpaceRecommendationPath::ManualReview],
+            paths,
         }
     }
 
@@ -1149,11 +1162,16 @@ impl CandidateSpaceRecommendation {
         rationale: impl Into<String>,
         confidence: CandidateConfidence,
     ) -> Self {
+        let rationale = rationale.into();
+        let paths = vec![CandidateSpaceRecommendationPath::ProposedFromCandidate];
+        let recommendation_id =
+            stable_recommendation_id(&("proposed_new", &intent, &rationale, &confidence, &paths));
         Self::ProposedNewSpaceIntent {
+            recommendation_id,
             proposed_new_space_intent: intent,
-            rationale: rationale.into(),
+            rationale,
             confidence,
-            paths: vec![CandidateSpaceRecommendationPath::ProposedFromCandidate],
+            paths,
         }
     }
 
@@ -1165,10 +1183,20 @@ impl CandidateSpaceRecommendation {
         confidence: CandidateConfidence,
         paths: Vec<CandidateSpaceRecommendationPath>,
     ) -> Self {
-        Self::Existing {
+        let rationale = rationale.into();
+        let recommendation_id = stable_recommendation_id(&(
+            "existing",
             space_id,
             role,
-            rationale: rationale.into(),
+            &rationale,
+            &confidence,
+            &paths,
+        ));
+        Self::Existing {
+            recommendation_id,
+            space_id,
+            role,
+            rationale,
             confidence,
             paths,
         }
@@ -1181,9 +1209,13 @@ impl CandidateSpaceRecommendation {
         confidence: CandidateConfidence,
         paths: Vec<CandidateSpaceRecommendationPath>,
     ) -> Self {
+        let rationale = rationale.into();
+        let recommendation_id =
+            stable_recommendation_id(&("proposed_new", &intent, &rationale, &confidence, &paths));
         Self::ProposedNewSpaceIntent {
+            recommendation_id,
             proposed_new_space_intent: intent,
-            rationale: rationale.into(),
+            rationale,
             confidence,
             paths,
         }
@@ -1217,6 +1249,12 @@ impl CandidateSpaceRecommendation {
     }
 }
 
+fn stable_recommendation_id(value: &impl Serialize) -> SpaceRecommendationId {
+    let bytes = serde_json::to_vec(value)
+        .expect("serializing Candidate Space recommendation identity cannot fail");
+    SpaceRecommendationId::from_stable_seed(&bytes)
+}
+
 fn validate_recommendation_paths(
     paths: &[CandidateSpaceRecommendationPath],
     field: &str,
@@ -1233,10 +1271,24 @@ fn validate_recommendation_paths(
 
 fn validate_recommendations(values: &[CandidateSpaceRecommendation]) -> Result<()> {
     let mut existing_spaces = HashSet::new();
+    let mut recommendation_ids = HashSet::new();
     let mut primary_count = 0_usize;
     let mut proposed_count = 0_usize;
     for (index, recommendation) in values.iter().enumerate() {
         recommendation.validate(&format!("space_recommendations[{index}]"))?;
+        let recommendation_id = match recommendation {
+            CandidateSpaceRecommendation::Existing {
+                recommendation_id, ..
+            }
+            | CandidateSpaceRecommendation::ProposedNewSpaceIntent {
+                recommendation_id, ..
+            } => recommendation_id,
+        };
+        if !recommendation_ids.insert(*recommendation_id) {
+            return Err(invalid(
+                "space_recommendations must not repeat recommendation IDs",
+            ));
+        }
         match recommendation {
             CandidateSpaceRecommendation::Existing { space_id, role, .. } => {
                 if !existing_spaces.insert(*space_id) {
@@ -1315,6 +1367,8 @@ pub struct CandidateReviewView {
     pub discarded_at_unix_seconds: Option<u64>,
     pub expired_at_unix_seconds: Option<u64>,
     pub discard_reason: Option<String>,
+    pub confirmation_id: Option<ConfirmationId>,
+    pub result_context_id: Option<ContextId>,
     pub ready_for_review: bool,
     pub diagnostics: Vec<CandidateReviewDiagnostic>,
     pub untrusted_data: bool,
@@ -1345,13 +1399,27 @@ impl CandidateReviewView {
             ));
         }
         match self.review_status {
-            CandidateReviewStatus::Pending | CandidateReviewStatus::Confirmed => {
+            CandidateReviewStatus::Pending => {
                 if self.discard_reason.is_some()
                     || self.discarded_at_unix_seconds.is_some()
                     || self.expired_at_unix_seconds.is_some()
+                    || self.confirmation_id.is_some()
+                    || self.result_context_id.is_some()
                 {
                     return Err(invalid(
-                        "Pending/Confirmed Candidate Review cannot contain terminal audit fields",
+                        "Pending Candidate Review cannot contain terminal audit fields",
+                    ));
+                }
+            }
+            CandidateReviewStatus::Confirmed => {
+                if self.discard_reason.is_some()
+                    || self.discarded_at_unix_seconds.is_some()
+                    || self.expired_at_unix_seconds.is_some()
+                    || self.confirmation_id.is_none()
+                    || self.result_context_id.is_none()
+                {
+                    return Err(invalid(
+                        "Confirmed Candidate Review requires only confirmation audit fields",
                     ));
                 }
             }
@@ -1359,6 +1427,8 @@ impl CandidateReviewView {
                 if self.discard_reason.as_deref().is_none_or(str::is_empty)
                     || self.discarded_at_unix_seconds.is_none()
                     || self.expired_at_unix_seconds.is_some()
+                    || self.confirmation_id.is_some()
+                    || self.result_context_id.is_some()
                 {
                     return Err(invalid(
                         "Discarded Candidate Review requires only discard audit fields",
@@ -1366,7 +1436,10 @@ impl CandidateReviewView {
                 }
             }
             CandidateReviewStatus::Expired => {
-                if self.expired_at_unix_seconds.is_none() {
+                if self.expired_at_unix_seconds.is_none()
+                    || self.confirmation_id.is_some()
+                    || self.result_context_id.is_some()
+                {
                     return Err(invalid(
                         "Expired Candidate Review requires an expiration timestamp",
                     ));

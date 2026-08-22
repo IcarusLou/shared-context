@@ -1,8 +1,8 @@
 # Task-first Retrieval Integration Acceptance Report
 
 Date: 2026-08-23
-Scope: Mew #112 through #160, including Mandatory Gates #114/#117, excluding deferred #162/#163 and accepted boundary #150
-Implementation baseline before Candidate Review lifecycle: `main@7a0e17d`
+Scope: Mew #112 through #162, including Mandatory Gates #114/#117, excluding deferred #163 and accepted boundary #150
+Implementation baseline before Candidate Confirmation Writer: `main@03c22ba`
 
 ## Verdict
 
@@ -17,7 +17,7 @@ This report does **not** claim M4:
 | M1 — Task-first primitives and unassigned Candidate entry | IMPLEMENTED | Covered below |
 | M2 — Task Runtime and multi-Space retrieval | IMPLEMENTED | TaskSession persistence, strict `task_intent_update`, read-only `task_context`, association inference, typed RetrievalPaths, and TaskContextPack pass focused cross-crate/E2E oracles |
 | M3 — Engineering Graph | IMPLEMENTED | Reference-derived bounded ScanPlan, deterministic Artifact locators, sparse build-time Context/safety snapshots, historical exact retrieval, frozen 1–2 hop relations, diagnostics, fallback, rebuild equivalence, and budget bounds pass cross-crate/E2E oracles |
-| M4 — Low-tax Capture | FOUNDATION ONLY | #117 and #156–#161 provide submission-idempotent Candidate admission, WorkEpisode/Builder/analysis/Review, and strict CandidateConfirmation/ContextSpaceAssociation facts; no automatic aggregation or confirmation Writer/MCP workflow |
+| M4 — Low-tax Capture | IMPLEMENTED EXCEPT AUTO-AGGREGATION | #117 and #156–#162 provide submission-idempotent Candidate admission, WorkEpisode/Builder/analysis/Review, and recoverable atomic Candidate Confirmation; #163 automatic aggregation remains deferred |
 
 `task_intent_update` is the only Task Intent write path. `task_context` accepts only an external Session locator and output bounds, and reads the already-authoritative ActiveTask without mutating Runtime. PromptSubmit supplies guidance rather than inferred Intent. Explicit `context_search.space_ids` remains available as a hard filter for diagnosis and exploration.
 
@@ -72,6 +72,9 @@ Mandatory Gates #114/#117 are implemented: stable `submission_id` and exact clos
 | Candidate relationship analysis is typed and conservative | PROVEN | Full canonical draft equality alone yields exact duplicate; equal statement with different rationale/Evidence yields support; same topic plus explicit Context or exact Graph path yields revision; differing topic/scope statements yield potential contradiction; pure BM25 remains unresolved related; no candidate yields novel |
 | Candidate Space recommendation is non-binding and generation-pinned | PROVEN | Deterministic RRF fuses assessment targets, source Task associations and Space Intent evidence under top-k/token budget; fixed Context/Graph generations and stable target ties survive Index rebuild; conflicted/unsafe Spaces cannot become Primary and absence of a safe Primary produces one complete system-suggested Intent |
 | Candidate Confirmation facts are causal and conflict-explicit | PROVEN | Existing/new Primary, multiple Related Spaces and field edits reduce identically under Event permutation; exact Candidate/source, embedded owner, Association, causal Publish and generated-ID-free content hash are verified; duplicate Confirmations and Association heads remain explicit conflicts, while later Withdraw preserves historical confirmation and current lifecycle exclusion |
+| Candidate Confirmation is recoverable and atomic | PROVEN | Runtime reserves a complete stable 4/5-Event plan before Git; every Writer crash seam, pending recovery, Git-before-Runtime recovery and index deletion converge to one batch/commit with no partial facts |
+| Confirmation input keeps identities server-owned | PROVEN | MCP primary is strict oneOf existing Space or current proposed recommendation ID; full new Intent and Confirmation/Context/Revision/Evidence/Event/Batch/Git IDs are absent and additional properties fail |
+| Explicit confirmation closes Review and exposes accepted Context | PROVEN | Existing/new Primary, two Related Spaces and optional edits return assessment acknowledgments; 100 threads and 20 CLI processes converge, Pending list clears, Confirmed audit remains, and Context Search returns the published revision |
 | Candidate analysis is disposable Runtime review state | PROVEN | Runtime v8 atomically replaces current analysis with monotonically increasing analysis generation; failed analysis remains Draft and retryable; deleting the derived row permits recomputation; Builder and internal CLI rerun preserve Candidate/Submission/Event identity and add no Git, Search, Hook or auto-injection state |
 | Capture ingestion survives claim/commit races | PROVEN | `capture_ingestion.capture_id` is unique; concurrent/retried ingestion returns one Observation, changed retry content/cross owner is rejected, and claim-before-failed-commit remains retryable without source deletion |
 | Capture File hints never guess Repository | PROVEN | Catalog maps only safe existing Workspace-allowed configured paths to File ArtifactRef; unconfigured/unsafe paths retain Capture source/summary plus typed Runtime diagnostic |

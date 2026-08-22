@@ -6,8 +6,9 @@ use sha2::{Digest, Sha256};
 use crate::{
     Applicability, CandidateId, ConfirmationId, ContextCandidate, ContextId, ContextKind,
     ContextRelation, ContextRevision, ContextRevisionDraft, Error, ErrorKind, EventId,
-    EvidenceSnapshotDraft, IntentSnapshot, PublicationId, Result, RevisionId, SpaceAssociationId,
-    SpaceId, SubmissionId, WorkEpisodeRef,
+    EvidenceSnapshotDraft, IntentRevision, IntentSnapshot, Publication, PublicationAction,
+    PublicationDraft, PublicationId, Result, RevisionId, SpaceAssociationId, SpaceId,
+    SpaceRecommendationId, SubmissionId, WorkEpisodeRef,
 };
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -30,6 +31,18 @@ where
 pub enum CandidatePrimarySelection {
     Existing { space_id: SpaceId },
     ProposedNew { intent: IntentSnapshot },
+}
+
+/// Public selection identity included in one confirmation operation hash.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CandidateConfirmationPrimaryReference {
+    ExistingSpace {
+        space_id: SpaceId,
+    },
+    ProposedRecommendation {
+        recommendation_id: SpaceRecommendationId,
+    },
 }
 
 impl CandidatePrimarySelection {
@@ -131,6 +144,57 @@ pub struct CandidateConfirmationRequest {
     pub primary: CandidatePrimarySelection,
     pub related_space_ids: Vec<SpaceId>,
     pub edits: OptionalCandidateEdits,
+}
+
+/// Authoritative semantics of one human confirmation operation, excluding generated identities.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateConfirmationOperation {
+    pub candidate_id: CandidateId,
+    pub review_parent_version: u64,
+    pub analysis_generation: u64,
+    pub primary: CandidateConfirmationPrimaryReference,
+    pub related_space_ids: Vec<SpaceId>,
+    pub edits: OptionalCandidateEdits,
+}
+
+impl CandidateConfirmationOperation {
+    /// Returns the canonical semantic operation hash used for retry/conflict detection.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if JSON-backed domain values unexpectedly fail serialization.
+    #[must_use]
+    pub fn operation_hash(&self) -> String {
+        let bytes = serde_json::to_vec(self)
+            .expect("serializing Candidate Confirmation operation cannot fail");
+        format!("sha256:{:x}", Sha256::digest(bytes))
+    }
+
+    /// Validates the non-generated operation boundary.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero versions, duplicate Related Spaces, or Primary/Related overlap.
+    pub fn validate(&self) -> Result<()> {
+        if self.review_parent_version == 0 || self.analysis_generation == 0 {
+            return Err(invalid(
+                "Candidate Confirmation operation requires positive Review and analysis generations",
+            ));
+        }
+        require_unique(
+            &self.related_space_ids,
+            "candidate_confirmation_operation.related_space_ids",
+        )?;
+        if let CandidateConfirmationPrimaryReference::ExistingSpace { space_id } = self.primary
+            && self.related_space_ids.contains(&space_id)
+        {
+            return Err(invalid(
+                "Candidate Confirmation operation Related Spaces must not include Primary",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl CandidateConfirmationRequest {
@@ -407,6 +471,238 @@ impl CandidateConfirmation {
             causal_refs: self.causal_refs,
         }
         .validate()
+    }
+}
+
+/// Server-owned Event identities for one atomic Confirmation fact closure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateConfirmationPlanEventIds {
+    pub space_created_event_id: Option<EventId>,
+    pub context_revision_event_id: EventId,
+    pub space_association_event_id: EventId,
+    pub publication_event_id: EventId,
+    pub confirmation_event_id: EventId,
+}
+
+/// Server-owned new Space fact reserved inside one Confirmation plan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateConfirmationNewSpace {
+    pub space_id: SpaceId,
+    pub intent_revision: IntentRevision,
+}
+
+/// Complete stable fact closure reserved before one atomic Git confirmation write.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateConfirmationPlan {
+    pub operation: CandidateConfirmationOperation,
+    pub operation_hash: String,
+    pub new_space: Option<CandidateConfirmationNewSpace>,
+    pub result_context_id: ContextId,
+    pub result_revision: ContextRevision,
+    pub space_association: ContextSpaceAssociation,
+    pub publication: Publication,
+    pub confirmation: CandidateConfirmation,
+    pub event_ids: CandidateConfirmationPlanEventIds,
+}
+
+impl CandidateConfirmationPlan {
+    /// Generates every stable identity and causal reference for one Confirmation operation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid selection resolution, edits, membership, or resulting fact closure.
+    #[allow(clippy::too_many_lines)]
+    pub fn reserve(
+        candidate: &ContextCandidate,
+        operation: CandidateConfirmationOperation,
+        resolved_primary: CandidatePrimarySelection,
+    ) -> Result<Self> {
+        operation.validate()?;
+        if operation.candidate_id != candidate.candidate_id {
+            return Err(invalid(
+                "Candidate Confirmation operation names a different Candidate",
+            ));
+        }
+        match (&operation.primary, &resolved_primary) {
+            (
+                CandidateConfirmationPrimaryReference::ExistingSpace { space_id: expected },
+                CandidatePrimarySelection::Existing { space_id: actual },
+            ) if expected == actual => {}
+            (
+                CandidateConfirmationPrimaryReference::ProposedRecommendation { .. },
+                CandidatePrimarySelection::ProposedNew { .. },
+            ) => {}
+            _ => {
+                return Err(invalid(
+                    "Candidate Confirmation primary reference and resolved selection disagree",
+                ));
+            }
+        }
+        let request = CandidateConfirmationRequest {
+            candidate_id: operation.candidate_id,
+            primary: resolved_primary.clone(),
+            related_space_ids: operation.related_space_ids.clone(),
+            edits: operation.edits.clone(),
+        };
+        let final_draft = request.final_draft(candidate)?;
+        let result_revision = ContextRevision::from_draft(Vec::new(), final_draft.clone())?;
+        let result_context_id = ContextId::new();
+        let (primary_space_id, new_space, space_created_event_id) = match resolved_primary {
+            CandidatePrimarySelection::Existing { space_id } => (space_id, None, None),
+            CandidatePrimarySelection::ProposedNew { intent } => {
+                let space_id = SpaceId::new();
+                (
+                    space_id,
+                    Some(CandidateConfirmationNewSpace {
+                        space_id,
+                        intent_revision: IntentRevision {
+                            revision_id: RevisionId::new(),
+                            parent_revision_ids: Vec::new(),
+                            intent,
+                        },
+                    }),
+                    Some(EventId::new()),
+                )
+            }
+        };
+        let context_revision_event_id = EventId::new();
+        let space_association_event_id = EventId::new();
+        let publication_event_id = EventId::new();
+        let confirmation_event_id = EventId::new();
+        let space_association =
+            ContextSpaceAssociation::from_draft(ContextSpaceAssociationDraft {
+                context_id: result_context_id,
+                primary_space_id,
+                related_space_ids: operation.related_space_ids.clone(),
+                previous_association_ids: Vec::new(),
+                origin: ContextSpaceAssociationOrigin::CandidateConfirmation {
+                    candidate_id: candidate.candidate_id,
+                },
+            })?;
+        let publication = Publication::from_draft(PublicationDraft {
+            previous_publication_ids: Vec::new(),
+            action: PublicationAction::Publish,
+            revision_id: result_revision.revision_id,
+            review_event_ids: Vec::new(),
+        })?;
+        let confirmation = CandidateConfirmation::from_draft(CandidateConfirmationDraft {
+            candidate_id: candidate.candidate_id,
+            submission_id: candidate.submission_id,
+            source_episode: candidate.source_episode,
+            result_context_id,
+            result_revision_id: result_revision.revision_id,
+            primary_space_id,
+            related_space_ids: operation.related_space_ids.clone(),
+            space_association_id: space_association.association_id,
+            publication_id: publication.publication_id,
+            created_space_id: new_space.as_ref().map(|space| space.space_id),
+            edits: operation.edits.clone(),
+            final_content_hash: context_revision_content_hash(&final_draft),
+            causal_refs: CandidateConfirmationCausalRefs {
+                space_created_event_id,
+                context_revision_event_id,
+                space_association_event_id,
+                publication_event_id,
+            },
+        })?;
+        let plan = Self {
+            operation_hash: operation.operation_hash(),
+            operation,
+            new_space,
+            result_context_id,
+            result_revision,
+            space_association,
+            publication,
+            confirmation,
+            event_ids: CandidateConfirmationPlanEventIds {
+                space_created_event_id,
+                context_revision_event_id,
+                space_association_event_id,
+                publication_event_id,
+                confirmation_event_id,
+            },
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    /// Hashes the complete server-owned plan including generated identities.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if JSON-backed domain values unexpectedly fail serialization.
+    #[must_use]
+    pub fn plan_hash(&self) -> String {
+        let bytes =
+            serde_json::to_vec(self).expect("serializing Candidate Confirmation plan cannot fail");
+        format!("sha256:{:x}", Sha256::digest(bytes))
+    }
+
+    /// Validates all local identities and causal references in the reserved closure.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any inconsistent generated identity, content hash, or selection fact.
+    pub fn validate(&self) -> Result<()> {
+        self.operation.validate()?;
+        if self.operation_hash != self.operation.operation_hash()
+            || self.operation.candidate_id != self.confirmation.candidate_id
+            || self.result_context_id != self.confirmation.result_context_id
+            || self.result_revision.revision_id != self.confirmation.result_revision_id
+            || self.space_association.association_id != self.confirmation.space_association_id
+            || self.publication.publication_id != self.confirmation.publication_id
+            || self.publication.revision_id != self.result_revision.revision_id
+            || self.space_association.context_id != self.result_context_id
+            || self.space_association.primary_space_id != self.confirmation.primary_space_id
+            || self.space_association.related_space_ids != self.confirmation.related_space_ids
+            || context_revision_content_hash(&context_revision_as_draft(&self.result_revision))
+                != self.confirmation.final_content_hash
+        {
+            return Err(invalid(
+                "Candidate Confirmation plan fact identities are inconsistent",
+            ));
+        }
+        self.result_revision.validate()?;
+        self.space_association.validate()?;
+        self.publication.validate()?;
+        self.confirmation.validate()?;
+        if self.event_ids.space_created_event_id
+            != self.confirmation.causal_refs.space_created_event_id
+            || self.event_ids.context_revision_event_id
+                != self.confirmation.causal_refs.context_revision_event_id
+            || self.event_ids.space_association_event_id
+                != self.confirmation.causal_refs.space_association_event_id
+            || self.event_ids.publication_event_id
+                != self.confirmation.causal_refs.publication_event_id
+        {
+            return Err(invalid(
+                "Candidate Confirmation plan Event identities are inconsistent",
+            ));
+        }
+        match (&self.new_space, self.confirmation.created_space_id) {
+            (Some(space), Some(created)) if space.space_id == created => {
+                space.intent_revision.validate()?;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(invalid(
+                    "Candidate Confirmation plan new Space identity is inconsistent",
+                ));
+            }
+        }
+        let mut event_ids = vec![
+            self.event_ids.context_revision_event_id,
+            self.event_ids.space_association_event_id,
+            self.event_ids.publication_event_id,
+            self.event_ids.confirmation_event_id,
+        ];
+        if let Some(event_id) = self.event_ids.space_created_event_id {
+            event_ids.push(event_id);
+        }
+        require_unique(&event_ids, "candidate_confirmation_plan.event_ids")
     }
 }
 

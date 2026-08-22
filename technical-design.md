@@ -19,7 +19,7 @@
 | **M1：Task-first 领域与入口基础** | **已实现** | `TaskIntent` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；CLI/MCP 通过 `candidate_create` 创建无 Space Candidate；Candidate 不可自动注入 |
 | **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、严格 `task_intent_update` 与只读 `task_context` 已通过跨 crate/E2E 验收 |
 | **M3：Engineering Graph** | **已实现** | 稳定本机 Repository Catalog、可重建 Registry、Reference-derived 有界扫描、build-time immutable Context/safety snapshot、历史 Graph Retrieval、ContextRelation 1–2 跳及 MCP/CLI 工作流已通过固定跨 crate/E2E oracle |
-| **M4：Low-tax Capture** | **基础部分已实现** | #117 已实现 submission-idempotent Candidate admission；#156–#161 已定义并验证 WorkEpisode、Candidate Builder/analysis/Review 及 CandidateConfirmation/ContextSpaceAssociation 事实；尚无自动聚合或 Candidate Confirm Writer/MCP 执行 |
+| **M4：Low-tax Capture** | **除自动聚合外已实现** | #117 与 #156–#162 已实现 WorkEpisode、Candidate Builder/analysis/Review、CandidateConfirmation/ContextSpaceAssociation 与可恢复原子 Writer/MCP；仅 #163 自动聚合尚未实现 |
 
 当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订权威 TaskIntent，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示。PostToolUse 的 File observation 只形成带 Session/optional Task owner 的 redacted Capture Breadcrumb，可识别测试工具只形成非定位 TestOutcome；Hook 不运行 Git、Scanner、Registry sync、Graph rebuild、Focus 提交或 Episode open/ingest。显式 Graph 工具完成 bounded scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。当前 `candidate_create` 仍是手工、无归属的 M1 入口，不等同于 M4 自动 Capture。
 
@@ -1035,7 +1035,7 @@ sctx mcp serve --client cursor|codex
 | `candidate_list` | 读 | 查看当前 Task 自动生成的 Candidate |
 | `candidate_get` | 读 | 获取一个自动 Candidate 的完整、不可信 Review 内容 |
 | `candidate_discard` | 写本地状态 | 在 Task/Intent/Review CAS 下显式放弃 Pending Review；不写知识事实 |
-| `candidate_confirm` | 未实现（#162） | 未来确认 Candidate、已有或新 Space、组织关系和初始生命周期 |
+| `candidate_confirm` | 写知识事实 | 在显式人工选择、Task/Intent/Review CAS 与完整分析下，原子确认 Candidate、Primary/Related Space、Context Revision、Association 与 Publish |
 | `context_search` | 读 | 面向诊断和显式探索的结构化搜索 |
 | `context_get` | 读 | 获取确定 Context Revision、Evidence 和关系 |
 | `space_search` | 读 | 显式查找 Space，不参与默认 Task 路由 |
@@ -1367,7 +1367,8 @@ EngineeringResolutionSource {
 - Review list 使用稳定 cursor、limit 和 whole-summary token budget；analysis pending/failed 以 typed diagnostic 可见但不 ready。discard 使用 Task/Intent/Review version CAS，同 reason timeout retry幂等，默认 list 隐藏 Discarded。
 - CandidateConfirmation 与 ContextSpaceAssociation 的领域/Event/Reducer/Index 契约已实现：确认 input 只选择 existing/new Primary、Related 与 field-level edits；事实闭包引用 exact Candidate、Revision、Association、causal Publish 和 final draft hash。Association 是独立因果 DAG，不写入 ContextRelation；初始确认仍强制 result Context 的嵌套 owner 等于 Primary，未来 correction 不改变当前 Search owner。
 - 一个 Candidate 的重复确认不论内容相同或不同都形成显式 conflict；Association 多 Head 同样显式 conflict。确认只验证其 causal Publication Event 为 exact Publish，后续 Withdraw/Supersede 不使历史 Confirmation 失效，当前检索继续服从现有 lifecycle。
-- TTL cleanup 只删除重型 Runtime analysis并保留 terminal Expired tombstone；后续 Builder retry不得重新初始化 Pending。Candidate Confirm（#162）与 PreCompact/TurnStop 自动写入/Builder 触发（#163）尚未实现；当前 Hook 仅给出显式 Checkpoint 能力提示。
+- TTL cleanup 只删除重型 Runtime analysis并保留 terminal Expired tombstone；后续 Builder retry不得重新初始化 Pending。Runtime v10 在 Git 前保留完整 ConfirmationPlan，GitStore 将 existing/new Primary 的4/5个事实写入一个 Journal/Commit，Index v11 重建 operation/plan/batch/commit mapping，Git-before-Runtime retry可恢复 Review Confirmed audit。
+- Candidate Confirm 只接受 existing Space 或 current proposed recommendation ID，不接受完整 new Intent 或生成 ID；Potential/ExactDuplicate assessment 可在明确人工调用下确认并在响应中回显 acknowledgment。PreCompact/TurnStop 自动写入/Builder 触发（#163）尚未实现；当前 Hook 仅给出显式 Checkpoint 能力提示。
 - 当前显式 `candidate_create` 继续作为手工入口；自动 Builder 复用相同 #117 admission，并提供内部 CLI `candidate build-closed-episode` 重试边界。Review discovery不扫描该手工入口产生的 Git-only Candidate。
 - Mandatory Gate #117 已完成：一次创建操作携带稳定 `submission_id`，首次提交由服务端生成 `candidate_id`/`event_id`/路径并持久化 submission mapping；重试复用同一 `submission_id`。
 - 相同 `submission_id` 加相同权威内容返回原 Candidate；相同 `submission_id` 加不同内容返回 `IdempotencyKeyConflict`；不同 `submission_id` 创建新的 Candidate，即使完整草稿相同。语义相近去重属于知识聚合，不由幂等键处理。
