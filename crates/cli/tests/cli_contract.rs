@@ -403,7 +403,7 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
         "uninstall [--root PATH]",
         "knowledge delete --confirm-path PATH",
         "space create|intent revise|list|get",
-        "candidate create",
+        "candidate list|get|discard|create",
         "context revise|review|publish|withdraw|get",
         "semantic conflict open|resolve",
         "task context",
@@ -1761,6 +1761,102 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
     );
     assert_eq!(analyzed["data"]["candidate"]["candidate_id"], candidate_id);
 
+    let listed = harness.success(&[
+        "candidate",
+        "list",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        "cli-authoritative",
+        "--limit",
+        "10",
+        "--token-budget",
+        "32768",
+    ]);
+    assert_eq!(listed["command"], "candidate.list");
+    assert_eq!(listed["data"]["reviews"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["data"]["reviews"][0]["candidate_id"], candidate_id);
+    assert_eq!(listed["data"]["reviews"][0]["untrusted_data"], true);
+    let got = harness.success(&[
+        "candidate",
+        "get",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        "cli-authoritative",
+        "--candidate-id",
+        candidate_id,
+    ]);
+    assert_eq!(got["command"], "candidate.get");
+    assert_eq!(got["data"]["candidate_id"], candidate_id);
+    assert!(
+        !got["data"]["content"]["evidence"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let discarded = harness.success(&[
+        "candidate",
+        "discard",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        "cli-authoritative",
+        "--expected-task-id",
+        updated["data"]["task_id"].as_str().unwrap(),
+        "--expected-intent-revision-id",
+        updated["data"]["intent_revision_id"].as_str().unwrap(),
+        "--candidate-id",
+        candidate_id,
+        "--expected-review-version",
+        "1",
+        "--reason",
+        "explicit CLI discard",
+    ]);
+    assert_eq!(discarded["command"], "candidate.discard");
+    assert_eq!(discarded["data"]["status"], "discarded");
+    assert_eq!(discarded["data"]["review"]["review_version"], 2);
+    assert!(
+        harness.success(&[
+            "candidate",
+            "list",
+            "--agent-kind",
+            "codex",
+            "--external-session-id",
+            "cli-authoritative",
+        ])["data"]["reviews"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        harness.success(&[
+            "candidate",
+            "list",
+            "--agent-kind",
+            "codex",
+            "--external-session-id",
+            "cli-authoritative",
+            "--status",
+            "discarded",
+            "--token-budget",
+            "32768",
+        ])["data"]["reviews"][0]["candidate_id"],
+        candidate_id
+    );
+    let forbidden_confirm = harness.failure(&[
+        "candidate",
+        "discard",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        "cli-authoritative",
+        "--candidate-id",
+        candidate_id,
+        "--confirm",
+    ]);
+    assert_eq!(forbidden_confirm["error"]["code"], "invalid_input");
+
     let business_repository = harness.home.join("business repository");
     fs::create_dir_all(&business_repository).unwrap();
     assert!(
@@ -1947,8 +2043,11 @@ fn mcp_stdio_entry_serves_cursor_and_codex_without_extra_stdout() {
         assert_eq!(responses.len(), 2);
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 16);
         assert!(tools.iter().any(|tool| tool["name"] == "task_checkpoint"));
+        for name in ["candidate_list", "candidate_get", "candidate_discard"] {
+            assert!(tools.iter().any(|tool| tool["name"] == name));
+        }
     }
 }
 

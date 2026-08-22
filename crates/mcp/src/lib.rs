@@ -20,6 +20,7 @@ use sctx_domain::{
     AgentCheckpointId, Applicability, ArtifactKey, ArtifactKind, ArtifactLocator, ArtifactRef,
     AutomaticCandidateStatus, AutomaticContextCandidate, CandidateAnalysis,
     CandidateAnalysisStatus, CandidateBuilderProvenance, CandidateConfidence,
+    CandidateReviewDiagnostic, CandidateReviewStatus, CandidateReviewSummary, CandidateReviewView,
     CandidateSpaceRecommendation, CaptureEvidenceRef, CaptureUnknown, CheckpointClaim,
     CheckpointClaimId, ContextId, ContextKind, ContextRevisionDraft, ContextRevisionRef,
     EngineeringReferenceDraft, Error, ErrorKind, EvidenceSnapshotDraft, EvidenceType,
@@ -52,8 +53,8 @@ use sctx_search::{
 };
 use sctx_task_runtime::{
     AgentCheckpointWrite, CandidateBuildItemPreparation, CandidateBuildItemStatus,
-    CandidateBuildStatus, CandidateBuildView, CheckpointBoundary, CheckpointClaimDraft,
-    TaskRuntime, WorkEpisodeView,
+    CandidateBuildStatus, CandidateBuildView, CandidateReviewDiscard, CandidateReviewDiscardStatus,
+    CandidateReviewRecord, CheckpointBoundary, CheckpointClaimDraft, TaskRuntime, WorkEpisodeView,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -63,6 +64,10 @@ pub const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_SCAN_ARTIFACT_LIMIT: usize = 200;
 const MAX_SCAN_ARTIFACT_LIMIT: usize = 1_000;
+const DEFAULT_CANDIDATE_REVIEW_LIST_LIMIT: usize = 20;
+const DEFAULT_CANDIDATE_REVIEW_TOKEN_BUDGET: usize = 4_096;
+const MIN_CANDIDATE_REVIEW_TOKEN_BUDGET: usize = 512;
+const MAX_CANDIDATE_REVIEW_TOKEN_BUDGET: usize = 32_768;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -270,6 +275,85 @@ pub struct CandidateAnalyzeInput {
 pub struct CandidateAnalyzeResponse {
     pub analysis_generation: u64,
     pub candidate: AutomaticContextCandidate,
+}
+
+/// Bounded Task-local Candidate Review list request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateListInput {
+    pub agent_kind: String,
+    pub external_session_id: String,
+    #[serde(default = "default_candidate_review_status")]
+    pub status: CandidateReviewStatus,
+    #[serde(default = "default_candidate_review_list_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default = "default_candidate_review_token_budget")]
+    pub token_budget: usize,
+}
+
+/// Exact Task-local Candidate Review read request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateGetInput {
+    pub agent_kind: String,
+    pub external_session_id: String,
+    pub candidate_id: String,
+}
+
+/// CAS-guarded explicit discard request; no confirmation fields exist.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateDiscardInput {
+    pub agent_kind: String,
+    pub external_session_id: String,
+    pub expected_task_id: String,
+    pub expected_intent_revision_id: String,
+    pub candidate_id: String,
+    pub expected_review_version: u64,
+    pub reason: String,
+}
+
+/// Why a whole Review Summary was omitted from one bounded page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateReviewOmittedReason {
+    TokenBudget,
+    PayloadUnavailable,
+}
+
+/// Stable identity retained when a full Summary is omitted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateReviewOmitted {
+    pub candidate_id: sctx_domain::CandidateId,
+    pub reason: CandidateReviewOmittedReason,
+    pub estimated_tokens: usize,
+}
+
+/// Stable page of whole untrusted Summaries; no Review content is truncated.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateListResponse {
+    pub reviews: Vec<CandidateReviewSummary>,
+    pub omitted: Vec<CandidateReviewOmitted>,
+    pub next_cursor: Option<String>,
+    pub estimated_tokens: usize,
+    pub token_budget: usize,
+}
+
+/// Exact public discard disposition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateDiscardResponseStatus {
+    Discarded,
+    AlreadyDiscarded,
+}
+
+/// Updated full Review after a discard operation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateDiscardResponse {
+    pub status: CandidateDiscardResponseStatus,
+    pub review: CandidateReviewView,
 }
 
 /// Public Claim-scoped submission state.
@@ -1432,6 +1516,243 @@ impl Runtime {
         })
     }
 
+    fn candidate_list(&self, input: &CandidateListInput) -> Result<CandidateListResponse> {
+        if input.token_budget < MIN_CANDIDATE_REVIEW_TOKEN_BUDGET
+            || input.token_budget > MAX_CANDIDATE_REVIEW_TOKEN_BUDGET
+        {
+            return Err(invalid(
+                "Candidate Review token budget is outside the safe bound",
+            ));
+        }
+        let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
+        let page = self.tasks.list_candidate_reviews(
+            &locator,
+            input.status,
+            input.limit,
+            input.cursor.as_deref(),
+        )?;
+        let snapshot = self.snapshot()?;
+        let mut reviews = Vec::new();
+        let mut omitted = Vec::new();
+        let mut estimated_tokens = 0_usize;
+        for record in page.records {
+            if !snapshot
+                .projection
+                .candidates
+                .contains_key(&record.candidate_id)
+            {
+                omitted.push(CandidateReviewOmitted {
+                    candidate_id: record.candidate_id,
+                    reason: CandidateReviewOmittedReason::PayloadUnavailable,
+                    estimated_tokens: 0,
+                });
+                continue;
+            }
+            let summary =
+                CandidateReviewSummary::from(self.candidate_review_view(&record, &snapshot)?);
+            let tokens = estimate_candidate_review_tokens(&summary)?;
+            if estimated_tokens.saturating_add(tokens) > input.token_budget {
+                omitted.push(CandidateReviewOmitted {
+                    candidate_id: record.candidate_id,
+                    reason: CandidateReviewOmittedReason::TokenBudget,
+                    estimated_tokens: tokens,
+                });
+            } else {
+                estimated_tokens = estimated_tokens.saturating_add(tokens);
+                reviews.push(summary);
+            }
+        }
+        Ok(CandidateListResponse {
+            reviews,
+            omitted,
+            next_cursor: page.next_cursor,
+            estimated_tokens,
+            token_budget: input.token_budget,
+        })
+    }
+
+    fn candidate_get(&self, input: &CandidateGetInput) -> Result<CandidateReviewView> {
+        let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
+        let candidate_id = parse_id_value(&input.candidate_id, "candidate_id")?;
+        let record = self
+            .tasks
+            .read_candidate_review(&locator, candidate_id)?
+            .ok_or_else(|| invalid("Candidate Review does not exist for the ActiveTask"))?;
+        let snapshot = self.snapshot()?;
+        self.candidate_review_view(&record, &snapshot)
+    }
+
+    fn candidate_discard(&self, input: &CandidateDiscardInput) -> Result<CandidateDiscardResponse> {
+        let scan = PrivacyScanner::default().scan(&input.reason)?;
+        if !scan.is_clean() {
+            return Err(Error::new(
+                ErrorKind::PrivacyRejected,
+                "Candidate discard reason failed the privacy boundary",
+            ));
+        }
+        let outcome = self
+            .tasks
+            .discard_candidate_review(&CandidateReviewDiscard {
+                locator: ExternalSessionLocator::new(
+                    &input.agent_kind,
+                    &input.external_session_id,
+                )?,
+                expected_task_id: parse_id_value(&input.expected_task_id, "expected_task_id")?,
+                expected_intent_revision_id: parse_id_value(
+                    &input.expected_intent_revision_id,
+                    "expected_intent_revision_id",
+                )?,
+                candidate_id: parse_id_value(&input.candidate_id, "candidate_id")?,
+                expected_review_version: input.expected_review_version,
+                reason: input.reason.clone(),
+            })?;
+        let snapshot = self.snapshot()?;
+        let review = self.candidate_review_view(&outcome.record, &snapshot)?;
+        Ok(CandidateDiscardResponse {
+            status: match outcome.status {
+                CandidateReviewDiscardStatus::Discarded => {
+                    CandidateDiscardResponseStatus::Discarded
+                }
+                CandidateReviewDiscardStatus::AlreadyDiscarded => {
+                    CandidateDiscardResponseStatus::AlreadyDiscarded
+                }
+            },
+            review,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn candidate_review_view(
+        &self,
+        record: &CandidateReviewRecord,
+        snapshot: &DomainSnapshot,
+    ) -> Result<CandidateReviewView> {
+        let persisted = snapshot
+            .projection
+            .candidates
+            .get(&record.candidate_id)
+            .map(|projection| &projection.candidate)
+            .ok_or_else(|| invalid("Candidate Review payload is unavailable"))?;
+        if persisted.submission_id != record.submission_id
+            || persisted.source_episode != record.source_episode
+        {
+            return Err(invariant(
+                "Candidate Review identity disagrees with its finalized Git Candidate",
+            ));
+        }
+        let episode = self
+            .tasks
+            .read_work_episode(record.source_episode.episode_id)?
+            .ok_or_else(|| invalid("Candidate Review source Episode does not exist"))?;
+        let checkpoint = episode
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.checkpoint_id == record.checkpoint_id)
+            .ok_or_else(|| invariant("Candidate Review source Checkpoint disappeared"))?;
+        let final_checkpoint = episode
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.checkpoint_id == record.final_checkpoint_id)
+            .ok_or_else(|| invariant("Candidate Review final Checkpoint disappeared"))?;
+        let claim = checkpoint
+            .claims
+            .iter()
+            .find(|claim| claim.claim_id == record.claim_id)
+            .ok_or_else(|| invariant("Candidate Review source Claim disappeared"))?;
+        let signals = self
+            .tasks
+            .read_signal_history(record.source_episode.task_session_id)?;
+        let material = build_claim_material(
+            &episode,
+            final_checkpoint,
+            checkpoint,
+            claim,
+            &signals,
+            snapshot,
+        );
+        if material.draft.as_ref() != Some(&persisted.content) {
+            return Err(invariant(
+                "Candidate Review source Claim no longer reconstructs the persisted draft",
+            ));
+        }
+        let analysis_view = self.tasks.read_candidate_analysis(record.candidate_id)?;
+        let (analysis, recommendations, confidence, unknowns, candidate_status, generation) =
+            analysis_view.map_or_else(
+                || {
+                    (
+                        CandidateAnalysis::default(),
+                        Vec::new(),
+                        material.confidence,
+                        material.unknowns,
+                        AutomaticCandidateStatus::Draft,
+                        None,
+                    )
+                },
+                |view| {
+                    (
+                        view.candidate.analysis,
+                        view.candidate.space_recommendations,
+                        view.candidate.confidence,
+                        view.candidate.unknowns,
+                        view.candidate.status,
+                        Some(view.analysis_generation),
+                    )
+                },
+            );
+        let diagnostics = if record.status == CandidateReviewStatus::Expired {
+            vec![CandidateReviewDiagnostic::ReviewExpired]
+        } else {
+            match analysis.status {
+                CandidateAnalysisStatus::Pending => {
+                    vec![CandidateReviewDiagnostic::AnalysisPending]
+                }
+                CandidateAnalysisStatus::Failed => {
+                    vec![CandidateReviewDiagnostic::AnalysisFailed {
+                        error_code: analysis.error_code.clone().unwrap_or_default(),
+                    }]
+                }
+                CandidateAnalysisStatus::Complete => Vec::new(),
+            }
+        };
+        let ready_for_review = record.status == CandidateReviewStatus::Pending
+            && analysis.status == CandidateAnalysisStatus::Complete
+            && matches!(
+                candidate_status,
+                AutomaticCandidateStatus::NeedsSpaceReview
+                    | AutomaticCandidateStatus::ExactDuplicateReview
+                    | AutomaticCandidateStatus::PotentialContradictionReview
+                    | AutomaticCandidateStatus::ReadyForReview
+            );
+        let view = CandidateReviewView {
+            candidate_id: record.candidate_id,
+            submission_id: record.submission_id,
+            source_episode: record.source_episode,
+            build_id: record.build_id,
+            final_checkpoint_id: record.final_checkpoint_id,
+            checkpoint_id: record.checkpoint_id,
+            claim_id: record.claim_id,
+            content: persisted.content.clone(),
+            analysis,
+            space_recommendations: recommendations,
+            confidence,
+            unknowns,
+            candidate_status,
+            review_status: record.status,
+            review_version: record.review_version,
+            analysis_generation: generation,
+            created_at_unix_seconds: record.created_at_unix_seconds,
+            expires_at_unix_seconds: record.expires_at_unix_seconds,
+            discarded_at_unix_seconds: record.discarded_at_unix_seconds,
+            expired_at_unix_seconds: record.expired_at_unix_seconds,
+            discard_reason: record.discard_reason.clone(),
+            ready_for_review,
+            diagnostics,
+            untrusted_data: true,
+        };
+        view.validate()?;
+        Ok(view)
+    }
+
     fn repository_scan(&self, input: &RepositoryScanInput) -> Result<RepositoryScanResponse> {
         input.validate()?;
         let paths = input
@@ -2436,6 +2757,42 @@ pub fn candidate_analyze_at_root(
     Runtime::open(root.as_ref())?.analyze_candidate(input)
 }
 
+/// Lists bounded whole Candidate Review summaries for one exact `ActiveTask`.
+///
+/// # Errors
+///
+/// Returns typed Session, cursor, budget, Runtime, index, or Review assembly errors.
+pub fn candidate_list_at_root(
+    root: impl AsRef<Path>,
+    input: &CandidateListInput,
+) -> Result<CandidateListResponse> {
+    Runtime::open(root.as_ref())?.candidate_list(input)
+}
+
+/// Gets one complete untrusted Candidate Review for one exact `ActiveTask`.
+///
+/// # Errors
+///
+/// Returns typed Session, ownership, Runtime, index, or Review assembly errors.
+pub fn candidate_get_at_root(
+    root: impl AsRef<Path>,
+    input: &CandidateGetInput,
+) -> Result<CandidateReviewView> {
+    Runtime::open(root.as_ref())?.candidate_get(input)
+}
+
+/// Explicitly discards one Pending Candidate Review under Task/Intent/Review CAS.
+///
+/// # Errors
+///
+/// Returns typed privacy, ownership, conflict, stale, lifecycle, or storage errors.
+pub fn candidate_discard_at_root(
+    root: impl AsRef<Path>,
+    input: &CandidateDiscardInput,
+) -> Result<CandidateDiscardResponse> {
+    Runtime::open(root.as_ref())?.candidate_discard(input)
+}
+
 /// Registers and scans one canonical local Git Repository without returning source text.
 ///
 /// # Errors
@@ -2710,6 +3067,9 @@ impl McpServer {
             "association_rebuild" => self.association_rebuild(call.arguments),
             "context_search" => self.context_search(call.arguments),
             "context_get" => self.context_get(call.arguments),
+            "candidate_list" => self.candidate_list(call.arguments),
+            "candidate_get" => self.candidate_get(call.arguments),
+            "candidate_discard" => self.candidate_discard(call.arguments),
             "candidate_create" => self.candidate_create(call.arguments),
             "space_list" => self.space_list(call.arguments),
             _ => return Err(invalid(format!("unknown tool: {}", call.name))),
@@ -2969,6 +3329,51 @@ impl McpServer {
             "match_reason": if created { "new_candidate_created" } else { "already_exists" },
         }))
     }
+
+    fn candidate_list(&self, arguments: Value) -> ToolResult {
+        let input: CandidateListInput = decode_arguments(arguments)?;
+        self.runtime
+            .candidate_list(&input)
+            .and_then(|response| {
+                serde_json::to_value(response).map_err(|error| {
+                    Error::new(
+                        ErrorKind::Io,
+                        format!("serialize Candidate Review list: {error}"),
+                    )
+                })
+            })
+            .map_err(ToolFailure::candidate_review_failed)
+    }
+
+    fn candidate_get(&self, arguments: Value) -> ToolResult {
+        let input: CandidateGetInput = decode_arguments(arguments)?;
+        self.runtime
+            .candidate_get(&input)
+            .and_then(|response| {
+                serde_json::to_value(response).map_err(|error| {
+                    Error::new(
+                        ErrorKind::Io,
+                        format!("serialize Candidate Review: {error}"),
+                    )
+                })
+            })
+            .map_err(ToolFailure::candidate_review_failed)
+    }
+
+    fn candidate_discard(&self, arguments: Value) -> ToolResult {
+        let input: CandidateDiscardInput = decode_arguments(arguments)?;
+        self.runtime
+            .candidate_discard(&input)
+            .and_then(|response| {
+                serde_json::to_value(response).map_err(|error| {
+                    Error::new(
+                        ErrorKind::Io,
+                        format!("serialize Candidate discard response: {error}"),
+                    )
+                })
+            })
+            .map_err(ToolFailure::candidate_review_failed)
+    }
 }
 
 /// Runs a server using process stdio.
@@ -3046,6 +3451,19 @@ impl ToolFailure {
             ErrorKind::Unsupported => "engineering_graph_unsupported",
             ErrorKind::RepositoryNotConfigured => "repository_not_configured",
             _ => "engineering_graph_failed",
+        };
+        Self { code, error }
+    }
+
+    fn candidate_review_failed(error: Error) -> Self {
+        let code = match error.kind() {
+            ErrorKind::InvalidInput => "candidate_review_invalid",
+            ErrorKind::InvariantViolation => "candidate_review_invariant",
+            ErrorKind::Io => "candidate_review_storage_failed",
+            ErrorKind::Conflict => "candidate_review_conflict",
+            ErrorKind::StaleState => "candidate_review_stale",
+            ErrorKind::PrivacyRejected => "privacy_rejected",
+            _ => "candidate_review_failed",
         };
         Self { code, error }
     }
@@ -3196,6 +3614,7 @@ impl From<EvidenceInput> for EvidenceSnapshotDraft {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn tools_list() -> Value {
     json!({"tools": [
         tool_schema(
@@ -3280,6 +3699,21 @@ fn tools_list() -> Value {
                     "revision_id": id_schema("rev_")
                 }
             })
+        ),
+        tool_schema(
+            "candidate_list",
+            "List whole untrusted automatic Candidate Review summaries for the exact ActiveTask; Pending is the default lifecycle filter.",
+            candidate_list_schema()
+        ),
+        tool_schema(
+            "candidate_get",
+            "Get one complete untrusted automatic Candidate Review without retyping its draft or Evidence.",
+            candidate_get_schema()
+        ),
+        tool_schema(
+            "candidate_discard",
+            "Explicitly discard one Pending automatic Candidate Review under Task, Intent, and Review-version CAS. This never confirms or publishes Context.",
+            candidate_discard_schema()
         ),
         tool_schema(
             "candidate_create",
@@ -3638,6 +4072,67 @@ fn search_schema() -> Value {
             "statuses": {"type": "array", "items": {"type": "string", "enum": ["candidate", "accepted", "deprecated", "superseded", "governance_conflict"]}},
             "page_size": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20},
             "cursor": {"type": "string"}
+        }
+    })
+}
+
+fn candidate_list_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["agent_kind", "external_session_id"],
+        "properties": {
+            "agent_kind": {"type": "string", "minLength": 1},
+            "external_session_id": {"type": "string", "minLength": 1},
+            "status": {
+                "type": "string",
+                "enum": ["pending", "discarded", "expired", "confirmed"],
+                "default": "pending"
+            },
+            "limit": {
+                "type": "integer", "minimum": 1,
+                "maximum": sctx_task_runtime::MAX_CANDIDATE_REVIEW_LIST_LIMIT,
+                "default": DEFAULT_CANDIDATE_REVIEW_LIST_LIMIT
+            },
+            "cursor": {"type": "string", "minLength": 1},
+            "token_budget": {
+                "type": "integer", "minimum": MIN_CANDIDATE_REVIEW_TOKEN_BUDGET,
+                "maximum": MAX_CANDIDATE_REVIEW_TOKEN_BUDGET,
+                "default": DEFAULT_CANDIDATE_REVIEW_TOKEN_BUDGET
+            }
+        }
+    })
+}
+
+fn candidate_get_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["agent_kind", "external_session_id", "candidate_id"],
+        "properties": {
+            "agent_kind": {"type": "string", "minLength": 1},
+            "external_session_id": {"type": "string", "minLength": 1},
+            "candidate_id": id_schema("cnd_")
+        }
+    })
+}
+
+fn candidate_discard_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "agent_kind", "external_session_id", "expected_task_id",
+            "expected_intent_revision_id", "candidate_id", "expected_review_version", "reason"
+        ],
+        "properties": {
+            "agent_kind": {"type": "string", "minLength": 1},
+            "external_session_id": {"type": "string", "minLength": 1},
+            "expected_task_id": id_schema("tsk_"),
+            "expected_intent_revision_id": id_schema("tir_"),
+            "candidate_id": id_schema("cnd_"),
+            "expected_review_version": {"type": "integer", "minimum": 1},
+            "reason": {"type": "string", "minLength": 1, "maxLength": 512}
         }
     })
 }
@@ -4014,6 +4509,24 @@ const fn default_candidate_analysis_token_budget() -> usize {
 
 const fn default_candidate_analysis_top_k() -> usize {
     16
+}
+
+const fn default_candidate_review_status() -> CandidateReviewStatus {
+    CandidateReviewStatus::Pending
+}
+
+const fn default_candidate_review_list_limit() -> usize {
+    DEFAULT_CANDIDATE_REVIEW_LIST_LIMIT
+}
+
+const fn default_candidate_review_token_budget() -> usize {
+    DEFAULT_CANDIDATE_REVIEW_TOKEN_BUDGET
+}
+
+fn estimate_candidate_review_tokens(summary: &CandidateReviewSummary) -> Result<usize> {
+    let bytes = serde_json::to_vec(summary)
+        .map_err(|error| Error::new(ErrorKind::Io, format!("serialize Review summary: {error}")))?;
+    Ok(bytes.len().div_ceil(4).max(1))
 }
 
 const fn error_code(kind: ErrorKind) -> &'static str {

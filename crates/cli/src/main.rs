@@ -22,12 +22,13 @@ use sctx_agent_adapter::{
     TaskRuntimeOperation, ToolOutcome, TrustState, plan_action,
 };
 use sctx_domain::{
-    Applicability, ConflictParticipant, ConflictResolutionDraft, ConflictResolutionResult,
-    ContextGovernanceStatus, ContextId, ContextKind, ContextRevisionDraft, DomainProjection, Error,
-    ErrorKind, EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot,
-    PublicationAction, PublicationDraft, RepositoryId, ResolutionOutcome, Result, ReviewDraft,
-    ReviewSummary, ReviewVerdict, RevisionId, SemanticConflictDraft, SpaceId, SubmissionId, TaskId,
-    TaskIntentRevisionId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkEpisodeStatus,
+    Applicability, CandidateReviewStatus, ConflictParticipant, ConflictResolutionDraft,
+    ConflictResolutionResult, ContextGovernanceStatus, ContextId, ContextKind,
+    ContextRevisionDraft, DomainProjection, Error, ErrorKind, EvidenceSnapshotDraft, EvidenceType,
+    ExternalSessionLocator, IntentSnapshot, PublicationAction, PublicationDraft, RepositoryId,
+    ResolutionOutcome, Result, ReviewDraft, ReviewSummary, ReviewVerdict, RevisionId,
+    SemanticConflictDraft, SpaceId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSignal,
+    TaskSignalKind, WorkEpisodeId, WorkEpisodeStatus,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{
@@ -43,8 +44,9 @@ use sctx_local_state::{
 };
 use sctx_mcp::{
     ArtifactFocusQuery, AssociationExplainInput, AssociationRebuildInput, CandidateAnalyzeInput,
-    EngineeringReferenceRecordInput, RepositoryScanInput, TaskCheckpointInput,
-    TaskContextReadInput, TaskIntentUpdateInput, TaskSignalSupersedeInput,
+    CandidateDiscardInput, CandidateGetInput, CandidateListInput, EngineeringReferenceRecordInput,
+    RepositoryScanInput, TaskCheckpointInput, TaskContextReadInput, TaskIntentUpdateInput,
+    TaskSignalSupersedeInput,
 };
 use sctx_search::{ContextStatus, ScopeFilter, SearchEngine, SearchFilters, SearchRequest};
 use sctx_task_runtime::TaskRuntime;
@@ -65,7 +67,7 @@ Commands:
   uninstall [--root PATH]
   knowledge delete --confirm-path PATH --confirm DELETE-SHARED-CONTEXT-KNOWLEDGE
   space create|intent revise|list|get
-  candidate create|build-closed-episode|analyze
+  candidate list|get|discard|create|build-closed-episode|analyze
   context revise|review|publish|withdraw|get
   semantic conflict open|resolve
   task context|artifact-focus|checkpoint|intent update|signal supersede
@@ -632,9 +634,18 @@ fn verify_demo_mcp(
         .and_then(|response| response.pointer("/result/tools"))
         .and_then(Value::as_array)
         .ok_or_else(|| invariant("demo MCP tools/list response is missing"))?;
-    if tools.len() != 13 || !tools.iter().any(|tool| tool["name"] == "task_checkpoint") {
+    if tools.len() != 16
+        || [
+            "task_checkpoint",
+            "candidate_list",
+            "candidate_get",
+            "candidate_discard",
+        ]
+        .iter()
+        .any(|name| !tools.iter().any(|tool| tool["name"] == *name))
+    {
         return Err(invariant(
-            "demo MCP tools/list did not return the thirteen-tool Checkpoint surface",
+            "demo MCP tools/list did not return the Candidate Review surface",
         ));
     }
     let results = responses
@@ -1115,6 +1126,118 @@ fn run_space(args: &[String], json_output: bool) -> Result<()> {
 #[allow(clippy::too_many_lines)]
 fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
     match args {
+        [command, rest @ ..] if command == "list" => {
+            if is_help(rest) {
+                println!(
+                    "Usage: sctx candidate list --agent-kind <KIND> --external-session-id <ID> [--status pending|discarded|expired|confirmed] [--limit <N>] [--cursor <CURSOR>] [--token-budget <N>]"
+                );
+                return Ok(());
+            }
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(
+                &[
+                    "--agent-kind",
+                    "--external-session-id",
+                    "--status",
+                    "--limit",
+                    "--cursor",
+                    "--token-budget",
+                ],
+                &[],
+            )?;
+            let input = CandidateListInput {
+                agent_kind: options.required("--agent-kind")?.to_owned(),
+                external_session_id: options.required("--external-session-id")?.to_owned(),
+                status: parse_candidate_review_status(
+                    options.optional("--status")?.unwrap_or("pending"),
+                )?,
+                limit: parse_usize(options.optional("--limit")?.unwrap_or("20"), "limit")?,
+                cursor: options.optional("--cursor")?.map(str::to_owned),
+                token_budget: parse_usize(
+                    options.optional("--token-budget")?.unwrap_or("4096"),
+                    "token budget",
+                )?,
+            };
+            let response = sctx_mcp::candidate_list_at_root(installation_root()?, &input)?;
+            let metadata = Runtime::open()?.index.synchronize()?.metadata;
+            emit(
+                "candidate.list",
+                &metadata,
+                serde_json::to_value(response)
+                    .map_err(json_error("serialize Candidate Review list"))?,
+                json_output,
+            )
+        }
+        [command, rest @ ..] if command == "get" => {
+            if is_help(rest) {
+                println!(
+                    "Usage: sctx candidate get --agent-kind <KIND> --external-session-id <ID> --candidate-id <ID>"
+                );
+                return Ok(());
+            }
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(
+                &["--agent-kind", "--external-session-id", "--candidate-id"],
+                &[],
+            )?;
+            let input = CandidateGetInput {
+                agent_kind: options.required("--agent-kind")?.to_owned(),
+                external_session_id: options.required("--external-session-id")?.to_owned(),
+                candidate_id: options.required("--candidate-id")?.to_owned(),
+            };
+            let response = sctx_mcp::candidate_get_at_root(installation_root()?, &input)?;
+            let metadata = Runtime::open()?.index.synchronize()?.metadata;
+            emit(
+                "candidate.get",
+                &metadata,
+                serde_json::to_value(response).map_err(json_error("serialize Candidate Review"))?,
+                json_output,
+            )
+        }
+        [command, rest @ ..] if command == "discard" => {
+            if is_help(rest) {
+                println!(
+                    "Usage: sctx candidate discard --agent-kind <KIND> --external-session-id <ID> --expected-task-id <ID> --expected-intent-revision-id <ID> --candidate-id <ID> --expected-review-version <N> --reason <TEXT>"
+                );
+                return Ok(());
+            }
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(
+                &[
+                    "--agent-kind",
+                    "--external-session-id",
+                    "--expected-task-id",
+                    "--expected-intent-revision-id",
+                    "--candidate-id",
+                    "--expected-review-version",
+                    "--reason",
+                ],
+                &[],
+            )?;
+            let input = CandidateDiscardInput {
+                agent_kind: options.required("--agent-kind")?.to_owned(),
+                external_session_id: options.required("--external-session-id")?.to_owned(),
+                expected_task_id: options.required("--expected-task-id")?.to_owned(),
+                expected_intent_revision_id: options
+                    .required("--expected-intent-revision-id")?
+                    .to_owned(),
+                candidate_id: options.required("--candidate-id")?.to_owned(),
+                expected_review_version: parse_u64(
+                    options.required("--expected-review-version")?,
+                    "expected Review version",
+                )?,
+                reason: options.required("--reason")?.to_owned(),
+            };
+            let response = sctx_mcp::candidate_discard_at_root(installation_root()?, &input)?;
+            let metadata = Runtime::open()?.index.synchronize()?.metadata;
+            emit(
+                "candidate.discard",
+                &metadata,
+                serde_json::to_value(response)
+                    .map_err(json_error("serialize Candidate discard response"))?,
+                json_output,
+            )
+        }
         [command, rest @ ..] if command == "analyze" => {
             if is_help(rest) {
                 println!(
@@ -1243,7 +1366,7 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
             )
         }
         _ => Err(invalid(format!(
-            "invalid candidate command; expected create|build-closed-episode|analyze\n\n{CONTEXT_WRITE_HELP}"
+            "invalid candidate command; expected list|get|discard|create|build-closed-episode|analyze\n\n{CONTEXT_WRITE_HELP}"
         ))),
     }
 }
@@ -2386,6 +2509,16 @@ fn parse_status(value: &str) -> Result<ContextStatus> {
     }
 }
 
+fn parse_candidate_review_status(value: &str) -> Result<CandidateReviewStatus> {
+    match value {
+        "pending" => Ok(CandidateReviewStatus::Pending),
+        "discarded" => Ok(CandidateReviewStatus::Discarded),
+        "expired" => Ok(CandidateReviewStatus::Expired),
+        "confirmed" => Ok(CandidateReviewStatus::Confirmed),
+        _ => Err(invalid(format!("invalid Candidate Review status: {value}"))),
+    }
+}
+
 fn parse_many_ids<T>(options: &Options, option: &str, field: &str) -> Result<Vec<T>>
 where
     T: FromStr,
@@ -2409,6 +2542,12 @@ where
 }
 
 fn parse_usize(value: &str, field: &str) -> Result<usize> {
+    value
+        .parse()
+        .map_err(|error| invalid(format!("invalid {field}: {error}")))
+}
+
+fn parse_u64(value: &str, field: &str) -> Result<u64> {
     value
         .parse()
         .map_err(|error| invalid(format!("invalid {field}: {error}")))

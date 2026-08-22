@@ -2173,7 +2173,15 @@ fn mcp_smoke(root: &Path) -> Result<()> {
         if values.len() != 2
             || values.iter().any(|value| value.get("error").is_some())
             || tools.is_none_or(|tools| {
-                tools.len() != 13 || !tools.iter().any(|tool| tool["name"] == "task_checkpoint")
+                tools.len() != 16
+                    || [
+                        "task_checkpoint",
+                        "candidate_list",
+                        "candidate_get",
+                        "candidate_discard",
+                    ]
+                    .iter()
+                    .any(|name| !tools.iter().any(|tool| tool["name"] == *name))
             })
         {
             return Err(Error::new(

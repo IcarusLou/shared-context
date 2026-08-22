@@ -7,26 +7,29 @@ use std::{
     thread,
 };
 
+use rusqlite::Connection;
 use sctx_domain::{
-    Applicability, ArtifactAction, ArtifactLocator, ArtifactRef, CandidateId, CaptureId,
-    CaptureUnknown, ContextId, ContextKind, ContextRevisionDraft, ContextRevisionRef,
-    ContextUseDisposition, EventId, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot,
-    NormalizedBreadcrumbKind, NormalizedWorkObservation, PublicationAction, PublicationDraft,
-    RepoRelativePath, RepositoryId, RevisionId, SpaceId, SubmissionId, TaskId, TaskIntentDraft,
-    TaskIntentRevisionId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkSourceRef,
-    candidate_submission_content_hash,
+    Applicability, ArtifactAction, ArtifactLocator, ArtifactRef, CandidateId,
+    CandidateReviewDiagnostic, CandidateReviewStatus, CaptureId, CaptureUnknown, ContextId,
+    ContextKind, ContextRevisionDraft, ContextRevisionRef, ContextUseDisposition, EventId,
+    EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, NormalizedBreadcrumbKind,
+    NormalizedWorkObservation, PublicationAction, PublicationDraft, RepoRelativePath, RepositoryId,
+    RevisionId, SpaceId, SubmissionId, TaskId, TaskIntentDraft, TaskIntentRevisionId, TaskSignal,
+    TaskSignalKind, WorkEpisodeId, WorkSourceRef, candidate_submission_content_hash,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
 use sctx_index::ProjectionIndex;
 use sctx_local_state::UserConfigStore;
 use sctx_mcp::{
-    CandidateBuildItemResponseStatus, CandidateBuildResponseStatus, ClientKind, DisconnectReason,
-    ExpectedRevisionId, IntentMaturity, McpServer, TaskBoundary, TaskCheckpointBoundary,
-    TaskCheckpointClaimInput, TaskCheckpointEvidenceInput, TaskCheckpointInput,
-    TaskContextReadInput, TaskIntentUpdateInput, TaskSignalSupersedeInput, TransportErrorKind,
-    build_closed_episode_at_root, task_checkpoint_at_root, task_context_readonly_at_root,
-    task_intent_update_at_root, task_signal_supersede_at_root,
+    CandidateBuildItemResponseStatus, CandidateBuildResponseStatus, CandidateDiscardInput,
+    CandidateDiscardResponseStatus, CandidateGetInput, CandidateListInput, ClientKind,
+    DisconnectReason, ExpectedRevisionId, IntentMaturity, McpServer, TaskBoundary,
+    TaskCheckpointBoundary, TaskCheckpointClaimInput, TaskCheckpointEvidenceInput,
+    TaskCheckpointInput, TaskContextReadInput, TaskIntentUpdateInput, TaskSignalSupersedeInput,
+    TransportErrorKind, build_closed_episode_at_root, candidate_discard_at_root,
+    candidate_get_at_root, candidate_list_at_root, task_checkpoint_at_root,
+    task_context_readonly_at_root, task_intent_update_at_root, task_signal_supersede_at_root,
 };
 use sctx_task_runtime::{
     AgentCheckpointWrite, CandidateBuildItemPreparation, CandidateBuildItemStatus,
@@ -1133,6 +1136,512 @@ fn candidate_builder_converts_six_typed_sources_without_raw_capture_or_search_in
     for item in &build.items {
         assert!(!pack_json.contains(&item.candidate_id.unwrap().to_string()));
     }
+
+    let full_list = candidate_list_at_root(
+        &fixture.root,
+        &CandidateListInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            status: CandidateReviewStatus::Pending,
+            limit: 10,
+            cursor: None,
+            token_budget: 32_768,
+        },
+    )
+    .unwrap();
+    assert_eq!(full_list.reviews.len(), 6);
+    assert!(full_list.omitted.is_empty());
+    assert!(full_list.reviews.iter().all(|summary| {
+        summary.0.untrusted_data
+            && summary.0.ready_for_review
+            && summary.0.analysis.status == sctx_domain::CandidateAnalysisStatus::Complete
+            && !summary.0.content.evidence.is_empty()
+    }));
+    let first_page = candidate_list_at_root(
+        &fixture.root,
+        &CandidateListInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            status: CandidateReviewStatus::Pending,
+            limit: 2,
+            cursor: None,
+            token_budget: 32_768,
+        },
+    )
+    .unwrap();
+    assert_eq!(first_page.reviews.len(), 2);
+    let next = first_page.next_cursor.clone().unwrap();
+    let second_page = candidate_list_at_root(
+        &fixture.root,
+        &CandidateListInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            status: CandidateReviewStatus::Pending,
+            limit: 2,
+            cursor: Some(next),
+            token_budget: 32_768,
+        },
+    )
+    .unwrap();
+    assert!(first_page.reviews.iter().all(|left| {
+        second_page
+            .reviews
+            .iter()
+            .all(|right| left.0.candidate_id != right.0.candidate_id)
+    }));
+    let budgeted = candidate_list_at_root(
+        &fixture.root,
+        &CandidateListInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            status: CandidateReviewStatus::Pending,
+            limit: 6,
+            cursor: None,
+            token_budget: 512,
+        },
+    )
+    .unwrap();
+    assert!(budgeted.estimated_tokens <= 512);
+    assert!(!budgeted.omitted.is_empty());
+
+    let review_candidate_id = build.items[2].candidate_id.unwrap();
+    let full_review = candidate_get_at_root(
+        &fixture.root,
+        &CandidateGetInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            candidate_id: review_candidate_id.to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(full_review.content, candidate_views[2].content);
+    assert_eq!(full_review.checkpoint_id, build.items[2].checkpoint_id);
+    assert_eq!(full_review.claim_id, build.items[2].claim_id);
+    assert!(!full_review.analysis.assessments.is_empty());
+    assert!(!full_review.space_recommendations.is_empty());
+
+    let other = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            "candidate-review-other-session",
+            TaskBoundary::New,
+            None,
+            IntentMaturity::Provisional,
+            "isolate Candidate Reviews",
+        ),
+    )
+    .unwrap();
+    assert!(
+        candidate_list_at_root(
+            &fixture.root,
+            &CandidateListInput {
+                agent_kind: "codex".to_owned(),
+                external_session_id: "candidate-review-other-session".to_owned(),
+                status: CandidateReviewStatus::Pending,
+                limit: 10,
+                cursor: None,
+                token_budget: 4_096,
+            },
+        )
+        .unwrap()
+        .reviews
+        .is_empty()
+    );
+    assert!(
+        candidate_get_at_root(
+            &fixture.root,
+            &CandidateGetInput {
+                agent_kind: "codex".to_owned(),
+                external_session_id: "candidate-review-other-session".to_owned(),
+                candidate_id: review_candidate_id.to_string(),
+            },
+        )
+        .is_err()
+    );
+    assert_ne!(other.context.task_id, active.task_id);
+
+    let manual_submission = SubmissionId::new();
+    let manual_owner = CandidateOwner {
+        agent_kind: "codex".to_owned(),
+        external_session_id: session.to_owned(),
+        task_id: active.task_id,
+        intent_revision_id: active.current_intent_revision().unwrap().revision_id,
+        source_episode_id: opened.episode.episode_id,
+    };
+    let manual = run_session(
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::Newline,
+        &[
+            request(90, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(
+                91,
+                "candidate_create",
+                candidate_arguments(
+                    manual_submission,
+                    &manual_owner,
+                    "manual Git-only Candidate must stay undiscoverable",
+                ),
+            ),
+        ],
+    );
+    assert_eq!(manual[1]["result"]["isError"], false);
+    assert_eq!(
+        candidate_list_at_root(
+            &fixture.root,
+            &CandidateListInput {
+                agent_kind: "codex".to_owned(),
+                external_session_id: session.to_owned(),
+                status: CandidateReviewStatus::Pending,
+                limit: 10,
+                cursor: None,
+                token_budget: 32_768,
+            },
+        )
+        .unwrap()
+        .reviews
+        .len(),
+        6,
+        "Git-only manual Candidate must not enter Runtime Review discovery"
+    );
+
+    let failed_candidate_id = build.items[0].candidate_id.unwrap();
+    let mut failed = tasks
+        .read_candidate_analysis(failed_candidate_id)
+        .unwrap()
+        .unwrap()
+        .candidate;
+    failed.analysis = sctx_domain::CandidateAnalysis {
+        status: sctx_domain::CandidateAnalysisStatus::Failed,
+        error_code: Some("analysis_dependency_unavailable".to_owned()),
+        ..sctx_domain::CandidateAnalysis::default()
+    };
+    failed.space_recommendations.clear();
+    failed.confidence = sctx_domain::CandidateConfidence {
+        basis_points: 0,
+        rationale: "Analysis failed and remains retryable".to_owned(),
+    };
+    failed.status = sctx_domain::AutomaticCandidateStatus::Draft;
+    tasks.replace_candidate_analysis(&failed).unwrap();
+    let missing_candidate_id = build.items[1].candidate_id.unwrap();
+    Connection::open(tasks.database_path())
+        .unwrap()
+        .execute(
+            "DELETE FROM candidate_analysis WHERE candidate_id = ?1",
+            [missing_candidate_id.to_string()],
+        )
+        .unwrap();
+    let failed_review = candidate_get_at_root(
+        &fixture.root,
+        &CandidateGetInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            candidate_id: failed_candidate_id.to_string(),
+        },
+    )
+    .unwrap();
+    assert!(!failed_review.ready_for_review);
+    assert_eq!(
+        failed_review.diagnostics,
+        vec![CandidateReviewDiagnostic::AnalysisFailed {
+            error_code: "analysis_dependency_unavailable".to_owned()
+        }]
+    );
+    let missing_review = candidate_get_at_root(
+        &fixture.root,
+        &CandidateGetInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            candidate_id: missing_candidate_id.to_string(),
+        },
+    )
+    .unwrap();
+    assert!(!missing_review.ready_for_review);
+    assert_eq!(
+        missing_review.diagnostics,
+        vec![CandidateReviewDiagnostic::AnalysisPending]
+    );
+
+    let discarded = candidate_discard_at_root(
+        &fixture.root,
+        &CandidateDiscardInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: active.task_id.to_string(),
+            expected_intent_revision_id: active
+                .current_intent_revision()
+                .unwrap()
+                .revision_id
+                .to_string(),
+            candidate_id: review_candidate_id.to_string(),
+            expected_review_version: 1,
+            reason: "not worth retaining".to_owned(),
+        },
+    )
+    .unwrap();
+    assert_eq!(discarded.status, CandidateDiscardResponseStatus::Discarded);
+    assert_eq!(
+        discarded.review.review_status,
+        CandidateReviewStatus::Discarded
+    );
+    assert!(!discarded.review.ready_for_review);
+    let retry = candidate_discard_at_root(
+        &fixture.root,
+        &CandidateDiscardInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: active.task_id.to_string(),
+            expected_intent_revision_id: active
+                .current_intent_revision()
+                .unwrap()
+                .revision_id
+                .to_string(),
+            candidate_id: review_candidate_id.to_string(),
+            expected_review_version: 1,
+            reason: "not worth retaining".to_owned(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        retry.status,
+        CandidateDiscardResponseStatus::AlreadyDiscarded
+    );
+    assert_eq!(
+        candidate_list_at_root(
+            &fixture.root,
+            &CandidateListInput {
+                agent_kind: "codex".to_owned(),
+                external_session_id: session.to_owned(),
+                status: CandidateReviewStatus::Discarded,
+                limit: 10,
+                cursor: None,
+                token_budget: 32_768,
+            },
+        )
+        .unwrap()
+        .reviews[0]
+            .0
+            .candidate_id,
+        review_candidate_id
+    );
+    let private_reason = candidate_discard_at_root(
+        &fixture.root,
+        &CandidateDiscardInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: active.task_id.to_string(),
+            expected_intent_revision_id: active
+                .current_intent_revision()
+                .unwrap()
+                .revision_id
+                .to_string(),
+            candidate_id: build.items[3].candidate_id.unwrap().to_string(),
+            expected_review_version: 1,
+            reason: "AKIAIOSFODNN7EXAMPLE".to_owned(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        private_reason.kind(),
+        sctx_domain::ErrorKind::PrivacyRejected
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn cursor_and_codex_candidate_review_tools_list_get_and_discard_without_confirmation() {
+    for (client, framing, agent_kind) in [
+        (ClientKind::Cursor, FixtureFraming::Newline, "cursor"),
+        (ClientKind::Codex, FixtureFraming::ContentLength, "codex"),
+    ] {
+        let fixture = Fixture::new();
+        let session = format!("candidate-review-{agent_kind}");
+        let task = task_intent_update_at_root(
+            &fixture.root,
+            &TaskIntentUpdateInput {
+                agent_kind: agent_kind.to_owned(),
+                external_session_id: session.clone(),
+                ..update_input(
+                    &session,
+                    TaskBoundary::New,
+                    None,
+                    IntentMaturity::Provisional,
+                    "review one complete Candidate",
+                )
+            },
+        )
+        .unwrap();
+        let closed = task_checkpoint_at_root(
+            &fixture.root,
+            &TaskCheckpointInput {
+                agent_kind: agent_kind.to_owned(),
+                external_session_id: session.clone(),
+                expected_task_id: task.context.task_id.to_string(),
+                expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+                expected_episode_version: 0,
+                boundary: TaskCheckpointBoundary::Close,
+                claims: vec![TaskCheckpointClaimInput {
+                    context_kind_hint: Some(ContextKind::Validation),
+                    topic_key_hint: Some("candidate/review-contract".to_owned()),
+                    statement: "Candidate Review returns the original complete draft".to_owned(),
+                    rationale: "Review must not ask the user to reconstruct Evidence".to_owned(),
+                    applicability: Applicability::default(),
+                    assumptions: Vec::new(),
+                    recheck_when: vec!["the Review schema changes".to_owned()],
+                    evidence: vec![TaskCheckpointEvidenceInput::InlineValidation {
+                        evidence: EvidenceSnapshotDraft {
+                            kind: EvidenceType::ExperimentRecord,
+                            supports: "The Candidate Review MCP fixture passed".to_owned(),
+                            content: json!({"tool": "candidate_get", "actual": "complete"}),
+                            interpretation: "The full draft is reviewable without retyping"
+                                .to_owned(),
+                            limitations: vec!["local fixture".to_owned()],
+                        },
+                    }],
+                    artifact_refs: Vec::new(),
+                    related_contexts: Vec::new(),
+                }],
+                unknowns: Vec::new(),
+            },
+        )
+        .unwrap();
+        let candidate_id = closed.candidate_build.as_ref().unwrap().items[0]
+            .candidate_id
+            .unwrap();
+        let owner = json!({
+            "agent_kind": agent_kind,
+            "external_session_id": session,
+        });
+        let responses = run_session(
+            &mut fixture.server(client),
+            framing,
+            &[
+                request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+                tool_call(
+                    2,
+                    "candidate_list",
+                    json!({
+                        "agent_kind": agent_kind,
+                        "external_session_id": session,
+                        "limit": 10,
+                        "token_budget": 32768
+                    }),
+                ),
+                tool_call(
+                    3,
+                    "candidate_get",
+                    json!({
+                        "agent_kind": agent_kind,
+                        "external_session_id": session,
+                        "candidate_id": candidate_id
+                    }),
+                ),
+                tool_call(
+                    4,
+                    "candidate_discard",
+                    json!({
+                        "agent_kind": agent_kind,
+                        "external_session_id": session,
+                        "expected_task_id": task.context.task_id,
+                        "expected_intent_revision_id": task.context.intent_revision_id,
+                        "candidate_id": candidate_id,
+                        "expected_review_version": 1,
+                        "reason": "explicitly not worth retaining"
+                    }),
+                ),
+                tool_call(
+                    5,
+                    "candidate_discard",
+                    json!({
+                        "agent_kind": agent_kind,
+                        "external_session_id": session,
+                        "expected_task_id": task.context.task_id,
+                        "expected_intent_revision_id": task.context.intent_revision_id,
+                        "candidate_id": candidate_id,
+                        "expected_review_version": 1,
+                        "reason": "explicitly not worth retaining"
+                    }),
+                ),
+                tool_call(
+                    6,
+                    "candidate_discard",
+                    json!({
+                        "agent_kind": agent_kind,
+                        "external_session_id": session,
+                        "expected_task_id": task.context.task_id,
+                        "expected_intent_revision_id": task.context.intent_revision_id,
+                        "candidate_id": candidate_id,
+                        "expected_review_version": 1,
+                        "reason": "conflicting retry meaning"
+                    }),
+                ),
+                tool_call(7, "candidate_list", owner.clone()),
+                tool_call(
+                    8,
+                    "candidate_list",
+                    json!({
+                        "agent_kind": agent_kind,
+                        "external_session_id": session,
+                        "status": "discarded",
+                        "token_budget": 32768
+                    }),
+                ),
+            ],
+        );
+        let listed = &responses[1]["result"]["structuredContent"];
+        assert_eq!(listed["reviews"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            listed["reviews"][0]["candidate_id"],
+            candidate_id.to_string()
+        );
+        assert_eq!(listed["reviews"][0]["untrusted_data"], true);
+        assert_eq!(listed["reviews"][0]["ready_for_review"], true);
+        assert_eq!(
+            listed["reviews"][0]["content"]["statement"],
+            "Candidate Review returns the original complete draft"
+        );
+        assert_eq!(
+            listed["reviews"][0]["content"]["evidence"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let got = &responses[2]["result"]["structuredContent"];
+        assert_eq!(got["candidate_id"], candidate_id.to_string());
+        assert_eq!(
+            got["claim_id"],
+            closed.candidate_build.as_ref().unwrap().items[0]
+                .claim_id
+                .to_string()
+        );
+        assert_eq!(
+            responses[3]["result"]["structuredContent"]["status"],
+            "discarded"
+        );
+        assert_eq!(
+            responses[4]["result"]["structuredContent"]["status"],
+            "already_discarded"
+        );
+        assert_eq!(responses[5]["result"]["isError"], true);
+        assert_eq!(
+            responses[5]["result"]["structuredContent"]["error"]["code"],
+            "candidate_review_conflict"
+        );
+        assert!(
+            responses[6]["result"]["structuredContent"]["reviews"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            responses[7]["result"]["structuredContent"]["reviews"][0]["review_status"],
+            "discarded"
+        );
+        let response_text = serde_json::to_string(&responses).unwrap();
+        for forbidden in ["candidate_confirm", "publication", "governance_action"] {
+            assert!(!response_text.contains(forbidden));
+        }
+    }
 }
 
 #[test]
@@ -1500,7 +2009,7 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
 
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 16);
         let names = tools
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
@@ -1519,6 +2028,9 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
                 "association_rebuild",
                 "context_search",
                 "context_get",
+                "candidate_list",
+                "candidate_get",
+                "candidate_discard",
                 "candidate_create",
                 "space_list"
             ]
@@ -1739,6 +2251,28 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
                 .iter()
                 .any(|field| field == "source_episode_id")
         );
+        let list_schema = &tools
+            .iter()
+            .find(|tool| tool["name"] == "candidate_list")
+            .unwrap()["inputSchema"];
+        assert_eq!(list_schema["additionalProperties"], false);
+        assert_eq!(
+            list_schema["required"],
+            json!(["agent_kind", "external_session_id"])
+        );
+        assert_eq!(list_schema["properties"]["status"]["default"], "pending");
+        let discard_schema = &tools
+            .iter()
+            .find(|tool| tool["name"] == "candidate_discard")
+            .unwrap()["inputSchema"];
+        assert_eq!(discard_schema["additionalProperties"], false);
+        let discard_schema_text = discard_schema.to_string();
+        for forbidden in ["confirm", "publish", "space_id", "context_id", "event_id"] {
+            assert!(
+                !discard_schema_text.contains(forbidden),
+                "Candidate discard schema leaked governance field: {forbidden}"
+            );
+        }
 
         for response in &responses[2..] {
             assert_eq!(response["result"]["isError"], false, "{response:#}");

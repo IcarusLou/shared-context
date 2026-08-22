@@ -9,25 +9,28 @@ use std::{
     fs,
     path::{Path, PathBuf},
     str::FromStr,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sctx_domain::{
     AgentCheckpoint, AgentCheckpointId, Applicability, ArtifactRef, AutomaticContextCandidate,
-    CandidateBuildId, CandidateId, CaptureEvidenceRef, CaptureId, CaptureSourceRef, CaptureUnknown,
-    CheckpointClaim, CheckpointClaimId, ContextRevisionRef, Error, ErrorKind, EventId,
-    EvidenceSnapshotDraft, ExternalSessionId, ExternalSessionLocator, ExternalSessionSnapshot,
-    IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation, Result, SignalId,
-    SubmissionId, TaskId, TaskIntent, TaskIntentDraft, TaskIntentRevision, TaskIntentRevisionId,
-    TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle,
-    TaskSignalRecord, WorkEpisode, WorkEpisodeId, WorkEpisodeRef, WorkEpisodeStatus,
-    WorkObservation, WorkObservationId, WorkSourceRef,
+    CandidateBuildId, CandidateId, CandidateReviewStatus, CaptureEvidenceRef, CaptureId,
+    CaptureSourceRef, CaptureUnknown, CheckpointClaim, CheckpointClaimId, ContextRevisionRef,
+    Error, ErrorKind, EventId, EvidenceSnapshotDraft, ExternalSessionId, ExternalSessionLocator,
+    ExternalSessionSnapshot, IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation,
+    Result, SignalId, SubmissionId, TaskId, TaskIntent, TaskIntentDraft, TaskIntentRevision,
+    TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalKind,
+    TaskSignalLifecycle, TaskSignalRecord, WorkEpisode, WorkEpisodeId, WorkEpisodeRef,
+    WorkEpisodeStatus, WorkObservation, WorkObservationId, WorkSourceRef,
 };
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_EPISODE_LIST_LIMIT: usize = 256;
+pub const DEFAULT_CANDIDATE_REVIEW_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+pub const MAX_CANDIDATE_REVIEW_TTL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+pub const MAX_CANDIDATE_REVIEW_LIST_LIMIT: usize = 100;
 
 /// Result of atomically locating or creating one `ExternalSession`'s first Task.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -134,6 +137,64 @@ pub struct AgentCheckpointOutcome {
 pub struct CandidateAnalysisView {
     pub candidate: AutomaticContextCandidate,
     pub analysis_generation: u64,
+}
+
+/// Minimal durable discovery/audit record for one finalized automatic Candidate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateReviewRecord {
+    pub candidate_id: CandidateId,
+    pub submission_id: SubmissionId,
+    pub source_episode: WorkEpisodeRef,
+    pub build_id: CandidateBuildId,
+    pub final_checkpoint_id: AgentCheckpointId,
+    pub checkpoint_id: AgentCheckpointId,
+    pub claim_id: CheckpointClaimId,
+    pub review_version: u64,
+    pub status: CandidateReviewStatus,
+    pub discard_reason: Option<String>,
+    pub created_at_unix_seconds: u64,
+    pub expires_at_unix_seconds: u64,
+    pub discarded_at_unix_seconds: Option<u64>,
+    pub expired_at_unix_seconds: Option<u64>,
+}
+
+/// Bounded stable page of Review records owned by one exact `ActiveTask`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateReviewPage {
+    pub records: Vec<CandidateReviewRecord>,
+    pub next_cursor: Option<String>,
+}
+
+/// CAS-guarded explicit discard command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateReviewDiscard {
+    pub locator: ExternalSessionLocator,
+    pub expected_task_id: TaskId,
+    pub expected_intent_revision_id: TaskIntentRevisionId,
+    pub candidate_id: CandidateId,
+    pub expected_review_version: u64,
+    pub reason: String,
+}
+
+/// Exact idempotent result of one discard command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CandidateReviewDiscardStatus {
+    Discarded,
+    AlreadyDiscarded,
+}
+
+/// Updated Review record plus exact discard disposition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateReviewDiscardOutcome {
+    pub record: CandidateReviewRecord,
+    pub status: CandidateReviewDiscardStatus,
+}
+
+/// Runtime-only expiration report; Git knowledge is never changed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateReviewCleanup {
+    pub expired_candidate_ids: Vec<CandidateId>,
+    pub removed_analysis_count: usize,
 }
 
 /// Aggregate state of one deterministic build over an immutable closed Episode.
@@ -1273,7 +1334,37 @@ impl TaskRuntime {
         event_id: Option<EventId>,
         error_code: Option<&str>,
     ) -> Result<CandidateBuildView> {
+        self.record_candidate_build_item_result_at(
+            build_id,
+            submission_id,
+            status,
+            candidate_id,
+            event_id,
+            error_code,
+            DEFAULT_CANDIDATE_REVIEW_TTL,
+            unix_seconds(SystemTime::now())?,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_candidate_build_item_result_at(
+        &self,
+        build_id: CandidateBuildId,
+        submission_id: SubmissionId,
+        status: CandidateBuildItemStatus,
+        candidate_id: Option<CandidateId>,
+        event_id: Option<EventId>,
+        error_code: Option<&str>,
+        review_ttl: Duration,
+        now_unix_seconds: u64,
+    ) -> Result<CandidateBuildView> {
         validate_build_item_result(status, candidate_id, event_id, error_code)?;
+        if review_ttl.is_zero() || review_ttl > MAX_CANDIDATE_REVIEW_TTL {
+            return Err(invalid("Candidate Review TTL is outside the safe bound"));
+        }
+        let expires_at_unix_seconds = now_unix_seconds
+            .checked_add(review_ttl.as_secs())
+            .ok_or_else(|| invalid("Candidate Review expiration overflows Unix time"))?;
         let mut connection = self.open_connection()?;
         let transaction = immediate(&mut connection, "begin Candidate Build result")?;
         let existing = read_candidate_build_item(&transaction, build_id, submission_id)?
@@ -1300,6 +1391,39 @@ impl TaskRuntime {
                     ],
                 )
                 .map_err(sql_error("update Candidate Build item result"))?;
+        }
+        if status.is_finalized() {
+            let candidate_id = candidate_id
+                .ok_or_else(|| invariant("finalized Candidate Build item lacks CandidateId"))?;
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO candidate_review (
+                        candidate_id, submission_id, episode_id, task_session_id, task_id,
+                        build_id, final_checkpoint_id, checkpoint_id, claim_id,
+                        review_version, status, discard_reason, created_at_unix_seconds,
+                        expires_at_unix_seconds, discarded_at_unix_seconds,
+                        expired_at_unix_seconds
+                     )
+                     SELECT ?1, item.submission_id, build.episode_id, build.task_session_id,
+                            build.task_id, build.build_id, build.final_checkpoint_id,
+                            item.checkpoint_id, item.claim_id, 1, 'pending', NULL, ?2, ?3, NULL, NULL
+                     FROM candidate_build_item AS item
+                     JOIN candidate_build AS build ON build.build_id = item.build_id
+                     WHERE item.build_id = ?4 AND item.submission_id = ?5
+                       AND item.candidate_id = ?1
+                       AND item.status IN ('created', 'already_exists')",
+                    params![
+                        candidate_id.to_string(),
+                        i64::try_from(now_unix_seconds)
+                            .map_err(|_| invalid("Candidate Review timestamp exceeds SQLite range"))?,
+                        i64::try_from(expires_at_unix_seconds).map_err(|_| invalid(
+                            "Candidate Review expiration exceeds SQLite range"
+                        ))?,
+                        build_id.to_string(),
+                        submission_id.to_string(),
+                    ],
+                )
+                .map_err(sql_error("initialize Candidate Review"))?;
         }
         refresh_candidate_build_status(&transaction, build_id)?;
         let view = require_candidate_build_view(&transaction, build_id)?;
@@ -1435,6 +1559,310 @@ impl TaskRuntime {
                 })
             })
             .transpose()
+    }
+
+    /// Lists one stable bounded page of Reviews owned by the locator's exact `ActiveTask`.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed locator, cursor, bound, parse, or storage failures.
+    pub fn list_candidate_reviews(
+        &self,
+        locator: &ExternalSessionLocator,
+        status: CandidateReviewStatus,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<CandidateReviewPage> {
+        locator.validate()?;
+        if limit == 0 || limit > MAX_CANDIDATE_REVIEW_LIST_LIMIT {
+            return Err(invalid(
+                "Candidate Review list limit is outside the safe bound",
+            ));
+        }
+        self.cleanup_expired_candidate_reviews()?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(sql_error("begin Candidate Review page"))?;
+        let task_session_id = find_active_task_by_locator(&transaction, locator)?
+            .ok_or_else(|| invalid("ExternalSession has no ActiveTask"))?;
+        let task = require_snapshot(&transaction, task_session_id)?;
+        let (cursor_created_at, cursor_candidate_id) = cursor
+            .map(parse_candidate_review_cursor)
+            .transpose()?
+            .map_or((0, None), |(created_at, candidate_id)| {
+                (created_at, Some(candidate_id))
+            });
+        let query_limit = i64::try_from(limit.saturating_add(1))
+            .map_err(|_| invalid("Candidate Review list limit exceeds SQLite range"))?;
+        let mut statement = transaction
+            .prepare(
+                "SELECT candidate_id, submission_id, episode_id, task_session_id, task_id,
+                        build_id, final_checkpoint_id, checkpoint_id, claim_id,
+                        review_version, status, discard_reason, created_at_unix_seconds,
+                        expires_at_unix_seconds, discarded_at_unix_seconds,
+                        expired_at_unix_seconds
+                 FROM candidate_review
+                 WHERE task_session_id = ?1 AND task_id = ?2 AND status = ?3
+                   AND (created_at_unix_seconds > ?4 OR
+                        (created_at_unix_seconds = ?4 AND candidate_id > ?5))
+                 ORDER BY created_at_unix_seconds ASC, candidate_id ASC
+                 LIMIT ?6",
+            )
+            .map_err(sql_error("prepare Candidate Review page"))?;
+        let cursor_candidate = cursor_candidate_id.map_or_else(String::new, |id| id.to_string());
+        let rows = statement
+            .query_map(
+                params![
+                    task.task_session_id.to_string(),
+                    task.task_id.to_string(),
+                    candidate_review_status_name(status),
+                    i64::try_from(cursor_created_at)
+                        .map_err(|_| invalid("Candidate Review cursor exceeds SQLite range"))?,
+                    cursor_candidate,
+                    query_limit,
+                ],
+                candidate_review_row,
+            )
+            .map_err(sql_error("query Candidate Review page"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error("read Candidate Review page"))?;
+        let mut records = rows
+            .into_iter()
+            .map(parse_candidate_review_record)
+            .collect::<Result<Vec<_>>>()?;
+        let has_more = records.len() > limit;
+        records.truncate(limit);
+        let next_cursor = if has_more {
+            records.last().map(candidate_review_cursor)
+        } else {
+            None
+        };
+        drop(statement);
+        transaction
+            .commit()
+            .map_err(sql_error("commit Candidate Review page"))?;
+        Ok(CandidateReviewPage {
+            records,
+            next_cursor,
+        })
+    }
+
+    /// Reads one complete Review identity only when it belongs to the locator's `ActiveTask`.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed locator, parse, or storage failures; absence and cross-Task identity are None.
+    pub fn read_candidate_review(
+        &self,
+        locator: &ExternalSessionLocator,
+        candidate_id: CandidateId,
+    ) -> Result<Option<CandidateReviewRecord>> {
+        locator.validate()?;
+        self.cleanup_expired_candidate_reviews()?;
+        let mut connection = self.open_connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(sql_error("begin Candidate Review read"))?;
+        let Some(task_session_id) = find_active_task_by_locator(&transaction, locator)? else {
+            return Ok(None);
+        };
+        let task = require_snapshot(&transaction, task_session_id)?;
+        let result = read_candidate_review_record(&transaction, candidate_id)?.map_or(
+            Ok(None),
+            |record| {
+                if record.source_episode.task_session_id == task.task_session_id
+                    && record.source_episode.task_id == task.task_id
+                {
+                    Ok(Some(record))
+                } else {
+                    Ok(None)
+                }
+            },
+        )?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit Candidate Review read"))?;
+        Ok(result)
+    }
+
+    /// Discards one Pending Review under exact `ActiveTask`, Intent and Review-version CAS.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed ownership, conflict, stale-version, lifecycle, validation, or storage errors.
+    pub fn discard_candidate_review(
+        &self,
+        request: &CandidateReviewDiscard,
+    ) -> Result<CandidateReviewDiscardOutcome> {
+        request.locator.validate()?;
+        let reason = request.reason.trim();
+        if reason.is_empty() || reason.len() > 512 || request.expected_review_version == 0 {
+            return Err(invalid(
+                "Candidate discard requires a non-empty bounded reason and positive review version",
+            ));
+        }
+        self.cleanup_expired_candidate_reviews()?;
+        let now = unix_seconds(SystemTime::now())?;
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Candidate Review discard")?;
+        let task_session_id = find_active_task_by_locator(&transaction, &request.locator)?
+            .ok_or_else(|| invalid("ExternalSession has no ActiveTask"))?;
+        let task = require_snapshot(&transaction, task_session_id)?;
+        if task.task_id != request.expected_task_id
+            || task
+                .current_intent_revision()
+                .is_none_or(|revision| revision.revision_id != request.expected_intent_revision_id)
+        {
+            return Err(Error::new(
+                ErrorKind::StaleState,
+                "Candidate discard Task/Intent ownership CAS is stale",
+            ));
+        }
+        let mut record = read_candidate_review_record(&transaction, request.candidate_id)?
+            .ok_or_else(|| invalid("Candidate Review does not exist for the ActiveTask"))?;
+        if record.source_episode.task_session_id != task.task_session_id
+            || record.source_episode.task_id != task.task_id
+        {
+            return Err(invalid(
+                "Candidate Review does not belong to the ExternalSession ActiveTask",
+            ));
+        }
+        match record.status {
+            CandidateReviewStatus::Discarded => {
+                if record.discard_reason.as_deref() != Some(reason) {
+                    return Err(Error::new(
+                        ErrorKind::Conflict,
+                        "Candidate Review was already discarded with a different reason",
+                    ));
+                }
+                transaction
+                    .commit()
+                    .map_err(sql_error("commit idempotent Candidate Review discard"))?;
+                return Ok(CandidateReviewDiscardOutcome {
+                    record,
+                    status: CandidateReviewDiscardStatus::AlreadyDiscarded,
+                });
+            }
+            CandidateReviewStatus::Expired => {
+                return Err(Error::new(
+                    ErrorKind::Conflict,
+                    "Expired Candidate Review cannot be discarded",
+                ));
+            }
+            CandidateReviewStatus::Confirmed => {
+                return Err(Error::new(
+                    ErrorKind::Conflict,
+                    "Confirmed Candidate Review cannot be discarded",
+                ));
+            }
+            CandidateReviewStatus::Pending => {}
+        }
+        if record.review_version != request.expected_review_version {
+            return Err(Error::new(
+                ErrorKind::StaleState,
+                "Candidate Review version is stale",
+            ));
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE candidate_review
+                 SET status = 'discarded', review_version = review_version + 1,
+                     discard_reason = ?1, discarded_at_unix_seconds = ?2
+                 WHERE candidate_id = ?3 AND review_version = ?4 AND status = 'pending'",
+                params![
+                    reason,
+                    i64::try_from(now)
+                        .map_err(|_| invalid("Candidate discard timestamp exceeds SQLite range"))?,
+                    request.candidate_id.to_string(),
+                    i64::try_from(request.expected_review_version)
+                        .map_err(|_| invalid("Candidate Review version exceeds SQLite range"))?,
+                ],
+            )
+            .map_err(sql_error("discard Candidate Review"))?;
+        if changed != 1 {
+            return Err(Error::new(
+                ErrorKind::StaleState,
+                "Candidate Review changed during discard",
+            ));
+        }
+        record = read_candidate_review_record(&transaction, request.candidate_id)?
+            .ok_or_else(|| invariant("discarded Candidate Review disappeared"))?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit Candidate Review discard"))?;
+        Ok(CandidateReviewDiscardOutcome {
+            record,
+            status: CandidateReviewDiscardStatus::Discarded,
+        })
+    }
+
+    /// Expires retained Pending/Discarded Reviews and removes only heavy Runtime analysis.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed clock, parse, or storage failures. Git is never opened or modified.
+    pub fn cleanup_expired_candidate_reviews(&self) -> Result<CandidateReviewCleanup> {
+        self.cleanup_expired_candidate_reviews_at(unix_seconds(SystemTime::now())?)
+    }
+
+    /// Deterministic cleanup boundary used by tests and maintenance orchestration.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed parse or storage failures. Expired tombstones are retained permanently.
+    pub fn cleanup_expired_candidate_reviews_at(
+        &self,
+        now_unix_seconds: u64,
+    ) -> Result<CandidateReviewCleanup> {
+        let now = i64::try_from(now_unix_seconds)
+            .map_err(|_| invalid("Candidate Review cleanup time exceeds SQLite range"))?;
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Candidate Review cleanup")?;
+        let mut statement = transaction
+            .prepare(
+                "SELECT candidate_id FROM candidate_review
+                 WHERE status IN ('pending', 'discarded')
+                   AND expires_at_unix_seconds <= ?1
+                 ORDER BY candidate_id ASC",
+            )
+            .map_err(sql_error("prepare expired Candidate Reviews"))?;
+        let candidate_ids = statement
+            .query_map([now], |row| row.get::<_, String>(0))
+            .map_err(sql_error("query expired Candidate Reviews"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error("read expired Candidate Reviews"))?
+            .into_iter()
+            .map(|value| parse_id::<CandidateId>(&value, "candidate_review.candidate_id"))
+            .collect::<Result<Vec<_>>>()?;
+        drop(statement);
+        let mut removed_analysis_count = 0_usize;
+        for candidate_id in &candidate_ids {
+            removed_analysis_count = removed_analysis_count.saturating_add(
+                transaction
+                    .execute(
+                        "DELETE FROM candidate_analysis WHERE candidate_id = ?1",
+                        [candidate_id.to_string()],
+                    )
+                    .map_err(sql_error("delete expired Candidate analysis"))?,
+            );
+            transaction
+                .execute(
+                    "UPDATE candidate_review
+                     SET status = 'expired', review_version = review_version + 1,
+                         expired_at_unix_seconds = ?1
+                     WHERE candidate_id = ?2 AND status IN ('pending', 'discarded')",
+                    params![now, candidate_id.to_string()],
+                )
+                .map_err(sql_error("expire Candidate Review"))?;
+        }
+        transaction
+            .commit()
+            .map_err(sql_error("commit Candidate Review cleanup"))?;
+        Ok(CandidateReviewCleanup {
+            expired_candidate_ids: candidate_ids,
+            removed_analysis_count,
+        })
     }
 
     /// Reads any retained Task by `TaskSessionId`.
@@ -1759,6 +2187,51 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 candidate_json TEXT NOT NULL CHECK (json_valid(candidate_json)),
                 FOREIGN KEY (episode_id) REFERENCES work_episode (episode_id)
             ) STRICT;
+            CREATE TABLE IF NOT EXISTS candidate_review (
+                candidate_id TEXT PRIMARY KEY,
+                submission_id TEXT NOT NULL UNIQUE,
+                episode_id TEXT NOT NULL,
+                task_session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                build_id TEXT NOT NULL,
+                final_checkpoint_id TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                claim_id TEXT NOT NULL,
+                review_version INTEGER NOT NULL CHECK (review_version > 0),
+                status TEXT NOT NULL CHECK (
+                    status IN ('pending', 'discarded', 'expired', 'confirmed')
+                ),
+                discard_reason TEXT,
+                created_at_unix_seconds INTEGER NOT NULL CHECK (created_at_unix_seconds >= 0),
+                expires_at_unix_seconds INTEGER NOT NULL CHECK (
+                    expires_at_unix_seconds > created_at_unix_seconds
+                ),
+                discarded_at_unix_seconds INTEGER,
+                expired_at_unix_seconds INTEGER,
+                UNIQUE (build_id, claim_id),
+                CHECK (
+                    (status IN ('pending', 'confirmed') AND discard_reason IS NULL
+                        AND discarded_at_unix_seconds IS NULL
+                        AND expired_at_unix_seconds IS NULL) OR
+                    (status = 'discarded' AND discard_reason IS NOT NULL
+                        AND length(trim(discard_reason)) > 0
+                        AND discarded_at_unix_seconds IS NOT NULL
+                        AND expired_at_unix_seconds IS NULL) OR
+                    (status = 'expired' AND expired_at_unix_seconds IS NOT NULL)
+                ),
+                FOREIGN KEY (episode_id, task_session_id, task_id)
+                    REFERENCES work_episode (episode_id, task_session_id, task_id),
+                FOREIGN KEY (build_id, claim_id)
+                    REFERENCES candidate_build_item (build_id, claim_id),
+                FOREIGN KEY (final_checkpoint_id, episode_id)
+                    REFERENCES agent_checkpoint (checkpoint_id, episode_id),
+                FOREIGN KEY (checkpoint_id, episode_id)
+                    REFERENCES agent_checkpoint (checkpoint_id, episode_id)
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS candidate_review_owner_status_order
+                ON candidate_review (
+                    task_session_id, task_id, status, created_at_unix_seconds, candidate_id
+                );
             CREATE TABLE IF NOT EXISTS work_episode_diagnostic (
                 episode_id TEXT NOT NULL,
                 diagnostic_ordinal INTEGER NOT NULL CHECK (diagnostic_ordinal >= 0),
@@ -1771,7 +2244,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 UNIQUE (episode_id, capture_id, kind),
                 FOREIGN KEY (episode_id) REFERENCES work_episode (episode_id)
             ) STRICT;
-            PRAGMA user_version = 8;",
+            PRAGMA user_version = 9;",
         )
         .map_err(sql_error("initialize task runtime schema"))
 }
@@ -2434,6 +2907,155 @@ const fn candidate_analysis_status_name(
         sctx_domain::CandidateAnalysisStatus::Complete => "complete",
         sctx_domain::CandidateAnalysisStatus::Failed => "failed",
     }
+}
+
+type CandidateReviewRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    i64,
+    i64,
+    Option<i64>,
+    Option<i64>,
+);
+
+fn candidate_review_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CandidateReviewRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+        row.get(14)?,
+        row.get(15)?,
+    ))
+}
+
+fn parse_candidate_review_record(row: CandidateReviewRow) -> Result<CandidateReviewRecord> {
+    Ok(CandidateReviewRecord {
+        candidate_id: parse_id(&row.0, "candidate_review.candidate_id")?,
+        submission_id: parse_id(&row.1, "candidate_review.submission_id")?,
+        source_episode: WorkEpisodeRef {
+            episode_id: parse_id(&row.2, "candidate_review.episode_id")?,
+            task_session_id: parse_id(&row.3, "candidate_review.task_session_id")?,
+            task_id: parse_id(&row.4, "candidate_review.task_id")?,
+        },
+        build_id: parse_id(&row.5, "candidate_review.build_id")?,
+        final_checkpoint_id: parse_id(&row.6, "candidate_review.final_checkpoint_id")?,
+        checkpoint_id: parse_id(&row.7, "candidate_review.checkpoint_id")?,
+        claim_id: parse_id(&row.8, "candidate_review.claim_id")?,
+        review_version: nonnegative_u64(row.9, "candidate_review.review_version")?,
+        status: parse_candidate_review_status(&row.10)?,
+        discard_reason: row.11,
+        created_at_unix_seconds: nonnegative_u64(
+            row.12,
+            "candidate_review.created_at_unix_seconds",
+        )?,
+        expires_at_unix_seconds: nonnegative_u64(
+            row.13,
+            "candidate_review.expires_at_unix_seconds",
+        )?,
+        discarded_at_unix_seconds: row
+            .14
+            .map(|value| nonnegative_u64(value, "candidate_review.discarded_at_unix_seconds"))
+            .transpose()?,
+        expired_at_unix_seconds: row
+            .15
+            .map(|value| nonnegative_u64(value, "candidate_review.expired_at_unix_seconds"))
+            .transpose()?,
+    })
+}
+
+fn read_candidate_review_record(
+    connection: &Connection,
+    candidate_id: CandidateId,
+) -> Result<Option<CandidateReviewRecord>> {
+    connection
+        .query_row(
+            "SELECT candidate_id, submission_id, episode_id, task_session_id, task_id,
+                    build_id, final_checkpoint_id, checkpoint_id, claim_id,
+                    review_version, status, discard_reason, created_at_unix_seconds,
+                    expires_at_unix_seconds, discarded_at_unix_seconds,
+                    expired_at_unix_seconds
+             FROM candidate_review WHERE candidate_id = ?1",
+            [candidate_id.to_string()],
+            candidate_review_row,
+        )
+        .optional()
+        .map_err(sql_error("read Candidate Review"))?
+        .map(parse_candidate_review_record)
+        .transpose()
+}
+
+const fn candidate_review_status_name(status: CandidateReviewStatus) -> &'static str {
+    match status {
+        CandidateReviewStatus::Pending => "pending",
+        CandidateReviewStatus::Discarded => "discarded",
+        CandidateReviewStatus::Expired => "expired",
+        CandidateReviewStatus::Confirmed => "confirmed",
+    }
+}
+
+fn parse_candidate_review_status(value: &str) -> Result<CandidateReviewStatus> {
+    match value {
+        "pending" => Ok(CandidateReviewStatus::Pending),
+        "discarded" => Ok(CandidateReviewStatus::Discarded),
+        "expired" => Ok(CandidateReviewStatus::Expired),
+        "confirmed" => Ok(CandidateReviewStatus::Confirmed),
+        _ => Err(invariant("persisted Candidate Review status is invalid")),
+    }
+}
+
+fn candidate_review_cursor(record: &CandidateReviewRecord) -> String {
+    format!(
+        "crv1:{:020}:{}",
+        record.created_at_unix_seconds, record.candidate_id
+    )
+}
+
+fn parse_candidate_review_cursor(value: &str) -> Result<(u64, CandidateId)> {
+    let mut parts = value.splitn(3, ':');
+    let (Some(version), Some(created_at), Some(candidate_id)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return Err(invalid("Candidate Review cursor is malformed"));
+    };
+    if version != "crv1" || created_at.len() != 20 {
+        return Err(invalid("Candidate Review cursor is malformed"));
+    }
+    let created_at = created_at
+        .parse::<u64>()
+        .map_err(|_| invalid("Candidate Review cursor timestamp is invalid"))?;
+    let candidate_id = parse_id(candidate_id, "Candidate Review cursor CandidateId")?;
+    Ok((created_at, candidate_id))
+}
+
+fn nonnegative_u64(value: i64, field: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| invariant(format!("{field} is negative")))
+}
+
+fn unix_seconds(time: SystemTime) -> Result<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| invalid("Candidate Review timestamp is before the Unix epoch"))
 }
 
 fn next_episode_ordinal(

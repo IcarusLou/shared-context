@@ -215,7 +215,7 @@ fn candidate_create_is_the_unassigned_main_path_and_never_auto_injects() {
 
     let help = Command::new(binary).arg("--help").output().unwrap();
     let help = String::from_utf8(help.stdout).unwrap();
-    assert!(help.contains("candidate create"));
+    assert!(help.contains("candidate list|get|discard|create"));
     let removed_command = ["workspace", "bind"].join(" ");
     assert!(!help.to_ascii_lowercase().contains(&removed_command));
 }

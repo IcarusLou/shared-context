@@ -1271,6 +1271,158 @@ pub enum AutomaticCandidateStatus {
     ReadyForReview,
 }
 
+/// Human review lifecycle for one finalized automatic Candidate.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateReviewStatus {
+    Pending,
+    Discarded,
+    Expired,
+    Confirmed,
+}
+
+/// Safe reason why a Candidate Review is visible but not ready for a decision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CandidateReviewDiagnostic {
+    AnalysisPending,
+    AnalysisFailed { error_code: String },
+    ReviewExpired,
+}
+
+/// Complete, task-scoped and explicitly untrusted Candidate Review payload.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateReviewView {
+    pub candidate_id: CandidateId,
+    pub submission_id: SubmissionId,
+    pub source_episode: WorkEpisodeRef,
+    pub build_id: CandidateBuildId,
+    pub final_checkpoint_id: AgentCheckpointId,
+    pub checkpoint_id: AgentCheckpointId,
+    pub claim_id: CheckpointClaimId,
+    pub content: ContextRevisionDraft,
+    pub analysis: CandidateAnalysis,
+    pub space_recommendations: Vec<CandidateSpaceRecommendation>,
+    pub confidence: CandidateConfidence,
+    pub unknowns: Vec<CaptureUnknown>,
+    pub candidate_status: AutomaticCandidateStatus,
+    pub review_status: CandidateReviewStatus,
+    pub review_version: u64,
+    pub analysis_generation: Option<u64>,
+    pub created_at_unix_seconds: u64,
+    pub expires_at_unix_seconds: u64,
+    pub discarded_at_unix_seconds: Option<u64>,
+    pub expired_at_unix_seconds: Option<u64>,
+    pub discard_reason: Option<String>,
+    pub ready_for_review: bool,
+    pub diagnostics: Vec<CandidateReviewDiagnostic>,
+    pub untrusted_data: bool,
+}
+
+impl CandidateReviewView {
+    /// Validates the complete Review representation and its lifecycle/readiness markers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input error for invalid Candidate content, analysis, lifecycle audit, or a
+    /// Review that could be mistaken for trusted or ready data.
+    pub fn validate(&self) -> Result<()> {
+        self.content.validate()?;
+        self.analysis.validate()?;
+        validate_recommendations(&self.space_recommendations)?;
+        self.confidence.validate("candidate_review.confidence")?;
+        require_unique(&self.unknowns, "candidate_review.unknowns")?;
+        for unknown in &self.unknowns {
+            unknown.validate("candidate_review.unknown")?;
+        }
+        if self.review_version == 0
+            || self.expires_at_unix_seconds <= self.created_at_unix_seconds
+            || !self.untrusted_data
+        {
+            return Err(invalid(
+                "Candidate Review requires a positive version, bounded retention, and untrusted marker",
+            ));
+        }
+        match self.review_status {
+            CandidateReviewStatus::Pending | CandidateReviewStatus::Confirmed => {
+                if self.discard_reason.is_some()
+                    || self.discarded_at_unix_seconds.is_some()
+                    || self.expired_at_unix_seconds.is_some()
+                {
+                    return Err(invalid(
+                        "Pending/Confirmed Candidate Review cannot contain terminal audit fields",
+                    ));
+                }
+            }
+            CandidateReviewStatus::Discarded => {
+                if self.discard_reason.as_deref().is_none_or(str::is_empty)
+                    || self.discarded_at_unix_seconds.is_none()
+                    || self.expired_at_unix_seconds.is_some()
+                {
+                    return Err(invalid(
+                        "Discarded Candidate Review requires only discard audit fields",
+                    ));
+                }
+            }
+            CandidateReviewStatus::Expired => {
+                if self.expired_at_unix_seconds.is_none() {
+                    return Err(invalid(
+                        "Expired Candidate Review requires an expiration timestamp",
+                    ));
+                }
+            }
+        }
+        let analysis_ready = self.analysis.status == CandidateAnalysisStatus::Complete;
+        let candidate_ready = matches!(
+            self.candidate_status,
+            AutomaticCandidateStatus::NeedsSpaceReview
+                | AutomaticCandidateStatus::ExactDuplicateReview
+                | AutomaticCandidateStatus::PotentialContradictionReview
+                | AutomaticCandidateStatus::ReadyForReview
+        );
+        let expected_ready = self.review_status == CandidateReviewStatus::Pending
+            && analysis_ready
+            && candidate_ready;
+        if self.ready_for_review != expected_ready {
+            return Err(invalid(
+                "Candidate Review readiness does not match analysis and lifecycle state",
+            ));
+        }
+        let expected_diagnostics = match self.review_status {
+            CandidateReviewStatus::Expired => vec![CandidateReviewDiagnostic::ReviewExpired],
+            _ => match self.analysis.status {
+                CandidateAnalysisStatus::Pending => {
+                    vec![CandidateReviewDiagnostic::AnalysisPending]
+                }
+                CandidateAnalysisStatus::Failed => {
+                    vec![CandidateReviewDiagnostic::AnalysisFailed {
+                        error_code: self.analysis.error_code.clone().unwrap_or_default(),
+                    }]
+                }
+                CandidateAnalysisStatus::Complete => Vec::new(),
+            },
+        };
+        if self.diagnostics != expected_diagnostics {
+            return Err(invalid(
+                "Candidate Review diagnostics do not match analysis/lifecycle state",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Complete list representation. List budgeting omits whole Summaries and never truncates them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CandidateReviewSummary(pub CandidateReviewView);
+
+impl From<CandidateReviewView> for CandidateReviewSummary {
+    fn from(review: CandidateReviewView) -> Self {
+        Self(review)
+    }
+}
+
 /// Builder-produced unowned Candidate with verifiable Episode provenance.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

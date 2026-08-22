@@ -9,16 +9,17 @@ use sctx_domain::{
     Applicability, AutomaticCandidateStatus, AutomaticContextCandidate, CandidateAnalysis,
     CandidateAnalysisStatus, CandidateAssessmentPath, CandidateAssessmentRelation,
     CandidateBuilderProvenance, CandidateConfidence, CandidateId, CandidateRelationAssessment,
-    CaptureEvidenceRef, CaptureId, CaptureUnknown, ContextCandidate, ContextKind,
-    ContextRevisionDraft, ErrorKind, EventId, EvidenceSnapshotDraft, EvidenceType,
+    CandidateReviewStatus, CaptureEvidenceRef, CaptureId, CaptureUnknown, ContextCandidate,
+    ContextKind, ContextRevisionDraft, ErrorKind, EventId, EvidenceSnapshotDraft, EvidenceType,
     ExternalSessionLocator, NormalizedBreadcrumbKind, NormalizedWorkObservation, TaskId,
     TaskIntent, TaskIntentDraft, TaskSignal, TaskSignalKind, TestOutcomeStatus, WorkEpisodeStatus,
     WorkSourceRef,
 };
 use sctx_task_runtime::{
     AgentCheckpointWrite, CandidateBuildItemPreparation, CandidateBuildItemStatus,
-    CandidateBuildStatus, CaptureIngestion, CheckpointBoundary, CheckpointClaimDraft, TaskRuntime,
-    WorkEpisodeDiagnosticKind,
+    CandidateBuildStatus, CandidateReviewDiscard, CandidateReviewDiscardStatus, CaptureIngestion,
+    CheckpointBoundary, CheckpointClaimDraft, DEFAULT_CANDIDATE_REVIEW_TTL,
+    MAX_CANDIDATE_REVIEW_TTL, TaskRuntime, WorkEpisodeDiagnosticKind,
 };
 use tempfile::TempDir;
 
@@ -146,6 +147,59 @@ fn checkpoint_write(
         claims,
         unknowns,
     }
+}
+
+fn finalize_review(
+    runtime: &TaskRuntime,
+    locator: &ExternalSessionLocator,
+    task: &sctx_domain::TaskSessionSnapshot,
+    statement: &str,
+) -> sctx_task_runtime::CandidateReviewRecord {
+    runtime
+        .open_work_episode(
+            locator,
+            task.task_id,
+            task.current_intent_revision().unwrap().revision_id,
+        )
+        .unwrap();
+    let closed = runtime
+        .write_agent_checkpoint(&checkpoint_write(
+            locator,
+            task,
+            0,
+            CheckpointBoundary::Close,
+            vec![checkpoint_claim(statement)],
+            Vec::new(),
+        ))
+        .unwrap();
+    let build = runtime
+        .prepare_candidate_build(
+            closed.episode.episode.episode_id,
+            &[CandidateBuildItemPreparation {
+                checkpoint_id: closed.checkpoint.checkpoint_id,
+                claim_id: closed.checkpoint.claims[0].claim_id,
+                content_hash: Some(format!("sha256:{statement}")),
+                status: CandidateBuildItemStatus::Prepared,
+                error_code: None,
+            }],
+        )
+        .unwrap();
+    let item = &build.items[0];
+    let candidate_id = CandidateId::new();
+    runtime
+        .record_candidate_build_item_result(
+            build.build_id,
+            item.submission_id,
+            CandidateBuildItemStatus::Created,
+            Some(candidate_id),
+            Some(EventId::new()),
+            None,
+        )
+        .unwrap();
+    runtime
+        .read_candidate_review(locator, candidate_id)
+        .unwrap()
+        .unwrap()
 }
 
 #[test]
@@ -403,6 +457,60 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
             )
             .is_err()
     );
+    let second_candidate_id = CandidateId::new();
+    runtime
+        .record_candidate_build_item_result(
+            promoted.build_id,
+            promoted.items[1].submission_id,
+            CandidateBuildItemStatus::Created,
+            Some(second_candidate_id),
+            Some(EventId::new()),
+            None,
+        )
+        .unwrap();
+    let first_page = runtime
+        .list_candidate_reviews(&locator, CandidateReviewStatus::Pending, 1, None)
+        .unwrap();
+    assert_eq!(first_page.records.len(), 1);
+    assert!(first_page.next_cursor.is_some());
+    let second_page = runtime
+        .list_candidate_reviews(
+            &locator,
+            CandidateReviewStatus::Pending,
+            1,
+            first_page.next_cursor.as_deref(),
+        )
+        .unwrap();
+    assert_eq!(second_page.records.len(), 1);
+    assert_ne!(
+        first_page.records[0].candidate_id,
+        second_page.records[0].candidate_id
+    );
+    assert!(second_page.next_cursor.is_none());
+    assert!(
+        runtime
+            .list_candidate_reviews(
+                &locator,
+                CandidateReviewStatus::Pending,
+                1,
+                Some("not-a-review-cursor"),
+            )
+            .is_err()
+    );
+    let review = runtime
+        .read_candidate_review(&locator, candidate_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(review.build_id, promoted.build_id);
+    assert_eq!(review.checkpoint_id, first.checkpoint_id);
+    assert_eq!(review.claim_id, first.claim_id);
+    assert_eq!(review.review_version, 1);
+    assert_eq!(review.status, CandidateReviewStatus::Pending);
+    assert_eq!(
+        review.expires_at_unix_seconds - review.created_at_unix_seconds,
+        DEFAULT_CANDIDATE_REVIEW_TTL.as_secs()
+    );
+    assert!(DEFAULT_CANDIDATE_REVIEW_TTL <= MAX_CANDIDATE_REVIEW_TTL);
 
     let persisted = ContextCandidate {
         candidate_id,
@@ -505,6 +613,116 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
     );
     let recomputed = runtime.replace_candidate_analysis(&automatic).unwrap();
     assert_eq!(recomputed.analysis_generation, 1);
+
+    let discarded = runtime
+        .discard_candidate_review(&CandidateReviewDiscard {
+            locator: locator.clone(),
+            expected_task_id: task.task_id,
+            expected_intent_revision_id: task.current_intent_revision().unwrap().revision_id,
+            candidate_id,
+            expected_review_version: 1,
+            reason: "not useful for durable knowledge".to_owned(),
+        })
+        .unwrap();
+    assert_eq!(discarded.status, CandidateReviewDiscardStatus::Discarded);
+    assert_eq!(discarded.record.review_version, 2);
+    let idempotent = runtime
+        .discard_candidate_review(&CandidateReviewDiscard {
+            locator: locator.clone(),
+            expected_task_id: task.task_id,
+            expected_intent_revision_id: task.current_intent_revision().unwrap().revision_id,
+            candidate_id,
+            expected_review_version: 1,
+            reason: "not useful for durable knowledge".to_owned(),
+        })
+        .unwrap();
+    assert_eq!(
+        idempotent.status,
+        CandidateReviewDiscardStatus::AlreadyDiscarded
+    );
+    assert_eq!(
+        runtime
+            .discard_candidate_review(&CandidateReviewDiscard {
+                locator: locator.clone(),
+                expected_task_id: task.task_id,
+                expected_intent_revision_id: task.current_intent_revision().unwrap().revision_id,
+                candidate_id,
+                expected_review_version: 1,
+                reason: "different retry meaning".to_owned(),
+            })
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Conflict
+    );
+    assert!(
+        runtime
+            .list_candidate_reviews(&locator, CandidateReviewStatus::Pending, 10, None)
+            .unwrap()
+            .records
+            .iter()
+            .all(|record| record.candidate_id != candidate_id)
+    );
+    assert_eq!(
+        runtime
+            .list_candidate_reviews(&locator, CandidateReviewStatus::Discarded, 10, None)
+            .unwrap()
+            .records[0]
+            .candidate_id,
+        candidate_id
+    );
+    let cleanup = runtime
+        .cleanup_expired_candidate_reviews_at(review.expires_at_unix_seconds + 1)
+        .unwrap();
+    assert!(cleanup.expired_candidate_ids.contains(&candidate_id));
+    assert!(
+        runtime
+            .read_candidate_analysis(candidate_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        runtime
+            .read_candidate_review(&locator, candidate_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        CandidateReviewStatus::Expired
+    );
+    assert!(
+        runtime
+            .list_candidate_reviews(&locator, CandidateReviewStatus::Pending, 10, None)
+            .unwrap()
+            .records
+            .iter()
+            .all(|record| record.candidate_id != candidate_id)
+    );
+    assert!(
+        runtime
+            .list_candidate_reviews(&locator, CandidateReviewStatus::Expired, 10, None)
+            .unwrap()
+            .records
+            .iter()
+            .any(|record| record.candidate_id == candidate_id)
+    );
+    runtime
+        .record_candidate_build_item_result(
+            promoted.build_id,
+            first.submission_id,
+            CandidateBuildItemStatus::AlreadyExists,
+            Some(candidate_id),
+            Some(event_id),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        runtime
+            .read_candidate_review(&locator, candidate_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        CandidateReviewStatus::Expired,
+        "Builder retry must not resurrect an Expired Review tombstone"
+    );
 }
 
 #[test]
@@ -558,6 +776,122 @@ fn same_workspace_sessions_have_isolated_episodes_and_concurrent_open_converges(
             .unwrap()
             .len(),
         1
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn candidate_reviews_isolate_sessions_episodes_stale_and_reserved_confirmed_state() {
+    let temporary = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(temporary.path()).unwrap();
+    let (first_locator, first) = open_task(&runtime, "review-a", "first review task");
+    let (second_locator, second) = open_task(&runtime, "review-b", "second review task");
+    let first_review = finalize_review(&runtime, &first_locator, &first, "first Episode Candidate");
+    let later_review = finalize_review(&runtime, &first_locator, &first, "later Episode Candidate");
+    let other_review = finalize_review(
+        &runtime,
+        &second_locator,
+        &second,
+        "other Session Candidate",
+    );
+
+    let first_records = runtime
+        .list_candidate_reviews(&first_locator, CandidateReviewStatus::Pending, 10, None)
+        .unwrap()
+        .records;
+    assert_eq!(first_records.len(), 2);
+    assert!(
+        first_records
+            .iter()
+            .any(|record| record.candidate_id == first_review.candidate_id)
+    );
+    assert!(
+        first_records
+            .iter()
+            .any(|record| record.candidate_id == later_review.candidate_id)
+    );
+    assert_ne!(
+        first_review.source_episode.episode_id,
+        later_review.source_episode.episode_id
+    );
+    let second_records = runtime
+        .list_candidate_reviews(&second_locator, CandidateReviewStatus::Pending, 10, None)
+        .unwrap()
+        .records;
+    assert_eq!(second_records.len(), 1);
+    assert_eq!(second_records[0].candidate_id, other_review.candidate_id);
+    assert!(
+        runtime
+            .read_candidate_review(&second_locator, first_review.candidate_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        runtime
+            .discard_candidate_review(&CandidateReviewDiscard {
+                locator: first_locator.clone(),
+                expected_task_id: first.task_id,
+                expected_intent_revision_id: first.current_intent_revision().unwrap().revision_id,
+                candidate_id: first_review.candidate_id,
+                expected_review_version: 99,
+                reason: "stale attempt".to_owned(),
+            })
+            .unwrap_err()
+            .kind(),
+        ErrorKind::StaleState
+    );
+    assert_eq!(
+        runtime
+            .discard_candidate_review(&CandidateReviewDiscard {
+                locator: second_locator.clone(),
+                expected_task_id: second.task_id,
+                expected_intent_revision_id: second.current_intent_revision().unwrap().revision_id,
+                candidate_id: first_review.candidate_id,
+                expected_review_version: 1,
+                reason: "cross task attempt".to_owned(),
+            })
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidInput
+    );
+
+    Connection::open(runtime.database_path())
+        .unwrap()
+        .execute(
+            "UPDATE candidate_review SET status = 'confirmed' WHERE candidate_id = ?1",
+            [later_review.candidate_id.to_string()],
+        )
+        .unwrap();
+    assert_eq!(
+        runtime
+            .discard_candidate_review(&CandidateReviewDiscard {
+                locator: first_locator.clone(),
+                expected_task_id: first.task_id,
+                expected_intent_revision_id: first.current_intent_revision().unwrap().revision_id,
+                candidate_id: later_review.candidate_id,
+                expected_review_version: 1,
+                reason: "must not discard confirmed".to_owned(),
+            })
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Conflict
+    );
+    assert_eq!(
+        runtime
+            .list_candidate_reviews(&first_locator, CandidateReviewStatus::Confirmed, 10, None)
+            .unwrap()
+            .records[0]
+            .candidate_id,
+        later_review.candidate_id
+    );
+
+    fs::remove_file(runtime.database_path()).unwrap();
+    let reset = TaskRuntime::initialize(temporary.path()).unwrap();
+    assert!(
+        reset
+            .list_candidate_reviews(&first_locator, CandidateReviewStatus::Pending, 10, None)
+            .is_err(),
+        "runtime deletion must not rediscover Git-only Candidate identities"
     );
 }
 

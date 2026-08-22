@@ -108,6 +108,14 @@ _Avoid_: similarity label, authoritative ContextRelation
 A non-binding, path-explained assessment that an AutomaticContextCandidate may be Primary or Related to an existing ContextSpace, or that a complete system-suggested new Space Intent may be needed. Recommendations never create, select, or resolve a conflicted Space Intent.
 _Avoid_: Candidate ownership, Active Space, automatic Space creation
 
+**CandidateReview**:
+A Task-scoped, untrusted presentation of one finalized AutomaticContextCandidate, preserving its complete draft, provenance, analysis, recommendations, confidence, and unknowns for a human decision.
+_Avoid_: Context fact, Candidate approval, Git Candidate browser
+
+**CandidateReviewStatus**:
+The human disposition of a CandidateReview: Pending remains available for a decision, Discarded records an explicit decision not to retain it, Expired is a terminal local-retention tombstone, and Confirmed is reserved for a later knowledge-governance transition.
+_Avoid_: analysis status, readiness status, publication status
+
 **TaskSpaceAssociation**:
 A derived, explainable relevance between one Task and one ContextSpace. A Task may have no associations or multiple associations, and their ordering may change as new signals arrive.
 _Avoid_: Active Space, default Space

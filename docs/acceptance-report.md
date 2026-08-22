@@ -1,8 +1,8 @@
 # Task-first Retrieval Integration Acceptance Report
 
-Date: 2026-08-22
-Scope: Mew #112 through #159, including Mandatory Gates #114/#117, excluding deferred #163 and accepted boundary #150
-Implementation baseline before Candidate review analysis: `main@69628c4`
+Date: 2026-08-23
+Scope: Mew #112 through #160, including Mandatory Gates #114/#117, excluding deferred #162/#163 and accepted boundary #150
+Implementation baseline before Candidate Review lifecycle: `main@7a0e17d`
 
 ## Verdict
 
@@ -17,7 +17,7 @@ This report does **not** claim M4:
 | M1 — Task-first primitives and unassigned Candidate entry | IMPLEMENTED | Covered below |
 | M2 — Task Runtime and multi-Space retrieval | IMPLEMENTED | TaskSession persistence, strict `task_intent_update`, read-only `task_context`, association inference, typed RetrievalPaths, and TaskContextPack pass focused cross-crate/E2E oracles |
 | M3 — Engineering Graph | IMPLEMENTED | Reference-derived bounded ScanPlan, deterministic Artifact locators, sparse build-time Context/safety snapshots, historical exact retrieval, frozen 1–2 hop relations, diagnostics, fallback, rebuild equivalence, and budget bounds pass cross-crate/E2E oracles |
-| M4 — Low-tax Capture | FOUNDATION ONLY | #117 provides submission-idempotent Candidate admission; #156/#157/#158/#159 persist verifiable WorkEpisode/Capture, explicit AgentCheckpoint, deterministic Candidate Builder, and rebuildable Candidate review analysis/Space recommendation state; no automatic aggregation or confirmation workflow |
+| M4 — Low-tax Capture | FOUNDATION ONLY | #117 provides submission-idempotent Candidate admission; #156/#157/#158/#159/#160 persist verifiable WorkEpisode/Capture, explicit AgentCheckpoint, deterministic Candidate Builder, rebuildable analysis/Space recommendations, and Task-local Candidate Review list/get/discard; no automatic aggregation or confirmation workflow |
 
 `task_intent_update` is the only Task Intent write path. `task_context` accepts only an external Session locator and output bounds, and reads the already-authoritative ActiveTask without mutating Runtime. PromptSubmit supplies guidance rather than inferred Intent. Explicit `context_search.space_ids` remains available as a hard filter for diagnosis and exploration.
 
@@ -40,6 +40,10 @@ Mandatory Gates #114/#117 are implemented: stable `submission_id` and exact clos
 | Manual Candidate staging cannot bypass submission admission | PROVEN | Generic append rejects valid Candidate Events, while `validate_staged` explicitly rejects both known Candidate additions and identifiable malformed Candidate additions as requiring the Candidate submission service; unrelated parse errors remain strict rather than swallowed |
 | Candidate admission verifies source ownership before Git | PROVEN | MCP adversarial coverage rejects missing, open, cross-Task and stale-Intent Episode sources with zero Event writes |
 | Unconfirmed Candidate cannot enter automatic injection | PROVEN | Candidate projection is outside Context FTS; CLI/MCP candidate retrieval tests and Codex hook test return only Accepted eligible Context |
+| Review discovery is automatic-Candidate-only and Task-isolated | PROVEN | Runtime v9 initializes Review exactly when a Builder item finalizes; same-Workspace dual Sessions and multiple Episodes/Candidates remain isolated, while a real manual Git-only `candidate_create` never appears in list/get |
+| Candidate Review is complete, bounded, and untrusted | PROVEN | Cursor/Codex MCP and CLI list/get return whole draft/Evidence/provenance/analysis/Space recommendations with an untrusted marker; stable cursor, limit, token-budget omission and complete get pass adversarial tests |
+| Discard is explicit, audited, and idempotent | PROVEN | Task/Intent/Review CAS changes Pending to Discarded once; same-reason timeout retry returns already_discarded, different reason/stale/cross-Task/Confirmed/secret input fail typed, and default list hides discarded |
+| Expired Reviews cannot revive | PROVEN | TTL cleanup deletes heavy Runtime analysis, advances a terminal Expired tombstone, never touches Git, and a later Builder retry cannot recreate Pending; deleting runtime removes all unconfirmed Review discovery |
 | Existing confirmed Context fixtures use neutral revision terminology | PROVEN | Event constructor is `context_revision_added`; no Context-Propose API or constructor remains |
 | SessionStart emits capability guidance without knowledge retrieval | PROVEN | Shared lifecycle policy returns no Task Runtime operation; the CLI adversarial contract seeds two Spaces with Accepted eligible Context and proves startup emits neither item before a supported PromptSubmit retrieves only its task match |
 | Codex dynamic sessions are isolated and incorporate later non-locating outcomes | PROVEN | CLI adversarial contract runs two Codex sessions in one Git Workspace, proves pre-Prompt PostToolUse cannot create a Session, File observations remain Breadcrumb-only, and TestOutcome changes only the owning Task fingerprint without Graph semantics |
