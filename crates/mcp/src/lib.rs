@@ -16,12 +16,14 @@ use std::{
 };
 
 use sctx_domain::{
-    Applicability, ArtifactKey, ArtifactKind, ArtifactLocator, ContextId, ContextKind,
-    ContextRevisionDraft, EngineeringReferenceDraft, Error, ErrorKind, EvidenceSnapshotDraft,
-    EvidenceType, ExternalSessionLocator, ReferenceId, ReferenceRelation, RepoRelativePath,
-    RepositoryId, ResolutionStatus, ResolvedFocus, Result, RevisionId, SignalId, SpaceId, TaskId,
-    TaskIntentDraft, TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignalLifecycle,
-    TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId,
+    AgentCheckpointId, Applicability, ArtifactKey, ArtifactKind, ArtifactLocator, ArtifactRef,
+    CaptureEvidenceRef, CaptureUnknown, CheckpointClaimId, ContextId, ContextKind,
+    ContextRevisionDraft, ContextRevisionRef, EngineeringReferenceDraft, Error, ErrorKind,
+    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, ReferenceId, ReferenceRelation,
+    RepoRelativePath, RepositoryId, ResolutionStatus, ResolvedFocus, Result, RevisionId, SignalId,
+    SpaceId, TaskId, TaskIntentDraft, TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot,
+    TaskSignalLifecycle, TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId, WorkEpisodeStatus,
+    WorkObservationId,
 };
 use sctx_engineering_graph::{
     CandidateMatchEvidence, CatalogRepositorySpec, EngineeringProjectionStore,
@@ -33,13 +35,15 @@ use sctx_engineering_graph::{
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::{DomainSnapshot, ProjectionIndex};
-use sctx_local_state::{RepositoryCatalogSnapshot, UserConfigStore};
+use sctx_local_state::{PrivacyScanner, RepositoryCatalogSnapshot, UserConfigStore};
 use sctx_search::{
     ConflictView, ContextPackOmitted, ContextStatus, DEFAULT_TASK_MAX_SPACES, MAX_TASK_MAX_SPACES,
     MIN_TASK_CONTEXT_TOKEN_BUDGET, ScopeFilter, SearchEngine, SearchFilters, SearchRequest,
     TaskContextItem, TaskContextRequest, TaskGraphDiagnostic, TaskRetrievalPath,
 };
-use sctx_task_runtime::TaskRuntime;
+use sctx_task_runtime::{
+    AgentCheckpointWrite, CheckpointBoundary, CheckpointClaimDraft, TaskRuntime,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -102,6 +106,90 @@ pub struct TaskSignalSupersedeInput {
     pub task_id: String,
     pub expected_revision_id: String,
     pub signal_ids: Vec<String>,
+}
+
+/// Explicit Episode transition requested by one Agent-authored Checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCheckpointBoundary {
+    Continue,
+    Close,
+}
+
+impl From<TaskCheckpointBoundary> for CheckpointBoundary {
+    fn from(value: TaskCheckpointBoundary) -> Self {
+        match value {
+            TaskCheckpointBoundary::Continue => Self::Continue,
+            TaskCheckpointBoundary::Close => Self::Close,
+        }
+    }
+}
+
+/// Existing or self-contained Evidence supplied for one Checkpoint Claim.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TaskCheckpointEvidenceInput {
+    Observation {
+        observation_id: String,
+    },
+    TaskSignal {
+        signal_id: String,
+    },
+    ContextEvidence {
+        context_id: String,
+        revision_id: String,
+        evidence_id: String,
+    },
+    InlineValidation {
+        evidence: EvidenceSnapshotDraft,
+    },
+}
+
+/// Complete Claim draft without caller-owned Claim or Observation identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCheckpointClaimInput {
+    pub statement: String,
+    pub rationale: String,
+    pub applicability: Applicability,
+    pub assumptions: Vec<String>,
+    pub recheck_when: Vec<String>,
+    pub evidence: Vec<TaskCheckpointEvidenceInput>,
+    pub artifact_refs: Vec<ArtifactRef>,
+    pub related_contexts: Vec<ContextRevisionRef>,
+}
+
+/// Strict public Agent Checkpoint request guarded by Task, Intent and Episode CAS.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCheckpointInput {
+    pub agent_kind: String,
+    pub external_session_id: String,
+    pub expected_task_id: String,
+    pub expected_intent_revision_id: String,
+    pub expected_episode_version: u64,
+    pub boundary: TaskCheckpointBoundary,
+    pub claims: Vec<TaskCheckpointClaimInput>,
+    pub unknowns: Vec<CaptureUnknown>,
+}
+
+/// Safe, typed Checkpoint diagnostic without Agent-authored source text.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TaskCheckpointDiagnostic {
+    InlineValidationRecorded { observation_id: WorkObservationId },
+}
+
+/// Server-owned Checkpoint and resulting Episode boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskCheckpointResponse {
+    pub checkpoint_id: AgentCheckpointId,
+    pub claim_ids: Vec<CheckpointClaimId>,
+    pub episode_id: WorkEpisodeId,
+    pub episode_version: u64,
+    pub episode_status: WorkEpisodeStatus,
+    pub created: bool,
+    pub diagnostics: Vec<TaskCheckpointDiagnostic>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -610,7 +698,7 @@ impl Runtime {
         let store = GitStore::initialize(root)?;
         let index = ProjectionIndex::for_store(&store);
         let repositories = RepositoryRegistry::initialize(root)?;
-        let catalog = UserConfigStore::initialize(root)?.repository_catalog()?;
+        let catalog = UserConfigStore::open_existing(root)?.repository_catalog_wait()?;
         sync_repository_catalog_snapshot(&repositories, &catalog)?;
         let engineering_graph = EngineeringProjectionStore::initialize(root).ok();
         let tasks = TaskRuntime::initialize(root)?;
@@ -787,6 +875,127 @@ impl Runtime {
             intent_revision_id: revision_id,
             superseded_signal_ids: outcome.superseded_signal_ids,
             active_signals: active_signal_records(&self.tasks, active.task_session_id)?,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn task_checkpoint(&self, input: &TaskCheckpointInput) -> Result<TaskCheckpointResponse> {
+        let input_json = serde_json::to_string(input).map_err(|error| {
+            invalid(format!(
+                "serialize task_checkpoint privacy boundary: {error}"
+            ))
+        })?;
+        let privacy = PrivacyScanner::default().scan(&input_json)?;
+        if !privacy.is_clean() {
+            return Err(Error::new(
+                ErrorKind::PrivacyRejected,
+                format!(
+                    "task_checkpoint rejected Secret/PII categories: {}",
+                    privacy.diagnostic_codes().join(",")
+                ),
+            ));
+        }
+        let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
+        let expected_task_id = parse_id_value(&input.expected_task_id, "expected_task_id")?;
+        let expected_intent_revision_id = parse_id_value(
+            &input.expected_intent_revision_id,
+            "expected_intent_revision_id",
+        )?;
+        let snapshot = self.snapshot()?;
+        let mut claims = Vec::with_capacity(input.claims.len());
+        for claim in &input.claims {
+            let mut evidence_refs = Vec::new();
+            let mut inline_validations = Vec::new();
+            for evidence in &claim.evidence {
+                match evidence {
+                    TaskCheckpointEvidenceInput::Observation { observation_id } => {
+                        evidence_refs.push(CaptureEvidenceRef::Observation {
+                            observation_id: parse_id_value(observation_id, "observation_id")?,
+                        });
+                    }
+                    TaskCheckpointEvidenceInput::TaskSignal { signal_id } => {
+                        evidence_refs.push(CaptureEvidenceRef::TaskSignal {
+                            signal_id: parse_id_value(signal_id, "signal_id")?,
+                        });
+                    }
+                    TaskCheckpointEvidenceInput::ContextEvidence {
+                        context_id,
+                        revision_id,
+                        evidence_id,
+                    } => {
+                        let reference = CaptureEvidenceRef::ContextEvidence {
+                            context_id: parse_id_value(context_id, "context_id")?,
+                            revision_id: parse_id_value(revision_id, "revision_id")?,
+                            evidence_id: parse_id_value(evidence_id, "evidence_id")?,
+                        };
+                        validate_context_evidence_ref(&snapshot, &reference)?;
+                        evidence_refs.push(reference);
+                    }
+                    TaskCheckpointEvidenceInput::InlineValidation { evidence } => {
+                        evidence.validate("task_checkpoint.inline_validation")?;
+                        inline_validations.push(evidence.clone());
+                    }
+                }
+            }
+            for artifact in &claim.artifact_refs {
+                artifact.locator.validate()?;
+                if !self
+                    .catalog
+                    .repositories
+                    .iter()
+                    .any(|entry| entry.repository_id == artifact.repository_id)
+                {
+                    return Err(invalid(format!(
+                        "Checkpoint Artifact Repository does not exist: {}",
+                        artifact.repository_id
+                    )));
+                }
+            }
+            for context in &claim.related_contexts {
+                validate_context_revision_ref(&snapshot, *context)?;
+            }
+            claims.push(CheckpointClaimDraft {
+                statement: claim.statement.clone(),
+                rationale: claim.rationale.clone(),
+                applicability: claim.applicability.clone(),
+                assumptions: claim.assumptions.clone(),
+                recheck_when: claim.recheck_when.clone(),
+                evidence_refs,
+                inline_validations,
+                artifact_refs: claim.artifact_refs.clone(),
+                related_contexts: claim.related_contexts.clone(),
+            });
+        }
+        let outcome = self.tasks.write_agent_checkpoint(&AgentCheckpointWrite {
+            locator,
+            expected_task_id,
+            expected_intent_revision_id,
+            expected_episode_version: input.expected_episode_version,
+            boundary: input.boundary.into(),
+            claims,
+            unknowns: input.unknowns.clone(),
+        })?;
+        Ok(TaskCheckpointResponse {
+            checkpoint_id: outcome.checkpoint.checkpoint_id,
+            claim_ids: outcome
+                .checkpoint
+                .claims
+                .iter()
+                .map(|claim| claim.claim_id)
+                .collect(),
+            episode_id: outcome.episode.episode.episode_id,
+            episode_version: outcome.episode.episode.version,
+            episode_status: outcome.episode.episode.status,
+            created: outcome.created,
+            diagnostics: outcome
+                .inline_observation_ids
+                .into_iter()
+                .map(
+                    |observation_id| TaskCheckpointDiagnostic::InlineValidationRecorded {
+                        observation_id,
+                    },
+                )
+                .collect(),
         })
     }
 
@@ -1400,6 +1609,18 @@ pub fn task_signal_supersede_at_root(
     Runtime::open(root.as_ref())?.task_signal_supersede(input)
 }
 
+/// Persists one explicit Agent-authored Checkpoint without creating a Candidate.
+///
+/// # Errors
+///
+/// Returns typed Session/Task/Intent/Episode CAS, reference, privacy or storage errors.
+pub fn task_checkpoint_at_root(
+    root: impl AsRef<Path>,
+    input: &TaskCheckpointInput,
+) -> Result<TaskCheckpointResponse> {
+    Runtime::open(root.as_ref())?.task_checkpoint(input)
+}
+
 /// Registers and scans one canonical local Git Repository without returning source text.
 ///
 /// # Errors
@@ -1666,6 +1887,7 @@ impl McpServer {
             "task_intent_update" => self.task_intent_update(call.arguments),
             "task_artifact_focus" => self.task_artifact_focus(call.arguments),
             "task_signal_supersede" => self.task_signal_supersede(call.arguments),
+            "task_checkpoint" => self.task_checkpoint(call.arguments),
             "task_context" => self.task_context(call.arguments),
             "repository_scan" => self.repository_scan(call.arguments),
             "engineering_reference_record" => self.engineering_reference_record(call.arguments),
@@ -1738,6 +1960,15 @@ impl McpServer {
         let response = self
             .runtime
             .task_signal_supersede(&input)
+            .map_err(ToolFailure::task_context_failed)?;
+        serde_json::to_value(response).map_err(serialization_failure)
+    }
+
+    fn task_checkpoint(&self, arguments: Value) -> ToolResult {
+        let input: TaskCheckpointInput = decode_arguments(arguments)?;
+        let response = self
+            .runtime
+            .task_checkpoint(&input)
             .map_err(ToolFailure::task_context_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
     }
@@ -1935,6 +2166,9 @@ impl ToolFailure {
             ErrorKind::InvariantViolation => "task_context_invariant",
             ErrorKind::Io => "task_context_storage_failed",
             ErrorKind::External => "task_runtime_conflict",
+            ErrorKind::Conflict => "checkpoint_conflict",
+            ErrorKind::StaleState => "checkpoint_stale",
+            ErrorKind::PrivacyRejected => "privacy_rejected",
             ErrorKind::Unsupported => "task_context_unsupported",
             _ => "task_context_failed",
         };
@@ -2111,6 +2345,11 @@ fn tools_list() -> Value {
             "task_signal_supersede",
             "Supersede stable active Signal IDs under exact Task and Intent CAS guards.",
             task_signal_supersede_schema()
+        ),
+        tool_schema(
+            "task_checkpoint",
+            "Persist one explicit Agent-authored Claim/Unknown checkpoint under Task, Intent and Episode CAS without creating a Candidate.",
+            task_checkpoint_schema()
         ),
         tool_schema(
             "task_context",
@@ -2404,6 +2643,108 @@ fn task_signal_supersede_schema() -> Value {
             "task_id": id_schema("tsk_"),
             "expected_revision_id": id_schema("tir_"),
             "signal_ids": {"type": "array", "minItems": 1, "items": id_schema("sig_")}
+        }
+    })
+}
+
+fn task_checkpoint_schema() -> Value {
+    let string_list = || json!({"type": "array", "items": {"type": "string", "minLength": 1}});
+    let context_revision = || {
+        json!({
+            "type": "object", "additionalProperties": false,
+            "required": ["context_id", "revision_id"],
+            "properties": {"context_id": id_schema("ctx_"), "revision_id": id_schema("rev_")}
+        })
+    };
+    let evidence_snapshot = || {
+        json!({
+            "type": "object", "additionalProperties": false,
+            "required": ["kind", "supports", "content", "interpretation", "limitations"],
+            "properties": {
+                "kind": {"type": "string", "enum": ["source_snapshot", "experiment_record", "artifact_snapshot"]},
+                "supports": {"type": "string", "minLength": 1},
+                "content": {"type": "object", "minProperties": 1},
+                "interpretation": {"type": "string", "minLength": 1},
+                "limitations": string_list()
+            }
+        })
+    };
+    let evidence = json!({
+        "oneOf": [
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "observation_id"],
+                "properties": {"kind": {"const": "observation"}, "observation_id": id_schema("wob_")}
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "signal_id"],
+                "properties": {"kind": {"const": "task_signal"}, "signal_id": id_schema("sig_")}
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "context_id", "revision_id", "evidence_id"],
+                "properties": {
+                    "kind": {"const": "context_evidence"}, "context_id": id_schema("ctx_"),
+                    "revision_id": id_schema("rev_"), "evidence_id": id_schema("evd_")
+                }
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "evidence"],
+                "properties": {"kind": {"const": "inline_validation"}, "evidence": evidence_snapshot()}
+            }
+        ]
+    });
+    let artifact_ref = json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["repository_id", "locator"],
+        "properties": {"repository_id": id_schema("rpo_"), "locator": artifact_locator_input_schema()}
+    });
+    let claim = json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["statement", "rationale", "applicability", "assumptions", "recheck_when", "evidence", "artifact_refs", "related_contexts"],
+        "properties": {
+            "statement": {"type": "string", "minLength": 1},
+            "rationale": {"type": "string", "minLength": 1},
+            "applicability": {
+                "type": "object", "additionalProperties": false,
+                "required": ["domains", "platforms", "conditions"],
+                "properties": {"domains": string_list(), "platforms": string_list(), "conditions": string_list()}
+            },
+            "assumptions": string_list(),
+            "recheck_when": string_list(),
+            "evidence": {"type": "array", "minItems": 1, "items": evidence},
+            "artifact_refs": {"type": "array", "items": artifact_ref},
+            "related_contexts": {"type": "array", "items": context_revision()}
+        }
+    });
+    let unknown = json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["statement", "blocking", "recheck_when"],
+        "properties": {
+            "statement": {"type": "string", "minLength": 1},
+            "blocking": {"type": "boolean"},
+            "recheck_when": string_list()
+        }
+    });
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["agent_kind", "external_session_id", "expected_task_id", "expected_intent_revision_id", "expected_episode_version", "boundary", "claims", "unknowns"],
+        "anyOf": [
+            {"properties": {"claims": {"minItems": 1}}},
+            {"properties": {"unknowns": {"minItems": 1}}}
+        ],
+        "properties": {
+            "agent_kind": {"type": "string", "minLength": 1},
+            "external_session_id": {"type": "string", "minLength": 1},
+            "expected_task_id": id_schema("tsk_"),
+            "expected_intent_revision_id": id_schema("tir_"),
+            "expected_episode_version": {"type": "integer", "minimum": 0},
+            "boundary": {"type": "string", "enum": ["continue", "close"]},
+            "claims": {"type": "array", "items": claim},
+            "unknowns": {"type": "array", "items": unknown}
         }
     })
 }
@@ -2802,10 +3143,62 @@ const fn error_code(kind: ErrorKind) -> &'static str {
         ErrorKind::InvariantViolation => "invariant_violation",
         ErrorKind::Io => "io_error",
         ErrorKind::External => "external_error",
+        ErrorKind::Conflict => "conflict",
+        ErrorKind::StaleState => "stale_state",
+        ErrorKind::PrivacyRejected => "privacy_rejected",
         ErrorKind::Unsupported => "unsupported",
         ErrorKind::RepositoryNotConfigured => "repository_not_configured",
         _ => "unknown_error",
     }
+}
+
+fn validate_context_revision_ref(
+    snapshot: &DomainSnapshot,
+    reference: ContextRevisionRef,
+) -> Result<()> {
+    let (_, context) =
+        find_context(snapshot, None, reference.context_id).map_err(|failure| failure.error)?;
+    if !context.revisions.contains_key(&reference.revision_id) {
+        return Err(invalid(format!(
+            "Revision {} does not belong to Context {} in the selected Index snapshot",
+            reference.revision_id, reference.context_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_context_evidence_ref(
+    snapshot: &DomainSnapshot,
+    reference: &CaptureEvidenceRef,
+) -> Result<()> {
+    let CaptureEvidenceRef::ContextEvidence {
+        context_id,
+        revision_id,
+        evidence_id,
+    } = reference
+    else {
+        return Err(invariant(
+            "Context Evidence validator received a non-Context reference",
+        ));
+    };
+    let (_, context) =
+        find_context(snapshot, None, *context_id).map_err(|failure| failure.error)?;
+    let revision = context.revisions.get(revision_id).ok_or_else(|| {
+        invalid(format!(
+            "Revision {revision_id} does not belong to Context {context_id} in the selected Index snapshot"
+        ))
+    })?;
+    if !revision
+        .revision
+        .evidence
+        .iter()
+        .any(|evidence| evidence.evidence_id == *evidence_id)
+    {
+        return Err(invalid(format!(
+            "Evidence {evidence_id} does not belong to Context {context_id} Revision {revision_id}"
+        )));
+    }
+    Ok(())
 }
 
 fn invalid(message: impl Into<String>) -> Error {

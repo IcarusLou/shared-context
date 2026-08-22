@@ -65,15 +65,15 @@ A server-identified, TaskSession- and Task-owned interval that aggregates normal
 _Avoid_: chat transcript, tool log, Workspace-to-Space binding
 
 **WorkObservation**:
-A server-identified, normalized statement about engineering work under one WorkEpisode, owned by an exact TaskIntentRevision and grounded by typed source references such as CaptureId. It preserves extracted meaning rather than raw source payloads.
+A server-identified, normalized statement about engineering work under one WorkEpisode, owned by an exact TaskIntentRevision and grounded by typed source references or self-contained inline Validation evidence. It preserves extracted meaning rather than raw source payloads.
 _Avoid_: raw Breadcrumb, terminal output, untyped artifact string
 
 **AgentCheckpoint**:
-An Agent-authored, server-identified snapshot of Claims and Unknowns owned by one WorkEpisode, TaskSession, Task, and TaskIntentRevision. It closes an Episode boundary without selecting a ContextSpace.
+An Agent-authored, server-identified snapshot of Claims and Unknowns owned by one WorkEpisode, TaskSession, Task, TaskIntentRevision, and exact parent Episode version. It may continue or close the Episode without selecting a ContextSpace; an Unknown-only Checkpoint records uncertainty without asserting knowledge.
 _Avoid_: conversation summary, Candidate approval, Space selection
 
 **CheckpointClaim**:
-A structured engineering assertion containing its statement, rationale, applicability, assumptions, recheck conditions, typed Evidence references, Artifact references, and related Context revisions.
+A structured engineering assertion containing its statement, rationale, applicability, assumptions, recheck conditions, typed Evidence references, Artifact associations, and related Context revisions. An Artifact association is not Evidence by itself.
 _Avoid_: unsupported conclusion, free-form note
 
 **CandidateBuilderProvenance**:

@@ -52,6 +52,21 @@ fn cursor_prompt_hook_is_observable_but_never_an_injection_dependency() {
 }
 
 #[test]
+fn cursor_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_claims() {
+    let capability = capabilities(Some("3.13.10"), true);
+    for index in [3, 4] {
+        let (event, _) =
+            decode_hook_input(&serde_json::to_vec(&fixtures().remove(index)).unwrap()).unwrap();
+        let action = plan_action(&event, &capability);
+        assert!(action.task_operation.is_none());
+        assert!(action.system_message.as_deref().is_some_and(|message| {
+            message.contains("task_checkpoint")
+                && message.contains("Hook summary text is not Claim evidence")
+        }));
+    }
+}
+
+#[test]
 fn cursor_unknown_version_and_missing_hooks_keep_only_mcp_cli() {
     for capability in [
         capabilities(Some("4.0.0"), true),

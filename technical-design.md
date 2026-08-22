@@ -19,7 +19,7 @@
 | **M1：Task-first 领域与入口基础** | **已实现** | `TaskIntent` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；CLI/MCP 通过 `candidate_create` 创建无 Space Candidate；Candidate 不可自动注入 |
 | **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、严格 `task_intent_update` 与只读 `task_context` 已通过跨 crate/E2E 验收 |
 | **M3：Engineering Graph** | **已实现** | 稳定本机 Repository Catalog、可重建 Registry、Reference-derived 有界扫描、build-time immutable Context/safety snapshot、历史 Graph Retrieval、ContextRelation 1–2 跳及 MCP/CLI 工作流已通过固定跨 crate/E2E oracle |
-| **M4：Low-tax Capture** | **基础部分已实现** | #156 已持久化可验证 WorkEpisode、normalized Observation 与 typed Capture；尚无自动聚合、AgentCheckpoint、Candidate Builder、去重/冲突、Space 推荐或 Candidate Confirm/List/Discard |
+| **M4：Low-tax Capture** | **基础部分已实现** | #156/#157 已持久化可验证 WorkEpisode、normalized Observation、typed Capture 与显式 AgentCheckpoint；尚无自动聚合、Candidate Builder、去重/冲突、Space 推荐或 Candidate Confirm/List/Discard |
 
 当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订权威 TaskIntent，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示。PostToolUse 的 File observation 只形成带 Session/optional Task owner 的 redacted Capture Breadcrumb，可识别测试工具只形成非定位 TestOutcome；Hook 不运行 Git、Scanner、Registry sync、Graph rebuild、Focus 提交或 Episode open/ingest。显式 Graph 工具完成 bounded scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。当前 `candidate_create` 仍是手工、无归属的 M1 入口，不等同于 M4 自动 Capture。
 
@@ -765,6 +765,7 @@ repository/
 | `work_episode_intent_ref` / `work_episode_signal_ref` | ordered Intent Revision 与非定位 Signal provenance |
 | `work_observation` / `work_observation_source` | server-owned normalized meaning 与 typed sources |
 | `capture_ingestion` | `CaptureId → Episode/Observation` 唯一幂等记录 |
+| `agent_checkpoint` | Episode parent-version 语义幂等的完整 Claims/Unknowns、server IDs 与 continue/close boundary |
 | `work_episode_diagnostic` | unconfigured/unsafe Capture Artifact 映射诊断 |
 
 Capture 文件设置 TTL；Runtime Episode 不进入 Git。删除 `runtime.sqlite` 只会丢失 Task/Episode，不改变 Context Git、Index 或 `state/capture`。
@@ -922,7 +923,7 @@ WorkEpisode 聚合一次 Task 中的：
 
 原始 Transcript 和完整 Tool Output 不进入 WorkEpisode。Runtime 只保存经过 Adapter 归一化、Secret/PII 扫描和容量限制的结构化观察。
 
-#156 当前可执行基础：
+#156/#157 当前可执行基础：
 
 - `CaptureId` 是 typed `cap_<uuid-v4>`；Capture record 固化 ExternalSessionLocator、optional exact ActiveTask owner、redacted summary/file hints、TTL/privacy diagnostics 与 idempotent claim。
 - CaptureStore 提供 bounded read/list/claim/cleanup；无 Session/ActiveTask 的 Capture 保留 `no_active_task` 诊断并不可 claim，跨 Task/Episode claim 拒绝。
@@ -930,26 +931,33 @@ WorkEpisode 聚合一次 Task 中的：
 - `capture_ingestion.capture_id` 唯一；claim 与 Runtime commit 任一侧崩溃都可重试且不产生重复 Observation。
 - Catalog 只把 safe existing configured File hint 映射为 File ArtifactRef；unconfigured/unsafe path 保留 Capture source、summary 和 typed diagnostic，不猜 Repository。
 - Hook 只 Capture，不自动 open/advance/ingest Episode；#163 才拥有自动聚合触发。
+- `task_checkpoint` 由工作 Agent 显式提交 Task/Intent/Episode CAS、完整 Claims/Unknowns 和 typed refs；Runtime 在一个事务中 open/advance Episode、生成 inline Validation Observation、Claim/Checkpoint ID，并 continue 或 close。
+- `(episode_id, parent_episode_version)` 唯一约束配合完整语义 JSON 实现 timeout retry；相同内容返回原 Checkpoint，不同内容冲突，stale version 拒绝。Checkpoint 不生成 Candidate 或 Git Event。
 
 ### 12.2 AgentCheckpoint
 
 Agent 在 PreCompact、TurnStop 或形成重要结论时调用：
 
 ```yaml
-task_id:
+agent_kind:
+external_session_id:
+expected_task_id:
+expected_intent_revision_id:
+expected_episode_version:
+boundary: continue | close
 claims:
   - statement:
     rationale:
     applicability:
     assumptions:
     recheck_when:
-    evidence_refs:
+    evidence:
     artifact_refs:
-    related_context_ids:
+    related_contexts:
 unknowns:
 ```
 
-Checkpoint 表达 Agent 已形成的工程认知，不是“工具执行成功”日志。
+Checkpoint 表达 Agent 已形成的工程认知，不是“工具执行成功”日志。Evidence 可引用 owned Observation、Task 历史 Signal、同一 Index snapshot 的 ContextEvidence，或提交经 PrivacyScanner 检查的 self-contained inline Validation；ArtifactRef 只描述关联，不独立成为 Evidence。Unknown-only Checkpoint 可以 continue 或 close，但不产生知识主张。
 
 ### 12.3 Candidate Builder
 
@@ -996,7 +1004,7 @@ optional_edits:
 sctx setup
 sctx doctor
 sctx space create|revise|list|get
-sctx task context|artifact-focus|intent update|signal supersede
+sctx task context|artifact-focus|checkpoint|intent update|signal supersede
 sctx candidate list|get|confirm|discard
 sctx context get|search|revise|deprecate
 sctx repository add|list|doctor|scan
@@ -1061,8 +1069,8 @@ Adapter 只翻译厂商 Payload。TaskIntent、Git Diff、代码扫描、检索�
 - SessionStart：仅注入系统能力说明；不得构造或执行空查询 Context Pack，也不注入任何知识项或假定 Space 摘要。
 - PromptSubmit：仅作为 PromptEnvelope 返回能力提示，不从 Prompt 文本构造 Intent 或 Signal；工作 Agent 显式调用 `task_intent_update`。
 - PostToolUse：保留 Breadcrumb；可识别 Test/Check/Lint 工具只合并非定位 TestOutcome。File Hint 不再写入工程 TaskSignal，也不会隐式发起 ArtifactFocusQuery；Prompt 前没有 Session 时不隐式创建，不保存原始 Tool Output、Transcript 或命令文本。
-- PreCompact：生成 Checkpoint，刷新并压缩当前最相关 Context。
-- TurnStop：固化 WorkEpisode，触发 Candidate Builder。
+- PreCompact：能力提示要求工作 Agent 显式提交完整 Checkpoint；Hook 不从摘要伪造 Claim。
+- TurnStop：能力提示要求工作 Agent 显式提交并按需要关闭 WorkEpisode；不自动触发 Candidate Builder。
 - SessionEnd：清理或延长未确认 Candidate TTL。
 
 Agent Hook 不支持某事件时，通过 MCP 主动调用和 CLI 完成同一核心流程；能力差异只影响自动化程度，不改变领域模型。
@@ -1342,13 +1350,13 @@ EngineeringResolutionSource {
 3. File/Module/Symbol/API/Schema/Test 声明必须由明确 Evidence 支撑；Prompt、Workspace、Diff、TestOutcome 或本次 `ResolvedFocus` 本身不能证明 Artifact/Interface 身份。
 4. `grounded` Revision 至少包含一个成功解析的 EvidenceSource，且每个 Artifact/Interface 声明都有来源覆盖；opaque 字符串、自由文本前缀和仅格式合法的 ID 一律不能通过。
 5. #136 实现必须将 maturity 与规范化 typed EvidenceSource 一起纳入 Revision 的持久内容、CAS 和幂等比较；完全相同的重试返回 `already_current`，不得新增 Revision。
-6. #156 WorkEpisode observation 已具备稳定 ID、Task/Intent ownership、typed Capture source、查询和固化规则；`source_episode_id` 可验证 existence/owner/status，但在 #157/#158/#136 接线前仍不能替代 Grounded EvidenceSource。
+6. #156/#157 WorkEpisode Observation 与 AgentCheckpoint 已具备稳定 server ID、Task/Intent/Episode ownership、typed source、查询和固化规则；它们不自动成为 Grounded EvidenceSource，#136 仍延期。
 
-### M4：Low-tax Capture — #156 基础已实现，完整链路未实现
+### M4：Low-tax Capture — #156/#157 基础已实现，完整链路未实现
 
-- WorkEpisode/Capture 显式持久 API 已实现；WorkEpisode 自动聚合（#163）和 AgentCheckpoint 消费（#157）尚未实现。
+- WorkEpisode/Capture 显式持久 API和 AgentCheckpoint MCP/CLI/Skill 已实现；WorkEpisode 自动聚合（#163）尚未实现。
 - Candidate Builder、Evidence 组装、去重、冲突和 Space 推荐尚未实现。
-- Candidate List/Confirm/Discard 以及 PreCompact/TurnStop 自动触发尚未实现。
+- Candidate List/Confirm/Discard 以及 PreCompact/TurnStop 自动写入/Builder 触发尚未实现；当前 Hook 仅给出显式 Checkpoint 能力提示。
 - 当前手工 `candidate_create` 只验证无归属 Candidate 的入口与安全边界。
 - Mandatory Gate #114/#117 必须在 Candidate Builder 落地时一起完成：Builder 为一次创建操作生成稳定 `submission_id`，首次提交由服务端生成 `candidate_id` 并持久化 `submission_id → candidate_id`；重试复用同一 `submission_id`。
 - 相同 `submission_id` 加相同内容返回 `already_exists`；相同 `submission_id` 加不同内容返回 `IdempotencyKeyConflict`；不同 `submission_id` 创建新的 Candidate，即使文本相似。语义相近去重属于知识聚合，不由幂等键处理。

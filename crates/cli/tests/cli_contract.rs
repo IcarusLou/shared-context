@@ -1421,6 +1421,62 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
     assert!(text(&updated, "task_id").starts_with("tsk_"));
     assert!(text(&updated, "intent_revision_id").starts_with("tir_"));
 
+    let checkpoint_path = harness.home.join("task-checkpoint.json");
+    fs::write(
+        &checkpoint_path,
+        serde_json::to_vec(&serde_json::json!({
+            "agent_kind": "codex",
+            "external_session_id": "cli-authoritative",
+            "expected_task_id": updated["data"]["task_id"],
+            "expected_intent_revision_id": updated["data"]["intent_revision_id"],
+            "expected_episode_version": 0,
+            "boundary": "continue",
+            "claims": [{
+                "statement": "The CLI Checkpoint completed",
+                "rationale": "The strict JSON entry called the shared MCP workflow",
+                "applicability": {"domains": ["cli"], "platforms": [], "conditions": ["checkpoint"]},
+                "assumptions": [],
+                "recheck_when": ["the CLI contract changes"],
+                "evidence": [{
+                    "kind": "inline_validation",
+                    "evidence": {
+                        "kind": "experiment_record",
+                        "supports": "the CLI returned a Checkpoint",
+                        "content": {"command": "task.checkpoint", "actual": "success"},
+                        "interpretation": "the explicit workflow is executable",
+                        "limitations": []
+                    }
+                }],
+                "artifact_refs": [],
+                "related_contexts": []
+            }],
+            "unknowns": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let checkpoint = harness.success(&[
+        "task",
+        "checkpoint",
+        "--input",
+        checkpoint_path.to_str().unwrap(),
+    ]);
+    assert_eq!(checkpoint["command"], "task.checkpoint");
+    assert_eq!(checkpoint["data"]["created"], true);
+    assert_eq!(checkpoint["data"]["episode_version"], 1);
+    assert!(text(&checkpoint, "checkpoint_id").starts_with("ckp_"));
+    let retried_checkpoint = harness.success(&[
+        "task",
+        "checkpoint",
+        "--input",
+        checkpoint_path.to_str().unwrap(),
+    ]);
+    assert_eq!(retried_checkpoint["data"]["created"], false);
+    assert_eq!(
+        retried_checkpoint["data"]["checkpoint_id"],
+        checkpoint["data"]["checkpoint_id"]
+    );
+
     let business_repository = harness.home.join("business repository");
     fs::create_dir_all(&business_repository).unwrap();
     assert!(
@@ -1606,10 +1662,9 @@ fn mcp_stdio_entry_serves_cursor_and_codex_without_extra_stdout() {
             .collect::<Vec<_>>();
         assert_eq!(responses.len(), 2);
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
-        assert_eq!(
-            responses[1]["result"]["tools"].as_array().unwrap().len(),
-            12
-        );
+        let tools = responses[1]["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 13);
+        assert!(tools.iter().any(|tool| tool["name"] == "task_checkpoint"));
     }
 }
 

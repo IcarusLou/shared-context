@@ -64,6 +64,12 @@ pub enum ErrorKind {
     Io,
     /// An external command or protocol peer failed.
     External,
+    /// A semantic idempotency key already names different authoritative content.
+    Conflict,
+    /// A caller-supplied compare-and-swap version no longer names the current state.
+    StaleState,
+    /// Untrusted content contains a Secret/PII signature and was rejected before storage.
+    PrivacyRejected,
     /// The requested behavior is outside the current implementation stage.
     Unsupported,
     /// An absolute engineering path is outside the explicit local Repository Catalog.

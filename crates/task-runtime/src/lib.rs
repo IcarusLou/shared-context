@@ -14,15 +14,16 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sctx_domain::{
-    CaptureId, CaptureSourceRef, Error, ErrorKind, ExternalSessionId, ExternalSessionLocator,
-    ExternalSessionSnapshot, IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation,
-    Result, SignalId, TaskId, TaskIntent, TaskIntentDraft, TaskIntentRevision,
-    TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalKind,
-    TaskSignalLifecycle, TaskSignalRecord, WorkEpisode, WorkEpisodeId, WorkEpisodeRef,
-    WorkEpisodeStatus, WorkObservation, WorkObservationId, WorkSourceRef,
+    AgentCheckpoint, Applicability, ArtifactRef, CaptureEvidenceRef, CaptureId, CaptureSourceRef,
+    CaptureUnknown, CheckpointClaim, ContextRevisionRef, Error, ErrorKind, EvidenceSnapshotDraft,
+    ExternalSessionId, ExternalSessionLocator, ExternalSessionSnapshot, IntentRevisionRange,
+    NonLocatingSignalRef, NormalizedWorkObservation, Result, SignalId, TaskId, TaskIntent,
+    TaskIntentDraft, TaskIntentRevision, TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot,
+    TaskSignal, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord, WorkEpisode, WorkEpisodeId,
+    WorkEpisodeRef, WorkEpisodeStatus, WorkObservation, WorkObservationId, WorkSourceRef,
 };
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_EPISODE_LIST_LIMIT: usize = 256;
 
@@ -69,7 +70,59 @@ pub struct SupersedeSignalsOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkEpisodeView {
     pub episode: WorkEpisode,
+    pub checkpoints: Vec<AgentCheckpoint>,
     pub diagnostics: Vec<WorkEpisodeDiagnostic>,
+}
+
+/// Whether a Checkpoint preserves the open Episode or closes its final boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckpointBoundary {
+    Continue,
+    Close,
+}
+
+impl CheckpointBoundary {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Close => "close",
+        }
+    }
+}
+
+/// Complete Agent-authored Claim content before server IDs and inline Observation IDs exist.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointClaimDraft {
+    pub statement: String,
+    pub rationale: String,
+    pub applicability: Applicability,
+    pub assumptions: Vec<String>,
+    pub recheck_when: Vec<String>,
+    pub evidence_refs: Vec<CaptureEvidenceRef>,
+    pub inline_validations: Vec<EvidenceSnapshotDraft>,
+    pub artifact_refs: Vec<ArtifactRef>,
+    pub related_contexts: Vec<ContextRevisionRef>,
+}
+
+/// One strict Checkpoint write under `ActiveTask`, Intent and Episode-version CAS.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentCheckpointWrite {
+    pub locator: ExternalSessionLocator,
+    pub expected_task_id: TaskId,
+    pub expected_intent_revision_id: TaskIntentRevisionId,
+    pub expected_episode_version: u64,
+    pub boundary: CheckpointBoundary,
+    pub claims: Vec<CheckpointClaimDraft>,
+    pub unknowns: Vec<CaptureUnknown>,
+}
+
+/// Idempotent result of one atomic Checkpoint and Episode transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentCheckpointOutcome {
+    pub checkpoint: AgentCheckpoint,
+    pub episode: WorkEpisodeView,
+    pub created: bool,
+    pub inline_observation_ids: Vec<WorkObservationId>,
 }
 
 /// Result of explicitly opening at most one Episode for an `ActiveTask`.
@@ -778,6 +831,183 @@ impl TaskRuntime {
         })
     }
 
+    /// Atomically opens or reuses the `ActiveTask` Episode, advances its typed
+    /// references, records inline Validation observations and persists one
+    /// server-identified Agent Checkpoint.
+    ///
+    /// Semantic retries are keyed by Episode and parent version. Identical
+    /// content returns the original Checkpoint; different content conflicts.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale ownership/version guards, invalid Task-local references,
+    /// incomplete Checkpoint content, or conflicting semantic retries.
+    #[allow(clippy::too_many_lines)]
+    pub fn write_agent_checkpoint(
+        &self,
+        input: &AgentCheckpointWrite,
+    ) -> Result<AgentCheckpointOutcome> {
+        input.locator.validate()?;
+        if input.claims.is_empty() && input.unknowns.is_empty() {
+            return Err(invalid(
+                "agent_checkpoint must contain at least one Claim or Unknown",
+            ));
+        }
+        let semantic_json = checkpoint_semantic_json(input)?;
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Agent Checkpoint transaction")?;
+        let external = read_external_identity(&transaction, &input.locator)?
+            .ok_or_else(|| invalid("ExternalSession has no ActiveTask for Agent Checkpoint"))?;
+        require_expected_active(external.active_task_id, input.expected_task_id)?;
+        let (task_id, current_revision_id) =
+            read_active_task_head(&transaction, external.active_task_session_id)?
+                .ok_or_else(|| invariant("located ActiveTask is not active"))?;
+        if current_revision_id != input.expected_intent_revision_id {
+            return Err(stale("expected Intent revision is stale"));
+        }
+
+        let open_episode = find_open_episode(&transaction, external.active_task_session_id)?;
+        let retry_episode = if open_episode.is_none() {
+            find_latest_checkpoint_episode(
+                &transaction,
+                external.active_task_session_id,
+                input.expected_episode_version,
+            )?
+        } else {
+            None
+        };
+        if let Some(episode_id) = open_episode.or(retry_episode) {
+            if let Some((checkpoint, persisted_semantics)) =
+                read_checkpoint_by_parent(&transaction, episode_id, input.expected_episode_version)?
+            {
+                if persisted_semantics != semantic_json {
+                    return Err(conflict(
+                        "Agent Checkpoint parent version already contains different content",
+                    ));
+                }
+                let episode = require_episode_view(&transaction, episode_id)?;
+                let inline_observation_ids = inline_observation_ids(&checkpoint, &input.claims)?;
+                transaction
+                    .commit()
+                    .map_err(sql_error("commit idempotent Agent Checkpoint retry"))?;
+                return Ok(AgentCheckpointOutcome {
+                    checkpoint,
+                    episode,
+                    created: false,
+                    inline_observation_ids,
+                });
+            }
+        }
+
+        let episode_id = if let Some(episode_id) = open_episode {
+            episode_id
+        } else {
+            if input.expected_episode_version != 0 {
+                return Err(stale("expected Work Episode version is stale"));
+            }
+            insert_open_episode(&transaction, external.active_task_session_id, task_id)?
+        };
+        let (task_session_id, episode_task_id, version, status) =
+            require_episode_head(&transaction, episode_id)?;
+        require_open_episode_version(version, &status, input.expected_episode_version)?;
+        if task_session_id != external.active_task_session_id || episode_task_id != task_id {
+            return Err(invariant("ActiveTask Work Episode ownership changed"));
+        }
+        insert_all_missing_episode_refs(&transaction, episode_id, task_session_id, task_id)?;
+        let episode_before = require_episode_view(&transaction, episode_id)?.episode;
+        validate_checkpoint_task_local_refs(&episode_before, &input.claims)?;
+
+        let mut claims = Vec::with_capacity(input.claims.len());
+        let mut inserted_inline_observations = Vec::new();
+        for claim in &input.claims {
+            let mut evidence_refs = claim.evidence_refs.clone();
+            for evidence in &claim.inline_validations {
+                evidence.validate("agent_checkpoint.inline_validation")?;
+                let observation = WorkObservation::from_parts(
+                    task_session_id,
+                    task_id,
+                    current_revision_id,
+                    Vec::new(),
+                    NormalizedWorkObservation::InlineValidation {
+                        evidence: evidence.clone(),
+                    },
+                )?;
+                insert_observation_rows(&transaction, episode_id, &observation)?;
+                evidence_refs.push(CaptureEvidenceRef::Observation {
+                    observation_id: observation.observation_id,
+                });
+                inserted_inline_observations.push(observation.observation_id);
+            }
+            claims.push(CheckpointClaim::from_parts(
+                claim.statement.clone(),
+                claim.rationale.clone(),
+                claim.applicability.clone(),
+                claim.assumptions.clone(),
+                claim.recheck_when.clone(),
+                evidence_refs,
+                claim.artifact_refs.clone(),
+                claim.related_contexts.clone(),
+            )?);
+        }
+        let episode_with_inline = require_episode_view(&transaction, episode_id)?.episode;
+        let checkpoint = AgentCheckpoint::from_parts(
+            &episode_with_inline,
+            current_revision_id,
+            claims,
+            input.unknowns.clone(),
+        )?;
+        let checkpoint_json =
+            serde_json::to_string(&checkpoint).map_err(json_error("serialize Agent Checkpoint"))?;
+        let checkpoint_ordinal = next_checkpoint_ordinal(&transaction, episode_id)?;
+        transaction
+            .execute(
+                "INSERT INTO agent_checkpoint (
+                    checkpoint_id, episode_id, task_session_id, task_id,
+                    intent_revision_id, parent_episode_version, boundary,
+                    semantic_json, checkpoint_json, checkpoint_ordinal
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    checkpoint.checkpoint_id.to_string(),
+                    episode_id.to_string(),
+                    task_session_id.to_string(),
+                    task_id.to_string(),
+                    current_revision_id.to_string(),
+                    i64::try_from(input.expected_episode_version)
+                        .map_err(|_| invalid("Work Episode version exceeds SQLite range"))?,
+                    input.boundary.as_str(),
+                    semantic_json,
+                    checkpoint_json,
+                    checkpoint_ordinal,
+                ],
+            )
+            .map_err(sql_error("insert Agent Checkpoint"))?;
+        match input.boundary {
+            CheckpointBoundary::Continue => {
+                advance_episode_version(&transaction, episode_id, input.expected_episode_version)?;
+            }
+            CheckpointBoundary::Close => {
+                let mut validation_episode = episode_with_inline;
+                validation_episode.close(&checkpoint)?;
+                close_episode_version(
+                    &transaction,
+                    episode_id,
+                    input.expected_episode_version,
+                    checkpoint.checkpoint_id,
+                )?;
+            }
+        }
+        let episode = require_episode_view(&transaction, episode_id)?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit Agent Checkpoint transaction"))?;
+        Ok(AgentCheckpointOutcome {
+            checkpoint,
+            episode,
+            created: true,
+            inline_observation_ids: inserted_inline_observations,
+        })
+    }
+
     /// Reads one persisted Work Episode by server-owned ID.
     ///
     /// # Errors
@@ -827,12 +1057,11 @@ impl TaskRuntime {
             .collect()
     }
 
-    /// Prepares, but does not commit, the final Checkpoint close boundary.
-    /// Checkpoint persistence and actual close belong to #157.
+    /// Prepares, but does not commit, a final Checkpoint close boundary.
     ///
     /// # Errors
     ///
-    /// Rejects stale/closed/empty Episodes.
+    /// Rejects stale or closed Episodes.
     pub fn prepare_work_episode_close(
         &self,
         episode_id: WorkEpisodeId,
@@ -845,11 +1074,6 @@ impl TaskRuntime {
             || view.episode.status != WorkEpisodeStatus::Open
         {
             return Err(invalid("Work Episode close version/status is stale"));
-        }
-        if view.episode.observations.is_empty() {
-            return Err(invalid(
-                "Work Episode requires observations before close preparation",
-            ));
         }
         Ok(EpisodeClosePreparation {
             ownership: view.episode.ownership(),
@@ -1131,6 +1355,25 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 FOREIGN KEY (episode_id, task_session_id, task_id)
                     REFERENCES work_episode (episode_id, task_session_id, task_id)
             ) STRICT;
+            CREATE TABLE IF NOT EXISTS agent_checkpoint (
+                checkpoint_id TEXT PRIMARY KEY,
+                episode_id TEXT NOT NULL,
+                task_session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                intent_revision_id TEXT NOT NULL,
+                parent_episode_version INTEGER NOT NULL CHECK (parent_episode_version >= 0),
+                boundary TEXT NOT NULL CHECK (boundary IN ('continue', 'close')),
+                semantic_json TEXT NOT NULL CHECK (json_valid(semantic_json)),
+                checkpoint_json TEXT NOT NULL CHECK (json_valid(checkpoint_json)),
+                checkpoint_ordinal INTEGER NOT NULL CHECK (checkpoint_ordinal >= 0),
+                UNIQUE (episode_id, parent_episode_version),
+                UNIQUE (episode_id, checkpoint_ordinal),
+                UNIQUE (checkpoint_id, episode_id),
+                FOREIGN KEY (episode_id, task_session_id, task_id)
+                    REFERENCES work_episode (episode_id, task_session_id, task_id),
+                FOREIGN KEY (intent_revision_id)
+                    REFERENCES task_intent_revision (revision_id)
+            ) STRICT;
             CREATE TABLE IF NOT EXISTS work_episode_diagnostic (
                 episode_id TEXT NOT NULL,
                 diagnostic_ordinal INTEGER NOT NULL CHECK (diagnostic_ordinal >= 0),
@@ -1143,7 +1386,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 UNIQUE (episode_id, capture_id, kind),
                 FOREIGN KEY (episode_id) REFERENCES work_episode (episode_id)
             ) STRICT;
-            PRAGMA user_version = 5;",
+            PRAGMA user_version = 6;",
         )
         .map_err(sql_error("initialize task runtime schema"))
 }
@@ -1291,6 +1534,175 @@ fn find_open_episode(
         .map_err(sql_error("find open Work Episode"))?
         .map(|value| parse_id(&value, "work_episode.episode_id"))
         .transpose()
+}
+
+fn insert_open_episode(
+    transaction: &Transaction<'_>,
+    task_session_id: TaskSessionId,
+    task_id: TaskId,
+) -> Result<WorkEpisodeId> {
+    let episode_id = WorkEpisodeId::new();
+    let episode_ordinal = next_episode_ordinal(transaction, task_session_id)?;
+    transaction
+        .execute(
+            "INSERT INTO work_episode (
+                episode_id, task_session_id, task_id, version, status,
+                final_checkpoint_id, episode_ordinal
+             ) VALUES (?1, ?2, ?3, 0, 'open', NULL, ?4)",
+            params![
+                episode_id.to_string(),
+                task_session_id.to_string(),
+                task_id.to_string(),
+                episode_ordinal,
+            ],
+        )
+        .map_err(sql_error("insert Work Episode"))?;
+    insert_all_missing_episode_refs(transaction, episode_id, task_session_id, task_id)?;
+    Ok(episode_id)
+}
+
+fn find_latest_checkpoint_episode(
+    connection: &Connection,
+    task_session_id: TaskSessionId,
+    parent_version: u64,
+) -> Result<Option<WorkEpisodeId>> {
+    let parent_version = i64::try_from(parent_version)
+        .map_err(|_| invalid("Work Episode version exceeds SQLite range"))?;
+    connection
+        .query_row(
+            "SELECT checkpoint.episode_id
+             FROM agent_checkpoint AS checkpoint
+             JOIN work_episode AS episode ON episode.episode_id = checkpoint.episode_id
+             WHERE episode.task_session_id = ?1
+               AND checkpoint.parent_episode_version = ?2
+             ORDER BY episode.episode_ordinal DESC LIMIT 1",
+            params![task_session_id.to_string(), parent_version],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(sql_error("find Agent Checkpoint retry Episode"))?
+        .map(|value| parse_id(&value, "agent_checkpoint.episode_id"))
+        .transpose()
+}
+
+fn checkpoint_semantic_json(input: &AgentCheckpointWrite) -> Result<String> {
+    let claims = input
+        .claims
+        .iter()
+        .map(|claim| {
+            serde_json::json!({
+                "statement": claim.statement,
+                "rationale": claim.rationale,
+                "applicability": claim.applicability,
+                "assumptions": claim.assumptions,
+                "recheck_when": claim.recheck_when,
+                "evidence_refs": claim.evidence_refs,
+                "inline_validations": claim.inline_validations,
+                "artifact_refs": claim.artifact_refs,
+                "related_contexts": claim.related_contexts,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&serde_json::json!({
+        "expected_task_id": input.expected_task_id,
+        "expected_intent_revision_id": input.expected_intent_revision_id,
+        "boundary": input.boundary.as_str(),
+        "claims": claims,
+        "unknowns": input.unknowns,
+    }))
+    .map_err(json_error("serialize Agent Checkpoint semantics"))
+}
+
+fn validate_checkpoint_task_local_refs(
+    episode: &WorkEpisode,
+    claims: &[CheckpointClaimDraft],
+) -> Result<()> {
+    let observations = episode
+        .observations
+        .iter()
+        .map(|observation| observation.observation_id)
+        .collect::<HashSet<_>>();
+    let signals = episode
+        .signal_refs
+        .iter()
+        .map(|signal| signal.signal_id)
+        .collect::<HashSet<_>>();
+    for evidence in claims.iter().flat_map(|claim| &claim.evidence_refs) {
+        match evidence {
+            CaptureEvidenceRef::Observation { observation_id }
+                if !observations.contains(observation_id) =>
+            {
+                return Err(invalid(
+                    "Checkpoint Observation evidence does not belong to its Work Episode",
+                ));
+            }
+            CaptureEvidenceRef::TaskSignal { signal_id } if !signals.contains(signal_id) => {
+                return Err(invalid(
+                    "Checkpoint TaskSignal evidence does not belong to its Task",
+                ));
+            }
+            CaptureEvidenceRef::Observation { .. }
+            | CaptureEvidenceRef::TaskSignal { .. }
+            | CaptureEvidenceRef::ContextEvidence { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn read_checkpoint_by_parent(
+    connection: &Connection,
+    episode_id: WorkEpisodeId,
+    parent_version: u64,
+) -> Result<Option<(AgentCheckpoint, String)>> {
+    let parent_version = i64::try_from(parent_version)
+        .map_err(|_| invalid("Work Episode version exceeds SQLite range"))?;
+    connection
+        .query_row(
+            "SELECT checkpoint_json, semantic_json FROM agent_checkpoint
+             WHERE episode_id = ?1 AND parent_episode_version = ?2",
+            params![episode_id.to_string(), parent_version],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(sql_error("read Agent Checkpoint retry"))?
+        .map(|(checkpoint, semantics)| {
+            Ok((
+                serde_json::from_str(&checkpoint).map_err(json_error("parse Agent Checkpoint"))?,
+                semantics,
+            ))
+        })
+        .transpose()
+}
+
+fn inline_observation_ids(
+    checkpoint: &AgentCheckpoint,
+    drafts: &[CheckpointClaimDraft],
+) -> Result<Vec<WorkObservationId>> {
+    if checkpoint.claims.len() != drafts.len() {
+        return Err(invariant("persisted Agent Checkpoint Claim count changed"));
+    }
+    let mut ids = Vec::new();
+    for (claim, draft) in checkpoint.claims.iter().zip(drafts) {
+        if claim.evidence_refs.len()
+            != draft
+                .evidence_refs
+                .len()
+                .saturating_add(draft.inline_validations.len())
+        {
+            return Err(invariant(
+                "persisted Agent Checkpoint inline Evidence count changed",
+            ));
+        }
+        for evidence in claim.evidence_refs.iter().skip(draft.evidence_refs.len()) {
+            let CaptureEvidenceRef::Observation { observation_id } = evidence else {
+                return Err(invariant(
+                    "persisted inline Validation does not reference an Observation",
+                ));
+            };
+            ids.push(*observation_id);
+        }
+    }
+    Ok(ids)
 }
 
 fn next_episode_ordinal(
@@ -1448,10 +1860,10 @@ fn require_episode_head(
 
 fn require_open_episode_version(actual: u64, status: &str, expected: u64) -> Result<()> {
     if status != "open" {
-        return Err(invalid("Work Episode is not open"));
+        return Err(stale("Work Episode is not open"));
     }
     if actual != expected {
-        return Err(invalid("expected Work Episode version is stale"));
+        return Err(stale("expected Work Episode version is stale"));
     }
     Ok(())
 }
@@ -1493,7 +1905,29 @@ fn advance_episode_version(
         )
         .map_err(sql_error("advance Work Episode version"))?;
     if changed != 1 {
-        return Err(invalid("expected Work Episode version became stale"));
+        return Err(stale("expected Work Episode version became stale"));
+    }
+    Ok(())
+}
+
+fn close_episode_version(
+    transaction: &Transaction<'_>,
+    episode_id: WorkEpisodeId,
+    expected_version: u64,
+    checkpoint_id: sctx_domain::AgentCheckpointId,
+) -> Result<()> {
+    let expected = i64::try_from(expected_version)
+        .map_err(|_| invalid("Work Episode version exceeds SQLite range"))?;
+    let changed = transaction
+        .execute(
+            "UPDATE work_episode
+             SET version = version + 1, status = 'closed', final_checkpoint_id = ?3
+             WHERE episode_id = ?1 AND version = ?2 AND status = 'open'",
+            params![episode_id.to_string(), expected, checkpoint_id.to_string()],
+        )
+        .map_err(sql_error("close Work Episode at Agent Checkpoint"))?;
+    if changed != 1 {
+        return Err(stale("expected Work Episode version became stale"));
     }
     Ok(())
 }
@@ -1519,6 +1953,16 @@ fn append_observation_in_transaction(
         normalized,
     )?;
     episode.add_observation(observation.clone())?;
+    insert_observation_rows(transaction, episode_id, &observation)?;
+    advance_episode_version(transaction, episode_id, expected_version)?;
+    Ok(observation.observation_id)
+}
+
+fn insert_observation_rows(
+    transaction: &Transaction<'_>,
+    episode_id: WorkEpisodeId,
+    observation: &WorkObservation,
+) -> Result<()> {
     let observation_ordinal = next_observation_ordinal(transaction, episode_id)?;
     let observation_json = serde_json::to_string(&observation.observation)
         .map_err(json_error("serialize normalized Work Observation"))?;
@@ -1531,9 +1975,9 @@ fn append_observation_in_transaction(
             params![
                 observation.observation_id.to_string(),
                 episode_id.to_string(),
-                task_session_id.to_string(),
-                task_id.to_string(),
-                intent_revision_id.to_string(),
+                observation.task_session_id.to_string(),
+                observation.task_id.to_string(),
+                observation.intent_revision_id.to_string(),
                 observation_ordinal,
                 observation_json,
             ],
@@ -1556,8 +2000,7 @@ fn append_observation_in_transaction(
             )
             .map_err(sql_error("insert Work Observation source"))?;
     }
-    advance_episode_version(transaction, episode_id, expected_version)?;
-    Ok(observation.observation_id)
+    Ok(())
 }
 
 fn next_observation_ordinal(
@@ -1570,6 +2013,19 @@ fn next_observation_ordinal(
          FROM work_observation WHERE episode_id = ?1",
         episode_id.to_string(),
         "read next Work Observation ordinal",
+    )
+}
+
+fn next_checkpoint_ordinal(
+    transaction: &Transaction<'_>,
+    episode_id: WorkEpisodeId,
+) -> Result<i64> {
+    next_ordinal(
+        transaction,
+        "SELECT COALESCE(MAX(checkpoint_ordinal), -1) + 1
+         FROM agent_checkpoint WHERE episode_id = ?1",
+        episode_id.to_string(),
+        "read next Agent Checkpoint ordinal",
     )
 }
 
@@ -1701,8 +2157,31 @@ fn read_episode_view(
             error.message()
         ))
     })?;
+    let checkpoints = read_episode_checkpoints(connection, episode_id)?;
+    for checkpoint in &checkpoints {
+        checkpoint
+            .validate_against_episode(&episode)
+            .map_err(|error| {
+                invariant(format!(
+                    "persisted Agent Checkpoint violates Episode contract: {}",
+                    error.message()
+                ))
+            })?;
+    }
+    if let WorkEpisodeStatus::Closed {
+        final_checkpoint_id,
+    } = episode.status
+        && checkpoints
+            .last()
+            .is_none_or(|checkpoint| checkpoint.checkpoint_id != final_checkpoint_id)
+    {
+        return Err(invariant(
+            "closed Work Episode final Checkpoint is not its persisted final Checkpoint",
+        ));
+    }
     Ok(Some(WorkEpisodeView {
         episode,
+        checkpoints,
         diagnostics: read_episode_diagnostics(connection, episode_id)?,
     }))
 }
@@ -1713,6 +2192,26 @@ fn require_episode_view(
 ) -> Result<WorkEpisodeView> {
     read_episode_view(connection, episode_id)?
         .ok_or_else(|| invariant("Work Episode disappeared inside transaction"))
+}
+
+fn read_episode_checkpoints(
+    connection: &Connection,
+    episode_id: WorkEpisodeId,
+) -> Result<Vec<AgentCheckpoint>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT checkpoint_json FROM agent_checkpoint
+             WHERE episode_id = ?1 ORDER BY checkpoint_ordinal ASC",
+        )
+        .map_err(sql_error("prepare Agent Checkpoint history"))?;
+    let rows = statement
+        .query_map([episode_id.to_string()], |row| row.get::<_, String>(0))
+        .map_err(sql_error("query Agent Checkpoint history"))?;
+    rows.map(|row| {
+        serde_json::from_str(&row.map_err(sql_error("read Agent Checkpoint row"))?)
+            .map_err(json_error("parse Agent Checkpoint history"))
+    })
+    .collect()
 }
 
 fn read_episode_intent_refs(
@@ -2403,6 +2902,14 @@ where
 
 fn invalid(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::InvalidInput, message)
+}
+
+fn conflict(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::Conflict, message)
+}
+
+fn stale(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::StaleState, message)
 }
 
 fn invariant(message: impl Into<String>) -> Error {

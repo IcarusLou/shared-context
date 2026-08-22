@@ -203,6 +203,21 @@ impl UserConfigStore {
         Ok(catalog_snapshot(&document))
     }
 
+    /// Reads the complete Catalog while waiting for a concurrent explicit
+    /// configuration writer. Request-serving code uses this after installation
+    /// initialization; Hook hot paths keep using the non-blocking reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or filesystem errors.
+    pub fn repository_catalog_wait(&self) -> Result<RepositoryCatalogSnapshot> {
+        let lock = open_private_file(&self.lock_path)?;
+        FileExt::lock_shared(&lock).map_err(io_error("lock config.lock shared"))?;
+        let document = self.read_document()?;
+        FileExt::unlock(&lock).map_err(io_error("unlock config.lock"))?;
+        Ok(catalog_snapshot(&document))
+    }
+
     /// Atomically creates a `RepositoryId` or attaches checkout paths to an existing one.
     ///
     /// `repository_id=None` is the only identity-creation path. A supplied ID must

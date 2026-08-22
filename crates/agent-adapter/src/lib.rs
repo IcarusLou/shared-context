@@ -362,6 +362,7 @@ pub fn plan_action(
             capabilities.agent,
             context,
             format!("context compaction requested ({trigger})"),
+            true,
         ),
         CanonicalAgentEvent::TurnStop {
             context, status, ..
@@ -369,6 +370,7 @@ pub fn plan_action(
             capabilities.agent,
             context,
             format!("agent turn stopped ({status})"),
+            true,
         ),
         CanonicalAgentEvent::SessionEnd {
             context, reason, ..
@@ -376,6 +378,7 @@ pub fn plan_action(
             capabilities.agent,
             context,
             format!("agent session ended ({reason})"),
+            false,
         ),
     }
 }
@@ -384,6 +387,7 @@ fn checkpoint(
     agent: AgentKind,
     context: &AgentEventContext,
     summary: String,
+    request_checkpoint: bool,
 ) -> CanonicalAgentAction {
     CanonicalAgentAction {
         task_operation: None,
@@ -394,7 +398,10 @@ fn checkpoint(
             workspace_hint: workspace_hint(context),
             file_hints: Vec::new(),
         }),
-        system_message: None,
+        system_message: request_checkpoint.then(|| {
+            "Before compaction or turn completion, use $shared-context and call task_checkpoint with complete Claims/Unknowns. Hook summary text is not Claim evidence."
+                .to_owned()
+        }),
     }
 }
 
@@ -721,19 +728,28 @@ mod tests {
             Some("session")
         );
 
-        for event in [
-            CanonicalAgentEvent::PreCompact {
-                context: context.clone(),
-                trigger: "auto".to_owned(),
-            },
-            CanonicalAgentEvent::TurnStop {
-                context: context.clone(),
-                status: "completed".to_owned(),
-            },
-            CanonicalAgentEvent::SessionEnd {
-                context,
-                reason: "other".to_owned(),
-            },
+        for (event, should_request_checkpoint) in [
+            (
+                CanonicalAgentEvent::PreCompact {
+                    context: context.clone(),
+                    trigger: "auto".to_owned(),
+                },
+                true,
+            ),
+            (
+                CanonicalAgentEvent::TurnStop {
+                    context: context.clone(),
+                    status: "completed".to_owned(),
+                },
+                true,
+            ),
+            (
+                CanonicalAgentEvent::SessionEnd {
+                    context,
+                    reason: "other".to_owned(),
+                },
+                false,
+            ),
         ] {
             let action = plan_action(&event, &codex);
             assert!(action.task_operation.is_none());
@@ -747,6 +763,13 @@ mod tests {
                     .as_ref()
                     .map(|value| value.external_session_locator.external_session_id.as_str()),
                 Some("session")
+            );
+            assert_eq!(
+                action
+                    .system_message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("task_checkpoint")),
+                should_request_checkpoint
             );
         }
     }

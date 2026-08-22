@@ -46,6 +46,21 @@ fn verified_and_trusted_codex_prompt_is_guidance_only() {
 }
 
 #[test]
+fn codex_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_claims() {
+    let capability = capabilities(Some("codex-cli 0.147.0"), true, TrustState::Confirmed);
+    for index in [3, 4] {
+        let event =
+            decode_hook_input(&serde_json::to_vec(&fixtures().remove(index)).unwrap()).unwrap();
+        let action = plan_action(&event, &capability);
+        assert!(action.task_operation.is_none());
+        assert!(action.system_message.as_deref().is_some_and(|message| {
+            message.contains("task_checkpoint")
+                && message.contains("Hook summary text is not Claim evidence")
+        }));
+    }
+}
+
+#[test]
 fn codex_unconfirmed_trust_is_action_required_and_unknown_versions_fallback() {
     let trust = capabilities(Some("0.147.0"), true, TrustState::Unconfirmed);
     assert_eq!(trust.mode, CapabilityMode::ActionRequired);

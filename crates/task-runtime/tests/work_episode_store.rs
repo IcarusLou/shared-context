@@ -5,11 +5,15 @@ use std::{
 };
 
 use sctx_domain::{
-    CaptureId, ExternalSessionLocator, NormalizedBreadcrumbKind, NormalizedWorkObservation, TaskId,
-    TaskIntent, TaskIntentDraft, TaskSignal, TaskSignalKind, TestOutcomeStatus, WorkEpisodeStatus,
-    WorkSourceRef,
+    Applicability, CaptureEvidenceRef, CaptureId, CaptureUnknown, ErrorKind, EvidenceSnapshotDraft,
+    EvidenceType, ExternalSessionLocator, NormalizedBreadcrumbKind, NormalizedWorkObservation,
+    TaskId, TaskIntent, TaskIntentDraft, TaskSignal, TaskSignalKind, TestOutcomeStatus,
+    WorkEpisodeStatus, WorkSourceRef,
 };
-use sctx_task_runtime::{CaptureIngestion, TaskRuntime, WorkEpisodeDiagnosticKind};
+use sctx_task_runtime::{
+    AgentCheckpointWrite, CaptureIngestion, CheckpointBoundary, CheckpointClaimDraft, TaskRuntime,
+    WorkEpisodeDiagnosticKind,
+};
 use tempfile::TempDir;
 
 fn intent(task_id: TaskId, goal: &str) -> TaskIntent {
@@ -71,6 +75,181 @@ fn draft(goal: &str) -> TaskIntentDraft {
         interfaces: Vec::new(),
         unknowns: Vec::new(),
     }
+}
+
+fn checkpoint_claim(statement: &str) -> CheckpointClaimDraft {
+    CheckpointClaimDraft {
+        statement: statement.to_owned(),
+        rationale: "Direct validation supports this engineering conclusion".to_owned(),
+        applicability: Applicability {
+            domains: vec!["runtime".to_owned()],
+            platforms: Vec::new(),
+            conditions: vec!["Agent Checkpoint".to_owned()],
+        },
+        assumptions: Vec::new(),
+        recheck_when: vec!["the validated behavior changes".to_owned()],
+        evidence_refs: Vec::new(),
+        inline_validations: vec![EvidenceSnapshotDraft {
+            kind: EvidenceType::ExperimentRecord,
+            supports: statement.to_owned(),
+            content: serde_json::json!({"test": "checkpoint", "actual": "passed"}),
+            interpretation: "The focused runtime behavior was directly validated".to_owned(),
+            limitations: Vec::new(),
+        }],
+        artifact_refs: Vec::new(),
+        related_contexts: Vec::new(),
+    }
+}
+
+fn checkpoint_write(
+    locator: &ExternalSessionLocator,
+    task: &sctx_domain::TaskSessionSnapshot,
+    expected_episode_version: u64,
+    boundary: CheckpointBoundary,
+    claims: Vec<CheckpointClaimDraft>,
+    unknowns: Vec<CaptureUnknown>,
+) -> AgentCheckpointWrite {
+    AgentCheckpointWrite {
+        locator: locator.clone(),
+        expected_task_id: task.task_id,
+        expected_intent_revision_id: task.current_intent_revision().unwrap().revision_id,
+        expected_episode_version,
+        boundary,
+        claims,
+        unknowns,
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn checkpoint_is_atomic_semantically_idempotent_and_closes_without_hook_observations() {
+    let temporary = TempDir::new().unwrap();
+    let runtime = Arc::new(TaskRuntime::initialize(temporary.path()).unwrap());
+    let (locator, task) = open_task(&runtime, "checkpoint", "persist conclusions");
+    let first = checkpoint_write(
+        &locator,
+        &task,
+        0,
+        CheckpointBoundary::Continue,
+        vec![checkpoint_claim("Inline validation is self-contained")],
+        Vec::new(),
+    );
+    let barrier = Arc::new(Barrier::new(8));
+    let outcomes = (0..8)
+        .map(|_| {
+            let runtime = Arc::clone(&runtime);
+            let barrier = Arc::clone(&barrier);
+            let input = first.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                runtime.write_agent_checkpoint(&input).unwrap()
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.created).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| outcome.checkpoint.checkpoint_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        1
+    );
+    let continued = &outcomes[0];
+    assert_eq!(continued.episode.episode.version, 1);
+    assert_eq!(continued.episode.checkpoints.len(), 1);
+    assert_eq!(continued.inline_observation_ids.len(), 1);
+    assert_eq!(continued.episode.episode.observations.len(), 1);
+
+    let mut conflicting = first.clone();
+    conflicting.claims[0].statement = "different semantic retry".to_owned();
+    assert_eq!(
+        runtime
+            .write_agent_checkpoint(&conflicting)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Conflict
+    );
+
+    let close = checkpoint_write(
+        &locator,
+        &task,
+        1,
+        CheckpointBoundary::Close,
+        Vec::new(),
+        vec![CaptureUnknown {
+            statement: "Compatibility remains to be checked".to_owned(),
+            blocking: true,
+            recheck_when: vec!["the client matrix is available".to_owned()],
+        }],
+    );
+    let closed = runtime.write_agent_checkpoint(&close).unwrap();
+    assert!(closed.created);
+    assert_eq!(closed.episode.episode.version, 2);
+    assert_eq!(closed.episode.checkpoints.len(), 2);
+    assert!(matches!(
+        closed.episode.episode.status,
+        WorkEpisodeStatus::Closed { final_checkpoint_id }
+            if final_checkpoint_id == closed.checkpoint.checkpoint_id
+    ));
+    let retry = runtime.write_agent_checkpoint(&close).unwrap();
+    assert!(!retry.created);
+    assert_eq!(retry.checkpoint, closed.checkpoint);
+
+    let stale = checkpoint_write(
+        &locator,
+        &task,
+        2,
+        CheckpointBoundary::Continue,
+        vec![checkpoint_claim("closed Episodes reject later writes")],
+        Vec::new(),
+    );
+    assert_eq!(
+        runtime.write_agent_checkpoint(&stale).unwrap_err().kind(),
+        ErrorKind::StaleState
+    );
+
+    let (_, other_task) = open_task(&runtime, "checkpoint-other", "isolated owner");
+    let other_locator = ExternalSessionLocator::new("codex", "checkpoint-other").unwrap();
+    let mut cross_task_claim = checkpoint_claim("cross Task evidence is rejected");
+    cross_task_claim.inline_validations.clear();
+    cross_task_claim.evidence_refs = vec![CaptureEvidenceRef::Observation {
+        observation_id: continued.inline_observation_ids[0],
+    }];
+    let cross_task = checkpoint_write(
+        &other_locator,
+        &other_task,
+        0,
+        CheckpointBoundary::Continue,
+        vec![cross_task_claim],
+        Vec::new(),
+    );
+    assert_eq!(
+        runtime
+            .write_agent_checkpoint(&cross_task)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidInput
+    );
+    assert!(
+        runtime
+            .list_work_episodes(other_task.task_session_id, 10)
+            .unwrap()
+            .is_empty(),
+        "failed cross-Task writes must roll back Episode creation"
+    );
+
+    runtime
+        .start_new_task(&locator, task.task_id, &draft("switched task"), Vec::new())
+        .unwrap();
+    assert_eq!(
+        runtime.write_agent_checkpoint(&close).unwrap_err().kind(),
+        ErrorKind::InvalidInput,
+        "Task switch must make the previous Checkpoint owner inactive"
+    );
 }
 
 #[test]
@@ -371,16 +550,21 @@ fn deleting_runtime_loses_episode_only_and_preserves_other_state() {
     let root = temporary.path().join("root");
     let runtime = TaskRuntime::initialize(&root).unwrap();
     let (locator, task) = open_task(&runtime, "episode-delete", "delete runtime");
-    let episode_id = runtime
-        .open_work_episode(
+    let checkpoint = runtime
+        .write_agent_checkpoint(&checkpoint_write(
             &locator,
-            task.task_id,
-            task.current_intent_revision().unwrap().revision_id,
-        )
-        .unwrap()
-        .episode
-        .episode
-        .episode_id;
+            &task,
+            0,
+            CheckpointBoundary::Close,
+            Vec::new(),
+            vec![CaptureUnknown {
+                statement: "Runtime deletion removes local Checkpoint state".to_owned(),
+                blocking: false,
+                recheck_when: Vec::new(),
+            }],
+        ))
+        .unwrap();
+    let episode_id = checkpoint.episode.episode.episode_id;
     fs::create_dir_all(root.join("repository")).unwrap();
     fs::write(root.join("repository/fact"), b"git fact").unwrap();
     fs::write(root.join("state/index.sqlite"), b"index").unwrap();

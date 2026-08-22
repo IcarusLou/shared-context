@@ -39,8 +39,8 @@ use sctx_local_state::{
 };
 use sctx_mcp::{
     ArtifactFocusQuery, AssociationExplainInput, AssociationRebuildInput,
-    EngineeringReferenceRecordInput, RepositoryScanInput, TaskContextReadInput,
-    TaskIntentUpdateInput, TaskSignalSupersedeInput,
+    EngineeringReferenceRecordInput, RepositoryScanInput, TaskCheckpointInput,
+    TaskContextReadInput, TaskIntentUpdateInput, TaskSignalSupersedeInput,
 };
 use sctx_search::{ContextStatus, ScopeFilter, SearchEngine, SearchFilters, SearchRequest};
 use sctx_task_runtime::TaskRuntime;
@@ -64,7 +64,7 @@ Commands:
   candidate create
   context revise|review|publish|withdraw|get
   semantic conflict open|resolve
-  task context|artifact-focus|intent update|signal supersede
+  task context|artifact-focus|checkpoint|intent update|signal supersede
   repository add|list|doctor|scan
   engineering-reference record
   association explain|rebuild
@@ -628,8 +628,10 @@ fn verify_demo_mcp(
         .and_then(|response| response.pointer("/result/tools"))
         .and_then(Value::as_array)
         .ok_or_else(|| invariant("demo MCP tools/list response is missing"))?;
-    if tools.len() != 12 {
-        return Err(invariant("demo MCP tools/list did not return twelve tools"));
+    if tools.len() != 13 || !tools.iter().any(|tool| tool["name"] == "task_checkpoint") {
+        return Err(invariant(
+            "demo MCP tools/list did not return the thirteen-tool Checkpoint surface",
+        ));
     }
     let results = responses
         .get(2)
@@ -1609,6 +1611,17 @@ fn run_task(args: &[String], json_output: bool) -> Result<()> {
                 json_output,
             )
         }
+        [command, rest @ ..] if command == "checkpoint" => {
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(&["--input"], &[])?;
+            let input: TaskCheckpointInput =
+                read_json(options.required("--input")?, "Task Checkpoint")?;
+            let response = sctx_mcp::task_checkpoint_at_root(installation_root()?, &input)?;
+            let metadata = Runtime::open()?.index.synchronize()?.metadata;
+            let data = serde_json::to_value(&response)
+                .map_err(json_error("serialize Task Checkpoint response"))?;
+            emit("task.checkpoint", &metadata, data, json_output)
+        }
         [group, command, rest @ ..] if group == "intent" && command == "update" => {
             let options = Options::parse(rest, &[])?;
             options.allow_only(&["--input"], &[])?;
@@ -1641,7 +1654,7 @@ fn run_task(args: &[String], json_output: bool) -> Result<()> {
             emit("task.signal.supersede", &metadata, data, json_output)
         }
         _ => Err(invalid(
-            "Usage: sctx task context|artifact-focus|intent update|signal supersede [OPTIONS]",
+            "Usage: sctx task context|artifact-focus|checkpoint|intent update|signal supersede [OPTIONS]",
         )),
     }
 }

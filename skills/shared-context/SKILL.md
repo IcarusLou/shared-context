@@ -1,6 +1,6 @@
 ---
 name: shared-context
-description: Maintain Shared Context Task Intent, query historical Context around an Artifact, manage signal lifecycle, and record verified engineering references during substantive work. Use when starting implementation, debugging, review, or design; when goals, scope, constraints, Artifacts, Interfaces, or Unknowns materially change; when history around a File, Module, Symbol/Class, API, Schema, or Test is needed; when verified evidence connects existing Context to code; when the user switches tasks; when signals become irrelevant; and before context compaction.
+description: Maintain Shared Context Task Intent, record Agent Checkpoints, query historical Context around an Artifact, manage signal lifecycle, and record verified engineering references during substantive work. Use when starting implementation, debugging, review, or design; when goals, scope, constraints, Artifacts, Interfaces, Unknowns, or important conclusions materially change; when history around a File, Module, Symbol/Class, API, Schema, or Test is needed; when verified evidence connects existing Context to code; when the user switches tasks; when signals become irrelevant; before context compaction; and before a turn stops.
 ---
 
 # Shared Context
@@ -27,6 +27,16 @@ Set `task_boundary` deliberately:
 - Use `continue` for the same engineering objective, including refinements, fixes, tests, added constraints, changed scope, and newly discovered Artifacts or Interfaces.
 - Use `new` only when the user clearly switches to an unrelated objective or deliverable. A shared Workspace, repository, file, or prior signal does not make two tasks the same.
 - If the boundary is ambiguous, preserve continuity with `continue` and record the uncertainty in `unknowns`.
+
+## Record engineering understanding
+
+Call `task_checkpoint` after forming an important engineering conclusion, immediately before PreCompact, and immediately before TurnStop. The working Agent must author the complete Claims and Unknowns; never turn Hook summary text into a Claim.
+
+Send the current external Session locator, returned `task_id`, current `intent_revision_id`, and exact Episode version. Use version `0` for the first Checkpoint; after each successful response use its `episode_version`. Retry a timeout with the same parent version and byte-equivalent semantic content. Reconcile `checkpoint_stale`; do not overwrite `checkpoint_conflict`.
+
+For every Claim include `statement`, `rationale`, complete `applicability`, `assumptions`, `recheck_when`, `evidence`, `artifact_refs`, and `related_contexts`. Evidence may reference an owned Work Observation, any retained Signal of this Task, exact Context/Revision/Evidence coordinates, or a self-contained inline Validation snapshot. Artifact references describe applicability but are not Evidence by themselves. Never include raw transcripts, commands, tool output, Secrets, PII, Space routing, governance actions, or caller-generated Checkpoint/Claim/Observation IDs.
+
+Use boundary `continue` while the Episode remains active and `close` at the final boundary. An Unknown-only Checkpoint is valid for either boundary and records no knowledge assertion. `task_checkpoint` stores local Episode state only and never creates, confirms, or publishes a Candidate.
 
 ## Retire stale signals
 

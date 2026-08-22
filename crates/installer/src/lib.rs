@@ -2167,9 +2167,14 @@ fn mcp_smoke(root: &Path) -> Result<()> {
             .map(serde_json::from_str::<Value>)
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| invalid(format!("invalid MCP smoke response: {error}")))?;
+        let tools = values
+            .get(1)
+            .and_then(|value| value["result"]["tools"].as_array());
         if values.len() != 2
             || values.iter().any(|value| value.get("error").is_some())
-            || values[1]["result"]["tools"].as_array().map_or(0, Vec::len) != 12
+            || tools.is_none_or(|tools| {
+                tools.len() != 13 || !tools.iter().any(|tool| tool["name"] == "task_checkpoint")
+            })
         {
             return Err(Error::new(
                 ErrorKind::InvariantViolation,

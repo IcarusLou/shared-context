@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AgentCheckpointId, Applicability, ArtifactLocator, CandidateBuildId, CandidateId, CaptureId,
     CheckpointClaimId, ContextId, ContextRevisionDraft, Error, ErrorKind, EvidenceId,
-    IntentSnapshot, RepositoryId, Result, RevisionId, SignalId, SpaceId, SpaceRecommendationId,
-    TaskId, TaskIntentRevisionId, TaskSessionId, TaskSignalKind, WorkEpisodeId, WorkObservationId,
+    EvidenceSnapshotDraft, IntentSnapshot, RepositoryId, Result, RevisionId, SignalId, SpaceId,
+    SpaceRecommendationId, TaskId, TaskIntentRevisionId, TaskSessionId, TaskSignalKind,
+    WorkEpisodeId, WorkObservationId,
 };
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -270,6 +271,9 @@ pub enum NormalizedWorkObservation {
         conclusion: String,
         evidence_refs: Vec<CaptureEvidenceRef>,
     },
+    InlineValidation {
+        evidence: EvidenceSnapshotDraft,
+    },
     UnresolvedQuestion {
         question: String,
     },
@@ -328,6 +332,7 @@ impl NormalizedWorkObservation {
                 }
                 require_unique(evidence_refs, &format!("{field}.evidence_refs"))
             }
+            Self::InlineValidation { evidence } => evidence.validate(&format!("{field}.evidence")),
             Self::UnresolvedQuestion { question } => {
                 require_text(question, &format!("{field}.question"))
             }
@@ -373,7 +378,12 @@ impl WorkObservation {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.source_refs.is_empty() {
+        if self.source_refs.is_empty()
+            && !matches!(
+                self.observation,
+                NormalizedWorkObservation::InlineValidation { .. }
+            )
+        {
             return Err(invalid("work_observation.source_refs must not be empty"));
         }
         require_unique(&self.source_refs, "work_observation.source_refs")?;
@@ -475,15 +485,10 @@ impl WorkEpisode {
     ///
     /// # Errors
     ///
-    /// Rejects empty/already-closed Episodes or a Checkpoint from another owner/Intent range.
+    /// Rejects already-closed Episodes or a Checkpoint from another owner/Intent range.
     pub fn close(&mut self, checkpoint: &AgentCheckpoint) -> Result<()> {
         if self.status != WorkEpisodeStatus::Open {
             return Err(invalid("Work Episode is already closed"));
-        }
-        if self.observations.is_empty() {
-            return Err(invalid(
-                "Work Episode requires at least one observation before close",
-            ));
         }
         checkpoint.validate_against_episode(self)?;
         self.status = WorkEpisodeStatus::Closed {
@@ -515,9 +520,6 @@ impl WorkEpisode {
                 ));
             }
             self.validate_observation(observation)?;
-        }
-        if matches!(self.status, WorkEpisodeStatus::Closed { .. }) && self.observations.is_empty() {
-            return Err(invalid("closed Work Episode must contain observations"));
         }
         Ok(())
     }

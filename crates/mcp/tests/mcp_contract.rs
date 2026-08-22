@@ -6,16 +6,21 @@ use std::{
 };
 
 use sctx_domain::{
-    Applicability, ContextId, ContextKind, ContextRevisionDraft, EvidenceSnapshotDraft,
-    EvidenceType, IntentSnapshot, PublicationAction, PublicationDraft, RevisionId, SpaceId, TaskId,
-    TaskIntentDraft, TaskSignal, TaskSignalKind, WorkEpisodeId,
+    Applicability, ArtifactLocator, ArtifactRef, ContextId, ContextKind, ContextRevisionDraft,
+    ContextRevisionRef, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, PublicationAction,
+    PublicationDraft, RepoRelativePath, RepositoryId, RevisionId, SpaceId, TaskId, TaskIntentDraft,
+    TaskSignal, TaskSignalKind, WorkEpisodeId,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
+use sctx_index::ProjectionIndex;
+use sctx_local_state::UserConfigStore;
 use sctx_mcp::{
     ClientKind, DisconnectReason, ExpectedRevisionId, IntentMaturity, McpServer, TaskBoundary,
-    TaskContextReadInput, TaskIntentUpdateInput, TaskSignalSupersedeInput, TransportErrorKind,
-    task_context_readonly_at_root, task_intent_update_at_root, task_signal_supersede_at_root,
+    TaskCheckpointBoundary, TaskCheckpointClaimInput, TaskCheckpointEvidenceInput,
+    TaskCheckpointInput, TaskContextReadInput, TaskIntentUpdateInput, TaskSignalSupersedeInput,
+    TransportErrorKind, task_checkpoint_at_root, task_context_readonly_at_root,
+    task_intent_update_at_root, task_signal_supersede_at_root,
 };
 use sctx_task_runtime::TaskRuntime;
 use serde_json::{Value, json};
@@ -268,6 +273,400 @@ fn decode_frames(bytes: &[u8], framing: FixtureFraming) -> Vec<Value> {
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+fn checkpoint_arguments(
+    agent_kind: &str,
+    session: &str,
+    task_id: &str,
+    revision_id: &str,
+    version: u64,
+    boundary: &str,
+    claims: Value,
+    unknowns: Value,
+) -> Value {
+    json!({
+        "agent_kind": agent_kind,
+        "external_session_id": session,
+        "expected_task_id": task_id,
+        "expected_intent_revision_id": revision_id,
+        "expected_episode_version": version,
+        "boundary": boundary,
+        "claims": claims,
+        "unknowns": unknowns
+    })
+}
+
+fn typed_checkpoint_input(
+    session: &str,
+    task_id: TaskId,
+    revision_id: sctx_domain::TaskIntentRevisionId,
+    version: u64,
+    evidence: Vec<TaskCheckpointEvidenceInput>,
+) -> TaskCheckpointInput {
+    TaskCheckpointInput {
+        agent_kind: "codex".to_owned(),
+        external_session_id: session.to_owned(),
+        expected_task_id: task_id.to_string(),
+        expected_intent_revision_id: revision_id.to_string(),
+        expected_episode_version: version,
+        boundary: TaskCheckpointBoundary::Continue,
+        claims: vec![TaskCheckpointClaimInput {
+            statement: "Checkpoint validation is strict".to_owned(),
+            rationale: "Invalid references and private content must fail before storage".to_owned(),
+            applicability: Applicability {
+                domains: vec!["mcp".to_owned()],
+                platforms: Vec::new(),
+                conditions: vec!["checkpoint".to_owned()],
+            },
+            assumptions: Vec::new(),
+            recheck_when: vec!["the schema changes".to_owned()],
+            evidence,
+            artifact_refs: Vec::new(),
+            related_contexts: Vec::new(),
+        }],
+        unknowns: Vec::new(),
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn checkpoint_rejects_dangling_private_stale_conflicting_and_forged_input_without_residue() {
+    let fixture = Fixture::new();
+    let session = "checkpoint-validation";
+    let created = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            session,
+            TaskBoundary::New,
+            None,
+            IntentMaturity::Provisional,
+            "validate checkpoint boundaries",
+        ),
+    )
+    .unwrap();
+    let task_id = created.context.task_id;
+    let revision_id = created.context.intent_revision_id;
+    let runtime = TaskRuntime::initialize(&fixture.root).unwrap();
+    let projection = ProjectionIndex::for_store(&fixture.store)
+        .domain_snapshot()
+        .unwrap();
+    let context_revision = &projection.projection.spaces[&fixture.space_id].contexts
+        [&fixture.context_id]
+        .revisions[&fixture.revision_id]
+        .revision;
+    let evidence_id = context_revision.evidence[0].evidence_id;
+
+    let repository = fixture.root.join("checkpoint repository");
+    fs::create_dir_all(&repository).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&repository)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let repository = fs::canonicalize(repository).unwrap();
+    let repository_id = UserConfigStore::initialize(&fixture.root)
+        .unwrap()
+        .add_repository(None, std::slice::from_ref(&repository))
+        .unwrap()
+        .repository
+        .repository_id;
+
+    let dangling = typed_checkpoint_input(
+        session,
+        task_id,
+        revision_id,
+        0,
+        vec![TaskCheckpointEvidenceInput::ContextEvidence {
+            context_id: ContextId::new().to_string(),
+            revision_id: RevisionId::new().to_string(),
+            evidence_id: sctx_domain::EvidenceId::new().to_string(),
+        }],
+    );
+    assert_eq!(
+        task_checkpoint_at_root(&fixture.root, &dangling)
+            .unwrap_err()
+            .kind(),
+        sctx_domain::ErrorKind::InvalidInput
+    );
+    assert!(
+        runtime
+            .list_work_episodes(created.context.task_session_id, 10)
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut private = typed_checkpoint_input(
+        session,
+        task_id,
+        revision_id,
+        0,
+        vec![TaskCheckpointEvidenceInput::InlineValidation {
+            evidence: EvidenceSnapshotDraft {
+                kind: EvidenceType::ExperimentRecord,
+                supports: "private validation".to_owned(),
+                content: json!({"owner": "person@example.com"}),
+                interpretation: "private content must not persist".to_owned(),
+                limitations: Vec::new(),
+            },
+        }],
+    );
+    assert_eq!(
+        task_checkpoint_at_root(&fixture.root, &private)
+            .unwrap_err()
+            .kind(),
+        sctx_domain::ErrorKind::PrivacyRejected
+    );
+    private.claims[0].evidence = vec![
+        TaskCheckpointEvidenceInput::InlineValidation {
+            evidence: EvidenceSnapshotDraft {
+                kind: EvidenceType::ExperimentRecord,
+                supports: "public validation".to_owned(),
+                content: json!({"actual": "passed"}),
+                interpretation: "the safe result is self-contained".to_owned(),
+                limitations: Vec::new(),
+            },
+        },
+        TaskCheckpointEvidenceInput::ContextEvidence {
+            context_id: fixture.context_id.to_string(),
+            revision_id: fixture.revision_id.to_string(),
+            evidence_id: evidence_id.to_string(),
+        },
+    ];
+    private.claims[0].artifact_refs = vec![ArtifactRef {
+        repository_id,
+        locator: ArtifactLocator::File {
+            path: RepoRelativePath::new("src/checkpoint.rs").unwrap(),
+        },
+    }];
+    private.claims[0].related_contexts = vec![ContextRevisionRef {
+        context_id: fixture.context_id,
+        revision_id: fixture.revision_id,
+    }];
+
+    let mut unknown_repository = private.clone();
+    unknown_repository.claims[0].artifact_refs[0].repository_id = RepositoryId::new();
+    assert_eq!(
+        task_checkpoint_at_root(&fixture.root, &unknown_repository)
+            .unwrap_err()
+            .kind(),
+        sctx_domain::ErrorKind::InvalidInput
+    );
+    let mut artifact_only = private.clone();
+    artifact_only.claims[0].evidence.clear();
+    assert_eq!(
+        task_checkpoint_at_root(&fixture.root, &artifact_only)
+            .unwrap_err()
+            .kind(),
+        sctx_domain::ErrorKind::InvalidInput,
+        "an Artifact association must not satisfy Claim Evidence"
+    );
+    let persisted = task_checkpoint_at_root(&fixture.root, &private).unwrap();
+    assert!(persisted.created);
+
+    let mut conflict = private.clone();
+    conflict.claims[0].statement = "different content at the same parent".to_owned();
+    assert_eq!(
+        task_checkpoint_at_root(&fixture.root, &conflict)
+            .unwrap_err()
+            .kind(),
+        sctx_domain::ErrorKind::Conflict
+    );
+    let stale = typed_checkpoint_input(session, task_id, revision_id, 9, Vec::new());
+    assert_eq!(
+        task_checkpoint_at_root(&fixture.root, &stale)
+            .unwrap_err()
+            .kind(),
+        sctx_domain::ErrorKind::StaleState
+    );
+
+    let mut server = fixture.server(ClientKind::Codex);
+    let mut forged = serde_json::to_value(&private).unwrap();
+    forged["space_id"] = json!(SpaceId::new());
+    let mut private_rpc = private.clone();
+    private_rpc.claims[0].statement = "contact person@example.com".to_owned();
+    let responses = run_session(
+        &mut server,
+        FixtureFraming::Newline,
+        &[
+            request(10, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(11, "task_checkpoint", forged),
+            tool_call(
+                12,
+                "task_checkpoint",
+                serde_json::to_value(conflict).unwrap(),
+            ),
+            tool_call(13, "task_checkpoint", serde_json::to_value(stale).unwrap()),
+            tool_call(
+                14,
+                "task_checkpoint",
+                serde_json::to_value(private_rpc).unwrap(),
+            ),
+        ],
+    );
+    assert_eq!(responses[1]["result"]["isError"], true);
+    assert_eq!(
+        responses[1]["result"]["structuredContent"]["error"]["code"],
+        "invalid_input"
+    );
+    assert_eq!(
+        responses[2]["result"]["structuredContent"]["error"]["code"],
+        "checkpoint_conflict"
+    );
+    assert_eq!(
+        responses[3]["result"]["structuredContent"]["error"]["code"],
+        "checkpoint_stale"
+    );
+    assert_eq!(
+        responses[4]["result"]["structuredContent"]["error"]["code"],
+        "privacy_rejected"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn codex_and_cursor_checkpoint_inline_evidence_and_close_without_hook_or_candidate() {
+    for (client, framing, agent_kind) in [
+        (ClientKind::Cursor, FixtureFraming::Newline, "cursor"),
+        (ClientKind::Codex, FixtureFraming::ContentLength, "codex"),
+    ] {
+        let fixture = Fixture::new();
+        let before_events = event_count(fixture.store.repository());
+        let session = format!("checkpoint-{agent_kind}");
+        let mut server = fixture.server(client);
+        let started = run_session(
+            &mut server,
+            framing,
+            &[
+                request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+                tool_call(
+                    2,
+                    "task_intent_update",
+                    serde_json::to_value(TaskIntentUpdateInput {
+                        agent_kind: agent_kind.to_owned(),
+                        external_session_id: session.clone(),
+                        ..update_input(
+                            &session,
+                            TaskBoundary::New,
+                            None,
+                            IntentMaturity::Provisional,
+                            "record a verified checkpoint",
+                        )
+                    })
+                    .unwrap(),
+                ),
+            ],
+        );
+        let task = &started[1]["result"]["structuredContent"];
+        let task_id = task["task_id"].as_str().unwrap();
+        let revision_id = task["intent_revision_id"].as_str().unwrap();
+        let claims = json!([{
+            "statement": "The public Checkpoint transaction completed",
+            "rationale": "A real MCP client submitted self-contained validation",
+            "applicability": {"domains": ["mcp"], "platforms": [], "conditions": [agent_kind]},
+            "assumptions": [],
+            "recheck_when": ["the Checkpoint contract changes"],
+            "evidence": [{
+                "kind": "inline_validation",
+                "evidence": {
+                    "kind": "experiment_record",
+                    "supports": "the Checkpoint write completed",
+                    "content": {"client": agent_kind, "actual": "persisted"},
+                    "interpretation": "the no-Hook workflow is executable",
+                    "limitations": []
+                }
+            }],
+            "artifact_refs": [],
+            "related_contexts": []
+        }]);
+        let continued_arguments = checkpoint_arguments(
+            agent_kind,
+            &session,
+            task_id,
+            revision_id,
+            0,
+            "continue",
+            claims,
+            json!([]),
+        );
+        let continued = run_session(
+            &mut server,
+            framing,
+            &[tool_call(3, "task_checkpoint", continued_arguments.clone())],
+        );
+        let continued = &continued[0]["result"]["structuredContent"];
+        assert_eq!(continued["created"], true);
+        assert_eq!(continued["episode_version"], 1);
+        assert_eq!(continued["episode_status"], json!({"status": "open"}));
+        assert!(
+            continued["checkpoint_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("ckp_")
+        );
+        assert!(
+            continued["claim_ids"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("clm_")
+        );
+        assert_eq!(
+            continued["diagnostics"][0]["kind"],
+            "inline_validation_recorded"
+        );
+
+        let retried = run_session(
+            &mut server,
+            framing,
+            &[tool_call(4, "task_checkpoint", continued_arguments)],
+        );
+        let retried = &retried[0]["result"]["structuredContent"];
+        assert_eq!(retried["created"], false);
+        assert_eq!(retried["checkpoint_id"], continued["checkpoint_id"]);
+
+        let closed = run_session(
+            &mut server,
+            framing,
+            &[tool_call(
+                5,
+                "task_checkpoint",
+                checkpoint_arguments(
+                    agent_kind,
+                    &session,
+                    task_id,
+                    revision_id,
+                    1,
+                    "close",
+                    json!([]),
+                    json!([{
+                        "statement": "No further conclusion is asserted",
+                        "blocking": false,
+                        "recheck_when": []
+                    }]),
+                ),
+            )],
+        );
+        let closed = &closed[0]["result"]["structuredContent"];
+        assert_eq!(closed["created"], true);
+        assert_eq!(closed["episode_version"], 2);
+        assert_eq!(
+            closed["episode_status"]["final_checkpoint_id"],
+            closed["checkpoint_id"]
+        );
+        let episode_id = closed["episode_id"].as_str().unwrap().parse().unwrap();
+        let persisted = TaskRuntime::initialize(&fixture.root)
+            .unwrap()
+            .read_work_episode(episode_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.checkpoints.len(), 2);
+        assert_eq!(persisted.episode.observations.len(), 1);
+        assert_eq!(event_count(fixture.store.repository()), before_events);
+    }
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() {
@@ -332,7 +731,7 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
 
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 13);
         let names = tools
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
@@ -343,6 +742,7 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
                 "task_intent_update",
                 "task_artifact_focus",
                 "task_signal_supersede",
+                "task_checkpoint",
                 "task_context",
                 "repository_scan",
                 "engineering_reference_record",
@@ -444,6 +844,39 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
             );
         }
         assert!(!focus_schema_text.contains("\"path\""));
+        let checkpoint_schema = &tools
+            .iter()
+            .find(|tool| tool["name"] == "task_checkpoint")
+            .unwrap()["inputSchema"];
+        assert_eq!(checkpoint_schema["additionalProperties"], false);
+        assert_eq!(
+            checkpoint_schema["required"],
+            json!([
+                "agent_kind",
+                "external_session_id",
+                "expected_task_id",
+                "expected_intent_revision_id",
+                "expected_episode_version",
+                "boundary",
+                "claims",
+                "unknowns"
+            ])
+        );
+        let checkpoint_schema_text = checkpoint_schema.to_string();
+        for forbidden in [
+            "checkpoint_id",
+            "claim_id",
+            "episode_id",
+            "space_id",
+            "publication",
+            "governance",
+            "candidate",
+        ] {
+            assert!(
+                !checkpoint_schema_text.contains(forbidden),
+                "caller-owned Checkpoint field leaked: {forbidden}"
+            );
+        }
         let repository_scan_schema = &tools
             .iter()
             .find(|tool| tool["name"] == "repository_scan")
