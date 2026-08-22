@@ -24,15 +24,16 @@ use sctx_domain::{
     TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId,
 };
 use sctx_engineering_graph::{
-    CandidateMatchEvidence, EngineeringProjectionStore, EngineeringReferenceResolver,
-    MAX_REPOSITORY_SCAN_PLAN_PATHS, ProjectedEngineeringReference, RegisterRepositoryRequest,
-    RegisteredRepository, RepositoryAvailability, RepositoryRegistry, RepositoryScanOutcome,
-    RepositoryScanPlan, RepositoryScanner, ResolvedReferenceProjection, SkippedFileReason,
-    build_graph_context_snapshots,
+    CandidateMatchEvidence, CatalogRepositorySpec, EngineeringProjectionStore,
+    EngineeringReferenceResolver, MAX_REPOSITORY_SCAN_PLAN_PATHS, ProjectedEngineeringReference,
+    RegisteredRepository, RepositoryAvailability, RepositoryCatalogSyncReport, RepositoryRegistry,
+    RepositoryScanOutcome, RepositoryScanPlan, RepositoryScanner, ResolvedReferenceProjection,
+    SkippedFileReason, build_graph_context_snapshots,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::{DomainSnapshot, ProjectionIndex};
+use sctx_local_state::UserConfigStore;
 use sctx_search::{
     ConflictView, ContextPackOmitted, ContextStatus, DEFAULT_TASK_MAX_SPACES, MAX_TASK_MAX_SPACES,
     MIN_TASK_CONTEXT_TOKEN_BUDGET, ScopeFilter, SearchEngine, SearchFilters, SearchRequest,
@@ -222,10 +223,6 @@ pub struct TaskContextResponse {
 pub struct RepositoryScanInput {
     pub checkout_path: String,
     pub paths: Vec<String>,
-    #[serde(default)]
-    pub declared_identity: Option<String>,
-    #[serde(default)]
-    pub remote_hint: Option<String>,
     #[serde(default = "default_scan_artifact_limit")]
     pub max_artifacts: usize,
 }
@@ -471,6 +468,7 @@ impl Runtime {
         let store = GitStore::initialize(root)?;
         let index = ProjectionIndex::for_store(&store);
         let repositories = RepositoryRegistry::initialize(root)?;
+        sync_repository_catalog(root, &repositories)?;
         let engineering_graph = EngineeringProjectionStore::initialize(root).ok();
         let tasks = TaskRuntime::initialize(root)?;
         Ok(Self {
@@ -616,19 +614,22 @@ impl Runtime {
             .iter()
             .map(RepoRelativePath::new)
             .collect::<Result<Vec<_>>>()?;
-        let registered = self.repositories.register(&RegisterRepositoryRequest {
-            checkout_path: PathBuf::from(&input.checkout_path),
-            declared_identity: input.declared_identity.clone(),
-            remote_hint: input.remote_hint.clone(),
-        })?;
         let requested = fs::canonicalize(&input.checkout_path).map_err(|error| {
             Error::new(
                 ErrorKind::Io,
                 format!("canonicalize scan checkout: {error}"),
             )
         })?;
+        let registered = self
+            .repositories
+            .resolve_by_checkout_path(&requested)?
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::RepositoryNotConfigured,
+                    "repository_scan checkout is not configured in the Repository Catalog",
+                )
+            })?;
         let locator = registered
-            .repository
             .locators
             .iter()
             .find(|locator| {
@@ -636,16 +637,16 @@ impl Runtime {
                     && locator.checkout_path == requested
                     && locator.checkout_path.exists()
             })
-            .ok_or_else(|| invalid("registered Repository has no available local checkout"))?;
-        let plan = RepositoryScanPlan::new(registered.repository.identity.repository_id, paths)?;
+            .ok_or_else(|| invalid("configured Repository has no available local checkout"))?;
+        let plan = RepositoryScanPlan::new(registered.identity.repository_id, paths)?;
         let outcome = RepositoryScanner::default().scan(
-            &registered.repository.identity,
+            &registered.identity,
             &locator.checkout_path,
             &plan,
         )?;
         let metadata = self.index.synchronize()?.metadata;
         Ok(repository_scan_response(
-            &registered.repository,
+            &registered,
             &locator.checkout_path,
             outcome,
             input.max_artifacts,
@@ -1137,6 +1138,35 @@ fn active_signal_records(
         .into_iter()
         .filter(|record| record.lifecycle == TaskSignalLifecycle::Active)
         .collect())
+}
+
+fn sync_repository_catalog(
+    root: &Path,
+    registry: &RepositoryRegistry,
+) -> Result<RepositoryCatalogSyncReport> {
+    let catalog = UserConfigStore::initialize(root)?.repository_catalog()?;
+    let specifications = catalog
+        .repositories
+        .into_iter()
+        .map(|repository| CatalogRepositorySpec {
+            repository_id: repository.repository_id,
+            checkout_paths: repository.checkout_paths,
+        })
+        .collect::<Vec<_>>();
+    registry.sync_catalog(&specifications)
+}
+
+/// Synchronizes the disposable Repository Registry from the authoritative local Catalog.
+///
+/// # Errors
+///
+/// Returns typed Catalog, Git validation, locking, or Registry errors.
+pub fn sync_repository_catalog_at_root(
+    root: impl AsRef<Path>,
+) -> Result<RepositoryCatalogSyncReport> {
+    let root = root.as_ref();
+    let registry = RepositoryRegistry::initialize(root)?;
+    sync_repository_catalog(root, &registry)
 }
 
 /// Reads a Context Pack for an already-authoritative `ActiveTask` without mutation.
@@ -1710,6 +1740,7 @@ impl ToolFailure {
             ErrorKind::Io => "engineering_graph_storage_failed",
             ErrorKind::External => "engineering_graph_unavailable",
             ErrorKind::Unsupported => "engineering_graph_unsupported",
+            ErrorKind::RepositoryNotConfigured => "repository_not_configured",
             _ => "engineering_graph_failed",
         };
         Self { code, error }
@@ -1957,8 +1988,6 @@ fn repository_scan_schema() -> Value {
                 "maxItems": MAX_REPOSITORY_SCAN_PLAN_PATHS,
                 "items": {"type": "string", "minLength": 1}
             },
-            "declared_identity": {"type": "string", "minLength": 1},
-            "remote_hint": {"type": "string", "minLength": 1},
             "max_artifacts": {"type": "integer", "minimum": 1, "maximum": MAX_SCAN_ARTIFACT_LIMIT, "default": DEFAULT_SCAN_ARTIFACT_LIMIT}
         }
     })
@@ -2481,6 +2510,7 @@ const fn error_code(kind: ErrorKind) -> &'static str {
         ErrorKind::Io => "io_error",
         ErrorKind::External => "external_error",
         ErrorKind::Unsupported => "unsupported",
+        ErrorKind::RepositoryNotConfigured => "repository_not_configured",
         _ => "unknown_error",
     }
 }

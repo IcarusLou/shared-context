@@ -24,6 +24,7 @@ use sctx_adapter_codex::TrustState;
 pub use sctx_domain::{Error, ErrorKind, Result};
 use sctx_git_store::GitStore;
 use sctx_index::ProjectionIndex;
+use sctx_local_state::{CatalogCheckoutStatus, UserConfigStore};
 use sctx_mcp::{ClientKind, McpServer};
 use sctx_search::{SearchEngine, SearchFilters, SearchRequest};
 use serde::{Deserialize, Serialize};
@@ -515,6 +516,7 @@ impl Installer {
         self.fail(SetupStage::RepositoryInitialized)?;
         let index = ProjectionIndex::for_store(&store);
         index.synchronize()?;
+        sctx_mcp::sync_repository_catalog_at_root(&self.context.root)?;
         self.fail(SetupStage::IndexInitialized)?;
 
         let stable_binary = current.join("sctx");
@@ -626,6 +628,7 @@ impl Installer {
         check_runtime(root, &mut checks);
         check_repository(root, &mut checks);
         check_index(root, &mut checks);
+        check_repository_catalog(root, &mut checks);
         check_configs(root, &self.context.home, &mut checks);
         check_global_skill(root, &self.context.home, &mut checks);
         if root.join("repository/.git").is_dir() && root.join("bin/current/sctx").is_file() {
@@ -2315,6 +2318,84 @@ fn check_index(root: &Path, checks: &mut Vec<DoctorCheck>) {
     match SearchEngine::new(index).search(&request) {
         Ok(_) => checks.push(ok("fts", "FTS query smoke passed")),
         Err(error) => checks.push(failed("fts", error.to_string())),
+    }
+}
+
+fn check_repository_catalog(root: &Path, checks: &mut Vec<DoctorCheck>) {
+    let config = match UserConfigStore::initialize(root) {
+        Ok(config) => config,
+        Err(error) => {
+            checks.push(failed("repository_catalog", error.to_string()));
+            return;
+        }
+    };
+    let report = match config.doctor_repository_catalog() {
+        Ok(report) => report,
+        Err(error) => {
+            checks.push(failed("repository_catalog", error.to_string()));
+            return;
+        }
+    };
+    for checkout in &report.checkouts {
+        let message = format!(
+            "{} {}",
+            checkout.repository_id,
+            checkout.checkout_path.display()
+        );
+        match checkout.status {
+            CatalogCheckoutStatus::Available => checks.push(ok(
+                format!("repository_catalog.{}", checkout.repository_id),
+                message,
+            )),
+            CatalogCheckoutStatus::Missing => checks.push(warning(
+                format!("repository_catalog.{}", checkout.repository_id),
+                format!("{message} is unavailable"),
+            )),
+            CatalogCheckoutStatus::Symlink => checks.push(failed(
+                format!("repository_catalog.{}", checkout.repository_id),
+                format!("{message} is a symlink"),
+            )),
+            CatalogCheckoutStatus::NotDirectory => checks.push(failed(
+                format!("repository_catalog.{}", checkout.repository_id),
+                format!("{message} is not a directory"),
+            )),
+            CatalogCheckoutStatus::NotGitRoot => checks.push(failed(
+                format!("repository_catalog.{}", checkout.repository_id),
+                format!("{message} is not a Git worktree root"),
+            )),
+        }
+    }
+    if report.checkouts.is_empty() {
+        checks.push(ok(
+            "repository_catalog",
+            format!(
+                "{} configured Repository identities and no checkout paths",
+                report.repository_count
+            ),
+        ));
+    }
+    let syncable = report.checkouts.iter().all(|checkout| {
+        matches!(
+            checkout.status,
+            CatalogCheckoutStatus::Available | CatalogCheckoutStatus::Missing
+        )
+    });
+    if syncable {
+        match sctx_mcp::sync_repository_catalog_at_root(root) {
+            Ok(sync) => checks.push(ok(
+                "repository_registry",
+                format!(
+                    "synchronized {} identities and {} locators",
+                    sync.repository_count, sync.locator_count
+                ),
+            )),
+            Err(error) => checks.push(failed("repository_registry", error.to_string())),
+        }
+    } else {
+        checks.push(failed(
+            "repository_registry",
+            "Catalog validation failed; Registry synchronization skipped",
+        ));
     }
 }
 

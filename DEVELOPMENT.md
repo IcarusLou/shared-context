@@ -10,7 +10,8 @@
 - `task_intent_update` 是 Task Intent 的唯一写入口并返回更新后的 TaskContextPack；`task_signal_supersede` 是 Signal 失效入口。
 - `TaskContextPack` 同时报告当前 Context Tree/Projection Generation 与可选的历史 Graph Context Tree/Artifact Generation；二者允许不同，且每个 Context 都链接到 Association、typed RetrievalPath 和明确 safety source。
 - 同一 Workspace 下的 external Session 独立持有 TaskIntent 与 TaskSignals；Codex PostToolUse 的受控 File/Test observation 会改变 Task fingerprint，只有显式 Graph build 中唯一 resolved Engineering Artifact 才能形成 Graph RetrievalPath。
-- Workspace 不形成 Space prior；已有 ActiveTask 的 Workspace/CWD 即使位于 Git Repository 内部子目录，也只向上解析并刷新该 Repository 的 canonical top-level，不递归发现共同父目录下的 sibling Repository。
+- Workspace 不形成 Space prior。`config.toml` 中的显式本机 Repository Catalog 是 RepositoryId 的唯一权威，一个 ID 可包含 `0..N` 个 canonical checkout/worktree；路径、basename、remote、Git common-dir 或共同父目录都不创建或合并身份。
+- PostTool Hook 不运行 Git、Scanner 或 Graph rebuild。它只在“当前允许 Workspace × configured checkout”内对已有绝对文件执行 bounded canonical longest-prefix 映射，并临时产生现有 Repository/File TaskSignals；未配置、Workspace 外或 symlink 路径不参与。setup、doctor 与显式 Runtime open 才验证 Catalog 并同步可删除重建的 Registry SQLite。
 - Engineering Graph 是围绕已有 Context/EngineeringReference 的稀疏历史知识快照，不是全仓代码搜索引擎或当前 Context Store 镜像。Builder 只固化 Reference roots 与最多两跳的 build-time ContextRelation closure；`association_rebuild` 按 RepositoryId 分组并去重 Reference 的精确 repo-relative path，Scanner 只读取该有界计划。
 - Graph Builder 固化 immutable ContextId+RevisionId、关系 target Revision 和 build-time safety；未接受、Evidence 不完整或冲突 Revision 永不自动注入。`context_tree_oid` 只解释构建来源，Tree mismatch、新 Revision、Withdraw 或无关 append 都不关闭或隐式重建旧 Graph。
 - 受限多语言 Scanner、持久 Engineering Reference、kind-specific 确定性 ArtifactLocator、可重建解析投影、ContextRelation 1–2 跳和 Graph RetrievalPath 已通过固定 oracle 与显式 MCP/CLI 工作流验收；move/rename 直接变为 missing，不执行关联猜测。新建或其他 untracked 文件不进入 Graph（#150 的已确认边界），Task query 也不触发 Repository scan。
@@ -21,6 +22,8 @@
 以下能力**尚未实现**，不得在代码、测试报告或评审中宣称已经具备：
 
 - **M4：未实现** — WorkEpisode 自动聚合、AgentCheckpoint、Candidate Builder、去重/冲突/Space 推荐和 Candidate confirm/list/discard。
+- **#151/#152：未实现** — 当前 Catalog 映射没有引入 TaskArtifactFocus 或 MCP Graph query；现有 Repository/File TaskSignal 只是过渡输出。
+- **团队同步：未实现** — Repository Catalog 是单机显式配置，不是团队事实或知识 Store。
 
 Cursor 与 Codex 都通过显式 `task_intent_update` 建立权威 Task；Prompt Hook 只提供能力提示。已有 ActiveTask 可通过只读 `task_context` 再取 Pack。
 

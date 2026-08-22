@@ -509,6 +509,7 @@ dependencies = [
 name = "sctx-cli"
 version = "0.1.0"
 dependencies = [
+ "fs2",
  "sctx-adapter-codex",
  "sctx-adapter-cursor",
  "sctx-agent-adapter",
@@ -602,8 +603,10 @@ dependencies = [
  "sctx-adapter-cursor",
  "sctx-agent-adapter",
  "sctx-domain",
+ "sctx-engineering-graph",
  "sctx-git-store",
  "sctx-index",
+ "sctx-local-state",
  "sctx-mcp",
  "sctx-search",
  "serde",
@@ -636,6 +639,7 @@ dependencies = [
  "sctx-event-schema",
  "sctx-git-store",
  "sctx-index",
+ "sctx-local-state",
  "sctx-search",
  "sctx-task-runtime",
  "serde",

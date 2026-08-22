@@ -425,6 +425,14 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
             repository_scan_schema["properties"]["paths"]["maxItems"],
             10_000
         );
+        for forbidden in ["repository_id", "declared_identity", "remote_hint"] {
+            assert!(
+                repository_scan_schema["properties"]
+                    .get(forbidden)
+                    .is_none(),
+                "repository_scan must not accept Catalog identity input: {forbidden}"
+            );
+        }
         let reference_schema = &tools
             .iter()
             .find(|tool| tool["name"] == "engineering_reference_record")

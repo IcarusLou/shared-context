@@ -18,10 +18,10 @@
 |---|---|---|
 | **M1：Task-first 领域与入口基础** | **已实现** | `TaskIntent` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；CLI/MCP 通过 `candidate_create` 创建无 Space Candidate；Candidate 不可自动注入 |
 | **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、严格 `task_intent_update` 与只读 `task_context` 已通过跨 crate/E2E 验收 |
-| **M3：Engineering Graph** | **已实现** | Repository Registry、Reference-derived 有界扫描、build-time immutable Context/safety snapshot、历史 Graph Retrieval、ContextRelation 1–2 跳及 MCP/CLI 工作流已通过固定跨 crate/E2E oracle |
+| **M3：Engineering Graph** | **已实现** | 稳定本机 Repository Catalog、可重建 Registry、Reference-derived 有界扫描、build-time immutable Context/safety snapshot、历史 Graph Retrieval、ContextRelation 1–2 跳及 MCP/CLI 工作流已通过固定跨 crate/E2E oracle |
 | **M4：Low-tax Capture** | **未实现** | 尚无 WorkEpisode 自动聚合、AgentCheckpoint、Candidate Builder、去重/冲突、Space 推荐或 Candidate Confirm/List/Discard |
 
-当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订权威 TaskIntent，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示；PostToolUse 仅在 ActiveTask 已存在时合并可证明的 File/Test 信号，并从 Workspace/CWD 的任意内部子目录向上刷新真实 canonical Git top-level。显式 Graph 工具完成 bounded scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。当前 `candidate_create` 仍是手工、无归属的 M1 入口，不等同于 M4 自动 Capture。
+当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订权威 TaskIntent，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示。PostToolUse 仅在 ActiveTask 已存在时读取本机 Repository Catalog，并在允许 Workspace 与 configured checkout 的交集内映射绝对 File Hint；Hook 不运行 Git、Scanner、Registry sync 或 Graph rebuild。显式 Graph 工具完成 bounded scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。当前 `candidate_create` 仍是手工、无归属的 M1 入口，不等同于 M4 自动 Capture。
 
 ## 2. 背景与目标
 
@@ -669,6 +669,7 @@ Task Retrieval 默认只扩展一至两跳：
 ├── state/
 │   ├── index.sqlite
 │   ├── runtime.sqlite
+│   ├── repository-registry.sqlite
 │   ├── writer.lock
 │   ├── index.lock
 │   ├── runtime.lock
@@ -683,7 +684,22 @@ Task Retrieval 默认只扩展一至两跳：
 - `index.sqlite`：可从 Git 和当前工程快照重建的知识及关联投影。
 - `runtime.sqlite`：Task、WorkEpisode 和 Candidate 短期状态，不是知识事实。
 - `capture/`：受 TTL 和容量限制的临时 Evidence/Observation 材料。
-- `config.toml`：Store 和 Agent 配置，不包含 Workspace-to-Space 映射。
+- `config.toml`：固定 Context Store 与本机显式 Repository Catalog，不包含 Workspace-to-Space 映射。
+
+Repository Catalog 的配置语义：
+
+```toml
+[[repositories]]
+id = "rpo_<uuid-v4>"
+paths = ["/absolute/canonical/checkout", "/absolute/canonical/worktree"]
+```
+
+- Catalog 是 RepositoryId 的唯一权威；新 ID 只能由 `repository add` 使用现有 typed `RepositoryId::new()` 格式生成。
+- 一个 ID 可有 `0..N` paths；同一 path 只能属于一个 ID。多个 worktree/checkout 是否同一逻辑 Repository 由显式配置决定。
+- basename、remote、Git common-dir、父 Workspace 和 sibling 目录都不是 identity 或合并依据。
+- `repository-registry.sqlite` 是可删除投影；setup、doctor、显式 Runtime open 从 Catalog 原子恢复相同 ID/locators。
+- 运行时文件解析只在允许 Workspace 与 configured checkout 的交集内执行 canonical longest-prefix；输出 RepositoryId + RepoRelativePath。未配置路径为 typed `repository_not_configured`，Workspace 外与 symlink traversal 拒绝。
+- Catalog 仅本机有效，不做团队同步，也不承载 Space/Requirement 关系。
 
 ### 9.2 仓库结构
 
@@ -972,7 +988,7 @@ sctx space create|revise|list|get
 sctx task inspect|reset
 sctx candidate list|get|confirm|discard
 sctx context get|search|revise|deprecate
-sctx repository scan
+sctx repository add|list|doctor|scan
 sctx engineering-reference record
 sctx association explain|rebuild
 sctx index rebuild
@@ -989,7 +1005,7 @@ sctx mcp serve --client cursor|codex
 | `task_intent_update` | 读/写本地状态 | CAS 更新 TaskIntent 并生成多 Space TaskContextPack |
 | `task_signal_supersede` | 读/写本地状态 | 按稳定 Signal ID 失效当前 Task 信号 |
 | `task_context` | 只读 | 按 external Session locator 重读已有 ActiveTask 的 TaskContextPack |
-| `repository_scan` | 读/写本地状态 | 注册 canonical Git worktree，要求显式非空 repo-relative paths，并返回有界 Artifact/skip 摘要 |
+| `repository_scan` | 读/写本地状态 | 只扫描已在 Catalog 配置的 checkout，要求显式非空 repo-relative paths，并返回有界 Artifact/skip 摘要；不接受 RepositoryId 注入 |
 | `engineering_reference_record` | 写知识事实 | 为已有 Context Revision 记录有证据的工程定位观察 |
 | `association_explain` | 只读 | 展示解析状态、证据、歧义候选和 Graph Paths，不代选 |
 | `association_rebuild` | 写派生状态 | 从 Git References 派生按 Repository 分组去重的 ScanPlan，并据此原子重建或诊断投影 |
@@ -1267,7 +1283,8 @@ M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命�
 
 ### M3：Engineering Graph — 已实现
 
-- 本地 Repository Registry、同一 Git common-dir 的多 worktree 归一和不可用状态已实现；Workspace/CWD 可位于 Repository 任意内部子目录，但只向上注册该真实 top-level，不递归发现 sibling Repository。
+- 本机显式 Repository Catalog 是稳定 RepositoryId 的权威；SQLite Registry 只由 Catalog 同步并可删除恢复。一个 ID 支持 `0..N` checkout/worktree，绝不按 basename、remote、Git common-dir 或共同父目录推断合并/发现。
+- Hook 从父 Workspace、Repo root 或内部子目录启动时，只用 Catalog 对已有绝对 File Hint 做 canonical longest-prefix 映射；热路径不启动 Git、不 scan/rebuild，不配置 sibling。Catalog lock/parse 故障 fail-open。
 - Reference-derived `RepositoryScanPlan` 按 RepositoryId 分组、按精确 RepoRelativePath 去重；受限 tracked-source Scanner 只解析显式非空计划并生成 Module/File/Symbol/API/Schema/Test Artifact 摘要，不保存或返回完整源码，不执行全仓 `git ls-files` 枚举。
 - 持久 EngineeringReference Event、ArtifactResolution、ContextArtifactAssociation 和 generation-stable historical Projection 已实现。
 - `repository_scan`、`engineering_reference_record`、`association_explain`、`association_rebuild`/diagnose 已接入 MCP/CLI；服务端拥有 Reference/Event 身份与路径。
@@ -1351,6 +1368,8 @@ EngineeringResolutionSource {
 7. Rebuild 只读取 EngineeringReference locator 指定并去重的 path；大量未引用 tracked 文件不产生 Artifact。
 8. 空计划与 missing path 不触发目录遍历或全仓 fallback；missing 保持 typed diagnostic。
 9. Repository 根目录和内部子目录收敛到同一 RepositoryId；共同父目录下 sibling Repository 不被递归注册。
+10. 删除 Registry SQLite 后从 Catalog 恢复相同 RepositoryId 与 locator；未配置、Workspace 外和 symlink path 均被 typed 拒绝。
+11. 真实 cross 父 Workspace 中多个独立 Repo 的同名相对路径由不同 RepositoryId 隔离；Hook 新增映射 p95 <10ms、p99 <25ms，且无 Git/scan/rebuild 热路径。
 
 ### 19.3 Low-tax Capture
 

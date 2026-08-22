@@ -24,16 +24,19 @@ use sctx_domain::{
     Applicability, ConflictParticipant, ConflictResolutionDraft, ConflictResolutionResult,
     ContextGovernanceStatus, ContextId, ContextKind, ContextRevisionDraft, DomainProjection, Error,
     ErrorKind, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, PublicationAction,
-    PublicationDraft, ResolutionOutcome, Result, ReviewDraft, ReviewSummary, ReviewVerdict,
-    RevisionId, SemanticConflictDraft, SpaceId, TaskSignal, TaskSignalKind, WorkEpisodeId,
+    PublicationDraft, RepositoryId, ResolutionOutcome, Result, ReviewDraft, ReviewSummary,
+    ReviewVerdict, RevisionId, SemanticConflictDraft, SpaceId, TaskSignal, TaskSignalKind,
+    WorkEpisodeId,
 };
-use sctx_engineering_graph::{RegisterRepositoryRequest, RepositoryRegistry};
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendOutcome, AppendRequest, BatchId, CandidateAppendOutcome, GitStore};
 use sctx_index::{
     DomainSnapshot, IndexMetadata, ProjectionDiagnosticView, ProjectionIndex, RebuildOutcome,
 };
-use sctx_local_state::{Breadcrumb, BreadcrumbKind, CaptureStore};
+use sctx_local_state::{
+    Breadcrumb, BreadcrumbKind, CaptureStore, CatalogCheckoutStatus, RepositoryCatalogSnapshot,
+    UserConfigStore,
+};
 use sctx_mcp::{
     AssociationExplainInput, AssociationRebuildInput, EngineeringReferenceRecordInput,
     RepositoryScanInput, TaskContextReadInput, TaskIntentUpdateInput, TaskSignalSupersedeInput,
@@ -61,7 +64,7 @@ Commands:
   context revise|review|publish|withdraw|get
   semantic conflict open|resolve
   task context|intent update|signal supersede
-  repository scan
+  repository add|list|doctor|scan
   engineering-reference record
   association explain|rebuild
   search
@@ -779,8 +782,9 @@ fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<Option<Stri
             if runtime.read_snapshot_by_locator(&locator)?.is_none() {
                 return Ok(None);
             }
-            refresh_registered_repositories(&root, &cwd, &workspace_roots)?;
+            let catalog = UserConfigStore::open_existing(&root)?.repository_catalog()?;
             let signals = normalized_observation_signals(
+                &catalog,
                 &cwd,
                 &workspace_roots,
                 &file_hints,
@@ -795,63 +799,8 @@ fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<Option<Stri
     }
 }
 
-fn refresh_registered_repositories(
-    root: &Path,
-    cwd: &Path,
-    workspace_roots: &[PathBuf],
-) -> Result<()> {
-    let candidates = if workspace_roots.is_empty() {
-        vec![cwd.to_path_buf()]
-    } else {
-        workspace_roots.to_vec()
-    };
-    let mut repositories = BTreeSet::new();
-    for candidate in candidates {
-        let Ok(metadata) = fs::symlink_metadata(&candidate) else {
-            continue;
-        };
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            continue;
-        }
-        let Ok(candidate) = fs::canonicalize(candidate) else {
-            continue;
-        };
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&candidate)
-            .args(["rev-parse", "--show-toplevel"])
-            .output();
-        let Ok(output) = output else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        let Ok(top_level) = String::from_utf8(output.stdout) else {
-            continue;
-        };
-        let Ok(top_level) = fs::canonicalize(top_level.trim()) else {
-            continue;
-        };
-        if candidate == top_level || candidate.starts_with(&top_level) {
-            repositories.insert(top_level);
-        }
-    }
-    if repositories.is_empty() {
-        return Ok(());
-    }
-    let registry = RepositoryRegistry::initialize(root.to_path_buf())?;
-    for checkout_path in repositories {
-        registry.register(&RegisterRepositoryRequest {
-            checkout_path,
-            declared_identity: None,
-            remote_hint: None,
-        })?;
-    }
-    Ok(())
-}
-
 fn normalized_observation_signals(
+    catalog: &RepositoryCatalogSnapshot,
     cwd: &Path,
     workspace_roots: &[PathBuf],
     file_hints: &[PathBuf],
@@ -862,11 +811,7 @@ fn normalized_observation_signals(
         vec![cwd.to_path_buf()]
     } else {
         workspace_roots.to_vec()
-    }
-    .into_iter()
-    .filter_map(|root| fs::canonicalize(root).ok())
-    .filter(|root| root.is_dir())
-    .collect::<Vec<_>>();
+    };
     let mut signals = Vec::new();
     for hint in file_hints {
         let candidate = if hint.is_absolute() {
@@ -874,22 +819,18 @@ fn normalized_observation_signals(
         } else {
             cwd.join(hint)
         };
-        let Ok(candidate) = fs::canonicalize(candidate) else {
-            continue;
-        };
-        if !candidate.is_file() {
-            continue;
-        }
-        let Some(root) = roots.iter().find(|root| candidate.starts_with(root)) else {
-            continue;
-        };
-        let Ok(relative) = candidate.strip_prefix(root) else {
+        let Ok(resolved) = catalog.resolve_file_path(&candidate, &roots) else {
             continue;
         };
         push_signal(
             &mut signals,
+            TaskSignalKind::Repository,
+            &resolved.repository_id.to_string(),
+        );
+        push_signal(
+            &mut signals,
             TaskSignalKind::File,
-            &relative.to_string_lossy(),
+            resolved.relative_path.as_str(),
         );
     }
     if is_test_tool(tool_name) {
@@ -1716,45 +1657,106 @@ fn run_task_context(args: &[String], json_output: bool) -> Result<()> {
 
 fn run_repository(args: &[String], json_output: bool) -> Result<()> {
     let [command, rest @ ..] = args else {
-        return Err(invalid("Usage: sctx repository scan [OPTIONS]"));
+        return Err(invalid(
+            "Usage: sctx repository add|list|doctor|scan [OPTIONS]",
+        ));
     };
-    if command != "scan" {
-        return Err(invalid("repository command must be scan"));
+    let root = installation_root()?;
+    match command.as_str() {
+        "add" => {
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(&["--repository-id", "--path"], &[])?;
+            let repository_id = options
+                .optional("--repository-id")?
+                .map(|value| parse_id::<RepositoryId>(value, "Repository ID"))
+                .transpose()?;
+            let paths = options
+                .many("--path")
+                .into_iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            let outcome =
+                UserConfigStore::initialize(&root)?.add_repository(repository_id, &paths)?;
+            let sync = sctx_mcp::sync_repository_catalog_at_root(&root)?;
+            let metadata = repository_command_metadata(&root)?;
+            emit(
+                "repository.add",
+                &metadata,
+                json!({"catalog": outcome, "registry": sync}),
+                json_output,
+            )
+        }
+        "list" => {
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(&[], &[])?;
+            let config = UserConfigStore::initialize(&root)?;
+            let catalog = config.repository_catalog()?;
+            let sync = sctx_mcp::sync_repository_catalog_at_root(&root)?;
+            let metadata = repository_command_metadata(&root)?;
+            emit(
+                "repository.list",
+                &metadata,
+                json!({"repositories": catalog.repositories, "registry": sync}),
+                json_output,
+            )
+        }
+        "doctor" => {
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(&[], &[])?;
+            let config = UserConfigStore::initialize(&root)?;
+            let report = config.doctor_repository_catalog()?;
+            let syncable = report.checkouts.iter().all(|checkout| {
+                matches!(
+                    checkout.status,
+                    CatalogCheckoutStatus::Available | CatalogCheckoutStatus::Missing
+                )
+            });
+            let sync = syncable
+                .then(|| sctx_mcp::sync_repository_catalog_at_root(&root))
+                .transpose()?;
+            let metadata = repository_command_metadata(&root)?;
+            emit(
+                "repository.doctor",
+                &metadata,
+                json!({"catalog": report, "registry": sync}),
+                json_output,
+            )
+        }
+        "scan" => {
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(&["--checkout-path", "--path", "--max-artifacts"], &[])?;
+            let input = RepositoryScanInput {
+                checkout_path: options.required("--checkout-path")?.to_owned(),
+                paths: options
+                    .many("--path")
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                max_artifacts: parse_usize(
+                    options.optional("--max-artifacts")?.unwrap_or("200"),
+                    "max artifacts",
+                )?,
+            };
+            let response = sctx_mcp::repository_scan_at_root(&root, &input)?;
+            let data =
+                serde_json::to_value(&response).map_err(json_error("serialize Repository scan"))?;
+            emit_raw(
+                "repository.scan",
+                &response.tree,
+                response.generation,
+                &data,
+                json_output,
+            )
+        }
+        _ => Err(invalid(
+            "repository command must be add, list, doctor, or scan",
+        )),
     }
-    let options = Options::parse(rest, &[])?;
-    options.allow_only(
-        &[
-            "--checkout-path",
-            "--declared-identity",
-            "--remote-hint",
-            "--path",
-            "--max-artifacts",
-        ],
-        &[],
-    )?;
-    let input = RepositoryScanInput {
-        checkout_path: options.required("--checkout-path")?.to_owned(),
-        paths: options
-            .many("--path")
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-        declared_identity: options.optional("--declared-identity")?.map(str::to_owned),
-        remote_hint: options.optional("--remote-hint")?.map(str::to_owned),
-        max_artifacts: parse_usize(
-            options.optional("--max-artifacts")?.unwrap_or("200"),
-            "max artifacts",
-        )?,
-    };
-    let response = sctx_mcp::repository_scan_at_root(installation_root()?, &input)?;
-    let data = serde_json::to_value(&response).map_err(json_error("serialize Repository scan"))?;
-    emit_raw(
-        "repository.scan",
-        &response.tree,
-        response.generation,
-        &data,
-        json_output,
-    )
+}
+
+fn repository_command_metadata(root: &Path) -> Result<IndexMetadata> {
+    let store = GitStore::initialize(root)?;
+    Ok(ProjectionIndex::for_store(&store).synchronize()?.metadata)
 }
 
 fn run_engineering_reference(args: &[String], json_output: bool) -> Result<()> {
@@ -2416,6 +2418,7 @@ const fn error_code(kind: ErrorKind) -> &'static str {
         ErrorKind::Io => "io_error",
         ErrorKind::External => "external_error",
         ErrorKind::Unsupported => "unsupported",
+        ErrorKind::RepositoryNotConfigured => "repository_not_configured",
         _ => "unknown_error",
     }
 }

@@ -15,6 +15,7 @@ use sctx_domain::{
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::ProjectionIndex;
+use sctx_local_state::UserConfigStore;
 use sctx_mcp::{
     ExpectedRevisionId, IntentMaturity, TaskBoundary, TaskContextReadInput, TaskContextResponse,
     TaskIntentUpdateInput, task_context_readonly_at_root, task_intent_update_at_root,
@@ -67,8 +68,13 @@ impl MilestoneTwoFixture {
             .status()
             .unwrap();
         assert!(status.success());
+        let workspace = fs::canonicalize(workspace).unwrap();
 
         let store = GitStore::initialize(&root).unwrap();
+        UserConfigStore::initialize(&root)
+            .unwrap()
+            .add_repository(None, std::slice::from_ref(&workspace))
+            .unwrap();
         let page_space = add_space(
             &store,
             "Quartz Page Requirement",

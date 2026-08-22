@@ -59,6 +59,8 @@ pub enum ErrorKind {
     External,
     /// The requested behavior is outside the current implementation stage.
     Unsupported,
+    /// An absolute engineering path is outside the explicit local Repository Catalog.
+    RepositoryNotConfigured,
 }
 
 /// The shared, user-presentable error type for workspace crates.

@@ -64,9 +64,13 @@ _Avoid_: current Context head, live governance lookup
 A typed, resolvable provenance target that can ground a TaskIntent or engineering claim, such as an active TaskSignal, immutable Context Evidence, or a current unique Engineering Resolution. An opaque label or unavailable/ambiguous target is not an EvidenceSource.
 _Avoid_: evidence string, unverified reference
 
+**RepositoryCatalog**:
+The local explicit record of logical Repository identities and their configured checkout or worktree locations. It is authoritative for RepositoryId assignment but never routes a Workspace or Task to a ContextSpace.
+_Avoid_: repository discovery, Workspace binding, team registry
+
 **RepositoryIdentity**:
-A stable identity for one logical source repository across local checkouts and machines. A Workspace path, branch, or Commit is never Repository identity.
-_Avoid_: checkout path, repository URL as identity
+A stable identity for one logical source repository across its configured checkouts and worktrees in one local installation. Paths, basenames, remotes, common parents, branches, and Commits never create or merge this identity.
+_Avoid_: checkout path, repository URL as identity, inferred repository identity
 
 **EngineeringReference**:
 A persistent, non-authoritative observation that Context relates to an engineering object at one deterministic repository-relative ArtifactLocator. It survives resolution failure and never claims that a current Artifact was found.

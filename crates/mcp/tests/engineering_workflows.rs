@@ -14,6 +14,7 @@ use sctx_domain::{
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
+use sctx_local_state::UserConfigStore;
 use sctx_mcp::{
     AssociationExplainInput, AssociationRebuildInput, EngineeringReferenceRecordInput,
     ExpectedRevisionId, IntentMaturity, RepositoryScanInput, TaskBoundary, TaskContextReadInput,
@@ -152,8 +153,6 @@ fn scan_input(path: &Path, paths: &[&str]) -> RepositoryScanInput {
     RepositoryScanInput {
         checkout_path: path.to_string_lossy().into_owned(),
         paths: paths.iter().map(|path| (*path).to_owned()).collect(),
-        declared_identity: None,
-        remote_hint: None,
         max_artifacts: 500,
     }
 }
@@ -239,6 +238,13 @@ fn scan_record_rebuild_explain_and_task_pack_cross_two_repositories_and_a_worktr
         )],
     );
     let (context_id, revision_id) = accepted_context(&root, "alpha graph decision");
+    let config = UserConfigStore::initialize(&root).unwrap();
+    config
+        .add_repository(None, &[first.clone(), worktree.clone()])
+        .unwrap();
+    config
+        .add_repository(None, std::slice::from_ref(&second))
+        .unwrap();
 
     let first_scan = repository_scan_at_root(
         &root,
@@ -388,6 +394,10 @@ fn reference_recording_is_concurrent_private_and_rejects_unsafe_or_incomplete_in
     let repo = temporary.path().join("repo");
     init_repo(&repo, &[("src/lib.rs", "pub fn graph_target() {}\n")]);
     let (context_id, revision_id) = accepted_context(&root, "concurrent graph reference");
+    UserConfigStore::initialize(&root)
+        .unwrap()
+        .add_repository(None, std::slice::from_ref(&repo))
+        .unwrap();
     let scan = repository_scan_at_root(&root, &scan_input(&repo, &["src/lib.rs"])).unwrap();
     assert!(
         repository_scan_at_root(&root, &scan_input(&repo, &[])).is_err(),
@@ -408,8 +418,6 @@ fn reference_recording_is_concurrent_private_and_rejects_unsafe_or_incomplete_in
             &RepositoryScanInput {
                 checkout_path: "../unsafe".to_owned(),
                 paths: vec!["src/lib.rs".to_owned()],
-                declared_identity: None,
-                remote_hint: None,
                 max_artifacts: 10,
             },
         )
@@ -494,6 +502,10 @@ fn ambiguous_and_unavailable_explanations_never_choose_and_graph_failure_degrade
         )],
     );
     let (context_id, revision_id) = accepted_context(&root, "ambiguous graph reference");
+    UserConfigStore::initialize(&root)
+        .unwrap()
+        .add_repository(None, std::slice::from_ref(&repo))
+        .unwrap();
     let scan = repository_scan_at_root(&root, &scan_input(&repo, &["src/a/one.rs"])).unwrap();
     let locator = scan
         .artifacts

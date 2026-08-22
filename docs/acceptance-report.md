@@ -1,8 +1,8 @@
 # Task-first Retrieval Integration Acceptance Report
 
 Date: 2026-08-22
-Scope: Mew #112 through #149, including historical Graph repair #147 and accepted boundary #150
-Implementation baseline for historical Graph repair: `main@8044f56`
+Scope: Mew #112 through #153, excluding deferred #151/#152 and accepted boundary #150
+Implementation baseline for local Repository Catalog: `main@92b88fe`
 
 ## Verdict
 
@@ -32,7 +32,7 @@ M4 retains Mandatory Gate #114/#117: stable `submission_id` idempotency must be 
 | Search request has no preferred-Space ranking input | PROVEN | `SearchRequest` contract; Search cursor/ranking contains only BM25, Evidence completeness, and stable IDs |
 | Explicit exploration can still hard-filter by Space | PROVEN | MCP contract sends `context_search.space_ids`; `SearchFilters.space_ids` is applied in SQL before ranking |
 | `task_context` is truthful and read-only | PROVEN | MCP schema accepts only locator/budget/max fields; route, Task, Intent, Workspace and Signal fields are strictly rejected; concurrent reads preserve Task/Revision/Signal bytes |
-| Workspace cannot select or persist a Space | PROVEN | `config.toml` contains only `version` and `store`; CLI has no binding command for a Workspace; milestone test verifies both |
+| Workspace cannot select or persist a Space | PROVEN | `config.toml` contains the fixed Store and local Repository Catalog only; Repository entries contain IDs/paths but no Space, Requirement, Task, or ranking route |
 | Candidate creation requires no Space | PROVEN | CLI and MCP `candidate_create` contracts reject Space fields and return an unassigned Candidate ID |
 | `candidate_create` is the Agent-facing Candidate main path | PROVEN | CLI help, MCP tool list, CLI milestone test, and MCP client fixtures |
 | Unconfirmed Candidate cannot enter automatic injection | PROVEN | Candidate projection is outside Context FTS; CLI/MCP candidate retrieval tests and Codex hook test return only Accepted eligible Context |
@@ -51,7 +51,10 @@ M4 retains Mandatory Gate #114/#117: stable `submission_id` idempotency must be 
 | Engineering workflows preserve identity, privacy, and ambiguity | PROVEN | Two-Repository/multi-worktree tests execute scan→record→rebuild→explain→Task Pack; concurrent Writer calls produce unique server-owned IDs; unsafe paths, incomplete evidence, and secrets are rejected; ambiguous candidates are returned without selection |
 | Graph build is sparse and Reference-derived | PROVEN | Scanner tests seed 200 unreferenced tracked files plus an unreadable sentinel and prove zero observations/Artifacts for them; duplicate Reference paths collapse to one planned path; public `repository_scan` requires `paths` with `minItems: 1`/`maxItems: 10000`; `association_rebuild` reports the deduplicated planned-path count |
 | Missing and empty plans never broaden scanning | PROVEN | Empty typed ScanPlan and empty MCP/CLI `paths` fail; an explicit missing path returns a typed `missing` skip with zero scanned files/Artifacts and no directory or Repository fallback |
-| Repository discovery accepts subdirectories without sibling recursion | PROVEN | Codex Hook starts from a Chinese/spaced Repository subdirectory, registers its canonical Git top-level, then proves a root refresh keeps the same RepositoryId while two sibling Git repositories remain unregistered |
+| Repository identity is explicit and rebuildable | PROVEN | `repository add` generates typed UUID-v4 IDs; one Catalog ID accepts multiple explicit worktrees; SQLite deletion followed by Runtime/doctor/list restores the same IDs and locators; Registry has no basename/remote/common-dir merge API |
+| Cross Workspace mapping is isolated and non-discovering | PROVEN | Real-structure CLI E2E configures FE/Android/iOS repos under one parent Workspace, maps equal relative paths to each owning stable RepositoryId, leaves an unconfigured sibling signal-free, and converges root/subdirectory/parent Workspace inputs |
+| Hook Repository mapping is bounded and Git-free | PROVEN | A fake `git` sentinel proves PostTool never launches Git; Registry failure is absent from the Hook path; Catalog config/lock failures return sanitized success responses. The full Hook helper boundary measures p95 281µs/p99 320µs; pure longest-prefix resolution measures p95 6µs/p99 6µs |
+| Catalog and Registry validation are explicit | PROVEN | CLI `repository add/list/doctor`, installer setup/doctor, and MCP Runtime open synchronize only trusted local Catalog IDs; invalid short IDs are typed errors and public `repository_scan` rejects unconfigured checkout or caller Repository identity fields |
 | Engineering failure is advisory to Task Retrieval | PROVEN | Rebuild reports unavailable registered Repositories explicitly, Explain reports typed projection availability, and a corrupt Engineering projection degrades Task responses to `artifact_generation: null` instead of blocking Context-only retrieval |
 | Multi-language Artifact discovery has an independent bounded oracle | PROVEN | `milestone-three-v1.json` fixes hand-authored IDs/References and the exact Reference-derived path plan; a separate Scanner contract explicitly plans Rust, TS, JS, Swift, Kotlin, JSON, OpenAPI and Proto paths and validates exact API/Schema/Qualified Symbol/Test locators without full-repository enumeration |
 | File move and Symbol rename never trigger guessing | PROVEN | M3 oracle moves a JS file and renames a TS Symbol, then proves both original deterministic locators become `missing`, create no Edge, and remain unchanged without Git-history or Agent repair workflow |
@@ -70,6 +73,8 @@ M4 retains Mandatory Gate #114/#117: stable `submission_id` idempotency must be 
 
 #150 remains an accepted product boundary: untracked files are not scanned, and no ActiveTask untracked scan entry was added.
 
+#151/#152 remain unimplemented: #153 temporarily emits the existing Repository/File TaskSignals and does not introduce TaskArtifactFocus or an MCP Graph query. Repository Catalog is local-only; team synchronization is not claimed.
+
 ## Residue gates
 
 The M1–M3 gate searches product code, tests, fixtures, scripts, and docs (excluding build output and the user-owned `readme.md`) for:
@@ -80,6 +85,8 @@ The M1–M3 gate searches product code, tests, fixtures, scripts, and docs (excl
 - the removed Context-Propose API/constructor spelling.
 - the removed task-text MCP bridge, bare-query Agent action, legacy Hook lookup helper, and non-Task automatic Context Pack CLI surface.
 - the removed textual TaskSignal channel/path that previously looked like an Engineering Graph edge.
+- the removed Repository auto-registration types, remote/declared/common-dir merge hints, and Hook `git rev-parse` discovery path;
+- any `TaskArtifactFocus`/MCP Graph-query implementation deferred to #151/#152.
 
 Expected result: zero matches. Generic target-design language such as a proposed new Space Intent is not a Context-Propose API. `context_search` and its explicit `space_ids` hard filter are intentionally present.
 
@@ -92,8 +99,10 @@ cargo test --locked -p sctx-search --test search_contract
 cargo test --locked -p sctx-mcp --test mcp_contract
 cargo test --locked -p sctx-mcp --test engineering_workflows
 cargo test --locked -p sctx-engineering-graph
+cargo test --locked -p sctx-local-state --test repository_catalog
 cargo test --locked -p sctx-task-runtime --test runtime_store
 cargo test --locked -p sctx-cli --test cli_contract
+cargo test --locked -p sctx-cli --test hook_fail_open
 cargo test --locked -p sctx-cli --test milestone_one_contract
 cargo test --locked -p sctx-cli --test milestone_two_contract
 cargo test --locked -p sctx-cli --test milestone_three_contract
@@ -109,7 +118,7 @@ Current repository gate results:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: passed with no warnings.
-- `cargo test --workspace --locked`: 273 passed, 0 failed, 1 ignored manual benchmark.
+- `cargo test --workspace --locked`: 280 passed, 0 failed, 1 ignored manual benchmark.
 - `npm test`: 16 passed, 0 failed, 0 skipped.
 - Shared Context Skill `quick_validate.py`: passed (`Skill is valid!`).
 

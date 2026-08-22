@@ -12,9 +12,10 @@ use sctx_domain::{
     EvidenceSnapshotDraft, ExternalSessionLocator, IntentSnapshot, PublicationAction,
     PublicationDraft, Result, SpaceId, TaskIntentDraft, TaskSignalKind, WorkEpisodeId,
 };
-use sctx_engineering_graph::{RepositoryLocatorQuery, RepositoryRegistry};
+use sctx_engineering_graph::RepositoryRegistry;
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CrashInjector, CrashSeam, GitStore};
+use sctx_local_state::UserConfigStore;
 use sctx_mcp::{
     ExpectedRevisionId, IntentMaturity, TaskBoundary, TaskIntentUpdateInput,
     task_intent_update_at_root,
@@ -51,9 +52,21 @@ impl Harness {
     }
 
     fn run_with_input(&self, args: &[&str], input: &Value) -> Output {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_sctx"))
-            .args(args)
-            .env("HOME", &self.home)
+        self.run_with_input_env(args, input, &[])
+    }
+
+    fn run_with_input_env(
+        &self,
+        args: &[&str],
+        input: &Value,
+        environment: &[(&str, &Path)],
+    ) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sctx"));
+        command.args(args).env("HOME", &self.home);
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -482,6 +495,7 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
 
     let workspace = harness.home.join("repo-9x7");
     fs::create_dir_all(workspace.join("src")).unwrap();
+    let workspace = fs::canonicalize(workspace).unwrap();
     let alpha_file = workspace.join("src/alpha_feature.rs");
     let beta_file = workspace.join("src/beta_feature.rs");
     let outside_file = harness.home.join("outside.rs");
@@ -494,6 +508,11 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         .status()
         .unwrap();
     assert!(git.success());
+    let configured = harness.success(&["repository", "add", "--path", workspace.to_str().unwrap()]);
+    let configured_repository_id = configured["data"]["catalog"]["repository"]["repository_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
 
     let prompt = |session_id: &str, text: &str| {
         serde_json::json!({
@@ -671,7 +690,7 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
     let canonical_workspace = fs::canonicalize(&workspace).unwrap();
     let registered = RepositoryRegistry::initialize(harness.root())
         .unwrap()
-        .resolve_by_locator(&RepositoryLocatorQuery::CheckoutPath(canonical_workspace))
+        .resolve_by_checkout_path(&canonical_workspace)
         .unwrap()
         .expect("ActiveTask PostToolUse must register its canonical Git Workspace root");
     assert_eq!(registered.locators.len(), 1);
@@ -696,9 +715,7 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
     assert_eq!(subdirectory_post, serde_json::json!({}));
     let after_subdirectory = RepositoryRegistry::initialize(harness.root())
         .unwrap()
-        .resolve_by_locator(&RepositoryLocatorQuery::CheckoutPath(
-            fs::canonicalize(&workspace).unwrap(),
-        ))
+        .resolve_by_checkout_path(&fs::canonicalize(&workspace).unwrap())
         .unwrap()
         .expect("a Workspace subdirectory must resolve and refresh its Git top-level");
     assert_eq!(
@@ -725,6 +742,9 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
                 signal.kind == TaskSignalKind::File && signal.content == own_file
             })
         );
+        assert!(snapshot.task_signals.iter().any(|signal| {
+            signal.kind == TaskSignalKind::Repository && signal.content == configured_repository_id
+        }));
         assert!(
             snapshot.task_signals.iter().any(|signal| {
                 signal.kind == TaskSignalKind::Test && signal.content == own_test
@@ -748,7 +768,7 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn hook_repository_discovery_ascends_only_the_explicit_sibling_repository() {
+fn hook_catalog_mapping_never_discovers_sibling_repositories() {
     let harness = Harness::new();
     GitStore::initialize(harness.root()).unwrap();
     let siblings = harness.home.join("三个 sibling repos");
@@ -775,7 +795,30 @@ fn hook_repository_discovery_ascends_only_the_explicit_sibling_repository() {
         git_output(repository, &["add", "--", "."]);
         git_output(repository, &["commit", "-q", "-m", "fixture"]);
     }
+    let repositories = repositories
+        .into_iter()
+        .map(|repository| fs::canonicalize(repository).unwrap())
+        .collect::<Vec<_>>();
     let explicit = &repositories[1];
+    let configured = UserConfigStore::initialize(harness.root())
+        .unwrap()
+        .add_repository(None, std::slice::from_ref(explicit))
+        .unwrap();
+    sctx_mcp::sync_repository_catalog_at_root(harness.root()).unwrap();
+    let fake_bin = harness.home.join("no-git-hot-path/bin");
+    let git_sentinel = harness.home.join("no-git-hot-path/git-was-invoked");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let fake_git = fake_bin.join("git");
+    fs::write(
+        &fake_git,
+        "#!/bin/sh\nprintf invoked > \"$SCTX_GIT_SENTINEL\"\nexit 97\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let open_task = |session_id: &str| {
         task_intent_update_at_root(
             harness.root(),
@@ -804,7 +847,7 @@ fn hook_repository_discovery_ascends_only_the_explicit_sibling_repository() {
         .unwrap();
     };
     let post_tool = |session_id: &str, cwd: &Path| {
-        let output = harness.run_with_input(
+        let output = harness.run_with_input_env(
             &["hook", "--agent", "codex", "--agent-version", "0.147.0"],
             &serde_json::json!({
                 "session_id": session_id,
@@ -819,6 +862,10 @@ fn hook_repository_discovery_ascends_only_the_explicit_sibling_repository() {
                 "tool_input": {"file_path": explicit.join("src/target.rs")},
                 "tool_response": {"output": "passed"}
             }),
+            &[
+                ("PATH", fake_bin.as_path()),
+                ("SCTX_GIT_SENTINEL", git_sentinel.as_path()),
+            ],
         );
         assert!(
             output.status.success(),
@@ -844,24 +891,201 @@ fn hook_repository_discovery_ascends_only_the_explicit_sibling_repository() {
     for sibling in [&repositories[0], &repositories[2]] {
         assert!(
             registry
-                .resolve_by_locator(&RepositoryLocatorQuery::CheckoutPath(
-                    fs::canonicalize(sibling).unwrap(),
-                ))
+                .resolve_by_checkout_path(&fs::canonicalize(sibling).unwrap())
                 .unwrap()
                 .is_none(),
             "a common parent must not recursively discover sibling Repositories"
         );
     }
 
-    let repository_id = registered[0].identity.repository_id;
+    let repository_id = configured.repository.repository_id;
     open_task("root-discovery");
     post_tool("root-discovery", explicit);
     let refreshed = registry.list().unwrap();
     assert_eq!(refreshed.len(), 1);
     assert_eq!(refreshed[0].identity.repository_id, repository_id);
+    assert!(
+        !git_sentinel.exists(),
+        "PostTool Hook hot path must not launch Git"
+    );
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn cross_parent_workspace_maps_three_catalog_repositories_without_cross_contamination() {
+    let harness = Harness::new();
+    GitStore::initialize(harness.root()).unwrap();
+    let cross = harness.home.join("workspace cross");
+    let repositories = [
+        cross.join("fe/search_web_monorepo"),
+        cross.join("android/TikTok"),
+        cross.join("ios/TikTok"),
+        cross.join("unconfigured/TikTok"),
+    ];
+    for (index, repository) in repositories.iter().enumerate() {
+        fs::create_dir_all(repository.join("src/search")).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .arg(repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        git_output(repository, &["config", "user.name", "Cross Catalog"]);
+        git_output(
+            repository,
+            &["config", "user.email", "cross@example.invalid"],
+        );
+        fs::write(
+            repository.join("src/search/Search.kt"),
+            format!("// repository {index}\n"),
+        )
+        .unwrap();
+        git_output(repository, &["add", "--", "."]);
+        git_output(repository, &["commit", "-q", "-m", "fixture"]);
+    }
+    let cross = fs::canonicalize(cross).unwrap();
+    let repositories = repositories
+        .into_iter()
+        .map(|repository| fs::canonicalize(repository).unwrap())
+        .collect::<Vec<_>>();
+    let mut configured_ids = Vec::new();
+    for repository in &repositories[..3] {
+        let added = harness.success(&["repository", "add", "--path", repository.to_str().unwrap()]);
+        configured_ids.push(
+            added["data"]["catalog"]["repository"]["repository_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    assert_eq!(
+        configured_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        3
+    );
+    let open_task = |session_id: &str| {
+        task_intent_update_at_root(
+            harness.root(),
+            &TaskIntentUpdateInput {
+                agent_kind: "codex".to_owned(),
+                external_session_id: session_id.to_owned(),
+                task_boundary: TaskBoundary::New,
+                expected_revision_id: ExpectedRevisionId::Null(()),
+                maturity: IntentMaturity::Provisional,
+                intent: TaskIntentDraft {
+                    goal: "Resolve one configured Repository file".to_owned(),
+                    desired_change: "Preserve stable local Repository identity".to_owned(),
+                    in_scope: Vec::new(),
+                    out_of_scope: Vec::new(),
+                    domains: Vec::new(),
+                    platforms: Vec::new(),
+                    constraints: Vec::new(),
+                    acceptance_conditions: Vec::new(),
+                    artifacts: Vec::new(),
+                    interfaces: Vec::new(),
+                    unknowns: Vec::new(),
+                },
+                evidence_refs: Vec::new(),
+            },
+        )
+        .unwrap();
+    };
+    for (index, repository) in repositories.iter().take(3).enumerate() {
+        let session_id = format!("cross-session-{index}");
+        open_task(&session_id);
+        let output = harness.run_with_input(
+            &["hook", "--agent", "codex", "--agent-version", "0.147.0"],
+            &serde_json::json!({
+                "session_id": session_id,
+                "transcript_path": null,
+                "cwd": cross,
+                "hook_event_name": "PostToolUse",
+                "model": "gpt-5.6-sol",
+                "permission_mode": "default",
+                "turn_id": format!("turn-{index}"),
+                "tool_name": "ReadFile",
+                "tool_use_id": format!("tool-{index}"),
+                "tool_input": {"file_path": repository.join("src/search/Search.kt")},
+                "tool_response": {"output": "read"}
+            }),
+        );
+        assert!(output.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+            serde_json::json!({})
+        );
+        let snapshot = TaskRuntime::initialize(harness.root())
+            .unwrap()
+            .read_snapshot_by_locator(&ExternalSessionLocator::new("codex", &session_id).unwrap())
+            .unwrap()
+            .unwrap();
+        let repository_signals = snapshot
+            .task_signals
+            .iter()
+            .filter(|signal| signal.kind == TaskSignalKind::Repository)
+            .map(|signal| signal.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(repository_signals, vec![configured_ids[index].as_str()]);
+        assert!(snapshot.task_signals.iter().any(|signal| {
+            signal.kind == TaskSignalKind::File && signal.content == "src/search/Search.kt"
+        }));
+    }
+
+    open_task("cross-unconfigured");
+    let unconfigured = harness.run_with_input(
+        &["hook", "--agent", "codex", "--agent-version", "0.147.0"],
+        &serde_json::json!({
+            "session_id": "cross-unconfigured",
+            "transcript_path": null,
+            "cwd": cross,
+            "hook_event_name": "PostToolUse",
+            "model": "gpt-5.6-sol",
+            "permission_mode": "default",
+            "turn_id": "turn-unconfigured",
+            "tool_name": "ReadFile",
+            "tool_use_id": "tool-unconfigured",
+            "tool_input": {"file_path": repositories[3].join("src/search/Search.kt")},
+            "tool_response": {"output": "read"}
+        }),
+    );
+    assert!(unconfigured.status.success());
+    let unconfigured_snapshot = TaskRuntime::initialize(harness.root())
+        .unwrap()
+        .read_snapshot_by_locator(
+            &ExternalSessionLocator::new("codex", "cross-unconfigured").unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(unconfigured_snapshot.task_signals.is_empty());
+
+    let database = harness.root().join("state/repository-registry.sqlite");
+    for suffix in ["", "-wal", "-shm"] {
+        let path = PathBuf::from(format!("{}{suffix}", database.display()));
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove Registry database: {error}"),
+        }
+    }
+    let restored = harness.success(&["repository", "list"]);
+    let restored_ids = restored["data"]["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|repository| repository["repository_id"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        restored_ids,
+        configured_ids.iter().map(String::as_str).collect()
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn engineering_graph_cli_commands_scan_record_rebuild_and_explain() {
     let harness = Harness::new();
     let (space_id, _) = create_space(&harness, "Engineering CLI workflow");
@@ -906,6 +1130,26 @@ fn engineering_graph_cli_commands_scan_record_rebuild_and_explain() {
             .unwrap()
             .contains("paths")
     );
+    let unconfigured = harness.failure(&[
+        "repository",
+        "scan",
+        "--checkout-path",
+        repository.to_str().unwrap(),
+        "--path",
+        "src/contract.rs",
+    ]);
+    assert_eq!(unconfigured["error"]["code"], "repository_not_configured");
+    let added = harness.success(&["repository", "add", "--path", repository.to_str().unwrap()]);
+    assert!(
+        added["data"]["catalog"]["repository"]["repository_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("rpo_")
+    );
+    let listed = harness.success(&["repository", "list"]);
+    assert_eq!(listed["data"]["repositories"].as_array().unwrap().len(), 1);
+    let doctor = harness.success(&["repository", "doctor"]);
+    assert_eq!(doctor["data"]["catalog"]["healthy"], true);
     let scan = harness.success(&[
         "repository",
         "scan",
@@ -957,6 +1201,25 @@ fn engineering_graph_cli_commands_scan_record_rebuild_and_explain() {
     let diagnosed = harness.success(&["association", "rebuild", "--diagnose"]);
     assert_eq!(diagnosed["command"], "association.diagnose");
     assert_eq!(diagnosed["data"]["stored"], false);
+}
+
+#[test]
+fn repository_doctor_rejects_invalid_catalog_identity_with_typed_error() {
+    let harness = Harness::new();
+    GitStore::initialize(harness.root()).unwrap();
+    let config_path = harness.root().join("config.toml");
+    let mut config = fs::read_to_string(&config_path).unwrap();
+    config.push_str("\n[[repositories]]\nid = \"rpo_short\"\npaths = []\n");
+    fs::write(config_path, config).unwrap();
+
+    let doctor = harness.failure(&["repository", "doctor"]);
+    assert_eq!(doctor["error"]["code"], "invalid_input");
+    assert!(
+        doctor["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("rpo_short")
+    );
 }
 
 #[test]

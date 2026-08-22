@@ -2,13 +2,16 @@ use std::{
     fs,
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
+    process::Command,
     sync::Arc,
 };
 
+use sctx_engineering_graph::RepositoryRegistry;
 use sctx_installer::{
     Agent, Architecture, CheckStatus, Host, InstallContext, Installer, SetupOptions, SetupStage,
     SkillStatus,
 };
+use sctx_local_state::UserConfigStore;
 use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 
@@ -189,6 +192,19 @@ fn replace_owned_skill_bytes(path: &Path, bytes: &[u8], manifest_path: &Path) {
         .unwrap();
     owned["sha256"] = format!("{:x}", Sha256::digest(bytes)).into();
     fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+}
+
+fn init_catalog_repo(path: &Path) -> PathBuf {
+    fs::create_dir_all(path).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::canonicalize(path).unwrap()
 }
 
 #[test]
@@ -710,6 +726,65 @@ fn doctor_distinguishes_modified_and_missing_managed_skill_files() {
     assert!(report.checks.iter().any(|check| {
         check.name == "global_skill.openai_yaml" && check.status == CheckStatus::Error
     }));
+}
+
+#[test]
+fn setup_and_doctor_restore_registry_from_catalog_and_report_invalid_config() {
+    let harness = Harness::new();
+    let checkout = init_catalog_repo(&harness.home.join("configured checkout"));
+    let configured = UserConfigStore::initialize(&harness.root)
+        .unwrap()
+        .add_repository(None, &[checkout])
+        .unwrap();
+    let installer = harness.installer("1.0.0");
+    installer.setup(&SetupOptions::default()).unwrap();
+    assert_eq!(
+        RepositoryRegistry::initialize(&harness.root)
+            .unwrap()
+            .list()
+            .unwrap()[0]
+            .identity
+            .repository_id,
+        configured.repository.repository_id,
+        "setup must synchronize the pre-existing Catalog"
+    );
+    let database = harness.root.join("state/repository-registry.sqlite");
+    for suffix in ["", "-wal", "-shm"] {
+        let path = PathBuf::from(format!("{}{suffix}", database.display()));
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove Registry database: {error}"),
+        }
+    }
+
+    let report = installer.doctor();
+    assert!(
+        report.checks.iter().any(|check| {
+            check.name == "repository_registry" && check.status == CheckStatus::Ok
+        })
+    );
+    assert_eq!(
+        RepositoryRegistry::initialize(&harness.root)
+            .unwrap()
+            .list()
+            .unwrap()[0]
+            .identity
+            .repository_id,
+        configured.repository.repository_id
+    );
+
+    let config_path = harness.root.join("config.toml");
+    let mut config = fs::read_to_string(&config_path).unwrap();
+    config.push_str("\n[[repositories]]\nid = \"rpo_short\"\npaths = []\n");
+    fs::write(config_path, config).unwrap();
+    let invalid = installer.doctor();
+    assert!(!invalid.healthy);
+    assert!(
+        invalid.checks.iter().any(|check| {
+            check.name == "repository_catalog" && check.status == CheckStatus::Error
+        })
+    );
 }
 
 #[test]

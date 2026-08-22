@@ -1,14 +1,16 @@
 use std::{
-    fs,
+    fs::{self, OpenOptions},
     io::{BufRead as _, BufReader, Write as _},
     path::Path,
     process::{Child, Command, Stdio},
 };
 
+use fs2::FileExt;
 use sctx_domain::{ExternalSessionLocator, IntentSnapshot, TaskId, TaskIntent};
 use sctx_event_schema::Event;
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::ProjectionIndex;
+use sctx_local_state::UserConfigStore;
 use sctx_task_runtime::TaskRuntime;
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
@@ -324,7 +326,7 @@ fn cursor_post_tool_hook_fails_open_when_runtime_is_unavailable() {
 }
 
 #[test]
-fn cursor_post_tool_hook_fails_open_when_repository_registry_is_unavailable() {
+fn cursor_post_tool_hook_ignores_repository_registry_failure() {
     let harness = Harness::new();
     initialize_store(&harness);
     let workspace = harness.home.join("registry workspace");
@@ -339,6 +341,12 @@ fn cursor_post_tool_hook_fails_open_when_repository_registry_is_unavailable() {
     );
     let file = workspace.join("contract.rs");
     fs::write(&file, "fn contract() {}\n").unwrap();
+    let workspace = fs::canonicalize(workspace).unwrap();
+    let file = fs::canonicalize(file).unwrap();
+    UserConfigStore::initialize(harness.root())
+        .unwrap()
+        .add_repository(None, std::slice::from_ref(&workspace))
+        .unwrap();
     TaskRuntime::initialize(harness.root())
         .unwrap()
         .open_or_create(
@@ -348,7 +356,38 @@ fn cursor_post_tool_hook_fails_open_when_repository_registry_is_unavailable() {
         )
         .unwrap();
     fs::create_dir(harness.root().join("state/repository-registry.sqlite")).unwrap();
-    let secret = "CURSOR_REGISTRY_SECRET_MUST_NOT_LEAK";
+    let secret = "CURSOR_REGISTRY_HOT_PATH_MUST_NOT_RUN";
+
+    let output = harness.hook("cursor", &cursor_post_tool(&workspace, &file, secret));
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({})
+    );
+}
+
+#[test]
+fn cursor_post_tool_hook_fails_open_when_catalog_config_is_invalid() {
+    let harness = Harness::new();
+    initialize_store(&harness);
+    let workspace = harness.home.join("invalid catalog workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let file = workspace.join("contract.rs");
+    fs::write(&file, "fn contract() {}\n").unwrap();
+    TaskRuntime::initialize(harness.root())
+        .unwrap()
+        .open_or_create(
+            ExternalSessionLocator::new("cursor", "cursor-fail-open").unwrap(),
+            task_intent(TaskId::new()),
+            Vec::new(),
+        )
+        .unwrap();
+    fs::write(
+        harness.root().join("config.toml"),
+        "RAW_INVALID_CATALOG_CONFIG",
+    )
+    .unwrap();
+    let secret = "CURSOR_CATALOG_CONFIG_MUST_NOT_LEAK";
 
     let output = harness.hook("cursor", &cursor_post_tool(&workspace, &file, secret));
     assert_fail_open(
@@ -358,4 +397,41 @@ fn cursor_post_tool_hook_fails_open_when_repository_registry_is_unavailable() {
         &harness.root(),
         secret,
     );
+}
+
+#[test]
+fn cursor_post_tool_hook_fails_open_immediately_when_catalog_lock_is_busy() {
+    let harness = Harness::new();
+    initialize_store(&harness);
+    let workspace = harness.home.join("locked catalog workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let file = workspace.join("contract.rs");
+    fs::write(&file, "fn contract() {}\n").unwrap();
+    TaskRuntime::initialize(harness.root())
+        .unwrap()
+        .open_or_create(
+            ExternalSessionLocator::new("cursor", "cursor-fail-open").unwrap(),
+            task_intent(TaskId::new()),
+            Vec::new(),
+        )
+        .unwrap();
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(harness.root().join("state/config.lock"))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    let secret = "CURSOR_CATALOG_LOCK_MUST_NOT_LEAK";
+
+    let started = std::time::Instant::now();
+    let output = harness.hook("cursor", &cursor_post_tool(&workspace, &file, secret));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert_fail_open(
+        &output,
+        "additional_context",
+        DIAGNOSTIC,
+        &harness.root(),
+        secret,
+    );
+    FileExt::unlock(&lock).unwrap();
 }
