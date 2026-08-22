@@ -18,12 +18,19 @@ pub use engineering::{
     ReferenceRelation, RepoRelativePath, RepositoryIdentity, ResolutionStatus, ResolvedFocus,
 };
 pub use episode::{
-    ArtifactAction, ContextCandidate, ContextUseDisposition, WorkEpisode, WorkObservation,
+    AgentCheckpoint, ArtifactAction, ArtifactRef, AutomaticCandidateStatus,
+    AutomaticContextCandidate, CandidateAnalysis, CandidateBuilderProvenance, CandidateConfidence,
+    CandidateSpaceRecommendation, CaptureEvidenceRef, CaptureUnknown, CheckpointClaim,
+    ContextCandidate, ContextRevisionRef, ContextUseDisposition, IntentRevisionRange,
+    NonLocatingSignalRef, NormalizedBreadcrumbKind, NormalizedWorkObservation,
+    RecommendedSpaceRole, TestOutcomeStatus, WorkEpisode, WorkEpisodeRef, WorkEpisodeStatus,
+    WorkObservation, WorkSourceRef,
 };
 pub use ids::{
-    CandidateId, ConflictId, ContextId, EventId, EvidenceId, ExternalSessionId, IdParseError,
-    PublicationId, ReferenceId, RepositoryId, ResolutionId, ReviewId, RevisionId, SignalId,
-    SpaceId, TaskId, TaskIntentRevisionId, TaskSessionId, WorkEpisodeId,
+    AgentCheckpointId, CandidateBuildId, CandidateId, CheckpointClaimId, ConflictId, ContextId,
+    EventId, EvidenceId, ExternalSessionId, IdParseError, PublicationId, ReferenceId, RepositoryId,
+    ResolutionId, ReviewId, RevisionId, SignalId, SpaceId, SpaceRecommendationId, TaskId,
+    TaskIntentRevisionId, TaskSessionId, WorkEpisodeId, WorkObservationId,
 };
 pub use model::{
     Applicability, ConflictParticipant, ConflictResolution, ConflictResolutionDraft,

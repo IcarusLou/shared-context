@@ -161,6 +161,31 @@ opaque_id!(
     "Opaque identity of one Task's aggregated work episode."
 );
 opaque_id!(
+    WorkObservationId,
+    "wob_",
+    "Opaque identity of one normalized work observation."
+);
+opaque_id!(
+    AgentCheckpointId,
+    "ckp_",
+    "Opaque identity of one Agent engineering checkpoint."
+);
+opaque_id!(
+    CheckpointClaimId,
+    "clm_",
+    "Opaque identity of one structured checkpoint claim."
+);
+opaque_id!(
+    CandidateBuildId,
+    "bld_",
+    "Opaque identity of one automatic Candidate build."
+);
+opaque_id!(
+    SpaceRecommendationId,
+    "rec_",
+    "Opaque identity of one Candidate Space recommendation."
+);
+opaque_id!(
     CandidateId,
     "cnd_",
     "Opaque identity of an unassigned `ContextCandidate`."
@@ -201,9 +226,10 @@ mod tests {
     use uuid::{Variant, Version};
 
     use super::{
-        CandidateId, ConflictId, ContextId, EventId, EvidenceId, ExternalSessionId, PublicationId,
-        ReferenceId, RepositoryId, ResolutionId, ReviewId, RevisionId, SignalId, SpaceId, TaskId,
-        TaskIntentRevisionId, TaskSessionId, WorkEpisodeId,
+        AgentCheckpointId, CandidateBuildId, CandidateId, CheckpointClaimId, ConflictId, ContextId,
+        EventId, EvidenceId, ExternalSessionId, PublicationId, ReferenceId, RepositoryId,
+        ResolutionId, ReviewId, RevisionId, SignalId, SpaceId, SpaceRecommendationId, TaskId,
+        TaskIntentRevisionId, TaskSessionId, WorkEpisodeId, WorkObservationId,
     };
 
     #[test]
@@ -248,6 +274,11 @@ mod tests {
         assert_generated_id!(TaskIntentRevisionId::new(), "tir_");
         assert_generated_id!(SignalId::new(), "sig_");
         assert_generated_id!(WorkEpisodeId::new(), "wep_");
+        assert_generated_id!(WorkObservationId::new(), "wob_");
+        assert_generated_id!(AgentCheckpointId::new(), "ckp_");
+        assert_generated_id!(CheckpointClaimId::new(), "clm_");
+        assert_generated_id!(CandidateBuildId::new(), "bld_");
+        assert_generated_id!(SpaceRecommendationId::new(), "rec_");
         assert_generated_id!(CandidateId::new(), "cnd_");
         assert_generated_id!(ContextId::new(), "ctx_");
         assert_generated_id!(RevisionId::new(), "rev_");

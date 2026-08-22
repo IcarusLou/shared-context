@@ -52,6 +52,38 @@ _Avoid_: Test Artifact, qualified Test locator
 The current relevance of one identified non-locating TaskSignal within its Task: Active signals participate in retrieval, while Superseded signals remain historical evidence but do not participate.
 _Avoid_: deletion, global signal state
 
+**WorkEpisode**:
+A server-identified, TaskSession- and Task-owned interval that aggregates normalized engineering observations across an explicit range of TaskIntentRevisions. It remains Open while work is accumulating and becomes Closed at a final AgentCheckpoint; it never embeds raw Prompt, transcript, tool output, or Space routing.
+_Avoid_: chat transcript, tool log, Workspace-to-Space binding
+
+**WorkObservation**:
+A server-identified, normalized statement about engineering work under one WorkEpisode, owned by an exact TaskIntentRevision and grounded by typed source references. It preserves extracted meaning rather than raw source payloads.
+_Avoid_: raw Breadcrumb, terminal output, untyped artifact string
+
+**AgentCheckpoint**:
+An Agent-authored, server-identified snapshot of Claims and Unknowns owned by one WorkEpisode, TaskSession, Task, and TaskIntentRevision. It closes an Episode boundary without selecting a ContextSpace.
+_Avoid_: conversation summary, Candidate approval, Space selection
+
+**CheckpointClaim**:
+A structured engineering assertion containing its statement, rationale, applicability, assumptions, recheck conditions, typed Evidence references, Artifact references, and related Context revisions.
+_Avoid_: unsupported conclusion, free-form note
+
+**CandidateBuilderProvenance**:
+The typed ownership and exact Checkpoint and WorkObservation inputs of one automatic Candidate build. It makes the source WorkEpisode verifiable without retaining raw Agent payloads.
+_Avoid_: opaque source_episode_id, transcript pointer
+
+**AutomaticContextCandidate**:
+An unowned, non-injectable Context draft produced from one Closed WorkEpisode. It carries CandidateAnalysis, Space recommendations, confidence, Unknowns, and Builder provenance, but no selected ContextSpace.
+_Avoid_: published Context, accepted Candidate, automatically injected knowledge
+
+**CandidateAnalysis**:
+A typed comparison of an AutomaticContextCandidate with existing immutable Context revisions: duplicate, supporting, revising, contradicting, or novel. Novel and duplicate classifications are exclusive; revision may coexist with support or contradiction when the relationship is partial.
+_Avoid_: similarity score, implicit deduplication
+
+**CandidateSpaceRecommendation**:
+A non-binding recommendation that an AutomaticContextCandidate is Primary or Related to an existing ContextSpace, or that a new Space Intent may be needed. Recommendations never create or select a Space.
+_Avoid_: Candidate ownership, Active Space, automatic Space creation
+
 **TaskSpaceAssociation**:
 A derived, explainable relevance between one Task and one ContextSpace. A Task may have no associations or multiple associations, and their ordering may change as new signals arrive.
 _Avoid_: Active Space, default Space
