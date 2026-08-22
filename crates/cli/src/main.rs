@@ -65,7 +65,7 @@ Commands:
   uninstall [--root PATH]
   knowledge delete --confirm-path PATH --confirm DELETE-SHARED-CONTEXT-KNOWLEDGE
   space create|intent revise|list|get
-  candidate create
+  candidate create|build-closed-episode
   context revise|review|publish|withdraw|get
   semantic conflict open|resolve
   task context|artifact-focus|checkpoint|intent update|signal supersede
@@ -1112,8 +1112,29 @@ fn run_space(args: &[String], json_output: bool) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
     match args {
+        [command, rest @ ..] if command == "build-closed-episode" => {
+            if is_help(rest) {
+                println!("Usage: sctx candidate build-closed-episode --episode-id <ID>");
+                return Ok(());
+            }
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(&["--episode-id"], &[])?;
+            let episode_id =
+                parse_id::<WorkEpisodeId>(options.required("--episode-id")?, "source episode ID")?;
+            let response =
+                sctx_mcp::build_closed_episode_at_root(installation_root()?, episode_id)?;
+            let metadata = Runtime::open()?.index.synchronize()?.metadata;
+            emit(
+                "candidate.build-closed-episode",
+                &metadata,
+                serde_json::to_value(response)
+                    .map_err(json_error("serialize Candidate Build response"))?,
+                json_output,
+            )
+        }
         [command, rest @ ..] if command == "create" => {
             if is_help(rest) {
                 print!(
@@ -1195,7 +1216,7 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
             )
         }
         _ => Err(invalid(format!(
-            "invalid candidate command; expected create\n\n{CONTEXT_WRITE_HELP}"
+            "invalid candidate command; expected create|build-closed-episode\n\n{CONTEXT_WRITE_HELP}"
         ))),
     }
 }

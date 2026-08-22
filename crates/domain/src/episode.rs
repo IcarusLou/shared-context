@@ -577,6 +577,8 @@ impl CaptureUnknown {
 #[serde(deny_unknown_fields)]
 pub struct CheckpointClaim {
     pub claim_id: CheckpointClaimId,
+    pub context_kind_hint: Option<crate::ContextKind>,
+    pub topic_key_hint: Option<String>,
     pub statement: String,
     pub rationale: String,
     pub applicability: Applicability,
@@ -595,6 +597,8 @@ impl CheckpointClaim {
     /// Returns an input error for missing statement/rationale/Evidence or invalid references.
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
+        context_kind_hint: Option<crate::ContextKind>,
+        topic_key_hint: Option<String>,
         statement: impl Into<String>,
         rationale: impl Into<String>,
         applicability: Applicability,
@@ -606,6 +610,8 @@ impl CheckpointClaim {
     ) -> Result<Self> {
         let claim = Self {
             claim_id: CheckpointClaimId::new(),
+            context_kind_hint,
+            topic_key_hint,
             statement: statement.into(),
             rationale: rationale.into(),
             applicability,
@@ -620,6 +626,9 @@ impl CheckpointClaim {
     }
 
     fn validate(&self, field: &str) -> Result<()> {
+        if let Some(topic_key_hint) = &self.topic_key_hint {
+            require_text(topic_key_hint, &format!("{field}.topic_key_hint"))?;
+        }
         require_text(&self.statement, &format!("{field}.statement"))?;
         require_text(&self.rationale, &format!("{field}.rationale"))?;
         self.applicability
@@ -754,7 +763,8 @@ impl CandidateBuilderProvenance {
     ///
     /// # Errors
     ///
-    /// Requires at least one Checkpoint and Observation with no duplicate IDs.
+    /// Requires at least one Checkpoint and no duplicate source IDs. Observation sources are
+    /// optional when a Claim is grounded directly by Task Signal or immutable Context Evidence.
     pub fn from_parts(
         source_episode: WorkEpisodeRef,
         checkpoint_ids: Vec<AgentCheckpointId>,
@@ -771,9 +781,9 @@ impl CandidateBuilderProvenance {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.checkpoint_ids.is_empty() || self.observation_ids.is_empty() {
+        if self.checkpoint_ids.is_empty() {
             return Err(invalid(
-                "candidate_builder_provenance requires Checkpoint and Observation sources",
+                "candidate_builder_provenance requires a Checkpoint source",
             ));
         }
         require_unique(
@@ -1050,6 +1060,44 @@ impl AutomaticContextCandidate {
             unknowns,
             status,
         };
+        candidate.validate_against_sources(episode, checkpoints)?;
+        Ok(candidate)
+    }
+
+    /// Restores the automatic Candidate view around the exact Candidate identity returned by the
+    /// persisted submission boundary.
+    ///
+    /// # Errors
+    ///
+    /// Rejects mismatched Episode ownership or invalid Builder metadata and content.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_persisted_candidate(
+        persisted: &ContextCandidate,
+        episode: &WorkEpisode,
+        checkpoints: &[AgentCheckpoint],
+        builder_provenance: CandidateBuilderProvenance,
+        analysis: CandidateAnalysis,
+        space_recommendations: Vec<CandidateSpaceRecommendation>,
+        confidence: CandidateConfidence,
+        unknowns: Vec<CaptureUnknown>,
+        status: AutomaticCandidateStatus,
+    ) -> Result<Self> {
+        let candidate = Self {
+            candidate_id: persisted.candidate_id,
+            source_episode: persisted.source_episode,
+            content: persisted.content.clone(),
+            builder_provenance,
+            analysis,
+            space_recommendations,
+            confidence,
+            unknowns,
+            status,
+        };
+        if persisted.source_episode != episode.ownership() {
+            return Err(invalid(
+                "persisted Candidate source Episode ownership does not match",
+            ));
+        }
         candidate.validate_against_sources(episode, checkpoints)?;
         Ok(candidate)
     }
@@ -1376,6 +1424,8 @@ mod tests {
         let observation_id = observation.observation_id;
         episode.add_observation(observation).unwrap();
         let claim = CheckpointClaim::from_parts(
+            Some(ContextKind::Decision),
+            Some("capture/fallback-owner".to_owned()),
             "Keep fallback ownership server-side",
             "Every client consumes one contract",
             Applicability::default(),
@@ -1658,6 +1708,8 @@ mod tests {
     fn checkpoint_claim_and_candidate_require_complete_evidence() {
         assert!(
             CheckpointClaim::from_parts(
+                None,
+                None,
                 "Claim without Evidence",
                 "Cannot be grounded",
                 Applicability::default(),
@@ -1826,6 +1878,29 @@ mod tests {
     #[test]
     fn automatic_candidate_source_ownership_and_status_are_verifiable() {
         let fixture = capture_fixture();
+        let mut unkeyed_decision = content();
+        unkeyed_decision.topic_key = None;
+        assert!(unkeyed_decision.validate().is_ok());
+        let persisted =
+            ContextCandidate::from_episode(SubmissionId::new(), &fixture.episode, unkeyed_decision)
+                .unwrap();
+        let restored = AutomaticContextCandidate::from_persisted_candidate(
+            &persisted,
+            &fixture.episode,
+            std::slice::from_ref(&fixture.checkpoint),
+            provenance(&fixture),
+            CandidateAnalysis {
+                novel: true,
+                ..CandidateAnalysis::default()
+            },
+            Vec::new(),
+            confidence(7_000),
+            Vec::new(),
+            AutomaticCandidateStatus::Draft,
+        )
+        .unwrap();
+        assert_eq!(restored.candidate_id, persisted.candidate_id);
+
         let mut candidate = AutomaticContextCandidate::from_builder(
             &fixture.episode,
             std::slice::from_ref(&fixture.checkpoint),

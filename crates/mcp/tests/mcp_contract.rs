@@ -3,27 +3,35 @@ use std::{
     io::{BufReader, Cursor},
     path::Path,
     process::Command,
+    sync::{Arc, Barrier},
+    thread,
 };
 
 use sctx_domain::{
-    Applicability, ArtifactLocator, ArtifactRef, CandidateId, CaptureUnknown, ContextId,
-    ContextKind, ContextRevisionDraft, ContextRevisionRef, EventId, EvidenceSnapshotDraft,
-    EvidenceType, IntentSnapshot, PublicationAction, PublicationDraft, RepoRelativePath,
-    RepositoryId, RevisionId, SpaceId, SubmissionId, TaskId, TaskIntentDraft, TaskIntentRevisionId,
-    TaskSignal, TaskSignalKind, WorkEpisodeId,
+    Applicability, ArtifactAction, ArtifactLocator, ArtifactRef, CandidateId, CaptureId,
+    CaptureUnknown, ContextId, ContextKind, ContextRevisionDraft, ContextRevisionRef,
+    ContextUseDisposition, EventId, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot,
+    NormalizedBreadcrumbKind, NormalizedWorkObservation, PublicationAction, PublicationDraft,
+    RepoRelativePath, RepositoryId, RevisionId, SpaceId, SubmissionId, TaskId, TaskIntentDraft,
+    TaskIntentRevisionId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkSourceRef,
+    candidate_submission_content_hash,
 };
 use sctx_event_schema::{Event, EventPayload};
-use sctx_git_store::{AppendRequest, GitStore};
+use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
 use sctx_index::ProjectionIndex;
 use sctx_local_state::UserConfigStore;
 use sctx_mcp::{
-    ClientKind, DisconnectReason, ExpectedRevisionId, IntentMaturity, McpServer, TaskBoundary,
-    TaskCheckpointBoundary, TaskCheckpointClaimInput, TaskCheckpointEvidenceInput,
-    TaskCheckpointInput, TaskContextReadInput, TaskIntentUpdateInput, TaskSignalSupersedeInput,
-    TransportErrorKind, task_checkpoint_at_root, task_context_readonly_at_root,
+    CandidateBuildItemResponseStatus, CandidateBuildResponseStatus, ClientKind, DisconnectReason,
+    ExpectedRevisionId, IntentMaturity, McpServer, TaskBoundary, TaskCheckpointBoundary,
+    TaskCheckpointClaimInput, TaskCheckpointEvidenceInput, TaskCheckpointInput,
+    TaskContextReadInput, TaskIntentUpdateInput, TaskSignalSupersedeInput, TransportErrorKind,
+    build_closed_episode_at_root, task_checkpoint_at_root, task_context_readonly_at_root,
     task_intent_update_at_root, task_signal_supersede_at_root,
 };
-use sctx_task_runtime::TaskRuntime;
+use sctx_task_runtime::{
+    AgentCheckpointWrite, CandidateBuildItemPreparation, CandidateBuildItemStatus,
+    CaptureIngestion, CheckpointBoundary, CheckpointClaimDraft, TaskRuntime,
+};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -203,6 +211,75 @@ fn candidate_arguments(
     })
 }
 
+fn directly_close_builder_episode(
+    fixture: &Fixture,
+    session: &str,
+    statement: &str,
+) -> (
+    sctx_task_runtime::AgentCheckpointOutcome,
+    ContextRevisionDraft,
+) {
+    let tasks = TaskRuntime::initialize(&fixture.root).unwrap();
+    let locator = sctx_domain::ExternalSessionLocator::new("codex", session).unwrap();
+    let task_id = TaskId::new();
+    let intent = update_input(
+        session,
+        TaskBoundary::New,
+        None,
+        IntentMaturity::Provisional,
+        "exercise Candidate Build crash recovery",
+    )
+    .intent
+    .bind(task_id);
+    let task = tasks
+        .open_or_create(locator.clone(), intent, Vec::new())
+        .unwrap()
+        .snapshot;
+    let evidence = EvidenceSnapshotDraft {
+        kind: EvidenceType::ExperimentRecord,
+        supports: statement.to_owned(),
+        content: json!({"test": session, "actual": "passed"}),
+        interpretation: "The deterministic Builder fixture passed".to_owned(),
+        limitations: Vec::new(),
+    };
+    let rationale = "The persisted Checkpoint owns this exact Claim".to_owned();
+    let closed = tasks
+        .write_agent_checkpoint(&AgentCheckpointWrite {
+            locator,
+            expected_task_id: task.task_id,
+            expected_intent_revision_id: task.current_intent_revision().unwrap().revision_id,
+            expected_episode_version: 0,
+            boundary: CheckpointBoundary::Close,
+            claims: vec![CheckpointClaimDraft {
+                context_kind_hint: Some(ContextKind::Validation),
+                topic_key_hint: None,
+                statement: statement.to_owned(),
+                rationale: rationale.clone(),
+                applicability: Applicability::default(),
+                assumptions: Vec::new(),
+                recheck_when: Vec::new(),
+                evidence_refs: Vec::new(),
+                inline_validations: vec![evidence.clone()],
+                artifact_refs: Vec::new(),
+                related_contexts: Vec::new(),
+            }],
+            unknowns: Vec::new(),
+        })
+        .unwrap();
+    let content = ContextRevisionDraft {
+        kind: ContextKind::Validation,
+        topic_key: None,
+        statement: statement.to_owned(),
+        rationale,
+        applicability: Applicability::default(),
+        assumptions: Vec::new(),
+        recheck_when: Vec::new(),
+        relations: Vec::new(),
+        evidence: vec![evidence],
+    };
+    (closed, content)
+}
+
 fn task_arguments(agent_kind: &str, external_session_id: &str) -> Value {
     json!({
         "agent_kind": agent_kind,
@@ -372,6 +449,8 @@ fn typed_checkpoint_input(
         expected_episode_version: version,
         boundary: TaskCheckpointBoundary::Continue,
         claims: vec![TaskCheckpointClaimInput {
+            context_kind_hint: None,
+            topic_key_hint: None,
             statement: "Checkpoint validation is strict".to_owned(),
             rationale: "Invalid references and private content must fail before storage".to_owned(),
             applicability: Applicability {
@@ -588,7 +667,7 @@ fn checkpoint_rejects_dangling_private_stale_conflicting_and_forged_input_withou
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn codex_and_cursor_checkpoint_inline_evidence_and_close_without_hook_or_candidate() {
+fn codex_and_cursor_checkpoint_inline_evidence_builds_only_after_close() {
     for (client, framing, agent_kind) in [
         (ClientKind::Cursor, FixtureFraming::Newline, "cursor"),
         (ClientKind::Codex, FixtureFraming::ContentLength, "codex"),
@@ -661,6 +740,7 @@ fn codex_and_cursor_checkpoint_inline_evidence_and_close_without_hook_or_candida
         assert_eq!(continued["created"], true);
         assert_eq!(continued["episode_version"], 1);
         assert_eq!(continued["episode_status"], json!({"status": "open"}));
+        assert!(continued.get("candidate_build").is_none());
         assert!(
             continued["checkpoint_id"]
                 .as_str()
@@ -724,8 +804,624 @@ fn codex_and_cursor_checkpoint_inline_evidence_and_close_without_hook_or_candida
             .unwrap();
         assert_eq!(persisted.checkpoints.len(), 2);
         assert_eq!(persisted.episode.observations.len(), 1);
-        assert_eq!(event_count(fixture.store.repository()), before_events);
+        assert_eq!(closed["candidate_build"]["status"], "complete");
+        assert_eq!(
+            closed["candidate_build"]["items"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(closed["candidate_build"]["items"][0]["status"], "created");
+        assert!(
+            closed["candidate_build"]["items"][0]["candidate_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("cnd_")
+        );
+        assert_eq!(event_count(fixture.store.repository()), before_events + 1);
     }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn candidate_builder_converts_six_typed_sources_without_raw_capture_or_search_injection() {
+    let fixture = Fixture::new();
+    let before_events = event_count(fixture.store.repository());
+    let session = "candidate-builder-six-sources";
+    let task = task_intent_update_at_root(
+        &fixture.root,
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            ..update_input(
+                session,
+                TaskBoundary::New,
+                None,
+                IntentMaturity::Provisional,
+                "build six evidenced Candidate drafts",
+            )
+        },
+    )
+    .unwrap();
+    let tasks = TaskRuntime::initialize(&fixture.root).unwrap();
+    let active = tasks
+        .read_snapshot(task.context.task_session_id)
+        .unwrap()
+        .unwrap();
+    let merged = tasks
+        .merge_signals(
+            active.task_session_id,
+            vec![TaskSignal {
+                kind: TaskSignalKind::Diff,
+                content: "SearchResult fallback field changed".to_owned(),
+            }],
+        )
+        .unwrap();
+    let opened = tasks
+        .open_work_episode(
+            &sctx_domain::ExternalSessionLocator::new("codex", session).unwrap(),
+            active.task_id,
+            active.current_intent_revision().unwrap().revision_id,
+        )
+        .unwrap()
+        .episode;
+    let signal = opened
+        .episode
+        .signal_refs
+        .iter()
+        .find(|signal| signal.signal_id == merged.inserted_signal_ids[0])
+        .copied()
+        .unwrap();
+    let artifact = ArtifactRef {
+        repository_id: RepositoryId::new(),
+        locator: ArtifactLocator::File {
+            path: RepoRelativePath::new("src/search.ts").unwrap(),
+        },
+    };
+    let artifact_observation = tasks
+        .append_work_observation(
+            opened.episode.episode_id,
+            0,
+            opened.episode.intent_revisions.last(),
+            vec![WorkSourceRef::TaskSignal(signal)],
+            NormalizedWorkObservation::Artifact {
+                artifact: artifact.clone(),
+                action: ArtifactAction::Inspected,
+                summary: "The FE reads the server fallback field".to_owned(),
+            },
+        )
+        .unwrap();
+    let artifact_observation_id = artifact_observation.observation_id;
+    let context_use = tasks
+        .append_work_observation(
+            opened.episode.episode_id,
+            1,
+            opened.episode.intent_revisions.last(),
+            vec![WorkSourceRef::TaskSignal(signal)],
+            NormalizedWorkObservation::ContextUse {
+                context: ContextRevisionRef {
+                    context_id: fixture.context_id,
+                    revision_id: fixture.revision_id,
+                },
+                disposition: ContextUseDisposition::Applied,
+                reason: "The existing transport decision constrains the implementation".to_owned(),
+            },
+        )
+        .unwrap();
+    let context_use_observation_id = context_use.observation_id;
+    let capture_id = CaptureId::new();
+    let capture = tasks
+        .ingest_capture(&CaptureIngestion {
+            capture_id,
+            episode_id: opened.episode.episode_id,
+            expected_episode_version: 2,
+            task_session_id: active.task_session_id,
+            task_id: active.task_id,
+            intent_revision_id: opened.episode.intent_revisions.last(),
+            additional_sources: Vec::new(),
+            observation: NormalizedWorkObservation::Breadcrumb {
+                category: NormalizedBreadcrumbKind::Decision,
+                summary: "Normalized Capture confirms the compatibility boundary".to_owned(),
+            },
+            diagnostics: Vec::new(),
+        })
+        .unwrap();
+    let source_snapshot = ProjectionIndex::for_store(&fixture.store)
+        .domain_snapshot()
+        .unwrap();
+    let source_evidence = source_snapshot.projection.spaces[&fixture.space_id].contexts
+        [&fixture.context_id]
+        .revisions[&fixture.revision_id]
+        .revision
+        .evidence[0]
+        .clone();
+    let inline = EvidenceSnapshotDraft {
+        kind: EvidenceType::ExperimentRecord,
+        supports: "The focused compatibility test passed".to_owned(),
+        content: json!({"test": "compatibility", "actual": "passed"}),
+        interpretation: "The behavior is directly validated".to_owned(),
+        limitations: vec!["local fixture".to_owned()],
+    };
+    let claims = vec![
+        TaskCheckpointClaimInput {
+            context_kind_hint: Some(ContextKind::Decision),
+            topic_key_hint: None,
+            statement: "Keep fallback ownership on the server".to_owned(),
+            rationale: "Every client consumes one response contract".to_owned(),
+            applicability: Applicability::default(),
+            assumptions: Vec::new(),
+            recheck_when: Vec::new(),
+            evidence: vec![TaskCheckpointEvidenceInput::InlineValidation { evidence: inline }],
+            artifact_refs: Vec::new(),
+            related_contexts: Vec::new(),
+        },
+        TaskCheckpointClaimInput {
+            context_kind_hint: None,
+            topic_key_hint: None,
+            statement: "The FE consumes the fallback Artifact".to_owned(),
+            rationale: "The normalized Artifact observation identifies the consumer".to_owned(),
+            applicability: Applicability::default(),
+            assumptions: Vec::new(),
+            recheck_when: Vec::new(),
+            evidence: vec![TaskCheckpointEvidenceInput::Observation {
+                observation_id: artifact_observation_id.to_string(),
+            }],
+            artifact_refs: Vec::new(),
+            related_contexts: Vec::new(),
+        },
+        TaskCheckpointClaimInput {
+            context_kind_hint: Some(ContextKind::Contract),
+            topic_key_hint: Some("mcp/context-use".to_owned()),
+            statement: "The existing Context constrains this implementation".to_owned(),
+            rationale: "The Agent explicitly applied that immutable revision".to_owned(),
+            applicability: Applicability::default(),
+            assumptions: Vec::new(),
+            recheck_when: Vec::new(),
+            evidence: vec![TaskCheckpointEvidenceInput::Observation {
+                observation_id: context_use_observation_id.to_string(),
+            }],
+            artifact_refs: Vec::new(),
+            related_contexts: vec![ContextRevisionRef {
+                context_id: fixture.context_id,
+                revision_id: fixture.revision_id,
+            }],
+        },
+        TaskCheckpointClaimInput {
+            context_kind_hint: Some(ContextKind::Validation),
+            topic_key_hint: None,
+            statement: "The Task Diff records the fallback change".to_owned(),
+            rationale: "The exact Task Signal is part of this Episode".to_owned(),
+            applicability: Applicability::default(),
+            assumptions: Vec::new(),
+            recheck_when: Vec::new(),
+            evidence: vec![TaskCheckpointEvidenceInput::TaskSignal {
+                signal_id: signal.signal_id.to_string(),
+            }],
+            artifact_refs: Vec::new(),
+            related_contexts: Vec::new(),
+        },
+        TaskCheckpointClaimInput {
+            context_kind_hint: Some(ContextKind::Validation),
+            topic_key_hint: None,
+            statement: "The immutable Context Evidence remains applicable".to_owned(),
+            rationale: "The exact indexed Evidence snapshot is reused".to_owned(),
+            applicability: Applicability::default(),
+            assumptions: Vec::new(),
+            recheck_when: Vec::new(),
+            evidence: vec![TaskCheckpointEvidenceInput::ContextEvidence {
+                context_id: fixture.context_id.to_string(),
+                revision_id: fixture.revision_id.to_string(),
+                evidence_id: source_evidence.evidence_id.to_string(),
+            }],
+            artifact_refs: Vec::new(),
+            related_contexts: Vec::new(),
+        },
+        TaskCheckpointClaimInput {
+            context_kind_hint: Some(ContextKind::Progress),
+            topic_key_hint: None,
+            statement: "The normalized Capture records the compatibility boundary".to_owned(),
+            rationale: "Only extracted engineering meaning is retained".to_owned(),
+            applicability: Applicability::default(),
+            assumptions: Vec::new(),
+            recheck_when: Vec::new(),
+            evidence: vec![TaskCheckpointEvidenceInput::Observation {
+                observation_id: capture.observation_id.to_string(),
+            }],
+            artifact_refs: Vec::new(),
+            related_contexts: Vec::new(),
+        },
+    ];
+    let closed = task_checkpoint_at_root(
+        &fixture.root,
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: active.task_id.to_string(),
+            expected_intent_revision_id: opened.episode.intent_revisions.last().to_string(),
+            expected_episode_version: 3,
+            boundary: TaskCheckpointBoundary::Close,
+            claims,
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap();
+    let build = closed.candidate_build.unwrap();
+    assert_eq!(build.status, CandidateBuildResponseStatus::Complete);
+    assert_eq!(build.items.len(), 6);
+    assert!(build.items.iter().all(|item| {
+        item.status == CandidateBuildItemResponseStatus::Created
+            && item.candidate_id.is_some()
+            && item.event_id.is_some()
+            && item.candidate_status == sctx_domain::AutomaticCandidateStatus::Draft
+            && item.analysis.novel
+            && item.space_recommendations.is_empty()
+    }));
+    assert_eq!(build.items[0].confidence.basis_points, 7_000);
+    assert!(
+        build.items[0]
+            .unknowns
+            .iter()
+            .any(|unknown| unknown.statement.contains("topic key") && !unknown.blocking)
+    );
+    assert_eq!(build.items[1].confidence.basis_points, 4_500);
+    assert!(
+        build.items[1]
+            .unknowns
+            .iter()
+            .any(|unknown| unknown.statement.contains("Discovery fallback") && !unknown.blocking)
+    );
+    assert_eq!(event_count(fixture.store.repository()), before_events + 6);
+
+    let candidates = ProjectionIndex::for_store(&fixture.store)
+        .domain_snapshot()
+        .unwrap()
+        .projection
+        .candidates;
+    let candidate_views = build
+        .items
+        .iter()
+        .map(|item| {
+            &candidates[&item
+                .candidate_id
+                .expect("created build item must name Candidate")]
+                .candidate
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(candidate_views[0].content.kind, ContextKind::Decision);
+    assert_eq!(candidate_views[0].content.topic_key, None);
+    assert_eq!(candidate_views[1].content.kind, ContextKind::Discovery);
+    assert_eq!(candidate_views[2].content.kind, ContextKind::Contract);
+    assert_eq!(
+        candidate_views[2].content.topic_key.as_deref(),
+        Some("mcp/context-use")
+    );
+    assert_eq!(
+        candidate_views[4].content.evidence[0].kind,
+        source_evidence.kind
+    );
+    assert_eq!(
+        candidate_views[4].content.evidence[0].supports,
+        source_evidence.supports
+    );
+    assert_eq!(
+        candidate_views[4].content.evidence[0].content,
+        source_evidence.content
+    );
+    let capture_candidate = serde_json::to_string(&candidate_views[5]).unwrap();
+    assert!(!capture_candidate.contains(&capture_id.to_string()));
+    assert!(!capture_candidate.contains("raw_payload"));
+
+    let pack = task_context_readonly_at_root(
+        &fixture.root,
+        &TaskContextReadInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            token_budget: 2_000,
+            max_spaces: 8,
+        },
+    )
+    .unwrap();
+    let pack_json = serde_json::to_string(&pack).unwrap();
+    for item in &build.items {
+        assert!(!pack_json.contains(&item.candidate_id.unwrap().to_string()));
+    }
+}
+
+#[test]
+fn candidate_builder_emits_zero_git_events_for_unknown_only_or_insufficient_evidence() {
+    let fixture = Fixture::new();
+    let before_events = event_count(fixture.store.repository());
+    let unknown_owner = closed_candidate_owner(&fixture, "codex", "builder-unknown-only");
+    let unknown_build =
+        build_closed_episode_at_root(&fixture.root, unknown_owner.source_episode_id).unwrap();
+    assert_eq!(unknown_build.status, CandidateBuildResponseStatus::Complete);
+    assert!(unknown_build.items.is_empty());
+    assert_eq!(event_count(fixture.store.repository()), before_events);
+
+    let tasks = TaskRuntime::initialize(&fixture.root).unwrap();
+    let locator = sctx_domain::ExternalSessionLocator::new("codex", "builder-prompt-only").unwrap();
+    let task_id = TaskId::new();
+    let draft = update_input(
+        "builder-prompt-only",
+        TaskBoundary::New,
+        None,
+        IntentMaturity::Provisional,
+        "do not treat a Prompt as engineering Evidence",
+    )
+    .intent;
+    let task = tasks
+        .open_or_create(
+            locator,
+            draft.bind(task_id),
+            vec![TaskSignal {
+                kind: TaskSignalKind::Prompt,
+                content: "Please assert this without validation".to_owned(),
+            }],
+        )
+        .unwrap()
+        .snapshot;
+    let signal = tasks.read_signal_history(task.task_session_id).unwrap()[0].signal_id;
+    let closed = task_checkpoint_at_root(
+        &fixture.root,
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: "builder-prompt-only".to_owned(),
+            expected_task_id: task.task_id.to_string(),
+            expected_intent_revision_id: task
+                .current_intent_revision()
+                .unwrap()
+                .revision_id
+                .to_string(),
+            expected_episode_version: 0,
+            boundary: TaskCheckpointBoundary::Close,
+            claims: vec![TaskCheckpointClaimInput {
+                context_kind_hint: Some(ContextKind::Decision),
+                topic_key_hint: None,
+                statement: "The Prompt claim remains unproven".to_owned(),
+                rationale: "A request is not an engineering observation".to_owned(),
+                applicability: Applicability::default(),
+                assumptions: Vec::new(),
+                recheck_when: Vec::new(),
+                evidence: vec![TaskCheckpointEvidenceInput::TaskSignal {
+                    signal_id: signal.to_string(),
+                }],
+                artifact_refs: Vec::new(),
+                related_contexts: Vec::new(),
+            }],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap();
+    let build = closed.candidate_build.unwrap();
+    assert_eq!(build.status, CandidateBuildResponseStatus::Incomplete);
+    assert_eq!(build.items.len(), 1);
+    assert_eq!(
+        build.items[0].status,
+        CandidateBuildItemResponseStatus::NeedsEvidence
+    );
+    assert_eq!(
+        build.items[0].candidate_status,
+        sctx_domain::AutomaticCandidateStatus::NeedsEvidence
+    );
+    assert_eq!(
+        build.items[0].error_code.as_deref(),
+        Some("task_signal_not_engineering_evidence")
+    );
+    assert!(build.items[0].candidate_id.is_none());
+    assert!(build.items[0].event_id.is_none());
+    assert_eq!(event_count(fixture.store.repository()), before_events);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn candidate_builder_recovers_both_crash_windows_and_twenty_concurrent_retries() {
+    let fixture = Fixture::new();
+    let before_events = event_count(fixture.store.repository());
+    let tasks = TaskRuntime::initialize(&fixture.root).unwrap();
+
+    let (runtime_first, runtime_first_content) = directly_close_builder_episode(
+        &fixture,
+        "builder-runtime-first",
+        "Runtime reservation survives before Git",
+    );
+    let runtime_first_claim = &runtime_first.checkpoint.claims[0];
+    let runtime_first_prepared = tasks
+        .prepare_candidate_build(
+            runtime_first.episode.episode.episode_id,
+            &[CandidateBuildItemPreparation {
+                checkpoint_id: runtime_first.checkpoint.checkpoint_id,
+                claim_id: runtime_first_claim.claim_id,
+                content_hash: Some(candidate_submission_content_hash(
+                    &runtime_first.episode.episode.ownership(),
+                    &runtime_first_content,
+                )),
+                status: CandidateBuildItemStatus::Prepared,
+                error_code: None,
+            }],
+        )
+        .unwrap();
+    assert_eq!(event_count(fixture.store.repository()), before_events);
+    let runtime_first_retry =
+        build_closed_episode_at_root(&fixture.root, runtime_first.episode.episode.episode_id)
+            .unwrap();
+    assert_eq!(
+        runtime_first_retry.build_id,
+        runtime_first_prepared.build_id
+    );
+    assert_eq!(
+        runtime_first_retry.items[0].submission_id,
+        runtime_first_prepared.items[0].submission_id
+    );
+    assert_eq!(
+        runtime_first_retry.items[0].status,
+        CandidateBuildItemResponseStatus::Created
+    );
+
+    let (git_first, git_first_content) = directly_close_builder_episode(
+        &fixture,
+        "builder-git-first",
+        "Git submission survives before Runtime finalize",
+    );
+    let git_first_claim = &git_first.checkpoint.claims[0];
+    let git_first_prepared = tasks
+        .prepare_candidate_build(
+            git_first.episode.episode.episode_id,
+            &[CandidateBuildItemPreparation {
+                checkpoint_id: git_first.checkpoint.checkpoint_id,
+                claim_id: git_first_claim.claim_id,
+                content_hash: Some(candidate_submission_content_hash(
+                    &git_first.episode.episode.ownership(),
+                    &git_first_content,
+                )),
+                status: CandidateBuildItemStatus::Prepared,
+                error_code: None,
+            }],
+        )
+        .unwrap();
+    let index = ProjectionIndex::for_store(&fixture.store);
+    let store = GitStore::initialize(&fixture.root)
+        .unwrap()
+        .with_candidate_submission_index(Arc::new(index));
+    let direct = store
+        .submit_candidate(CandidateSubmissionRequest {
+            submission_id: git_first_prepared.items[0].submission_id,
+            source_episode: git_first.episode.episode.ownership(),
+            content: git_first_content,
+        })
+        .unwrap();
+    let git_first_retry =
+        build_closed_episode_at_root(&fixture.root, git_first.episode.episode.episode_id).unwrap();
+    assert_eq!(
+        git_first_retry.items[0].status,
+        CandidateBuildItemResponseStatus::AlreadyExists
+    );
+    assert_eq!(
+        git_first_retry.items[0].candidate_id,
+        Some(direct.record.candidate_id)
+    );
+
+    let (concurrent, _) = directly_close_builder_episode(
+        &fixture,
+        "builder-concurrent",
+        "Concurrent Builder retries converge",
+    );
+    let episode_id = concurrent.episode.episode.episode_id;
+    let barrier = Arc::new(Barrier::new(20));
+    let outcomes = (0..20)
+        .map(|_| {
+            let root = fixture.root.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                build_closed_episode_at_root(root, episode_id).unwrap()
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| outcome.build_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| outcome.items[0].submission_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| outcome.items[0].candidate_id.unwrap())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        1
+    );
+    assert_eq!(event_count(fixture.store.repository()), before_events + 3);
+}
+
+#[test]
+fn distinct_claims_with_identical_drafts_keep_distinct_stable_submissions() {
+    let fixture = Fixture::new();
+    let before_events = event_count(fixture.store.repository());
+    let tasks = TaskRuntime::initialize(&fixture.root).unwrap();
+    let session = "builder-identical-claims";
+    let locator = sctx_domain::ExternalSessionLocator::new("codex", session).unwrap();
+    let task_id = TaskId::new();
+    let task = tasks
+        .open_or_create(
+            locator.clone(),
+            update_input(
+                session,
+                TaskBoundary::New,
+                None,
+                IntentMaturity::Provisional,
+                "keep creation-operation identity",
+            )
+            .intent
+            .bind(task_id),
+            Vec::new(),
+        )
+        .unwrap()
+        .snapshot;
+    let evidence = EvidenceSnapshotDraft {
+        kind: EvidenceType::ExperimentRecord,
+        supports: "The identical draft fixture passed".to_owned(),
+        content: json!({"test": "identical", "actual": "passed"}),
+        interpretation: "Both Claims intentionally carry the same content".to_owned(),
+        limitations: Vec::new(),
+    };
+    let claim = CheckpointClaimDraft {
+        context_kind_hint: Some(ContextKind::Validation),
+        topic_key_hint: None,
+        statement: "Two creation operations may have identical text".to_owned(),
+        rationale: "Submission identity is operational, not semantic".to_owned(),
+        applicability: Applicability::default(),
+        assumptions: Vec::new(),
+        recheck_when: Vec::new(),
+        evidence_refs: Vec::new(),
+        inline_validations: vec![evidence],
+        artifact_refs: Vec::new(),
+        related_contexts: Vec::new(),
+    };
+    let revision_id = task.current_intent_revision().unwrap().revision_id;
+    tasks
+        .write_agent_checkpoint(&AgentCheckpointWrite {
+            locator: locator.clone(),
+            expected_task_id: task.task_id,
+            expected_intent_revision_id: revision_id,
+            expected_episode_version: 0,
+            boundary: CheckpointBoundary::Continue,
+            claims: vec![claim.clone()],
+            unknowns: Vec::new(),
+        })
+        .unwrap();
+    let closed = tasks
+        .write_agent_checkpoint(&AgentCheckpointWrite {
+            locator,
+            expected_task_id: task.task_id,
+            expected_intent_revision_id: revision_id,
+            expected_episode_version: 1,
+            boundary: CheckpointBoundary::Close,
+            claims: vec![claim],
+            unknowns: Vec::new(),
+        })
+        .unwrap();
+    let built =
+        build_closed_episode_at_root(&fixture.root, closed.episode.episode.episode_id).unwrap();
+    assert_eq!(built.status, CandidateBuildResponseStatus::Complete);
+    assert_eq!(built.items.len(), 2);
+    assert_ne!(built.items[0].submission_id, built.items[1].submission_id);
+    assert_ne!(built.items[0].candidate_id, built.items[1].candidate_id);
+    let retried =
+        build_closed_episode_at_root(&fixture.root, closed.episode.episode.episode_id).unwrap();
+    assert_eq!(retried, built);
+    assert_eq!(event_count(fixture.store.repository()), before_events + 2);
 }
 
 #[test]
@@ -850,6 +1546,29 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
             );
         }
         assert!(!schema_text.contains("space"));
+        let checkpoint_schema = &tools
+            .iter()
+            .find(|tool| tool["name"] == "task_checkpoint")
+            .unwrap()["inputSchema"];
+        let checkpoint_claim = &checkpoint_schema["properties"]["claims"]["items"];
+        assert_eq!(checkpoint_claim["additionalProperties"], false);
+        assert!(
+            checkpoint_claim["properties"]
+                .get("context_kind_hint")
+                .is_some()
+        );
+        assert!(
+            checkpoint_claim["properties"]
+                .get("topic_key_hint")
+                .is_some()
+        );
+        assert!(
+            !checkpoint_claim["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "context_kind_hint" || field == "topic_key_hint")
+        );
         let task_schema = &tools
             .iter()
             .find(|tool| tool["name"] == "task_context")

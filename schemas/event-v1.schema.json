@@ -473,17 +473,6 @@
           "items": { "$ref": "#/$defs/evidence_draft" }
         }
       },
-      "allOf": [
-        {
-          "if": {
-            "properties": {
-              "kind": { "enum": ["decision", "contract"] }
-            },
-            "required": ["kind"]
-          },
-          "then": { "required": ["topic_key"] }
-        }
-      ],
       "additionalProperties": false
     },
     "context_candidate": {
@@ -555,17 +544,6 @@
           "items": { "$ref": "#/$defs/evidence" }
         }
       },
-      "allOf": [
-        {
-          "if": {
-            "properties": {
-              "kind": { "enum": ["decision", "contract"] }
-            },
-            "required": ["kind"]
-          },
-          "then": { "required": ["topic_key"] }
-        }
-      ],
       "additionalProperties": false
     },
     "review": {

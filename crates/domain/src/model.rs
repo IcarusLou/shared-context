@@ -238,13 +238,6 @@ impl ContextRevisionDraft {
     ///
     /// Returns [`ErrorKind::InvalidInput`] when required content or evidence is absent.
     pub fn validate(&self) -> Result<()> {
-        if matches!(self.kind, ContextKind::Decision | ContextKind::Contract)
-            && self.topic_key.as_deref().is_none_or(str::is_empty)
-        {
-            return Err(invalid(
-                "context revision topic_key is required for decision and contract",
-            ));
-        }
         if let Some(topic_key) = &self.topic_key {
             require_text(topic_key, "context revision topic_key")?;
         }

@@ -5,13 +5,14 @@ use std::{
 };
 
 use sctx_domain::{
-    Applicability, CaptureEvidenceRef, CaptureId, CaptureUnknown, ErrorKind, EvidenceSnapshotDraft,
-    EvidenceType, ExternalSessionLocator, NormalizedBreadcrumbKind, NormalizedWorkObservation,
-    TaskId, TaskIntent, TaskIntentDraft, TaskSignal, TaskSignalKind, TestOutcomeStatus,
-    WorkEpisodeStatus, WorkSourceRef,
+    Applicability, CandidateId, CaptureEvidenceRef, CaptureId, CaptureUnknown, ErrorKind, EventId,
+    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, NormalizedBreadcrumbKind,
+    NormalizedWorkObservation, TaskId, TaskIntent, TaskIntentDraft, TaskSignal, TaskSignalKind,
+    TestOutcomeStatus, WorkEpisodeStatus, WorkSourceRef,
 };
 use sctx_task_runtime::{
-    AgentCheckpointWrite, CaptureIngestion, CheckpointBoundary, CheckpointClaimDraft, TaskRuntime,
+    AgentCheckpointWrite, CandidateBuildItemPreparation, CandidateBuildItemStatus,
+    CandidateBuildStatus, CaptureIngestion, CheckpointBoundary, CheckpointClaimDraft, TaskRuntime,
     WorkEpisodeDiagnosticKind,
 };
 use tempfile::TempDir;
@@ -79,6 +80,8 @@ fn draft(goal: &str) -> TaskIntentDraft {
 
 fn checkpoint_claim(statement: &str) -> CheckpointClaimDraft {
     CheckpointClaimDraft {
+        context_kind_hint: None,
+        topic_key_hint: None,
         statement: statement.to_owned(),
         rationale: "Direct validation supports this engineering conclusion".to_owned(),
         applicability: Applicability {
@@ -249,6 +252,131 @@ fn checkpoint_is_atomic_semantically_idempotent_and_closes_without_hook_observat
         runtime.write_agent_checkpoint(&close).unwrap_err().kind(),
         ErrorKind::InvalidInput,
         "Task switch must make the previous Checkpoint owner inactive"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_once() {
+    let temporary = TempDir::new().unwrap();
+    let runtime = Arc::new(TaskRuntime::initialize(temporary.path()).unwrap());
+    let (locator, task) = open_task(&runtime, "candidate-build", "reserve submissions");
+    let closed = runtime
+        .write_agent_checkpoint(&checkpoint_write(
+            &locator,
+            &task,
+            0,
+            CheckpointBoundary::Close,
+            vec![
+                checkpoint_claim("first Candidate Claim"),
+                checkpoint_claim("second Candidate Claim"),
+            ],
+            Vec::new(),
+        ))
+        .unwrap();
+    let claims = &closed.checkpoint.claims;
+    let preparations = vec![
+        CandidateBuildItemPreparation {
+            checkpoint_id: closed.checkpoint.checkpoint_id,
+            claim_id: claims[0].claim_id,
+            content_hash: Some("sha256:first".to_owned()),
+            status: CandidateBuildItemStatus::Prepared,
+            error_code: None,
+        },
+        CandidateBuildItemPreparation {
+            checkpoint_id: closed.checkpoint.checkpoint_id,
+            claim_id: claims[1].claim_id,
+            content_hash: None,
+            status: CandidateBuildItemStatus::NeedsEvidence,
+            error_code: Some("insufficient_evidence".to_owned()),
+        },
+    ];
+    let barrier = Arc::new(Barrier::new(20));
+    let reservations = (0..20)
+        .map(|_| {
+            let runtime = Arc::clone(&runtime);
+            let barrier = Arc::clone(&barrier);
+            let preparations = preparations.clone();
+            let episode_id = closed.episode.episode.episode_id;
+            thread::spawn(move || {
+                barrier.wait();
+                runtime
+                    .prepare_candidate_build(episode_id, &preparations)
+                    .unwrap()
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reservations
+            .iter()
+            .map(|view| view.build_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        1
+    );
+    assert_eq!(
+        reservations
+            .iter()
+            .flat_map(|view| view.items.iter().map(|item| item.submission_id))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        2,
+        "each Claim keeps one distinct stable SubmissionId"
+    );
+    assert_eq!(reservations[0].status, CandidateBuildStatus::Pending);
+
+    let mut promoted = preparations;
+    promoted[1].content_hash = Some("sha256:second".to_owned());
+    promoted[1].status = CandidateBuildItemStatus::Prepared;
+    promoted[1].error_code = None;
+    let promoted = runtime
+        .prepare_candidate_build(closed.episode.episode.episode_id, &promoted)
+        .unwrap();
+    assert!(
+        promoted
+            .items
+            .iter()
+            .all(|item| item.status == CandidateBuildItemStatus::Prepared)
+    );
+    let first = &promoted.items[0];
+    let candidate_id = CandidateId::new();
+    let event_id = EventId::new();
+    let finalized = runtime
+        .record_candidate_build_item_result(
+            promoted.build_id,
+            first.submission_id,
+            CandidateBuildItemStatus::Created,
+            Some(candidate_id),
+            Some(event_id),
+            None,
+        )
+        .unwrap();
+    let retried = runtime
+        .record_candidate_build_item_result(
+            promoted.build_id,
+            first.submission_id,
+            CandidateBuildItemStatus::AlreadyExists,
+            Some(candidate_id),
+            Some(event_id),
+            None,
+        )
+        .unwrap();
+    assert_eq!(finalized, retried);
+    assert_eq!(retried.items[0].status, CandidateBuildItemStatus::Created);
+    assert!(
+        runtime
+            .record_candidate_build_item_result(
+                promoted.build_id,
+                first.submission_id,
+                CandidateBuildItemStatus::AlreadyExists,
+                Some(CandidateId::new()),
+                Some(event_id),
+                None,
+            )
+            .is_err()
     );
 }
 

@@ -1693,6 +1693,53 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
         retried_checkpoint["data"]["checkpoint_id"],
         checkpoint["data"]["checkpoint_id"]
     );
+    let close_path = harness.home.join("task-checkpoint-close.json");
+    fs::write(
+        &close_path,
+        serde_json::to_vec(&serde_json::json!({
+            "agent_kind": "codex",
+            "external_session_id": "cli-authoritative",
+            "expected_task_id": updated["data"]["task_id"],
+            "expected_intent_revision_id": updated["data"]["intent_revision_id"],
+            "expected_episode_version": 1,
+            "boundary": "close",
+            "claims": [],
+            "unknowns": [{
+                "statement": "Candidate confirmation remains separate",
+                "blocking": false,
+                "recheck_when": []
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let closed = harness.success(&[
+        "task",
+        "checkpoint",
+        "--input",
+        close_path.to_str().unwrap(),
+    ]);
+    assert_eq!(closed["data"]["candidate_build"]["status"], "complete");
+    assert_eq!(
+        closed["data"]["candidate_build"]["items"][0]["status"],
+        "created"
+    );
+    let episode_id = closed["data"]["episode_id"].as_str().unwrap();
+    let rebuilt = harness.success(&[
+        "candidate",
+        "build-closed-episode",
+        "--episode-id",
+        episode_id,
+    ]);
+    assert_eq!(rebuilt["command"], "candidate.build-closed-episode");
+    assert_eq!(
+        rebuilt["data"]["build_id"],
+        closed["data"]["candidate_build"]["build_id"]
+    );
+    assert_eq!(
+        rebuilt["data"]["items"][0]["submission_id"],
+        closed["data"]["candidate_build"]["items"][0]["submission_id"]
+    );
 
     let business_repository = harness.home.join("business repository");
     fs::create_dir_all(&business_repository).unwrap();

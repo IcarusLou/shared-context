@@ -17,23 +17,24 @@
 - 公开只读 `task_artifact_focus` 接受 Session locator、Intent CAS、absolute path 和无 path 的 kind-specific coordinates；服务端钉定 immutable ActiveTask snapshot，经 Catalog 补全本次 `ResolvedFocus` 并直接返回即时 Pack。它不创建 ID、生命周期、Intent Revision 或 Runtime 记录；missing declared tail 可安全映射，exact Graph 不可达则返回 budgeted `artifact_not_reachable_in_graph`，不 scan/rebuild、不猜测。
 - 受限多语言 Scanner、持久 Engineering Reference、kind-specific 确定性 ArtifactLocator、可重建解析投影、ContextRelation 1–2 跳和 Graph RetrievalPath 已通过固定 oracle 与显式 MCP/CLI 工作流验收；move/rename 直接变为 missing，不执行关联猜测。新建或其他 untracked 文件不进入 Graph（#150 的已确认边界），Task query 也不触发 Repository scan。
 - `runtime.sqlite` 已持久化 server-owned、TaskSession/Task-owned、version-CAS 的 `WorkEpisode`、ordered Intent/Signal refs、normalized `WorkObservation`、Capture ingestion 与 safe diagnostics；显式 Runtime API 提供 open/read/list/advance/append/ingest/close-prepare/source verification，一 TaskSession 最多一个 Open Episode。
-- 公开 `task_checkpoint` MCP/CLI 以 Task、Intent 和 Episode version CAS 显式写入完整 Claims/Unknowns；Runtime v6 同事务 open/advance Episode、生成 inline Validation Observation 与 Claim/Checkpoint ID，并按 Episode+parent version+完整语义幂等 continue/close。ArtifactRef 不作为 Evidence，Checkpoint 不创建 Candidate 或 Git Event。
+- 公开 `task_checkpoint` MCP/CLI 以 Task、Intent 和 Episode version CAS 显式写入完整 Claims/Unknowns；Runtime v7 同事务 open/advance Episode、生成 inline Validation Observation 与 Claim/Checkpoint ID，并按 Episode+parent version+完整语义幂等 continue/close。ArtifactRef 不作为 Evidence；`continue` 不构建 Candidate，`close` 在 Checkpoint 成功或语义重试后触发确定性 Candidate Builder。
 - `CaptureStore` 使用 typed `CaptureId` 保存带 ExternalSessionLocator 与 optional exact ActiveTask owner 的 redacted TTL Breadcrumb；bounded read/list/claim/cleanup、claim 与 Runtime commit 双重幂等、Catalog File→ArtifactRef 映射已实现。无 ActiveTask 或未配置/unsafe File 只保留 typed diagnostic，绝不猜 owner/Repository。
 - Hook 只写 owned/diagnostic Capture 和原有非定位 TestOutcome，不 open/advance/ingest Episode 或伪造 Claim；PreCompact/TurnStop 只提示工作 Agent 显式调用 `task_checkpoint`，自动聚合属于 #163。
-- 无 Space 的 `ContextCandidate` 领域类型已经存在。
+- Candidate Builder 读取 exact closed Episode、final/相关 Checkpoint 和一个 Index snapshot，逐 Claim 组装最小充分 Evidence；Runtime 在任何 Git 写入前固化 BuildId/SubmissionId/content hash，#117 返回的 CandidateId/EventId 再原子回填。无 Claim、Unknown-only 或 Evidence 不充分均为零 Candidate；无 kind hint 固定降级 Discovery，不做关键词分类、语义去重、冲突分析或 Space 推荐。
+- 无 Space 的 `ContextCandidate` 领域类型已经存在，Builder Candidate 仍不可自动注入。
 - `candidate_create` 是当前 Candidate 写入主入口；CLI 与 MCP 要求调用方提供稳定 `submission_id` 与精确 ActiveTask/Intent/closed WorkEpisode 所有权，服务端生成 Candidate/Event 身份和路径，且未确认 Candidate 不参与自动注入。
 - 既有 Git Writer、事件校验、SQLite 投影、Context 生命周期、CLI/MCP、Agent Adapter、安装器和 NPM 分发能力继续作为 M1 的基础设施。
 
 以下能力**尚未实现**，不得在代码、测试报告或评审中宣称已经具备：
 
-- **M4 完整链路：未实现** — #117 已完成 Candidate submission 幂等门禁，#156/#157 已完成可验证 WorkEpisode/Capture 与显式 AgentCheckpoint；Candidate Builder（#158）、自动聚合（#163）、知识语义去重/冲突/Space 推荐和 Candidate confirm/list/discard 尚未实现。
+- **M4 完整链路：未实现** — #117 已完成 Candidate submission 幂等门禁，#156/#157/#158 已完成可验证 WorkEpisode/Capture、显式 AgentCheckpoint 与确定性 Candidate Builder；自动聚合（#163）、知识语义去重/冲突/Space 推荐和 Candidate confirm/list/discard 尚未实现。
 - **团队同步：未实现** — Repository Catalog 是单机显式配置，不是团队事实或知识 Store。
 
 Cursor 与 Codex 都通过显式 `task_intent_update` 建立权威 Task；Prompt Hook 只提供能力提示。已有 ActiveTask 可通过只读 `task_context` 再取 Pack。
 
 Mandatory Gate #114/#117 已完成：稳定 `submission_id` 写入 Git Event 并可重建到 SQLite submission/conflict 索引；Candidate lock 覆盖索引同步、lookup、pending recovery 和 append，主写路径不扫描全量 Event，也不依赖 commit subject。known-v1 malformed Candidate 只有在可安全提取合法 SubmissionId 时形成 submission-local conflict；unknown schema、无 hint 或其他 submission 的坏 Event 只保留 diagnostic。`candidate_create` 同时使用 #156 的 Runtime existence/owner/status 与 Task/Intent CAS 验证 source Episode。
 
-M1 的手工 `candidate_create` 是领域和安全边界的可执行入口，不等同于 M4 的 Low-tax Capture。
+M1 的手工 `candidate_create` 仍是独立领域和安全入口；M4 Builder 复用其 #117 admission，但不替代后续确认和知识聚合。
 
 ## 环境与检查
 

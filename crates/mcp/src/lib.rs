@@ -18,13 +18,16 @@ use std::{
 
 use sctx_domain::{
     AgentCheckpointId, Applicability, ArtifactKey, ArtifactKind, ArtifactLocator, ArtifactRef,
-    CaptureEvidenceRef, CaptureUnknown, CheckpointClaimId, ContextId, ContextKind,
-    ContextRevisionDraft, ContextRevisionRef, EngineeringReferenceDraft, Error, ErrorKind,
-    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, ReferenceId, ReferenceRelation,
-    RepoRelativePath, RepositoryId, ResolutionStatus, ResolvedFocus, Result, RevisionId, SignalId,
-    SpaceId, SubmissionId, TaskId, TaskIntentDraft, TaskIntentRevisionId, TaskSessionId,
-    TaskSessionSnapshot, TaskSignalLifecycle, TaskSignalRecord, TaskSpaceAssociation,
-    WorkEpisodeId, WorkEpisodeStatus, WorkObservationId,
+    AutomaticCandidateStatus, AutomaticContextCandidate, CandidateAnalysis,
+    CandidateBuilderProvenance, CandidateConfidence, CandidateSpaceRecommendation,
+    CaptureEvidenceRef, CaptureUnknown, CheckpointClaim, CheckpointClaimId, ContextCandidate,
+    ContextId, ContextKind, ContextRevisionDraft, ContextRevisionRef, EngineeringReferenceDraft,
+    Error, ErrorKind, EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator,
+    NormalizedWorkObservation, ReferenceId, ReferenceRelation, RepoRelativePath, RepositoryId,
+    ResolutionStatus, ResolvedFocus, Result, RevisionId, SignalId, SpaceId, SubmissionId, TaskId,
+    TaskIntentDraft, TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignalKind,
+    TaskSignalLifecycle, TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId, WorkEpisodeStatus,
+    WorkObservation, WorkObservationId, WorkSourceRef,
 };
 use sctx_engineering_graph::{
     CandidateMatchEvidence, CatalogRepositorySpec, EngineeringProjectionStore,
@@ -34,7 +37,9 @@ use sctx_engineering_graph::{
     SkippedFileReason, build_graph_context_snapshots,
 };
 use sctx_event_schema::{Event, EventPayload};
-use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
+use sctx_git_store::{
+    AppendRequest, CandidateSubmissionRequest, CandidateSubmissionStatus, GitStore,
+};
 use sctx_index::{DomainSnapshot, ProjectionIndex};
 use sctx_local_state::{PrivacyScanner, RepositoryCatalogSnapshot, UserConfigStore};
 use sctx_search::{
@@ -43,7 +48,9 @@ use sctx_search::{
     TaskContextItem, TaskContextRequest, TaskGraphDiagnostic, TaskRetrievalPath,
 };
 use sctx_task_runtime::{
-    AgentCheckpointWrite, CheckpointBoundary, CheckpointClaimDraft, TaskRuntime,
+    AgentCheckpointWrite, CandidateBuildItemPreparation, CandidateBuildItemStatus,
+    CandidateBuildStatus, CandidateBuildView, CheckpointBoundary, CheckpointClaimDraft,
+    TaskRuntime, WorkEpisodeView,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -150,6 +157,10 @@ pub enum TaskCheckpointEvidenceInput {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskCheckpointClaimInput {
+    #[serde(default)]
+    pub context_kind_hint: Option<ContextKind>,
+    #[serde(default)]
+    pub topic_key_hint: Option<String>,
     pub statement: String,
     pub rationale: String,
     pub applicability: Applicability,
@@ -191,6 +202,76 @@ pub struct TaskCheckpointResponse {
     pub episode_status: WorkEpisodeStatus,
     pub created: bool,
     pub diagnostics: Vec<TaskCheckpointDiagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_build: Option<CandidateBuildResponse>,
+}
+
+/// Aggregate state returned after deterministically building one closed Episode.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateBuildResponse {
+    pub build_id: sctx_domain::CandidateBuildId,
+    pub episode_id: WorkEpisodeId,
+    pub status: CandidateBuildResponseStatus,
+    pub items: Vec<CandidateBuildItemSummary>,
+}
+
+/// Public aggregate Candidate Build status without exposing `SQLite` details.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateBuildResponseStatus {
+    Pending,
+    Complete,
+    Incomplete,
+}
+
+impl From<CandidateBuildStatus> for CandidateBuildResponseStatus {
+    fn from(value: CandidateBuildStatus) -> Self {
+        match value {
+            CandidateBuildStatus::Pending => Self::Pending,
+            CandidateBuildStatus::Complete => Self::Complete,
+            CandidateBuildStatus::Incomplete => Self::Incomplete,
+        }
+    }
+}
+
+/// Claim-scoped Candidate result. Missing Candidate/Event IDs means no Git write occurred.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateBuildItemSummary {
+    pub checkpoint_id: AgentCheckpointId,
+    pub claim_id: CheckpointClaimId,
+    pub submission_id: SubmissionId,
+    pub status: CandidateBuildItemResponseStatus,
+    pub candidate_id: Option<sctx_domain::CandidateId>,
+    pub event_id: Option<sctx_domain::EventId>,
+    pub error_code: Option<String>,
+    pub candidate_status: AutomaticCandidateStatus,
+    pub analysis: CandidateAnalysis,
+    pub confidence: CandidateConfidence,
+    pub unknowns: Vec<CaptureUnknown>,
+    pub space_recommendations: Vec<CandidateSpaceRecommendation>,
+}
+
+/// Public Claim-scoped submission state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateBuildItemResponseStatus {
+    Prepared,
+    NeedsEvidence,
+    Created,
+    AlreadyExists,
+    Failed,
+}
+
+impl From<CandidateBuildItemStatus> for CandidateBuildItemResponseStatus {
+    fn from(value: CandidateBuildItemStatus) -> Self {
+        match value {
+            CandidateBuildItemStatus::Prepared => Self::Prepared,
+            CandidateBuildItemStatus::NeedsEvidence => Self::NeedsEvidence,
+            CandidateBuildItemStatus::Created => Self::Created,
+            CandidateBuildItemStatus::AlreadyExists => Self::AlreadyExists,
+            CandidateBuildItemStatus::Failed => Self::Failed,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -694,6 +775,45 @@ struct Runtime {
     catalog: RepositoryCatalogSnapshot,
 }
 
+#[derive(Clone)]
+struct ClaimBuildMaterial {
+    checkpoint_id: AgentCheckpointId,
+    claim_id: CheckpointClaimId,
+    draft: Option<ContextRevisionDraft>,
+    observation_ids: Vec<WorkObservationId>,
+    checkpoint_ids: Vec<AgentCheckpointId>,
+    confidence: CandidateConfidence,
+    unknowns: Vec<CaptureUnknown>,
+    error_code: Option<&'static str>,
+}
+
+impl ClaimBuildMaterial {
+    fn preparation(
+        &self,
+        source_episode: &sctx_domain::WorkEpisodeRef,
+    ) -> CandidateBuildItemPreparation {
+        match &self.draft {
+            Some(draft) => CandidateBuildItemPreparation {
+                checkpoint_id: self.checkpoint_id,
+                claim_id: self.claim_id,
+                content_hash: Some(sctx_domain::candidate_submission_content_hash(
+                    source_episode,
+                    draft,
+                )),
+                status: CandidateBuildItemStatus::Prepared,
+                error_code: None,
+            },
+            None => CandidateBuildItemPreparation {
+                checkpoint_id: self.checkpoint_id,
+                claim_id: self.claim_id,
+                content_hash: None,
+                status: CandidateBuildItemStatus::NeedsEvidence,
+                error_code: self.error_code.map(str::to_owned),
+            },
+        }
+    }
+}
+
 impl Runtime {
     fn open(root: &Path) -> Result<Self> {
         let base_store = GitStore::initialize(root)?;
@@ -957,6 +1077,8 @@ impl Runtime {
                 validate_context_revision_ref(&snapshot, *context)?;
             }
             claims.push(CheckpointClaimDraft {
+                context_kind_hint: claim.context_kind_hint,
+                topic_key_hint: claim.topic_key_hint.clone(),
                 statement: claim.statement.clone(),
                 rationale: claim.rationale.clone(),
                 applicability: claim.applicability.clone(),
@@ -977,6 +1099,11 @@ impl Runtime {
             claims,
             unknowns: input.unknowns.clone(),
         })?;
+        let candidate_build = if input.boundary == TaskCheckpointBoundary::Close {
+            Some(self.build_closed_episode(outcome.episode.episode.episode_id)?)
+        } else {
+            None
+        };
         Ok(TaskCheckpointResponse {
             checkpoint_id: outcome.checkpoint.checkpoint_id,
             claim_ids: outcome
@@ -998,7 +1125,142 @@ impl Runtime {
                     },
                 )
                 .collect(),
+            candidate_build,
         })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn build_closed_episode(&self, episode_id: WorkEpisodeId) -> Result<CandidateBuildResponse> {
+        let episode = self
+            .tasks
+            .read_work_episode(episode_id)?
+            .ok_or_else(|| invalid("Candidate Builder source Work Episode does not exist"))?;
+        let WorkEpisodeStatus::Closed {
+            final_checkpoint_id,
+        } = episode.episode.status
+        else {
+            return Err(invalid(
+                "Candidate Builder source Work Episode must be closed",
+            ));
+        };
+        let final_checkpoint = episode
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.checkpoint_id == final_checkpoint_id)
+            .ok_or_else(|| invariant("closed Episode final Checkpoint disappeared"))?;
+        let claim_count = episode
+            .checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.claims.len())
+            .sum::<usize>();
+        let materials = if claim_count == 0 {
+            Vec::new()
+        } else {
+            let snapshot = self.snapshot()?;
+            let signals = self
+                .tasks
+                .read_signal_history(episode.episode.task_session_id)?;
+            episode
+                .checkpoints
+                .iter()
+                .flat_map(|checkpoint| {
+                    checkpoint.claims.iter().map(|claim| {
+                        build_claim_material(
+                            &episode,
+                            final_checkpoint,
+                            checkpoint,
+                            claim,
+                            &signals,
+                            &snapshot,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let preparations = materials
+            .iter()
+            .map(|material| material.preparation(&episode.episode.ownership()))
+            .collect::<Vec<_>>();
+        let mut build = self
+            .tasks
+            .prepare_candidate_build(episode_id, &preparations)?;
+        let materials = materials
+            .iter()
+            .map(|material| (material.claim_id, material))
+            .collect::<BTreeMap<_, _>>();
+        for item in build.items.clone() {
+            if item.status.is_finalized() || item.status == CandidateBuildItemStatus::NeedsEvidence
+            {
+                continue;
+            }
+            let material = materials
+                .get(&item.claim_id)
+                .ok_or_else(|| invariant("Candidate Build material disappeared"))?;
+            let draft = material
+                .draft
+                .as_ref()
+                .ok_or_else(|| invariant("prepared Candidate Build item lacks a draft"))?;
+            match self.store.submit_candidate(CandidateSubmissionRequest {
+                submission_id: item.submission_id,
+                source_episode: episode.episode.ownership(),
+                content: draft.clone(),
+            }) {
+                Ok(outcome) => {
+                    let submission_status = match outcome.status {
+                        CandidateSubmissionStatus::Created => CandidateBuildItemStatus::Created,
+                        CandidateSubmissionStatus::AlreadyExists => {
+                            CandidateBuildItemStatus::AlreadyExists
+                        }
+                    };
+                    let persisted = ContextCandidate {
+                        candidate_id: outcome.record.candidate_id,
+                        submission_id: item.submission_id,
+                        source_episode: outcome.record.source_episode,
+                        content: draft.clone(),
+                    };
+                    let provenance = CandidateBuilderProvenance {
+                        build_id: build.build_id,
+                        source_episode: episode.episode.ownership(),
+                        checkpoint_ids: material.checkpoint_ids.clone(),
+                        observation_ids: material.observation_ids.clone(),
+                    };
+                    let _candidate = AutomaticContextCandidate::from_persisted_candidate(
+                        &persisted,
+                        &episode.episode,
+                        &episode.checkpoints,
+                        provenance,
+                        CandidateAnalysis {
+                            novel: true,
+                            ..CandidateAnalysis::default()
+                        },
+                        Vec::new(),
+                        material.confidence.clone(),
+                        material.unknowns.clone(),
+                        AutomaticCandidateStatus::Draft,
+                    )?;
+                    build = self.tasks.record_candidate_build_item_result(
+                        build.build_id,
+                        item.submission_id,
+                        submission_status,
+                        Some(outcome.record.candidate_id),
+                        Some(outcome.record.event_id),
+                        None,
+                    )?;
+                }
+                Err(error) => {
+                    let error_code = candidate_builder_error_code(&error);
+                    build = self.tasks.record_candidate_build_item_result(
+                        build.build_id,
+                        item.submission_id,
+                        CandidateBuildItemStatus::Failed,
+                        None,
+                        None,
+                        Some(error_code),
+                    )?;
+                }
+            }
+        }
+        candidate_build_response(build, &materials)
     }
 
     fn repository_scan(&self, input: &RepositoryScanInput) -> Result<RepositoryScanResponse> {
@@ -1527,6 +1789,359 @@ fn active_signal_records(
         .collect())
 }
 
+fn build_claim_material(
+    episode: &WorkEpisodeView,
+    final_checkpoint: &sctx_domain::AgentCheckpoint,
+    checkpoint: &sctx_domain::AgentCheckpoint,
+    claim: &CheckpointClaim,
+    signals: &[TaskSignalRecord],
+    snapshot: &DomainSnapshot,
+) -> ClaimBuildMaterial {
+    let mut evidence = Vec::new();
+    let mut observation_ids = Vec::new();
+    let mut visited_observations = HashSet::new();
+    let evidence_result = claim.evidence_refs.iter().try_for_each(|reference| {
+        collect_candidate_evidence(
+            reference,
+            claim,
+            episode,
+            signals,
+            snapshot,
+            &mut visited_observations,
+            &mut observation_ids,
+            &mut evidence,
+        )
+    });
+    deduplicate_candidate_evidence(&mut evidence);
+    let mut unknowns = checkpoint.unknowns.clone();
+    if checkpoint.checkpoint_id != final_checkpoint.checkpoint_id {
+        unknowns.extend(final_checkpoint.unknowns.clone());
+    }
+    let kind = claim.context_kind_hint.unwrap_or(ContextKind::Discovery);
+    let mut confidence = if claim.context_kind_hint.is_some() {
+        8_000_u16
+    } else {
+        unknowns.push(CaptureUnknown {
+            statement: "Context kind was not explicitly classified; conservative Discovery fallback applied"
+                .to_owned(),
+            blocking: false,
+            recheck_when: vec!["Before Candidate confirmation".to_owned()],
+        });
+        4_500
+    };
+    if matches!(kind, ContextKind::Decision | ContextKind::Contract)
+        && claim.topic_key_hint.is_none()
+    {
+        unknowns.push(CaptureUnknown {
+            statement: "Decision or Contract topic key remains unclassified".to_owned(),
+            blocking: false,
+            recheck_when: vec!["Before Candidate confirmation".to_owned()],
+        });
+        confidence = confidence.saturating_sub(1_000);
+    }
+    let mut seen_unknowns = HashSet::new();
+    unknowns.retain(|unknown| seen_unknowns.insert(unknown.clone()));
+    let error_code = evidence_result.err().or({
+        if evidence.is_empty() {
+            Some("insufficient_evidence")
+        } else {
+            None
+        }
+    });
+    let draft = error_code.is_none().then(|| ContextRevisionDraft {
+        kind,
+        topic_key: claim.topic_key_hint.clone(),
+        statement: claim.statement.clone(),
+        rationale: claim.rationale.clone(),
+        applicability: claim.applicability.clone(),
+        assumptions: claim.assumptions.clone(),
+        recheck_when: claim.recheck_when.clone(),
+        relations: Vec::new(),
+        evidence,
+    });
+    let mut checkpoint_ids = vec![final_checkpoint.checkpoint_id];
+    if checkpoint.checkpoint_id != final_checkpoint.checkpoint_id {
+        checkpoint_ids.push(checkpoint.checkpoint_id);
+    }
+    ClaimBuildMaterial {
+        checkpoint_id: checkpoint.checkpoint_id,
+        claim_id: claim.claim_id,
+        draft,
+        observation_ids,
+        checkpoint_ids,
+        confidence: CandidateConfidence {
+            basis_points: confidence,
+            rationale: if claim.context_kind_hint.is_some() {
+                "Claim structure and self-contained Evidence were preserved deterministically"
+                    .to_owned()
+            } else {
+                "Evidence is complete, but Context kind uses the conservative Discovery fallback"
+                    .to_owned()
+            },
+        },
+        unknowns,
+        error_code,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_candidate_evidence(
+    reference: &CaptureEvidenceRef,
+    claim: &CheckpointClaim,
+    episode: &WorkEpisodeView,
+    signals: &[TaskSignalRecord],
+    snapshot: &DomainSnapshot,
+    visited_observations: &mut HashSet<WorkObservationId>,
+    observation_ids: &mut Vec<WorkObservationId>,
+    evidence: &mut Vec<EvidenceSnapshotDraft>,
+) -> std::result::Result<(), &'static str> {
+    match reference {
+        CaptureEvidenceRef::Observation { observation_id } => {
+            let observation = episode
+                .episode
+                .observations
+                .iter()
+                .find(|observation| observation.observation_id == *observation_id)
+                .ok_or("observation_not_found")?;
+            collect_observation_evidence(
+                observation,
+                claim,
+                episode,
+                signals,
+                snapshot,
+                visited_observations,
+                observation_ids,
+                evidence,
+            )
+        }
+        CaptureEvidenceRef::TaskSignal { signal_id } => {
+            let signal = signals
+                .iter()
+                .find(|signal| signal.signal_id == *signal_id)
+                .ok_or("task_signal_not_found")?;
+            if signal.task_session_id != episode.episode.task_session_id
+                || signal.task_id != episode.episode.task_id
+            {
+                return Err("task_signal_owner_mismatch");
+            }
+            let evidence_kind = match signal.signal.kind {
+                TaskSignalKind::Diff => EvidenceType::ArtifactSnapshot,
+                TaskSignalKind::TestOutcome => EvidenceType::ExperimentRecord,
+                TaskSignalKind::Prompt | TaskSignalKind::Workspace => {
+                    return Err("task_signal_not_engineering_evidence");
+                }
+            };
+            evidence.push(EvidenceSnapshotDraft {
+                kind: evidence_kind,
+                supports: claim.statement.clone(),
+                content: json!({
+                    "signal_id": signal.signal_id,
+                    "kind": signal.signal.kind,
+                    "normalized_content": signal.signal.content,
+                }),
+                interpretation: "The Claim explicitly cites this normalized Task Signal"
+                    .to_owned(),
+                limitations: vec![
+                    "A Task Signal records Task-local work and does not independently verify external state"
+                        .to_owned(),
+                ],
+            });
+            Ok(())
+        }
+        CaptureEvidenceRef::ContextEvidence {
+            context_id,
+            revision_id,
+            evidence_id,
+        } => {
+            let source = snapshot
+                .projection
+                .spaces
+                .values()
+                .find_map(|space| space.contexts.get(context_id))
+                .and_then(|context| context.revisions.get(revision_id))
+                .and_then(|revision| {
+                    revision
+                        .revision
+                        .evidence
+                        .iter()
+                        .find(|source| source.evidence_id == *evidence_id)
+                })
+                .ok_or("context_evidence_not_found")?;
+            evidence.push(EvidenceSnapshotDraft {
+                kind: source.kind,
+                supports: source.supports.clone(),
+                content: source.content.clone(),
+                interpretation: source.interpretation.clone(),
+                limitations: source.limitations.clone(),
+            });
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_observation_evidence(
+    observation: &WorkObservation,
+    claim: &CheckpointClaim,
+    episode: &WorkEpisodeView,
+    signals: &[TaskSignalRecord],
+    snapshot: &DomainSnapshot,
+    visited_observations: &mut HashSet<WorkObservationId>,
+    observation_ids: &mut Vec<WorkObservationId>,
+    evidence: &mut Vec<EvidenceSnapshotDraft>,
+) -> std::result::Result<(), &'static str> {
+    if !visited_observations.insert(observation.observation_id) {
+        return Ok(());
+    }
+    observation_ids.push(observation.observation_id);
+    match &observation.observation {
+        NormalizedWorkObservation::InlineValidation { evidence: inline } => {
+            evidence.push(inline.clone());
+            Ok(())
+        }
+        NormalizedWorkObservation::UnresolvedQuestion { .. } => {
+            Err("unresolved_question_not_evidence")
+        }
+        NormalizedWorkObservation::Validation {
+            conclusion,
+            evidence_refs,
+        } => {
+            for reference in evidence_refs {
+                collect_candidate_evidence(
+                    reference,
+                    claim,
+                    episode,
+                    signals,
+                    snapshot,
+                    visited_observations,
+                    observation_ids,
+                    evidence,
+                )?;
+            }
+            evidence.push(EvidenceSnapshotDraft {
+                kind: EvidenceType::ExperimentRecord,
+                supports: claim.statement.clone(),
+                content: json!({
+                    "observation_id": observation.observation_id,
+                    "conclusion": conclusion,
+                }),
+                interpretation: "The Claim cites this normalized validation conclusion".to_owned(),
+                limitations: normalized_observation_limitations(observation),
+            });
+            Ok(())
+        }
+        normalized => {
+            let kind = match normalized {
+                NormalizedWorkObservation::TestOutcome { .. } => EvidenceType::ExperimentRecord,
+                NormalizedWorkObservation::Diff { .. }
+                | NormalizedWorkObservation::Artifact { .. }
+                | NormalizedWorkObservation::Interface { .. } => EvidenceType::ArtifactSnapshot,
+                NormalizedWorkObservation::Breadcrumb { .. }
+                | NormalizedWorkObservation::ContextUse { .. } => EvidenceType::SourceSnapshot,
+                NormalizedWorkObservation::Validation { .. }
+                | NormalizedWorkObservation::InlineValidation { .. }
+                | NormalizedWorkObservation::UnresolvedQuestion { .. } => {
+                    unreachable!("special Observation variants were handled above")
+                }
+            };
+            evidence.push(EvidenceSnapshotDraft {
+                kind,
+                supports: claim.statement.clone(),
+                content: json!({
+                    "observation_id": observation.observation_id,
+                    "normalized": normalized,
+                }),
+                interpretation: "The Claim explicitly cites this normalized Work Observation"
+                    .to_owned(),
+                limitations: normalized_observation_limitations(observation),
+            });
+            Ok(())
+        }
+    }
+}
+
+fn normalized_observation_limitations(observation: &WorkObservation) -> Vec<String> {
+    if observation
+        .source_refs
+        .iter()
+        .any(|source| matches!(source, WorkSourceRef::Capture(_)))
+    {
+        vec![
+            "Only normalized engineering meaning is preserved; the raw Capture payload is excluded"
+                .to_owned(),
+        ]
+    } else {
+        vec!["The snapshot excludes raw transcript and tool output".to_owned()]
+    }
+}
+
+fn deduplicate_candidate_evidence(evidence: &mut Vec<EvidenceSnapshotDraft>) {
+    let mut seen = HashSet::with_capacity(evidence.len());
+    evidence.retain(|snapshot| {
+        serde_json::to_string(snapshot).map_or(true, |encoded| seen.insert(encoded))
+    });
+}
+
+fn candidate_builder_error_code(error: &Error) -> &'static str {
+    match error.kind() {
+        ErrorKind::IdempotencyKeyConflict => "idempotency_key_conflict",
+        ErrorKind::PrivacyRejected => "privacy_rejected",
+        ErrorKind::InvalidInput if error.message().contains("privacy gate rejected") => {
+            "privacy_rejected"
+        }
+        ErrorKind::InvalidInput => "candidate_rejected",
+        ErrorKind::StaleState => "stale_state",
+        ErrorKind::Conflict => "conflict",
+        ErrorKind::Io => "io_error",
+        ErrorKind::External => "external_error",
+        ErrorKind::InvariantViolation => "invariant_violation",
+        ErrorKind::Unsupported => "unsupported",
+        ErrorKind::RepositoryNotConfigured => "repository_not_configured",
+        _ => "candidate_write_failed",
+    }
+}
+
+fn candidate_build_response(
+    view: CandidateBuildView,
+    materials: &BTreeMap<CheckpointClaimId, &ClaimBuildMaterial>,
+) -> Result<CandidateBuildResponse> {
+    Ok(CandidateBuildResponse {
+        build_id: view.build_id,
+        episode_id: view.source_episode.episode_id,
+        status: view.status.into(),
+        items: view
+            .items
+            .into_iter()
+            .map(|item| {
+                let material = materials.get(&item.claim_id).ok_or_else(|| {
+                    invariant("persisted Build item lost immutable Claim material")
+                })?;
+                Ok(CandidateBuildItemSummary {
+                    checkpoint_id: item.checkpoint_id,
+                    claim_id: item.claim_id,
+                    submission_id: item.submission_id,
+                    status: item.status.into(),
+                    candidate_id: item.candidate_id,
+                    event_id: item.event_id,
+                    error_code: item.error_code,
+                    candidate_status: if item.status == CandidateBuildItemStatus::NeedsEvidence {
+                        AutomaticCandidateStatus::NeedsEvidence
+                    } else {
+                        AutomaticCandidateStatus::Draft
+                    },
+                    analysis: CandidateAnalysis {
+                        novel: true,
+                        ..CandidateAnalysis::default()
+                    },
+                    confidence: material.confidence.clone(),
+                    unknowns: material.unknowns.clone(),
+                    space_recommendations: Vec::new(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
 fn sync_repository_catalog(
     root: &Path,
     registry: &RepositoryRegistry,
@@ -1611,7 +2226,7 @@ pub fn task_signal_supersede_at_root(
     Runtime::open(root.as_ref())?.task_signal_supersede(input)
 }
 
-/// Persists one explicit Agent-authored Checkpoint without creating a Candidate.
+/// Persists one explicit Agent-authored Checkpoint and builds Candidates only at a close boundary.
 ///
 /// # Errors
 ///
@@ -1621,6 +2236,20 @@ pub fn task_checkpoint_at_root(
     input: &TaskCheckpointInput,
 ) -> Result<TaskCheckpointResponse> {
     Runtime::open(root.as_ref())?.task_checkpoint(input)
+}
+
+/// Retries the deterministic Candidate Build for one exact persisted closed Episode.
+///
+/// This is an internal/CLI recovery boundary, not a public MCP Tool.
+///
+/// # Errors
+///
+/// Returns typed Episode, Evidence snapshot, runtime reservation, privacy, or Writer errors.
+pub fn build_closed_episode_at_root(
+    root: impl AsRef<Path>,
+    episode_id: WorkEpisodeId,
+) -> Result<CandidateBuildResponse> {
+    Runtime::open(root.as_ref())?.build_closed_episode(episode_id)
 }
 
 /// Registers and scans one canonical local Git Repository without returning source text.
@@ -2402,7 +3031,7 @@ fn tools_list() -> Value {
         ),
         tool_schema(
             "task_checkpoint",
-            "Persist one explicit Agent-authored Claim/Unknown checkpoint under Task, Intent and Episode CAS without creating a Candidate.",
+            "Persist one explicit Agent-authored Claim/Unknown checkpoint under Task, Intent and Episode CAS; a close boundary deterministically builds unassigned Candidate drafts.",
             task_checkpoint_schema()
         ),
         tool_schema(
@@ -2701,6 +3330,7 @@ fn task_signal_supersede_schema() -> Value {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn task_checkpoint_schema() -> Value {
     let string_list = || json!({"type": "array", "items": {"type": "string", "minLength": 1}});
     let context_revision = || {
@@ -2759,6 +3389,8 @@ fn task_checkpoint_schema() -> Value {
         "type": "object", "additionalProperties": false,
         "required": ["statement", "rationale", "applicability", "assumptions", "recheck_when", "evidence", "artifact_refs", "related_contexts"],
         "properties": {
+            "context_kind_hint": kind_schema(),
+            "topic_key_hint": {"type": "string", "minLength": 1},
             "statement": {"type": "string", "minLength": 1},
             "rationale": {"type": "string", "minLength": 1},
             "applicability": {
@@ -2866,11 +3498,7 @@ fn candidate_create_schema() -> Value {
                     }
                 }
             }
-        },
-        "allOf": [{
-            "if": {"properties": {"kind": {"enum": ["decision", "contract"]}}, "required": ["kind"]},
-            "then": {"required": ["topic_key"]}
-        }]
+        }
     })
 }
 

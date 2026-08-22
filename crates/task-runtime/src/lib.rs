@@ -14,16 +14,18 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sctx_domain::{
-    AgentCheckpoint, Applicability, ArtifactRef, CaptureEvidenceRef, CaptureId, CaptureSourceRef,
-    CaptureUnknown, CheckpointClaim, ContextRevisionRef, Error, ErrorKind, EvidenceSnapshotDraft,
+    AgentCheckpoint, AgentCheckpointId, Applicability, ArtifactRef, CandidateBuildId, CandidateId,
+    CaptureEvidenceRef, CaptureId, CaptureSourceRef, CaptureUnknown, CheckpointClaim,
+    CheckpointClaimId, ContextRevisionRef, Error, ErrorKind, EventId, EvidenceSnapshotDraft,
     ExternalSessionId, ExternalSessionLocator, ExternalSessionSnapshot, IntentRevisionRange,
-    NonLocatingSignalRef, NormalizedWorkObservation, Result, SignalId, TaskId, TaskIntent,
-    TaskIntentDraft, TaskIntentRevision, TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot,
-    TaskSignal, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord, WorkEpisode, WorkEpisodeId,
-    WorkEpisodeRef, WorkEpisodeStatus, WorkObservation, WorkObservationId, WorkSourceRef,
+    NonLocatingSignalRef, NormalizedWorkObservation, Result, SignalId, SubmissionId, TaskId,
+    TaskIntent, TaskIntentDraft, TaskIntentRevision, TaskIntentRevisionId, TaskSessionId,
+    TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord,
+    WorkEpisode, WorkEpisodeId, WorkEpisodeRef, WorkEpisodeStatus, WorkObservation,
+    WorkObservationId, WorkSourceRef,
 };
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_EPISODE_LIST_LIMIT: usize = 256;
 
@@ -93,6 +95,8 @@ impl CheckpointBoundary {
 /// Complete Agent-authored Claim content before server IDs and inline Observation IDs exist.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckpointClaimDraft {
+    pub context_kind_hint: Option<sctx_domain::ContextKind>,
+    pub topic_key_hint: Option<String>,
     pub statement: String,
     pub rationale: String,
     pub applicability: Applicability,
@@ -123,6 +127,84 @@ pub struct AgentCheckpointOutcome {
     pub episode: WorkEpisodeView,
     pub created: bool,
     pub inline_observation_ids: Vec<WorkObservationId>,
+}
+
+/// Aggregate state of one deterministic build over an immutable closed Episode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CandidateBuildStatus {
+    Pending,
+    Complete,
+    Incomplete,
+}
+
+impl CandidateBuildStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Complete => "complete",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+/// Durable state of one Claim-scoped Candidate creation operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CandidateBuildItemStatus {
+    Prepared,
+    NeedsEvidence,
+    Created,
+    AlreadyExists,
+    Failed,
+}
+
+impl CandidateBuildItemStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::NeedsEvidence => "needs_evidence",
+            Self::Created => "created",
+            Self::AlreadyExists => "already_exists",
+            Self::Failed => "failed",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_finalized(self) -> bool {
+        matches!(self, Self::Created | Self::AlreadyExists)
+    }
+}
+
+/// Builder-computed Claim readiness persisted before any Git write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateBuildItemPreparation {
+    pub checkpoint_id: AgentCheckpointId,
+    pub claim_id: CheckpointClaimId,
+    pub content_hash: Option<String>,
+    pub status: CandidateBuildItemStatus,
+    pub error_code: Option<String>,
+}
+
+/// One durable Claim-scoped build item and its stable submission identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateBuildItemView {
+    pub checkpoint_id: AgentCheckpointId,
+    pub claim_id: CheckpointClaimId,
+    pub submission_id: SubmissionId,
+    pub content_hash: Option<String>,
+    pub status: CandidateBuildItemStatus,
+    pub candidate_id: Option<CandidateId>,
+    pub event_id: Option<EventId>,
+    pub error_code: Option<String>,
+}
+
+/// Durable deterministic build state for one exact closed Episode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateBuildView {
+    pub build_id: CandidateBuildId,
+    pub source_episode: WorkEpisodeRef,
+    pub final_checkpoint_id: AgentCheckpointId,
+    pub status: CandidateBuildStatus,
+    pub items: Vec<CandidateBuildItemView>,
 }
 
 /// Result of explicitly opening at most one Episode for an `ActiveTask`.
@@ -939,6 +1021,8 @@ impl TaskRuntime {
                 inserted_inline_observations.push(observation.observation_id);
             }
             claims.push(CheckpointClaim::from_parts(
+                claim.context_kind_hint,
+                claim.topic_key_hint.clone(),
                 claim.statement.clone(),
                 claim.rationale.clone(),
                 claim.applicability.clone(),
@@ -1105,6 +1189,132 @@ impl TaskRuntime {
                 status: view.episode.status,
                 observation_count: view.episode.observations.len(),
             }))
+    }
+
+    /// Reserves one stable `BuildId` and one stable `SubmissionId` per exact Checkpoint Claim before
+    /// any Candidate Git write.
+    ///
+    /// Semantic retries reuse the persisted identities. A previously incomplete Evidence item may
+    /// become prepared when the same immutable source resolves from a later healthy Index read.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an open/missing Episode, a non-exhaustive Claim set, invalid readiness metadata, or
+    /// deterministic content drift for an already prepared item.
+    pub fn prepare_candidate_build(
+        &self,
+        episode_id: WorkEpisodeId,
+        items: &[CandidateBuildItemPreparation],
+    ) -> Result<CandidateBuildView> {
+        validate_build_preparations(items)?;
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Candidate Build preparation")?;
+        let episode = require_episode_view(&transaction, episode_id)?;
+        let WorkEpisodeStatus::Closed {
+            final_checkpoint_id,
+        } = episode.episode.status
+        else {
+            return Err(invalid(
+                "Candidate Builder requires an exact closed Work Episode",
+            ));
+        };
+        validate_build_claim_coverage(&episode, items)?;
+        let build_id = if let Some(build_id) = read_candidate_build_id(&transaction, episode_id)? {
+            build_id
+        } else {
+            let build_id = CandidateBuildId::new();
+            transaction
+                .execute(
+                    "INSERT INTO candidate_build (
+                            build_id, episode_id, task_session_id, task_id,
+                            final_checkpoint_id, status
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        build_id.to_string(),
+                        episode_id.to_string(),
+                        episode.episode.task_session_id.to_string(),
+                        episode.episode.task_id.to_string(),
+                        final_checkpoint_id.to_string(),
+                        CandidateBuildStatus::Pending.as_str(),
+                    ],
+                )
+                .map_err(sql_error("insert Candidate Build"))?;
+            build_id
+        };
+        upsert_candidate_build_items(&transaction, build_id, items)?;
+        refresh_candidate_build_status(&transaction, build_id)?;
+        let view = require_candidate_build_view(&transaction, build_id)?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit Candidate Build preparation"))?;
+        Ok(view)
+    }
+
+    /// Records the result of one #117 Candidate submission after the Git boundary returns.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown/mismatched items, incomplete success identity, or a conflicting finalized
+    /// result for the same stable `SubmissionId`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_candidate_build_item_result(
+        &self,
+        build_id: CandidateBuildId,
+        submission_id: SubmissionId,
+        status: CandidateBuildItemStatus,
+        candidate_id: Option<CandidateId>,
+        event_id: Option<EventId>,
+        error_code: Option<&str>,
+    ) -> Result<CandidateBuildView> {
+        validate_build_item_result(status, candidate_id, event_id, error_code)?;
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Candidate Build result")?;
+        let existing = read_candidate_build_item(&transaction, build_id, submission_id)?
+            .ok_or_else(|| invalid("Candidate Build item does not exist"))?;
+        if existing.status.is_finalized() {
+            if existing.candidate_id != candidate_id || existing.event_id != event_id {
+                return Err(invariant(
+                    "finalized Candidate Build item identity changed across retry",
+                ));
+            }
+        } else {
+            transaction
+                .execute(
+                    "UPDATE candidate_build_item
+                     SET status = ?1, candidate_id = ?2, event_id = ?3, error_code = ?4
+                     WHERE build_id = ?5 AND submission_id = ?6",
+                    params![
+                        status.as_str(),
+                        candidate_id.map(|id| id.to_string()),
+                        event_id.map(|id| id.to_string()),
+                        error_code,
+                        build_id.to_string(),
+                        submission_id.to_string(),
+                    ],
+                )
+                .map_err(sql_error("update Candidate Build item result"))?;
+        }
+        refresh_candidate_build_status(&transaction, build_id)?;
+        let view = require_candidate_build_view(&transaction, build_id)?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit Candidate Build result"))?;
+        Ok(view)
+    }
+
+    /// Reads one persisted Candidate Build by its closed Episode identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage or invariant errors.
+    pub fn read_candidate_build(
+        &self,
+        episode_id: WorkEpisodeId,
+    ) -> Result<Option<CandidateBuildView>> {
+        let connection = self.open_connection()?;
+        read_candidate_build_id(&connection, episode_id)?
+            .map(|build_id| require_candidate_build_view(&connection, build_id))
+            .transpose()
     }
 
     /// Reads any retained Task by `TaskSessionId`.
@@ -1374,6 +1584,47 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 FOREIGN KEY (intent_revision_id)
                     REFERENCES task_intent_revision (revision_id)
             ) STRICT;
+            CREATE TABLE IF NOT EXISTS candidate_build (
+                build_id TEXT PRIMARY KEY,
+                episode_id TEXT NOT NULL UNIQUE,
+                task_session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                final_checkpoint_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'complete', 'incomplete')),
+                FOREIGN KEY (episode_id, task_session_id, task_id)
+                    REFERENCES work_episode (episode_id, task_session_id, task_id),
+                FOREIGN KEY (final_checkpoint_id, episode_id)
+                    REFERENCES agent_checkpoint (checkpoint_id, episode_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS candidate_build_item (
+                build_id TEXT NOT NULL,
+                item_ordinal INTEGER NOT NULL CHECK (item_ordinal >= 0),
+                checkpoint_id TEXT NOT NULL,
+                claim_id TEXT NOT NULL,
+                submission_id TEXT NOT NULL UNIQUE,
+                content_hash TEXT,
+                status TEXT NOT NULL CHECK (status IN (
+                    'prepared', 'needs_evidence', 'created', 'already_exists', 'failed'
+                )),
+                candidate_id TEXT,
+                event_id TEXT,
+                error_code TEXT,
+                PRIMARY KEY (build_id, claim_id),
+                UNIQUE (build_id, item_ordinal),
+                CHECK (
+                    (status = 'prepared' AND content_hash IS NOT NULL
+                        AND candidate_id IS NULL AND event_id IS NULL AND error_code IS NULL) OR
+                    (status = 'needs_evidence' AND content_hash IS NULL
+                        AND candidate_id IS NULL AND event_id IS NULL AND error_code IS NOT NULL) OR
+                    (status IN ('created', 'already_exists') AND content_hash IS NOT NULL
+                        AND candidate_id IS NOT NULL AND event_id IS NOT NULL
+                        AND error_code IS NULL) OR
+                    (status = 'failed' AND candidate_id IS NULL AND event_id IS NULL
+                        AND error_code IS NOT NULL)
+                ),
+                FOREIGN KEY (build_id) REFERENCES candidate_build (build_id),
+                FOREIGN KEY (checkpoint_id) REFERENCES agent_checkpoint (checkpoint_id)
+            ) STRICT;
             CREATE TABLE IF NOT EXISTS work_episode_diagnostic (
                 episode_id TEXT NOT NULL,
                 diagnostic_ordinal INTEGER NOT NULL CHECK (diagnostic_ordinal >= 0),
@@ -1386,7 +1637,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 UNIQUE (episode_id, capture_id, kind),
                 FOREIGN KEY (episode_id) REFERENCES work_episode (episode_id)
             ) STRICT;
-            PRAGMA user_version = 6;",
+            PRAGMA user_version = 7;",
         )
         .map_err(sql_error("initialize task runtime schema"))
 }
@@ -1591,6 +1842,8 @@ fn checkpoint_semantic_json(input: &AgentCheckpointWrite) -> Result<String> {
         .iter()
         .map(|claim| {
             serde_json::json!({
+                "context_kind_hint": claim.context_kind_hint,
+                "topic_key_hint": claim.topic_key_hint,
                 "statement": claim.statement,
                 "rationale": claim.rationale,
                 "applicability": claim.applicability,
@@ -1703,6 +1956,340 @@ fn inline_observation_ids(
         }
     }
     Ok(ids)
+}
+
+fn validate_build_preparations(items: &[CandidateBuildItemPreparation]) -> Result<()> {
+    let mut claim_ids = HashSet::with_capacity(items.len());
+    for item in items {
+        if !claim_ids.insert(item.claim_id) {
+            return Err(invalid(
+                "Candidate Build preparations must not repeat ClaimId",
+            ));
+        }
+        match item.status {
+            CandidateBuildItemStatus::Prepared
+                if item
+                    .content_hash
+                    .as_deref()
+                    .is_some_and(|hash| !hash.is_empty())
+                    && item.error_code.is_none() => {}
+            CandidateBuildItemStatus::NeedsEvidence
+                if item.content_hash.is_none()
+                    && item.error_code.as_deref().is_some_and(valid_error_code) => {}
+            CandidateBuildItemStatus::Prepared | CandidateBuildItemStatus::NeedsEvidence => {
+                return Err(invalid(
+                    "Candidate Build preparation readiness metadata is incomplete",
+                ));
+            }
+            CandidateBuildItemStatus::Created
+            | CandidateBuildItemStatus::AlreadyExists
+            | CandidateBuildItemStatus::Failed => {
+                return Err(invalid(
+                    "Candidate Build preparation cannot supply a submission result status",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_error_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 96
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn validate_build_claim_coverage(
+    episode: &WorkEpisodeView,
+    items: &[CandidateBuildItemPreparation],
+) -> Result<()> {
+    let persisted = episode
+        .checkpoints
+        .iter()
+        .flat_map(|checkpoint| {
+            checkpoint
+                .claims
+                .iter()
+                .map(move |claim| (checkpoint.checkpoint_id, claim.claim_id))
+        })
+        .collect::<BTreeSet<_>>();
+    let supplied = items
+        .iter()
+        .map(|item| (item.checkpoint_id, item.claim_id))
+        .collect::<BTreeSet<_>>();
+    if persisted.len() != items.len() || persisted != supplied {
+        return Err(invalid(
+            "Candidate Build must prepare every persisted Checkpoint Claim exactly once",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_build_item_result(
+    status: CandidateBuildItemStatus,
+    candidate_id: Option<CandidateId>,
+    event_id: Option<EventId>,
+    error_code: Option<&str>,
+) -> Result<()> {
+    match status {
+        CandidateBuildItemStatus::Created | CandidateBuildItemStatus::AlreadyExists
+            if candidate_id.is_some() && event_id.is_some() && error_code.is_none() =>
+        {
+            Ok(())
+        }
+        CandidateBuildItemStatus::Failed
+            if candidate_id.is_none()
+                && event_id.is_none()
+                && error_code.is_some_and(valid_error_code) =>
+        {
+            Ok(())
+        }
+        CandidateBuildItemStatus::Created
+        | CandidateBuildItemStatus::AlreadyExists
+        | CandidateBuildItemStatus::Failed => Err(invalid(
+            "Candidate Build result identity or safe error code is incomplete",
+        )),
+        CandidateBuildItemStatus::Prepared | CandidateBuildItemStatus::NeedsEvidence => Err(
+            invalid("Candidate Build result requires a terminal submission status"),
+        ),
+    }
+}
+
+fn read_candidate_build_id(
+    connection: &Connection,
+    episode_id: WorkEpisodeId,
+) -> Result<Option<CandidateBuildId>> {
+    connection
+        .query_row(
+            "SELECT build_id FROM candidate_build WHERE episode_id = ?1",
+            [episode_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(sql_error("read Candidate Build identity"))?
+        .map(|value| parse_id(&value, "candidate_build.build_id"))
+        .transpose()
+}
+
+fn upsert_candidate_build_items(
+    transaction: &Transaction<'_>,
+    build_id: CandidateBuildId,
+    items: &[CandidateBuildItemPreparation],
+) -> Result<()> {
+    let existing = read_candidate_build_items(transaction, build_id)?
+        .into_iter()
+        .map(|item| (item.claim_id, item))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if !existing.is_empty() && existing.len() != items.len() {
+        return Err(invariant(
+            "persisted Candidate Build Claim coverage changed",
+        ));
+    }
+    for (ordinal, item) in items.iter().enumerate() {
+        if let Some(persisted) = existing.get(&item.claim_id) {
+            if persisted.checkpoint_id != item.checkpoint_id {
+                return Err(invariant("persisted Candidate Build Claim owner changed"));
+            }
+            if let (Some(expected), Some(actual)) =
+                (item.content_hash.as_ref(), persisted.content_hash.as_ref())
+                && expected != actual
+            {
+                return Err(invariant(
+                    "deterministic Candidate content hash changed across retry",
+                ));
+            }
+            if persisted.status.is_finalized()
+                || (persisted.status == CandidateBuildItemStatus::Prepared
+                    && item.status == CandidateBuildItemStatus::NeedsEvidence)
+            {
+                continue;
+            }
+            transaction
+                .execute(
+                    "UPDATE candidate_build_item
+                     SET content_hash = ?1, status = ?2,
+                         candidate_id = NULL, event_id = NULL, error_code = ?3
+                     WHERE build_id = ?4 AND claim_id = ?5",
+                    params![
+                        item.content_hash.as_deref(),
+                        item.status.as_str(),
+                        item.error_code.as_deref(),
+                        build_id.to_string(),
+                        item.claim_id.to_string(),
+                    ],
+                )
+                .map_err(sql_error("refresh Candidate Build item preparation"))?;
+            continue;
+        }
+        let item_ordinal = i64::try_from(ordinal)
+            .map_err(|_| invalid("Candidate Build item ordinal exceeds SQLite range"))?;
+        transaction
+            .execute(
+                "INSERT INTO candidate_build_item (
+                    build_id, item_ordinal, checkpoint_id, claim_id, submission_id,
+                    content_hash, status, candidate_id, event_id, error_code
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8)",
+                params![
+                    build_id.to_string(),
+                    item_ordinal,
+                    item.checkpoint_id.to_string(),
+                    item.claim_id.to_string(),
+                    SubmissionId::new().to_string(),
+                    item.content_hash.as_deref(),
+                    item.status.as_str(),
+                    item.error_code.as_deref(),
+                ],
+            )
+            .map_err(sql_error("insert Candidate Build item"))?;
+    }
+    Ok(())
+}
+
+fn refresh_candidate_build_status(
+    transaction: &Transaction<'_>,
+    build_id: CandidateBuildId,
+) -> Result<()> {
+    let items = read_candidate_build_items(transaction, build_id)?;
+    let status = if items
+        .iter()
+        .any(|item| item.status == CandidateBuildItemStatus::Prepared)
+    {
+        CandidateBuildStatus::Pending
+    } else if items.iter().any(|item| {
+        matches!(
+            item.status,
+            CandidateBuildItemStatus::NeedsEvidence | CandidateBuildItemStatus::Failed
+        )
+    }) {
+        CandidateBuildStatus::Incomplete
+    } else {
+        CandidateBuildStatus::Complete
+    };
+    transaction
+        .execute(
+            "UPDATE candidate_build SET status = ?1 WHERE build_id = ?2",
+            params![status.as_str(), build_id.to_string()],
+        )
+        .map_err(sql_error("refresh Candidate Build status"))?;
+    Ok(())
+}
+
+fn require_candidate_build_view(
+    connection: &Connection,
+    build_id: CandidateBuildId,
+) -> Result<CandidateBuildView> {
+    let row = connection
+        .query_row(
+            "SELECT episode_id, task_session_id, task_id, final_checkpoint_id, status
+             FROM candidate_build WHERE build_id = ?1",
+            [build_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error("read Candidate Build"))?
+        .ok_or_else(|| invariant("Candidate Build disappeared"))?;
+    Ok(CandidateBuildView {
+        build_id,
+        source_episode: WorkEpisodeRef {
+            episode_id: parse_id(&row.0, "candidate_build.episode_id")?,
+            task_session_id: parse_id(&row.1, "candidate_build.task_session_id")?,
+            task_id: parse_id(&row.2, "candidate_build.task_id")?,
+        },
+        final_checkpoint_id: parse_id(&row.3, "candidate_build.final_checkpoint_id")?,
+        status: parse_candidate_build_status(&row.4)?,
+        items: read_candidate_build_items(connection, build_id)?,
+    })
+}
+
+fn read_candidate_build_items(
+    connection: &Connection,
+    build_id: CandidateBuildId,
+) -> Result<Vec<CandidateBuildItemView>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT checkpoint_id, claim_id, submission_id, content_hash, status,
+                    candidate_id, event_id, error_code
+             FROM candidate_build_item WHERE build_id = ?1 ORDER BY item_ordinal ASC",
+        )
+        .map_err(sql_error("prepare Candidate Build items"))?;
+    let rows = statement
+        .query_map([build_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
+        })
+        .map_err(sql_error("query Candidate Build items"))?;
+    rows.map(|row| {
+        let row = row.map_err(sql_error("read Candidate Build item row"))?;
+        Ok(CandidateBuildItemView {
+            checkpoint_id: parse_id(&row.0, "candidate_build_item.checkpoint_id")?,
+            claim_id: parse_id(&row.1, "candidate_build_item.claim_id")?,
+            submission_id: parse_id(&row.2, "candidate_build_item.submission_id")?,
+            content_hash: row.3,
+            status: parse_candidate_build_item_status(&row.4)?,
+            candidate_id: row
+                .5
+                .as_deref()
+                .map(|value| parse_id(value, "candidate_build_item.candidate_id"))
+                .transpose()?,
+            event_id: row
+                .6
+                .as_deref()
+                .map(|value| parse_id(value, "candidate_build_item.event_id"))
+                .transpose()?,
+            error_code: row.7,
+        })
+    })
+    .collect()
+}
+
+fn read_candidate_build_item(
+    connection: &Connection,
+    build_id: CandidateBuildId,
+    submission_id: SubmissionId,
+) -> Result<Option<CandidateBuildItemView>> {
+    Ok(read_candidate_build_items(connection, build_id)?
+        .into_iter()
+        .find(|item| item.submission_id == submission_id))
+}
+
+fn parse_candidate_build_status(value: &str) -> Result<CandidateBuildStatus> {
+    match value {
+        "pending" => Ok(CandidateBuildStatus::Pending),
+        "complete" => Ok(CandidateBuildStatus::Complete),
+        "incomplete" => Ok(CandidateBuildStatus::Incomplete),
+        _ => Err(invariant("persisted Candidate Build status is invalid")),
+    }
+}
+
+fn parse_candidate_build_item_status(value: &str) -> Result<CandidateBuildItemStatus> {
+    match value {
+        "prepared" => Ok(CandidateBuildItemStatus::Prepared),
+        "needs_evidence" => Ok(CandidateBuildItemStatus::NeedsEvidence),
+        "created" => Ok(CandidateBuildItemStatus::Created),
+        "already_exists" => Ok(CandidateBuildItemStatus::AlreadyExists),
+        "failed" => Ok(CandidateBuildItemStatus::Failed),
+        _ => Err(invariant(
+            "persisted Candidate Build item status is invalid",
+        )),
+    }
 }
 
 fn next_episode_ordinal(

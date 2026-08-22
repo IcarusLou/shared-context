@@ -80,6 +80,10 @@ _Avoid_: unsupported conclusion, free-form note
 The typed ownership and exact Checkpoint and WorkObservation inputs of one automatic Candidate build. It makes the source WorkEpisode verifiable without retaining raw Agent payloads.
 _Avoid_: opaque source_episode_id, transcript pointer
 
+**CandidateBuilder**:
+A deterministic converter that turns each sufficiently evidenced Claim in one Closed WorkEpisode into an unowned Context draft. It preserves explicit Claim classification when present, uses a conservative Discovery fallback when absent, and never performs semantic deduplication, conflict analysis, or Space selection.
+_Avoid_: recommendation engine, keyword classifier, Candidate confirmer
+
 **SubmissionId**:
 The stable identity of one Candidate creation operation, reused only when retrying that operation. Equal Candidate content under different SubmissionIds represents distinct creation operations and must not converge.
 _Avoid_: content hash, CandidateId, semantic deduplication key
