@@ -377,6 +377,26 @@ pub struct EpisodeClosePreparation {
     pub observation_ids: Vec<WorkObservationId>,
 }
 
+/// Result of attempting to solidify the `ActiveTask`'s current Work Episode from an already
+/// persisted Agent Checkpoint. Lifecycle Hooks never synthesize Claims or Unknowns.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AutomatedEpisodeBoundary {
+    NoActiveTask,
+    NoEpisode {
+        task_session_id: TaskSessionId,
+        task_id: TaskId,
+        intent_revision_id: TaskIntentRevisionId,
+    },
+    CheckpointRequired {
+        episode: WorkEpisodeView,
+        intent_revision_id: TaskIntentRevisionId,
+    },
+    Closed {
+        episode: WorkEpisodeView,
+        newly_closed: bool,
+    },
+}
+
 /// Verifiable source-Episode status for later Candidate admission.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceEpisodeVerification {
@@ -1272,6 +1292,162 @@ impl TaskRuntime {
                 .iter()
                 .map(|observation| observation.observation_id)
                 .collect(),
+        })
+    }
+
+    /// Closes the `ActiveTask`'s open Episode at its latest current-Intent Checkpoint.
+    ///
+    /// This is the narrow lifecycle-Hook boundary: it may advance ordered Intent/Signal refs and
+    /// close an Episode, but it never creates a Checkpoint, Claim, Unknown, Observation, or
+    /// Candidate. A duplicate call returns the latest already-closed Episode so the application
+    /// service can recover a missing Builder step idempotently.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed locator, storage, ownership, or persisted-state errors. Missing Tasks,
+    /// Episodes, and current Checkpoints are ordinary typed outcomes rather than failures.
+    pub fn close_checkpointed_work_episode(
+        &self,
+        locator: &ExternalSessionLocator,
+    ) -> Result<AutomatedEpisodeBoundary> {
+        self.close_checkpointed_work_episode_guarded(locator, None)
+    }
+
+    /// Explicit CAS fallback for closing an already persisted Checkpoint when a lifecycle Hook is
+    /// unavailable or its completion is uncertain.
+    ///
+    /// # Errors
+    ///
+    /// Returns stale state when Task, Intent, or Episode version changed. It never creates a new
+    /// Checkpoint or accepts caller-authored Claim content.
+    pub fn close_checkpointed_work_episode_cas(
+        &self,
+        locator: &ExternalSessionLocator,
+        expected_task_id: TaskId,
+        expected_intent_revision_id: TaskIntentRevisionId,
+        expected_episode_version: u64,
+    ) -> Result<AutomatedEpisodeBoundary> {
+        self.close_checkpointed_work_episode_guarded(
+            locator,
+            Some((
+                expected_task_id,
+                expected_intent_revision_id,
+                expected_episode_version,
+            )),
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn close_checkpointed_work_episode_guarded(
+        &self,
+        locator: &ExternalSessionLocator,
+        expected: Option<(TaskId, TaskIntentRevisionId, u64)>,
+    ) -> Result<AutomatedEpisodeBoundary> {
+        locator.validate()?;
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin automated Episode boundary")?;
+        let Some(external) = read_external_identity(&transaction, locator)? else {
+            transaction
+                .commit()
+                .map_err(sql_error("commit missing automated ActiveTask"))?;
+            return Ok(AutomatedEpisodeBoundary::NoActiveTask);
+        };
+        let (task_id, intent_revision_id) =
+            read_active_task_head(&transaction, external.active_task_session_id)?
+                .ok_or_else(|| invariant("located automated ActiveTask is not active"))?;
+        if task_id != external.active_task_id {
+            return Err(invariant(
+                "ExternalSession ActiveTask identity disagrees with its TaskSession",
+            ));
+        }
+        if expected.is_some_and(|(expected_task_id, expected_intent_revision_id, _)| {
+            expected_task_id != task_id || expected_intent_revision_id != intent_revision_id
+        }) {
+            return Err(stale(
+                "automated Episode Task/Intent ownership CAS is stale",
+            ));
+        }
+        let Some(episode_id) = find_open_episode(&transaction, external.active_task_session_id)?
+        else {
+            let latest = find_latest_episode(&transaction, external.active_task_session_id)?
+                .map(|episode_id| require_episode_view(&transaction, episode_id))
+                .transpose()?;
+            transaction
+                .commit()
+                .map_err(sql_error("commit duplicate automated Episode boundary"))?;
+            return Ok(match latest {
+                Some(episode)
+                    if matches!(episode.episode.status, WorkEpisodeStatus::Closed { .. }) =>
+                {
+                    if expected.is_some_and(|(_, _, expected_version)| {
+                        expected_version
+                            .checked_add(1)
+                            .is_none_or(|closed_version| closed_version != episode.episode.version)
+                    }) {
+                        return Err(stale("automated closed Episode version CAS is stale"));
+                    }
+                    AutomatedEpisodeBoundary::Closed {
+                        episode,
+                        newly_closed: false,
+                    }
+                }
+                Some(_) => {
+                    return Err(invariant(
+                        "latest open Work Episode was absent from the open-Episode lookup",
+                    ));
+                }
+                None => AutomatedEpisodeBoundary::NoEpisode {
+                    task_session_id: external.active_task_session_id,
+                    task_id,
+                    intent_revision_id,
+                },
+            });
+        };
+        let episode = require_episode_view(&transaction, episode_id)?;
+        if expected
+            .is_some_and(|(_, _, expected_version)| expected_version != episode.episode.version)
+        {
+            return Err(stale("automated open Episode version CAS is stale"));
+        }
+        let Some(checkpoint) = episode.checkpoints.last() else {
+            transaction
+                .commit()
+                .map_err(sql_error("commit missing automated Checkpoint"))?;
+            return Ok(AutomatedEpisodeBoundary::CheckpointRequired {
+                episode,
+                intent_revision_id,
+            });
+        };
+        if checkpoint.intent_revision_id != intent_revision_id {
+            transaction
+                .commit()
+                .map_err(sql_error("commit stale automated Checkpoint"))?;
+            return Ok(AutomatedEpisodeBoundary::CheckpointRequired {
+                episode,
+                intent_revision_id,
+            });
+        }
+        insert_all_missing_episode_refs(
+            &transaction,
+            episode_id,
+            external.active_task_session_id,
+            task_id,
+        )?;
+        let mut validation_episode = require_episode_view(&transaction, episode_id)?.episode;
+        validation_episode.close(checkpoint)?;
+        close_episode_version(
+            &transaction,
+            episode_id,
+            episode.episode.version,
+            checkpoint.checkpoint_id,
+        )?;
+        let episode = require_episode_view(&transaction, episode_id)?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit automated Episode boundary"))?;
+        Ok(AutomatedEpisodeBoundary::Closed {
+            episode,
+            newly_closed: true,
         })
     }
 
@@ -2654,6 +2830,24 @@ fn find_open_episode(
         )
         .optional()
         .map_err(sql_error("find open Work Episode"))?
+        .map(|value| parse_id(&value, "work_episode.episode_id"))
+        .transpose()
+}
+
+fn find_latest_episode(
+    connection: &Connection,
+    task_session_id: TaskSessionId,
+) -> Result<Option<WorkEpisodeId>> {
+    connection
+        .query_row(
+            "SELECT episode_id FROM work_episode
+             WHERE task_session_id = ?1
+             ORDER BY episode_ordinal DESC LIMIT 1",
+            [task_session_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(sql_error("find latest Work Episode"))?
         .map(|value| parse_id(&value, "work_episode.episode_id"))
         .transpose()
 }

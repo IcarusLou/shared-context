@@ -19,7 +19,7 @@
 - `runtime.sqlite` 已持久化 server-owned、TaskSession/Task-owned、version-CAS 的 `WorkEpisode`、ordered Intent/Signal refs、normalized `WorkObservation`、Capture ingestion 与 safe diagnostics；显式 Runtime API 提供 open/read/list/advance/append/ingest/close-prepare/source verification，一 TaskSession 最多一个 Open Episode。
 - 公开 `task_checkpoint` MCP/CLI 以 Task、Intent 和 Episode version CAS 显式写入完整 Claims/Unknowns；Runtime v8 同事务 open/advance Episode、生成 inline Validation Observation 与 Claim/Checkpoint ID，并按 Episode+parent version+完整语义幂等 continue/close。ArtifactRef 不作为 Evidence；`continue` 不构建 Candidate，`close` 在 Checkpoint 成功或语义重试后触发确定性 Candidate Builder。
 - `CaptureStore` 使用 typed `CaptureId` 保存带 ExternalSessionLocator 与 optional exact ActiveTask owner 的 redacted TTL Breadcrumb；bounded read/list/claim/cleanup、claim 与 Runtime commit 双重幂等、Catalog File→ArtifactRef 映射已实现。无 ActiveTask 或未配置/unsafe File 只保留 typed diagnostic，绝不猜 owner/Repository。
-- Hook 只写 owned/diagnostic Capture 和原有非定位 TestOutcome，不 open/advance/ingest Episode 或伪造 Claim；PreCompact/TurnStop 只提示工作 Agent 显式调用 `task_checkpoint`，自动聚合属于 #163。
+- Hook 只写 owned/diagnostic Capture 和原有非定位 TestOutcome，不 open/ingest Episode 或伪造 Claim。工作 Agent 在 PreCompact/TurnStop 前显式写入完整 current-Intent Checkpoint；verified Hook 只在该 Checkpoint 已存在时补齐 ordered Intent/Signal refs、关闭 Episode 并调用共享 Candidate Builder。重复/并发事件复用同一 Episode/Build/Candidate；SessionEnd 只做本地 TTL 清理。若 `continue` 已成功而 Hook 缺失/失败，`task_checkpoint boundary=close` 加当前 Episode version 与空 Claims/Unknowns 可在同一 CAS 边界关闭已有 Checkpoint，不要求重填或伪造内容。
 - Candidate Builder 读取 exact closed Episode、final/相关 Checkpoint 和一个 Index snapshot，逐 Claim 组装最小充分 Evidence；Runtime 在任何 Git 写入前固化 BuildId/SubmissionId/content hash，#117 返回的 CandidateId/EventId 再原子回填。无 Claim、Unknown-only 或 Evidence 不充分均为零 Candidate；无 kind hint固定降级 Discovery。
 - #159 Candidate Analysis 是 Runtime derived review state：Search 以完整草稿等值、显式 related Context、exact Artifact Graph、topic/scope 与 BM25 多路 RRF 生成 typed assessment，明确区分 exact duplicate、supports、revises、potential contradiction、unresolved related 和 novel。Space 推荐融合 assessment target、source Task association 与 Space Intent；冲突 Intent/unsafe Context 不自动成为 Primary，无安全 Primary 时给出完整 system-suggested Space Intent。分析不写 Git、不进入 Search/Hook/自动注入；`candidate analyze` 可重跑并替换当前结果。
 - #161 已定义 CandidateConfirmation 与 ContextSpaceAssociation 的严格 Event/Reducer/Index 事实：确认引用 exact Candidate/source、Primary/Related、结果 Revision、initial Association、causal Publish Event 和 final content hash；后续 Withdraw 不反向抹除历史确认。Association 独立成可修订 DAG，多 Head 与重复 Confirmation 都显式 conflict；当前嵌套 Context owner 与 Search ranking 不变。
@@ -29,7 +29,7 @@
 
 以下能力**尚未实现**，不得在代码、测试报告或评审中宣称已经具备：
 
-- **M4 完整链路：未实现** — #117 已完成 Candidate submission 幂等门禁，#156–#162 已完成可验证 WorkEpisode/Capture、显式 AgentCheckpoint、确定性 Candidate Builder、非权威分析/Space 推荐、Task-local Review 与可恢复原子确认；仅自动聚合（#163）尚未实现。
+- **M4 最终验收：未完成** — #117 与 #156–#163 已完成可验证 WorkEpisode/Capture、显式 AgentCheckpoint、Hook lifecycle boundary、确定性 Candidate Builder、非权威分析/Space 推荐、Task-local Review 与可恢复原子确认；延期 #136 必须重新人工批准后完成，随后由 #164 关闭端到端验收。
 - **团队同步：未实现** — Repository Catalog 是单机显式配置，不是团队事实或知识 Store。
 
 Cursor 与 Codex 都通过显式 `task_intent_update` 建立权威 Task；Prompt Hook 只提供能力提示。已有 ActiveTask 可通过只读 `task_context` 再取 Pack。

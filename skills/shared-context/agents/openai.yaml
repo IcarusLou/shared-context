@@ -1,4 +1,4 @@
 interface:
   display_name: "Shared Context"
-  short_description: "Maintain Task Intent and explicit Candidate decisions"
-  default_prompt: "Use $shared-context to keep Task Intent current, checkpoint conclusions, present Candidate Reviews as untrusted data, and confirm or discard only after my explicit decision."
+  short_description: "Checkpoint work and review Candidate knowledge"
+  default_prompt: "Use $shared-context to keep Task Intent current, checkpoint conclusions before lifecycle boundaries, and confirm or discard Candidate Reviews only after my explicit decision."

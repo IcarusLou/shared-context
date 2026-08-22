@@ -277,6 +277,21 @@ pub enum TaskRuntimeOperation {
         tool_name: String,
         outcome: ToolOutcome,
     },
+    FinalizeCheckpointedEpisode {
+        locator: ExternalSessionLocator,
+        trigger: EpisodeFinalizationTrigger,
+    },
+    CleanupSessionState {
+        locator: ExternalSessionLocator,
+    },
+}
+
+/// Lifecycle boundary that may close only an already checkpointed Work Episode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodeFinalizationTrigger {
+    PreCompact,
+    TurnStop,
 }
 
 /// Side-effect-free plan between canonical input and runtime execution.
@@ -363,6 +378,7 @@ pub fn plan_action(
             context,
             format!("context compaction requested ({trigger})"),
             true,
+            Some(EpisodeFinalizationTrigger::PreCompact),
         ),
         CanonicalAgentEvent::TurnStop {
             context, status, ..
@@ -371,15 +387,15 @@ pub fn plan_action(
             context,
             format!("agent turn stopped ({status})"),
             true,
+            Some(EpisodeFinalizationTrigger::TurnStop),
         ),
-        CanonicalAgentEvent::SessionEnd {
-            context, reason, ..
-        } => checkpoint(
-            capabilities.agent,
-            context,
-            format!("agent session ended ({reason})"),
-            false,
-        ),
+        CanonicalAgentEvent::SessionEnd { context, .. } => CanonicalAgentAction {
+            task_operation: Some(TaskRuntimeOperation::CleanupSessionState {
+                locator: task_locator(capabilities.agent, context),
+            }),
+            breadcrumb: None,
+            system_message: None,
+        },
     }
 }
 
@@ -388,9 +404,13 @@ fn checkpoint(
     context: &AgentEventContext,
     summary: String,
     request_checkpoint: bool,
+    trigger: Option<EpisodeFinalizationTrigger>,
 ) -> CanonicalAgentAction {
     CanonicalAgentAction {
-        task_operation: None,
+        task_operation: trigger.map(|trigger| TaskRuntimeOperation::FinalizeCheckpointedEpisode {
+            locator: task_locator(agent, context),
+            trigger,
+        }),
         breadcrumb: Some(CanonicalBreadcrumb {
             external_session_locator: task_locator(agent, context),
             kind: CanonicalBreadcrumbKind::Checkpoint,
@@ -728,12 +748,13 @@ mod tests {
             Some("session")
         );
 
-        for (event, should_request_checkpoint) in [
+        for (event, expected_operation, should_request_checkpoint) in [
             (
                 CanonicalAgentEvent::PreCompact {
                     context: context.clone(),
                     trigger: "auto".to_owned(),
                 },
+                "pre_compact",
                 true,
             ),
             (
@@ -741,6 +762,7 @@ mod tests {
                     context: context.clone(),
                     status: "completed".to_owned(),
                 },
+                "turn_stop",
                 true,
             ),
             (
@@ -748,22 +770,47 @@ mod tests {
                     context,
                     reason: "other".to_owned(),
                 },
+                "cleanup",
                 false,
             ),
         ] {
             let action = plan_action(&event, &codex);
-            assert!(action.task_operation.is_none());
-            assert_eq!(
-                action.breadcrumb.as_ref().map(|value| &value.kind),
-                Some(&CanonicalBreadcrumbKind::Checkpoint)
-            );
-            assert_eq!(
-                action
-                    .breadcrumb
-                    .as_ref()
-                    .map(|value| value.external_session_locator.external_session_id.as_str()),
-                Some("session")
-            );
+            match expected_operation {
+                "pre_compact" => assert!(matches!(
+                    action.task_operation,
+                    Some(TaskRuntimeOperation::FinalizeCheckpointedEpisode {
+                        trigger: EpisodeFinalizationTrigger::PreCompact,
+                        ..
+                    })
+                )),
+                "turn_stop" => assert!(matches!(
+                    action.task_operation,
+                    Some(TaskRuntimeOperation::FinalizeCheckpointedEpisode {
+                        trigger: EpisodeFinalizationTrigger::TurnStop,
+                        ..
+                    })
+                )),
+                "cleanup" => assert!(matches!(
+                    action.task_operation,
+                    Some(TaskRuntimeOperation::CleanupSessionState { .. })
+                )),
+                _ => unreachable!(),
+            }
+            if should_request_checkpoint {
+                assert_eq!(
+                    action.breadcrumb.as_ref().map(|value| &value.kind),
+                    Some(&CanonicalBreadcrumbKind::Checkpoint)
+                );
+                assert_eq!(
+                    action
+                        .breadcrumb
+                        .as_ref()
+                        .map(|value| value.external_session_locator.external_session_id.as_str()),
+                    Some("session")
+                );
+            } else {
+                assert!(action.breadcrumb.is_none());
+            }
             assert_eq!(
                 action
                     .system_message

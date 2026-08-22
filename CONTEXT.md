@@ -72,6 +72,10 @@ _Avoid_: raw Breadcrumb, terminal output, untyped artifact string
 An Agent-authored, server-identified snapshot of Claims and Unknowns owned by one WorkEpisode, TaskSession, Task, TaskIntentRevision, and exact parent Episode version. It may continue or close the Episode without selecting a ContextSpace; an Unknown-only Checkpoint records uncertainty without asserting knowledge.
 _Avoid_: conversation summary, Candidate approval, Space selection
 
+**AutomatedEpisodeBoundary**:
+A fail-open lifecycle transition that may close one Open WorkEpisode only at its latest persisted AgentCheckpoint for the current TaskIntentRevision, then ask the shared CandidateBuilder to process that exact Closed Episode. PreCompact and TurnStop may trigger it; it never authors Claims or Unknowns, and repeated or concurrent triggers reuse the same Episode and Candidate identities. SessionEnd is retention cleanup, not an AutomatedEpisodeBoundary.
+_Avoid_: automatic Checkpoint, Hook-authored Claim, SessionEnd Candidate build
+
 **CheckpointClaim**:
 A structured engineering assertion containing its statement, rationale, applicability, assumptions, recheck conditions, typed Evidence references, Artifact associations, and related Context revisions. An Artifact association is not Evidence by itself.
 _Avoid_: unsupported conclusion, free-form note

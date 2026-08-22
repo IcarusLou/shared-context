@@ -843,17 +843,17 @@ fn codex_and_cursor_checkpoint_inline_evidence_builds_only_after_close() {
                     1,
                     "close",
                     json!([]),
-                    json!([{
-                        "statement": "No further conclusion is asserted",
-                        "blocking": false,
-                        "recheck_when": []
-                    }]),
+                    json!([]),
                 ),
             )],
         );
         let closed = &closed[0]["result"]["structuredContent"];
-        assert_eq!(closed["created"], true);
+        assert_eq!(
+            closed["created"], false,
+            "empty close must reuse the explicit Checkpoint rather than inventing another"
+        );
         assert_eq!(closed["episode_version"], 2);
+        assert_eq!(closed["checkpoint_id"], continued["checkpoint_id"]);
         assert_eq!(
             closed["episode_status"]["final_checkpoint_id"],
             closed["checkpoint_id"]
@@ -864,7 +864,7 @@ fn codex_and_cursor_checkpoint_inline_evidence_builds_only_after_close() {
             .read_work_episode(episode_id)
             .unwrap()
             .unwrap();
-        assert_eq!(persisted.checkpoints.len(), 2);
+        assert_eq!(persisted.checkpoints.len(), 1);
         assert_eq!(persisted.episode.observations.len(), 1);
         assert_eq!(closed["candidate_build"]["status"], "complete");
         assert_eq!(
@@ -2596,6 +2596,16 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
                 .unwrap()
                 .iter()
                 .any(|field| field == "context_kind_hint" || field == "topic_key_hint")
+        );
+        assert_eq!(
+            checkpoint_schema["anyOf"][2],
+            json!({
+                "properties": {
+                    "boundary": {"const": "close"},
+                    "claims": {"maxItems": 0},
+                    "unknowns": {"maxItems": 0}
+                }
+            })
         );
         let task_schema = &tools
             .iter()

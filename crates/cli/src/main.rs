@@ -18,8 +18,8 @@ use std::{
 
 use args::Options;
 use sctx_agent_adapter::{
-    AgentCapabilities, CanonicalAgentAction, CanonicalBreadcrumbKind, ResolvedAgentAction,
-    TaskRuntimeOperation, ToolOutcome, TrustState, plan_action,
+    AgentCapabilities, CanonicalAgentAction, CanonicalBreadcrumbKind, EpisodeFinalizationTrigger,
+    ResolvedAgentAction, TaskRuntimeOperation, ToolOutcome, TrustState, plan_action,
 };
 use sctx_domain::{
     Applicability, CandidateReviewStatus, ConflictParticipant, ConflictResolutionDraft,
@@ -49,7 +49,7 @@ use sctx_mcp::{
     TaskContextReadInput, TaskIntentUpdateInput, TaskSignalSupersedeInput,
 };
 use sctx_search::{ContextStatus, ScopeFilter, SearchEngine, SearchFilters, SearchRequest};
-use sctx_task_runtime::TaskRuntime;
+use sctx_task_runtime::{AutomatedEpisodeBoundary, CandidateBuildStatus, TaskRuntime};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -760,17 +760,15 @@ fn resolve_hook_action(action: CanonicalAgentAction) -> Result<ResolvedAgentActi
         breadcrumb,
         system_message,
     } = action;
-    if let Some(breadcrumb) = breadcrumb {
-        let root = installation_root()?;
-        if capture_breadcrumb(&root, breadcrumb).is_err() {
-            return Ok(ResolvedAgentAction {
-                additional_context: None,
-                system_message: Some(HOOK_TASK_UNAVAILABLE.to_owned()),
-            });
-        }
-    }
-    let additional_context = match task_operation.map(resolve_task_operation).transpose() {
-        Ok(context) => context.flatten(),
+    let lifecycle_operation = task_operation.as_ref().is_some_and(|operation| {
+        matches!(
+            operation,
+            TaskRuntimeOperation::FinalizeCheckpointedEpisode { .. }
+                | TaskRuntimeOperation::CleanupSessionState { .. }
+        )
+    });
+    let task_resolution = match task_operation.map(resolve_task_operation).transpose() {
+        Ok(resolution) => resolution.unwrap_or_default(),
         Err(_) => {
             return Ok(ResolvedAgentAction {
                 additional_context: None,
@@ -778,10 +776,25 @@ fn resolve_hook_action(action: CanonicalAgentAction) -> Result<ResolvedAgentActi
             });
         }
     };
+    if let Some(breadcrumb) = breadcrumb {
+        let root = installation_root()?;
+        if capture_breadcrumb(&root, breadcrumb).is_err() && !lifecycle_operation {
+            return Ok(ResolvedAgentAction {
+                additional_context: None,
+                system_message: Some(HOOK_TASK_UNAVAILABLE.to_owned()),
+            });
+        }
+    }
     Ok(ResolvedAgentAction {
-        additional_context,
-        system_message,
+        additional_context: task_resolution.additional_context,
+        system_message: task_resolution.system_message.or(system_message),
     })
+}
+
+#[derive(Default)]
+struct ResolvedTaskOperation {
+    additional_context: Option<String>,
+    system_message: Option<String>,
 }
 
 fn capture_breadcrumb(
@@ -820,7 +833,7 @@ fn capture_breadcrumb(
     Ok(())
 }
 
-fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<Option<String>> {
+fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<ResolvedTaskOperation> {
     match operation {
         TaskRuntimeOperation::MergeObservations {
             locator,
@@ -833,7 +846,7 @@ fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<Option<Stri
             let root = installation_root()?;
             let runtime = TaskRuntime::initialize(&root)?;
             if runtime.read_snapshot_by_locator(&locator)?.is_none() {
-                return Ok(None);
+                return Ok(ResolvedTaskOperation::default());
             }
             let catalog = UserConfigStore::open_existing(&root)?.repository_catalog()?;
             let signals = normalized_observation_signals(
@@ -847,9 +860,134 @@ fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<Option<Stri
             if !signals.is_empty() {
                 let _outcome = runtime.merge_signals_by_locator(&locator, signals)?;
             }
-            Ok(None)
+            Ok(ResolvedTaskOperation::default())
+        }
+        TaskRuntimeOperation::FinalizeCheckpointedEpisode { locator, trigger } => {
+            finalize_checkpointed_episode(&locator, trigger)
+        }
+        TaskRuntimeOperation::CleanupSessionState { locator } => {
+            let root = installation_root()?;
+            let runtime = TaskRuntime::initialize(&root)?;
+            let _active = runtime.read_snapshot_by_locator(&locator)?;
+            let _reviews = runtime.cleanup_expired_candidate_reviews()?;
+            let _captures = CaptureStore::initialize(root)?.cleanup_expired()?;
+            Ok(ResolvedTaskOperation::default())
         }
     }
+}
+
+fn finalize_checkpointed_episode(
+    locator: &ExternalSessionLocator,
+    trigger: EpisodeFinalizationTrigger,
+) -> Result<ResolvedTaskOperation> {
+    let root = installation_root()?;
+    let runtime = TaskRuntime::initialize(&root)?;
+    let boundary = runtime.close_checkpointed_work_episode(locator)?;
+    let trigger_name = match trigger {
+        EpisodeFinalizationTrigger::PreCompact => "PreCompact",
+        EpisodeFinalizationTrigger::TurnStop => "TurnStop",
+    };
+    let system_message = match boundary {
+        AutomatedEpisodeBoundary::NoActiveTask => format!(
+            "Shared Context {trigger_name}: no ActiveTask exists. Continue coding normally; use $shared-context and task_intent_update before checkpointing."
+        ),
+        AutomatedEpisodeBoundary::NoEpisode {
+            task_id,
+            intent_revision_id,
+            ..
+        } => format!(
+            "Shared Context {trigger_name}: no Work Episode is open for Task {task_id}. Use $shared-context and call task_checkpoint with expected_intent_revision_id {intent_revision_id}; Hook text is not Claim evidence."
+        ),
+        AutomatedEpisodeBoundary::CheckpointRequired {
+            episode,
+            intent_revision_id,
+        } => format!(
+            "Shared Context {trigger_name}: Work Episode {} remains open at version {} because no current-Intent Checkpoint exists. Before compaction or completion, call task_checkpoint for Task {} with expected_intent_revision_id {intent_revision_id} and complete Claims/Unknowns. Hook text is not Claim evidence.",
+            episode.episode.episode_id, episode.episode.version, episode.episode.task_id,
+        ),
+        AutomatedEpisodeBoundary::Closed {
+            episode,
+            newly_closed,
+        } => {
+            let episode_id = episode.episode.episode_id;
+            let WorkEpisodeStatus::Closed {
+                final_checkpoint_id,
+            } = episode.episode.status
+            else {
+                return Err(invariant("automated closed Episode lacks final Checkpoint"));
+            };
+            let existing = runtime.read_candidate_build(episode_id)?;
+            let should_build = newly_closed
+                || existing
+                    .as_ref()
+                    .is_none_or(|build| build.status == CandidateBuildStatus::Pending);
+            let build = if should_build {
+                Some(sctx_mcp::build_closed_episode_at_root(&root, episode_id)?)
+            } else {
+                None
+            };
+            let (build_status, item_count) = build.as_ref().map_or_else(
+                || {
+                    existing.as_ref().map_or_else(
+                        || ("not_started", 0),
+                        |build| {
+                            (
+                                match build.status {
+                                    CandidateBuildStatus::Pending => "pending",
+                                    CandidateBuildStatus::Complete => "complete",
+                                    CandidateBuildStatus::Incomplete => "incomplete",
+                                },
+                                build.items.len(),
+                            )
+                        },
+                    )
+                },
+                |build| {
+                    (
+                        match build.status {
+                            sctx_mcp::CandidateBuildResponseStatus::Pending => "pending",
+                            sctx_mcp::CandidateBuildResponseStatus::Complete => "complete",
+                            sctx_mcp::CandidateBuildResponseStatus::Incomplete => "incomplete",
+                        },
+                        build.items.len(),
+                    )
+                },
+            );
+            format!(
+                "Shared Context {trigger_name}: Work Episode {episode_id} is durably closed at Checkpoint {final_checkpoint_id}; Candidate Builder is {build_status} with {item_count} item(s). Candidate review remains explicit and untrusted.",
+            )
+        }
+    };
+    recover_one_pending_episode_build(&root, &runtime, locator)?;
+    Ok(ResolvedTaskOperation {
+        additional_context: None,
+        system_message: Some(system_message),
+    })
+}
+
+fn recover_one_pending_episode_build(
+    root: &Path,
+    runtime: &TaskRuntime,
+    locator: &ExternalSessionLocator,
+) -> Result<()> {
+    let Some(active) = runtime.read_snapshot_by_locator(locator)? else {
+        return Ok(());
+    };
+    let episodes = runtime.list_work_episodes(active.task_session_id, 256)?;
+    for episode in episodes.into_iter().rev() {
+        if !matches!(episode.episode.status, WorkEpisodeStatus::Closed { .. }) {
+            continue;
+        }
+        let build = runtime.read_candidate_build(episode.episode.episode_id)?;
+        if build
+            .as_ref()
+            .is_none_or(|build| build.status == CandidateBuildStatus::Pending)
+        {
+            let _build = sctx_mcp::build_closed_episode_at_root(root, episode.episode.episode_id)?;
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn normalized_observation_signals(

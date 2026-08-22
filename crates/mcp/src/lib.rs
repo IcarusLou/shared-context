@@ -55,9 +55,10 @@ use sctx_search::{
     TaskGraphDiagnostic, TaskRetrievalPath,
 };
 use sctx_task_runtime::{
-    AgentCheckpointWrite, CandidateBuildItemPreparation, CandidateBuildItemStatus,
-    CandidateBuildStatus, CandidateBuildView, CandidateReviewDiscard, CandidateReviewDiscardStatus,
-    CandidateReviewRecord, CheckpointBoundary, CheckpointClaimDraft, TaskRuntime, WorkEpisodeView,
+    AgentCheckpointWrite, AutomatedEpisodeBoundary, CandidateBuildItemPreparation,
+    CandidateBuildItemStatus, CandidateBuildStatus, CandidateBuildView, CandidateReviewDiscard,
+    CandidateReviewDiscardStatus, CandidateReviewRecord, CheckpointBoundary, CheckpointClaimDraft,
+    TaskRuntime, WorkEpisodeView,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -1261,6 +1262,41 @@ impl Runtime {
                 inline_validations,
                 artifact_refs: claim.artifact_refs.clone(),
                 related_contexts: claim.related_contexts.clone(),
+            });
+        }
+        if input.boundary == TaskCheckpointBoundary::Close
+            && claims.is_empty()
+            && input.unknowns.is_empty()
+        {
+            let boundary = self.tasks.close_checkpointed_work_episode_cas(
+                &locator,
+                expected_task_id,
+                expected_intent_revision_id,
+                input.expected_episode_version,
+            )?;
+            let AutomatedEpisodeBoundary::Closed { episode, .. } = boundary else {
+                return Err(invalid(
+                    "empty close requires an existing current-Intent Agent Checkpoint",
+                ));
+            };
+            let checkpoint = episode
+                .checkpoints
+                .last()
+                .ok_or_else(|| invariant("closed Episode lacks its final Agent Checkpoint"))?;
+            let candidate_build = Some(self.build_closed_episode(episode.episode.episode_id)?);
+            return Ok(TaskCheckpointResponse {
+                checkpoint_id: checkpoint.checkpoint_id,
+                claim_ids: checkpoint
+                    .claims
+                    .iter()
+                    .map(|claim| claim.claim_id)
+                    .collect(),
+                episode_id: episode.episode.episode_id,
+                episode_version: episode.episode.version,
+                episode_status: episode.episode.status,
+                created: false,
+                diagnostics: Vec::new(),
+                candidate_build,
             });
         }
         let outcome = self.tasks.write_agent_checkpoint(&AgentCheckpointWrite {
@@ -3901,7 +3937,7 @@ fn tools_list() -> Value {
         ),
         tool_schema(
             "task_checkpoint",
-            "Persist one explicit Agent-authored Claim/Unknown checkpoint under Task, Intent and Episode CAS; a close boundary deterministically builds unassigned Candidate drafts.",
+            "Persist one explicit Agent-authored Claim/Unknown checkpoint under Task, Intent and Episode CAS; close deterministically builds unassigned Candidate drafts, and an empty close reuses an existing current Checkpoint after Hook failure.",
             task_checkpoint_schema()
         ),
         tool_schema(
@@ -4310,7 +4346,14 @@ fn task_checkpoint_schema() -> Value {
         "required": ["agent_kind", "external_session_id", "expected_task_id", "expected_intent_revision_id", "expected_episode_version", "boundary", "claims", "unknowns"],
         "anyOf": [
             {"properties": {"claims": {"minItems": 1}}},
-            {"properties": {"unknowns": {"minItems": 1}}}
+            {"properties": {"unknowns": {"minItems": 1}}},
+            {
+                "properties": {
+                    "boundary": {"const": "close"},
+                    "claims": {"maxItems": 0},
+                    "unknowns": {"maxItems": 0}
+                }
+            }
         ],
         "properties": {
             "agent_kind": {"type": "string", "minLength": 1},

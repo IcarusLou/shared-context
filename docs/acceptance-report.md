@@ -1,8 +1,8 @@
 # Task-first Retrieval Integration Acceptance Report
 
 Date: 2026-08-23
-Scope: Mew #112 through #162, including Mandatory Gates #114/#117, excluding deferred #163 and accepted boundary #150
-Implementation baseline before Candidate Confirmation Writer: `main@03c22ba`
+Scope: Mew #112 through #163, including Mandatory Gates #114/#117 and accepted boundary #150; final M4 Gate #164 and deferred #136 are excluded
+Implementation baseline before lifecycle automation: `main@010a310`
 
 ## Verdict
 
@@ -10,14 +10,14 @@ M1 closes the Task-first domain and entry-point foundation. M2 closes the local 
 
 Session startup is capability-only: it does not run an empty automatic knowledge query. Task-aware automatic retrieval begins only from a supported PromptSubmit event.
 
-This report does **not** claim M4:
+This report does **not** claim the final M4 Gate:
 
 | Milestone | Status | Boundary |
 |---|---|---|
 | M1 — Task-first primitives and unassigned Candidate entry | IMPLEMENTED | Covered below |
 | M2 — Task Runtime and multi-Space retrieval | IMPLEMENTED | TaskSession persistence, strict `task_intent_update`, read-only `task_context`, association inference, typed RetrievalPaths, and TaskContextPack pass focused cross-crate/E2E oracles |
 | M3 — Engineering Graph | IMPLEMENTED | Reference-derived bounded ScanPlan, deterministic Artifact locators, sparse build-time Context/safety snapshots, historical exact retrieval, frozen 1–2 hop relations, diagnostics, fallback, rebuild equivalence, and budget bounds pass cross-crate/E2E oracles |
-| M4 — Low-tax Capture | IMPLEMENTED EXCEPT AUTO-AGGREGATION | #117 and #156–#162 provide submission-idempotent Candidate admission, WorkEpisode/Builder/analysis/Review, and recoverable atomic Candidate Confirmation; #163 automatic aggregation remains deferred |
+| M4 — Low-tax Capture | FUNCTIONAL CHAIN IMPLEMENTED; FINAL GATE PENDING | #117 and #156–#163 provide submission-idempotent Candidate admission, WorkEpisode/Checkpoint lifecycle automation, Builder/analysis/Review, and recoverable atomic Candidate Confirmation; deferred #136 requires fresh approval and #164 closes the final E2E Gate |
 
 `task_intent_update` is the only Task Intent write path. `task_context` accepts only an external Session locator and output bounds, and reads the already-authoritative ActiveTask without mutating Runtime. PromptSubmit supplies guidance rather than inferred Intent. Explicit `context_search.space_ids` remains available as a hard filter for diagnosis and exploration.
 
@@ -79,7 +79,8 @@ Mandatory Gates #114/#117 are implemented: stable `submission_id` and exact clos
 | Capture ingestion survives claim/commit races | PROVEN | `capture_ingestion.capture_id` is unique; concurrent/retried ingestion returns one Observation, changed retry content/cross owner is rejected, and claim-before-failed-commit remains retryable without source deletion |
 | Capture File hints never guess Repository | PROVEN | Catalog maps only safe existing Workspace-allowed configured paths to File ArtifactRef; unconfigured/unsafe paths retain Capture source/summary plus typed Runtime diagnostic |
 | Source Episode is query-verifiable without Candidate creation | PROVEN | Explicit Runtime and Checkpoint APIs return exact Episode owner/version/status/Observation/Checkpoint state; deleting runtime loses Episode and Checkpoint only while Git/Index/Capture bytes remain |
-| Hook does not start M4 automation | PROVEN | Real Hook E2E writes owned/diagnostic Capture and existing TestOutcome only; PreCompact/TurnStop capability text asks the working Agent to call `task_checkpoint` but Hook never opens/advances Episode or fabricates Claim content; #163 is not implemented |
+| Hook automates only a persisted Checkpoint boundary | PROVEN | Real Codex PreCompact and Cursor TurnStop fixtures close only an already checkpointed current-Intent Episode and invoke the shared Builder; missing/stale Checkpoints remain Open, 12 concurrent processes and repeated events converge, same-Workspace Sessions stay isolated, and Hook never opens an Episode or fabricates Claim content |
+| Missing or failed Hook has a no-retype fallback | PROVEN | `task_checkpoint boundary=close` with current Episode version and empty Claims/Unknowns closes the previously persisted Checkpoint under Task/Intent/Episode CAS, returns that same Checkpoint ID, and invokes the same Builder without inventing an Unknown or duplicate Claim |
 | Automatic TaskContextPack excludes every unsafe state | PROVEN | The oracle seeds an unassigned Candidate plus Space-associated Candidate, Deprecated, semantic-conflict, and incomplete-Evidence Context; automatic output is empty while a direct SearchEngine diagnostic query proves each fixture state exists |
 | Tree, Generation, and Task fingerprint are consistent | PROVEN | M2 response Tree equals Git `HEAD^{tree}` and index metadata; Generation equals the same projection; identical Session input returns identical fingerprint, associations, items, and paths |
 | Engineering workflows preserve identity, privacy, and ambiguity | PROVEN | Two-Repository/multi-worktree tests execute scan→record→rebuild→explain→Task Pack; concurrent Writer calls produce unique server-owned IDs; unsafe paths, incomplete evidence, and secrets are rejected; ambiguous candidates are returned without selection |
@@ -111,7 +112,7 @@ Mandatory Gates #114/#117 are implemented: stable `submission_id` and exact clos
 
 #154 replaces the unlaunched #151/#152 persistence model: `task_artifact_focus` is a read-only ArtifactFocusQuery, Catalog supplies a request-local `ResolvedFocus`, and Search consumes only that value for the current Pack. Runtime owns no Focus state, and later Focus queries, ordinary `task_context`, MCP restart, Task switch, or compaction restore nothing. Repository Catalog remains local-only; team synchronization is not claimed.
 
-#157 exposes explicit AgentCheckpoint through MCP/CLI/Skill without Hook-authored Claims. #114/#117 connect Candidate writes to closed Episode verification, submission-idempotent Git admission, and malformed-Event isolation. #158 deterministically builds unassigned drafts at close and through an internal CLI retry; #163/#136 remain deferred.
+#157 exposes explicit AgentCheckpoint through MCP/CLI/Skill without Hook-authored Claims. #114/#117 connect Candidate writes to closed Episode verification, submission-idempotent Git admission, and malformed-Event isolation. #158 deterministically builds unassigned drafts at close and through an internal CLI retry. #163 lets verified PreCompact/TurnStop Hooks close only an already checkpointed Episode and invoke that same Builder; #136 remains deferred pending fresh approval.
 
 ## Residue gates
 
@@ -127,7 +128,7 @@ The M1–M3 gate searches product code, tests, fixtures, scripts, and docs (excl
 - caller-supplied RepositoryId, RepoRelativePath, ArtifactKey, Generation, Workspace, Hook or corroboration fields in `task_artifact_focus`.
 - persistent Focus records, Signal IDs, active/superseded Focus state, canonical Focus identities, Runtime Focus tables, and Focus fields in Task snapshots or fingerprints.
 - bare-string Capture IDs, raw transcript/command/tool-output fields in Capture/Observation state, or ownerless Capture ingestion;
-- public Candidate Builder tools and Hook calls that open/advance/checkpoint/ingest Episodes, all deferred to #158/#163.
+- Hook calls that open/checkpoint/ingest Episodes or derive Claims from summaries; implemented lifecycle automation may only advance ordered refs and close an already checkpointed Episode.
 
 Expected result: zero matches. Generic target-design language such as a proposed new Space Intent is not a Context-Propose API. `context_search` and its explicit `space_ids` hard filter are intentionally present.
 

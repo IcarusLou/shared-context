@@ -10,7 +10,7 @@
 
 本项目尚未上线，本文直接定义目标模型、接口和存储结构。
 
-### 1.1 当前实现状态（Mew #147）
+### 1.1 当前实现状态（Mew #163）
 
 本文的大部分章节描述目标架构，不代表代码已经全部实现。当前里程碑边界如下：
 
@@ -19,9 +19,9 @@
 | **M1：Task-first 领域与入口基础** | **已实现** | `TaskIntent` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；CLI/MCP 通过 `candidate_create` 创建无 Space Candidate；Candidate 不可自动注入 |
 | **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、严格 `task_intent_update` 与只读 `task_context` 已通过跨 crate/E2E 验收 |
 | **M3：Engineering Graph** | **已实现** | 稳定本机 Repository Catalog、可重建 Registry、Reference-derived 有界扫描、build-time immutable Context/safety snapshot、历史 Graph Retrieval、ContextRelation 1–2 跳及 MCP/CLI 工作流已通过固定跨 crate/E2E oracle |
-| **M4：Low-tax Capture** | **除自动聚合外已实现** | #117 与 #156–#162 已实现 WorkEpisode、Candidate Builder/analysis/Review、CandidateConfirmation/ContextSpaceAssociation 与可恢复原子 Writer/MCP；仅 #163 自动聚合尚未实现 |
+| **M4：Low-tax Capture** | **功能链已实现，最终验收待完成** | #117 与 #156–#163 已实现 WorkEpisode、显式 Checkpoint、Hook lifecycle boundary、Candidate Builder/analysis/Review、CandidateConfirmation/ContextSpaceAssociation 与可恢复原子 Writer/MCP；延期 #136 需重新人工批准，#164 负责最终 E2E Gate |
 
-当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订权威 TaskIntent，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示。PostToolUse 的 File observation 只形成带 Session/optional Task owner 的 redacted Capture Breadcrumb，可识别测试工具只形成非定位 TestOutcome；Hook 不运行 Git、Scanner、Registry sync、Graph rebuild、Focus 提交或 Episode open/ingest。显式 Graph 工具完成 bounded scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。当前 `candidate_create` 仍是手工、无归属的 M1 入口，不等同于 M4 自动 Capture。
+当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订权威 TaskIntent，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示。PostToolUse 的 File observation 只形成带 Session/optional Task owner 的 redacted Capture Breadcrumb，可识别测试工具只形成非定位 TestOutcome；Hook 不运行 Git discovery、Scanner、Registry sync、Graph rebuild、Focus 提交、Episode open/ingest，也不伪造 Claim。PreCompact/TurnStop 只能关闭已有 current-Intent Checkpoint 的 Episode 并调用共享 Builder。显式 Graph 工具完成 bounded scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。当前 `candidate_create` 仍是手工、无归属的 M1 入口，不等同于 M4 自动 Capture。
 
 ## 2. 背景与目标
 
@@ -932,7 +932,7 @@ WorkEpisode 聚合一次 Task 中的：
 - WorkEpisode 一 TaskSession 最多一个 Open 实例；open/read/list、显式 refs advance、normalized append、Capture ingestion、close preparation 和 source verification 使用 Episode version CAS。
 - `capture_ingestion.capture_id` 唯一；claim 与 Runtime commit 任一侧崩溃都可重试且不产生重复 Observation。
 - Catalog 只把 safe existing configured File hint 映射为 File ArtifactRef；unconfigured/unsafe path 保留 Capture source、summary 和 typed diagnostic，不猜 Repository。
-- Hook 只 Capture，不自动 open/advance/ingest Episode；#163 才拥有自动聚合触发。
+- Hook 只 Capture，不自动 open/ingest Episode，也不生成 Claim。#163 的 AutomatedEpisodeBoundary 只能在工作 Agent 已写入 current-Intent Checkpoint 后补齐 ordered refs、关闭 Episode 并调用共享 Builder。
 - `task_checkpoint` 由工作 Agent 显式提交 Task/Intent/Episode CAS、完整 Claims/Unknowns 和 typed refs；Runtime 在一个事务中 open/advance Episode、生成 inline Validation Observation、Claim/Checkpoint ID，并 continue 或 close。
 - `(episode_id, parent_episode_version)` 唯一约束配合完整语义 JSON 实现 timeout retry；相同内容返回原 Checkpoint，不同内容冲突，stale version 拒绝。Checkpoint 不生成 Candidate 或 Git Event。
 
@@ -1031,7 +1031,7 @@ sctx mcp serve --client cursor|codex
 | `engineering_reference_record` | 写知识事实 | 为已有 Context Revision 记录有证据的工程定位观察 |
 | `association_explain` | 只读 | 展示解析状态、证据、歧义候选和 Graph Paths，不代选 |
 | `association_rebuild` | 写派生状态 | 从 Git References 派生按 Repository 分组去重的 ScanPlan，并据此原子重建或诊断投影 |
-| `task_checkpoint` | 写本地状态；close 可写 Candidate Event | 提交结构化 Claim、Evidence Ref 和未知项；仅 close 触发确定性 Candidate Builder |
+| `task_checkpoint` | 写本地状态；close 或后续 verified lifecycle boundary 可写 Candidate Event | 提交结构化 Claim、Evidence Ref 和未知项；显式 close 或 Hook 对已持久 Checkpoint 的 close 触发同一确定性 Candidate Builder |
 | `candidate_list` | 读 | 查看当前 Task 自动生成的 Candidate |
 | `candidate_get` | 读 | 获取一个自动 Candidate 的完整、不可信 Review 内容 |
 | `candidate_discard` | 写本地状态 | 在 Task/Intent/Review CAS 下显式放弃 Pending Review；不写知识事实 |
@@ -1073,11 +1073,13 @@ Adapter 只翻译厂商 Payload。TaskIntent、Git Diff、代码扫描、检索�
 - SessionStart：仅注入系统能力说明；不得构造或执行空查询 Context Pack，也不注入任何知识项或假定 Space 摘要。
 - PromptSubmit：仅作为 PromptEnvelope 返回能力提示，不从 Prompt 文本构造 Intent 或 Signal；工作 Agent 显式调用 `task_intent_update`。
 - PostToolUse：保留 Breadcrumb；可识别 Test/Check/Lint 工具只合并非定位 TestOutcome。File Hint 不再写入工程 TaskSignal，也不会隐式发起 ArtifactFocusQuery；Prompt 前没有 Session 时不隐式创建，不保存原始 Tool Output、Transcript 或命令文本。
-- PreCompact：能力提示要求工作 Agent 显式提交完整 Checkpoint；Hook 不从摘要伪造 Claim。
-- TurnStop：能力提示要求工作 Agent 显式提交并按需要关闭 WorkEpisode；不自动触发 Candidate Builder。
-- SessionEnd：清理或延长未确认 Candidate TTL。
+- PreCompact：工作 Agent 先显式提交完整 current-Intent Checkpoint；Hook 不从摘要伪造 Claim，只在该 Checkpoint 存在时原子关闭 Episode 并调用共享 Candidate Builder。缺失或 stale Checkpoint 时 Episode 保持 Open，并返回修正提示。
+- TurnStop：执行同一 AutomatedEpisodeBoundary；重复、乱序和并发事件复用 Closed Episode 与稳定 Build/Submission/Candidate 身份。Builder 暂时失败时 Hook fail-open，后续重复事件或显式 CLI 可恢复。
+- SessionEnd：只清理过期 Capture/Review 状态，不关闭 Episode、不生成 Candidate。
 
 Agent Hook 不支持某事件时，通过 MCP 主动调用和 CLI 完成同一核心流程；能力差异只影响自动化程度，不改变领域模型。
+
+若工作 Agent 已成功提交 `continue` Checkpoint，但 Hook 随后缺失、fail-open 或结果不确定，则用同一个 `task_checkpoint` 提交 `boundary=close`、当前 Episode version 和空 Claims/Unknowns。Runtime 在 Task/Intent/Episode CAS 下关闭既有 Checkpoint并调用 Builder，不创建第二个 Checkpoint，也不要求重新填写认知。
 
 ## 14. Git Writer 与一致性
 
@@ -1356,9 +1358,9 @@ EngineeringResolutionSource {
 5. #136 实现必须将 maturity 与规范化 typed EvidenceSource 一起纳入 Revision 的持久内容、CAS 和幂等比较；完全相同的重试返回 `already_current`，不得新增 Revision。
 6. #156/#157 WorkEpisode Observation 与 AgentCheckpoint 已具备稳定 server ID、Task/Intent/Episode ownership、typed source、查询和固化规则；它们不自动成为 Grounded EvidenceSource，#136 仍延期。
 
-### M4：Low-tax Capture — #156/#157/#158/#159/#160 基础已实现，完整链路未实现
+### M4：Low-tax Capture — #156–#163 功能链已实现，#136/#164 Gate 待完成
 
-- WorkEpisode/Capture 显式持久 API和 AgentCheckpoint MCP/CLI/Skill 已实现；WorkEpisode 自动聚合（#163）尚未实现。
+- WorkEpisode/Capture 显式持久 API和 AgentCheckpoint MCP/CLI/Skill 已实现。PreCompact/TurnStop AutomatedEpisodeBoundary 只消费工作 Agent 已写入的 current-Intent Checkpoint，补齐 ordered refs、关闭 Episode 并调用共享 Builder；Adapter 不复制 Builder，SessionEnd 只清理 TTL。
 - Candidate Builder 与最小充分 Evidence 组装已实现：closed Episode 的每个充分 Claim 形成一个无 Space Draft；Inline Validation 原样复用，normalized Observation/Task Signal 转为 self-contained snapshot，Context Evidence 从一个 exact Index snapshot 复用；原始 Capture 不进 Git。
 - Builder 在 Git 前用 Runtime v8 固化 BuildId、Claim-scoped SubmissionId 和 content hash，#117 后回填 CandidateId/EventId；两个 crash window、语义重试和并发 close/build 均复用同一操作身份。缺 Claim、Unknown-only、Evidence 不充分为零 Git 写；kind 无 hint 固定 Discovery，topic 缺失保留 Unknown，不做关键词推断。
 - Candidate relationship assessment 与 Space 推荐已实现为 Runtime derived review state：只有完整 canonical draft equality 是 exact duplicate；same statement/different Evidence 是 supports；same topic 加 explicit Context 或 exact Artifact Graph 是 revises；topic/scope 不同 statement 只是 potential contradiction；纯 FTS 是 unresolved related；无候选才 novel。所有结果固定 Context/Graph generation、typed path、confidence、RRF/top-k/token budget 与 stable target tie。
@@ -1368,7 +1370,7 @@ EngineeringResolutionSource {
 - CandidateConfirmation 与 ContextSpaceAssociation 的领域/Event/Reducer/Index 契约已实现：确认 input 只选择 existing/new Primary、Related 与 field-level edits；事实闭包引用 exact Candidate、Revision、Association、causal Publish 和 final draft hash。Association 是独立因果 DAG，不写入 ContextRelation；初始确认仍强制 result Context 的嵌套 owner 等于 Primary，未来 correction 不改变当前 Search owner。
 - 一个 Candidate 的重复确认不论内容相同或不同都形成显式 conflict；Association 多 Head 同样显式 conflict。确认只验证其 causal Publication Event 为 exact Publish，后续 Withdraw/Supersede 不使历史 Confirmation 失效，当前检索继续服从现有 lifecycle。
 - TTL cleanup 只删除重型 Runtime analysis并保留 terminal Expired tombstone；后续 Builder retry不得重新初始化 Pending。Runtime v10 在 Git 前保留完整 ConfirmationPlan，GitStore 将 existing/new Primary 的4/5个事实写入一个 Journal/Commit，Index v11 重建 operation/plan/batch/commit mapping，Git-before-Runtime retry可恢复 Review Confirmed audit。
-- Candidate Confirm 只接受 existing Space 或 current proposed recommendation ID，不接受完整 new Intent 或生成 ID；Potential/ExactDuplicate assessment 可在明确人工调用下确认并在响应中回显 acknowledgment。PreCompact/TurnStop 自动写入/Builder 触发（#163）尚未实现；当前 Hook 仅给出显式 Checkpoint 能力提示。
+- Candidate Confirm 只接受 existing Space 或 current proposed recommendation ID，不接受完整 new Intent 或生成 ID；Potential/ExactDuplicate assessment 可在明确人工调用下确认并在响应中回显 acknowledgment。PreCompact/TurnStop 已接入幂等 Episode close/Builder 触发，但绝不自动 Checkpoint、Review、Discard 或 Confirm。
 - 当前显式 `candidate_create` 继续作为手工入口；自动 Builder 复用相同 #117 admission，并提供内部 CLI `candidate build-closed-episode` 重试边界。Review discovery不扫描该手工入口产生的 Git-only Candidate。
 - Mandatory Gate #117 已完成：一次创建操作携带稳定 `submission_id`，首次提交由服务端生成 `candidate_id`/`event_id`/路径并持久化 submission mapping；重试复用同一 `submission_id`。
 - 相同 `submission_id` 加相同权威内容返回原 Candidate；相同 `submission_id` 加不同内容返回 `IdempotencyKeyConflict`；不同 `submission_id` 创建新的 Candidate，即使完整草稿相同。语义相近去重属于知识聚合，不由幂等键处理。

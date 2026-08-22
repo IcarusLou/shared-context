@@ -16,10 +16,10 @@ use sctx_domain::{
     TestOutcomeStatus, WorkEpisodeStatus, WorkSourceRef,
 };
 use sctx_task_runtime::{
-    AgentCheckpointWrite, CandidateBuildItemPreparation, CandidateBuildItemStatus,
-    CandidateBuildStatus, CandidateReviewDiscard, CandidateReviewDiscardStatus, CaptureIngestion,
-    CheckpointBoundary, CheckpointClaimDraft, DEFAULT_CANDIDATE_REVIEW_TTL,
-    MAX_CANDIDATE_REVIEW_TTL, TaskRuntime, WorkEpisodeDiagnosticKind,
+    AgentCheckpointWrite, AutomatedEpisodeBoundary, CandidateBuildItemPreparation,
+    CandidateBuildItemStatus, CandidateBuildStatus, CandidateReviewDiscard,
+    CandidateReviewDiscardStatus, CaptureIngestion, CheckpointBoundary, CheckpointClaimDraft,
+    DEFAULT_CANDIDATE_REVIEW_TTL, MAX_CANDIDATE_REVIEW_TTL, TaskRuntime, WorkEpisodeDiagnosticKind,
 };
 use tempfile::TempDir;
 
@@ -332,6 +332,167 @@ fn checkpoint_is_atomic_semantically_idempotent_and_closes_without_hook_observat
         ErrorKind::InvalidInput,
         "Task switch must make the previous Checkpoint owner inactive"
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn lifecycle_boundary_requires_current_checkpoint_and_concurrent_retries_close_once() {
+    let temporary = TempDir::new().unwrap();
+    let runtime = Arc::new(TaskRuntime::initialize(temporary.path()).unwrap());
+    let missing = ExternalSessionLocator::new("codex", "lifecycle-missing").unwrap();
+    assert_eq!(
+        runtime.close_checkpointed_work_episode(&missing).unwrap(),
+        AutomatedEpisodeBoundary::NoActiveTask
+    );
+
+    let (locator, task) = open_task(&runtime, "lifecycle", "solidify checkpointed work");
+    assert!(matches!(
+        runtime.close_checkpointed_work_episode(&locator).unwrap(),
+        AutomatedEpisodeBoundary::NoEpisode {
+            task_session_id,
+            task_id,
+            ..
+        } if task_session_id == task.task_session_id && task_id == task.task_id
+    ));
+    let opened = runtime
+        .open_work_episode(
+            &locator,
+            task.task_id,
+            task.current_intent_revision().unwrap().revision_id,
+        )
+        .unwrap()
+        .episode;
+    assert!(matches!(
+        runtime.close_checkpointed_work_episode(&locator).unwrap(),
+        AutomatedEpisodeBoundary::CheckpointRequired { episode, .. }
+            if episode.episode.episode_id == opened.episode.episode_id
+    ));
+    let checkpoint = runtime
+        .write_agent_checkpoint(&checkpoint_write(
+            &locator,
+            &task,
+            0,
+            CheckpointBoundary::Continue,
+            vec![checkpoint_claim(
+                "Lifecycle automation reuses explicit cognition",
+            )],
+            Vec::new(),
+        ))
+        .unwrap();
+    runtime
+        .merge_signals(
+            task.task_session_id,
+            vec![TaskSignal {
+                kind: TaskSignalKind::Diff,
+                content: "the lifecycle implementation changed".to_owned(),
+            }],
+        )
+        .unwrap();
+    let barrier = Arc::new(Barrier::new(16));
+    let outcomes = (0..16)
+        .map(|_| {
+            let runtime = Arc::clone(&runtime);
+            let barrier = Arc::clone(&barrier);
+            let locator = locator.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                runtime.close_checkpointed_work_episode(&locator).unwrap()
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(
+                outcome,
+                AutomatedEpisodeBoundary::Closed {
+                    newly_closed: true,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    for outcome in outcomes {
+        let AutomatedEpisodeBoundary::Closed {
+            episode,
+            newly_closed: _,
+        } = outcome
+        else {
+            panic!("every concurrent lifecycle retry must observe the closed Episode");
+        };
+        assert_eq!(episode.episode.episode_id, opened.episode.episode_id);
+        assert_eq!(episode.episode.version, 2);
+        assert_eq!(episode.episode.signal_refs.len(), 2);
+        assert!(matches!(
+            episode.episode.status,
+            WorkEpisodeStatus::Closed { final_checkpoint_id }
+                if final_checkpoint_id == checkpoint.checkpoint.checkpoint_id
+        ));
+    }
+    assert!(matches!(
+        runtime
+            .close_checkpointed_work_episode_cas(
+                &locator,
+                task.task_id,
+                task.current_intent_revision().unwrap().revision_id,
+                1,
+            )
+            .unwrap(),
+        AutomatedEpisodeBoundary::Closed {
+            newly_closed: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        runtime
+            .close_checkpointed_work_episode_cas(
+                &locator,
+                task.task_id,
+                task.current_intent_revision().unwrap().revision_id,
+                0,
+            )
+            .unwrap_err()
+            .kind(),
+        ErrorKind::StaleState
+    );
+
+    let (stale_locator, stale_task) = open_task(
+        &runtime,
+        "lifecycle-stale",
+        "require current Intent checkpoint",
+    );
+    runtime
+        .write_agent_checkpoint(&checkpoint_write(
+            &stale_locator,
+            &stale_task,
+            0,
+            CheckpointBoundary::Continue,
+            vec![checkpoint_claim("The old Intent was checkpointed")],
+            Vec::new(),
+        ))
+        .unwrap();
+    runtime
+        .append_intent_revision(
+            stale_task.task_session_id,
+            stale_task.current_intent_revision().unwrap().revision_id,
+            intent(
+                stale_task.task_id,
+                "the revised Intent requires a new Checkpoint",
+            ),
+        )
+        .unwrap();
+    let required = runtime
+        .close_checkpointed_work_episode(&stale_locator)
+        .unwrap();
+    assert!(matches!(
+        required,
+        AutomatedEpisodeBoundary::CheckpointRequired { episode, .. }
+            if episode.episode.status == WorkEpisodeStatus::Open
+    ));
 }
 
 #[test]
