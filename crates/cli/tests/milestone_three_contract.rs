@@ -10,7 +10,8 @@ use sctx_domain::{
     Applicability, ArtifactKind, ContextGovernanceStatus, ContextId, ContextKind,
     ContextRelationKind, ContextRevisionDraft, EvidenceSnapshotDraft, EvidenceType,
     PublicationAction, PublicationDraft, ReferenceId, RepositoryIdentity, ResolutionStatus,
-    SpaceId, TaskIntent, TaskSignal, TaskSignalKind,
+    SignalId, SpaceId, TaskArtifactFocus, TaskArtifactFocusRecord, TaskId, TaskIntent,
+    TaskSessionId, TaskSignalLifecycle,
 };
 use sctx_engineering_graph::{
     EngineeringProjection, EngineeringProjectionStore, EngineeringReferenceResolver,
@@ -223,15 +224,15 @@ impl MilestoneThreeFixture {
 }
 
 fn task_request(
-    kind: TaskSignalKind,
-    content: &str,
+    focus: TaskArtifactFocus,
     mode: ContextPackMode,
     token_budget: usize,
     goal: &str,
 ) -> TaskContextRequest {
+    let task_id: TaskId = parse_id("tsk_00000000-0000-4000-8000-000000003801");
     TaskContextRequest {
         task_intent: TaskIntent {
-            task_id: parse_id("tsk_00000000-0000-4000-8000-000000003801"),
+            task_id,
             goal: goal.to_owned(),
             desired_change: format!("apply a verified change for {goal}"),
             in_scope: Vec::new(),
@@ -244,9 +245,13 @@ fn task_request(
             interfaces: Vec::new(),
             unknowns: Vec::new(),
         },
-        task_signals: vec![TaskSignal {
-            kind,
-            content: content.to_owned(),
+        task_signals: Vec::new(),
+        artifact_focuses: vec![TaskArtifactFocusRecord {
+            signal_id: SignalId::new(),
+            task_session_id: TaskSessionId::new(),
+            task_id,
+            focus,
+            lifecycle: TaskSignalLifecycle::Active,
         }],
         token_budget,
         max_spaces: 8,
@@ -386,8 +391,13 @@ fn fixed_multilanguage_oracle_marks_moves_and_renames_missing_and_rebuilds() {
     let moved_file_pack = fixture
         .engine()
         .task_context_pack(&task_request(
-            TaskSignalKind::File,
-            moved.new_path.as_deref().unwrap(),
+            TaskArtifactFocus {
+                repository_id: fixture.repository.repository_id,
+                locator: sctx_domain::ArtifactLocator::File {
+                    path: sctx_domain::RepoRelativePath::new(moved.new_path.as_deref().unwrap())
+                        .unwrap(),
+                },
+            },
             ContextPackMode::AutomaticInjection,
             fixture.oracle.expected.token_budget,
             "zxq moved implementation",
@@ -409,12 +419,14 @@ fn fixed_multilanguage_oracle_marks_moves_and_renames_missing_and_rebuilds() {
         .artifact
         .artifact_key
         .locator()
-        .canonical_key();
+        .clone();
     let renamed_symbol_pack = fixture
         .engine()
         .task_context_pack(&task_request(
-            TaskSignalKind::Symbol,
-            &renamed_locator,
+            TaskArtifactFocus {
+                repository_id: fixture.repository.repository_id,
+                locator: renamed_locator,
+            },
             ContextPackMode::AutomaticInjection,
             fixture.oracle.expected.token_budget,
             "zxr renamed implementation",
@@ -440,12 +452,14 @@ fn fixed_graph_oracle_opens_requirement_decision_contract_and_cross_platform_val
         .as_ref()
         .unwrap()
         .locator()
-        .canonical_key();
+        .clone();
     let pack = fixture
         .engine()
         .task_context_pack(&task_request(
-            TaskSignalKind::Symbol,
-            &symbol_signal,
+            TaskArtifactFocus {
+                repository_id: fixture.repository.repository_id,
+                locator: symbol_signal.clone(),
+            },
             ContextPackMode::AutomaticInjection,
             fixture.oracle.expected.token_budget,
             "zxq inspect current implementation",
@@ -488,10 +502,7 @@ fn fixed_graph_oracle_opens_requirement_decision_contract_and_cross_platform_val
     }
     assert_cycle_safe_and_bounded(&pack);
 
-    for (signal_kind, reference_name) in [
-        (TaskSignalKind::Api, "api"),
-        (TaskSignalKind::Schema, "schema"),
-    ] {
+    for reference_name in ["api", "schema"] {
         let exact_signal = fixture
             .reference(reference_name)
             .resolution
@@ -499,12 +510,14 @@ fn fixed_graph_oracle_opens_requirement_decision_contract_and_cross_platform_val
             .as_ref()
             .unwrap()
             .locator()
-            .canonical_key();
+            .clone();
         let cross_end = fixture
             .engine()
             .task_context_pack(&task_request(
-                signal_kind,
-                &exact_signal,
+                TaskArtifactFocus {
+                    repository_id: fixture.repository.repository_id,
+                    locator: exact_signal,
+                },
                 ContextPackMode::AutomaticInjection,
                 fixture.oracle.expected.token_budget,
                 "zxs opaque route",
@@ -529,8 +542,10 @@ fn fixed_graph_oracle_opens_requirement_decision_contract_and_cross_platform_val
     }
 
     let mut bounded_request = task_request(
-        TaskSignalKind::Symbol,
-        &symbol_signal,
+        TaskArtifactFocus {
+            repository_id: fixture.repository.repository_id,
+            locator: symbol_signal,
+        },
         ContextPackMode::AutomaticInjection,
         fixture.oracle.expected.bounded_token_budget,
         "zxt budget graph output",
@@ -557,13 +572,15 @@ fn ambiguous_and_unavailable_edges_diagnose_or_fall_back_without_automatic_graph
     assert_eq!(ambiguous.resolution.status, ResolutionStatus::Ambiguous);
     assert_eq!(ambiguous.resolution.candidates.len(), 1);
     assert!(ambiguous.association.is_none());
-    let ambiguous_signal = ambiguous.resolution.candidates[0].locator().canonical_key();
+    let ambiguous_locator = ambiguous.resolution.candidates[0].locator().clone();
 
     let explicit = fixture
         .engine()
         .task_context_pack(&task_request(
-            TaskSignalKind::Symbol,
-            &ambiguous_signal,
+            TaskArtifactFocus {
+                repository_id: fixture.repository.repository_id,
+                locator: ambiguous_locator.clone(),
+            },
             ContextPackMode::Explicit,
             fixture.oracle.expected.token_budget,
             "ambiguous Symbol association",
@@ -582,8 +599,10 @@ fn ambiguous_and_unavailable_edges_diagnose_or_fall_back_without_automatic_graph
     let automatic = fixture
         .engine()
         .task_context_pack(&task_request(
-            TaskSignalKind::Symbol,
-            &ambiguous_signal,
+            TaskArtifactFocus {
+                repository_id: fixture.repository.repository_id,
+                locator: ambiguous_locator,
+            },
             ContextPackMode::AutomaticInjection,
             fixture.oracle.expected.token_budget,
             "zxu no textual fallback",
@@ -636,8 +655,26 @@ fn ambiguous_and_unavailable_edges_diagnose_or_fall_back_without_automatic_graph
     let fallback = fixture
         .engine()
         .task_context_pack(&task_request(
-            TaskSignalKind::Symbol,
-            "openSearchResults",
+            TaskArtifactFocus {
+                repository_id: fixture.repository.repository_id,
+                locator: fixture
+                    .projection
+                    .references
+                    .iter()
+                    .find(|reference| {
+                        reference.reference_id
+                            == parse_id::<ReferenceId>(
+                                &fixture.oracle.expected.references["symbol"],
+                            )
+                    })
+                    .unwrap()
+                    .resolution
+                    .resolved_artifact
+                    .as_ref()
+                    .unwrap()
+                    .locator()
+                    .clone(),
+            },
             ContextPackMode::AutomaticInjection,
             fixture.oracle.expected.token_budget,
             "frontend renders SearchEnvelopeClient",
@@ -770,19 +807,21 @@ fn adapter_injects_frozen_safe_revision_after_current_revision_is_withdrawn() {
             if revision_id == current_revision
     ));
 
-    let signal = fixture
+    let locator = fixture
         .reference("symbol")
         .resolution
         .resolved_artifact
         .as_ref()
         .unwrap()
         .locator()
-        .canonical_key();
+        .clone();
     let pack = fixture
         .engine()
         .task_context_pack(&task_request(
-            TaskSignalKind::Symbol,
-            &signal,
+            TaskArtifactFocus {
+                repository_id: fixture.repository.repository_id,
+                locator,
+            },
             ContextPackMode::AutomaticInjection,
             fixture.oracle.expected.token_budget,
             "opaque historical graph injection",

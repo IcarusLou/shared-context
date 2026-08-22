@@ -9,7 +9,8 @@ use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value as 
 use sctx_domain::{
     Applicability, ArtifactAssociationKind, ArtifactKey, ArtifactKind, ContextId, ContextKind,
     ContextRelationKind, EvidenceId, EvidenceType, ReferenceId, RepositoryId, ResolutionStatus,
-    RevisionId, SpaceId, TaskId, TaskIntent, TaskSignal, TaskSignalKind, TaskSpaceAssociation,
+    RevisionId, SignalId, SpaceId, TaskArtifactFocus, TaskArtifactFocusRecord, TaskId, TaskIntent,
+    TaskSignal, TaskSignalKind, TaskSignalLifecycle, TaskSpaceAssociation,
 };
 use sctx_engineering_graph::{
     EngineeringProjection, EngineeringProjectionSnapshot, EngineeringProjectionStore,
@@ -248,6 +249,7 @@ pub struct TaskSpaceAssociationsResponse {
 pub struct TaskContextRequest {
     pub task_intent: TaskIntent,
     pub task_signals: Vec<TaskSignal>,
+    pub artifact_focuses: Vec<TaskArtifactFocusRecord>,
     pub token_budget: usize,
     pub max_spaces: usize,
     pub candidate_limit: usize,
@@ -264,11 +266,24 @@ impl TaskContextRequest {
         Self {
             task_intent,
             task_signals,
+            artifact_focuses: Vec::new(),
             token_budget,
             max_spaces: DEFAULT_TASK_MAX_SPACES,
             candidate_limit: DEFAULT_CANDIDATE_LIMIT,
             mode: ContextPackMode::AutomaticInjection,
         }
+    }
+
+    #[must_use]
+    pub fn automatic_with_focus(
+        task_intent: TaskIntent,
+        task_signals: Vec<TaskSignal>,
+        artifact_focuses: Vec<TaskArtifactFocusRecord>,
+        token_budget: usize,
+    ) -> Self {
+        let mut request = Self::automatic(task_intent, task_signals, token_budget);
+        request.artifact_focuses = artifact_focuses;
+        request
     }
 }
 
@@ -292,7 +307,6 @@ pub enum IntentScopeConflictPolicy {
 pub struct IntentScopeConflictExplanation {
     pub kind: IntentScopeConflictKind,
     pub matched_tokens: Vec<String>,
-    pub matched_task_signals: Vec<String>,
     pub policy: IntentScopeConflictPolicy,
     pub score_multiplier_basis_points: u16,
 }
@@ -388,11 +402,11 @@ pub struct TaskAssociationFusionExplanation {
     pub final_score_basis_points: u16,
 }
 
-/// One exact Task Signal to current Engineering Artifact and Context association.
+/// One exact active Artifact Focus to a historical Engineering Artifact association.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GraphArtifactRetrievalPath {
-    pub task_signal_kind: TaskSignalKind,
-    pub task_signal_content: String,
+    pub focus_signal_id: SignalId,
+    pub focus: TaskArtifactFocus,
     pub repository_id: RepositoryId,
     pub artifact_key: ArtifactKey,
     pub artifact_kind: ArtifactKind,
@@ -421,14 +435,29 @@ pub struct ContextRelationRetrievalPath {
 /// Explicit-only diagnostic for an Artifact edge that was not safe to resolve.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GraphResolutionDiagnosticPath {
-    pub task_signal_kind: TaskSignalKind,
-    pub task_signal_content: String,
+    pub focus_signal_id: SignalId,
+    pub focus: TaskArtifactFocus,
     pub repository_id: RepositoryId,
     pub reference_id: ReferenceId,
     pub resolution_status: ResolutionStatus,
     pub candidate_artifact_keys: Vec<ArtifactKey>,
     pub match_bases: Vec<MatchBasis>,
     pub artifact_generation: String,
+}
+
+/// Why an active Focus produced no exact node in the selected Graph snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskGraphDiagnosticKind {
+    ArtifactNotReachableInGraph,
+}
+
+/// Budgeted Task-level Graph diagnostic that makes zero-result semantics explicit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskGraphDiagnostic {
+    pub kind: TaskGraphDiagnosticKind,
+    pub focus_signal_id: SignalId,
+    pub focus: TaskArtifactFocus,
 }
 
 /// Explainable route from the Task to one returned Context.
@@ -482,6 +511,7 @@ pub struct TaskContextPack {
     pub mode: ContextPackMode,
     pub associations: Vec<TaskSpaceAssociation>,
     pub items: Vec<TaskContextItem>,
+    pub graph_diagnostics: Vec<TaskGraphDiagnostic>,
     pub omitted: Vec<ContextPackOmitted>,
 }
 
@@ -636,11 +666,26 @@ impl SearchEngine {
         intent: &TaskIntent,
         signals: &[TaskSignal],
     ) -> Result<TaskSpaceAssociationsResponse> {
+        self.task_space_associations_with_focus(intent, signals, &[])
+    }
+
+    /// Infers associations while consuming only active structured Artifact Focuses
+    /// as Engineering Graph seeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input error for invalid or mixed-task Focus records.
+    pub fn task_space_associations_with_focus(
+        &self,
+        intent: &TaskIntent,
+        signals: &[TaskSignal],
+        artifact_focuses: &[TaskArtifactFocusRecord],
+    ) -> Result<TaskSpaceAssociationsResponse> {
         intent.validate()?;
         TaskSignal::validate_collection(signals)?;
+        validate_active_artifact_focuses(intent.task_id, artifact_focuses)?;
         let query_tokens = association_query_tokens(intent, signals);
         let query_phrases = task_query_phrases(intent, signals, false);
-        let artifact_hints = artifact_hints(signals);
         let scope_targets = ScopeTargets::from_intent(intent);
         for _attempt in 0..3 {
             let graph_snapshot = self.read_graph_snapshot();
@@ -651,9 +696,8 @@ impl SearchEngine {
                     intent.task_id,
                     &query_tokens,
                     &query_phrases,
-                    &artifact_hints,
                     &scope_targets,
-                    signals,
+                    artifact_focuses,
                     graph,
                     graph_snapshot
                         .as_ref()
@@ -688,10 +732,13 @@ impl SearchEngine {
     /// storage errors propagated by index synchronization and snapshot reads.
     pub fn task_context_pack(&self, request: &TaskContextRequest) -> Result<TaskContextPack> {
         validate_task_context_request(request)?;
-        let fingerprint = task_fingerprint(&request.task_intent, &request.task_signals)?;
+        let fingerprint = task_fingerprint(
+            &request.task_intent,
+            &request.task_signals,
+            &request.artifact_focuses,
+        )?;
         let query_tokens = association_query_tokens(&request.task_intent, &request.task_signals);
         let query_phrases = task_query_phrases(&request.task_intent, &request.task_signals, false);
-        let artifact_hints = artifact_hints(&request.task_signals);
         let scope_targets = ScopeTargets::from_intent(&request.task_intent);
         for _attempt in 0..3 {
             let graph_snapshot = self.read_graph_snapshot();
@@ -702,9 +749,8 @@ impl SearchEngine {
                     request.task_intent.task_id,
                     &query_tokens,
                     &query_phrases,
-                    &artifact_hints,
                     &scope_targets,
-                    &request.task_signals,
+                    &request.artifact_focuses,
                     graph,
                     graph_snapshot
                         .as_ref()
@@ -727,10 +773,15 @@ impl SearchEngine {
                     request.mode,
                     request.candidate_limit,
                 )?;
+                let graph_diagnostics = artifact_focus_diagnostics(
+                    &request.artifact_focuses,
+                    &inference.reachable_focus_ids,
+                );
                 Ok(pack_task_context_candidates(
                     candidates,
                     request.token_budget,
                     inference,
+                    graph_diagnostics,
                     omitted_spaces,
                     omitted_space_tokens,
                 ))
@@ -753,6 +804,7 @@ impl SearchEngine {
                 mode: request.mode,
                 associations: snapshot.data.associations,
                 items: snapshot.data.items,
+                graph_diagnostics: snapshot.data.graph_diagnostics,
                 omitted: snapshot.data.omitted,
             });
         }
@@ -878,12 +930,7 @@ fn task_query_tokens(intent: &TaskIntent, signals: &[TaskSignal]) -> Vec<String>
     .flat_map(|values| values.iter().map(String::as_str));
     let signal_text = signals
         .iter()
-        .filter(|signal| {
-            !matches!(
-                signal.kind,
-                TaskSignalKind::Workspace | TaskSignalKind::Repository
-            )
-        })
+        .filter(|signal| matches!(signal.kind, TaskSignalKind::Prompt | TaskSignalKind::Diff))
         .map(|signal| signal.content.as_str());
     [intent.goal.as_str(), intent.desired_change.as_str()]
         .into_iter()
@@ -1148,13 +1195,6 @@ fn explain_intent_match<const N: usize>(
         .collect()
 }
 
-#[derive(Clone, Debug)]
-struct ArtifactHint {
-    label: String,
-    kind: TaskSignalKind,
-    content: String,
-}
-
 #[derive(Debug, Default)]
 struct ScopeTargets {
     domains: BTreeSet<String>,
@@ -1258,34 +1298,7 @@ struct TaskAssociationInference {
     graph_contexts: BTreeMap<GraphContextKey, GraphContextEvidence>,
     graph_context_tree_oid: Option<String>,
     graph_artifact_generation: Option<String>,
-}
-
-fn artifact_hints(signals: &[TaskSignal]) -> Vec<ArtifactHint> {
-    signals
-        .iter()
-        .filter_map(|signal| {
-            let kind = artifact_kind(signal.kind)?;
-            (!signal.content.trim().is_empty()).then(|| ArtifactHint {
-                label: format!("{kind}:{}", signal.content),
-                kind: signal.kind,
-                content: signal.content.clone(),
-            })
-        })
-        .collect()
-}
-
-const fn artifact_kind(kind: TaskSignalKind) -> Option<&'static str> {
-    match kind {
-        TaskSignalKind::File => Some("file"),
-        TaskSignalKind::Symbol => Some("symbol"),
-        TaskSignalKind::Api => Some("api"),
-        TaskSignalKind::Schema => Some("schema"),
-        TaskSignalKind::Test => Some("test"),
-        TaskSignalKind::Prompt
-        | TaskSignalKind::Workspace
-        | TaskSignalKind::Repository
-        | TaskSignalKind::Diff => None,
-    }
+    reachable_focus_ids: BTreeSet<SignalId>,
 }
 
 fn normalized_values(values: &[String]) -> BTreeSet<String> {
@@ -1301,9 +1314,8 @@ fn infer_task_space_associations(
     task_id: TaskId,
     query_tokens: &[String],
     query_phrases: &[String],
-    artifact_hints: &[ArtifactHint],
     scope_targets: &ScopeTargets,
-    task_signals: &[TaskSignal],
+    artifact_focuses: &[TaskArtifactFocusRecord],
     engineering_graph: Option<&EngineeringProjection>,
     graph_context_tree_oid: Option<&str>,
     mode: ContextPackMode,
@@ -1312,14 +1324,10 @@ fn infer_task_space_associations(
     let mut contexts =
         query_accepted_context_evidence(connection, query_tokens, query_phrases, scope_targets)?;
     let mut graph_contexts = BTreeMap::new();
+    let mut reachable_focus_ids = BTreeSet::new();
     if let Some(graph) = engineering_graph {
-        query_graph_context_evidence(
-            graph,
-            artifact_hints,
-            task_signals,
-            mode,
-            &mut graph_contexts,
-        );
+        reachable_focus_ids =
+            query_graph_context_evidence(graph, artifact_focuses, mode, &mut graph_contexts);
         expand_graph_context_relation_evidence(graph, mode, &mut graph_contexts)?;
     }
     expand_current_context_relation_evidence(connection, mode, &mut contexts)?;
@@ -1355,6 +1363,7 @@ fn infer_task_space_associations(
         graph_contexts,
         graph_context_tree_oid: graph_context_tree_oid.map(ToOwned::to_owned),
         graph_artifact_generation: engineering_graph.map(|graph| graph.artifact_generation.clone()),
+        reachable_focus_ids,
     })
 }
 
@@ -1531,50 +1540,31 @@ fn query_accepted_context_evidence(
 #[allow(clippy::too_many_lines)]
 fn query_graph_context_evidence(
     graph: &EngineeringProjection,
-    artifact_hints: &[ArtifactHint],
-    task_signals: &[TaskSignal],
+    artifact_focuses: &[TaskArtifactFocusRecord],
     mode: ContextPackMode,
     contexts: &mut BTreeMap<GraphContextKey, GraphContextEvidence>,
-) {
-    let repository_ids = task_signals
-        .iter()
-        .filter(|signal| signal.kind == TaskSignalKind::Repository)
-        .filter_map(|signal| RepositoryId::from_str(signal.content.trim()).ok())
-        .collect::<BTreeSet<_>>();
+) -> BTreeSet<SignalId> {
+    let mut reachable = BTreeSet::new();
     for resolved in &graph.references {
-        if !repository_ids.is_empty()
-            && !repository_ids.contains(&resolved.resolution.repository_id)
-        {
-            continue;
-        }
         let candidates = resolved
             .resolution
             .resolved_artifact
             .iter()
             .chain(resolved.resolution.candidates.iter())
             .collect::<Vec<_>>();
-        let matches = artifact_hints
+        let matches = artifact_focuses
             .iter()
-            .filter_map(|hint| {
+            .filter_map(|record| {
                 candidates
                     .iter()
-                    .find(|artifact| task_signal_matches_artifact(hint, artifact))
-                    .map(|artifact| (hint, *artifact))
+                    .find(|artifact| focus_matches_artifact(&record.focus, artifact))
+                    .map(|artifact| (record, *artifact))
             })
             .collect::<Vec<_>>();
-        let repository_diagnostics = task_signals
-            .iter()
-            .filter(|signal| {
-                signal.kind == TaskSignalKind::Repository
-                    && normalize_artifact_identity(&signal.content)
-                        == normalize_artifact_identity(
-                            &resolved.resolution.repository_id.to_string(),
-                        )
-            })
-            .collect::<Vec<_>>();
-        if matches.is_empty() && repository_diagnostics.is_empty() {
+        if matches.is_empty() {
             continue;
         }
+        reachable.extend(matches.iter().map(|(record, _)| record.signal_id));
         let Some(snapshot) = graph.contexts.iter().find(|snapshot| {
             snapshot.context_id == resolved.context_id
                 && snapshot.revision.revision_id == resolved.revision_id
@@ -1602,10 +1592,10 @@ fn query_graph_context_evidence(
             else {
                 continue;
             };
-            for (hint, artifact) in matches {
+            for (record, artifact) in matches {
                 let path = GraphArtifactRetrievalPath {
-                    task_signal_kind: hint.kind,
-                    task_signal_content: hint.content.clone(),
+                    focus_signal_id: record.signal_id,
+                    focus: record.focus.clone(),
                     repository_id: artifact.repository_id(),
                     artifact_key: artifact.clone(),
                     artifact_kind: artifact.kind(),
@@ -1629,7 +1619,7 @@ fn query_graph_context_evidence(
                 context
                     .evidence
                     .matched_artifacts
-                    .insert(hint.label.clone());
+                    .insert(record.focus.canonical_identity());
                 context
                     .evidence
                     .graph_paths
@@ -1639,16 +1629,7 @@ fn query_graph_context_evidence(
                     });
             }
         } else if mode == ContextPackMode::Explicit {
-            let diagnostics = matches
-                .iter()
-                .map(|(hint, _artifact)| (hint.kind, hint.content.as_str()))
-                .chain(
-                    repository_diagnostics
-                        .iter()
-                        .map(|signal| (signal.kind, signal.content.as_str())),
-                )
-                .collect::<Vec<_>>();
-            for (signal_kind, signal_content) in diagnostics {
+            for (record, _artifact) in matches {
                 let mut bases = resolved
                     .evidence
                     .iter()
@@ -1666,8 +1647,8 @@ fn query_graph_context_evidence(
                     .graph_paths
                     .push(TaskRetrievalPath::GraphDiagnostic {
                         diagnostic: GraphResolutionDiagnosticPath {
-                            task_signal_kind: signal_kind,
-                            task_signal_content: signal_content.to_owned(),
+                            focus_signal_id: record.signal_id,
+                            focus: record.focus.clone(),
                             repository_id: resolved.resolution.repository_id,
                             reference_id: resolved.reference_id,
                             resolution_status: resolved.resolution.status,
@@ -1685,6 +1666,7 @@ fn query_graph_context_evidence(
     for context in contexts.values_mut() {
         sort_dedup_paths(&mut context.evidence.graph_paths);
     }
+    reachable
 }
 
 fn current_context_space(
@@ -1716,35 +1698,8 @@ fn current_context_space(
         .transpose()
 }
 
-fn task_signal_matches_artifact(hint: &ArtifactHint, artifact: &ArtifactKey) -> bool {
-    if task_signal_artifact_kind(hint.kind) != Some(artifact.kind()) {
-        return false;
-    }
-    hint.content.trim() == artifact.locator().canonical_key()
-}
-
-const fn task_signal_artifact_kind(kind: TaskSignalKind) -> Option<ArtifactKind> {
-    match kind {
-        TaskSignalKind::File => Some(ArtifactKind::File),
-        TaskSignalKind::Symbol => Some(ArtifactKind::Symbol),
-        TaskSignalKind::Api => Some(ArtifactKind::Api),
-        TaskSignalKind::Schema => Some(ArtifactKind::Schema),
-        TaskSignalKind::Test => Some(ArtifactKind::Test),
-        TaskSignalKind::Prompt
-        | TaskSignalKind::Workspace
-        | TaskSignalKind::Repository
-        | TaskSignalKind::Diff => None,
-    }
-}
-
-fn normalize_artifact_identity(value: &str) -> String {
-    value
-        .trim()
-        .replace('\\', "/")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
+fn focus_matches_artifact(focus: &TaskArtifactFocus, artifact: &ArtifactKey) -> bool {
+    focus.repository_id == artifact.repository_id() && &focus.locator == artifact.locator()
 }
 
 fn context_artifact_association_id(
@@ -2548,7 +2503,6 @@ fn intent_scope_conflict(evidence: &AssociationEvidence) -> Option<IntentScopeCo
     has_intent_scope_conflict(evidence).then(|| IntentScopeConflictExplanation {
         kind: IntentScopeConflictKind::ContextSpaceOutOfScope,
         matched_tokens: evidence.excluded_intent_tokens.iter().cloned().collect(),
-        matched_task_signals: Vec::new(),
         policy: IntentScopeConflictPolicy::PenalizeAssociation,
         score_multiplier_basis_points: SCOPE_CONFLICT_SCORE_MULTIPLIER_BASIS_POINTS,
     })
@@ -2659,12 +2613,29 @@ struct PackedTaskContexts {
     estimated_tokens: usize,
     associations: Vec<TaskSpaceAssociation>,
     items: Vec<TaskContextItem>,
+    graph_diagnostics: Vec<TaskGraphDiagnostic>,
     omitted: Vec<ContextPackOmitted>,
+}
+
+fn artifact_focus_diagnostics(
+    records: &[TaskArtifactFocusRecord],
+    reachable: &BTreeSet<SignalId>,
+) -> Vec<TaskGraphDiagnostic> {
+    records
+        .iter()
+        .filter(|record| !reachable.contains(&record.signal_id))
+        .map(|record| TaskGraphDiagnostic {
+            kind: TaskGraphDiagnosticKind::ArtifactNotReachableInGraph,
+            focus_signal_id: record.signal_id,
+            focus: record.focus.clone(),
+        })
+        .collect()
 }
 
 fn validate_task_context_request(request: &TaskContextRequest) -> Result<()> {
     request.task_intent.validate()?;
     TaskSignal::validate_collection(&request.task_signals)?;
+    validate_active_artifact_focuses(request.task_intent.task_id, &request.artifact_focuses)?;
     if request.token_budget < MIN_TASK_CONTEXT_TOKEN_BUDGET {
         return Err(invalid(format!(
             "task context token_budget must be at least {MIN_TASK_CONTEXT_TOKEN_BUDGET}"
@@ -2683,7 +2654,40 @@ fn validate_task_context_request(request: &TaskContextRequest) -> Result<()> {
     Ok(())
 }
 
-fn task_fingerprint(intent: &TaskIntent, signals: &[TaskSignal]) -> Result<String> {
+fn validate_active_artifact_focuses(
+    task_id: TaskId,
+    records: &[TaskArtifactFocusRecord],
+) -> Result<()> {
+    let mut signal_ids = BTreeSet::new();
+    let mut focuses = BTreeSet::new();
+    let mut task_session_id = None;
+    for record in records {
+        if record.task_id != task_id || record.lifecycle != TaskSignalLifecycle::Active {
+            return Err(invalid(
+                "Task Context accepts only active Artifact Focuses owned by its Task",
+            ));
+        }
+        record.focus.validate()?;
+        if task_session_id.is_some_and(|owner| owner != record.task_session_id) {
+            return Err(invalid(
+                "Task Context Artifact Focuses must share one Task Session",
+            ));
+        }
+        task_session_id = Some(record.task_session_id);
+        if !signal_ids.insert(record.signal_id) || !focuses.insert(record.focus.clone()) {
+            return Err(invalid(
+                "Task Context Artifact Focuses must not contain duplicates",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn task_fingerprint(
+    intent: &TaskIntent,
+    signals: &[TaskSignal],
+    artifact_focuses: &[TaskArtifactFocusRecord],
+) -> Result<String> {
     let mut intent = intent.clone();
     for values in [
         &mut intent.in_scope,
@@ -2700,11 +2704,7 @@ fn task_fingerprint(intent: &TaskIntent, signals: &[TaskSignal]) -> Result<Strin
     }
     let mut signals = signals
         .iter()
-        .filter(|signal| {
-            signal.kind != TaskSignalKind::Workspace
-                && (signal.kind != TaskSignalKind::Repository
-                    || RepositoryId::from_str(signal.content.trim()).is_ok())
-        })
+        .filter(|signal| signal.kind != TaskSignalKind::Workspace)
         .cloned()
         .collect::<Vec<_>>();
     signals.sort_by(|left, right| {
@@ -2712,7 +2712,11 @@ fn task_fingerprint(intent: &TaskIntent, signals: &[TaskSignal]) -> Result<Strin
             .cmp(signal_kind_name(right.kind))
             .then_with(|| left.content.cmp(&right.content))
     });
-    let bytes = serde_json::to_vec(&(intent, signals))
+    let focuses = artifact_focuses
+        .iter()
+        .map(|record| record.focus.canonical_identity())
+        .collect::<BTreeSet<_>>();
+    let bytes = serde_json::to_vec(&(intent, signals, focuses))
         .map_err(|error| invalid(format!("serialize Task fingerprint: {error}")))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
@@ -2721,13 +2725,8 @@ const fn signal_kind_name(kind: TaskSignalKind) -> &'static str {
     match kind {
         TaskSignalKind::Prompt => "prompt",
         TaskSignalKind::Workspace => "workspace",
-        TaskSignalKind::Repository => "repository",
-        TaskSignalKind::File => "file",
-        TaskSignalKind::Symbol => "symbol",
         TaskSignalKind::Diff => "diff",
-        TaskSignalKind::Api => "api",
-        TaskSignalKind::Schema => "schema",
-        TaskSignalKind::Test => "test",
+        TaskSignalKind::TestOutcome => "test_outcome",
     }
 }
 
@@ -3134,6 +3133,7 @@ fn pack_task_context_candidates(
     loaded: LoadedTaskContexts,
     token_budget: usize,
     inference: TaskAssociationInference,
+    mut graph_diagnostics: Vec<TaskGraphDiagnostic>,
     omitted_space_count: usize,
     omitted_space_tokens: usize,
 ) -> PackedTaskContexts {
@@ -3156,16 +3156,28 @@ fn pack_task_context_candidates(
     let mut detail_omitted = OmissionAggregate::default();
     let mut item_omitted = OmissionAggregate::default();
     let mut space_omitted = OmissionAggregate::default();
+    let mut diagnostic_omitted = OmissionAggregate::default();
 
     loop {
-        let current_omitted =
-            task_budget_omissions(&omitted, detail_omitted, item_omitted, space_omitted);
-        let estimated_tokens = charged_task_context_tokens(&associations, &items, &current_omitted);
+        let current_omitted = task_budget_omissions(
+            &omitted,
+            detail_omitted,
+            item_omitted,
+            space_omitted,
+            diagnostic_omitted,
+        );
+        let estimated_tokens = charged_task_context_tokens(
+            &associations,
+            &items,
+            &graph_diagnostics,
+            &current_omitted,
+        );
         if estimated_tokens <= token_budget {
             return PackedTaskContexts {
                 estimated_tokens,
                 associations,
                 items,
+                graph_diagnostics,
                 omitted: current_omitted,
             };
         }
@@ -3197,6 +3209,11 @@ fn pack_task_context_candidates(
             continue;
         }
 
+        if let Some(diagnostic) = graph_diagnostics.pop() {
+            diagnostic_omitted.add(serialized_tokens(&diagnostic));
+            continue;
+        }
+
         let count = current_omitted.iter().map(|item| item.count).sum();
         let compact = vec![ContextPackOmitted {
             context_id: None,
@@ -3209,9 +3226,10 @@ fn pack_task_context_candidates(
             count,
         }];
         return PackedTaskContexts {
-            estimated_tokens: charged_task_context_tokens(&[], &[], &compact),
+            estimated_tokens: charged_task_context_tokens(&[], &[], &[], &compact),
             associations: Vec::new(),
             items: Vec::new(),
+            graph_diagnostics: Vec::new(),
             omitted: compact,
         };
     }
@@ -3235,12 +3253,14 @@ fn task_budget_omissions(
     detail: OmissionAggregate,
     item: OmissionAggregate,
     space: OmissionAggregate,
+    diagnostic: OmissionAggregate,
 ) -> Vec<ContextPackOmitted> {
     let mut omitted = base.to_vec();
     for (reason, aggregate) in [
         ("detail_token_budget", detail),
         ("item_token_budget", item),
         ("space_token_budget", space),
+        ("diagnostic_token_budget", diagnostic),
     ] {
         if aggregate.count > 0 {
             omitted.push(ContextPackOmitted {
@@ -3258,11 +3278,13 @@ fn task_budget_omissions(
 fn charged_task_context_tokens(
     associations: &[TaskSpaceAssociation],
     items: &[TaskContextItem],
+    graph_diagnostics: &[TaskGraphDiagnostic],
     omitted: &[ContextPackOmitted],
 ) -> usize {
     TASK_CONTEXT_ENVELOPE_TOKEN_RESERVE.saturating_add(serialized_tokens(&(
         associations,
         items,
+        graph_diagnostics,
         omitted,
     )))
 }
@@ -3270,7 +3292,12 @@ fn charged_task_context_tokens(
 /// Recomputes the charged Association, item/path, omission, and deterministic envelope reserve.
 #[must_use]
 pub fn estimate_task_context_payload_tokens(pack: &TaskContextPack) -> usize {
-    charged_task_context_tokens(&pack.associations, &pack.items, &pack.omitted)
+    charged_task_context_tokens(
+        &pack.associations,
+        &pack.items,
+        &pack.graph_diagnostics,
+        &pack.omitted,
+    )
 }
 
 #[derive(Debug)]

@@ -6,8 +6,9 @@ use std::{
 };
 
 use sctx_domain::{
-    Applicability, ContextId, ContextKind, ContextRevisionDraft, EvidenceSnapshotDraft,
-    EvidenceType, IntentSnapshot, PublicationAction, PublicationDraft, RevisionId, SpaceId, TaskId,
+    Applicability, ArtifactLocator, ContextId, ContextKind, ContextRevisionDraft,
+    EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, PublicationAction, PublicationDraft,
+    RepoRelativePath, RepositoryId, RevisionId, SpaceId, TaskArtifactFocus, TaskId,
     TaskIntentDraft, TaskSignal, TaskSignalKind, WorkEpisodeId,
 };
 use sctx_event_schema::{Event, EventPayload};
@@ -698,7 +699,7 @@ fn different_sessions_with_the_same_workspace_signal_remain_isolated() {
                     content: "/work/shared".to_owned(),
                 },
                 TaskSignal {
-                    kind: TaskSignalKind::File,
+                    kind: TaskSignalKind::Diff,
                     content: "web/Search.tsx".to_owned(),
                 },
             ],
@@ -713,7 +714,7 @@ fn different_sessions_with_the_same_workspace_signal_remain_isolated() {
                     content: "/work/shared".to_owned(),
                 },
                 TaskSignal {
-                    kind: TaskSignalKind::Api,
+                    kind: TaskSignalKind::Diff,
                     content: "search-v2".to_owned(),
                 },
             ],
@@ -759,19 +760,19 @@ fn different_sessions_with_the_same_workspace_signal_remain_isolated() {
         frontend_snapshot
             .task_signals
             .iter()
-            .any(|signal| signal.kind == TaskSignalKind::File)
+            .any(|signal| signal.content == "web/Search.tsx")
     );
     assert!(
         !frontend_snapshot
             .task_signals
             .iter()
-            .any(|signal| signal.kind == TaskSignalKind::Api)
+            .any(|signal| signal.content == "search-v2")
     );
     assert!(
         backend_snapshot
             .task_signals
             .iter()
-            .any(|signal| signal.kind == TaskSignalKind::Api)
+            .any(|signal| signal.content == "search-v2")
     );
 }
 
@@ -1044,9 +1045,31 @@ fn task_intent_update_enforces_cas_complete_shape_and_semantic_evidence() {
         task_intent_update_at_root(&fixture.root, &unsupported)
             .unwrap_err()
             .message()
-            .contains("lacks active TaskSignal")
+            .contains("lacks active TaskArtifactFocus")
     );
-    unsupported.evidence_refs = vec!["symbol:Missing".to_owned(), "api:Missing".to_owned()];
+    let focus = TaskArtifactFocus {
+        repository_id: RepositoryId::new(),
+        locator: ArtifactLocator::Symbol {
+            path: RepoRelativePath::new("src/search.rs").unwrap(),
+            language: "rust".to_owned(),
+            module: "search".to_owned(),
+            enclosing_type: None,
+            symbol_name: "focused".to_owned(),
+            signature: "focused()".to_owned(),
+        },
+    };
+    TaskRuntime::initialize(&fixture.root)
+        .unwrap()
+        .merge_artifact_focuses(
+            created.context.task_session_id,
+            created.context.task_id,
+            created.context.intent_revision_id,
+            vec![focus.clone()],
+        )
+        .unwrap();
+    unsupported.intent.artifacts = vec![focus.canonical_identity()];
+    unsupported.intent.interfaces.clear();
+    unsupported.evidence_refs.clear();
     assert!(task_intent_update_at_root(&fixture.root, &unsupported).is_ok());
 
     let missing_array = json!({
@@ -1099,7 +1122,7 @@ fn signal_supersede_is_cas_guarded_and_removed_from_paths_but_retained_in_histor
         .merge_signals(
             created.context.task_session_id,
             vec![TaskSignal {
-                kind: TaskSignalKind::File,
+                kind: TaskSignalKind::Diff,
                 content: "MCP Contract".to_owned(),
             }],
         )
@@ -1157,7 +1180,7 @@ fn signal_supersede_is_cas_guarded_and_removed_from_paths_but_retained_in_histor
         .merge_signals(
             other.context.task_session_id,
             vec![TaskSignal {
-                kind: TaskSignalKind::File,
+                kind: TaskSignalKind::Diff,
                 content: "src/other.rs".to_owned(),
             }],
         )

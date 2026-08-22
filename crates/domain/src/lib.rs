@@ -40,9 +40,9 @@ pub use reducer::{
     SemanticConflictOpenReason, SemanticConflictProjection, SemanticConflictStatus, reduce,
 };
 pub use task::{
-    ExternalSessionLocator, ExternalSessionSnapshot, TaskIntent, TaskIntentDraft,
-    TaskIntentRevision, TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle,
-    TaskSignalRecord, TaskSpaceAssociation,
+    ExternalSessionLocator, ExternalSessionSnapshot, TaskArtifactFocus, TaskArtifactFocusRecord,
+    TaskIntent, TaskIntentDraft, TaskIntentRevision, TaskSessionSnapshot, TaskSignal,
+    TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord, TaskSpaceAssociation,
 };
 
 /// Broad categories used to route recoverable errors across crate boundaries.

@@ -545,24 +545,10 @@ fn feature_task() -> TaskIntent {
 }
 
 fn feature_signals() -> Vec<TaskSignal> {
-    vec![
-        TaskSignal {
-            kind: TaskSignalKind::File,
-            content: "SearchResultsPage.tsx".to_owned(),
-        },
-        TaskSignal {
-            kind: TaskSignalKind::Api,
-            content: "SearchV2Endpoint".to_owned(),
-        },
-        TaskSignal {
-            kind: TaskSignalKind::Schema,
-            content: "SearchResponseV2".to_owned(),
-        },
-        TaskSignal {
-            kind: TaskSignalKind::Test,
-            content: "LegacyCompatibilityTest".to_owned(),
-        },
-    ]
+    vec![TaskSignal {
+        kind: TaskSignalKind::TestOutcome,
+        content: "LegacyCompatibilityTest succeeded".to_owned(),
+    }]
 }
 
 #[test]
@@ -661,7 +647,7 @@ fn workspace_and_repository_locations_never_add_space_priors() {
                     content: "pageintentneedle SearchV2Endpoint analyticsdomain".to_owned(),
                 },
                 TaskSignal {
-                    kind: TaskSignalKind::Repository,
+                    kind: TaskSignalKind::Workspace,
                     content: "protocolintentonly LegacyCompatibilityTest".to_owned(),
                 },
             ],
@@ -704,7 +690,7 @@ fn out_of_scope_only_text_or_code_signal_stays_diagnostic_and_never_associates()
         .task_space_associations(
             &task("unrelated positive query"),
             &[TaskSignal {
-                kind: TaskSignalKind::Symbol,
+                kind: TaskSignalKind::Diff,
                 content: "LegacyRouterBoundary".to_owned(),
             }],
         )
@@ -742,7 +728,7 @@ fn positive_and_out_of_scope_matches_keep_one_penalized_explained_association() 
 
     let conflict_task = task("SearchRankingEngine 搜索排序 支付迁移 LegacyRouterBoundary");
     let conflict_signals = vec![TaskSignal {
-        kind: TaskSignalKind::Symbol,
+        kind: TaskSignalKind::Diff,
         content: "LegacyRouterBoundary".to_owned(),
     }];
     let conflicted = engine
@@ -776,7 +762,6 @@ fn positive_and_out_of_scope_matches_keep_one_penalized_explained_association() 
     );
     assert_eq!(explanation.score_multiplier_basis_points, 5_000);
     assert!(!explanation.matched_tokens.is_empty());
-    assert!(explanation.matched_task_signals.is_empty());
 
     let pack = engine
         .task_context_pack(&TaskContextRequest::automatic(
@@ -918,7 +903,7 @@ fn forty_space_corpus_is_rrf_ranked_top_k_bounded_and_fully_budgeted() {
     let fixture = fusion_corpus_fixture();
     let engine = SearchEngine::new(fixture.index);
     let signals = vec![TaskSignal {
-        kind: TaskSignalKind::Api,
+        kind: TaskSignalKind::Diff,
         content: "SearchV9RareEndpoint".to_owned(),
     }];
     let mut request = TaskContextRequest::automatic(
@@ -1244,7 +1229,7 @@ fn task_context_order_budget_and_fingerprint_are_stable() {
         content: "/different/local/checkout".to_owned(),
     });
     reordered.push(TaskSignal {
-        kind: TaskSignalKind::Repository,
+        kind: TaskSignalKind::Workspace,
         content: "/different/local/repository".to_owned(),
     });
     let reordered_pack = SearchEngine::new(index.clone())
@@ -1294,6 +1279,7 @@ fn automatic_task_pack_excludes_every_unsafe_state_while_explicit_expands_confli
         .task_context_pack(&TaskContextRequest {
             task_intent: task,
             task_signals: Vec::new(),
+            artifact_focuses: Vec::new(),
             token_budget: 100_000,
             max_spaces: sctx_search::DEFAULT_TASK_MAX_SPACES,
             candidate_limit: 100,

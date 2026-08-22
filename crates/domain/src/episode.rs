@@ -333,8 +333,8 @@ mod tests {
         WorkEpisode::from_parts(
             intent(),
             vec![TaskSignal {
-                kind: TaskSignalKind::File,
-                content: "src/SearchResult.tsx".to_owned(),
+                kind: TaskSignalKind::Diff,
+                content: "SearchResult changed".to_owned(),
             }],
             vec![WorkObservation::Artifact {
                 artifact_ref: "symbol:SearchResult".to_owned(),

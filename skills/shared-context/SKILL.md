@@ -18,7 +18,7 @@ Submit a complete Intent snapshot every time. Include all fields: `goal`, `desir
 
 Always send the last returned `intent_revision_id` as `expected_revision_id` for `continue` or for `new` within an existing external session. Use `null` only for the first `new` Task when no external session exists. On a stale-revision error, read the current response/state, reconcile it, and retry; never guess a Revision ID.
 
-Set `maturity` to `provisional` while important claims remain unconfirmed and to `grounded` only with non-empty `evidence_refs`. Every declared Artifact or Interface must be backed by an active TaskSignal or an exact `evidence_ref`. Use the returned Context Pack as read-only task context and retain its `task_id`, `intent_revision_id`, and `active_signals` for later CAS updates.
+Set `maturity` to `provisional` while important claims remain unconfirmed and to `grounded` only with non-empty `evidence_refs`. Every declared Artifact or Interface must be backed by an already-active repository-scoped structured Artifact identity or an exact `evidence_ref`; Prompt, Diff, Workspace and TestOutcome text do not qualify. This Skill exposes no Artifact-focus submission workflow. Use the returned Context Pack as read-only task context and retain its `task_id`, `intent_revision_id`, and `active_signals` for later CAS updates.
 
 ## Choose the Task boundary
 

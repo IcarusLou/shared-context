@@ -204,7 +204,7 @@ fn signals_are_normalized_and_merged_without_duplicates() {
         .open_or_create(
             locator("session-a"),
             intent(TaskId::new(), "normalize signals"),
-            vec![signal(TaskSignalKind::File, "  src/search.tsx  ")],
+            vec![signal(TaskSignalKind::Diff, "  src/search.tsx  ")],
         )
         .unwrap()
         .snapshot;
@@ -213,9 +213,9 @@ fn signals_are_normalized_and_merged_without_duplicates() {
         .merge_signals(
             session.task_session_id,
             vec![
-                signal(TaskSignalKind::File, "src/search.tsx"),
-                signal(TaskSignalKind::File, " src/search.tsx "),
-                signal(TaskSignalKind::Test, " compatibility passes "),
+                signal(TaskSignalKind::Diff, "src/search.tsx"),
+                signal(TaskSignalKind::Diff, " src/search.tsx "),
+                signal(TaskSignalKind::TestOutcome, " compatibility passes "),
             ],
         )
         .unwrap();
@@ -226,13 +226,13 @@ fn signals_are_normalized_and_merged_without_duplicates() {
         outcome
             .snapshot
             .task_signals
-            .contains(&signal(TaskSignalKind::File, "src/search.tsx"))
+            .contains(&signal(TaskSignalKind::Diff, "src/search.tsx"))
     );
     assert!(
         outcome
             .snapshot
             .task_signals
-            .contains(&signal(TaskSignalKind::Test, "compatibility passes"))
+            .contains(&signal(TaskSignalKind::TestOutcome, "compatibility passes"))
     );
 }
 
@@ -244,7 +244,7 @@ fn locator_merge_updates_only_an_existing_session_and_never_creates_one() {
         runtime
             .merge_signals_by_locator(
                 &locator("missing-session"),
-                vec![signal(TaskSignalKind::File, "src/missing.rs")],
+                vec![signal(TaskSignalKind::Diff, "src/missing.rs")],
             )
             .unwrap()
             .is_none()
@@ -262,8 +262,8 @@ fn locator_merge_updates_only_an_existing_session_and_never_creates_one() {
         .merge_signals_by_locator(
             &locator("session-a"),
             vec![
-                signal(TaskSignalKind::File, " src/search.rs "),
-                signal(TaskSignalKind::Test, "SearchContractTest succeeded"),
+                signal(TaskSignalKind::Diff, " src/search.rs "),
+                signal(TaskSignalKind::TestOutcome, "SearchContractTest succeeded"),
             ],
         )
         .unwrap()
@@ -275,10 +275,10 @@ fn locator_merge_updates_only_an_existing_session_and_never_creates_one() {
         outcome
             .snapshot
             .task_signals
-            .contains(&signal(TaskSignalKind::File, "src/search.rs"))
+            .contains(&signal(TaskSignalKind::Diff, "src/search.rs"))
     );
     assert!(outcome.snapshot.task_signals.contains(&signal(
-        TaskSignalKind::Test,
+        TaskSignalKind::TestOutcome,
         "SearchContractTest succeeded"
     )));
     assert_eq!(
@@ -315,13 +315,13 @@ fn same_workspace_signal_does_not_join_external_sessions() {
     runtime
         .merge_signals(
             first.task_session_id,
-            vec![signal(TaskSignalKind::File, "web/Search.tsx")],
+            vec![signal(TaskSignalKind::Diff, "web/Search.tsx")],
         )
         .unwrap();
     runtime
         .merge_signals(
             second.task_session_id,
-            vec![signal(TaskSignalKind::Api, "search-v2")],
+            vec![signal(TaskSignalKind::Diff, "search-v2")],
         )
         .unwrap();
     let first = runtime
@@ -339,25 +339,25 @@ fn same_workspace_signal_does_not_join_external_sessions() {
         first
             .task_signals
             .iter()
-            .any(|value| value.kind == TaskSignalKind::File)
+            .any(|value| value.content == "web/Search.tsx")
     );
     assert!(
         !first
             .task_signals
             .iter()
-            .any(|value| value.kind == TaskSignalKind::Api)
+            .any(|value| value.content == "search-v2")
     );
     assert!(
         second
             .task_signals
             .iter()
-            .any(|value| value.kind == TaskSignalKind::Api)
+            .any(|value| value.content == "search-v2")
     );
     assert!(
         !second
             .task_signals
             .iter()
-            .any(|value| value.kind == TaskSignalKind::File)
+            .any(|value| value.content == "web/Search.tsx")
     );
 }
 
@@ -387,7 +387,7 @@ fn concurrent_same_session_updates_preserve_signals_and_one_intent_head() {
                 .merge_signals(
                     session.task_session_id,
                     vec![signal(
-                        TaskSignalKind::File,
+                        TaskSignalKind::Diff,
                         &format!("src/file-{index}.rs"),
                     )],
                 )
@@ -436,7 +436,7 @@ fn explicit_new_task_boundary_keeps_history_and_excludes_old_signals_from_active
             intent(TaskId::new(), "alpha requirement"),
             vec![
                 signal(TaskSignalKind::Prompt, "alpha requirement"),
-                signal(TaskSignalKind::File, "src/alpha.rs"),
+                signal(TaskSignalKind::Diff, "src/alpha.rs"),
             ],
         )
         .unwrap()
@@ -489,7 +489,7 @@ fn explicit_new_task_boundary_keeps_history_and_excludes_old_signals_from_active
     let error = runtime
         .merge_signals(
             first.task_session_id,
-            vec![signal(TaskSignalKind::Test, "old task test")],
+            vec![signal(TaskSignalKind::TestOutcome, "old task test")],
         )
         .unwrap_err();
     assert!(error.message().contains("ActiveTask"));
@@ -504,7 +504,7 @@ fn explicit_switch_restores_only_the_target_tasks_own_active_signals() {
         .open_or_create(
             external_locator.clone(),
             intent(TaskId::new(), "first task"),
-            vec![signal(TaskSignalKind::File, "src/first.rs")],
+            vec![signal(TaskSignalKind::Diff, "src/first.rs")],
         )
         .unwrap()
         .snapshot;
@@ -513,7 +513,7 @@ fn explicit_switch_restores_only_the_target_tasks_own_active_signals() {
             &external_locator,
             first.task_id,
             &intent_draft("second task"),
-            vec![signal(TaskSignalKind::Api, "second-v2")],
+            vec![signal(TaskSignalKind::Diff, "second-v2")],
         )
         .unwrap()
         .snapshot;
@@ -530,7 +530,7 @@ fn explicit_switch_restores_only_the_target_tasks_own_active_signals() {
             .snapshot
             .task_signals
             .iter()
-            .all(|value| value.kind != TaskSignalKind::Api)
+            .all(|value| value.content != "second-v2")
     );
     assert_eq!(
         runtime
@@ -552,7 +552,7 @@ fn signal_supersede_hides_active_input_but_retains_queryable_history_and_identit
             intent(TaskId::new(), "signal lifecycle"),
             vec![
                 signal(TaskSignalKind::Prompt, "signal lifecycle"),
-                signal(TaskSignalKind::File, "src/obsolete.rs"),
+                signal(TaskSignalKind::Diff, "src/obsolete.rs"),
             ],
         )
         .unwrap()
@@ -562,7 +562,7 @@ fn signal_supersede_hides_active_input_but_retains_queryable_history_and_identit
         .unwrap();
     let obsolete = history
         .iter()
-        .find(|record| record.signal.kind == TaskSignalKind::File)
+        .find(|record| record.signal.kind == TaskSignalKind::Diff)
         .unwrap();
 
     let superseded = runtime
@@ -577,7 +577,7 @@ fn signal_supersede_hides_active_input_but_retains_queryable_history_and_identit
             .snapshot
             .task_signals
             .iter()
-            .all(|value| value.kind != TaskSignalKind::File)
+            .all(|value| value.kind != TaskSignalKind::Diff)
     );
     let retained = runtime
         .read_signal_history(session.task_session_id)
@@ -592,7 +592,7 @@ fn signal_supersede_hides_active_input_but_retains_queryable_history_and_identit
     let readded = runtime
         .merge_signals(
             session.task_session_id,
-            vec![signal(TaskSignalKind::File, "src/obsolete.rs")],
+            vec![signal(TaskSignalKind::Diff, "src/obsolete.rs")],
         )
         .unwrap();
     assert_eq!(readded.inserted, 1);

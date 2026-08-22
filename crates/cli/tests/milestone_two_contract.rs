@@ -307,19 +307,19 @@ impl MilestoneTwoFixture {
         input.intent.acceptance_conditions = vec!["impressionacceptance".to_owned()];
         input.task_signals.extend([
             TaskSignal {
-                kind: TaskSignalKind::File,
+                kind: TaskSignalKind::Diff,
                 content: "src/search_results_page.tsx".to_owned(),
             },
             TaskSignal {
-                kind: TaskSignalKind::Api,
+                kind: TaskSignalKind::Diff,
                 content: "SearchV2Endpoint".to_owned(),
             },
             TaskSignal {
-                kind: TaskSignalKind::Schema,
+                kind: TaskSignalKind::Diff,
                 content: "SearchResponseV2".to_owned(),
             },
             TaskSignal {
-                kind: TaskSignalKind::Test,
+                kind: TaskSignalKind::TestOutcome,
                 content: "LegacyCompatibilityTest succeeded".to_owned(),
             },
         ]);
@@ -556,7 +556,7 @@ fn assert_typed_m2_path(path: &TaskRetrievalPath) {
             path,
             relation_hops,
         } => {
-            assert!(!path.task_signal_content.is_empty());
+            assert!(!path.focus.canonical_identity().is_empty());
             assert!(!path.artifact_generation.is_empty());
             assert!(relation_hops.len() <= 2);
         }
@@ -565,7 +565,7 @@ fn assert_typed_m2_path(path: &TaskRetrievalPath) {
             assert!(hops.len() <= 2);
         }
         TaskRetrievalPath::GraphDiagnostic { diagnostic } => {
-            assert!(!diagnostic.task_signal_content.is_empty());
+            assert!(!diagnostic.focus.canonical_identity().is_empty());
             assert!(!diagnostic.artifact_generation.is_empty());
         }
     }
@@ -732,6 +732,7 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
         .task_context_pack(&TaskContextRequest {
             task_intent: task_intent("hazardpackintent"),
             task_signals: Vec::new(),
+            artifact_focuses: Vec::new(),
             token_budget: 100_000,
             max_spaces: sctx_search::DEFAULT_TASK_MAX_SPACES,
             candidate_limit: 100,
@@ -767,7 +768,7 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn post_tool_file_and_test_observations_refresh_an_explicit_active_task() {
+fn post_tool_file_is_breadcrumb_only_and_test_outcome_refreshes_active_task() {
     let fixture = MilestoneTwoFixture::new();
     let session_id = "hook-signal-session";
     let update = |boundary: TaskBoundary, expected: Option<String>| TaskIntentUpdateInput {
@@ -861,10 +862,15 @@ fn post_tool_file_and_test_observations_refresh_an_explicit_active_task() {
     }));
 
     assert_eq!(snapshot.task_id, updated.task_id);
+    assert!(snapshot.artifact_focuses.is_empty());
+    assert!(
+        !snapshot
+            .task_signals
+            .iter()
+            .any(|signal| signal.content == "src/search_results_page.tsx")
+    );
     assert!(snapshot.task_signals.iter().any(|signal| {
-        signal.kind == TaskSignalKind::File && signal.content == "src/search_results_page.tsx"
-    }));
-    assert!(snapshot.task_signals.iter().any(|signal| {
-        signal.kind == TaskSignalKind::Test && signal.content == "LegacyCompatibilityTest succeeded"
+        signal.kind == TaskSignalKind::TestOutcome
+            && signal.content == "LegacyCompatibilityTest succeeded"
     }));
 }

@@ -10,7 +10,7 @@ use sctx_domain::{
     Applicability, ArtifactKind, ArtifactLocator, ContextId, ContextKind, ContextRevisionDraft,
     EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot, PublicationAction,
     PublicationDraft, ReferenceRelation, RepoRelativePath, ReviewDraft, ReviewVerdict, RevisionId,
-    TaskId, TaskIntent, TaskIntentDraft, TaskSignal, TaskSignalKind,
+    TaskArtifactFocus, TaskId, TaskIntent, TaskIntentDraft, TaskSignal, TaskSignalKind,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
@@ -351,14 +351,17 @@ fn scan_record_rebuild_explain_and_task_pack_cross_two_repositories_and_a_worktr
     );
     TaskRuntime::initialize(&root)
         .unwrap()
-        .merge_signals_by_locator(
-            &ExternalSessionLocator::new("codex", "graph-session").unwrap(),
-            vec![TaskSignal {
-                kind: TaskSignalKind::File,
-                content: "src/alpha.rs".to_owned(),
+        .merge_artifact_focuses(
+            authoritative.context.task_session_id,
+            authoritative.context.task_id,
+            authoritative.context.intent_revision_id,
+            vec![TaskArtifactFocus {
+                repository_id: first_scan.repository_id,
+                locator: ArtifactLocator::File {
+                    path: RepoRelativePath::new("src/alpha.rs").unwrap(),
+                },
             }],
         )
-        .unwrap()
         .unwrap();
     let pack = task_context_readonly_at_root(
         &root,
@@ -583,7 +586,7 @@ fn ambiguous_and_unavailable_explanations_never_choose_and_graph_failure_degrade
             ExternalSessionLocator::new("codex", "degraded-graph").unwrap(),
             task_intent(task_id, "ambiguous graph task"),
             vec![TaskSignal {
-                kind: TaskSignalKind::File,
+                kind: TaskSignalKind::Diff,
                 content: "src/a/one.rs".to_owned(),
             }],
         )

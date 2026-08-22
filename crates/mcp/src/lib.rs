@@ -20,7 +20,7 @@ use sctx_domain::{
     ContextRevisionDraft, EngineeringReferenceDraft, Error, ErrorKind, EvidenceSnapshotDraft,
     EvidenceType, ExternalSessionLocator, ReferenceId, ReferenceRelation, RepoRelativePath,
     RepositoryId, ResolutionStatus, Result, RevisionId, SignalId, SpaceId, TaskId, TaskIntentDraft,
-    TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalLifecycle,
+    TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignalLifecycle,
     TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId,
 };
 use sctx_engineering_graph::{
@@ -37,7 +37,7 @@ use sctx_local_state::UserConfigStore;
 use sctx_search::{
     ConflictView, ContextPackOmitted, ContextStatus, DEFAULT_TASK_MAX_SPACES, MAX_TASK_MAX_SPACES,
     MIN_TASK_CONTEXT_TOKEN_BUDGET, ScopeFilter, SearchEngine, SearchFilters, SearchRequest,
-    TaskContextItem, TaskContextRequest, TaskRetrievalPath,
+    TaskContextItem, TaskContextRequest, TaskGraphDiagnostic, TaskRetrievalPath,
 };
 use sctx_task_runtime::TaskRuntime;
 use serde::{Deserialize, Serialize};
@@ -207,6 +207,7 @@ pub struct TaskContextResponse {
     pub candidate_spaces: Vec<TaskSpaceAssociation>,
     pub items: Vec<TaskContextItem>,
     pub retrieval_paths: Vec<TaskContextRetrievalPaths>,
+    pub graph_diagnostics: Vec<TaskGraphDiagnostic>,
     pub task_fingerprint: String,
     pub tree: String,
     pub generation: u64,
@@ -514,7 +515,7 @@ impl Runtime {
                     invalid("task_boundary=continue requires an existing ActiveTask")
                 })?;
                 require_expected_revision(&active, input.expected_revision_id.as_deref())?;
-                validate_intent_update(input, &active.task_signals)?;
+                validate_intent_update(input, &active.artifact_focuses)?;
                 let parent = active
                     .current_intent_revision()
                     .ok_or_else(|| invariant("ActiveTask has no Intent Head"))?
@@ -1059,7 +1060,7 @@ fn require_expected_revision(
 
 fn validate_intent_update(
     input: &TaskIntentUpdateInput,
-    active_signals: &[TaskSignal],
+    artifact_focuses: &[sctx_domain::TaskArtifactFocusRecord],
 ) -> Result<()> {
     input.intent.validate()?;
     if normalize_semantic(&input.intent.goal) == normalize_semantic(&input.intent.desired_change) {
@@ -1080,9 +1081,9 @@ fn validate_intent_update(
             "maturity=grounded requires at least one evidence_ref",
         ));
     }
-    let signal_support = active_signals
+    let focus_support = artifact_focuses
         .iter()
-        .map(|signal| normalize_semantic(&signal.content))
+        .map(|record| normalize_semantic(&record.focus.canonical_identity()))
         .collect::<HashSet<_>>();
     for (field, values) in [
         ("intent.artifacts", &input.intent.artifacts),
@@ -1090,9 +1091,9 @@ fn validate_intent_update(
     ] {
         for value in values {
             let normalized = normalize_semantic(value);
-            if !signal_support.contains(&normalized) && !evidence.contains(&normalized) {
+            if !focus_support.contains(&normalized) && !evidence.contains(&normalized) {
                 return Err(invalid(format!(
-                    "{field} item lacks active TaskSignal or evidence_ref support: {value}"
+                    "{field} item lacks active TaskArtifactFocus or evidence_ref support: {value}"
                 )));
             }
         }
@@ -1263,9 +1264,10 @@ fn build_task_context_response(
     let current = snapshot
         .current_intent_revision()
         .ok_or_else(|| invariant("Task Session has no current Intent revision"))?;
-    let mut request = TaskContextRequest::automatic(
+    let mut request = TaskContextRequest::automatic_with_focus(
         current.intent.clone(),
         snapshot.task_signals.clone(),
+        snapshot.artifact_focuses.clone(),
         token_budget,
     );
     request.max_spaces = max_spaces;
@@ -1291,6 +1293,7 @@ fn build_task_context_response(
         candidate_spaces: pack.associations,
         items: pack.items,
         retrieval_paths,
+        graph_diagnostics: pack.graph_diagnostics,
         task_fingerprint: pack.task_fingerprint,
         tree: pack.indexed_tree_oid,
         generation: pack.projection_generation,

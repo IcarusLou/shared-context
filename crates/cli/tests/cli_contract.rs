@@ -513,6 +513,7 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         .as_str()
         .unwrap()
         .to_owned();
+    assert!(configured_repository_id.starts_with("rpo_"));
 
     let prompt = |session_id: &str, text: &str| {
         serde_json::json!({
@@ -723,41 +724,16 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         registered.identity.repository_id
     );
     assert_eq!(after_subdirectory.locators.len(), 1);
-    for (snapshot, own_file, own_test, other_file) in [
-        (
-            &alpha_snapshot,
-            "src/alpha_feature.rs",
-            "AlphaContractTest succeeded",
-            "src/beta_feature.rs",
-        ),
-        (
-            &beta_snapshot,
-            "src/beta_feature.rs",
-            "BetaContractTest succeeded",
-            "src/alpha_feature.rs",
-        ),
+    for (snapshot, own_test) in [
+        (&alpha_snapshot, "AlphaContractTest succeeded"),
+        (&beta_snapshot, "BetaContractTest succeeded"),
     ] {
-        assert!(
-            snapshot.task_signals.iter().any(|signal| {
-                signal.kind == TaskSignalKind::File && signal.content == own_file
-            })
-        );
         assert!(snapshot.task_signals.iter().any(|signal| {
-            signal.kind == TaskSignalKind::Repository && signal.content == configured_repository_id
+            signal.kind == TaskSignalKind::TestOutcome && signal.content == own_test
         }));
-        assert!(
-            snapshot.task_signals.iter().any(|signal| {
-                signal.kind == TaskSignalKind::Test && signal.content == own_test
-            })
-        );
-        assert!(
-            !snapshot.task_signals.iter().any(|signal| {
-                signal.kind == TaskSignalKind::File && signal.content == other_file
-            })
-        );
+        assert!(snapshot.artifact_focuses.is_empty());
         assert!(!snapshot.task_signals.iter().any(|signal| {
-            signal.kind == TaskSignalKind::File
-                && (signal.content.contains("outside.rs") || signal.content.contains("missing.rs"))
+            signal.content.contains("outside.rs") || signal.content.contains("missing.rs")
         }));
         assert!(snapshot.task_signals.iter().all(|signal| {
             !signal.content.contains("RAW_ALPHA_MUST_NOT_PERSIST")
@@ -1023,16 +999,8 @@ fn cross_parent_workspace_maps_three_catalog_repositories_without_cross_contamin
             .read_snapshot_by_locator(&ExternalSessionLocator::new("codex", &session_id).unwrap())
             .unwrap()
             .unwrap();
-        let repository_signals = snapshot
-            .task_signals
-            .iter()
-            .filter(|signal| signal.kind == TaskSignalKind::Repository)
-            .map(|signal| signal.content.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(repository_signals, vec![configured_ids[index].as_str()]);
-        assert!(snapshot.task_signals.iter().any(|signal| {
-            signal.kind == TaskSignalKind::File && signal.content == "src/search/Search.kt"
-        }));
+        assert!(snapshot.task_signals.is_empty());
+        assert!(snapshot.artifact_focuses.is_empty());
     }
 
     open_task("cross-unconfigured");
@@ -1466,8 +1434,8 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
         .merge_signals(
             task_session_id,
             vec![sctx_domain::TaskSignal {
-                kind: TaskSignalKind::File,
-                content: "src/stale.rs".to_owned(),
+                kind: TaskSignalKind::Diff,
+                content: "stale diff".to_owned(),
             }],
         )
         .unwrap();

@@ -800,39 +800,14 @@ fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<Option<Stri
 }
 
 fn normalized_observation_signals(
-    catalog: &RepositoryCatalogSnapshot,
-    cwd: &Path,
-    workspace_roots: &[PathBuf],
-    file_hints: &[PathBuf],
+    _catalog: &RepositoryCatalogSnapshot,
+    _cwd: &Path,
+    _workspace_roots: &[PathBuf],
+    _file_hints: &[PathBuf],
     tool_name: &str,
     outcome: ToolOutcome,
 ) -> Vec<TaskSignal> {
-    let roots = if workspace_roots.is_empty() {
-        vec![cwd.to_path_buf()]
-    } else {
-        workspace_roots.to_vec()
-    };
     let mut signals = Vec::new();
-    for hint in file_hints {
-        let candidate = if hint.is_absolute() {
-            hint.clone()
-        } else {
-            cwd.join(hint)
-        };
-        let Ok(resolved) = catalog.resolve_file_path(&candidate, &roots) else {
-            continue;
-        };
-        push_signal(
-            &mut signals,
-            TaskSignalKind::Repository,
-            &resolved.repository_id.to_string(),
-        );
-        push_signal(
-            &mut signals,
-            TaskSignalKind::File,
-            resolved.relative_path.as_str(),
-        );
-    }
     if is_test_tool(tool_name) {
         let test_outcome = format!(
             "{} {}",
@@ -842,7 +817,7 @@ fn normalized_observation_signals(
                 ToolOutcome::Failed => "failed",
             }
         );
-        push_signal(&mut signals, TaskSignalKind::Test, &test_outcome);
+        push_signal(&mut signals, TaskSignalKind::TestOutcome, &test_outcome);
     }
     signals
 }

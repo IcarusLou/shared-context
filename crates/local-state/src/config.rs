@@ -8,7 +8,9 @@ use std::{
 };
 
 use fs2::FileExt;
-use sctx_domain::{Error, ErrorKind, RepoRelativePath, RepositoryId, Result};
+use sctx_domain::{
+    ArtifactLocator, Error, ErrorKind, RepoRelativePath, RepositoryId, Result, TaskArtifactFocus,
+};
 use serde::{Deserialize, Serialize};
 
 const CONFIG_VERSION: u32 = 1;
@@ -58,6 +60,20 @@ pub struct ResolvedRepositoryPath {
     pub repository_id: RepositoryId,
     pub checkout_path: PathBuf,
     pub relative_path: RepoRelativePath,
+}
+
+impl ResolvedRepositoryPath {
+    /// Converts the resolved Repository identity and exact relative path into
+    /// one lossless File Focus without exposing a public submission surface.
+    #[must_use]
+    pub fn into_file_focus(self) -> TaskArtifactFocus {
+        TaskArtifactFocus {
+            repository_id: self.repository_id,
+            locator: ArtifactLocator::File {
+                path: self.relative_path,
+            },
+        }
+    }
 }
 
 /// Current validation state of one configured checkout path.

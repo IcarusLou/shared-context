@@ -616,7 +616,7 @@ fn task_intent_and_signals_match_chinese_english_code_and_api_tokens() {
         (
             task_query("unmatchedcodesignal"),
             vec![TaskSignal {
-                kind: TaskSignalKind::Symbol,
+                kind: TaskSignalKind::Diff,
                 content: "GeneralTabVisibility".to_owned(),
             }],
             SpaceIntentField::InScope,
@@ -624,7 +624,7 @@ fn task_intent_and_signals_match_chinese_english_code_and_api_tokens() {
         (
             task_query("unmatchedapisignal"),
             vec![TaskSignal {
-                kind: TaskSignalKind::Api,
+                kind: TaskSignalKind::Diff,
                 content: "SearchV2Endpoint".to_owned(),
             }],
             SpaceIntentField::AcceptanceConditions,

@@ -777,6 +777,7 @@ mod tests {
                     matched_tokens: vec!["fixture".to_owned()],
                 }],
             }],
+            graph_diagnostics: Vec::new(),
             omitted: Vec::new(),
         }
     }
