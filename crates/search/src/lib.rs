@@ -1564,7 +1564,6 @@ fn query_graph_context_evidence(
         if matches.is_empty() {
             continue;
         }
-        reachable.extend(matches.iter().map(|(record, _)| record.signal_id));
         let Some(snapshot) = graph.contexts.iter().find(|snapshot| {
             snapshot.context_id == resolved.context_id
                 && snapshot.revision.revision_id == resolved.revision_id
@@ -1593,6 +1592,7 @@ fn query_graph_context_evidence(
                 continue;
             };
             for (record, artifact) in matches {
+                reachable.insert(record.signal_id);
                 let path = GraphArtifactRetrievalPath {
                     focus_signal_id: record.signal_id,
                     focus: record.focus.clone(),
@@ -1630,6 +1630,7 @@ fn query_graph_context_evidence(
             }
         } else if mode == ContextPackMode::Explicit {
             for (record, _artifact) in matches {
+                reachable.insert(record.signal_id);
                 let mut bases = resolved
                     .evidence
                     .iter()

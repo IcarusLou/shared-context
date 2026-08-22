@@ -193,6 +193,69 @@ fn cross_workspace_resolution_is_stable_isolated_and_rejects_unsafe_paths() {
 }
 
 #[test]
+fn declared_path_resolution_allows_missing_tail_but_rejects_escape_and_symlink_components() {
+    let temporary = TempDir::new().unwrap();
+    let repository = init_repo(&temporary.path().join("declared repo"), "declared");
+    let outside = init_repo(&temporary.path().join("outside repo"), "outside");
+    let config = UserConfigStore::initialize(temporary.path().join("declared state")).unwrap();
+    let repository_id = config
+        .add_repository(None, std::slice::from_ref(&repository))
+        .unwrap()
+        .repository
+        .repository_id;
+    let catalog = config.repository_catalog().unwrap();
+
+    let missing = repository.join("src/future/generated/SearchContract.proto");
+    assert!(!missing.exists());
+    let resolved = catalog.resolve_declared_path(&missing).unwrap();
+    assert_eq!(resolved.repository_id, repository_id);
+    assert_eq!(
+        resolved.relative_path.as_str(),
+        "src/future/generated/SearchContract.proto"
+    );
+    let existing = catalog
+        .resolve_declared_path(&repository.join("src/search/Search.kt"))
+        .unwrap();
+    assert_eq!(existing.repository_id, repository_id);
+    assert_eq!(
+        catalog
+            .resolve_declared_path(&outside.join("missing.kt"))
+            .unwrap_err()
+            .kind(),
+        ErrorKind::RepositoryNotConfigured
+    );
+    assert!(
+        catalog
+            .resolve_declared_path(&repository.join("src/../escaped.kt"))
+            .is_err()
+    );
+
+    fs::write(repository.join("src/not-a-directory"), "fixture").unwrap();
+    assert!(
+        catalog
+            .resolve_declared_path(&repository.join("src/not-a-directory/tail.kt"))
+            .unwrap_err()
+            .message()
+            .contains("non-directory")
+    );
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(
+            repository.join("src/search"),
+            repository.join("src/linked-search"),
+        )
+        .unwrap();
+        assert!(
+            catalog
+                .resolve_declared_path(&repository.join("src/linked-search/missing.kt"))
+                .unwrap_err()
+                .message()
+                .contains("symlink")
+        );
+    }
+}
+
+#[test]
 fn catalog_writes_are_concurrent_and_doctor_reports_checkout_drift() {
     let temporary = TempDir::new().unwrap();
     let root = temporary.path().join("catalog root");

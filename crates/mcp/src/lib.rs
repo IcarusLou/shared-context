@@ -1,4 +1,4 @@
-//! Stdio Model Context Protocol server for the five Shared Context V1 tools.
+//! Stdio Model Context Protocol server for Shared Context V1 tools.
 //!
 //! The transport accepts the newline-delimited framing used by current MCP
 //! clients and the `Content-Length` framing used by older fixtures. Read tools
@@ -19,9 +19,10 @@ use sctx_domain::{
     Applicability, ArtifactKey, ArtifactKind, ArtifactLocator, ContextId, ContextKind,
     ContextRevisionDraft, EngineeringReferenceDraft, Error, ErrorKind, EvidenceSnapshotDraft,
     EvidenceType, ExternalSessionLocator, ReferenceId, ReferenceRelation, RepoRelativePath,
-    RepositoryId, ResolutionStatus, Result, RevisionId, SignalId, SpaceId, TaskId, TaskIntentDraft,
-    TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignalLifecycle,
-    TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId,
+    RepositoryId, ResolutionStatus, Result, RevisionId, SignalId, SpaceId, TaskArtifactFocus,
+    TaskArtifactFocusRecord, TaskId, TaskIntentDraft, TaskIntentRevisionId, TaskSessionId,
+    TaskSessionSnapshot, TaskSignalLifecycle, TaskSignalRecord, TaskSpaceAssociation,
+    WorkEpisodeId,
 };
 use sctx_engineering_graph::{
     CandidateMatchEvidence, CatalogRepositorySpec, EngineeringProjectionStore,
@@ -33,7 +34,7 @@ use sctx_engineering_graph::{
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::{DomainSnapshot, ProjectionIndex};
-use sctx_local_state::UserConfigStore;
+use sctx_local_state::{RepositoryCatalogSnapshot, UserConfigStore};
 use sctx_search::{
     ConflictView, ContextPackOmitted, ContextStatus, DEFAULT_TASK_MAX_SPACES, MAX_TASK_MAX_SPACES,
     MIN_TASK_CONTEXT_TOKEN_BUDGET, ScopeFilter, SearchEngine, SearchFilters, SearchRequest,
@@ -190,6 +191,139 @@ impl TaskContextReadInput {
     }
 }
 
+/// Required nullable string used by Symbol coordinates; omission is rejected.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RequiredNullableString {
+    Value(String),
+    Null(()),
+}
+
+impl RequiredNullableString {
+    fn into_option(self) -> Option<String> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Null(()) => None,
+        }
+    }
+}
+
+/// Agent-authored kind-specific Artifact coordinates. Repository-relative path is server-owned.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "locator_kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TaskArtifactFocusCoordinates {
+    File,
+    Module,
+    Api {
+        protocol: String,
+        operation: String,
+        normalized_route: String,
+    },
+    Schema {
+        namespace: String,
+        version: String,
+        qualified_name: String,
+    },
+    Symbol {
+        language: String,
+        module: String,
+        enclosing_type: RequiredNullableString,
+        symbol_name: String,
+        signature: String,
+    },
+    Test {
+        qualified_test_name: String,
+    },
+}
+
+impl TaskArtifactFocusCoordinates {
+    fn into_locator(self, path: RepoRelativePath) -> ArtifactLocator {
+        match self {
+            Self::File => ArtifactLocator::File { path },
+            Self::Module => ArtifactLocator::Module { path },
+            Self::Api {
+                protocol,
+                operation,
+                normalized_route,
+            } => ArtifactLocator::Api {
+                path,
+                protocol,
+                operation,
+                normalized_route,
+            },
+            Self::Schema {
+                namespace,
+                version,
+                qualified_name,
+            } => ArtifactLocator::Schema {
+                path,
+                namespace,
+                version,
+                qualified_name,
+            },
+            Self::Symbol {
+                language,
+                module,
+                enclosing_type,
+                symbol_name,
+                signature,
+            } => ArtifactLocator::Symbol {
+                path,
+                language,
+                module,
+                enclosing_type: enclosing_type.into_option(),
+                symbol_name,
+                signature,
+            },
+            Self::Test {
+                qualified_test_name,
+            } => ArtifactLocator::Test {
+                path,
+                qualified_test_name,
+            },
+        }
+    }
+}
+
+/// Strict public request for declaring one current Artifact Focus and immediately retrieving.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskArtifactFocusInput {
+    pub agent_kind: String,
+    pub external_session_id: String,
+    pub expected_revision_id: String,
+    pub absolute_file_path: String,
+    pub locator: TaskArtifactFocusCoordinates,
+    #[serde(default = "default_token_budget")]
+    pub token_budget: usize,
+    #[serde(default = "default_max_spaces")]
+    pub max_spaces: usize,
+}
+
+impl TaskArtifactFocusInput {
+    fn locator(&self) -> Result<ExternalSessionLocator> {
+        ExternalSessionLocator::new(&self.agent_kind, &self.external_session_id)
+    }
+
+    fn validate_bounds(&self) -> Result<()> {
+        let _locator = self.locator()?;
+        if self.absolute_file_path.trim().is_empty() {
+            return Err(invalid("absolute_file_path must not be empty"));
+        }
+        if self.token_budget < MIN_TASK_CONTEXT_TOKEN_BUDGET {
+            return Err(invalid(format!(
+                "task_artifact_focus token_budget must be at least {MIN_TASK_CONTEXT_TOKEN_BUDGET}"
+            )));
+        }
+        if self.max_spaces == 0 || self.max_spaces > MAX_TASK_MAX_SPACES {
+            return Err(invalid(format!(
+                "task_artifact_focus max_spaces must be between 1 and {MAX_TASK_MAX_SPACES}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Flattened explanation index for one returned Task Context item.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TaskContextRetrievalPaths {
@@ -216,6 +350,14 @@ pub struct TaskContextResponse {
     pub token_budget: usize,
     pub estimated_tokens: usize,
     pub omitted: Vec<ContextPackOmitted>,
+}
+
+/// Result of one idempotent Focus declaration and its immediate Task Context retrieval.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskArtifactFocusResponse {
+    pub focus: TaskArtifactFocusRecord,
+    pub created: bool,
+    pub context: TaskContextResponse,
 }
 
 /// Register-and-scan request for one canonical local Git worktree root.
@@ -462,6 +604,7 @@ struct Runtime {
     repositories: RepositoryRegistry,
     engineering_graph: Option<EngineeringProjectionStore>,
     tasks: TaskRuntime,
+    catalog: RepositoryCatalogSnapshot,
 }
 
 impl Runtime {
@@ -469,7 +612,8 @@ impl Runtime {
         let store = GitStore::initialize(root)?;
         let index = ProjectionIndex::for_store(&store);
         let repositories = RepositoryRegistry::initialize(root)?;
-        sync_repository_catalog(root, &repositories)?;
+        let catalog = UserConfigStore::initialize(root)?.repository_catalog()?;
+        sync_repository_catalog_snapshot(&repositories, &catalog)?;
         let engineering_graph = EngineeringProjectionStore::initialize(root).ok();
         let tasks = TaskRuntime::initialize(root)?;
         Ok(Self {
@@ -478,6 +622,7 @@ impl Runtime {
             repositories,
             engineering_graph,
             tasks,
+            catalog,
         })
     }
 
@@ -501,6 +646,63 @@ impl Runtime {
             input.token_budget,
             input.max_spaces,
         )
+    }
+
+    fn task_artifact_focus(
+        &self,
+        input: &TaskArtifactFocusInput,
+    ) -> Result<TaskArtifactFocusResponse> {
+        input.validate_bounds()?;
+        let session_locator = input.locator()?;
+        let active = self
+            .tasks
+            .read_snapshot_by_locator(&session_locator)?
+            .ok_or_else(|| {
+                invalid(
+                    "task_artifact_focus requires task_intent_update to establish an ActiveTask",
+                )
+            })?;
+        let expected_revision_id =
+            require_expected_revision(&active, Some(input.expected_revision_id.as_str()))?;
+        let resolved = self
+            .catalog
+            .resolve_declared_path(Path::new(&input.absolute_file_path))?;
+        let focus = TaskArtifactFocus {
+            repository_id: resolved.repository_id,
+            locator: input.locator.clone().into_locator(resolved.relative_path),
+        };
+        focus.validate()?;
+        let merged = self.tasks.merge_artifact_focuses(
+            active.task_session_id,
+            active.task_id,
+            expected_revision_id,
+            vec![focus],
+        )?;
+        let [signal_id] = merged.focus_signal_ids.as_slice() else {
+            return Err(invariant(
+                "single Artifact Focus merge did not return one stable SignalId",
+            ));
+        };
+        let focus = merged
+            .snapshot
+            .artifact_focuses
+            .iter()
+            .find(|record| record.signal_id == *signal_id)
+            .cloned()
+            .ok_or_else(|| invariant("merged Artifact Focus is not active in its Task"))?;
+        let created = merged.inserted_signal_ids.contains(signal_id);
+        let context = build_task_context_response(
+            &self.index,
+            self.engineering_graph.as_ref(),
+            &merged.snapshot,
+            input.token_budget,
+            input.max_spaces,
+        )?;
+        Ok(TaskArtifactFocusResponse {
+            focus,
+            created,
+            context,
+        })
     }
 
     fn task_intent_update(
@@ -1146,12 +1348,19 @@ fn sync_repository_catalog(
     registry: &RepositoryRegistry,
 ) -> Result<RepositoryCatalogSyncReport> {
     let catalog = UserConfigStore::initialize(root)?.repository_catalog()?;
+    sync_repository_catalog_snapshot(registry, &catalog)
+}
+
+fn sync_repository_catalog_snapshot(
+    registry: &RepositoryRegistry,
+    catalog: &RepositoryCatalogSnapshot,
+) -> Result<RepositoryCatalogSyncReport> {
     let specifications = catalog
         .repositories
-        .into_iter()
+        .iter()
         .map(|repository| CatalogRepositorySpec {
             repository_id: repository.repository_id,
-            checkout_paths: repository.checkout_paths,
+            checkout_paths: repository.checkout_paths.clone(),
         })
         .collect::<Vec<_>>();
     registry.sync_catalog(&specifications)
@@ -1180,6 +1389,18 @@ pub fn task_context_readonly_at_root(
     input: &TaskContextReadInput,
 ) -> Result<TaskContextResponse> {
     Runtime::open(root.as_ref())?.task_context_readonly(input)
+}
+
+/// Declares one current Artifact Focus under `ActiveTask` Intent CAS and returns its immediate Pack.
+///
+/// # Errors
+///
+/// Returns typed Session, CAS, Catalog path, locator, Runtime, or Search errors.
+pub fn task_artifact_focus_at_root(
+    root: impl AsRef<Path>,
+    input: &TaskArtifactFocusInput,
+) -> Result<TaskArtifactFocusResponse> {
+    Runtime::open(root.as_ref())?.task_artifact_focus(input)
 }
 
 /// Applies an authoritative Task Intent CAS update and returns its new Context Pack.
@@ -1469,6 +1690,7 @@ impl McpServer {
             .map_err(|error| invalid(format!("invalid tools/call params: {error}")))?;
         let result = match call.name.as_str() {
             "task_intent_update" => self.task_intent_update(call.arguments),
+            "task_artifact_focus" => self.task_artifact_focus(call.arguments),
             "task_signal_supersede" => self.task_signal_supersede(call.arguments),
             "task_context" => self.task_context(call.arguments),
             "repository_scan" => self.repository_scan(call.arguments),
@@ -1524,6 +1746,15 @@ impl McpServer {
         let response = self
             .runtime
             .task_intent_update(&input)
+            .map_err(ToolFailure::task_context_failed)?;
+        serde_json::to_value(response).map_err(serialization_failure)
+    }
+
+    fn task_artifact_focus(&self, arguments: Value) -> ToolResult {
+        let input: TaskArtifactFocusInput = decode_arguments(arguments)?;
+        let response = self
+            .runtime
+            .task_artifact_focus(&input)
             .map_err(ToolFailure::task_context_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
     }
@@ -1898,6 +2129,11 @@ fn tools_list() -> Value {
             task_intent_update_schema()
         ),
         tool_schema(
+            "task_artifact_focus",
+            "Declare one current File/Module/Symbol/API/Schema/Test focus under ActiveTask CAS and immediately retrieve exact historical Graph context. Repository identity and relative path are resolved by the configured local Catalog.",
+            task_artifact_focus_schema()
+        ),
+        tool_schema(
             "task_signal_supersede",
             "Supersede stable active Signal IDs under exact Task and Intent CAS guards.",
             task_signal_supersede_schema()
@@ -1993,6 +2229,86 @@ fn repository_scan_schema() -> Value {
             },
             "max_artifacts": {"type": "integer", "minimum": 1, "maximum": MAX_SCAN_ARTIFACT_LIMIT, "default": DEFAULT_SCAN_ARTIFACT_LIMIT}
         }
+    })
+}
+
+fn task_artifact_focus_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "agent_kind", "external_session_id", "expected_revision_id",
+            "absolute_file_path", "locator"
+        ],
+        "properties": {
+            "agent_kind": {"type": "string", "minLength": 1},
+            "external_session_id": {"type": "string", "minLength": 1},
+            "expected_revision_id": id_schema("tir_"),
+            "absolute_file_path": {"type": "string", "minLength": 1},
+            "locator": task_artifact_focus_coordinates_schema(),
+            "token_budget": {"type": "integer", "minimum": MIN_TASK_CONTEXT_TOKEN_BUDGET, "default": 2000},
+            "max_spaces": {"type": "integer", "minimum": 1, "maximum": MAX_TASK_MAX_SPACES, "default": DEFAULT_TASK_MAX_SPACES}
+        }
+    })
+}
+
+fn task_artifact_focus_coordinates_schema() -> Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["locator_kind"],
+                "properties": {"locator_kind": {"const": "file"}}
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["locator_kind"],
+                "properties": {"locator_kind": {"const": "module"}}
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["locator_kind", "protocol", "operation", "normalized_route"],
+                "properties": {
+                    "locator_kind": {"const": "api"},
+                    "protocol": {"type": "string", "minLength": 1},
+                    "operation": {"type": "string", "minLength": 1},
+                    "normalized_route": {"type": "string", "minLength": 1}
+                }
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["locator_kind", "namespace", "version", "qualified_name"],
+                "properties": {
+                    "locator_kind": {"const": "schema"},
+                    "namespace": {"type": "string", "minLength": 1},
+                    "version": {"type": "string", "minLength": 1},
+                    "qualified_name": {"type": "string", "minLength": 1}
+                }
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": [
+                    "locator_kind", "language", "module", "enclosing_type",
+                    "symbol_name", "signature"
+                ],
+                "properties": {
+                    "locator_kind": {"const": "symbol"},
+                    "language": {"type": "string", "minLength": 1},
+                    "module": {"type": "string", "minLength": 1},
+                    "enclosing_type": {"type": ["string", "null"], "minLength": 1},
+                    "symbol_name": {"type": "string", "minLength": 1},
+                    "signature": {"type": "string", "minLength": 1}
+                }
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["locator_kind", "qualified_test_name"],
+                "properties": {
+                    "locator_kind": {"const": "test"},
+                    "qualified_test_name": {"type": "string", "minLength": 1}
+                }
+            }
+        ]
     })
 }
 

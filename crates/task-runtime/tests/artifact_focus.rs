@@ -103,6 +103,8 @@ fn six_kinds_are_cas_merged_idempotent_superseded_and_retained_without_intent_re
         .merge_artifact_focuses(initial.task_session_id, initial.task_id, head, all.clone())
         .unwrap();
     assert_eq!(merged.inserted, 6);
+    assert_eq!(merged.focus_signal_ids.len(), 6);
+    assert_eq!(merged.inserted_signal_ids, merged.focus_signal_ids);
     assert_eq!(merged.snapshot.artifact_focuses.len(), 6);
     assert_eq!(merged.snapshot.intent_revisions, initial.intent_revisions);
 
@@ -115,6 +117,17 @@ fn six_kinds_are_cas_merged_idempotent_superseded_and_retained_without_intent_re
         )
         .unwrap();
     assert_eq!(repeated.inserted, 0);
+    assert_eq!(repeated.focus_signal_ids.len(), 1);
+    assert_eq!(
+        repeated.focus_signal_ids[0],
+        merged
+            .snapshot
+            .artifact_focuses
+            .iter()
+            .find(|record| record.focus == all[0])
+            .unwrap()
+            .signal_id
+    );
     assert_eq!(
         repeated.snapshot.artifact_focuses,
         merged.snapshot.artifact_focuses
@@ -167,6 +180,10 @@ fn six_kinds_are_cas_merged_idempotent_superseded_and_retained_without_intent_re
         )
         .unwrap();
     assert_eq!(reactivated.inserted, 1);
+    assert_eq!(
+        reactivated.focus_signal_ids,
+        reactivated.inserted_signal_ids
+    );
     assert!(!ids.contains(&reactivated.inserted_signal_ids[0]));
     assert_eq!(
         runtime

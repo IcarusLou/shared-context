@@ -136,7 +136,7 @@
 | `TaskSession` | 一次 Agent 工程任务的本地运行实例，与 Agent Session 隔离 |
 | `TaskIntent` | 系统对当前 Task 目标、范围、约束和未知项的动态理解 |
 | `TaskSignal` | Prompt、Workspace、Diff、TestOutcome 等非定位任务观察 |
-| `TaskArtifactFocus` | Agent 声明当前 Task 关注的 RepositoryId + 完整 ArtifactLocator；是 Graph seed，不是工程事实证明 |
+| `TaskArtifactFocus` | Agent 声明当前 Task 关注的工程对象；系统通过 Catalog 将 absolute path + kind coordinates 规范化为 RepositoryId + 完整 ArtifactLocator。它是 Graph seed，不是工程事实证明 |
 | `TaskSpaceAssociation` | Task 与多个 Space 的派生相关性、置信度和匹配依据 |
 | `WorkEpisode` | 一次 Task 内被聚合的探索、修改、验证和结论 |
 | `ContextCandidate` | 从 WorkEpisode 自动生成、尚未进入知识事实层的 Context 草稿 |
@@ -822,7 +822,7 @@ token_budget:
 - 第一次 `task_intent_update`：显式创建 TaskSession，并提交完整 Provisional 或 Grounded TaskIntent。
 - Agent 调用 `task_intent_update`：提交完整 Intent Snapshot、Task boundary、maturity、evidence refs 与 Revision CAS。
 - 后续 Prompt：修订目标、范围和约束。
-- Agent 判断某工程对象与 Task 相关：通过内部 Runtime API 增加 Repository-scoped TaskArtifactFocus；不会创建 Intent Revision。
+- Agent 判断某工程对象与 Task 相关：调用 `task_artifact_focus`，由 Catalog 解析 Repository-scoped TaskArtifactFocus；不会创建 Intent Revision。
 - Diff 变化：修订受影响范围。
 - API、Schema 或测试信号出现：增加跨模块、跨端线索。
 - PreCompact、TurnStop：固化一次 TaskIntent Revision 和 WorkEpisode Checkpoint。
@@ -986,7 +986,7 @@ optional_edits:
 sctx setup
 sctx doctor
 sctx space create|revise|list|get
-sctx task inspect|reset
+sctx task context|artifact-focus|intent update|signal supersede
 sctx candidate list|get|confirm|discard
 sctx context get|search|revise|deprecate
 sctx repository add|list|doctor|scan
@@ -1004,6 +1004,7 @@ sctx mcp serve --client cursor|codex
 | Tool | 类型 | 说明 |
 |---|---|---|
 | `task_intent_update` | 读/写本地状态 | CAS 更新 TaskIntent 并生成多 Space TaskContextPack |
+| `task_artifact_focus` | 读/写本地状态 | CAS 增加/复用当前 Artifact Focus；仅接收 Session、absolute path 与无 path coordinates，由 Catalog 补全身份并立即返回 TaskContextPack |
 | `task_signal_supersede` | 读/写本地状态 | 按稳定 Signal ID 失效当前 Task 信号 |
 | `task_context` | 只读 | 按 external Session locator 重读已有 ActiveTask 的 TaskContextPack |
 | `repository_scan` | 读/写本地状态 | 只扫描已在 Catalog 配置的 checkout，要求显式非空 repo-relative paths，并返回有界 Artifact/skip 摘要；不接受 RepositoryId 注入 |
@@ -1294,7 +1295,9 @@ M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命�
 - Graph Retrieval 与当前 Intent/Context/Scope fallback 使用 revision-aware candidate key；同一 ContextId 的 frozen old Revision 与 current FTS Revision 可以同时返回，Graph path 不得重绑到当前 Revision。Graph relation traversal 只使用 frozen relation targets；当前 fallback relation 不混入 EngineeringGraph path。
 - 已删除裸 Repository/File/Symbol/API/Schema/Test TaskSignal；Graph exact 只消费 Active TaskArtifactFocus，并同时匹配 RepositoryId 与完整 ArtifactLocator。Intent/Context BM25 与 Scope 继续作为非 Graph fallback。
 - `runtime.sqlite` 以稳定 SignalId 保存 Focus active/superseded 历史；CAS 同时守卫 ActiveTask 与当前 Intent Head，Focus 变更不创建 Intent Revision。新 Task 不继承，双 Session 隔离，重复/并发提交幂等。
-- 不可达 Focus 只返回 budgeted `artifact_not_reachable_in_graph` 诊断，不声称当前代码 `missing`；历史 frozen Graph 中仍存在的精确节点继续可达。#152 公共 MCP/Skill 提交入口尚未实现。
+- 公开 MCP/CLI `task_artifact_focus` 只接受 external Session locator、Intent Revision CAS、absolute file path、无 path 的六类 coordinates 与输出预算，所有层 `additionalProperties=false`。RepositoryId、RepoRelativePath、ArtifactKey、Generation、Workspace、Hook 和 corroboration 均由 schema/decoder 拒绝。
+- Catalog declared-path resolver 允许配置 checkout 下的 missing leaf/tail，同时拒绝 dot segment、symlink traversal、现存非目录父节点和未配置前缀；不要求当前代码存在，不读取 Git、Scanner 或 AST。
+- 不可达 Focus 只返回 budgeted `artifact_not_reachable_in_graph` 诊断，不声称当前代码 `missing`；只有当前 mode 实际形成 resolved safe EngineeringGraph path（Explicit 可形成 GraphDiagnostic）后才标记 reachable。历史 frozen Graph 中仍存在的精确节点继续可达。
 - 固定跨 crate/E2E oracle 以手工 ID、Reference-derived path 计划、确定性 locator 和关系验证稀疏 Graph；独立 Scanner contract 用显式计划覆盖 Rust、TypeScript、JavaScript、Swift、Kotlin、JSON、OpenAPI 与 Proto。验收覆盖未引用 tracked 文件零 Artifact、path 去重、missing 无 fallback、API/Schema/Qualified Symbol/Test 精确 locator、Symbol→Requirement/Decision/Contract/Validation、File move/Symbol rename 变为 missing、FE API/Schema→跨端 Context、cycle/depth、歧义诊断、Repository unavailable、增量=scratch、投影删除重建、Generation 和 Token Budget。
 - 固定 expected 位于 `tests/oracles/milestone-three-v1.json`，不得通过序列化生产结果生成或更新；只读源 Fixture 位于 `tests/fixtures/milestone-three/repository/`。
 - `context_tree_oid` 仅保留 Graph build provenance；不作为启用谓词。新建或其他 untracked 文件仍不扫描，不实现 #150 范围。

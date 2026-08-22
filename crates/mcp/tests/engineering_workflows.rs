@@ -1,29 +1,33 @@
 use std::{
     fs,
+    io::{BufReader, Cursor},
     path::Path,
     process::Command,
     sync::{Arc, Barrier},
     thread,
+    time::Instant,
 };
 
 use sctx_domain::{
     Applicability, ArtifactKind, ArtifactLocator, ContextId, ContextKind, ContextRevisionDraft,
     EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot, PublicationAction,
     PublicationDraft, ReferenceRelation, RepoRelativePath, ReviewDraft, ReviewVerdict, RevisionId,
-    TaskArtifactFocus, TaskId, TaskIntent, TaskIntentDraft, TaskSignal, TaskSignalKind,
+    TaskId, TaskIntent, TaskIntentDraft, TaskSignal, TaskSignalKind,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_local_state::UserConfigStore;
 use sctx_mcp::{
-    AssociationExplainInput, AssociationRebuildInput, EngineeringReferenceRecordInput,
-    ExpectedRevisionId, IntentMaturity, RepositoryScanInput, TaskBoundary, TaskContextReadInput,
-    TaskIntentUpdateInput, association_explain_at_root, association_rebuild_at_root,
-    engineering_reference_record_at_root, repository_scan_at_root, task_context_readonly_at_root,
-    task_intent_update_at_root,
+    AssociationExplainInput, AssociationRebuildInput, ClientKind, DisconnectReason,
+    EngineeringReferenceRecordInput, ExpectedRevisionId, IntentMaturity, McpServer,
+    RepositoryScanInput, TaskArtifactFocusCoordinates, TaskArtifactFocusInput, TaskBoundary,
+    TaskContextReadInput, TaskIntentUpdateInput, association_explain_at_root,
+    association_rebuild_at_root, engineering_reference_record_at_root, repository_scan_at_root,
+    task_artifact_focus_at_root, task_context_readonly_at_root, task_intent_update_at_root,
 };
 use sctx_search::TaskRetrievalPath;
 use sctx_task_runtime::TaskRuntime;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 fn git(path: &Path, args: &[&str]) -> String {
@@ -39,6 +43,116 @@ fn git(path: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn rpc_request(id: u64, method: &str, params: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn tool_call(id: u64, name: &str, arguments: Value) -> Value {
+    rpc_request(
+        id,
+        "tools/call",
+        json!({"name": name, "arguments": arguments}),
+    )
+}
+
+fn run_mcp(server: &mut McpServer, requests: &[Value]) -> Vec<Value> {
+    let mut input = requests
+        .iter()
+        .flat_map(|request| {
+            let mut bytes = serde_json::to_vec(request).unwrap();
+            bytes.push(b'\n');
+            bytes
+        })
+        .collect::<Vec<_>>();
+    let mut output = Vec::new();
+    let outcome = server
+        .serve(&mut BufReader::new(Cursor::new(&mut input)), &mut output)
+        .unwrap();
+    assert_eq!(outcome.disconnect, DisconnectReason::CleanEof);
+    output
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect()
+}
+
+fn task_update_arguments(session: &str) -> Value {
+    json!({
+        "agent_kind": "codex",
+        "external_session_id": session,
+        "task_boundary": "new",
+        "expected_revision_id": null,
+        "maturity": "provisional",
+        "intent": {
+            "goal": "zxqvortex",
+            "desired_change": "zyqnebula",
+            "in_scope": [],
+            "out_of_scope": [],
+            "domains": [],
+            "platforms": [],
+            "constraints": [],
+            "acceptance_conditions": [],
+            "artifacts": [],
+            "interfaces": [],
+            "unknowns": []
+        },
+        "evidence_refs": []
+    })
+}
+
+fn focus_coordinates(locator: &ArtifactLocator) -> Value {
+    match locator {
+        ArtifactLocator::File { .. } => json!({"locator_kind": "file"}),
+        ArtifactLocator::Module { .. } => json!({"locator_kind": "module"}),
+        ArtifactLocator::Api {
+            protocol,
+            operation,
+            normalized_route,
+            ..
+        } => json!({
+            "locator_kind": "api",
+            "protocol": protocol,
+            "operation": operation,
+            "normalized_route": normalized_route
+        }),
+        ArtifactLocator::Schema {
+            namespace,
+            version,
+            qualified_name,
+            ..
+        } => json!({
+            "locator_kind": "schema",
+            "namespace": namespace,
+            "version": version,
+            "qualified_name": qualified_name
+        }),
+        ArtifactLocator::Symbol {
+            language,
+            module,
+            enclosing_type,
+            symbol_name,
+            signature,
+            ..
+        } => json!({
+            "locator_kind": "symbol",
+            "language": language,
+            "module": module,
+            "enclosing_type": enclosing_type,
+            "symbol_name": symbol_name,
+            "signature": signature
+        }),
+        ArtifactLocator::Test {
+            qualified_test_name,
+            ..
+        } => json!({
+            "locator_kind": "test",
+            "qualified_test_name": qualified_test_name
+        }),
+    }
 }
 
 fn init_repo(path: &Path, files: &[(&str, &str)]) {
@@ -60,6 +174,33 @@ fn init_repo(path: &Path, files: &[(&str, &str)]) {
     }
     git(path, &["add", "--", "."]);
     git(path, &["commit", "-q", "-m", "fixture"]);
+}
+
+fn seed_six_kinds(path: &Path) {
+    init_repo(
+        path,
+        &[
+            (
+                "rust/src/lib.rs",
+                r"
+pub struct RustResult { value: String }
+#[test]
+fn rust_contract_test() { assert!(true); }
+",
+            ),
+            (
+                "web/src/search.ts",
+                r#"
+export interface SearchResponse { value: string }
+export function webSearch() { return fetch("/api/search"); }
+"#,
+            ),
+            (
+                "schema/openapi.json",
+                r#"{"openapi":"3.0.0","paths":{"/api/search":{}},"components":{"schemas":{"SearchResponse":{}}}}"#,
+            ),
+        ],
+    );
 }
 
 fn context_draft(statement: &str) -> ContextRevisionDraft {
@@ -187,6 +328,16 @@ fn reference_input(
     }
 }
 
+fn reference_relation(kind: ArtifactKind) -> ReferenceRelation {
+    match kind {
+        ArtifactKind::File | ArtifactKind::Module | ArtifactKind::Symbol => {
+            ReferenceRelation::Implements
+        }
+        ArtifactKind::Api | ArtifactKind::Schema => ReferenceRelation::Defines,
+        ArtifactKind::Test => ReferenceRelation::Validates,
+    }
+}
+
 fn task_intent(task_id: TaskId, goal: &str) -> TaskIntent {
     TaskIntent {
         task_id,
@@ -237,6 +388,9 @@ fn scan_record_rebuild_explain_and_task_pack_cross_two_repositories_and_a_worktr
             "pub fn beta_graph_entry() -> bool { true }\n",
         )],
     );
+    let first = fs::canonicalize(first).unwrap();
+    let worktree = fs::canonicalize(worktree).unwrap();
+    let second = fs::canonicalize(second).unwrap();
     let (context_id, revision_id) = accepted_context(&root, "alpha graph decision");
     let config = UserConfigStore::initialize(&root).unwrap();
     config
@@ -349,30 +503,26 @@ fn scan_record_rebuild_explain_and_task_pack_cross_two_repositories_and_a_worktr
         authoritative.context.artifact_generation,
         Some(rebuilt.artifact_generation.clone())
     );
-    TaskRuntime::initialize(&root)
-        .unwrap()
-        .merge_artifact_focuses(
-            authoritative.context.task_session_id,
-            authoritative.context.task_id,
-            authoritative.context.intent_revision_id,
-            vec![TaskArtifactFocus {
-                repository_id: first_scan.repository_id,
-                locator: ArtifactLocator::File {
-                    path: RepoRelativePath::new("src/alpha.rs").unwrap(),
-                },
-            }],
-        )
-        .unwrap();
-    let pack = task_context_readonly_at_root(
+    let focused = task_artifact_focus_at_root(
         &root,
-        &TaskContextReadInput {
+        &TaskArtifactFocusInput {
             agent_kind: "codex".to_owned(),
             external_session_id: "graph-session".to_owned(),
+            expected_revision_id: authoritative.context.intent_revision_id.to_string(),
+            absolute_file_path: first.join("src/alpha.rs").to_string_lossy().into_owned(),
+            locator: TaskArtifactFocusCoordinates::File,
             token_budget: 4_000,
             max_spaces: 8,
         },
     )
     .unwrap();
+    assert!(focused.created);
+    assert_eq!(
+        focused.focus.lifecycle,
+        sctx_domain::TaskSignalLifecycle::Active
+    );
+    assert_eq!(focused.focus.focus.repository_id, first_scan.repository_id);
+    let pack = focused.context;
     assert_eq!(pack.artifact_generation, Some(rebuilt.artifact_generation));
     assert!(pack.items.iter().any(|item| {
         item.context.context_id == context_id
@@ -388,6 +538,496 @@ fn scan_record_rebuild_explain_and_task_pack_cross_two_repositories_and_a_worktr
             .all(|repository| repository.status == "available"),
         "Task retrieval consumes the already-built Graph without rescanning now-missing Repositories"
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn public_mcp_artifact_focus_covers_six_kinds_catalog_isolation_lifecycle_and_hot_path() {
+    #[derive(Clone)]
+    struct FocusCase {
+        repository_path: std::path::PathBuf,
+        repository_id: sctx_domain::RepositoryId,
+        context_id: ContextId,
+        locator: ArtifactLocator,
+    }
+
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("focus MCP root");
+    let cross = temporary.path().join("workspace cross");
+    let main_repository = cross.join("main/multilanguage");
+    seed_six_kinds(&main_repository);
+    let cross_repositories =
+        ["fe/search", "android/search", "ios/search"].map(|relative| cross.join(relative));
+    for repository in &cross_repositories {
+        init_repo(
+            repository,
+            &[(
+                "src/shared.ts",
+                "export function sharedSearch() { return true; }\n",
+            )],
+        );
+    }
+    let main_repository = fs::canonicalize(main_repository).unwrap();
+    let cross_repositories =
+        cross_repositories.map(|repository| fs::canonicalize(repository).unwrap());
+    let config = UserConfigStore::initialize(&root).unwrap();
+    let main_id = config
+        .add_repository(None, std::slice::from_ref(&main_repository))
+        .unwrap()
+        .repository
+        .repository_id;
+    let cross_ids = cross_repositories.each_ref().map(|repository| {
+        config
+            .add_repository(None, std::slice::from_ref(repository))
+            .unwrap()
+            .repository
+            .repository_id
+    });
+    let main_scan = repository_scan_at_root(
+        &root,
+        &scan_input(
+            &main_repository,
+            &[
+                "rust/src/lib.rs",
+                "web/src/search.ts",
+                "schema/openapi.json",
+            ],
+        ),
+    )
+    .unwrap();
+    let mut cases = Vec::new();
+    for kind in [
+        ArtifactKind::File,
+        ArtifactKind::Module,
+        ArtifactKind::Symbol,
+        ArtifactKind::Api,
+        ArtifactKind::Schema,
+        ArtifactKind::Test,
+    ] {
+        let artifact = main_scan
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == kind)
+            .unwrap_or_else(|| panic!("missing six-kind Artifact {kind:?}"));
+        let (context_id, revision_id) =
+            accepted_context(&root, &format!("public Focus {kind:?} Context"));
+        engineering_reference_record_at_root(
+            &root,
+            &reference_input(
+                context_id,
+                revision_id,
+                main_id,
+                kind,
+                reference_relation(kind),
+                artifact.locator.clone(),
+            ),
+        )
+        .unwrap();
+        cases.push(FocusCase {
+            repository_path: main_repository.clone(),
+            repository_id: main_id,
+            context_id,
+            locator: artifact.locator.clone(),
+        });
+    }
+    for (index, (repository, repository_id)) in cross_repositories.iter().zip(cross_ids).enumerate()
+    {
+        let scan =
+            repository_scan_at_root(&root, &scan_input(repository, &["src/shared.ts"])).unwrap();
+        let artifact = scan
+            .artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.kind == ArtifactKind::Symbol && artifact.display_name == "sharedSearch"
+            })
+            .unwrap();
+        let (context_id, revision_id) =
+            accepted_context(&root, &format!("cross Repository Focus {index}"));
+        engineering_reference_record_at_root(
+            &root,
+            &reference_input(
+                context_id,
+                revision_id,
+                repository_id,
+                ArtifactKind::Symbol,
+                ReferenceRelation::Implements,
+                artifact.locator.clone(),
+            ),
+        )
+        .unwrap();
+        cases.push(FocusCase {
+            repository_path: repository.clone(),
+            repository_id,
+            context_id,
+            locator: artifact.locator.clone(),
+        });
+    }
+    let rebuilt = association_rebuild_at_root(
+        &root,
+        &AssociationRebuildInput {
+            diagnose_only: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(rebuilt.status_counts.resolved, cases.len());
+    let graph_store =
+        sctx_engineering_graph::EngineeringProjectionStore::initialize(&root).unwrap();
+    let graph_before = graph_store.canonical_bytes().unwrap().unwrap();
+    let store = GitStore::initialize(&root).unwrap();
+    let knowledge_head_before = git(store.repository(), &["rev-parse", "HEAD"]);
+
+    fs::remove_dir_all(&main_repository).unwrap();
+    for repository in &cross_repositories {
+        fs::remove_dir_all(repository).unwrap();
+    }
+    let mut server = McpServer::new(&root, ClientKind::Codex).unwrap();
+    let initialized = run_mcp(
+        &mut server,
+        &[rpc_request(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2024-11-05"}),
+        )],
+    );
+    assert_eq!(initialized[0]["result"]["protocolVersion"], "2024-11-05");
+
+    let mut first_session = None;
+    for (index, case) in cases.iter().enumerate() {
+        let session = TaskId::new().to_string();
+        let created_task = run_mcp(
+            &mut server,
+            &[tool_call(
+                10 + u64::try_from(index).unwrap() * 10,
+                "task_intent_update",
+                task_update_arguments(&session),
+            )],
+        );
+        assert_eq!(
+            created_task[0]["result"]["isError"], false,
+            "task_intent_update failed: {}",
+            created_task[0]
+        );
+        let task = &created_task[0]["result"]["structuredContent"];
+        let expected_revision_id = task["intent_revision_id"].as_str().unwrap();
+        let task_id = task["task_id"].as_str().unwrap();
+        let absolute = case.repository_path.join(case.locator.path().as_str());
+        assert!(
+            !absolute.exists(),
+            "declared-path resolver must allow missing tails"
+        );
+        let arguments = json!({
+            "agent_kind": "codex",
+            "external_session_id": session,
+            "expected_revision_id": expected_revision_id,
+            "absolute_file_path": absolute,
+            "locator": focus_coordinates(&case.locator),
+            "token_budget": 8000,
+            "max_spaces": 8
+        });
+        let focused = run_mcp(
+            &mut server,
+            &[tool_call(
+                11 + u64::try_from(index).unwrap() * 10,
+                "task_artifact_focus",
+                arguments.clone(),
+            )],
+        );
+        assert_eq!(
+            focused[0]["result"]["isError"], false,
+            "task_artifact_focus failed: {}",
+            focused[0]
+        );
+        let data = &focused[0]["result"]["structuredContent"];
+        assert_eq!(data["created"], true);
+        assert_eq!(data["focus"]["lifecycle"], "active");
+        assert_eq!(
+            data["focus"]["focus"]["repository_id"],
+            case.repository_id.to_string()
+        );
+        assert_eq!(
+            data["focus"]["focus"]["locator"],
+            serde_json::to_value(&case.locator).unwrap()
+        );
+        assert_eq!(
+            data["context"]["items"].as_array().unwrap().len(),
+            1,
+            "unexpected Focus items: {}",
+            data["context"]["items"]
+        );
+        assert_eq!(
+            data["context"]["items"][0]["context"]["context_id"],
+            case.context_id.to_string()
+        );
+        assert_eq!(data["context"]["graph_diagnostics"], json!([]));
+        let signal_id = data["focus"]["signal_id"].as_str().unwrap().to_owned();
+
+        let retried = run_mcp(
+            &mut server,
+            &[tool_call(
+                12 + u64::try_from(index).unwrap() * 10,
+                "task_artifact_focus",
+                arguments,
+            )],
+        );
+        let retry = &retried[0]["result"]["structuredContent"];
+        assert_eq!(retry["created"], false);
+        assert_eq!(retry["focus"]["signal_id"], signal_id);
+        let snapshot = TaskRuntime::initialize(&root)
+            .unwrap()
+            .read_snapshot_by_locator(&ExternalSessionLocator::new("codex", &session).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.intent_revisions.len(), 1);
+        assert_eq!(snapshot.artifact_focuses.len(), 1);
+        if index == 0 {
+            first_session = Some((
+                session,
+                task_id.to_owned(),
+                expected_revision_id.to_owned(),
+                signal_id,
+            ));
+        }
+    }
+
+    let (session, task_id, revision_id, signal_id) = first_session.unwrap();
+    let superseded = run_mcp(
+        &mut server,
+        &[tool_call(
+            500,
+            "task_signal_supersede",
+            json!({
+                "agent_kind": "codex",
+                "external_session_id": session.clone(),
+                "task_id": task_id,
+                "expected_revision_id": revision_id,
+                "signal_ids": [signal_id.clone()]
+            }),
+        )],
+    );
+    assert_eq!(
+        superseded[0]["result"]["structuredContent"]["active_signals"],
+        json!([])
+    );
+    let after_supersede = run_mcp(
+        &mut server,
+        &[tool_call(
+            501,
+            "task_context",
+            json!({
+                "agent_kind": "codex",
+                "external_session_id": session.clone(),
+                "token_budget": 2000,
+                "max_spaces": 8
+            }),
+        )],
+    );
+    let after_supersede = &after_supersede[0]["result"]["structuredContent"];
+    assert_eq!(after_supersede["items"], json!([]));
+    assert_eq!(after_supersede["graph_diagnostics"], json!([]));
+    let first_case = &cases[0];
+    let first_arguments = json!({
+        "agent_kind": "codex",
+        "external_session_id": session,
+        "expected_revision_id": revision_id,
+        "absolute_file_path": first_case.repository_path.join(first_case.locator.path().as_str()),
+        "locator": focus_coordinates(&first_case.locator),
+        "token_budget": 8000,
+        "max_spaces": 8
+    });
+    let reactivated = run_mcp(
+        &mut server,
+        &[tool_call(502, "task_artifact_focus", first_arguments)],
+    );
+    let reactivated = &reactivated[0]["result"]["structuredContent"];
+    assert_eq!(reactivated["created"], true);
+    assert_ne!(reactivated["focus"]["signal_id"], signal_id);
+
+    let second_session_id = TaskId::new().to_string();
+    let second_session = run_mcp(
+        &mut server,
+        &[tool_call(
+            503,
+            "task_intent_update",
+            task_update_arguments(&second_session_id),
+        )],
+    );
+    let second_revision = second_session[0]["result"]["structuredContent"]["intent_revision_id"]
+        .as_str()
+        .unwrap();
+    let isolated = run_mcp(
+        &mut server,
+        &[tool_call(
+            504,
+            "task_artifact_focus",
+            json!({
+                "agent_kind": "codex",
+                "external_session_id": second_session_id,
+                "expected_revision_id": second_revision,
+                "absolute_file_path": first_case.repository_path.join(first_case.locator.path().as_str()),
+                "locator": focus_coordinates(&first_case.locator),
+                "token_budget": 8000,
+                "max_spaces": 8
+            }),
+        )],
+    );
+    let isolated = &isolated[0]["result"]["structuredContent"];
+    assert_ne!(
+        isolated["focus"]["signal_id"],
+        reactivated["focus"]["signal_id"]
+    );
+    assert_eq!(isolated["context"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        isolated["context"]["items"][0]["context"]["context_id"],
+        first_case.context_id.to_string()
+    );
+
+    let missing_session_id = TaskId::new().to_string();
+    let missing_task = run_mcp(
+        &mut server,
+        &[tool_call(
+            510,
+            "task_intent_update",
+            task_update_arguments(&missing_session_id),
+        )],
+    );
+    let missing_revision = missing_task[0]["result"]["structuredContent"]["intent_revision_id"]
+        .as_str()
+        .unwrap();
+    let missing_path = main_repository.join("future/not-created.ts");
+    let missing_arguments = json!({
+        "agent_kind": "codex",
+        "external_session_id": missing_session_id,
+        "expected_revision_id": missing_revision,
+        "absolute_file_path": missing_path,
+        "locator": {
+            "locator_kind": "symbol",
+            "language": "typescript-javascript",
+            "module": "future",
+            "enclosing_type": null,
+            "symbol_name": "notCreated",
+            "signature": "export function notCreated()"
+        },
+        "token_budget": 2000,
+        "max_spaces": 8
+    });
+    let missing = run_mcp(
+        &mut server,
+        &[tool_call(
+            511,
+            "task_artifact_focus",
+            missing_arguments.clone(),
+        )],
+    );
+    let missing = &missing[0]["result"]["structuredContent"];
+    assert_eq!(missing["context"]["items"], json!([]));
+    assert_eq!(
+        missing["context"]["graph_diagnostics"][0]["kind"],
+        "artifact_not_reachable_in_graph"
+    );
+    assert_eq!(missing["focus"]["lifecycle"], "active");
+    let mut bounded_arguments = missing_arguments.clone();
+    bounded_arguments["token_budget"] = json!(256);
+    let bounded = run_mcp(
+        &mut server,
+        &[tool_call(5111, "task_artifact_focus", bounded_arguments)],
+    );
+    let bounded = &bounded[0]["result"]["structuredContent"]["context"];
+    assert!(bounded["estimated_tokens"].as_u64().unwrap() <= 256);
+    assert!(
+        !bounded["graph_diagnostics"].as_array().unwrap().is_empty()
+            || bounded["omitted"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|omitted| {
+                    omitted["reason"] == "graph_diagnostic_token_budget"
+                        || omitted["reason"] == "omitted"
+                })
+    );
+
+    let mut stale_arguments = missing_arguments.clone();
+    stale_arguments["expected_revision_id"] = json!(sctx_domain::TaskIntentRevisionId::new());
+    let stale = run_mcp(
+        &mut server,
+        &[tool_call(512, "task_artifact_focus", stale_arguments)],
+    );
+    assert_eq!(stale[0]["result"]["isError"], true);
+
+    for (offset, forbidden) in [
+        ("repository_id", json!(main_id)),
+        ("relative_path", json!("future/not-created.ts")),
+        ("artifact_key", json!("forged")),
+        ("generation", json!("forged")),
+        ("hook", json!(true)),
+        ("corroboration", json!({})),
+        ("workspace", json!(cross)),
+    ] {
+        let mut forged = missing_arguments.clone();
+        forged
+            .as_object_mut()
+            .unwrap()
+            .insert(offset.to_owned(), forbidden);
+        let rejected = run_mcp(
+            &mut server,
+            &[tool_call(520, "task_artifact_focus", forged)],
+        );
+        assert_eq!(rejected[0]["result"]["isError"], true, "accepted {offset}");
+    }
+    let mut nested_path = missing_arguments.clone();
+    nested_path["locator"]["path"] = json!("future/not-created.ts");
+    let rejected = run_mcp(
+        &mut server,
+        &[tool_call(521, "task_artifact_focus", nested_path)],
+    );
+    assert_eq!(rejected[0]["result"]["isError"], true);
+
+    let mut durations = Vec::with_capacity(100);
+    for index in 0..100 {
+        let started = Instant::now();
+        let response = run_mcp(
+            &mut server,
+            &[tool_call(
+                600 + index,
+                "task_artifact_focus",
+                missing_arguments.clone(),
+            )],
+        );
+        assert_eq!(response[0]["result"]["isError"], false);
+        durations.push(started.elapsed().as_micros());
+    }
+    durations.sort_unstable();
+    let p95 = durations[durations.len() * 95 / 100];
+    eprintln!("task_artifact_focus established-session p95={p95}us");
+    assert!(p95 < 250_000, "task_artifact_focus p95 {p95}us >= 250ms");
+
+    assert_eq!(
+        git(store.repository(), &["rev-parse", "HEAD"]),
+        knowledge_head_before
+    );
+    assert_eq!(
+        graph_store.canonical_bytes().unwrap().unwrap(),
+        graph_before
+    );
+    let implementation = include_str!("../src/lib.rs");
+    let focus_hot_path = implementation
+        .split_once("    fn task_artifact_focus(\n")
+        .unwrap()
+        .1
+        .split_once("    fn task_intent_update(\n")
+        .unwrap()
+        .0;
+    for forbidden in [
+        "Command::",
+        "RepositoryScanner",
+        "association_rebuild",
+        "engineering_reference_record",
+        "hook",
+    ] {
+        assert!(
+            !focus_hot_path.contains(forbidden),
+            "hot path contains {forbidden}"
+        );
+    }
 }
 
 #[test]

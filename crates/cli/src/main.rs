@@ -39,7 +39,8 @@ use sctx_local_state::{
 };
 use sctx_mcp::{
     AssociationExplainInput, AssociationRebuildInput, EngineeringReferenceRecordInput,
-    RepositoryScanInput, TaskContextReadInput, TaskIntentUpdateInput, TaskSignalSupersedeInput,
+    RepositoryScanInput, TaskArtifactFocusInput, TaskContextReadInput, TaskIntentUpdateInput,
+    TaskSignalSupersedeInput,
 };
 use sctx_search::{ContextStatus, ScopeFilter, SearchEngine, SearchFilters, SearchRequest};
 use sctx_task_runtime::TaskRuntime;
@@ -63,7 +64,7 @@ Commands:
   candidate create
   context revise|review|publish|withdraw|get
   semantic conflict open|resolve
-  task context|intent update|signal supersede
+  task context|artifact-focus|intent update|signal supersede
   repository add|list|doctor|scan
   engineering-reference record
   association explain|rebuild
@@ -627,8 +628,8 @@ fn verify_demo_mcp(
         .and_then(|response| response.pointer("/result/tools"))
         .and_then(Value::as_array)
         .ok_or_else(|| invariant("demo MCP tools/list response is missing"))?;
-    if tools.len() != 11 {
-        return Err(invariant("demo MCP tools/list did not return eleven tools"));
+    if tools.len() != 12 {
+        return Err(invariant("demo MCP tools/list did not return twelve tools"));
     }
     let results = responses
         .get(2)
@@ -1558,6 +1559,22 @@ fn run_search(args: &[String], json_output: bool) -> Result<()> {
 fn run_task(args: &[String], json_output: bool) -> Result<()> {
     match args {
         [command, rest @ ..] if command == "context" => run_task_context(rest, json_output),
+        [command, rest @ ..] if command == "artifact-focus" => {
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(&["--input"], &[])?;
+            let input: TaskArtifactFocusInput =
+                read_json(options.required("--input")?, "Task Artifact Focus")?;
+            let response = sctx_mcp::task_artifact_focus_at_root(installation_root()?, &input)?;
+            let data = serde_json::to_value(&response)
+                .map_err(json_error("serialize Task Artifact Focus response"))?;
+            emit_raw(
+                "task.artifact-focus",
+                &response.context.tree,
+                response.context.generation,
+                &data,
+                json_output,
+            )
+        }
         [group, command, rest @ ..] if group == "intent" && command == "update" => {
             let options = Options::parse(rest, &[])?;
             options.allow_only(&["--input"], &[])?;
@@ -1590,7 +1607,7 @@ fn run_task(args: &[String], json_output: bool) -> Result<()> {
             emit("task.signal.supersede", &metadata, data, json_output)
         }
         _ => Err(invalid(
-            "Usage: sctx task context|intent update|signal supersede [OPTIONS]",
+            "Usage: sctx task context|artifact-focus|intent update|signal supersede [OPTIONS]",
         )),
     }
 }

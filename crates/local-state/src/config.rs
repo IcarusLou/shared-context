@@ -454,6 +454,60 @@ impl RepositoryCatalogSnapshot {
         Ok(resolved)
     }
 
+    /// Resolves one Agent-declared absolute Artifact path through the configured Catalog without
+    /// requiring the leaf (or a trailing path suffix) to exist.
+    ///
+    /// Existing components are checked for symlink escape and non-directory parents. No Git,
+    /// scanner, Workspace, or source-existence claim participates in this mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RepositoryNotConfigured` when no configured checkout is a prefix, or rejects dot
+    /// segments, symlink traversal, and an existing non-directory before the final component.
+    pub fn resolve_declared_path(&self, declared_path: &Path) -> Result<ResolvedRepositoryPath> {
+        validate_absolute_path(declared_path, "declared Artifact path")?;
+        let mut matches = self
+            .repositories
+            .iter()
+            .flat_map(|repository| {
+                repository
+                    .checkout_paths
+                    .iter()
+                    .filter_map(move |checkout| {
+                        declared_path
+                            .starts_with(checkout)
+                            .then_some((repository.repository_id, checkout))
+                    })
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            right
+                .1
+                .components()
+                .count()
+                .cmp(&left.1.components().count())
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let Some((repository_id, checkout_path)) = matches.first().copied() else {
+            return Err(Error::new(
+                ErrorKind::RepositoryNotConfigured,
+                "declared Artifact path is not inside a configured Repository checkout",
+            ));
+        };
+        validate_declared_components(declared_path, checkout_path)?;
+        let relative = declared_path
+            .strip_prefix(checkout_path)
+            .map_err(|_| invariant("configured declared-path prefix disappeared"))?;
+        let relative = relative
+            .to_str()
+            .ok_or_else(|| invalid("Repository-relative Artifact path must be valid UTF-8"))?;
+        Ok(ResolvedRepositoryPath {
+            repository_id,
+            checkout_path: checkout_path.clone(),
+            relative_path: RepoRelativePath::new(relative)?,
+        })
+    }
+
     /// Pure longest-prefix mapping for already-canonical paths.
     ///
     /// # Errors
@@ -648,6 +702,49 @@ fn reject_symlink_below_checkout(path: &Path, checkout: &Path) -> Result<()> {
             fs::symlink_metadata(&current).map_err(io_error("inspect file component"))?;
         if metadata.file_type().is_symlink() {
             return Err(invalid("file path must not traverse a symlink"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_declared_components(path: &Path, checkout: &Path) -> Result<()> {
+    let checkout_metadata = match fs::symlink_metadata(checkout) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error("inspect configured checkout")(error)),
+    };
+    if checkout_metadata.file_type().is_symlink() || !checkout_metadata.is_dir() {
+        return Err(invalid(
+            "configured checkout must remain a non-symlink directory",
+        ));
+    }
+    if fs::canonicalize(checkout).map_err(io_error("canonicalize configured checkout"))? != checkout
+    {
+        return Err(invalid(
+            "configured checkout canonical path changed or traverses a symlink",
+        ));
+    }
+    let relative = path
+        .strip_prefix(checkout)
+        .map_err(|_| invalid("declared Artifact path is outside the configured checkout"))?;
+    let components = relative.components().collect::<Vec<_>>();
+    let mut current = checkout.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(io_error("inspect declared Artifact component")(error)),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(invalid(
+                "declared Artifact path must not traverse a symlink",
+            ));
+        }
+        if index + 1 < components.len() && !metadata.is_dir() {
+            return Err(invalid(
+                "declared Artifact path traverses an existing non-directory",
+            ));
         }
     }
     Ok(())

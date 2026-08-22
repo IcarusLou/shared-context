@@ -1,8 +1,8 @@
 # Task-first Retrieval Integration Acceptance Report
 
 Date: 2026-08-22
-Scope: Mew #112 through #153, excluding deferred #151/#152 and accepted boundary #150
-Implementation baseline for local Repository Catalog: `main@92b88fe`
+Scope: Mew #112 through #153, including TaskArtifactFocus runtime/tool #151/#152 and accepted boundary #150
+Implementation baseline for public Artifact Focus: `main@fbf9e4c`
 
 ## Verdict
 
@@ -46,8 +46,12 @@ M4 retains Mandatory Gate #114/#117: stable `submission_id` idempotency must be 
 | Same Workspace external Sessions remain isolated | PROVEN | Page and server calls share one Workspace signal but receive distinct TaskSession/Task IDs and disjoint Space/Context sets |
 | Workspace paths cannot create Space or Artifact priors | PROVEN | Workspace signals remain non-locating; RepositoryId enters Graph retrieval only inside a complete TaskArtifactFocus and never as a global filter |
 | TaskArtifactFocus lifecycle is isolated and deterministic | PROVEN | Internal Runtime tests cover all six Artifact kinds, Task+Intent CAS, concurrent/repeated dedup, stable SignalId, supersede/history/re-focus, new Task reset, task switch, and same-Workspace double Session isolation without creating Intent revisions |
+| Public Artifact Focus contract is strict and server-resolved | PROVEN | MCP `task_artifact_focus` exposes only Session locator, expected Revision, absolute path, six no-path coordinate shapes and output bounds with recursive `additionalProperties=false`; forged identity/route/generation/Hook fields fail |
+| Public MCP lifecycle reaches Graph for all six kinds | PROVEN | Real MCP frames create ActiveTasks and declare File/Module/Symbol/API/Schema/Test Focuses, immediately return exact Graph Context, idempotently reuse SignalId, supersede/re-focus, and isolate duplicate Sessions |
 | Repository-scoped exact Focus never crosses repositories | PROVEN | Search builds two historical Graph nodes with identical locators under different RepositoryIds and proves each Focus returns only its named Repository Context |
+| Cross-parent Catalog mapping never mixes repositories | PROVEN | Real MCP Focuses use equal `src/shared.ts` locators under configured FE/Android/iOS checkouts and return only the Context owned by each stable Catalog RepositoryId |
 | Unreachable Focus has typed zero-result semantics | PROVEN | Wrong-Repository and unavailable-Graph Focuses return no Graph Context and a budgeted `artifact_not_reachable_in_graph` diagnostic; they never claim current-code `missing` |
+| Reachability reflects actual selected-mode output | PROVEN | Unsafe/ambiguous automatic Focus remains unreachable; Explicit marks reachable only after a GraphDiagnostic, preventing false suppression of `artifact_not_reachable_in_graph` |
 | PostTool observations never fabricate Artifact identity | PROVEN | A real Codex Hook Prompt→PostTool sequence retains one Task ID, keeps File data out of engineering Signals/Focus, records TestOutcome as non-locating, and creates no Graph edge |
 | Automatic TaskContextPack excludes every unsafe state | PROVEN | The oracle seeds an unassigned Candidate plus Space-associated Candidate, Deprecated, semantic-conflict, and incomplete-Evidence Context; automatic output is empty while a direct SearchEngine diagnostic query proves each fixture state exists |
 | Tree, Generation, and Task fingerprint are consistent | PROVEN | M2 response Tree equals Git `HEAD^{tree}` and index metadata; Generation equals the same projection; identical Session input returns identical fingerprint, associations, items, and paths |
@@ -58,6 +62,8 @@ M4 retains Mandatory Gate #114/#117: stable `submission_id` idempotency must be 
 | Cross Workspace mapping is isolated and non-discovering | PROVEN | Real-structure CLI E2E configures FE/Android/iOS repos under one parent Workspace, maps equal relative paths to each owning stable RepositoryId, leaves an unconfigured sibling signal-free, and converges root/subdirectory/parent Workspace inputs |
 | Hook observations are bounded, non-locating, and Git-free | PROVEN | A fake `git` sentinel proves PostTool never launches Git; File observations remain Breadcrumb-only, TestOutcome is non-locating, and Catalog/Registry failures return sanitized success responses without Focus submission |
 | Catalog and Registry validation are explicit | PROVEN | CLI `repository add/list/doctor`, installer setup/doctor, and MCP Runtime open synchronize only trusted local Catalog IDs; invalid short IDs are typed errors and public `repository_scan` rejects unconfigured checkout or caller Repository identity fields |
+| Declared missing paths resolve safely without code inspection | PROVEN | Catalog accepts missing leaf/tail below an exact configured checkout while rejecting dot segments, symlink components, existing non-directory parents, and unconfigured paths; historical Graph remains reachable after checkout deletion |
+| Focus hot path has no engineering mutation or Hook dependency | PROVEN | Git HEAD and Graph canonical bytes remain unchanged; source sentinel rejects Command/Scanner/rebuild/Reference/Hook calls; real established-session MCP p95 is below 250ms (observed 66.1ms in focused gate) |
 | Engineering failure is advisory to Task Retrieval | PROVEN | Rebuild reports unavailable registered Repositories explicitly, Explain reports typed projection availability, and a corrupt Engineering projection degrades Task responses to `artifact_generation: null` instead of blocking Context-only retrieval |
 | Multi-language Artifact discovery has an independent bounded oracle | PROVEN | `milestone-three-v1.json` fixes hand-authored IDs/References and the exact Reference-derived path plan; a separate Scanner contract explicitly plans Rust, TS, JS, Swift, Kotlin, JSON, OpenAPI and Proto paths and validates exact API/Schema/Qualified Symbol/Test locators without full-repository enumeration |
 | File move and Symbol rename never trigger guessing | PROVEN | M3 oracle moves a JS file and renames a TS Symbol, then proves both original deterministic locators become `missing`, create no Edge, and remain unchanged without Git-history or Agent repair workflow |
@@ -76,7 +82,7 @@ M4 retains Mandatory Gate #114/#117: stable `submission_id` idempotency must be 
 
 #150 remains an accepted product boundary: untracked files are not scanned, and no ActiveTask untracked scan entry was added.
 
-#151 is implemented below the public tool layer: Runtime owns repository-scoped TaskArtifactFocus CAS/dedup/lifecycle/history, and Search consumes only Active Focus. #152 remains unimplemented, so no MCP/Skill Focus submission entry exists. Repository Catalog is local-only; team synchronization is not claimed.
+#151/#152 are implemented: Runtime owns repository-scoped TaskArtifactFocus CAS/dedup/lifecycle/history; public MCP/CLI and Skill submit Focus through Catalog-resolved identity; Search consumes only Active Focus. Repository Catalog remains local-only; team synchronization is not claimed.
 
 ## Residue gates
 
@@ -89,7 +95,7 @@ The M1–M3 gate searches product code, tests, fixtures, scripts, and docs (excl
 - the removed task-text MCP bridge, bare-query Agent action, legacy Hook lookup helper, and non-Task automatic Context Pack CLI surface.
 - the removed textual TaskSignal channel/path that previously looked like an Engineering Graph edge.
 - the removed Repository auto-registration types, remote/declared/common-dir merge hints, and Hook `git rev-parse` discovery path;
-- any `TaskArtifactFocus`/MCP Graph-query implementation deferred to #151/#152.
+- caller-supplied RepositoryId, RepoRelativePath, ArtifactKey, Generation, Workspace, Hook or corroboration fields in `task_artifact_focus`.
 
 Expected result: zero matches. Generic target-design language such as a proposed new Space Intent is not a Context-Propose API. `context_search` and its explicit `space_ids` hard filter are intentionally present.
 
@@ -121,7 +127,7 @@ Current repository gate results:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: passed with no warnings.
-- `cargo test --workspace --locked`: 280 passed, 0 failed, 1 ignored manual benchmark.
+- `cargo test --workspace --locked`: 289 passed, 0 failed, 1 ignored manual benchmark.
 - `npm test`: 16 passed, 0 failed, 0 skipped.
 - Shared Context Skill `quick_validate.py`: passed (`Skill is valid!`).
 

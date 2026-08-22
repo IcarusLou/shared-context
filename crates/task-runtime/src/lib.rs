@@ -45,6 +45,7 @@ pub struct MergeArtifactFocusesOutcome {
     pub snapshot: TaskSessionSnapshot,
     pub inserted: usize,
     pub inserted_signal_ids: Vec<SignalId>,
+    pub focus_signal_ids: Vec<SignalId>,
 }
 
 /// Result of explicitly creating and activating a new Task.
@@ -858,18 +859,18 @@ fn merge_artifact_focuses_in_transaction(
     focuses: &[TaskArtifactFocus],
 ) -> Result<MergeArtifactFocusesOutcome> {
     let mut inserted_signal_ids = Vec::new();
+    let mut focus_signal_ids = Vec::with_capacity(focuses.len());
     let mut next_ordinal = next_artifact_focus_ordinal(transaction, task_session_id)?;
     for focus in focuses {
         let locator_json = serde_json::to_string(&focus.locator)
             .map_err(json_error("serialize Task Artifact Focus locator"))?;
-        if find_active_artifact_focus(
+        if let Some(signal_id) = find_active_artifact_focus(
             transaction,
             task_session_id,
             focus.repository_id,
             &locator_json,
-        )?
-        .is_some()
-        {
+        )? {
+            focus_signal_ids.push(signal_id);
             continue;
         }
         let signal_id = SignalId::new();
@@ -890,6 +891,7 @@ fn merge_artifact_focuses_in_transaction(
             )
             .map_err(sql_error("insert active Task Artifact Focus"))?;
         inserted_signal_ids.push(signal_id);
+        focus_signal_ids.push(signal_id);
         next_ordinal = next_ordinal
             .checked_add(1)
             .ok_or_else(|| invariant("Task Artifact Focus ordinal overflow"))?;
@@ -899,6 +901,7 @@ fn merge_artifact_focuses_in_transaction(
         snapshot,
         inserted: inserted_signal_ids.len(),
         inserted_signal_ids,
+        focus_signal_ids,
     })
 }
 

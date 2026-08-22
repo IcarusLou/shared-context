@@ -1387,6 +1387,7 @@ fn task_context_cli_entry_is_locator_only_and_read_only() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts() {
     let harness = Harness::new();
     GitStore::initialize(harness.root()).unwrap();
@@ -1421,6 +1422,50 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
     assert_eq!(updated["command"], "task.intent.update");
     assert!(text(&updated, "task_id").starts_with("tsk_"));
     assert!(text(&updated, "intent_revision_id").starts_with("tir_"));
+
+    let business_repository = harness.home.join("business repository");
+    fs::create_dir_all(&business_repository).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&business_repository)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let business_repository = fs::canonicalize(business_repository).unwrap();
+    UserConfigStore::initialize(harness.root())
+        .unwrap()
+        .add_repository(None, std::slice::from_ref(&business_repository))
+        .unwrap();
+    let focus_path = harness.home.join("task-artifact-focus.json");
+    fs::write(
+        &focus_path,
+        serde_json::to_vec(&serde_json::json!({
+            "agent_kind": "codex",
+            "external_session_id": "cli-authoritative",
+            "expected_revision_id": updated["data"]["intent_revision_id"],
+            "absolute_file_path": business_repository.join("src/future.rs"),
+            "locator": {"locator_kind": "file"},
+            "token_budget": 2000,
+            "max_spaces": 8
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let focused = harness.success(&[
+        "task",
+        "artifact-focus",
+        "--input",
+        focus_path.to_str().unwrap(),
+    ]);
+    assert_eq!(focused["command"], "task.artifact-focus");
+    assert_eq!(focused["data"]["created"], true);
+    assert_eq!(focused["data"]["focus"]["lifecycle"], "active");
+    assert_eq!(
+        focused["data"]["context"]["graph_diagnostics"][0]["kind"],
+        "artifact_not_reachable_in_graph"
+    );
 
     let task_session_id = updated["data"]["task_session_id"]
         .as_str()
@@ -1561,7 +1606,7 @@ fn mcp_stdio_entry_serves_cursor_and_codex_without_extra_stdout() {
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
         assert_eq!(
             responses[1]["result"]["tools"].as_array().unwrap().len(),
-            11
+            12
         );
     }
 }

@@ -333,7 +333,7 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
 
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 12);
         let names = tools
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
@@ -342,6 +342,7 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
             names,
             [
                 "task_intent_update",
+                "task_artifact_focus",
                 "task_signal_supersede",
                 "task_context",
                 "repository_scan",
@@ -413,6 +414,37 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
         assert_eq!(task_schema["properties"]["max_spaces"]["maximum"], 32);
         assert_eq!(task_schema["properties"]["max_spaces"]["default"], 8);
         assert_eq!(task_schema["properties"]["token_budget"]["minimum"], 256);
+        let focus_schema = &tools
+            .iter()
+            .find(|tool| tool["name"] == "task_artifact_focus")
+            .unwrap()["inputSchema"];
+        assert_eq!(focus_schema["additionalProperties"], false);
+        assert_eq!(
+            focus_schema["required"],
+            json!([
+                "agent_kind",
+                "external_session_id",
+                "expected_revision_id",
+                "absolute_file_path",
+                "locator"
+            ])
+        );
+        let focus_schema_text = focus_schema.to_string();
+        for forbidden in [
+            "repository_id",
+            "relative_path",
+            "artifact_key",
+            "generation",
+            "hook",
+            "corroboration",
+            "workspace",
+        ] {
+            assert!(
+                !focus_schema_text.contains(forbidden),
+                "forbidden task_artifact_focus field: {forbidden}"
+            );
+        }
+        assert!(!focus_schema_text.contains("\"path\""));
         let repository_scan_schema = &tools
             .iter()
             .find(|tool| tool["name"] == "repository_scan")
@@ -1225,8 +1257,12 @@ fn shared_context_skill_contract_drives_mcp_runtime_and_search_response() {
         "maturity",
         "evidence_refs",
         "active_signals",
+        "task_artifact_focus",
+        "absolute_file_path",
+        "artifact_not_reachable_in_graph",
+        "task_signal_supersede",
     ] {
-        assert!(skill.contains(required));
+        assert!(skill.contains(required), "Skill is missing {required}");
     }
     let arguments = serde_json::to_value(update_input(
         "skill-e2e",

@@ -796,6 +796,7 @@ fn generic_test_outcome_never_matches_qualified_test_artifact() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn context_tree_mismatch_preserves_historical_graph_while_unavailable_artifacts_fall_back() {
     let fixture = graph_fixture();
     let current = fixture.graph_store.read_projection().unwrap().unwrap();
@@ -881,6 +882,11 @@ fn context_tree_mismatch_preserves_historical_graph_while_unavailable_artifacts_
             .associations
             .iter()
             .any(|item| item.space_id == fixture.generic_space)
+    );
+    assert_eq!(fallback.graph_diagnostics.len(), 1);
+    assert_eq!(
+        fallback.graph_diagnostics[0].kind,
+        TaskGraphDiagnosticKind::ArtifactNotReachableInGraph
     );
 
     let mut diagnostic_request = task_request(
@@ -1335,9 +1341,15 @@ fn build_time_candidate_incomplete_and_conflicted_contexts_never_cross_automatic
                 .iter()
                 .all(|item| item.context.context_id != context_id)
         );
+        assert_eq!(automatic_pack.graph_diagnostics.len(), 1);
+        assert_eq!(
+            automatic_pack.graph_diagnostics[0].focus_signal_id,
+            automatic.artifact_focuses[0].signal_id
+        );
 
         automatic.mode = ContextPackMode::Explicit;
         let explicit = engine.task_context_pack(&automatic).unwrap();
+        assert!(explicit.graph_diagnostics.is_empty());
         let item = explicit
             .items
             .iter()
@@ -1394,6 +1406,7 @@ fn ambiguous_edges_are_explicit_diagnostics_only_and_never_raise_automatic_eligi
     request.task_intent.goal = "frontend source behavior".to_owned();
     request.task_intent.desired_change = "inspect frontend source decision".to_owned();
     let explicit = engine.task_context_pack(&request).unwrap();
+    assert!(explicit.graph_diagnostics.is_empty());
     let source = explicit
         .items
         .iter()
@@ -1419,6 +1432,11 @@ fn ambiguous_edges_are_explicit_diagnostics_only_and_never_raise_automatic_eligi
 
     request.mode = ContextPackMode::AutomaticInjection;
     let automatic = engine.task_context_pack(&request).unwrap();
+    assert_eq!(automatic.graph_diagnostics.len(), 1);
+    assert_eq!(
+        automatic.graph_diagnostics[0].focus_signal_id,
+        request.artifact_focuses[0].signal_id
+    );
     assert!(
         automatic
             .items
