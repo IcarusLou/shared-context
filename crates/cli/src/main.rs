@@ -38,9 +38,9 @@ use sctx_local_state::{
     UserConfigStore,
 };
 use sctx_mcp::{
-    AssociationExplainInput, AssociationRebuildInput, EngineeringReferenceRecordInput,
-    RepositoryScanInput, TaskArtifactFocusInput, TaskContextReadInput, TaskIntentUpdateInput,
-    TaskSignalSupersedeInput,
+    ArtifactFocusQuery, AssociationExplainInput, AssociationRebuildInput,
+    EngineeringReferenceRecordInput, RepositoryScanInput, TaskContextReadInput,
+    TaskIntentUpdateInput, TaskSignalSupersedeInput,
 };
 use sctx_search::{ContextStatus, ScopeFilter, SearchEngine, SearchFilters, SearchRequest};
 use sctx_task_runtime::TaskRuntime;
@@ -1562,7 +1562,7 @@ fn run_task(args: &[String], json_output: bool) -> Result<()> {
         [command, rest @ ..] if command == "artifact-focus" => {
             let options = Options::parse(rest, &[])?;
             options.allow_only(&["--input"], &[])?;
-            let input: TaskArtifactFocusInput =
+            let input: ArtifactFocusQuery =
                 read_json(options.required("--input")?, "Task Artifact Focus")?;
             let response = sctx_mcp::task_artifact_focus_at_root(installation_root()?, &input)?;
             let data = serde_json::to_value(&response)

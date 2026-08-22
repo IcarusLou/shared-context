@@ -1,6 +1,6 @@
 ---
 name: shared-context
-description: Maintain Shared Context Task Intent, current Artifact Focus, signal lifecycle, and verified engineering references during substantive work. Use when starting implementation, debugging, review, or design; when goals, scope, constraints, Artifacts, Interfaces, or Unknowns materially change; when a File, Module, Symbol/Class, API, Schema, or Test becomes the current engineering focus; when verified evidence connects existing Context to code; when the user switches tasks; when signals become irrelevant; and before context compaction.
+description: Maintain Shared Context Task Intent, query historical Context around an Artifact, manage signal lifecycle, and record verified engineering references during substantive work. Use when starting implementation, debugging, review, or design; when goals, scope, constraints, Artifacts, Interfaces, or Unknowns materially change; when history around a File, Module, Symbol/Class, API, Schema, or Test is needed; when verified evidence connects existing Context to code; when the user switches tasks; when signals become irrelevant; and before context compaction.
 ---
 
 # Shared Context
@@ -18,7 +18,7 @@ Submit a complete Intent snapshot every time. Include all fields: `goal`, `desir
 
 Always send the last returned `intent_revision_id` as `expected_revision_id` for `continue` or for `new` within an existing external session. Use `null` only for the first `new` Task when no external session exists. On a stale-revision error, read the current response/state, reconcile it, and retry; never guess a Revision ID.
 
-Set `maturity` to `provisional` while important claims remain unconfirmed and to `grounded` only with non-empty `evidence_refs`. Every declared Artifact or Interface must be backed by an already-active repository-scoped structured Artifact identity or an exact `evidence_ref`; Prompt, Diff, Workspace and TestOutcome text do not qualify. Use the returned Context Pack as read-only task context and retain its `task_id`, `intent_revision_id`, `active_signals`, and Artifact Focus Signal IDs for later CAS updates.
+Set `maturity` to `provisional` while important claims remain unconfirmed and to `grounded` only with non-empty `evidence_refs`. Every declared Artifact or Interface must be backed by an exact `evidence_ref`; Prompt, Diff, Workspace, TestOutcome, and a transient Artifact Focus query do not qualify. Use the returned Context Pack as read-only task context and retain its `task_id`, `intent_revision_id`, and `active_signals` for later CAS updates.
 
 ## Choose the Task boundary
 
@@ -30,15 +30,15 @@ Set `task_boundary` deliberately:
 
 ## Retire stale signals
 
-Call `task_signal_supersede` when an active signal or Artifact Focus becomes irrelevant to the current Task. Send the returned `task_id`, current `intent_revision_id`, and exact `signal_id` values. Supersede only active IDs returned by the Task runtime; do not guess IDs or delete history.
+Call `task_signal_supersede` when an active non-locating signal becomes irrelevant to the current Task. Send the returned `task_id`, current `intent_revision_id`, and exact `signal_id` values. Supersede only active IDs returned by the Task runtime; do not guess IDs or delete history.
 
-## Declare the current Artifact Focus
+## Query Context around an Artifact
 
-Call `task_artifact_focus` after confirming that a new File, Module, Symbol/Class, API, Schema, or Test is a current engineering focus. Do not call it for every file read. If the same Focus is still active, reuse its returned Signal ID instead of repeatedly declaring it.
+Call `task_artifact_focus` once whenever the current request needs historical Context around a File, Module, Symbol/Class, API, Schema, or Test. This is an `ArtifactFocusQuery`, not a declaration or saved Task state. Query again for each different Artifact; after compaction, restart, or Task switch there is no Focus ID or active Focus to restore.
 
-Send the current external Session locator, last `intent_revision_id` as `expected_revision_id`, the absolute local file path as `absolute_file_path`, and complete kind-specific coordinates without a path. Do not submit Repository IDs, repository-relative paths, Artifact keys, Graph generations, Workspace routes, Hook observations, or corroboration claims; the server resolves Repository identity and path from the configured local Catalog.
+Send the current external Session locator, last `intent_revision_id` as `expected_revision_id`, the absolute local file path as `absolute_file_path`, and complete kind-specific coordinates without a path. Do not submit Repository IDs, repository-relative paths, Artifact keys, Graph generations, Workspace routes, Hook observations, or corroboration claims; the server resolves a request-local `ResolvedFocus` from the configured local Catalog.
 
-Treat `artifact_not_reachable_in_graph` as a precise zero-result: the declared Focus remains active and explainable, but the selected historical Graph has no safe exact route. Do not reinterpret it as proof that current code is missing, and do not guess a similar Artifact. Supersede the Focus by its stable Signal ID when it becomes irrelevant.
+Treat `artifact_not_reachable_in_graph` as a precise zero-result for this query: the selected historical Graph has no safe exact route for its `ResolvedFocus`. Do not reinterpret it as proof that current code is missing, and do not guess a similar Artifact. A later query starts independently and ordinary `task_context` never reuses this Focus.
 
 ## Record verified engineering references
 

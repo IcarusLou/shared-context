@@ -1,4 +1,4 @@
 interface:
   display_name: "Shared Context"
-  short_description: "Maintain Task Intent, Artifact Focus, and signals"
-  default_prompt: "Use $shared-context to keep Task Intent, current Artifact Focus, signals, and verified engineering references current."
+  short_description: "Maintain Task Intent and query Artifact history"
+  default_prompt: "Use $shared-context to keep Task Intent and signals current, query historical Context around an Artifact when needed, and record verified engineering references."

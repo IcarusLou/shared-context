@@ -21,7 +21,7 @@ A local container corresponding to one external Agent session, with exactly one 
 _Avoid_: Task, Workspace, knowledge owner
 
 **ActiveTask**:
-The one TaskSession currently selected for new Intent revisions, TaskSignals, TaskArtifactFocuses, and retrieval within an ExternalSession. Changing it is an explicit task-boundary decision, not a Workspace-derived guess.
+The one TaskSession currently selected for new Intent revisions, non-locating TaskSignals, and retrieval within an ExternalSession. Changing it is an explicit task-boundary decision, not a Workspace-derived guess.
 _Avoid_: Active Space, latest Prompt
 
 **TaskIntentRevision**:
@@ -36,16 +36,20 @@ _Avoid_: TaskSessionId, knowledge identifier
 An observable, non-locating input that informs TaskIntent or knowledge retrieval, such as a Prompt, Workspace, Diff, or TestOutcome. A signal is evidence about the current Task, not Artifact identity or a declaration of Space membership.
 _Avoid_: Space binding, routing key
 
-**TaskArtifactFocus**:
-One Artifact an Agent declares relevant to the current Task, identified by RepositoryIdentity plus a complete ArtifactLocator. A Task may have zero or many independent Focuses; the declaration seeds Graph retrieval but does not prove an engineering fact.
-_Avoid_: File signal, Repository filter, verified Artifact
+**ArtifactFocusQuery**:
+A one-request question asking for historical Context around one Artifact. It is transient retrieval input, not Task state, Evidence, or an engineering fact.
+_Avoid_: Active Focus, Focus Signal, saved Focus
+
+**ResolvedFocus**:
+The server’s transient RepositoryIdentity plus complete ArtifactLocator interpretation of one ArtifactFocusQuery. It exists only for that query and is never restored, superseded, or reused implicitly.
+_Avoid_: Focus ID, Artifact evidence, persistent query state
 
 **TestOutcome**:
-A non-locating observation about a test tool execution, such as success or failure. It cannot identify or match a qualified Test Artifact without a separate TaskArtifactFocus.
+A non-locating observation about a test tool execution, such as success or failure. It cannot identify or match a qualified Test Artifact; a request that needs that lookup supplies a separate ArtifactFocusQuery.
 _Avoid_: Test Artifact, qualified Test locator
 
 **TaskSignalLifecycle**:
-The current relevance of one identified TaskSignal or TaskArtifactFocus within its Task: Active entries participate in retrieval, while Superseded entries remain historical evidence but do not participate.
+The current relevance of one identified non-locating TaskSignal within its Task: Active signals participate in retrieval, while Superseded signals remain historical evidence but do not participate.
 _Avoid_: deletion, global signal state
 
 **TaskSpaceAssociation**:
@@ -57,7 +61,7 @@ A budgeted retrieval result for one TaskIntent revision, one current Context pro
 _Avoid_: Space-scoped search result, manually routed Context Pack
 
 **RetrievalPath**:
-A typed explanation of how TaskIntent or an active TaskArtifactFocus made one Context relevant. Text and Applicability paths remain distinct from Engineering Graph paths; only an exact Repository-scoped Focus reachable in that Graph Snapshot can claim an engineering edge.
+A typed explanation of how TaskIntent or this request’s ResolvedFocus made one Context relevant. Text and Applicability paths remain distinct from Engineering Graph paths; only an exact ResolvedFocus reachable in that Graph Snapshot can claim an engineering edge.
 _Avoid_: opaque relevance score, inferred code relation
 
 **EngineeringGraphSnapshot**:
@@ -69,7 +73,7 @@ One immutable Context revision, its fixed relation targets, and its automatic-sa
 _Avoid_: current Context head, live governance lookup
 
 **EvidenceSource**:
-A typed, resolvable provenance target that can ground a TaskIntent or engineering claim, such as an active TaskArtifactFocus, immutable Context Evidence, or a current unique Engineering Resolution. An opaque label, generic TestOutcome, or unavailable/ambiguous target is not an EvidenceSource.
+A typed, resolvable provenance target that can ground a TaskIntent or engineering claim, such as immutable Context Evidence or a current unique Engineering Resolution. ArtifactFocusQuery, ResolvedFocus, generic TestOutcome, and unavailable/ambiguous targets are not EvidenceSources.
 _Avoid_: evidence string, unverified reference
 
 **RepositoryCatalog**:

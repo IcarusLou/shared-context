@@ -19,10 +19,9 @@ use sctx_domain::{
     Applicability, ArtifactKey, ArtifactKind, ArtifactLocator, ContextId, ContextKind,
     ContextRevisionDraft, EngineeringReferenceDraft, Error, ErrorKind, EvidenceSnapshotDraft,
     EvidenceType, ExternalSessionLocator, ReferenceId, ReferenceRelation, RepoRelativePath,
-    RepositoryId, ResolutionStatus, Result, RevisionId, SignalId, SpaceId, TaskArtifactFocus,
-    TaskArtifactFocusRecord, TaskId, TaskIntentDraft, TaskIntentRevisionId, TaskSessionId,
-    TaskSessionSnapshot, TaskSignalLifecycle, TaskSignalRecord, TaskSpaceAssociation,
-    WorkEpisodeId,
+    RepositoryId, ResolutionStatus, ResolvedFocus, Result, RevisionId, SignalId, SpaceId, TaskId,
+    TaskIntentDraft, TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignalLifecycle,
+    TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId,
 };
 use sctx_engineering_graph::{
     CandidateMatchEvidence, CatalogRepositorySpec, EngineeringProjectionStore,
@@ -211,7 +210,7 @@ impl RequiredNullableString {
 /// Agent-authored kind-specific Artifact coordinates. Repository-relative path is server-owned.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "locator_kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum TaskArtifactFocusCoordinates {
+pub enum ArtifactFocusQueryCoordinates {
     File,
     Module,
     Api {
@@ -236,7 +235,7 @@ pub enum TaskArtifactFocusCoordinates {
     },
 }
 
-impl TaskArtifactFocusCoordinates {
+impl ArtifactFocusQueryCoordinates {
     fn into_locator(self, path: RepoRelativePath) -> ArtifactLocator {
         match self {
             Self::File => ArtifactLocator::File { path },
@@ -285,22 +284,22 @@ impl TaskArtifactFocusCoordinates {
     }
 }
 
-/// Strict public request for declaring one current Artifact Focus and immediately retrieving.
+/// Strict public query for resolving one Artifact Focus and immediately retrieving.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TaskArtifactFocusInput {
+pub struct ArtifactFocusQuery {
     pub agent_kind: String,
     pub external_session_id: String,
     pub expected_revision_id: String,
     pub absolute_file_path: String,
-    pub locator: TaskArtifactFocusCoordinates,
+    pub locator: ArtifactFocusQueryCoordinates,
     #[serde(default = "default_token_budget")]
     pub token_budget: usize,
     #[serde(default = "default_max_spaces")]
     pub max_spaces: usize,
 }
 
-impl TaskArtifactFocusInput {
+impl ArtifactFocusQuery {
     fn locator(&self) -> Result<ExternalSessionLocator> {
         ExternalSessionLocator::new(&self.agent_kind, &self.external_session_id)
     }
@@ -352,11 +351,10 @@ pub struct TaskContextResponse {
     pub omitted: Vec<ContextPackOmitted>,
 }
 
-/// Result of one idempotent Focus declaration and its immediate Task Context retrieval.
+/// Result of one request-local Focus resolution and its immediate Task Context retrieval.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct TaskArtifactFocusResponse {
-    pub focus: TaskArtifactFocusRecord,
-    pub created: bool,
+pub struct ArtifactFocusQueryResponse {
+    pub resolved_focus: ResolvedFocus,
     pub context: TaskContextResponse,
 }
 
@@ -643,6 +641,7 @@ impl Runtime {
             &self.index,
             self.engineering_graph.as_ref(),
             &snapshot,
+            None,
             input.token_budget,
             input.max_spaces,
         )
@@ -650,8 +649,8 @@ impl Runtime {
 
     fn task_artifact_focus(
         &self,
-        input: &TaskArtifactFocusInput,
-    ) -> Result<TaskArtifactFocusResponse> {
+        input: &ArtifactFocusQuery,
+    ) -> Result<ArtifactFocusQueryResponse> {
         input.validate_bounds()?;
         let session_locator = input.locator()?;
         let active = self
@@ -662,45 +661,25 @@ impl Runtime {
                     "task_artifact_focus requires task_intent_update to establish an ActiveTask",
                 )
             })?;
-        let expected_revision_id =
-            require_expected_revision(&active, Some(input.expected_revision_id.as_str()))?;
+        require_expected_revision(&active, Some(input.expected_revision_id.as_str()))?;
         let resolved = self
             .catalog
             .resolve_declared_path(Path::new(&input.absolute_file_path))?;
-        let focus = TaskArtifactFocus {
+        let resolved_focus = ResolvedFocus {
             repository_id: resolved.repository_id,
             locator: input.locator.clone().into_locator(resolved.relative_path),
         };
-        focus.validate()?;
-        let merged = self.tasks.merge_artifact_focuses(
-            active.task_session_id,
-            active.task_id,
-            expected_revision_id,
-            vec![focus],
-        )?;
-        let [signal_id] = merged.focus_signal_ids.as_slice() else {
-            return Err(invariant(
-                "single Artifact Focus merge did not return one stable SignalId",
-            ));
-        };
-        let focus = merged
-            .snapshot
-            .artifact_focuses
-            .iter()
-            .find(|record| record.signal_id == *signal_id)
-            .cloned()
-            .ok_or_else(|| invariant("merged Artifact Focus is not active in its Task"))?;
-        let created = merged.inserted_signal_ids.contains(signal_id);
+        resolved_focus.validate()?;
         let context = build_task_context_response(
             &self.index,
             self.engineering_graph.as_ref(),
-            &merged.snapshot,
+            &active,
+            Some(resolved_focus.clone()),
             input.token_budget,
             input.max_spaces,
         )?;
-        Ok(TaskArtifactFocusResponse {
-            focus,
-            created,
+        Ok(ArtifactFocusQueryResponse {
+            resolved_focus,
             context,
         })
     }
@@ -717,7 +696,7 @@ impl Runtime {
                     invalid("task_boundary=continue requires an existing ActiveTask")
                 })?;
                 require_expected_revision(&active, input.expected_revision_id.as_deref())?;
-                validate_intent_update(input, &active.artifact_focuses)?;
+                validate_intent_update(input)?;
                 let parent = active
                     .current_intent_revision()
                     .ok_or_else(|| invariant("ActiveTask has no Intent Head"))?
@@ -734,7 +713,7 @@ impl Runtime {
             TaskBoundary::New => {
                 if let Some(active) = active {
                     require_expected_revision(&active, input.expected_revision_id.as_deref())?;
-                    validate_intent_update(input, &[])?;
+                    validate_intent_update(input)?;
                     self.tasks
                         .start_new_task(&locator, active.task_id, &input.intent, Vec::new())?
                         .snapshot
@@ -744,7 +723,7 @@ impl Runtime {
                             "expected_revision_id must be null when no ExternalSession exists",
                         ));
                     }
-                    validate_intent_update(input, &[])?;
+                    validate_intent_update(input)?;
                     let task_id = TaskId::new();
                     self.tasks
                         .open_or_create(locator, input.intent.bind(task_id), Vec::new())?
@@ -756,6 +735,7 @@ impl Runtime {
             &self.index,
             self.engineering_graph.as_ref(),
             &snapshot,
+            None,
             default_token_budget(),
             default_max_spaces(),
         )?;
@@ -1260,10 +1240,7 @@ fn require_expected_revision(
     Ok(actual)
 }
 
-fn validate_intent_update(
-    input: &TaskIntentUpdateInput,
-    artifact_focuses: &[sctx_domain::TaskArtifactFocusRecord],
-) -> Result<()> {
+fn validate_intent_update(input: &TaskIntentUpdateInput) -> Result<()> {
     input.intent.validate()?;
     if normalize_semantic(&input.intent.goal) == normalize_semantic(&input.intent.desired_change) {
         return Err(invalid(
@@ -1283,19 +1260,15 @@ fn validate_intent_update(
             "maturity=grounded requires at least one evidence_ref",
         ));
     }
-    let focus_support = artifact_focuses
-        .iter()
-        .map(|record| normalize_semantic(&record.focus.canonical_identity()))
-        .collect::<HashSet<_>>();
     for (field, values) in [
         ("intent.artifacts", &input.intent.artifacts),
         ("intent.interfaces", &input.intent.interfaces),
     ] {
         for value in values {
             let normalized = normalize_semantic(value);
-            if !focus_support.contains(&normalized) && !evidence.contains(&normalized) {
+            if !evidence.contains(&normalized) {
                 return Err(invalid(format!(
-                    "{field} item lacks active TaskArtifactFocus or evidence_ref support: {value}"
+                    "{field} item lacks evidence_ref support: {value}"
                 )));
             }
         }
@@ -1391,15 +1364,15 @@ pub fn task_context_readonly_at_root(
     Runtime::open(root.as_ref())?.task_context_readonly(input)
 }
 
-/// Declares one current Artifact Focus under `ActiveTask` Intent CAS and returns its immediate Pack.
+/// Resolves one request-local Artifact Focus under `ActiveTask` Intent CAS and returns its Pack.
 ///
 /// # Errors
 ///
 /// Returns typed Session, CAS, Catalog path, locator, Runtime, or Search errors.
 pub fn task_artifact_focus_at_root(
     root: impl AsRef<Path>,
-    input: &TaskArtifactFocusInput,
-) -> Result<TaskArtifactFocusResponse> {
+    input: &ArtifactFocusQuery,
+) -> Result<ArtifactFocusQueryResponse> {
     Runtime::open(root.as_ref())?.task_artifact_focus(input)
 }
 
@@ -1479,18 +1452,19 @@ fn build_task_context_response(
     index: &ProjectionIndex,
     engineering_graph: Option<&EngineeringProjectionStore>,
     snapshot: &TaskSessionSnapshot,
+    resolved_focus: Option<ResolvedFocus>,
     token_budget: usize,
     max_spaces: usize,
 ) -> Result<TaskContextResponse> {
     let current = snapshot
         .current_intent_revision()
         .ok_or_else(|| invariant("Task Session has no current Intent revision"))?;
-    let mut request = TaskContextRequest::automatic_with_focus(
+    let mut request = TaskContextRequest::automatic(
         current.intent.clone(),
         snapshot.task_signals.clone(),
-        snapshot.artifact_focuses.clone(),
         token_budget,
     );
+    request.resolved_focus = resolved_focus;
     request.max_spaces = max_spaces;
     let pack = if let Some(engineering_graph) = engineering_graph {
         SearchEngine::with_engineering_graph(index.clone(), engineering_graph.clone())
@@ -1751,7 +1725,7 @@ impl McpServer {
     }
 
     fn task_artifact_focus(&self, arguments: Value) -> ToolResult {
-        let input: TaskArtifactFocusInput = decode_arguments(arguments)?;
+        let input: ArtifactFocusQuery = decode_arguments(arguments)?;
         let response = self
             .runtime
             .task_artifact_focus(&input)

@@ -9,8 +9,8 @@ use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value as 
 use sctx_domain::{
     Applicability, ArtifactAssociationKind, ArtifactKey, ArtifactKind, ContextId, ContextKind,
     ContextRelationKind, EvidenceId, EvidenceType, ReferenceId, RepositoryId, ResolutionStatus,
-    RevisionId, SignalId, SpaceId, TaskArtifactFocus, TaskArtifactFocusRecord, TaskId, TaskIntent,
-    TaskSignal, TaskSignalKind, TaskSignalLifecycle, TaskSpaceAssociation,
+    ResolvedFocus, RevisionId, SpaceId, TaskId, TaskIntent, TaskSignal, TaskSignalKind,
+    TaskSpaceAssociation,
 };
 use sctx_engineering_graph::{
     EngineeringProjection, EngineeringProjectionSnapshot, EngineeringProjectionStore,
@@ -249,7 +249,7 @@ pub struct TaskSpaceAssociationsResponse {
 pub struct TaskContextRequest {
     pub task_intent: TaskIntent,
     pub task_signals: Vec<TaskSignal>,
-    pub artifact_focuses: Vec<TaskArtifactFocusRecord>,
+    pub resolved_focus: Option<ResolvedFocus>,
     pub token_budget: usize,
     pub max_spaces: usize,
     pub candidate_limit: usize,
@@ -266,7 +266,7 @@ impl TaskContextRequest {
         Self {
             task_intent,
             task_signals,
-            artifact_focuses: Vec::new(),
+            resolved_focus: None,
             token_budget,
             max_spaces: DEFAULT_TASK_MAX_SPACES,
             candidate_limit: DEFAULT_CANDIDATE_LIMIT,
@@ -275,14 +275,14 @@ impl TaskContextRequest {
     }
 
     #[must_use]
-    pub fn automatic_with_focus(
+    pub fn for_resolved_focus(
         task_intent: TaskIntent,
         task_signals: Vec<TaskSignal>,
-        artifact_focuses: Vec<TaskArtifactFocusRecord>,
+        resolved_focus: ResolvedFocus,
         token_budget: usize,
     ) -> Self {
         let mut request = Self::automatic(task_intent, task_signals, token_budget);
-        request.artifact_focuses = artifact_focuses;
+        request.resolved_focus = Some(resolved_focus);
         request
     }
 }
@@ -405,8 +405,7 @@ pub struct TaskAssociationFusionExplanation {
 /// One exact active Artifact Focus to a historical Engineering Artifact association.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GraphArtifactRetrievalPath {
-    pub focus_signal_id: SignalId,
-    pub focus: TaskArtifactFocus,
+    pub resolved_focus: ResolvedFocus,
     pub repository_id: RepositoryId,
     pub artifact_key: ArtifactKey,
     pub artifact_kind: ArtifactKind,
@@ -435,8 +434,7 @@ pub struct ContextRelationRetrievalPath {
 /// Explicit-only diagnostic for an Artifact edge that was not safe to resolve.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GraphResolutionDiagnosticPath {
-    pub focus_signal_id: SignalId,
-    pub focus: TaskArtifactFocus,
+    pub resolved_focus: ResolvedFocus,
     pub repository_id: RepositoryId,
     pub reference_id: ReferenceId,
     pub resolution_status: ResolutionStatus,
@@ -445,7 +443,7 @@ pub struct GraphResolutionDiagnosticPath {
     pub artifact_generation: String,
 }
 
-/// Why an active Focus produced no exact node in the selected Graph snapshot.
+/// Why this request's Resolved Focus produced no exact node in the selected Graph snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskGraphDiagnosticKind {
@@ -456,8 +454,7 @@ pub enum TaskGraphDiagnosticKind {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TaskGraphDiagnostic {
     pub kind: TaskGraphDiagnosticKind,
-    pub focus_signal_id: SignalId,
-    pub focus: TaskArtifactFocus,
+    pub resolved_focus: ResolvedFocus,
 }
 
 /// Explainable route from the Task to one returned Context.
@@ -666,24 +663,26 @@ impl SearchEngine {
         intent: &TaskIntent,
         signals: &[TaskSignal],
     ) -> Result<TaskSpaceAssociationsResponse> {
-        self.task_space_associations_with_focus(intent, signals, &[])
+        self.task_space_associations_with_resolved_focus(intent, signals, None)
     }
 
-    /// Infers associations while consuming only active structured Artifact Focuses
-    /// as Engineering Graph seeds.
+    /// Infers associations with at most one request-local Resolved Focus as an
+    /// Engineering Graph seed.
     ///
     /// # Errors
     ///
-    /// Returns an input error for invalid or mixed-task Focus records.
-    pub fn task_space_associations_with_focus(
+    /// Returns an input error for an invalid request-local Resolved Focus.
+    pub fn task_space_associations_with_resolved_focus(
         &self,
         intent: &TaskIntent,
         signals: &[TaskSignal],
-        artifact_focuses: &[TaskArtifactFocusRecord],
+        resolved_focus: Option<&ResolvedFocus>,
     ) -> Result<TaskSpaceAssociationsResponse> {
         intent.validate()?;
         TaskSignal::validate_collection(signals)?;
-        validate_active_artifact_focuses(intent.task_id, artifact_focuses)?;
+        if let Some(focus) = resolved_focus {
+            focus.validate()?;
+        }
         let query_tokens = association_query_tokens(intent, signals);
         let query_phrases = task_query_phrases(intent, signals, false);
         let scope_targets = ScopeTargets::from_intent(intent);
@@ -697,7 +696,7 @@ impl SearchEngine {
                     &query_tokens,
                     &query_phrases,
                     &scope_targets,
-                    artifact_focuses,
+                    resolved_focus,
                     graph,
                     graph_snapshot
                         .as_ref()
@@ -732,11 +731,7 @@ impl SearchEngine {
     /// storage errors propagated by index synchronization and snapshot reads.
     pub fn task_context_pack(&self, request: &TaskContextRequest) -> Result<TaskContextPack> {
         validate_task_context_request(request)?;
-        let fingerprint = task_fingerprint(
-            &request.task_intent,
-            &request.task_signals,
-            &request.artifact_focuses,
-        )?;
+        let fingerprint = task_fingerprint(&request.task_intent, &request.task_signals)?;
         let query_tokens = association_query_tokens(&request.task_intent, &request.task_signals);
         let query_phrases = task_query_phrases(&request.task_intent, &request.task_signals, false);
         let scope_targets = ScopeTargets::from_intent(&request.task_intent);
@@ -750,7 +745,7 @@ impl SearchEngine {
                     &query_tokens,
                     &query_phrases,
                     &scope_targets,
-                    &request.artifact_focuses,
+                    request.resolved_focus.as_ref(),
                     graph,
                     graph_snapshot
                         .as_ref()
@@ -774,8 +769,8 @@ impl SearchEngine {
                     request.candidate_limit,
                 )?;
                 let graph_diagnostics = artifact_focus_diagnostics(
-                    &request.artifact_focuses,
-                    &inference.reachable_focus_ids,
+                    request.resolved_focus.as_ref(),
+                    inference.focus_reachable,
                 );
                 Ok(pack_task_context_candidates(
                     candidates,
@@ -1298,7 +1293,7 @@ struct TaskAssociationInference {
     graph_contexts: BTreeMap<GraphContextKey, GraphContextEvidence>,
     graph_context_tree_oid: Option<String>,
     graph_artifact_generation: Option<String>,
-    reachable_focus_ids: BTreeSet<SignalId>,
+    focus_reachable: bool,
 }
 
 fn normalized_values(values: &[String]) -> BTreeSet<String> {
@@ -1315,7 +1310,7 @@ fn infer_task_space_associations(
     query_tokens: &[String],
     query_phrases: &[String],
     scope_targets: &ScopeTargets,
-    artifact_focuses: &[TaskArtifactFocusRecord],
+    resolved_focus: Option<&ResolvedFocus>,
     engineering_graph: Option<&EngineeringProjection>,
     graph_context_tree_oid: Option<&str>,
     mode: ContextPackMode,
@@ -1324,10 +1319,10 @@ fn infer_task_space_associations(
     let mut contexts =
         query_accepted_context_evidence(connection, query_tokens, query_phrases, scope_targets)?;
     let mut graph_contexts = BTreeMap::new();
-    let mut reachable_focus_ids = BTreeSet::new();
+    let mut focus_reachable = false;
     if let Some(graph) = engineering_graph {
-        reachable_focus_ids =
-            query_graph_context_evidence(graph, artifact_focuses, mode, &mut graph_contexts);
+        focus_reachable =
+            query_graph_context_evidence(graph, resolved_focus, mode, &mut graph_contexts);
         expand_graph_context_relation_evidence(graph, mode, &mut graph_contexts)?;
     }
     expand_current_context_relation_evidence(connection, mode, &mut contexts)?;
@@ -1363,7 +1358,7 @@ fn infer_task_space_associations(
         graph_contexts,
         graph_context_tree_oid: graph_context_tree_oid.map(ToOwned::to_owned),
         graph_artifact_generation: engineering_graph.map(|graph| graph.artifact_generation.clone()),
-        reachable_focus_ids,
+        focus_reachable,
     })
 }
 
@@ -1540,11 +1535,14 @@ fn query_accepted_context_evidence(
 #[allow(clippy::too_many_lines)]
 fn query_graph_context_evidence(
     graph: &EngineeringProjection,
-    artifact_focuses: &[TaskArtifactFocusRecord],
+    resolved_focus: Option<&ResolvedFocus>,
     mode: ContextPackMode,
     contexts: &mut BTreeMap<GraphContextKey, GraphContextEvidence>,
-) -> BTreeSet<SignalId> {
-    let mut reachable = BTreeSet::new();
+) -> bool {
+    let Some(resolved_focus) = resolved_focus else {
+        return false;
+    };
+    let mut reachable = false;
     for resolved in &graph.references {
         let candidates = resolved
             .resolution
@@ -1552,18 +1550,13 @@ fn query_graph_context_evidence(
             .iter()
             .chain(resolved.resolution.candidates.iter())
             .collect::<Vec<_>>();
-        let matches = artifact_focuses
+        let Some(artifact) = candidates
             .iter()
-            .filter_map(|record| {
-                candidates
-                    .iter()
-                    .find(|artifact| focus_matches_artifact(&record.focus, artifact))
-                    .map(|artifact| (record, *artifact))
-            })
-            .collect::<Vec<_>>();
-        if matches.is_empty() {
+            .find(|artifact| focus_matches_artifact(resolved_focus, artifact))
+            .copied()
+        else {
             continue;
-        }
+        };
         let Some(snapshot) = graph.contexts.iter().find(|snapshot| {
             snapshot.context_id == resolved.context_id
                 && snapshot.revision.revision_id == resolved.revision_id
@@ -1591,77 +1584,71 @@ fn query_graph_context_evidence(
             else {
                 continue;
             };
-            for (record, artifact) in matches {
-                reachable.insert(record.signal_id);
-                let path = GraphArtifactRetrievalPath {
-                    focus_signal_id: record.signal_id,
-                    focus: record.focus.clone(),
-                    repository_id: artifact.repository_id(),
-                    artifact_key: artifact.clone(),
-                    artifact_kind: artifact.kind(),
-                    reference_id: resolved.reference_id,
-                    association_id: context_artifact_association_id(
-                        resolved.reference_id,
-                        resolved.context_id,
-                        resolved.revision_id,
-                        artifact,
-                    ),
-                    association_kind: association.kind,
-                    match_basis: match_evidence.basis,
-                    resolution_status: resolved.resolution.status,
-                    confidence_basis_points: confidence_basis_points(association.confidence),
-                    artifact_generation: graph.artifact_generation.clone(),
-                };
-                let context = contexts.entry(key).or_insert_with(|| GraphContextEvidence {
+            reachable = true;
+            let path = GraphArtifactRetrievalPath {
+                resolved_focus: resolved_focus.clone(),
+                repository_id: artifact.repository_id(),
+                artifact_key: artifact.clone(),
+                artifact_kind: artifact.kind(),
+                reference_id: resolved.reference_id,
+                association_id: context_artifact_association_id(
+                    resolved.reference_id,
+                    resolved.context_id,
+                    resolved.revision_id,
+                    artifact,
+                ),
+                association_kind: association.kind,
+                match_basis: match_evidence.basis,
+                resolution_status: resolved.resolution.status,
+                confidence_basis_points: confidence_basis_points(association.confidence),
+                artifact_generation: graph.artifact_generation.clone(),
+            };
+            let context = contexts.entry(key).or_insert_with(|| GraphContextEvidence {
+                snapshot: snapshot.clone(),
+                evidence: AcceptedContextEvidence::default(),
+            });
+            context.evidence.matched_artifacts.insert(
+                serde_json::to_string(resolved_focus)
+                    .expect("ResolvedFocus is always JSON serializable"),
+            );
+            context
+                .evidence
+                .graph_paths
+                .push(TaskRetrievalPath::EngineeringGraph {
+                    path,
+                    relation_hops: Vec::new(),
+                });
+        } else if mode == ContextPackMode::Explicit {
+            reachable = true;
+            let mut bases = resolved
+                .evidence
+                .iter()
+                .map(|evidence| evidence.basis)
+                .collect::<Vec<_>>();
+            bases.sort();
+            bases.dedup();
+            contexts
+                .entry(key)
+                .or_insert_with(|| GraphContextEvidence {
                     snapshot: snapshot.clone(),
                     evidence: AcceptedContextEvidence::default(),
+                })
+                .evidence
+                .graph_paths
+                .push(TaskRetrievalPath::GraphDiagnostic {
+                    diagnostic: GraphResolutionDiagnosticPath {
+                        resolved_focus: resolved_focus.clone(),
+                        repository_id: resolved.resolution.repository_id,
+                        reference_id: resolved.reference_id,
+                        resolution_status: resolved.resolution.status,
+                        candidate_artifact_keys: candidates
+                            .iter()
+                            .map(|artifact| (*artifact).clone())
+                            .collect(),
+                        match_bases: bases,
+                        artifact_generation: graph.artifact_generation.clone(),
+                    },
                 });
-                context
-                    .evidence
-                    .matched_artifacts
-                    .insert(record.focus.canonical_identity());
-                context
-                    .evidence
-                    .graph_paths
-                    .push(TaskRetrievalPath::EngineeringGraph {
-                        path,
-                        relation_hops: Vec::new(),
-                    });
-            }
-        } else if mode == ContextPackMode::Explicit {
-            for (record, _artifact) in matches {
-                reachable.insert(record.signal_id);
-                let mut bases = resolved
-                    .evidence
-                    .iter()
-                    .map(|evidence| evidence.basis)
-                    .collect::<Vec<_>>();
-                bases.sort();
-                bases.dedup();
-                contexts
-                    .entry(key)
-                    .or_insert_with(|| GraphContextEvidence {
-                        snapshot: snapshot.clone(),
-                        evidence: AcceptedContextEvidence::default(),
-                    })
-                    .evidence
-                    .graph_paths
-                    .push(TaskRetrievalPath::GraphDiagnostic {
-                        diagnostic: GraphResolutionDiagnosticPath {
-                            focus_signal_id: record.signal_id,
-                            focus: record.focus.clone(),
-                            repository_id: resolved.resolution.repository_id,
-                            reference_id: resolved.reference_id,
-                            resolution_status: resolved.resolution.status,
-                            candidate_artifact_keys: candidates
-                                .iter()
-                                .map(|artifact| (*artifact).clone())
-                                .collect(),
-                            match_bases: bases,
-                            artifact_generation: graph.artifact_generation.clone(),
-                        },
-                    });
-            }
         }
     }
     for context in contexts.values_mut() {
@@ -1699,7 +1686,7 @@ fn current_context_space(
         .transpose()
 }
 
-fn focus_matches_artifact(focus: &TaskArtifactFocus, artifact: &ArtifactKey) -> bool {
+fn focus_matches_artifact(focus: &ResolvedFocus, artifact: &ArtifactKey) -> bool {
     focus.repository_id == artifact.repository_id() && &focus.locator == artifact.locator()
 }
 
@@ -2619,24 +2606,25 @@ struct PackedTaskContexts {
 }
 
 fn artifact_focus_diagnostics(
-    records: &[TaskArtifactFocusRecord],
-    reachable: &BTreeSet<SignalId>,
+    resolved_focus: Option<&ResolvedFocus>,
+    reachable: bool,
 ) -> Vec<TaskGraphDiagnostic> {
-    records
-        .iter()
-        .filter(|record| !reachable.contains(&record.signal_id))
-        .map(|record| TaskGraphDiagnostic {
+    resolved_focus
+        .filter(|_| !reachable)
+        .map(|focus| TaskGraphDiagnostic {
             kind: TaskGraphDiagnosticKind::ArtifactNotReachableInGraph,
-            focus_signal_id: record.signal_id,
-            focus: record.focus.clone(),
+            resolved_focus: focus.clone(),
         })
+        .into_iter()
         .collect()
 }
 
 fn validate_task_context_request(request: &TaskContextRequest) -> Result<()> {
     request.task_intent.validate()?;
     TaskSignal::validate_collection(&request.task_signals)?;
-    validate_active_artifact_focuses(request.task_intent.task_id, &request.artifact_focuses)?;
+    if let Some(focus) = &request.resolved_focus {
+        focus.validate()?;
+    }
     if request.token_budget < MIN_TASK_CONTEXT_TOKEN_BUDGET {
         return Err(invalid(format!(
             "task context token_budget must be at least {MIN_TASK_CONTEXT_TOKEN_BUDGET}"
@@ -2655,40 +2643,7 @@ fn validate_task_context_request(request: &TaskContextRequest) -> Result<()> {
     Ok(())
 }
 
-fn validate_active_artifact_focuses(
-    task_id: TaskId,
-    records: &[TaskArtifactFocusRecord],
-) -> Result<()> {
-    let mut signal_ids = BTreeSet::new();
-    let mut focuses = BTreeSet::new();
-    let mut task_session_id = None;
-    for record in records {
-        if record.task_id != task_id || record.lifecycle != TaskSignalLifecycle::Active {
-            return Err(invalid(
-                "Task Context accepts only active Artifact Focuses owned by its Task",
-            ));
-        }
-        record.focus.validate()?;
-        if task_session_id.is_some_and(|owner| owner != record.task_session_id) {
-            return Err(invalid(
-                "Task Context Artifact Focuses must share one Task Session",
-            ));
-        }
-        task_session_id = Some(record.task_session_id);
-        if !signal_ids.insert(record.signal_id) || !focuses.insert(record.focus.clone()) {
-            return Err(invalid(
-                "Task Context Artifact Focuses must not contain duplicates",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn task_fingerprint(
-    intent: &TaskIntent,
-    signals: &[TaskSignal],
-    artifact_focuses: &[TaskArtifactFocusRecord],
-) -> Result<String> {
+fn task_fingerprint(intent: &TaskIntent, signals: &[TaskSignal]) -> Result<String> {
     let mut intent = intent.clone();
     for values in [
         &mut intent.in_scope,
@@ -2713,11 +2668,7 @@ fn task_fingerprint(
             .cmp(signal_kind_name(right.kind))
             .then_with(|| left.content.cmp(&right.content))
     });
-    let focuses = artifact_focuses
-        .iter()
-        .map(|record| record.focus.canonical_identity())
-        .collect::<BTreeSet<_>>();
-    let bytes = serde_json::to_vec(&(intent, signals, focuses))
+    let bytes = serde_json::to_vec(&(intent, signals))
         .map_err(|error| invalid(format!("serialize Task fingerprint: {error}")))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }

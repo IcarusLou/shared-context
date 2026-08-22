@@ -136,7 +136,7 @@ fn cross_workspace_resolution_is_stable_isolated_and_rejects_unsafe_paths() {
             assert_eq!(resolved.repository_id, expected_id);
             assert_eq!(resolved.checkout_path, *repository);
             assert_eq!(resolved.relative_path.as_str(), "src/search/Search.kt");
-            let focus = resolved.into_file_focus();
+            let focus = resolved.into_resolved_file_focus();
             assert_eq!(focus.repository_id, expected_id);
             assert!(matches!(
                 focus.locator,

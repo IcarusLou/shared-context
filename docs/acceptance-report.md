@@ -1,8 +1,8 @@
 # Task-first Retrieval Integration Acceptance Report
 
 Date: 2026-08-22
-Scope: Mew #112 through #153, including TaskArtifactFocus runtime/tool #151/#152 and accepted boundary #150
-Implementation baseline for public Artifact Focus: `main@fbf9e4c`
+Scope: Mew #112 through #154, including query-scoped Artifact Focus and accepted boundary #150
+Implementation baseline before the query-scoped correction: `main@a662e6a`
 
 ## Verdict
 
@@ -44,10 +44,10 @@ M4 retains Mandatory Gate #114/#117: stable `submission_id` idempotency must be 
 | One FE task retrieves Requirement, server Contract, and cross-platform Validation Context | PROVEN | The fixed M3 oracle uses frontend Symbol and FE API/Schema Focuses, then asserts exact hand-authored Requirement/Decision/Contract/iOS/Android identities through Graph plus ContextRelation paths |
 | Every returned Context links to a Space association and typed RetrievalPath | PROVEN | M2 validates Intent FTS, Context FTS, and Scope; M3 validates uniquely resolved EngineeringGraph and ContextRelation paths. Textual Task Signals no longer claim Graph semantics |
 | Same Workspace external Sessions remain isolated | PROVEN | Page and server calls share one Workspace signal but receive distinct TaskSession/Task IDs and disjoint Space/Context sets |
-| Workspace paths cannot create Space or Artifact priors | PROVEN | Workspace signals remain non-locating; RepositoryId enters Graph retrieval only inside a complete TaskArtifactFocus and never as a global filter |
-| TaskArtifactFocus lifecycle is isolated and deterministic | PROVEN | Internal Runtime tests cover all six Artifact kinds, Task+Intent CAS, concurrent/repeated dedup, stable SignalId, supersede/history/re-focus, new Task reset, task switch, and same-Workspace double Session isolation without creating Intent revisions |
+| Workspace paths cannot create Space or Artifact priors | PROVEN | Workspace signals remain non-locating; RepositoryId enters Graph retrieval only inside the complete `ResolvedFocus` of one ArtifactFocusQuery and never as a global filter |
+| Artifact Focus is query-scoped and leaves no Runtime state | PROVEN | Domain and Runtime contain no Focus record, ID, lifecycle, history, table or snapshot field; repeated A, A→B, ordinary no-Focus reads and MCP restart preserve stable serialized ExternalSession/Task/Intent/Signal state and retrieval fingerprint |
 | Public Artifact Focus contract is strict and server-resolved | PROVEN | MCP `task_artifact_focus` exposes only Session locator, expected Revision, absolute path, six no-path coordinate shapes and output bounds with recursive `additionalProperties=false`; forged identity/route/generation/Hook fields fail |
-| Public MCP lifecycle reaches Graph for all six kinds | PROVEN | Real MCP frames create ActiveTasks and declare File/Module/Symbol/API/Schema/Test Focuses, immediately return exact Graph Context, idempotently reuse SignalId, supersede/re-focus, and isolate duplicate Sessions |
+| Public MCP queries reach Graph for all six kinds | PROVEN | Real MCP frames create ActiveTasks and query File/Module/Symbol/API/Schema/Test Focuses, immediately return exact Graph Context, return no ID/lifecycle metadata, isolate equal locators by Repository, and leave the next ordinary `task_context` without Focus |
 | Repository-scoped exact Focus never crosses repositories | PROVEN | Search builds two historical Graph nodes with identical locators under different RepositoryIds and proves each Focus returns only its named Repository Context |
 | Cross-parent Catalog mapping never mixes repositories | PROVEN | Real MCP Focuses use equal `src/shared.ts` locators under configured FE/Android/iOS checkouts and return only the Context owned by each stable Catalog RepositoryId |
 | Unreachable Focus has typed zero-result semantics | PROVEN | Wrong-Repository and unavailable-Graph Focuses return no Graph Context and a budgeted `artifact_not_reachable_in_graph` diagnostic; they never claim current-code `missing` |
@@ -63,7 +63,7 @@ M4 retains Mandatory Gate #114/#117: stable `submission_id` idempotency must be 
 | Hook observations are bounded, non-locating, and Git-free | PROVEN | A fake `git` sentinel proves PostTool never launches Git; File observations remain Breadcrumb-only, TestOutcome is non-locating, and Catalog/Registry failures return sanitized success responses without Focus submission |
 | Catalog and Registry validation are explicit | PROVEN | CLI `repository add/list/doctor`, installer setup/doctor, and MCP Runtime open synchronize only trusted local Catalog IDs; invalid short IDs are typed errors and public `repository_scan` rejects unconfigured checkout or caller Repository identity fields |
 | Declared missing paths resolve safely without code inspection | PROVEN | Catalog accepts missing leaf/tail below an exact configured checkout while rejecting dot segments, symlink components, existing non-directory parents, and unconfigured paths; historical Graph remains reachable after checkout deletion |
-| Focus hot path has no engineering mutation or Hook dependency | PROVEN | Git HEAD and Graph canonical bytes remain unchanged; source sentinel rejects Command/Scanner/rebuild/Reference/Hook calls; real established-session MCP p95 is below 250ms (observed 66.1ms in focused gate) |
+| Focus hot path has no engineering or Task mutation and no Hook dependency | PROVEN | Git HEAD, Graph canonical bytes, and canonical Runtime authoritative bytes remain unchanged; source sentinel rejects Command/Scanner/rebuild/Reference/Hook calls; real established-session MCP p95 stays below 250ms |
 | Engineering failure is advisory to Task Retrieval | PROVEN | Rebuild reports unavailable registered Repositories explicitly, Explain reports typed projection availability, and a corrupt Engineering projection degrades Task responses to `artifact_generation: null` instead of blocking Context-only retrieval |
 | Multi-language Artifact discovery has an independent bounded oracle | PROVEN | `milestone-three-v1.json` fixes hand-authored IDs/References and the exact Reference-derived path plan; a separate Scanner contract explicitly plans Rust, TS, JS, Swift, Kotlin, JSON, OpenAPI and Proto paths and validates exact API/Schema/Qualified Symbol/Test locators without full-repository enumeration |
 | File move and Symbol rename never trigger guessing | PROVEN | M3 oracle moves a JS file and renames a TS Symbol, then proves both original deterministic locators become `missing`, create no Edge, and remain unchanged without Git-history or Agent repair workflow |
@@ -82,7 +82,7 @@ M4 retains Mandatory Gate #114/#117: stable `submission_id` idempotency must be 
 
 #150 remains an accepted product boundary: untracked files are not scanned, and no ActiveTask untracked scan entry was added.
 
-#151/#152 are implemented: Runtime owns repository-scoped TaskArtifactFocus CAS/dedup/lifecycle/history; public MCP/CLI and Skill submit Focus through Catalog-resolved identity; Search consumes only Active Focus. Repository Catalog remains local-only; team synchronization is not claimed.
+#154 replaces the unlaunched #151/#152 persistence model: `task_artifact_focus` is a read-only ArtifactFocusQuery, Catalog supplies a request-local `ResolvedFocus`, and Search consumes only that value for the current Pack. Runtime owns no Focus state, and later Focus queries, ordinary `task_context`, MCP restart, Task switch, or compaction restore nothing. Repository Catalog remains local-only; team synchronization is not claimed.
 
 ## Residue gates
 
@@ -96,6 +96,7 @@ The M1–M3 gate searches product code, tests, fixtures, scripts, and docs (excl
 - the removed textual TaskSignal channel/path that previously looked like an Engineering Graph edge.
 - the removed Repository auto-registration types, remote/declared/common-dir merge hints, and Hook `git rev-parse` discovery path;
 - caller-supplied RepositoryId, RepoRelativePath, ArtifactKey, Generation, Workspace, Hook or corroboration fields in `task_artifact_focus`.
+- persistent Focus records, Signal IDs, active/superseded Focus state, canonical Focus identities, Runtime Focus tables, and Focus fields in Task snapshots or fingerprints.
 
 Expected result: zero matches. Generic target-design language such as a proposed new Space Intent is not a Context-Propose API. `context_search` and its explicit `space_ids` hard filter are intentionally present.
 

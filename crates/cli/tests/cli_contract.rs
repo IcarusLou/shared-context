@@ -731,7 +731,6 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         assert!(snapshot.task_signals.iter().any(|signal| {
             signal.kind == TaskSignalKind::TestOutcome && signal.content == own_test
         }));
-        assert!(snapshot.artifact_focuses.is_empty());
         assert!(!snapshot.task_signals.iter().any(|signal| {
             signal.content.contains("outside.rs") || signal.content.contains("missing.rs")
         }));
@@ -1000,7 +999,6 @@ fn cross_parent_workspace_maps_three_catalog_repositories_without_cross_contamin
             .unwrap()
             .unwrap();
         assert!(snapshot.task_signals.is_empty());
-        assert!(snapshot.artifact_focuses.is_empty());
     }
 
     open_task("cross-unconfigured");
@@ -1460,8 +1458,12 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
         focus_path.to_str().unwrap(),
     ]);
     assert_eq!(focused["command"], "task.artifact-focus");
-    assert_eq!(focused["data"]["created"], true);
-    assert_eq!(focused["data"]["focus"]["lifecycle"], "active");
+    assert!(focused["data"].get("created").is_none());
+    assert!(focused["data"].get("focus").is_none());
+    assert_eq!(
+        focused["data"]["resolved_focus"]["locator"],
+        serde_json::json!({"locator_kind": "file", "path": "src/future.rs"})
+    );
     assert_eq!(
         focused["data"]["context"]["graph_diagnostics"][0]["kind"],
         "artifact_not_reachable_in_graph"

@@ -278,6 +278,25 @@ impl ArtifactLocator {
     }
 }
 
+/// Transient Repository-scoped interpretation of one Artifact Focus query.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedFocus {
+    pub repository_id: RepositoryId,
+    pub locator: ArtifactLocator,
+}
+
+impl ResolvedFocus {
+    /// Validates the complete kind-specific locator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] for incomplete or unsafe coordinates.
+    pub fn validate(&self) -> Result<()> {
+        self.locator.validate()
+    }
+}
+
 /// Deterministic, rebuildable identity of one `EngineeringArtifact`.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

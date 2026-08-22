@@ -556,7 +556,7 @@ fn assert_typed_m2_path(path: &TaskRetrievalPath) {
             path,
             relation_hops,
         } => {
-            assert!(!path.focus.canonical_identity().is_empty());
+            assert!(!path.resolved_focus.locator.canonical_key().is_empty());
             assert!(!path.artifact_generation.is_empty());
             assert!(relation_hops.len() <= 2);
         }
@@ -565,7 +565,7 @@ fn assert_typed_m2_path(path: &TaskRetrievalPath) {
             assert!(hops.len() <= 2);
         }
         TaskRetrievalPath::GraphDiagnostic { diagnostic } => {
-            assert!(!diagnostic.focus.canonical_identity().is_empty());
+            assert!(!diagnostic.resolved_focus.locator.canonical_key().is_empty());
             assert!(!diagnostic.artifact_generation.is_empty());
         }
     }
@@ -732,7 +732,7 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
         .task_context_pack(&TaskContextRequest {
             task_intent: task_intent("hazardpackintent"),
             task_signals: Vec::new(),
-            artifact_focuses: Vec::new(),
+            resolved_focus: None,
             token_budget: 100_000,
             max_spaces: sctx_search::DEFAULT_TASK_MAX_SPACES,
             candidate_limit: 100,
@@ -862,7 +862,6 @@ fn post_tool_file_is_breadcrumb_only_and_test_outcome_refreshes_active_task() {
     }));
 
     assert_eq!(snapshot.task_id, updated.task_id);
-    assert!(snapshot.artifact_focuses.is_empty());
     assert!(
         !snapshot
             .task_signals

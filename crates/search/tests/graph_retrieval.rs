@@ -5,9 +5,8 @@ use sctx_domain::{
     ContextKind, ContextRelation, ContextRelationKind, ContextRevisionDraft, EngineeringArtifact,
     EngineeringReference, EngineeringReferenceDraft, EvidenceSnapshotDraft, EvidenceType,
     PublicationAction, PublicationDraft, ReferenceId, ReferenceRelation, RepoRelativePath,
-    RepositoryId, RepositoryIdentity, RevisionId, SemanticConflictDraft, SignalId, SpaceId,
-    TaskArtifactFocus, TaskArtifactFocusRecord, TaskId, TaskIntent, TaskSessionId,
-    TaskSignalLifecycle, WorkEpisodeId,
+    RepositoryId, RepositoryIdentity, ResolvedFocus, RevisionId, SemanticConflictDraft, SpaceId,
+    TaskId, TaskIntent, WorkEpisodeId,
 };
 use sctx_engineering_graph::{
     ArtifactObservation, ArtifactSourceState, EngineeringProjectionStore,
@@ -433,20 +432,10 @@ fn graph_fixture() -> GraphFixture {
     }
 }
 
-fn focus_record(
-    task_id: TaskId,
-    repository_id: RepositoryId,
-    locator: ArtifactLocator,
-) -> TaskArtifactFocusRecord {
-    TaskArtifactFocusRecord {
-        signal_id: SignalId::new(),
-        task_session_id: TaskSessionId::new(),
-        task_id,
-        focus: TaskArtifactFocus {
-            repository_id,
-            locator,
-        },
-        lifecycle: TaskSignalLifecycle::Active,
+fn resolved_focus(repository_id: RepositoryId, locator: ArtifactLocator) -> ResolvedFocus {
+    ResolvedFocus {
+        repository_id,
+        locator,
     }
 }
 
@@ -472,11 +461,10 @@ fn task_request(
             unknowns: Vec::new(),
         },
         task_signals: Vec::new(),
-        artifact_focuses: vec![focus_record(
-            task_id,
+        resolved_focus: Some(resolved_focus(
             repository_id,
             symbol_locator("SearchSymbol"),
-        )],
+        )),
         token_budget,
         max_spaces: 8,
         candidate_limit: 100,
@@ -585,21 +573,20 @@ fn exact_graph_priority_reaches_cross_end_contexts_in_two_cycle_safe_hops() {
     );
     assert!(pack.estimated_tokens <= pack.token_budget);
 
-    let mut same_identity = request.clone();
-    same_identity.artifact_focuses[0].signal_id = SignalId::new();
-    let same_identity_pack = engine.task_context_pack(&same_identity).unwrap();
-    assert_eq!(same_identity_pack.task_fingerprint, pack.task_fingerprint);
-    let mut superseded = same_identity;
-    superseded.artifact_focuses[0].lifecycle = TaskSignalLifecycle::Superseded;
-    assert!(engine.task_context_pack(&superseded).is_err());
+    let mut different_focus = request;
+    different_focus
+        .resolved_focus
+        .as_mut()
+        .unwrap()
+        .repository_id = RepositoryId::new();
+    let different_focus_pack = engine.task_context_pack(&different_focus).unwrap();
+    assert_eq!(different_focus_pack.task_fingerprint, pack.task_fingerprint);
 
-    let mut wrong_repository = request;
-    wrong_repository.artifact_focuses[0].focus.repository_id = RepositoryId::new();
+    let mut wrong_repository = different_focus;
     wrong_repository.task_intent.goal = "zxunreachablefocus".to_owned();
     wrong_repository.task_intent.desired_change = "zxunreachablegraph".to_owned();
     wrong_repository.task_intent.platforms.clear();
     let filtered = engine.task_context_pack(&wrong_repository).unwrap();
-    assert_ne!(filtered.task_fingerprint, pack.task_fingerprint);
     assert!(filtered.associations.is_empty());
     assert!(filtered.items.is_empty());
     assert_eq!(filtered.graph_diagnostics.len(), 1);
@@ -781,7 +768,7 @@ fn generic_test_outcome_never_matches_qualified_test_artifact() {
         ContextPackMode::AutomaticInjection,
         8_000,
     );
-    request.artifact_focuses.clear();
+    request.resolved_focus = None;
     request.task_signals = vec![sctx_domain::TaskSignal {
         kind: sctx_domain::TaskSignalKind::TestOutcome,
         content: locator.canonical_key(),
@@ -900,7 +887,7 @@ fn context_tree_mismatch_preserves_historical_graph_while_unavailable_artifacts_
     let diagnostic = engine.task_context_pack(&diagnostic_request).unwrap();
     assert!(diagnostic.graph_diagnostics.iter().any(|diagnostic| {
         diagnostic.kind == TaskGraphDiagnosticKind::ArtifactNotReachableInGraph
-            && diagnostic.focus.repository_id == fixture.repository.repository_id
+            && diagnostic.resolved_focus.repository_id == fixture.repository.repository_id
     }));
 }
 
@@ -1333,7 +1320,7 @@ fn build_time_candidate_incomplete_and_conflicted_contexts_never_cross_automatic
         );
         automatic.task_intent.goal = "opaque unsafe graph lookup".to_owned();
         automatic.task_intent.desired_change = "inspect without text fallback".to_owned();
-        automatic.artifact_focuses[0].focus.locator = symbol_locator(symbol);
+        automatic.resolved_focus.as_mut().unwrap().locator = symbol_locator(symbol);
         let automatic_pack = engine.task_context_pack(&automatic).unwrap();
         assert!(
             automatic_pack
@@ -1343,8 +1330,8 @@ fn build_time_candidate_incomplete_and_conflicted_contexts_never_cross_automatic
         );
         assert_eq!(automatic_pack.graph_diagnostics.len(), 1);
         assert_eq!(
-            automatic_pack.graph_diagnostics[0].focus_signal_id,
-            automatic.artifact_focuses[0].signal_id
+            automatic_pack.graph_diagnostics[0].resolved_focus,
+            *automatic.resolved_focus.as_ref().unwrap()
         );
 
         automatic.mode = ContextPackMode::Explicit;
@@ -1434,8 +1421,8 @@ fn ambiguous_edges_are_explicit_diagnostics_only_and_never_raise_automatic_eligi
     let automatic = engine.task_context_pack(&request).unwrap();
     assert_eq!(automatic.graph_diagnostics.len(), 1);
     assert_eq!(
-        automatic.graph_diagnostics[0].focus_signal_id,
-        request.artifact_focuses[0].signal_id
+        automatic.graph_diagnostics[0].resolved_focus,
+        *request.resolved_focus.as_ref().unwrap()
     );
     assert!(
         automatic
@@ -1534,11 +1521,10 @@ fn exact_file_signal_uses_repository_relative_path_locator() {
         ContextPackMode::AutomaticInjection,
         8_000,
     );
-    request.artifact_focuses = vec![focus_record(
-        request.task_intent.task_id,
+    request.resolved_focus = Some(resolved_focus(
         fixture.repository.repository_id,
         locator.clone(),
-    )];
+    ));
     let pack = engine.task_context_pack(&request).unwrap();
     let source = pack
         .items
@@ -1548,8 +1534,8 @@ fn exact_file_signal_uses_repository_relative_path_locator() {
     assert!(source.retrieval_paths.iter().any(|path| matches!(
         path,
         TaskRetrievalPath::EngineeringGraph { path, .. }
-            if path.focus.locator == locator
-                && path.focus.repository_id == fixture.repository.repository_id
-                && path.artifact_key.locator() == &path.focus.locator
+            if path.resolved_focus.locator == locator
+                && path.resolved_focus.repository_id == fixture.repository.repository_id
+                && path.artifact_key.locator() == &path.resolved_focus.locator
     )));
 }

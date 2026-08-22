@@ -10,8 +10,7 @@ use sctx_domain::{
     Applicability, ArtifactKind, ContextGovernanceStatus, ContextId, ContextKind,
     ContextRelationKind, ContextRevisionDraft, EvidenceSnapshotDraft, EvidenceType,
     PublicationAction, PublicationDraft, ReferenceId, RepositoryIdentity, ResolutionStatus,
-    SignalId, SpaceId, TaskArtifactFocus, TaskArtifactFocusRecord, TaskId, TaskIntent,
-    TaskSessionId, TaskSignalLifecycle,
+    ResolvedFocus, SpaceId, TaskId, TaskIntent,
 };
 use sctx_engineering_graph::{
     EngineeringProjection, EngineeringProjectionStore, EngineeringReferenceResolver,
@@ -224,7 +223,7 @@ impl MilestoneThreeFixture {
 }
 
 fn task_request(
-    focus: TaskArtifactFocus,
+    focus: ResolvedFocus,
     mode: ContextPackMode,
     token_budget: usize,
     goal: &str,
@@ -246,13 +245,7 @@ fn task_request(
             unknowns: Vec::new(),
         },
         task_signals: Vec::new(),
-        artifact_focuses: vec![TaskArtifactFocusRecord {
-            signal_id: SignalId::new(),
-            task_session_id: TaskSessionId::new(),
-            task_id,
-            focus,
-            lifecycle: TaskSignalLifecycle::Active,
-        }],
+        resolved_focus: Some(focus),
         token_budget,
         max_spaces: 8,
         candidate_limit: 100,
@@ -391,7 +384,7 @@ fn fixed_multilanguage_oracle_marks_moves_and_renames_missing_and_rebuilds() {
     let moved_file_pack = fixture
         .engine()
         .task_context_pack(&task_request(
-            TaskArtifactFocus {
+            ResolvedFocus {
                 repository_id: fixture.repository.repository_id,
                 locator: sctx_domain::ArtifactLocator::File {
                     path: sctx_domain::RepoRelativePath::new(moved.new_path.as_deref().unwrap())
@@ -423,7 +416,7 @@ fn fixed_multilanguage_oracle_marks_moves_and_renames_missing_and_rebuilds() {
     let renamed_symbol_pack = fixture
         .engine()
         .task_context_pack(&task_request(
-            TaskArtifactFocus {
+            ResolvedFocus {
                 repository_id: fixture.repository.repository_id,
                 locator: renamed_locator,
             },
@@ -456,7 +449,7 @@ fn fixed_graph_oracle_opens_requirement_decision_contract_and_cross_platform_val
     let pack = fixture
         .engine()
         .task_context_pack(&task_request(
-            TaskArtifactFocus {
+            ResolvedFocus {
                 repository_id: fixture.repository.repository_id,
                 locator: symbol_signal.clone(),
             },
@@ -514,7 +507,7 @@ fn fixed_graph_oracle_opens_requirement_decision_contract_and_cross_platform_val
         let cross_end = fixture
             .engine()
             .task_context_pack(&task_request(
-                TaskArtifactFocus {
+                ResolvedFocus {
                     repository_id: fixture.repository.repository_id,
                     locator: exact_signal,
                 },
@@ -542,7 +535,7 @@ fn fixed_graph_oracle_opens_requirement_decision_contract_and_cross_platform_val
     }
 
     let mut bounded_request = task_request(
-        TaskArtifactFocus {
+        ResolvedFocus {
             repository_id: fixture.repository.repository_id,
             locator: symbol_signal,
         },
@@ -577,7 +570,7 @@ fn ambiguous_and_unavailable_edges_diagnose_or_fall_back_without_automatic_graph
     let explicit = fixture
         .engine()
         .task_context_pack(&task_request(
-            TaskArtifactFocus {
+            ResolvedFocus {
                 repository_id: fixture.repository.repository_id,
                 locator: ambiguous_locator.clone(),
             },
@@ -599,7 +592,7 @@ fn ambiguous_and_unavailable_edges_diagnose_or_fall_back_without_automatic_graph
     let automatic = fixture
         .engine()
         .task_context_pack(&task_request(
-            TaskArtifactFocus {
+            ResolvedFocus {
                 repository_id: fixture.repository.repository_id,
                 locator: ambiguous_locator,
             },
@@ -655,7 +648,7 @@ fn ambiguous_and_unavailable_edges_diagnose_or_fall_back_without_automatic_graph
     let fallback = fixture
         .engine()
         .task_context_pack(&task_request(
-            TaskArtifactFocus {
+            ResolvedFocus {
                 repository_id: fixture.repository.repository_id,
                 locator: fixture
                     .projection
@@ -818,7 +811,7 @@ fn adapter_injects_frozen_safe_revision_after_current_revision_is_withdrawn() {
     let pack = fixture
         .engine()
         .task_context_pack(&task_request(
-            TaskArtifactFocus {
+            ResolvedFocus {
                 repository_id: fixture.repository.repository_id,
                 locator,
             },

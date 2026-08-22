@@ -15,7 +15,7 @@ pub use engineering::{
     ArtifactAssociationKind, ArtifactKey, ArtifactKind, ArtifactLocator, ArtifactRelationKind,
     ArtifactResolution, ContextArtifactAssociation, ContextRelation, ContextRelationKind,
     EngineeringArtifact, EngineeringGraphEdge, EngineeringReference, EngineeringReferenceDraft,
-    ReferenceRelation, RepoRelativePath, RepositoryIdentity, ResolutionStatus,
+    ReferenceRelation, RepoRelativePath, RepositoryIdentity, ResolutionStatus, ResolvedFocus,
 };
 pub use episode::{
     ArtifactAction, ContextCandidate, ContextUseDisposition, WorkEpisode, WorkObservation,
@@ -40,9 +40,9 @@ pub use reducer::{
     SemanticConflictOpenReason, SemanticConflictProjection, SemanticConflictStatus, reduce,
 };
 pub use task::{
-    ExternalSessionLocator, ExternalSessionSnapshot, TaskArtifactFocus, TaskArtifactFocusRecord,
-    TaskIntent, TaskIntentDraft, TaskIntentRevision, TaskSessionSnapshot, TaskSignal,
-    TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord, TaskSpaceAssociation,
+    ExternalSessionLocator, ExternalSessionSnapshot, TaskIntent, TaskIntentDraft,
+    TaskIntentRevision, TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle,
+    TaskSignalRecord, TaskSpaceAssociation,
 };
 
 /// Broad categories used to route recoverable errors across crate boundaries.

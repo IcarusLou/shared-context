@@ -14,14 +14,13 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sctx_domain::{
-    ArtifactLocator, Error, ErrorKind, ExternalSessionId, ExternalSessionLocator,
-    ExternalSessionSnapshot, RepositoryId, Result, SignalId, TaskArtifactFocus,
-    TaskArtifactFocusRecord, TaskId, TaskIntent, TaskIntentDraft, TaskIntentRevision,
-    TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalKind,
-    TaskSignalLifecycle, TaskSignalRecord,
+    Error, ErrorKind, ExternalSessionId, ExternalSessionLocator, ExternalSessionSnapshot, Result,
+    SignalId, TaskId, TaskIntent, TaskIntentDraft, TaskIntentRevision, TaskIntentRevisionId,
+    TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle,
+    TaskSignalRecord,
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Result of atomically locating or creating one `ExternalSession`'s first Task.
@@ -37,15 +36,6 @@ pub struct MergeSignalsOutcome {
     pub snapshot: TaskSessionSnapshot,
     pub inserted: usize,
     pub inserted_signal_ids: Vec<SignalId>,
-}
-
-/// Result of a CAS-guarded merge of structured Artifact Focuses.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MergeArtifactFocusesOutcome {
-    pub snapshot: TaskSessionSnapshot,
-    pub inserted: usize,
-    pub inserted_signal_ids: Vec<SignalId>,
-    pub focus_signal_ids: Vec<SignalId>,
 }
 
 /// Result of explicitly creating and activating a new Task.
@@ -382,45 +372,6 @@ impl TaskRuntime {
         Ok(Some(outcome))
     }
 
-    /// CAS-merges structured Artifact Focuses into the current `ActiveTask`
-    /// without creating an Intent revision.
-    ///
-    /// # Errors
-    ///
-    /// Returns an input error for an inactive/stale Task or Intent guard, or
-    /// invalid Focus coordinates.
-    pub fn merge_artifact_focuses(
-        &self,
-        task_session_id: TaskSessionId,
-        expected_active_task_id: TaskId,
-        expected_intent_revision_id: TaskIntentRevisionId,
-        focuses: Vec<TaskArtifactFocus>,
-    ) -> Result<MergeArtifactFocusesOutcome> {
-        let focuses = normalize_artifact_focuses(focuses)?;
-        let mut connection = self.open_connection()?;
-        let transaction = immediate(&mut connection, "begin Artifact Focus merge transaction")?;
-        let (task_id, current_revision_id) = read_active_task_head(&transaction, task_session_id)?
-            .ok_or_else(|| {
-                invalid("task_session_id does not identify the ExternalSession ActiveTask")
-            })?;
-        require_expected_active(task_id, expected_active_task_id)?;
-        if current_revision_id != expected_intent_revision_id {
-            return Err(invalid(format!(
-                "expected_intent_revision_id is stale; current Intent Head is {current_revision_id}"
-            )));
-        }
-        let outcome = merge_artifact_focuses_in_transaction(
-            &transaction,
-            task_session_id,
-            task_id,
-            &focuses,
-        )?;
-        transaction
-            .commit()
-            .map_err(sql_error("commit Artifact Focus merge transaction"))?;
-        Ok(outcome)
-    }
-
     /// Supersedes stable Signal IDs without deleting history.
     ///
     /// # Errors
@@ -441,41 +392,23 @@ impl TaskRuntime {
             })?;
         require_expected_active(task_id, expected_active_task_id)?;
         for signal_id in &signal_ids {
-            if let Some(record) = read_signal_record(&transaction, *signal_id)? {
-                record.validate_for_task(task_session_id, task_id)?;
-                if record.lifecycle != TaskSignalLifecycle::Active {
-                    return Err(invalid(format!(
-                        "Signal is already superseded: {signal_id}"
-                    )));
-                }
-            } else if let Some(record) = read_artifact_focus_record(&transaction, *signal_id)? {
-                record.validate_for_task(task_session_id, task_id)?;
-                if record.lifecycle != TaskSignalLifecycle::Active {
-                    return Err(invalid(format!(
-                        "Signal is already superseded: {signal_id}"
-                    )));
-                }
-            } else {
-                return Err(invalid(format!("Signal does not exist: {signal_id}")));
+            let record = read_signal_record(&transaction, *signal_id)?
+                .ok_or_else(|| invalid(format!("Signal does not exist: {signal_id}")))?;
+            record.validate_for_task(task_session_id, task_id)?;
+            if record.lifecycle != TaskSignalLifecycle::Active {
+                return Err(invalid(format!(
+                    "Signal is already superseded: {signal_id}"
+                )));
             }
         }
         for signal_id in &signal_ids {
-            let mut changed = transaction
+            let changed = transaction
                 .execute(
                     "UPDATE task_signal SET lifecycle = 'superseded'
                      WHERE signal_id = ?1 AND lifecycle = 'active'",
                     [signal_id.to_string()],
                 )
                 .map_err(sql_error("supersede Task Signal"))?;
-            if changed == 0 {
-                changed = transaction
-                    .execute(
-                        "UPDATE task_artifact_focus SET lifecycle = 'superseded'
-                         WHERE signal_id = ?1 AND lifecycle = 'active'",
-                        [signal_id.to_string()],
-                    )
-                    .map_err(sql_error("supersede Task Artifact Focus"))?;
-            }
             if changed != 1 {
                 return Err(invariant(
                     "Signal lifecycle changed inside write transaction",
@@ -567,18 +500,6 @@ impl TaskRuntime {
         task_session_id: TaskSessionId,
     ) -> Result<Vec<TaskSignalRecord>> {
         read_signal_records(&self.open_connection()?, task_session_id)
-    }
-
-    /// Reads active and superseded Artifact Focus records for any retained Task.
-    ///
-    /// # Errors
-    ///
-    /// Returns typed storage or invariant errors.
-    pub fn read_artifact_focus_history(
-        &self,
-        task_session_id: TaskSessionId,
-    ) -> Result<Vec<TaskArtifactFocusRecord>> {
-        read_artifact_focus_records(&self.open_connection()?, task_session_id)
     }
 
     fn open_connection(&self) -> Result<Connection> {
@@ -682,21 +603,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
             CREATE UNIQUE INDEX IF NOT EXISTS task_signal_one_active_semantic
                 ON task_signal (task_session_id, kind, content)
                 WHERE lifecycle = 'active';
-            CREATE TABLE IF NOT EXISTS task_artifact_focus (
-                signal_id TEXT PRIMARY KEY,
-                task_session_id TEXT NOT NULL,
-                task_id TEXT NOT NULL,
-                repository_id TEXT NOT NULL,
-                locator_json TEXT NOT NULL CHECK (json_valid(locator_json)),
-                lifecycle TEXT NOT NULL CHECK (lifecycle IN ('active', 'superseded')),
-                focus_ordinal INTEGER NOT NULL CHECK (focus_ordinal >= 0),
-                UNIQUE (task_session_id, focus_ordinal),
-                FOREIGN KEY (task_session_id) REFERENCES task_session (task_session_id)
-            ) STRICT;
-            CREATE UNIQUE INDEX IF NOT EXISTS task_artifact_focus_one_active_identity
-                ON task_artifact_focus (task_session_id, repository_id, locator_json)
-                WHERE lifecycle = 'active';
-            PRAGMA user_version = 3;",
+            PRAGMA user_version = 4;",
         )
         .map_err(sql_error("initialize task runtime schema"))
 }
@@ -850,97 +757,6 @@ fn find_active_signal(
         .map_err(sql_error("find active Task Signal"))?
         .map(|value| parse_id(&value, "task_signal.signal_id"))
         .transpose()
-}
-
-fn merge_artifact_focuses_in_transaction(
-    transaction: &Transaction<'_>,
-    task_session_id: TaskSessionId,
-    task_id: TaskId,
-    focuses: &[TaskArtifactFocus],
-) -> Result<MergeArtifactFocusesOutcome> {
-    let mut inserted_signal_ids = Vec::new();
-    let mut focus_signal_ids = Vec::with_capacity(focuses.len());
-    let mut next_ordinal = next_artifact_focus_ordinal(transaction, task_session_id)?;
-    for focus in focuses {
-        let locator_json = serde_json::to_string(&focus.locator)
-            .map_err(json_error("serialize Task Artifact Focus locator"))?;
-        if let Some(signal_id) = find_active_artifact_focus(
-            transaction,
-            task_session_id,
-            focus.repository_id,
-            &locator_json,
-        )? {
-            focus_signal_ids.push(signal_id);
-            continue;
-        }
-        let signal_id = SignalId::new();
-        transaction
-            .execute(
-                "INSERT INTO task_artifact_focus (
-                    signal_id, task_session_id, task_id, repository_id,
-                    locator_json, lifecycle, focus_ordinal
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6)",
-                params![
-                    signal_id.to_string(),
-                    task_session_id.to_string(),
-                    task_id.to_string(),
-                    focus.repository_id.to_string(),
-                    locator_json,
-                    next_ordinal,
-                ],
-            )
-            .map_err(sql_error("insert active Task Artifact Focus"))?;
-        inserted_signal_ids.push(signal_id);
-        focus_signal_ids.push(signal_id);
-        next_ordinal = next_ordinal
-            .checked_add(1)
-            .ok_or_else(|| invariant("Task Artifact Focus ordinal overflow"))?;
-    }
-    let snapshot = require_snapshot(transaction, task_session_id)?;
-    Ok(MergeArtifactFocusesOutcome {
-        snapshot,
-        inserted: inserted_signal_ids.len(),
-        inserted_signal_ids,
-        focus_signal_ids,
-    })
-}
-
-fn find_active_artifact_focus(
-    transaction: &Transaction<'_>,
-    task_session_id: TaskSessionId,
-    repository_id: RepositoryId,
-    locator_json: &str,
-) -> Result<Option<SignalId>> {
-    transaction
-        .query_row(
-            "SELECT signal_id FROM task_artifact_focus
-             WHERE task_session_id = ?1 AND repository_id = ?2 AND locator_json = ?3
-               AND lifecycle = 'active'",
-            params![
-                task_session_id.to_string(),
-                repository_id.to_string(),
-                locator_json
-            ],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(sql_error("find active Task Artifact Focus"))?
-        .map(|value| parse_id(&value, "task_artifact_focus.signal_id"))
-        .transpose()
-}
-
-fn next_artifact_focus_ordinal(
-    transaction: &Transaction<'_>,
-    task_session_id: TaskSessionId,
-) -> Result<i64> {
-    transaction
-        .query_row(
-            "SELECT COALESCE(MAX(focus_ordinal), -1) + 1
-             FROM task_artifact_focus WHERE task_session_id = ?1",
-            [task_session_id.to_string()],
-            |row| row.get(0),
-        )
-        .map_err(sql_error("read next Artifact Focus ordinal"))
 }
 
 fn read_external_identity(
@@ -1184,10 +1000,6 @@ fn read_snapshot_in_transaction(
         },
         intent_revisions: read_intent_revisions(transaction, task_session_id)?,
         task_signals: read_active_task_signals(transaction, task_session_id)?,
-        artifact_focuses: read_artifact_focus_records(transaction, task_session_id)?
-            .into_iter()
-            .filter(|record| record.lifecycle == TaskSignalLifecycle::Active)
-            .collect(),
     };
     snapshot.validate().map_err(|error| {
         invariant(format!(
@@ -1342,95 +1154,6 @@ fn read_signal_records(
     Ok(records)
 }
 
-fn read_artifact_focus_records(
-    connection: &Connection,
-    task_session_id: TaskSessionId,
-) -> Result<Vec<TaskArtifactFocusRecord>> {
-    let mut statement = connection
-        .prepare(
-            "SELECT signal_id, task_id, repository_id, locator_json, lifecycle
-             FROM task_artifact_focus
-             WHERE task_session_id = ?1 ORDER BY focus_ordinal ASC",
-        )
-        .map_err(sql_error("prepare Artifact Focus history"))?;
-    let rows = statement
-        .query_map([task_session_id.to_string()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })
-        .map_err(sql_error("query Artifact Focus history"))?;
-    let mut records = Vec::new();
-    for row in rows {
-        let (signal_id, task_id, repository_id, locator_json, lifecycle) =
-            row.map_err(sql_error("read Artifact Focus history row"))?;
-        let locator: ArtifactLocator = serde_json::from_str(&locator_json)
-            .map_err(json_error("parse Artifact Focus locator"))?;
-        let record = TaskArtifactFocusRecord {
-            signal_id: parse_id(&signal_id, "task_artifact_focus.signal_id")?,
-            task_session_id,
-            task_id: parse_id(&task_id, "task_artifact_focus.task_id")?,
-            focus: TaskArtifactFocus {
-                repository_id: parse_id(&repository_id, "task_artifact_focus.repository_id")?,
-                locator,
-            },
-            lifecycle: parse_signal_lifecycle(&lifecycle)?,
-        };
-        record.validate_for_task(task_session_id, record.task_id)?;
-        records.push(record);
-    }
-    Ok(records)
-}
-
-fn read_artifact_focus_record(
-    transaction: &Transaction<'_>,
-    signal_id: SignalId,
-) -> Result<Option<TaskArtifactFocusRecord>> {
-    transaction
-        .query_row(
-            "SELECT task_session_id, task_id, repository_id, locator_json, lifecycle
-             FROM task_artifact_focus WHERE signal_id = ?1",
-            [signal_id.to_string()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(sql_error("read Artifact Focus record"))?
-        .map(
-            |(task_session_id, task_id, repository_id, locator_json, lifecycle)| {
-                Ok(TaskArtifactFocusRecord {
-                    signal_id,
-                    task_session_id: parse_id(
-                        &task_session_id,
-                        "task_artifact_focus.task_session_id",
-                    )?,
-                    task_id: parse_id(&task_id, "task_artifact_focus.task_id")?,
-                    focus: TaskArtifactFocus {
-                        repository_id: parse_id(
-                            &repository_id,
-                            "task_artifact_focus.repository_id",
-                        )?,
-                        locator: serde_json::from_str(&locator_json)
-                            .map_err(json_error("parse Artifact Focus locator"))?,
-                    },
-                    lifecycle: parse_signal_lifecycle(&lifecycle)?,
-                })
-            },
-        )
-        .transpose()
-}
-
 fn read_signal_record(
     transaction: &Transaction<'_>,
     signal_id: SignalId,
@@ -1492,18 +1215,6 @@ fn normalize_signals(signals: Vec<TaskSignal>) -> Result<Vec<TaskSignal>> {
         signal.validate()?;
         if seen.insert(signal.clone()) {
             normalized.push(signal);
-        }
-    }
-    Ok(normalized)
-}
-
-fn normalize_artifact_focuses(focuses: Vec<TaskArtifactFocus>) -> Result<Vec<TaskArtifactFocus>> {
-    let mut normalized = Vec::with_capacity(focuses.len());
-    let mut seen = HashSet::with_capacity(focuses.len());
-    for focus in focuses {
-        focus.validate()?;
-        if seen.insert(focus.clone()) {
-            normalized.push(focus);
         }
     }
     Ok(normalized)

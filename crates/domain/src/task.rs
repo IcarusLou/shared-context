@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ArtifactLocator, ContextId, Error, ErrorKind, ExternalSessionId, RepositoryId, Result,
-    SignalId, SpaceId, TaskId, TaskIntentRevisionId, TaskSessionId,
+    ContextId, Error, ErrorKind, ExternalSessionId, Result, SignalId, SpaceId, TaskId,
+    TaskIntentRevisionId, TaskSessionId,
 };
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -285,7 +285,6 @@ pub struct TaskSessionSnapshot {
     pub external_session_locator: ExternalSessionLocator,
     pub intent_revisions: Vec<TaskIntentRevision>,
     pub task_signals: Vec<TaskSignal>,
-    pub artifact_focuses: Vec<TaskArtifactFocusRecord>,
 }
 
 impl TaskSessionSnapshot {
@@ -313,7 +312,6 @@ impl TaskSessionSnapshot {
             external_session_locator,
             intent_revisions: vec![initial_revision],
             task_signals,
-            artifact_focuses: Vec::new(),
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -355,11 +353,6 @@ impl TaskSessionSnapshot {
     pub fn validate(&self) -> Result<()> {
         self.external_session_locator.validate()?;
         TaskSignal::validate_collection(&self.task_signals)?;
-        TaskArtifactFocusRecord::validate_active_collection(
-            self.task_session_id,
-            self.task_id,
-            &self.artifact_focuses,
-        )?;
         if self.intent_revisions.is_empty() {
             return Err(invalid(
                 "task_session.intent_revisions must contain an initial revision",
@@ -397,103 +390,6 @@ impl TaskSessionSnapshot {
 pub enum TaskSignalLifecycle {
     Active,
     Superseded,
-}
-
-/// Repository-scoped Artifact declared relevant to one Task.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TaskArtifactFocus {
-    pub repository_id: RepositoryId,
-    pub locator: ArtifactLocator,
-}
-
-impl TaskArtifactFocus {
-    /// Validates the complete Artifact locator.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorKind::InvalidInput`] when the locator is incomplete or unsafe.
-    pub fn validate(&self) -> Result<()> {
-        self.locator.validate()
-    }
-
-    /// Canonical Repository-scoped identity used by Intent support checks.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the in-memory, string-only [`ArtifactLocator`] cannot be
-    /// serialized by `serde_json`.
-    #[must_use]
-    pub fn canonical_identity(&self) -> String {
-        format!(
-            "{}::{}",
-            self.repository_id,
-            serde_json::to_string(&self.locator)
-                .expect("validated ArtifactLocator is always JSON serializable")
-        )
-    }
-
-    /// Validates and deduplicates a Focus collection.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorKind::InvalidInput`] for invalid or duplicate Focuses.
-    pub fn validate_collection(focuses: &[Self]) -> Result<()> {
-        for focus in focuses {
-            focus.validate()?;
-        }
-        require_unique(focuses, "task_artifact_focuses")
-    }
-}
-
-/// One stable Focus record retained for active use or historical diagnosis.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TaskArtifactFocusRecord {
-    pub signal_id: SignalId,
-    pub task_session_id: TaskSessionId,
-    pub task_id: TaskId,
-    pub focus: TaskArtifactFocus,
-    pub lifecycle: TaskSignalLifecycle,
-}
-
-impl TaskArtifactFocusRecord {
-    /// Validates Focus content and ownership.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorKind::InvalidInput`] for invalid content or mixed ownership.
-    pub fn validate_for_task(&self, task_session_id: TaskSessionId, task_id: TaskId) -> Result<()> {
-        if self.task_session_id != task_session_id || self.task_id != task_id {
-            return Err(invalid(
-                "task_artifact_focus_record must belong to the supplied Task Session",
-            ));
-        }
-        self.focus.validate()
-    }
-
-    fn validate_active_collection(
-        task_session_id: TaskSessionId,
-        task_id: TaskId,
-        records: &[Self],
-    ) -> Result<()> {
-        let mut ids = HashSet::with_capacity(records.len());
-        let mut focuses = HashSet::with_capacity(records.len());
-        for record in records {
-            record.validate_for_task(task_session_id, task_id)?;
-            if record.lifecycle != TaskSignalLifecycle::Active {
-                return Err(invalid(
-                    "task_session.artifact_focuses must contain only active records",
-                ));
-            }
-            if !ids.insert(record.signal_id) || !focuses.insert(&record.focus) {
-                return Err(invalid(
-                    "task_session.artifact_focuses must not contain duplicates",
-                ));
-            }
-        }
-        Ok(())
-    }
 }
 
 /// One stable Task Signal record retained for active use or historical diagnosis.
@@ -734,14 +630,12 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        ExternalSessionLocator, ExternalSessionSnapshot, TaskArtifactFocus,
-        TaskArtifactFocusRecord, TaskIntent, TaskIntentDraft, TaskIntentRevision,
-        TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord,
-        TaskSpaceAssociation,
+        ExternalSessionLocator, ExternalSessionSnapshot, TaskIntent, TaskIntentDraft,
+        TaskIntentRevision, TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle,
+        TaskSignalRecord, TaskSpaceAssociation,
     };
     use crate::{
-        ArtifactLocator, ContextId, ErrorKind, ExternalSessionId, RepoRelativePath, RepositoryId,
-        SignalId, SpaceId, TaskId, TaskSessionId,
+        ContextId, ErrorKind, ExternalSessionId, SignalId, SpaceId, TaskId, TaskSessionId,
     };
 
     fn intent() -> TaskIntent {
@@ -1120,74 +1014,6 @@ mod tests {
         .validate()
         .expect_err("empty signal content must fail");
         assert!(error.message().contains("task_signal.content"));
-    }
-
-    #[test]
-    fn artifact_focus_identity_is_repository_plus_complete_locator_for_all_kinds() {
-        let path = |value: &str| RepoRelativePath::new(value).unwrap();
-        let locators = vec![
-            ArtifactLocator::File {
-                path: path("src/search.ts"),
-            },
-            ArtifactLocator::Module {
-                path: path("src/search"),
-            },
-            ArtifactLocator::Symbol {
-                path: path("src/search.ts"),
-                language: "typescript".to_owned(),
-                module: "search".to_owned(),
-                enclosing_type: None,
-                symbol_name: "run".to_owned(),
-                signature: "run(query: string)".to_owned(),
-            },
-            ArtifactLocator::Api {
-                path: path("api/search.yaml"),
-                protocol: "http".to_owned(),
-                operation: "GET".to_owned(),
-                normalized_route: "/v2/search".to_owned(),
-            },
-            ArtifactLocator::Schema {
-                path: path("api/search.yaml"),
-                namespace: "search".to_owned(),
-                version: "v2".to_owned(),
-                qualified_name: "search::Response".to_owned(),
-            },
-            ArtifactLocator::Test {
-                path: path("tests/search.rs"),
-                qualified_test_name: "search::returns_results".to_owned(),
-            },
-        ];
-        let repository_id = RepositoryId::new();
-        let focuses = locators
-            .into_iter()
-            .map(|locator| TaskArtifactFocus {
-                repository_id,
-                locator,
-            })
-            .collect::<Vec<_>>();
-        assert!(TaskArtifactFocus::validate_collection(&focuses).is_ok());
-        assert!(
-            TaskArtifactFocus::validate_collection(&[focuses[0].clone(), focuses[0].clone()])
-                .is_err()
-        );
-        let other_repository = TaskArtifactFocus {
-            repository_id: RepositoryId::new(),
-            locator: focuses[0].locator.clone(),
-        };
-        assert_ne!(focuses[0], other_repository);
-
-        let record = TaskArtifactFocusRecord {
-            signal_id: SignalId::new(),
-            task_session_id: TaskSessionId::new(),
-            task_id: TaskId::new(),
-            focus: focuses[0].clone(),
-            lifecycle: TaskSignalLifecycle::Active,
-        };
-        assert!(
-            record
-                .validate_for_task(record.task_session_id, record.task_id)
-                .is_ok()
-        );
     }
 
     #[test]

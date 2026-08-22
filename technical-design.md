@@ -136,7 +136,8 @@
 | `TaskSession` | 一次 Agent 工程任务的本地运行实例，与 Agent Session 隔离 |
 | `TaskIntent` | 系统对当前 Task 目标、范围、约束和未知项的动态理解 |
 | `TaskSignal` | Prompt、Workspace、Diff、TestOutcome 等非定位任务观察 |
-| `TaskArtifactFocus` | Agent 声明当前 Task 关注的工程对象；系统通过 Catalog 将 absolute path + kind coordinates 规范化为 RepositoryId + 完整 ArtifactLocator。它是 Graph seed，不是工程事实证明 |
+| `ArtifactFocusQuery` | 一次围绕 File、Module、Symbol、API、Schema 或 Test 检索历史 Context 的请求；只包含 Session/Intent CAS、absolute path、kind coordinates 和输出边界，不是持久 Task 状态 |
+| `ResolvedFocus` | 服务端在单次 ArtifactFocusQuery 内通过 Catalog 得到的 RepositoryId + 完整 ArtifactLocator；只作为本次 Graph seed，不是领域身份或工程事实证明 |
 | `TaskSpaceAssociation` | Task 与多个 Space 的派生相关性、置信度和匹配依据 |
 | `WorkEpisode` | 一次 Task 内被聚合的探索、修改、验证和结论 |
 | `ContextCandidate` | 从 WorkEpisode 自动生成、尚未进入知识事实层的 Context 草稿 |
@@ -822,7 +823,7 @@ token_budget:
 - 第一次 `task_intent_update`：显式创建 TaskSession，并提交完整 Provisional 或 Grounded TaskIntent。
 - Agent 调用 `task_intent_update`：提交完整 Intent Snapshot、Task boundary、maturity、evidence refs 与 Revision CAS。
 - 后续 Prompt：修订目标、范围和约束。
-- Agent 判断某工程对象与 Task 相关：调用 `task_artifact_focus`，由 Catalog 解析 Repository-scoped TaskArtifactFocus；不会创建 Intent Revision。
+- Agent 需要围绕某工程对象查询历史：调用只读 `task_artifact_focus`，Catalog 为本次请求解析 `ResolvedFocus`；不会创建 Intent Revision 或任何 Focus Runtime 状态。
 - Diff 变化：修订受影响范围。
 - API、Schema 或测试信号出现：增加跨模块、跨端线索。
 - PreCompact、TurnStop：固化一次 TaskIntent Revision 和 WorkEpisode Checkpoint。
@@ -1004,7 +1005,7 @@ sctx mcp serve --client cursor|codex
 | Tool | 类型 | 说明 |
 |---|---|---|
 | `task_intent_update` | 读/写本地状态 | CAS 更新 TaskIntent 并生成多 Space TaskContextPack |
-| `task_artifact_focus` | 读/写本地状态 | CAS 增加/复用当前 Artifact Focus；仅接收 Session、absolute path 与无 path coordinates，由 Catalog 补全身份并立即返回 TaskContextPack |
+| `task_artifact_focus` | 只读 | 钉定 ActiveTask 与 Intent Revision；仅接收 Session、absolute path 与无 path coordinates，由 Catalog 补全本次 `ResolvedFocus` 并立即返回 TaskContextPack，不保存 ID 或生命周期 |
 | `task_signal_supersede` | 读/写本地状态 | 按稳定 Signal ID 失效当前 Task 信号 |
 | `task_context` | 只读 | 按 external Session locator 重读已有 ActiveTask 的 TaskContextPack |
 | `repository_scan` | 读/写本地状态 | 只扫描已在 Catalog 配置的 checkout，要求显式非空 repo-relative paths，并返回有界 Artifact/skip 摘要；不接受 RepositoryId 注入 |
@@ -1050,7 +1051,7 @@ Adapter 只翻译厂商 Payload。TaskIntent、Git Diff、代码扫描、检索�
 
 - SessionStart：仅注入系统能力说明；不得构造或执行空查询 Context Pack，也不注入任何知识项或假定 Space 摘要。
 - PromptSubmit：仅作为 PromptEnvelope 返回能力提示，不从 Prompt 文本构造 Intent 或 Signal；工作 Agent 显式调用 `task_intent_update`。
-- PostToolUse：保留 Breadcrumb；可识别 Test/Check/Lint 工具只合并非定位 TestOutcome。File Hint 不再写入工程 TaskSignal，也不会隐式创建 TaskArtifactFocus；Prompt 前没有 Session 时不隐式创建，不保存原始 Tool Output、Transcript 或命令文本。
+- PostToolUse：保留 Breadcrumb；可识别 Test/Check/Lint 工具只合并非定位 TestOutcome。File Hint 不再写入工程 TaskSignal，也不会隐式发起 ArtifactFocusQuery；Prompt 前没有 Session 时不隐式创建，不保存原始 Tool Output、Transcript 或命令文本。
 - PreCompact：生成 Checkpoint，刷新并压缩当前最相关 Context。
 - TurnStop：固化 WorkEpisode，触发 Candidate Builder。
 - SessionEnd：清理或延长未确认 Candidate TTL。
@@ -1156,7 +1157,7 @@ crates/
 - `event-schema`：Event JSON 解析和校验。
 - `git-store`：不可变事件、对象、Batch 和 Git Commit。
 - `index`：知识 Projection、FTS、增量同步和重建。
-- `task-runtime`：TaskSession、TaskIntent、非定位 TaskSignal、TaskArtifactFocus 生命周期和 WorkEpisode。
+- `task-runtime`：TaskSession、TaskIntent、非定位 TaskSignal 和 WorkEpisode；不持久化 Artifact Focus。
 - `engineering-graph`：Artifact 扫描、Resolution、Association 和图扩展。
 - `retrieval`：Task 多路召回、排序、解释和 Context Pack。
 - `candidate-builder`：Claim/Evidence 聚合、去重、冲突与 Space 推荐。
@@ -1261,7 +1262,7 @@ sctx doctor --json
 
 ### M1：Task-first 领域与入口基础 — 已实现
 
-- `TaskIntent`、非定位 `TaskSignal` 与 Repository-scoped `TaskArtifactFocus` 已建模，Task Intent 不携带 Space 或 Workspace 路由。
+- `TaskIntent` 与非定位 `TaskSignal` 已建模，Task Intent 不携带 Space 或 Workspace 路由；Artifact Focus 明确为查询参数而非 Task 领域状态。
 - `TaskSpaceAssociation` 已作为独立派生类型建模，集合允许零个或多个 Space。
 - `WorkEpisode` 与无 Space 的 `ContextCandidate` 已建模。
 - 已删除 Workspace-to-Space 配置、绑定命令、preferred-Space 请求字段和对应排序逻辑。
@@ -1286,16 +1287,16 @@ M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命�
 ### M3：Engineering Graph — 已实现
 
 - 本机显式 Repository Catalog 是稳定 RepositoryId 的权威；SQLite Registry 只由 Catalog 同步并可删除恢复。一个 ID 支持 `0..N` checkout/worktree，绝不按 basename、remote、Git common-dir 或共同父目录推断合并/发现。
-- `ResolvedRepositoryPath` 可无损转换为 File Focus，但 Hook 当前不提交 Focus；热路径不启动 Git、不 scan/rebuild，不配置 sibling。Catalog lock/parse 故障 fail-open。
+- `ResolvedRepositoryPath` 可无损转换为本次 File `ResolvedFocus`，但 Hook 当前不发起 ArtifactFocusQuery；热路径不启动 Git、不 scan/rebuild，不配置 sibling。Catalog lock/parse 故障 fail-open。
 - Reference-derived `RepositoryScanPlan` 按 RepositoryId 分组、按精确 RepoRelativePath 去重；受限 tracked-source Scanner 只解析显式非空计划并生成 Module/File/Symbol/API/Schema/Test Artifact 摘要，不保存或返回完整源码，不执行全仓 `git ls-files` 枚举。
 - 持久 EngineeringReference Event、ArtifactResolution、ContextArtifactAssociation 和 generation-stable historical Projection 已实现。
 - `repository_scan`、`engineering_reference_record`、`association_explain`、`association_rebuild`/diagnose 已接入 MCP/CLI；服务端拥有 Reference/Event 身份与路径。
 - Task Retrieval 已消费唯一 resolved Graph edge 和 Context Relation；歧义/不可用不自动选择，Graph 故障降级为 Context-only。
 - Graph Builder 只固化 Reference roots 与最多两跳的 frozen ContextRelation closure；Graph item 使用 build-time immutable Revision/safety。后续 Candidate/Reference/Context/Publication append、新 Revision 或 Withdraw 不关闭旧 Graph，查询也不隐式 rebuild。
 - Graph Retrieval 与当前 Intent/Context/Scope fallback 使用 revision-aware candidate key；同一 ContextId 的 frozen old Revision 与 current FTS Revision 可以同时返回，Graph path 不得重绑到当前 Revision。Graph relation traversal 只使用 frozen relation targets；当前 fallback relation 不混入 EngineeringGraph path。
-- 已删除裸 Repository/File/Symbol/API/Schema/Test TaskSignal；Graph exact 只消费 Active TaskArtifactFocus，并同时匹配 RepositoryId 与完整 ArtifactLocator。Intent/Context BM25 与 Scope 继续作为非 Graph fallback。
-- `runtime.sqlite` 以稳定 SignalId 保存 Focus active/superseded 历史；CAS 同时守卫 ActiveTask 与当前 Intent Head，Focus 变更不创建 Intent Revision。新 Task 不继承，双 Session 隔离，重复/并发提交幂等。
-- 公开 MCP/CLI `task_artifact_focus` 只接受 external Session locator、Intent Revision CAS、absolute file path、无 path 的六类 coordinates 与输出预算，所有层 `additionalProperties=false`。RepositoryId、RepoRelativePath、ArtifactKey、Generation、Workspace、Hook 和 corroboration 均由 schema/decoder 拒绝。
+- 已删除裸 Repository/File/Symbol/API/Schema/Test TaskSignal；Graph exact 只消费当前请求的 `ResolvedFocus`，并同时匹配 RepositoryId 与完整 ArtifactLocator。Intent/Context BM25 与 Scope 继续作为非 Graph fallback。
+- Focus 不进入 `runtime.sqlite`、TaskSession snapshot、Signal history、Intent Revision 或 Task fingerprint。A→B 只消费 B，随后普通 `task_context` 无 Focus；重复、MCP 重启、Task 切换与 compaction 都没有 ID 或 active state 需要恢复。
+- 公开 MCP/CLI `task_artifact_focus` 只接受 external Session locator、Intent Revision CAS、absolute file path、无 path 的六类 coordinates 与输出预算，所有层 `additionalProperties=false`。RepositoryId、RepoRelativePath、ArtifactKey、Generation、Workspace、Hook 和 corroboration 均由 schema/decoder 拒绝；响应只含 `resolved_focus + context`。
 - Catalog declared-path resolver 允许配置 checkout 下的 missing leaf/tail，同时拒绝 dot segment、symlink traversal、现存非目录父节点和未配置前缀；不要求当前代码存在，不读取 Git、Scanner 或 AST。
 - 不可达 Focus 只返回 budgeted `artifact_not_reachable_in_graph` 诊断，不声称当前代码 `missing`；只有当前 mode 实际形成 resolved safe EngineeringGraph path（Explicit 可形成 GraphDiagnostic）后才标记 reachable。历史 frozen Graph 中仍存在的精确节点继续可达。
 - 固定跨 crate/E2E oracle 以手工 ID、Reference-derived path 计划、确定性 locator 和关系验证稀疏 Graph；独立 Scanner contract 用显式计划覆盖 Rust、TypeScript、JavaScript、Swift、Kotlin、JSON、OpenAPI 与 Proto。验收覆盖未引用 tracked 文件零 Artifact、path 去重、missing 无 fallback、API/Schema/Qualified Symbol/Test 精确 locator、Symbol→Requirement/Decision/Contract/Validation、File move/Symbol rename 变为 missing、FE API/Schema→跨端 Context、cycle/depth、歧义诊断、Repository unavailable、增量=scratch、投影删除重建、Generation 和 Token Budget。
@@ -1306,16 +1307,9 @@ M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命�
 
 M3 只定义和验证 Evidence 来源边界，不在 `TaskIntentRevision` 中持久化 maturity 或 EvidenceSource；持久化、去重和 Capture 固化属于 M4 后的 #136 强制验收项。
 
-`task_intent_update.evidence_refs` 的后续类型化形态只能引用以下可解析来源：
+`task_intent_update.evidence_refs` 的后续类型化形态只能引用以下可解析持久来源；瞬时 `ResolvedFocus` 不属于 EvidenceSource：
 
 ```text
-TaskArtifactFocusSource {
-  task_id,
-  signal_id,
-  repository_id,
-  locator
-}
-
 ContextEvidenceSource {
   context_id,
   revision_id,
@@ -1334,13 +1328,12 @@ EngineeringResolutionSource {
 
 验证规则：
 
-1. `TaskArtifactFocusSource` 必须属于当前 ActiveTask 且 lifecycle 为 active；superseded、其他 Task 或不存在的 Focus 不可解析。
-2. `ContextEvidenceSource` 的 Context、Revision 和 Evidence 必须在指定 Context Tree 中构成同一所有权链；任一 ID 存在但组合错误仍视为不可解析。
-3. `EngineeringResolutionSource` 必须在同一 `{context_tree_oid, artifact_generation}` 中解析为唯一 `resolved` Artifact 和 ContextArtifactAssociation；ambiguous、missing、unavailable 或跨 Generation 目标只能作为诊断，不能使 maturity 成为 grounded。
-4. File/Module/Symbol/API/Schema/Test 声明必须由 Repository-scoped TaskArtifactFocus canonical identity 或明确 Evidence 支撑；Prompt、Workspace、Diff 或 TestOutcome 文本本身不能证明 Artifact/Interface 身份。
-5. `grounded` Revision 至少包含一个成功解析的 EvidenceSource，且每个 Artifact/Interface 声明都有来源覆盖；opaque 字符串、自由文本前缀和仅格式合法的 ID 一律不能通过。
-6. #136 实现必须将 maturity 与规范化 typed EvidenceSource 一起纳入 Revision 的持久内容、CAS 和幂等比较；完全相同的重试返回 `already_current`，不得新增 Revision。
-7. M4 新增的 WorkEpisode/Checkpoint observation 只有在定义稳定 ID、所有权、查询和固化规则后，才能新增为第四类 EvidenceSource；当前 `source_episode_id` 不能代替该契约。
+1. `ContextEvidenceSource` 的 Context、Revision 和 Evidence 必须在指定 Context Tree 中构成同一所有权链；任一 ID 存在但组合错误仍视为不可解析。
+2. `EngineeringResolutionSource` 必须在同一 `{context_tree_oid, artifact_generation}` 中解析为唯一 `resolved` Artifact 和 ContextArtifactAssociation；ambiguous、missing、unavailable 或跨 Generation 目标只能作为诊断，不能使 maturity 成为 grounded。
+3. File/Module/Symbol/API/Schema/Test 声明必须由明确 Evidence 支撑；Prompt、Workspace、Diff、TestOutcome 或本次 `ResolvedFocus` 本身不能证明 Artifact/Interface 身份。
+4. `grounded` Revision 至少包含一个成功解析的 EvidenceSource，且每个 Artifact/Interface 声明都有来源覆盖；opaque 字符串、自由文本前缀和仅格式合法的 ID 一律不能通过。
+5. #136 实现必须将 maturity 与规范化 typed EvidenceSource 一起纳入 Revision 的持久内容、CAS 和幂等比较；完全相同的重试返回 `already_current`，不得新增 Revision。
+6. M4 新增的 WorkEpisode/Checkpoint observation 只有在定义稳定 ID、所有权、查询和固化规则后，才能新增为另一类 EvidenceSource；当前 `source_episode_id` 不能代替该契约。
 
 ### M4：Low-tax Capture — 未实现
 

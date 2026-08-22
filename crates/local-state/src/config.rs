@@ -9,7 +9,7 @@ use std::{
 
 use fs2::FileExt;
 use sctx_domain::{
-    ArtifactLocator, Error, ErrorKind, RepoRelativePath, RepositoryId, Result, TaskArtifactFocus,
+    ArtifactLocator, Error, ErrorKind, RepoRelativePath, RepositoryId, ResolvedFocus, Result,
 };
 use serde::{Deserialize, Serialize};
 
@@ -66,8 +66,8 @@ impl ResolvedRepositoryPath {
     /// Converts the resolved Repository identity and exact relative path into
     /// one lossless File Focus without exposing a public submission surface.
     #[must_use]
-    pub fn into_file_focus(self) -> TaskArtifactFocus {
-        TaskArtifactFocus {
+    pub fn into_resolved_file_focus(self) -> ResolvedFocus {
+        ResolvedFocus {
             repository_id: self.repository_id,
             locator: ArtifactLocator::File {
                 path: self.relative_path,
