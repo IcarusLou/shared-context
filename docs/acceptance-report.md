@@ -1,14 +1,14 @@
 # Task-first Retrieval Integration Acceptance Report
 
 Date: 2026-08-23
-Scope: Mew #112 through #163 plus #136, including Mandatory Gates #114/#117 and accepted boundary #150; final M4 Gate #164 is not executed
-Implementation baseline before lifecycle automation: `main@010a310`
+Scope: completed redesign work through Mew #170, including Mandatory Gates #114/#117, Working Intent fixes #136/#169, and accepted boundary #150; final M4 Gate #164 is not executed
+Documentation baseline before the #170 language alignment: `main@e03193b`
 
 ## Verdict
 
 M1 closes the Task-first domain and entry-point foundation. M2 closes the local Task Runtime and explainable multi-Space retrieval path. M3 closes the Engineering Graph through a local Repository Registry, bounded multi-language scanner, persistent Engineering References, rebuildable resolution projection, bounded ContextRelation traversal, graph retrieval, and explicit MCP/CLI workflows.
 
-Session startup is capability-only: it does not run an empty automatic knowledge query. Task-aware automatic retrieval begins only from a supported PromptSubmit event.
+Session startup and PromptSubmit are capability-only: neither infers Working Intent nor runs an automatic knowledge query. Task-aware retrieval begins after the Agent explicitly calls `task_intent_update`; subsequent `task_context` calls are read-only.
 
 This report does **not** claim the final M4 Gate:
 
@@ -17,9 +17,9 @@ This report does **not** claim the final M4 Gate:
 | M1 — Task-first primitives and unassigned Candidate entry | IMPLEMENTED | Covered below |
 | M2 — Task Runtime and multi-Space retrieval | IMPLEMENTED | TaskSession persistence, strict `task_intent_update`, read-only `task_context`, association inference, typed RetrievalPaths, and TaskContextPack pass focused cross-crate/E2E oracles |
 | M3 — Engineering Graph | IMPLEMENTED | Reference-derived bounded ScanPlan, deterministic Artifact locators, sparse build-time Context/safety snapshots, historical exact retrieval, frozen 1–2 hop relations, diagnostics, fallback, rebuild equivalence, and budget bounds pass cross-crate/E2E oracles |
-| M4 — Low-tax Capture | FUNCTIONAL CHAIN + WORKING INTENT FIX IMPLEMENTED; FINAL GATE PENDING | #117, #136 and #156–#163 provide lightweight idempotent Working Intent, WorkEpisode/Checkpoint automation, Builder/analysis/Review, and atomic Candidate Confirmation; #164 remains unexecuted |
+| M4 — Low-tax Capture | FUNCTIONAL CHAIN + WORKING INTENT FIX IMPLEMENTED; FINAL GATE PENDING | #117, #136, #156–#163 and #169 provide lightweight idempotent Working Intent, Hint Text retrieval, WorkEpisode/Checkpoint automation, Builder/analysis/Review, and atomic Candidate Confirmation; #164 remains unexecuted |
 
-`task_intent_update` is the only Task Intent write path. `task_context` accepts only an external Session locator and output bounds, and reads the already-authoritative ActiveTask without mutating Runtime. PromptSubmit supplies guidance rather than inferred Intent. Explicit `context_search.space_ids` remains available as a hard filter for diagnosis and exploration.
+`task_intent_update` is the only public Working Intent write path. It creates or advances a `TaskIntentRevision` containing one `WorkingIntentSnapshot`. `task_context` accepts only an external Session locator and output bounds, and reads the already-authoritative ActiveTask without mutating Runtime. PromptSubmit supplies guidance rather than inferred Intent. Explicit `context_search.space_ids` remains available as a hard filter for diagnosis and exploration.
 
 Mandatory Gates #114/#117 are implemented: stable `submission_id` and exact closed Episode ownership are represented in Git, rebuilt into SQLite submission/conflict indexes, and admitted only after Task/Intent/source Episode verification. Same-ID retries reuse the original Candidate while conflicting or identifiable malformed same-ID Events fail closed; different IDs and unrelated invalid/unknown Events remain isolated. The write path uses indexed lookup rather than Event scans or commit subjects.
 
@@ -27,7 +27,7 @@ Mandatory Gates #114/#117 are implemented: stable `submission_id` and exact clos
 
 | Requirement | Result | Authoritative evidence |
 |---|---|---|
-| `TaskIntent` has no Space or Workspace route | PROVEN | `sctx-domain` serialization contract and `milestone_one_contract::task_intent_has_no_route_and_accepts_zero_or_many_space_associations` |
+| `WorkingIntentSnapshot` has no Space or Workspace route | PROVEN | `sctx-domain` serialization contract and historical test identifier `milestone_one_contract::task_intent_has_no_route_and_accepts_zero_or_many_space_associations` |
 | One Task accepts zero or multiple Space associations | PROVEN | `TaskSpaceAssociation::validate_collection` domain contract and the cross-crate milestone test |
 | Search request has no preferred-Space ranking input | PROVEN | `SearchRequest` contract; Search cursor/ranking contains only BM25, Evidence completeness, and stable IDs |
 | Explicit exploration can still hard-filter by Space | PROVEN | MCP contract sends `context_search.space_ids`; `SearchFilters.space_ids` is applied in SQL before ranking |
@@ -45,7 +45,7 @@ Mandatory Gates #114/#117 are implemented: stable `submission_id` and exact clos
 | Discard is explicit, audited, and idempotent | PROVEN | Task/Intent/Review CAS changes Pending to Discarded once; same-reason timeout retry returns already_discarded, different reason/stale/cross-Task/Confirmed/secret input fail typed, and default list hides discarded |
 | Expired Reviews cannot revive | PROVEN | TTL cleanup deletes heavy Runtime analysis, advances a terminal Expired tombstone, never touches Git, and a later Builder retry cannot recreate Pending; deleting runtime removes all unconfirmed Review discovery |
 | Existing confirmed Context fixtures use neutral revision terminology | PROVEN | Event constructor is `context_revision_added`; no Context-Propose API or constructor remains |
-| SessionStart emits capability guidance without knowledge retrieval | PROVEN | Shared lifecycle policy returns no Task Runtime operation; the CLI adversarial contract seeds two Spaces with Accepted eligible Context and proves startup emits neither item before a supported PromptSubmit retrieves only its task match |
+| SessionStart and PromptSubmit emit capability guidance without knowledge retrieval | PROVEN | Shared lifecycle policy returns no Task Runtime operation; the CLI adversarial contract seeds two Spaces with Accepted eligible Context and proves both lifecycle events emit no item before the Agent explicitly calls `task_intent_update` and retrieves only its task match |
 | Codex dynamic sessions are isolated and incorporate later non-locating outcomes | PROVEN | CLI adversarial contract runs two Codex sessions in one Git Workspace, proves pre-Prompt PostToolUse cannot create a Session, File observations remain Breadcrumb-only, and TestOutcome changes only the owning Task fingerprint without Graph semantics |
 | Task retrieval accepts no caller Space or Workspace route | PROVEN | `milestone_two_contract` serializes the accepted input and rejects injected `space_id`, `space_ids`, `workspace`, and `workspace_id` fields |
 | Task retrieval returns zero, one, or many Space candidates | PROVEN | The M2 oracle executes unrelated, page-only, and multi-Space tasks through the shared Runtime/MCP/Search/Index path |
@@ -66,9 +66,9 @@ Mandatory Gates #114/#117 are implemented: stable `submission_id` and exact clos
 | WorkEpisode persistence is Task-isolated and CAS-guarded | PROVEN | Runtime v8 enforces one Open Episode per TaskSession, server IDs, ordered Intent/Signal refs, normalized Observation sources, Episode version CAS, inactive-Task rejection and same-Workspace dual-Session isolation; Candidate Build and derived analysis remain Episode-owned |
 | Public AgentCheckpoint is strict and transactionally owned | PROVEN | MCP/CLI require external Session, Task/Intent/Episode CAS, boundary, complete Claims/Unknowns and typed refs with recursive `additionalProperties=false`; Runtime atomically opens/advances Episode, assigns WorkObservation/Claim/Checkpoint IDs and continues or closes |
 | Checkpoint retries are semantic and concurrent-safe | PROVEN | `(episode_id,parent_episode_version)` is unique; eight concurrent identical writes return one created Checkpoint and stable IDs, identical timeout retries return the original, changed content conflicts and stale versions have distinct typed errors |
-| Checkpoint Evidence is verified and private | PROVEN | One Index snapshot validates Context→Revision→Evidence, Catalog validates Repository-scoped Artifact locators, Episode/Task validates Observation and active/historical Signal ownership, inline Validation is self-contained and PrivacyScanner rejects Secret/PII; ArtifactRef alone cannot satisfy Evidence |
+| Checkpoint Evidence is verified and private | PROVEN | One Index snapshot validates Context→Revision→Evidence, Episode/Task validates WorkObservation ownership, and inline Validation is self-contained. TaskSignal references are validated only as owned, non-factual source clues: Prompt/Workspace cannot become engineering Evidence, while explicitly cited normalized Diff/TestOutcome clues are converted by the Builder into self-contained EvidenceSnapshot content. PrivacyScanner rejects Secret/PII, and ArtifactRef alone cannot satisfy Evidence |
 | Codex and Cursor close Episodes without Hook claims | PROVEN | Real newline Cursor and Content-Length Codex MCP sessions execute Intent→inline Validation Checkpoint→unknown-only close; continue writes no Candidate, while close builds the earlier evidenced Claim exactly once and returns stable Candidate summaries |
-| Candidate Builder is deterministic, evidence-bounded and crash-safe | PROVEN | Six typed Evidence paths produce complete drafts; Unknown-only and insufficient Prompt Evidence produce zero Git writes; missing kind uses Discovery and missing topic remains a non-blocking Unknown; Runtime-before-Git, Git-before-Runtime, semantic retry, identical-text distinct Claims, and 20 concurrent builds preserve stable operation identities |
+| Candidate Builder is deterministic, evidence-bounded and crash-safe | PROVEN | Typed WorkObservation, Context Evidence, normalized Diff/TestOutcome source conversion, and inline Validation paths produce complete drafts; Unknown-only and unsupported Prompt clues produce zero Git writes; missing kind uses Discovery and missing topic remains a non-blocking Unknown; Runtime-before-Git, Git-before-Runtime, semantic retry, identical-text distinct Claims, and 20 concurrent builds preserve stable operation identities |
 | Candidate relationship analysis is typed and conservative | PROVEN | Full canonical draft equality alone yields exact duplicate; equal statement with different rationale/Evidence yields support; same topic plus explicit Context or exact Graph path yields revision; differing topic/scope statements yield potential contradiction; pure BM25 remains unresolved related; no candidate yields novel |
 | Candidate Space recommendation is non-binding and generation-pinned | PROVEN | Deterministic RRF fuses assessment targets, source Task associations and Space Intent evidence under top-k/token budget; fixed Context/Graph generations and stable target ties survive Index rebuild; conflicted/unsafe Spaces cannot become Primary and absence of a safe Primary produces one complete system-suggested Intent |
 | Candidate Confirmation facts are causal and conflict-explicit | PROVEN | Existing/new Primary, multiple Related Spaces and field edits reduce identically under Event permutation; exact Candidate/source, embedded owner, Association, causal Publish and generated-ID-free content hash are verified; duplicate Confirmations and Association heads remain explicit conflicts, while later Withdraw preserves historical confirmation and current lifecycle exclusion |
@@ -100,7 +100,7 @@ Mandatory Gates #114/#117 are implemented: stable `submission_id` and exact clos
 | Engineering projection is disposable and generation-consistent | PROVEN | The oracle deletes `engineering.sqlite`, rebuilds byte-equivalent canonical projection, and proves every Graph path shares one Artifact Generation while Graph build Tree remains explicit provenance |
 | Incremental and scratch scans are equivalent | PROVEN | The Scanner contract runs both paths with the same RepositoryId and deduplicated ScanPlan and asserts byte-for-byte equal RepositorySnapshot output |
 | Associations, paths and omissions obey Token Budget | PROVEN | Full and constrained fixed Graph packs recompute exact charged tokens, stay within budget, obey top-k, and emit omissions when bounded |
-| M3 defines the verifiable Evidence source boundary for deferred #136 | PROVEN | Technical design defines typed TaskSignal, ContextEvidence and EngineeringResolution sources, ownership/snapshot rules, negative statuses, and the M4 persistence boundary without claiming it is implemented |
+| #136 removes Intent maturity and Evidence while preserving knowledge Evidence | PROVEN | `WorkingIntentSnapshot`, its Hints, and TaskSignals are explicitly non-factual and carry no maturity or Evidence binding. M3 typed Context Evidence, EngineeringReference support, Graph safety provenance, and exact Revision ownership continue to serve CheckpointClaim, Candidate and ContextRevision assertion chains |
 | Historical Graph remains active across current Tree changes | PROVEN | Tree mismatch plus unrelated Candidate/Reference/Context/Publication append, new Revision and Withdraw preserve the old Graph path and exact frozen Revision without implicit rebuild |
 | Graph safety is decided at build time | PROVEN | Candidate, incomplete-Evidence and semantic-conflict roots remain explicit-only; withdrawn-after-build safe Revision passes Agent Adapter only with matching Graph provenance, generation, identity and empty blockers |
 | Current and historical revisions never collide | PROVEN | One Task returns the same ContextId's frozen old Graph Revision and current FTS Revision as separate revision-aware items; each path remains attached to its exact Revision |
@@ -112,7 +112,7 @@ Mandatory Gates #114/#117 are implemented: stable `submission_id` and exact clos
 
 #154 replaces the unlaunched #151/#152 persistence model: `task_artifact_focus` is a read-only ArtifactFocusQuery, Catalog supplies a request-local `ResolvedFocus`, and Search consumes only that value for the current Pack. Runtime owns no Focus state, and later Focus queries, ordinary `task_context`, MCP restart, Task switch, or compaction restore nothing. Repository Catalog remains local-only; team synchronization is not claimed.
 
-#157 exposes explicit AgentCheckpoint through MCP/CLI/Skill without Hook-authored Claims. #114/#117 connect Candidate writes to closed Episode verification, submission-idempotent Git admission, and malformed-Event isolation. #158 deterministically builds unassigned drafts at close and through an internal CLI retry. #163 lets verified PreCompact/TurnStop Hooks close only an already checkpointed Episode and invoke that same Builder. #136 now stores optional, non-factual Working Intent snapshots with canonical retry convergence; #164 remains unexecuted.
+#157 exposes explicit AgentCheckpoint through MCP/CLI/Skill without Hook-authored Claims. #114/#117 connect Candidate writes to closed Episode verification, submission-idempotent Git admission, and malformed-Event isolation. #158 deterministically builds unassigned drafts at close and through an internal CLI retry. #163 lets verified PreCompact/TurnStop Hooks close only an already checkpointed Episode and invoke that same Builder. #136 stores optional, non-factual Working Intent snapshots with canonical retry convergence, and #169 adds typed Hint Text recall without Graph semantics; both are complete. #164 remains unexecuted.
 
 The fixed #136 oracle proves goal-only input, created/already-current continue, real changes, old-parent retry convergence, 20-way concurrency, stale zero-write, explicit new, Task switch and Runtime deletion. Artifact/interface Hints retrieve only through `WorkingIntentHintText`; they create no Git Event, Candidate, EngineeringReference, Graph path, Evidence, or automatic eligibility. Existing `episode_lifecycle_hooks`, `work_episode_capture`, and `hook_fail_open` suites cover PreCompact/TurnStop and Intent/Capture/Hook fail-open.
 
@@ -164,8 +164,8 @@ Current repository gate results:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: passed with no warnings.
-- `cargo test --workspace --locked`: 295 passed, 0 failed, 1 ignored manual benchmark.
+- `cargo test --workspace --locked`: passed with no failures and one ignored manual benchmark.
 - `npm test`: 16 passed, 0 failed, 0 skipped.
 - Shared Context Skill `quick_validate.py`: passed (`Skill is valid!`).
 
-The complete historical V1 storage, lifecycle, installer, adapter, and NPM regression coverage remains in the workspace suites. M1–M3 establish Task-first runtime retrieval and Engineering Graph truth; they do not claim automatic Capture behavior.
+The complete historical V1 storage, lifecycle, installer, adapter, and NPM regression coverage remains in the workspace suites. M1–M3 establish Task-first runtime retrieval and Engineering Graph truth; #156–#163 implement the functional Low-tax Capture chain, while #164 remains the unexecuted final M4 gate.

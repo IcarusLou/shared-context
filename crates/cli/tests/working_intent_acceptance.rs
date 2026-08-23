@@ -371,3 +371,74 @@ fn production_working_intent_residue_is_zero() {
         );
     }
 }
+
+#[test]
+fn working_intent_document_language_is_current_and_bounded() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let context = fs::read_to_string(root.join("CONTEXT.md")).unwrap();
+    let development = fs::read_to_string(root.join("DEVELOPMENT.md")).unwrap();
+    let technical = fs::read_to_string(root.join("technical-design.md")).unwrap();
+    let acceptance = fs::read_to_string(root.join("docs/acceptance-report.md")).unwrap();
+
+    for required in [
+        "**WorkingIntentSnapshot**:",
+        "**TaskIntentRevision**:",
+        "**TaskSignal**:",
+        "**Evidence**:",
+        "it is not engineering Evidence",
+    ] {
+        assert!(
+            context.contains(required),
+            "missing glossary language: {required}"
+        );
+    }
+    for required in [
+        "`task_intent_update`",
+        "`WorkingIntentSnapshot`",
+        "`TaskIntentRevision`",
+    ] {
+        assert!(
+            development.contains(required)
+                && technical.contains(required)
+                && acceptance.contains(required),
+            "current-state docs are missing {required}"
+        );
+    }
+    assert!(
+        technical.contains(
+            "Evidence 绑定 WorkObservation、CheckpointClaim、Candidate、ContextRevision 或 EngineeringReference"
+        )
+    );
+    assert!(development.contains("#136、#156–#163 与 #169"));
+    assert!(acceptance.contains("#136/#169"));
+    assert!(
+        development.contains("#164 最终端到端验收尚未执行")
+            && technical.contains("#164 Gate 待完成")
+            && acceptance.contains("#164 remains unexecuted")
+    );
+
+    let current_state = [context, development, technical, acceptance]
+        .join("\n")
+        .to_lowercase();
+    for residue in [
+        "a signal is evidence about the current task",
+        "superseded signals remain historical evidence",
+        "`taskintent` 不包含 space",
+        "各自的 taskintent",
+        "创建或修订权威 taskintent",
+        "以 `taskintent` 作为默认检索入口",
+        "| `taskintent` |",
+        "m3 defines the verifiable evidence source boundary for deferred #136",
+        "tasksignal, contextevidence and engineeringresolution sources",
+        "grounded working intent",
+        "grounded workingintent",
+        "working intent maturity",
+        "tasksignal 是 evidence",
+        "tasksignal 作为 evidence",
+    ] {
+        assert!(
+            !current_state.contains(residue),
+            "obsolete document language: {residue}"
+        );
+    }
+}

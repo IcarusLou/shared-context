@@ -21,7 +21,7 @@ A local container corresponding to one external Agent session, with exactly one 
 _Avoid_: Task, Workspace, knowledge owner
 
 **ActiveTask**:
-The one TaskSession currently selected for new Intent revisions, non-locating TaskSignals, and retrieval within an ExternalSession. Changing it is an explicit task-boundary decision, not a Workspace-derived guess.
+The one TaskSession currently selected for new TaskIntentRevisions, non-locating TaskSignals, and retrieval within an ExternalSession. Changing it is an explicit task-boundary decision, not a Workspace-derived guess.
 _Avoid_: Active Space, latest Prompt
 
 **TaskIntentRevision**:
@@ -33,8 +33,8 @@ An Agent kind and its external session key used only to find the corresponding l
 _Avoid_: TaskSessionId, knowledge identifier
 
 **TaskSignal**:
-An observable, non-locating input that informs TaskIntent or knowledge retrieval, such as a Prompt, Workspace, Diff, or TestOutcome. A signal is evidence about the current Task, not Artifact identity or a declaration of Space membership.
-_Avoid_: Space binding, routing key
+A non-factual, non-locating work clue such as a Prompt, Workspace, Diff, or TestOutcome. It may influence a WorkingIntentSnapshot or retrieval, but it is not engineering Evidence, Artifact identity, or a declaration of Space membership.
+_Avoid_: Evidence, Space binding, routing key
 
 **ArtifactFocusQuery**:
 A one-request question asking for historical Context around one Artifact. It is transient retrieval input, not Task state, Evidence, or an engineering fact.
@@ -49,12 +49,12 @@ A non-locating observation about a test tool execution, such as success or failu
 _Avoid_: Test Artifact, qualified Test locator
 
 **TaskSignalLifecycle**:
-The current relevance of one identified non-locating TaskSignal within its Task: Active signals participate in retrieval, while Superseded signals remain historical evidence but do not participate.
+The current relevance of one identified non-locating TaskSignal within its Task: Active signals participate in retrieval, while Superseded signals remain historical work records but do not participate.
 _Avoid_: deletion, global signal state
 
 **CaptureRecord**:
 A redacted, TTL-bounded local Breadcrumb identified by CaptureId and carrying its ExternalSessionLocator plus any exactly resolved ActiveTask owner. It is an ingestion source, not yet a WorkObservation or durable knowledge.
-_Avoid_: transcript, tool log, ownerless Task evidence
+_Avoid_: transcript, tool log, ownerless Task attribution
 
 **CaptureClaim**:
 An idempotent reservation of one CaptureRecord for its exact Task owner. It neither deletes the CaptureRecord nor proves that Runtime ingestion committed.
@@ -155,6 +155,10 @@ _Avoid_: current Context view, automatic index refresh
 **GraphContextSnapshot**:
 One immutable Context revision, its fixed relation targets, and its automatic-safety decision as included by an EngineeringGraphSnapshot. Its source Context Tree is provenance, not a current-validity condition.
 _Avoid_: current Context head, live governance lookup
+
+**Evidence**:
+A self-contained or typed, resolvable provenance record supporting a normalized WorkObservation or an engineering assertion in a CheckpointClaim, Candidate, ContextRevision, or EngineeringReference. A WorkingIntentSnapshot, TaskSignal, Hint, or ArtifactFocusQuery may guide work or retrieval but is not Evidence.
+_Avoid_: Task clue, retrieval match, Artifact association alone
 
 **EvidenceSource**:
 A typed, resolvable provenance target for an engineering claim, such as immutable Context Evidence or a current unique Engineering Resolution. WorkingIntentSnapshot, its Hints, ArtifactFocusQuery, generic TestOutcome, and unavailable/ambiguous targets are not EvidenceSources.

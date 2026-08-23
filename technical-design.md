@@ -10,18 +10,18 @@
 
 本项目尚未上线，本文直接定义目标模型、接口和存储结构。
 
-### 1.1 当前实现状态（Mew #163）
+### 1.1 当前实现状态（Mew #170）
 
 本文的大部分章节描述目标架构，不代表代码已经全部实现。当前里程碑边界如下：
 
 | 里程碑 | 状态 | 当前代码事实 |
 |---|---|---|
-| **M1：Task-first 领域与入口基础** | **已实现** | `TaskIntent` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；CLI/MCP 通过 `candidate_create` 创建无 Space Candidate；Candidate 不可自动注入 |
-| **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、严格 `task_intent_update` 与只读 `task_context` 已通过跨 crate/E2E 验收 |
+| **M1：Task-first 领域与入口基础** | **已实现** | `WorkingIntentSnapshot` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；CLI/MCP 通过 `candidate_create` 创建无 Space Candidate；Candidate 不可自动注入 |
+| **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、`TaskIntentRevision`、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、严格 `task_intent_update` 与只读 `task_context` 已通过跨 crate/E2E 验收 |
 | **M3：Engineering Graph** | **已实现** | 稳定本机 Repository Catalog、可重建 Registry、Reference-derived 有界扫描、build-time immutable Context/safety snapshot、历史 Graph Retrieval、ContextRelation 1–2 跳及 MCP/CLI 工作流已通过固定跨 crate/E2E oracle |
-| **M4：Low-tax Capture** | **功能链与 #136 Working Intent 修复已实现，最终验收待完成** | #117、#136 与 #156–#163 已实现旁路 Working Intent、WorkEpisode、Hook lifecycle、Candidate Builder/Review/Confirm；#164 最终 E2E Gate 尚未执行 |
+| **M4：Low-tax Capture** | **功能链与 #136/#169 Working Intent 修复已实现，最终验收待完成** | #117、#136、#156–#163 与 #169 已实现旁路 Working Intent、Hint Text retrieval、WorkEpisode、Hook lifecycle、Candidate Builder/Review/Confirm；#164 最终 E2E Gate 尚未执行 |
 
-当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订权威 TaskIntent，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示。PostToolUse 的 File observation 只形成带 Session/optional Task owner 的 redacted Capture Breadcrumb，可识别测试工具只形成非定位 TestOutcome；Hook 不运行 Git discovery、Scanner、Registry sync、Graph rebuild、Focus 提交、Episode open/ingest，也不伪造 Claim。PreCompact/TurnStop 只能关闭已有 current-Intent Checkpoint 的 Episode 并调用共享 Builder。显式 Graph 工具完成 bounded scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。当前 `candidate_create` 仍是手工、无归属的 M1 入口，不等同于 M4 自动 Capture。
+当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订承载 `WorkingIntentSnapshot` 的 `TaskIntentRevision`，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示。PostToolUse 的 File observation 只形成带 Session/optional Task owner 的 redacted Capture Breadcrumb，可识别测试工具只形成非事实、非定位的 TestOutcome TaskSignal；TaskSignal 可影响 Working Intent retrieval，但不是工程 Evidence。Hook 不运行 Git discovery、Scanner、Registry sync、Graph rebuild、Focus 提交、Episode open/ingest，也不伪造 Claim。PreCompact/TurnStop 只能关闭已有 current-Intent Checkpoint 的 Episode并调用共享 Builder。显式 Graph 工具完成 bounded scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。当前 `candidate_create` 仍是手工、无归属的 M1 入口，不等同于 M4 自动 Capture。
 
 ## 2. 背景与目标
 
@@ -43,7 +43,7 @@
 
 核心目标：
 
-1. 以 `TaskIntent` 作为默认检索入口，不要求调用者提前选择 Space。
+1. 以当前 `TaskIntentRevision` 中的 `WorkingIntentSnapshot` 作为默认检索入口，不要求调用者提前选择 Space。
 2. 自动推断一个 Task 与多个 `ContextSpace` 的关联，并返回匹配原因。
 3. 建立 Context 与 Repository、Module、File、Symbol、API、Schema、Test 的可重建关联。
 4. 从 Prompt、代码访问、Diff、测试和 Agent 结论中自动生成 `ContextCandidate`。
@@ -86,7 +86,7 @@
                                ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ Task Runtime                                                │
-│ TaskSession / TaskIntent / WorkEpisode / ContextCandidate   │
+│ TaskSession / TaskIntentRevision / WorkEpisode / Candidate  │
 └───────────────────────┬──────────────────────┬──────────────┘
                         ↓                      ↓
 ┌───────────────────────────────┐  ┌──────────────────────────┐
@@ -115,7 +115,7 @@
 
 派生或短期状态：
 
-- TaskIntent。
+- WorkingIntentSnapshot 与 TaskIntentRevision。
 - Task 与 Space 的相关性分数。
 - 当前文件、Symbol、API 和 Schema 的解析位置。
 - Context 与工程对象的当前匹配结果。
@@ -134,8 +134,9 @@
 | `ContextSpace` | 一项内部 Requirement 或长期工作目标的 Intent 与 Context 组织容器 |
 | `IntentRevision` | ContextSpace 目标、范围和验收条件的一版完整快照 |
 | `TaskSession` | 一次 Agent 工程任务的本地运行实例，与 Agent Session 隔离 |
-| `TaskIntent` | 系统对当前 Task 目标、范围、约束和未知项的动态理解 |
-| `TaskSignal` | Prompt、Workspace、Diff、TestOutcome 等非定位任务观察 |
+| `WorkingIntentSnapshot` | Agent 对当前 Task 目标、方向、范围、约束、Hint 与自然形成问题的轻量、非事实工作理解 |
+| `TaskIntentRevision` | TaskSession 中一个不可变 WorkingIntentSnapshot 版本及其 parent 关系 |
+| `TaskSignal` | Prompt、Workspace、Diff、TestOutcome 等非事实、非定位工作线索；可影响 Working Intent retrieval，但不是工程 Evidence |
 | `ArtifactFocusQuery` | 一次围绕 File、Module、Symbol、API、Schema 或 Test 检索历史 Context 的请求；只包含 Session/Intent CAS、absolute path、kind coordinates 和输出边界，不是持久 Task 状态 |
 | `ResolvedFocus` | 服务端在单次 ArtifactFocusQuery 内通过 Catalog 得到的 RepositoryId + 完整 ArtifactLocator；只作为本次 Graph seed，不是领域身份或工程事实证明 |
 | `TaskSpaceAssociation` | Task 与多个 Space 的派生相关性、置信度和匹配依据 |
@@ -336,7 +337,7 @@ semantic_conflict.opened
 semantic_conflict.resolution_added
 ```
 
-TaskSession、TaskIntent、WorkEpisode 和 ContextCandidate 不属于 Event。
+TaskSession、TaskIntentRevision、WorkEpisode 和 ContextCandidate 不属于 Event。
 
 ### 6.2 Context 创建示例
 
@@ -509,6 +510,8 @@ Evidence 必须在开发分支、Commit、业务代码仓库或 Agent Session �
 - `source_snapshot`：最小充分的代码、配置、协议或文档片段。
 - `experiment_record`：实验前提、输入、步骤、期望和实际结果。
 - `artifact_snapshot`：接口响应、测试结果或其他结构化材料。
+
+Evidence 绑定 WorkObservation、CheckpointClaim、Candidate、ContextRevision 或 EngineeringReference 等工程断言。WorkingIntentSnapshot、TaskSignal、Hint 和 ArtifactFocusQuery 只提供工作理解或检索线索，不是 Evidence；Claim 显式引用的 owned Diff/TestOutcome 也必须先由 Builder 转换为自包含 EvidenceSnapshot，不能把 TaskSignal 原样提升为知识证据。
 
 ### 7.2 EngineeringReference
 
@@ -758,7 +761,7 @@ repository/
 | 表 | 用途 |
 |---|---|
 | `task_session` | Agent Session 对应的 Task 状态 |
-| `task_intent_revision` | TaskIntent 演进快照 |
+| `task_intent_revision` | `WorkingIntentSnapshot` 的不可变 `TaskIntentRevision` 链 |
 | `task_signal` | Prompt、Workspace、Diff、TestOutcome 等非定位信号 |
 | `task_space_association` | 当前多 Space 推断结果和原因 |
 | `work_episode` | Task-owned、version-CAS 的 Open/Closed Episode boundary |
@@ -784,7 +787,7 @@ task_intent_revision_id
 task_signal_fingerprint
 ```
 
-一次 TaskContextPack 必须在一个固定的当前知识 Projection、一个固定 TaskIntent Revision 和至多一个固定 EngineeringGraphSnapshot 上生成，禁止拼装多个 Graph Generation。`indexed_tree_oid` 是当前 Context Tree；`graph_context_tree_oid` 是 Graph build provenance；二者允许不同。`context_tree_oid` mismatch 不影响 Graph eligibility，也不触发自动 rebuild。
+一次 TaskContextPack 必须在一个固定的当前知识 Projection、一个固定 `TaskIntentRevision` 和至多一个固定 EngineeringGraphSnapshot 上生成，禁止拼装多个 Graph Generation。`indexed_tree_oid` 是当前 Context Tree；`graph_context_tree_oid` 是 Graph build provenance；二者允许不同。`context_tree_oid` mismatch 不影响 Graph eligibility，也不触发自动 rebuild。
 
 ### 10.4 重建
 
@@ -799,39 +802,32 @@ task_signal_fingerprint
 
 ### 11.1 TaskContextRequest
 
-默认检索接口接收 Task，而不是 Space：
+内部检索请求接收当前 Task，而不是 Space：
 
 ```yaml
 task_id:
-prompt:
-intent_snapshot:
-repository_roots:
-changed_files:
-active_files:
-active_symbols:
-diff_summary:
-api_schema_hints:
-test_observations:
-platform_hints:
-domain_hints:
+working_intent:                 # 当前 TaskIntentRevision 的 WorkingIntentSnapshot
+task_signals: []                # 非事实、非定位工作线索
+resolved_focus:                 # 仅 task_artifact_focus 本次请求可提供
 token_budget:
+max_spaces:
+candidate_limit:
+mode:
 ```
 
-`prompt` 是唯一必需的语义输入；`task_id` 由 Runtime 根据 Agent Session 创建或续接。Agent 在具备任务理解后提交结构化 `intent_snapshot`，Adapter 和 Runtime 自动补充 Repository、Diff、Artifact 和 Test 信号。调用者不提供 `space_id`。
+公开只读 `task_context` 只接收 ExternalSessionLocator 与输出边界，由 Runtime 钉定 ActiveTask、当前 `TaskIntentRevision` 和 Active TaskSignals。`task_intent_update` 只接收 Session locator、Task boundary、Revision CAS 与 `WorkingIntentSnapshot`。`task_artifact_focus` 另行接收绝对路径和 kind-specific coordinates，由服务端构造本次 `ResolvedFocus`。这些入口都不接受 `space_id`。
 
-### 11.2 TaskIntent 更新
+### 11.2 Working Intent 更新
 
-更新触发点：
+更新边界：
 
-- 第一次 `task_intent_update`：显式创建 TaskSession，只要求 Working Intent `goal`。
-- Agent 调用 `task_intent_update`：旁路提交当前自然形成的 WorkingIntentSnapshot、Task boundary 与 Revision CAS；其余字段可省略。
-- 后续 Prompt：修订目标、范围和约束。
-- Agent 需要围绕某工程对象查询历史：调用只读 `task_artifact_focus`，Catalog 为本次请求解析 `ResolvedFocus`；不会创建 Intent Revision 或任何 Focus Runtime 状态。
-- Diff 变化：修订受影响范围。
-- API、Schema 或测试信号出现：增加跨模块、跨端线索。
-- PreCompact、TurnStop：在已有自然变化时旁路记录 Working Intent，并只基于已有 Checkpoint 推进 WorkEpisode lifecycle。
+- 第一次 `task_intent_update`：显式创建 TaskSession 和首个 `TaskIntentRevision`，只要求 Working Intent `goal`。
+- Agent 后续调用 `task_intent_update`：旁路提交当前自然形成的 `WorkingIntentSnapshot`、Task boundary 与 Revision CAS；其余字段可省略。
+- 目标、方向、范围、约束、验收条件、Hint 或自然形成的问题变化时，Agent 可以提交新 Revision；Runtime 不从 Prompt、Diff 或相似度自动推断完整 Working Intent。
+- Agent 需要围绕某工程对象查询历史时调用只读 `task_artifact_focus`；Catalog 为本次请求解析 `ResolvedFocus`，不会创建 `TaskIntentRevision` 或任何 Focus Runtime 状态。
+- PreCompact、TurnStop 只在 Agent 已自然形成更新时旁路记录 Working Intent，并只基于已有 Checkpoint 推进 WorkEpisode lifecycle。
 
-如果 Prompt 明显切换目标且与当前 Diff/Artifact 信号无连续性，Runtime 创建新 `task_id`；不确定时沿用当前 Task 并记录边界诊断。用户可以显式执行 `task reset`，只影响当前 Session。
+`task_boundary=new` 只能由 Agent 显式声明；Runtime 只执行 ActiveTask 切换，不根据 Prompt 相似度猜测任务边界。`continue` 使用调用方的 parent Revision CAS，由 Runtime 原子判断 `created`、`already_current` 或 stale。
 
 ### 11.3 多路召回
 
@@ -839,8 +835,8 @@ token_budget:
 
 1. EngineeringArtifact 直接关联的 Active Context。
 2. API/Schema、调用关系和 ContextRelation 扩展的 Context。
-3. TaskIntent 与 Space Intent 的结构化和 FTS 匹配。
-4. TaskIntent 与 Context Statement、Rationale、Evidence 的 FTS 匹配。
+3. Working Intent 通用文本与 Space Intent、Context 的结构化和 FTS 匹配。
+4. `artifact_hints` / `interface_hints` 通过独立 `WorkingIntentHintText` channel 查询 Space Intent FTS 与安全 Accepted Context FTS；Hint 不解析 Artifact，也不产生 Graph 或 Evidence 语义。
 5. Platform、Domain、Condition、Kind 的结构化匹配。
 
 候选 Space 由上述 Context 和 Intent 信号共同推断，不能先选 Space 再搜索。
@@ -867,7 +863,7 @@ token_budget:
 返回：
 
 ```yaml
-task_intent:
+task_intent_revision_id:
 candidate_spaces:
   - space_id:
     score:
@@ -886,7 +882,7 @@ contexts:
 omitted:
 ```
 
-每条 `retrieval_path` 必须说明 Task Signal 如何连接到 Context，例如：
+每条 `retrieval_path` 必须说明 Working Intent 文本、结构化 Applicability 或本次 `ResolvedFocus` 如何连接到 Context。例如：
 
 ```text
 SearchResult.tsx
@@ -914,7 +910,7 @@ Candidate、Deprecated Context、Annotation 和原始 Capture 内容只能作为
 
 WorkEpisode 聚合一次 Task 中的：
 
-- TaskIntent Revisions。
+- TaskIntentRevisions 及其 WorkingIntentSnapshots。
 - 检索过的 Context 及采用/忽略原因。
 - 访问和修改的 Artifact。
 - Diff 摘要。
@@ -933,7 +929,7 @@ WorkEpisode 聚合一次 Task 中的：
 - `capture_ingestion.capture_id` 唯一；claim 与 Runtime commit 任一侧崩溃都可重试且不产生重复 Observation。
 - Catalog 只把 safe existing configured File hint 映射为 File ArtifactRef；unconfigured/unsafe path 保留 Capture source、summary 和 typed diagnostic，不猜 Repository。
 - Hook 只 Capture，不自动 open/ingest Episode，也不生成 Claim。#163 的 AutomatedEpisodeBoundary 只能在工作 Agent 已写入 current-Intent Checkpoint 后补齐 ordered refs、关闭 Episode 并调用共享 Builder。
-- `task_checkpoint` 由工作 Agent 显式提交 Task/Intent/Episode CAS、完整 Claims/Unknowns 和 typed refs；Runtime 在一个事务中 open/advance Episode、生成 inline Validation Observation、Claim/Checkpoint ID，并 continue 或 close。
+- `task_checkpoint` 由工作 Agent 显式提交 Task/TaskIntentRevision/Episode CAS、完整 Claims/Unknowns 和 typed refs；Runtime 在一个事务中 open/advance Episode、生成 inline Validation Observation、Claim/Checkpoint ID，并 continue 或 close。
 - `(episode_id, parent_episode_version)` 唯一约束配合完整语义 JSON 实现 timeout retry；相同内容返回原 Checkpoint，不同内容冲突，stale version 拒绝。Checkpoint 不生成 Candidate 或 Git Event。
 
 ### 12.2 AgentCheckpoint
@@ -959,7 +955,7 @@ claims:
 unknowns:
 ```
 
-Checkpoint 表达 Agent 已形成的工程认知，不是“工具执行成功”日志。Evidence 可引用 owned Observation、Task 历史 Signal、同一 Index snapshot 的 ContextEvidence，或提交经 PrivacyScanner 检查的 self-contained inline Validation；ArtifactRef 只描述关联，不独立成为 Evidence。Unknown-only Checkpoint 可以 continue 或 close，但不产生知识主张。
+Checkpoint 表达 Agent 已形成的工程认知，不是“工具执行成功”日志。Evidence 绑定 CheckpointClaim，并可复用 owned WorkObservation、同一 Index snapshot 的 ContextEvidence，或提交经 PrivacyScanner 检查的 self-contained inline Validation。TaskSignal 即使被 Claim 显式引用也仍是非事实来源线索：Prompt/Workspace 不可转成工程 Evidence，normalized Diff/TestOutcome 必须先由 Builder 组装为带 supports、content、interpretation 和 limitations 的 EvidenceSnapshot。ArtifactRef 只描述关联，不独立成为 Evidence。Unknown-only Checkpoint 可以 continue 或 close，但不产生知识主张。
 
 ### 12.3 Candidate Builder
 
@@ -1023,7 +1019,7 @@ sctx mcp serve --client cursor|codex
 
 | Tool | 类型 | 说明 |
 |---|---|---|
-| `task_intent_update` | 读/写本地状态 | CAS 更新 TaskIntent 并生成多 Space TaskContextPack |
+| `task_intent_update` | 读/写本地状态 | CAS 写入 `WorkingIntentSnapshot` 的 `TaskIntentRevision` 并生成多 Space TaskContextPack |
 | `task_artifact_focus` | 只读 | 钉定 ActiveTask 与 Intent Revision；仅接收 Session、absolute path 与无 path coordinates，由 Catalog 补全本次 `ResolvedFocus` 并立即返回 TaskContextPack，不保存 ID 或生命周期 |
 | `task_signal_supersede` | 读/写本地状态 | 按稳定 Signal ID 失效当前 Task 信号 |
 | `task_context` | 只读 | 按 external Session locator 重读已有 ActiveTask 的 TaskContextPack |
@@ -1066,7 +1062,7 @@ prompt（仅 PromptSubmit）
 tool_name / outcome / normalized_file_hints（仅 PostToolUse）
 ```
 
-Adapter 只翻译厂商 Payload。TaskIntent、Git Diff、代码扫描、检索和 Candidate Builder 属于共享 Runtime，不得复制进厂商 Adapter。
+Adapter 只翻译厂商 Payload。Working Intent、TaskIntentRevision、Git Diff、代码扫描、检索和 Candidate Builder 属于共享 Runtime，不得复制进厂商 Adapter。
 
 ### 13.4 动态检索策略
 
@@ -1180,7 +1176,7 @@ crates/
 - `event-schema`：Event JSON 解析和校验。
 - `git-store`：不可变事件、对象、Batch 和 Git Commit。
 - `index`：知识 Projection、FTS、增量同步和重建。
-- `task-runtime`：TaskSession、TaskIntent、非定位 TaskSignal 和 WorkEpisode；不持久化 Artifact Focus。
+- `task-runtime`：TaskSession、WorkingIntentSnapshot、TaskIntentRevision、非事实非定位 TaskSignal 和 WorkEpisode；不持久化 Artifact Focus。
 - `engineering-graph`：Artifact 扫描、Resolution、Association 和图扩展。
 - `retrieval`：Task 多路召回、排序、解释和 Context Pack。
 - `candidate-builder`：Claim/Evidence 聚合、去重、冲突与 Space 推荐。
@@ -1285,20 +1281,20 @@ sctx doctor --json
 
 ### M1：Task-first 领域与入口基础 — 已实现
 
-- `TaskIntent` 与非定位 `TaskSignal` 已建模，Task Intent 不携带 Space 或 Workspace 路由；Artifact Focus 明确为查询参数而非 Task 领域状态。
+- `WorkingIntentSnapshot`、`TaskIntentRevision` 与非事实非定位 `TaskSignal` 已建模；Working Intent 不携带 Space 或 Workspace 路由，TaskSignal 不是工程 Evidence，Artifact Focus 是查询参数而非 Task 领域状态。
 - `TaskSpaceAssociation` 已作为独立派生类型建模，集合允许零个或多个 Space。
 - `WorkEpisode` 与无 Space 的 `ContextCandidate` 已建模。
 - 已删除 Workspace-to-Space 配置、绑定命令、preferred-Space 请求字段和对应排序逻辑。
 - Task-first 领域不携带 Space 路由；`context_search.space_ids` 仅作为显式探索的硬过滤。
 - CLI/MCP 的 `candidate_create` 已成为 Candidate 创建主入口，服务端生成身份和路径。
 - Candidate 使用独立投影，不进入 Context FTS，也不满足自动注入资格。
-- 跨 crate M1 验收覆盖 TaskIntent、`0..N` 关联、无 Space Candidate、无 Workspace 路由和自动注入隔离。
+- 跨 crate M1 验收覆盖 WorkingIntentSnapshot/TaskIntentRevision、`0..N` 关联、无 Space Candidate、无 Workspace 路由和自动注入隔离；历史测试函数名中的 `task_intent` 仅保留为测试标识。
 
 M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命周期、CLI/MCP、Agent Adapter、安装器与 NPM 基础设施。复用这些基础设施不表示下面的目标里程碑已经完成。
 
 ### M2：Task Runtime 与多 Space Retrieval — 已实现
 
-- `runtime.sqlite`、TaskSession、TaskIntent Revision 及并发线性 Head 已实现。
+- `runtime.sqlite`、TaskSession、TaskIntentRevision 及并发线性 Head 已实现。
 - 完整 Space Intent FTS、Task 多路召回、Space 关联推断、解释路径和 Session 隔离已实现。
 - `task_intent_update` 按 external Session Locator 与 Revision CAS 更新 Runtime；只读 `task_context` 仅重取固定 Task Revision 与知识 Projection 上的 TaskContextPack。
 - PromptSubmit 只返回不含 Prompt 原文的 Skill/工具能力提示，不访问 Runtime 或 Search。
@@ -1328,14 +1324,14 @@ M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命�
 
 #### Working Intent 与 Evidence 边界（#136）
 
-WorkingIntentSnapshot 只保存当前工作理解，不含 maturity、EvidenceSource 或 Evidence binding。Artifact/Interface Hint 只进入可解释文本匹配 `WorkingIntentHintText`，不得生成 EngineeringGraph path、事实、Candidate 或自动注入资格；`open_questions` 只记录自然形成的问题，省略是正常完整快照。
+WorkingIntentSnapshot 只保存当前非事实工作理解，不含 maturity、EvidenceSource 或 Evidence binding。Artifact/Interface Hint 只进入可解释文本匹配 `WorkingIntentHintText`，不得生成 EngineeringGraph path、事实、Candidate 或自动注入资格；`open_questions` 只记录自然形成的问题，省略是正常完整快照。TaskSignal 同样是非事实工作线索，可参与 Working Intent retrieval，但不独立支持工程断言。
 
-Evidence 继续只约束 WorkObservation、CheckpointClaim、Candidate、ContextRevision 与 EngineeringReference。TaskIntentRevision 持久 authoritative text 和 canonical semantic hash；相同 continue 返回 `already_current`，真实变化创建唯一 successor，显式 new 始终创建独立 Task。
+Evidence 继续只约束 WorkObservation、CheckpointClaim、Candidate、ContextRevision 与 EngineeringReference 等工程断言。TaskIntentRevision 持久 authoritative text 和 canonical semantic hash；相同 continue 返回 `already_current`，真实变化创建唯一 successor，显式 new 始终创建独立 Task。M3 的 Context Evidence、EngineeringReference support/limitations、Graph provenance 与 build-time safety 服务知识断言链，不回流为 Working Intent Evidence。
 
-### M4：Low-tax Capture — #136 与 #156–#163 已实现，#164 Gate 待完成
+### M4：Low-tax Capture — #136、#156–#163 与 #169 已实现，#164 Gate 待完成
 
 - WorkEpisode/Capture 显式持久 API和 AgentCheckpoint MCP/CLI/Skill 已实现。PreCompact/TurnStop AutomatedEpisodeBoundary 只消费工作 Agent 已写入的 current-Intent Checkpoint，补齐 ordered refs、关闭 Episode 并调用共享 Builder；Adapter 不复制 Builder，SessionEnd 只清理 TTL。
-- Candidate Builder 与最小充分 Evidence 组装已实现：closed Episode 的每个充分 Claim 形成一个无 Space Draft；Inline Validation 原样复用，normalized Observation/Task Signal 转为 self-contained snapshot，Context Evidence 从一个 exact Index snapshot 复用；原始 Capture 不进 Git。
+- Candidate Builder 与最小充分 Evidence 组装已实现：closed Episode 的每个充分 Claim 形成一个无 Space Draft；Inline Validation 原样复用，normalized WorkObservation 可转换为 self-contained snapshot，Context Evidence 从一个 exact Index snapshot 复用。TaskSignal 本身仍是非事实线索；只有 Claim 显式引用的 owned Diff/TestOutcome 才由 Builder 转换为带完整解释与限制的 EvidenceSnapshot，Prompt/Workspace 线索不能成为工程 Evidence；原始 Capture 不进 Git。
 - Builder 在 Git 前用 Runtime v8 固化 BuildId、Claim-scoped SubmissionId 和 content hash，#117 后回填 CandidateId/EventId；两个 crash window、语义重试和并发 close/build 均复用同一操作身份。缺 Claim、Unknown-only、Evidence 不充分为零 Git 写；kind 无 hint 固定 Discovery，topic 缺失保留 Unknown，不做关键词推断。
 - Candidate relationship assessment 与 Space 推荐已实现为 Runtime derived review state：只有完整 canonical draft equality 是 exact duplicate；same statement/different Evidence 是 supports；same topic 加 explicit Context 或 exact Artifact Graph 是 revises；topic/scope 不同 statement 只是 potential contradiction；纯 FTS 是 unresolved related；无候选才 novel。所有结果固定 Context/Graph generation、typed path、confidence、RRF/top-k/token budget 与 stable target tie。
 - Existing Space 推荐融合 assessment targets、source Task associations 与 Space Intent；conflicted Intent/unsafe Context 只作诊断或 Related，无安全 Primary 时生成一个完整 system-suggested Intent。分析可由 `candidate analyze` 重跑替换，不写 Git、不改变 Candidate submission/content/ID，不参与 Context Search、Hook 或自动注入。
@@ -1357,7 +1353,7 @@ Evidence 继续只约束 WorkObservation、CheckpointClaim、Candidate、Context
 
 1. 没有任何 Workspace-to-Space 配置，Task 仍可完成检索。
 2. Task 请求不包含 Space ID，系统仍能返回零个、一个或多个 Space 候选。
-3. 同一仓库中两个 Agent Session 同时执行不同 Task，TaskIntent、Space 候选和 Candidate 互不覆盖。
+3. 同一仓库中两个 Agent Session 同时执行不同 Task，TaskIntentRevision、Space 候选和 Candidate 互不覆盖。
 4. 一个 FE Task 可以同时召回页面需求、服务端协议、兼容策略和埋点口径等多个 Space 的 Context。
 5. 每个自动注入 Context 都包含至少一条可解释 Retrieval Path。
 6. 关键文件、Symbol、Diff 或测试信号变化后，Context Pack 可以增量更新。
@@ -1417,7 +1413,7 @@ Evidence 继续只约束 WorkObservation、CheckpointClaim、Candidate、Context
 4. ContextCandidate 可以没有 Space，确认后再形成显式 SpaceAssociation。
 5. ContextItem 的身份独立于 Space；归属修正不改变 Context ID。
 6. Git Event 和 Evidence Object 是稳定 Context 事实源。
-7. TaskIntent、WorkEpisode、Candidate、置信度和当前代码解析结果不是知识事实。
+7. WorkingIntentSnapshot、TaskIntentRevision、TaskSignal、WorkEpisode、Candidate、置信度和当前代码解析结果不是知识事实。
 8. Revision 保存完整快照，不保存文本 Patch。
 9. Evidence 必须自包含；repo-relative Path 与 qualified Symbol/API/Schema/Test 坐标只能作为 EngineeringReference。
 10. EngineeringReference 可以失效，ContextArtifactAssociation 必须可重建。
