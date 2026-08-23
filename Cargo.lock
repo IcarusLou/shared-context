@@ -649,6 +649,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sctx-scenario-contract"
+version = "0.1.0"
+dependencies = [
+ "semver",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "sctx-search"
 version = "0.1.0"
 dependencies = [

@@ -14,6 +14,7 @@ members = [
     "crates/adapter-codex",
     "crates/installer",
     "crates/cli",
+    "crates/scenario-contract",
 ]
 resolver = "3"
 
@@ -42,6 +43,7 @@ sctx-installer = { path = "crates/installer" }
 sctx-local-state = { path = "crates/local-state" }
 sctx-mcp = { path = "crates/mcp" }
 sctx-search = { path = "crates/search" }
+sctx-scenario-contract = { path = "crates/scenario-contract" }
 sctx-task-runtime = { path = "crates/task-runtime" }
 uuid = { version = "1.18", features = ["v4"] }
 toml = "0.9"
