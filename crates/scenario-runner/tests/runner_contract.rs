@@ -6,11 +6,14 @@ use std::{
 };
 
 use sctx_scenario_contract::{
-    ActionKind, ActorId, ActorKind, AgentFraming, AgentProfile, AgentVendor, AgentVersion,
-    AssertionId, BarrierId, CaptureSource, CrashTiming, EventClassification, EventSupport, FaultId,
+    ActionExpectation, ActionKind, ActorId, ActorKind, AgentFraming, AgentProfile, AgentVendor,
+    AgentVersion, AssertionId, BarrierId, CaptureSource, ConfirmationEventCount, CrashTiming,
+    EventClassification, EventSupport, ExpectedFailureCode, ExpectedFailureKind, FaultId,
     FaultKind, FaultPlan, InvariantAssertion, InvariantKind, JsonPointer, ObservationSource,
-    ProductAction, ScenarioAction, ScenarioActor, ScenarioContractVersion, ScenarioDefinition,
-    ScenarioSchema, ScenarioVariable, StepId, TemplateValue, VariableKind, VariableName, WireName,
+    ProductAction, RawContentKind, RawContentProbe, ResourceId, ResourcePath, SandboxBuiltin,
+    SandboxFile, SandboxResource, ScenarioAction, ScenarioActor, ScenarioContractVersion,
+    ScenarioDefinition, ScenarioSchema, ScenarioVariable, StepId, TemplateValue, VariableKind,
+    VariableName, WireName,
 };
 use sctx_scenario_runner::{FailureClassification, RunnerConfig, ScenarioRunner, StepStatus};
 use tempfile::tempdir;
@@ -47,6 +50,10 @@ fn variable(value: &str) -> TemplateValue {
     }
 }
 
+fn builtin(value: SandboxBuiltin) -> TemplateValue {
+    TemplateValue::Builtin { builtin: value }
+}
+
 fn object(fields: impl IntoIterator<Item = (&'static str, TemplateValue)>) -> TemplateValue {
     TemplateValue::Object {
         fields: fields
@@ -61,6 +68,7 @@ fn cli(id: &str, after: &[&str], arguments: &[TemplateValue]) -> ScenarioAction 
         id: identifier(id),
         actor: ActorId::new("task").unwrap(),
         after: after.iter().map(|step| identifier(step)).collect(),
+        expectation: ActionExpectation::default(),
         action: ActionKind::CliJson {
             arguments: arguments.to_vec(),
         },
@@ -72,6 +80,7 @@ fn mcp(id: &str, after: &[&str], method: &str, params: TemplateValue) -> Scenari
         id: identifier(id),
         actor: ActorId::new("task").unwrap(),
         after: after.iter().map(|step| identifier(step)).collect(),
+        expectation: ActionExpectation::default(),
         action: ActionKind::McpRequest {
             method: WireName::new(method).unwrap(),
             params,
@@ -84,6 +93,7 @@ fn restart(id: &str, after: &[&str]) -> ScenarioAction {
         id: identifier(id),
         actor: ActorId::new("session").unwrap(),
         after: after.iter().map(|step| identifier(step)).collect(),
+        expectation: ActionExpectation::default(),
         action: ActionKind::Restart,
     }
 }
@@ -93,6 +103,7 @@ fn hook(id: &str, after: &[&str], value: &str) -> ScenarioAction {
         id: identifier(id),
         actor: ActorId::new("session").unwrap(),
         after: after.iter().map(|step| identifier(step)).collect(),
+        expectation: ActionExpectation::default(),
         action: ActionKind::HookEvent {
             event: WireName::new("SessionStart").unwrap(),
             payload: object([("value", string(value))]),
@@ -101,13 +112,44 @@ fn hook(id: &str, after: &[&str], value: &str) -> ScenarioAction {
 }
 
 fn observation(after: &[&str]) -> ScenarioAction {
+    named_observation("observe", after, ObservationSource::Runtime, "work_episode")
+}
+
+fn named_observation(
+    id: &str,
+    after: &[&str],
+    source: ObservationSource,
+    entity: &str,
+) -> ScenarioAction {
     ScenarioAction {
-        id: identifier("observe"),
+        id: identifier(id),
         actor: ActorId::new("task").unwrap(),
         after: after.iter().map(|step| identifier(step)).collect(),
+        expectation: ActionExpectation::default(),
+        action: ActionKind::Observe {
+            source,
+            selector: object([("entity", string(entity))]),
+        },
+    }
+}
+
+fn semantic_observation(id: &str, after: &[&str]) -> ScenarioAction {
+    ScenarioAction {
+        id: identifier(id),
+        actor: ActorId::new("task").unwrap(),
+        after: after.iter().map(|step| identifier(step)).collect(),
+        expectation: ActionExpectation::default(),
         action: ActionKind::Observe {
             source: ObservationSource::Runtime,
-            selector: object([("entity", string("work_episode"))]),
+            selector: object([
+                ("entity", string("task_semantic_state")),
+                (
+                    "session_key",
+                    builtin(SandboxBuiltin::ActorSessionKey {
+                        actor: ActorId::new("session").unwrap(),
+                    }),
+                ),
+            ]),
         },
     }
 }
@@ -134,9 +176,13 @@ fn scenario(
         .iter()
         .map(|action| action.id.as_str().to_owned())
         .collect::<Vec<_>>();
-    actions.push(observation(
+    actions.push(mcp(
+        "assertion-response",
         &prior.iter().map(String::as_str).collect::<Vec<_>>(),
+        "task_context",
+        object([]),
     ));
+    actions.push(observation(&["assertion-response"]));
     ScenarioDefinition {
         schema: ScenarioSchema::DynamicScenario,
         version: ScenarioContractVersion::V1,
@@ -166,12 +212,13 @@ fn scenario(
             },
         ],
         actions,
+        resources: vec![],
         variables,
         faults,
         assertions: vec![InvariantAssertion {
             id: AssertionId::new("observer-is-typed").unwrap(),
             invariant: InvariantKind::WorkingIntentHintHasNoGraphPath {
-                observation: identifier("observe"),
+                response: identifier("assertion-response"),
             },
         }],
         events: vec![EventClassification {
@@ -422,6 +469,85 @@ fn text_capture_is_allowed_only_for_a_typed_observer_summary() {
         run.outcome.variables["observer-entity"].value,
         "work_episode"
     );
+}
+
+#[test]
+fn generation_capture_rejects_paths_and_accepts_only_safe_wire_forms() {
+    let parent = tempdir().unwrap();
+    let invalid = scenario(
+        "unsafe_generation_capture",
+        AgentVendor::Codex,
+        vec![mcp(
+            "source",
+            &[],
+            "fake-echo",
+            object([("generation_value", string("/private/synthetic/path"))]),
+        )],
+        vec![capture(
+            "generation",
+            VariableKind::Generation,
+            "source",
+            "/generation_value",
+        )],
+        vec![],
+    );
+    let failure = runner(parent.path(), Duration::from_secs(2))
+        .run(&invalid, 186)
+        .err()
+        .expect("machine path must not cross the Generation capture boundary");
+    assert_eq!(
+        failure.classification,
+        FailureClassification::CaptureFailure
+    );
+    let encoded = serde_json::to_string(&failure).unwrap();
+    assert!(!encoded.contains("/private/synthetic/path"));
+    let mut invalid_status = invalid.clone();
+    invalid_status.variables[0].value_type = VariableKind::Status;
+    let status_failure = runner(parent.path(), Duration::from_secs(2))
+        .run(&invalid_status, 187)
+        .err()
+        .expect("Status must not provide an alternate path channel");
+    assert_eq!(
+        status_failure.classification,
+        FailureClassification::CaptureFailure
+    );
+    assert!(
+        !serde_json::to_string(&status_failure)
+            .unwrap()
+            .contains("/private/synthetic/path")
+    );
+
+    for (index, value) in [
+        TemplateValue::Unsigned { value: 7 },
+        string("0123456789abcdef0123456789abcdef01234567"),
+        string("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+        string("eng_SYNTHETIC-1"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let parent = tempdir().unwrap();
+        let contract = scenario(
+            "safe_generation_capture",
+            AgentVendor::Codex,
+            vec![mcp(
+                "source",
+                &[],
+                "fake-echo",
+                object([("generation_value", value)]),
+            )],
+            vec![capture(
+                "generation",
+                VariableKind::Generation,
+                "source",
+                "/generation_value",
+            )],
+            vec![],
+        );
+        runner(parent.path(), Duration::from_secs(2))
+            .run(&contract, 188 + u64::try_from(index).unwrap())
+            .unwrap();
+    }
 }
 
 #[test]
@@ -739,6 +865,7 @@ fn shared_barrier_waits_for_all_participants() {
                 id: identifier("alpha-barrier"),
                 actor: ActorId::new("task").unwrap(),
                 after: vec![identifier("alpha")],
+                expectation: ActionExpectation::default(),
                 action: ActionKind::Barrier {
                     barrier: BarrierId::new("join").unwrap(),
                 },
@@ -747,6 +874,7 @@ fn shared_barrier_waits_for_all_participants() {
                 id: identifier("beta-barrier"),
                 actor: ActorId::new("session").unwrap(),
                 after: vec![identifier("beta")],
+                expectation: ActionExpectation::default(),
                 action: ActionKind::Barrier {
                     barrier: BarrierId::new("join").unwrap(),
                 },
@@ -928,6 +1056,633 @@ fn observer_failures_use_the_safe_observer_classification() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn matching_typed_failure_continues_to_after_observation_without_writes() {
+    let temporary = tempdir().unwrap();
+    let mut contract = scenario(
+        "typed_stale_bridge",
+        AgentVendor::Codex,
+        vec![
+            semantic_observation("before", &[]),
+            mcp(
+                "stale-attempt",
+                &["before"],
+                "fake-typed-failure",
+                object([
+                    ("code", string("intent_stale")),
+                    ("kind", string("stale_state")),
+                ]),
+            ),
+            semantic_observation("after", &["stale-attempt"]),
+        ],
+        vec![],
+        vec![],
+    );
+    contract
+        .actions
+        .iter_mut()
+        .find(|action| action.id.as_str() == "stale-attempt")
+        .unwrap()
+        .expectation = ActionExpectation::TypedFailure {
+        code: ExpectedFailureCode::new("intent_stale").unwrap(),
+        kind: ExpectedFailureKind::StaleState,
+    };
+    contract.assertions.push(InvariantAssertion {
+        id: AssertionId::new("stale-zero-write").unwrap(),
+        invariant: InvariantKind::StaleCasZeroWrites {
+            attempt: identifier("stale-attempt"),
+            before_observation: identifier("before"),
+            after_observation: identifier("after"),
+        },
+    });
+
+    let run = runner(temporary.path(), Duration::from_secs(2))
+        .run(&contract, 177)
+        .unwrap();
+    let failure_step = run
+        .outcome
+        .steps
+        .iter()
+        .find(|step| step.step == "stale-attempt")
+        .unwrap();
+    assert_eq!(failure_step.status, StepStatus::ExpectedFailure);
+    assert_eq!(failure_step.error_code.as_deref(), Some("intent_stale"));
+    assert_eq!(failure_step.error_kind.as_deref(), Some("stale_state"));
+    assert!(run.outcome.steps.iter().any(|step| step.step == "after"));
+    assert!(
+        run.outcome
+            .assertions
+            .iter()
+            .find(|assertion| assertion.id == "stale-zero-write")
+            .unwrap()
+            .passed
+    );
+    let encoded = serde_json::to_string(&run.outcome).unwrap();
+    for forbidden in ["SECRET_TYPED_FAILURE_BODY", "SECRET_TYPED_FAILURE_MESSAGE"] {
+        assert!(!encoded.contains(forbidden));
+    }
+
+    let mut semantic_change = contract.clone();
+    let ActionKind::McpRequest {
+        params: TemplateValue::Object { fields },
+        ..
+    } = &mut semantic_change
+        .actions
+        .iter_mut()
+        .find(|action| action.id.as_str() == "stale-attempt")
+        .unwrap()
+        .action
+    else {
+        unreachable!()
+    };
+    fields.insert(
+        "mutate_semantic".to_owned(),
+        TemplateValue::Boolean { value: true },
+    );
+    let changed_parent = tempdir().unwrap();
+    let changed = runner(changed_parent.path(), Duration::from_secs(2))
+        .run(&semantic_change, 177)
+        .unwrap();
+    let changed_assertion = changed
+        .outcome
+        .assertions
+        .iter()
+        .find(|assertion| assertion.id == "stale-zero-write")
+        .unwrap();
+    assert!(!changed_assertion.passed);
+    assert_eq!(
+        changed_assertion.diagnostic_code,
+        "stale_attempt_changed_semantic_state"
+    );
+
+    let mut mismatch = contract;
+    let ActionExpectation::TypedFailure { code, .. } = &mut mismatch
+        .actions
+        .iter_mut()
+        .find(|action| action.id.as_str() == "stale-attempt")
+        .unwrap()
+        .expectation
+    else {
+        unreachable!()
+    };
+    *code = ExpectedFailureCode::new("different_stale").unwrap();
+    let parent = tempdir().unwrap();
+    let failure = runner(parent.path(), Duration::from_secs(2))
+        .run(&mismatch, 178)
+        .err()
+        .expect("typed failure mismatch must stop the run");
+    let encoded = serde_json::to_string(&failure).unwrap();
+    assert!(!encoded.contains("SECRET_TYPED_FAILURE"));
+}
+
+#[test]
+fn sandbox_resource_builtins_materialize_a_tracked_repository() {
+    let temporary = tempdir().unwrap();
+    let resource = ResourceId::new("focus-repo").unwrap();
+    let path = ResourcePath::new("src/focus.rs").unwrap();
+    let mut contract = scenario(
+        "sandbox_resource_bridge",
+        AgentVendor::Cursor,
+        vec![cli(
+            "resource-use",
+            &[],
+            &[
+                string("fake-echo"),
+                builtin(SandboxBuiltin::ResourceFile {
+                    resource: resource.clone(),
+                    path: path.clone(),
+                }),
+            ],
+        )],
+        vec![],
+        vec![],
+    );
+    contract.resources.push(SandboxResource {
+        id: resource,
+        synthetic_git: true,
+        files: vec![SandboxFile {
+            path,
+            content: "pub fn synthetic_focus() -> bool { true }\n".to_owned(),
+        }],
+    });
+    let run = runner(temporary.path(), Duration::from_secs(2))
+        .run(&contract, 179)
+        .unwrap();
+    let repository = run.workspace().join("resources/focus-repo");
+    assert_eq!(
+        fs::read_to_string(repository.join("src/focus.rs")).unwrap(),
+        "pub fn synthetic_focus() -> bool { true }\n"
+    );
+    let remotes = Command::new("/usr/bin/git")
+        .arg("-C")
+        .arg(&repository)
+        .arg("remote")
+        .output()
+        .unwrap();
+    assert!(remotes.status.success());
+    assert!(remotes.stdout.is_empty());
+    assert!(
+        !serde_json::to_string(&run.outcome)
+            .unwrap()
+            .contains(temporary.path().to_string_lossy().as_ref())
+    );
+
+    let parent = tempdir().unwrap();
+    let mut private = contract;
+    private.resources[0].files[0].content = "owner=private@example.com".to_owned();
+    let failure = runner(parent.path(), Duration::from_secs(2))
+        .run(&private, 180)
+        .err()
+        .expect("private resource must fail before sandbox creation");
+    assert_eq!(
+        failure.classification,
+        FailureClassification::PolicyViolation
+    );
+    assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn closed_response_predicates_keep_only_safe_facts() {
+    let temporary = tempdir().unwrap();
+    let resource = ResourceId::new("focus-repo").unwrap();
+    let path = ResourcePath::new("src/focus.rs").unwrap();
+    let mut contract = scenario(
+        "closed_response_predicates",
+        AgentVendor::Codex,
+        vec![
+            mcp("candidate", &[], "candidate_get", object([])),
+            mcp(
+                "context",
+                &["candidate"],
+                "task_context",
+                object([("revision_id", variable("first-revision-id"))]),
+            ),
+            mcp("confirm", &["context"], "candidate_confirm", object([])),
+            mcp(
+                "focus",
+                &["confirm"],
+                "task_artifact_focus",
+                object([("resource_path", string("src/focus.rs"))]),
+            ),
+            mcp(
+                "ordinary",
+                &["focus"],
+                "task_context",
+                object([("emit_hint", TemplateValue::Boolean { value: true })]),
+            ),
+        ],
+        vec![
+            capture(
+                "candidate-id",
+                VariableKind::CandidateId,
+                "candidate",
+                "/candidate_id",
+            ),
+            capture(
+                "episode-id",
+                VariableKind::WorkEpisodeId,
+                "candidate",
+                "/source_episode/episode_id",
+            ),
+            capture(
+                "confirmation-id",
+                VariableKind::ConfirmationId,
+                "confirm",
+                "/confirmation_id",
+            ),
+            capture(
+                "first-revision-id",
+                VariableKind::IntentRevisionId,
+                "candidate",
+                "/revision_id",
+            ),
+            capture(
+                "retry-revision-id",
+                VariableKind::IntentRevisionId,
+                "context",
+                "/revision_id",
+            ),
+        ],
+        vec![],
+    );
+    contract.resources.push(SandboxResource {
+        id: resource.clone(),
+        synthetic_git: false,
+        files: vec![SandboxFile {
+            path: path.clone(),
+            content: "pub fn focus_target() {}\n".to_owned(),
+        }],
+    });
+    contract.assertions.extend([
+        InvariantAssertion {
+            id: AssertionId::new("same-revision").unwrap(),
+            invariant: InvariantKind::CanonicalContinueKeepsRevision {
+                first_revision: VariableName::new("first-revision-id").unwrap(),
+                retry_revision: VariableName::new("retry-revision-id").unwrap(),
+            },
+        },
+        InvariantAssertion {
+            id: AssertionId::new("candidate-source").unwrap(),
+            invariant: InvariantKind::CandidateSourceEpisode {
+                response: identifier("candidate"),
+                candidate: VariableName::new("candidate-id").unwrap(),
+                episode: VariableName::new("episode-id").unwrap(),
+            },
+        },
+        InvariantAssertion {
+            id: AssertionId::new("candidate-not-injected").unwrap(),
+            invariant: InvariantKind::CandidateIsNotAutoInjected {
+                candidate: VariableName::new("candidate-id").unwrap(),
+                response: identifier("context"),
+            },
+        },
+        InvariantAssertion {
+            id: AssertionId::new("confirmation-atomic").unwrap(),
+            invariant: InvariantKind::ConfirmationIsAtomic {
+                confirmation: VariableName::new("confirmation-id").unwrap(),
+                response: identifier("confirm"),
+                event_count: ConfirmationEventCount::Five,
+            },
+        },
+        InvariantAssertion {
+            id: AssertionId::new("hint-no-graph").unwrap(),
+            invariant: InvariantKind::WorkingIntentHintHasNoGraphPath {
+                response: identifier("ordinary"),
+            },
+        },
+        InvariantAssertion {
+            id: AssertionId::new("focus-scoped").unwrap(),
+            invariant: InvariantKind::ArtifactFocusIsRequestScoped {
+                focused_response: identifier("focus"),
+                ordinary_response: identifier("ordinary"),
+                resource,
+                path,
+            },
+        },
+    ]);
+    let run = runner(temporary.path(), Duration::from_secs(2))
+        .run(&contract, 182)
+        .unwrap();
+    for assertion in [
+        "same-revision",
+        "candidate-source",
+        "candidate-not-injected",
+        "confirmation-atomic",
+        "hint-no-graph",
+        "focus-scoped",
+    ] {
+        assert!(
+            run.outcome
+                .assertions
+                .iter()
+                .find(|record| record.id == assertion)
+                .unwrap()
+                .passed
+        );
+    }
+
+    let mut injected = contract.clone();
+    let ActionKind::McpRequest {
+        params: TemplateValue::Object { fields },
+        ..
+    } = &mut injected
+        .actions
+        .iter_mut()
+        .find(|action| action.id.as_str() == "context")
+        .unwrap()
+        .action
+    else {
+        unreachable!()
+    };
+    fields.insert("candidate_id".to_owned(), variable("candidate-id"));
+    let parent = tempdir().unwrap();
+    let injected = runner(parent.path(), Duration::from_secs(2))
+        .run(&injected, 183)
+        .unwrap();
+    let record = injected
+        .outcome
+        .assertions
+        .iter()
+        .find(|record| record.id == "candidate-not-injected")
+        .unwrap();
+    assert!(!record.passed);
+    assert_eq!(record.diagnostic_code, "candidate_was_injected");
+    let encoded = serde_json::to_string(&injected.outcome).unwrap();
+    assert!(!encoded.contains("retrieval_paths"));
+
+    for (flag, nested) in [
+        ("nested_confirmation", true),
+        ("duplicate_events", false),
+        ("missing_batch", false),
+        ("invalid_batch", false),
+        ("missing_commit", false),
+        ("invalid_commit", false),
+    ] {
+        let mut malformed = contract.clone();
+        let ActionKind::McpRequest {
+            params: TemplateValue::Object { fields },
+            ..
+        } = &mut malformed
+            .actions
+            .iter_mut()
+            .find(|action| action.id.as_str() == "confirm")
+            .unwrap()
+            .action
+        else {
+            unreachable!()
+        };
+        fields.insert(flag.to_owned(), TemplateValue::Boolean { value: true });
+        if nested {
+            malformed
+                .variables
+                .iter_mut()
+                .find(|variable| variable.name.as_str() == "confirmation-id")
+                .unwrap()
+                .capture
+                .pointer = JsonPointer::new("/nested/confirmation_id").unwrap();
+        }
+        let parent = tempdir().unwrap();
+        let malformed = runner(parent.path(), Duration::from_secs(2))
+            .run(&malformed, 185)
+            .unwrap();
+        let confirmation = malformed
+            .outcome
+            .assertions
+            .iter()
+            .find(|record| record.id == "confirmation-atomic")
+            .unwrap();
+        assert!(!confirmation.passed, "{flag}");
+        assert_eq!(
+            confirmation.diagnostic_code,
+            "confirmation_event_closure_mismatch"
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn lifecycle_and_open_episode_predicates_use_typed_observer_facts() {
+    let temporary = tempdir().unwrap();
+    let hook_action = |id: &str, after: &str, event: &str| ScenarioAction {
+        id: identifier(id),
+        actor: ActorId::new("session").unwrap(),
+        after: vec![identifier(after)],
+        expectation: ActionExpectation::default(),
+        action: ActionKind::HookEvent {
+            event: WireName::new(event).unwrap(),
+            payload: object([]),
+        },
+    };
+    let observe = |id: &str, after: &str, source, entity: &str| ScenarioAction {
+        id: identifier(id),
+        actor: ActorId::new("task").unwrap(),
+        after: vec![identifier(after)],
+        expectation: ActionExpectation::default(),
+        action: ActionKind::Observe {
+            source,
+            selector: object([
+                ("entity", string(entity)),
+                ("identity", variable("episode-id")),
+            ]),
+        },
+    };
+    let mut contract = scenario(
+        "lifecycle_predicates",
+        AgentVendor::Codex,
+        vec![
+            mcp("open", &[], "fake-open-episode", object([])),
+            hook_action("session-end", "open", "SessionEnd"),
+            observe(
+                "episode-observe",
+                "session-end",
+                ObservationSource::Runtime,
+                "work_episode",
+            ),
+            observe(
+                "candidate-observe",
+                "episode-observe",
+                ObservationSource::Index,
+                "index_candidate_for_episode",
+            ),
+            hook_action("first-stop", "candidate-observe", "Stop"),
+            mcp(
+                "first-candidate",
+                &["first-stop"],
+                "candidate_get",
+                object([]),
+            ),
+            hook_action("repeat-stop", "first-candidate", "Stop"),
+            mcp(
+                "repeat-candidate",
+                &["repeat-stop"],
+                "candidate_get",
+                object([("candidate_id", variable("first-candidate-id"))]),
+            ),
+        ],
+        vec![
+            capture(
+                "episode-id",
+                VariableKind::WorkEpisodeId,
+                "open",
+                "/episode_id",
+            ),
+            capture(
+                "first-candidate-id",
+                VariableKind::CandidateId,
+                "first-candidate",
+                "/candidate_id",
+            ),
+            capture(
+                "repeat-candidate-id",
+                VariableKind::CandidateId,
+                "repeat-candidate",
+                "/candidate_id",
+            ),
+        ],
+        vec![],
+    );
+    contract.events.extend([
+        EventClassification {
+            event: WireName::new("SessionEnd").unwrap(),
+            classification: EventSupport::Supported,
+            product_action: Some(ProductAction::SessionEnd),
+        },
+        EventClassification {
+            event: WireName::new("Stop").unwrap(),
+            classification: EventSupport::Supported,
+            product_action: Some(ProductAction::TurnStop),
+        },
+    ]);
+    contract.assertions.extend([
+        InvariantAssertion {
+            id: AssertionId::new("open-no-candidate").unwrap(),
+            invariant: InvariantKind::OpenEpisodeHasNoCandidate {
+                episode: VariableName::new("episode-id").unwrap(),
+                episode_observation: identifier("episode-observe"),
+                candidate_observation: identifier("candidate-observe"),
+            },
+        },
+        InvariantAssertion {
+            id: AssertionId::new("session-end-keeps-open").unwrap(),
+            invariant: InvariantKind::SessionEndDoesNotCloseEpisode {
+                session_end: identifier("session-end"),
+                observation: identifier("episode-observe"),
+                episode: VariableName::new("episode-id").unwrap(),
+            },
+        },
+        InvariantAssertion {
+            id: AssertionId::new("turn-stop-idempotent").unwrap(),
+            invariant: InvariantKind::TurnStopIsIdempotent {
+                first_stop: identifier("first-stop"),
+                repeated_stop: identifier("repeat-stop"),
+                first_candidate: VariableName::new("first-candidate-id").unwrap(),
+                repeated_candidate: VariableName::new("repeat-candidate-id").unwrap(),
+            },
+        },
+    ]);
+    let run = runner(temporary.path(), Duration::from_secs(2))
+        .run(&contract, 184)
+        .unwrap();
+    for assertion in [
+        "open-no-candidate",
+        "session-end-keeps-open",
+        "turn-stop-idempotent",
+    ] {
+        assert!(
+            run.outcome
+                .assertions
+                .iter()
+                .find(|record| record.id == assertion)
+                .unwrap()
+                .passed
+        );
+    }
+}
+
+#[test]
+fn privacy_canary_assertion_reports_clean_and_leaked_state_without_canary_text() {
+    for (leak, expected_pass) in [(false, true), (true, false)] {
+        let temporary = tempdir().unwrap();
+        let mut contract = scenario(
+            "privacy_canary_bridge",
+            AgentVendor::Cursor,
+            vec![
+                ScenarioAction {
+                    id: identifier("prompt-probe"),
+                    actor: ActorId::new("session").unwrap(),
+                    after: vec![],
+                    expectation: ActionExpectation::default(),
+                    action: ActionKind::HookEvent {
+                        event: WireName::new("beforeSubmitPrompt").unwrap(),
+                        payload: object([(
+                            "persist_canary",
+                            TemplateValue::Boolean { value: leak },
+                        )]),
+                    },
+                },
+                ScenarioAction {
+                    id: identifier("tool-probe"),
+                    actor: ActorId::new("session").unwrap(),
+                    after: vec![identifier("prompt-probe")],
+                    expectation: ActionExpectation::default(),
+                    action: ActionKind::HookEvent {
+                        event: WireName::new("postToolUse").unwrap(),
+                        payload: object([]),
+                    },
+                },
+            ],
+            vec![],
+            vec![],
+        );
+        contract.events.extend([
+            EventClassification {
+                event: WireName::new("beforeSubmitPrompt").unwrap(),
+                classification: EventSupport::Supported,
+                product_action: Some(ProductAction::PromptSubmit),
+            },
+            EventClassification {
+                event: WireName::new("postToolUse").unwrap(),
+                classification: EventSupport::Supported,
+                product_action: Some(ProductAction::PostToolUse),
+            },
+        ]);
+        contract.assertions.push(InvariantAssertion {
+            id: AssertionId::new("raw-is-absent").unwrap(),
+            invariant: InvariantKind::RawContentIsAbsent {
+                probes: vec![
+                    RawContentProbe {
+                        kind: RawContentKind::Prompt,
+                        hook: identifier("prompt-probe"),
+                    },
+                    RawContentProbe {
+                        kind: RawContentKind::Transcript,
+                        hook: identifier("prompt-probe"),
+                    },
+                    RawContentProbe {
+                        kind: RawContentKind::ToolOutput,
+                        hook: identifier("tool-probe"),
+                    },
+                ],
+            },
+        });
+        let run = runner(temporary.path(), Duration::from_secs(2))
+            .run(&contract, 181)
+            .unwrap();
+        let assertion = run
+            .outcome
+            .assertions
+            .iter()
+            .find(|assertion| assertion.id == "raw-is-absent")
+            .unwrap();
+        assert_eq!(assertion.passed, expected_pass);
+        let encoded = serde_json::to_string(&run.outcome).unwrap();
+        assert!(!encoded.contains("sctx-canary-"));
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn invalid_contract_and_fault_capture_fail_before_any_sandbox_or_spawn() {
     let parent = tempdir().unwrap();
     let invalid = runner(parent.path(), Duration::from_secs(1))
@@ -968,6 +1723,51 @@ fn invalid_contract_and_fault_capture_fail_before_any_sandbox_or_spawn() {
         .run(&conflicting_faults, 44)
         .err()
         .expect("conflicting fault plans must fail preflight");
+    assert_eq!(
+        failure.classification,
+        FailureClassification::InvalidScenario
+    );
+    assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+
+    let mut ambiguous_assertion = scenario(
+        "invalid_assertion_occurrence",
+        AgentVendor::Cursor,
+        vec![cli("safe", &[], &[string("fake-echo")])],
+        vec![],
+        vec![],
+    );
+    ambiguous_assertion.faults.push(fault(
+        "repeat-proof",
+        FaultKind::Repeat {
+            target: identifier("assertion-response"),
+            times: 2,
+        },
+    ));
+    let failure = runner(parent.path(), Duration::from_secs(1))
+        .run(&ambiguous_assertion, 45)
+        .err()
+        .expect("repeated assertion evidence must fail preflight");
+    assert_eq!(
+        failure.classification,
+        FailureClassification::InvalidScenario
+    );
+    assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+
+    let mut unsupported_expectation = scenario(
+        "invalid_cli_expectation",
+        AgentVendor::Cursor,
+        vec![cli("safe", &[], &[string("fake-echo")])],
+        vec![],
+        vec![],
+    );
+    unsupported_expectation.actions[0].expectation = ActionExpectation::TypedFailure {
+        code: ExpectedFailureCode::new("invalid_input").unwrap(),
+        kind: ExpectedFailureKind::InvalidInput,
+    };
+    let failure = runner(parent.path(), Duration::from_secs(1))
+        .run(&unsupported_expectation, 46)
+        .err()
+        .expect("unsupported typed failure transport must fail preflight");
     assert_eq!(
         failure.classification,
         FailureClassification::InvalidScenario

@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    path::{Component, Path},
+};
 
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -11,6 +15,8 @@ pub const MAX_IDENTIFIER_BYTES: usize = 64;
 pub const MAX_WIRE_NAME_BYTES: usize = 128;
 /// Maximum bytes in a JSON Pointer used for a scalar capture.
 pub const MAX_JSON_POINTER_BYTES: usize = 256;
+/// Maximum bytes in one sandbox-relative resource path.
+pub const MAX_RESOURCE_PATH_BYTES: usize = 256;
 
 macro_rules! protocol_identifier {
     ($name:ident, $description:literal) => {
@@ -86,6 +92,10 @@ protocol_identifier!(
     "Scenario-local identity of one typed invariant assertion."
 );
 protocol_identifier!(BarrierId, "Scenario-local identity of a scheduler barrier.");
+protocol_identifier!(
+    ResourceId,
+    "Scenario-local identity of one sandbox resource root."
+);
 
 fn validate_identifier(name: &str, value: &str) -> Result<(), crate::ContractError> {
     if value.is_empty() || value.len() > MAX_IDENTIFIER_BYTES {
@@ -134,6 +144,55 @@ impl WireName {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Bounded machine-readable product failure code used by an expected typed failure.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ExpectedFailureCode(String);
+
+impl ExpectedFailureCode {
+    /// Creates a safe lowercase failure code.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty, overlong, or non-lowercase identifier text.
+    pub fn new(value: impl Into<String>) -> Result<Self, crate::ContractError> {
+        let value = value.into();
+        let mut bytes = value.bytes();
+        if value.is_empty()
+            || value.len() > MAX_IDENTIFIER_BYTES
+            || !bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+            || !bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err(invalid_schema(
+                "expected failure code must be a bounded lowercase identifier",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Serialize for ExpectedFailureCode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExpectedFailureCode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(de::Error::custom)
     }
 }
 
@@ -212,6 +271,82 @@ impl Serialize for JsonPointer {
 }
 
 impl<'de> Deserialize<'de> for JsonPointer {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(de::Error::custom)
+    }
+}
+
+/// A bounded safe path below a declared sandbox resource root.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ResourcePath(String);
+
+impl ResourcePath {
+    /// Creates a normalized sandbox-relative regular-file path.
+    ///
+    /// # Errors
+    ///
+    /// Rejects absolute paths, traversal, empty or hidden Git-control components, backslashes,
+    /// non-ASCII text, and values over the protocol bound.
+    pub fn new(value: impl Into<String>) -> Result<Self, crate::ContractError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > MAX_RESOURCE_PATH_BYTES
+            || value.contains('\\')
+            || value.starts_with('/')
+            || value.ends_with('/')
+            || value.contains("//")
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-/".contains(&byte))
+        {
+            return Err(invalid_schema(
+                "resource path is not a bounded safe relative path",
+            ));
+        }
+        let path = Path::new(&value);
+        if path.is_absolute()
+            || path.components().any(|component| match component {
+                Component::Normal(value) => value
+                    .to_str()
+                    .is_none_or(|value| value.to_ascii_lowercase().starts_with(".git")),
+                Component::CurDir
+                | Component::ParentDir
+                | Component::RootDir
+                | Component::Prefix(_) => true,
+            })
+        {
+            return Err(invalid_schema(
+                "resource path cannot escape or control its synthetic repository",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ResourcePath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Serialize for ResourcePath {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ResourcePath {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -381,6 +516,45 @@ pub struct ScenarioVariable {
     pub capture: CaptureSource,
 }
 
+/// One handwritten regular file materialized only below a runner-owned resource root.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxFile {
+    pub path: ResourcePath,
+    pub content: String,
+}
+
+/// Bounded resource root optionally initialized as a synthetic local Git repository.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxResource {
+    pub id: ResourceId,
+    #[serde(default)]
+    pub synthetic_git: bool,
+    pub files: Vec<SandboxFile>,
+}
+
+/// Runner-owned values that a fixture may reference without embedding machine-local paths or
+/// external Session identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SandboxBuiltin {
+    Home,
+    Root,
+    Workspace,
+    Temp,
+    ResourceRoot {
+        resource: ResourceId,
+    },
+    ResourceFile {
+        resource: ResourceId,
+        path: ResourcePath,
+    },
+    ActorSessionKey {
+        actor: ActorId,
+    },
+}
+
 /// Strongly typed JSON template. Runtime variables are explicit leaves, not string interpolation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -393,6 +567,32 @@ pub enum TemplateValue {
     Array { items: Vec<Self> },
     Object { fields: BTreeMap<String, Self> },
     Variable { name: VariableName },
+    Builtin { builtin: SandboxBuiltin },
+}
+
+/// Safe cross-interface error classes accepted by typed expected-failure actions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpectedFailureKind {
+    InvalidInput,
+    StaleState,
+    Conflict,
+    PrivacyRejected,
+    Unsupported,
+    RepositoryNotConfigured,
+    IdempotencyKeyConflict,
+}
+
+/// Expected action disposition. This is never an expected response document.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ActionExpectation {
+    #[default]
+    Success,
+    TypedFailure {
+        code: ExpectedFailureCode,
+        kind: ExpectedFailureKind,
+    },
 }
 
 /// Read-only state surface available to the future black-box observer.
@@ -459,6 +659,8 @@ pub struct ScenarioAction {
     pub actor: ActorId,
     #[serde(default)]
     pub after: Vec<StepId>,
+    #[serde(default)]
+    pub expectation: ActionExpectation,
     pub action: ActionKind,
 }
 
@@ -551,12 +753,21 @@ pub enum RawContentKind {
     ToolOutput,
 }
 
+/// One non-vacuous raw-content probe tied to the compatible Hook payload that carries it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawContentProbe {
+    pub kind: RawContentKind,
+    pub hook: StepId,
+}
+
 /// Closed set of stable product invariants. There is deliberately no generic equality or
 /// expected-output variant.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InvariantKind {
     ActiveTaskPerSession {
+        observation: StepId,
         session: ActorId,
         task: VariableName,
     },
@@ -566,41 +777,50 @@ pub enum InvariantKind {
     },
     StaleCasZeroWrites {
         attempt: StepId,
-        before_generation: VariableName,
-        after_generation: VariableName,
+        before_observation: StepId,
+        after_observation: StepId,
     },
     OpenEpisodeHasNoCandidate {
         episode: VariableName,
+        episode_observation: StepId,
+        candidate_observation: StepId,
     },
     TurnStopIsIdempotent {
+        first_stop: StepId,
+        repeated_stop: StepId,
         first_candidate: VariableName,
         repeated_candidate: VariableName,
     },
     CandidateSourceEpisode {
+        response: StepId,
         candidate: VariableName,
         episode: VariableName,
     },
     CandidateIsNotAutoInjected {
         candidate: VariableName,
+        response: StepId,
     },
     ConfirmationIsAtomic {
         confirmation: VariableName,
+        response: StepId,
         event_count: ConfirmationEventCount,
     },
     SessionEndDoesNotCloseEpisode {
         session_end: StepId,
+        observation: StepId,
         episode: VariableName,
     },
     WorkingIntentHintHasNoGraphPath {
-        observation: StepId,
+        response: StepId,
     },
     ArtifactFocusIsRequestScoped {
-        focus: StepId,
-        ordinary_context: StepId,
+        focused_response: StepId,
+        ordinary_response: StepId,
+        resource: ResourceId,
+        path: ResourcePath,
     },
     RawContentIsAbsent {
-        observation: StepId,
-        fields: Vec<RawContentKind>,
+        probes: Vec<RawContentProbe>,
     },
 }
 
@@ -622,6 +842,8 @@ pub struct ScenarioDefinition {
     pub agent: AgentProfile,
     pub actors: Vec<ScenarioActor>,
     pub actions: Vec<ScenarioAction>,
+    #[serde(default)]
+    pub resources: Vec<SandboxResource>,
     #[serde(default)]
     pub variables: Vec<ScenarioVariable>,
     #[serde(default)]

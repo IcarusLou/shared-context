@@ -59,6 +59,26 @@ impl RunnerFailure {
             message,
         )
     }
+
+    pub(crate) fn typed_failure_mismatch(
+        scenario: &str,
+        seed: u64,
+        step: &str,
+        code: &str,
+        kind: &str,
+    ) -> Self {
+        let mut message = format!("typed failure mismatch: code={code}, kind={kind}");
+        if message.len() > MAX_FAILURE_MESSAGE_BYTES {
+            message.truncate(MAX_FAILURE_MESSAGE_BYTES);
+        }
+        Self {
+            scenario: scenario.to_owned(),
+            seed,
+            step: Some(step.to_owned()),
+            classification: FailureClassification::ProcessFailure,
+            message,
+        }
+    }
 }
 
 impl fmt::Display for RunnerFailure {

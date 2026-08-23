@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     ffi::OsString,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -34,6 +35,11 @@ pub(crate) struct ProcessError {
     pub message: &'static str,
 }
 
+pub(crate) enum McpToolOutcome {
+    Success(Value),
+    TypedFailure { code: String, kind: String },
+}
+
 impl ProcessError {
     const fn new(kind: ProcessErrorKind, message: &'static str) -> Self {
         Self { kind, message }
@@ -44,9 +50,12 @@ impl ProcessError {
 pub(crate) struct CommandContext {
     pub binary: PathBuf,
     pub home: PathBuf,
+    pub root: PathBuf,
     pub temporary: PathBuf,
     pub workspace: PathBuf,
     pub search_path: OsString,
+    pub resource_roots: BTreeMap<String, PathBuf>,
+    pub resource_files: BTreeMap<(String, String), PathBuf>,
 }
 
 impl CommandContext {
@@ -213,7 +222,7 @@ impl McpManager {
         }
     }
 
-    pub fn call(&mut self, tool: &str, arguments: &Value) -> Result<Value, ProcessError> {
+    pub fn call(&mut self, tool: &str, arguments: &Value) -> Result<McpToolOutcome, ProcessError> {
         self.ensure_started()?;
         match self {
             Self::Running(child) => child.call_tool(tool, arguments),
@@ -378,7 +387,7 @@ impl McpChild {
         Ok(process)
     }
 
-    fn call_tool(&mut self, tool: &str, arguments: &Value) -> Result<Value, ProcessError> {
+    fn call_tool(&mut self, tool: &str, arguments: &Value) -> Result<McpToolOutcome, ProcessError> {
         self.next_id = self.next_id.checked_add(1).ok_or_else(|| {
             ProcessError::new(
                 ProcessErrorKind::Protocol,
@@ -401,18 +410,30 @@ impl McpChild {
         let result = response.get("result").ok_or_else(|| {
             ProcessError::new(ProcessErrorKind::Protocol, "MCP result is missing")
         })?;
-        if result.get("isError").and_then(Value::as_bool) == Some(true) {
-            return Err(ProcessError::new(
-                ProcessErrorKind::Protocol,
-                "MCP tool returned a typed failure",
-            ));
-        }
-        result.get("structuredContent").cloned().ok_or_else(|| {
+        let structured = result.get("structuredContent").cloned().ok_or_else(|| {
             ProcessError::new(
                 ProcessErrorKind::Protocol,
                 "MCP structured result is missing",
             )
-        })
+        })?;
+        if result.get("isError").and_then(Value::as_bool) == Some(true) {
+            let code = structured
+                .pointer("/error/code")
+                .and_then(Value::as_str)
+                .filter(|value| safe_error_component(value))
+                .ok_or_else(invalid_typed_failure)?;
+            let kind = structured
+                .pointer("/error/kind")
+                .and_then(Value::as_str)
+                .filter(|value| safe_error_component(value))
+                .ok_or_else(invalid_typed_failure)?;
+            Ok(McpToolOutcome::TypedFailure {
+                code: code.to_owned(),
+                kind: kind.to_owned(),
+            })
+        } else {
+            Ok(McpToolOutcome::Success(structured))
+        }
     }
 
     fn request(&mut self, request: &Value) -> Result<Value, ProcessError> {
@@ -447,6 +468,21 @@ impl McpChild {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+fn safe_error_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+        })
+}
+
+fn invalid_typed_failure() -> ProcessError {
+    ProcessError::new(
+        ProcessErrorKind::Protocol,
+        "MCP typed failure metadata is invalid",
+    )
 }
 
 impl Drop for McpChild {

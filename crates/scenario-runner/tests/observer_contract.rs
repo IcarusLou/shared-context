@@ -177,6 +177,71 @@ fn missing_database_observation_never_initializes_state() {
 }
 
 #[test]
+fn fixed_active_task_and_candidate_episode_selectors_return_only_safe_identity_counts() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let runtime = wal_database(
+        &root.join("state/runtime.sqlite"),
+        "CREATE TABLE external_session (
+            external_session_key TEXT PRIMARY KEY,
+            active_task_id TEXT NOT NULL
+         ); PRAGMA user_version = 11;",
+    );
+    let task_id = format!("tsk_{}", uuid::Uuid::new_v4().hyphenated());
+    runtime
+        .execute(
+            "INSERT INTO external_session VALUES ('scenario-session', ?1)",
+            [&task_id],
+        )
+        .unwrap();
+    let active = observer()
+        .observe(
+            &root,
+            ObservationSource::Runtime,
+            &json!({"entity": "active_task", "session_key": "scenario-session"}),
+        )
+        .unwrap();
+    assert_eq!(active.summary.count, 1);
+    assert_eq!(active.summary.identity.as_deref(), Some(task_id.as_str()));
+
+    let index = wal_database(
+        &root.join("state/index.sqlite"),
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         CREATE TABLE context_candidate (
+            candidate_id TEXT PRIMARY KEY,
+            source_episode_id TEXT NOT NULL
+         ); PRAGMA user_version = 11;",
+    );
+    index
+        .execute_batch(
+            "INSERT INTO meta VALUES ('indexed_tree_oid', '3333333333333333333333333333333333333333');
+             INSERT INTO meta VALUES ('projection_generation', '1');",
+        )
+        .unwrap();
+    let episode_id = format!("wep_{}", uuid::Uuid::new_v4().hyphenated());
+    let candidate_id = format!("cnd_{}", uuid::Uuid::new_v4().hyphenated());
+    index
+        .execute(
+            "INSERT INTO context_candidate VALUES (?1, ?2)",
+            [&candidate_id, &episode_id],
+        )
+        .unwrap();
+    let candidates = observer()
+        .observe(
+            &root,
+            ObservationSource::Index,
+            &json!({"entity": "index_candidate_for_episode", "identity": episode_id}),
+        )
+        .unwrap();
+    assert_eq!(candidates.summary.count, 1);
+    assert_eq!(
+        candidates.summary.identity.as_deref(),
+        Some(candidate_id.as_str())
+    );
+    drop((runtime, index));
+}
+
+#[test]
 fn git_observer_reads_only_committed_head_tree_and_path_counts() {
     let temporary = tempdir().unwrap();
     let root = temporary.path().join("root");

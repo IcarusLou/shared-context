@@ -109,8 +109,8 @@ fn duplicate_actor_step_variable_fault_assertion_and_event_are_rejected() {
             ContractErrorKind::DuplicateFault,
         ),
         (
-            "/assertions/1/id",
-            json!("one-active-task"),
+            "/assertions/0/id",
+            json!("atomic-confirmation"),
             ContractErrorKind::DuplicateAssertion,
         ),
         (
@@ -122,11 +122,16 @@ fn duplicate_actor_step_variable_fault_assertion_and_event_are_rejected() {
 
     for (pointer, replacement, expected) in cases {
         let mut scenario = value(CODEX);
-        if pointer == "/faults/0/id" {
-            let clone = scenario["faults"][0].clone();
-            scenario["faults"]
+        if matches!(pointer, "/faults/0/id" | "/assertions/0/id") {
+            let collection = if pointer.starts_with("/faults") {
+                "faults"
+            } else {
+                "assertions"
+            };
+            let clone = scenario[collection][0].clone();
+            scenario[collection]
                 .as_array_mut()
-                .expect("faults array")
+                .expect("fixture collection")
                 .push(clone);
         } else {
             *scenario.pointer_mut(pointer).expect("fixture pointer") = replacement;
@@ -286,11 +291,11 @@ fn supported_event_remains_a_valid_hook_action() {
 #[test]
 fn typed_invariants_reject_wrong_or_dangling_variable_kinds() {
     let mut wrong_kind = value(CODEX);
-    wrong_kind["variables"][0]["value_type"] = json!("context_id");
+    wrong_kind["variables"][4]["value_type"] = json!("context_id");
     expect_error(&wrong_kind, ContractErrorKind::VariableTypeMismatch);
 
     let mut dangling = value(CODEX);
-    dangling["assertions"][0]["invariant"]["task"] = json!("unknown-task-id");
+    dangling["assertions"][0]["invariant"]["confirmation"] = json!("unknown-confirmation-id");
     expect_error(&dangling, ContractErrorKind::DanglingReference);
 }
 
@@ -321,7 +326,7 @@ fn malformed_json_and_excessive_template_depth_are_bounded() {
 
     let mut scenario = value(CODEX);
     let mut nested = json!({"type": "null"});
-    for _ in 0..=20 {
+    for _ in 0..=40 {
         nested = json!({"type": "array", "items": [nested]});
     }
     scenario["actions"][0]["action"]["payload"] = nested;

@@ -88,6 +88,13 @@ fn serve_hook(_arguments: &[String]) {
         eprintln!("SECRET_HOOK_STDERR_MUST_NOT_ESCAPE");
         process::exit(18);
     }
+    if payload.get("persist_canary").and_then(Value::as_bool) == Some(true)
+        && let Some(canary) = find_canary(&payload)
+    {
+        let root = PathBuf::from(env::var_os("HOME").unwrap()).join(".shared-context");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("fake-canary-leak.bin"), canary.as_bytes()).unwrap();
+    }
     println!(
         "{}",
         json!({
@@ -101,6 +108,7 @@ fn serve_hook(_arguments: &[String]) {
     );
 }
 
+#[allow(clippy::too_many_lines)]
 fn serve_mcp(_client: &str) {
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin.lock());
@@ -128,6 +136,32 @@ fn serve_mcp(_client: &str) {
                     eprintln!("SECRET_MCP_STDERR_MUST_NOT_ESCAPE");
                     process::exit(19);
                 }
+                if name == "fake-typed-failure" {
+                    if arguments.get("mutate_semantic").and_then(Value::as_bool) == Some(true) {
+                        mutate_semantic_state();
+                    }
+                    let code = arguments
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .unwrap_or("fake_failure");
+                    let kind = arguments
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("invalid_input");
+                    let response = json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {
+                            "content": [{"type": "text", "text": "SECRET_TYPED_FAILURE_BODY"}],
+                            "structuredContent": {"error": {
+                                "code": code, "kind": kind,
+                                "message": "SECRET_TYPED_FAILURE_MESSAGE"
+                            }},
+                            "isError": true
+                        }
+                    });
+                    write_frame(&mut writer, &response, framing);
+                    continue;
+                }
                 if name == "fake-sleep" {
                     let milliseconds = arguments
                         .get("sleep_ms")
@@ -138,6 +172,12 @@ fn serve_mcp(_client: &str) {
                     log("mcp-sleep-end");
                 }
                 let mut data = arguments.as_object().cloned().unwrap_or_default();
+                if name == "fake-open-episode" {
+                    data.insert(
+                        "episode_id".to_owned(),
+                        Value::String(create_open_episode_state()),
+                    );
+                }
                 data.insert("sequence".to_owned(), json!(sequence));
                 data.insert("network_disabled".to_owned(), json!(network_disabled()));
                 data.insert(
@@ -147,6 +187,83 @@ fn serve_mcp(_client: &str) {
                 data.insert("process_id".to_owned(), json!(process::id()));
                 data.entry("task_id".to_owned())
                     .or_insert_with(|| json!(format!("tsk_{}", uuid::Uuid::new_v4().hyphenated())));
+                data.entry("revision_id".to_owned())
+                    .or_insert_with(|| json!(format!("tir_{}", uuid::Uuid::new_v4().hyphenated())));
+                if name == "candidate_get" {
+                    data.entry("candidate_id".to_owned()).or_insert_with(|| {
+                        json!(format!("cnd_{}", uuid::Uuid::new_v4().hyphenated()))
+                    });
+                    data.entry("source_episode".to_owned()).or_insert_with(|| {
+                        json!({"episode_id": format!("wep_{}", uuid::Uuid::new_v4().hyphenated())})
+                    });
+                }
+                if name == "candidate_confirm" {
+                    data.entry("confirmation_id".to_owned()).or_insert_with(|| {
+                        json!(format!("cfm_{}", uuid::Uuid::new_v4().hyphenated()))
+                    });
+                    data.entry("event_ids".to_owned()).or_insert_with(|| {
+                        Value::Array(
+                            (0..5)
+                                .map(|_| {
+                                    json!(format!("evt_{}", uuid::Uuid::new_v4().hyphenated()))
+                                })
+                                .collect(),
+                        )
+                    });
+                    data.entry("batch_id".to_owned()).or_insert_with(|| {
+                        json!(format!("bat_{}", uuid::Uuid::new_v4().hyphenated()))
+                    });
+                    data.entry("commit_oid".to_owned())
+                        .or_insert_with(|| json!("0123456789abcdef0123456789abcdef01234567"));
+                    data.entry("status".to_owned())
+                        .or_insert_with(|| json!("confirmed"));
+                    data.entry("created".to_owned())
+                        .or_insert_with(|| json!(true));
+                    if arguments
+                        .get("nested_confirmation")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                        && let Some(confirmation) = data.remove("confirmation_id")
+                    {
+                        data.insert(
+                            "nested".to_owned(),
+                            json!({"confirmation_id": confirmation}),
+                        );
+                    }
+                    if arguments.get("duplicate_events").and_then(Value::as_bool) == Some(true)
+                        && let Some(events) =
+                            data.get_mut("event_ids").and_then(Value::as_array_mut)
+                        && events.len() > 1
+                    {
+                        events[1] = events[0].clone();
+                    }
+                    if arguments.get("missing_batch").and_then(Value::as_bool) == Some(true) {
+                        data.remove("batch_id");
+                    }
+                    if arguments.get("invalid_batch").and_then(Value::as_bool) == Some(true) {
+                        data.insert("batch_id".to_owned(), json!("invalid-batch"));
+                    }
+                    if arguments.get("missing_commit").and_then(Value::as_bool) == Some(true) {
+                        data.remove("commit_oid");
+                    }
+                    if arguments.get("invalid_commit").and_then(Value::as_bool) == Some(true) {
+                        data.insert("commit_oid".to_owned(), json!("ABCDEF"));
+                    }
+                }
+                if name == "task_artifact_focus" {
+                    data.insert(
+                        "retrieval_paths".to_owned(),
+                        json!([{"source": "engineering_graph"}]),
+                    );
+                }
+                if name == "task_context"
+                    && arguments.get("emit_hint").and_then(Value::as_bool) == Some(true)
+                {
+                    data.insert(
+                        "retrieval_paths".to_owned(),
+                        json!([{"source": "working_intent_hint_text"}]),
+                    );
+                }
                 json!({
                     "jsonrpc": "2.0", "id": id,
                     "result": {"content": [], "structuredContent": data, "isError": false}
@@ -159,6 +276,105 @@ fn serve_mcp(_client: &str) {
         };
         write_frame(&mut writer, &response, framing);
     }
+}
+
+fn find_canary(value: &Value) -> Option<&str> {
+    match value {
+        Value::String(value) if value.starts_with("sctx-canary-") => Some(value),
+        Value::Array(values) => values.iter().find_map(find_canary),
+        Value::Object(values) => values.values().find_map(find_canary),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => None,
+    }
+}
+
+fn mutate_semantic_state() {
+    let home = PathBuf::from(env::var_os("HOME").unwrap());
+    let state = home.join(".shared-context/state");
+    fs::create_dir_all(&state).unwrap();
+    let connection = rusqlite::Connection::open(state.join("runtime.sqlite")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS external_session (
+                external_session_key TEXT PRIMARY KEY,
+                active_task_id TEXT NOT NULL,
+                active_task_session_id TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS task_session (
+                task_session_id TEXT PRIMARY KEY,
+                current_intent_revision_id TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS task_intent_revision (
+                task_session_id TEXT NOT NULL,
+                revision_id TEXT PRIMARY KEY
+             );
+             CREATE TABLE IF NOT EXISTS work_episode (
+                episode_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL
+             );
+             DELETE FROM external_session;
+             DELETE FROM task_session;
+             DELETE FROM task_intent_revision;
+             PRAGMA user_version = 11;",
+        )
+        .unwrap();
+    let task = format!("tsk_{}", uuid::Uuid::new_v4().hyphenated());
+    let task_session = format!("tss_{}", uuid::Uuid::new_v4().hyphenated());
+    let revision = format!("tir_{}", uuid::Uuid::new_v4().hyphenated());
+    connection
+        .execute(
+            "INSERT INTO external_session VALUES ('scenario-session', ?1, ?2)",
+            rusqlite::params![task, task_session],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO task_session VALUES (?1, ?2)",
+            rusqlite::params![task_session, revision],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO task_intent_revision VALUES (?1, ?2)",
+            rusqlite::params![task_session, revision],
+        )
+        .unwrap();
+}
+
+fn create_open_episode_state() -> String {
+    let home = PathBuf::from(env::var_os("HOME").unwrap());
+    let state = home.join(".shared-context/state");
+    fs::create_dir_all(&state).unwrap();
+    let episode = format!("wep_{}", uuid::Uuid::new_v4().hyphenated());
+    let runtime = rusqlite::Connection::open(state.join("runtime.sqlite")).unwrap();
+    runtime
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS work_episode (
+                episode_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL
+             );
+             DELETE FROM work_episode;
+             PRAGMA user_version = 11;",
+        )
+        .unwrap();
+    runtime
+        .execute("INSERT INTO work_episode VALUES (?1, 'open')", [&episode])
+        .unwrap();
+    let index = rusqlite::Connection::open(state.join("index.sqlite")).unwrap();
+    index
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS context_candidate (
+                candidate_id TEXT PRIMARY KEY,
+                source_episode_id TEXT NOT NULL
+             );
+             DELETE FROM meta;
+             DELETE FROM context_candidate;
+             INSERT INTO meta VALUES ('indexed_tree_oid', '4444444444444444444444444444444444444444');
+             INSERT INTO meta VALUES ('projection_generation', '1');
+             PRAGMA user_version = 11;",
+        )
+        .unwrap();
+    episode
 }
 
 fn read_frame(reader: &mut impl BufRead) -> Option<(Value, Framing)> {

@@ -148,42 +148,12 @@
   ],
   "assertions": [
     {
-      "id": "one-active-task",
-      "invariant": {
-        "type": "active_task_per_session",
-        "session": "session",
-        "task": "task-id"
-      }
-    },
-    {
-      "id": "source-episode",
-      "invariant": {
-        "type": "candidate_source_episode",
-        "candidate": "candidate-id",
-        "episode": "episode-id"
-      }
-    },
-    {
-      "id": "candidate-not-injected",
-      "invariant": {
-        "type": "candidate_is_not_auto_injected",
-        "candidate": "candidate-id"
-      }
-    },
-    {
       "id": "atomic-confirmation",
       "invariant": {
         "type": "confirmation_is_atomic",
         "confirmation": "confirmation-id",
+        "response": "confirm",
         "event_count": "four"
-      }
-    },
-    {
-      "id": "no-raw-content",
-      "invariant": {
-        "type": "raw_content_is_absent",
-        "observation": "confirmation-observation",
-        "fields": ["prompt", "transcript", "tool_output"]
       }
     }
   ],

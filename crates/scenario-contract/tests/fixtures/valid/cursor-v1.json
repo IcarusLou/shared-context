@@ -87,7 +87,8 @@
         "selector": {
           "type": "object",
           "fields": {
-            "episode_id": { "type": "variable", "name": "episode-id" }
+            "entity": { "type": "string", "value": "work_episode" },
+            "identity": { "type": "variable", "name": "episode-id" }
           }
         }
       }
@@ -110,35 +111,15 @@
       "capture": { "step": "checkpoint", "pointer": "/episode_id" }
     }
   ],
-  "faults": [
-    {
-      "id": "drop-session-end",
-      "fault": { "type": "drop", "target": "session-end" }
-    }
-  ],
+  "faults": [],
   "assertions": [
-    {
-      "id": "one-active-task",
-      "invariant": {
-        "type": "active_task_per_session",
-        "session": "session",
-        "task": "task-id"
-      }
-    },
     {
       "id": "session-end-keeps-episode",
       "invariant": {
         "type": "session_end_does_not_close_episode",
         "session_end": "session-end",
-        "episode": "episode-id"
-      }
-    },
-    {
-      "id": "no-raw-content",
-      "invariant": {
-        "type": "raw_content_is_absent",
         "observation": "runtime-observation",
-        "fields": ["prompt", "transcript", "tool_output"]
+        "episode": "episode-id"
       }
     }
   ],

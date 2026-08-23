@@ -19,6 +19,7 @@ pub enum ContractErrorKind {
     DuplicateFault,
     DuplicateAssertion,
     DuplicateEvent,
+    DuplicateResource,
     DanglingReference,
     DependencyCycle,
     ForwardReference,
@@ -28,6 +29,8 @@ pub enum ContractErrorKind {
     InvalidCapture,
     InvalidFaultTarget,
     InvalidEventClassification,
+    InvalidResource,
+    InvalidExpectation,
     HardcodedDomainId,
     ForgedExpected,
 }

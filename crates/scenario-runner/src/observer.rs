@@ -20,6 +20,8 @@ const MAX_FINGERPRINT_BYTES: u64 = 512 * 1024 * 1024;
 #[serde(rename_all = "snake_case")]
 pub enum ObservationEntity {
     ExternalSession,
+    ActiveTask,
+    TaskSemanticState,
     TaskSession,
     WorkEpisode,
     Checkpoint,
@@ -30,6 +32,7 @@ pub enum ObservationEntity {
     GitObject,
     IndexProjection,
     IndexCandidate,
+    IndexCandidateForEpisode,
     IndexContext,
     IndexSpace,
     IndexConfirmation,
@@ -44,6 +47,8 @@ struct ObservationSelector {
     entity: ObservationEntity,
     #[serde(default)]
     identity: Option<String>,
+    #[serde(default)]
+    session_key: Option<String>,
 }
 
 /// Typed generation carried by one observed storage surface.
@@ -189,10 +194,14 @@ impl ReadOnlyObserver {
         root: &Path,
         selector: &ObservationSelector,
     ) -> Result<ObservationSummary, ObserverError> {
+        if selector.session_key.is_some() {
+            return Err(invalid_selector());
+        }
         if !matches!(
             selector.entity,
             ObservationEntity::GitEvent | ObservationEntity::GitObject
-        ) {
+        ) || selector.identity.as_deref().is_some_and(str::is_empty)
+        {
             return Err(invalid_selector());
         }
         let repository = root.join("repository");
@@ -218,8 +227,14 @@ impl ReadOnlyObserver {
             .filter(|path| !path.is_empty())
         {
             if selector.identity.as_ref().is_none_or(|identity| {
-                path.windows(identity.len())
-                    .any(|window| window == identity.as_bytes())
+                path.rsplit(|byte| *byte == b'/')
+                    .next()
+                    .is_some_and(|name| {
+                        name == identity.as_bytes()
+                            || name
+                                .strip_suffix(b".json")
+                                .is_some_and(|stem| stem == identity.as_bytes())
+                    })
             }) {
                 count = count.saturating_add(1);
                 if count == 1 {
@@ -385,6 +400,12 @@ fn observe_runtime(
     root: &Path,
     selector: &ObservationSelector,
 ) -> Result<ObservationSummary, ObserverError> {
+    if selector.entity == ObservationEntity::ActiveTask {
+        return observe_active_task(&root.join("state/runtime.sqlite"), selector);
+    }
+    if selector.entity == ObservationEntity::TaskSemanticState {
+        return observe_task_semantic_state(&root.join("state/runtime.sqlite"), selector);
+    }
     let spec = match selector.entity {
         ObservationEntity::ExternalSession => {
             TableSpec::new("external_session", "external_session_id", None)
@@ -424,6 +445,9 @@ fn observe_index(
 ) -> Result<ObservationSummary, ObserverError> {
     if selector.entity == ObservationEntity::IndexProjection {
         return observe_index_projection(&root.join("state/index.sqlite"), selector);
+    }
+    if selector.entity == ObservationEntity::IndexCandidateForEpisode {
+        return observe_index_candidate_for_episode(&root.join("state/index.sqlite"), selector);
     }
     let spec = match selector.entity {
         ObservationEntity::IndexCandidate => {
@@ -503,6 +527,9 @@ fn observe_table_database(
     spec: TableSpec,
     metadata_reader: Option<MetadataReader>,
 ) -> Result<ObservationSummary, ObserverError> {
+    if selector.session_key.is_some() {
+        return Err(invalid_selector());
+    }
     let Some(snapshot) = DatabaseSnapshot::copy(database)? else {
         return Ok(absent(source, selector.entity));
     };
@@ -533,6 +560,128 @@ fn observe_table_database(
         count,
         identity,
         status,
+        tree,
+        generation,
+        schema_version: Some(schema_version),
+    })
+}
+
+fn observe_active_task(
+    database: &Path,
+    selector: &ObservationSelector,
+) -> Result<ObservationSummary, ObserverError> {
+    if selector.identity.is_some() || selector.session_key.as_deref().is_none_or(str::is_empty) {
+        return Err(invalid_selector());
+    }
+    let Some(snapshot) = DatabaseSnapshot::copy(database)? else {
+        return Ok(absent(ObservationSource::Runtime, selector.entity));
+    };
+    let connection = snapshot.open()?;
+    let (count, identity): (i64, Option<String>) = connection
+        .query_row(
+            "SELECT COUNT(*), MIN(active_task_id) FROM external_session WHERE external_session_key = ?1",
+            [selector.session_key.as_deref().unwrap_or_default()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| read_failed())?;
+    let schema_version = schema_version(&connection)?;
+    finish_read(&connection)?;
+    Ok(ObservationSummary {
+        source: ObservationSource::Runtime,
+        entity: selector.entity,
+        present: true,
+        count: u64::try_from(count).map_err(|_| read_failed())?,
+        identity,
+        status: None,
+        tree: None,
+        generation: None,
+        schema_version: Some(schema_version),
+    })
+}
+
+fn observe_task_semantic_state(
+    database: &Path,
+    selector: &ObservationSelector,
+) -> Result<ObservationSummary, ObserverError> {
+    if selector.identity.is_some() || selector.session_key.as_deref().is_none_or(str::is_empty) {
+        return Err(invalid_selector());
+    }
+    let Some(snapshot) = DatabaseSnapshot::copy(database)? else {
+        return Ok(absent(ObservationSource::Runtime, selector.entity));
+    };
+    let connection = snapshot.open()?;
+    let state = connection
+        .query_row(
+            "SELECT external_session.active_task_id,
+                    task_session.current_intent_revision_id,
+                    (SELECT COUNT(*) FROM task_intent_revision
+                     WHERE task_intent_revision.task_session_id = task_session.task_session_id)
+             FROM external_session
+             JOIN task_session
+               ON task_session.task_session_id = external_session.active_task_session_id
+             WHERE external_session.external_session_key = ?1",
+            [selector.session_key.as_deref().unwrap_or_default()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| read_failed())?;
+    let schema_version = schema_version(&connection)?;
+    finish_read(&connection)?;
+    let (identity, status, count) = state.map_or((None, None, 0), |(task, revision, count)| {
+        (
+            Some(task),
+            Some(revision),
+            u64::try_from(count).unwrap_or(0),
+        )
+    });
+    Ok(ObservationSummary {
+        source: ObservationSource::Runtime,
+        entity: selector.entity,
+        present: true,
+        count,
+        identity,
+        status,
+        tree: None,
+        generation: None,
+        schema_version: Some(schema_version),
+    })
+}
+
+fn observe_index_candidate_for_episode(
+    database: &Path,
+    selector: &ObservationSelector,
+) -> Result<ObservationSummary, ObserverError> {
+    if selector.session_key.is_some() || selector.identity.as_deref().is_none_or(str::is_empty) {
+        return Err(invalid_selector());
+    }
+    let Some(snapshot) = DatabaseSnapshot::copy(database)? else {
+        return Ok(absent(ObservationSource::Index, selector.entity));
+    };
+    let connection = snapshot.open()?;
+    let (count, identity): (i64, Option<String>) = connection
+        .query_row(
+            "SELECT COUNT(*), CASE WHEN COUNT(*) = 1 THEN MIN(candidate_id) END
+             FROM context_candidate WHERE source_episode_id = ?1",
+            [selector.identity.as_deref().unwrap_or_default()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| read_failed())?;
+    let (tree, generation) = index_metadata(&connection)?;
+    let schema_version = schema_version(&connection)?;
+    finish_read(&connection)?;
+    Ok(ObservationSummary {
+        source: ObservationSource::Index,
+        entity: selector.entity,
+        present: true,
+        count: u64::try_from(count).map_err(|_| read_failed())?,
+        identity,
+        status: None,
         tree,
         generation,
         schema_version: Some(schema_version),
@@ -574,7 +723,7 @@ fn observe_index_projection(
     database: &Path,
     selector: &ObservationSelector,
 ) -> Result<ObservationSummary, ObserverError> {
-    if selector.identity.is_some() {
+    if selector.identity.is_some() || selector.session_key.is_some() {
         return Err(invalid_selector());
     }
     let Some(snapshot) = DatabaseSnapshot::copy(database)? else {
@@ -602,7 +751,7 @@ fn observe_graph_projection(
     database: &Path,
     selector: &ObservationSelector,
 ) -> Result<ObservationSummary, ObserverError> {
-    if selector.identity.is_some() {
+    if selector.identity.is_some() || selector.session_key.is_some() {
         return Err(invalid_selector());
     }
     let Some(snapshot) = DatabaseSnapshot::copy(database)? else {

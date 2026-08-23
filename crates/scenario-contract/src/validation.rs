@@ -4,9 +4,10 @@ use serde_json::Value;
 use uuid::{Variant, Version};
 
 use crate::{
-    ActionKind, ActorKind, AgentFraming, AgentVendor, ContractError, ContractErrorKind,
-    EventSupport, FaultKind, InvariantKind, ProductAction, RawContentKind, ScenarioDefinition,
-    StepId, TemplateValue, VariableKind, VariableName, error::invalid_schema,
+    ActionExpectation, ActionKind, ActorKind, AgentFraming, AgentVendor, ContractError,
+    ContractErrorKind, EventSupport, ExpectedFailureKind, FaultKind, InvariantKind, ProductAction,
+    RawContentKind, SandboxBuiltin, ScenarioDefinition, StepId, TemplateValue, VariableKind,
+    VariableName, error::invalid_schema,
 };
 
 /// Maximum accepted serialized scenario size.
@@ -23,10 +24,16 @@ pub const MAX_FAULTS: usize = 64;
 pub const MAX_ASSERTIONS: usize = 128;
 /// Maximum classified vendor events in one scenario.
 pub const MAX_EVENTS: usize = 128;
+/// Maximum sandbox resource roots in one scenario.
+pub const MAX_RESOURCES: usize = 16;
+/// Maximum regular files across one sandbox resource root.
+pub const MAX_RESOURCE_FILES: usize = 64;
+/// Maximum UTF-8 bytes in one handwritten sandbox file.
+pub const MAX_RESOURCE_CONTENT_BYTES: usize = 4 * 1024;
 /// Maximum direct causal dependencies declared by one action.
 pub const MAX_DEPENDENCIES_PER_ACTION: usize = 32;
 /// Maximum nesting depth of any JSON or typed action template.
-pub const MAX_TEMPLATE_DEPTH: usize = 16;
+pub const MAX_TEMPLATE_DEPTH: usize = 32;
 /// Maximum total JSON/template nodes in one scenario.
 pub const MAX_TEMPLATE_NODES: usize = 4_096;
 
@@ -117,19 +124,31 @@ impl ScenarioDefinition {
         validate_collection_capacity("faults", self.faults.len(), 0, MAX_FAULTS)?;
         validate_collection_capacity("assertions", self.assertions.len(), 1, MAX_ASSERTIONS)?;
         validate_collection_capacity("events", self.events.len(), 1, MAX_EVENTS)?;
+        validate_collection_capacity("resources", self.resources.len(), 0, MAX_RESOURCES)?;
 
         validate_agent_framing(self)?;
+        let resources = validate_resources(self)?;
         let actors = validate_actors(self)?;
         let graph = validate_actions(self, &actors)?;
         let variables = validate_variables(self, &graph)?;
-        validate_action_variables(self, &graph, &variables)?;
+        validate_action_variables(self, &actors, &resources, &graph, &variables)?;
         validate_faults(self, &actors, &graph)?;
         validate_events(self)?;
-        validate_assertions(self, &actors, &graph, &variables)?;
+        validate_assertions(self, &actors, &resources, &graph, &variables)?;
 
         let value = serde_json::to_value(self)
             .map_err(|_| invalid_schema("scenario could not be represented as JSON"))?;
         validate_raw_capacity(&value)?;
+        if serde_json::to_vec(&value)
+            .map_err(|_| invalid_schema("scenario could not be sized as JSON"))?
+            .len()
+            > MAX_DOCUMENT_BYTES
+        {
+            return Err(ContractError::new(
+                ContractErrorKind::DocumentTooLarge,
+                format!("scenario exceeds {MAX_DOCUMENT_BYTES} bytes"),
+            ));
+        }
         reject_hardcoded_domain_ids(&value)
     }
 }
@@ -167,6 +186,81 @@ fn validate_collection_capacity(
             format!("{name} must contain {minimum}..={maximum} entries"),
         ))
     }
+}
+
+struct ResourceDefinition<'a> {
+    files: HashSet<&'a str>,
+}
+
+fn validate_resources(
+    scenario: &ScenarioDefinition,
+) -> Result<HashMap<&str, ResourceDefinition<'_>>, ContractError> {
+    let mut resources = HashMap::with_capacity(scenario.resources.len());
+    for resource in &scenario.resources {
+        validate_collection_capacity(
+            "resource files",
+            resource.files.len(),
+            1,
+            MAX_RESOURCE_FILES,
+        )?;
+        let mut files = HashSet::with_capacity(resource.files.len());
+        let mut folded_files = HashSet::with_capacity(resource.files.len());
+        for file in &resource.files {
+            if file.content.len() > MAX_RESOURCE_CONTENT_BYTES {
+                return Err(ContractError::new(
+                    ContractErrorKind::CapacityExceeded,
+                    format!(
+                        "resource {} contains a file over {MAX_RESOURCE_CONTENT_BYTES} bytes",
+                        resource.id
+                    ),
+                ));
+            }
+            if !files.insert(file.path.as_str()) {
+                return Err(ContractError::new(
+                    ContractErrorKind::InvalidResource,
+                    format!("resource {} repeats a file path", resource.id),
+                ));
+            }
+            if !folded_files.insert(file.path.as_str().to_ascii_lowercase()) {
+                return Err(ContractError::new(
+                    ContractErrorKind::InvalidResource,
+                    format!("resource {} repeats a case-folded file path", resource.id),
+                ));
+            }
+        }
+        let paths = resource
+            .files
+            .iter()
+            .map(|file| file.path.as_str().to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        for (offset, first) in paths.iter().enumerate() {
+            for second in &paths[offset + 1..] {
+                if first
+                    .strip_prefix(second)
+                    .or_else(|| second.strip_prefix(first))
+                    .is_some_and(|tail| tail.starts_with('/'))
+                {
+                    return Err(ContractError::new(
+                        ContractErrorKind::InvalidResource,
+                        format!(
+                            "resource {} has a file/directory path conflict",
+                            resource.id
+                        ),
+                    ));
+                }
+            }
+        }
+        if resources
+            .insert(resource.id.as_str(), ResourceDefinition { files })
+            .is_some()
+        {
+            return Err(ContractError::new(
+                ContractErrorKind::DuplicateResource,
+                format!("resource {} is declared more than once", resource.id),
+            ));
+        }
+    }
+    Ok(resources)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -271,6 +365,20 @@ fn validate_actions<'a>(
         }
         if let ActionKind::CliJson { arguments } = &step.action {
             validate_collection_capacity("CLI arguments", arguments.len(), 1, MAX_CLI_ARGUMENTS)?;
+        }
+        if matches!(step.expectation, ActionExpectation::TypedFailure { .. })
+            && !matches!(
+                step.action,
+                ActionKind::McpRequest { .. } | ActionKind::CliJson { .. }
+            )
+        {
+            return Err(ContractError::new(
+                ContractErrorKind::InvalidExpectation,
+                format!(
+                    "step {} can expect a typed failure only from MCP or CLI",
+                    step.id
+                ),
+            ));
         }
         validate_collection_capacity(
             "action dependencies",
@@ -385,6 +493,15 @@ fn validate_variables<'a>(
                 format!("variable {} captures a step without output", variable.name),
             ));
         }
+        if matches!(
+            scenario.actions[source_step].expectation,
+            ActionExpectation::TypedFailure { .. }
+        ) {
+            return Err(ContractError::new(
+                ContractErrorKind::InvalidCapture,
+                format!("variable {} cannot capture a typed failure", variable.name),
+            ));
+        }
         if variables
             .insert(
                 variable.name.as_str(),
@@ -406,6 +523,8 @@ fn validate_variables<'a>(
 
 fn validate_action_variables(
     scenario: &ScenarioDefinition,
+    actors: &HashMap<&str, ActorRole>,
+    resources: &HashMap<&str, ResourceDefinition<'_>>,
     graph: &ActionGraph<'_>,
     variables: &HashMap<&str, VariableDefinition>,
 ) -> Result<(), ContractError> {
@@ -418,9 +537,13 @@ fn validate_action_variables(
             }
             | ActionKind::Observe {
                 selector: params, ..
-            } => collect_template_variables(params, &mut references),
+            } => {
+                validate_template_builtins(params, actors, resources)?;
+                collect_template_variables(params, &mut references);
+            }
             ActionKind::CliJson { arguments } => {
                 for argument in arguments {
+                    validate_template_builtins(argument, actors, resources)?;
                     collect_template_variables(argument, &mut references);
                 }
             }
@@ -466,12 +589,75 @@ fn collect_template_variables<'a>(value: &'a TemplateValue, output: &mut Vec<&'a
             }
         }
         TemplateValue::Variable { name } => output.push(name),
-        TemplateValue::Null
+        TemplateValue::Builtin { .. }
+        | TemplateValue::Null
         | TemplateValue::Boolean { .. }
         | TemplateValue::Integer { .. }
         | TemplateValue::Unsigned { .. }
         | TemplateValue::String { .. } => {}
     }
+}
+
+fn validate_template_builtins(
+    value: &TemplateValue,
+    actors: &HashMap<&str, ActorRole>,
+    resources: &HashMap<&str, ResourceDefinition<'_>>,
+) -> Result<(), ContractError> {
+    match value {
+        TemplateValue::Array { items } => {
+            for item in items {
+                validate_template_builtins(item, actors, resources)?;
+            }
+        }
+        TemplateValue::Object { fields } => {
+            for item in fields.values() {
+                validate_template_builtins(item, actors, resources)?;
+            }
+        }
+        TemplateValue::Builtin { builtin } => match builtin {
+            SandboxBuiltin::Home
+            | SandboxBuiltin::Root
+            | SandboxBuiltin::Workspace
+            | SandboxBuiltin::Temp => {}
+            SandboxBuiltin::ResourceRoot { resource } => {
+                if !resources.contains_key(resource.as_str()) {
+                    return Err(ContractError::new(
+                        ContractErrorKind::DanglingReference,
+                        "sandbox builtin references an unknown resource",
+                    ));
+                }
+            }
+            SandboxBuiltin::ResourceFile { resource, path } => {
+                let Some(resource) = resources.get(resource.as_str()) else {
+                    return Err(ContractError::new(
+                        ContractErrorKind::DanglingReference,
+                        "sandbox builtin references an unknown resource",
+                    ));
+                };
+                if !resource.files.contains(path.as_str()) {
+                    return Err(ContractError::new(
+                        ContractErrorKind::DanglingReference,
+                        "sandbox builtin references an undeclared resource file",
+                    ));
+                }
+            }
+            SandboxBuiltin::ActorSessionKey { actor } => {
+                if actors.get(actor.as_str()) != Some(&ActorRole::Session) {
+                    return Err(ContractError::new(
+                        ContractErrorKind::DanglingReference,
+                        "sandbox Session-key builtin requires a Session actor",
+                    ));
+                }
+            }
+        },
+        TemplateValue::Null
+        | TemplateValue::Boolean { .. }
+        | TemplateValue::Integer { .. }
+        | TemplateValue::Unsigned { .. }
+        | TemplateValue::String { .. }
+        | TemplateValue::Variable { .. } => {}
+    }
+    Ok(())
 }
 
 fn validate_faults(
@@ -562,6 +748,14 @@ fn fault_target(
             "fault target must be an MCP, CLI, or Hook product action",
         ));
     }
+    if matches!(
+        scenario.actions[index].expectation,
+        ActionExpectation::TypedFailure { .. }
+    ) {
+        return Err(invalid_fault(
+            "typed expected-failure steps cannot be fault targets",
+        ));
+    }
     Ok(index)
 }
 
@@ -625,6 +819,7 @@ fn validate_events(scenario: &ScenarioDefinition) -> Result<(), ContractError> {
 fn validate_assertions(
     scenario: &ScenarioDefinition,
     actors: &HashMap<&str, ActorRole>,
+    resources: &HashMap<&str, ResourceDefinition<'_>>,
     graph: &ActionGraph<'_>,
     variables: &HashMap<&str, VariableDefinition>,
 ) -> Result<(), ContractError> {
@@ -637,99 +832,300 @@ fn validate_assertions(
             ));
         }
         match &assertion.invariant {
-            InvariantKind::ActiveTaskPerSession { session, task } => {
+            InvariantKind::ActiveTaskPerSession {
+                observation,
+                session,
+                task,
+            } => {
                 require_actor_role(actors, session.as_str(), ActorRole::Session)?;
                 require_variable(variables, task, VariableKind::TaskId)?;
+                let observed = require_observation_entity(
+                    scenario,
+                    graph,
+                    observation,
+                    crate::ObservationSource::Runtime,
+                    "active_task",
+                )?;
+                require_observer_session_builtin(&scenario.actions[observed], session)?;
+                require_after_variable_source(graph, variables, task, observed)?;
             }
             InvariantKind::CanonicalContinueKeepsRevision {
                 first_revision,
                 retry_revision,
             } => {
+                if first_revision == retry_revision {
+                    return Err(invalid_schema(
+                        "semantic retry assertion requires two distinct captures",
+                    ));
+                }
                 require_variable(variables, first_revision, VariableKind::IntentRevisionId)?;
                 require_variable(variables, retry_revision, VariableKind::IntentRevisionId)?;
             }
             InvariantKind::StaleCasZeroWrites {
                 attempt,
-                before_generation,
-                after_generation,
+                before_observation,
+                after_observation,
             } => {
-                require_step(graph, attempt)?;
-                require_variable(variables, before_generation, VariableKind::Generation)?;
-                require_variable(variables, after_generation, VariableKind::Generation)?;
-            }
-            InvariantKind::OpenEpisodeHasNoCandidate { episode }
-            | InvariantKind::SessionEndDoesNotCloseEpisode { episode, .. } => {
-                require_variable(variables, episode, VariableKind::WorkEpisodeId)?;
-                if let InvariantKind::SessionEndDoesNotCloseEpisode { session_end, .. } =
-                    &assertion.invariant
-                {
-                    let index = require_step(graph, session_end)?;
-                    let ActionKind::HookEvent { event, .. } = &scenario.actions[index].action
-                    else {
-                        return Err(invalid_schema(
-                            "session-end invariant must reference a Hook event step",
-                        ));
-                    };
-                    let classified = scenario.events.iter().any(|classification| {
-                        classification.event == *event
-                            && classification.classification == EventSupport::Supported
-                            && classification.product_action == Some(ProductAction::SessionEnd)
-                    });
-                    if !classified {
-                        return Err(invalid_schema(
-                            "session-end invariant must reference an event classified as SessionEnd",
-                        ));
+                let attempt = require_step(graph, attempt)?;
+                if !matches!(
+                    scenario.actions[attempt].expectation,
+                    ActionExpectation::TypedFailure {
+                        kind: ExpectedFailureKind::StaleState,
+                        ..
                     }
+                ) {
+                    return Err(ContractError::new(
+                        ContractErrorKind::InvalidExpectation,
+                        "stale-zero-write invariant requires a stale_state typed failure",
+                    ));
+                }
+                let before = require_observation_entity(
+                    scenario,
+                    graph,
+                    before_observation,
+                    crate::ObservationSource::Runtime,
+                    "task_semantic_state",
+                )?;
+                let after = require_observation_entity(
+                    scenario,
+                    graph,
+                    after_observation,
+                    crate::ObservationSource::Runtime,
+                    "task_semantic_state",
+                )?;
+                require_any_observer_session_builtin(&scenario.actions[before])?;
+                require_any_observer_session_builtin(&scenario.actions[after])?;
+                if before >= attempt
+                    || attempt >= after
+                    || attempt != before + 1
+                    || after != attempt + 1
+                    || !graph.depends_on(attempt, before)
+                    || !graph.depends_on(after, attempt)
+                {
+                    return Err(ContractError::new(
+                        ContractErrorKind::ForwardReference,
+                        "stale zero-write observations must causally surround the attempt",
+                    ));
+                }
+                let ActionKind::Observe {
+                    source: before_source,
+                    selector: before_selector,
+                } = &scenario.actions[before].action
+                else {
+                    unreachable!()
+                };
+                let ActionKind::Observe {
+                    source: after_source,
+                    selector: after_selector,
+                } = &scenario.actions[after].action
+                else {
+                    unreachable!()
+                };
+                if before_source != after_source || before_selector != after_selector {
+                    return Err(invalid_schema(
+                        "stale zero-write observations must use the same fixed selector",
+                    ));
                 }
             }
+            InvariantKind::OpenEpisodeHasNoCandidate {
+                episode,
+                episode_observation,
+                candidate_observation,
+            } => {
+                require_variable(variables, episode, VariableKind::WorkEpisodeId)?;
+                let episode_observation = require_observation_entity(
+                    scenario,
+                    graph,
+                    episode_observation,
+                    crate::ObservationSource::Runtime,
+                    "work_episode",
+                )?;
+                require_observer_identity_variable(
+                    &scenario.actions[episode_observation],
+                    episode,
+                )?;
+                require_after_variable_source(graph, variables, episode, episode_observation)?;
+                let candidate_observation = require_observation_entity(
+                    scenario,
+                    graph,
+                    candidate_observation,
+                    crate::ObservationSource::Index,
+                    "index_candidate_for_episode",
+                )?;
+                require_observer_identity_variable(
+                    &scenario.actions[candidate_observation],
+                    episode,
+                )?;
+                require_after_variable_source(graph, variables, episode, candidate_observation)?;
+            }
             InvariantKind::TurnStopIsIdempotent {
+                first_stop,
+                repeated_stop,
                 first_candidate,
                 repeated_candidate,
             } => {
+                let first = require_hook_product_action(
+                    scenario,
+                    graph,
+                    first_stop,
+                    ProductAction::TurnStop,
+                )?;
+                let repeated = require_hook_product_action(
+                    scenario,
+                    graph,
+                    repeated_stop,
+                    ProductAction::TurnStop,
+                )?;
+                if first >= repeated || !graph.depends_on(repeated, first) {
+                    return Err(ContractError::new(
+                        ContractErrorKind::ForwardReference,
+                        "repeated TurnStop must causally follow the first TurnStop",
+                    ));
+                }
                 require_variable(variables, first_candidate, VariableKind::CandidateId)?;
                 require_variable(variables, repeated_candidate, VariableKind::CandidateId)?;
+                let first_candidate_source = variables[first_candidate.as_str()].source_step;
+                let repeated_candidate_source = variables[repeated_candidate.as_str()].source_step;
+                if !(first < first_candidate_source
+                    && first_candidate_source < repeated
+                    && repeated < repeated_candidate_source
+                    && graph.depends_on(first_candidate_source, first)
+                    && graph.depends_on(repeated, first_candidate_source)
+                    && graph.depends_on(repeated_candidate_source, repeated))
+                {
+                    return Err(ContractError::new(
+                        ContractErrorKind::ForwardReference,
+                        "TurnStop Candidate captures must bracket the two Hook steps",
+                    ));
+                }
             }
-            InvariantKind::CandidateSourceEpisode { candidate, episode } => {
+            InvariantKind::CandidateSourceEpisode {
+                response,
+                candidate,
+                episode,
+            } => {
                 require_variable(variables, candidate, VariableKind::CandidateId)?;
                 require_variable(variables, episode, VariableKind::WorkEpisodeId)?;
+                let response = require_mcp_method(scenario, graph, response, "candidate_get")?;
+                if variables[candidate.as_str()].source_step != response
+                    || variables[episode.as_str()].source_step != response
+                {
+                    return Err(invalid_schema(
+                        "Candidate source assertion identities must come from its response",
+                    ));
+                }
             }
-            InvariantKind::CandidateIsNotAutoInjected { candidate } => {
+            InvariantKind::CandidateIsNotAutoInjected {
+                candidate,
+                response,
+            } => {
                 require_variable(variables, candidate, VariableKind::CandidateId)?;
+                let context_step = require_mcp_method(scenario, graph, response, "task_context")?;
+                let candidate_source = variables[candidate.as_str()].source_step;
+                if context_step <= candidate_source
+                    || !graph.depends_on(context_step, candidate_source)
+                {
+                    return Err(ContractError::new(
+                        ContractErrorKind::ForwardReference,
+                        "Candidate injection response must causally follow Candidate capture",
+                    ));
+                }
             }
-            InvariantKind::ConfirmationIsAtomic { confirmation, .. } => {
+            InvariantKind::ConfirmationIsAtomic {
+                confirmation,
+                response,
+                ..
+            } => {
                 require_variable(variables, confirmation, VariableKind::ConfirmationId)?;
+                let response = require_mcp_method(scenario, graph, response, "candidate_confirm")?;
+                if variables[confirmation.as_str()].source_step != response {
+                    return Err(invalid_schema(
+                        "confirmation assertion must reference its capture response step",
+                    ));
+                }
             }
-            InvariantKind::WorkingIntentHintHasNoGraphPath { observation } => {
-                require_observation_step(scenario, graph, observation)?;
+            InvariantKind::SessionEndDoesNotCloseEpisode {
+                session_end,
+                observation,
+                episode,
+            } => {
+                require_variable(variables, episode, VariableKind::WorkEpisodeId)?;
+                let session_end = require_hook_product_action(
+                    scenario,
+                    graph,
+                    session_end,
+                    ProductAction::SessionEnd,
+                )?;
+                let observation = require_observation_entity(
+                    scenario,
+                    graph,
+                    observation,
+                    crate::ObservationSource::Runtime,
+                    "work_episode",
+                )?;
+                require_observer_identity_variable(&scenario.actions[observation], episode)?;
+                if observation <= session_end || !graph.depends_on(observation, session_end) {
+                    return Err(ContractError::new(
+                        ContractErrorKind::ForwardReference,
+                        "SessionEnd observation must causally follow SessionEnd",
+                    ));
+                }
+            }
+            InvariantKind::WorkingIntentHintHasNoGraphPath { response } => {
+                let response = require_step(graph, response)?;
+                if !matches!(
+                    &scenario.actions[response].action,
+                    ActionKind::McpRequest { method, .. }
+                        if matches!(method.as_str(), "task_intent_update" | "task_context")
+                ) {
+                    return Err(invalid_schema(
+                        "Working Intent Hint assertion requires task_intent_update or task_context",
+                    ));
+                }
             }
             InvariantKind::ArtifactFocusIsRequestScoped {
-                focus,
-                ordinary_context,
+                focused_response,
+                ordinary_response,
+                resource,
+                path,
             } => {
-                let focus_index = require_step(graph, focus)?;
-                let context_index = require_step(graph, ordinary_context)?;
+                let focus_index =
+                    require_mcp_method(scenario, graph, focused_response, "task_artifact_focus")?;
+                let context_index =
+                    require_mcp_method(scenario, graph, ordinary_response, "task_context")?;
                 if focus_index >= context_index || !graph.depends_on(context_index, focus_index) {
                     return Err(ContractError::new(
                         ContractErrorKind::ForwardReference,
                         "ordinary context observation must causally follow artifact focus",
                     ));
                 }
-            }
-            InvariantKind::RawContentIsAbsent {
-                observation,
-                fields,
-            } => {
-                require_observation_step(scenario, graph, observation)?;
-                if fields.is_empty() || fields.len() > 3 {
-                    return Err(invalid_schema(
-                        "raw-content assertion must select 1..=3 typed fields",
+                if !resources
+                    .get(resource.as_str())
+                    .is_some_and(|resource| resource.files.contains(path.as_str()))
+                {
+                    return Err(ContractError::new(
+                        ContractErrorKind::DanglingReference,
+                        "Artifact Focus assertion references an undeclared resource file",
                     ));
                 }
-                let unique = fields.iter().copied().collect::<BTreeSet<RawContentKind>>();
-                if unique.len() != fields.len() {
+            }
+            InvariantKind::RawContentIsAbsent { probes } => {
+                if probes.is_empty() || probes.len() > 3 {
                     return Err(invalid_schema(
-                        "raw-content assertion fields must be unique",
+                        "raw-content assertion must contain 1..=3 typed probes",
                     ));
+                }
+                let unique = probes
+                    .iter()
+                    .map(|probe| probe.kind)
+                    .collect::<BTreeSet<RawContentKind>>();
+                if unique.len() != probes.len() {
+                    return Err(invalid_schema(
+                        "raw-content assertion probe kinds must be unique",
+                    ));
+                }
+                for probe in probes {
+                    require_raw_probe(scenario, graph, probe)?;
                 }
             }
         }
@@ -748,6 +1144,180 @@ fn require_actor_role(
             ContractErrorKind::DanglingReference,
             "invariant references an unknown or incorrectly typed actor",
         )),
+    }
+}
+
+fn require_after_variable_source(
+    graph: &ActionGraph<'_>,
+    variables: &HashMap<&str, VariableDefinition>,
+    variable: &VariableName,
+    step: usize,
+) -> Result<(), ContractError> {
+    let source = variables[variable.as_str()].source_step;
+    if source < step && graph.depends_on(step, source) {
+        Ok(())
+    } else {
+        Err(ContractError::new(
+            ContractErrorKind::ForwardReference,
+            "observation proof must causally follow its captured identity",
+        ))
+    }
+}
+
+fn require_observation_entity(
+    scenario: &ScenarioDefinition,
+    graph: &ActionGraph<'_>,
+    step: &StepId,
+    expected_source: crate::ObservationSource,
+    expected_entity: &str,
+) -> Result<usize, ContractError> {
+    let index = require_observation_step(scenario, graph, step)?;
+    let ActionKind::Observe { source, selector } = &scenario.actions[index].action else {
+        unreachable!()
+    };
+    let TemplateValue::Object { fields } = selector else {
+        return Err(invalid_schema(
+            "typed observation selector must be an object template",
+        ));
+    };
+    if *source != expected_source
+        || !matches!(
+            fields.get("entity"),
+            Some(TemplateValue::String { value }) if value == expected_entity
+        )
+    {
+        return Err(invalid_schema(
+            "observation proof uses the wrong fixed source or entity",
+        ));
+    }
+    Ok(index)
+}
+
+fn require_observer_session_builtin(
+    action: &crate::ScenarioAction,
+    session: &crate::ActorId,
+) -> Result<(), ContractError> {
+    let ActionKind::Observe {
+        selector: TemplateValue::Object { fields },
+        ..
+    } = &action.action
+    else {
+        unreachable!()
+    };
+    if matches!(
+        fields.get("session_key"),
+        Some(TemplateValue::Builtin {
+            builtin: SandboxBuiltin::ActorSessionKey { actor }
+        }) if actor == session
+    ) {
+        Ok(())
+    } else {
+        Err(invalid_schema(
+            "active-task observation requires the same Session-key builtin",
+        ))
+    }
+}
+
+fn require_any_observer_session_builtin(
+    action: &crate::ScenarioAction,
+) -> Result<(), ContractError> {
+    let ActionKind::Observe {
+        selector: TemplateValue::Object { fields },
+        ..
+    } = &action.action
+    else {
+        unreachable!()
+    };
+    if matches!(
+        fields.get("session_key"),
+        Some(TemplateValue::Builtin {
+            builtin: SandboxBuiltin::ActorSessionKey { .. }
+        })
+    ) {
+        Ok(())
+    } else {
+        Err(invalid_schema(
+            "task semantic observation requires a Session-key builtin",
+        ))
+    }
+}
+
+fn require_observer_identity_variable(
+    action: &crate::ScenarioAction,
+    variable: &VariableName,
+) -> Result<(), ContractError> {
+    let ActionKind::Observe {
+        selector: TemplateValue::Object { fields },
+        ..
+    } = &action.action
+    else {
+        unreachable!()
+    };
+    if matches!(
+        fields.get("identity"),
+        Some(TemplateValue::Variable { name }) if name == variable
+    ) {
+        Ok(())
+    } else {
+        Err(invalid_schema(
+            "identity observation requires the matching runtime variable",
+        ))
+    }
+}
+
+fn require_hook_product_action(
+    scenario: &ScenarioDefinition,
+    graph: &ActionGraph<'_>,
+    step: &StepId,
+    expected: ProductAction,
+) -> Result<usize, ContractError> {
+    let index = require_step(graph, step)?;
+    let ActionKind::HookEvent { event, .. } = &scenario.actions[index].action else {
+        return Err(invalid_schema(
+            "Hook invariant must reference a Hook event step",
+        ));
+    };
+    if scenario.events.iter().any(|classification| {
+        classification.event == *event
+            && classification.classification == EventSupport::Supported
+            && classification.product_action == Some(expected)
+    }) {
+        Ok(index)
+    } else {
+        Err(invalid_schema(
+            "Hook invariant references the wrong classified product action",
+        ))
+    }
+}
+
+fn require_raw_probe(
+    scenario: &ScenarioDefinition,
+    graph: &ActionGraph<'_>,
+    probe: &crate::RawContentProbe,
+) -> Result<(), ContractError> {
+    let index = require_step(graph, &probe.hook)?;
+    let ActionKind::HookEvent { event, .. } = &scenario.actions[index].action else {
+        return Err(invalid_schema(
+            "raw-content probe must reference a Hook event step",
+        ));
+    };
+    let product_action = scenario
+        .events
+        .iter()
+        .find(|classification| classification.event == *event)
+        .and_then(|classification| classification.product_action)
+        .ok_or_else(|| invalid_schema("raw-content probe Hook is not supported"))?;
+    let compatible = match probe.kind {
+        RawContentKind::Prompt => product_action == ProductAction::PromptSubmit,
+        RawContentKind::Transcript => true,
+        RawContentKind::ToolOutput => product_action == ProductAction::PostToolUse,
+    };
+    if compatible {
+        Ok(())
+    } else {
+        Err(invalid_schema(
+            "raw-content probe lacks a compatible nonempty synthetic Hook field",
+        ))
     }
 }
 
@@ -778,6 +1348,28 @@ fn require_step(graph: &ActionGraph<'_>, step: &StepId) -> Result<usize, Contrac
     })
 }
 
+fn require_mcp_method(
+    scenario: &ScenarioDefinition,
+    graph: &ActionGraph<'_>,
+    step: &StepId,
+    expected_method: &str,
+) -> Result<usize, ContractError> {
+    let index = require_step(graph, step)?;
+    if matches!(
+        &scenario.actions[index].action,
+        ActionKind::McpRequest { method, .. } if method.as_str() == expected_method
+    ) && matches!(
+        scenario.actions[index].expectation,
+        ActionExpectation::Success
+    ) {
+        Ok(index)
+    } else {
+        Err(invalid_schema(
+            "invariant response uses the wrong MCP operation or expectation",
+        ))
+    }
+}
+
 fn require_observation_step(
     scenario: &ScenarioDefinition,
     graph: &ActionGraph<'_>,
@@ -788,7 +1380,7 @@ fn require_observation_step(
         Ok(index)
     } else {
         Err(invalid_schema(
-            "invariant observation must reference a read-only Observe step",
+            "observation proof must reference a read-only Observe step",
         ))
     }
 }
