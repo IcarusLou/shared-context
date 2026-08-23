@@ -10,7 +10,7 @@ use sctx_domain::{
     Applicability, ArtifactKind, ContextGovernanceStatus, ContextId, ContextKind,
     ContextRelationKind, ContextRevisionDraft, EvidenceSnapshotDraft, EvidenceType,
     PublicationAction, PublicationDraft, ReferenceId, RepositoryIdentity, ResolutionStatus,
-    ResolvedFocus, SpaceId, TaskId, TaskIntent,
+    ResolvedFocus, SpaceId, TaskId, WorkingIntentSnapshot,
 };
 use sctx_engineering_graph::{
     EngineeringProjection, EngineeringProjectionStore, EngineeringReferenceResolver,
@@ -230,19 +230,19 @@ fn task_request(
 ) -> TaskContextRequest {
     let task_id: TaskId = parse_id("tsk_00000000-0000-4000-8000-000000003801");
     TaskContextRequest {
-        task_intent: TaskIntent {
-            task_id,
+        task_id,
+        working_intent: WorkingIntentSnapshot {
             goal: goal.to_owned(),
-            desired_change: format!("apply a verified change for {goal}"),
+            current_direction: Some(format!("apply a verified change for {goal}")),
             in_scope: Vec::new(),
             out_of_scope: Vec::new(),
             domains: Vec::new(),
             platforms: Vec::new(),
             constraints: Vec::new(),
             acceptance_conditions: Vec::new(),
-            artifacts: Vec::new(),
-            interfaces: Vec::new(),
-            unknowns: Vec::new(),
+            artifact_hints: Vec::new(),
+            interface_hints: Vec::new(),
+            open_questions: Vec::new(),
         },
         task_signals: Vec::new(),
         resolved_focus: Some(focus),

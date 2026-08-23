@@ -7,7 +7,8 @@ use sctx_domain::{
     ContextRevisionRef, EngineeringArtifact, EngineeringReference, EvidenceSnapshotDraft,
     EvidenceType, IntentSnapshot, PublicationAction, PublicationDraft, RecommendedSpaceRole,
     ReferenceId, ReferenceRelation, RepoRelativePath, RepositoryId, RepositoryIdentity, RevisionId,
-    SpaceId, SubmissionId, TaskId, TaskIntent, TaskSessionId, WorkEpisodeId, WorkEpisodeRef,
+    SpaceId, SubmissionId, TaskId, TaskSessionId, WorkEpisodeId, WorkEpisodeRef,
+    WorkingIntentSnapshot,
 };
 use sctx_engineering_graph::{
     ArtifactObservation, ArtifactSourceState, EngineeringProjectionStore,
@@ -292,7 +293,8 @@ fn empty_context_store_yields_zero_existing_spaces_and_does_not_write_git() {
     ));
     let result = SearchEngine::new(index)
         .analyze_candidate(&CandidateAnalysisRequest {
-            source_task_intent: source_intent(candidate.source_episode.task_id),
+            source_task_id: candidate.source_episode.task_id,
+            source_working_intent: source_intent(candidate.source_episode.task_id),
             source_task_signals: Vec::new(),
             candidate,
             explicit_related_contexts: Vec::new(),
@@ -342,7 +344,8 @@ fn one_safe_exact_owner_yields_one_existing_primary_space() {
     let candidate = candidate(content);
     let result = SearchEngine::new(index)
         .analyze_candidate(&CandidateAnalysisRequest {
-            source_task_intent: source_intent(candidate.source_episode.task_id),
+            source_task_id: candidate.source_episode.task_id,
+            source_working_intent: source_intent(candidate.source_episode.task_id),
             source_task_signals: Vec::new(),
             candidate,
             explicit_related_contexts: Vec::new(),
@@ -385,20 +388,19 @@ fn candidate(content: ContextRevisionDraft) -> ContextCandidate {
         .unwrap()
 }
 
-fn source_intent(task_id: TaskId) -> TaskIntent {
-    TaskIntent {
-        task_id,
+fn source_intent(_task_id: TaskId) -> WorkingIntentSnapshot {
+    WorkingIntentSnapshot {
         goal: "ZXQ review objective".to_owned(),
-        desired_change: "Nebula routing objective".to_owned(),
+        current_direction: Some("Nebula routing objective".to_owned()),
         in_scope: Vec::new(),
         out_of_scope: Vec::new(),
         domains: Vec::new(),
         platforms: Vec::new(),
         constraints: Vec::new(),
         acceptance_conditions: Vec::new(),
-        artifacts: Vec::new(),
-        interfaces: Vec::new(),
-        unknowns: Vec::new(),
+        artifact_hints: Vec::new(),
+        interface_hints: Vec::new(),
+        open_questions: Vec::new(),
     }
 }
 
@@ -412,7 +414,8 @@ fn analyze(
     let candidate = candidate(content);
     SearchEngine::new(fixture.index.clone())
         .analyze_candidate(&CandidateAnalysisRequest {
-            source_task_intent: source_intent(candidate.source_episode.task_id),
+            source_task_id: candidate.source_episode.task_id,
+            source_working_intent: source_intent(candidate.source_episode.task_id),
             source_task_signals: Vec::new(),
             candidate,
             explicit_related_contexts: explicit,
@@ -780,7 +783,8 @@ fn exact_artifact_graph_reaches_cross_end_space_with_frozen_generation() {
     let candidate = candidate(content);
     let result = SearchEngine::with_engineering_graph(index, graph_store)
         .analyze_candidate(&CandidateAnalysisRequest {
-            source_task_intent: source_intent(candidate.source_episode.task_id),
+            source_task_id: candidate.source_episode.task_id,
+            source_working_intent: source_intent(candidate.source_episode.task_id),
             source_task_signals: Vec::new(),
             candidate,
             explicit_related_contexts: Vec::new(),

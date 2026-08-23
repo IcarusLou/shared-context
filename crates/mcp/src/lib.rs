@@ -28,10 +28,10 @@ use sctx_domain::{
     EngineeringReferenceDraft, Error, ErrorKind, EvidenceSnapshotDraft, EvidenceType,
     ExternalSessionLocator, NormalizedWorkObservation, OptionalCandidateEdits, ReferenceId,
     ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionStatus, ResolvedFocus, Result,
-    RevisionId, SignalId, SpaceId, SpaceRecommendationId, SubmissionId, TaskId, TaskIntentDraft,
+    RevisionId, SignalId, SpaceId, SpaceRecommendationId, SubmissionId, TaskId,
     TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignalKind, TaskSignalLifecycle,
     TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId, WorkEpisodeStatus, WorkObservation,
-    WorkObservationId, WorkSourceRef,
+    WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
 };
 use sctx_engineering_graph::{
     CandidateMatchEvidence, CatalogRepositorySpec, EngineeringProjectionStore,
@@ -58,7 +58,7 @@ use sctx_task_runtime::{
     AgentCheckpointWrite, AutomatedEpisodeBoundary, CandidateBuildItemPreparation,
     CandidateBuildItemStatus, CandidateBuildStatus, CandidateBuildView, CandidateReviewDiscard,
     CandidateReviewDiscardStatus, CandidateReviewRecord, CheckpointBoundary, CheckpointClaimDraft,
-    TaskRuntime, WorkEpisodeView,
+    IntentRevisionWriteStatus, TaskRuntime, WorkEpisodeView,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -80,13 +80,6 @@ pub enum TaskBoundary {
     New,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IntentMaturity {
-    Provisional,
-    Grounded,
-}
-
 /// Required nullable CAS field. Unlike `Option<T>`, an omitted field fails deserialization.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -104,7 +97,7 @@ impl ExpectedRevisionId {
     }
 }
 
-/// Complete authoritative Task Intent update. Every field is required by transport.
+/// Lightweight Working Intent update; only the goal is required inside the snapshot.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskIntentUpdateInput {
@@ -112,9 +105,7 @@ pub struct TaskIntentUpdateInput {
     pub external_session_id: String,
     pub task_boundary: TaskBoundary,
     pub expected_revision_id: ExpectedRevisionId,
-    pub maturity: IntentMaturity,
-    pub intent: TaskIntentDraft,
-    pub evidence_refs: Vec<String>,
+    pub intent: WorkingIntentSnapshot,
 }
 
 /// Stable-ID Signal lifecycle update guarded by active Task and Intent revision.
@@ -452,9 +443,25 @@ impl From<CandidateBuildItemStatus> for CandidateBuildItemResponseStatus {
 pub struct TaskIntentUpdateResponse {
     #[serde(flatten)]
     pub context: TaskContextResponse,
-    pub maturity: IntentMaturity,
-    pub evidence_refs: Vec<String>,
+    pub revision_status: IntentRevisionStatus,
     pub active_signals: Vec<TaskSignalRecord>,
+}
+
+/// Whether one Working Intent call created a Revision or matched current canonical semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentRevisionStatus {
+    Created,
+    AlreadyCurrent,
+}
+
+impl From<IntentRevisionWriteStatus> for IntentRevisionStatus {
+    fn from(value: IntentRevisionWriteStatus) -> Self {
+        match value {
+            IntentRevisionWriteStatus::Created => Self::Created,
+            IntentRevisionWriteStatus::AlreadyCurrent => Self::AlreadyCurrent,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1074,54 +1081,64 @@ impl Runtime {
     ) -> Result<TaskIntentUpdateResponse> {
         let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
         let active = self.tasks.read_snapshot_by_locator(&locator)?;
-        let snapshot = match input.task_boundary {
+        input.intent.validate()?;
+        let (snapshot, revision_status) = match input.task_boundary {
             TaskBoundary::Continue => {
                 let active = active.ok_or_else(|| {
                     invalid("task_boundary=continue requires an existing ActiveTask")
                 })?;
-                require_expected_revision(&active, input.expected_revision_id.as_deref())?;
-                validate_intent_update(input)?;
-                let parent = active
-                    .current_intent_revision()
-                    .ok_or_else(|| invariant("ActiveTask has no Intent Head"))?
-                    .revision_id;
-                self.tasks.append_working_intent_revision(
+                let parent = input
+                    .expected_revision_id
+                    .as_deref()
+                    .ok_or_else(|| {
+                        invalid(
+                            "expected_revision_id must be non-null when continuing an ActiveTask",
+                        )
+                    })?
+                    .parse::<TaskIntentRevisionId>()
+                    .map_err(|error| invalid(format!("invalid expected_revision_id: {error}")))?;
+                let outcome = self.tasks.append_intent_revision(
                     active.task_session_id,
                     parent,
-                    input.intent.to_working_intent()?,
+                    input.intent.clone(),
                 )?;
-                self.tasks
-                    .read_snapshot(active.task_session_id)?
-                    .ok_or_else(|| invariant("updated ActiveTask disappeared"))?
+                (
+                    self.tasks
+                        .read_snapshot(active.task_session_id)?
+                        .ok_or_else(|| invariant("updated ActiveTask disappeared"))?,
+                    outcome.status.into(),
+                )
             }
             TaskBoundary::New => {
                 if let Some(active) = active {
                     require_expected_revision(&active, input.expected_revision_id.as_deref())?;
-                    validate_intent_update(input)?;
-                    self.tasks
-                        .start_new_task_working(
-                            &locator,
-                            active.task_id,
-                            &input.intent.to_working_intent()?,
-                            Vec::new(),
-                        )?
-                        .snapshot
+                    (
+                        self.tasks
+                            .start_new_task(&locator, active.task_id, &input.intent, Vec::new())?
+                            .snapshot,
+                        IntentRevisionStatus::Created,
+                    )
                 } else {
                     if input.expected_revision_id.as_deref().is_some() {
                         return Err(invalid(
                             "expected_revision_id must be null when no ExternalSession exists",
                         ));
                     }
-                    validate_intent_update(input)?;
                     let task_id = TaskId::new();
-                    self.tasks
-                        .open_or_create_working(
-                            locator,
-                            task_id,
-                            input.intent.to_working_intent()?,
-                            Vec::new(),
-                        )?
-                        .snapshot
+                    let outcome = self.tasks.open_or_create(
+                        locator,
+                        task_id,
+                        input.intent.clone(),
+                        Vec::new(),
+                    )?;
+                    (
+                        outcome.snapshot,
+                        if outcome.created {
+                            IntentRevisionStatus::Created
+                        } else {
+                            IntentRevisionStatus::AlreadyCurrent
+                        },
+                    )
                 }
             }
         };
@@ -1136,8 +1153,7 @@ impl Runtime {
         Ok(TaskIntentUpdateResponse {
             active_signals: active_signal_records(&self.tasks, snapshot.task_session_id)?,
             context,
-            maturity: input.maturity,
-            evidence_refs: input.evidence_refs.clone(),
+            revision_status,
         })
     }
 
@@ -1542,7 +1558,7 @@ impl Runtime {
             .intent_revisions
             .iter()
             .find(|revision| revision.revision_id == source_intent_id)
-            .map(|revision| revision.working_intent.bind_task_intent(task.task_id))
+            .map(|revision| revision.working_intent.clone())
             .ok_or_else(|| invariant("Candidate source Intent revision disappeared"))?;
         let signal_history = self
             .tasks
@@ -1561,7 +1577,8 @@ impl Runtime {
         );
         let derived = engine.analyze_candidate(&CandidateAnalysisRequest {
             candidate: persisted.clone(),
-            source_task_intent: source_intent,
+            source_task_id: task.task_id,
+            source_working_intent: source_intent,
             source_task_signals: task.task_signals.clone(),
             explicit_related_contexts: claim.related_contexts.clone(),
             artifact_refs: claim.artifact_refs.clone(),
@@ -2488,71 +2505,6 @@ fn require_expected_revision(
     Ok(actual)
 }
 
-fn validate_intent_update(input: &TaskIntentUpdateInput) -> Result<()> {
-    input.intent.validate()?;
-    if normalize_semantic(&input.intent.goal) == normalize_semantic(&input.intent.desired_change) {
-        return Err(invalid(
-            "intent.goal and intent.desired_change must be semantically distinct",
-        ));
-    }
-    let in_scope = normalized_values(&input.intent.in_scope);
-    let out_of_scope = normalized_values(&input.intent.out_of_scope);
-    if let Some(overlap) = in_scope.intersection(&out_of_scope).next() {
-        return Err(invalid(format!(
-            "intent.in_scope and intent.out_of_scope overlap: {overlap}"
-        )));
-    }
-    let evidence = validate_evidence_refs(&input.evidence_refs)?;
-    if input.maturity == IntentMaturity::Grounded && evidence.is_empty() {
-        return Err(invalid(
-            "maturity=grounded requires at least one evidence_ref",
-        ));
-    }
-    for (field, values) in [
-        ("intent.artifacts", &input.intent.artifacts),
-        ("intent.interfaces", &input.intent.interfaces),
-    ] {
-        for value in values {
-            let normalized = normalize_semantic(value);
-            if !evidence.contains(&normalized) {
-                return Err(invalid(format!(
-                    "{field} item lacks evidence_ref support: {value}"
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_evidence_refs(values: &[String]) -> Result<HashSet<String>> {
-    let mut normalized = HashSet::with_capacity(values.len());
-    for (index, value) in values.iter().enumerate() {
-        let value = normalize_semantic(value);
-        if value.is_empty() {
-            return Err(invalid(format!("evidence_refs[{index}] must not be empty")));
-        }
-        if !normalized.insert(value) {
-            return Err(invalid("evidence_refs must not contain duplicates"));
-        }
-    }
-    Ok(normalized)
-}
-
-fn normalized_values(values: &[String]) -> HashSet<String> {
-    values
-        .iter()
-        .map(|value| normalize_semantic(value))
-        .collect()
-}
-
-fn normalize_semantic(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-}
-
 fn active_signal_records(
     runtime: &TaskRuntime,
     task_session_id: TaskSessionId,
@@ -2960,7 +2912,7 @@ pub fn sync_repository_catalog_at_root(
 ///
 /// # Errors
 ///
-/// Returns an input error when no strict Task Intent update established the Task.
+/// Returns an input error when no Working Intent update established the Task.
 pub fn task_context_readonly_at_root(
     root: impl AsRef<Path>,
     input: &TaskContextReadInput,
@@ -2980,7 +2932,7 @@ pub fn task_artifact_focus_at_root(
     Runtime::open(root.as_ref())?.task_artifact_focus(input)
 }
 
-/// Applies an authoritative Task Intent CAS update and returns its new Context Pack.
+/// Applies a lightweight Working Intent CAS update and returns its Context Pack.
 ///
 /// # Errors
 ///
@@ -3150,7 +3102,8 @@ fn build_task_context_response(
         .current_intent_revision()
         .ok_or_else(|| invariant("Task Session has no current Intent revision"))?;
     let mut request = TaskContextRequest::automatic(
-        current.working_intent.bind_task_intent(snapshot.task_id),
+        snapshot.task_id,
+        current.working_intent.clone(),
         snapshot.task_signals.clone(),
         token_budget,
     );
@@ -3944,7 +3897,7 @@ fn tools_list() -> Value {
     json!({"tools": [
         tool_schema(
             "task_intent_update",
-            "CAS-update a complete Task Intent, optionally start a new explicit Task, and return its TaskContextPack.",
+            "CAS-record a lightweight Working Intent snapshot, optionally start a new explicit Task, and return its TaskContextPack.",
             task_intent_update_schema()
         ),
         tool_schema(
@@ -4228,10 +4181,22 @@ fn artifact_locator_input_schema() -> Value {
 }
 
 fn task_intent_update_schema() -> Value {
+    let intent_list = || {
+        json!({
+            "type": "array",
+            "maxItems": sctx_domain::MAX_WORKING_INTENT_ITEMS_PER_FIELD,
+            "uniqueItems": true,
+            "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": sctx_domain::MAX_WORKING_INTENT_ITEM_BYTES
+            }
+        })
+    };
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["agent_kind", "external_session_id", "task_boundary", "expected_revision_id", "maturity", "intent", "evidence_refs"],
+        "required": ["agent_kind", "external_session_id", "task_boundary", "expected_revision_id", "intent"],
         "properties": {
             "agent_kind": {"type": "string", "minLength": 1},
             "external_session_id": {"type": "string", "minLength": 1},
@@ -4239,26 +4204,24 @@ fn task_intent_update_schema() -> Value {
             "expected_revision_id": {
                 "anyOf": [id_schema("tir_"), {"type": "null"}]
             },
-            "maturity": {"type": "string", "enum": ["provisional", "grounded"]},
             "intent": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["goal", "desired_change", "in_scope", "out_of_scope", "domains", "platforms", "constraints", "acceptance_conditions", "artifacts", "interfaces", "unknowns"],
+                "required": ["goal"],
                 "properties": {
-                    "goal": {"type": "string", "minLength": 1},
-                    "desired_change": {"type": "string", "minLength": 1},
-                    "in_scope": string_array_schema(),
-                    "out_of_scope": string_array_schema(),
-                    "domains": string_array_schema(),
-                    "platforms": string_array_schema(),
-                    "constraints": string_array_schema(),
-                    "acceptance_conditions": string_array_schema(),
-                    "artifacts": string_array_schema(),
-                    "interfaces": string_array_schema(),
-                    "unknowns": string_array_schema()
+                    "goal": {"type": "string", "minLength": 1, "maxLength": sctx_domain::MAX_WORKING_INTENT_TEXT_BYTES},
+                    "current_direction": {"type": "string", "minLength": 1, "maxLength": sctx_domain::MAX_WORKING_INTENT_TEXT_BYTES},
+                    "in_scope": intent_list(),
+                    "out_of_scope": intent_list(),
+                    "domains": intent_list(),
+                    "platforms": intent_list(),
+                    "constraints": intent_list(),
+                    "acceptance_conditions": intent_list(),
+                    "artifact_hints": intent_list(),
+                    "interface_hints": intent_list(),
+                    "open_questions": intent_list()
                 }
-            },
-            "evidence_refs": string_array_schema()
+            }
         }
     })
 }
@@ -4752,25 +4715,6 @@ fn write_frame<W: Write>(
     writer.flush().map_err(transport_io("flush MCP response"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn intent_update_conflict_and_stale_errors_have_intent_specific_codes() {
-        let conflict = ToolFailure::intent_update_failed(Error::new(
-            ErrorKind::Conflict,
-            "divergent initial Working Intent",
-        ));
-        let stale = ToolFailure::intent_update_failed(Error::new(
-            ErrorKind::StaleState,
-            "stale Working Intent parent",
-        ));
-        assert_eq!(conflict.code, "intent_conflict");
-        assert_eq!(stale.code, "intent_stale");
-    }
-}
-
 fn trim_line_ending(line: &mut String) {
     if line.ends_with('\n') {
         line.pop();
@@ -5077,4 +5021,23 @@ where
     value
         .parse()
         .map_err(|error| invalid(format!("invalid {field}: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intent_update_conflict_and_stale_errors_have_intent_specific_codes() {
+        let conflict = ToolFailure::intent_update_failed(Error::new(
+            ErrorKind::Conflict,
+            "divergent initial Working Intent",
+        ));
+        let stale = ToolFailure::intent_update_failed(Error::new(
+            ErrorKind::StaleState,
+            "stale Working Intent parent",
+        ));
+        assert_eq!(conflict.code, "intent_conflict");
+        assert_eq!(stale.code, "intent_stale");
+    }
 }

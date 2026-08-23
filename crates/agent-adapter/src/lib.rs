@@ -337,7 +337,7 @@ pub fn plan_action(
             task_operation: None,
             breadcrumb: None,
             system_message: Some(
-                "Shared Context PromptEnvelope received. No Task Intent was inferred from prompt text. Use $shared-context and task_intent_update before precise retrieval."
+                "Shared Context PromptEnvelope received. No Working Intent was inferred from prompt text. Use $shared-context and task_intent_update to record naturally formed understanding before precise retrieval."
                     .to_owned(),
             ),
         },

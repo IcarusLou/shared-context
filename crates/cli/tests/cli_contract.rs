@@ -12,17 +12,17 @@ use std::{
 use sctx_domain::{
     Applicability, CaptureUnknown, ContextKind, ContextRevisionDraft, Error, ErrorKind, EventId,
     EvidenceSnapshotDraft, ExternalSessionLocator, IntentSnapshot, PublicationAction,
-    PublicationDraft, Result, SpaceId, SubmissionId, TaskId, TaskIntentDraft, TaskIntentRevisionId,
-    TaskSignalKind, WorkEpisodeId,
+    PublicationDraft, Result, SpaceId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSignalKind,
+    WorkEpisodeId, WorkingIntentSnapshot,
 };
 use sctx_engineering_graph::RepositoryRegistry;
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CrashInjector, CrashSeam, GitStore};
 use sctx_local_state::UserConfigStore;
 use sctx_mcp::{
-    ExpectedRevisionId, IntentMaturity, TaskBoundary, TaskCheckpointBoundary,
-    TaskCheckpointClaimInput, TaskCheckpointEvidenceInput, TaskCheckpointInput,
-    TaskIntentUpdateInput, task_checkpoint_at_root, task_intent_update_at_root,
+    ExpectedRevisionId, TaskBoundary, TaskCheckpointBoundary, TaskCheckpointClaimInput,
+    TaskCheckpointEvidenceInput, TaskCheckpointInput, TaskIntentUpdateInput,
+    task_checkpoint_at_root, task_intent_update_at_root,
 };
 use sctx_task_runtime::TaskRuntime;
 use serde_json::Value;
@@ -225,21 +225,19 @@ fn closed_candidate_owner(harness: &Harness, session: &str) -> CandidateOwner {
             external_session_id: session.to_owned(),
             task_boundary: TaskBoundary::New,
             expected_revision_id: ExpectedRevisionId::Null(()),
-            maturity: IntentMaturity::Provisional,
-            intent: TaskIntentDraft {
+            intent: WorkingIntentSnapshot {
                 goal: "create a verified Candidate".to_owned(),
-                desired_change: "record one unassigned Candidate".to_owned(),
+                current_direction: Some("record one unassigned Candidate".to_owned()),
                 in_scope: vec![],
                 out_of_scope: vec![],
                 domains: vec![],
                 platforms: vec![],
                 constraints: vec![],
                 acceptance_conditions: vec![],
-                artifacts: vec![],
-                interfaces: vec![],
-                unknowns: vec![],
+                artifact_hints: vec![],
+                interface_hints: vec![],
+                open_questions: vec![],
             },
-            evidence_refs: vec![],
         },
     )
     .unwrap();
@@ -303,7 +301,7 @@ fn create_candidate(
     ])
 }
 
-fn establish_cli_task(harness: &Harness, session: &str, goal: &str, desired_change: &str) {
+fn establish_cli_task(harness: &Harness, session: &str, goal: &str, current_direction: &str) {
     task_intent_update_at_root(
         harness.root(),
         &TaskIntentUpdateInput {
@@ -311,21 +309,19 @@ fn establish_cli_task(harness: &Harness, session: &str, goal: &str, desired_chan
             external_session_id: session.to_owned(),
             task_boundary: TaskBoundary::New,
             expected_revision_id: ExpectedRevisionId::Null(()),
-            maturity: IntentMaturity::Provisional,
-            intent: TaskIntentDraft {
+            intent: WorkingIntentSnapshot {
                 goal: goal.to_owned(),
-                desired_change: desired_change.to_owned(),
+                current_direction: Some(current_direction.to_owned()),
                 in_scope: vec![],
                 out_of_scope: vec![],
                 domains: vec![],
                 platforms: vec![],
                 constraints: vec![],
                 acceptance_conditions: vec![],
-                artifacts: vec![],
-                interfaces: vec![],
-                unknowns: vec![],
+                artifact_hints: vec![],
+                interface_hints: vec![],
+                open_questions: vec![],
             },
-            evidence_refs: vec![],
         },
     )
     .unwrap();
@@ -643,21 +639,19 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
             },
             expected_revision_id: expected
                 .map_or(ExpectedRevisionId::Null(()), ExpectedRevisionId::Revision),
-            maturity: IntentMaturity::Provisional,
-            intent: TaskIntentDraft {
+            intent: WorkingIntentSnapshot {
                 goal: goal.to_owned(),
-                desired_change: format!("Implement {goal}"),
+                current_direction: Some(format!("Implement {goal}")),
                 in_scope: vec![],
                 out_of_scope: vec![],
                 domains: vec![],
                 platforms: vec![],
                 constraints: vec![],
                 acceptance_conditions: vec![],
-                artifacts: vec![],
-                interfaces: vec![],
-                unknowns: vec![],
+                artifact_hints: vec![],
+                interface_hints: vec![],
+                open_questions: vec![],
             },
-            evidence_refs: vec![],
         };
 
     let before_prompt = hook(&serde_json::json!({
@@ -895,21 +889,19 @@ fn hook_catalog_mapping_never_discovers_sibling_repositories() {
                 external_session_id: session_id.to_owned(),
                 task_boundary: TaskBoundary::New,
                 expected_revision_id: ExpectedRevisionId::Null(()),
-                maturity: IntentMaturity::Provisional,
-                intent: TaskIntentDraft {
+                intent: WorkingIntentSnapshot {
                     goal: "Verify sparse Repository discovery".to_owned(),
-                    desired_change: "Refresh only the explicit Repository".to_owned(),
+                    current_direction: Some("Refresh only the explicit Repository".to_owned()),
                     in_scope: Vec::new(),
                     out_of_scope: Vec::new(),
                     domains: Vec::new(),
                     platforms: Vec::new(),
                     constraints: Vec::new(),
                     acceptance_conditions: Vec::new(),
-                    artifacts: Vec::new(),
-                    interfaces: Vec::new(),
-                    unknowns: Vec::new(),
+                    artifact_hints: Vec::new(),
+                    interface_hints: Vec::new(),
+                    open_questions: Vec::new(),
                 },
-                evidence_refs: Vec::new(),
             },
         )
         .unwrap();
@@ -1043,21 +1035,19 @@ fn cross_parent_workspace_maps_three_catalog_repositories_without_cross_contamin
                 external_session_id: session_id.to_owned(),
                 task_boundary: TaskBoundary::New,
                 expected_revision_id: ExpectedRevisionId::Null(()),
-                maturity: IntentMaturity::Provisional,
-                intent: TaskIntentDraft {
+                intent: WorkingIntentSnapshot {
                     goal: "Resolve one configured Repository file".to_owned(),
-                    desired_change: "Preserve stable local Repository identity".to_owned(),
+                    current_direction: Some("Preserve stable local Repository identity".to_owned()),
                     in_scope: Vec::new(),
                     out_of_scope: Vec::new(),
                     domains: Vec::new(),
                     platforms: Vec::new(),
                     constraints: Vec::new(),
                     acceptance_conditions: Vec::new(),
-                    artifacts: Vec::new(),
-                    interfaces: Vec::new(),
-                    unknowns: Vec::new(),
+                    artifact_hints: Vec::new(),
+                    interface_hints: Vec::new(),
+                    open_questions: Vec::new(),
                 },
-                evidence_refs: Vec::new(),
             },
         )
         .unwrap();
@@ -1498,21 +1488,19 @@ fn twenty_cli_processes_confirm_one_review_in_one_atomic_commit() {
             external_session_id: session.to_owned(),
             task_boundary: TaskBoundary::New,
             expected_revision_id: ExpectedRevisionId::Null(()),
-            maturity: IntentMaturity::Provisional,
-            intent: TaskIntentDraft {
+            intent: WorkingIntentSnapshot {
                 goal: "confirm one CLI Candidate".to_owned(),
-                desired_change: "write one atomic confirmation".to_owned(),
+                current_direction: Some("write one atomic confirmation".to_owned()),
                 in_scope: Vec::new(),
                 out_of_scope: Vec::new(),
                 domains: Vec::new(),
                 platforms: Vec::new(),
                 constraints: Vec::new(),
                 acceptance_conditions: Vec::new(),
-                artifacts: Vec::new(),
-                interfaces: Vec::new(),
-                unknowns: Vec::new(),
+                artifact_hints: Vec::new(),
+                interface_hints: Vec::new(),
+                open_questions: Vec::new(),
             },
-            evidence_refs: Vec::new(),
         },
     )
     .unwrap();
@@ -1639,21 +1627,19 @@ fn task_context_cli_entry_is_locator_only_and_read_only() {
         external_session_id: session.to_owned(),
         task_boundary: TaskBoundary::New,
         expected_revision_id: ExpectedRevisionId::Null(()),
-        maturity: IntentMaturity::Provisional,
-        intent: TaskIntentDraft {
+        intent: WorkingIntentSnapshot {
             goal: "retrieve CLI task context".to_owned(),
-            desired_change: "return published CLI knowledge".to_owned(),
+            current_direction: Some("return published CLI knowledge".to_owned()),
             in_scope: vec![],
             out_of_scope: vec![],
             domains: vec!["cli".to_owned()],
             platforms: vec![],
             constraints: vec![],
             acceptance_conditions: vec![],
-            artifacts: vec![],
-            interfaces: vec![],
-            unknowns: vec![],
+            artifact_hints: vec![],
+            interface_hints: vec![],
+            open_questions: vec![],
         },
-        evidence_refs: vec![],
     };
     task_intent_update_at_root(harness.root(), &establish("cli-session")).unwrap();
     task_intent_update_at_root(harness.root(), &establish("other-cli-session")).unwrap();
@@ -1754,15 +1740,11 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
             "external_session_id": "cli-authoritative",
             "task_boundary": "new",
             "expected_revision_id": null,
-            "maturity": "provisional",
             "intent": {
                 "goal": "authoritative CLI task",
-                "desired_change": "establish authoritative CLI intent",
-                "in_scope": [], "out_of_scope": [], "domains": ["cli"],
-                "platforms": [], "constraints": [], "acceptance_conditions": [],
-                "artifacts": [], "interfaces": [], "unknowns": []
-            },
-            "evidence_refs": []
+                "current_direction": "establish authoritative CLI intent",
+                "domains": ["cli"]
+            }
         }))
         .unwrap(),
     )
@@ -1775,6 +1757,7 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
         update_path.to_str().unwrap(),
     ]);
     assert_eq!(updated["command"], "task.intent.update");
+    assert_eq!(updated["data"]["revision_status"], "created");
     assert!(text(&updated, "task_id").starts_with("tsk_"));
     assert!(text(&updated, "intent_revision_id").starts_with("tir_"));
 

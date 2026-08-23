@@ -1,8 +1,8 @@
 use sctx_domain::{
     Applicability, ConflictParticipant, ContextId, ContextKind, ContextRevisionDraft,
     EvidenceSnapshotDraft, EvidenceType, PublicationAction, PublicationDraft, RevisionId,
-    SemanticConflictDraft, SpaceId, TaskId, TaskIntent, TaskSignal, TaskSignalKind,
-    TaskSpaceAssociation,
+    SemanticConflictDraft, SpaceId, TaskId, TaskSignal, TaskSignalKind, TaskSpaceAssociation,
+    WorkingIntentSnapshot,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
@@ -517,26 +517,25 @@ fn fixture() -> AssociationFixture {
     }
 }
 
-fn task(goal: &str) -> TaskIntent {
-    TaskIntent {
-        task_id: TaskId::new(),
+fn task(goal: &str) -> WorkingIntentSnapshot {
+    WorkingIntentSnapshot {
         goal: goal.to_owned(),
-        desired_change: goal.to_owned(),
+        current_direction: Some(goal.to_owned()),
         in_scope: Vec::new(),
         out_of_scope: Vec::new(),
         domains: Vec::new(),
         platforms: Vec::new(),
         constraints: Vec::new(),
         acceptance_conditions: Vec::new(),
-        artifacts: Vec::new(),
-        interfaces: Vec::new(),
-        unknowns: Vec::new(),
+        artifact_hints: Vec::new(),
+        interface_hints: Vec::new(),
+        open_questions: Vec::new(),
     }
 }
 
-fn feature_task() -> TaskIntent {
+fn feature_task() -> WorkingIntentSnapshot {
     let mut task = task("pageintentneedle");
-    "featureassociationgoal".clone_into(&mut task.desired_change);
+    task.current_direction = Some("featureassociationgoal".to_owned());
     task.domains = vec!["analyticsdomain".to_owned()];
     task.platforms = vec!["fe".to_owned()];
     task.constraints = vec!["legacyclient".to_owned()];
@@ -554,14 +553,15 @@ fn feature_signals() -> Vec<TaskSignal> {
 #[test]
 fn fe_task_associates_requirement_protocol_compatibility_and_analytics_spaces() {
     let fixture = fixture();
+    let task_id = TaskId::new();
     let task = feature_task();
     let signals = feature_signals();
     let response = SearchEngine::new(fixture.index)
-        .task_space_associations(&task, &signals)
+        .task_space_associations(task_id, &task, &signals)
         .unwrap();
 
-    assert_eq!(response.task_id, task.task_id);
-    TaskSpaceAssociation::validate_collection(task.task_id, &response.associations).unwrap();
+    assert_eq!(response.task_id, task_id);
+    TaskSpaceAssociation::validate_collection(task_id, &response.associations).unwrap();
     assert!(!response.indexed_tree_oid.is_empty());
     assert!(response.projection_generation > 0);
     let actual_spaces = response
@@ -640,6 +640,7 @@ fn workspace_and_repository_locations_never_add_space_priors() {
     let unrelated = task("unrelatedtaskneedle");
     let response = SearchEngine::new(fixture.index)
         .task_space_associations(
+            TaskId::new(),
             &unrelated,
             &[
                 TaskSignal {
@@ -662,7 +663,9 @@ fn out_of_scope_only_text_or_code_signal_stays_diagnostic_and_never_associates()
     let engine = SearchEngine::new(fixture.index);
     let excluded_task = task("支付迁移 LegacyRouterBoundary");
 
-    let candidates = engine.space_intent_candidates(&excluded_task, &[]).unwrap();
+    let candidates = engine
+        .space_intent_candidates(TaskId::new(), &excluded_task, &[])
+        .unwrap();
     assert_eq!(candidates.candidates.len(), 1);
     let candidate = &candidates.candidates[0];
     assert_eq!(candidate.space_id, fixture.space_id);
@@ -674,10 +677,13 @@ fn out_of_scope_only_text_or_code_signal_stays_diagnostic_and_never_associates()
     );
     assert!(!candidate.field_matches[0].matched_tokens.is_empty());
 
-    let associations = engine.task_space_associations(&excluded_task, &[]).unwrap();
+    let associations = engine
+        .task_space_associations(TaskId::new(), &excluded_task, &[])
+        .unwrap();
     assert!(associations.associations.is_empty());
     let automatic = engine
         .task_context_pack(&TaskContextRequest::automatic(
+            TaskId::new(),
             excluded_task,
             Vec::new(),
             100_000,
@@ -688,6 +694,7 @@ fn out_of_scope_only_text_or_code_signal_stays_diagnostic_and_never_associates()
 
     let code_signal_only = engine
         .task_space_associations(
+            TaskId::new(),
             &task("unrelated positive query"),
             &[TaskSignal {
                 kind: TaskSignalKind::Diff,
@@ -703,14 +710,16 @@ fn positive_and_out_of_scope_matches_keep_one_penalized_explained_association() 
     let fixture = polarity_fixture();
     let engine = SearchEngine::new(fixture.index);
     let positive_task = task("SearchRankingEngine 搜索排序");
-    let positive = engine.task_space_associations(&positive_task, &[]).unwrap();
+    let positive = engine
+        .task_space_associations(TaskId::new(), &positive_task, &[])
+        .unwrap();
     assert_eq!(positive.associations.len(), 1);
     let positive_score = positive.associations[0].score;
 
     let mut task_declares_exclusion = positive_task;
     task_declares_exclusion.out_of_scope = vec!["支付迁移 LegacyRouterBoundary".to_owned()];
     let declared_exclusion = engine
-        .task_space_associations(&task_declares_exclusion, &[])
+        .task_space_associations(TaskId::new(), &task_declares_exclusion, &[])
         .unwrap();
     assert_eq!(declared_exclusion.associations.len(), 1);
     assert_eq!(
@@ -731,8 +740,9 @@ fn positive_and_out_of_scope_matches_keep_one_penalized_explained_association() 
         kind: TaskSignalKind::Diff,
         content: "LegacyRouterBoundary".to_owned(),
     }];
+    let conflict_task_id = TaskId::new();
     let conflicted = engine
-        .task_space_associations(&conflict_task, &conflict_signals)
+        .task_space_associations(conflict_task_id, &conflict_task, &conflict_signals)
         .unwrap();
     assert_eq!(conflicted.associations.len(), 1);
     let association = &conflicted.associations[0];
@@ -765,6 +775,7 @@ fn positive_and_out_of_scope_matches_keep_one_penalized_explained_association() 
 
     let pack = engine
         .task_context_pack(&TaskContextRequest::automatic(
+            conflict_task_id,
             conflict_task,
             conflict_signals,
             100_000,
@@ -790,7 +801,9 @@ fn intent_conflict_handoff_is_visible_without_blocking_and_disappears_after_merg
     let fixture = intent_handoff_fixture();
     let engine = SearchEngine::new(fixture.index.clone());
     let query = task("handoffsharedneedle");
-    let candidates = engine.space_intent_candidates(&query, &[]).unwrap();
+    let candidates = engine
+        .space_intent_candidates(TaskId::new(), &query, &[])
+        .unwrap();
     assert_eq!(candidates.candidates.len(), 1);
     let candidate = &candidates.candidates[0];
     assert!(candidate.intent_conflicted);
@@ -799,8 +812,9 @@ fn intent_conflict_handoff_is_visible_without_blocking_and_disappears_after_merg
     assert_eq!(candidate.head_revision_ids, expected_heads);
 
     let context_only_query = task("contextonlyhandoffneedle");
+    let context_only_task_id = TaskId::new();
     let associations = engine
-        .task_space_associations(&context_only_query, &[])
+        .task_space_associations(context_only_task_id, &context_only_query, &[])
         .unwrap();
     assert_eq!(associations.associations.len(), 1);
     let warning = associations.associations[0]
@@ -833,6 +847,7 @@ fn intent_conflict_handoff_is_visible_without_blocking_and_disappears_after_merg
 
     let before = engine
         .task_context_pack(&TaskContextRequest::automatic(
+            context_only_task_id,
             context_only_query.clone(),
             Vec::new(),
             100_000,
@@ -874,12 +889,15 @@ fn intent_conflict_handoff_is_visible_without_blocking_and_disappears_after_merg
         )
         .unwrap(),
     );
-    let resolved_candidates = engine.space_intent_candidates(&query, &[]).unwrap();
+    let resolved_candidates = engine
+        .space_intent_candidates(TaskId::new(), &query, &[])
+        .unwrap();
     assert_eq!(resolved_candidates.candidates.len(), 1);
     assert!(!resolved_candidates.candidates[0].intent_conflicted);
     assert_eq!(resolved_candidates.candidates[0].head_revision_ids.len(), 1);
     let resolved = engine
         .task_context_pack(&TaskContextRequest::automatic(
+            TaskId::new(),
             context_only_query,
             Vec::new(),
             100_000,
@@ -907,6 +925,7 @@ fn forty_space_corpus_is_rrf_ranked_top_k_bounded_and_fully_budgeted() {
         content: "SearchV9RareEndpoint".to_owned(),
     }];
     let mut request = TaskContextRequest::automatic(
+        TaskId::new(),
         task("implement rare endpoint SearchV9RareEndpoint ExactResultSchema"),
         signals,
         4_000,
@@ -1029,7 +1048,8 @@ fn forty_space_corpus_is_rrf_ranked_top_k_bounded_and_fully_budgeted() {
     );
     assert!(!bounded.omitted.is_empty());
 
-    let mut generic_request = TaskContextRequest::automatic(task("implement"), Vec::new(), 900);
+    let mut generic_request =
+        TaskContextRequest::automatic(TaskId::new(), task("implement"), Vec::new(), 900);
     generic_request.max_spaces = 4;
     let generic = engine.task_context_pack(&generic_request).unwrap();
     assert!(generic.associations.len() <= generic_request.max_spaces);
@@ -1051,8 +1071,9 @@ fn equal_fused_scores_use_stable_space_id_ties() {
     let fixture = fixture();
     let index = fixture.index.clone();
     let query = task("tieassociationneedle");
+    let task_id = TaskId::new();
     let first = SearchEngine::new(fixture.index)
-        .task_space_associations(&query, &[])
+        .task_space_associations(task_id, &query, &[])
         .unwrap();
     assert_eq!(first.associations.len(), 2);
     let mut expected = fixture.tied_spaces.to_vec();
@@ -1072,7 +1093,7 @@ fn equal_fused_scores_use_stable_space_id_ties() {
 
     index.rebuild().unwrap();
     let rebuilt = SearchEngine::new(index)
-        .task_space_associations(&query, &[])
+        .task_space_associations(task_id, &query, &[])
         .unwrap();
     assert_eq!(rebuilt.associations, first.associations);
 }
@@ -1081,7 +1102,7 @@ fn equal_fused_scores_use_stable_space_id_ties() {
 fn unsafe_context_states_cannot_supply_association_or_injection_evidence() {
     let fixture = fixture();
     let response = SearchEngine::new(fixture.index)
-        .task_space_associations(&task("unsafeassociationneedle"), &[])
+        .task_space_associations(TaskId::new(), &task("unsafeassociationneedle"), &[])
         .unwrap();
     assert!(
         response.associations.is_empty(),
@@ -1095,6 +1116,7 @@ fn task_context_pack_supports_zero_one_and_many_spaces_with_explicit_m2_paths() 
     let engine = SearchEngine::new(fixture.index.clone());
     let zero = engine
         .task_context_pack(&TaskContextRequest::automatic(
+            TaskId::new(),
             task("unrelatedpackneedle"),
             Vec::new(),
             100_000,
@@ -1105,6 +1127,7 @@ fn task_context_pack_supports_zero_one_and_many_spaces_with_explicit_m2_paths() 
 
     let one = engine
         .task_context_pack(&TaskContextRequest::automatic(
+            TaskId::new(),
             task("pageintentneedle"),
             Vec::new(),
             100_000,
@@ -1119,6 +1142,7 @@ fn task_context_pack_supports_zero_one_and_many_spaces_with_explicit_m2_paths() 
 
     let many = engine
         .task_context_pack(&TaskContextRequest::automatic(
+            TaskId::new(),
             feature_task(),
             feature_signals(),
             100_000,
@@ -1192,7 +1216,9 @@ fn task_context_order_budget_and_fingerprint_are_stable() {
     let index = fixture.index.clone();
     let task = feature_task();
     let signals = feature_signals();
-    let full_request = TaskContextRequest::automatic(task.clone(), signals.clone(), 100_000);
+    let task_id = TaskId::new();
+    let full_request =
+        TaskContextRequest::automatic(task_id, task.clone(), signals.clone(), 100_000);
     let full = SearchEngine::new(fixture.index)
         .task_context_pack(&full_request)
         .unwrap();
@@ -1211,7 +1237,8 @@ fn task_context_order_budget_and_fingerprint_are_stable() {
         .collect::<Vec<_>>();
     assert!(item_ranks.windows(2).all(|pair| pair[0] <= pair[1]));
 
-    let limited_request = TaskContextRequest::automatic(task.clone(), signals.clone(), 512);
+    let limited_request =
+        TaskContextRequest::automatic(task_id, task.clone(), signals.clone(), 512);
     let limited_first = SearchEngine::new(index.clone())
         .task_context_pack(&limited_request)
         .unwrap();
@@ -1234,6 +1261,7 @@ fn task_context_order_budget_and_fingerprint_are_stable() {
     });
     let reordered_pack = SearchEngine::new(index.clone())
         .task_context_pack(&TaskContextRequest::automatic(
+            task_id,
             task.clone(),
             reordered,
             100_000,
@@ -1257,9 +1285,11 @@ fn task_context_order_budget_and_fingerprint_are_stable() {
 #[test]
 fn automatic_task_pack_excludes_every_unsafe_state_while_explicit_expands_conflicts() {
     let fixture = fixture();
+    let task_id = TaskId::new();
     let task = task("unsafepackintentneedle");
     let automatic = SearchEngine::new(fixture.index.clone())
         .task_context_pack(&TaskContextRequest::automatic(
+            task_id,
             task.clone(),
             Vec::new(),
             100_000,
@@ -1277,7 +1307,8 @@ fn automatic_task_pack_excludes_every_unsafe_state_while_explicit_expands_confli
 
     let explicit = SearchEngine::new(fixture.index)
         .task_context_pack(&TaskContextRequest {
-            task_intent: task,
+            task_id,
+            working_intent: task,
             task_signals: Vec::new(),
             resolved_focus: None,
             token_budget: 100_000,

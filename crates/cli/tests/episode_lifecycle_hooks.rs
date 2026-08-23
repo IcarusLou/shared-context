@@ -9,8 +9,8 @@ use std::{
 };
 
 use sctx_domain::{
-    Applicability, EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, TaskId, TaskIntent,
-    WorkEpisodeStatus,
+    Applicability, EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, TaskId,
+    WorkEpisodeStatus, WorkingIntentSnapshot,
 };
 use sctx_git_store::GitStore;
 use sctx_index::ProjectionIndex;
@@ -74,20 +74,19 @@ impl Harness {
     }
 }
 
-fn intent(task_id: TaskId, session: &str) -> TaskIntent {
-    TaskIntent {
-        task_id,
+fn intent(session: &str) -> WorkingIntentSnapshot {
+    WorkingIntentSnapshot {
         goal: format!("solidify {session} engineering conclusions"),
-        desired_change: "close only explicitly checkpointed cognition".to_owned(),
+        current_direction: Some("close only explicitly checkpointed cognition".to_owned()),
         in_scope: vec!["Agent lifecycle automation".to_owned()],
         out_of_scope: Vec::new(),
         domains: vec!["capture".to_owned()],
         platforms: Vec::new(),
         constraints: Vec::new(),
         acceptance_conditions: vec!["one closed Episode produces one Candidate".to_owned()],
-        artifacts: Vec::new(),
-        interfaces: Vec::new(),
-        unknowns: Vec::new(),
+        artifact_hints: Vec::new(),
+        interface_hints: Vec::new(),
+        open_questions: Vec::new(),
     }
 }
 
@@ -125,7 +124,7 @@ fn open_checkpoint(
 ) -> (ExternalSessionLocator, sctx_domain::WorkEpisodeId) {
     let locator = ExternalSessionLocator::new(agent, session).unwrap();
     let snapshot = runtime
-        .open_or_create(locator.clone(), intent(TaskId::new(), session), Vec::new())
+        .open_or_create(locator.clone(), TaskId::new(), intent(session), Vec::new())
         .unwrap()
         .snapshot;
     let outcome = runtime
@@ -301,7 +300,7 @@ fn out_of_order_stop_requires_checkpoint_and_session_end_never_closes_or_builds(
     let session = "out-of-order";
     let locator = ExternalSessionLocator::new("codex", session).unwrap();
     let snapshot = runtime
-        .open_or_create(locator, intent(TaskId::new(), session), Vec::new())
+        .open_or_create(locator, TaskId::new(), intent(session), Vec::new())
         .unwrap()
         .snapshot;
     let stop = harness.hook(

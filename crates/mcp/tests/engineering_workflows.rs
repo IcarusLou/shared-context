@@ -12,7 +12,7 @@ use sctx_domain::{
     Applicability, ArtifactKind, ArtifactLocator, ContextId, ContextKind, ContextRevisionDraft,
     EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot, PublicationAction,
     PublicationDraft, ReferenceRelation, RepoRelativePath, ReviewDraft, ReviewVerdict, RevisionId,
-    TaskId, TaskIntent, TaskIntentDraft, TaskSignal, TaskSignalKind,
+    TaskId, TaskSignal, TaskSignalKind, WorkingIntentSnapshot,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
@@ -20,10 +20,10 @@ use sctx_local_state::UserConfigStore;
 use sctx_mcp::{
     ArtifactFocusQuery, ArtifactFocusQueryCoordinates, AssociationExplainInput,
     AssociationRebuildInput, ClientKind, DisconnectReason, EngineeringReferenceRecordInput,
-    ExpectedRevisionId, IntentMaturity, McpServer, RepositoryScanInput, TaskBoundary,
-    TaskContextReadInput, TaskIntentUpdateInput, association_explain_at_root,
-    association_rebuild_at_root, engineering_reference_record_at_root, repository_scan_at_root,
-    task_artifact_focus_at_root, task_context_readonly_at_root, task_intent_update_at_root,
+    ExpectedRevisionId, McpServer, RepositoryScanInput, TaskBoundary, TaskContextReadInput,
+    TaskIntentUpdateInput, association_explain_at_root, association_rebuild_at_root,
+    engineering_reference_record_at_root, repository_scan_at_root, task_artifact_focus_at_root,
+    task_context_readonly_at_root, task_intent_update_at_root,
 };
 use sctx_search::TaskRetrievalPath;
 use sctx_task_runtime::TaskRuntime;
@@ -86,21 +86,10 @@ fn task_update_arguments(session: &str) -> Value {
         "external_session_id": session,
         "task_boundary": "new",
         "expected_revision_id": null,
-        "maturity": "provisional",
         "intent": {
             "goal": "zxqvortex",
-            "desired_change": "zyqnebula",
-            "in_scope": [],
-            "out_of_scope": [],
-            "domains": [],
-            "platforms": [],
-            "constraints": [],
-            "acceptance_conditions": [],
-            "artifacts": [],
-            "interfaces": [],
-            "unknowns": []
-        },
-        "evidence_refs": []
+            "current_direction": "zyqnebula"
+        }
     })
 }
 
@@ -338,20 +327,19 @@ fn reference_relation(kind: ArtifactKind) -> ReferenceRelation {
     }
 }
 
-fn task_intent(task_id: TaskId, goal: &str) -> TaskIntent {
-    TaskIntent {
-        task_id,
+fn task_intent(_task_id: TaskId, goal: &str) -> WorkingIntentSnapshot {
+    WorkingIntentSnapshot {
         goal: goal.to_owned(),
-        desired_change: format!("Use the verified {goal} implementation"),
+        current_direction: Some(format!("Use the verified {goal} implementation")),
         in_scope: vec![goal.to_owned()],
         out_of_scope: Vec::new(),
         domains: Vec::new(),
         platforms: Vec::new(),
         constraints: Vec::new(),
         acceptance_conditions: vec!["Graph Context is retrieved".to_owned()],
-        artifacts: Vec::new(),
-        interfaces: Vec::new(),
-        unknowns: Vec::new(),
+        artifact_hints: Vec::new(),
+        interface_hints: Vec::new(),
+        open_questions: Vec::new(),
     }
 }
 
@@ -481,21 +469,19 @@ fn scan_record_rebuild_explain_and_task_pack_cross_two_repositories_and_a_worktr
             external_session_id: "graph-session".to_owned(),
             task_boundary: TaskBoundary::New,
             expected_revision_id: ExpectedRevisionId::Null(()),
-            maturity: IntentMaturity::Provisional,
-            intent: TaskIntentDraft {
+            intent: WorkingIntentSnapshot {
                 goal: "Use alpha graph context".to_owned(),
-                desired_change: "Retrieve the verified alpha implementation".to_owned(),
+                current_direction: Some("Retrieve the verified alpha implementation".to_owned()),
                 in_scope: Vec::new(),
                 out_of_scope: Vec::new(),
                 domains: Vec::new(),
                 platforms: Vec::new(),
                 constraints: Vec::new(),
                 acceptance_conditions: Vec::new(),
-                artifacts: Vec::new(),
-                interfaces: Vec::new(),
-                unknowns: Vec::new(),
+                artifact_hints: Vec::new(),
+                interface_hints: Vec::new(),
+                open_questions: Vec::new(),
             },
-            evidence_refs: Vec::new(),
         },
     )
     .unwrap();
@@ -1268,6 +1254,7 @@ fn ambiguous_and_unavailable_explanations_never_choose_and_graph_failure_degrade
         .unwrap()
         .open_or_create(
             ExternalSessionLocator::new("codex", "degraded-graph").unwrap(),
+            task_id,
             task_intent(task_id, "ambiguous graph task"),
             vec![TaskSignal {
                 kind: TaskSignalKind::Diff,

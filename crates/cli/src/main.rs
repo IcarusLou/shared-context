@@ -2006,10 +2006,10 @@ fn run_task(args: &[String], json_output: bool) -> Result<()> {
             let options = Options::parse(rest, &[])?;
             options.allow_only(&["--input"], &[])?;
             let input: TaskIntentUpdateInput =
-                read_json(options.required("--input")?, "Task Intent update")?;
+                read_json(options.required("--input")?, "Working Intent update")?;
             let response = sctx_mcp::task_intent_update_at_root(installation_root()?, &input)?;
             let data = serde_json::to_value(&response)
-                .map_err(json_error("serialize Task Intent update response"))?;
+                .map_err(json_error("serialize Working Intent update response"))?;
             emit_raw(
                 "task.intent.update",
                 &response.context.tree,

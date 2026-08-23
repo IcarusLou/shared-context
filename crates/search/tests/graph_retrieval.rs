@@ -6,7 +6,7 @@ use sctx_domain::{
     EngineeringReference, EngineeringReferenceDraft, EvidenceSnapshotDraft, EvidenceType,
     PublicationAction, PublicationDraft, ReferenceId, ReferenceRelation, RepoRelativePath,
     RepositoryId, RepositoryIdentity, ResolvedFocus, RevisionId, SemanticConflictDraft, SpaceId,
-    SubmissionId, TaskId, TaskIntent, TaskSessionId, WorkEpisodeId, WorkEpisodeRef,
+    SubmissionId, TaskId, TaskSessionId, WorkEpisodeId, WorkEpisodeRef, WorkingIntentSnapshot,
 };
 use sctx_engineering_graph::{
     ArtifactObservation, ArtifactSourceState, EngineeringProjectionStore,
@@ -447,19 +447,19 @@ fn task_request(
 ) -> TaskContextRequest {
     let task_id = TaskId::new();
     TaskContextRequest {
-        task_intent: TaskIntent {
-            task_id,
+        task_id,
+        working_intent: WorkingIntentSnapshot {
             goal: "implement generic workflow".to_owned(),
-            desired_change: "preserve deterministic workflow behavior".to_owned(),
+            current_direction: Some("preserve deterministic workflow behavior".to_owned()),
             in_scope: Vec::new(),
             out_of_scope: Vec::new(),
             domains: Vec::new(),
             platforms: vec!["fe".to_owned()],
             constraints: Vec::new(),
             acceptance_conditions: Vec::new(),
-            artifacts: Vec::new(),
-            interfaces: Vec::new(),
-            unknowns: Vec::new(),
+            artifact_hints: Vec::new(),
+            interface_hints: Vec::new(),
+            open_questions: Vec::new(),
         },
         task_signals: Vec::new(),
         resolved_focus: Some(resolved_focus(
@@ -584,9 +584,9 @@ fn exact_graph_priority_reaches_cross_end_contexts_in_two_cycle_safe_hops() {
     assert_eq!(different_focus_pack.task_fingerprint, pack.task_fingerprint);
 
     let mut wrong_repository = different_focus;
-    wrong_repository.task_intent.goal = "zxunreachablefocus".to_owned();
-    wrong_repository.task_intent.desired_change = "zxunreachablegraph".to_owned();
-    wrong_repository.task_intent.platforms.clear();
+    wrong_repository.working_intent.goal = "zxunreachablefocus".to_owned();
+    wrong_repository.working_intent.current_direction = Some("zxunreachablegraph".to_owned());
+    wrong_repository.working_intent.platforms.clear();
     let filtered = engine.task_context_pack(&wrong_repository).unwrap();
     assert!(filtered.associations.is_empty());
     assert!(filtered.items.is_empty());
@@ -688,9 +688,10 @@ fn identical_locator_in_two_repositories_retrieves_only_focused_repository_conte
         ContextPackMode::AutomaticInjection,
         12_000,
     );
-    request.task_intent.goal = "opaque repository-scoped graph focus".to_owned();
-    request.task_intent.desired_change = "retrieve only exact focused repository".to_owned();
-    request.task_intent.platforms.clear();
+    request.working_intent.goal = "opaque repository-scoped graph focus".to_owned();
+    request.working_intent.current_direction =
+        Some("retrieve only exact focused repository".to_owned());
+    request.working_intent.platforms.clear();
     let pack = engine.task_context_pack(&request).unwrap();
     let direct = pack
         .items
@@ -774,9 +775,9 @@ fn generic_test_outcome_never_matches_qualified_test_artifact() {
         kind: sctx_domain::TaskSignalKind::TestOutcome,
         content: locator.canonical_key(),
     }];
-    request.task_intent.goal = "zxtestoutcomeonly".to_owned();
-    request.task_intent.desired_change = "zxnonlocatingoutcome".to_owned();
-    request.task_intent.platforms.clear();
+    request.working_intent.goal = "zxtestoutcomeonly".to_owned();
+    request.working_intent.current_direction = Some("zxnonlocatingoutcome".to_owned());
+    request.working_intent.platforms.clear();
     let pack = engine.task_context_pack(&request).unwrap();
     assert!(pack.associations.is_empty());
     assert!(pack.items.is_empty());
@@ -882,9 +883,9 @@ fn context_tree_mismatch_preserves_historical_graph_while_unavailable_artifacts_
         ContextPackMode::Explicit,
         8_000,
     );
-    diagnostic_request.task_intent.goal = "frontend source behavior".to_owned();
-    diagnostic_request.task_intent.desired_change =
-        "inspect offline repository evidence".to_owned();
+    diagnostic_request.working_intent.goal = "frontend source behavior".to_owned();
+    diagnostic_request.working_intent.current_direction =
+        Some("inspect offline repository evidence".to_owned());
     let diagnostic = engine.task_context_pack(&diagnostic_request).unwrap();
     assert!(diagnostic.graph_diagnostics.iter().any(|diagnostic| {
         diagnostic.kind == TaskGraphDiagnosticKind::ArtifactNotReachableInGraph
@@ -967,9 +968,9 @@ fn historical_graph_revision_survives_append_new_revision_withdraw_and_index_reb
         ContextPackMode::AutomaticInjection,
         20_000,
     );
-    collision_request.task_intent.goal = "newcurrentneedle".to_owned();
-    collision_request.task_intent.desired_change =
-        "compare current text with frozen implementation".to_owned();
+    collision_request.working_intent.goal = "newcurrentneedle".to_owned();
+    collision_request.working_intent.current_direction =
+        Some("compare current text with frozen implementation".to_owned());
     let collision = engine.task_context_pack(&collision_request).unwrap();
     assert_eq!(
         collision.graph_context_tree_oid.as_deref(),
@@ -1322,8 +1323,9 @@ fn build_time_candidate_incomplete_and_conflicted_contexts_never_cross_automatic
             ContextPackMode::AutomaticInjection,
             8_000,
         );
-        automatic.task_intent.goal = "opaque unsafe graph lookup".to_owned();
-        automatic.task_intent.desired_change = "inspect without text fallback".to_owned();
+        automatic.working_intent.goal = "opaque unsafe graph lookup".to_owned();
+        automatic.working_intent.current_direction =
+            Some("inspect without text fallback".to_owned());
         automatic.resolved_focus.as_mut().unwrap().locator = symbol_locator(symbol);
         let automatic_pack = engine.task_context_pack(&automatic).unwrap();
         assert!(
@@ -1394,8 +1396,8 @@ fn ambiguous_edges_are_explicit_diagnostics_only_and_never_raise_automatic_eligi
         ContextPackMode::Explicit,
         12_000,
     );
-    request.task_intent.goal = "frontend source behavior".to_owned();
-    request.task_intent.desired_change = "inspect frontend source decision".to_owned();
+    request.working_intent.goal = "frontend source behavior".to_owned();
+    request.working_intent.current_direction = Some("inspect frontend source decision".to_owned());
     let explicit = engine.task_context_pack(&request).unwrap();
     assert!(explicit.graph_diagnostics.is_empty());
     let source = explicit

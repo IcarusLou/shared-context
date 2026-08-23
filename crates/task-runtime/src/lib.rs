@@ -20,10 +20,10 @@ use sctx_domain::{
     CheckpointClaimId, ConfirmationId, ContextId, ContextRevisionRef, Error, ErrorKind, EventId,
     EvidenceSnapshotDraft, ExternalSessionId, ExternalSessionLocator, ExternalSessionSnapshot,
     IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation, Result, SignalId,
-    SubmissionId, TaskId, TaskIntent, TaskIntentDraft, TaskIntentRevision, TaskIntentRevisionId,
-    TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle,
-    TaskSignalRecord, WorkEpisode, WorkEpisodeId, WorkEpisodeRef, WorkEpisodeStatus,
-    WorkObservation, WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
+    SubmissionId, TaskId, TaskIntentRevision, TaskIntentRevisionId, TaskSessionId,
+    TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord,
+    WorkEpisode, WorkEpisodeId, WorkEpisodeRef, WorkEpisodeStatus, WorkObservation,
+    WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
 };
 
 const SCHEMA_VERSION: i64 = 11;
@@ -477,7 +477,7 @@ impl TaskRuntime {
     /// # Errors
     ///
     /// Returns typed validation or storage errors.
-    pub fn open_or_create_working(
+    pub fn open_or_create(
         &self,
         locator: ExternalSessionLocator,
         task_id: TaskId,
@@ -533,30 +533,13 @@ impl TaskRuntime {
         })
     }
 
-    /// Mechanical pre-#167 adapter into Working Intent authority.
-    ///
-    /// # Errors
-    ///
-    /// Returns Working Intent validation or Runtime storage errors.
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn open_or_create(
-        &self,
-        locator: ExternalSessionLocator,
-        initial_intent: TaskIntent,
-        signals: Vec<TaskSignal>,
-    ) -> Result<OpenSessionOutcome> {
-        let task_id = initial_intent.task_id;
-        let working = TaskIntentDraft::from(&initial_intent).to_working_intent()?;
-        self.open_or_create_working(locator, task_id, working, signals)
-    }
-
     /// Explicitly creates and activates a new runtime-owned Task.
     ///
     /// # Errors
     ///
     /// Returns an input error for a missing Session, stale `ActiveTask` CAS guard,
     /// or invalid Task content and Signals.
-    pub fn start_new_task_working(
+    pub fn start_new_task(
         &self,
         locator: &ExternalSessionLocator,
         expected_active_task_id: TaskId,
@@ -602,26 +585,6 @@ impl TaskRuntime {
             previous_task_id: expected_active_task_id,
             snapshot: persisted,
         })
-    }
-
-    /// Mechanical pre-#167 adapter into a new Task with Working Intent authority.
-    ///
-    /// # Errors
-    ///
-    /// Returns Working Intent validation, CAS, or Runtime storage errors.
-    pub fn start_new_task(
-        &self,
-        locator: &ExternalSessionLocator,
-        expected_active_task_id: TaskId,
-        initial_intent: &TaskIntentDraft,
-        signals: Vec<TaskSignal>,
-    ) -> Result<StartNewTaskOutcome> {
-        self.start_new_task_working(
-            locator,
-            expected_active_task_id,
-            &initial_intent.to_working_intent()?,
-            signals,
-        )
     }
 
     /// Explicitly switches to a retained historical Task using an `ActiveTask` CAS guard.
@@ -674,7 +637,7 @@ impl TaskRuntime {
     /// # Errors
     ///
     /// Returns an input error for inactive/cross-Task/stale-parent data.
-    pub fn append_working_intent_revision(
+    pub fn append_intent_revision(
         &self,
         task_session_id: TaskSessionId,
         parent_revision_id: TaskIntentRevisionId,
@@ -741,31 +704,6 @@ impl TaskRuntime {
             revision,
             status: IntentRevisionWriteStatus::Created,
         })
-    }
-
-    /// Mechanical pre-#167 adapter for legacy Task-bound Intent input.
-    ///
-    /// # Errors
-    ///
-    /// Returns ownership, Working Intent validation, CAS, or storage errors.
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn append_intent_revision(
-        &self,
-        task_session_id: TaskSessionId,
-        parent_revision_id: TaskIntentRevisionId,
-        intent: TaskIntent,
-    ) -> Result<AppendIntentRevisionOutcome> {
-        let snapshot = self
-            .read_snapshot(task_session_id)?
-            .ok_or_else(|| invalid("Task Session does not exist"))?;
-        if intent.task_id != snapshot.task_id {
-            return Err(invalid("Task Intent belongs to another Task"));
-        }
-        self.append_working_intent_revision(
-            task_session_id,
-            parent_revision_id,
-            TaskIntentDraft::from(&intent).to_working_intent()?,
-        )
     }
 
     /// Merges normalized Signals only into the current `ActiveTask`.
@@ -4535,8 +4473,13 @@ fn reject_invalid_parent(
         if owner_session != task_session_id || owner_task != task_id {
             return Err(invalid("Intent parent belongs to another Task Session"));
         }
+        return Err(stale(
+            "Intent parent is no longer the ActiveTask current Head",
+        ));
     }
-    Err(invalid("Intent parent must be the ActiveTask current Head"))
+    Err(stale(
+        "Intent parent is stale: unknown or no longer retained",
+    ))
 }
 
 fn next_task_ordinal(

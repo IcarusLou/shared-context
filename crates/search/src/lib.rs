@@ -9,8 +9,8 @@ use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value as 
 use sctx_domain::{
     Applicability, ArtifactAssociationKind, ArtifactKey, ArtifactKind, ContextId, ContextKind,
     ContextRelationKind, EvidenceId, EvidenceType, ReferenceId, RepositoryId, ResolutionStatus,
-    ResolvedFocus, RevisionId, SpaceId, TaskId, TaskIntent, TaskSignal, TaskSignalKind,
-    TaskSpaceAssociation,
+    ResolvedFocus, RevisionId, SpaceId, TaskId, TaskSignal, TaskSignalKind, TaskSpaceAssociation,
+    WorkingIntentSnapshot,
 };
 use sctx_engineering_graph::{
     EngineeringProjection, EngineeringProjectionSnapshot, EngineeringProjectionStore,
@@ -254,7 +254,8 @@ pub struct TaskSpaceAssociationsResponse {
 /// Task-first Context retrieval request. No Space identifier is required or accepted.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TaskContextRequest {
-    pub task_intent: TaskIntent,
+    pub task_id: TaskId,
+    pub working_intent: WorkingIntentSnapshot,
     pub task_signals: Vec<TaskSignal>,
     pub resolved_focus: Option<ResolvedFocus>,
     pub token_budget: usize,
@@ -266,12 +267,14 @@ pub struct TaskContextRequest {
 impl TaskContextRequest {
     #[must_use]
     pub fn automatic(
-        task_intent: TaskIntent,
+        task_id: TaskId,
+        working_intent: WorkingIntentSnapshot,
         task_signals: Vec<TaskSignal>,
         token_budget: usize,
     ) -> Self {
         Self {
-            task_intent,
+            task_id,
+            working_intent,
             task_signals,
             resolved_focus: None,
             token_budget,
@@ -283,12 +286,13 @@ impl TaskContextRequest {
 
     #[must_use]
     pub fn for_resolved_focus(
-        task_intent: TaskIntent,
+        task_id: TaskId,
+        working_intent: WorkingIntentSnapshot,
         task_signals: Vec<TaskSignal>,
         resolved_focus: ResolvedFocus,
         token_budget: usize,
     ) -> Self {
-        let mut request = Self::automatic(task_intent, task_signals, token_budget);
+        let mut request = Self::automatic(task_id, working_intent, task_signals, token_budget);
         request.resolved_focus = Some(resolved_focus);
         request
     }
@@ -626,17 +630,18 @@ impl SearchEngine {
         }
     }
 
-    /// Finds zero or more current Space Intent candidates from a Task Intent and its observed
+    /// Finds zero or more current Space Intent candidates from a Working Intent and its observed
     /// signals. Every current head is searched independently; conflicts are returned rather than
     /// resolved by ranking.
     ///
     /// # Errors
     ///
-    /// Returns an input error for an invalid Task Intent or signal collection, and storage errors
+    /// Returns an input error for an invalid Working Intent or signal collection, and storage errors
     /// propagated by index synchronization and snapshot reads.
     pub fn space_intent_candidates(
         &self,
-        intent: &TaskIntent,
+        task_id: TaskId,
+        intent: &WorkingIntentSnapshot,
         signals: &[TaskSignal],
     ) -> Result<SpaceIntentCandidatesResponse> {
         intent.validate()?;
@@ -649,7 +654,7 @@ impl SearchEngine {
         Ok(SpaceIntentCandidatesResponse {
             indexed_tree_oid: snapshot.metadata.indexed_tree_oid,
             projection_generation: snapshot.metadata.projection_generation,
-            task_id: intent.task_id,
+            task_id,
             candidates: snapshot.data,
         })
     }
@@ -663,14 +668,15 @@ impl SearchEngine {
     ///
     /// # Errors
     ///
-    /// Returns an input error for an invalid Task Intent or signal collection, and storage errors
+    /// Returns an input error for an invalid Working Intent or signal collection, and storage errors
     /// propagated by index synchronization and snapshot reads.
     pub fn task_space_associations(
         &self,
-        intent: &TaskIntent,
+        task_id: TaskId,
+        intent: &WorkingIntentSnapshot,
         signals: &[TaskSignal],
     ) -> Result<TaskSpaceAssociationsResponse> {
-        self.task_space_associations_with_resolved_focus(intent, signals, None)
+        self.task_space_associations_with_resolved_focus(task_id, intent, signals, None)
     }
 
     /// Infers associations with at most one request-local Resolved Focus as an
@@ -681,7 +687,8 @@ impl SearchEngine {
     /// Returns an input error for an invalid request-local Resolved Focus.
     pub fn task_space_associations_with_resolved_focus(
         &self,
-        intent: &TaskIntent,
+        task_id: TaskId,
+        intent: &WorkingIntentSnapshot,
         signals: &[TaskSignal],
         resolved_focus: Option<&ResolvedFocus>,
     ) -> Result<TaskSpaceAssociationsResponse> {
@@ -699,7 +706,7 @@ impl SearchEngine {
                 let graph = graph_projection(graph_snapshot.as_ref());
                 infer_task_space_associations(
                     connection,
-                    intent.task_id,
+                    task_id,
                     &query_tokens,
                     &query_phrases,
                     &scope_targets,
@@ -718,7 +725,7 @@ impl SearchEngine {
             return Ok(TaskSpaceAssociationsResponse {
                 indexed_tree_oid: snapshot.metadata.indexed_tree_oid,
                 projection_generation: snapshot.metadata.projection_generation,
-                task_id: intent.task_id,
+                task_id,
                 associations: snapshot.data.associations,
             });
         }
@@ -738,17 +745,18 @@ impl SearchEngine {
     /// storage errors propagated by index synchronization and snapshot reads.
     pub fn task_context_pack(&self, request: &TaskContextRequest) -> Result<TaskContextPack> {
         validate_task_context_request(request)?;
-        let fingerprint = task_fingerprint(&request.task_intent, &request.task_signals)?;
-        let query_tokens = association_query_tokens(&request.task_intent, &request.task_signals);
-        let query_phrases = task_query_phrases(&request.task_intent, &request.task_signals, false);
-        let scope_targets = ScopeTargets::from_intent(&request.task_intent);
+        let fingerprint = task_fingerprint(&request.working_intent, &request.task_signals)?;
+        let query_tokens = association_query_tokens(&request.working_intent, &request.task_signals);
+        let query_phrases =
+            task_query_phrases(&request.working_intent, &request.task_signals, false);
+        let scope_targets = ScopeTargets::from_intent(&request.working_intent);
         for _attempt in 0..3 {
             let graph_snapshot = self.read_graph_snapshot();
             let snapshot = self.index.query_snapshot(|connection| {
                 let graph = graph_projection(graph_snapshot.as_ref());
                 let mut inference = infer_task_space_associations(
                     connection,
-                    request.task_intent.task_id,
+                    request.task_id,
                     &query_tokens,
                     &query_phrases,
                     &scope_targets,
@@ -799,7 +807,7 @@ impl SearchEngine {
                 graph_context_tree_oid: graph_snapshot
                     .as_ref()
                     .and_then(|snapshot| snapshot.context_tree_oid.clone()),
-                task_id: request.task_intent.task_id,
+                task_id: request.task_id,
                 task_fingerprint: fingerprint,
                 token_budget: request.token_budget,
                 estimated_tokens: snapshot.data.estimated_tokens,
@@ -916,7 +924,7 @@ struct StoredIntentFtsMatch {
     fields: [String; 7],
 }
 
-fn task_query_tokens(intent: &TaskIntent, signals: &[TaskSignal]) -> Vec<String> {
+fn task_query_tokens(intent: &WorkingIntentSnapshot, signals: &[TaskSignal]) -> Vec<String> {
     let list_text = [
         &intent.in_scope,
         &intent.out_of_scope,
@@ -924,9 +932,9 @@ fn task_query_tokens(intent: &TaskIntent, signals: &[TaskSignal]) -> Vec<String>
         &intent.platforms,
         &intent.constraints,
         &intent.acceptance_conditions,
-        &intent.artifacts,
-        &intent.interfaces,
-        &intent.unknowns,
+        &intent.artifact_hints,
+        &intent.interface_hints,
+        &intent.open_questions,
     ]
     .into_iter()
     .flat_map(|values| values.iter().map(String::as_str));
@@ -934,8 +942,8 @@ fn task_query_tokens(intent: &TaskIntent, signals: &[TaskSignal]) -> Vec<String>
         .iter()
         .filter(|signal| matches!(signal.kind, TaskSignalKind::Prompt | TaskSignalKind::Diff))
         .map(|signal| signal.content.as_str());
-    [intent.goal.as_str(), intent.desired_change.as_str()]
-        .into_iter()
+    std::iter::once(intent.goal.as_str())
+        .chain(intent.current_direction.as_deref())
         .chain(list_text)
         .chain(signal_text)
         .flat_map(search_tokens)
@@ -944,16 +952,16 @@ fn task_query_tokens(intent: &TaskIntent, signals: &[TaskSignal]) -> Vec<String>
         .collect()
 }
 
-fn association_query_tokens(intent: &TaskIntent, signals: &[TaskSignal]) -> Vec<String> {
+fn association_query_tokens(intent: &WorkingIntentSnapshot, signals: &[TaskSignal]) -> Vec<String> {
     let list_text = [
         &intent.in_scope,
         &intent.domains,
         &intent.platforms,
         &intent.constraints,
         &intent.acceptance_conditions,
-        &intent.artifacts,
-        &intent.interfaces,
-        &intent.unknowns,
+        &intent.artifact_hints,
+        &intent.interface_hints,
+        &intent.open_questions,
     ]
     .into_iter()
     .flat_map(|values| values.iter().map(String::as_str));
@@ -961,8 +969,8 @@ fn association_query_tokens(intent: &TaskIntent, signals: &[TaskSignal]) -> Vec<
         .iter()
         .filter(|signal| matches!(signal.kind, TaskSignalKind::Prompt | TaskSignalKind::Diff))
         .map(|signal| signal.content.as_str());
-    [intent.goal.as_str(), intent.desired_change.as_str()]
-        .into_iter()
+    std::iter::once(intent.goal.as_str())
+        .chain(intent.current_direction.as_deref())
         .chain(list_text)
         .chain(signal_text)
         .flat_map(search_tokens)
@@ -972,20 +980,21 @@ fn association_query_tokens(intent: &TaskIntent, signals: &[TaskSignal]) -> Vec<
 }
 
 fn task_query_phrases(
-    intent: &TaskIntent,
+    intent: &WorkingIntentSnapshot,
     signals: &[TaskSignal],
     include_out_of_scope: bool,
 ) -> Vec<String> {
-    let mut texts = vec![intent.goal.as_str(), intent.desired_change.as_str()];
+    let mut texts = vec![intent.goal.as_str()];
+    texts.extend(intent.current_direction.as_deref());
     for values in [
         &intent.in_scope,
         &intent.domains,
         &intent.platforms,
         &intent.constraints,
         &intent.acceptance_conditions,
-        &intent.artifacts,
-        &intent.interfaces,
-        &intent.unknowns,
+        &intent.artifact_hints,
+        &intent.interface_hints,
+        &intent.open_questions,
     ] {
         texts.extend(values.iter().map(String::as_str));
     }
@@ -1205,7 +1214,7 @@ struct ScopeTargets {
 }
 
 impl ScopeTargets {
-    fn from_intent(intent: &TaskIntent) -> Self {
+    fn from_intent(intent: &WorkingIntentSnapshot) -> Self {
         Self {
             domains: normalized_values(&intent.domains),
             platforms: normalized_values(&intent.platforms),
@@ -2627,7 +2636,7 @@ fn artifact_focus_diagnostics(
 }
 
 fn validate_task_context_request(request: &TaskContextRequest) -> Result<()> {
-    request.task_intent.validate()?;
+    request.working_intent.validate()?;
     TaskSignal::validate_collection(&request.task_signals)?;
     if let Some(focus) = &request.resolved_focus {
         focus.validate()?;
@@ -2650,7 +2659,7 @@ fn validate_task_context_request(request: &TaskContextRequest) -> Result<()> {
     Ok(())
 }
 
-fn task_fingerprint(intent: &TaskIntent, signals: &[TaskSignal]) -> Result<String> {
+fn task_fingerprint(intent: &WorkingIntentSnapshot, signals: &[TaskSignal]) -> Result<String> {
     let mut intent = intent.clone();
     for values in [
         &mut intent.in_scope,
@@ -2659,9 +2668,9 @@ fn task_fingerprint(intent: &TaskIntent, signals: &[TaskSignal]) -> Result<Strin
         &mut intent.platforms,
         &mut intent.constraints,
         &mut intent.acceptance_conditions,
-        &mut intent.artifacts,
-        &mut intent.interfaces,
-        &mut intent.unknowns,
+        &mut intent.artifact_hints,
+        &mut intent.interface_hints,
+        &mut intent.open_questions,
     ] {
         values.sort();
     }

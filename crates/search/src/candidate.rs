@@ -6,7 +6,7 @@ use sctx_domain::{
     CandidateConfidence, CandidateRelationAssessment, CandidateSpaceRecommendation,
     CandidateSpaceRecommendationPath, ContextCandidate, ContextRevision, ContextRevisionDraft,
     ContextRevisionRef, EvidenceSnapshotDraft, IntentSnapshot, RecommendedSpaceRole,
-    RevisionLifecycle, SpaceId, TaskIntent, TaskSignal, TaskSpaceAssociation,
+    RevisionLifecycle, SpaceId, TaskId, TaskSignal, TaskSpaceAssociation, WorkingIntentSnapshot,
 };
 use sctx_engineering_graph::EngineeringProjectionSnapshot;
 use sctx_index::{DomainSnapshot, normalize_search_text, search_tokens};
@@ -26,7 +26,8 @@ const RRF_K: u64 = 60;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateAnalysisRequest {
     pub candidate: ContextCandidate,
-    pub source_task_intent: TaskIntent,
+    pub source_task_id: TaskId,
+    pub source_working_intent: WorkingIntentSnapshot,
     pub source_task_signals: Vec<TaskSignal>,
     pub explicit_related_contexts: Vec<ContextRevisionRef>,
     pub artifact_refs: Vec<ArtifactRef>,
@@ -75,7 +76,7 @@ impl SearchEngine {
     ) -> Result<CandidateAnalysisResult> {
         validate_request(request)?;
         request.candidate.content.validate()?;
-        request.source_task_intent.validate()?;
+        request.source_working_intent.validate()?;
         TaskSignal::validate_collection(&request.source_task_signals)?;
         let snapshot = self.index.domain_snapshot()?;
         let graph = self
@@ -102,13 +103,14 @@ impl SearchEngine {
             page_size: request.top_k.saturating_mul(4).clamp(1, 128),
             cursor: None,
         })?;
-        let source_spaces = self
-            .task_space_associations(&request.source_task_intent, &request.source_task_signals)?;
-        let candidate_intent = candidate_task_intent(
-            request.source_task_intent.task_id,
-            &request.candidate.content,
-        );
-        let candidate_spaces = self.task_space_associations(&candidate_intent, &[])?;
+        let source_spaces = self.task_space_associations(
+            request.source_task_id,
+            &request.source_working_intent,
+            &request.source_task_signals,
+        )?;
+        let candidate_intent = candidate_working_intent(&request.candidate.content);
+        let candidate_spaces =
+            self.task_space_associations(request.source_task_id, &candidate_intent, &[])?;
         for (tree, generation) in [
             (&bm25.indexed_tree_oid, bm25.projection_generation),
             (
@@ -854,14 +856,10 @@ fn candidate_query(candidate: &ContextRevisionDraft) -> String {
         .unwrap_or_else(|| candidate.statement.clone())
 }
 
-fn candidate_task_intent(
-    task_id: sctx_domain::TaskId,
-    candidate: &ContextRevisionDraft,
-) -> TaskIntent {
-    TaskIntent {
-        task_id,
+fn candidate_working_intent(candidate: &ContextRevisionDraft) -> WorkingIntentSnapshot {
+    WorkingIntentSnapshot {
         goal: candidate.statement.clone(),
-        desired_change: candidate.rationale.clone(),
+        current_direction: Some(candidate.rationale.clone()),
         in_scope: candidate.applicability.conditions.clone(),
         out_of_scope: Vec::new(),
         domains: candidate.applicability.domains.clone(),
@@ -872,9 +870,9 @@ fn candidate_task_intent(
             .iter()
             .map(|evidence| evidence.supports.clone())
             .collect(),
-        artifacts: Vec::new(),
-        interfaces: Vec::new(),
-        unknowns: Vec::new(),
+        artifact_hints: Vec::new(),
+        interface_hints: Vec::new(),
+        open_questions: Vec::new(),
     }
 }
 

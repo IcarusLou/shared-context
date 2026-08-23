@@ -7,7 +7,7 @@ use std::{
 
 use sctx_domain::{
     ExternalSessionLocator, NormalizedBreadcrumbKind, NormalizedWorkObservation, TaskId,
-    TaskIntent, WorkSourceRef,
+    WorkSourceRef, WorkingIntentSnapshot,
 };
 use sctx_git_store::GitStore;
 use sctx_local_state::{
@@ -77,20 +77,19 @@ fn git_repo(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap()
 }
 
-fn task(task_id: TaskId) -> TaskIntent {
-    TaskIntent {
-        task_id,
+fn task() -> WorkingIntentSnapshot {
+    WorkingIntentSnapshot {
         goal: "Persist a verifiable Work Episode".to_owned(),
-        desired_change: "Ingest redacted Capture meaning".to_owned(),
+        current_direction: Some("Ingest redacted Capture meaning".to_owned()),
         in_scope: Vec::new(),
         out_of_scope: Vec::new(),
         domains: Vec::new(),
         platforms: Vec::new(),
         constraints: Vec::new(),
         acceptance_conditions: Vec::new(),
-        artifacts: Vec::new(),
-        interfaces: Vec::new(),
-        unknowns: Vec::new(),
+        artifact_hints: Vec::new(),
+        interface_hints: Vec::new(),
+        open_questions: Vec::new(),
     }
 }
 
@@ -169,7 +168,7 @@ fn hook_capture_keeps_locator_then_explicit_claim_and_ingestion_are_verifiable()
     let locator = ExternalSessionLocator::new("codex", "capture-owned").unwrap();
     let runtime = TaskRuntime::initialize(harness.root()).unwrap();
     let active = runtime
-        .open_or_create(locator.clone(), task(TaskId::new()), Vec::new())
+        .open_or_create(locator.clone(), TaskId::new(), task(), Vec::new())
         .unwrap()
         .snapshot;
     let raw = "RAW_COMMAND_AND_OUTPUT_MUST_NOT_PERSIST";

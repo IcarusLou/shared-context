@@ -64,9 +64,8 @@ pub use reducer::{
     SemanticConflictProjection, SemanticConflictStatus, reduce,
 };
 pub use task::{
-    ExternalSessionLocator, ExternalSessionSnapshot, TaskIntent, TaskIntentDraft,
-    TaskIntentRevision, TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle,
-    TaskSignalRecord, TaskSpaceAssociation,
+    ExternalSessionLocator, ExternalSessionSnapshot, TaskIntentRevision, TaskSessionSnapshot,
+    TaskSignal, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord, TaskSpaceAssociation,
 };
 pub use working_intent::{
     MAX_WORKING_INTENT_ITEM_BYTES, MAX_WORKING_INTENT_ITEMS_PER_FIELD,

@@ -1,24 +1,26 @@
 ---
 name: shared-context
-description: Maintain Shared Context Task Intent, record Agent Checkpoints, review and explicitly confirm or discard automatic Candidate drafts, query historical Context around an Artifact, manage signal lifecycle, and record verified engineering references during substantive work. Use when starting implementation, debugging, review, or design; when goals, scope, constraints, Artifacts, Interfaces, Unknowns, or important conclusions materially change; when a closed Episode yields Candidate Reviews; when the user explicitly decides to retain or discard a reviewed Candidate; when history around a File, Module, Symbol/Class, API, Schema, or Test is needed; when verified evidence connects existing Context to code; when the user switches tasks; when signals become irrelevant; before context compaction; and before a turn stops.
+description: Record lightweight Working Intent, persist evidenced Agent Checkpoints, review and explicitly confirm or discard automatic Candidate drafts, query historical Context around an Artifact, manage signal lifecycle, and record verified engineering references during substantive work. Use when starting implementation, debugging, review, or design; when the naturally understood goal, direction, scope, constraints, acceptance conditions, retrieval hints, or open questions materially change; when a closed Episode yields Candidate Reviews; when the user explicitly decides to retain or discard a reviewed Candidate; when history around a File, Module, Symbol/Class, API, Schema, or Test is needed; when verified evidence connects existing Context to code; when the user switches tasks; when signals become irrelevant; before context compaction; and before a turn stops.
 ---
 
 # Shared Context
 
-## Keep Task Intent current
+## Keep Working Intent current
 
 Call `task_intent_update`:
 
 - at the start of a substantive engineering task;
-- after a material goal, desired change, scope, constraint, or acceptance change;
-- after discovering a relevant Artifact, Interface, or Unknown;
+- after a material goal, current direction, scope, constraint, or acceptance change;
+- after naturally identifying a useful Artifact/Interface retrieval hint or open question;
 - immediately before PreCompact.
 
-Submit a complete Intent snapshot every time. Include all fields: `goal`, `desired_change`, `in_scope`, `out_of_scope`, `domains`, `platforms`, `constraints`, `acceptance_conditions`, `artifacts`, `interfaces`, and `unknowns`. Use empty arrays when a field is unknown. Put unconfirmed facts in `unknowns`; do not present them as confirmed scope, Artifacts, or Interfaces.
+Submit `goal` and only the optional snapshot fields already known from normal work: `current_direction`, `in_scope`, `out_of_scope`, `domains`, `platforms`, `constraints`, `acceptance_conditions`, `artifact_hints`, `interface_hints`, and `open_questions`. Omit absent fields. Do not manufacture questions, Evidence, investigation plans, or Space structure to satisfy Shared Context.
+
+Treat `artifact_hints` and `interface_hints` only as retrieval clues. They do not prove that code or a contract exists, do not require Intent Evidence, and never create Engineering Graph Evidence or automatic-injection eligibility. `open_questions` contains only questions already noticed during the task; an empty or omitted list is normal.
 
 Always send the last returned `intent_revision_id` as `expected_revision_id` for `continue` or for `new` within an existing external session. Use `null` only for the first `new` Task when no external session exists. On a stale-revision error, read the current response/state, reconcile it, and retry; never guess a Revision ID.
 
-Set `maturity` to `provisional` while important claims remain unconfirmed and to `grounded` only with non-empty `evidence_refs`. Every declared Artifact or Interface must be backed by an exact `evidence_ref`; Prompt, Diff, Workspace, TestOutcome, and a transient Artifact Focus query do not qualify. Use the returned Context Pack as read-only task context and retain its `task_id`, `intent_revision_id`, and `active_signals` for later CAS updates.
+Use `revision_status=created` to retain the new `intent_revision_id`; `already_current` means canonical semantics already match and the returned Revision ID remains current. Use the returned Context Pack as read-only task context and retain its `task_id`, `intent_revision_id`, and `active_signals` for later CAS updates. If Working Intent recording is unavailable, continue the engineering task and retry the side-channel later.
 
 ## Choose the Task boundary
 
@@ -26,11 +28,11 @@ Set `task_boundary` deliberately:
 
 - Use `continue` for the same engineering objective, including refinements, fixes, tests, added constraints, changed scope, and newly discovered Artifacts or Interfaces.
 - Use `new` only when the user clearly switches to an unrelated objective or deliverable. A shared Workspace, repository, file, or prior signal does not make two tasks the same.
-- If the boundary is ambiguous, preserve continuity with `continue` and record the uncertainty in `unknowns`.
+- If the boundary is ambiguous, preserve continuity with `continue`; record an `open_question` only if the Agent already formed one.
 
 ## Record engineering understanding
 
-Call `task_checkpoint` after forming an important engineering conclusion, immediately before PreCompact, and immediately before TurnStop. The working Agent must author the complete Claims and Unknowns; never turn Hook trigger, status, summary text, transcript metadata, or last-message text into a Claim.
+Call `task_checkpoint` after forming an important engineering conclusion, immediately before PreCompact, and immediately before TurnStop. The working Agent must author only Claims and Unknowns already formed through normal work; never turn Hook trigger, status, summary text, transcript metadata, or last-message text into a Claim.
 
 Send the current external Session locator, returned `task_id`, current `intent_revision_id`, and exact Episode version. Use version `0` for the first Checkpoint; after each successful response use its `episode_version`. Retry a timeout with the same parent version and byte-equivalent semantic content. Reconcile `checkpoint_stale`; do not overwrite `checkpoint_conflict`.
 
@@ -38,7 +40,7 @@ For every Claim include `statement`, `rationale`, complete `applicability`, `ass
 
 Use boundary `continue` while the Episode remains active; it never runs the Candidate Builder. With verified lifecycle Hooks, also use `continue` for the Checkpoint immediately preceding PreCompact or TurnStop: the Hook may close only that already-persisted current-Intent Checkpoint and then invoke the same Builder. If the Checkpoint is absent or belongs to an older Intent, the Hook leaves the Episode open and requests a corrected Checkpoint; it never invents one. Repeated or concurrent lifecycle events reuse the same closed Episode and Candidate identities. SessionEnd performs retention cleanup only and never closes an Episode or builds a Candidate.
 
-When Hooks are missing or unverified, use boundary `close` with the complete final Claims/Unknowns through MCP or CLI. If a `continue` Checkpoint already succeeded but the following Hook failed or its completion is uncertain, call `task_checkpoint` again with boundary `close`, the returned current Episode version, and empty `claims`/`unknowns`; this CAS-guarded form closes the existing Checkpoint without inventing another. These are the authoritative fallbacks and do not depend on Adapter output. Closing deterministically builds one unassigned Candidate draft per sufficiently evidenced Claim across the Episode and returns Claim-scoped Candidate summaries with non-authoritative relationship assessments and Space recommendations. Treat `potential_contradiction` and `unresolved_related` as review hypotheses, never as established facts. A missing kind hint conservatively becomes Discovery; a missing topic remains an explicit non-blocking Unknown. Claims with unresolved or insufficient Evidence produce `needs_evidence` and no Git write. An Unknown-only Checkpoint is valid and produces no Candidate.
+When Hooks are missing or unverified, use boundary `close` with the final Claims and Unknowns already formed through normal work. If a `continue` Checkpoint already succeeded but the following Hook failed or its completion is uncertain, call `task_checkpoint` again with boundary `close`, the returned current Episode version, and empty `claims`/`unknowns`; this CAS-guarded form closes the existing Checkpoint without inventing another. These are the authoritative fallbacks and do not depend on Adapter output. Closing deterministically builds one unassigned Candidate draft per sufficiently evidenced Claim across the Episode and returns Claim-scoped Candidate summaries with non-authoritative relationship assessments and Space recommendations. Treat `potential_contradiction` and `unresolved_related` as review hypotheses, never as established facts. A missing kind hint conservatively becomes Discovery; a missing topic remains an explicit non-blocking Unknown. Claims with unresolved or insufficient Evidence produce `needs_evidence` and no Git write. An Unknown-only Checkpoint is valid and produces no Candidate.
 
 Retry a timed-out close with the same Checkpoint semantic content and parent Episode version; the returned Build, Submission, Candidate, and Event identities remain stable. If the Checkpoint succeeded but its Builder response was lost, use the internal CLI `candidate build-closed-episode --episode-id <ID>` recovery path. Built Candidates have no Space, remain unconfirmed, and are never automatically injected, confirmed, or published by this workflow.
 

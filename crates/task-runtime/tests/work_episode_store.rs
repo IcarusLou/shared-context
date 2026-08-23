@@ -12,8 +12,8 @@ use sctx_domain::{
     CandidateReviewStatus, CaptureEvidenceRef, CaptureId, CaptureUnknown, ConfirmationId,
     ContextCandidate, ContextId, ContextKind, ContextRevisionDraft, ErrorKind, EventId,
     EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, NormalizedBreadcrumbKind,
-    NormalizedWorkObservation, TaskId, TaskIntent, TaskIntentDraft, TaskSignal, TaskSignalKind,
-    TestOutcomeStatus, WorkEpisodeStatus, WorkSourceRef,
+    NormalizedWorkObservation, TaskId, TaskSignal, TaskSignalKind, TestOutcomeStatus,
+    WorkEpisodeStatus, WorkSourceRef, WorkingIntentSnapshot,
 };
 use sctx_task_runtime::{
     AgentCheckpointWrite, AutomatedEpisodeBoundary, CandidateBuildItemPreparation,
@@ -24,20 +24,19 @@ use sctx_task_runtime::{
 };
 use tempfile::TempDir;
 
-fn intent(task_id: TaskId, goal: &str) -> TaskIntent {
-    TaskIntent {
-        task_id,
+fn intent(goal: &str) -> WorkingIntentSnapshot {
+    WorkingIntentSnapshot {
         goal: goal.to_owned(),
-        desired_change: format!("implement {goal}"),
+        current_direction: Some(format!("implement {goal}")),
         in_scope: Vec::new(),
         out_of_scope: Vec::new(),
         domains: Vec::new(),
         platforms: Vec::new(),
         constraints: Vec::new(),
         acceptance_conditions: Vec::new(),
-        artifacts: Vec::new(),
-        interfaces: Vec::new(),
-        unknowns: Vec::new(),
+        artifact_hints: Vec::new(),
+        interface_hints: Vec::new(),
+        open_questions: Vec::new(),
     }
 }
 
@@ -51,7 +50,8 @@ fn open_task(
     let snapshot = runtime
         .open_or_create(
             locator.clone(),
-            intent(task_id, goal),
+            task_id,
+            intent(goal),
             vec![TaskSignal {
                 kind: TaskSignalKind::Workspace,
                 content: "/workspace/shared".to_owned(),
@@ -66,22 +66,6 @@ fn breadcrumb(summary: &str) -> NormalizedWorkObservation {
     NormalizedWorkObservation::Breadcrumb {
         category: NormalizedBreadcrumbKind::Exploration,
         summary: summary.to_owned(),
-    }
-}
-
-fn draft(goal: &str) -> TaskIntentDraft {
-    TaskIntentDraft {
-        goal: goal.to_owned(),
-        desired_change: format!("implement {goal}"),
-        in_scope: Vec::new(),
-        out_of_scope: Vec::new(),
-        domains: Vec::new(),
-        platforms: Vec::new(),
-        constraints: Vec::new(),
-        acceptance_conditions: Vec::new(),
-        artifacts: Vec::new(),
-        interfaces: Vec::new(),
-        unknowns: Vec::new(),
     }
 }
 
@@ -326,7 +310,7 @@ fn checkpoint_is_atomic_semantically_idempotent_and_closes_without_hook_observat
     );
 
     runtime
-        .start_new_task(&locator, task.task_id, &draft("switched task"), Vec::new())
+        .start_new_task(&locator, task.task_id, &intent("switched task"), Vec::new())
         .unwrap();
     assert_eq!(
         runtime.write_agent_checkpoint(&close).unwrap_err().kind(),
@@ -480,10 +464,7 @@ fn lifecycle_boundary_requires_current_checkpoint_and_concurrent_retries_close_o
         .append_intent_revision(
             stale_task.task_session_id,
             stale_task.current_intent_revision().unwrap().revision_id,
-            intent(
-                stale_task.task_id,
-                "the revised Intent requires a new Checkpoint",
-            ),
+            intent("the revised Intent requires a new Checkpoint"),
         )
         .unwrap();
     let required = runtime
@@ -1083,7 +1064,7 @@ fn intent_and_signal_refs_advance_only_through_explicit_episode_api() {
 
     let current = initial.current_intent_revision().unwrap().revision_id;
     let same = runtime
-        .append_working_intent_revision(
+        .append_intent_revision(
             initial.task_session_id,
             current,
             initial
@@ -1106,11 +1087,7 @@ fn intent_and_signal_refs_advance_only_through_explicit_episode_api() {
         vec![current]
     );
     let revision = runtime
-        .append_intent_revision(
-            initial.task_session_id,
-            current,
-            intent(initial.task_id, "revised"),
-        )
+        .append_intent_revision(initial.task_session_id, current, intent("revised"))
         .unwrap();
     let merge = runtime
         .merge_signals(
@@ -1188,7 +1165,7 @@ fn intent_and_signal_refs_advance_only_through_explicit_episode_api() {
         .start_new_task(
             &locator,
             initial.task_id,
-            &draft("replacement task"),
+            &intent("replacement task"),
             Vec::new(),
         )
         .unwrap();

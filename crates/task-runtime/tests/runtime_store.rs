@@ -6,26 +6,25 @@ use std::{
 
 use rusqlite::Connection;
 use sctx_domain::{
-    ErrorKind, ExternalSessionLocator, TaskId, TaskIntent, TaskIntentDraft, TaskSignal,
-    TaskSignalKind, TaskSignalLifecycle, WorkingIntentSnapshot,
+    ErrorKind, ExternalSessionLocator, TaskId, TaskSignal, TaskSignalKind, TaskSignalLifecycle,
+    WorkingIntentSnapshot,
 };
 use sctx_task_runtime::{IntentRevisionWriteStatus, TaskRuntime};
 use tempfile::TempDir;
 
-fn intent(task_id: TaskId, goal: &str) -> TaskIntent {
-    TaskIntent {
-        task_id,
+fn intent(_task_id: TaskId, goal: &str) -> WorkingIntentSnapshot {
+    WorkingIntentSnapshot {
         goal: goal.to_owned(),
-        desired_change: format!("Deliver {goal}"),
+        current_direction: Some(format!("Deliver {goal}")),
         in_scope: vec![goal.to_owned()],
         out_of_scope: vec![],
         domains: vec!["task-runtime".to_owned()],
         platforms: vec![],
         constraints: vec!["No Space route".to_owned()],
         acceptance_conditions: vec![format!("{goal} is isolated")],
-        artifacts: vec![],
-        interfaces: vec![],
-        unknowns: vec![],
+        artifact_hints: vec![],
+        interface_hints: vec![],
+        open_questions: vec![],
     }
 }
 
@@ -40,12 +39,12 @@ fn signal(kind: TaskSignalKind, content: &str) -> TaskSignal {
     }
 }
 
-fn intent_draft(goal: &str) -> TaskIntentDraft {
-    TaskIntentDraft::from(&intent(TaskId::new(), goal))
+fn intent_draft(goal: &str) -> WorkingIntentSnapshot {
+    intent(TaskId::new(), goal)
 }
 
 fn working(goal: &str) -> WorkingIntentSnapshot {
-    intent_draft(goal).to_working_intent().unwrap()
+    intent_draft(goal)
 }
 
 #[test]
@@ -74,12 +73,18 @@ fn open_or_create_is_atomic_and_keeps_one_initial_revision() {
     let created = runtime
         .open_or_create(
             locator("session-a"),
+            task_id,
             initial_intent.clone(),
             initial_signals.clone(),
         )
         .unwrap();
     let reopened = runtime
-        .open_or_create(locator("session-a"), initial_intent, initial_signals)
+        .open_or_create(
+            locator("session-a"),
+            task_id,
+            initial_intent,
+            initial_signals,
+        )
         .unwrap();
 
     assert!(created.created);
@@ -108,6 +113,7 @@ fn twenty_concurrent_identical_initial_requests_return_one_task_and_revision() {
             runtime
                 .open_or_create(
                     locator("shared-session"),
+                    TaskId::new(),
                     intent(TaskId::new(), "shared task"),
                     vec![],
                 )
@@ -145,7 +151,7 @@ fn concurrent_divergent_initial_requests_choose_one_and_reject_every_other_witho
             thread::spawn(move || {
                 barrier.wait();
                 let goal = format!("divergent authoritative goal {index}");
-                let result = runtime.open_or_create_working(
+                let result = runtime.open_or_create(
                     locator("divergent-session"),
                     TaskId::new(),
                     working(&goal),
@@ -191,7 +197,7 @@ fn sequential_existing_locator_with_different_initial_intent_is_rejected_without
     let root = TempDir::new().unwrap();
     let runtime = TaskRuntime::initialize(root.path()).unwrap();
     let created = runtime
-        .open_or_create_working(
+        .open_or_create(
             locator("sequential-divergent"),
             TaskId::new(),
             working("first authoritative text"),
@@ -199,7 +205,7 @@ fn sequential_existing_locator_with_different_initial_intent_is_rejected_without
         )
         .unwrap();
     let error = runtime
-        .open_or_create_working(
+        .open_or_create(
             locator("sequential-divergent"),
             TaskId::new(),
             working("different authoritative text"),
@@ -219,12 +225,13 @@ fn sequential_existing_locator_with_different_initial_intent_is_rejected_without
 }
 
 #[test]
-fn intent_append_advances_one_linear_head_and_rejects_cross_task_parents() {
+fn intent_append_advances_one_linear_head_and_rejects_cross_session_parents() {
     let root = TempDir::new().unwrap();
     let runtime = TaskRuntime::initialize(root.path()).unwrap();
     let first = runtime
         .open_or_create(
             locator("session-a"),
+            TaskId::new(),
             intent(TaskId::new(), "first task"),
             vec![],
         )
@@ -233,6 +240,7 @@ fn intent_append_advances_one_linear_head_and_rejects_cross_task_parents() {
     let second = runtime
         .open_or_create(
             locator("session-b"),
+            TaskId::new(),
             intent(TaskId::new(), "second task"),
             vec![],
         )
@@ -266,7 +274,7 @@ fn intent_append_advances_one_linear_head_and_rejects_cross_task_parents() {
             intent(first.task_id, "stale update"),
         )
         .unwrap_err();
-    assert_eq!(stale.kind(), ErrorKind::InvalidInput);
+    assert_eq!(stale.kind(), ErrorKind::StaleState);
     assert!(stale.message().contains("current Head"));
 
     let cross_parent = runtime
@@ -278,16 +286,6 @@ fn intent_append_advances_one_linear_head_and_rejects_cross_task_parents() {
         .unwrap_err();
     assert_eq!(cross_parent.kind(), ErrorKind::InvalidInput);
     assert!(cross_parent.message().contains("another Task Session"));
-
-    let mixed_task = runtime
-        .append_intent_revision(
-            first.task_session_id,
-            revision.revision.revision_id,
-            intent(second.task_id, "mixed task"),
-        )
-        .unwrap_err();
-    assert_eq!(mixed_task.kind(), ErrorKind::InvalidInput);
-    assert!(mixed_task.message().contains("another Task"));
 }
 
 #[test]
@@ -310,7 +308,7 @@ fn working_intent_continue_is_semantically_idempotent_and_stale_changes_write_no
         open_questions: Vec::new(),
     };
     let session = runtime
-        .open_or_create_working(
+        .open_or_create(
             locator("working-idempotent"),
             task_id,
             initial_working.clone(),
@@ -355,7 +353,7 @@ fn working_intent_continue_is_semantically_idempotent_and_stale_changes_write_no
     equivalent.current_direction = Some("use THE existing api".to_owned());
     equivalent.in_scope.reverse();
     let already = runtime
-        .append_working_intent_revision(session.task_session_id, parent, equivalent)
+        .append_intent_revision(session.task_session_id, parent, equivalent)
         .unwrap();
     assert_eq!(already.status, IntentRevisionWriteStatus::AlreadyCurrent);
     assert_eq!(already.revision.revision_id, parent);
@@ -372,23 +370,22 @@ fn working_intent_continue_is_semantically_idempotent_and_stale_changes_write_no
     let mut changed = initial_working.clone();
     changed.current_direction = Some("Adopt the v2 API".to_owned());
     let created = runtime
-        .append_working_intent_revision(session.task_session_id, parent, changed.clone())
+        .append_intent_revision(session.task_session_id, parent, changed.clone())
         .unwrap();
     assert_eq!(created.status, IntentRevisionWriteStatus::Created);
     assert_ne!(created.revision.revision_id, parent);
     let retry = runtime
-        .append_working_intent_revision(session.task_session_id, parent, changed)
+        .append_intent_revision(session.task_session_id, parent, changed)
         .unwrap();
     assert_eq!(retry.status, IntentRevisionWriteStatus::AlreadyCurrent);
     assert_eq!(retry.revision.revision_id, created.revision.revision_id);
 
     let mut stale_change = initial_working.clone();
     stale_change.current_direction = Some("Choose a third implementation".to_owned());
-    assert!(
-        runtime
-            .append_working_intent_revision(session.task_session_id, parent, stale_change)
-            .is_err()
-    );
+    let stale = runtime
+        .append_intent_revision(session.task_session_id, parent, stale_change)
+        .unwrap_err();
+    assert_eq!(stale.kind(), ErrorKind::StaleState);
     let persisted = runtime
         .read_snapshot(session.task_session_id)
         .unwrap()
@@ -410,7 +407,7 @@ fn twenty_concurrent_identical_working_intent_continues_converge_to_one_revision
     let runtime = Arc::new(TaskRuntime::initialize(root.path()).unwrap());
     let task_id = TaskId::new();
     let session = runtime
-        .open_or_create_working(
+        .open_or_create(
             locator("working-concurrent"),
             task_id,
             working("initial Working Intent"),
@@ -429,7 +426,7 @@ fn twenty_concurrent_identical_working_intent_continues_converge_to_one_revision
             thread::spawn(move || {
                 barrier.wait();
                 runtime
-                    .append_working_intent_revision(session.task_session_id, parent, next)
+                    .append_intent_revision(session.task_session_id, parent, next)
                     .unwrap()
             })
         })
@@ -470,6 +467,7 @@ fn signals_are_normalized_and_merged_without_duplicates() {
     let session = runtime
         .open_or_create(
             locator("session-a"),
+            TaskId::new(),
             intent(TaskId::new(), "normalize signals"),
             vec![signal(TaskSignalKind::Diff, "  src/search.tsx  ")],
         )
@@ -520,6 +518,7 @@ fn locator_merge_updates_only_an_existing_session_and_never_creates_one() {
     let session = runtime
         .open_or_create(
             locator("session-a"),
+            TaskId::new(),
             intent(TaskId::new(), "locator merge"),
             vec![signal(TaskSignalKind::Prompt, "locator merge")],
         )
@@ -565,6 +564,7 @@ fn same_workspace_signal_does_not_join_external_sessions() {
     let first = runtime
         .open_or_create(
             locator("session-a"),
+            TaskId::new(),
             intent(TaskId::new(), "frontend task"),
             vec![workspace.clone()],
         )
@@ -573,6 +573,7 @@ fn same_workspace_signal_does_not_join_external_sessions() {
     let second = runtime
         .open_or_create(
             locator("session-b"),
+            TaskId::new(),
             intent(TaskId::new(), "backend task"),
             vec![workspace],
         )
@@ -635,6 +636,7 @@ fn concurrent_same_session_updates_preserve_signals_and_one_intent_head() {
     let session = runtime
         .open_or_create(
             locator("session-a"),
+            TaskId::new(),
             intent(TaskId::new(), "concurrent task"),
             vec![],
         )
@@ -676,7 +678,7 @@ fn concurrent_same_session_updates_preserve_signals_and_one_intent_head() {
         match outcome {
             Ok(_) => intent_successes += 1,
             Err(error) => {
-                assert_eq!(error.kind(), ErrorKind::InvalidInput);
+                assert_eq!(error.kind(), ErrorKind::StaleState);
                 assert!(error.message().contains("current Head"));
             }
         }
@@ -700,6 +702,7 @@ fn explicit_new_task_boundary_keeps_history_and_excludes_old_signals_from_active
     let first = runtime
         .open_or_create(
             external_locator.clone(),
+            TaskId::new(),
             intent(TaskId::new(), "alpha requirement"),
             vec![
                 signal(TaskSignalKind::Prompt, "alpha requirement"),
@@ -770,6 +773,7 @@ fn explicit_switch_restores_only_the_target_tasks_own_active_signals() {
     let first = runtime
         .open_or_create(
             external_locator.clone(),
+            TaskId::new(),
             intent(TaskId::new(), "first task"),
             vec![signal(TaskSignalKind::Diff, "src/first.rs")],
         )
@@ -816,6 +820,7 @@ fn signal_supersede_hides_active_input_but_retains_queryable_history_and_identit
     let session = runtime
         .open_or_create(
             locator("signal-lifecycle"),
+            TaskId::new(),
             intent(TaskId::new(), "signal lifecycle"),
             vec![
                 signal(TaskSignalKind::Prompt, "signal lifecycle"),
@@ -885,6 +890,7 @@ fn concurrent_new_task_cas_creates_exactly_one_history_entry() {
     let initial = runtime
         .open_or_create(
             external_locator.clone(),
+            TaskId::new(),
             intent(TaskId::new(), "initial task"),
             vec![],
         )
@@ -934,7 +940,7 @@ fn explicit_new_with_identical_working_intent_always_creates_a_distinct_task() {
     let external_locator = locator("identical-new-tasks");
     let same = working("identical explicit new content");
     let first = runtime
-        .open_or_create_working(
+        .open_or_create(
             external_locator.clone(),
             TaskId::new(),
             same.clone(),
@@ -943,7 +949,7 @@ fn explicit_new_with_identical_working_intent_always_creates_a_distinct_task() {
         .unwrap()
         .snapshot;
     let second = runtime
-        .start_new_task_working(&external_locator, first.task_id, &same, Vec::new())
+        .start_new_task(&external_locator, first.task_id, &same, Vec::new())
         .unwrap()
         .snapshot;
     assert_ne!(first.task_id, second.task_id);
@@ -970,6 +976,7 @@ fn invalid_locator_is_rejected_before_any_session_is_created() {
                 agent_kind: " ".to_owned(),
                 external_session_id: "session-a".to_owned(),
             },
+            TaskId::new(),
             intent(TaskId::new(), "invalid locator"),
             vec![],
         )
@@ -995,6 +1002,7 @@ fn deleting_runtime_database_loses_sessions_without_touching_knowledge_files() {
     let session_id = runtime
         .open_or_create(
             locator("session-a"),
+            TaskId::new(),
             intent(TaskId::new(), "disposable task"),
             vec![],
         )

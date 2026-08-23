@@ -1,11 +1,11 @@
 use std::{fs, process::Command};
 
 use sctx_domain::{
-    CaptureUnknown, ContextId, ExternalSessionLocator, SpaceId, SubmissionId, TaskId, TaskIntent,
-    TaskIntentDraft, TaskSpaceAssociation,
+    CaptureUnknown, ContextId, ExternalSessionLocator, SpaceId, SubmissionId, TaskId,
+    TaskSpaceAssociation, WorkingIntentSnapshot,
 };
 use sctx_mcp::{
-    ExpectedRevisionId, IntentMaturity, TaskBoundary, TaskCheckpointBoundary, TaskCheckpointInput,
+    ExpectedRevisionId, TaskBoundary, TaskCheckpointBoundary, TaskCheckpointInput,
     TaskIntentUpdateInput, task_checkpoint_at_root, task_intent_update_at_root,
 };
 use sctx_task_runtime::TaskRuntime;
@@ -14,20 +14,19 @@ use tempfile::tempdir;
 
 const EVIDENCE: &str = r#"{"kind":"experiment_record","supports":"M1 candidate creation completed","content":{"gate":"milestone_one","actual":"created"},"interpretation":"the task-first Candidate path is executable","limitations":[]}"#;
 
-fn task_intent(task_id: TaskId) -> TaskIntent {
-    TaskIntent {
-        task_id,
+fn task_intent() -> WorkingIntentSnapshot {
+    WorkingIntentSnapshot {
         goal: "Close milestone one".to_owned(),
-        desired_change: "Make task-first primitives the only routing model".to_owned(),
+        current_direction: Some("Make task-first primitives the only routing model".to_owned()),
         in_scope: vec!["M1 integration".to_owned()],
         out_of_scope: vec!["M2 runtime retrieval".to_owned()],
         domains: vec!["shared-context".to_owned()],
         platforms: Vec::new(),
         constraints: vec!["No Workspace route".to_owned()],
         acceptance_conditions: vec!["One Task can have zero or many Space matches".to_owned()],
-        artifacts: Vec::new(),
-        interfaces: vec!["candidate_create".to_owned()],
-        unknowns: Vec::new(),
+        artifact_hints: Vec::new(),
+        interface_hints: vec!["candidate_create".to_owned()],
+        open_questions: Vec::new(),
     }
 }
 
@@ -47,7 +46,7 @@ fn association(task_id: TaskId, space_id: SpaceId, reason: &str) -> TaskSpaceAss
 #[test]
 fn task_intent_has_no_route_and_accepts_zero_or_many_space_associations() {
     let task_id = TaskId::new();
-    let intent = task_intent(task_id);
+    let intent = task_intent();
     intent.validate().unwrap();
     let serialized = serde_json::to_value(intent).unwrap();
     assert!(
@@ -83,21 +82,21 @@ fn candidate_create_is_the_unassigned_main_path_and_never_auto_injects() {
             external_session_id: "m1-candidate-create".to_owned(),
             task_boundary: TaskBoundary::New,
             expected_revision_id: ExpectedRevisionId::Null(()),
-            maturity: IntentMaturity::Provisional,
-            intent: TaskIntentDraft {
+            intent: WorkingIntentSnapshot {
                 goal: "Close milestone one".to_owned(),
-                desired_change: "Create a source-verifiable unassigned Candidate".to_owned(),
+                current_direction: Some(
+                    "Create a source-verifiable unassigned Candidate".to_owned(),
+                ),
                 in_scope: vec!["M1 integration".to_owned()],
                 out_of_scope: Vec::new(),
                 domains: vec!["shared-context".to_owned()],
                 platforms: Vec::new(),
                 constraints: Vec::new(),
                 acceptance_conditions: vec!["Candidate stays non-injectable".to_owned()],
-                artifacts: Vec::new(),
-                interfaces: Vec::new(),
-                unknowns: Vec::new(),
+                artifact_hints: Vec::new(),
+                interface_hints: Vec::new(),
+                open_questions: Vec::new(),
             },
-            evidence_refs: Vec::new(),
         },
     )
     .unwrap();
@@ -178,13 +177,14 @@ fn candidate_create_is_the_unassigned_main_path_and_never_auto_injects() {
         .collect::<Vec<_>>();
     assert_eq!(config_keys, vec!["version", "store"]);
 
-    let mut authoritative = task_intent(TaskId::new());
+    let mut authoritative = task_intent();
     authoritative.goal = "M1 Candidate".to_owned();
-    authoritative.desired_change = "retrieve confirmed Context only".to_owned();
+    authoritative.current_direction = Some("retrieve confirmed Context only".to_owned());
     TaskRuntime::initialize(home.join(".shared-context"))
         .unwrap()
         .open_or_create(
             ExternalSessionLocator::new("codex", "m1-candidate-isolation").unwrap(),
+            TaskId::new(),
             authoritative,
             vec![],
         )

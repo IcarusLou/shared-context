@@ -2,7 +2,7 @@ use sctx_domain::{
     Applicability, ConflictParticipant, ContextId, ContextKind, ContextRelation,
     ContextRelationKind, ContextRevisionDraft, EvidenceSnapshotDraft, EvidenceType,
     PublicationAction, PublicationDraft, RevisionId, SemanticConflictDraft, SpaceId, TaskId,
-    TaskIntent, TaskSignal, TaskSignalKind,
+    TaskSignal, TaskSignalKind, WorkingIntentSnapshot,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
@@ -581,20 +581,19 @@ fn intent_fixture() -> IntentFixture {
     }
 }
 
-fn task_query(text: &str) -> TaskIntent {
-    TaskIntent {
-        task_id: TaskId::new(),
+fn task_query(text: &str) -> WorkingIntentSnapshot {
+    WorkingIntentSnapshot {
         goal: text.to_owned(),
-        desired_change: text.to_owned(),
+        current_direction: Some(text.to_owned()),
         in_scope: Vec::new(),
         out_of_scope: Vec::new(),
         domains: Vec::new(),
         platforms: Vec::new(),
         constraints: Vec::new(),
         acceptance_conditions: Vec::new(),
-        artifacts: Vec::new(),
-        interfaces: Vec::new(),
-        unknowns: Vec::new(),
+        artifact_hints: Vec::new(),
+        interface_hints: Vec::new(),
+        open_questions: Vec::new(),
     }
 }
 
@@ -635,8 +634,11 @@ fn task_intent_and_signals_match_chinese_english_code_and_api_tokens() {
             SpaceIntentField::OutOfScope,
         ),
     ] {
-        let response = engine.space_intent_candidates(&task, &signals).unwrap();
-        assert_eq!(response.task_id, task.task_id);
+        let task_id = TaskId::new();
+        let response = engine
+            .space_intent_candidates(task_id, &task, &signals)
+            .unwrap();
+        assert_eq!(response.task_id, task_id);
         assert_eq!(response.candidates.len(), 1);
         assert_eq!(response.candidates[0].space_id, fixture.rich_space_id);
         assert!(
@@ -653,21 +655,22 @@ fn task_intent_and_signals_match_chinese_english_code_and_api_tokens() {
 fn full_task_query_explains_all_current_intent_fields() {
     let fixture = intent_fixture();
     let engine = SearchEngine::new(fixture.index);
-    let task = TaskIntent {
-        task_id: TaskId::new(),
+    let task = WorkingIntentSnapshot {
         goal: "englishtitleneedle".to_owned(),
-        desired_change: "multilingualoutcome".to_owned(),
+        current_direction: Some("multilingualoutcome".to_owned()),
         in_scope: vec!["中文检索".to_owned()],
         out_of_scope: vec!["legacyrouterboundary".to_owned()],
         domains: vec!["requirementintent".to_owned()],
         platforms: Vec::new(),
         constraints: Vec::new(),
         acceptance_conditions: vec!["searchv2endpoint".to_owned()],
-        artifacts: vec!["generaltabvisibility".to_owned()],
-        interfaces: Vec::new(),
-        unknowns: Vec::new(),
+        artifact_hints: vec!["generaltabvisibility".to_owned()],
+        interface_hints: Vec::new(),
+        open_questions: Vec::new(),
     };
-    let response = engine.space_intent_candidates(&task, &[]).unwrap();
+    let response = engine
+        .space_intent_candidates(TaskId::new(), &task, &[])
+        .unwrap();
     assert_eq!(response.candidates.len(), 1);
     assert_eq!(response.candidates[0].space_id, fixture.rich_space_id);
     assert_eq!(
@@ -699,18 +702,20 @@ fn candidate_query_returns_zero_one_or_many_with_stable_id_ties() {
     let engine = SearchEngine::new(fixture.index);
 
     let none = engine
-        .space_intent_candidates(&task_query("totallyabsenttoken"), &[])
+        .space_intent_candidates(TaskId::new(), &task_query("totallyabsenttoken"), &[])
         .unwrap();
     assert!(none.candidates.is_empty());
 
     let one = engine
-        .space_intent_candidates(&task_query("EnglishTitleNeedle"), &[])
+        .space_intent_candidates(TaskId::new(), &task_query("EnglishTitleNeedle"), &[])
         .unwrap();
     assert_eq!(one.candidates.len(), 1);
     assert_eq!(one.candidates[0].space_id, fixture.rich_space_id);
 
     let task = task_query("sharedassociationneedle");
-    let many = engine.space_intent_candidates(&task, &[]).unwrap();
+    let many = engine
+        .space_intent_candidates(TaskId::new(), &task, &[])
+        .unwrap();
     let mut expected = fixture.shared_space_ids.to_vec();
     expected.sort();
     let actual = many
@@ -726,7 +731,7 @@ fn candidate_query_returns_zero_one_or_many_with_stable_id_ties() {
 
     index.rebuild().unwrap();
     let rebuilt = SearchEngine::new(index)
-        .space_intent_candidates(&task, &[])
+        .space_intent_candidates(TaskId::new(), &task, &[])
         .unwrap();
     assert_eq!(rebuilt.candidates, many.candidates);
 }
@@ -736,7 +741,7 @@ fn conflicted_intent_returns_every_head_without_silently_selecting_one() {
     let fixture = intent_fixture();
     let engine = SearchEngine::new(fixture.index);
     let both = engine
-        .space_intent_candidates(&task_query("forkmatchneedle"), &[])
+        .space_intent_candidates(TaskId::new(), &task_query("forkmatchneedle"), &[])
         .unwrap();
     assert_eq!(both.candidates.len(), 1);
     let candidate = &both.candidates[0];
@@ -763,7 +768,7 @@ fn conflicted_intent_returns_every_head_without_silently_selecting_one() {
     );
 
     let one_side = engine
-        .space_intent_candidates(&task_query("leftonlyneedle"), &[])
+        .space_intent_candidates(TaskId::new(), &task_query("leftonlyneedle"), &[])
         .unwrap();
     assert_eq!(one_side.candidates.len(), 1);
     assert!(one_side.candidates[0].intent_conflicted);

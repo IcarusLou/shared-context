@@ -6,7 +6,7 @@ use std::{
 };
 
 use fs2::FileExt;
-use sctx_domain::{ExternalSessionLocator, IntentSnapshot, TaskId, TaskIntent};
+use sctx_domain::{ExternalSessionLocator, IntentSnapshot, TaskId, WorkingIntentSnapshot};
 use sctx_event_schema::Event;
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::ProjectionIndex;
@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 
 const DIAGNOSTIC: &str = "Shared Context task retrieval is temporarily unavailable. Coding can continue; retry through MCP or CLI later.";
-const PROMPT_GUIDANCE: &str = "Shared Context PromptEnvelope received. No Task Intent was inferred from prompt text. Use $shared-context and task_intent_update before precise retrieval.";
+const PROMPT_GUIDANCE: &str = "Shared Context PromptEnvelope received. No Working Intent was inferred from prompt text. Use $shared-context and task_intent_update to record naturally formed understanding before precise retrieval.";
 
 struct SqliteLock {
     child: Child,
@@ -189,20 +189,19 @@ fn initialize_store(harness: &Harness) -> GitStore {
     GitStore::initialize(harness.root()).unwrap()
 }
 
-fn task_intent(task_id: TaskId) -> TaskIntent {
-    TaskIntent {
-        task_id,
+fn task_intent() -> WorkingIntentSnapshot {
+    WorkingIntentSnapshot {
         goal: "Refresh the registered engineering repository".to_owned(),
-        desired_change: "Observe verified local Git repository state".to_owned(),
+        current_direction: Some("Observe verified local Git repository state".to_owned()),
         in_scope: Vec::new(),
         out_of_scope: Vec::new(),
         domains: Vec::new(),
         platforms: Vec::new(),
         constraints: Vec::new(),
         acceptance_conditions: Vec::new(),
-        artifacts: Vec::new(),
-        interfaces: Vec::new(),
-        unknowns: Vec::new(),
+        artifact_hints: Vec::new(),
+        interface_hints: Vec::new(),
+        open_questions: Vec::new(),
     }
 }
 
@@ -351,7 +350,8 @@ fn cursor_post_tool_hook_ignores_repository_registry_failure() {
         .unwrap()
         .open_or_create(
             ExternalSessionLocator::new("cursor", "cursor-fail-open").unwrap(),
-            task_intent(TaskId::new()),
+            TaskId::new(),
+            task_intent(),
             Vec::new(),
         )
         .unwrap();
@@ -378,7 +378,8 @@ fn cursor_post_tool_hook_fails_open_when_catalog_config_is_invalid() {
         .unwrap()
         .open_or_create(
             ExternalSessionLocator::new("cursor", "cursor-fail-open").unwrap(),
-            task_intent(TaskId::new()),
+            TaskId::new(),
+            task_intent(),
             Vec::new(),
         )
         .unwrap();
@@ -411,7 +412,8 @@ fn cursor_post_tool_hook_fails_open_immediately_when_catalog_lock_is_busy() {
         .unwrap()
         .open_or_create(
             ExternalSessionLocator::new("cursor", "cursor-fail-open").unwrap(),
-            task_intent(TaskId::new()),
+            TaskId::new(),
+            task_intent(),
             Vec::new(),
         )
         .unwrap();

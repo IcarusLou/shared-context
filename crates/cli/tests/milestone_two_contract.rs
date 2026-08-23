@@ -10,15 +10,15 @@ use std::{
 use sctx_domain::{
     Applicability, ConflictParticipant, ContextId, ContextKind, ContextRevisionDraft,
     EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot, PublicationAction,
-    PublicationDraft, SemanticConflictDraft, SpaceId, SubmissionId, TaskId, TaskIntent,
-    TaskIntentDraft, TaskSessionId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkEpisodeRef,
+    PublicationDraft, SemanticConflictDraft, SpaceId, SubmissionId, TaskId, TaskSessionId,
+    TaskSignal, TaskSignalKind, WorkEpisodeId, WorkEpisodeRef, WorkingIntentSnapshot,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
 use sctx_index::ProjectionIndex;
 use sctx_local_state::UserConfigStore;
 use sctx_mcp::{
-    ExpectedRevisionId, IntentMaturity, TaskBoundary, TaskContextReadInput, TaskContextResponse,
+    ExpectedRevisionId, TaskBoundary, TaskContextReadInput, TaskContextResponse,
     TaskIntentUpdateInput, task_context_readonly_at_root, task_intent_update_at_root,
 };
 use sctx_search::{
@@ -45,7 +45,7 @@ struct MilestoneTwoFixture {
 struct TaskScenario {
     agent_kind: String,
     external_session_id: String,
-    intent: TaskIntentDraft,
+    intent: WorkingIntentSnapshot,
     task_signals: Vec<TaskSignal>,
     max_spaces: usize,
 }
@@ -278,18 +278,18 @@ impl MilestoneTwoFixture {
         TaskScenario {
             agent_kind: "codex".to_owned(),
             external_session_id: external_session_id.to_owned(),
-            intent: TaskIntentDraft {
+            intent: WorkingIntentSnapshot {
                 goal: goal.to_owned(),
-                desired_change: goal.to_owned(),
+                current_direction: None,
                 in_scope: Vec::new(),
                 out_of_scope: Vec::new(),
                 domains: Vec::new(),
                 platforms: Vec::new(),
                 constraints: Vec::new(),
                 acceptance_conditions: Vec::new(),
-                artifacts: Vec::new(),
-                interfaces: Vec::new(),
-                unknowns: Vec::new(),
+                artifact_hints: Vec::new(),
+                interface_hints: Vec::new(),
+                open_questions: Vec::new(),
             },
             task_signals: vec![TaskSignal {
                 kind: TaskSignalKind::Workspace,
@@ -301,7 +301,7 @@ impl MilestoneTwoFixture {
 
     fn feature_input(&self, external_session_id: &str) -> TaskScenario {
         let mut input = self.input(external_session_id, "quartzpageintent");
-        "quartzfeaturechange".clone_into(&mut input.intent.desired_change);
+        input.intent.current_direction = Some("quartzfeaturechange".to_owned());
         input.intent.domains = vec!["analyticsdomainconstraint".to_owned()];
         input.intent.platforms = vec!["fe".to_owned()];
         input.intent.constraints = vec!["legacyclientconstraint".to_owned()];
@@ -487,37 +487,12 @@ fn response_spaces(response: &TaskContextResponse) -> BTreeSet<SpaceId> {
 }
 
 fn establish_task(root: &Path, input: &TaskScenario) -> TaskContextResponse {
-    let evidence_refs = input
-        .intent
-        .artifacts
-        .iter()
-        .chain(&input.intent.interfaces)
-        .cloned()
-        .collect();
     let mut update = TaskIntentUpdateInput {
         agent_kind: input.agent_kind.clone(),
         external_session_id: input.external_session_id.clone(),
         task_boundary: TaskBoundary::New,
         expected_revision_id: ExpectedRevisionId::Null(()),
-        maturity: IntentMaturity::Provisional,
-        intent: TaskIntentDraft {
-            goal: input.intent.goal.clone(),
-            desired_change: if input.intent.desired_change == input.intent.goal {
-                format!("Deliver {}", input.intent.desired_change)
-            } else {
-                input.intent.desired_change.clone()
-            },
-            in_scope: input.intent.in_scope.clone(),
-            out_of_scope: input.intent.out_of_scope.clone(),
-            domains: input.intent.domains.clone(),
-            platforms: input.intent.platforms.clone(),
-            constraints: input.intent.constraints.clone(),
-            acceptance_conditions: input.intent.acceptance_conditions.clone(),
-            artifacts: input.intent.artifacts.clone(),
-            interfaces: input.intent.interfaces.clone(),
-            unknowns: input.intent.unknowns.clone(),
-        },
-        evidence_refs,
+        intent: input.intent.clone(),
     };
     let created = task_intent_update_at_root(root, &update).unwrap().context;
     if input.task_signals.is_empty() {
@@ -572,20 +547,19 @@ fn assert_typed_m2_path(path: &TaskRetrievalPath) {
     }
 }
 
-fn task_intent(goal: &str) -> TaskIntent {
-    TaskIntent {
-        task_id: TaskId::new(),
+fn task_intent(goal: &str) -> WorkingIntentSnapshot {
+    WorkingIntentSnapshot {
         goal: goal.to_owned(),
-        desired_change: goal.to_owned(),
+        current_direction: None,
         in_scope: Vec::new(),
         out_of_scope: Vec::new(),
         domains: Vec::new(),
         platforms: Vec::new(),
         constraints: Vec::new(),
         acceptance_conditions: Vec::new(),
-        artifacts: Vec::new(),
-        interfaces: Vec::new(),
-        unknowns: Vec::new(),
+        artifact_hints: Vec::new(),
+        interface_hints: Vec::new(),
+        open_questions: Vec::new(),
     }
 }
 
@@ -731,7 +705,8 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
 
     let explicit_unsafe = SearchEngine::new(fixture.index.clone())
         .task_context_pack(&TaskContextRequest {
-            task_intent: task_intent("hazardpackintent"),
+            task_id: TaskId::new(),
+            working_intent: task_intent("hazardpackintent"),
             task_signals: Vec::new(),
             resolved_focus: None,
             token_budget: 100_000,
@@ -778,21 +753,19 @@ fn post_tool_file_is_breadcrumb_only_and_test_outcome_refreshes_active_task() {
         task_boundary: boundary,
         expected_revision_id: expected
             .map_or(ExpectedRevisionId::Null(()), ExpectedRevisionId::Revision),
-        maturity: IntentMaturity::Provisional,
-        intent: TaskIntentDraft {
+        intent: WorkingIntentSnapshot {
             goal: "quartzpageintent".to_owned(),
-            desired_change: "implement quartz page intent".to_owned(),
+            current_direction: Some("implement quartz page intent".to_owned()),
             in_scope: vec![],
             out_of_scope: vec![],
             domains: vec![],
             platforms: vec![],
             constraints: vec![],
             acceptance_conditions: vec![],
-            artifacts: vec![],
-            interfaces: vec![],
-            unknowns: vec![],
+            artifact_hints: vec![],
+            interface_hints: vec![],
+            open_questions: vec![],
         },
-        evidence_refs: vec![],
     };
 
     let initial = task_intent_update_at_root(&fixture.root, &update(TaskBoundary::New, None))

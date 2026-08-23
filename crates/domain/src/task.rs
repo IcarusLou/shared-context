@@ -41,168 +41,6 @@ fn validate_text_set(values: &[String], field: &str) -> Result<()> {
     require_unique(values, field)
 }
 
-/// A structured, revisable understanding of the current engineering task.
-///
-/// A Task Intent deliberately has no Context Space identity. Space relevance is
-/// represented separately by zero or more [`TaskSpaceAssociation`] values.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TaskIntent {
-    pub task_id: TaskId,
-    pub goal: String,
-    pub desired_change: String,
-    pub in_scope: Vec<String>,
-    pub out_of_scope: Vec<String>,
-    pub domains: Vec<String>,
-    pub platforms: Vec<String>,
-    pub constraints: Vec<String>,
-    pub acceptance_conditions: Vec<String>,
-    pub artifacts: Vec<String>,
-    pub interfaces: Vec<String>,
-    pub unknowns: Vec<String>,
-}
-
-impl TaskIntent {
-    /// Validates that the Task has a meaningful target and unambiguous lists.
-    ///
-    /// Empty lists are valid because an early, provisional Task Intent may know
-    /// only its target. Entries that are present must be non-empty and unique.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorKind::InvalidInput`] when required target text is empty or
-    /// a structured list contains an empty or duplicate item.
-    pub fn validate(&self) -> Result<()> {
-        require_text(&self.goal, "task_intent.goal")?;
-        require_text(&self.desired_change, "task_intent.desired_change")?;
-        validate_text_set(&self.in_scope, "task_intent.in_scope")?;
-        validate_text_set(&self.out_of_scope, "task_intent.out_of_scope")?;
-        validate_text_set(&self.domains, "task_intent.domains")?;
-        validate_text_set(&self.platforms, "task_intent.platforms")?;
-        validate_text_set(&self.constraints, "task_intent.constraints")?;
-        validate_text_set(
-            &self.acceptance_conditions,
-            "task_intent.acceptance_conditions",
-        )?;
-        validate_text_set(&self.artifacts, "task_intent.artifacts")?;
-        validate_text_set(&self.interfaces, "task_intent.interfaces")?;
-        validate_text_set(&self.unknowns, "task_intent.unknowns")
-    }
-}
-
-/// Caller-authored Task Intent content before the runtime assigns Task identity.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TaskIntentDraft {
-    pub goal: String,
-    pub desired_change: String,
-    pub in_scope: Vec<String>,
-    pub out_of_scope: Vec<String>,
-    pub domains: Vec<String>,
-    pub platforms: Vec<String>,
-    pub constraints: Vec<String>,
-    pub acceptance_conditions: Vec<String>,
-    pub artifacts: Vec<String>,
-    pub interfaces: Vec<String>,
-    pub unknowns: Vec<String>,
-}
-
-impl TaskIntentDraft {
-    /// Binds this content to a runtime-owned Task identity.
-    #[must_use]
-    pub fn bind(&self, task_id: TaskId) -> TaskIntent {
-        TaskIntent {
-            task_id,
-            goal: self.goal.clone(),
-            desired_change: self.desired_change.clone(),
-            in_scope: self.in_scope.clone(),
-            out_of_scope: self.out_of_scope.clone(),
-            domains: self.domains.clone(),
-            platforms: self.platforms.clone(),
-            constraints: self.constraints.clone(),
-            acceptance_conditions: self.acceptance_conditions.clone(),
-            artifacts: self.artifacts.clone(),
-            interfaces: self.interfaces.clone(),
-            unknowns: self.unknowns.clone(),
-        }
-    }
-
-    /// Validates Task content before identity is assigned.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorKind::InvalidInput`] under the same content invariants as
-    /// [`TaskIntent::validate`].
-    pub fn validate(&self) -> Result<()> {
-        self.bind(TaskId::new()).validate()
-    }
-
-    /// Mechanically maps the pre-#167 public draft into Working Intent authority.
-    ///
-    /// # Errors
-    ///
-    /// Returns Working Intent validation and bound errors.
-    pub fn to_working_intent(&self) -> Result<WorkingIntentSnapshot> {
-        let snapshot = WorkingIntentSnapshot {
-            goal: self.goal.clone(),
-            current_direction: Some(self.desired_change.clone()),
-            in_scope: self.in_scope.clone(),
-            out_of_scope: self.out_of_scope.clone(),
-            domains: self.domains.clone(),
-            platforms: self.platforms.clone(),
-            constraints: self.constraints.clone(),
-            acceptance_conditions: self.acceptance_conditions.clone(),
-            artifact_hints: self.artifacts.clone(),
-            interface_hints: self.interfaces.clone(),
-            open_questions: self.unknowns.clone(),
-        };
-        snapshot.validate()?;
-        Ok(snapshot)
-    }
-}
-
-impl WorkingIntentSnapshot {
-    /// Mechanically supplies Task identity to legacy retrieval consumers until #167.
-    #[must_use]
-    pub fn bind_task_intent(&self, task_id: TaskId) -> TaskIntent {
-        TaskIntent {
-            task_id,
-            goal: self.goal.clone(),
-            desired_change: self
-                .current_direction
-                .clone()
-                .unwrap_or_else(|| self.goal.clone()),
-            in_scope: self.in_scope.clone(),
-            out_of_scope: self.out_of_scope.clone(),
-            domains: self.domains.clone(),
-            platforms: self.platforms.clone(),
-            constraints: self.constraints.clone(),
-            acceptance_conditions: self.acceptance_conditions.clone(),
-            artifacts: self.artifact_hints.clone(),
-            interfaces: self.interface_hints.clone(),
-            unknowns: self.open_questions.clone(),
-        }
-    }
-}
-
-impl From<&TaskIntent> for TaskIntentDraft {
-    fn from(intent: &TaskIntent) -> Self {
-        Self {
-            goal: intent.goal.clone(),
-            desired_change: intent.desired_change.clone(),
-            in_scope: intent.in_scope.clone(),
-            out_of_scope: intent.out_of_scope.clone(),
-            domains: intent.domains.clone(),
-            platforms: intent.platforms.clone(),
-            constraints: intent.constraints.clone(),
-            acceptance_conditions: intent.acceptance_conditions.clone(),
-            artifacts: intent.artifacts.clone(),
-            interfaces: intent.interfaces.clone(),
-            unknowns: intent.unknowns.clone(),
-        }
-    }
-}
-
 /// External Agent coordinates used only to locate a local Task Session.
 ///
 /// The locator is deliberately not a domain identifier. Reusing the same
@@ -673,52 +511,36 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        ExternalSessionLocator, ExternalSessionSnapshot, TaskIntent, TaskIntentDraft,
-        TaskIntentRevision, TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle,
-        TaskSignalRecord, TaskSpaceAssociation,
+        ExternalSessionLocator, ExternalSessionSnapshot, TaskIntentRevision, TaskSessionSnapshot,
+        TaskSignal, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord, TaskSpaceAssociation,
     };
     use crate::{
         ContextId, ErrorKind, ExternalSessionId, SignalId, SpaceId, TaskId, TaskSessionId,
         WorkingIntentSnapshot,
     };
 
-    fn intent() -> TaskIntent {
-        intent_for(TaskId::new())
-    }
-
-    fn intent_for(task_id: TaskId) -> TaskIntent {
-        TaskIntent {
-            task_id,
+    fn intent() -> WorkingIntentSnapshot {
+        WorkingIntentSnapshot {
             goal: "Make task-first retrieval possible".to_owned(),
-            desired_change: "Infer relevant knowledge from the current task".to_owned(),
+            current_direction: Some("Infer relevant knowledge from the current task".to_owned()),
             in_scope: vec!["Task domain primitives".to_owned()],
             out_of_scope: vec!["Workspace routing".to_owned()],
             domains: vec!["context retrieval".to_owned()],
             platforms: vec!["fe".to_owned()],
             constraints: vec!["No Space prerequisite".to_owned()],
             acceptance_conditions: vec!["One Task can match many Spaces".to_owned()],
-            artifacts: vec!["SearchResult".to_owned()],
-            interfaces: vec!["search-v2".to_owned()],
-            unknowns: vec!["Historical compatibility limits".to_owned()],
+            artifact_hints: vec!["SearchResult".to_owned()],
+            interface_hints: vec!["search-v2".to_owned()],
+            open_questions: vec!["Historical compatibility limits".to_owned()],
         }
     }
 
-    fn intent_draft() -> TaskIntentDraft {
-        TaskIntentDraft::from(&intent())
-    }
-
-    fn working(intent: &TaskIntent) -> WorkingIntentSnapshot {
-        TaskIntentDraft::from(intent).to_working_intent().unwrap()
-    }
-
-    #[allow(clippy::needless_pass_by_value)]
     fn session_from_intent(
         locator: ExternalSessionLocator,
-        intent: TaskIntent,
+        intent: WorkingIntentSnapshot,
         signals: Vec<TaskSignal>,
     ) -> crate::Result<TaskSessionSnapshot> {
-        let working_intent = TaskIntentDraft::from(&intent).to_working_intent()?;
-        TaskSessionSnapshot::from_initial(locator, intent.task_id, working_intent, signals)
+        TaskSessionSnapshot::from_initial(locator, TaskId::new(), intent, signals)
     }
 
     fn locator(external_session_id: &str) -> ExternalSessionLocator {
@@ -762,51 +584,11 @@ mod tests {
     }
 
     #[test]
-    fn task_intent_rejects_an_empty_target() {
-        let mut value = intent();
-        value.goal = "  ".to_owned();
-
-        let error = value.validate().expect_err("empty goal must fail");
-
-        assert_eq!(error.kind(), ErrorKind::InvalidInput);
-        assert!(error.message().contains("task_intent.goal"));
-    }
-
-    #[test]
-    fn task_intent_rejects_duplicate_structured_values() {
-        let mut value = intent();
-        value.domains.push(value.domains[0].clone());
-
-        let error = value.validate().expect_err("duplicate domain must fail");
-
-        assert_eq!(error.kind(), ErrorKind::InvalidInput);
-        assert!(error.message().contains("task_intent.domains"));
-    }
-
-    #[test]
-    fn task_intent_draft_binds_the_same_content_to_runtime_owned_identity() {
-        let draft = intent_draft();
-        let first_id = TaskId::new();
-        let second_id = TaskId::new();
-
-        let first = draft.bind(first_id);
-        let second = draft.bind(second_id);
-
-        assert!(draft.validate().is_ok());
-        assert_eq!(first.task_id, first_id);
-        assert_eq!(second.task_id, second_id);
-        assert_eq!(
-            TaskIntentDraft::from(&first),
-            TaskIntentDraft::from(&second)
-        );
-    }
-
-    #[test]
     fn task_session_starts_with_one_parentless_intent_revision() {
-        let intent = intent();
-        let task_id = intent.task_id;
-        let session = session_from_intent(locator("session-a"), intent, vec![])
-            .expect("valid initial Task Session");
+        let task_id = TaskId::new();
+        let session =
+            TaskSessionSnapshot::from_initial(locator("session-a"), task_id, intent(), vec![])
+                .expect("valid initial Task Session");
 
         assert_eq!(session.task_id, task_id);
         assert_eq!(session.intent_revisions.len(), 1);
@@ -822,15 +604,14 @@ mod tests {
 
     #[test]
     fn task_intent_revisions_form_a_linear_parent_chain() {
-        let task_id = TaskId::new();
-        let mut session = session_from_intent(locator("session-a"), intent_for(task_id), vec![])
+        let mut session = session_from_intent(locator("session-a"), intent(), vec![])
             .expect("valid initial Task Session");
         let initial_id = session.intent_revisions[0].revision_id;
 
-        let mut second_intent = intent_for(task_id);
-        second_intent.unknowns.clear();
+        let mut second_intent = intent();
+        second_intent.open_questions.clear();
         let second_id = session
-            .append_intent(working(&second_intent))
+            .append_intent(second_intent)
             .expect("valid successor");
 
         assert_eq!(session.intent_revisions[1].revision_id, second_id);
@@ -846,7 +627,7 @@ mod tests {
         let mut session = session_from_intent(locator("session-a"), intent(), vec![])
             .expect("valid initial Task Session");
         let parent = session.intent_revisions[0].clone();
-        let mut revision = TaskIntentRevision::successor(&parent, working(&intent())).unwrap();
+        let mut revision = TaskIntentRevision::successor(&parent, intent()).unwrap();
         revision.semantic_hash = "sha256:wrong".to_owned();
         session.intent_revisions.push(revision);
         let error = session
@@ -867,17 +648,13 @@ mod tests {
             .expect_err("duplicate revision must fail");
         assert!(error.message().contains("must not repeat a revision"));
 
-        let task_id = TaskId::new();
-        let mut disconnected =
-            session_from_intent(locator("session-b"), intent_for(task_id), vec![])
-                .expect("valid initial Task Session");
+        let mut disconnected = session_from_intent(locator("session-b"), intent(), vec![])
+            .expect("valid initial Task Session");
         disconnected.intent_revisions.push(TaskIntentRevision {
             revision_id: crate::TaskIntentRevisionId::new(),
             parent_revision_id: None,
-            working_intent: working(&intent_for(task_id)),
-            semantic_hash: working(&intent_for(task_id))
-                .canonical_semantic_hash()
-                .unwrap(),
+            working_intent: intent(),
+            semantic_hash: intent().canonical_semantic_hash().unwrap(),
         });
         let error = disconnected
             .validate()
@@ -888,7 +665,7 @@ mod tests {
     #[test]
     fn task_session_rejects_empty_intent_or_external_locator_boundaries() {
         let mut empty_intent = intent();
-        empty_intent.desired_change = "  ".to_owned();
+        empty_intent.current_direction = Some("  ".to_owned());
         let error = session_from_intent(locator("session-a"), empty_intent, vec![])
             .expect_err("empty Intent must fail");
         assert!(error.message().contains("working_intent.current_direction"));
@@ -1029,19 +806,6 @@ mod tests {
 
         assert_has_no_route_fields(&revision);
         assert_has_no_route_fields(&session);
-    }
-
-    #[test]
-    fn serialized_task_intent_has_no_space_route() {
-        let value = serde_json::to_value(intent()).expect("serialize Task Intent");
-
-        assert!(
-            value
-                .as_object()
-                .unwrap()
-                .keys()
-                .all(|field| !field.contains("space") && !field.contains("workspace"))
-        );
     }
 
     #[test]
