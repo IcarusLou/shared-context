@@ -57,6 +57,7 @@ cargo test --locked -p sctx-mcp --test mcp_contract
 cargo test --locked -p sctx-cli --test milestone_two_contract
 cargo test --locked -p sctx-cli --test milestone_three_contract
 cargo test --locked -p sctx-cli --test milestone_four_contract
+cargo test --locked -p sctx-cli --test hook_to_confirm_chain
 ```
 
 提交 `Cargo.lock`，确保 CLI workspace 的本地与 CI 构建使用相同依赖解析结果。

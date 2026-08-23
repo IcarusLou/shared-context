@@ -30,5 +30,21 @@
     "existing_confirmation_events": 4,
     "new_confirmation_events": 5,
     "accepted_query": "result contract shared FE iOS Android"
+  },
+  "hook_chain": {
+    "session": "m4-hook-to-confirm-codex",
+    "prompt": "Implement the ZXQ42 result path",
+    "working_intent_goal": "Implement the ZXQ42 operation",
+    "source_relative_path": "src/result.ts",
+    "source_text": "export function resultPath(): string { return \"stable\"; }\n",
+    "space_title": "Opaque Accepted Graph Home",
+    "context_statement": "CrossClientResultCache preserves response compatibility",
+    "claim_statement": "The result path passed its cross-client contract test",
+    "claim_rationale": "The owned TestOutcome and exact File focus verify the behavior",
+    "test_tool": "M4CrossClientContractTest",
+    "raw_file_marker": "RAW_FILE_OUTPUT_MUST_NOT_PERSIST_7H3Q",
+    "raw_test_marker": "RAW_TEST_OUTPUT_MUST_NOT_PERSIST_9K2W",
+    "raw_stop_marker": "RAW_STOP_OUTPUT_MUST_NOT_PERSIST_4M8V",
+    "expected_confirmation_events": 4
   }
 }
