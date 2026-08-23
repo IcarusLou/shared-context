@@ -1087,7 +1087,9 @@ impl TaskRuntime {
     /// server-identified Agent Checkpoint.
     ///
     /// Semantic retries are keyed by Episode and parent version. Identical
-    /// content returns the original Checkpoint; different content conflicts.
+    /// content returns the original Checkpoint. Different content conflicts
+    /// within an open Episode, while version zero starts a new Episode after
+    /// the latest matching closed-Episode parent.
     ///
     /// # Errors
     ///
@@ -1131,22 +1133,25 @@ impl TaskRuntime {
             if let Some((checkpoint, persisted_semantics)) =
                 read_checkpoint_by_parent(&transaction, episode_id, input.expected_episode_version)?
             {
-                if persisted_semantics != semantic_json {
+                if persisted_semantics == semantic_json {
+                    let episode = require_episode_view(&transaction, episode_id)?;
+                    let inline_observation_ids =
+                        inline_observation_ids(&checkpoint, &input.claims)?;
+                    transaction
+                        .commit()
+                        .map_err(sql_error("commit idempotent Agent Checkpoint retry"))?;
+                    return Ok(AgentCheckpointOutcome {
+                        checkpoint,
+                        episode,
+                        created: false,
+                        inline_observation_ids,
+                    });
+                }
+                if open_episode.is_some() {
                     return Err(conflict(
                         "Agent Checkpoint parent version already contains different content",
                     ));
                 }
-                let episode = require_episode_view(&transaction, episode_id)?;
-                let inline_observation_ids = inline_observation_ids(&checkpoint, &input.claims)?;
-                transaction
-                    .commit()
-                    .map_err(sql_error("commit idempotent Agent Checkpoint retry"))?;
-                return Ok(AgentCheckpointOutcome {
-                    checkpoint,
-                    episode,
-                    created: false,
-                    inline_observation_ids,
-                });
             }
         }
 
@@ -2936,6 +2941,7 @@ fn find_latest_checkpoint_episode(
              FROM agent_checkpoint AS checkpoint
              JOIN work_episode AS episode ON episode.episode_id = checkpoint.episode_id
              WHERE episode.task_session_id = ?1
+               AND episode.status = 'closed'
                AND checkpoint.parent_episode_version = ?2
              ORDER BY episode.episode_ordinal DESC LIMIT 1",
             params![task_session_id.to_string(), parent_version],

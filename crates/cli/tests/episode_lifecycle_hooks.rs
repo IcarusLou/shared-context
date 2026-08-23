@@ -9,8 +9,8 @@ use std::{
 };
 
 use sctx_domain::{
-    Applicability, EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, TaskId,
-    WorkEpisodeStatus, WorkingIntentSnapshot,
+    Applicability, CandidateReviewStatus, EvidenceSnapshotDraft, EvidenceType,
+    ExternalSessionLocator, TaskId, WorkEpisodeStatus, WorkingIntentSnapshot,
 };
 use sctx_git_store::GitStore;
 use sctx_index::ProjectionIndex;
@@ -71,6 +71,51 @@ impl Harness {
             String::from_utf8_lossy(&output.stderr)
         );
         serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    fn mcp(&self, name: &str, arguments: &Value) -> Value {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_sctx"))
+            .args(["mcp", "serve", "--client", "codex"])
+            .env("HOME", &self.home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "episode-lifecycle", "version": "1"}
+            }
+        });
+        let call = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        });
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, "{initialize}").unwrap();
+        writeln!(stdin, "{call}").unwrap();
+        drop(child.stdin.take());
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "MCP {name} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let responses = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2, "unexpected MCP output: {responses:#?}");
+        assert_eq!(responses[1]["result"]["isError"], false, "{responses:#?}");
+        responses[1]["result"]["structuredContent"].clone()
     }
 }
 
@@ -291,6 +336,137 @@ fn real_hooks_close_checkpointed_episodes_build_once_and_keep_sessions_isolated(
         "duplicate lifecycle events must not create duplicate Candidates"
     );
     assert!(!files_contain(&harness.root, raw_marker));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn precompact_resume_and_turn_stop_use_new_episodes_under_the_same_mcp_task() {
+    let harness = Harness::new();
+    let session = "precompact-resume-same-task";
+    let task = harness.mcp(
+        "task_intent_update",
+        &json!({
+            "agent_kind": "codex",
+            "external_session_id": session,
+            "task_boundary": "new",
+            "expected_revision_id": null,
+            "intent": {"goal": "resume one Task after context compaction"}
+        }),
+    );
+    let task_id = task["task_id"].as_str().unwrap().to_owned();
+    let revision_id = task["intent_revision_id"].as_str().unwrap().to_owned();
+    let checkpoint = |statement: &str, episode: u64| {
+        json!({
+            "agent_kind": "codex",
+            "external_session_id": session,
+            "expected_task_id": task_id,
+            "expected_intent_revision_id": revision_id,
+            "expected_episode_version": 0,
+            "boundary": "continue",
+            "claims": [{
+                "statement": statement,
+                "rationale": "A real MCP write validates the lifecycle boundary",
+                "applicability": {
+                    "domains": ["capture"],
+                    "platforms": [],
+                    "conditions": ["resume"]
+                },
+                "assumptions": [],
+                "recheck_when": ["the lifecycle boundary changes"],
+                "evidence": [{
+                    "kind": "inline_validation",
+                    "evidence": {
+                        "kind": "experiment_record",
+                        "supports": format!("Episode {episode} MCP write passed"),
+                        "content": {"episode": episode, "actual": "passed"},
+                        "interpretation": "The persisted checkpoint is self-contained",
+                        "limitations": []
+                    }
+                }],
+                "artifact_refs": [],
+                "related_contexts": []
+            }],
+            "unknowns": []
+        })
+    };
+
+    let first_input = checkpoint("PreCompact closes Episode one", 1);
+    let first = harness.mcp("task_checkpoint", &first_input);
+    let first_episode_id = first["episode_id"].as_str().unwrap().to_owned();
+    let compacted = harness.hook(
+        "codex",
+        &codex_event(
+            session,
+            &harness.home,
+            "PreCompact",
+            "RAW_PRECOMPACT_RESUME",
+        ),
+    );
+    assert!(
+        compacted["systemMessage"]
+            .as_str()
+            .is_some_and(|message| message.contains("durably closed"))
+    );
+    let first_retry = harness.mcp("task_checkpoint", &first_input);
+    assert_eq!(first_retry["created"], false);
+    assert_eq!(first_retry["episode_id"], first_episode_id);
+
+    let second = harness.mcp(
+        "task_checkpoint",
+        &checkpoint("Resume creates Episode two without changing Task", 2),
+    );
+    let second_episode_id = second["episode_id"].as_str().unwrap().to_owned();
+    assert_eq!(second["created"], true);
+    assert_ne!(second_episode_id, first_episode_id);
+    assert_eq!(second["episode_version"], 1);
+    let stopped = harness.hook(
+        "codex",
+        &codex_event(session, &harness.home, "Stop", "RAW_RESUMED_TURN_STOP"),
+    );
+    assert!(
+        stopped["systemMessage"]
+            .as_str()
+            .is_some_and(|message| message.contains("durably closed"))
+    );
+    let third = harness.mcp(
+        "task_checkpoint",
+        &checkpoint("TurnStop permits Episode three without changing Task", 3),
+    );
+    let third_episode_id = third["episode_id"].as_str().unwrap().to_owned();
+    assert_eq!(third["created"], true);
+    assert_ne!(third_episode_id, first_episode_id);
+    assert_ne!(third_episode_id, second_episode_id);
+
+    let runtime = TaskRuntime::initialize(&harness.root).unwrap();
+    let locator = ExternalSessionLocator::new("codex", session).unwrap();
+    let active = runtime.read_snapshot_by_locator(&locator).unwrap().unwrap();
+    assert_eq!(active.task_id.to_string(), task_id);
+    let episodes = runtime
+        .list_work_episodes(active.task_session_id, 10)
+        .unwrap();
+    assert_eq!(episodes.len(), 3);
+    assert_eq!(
+        episodes
+            .iter()
+            .filter(|episode| matches!(episode.episode.status, WorkEpisodeStatus::Closed { .. }))
+            .count(),
+        2
+    );
+    assert!(episodes.iter().any(|episode| {
+        episode.episode.episode_id.to_string() == third_episode_id
+            && episode.episode.status == WorkEpisodeStatus::Open
+    }));
+    let candidate_sources = runtime
+        .list_candidate_reviews(&locator, CandidateReviewStatus::Pending, 10, None)
+        .unwrap()
+        .records
+        .into_iter()
+        .map(|review| review.source_episode.episode_id.to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        candidate_sources,
+        std::collections::BTreeSet::from([first_episode_id, second_episode_id])
+    );
 }
 
 #[test]

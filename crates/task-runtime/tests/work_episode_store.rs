@@ -321,6 +321,298 @@ fn checkpoint_is_atomic_semantically_idempotent_and_closes_without_hook_observat
 
 #[test]
 #[allow(clippy::too_many_lines)]
+fn checkpoint_disambiguates_closed_retries_new_episodes_and_open_episode_versions() {
+    let temporary = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(temporary.path()).unwrap();
+    let (locator, task) = open_task(&runtime, "checkpoint-episodes", "resume the same task");
+    let first = checkpoint_write(
+        &locator,
+        &task,
+        0,
+        CheckpointBoundary::Close,
+        vec![checkpoint_claim("Episode one is complete")],
+        Vec::new(),
+    );
+    let closed_first = runtime.write_agent_checkpoint(&first).unwrap();
+    assert!(closed_first.created);
+    assert!(matches!(
+        closed_first.episode.episode.status,
+        WorkEpisodeStatus::Closed { .. }
+    ));
+
+    let retry = runtime.write_agent_checkpoint(&first).unwrap();
+    assert!(!retry.created);
+    assert_eq!(retry.checkpoint, closed_first.checkpoint);
+    assert_eq!(retry.episode, closed_first.episode);
+
+    let second = checkpoint_write(
+        &locator,
+        &task,
+        0,
+        CheckpointBoundary::Continue,
+        vec![checkpoint_claim("Episode two resumed new work")],
+        Vec::new(),
+    );
+    let opened_second = runtime.write_agent_checkpoint(&second).unwrap();
+    assert!(opened_second.created);
+    assert_ne!(
+        opened_second.episode.episode.episode_id,
+        closed_first.episode.episode.episode_id
+    );
+    assert_eq!(opened_second.episode.episode.version, 1);
+
+    let appended = checkpoint_write(
+        &locator,
+        &task,
+        1,
+        CheckpointBoundary::Continue,
+        vec![checkpoint_claim("Episode two accepts its current version")],
+        Vec::new(),
+    );
+    let appended = runtime.write_agent_checkpoint(&appended).unwrap();
+    assert!(appended.created);
+    assert_eq!(
+        appended.episode.episode.episode_id,
+        opened_second.episode.episode.episode_id
+    );
+    assert_eq!(appended.episode.episode.version, 2);
+
+    let mut old_version_conflict = second;
+    old_version_conflict.claims[0].statement = "An old Episode two parent cannot fork".to_owned();
+    assert_eq!(
+        runtime
+            .write_agent_checkpoint(&old_version_conflict)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Conflict
+    );
+
+    let close_second = checkpoint_write(
+        &locator,
+        &task,
+        2,
+        CheckpointBoundary::Close,
+        Vec::new(),
+        vec![CaptureUnknown {
+            statement: "Episode two follow-up is recorded".to_owned(),
+            blocking: false,
+            recheck_when: vec!["the follow-up is resolved".to_owned()],
+        }],
+    );
+    runtime.write_agent_checkpoint(&close_second).unwrap();
+    let closed_history = runtime
+        .list_work_episodes(task.task_session_id, 10)
+        .unwrap();
+    assert_eq!(closed_history.len(), 2);
+
+    let nonzero_after_close = checkpoint_write(
+        &locator,
+        &task,
+        2,
+        CheckpointBoundary::Continue,
+        vec![checkpoint_claim(
+            "A closed Episode rejects nonzero new work",
+        )],
+        Vec::new(),
+    );
+    assert_eq!(
+        runtime
+            .write_agent_checkpoint(&nonzero_after_close)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::StaleState
+    );
+    assert_eq!(
+        runtime
+            .list_work_episodes(task.task_session_id, 10)
+            .unwrap(),
+        closed_history,
+        "a stale closed-Episode write must leave Episode state unchanged"
+    );
+
+    let mut wrong_task = checkpoint_write(
+        &locator,
+        &task,
+        0,
+        CheckpointBoundary::Continue,
+        vec![checkpoint_claim("Task CAS must be exact")],
+        Vec::new(),
+    );
+    wrong_task.expected_task_id = TaskId::new();
+    assert_eq!(
+        runtime
+            .write_agent_checkpoint(&wrong_task)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        runtime
+            .list_work_episodes(task.task_session_id, 10)
+            .unwrap(),
+        closed_history,
+        "a Task CAS failure must not create an Episode"
+    );
+
+    let old_revision_id = task.current_intent_revision().unwrap().revision_id;
+    runtime
+        .append_intent_revision(
+            task.task_session_id,
+            old_revision_id,
+            intent("resume the same task with a revised intent"),
+        )
+        .unwrap();
+    let after_intent_update = runtime
+        .list_work_episodes(task.task_session_id, 10)
+        .unwrap();
+    let stale_intent = checkpoint_write(
+        &locator,
+        &task,
+        0,
+        CheckpointBoundary::Continue,
+        vec![checkpoint_claim("Intent CAS must be exact")],
+        Vec::new(),
+    );
+    assert_eq!(
+        runtime
+            .write_agent_checkpoint(&stale_intent)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::StaleState
+    );
+    assert_eq!(
+        runtime
+            .list_work_episodes(task.task_session_id, 10)
+            .unwrap(),
+        after_intent_update,
+        "an Intent CAS failure must not create an Episode"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn concurrent_new_episode_checkpoints_converge_and_divergent_content_cannot_fork() {
+    let temporary = TempDir::new().unwrap();
+    let runtime = Arc::new(TaskRuntime::initialize(temporary.path()).unwrap());
+    let (locator, task) = open_task(
+        &runtime,
+        "checkpoint-new-episode-race",
+        "serialize resumed checkpoints",
+    );
+    runtime
+        .write_agent_checkpoint(&checkpoint_write(
+            &locator,
+            &task,
+            0,
+            CheckpointBoundary::Close,
+            vec![checkpoint_claim("The first Episode establishes history")],
+            Vec::new(),
+        ))
+        .unwrap();
+
+    let same_new_episode = checkpoint_write(
+        &locator,
+        &task,
+        0,
+        CheckpointBoundary::Continue,
+        vec![checkpoint_claim("Concurrent resumed work is identical")],
+        Vec::new(),
+    );
+    let barrier = Arc::new(Barrier::new(20));
+    let outcomes = (0..20)
+        .map(|_| {
+            let runtime = Arc::clone(&runtime);
+            let barrier = Arc::clone(&barrier);
+            let input = same_new_episode.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                runtime.write_agent_checkpoint(&input).unwrap()
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.created).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| outcome.episode.episode.episode_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| outcome.checkpoint.checkpoint_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        1
+    );
+    assert_eq!(
+        runtime
+            .list_work_episodes(task.task_session_id, 10)
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let closed_second = runtime.close_checkpointed_work_episode(&locator).unwrap();
+    assert!(matches!(
+        closed_second,
+        AutomatedEpisodeBoundary::Closed {
+            newly_closed: true,
+            ..
+        }
+    ));
+    let barrier = Arc::new(Barrier::new(20));
+    let divergent = (0..20)
+        .map(|index| {
+            let runtime = Arc::clone(&runtime);
+            let barrier = Arc::clone(&barrier);
+            let mut input = checkpoint_write(
+                &locator,
+                &task,
+                0,
+                CheckpointBoundary::Continue,
+                vec![checkpoint_claim("Divergent resumed work")],
+                Vec::new(),
+            );
+            input.claims[0].statement = format!("Divergent resumed work {index}");
+            thread::spawn(move || {
+                barrier.wait();
+                runtime.write_agent_checkpoint(&input)
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        divergent.iter().filter(|outcome| outcome.is_ok()).count(),
+        1
+    );
+    assert!(
+        divergent
+            .iter()
+            .filter_map(|outcome| outcome.as_ref().err())
+            .all(|error| error.kind() == ErrorKind::Conflict)
+    );
+    let history = runtime
+        .list_work_episodes(task.task_session_id, 10)
+        .unwrap();
+    assert_eq!(history.len(), 3);
+    let open = history
+        .iter()
+        .filter(|episode| episode.episode.status == WorkEpisodeStatus::Open)
+        .collect::<Vec<_>>();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].checkpoints.len(), 1);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn lifecycle_boundary_requires_current_checkpoint_and_concurrent_retries_close_once() {
     let temporary = TempDir::new().unwrap();
     let runtime = Arc::new(TaskRuntime::initialize(temporary.path()).unwrap());

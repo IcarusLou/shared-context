@@ -13,11 +13,11 @@ use sctx_domain::{
     CandidateConfirmationPlan, CandidateConfirmationPrimaryReference, CandidateId,
     CandidatePrimarySelection, CandidateReviewDiagnostic, CandidateReviewStatus, CaptureId,
     CaptureUnknown, ContextId, ContextKind, ContextRevisionDraft, ContextRevisionRef,
-    ContextUseDisposition, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot,
-    NormalizedBreadcrumbKind, NormalizedWorkObservation, OptionalCandidateEdits, PublicationAction,
-    PublicationDraft, RepoRelativePath, RepositoryId, ReviewDraft, ReviewVerdict, RevisionId,
-    SpaceId, SubmissionId, TaskId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkSourceRef,
-    WorkingIntentSnapshot, candidate_submission_content_hash,
+    ContextUseDisposition, EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator,
+    IntentSnapshot, NormalizedBreadcrumbKind, NormalizedWorkObservation, OptionalCandidateEdits,
+    PublicationAction, PublicationDraft, RepoRelativePath, RepositoryId, ReviewDraft,
+    ReviewVerdict, RevisionId, SpaceId, SubmissionId, TaskId, TaskSignal, TaskSignalKind,
+    WorkEpisodeId, WorkSourceRef, WorkingIntentSnapshot, candidate_submission_content_hash,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
@@ -824,6 +824,107 @@ fn codex_and_cursor_checkpoint_inline_evidence_builds_only_after_close() {
         );
         assert_eq!(event_count(fixture.store.repository()), before_events + 1);
     }
+}
+
+#[test]
+fn mcp_closed_checkpoint_retry_then_new_episode_keeps_empty_close_and_builder_ownership() {
+    let fixture = Fixture::new();
+    let session = "mcp-multiple-episodes";
+    let task = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            session,
+            TaskBoundary::New,
+            None,
+            "resume one Task across Episodes",
+        ),
+    )
+    .unwrap();
+    let task_id = task.context.task_id;
+    let revision_id = task.context.intent_revision_id;
+    let mut first = typed_checkpoint_input(
+        session,
+        task_id,
+        revision_id,
+        0,
+        vec![TaskCheckpointEvidenceInput::InlineValidation {
+            evidence: EvidenceSnapshotDraft {
+                kind: EvidenceType::ExperimentRecord,
+                supports: "Episode one MCP checkpoint passed".to_owned(),
+                content: json!({"episode": 1, "actual": "passed"}),
+                interpretation: "The first Episode has direct evidence".to_owned(),
+                limitations: Vec::new(),
+            },
+        }],
+    );
+    first.claims[0].statement = "Episode one MCP conclusion".to_owned();
+    let first_checkpoint = task_checkpoint_at_root(&fixture.root, &first).unwrap();
+    let first_episode_id = first_checkpoint.episode_id;
+    let first_close_input = TaskCheckpointInput {
+        agent_kind: "codex".to_owned(),
+        external_session_id: session.to_owned(),
+        expected_task_id: task_id.to_string(),
+        expected_intent_revision_id: revision_id.to_string(),
+        expected_episode_version: 1,
+        boundary: TaskCheckpointBoundary::Close,
+        claims: Vec::new(),
+        unknowns: Vec::new(),
+    };
+    let first_closed = task_checkpoint_at_root(&fixture.root, &first_close_input).unwrap();
+    assert!(!first_closed.created);
+    assert_eq!(first_closed.episode_id, first_episode_id);
+    assert_eq!(
+        first_closed.candidate_build.as_ref().unwrap().status,
+        CandidateBuildResponseStatus::Complete
+    );
+
+    let closed_retry = task_checkpoint_at_root(&fixture.root, &first).unwrap();
+    assert!(!closed_retry.created);
+    assert_eq!(closed_retry.episode_id, first_episode_id);
+    assert_eq!(closed_retry.checkpoint_id, first_checkpoint.checkpoint_id);
+
+    let mut second = first.clone();
+    second.claims[0].statement = "Episode two MCP conclusion".to_owned();
+    if let TaskCheckpointEvidenceInput::InlineValidation { evidence } =
+        &mut second.claims[0].evidence[0]
+    {
+        evidence.supports = "Episode two MCP checkpoint passed".to_owned();
+        evidence.content = json!({"episode": 2, "actual": "passed"});
+        evidence.interpretation = "The second Episode has direct evidence".to_owned();
+    }
+    let second_checkpoint = task_checkpoint_at_root(&fixture.root, &second).unwrap();
+    let second_episode_id = second_checkpoint.episode_id;
+    assert!(second_checkpoint.created);
+    assert_ne!(second_episode_id, first_episode_id);
+    assert_eq!(second_checkpoint.episode_version, 1);
+
+    let second_close_input = TaskCheckpointInput {
+        expected_episode_version: 1,
+        ..first_close_input
+    };
+    let second_closed = task_checkpoint_at_root(&fixture.root, &second_close_input).unwrap();
+    assert!(!second_closed.created);
+    assert_eq!(second_closed.episode_id, second_episode_id);
+    assert_eq!(
+        second_closed.candidate_build.as_ref().unwrap().status,
+        CandidateBuildResponseStatus::Complete
+    );
+
+    let runtime = TaskRuntime::initialize(&fixture.root).unwrap();
+    let locator = ExternalSessionLocator::new("codex", session).unwrap();
+    let active = runtime.read_snapshot_by_locator(&locator).unwrap().unwrap();
+    assert_eq!(active.task_id, task_id);
+    let sources = runtime
+        .list_candidate_reviews(&locator, CandidateReviewStatus::Pending, 10, None)
+        .unwrap()
+        .records
+        .into_iter()
+        .map(|review| review.source_episode.episode_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        sources,
+        std::collections::BTreeSet::from([first_episode_id, second_episode_id])
+    );
 }
 
 #[test]
