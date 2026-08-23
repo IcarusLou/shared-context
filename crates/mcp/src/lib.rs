@@ -1085,10 +1085,10 @@ impl Runtime {
                     .current_intent_revision()
                     .ok_or_else(|| invariant("ActiveTask has no Intent Head"))?
                     .revision_id;
-                self.tasks.append_intent_revision(
+                self.tasks.append_working_intent_revision(
                     active.task_session_id,
                     parent,
-                    input.intent.bind(active.task_id),
+                    input.intent.to_working_intent()?,
                 )?;
                 self.tasks
                     .read_snapshot(active.task_session_id)?
@@ -1099,7 +1099,12 @@ impl Runtime {
                     require_expected_revision(&active, input.expected_revision_id.as_deref())?;
                     validate_intent_update(input)?;
                     self.tasks
-                        .start_new_task(&locator, active.task_id, &input.intent, Vec::new())?
+                        .start_new_task_working(
+                            &locator,
+                            active.task_id,
+                            &input.intent.to_working_intent()?,
+                            Vec::new(),
+                        )?
                         .snapshot
                 } else {
                     if input.expected_revision_id.as_deref().is_some() {
@@ -1110,7 +1115,12 @@ impl Runtime {
                     validate_intent_update(input)?;
                     let task_id = TaskId::new();
                     self.tasks
-                        .open_or_create(locator, input.intent.bind(task_id), Vec::new())?
+                        .open_or_create_working(
+                            locator,
+                            task_id,
+                            input.intent.to_working_intent()?,
+                            Vec::new(),
+                        )?
                         .snapshot
                 }
             }
@@ -1532,7 +1542,7 @@ impl Runtime {
             .intent_revisions
             .iter()
             .find(|revision| revision.revision_id == source_intent_id)
-            .map(|revision| revision.intent.clone())
+            .map(|revision| revision.working_intent.bind_task_intent(task.task_id))
             .ok_or_else(|| invariant("Candidate source Intent revision disappeared"))?;
         let signal_history = self
             .tasks
@@ -3140,7 +3150,7 @@ fn build_task_context_response(
         .current_intent_revision()
         .ok_or_else(|| invariant("Task Session has no current Intent revision"))?;
     let mut request = TaskContextRequest::automatic(
-        current.intent.clone(),
+        current.working_intent.bind_task_intent(snapshot.task_id),
         snapshot.task_signals.clone(),
         token_budget,
     );
@@ -3405,7 +3415,7 @@ impl McpServer {
         let response = self
             .runtime
             .task_intent_update(&input)
-            .map_err(ToolFailure::task_context_failed)?;
+            .map_err(ToolFailure::intent_update_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
     }
 
@@ -3741,6 +3751,18 @@ impl ToolFailure {
             ErrorKind::PrivacyRejected => "privacy_rejected",
             ErrorKind::Unsupported => "task_context_unsupported",
             _ => "task_context_failed",
+        };
+        Self { code, error }
+    }
+
+    fn intent_update_failed(error: Error) -> Self {
+        let code = match error.kind() {
+            ErrorKind::InvalidInput => "invalid_input",
+            ErrorKind::Conflict => "intent_conflict",
+            ErrorKind::StaleState => "intent_stale",
+            ErrorKind::InvariantViolation => "intent_invariant",
+            ErrorKind::Io => "intent_storage_failed",
+            _ => "intent_update_failed",
         };
         Self { code, error }
     }
@@ -4728,6 +4750,25 @@ fn write_frame<W: Write>(
         }
     }
     writer.flush().map_err(transport_io("flush MCP response"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intent_update_conflict_and_stale_errors_have_intent_specific_codes() {
+        let conflict = ToolFailure::intent_update_failed(Error::new(
+            ErrorKind::Conflict,
+            "divergent initial Working Intent",
+        ));
+        let stale = ToolFailure::intent_update_failed(Error::new(
+            ErrorKind::StaleState,
+            "stale Working Intent parent",
+        ));
+        assert_eq!(conflict.code, "intent_conflict");
+        assert_eq!(stale.code, "intent_stale");
+    }
 }
 
 fn trim_line_ending(line: &mut String) {

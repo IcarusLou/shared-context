@@ -23,10 +23,10 @@ use sctx_domain::{
     SubmissionId, TaskId, TaskIntent, TaskIntentDraft, TaskIntentRevision, TaskIntentRevisionId,
     TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle,
     TaskSignalRecord, WorkEpisode, WorkEpisodeId, WorkEpisodeRef, WorkEpisodeStatus,
-    WorkObservation, WorkObservationId, WorkSourceRef,
+    WorkObservation, WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
 };
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_EPISODE_LIST_LIMIT: usize = 256;
 pub const DEFAULT_CANDIDATE_REVIEW_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -54,6 +54,20 @@ pub struct StartNewTaskOutcome {
     pub external_session_id: ExternalSessionId,
     pub previous_task_id: TaskId,
     pub snapshot: TaskSessionSnapshot,
+}
+
+/// Exact semantic disposition of one CAS-guarded Working Intent continue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntentRevisionWriteStatus {
+    Created,
+    AlreadyCurrent,
+}
+
+/// Current or newly-created Working Intent revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppendIntentRevisionOutcome {
+    pub revision: TaskIntentRevision,
+    pub status: IntentRevisionWriteStatus,
 }
 
 /// Result of explicitly selecting a retained Task as active.
@@ -463,19 +477,33 @@ impl TaskRuntime {
     /// # Errors
     ///
     /// Returns typed validation or storage errors.
-    pub fn open_or_create(
+    pub fn open_or_create_working(
         &self,
         locator: ExternalSessionLocator,
-        initial_intent: TaskIntent,
+        task_id: TaskId,
+        initial_intent: WorkingIntentSnapshot,
         signals: Vec<TaskSignal>,
     ) -> Result<OpenSessionOutcome> {
         locator.validate()?;
         initial_intent.validate()?;
+        let requested_hash = initial_intent.canonical_semantic_hash()?;
         let signals = normalize_signals(signals)?;
         let mut connection = self.open_connection()?;
         let transaction = immediate(&mut connection, "begin open-or-create transaction")?;
         if let Some(task_session_id) = find_active_task_by_locator(&transaction, &locator)? {
             let snapshot = require_snapshot(&transaction, task_session_id)?;
+            let current = snapshot
+                .current_intent_revision()
+                .ok_or_else(|| invariant("existing ActiveTask has no Working Intent Head"))?;
+            if snapshot.intent_revisions.len() != 1
+                || current.parent_revision_id.is_some()
+                || current.semantic_hash != requested_hash
+            {
+                return Err(Error::new(
+                    ErrorKind::Conflict,
+                    "ExternalSession was concurrently initialized with different Working Intent; read the current Revision and retry explicit new with CAS",
+                ));
+            }
             transaction
                 .commit()
                 .map_err(sql_error("commit existing ExternalSession transaction"))?;
@@ -486,7 +514,8 @@ impl TaskRuntime {
         }
 
         let external_session_id = ExternalSessionId::new();
-        let snapshot = TaskSessionSnapshot::from_initial(locator, initial_intent, signals)?;
+        let snapshot =
+            TaskSessionSnapshot::from_initial(locator, task_id, initial_intent, signals)?;
         insert_external_session(
             &transaction,
             external_session_id,
@@ -504,17 +533,34 @@ impl TaskRuntime {
         })
     }
 
+    /// Mechanical pre-#167 adapter into Working Intent authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns Working Intent validation or Runtime storage errors.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn open_or_create(
+        &self,
+        locator: ExternalSessionLocator,
+        initial_intent: TaskIntent,
+        signals: Vec<TaskSignal>,
+    ) -> Result<OpenSessionOutcome> {
+        let task_id = initial_intent.task_id;
+        let working = TaskIntentDraft::from(&initial_intent).to_working_intent()?;
+        self.open_or_create_working(locator, task_id, working, signals)
+    }
+
     /// Explicitly creates and activates a new runtime-owned Task.
     ///
     /// # Errors
     ///
     /// Returns an input error for a missing Session, stale `ActiveTask` CAS guard,
     /// or invalid Task content and Signals.
-    pub fn start_new_task(
+    pub fn start_new_task_working(
         &self,
         locator: &ExternalSessionLocator,
         expected_active_task_id: TaskId,
-        initial_intent: &TaskIntentDraft,
+        initial_intent: &WorkingIntentSnapshot,
         signals: Vec<TaskSignal>,
     ) -> Result<StartNewTaskOutcome> {
         locator.validate()?;
@@ -529,7 +575,8 @@ impl TaskRuntime {
         let task_id = TaskId::new();
         let snapshot = TaskSessionSnapshot::from_initial(
             locator.clone(),
-            initial_intent.bind(task_id),
+            task_id,
+            initial_intent.clone(),
             signals,
         )?;
         let ordinal = next_task_ordinal(&transaction, external.external_session_id)?;
@@ -555,6 +602,26 @@ impl TaskRuntime {
             previous_task_id: expected_active_task_id,
             snapshot: persisted,
         })
+    }
+
+    /// Mechanical pre-#167 adapter into a new Task with Working Intent authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns Working Intent validation, CAS, or Runtime storage errors.
+    pub fn start_new_task(
+        &self,
+        locator: &ExternalSessionLocator,
+        expected_active_task_id: TaskId,
+        initial_intent: &TaskIntentDraft,
+        signals: Vec<TaskSignal>,
+    ) -> Result<StartNewTaskOutcome> {
+        self.start_new_task_working(
+            locator,
+            expected_active_task_id,
+            &initial_intent.to_working_intent()?,
+            signals,
+        )
     }
 
     /// Explicitly switches to a retained historical Task using an `ActiveTask` CAS guard.
@@ -607,33 +674,46 @@ impl TaskRuntime {
     /// # Errors
     ///
     /// Returns an input error for inactive/cross-Task/stale-parent data.
-    pub fn append_intent_revision(
+    pub fn append_working_intent_revision(
         &self,
         task_session_id: TaskSessionId,
         parent_revision_id: TaskIntentRevisionId,
-        intent: TaskIntent,
-    ) -> Result<TaskIntentRevision> {
-        intent.validate()?;
+        working_intent: WorkingIntentSnapshot,
+    ) -> Result<AppendIntentRevisionOutcome> {
+        working_intent.validate()?;
+        let semantic_hash = working_intent.canonical_semantic_hash()?;
         let mut connection = self.open_connection()?;
         let transaction = immediate(&mut connection, "begin Intent append transaction")?;
         let (task_id, current_revision_id) = read_active_task_head(&transaction, task_session_id)?
             .ok_or_else(|| {
                 invalid("task_session_id does not identify the ExternalSession ActiveTask")
             })?;
-        if intent.task_id != task_id {
-            return Err(invalid(
-                "Task Intent must belong to the Session task selected as ActiveTask",
-            ));
-        }
         if parent_revision_id != current_revision_id {
+            let current = read_intent_revision(&transaction, current_revision_id)?;
+            if current.parent_revision_id == Some(parent_revision_id)
+                && current.semantic_hash == semantic_hash
+            {
+                transaction.commit().map_err(sql_error(
+                    "commit concurrent already-current Intent transaction",
+                ))?;
+                return Ok(AppendIntentRevisionOutcome {
+                    revision: current,
+                    status: IntentRevisionWriteStatus::AlreadyCurrent,
+                });
+            }
             reject_invalid_parent(&transaction, task_session_id, task_id, parent_revision_id)?;
         }
-        let revision = TaskIntentRevision {
-            revision_id: TaskIntentRevisionId::new(),
-            parent_revision_id: Some(parent_revision_id),
-            intent,
-        };
-        revision.validate()?;
+        let current = read_intent_revision(&transaction, current_revision_id)?;
+        if current.semantic_hash == semantic_hash {
+            transaction
+                .commit()
+                .map_err(sql_error("commit already-current Intent transaction"))?;
+            return Ok(AppendIntentRevisionOutcome {
+                revision: current,
+                status: IntentRevisionWriteStatus::AlreadyCurrent,
+            });
+        }
+        let revision = TaskIntentRevision::successor(&current, working_intent)?;
         let ordinal = read_revision_ordinal(&transaction, current_revision_id)?
             .checked_add(1)
             .ok_or_else(|| invariant("Task Intent revision ordinal overflow"))?;
@@ -657,7 +737,35 @@ impl TaskRuntime {
         transaction
             .commit()
             .map_err(sql_error("commit Intent append transaction"))?;
-        Ok(revision)
+        Ok(AppendIntentRevisionOutcome {
+            revision,
+            status: IntentRevisionWriteStatus::Created,
+        })
+    }
+
+    /// Mechanical pre-#167 adapter for legacy Task-bound Intent input.
+    ///
+    /// # Errors
+    ///
+    /// Returns ownership, Working Intent validation, CAS, or storage errors.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn append_intent_revision(
+        &self,
+        task_session_id: TaskSessionId,
+        parent_revision_id: TaskIntentRevisionId,
+        intent: TaskIntent,
+    ) -> Result<AppendIntentRevisionOutcome> {
+        let snapshot = self
+            .read_snapshot(task_session_id)?
+            .ok_or_else(|| invalid("Task Session does not exist"))?;
+        if intent.task_id != snapshot.task_id {
+            return Err(invalid("Task Intent belongs to another Task"));
+        }
+        self.append_working_intent_revision(
+            task_session_id,
+            parent_revision_id,
+            TaskIntentDraft::from(&intent).to_working_intent()?,
+        )
     }
 
     /// Merges normalized Signals only into the current `ActiveTask`.
@@ -2436,10 +2544,10 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
             CREATE TABLE IF NOT EXISTS task_intent_revision (
                 task_session_id TEXT NOT NULL,
                 revision_id TEXT PRIMARY KEY,
-                task_id TEXT NOT NULL,
                 parent_revision_id TEXT,
                 revision_ordinal INTEGER NOT NULL CHECK (revision_ordinal >= 0),
-                intent_json TEXT NOT NULL CHECK (json_valid(intent_json)),
+                authority_json TEXT NOT NULL CHECK (json_valid(authority_json)),
+                semantic_hash TEXT NOT NULL,
                 UNIQUE (task_session_id, revision_id),
                 UNIQUE (task_session_id, revision_ordinal),
                 FOREIGN KEY (task_session_id) REFERENCES task_session (task_session_id),
@@ -2684,7 +2792,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 UNIQUE (episode_id, capture_id, kind),
                 FOREIGN KEY (episode_id) REFERENCES work_episode (episode_id)
             ) STRICT;
-            PRAGMA user_version = 10;",
+            PRAGMA user_version = 11;",
         )
         .map_err(sql_error("initialize task runtime schema"))
 }
@@ -2754,21 +2862,21 @@ fn insert_intent_revision(
     ordinal: i64,
     revision: &TaskIntentRevision,
 ) -> Result<()> {
-    let intent_json = serde_json::to_string(&revision.intent)
-        .map_err(json_error("serialize Task Intent revision"))?;
+    let authority_json = serde_json::to_string(&revision.working_intent)
+        .map_err(json_error("serialize Working Intent revision"))?;
     transaction
         .execute(
             "INSERT INTO task_intent_revision (
-                task_session_id, revision_id, task_id, parent_revision_id,
-                revision_ordinal, intent_json
+                task_session_id, revision_id, parent_revision_id,
+                revision_ordinal, authority_json, semantic_hash
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 task_session_id.to_string(),
                 revision.revision_id.to_string(),
-                revision.task_id().to_string(),
                 revision.parent_revision_id.map(|value| value.to_string()),
                 ordinal,
-                intent_json,
+                authority_json,
+                revision.semantic_hash,
             ],
         )
         .map_err(sql_error("insert Task Intent revision"))?;
@@ -3617,15 +3725,12 @@ fn insert_all_missing_episode_refs(
     let mut intent_statement = transaction
         .prepare(
             "SELECT revision_id FROM task_intent_revision
-             WHERE task_session_id = ?1 AND task_id = ?2
+             WHERE task_session_id = ?1
              ORDER BY revision_ordinal ASC",
         )
         .map_err(sql_error("prepare Task Intent refs"))?;
     let intent_ids = intent_statement
-        .query_map(
-            params![task_session_id.to_string(), task_id.to_string()],
-            |row| row.get::<_, String>(0),
-        )
+        .query_map([task_session_id.to_string()], |row| row.get::<_, String>(0))
         .map_err(sql_error("query Task Intent refs"))?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(sql_error("read Task Intent ref"))?;
@@ -4415,7 +4520,10 @@ fn reject_invalid_parent(
 ) -> Result<()> {
     let owner = transaction
         .query_row(
-            "SELECT task_session_id, task_id FROM task_intent_revision WHERE revision_id = ?1",
+            "SELECT revision.task_session_id, task.task_id
+             FROM task_intent_revision AS revision
+             JOIN task_session AS task ON task.task_session_id = revision.task_session_id
+             WHERE revision.revision_id = ?1",
             [parent_revision_id.to_string()],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
@@ -4591,7 +4699,7 @@ fn read_intent_revisions(
 ) -> Result<Vec<TaskIntentRevision>> {
     let mut statement = transaction
         .prepare(
-            "SELECT revision_id, parent_revision_id, task_id, intent_json
+            "SELECT revision_id, parent_revision_id, authority_json, semantic_hash
              FROM task_intent_revision
              WHERE task_session_id = ?1 ORDER BY revision_ordinal ASC",
         )
@@ -4608,23 +4716,58 @@ fn read_intent_revisions(
         .map_err(sql_error("query Intent revisions"))?;
     let mut revisions = Vec::new();
     for row in rows {
-        let (revision_id, parent_revision_id, stored_task_id, intent_json) =
+        let (revision_id, parent_revision_id, authority_json, semantic_hash) =
             row.map_err(sql_error("read Intent revision row"))?;
-        let stored_task_id: TaskId = parse_id(&stored_task_id, "revision.task_id")?;
-        let intent: TaskIntent =
-            serde_json::from_str(&intent_json).map_err(json_error("parse Task Intent"))?;
-        if stored_task_id != intent.task_id {
-            return Err(invariant("Intent JSON identity differs from runtime row"));
-        }
-        revisions.push(TaskIntentRevision {
+        let working_intent: WorkingIntentSnapshot = serde_json::from_str(&authority_json)
+            .map_err(json_error("parse Working Intent authority"))?;
+        let revision = TaskIntentRevision {
             revision_id: parse_id(&revision_id, "revision.revision_id")?,
             parent_revision_id: parent_revision_id
                 .map(|value| parse_id(&value, "revision.parent_revision_id"))
                 .transpose()?,
-            intent,
-        });
+            working_intent,
+            semantic_hash,
+        };
+        revision.validate()?;
+        revisions.push(revision);
     }
     Ok(revisions)
+}
+
+fn read_intent_revision(
+    connection: &Connection,
+    revision_id: TaskIntentRevisionId,
+) -> Result<TaskIntentRevision> {
+    connection
+        .query_row(
+            "SELECT parent_revision_id, authority_json, semantic_hash
+             FROM task_intent_revision WHERE revision_id = ?1",
+            [revision_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error("read Working Intent revision"))?
+        .map(|(parent_revision_id, authority_json, semantic_hash)| {
+            let revision = TaskIntentRevision {
+                revision_id,
+                parent_revision_id: parent_revision_id
+                    .map(|value| parse_id(&value, "revision.parent_revision_id"))
+                    .transpose()?,
+                working_intent: serde_json::from_str(&authority_json)
+                    .map_err(json_error("parse Working Intent authority"))?,
+                semantic_hash,
+            };
+            revision.validate()?;
+            Ok(revision)
+        })
+        .transpose()?
+        .ok_or_else(|| invariant("ActiveTask Working Intent Head disappeared"))
 }
 
 fn read_active_task_signals(

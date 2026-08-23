@@ -4,11 +4,12 @@ use std::{
     thread,
 };
 
+use rusqlite::Connection;
 use sctx_domain::{
     ErrorKind, ExternalSessionLocator, TaskId, TaskIntent, TaskIntentDraft, TaskSignal,
-    TaskSignalKind, TaskSignalLifecycle,
+    TaskSignalKind, TaskSignalLifecycle, WorkingIntentSnapshot,
 };
-use sctx_task_runtime::TaskRuntime;
+use sctx_task_runtime::{IntentRevisionWriteStatus, TaskRuntime};
 use tempfile::TempDir;
 
 fn intent(task_id: TaskId, goal: &str) -> TaskIntent {
@@ -41,6 +42,10 @@ fn signal(kind: TaskSignalKind, content: &str) -> TaskSignal {
 
 fn intent_draft(goal: &str) -> TaskIntentDraft {
     TaskIntentDraft::from(&intent(TaskId::new(), goal))
+}
+
+fn working(goal: &str) -> WorkingIntentSnapshot {
+    intent_draft(goal).to_working_intent().unwrap()
 }
 
 #[test]
@@ -88,12 +93,11 @@ fn open_or_create_is_atomic_and_keeps_one_initial_revision() {
 }
 
 #[test]
-fn concurrent_open_or_create_returns_one_shared_session() {
+fn twenty_concurrent_identical_initial_requests_return_one_task_and_revision() {
     let root = TempDir::new().unwrap();
     let runtime = Arc::new(TaskRuntime::initialize(root.path()).unwrap());
-    let worker_count = 8;
+    let worker_count = 20;
     let barrier = Arc::new(Barrier::new(worker_count));
-    let task_id = TaskId::new();
     let mut workers = Vec::new();
 
     for _ in 0..worker_count {
@@ -104,7 +108,7 @@ fn concurrent_open_or_create_returns_one_shared_session() {
             runtime
                 .open_or_create(
                     locator("shared-session"),
-                    intent(task_id, "shared task"),
+                    intent(TaskId::new(), "shared task"),
                     vec![],
                 )
                 .unwrap()
@@ -121,6 +125,96 @@ fn concurrent_open_or_create_returns_one_shared_session() {
         outcomes
             .iter()
             .all(|outcome| outcome.snapshot.task_session_id == first_session_id)
+    );
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| outcome.snapshot.intent_revisions.len() == 1)
+    );
+}
+
+#[test]
+fn concurrent_divergent_initial_requests_choose_one_and_reject_every_other_without_overwrite() {
+    let root = TempDir::new().unwrap();
+    let runtime = Arc::new(TaskRuntime::initialize(root.path()).unwrap());
+    let barrier = Arc::new(Barrier::new(20));
+    let outcomes = (0..20)
+        .map(|index| {
+            let runtime = Arc::clone(&runtime);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let goal = format!("divergent authoritative goal {index}");
+                let result = runtime.open_or_create_working(
+                    locator("divergent-session"),
+                    TaskId::new(),
+                    working(&goal),
+                    Vec::new(),
+                );
+                (goal, result)
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes.iter().filter(|(_, result)| result.is_ok()).count(),
+        1
+    );
+    assert!(
+        outcomes
+            .iter()
+            .filter_map(|(_, result)| result.as_ref().err())
+            .all(|error| error.kind() == ErrorKind::Conflict
+                && error.message().contains("different Working Intent"))
+    );
+    let (winning_goal, winning) = outcomes
+        .iter()
+        .find_map(|(goal, result)| result.as_ref().ok().map(|value| (goal, value)))
+        .unwrap();
+    assert!(winning.created);
+    let persisted = runtime
+        .read_snapshot_by_locator(&locator("divergent-session"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.task_id, winning.snapshot.task_id);
+    assert_eq!(persisted.intent_revisions.len(), 1);
+    assert_eq!(
+        &persisted.intent_revisions[0].working_intent.goal, winning_goal,
+        "losing divergent requests must not overwrite authoritative text"
+    );
+}
+
+#[test]
+fn sequential_existing_locator_with_different_initial_intent_is_rejected_without_write() {
+    let root = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(root.path()).unwrap();
+    let created = runtime
+        .open_or_create_working(
+            locator("sequential-divergent"),
+            TaskId::new(),
+            working("first authoritative text"),
+            Vec::new(),
+        )
+        .unwrap();
+    let error = runtime
+        .open_or_create_working(
+            locator("sequential-divergent"),
+            TaskId::new(),
+            working("different authoritative text"),
+            Vec::new(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Conflict);
+    let persisted = runtime
+        .read_snapshot(created.snapshot.task_session_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.intent_revisions.len(), 1);
+    assert_eq!(
+        persisted.intent_revisions[0].working_intent.goal,
+        "first authoritative text"
     );
 }
 
@@ -159,10 +253,10 @@ fn intent_append_advances_one_linear_head_and_rejects_cross_task_parents() {
         .unwrap()
         .unwrap();
     assert_eq!(snapshot.intent_revisions.len(), 2);
-    assert_eq!(revision.parent_revision_id, Some(first_parent));
+    assert_eq!(revision.revision.parent_revision_id, Some(first_parent));
     assert_eq!(
         snapshot.current_intent_revision().unwrap().revision_id,
-        revision.revision_id
+        revision.revision.revision_id
     );
 
     let stale = runtime
@@ -188,12 +282,185 @@ fn intent_append_advances_one_linear_head_and_rejects_cross_task_parents() {
     let mixed_task = runtime
         .append_intent_revision(
             first.task_session_id,
-            revision.revision_id,
+            revision.revision.revision_id,
             intent(second.task_id, "mixed task"),
         )
         .unwrap_err();
     assert_eq!(mixed_task.kind(), ErrorKind::InvalidInput);
-    assert!(mixed_task.message().contains("Session task"));
+    assert!(mixed_task.message().contains("another Task"));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn working_intent_continue_is_semantically_idempotent_and_stale_changes_write_nothing() {
+    let root = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(root.path()).unwrap();
+    let task_id = TaskId::new();
+    let initial_working = WorkingIntentSnapshot {
+        goal: "Implement Search Result".to_owned(),
+        current_direction: Some("Use the existing API".to_owned()),
+        in_scope: vec!["Frontend".to_owned(), "Contract".to_owned()],
+        out_of_scope: Vec::new(),
+        domains: vec!["Search".to_owned()],
+        platforms: Vec::new(),
+        constraints: Vec::new(),
+        acceptance_conditions: Vec::new(),
+        artifact_hints: Vec::new(),
+        interface_hints: Vec::new(),
+        open_questions: Vec::new(),
+    };
+    let session = runtime
+        .open_or_create_working(
+            locator("working-idempotent"),
+            task_id,
+            initial_working.clone(),
+            Vec::new(),
+        )
+        .unwrap()
+        .snapshot;
+    let parent = session.current_intent_revision().unwrap().revision_id;
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    let columns = connection
+        .prepare("PRAGMA table_info(task_intent_revision)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(columns.contains(&"authority_json".to_owned()));
+    assert!(columns.contains(&"semantic_hash".to_owned()));
+    for forbidden in [
+        "task_id",
+        "intent_json",
+        "maturity",
+        "evidence",
+        "evidence_refs",
+    ] {
+        assert!(!columns.iter().any(|column| column == forbidden));
+    }
+    let authority: String = connection
+        .query_row(
+            "SELECT authority_json FROM task_intent_revision WHERE revision_id = ?1",
+            [parent.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<WorkingIntentSnapshot>(&authority).unwrap(),
+        initial_working
+    );
+    drop(connection);
+    let mut equivalent = initial_working.clone();
+    equivalent.goal = "  implement   SEARCH result  ".to_owned();
+    equivalent.current_direction = Some("use THE existing api".to_owned());
+    equivalent.in_scope.reverse();
+    let already = runtime
+        .append_working_intent_revision(session.task_session_id, parent, equivalent)
+        .unwrap();
+    assert_eq!(already.status, IntentRevisionWriteStatus::AlreadyCurrent);
+    assert_eq!(already.revision.revision_id, parent);
+    assert_eq!(
+        runtime
+            .read_snapshot(session.task_session_id)
+            .unwrap()
+            .unwrap()
+            .intent_revisions
+            .len(),
+        1
+    );
+
+    let mut changed = initial_working.clone();
+    changed.current_direction = Some("Adopt the v2 API".to_owned());
+    let created = runtime
+        .append_working_intent_revision(session.task_session_id, parent, changed.clone())
+        .unwrap();
+    assert_eq!(created.status, IntentRevisionWriteStatus::Created);
+    assert_ne!(created.revision.revision_id, parent);
+    let retry = runtime
+        .append_working_intent_revision(session.task_session_id, parent, changed)
+        .unwrap();
+    assert_eq!(retry.status, IntentRevisionWriteStatus::AlreadyCurrent);
+    assert_eq!(retry.revision.revision_id, created.revision.revision_id);
+
+    let mut stale_change = initial_working.clone();
+    stale_change.current_direction = Some("Choose a third implementation".to_owned());
+    assert!(
+        runtime
+            .append_working_intent_revision(session.task_session_id, parent, stale_change)
+            .is_err()
+    );
+    let persisted = runtime
+        .read_snapshot(session.task_session_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.intent_revisions.len(), 2);
+    assert_eq!(
+        persisted.current_intent_revision().unwrap().revision_id,
+        created.revision.revision_id
+    );
+    assert_eq!(
+        persisted.intent_revisions[0].working_intent, initial_working,
+        "authoritative text must not be rewritten by canonical comparison"
+    );
+}
+
+#[test]
+fn twenty_concurrent_identical_working_intent_continues_converge_to_one_revision() {
+    let root = TempDir::new().unwrap();
+    let runtime = Arc::new(TaskRuntime::initialize(root.path()).unwrap());
+    let task_id = TaskId::new();
+    let session = runtime
+        .open_or_create_working(
+            locator("working-concurrent"),
+            task_id,
+            working("initial Working Intent"),
+            Vec::new(),
+        )
+        .unwrap()
+        .snapshot;
+    let parent = session.current_intent_revision().unwrap().revision_id;
+    let next = working("one shared successor");
+    let barrier = Arc::new(Barrier::new(20));
+    let outcomes = (0..20)
+        .map(|_| {
+            let runtime = Arc::clone(&runtime);
+            let barrier = Arc::clone(&barrier);
+            let next = next.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                runtime
+                    .append_working_intent_revision(session.task_session_id, parent, next)
+                    .unwrap()
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| outcome.status == IntentRevisionWriteStatus::Created)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| outcome.revision.revision_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        1
+    );
+    assert_eq!(
+        runtime
+            .read_snapshot(session.task_session_id)
+            .unwrap()
+            .unwrap()
+            .intent_revisions
+            .len(),
+        2
+    );
 }
 
 #[test]
@@ -658,6 +925,39 @@ fn concurrent_new_task_cas_creates_exactly_one_history_entry() {
     assert_eq!(external.tasks.len(), 2);
     assert_ne!(external.active_task_id, initial.task_id);
     assert!(external.validate().is_ok());
+}
+
+#[test]
+fn explicit_new_with_identical_working_intent_always_creates_a_distinct_task() {
+    let root = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(root.path()).unwrap();
+    let external_locator = locator("identical-new-tasks");
+    let same = working("identical explicit new content");
+    let first = runtime
+        .open_or_create_working(
+            external_locator.clone(),
+            TaskId::new(),
+            same.clone(),
+            Vec::new(),
+        )
+        .unwrap()
+        .snapshot;
+    let second = runtime
+        .start_new_task_working(&external_locator, first.task_id, &same, Vec::new())
+        .unwrap()
+        .snapshot;
+    assert_ne!(first.task_id, second.task_id);
+    assert_ne!(first.task_session_id, second.task_session_id);
+    let history = runtime
+        .read_external_session_by_locator(&external_locator)
+        .unwrap()
+        .unwrap();
+    assert_eq!(history.tasks.len(), 2);
+    assert_eq!(history.active_task_id, second.task_id);
+    assert_eq!(
+        history.tasks[0].intent_revisions[0].semantic_hash,
+        history.tasks[1].intent_revisions[0].semantic_hash
+    );
 }
 
 #[test]

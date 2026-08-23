@@ -19,7 +19,8 @@ use sctx_task_runtime::{
     AgentCheckpointWrite, AutomatedEpisodeBoundary, CandidateBuildItemPreparation,
     CandidateBuildItemStatus, CandidateBuildStatus, CandidateReviewDiscard,
     CandidateReviewDiscardStatus, CaptureIngestion, CheckpointBoundary, CheckpointClaimDraft,
-    DEFAULT_CANDIDATE_REVIEW_TTL, MAX_CANDIDATE_REVIEW_TTL, TaskRuntime, WorkEpisodeDiagnosticKind,
+    DEFAULT_CANDIDATE_REVIEW_TTL, IntentRevisionWriteStatus, MAX_CANDIDATE_REVIEW_TTL, TaskRuntime,
+    WorkEpisodeDiagnosticKind,
 };
 use tempfile::TempDir;
 
@@ -1081,6 +1082,29 @@ fn intent_and_signal_refs_advance_only_through_explicit_episode_api() {
     assert_eq!(opened.episode.signal_refs.len(), 1);
 
     let current = initial.current_intent_revision().unwrap().revision_id;
+    let same = runtime
+        .append_working_intent_revision(
+            initial.task_session_id,
+            current,
+            initial
+                .current_intent_revision()
+                .unwrap()
+                .working_intent
+                .clone(),
+        )
+        .unwrap();
+    assert_eq!(same.status, IntentRevisionWriteStatus::AlreadyCurrent);
+    assert_eq!(same.revision.revision_id, current);
+    assert_eq!(
+        runtime
+            .read_work_episode(opened.episode.episode_id)
+            .unwrap()
+            .unwrap()
+            .episode
+            .intent_revisions
+            .revision_ids,
+        vec![current]
+    );
     let revision = runtime
         .append_intent_revision(
             initial.task_session_id,
@@ -1113,7 +1137,7 @@ fn intent_and_signal_refs_advance_only_through_explicit_episode_api() {
     assert_eq!(advanced.episode.episode.version, 1);
     assert_eq!(
         advanced.episode.episode.intent_revisions.last(),
-        revision.revision_id
+        revision.revision.revision_id
     );
     assert!(
         advanced
@@ -1146,7 +1170,7 @@ fn intent_and_signal_refs_advance_only_through_explicit_episode_api() {
         .append_work_observation(
             opened.episode.episode_id,
             1,
-            revision.revision_id,
+            revision.revision.revision_id,
             vec![WorkSourceRef::TaskSignal(test_signal)],
             NormalizedWorkObservation::TestOutcome {
                 test_name: "ContractTest".to_owned(),

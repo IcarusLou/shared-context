@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ContextId, Error, ErrorKind, ExternalSessionId, Result, SignalId, SpaceId, TaskId,
-    TaskIntentRevisionId, TaskSessionId,
+    TaskIntentRevisionId, TaskSessionId, WorkingIntentSnapshot,
 };
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -136,6 +136,53 @@ impl TaskIntentDraft {
     pub fn validate(&self) -> Result<()> {
         self.bind(TaskId::new()).validate()
     }
+
+    /// Mechanically maps the pre-#167 public draft into Working Intent authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns Working Intent validation and bound errors.
+    pub fn to_working_intent(&self) -> Result<WorkingIntentSnapshot> {
+        let snapshot = WorkingIntentSnapshot {
+            goal: self.goal.clone(),
+            current_direction: Some(self.desired_change.clone()),
+            in_scope: self.in_scope.clone(),
+            out_of_scope: self.out_of_scope.clone(),
+            domains: self.domains.clone(),
+            platforms: self.platforms.clone(),
+            constraints: self.constraints.clone(),
+            acceptance_conditions: self.acceptance_conditions.clone(),
+            artifact_hints: self.artifacts.clone(),
+            interface_hints: self.interfaces.clone(),
+            open_questions: self.unknowns.clone(),
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+}
+
+impl WorkingIntentSnapshot {
+    /// Mechanically supplies Task identity to legacy retrieval consumers until #167.
+    #[must_use]
+    pub fn bind_task_intent(&self, task_id: TaskId) -> TaskIntent {
+        TaskIntent {
+            task_id,
+            goal: self.goal.clone(),
+            desired_change: self
+                .current_direction
+                .clone()
+                .unwrap_or_else(|| self.goal.clone()),
+            in_scope: self.in_scope.clone(),
+            out_of_scope: self.out_of_scope.clone(),
+            domains: self.domains.clone(),
+            platforms: self.platforms.clone(),
+            constraints: self.constraints.clone(),
+            acceptance_conditions: self.acceptance_conditions.clone(),
+            artifacts: self.artifact_hints.clone(),
+            interfaces: self.interface_hints.clone(),
+            unknowns: self.open_questions.clone(),
+        }
+    }
 }
 
 impl From<&TaskIntent> for TaskIntentDraft {
@@ -210,7 +257,8 @@ impl ExternalSessionLocator {
 pub struct TaskIntentRevision {
     pub revision_id: TaskIntentRevisionId,
     pub parent_revision_id: Option<TaskIntentRevisionId>,
-    pub intent: TaskIntent,
+    pub working_intent: WorkingIntentSnapshot,
+    pub semantic_hash: String,
 }
 
 impl TaskIntentRevision {
@@ -219,12 +267,14 @@ impl TaskIntentRevision {
     /// # Errors
     ///
     /// Returns [`ErrorKind::InvalidInput`] when the Task Intent is invalid.
-    pub fn initial(intent: TaskIntent) -> Result<Self> {
-        intent.validate()?;
+    pub fn initial(working_intent: WorkingIntentSnapshot) -> Result<Self> {
+        working_intent.validate()?;
+        let semantic_hash = working_intent.canonical_semantic_hash()?;
         Ok(Self {
             revision_id: TaskIntentRevisionId::new(),
             parent_revision_id: None,
-            intent,
+            working_intent,
+            semantic_hash,
         })
     }
 
@@ -232,27 +282,17 @@ impl TaskIntentRevision {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::InvalidInput`] when the new Intent is invalid or
-    /// belongs to a different Task.
-    pub fn successor(parent: &Self, intent: TaskIntent) -> Result<Self> {
+    /// Returns [`ErrorKind::InvalidInput`] when the new Working Intent is invalid.
+    pub fn successor(parent: &Self, working_intent: WorkingIntentSnapshot) -> Result<Self> {
         parent.validate()?;
-        intent.validate()?;
-        if intent.task_id != parent.task_id() {
-            return Err(invalid(
-                "task_intent_revision successor must belong to the parent task",
-            ));
-        }
+        working_intent.validate()?;
+        let semantic_hash = working_intent.canonical_semantic_hash()?;
         Ok(Self {
             revision_id: TaskIntentRevisionId::new(),
             parent_revision_id: Some(parent.revision_id),
-            intent,
+            working_intent,
+            semantic_hash,
         })
-    }
-
-    /// Returns the Task whose understanding this revision records.
-    #[must_use]
-    pub const fn task_id(&self) -> TaskId {
-        self.intent.task_id
     }
 
     /// Validates this revision without consulting a Session history.
@@ -262,9 +302,14 @@ impl TaskIntentRevision {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::InvalidInput`] for an invalid Intent or self-parent.
+    /// Returns [`ErrorKind::InvalidInput`] for invalid authority/hash or self-parent.
     pub fn validate(&self) -> Result<()> {
-        self.intent.validate()?;
+        self.working_intent.validate()?;
+        if self.semantic_hash != self.working_intent.canonical_semantic_hash()? {
+            return Err(invalid(
+                "task_intent_revision semantic_hash must match Working Intent semantics",
+            ));
+        }
         if self.parent_revision_id == Some(self.revision_id) {
             return Err(invalid("task_intent_revision cannot name itself as parent"));
         }
@@ -295,17 +340,17 @@ impl TaskSessionSnapshot {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::InvalidInput`] when the locator, Intent, or signals
+    /// Returns [`ErrorKind::InvalidInput`] when the locator, Working Intent, or signals
     /// are invalid.
     pub fn from_initial(
         external_session_locator: ExternalSessionLocator,
-        intent: TaskIntent,
+        task_id: TaskId,
+        working_intent: WorkingIntentSnapshot,
         task_signals: Vec<TaskSignal>,
     ) -> Result<Self> {
         external_session_locator.validate()?;
         TaskSignal::validate_collection(&task_signals)?;
-        let task_id = intent.task_id;
-        let initial_revision = TaskIntentRevision::initial(intent)?;
+        let initial_revision = TaskIntentRevision::initial(working_intent)?;
         let snapshot = Self {
             task_session_id: TaskSessionId::new(),
             task_id,
@@ -331,13 +376,16 @@ impl TaskSessionSnapshot {
     /// # Errors
     ///
     /// Returns [`ErrorKind::InvalidInput`] when the existing Session is invalid,
-    /// the Intent is invalid, or the Intent belongs to another Task.
-    pub fn append_intent(&mut self, intent: TaskIntent) -> Result<TaskIntentRevisionId> {
+    /// or the Working Intent is invalid.
+    pub fn append_intent(
+        &mut self,
+        working_intent: WorkingIntentSnapshot,
+    ) -> Result<TaskIntentRevisionId> {
         self.validate()?;
         let parent = self.current_intent_revision().ok_or_else(|| {
             invalid("task_session.intent_revisions must contain an initial revision")
         })?;
-        let revision = TaskIntentRevision::successor(parent, intent)?;
+        let revision = TaskIntentRevision::successor(parent, working_intent)?;
         let revision_id = revision.revision_id;
         self.intent_revisions.push(revision);
         Ok(revision_id)
@@ -363,11 +411,6 @@ impl TaskSessionSnapshot {
         let mut expected_parent = None;
         for (index, revision) in self.intent_revisions.iter().enumerate() {
             revision.validate()?;
-            if revision.task_id() != self.task_id {
-                return Err(invalid(format!(
-                    "task_session.intent_revisions[{index}] must belong to the session task"
-                )));
-            }
             if !revision_ids.insert(revision.revision_id) {
                 return Err(invalid(
                     "task_session.intent_revisions must not repeat a revision",
@@ -636,6 +679,7 @@ mod tests {
     };
     use crate::{
         ContextId, ErrorKind, ExternalSessionId, SignalId, SpaceId, TaskId, TaskSessionId,
+        WorkingIntentSnapshot,
     };
 
     fn intent() -> TaskIntent {
@@ -661,6 +705,20 @@ mod tests {
 
     fn intent_draft() -> TaskIntentDraft {
         TaskIntentDraft::from(&intent())
+    }
+
+    fn working(intent: &TaskIntent) -> WorkingIntentSnapshot {
+        TaskIntentDraft::from(intent).to_working_intent().unwrap()
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn session_from_intent(
+        locator: ExternalSessionLocator,
+        intent: TaskIntent,
+        signals: Vec<TaskSignal>,
+    ) -> crate::Result<TaskSessionSnapshot> {
+        let working_intent = TaskIntentDraft::from(&intent).to_working_intent()?;
+        TaskSessionSnapshot::from_initial(locator, intent.task_id, working_intent, signals)
     }
 
     fn locator(external_session_id: &str) -> ExternalSessionLocator {
@@ -747,7 +805,7 @@ mod tests {
     fn task_session_starts_with_one_parentless_intent_revision() {
         let intent = intent();
         let task_id = intent.task_id;
-        let session = TaskSessionSnapshot::from_initial(locator("session-a"), intent, vec![])
+        let session = session_from_intent(locator("session-a"), intent, vec![])
             .expect("valid initial Task Session");
 
         assert_eq!(session.task_id, task_id);
@@ -765,15 +823,14 @@ mod tests {
     #[test]
     fn task_intent_revisions_form_a_linear_parent_chain() {
         let task_id = TaskId::new();
-        let mut session =
-            TaskSessionSnapshot::from_initial(locator("session-a"), intent_for(task_id), vec![])
-                .expect("valid initial Task Session");
+        let mut session = session_from_intent(locator("session-a"), intent_for(task_id), vec![])
+            .expect("valid initial Task Session");
         let initial_id = session.intent_revisions[0].revision_id;
 
         let mut second_intent = intent_for(task_id);
         second_intent.unknowns.clear();
         let second_id = session
-            .append_intent(second_intent)
+            .append_intent(working(&second_intent))
             .expect("valid successor");
 
         assert_eq!(session.intent_revisions[1].revision_id, second_id);
@@ -785,32 +842,23 @@ mod tests {
     }
 
     #[test]
-    fn task_session_rejects_mixed_tasks() {
-        let mut session = TaskSessionSnapshot::from_initial(locator("session-a"), intent(), vec![])
+    fn task_session_rejects_mismatched_semantic_hash() {
+        let mut session = session_from_intent(locator("session-a"), intent(), vec![])
             .expect("valid initial Task Session");
         let parent = session.intent_revisions[0].clone();
-
-        let error = TaskIntentRevision::successor(&parent, intent())
-            .expect_err("mixed Task successor must fail");
-        assert_eq!(error.kind(), ErrorKind::InvalidInput);
-        assert!(error.message().contains("parent task"));
-
-        session.intent_revisions.push(TaskIntentRevision {
-            revision_id: crate::TaskIntentRevisionId::new(),
-            parent_revision_id: Some(parent.revision_id),
-            intent: intent(),
-        });
+        let mut revision = TaskIntentRevision::successor(&parent, working(&intent())).unwrap();
+        revision.semantic_hash = "sha256:wrong".to_owned();
+        session.intent_revisions.push(revision);
         let error = session
             .validate()
-            .expect_err("mixed Task history must fail");
-        assert!(error.message().contains("session task"));
+            .expect_err("mismatched semantic hash must fail");
+        assert!(error.message().contains("semantic_hash"));
     }
 
     #[test]
     fn task_session_rejects_duplicate_or_disconnected_revisions() {
-        let mut duplicate =
-            TaskSessionSnapshot::from_initial(locator("session-a"), intent(), vec![])
-                .expect("valid initial Task Session");
+        let mut duplicate = session_from_intent(locator("session-a"), intent(), vec![])
+            .expect("valid initial Task Session");
         duplicate
             .intent_revisions
             .push(duplicate.intent_revisions[0].clone());
@@ -821,12 +869,15 @@ mod tests {
 
         let task_id = TaskId::new();
         let mut disconnected =
-            TaskSessionSnapshot::from_initial(locator("session-b"), intent_for(task_id), vec![])
+            session_from_intent(locator("session-b"), intent_for(task_id), vec![])
                 .expect("valid initial Task Session");
         disconnected.intent_revisions.push(TaskIntentRevision {
             revision_id: crate::TaskIntentRevisionId::new(),
             parent_revision_id: None,
-            intent: intent_for(task_id),
+            working_intent: working(&intent_for(task_id)),
+            semantic_hash: working(&intent_for(task_id))
+                .canonical_semantic_hash()
+                .unwrap(),
         });
         let error = disconnected
             .validate()
@@ -838,9 +889,9 @@ mod tests {
     fn task_session_rejects_empty_intent_or_external_locator_boundaries() {
         let mut empty_intent = intent();
         empty_intent.desired_change = "  ".to_owned();
-        let error = TaskSessionSnapshot::from_initial(locator("session-a"), empty_intent, vec![])
+        let error = session_from_intent(locator("session-a"), empty_intent, vec![])
             .expect_err("empty Intent must fail");
-        assert!(error.message().contains("task_intent.desired_change"));
+        assert!(error.message().contains("working_intent.current_direction"));
 
         for (agent_kind, external_session_id, field) in [
             (" ", "session-a", "agent_kind"),
@@ -859,18 +910,14 @@ mod tests {
             kind: TaskSignalKind::Workspace,
             content: "/work/shared-repository".to_owned(),
         };
-        let first = TaskSessionSnapshot::from_initial(
+        let first = session_from_intent(
             locator("session-a"),
             intent(),
             vec![workspace_signal.clone()],
         )
         .expect("first Task Session");
-        let second = TaskSessionSnapshot::from_initial(
-            locator("session-b"),
-            intent(),
-            vec![workspace_signal],
-        )
-        .expect("second Task Session");
+        let second = session_from_intent(locator("session-b"), intent(), vec![workspace_signal])
+            .expect("second Task Session");
 
         assert_ne!(first.task_session_id, second.task_session_id);
         assert_ne!(first.task_id, second.task_id);
@@ -884,7 +931,7 @@ mod tests {
     #[test]
     fn external_session_retains_history_and_selects_exactly_one_active_task() {
         let shared_locator = locator("external-session");
-        let first = TaskSessionSnapshot::from_initial(
+        let first = session_from_intent(
             shared_locator.clone(),
             intent(),
             vec![TaskSignal {
@@ -893,7 +940,7 @@ mod tests {
             }],
         )
         .unwrap();
-        let second = TaskSessionSnapshot::from_initial(
+        let second = session_from_intent(
             shared_locator.clone(),
             intent(),
             vec![TaskSignal {
@@ -967,7 +1014,7 @@ mod tests {
 
     #[test]
     fn serialized_task_intent_revision_and_session_have_no_route_fields() {
-        let session = TaskSessionSnapshot::from_initial(
+        let session = session_from_intent(
             locator("session-a"),
             intent(),
             vec![TaskSignal {
