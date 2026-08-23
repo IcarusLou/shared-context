@@ -524,6 +524,11 @@ fn assert_typed_m2_path(path: &TaskRetrievalPath) {
             assert!(!matched_fields.is_empty());
             assert!(!matched_tokens.is_empty());
         }
+        TaskRetrievalPath::WorkingIntentHintText { explanation } => {
+            assert!(!explanation.matched_tokens.is_empty());
+            assert!(explanation.query_token_coverage_basis_points > 0);
+            assert!(explanation.fusion_contribution_micros > 0);
+        }
         TaskRetrievalPath::ExactScope { dimension, value } => {
             assert!(!dimension.is_empty());
             assert!(!value.is_empty());

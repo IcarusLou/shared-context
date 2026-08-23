@@ -376,6 +376,10 @@ pub struct IntentConflictHandoffExplanation {
 pub enum TaskAssociationChannel {
     ResolvedArtifactExact,
     ContextRelation,
+    ArtifactHintSpaceIntentBm25,
+    ArtifactHintAcceptedContextBm25,
+    InterfaceHintSpaceIntentBm25,
+    InterfaceHintAcceptedContextBm25,
     SpaceIntentBm25,
     AcceptedContextBm25,
     ExactScope,
@@ -468,6 +472,34 @@ pub struct TaskGraphDiagnostic {
     pub resolved_focus: ResolvedFocus,
 }
 
+/// Working Intent field that supplied one non-factual text-retrieval Hint.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkingIntentHintField {
+    ArtifactHints,
+    InterfaceHints,
+}
+
+/// FTS projection matched by one Working Intent Hint without resolving an Artifact.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkingIntentHintTarget {
+    SpaceIntentFts,
+    AcceptedContextFts,
+}
+
+/// Typed explanation for one positive, text-only Working Intent Hint retrieval path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkingIntentHintTextExplanation {
+    pub source_field: WorkingIntentHintField,
+    pub target: WorkingIntentHintTarget,
+    pub matched_tokens: Vec<String>,
+    pub phrase_match: bool,
+    pub query_token_coverage_basis_points: u16,
+    pub bm25_micros: i64,
+    pub fusion_contribution_micros: u32,
+}
+
 /// Explainable route from the Task to one returned Context.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
@@ -489,6 +521,9 @@ pub enum TaskRetrievalPath {
     ContextFts {
         matched_fields: Vec<MatchField>,
         matched_tokens: Vec<String>,
+    },
+    WorkingIntentHintText {
+        explanation: WorkingIntentHintTextExplanation,
     },
     ExactScope {
         dimension: String,
@@ -698,7 +733,8 @@ impl SearchEngine {
             focus.validate()?;
         }
         let query_tokens = association_query_tokens(intent, signals);
-        let query_phrases = task_query_phrases(intent, signals, false);
+        let query_phrases = association_query_phrases(intent, signals);
+        let hint_queries = working_intent_hint_queries(intent);
         let scope_targets = ScopeTargets::from_intent(intent);
         for _attempt in 0..3 {
             let graph_snapshot = self.read_graph_snapshot();
@@ -709,6 +745,7 @@ impl SearchEngine {
                     task_id,
                     &query_tokens,
                     &query_phrases,
+                    &hint_queries,
                     &scope_targets,
                     resolved_focus,
                     graph,
@@ -748,7 +785,8 @@ impl SearchEngine {
         let fingerprint = task_fingerprint(&request.working_intent, &request.task_signals)?;
         let query_tokens = association_query_tokens(&request.working_intent, &request.task_signals);
         let query_phrases =
-            task_query_phrases(&request.working_intent, &request.task_signals, false);
+            association_query_phrases(&request.working_intent, &request.task_signals);
+        let hint_queries = working_intent_hint_queries(&request.working_intent);
         let scope_targets = ScopeTargets::from_intent(&request.working_intent);
         for _attempt in 0..3 {
             let graph_snapshot = self.read_graph_snapshot();
@@ -759,6 +797,7 @@ impl SearchEngine {
                     request.task_id,
                     &query_tokens,
                     &query_phrases,
+                    &hint_queries,
                     &scope_targets,
                     request.resolved_focus.as_ref(),
                     graph,
@@ -959,8 +998,6 @@ fn association_query_tokens(intent: &WorkingIntentSnapshot, signals: &[TaskSigna
         &intent.platforms,
         &intent.constraints,
         &intent.acceptance_conditions,
-        &intent.artifact_hints,
-        &intent.interface_hints,
         &intent.open_questions,
     ]
     .into_iter()
@@ -974,6 +1011,77 @@ fn association_query_tokens(intent: &WorkingIntentSnapshot, signals: &[TaskSigna
         .chain(list_text)
         .chain(signal_text)
         .flat_map(search_tokens)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn association_query_phrases(
+    intent: &WorkingIntentSnapshot,
+    signals: &[TaskSignal],
+) -> Vec<String> {
+    let mut texts = vec![intent.goal.as_str()];
+    texts.extend(intent.current_direction.as_deref());
+    for values in [
+        &intent.in_scope,
+        &intent.domains,
+        &intent.platforms,
+        &intent.constraints,
+        &intent.acceptance_conditions,
+        &intent.open_questions,
+    ] {
+        texts.extend(values.iter().map(String::as_str));
+    }
+    texts.extend(
+        signals
+            .iter()
+            .filter(|signal| matches!(signal.kind, TaskSignalKind::Prompt | TaskSignalKind::Diff))
+            .map(|signal| signal.content.as_str()),
+    );
+    normalized_phrases(texts)
+}
+
+#[derive(Clone, Debug)]
+struct WorkingIntentHintQuery {
+    source_field: WorkingIntentHintField,
+    tokens: Vec<String>,
+    phrases: Vec<String>,
+}
+
+fn working_intent_hint_queries(intent: &WorkingIntentSnapshot) -> Vec<WorkingIntentHintQuery> {
+    [
+        (
+            WorkingIntentHintField::ArtifactHints,
+            &intent.artifact_hints,
+        ),
+        (
+            WorkingIntentHintField::InterfaceHints,
+            &intent.interface_hints,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(source_field, values)| {
+        let tokens = values
+            .iter()
+            .flat_map(|value| search_tokens(value))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        (!tokens.is_empty()).then(|| WorkingIntentHintQuery {
+            source_field,
+            tokens,
+            phrases: normalized_phrases(values.iter().map(String::as_str)),
+        })
+    })
+    .collect()
+}
+
+fn normalized_phrases<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    texts
+        .into_iter()
+        .filter(|text| search_tokens(text).len() > 1)
+        .map(normalize_search_text)
+        .filter(|phrase| !phrase.is_empty())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -1007,14 +1115,7 @@ fn task_query_phrases(
             .filter(|signal| matches!(signal.kind, TaskSignalKind::Prompt | TaskSignalKind::Diff))
             .map(|signal| signal.content.as_str()),
     );
-    texts
-        .into_iter()
-        .filter(|text| search_tokens(text).len() > 1)
-        .map(normalize_search_text)
-        .filter(|phrase| !phrase.is_empty())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+    normalized_phrases(texts)
 }
 
 fn query_space_intent_candidates(
@@ -1248,8 +1349,55 @@ struct AcceptedContextEvidence {
     phrase_match: bool,
     matched_artifacts: BTreeSet<String>,
     matched_scopes: BTreeSet<ScopeEvidence>,
+    hint_text: BTreeMap<WorkingIntentHintTextChannel, HintTextEvidence>,
     graph_paths: Vec<TaskRetrievalPath>,
     relation_depth: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct WorkingIntentHintTextChannel {
+    source_field: WorkingIntentHintField,
+    target: WorkingIntentHintTarget,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HintTextEvidence {
+    query_tokens: BTreeSet<String>,
+    matched_tokens: BTreeSet<String>,
+    bm25: Option<f64>,
+    phrase_match: bool,
+    field_weight_points: u16,
+}
+
+impl HintTextEvidence {
+    fn merge(&mut self, other: &Self) {
+        self.query_tokens.extend(other.query_tokens.iter().cloned());
+        self.matched_tokens
+            .extend(other.matched_tokens.iter().cloned());
+        if let Some(bm25) = other.bm25 {
+            self.bm25 = Some(self.bm25.map_or(bm25, |current| current.min(bm25)));
+        }
+        self.phrase_match |= other.phrase_match;
+        self.field_weight_points = self
+            .field_weight_points
+            .saturating_add(other.field_weight_points);
+    }
+
+    fn coverage_basis_points(&self) -> u16 {
+        if self.query_tokens.is_empty() {
+            return 0;
+        }
+        u16::try_from(
+            self.matched_tokens
+                .intersection(&self.query_tokens)
+                .count()
+                .saturating_mul(BASIS_POINTS_SCALE)
+                .checked_div(self.query_tokens.len())
+                .unwrap_or(0)
+                .min(BASIS_POINTS_SCALE),
+        )
+        .expect("coverage basis points fit u16")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1293,6 +1441,7 @@ struct AssociationEvidence {
     context_bm25: Option<f64>,
     context_phrase_match: bool,
     context_field_weight_points: u16,
+    hint_text: BTreeMap<WorkingIntentHintTextChannel, HintTextEvidence>,
     matched_scopes: BTreeSet<ScopeEvidence>,
     graph_exact_contexts: BTreeSet<ContextId>,
     relation_contexts: BTreeSet<ContextId>,
@@ -1325,6 +1474,7 @@ fn infer_task_space_associations(
     task_id: TaskId,
     query_tokens: &[String],
     query_phrases: &[String],
+    hint_queries: &[WorkingIntentHintQuery],
     scope_targets: &ScopeTargets,
     resolved_focus: Option<&ResolvedFocus>,
     engineering_graph: Option<&EngineeringProjection>,
@@ -1334,6 +1484,9 @@ fn infer_task_space_associations(
     let intent_candidates = query_space_intent_candidates(connection, query_tokens, query_phrases)?;
     let mut contexts =
         query_accepted_context_evidence(connection, query_tokens, query_phrases, scope_targets)?;
+    let mut evidence = BTreeMap::<SpaceId, AssociationEvidence>::new();
+    apply_intent_evidence(&mut evidence, intent_candidates);
+    apply_working_intent_hint_evidence(connection, hint_queries, &mut evidence, &mut contexts)?;
     let mut graph_contexts = BTreeMap::new();
     let mut focus_reachable = false;
     if let Some(graph) = engineering_graph {
@@ -1342,8 +1495,6 @@ fn infer_task_space_associations(
         expand_graph_context_relation_evidence(graph, mode, &mut graph_contexts)?;
     }
     expand_current_context_relation_evidence(connection, mode, &mut contexts)?;
-    let mut evidence = BTreeMap::<SpaceId, AssociationEvidence>::new();
-    apply_intent_evidence(&mut evidence, intent_candidates);
     for ((space_id, context_id), context) in &contexts {
         aggregate_context_evidence(evidence.entry(*space_id).or_default(), *context_id, context);
     }
@@ -1404,6 +1555,9 @@ fn aggregate_context_evidence(
                     .saturating_add(context_field_weight(*field));
             }
         }
+    }
+    for (channel, hint) in &context.hint_text {
+        aggregate.hint_text.entry(*channel).or_default().merge(hint);
     }
     aggregate
         .matched_artifacts
@@ -1502,6 +1656,88 @@ fn apply_intent_evidence(
             }
         }
     }
+}
+
+fn apply_working_intent_hint_evidence(
+    connection: &Connection,
+    queries: &[WorkingIntentHintQuery],
+    associations: &mut BTreeMap<SpaceId, AssociationEvidence>,
+    contexts: &mut BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>,
+) -> Result<()> {
+    for query in queries {
+        let space_channel = WorkingIntentHintTextChannel {
+            source_field: query.source_field,
+            target: WorkingIntentHintTarget::SpaceIntentFts,
+        };
+        for candidate in query_space_intent_candidates(connection, &query.tokens, &query.phrases)? {
+            let aggregate = associations.entry(candidate.space_id).or_default();
+            aggregate.intent_conflicted |= candidate.intent_conflicted;
+            aggregate
+                .intent_head_revision_ids
+                .extend(candidate.head_revision_ids);
+            let mut matched_tokens = BTreeSet::new();
+            let mut matched_fields = BTreeSet::new();
+            for field_match in candidate.field_matches {
+                if field_match.field == SpaceIntentField::OutOfScope {
+                    aggregate
+                        .excluded_intent_tokens
+                        .extend(field_match.matched_tokens);
+                } else {
+                    matched_fields.insert(field_match.field);
+                    matched_tokens.extend(field_match.matched_tokens);
+                }
+            }
+            if !matched_tokens.is_empty() {
+                aggregate
+                    .hint_text
+                    .entry(space_channel)
+                    .or_default()
+                    .merge(&HintTextEvidence {
+                        query_tokens: query.tokens.iter().cloned().collect(),
+                        matched_tokens,
+                        bm25: Some(candidate.bm25),
+                        phrase_match: candidate.phrase_match,
+                        field_weight_points: matched_fields
+                            .into_iter()
+                            .map(intent_field_weight)
+                            .fold(0_u16, u16::saturating_add),
+                    });
+            }
+        }
+
+        let mut context_matches = BTreeMap::new();
+        query_accepted_context_text(
+            connection,
+            &query.tokens,
+            &query.phrases,
+            &mut context_matches,
+        )?;
+        let context_channel = WorkingIntentHintTextChannel {
+            source_field: query.source_field,
+            target: WorkingIntentHintTarget::AcceptedContextFts,
+        };
+        for (key, matched) in context_matches {
+            let hint = HintTextEvidence {
+                query_tokens: query.tokens.iter().cloned().collect(),
+                matched_tokens: matched.matched_tokens,
+                bm25: matched.bm25,
+                phrase_match: matched.phrase_match,
+                field_weight_points: matched
+                    .matched_fields
+                    .into_iter()
+                    .map(context_field_weight)
+                    .fold(0_u16, u16::saturating_add),
+            };
+            contexts
+                .entry(key)
+                .or_default()
+                .hint_text
+                .entry(context_channel)
+                .or_default()
+                .merge(&hint);
+        }
+    }
+    Ok(())
 }
 
 const fn intent_field_name(field: SpaceIntentField) -> &'static str {
@@ -1929,6 +2165,7 @@ fn expand_current_context_relation_evidence(
 
 fn context_is_positive_seed(evidence: &AcceptedContextEvidence) -> bool {
     evidence.textual_match
+        || !evidence.hint_text.is_empty()
         || !evidence.matched_artifacts.is_empty()
         || !evidence.matched_scopes.is_empty()
         || evidence.graph_paths.iter().any(|path| {
@@ -2172,10 +2409,13 @@ where
 const RRF_K: usize = 60;
 const RRF_SCALE: usize = 1_000_000;
 const M2_FUSION_CHANNEL_WEIGHT: usize = 1;
-const GRAPH_ARTIFACT_CHANNEL_WEIGHT: usize = 9;
-const CONTEXT_RELATION_CHANNEL_WEIGHT: usize = 7;
-const FUSION_CHANNEL_WEIGHT: usize =
-    GRAPH_ARTIFACT_CHANNEL_WEIGHT + CONTEXT_RELATION_CHANNEL_WEIGHT + 3;
+const GRAPH_ARTIFACT_CHANNEL_WEIGHT: usize = 13;
+const CONTEXT_RELATION_CHANNEL_WEIGHT: usize = 10;
+const HINT_TEXT_CHANNEL_WEIGHT: usize = 3;
+const FUSION_CHANNEL_WEIGHT: usize = GRAPH_ARTIFACT_CHANNEL_WEIGHT
+    + CONTEXT_RELATION_CHANNEL_WEIGHT
+    + (4 * HINT_TEXT_CHANNEL_WEIGHT)
+    + 3;
 const MINIMUM_ASSOCIATION_SCORE_BASIS_POINTS: u16 = 100;
 const TASK_CONTEXT_ENVELOPE_TOKEN_RESERVE: usize = 128;
 
@@ -2185,6 +2425,7 @@ fn assign_channel_features(
     query_tokens: &[String],
 ) {
     assign_graph_channel_features(evidence);
+    assign_hint_channel_features(evidence);
     let mut intent = evidence
         .iter()
         .filter_map(|(space_id, value)| {
@@ -2320,6 +2561,93 @@ fn assign_channel_features(
     }
 }
 
+fn assign_hint_channel_features(evidence: &mut BTreeMap<SpaceId, AssociationEvidence>) {
+    for key in [
+        WorkingIntentHintTextChannel {
+            source_field: WorkingIntentHintField::ArtifactHints,
+            target: WorkingIntentHintTarget::SpaceIntentFts,
+        },
+        WorkingIntentHintTextChannel {
+            source_field: WorkingIntentHintField::ArtifactHints,
+            target: WorkingIntentHintTarget::AcceptedContextFts,
+        },
+        WorkingIntentHintTextChannel {
+            source_field: WorkingIntentHintField::InterfaceHints,
+            target: WorkingIntentHintTarget::SpaceIntentFts,
+        },
+        WorkingIntentHintTextChannel {
+            source_field: WorkingIntentHintField::InterfaceHints,
+            target: WorkingIntentHintTarget::AcceptedContextFts,
+        },
+    ] {
+        let mut matches = evidence
+            .iter()
+            .filter_map(|(space_id, value)| {
+                value.hint_text.get(&key).and_then(|hint| {
+                    hint.bm25.map(|bm25| {
+                        (
+                            *space_id,
+                            bm25,
+                            hint.coverage_basis_points(),
+                            hint.phrase_match,
+                            hint.field_weight_points,
+                        )
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| right.2.cmp(&left.2))
+                .then_with(|| right.3.cmp(&left.3))
+                .then_with(|| right.4.cmp(&left.4))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let mut previous = None;
+        let mut rank = 0;
+        for (offset, (space_id, bm25, coverage, phrase_match, field_weight_points)) in
+            matches.into_iter().enumerate()
+        {
+            let rank_key = (bm25.to_bits(), coverage, phrase_match, field_weight_points);
+            if previous.as_ref() != Some(&rank_key) {
+                rank = offset + 1;
+                previous = Some(rank_key);
+            }
+            evidence
+                .get_mut(&space_id)
+                .expect("ranked Working Intent Hint Space exists")
+                .channel_features
+                .push(weighted_text_channel_feature(
+                    hint_association_channel(key),
+                    rank,
+                    bm25,
+                    coverage,
+                    phrase_match,
+                    field_weight_points,
+                    HINT_TEXT_CHANNEL_WEIGHT,
+                ));
+        }
+    }
+}
+
+const fn hint_association_channel(key: WorkingIntentHintTextChannel) -> TaskAssociationChannel {
+    match (key.source_field, key.target) {
+        (WorkingIntentHintField::ArtifactHints, WorkingIntentHintTarget::SpaceIntentFts) => {
+            TaskAssociationChannel::ArtifactHintSpaceIntentBm25
+        }
+        (WorkingIntentHintField::ArtifactHints, WorkingIntentHintTarget::AcceptedContextFts) => {
+            TaskAssociationChannel::ArtifactHintAcceptedContextBm25
+        }
+        (WorkingIntentHintField::InterfaceHints, WorkingIntentHintTarget::SpaceIntentFts) => {
+            TaskAssociationChannel::InterfaceHintSpaceIntentBm25
+        }
+        (WorkingIntentHintField::InterfaceHints, WorkingIntentHintTarget::AcceptedContextFts) => {
+            TaskAssociationChannel::InterfaceHintAcceptedContextBm25
+        }
+    }
+}
+
 fn assign_graph_channel_features(evidence: &mut BTreeMap<SpaceId, AssociationEvidence>) {
     let mut artifacts = evidence
         .iter()
@@ -2384,10 +2712,32 @@ fn text_channel_feature(
     phrase_match: bool,
     field_weight_points: u16,
 ) -> TaskAssociationChannelFeature {
+    weighted_text_channel_feature(
+        channel,
+        rank,
+        bm25,
+        coverage,
+        phrase_match,
+        field_weight_points,
+        M2_FUSION_CHANNEL_WEIGHT,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn weighted_text_channel_feature(
+    channel: TaskAssociationChannel,
+    rank: usize,
+    bm25: f64,
+    coverage: u16,
+    phrase_match: bool,
+    field_weight_points: u16,
+    weight: usize,
+) -> TaskAssociationChannelFeature {
     TaskAssociationChannelFeature {
         channel,
         rank,
-        reciprocal_rank_micros: reciprocal_rank_micros(rank),
+        reciprocal_rank_micros: reciprocal_rank_micros(rank)
+            .saturating_mul(u32::try_from(weight).unwrap_or(u32::MAX)),
         bm25_micros: Some(scale_bm25(bm25)),
         query_token_coverage_basis_points: coverage,
         idf_bm25_contribution_micros: scale_idf_bm25_contribution(bm25),
@@ -2460,6 +2810,7 @@ fn association(
     evidence: &AssociationEvidence,
 ) -> Option<TaskSpaceAssociation> {
     if !evidence.intent_matched
+        && evidence.hint_text.is_empty()
         && evidence.matched_artifacts.is_empty()
         && evidence.matched_contexts.is_empty()
         && evidence.matched_scopes.is_empty()
@@ -2570,6 +2921,12 @@ fn association_reasons(evidence: &AssociationEvidence) -> Vec<String> {
         reasons.push(format!(
             "Task text matched {} accepted, injection-safe Context(s)",
             evidence.textual_contexts.len()
+        ));
+    }
+    if !evidence.hint_text.is_empty() {
+        reasons.push(format!(
+            "Working Intent Hint text matched {} positive FTS channel(s)",
+            evidence.hint_text.len()
         ));
     }
     if !evidence.matched_scopes.is_empty() {
@@ -2961,7 +3318,11 @@ fn task_context_candidate_from_row(
         return Ok(None);
     };
     let context_evidence = inference.contexts.get(&(space_id, context_id));
-    let inherited = space_evidence.intent_matched;
+    let inherited = space_evidence.intent_matched
+        || space_evidence
+            .hint_text
+            .keys()
+            .any(|channel| channel.target == WorkingIntentHintTarget::SpaceIntentFts);
     if context_evidence.is_none() && !inherited {
         return Ok(None);
     }
@@ -3056,6 +3417,13 @@ fn task_retrieval_paths(
             matched_tokens: space.excluded_intent_tokens.iter().cloned().collect(),
         });
     }
+    paths.extend(
+        space
+            .hint_text
+            .iter()
+            .filter(|(channel, _)| channel.target == WorkingIntentHintTarget::SpaceIntentFts)
+            .map(|(channel, hint)| working_intent_hint_path(space, *channel, hint)),
+    );
     if let Some(context) = context {
         paths.extend(context.graph_paths.iter().cloned());
         if context.textual_match {
@@ -3064,6 +3432,12 @@ fn task_retrieval_paths(
                 matched_tokens: context.matched_tokens.iter().cloned().collect(),
             });
         }
+        paths.extend(
+            context
+                .hint_text
+                .iter()
+                .map(|(channel, hint)| working_intent_hint_path(space, *channel, hint)),
+        );
         paths.extend(
             context
                 .matched_scopes
@@ -3076,6 +3450,29 @@ fn task_retrieval_paths(
     }
     sort_dedup_paths(&mut paths);
     paths
+}
+
+fn working_intent_hint_path(
+    space: &AssociationEvidence,
+    channel: WorkingIntentHintTextChannel,
+    hint: &HintTextEvidence,
+) -> TaskRetrievalPath {
+    let fusion_contribution_micros = space
+        .channel_features
+        .iter()
+        .find(|feature| feature.channel == hint_association_channel(channel))
+        .map_or(0, |feature| feature.reciprocal_rank_micros);
+    TaskRetrievalPath::WorkingIntentHintText {
+        explanation: WorkingIntentHintTextExplanation {
+            source_field: channel.source_field,
+            target: channel.target,
+            matched_tokens: hint.matched_tokens.iter().cloned().collect(),
+            phrase_match: hint.phrase_match,
+            query_token_coverage_basis_points: hint.coverage_basis_points(),
+            bm25_micros: hint.bm25.map_or(0, scale_bm25),
+            fusion_contribution_micros,
+        },
+    }
 }
 
 fn context_match_reason(

@@ -13,7 +13,7 @@ use sctx_search::{
     IntentConflictValidation, IntentScopeConflictExplanation, IntentScopeConflictKind,
     IntentScopeConflictPolicy, SearchEngine, SpaceIntentField, TaskAssociationChannel,
     TaskAssociationFusionExplanation, TaskContextRequest, TaskRetrievalPath,
-    estimate_task_context_payload_tokens,
+    WorkingIntentHintField, WorkingIntentHintTarget, estimate_task_context_payload_tokens,
 };
 use tempfile::TempDir;
 
@@ -1352,4 +1352,159 @@ fn automatic_task_pack_excludes_every_unsafe_state_while_explicit_expands_confli
             .any(|evidence| evidence.limitations.is_empty()),
         "explicit mode exposes incomplete Evidence without making it automatic"
     );
+}
+
+#[test]
+fn artifact_and_interface_hints_recall_context_only_text_without_graph_semantics() {
+    let fixture = fixture();
+    let index = fixture.index.clone();
+    let mut intent = task("zzzzabsenttaskneedle");
+    intent.artifact_hints = vec!["SearchV2Endpoint".to_owned()];
+    intent.interface_hints = vec!["SearchResponseV2".to_owned()];
+    let request = TaskContextRequest::automatic(TaskId::new(), intent, Vec::new(), 100_000);
+    let first = SearchEngine::new(index.clone())
+        .task_context_pack(&request)
+        .unwrap();
+
+    let protocol_association = first
+        .associations
+        .iter()
+        .find(|association| association.space_id == fixture.feature_spaces[1])
+        .unwrap();
+    assert_eq!(
+        protocol_association.matched_contexts,
+        vec![fixture.feature_contexts[0]]
+    );
+    let item = first
+        .items
+        .iter()
+        .find(|item| item.context.context_id == fixture.feature_contexts[0])
+        .unwrap();
+    let explanations = item
+        .retrieval_paths
+        .iter()
+        .filter_map(|path| {
+            let TaskRetrievalPath::WorkingIntentHintText { explanation } = path else {
+                return None;
+            };
+            Some(explanation)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(explanations.len(), 2);
+    assert_eq!(
+        explanations
+            .iter()
+            .map(|explanation| explanation.source_field)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            WorkingIntentHintField::ArtifactHints,
+            WorkingIntentHintField::InterfaceHints,
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert!(explanations.iter().all(|explanation| {
+        explanation.target == WorkingIntentHintTarget::AcceptedContextFts
+            && explanation.phrase_match
+            && explanation.query_token_coverage_basis_points == 10_000
+            && explanation.fusion_contribution_micros > 0
+            && !explanation.matched_tokens.is_empty()
+    }));
+    assert!(
+        item.retrieval_paths
+            .iter()
+            .all(|path| matches!(path, TaskRetrievalPath::WorkingIntentHintText { .. }))
+    );
+    assert!(first.artifact_generation.is_none());
+    assert!(first.graph_context_tree_oid.is_none());
+
+    let second = SearchEngine::new(index.clone())
+        .task_context_pack(&request)
+        .unwrap();
+    assert_eq!(second, first);
+    index.rebuild().unwrap();
+    let rebuilt = SearchEngine::new(index.clone())
+        .task_context_pack(&request)
+        .unwrap();
+    assert_eq!(rebuilt.task_fingerprint, first.task_fingerprint);
+    assert_eq!(rebuilt.associations, first.associations);
+    assert_eq!(rebuilt.items, first.items);
+
+    let mut unsafe_intent = task("another absent goal");
+    unsafe_intent.artifact_hints = vec!["unsafeassociationneedle".to_owned()];
+    unsafe_intent.interface_hints = vec!["incomplete evidence must not enter".to_owned()];
+    let unsafe_pack = SearchEngine::new(index)
+        .task_context_pack(&TaskContextRequest::automatic(
+            TaskId::new(),
+            unsafe_intent,
+            Vec::new(),
+            100_000,
+        ))
+        .unwrap();
+    assert!(unsafe_pack.items.iter().all(|item| {
+        !fixture
+            .unsafe_pack_spaces
+            .contains(&item.association_space_id)
+    }));
+}
+
+#[test]
+fn high_coverage_hint_text_outranks_generic_text_and_remains_budgeted() {
+    let fixture = fusion_corpus_fixture();
+    let index = fixture.index.clone();
+    let mut intent = task("implement shared workflow");
+    intent.artifact_hints = vec!["SearchV9RareEndpoint".to_owned()];
+    intent.interface_hints = vec!["ExactResultSchema".to_owned()];
+    let task_id = TaskId::new();
+    let mut request = TaskContextRequest::automatic(task_id, intent, Vec::new(), 100_000);
+    request.max_spaces = 5;
+    let full = SearchEngine::new(index.clone())
+        .task_context_pack(&request)
+        .unwrap();
+    assert_eq!(full.associations[0].space_id, fixture.precise_space_id);
+    assert_eq!(full.items[0].context.context_id, fixture.precise_context_id);
+    let channels = full.associations[0]
+        .reasons
+        .iter()
+        .find_map(|reason| serde_json::from_str::<TaskAssociationFusionExplanation>(reason).ok())
+        .unwrap()
+        .channels
+        .into_iter()
+        .map(|feature| feature.channel)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(channels.contains(&TaskAssociationChannel::ArtifactHintSpaceIntentBm25));
+    assert!(channels.contains(&TaskAssociationChannel::ArtifactHintAcceptedContextBm25));
+    assert!(channels.contains(&TaskAssociationChannel::InterfaceHintSpaceIntentBm25));
+    assert!(channels.contains(&TaskAssociationChannel::InterfaceHintAcceptedContextBm25));
+    assert!(full.associations.len() <= request.max_spaces);
+    assert!(!full.omitted.is_empty());
+
+    request.token_budget = 512;
+    let limited_first = SearchEngine::new(index.clone())
+        .task_context_pack(&request)
+        .unwrap();
+    let limited_second = SearchEngine::new(index)
+        .task_context_pack(&request)
+        .unwrap();
+    assert_eq!(limited_first, limited_second);
+    assert!(limited_first.estimated_tokens <= limited_first.token_budget);
+    assert!(!limited_first.omitted.is_empty());
+
+    let mut generic_hint = task("zzzzabsentgenerichintgoal");
+    generic_hint.artifact_hints = vec!["implement shared workflow".to_owned()];
+    let mut generic_request =
+        TaskContextRequest::automatic(TaskId::new(), generic_hint, Vec::new(), 100_000);
+    generic_request.max_spaces = 4;
+    let generic_first = SearchEngine::new(fixture.index.clone())
+        .task_context_pack(&generic_request)
+        .unwrap();
+    let generic_second = SearchEngine::new(fixture.index)
+        .task_context_pack(&generic_request)
+        .unwrap();
+    assert_eq!(generic_first, generic_second);
+    assert_eq!(generic_first.associations.len(), generic_request.max_spaces);
+    assert!(generic_first.omitted.iter().any(|item| {
+        item.reason == "space_top_k"
+            && item.count == fixture.total_spaces - generic_request.max_spaces
+    }));
 }

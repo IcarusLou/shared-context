@@ -20,7 +20,8 @@ use sctx_index::ProjectionIndex;
 use sctx_search::{
     ContextPackMode, ContextSafetySource, SearchEngine, TaskAssociationChannel,
     TaskAssociationFusionExplanation, TaskContextRequest, TaskGraphDiagnosticKind,
-    TaskRetrievalPath, estimate_task_context_payload_tokens,
+    TaskRetrievalPath, WorkingIntentHintField, WorkingIntentHintTarget,
+    estimate_task_context_payload_tokens,
 };
 use tempfile::TempDir;
 
@@ -631,6 +632,78 @@ fn exact_graph_priority_reaches_cross_end_contexts_in_two_cycle_safe_hops() {
 }
 
 #[test]
+fn focus_pack_unions_hint_text_with_graph_without_persisting_focus_or_hint_state() {
+    let fixture = graph_fixture();
+    let before_domain =
+        serde_json::to_vec(&fixture.index.domain_snapshot().unwrap().projection).unwrap();
+    let before_graph = fixture.graph_store.canonical_bytes().unwrap();
+    let engine =
+        SearchEngine::with_engineering_graph(fixture.index.clone(), fixture.graph_store.clone());
+    let mut focused = task_request(
+        fixture.repository.repository_id,
+        ContextPackMode::AutomaticInjection,
+        20_000,
+    );
+    focused.working_intent.goal = "zzzzabsentgraphgoal".to_owned();
+    focused.working_intent.current_direction = None;
+    focused.working_intent.platforms.clear();
+    focused.working_intent.artifact_hints =
+        vec!["server contract defines SearchResponse semantics".to_owned()];
+    focused.working_intent.interface_hints =
+        vec!["iOS compatibility validates response fallback".to_owned()];
+    let pack = engine.task_context_pack(&focused).unwrap();
+
+    assert_eq!(pack.associations[0].space_id, fixture.source_space);
+    assert!(
+        fusion(&pack.associations[0])
+            .channels
+            .iter()
+            .any(|feature| { feature.channel == TaskAssociationChannel::ResolvedArtifactExact })
+    );
+    let contract = pack
+        .items
+        .iter()
+        .find(|item| item.context.context_id == fixture.contract_context)
+        .unwrap();
+    assert!(
+        contract
+            .retrieval_paths
+            .iter()
+            .any(|path| { matches!(path, TaskRetrievalPath::EngineeringGraph { .. }) })
+    );
+    assert!(contract.retrieval_paths.iter().any(|path| {
+        matches!(
+            path,
+            TaskRetrievalPath::WorkingIntentHintText { explanation }
+                if explanation.source_field == WorkingIntentHintField::ArtifactHints
+                    && explanation.target == WorkingIntentHintTarget::AcceptedContextFts
+        )
+    }));
+
+    let mut text_only = focused.clone();
+    text_only.resolved_focus = None;
+    let text_pack = engine.task_context_pack(&text_only).unwrap();
+    assert!(text_pack.items.iter().any(|item| {
+        item.context.context_id == fixture.contract_context
+            && item
+                .retrieval_paths
+                .iter()
+                .any(|path| matches!(path, TaskRetrievalPath::WorkingIntentHintText { .. }))
+    }));
+    assert!(text_pack.graph_diagnostics.is_empty());
+    assert!(text_pack.items.iter().all(|item| {
+        item.retrieval_paths
+            .iter()
+            .all(|path| !matches!(path, TaskRetrievalPath::EngineeringGraph { .. }))
+    }));
+
+    let after_domain =
+        serde_json::to_vec(&fixture.index.domain_snapshot().unwrap().projection).unwrap();
+    assert_eq!(after_domain, before_domain);
+    assert_eq!(fixture.graph_store.canonical_bytes().unwrap(), before_graph);
+}
+
+#[test]
 fn identical_locator_in_two_repositories_retrieves_only_focused_repository_context() {
     let fixture = graph_fixture();
     let second_repository = repository();
@@ -710,6 +783,19 @@ fn identical_locator_in_two_repositories_retrieves_only_focused_repository_conte
     assert_eq!(direct, BTreeSet::from([second_context]));
     assert!(!direct.contains(&fixture.source_context));
     assert!(pack.graph_diagnostics.is_empty());
+
+    let mut hint_only = request;
+    hint_only.resolved_focus = None;
+    hint_only.working_intent.goal = "zzzzabsentrepositorygoal".to_owned();
+    hint_only.working_intent.current_direction = None;
+    hint_only.working_intent.artifact_hints = vec!["SearchSymbol".to_owned()];
+    let hint_pack = engine.task_context_pack(&hint_only).unwrap();
+    assert!(hint_pack.graph_diagnostics.is_empty());
+    assert!(hint_pack.items.iter().all(|item| {
+        item.retrieval_paths
+            .iter()
+            .all(|path| !matches!(path, TaskRetrievalPath::EngineeringGraph { .. }))
+    }));
 }
 
 #[test]
