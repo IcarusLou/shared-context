@@ -29,7 +29,7 @@
 
 以下能力**尚未实现**，不得在代码、测试报告或评审中宣称已经具备：
 
-- **M4 最终验收：未完成** — #117 与 #156–#163 已完成可验证 WorkEpisode/Capture、显式 AgentCheckpoint、Hook lifecycle boundary、确定性 Candidate Builder、非权威分析/Space 推荐、Task-local Review 与可恢复原子确认；延期 #136 必须重新人工批准后完成，随后由 #164 关闭端到端验收。
+- **M4 最终验收：未完成** — #117、#136 与 #156–#163 已完成轻量 Working Intent、语义幂等、可验证 WorkEpisode/Capture、Hook lifecycle、Candidate Builder/Review/Confirm 全链路；#164 最终端到端验收尚未执行。
 - **团队同步：未实现** — Repository Catalog 是单机显式配置，不是团队事实或知识 Store。
 
 Cursor 与 Codex 都通过显式 `task_intent_update` 建立权威 Task；Prompt Hook 只提供能力提示。已有 ActiveTask 可通过只读 `task_context` 再取 Pack。

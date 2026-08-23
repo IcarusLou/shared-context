@@ -9,7 +9,7 @@ A stable container that organizes the intent and durable Context of one requirem
 _Avoid_: Active Space, Workspace Space, search partition
 
 **WorkingIntentSnapshot**:
-A lightweight, revisable snapshot of what the Agent currently understands it is doing: a required goal plus any naturally known direction, scope, constraints, acceptance conditions, retrieval Hints, and open questions. It is not an engineering fact, Evidence claim, Space selection, or investigation checklist.
+A lightweight, revisable snapshot of what the Agent currently understands it is doing: a required goal plus any naturally known direction, scope, constraints, acceptance conditions, retrieval Hints, and open questions. Its Hints may match text but never establish an Artifact, Interface, Evidence, Graph path, Candidate, Space selection, or investigation checklist.
 _Avoid_: grounded Intent, task specification, Evidence binding
 
 **TaskSession**:
@@ -141,11 +141,11 @@ A derived, explainable relevance between one Task and one ContextSpace. A Task m
 _Avoid_: Active Space, default Space
 
 **TaskContextPack**:
-A budgeted retrieval result for one TaskIntent revision, one current Context projection, and at most one historical EngineeringGraphSnapshot. It keeps their identities distinct and links every returned Context through typed RetrievalPaths and a safety source.
+A budgeted retrieval result for one WorkingIntentSnapshot revision, one current Context projection, and at most one historical EngineeringGraphSnapshot. It keeps their identities distinct and links every returned Context through typed RetrievalPaths and a safety source.
 _Avoid_: Space-scoped search result, manually routed Context Pack
 
 **RetrievalPath**:
-A typed explanation of how TaskIntent or this request’s ResolvedFocus made one Context relevant. Text and Applicability paths remain distinct from Engineering Graph paths; only an exact ResolvedFocus reachable in that Graph Snapshot can claim an engineering edge.
+A typed explanation of how Working Intent text or this request’s ResolvedFocus made one Context relevant. Hint text and Applicability paths remain distinct from Engineering Graph paths; only an exact ResolvedFocus reachable in that Graph Snapshot can claim an engineering edge.
 _Avoid_: opaque relevance score, inferred code relation
 
 **EngineeringGraphSnapshot**:
@@ -157,7 +157,7 @@ One immutable Context revision, its fixed relation targets, and its automatic-sa
 _Avoid_: current Context head, live governance lookup
 
 **EvidenceSource**:
-A typed, resolvable provenance target that can ground a TaskIntent or engineering claim, such as immutable Context Evidence or a current unique Engineering Resolution. ArtifactFocusQuery, ResolvedFocus, generic TestOutcome, and unavailable/ambiguous targets are not EvidenceSources.
+A typed, resolvable provenance target for an engineering claim, such as immutable Context Evidence or a current unique Engineering Resolution. WorkingIntentSnapshot, its Hints, ArtifactFocusQuery, generic TestOutcome, and unavailable/ambiguous targets are not EvidenceSources.
 _Avoid_: evidence string, unverified reference
 
 **RepositoryCatalog**:

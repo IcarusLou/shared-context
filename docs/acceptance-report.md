@@ -1,7 +1,7 @@
 # Task-first Retrieval Integration Acceptance Report
 
 Date: 2026-08-23
-Scope: Mew #112 through #163, including Mandatory Gates #114/#117 and accepted boundary #150; final M4 Gate #164 and deferred #136 are excluded
+Scope: Mew #112 through #163 plus #136, including Mandatory Gates #114/#117 and accepted boundary #150; final M4 Gate #164 is not executed
 Implementation baseline before lifecycle automation: `main@010a310`
 
 ## Verdict
@@ -17,7 +17,7 @@ This report does **not** claim the final M4 Gate:
 | M1 — Task-first primitives and unassigned Candidate entry | IMPLEMENTED | Covered below |
 | M2 — Task Runtime and multi-Space retrieval | IMPLEMENTED | TaskSession persistence, strict `task_intent_update`, read-only `task_context`, association inference, typed RetrievalPaths, and TaskContextPack pass focused cross-crate/E2E oracles |
 | M3 — Engineering Graph | IMPLEMENTED | Reference-derived bounded ScanPlan, deterministic Artifact locators, sparse build-time Context/safety snapshots, historical exact retrieval, frozen 1–2 hop relations, diagnostics, fallback, rebuild equivalence, and budget bounds pass cross-crate/E2E oracles |
-| M4 — Low-tax Capture | FUNCTIONAL CHAIN IMPLEMENTED; FINAL GATE PENDING | #117 and #156–#163 provide submission-idempotent Candidate admission, WorkEpisode/Checkpoint lifecycle automation, Builder/analysis/Review, and recoverable atomic Candidate Confirmation; deferred #136 requires fresh approval and #164 closes the final E2E Gate |
+| M4 — Low-tax Capture | FUNCTIONAL CHAIN + WORKING INTENT FIX IMPLEMENTED; FINAL GATE PENDING | #117, #136 and #156–#163 provide lightweight idempotent Working Intent, WorkEpisode/Checkpoint automation, Builder/analysis/Review, and atomic Candidate Confirmation; #164 remains unexecuted |
 
 `task_intent_update` is the only Task Intent write path. `task_context` accepts only an external Session locator and output bounds, and reads the already-authoritative ActiveTask without mutating Runtime. PromptSubmit supplies guidance rather than inferred Intent. Explicit `context_search.space_ids` remains available as a hard filter for diagnosis and exploration.
 
@@ -112,7 +112,9 @@ Mandatory Gates #114/#117 are implemented: stable `submission_id` and exact clos
 
 #154 replaces the unlaunched #151/#152 persistence model: `task_artifact_focus` is a read-only ArtifactFocusQuery, Catalog supplies a request-local `ResolvedFocus`, and Search consumes only that value for the current Pack. Runtime owns no Focus state, and later Focus queries, ordinary `task_context`, MCP restart, Task switch, or compaction restore nothing. Repository Catalog remains local-only; team synchronization is not claimed.
 
-#157 exposes explicit AgentCheckpoint through MCP/CLI/Skill without Hook-authored Claims. #114/#117 connect Candidate writes to closed Episode verification, submission-idempotent Git admission, and malformed-Event isolation. #158 deterministically builds unassigned drafts at close and through an internal CLI retry. #163 lets verified PreCompact/TurnStop Hooks close only an already checkpointed Episode and invoke that same Builder; #136 remains deferred pending fresh approval.
+#157 exposes explicit AgentCheckpoint through MCP/CLI/Skill without Hook-authored Claims. #114/#117 connect Candidate writes to closed Episode verification, submission-idempotent Git admission, and malformed-Event isolation. #158 deterministically builds unassigned drafts at close and through an internal CLI retry. #163 lets verified PreCompact/TurnStop Hooks close only an already checkpointed Episode and invoke that same Builder. #136 now stores optional, non-factual Working Intent snapshots with canonical retry convergence; #164 remains unexecuted.
+
+The fixed #136 oracle proves goal-only input, created/already-current continue, real changes, old-parent retry convergence, 20-way concurrency, stale zero-write, explicit new, Task switch and Runtime deletion. Artifact/interface Hints retrieve only through `WorkingIntentHintText`; they create no Git Event, Candidate, EngineeringReference, Graph path, Evidence, or automatic eligibility. Existing `episode_lifecycle_hooks`, `work_episode_capture`, and `hook_fail_open` suites cover PreCompact/TurnStop and Intent/Capture/Hook fail-open.
 
 ## Residue gates
 

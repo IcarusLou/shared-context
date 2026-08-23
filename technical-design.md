@@ -19,7 +19,7 @@
 | **M1：Task-first 领域与入口基础** | **已实现** | `TaskIntent` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；CLI/MCP 通过 `candidate_create` 创建无 Space Candidate；Candidate 不可自动注入 |
 | **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、TaskIntent Revision、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、严格 `task_intent_update` 与只读 `task_context` 已通过跨 crate/E2E 验收 |
 | **M3：Engineering Graph** | **已实现** | 稳定本机 Repository Catalog、可重建 Registry、Reference-derived 有界扫描、build-time immutable Context/safety snapshot、历史 Graph Retrieval、ContextRelation 1–2 跳及 MCP/CLI 工作流已通过固定跨 crate/E2E oracle |
-| **M4：Low-tax Capture** | **功能链已实现，最终验收待完成** | #117 与 #156–#163 已实现 WorkEpisode、显式 Checkpoint、Hook lifecycle boundary、Candidate Builder/analysis/Review、CandidateConfirmation/ContextSpaceAssociation 与可恢复原子 Writer/MCP；延期 #136 需重新人工批准，#164 负责最终 E2E Gate |
+| **M4：Low-tax Capture** | **功能链与 #136 Working Intent 修复已实现，最终验收待完成** | #117、#136 与 #156–#163 已实现旁路 Working Intent、WorkEpisode、Hook lifecycle、Candidate Builder/Review/Confirm；#164 最终 E2E Gate 尚未执行 |
 
 当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订权威 TaskIntent，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示。PostToolUse 的 File observation 只形成带 Session/optional Task owner 的 redacted Capture Breadcrumb，可识别测试工具只形成非定位 TestOutcome；Hook 不运行 Git discovery、Scanner、Registry sync、Graph rebuild、Focus 提交、Episode open/ingest，也不伪造 Claim。PreCompact/TurnStop 只能关闭已有 current-Intent Checkpoint 的 Episode 并调用共享 Builder。显式 Graph 工具完成 bounded scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。当前 `candidate_create` 仍是手工、无归属的 M1 入口，不等同于 M4 自动 Capture。
 
@@ -173,25 +173,25 @@ Intent 变化时新增完整 `IntentRevision`。Revision 使用显式 Parent DAG
 
 完整 Intent 字段都进入 `space_intent_fts`，作为 Task 多路召回的一种信号，并与 Context、Scope 和工程关联共同推断候选 Space。
 
-### 5.3 TaskIntent
+### 5.3 WorkingIntentSnapshot
 
-`TaskIntent` 是本地、会话级、可重算对象，不进入 Git。它不是用户 Prompt 的原样副本，而是对当前任务的结构化理解：
+`WorkingIntentSnapshot` 是本地、会话级、非事实的旁路快照，不进入 Git。仅 `goal` 必填，其余字段省略即为空：
 
 ```yaml
 goal:
-desired_change:
+current_direction:
 in_scope:
 out_of_scope:
 domains:
 platforms:
 constraints:
 acceptance_conditions:
-artifacts:
-interfaces:
-unknowns:
+artifact_hints:
+interface_hints:
+open_questions:
 ```
 
-每次 Prompt、关键文件访问、Diff 变化、测试结果或 Agent Checkpoint 都可以生成新的 TaskIntent Revision。旧 Revision 在 Task 生命周期内保留，用于解释检索结果为何发生变化。
+真实目标、方向、范围或 Hint 变化时可旁路生成新 Revision；canonical 语义相同的 continue 返回 `already_current`。Hint 只参与文本检索，open_questions 只保存自然形成的问题。
 
 同一个业务仓库中的不同 Agent Session 使用不同 `task_id`，互不覆盖当前 Intent 或候选 Space。
 
@@ -823,13 +823,13 @@ token_budget:
 
 更新触发点：
 
-- 第一次 `task_intent_update`：显式创建 TaskSession，并提交完整 Provisional 或 Grounded TaskIntent。
-- Agent 调用 `task_intent_update`：提交完整 Intent Snapshot、Task boundary、maturity、evidence refs 与 Revision CAS。
+- 第一次 `task_intent_update`：显式创建 TaskSession，只要求 Working Intent `goal`。
+- Agent 调用 `task_intent_update`：旁路提交当前自然形成的 WorkingIntentSnapshot、Task boundary 与 Revision CAS；其余字段可省略。
 - 后续 Prompt：修订目标、范围和约束。
 - Agent 需要围绕某工程对象查询历史：调用只读 `task_artifact_focus`，Catalog 为本次请求解析 `ResolvedFocus`；不会创建 Intent Revision 或任何 Focus Runtime 状态。
 - Diff 变化：修订受影响范围。
 - API、Schema 或测试信号出现：增加跨模块、跨端线索。
-- PreCompact、TurnStop：固化一次 TaskIntent Revision 和 WorkEpisode Checkpoint。
+- PreCompact、TurnStop：在已有自然变化时旁路记录 Working Intent，并只基于已有 Checkpoint 推进 WorkEpisode lifecycle。
 
 如果 Prompt 明显切换目标且与当前 Diff/Artifact 信号无连续性，Runtime 创建新 `task_id`；不确定时沿用当前 Task 并记录边界诊断。用户可以显式执行 `task reset`，只影响当前 Session。
 
@@ -1326,39 +1326,13 @@ M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命�
 - 固定 expected 位于 `tests/oracles/milestone-three-v1.json`，不得通过序列化生产结果生成或更新；只读源 Fixture 位于 `tests/fixtures/milestone-three/repository/`。
 - `context_tree_oid` 仅保留 Graph build provenance；不作为启用谓词。新建或其他 untracked 文件仍不扫描，不实现 #150 范围。
 
-#### M3 EvidenceSource 可验证契约（供延期 #136 使用）
+#### Working Intent 与 Evidence 边界（#136）
 
-M3 只定义和验证 Evidence 来源边界，不在 `TaskIntentRevision` 中持久化 maturity 或 EvidenceSource；持久化、去重和 Capture 固化属于 M4 后的 #136 强制验收项。
+WorkingIntentSnapshot 只保存当前工作理解，不含 maturity、EvidenceSource 或 Evidence binding。Artifact/Interface Hint 只进入可解释文本匹配 `WorkingIntentHintText`，不得生成 EngineeringGraph path、事实、Candidate 或自动注入资格；`open_questions` 只记录自然形成的问题，省略是正常完整快照。
 
-`task_intent_update.evidence_refs` 的后续类型化形态只能引用以下可解析持久来源；瞬时 `ResolvedFocus` 不属于 EvidenceSource：
+Evidence 继续只约束 WorkObservation、CheckpointClaim、Candidate、ContextRevision 与 EngineeringReference。TaskIntentRevision 持久 authoritative text 和 canonical semantic hash；相同 continue 返回 `already_current`，真实变化创建唯一 successor，显式 new 始终创建独立 Task。
 
-```text
-ContextEvidenceSource {
-  context_id,
-  revision_id,
-  evidence_id,
-  context_tree_oid
-}
-
-EngineeringResolutionSource {
-  reference_id,
-  repository_id,
-  artifact_key,
-  context_tree_oid,
-  artifact_generation
-}
-```
-
-验证规则：
-
-1. `ContextEvidenceSource` 的 Context、Revision 和 Evidence 必须在指定 Context Tree 中构成同一所有权链；任一 ID 存在但组合错误仍视为不可解析。
-2. `EngineeringResolutionSource` 必须在同一 `{context_tree_oid, artifact_generation}` 中解析为唯一 `resolved` Artifact 和 ContextArtifactAssociation；ambiguous、missing、unavailable 或跨 Generation 目标只能作为诊断，不能使 maturity 成为 grounded。
-3. File/Module/Symbol/API/Schema/Test 声明必须由明确 Evidence 支撑；Prompt、Workspace、Diff、TestOutcome 或本次 `ResolvedFocus` 本身不能证明 Artifact/Interface 身份。
-4. `grounded` Revision 至少包含一个成功解析的 EvidenceSource，且每个 Artifact/Interface 声明都有来源覆盖；opaque 字符串、自由文本前缀和仅格式合法的 ID 一律不能通过。
-5. #136 实现必须将 maturity 与规范化 typed EvidenceSource 一起纳入 Revision 的持久内容、CAS 和幂等比较；完全相同的重试返回 `already_current`，不得新增 Revision。
-6. #156/#157 WorkEpisode Observation 与 AgentCheckpoint 已具备稳定 server ID、Task/Intent/Episode ownership、typed source、查询和固化规则；它们不自动成为 Grounded EvidenceSource，#136 仍延期。
-
-### M4：Low-tax Capture — #156–#163 功能链已实现，#136/#164 Gate 待完成
+### M4：Low-tax Capture — #136 与 #156–#163 已实现，#164 Gate 待完成
 
 - WorkEpisode/Capture 显式持久 API和 AgentCheckpoint MCP/CLI/Skill 已实现。PreCompact/TurnStop AutomatedEpisodeBoundary 只消费工作 Agent 已写入的 current-Intent Checkpoint，补齐 ordered refs、关闭 Episode 并调用共享 Builder；Adapter 不复制 Builder，SessionEnd 只清理 TTL。
 - Candidate Builder 与最小充分 Evidence 组装已实现：closed Episode 的每个充分 Claim 形成一个无 Space Draft；Inline Validation 原样复用，normalized Observation/Task Signal 转为 self-contained snapshot，Context Evidence 从一个 exact Index snapshot 复用；原始 Capture 不进 Git。
