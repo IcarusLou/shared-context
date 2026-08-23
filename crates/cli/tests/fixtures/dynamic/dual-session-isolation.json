@@ -1,0 +1,171 @@
+{
+  "schema": "shared-context.dynamic-scenario",
+  "version": "1",
+  "name": "same_workspace_dual_session_isolation",
+  "agent": {"vendor": "cursor", "version": "3.13.2", "framing": "newline_delimited_json"},
+  "actors": [
+    {"id": "session-a", "kind": {"type": "session"}},
+    {"id": "task-a", "kind": {"type": "task", "session": "session-a"}},
+    {"id": "session-b", "kind": {"type": "session"}},
+    {"id": "task-b", "kind": {"type": "task", "session": "session-b"}}
+  ],
+  "actions": [
+    {
+      "id": "intent-a", "actor": "task-a", "after": [],
+      "action": {"type": "mcp_request", "method": "task_intent_update", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "cursor"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session-a"}},
+        "task_boundary": {"type": "string", "value": "new"},
+        "expected_revision_id": {"type": "null"},
+        "intent": {"type": "object", "fields": {"goal": {"type": "string", "value": "keep session A open in the shared synthetic workspace"}}}
+      }}}
+    },
+    {
+      "id": "intent-b", "actor": "task-b", "after": [],
+      "action": {"type": "mcp_request", "method": "task_intent_update", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "cursor"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session-b"}},
+        "task_boundary": {"type": "string", "value": "new"},
+        "expected_revision_id": {"type": "null"},
+        "intent": {"type": "object", "fields": {"goal": {"type": "string", "value": "close session B independently in the shared synthetic workspace"}}}
+      }}}
+    },
+    {
+      "id": "active-a", "actor": "task-a", "after": ["intent-a"],
+      "action": {"type": "observe", "source": "runtime", "selector": {"type": "object", "fields": {
+        "entity": {"type": "string", "value": "active_task"},
+        "session_key": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session-a"}}
+      }}}
+    },
+    {
+      "id": "active-b", "actor": "task-b", "after": ["intent-b"],
+      "action": {"type": "observe", "source": "runtime", "selector": {"type": "object", "fields": {
+        "entity": {"type": "string", "value": "active_task"},
+        "session_key": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session-b"}}
+      }}}
+    },
+    {
+      "id": "checkpoint-a", "actor": "task-a", "after": ["active-a"],
+      "action": {"type": "mcp_request", "method": "task_checkpoint", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "cursor"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session-a"}},
+        "expected_task_id": {"type": "variable", "name": "task-a-id"},
+        "expected_intent_revision_id": {"type": "variable", "name": "revision-a-id"},
+        "expected_episode_version": {"type": "unsigned", "value": 0},
+        "boundary": {"type": "string", "value": "continue"},
+        "claims": {"type": "array", "items": []},
+        "unknowns": {"type": "array", "items": [{"type": "object", "fields": {
+          "statement": {"type": "string", "value": "session A remains independently open"},
+          "blocking": {"type": "boolean", "value": false},
+          "recheck_when": {"type": "array", "items": [{"type": "string", "value": "session A completes"}]}
+        }}]}
+      }}}
+    },
+    {
+      "id": "checkpoint-b", "actor": "task-b", "after": ["active-b"],
+      "action": {"type": "mcp_request", "method": "task_checkpoint", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "cursor"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session-b"}},
+        "expected_task_id": {"type": "variable", "name": "task-b-id"},
+        "expected_intent_revision_id": {"type": "variable", "name": "revision-b-id"},
+        "expected_episode_version": {"type": "unsigned", "value": 0},
+        "boundary": {"type": "string", "value": "continue"},
+        "claims": {"type": "array", "items": [{"type": "object", "fields": {
+          "context_kind_hint": {"type": "string", "value": "validation"},
+          "topic_key_hint": {"type": "string", "value": "testing/dual-session"},
+          "statement": {"type": "string", "value": "Session B closes without changing session A"},
+          "rationale": {"type": "string", "value": "Each actor owns an independent persistent protocol child"},
+          "applicability": {"type": "object", "fields": {
+            "domains": {"type": "array", "items": [{"type": "string", "value": "testing"}]},
+            "platforms": {"type": "array", "items": []},
+            "conditions": {"type": "array", "items": []}
+          }},
+          "assumptions": {"type": "array", "items": []},
+          "recheck_when": {"type": "array", "items": [{"type": "string", "value": "the session ownership contract changes"}]},
+          "evidence": {"type": "array", "items": [{"type": "object", "fields": {
+            "kind": {"type": "string", "value": "inline_validation"},
+            "evidence": {"type": "object", "fields": {
+              "kind": {"type": "string", "value": "experiment_record"},
+              "supports": {"type": "string", "value": "the session B checkpoint completed"},
+              "content": {"type": "object", "fields": {"actual": {"type": "string", "value": "passed"}}},
+              "interpretation": {"type": "string", "value": "the two session actors retain separate identities"},
+              "limitations": {"type": "array", "items": [{"type": "string", "value": "synthetic offline fixture"}]}
+            }}
+          }}]},
+          "artifact_refs": {"type": "array", "items": []},
+          "related_contexts": {"type": "array", "items": []}
+        }}]},
+        "unknowns": {"type": "array", "items": []}
+      }}}
+    },
+    {
+      "id": "session-end-a", "actor": "session-a", "after": ["checkpoint-a", "checkpoint-b"],
+      "action": {"type": "hook_event", "event": "sessionEnd", "payload": {"type": "object", "fields": {"reason": {"type": "string", "value": "completed"}}}}
+    },
+    {
+      "id": "episode-a-observe", "actor": "task-a", "after": ["session-end-a"],
+      "action": {"type": "observe", "source": "runtime", "selector": {"type": "object", "fields": {
+        "entity": {"type": "string", "value": "work_episode"},
+        "identity": {"type": "variable", "name": "episode-a-id"}
+      }}}
+    },
+    {
+      "id": "candidate-a-zero", "actor": "task-a", "after": ["episode-a-observe"],
+      "action": {"type": "observe", "source": "index", "selector": {"type": "object", "fields": {
+        "entity": {"type": "string", "value": "index_candidate_for_episode"},
+        "identity": {"type": "variable", "name": "episode-a-id"}
+      }}}
+    },
+    {
+      "id": "stop-b", "actor": "session-b", "after": ["candidate-a-zero"],
+      "action": {"type": "hook_event", "event": "stop", "payload": {"type": "object", "fields": {}}}
+    },
+    {
+      "id": "candidate-list-b", "actor": "task-b", "after": ["stop-b"],
+      "action": {"type": "mcp_request", "method": "candidate_list", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "cursor"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session-b"}},
+        "status": {"type": "string", "value": "pending"},
+        "limit": {"type": "unsigned", "value": 10},
+        "token_budget": {"type": "unsigned", "value": 32768}
+      }}}
+    },
+    {
+      "id": "candidate-get-b", "actor": "task-b", "after": ["candidate-list-b"],
+      "action": {"type": "mcp_request", "method": "candidate_get", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "cursor"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session-b"}},
+        "candidate_id": {"type": "variable", "name": "listed-candidate-b-id"}
+      }}}
+    }
+  ],
+  "resources": [],
+  "variables": [
+    {"name": "task-a-id", "value_type": "task_id", "capture": {"step": "intent-a", "pointer": "/task_id"}},
+    {"name": "task-session-a-id", "value_type": "task_session_id", "capture": {"step": "intent-a", "pointer": "/task_session_id"}},
+    {"name": "revision-a-id", "value_type": "intent_revision_id", "capture": {"step": "intent-a", "pointer": "/intent_revision_id"}},
+    {"name": "task-b-id", "value_type": "task_id", "capture": {"step": "intent-b", "pointer": "/task_id"}},
+    {"name": "task-session-b-id", "value_type": "task_session_id", "capture": {"step": "intent-b", "pointer": "/task_session_id"}},
+    {"name": "revision-b-id", "value_type": "intent_revision_id", "capture": {"step": "intent-b", "pointer": "/intent_revision_id"}},
+    {"name": "episode-a-id", "value_type": "work_episode_id", "capture": {"step": "checkpoint-a", "pointer": "/episode_id"}},
+    {"name": "episode-b-id", "value_type": "work_episode_id", "capture": {"step": "checkpoint-b", "pointer": "/episode_id"}},
+    {"name": "listed-candidate-b-id", "value_type": "candidate_id", "capture": {"step": "candidate-list-b", "pointer": "/reviews/0/candidate_id"}},
+    {"name": "candidate-b-id", "value_type": "candidate_id", "capture": {"step": "candidate-get-b", "pointer": "/candidate_id"}},
+    {"name": "candidate-b-episode-id", "value_type": "work_episode_id", "capture": {"step": "candidate-get-b", "pointer": "/source_episode/episode_id"}}
+  ],
+  "faults": [
+    {"id": "parallel-intents", "fault": {"type": "concurrent", "targets": ["intent-a", "intent-b"]}},
+    {"id": "parallel-checkpoints", "fault": {"type": "concurrent", "targets": ["checkpoint-a", "checkpoint-b"]}}
+  ],
+  "assertions": [
+    {"id": "active-a-isolated", "invariant": {"type": "active_task_per_session", "observation": "active-a", "session": "session-a", "task": "task-a-id"}},
+    {"id": "active-b-isolated", "invariant": {"type": "active_task_per_session", "observation": "active-b", "session": "session-b", "task": "task-b-id"}},
+    {"id": "session-end-a-keeps-open", "invariant": {"type": "session_end_does_not_close_episode", "session_end": "session-end-a", "observation": "episode-a-observe", "episode": "episode-a-id"}},
+    {"id": "session-a-open-no-candidate", "invariant": {"type": "open_episode_has_no_candidate", "episode": "episode-a-id", "episode_observation": "episode-a-observe", "candidate_observation": "candidate-a-zero"}},
+    {"id": "session-b-candidate-source", "invariant": {"type": "candidate_source_episode", "response": "candidate-get-b", "candidate": "candidate-b-id", "episode": "candidate-b-episode-id"}}
+  ],
+  "events": [
+    {"event": "sessionEnd", "classification": "supported", "product_action": "session_end"},
+    {"event": "stop", "classification": "supported", "product_action": "turn_stop"}
+  ]
+}

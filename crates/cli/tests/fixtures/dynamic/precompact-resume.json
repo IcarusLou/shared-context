@@ -1,0 +1,248 @@
+{
+  "schema": "shared-context.dynamic-scenario",
+  "version": "1",
+  "name": "precompact_resume_new_episode",
+  "agent": {"vendor": "codex", "version": "0.147.0", "framing": "content_length"},
+  "actors": [
+    {"id": "session", "kind": {"type": "session"}},
+    {"id": "task", "kind": {"type": "task", "session": "session"}}
+  ],
+  "actions": [
+    {
+      "id": "intent-new", "actor": "task", "after": [],
+      "action": {"type": "mcp_request", "method": "task_intent_update", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "task_boundary": {"type": "string", "value": "new"},
+        "expected_revision_id": {"type": "null"},
+        "intent": {"type": "object", "fields": {"goal": {"type": "string", "value": "exercise synthetic compaction and resume"}}}
+      }}}
+    },
+    {
+      "id": "checkpoint-one", "actor": "task", "after": ["intent-new"],
+      "action": {"type": "mcp_request", "method": "task_checkpoint", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "expected_task_id": {"type": "variable", "name": "task-id"},
+        "expected_intent_revision_id": {"type": "variable", "name": "intent-revision-id"},
+        "expected_episode_version": {"type": "unsigned", "value": 0},
+        "boundary": {"type": "string", "value": "continue"},
+        "claims": {"type": "array", "items": [{"type": "object", "fields": {
+          "context_kind_hint": {"type": "string", "value": "validation"},
+          "topic_key_hint": {"type": "string", "value": "testing/precompact"},
+          "statement": {"type": "string", "value": "Synthetic compaction closes the checkpointed episode"},
+          "rationale": {"type": "string", "value": "The lifecycle Hook follows the explicit checkpoint"},
+          "applicability": {"type": "object", "fields": {
+            "domains": {"type": "array", "items": [{"type": "string", "value": "testing"}]},
+            "platforms": {"type": "array", "items": []},
+            "conditions": {"type": "array", "items": []}
+          }},
+          "assumptions": {"type": "array", "items": []},
+          "recheck_when": {"type": "array", "items": [{"type": "string", "value": "the compaction protocol changes"}]},
+          "evidence": {"type": "array", "items": [{"type": "object", "fields": {
+            "kind": {"type": "string", "value": "inline_validation"},
+            "evidence": {"type": "object", "fields": {
+              "kind": {"type": "string", "value": "experiment_record"},
+              "supports": {"type": "string", "value": "the checkpoint was written"},
+              "content": {"type": "object", "fields": {"actual": {"type": "string", "value": "passed"}}},
+              "interpretation": {"type": "string", "value": "the fixed lifecycle is reproducible"},
+              "limitations": {"type": "array", "items": [{"type": "string", "value": "synthetic offline fixture"}]}
+            }}
+          }}]},
+          "artifact_refs": {"type": "array", "items": []},
+          "related_contexts": {"type": "array", "items": []}
+        }}]},
+        "unknowns": {"type": "array", "items": []}
+      }}}
+    },
+    {
+      "id": "precompact", "actor": "session", "after": ["checkpoint-one"],
+      "action": {"type": "hook_event", "event": "PreCompact", "payload": {"type": "object", "fields": {"trigger": {"type": "string", "value": "auto"}}}}
+    },
+    {
+      "id": "candidate-list", "actor": "task", "after": ["precompact"],
+      "action": {"type": "mcp_request", "method": "candidate_list", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "status": {"type": "string", "value": "pending"},
+        "limit": {"type": "unsigned", "value": 10},
+        "token_budget": {"type": "unsigned", "value": 32768}
+      }}}
+    },
+    {
+      "id": "candidate-get", "actor": "task", "after": ["candidate-list"],
+      "action": {"type": "mcp_request", "method": "candidate_get", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "candidate_id": {"type": "variable", "name": "listed-candidate-id"}
+      }}}
+    },
+    {
+      "id": "discard-first", "actor": "task", "after": ["candidate-get"],
+      "action": {"type": "mcp_request", "method": "candidate_discard", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "expected_task_id": {"type": "variable", "name": "task-id"},
+        "expected_intent_revision_id": {"type": "variable", "name": "intent-revision-id"},
+        "candidate_id": {"type": "variable", "name": "candidate-id"},
+        "expected_review_version": {"type": "variable", "name": "review-version"},
+        "reason": {"type": "string", "value": "advance the synthetic lifecycle fixture"}
+      }}}
+    },
+    {
+      "id": "resume", "actor": "session", "after": ["discard-first"],
+      "action": {"type": "hook_event", "event": "SessionStart", "payload": {"type": "object", "fields": {"source": {"type": "string", "value": "resume"}}}}
+    },
+    {
+      "id": "active-after-resume", "actor": "task", "after": ["resume"],
+      "action": {"type": "observe", "source": "runtime", "selector": {"type": "object", "fields": {
+        "entity": {"type": "string", "value": "active_task"},
+        "session_key": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}}
+      }}}
+    },
+    {
+      "id": "checkpoint-two", "actor": "task", "after": ["active-after-resume"],
+      "action": {"type": "mcp_request", "method": "task_checkpoint", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "expected_task_id": {"type": "variable", "name": "task-id"},
+        "expected_intent_revision_id": {"type": "variable", "name": "intent-revision-id"},
+        "expected_episode_version": {"type": "unsigned", "value": 0},
+        "boundary": {"type": "string", "value": "continue"},
+        "claims": {"type": "array", "items": [{"type": "object", "fields": {
+          "context_kind_hint": {"type": "string", "value": "validation"},
+          "topic_key_hint": {"type": "string", "value": "testing/resume"},
+          "statement": {"type": "string", "value": "Resume creates Episode two without changing Task"},
+          "rationale": {"type": "string", "value": "The different checkpoint follows a closed Episode"},
+          "applicability": {"type": "object", "fields": {
+            "domains": {"type": "array", "items": [{"type": "string", "value": "testing"}]},
+            "platforms": {"type": "array", "items": []},
+            "conditions": {"type": "array", "items": []}
+          }},
+          "assumptions": {"type": "array", "items": []},
+          "recheck_when": {"type": "array", "items": [{"type": "string", "value": "the Episode retry boundary changes"}]},
+          "evidence": {"type": "array", "items": [{"type": "object", "fields": {
+            "kind": {"type": "string", "value": "inline_validation"},
+            "evidence": {"type": "object", "fields": {
+              "kind": {"type": "string", "value": "experiment_record"},
+              "supports": {"type": "string", "value": "Episode two was written through MCP"},
+              "content": {"type": "object", "fields": {"actual": {"type": "string", "value": "passed"}}},
+              "interpretation": {"type": "string", "value": "the closed parent is not mistaken for a retry"},
+              "limitations": {"type": "array", "items": [{"type": "string", "value": "synthetic offline fixture"}]}
+            }}
+          }}]},
+          "artifact_refs": {"type": "array", "items": []},
+          "related_contexts": {"type": "array", "items": []}
+        }}]},
+        "unknowns": {"type": "array", "items": []}
+      }}}
+    },
+    {
+      "id": "episode-two-observe", "actor": "task", "after": ["checkpoint-two"],
+      "action": {"type": "observe", "source": "runtime", "selector": {"type": "object", "fields": {
+        "entity": {"type": "string", "value": "work_episode"},
+        "identity": {"type": "variable", "name": "episode-two-id"}
+      }}}
+    },
+    {
+      "id": "candidate-two-zero", "actor": "task", "after": ["episode-two-observe"],
+      "action": {"type": "observe", "source": "index", "selector": {"type": "object", "fields": {
+        "entity": {"type": "string", "value": "index_candidate_for_episode"},
+        "identity": {"type": "variable", "name": "episode-two-id"}
+      }}}
+    },
+    {
+      "id": "turn-stop-two", "actor": "session", "after": ["candidate-two-zero"],
+      "action": {"type": "hook_event", "event": "Stop", "payload": {"type": "object", "fields": {}}}
+    },
+    {
+      "id": "candidate-list-two", "actor": "task", "after": ["turn-stop-two"],
+      "action": {"type": "mcp_request", "method": "candidate_list", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "status": {"type": "string", "value": "pending"},
+        "limit": {"type": "unsigned", "value": 10},
+        "token_budget": {"type": "unsigned", "value": 32768}
+      }}}
+    },
+    {
+      "id": "candidate-get-two", "actor": "task", "after": ["candidate-list-two"],
+      "action": {"type": "mcp_request", "method": "candidate_get", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "candidate_id": {"type": "variable", "name": "listed-candidate-two-id"}
+      }}}
+    },
+    {
+      "id": "checkpoint-three", "actor": "task", "after": ["candidate-get-two"],
+      "action": {"type": "mcp_request", "method": "task_checkpoint", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "expected_task_id": {"type": "variable", "name": "task-id"},
+        "expected_intent_revision_id": {"type": "variable", "name": "intent-revision-id"},
+        "expected_episode_version": {"type": "unsigned", "value": 0},
+        "boundary": {"type": "string", "value": "continue"},
+        "claims": {"type": "array", "items": []},
+        "unknowns": {"type": "array", "items": [{"type": "object", "fields": {
+          "statement": {"type": "string", "value": "the third synthetic Episode remains open"},
+          "blocking": {"type": "boolean", "value": false},
+          "recheck_when": {"type": "array", "items": [{"type": "string", "value": "the resumed work completes"}]}
+        }}]}
+      }}}
+    },
+    {
+      "id": "episode-three-observe", "actor": "task", "after": ["checkpoint-three"],
+      "action": {"type": "observe", "source": "runtime", "selector": {"type": "object", "fields": {
+        "entity": {"type": "string", "value": "work_episode"},
+        "identity": {"type": "variable", "name": "episode-three-id"}
+      }}}
+    },
+    {
+      "id": "candidate-three-zero", "actor": "task", "after": ["episode-three-observe"],
+      "action": {"type": "observe", "source": "index", "selector": {"type": "object", "fields": {
+        "entity": {"type": "string", "value": "index_candidate_for_episode"},
+        "identity": {"type": "variable", "name": "episode-three-id"}
+      }}}
+    },
+    {
+      "id": "context-after-resume", "actor": "task", "after": ["candidate-three-zero"],
+      "action": {"type": "mcp_request", "method": "task_context", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "token_budget": {"type": "unsigned", "value": 32768},
+        "max_spaces": {"type": "unsigned", "value": 5}
+      }}}
+    }
+  ],
+  "resources": [],
+  "variables": [
+    {"name": "task-id", "value_type": "task_id", "capture": {"step": "intent-new", "pointer": "/task_id"}},
+    {"name": "task-session-id", "value_type": "task_session_id", "capture": {"step": "intent-new", "pointer": "/task_session_id"}},
+    {"name": "intent-revision-id", "value_type": "intent_revision_id", "capture": {"step": "intent-new", "pointer": "/intent_revision_id"}},
+    {"name": "checkpoint-one-episode-id", "value_type": "work_episode_id", "capture": {"step": "checkpoint-one", "pointer": "/episode_id"}},
+    {"name": "episode-one-id", "value_type": "work_episode_id", "capture": {"step": "candidate-get", "pointer": "/source_episode/episode_id"}},
+    {"name": "listed-candidate-id", "value_type": "candidate_id", "capture": {"step": "candidate-list", "pointer": "/reviews/0/candidate_id"}},
+    {"name": "candidate-id", "value_type": "candidate_id", "capture": {"step": "candidate-get", "pointer": "/candidate_id"}},
+    {"name": "review-version", "value_type": "count", "capture": {"step": "candidate-get", "pointer": "/review_version"}},
+    {"name": "episode-two-id", "value_type": "work_episode_id", "capture": {"step": "checkpoint-two", "pointer": "/episode_id"}},
+    {"name": "listed-candidate-two-id", "value_type": "candidate_id", "capture": {"step": "candidate-list-two", "pointer": "/reviews/0/candidate_id"}},
+    {"name": "candidate-two-id", "value_type": "candidate_id", "capture": {"step": "candidate-get-two", "pointer": "/candidate_id"}},
+    {"name": "candidate-two-episode-id", "value_type": "work_episode_id", "capture": {"step": "candidate-get-two", "pointer": "/source_episode/episode_id"}},
+    {"name": "episode-three-id", "value_type": "work_episode_id", "capture": {"step": "checkpoint-three", "pointer": "/episode_id"}},
+    {"name": "task-id-after", "value_type": "task_id", "capture": {"step": "context-after-resume", "pointer": "/task_id"}},
+    {"name": "task-session-after", "value_type": "task_session_id", "capture": {"step": "context-after-resume", "pointer": "/task_session_id"}}
+  ],
+  "faults": [],
+  "assertions": [
+    {"id": "same-active-task-after-resume", "invariant": {"type": "active_task_per_session", "observation": "active-after-resume", "session": "session", "task": "task-id"}},
+    {"id": "first-candidate-source", "invariant": {"type": "candidate_source_episode", "response": "candidate-get", "candidate": "candidate-id", "episode": "episode-one-id"}},
+    {"id": "resumed-open-no-candidate", "invariant": {"type": "open_episode_has_no_candidate", "episode": "episode-two-id", "episode_observation": "episode-two-observe", "candidate_observation": "candidate-two-zero"}},
+    {"id": "second-candidate-source", "invariant": {"type": "candidate_source_episode", "response": "candidate-get-two", "candidate": "candidate-two-id", "episode": "candidate-two-episode-id"}},
+    {"id": "third-open-no-candidate", "invariant": {"type": "open_episode_has_no_candidate", "episode": "episode-three-id", "episode_observation": "episode-three-observe", "candidate_observation": "candidate-three-zero"}}
+  ],
+  "events": [
+    {"event": "PreCompact", "classification": "supported", "product_action": "pre_compact"},
+    {"event": "SessionStart", "classification": "supported", "product_action": "session_start"},
+    {"event": "Stop", "classification": "supported", "product_action": "turn_stop"}
+  ]
+}

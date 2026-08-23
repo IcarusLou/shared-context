@@ -1,0 +1,289 @@
+{
+  "schema": "shared-context.dynamic-scenario",
+  "version": "1",
+  "name": "codex_normal_candidate_confirm",
+  "agent": {"vendor": "codex", "version": "0.147.0", "framing": "content_length"},
+  "actors": [
+    {"id": "session", "kind": {"type": "session"}},
+    {"id": "task", "kind": {"type": "task", "session": "session"}}
+  ],
+  "actions": [
+    {
+      "id": "repository-add", "actor": "task", "after": [],
+      "action": {"type": "cli_json", "arguments": [
+        {"type": "string", "value": "repository"},
+        {"type": "string", "value": "add"},
+        {"type": "string", "value": "--path"},
+        {"type": "builtin", "builtin": {"type": "resource_root", "resource": "focus-repo"}}
+      ]}
+    },
+    {
+      "id": "prompt", "actor": "session", "after": ["repository-add"],
+      "action": {"type": "hook_event", "event": "UserPromptSubmit", "payload": {"type": "object", "fields": {}}}
+    },
+    {
+      "id": "intent-new", "actor": "task", "after": ["prompt"],
+      "action": {"type": "mcp_request", "method": "task_intent_update", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "task_boundary": {"type": "string", "value": "new"},
+        "expected_revision_id": {"type": "null"},
+        "intent": {"type": "object", "fields": {
+          "goal": {"type": "string", "value": "establish a synthetic dynamic workflow"},
+          "artifact_hints": {"type": "array", "items": [{"type": "string", "value": "synthetic focus resource"}]}
+        }}
+      }}}
+    },
+    {
+      "id": "intent-retry", "actor": "task", "after": ["intent-new"],
+      "action": {"type": "mcp_request", "method": "task_intent_update", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "task_boundary": {"type": "string", "value": "continue"},
+        "expected_revision_id": {"type": "variable", "name": "revision-one"},
+        "intent": {"type": "object", "fields": {
+          "goal": {"type": "string", "value": " establish   a SYNTHETIC dynamic workflow "},
+          "artifact_hints": {"type": "array", "items": [{"type": "string", "value": "synthetic focus resource"}]}
+        }}
+      }}}
+    },
+    {
+      "id": "intent-change", "actor": "task", "after": ["intent-retry"],
+      "action": {"type": "mcp_request", "method": "task_intent_update", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "task_boundary": {"type": "string", "value": "continue"},
+        "expected_revision_id": {"type": "variable", "name": "revision-retry"},
+        "intent": {"type": "object", "fields": {
+          "goal": {"type": "string", "value": "validate the accepted synthetic focus resource"},
+          "artifact_hints": {"type": "array", "items": [{"type": "string", "value": "synthetic focus resource"}]}
+        }}
+      }}}
+    },
+    {
+      "id": "post-tool", "actor": "session", "after": ["intent-change"],
+      "action": {"type": "hook_event", "event": "PostToolUse", "payload": {"type": "object", "fields": {}}}
+    },
+    {
+      "id": "semantic-before", "actor": "task", "after": ["post-tool"],
+      "action": {"type": "observe", "source": "runtime", "selector": {"type": "object", "fields": {
+        "entity": {"type": "string", "value": "task_semantic_state"},
+        "session_key": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}}
+      }}}
+    },
+    {
+      "id": "stale-attempt", "actor": "task", "after": ["semantic-before"],
+      "expectation": {"type": "typed_failure", "code": "intent_stale", "kind": "stale_state"},
+      "action": {"type": "mcp_request", "method": "task_intent_update", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "task_boundary": {"type": "string", "value": "continue"},
+        "expected_revision_id": {"type": "variable", "name": "revision-one"},
+        "intent": {"type": "object", "fields": {"goal": {"type": "string", "value": "attempt a stale synthetic direction"}}}
+      }}}
+    },
+    {
+      "id": "semantic-after", "actor": "task", "after": ["stale-attempt"],
+      "action": {"type": "observe", "source": "runtime", "selector": {"type": "object", "fields": {
+        "entity": {"type": "string", "value": "task_semantic_state"},
+        "session_key": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}}
+      }}}
+    },
+    {
+      "id": "active-observe", "actor": "task", "after": ["semantic-after"],
+      "action": {"type": "observe", "source": "runtime", "selector": {"type": "object", "fields": {
+        "entity": {"type": "string", "value": "active_task"},
+        "session_key": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}}
+      }}}
+    },
+    {
+      "id": "checkpoint", "actor": "task", "after": ["active-observe"],
+      "action": {"type": "mcp_request", "method": "task_checkpoint", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "expected_task_id": {"type": "variable", "name": "task-id"},
+        "expected_intent_revision_id": {"type": "variable", "name": "revision-two"},
+        "expected_episode_version": {"type": "unsigned", "value": 0},
+        "boundary": {"type": "string", "value": "continue"},
+        "claims": {"type": "array", "items": [{"type": "object", "fields": {
+          "context_kind_hint": {"type": "string", "value": "validation"},
+          "topic_key_hint": {"type": "string", "value": "testing/codex-normal"},
+          "statement": {"type": "string", "value": "The synthetic focus resource resolves through the graph"},
+          "rationale": {"type": "string", "value": "A fixed offline validation exercises the dynamic chain"},
+          "applicability": {"type": "object", "fields": {
+            "domains": {"type": "array", "items": [{"type": "string", "value": "testing"}]},
+            "platforms": {"type": "array", "items": []},
+            "conditions": {"type": "array", "items": []}
+          }},
+          "assumptions": {"type": "array", "items": []},
+          "recheck_when": {"type": "array", "items": [{"type": "string", "value": "the dynamic protocol changes"}]},
+          "evidence": {"type": "array", "items": [{"type": "object", "fields": {
+            "kind": {"type": "string", "value": "inline_validation"},
+            "evidence": {"type": "object", "fields": {
+              "kind": {"type": "string", "value": "experiment_record"},
+              "supports": {"type": "string", "value": "the synthetic action completed"},
+              "content": {"type": "object", "fields": {"actual": {"type": "string", "value": "passed"}}},
+              "interpretation": {"type": "string", "value": "the scenario controls the observation"},
+              "limitations": {"type": "array", "items": [{"type": "string", "value": "synthetic offline fixture"}]}
+            }}
+          }}]},
+          "artifact_refs": {"type": "array", "items": []},
+          "related_contexts": {"type": "array", "items": []}
+        }}]},
+        "unknowns": {"type": "array", "items": []}
+      }}}
+    },
+    {
+      "id": "episode-observe", "actor": "task", "after": ["checkpoint"],
+      "action": {"type": "observe", "source": "runtime", "selector": {"type": "object", "fields": {
+        "entity": {"type": "string", "value": "work_episode"},
+        "identity": {"type": "variable", "name": "episode-id"}
+      }}}
+    },
+    {
+      "id": "candidate-zero", "actor": "task", "after": ["episode-observe"],
+      "action": {"type": "observe", "source": "index", "selector": {"type": "object", "fields": {
+        "entity": {"type": "string", "value": "index_candidate_for_episode"},
+        "identity": {"type": "variable", "name": "episode-id"}
+      }}}
+    },
+    {
+      "id": "turn-stop", "actor": "session", "after": ["candidate-zero"],
+      "action": {"type": "hook_event", "event": "Stop", "payload": {"type": "object", "fields": {}}}
+    },
+    {
+      "id": "candidate-list", "actor": "task", "after": ["turn-stop"],
+      "action": {"type": "mcp_request", "method": "candidate_list", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "status": {"type": "string", "value": "pending"},
+        "limit": {"type": "unsigned", "value": 10},
+        "token_budget": {"type": "unsigned", "value": 32768}
+      }}}
+    },
+    {
+      "id": "candidate-get", "actor": "task", "after": ["candidate-list"],
+      "action": {"type": "mcp_request", "method": "candidate_get", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "candidate_id": {"type": "variable", "name": "listed-candidate-id"}
+      }}}
+    },
+    {
+      "id": "context-before-confirm", "actor": "task", "after": ["candidate-get"],
+      "action": {"type": "mcp_request", "method": "task_context", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "token_budget": {"type": "unsigned", "value": 4000},
+        "max_spaces": {"type": "unsigned", "value": 8}
+      }}}
+    },
+    {
+      "id": "candidate-confirm", "actor": "task", "after": ["context-before-confirm"],
+      "action": {"type": "mcp_request", "method": "candidate_confirm", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "expected_task_id": {"type": "variable", "name": "task-id"},
+        "expected_intent_revision_id": {"type": "variable", "name": "revision-two"},
+        "candidate_id": {"type": "variable", "name": "candidate-id"},
+        "expected_review_version": {"type": "variable", "name": "review-version"},
+        "primary": {"type": "object", "fields": {"new_space_recommendation_id": {"type": "variable", "name": "recommendation-id"}}},
+        "related_space_ids": {"type": "array", "items": []}
+      }}}
+    },
+    {
+      "id": "repository-scan", "actor": "task", "after": ["candidate-confirm"],
+      "action": {"type": "mcp_request", "method": "repository_scan", "params": {"type": "object", "fields": {
+        "checkout_path": {"type": "builtin", "builtin": {"type": "resource_root", "resource": "focus-repo"}},
+        "paths": {"type": "array", "items": [{"type": "string", "value": "src/focus.rs"}]},
+        "max_artifacts": {"type": "unsigned", "value": 20}
+      }}}
+    },
+    {
+      "id": "reference-record", "actor": "task", "after": ["repository-scan"],
+      "action": {"type": "mcp_request", "method": "engineering_reference_record", "params": {"type": "object", "fields": {
+        "context_id": {"type": "variable", "name": "context-id"},
+        "revision_id": {"type": "variable", "name": "context-revision-id"},
+        "repository_id": {"type": "variable", "name": "repository-id"},
+        "artifact_kind": {"type": "string", "value": "file"},
+        "relation": {"type": "string", "value": "implements"},
+        "locator": {"type": "object", "fields": {
+          "locator_kind": {"type": "string", "value": "file"},
+          "path": {"type": "string", "value": "src/focus.rs"}
+        }},
+        "supports": {"type": "string", "value": "the synthetic file implements the validation"},
+        "limitations": {"type": "array", "items": [{"type": "string", "value": "synthetic repository"}]}
+      }}}
+    },
+    {
+      "id": "association-rebuild", "actor": "task", "after": ["reference-record"],
+      "action": {"type": "mcp_request", "method": "association_rebuild", "params": {"type": "object", "fields": {
+        "diagnose_only": {"type": "boolean", "value": false}
+      }}}
+    },
+    {
+      "id": "artifact-focus", "actor": "task", "after": ["association-rebuild"],
+      "action": {"type": "mcp_request", "method": "task_artifact_focus", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "expected_revision_id": {"type": "variable", "name": "revision-two"},
+        "absolute_file_path": {"type": "builtin", "builtin": {"type": "resource_file", "resource": "focus-repo", "path": "src/focus.rs"}},
+        "locator": {"type": "object", "fields": {"locator_kind": {"type": "string", "value": "file"}}},
+        "token_budget": {"type": "unsigned", "value": 4000},
+        "max_spaces": {"type": "unsigned", "value": 8}
+      }}}
+    },
+    {
+      "id": "ordinary-context", "actor": "task", "after": ["artifact-focus"],
+      "action": {"type": "mcp_request", "method": "task_context", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "token_budget": {"type": "unsigned", "value": 4000},
+        "max_spaces": {"type": "unsigned", "value": 8}
+      }}}
+    }
+  ],
+  "resources": [{
+    "id": "focus-repo", "synthetic_git": true,
+    "files": [{"path": "src/focus.rs", "content": "pub fn synthetic_focus_target() -> bool { true }\n"}]
+  }],
+  "variables": [
+    {"name": "repository-id", "value_type": "repository_id", "capture": {"step": "repository-add", "pointer": "/catalog/repository/repository_id"}},
+    {"name": "task-id", "value_type": "task_id", "capture": {"step": "intent-new", "pointer": "/task_id"}},
+    {"name": "revision-one", "value_type": "intent_revision_id", "capture": {"step": "intent-new", "pointer": "/intent_revision_id"}},
+    {"name": "revision-retry", "value_type": "intent_revision_id", "capture": {"step": "intent-retry", "pointer": "/intent_revision_id"}},
+    {"name": "revision-two", "value_type": "intent_revision_id", "capture": {"step": "intent-change", "pointer": "/intent_revision_id"}},
+    {"name": "episode-id", "value_type": "work_episode_id", "capture": {"step": "checkpoint", "pointer": "/episode_id"}},
+    {"name": "listed-candidate-id", "value_type": "candidate_id", "capture": {"step": "candidate-list", "pointer": "/reviews/0/candidate_id"}},
+    {"name": "candidate-id", "value_type": "candidate_id", "capture": {"step": "candidate-get", "pointer": "/candidate_id"}},
+    {"name": "candidate-episode-id", "value_type": "work_episode_id", "capture": {"step": "candidate-get", "pointer": "/source_episode/episode_id"}},
+    {"name": "review-version", "value_type": "count", "capture": {"step": "candidate-get", "pointer": "/review_version"}},
+    {"name": "recommendation-id", "value_type": "space_recommendation_id", "capture": {"step": "candidate-get", "pointer": "/space_recommendations/0/recommendation_id"}},
+    {"name": "confirmation-id", "value_type": "confirmation_id", "capture": {"step": "candidate-confirm", "pointer": "/confirmation_id"}},
+    {"name": "context-id", "value_type": "context_id", "capture": {"step": "candidate-confirm", "pointer": "/context_id"}},
+    {"name": "context-revision-id", "value_type": "revision_id", "capture": {"step": "candidate-confirm", "pointer": "/revision_id"}}
+  ],
+  "faults": [],
+  "assertions": [
+    {"id": "active-task", "invariant": {"type": "active_task_per_session", "observation": "active-observe", "session": "session", "task": "task-id"}},
+    {"id": "same-revision", "invariant": {"type": "canonical_continue_keeps_revision", "first_revision": "revision-one", "retry_revision": "revision-retry"}},
+    {"id": "stale-zero-write", "invariant": {"type": "stale_cas_zero_writes", "attempt": "stale-attempt", "before_observation": "semantic-before", "after_observation": "semantic-after"}},
+    {"id": "open-no-candidate", "invariant": {"type": "open_episode_has_no_candidate", "episode": "episode-id", "episode_observation": "episode-observe", "candidate_observation": "candidate-zero"}},
+    {"id": "candidate-source", "invariant": {"type": "candidate_source_episode", "response": "candidate-get", "candidate": "candidate-id", "episode": "candidate-episode-id"}},
+    {"id": "candidate-not-injected", "invariant": {"type": "candidate_is_not_auto_injected", "candidate": "candidate-id", "response": "context-before-confirm"}},
+    {"id": "confirmation-five", "invariant": {"type": "confirmation_is_atomic", "confirmation": "confirmation-id", "response": "candidate-confirm", "event_count": "five"}},
+    {"id": "hint-no-graph", "invariant": {"type": "working_intent_hint_has_no_graph_path", "response": "ordinary-context"}},
+    {"id": "focus-scoped", "invariant": {"type": "artifact_focus_is_request_scoped", "focused_response": "artifact-focus", "ordinary_response": "ordinary-context", "resource": "focus-repo", "path": "src/focus.rs"}},
+    {"id": "raw-absent", "invariant": {"type": "raw_content_is_absent", "probes": [
+      {"kind": "prompt", "hook": "prompt"},
+      {"kind": "transcript", "hook": "prompt"},
+      {"kind": "tool_output", "hook": "post-tool"}
+    ]}}
+  ],
+  "events": [
+    {"event": "UserPromptSubmit", "classification": "supported", "product_action": "prompt_submit"},
+    {"event": "PostToolUse", "classification": "supported", "product_action": "post_tool_use"},
+    {"event": "Stop", "classification": "supported", "product_action": "turn_stop"},
+    {"event": "afterAgentThought", "classification": "observed_only"}
+  ]
+}
