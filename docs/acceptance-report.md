@@ -1,8 +1,10 @@
 # Task-first Retrieval Integration Acceptance Report
 
-Date: 2026-08-23
-Scope: completed redesign work through Mew #170, including Mandatory Gates #114/#117, Working Intent fixes #136/#169, accepted boundary #150, and final M4 Gate #164
+Date: 2026-08-24
+Scope: production acceptance through Mew #170/#164 is unchanged, including #136/#169; additive non-blocking testing evidence extends through #171/#176
 Documentation baseline before the #170 language alignment: `main@e03193b`
+
+Production acceptance remains closed by final M4 Gate #164.
 
 ## Verdict
 
@@ -16,6 +18,14 @@ Session startup and PromptSubmit are capability-only: neither infers Working Int
 | M2 — Task Runtime and multi-Space retrieval | IMPLEMENTED | TaskSession persistence, strict `task_intent_update`, read-only `task_context`, association inference, typed RetrievalPaths, and TaskContextPack pass focused cross-crate/E2E oracles |
 | M3 — Engineering Graph | IMPLEMENTED | Reference-derived bounded ScanPlan, deterministic Artifact locators, sparse build-time Context/safety snapshots, historical exact retrieval, frozen 1–2 hop relations, diagnostics, fallback, rebuild equivalence, and budget bounds pass cross-crate/E2E oracles |
 | M4 — Low-tax Capture | IMPLEMENTED | #117, #136, #156–#164 and #169 provide lightweight idempotent Working Intent, Hint Text retrieval, exact WorkEpisode/Checkpoint automation, Builder/analysis/Review, and atomic existing/new Candidate Confirmation, closed by a fixed cross-layer oracle plus Hook/Capture/privacy/performance suites |
+
+## #171 Dynamic Replay Phase One — NON-BLOCKING EVIDENCE
+
+#176 adds sanitized reporting around six hand-written synthetic scenarios executed against the real local `sctx` binary in isolated runner-owned sandboxes. It does not replay a real Session and changes no product logic, product Schema, scenario contract semantics, Agent Adapter, or fixture. Real local Codex/Cursor material influenced only human-reviewed aggregate pacing; no Prompt, transcript, tool output, path, user/Session identity, domain ID, or per-session event sequence is an input or committed artifact.
+
+The explicit 6×20 run completed all 120 isolated runs with zero failures: 100 normal `Passed` dispositions and 20 declared `expected_fail_open` stale-CAS results whose downstream closed assertions all passed. The other report classes—invalid scenario, unsupported version, corrupt data, infrastructure flake, and product invariant violation—were zero. Timing is committed only as rounded aggregate data, while a semantic digest excludes timing and runtime-generated identities. See [`dynamic-replay-phase-one.md`](./dynamic-replay-phase-one.md) and the audited [`dynamic-replay-phase-one-v1.json`](../tests/reports/dynamic-replay-phase-one-v1.json).
+
+This is additive, non-blocking evidence. Codex `0.147.0` and Cursor `3.13.2` are fixture profiles rather than a compatibility matrix. The fixed M4 oracle, `hook_to_confirm_chain`, workspace Rust/NPM gates, and accepted #150 untracked-file boundary remain blocking. A replay result can authorize a production-fix proposal only for a supported profile, after stable non-infrastructure reproduction of a named primary-flow closed invariant at ROI-1, and only with explicit human approval of a new atomic production Issue. Actual Session replay, collection/sanitization, model-in-the-loop execution, a multi-version matrix, and promotion to merge-blocking all remain unimplemented and require new Issues plus fresh privacy/design review and approval.
 
 `task_intent_update` is the only public Working Intent write path. It creates or advances a `TaskIntentRevision` containing one `WorkingIntentSnapshot`. `task_context` accepts only an external Session locator and output bounds, and reads the already-authoritative ActiveTask without mutating Runtime. PromptSubmit supplies guidance rather than inferred Intent. Explicit `context_search.space_ids` remains available as a hard filter for diagnosis and exploration.
 

@@ -28,7 +28,7 @@ cargo test --locked -p sctx-cli --test milestone_one_contract
 cargo build --locked -p sctx-cli
 python3 tests/scripts/demo_acceptance.py --binary target/debug/sctx
 
-# arm64 execution plus arm64/x64/offline package structure (12 Node tests).
+# arm64 execution plus arm64/x64/offline package structure (16 Node tests).
 (cd npm && npm test)
 
 # Fixed 100k-row, four-query, 30-sample release benchmark with an asserted P95.

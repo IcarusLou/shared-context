@@ -36,6 +36,12 @@ Mandatory Gate #114/#117 已完成：Builder 的内部 submission service 将稳
 
 #164 固定 oracle 位于 `fixtures/m4/fixed-oracle.json`，由跨层测试直接驱动 Builder→Review→existing/new Confirm，不能从 production 输出生成。完整 M4 gate 同时固定运行 Working Intent/Hint、M3 跨端 Graph、真实 Cursor/Codex Hook、Capture privacy、Builder submission、analysis、Review 与 Confirmation 对抗套件。
 
+## Dynamic Replay Phase One（#171）
+
+#176 在 test-only runner 上关闭了第一阶段动态 Replay 验证。六个场景是手写、合成、经隐私审查的协议输入，在隔离 sandbox 中调用真实本机 `sctx`；它们不是对真实用户 Session 的回放。本机真实 Codex/Cursor 数据只用于人工提炼事件密度、相对生命周期顺序、Compaction、缺失 Hook 与并发位置等聚合节奏，不提交 Prompt、transcript、tool output、路径、用户/Session/领域 ID 或逐 Session 事件序列。
+
+默认测试保留六场景各一次的确定性真实执行；6×20 长跑是显式、非阻塞的附加证据，不进入每次提交或 merge gate。Codex `0.147.0` 与 Cursor `3.13.2` 仅是 fixture profiles，不是版本支持矩阵。报告分类、产品修复人工 Gate、延期范围、显式命令和已审计 120-run 聚合见 [`docs/dynamic-replay-phase-one.md`](./docs/dynamic-replay-phase-one.md)。`fixtures/m4/fixed-oracle.json`、`hook_to_confirm_chain`、Rust/NPM workspace gates 与 #150 的 untracked-file 边界继续 blocking，Replay 不得替代或弱化它们。
+
 ## 环境与检查
 
 需要 Rust stable（最低 Rust 1.85）、`rustfmt`、`clippy`、Git，以及 Node.js 18 或更新版本。

@@ -153,6 +153,7 @@ fn dynamic_fixtures_run_with_all_closed_assertions() {
 }
 
 #[test]
+#[ignore = "representative multi-seed replay runs through the phase-one report harness"]
 fn dynamic_suite_is_reproducible_across_representative_seeds() {
     for (name, fixture) in FIXTURES {
         let scenario = parse_scenario(fixture).unwrap();

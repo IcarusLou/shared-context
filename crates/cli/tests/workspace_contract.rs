@@ -84,6 +84,8 @@ fn source_asset_trees_are_not_ignored() {
         "fixtures/agents/cursor-3.13.json",
         "fixtures/agents/codex-0.147.json",
         "npm/packages/README.md",
+        "docs/dynamic-replay-phase-one.md",
+        "tests/reports/dynamic-replay-phase-one-v1.json",
     ] {
         let status = Command::new("git")
             .args(["check-ignore", "--quiet", "--no-index", path])

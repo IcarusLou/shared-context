@@ -9,6 +9,7 @@
 mod error;
 mod observer;
 mod process;
+mod report;
 mod schedule;
 
 use std::{
@@ -32,6 +33,10 @@ pub use observer::{
 use process::{
     CommandContext, McpManager, McpToolOutcome, ProcessError, ProcessErrorKind, binary_basename,
     parse_json_output, run_one_shot,
+};
+pub use report::{
+    ReplayClassification, ReplayDiagnosticCode, ReplayDisposition, ReplayExecutor, ReplayHarness,
+    ReplayReport, ReplayReportItem, ReplayScenario,
 };
 use schedule::{PlannedDisposition, PlannedStep, ScheduledBatch, compile_schedule};
 use sctx_local_state::PrivacyScanner;
