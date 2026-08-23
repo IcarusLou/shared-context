@@ -521,6 +521,8 @@ dependencies = [
  "sctx-installer",
  "sctx-local-state",
  "sctx-mcp",
+ "sctx-scenario-contract",
+ "sctx-scenario-runner",
  "sctx-search",
  "sctx-task-runtime",
  "serde",
@@ -655,6 +657,19 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "sctx-scenario-runner"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "sctx-scenario-contract",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "uuid",
 ]
 

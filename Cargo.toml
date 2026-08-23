@@ -15,6 +15,7 @@ members = [
     "crates/installer",
     "crates/cli",
     "crates/scenario-contract",
+    "crates/scenario-runner",
 ]
 resolver = "3"
 
@@ -44,6 +45,7 @@ sctx-local-state = { path = "crates/local-state" }
 sctx-mcp = { path = "crates/mcp" }
 sctx-search = { path = "crates/search" }
 sctx-scenario-contract = { path = "crates/scenario-contract" }
+sctx-scenario-runner = { path = "crates/scenario-runner" }
 sctx-task-runtime = { path = "crates/task-runtime" }
 uuid = { version = "1.18", features = ["v4"] }
 toml = "0.9"

@@ -32,4 +32,6 @@ workspace = true
 
 [dev-dependencies]
 fs2.workspace = true
+sctx-scenario-contract.workspace = true
+sctx-scenario-runner.workspace = true
 tempfile = "3.20"

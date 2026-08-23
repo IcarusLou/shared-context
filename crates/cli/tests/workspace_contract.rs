@@ -1,7 +1,8 @@
 use std::{collections::HashMap, fs, path::PathBuf, process::Command};
 
-const MEMBERS: [(&str, u8); 15] = [
+const MEMBERS: [(&str, u8); 16] = [
     ("scenario-contract", 0),
+    ("scenario-runner", 1),
     ("domain", 0),
     ("engineering-graph", 1),
     ("local-state", 1),
