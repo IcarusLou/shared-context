@@ -3321,7 +3321,6 @@ impl McpServer {
             "candidate_get" => self.candidate_get(call.arguments),
             "candidate_discard" => self.candidate_discard(call.arguments),
             "candidate_confirm" => self.candidate_confirm(call.arguments),
-            "candidate_create" => self.candidate_create(call.arguments),
             "space_list" => self.space_list(call.arguments),
             _ => return Err(invalid(format!("unknown tool: {}", call.name))),
         };
@@ -3507,80 +3506,6 @@ impl McpServer {
         }))
     }
 
-    fn candidate_create(&mut self, arguments: Value) -> ToolResult {
-        let input: CandidateCreateInput = decode_arguments(arguments)?;
-        let submission_id = parse_id::<SubmissionId>(&input.submission_id, "submission_id")?;
-        let source_episode_id =
-            parse_id::<WorkEpisodeId>(&input.source_episode_id, "source_episode_id")?;
-        let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
-        let expected_task_id = parse_id::<TaskId>(&input.expected_task_id, "expected_task_id")?;
-        let expected_revision_id = parse_id::<TaskIntentRevisionId>(
-            &input.expected_intent_revision_id,
-            "expected_intent_revision_id",
-        )?;
-        let active = self
-            .runtime
-            .tasks
-            .read_snapshot_by_locator(&locator)
-            .map_err(ToolFailure::task_context_failed)?
-            .ok_or_else(|| ToolFailure::invalid("ExternalSession has no ActiveTask"))?;
-        if active.task_id != expected_task_id
-            || active
-                .current_intent_revision()
-                .is_none_or(|revision| revision.revision_id != expected_revision_id)
-        {
-            return Err(ToolFailure::invalid(
-                "Candidate Task/Intent ownership CAS is stale",
-            ));
-        }
-        let source = self
-            .runtime
-            .tasks
-            .verify_source_episode(source_episode_id)
-            .map_err(ToolFailure::task_context_failed)?
-            .ok_or_else(|| ToolFailure::invalid("source Work Episode does not exist"))?;
-        if source.ownership.task_session_id != active.task_session_id
-            || source.ownership.task_id != active.task_id
-            || !matches!(source.status, WorkEpisodeStatus::Closed { .. })
-        {
-            return Err(ToolFailure::invalid(
-                "source Work Episode must be closed and owned by the exact ActiveTask",
-            ));
-        }
-        let outcome = self
-            .runtime
-            .store
-            .submit_candidate(CandidateSubmissionRequest {
-                submission_id,
-                source_episode: source.ownership,
-                content: input.draft(),
-            })
-            .map_err(ToolFailure::writer_rejected)?;
-        let candidate_id = outcome.record.candidate_id;
-        let source_episode_id = outcome.record.source_episode.episode_id;
-        let event_id = outcome.record.event_id;
-        let created = outcome.created();
-        let snapshot = self
-            .runtime
-            .snapshot()
-            .map_err(ToolFailure::index_sync_failed)?;
-        Ok(json!({
-            "indexed_tree_oid": snapshot.metadata.indexed_tree_oid,
-            "projection_generation": snapshot.metadata.projection_generation,
-            "candidate_id": candidate_id,
-            "submission_id": submission_id,
-            "source_episode_id": source_episode_id,
-            "event_id": event_id,
-            "status": "candidate",
-            "submission_status": outcome.status,
-            "created": created,
-            "batch_id": outcome.append.batch_id,
-            "commit_oid": outcome.append.commit_oid,
-            "conflicts": [],
-            "match_reason": if created { "new_candidate_created" } else { "already_exists" },
-        }))
-    }
-
     fn candidate_list(&self, arguments: Value) -> ToolResult {
         let input: CandidateListInput = decode_arguments(arguments)?;
         self.runtime
@@ -3670,29 +3595,6 @@ struct ToolFailure {
 }
 
 impl ToolFailure {
-    fn writer_rejected(error: Error) -> Self {
-        let code = if error.kind() == ErrorKind::IdempotencyKeyConflict {
-            "idempotency_key_conflict"
-        } else {
-            "writer_rejected"
-        };
-        Self { code, error }
-    }
-
-    fn invalid(message: impl Into<String>) -> Self {
-        Self {
-            code: "invalid_input",
-            error: invalid(message),
-        }
-    }
-
-    fn index_sync_failed(error: Error) -> Self {
-        Self {
-            code: "index_sync_failed",
-            error,
-        }
-    }
-
     fn task_context_failed(error: Error) -> Self {
         let code = match error.kind() {
             ErrorKind::InvalidInput => "invalid_input",
@@ -3830,68 +3732,6 @@ impl SearchInput {
 
 type ToolResultSearch = std::result::Result<SearchRequest, ToolFailure>;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CandidateCreateInput {
-    submission_id: String,
-    agent_kind: String,
-    external_session_id: String,
-    expected_task_id: String,
-    expected_intent_revision_id: String,
-    source_episode_id: String,
-    kind: ContextKind,
-    #[serde(default)]
-    topic_key: Option<String>,
-    statement: String,
-    rationale: String,
-    #[serde(default)]
-    applicability: Applicability,
-    #[serde(default)]
-    assumptions: Vec<String>,
-    #[serde(default)]
-    recheck_when: Vec<String>,
-    evidence: Vec<EvidenceInput>,
-}
-
-impl CandidateCreateInput {
-    fn draft(&self) -> ContextRevisionDraft {
-        ContextRevisionDraft {
-            kind: self.kind,
-            topic_key: self.topic_key.clone(),
-            statement: self.statement.clone(),
-            rationale: self.rationale.clone(),
-            applicability: self.applicability.clone(),
-            assumptions: self.assumptions.clone(),
-            recheck_when: self.recheck_when.clone(),
-            relations: Vec::new(),
-            evidence: self.evidence.iter().cloned().map(Into::into).collect(),
-        }
-    }
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EvidenceInput {
-    kind: EvidenceType,
-    supports: String,
-    content: Value,
-    interpretation: String,
-    #[serde(default)]
-    limitations: Vec<String>,
-}
-
-impl From<EvidenceInput> for EvidenceSnapshotDraft {
-    fn from(input: EvidenceInput) -> Self {
-        Self {
-            kind: input.kind,
-            supports: input.supports,
-            content: input.content,
-            interpretation: input.interpretation,
-            limitations: input.limitations,
-        }
-    }
-}
-
 #[allow(clippy::too_many_lines)]
 fn tools_list() -> Value {
     json!({"tools": [
@@ -3997,11 +3837,6 @@ fn tools_list() -> Value {
             "candidate_confirm",
             "Explicitly confirm one owned Pending Candidate Review into one atomic Context/Space fact closure. All generated identities and any proposed new Space Intent are server-owned.",
             candidate_confirm_schema()
-        ),
-        tool_schema(
-            "candidate_create",
-            "Create one unassigned Context Candidate from a source Work Episode. Complete authoritative retries are idempotent; IDs and paths remain server-owned.",
-            candidate_create_schema()
         ),
         tool_schema(
             "space_list",
@@ -4531,50 +4366,6 @@ fn candidate_edits_schema() -> Value {
                 "items": {
                     "type": "object", "additionalProperties": false,
                     "required": ["kind", "supports", "content", "interpretation", "limitations"],
-                    "properties": {
-                        "kind": {"type": "string", "enum": ["source_snapshot", "experiment_record", "artifact_snapshot"]},
-                        "supports": {"type": "string", "minLength": 1},
-                        "content": {"type": "object", "minProperties": 1},
-                        "interpretation": {"type": "string", "minLength": 1},
-                        "limitations": string_array_schema()
-                    }
-                }
-            }
-        }
-    })
-}
-
-fn candidate_create_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["submission_id", "agent_kind", "external_session_id", "expected_task_id", "expected_intent_revision_id", "source_episode_id", "kind", "statement", "rationale", "evidence"],
-        "properties": {
-            "submission_id": id_schema("sub_"),
-            "agent_kind": {"type": "string", "minLength": 1},
-            "external_session_id": {"type": "string", "minLength": 1},
-            "expected_task_id": id_schema("tsk_"),
-            "expected_intent_revision_id": id_schema("tir_"),
-            "source_episode_id": id_schema("wep_"),
-            "kind": kind_schema(),
-            "topic_key": {"type": "string", "minLength": 1},
-            "statement": {"type": "string", "minLength": 1},
-            "rationale": {"type": "string", "minLength": 1},
-            "applicability": {
-                "type": "object", "additionalProperties": false,
-                "properties": {
-                    "domains": string_array_schema(),
-                    "platforms": string_array_schema(),
-                    "conditions": string_array_schema()
-                }
-            },
-            "assumptions": string_array_schema(),
-            "recheck_when": string_array_schema(),
-            "evidence": {
-                "type": "array", "minItems": 1,
-                "items": {
-                    "type": "object", "additionalProperties": false,
-                    "required": ["kind", "supports", "content", "interpretation"],
                     "properties": {
                         "kind": {"type": "string", "enum": ["source_snapshot", "experiment_record", "artifact_snapshot"]},
                         "supports": {"type": "string", "minLength": 1},

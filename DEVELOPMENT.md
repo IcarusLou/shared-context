@@ -2,7 +2,7 @@
 
 ## 当前实现边界
 
-仓库已完成 **M1：Task-first 领域与入口基础**、**M2：Task Runtime 与多 Space Retrieval** 和 **M3：Engineering Graph**：
+仓库已完成 **M1：Task-first 领域与入口基础**、**M2：Task Runtime 与多 Space Retrieval**、**M3：Engineering Graph** 和 **M4：Low-tax Capture**：
 
 - `WorkingIntentSnapshot` 是当前 Task 的非事实工作理解，不包含 Space 路由；每次不可变版本由 `TaskIntentRevision` 表达。Task 与 Space 的相关性由独立的 `TaskSpaceAssociation` 表达，并允许 `0..N` 个结果。
 - 不存在 Workspace-to-Space 绑定类型、全局 Active Space、对应配置或绑定命令。
@@ -23,20 +23,18 @@
 - Candidate Builder 读取 exact closed Episode、final/相关 Checkpoint 和一个 Index snapshot，逐 Claim 组装最小充分 Evidence；Runtime 在任何 Git 写入前固化 BuildId/SubmissionId/content hash，#117 返回的 CandidateId/EventId 再原子回填。无 Claim、Unknown-only 或 Evidence 不充分均为零 Candidate；无 kind hint固定降级 Discovery。
 - #159 Candidate Analysis 是 Runtime derived review state：Search 以完整草稿等值、显式 related Context、exact Artifact Graph、topic/scope 与 BM25 多路 RRF 生成 typed assessment，明确区分 exact duplicate、supports、revises、potential contradiction、unresolved related 和 novel。Space 推荐融合 assessment target、source Task association 与 Space Intent；冲突 Intent/unsafe Context 不自动成为 Primary，无安全 Primary 时给出完整 system-suggested Space Intent。分析不写 Git、不进入 Search/Hook/自动注入；`candidate analyze` 可重跑并替换当前结果。
 - #161 已定义 CandidateConfirmation 与 ContextSpaceAssociation 的严格 Event/Reducer/Index 事实：确认引用 exact Candidate/source、Primary/Related、结果 Revision、initial Association、causal Publish Event 和 final content hash；后续 Withdraw 不反向抹除历史确认。Association 独立成可修订 DAG，多 Head 与重复 Confirmation 都显式 conflict；当前嵌套 Context owner 与 Search ranking 不变。
-- 无 Space 的 `ContextCandidate` 领域类型已经存在，Builder Candidate 仍不可自动注入。
-- `candidate_create` 是当前 Candidate 写入主入口；CLI 与 MCP 要求调用方提供稳定 `submission_id` 与精确 ActiveTask/Intent/closed WorkEpisode 所有权，服务端生成 Candidate/Event 身份和路径，且未确认 Candidate 不参与自动注入。
+- 无 Space 的 `ContextCandidate` 领域类型已经存在；只有 closed WorkEpisode 的 Candidate Builder 可调用内部 #117 submission service，Builder Candidate 仍不可自动注入。
 - 既有 Git Writer、事件校验、SQLite 投影、Context 生命周期、CLI/MCP、Agent Adapter、安装器和 NPM 分发能力继续作为 M1 的基础设施。
 
 以下能力**尚未实现**，不得在代码、测试报告或评审中宣称已经具备：
 
-- **M4 最终验收：未完成** — #117、#136、#156–#163 与 #169 已完成轻量 Working Intent、语义幂等、Hint 文本召回、可验证 WorkEpisode/Capture、Hook lifecycle、Candidate Builder/Review/Confirm 全链路；#164 最终端到端验收尚未执行。
 - **团队同步：未实现** — Repository Catalog 是单机显式配置，不是团队事实或知识 Store。
 
 Cursor 与 Codex 都通过显式 `task_intent_update` 建立 TaskSession 的首个 `TaskIntentRevision`；Prompt Hook 只提供能力提示。已有 ActiveTask 可通过只读 `task_context` 再取 Pack。
 
-Mandatory Gate #114/#117 已完成：稳定 `submission_id` 写入 Git Event 并可重建到 SQLite submission/conflict 索引；Candidate lock 覆盖索引同步、lookup、pending recovery 和 append，主写路径不扫描全量 Event，也不依赖 commit subject。known-v1 malformed Candidate 只有在可安全提取合法 SubmissionId 时形成 submission-local conflict；unknown schema、无 hint 或其他 submission 的坏 Event 只保留 diagnostic。`candidate_create` 同时使用 #156 的 Runtime existence/owner/status 与 Task/Intent CAS 验证 source Episode。
+Mandatory Gate #114/#117 已完成：Builder 的内部 submission service 将稳定 `submission_id` 写入 Git Event 并可重建到 SQLite submission/conflict 索引；Candidate lock 覆盖索引同步、lookup、pending recovery 和 append，主写路径不扫描全量 Event，也不依赖 commit subject。known-v1 malformed Candidate 只有在可安全提取合法 SubmissionId 时形成 submission-local conflict；unknown schema、无 hint 或其他 submission 的坏 Event 只保留 diagnostic。内部 admission 在任何 Git 写入前验证 #156 的 exact closed Episode ownership；不存在手工 MCP/CLI Candidate 创建入口。
 
-M1 的手工 `candidate_create` 仍是独立领域和安全入口；M4 Builder 复用其 #117 admission，但不替代后续确认和知识聚合。
+#164 固定 oracle 位于 `fixtures/m4/fixed-oracle.json`，由跨层测试直接驱动 Builder→Review→existing/new Confirm，不能从 production 输出生成。完整 M4 gate 同时固定运行 Working Intent/Hint、M3 跨端 Graph、真实 Cursor/Codex Hook、Capture privacy、Builder submission、analysis、Review 与 Confirmation 对抗套件。
 
 ## 环境与检查
 
@@ -58,6 +56,7 @@ cargo test --locked -p sctx-cli --test milestone_one_contract
 cargo test --locked -p sctx-mcp --test mcp_contract
 cargo test --locked -p sctx-cli --test milestone_two_contract
 cargo test --locked -p sctx-cli --test milestone_three_contract
+cargo test --locked -p sctx-cli --test milestone_four_contract
 ```
 
 提交 `Cargo.lock`，确保 CLI workspace 的本地与 CI 构建使用相同依赖解析结果。

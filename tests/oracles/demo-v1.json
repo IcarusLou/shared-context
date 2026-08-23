@@ -20,7 +20,9 @@
   },
   "mcp_tools": [
     "task_intent_update",
+    "task_artifact_focus",
     "task_signal_supersede",
+    "task_checkpoint",
     "task_context",
     "repository_scan",
     "engineering_reference_record",
@@ -28,7 +30,10 @@
     "association_rebuild",
     "context_search",
     "context_get",
-    "candidate_create",
+    "candidate_list",
+    "candidate_get",
+    "candidate_discard",
+    "candidate_confirm",
     "space_list"
   ],
   "mcp_clients": ["cursor", "codex"]

@@ -27,14 +27,10 @@ use sctx_domain::{
     ContextRevisionDraft, DomainProjection, Error, ErrorKind, EvidenceSnapshotDraft, EvidenceType,
     ExternalSessionLocator, IntentSnapshot, PublicationAction, PublicationDraft, RepositoryId,
     ResolutionOutcome, Result, ReviewDraft, ReviewSummary, ReviewVerdict, RevisionId,
-    SemanticConflictDraft, SpaceId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSignal,
-    TaskSignalKind, WorkEpisodeId, WorkEpisodeStatus,
+    SemanticConflictDraft, SpaceId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkEpisodeStatus,
 };
 use sctx_event_schema::{Event, EventPayload};
-use sctx_git_store::{
-    AppendOutcome, AppendRequest, BatchId, CandidateSubmissionOutcome, CandidateSubmissionRequest,
-    GitStore,
-};
+use sctx_git_store::{AppendOutcome, AppendRequest, BatchId, GitStore};
 use sctx_index::{
     DomainSnapshot, IndexMetadata, ProjectionDiagnosticView, ProjectionIndex, RebuildOutcome,
 };
@@ -67,7 +63,7 @@ Commands:
   uninstall [--root PATH]
   knowledge delete --confirm-path PATH --confirm DELETE-SHARED-CONTEXT-KNOWLEDGE
   space create|intent revise|list|get
-  candidate list|get|discard|confirm|create|build-closed-episode|analyze
+  candidate list|get|discard|confirm|build-closed-episode|analyze
   context revise|review|publish|withdraw|get
   semantic conflict open|resolve
   task context|artifact-focus|checkpoint|intent update|signal supersede
@@ -634,7 +630,7 @@ fn verify_demo_mcp(
         .and_then(|response| response.pointer("/result/tools"))
         .and_then(Value::as_array)
         .ok_or_else(|| invariant("demo MCP tools/list response is missing"))?;
-    if tools.len() != 17
+    if tools.len() != 16
         || [
             "task_checkpoint",
             "candidate_list",
@@ -1128,15 +1124,6 @@ impl Runtime {
         let metadata = self.index.synchronize()?.metadata;
         Ok((outcome, metadata))
     }
-
-    fn submit_candidate(
-        &self,
-        request: CandidateSubmissionRequest,
-    ) -> Result<(CandidateSubmissionOutcome, IndexMetadata)> {
-        let outcome = self.store.submit_candidate(request)?;
-        let metadata = self.index.synchronize()?.metadata;
-        Ok((outcome, metadata))
-    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1445,88 +1432,8 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
                 json_output,
             )
         }
-        [command, rest @ ..] if command == "create" => {
-            if is_help(rest) {
-                print!(
-                    "Usage: sctx candidate create --submission-id <ID> --agent-kind <KIND> --external-session-id <ID> --expected-task-id <ID> --expected-intent-revision-id <ID> --source-episode-id <ID> [content options]\n\n{CONTEXT_WRITE_HELP}"
-                );
-                return Ok(());
-            }
-            let options = Options::parse(rest, &[])?;
-            allow_context_options(
-                &options,
-                &[
-                    "--submission-id",
-                    "--agent-kind",
-                    "--external-session-id",
-                    "--expected-task-id",
-                    "--expected-intent-revision-id",
-                    "--source-episode-id",
-                ],
-            )?;
-            let submission_id =
-                parse_id::<SubmissionId>(options.required("--submission-id")?, "submission ID")?;
-            let source_episode_id = parse_id::<WorkEpisodeId>(
-                options.required("--source-episode-id")?,
-                "source episode ID",
-            )?;
-            let locator = ExternalSessionLocator::new(
-                options.required("--agent-kind")?,
-                options.required("--external-session-id")?,
-            )?;
-            let expected_task_id =
-                parse_id::<TaskId>(options.required("--expected-task-id")?, "expected Task ID")?;
-            let expected_revision_id = parse_id::<TaskIntentRevisionId>(
-                options.required("--expected-intent-revision-id")?,
-                "expected Intent revision ID",
-            )?;
-            let draft = context_draft(&options)?;
-            let runtime = Runtime::open()?;
-            let tasks = TaskRuntime::initialize(installation_root()?)?;
-            let active = tasks
-                .read_snapshot_by_locator(&locator)?
-                .ok_or_else(|| invalid("ExternalSession has no ActiveTask"))?;
-            if active.task_id != expected_task_id
-                || active
-                    .current_intent_revision()
-                    .is_none_or(|revision| revision.revision_id != expected_revision_id)
-            {
-                return Err(invalid("Candidate Task/Intent ownership CAS is stale"));
-            }
-            let source = tasks
-                .verify_source_episode(source_episode_id)?
-                .ok_or_else(|| invalid("source Work Episode does not exist"))?;
-            if source.ownership.task_session_id != active.task_session_id
-                || source.ownership.task_id != active.task_id
-                || !matches!(source.status, WorkEpisodeStatus::Closed { .. })
-            {
-                return Err(invalid(
-                    "source Work Episode must be closed and owned by the exact ActiveTask",
-                ));
-            }
-            let (outcome, metadata) = runtime.submit_candidate(CandidateSubmissionRequest {
-                submission_id,
-                source_episode: source.ownership,
-                content: draft,
-            })?;
-            let candidate_id = outcome.record.candidate_id;
-            let source_episode_id = outcome.record.source_episode.episode_id;
-            let created = outcome.created();
-            emit(
-                "candidate.create",
-                &metadata,
-                json!({"candidate_id": candidate_id,
-                       "submission_id": submission_id,
-                       "source_episode_id": source_episode_id,
-                       "event_id": outcome.record.event_id, "status": "candidate",
-                       "submission_status": outcome.status, "created": created,
-                       "batch_id": outcome.append.batch_id,
-                       "commit_oid": outcome.append.commit_oid}),
-                json_output,
-            )
-        }
         _ => Err(invalid(format!(
-            "invalid candidate command; expected list|get|discard|confirm|create|build-closed-episode|analyze\n\n{CONTEXT_WRITE_HELP}"
+            "invalid candidate command; expected list|get|discard|confirm|build-closed-episode|analyze\n\n{CONTEXT_WRITE_HELP}"
         ))),
     }
 }

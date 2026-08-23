@@ -16,12 +16,12 @@
 
 | 里程碑 | 状态 | 当前代码事实 |
 |---|---|---|
-| **M1：Task-first 领域与入口基础** | **已实现** | `WorkingIntentSnapshot` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；CLI/MCP 通过 `candidate_create` 创建无 Space Candidate；Candidate 不可自动注入 |
+| **M1：Task-first 领域与入口基础** | **已实现** | `WorkingIntentSnapshot` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；无 Space Candidate 不可自动注入 |
 | **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、`TaskIntentRevision`、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、严格 `task_intent_update` 与只读 `task_context` 已通过跨 crate/E2E 验收 |
 | **M3：Engineering Graph** | **已实现** | 稳定本机 Repository Catalog、可重建 Registry、Reference-derived 有界扫描、build-time immutable Context/safety snapshot、历史 Graph Retrieval、ContextRelation 1–2 跳及 MCP/CLI 工作流已通过固定跨 crate/E2E oracle |
-| **M4：Low-tax Capture** | **功能链与 #136/#169 Working Intent 修复已实现，最终验收待完成** | #117、#136、#156–#163 与 #169 已实现旁路 Working Intent、Hint Text retrieval、WorkEpisode、Hook lifecycle、Candidate Builder/Review/Confirm；#164 最终 E2E Gate 尚未执行 |
+| **M4：Low-tax Capture** | **已实现** | #117、#136、#156–#164 与 #169 已实现旁路 Working Intent、Hint Text retrieval、WorkEpisode、Hook lifecycle、Candidate Builder/analysis/Review/Confirm，并通过固定跨层 E2E、privacy、performance 与恢复验收 |
 
-当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订承载 `WorkingIntentSnapshot` 的 `TaskIntentRevision`，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示。PostToolUse 的 File observation 只形成带 Session/optional Task owner 的 redacted Capture Breadcrumb，可识别测试工具只形成非事实、非定位的 TestOutcome TaskSignal；TaskSignal 可影响 Working Intent retrieval，但不是工程 Evidence。Hook 不运行 Git discovery、Scanner、Registry sync、Graph rebuild、Focus 提交、Episode open/ingest，也不伪造 Claim。PreCompact/TurnStop 只能关闭已有 current-Intent Checkpoint 的 Episode并调用共享 Builder。显式 Graph 工具完成 bounded scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。当前 `candidate_create` 仍是手工、无归属的 M1 入口，不等同于 M4 自动 Capture。
+当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订承载 `WorkingIntentSnapshot` 的 `TaskIntentRevision`，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示。PostToolUse 的 File observation 只形成带 Session/optional Task owner 的 redacted Capture Breadcrumb，可识别测试工具只形成非事实、非定位的 TestOutcome TaskSignal；TaskSignal 可影响 Working Intent retrieval，但不是工程 Evidence。Hook 不运行 Git discovery、Scanner、Registry sync、Graph rebuild、Focus 提交、Episode open/ingest，也不伪造 Claim。PreCompact/TurnStop 只能关闭已有 current-Intent Checkpoint 的 Episode并调用共享 Builder。显式 Graph 工具完成 bounded scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。Candidate 只由 closed WorkEpisode 的 Builder 调用内部 submission service 创建，公开面仅提供 list/get/discard/confirm。
 
 ## 2. 背景与目标
 
@@ -1286,7 +1286,7 @@ sctx doctor --json
 - `WorkEpisode` 与无 Space 的 `ContextCandidate` 已建模。
 - 已删除 Workspace-to-Space 配置、绑定命令、preferred-Space 请求字段和对应排序逻辑。
 - Task-first 领域不携带 Space 路由；`context_search.space_ids` 仅作为显式探索的硬过滤。
-- CLI/MCP 的 `candidate_create` 已成为 Candidate 创建主入口，服务端生成身份和路径。
+- Candidate 创建身份与路径由服务端拥有；公开 MCP/CLI 不提供手工 Candidate submission，只有 M4 Builder 可调用内部 #117 admission。
 - Candidate 使用独立投影，不进入 Context FTS，也不满足自动注入资格。
 - 跨 crate M1 验收覆盖 WorkingIntentSnapshot/TaskIntentRevision、`0..N` 关联、无 Space Candidate、无 Workspace 路由和自动注入隔离；历史测试函数名中的 `task_intent` 仅保留为测试标识。
 
@@ -1328,7 +1328,7 @@ WorkingIntentSnapshot 只保存当前非事实工作理解，不含 maturity、E
 
 Evidence 继续只约束 WorkObservation、CheckpointClaim、Candidate、ContextRevision 与 EngineeringReference 等工程断言。TaskIntentRevision 持久 authoritative text 和 canonical semantic hash；相同 continue 返回 `already_current`，真实变化创建唯一 successor，显式 new 始终创建独立 Task。M3 的 Context Evidence、EngineeringReference support/limitations、Graph provenance 与 build-time safety 服务知识断言链，不回流为 Working Intent Evidence。
 
-### M4：Low-tax Capture — #136、#156–#163 与 #169 已实现，#164 Gate 待完成
+### M4：Low-tax Capture — 已实现
 
 - WorkEpisode/Capture 显式持久 API和 AgentCheckpoint MCP/CLI/Skill 已实现。PreCompact/TurnStop AutomatedEpisodeBoundary 只消费工作 Agent 已写入的 current-Intent Checkpoint，补齐 ordered refs、关闭 Episode 并调用共享 Builder；Adapter 不复制 Builder，SessionEnd 只清理 TTL。
 - Candidate Builder 与最小充分 Evidence 组装已实现：closed Episode 的每个充分 Claim 形成一个无 Space Draft；Inline Validation 原样复用，normalized WorkObservation 可转换为 self-contained snapshot，Context Evidence 从一个 exact Index snapshot 复用。TaskSignal 本身仍是非事实线索；只有 Claim 显式引用的 owned Diff/TestOutcome 才由 Builder 转换为带完整解释与限制的 EvidenceSnapshot，Prompt/Workspace 线索不能成为工程 Evidence；原始 Capture 不进 Git。
@@ -1341,11 +1341,12 @@ Evidence 继续只约束 WorkObservation、CheckpointClaim、Candidate、Context
 - 一个 Candidate 的重复确认不论内容相同或不同都形成显式 conflict；Association 多 Head 同样显式 conflict。确认只验证其 causal Publication Event 为 exact Publish，后续 Withdraw/Supersede 不使历史 Confirmation 失效，当前检索继续服从现有 lifecycle。
 - TTL cleanup 只删除重型 Runtime analysis并保留 terminal Expired tombstone；后续 Builder retry不得重新初始化 Pending。Runtime v10 在 Git 前保留完整 ConfirmationPlan，GitStore 将 existing/new Primary 的4/5个事实写入一个 Journal/Commit，Index v11 重建 operation/plan/batch/commit mapping，Git-before-Runtime retry可恢复 Review Confirmed audit。
 - Candidate Confirm 只接受 existing Space 或 current proposed recommendation ID，不接受完整 new Intent 或生成 ID；Potential/ExactDuplicate assessment 可在明确人工调用下确认并在响应中回显 acknowledgment。PreCompact/TurnStop 已接入幂等 Episode close/Builder 触发，但绝不自动 Checkpoint、Review、Discard 或 Confirm。
-- 当前显式 `candidate_create` 继续作为手工入口；自动 Builder 复用相同 #117 admission，并提供内部 CLI `candidate build-closed-episode` 重试边界。Review discovery不扫描该手工入口产生的 Git-only Candidate。
+- Candidate Builder 是 Candidate 创建的唯一产品入口，复用内部 #117 admission，并提供内部 CLI `candidate build-closed-episode` 恢复边界。公开 MCP/CLI 已删除手工 Candidate submission；孤立 Git Candidate 仍不进入 Review discovery。
 - Mandatory Gate #117 已完成：一次创建操作携带稳定 `submission_id`，首次提交由服务端生成 `candidate_id`/`event_id`/路径并持久化 submission mapping；重试复用同一 `submission_id`。
 - 相同 `submission_id` 加相同权威内容返回原 Candidate；相同 `submission_id` 加不同内容返回 `IdempotencyKeyConflict`；不同 `submission_id` 创建新的 Candidate，即使完整草稿相同。语义相近去重属于知识聚合，不由幂等键处理。
 - `submission_id`、closed Episode ownership 和 writer batch annotation 进入 Git Event；SQLite 建 submission/conflict 投影并从 Git Tree 与引入 commit 重建。Candidate 主写路径使用索引 lookup，不扫描 Event 或读取 commit subject。known-v1 malformed Candidate 仅在有界解析出合法 SubmissionId 时合并到该 ID 的 conflict；unknown schema、无 hint 和其他 ID 只保留 diagnostic，不形成全局阻断。
 - #156 的 WorkEpisode query 已接入 Candidate admission；不存在、Open、跨 Task 或 stale Intent 的来源在任何 Git 写入前拒绝。
+- #164 固定 oracle 位于 `fixtures/m4/fixed-oracle.json`，直接驱动 WorkingIntent→Checkpoint close→Builder→Review list/get→existing/new Confirm，并与固定 Working Intent Hint、跨端 Graph、真实 Cursor/Codex Hook/Capture、submission crash/concurrency、analysis safety、pagination/budget/privacy 套件共同关闭 M4。Oracle 输入为手写 fixture，不从 production 结果生成。
 
 ## 19. 验收标准
 

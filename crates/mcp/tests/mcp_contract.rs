@@ -13,11 +13,11 @@ use sctx_domain::{
     CandidateConfirmationPlan, CandidateConfirmationPrimaryReference, CandidateId,
     CandidatePrimarySelection, CandidateReviewDiagnostic, CandidateReviewStatus, CaptureId,
     CaptureUnknown, ContextId, ContextKind, ContextRevisionDraft, ContextRevisionRef,
-    ContextUseDisposition, EventId, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot,
+    ContextUseDisposition, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot,
     NormalizedBreadcrumbKind, NormalizedWorkObservation, OptionalCandidateEdits, PublicationAction,
     PublicationDraft, RepoRelativePath, RepositoryId, ReviewDraft, ReviewVerdict, RevisionId,
-    SpaceId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSignal, TaskSignalKind, WorkEpisodeId,
-    WorkSourceRef, WorkingIntentSnapshot, candidate_submission_content_hash,
+    SpaceId, SubmissionId, TaskId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkSourceRef,
+    WorkingIntentSnapshot, candidate_submission_content_hash,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
@@ -139,15 +139,7 @@ fn draft(statement: &str) -> ContextRevisionDraft {
     }
 }
 
-struct CandidateOwner {
-    agent_kind: String,
-    external_session_id: String,
-    task_id: TaskId,
-    intent_revision_id: TaskIntentRevisionId,
-    source_episode_id: WorkEpisodeId,
-}
-
-fn closed_candidate_owner(fixture: &Fixture, agent_kind: &str, session: &str) -> CandidateOwner {
+fn closed_candidate_episode(fixture: &Fixture, agent_kind: &str, session: &str) -> WorkEpisodeId {
     let task = task_intent_update_at_root(
         &fixture.root,
         &TaskIntentUpdateInput {
@@ -180,13 +172,7 @@ fn closed_candidate_owner(fixture: &Fixture, agent_kind: &str, session: &str) ->
         },
     )
     .unwrap();
-    CandidateOwner {
-        agent_kind: agent_kind.to_owned(),
-        external_session_id: session.to_owned(),
-        task_id: task.context.task_id,
-        intent_revision_id: task.context.intent_revision_id,
-        source_episode_id: closed.episode_id,
-    }
+    closed.episode_id
 }
 
 fn build_review_candidate(
@@ -236,35 +222,6 @@ fn build_review_candidate(
         .candidate_id
         .unwrap();
     (task, candidate_id)
-}
-
-fn candidate_arguments(
-    submission_id: SubmissionId,
-    owner: &CandidateOwner,
-    statement: &str,
-) -> Value {
-    json!({
-        "submission_id": submission_id,
-        "agent_kind": owner.agent_kind,
-        "external_session_id": owner.external_session_id,
-        "expected_task_id": owner.task_id,
-        "expected_intent_revision_id": owner.intent_revision_id,
-        "source_episode_id": owner.source_episode_id,
-        "kind": "decision",
-        "topic_key": "mcp/candidate",
-        "statement": statement,
-        "rationale": "candidate IDs and paths remain server-owned",
-        "applicability": {"domains": ["mcp"], "platforms": ["macos"], "conditions": ["stdio"]},
-        "assumptions": [],
-        "recheck_when": ["the Writer contract changes"],
-        "evidence": [{
-            "kind": "experiment_record",
-            "supports": "the Candidate fixture called the Writer",
-            "content": {"fixture": "candidate_create", "actual": "candidate"},
-            "interpretation": "the candidate was appended",
-            "limitations": []
-        }]
-    })
 }
 
 fn directly_close_builder_episode(
@@ -1304,31 +1261,16 @@ fn candidate_builder_converts_six_typed_sources_without_raw_capture_or_search_in
     );
     assert_ne!(other.context.task_id, active.task_id);
 
-    let manual_submission = SubmissionId::new();
-    let manual_owner = CandidateOwner {
-        agent_kind: "codex".to_owned(),
-        external_session_id: session.to_owned(),
-        task_id: active.task_id,
-        intent_revision_id: active.current_intent_revision().unwrap().revision_id,
-        source_episode_id: opened.episode.episode_id,
-    };
-    let manual = run_session(
-        &mut fixture.server(ClientKind::Codex),
-        FixtureFraming::Newline,
-        &[
-            request(90, "initialize", json!({"protocolVersion": "2024-11-05"})),
-            tool_call(
-                91,
-                "candidate_create",
-                candidate_arguments(
-                    manual_submission,
-                    &manual_owner,
-                    "manual Git-only Candidate must stay undiscoverable",
-                ),
-            ),
-        ],
-    );
-    assert_eq!(manual[1]["result"]["isError"], false);
+    let index = ProjectionIndex::for_store(&fixture.store);
+    GitStore::initialize(&fixture.root)
+        .unwrap()
+        .with_candidate_submission_index(Arc::new(index))
+        .submit_candidate(CandidateSubmissionRequest {
+            submission_id: SubmissionId::new(),
+            source_episode: opened.episode.ownership(),
+            content: draft("Git-only Candidate must stay undiscoverable"),
+        })
+        .unwrap();
     assert_eq!(
         candidate_list_at_root(
             &fixture.root,
@@ -2137,9 +2079,8 @@ fn candidate_confirm_recovers_reserved_before_git_and_git_before_runtime_finaliz
 fn candidate_builder_emits_zero_git_events_for_unknown_only_or_insufficient_evidence() {
     let fixture = Fixture::new();
     let before_events = event_count(fixture.store.repository());
-    let unknown_owner = closed_candidate_owner(&fixture, "codex", "builder-unknown-only");
-    let unknown_build =
-        build_closed_episode_at_root(&fixture.root, unknown_owner.source_episode_id).unwrap();
+    let unknown_episode = closed_candidate_episode(&fixture, "codex", "builder-unknown-only");
+    let unknown_build = build_closed_episode_at_root(&fixture.root, unknown_episode).unwrap();
     assert_eq!(unknown_build.status, CandidateBuildResponseStatus::Complete);
     assert!(unknown_build.items.is_empty());
     assert_eq!(event_count(fixture.store.repository()), before_events);
@@ -2433,16 +2374,13 @@ fn distinct_claims_with_identical_drafts_keep_distinct_stable_submissions() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() {
-    for (client, framing, agent_kind) in [
-        (ClientKind::Cursor, FixtureFraming::Newline, "cursor"),
-        (ClientKind::Codex, FixtureFraming::ContentLength, "codex"),
+fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
+    for (client, framing) in [
+        (ClientKind::Cursor, FixtureFraming::Newline),
+        (ClientKind::Codex, FixtureFraming::ContentLength),
     ] {
         let fixture = Fixture::new();
         let before_count = event_count(fixture.store.repository());
-        let owner =
-            closed_candidate_owner(&fixture, agent_kind, &format!("candidate-{agent_kind}"));
-        let submission_id = SubmissionId::new();
         let requests = vec![
             request(
                 1,
@@ -2484,19 +2422,14 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
                 ))
                 .unwrap(),
             ),
-            tool_call(
-                6,
-                "candidate_create",
-                candidate_arguments(submission_id, &owner, "new MCP candidate"),
-            ),
-            tool_call(7, "space_list", json!({})),
+            tool_call(6, "space_list", json!({})),
         ];
         let responses = run_session(&mut fixture.server(client), framing, &requests);
         assert_eq!(responses.len(), requests.len() - 1);
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
 
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 16);
         let names = tools
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
@@ -2519,10 +2452,11 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
                 "candidate_get",
                 "candidate_discard",
                 "candidate_confirm",
-                "candidate_create",
                 "space_list"
             ]
         );
+        let removed_manual_tool = ["candidate", "create"].join("_");
+        assert!(tools.iter().all(|tool| tool["name"] != removed_manual_tool));
         let update_schema = &tools
             .iter()
             .find(|tool| tool["name"] == "task_intent_update")
@@ -2567,26 +2501,6 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
         for legacy in ["maturity", "evidence_refs"] {
             assert!(update_schema["properties"].get(legacy).is_none());
         }
-        let candidate_schema = &tools
-            .iter()
-            .find(|tool| tool["name"] == "candidate_create")
-            .unwrap()["inputSchema"];
-        let schema_text = candidate_schema.to_string();
-        let candidate_properties = candidate_schema["properties"].as_object().unwrap();
-        for forbidden in [
-            "event_id",
-            "context_id",
-            "revision_id",
-            "path",
-            "publication",
-            "workspace",
-        ] {
-            assert!(
-                !candidate_properties.contains_key(forbidden),
-                "forbidden Candidate field: {forbidden}"
-            );
-        }
-        assert!(!schema_text.contains("space"));
         let checkpoint_schema = &tools
             .iter()
             .find(|tool| tool["name"] == "task_checkpoint")
@@ -2772,14 +2686,6 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
                 .keys()
                 .all(|field| !field.starts_with("preferred"))
         );
-        assert_eq!(candidate_schema["additionalProperties"], false);
-        assert!(
-            candidate_schema["required"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|field| field == "source_episode_id")
-        );
         let list_schema = &tools
             .iter()
             .find(|tool| tool["name"] == "candidate_list")
@@ -2852,17 +2758,8 @@ fn cursor_and_codex_fixtures_initialize_read_create_candidate_and_list_spaces() 
         assert_eq!(pack["task_fingerprint"].as_str().unwrap().len(), 64);
         assert!(pack["tree"].as_str().is_some());
         assert!(pack["generation"].as_u64().is_some());
-        let candidate = &responses[5]["result"]["structuredContent"];
-        assert_eq!(candidate["status"], "candidate");
-        assert_eq!(
-            candidate["source_episode_id"],
-            owner.source_episode_id.to_string()
-        );
-        assert_eq!(candidate["submission_id"], submission_id.to_string());
-        assert!(candidate["candidate_id"].as_str().is_some());
-        assert!(candidate.get("space_id").is_none());
-        assert_eq!(event_count(fixture.store.repository()), before_count + 1);
-        let spaces = &responses[6]["result"]["structuredContent"];
+        assert_eq!(event_count(fixture.store.repository()), before_count);
+        let spaces = &responses[5]["result"]["structuredContent"];
         assert_eq!(spaces["spaces"].as_array().unwrap().len(), 1);
     }
 }
@@ -3924,323 +3821,15 @@ fn shared_context_skill_contract_drives_mcp_runtime_and_search_response() {
 }
 
 #[test]
-fn candidate_create_retries_are_strict_and_unassigned_candidates_are_not_retrieved() {
-    let fixture = Fixture::new();
-    let owner = closed_candidate_owner(&fixture, "codex", "candidate-create-retry");
-    let submission_id = SubmissionId::new();
-    let distinct_submission_id = SubmissionId::new();
-    let before_count = event_count(fixture.store.repository());
-    let responses = run_session(
-        &mut fixture.server(ClientKind::Codex),
-        FixtureFraming::Newline,
-        &[
-            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
-            tool_call(
-                2,
-                "candidate_create",
-                candidate_arguments(submission_id, &owner, "hidden MCP episode knowledge"),
-            ),
-            tool_call(
-                3,
-                "candidate_create",
-                candidate_arguments(submission_id, &owner, "hidden MCP episode knowledge"),
-            ),
-            tool_call(
-                4,
-                "candidate_create",
-                candidate_arguments(submission_id, &owner, "different MCP episode knowledge"),
-            ),
-            tool_call(
-                5,
-                "candidate_create",
-                candidate_arguments(
-                    distinct_submission_id,
-                    &owner,
-                    "hidden MCP episode knowledge",
-                ),
-            ),
-            tool_call(
-                6,
-                "context_search",
-                json!({"query": "hidden MCP episode knowledge", "statuses": ["candidate"]}),
-            ),
-            tool_call(
-                7,
-                "task_intent_update",
-                serde_json::to_value(update_input(
-                    "candidate-isolation",
-                    TaskBoundary::New,
-                    None,
-                    "hidden MCP episode knowledge",
-                ))
-                .unwrap(),
-            ),
-        ],
-    );
-    let created = &responses[1]["result"]["structuredContent"];
-    let retry = &responses[2]["result"]["structuredContent"];
-    let conflict = &responses[3]["result"]["structuredContent"];
-    let distinct = &responses[4]["result"]["structuredContent"];
-    assert_eq!(created["created"], true);
-    assert_eq!(retry["created"], false);
-    assert_eq!(created["submission_status"], "created");
-    assert_eq!(retry["submission_status"], "already_exists");
-    assert_eq!(retry["match_reason"], "already_exists");
-    for field in [
-        "candidate_id",
-        "submission_id",
-        "source_episode_id",
-        "event_id",
-        "batch_id",
-        "commit_oid",
-    ] {
-        assert_eq!(created[field], retry[field]);
-    }
-    assert_eq!(responses[3]["result"]["isError"], true);
-    assert_eq!(conflict["error"]["code"], "idempotency_key_conflict");
-    assert_ne!(created["candidate_id"], distinct["candidate_id"]);
-    assert_ne!(created["submission_id"], distinct["submission_id"]);
-    assert_eq!(distinct["created"], true);
-    assert_eq!(event_count(fixture.store.repository()), before_count + 2);
-    assert!(
-        responses[5]["result"]["structuredContent"]["results"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
-    let task_context = &responses[6]["result"]["structuredContent"];
-    assert!(
-        !serde_json::to_string(task_context)
-            .unwrap()
-            .contains(created["candidate_id"].as_str().unwrap())
-    );
-    assert!(
-        task_context["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|item| { item["context"]["statement"] != "hidden MCP episode knowledge" })
-    );
-}
-
-#[test]
-fn candidate_create_ignores_unrelated_bad_events_but_blocks_its_malformed_submission() {
-    let fixture = Fixture::new();
-    let owner = closed_candidate_owner(&fixture, "codex", "candidate-malformed-isolation");
-    commit_raw_event(
-        fixture.store.repository(),
-        "unrelated-missing-required",
-        &serde_json::from_str(include_str!(
-            "../../../fixtures/events/v1/invalid/missing-required-field.json"
-        ))
-        .unwrap(),
-    );
-    let blocked_submission = SubmissionId::new();
-    commit_raw_event(
-        fixture.store.repository(),
-        "same-submission-malformed",
-        &json!({
-            "schema_version": "1",
-            "event_type": "context_candidate.created",
-            "event_id": EventId::new(),
-            "candidate": {
-                "candidate_id": CandidateId::new(),
-                "submission_id": blocked_submission
-            }
-        }),
-    );
-    let responses = run_session(
-        &mut fixture.server(ClientKind::Codex),
-        FixtureFraming::Newline,
-        &[
-            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
-            tool_call(
-                2,
-                "candidate_create",
-                candidate_arguments(
-                    SubmissionId::new(),
-                    &owner,
-                    "unrelated malformed Events remain isolated",
-                ),
-            ),
-            tool_call(
-                3,
-                "candidate_create",
-                candidate_arguments(
-                    blocked_submission,
-                    &owner,
-                    "same malformed submission is blocked",
-                ),
-            ),
-            tool_call(
-                4,
-                "candidate_create",
-                candidate_arguments(
-                    SubmissionId::new(),
-                    &owner,
-                    "another submission remains writable",
-                ),
-            ),
-        ],
-    );
-    assert_eq!(responses[1]["result"]["isError"], false);
-    assert_eq!(responses[1]["result"]["structuredContent"]["created"], true);
-    assert_eq!(responses[2]["result"]["isError"], true);
-    assert_eq!(
-        responses[2]["result"]["structuredContent"]["error"]["code"],
-        "idempotency_key_conflict"
-    );
-    assert_eq!(responses[3]["result"]["isError"], false);
-    let diagnostics = ProjectionIndex::for_store(&fixture.store)
-        .domain_snapshot()
-        .unwrap()
-        .diagnostics;
-    assert!(
-        diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.code == "EVENT_PARSE_ERROR")
-            .count()
-            >= 2
-    );
-}
-
-#[test]
-#[allow(clippy::too_many_lines)]
-fn candidate_create_rejects_missing_open_cross_task_and_stale_ownership_without_git_writes() {
-    let fixture = Fixture::new();
-    let before_events = event_count(fixture.store.repository());
-
-    let missing_task = task_intent_update_at_root(
-        &fixture.root,
-        &update_input(
-            "candidate-missing-episode",
-            TaskBoundary::New,
-            None,
-            "reject a missing source Episode",
-        ),
-    )
-    .unwrap();
-    let missing_owner = CandidateOwner {
-        agent_kind: "codex".to_owned(),
-        external_session_id: "candidate-missing-episode".to_owned(),
-        task_id: missing_task.context.task_id,
-        intent_revision_id: missing_task.context.intent_revision_id,
-        source_episode_id: WorkEpisodeId::new(),
-    };
-
-    let open_task = task_intent_update_at_root(
-        &fixture.root,
-        &update_input(
-            "candidate-open-episode",
-            TaskBoundary::New,
-            None,
-            "reject an open source Episode",
-        ),
-    )
-    .unwrap();
-    let open_checkpoint = task_checkpoint_at_root(
-        &fixture.root,
-        &TaskCheckpointInput {
-            agent_kind: "codex".to_owned(),
-            external_session_id: "candidate-open-episode".to_owned(),
-            expected_task_id: open_task.context.task_id.to_string(),
-            expected_intent_revision_id: open_task.context.intent_revision_id.to_string(),
-            expected_episode_version: 0,
-            boundary: TaskCheckpointBoundary::Continue,
-            claims: Vec::new(),
-            unknowns: vec![CaptureUnknown {
-                statement: "Episode intentionally remains open".to_owned(),
-                blocking: false,
-                recheck_when: Vec::new(),
-            }],
-        },
-    )
-    .unwrap();
-    let open_owner = CandidateOwner {
-        agent_kind: "codex".to_owned(),
-        external_session_id: "candidate-open-episode".to_owned(),
-        task_id: open_task.context.task_id,
-        intent_revision_id: open_task.context.intent_revision_id,
-        source_episode_id: open_checkpoint.episode_id,
-    };
-
-    let source_owner = closed_candidate_owner(&fixture, "codex", "candidate-source-task");
-    let target_owner = closed_candidate_owner(&fixture, "codex", "candidate-target-task");
-    let cross_task_owner = CandidateOwner {
-        source_episode_id: source_owner.source_episode_id,
-        ..target_owner
-    };
-
-    let stale_owner = closed_candidate_owner(&fixture, "codex", "candidate-stale-intent");
-    task_intent_update_at_root(
-        &fixture.root,
-        &update_input(
-            &stale_owner.external_session_id,
-            TaskBoundary::Continue,
-            Some(stale_owner.intent_revision_id.to_string()),
-            "advance the Candidate owner Intent",
-        ),
-    )
-    .unwrap();
-
-    let responses = run_session(
-        &mut fixture.server(ClientKind::Codex),
-        FixtureFraming::Newline,
-        &[
-            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
-            tool_call(
-                2,
-                "candidate_create",
-                candidate_arguments(SubmissionId::new(), &missing_owner, "missing source"),
-            ),
-            tool_call(
-                3,
-                "candidate_create",
-                candidate_arguments(SubmissionId::new(), &open_owner, "open source"),
-            ),
-            tool_call(
-                4,
-                "candidate_create",
-                candidate_arguments(SubmissionId::new(), &cross_task_owner, "cross Task source"),
-            ),
-            tool_call(
-                5,
-                "candidate_create",
-                candidate_arguments(SubmissionId::new(), &stale_owner, "stale Intent owner"),
-            ),
-        ],
-    );
-    for response in &responses[1..] {
-        assert_eq!(response["result"]["isError"], true, "{response:#}");
-        assert_eq!(
-            response["result"]["structuredContent"]["error"]["code"],
-            "invalid_input"
-        );
-    }
-    assert_eq!(event_count(fixture.store.repository()), before_events);
-}
-
-#[test]
-fn malformed_json_invalid_arguments_and_writer_rejection_are_typed() {
+fn malformed_json_is_typed_and_does_not_stop_the_session() {
     let fixture = Fixture::new();
     let mut input = b"{not-json}\n".to_vec();
     input.extend(encode_frames(
-        &[
-            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
-            tool_call(
-                2,
-                "candidate_create",
-                json!({
-                    "context_id": fixture.context_id,
-                    "space_id": fixture.space_id,
-                    "source_episode_id": WorkEpisodeId::new(),
-                    "kind": "decision",
-                    "statement": "caller supplied identity",
-                    "rationale": "must fail",
-                    "evidence": []
-                }),
-            ),
-        ],
+        &[request(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2024-11-05"}),
+        )],
         FixtureFraming::Newline,
     ));
     let mut output = Vec::new();
@@ -4248,45 +3837,12 @@ fn malformed_json_invalid_arguments_and_writer_rejection_are_typed() {
         .server(ClientKind::Cursor)
         .serve(&mut BufReader::new(Cursor::new(input)), &mut output)
         .unwrap();
-    assert_eq!(outcome.requests_handled, 3);
+    assert_eq!(outcome.requests_handled, 2);
     let responses = decode_frames(&output, FixtureFraming::Newline);
     assert_eq!(responses[0]["error"]["code"], -32_700);
     assert_eq!(responses[0]["error"]["data"]["code"], "parse_error");
-    assert_eq!(responses[2]["result"]["isError"], true);
-    assert_eq!(
-        responses[2]["result"]["structuredContent"]["error"]["code"],
-        "invalid_input"
-    );
-
-    let owner = closed_candidate_owner(&fixture, "codex", "candidate-writer-rejection");
-    dirty_first_event(fixture.store.repository());
-    let writer_responses = run_session(
-        &mut fixture.server(ClientKind::Codex),
-        FixtureFraming::Newline,
-        &[
-            request(4, "initialize", json!({"protocolVersion": "2024-11-05"})),
-            tool_call(
-                5,
-                "candidate_create",
-                candidate_arguments(
-                    SubmissionId::new(),
-                    &owner,
-                    "Writer must reject dirty managed input",
-                ),
-            ),
-        ],
-    );
-    assert_eq!(writer_responses[1]["result"]["isError"], true);
-    assert_eq!(
-        writer_responses[1]["result"]["structuredContent"]["error"]["code"],
-        "writer_rejected"
-    );
-    assert_eq!(
-        writer_responses[1]["result"]["structuredContent"]["error"]["kind"],
-        "invariant_violation"
-    );
+    assert_eq!(responses[1]["result"]["protocolVersion"], "2024-11-05");
 }
-
 #[test]
 fn disconnects_and_invalid_framing_have_typed_transport_results() {
     let fixture = Fixture::new();
@@ -4331,27 +3887,6 @@ fn event_count(repository: &Path) -> usize {
         .lines()
         .filter(|path| path.starts_with("events/"))
         .count()
-}
-
-fn commit_raw_event(repository: &Path, label: &str, value: &Value) {
-    let relative = format!("events/ab/{label}.json");
-    let path = repository.join(&relative);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
-    git(repository, &["add", "--", &relative]);
-    git(
-        repository,
-        &["commit", "-m", &format!("Add {label} fixture")],
-    );
-}
-
-fn dirty_first_event(repository: &Path) {
-    let path = git(repository, &["ls-tree", "-r", "--name-only", "HEAD"])
-        .lines()
-        .find(|path| path.starts_with("events/"))
-        .unwrap()
-        .to_owned();
-    fs::write(repository.join(path), b"{}\n").unwrap();
 }
 
 fn git(repository: &Path, args: &[&str]) -> String {

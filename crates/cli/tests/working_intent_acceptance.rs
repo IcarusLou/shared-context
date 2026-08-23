@@ -325,6 +325,8 @@ fn fixed_working_intent_cross_layer_oracle() {
 fn production_working_intent_residue_is_zero() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mcp = fs::read_to_string(root.join("crates/mcp/src/lib.rs")).unwrap();
+    let cli = fs::read_to_string(root.join("crates/cli/src/main.rs")).unwrap();
+    let git_store = fs::read_to_string(root.join("crates/git-store/src/store.rs")).unwrap();
     let domain = fs::read_to_string(root.join("crates/domain/src/task.rs")).unwrap();
     let runtime = fs::read_to_string(root.join("crates/task-runtime/src/lib.rs")).unwrap();
     for residue in [
@@ -370,6 +372,11 @@ fn production_working_intent_residue_is_zero() {
             "runtime Intent schema residue: {residue}"
         );
     }
+    let removed_manual_entry = ["candidate", "_create"].concat();
+    let removed_manual_command = ["candidate", " create"].concat();
+    assert!(!mcp.contains(&removed_manual_entry));
+    assert!(!cli.contains(&removed_manual_command));
+    assert!(git_store.contains("submit_candidate"));
 }
 
 #[test]
@@ -409,12 +416,12 @@ fn working_intent_document_language_is_current_and_bounded() {
             "Evidence 绑定 WorkObservation、CheckpointClaim、Candidate、ContextRevision 或 EngineeringReference"
         )
     );
-    assert!(development.contains("#136、#156–#163 与 #169"));
+    assert!(development.contains("M4：Low-tax Capture"));
     assert!(acceptance.contains("#136/#169"));
     assert!(
-        development.contains("#164 最终端到端验收尚未执行")
-            && technical.contains("#164 Gate 待完成")
-            && acceptance.contains("#164 remains unexecuted")
+        development.contains("#164 固定 oracle")
+            && technical.contains("#164 固定 oracle")
+            && acceptance.contains("final M4 Gate #164")
     );
 
     let current_state = [context, development, technical, acceptance]

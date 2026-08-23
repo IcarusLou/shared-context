@@ -12,12 +12,15 @@ use std::{
 use sctx_domain::{
     Applicability, CaptureUnknown, ContextKind, ContextRevisionDraft, Error, ErrorKind, EventId,
     EvidenceSnapshotDraft, ExternalSessionLocator, IntentSnapshot, PublicationAction,
-    PublicationDraft, Result, SpaceId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSignalKind,
-    WorkEpisodeId, WorkingIntentSnapshot,
+    PublicationDraft, Result, SpaceId, SubmissionId, TaskSignalKind, WorkEpisodeId,
+    WorkingIntentSnapshot,
 };
 use sctx_engineering_graph::RepositoryRegistry;
 use sctx_event_schema::{Event, EventPayload};
-use sctx_git_store::{AppendRequest, CrashInjector, CrashSeam, GitStore};
+use sctx_git_store::{
+    AppendRequest, CandidateSubmissionRequest, CrashInjector, CrashSeam, GitStore,
+};
+use sctx_index::ProjectionIndex;
 use sctx_local_state::UserConfigStore;
 use sctx_mcp::{
     ExpectedRevisionId, TaskBoundary, TaskCheckpointBoundary, TaskCheckpointClaimInput,
@@ -133,18 +136,6 @@ impl Harness {
     }
 }
 
-fn commit_raw_event(harness: &Harness, label: &str, value: &Value) {
-    let relative = format!("events/ac/{label}.json");
-    let path = harness.repository().join(&relative);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
-    git_output(&harness.repository(), &["add", "--", &relative]);
-    git_output(
-        &harness.repository(),
-        &["commit", "-m", &format!("Add {label} fixture")],
-    );
-}
-
 #[allow(clippy::struct_field_names)]
 struct Published {
     context_id: String,
@@ -211,9 +202,6 @@ fn seed_context(harness: &Harness, space_id: &str, statement: &str) -> (String, 
 
 #[allow(clippy::struct_field_names)]
 struct CandidateOwner {
-    external_session_id: String,
-    task_id: TaskId,
-    intent_revision_id: TaskIntentRevisionId,
     source_episode_id: WorkEpisodeId,
 }
 
@@ -260,45 +248,53 @@ fn closed_candidate_owner(harness: &Harness, session: &str) -> CandidateOwner {
     )
     .unwrap();
     CandidateOwner {
-        external_session_id: session.to_owned(),
-        task_id: task.context.task_id,
-        intent_revision_id: task.context.intent_revision_id,
         source_episode_id: closed.episode_id,
     }
 }
 
-fn create_candidate(
+fn submit_git_only_candidate(
     harness: &Harness,
     submission_id: SubmissionId,
     owner: &CandidateOwner,
     statement: &str,
-) -> Value {
-    harness.success(&[
-        "candidate",
-        "create",
-        "--submission-id",
-        &submission_id.to_string(),
-        "--agent-kind",
-        "codex",
-        "--external-session-id",
-        &owner.external_session_id,
-        "--expected-task-id",
-        &owner.task_id.to_string(),
-        "--expected-intent-revision-id",
-        &owner.intent_revision_id.to_string(),
-        "--source-episode-id",
-        &owner.source_episode_id.to_string(),
-        "--kind",
-        "discovery",
-        "--statement",
-        statement,
-        "--rationale",
-        "the task produced governable knowledge",
-        "--domain",
-        "cli",
-        "--evidence-json",
-        EVIDENCE,
-    ])
+) -> String {
+    let tasks = TaskRuntime::initialize(harness.root()).unwrap();
+    let source_episode = tasks
+        .verify_source_episode(owner.source_episode_id)
+        .unwrap()
+        .unwrap()
+        .ownership;
+    let base = GitStore::initialize(harness.root()).unwrap();
+    let index = ProjectionIndex::for_store(&base);
+    base.with_candidate_submission_index(Arc::new(index))
+        .submit_candidate(CandidateSubmissionRequest {
+            submission_id,
+            source_episode,
+            content: ContextRevisionDraft {
+                kind: ContextKind::Discovery,
+                topic_key: None,
+                statement: statement.to_owned(),
+                rationale: "the task produced governable knowledge".to_owned(),
+                applicability: Applicability {
+                    domains: vec!["cli".to_owned()],
+                    ..Applicability::default()
+                },
+                assumptions: Vec::new(),
+                recheck_when: Vec::new(),
+                relations: Vec::new(),
+                evidence: vec![EvidenceSnapshotDraft {
+                    kind: sctx_domain::EvidenceType::ExperimentRecord,
+                    supports: "CLI contract completed".to_owned(),
+                    content: serde_json::json!({"command": "contract"}),
+                    interpretation: "the contract is executable".to_owned(),
+                    limitations: vec!["synthetic CLI fixture".to_owned()],
+                }],
+            },
+        })
+        .unwrap()
+        .record
+        .candidate_id
+        .to_string()
 }
 
 fn establish_cli_task(harness: &Harness, session: &str, goal: &str, current_direction: &str) {
@@ -400,7 +396,7 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
         "uninstall [--root PATH]",
         "knowledge delete --confirm-path PATH",
         "space create|intent revise|list|get",
-        "candidate list|get|discard|confirm|create",
+        "candidate list|get|discard|confirm|build-closed-episode|analyze",
         "context revise|review|publish|withdraw|get",
         "semantic conflict open|resolve",
         "task context",
@@ -412,6 +408,8 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
     ] {
         assert!(stdout.contains(command), "missing help surface: {command}");
     }
+    let removed_manual_command = ["candidate", " create"].concat();
+    assert!(!stdout.contains(&removed_manual_command));
 
     let version = Command::new(env!("CARGO_BIN_EXE_sctx"))
         .arg("--version")
@@ -481,13 +479,12 @@ fn session_start_and_prompt_submit_emit_capabilities_without_inferred_context() 
     let (beta_space_id, _) = create_space(&harness, "Beta Hook contract");
     let beta = approve_publish(&harness, &beta_space_id, "beta decoy accepted context");
     let candidate_owner = closed_candidate_owner(&harness, "hook-candidate-fixture");
-    let candidate = create_candidate(
+    let candidate_id = submit_git_only_candidate(
         &harness,
         SubmissionId::new(),
         &candidate_owner,
         "alpha needle candidate $(touch /tmp/SCTX_MUST_NOT_EXECUTE)",
     );
-    let candidate_id = text(&candidate, "candidate_id");
     assert_ne!(alpha.context_id, candidate_id);
     assert_ne!(beta.context_id, candidate_id);
 
@@ -1270,211 +1267,6 @@ fn repository_doctor_rejects_invalid_catalog_identity_with_typed_error() {
             .contains("rpo_short")
     );
 }
-
-#[test]
-#[allow(clippy::too_many_lines)]
-fn candidate_create_is_unassigned_idempotent_and_absent_from_retrieval() {
-    let harness = Harness::new();
-    GitStore::initialize(harness.root()).unwrap();
-    let owner = closed_candidate_owner(&harness, "cli-candidate-retry");
-    let submission_id = SubmissionId::new();
-    commit_raw_event(
-        &harness,
-        "unrelated-missing-required",
-        &serde_json::from_str(include_str!(
-            "../../../fixtures/events/v1/invalid/missing-required-field.json"
-        ))
-        .unwrap(),
-    );
-    let initial_count = harness.event_count();
-
-    let created = create_candidate(&harness, submission_id, &owner, "hidden episode discovery");
-    let retry = create_candidate(&harness, submission_id, &owner, "hidden episode discovery");
-    assert_eq!(created["data"]["created"], true);
-    assert_eq!(retry["data"]["created"], false);
-    assert_eq!(created["data"]["submission_status"], "created");
-    assert_eq!(retry["data"]["submission_status"], "already_exists");
-    for field in [
-        "candidate_id",
-        "submission_id",
-        "source_episode_id",
-        "event_id",
-        "batch_id",
-        "commit_oid",
-    ] {
-        assert_eq!(created["data"][field], retry["data"][field]);
-    }
-    assert_eq!(created["data"]["status"], "candidate");
-    assert_eq!(harness.event_count(), initial_count + 1);
-
-    let conflicting = harness.failure(&[
-        "candidate",
-        "create",
-        "--submission-id",
-        &submission_id.to_string(),
-        "--agent-kind",
-        "codex",
-        "--external-session-id",
-        &owner.external_session_id,
-        "--expected-task-id",
-        &owner.task_id.to_string(),
-        "--expected-intent-revision-id",
-        &owner.intent_revision_id.to_string(),
-        "--source-episode-id",
-        &owner.source_episode_id.to_string(),
-        "--kind",
-        "discovery",
-        "--statement",
-        "different hidden episode discovery",
-        "--rationale",
-        "the task produced governable knowledge",
-        "--domain",
-        "cli",
-        "--evidence-json",
-        EVIDENCE,
-    ]);
-    assert_eq!(conflicting["error"]["code"], "idempotency_key_conflict");
-    assert_eq!(harness.event_count(), initial_count + 1);
-
-    let different = create_candidate(
-        &harness,
-        SubmissionId::new(),
-        &owner,
-        "hidden episode discovery",
-    );
-    assert_ne!(
-        created["data"]["candidate_id"],
-        different["data"]["candidate_id"]
-    );
-    assert_eq!(harness.event_count(), initial_count + 2);
-
-    let search = harness.success(&[
-        "search",
-        "--query",
-        "hidden episode discovery",
-        "--status",
-        "candidate",
-    ]);
-    assert!(search["data"]["results"].as_array().unwrap().is_empty());
-    establish_cli_task(
-        &harness,
-        "candidate-retrieval-isolation",
-        "hidden episode discovery",
-        "retrieve confirmed knowledge only",
-    );
-    let pack = harness.success(&[
-        "task",
-        "context",
-        "--agent-kind",
-        "codex",
-        "--external-session-id",
-        "candidate-retrieval-isolation",
-        "--token-budget",
-        "1000",
-    ]);
-    assert!(pack["data"]["items"].as_array().unwrap().is_empty());
-
-    let rejected = harness.failure(&[
-        "candidate",
-        "create",
-        "--source-episode-id",
-        &owner.source_episode_id.to_string(),
-        "--space-id",
-        &SpaceId::new().to_string(),
-        "--kind",
-        "discovery",
-        "--statement",
-        "routing must be rejected",
-        "--rationale",
-        "candidates are unassigned",
-        "--evidence-json",
-        EVIDENCE,
-    ]);
-    assert_eq!(rejected["error"]["code"], "invalid_input");
-}
-
-#[test]
-fn twenty_cli_processes_share_one_submission_without_duplicate_candidate_events() {
-    let harness = Harness::new();
-    GitStore::initialize(harness.root()).unwrap();
-    let owner = closed_candidate_owner(&harness, "cli-candidate-multiprocess");
-    let submission_id = SubmissionId::new();
-    let initial_count = harness.event_count();
-    let arguments = vec![
-        "--json".to_owned(),
-        "candidate".to_owned(),
-        "create".to_owned(),
-        "--submission-id".to_owned(),
-        submission_id.to_string(),
-        "--agent-kind".to_owned(),
-        "codex".to_owned(),
-        "--external-session-id".to_owned(),
-        owner.external_session_id.clone(),
-        "--expected-task-id".to_owned(),
-        owner.task_id.to_string(),
-        "--expected-intent-revision-id".to_owned(),
-        owner.intent_revision_id.to_string(),
-        "--source-episode-id".to_owned(),
-        owner.source_episode_id.to_string(),
-        "--kind".to_owned(),
-        "discovery".to_owned(),
-        "--statement".to_owned(),
-        "twenty CLI processes retry one Candidate operation".to_owned(),
-        "--rationale".to_owned(),
-        "the task produced governable knowledge".to_owned(),
-        "--domain".to_owned(),
-        "cli".to_owned(),
-        "--evidence-json".to_owned(),
-        EVIDENCE.to_owned(),
-    ];
-    let barrier = Arc::new(Barrier::new(20));
-    let outputs = (0..20)
-        .map(|_| {
-            let barrier = Arc::clone(&barrier);
-            let arguments = arguments.clone();
-            let home = harness.home.clone();
-            thread::spawn(move || {
-                barrier.wait();
-                Command::new(env!("CARGO_BIN_EXE_sctx"))
-                    .args(arguments)
-                    .env("HOME", home)
-                    .output()
-                    .unwrap()
-            })
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .map(|handle| handle.join().unwrap())
-        .collect::<Vec<_>>();
-    let values = outputs
-        .iter()
-        .map(|output| {
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            serde_json::from_slice::<Value>(&output.stdout).unwrap()
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        values
-            .iter()
-            .filter(|value| value["data"]["created"] == true)
-            .count(),
-        1
-    );
-    assert_eq!(
-        values
-            .iter()
-            .map(|value| value["data"]["candidate_id"].as_str().unwrap())
-            .collect::<BTreeSet<_>>()
-            .len(),
-        1
-    );
-    assert_eq!(harness.event_count(), initial_count + 1);
-}
-
 #[test]
 #[allow(clippy::too_many_lines)]
 fn twenty_cli_processes_confirm_one_review_in_one_atomic_commit() {
@@ -2166,7 +1958,7 @@ fn mcp_stdio_entry_serves_cursor_and_codex_without_extra_stdout() {
         assert_eq!(responses.len(), 2);
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 16);
         assert!(tools.iter().any(|tool| tool["name"] == "task_checkpoint"));
         for name in [
             "candidate_list",

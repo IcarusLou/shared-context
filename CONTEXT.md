@@ -117,7 +117,7 @@ A Task-scoped, untrusted presentation of one finalized AutomaticContextCandidate
 _Avoid_: Context fact, Candidate approval, Git Candidate browser
 
 **CandidateReviewStatus**:
-The human disposition of a CandidateReview: Pending remains available for a decision, Discarded records an explicit decision not to retain it, Expired is a terminal local-retention tombstone, and Confirmed is reserved for a later knowledge-governance transition.
+The human disposition of a CandidateReview: Pending remains available for a decision, Discarded records an explicit decision not to retain it, Expired is a terminal local-retention tombstone, and Confirmed records the exact accepted CandidateConfirmation and resulting Context.
 _Avoid_: analysis status, readiness status, publication status
 
 **CandidateConfirmation**:

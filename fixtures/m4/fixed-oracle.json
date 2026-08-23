@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "existing_session": "m4-codex-existing",
+  "new_session": "m4-cursor-new",
+  "working_intent": {
+    "goal": "Preserve the cross-client result contract",
+    "current_direction": "Record only verified behavior",
+    "domains": ["search"],
+    "platforms": ["fe", "ios", "android"],
+    "artifact_hints": ["SearchResultRenderer"],
+    "interface_hints": ["search-v2-endpoint"]
+  },
+  "existing_claim": {
+    "statement": "The result contract is shared by FE, iOS, and Android",
+    "rationale": "The fixed integration test verified the same response semantics",
+    "supports": "The cross-client contract fixture passed",
+    "interpretation": "The observed behavior is suitable for review",
+    "limitations": ["fixed local integration fixture"]
+  },
+  "new_claim": {
+    "statement": "A novel offline reconciliation rule needs a new knowledge home",
+    "rationale": "No existing Space describes this verified rule",
+    "supports": "The offline reconciliation fixture passed",
+    "interpretation": "The distinct rule is suitable for review",
+    "limitations": ["fixed local integration fixture"]
+  },
+  "expected": {
+    "builder_items": 1,
+    "pending_reviews": 1,
+    "existing_confirmation_events": 4,
+    "new_confirmation_events": 5,
+    "accepted_query": "result contract shared FE iOS Android"
+  }
+}
