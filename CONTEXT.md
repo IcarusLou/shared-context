@@ -8,9 +8,9 @@ Shared Context organizes durable engineering knowledge around the intent behind 
 A stable container that organizes the intent and durable Context of one requirement or long-running objective. It is a knowledge-governance boundary, not a retrieval partition or property of a Workspace.
 _Avoid_: Active Space, Workspace Space, search partition
 
-**TaskIntent**:
-The current structured understanding of a Task's goal, desired change, scope, constraints, and unknowns. It is independent of every ContextSpace and may evolve as the Task proceeds.
-_Avoid_: Prompt, Space selection
+**WorkingIntentSnapshot**:
+A lightweight, revisable snapshot of what the Agent currently understands it is doing: a required goal plus any naturally known direction, scope, constraints, acceptance conditions, retrieval Hints, and open questions. It is not an engineering fact, Evidence claim, Space selection, or investigation checklist.
+_Avoid_: grounded Intent, task specification, Evidence binding
 
 **TaskSession**:
 The local runtime boundary for one explicit Agent Task. An ExternalSession may retain multiple historical TaskSessions while selecting exactly one as active.
@@ -25,7 +25,7 @@ The one TaskSession currently selected for new Intent revisions, non-locating Ta
 _Avoid_: Active Space, latest Prompt
 
 **TaskIntentRevision**:
-One immutable version of a TaskIntent in a TaskSession's parent chain. It records how task understanding evolves without selecting or owning a ContextSpace.
+One immutable version of a WorkingIntentSnapshot in a TaskSession's parent chain. It records how task understanding evolves without selecting or owning a ContextSpace.
 _Avoid_: Space revision, Prompt history
 
 **ExternalSessionLocator**:

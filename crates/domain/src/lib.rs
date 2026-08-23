@@ -11,6 +11,7 @@ mod ids;
 mod model;
 mod reducer;
 mod task;
+mod working_intent;
 
 pub use confirmation::{
     CandidateConfirmation, CandidateConfirmationCausalRefs, CandidateConfirmationDraft,
@@ -66,6 +67,10 @@ pub use task::{
     ExternalSessionLocator, ExternalSessionSnapshot, TaskIntent, TaskIntentDraft,
     TaskIntentRevision, TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle,
     TaskSignalRecord, TaskSpaceAssociation,
+};
+pub use working_intent::{
+    MAX_WORKING_INTENT_ITEM_BYTES, MAX_WORKING_INTENT_ITEMS_PER_FIELD,
+    MAX_WORKING_INTENT_TEXT_BYTES, MAX_WORKING_INTENT_TOTAL_BYTES, WorkingIntentSnapshot,
 };
 
 /// Broad categories used to route recoverable errors across crate boundaries.
