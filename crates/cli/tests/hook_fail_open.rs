@@ -6,6 +6,7 @@ use std::{
 };
 
 use fs2::FileExt;
+use sctx_agent_adapter::SHARED_CONTEXT_ACTIVATION_MARKER;
 use sctx_domain::{ExternalSessionLocator, IntentSnapshot, TaskId, WorkingIntentSnapshot};
 use sctx_event_schema::Event;
 use sctx_git_store::{AppendRequest, GitStore};
@@ -16,7 +17,6 @@ use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 
 const DIAGNOSTIC: &str = "Shared Context task retrieval is temporarily unavailable. Coding can continue; retry through MCP or CLI later.";
-const PROMPT_GUIDANCE: &str = "Shared Context PromptEnvelope received. No Working Intent was inferred from prompt text. Use $shared-context and task_intent_update to record naturally formed understanding before precise retrieval.";
 
 struct SqliteLock {
     child: Child,
@@ -146,6 +146,46 @@ fn cursor_post_tool(cwd: &Path, file: &Path, raw_marker: &str) -> Value {
     })
 }
 
+fn cursor_session_start(cwd: &Path, session_id: &str) -> Value {
+    json!({
+        "conversation_id": session_id,
+        "generation_id": format!("generation-{session_id}"),
+        "model": "claude-opus-4-7",
+        "hook_event_name": "sessionStart",
+        "cursor_version": "3.13.10",
+        "workspace_roots": [cwd],
+        "user_email": null,
+        "transcript_path": null,
+        "session_id": session_id,
+        "is_background_agent": false,
+        "composer_mode": "agent"
+    })
+}
+
+fn assert_neutral(output: &std::process::Output, root: &Path, secret: &str) {
+    assert!(
+        output.status.success(),
+        "Hook must fail open: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({})
+    );
+    let observable = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let root_text = root.to_string_lossy().into_owned();
+    for forbidden in [secret, root_text.as_str(), "<shared-context"] {
+        assert!(
+            !observable.contains(forbidden),
+            "neutral output leaked {forbidden:?}: {observable}"
+        );
+    }
+}
+
 fn assert_fail_open(
     output: &std::process::Output,
     field: &str,
@@ -206,20 +246,14 @@ fn task_intent() -> WorkingIntentSnapshot {
 }
 
 #[test]
-fn codex_hook_fails_open_when_runtime_database_path_cannot_open() {
+fn disabled_codex_prompt_does_not_open_unavailable_runtime_database() {
     let harness = Harness::new();
     initialize_store(&harness);
     fs::create_dir(harness.root().join("state/runtime.sqlite")).unwrap();
     let secret = "PROMPT_SECRET_RUNTIME_OPEN";
 
     let output = harness.hook("codex", &codex_prompt(&harness.home, "open-fault", secret));
-    assert_fail_open(
-        &output,
-        "systemMessage",
-        PROMPT_GUIDANCE,
-        &harness.root(),
-        secret,
-    );
+    assert_neutral(&output, &harness.root(), secret);
 
     let explicit = harness.explicit_task_context();
     assert_eq!(explicit.status.code(), Some(2));
@@ -228,7 +262,7 @@ fn codex_hook_fails_open_when_runtime_database_path_cannot_open() {
 }
 
 #[test]
-fn codex_hook_fails_open_when_runtime_database_is_corrupt() {
+fn disabled_codex_prompt_does_not_open_corrupt_runtime_database() {
     let harness = Harness::new();
     initialize_store(&harness);
     let runtime = TaskRuntime::initialize(harness.root()).unwrap();
@@ -241,18 +275,12 @@ fn codex_hook_fails_open_when_runtime_database_is_corrupt() {
         "codex",
         &codex_prompt(&harness.home, "corrupt-fault", secret),
     );
-    assert_fail_open(
-        &output,
-        "systemMessage",
-        PROMPT_GUIDANCE,
-        &harness.root(),
-        secret,
-    );
+    assert_neutral(&output, &harness.root(), secret);
     assert!(!String::from_utf8_lossy(&output.stdout).contains("RAW_CORRUPT_DATABASE_MESSAGE"));
 }
 
 #[test]
-fn codex_hook_fails_open_when_runtime_database_is_busy() {
+fn disabled_codex_prompt_does_not_wait_for_busy_runtime_database() {
     let harness = Harness::new();
     initialize_store(&harness);
     let runtime = TaskRuntime::initialize(harness.root()).unwrap();
@@ -260,17 +288,11 @@ fn codex_hook_fails_open_when_runtime_database_is_busy() {
     let secret = "PROMPT_SECRET_RUNTIME_BUSY";
 
     let output = harness.hook("codex", &codex_prompt(&harness.home, "busy-fault", secret));
-    assert_fail_open(
-        &output,
-        "systemMessage",
-        PROMPT_GUIDANCE,
-        &harness.root(),
-        secret,
-    );
+    assert_neutral(&output, &harness.root(), secret);
 }
 
 #[test]
-fn codex_hook_fails_open_when_index_update_is_busy() {
+fn disabled_codex_prompt_does_not_wait_for_busy_index() {
     let harness = Harness::new();
     let store = initialize_store(&harness);
     TaskRuntime::initialize(harness.root()).unwrap();
@@ -294,13 +316,7 @@ fn codex_hook_fails_open_when_index_update_is_busy() {
     let secret = "PROMPT_SECRET_INDEX_BUSY";
 
     let output = harness.hook("codex", &codex_prompt(&harness.home, "index-fault", secret));
-    assert_fail_open(
-        &output,
-        "systemMessage",
-        PROMPT_GUIDANCE,
-        &harness.root(),
-        secret,
-    );
+    assert_neutral(&output, &harness.root(), secret);
 }
 
 #[test]
@@ -309,8 +325,31 @@ fn cursor_post_tool_hook_fails_open_when_runtime_is_unavailable() {
     initialize_store(&harness);
     let workspace = harness.home.join("cursor workspace");
     fs::create_dir_all(&workspace).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&workspace)
+            .status()
+            .unwrap()
+            .success()
+    );
     let file = workspace.join("contract.rs");
     fs::write(&file, "fn contract() {}\n").unwrap();
+    let workspace = fs::canonicalize(workspace).unwrap();
+    let file = fs::canonicalize(file).unwrap();
+    UserConfigStore::open_existing(harness.root())
+        .unwrap()
+        .add_repository(None, std::slice::from_ref(&workspace))
+        .unwrap();
+    let start = harness.hook(
+        "cursor",
+        &cursor_session_start(&workspace, "cursor-fail-open"),
+    );
+    assert!(start.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&start.stdout).unwrap(),
+        json!({"additional_context": SHARED_CONTEXT_ACTIVATION_MARKER})
+    );
     fs::create_dir(harness.root().join("state/runtime.sqlite")).unwrap();
     let secret = "CURSOR_RAW_SECRET_MUST_NOT_LEAK";
 
@@ -355,6 +394,15 @@ fn cursor_post_tool_hook_ignores_repository_registry_failure() {
             Vec::new(),
         )
         .unwrap();
+    let start = harness.hook(
+        "cursor",
+        &cursor_session_start(&workspace, "cursor-fail-open"),
+    );
+    assert!(start.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&start.stdout).unwrap(),
+        json!({"additional_context": SHARED_CONTEXT_ACTIVATION_MARKER})
+    );
     fs::create_dir(harness.root().join("state/repository-registry.sqlite")).unwrap();
     let secret = "CURSOR_REGISTRY_HOT_PATH_MUST_NOT_RUN";
 
@@ -367,7 +415,7 @@ fn cursor_post_tool_hook_ignores_repository_registry_failure() {
 }
 
 #[test]
-fn cursor_post_tool_hook_fails_open_when_catalog_config_is_invalid() {
+fn cursor_post_tool_hook_is_neutral_when_catalog_config_is_invalid() {
     let harness = Harness::new();
     initialize_store(&harness);
     let workspace = harness.home.join("invalid catalog workspace");
@@ -391,17 +439,11 @@ fn cursor_post_tool_hook_fails_open_when_catalog_config_is_invalid() {
     let secret = "CURSOR_CATALOG_CONFIG_MUST_NOT_LEAK";
 
     let output = harness.hook("cursor", &cursor_post_tool(&workspace, &file, secret));
-    assert_fail_open(
-        &output,
-        "additional_context",
-        DIAGNOSTIC,
-        &harness.root(),
-        secret,
-    );
+    assert_neutral(&output, &harness.root(), secret);
 }
 
 #[test]
-fn cursor_post_tool_hook_fails_open_immediately_when_catalog_lock_is_busy() {
+fn cursor_post_tool_hook_is_neutral_immediately_when_catalog_lock_is_busy() {
     let harness = Harness::new();
     initialize_store(&harness);
     let workspace = harness.home.join("locked catalog workspace");
@@ -428,12 +470,6 @@ fn cursor_post_tool_hook_fails_open_immediately_when_catalog_lock_is_busy() {
     let started = std::time::Instant::now();
     let output = harness.hook("cursor", &cursor_post_tool(&workspace, &file, secret));
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
-    assert_fail_open(
-        &output,
-        "additional_context",
-        DIAGNOSTIC,
-        &harness.root(),
-        secret,
-    );
+    assert_neutral(&output, &harness.root(), secret);
     FileExt::unlock(&lock).unwrap();
 }

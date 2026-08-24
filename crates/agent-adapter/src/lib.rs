@@ -352,41 +352,6 @@ impl CanonicalAgentAction {
     }
 }
 
-/// Legacy compatibility policy for the production caller that has not yet supplied a resolved
-/// activation decision.
-///
-/// This preserves the pre-activation contract only until the `SessionStart` integration migrates to
-/// [`plan_action_for_activation`]. It is not an authorization boundary and must not be used as
-/// evidence that a Session was activated. New callers must use the explicit API.
-#[must_use]
-pub fn plan_action(
-    event: &CanonicalAgentEvent,
-    capabilities: &AgentCapabilities,
-) -> CanonicalAgentAction {
-    if !capabilities.hooks_verified() {
-        return CanonicalAgentAction::degraded(capabilities.diagnostic.clone());
-    }
-    match event {
-        CanonicalAgentEvent::SessionStart { .. } => CanonicalAgentAction {
-            task_operation: None,
-            breadcrumb: None,
-            system_message: Some(
-                "Shared Context capabilities: MCP and CLI are available. Task-aware knowledge retrieval starts only from a supported prompt."
-                    .to_owned(),
-            ),
-        },
-        CanonicalAgentEvent::PromptSubmit { .. } => CanonicalAgentAction {
-            task_operation: None,
-            breadcrumb: None,
-            system_message: Some(
-                "Shared Context PromptEnvelope received. No Working Intent was inferred from prompt text. Use $shared-context and task_intent_update to record naturally formed understanding before precise retrieval."
-                    .to_owned(),
-            ),
-        },
-        _ => plan_enabled_action(event, capabilities),
-    }
-}
-
 /// Pure policy mapping shared by both vendor adapters after local Session scope resolution.
 ///
 /// This function does no I/O and cannot inspect Repository Catalog, lease storage, `SQLite`, the
@@ -891,20 +856,17 @@ mod tests {
             TrustState::Confirmed,
             false,
         );
-        let unscoped = plan_action(&event, &capabilities);
-        assert_eq!(unscoped.task_operation, None);
-        assert_eq!(unscoped.breadcrumb, None);
-        assert_eq!(
-            unscoped.system_message.as_deref(),
-            Some(capabilities.diagnostic.as_str())
-        );
-
         for activation in [
             ResolvedActivationDecision::Direct,
             ResolvedActivationDecision::Group,
         ] {
             let action = plan_action_for_activation(&event, &capabilities, activation);
-            assert_eq!(action, unscoped);
+            assert_eq!(action.task_operation, None);
+            assert_eq!(action.breadcrumb, None);
+            assert_eq!(
+                action.system_message.as_deref(),
+                Some(capabilities.diagnostic.as_str())
+            );
             assert!(
                 !action
                     .system_message

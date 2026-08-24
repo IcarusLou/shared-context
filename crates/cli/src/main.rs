@@ -18,8 +18,9 @@ use std::{
 
 use args::Options;
 use sctx_agent_adapter::{
-    AgentCapabilities, CanonicalAgentAction, CanonicalBreadcrumbKind, EpisodeFinalizationTrigger,
-    ResolvedAgentAction, TaskRuntimeOperation, ToolOutcome, TrustState, plan_action,
+    AgentCapabilities, CanonicalAgentAction, CanonicalAgentEvent, CanonicalAgentEventKind,
+    CanonicalBreadcrumbKind, EpisodeFinalizationTrigger, ResolvedActivationDecision,
+    ResolvedAgentAction, TaskRuntimeOperation, ToolOutcome, TrustState, plan_action_for_activation,
 };
 use sctx_domain::{
     Applicability, CandidateReviewStatus, ConflictParticipant, ConflictResolutionDraft,
@@ -35,6 +36,7 @@ use sctx_index::{
     DomainSnapshot, IndexMetadata, ProjectionDiagnosticView, ProjectionIndex, RebuildOutcome,
 };
 use sctx_local_state::{
+    AuthorizedSessionScopeDecision, AuthorizedSessionScopeRead, AuthorizedSessionScopeStore,
     Breadcrumb, BreadcrumbKind, CaptureDiagnosticKind, CaptureStore, CaptureTaskOwner,
     CatalogCheckoutStatus, CatalogRepositoryGroupStatus, RepositoryCatalogSnapshot,
     UserConfigStore,
@@ -720,7 +722,12 @@ fn run_hook(args: &[String]) -> Result<()> {
     };
     let trust = parse_trust(agent, None, true)?;
     let capabilities = agent_capabilities(agent, version.as_deref(), true, trust);
-    let action = plan_action(&event, &capabilities);
+    let activation = resolve_hook_activation(agent, &event);
+    let activated = matches!(
+        activation,
+        ResolvedActivationDecision::Direct | ResolvedActivationDecision::Group
+    );
+    let action = plan_action_for_activation(&event, &capabilities, activation);
     let resolved = resolve_hook_action(action)?;
     let output = if agent == "cursor" {
         sctx_adapter_cursor::encode_hook_output(event.kind(), &resolved)?
@@ -733,10 +740,59 @@ fn run_hook(args: &[String]) -> Result<()> {
             Error::new(ErrorKind::Io, format!("hook output is not UTF-8: {error}"))
         })?
     );
-    if !capabilities.hooks_verified() {
+    if activated && !capabilities.hooks_verified() {
         eprintln!("{}", capabilities.diagnostic);
     }
     Ok(())
+}
+
+fn resolve_hook_activation(agent: &str, event: &CanonicalAgentEvent) -> ResolvedActivationDecision {
+    resolve_hook_activation_inner(
+        agent,
+        event.kind(),
+        &event.context().session_id,
+        &event.context().cwd,
+    )
+    .ok()
+    .unwrap_or(ResolvedActivationDecision::Disabled)
+}
+
+fn resolve_hook_activation_inner(
+    agent: &str,
+    event_kind: CanonicalAgentEventKind,
+    session_id: &str,
+    startup_cwd: &Path,
+) -> Result<ResolvedActivationDecision> {
+    let root = installation_root()?;
+    let locator = ExternalSessionLocator::new(agent, session_id)?;
+    let config = UserConfigStore::open_existing(&root)?;
+    let catalog = config.repository_catalog()?;
+    let store = AuthorizedSessionScopeStore::initialize(&root)?;
+
+    let decision = match store.try_read(&locator, &catalog)? {
+        AuthorizedSessionScopeRead::Current(scope) => scope.decision,
+        AuthorizedSessionScopeRead::Expired | AuthorizedSessionScopeRead::StaleCatalog => {
+            AuthorizedSessionScopeDecision::Disabled
+        }
+        AuthorizedSessionScopeRead::Missing
+            if event_kind == CanonicalAgentEventKind::SessionStart =>
+        {
+            let canonical_startup_cwd = fs::canonicalize(startup_cwd).map_err(|error| {
+                Error::new(ErrorKind::Io, format!("canonicalize startup cwd: {error}"))
+            })?;
+            let scope = catalog.resolve_activation_scope(&canonical_startup_cwd)?;
+            store
+                .try_authorize_missing(&locator, &scope, &catalog)?
+                .decision
+        }
+        AuthorizedSessionScopeRead::Missing => AuthorizedSessionScopeDecision::Disabled,
+    };
+
+    Ok(match decision {
+        AuthorizedSessionScopeDecision::Disabled => ResolvedActivationDecision::Disabled,
+        AuthorizedSessionScopeDecision::Direct { .. } => ResolvedActivationDecision::Direct,
+        AuthorizedSessionScopeDecision::Group { .. } => ResolvedActivationDecision::Group,
+    })
 }
 
 fn agent_capabilities(

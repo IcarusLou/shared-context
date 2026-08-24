@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use sctx_agent_adapter::SHARED_CONTEXT_ACTIVATION_MARKER;
 use sctx_domain::{
     Applicability, CandidateReviewStatus, EvidenceSnapshotDraft, EvidenceType,
     ExternalSessionLocator, TaskId, WorkEpisodeStatus, WorkingIntentSnapshot,
@@ -26,6 +27,7 @@ struct Harness {
     _temporary: TempDir,
     home: PathBuf,
     root: PathBuf,
+    workspace: PathBuf,
 }
 
 impl Harness {
@@ -33,13 +35,28 @@ impl Harness {
         let temporary = tempdir().unwrap();
         let home = temporary.path().join("episode lifecycle home");
         let root = home.join(".shared-context");
+        let workspace = temporary.path().join("episode lifecycle repository");
         fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .arg(&workspace)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let workspace = fs::canonicalize(workspace).unwrap();
         GitStore::initialize(&root).unwrap();
-        UserConfigStore::initialize(&root).unwrap();
+        UserConfigStore::initialize(&root)
+            .unwrap()
+            .add_repository(None, std::slice::from_ref(&workspace))
+            .unwrap();
         Self {
             _temporary: temporary,
             home,
             root,
+            workspace,
         }
     }
 
@@ -116,6 +133,40 @@ impl Harness {
         assert_eq!(responses.len(), 2, "unexpected MCP output: {responses:#?}");
         assert_eq!(responses[1]["result"]["isError"], false, "{responses:#?}");
         responses[1]["result"]["structuredContent"].clone()
+    }
+
+    fn activate(&self, agent: &str, session: &str) {
+        let payload = if agent == "codex" {
+            json!({
+                "session_id": session,
+                "transcript_path": null,
+                "cwd": self.workspace,
+                "hook_event_name": "SessionStart",
+                "model": "gpt-5.6-sol",
+                "permission_mode": "default",
+                "source": "startup"
+            })
+        } else {
+            json!({
+                "conversation_id": session,
+                "generation_id": format!("generation-{session}"),
+                "model": "claude-opus-4-7-thinking-max",
+                "hook_event_name": "sessionStart",
+                "cursor_version": "3.13.10",
+                "workspace_roots": [self.workspace],
+                "user_email": null,
+                "transcript_path": null,
+                "session_id": session,
+                "is_background_agent": false,
+                "composer_mode": "agent"
+            })
+        };
+        let response = self.hook(agent, &payload);
+        assert!(
+            serde_json::to_string(&response)
+                .unwrap()
+                .contains(SHARED_CONTEXT_ACTIVATION_MARKER)
+        );
     }
 }
 
@@ -266,6 +317,8 @@ fn files_contain(path: &Path, needle: &str) -> bool {
 fn real_hooks_close_checkpointed_episodes_build_once_and_keep_sessions_isolated() {
     let harness = Arc::new(Harness::new());
     let runtime = TaskRuntime::initialize(&harness.root).unwrap();
+    harness.activate("codex", "codex-lifecycle");
+    harness.activate("cursor", "cursor-lifecycle");
     let (_, codex_episode) = open_checkpoint(&runtime, "codex", "codex-lifecycle");
     let (_, cursor_episode) = open_checkpoint(&runtime, "cursor", "cursor-lifecycle");
     let raw_marker = "RAW_TRANSCRIPT_AND_LAST_MESSAGE_MUST_NOT_PERSIST";
@@ -343,6 +396,7 @@ fn real_hooks_close_checkpointed_episodes_build_once_and_keep_sessions_isolated(
 fn precompact_resume_and_turn_stop_use_new_episodes_under_the_same_mcp_task() {
     let harness = Harness::new();
     let session = "precompact-resume-same-task";
+    harness.activate("codex", session);
     let task = harness.mcp(
         "task_intent_update",
         &json!({
@@ -474,6 +528,8 @@ fn out_of_order_stop_requires_checkpoint_and_session_end_never_closes_or_builds(
     let harness = Harness::new();
     let runtime = TaskRuntime::initialize(&harness.root).unwrap();
     let session = "out-of-order";
+    harness.activate("codex", session);
+    harness.activate("codex", "session-end-only");
     let locator = ExternalSessionLocator::new("codex", session).unwrap();
     let snapshot = runtime
         .open_or_create(locator, TaskId::new(), intent(session), Vec::new())
@@ -515,6 +571,7 @@ fn out_of_order_stop_requires_checkpoint_and_session_end_never_closes_or_builds(
 fn concurrent_turn_stop_processes_converge_on_one_build_and_candidate() {
     let harness = Arc::new(Harness::new());
     let runtime = TaskRuntime::initialize(&harness.root).unwrap();
+    harness.activate("codex", "concurrent-stop");
     let (_, episode_id) = open_checkpoint(&runtime, "codex", "concurrent-stop");
     let barrier = Arc::new(Barrier::new(12));
     let outputs = (0..12)
@@ -538,10 +595,16 @@ fn concurrent_turn_stop_processes_converge_on_one_build_and_candidate() {
         .into_iter()
         .map(|worker| worker.join().unwrap())
         .collect::<Vec<_>>();
-    assert!(outputs.iter().all(|output| {
+    assert!(outputs.iter().any(|output| {
         output["systemMessage"]
             .as_str()
             .is_some_and(|message| message.contains("durably closed"))
+    }));
+    assert!(outputs.iter().all(|output| {
+        output == &json!({})
+            || output["systemMessage"]
+                .as_str()
+                .is_some_and(|message| message.contains("durably closed"))
     }));
     let build = runtime.read_candidate_build(episode_id).unwrap().unwrap();
     assert_eq!(build.status, CandidateBuildStatus::Complete);
@@ -557,6 +620,7 @@ fn concurrent_turn_stop_processes_converge_on_one_build_and_candidate() {
 fn turn_stop_fails_open_after_close_and_later_retry_recovers_builder() {
     let harness = Harness::new();
     let runtime = TaskRuntime::initialize(&harness.root).unwrap();
+    harness.activate("codex", "builder-recovery");
     let (locator, episode_id) = open_checkpoint(&runtime, "codex", "builder-recovery");
     let repository = UserConfigStore::open_existing(&harness.root)
         .unwrap()
@@ -645,6 +709,7 @@ fn turn_stop_fails_open_after_close_and_later_retry_recovers_builder() {
 fn lifecycle_boundary_does_not_depend_on_noncritical_breadcrumb_storage() {
     let harness = Harness::new();
     let runtime = TaskRuntime::initialize(&harness.root).unwrap();
+    harness.activate("codex", "capture-unavailable");
     let (_, episode_id) = open_checkpoint(&runtime, "codex", "capture-unavailable");
     let capture = harness.root.join("state/capture");
     if capture.exists() {

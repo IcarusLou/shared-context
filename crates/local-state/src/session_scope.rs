@@ -253,8 +253,10 @@ impl AuthorizedSessionScopeStore {
 
     /// Atomically creates or replaces one locator's activation lease.
     ///
-    /// This is the future `SessionStart` authorization seam. Later lifecycle
-    /// events must call [`Self::read`] and must not re-resolve a changed CWD.
+    /// This blocking legacy/configuration seam may opportunistically clean
+    /// expired records before replacing its target. Hook `SessionStart` must
+    /// instead use [`Self::try_authorize_missing`], and later lifecycle events
+    /// must use [`Self::try_read`].
     ///
     /// Concurrent calls for the same locator linearize under the Store lock.
     /// A semantically identical retry atomically refreshes the one record's TTL
@@ -279,6 +281,32 @@ impl AuthorizedSessionScopeStore {
         )
     }
 
+    /// Non-blockingly persists the first authorization for one locator.
+    ///
+    /// If a concurrent caller already persisted a valid decision, that first
+    /// decision is returned without refreshing or replacing it. A busy lock is
+    /// an immediate typed error; no delayed operation remains after return.
+    /// This Hook-facing path never cleans expired records for this or any other
+    /// locator; capacity pressure therefore fails closed until explicit cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns immediately for lock contention and rejects unsafe, stale, or
+    /// invalid existing state without changing it.
+    pub fn try_authorize_missing(
+        &self,
+        external_session_locator: &ExternalSessionLocator,
+        activation_scope: &ActivationScope,
+        catalog: &RepositoryCatalogSnapshot,
+    ) -> Result<AuthorizedSessionScope> {
+        self.try_authorize_missing_at(
+            external_session_locator,
+            activation_scope,
+            catalog,
+            SystemTime::now(),
+        )
+    }
+
     /// Reads one lease and validates it against the current Catalog snapshot.
     ///
     /// Missing, expired, or stale records are explicit non-authorizing results.
@@ -294,6 +322,24 @@ impl AuthorizedSessionScopeStore {
         catalog: &RepositoryCatalogSnapshot,
     ) -> Result<AuthorizedSessionScopeRead> {
         self.read_at(external_session_locator, catalog, SystemTime::now())
+    }
+
+    /// Classifies one lease without waiting for another scope operation.
+    ///
+    /// This shared-lock path is strictly non-mutating: `Expired` records remain
+    /// present until an explicit exclusive cleanup or expiry operation removes
+    /// them. Concurrent Hook readers therefore never exclude one another.
+    ///
+    /// # Errors
+    ///
+    /// A busy lock and every unsafe or invalid record are immediate typed
+    /// failures and never become authorization.
+    pub fn try_read(
+        &self,
+        external_session_locator: &ExternalSessionLocator,
+        catalog: &RepositoryCatalogSnapshot,
+    ) -> Result<AuthorizedSessionScopeRead> {
+        self.try_read_at(external_session_locator, catalog, SystemTime::now())
     }
 
     /// Removes this locator only when its valid record has expired.
@@ -343,6 +389,68 @@ impl AuthorizedSessionScopeStore {
         catalog: &RepositoryCatalogSnapshot,
         now: SystemTime,
     ) -> Result<AuthorizedSessionScopeAuthorizeOutcome> {
+        let scope =
+            self.scope_for_authorization(external_session_locator, activation_scope, catalog, now)?;
+        let bytes = self.serialize_scope(&scope)?;
+
+        self.with_lock(|| {
+            self.cleanup_expired_at(now)?;
+            let path = self.record_path(external_session_locator);
+            let existing = self.read_optional_record(&path)?;
+            let mut semantic_changed = true;
+            if let Some(existing) = &existing {
+                verify_record_locator(existing, external_session_locator)?;
+                semantic_changed = !existing.semantically_matches(&scope);
+            }
+            let usage = self.usage(existing.as_ref().map(|_| path.as_path()))?;
+            self.validate_new_usage(&usage, existing.is_none(), bytes.len())?;
+            self.replace_record(&path, &bytes, existing.is_some())?;
+            Ok(AuthorizedSessionScopeAuthorizeOutcome {
+                scope,
+                semantic_changed,
+            })
+        })
+    }
+
+    fn try_authorize_missing_at(
+        &self,
+        external_session_locator: &ExternalSessionLocator,
+        activation_scope: &ActivationScope,
+        catalog: &RepositoryCatalogSnapshot,
+        now: SystemTime,
+    ) -> Result<AuthorizedSessionScope> {
+        let scope =
+            self.scope_for_authorization(external_session_locator, activation_scope, catalog, now)?;
+        let bytes = self.serialize_scope(&scope)?;
+
+        self.with_try_lock(|| {
+            let path = self.record_path(external_session_locator);
+            if let Some(existing) = self.read_optional_record(&path)? {
+                verify_record_locator(&existing, external_session_locator)?;
+                if existing.expires_at_unix_seconds <= unix_seconds(now)? {
+                    return Err(invalid("existing AuthorizedSessionScope is expired"));
+                }
+                if !scope_matches_catalog(&existing, catalog)? {
+                    return Err(invalid(
+                        "existing AuthorizedSessionScope is stale for this Catalog",
+                    ));
+                }
+                return Ok(existing);
+            }
+            let usage = self.usage(None)?;
+            self.validate_new_usage(&usage, true, bytes.len())?;
+            self.replace_record(&path, &bytes, false)?;
+            Ok(scope)
+        })
+    }
+
+    fn scope_for_authorization(
+        &self,
+        external_session_locator: &ExternalSessionLocator,
+        activation_scope: &ActivationScope,
+        catalog: &RepositoryCatalogSnapshot,
+        now: SystemTime,
+    ) -> Result<AuthorizedSessionScope> {
         validate_locator(external_session_locator)?;
         let catalog_revision = catalog.revision()?;
         let (decision, allowed_repository_ids) =
@@ -361,36 +469,7 @@ impl AuthorizedSessionScopeStore {
             expires_at_unix_seconds: unix_seconds(expires_at)?,
         };
         scope.validate()?;
-        let bytes = self.serialize_scope(&scope)?;
-
-        self.with_lock(|| {
-            self.cleanup_expired_at(now)?;
-            let path = self.record_path(external_session_locator);
-            let existing = self.read_optional_record(&path)?;
-            let mut semantic_changed = true;
-            if let Some(existing) = &existing {
-                verify_record_locator(existing, external_session_locator)?;
-                semantic_changed = !existing.semantically_matches(&scope);
-            }
-            let usage = self.usage(existing.as_ref().map(|_| path.as_path()))?;
-            if existing.is_none() && usage.entries >= self.policy.max_entries {
-                return Err(invalid(format!(
-                    "AuthorizedSessionScope state would exceed {} entries",
-                    self.policy.max_entries
-                )));
-            }
-            if usage.bytes.saturating_add(bytes.len() as u64) > self.policy.max_total_bytes {
-                return Err(invalid(format!(
-                    "AuthorizedSessionScope state would exceed {} bytes",
-                    self.policy.max_total_bytes
-                )));
-            }
-            self.replace_record(&path, &bytes, existing.is_some())?;
-            Ok(AuthorizedSessionScopeAuthorizeOutcome {
-                scope,
-                semantic_changed,
-            })
-        })
+        Ok(scope)
     }
 
     fn read_at(
@@ -401,22 +480,47 @@ impl AuthorizedSessionScopeStore {
     ) -> Result<AuthorizedSessionScopeRead> {
         validate_locator(external_session_locator)?;
         self.with_lock(|| {
-            let path = self.record_path(external_session_locator);
-            let Some(record) = self.read_optional_record(&path)? else {
-                return Ok(AuthorizedSessionScopeRead::Missing);
-            };
-            verify_record_locator(&record, external_session_locator)?;
-            if record.expires_at_unix_seconds <= unix_seconds(now)? {
+            let classification = self.classify_at_locked(external_session_locator, catalog, now)?;
+            if classification == AuthorizedSessionScopeRead::Expired {
+                let path = self.record_path(external_session_locator);
                 fs::remove_file(&path)
                     .map_err(io_error("remove expired AuthorizedSessionScope"))?;
                 sync_directory(&self.directory)?;
-                return Ok(AuthorizedSessionScopeRead::Expired);
             }
-            if !scope_matches_catalog(&record, catalog)? {
-                return Ok(AuthorizedSessionScopeRead::StaleCatalog);
-            }
-            Ok(AuthorizedSessionScopeRead::Current(record))
+            Ok(classification)
         })
+    }
+
+    fn try_read_at(
+        &self,
+        external_session_locator: &ExternalSessionLocator,
+        catalog: &RepositoryCatalogSnapshot,
+        now: SystemTime,
+    ) -> Result<AuthorizedSessionScopeRead> {
+        validate_locator(external_session_locator)?;
+        self.with_try_shared_lock(|| {
+            self.classify_at_locked(external_session_locator, catalog, now)
+        })
+    }
+
+    fn classify_at_locked(
+        &self,
+        external_session_locator: &ExternalSessionLocator,
+        catalog: &RepositoryCatalogSnapshot,
+        now: SystemTime,
+    ) -> Result<AuthorizedSessionScopeRead> {
+        let path = self.record_path(external_session_locator);
+        let Some(record) = self.read_optional_record(&path)? else {
+            return Ok(AuthorizedSessionScopeRead::Missing);
+        };
+        verify_record_locator(&record, external_session_locator)?;
+        if record.expires_at_unix_seconds <= unix_seconds(now)? {
+            return Ok(AuthorizedSessionScopeRead::Expired);
+        }
+        if !scope_matches_catalog(&record, catalog)? {
+            return Ok(AuthorizedSessionScopeRead::StaleCatalog);
+        }
+        Ok(AuthorizedSessionScopeRead::Current(record))
     }
 
     fn expire_at(
@@ -562,7 +666,49 @@ impl AuthorizedSessionScopeStore {
         Ok(usage)
     }
 
+    fn validate_new_usage(
+        &self,
+        usage: &ScopeUsage,
+        adding_entry: bool,
+        record_bytes: usize,
+    ) -> Result<()> {
+        if adding_entry && usage.entries >= self.policy.max_entries {
+            return Err(invalid(format!(
+                "AuthorizedSessionScope state would exceed {} entries",
+                self.policy.max_entries
+            )));
+        }
+        if usage.bytes.saturating_add(record_bytes as u64) > self.policy.max_total_bytes {
+            return Err(invalid(format!(
+                "AuthorizedSessionScope state would exceed {} bytes",
+                self.policy.max_total_bytes
+            )));
+        }
+        Ok(())
+    }
+
     fn lock(&self) -> Result<File> {
+        let lock = self.open_lock()?;
+        lock.lock_exclusive()
+            .map_err(io_error("lock authorized-session-scopes.lock"))?;
+        Ok(lock)
+    }
+
+    fn try_lock(&self) -> Result<File> {
+        let lock = self.open_lock()?;
+        FileExt::try_lock_exclusive(&lock)
+            .map_err(io_error("try lock authorized-session-scopes.lock"))?;
+        Ok(lock)
+    }
+
+    fn try_shared_lock(&self) -> Result<File> {
+        let lock = self.open_lock()?;
+        FileExt::try_lock_shared(&lock)
+            .map_err(io_error("try lock authorized-session-scopes.lock shared"))?;
+        Ok(lock)
+    }
+
+    fn open_lock(&self) -> Result<File> {
         reject_symlink(&self.lock_path)?;
         let lock = OpenOptions::new()
             .read(true)
@@ -581,8 +727,6 @@ impl AuthorizedSessionScopeStore {
         }
         fs::set_permissions(&self.lock_path, fs::Permissions::from_mode(0o600))
             .map_err(io_error("set authorized-session-scopes.lock permissions"))?;
-        lock.lock_exclusive()
-            .map_err(io_error("lock authorized-session-scopes.lock"))?;
         Ok(lock)
     }
 
@@ -591,6 +735,22 @@ impl AuthorizedSessionScopeStore {
         let outcome = operation();
         let unlock =
             FileExt::unlock(&lock).map_err(io_error("unlock authorized-session-scopes.lock"));
+        outcome.and_then(|value| unlock.map(|()| value))
+    }
+
+    fn with_try_lock<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        let lock = self.try_lock()?;
+        let outcome = operation();
+        let unlock =
+            FileExt::unlock(&lock).map_err(io_error("unlock authorized-session-scopes.lock"));
+        outcome.and_then(|value| unlock.map(|()| value))
+    }
+
+    fn with_try_shared_lock<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        let lock = self.try_shared_lock()?;
+        let outcome = operation();
+        let unlock = FileExt::unlock(&lock)
+            .map_err(io_error("unlock authorized-session-scopes.lock shared"));
         outcome.and_then(|value| unlock.map(|()| value))
     }
 }
@@ -841,13 +1001,14 @@ fn io_error(operation: &'static str) -> impl FnOnce(std::io::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
+        fs::{self, OpenOptions},
         os::unix::fs::PermissionsExt,
         sync::{Arc, Barrier},
         thread,
-        time::{Duration, UNIX_EPOCH},
+        time::{Duration, Instant, UNIX_EPOCH},
     };
 
+    use fs2::FileExt;
     use sctx_domain::{ExternalSessionLocator, RepositoryGroupId, RepositoryId};
     use tempfile::tempdir;
 
@@ -889,6 +1050,19 @@ mod tests {
             decision: ActivationScopeDecision::Direct {
                 repository_id,
                 checkout_path: "/private/checkouts/member".into(),
+            },
+            allowed_repository_ids: vec![repository_id],
+        }
+    }
+
+    fn group_scope(
+        repository_id: RepositoryId,
+        repository_group_id: RepositoryGroupId,
+    ) -> ActivationScope {
+        ActivationScope {
+            decision: ActivationScopeDecision::Group {
+                repository_group_id,
+                root_path: "/private/checkouts".into(),
             },
             allowed_repository_ids: vec![repository_id],
         }
@@ -1025,6 +1199,225 @@ mod tests {
             store.read(&external, &catalog).unwrap(),
             AuthorizedSessionScopeRead::Current(_)
         ));
+    }
+
+    #[test]
+    fn try_lock_operations_return_immediately_without_a_late_record() {
+        let temporary = tempdir().unwrap();
+        let store = AuthorizedSessionScopeStore::initialize(temporary.path()).unwrap();
+        let (catalog, repository_id, _) = fixture_catalog();
+        let external = locator("held-lock");
+        assert_eq!(
+            store.try_read(&external, &catalog).unwrap(),
+            AuthorizedSessionScopeRead::Missing
+        );
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&store.lock_path)
+            .unwrap();
+        FileExt::lock_exclusive(&lock).unwrap();
+
+        let started = Instant::now();
+        assert!(store.try_read(&external, &catalog).is_err());
+        assert!(
+            store
+                .try_authorize_missing(&external, &direct_scope(repository_id), &catalog)
+                .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        FileExt::unlock(&lock).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        assert_eq!(
+            store.try_read(&external, &catalog).unwrap(),
+            AuthorizedSessionScopeRead::Missing
+        );
+        assert_eq!(fs::read_dir(store.directory()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn try_authorize_missing_never_replaces_the_first_persisted_decision() {
+        let temporary = tempdir().unwrap();
+        let store = AuthorizedSessionScopeStore::initialize(temporary.path()).unwrap();
+        let (catalog, repository_id, repository_group_id) = fixture_catalog();
+        let external = locator("sticky-first");
+        let direct = store
+            .try_authorize_missing(&external, &direct_scope(repository_id), &catalog)
+            .unwrap();
+        assert!(matches!(
+            direct.decision,
+            AuthorizedSessionScopeDecision::Direct { .. }
+        ));
+
+        let retained = store
+            .try_authorize_missing(
+                &external,
+                &group_scope(repository_id, repository_group_id),
+                &catalog,
+            )
+            .unwrap();
+        assert_eq!(retained, direct);
+        assert!(matches!(
+            store.try_read(&external, &catalog).unwrap(),
+            AuthorizedSessionScopeRead::Current(scope) if scope == direct
+        ));
+        assert_eq!(fs::read_dir(store.directory()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn shared_try_reads_coexist_for_same_and_different_locators() {
+        let temporary = tempdir().unwrap();
+        let store = Arc::new(AuthorizedSessionScopeStore::initialize(temporary.path()).unwrap());
+        let (catalog, repository_id, _) = fixture_catalog();
+        let same = locator("shared-same");
+        let different = locator("shared-different");
+        for external in [&same, &different] {
+            store
+                .authorize(external, &direct_scope(repository_id), &catalog)
+                .unwrap();
+        }
+
+        let first_shared = store.try_shared_lock().unwrap();
+        let second_shared = store.try_shared_lock().unwrap();
+        FileExt::unlock(&second_shared).unwrap();
+        FileExt::unlock(&first_shared).unwrap();
+
+        let workers = 12;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut handles = Vec::new();
+        for index in 0..workers {
+            let store = Arc::clone(&store);
+            let catalog = catalog.clone();
+            let external = if index % 2 == 0 {
+                same.clone()
+            } else {
+                different.clone()
+            };
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                store.try_read(&external, &catalog)
+            }));
+        }
+        for handle in handles {
+            assert!(matches!(
+                handle.join().unwrap().unwrap(),
+                AuthorizedSessionScopeRead::Current(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn shared_try_read_preserves_expired_record_until_explicit_exclusive_expire() {
+        let temporary = tempdir().unwrap();
+        let store = AuthorizedSessionScopeStore::with_policy(
+            temporary.path(),
+            policy(Duration::from_secs(2)),
+        )
+        .unwrap();
+        let (catalog, repository_id, _) = fixture_catalog();
+        let external = locator("shared-expired");
+        let start = UNIX_EPOCH + Duration::from_secs(100);
+        store
+            .authorize_at(&external, &direct_scope(repository_id), &catalog, start)
+            .unwrap();
+        let expired = start + Duration::from_secs(3);
+
+        for _ in 0..2 {
+            assert_eq!(
+                store.try_read_at(&external, &catalog, expired).unwrap(),
+                AuthorizedSessionScopeRead::Expired
+            );
+            assert_eq!(fs::read_dir(store.directory()).unwrap().count(), 1);
+        }
+        assert!(store.expire_at(&external, expired).unwrap());
+        assert_eq!(
+            store.try_read_at(&external, &catalog, expired).unwrap(),
+            AuthorizedSessionScopeRead::Missing
+        );
+        assert_eq!(fs::read_dir(store.directory()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn first_authorizing_an_unrelated_locator_never_cleans_an_expired_record() {
+        let temporary = tempdir().unwrap();
+        let store = AuthorizedSessionScopeStore::with_policy(
+            temporary.path(),
+            policy(Duration::from_secs(2)),
+        )
+        .unwrap();
+        let (catalog, repository_id, _) = fixture_catalog();
+        let expired_a = locator("expired-a");
+        let new_b = locator("new-b");
+        let start = UNIX_EPOCH + Duration::from_secs(100);
+        let expired = start + Duration::from_secs(3);
+        store
+            .authorize_at(&expired_a, &direct_scope(repository_id), &catalog, start)
+            .unwrap();
+        assert!(
+            store
+                .try_authorize_missing_at(
+                    &expired_a,
+                    &direct_scope(repository_id),
+                    &catalog,
+                    expired,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.try_read_at(&expired_a, &catalog, expired).unwrap(),
+            AuthorizedSessionScopeRead::Expired
+        );
+
+        let authorized_b = store
+            .try_authorize_missing_at(&new_b, &direct_scope(repository_id), &catalog, expired)
+            .unwrap();
+        assert!(matches!(
+            authorized_b.decision,
+            AuthorizedSessionScopeDecision::Direct { .. }
+        ));
+        assert_eq!(
+            store.try_read_at(&expired_a, &catalog, expired).unwrap(),
+            AuthorizedSessionScopeRead::Expired
+        );
+        assert!(matches!(
+            store.try_read_at(&new_b, &catalog, expired).unwrap(),
+            AuthorizedSessionScopeRead::Current(scope) if scope == authorized_b
+        ));
+        assert_eq!(fs::read_dir(store.directory()).unwrap().count(), 2);
+
+        let mut changed_catalog = catalog.clone();
+        changed_catalog.repositories[0]
+            .checkout_paths
+            .push("/private/checkouts/another".into());
+        assert!(
+            store
+                .try_authorize_missing_at(
+                    &new_b,
+                    &direct_scope(repository_id),
+                    &changed_catalog,
+                    expired,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .try_read_at(&new_b, &changed_catalog, expired)
+                .unwrap(),
+            AuthorizedSessionScopeRead::StaleCatalog
+        );
+        assert!(matches!(
+            store.try_read_at(&new_b, &catalog, expired).unwrap(),
+            AuthorizedSessionScopeRead::Current(scope) if scope == authorized_b
+        ));
+
+        assert!(store.expire_at(&expired_a, expired).unwrap());
+        assert_eq!(
+            store.try_read_at(&expired_a, &catalog, expired).unwrap(),
+            AuthorizedSessionScopeRead::Missing
+        );
+        assert_eq!(fs::read_dir(store.directory()).unwrap().count(), 1);
     }
 
     #[test]

@@ -2052,7 +2052,9 @@ fn hook_payload(
                 },
             );
             payload.insert("session_id".to_owned(), Value::String(session));
-            payload.insert("cwd".to_owned(), Value::String(workspace));
+            payload
+                .entry("cwd".to_owned())
+                .or_insert_with(|| Value::String(workspace));
             payload.insert(
                 "hook_event_name".to_owned(),
                 Value::String(event.to_owned()),
@@ -2111,10 +2113,9 @@ fn hook_payload(
                 "cursor_version".to_owned(),
                 Value::String(profile.version.to_string()),
             );
-            payload.insert(
-                "workspace_roots".to_owned(),
-                Value::Array(vec![Value::String(workspace)]),
-            );
+            payload
+                .entry("workspace_roots".to_owned())
+                .or_insert_with(|| Value::Array(vec![Value::String(workspace)]));
         }
     }
     Some(Value::Object(payload))

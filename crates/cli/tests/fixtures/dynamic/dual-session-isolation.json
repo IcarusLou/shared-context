@@ -11,7 +11,32 @@
   ],
   "actions": [
     {
-      "id": "intent-a", "actor": "task-a", "after": [],
+      "id": "repository-add", "actor": "task-a", "after": [],
+      "action": {"type": "cli_json", "arguments": [
+        {"type": "string", "value": "repository"},
+        {"type": "string", "value": "add"},
+        {"type": "string", "value": "--path"},
+        {"type": "builtin", "builtin": {"type": "resource_root", "resource": "focus-repo"}}
+      ]}
+    },
+    {
+      "id": "session-start-a", "actor": "session-a", "after": ["repository-add"],
+      "action": {"type": "hook_event", "event": "sessionStart", "payload": {"type": "object", "fields": {
+        "workspace_roots": {"type": "array", "items": [
+          {"type": "builtin", "builtin": {"type": "resource_root", "resource": "focus-repo"}}
+        ]}
+      }}}
+    },
+    {
+      "id": "session-start-b", "actor": "session-b", "after": ["repository-add"],
+      "action": {"type": "hook_event", "event": "sessionStart", "payload": {"type": "object", "fields": {
+        "workspace_roots": {"type": "array", "items": [
+          {"type": "builtin", "builtin": {"type": "resource_root", "resource": "focus-repo"}}
+        ]}
+      }}}
+    },
+    {
+      "id": "intent-a", "actor": "task-a", "after": ["session-start-a"],
       "action": {"type": "mcp_request", "method": "task_intent_update", "params": {"type": "object", "fields": {
         "agent_kind": {"type": "string", "value": "cursor"},
         "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session-a"}},
@@ -21,7 +46,7 @@
       }}}
     },
     {
-      "id": "intent-b", "actor": "task-b", "after": [],
+      "id": "intent-b", "actor": "task-b", "after": ["session-start-b"],
       "action": {"type": "mcp_request", "method": "task_intent_update", "params": {"type": "object", "fields": {
         "agent_kind": {"type": "string", "value": "cursor"},
         "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session-b"}},
@@ -139,7 +164,10 @@
       }}}
     }
   ],
-  "resources": [],
+  "resources": [{
+    "id": "focus-repo", "synthetic_git": true,
+    "files": [{"path": "README.txt", "content": "synthetic dual-session activation repository\n"}]
+  }],
   "variables": [
     {"name": "task-a-id", "value_type": "task_id", "capture": {"step": "intent-a", "pointer": "/task_id"}},
     {"name": "task-session-a-id", "value_type": "task_session_id", "capture": {"step": "intent-a", "pointer": "/task_session_id"}},
@@ -165,6 +193,7 @@
     {"id": "session-b-candidate-source", "invariant": {"type": "candidate_source_episode", "response": "candidate-get-b", "candidate": "candidate-b-id", "episode": "candidate-b-episode-id"}}
   ],
   "events": [
+    {"event": "sessionStart", "classification": "supported", "product_action": "session_start"},
     {"event": "sessionEnd", "classification": "supported", "product_action": "session_end"},
     {"event": "stop", "classification": "supported", "product_action": "turn_stop"}
   ]

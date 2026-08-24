@@ -109,6 +109,18 @@ fn post_tool(session_id: &str, cwd: &Path, file: &Path, raw: &str, tool: &str) -
     })
 }
 
+fn session_start(session_id: &str, cwd: &Path) -> Value {
+    json!({
+        "session_id": session_id,
+        "transcript_path": null,
+        "cwd": cwd,
+        "hook_event_name": "SessionStart",
+        "model": "gpt-5.6-sol",
+        "permission_mode": "default",
+        "source": "startup"
+    })
+}
+
 fn runtime_diagnostics(values: &[CaptureDiagnosticKind]) -> Vec<WorkEpisodeDiagnosticKind> {
     values
         .iter()
@@ -137,6 +149,16 @@ fn hook_capture_keeps_locator_then_explicit_claim_and_ingestion_are_verifiable()
         .unwrap()
         .add_repository(None, std::slice::from_ref(&repository))
         .unwrap();
+    assert!(
+        harness.hook(&session_start("capture-before-task", &repository))["systemMessage"]
+            .as_str()
+            .is_some_and(|message| message.contains("<shared-context-active>"))
+    );
+    assert!(
+        harness.hook(&session_start("capture-owned", &repository))["systemMessage"]
+            .as_str()
+            .is_some_and(|message| message.contains("<shared-context-active>"))
+    );
 
     let no_task_raw = "RAW_BEFORE_TASK_MUST_NOT_PERSIST";
     assert_eq!(

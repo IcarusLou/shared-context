@@ -5,6 +5,7 @@ use std::{
     process::{Command, Stdio},
 };
 
+use sctx_agent_adapter::SHARED_CONTEXT_ACTIVATION_MARKER;
 use sctx_domain::{
     Applicability, ContextKind, ContextRevisionDraft, EvidenceSnapshotDraft, EvidenceType,
     ExternalSessionLocator, IntentSnapshot, PublicationAction, PublicationDraft, ReviewDraft,
@@ -317,6 +318,36 @@ fn one_real_hook_to_confirm_identity_chain() {
         &oracle.source_text,
     );
     let absolute_source = source_repository.join(&oracle.source_relative_path);
+    let repository = run_json_cli(
+        &home,
+        &[
+            "repository",
+            "add",
+            "--path",
+            source_repository.to_str().unwrap(),
+        ],
+    );
+    let repository_id = repository["data"]["catalog"]["repository"]["repository_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let session_start = run_hook(
+        &home,
+        &json!({
+            "session_id": oracle.session,
+            "transcript_path": null,
+            "cwd": source_repository,
+            "hook_event_name": "SessionStart",
+            "model": "gpt-5.6-sol",
+            "permission_mode": "default",
+            "source": "startup"
+        }),
+    );
+    assert_eq!(
+        session_start,
+        json!({"systemMessage": SHARED_CONTEXT_ACTIVATION_MARKER})
+    );
 
     let prompt = run_hook(
         &home,
@@ -331,9 +362,7 @@ fn one_real_hook_to_confirm_identity_chain() {
             "prompt": oracle.prompt
         }),
     );
-    let guidance = prompt["systemMessage"].as_str().unwrap();
-    assert!(guidance.contains("task_intent_update"));
-    assert!(!guidance.contains(&oracle.prompt));
+    assert_eq!(prompt, json!({}));
 
     let task = mcp_tool(
         &home,
@@ -354,19 +383,6 @@ fn one_real_hook_to_confirm_identity_chain() {
     assert!(intent_revision_id.starts_with("tir_"));
 
     let seeded = seed_accepted_context(&store, &oracle);
-    let repository = run_json_cli(
-        &home,
-        &[
-            "repository",
-            "add",
-            "--path",
-            source_repository.to_str().unwrap(),
-        ],
-    );
-    let repository_id = repository["data"]["catalog"]["repository"]["repository_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
     let scan = mcp_tool(
         &home,
         "repository_scan",

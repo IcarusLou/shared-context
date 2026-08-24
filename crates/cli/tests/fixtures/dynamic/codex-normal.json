@@ -18,7 +18,14 @@
       ]}
     },
     {
-      "id": "prompt", "actor": "session", "after": ["repository-add"],
+      "id": "session-start", "actor": "session", "after": ["repository-add"],
+      "action": {"type": "hook_event", "event": "SessionStart", "payload": {"type": "object", "fields": {
+        "cwd": {"type": "builtin", "builtin": {"type": "resource_root", "resource": "focus-repo"}},
+        "source": {"type": "string", "value": "startup"}
+      }}}
+    },
+    {
+      "id": "prompt", "actor": "session", "after": ["session-start"],
       "action": {"type": "hook_event", "event": "UserPromptSubmit", "payload": {"type": "object", "fields": {}}}
     },
     {
@@ -281,6 +288,7 @@
     ]}}
   ],
   "events": [
+    {"event": "SessionStart", "classification": "supported", "product_action": "session_start"},
     {"event": "UserPromptSubmit", "classification": "supported", "product_action": "prompt_submit"},
     {"event": "PostToolUse", "classification": "supported", "product_action": "post_tool_use"},
     {"event": "Stop", "classification": "supported", "product_action": "turn_stop"},

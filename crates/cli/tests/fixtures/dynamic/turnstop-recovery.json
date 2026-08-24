@@ -9,7 +9,23 @@
   ],
   "actions": [
     {
-      "id": "out-of-order-stop", "actor": "session", "after": [],
+      "id": "repository-add", "actor": "task", "after": [],
+      "action": {"type": "cli_json", "arguments": [
+        {"type": "string", "value": "repository"},
+        {"type": "string", "value": "add"},
+        {"type": "string", "value": "--path"},
+        {"type": "builtin", "builtin": {"type": "resource_root", "resource": "focus-repo"}}
+      ]}
+    },
+    {
+      "id": "session-start", "actor": "session", "after": ["repository-add"],
+      "action": {"type": "hook_event", "event": "SessionStart", "payload": {"type": "object", "fields": {
+        "cwd": {"type": "builtin", "builtin": {"type": "resource_root", "resource": "focus-repo"}},
+        "source": {"type": "string", "value": "startup"}
+      }}}
+    },
+    {
+      "id": "out-of-order-stop", "actor": "session", "after": ["session-start"],
       "action": {"type": "hook_event", "event": "Stop", "payload": {"type": "object", "fields": {}}}
     },
     {
@@ -109,7 +125,10 @@
       }}}
     }
   ],
-  "resources": [],
+  "resources": [{
+    "id": "focus-repo", "synthetic_git": true,
+    "files": [{"path": "README.txt", "content": "synthetic Stop recovery activation repository\n"}]
+  }],
   "variables": [
     {"name": "task-id", "value_type": "task_id", "capture": {"step": "intent-new", "pointer": "/task_id"}},
     {"name": "revision-id", "value_type": "intent_revision_id", "capture": {"step": "intent-new", "pointer": "/intent_revision_id"}},
@@ -127,6 +146,7 @@
     {"id": "recovered-candidate-source", "invariant": {"type": "candidate_source_episode", "response": "candidate-get", "candidate": "candidate-id", "episode": "episode-id"}}
   ],
   "events": [
+    {"event": "SessionStart", "classification": "supported", "product_action": "session_start"},
     {"event": "Stop", "classification": "supported", "product_action": "turn_stop"}
   ]
 }

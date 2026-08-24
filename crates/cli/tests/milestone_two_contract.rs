@@ -752,6 +752,20 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
 fn post_tool_file_is_breadcrumb_only_and_test_outcome_refreshes_active_task() {
     let fixture = MilestoneTwoFixture::new();
     let session_id = "hook-signal-session";
+    let activation = fixture.hook(&serde_json::json!({
+        "session_id": session_id,
+        "transcript_path": null,
+        "cwd": fixture.workspace,
+        "hook_event_name": "SessionStart",
+        "model": "gpt-5.6-sol",
+        "permission_mode": "default",
+        "source": "startup"
+    }));
+    assert!(
+        activation["systemMessage"]
+            .as_str()
+            .is_some_and(|message| message.contains("<shared-context-active>"))
+    );
     let update = |boundary: TaskBoundary, expected: Option<String>| TaskIntentUpdateInput {
         agent_kind: "codex".to_owned(),
         external_session_id: session_id.to_owned(),

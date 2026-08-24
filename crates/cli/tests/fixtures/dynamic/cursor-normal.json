@@ -26,8 +26,21 @@
       ]}
     },
     {
-      "id": "session-start", "actor": "session", "after": ["space-create"],
-      "action": {"type": "hook_event", "event": "sessionStart", "payload": {"type": "object", "fields": {}}}
+      "id": "repository-add", "actor": "task", "after": [],
+      "action": {"type": "cli_json", "arguments": [
+        {"type": "string", "value": "repository"},
+        {"type": "string", "value": "add"},
+        {"type": "string", "value": "--path"},
+        {"type": "builtin", "builtin": {"type": "resource_root", "resource": "focus-repo"}}
+      ]}
+    },
+    {
+      "id": "session-start", "actor": "session", "after": ["space-create", "repository-add"],
+      "action": {"type": "hook_event", "event": "sessionStart", "payload": {"type": "object", "fields": {
+        "workspace_roots": {"type": "array", "items": [
+          {"type": "builtin", "builtin": {"type": "resource_root", "resource": "focus-repo"}}
+        ]}
+      }}}
     },
     {
       "id": "intent-new", "actor": "task", "after": ["session-start"],
@@ -128,7 +141,10 @@
       }}}
     }
   ],
-  "resources": [],
+  "resources": [{
+    "id": "focus-repo", "synthetic_git": true,
+    "files": [{"path": "README.txt", "content": "synthetic Cursor activation repository\n"}]
+  }],
   "variables": [
     {"name": "existing-space-id", "value_type": "space_id", "capture": {"step": "space-create", "pointer": "/space_id"}},
     {"name": "task-id", "value_type": "task_id", "capture": {"step": "intent-new", "pointer": "/task_id"}},

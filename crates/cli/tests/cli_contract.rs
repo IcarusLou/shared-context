@@ -9,6 +9,7 @@ use std::{
     thread,
 };
 
+use sctx_agent_adapter::SHARED_CONTEXT_ACTIVATION_MARKER;
 use sctx_domain::{
     Applicability, CaptureUnknown, ContextKind, ContextRevisionDraft, Error, ErrorKind, EventId,
     EvidenceSnapshotDraft, ExternalSessionLocator, IntentSnapshot, PublicationAction,
@@ -518,7 +519,7 @@ fn hook_capabilities_require_only_minimum_versions_and_codex_trust() {
 }
 
 #[test]
-fn session_start_and_prompt_submit_emit_capabilities_without_inferred_context() {
+fn disabled_session_start_and_prompt_submit_are_agent_neutral() {
     let harness = Harness::new();
     let (alpha_space_id, _) = create_space(&harness, "Alpha Hook contract");
     let alpha = approve_publish(&harness, &alpha_space_id, "alpha needle accepted context");
@@ -556,13 +557,7 @@ fn session_start_and_prompt_submit_emit_capabilities_without_inferred_context() 
     );
     let response: Value = serde_json::from_slice(&output.stdout).unwrap();
     let response_text = serde_json::to_string(&response).unwrap();
-    assert_eq!(response.as_object().unwrap().len(), 1);
-    assert!(
-        response["systemMessage"]
-            .as_str()
-            .is_some_and(|message| message.contains("MCP and CLI"))
-    );
-    assert!(response.get("hookSpecificOutput").is_none());
+    assert_eq!(response, serde_json::json!({}));
     assert!(!response_text.contains("alpha needle accepted context"));
     assert!(!response_text.contains("beta decoy accepted context"));
     assert!(!response_text.contains("untrusted-data"));
@@ -587,16 +582,7 @@ fn session_start_and_prompt_submit_emit_capabilities_without_inferred_context() 
         String::from_utf8_lossy(&output.stderr)
     );
     let response: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let context = response["systemMessage"].as_str().unwrap();
-    assert!(
-        context.contains("PromptEnvelope") && context.contains("task_intent_update"),
-        "unexpected Prompt guidance: {context}"
-    );
-    assert!(!context.contains("alpha needle"));
-    assert!(!context.contains("alpha needle accepted context"));
-    assert!(!context.contains("beta decoy accepted context"));
-    assert!(!context.contains("SCTX_MUST_NOT_EXECUTE"));
-    assert!(response.get("hookSpecificOutput").is_none());
+    assert_eq!(response, serde_json::json!({}));
     assert!(
         TaskRuntime::initialize(harness.root())
             .unwrap()
@@ -671,6 +657,17 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         );
         serde_json::from_slice::<Value>(&output.stdout).unwrap()
     };
+    let start = |session_id: &str, cwd: &Path| {
+        hook(&serde_json::json!({
+            "session_id": session_id,
+            "transcript_path": null,
+            "cwd": cwd,
+            "hook_event_name": "SessionStart",
+            "model": "gpt-5.6-sol",
+            "permission_mode": "default",
+            "source": "startup"
+        }))
+    };
     let intent_update =
         |session_id: &str, goal: &str, expected: Option<String>| TaskIntentUpdateInput {
             agent_kind: "codex".to_owned(),
@@ -722,14 +719,23 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         "PostToolUse without a Prompt must not invent a Task Session"
     );
 
-    let alpha_initial = hook(&prompt("session-alpha", "alphaquartz"));
-    let beta_initial = hook(&prompt("session-beta", "betacobalt"));
-    for guidance in [alpha_initial, beta_initial] {
-        let guidance = guidance["systemMessage"].as_str().unwrap();
-        assert!(guidance.contains("task_intent_update"));
-        assert!(!guidance.contains("alphaquartz"));
-        assert!(!guidance.contains("betacobalt"));
+    for response in [
+        start("session-alpha", &workspace),
+        start("session-beta", &workspace),
+    ] {
+        assert_eq!(
+            response,
+            serde_json::json!({"systemMessage": SHARED_CONTEXT_ACTIVATION_MARKER})
+        );
     }
+    assert_eq!(
+        hook(&prompt("session-alpha", "alphaquartz")),
+        serde_json::json!({})
+    );
+    assert_eq!(
+        hook(&prompt("session-beta", "betacobalt")),
+        serde_json::json!({})
+    );
     let alpha_created = task_intent_update_at_root(
         harness.root(),
         &intent_update("session-alpha", "alphaquartz", None),
@@ -830,6 +836,10 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         &intent_update("session-subdir", "subdirectory task", None),
     )
     .unwrap();
+    assert_eq!(
+        start("session-subdir", &workspace.join("src")),
+        serde_json::json!({"systemMessage": SHARED_CONTEXT_ACTIVATION_MARKER})
+    );
     let subdirectory_post = hook(&serde_json::json!({
         "session_id": "session-subdir",
         "transcript_path": null,
@@ -2169,6 +2179,35 @@ fn post_tool_hook_captures_a_bounded_breadcrumb_not_raw_payload() {
     assert!(!space_id.is_empty());
     let workspace = harness.home.join("business workspace");
     fs::create_dir_all(&workspace).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&workspace)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let workspace = fs::canonicalize(workspace).unwrap();
+    harness.success(&["repository", "add", "--path", workspace.to_str().unwrap()]);
+    let start = serde_json::json!({
+        "conversation_id": "conv_contract",
+        "generation_id": "gen_contract",
+        "model": "claude-opus-4-7",
+        "hook_event_name": "sessionStart",
+        "cursor_version": "3.13.10",
+        "workspace_roots": [workspace],
+        "user_email": null,
+        "transcript_path": null,
+        "session_id": "conv_contract",
+        "is_background_agent": false,
+        "composer_mode": "agent"
+    });
+    let start_output = harness.run_with_input(&["hook", "--agent", "cursor"], &start);
+    assert!(start_output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&start_output.stdout).unwrap(),
+        serde_json::json!({"additional_context": SHARED_CONTEXT_ACTIVATION_MARKER})
+    );
     let payload = serde_json::json!({
         "conversation_id": "conv_contract",
         "generation_id": "gen_contract",
@@ -2181,11 +2220,11 @@ fn post_tool_hook_captures_a_bounded_breadcrumb_not_raw_payload() {
         "tool_name": "Shell",
         "tool_input": {
             "command": "echo RAW_COMMAND_MUST_NOT_BE_CAPTURED",
-            "working_directory": harness.home.join("business workspace")
+            "working_directory": workspace
         },
         "tool_output": "RAW_OUTPUT_MUST_NOT_BE_CAPTURED",
         "tool_use_id": "tool_contract",
-        "cwd": harness.home.join("business workspace"),
+        "cwd": workspace,
         "duration": 10
     });
     let output = harness.run_with_input(&["hook", "--agent", "cursor"], &payload);
