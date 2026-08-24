@@ -9,6 +9,7 @@
 mod capture;
 mod config;
 mod privacy;
+mod session_scope;
 
 pub use capture::{
     Breadcrumb, BreadcrumbKind, CaptureArtifactMapping, CaptureClaim, CaptureClaimOutcome,
@@ -20,9 +21,15 @@ pub use config::{
     ActivationScope, ActivationScopeDecision, CatalogCheckoutStatus, CatalogRepositoryGroupStatus,
     RepositoryCatalogAddOutcome, RepositoryCatalogCheckoutCheck, RepositoryCatalogDoctorReport,
     RepositoryCatalogEntry, RepositoryCatalogGroupCheck, RepositoryCatalogInspection,
-    RepositoryCatalogSnapshot, RepositoryGroupCatalogAddOutcome, RepositoryGroupCatalogEntry,
-    RepositoryGroupCatalogRemoveOutcome, RepositoryGroupCatalogUpdateOutcome,
-    ResolvedRepositoryPath, UserConfigStore,
+    RepositoryCatalogRevision, RepositoryCatalogSnapshot, RepositoryGroupCatalogAddOutcome,
+    RepositoryGroupCatalogEntry, RepositoryGroupCatalogRemoveOutcome,
+    RepositoryGroupCatalogUpdateOutcome, ResolvedRepositoryPath, UserConfigStore,
 };
 pub use privacy::{PrivacyFinding, PrivacyFindingKind, PrivacyScan, PrivacyScanner, RedactedText};
 pub use sctx_domain::{Error, ErrorKind, Result};
+pub use session_scope::{
+    AuthorizedSessionScope, AuthorizedSessionScopeAuthorizeOutcome, AuthorizedSessionScopeCleanup,
+    AuthorizedSessionScopeCleanupDiagnostic, AuthorizedSessionScopeCleanupDiagnosticKind,
+    AuthorizedSessionScopeDecision, AuthorizedSessionScopePolicy, AuthorizedSessionScopeRead,
+    AuthorizedSessionScopeRecordVersion, AuthorizedSessionScopeStore,
+};

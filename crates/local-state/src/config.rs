@@ -13,6 +13,7 @@ use sctx_domain::{
     ResolvedFocus, Result,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const CONFIG_VERSION: u32 = 1;
 const MAX_CATALOG_REPOSITORIES: usize = 256;
@@ -66,6 +67,39 @@ pub struct RepositoryGroupCatalogEntry {
 pub struct RepositoryCatalogSnapshot {
     pub repositories: Vec<RepositoryCatalogEntry>,
     pub repository_groups: Vec<RepositoryGroupCatalogEntry>,
+}
+
+/// Deterministic local revision of the complete explicit `RepositoryCatalog`.
+///
+/// This is a SHA-256 digest of a canonically ordered serialization of configured
+/// Repository IDs, checkout paths, Group IDs, roots, and members. Computing it is
+/// pure: it performs no filesystem scan and never invokes Git.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RepositoryCatalogRevision(String);
+
+impl RepositoryCatalogRevision {
+    /// Stable textual representation used only by private local state.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        let Some(digest) = self.0.strip_prefix("sha256:") else {
+            return Err(invalid("Repository Catalog revision has an invalid prefix"));
+        };
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(invalid(
+                "Repository Catalog revision is not canonical SHA-256",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Result of an atomic Catalog add operation.
@@ -793,6 +827,36 @@ impl UserConfigStore {
 }
 
 impl RepositoryCatalogSnapshot {
+    /// Computes the semantic revision used to invalidate local Session leases.
+    ///
+    /// Ordering differences in caller-built Snapshots do not change the result.
+    /// The revision changes when any configured Repository identity, checkout,
+    /// Group root, or Group membership changes. No path is inspected and Git is
+    /// never executed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input error when a configured path cannot be serialized.
+    pub fn revision(&self) -> Result<RepositoryCatalogRevision> {
+        let mut canonical = self.clone();
+        canonical
+            .repositories
+            .sort_by_key(|repository| repository.repository_id);
+        for repository in &mut canonical.repositories {
+            repository.checkout_paths.sort();
+        }
+        canonical
+            .repository_groups
+            .sort_by_key(|group| group.repository_group_id);
+        for group in &mut canonical.repository_groups {
+            group.member_repository_ids.sort();
+        }
+        let bytes = serde_json::to_vec(&canonical)
+            .map_err(|_| invalid("serialize Repository Catalog revision source"))?;
+        let digest = Sha256::digest(bytes);
+        Ok(RepositoryCatalogRevision(format!("sha256:{digest:x}")))
+    }
+
     /// Resolves one canonical Agent startup directory into local authorization.
     ///
     /// Direct checkout ownership takes precedence and uses longest-prefix

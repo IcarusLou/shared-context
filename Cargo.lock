@@ -627,6 +627,7 @@ dependencies = [
  "sctx-domain",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "toml",
  "uuid",

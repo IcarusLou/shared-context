@@ -180,6 +180,10 @@ _Avoid_: inferred repository family, Workspace Space, monorepo identity
 The local authorization decision for whether Shared Context may participate in an Agent session: one Direct RepositoryIdentity, one explicitly matched RepositoryGroup, or Disabled. It never selects a ContextSpace or owns durable knowledge.
 _Avoid_: Workspace route, Active Space, repository discovery
 
+**AuthorizedSessionScope**:
+An ExternalSessionLocator-owned, TTL-bounded local activation lease holding one Disabled, Direct, or Group decision. It is neither a TaskSession, Workspace route, Context fact, nor durable knowledge.
+_Avoid_: Task authorization, Workspace binding, durable session knowledge
+
 **EngineeringReference**:
 A persistent, non-authoritative observation that Context relates to an engineering object at one deterministic repository-relative ArtifactLocator. It survives resolution failure and never claims that a current Artifact was found.
 _Avoid_: resolved Artifact, file identity
