@@ -10,8 +10,9 @@ use std::{
 
 use sctx_domain::{ArtifactLocator, ErrorKind, RepositoryGroupId, RepositoryId};
 use sctx_local_state::{
-    ActivationScope, ActivationScopeDecision, CatalogCheckoutStatus, RepositoryCatalogEntry,
-    RepositoryCatalogSnapshot, RepositoryGroupCatalogEntry, UserConfigStore,
+    ActivationScope, ActivationScopeDecision, CatalogCheckoutStatus, CatalogRepositoryGroupStatus,
+    RepositoryCatalogEntry, RepositoryCatalogSnapshot, RepositoryGroupCatalogEntry,
+    UserConfigStore,
 };
 use tempfile::TempDir;
 
@@ -649,6 +650,119 @@ fn configured_repository_group_root_error_names_identity_path_and_reason() {
     );
     assert!(error.message().contains(root.to_str().unwrap()));
     assert!(error.message().contains("must not be a symlink"));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn repository_group_inspection_update_and_remove_repair_drift_without_touching_repositories() {
+    let temporary = TempDir::new().unwrap();
+    let original_root = temporary.path().join("original group");
+    let first = init_repo(&original_root.join("first"), "first");
+    let second = init_repo(&original_root.join("second"), "second");
+    let original_root = fs::canonicalize(original_root).unwrap();
+    let replacement_root = temporary.path().join("replacement group");
+    let replacement_first = init_repo(&replacement_root.join("first"), "replacement-first");
+    let replacement_second = init_repo(&replacement_root.join("second"), "replacement-second");
+    let replacement_root = fs::canonicalize(replacement_root).unwrap();
+    let config = UserConfigStore::initialize(temporary.path().join("repair state")).unwrap();
+    let first_id = config
+        .add_repository(None, std::slice::from_ref(&first))
+        .unwrap()
+        .repository
+        .repository_id;
+    config
+        .add_repository(Some(first_id), std::slice::from_ref(&replacement_first))
+        .unwrap();
+    let second_id = config
+        .add_repository(None, std::slice::from_ref(&second))
+        .unwrap()
+        .repository
+        .repository_id;
+    config
+        .add_repository(Some(second_id), std::slice::from_ref(&replacement_second))
+        .unwrap();
+    let group = config
+        .add_repository_group(&original_root, &[first_id])
+        .unwrap()
+        .repository_group;
+
+    let moved_original = temporary.path().join("moved original group");
+    fs::rename(&original_root, &moved_original).unwrap();
+    assert!(config.repository_catalog().is_err());
+    let inspection = config.inspect_repository_catalog().unwrap();
+    assert_eq!(inspection.catalog.repositories.len(), 2);
+    assert_eq!(inspection.repository_groups.len(), 1);
+    assert_eq!(
+        inspection.repository_groups[0].status,
+        CatalogRepositoryGroupStatus::Missing
+    );
+    assert_eq!(inspection.repository_groups[0].root_path, original_root);
+    assert_eq!(
+        inspection.repository_groups[0].repository_group_id,
+        group.repository_group_id
+    );
+    let doctor = config.doctor_repository_catalog().unwrap();
+    assert!(!doctor.healthy);
+    assert_eq!(doctor.repository_group_count, 1);
+    assert_eq!(
+        doctor.repository_groups[0].status,
+        CatalogRepositoryGroupStatus::Missing
+    );
+
+    let unknown_member = RepositoryId::new();
+    assert_eq!(
+        config
+            .update_repository_group(
+                group.repository_group_id,
+                Some(&replacement_root),
+                Some(&[unknown_member]),
+            )
+            .unwrap_err()
+            .kind(),
+        ErrorKind::RepositoryNotConfigured
+    );
+    let updated = config
+        .update_repository_group(
+            group.repository_group_id,
+            Some(&replacement_root),
+            Some(&[first_id, second_id]),
+        )
+        .unwrap();
+    assert!(updated.changed);
+    assert_eq!(updated.repository_group.root_path, replacement_root);
+    assert_eq!(
+        updated
+            .repository_group
+            .member_repository_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([first_id, second_id])
+    );
+    let retry = config
+        .update_repository_group(
+            group.repository_group_id,
+            Some(&replacement_root),
+            Some(&[first_id, second_id]),
+        )
+        .unwrap();
+    assert!(!retry.changed);
+
+    let moved_replacement = temporary.path().join("moved replacement group");
+    fs::rename(&replacement_root, &moved_replacement).unwrap();
+    let removed = config
+        .remove_repository_group(group.repository_group_id)
+        .unwrap();
+    assert!(removed.removed);
+    let removal_retry = config
+        .remove_repository_group(group.repository_group_id)
+        .unwrap();
+    assert!(!removal_retry.removed);
+    let repaired = config.repository_catalog().unwrap();
+    assert!(repaired.repository_groups.is_empty());
+    assert_eq!(repaired.repositories.len(), 2);
+    assert!(moved_original.exists());
+    assert!(moved_replacement.exists());
 }
 
 #[test]

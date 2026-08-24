@@ -76,6 +76,10 @@ impl Options {
         })
     }
 
+    pub(crate) fn provided(&self, name: &str) -> bool {
+        self.values.contains_key(name)
+    }
+
     pub(crate) fn has(&self, name: &str) -> bool {
         self.switches.contains(name)
     }

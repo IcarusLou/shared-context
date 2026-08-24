@@ -83,6 +83,20 @@ pub struct RepositoryGroupCatalogAddOutcome {
     pub created: bool,
 }
 
+/// Result of one atomic, semantically idempotent `RepositoryGroup` update.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RepositoryGroupCatalogUpdateOutcome {
+    pub repository_group: RepositoryGroupCatalogEntry,
+    pub changed: bool,
+}
+
+/// Result of one atomic, semantically idempotent `RepositoryGroup` removal.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RepositoryGroupCatalogRemoveOutcome {
+    pub repository_group_id: RepositoryGroupId,
+    pub removed: bool,
+}
+
 /// Local `SessionStart` authorization decision for one canonical startup directory.
 ///
 /// Absolute paths are backend-only event-attribution metadata. Callers must not
@@ -141,13 +155,33 @@ pub enum CatalogCheckoutStatus {
     NotGitRoot,
 }
 
+/// Current validation state of one explicitly configured `RepositoryGroup` root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogRepositoryGroupStatus {
+    Available,
+    Missing,
+    Symlink,
+    NotDirectory,
+    NonCanonical,
+}
+
+/// CLI-only structural Catalog view. This is never an activation authorization input.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RepositoryCatalogInspection {
+    pub catalog: RepositoryCatalogSnapshot,
+    pub repository_groups: Vec<RepositoryCatalogGroupCheck>,
+}
+
 /// Bounded explicit Catalog diagnosis.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RepositoryCatalogDoctorReport {
     pub healthy: bool,
     pub repository_count: usize,
     pub checkout_count: usize,
+    pub repository_group_count: usize,
     pub checkouts: Vec<RepositoryCatalogCheckoutCheck>,
+    pub repository_groups: Vec<RepositoryCatalogGroupCheck>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -155,6 +189,14 @@ pub struct RepositoryCatalogCheckoutCheck {
     pub repository_id: RepositoryId,
     pub checkout_path: PathBuf,
     pub status: CatalogCheckoutStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RepositoryCatalogGroupCheck {
+    pub repository_group_id: RepositoryGroupId,
+    pub root_path: PathBuf,
+    pub member_repository_ids: Vec<RepositoryId>,
+    pub status: CatalogRepositoryGroupStatus,
 }
 
 /// Locked, atomic manager for `config.toml` under one installation root.
@@ -275,6 +317,30 @@ impl UserConfigStore {
         let outcome = self
             .read_document()
             .map(|document| catalog_snapshot(&document));
+        finish_locked(&lock, outcome)
+    }
+
+    /// Reads a narrow structural view for local CLI list, doctor, and repair flows.
+    ///
+    /// Unlike [`Self::repository_catalog`], a missing or drifted Group root is
+    /// represented as a typed status rather than failing the whole read. The
+    /// returned Snapshot must never be used to authorize an Agent session.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or unexpected filesystem errors.
+    pub fn inspect_repository_catalog(&self) -> Result<RepositoryCatalogInspection> {
+        let lock = open_private_file(&self.lock_path)?;
+        FileExt::lock_shared(&lock).map_err(io_error("lock config.lock shared"))?;
+        let outcome = (|| {
+            let document = self.read_document_for_repair()?;
+            let catalog = catalog_snapshot(&document);
+            let repository_groups = inspect_repository_groups(&catalog.repository_groups)?;
+            Ok(RepositoryCatalogInspection {
+                catalog,
+                repository_groups,
+            })
+        })();
         finish_locked(&lock, outcome)
     }
 
@@ -521,6 +587,113 @@ impl UserConfigStore {
         finish_locked(&lock, outcome)
     }
 
+    /// Atomically replaces the root and/or exact membership of one configured Group.
+    ///
+    /// This is an explicit repair path: it can structurally read a Catalog whose
+    /// current Group root has drifted, while fully validating the resulting Group
+    /// before writing it back. No Repository identity is created or removed.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown Group, an empty update, unsafe replacement values,
+    /// unknown members, conflicting roots, or members without an available
+    /// checkout strictly below the resulting root.
+    pub fn update_repository_group(
+        &self,
+        repository_group_id: RepositoryGroupId,
+        replacement_root: Option<&Path>,
+        replacement_member_repository_ids: Option<&[RepositoryId]>,
+    ) -> Result<RepositoryGroupCatalogUpdateOutcome> {
+        if replacement_root.is_none() && replacement_member_repository_ids.is_none() {
+            return Err(invalid(
+                "RepositoryGroup update requires --root and/or member Repository identities",
+            ));
+        }
+        let replacement_root = replacement_root
+            .map(validate_repository_group_root)
+            .transpose()?;
+        let replacement_members = replacement_member_repository_ids
+            .map(validate_repository_group_member_input)
+            .transpose()?;
+
+        let lock = self.lock()?;
+        let outcome = (|| {
+            let mut document = self.read_document_for_repair()?;
+            let index = document
+                .repository_groups
+                .iter()
+                .position(|group| group.id == repository_group_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::RepositoryNotConfigured,
+                        format!("RepositoryGroup is not configured: {repository_group_id}"),
+                    )
+                })?;
+            let existing = document.repository_groups[index].clone();
+            let root_path = replacement_root.unwrap_or_else(|| PathBuf::from(&existing.root));
+            validate_repository_group_root(&root_path)?;
+            let members = replacement_members.unwrap_or(existing.members);
+            validate_repository_group_members(&document.repositories, &root_path, &members)?;
+            validate_current_repository_group_members(
+                &document.repositories,
+                &root_path,
+                &members,
+            )?;
+            let root = path_text(&root_path)?;
+            let changed = document.repository_groups[index].root != root
+                || document.repository_groups[index].members != members;
+            document.repository_groups[index].root = root;
+            document.repository_groups[index].members = members;
+            validate_document_structure(&document, &self.repository)?;
+            if changed {
+                self.write_document(&document)?;
+            }
+            let repository_group = catalog_snapshot(&document)
+                .repository_groups
+                .into_iter()
+                .find(|group| group.repository_group_id == repository_group_id)
+                .ok_or_else(|| invariant("updated RepositoryGroup disappeared before return"))?;
+            Ok(RepositoryGroupCatalogUpdateOutcome {
+                repository_group,
+                changed,
+            })
+        })();
+        finish_locked(&lock, outcome)
+    }
+
+    /// Atomically removes only one local `RepositoryGroup` activation entry.
+    ///
+    /// Repeating removal of the same ID succeeds with `removed=false`. This
+    /// operation never deletes Repository identities, checkouts, Runtime,
+    /// Capture, durable Context, or files below the configured root.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or atomic-write failures.
+    pub fn remove_repository_group(
+        &self,
+        repository_group_id: RepositoryGroupId,
+    ) -> Result<RepositoryGroupCatalogRemoveOutcome> {
+        let lock = self.lock()?;
+        let outcome = (|| {
+            let mut document = self.read_document_for_repair()?;
+            let before = document.repository_groups.len();
+            document
+                .repository_groups
+                .retain(|group| group.id != repository_group_id);
+            let removed = document.repository_groups.len() != before;
+            validate_document_structure(&document, &self.repository)?;
+            if removed {
+                self.write_document(&document)?;
+            }
+            Ok(RepositoryGroupCatalogRemoveOutcome {
+                repository_group_id,
+                removed,
+            })
+        })();
+        finish_locked(&lock, outcome)
+    }
+
     /// Validates every configured checkout without changing Catalog identity.
     ///
     /// # Errors
@@ -528,7 +701,8 @@ impl UserConfigStore {
     /// Returns configuration or local process errors. Per-checkout drift is
     /// represented in the typed report.
     pub fn doctor_repository_catalog(&self) -> Result<RepositoryCatalogDoctorReport> {
-        let catalog = self.repository_catalog()?;
+        let inspection = self.inspect_repository_catalog()?;
+        let catalog = inspection.catalog;
         let mut checkouts = Vec::new();
         for repository in &catalog.repositories {
             for path in &repository.checkout_paths {
@@ -541,12 +715,18 @@ impl UserConfigStore {
         }
         let healthy = checkouts
             .iter()
-            .all(|checkout| checkout.status == CatalogCheckoutStatus::Available);
+            .all(|checkout| checkout.status == CatalogCheckoutStatus::Available)
+            && inspection
+                .repository_groups
+                .iter()
+                .all(|group| group.status == CatalogRepositoryGroupStatus::Available);
         Ok(RepositoryCatalogDoctorReport {
             healthy,
             repository_count: catalog.repositories.len(),
             checkout_count: checkouts.len(),
+            repository_group_count: inspection.repository_groups.len(),
             checkouts,
+            repository_groups: inspection.repository_groups,
         })
     }
 
@@ -564,6 +744,12 @@ impl UserConfigStore {
     }
 
     fn read_document(&self) -> Result<ConfigDocument> {
+        let document = self.read_document_for_repair()?;
+        validate_repository_group_roots(&document.repository_groups)?;
+        Ok(document)
+    }
+
+    fn read_document_for_repair(&self) -> Result<ConfigDocument> {
         reject_symlink(&self.config_path)?;
         let text = fs::read_to_string(&self.config_path).map_err(io_error("read config.toml"))?;
         let document: ConfigDocument = toml::from_str(&text).map_err(|error| {
@@ -572,27 +758,13 @@ impl UserConfigStore {
                 format!("parse {}: {error}", self.config_path.display()),
             )
         })?;
-        self.validate_document(&document)?;
+        validate_document_structure(&document, &self.repository)?;
         Ok(document)
     }
 
     fn validate_document(&self, document: &ConfigDocument) -> Result<()> {
-        if document.version != CONFIG_VERSION {
-            return Err(invariant(format!(
-                "unsupported config version {}",
-                document.version
-            )));
-        }
-        let expected = path_text(&self.repository)?;
-        if document.store != expected {
-            return Err(invariant(format!(
-                "config must contain exactly the fixed Store {}; found {}",
-                self.repository.display(),
-                document.store
-            )));
-        }
-        validate_repository_documents(&document.repositories)?;
-        validate_repository_group_documents(&document.repository_groups, &document.repositories)
+        validate_document_structure(document, &self.repository)?;
+        validate_repository_group_roots(&document.repository_groups)
     }
 
     fn write_document(&self, document: &ConfigDocument) -> Result<()> {
@@ -871,6 +1043,28 @@ fn catalog_snapshot(document: &ConfigDocument) -> RepositoryCatalogSnapshot {
     }
 }
 
+fn validate_document_structure(document: &ConfigDocument, repository: &Path) -> Result<()> {
+    if document.version != CONFIG_VERSION {
+        return Err(invariant(format!(
+            "unsupported config version {}",
+            document.version
+        )));
+    }
+    let expected = path_text(repository)?;
+    if document.store != expected {
+        return Err(invariant(format!(
+            "config must contain exactly the fixed Store {}; found {}",
+            repository.display(),
+            document.store
+        )));
+    }
+    validate_repository_documents(&document.repositories)?;
+    validate_repository_group_documents_structure(
+        &document.repository_groups,
+        &document.repositories,
+    )
+}
+
 fn validate_repository_documents(repositories: &[RepositoryConfigDocument]) -> Result<()> {
     if repositories.len() > MAX_CATALOG_REPOSITORIES {
         return Err(invariant(format!(
@@ -913,7 +1107,7 @@ fn validate_repository_documents(repositories: &[RepositoryConfigDocument]) -> R
     Ok(())
 }
 
-fn validate_repository_group_documents(
+fn validate_repository_group_documents_structure(
     groups: &[RepositoryGroupConfigDocument],
     repositories: &[RepositoryConfigDocument],
 ) -> Result<()> {
@@ -938,17 +1132,7 @@ fn validate_repository_group_documents(
             )));
         }
         let root = Path::new(&group.root);
-        validate_repository_group_root(root).map_err(|error| {
-            Error::new(
-                error.kind(),
-                format!(
-                    "RepositoryGroup {} configured root {} is invalid: {}",
-                    group.id,
-                    root.display(),
-                    error.message()
-                ),
-            )
-        })?;
+        validate_absolute_path(root, "RepositoryGroup configured root")?;
         if group.members.is_empty() {
             return Err(invalid(format!(
                 "RepositoryGroup {} requires at least one member Repository",
@@ -977,6 +1161,65 @@ fn validate_repository_group_documents(
         validate_repository_group_members(repositories, root, &group.members)?;
     }
     Ok(())
+}
+
+fn validate_repository_group_roots(groups: &[RepositoryGroupConfigDocument]) -> Result<()> {
+    for group in groups {
+        let root = Path::new(&group.root);
+        validate_repository_group_root(root).map_err(|error| {
+            Error::new(
+                error.kind(),
+                format!(
+                    "RepositoryGroup {} configured root {} is invalid: {}",
+                    group.id,
+                    root.display(),
+                    error.message()
+                ),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_repository_group_member_input(
+    member_repository_ids: &[RepositoryId],
+) -> Result<Vec<RepositoryId>> {
+    if member_repository_ids.is_empty() {
+        return Err(invalid(
+            "RepositoryGroup requires at least one member Repository",
+        ));
+    }
+    if member_repository_ids.len() > MAX_REPOSITORIES_PER_GROUP {
+        return Err(invalid(format!(
+            "RepositoryGroup accepts at most {MAX_REPOSITORIES_PER_GROUP} members"
+        )));
+    }
+    let members = member_repository_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if members.len() != member_repository_ids.len() {
+        return Err(invalid(
+            "RepositoryGroup member Repository identities must be unique",
+        ));
+    }
+    Ok(members.into_iter().collect())
+}
+
+fn inspect_repository_groups(
+    groups: &[RepositoryGroupCatalogEntry],
+) -> Result<Vec<RepositoryCatalogGroupCheck>> {
+    groups
+        .iter()
+        .map(|group| {
+            Ok(RepositoryCatalogGroupCheck {
+                repository_group_id: group.repository_group_id,
+                root_path: group.root_path.clone(),
+                member_repository_ids: group.member_repository_ids.clone(),
+                status: repository_group_root_status(&group.root_path)?,
+            })
+        })
+        .collect()
 }
 
 fn validate_repository_group_members(
@@ -1029,6 +1272,29 @@ fn validate_git_checkout_root(path: &Path) -> Result<PathBuf> {
 fn validate_repository_group_root(path: &Path) -> Result<PathBuf> {
     validate_canonical_directory(path, "RepositoryGroup root")?;
     Ok(path.to_path_buf())
+}
+
+fn repository_group_root_status(path: &Path) -> Result<CatalogRepositoryGroupStatus> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CatalogRepositoryGroupStatus::Missing);
+        }
+        Err(error) => return Err(io_error("inspect RepositoryGroup root")(error)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(CatalogRepositoryGroupStatus::Symlink);
+    }
+    if !metadata.is_dir() {
+        return Ok(CatalogRepositoryGroupStatus::NotDirectory);
+    }
+    let canonical =
+        fs::canonicalize(path).map_err(io_error("canonicalize RepositoryGroup root"))?;
+    Ok(if canonical == path {
+        CatalogRepositoryGroupStatus::Available
+    } else {
+        CatalogRepositoryGroupStatus::NonCanonical
+    })
 }
 
 fn validate_canonical_directory(path: &Path, field: &str) -> Result<()> {

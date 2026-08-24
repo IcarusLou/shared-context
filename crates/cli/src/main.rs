@@ -25,8 +25,8 @@ use sctx_domain::{
     Applicability, CandidateReviewStatus, ConflictParticipant, ConflictResolutionDraft,
     ConflictResolutionResult, ContextGovernanceStatus, ContextId, ContextKind,
     ContextRevisionDraft, DomainProjection, Error, ErrorKind, EvidenceSnapshotDraft, EvidenceType,
-    ExternalSessionLocator, IntentSnapshot, PublicationAction, PublicationDraft, RepositoryId,
-    ResolutionOutcome, Result, ReviewDraft, ReviewSummary, ReviewVerdict, RevisionId,
+    ExternalSessionLocator, IntentSnapshot, PublicationAction, PublicationDraft, RepositoryGroupId,
+    RepositoryId, ResolutionOutcome, Result, ReviewDraft, ReviewSummary, ReviewVerdict, RevisionId,
     SemanticConflictDraft, SpaceId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkEpisodeStatus,
 };
 use sctx_event_schema::{Event, EventPayload};
@@ -36,7 +36,8 @@ use sctx_index::{
 };
 use sctx_local_state::{
     Breadcrumb, BreadcrumbKind, CaptureDiagnosticKind, CaptureStore, CaptureTaskOwner,
-    CatalogCheckoutStatus, RepositoryCatalogSnapshot, UserConfigStore,
+    CatalogCheckoutStatus, CatalogRepositoryGroupStatus, RepositoryCatalogSnapshot,
+    UserConfigStore,
 };
 use sctx_mcp::{
     ArtifactFocusQuery, AssociationExplainInput, AssociationRebuildInput, CandidateAnalyzeInput,
@@ -68,6 +69,7 @@ Commands:
   semantic conflict open|resolve
   task context|artifact-focus|checkpoint|intent update|signal supersede
   repository add|list|doctor|scan
+  repository group add|update|remove|list|doctor
   engineering-reference record
   association explain|rebuild
   search
@@ -1984,7 +1986,7 @@ fn run_task_context(args: &[String], json_output: bool) -> Result<()> {
 fn run_repository(args: &[String], json_output: bool) -> Result<()> {
     let [command, rest @ ..] = args else {
         return Err(invalid(
-            "Usage: sctx repository add|list|doctor|scan [OPTIONS]",
+            "Usage: sctx repository add|list|doctor|scan|group [OPTIONS]",
         ));
     };
     let root = installation_root()?;
@@ -2012,42 +2014,9 @@ fn run_repository(args: &[String], json_output: bool) -> Result<()> {
                 json_output,
             )
         }
-        "list" => {
-            let options = Options::parse(rest, &[])?;
-            options.allow_only(&[], &[])?;
-            let config = UserConfigStore::initialize(&root)?;
-            let catalog = config.repository_catalog()?;
-            let sync = sctx_mcp::sync_repository_catalog_at_root(&root)?;
-            let metadata = repository_command_metadata(&root)?;
-            emit(
-                "repository.list",
-                &metadata,
-                json!({"repositories": catalog.repositories, "registry": sync}),
-                json_output,
-            )
-        }
-        "doctor" => {
-            let options = Options::parse(rest, &[])?;
-            options.allow_only(&[], &[])?;
-            let config = UserConfigStore::initialize(&root)?;
-            let report = config.doctor_repository_catalog()?;
-            let syncable = report.checkouts.iter().all(|checkout| {
-                matches!(
-                    checkout.status,
-                    CatalogCheckoutStatus::Available | CatalogCheckoutStatus::Missing
-                )
-            });
-            let sync = syncable
-                .then(|| sctx_mcp::sync_repository_catalog_at_root(&root))
-                .transpose()?;
-            let metadata = repository_command_metadata(&root)?;
-            emit(
-                "repository.doctor",
-                &metadata,
-                json!({"catalog": report, "registry": sync}),
-                json_output,
-            )
-        }
+        "list" => run_repository_list(rest, json_output, &root),
+        "doctor" => run_repository_doctor(rest, json_output, &root),
+        "group" => run_repository_group(rest, json_output, &root),
         "scan" => {
             let options = Options::parse(rest, &[])?;
             options.allow_only(&["--checkout-path", "--path", "--max-artifacts"], &[])?;
@@ -2075,14 +2044,190 @@ fn run_repository(args: &[String], json_output: bool) -> Result<()> {
             )
         }
         _ => Err(invalid(
-            "repository command must be add, list, doctor, or scan",
+            "repository command must be add, list, doctor, scan, or group",
         )),
     }
+}
+
+fn run_repository_list(args: &[String], json_output: bool, root: &Path) -> Result<()> {
+    let options = Options::parse(args, &[])?;
+    options.allow_only(&[], &[])?;
+    let inspection = UserConfigStore::open_existing(root)?.inspect_repository_catalog()?;
+    let sync = inspection
+        .repository_groups
+        .iter()
+        .all(|group| group.status == CatalogRepositoryGroupStatus::Available)
+        .then(|| sctx_mcp::sync_repository_catalog_at_root(root))
+        .transpose()?;
+    let metadata = repository_repair_command_metadata(root)?;
+    emit(
+        "repository.list",
+        &metadata,
+        json!({
+            "repositories": inspection.catalog.repositories,
+            "repository_groups": inspection.repository_groups,
+            "registry": sync,
+        }),
+        json_output,
+    )
+}
+
+fn run_repository_doctor(args: &[String], json_output: bool, root: &Path) -> Result<()> {
+    let options = Options::parse(args, &[])?;
+    options.allow_only(&[], &[])?;
+    let report = UserConfigStore::open_existing(root)?.doctor_repository_catalog()?;
+    let syncable = report.checkouts.iter().all(|checkout| {
+        matches!(
+            checkout.status,
+            CatalogCheckoutStatus::Available | CatalogCheckoutStatus::Missing
+        )
+    }) && report
+        .repository_groups
+        .iter()
+        .all(|group| group.status == CatalogRepositoryGroupStatus::Available);
+    let sync = syncable
+        .then(|| sctx_mcp::sync_repository_catalog_at_root(root))
+        .transpose()?;
+    let metadata = repository_repair_command_metadata(root)?;
+    emit(
+        "repository.doctor",
+        &metadata,
+        json!({"catalog": report, "registry": sync}),
+        json_output,
+    )
+}
+
+fn run_repository_group(args: &[String], json_output: bool, root: &Path) -> Result<()> {
+    let [command, rest @ ..] = args else {
+        return Err(invalid(
+            "Usage: sctx repository group add|update|remove|list|doctor [OPTIONS]",
+        ));
+    };
+    match command.as_str() {
+        "add" => {
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(&["--root", "--member-repository-id"], &[])?;
+            let group_root = PathBuf::from(options.required("--root")?);
+            let members = parse_repository_group_members(&options)?;
+            let outcome =
+                UserConfigStore::initialize(root)?.add_repository_group(&group_root, &members)?;
+            let metadata = repository_command_metadata(root)?;
+            emit(
+                "repository.group.add",
+                &metadata,
+                json!({"catalog": outcome}),
+                json_output,
+            )
+        }
+        "update" => {
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(
+                &["--repository-group-id", "--root", "--member-repository-id"],
+                &[],
+            )?;
+            let repository_group_id = parse_id::<RepositoryGroupId>(
+                options.required("--repository-group-id")?,
+                "RepositoryGroup ID",
+            )?;
+            let replacement_root = options.optional("--root")?.map(PathBuf::from);
+            let replacement_members = options
+                .provided("--member-repository-id")
+                .then(|| parse_repository_group_members(&options))
+                .transpose()?;
+            let outcome = UserConfigStore::open_existing(root)?.update_repository_group(
+                repository_group_id,
+                replacement_root.as_deref(),
+                replacement_members.as_deref(),
+            )?;
+            let metadata = repository_repair_command_metadata(root)?;
+            emit(
+                "repository.group.update",
+                &metadata,
+                json!({"catalog": outcome}),
+                json_output,
+            )
+        }
+        "remove" => {
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(&["--repository-group-id"], &[])?;
+            let repository_group_id = parse_id::<RepositoryGroupId>(
+                options.required("--repository-group-id")?,
+                "RepositoryGroup ID",
+            )?;
+            let outcome = UserConfigStore::open_existing(root)?
+                .remove_repository_group(repository_group_id)?;
+            let metadata = repository_repair_command_metadata(root)?;
+            emit(
+                "repository.group.remove",
+                &metadata,
+                json!({"catalog": outcome}),
+                json_output,
+            )
+        }
+        "list" => run_repository_group_list(rest, json_output, root),
+        "doctor" => run_repository_group_doctor(rest, json_output, root),
+        _ => Err(invalid(
+            "repository group command must be add, update, remove, list, or doctor",
+        )),
+    }
+}
+
+fn run_repository_group_list(args: &[String], json_output: bool, root: &Path) -> Result<()> {
+    let options = Options::parse(args, &[])?;
+    options.allow_only(&[], &[])?;
+    let inspection = UserConfigStore::open_existing(root)?.inspect_repository_catalog()?;
+    let metadata = repository_repair_command_metadata(root)?;
+    emit(
+        "repository.group.list",
+        &metadata,
+        json!({"repository_groups": inspection.repository_groups}),
+        json_output,
+    )
+}
+
+fn run_repository_group_doctor(args: &[String], json_output: bool, root: &Path) -> Result<()> {
+    let options = Options::parse(args, &[])?;
+    options.allow_only(&[], &[])?;
+    let report = UserConfigStore::open_existing(root)?.doctor_repository_catalog()?;
+    let healthy = report
+        .repository_groups
+        .iter()
+        .all(|group| group.status == CatalogRepositoryGroupStatus::Available);
+    let metadata = repository_repair_command_metadata(root)?;
+    emit(
+        "repository.group.doctor",
+        &metadata,
+        json!({
+            "healthy": healthy,
+            "repository_group_count": report.repository_group_count,
+            "repository_groups": report.repository_groups,
+        }),
+        json_output,
+    )
+}
+
+fn parse_repository_group_members(options: &Options) -> Result<Vec<RepositoryId>> {
+    options
+        .many("--member-repository-id")
+        .into_iter()
+        .map(|value| parse_id::<RepositoryId>(value, "member Repository ID"))
+        .collect()
 }
 
 fn repository_command_metadata(root: &Path) -> Result<IndexMetadata> {
     let store = GitStore::initialize(root)?;
     Ok(ProjectionIndex::for_store(&store).synchronize()?.metadata)
+}
+
+fn repository_repair_command_metadata(root: &Path) -> Result<IndexMetadata> {
+    if !root.join("repository").exists() {
+        return repository_command_metadata(root);
+    }
+    Ok(
+        ProjectionIndex::new(root.join("repository"), root.join("state"))
+            .synchronize()?
+            .metadata,
+    )
 }
 
 fn run_engineering_reference(args: &[String], json_output: bool) -> Result<()> {
