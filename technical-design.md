@@ -23,6 +23,17 @@
 
 当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订承载 `WorkingIntentSnapshot` 的 `TaskIntentRevision`，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示。PostToolUse 的 File observation 只形成带 Session/optional Task owner 的 redacted Capture Breadcrumb，可识别测试工具只形成非事实、非定位的 TestOutcome TaskSignal；TaskSignal 可影响 Working Intent retrieval，但不是工程 Evidence。Hook 不运行 Git discovery、Scanner、Registry sync、Graph rebuild、Focus 提交、Episode open/ingest，也不伪造 Claim。PreCompact/TurnStop 只能关闭已有 current-Intent Checkpoint 的 Episode并调用共享 Builder。显式 Graph 工具完成 bounded scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。Candidate 只由 closed WorkEpisode 的 Builder 调用内部 submission service 创建，公开面仅提供 list/get/discard/confirm。
 
+### 1.2 Repository 范围激活基础（Mew #180）
+
+当前已实现的是推理前激活所需的本地基础组件，尚未接入 Agent Hook、MCP 或 Skill：
+
+- `RepositoryGroup` 是产品私有 `config.toml` 中的显式本机配置。Group root、成员 Repository 与 `RepositoryGroupId` 由 typed CLI 进行 add/update/remove/list/doctor；配置与修复不会在业务仓库中创建项目级 Agent 文件。
+- `ScopeResolver` 对 canonical Session 启动目录返回 `Direct`、`Group` 或 `Disabled`。`Direct` 使用已注册 checkout 的 longest-prefix 并优先于 Group；`Group` 只匹配显式 root 的精确相等；任意祖先目录和未注册 sibling 都是 `Disabled`。
+- `AuthorizedSessionScope` 是按 `ExternalSessionLocator` 隔离、Catalog revision 约束、最长 24 小时的产品私有 lease。文件名只含 locator digest，记录只含 typed decision、允许的 RepositoryId、Catalog revision 与 TTL；不保存 checkout/Group root、Prompt、transcript、tool output、report 或业务正文。
+- Catalog 变化、lease 过期、locator 不匹配或本地状态不安全时只产生非授权结果；scope 解析与 lease 读写不运行 Git 或 Repository scan。
+
+这些组件当前只是后续 SessionStart 集成的授权 seam。代码尚未在 SessionStart 创建 lease，尚未向 Agent 注入 activation hint，也尚未用 lease 保护 Hook 生命周期或 MCP 工具；完整 Skill 条件加载与实际 token 节省同样尚未实现。
+
 ## 2. 背景与目标
 
 本项目希望让 Agent 在工程过程中形成的有效理解、判断和验证，低成本地沉淀为后续任务可以直接继承的工程 Context，从而降低跨端、跨仓库、跨 Agent 和跨 Session 的冷启动成本。

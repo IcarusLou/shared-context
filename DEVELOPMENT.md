@@ -26,6 +26,8 @@
 - 无 Space 的 `ContextCandidate` 领域类型已经存在；只有 closed WorkEpisode 的 Candidate Builder 可调用内部 #117 submission service，Builder Candidate 仍不可自动注入。
 - 既有 Git Writer、事件校验、SQLite 投影、Context 生命周期、CLI/MCP、Agent Adapter、安装器和 NPM 分发能力继续作为 M1 的基础设施。
 
+Repository 范围激活的本地基础（Mew #181–#183）也已实现：产品私有 Catalog 支持显式 `RepositoryGroup` 管理与漂移修复，纯 `ScopeResolver` 只把注册 checkout 内目录判为 `Direct`、显式 Group exact root 判为 `Group`，其他目录判为 `Disabled`；`AuthorizedSessionScopeStore` 以 locator digest 文件名保存短期、Catalog-bound、无业务正文的 typed lease。解析与 lease 热路径不运行 Git 或 Repository scan。该基础尚未接入 SessionStart Hook、activation hint、Hook lifecycle、MCP authorization 或完整 Skill 条件加载，因此当前不得宣称未注册目录已经节省 token。
+
 以下能力**尚未实现**，不得在代码、测试报告或评审中宣称已经具备：
 
 - **团队同步：未实现** — Repository Catalog 是单机显式配置，不是团队事实或知识 Store。
@@ -64,6 +66,7 @@ cargo test --locked -p sctx-cli --test milestone_two_contract
 cargo test --locked -p sctx-cli --test milestone_three_contract
 cargo test --locked -p sctx-cli --test milestone_four_contract
 cargo test --locked -p sctx-cli --test hook_to_confirm_chain
+cargo test --locked -p sctx-cli --test repository_scope_foundation
 ```
 
 提交 `Cargo.lock`，确保 CLI workspace 的本地与 CI 构建使用相同依赖解析结果。

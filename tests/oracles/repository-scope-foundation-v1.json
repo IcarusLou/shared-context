@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "routing": [
+    {"case": "group_exact_root", "kind": "group", "allowed": ["nested", "outer"]},
+    {"case": "outer_checkout", "kind": "direct", "allowed": ["outer"]},
+    {"case": "nested_longest_prefix", "kind": "direct", "allowed": ["nested"]},
+    {"case": "arbitrary_ancestor", "kind": "disabled", "allowed": []},
+    {"case": "unregistered_sibling", "kind": "disabled", "allowed": []}
+  ],
+  "group_lifecycle": {
+    "add_created": [true, false],
+    "initial_group_count": 1,
+    "initial_status": "available",
+    "initial_doctor_healthy": true,
+    "membership_update_changed": [true, false],
+    "drift_status": "missing",
+    "repaired_status": "available",
+    "root_update_changed": [true, false],
+    "remove_removed": [true, false]
+  },
+  "lease": {
+    "decision_kinds": ["direct", "disabled", "group"],
+    "directory_mode": 448,
+    "record_mode": 384,
+    "ttl_seconds": 1,
+    "max_ttl_seconds": 86400,
+    "concurrent_semantic_changes": 1,
+    "forbidden_state_fragments": [
+      "PROMPT_CANARY_M1_Z8Q4",
+      "TRANSCRIPT_CANARY_M1_P7V2",
+      "TOOL_OUTPUT_CANARY_M1_C6N9",
+      "REPORT_CANARY_M1_K3D5",
+      "BUSINESS_BODY_CANARY_M1_H2W7",
+      "checkout_path",
+      "root_path",
+      "prompt",
+      "transcript",
+      "tool_output",
+      "report"
+    ]
+  }
+}
