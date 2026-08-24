@@ -127,6 +127,11 @@ opaque_id!(
     "Opaque identity of one logical source repository."
 );
 opaque_id!(
+    RepositoryGroupId,
+    "rpg_",
+    "Opaque identity of one explicitly configured local repository group."
+);
+opaque_id!(
     ReferenceId,
     "ref_",
     "Opaque identity of one persistent Engineering Reference observation."
@@ -260,9 +265,9 @@ mod tests {
     use super::{
         AgentCheckpointId, CandidateBuildId, CandidateId, CaptureId, CheckpointClaimId,
         ConfirmationId, ConflictId, ContextId, EventId, EvidenceId, ExternalSessionId,
-        PublicationId, ReferenceId, RepositoryId, ResolutionId, ReviewId, RevisionId, SignalId,
-        SpaceAssociationId, SpaceId, SpaceRecommendationId, SubmissionId, TaskId,
-        TaskIntentRevisionId, TaskSessionId, WorkEpisodeId, WorkObservationId,
+        PublicationId, ReferenceId, RepositoryGroupId, RepositoryId, ResolutionId, ReviewId,
+        RevisionId, SignalId, SpaceAssociationId, SpaceId, SpaceRecommendationId, SubmissionId,
+        TaskId, TaskIntentRevisionId, TaskSessionId, WorkEpisodeId, WorkObservationId,
     };
 
     #[test]
@@ -285,6 +290,10 @@ mod tests {
         assert!(SpaceId::from_str(&valid.replace("spc_", "ctx_")).is_err());
         assert!(SpaceId::from_str("spc_00000000-0000-1000-8000-000000000000").is_err());
         assert!(SpaceId::from_str("spc_00000000000040008000000000000000").is_err());
+
+        let repository_group = RepositoryGroupId::new().to_string();
+        assert!(RepositoryGroupId::from_str(&repository_group).is_ok());
+        assert!(RepositoryGroupId::from_str(&repository_group.replace("rpg_", "rpo_")).is_err());
     }
 
     #[test]
@@ -300,6 +309,7 @@ mod tests {
 
         assert_generated_id!(SpaceId::new(), "spc_");
         assert_generated_id!(RepositoryId::new(), "rpo_");
+        assert_generated_id!(RepositoryGroupId::new(), "rpg_");
         assert_generated_id!(ReferenceId::new(), "ref_");
         assert_generated_id!(TaskId::new(), "tsk_");
         assert_generated_id!(TaskSessionId::new(), "tss_");

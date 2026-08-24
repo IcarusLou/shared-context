@@ -42,9 +42,9 @@ pub use episode::{
 pub use ids::{
     AgentCheckpointId, CandidateBuildId, CandidateId, CaptureId, CheckpointClaimId, ConfirmationId,
     ConflictId, ContextId, EventId, EvidenceId, ExternalSessionId, IdParseError, PublicationId,
-    ReferenceId, RepositoryId, ResolutionId, ReviewId, RevisionId, SignalId, SpaceAssociationId,
-    SpaceId, SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId,
-    WorkEpisodeId, WorkObservationId,
+    ReferenceId, RepositoryGroupId, RepositoryId, ResolutionId, ReviewId, RevisionId, SignalId,
+    SpaceAssociationId, SpaceId, SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId,
+    TaskSessionId, WorkEpisodeId, WorkObservationId,
 };
 pub use model::{
     Applicability, ConflictParticipant, ConflictResolution, ConflictResolutionDraft,

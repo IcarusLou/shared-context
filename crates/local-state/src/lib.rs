@@ -17,8 +17,9 @@ pub use capture::{
     CaptureStoreDiagnosticKind, CaptureTaskOwner, CleanupReport, map_capture_artifacts,
 };
 pub use config::{
-    CatalogCheckoutStatus, RepositoryCatalogAddOutcome, RepositoryCatalogCheckoutCheck,
-    RepositoryCatalogDoctorReport, RepositoryCatalogEntry, RepositoryCatalogSnapshot,
+    ActivationScope, ActivationScopeDecision, CatalogCheckoutStatus, RepositoryCatalogAddOutcome,
+    RepositoryCatalogCheckoutCheck, RepositoryCatalogDoctorReport, RepositoryCatalogEntry,
+    RepositoryCatalogSnapshot, RepositoryGroupCatalogAddOutcome, RepositoryGroupCatalogEntry,
     ResolvedRepositoryPath, UserConfigStore,
 };
 pub use privacy::{PrivacyFinding, PrivacyFindingKind, PrivacyScan, PrivacyScanner, RedactedText};

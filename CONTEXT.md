@@ -172,6 +172,14 @@ _Avoid_: repository discovery, Workspace binding, team registry
 A stable identity for one logical source repository across its configured checkouts and worktrees in one local installation. Paths, basenames, remotes, common parents, branches, and Commits never create or merge this identity.
 _Avoid_: checkout path, repository URL as identity, inferred repository identity
 
+**RepositoryGroup**:
+A local, explicitly declared activation boundary containing a closed set of RepositoryIdentities that may participate together in one Agent session. It is neither repository discovery nor Workspace-to-ContextSpace routing or knowledge identity.
+_Avoid_: inferred repository family, Workspace Space, monorepo identity
+
+**ActivationScope**:
+The local authorization decision for whether Shared Context may participate in an Agent session: one Direct RepositoryIdentity, one explicitly matched RepositoryGroup, or Disabled. It never selects a ContextSpace or owns durable knowledge.
+_Avoid_: Workspace route, Active Space, repository discovery
+
 **EngineeringReference**:
 A persistent, non-authoritative observation that Context relates to an engineering object at one deterministic repository-relative ArtifactLocator. It survives resolution failure and never claims that a current Artifact was found.
 _Avoid_: resolved Artifact, file identity
