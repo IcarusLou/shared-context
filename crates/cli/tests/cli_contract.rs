@@ -422,7 +422,7 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
 }
 
 #[test]
-fn hook_capabilities_expose_version_fallback_and_codex_trust_action() {
+fn hook_capabilities_require_only_minimum_versions_and_codex_trust() {
     let harness = Harness::new();
     let output = harness.run(&[
         "hook",
@@ -452,10 +452,42 @@ fn hook_capabilities_expose_version_fallback_and_codex_trust_action() {
     let output = harness.run(&[
         "hook",
         "--agent",
+        "codex",
+        "--capabilities",
+        "--agent-version",
+        "codex-cli 0.149.1",
+        "--hook-available",
+        "true",
+        "--trust",
+        "confirmed",
+    ]);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["mode"], "verified_hooks");
+    assert_eq!(report["verified_version_requirement"], ">=0.147.0");
+
+    let output = harness.run(&[
+        "hook",
+        "--agent",
         "cursor",
         "--capabilities",
         "--agent-version",
         "99.0.0",
+        "--hook-available",
+        "true",
+    ]);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["mode"], "verified_hooks");
+    assert_eq!(report["verified_version_requirement"], ">=3.13.0");
+
+    let output = harness.run(&[
+        "hook",
+        "--agent",
+        "cursor",
+        "--capabilities",
+        "--agent-version",
+        "3.12.99",
         "--hook-available",
         "true",
     ]);

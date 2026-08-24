@@ -76,9 +76,19 @@ fn cursor_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_c
 }
 
 #[test]
-fn cursor_unknown_version_and_missing_hooks_keep_only_mcp_cli() {
+fn cursor_accepts_every_version_at_or_above_the_minimum() {
+    for version in ["3.13.0", "4.0.0"] {
+        let capability = capabilities(Some(version), true);
+        assert_eq!(capability.mode, CapabilityMode::VerifiedHooks);
+        assert!(capability.session_start);
+        assert_eq!(capability.verified_version_requirement, ">=3.13.0");
+    }
+}
+
+#[test]
+fn cursor_below_minimum_missing_version_or_hooks_keep_only_mcp_cli() {
     for capability in [
-        capabilities(Some("4.0.0"), true),
+        capabilities(Some("3.12.99"), true),
         capabilities(Some("3.13.10"), false),
         capabilities(None, true),
     ] {

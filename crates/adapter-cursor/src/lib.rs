@@ -1,8 +1,8 @@
 //! Strict Cursor hook payload/output adapter.
 //!
-//! Verified against Cursor 3.13.x. Unknown versions retain MCP + CLI while all Hook actions are
-//! disabled. `beforeSubmitPrompt` is translated for completeness but never drives Context Pack
-//! injection.
+//! Supports Cursor 3.13.0 and newer. Missing, malformed, or older versions retain MCP + CLI while
+//! all Hook actions are disabled. `beforeSubmitPrompt` is translated for completeness but never
+//! drives Context Pack injection.
 
 use std::path::PathBuf;
 
@@ -17,8 +17,8 @@ pub use sctx_domain::{Error, ErrorKind, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-/// Fail-closed window exercised by checked-in fixtures and the local Cursor build.
-pub const VERIFIED_VERSION_REQUIREMENT: &str = ">=3.13.0, <3.14.0";
+/// Minimum supported version exercised by checked-in fixtures and the local Cursor build.
+pub const VERIFIED_VERSION_REQUIREMENT: &str = ">=3.13.0";
 
 #[must_use]
 pub fn capabilities(version: Option<&str>, hook_available: bool) -> AgentCapabilities {

@@ -70,17 +70,27 @@ fn codex_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_cl
 }
 
 #[test]
-fn codex_unconfirmed_trust_is_action_required_and_unknown_versions_fallback() {
+fn codex_unconfirmed_trust_is_action_required() {
     let trust = capabilities(Some("0.147.0"), true, TrustState::Unconfirmed);
     assert_eq!(trust.mode, CapabilityMode::ActionRequired);
     assert!(trust.diagnostic.starts_with("ACTION REQUIRED:"));
     assert!(trust.mcp && trust.cli);
     assert!(!trust.session_start);
+}
 
-    let unknown = capabilities(Some("0.148.0"), true, TrustState::Confirmed);
-    assert_eq!(unknown.mode, CapabilityMode::McpCliFallback);
-    assert!(unknown.mcp && unknown.cli);
-    assert!(!unknown.prompt_aware_injection);
+#[test]
+fn codex_accepts_every_version_at_or_above_the_minimum() {
+    for version in ["codex-cli 0.147.0", "codex-cli 0.149.1"] {
+        let capability = capabilities(Some(version), true, TrustState::Confirmed);
+        assert_eq!(capability.mode, CapabilityMode::VerifiedHooks);
+        assert!(capability.prompt_aware_injection);
+        assert_eq!(capability.verified_version_requirement, ">=0.147.0");
+    }
+
+    let below_minimum = capabilities(Some("0.146.99"), true, TrustState::Confirmed);
+    assert_eq!(below_minimum.mode, CapabilityMode::McpCliFallback);
+    assert!(below_minimum.mcp && below_minimum.cli);
+    assert!(!below_minimum.prompt_aware_injection);
 }
 
 #[test]

@@ -151,7 +151,7 @@ impl AgentCapabilities {
     }
 }
 
-/// Evaluate a fail-closed version window and hook/trust prerequisites.
+/// Evaluate a minimum supported version requirement and hook/trust prerequisites.
 #[must_use]
 pub fn evaluate_capabilities(
     agent: AgentKind,
@@ -192,7 +192,7 @@ pub fn evaluate_capabilities(
             "Agent hooks are unavailable; using MCP + CLI fallback.".to_owned()
         }
         CapabilityMode::McpCliFallback => format!(
-            "Agent version {} is outside verified range {verified_requirement}; using MCP + CLI fallback.",
+            "Agent version {} does not meet minimum supported version requirement {verified_requirement}; using MCP + CLI fallback.",
             version_text.unwrap_or("unknown")
         ),
     };
@@ -596,23 +596,33 @@ mod tests {
     };
 
     #[test]
-    fn unknown_versions_and_untrusted_codex_fail_closed() {
-        let unknown = evaluate_capabilities(
+    fn versions_below_minimum_and_untrusted_codex_fail_closed() {
+        let below_minimum = evaluate_capabilities(
             AgentKind::Cursor,
-            Some("99.0.0"),
-            ">=3.13.0, <3.14.0",
+            Some("3.12.99"),
+            ">=3.13.0",
             true,
             TrustState::NotRequired,
             true,
         );
-        assert_eq!(unknown.mode, CapabilityMode::McpCliFallback);
-        assert!(unknown.mcp && unknown.cli);
-        assert!(!unknown.session_start);
+        assert_eq!(below_minimum.mode, CapabilityMode::McpCliFallback);
+        assert!(below_minimum.mcp && below_minimum.cli);
+        assert!(!below_minimum.session_start);
+
+        let newer = evaluate_capabilities(
+            AgentKind::Cursor,
+            Some("99.0.0"),
+            ">=3.13.0",
+            true,
+            TrustState::NotRequired,
+            true,
+        );
+        assert_eq!(newer.mode, CapabilityMode::VerifiedHooks);
 
         let trust = evaluate_capabilities(
             AgentKind::Codex,
             Some("codex-cli 0.147.0"),
-            ">=0.147.0, <0.148.0",
+            ">=0.147.0",
             true,
             TrustState::Unconfirmed,
             false,
@@ -680,7 +690,7 @@ mod tests {
         let cursor = evaluate_capabilities(
             AgentKind::Cursor,
             Some("3.13.10"),
-            ">=3.13.0, <3.14.0",
+            ">=3.13.0",
             true,
             TrustState::NotRequired,
             true,
@@ -688,7 +698,7 @@ mod tests {
         let codex = evaluate_capabilities(
             AgentKind::Codex,
             Some("0.147.0"),
-            ">=0.147.0, <0.148.0",
+            ">=0.147.0",
             true,
             TrustState::Confirmed,
             false,

@@ -1,6 +1,6 @@
 //! Strict Codex hook payload/output adapter.
 //!
-//! Verified against Codex CLI 0.147.x. Codex Hook Trust is explicit: an unconfirmed state is
+//! Supports Codex CLI 0.147.0 and newer. Codex Hook Trust is explicit: an unconfirmed state is
 //! reported as `ACTION REQUIRED` and disables all Hook capabilities while MCP + CLI remain usable.
 
 use std::path::PathBuf;
@@ -16,8 +16,8 @@ pub use sctx_domain::{Error, ErrorKind, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-/// Fail-closed window exercised by checked-in fixtures and the local Codex CLI build.
-pub const VERIFIED_VERSION_REQUIREMENT: &str = ">=0.147.0, <0.148.0";
+/// Minimum supported version exercised by checked-in fixtures and the local Codex CLI build.
+pub const VERIFIED_VERSION_REQUIREMENT: &str = ">=0.147.0";
 
 #[must_use]
 pub fn capabilities(
