@@ -123,6 +123,34 @@ pub enum CapabilityMode {
     ActionRequired,
 }
 
+/// Already-resolved, vendor-neutral activation input for pure Hook policy.
+///
+/// Repository and Group identities deliberately do not cross this seam. Local startup code owns
+/// scope resolution and supplies only the resulting policy state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolvedActivationDecision {
+    Disabled,
+    Direct,
+    Group,
+}
+
+impl ResolvedActivationDecision {
+    const fn is_enabled(self) -> bool {
+        matches!(self, Self::Direct | Self::Group)
+    }
+}
+
+/// The complete Agent-visible activation marker.
+///
+/// This fixed value contains no Repository identity, path, membership, Prompt, transcript,
+/// historical Context, or executable instruction. Direct and Group activation use the same value.
+pub const SHARED_CONTEXT_ACTIVATION_MARKER: &str = "<shared-context-active>Shared Context is authorized; the installed skill may be used.</shared-context-active>";
+
+/// Exact upper bound for Agent-visible activation policy output.
+pub const SHARED_CONTEXT_ACTIVATION_MARKER_MAX_BYTES: usize =
+    SHARED_CONTEXT_ACTIVATION_MARKER.len();
+const _: () = assert!(SHARED_CONTEXT_ACTIVATION_MARKER_MAX_BYTES <= 128);
+
 /// Explicit, serializable capability matrix for one detected Agent installation.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -306,6 +334,15 @@ pub struct CanonicalAgentAction {
 
 impl CanonicalAgentAction {
     #[must_use]
+    pub const fn neutral() -> Self {
+        Self {
+            task_operation: None,
+            breadcrumb: None,
+            system_message: None,
+        }
+    }
+
+    #[must_use]
     pub fn degraded(diagnostic: String) -> Self {
         Self {
             task_operation: None,
@@ -315,7 +352,12 @@ impl CanonicalAgentAction {
     }
 }
 
-/// Pure policy mapping shared by both vendor adapters.
+/// Legacy compatibility policy for the production caller that has not yet supplied a resolved
+/// activation decision.
+///
+/// This preserves the pre-activation contract only until the `SessionStart` integration migrates to
+/// [`plan_action_for_activation`]. It is not an authorization boundary and must not be used as
+/// evidence that a Session was activated. New callers must use the explicit API.
 #[must_use]
 pub fn plan_action(
     event: &CanonicalAgentEvent,
@@ -341,6 +383,42 @@ pub fn plan_action(
                     .to_owned(),
             ),
         },
+        _ => plan_enabled_action(event, capabilities),
+    }
+}
+
+/// Pure policy mapping shared by both vendor adapters after local Session scope resolution.
+///
+/// This function does no I/O and cannot inspect Repository Catalog, lease storage, `SQLite`, the
+/// filesystem, Git, Prompt text, transcript content, or historical Context. Enabled behavior
+/// requires an explicit [`ResolvedActivationDecision::Direct`] or
+/// [`ResolvedActivationDecision::Group`] input.
+#[must_use]
+pub fn plan_action_for_activation(
+    event: &CanonicalAgentEvent,
+    capabilities: &AgentCapabilities,
+    activation: ResolvedActivationDecision,
+) -> CanonicalAgentAction {
+    if !activation.is_enabled() {
+        return CanonicalAgentAction::neutral();
+    }
+    if !capabilities.hooks_verified() {
+        return CanonicalAgentAction::degraded(capabilities.diagnostic.clone());
+    }
+    plan_enabled_action(event, capabilities)
+}
+
+fn plan_enabled_action(
+    event: &CanonicalAgentEvent,
+    capabilities: &AgentCapabilities,
+) -> CanonicalAgentAction {
+    match event {
+        CanonicalAgentEvent::SessionStart { .. } => CanonicalAgentAction {
+            task_operation: None,
+            breadcrumb: None,
+            system_message: Some(SHARED_CONTEXT_ACTIVATION_MARKER.to_owned()),
+        },
+        CanonicalAgentEvent::PromptSubmit { .. } => CanonicalAgentAction::neutral(),
         CanonicalAgentEvent::PostToolUse {
             context,
             tool_name,
@@ -680,68 +758,87 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
-    fn lifecycle_policy_never_infers_task_intent_from_prompt_envelopes() {
-        let context = AgentEventContext {
-            session_id: "session".to_owned(),
-            cwd: PathBuf::from("/workspace"),
-            workspace_roots: vec![PathBuf::from("/workspace")],
-        };
-        let cursor = evaluate_capabilities(
-            AgentKind::Cursor,
-            Some("3.13.10"),
-            ">=3.13.0",
-            true,
-            TrustState::NotRequired,
-            true,
-        );
-        let codex = evaluate_capabilities(
-            AgentKind::Codex,
-            Some("0.147.0"),
-            ">=0.147.0",
-            true,
-            TrustState::Confirmed,
-            false,
-        );
-        let start = CanonicalAgentEvent::SessionStart {
-            context: context.clone(),
-        };
-        let start_action = plan_action(&start, &cursor);
-        assert!(start_action.task_operation.is_none());
-        assert!(
-            start_action
-                .system_message
-                .as_deref()
-                .is_some_and(|message| message.contains("MCP and CLI"))
-        );
-        let prompt = CanonicalAgentEvent::PromptSubmit {
-            context: context.clone(),
-            prompt: "task".to_owned(),
-        };
-        assert!(plan_action(&prompt, &cursor).task_operation.is_none());
-        let prompt_action = plan_action(&prompt, &codex);
-        assert!(prompt_action.task_operation.is_none());
-        assert!(
-            prompt_action
-                .system_message
-                .as_deref()
-                .is_some_and(|message| {
-                    message.contains("PromptEnvelope")
-                        && message.contains("$shared-context")
-                        && message.contains("task_intent_update")
-                        && !message.contains("\"task\"")
-                })
-        );
-        assert!(prompt_action.breadcrumb.is_none());
+    fn disabled_policy_is_neutral_for_all_lifecycle_events() {
+        let capabilities = verified_codex_capabilities();
+        for event in lifecycle_events() {
+            assert_eq!(
+                plan_action_for_activation(
+                    &event,
+                    &capabilities,
+                    ResolvedActivationDecision::Disabled,
+                ),
+                CanonicalAgentAction::neutral()
+            );
+        }
+    }
 
-        let post_tool = CanonicalAgentEvent::PostToolUse {
-            context: context.clone(),
-            tool_name: "ContractTest".to_owned(),
-            tool_use_id: "tool-1".to_owned(),
-            file_hints: vec![PathBuf::from("src/lib.rs")],
-            outcome: ToolOutcome::Succeeded,
+    #[test]
+    fn direct_and_group_have_identical_bounded_public_policy_for_all_events() {
+        let capabilities = verified_codex_capabilities();
+        for event in lifecycle_events() {
+            let direct = plan_action_for_activation(
+                &event,
+                &capabilities,
+                ResolvedActivationDecision::Direct,
+            );
+            let group = plan_action_for_activation(
+                &event,
+                &capabilities,
+                ResolvedActivationDecision::Group,
+            );
+            assert_eq!(direct, group);
+        }
+
+        let start = lifecycle_events().remove(0);
+        let action =
+            plan_action_for_activation(&start, &capabilities, ResolvedActivationDecision::Direct);
+        assert_eq!(
+            action.system_message.as_deref(),
+            Some(SHARED_CONTEXT_ACTIVATION_MARKER)
+        );
+        assert_eq!(
+            SHARED_CONTEXT_ACTIVATION_MARKER.len(),
+            SHARED_CONTEXT_ACTIVATION_MARKER_MAX_BYTES
+        );
+        for private_data in [
+            "rpo_",
+            "grp_",
+            "/private/repository",
+            "implement private task",
+            "transcript",
+            "Context data",
+            "task_intent_update",
+        ] {
+            assert!(!SHARED_CONTEXT_ACTIVATION_MARKER.contains(private_data));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn enabled_lifecycle_policy_only_activates_once_and_retains_runtime_plans() {
+        let events = lifecycle_events();
+        let capabilities = verified_codex_capabilities();
+        let plan = |index| {
+            plan_action_for_activation(
+                &events[index],
+                &capabilities,
+                ResolvedActivationDecision::Direct,
+            )
         };
-        let post_action = plan_action(&post_tool, &codex);
+
+        let start_action = plan(0);
+        assert!(start_action.task_operation.is_none());
+        assert!(start_action.breadcrumb.is_none());
+        assert_eq!(
+            start_action.system_message.as_deref(),
+            Some(SHARED_CONTEXT_ACTIVATION_MARKER)
+        );
+
+        let prompt_action = plan(1);
+        assert_eq!(prompt_action, CanonicalAgentAction::neutral());
+        assert!(!format!("{prompt_action:?}").contains(SHARED_CONTEXT_ACTIVATION_MARKER));
+
+        let post_action = plan(2);
         assert!(matches!(
             post_action.task_operation,
             Some(TaskRuntimeOperation::MergeObservations { .. })
@@ -750,85 +847,119 @@ mod tests {
             post_action.breadcrumb.as_ref().map(|value| &value.kind),
             Some(&CanonicalBreadcrumbKind::ToolOutcome)
         );
-        assert_eq!(
-            post_action
-                .breadcrumb
-                .as_ref()
-                .map(|value| value.external_session_locator.external_session_id.as_str()),
-            Some("session")
-        );
+        assert!(post_action.system_message.is_none());
 
-        for (event, expected_operation, should_request_checkpoint) in [
-            (
-                CanonicalAgentEvent::PreCompact {
-                    context: context.clone(),
-                    trigger: "auto".to_owned(),
-                },
-                "pre_compact",
-                true,
-            ),
-            (
-                CanonicalAgentEvent::TurnStop {
-                    context: context.clone(),
-                    status: "completed".to_owned(),
-                },
-                "turn_stop",
-                true,
-            ),
-            (
-                CanonicalAgentEvent::SessionEnd {
-                    context,
-                    reason: "other".to_owned(),
-                },
-                "cleanup",
-                false,
-            ),
+        for (index, expected_trigger) in [
+            (3, EpisodeFinalizationTrigger::PreCompact),
+            (4, EpisodeFinalizationTrigger::TurnStop),
         ] {
-            let action = plan_action(&event, &codex);
-            match expected_operation {
-                "pre_compact" => assert!(matches!(
-                    action.task_operation,
-                    Some(TaskRuntimeOperation::FinalizeCheckpointedEpisode {
-                        trigger: EpisodeFinalizationTrigger::PreCompact,
-                        ..
-                    })
-                )),
-                "turn_stop" => assert!(matches!(
-                    action.task_operation,
-                    Some(TaskRuntimeOperation::FinalizeCheckpointedEpisode {
-                        trigger: EpisodeFinalizationTrigger::TurnStop,
-                        ..
-                    })
-                )),
-                "cleanup" => assert!(matches!(
-                    action.task_operation,
-                    Some(TaskRuntimeOperation::CleanupSessionState { .. })
-                )),
-                _ => unreachable!(),
-            }
-            if should_request_checkpoint {
-                assert_eq!(
-                    action.breadcrumb.as_ref().map(|value| &value.kind),
-                    Some(&CanonicalBreadcrumbKind::Checkpoint)
-                );
-                assert_eq!(
-                    action
-                        .breadcrumb
-                        .as_ref()
-                        .map(|value| value.external_session_locator.external_session_id.as_str()),
-                    Some("session")
-                );
-            } else {
-                assert!(action.breadcrumb.is_none());
-            }
+            let action = plan(index);
+            assert!(matches!(
+                action.task_operation,
+                Some(TaskRuntimeOperation::FinalizeCheckpointedEpisode { trigger, .. })
+                    if trigger == expected_trigger
+            ));
             assert_eq!(
+                action.breadcrumb.as_ref().map(|value| &value.kind),
+                Some(&CanonicalBreadcrumbKind::Checkpoint)
+            );
+            assert!(
                 action
                     .system_message
                     .as_deref()
-                    .is_some_and(|message| message.contains("task_checkpoint")),
-                should_request_checkpoint
+                    .is_some_and(|message| message.contains("task_checkpoint"))
             );
         }
+
+        let end_action = plan(5);
+        assert!(matches!(
+            end_action.task_operation,
+            Some(TaskRuntimeOperation::CleanupSessionState { .. })
+        ));
+        assert!(end_action.breadcrumb.is_none());
+        assert!(end_action.system_message.is_none());
+    }
+
+    #[test]
+    fn unverified_hooks_keep_capability_degradation_without_claiming_activation() {
+        let event = lifecycle_events().remove(0);
+        let capabilities = evaluate_capabilities(
+            AgentKind::Codex,
+            Some("0.146.0"),
+            ">=0.147.0",
+            true,
+            TrustState::Confirmed,
+            false,
+        );
+        let unscoped = plan_action(&event, &capabilities);
+        assert_eq!(unscoped.task_operation, None);
+        assert_eq!(unscoped.breadcrumb, None);
+        assert_eq!(
+            unscoped.system_message.as_deref(),
+            Some(capabilities.diagnostic.as_str())
+        );
+
+        for activation in [
+            ResolvedActivationDecision::Direct,
+            ResolvedActivationDecision::Group,
+        ] {
+            let action = plan_action_for_activation(&event, &capabilities, activation);
+            assert_eq!(action, unscoped);
+            assert!(
+                !action
+                    .system_message
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(SHARED_CONTEXT_ACTIVATION_MARKER)
+            );
+        }
+    }
+
+    fn verified_codex_capabilities() -> AgentCapabilities {
+        evaluate_capabilities(
+            AgentKind::Codex,
+            Some("0.147.0"),
+            ">=0.147.0",
+            true,
+            TrustState::Confirmed,
+            false,
+        )
+    }
+
+    fn lifecycle_events() -> Vec<CanonicalAgentEvent> {
+        let context = AgentEventContext {
+            session_id: "session".to_owned(),
+            cwd: PathBuf::from("/private/repository"),
+            workspace_roots: vec![PathBuf::from("/private/repository")],
+        };
+        vec![
+            CanonicalAgentEvent::SessionStart {
+                context: context.clone(),
+            },
+            CanonicalAgentEvent::PromptSubmit {
+                context: context.clone(),
+                prompt: "implement private task".to_owned(),
+            },
+            CanonicalAgentEvent::PostToolUse {
+                context: context.clone(),
+                tool_name: "ContractTest".to_owned(),
+                tool_use_id: "tool-1".to_owned(),
+                file_hints: vec![PathBuf::from("src/lib.rs")],
+                outcome: ToolOutcome::Succeeded,
+            },
+            CanonicalAgentEvent::PreCompact {
+                context: context.clone(),
+                trigger: "auto".to_owned(),
+            },
+            CanonicalAgentEvent::TurnStop {
+                context: context.clone(),
+                status: "completed".to_owned(),
+            },
+            CanonicalAgentEvent::SessionEnd {
+                context,
+                reason: "other".to_owned(),
+            },
+        ]
     }
 
     fn pack_with_item(status: ContextStatus, eligible: bool, statement: &str) -> TaskContextPack {

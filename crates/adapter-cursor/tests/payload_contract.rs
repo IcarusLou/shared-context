@@ -3,7 +3,8 @@ use sctx_adapter_cursor::{
     encode_hook_output,
 };
 use sctx_agent_adapter::{
-    CapabilityMode, EpisodeFinalizationTrigger, TaskRuntimeOperation, plan_action,
+    CapabilityMode, EpisodeFinalizationTrigger, ResolvedActivationDecision,
+    SHARED_CONTEXT_ACTIVATION_MARKER, TaskRuntimeOperation, plan_action_for_activation,
 };
 use serde_json::Value;
 
@@ -36,20 +37,35 @@ fn documented_cursor_3_13_shapes_map_to_all_canonical_events() {
 }
 
 #[test]
-fn cursor_prompt_hook_is_observable_but_never_an_injection_dependency() {
+fn cursor_prompt_hook_never_repeats_activation_marker() {
     let payload = fixtures().remove(1);
     let (event, _) = decode_hook_input(&serde_json::to_vec(&payload).unwrap()).unwrap();
     let capability = capabilities(Some("3.13.10"), true);
     assert_eq!(capability.mode, CapabilityMode::VerifiedHooks);
     assert!(capability.prompt_submit);
     assert!(!capability.prompt_aware_injection);
-    let action = plan_action(&event, &capability);
+    let action =
+        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Direct);
     assert!(action.task_operation.is_none());
+    assert!(action.breadcrumb.is_none());
+    assert!(action.system_message.is_none());
+
+    let output = encode_hook_output(
+        event.kind(),
+        &ResolvedAgentAction {
+            additional_context: None,
+            system_message: action.system_message,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output).unwrap(),
+        serde_json::json!({})
+    );
     assert!(
-        action
-            .system_message
-            .as_deref()
-            .is_some_and(|message| message.contains("task_intent_update"))
+        !String::from_utf8(output)
+            .unwrap()
+            .contains(SHARED_CONTEXT_ACTIVATION_MARKER)
     );
 }
 
@@ -62,7 +78,8 @@ fn cursor_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_c
     ] {
         let (event, _) =
             decode_hook_input(&serde_json::to_vec(&fixtures().remove(index)).unwrap()).unwrap();
-        let action = plan_action(&event, &capability);
+        let action =
+            plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Direct);
         assert!(matches!(
             action.task_operation,
             Some(TaskRuntimeOperation::FinalizeCheckpointedEpisode { trigger, .. })
@@ -73,6 +90,55 @@ fn cursor_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_c
                 && message.contains("Hook summary text is not Claim evidence")
         }));
     }
+}
+
+#[test]
+fn cursor_session_start_encodes_disabled_as_neutral_and_both_enabled_scopes_identically() {
+    let (event, _) =
+        decode_hook_input(&serde_json::to_vec(&fixtures().remove(0)).unwrap()).unwrap();
+    let capability = capabilities(Some("3.13.10"), true);
+
+    let disabled =
+        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Disabled);
+    assert!(disabled.task_operation.is_none());
+    assert!(disabled.breadcrumb.is_none());
+    let disabled_output = encode_hook_output(
+        event.kind(),
+        &ResolvedAgentAction {
+            additional_context: None,
+            system_message: disabled.system_message,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&disabled_output).unwrap(),
+        serde_json::json!({})
+    );
+
+    let mut outputs = Vec::new();
+    for activation in [
+        ResolvedActivationDecision::Direct,
+        ResolvedActivationDecision::Group,
+    ] {
+        let action = plan_action_for_activation(&event, &capability, activation);
+        assert!(action.task_operation.is_none());
+        assert!(action.breadcrumb.is_none());
+        outputs.push(
+            encode_hook_output(
+                event.kind(),
+                &ResolvedAgentAction {
+                    additional_context: None,
+                    system_message: action.system_message,
+                },
+            )
+            .unwrap(),
+        );
+    }
+    assert_eq!(outputs[0], outputs[1]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&outputs[0]).unwrap(),
+        serde_json::json!({"additional_context": SHARED_CONTEXT_ACTIVATION_MARKER})
+    );
 }
 
 #[test]
