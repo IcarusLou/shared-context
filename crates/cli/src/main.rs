@@ -19,7 +19,7 @@ use std::{
 use args::Options;
 use sctx_agent_adapter::{
     AgentCapabilities, CanonicalAgentAction, CanonicalAgentEvent, CanonicalAgentEventKind,
-    CanonicalBreadcrumbKind, EpisodeFinalizationTrigger, ResolvedActivationDecision,
+    CanonicalBreadcrumbKind, EpisodeFinalizationTrigger, PathHint, ResolvedActivationDecision,
     ResolvedAgentAction, TaskRuntimeOperation, ToolOutcome, TrustState, plan_action_for_activation,
 };
 use sctx_domain::{
@@ -36,10 +36,10 @@ use sctx_index::{
     DomainSnapshot, IndexMetadata, ProjectionDiagnosticView, ProjectionIndex, RebuildOutcome,
 };
 use sctx_local_state::{
-    AuthorizedSessionScopeDecision, AuthorizedSessionScopeRead, AuthorizedSessionScopeStore,
-    Breadcrumb, BreadcrumbKind, CaptureDiagnosticKind, CaptureStore, CaptureTaskOwner,
-    CatalogCheckoutStatus, CatalogRepositoryGroupStatus, RepositoryCatalogSnapshot,
-    UserConfigStore,
+    AuthorizedSessionScope, AuthorizedSessionScopeDecision, AuthorizedSessionScopeRead,
+    AuthorizedSessionScopeStore, Breadcrumb, BreadcrumbKind, CaptureDiagnosticKind, CaptureStore,
+    CaptureTaskOwner, CatalogCheckoutStatus, CatalogRepositoryGroupStatus,
+    RepositoryCatalogSnapshot, UserConfigStore,
 };
 use sctx_mcp::{
     ArtifactFocusQuery, AssociationExplainInput, AssociationRebuildInput, CandidateAnalyzeInput,
@@ -722,13 +722,29 @@ fn run_hook(args: &[String]) -> Result<()> {
     };
     let trust = parse_trust(agent, None, true)?;
     let capabilities = agent_capabilities(agent, version.as_deref(), true, trust);
-    let activation = resolve_hook_activation(agent, &event);
+    let authorization = resolve_hook_authorization(agent, &event);
+    let activation = authorization.activation;
     let activated = matches!(
         activation,
         ResolvedActivationDecision::Direct | ResolvedActivationDecision::Group
     );
     let action = plan_action_for_activation(&event, &capabilities, activation);
+    let action = if event.kind() == CanonicalAgentEventKind::PostToolUse && activated {
+        authorization
+            .scope
+            .as_ref()
+            .zip(authorization.catalog.as_ref())
+            .and_then(|(scope, catalog)| {
+                attribute_post_tool_action(&event, action, scope, catalog).ok()
+            })
+            .unwrap_or_else(CanonicalAgentAction::neutral)
+    } else {
+        action
+    };
     let resolved = resolve_hook_action(action)?;
+    if event.kind() == CanonicalAgentEventKind::SessionEnd {
+        remove_hook_session_scope(agent, &event.context().session_id);
+    }
     let output = if agent == "cursor" {
         sctx_adapter_cursor::encode_hook_output(event.kind(), &resolved)?
     } else {
@@ -746,34 +762,48 @@ fn run_hook(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn resolve_hook_activation(agent: &str, event: &CanonicalAgentEvent) -> ResolvedActivationDecision {
-    resolve_hook_activation_inner(
+#[derive(Debug)]
+struct HookAuthorization {
+    activation: ResolvedActivationDecision,
+    scope: Option<AuthorizedSessionScope>,
+    catalog: Option<RepositoryCatalogSnapshot>,
+}
+
+impl HookAuthorization {
+    const fn disabled() -> Self {
+        Self {
+            activation: ResolvedActivationDecision::Disabled,
+            scope: None,
+            catalog: None,
+        }
+    }
+}
+
+fn resolve_hook_authorization(agent: &str, event: &CanonicalAgentEvent) -> HookAuthorization {
+    resolve_hook_authorization_inner(
         agent,
         event.kind(),
         &event.context().session_id,
         &event.context().cwd,
     )
     .ok()
-    .unwrap_or(ResolvedActivationDecision::Disabled)
+    .unwrap_or_else(HookAuthorization::disabled)
 }
 
-fn resolve_hook_activation_inner(
+fn resolve_hook_authorization_inner(
     agent: &str,
     event_kind: CanonicalAgentEventKind,
     session_id: &str,
     startup_cwd: &Path,
-) -> Result<ResolvedActivationDecision> {
+) -> Result<HookAuthorization> {
     let root = installation_root()?;
     let locator = ExternalSessionLocator::new(agent, session_id)?;
     let config = UserConfigStore::open_existing(&root)?;
     let catalog = config.repository_catalog()?;
     let store = AuthorizedSessionScopeStore::initialize(&root)?;
 
-    let decision = match store.try_read(&locator, &catalog)? {
-        AuthorizedSessionScopeRead::Current(scope) => scope.decision,
-        AuthorizedSessionScopeRead::Expired | AuthorizedSessionScopeRead::StaleCatalog => {
-            AuthorizedSessionScopeDecision::Disabled
-        }
+    let scope = match store.try_read(&locator, &catalog)? {
+        AuthorizedSessionScopeRead::Current(scope) => Some(scope),
         AuthorizedSessionScopeRead::Missing
             if event_kind == CanonicalAgentEventKind::SessionStart =>
         {
@@ -781,18 +811,256 @@ fn resolve_hook_activation_inner(
                 Error::new(ErrorKind::Io, format!("canonicalize startup cwd: {error}"))
             })?;
             let scope = catalog.resolve_activation_scope(&canonical_startup_cwd)?;
-            store
-                .try_authorize_missing(&locator, &scope, &catalog)?
-                .decision
+            Some(store.try_authorize_missing(&locator, &scope, &catalog)?)
         }
-        AuthorizedSessionScopeRead::Missing => AuthorizedSessionScopeDecision::Disabled,
+        AuthorizedSessionScopeRead::Expired
+        | AuthorizedSessionScopeRead::StaleCatalog
+        | AuthorizedSessionScopeRead::Missing => None,
+    };
+    let activation = match scope.as_ref().map(|scope| &scope.decision) {
+        None | Some(AuthorizedSessionScopeDecision::Disabled) => {
+            ResolvedActivationDecision::Disabled
+        }
+        Some(AuthorizedSessionScopeDecision::Direct { .. }) => ResolvedActivationDecision::Direct,
+        Some(AuthorizedSessionScopeDecision::Group { .. }) => ResolvedActivationDecision::Group,
+    };
+    Ok(HookAuthorization {
+        activation,
+        scope,
+        catalog: Some(catalog),
+    })
+}
+
+fn remove_hook_session_scope(agent: &str, session_id: &str) {
+    let Some((root, locator)) = installation_root()
+        .ok()
+        .zip(ExternalSessionLocator::new(agent, session_id).ok())
+    else {
+        return;
+    };
+    let _removed =
+        AuthorizedSessionScopeStore::initialize(root).and_then(|store| store.try_remove(&locator));
+}
+
+#[derive(Debug)]
+struct HookEventAttribution {
+    repository_ids: BTreeSet<RepositoryId>,
+    workspace_hint: PathBuf,
+    file_hints: Vec<PathBuf>,
+}
+
+fn attribute_post_tool_action(
+    event: &CanonicalAgentEvent,
+    mut action: CanonicalAgentAction,
+    scope: &AuthorizedSessionScope,
+    catalog: &RepositoryCatalogSnapshot,
+) -> Result<CanonicalAgentAction> {
+    let CanonicalAgentEvent::PostToolUse {
+        context,
+        path_hints,
+        ..
+    } = event
+    else {
+        return Err(invariant("PostToolUse attribution received another event"));
+    };
+    let attribution =
+        resolve_post_tool_attribution(context.cwd.as_path(), path_hints, scope, catalog)?;
+    if attribution.repository_ids.is_empty() {
+        return Err(invariant("PostToolUse attribution resolved no Repository"));
+    }
+    let Some(TaskRuntimeOperation::MergeObservations {
+        cwd,
+        workspace_roots,
+        file_hints,
+        ..
+    }) = action.task_operation.as_mut()
+    else {
+        return Err(invariant("enabled PostToolUse has no merge operation"));
+    };
+    cwd.clone_from(&attribution.workspace_hint);
+    *workspace_roots = vec![attribution.workspace_hint.clone()];
+    file_hints.clone_from(&attribution.file_hints);
+    let Some(breadcrumb) = action.breadcrumb.as_mut() else {
+        return Err(invariant("enabled PostToolUse has no Breadcrumb"));
+    };
+    breadcrumb.workspace_hint = Some(attribution.workspace_hint);
+    breadcrumb.file_hints = attribution.file_hints;
+    Ok(action)
+}
+
+fn resolve_post_tool_attribution(
+    event_cwd: &Path,
+    path_hints: &[PathHint],
+    scope: &AuthorizedSessionScope,
+    catalog: &RepositoryCatalogSnapshot,
+) -> Result<HookEventAttribution> {
+    let allowed_repository_ids = scope
+        .allowed_repository_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if allowed_repository_ids.is_empty()
+        || matches!(scope.decision, AuthorizedSessionScopeDecision::Disabled)
+    {
+        return Err(invalid("PostToolUse requires an enabled Session scope"));
+    }
+
+    let mut repository_ids = BTreeSet::new();
+    let mut checkout_paths = BTreeSet::new();
+    let mut file_hints = BTreeSet::new();
+    if path_hints.is_empty() {
+        let (repository_id, checkout_path) = resolve_attributed_directory(event_cwd, catalog)?;
+        ensure_repository_allowed(repository_id, &allowed_repository_ids)?;
+        repository_ids.insert(repository_id);
+        checkout_paths.insert(checkout_path);
+    } else {
+        for hint in path_hints {
+            resolve_structured_path_hint(
+                hint,
+                catalog,
+                &allowed_repository_ids,
+                &mut repository_ids,
+                &mut checkout_paths,
+                &mut file_hints,
+            )?;
+        }
+    }
+
+    let workspace_hint = match scope.decision {
+        AuthorizedSessionScopeDecision::Direct { repository_id } => {
+            if repository_ids
+                .iter()
+                .any(|resolved| *resolved != repository_id)
+            {
+                return Err(invalid("PostToolUse is outside its Direct Repository"));
+            }
+            checkout_paths
+                .into_iter()
+                .next()
+                .ok_or_else(|| invariant("Direct attribution has no checkout"))?
+        }
+        AuthorizedSessionScopeDecision::Group {
+            repository_group_id,
+        } => catalog
+            .repository_groups
+            .iter()
+            .find(|group| group.repository_group_id == repository_group_id)
+            .filter(|group| group.member_repository_ids == scope.allowed_repository_ids)
+            .map(|group| group.root_path.clone())
+            .ok_or_else(|| invariant("Group lease does not match the current Catalog"))?,
+        AuthorizedSessionScopeDecision::Disabled => {
+            return Err(invalid("PostToolUse requires an enabled Session scope"));
+        }
     };
 
-    Ok(match decision {
-        AuthorizedSessionScopeDecision::Disabled => ResolvedActivationDecision::Disabled,
-        AuthorizedSessionScopeDecision::Direct { .. } => ResolvedActivationDecision::Direct,
-        AuthorizedSessionScopeDecision::Group { .. } => ResolvedActivationDecision::Group,
+    Ok(HookEventAttribution {
+        repository_ids,
+        workspace_hint,
+        file_hints: file_hints.into_iter().collect(),
     })
+}
+
+fn resolve_structured_path_hint(
+    hint: &PathHint,
+    catalog: &RepositoryCatalogSnapshot,
+    allowed_repository_ids: &BTreeSet<RepositoryId>,
+    repository_ids: &mut BTreeSet<RepositoryId>,
+    checkout_paths: &mut BTreeSet<PathBuf>,
+    file_hints: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    match hint {
+        PathHint::File(path) => resolve_attributed_file(
+            path,
+            catalog,
+            allowed_repository_ids,
+            repository_ids,
+            checkout_paths,
+            file_hints,
+        ),
+        PathHint::Path(path) => {
+            let metadata = fs::symlink_metadata(path).map_err(|error| {
+                Error::new(ErrorKind::Io, format!("inspect structured path: {error}"))
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(invalid("PostToolUse path must not be a symlink"));
+            }
+            if metadata.is_file() {
+                return resolve_attributed_file(
+                    path,
+                    catalog,
+                    allowed_repository_ids,
+                    repository_ids,
+                    checkout_paths,
+                    file_hints,
+                );
+            }
+            if !metadata.is_dir() {
+                return Err(invalid(
+                    "PostToolUse path must identify a regular file or directory",
+                ));
+            }
+            let (repository_id, checkout_path) = resolve_attributed_directory(path, catalog)?;
+            ensure_repository_allowed(repository_id, allowed_repository_ids)?;
+            repository_ids.insert(repository_id);
+            checkout_paths.insert(checkout_path);
+            Ok(())
+        }
+        PathHint::WorkingDirectory(path) => {
+            let (repository_id, checkout_path) = resolve_attributed_directory(path, catalog)?;
+            ensure_repository_allowed(repository_id, allowed_repository_ids)?;
+            repository_ids.insert(repository_id);
+            checkout_paths.insert(checkout_path);
+            Ok(())
+        }
+        PathHint::Ambiguous => Err(invalid("PostToolUse contains an ambiguous path hint")),
+    }
+}
+
+fn resolve_attributed_file(
+    path: &Path,
+    catalog: &RepositoryCatalogSnapshot,
+    allowed_repository_ids: &BTreeSet<RepositoryId>,
+    repository_ids: &mut BTreeSet<RepositoryId>,
+    checkout_paths: &mut BTreeSet<PathBuf>,
+    file_hints: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let declared = catalog.resolve_declared_path(path)?;
+    ensure_repository_allowed(declared.repository_id, allowed_repository_ids)?;
+    let resolved =
+        catalog.resolve_file_path(path, std::slice::from_ref(&declared.checkout_path))?;
+    repository_ids.insert(resolved.repository_id);
+    checkout_paths.insert(resolved.checkout_path);
+    file_hints.insert(path.to_path_buf());
+    Ok(())
+}
+
+fn resolve_attributed_directory(
+    directory: &Path,
+    catalog: &RepositoryCatalogSnapshot,
+) -> Result<(RepositoryId, PathBuf)> {
+    match catalog.resolve_activation_scope(directory)?.decision {
+        sctx_local_state::ActivationScopeDecision::Direct {
+            repository_id,
+            checkout_path,
+        } => Ok((repository_id, checkout_path)),
+        sctx_local_state::ActivationScopeDecision::Group { .. }
+        | sctx_local_state::ActivationScopeDecision::Disabled => Err(invalid(
+            "PostToolUse working directory is not inside a configured Repository checkout",
+        )),
+    }
+}
+
+fn ensure_repository_allowed(
+    repository_id: RepositoryId,
+    allowed_repository_ids: &BTreeSet<RepositoryId>,
+) -> Result<()> {
+    if allowed_repository_ids.contains(&repository_id) {
+        Ok(())
+    } else {
+        Err(invalid(
+            "PostToolUse Repository is outside the Session scope",
+        ))
+    }
 }
 
 fn agent_capabilities(

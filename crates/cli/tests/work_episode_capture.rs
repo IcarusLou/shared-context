@@ -307,67 +307,46 @@ fn hook_capture_keeps_locator_then_explicit_claim_and_ingestion_are_verifiable()
     assert!(ingested.inserted);
     assert!(!runtime.ingest_capture(&input).unwrap().inserted);
 
+    let capture_count_before_sibling = store.list(32).unwrap().captures.len();
     assert_eq!(
         harness.hook(&post_tool(
             "capture-owned",
             &cross,
             &sibling.join("src/feature.rs"),
             "RAW_UNCONFIGURED_PATH",
-            "Inspect",
+            "SiblingInspect",
         )),
         json!({})
     );
-    let unconfigured = store
-        .list(32)
-        .unwrap()
-        .captures
-        .into_iter()
-        .find(|capture| {
-            capture.record.external_session_locator.external_session_id == "capture-owned"
-                && capture.record.capture_id != claimed.capture_id
-        })
-        .unwrap()
-        .record;
-    assert!(
-        store
-            .claim(
-                unconfigured.capture_id,
-                CaptureClaim {
-                    episode_id: opened.episode.episode_id,
-                    task_session_id: active.task_session_id,
-                    task_id: active.task_id,
-                },
-            )
-            .unwrap()
-            .newly_claimed
-    );
-    let mapping = map_capture_artifacts(&unconfigured, &catalog);
-    assert!(mapping.artifact_refs.is_empty());
+    let captures_after_sibling = store.list(32).unwrap().captures;
     assert_eq!(
-        mapping.diagnostics,
-        vec![CaptureDiagnosticKind::RepositoryNotConfigured]
+        captures_after_sibling.len(),
+        capture_count_before_sibling,
+        "unexpected Capture after sibling event: {captures_after_sibling:#?}"
     );
-    let second = runtime
-        .ingest_capture(&CaptureIngestion {
-            capture_id: unconfigured.capture_id,
-            episode_id: opened.episode.episode_id,
-            expected_episode_version: 1,
-            task_session_id: active.task_session_id,
-            task_id: active.task_id,
-            intent_revision_id: task_owner.intent_revision_id,
-            additional_sources: Vec::new(),
-            observation: NormalizedWorkObservation::Breadcrumb {
-                category: NormalizedBreadcrumbKind::Exploration,
-                summary: unconfigured.summary,
-            },
-            diagnostics: runtime_diagnostics(&mapping.diagnostics),
-        })
-        .unwrap();
-    assert_eq!(second.episode.episode.observations.len(), 2);
-    assert_eq!(second.episode.diagnostics.len(), 1);
+    assert!(captures_after_sibling.iter().all(|capture| {
+        !capture.record.summary.contains("SiblingInspect")
+            && !capture
+                .record
+                .file_hints
+                .iter()
+                .any(|path| path.contains("unconfigured"))
+    }));
+    assert!(!fs::read_dir(store.directory()).unwrap().any(|entry| {
+        fs::read_to_string(entry.unwrap().path())
+            .is_ok_and(|contents| contents.contains("RAW_UNCONFIGURED_PATH"))
+    }));
     let verified = runtime
         .verify_source_episode(opened.episode.episode_id)
         .unwrap()
         .unwrap();
-    assert_eq!(verified.observation_count, 2);
+    assert_eq!(verified.observation_count, 1);
+    assert!(
+        runtime
+            .read_work_episode(opened.episode.episode_id)
+            .unwrap()
+            .unwrap()
+            .diagnostics
+            .is_empty()
+    );
 }

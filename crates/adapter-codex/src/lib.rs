@@ -10,7 +10,7 @@ pub use sctx_agent_adapter::{
     TrustState,
 };
 use sctx_agent_adapter::{
-    AgentEventContext, AgentKind, ToolOutcome, evaluate_capabilities, file_hints_from_tool_input,
+    AgentEventContext, AgentKind, ToolOutcome, evaluate_capabilities, path_hints_from_tool_input,
 };
 pub use sctx_domain::{Error, ErrorKind, Result};
 use serde::Deserialize;
@@ -172,7 +172,7 @@ pub fn decode_hook_input(bytes: &[u8]) -> Result<CanonicalAgentEvent> {
                 context: input.common.context(),
                 tool_name: input.tool_name,
                 tool_use_id: input.tool_use_id,
-                file_hints: file_hints_from_tool_input(&input.tool_input),
+                path_hints: path_hints_from_tool_input(&input.tool_input),
                 outcome,
             })
         }

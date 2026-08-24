@@ -56,7 +56,7 @@ pub enum CanonicalAgentEvent {
         context: AgentEventContext,
         tool_name: String,
         tool_use_id: String,
-        file_hints: Vec<PathBuf>,
+        path_hints: Vec<PathHint>,
         /// Only a structured success/failure marker is retained. This is never raw tool output.
         outcome: ToolOutcome,
     },
@@ -105,6 +105,20 @@ impl CanonicalAgentEvent {
 pub enum ToolOutcome {
     Succeeded,
     Failed,
+}
+
+/// One bounded structured path field translated from a vendor tool input.
+///
+/// `Ambiguous` records the presence of a recognized path key whose value could not be represented
+/// as one scalar path. Keeping that fact, without retaining the raw value, lets attribution fail
+/// closed instead of silently falling back to the event working directory.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "path", rename_all = "snake_case")]
+pub enum PathHint {
+    File(PathBuf),
+    Path(PathBuf),
+    WorkingDirectory(PathBuf),
+    Ambiguous,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -388,32 +402,45 @@ fn plan_enabled_action(
             context,
             tool_name,
             outcome,
-            file_hints,
+            path_hints,
             ..
-        } => CanonicalAgentAction {
-            task_operation: Some(TaskRuntimeOperation::MergeObservations {
-                locator: task_locator(capabilities.agent, context),
-                cwd: context.cwd.clone(),
-                workspace_roots: context.workspace_roots.clone(),
-                file_hints: file_hints.clone(),
-                tool_name: tool_name.clone(),
-                outcome: *outcome,
-            }),
-            breadcrumb: Some(CanonicalBreadcrumb {
-                external_session_locator: task_locator(capabilities.agent, context),
-                kind: CanonicalBreadcrumbKind::ToolOutcome,
-                summary: format!(
-                    "tool {tool_name} {}",
-                    match outcome {
-                        ToolOutcome::Succeeded => "succeeded",
-                        ToolOutcome::Failed => "failed",
-                    }
-                ),
-                workspace_hint: workspace_hint(context),
-                file_hints: file_hints.clone(),
-            }),
-            system_message: None,
-        },
+        } => {
+            let file_hints = path_hints
+                .iter()
+                .filter_map(|hint| match hint {
+                    PathHint::File(path) => Some(path.clone()),
+                    PathHint::Path(_) | PathHint::WorkingDirectory(_) | PathHint::Ambiguous => None,
+                })
+                .collect::<Vec<_>>();
+            let explicit_workspace_hint = path_hints.iter().find_map(|hint| match hint {
+                PathHint::WorkingDirectory(path) => Some(path.clone()),
+                PathHint::File(_) | PathHint::Path(_) | PathHint::Ambiguous => None,
+            });
+            CanonicalAgentAction {
+                task_operation: Some(TaskRuntimeOperation::MergeObservations {
+                    locator: task_locator(capabilities.agent, context),
+                    cwd: context.cwd.clone(),
+                    workspace_roots: context.workspace_roots.clone(),
+                    file_hints: file_hints.clone(),
+                    tool_name: tool_name.clone(),
+                    outcome: *outcome,
+                }),
+                breadcrumb: Some(CanonicalBreadcrumb {
+                    external_session_locator: task_locator(capabilities.agent, context),
+                    kind: CanonicalBreadcrumbKind::ToolOutcome,
+                    summary: format!(
+                        "tool {tool_name} {}",
+                        match outcome {
+                            ToolOutcome::Succeeded => "succeeded",
+                            ToolOutcome::Failed => "failed",
+                        }
+                    ),
+                    workspace_hint: explicit_workspace_hint.or_else(|| workspace_hint(context)),
+                    file_hints,
+                }),
+                system_message: None,
+            }
+        }
         CanonicalAgentEvent::PreCompact {
             context, trigger, ..
         } => checkpoint(
@@ -582,40 +609,70 @@ pub fn render_untrusted_task_context_pack(pack: &TaskContextPack) -> Result<Stri
     ))
 }
 
-/// Extract likely file paths from tool input without retaining the full input or command text.
+/// Extract bounded structured file and working-directory hints without retaining tool input or
+/// command text.
+///
+/// A recognized key with a non-string value, or more than sixteen recognized fields, becomes one
+/// [`PathHint::Ambiguous`] marker. Attribution must reject an event containing that marker.
 #[must_use]
-pub fn file_hints_from_tool_input(input: &Value) -> Vec<PathBuf> {
-    const KEYS: [&str; 5] = [
-        "path",
-        "file_path",
-        "filepath",
-        "workdir",
-        "working_directory",
-    ];
+pub fn path_hints_from_tool_input(input: &Value) -> Vec<PathHint> {
+    const FILE_KEYS: [&str; 2] = ["file_path", "filepath"];
+    const PATH_KEYS: [&str; 1] = ["path"];
+    const WORKING_DIRECTORY_KEYS: [&str; 2] = ["workdir", "working_directory"];
     let mut paths = Vec::new();
-    collect_paths(input, &KEYS, &mut paths);
+    collect_paths(
+        input,
+        &FILE_KEYS,
+        &PATH_KEYS,
+        &WORKING_DIRECTORY_KEYS,
+        &mut paths,
+    );
+    if paths.len() > 16 {
+        return vec![PathHint::Ambiguous];
+    }
     paths.sort();
     paths.dedup();
-    paths.truncate(16);
     paths
 }
 
-fn collect_paths(value: &Value, keys: &[&str], paths: &mut Vec<PathBuf>) {
+fn collect_paths(
+    value: &Value,
+    file_keys: &[&str],
+    path_keys: &[&str],
+    working_directory_keys: &[&str],
+    paths: &mut Vec<PathHint>,
+) {
     match value {
         Value::Object(object) => {
             for (key, value) in object {
-                if keys.contains(&key.as_str()) {
-                    if let Some(path) = value.as_str() {
-                        paths.push(PathBuf::from(path));
-                    }
+                let kind = if file_keys.contains(&key.as_str()) {
+                    Some(0)
+                } else if path_keys.contains(&key.as_str()) {
+                    Some(1)
+                } else if working_directory_keys.contains(&key.as_str()) {
+                    Some(2)
+                } else {
+                    None
+                };
+                if let Some(kind) = kind {
+                    paths.push(
+                        value
+                            .as_str()
+                            .map_or(PathHint::Ambiguous, |path| match kind {
+                                0 => PathHint::File(PathBuf::from(path)),
+                                1 => PathHint::Path(PathBuf::from(path)),
+                                2 => PathHint::WorkingDirectory(PathBuf::from(path)),
+                                _ => unreachable!(),
+                            }),
+                    );
                 } else if value.is_object() || value.is_array() {
-                    collect_paths(value, keys, paths);
+                    collect_paths(value, file_keys, path_keys, working_directory_keys, paths);
                 }
             }
         }
         Value::Array(values) => {
             for value in values {
-                collect_paths(value, keys, paths);
+                collect_paths(value, file_keys, path_keys, working_directory_keys, paths);
             }
         }
         _ => {}
@@ -637,6 +694,41 @@ mod tests {
         ContextPackDetail, ContextPackItem, ContextPackMode, ContextSafetySource, EvidenceView,
         MatchReason, TaskContextItem, TaskRetrievalPath,
     };
+
+    #[test]
+    fn structured_path_hints_keep_kind_and_ambiguity_without_parsing_command_text() {
+        let hints = path_hints_from_tool_input(&serde_json::json!({
+            "file_path": "/repo/src/lib.rs",
+            "nested": {"working_directory": "/repo"},
+            "command": "cd /outside && read /outside/secret.rs"
+        }));
+        assert_eq!(
+            hints,
+            vec![
+                PathHint::File(PathBuf::from("/repo/src/lib.rs")),
+                PathHint::WorkingDirectory(PathBuf::from("/repo")),
+            ]
+        );
+        assert!(
+            hints
+                .iter()
+                .all(|hint| !format!("{hint:?}").contains("outside"))
+        );
+
+        assert_eq!(
+            path_hints_from_tool_input(&serde_json::json!({
+                "file_path": ["/repo/a.rs", "/repo/b.rs"]
+            })),
+            vec![PathHint::Ambiguous]
+        );
+        let too_many = (0..17)
+            .map(|index| serde_json::json!({"path": format!("/repo/{index}")}))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            path_hints_from_tool_input(&Value::Array(too_many)),
+            vec![PathHint::Ambiguous]
+        );
+    }
 
     #[test]
     fn versions_below_minimum_and_untrusted_codex_fail_closed() {
@@ -906,7 +998,7 @@ mod tests {
                 context: context.clone(),
                 tool_name: "ContractTest".to_owned(),
                 tool_use_id: "tool-1".to_owned(),
-                file_hints: vec![PathBuf::from("src/lib.rs")],
+                path_hints: vec![PathHint::File(PathBuf::from("src/lib.rs"))],
                 outcome: ToolOutcome::Succeeded,
             },
             CanonicalAgentEvent::PreCompact {

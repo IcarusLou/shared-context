@@ -358,16 +358,21 @@ impl AuthorizedSessionScopeStore {
     /// Refuses an unsafe record or cross-locator digest mismatch.
     pub fn remove(&self, external_session_locator: &ExternalSessionLocator) -> Result<bool> {
         validate_locator(external_session_locator)?;
-        self.with_lock(|| {
-            let path = self.record_path(external_session_locator);
-            let Some(record) = self.read_optional_record(&path)? else {
-                return Ok(false);
-            };
-            verify_record_locator(&record, external_session_locator)?;
-            fs::remove_file(&path).map_err(io_error("remove AuthorizedSessionScope"))?;
-            sync_directory(&self.directory)?;
-            Ok(true)
-        })
+        self.with_lock(|| self.remove_exact_unlocked(external_session_locator))
+    }
+
+    /// Non-blockingly removes one exact locator's valid record for a Hook `SessionEnd`.
+    ///
+    /// A busy lock or an unsafe/corrupt record is an immediate error. Callers on the Hook path
+    /// deliberately ignore that error so Agent shutdown remains fail-open without touching another
+    /// locator or waiting for concurrent scope work.
+    ///
+    /// # Errors
+    ///
+    /// Returns immediately for lock contention and refuses unsafe records or locator mismatches.
+    pub fn try_remove(&self, external_session_locator: &ExternalSessionLocator) -> Result<bool> {
+        validate_locator(external_session_locator)?;
+        self.with_try_lock(|| self.remove_exact_unlocked(external_session_locator))
     }
 
     /// Removes all expired valid records in deterministic filename order.
@@ -410,6 +415,20 @@ impl AuthorizedSessionScopeStore {
                 semantic_changed,
             })
         })
+    }
+
+    fn remove_exact_unlocked(
+        &self,
+        external_session_locator: &ExternalSessionLocator,
+    ) -> Result<bool> {
+        let path = self.record_path(external_session_locator);
+        let Some(record) = self.read_optional_record(&path)? else {
+            return Ok(false);
+        };
+        verify_record_locator(&record, external_session_locator)?;
+        fs::remove_file(&path).map_err(io_error("remove AuthorizedSessionScope"))?;
+        sync_directory(&self.directory)?;
+        Ok(true)
     }
 
     fn try_authorize_missing_at(
@@ -1234,6 +1253,41 @@ mod tests {
             AuthorizedSessionScopeRead::Missing
         );
         assert_eq!(fs::read_dir(store.directory()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn try_remove_is_exact_nonblocking_and_never_completes_after_return() {
+        let temporary = tempdir().unwrap();
+        let store = AuthorizedSessionScopeStore::initialize(temporary.path()).unwrap();
+        let (catalog, repository_id, _) = fixture_catalog();
+        let remove = locator("remove-exact");
+        let preserve = locator("preserve-exact");
+        for locator in [&remove, &preserve] {
+            store
+                .authorize(locator, &direct_scope(repository_id), &catalog)
+                .unwrap();
+        }
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&store.lock_path)
+            .unwrap();
+        FileExt::lock_exclusive(&lock).unwrap();
+        let started = Instant::now();
+        assert!(store.try_remove(&remove).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        FileExt::unlock(&lock).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert!(matches!(
+            store.read(&remove, &catalog).unwrap(),
+            AuthorizedSessionScopeRead::Current(_)
+        ));
+        assert!(store.try_remove(&remove).unwrap());
+        assert!(!store.try_remove(&remove).unwrap());
+        assert!(matches!(
+            store.read(&preserve, &catalog).unwrap(),
+            AuthorizedSessionScopeRead::Current(_)
+        ));
     }
 
     #[test]

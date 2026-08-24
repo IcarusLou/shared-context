@@ -773,14 +773,33 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
             "tool_use_id": format!("tool-{session_id}"),
             "tool_input": {
                 "file_path": file,
-                "command": raw_marker,
-                "outside": {"path": outside_file},
-                "missing": {"path": workspace.join("src/missing.rs")}
+                "command": raw_marker
             },
             "tool_response": {"output": raw_marker}
         }));
         assert_eq!(response, serde_json::json!({}));
     }
+
+    assert_eq!(
+        hook(&serde_json::json!({
+            "session_id": "session-alpha",
+            "transcript_path": "/tmp/RAW_MIXED_TEST_MUST_NOT_PERSIST.jsonl",
+            "cwd": workspace,
+            "hook_event_name": "PostToolUse",
+            "model": "gpt-5.6-sol",
+            "permission_mode": "default",
+            "turn_id": "turn-session-alpha",
+            "tool_name": "DroppedContractTest",
+            "tool_use_id": "tool-mixed",
+            "tool_input": {
+                "file_path": alpha_file,
+                "outside": {"path": outside_file},
+                "missing": {"path": workspace.join("src/missing.rs")}
+            },
+            "tool_response": {"output": "RAW_MIXED_TEST_MUST_NOT_PERSIST"}
+        })),
+        serde_json::json!({})
+    );
 
     let alpha_updated = task_intent_update_at_root(
         harness.root(),
@@ -877,6 +896,8 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         assert!(snapshot.task_signals.iter().all(|signal| {
             !signal.content.contains("RAW_ALPHA_MUST_NOT_PERSIST")
                 && !signal.content.contains("RAW_BETA_MUST_NOT_PERSIST")
+                && !signal.content.contains("DroppedContractTest")
+                && !signal.content.contains("RAW_MIXED_TEST_MUST_NOT_PERSIST")
         }));
     }
 }
