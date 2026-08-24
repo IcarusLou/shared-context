@@ -1,7 +1,7 @@
 # Task-first Retrieval Integration Acceptance Report
 
-Date: 2026-08-24
-Scope: production acceptance through Mew #170/#164 is unchanged, including #136/#169; additive non-blocking testing evidence extends through #171/#176
+Date: 2026-08-25
+Scope: production acceptance through Mew #170/#164 is unchanged, including #136/#169; Repository-scoped pre-inference Hook acceptance is implemented through #189 and awaits milestone human review; additive non-blocking replay evidence extends through #171/#176
 Documentation baseline before the #170 language alignment: `main@e03193b`
 
 Production acceptance remains closed by final M4 Gate #164.
@@ -10,7 +10,7 @@ Production acceptance remains closed by final M4 Gate #164.
 
 M1 closes the Task-first domain and entry-point foundation. M2 closes the local Task Runtime and explainable multi-Space retrieval path. M3 closes the Engineering Graph through a local Repository Registry, bounded multi-language scanner, persistent Engineering References, rebuildable resolution projection, bounded ContextRelation traversal, graph retrieval, and explicit MCP/CLI workflows.
 
-Session startup and PromptSubmit are capability-only: neither infers Working Intent nor runs an automatic knowledge query. Task-aware retrieval begins after the Agent explicitly calls `task_intent_update`; subsequent `task_context` calls are read-only.
+SessionStart now performs synchronous local Repository-scope admission before model inference. Direct and explicit Group receive one fixed bounded activation marker; Disabled receives no Shared Context text. PromptSubmit never repeats the marker, infers Working Intent, or runs an automatic knowledge query. Task-aware retrieval begins only after the Agent explicitly calls `task_intent_update`; subsequent `task_context` calls are read-only.
 
 | Milestone | Status | Boundary |
 |---|---|---|
@@ -18,6 +18,21 @@ Session startup and PromptSubmit are capability-only: neither infers Working Int
 | M2 — Task Runtime and multi-Space retrieval | IMPLEMENTED | TaskSession persistence, strict `task_intent_update`, read-only `task_context`, association inference, typed RetrievalPaths, and TaskContextPack pass focused cross-crate/E2E oracles |
 | M3 — Engineering Graph | IMPLEMENTED | Reference-derived bounded ScanPlan, deterministic Artifact locators, sparse build-time Context/safety snapshots, historical exact retrieval, frozen 1–2 hop relations, diagnostics, fallback, rebuild equivalence, and budget bounds pass cross-crate/E2E oracles |
 | M4 — Low-tax Capture | IMPLEMENTED | #117, #136, #156–#164 and #169 provide lightweight idempotent Working Intent, Hint Text retrieval, exact WorkEpisode/Checkpoint automation, Builder/analysis/Review, and atomic existing/new Candidate Confirmation, closed by a fixed cross-layer oracle plus Hook/Capture/privacy/performance suites |
+| Repository-scoped pre-inference activation — Mew #185 | IMPLEMENTED; GATE REVIEW | #181–#189 provide explicit RepositoryGroup/Direct/Disabled resolution, sticky short-lived Session lease, SessionStart marker, PostTool attribution gate, exact SessionEnd cleanup, and a fixed Codex/Cursor lifecycle oracle; milestone human acceptance is still required |
+
+## Repository-scoped activation gate — Mew #181–#189
+
+The blocking test-only oracle is hand-written at [`fixtures/m2/repository-scoped-activation-v1.json`](../fixtures/m2/repository-scoped-activation-v1.json). `repository_scoped_activation_acceptance` applies the repository's documented Codex 0.147 and Cursor 3.13 payload shapes to isolated, synthetic checkouts and invokes the real `sctx hook` binary. The oracle contains no real path, Prompt, transcript, tool output, user identity, or Session identity and is not generated from production output.
+
+The fixed acceptance proves:
+
+- SessionStart resolves and durably records Direct, explicit multi-member Group, or Disabled before returning any Agent-visible marker. Authorization uses local synchronous non-blocking Catalog/lease access and never invokes the model, Git discovery, or Repository scan.
+- Direct and Group return the same fixed marker, bounded to 128 bytes. Codex startup/resume/compact SessionStart boundaries may return it; PromptSubmit always returns the vendor-neutral empty response and never repeats it.
+- The first successful decision for one exact external Session locator remains byte-for-byte sticky across later cwd changes and 12 concurrent repeated SessionStart calls. SessionEnd removes only that exact lease.
+- Disabled and Catalog-unavailable Codex/Cursor lifecycles execute SessionStart→Prompt→Tool→PreCompact/Stop→End with empty wire output and zero Runtime, Capture, Report, or knowledge-Git residue.
+- Group member events may capture only after all structured paths resolve to current explicit members. An unregistered sibling or one mixed member/sibling event is rejected before Runtime/Capture and leaves the business-state and knowledge-Git snapshots byte-for-byte unchanged.
+
+This gate does **not** prove or implement MCP Server authorization, conditional loading/unloading of the complete installed Skill, project-level Agent configuration, a launcher, real transcript replay, or the later #190 boundary. MCP remains globally available through user-level Agent configuration, so the Hook acceptance must not be described as a Server-side security guard or as eliminating every possible Skill/MCP token cost.
 
 ## #171 Dynamic Replay Phase One — NON-BLOCKING EVIDENCE
 
@@ -53,7 +68,9 @@ Mandatory Gates #114/#117 are implemented: stable `submission_id` and exact clos
 | Discard is explicit, audited, and idempotent | PROVEN | Task/Intent/Review CAS changes Pending to Discarded once; same-reason timeout retry returns already_discarded, different reason/stale/cross-Task/Confirmed/secret input fail typed, and default list hides discarded |
 | Expired Reviews cannot revive | PROVEN | TTL cleanup deletes heavy Runtime analysis, advances a terminal Expired tombstone, never touches Git, and a later Builder retry cannot recreate Pending; deleting runtime removes all unconfirmed Review discovery |
 | Existing confirmed Context fixtures use neutral revision terminology | PROVEN | Event constructor is `context_revision_added`; no Context-Propose API or constructor remains |
-| SessionStart and PromptSubmit emit capability guidance without knowledge retrieval | PROVEN | Shared lifecycle policy returns no Task Runtime operation; the CLI adversarial contract seeds two Spaces with Accepted eligible Context and proves both lifecycle events emit no item before the Agent explicitly calls `task_intent_update` and retrieves only its task match |
+| SessionStart gates Shared Context before Prompt inference; PromptSubmit stays neutral | PROVEN | `repository_scoped_activation_acceptance` invokes the real Codex/Cursor Hook with documented payload shapes and a hand-written wire oracle: Enabled SessionStart returns the fixed marker, Disabled returns `{}`, PromptSubmit always returns `{}`, and no lifecycle path retrieves knowledge before explicit `task_intent_update` |
+| Repeated SessionStart cannot change an established locator authorization | PROVEN | A first successful Direct lease remains byte-for-byte unchanged across resume/compact cwd changes and 12 concurrent repeated starts from another Repository, Group root, and unregistered directory; every repeated boundary returns only the original enabled policy |
+| Disabled and out-of-scope Hook events leave no business residue | PROVEN | Full Disabled/Catalog-unavailable Codex and Cursor lifecycles preserve zero Runtime/Capture/Report files and the exact knowledge Git snapshot; explicit Group sibling and mixed events preserve byte-for-byte business-state/Git snapshots before lifecycle cleanup |
 | Codex dynamic sessions are isolated and incorporate later non-locating outcomes | PROVEN | CLI adversarial contract runs two Codex sessions in one Git Workspace, proves pre-Prompt PostToolUse cannot create a Session, File observations remain Breadcrumb-only, and TestOutcome changes only the owning Task fingerprint without Graph semantics |
 | Task retrieval accepts no caller Space or Workspace route | PROVEN | `milestone_two_contract` serializes the accepted input and rejects injected `space_id`, `space_ids`, `workspace`, and `workspace_id` fields |
 | Task retrieval returns zero, one, or many Space candidates | PROVEN | The M2 oracle executes unrelated, page-only, and multi-Space tasks through the shared Runtime/MCP/Search/Index path |
@@ -158,6 +175,9 @@ cargo test --locked -p sctx-task-runtime --test work_episode_store
 cargo test --locked -p sctx-cli --test cli_contract
 cargo test --locked -p sctx-cli --test hook_fail_open
 cargo test --locked -p sctx-cli --test work_episode_capture
+cargo test --locked -p sctx-cli --test hook_session_activation
+cargo test --locked -p sctx-cli --test hook_repository_attribution
+cargo test --locked -p sctx-cli --test repository_scoped_activation_acceptance
 cargo test --locked -p sctx-cli --test milestone_one_contract
 cargo test --locked -p sctx-cli --test milestone_two_contract
 cargo test --locked -p sctx-cli --test milestone_three_contract

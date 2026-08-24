@@ -1,0 +1,24 @@
+{
+  "schema": "sctx.repository-scoped-activation.acceptance.v1",
+  "activation_marker": "<shared-context-active>Shared Context is authorized; the installed skill may be used.</shared-context-active>",
+  "activation_marker_max_bytes": 128,
+  "wire": {
+    "codex_enabled_session_start": {
+      "systemMessage": "<shared-context-active>Shared Context is authorized; the installed skill may be used.</shared-context-active>"
+    },
+    "cursor_enabled_session_start": {
+      "additional_context": "<shared-context-active>Shared Context is authorized; the installed skill may be used.</shared-context-active>"
+    },
+    "neutral": {}
+  },
+  "enabled_without_active_task": {
+    "pre_compact": "Shared Context PreCompact: no ActiveTask exists. Continue coding normally; use $shared-context and task_intent_update before checkpointing.",
+    "turn_stop": "Shared Context TurnStop: no ActiveTask exists. Continue coding normally; use $shared-context and task_intent_update before checkpointing."
+  },
+  "disabled_business_residue": {
+    "runtime_files": 0,
+    "capture_records": 0,
+    "report_files": 0,
+    "knowledge_commits_delta": 0
+  }
+}

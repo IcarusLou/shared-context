@@ -43,7 +43,7 @@ sctx demo
 
 `sctx demo` 会在本机创建一组固定的演示数据，完成“创建 Space → 写入 Context → 审核 → 发布 → CLI/MCP 搜索”的闭环。重复执行不会反复创建相同数据。
 
-然后重启已经打开的 Cursor 或 Codex。正常工作时，Agent 会通过已安装的 Shared Context Skill、MCP 工具和生命周期 Hook 维护任务意图、取回相关历史、记录检查点，并把值得长期保存的结论整理成待审核 Candidate。
+然后用 `sctx repository add` 登记希望启用 Shared Context 的本机代码仓库，再重启已经打开的 Cursor 或 Codex。只有从已登记 checkout 内启动，或从显式登记的 Repository Group 精确根目录启动时，SessionStart 才会向 Agent 注入简短授权 marker；未登记目录保持 neutral，不进入 Hook 记录流程。进入授权范围后，Agent 才按已安装的 Shared Context Skill、MCP 工具和生命周期 Hook 维护任务意图、取回相关历史、记录检查点，并把值得长期保存的结论整理成待审核 Candidate。
 
 ## 3. 安装步骤
 
@@ -277,6 +277,10 @@ Workspace 路径不会自动绑定一个 Space，文本 Hint 也不会冒充已�
 
 ### 4.5 隐私和信任边界
 
+- SessionStart 在模型推理前用本机 Repository Catalog 判定范围，不读取 Prompt，也不调用模型。已登记 checkout 是 `Direct`；只有显式登记且精确匹配的 Group root 才是 `Group`；普通父目录、未登记 sibling 和其他目录都是 `Disabled`。
+- Enabled 只返回一个固定、短小且不含路径/Repository/Prompt/Session 身份的 marker。PromptSubmit 不重复 marker。Disabled 的 Prompt、Tool、压缩、停止和结束 Hook 不打开 Runtime/Capture，也不写 Report 或知识 Git。
+- 同一 Agent Session locator 的第一次成功决定会一直复用到 SessionEnd；后续 resume/compact 或 cwd 变化不会重新判定。Catalog/lease 锁忙、损坏或异常会立即按 Disabled 处理，但不会阻断正常编程。
+- PostToolUse 会在记录前检查全部结构化路径。显式 Group 的成员可以共同出现在一个事件中；未登记 sibling、成员与 sibling 混合、相对/缺失/symlink/歧义路径会让整条事件被丢弃。
 - Hook 采用 fail-open：Shared Context 暂时不可用时，正常编程仍可继续。
 - 短期 Capture 会先做隐私过滤，默认保留时间为 24 小时，并受大小限制。
 - Work Episode 和长期 Context 保存结构化工程含义，不保存原始聊天、完整工具输出或完整终端日志。
@@ -288,7 +292,7 @@ Workspace 路径不会自动绑定一个 Space，文本 Hint 也不会冒充已�
 
 ### 5.1 推荐方式：让 Agent 通过 MCP 使用
 
-安装并重启 Cursor/Codex 后，普通用户通常不需要手写 JSON。正常向 Agent 描述任务即可，例如：
+安装、登记 Repository 并重启 Cursor/Codex 后，普通用户通常不需要通过额外 launcher，也不需要在业务仓库添加项目级 Agent 配置。请从已登记 checkout 内启动 Agent，再正常描述任务，例如：
 
 ```text
 请修复搜索结果页的旧版本兼容问题，并使用 Shared Context 查找相关历史决策。
@@ -608,6 +612,10 @@ CONTEXT_ID:REVISION_ID:retained|revised|withdrawn|scope_split
 | `sctx repository add --repository-id <ID> --path <路径>` | 给已经登记的 Repository ID 增加 checkout 路径。 |
 | `sctx repository list` | 查看 Repository Catalog，并同步本地 Registry。 |
 | `sctx repository doctor` | 检查 checkout 是可用、缺失还是不安全，并在安全时同步 Registry。 |
+| `sctx repository group add --root <绝对父目录> --member-repository-id <ID> [--member-repository-id <ID> ...]` | 显式登记一个精确父目录为 Repository Group；只有该 root 本身可以启用 Group，普通祖先目录不会自动启用。 |
+| `sctx repository group update --repository-group-id <ID> [--root <路径>] [--member-repository-id <ID> ...]` | 显式修复或更新 Group root/成员。 |
+| `sctx repository group remove --repository-group-id <ID>` | 移除 Group；不删除成员 Repository。 |
+| `sctx repository group list` / `doctor` | 查看 Group 与成员、检查 root 漂移或不可用状态。 |
 | `sctx repository scan --checkout-path <路径> [--path <仓库相对路径>] [--max-artifacts 200]` | 显式扫描有界路径并返回工程对象摘要，不返回源码正文。最多请求 1000 个 Artifact。 |
 | `sctx engineering-reference record --input <JSON>` | 把现有 Context Revision 与已验证的工程对象关系写入长期事实层。 |
 | `sctx association explain --reference-id <ID>` | 解释一条 Reference 当前解析到了什么、依据是什么、是否存在歧义、有哪些图路径。 |
@@ -616,6 +624,8 @@ CONTEXT_ID:REVISION_ID:retained|revised|withdrawn|scope_split
 支持的工程对象是 `module`、`file`、`symbol`、`api`、`schema`、`test`；关系是 `implements`、`defines`、`consumes`、`validates`、`constrains`、`depends_on`。
 
 `engineering-reference record` 只应在直接检查或验证后调用。它要求完整、确定性的 locator、非空 `supports` 和至少一条 `limitations`。不要用相似文件名猜移动或重命名关系。
+
+例如多个 Android 仓库位于同一父目录，而你希望从父目录启动 Agent，应先用 `repository list` 取得各成员的 Repository ID，再显式创建 Group。仅仅把已登记仓库放在同一个父目录下不会自动产生 Group；从更高层祖先目录启动仍是 Disabled。这条规则避免系统把未登记 sibling 一并纳入记录范围。
 
 ### 6.8 搜索与读取
 
@@ -686,6 +696,8 @@ sctx search \
 
 CLI 还提供 Space/Context 写入治理、语义冲突、索引和 Pending Batch 等管理员能力；这些没有全部开放成 Agent MCP 写工具，以维持显式审核和生命周期边界。
 
+当前 Repository 准入控制的是 Hook 的 Agent-visible activation 与生命周期记录路径。MCP Server 仍由用户级 Agent 配置提供，尚未用 Session lease 实现 Server authorization；完整 Skill 也尚未按目录条件加载/卸载。因此不要把 Disabled 理解为 MCP 进程物理未启动或 Server 已拒绝所有主动调用。当前已经证明的是：Disabled Hook 不向模型注入 Shared Context 文本，也不产生 Runtime/Capture/Report/知识 Git 记录。
+
 ## 7. 常见问题
 
 ### 7.1 `sctx` 找不到
@@ -718,7 +730,20 @@ sctx association rebuild --diagnose
 
 确认仓库已经登记、路径仍存在、相关 Context 已经记录 Engineering Reference，并且工程图已经显式构建。`artifact_not_reachable_in_graph` 只表示当前历史图没有安全的精确路径，不代表当前源码文件不存在。
 
-### 7.5 Candidate 没有生成
+### 7.5 在多个仓库的父目录启动时为什么没有激活
+
+父目录不会因为下面恰好有多个已登记仓库而自动获得权限。先确认每个成员都已用 `sctx repository add` 登记，再显式执行：
+
+```bash
+sctx repository group add \
+  --root /absolute/path/to/android-parent \
+  --member-repository-id <REPOSITORY_A_ID> \
+  --member-repository-id <REPOSITORY_B_ID>
+```
+
+Group 只匹配这个 canonical root 的精确路径；父目录的父目录、未登记 sibling、漂移后的旧路径都保持 Disabled。用 `sctx repository group doctor` 检查当前状态。创建 Group 后应新开一个 Agent Session；同一 Session 已经形成的 Enabled/Disabled lease 不会因为 cwd 或 Catalog 随后变化而改写。
+
+### 7.6 Candidate 没有生成
 
 常见原因是 Episode 未关闭、Checkpoint 只有 Unknown、Claim 没有充分 Evidence，或者 Builder 返回 `needs_evidence`。先查看 `task checkpoint` 响应；如果 Episode 已关闭但构建响应丢失，可使用：
 
@@ -728,7 +753,7 @@ sctx candidate build-closed-episode --episode-id <EPISODE_ID>
 
 不要为了生成 Candidate 而编造 Evidence、问题或工程引用。
 
-### 7.6 SQLite 索引异常
+### 7.7 SQLite 索引异常
 
 先执行：
 
@@ -745,7 +770,7 @@ sctx index rebuild
 
 索引是派生数据，可以从 Git 事实重建。
 
-### 7.7 能否团队共享或跨电脑同步
+### 7.8 能否团队共享或跨电脑同步
 
 当前版本不能。Repository Catalog 是单机配置，知识 Store 也没有实现团队远程同步。可以把当前版本理解为“先在一台 Mac 上让多个本机 Agent/Session 继承工程认知”。
 
