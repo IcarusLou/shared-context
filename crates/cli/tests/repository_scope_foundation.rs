@@ -139,6 +139,8 @@ fn setup_foundation() -> FoundationFixture {
     let outer_added = harness.success(&[
         "repository",
         "add",
+        "--repository-id",
+        "Android",
         "--path",
         outer_checkout.to_str().unwrap(),
     ]);
@@ -154,6 +156,8 @@ fn setup_foundation() -> FoundationFixture {
     let nested_added = harness.success(&[
         "repository",
         "add",
+        "--repository-id",
+        "Nested",
         "--path",
         nested_checkout.to_str().unwrap(),
     ]);

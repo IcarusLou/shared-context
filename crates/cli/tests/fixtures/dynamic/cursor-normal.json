@@ -30,6 +30,8 @@
       "action": {"type": "cli_json", "arguments": [
         {"type": "string", "value": "repository"},
         {"type": "string", "value": "add"},
+        {"type": "string", "value": "--repository-id"},
+        {"type": "string", "value": "FE"},
         {"type": "string", "value": "--path"},
         {"type": "builtin", "builtin": {"type": "resource_root", "resource": "focus-repo"}}
       ]}

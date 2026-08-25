@@ -98,7 +98,10 @@ impl Fixture {
         let checkout_path = fs::canonicalize(store.repository()).unwrap();
         let repository_id = UserConfigStore::initialize(&root)
             .unwrap()
-            .add_repository(None, std::slice::from_ref(&checkout_path))
+            .add_repository(
+                sctx_domain::RepositoryId::new(),
+                std::slice::from_ref(&checkout_path),
+            )
             .unwrap()
             .repository
             .repository_id;
@@ -418,7 +421,10 @@ fn add_git_repository(fixture: &Fixture, name: &str) -> (std::path::PathBuf, Rep
     let repository = fs::canonicalize(repository).unwrap();
     let repository_id = UserConfigStore::open_existing(&fixture.root)
         .unwrap()
-        .add_repository(None, std::slice::from_ref(&repository))
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(&repository),
+        )
         .unwrap()
         .repository
         .repository_id;
@@ -882,7 +888,10 @@ fn checkpoint_rejects_dangling_private_stale_conflicting_and_forged_input_withou
     let repository = fs::canonicalize(repository).unwrap();
     let repository_id = UserConfigStore::initialize(&fixture.root)
         .unwrap()
-        .add_repository(None, std::slice::from_ref(&repository))
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(&repository),
+        )
         .unwrap()
         .repository
         .repository_id;
@@ -3430,7 +3439,7 @@ fn authorization_states_cross_agent_and_busy_or_unsafe_storage_fail_identically(
     let added = fs::canonicalize(added).unwrap();
     UserConfigStore::open_existing(&stale.root)
         .unwrap()
-        .add_repository(None, &[added])
+        .add_repository(sctx_domain::RepositoryId::new(), &[added])
         .unwrap();
     assert_eq!(
         authorization_error(&stale, "codex", "stale", ClientKind::Codex),
@@ -3569,7 +3578,10 @@ fn authorization_snapshot_linearizes_before_catalog_mutation_without_toctou_expa
     reached.wait();
     UserConfigStore::open_existing(&fixture.root)
         .unwrap()
-        .add_repository(None, std::slice::from_ref(&nested))
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(&nested),
+        )
         .unwrap();
     release.wait();
     let responses = worker.join().unwrap();

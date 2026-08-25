@@ -331,6 +331,8 @@ fn one_real_hook_to_confirm_identity_chain() {
         &[
             "repository",
             "add",
+            "--repository-id",
+            "Server",
             "--path",
             source_repository.to_str().unwrap(),
         ],

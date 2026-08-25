@@ -130,6 +130,8 @@ fn contract() -> ScenarioDefinition {
                 vec![
                     text("repository"),
                     text("add"),
+                    text("--repository-id"),
+                    text("FE"),
                     text("--path"),
                     resource_root(),
                 ],

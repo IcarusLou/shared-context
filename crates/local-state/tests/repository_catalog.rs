@@ -50,7 +50,7 @@ fn init_repo(path: &Path, marker: &str) -> PathBuf {
 }
 
 #[test]
-fn catalog_assigns_typed_ids_atomically_and_supports_explicit_worktrees() {
+fn catalog_binds_readable_ids_atomically_and_supports_explicit_worktrees() {
     let temporary = TempDir::new().unwrap();
     let root = temporary.path().join("共享 配置");
     let repository = init_repo(&temporary.path().join("primary repo"), "primary");
@@ -68,21 +68,16 @@ fn catalog_assigns_typed_ids_atomically_and_supports_explicit_worktrees() {
     );
     let worktree = fs::canonicalize(worktree).unwrap();
     let config = UserConfigStore::initialize(&root).unwrap();
+    let repository_id: RepositoryId = "FE".parse().unwrap();
 
     let created = config
-        .add_repository(None, std::slice::from_ref(&repository))
+        .add_repository(repository_id.clone(), std::slice::from_ref(&repository))
         .unwrap();
     assert!(created.created_identity);
-    assert!(
-        created
-            .repository
-            .repository_id
-            .to_string()
-            .starts_with("Repository-")
-    );
+    assert_eq!(created.repository.repository_id, repository_id);
     let extended = config
         .add_repository(
-            Some(created.repository.repository_id.clone()),
+            created.repository.repository_id.clone(),
             std::slice::from_ref(&worktree),
         )
         .unwrap();
@@ -90,8 +85,21 @@ fn catalog_assigns_typed_ids_atomically_and_supports_explicit_worktrees() {
     assert_eq!(extended.added_paths, 1);
     assert_eq!(
         extended.repository.checkout_paths,
-        vec![worktree, repository]
+        vec![worktree, repository.clone()]
     );
+    let repeated = config
+        .add_repository(repository_id.clone(), std::slice::from_ref(&repository))
+        .unwrap();
+    assert!(!repeated.created_identity);
+    assert_eq!(repeated.added_paths, 0);
+
+    let case_conflict = init_repo(&temporary.path().join("case conflict"), "case-conflict");
+    let error = config
+        .add_repository("fe".parse().unwrap(), std::slice::from_ref(&case_conflict))
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(error.message().contains("differs only by ASCII case"));
+    assert_eq!(config.repository_catalog().unwrap().repositories.len(), 1);
     let document = fs::read_to_string(root.join("config.toml")).unwrap();
     assert!(document.contains("[[repositories]]"));
     assert!(document.contains(&format!("id = \"{}\"", created.repository.repository_id)));
@@ -116,6 +124,53 @@ fn catalog_assigns_typed_ids_atomically_and_supports_explicit_worktrees() {
 }
 
 #[test]
+fn same_team_id_maps_different_installation_checkouts_without_path_identity() {
+    let temporary = TempDir::new().unwrap();
+    let first_checkout = init_repo(&temporary.path().join("member-a/frontend"), "member-a");
+    let second_checkout = init_repo(&temporary.path().join("member-b/web"), "member-b");
+    let repository_id: RepositoryId = "FE".parse().unwrap();
+
+    let first = UserConfigStore::initialize(temporary.path().join("install-a")).unwrap();
+    let second = UserConfigStore::initialize(temporary.path().join("install-b")).unwrap();
+    let first_added = first
+        .add_repository(repository_id.clone(), std::slice::from_ref(&first_checkout))
+        .unwrap();
+    let second_added = second
+        .add_repository(
+            repository_id.clone(),
+            std::slice::from_ref(&second_checkout),
+        )
+        .unwrap();
+
+    assert_eq!(first_added.repository.repository_id, repository_id);
+    assert_eq!(second_added.repository.repository_id, repository_id);
+    assert_ne!(
+        first_added.repository.checkout_paths,
+        second_added.repository.checkout_paths
+    );
+    let first_file = first_checkout.join("src/search/Search.kt");
+    let second_file = second_checkout.join("src/search/Search.kt");
+    assert_eq!(
+        first
+            .repository_catalog()
+            .unwrap()
+            .resolve_file_path(&first_file, std::slice::from_ref(&first_checkout))
+            .unwrap()
+            .repository_id,
+        repository_id
+    );
+    assert_eq!(
+        second
+            .repository_catalog()
+            .unwrap()
+            .resolve_file_path(&second_file, std::slice::from_ref(&second_checkout))
+            .unwrap()
+            .repository_id,
+        repository_id
+    );
+}
+
+#[test]
 fn cross_workspace_resolution_is_stable_isolated_and_rejects_unsafe_paths() {
     let temporary = TempDir::new().unwrap();
     let cross = temporary.path().join("workspace cross 中文");
@@ -125,17 +180,17 @@ fn cross_workspace_resolution_is_stable_isolated_and_rejects_unsafe_paths() {
     let sibling = init_repo(&cross.join("unconfigured/TikTok"), "sibling");
     let config = UserConfigStore::initialize(temporary.path().join("state root")).unwrap();
     let fe_id = config
-        .add_repository(None, std::slice::from_ref(&fe))
+        .add_repository("FE".parse().unwrap(), std::slice::from_ref(&fe))
         .unwrap()
         .repository
         .repository_id;
     let android_id = config
-        .add_repository(None, std::slice::from_ref(&android))
+        .add_repository("Android".parse().unwrap(), std::slice::from_ref(&android))
         .unwrap()
         .repository
         .repository_id;
     let ios_id = config
-        .add_repository(None, std::slice::from_ref(&ios))
+        .add_repository("iOS".parse().unwrap(), std::slice::from_ref(&ios))
         .unwrap()
         .repository
         .repository_id;
@@ -218,7 +273,7 @@ fn declared_path_resolution_allows_missing_tail_but_rejects_escape_and_symlink_c
     let outside = init_repo(&temporary.path().join("outside repo"), "outside");
     let config = UserConfigStore::initialize(temporary.path().join("declared state")).unwrap();
     let repository_id = config
-        .add_repository(None, std::slice::from_ref(&repository))
+        .add_repository(RepositoryId::new(), std::slice::from_ref(&repository))
         .unwrap()
         .repository
         .repository_id;
@@ -291,7 +346,7 @@ fn catalog_writes_are_concurrent_and_doctor_reports_checkout_drift() {
             barrier.wait();
             UserConfigStore::initialize(root)
                 .unwrap()
-                .add_repository(None, &[repository])
+                .add_repository(RepositoryId::new(), &[repository])
                 .unwrap()
                 .repository
                 .repository_id
@@ -321,6 +376,59 @@ fn catalog_writes_are_concurrent_and_doctor_reports_checkout_drift() {
 }
 
 #[test]
+fn concurrent_explicit_same_identity_converges_to_one_catalog_entry() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("shared identity catalog");
+    let repositories = (0..8)
+        .map(|index| init_repo(&temporary.path().join(format!("member-{index}/fe")), "FE"))
+        .collect::<Vec<_>>();
+    let repository_id: RepositoryId = "FE".parse().unwrap();
+    let barrier = Arc::new(Barrier::new(repositories.len()));
+    let mut workers = Vec::new();
+    for repository in &repositories {
+        let barrier = Arc::clone(&barrier);
+        let root = root.clone();
+        let repository = repository.clone();
+        let repository_id = repository_id.clone();
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            UserConfigStore::initialize(root)
+                .unwrap()
+                .add_repository(repository_id, &[repository])
+                .unwrap()
+        }));
+    }
+    let outcomes = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| outcome.created_identity)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| &outcome.repository.repository_id)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([&repository_id])
+    );
+    let catalog = UserConfigStore::initialize(root)
+        .unwrap()
+        .repository_catalog()
+        .unwrap();
+    assert_eq!(catalog.repositories.len(), 1);
+    assert_eq!(catalog.repositories[0].repository_id, repository_id);
+    assert_eq!(
+        catalog.repositories[0].checkout_paths.len(),
+        repositories.len()
+    );
+}
+
+#[test]
 fn failed_config_write_releases_exclusive_lock_before_immediate_catalog_read() {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -331,13 +439,13 @@ fn failed_config_write_releases_exclusive_lock_before_immediate_catalog_read() {
     let second = init_repo(&temporary.path().join("second repo"), "second");
     let config = UserConfigStore::initialize(&state_root).unwrap();
     let first_id = config
-        .add_repository(None, std::slice::from_ref(&first))
+        .add_repository(RepositoryId::new(), std::slice::from_ref(&first))
         .unwrap()
         .repository
         .repository_id;
 
     fs::set_permissions(&state_root, fs::Permissions::from_mode(0o500)).unwrap();
-    let failed_write = config.add_repository(None, std::slice::from_ref(&second));
+    let failed_write = config.add_repository(RepositoryId::new(), std::slice::from_ref(&second));
     fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700)).unwrap();
 
     let error = failed_write.unwrap_err();
@@ -392,22 +500,22 @@ fn activation_scope_is_direct_group_or_disabled_only_at_explicit_boundaries() {
 
     let config = UserConfigStore::initialize(temporary.path().join("activation state")).unwrap();
     let android_id = config
-        .add_repository(None, std::slice::from_ref(&android))
+        .add_repository("Android".parse().unwrap(), std::slice::from_ref(&android))
         .unwrap()
         .repository
         .repository_id;
     let ios_id = config
-        .add_repository(None, std::slice::from_ref(&ios))
+        .add_repository("iOS".parse().unwrap(), std::slice::from_ref(&ios))
         .unwrap()
         .repository
         .repository_id;
     let outer_id = config
-        .add_repository(None, std::slice::from_ref(&outer))
+        .add_repository("Outer".parse().unwrap(), std::slice::from_ref(&outer))
         .unwrap()
         .repository
         .repository_id;
     let nested_id = config
-        .add_repository(None, std::slice::from_ref(&nested))
+        .add_repository("Nested".parse().unwrap(), std::slice::from_ref(&nested))
         .unwrap()
         .repository
         .repository_id;
@@ -504,17 +612,17 @@ fn repository_groups_reject_unsafe_roots_unknown_or_ineligible_members_and_drift
     let root = fs::canonicalize(root).unwrap();
     let config = UserConfigStore::initialize(temporary.path().join("group state")).unwrap();
     let member_id = config
-        .add_repository(None, std::slice::from_ref(&member))
+        .add_repository(RepositoryId::new(), std::slice::from_ref(&member))
         .unwrap()
         .repository
         .repository_id;
     let second_member_id = config
-        .add_repository(None, std::slice::from_ref(&second_member))
+        .add_repository(RepositoryId::new(), std::slice::from_ref(&second_member))
         .unwrap()
         .repository
         .repository_id;
     let outside_id = config
-        .add_repository(None, std::slice::from_ref(&outside))
+        .add_repository(RepositoryId::new(), std::slice::from_ref(&outside))
         .unwrap()
         .repository
         .repository_id;
@@ -643,7 +751,7 @@ fn configured_repository_group_root_error_names_identity_path_and_reason() {
     let root = fs::canonicalize(root).unwrap();
     let config = UserConfigStore::initialize(temporary.path().join("drift state")).unwrap();
     let member_id = config
-        .add_repository(None, std::slice::from_ref(&member))
+        .add_repository(RepositoryId::new(), std::slice::from_ref(&member))
         .unwrap()
         .repository
         .repository_id;
@@ -681,26 +789,20 @@ fn repository_group_inspection_update_and_remove_repair_drift_without_touching_r
     let replacement_root = fs::canonicalize(replacement_root).unwrap();
     let config = UserConfigStore::initialize(temporary.path().join("repair state")).unwrap();
     let first_id = config
-        .add_repository(None, std::slice::from_ref(&first))
+        .add_repository(RepositoryId::new(), std::slice::from_ref(&first))
         .unwrap()
         .repository
         .repository_id;
     config
-        .add_repository(
-            Some(first_id.clone()),
-            std::slice::from_ref(&replacement_first),
-        )
+        .add_repository(first_id.clone(), std::slice::from_ref(&replacement_first))
         .unwrap();
     let second_id = config
-        .add_repository(None, std::slice::from_ref(&second))
+        .add_repository(RepositoryId::new(), std::slice::from_ref(&second))
         .unwrap()
         .repository
         .repository_id;
     config
-        .add_repository(
-            Some(second_id.clone()),
-            std::slice::from_ref(&replacement_second),
-        )
+        .add_repository(second_id.clone(), std::slice::from_ref(&replacement_second))
         .unwrap();
     let group = config
         .add_repository_group(&original_root, std::slice::from_ref(&first_id))
@@ -942,7 +1044,7 @@ fn concurrent_repository_group_add_is_atomic_and_semantically_idempotent() {
     let root = fs::canonicalize(root).unwrap();
     let config = UserConfigStore::initialize(temporary.path().join("concurrent state")).unwrap();
     let member_id = config
-        .add_repository(None, std::slice::from_ref(&member))
+        .add_repository(RepositoryId::new(), std::slice::from_ref(&member))
         .unwrap()
         .repository
         .repository_id;
@@ -990,7 +1092,7 @@ fn pure_longest_prefix_resolution_meets_the_hot_path_budget() {
     let config = UserConfigStore::initialize(&state_root).unwrap();
     for repository in &repositories {
         config
-            .add_repository(None, std::slice::from_ref(repository))
+            .add_repository(RepositoryId::new(), std::slice::from_ref(repository))
             .unwrap();
     }
     let catalog = config.repository_catalog().unwrap();

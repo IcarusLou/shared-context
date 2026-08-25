@@ -169,17 +169,26 @@ impl Fixture {
         GitStore::initialize(&root).unwrap();
         let config = UserConfigStore::open_existing(&root).unwrap();
         let first = config
-            .add_repository(None, std::slice::from_ref(&repository_a))
+            .add_repository(
+                sctx_domain::RepositoryId::new(),
+                std::slice::from_ref(&repository_a),
+            )
             .unwrap()
             .repository
             .repository_id;
         let second = config
-            .add_repository(None, std::slice::from_ref(&repository_b))
+            .add_repository(
+                sctx_domain::RepositoryId::new(),
+                std::slice::from_ref(&repository_b),
+            )
             .unwrap()
             .repository
             .repository_id;
         config
-            .add_repository(None, std::slice::from_ref(&repository_c))
+            .add_repository(
+                sctx_domain::RepositoryId::new(),
+                std::slice::from_ref(&repository_c),
+            )
             .unwrap();
         config
             .add_repository_group(&group_root, &[first, second])
@@ -1183,7 +1192,7 @@ fn server_negative_matrix_is_uniform_and_writes_no_business_state() {
     let added = fs::canonicalize(added).unwrap();
     UserConfigStore::open_existing(&stale.root)
         .unwrap()
-        .add_repository(None, &[added])
+        .add_repository(sctx_domain::RepositoryId::new(), &[added])
         .unwrap();
     let before = stale.business_snapshot();
     let response = mcp_call(

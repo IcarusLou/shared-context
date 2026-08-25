@@ -60,12 +60,18 @@ impl Fixture {
         GitStore::initialize(&root).unwrap();
         let config = UserConfigStore::open_existing(&root).unwrap();
         let direct_repository_id = config
-            .add_repository(None, std::slice::from_ref(&direct_repository))
+            .add_repository(
+                sctx_domain::RepositoryId::new(),
+                std::slice::from_ref(&direct_repository),
+            )
             .unwrap()
             .repository
             .repository_id;
         let second_repository_id = config
-            .add_repository(None, std::slice::from_ref(&second_repository))
+            .add_repository(
+                sctx_domain::RepositoryId::new(),
+                std::slice::from_ref(&second_repository),
+            )
             .unwrap()
             .repository
             .repository_id;
@@ -405,7 +411,7 @@ fn non_session_start_missing_expired_stale_and_disabled_leases_are_neutral() {
     UserConfigStore::open_existing(fixture.root())
         .unwrap()
         .add_repository(
-            None,
+            sctx_domain::RepositoryId::new(),
             std::slice::from_ref(&fs::canonicalize(third_repository).unwrap()),
         )
         .unwrap();

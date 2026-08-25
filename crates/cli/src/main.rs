@@ -2359,10 +2359,8 @@ fn run_repository(args: &[String], json_output: bool) -> Result<()> {
         "add" => {
             let options = Options::parse(rest, &[])?;
             options.allow_only(&["--repository-id", "--path"], &[])?;
-            let repository_id = options
-                .optional("--repository-id")?
-                .map(|value| parse_id::<RepositoryId>(value, "Repository ID"))
-                .transpose()?;
+            let repository_id =
+                parse_id::<RepositoryId>(options.required("--repository-id")?, "Repository ID")?;
             let paths = options
                 .many("--path")
                 .into_iter()

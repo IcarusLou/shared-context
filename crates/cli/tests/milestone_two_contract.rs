@@ -74,7 +74,10 @@ impl MilestoneTwoFixture {
         let store = GitStore::initialize(&root).unwrap();
         UserConfigStore::initialize(&root)
             .unwrap()
-            .add_repository(None, std::slice::from_ref(&workspace))
+            .add_repository(
+                sctx_domain::RepositoryId::new(),
+                std::slice::from_ref(&workspace),
+            )
             .unwrap();
         let page_space = add_space(
             &store,

@@ -50,7 +50,10 @@ impl Harness {
         GitStore::initialize(&root).unwrap();
         UserConfigStore::initialize(&root)
             .unwrap()
-            .add_repository(None, std::slice::from_ref(&workspace))
+            .add_repository(
+                sctx_domain::RepositoryId::new(),
+                std::slice::from_ref(&workspace),
+            )
             .unwrap();
         Self {
             _temporary: temporary,

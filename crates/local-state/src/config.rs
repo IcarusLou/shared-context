@@ -392,10 +392,8 @@ impl UserConfigStore {
             .resolve_activation_scope(canonical_startup_cwd)
     }
 
-    /// Atomically creates a `RepositoryId` or attaches checkout paths to an existing one.
-    ///
-    /// `repository_id=None` is the only identity-creation path. A supplied ID must
-    /// already exist in this Catalog and therefore cannot inject a new identity.
+    /// Atomically creates an explicitly named `RepositoryId` or attaches checkout
+    /// paths to the existing exact identity.
     ///
     /// # Errors
     ///
@@ -403,7 +401,7 @@ impl UserConfigStore {
     #[allow(clippy::too_many_lines)]
     pub fn add_repository(
         &self,
-        repository_id: Option<RepositoryId>,
+        repository_id: RepositoryId,
         checkout_paths: &[PathBuf],
     ) -> Result<RepositoryCatalogAddOutcome> {
         if checkout_paths.is_empty() {
@@ -437,33 +435,36 @@ impl UserConfigStore {
             for path in &paths {
                 let text = path_text(path)?;
                 if let Some(owner) = configured_owner.get(text.as_str())
-                    && repository_id.as_ref() != Some(owner)
+                    && &repository_id != owner
                 {
                     return Err(invalid(format!(
                         "checkout path is already configured for Repository {owner}"
                     )));
                 }
             }
-            let (repository_id, created_identity) = if let Some(repository_id) = repository_id {
-                if !document
-                    .repositories
-                    .iter()
-                    .any(|repository| repository.id == repository_id)
-                {
-                    return Err(Error::new(
-                        ErrorKind::RepositoryNotConfigured,
-                        format!("Repository is not configured: {repository_id}"),
-                    ));
-                }
-                (repository_id, false)
-            } else {
+            let created_identity = !document
+                .repositories
+                .iter()
+                .any(|repository| repository.id == repository_id);
+            if created_identity {
                 if document.repositories.len() >= MAX_CATALOG_REPOSITORIES {
                     return Err(invariant(format!(
                         "Repository Catalog exceeds {MAX_CATALOG_REPOSITORIES} identities"
                     )));
                 }
-                (RepositoryId::new(), true)
-            };
+                if let Some(conflict) = document.repositories.iter().find(|repository| {
+                    repository
+                        .id
+                        .as_str()
+                        .eq_ignore_ascii_case(repository_id.as_str())
+                }) {
+                    return Err(invalid(format!(
+                        "Repository ID differs only by ASCII case from configured identity {}",
+                        conflict.id
+                    )));
+                }
+            }
+            let lookup_id = repository_id.clone();
             let repository = if let Some(repository) = document
                 .repositories
                 .iter_mut()
@@ -472,7 +473,7 @@ impl UserConfigStore {
                 repository
             } else {
                 document.repositories.push(RepositoryConfigDocument {
-                    id: repository_id.clone(),
+                    id: repository_id,
                     paths: Vec::new(),
                 });
                 let index = document.repositories.len().saturating_sub(1);
@@ -492,7 +493,8 @@ impl UserConfigStore {
             repository.paths.dedup();
             if repository.paths.len() > MAX_CHECKOUTS_PER_REPOSITORY {
                 return Err(invariant(format!(
-                    "Repository {repository_id} exceeds {MAX_CHECKOUTS_PER_REPOSITORY} checkout paths"
+                    "Repository {} exceeds {MAX_CHECKOUTS_PER_REPOSITORY} checkout paths",
+                    repository.id
                 )));
             }
             let added_paths = repository.paths.len().saturating_sub(before);
@@ -505,7 +507,7 @@ impl UserConfigStore {
             let repository = snapshot
                 .repositories
                 .into_iter()
-                .find(|repository| repository.repository_id == repository_id)
+                .find(|repository| repository.repository_id == lookup_id)
                 .ok_or_else(|| invariant("configured Repository disappeared before commit"))?;
             Ok(RepositoryCatalogAddOutcome {
                 repository,

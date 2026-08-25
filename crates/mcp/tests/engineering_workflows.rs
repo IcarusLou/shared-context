@@ -406,10 +406,16 @@ fn scan_record_rebuild_explain_and_task_pack_cross_two_repositories_and_a_worktr
     let (context_id, revision_id) = accepted_context(&root, "alpha graph decision");
     let config = UserConfigStore::initialize(&root).unwrap();
     config
-        .add_repository(None, &[first.clone(), worktree.clone()])
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            &[first.clone(), worktree.clone()],
+        )
         .unwrap();
     config
-        .add_repository(None, std::slice::from_ref(&second))
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(&second),
+        )
         .unwrap();
 
     let first_scan = repository_scan_at_root(
@@ -580,13 +586,19 @@ fn public_mcp_artifact_focus_is_query_scoped_across_six_kinds_and_hot_path() {
         cross_repositories.map(|repository| fs::canonicalize(repository).unwrap());
     let config = UserConfigStore::initialize(&root).unwrap();
     let main_id = config
-        .add_repository(None, std::slice::from_ref(&main_repository))
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(&main_repository),
+        )
         .unwrap()
         .repository
         .repository_id;
     let cross_ids = cross_repositories.each_ref().map(|repository| {
         config
-            .add_repository(None, std::slice::from_ref(repository))
+            .add_repository(
+                sctx_domain::RepositoryId::new(),
+                std::slice::from_ref(repository),
+            )
             .unwrap()
             .repository
             .repository_id
@@ -1101,7 +1113,10 @@ fn reference_recording_is_concurrent_private_and_rejects_unsafe_or_incomplete_in
     let (context_id, revision_id) = accepted_context(&root, "concurrent graph reference");
     UserConfigStore::initialize(&root)
         .unwrap()
-        .add_repository(None, std::slice::from_ref(&repo))
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(&repo),
+        )
         .unwrap();
     let scan = repository_scan_at_root(&root, &scan_input(&repo, &["src/lib.rs"])).unwrap();
     assert!(
@@ -1209,7 +1224,10 @@ fn ambiguous_and_unavailable_explanations_never_choose_and_graph_failure_degrade
     let (context_id, revision_id) = accepted_context(&root, "ambiguous graph reference");
     UserConfigStore::initialize(&root)
         .unwrap()
-        .add_repository(None, std::slice::from_ref(&repo))
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(&repo),
+        )
         .unwrap();
     let scan = repository_scan_at_root(&root, &scan_input(&repo, &["src/a/one.rs"])).unwrap();
     let locator = scan

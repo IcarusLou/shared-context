@@ -713,16 +713,17 @@ Repository Catalog 的配置语义：
 
 ```toml
 [[repositories]]
-id = "rpo_<uuid-v4>"
+id = "FE"
 paths = ["/absolute/canonical/checkout", "/absolute/canonical/worktree"]
 ```
 
-- Catalog 是 RepositoryId 的唯一权威；新 ID 只能由 `repository add` 使用现有 typed `RepositoryId::new()` 格式生成。
+- RepositoryId 是团队显式约定的 exact-case 可读 ASCII 名称；`repository add --repository-id <ID>` 负责创建或幂等挂载本机 checkout，Catalog 不自动生成身份。
 - 一个 ID 可有 `0..N` paths；同一 path 只能属于一个 ID。多个 worktree/checkout 是否同一逻辑 Repository 由显式配置决定。
+- 同一本机 Catalog 拒绝只存在 ASCII 大小写差异的两个 ID，避免 `FE`/`fe` 误绑定；跨机器共享要求使用完全相同的 spelling。
 - basename、remote、Git common-dir、父 Workspace 和 sibling 目录都不是 identity 或合并依据。
 - `repository-registry.sqlite` 是可删除投影；setup、doctor、显式 Runtime open 从 Catalog 原子恢复相同 ID/locators。
 - 运行时文件解析只在允许 Workspace 与 configured checkout 的交集内执行 canonical longest-prefix；输出 RepositoryId + RepoRelativePath。未配置路径为 typed `repository_not_configured`，Workspace 外与 symlink traversal 拒绝。
-- Catalog 仅本机有效，不做团队同步，也不承载 Space/Requirement 关系。
+- Catalog path 绑定仅本机有效，不做团队路径同步，也不承载 Space/Requirement 关系；团队共享的是 RepositoryId spelling 与 Knowledge Store 中引用它的事实。
 
 ### 9.2 仓库结构
 
@@ -1326,7 +1327,7 @@ M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命�
 
 ### M3：Engineering Graph — 已实现
 
-- 本机显式 Repository Catalog 是稳定 RepositoryId 的权威；SQLite Registry 只由 Catalog 同步并可删除恢复。一个 ID 支持 `0..N` checkout/worktree，绝不按 basename、remote、Git common-dir 或共同父目录推断合并/发现。
+- 团队显式约定 exact-case RepositoryId；本机 Catalog 只权威绑定该 ID 与本机 checkout，SQLite Registry 由 Catalog 同步并可删除恢复。一个 ID 支持 `0..N` checkout/worktree，绝不按 basename、remote、Git common-dir 或共同父目录推断合并/发现。
 - `ResolvedRepositoryPath` 可无损转换为本次 File `ResolvedFocus`，但 Hook 当前不发起 ArtifactFocusQuery；热路径不启动 Git、不 scan/rebuild，不配置 sibling。Catalog lock/parse 故障 fail-open。
 - Reference-derived `RepositoryScanPlan` 按 RepositoryId 分组、按精确 RepoRelativePath 去重；受限 tracked-source Scanner 只解析显式非空计划并生成 Module/File/Symbol/API/Schema/Test Artifact 摘要，不保存或返回完整源码，不执行全仓 `git ls-files` 枚举。
 - 持久 EngineeringReference Event、ArtifactResolution、ContextArtifactAssociation 和 generation-stable historical Projection 已实现。

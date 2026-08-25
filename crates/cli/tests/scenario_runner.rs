@@ -95,6 +95,8 @@ fn real_protocol_contract() -> ScenarioDefinition {
                     arguments: vec![
                         string("repository"),
                         string("add"),
+                        string("--repository-id"),
+                        string("FE"),
                         string("--path"),
                         resource_root(),
                     ],
@@ -322,6 +324,8 @@ fn stale_contract() -> ScenarioDefinition {
                     arguments: vec![
                         string("repository"),
                         string("add"),
+                        string("--repository-id"),
+                        string("FE"),
                         string("--path"),
                         builtin(SandboxBuiltin::ResourceRoot {
                             resource: resource.clone(),

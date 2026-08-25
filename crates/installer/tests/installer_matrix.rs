@@ -907,7 +907,7 @@ fn setup_and_doctor_restore_registry_from_catalog_and_report_invalid_config() {
     let checkout = init_catalog_repo(&harness.home.join("configured checkout"));
     let configured = UserConfigStore::initialize(&harness.root)
         .unwrap()
-        .add_repository(None, &[checkout])
+        .add_repository(sctx_domain::RepositoryId::new(), &[checkout])
         .unwrap();
     let installer = harness.installer("1.0.0");
     installer.setup(&SetupOptions::default()).unwrap();

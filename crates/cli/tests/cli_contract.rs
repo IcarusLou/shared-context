@@ -626,12 +626,19 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         .status()
         .unwrap();
     assert!(git.success());
-    let configured = harness.success(&["repository", "add", "--path", workspace.to_str().unwrap()]);
+    let configured = harness.success(&[
+        "repository",
+        "add",
+        "--repository-id",
+        "FE",
+        "--path",
+        workspace.to_str().unwrap(),
+    ]);
     let configured_repository_id = configured["data"]["catalog"]["repository"]["repository_id"]
         .as_str()
         .unwrap()
         .to_owned();
-    assert!(configured_repository_id.starts_with("Repository-"));
+    assert_eq!(configured_repository_id, "FE");
 
     let prompt = |session_id: &str, text: &str| {
         serde_json::json!({
@@ -938,7 +945,10 @@ fn hook_catalog_mapping_never_discovers_sibling_repositories() {
     let explicit = &repositories[1];
     let configured = UserConfigStore::initialize(harness.root())
         .unwrap()
-        .add_repository(None, std::slice::from_ref(explicit))
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(explicit),
+        )
         .unwrap();
     sctx_mcp::sync_repository_catalog_at_root(harness.root()).unwrap();
     let fake_bin = harness.home.join("no-git-hot-path/bin");
@@ -1085,8 +1095,15 @@ fn cross_parent_workspace_maps_three_catalog_repositories_without_cross_contamin
         .map(|repository| fs::canonicalize(repository).unwrap())
         .collect::<Vec<_>>();
     let mut configured_ids = Vec::new();
-    for repository in &repositories[..3] {
-        let added = harness.success(&["repository", "add", "--path", repository.to_str().unwrap()]);
+    for (repository, repository_id) in repositories[..3].iter().zip(["FE", "Android", "iOS"]) {
+        let added = harness.success(&[
+            "repository",
+            "add",
+            "--repository-id",
+            repository_id,
+            "--path",
+            repository.to_str().unwrap(),
+        ]);
         configured_ids.push(
             added["data"]["catalog"]["repository"]["repository_id"]
                 .as_str()
@@ -1262,12 +1279,17 @@ fn engineering_graph_cli_commands_scan_record_rebuild_and_explain() {
         "src/contract.rs",
     ]);
     assert_eq!(unconfigured["error"]["code"], "repository_not_configured");
-    let added = harness.success(&["repository", "add", "--path", repository.to_str().unwrap()]);
-    assert!(
-        added["data"]["catalog"]["repository"]["repository_id"]
-            .as_str()
-            .unwrap()
-            .starts_with("Repository-")
+    let added = harness.success(&[
+        "repository",
+        "add",
+        "--repository-id",
+        "FE",
+        "--path",
+        repository.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        added["data"]["catalog"]["repository"]["repository_id"],
+        "FE"
     );
     let listed = harness.success(&["repository", "list"]);
     assert_eq!(listed["data"]["repositories"].as_array().unwrap().len(), 1);
@@ -1346,6 +1368,75 @@ fn repository_doctor_rejects_invalid_catalog_identity_with_typed_error() {
 }
 
 #[test]
+fn repository_add_requires_a_readable_id_and_upserts_only_the_exact_spelling() {
+    let harness = Harness::new();
+    let first = init_cli_repo(&harness.home.join("frontend-a"));
+    let worktree = init_cli_repo(&harness.home.join("frontend-b"));
+    let case_conflict = init_cli_repo(&harness.home.join("frontend-case-conflict"));
+
+    let missing = harness.failure(&["repository", "add", "--path", first.to_str().unwrap()]);
+    assert_eq!(missing["error"]["code"], "invalid_input");
+    assert!(
+        missing["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--repository-id")
+    );
+
+    let created = harness.success(&[
+        "repository",
+        "add",
+        "--repository-id",
+        "FE",
+        "--path",
+        first.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        created["data"]["catalog"]["repository"]["repository_id"],
+        "FE"
+    );
+    assert_eq!(created["data"]["catalog"]["created_identity"], true);
+
+    let extended = harness.success(&[
+        "repository",
+        "add",
+        "--repository-id",
+        "FE",
+        "--path",
+        worktree.to_str().unwrap(),
+    ]);
+    assert_eq!(extended["data"]["catalog"]["created_identity"], false);
+    assert_eq!(extended["data"]["catalog"]["added_paths"], 1);
+
+    let rejected = harness.failure(&[
+        "repository",
+        "add",
+        "--repository-id",
+        "fe",
+        "--path",
+        case_conflict.to_str().unwrap(),
+    ]);
+    assert_eq!(rejected["error"]["code"], "invalid_input");
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("differs only by ASCII case")
+    );
+
+    let listed = harness.success(&["repository", "list"]);
+    assert_eq!(listed["data"]["repositories"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["data"]["repositories"][0]["repository_id"], "FE");
+    assert_eq!(
+        listed["data"]["repositories"][0]["checkout_paths"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn repository_group_cli_is_explicit_idempotent_concurrent_and_repairs_root_drift() {
     let harness = Harness::new();
@@ -1359,7 +1450,14 @@ fn repository_group_cli_is_explicit_idempotent_concurrent_and_repairs_root_drift
     let replacement_second = init_cli_repo(&replacement_root.join("second"));
     let replacement_root = fs::canonicalize(replacement_root).unwrap();
 
-    let first_added = harness.success(&["repository", "add", "--path", first.to_str().unwrap()]);
+    let first_added = harness.success(&[
+        "repository",
+        "add",
+        "--repository-id",
+        "Android",
+        "--path",
+        first.to_str().unwrap(),
+    ]);
     let first_id = first_added["data"]["catalog"]["repository"]["repository_id"]
         .as_str()
         .unwrap()
@@ -1372,7 +1470,14 @@ fn repository_group_cli_is_explicit_idempotent_concurrent_and_repairs_root_drift
         "--path",
         replacement_first.to_str().unwrap(),
     ]);
-    let second_added = harness.success(&["repository", "add", "--path", second.to_str().unwrap()]);
+    let second_added = harness.success(&[
+        "repository",
+        "add",
+        "--repository-id",
+        "iOS",
+        "--path",
+        second.to_str().unwrap(),
+    ]);
     let second_id = second_added["data"]["catalog"]["repository"]["repository_id"]
         .as_str()
         .unwrap()
@@ -2112,7 +2217,10 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
     let business_repository = fs::canonicalize(business_repository).unwrap();
     UserConfigStore::initialize(harness.root())
         .unwrap()
-        .add_repository(None, std::slice::from_ref(&business_repository))
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(&business_repository),
+        )
         .unwrap();
     let focus_path = harness.home.join("task-artifact-focus.json");
     fs::write(
@@ -2209,7 +2317,14 @@ fn post_tool_hook_captures_a_bounded_breadcrumb_not_raw_payload() {
             .success()
     );
     let workspace = fs::canonicalize(workspace).unwrap();
-    harness.success(&["repository", "add", "--path", workspace.to_str().unwrap()]);
+    harness.success(&[
+        "repository",
+        "add",
+        "--repository-id",
+        "FE",
+        "--path",
+        workspace.to_str().unwrap(),
+    ]);
     let start = serde_json::json!({
         "conversation_id": "conv_contract",
         "generation_id": "gen_contract",

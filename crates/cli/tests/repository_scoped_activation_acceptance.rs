@@ -107,12 +107,18 @@ impl Fixture {
         GitStore::initialize(&root).unwrap();
         let config = UserConfigStore::open_existing(&root).unwrap();
         let first_id = config
-            .add_repository(None, std::slice::from_ref(&repository_a))
+            .add_repository(
+                sctx_domain::RepositoryId::new(),
+                std::slice::from_ref(&repository_a),
+            )
             .unwrap()
             .repository
             .repository_id;
         let second_id = config
-            .add_repository(None, std::slice::from_ref(&repository_b))
+            .add_repository(
+                sctx_domain::RepositoryId::new(),
+                std::slice::from_ref(&repository_b),
+            )
             .unwrap()
             .repository
             .repository_id;

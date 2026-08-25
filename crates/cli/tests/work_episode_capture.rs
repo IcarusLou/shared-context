@@ -152,7 +152,10 @@ fn hook_capture_keeps_locator_then_explicit_claim_and_ingestion_are_verifiable()
     let cross = fs::canonicalize(cross).unwrap();
     UserConfigStore::initialize(harness.root())
         .unwrap()
-        .add_repository(None, std::slice::from_ref(&repository))
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(&repository),
+        )
         .unwrap();
     assert!(
         harness.hook(&session_start("capture-before-task", &repository))["systemMessage"]

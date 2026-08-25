@@ -608,8 +608,7 @@ CONTEXT_ID:REVISION_ID:retained|revised|withdrawn|scope_split
 
 | 命令 | 功能 |
 |---|---|
-| `sctx repository add --path <绝对仓库路径> [--path ...]` | 创建一个本机 Repository ID，并登记一个或多个 canonical checkout/worktree。 |
-| `sctx repository add --repository-id <ID> --path <路径>` | 给已经登记的 Repository ID 增加 checkout 路径。 |
+| `sctx repository add --repository-id <ID> --path <绝对仓库路径> [--path ...]` | 用团队约定的 ID 创建本机 Catalog 身份，或给已有 exact ID 增加 canonical checkout/worktree。 |
 | `sctx repository list` | 查看 Repository Catalog，并同步本地 Registry。 |
 | `sctx repository doctor` | 检查 checkout 是可用、缺失还是不安全，并在安全时同步 Registry。 |
 | `sctx repository group add --root <绝对父目录> --member-repository-id <ID> [--member-repository-id <ID> ...]` | 显式登记一个精确父目录为 Repository Group；只有该 root 本身可以启用 Group，普通祖先目录不会自动启用。 |
@@ -623,9 +622,11 @@ CONTEXT_ID:REVISION_ID:retained|revised|withdrawn|scope_split
 
 支持的工程对象是 `module`、`file`、`symbol`、`api`、`schema`、`test`；关系是 `implements`、`defines`、`consumes`、`validates`、`constrains`、`depends_on`。
 
+RepositoryId 是 1–64 字节、大小写敏感的可读 ASCII 名称，例如 `Android`、`iOS`、`FE`。首字符必须是字母，后续可使用字母、数字、点、下划线和连字符。团队成员应对同一逻辑源码仓库使用完全相同的 ID；本机 Catalog 会拒绝 `FE` 与 `fe` 这类仅大小写不同的重复身份，也不会从路径、basename 或 Git remote 猜测 ID。
+
 `engineering-reference record` 只应在直接检查或验证后调用。它要求完整、确定性的 locator、非空 `supports` 和至少一条 `limitations`。不要用相似文件名猜移动或重命名关系。
 
-例如多个 Android 仓库位于同一父目录，而你希望从父目录启动 Agent，应先用 `repository list` 取得各成员的 Repository ID，再显式创建 Group。仅仅把已登记仓库放在同一个父目录下不会自动产生 Group；从更高层祖先目录启动仍是 Disabled。这条规则避免系统把未登记 sibling 猜测成 Group 成员或 Repository identity；Session 已准入后对安全未登记位置的调查最多形成非定位工程含义。
+例如多个 Android 仓库位于同一父目录，而你希望从父目录启动 Agent，应先分别用显式 Repository ID 登记，再用 `repository list` 核对并创建 Group。仅仅把已登记仓库放在同一个父目录下不会自动产生 Group；从更高层祖先目录启动仍是 Disabled。这条规则避免系统把未登记 sibling 猜测成 Group 成员或 Repository identity；Session 已准入后对安全未登记位置的调查最多形成非定位工程含义。
 
 ### 6.8 搜索与读取
 

@@ -339,7 +339,10 @@ fn cursor_post_tool_hook_fails_open_when_runtime_is_unavailable() {
     let file = fs::canonicalize(file).unwrap();
     UserConfigStore::open_existing(harness.root())
         .unwrap()
-        .add_repository(None, std::slice::from_ref(&workspace))
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(&workspace),
+        )
         .unwrap();
     let start = harness.hook(
         "cursor",
@@ -383,7 +386,10 @@ fn cursor_post_tool_hook_ignores_repository_registry_failure() {
     let file = fs::canonicalize(file).unwrap();
     UserConfigStore::initialize(harness.root())
         .unwrap()
-        .add_repository(None, std::slice::from_ref(&workspace))
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(&workspace),
+        )
         .unwrap();
     TaskRuntime::initialize(harness.root())
         .unwrap()
