@@ -1519,10 +1519,10 @@ fn reject_hardcoded_domain_ids(value: &Value) -> Result<(), ContractError> {
     }
 }
 
-const DOMAIN_ID_PREFIXES: [&str; 27] = [
-    "spc_", "rpo_", "ref_", "tsk_", "tss_", "xss_", "tir_", "sig_", "cap_", "wep_", "wob_", "ckp_",
-    "clm_", "bld_", "rec_", "cnd_", "sub_", "cfm_", "asc_", "ctx_", "rev_", "evt_", "pub_", "evd_",
-    "rvw_", "cnf_", "rsl_",
+const DOMAIN_ID_PREFIXES: [&str; 28] = [
+    "spc_", "rpo_", "rpg_", "ref_", "tsk_", "tss_", "xss_", "tir_", "sig_", "cap_", "wep_", "wob_",
+    "ckp_", "clm_", "bld_", "rec_", "cnd_", "sub_", "cfm_", "asc_", "ctx_", "rev_", "evt_", "pub_",
+    "evd_", "rvw_", "cnf_", "rsl_",
 ];
 
 fn find_domain_id_prefix(value: &str) -> Option<&'static str> {
@@ -1580,7 +1580,7 @@ mod tests {
             DOMAIN_ID_PREFIXES.len(),
             "the scenario denylist must change with the product's opaque ID declarations"
         );
-        assert_eq!(DOMAIN_ID_PREFIXES.len(), 27);
+        assert_eq!(DOMAIN_ID_PREFIXES.len(), 28);
         for prefix in DOMAIN_ID_PREFIXES {
             assert!(
                 declarations.contains(&format!("\"{prefix}\"")),
@@ -1595,6 +1595,8 @@ mod tests {
     fn domain_id_scan_does_not_flag_business_text() {
         for value in [
             "tsk_documentation",
+            "rpg_feature",
+            "rpg_not-a-uuid",
             "rev_parse",
             "ctx_menu",
             "a_tsk_123e4567-e89b-42d3-a456-426614174000",

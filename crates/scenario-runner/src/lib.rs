@@ -1758,10 +1758,10 @@ fn validate_domain_id(value: &Value, prefix: &str) -> Result<(), ()> {
 }
 
 fn is_domain_id(value: &str) -> bool {
-    const PREFIXES: [&str; 27] = [
-        "spc_", "rpo_", "ref_", "tsk_", "tss_", "xss_", "tir_", "sig_", "cap_", "wep_", "wob_",
-        "ckp_", "clm_", "bld_", "rec_", "cnd_", "sub_", "cfm_", "asc_", "ctx_", "rev_", "evt_",
-        "pub_", "evd_", "rvw_", "cnf_", "rsl_",
+    const PREFIXES: [&str; 28] = [
+        "spc_", "rpo_", "rpg_", "ref_", "tsk_", "tss_", "xss_", "tir_", "sig_", "cap_", "wep_",
+        "wob_", "ckp_", "clm_", "bld_", "rec_", "cnd_", "sub_", "cfm_", "asc_", "ctx_", "rev_",
+        "evt_", "pub_", "evd_", "rvw_", "cnf_", "rsl_",
     ];
     PREFIXES
         .iter()
@@ -2275,4 +2275,21 @@ fn map_process_error(
         },
         error.message,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_domain_id;
+
+    #[test]
+    fn repository_group_identity_is_recognized_without_flagging_business_text() {
+        assert!(is_domain_id("rpg_123e4567-e89b-42d3-a456-426614174000"));
+        for value in [
+            "rpg_feature",
+            "rpg_not-a-uuid",
+            "rpg_123e4567-e89b-12d3-a456-426614174000",
+        ] {
+            assert!(!is_domain_id(value), "{value}");
+        }
+    }
 }
