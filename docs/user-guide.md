@@ -280,7 +280,7 @@ Workspace 路径不会自动绑定一个 Space，文本 Hint 也不会冒充已�
 - SessionStart 在模型推理前用本机 Repository Catalog 判定范围，不读取 Prompt，也不调用模型。已登记 checkout 是 `Direct`；只有显式登记且精确匹配的 Group root 才是 `Group`；普通父目录、未登记 sibling 和其他目录都是 `Disabled`。
 - Enabled 只返回一个固定、短小且不含路径/Repository/Prompt/Session 身份的 marker。PromptSubmit 不重复 marker。Disabled 的 Prompt、Tool、压缩、停止和结束 Hook 不打开 Runtime/Capture，也不写 Report 或知识 Git。
 - 同一 Agent Session locator 的第一次成功决定会一直复用到 SessionEnd；后续 resume/compact 或 cwd 变化不会重新判定。Catalog/lease 锁忙、损坏或异常会立即按 Disabled 处理，但不会阻断正常编程。
-- PostToolUse 会在记录前检查全部结构化路径。显式 Group 的成员可以共同出现在一个事件中；未登记 sibling、成员与 sibling 混合、相对/缺失/symlink/歧义路径会让整条事件被丢弃。
+- PostToolUse 会在记录前检查全部结构化路径。Enabled 表示整个 Session 已准入，不把调查目标限制在启动 Repo 或 Group 成员：其他已登记 Repo 会按真实 Catalog identity 记录；安全的未登记路径、registered/unregistered mixed 或无法用一个显式 workspace 安全表示的多 Repo 事件只保留无路径、无 Repository 猜测的非定位工程含义；相对、缺失、symlink、歧义或特殊文件仍让整条事件被丢弃。
 - Hook 采用 fail-open：Shared Context 暂时不可用时，正常编程仍可继续。
 - 短期 Capture 会先做隐私过滤，默认保留时间为 24 小时，并受大小限制。
 - Work Episode 和长期 Context 保存结构化工程含义，不保存原始聊天、完整工具输出或完整终端日志。
@@ -625,7 +625,7 @@ CONTEXT_ID:REVISION_ID:retained|revised|withdrawn|scope_split
 
 `engineering-reference record` 只应在直接检查或验证后调用。它要求完整、确定性的 locator、非空 `supports` 和至少一条 `limitations`。不要用相似文件名猜移动或重命名关系。
 
-例如多个 Android 仓库位于同一父目录，而你希望从父目录启动 Agent，应先用 `repository list` 取得各成员的 Repository ID，再显式创建 Group。仅仅把已登记仓库放在同一个父目录下不会自动产生 Group；从更高层祖先目录启动仍是 Disabled。这条规则避免系统把未登记 sibling 一并纳入记录范围。
+例如多个 Android 仓库位于同一父目录，而你希望从父目录启动 Agent，应先用 `repository list` 取得各成员的 Repository ID，再显式创建 Group。仅仅把已登记仓库放在同一个父目录下不会自动产生 Group；从更高层祖先目录启动仍是 Disabled。这条规则避免系统把未登记 sibling 猜测成 Group 成员或 Repository identity；Session 已准入后对安全未登记位置的调查最多形成非定位工程含义。
 
 ### 6.8 搜索与读取
 
@@ -696,7 +696,7 @@ sctx search \
 
 CLI 还提供 Space/Context 写入治理、语义冲突、索引和 Pending Batch 等管理员能力；这些没有全部开放成 Agent MCP 写工具，以维持显式审核和生命周期边界。
 
-当前 Repository 准入控制的是 Hook 的 Agent-visible activation 与生命周期记录路径。MCP Server 仍由用户级 Agent 配置提供，尚未用 Session lease 实现 Server authorization；完整 Skill 也尚未按目录条件加载/卸载。因此不要把 Disabled 理解为 MCP 进程物理未启动或 Server 已拒绝所有主动调用。当前已经证明的是：Disabled Hook 不向模型注入 Shared Context 文本，也不产生 Runtime/Capture/Report/知识 Git 记录。
+当前 Repository 准入控制 Hook 的 Agent-visible activation 与生命周期记录路径；MCP Server 也已用 current Enabled Session lease 实现授权校验，Disabled/Missing/Expired/Stale/busy/corrupt Session 的调用会被拒绝。MCP 进程仍由用户级 Agent 配置提供，完整 Skill 也尚未按目录条件加载/卸载。因此不要把 Disabled 理解为 MCP 进程物理未启动，也不要把 Server 端拒绝外推为已经节省 Agent 产生调用前的 token。当前已经证明的是：Disabled Hook 不向模型注入 Shared Context 文本、不产生 Runtime/Capture/Report/知识 Git 记录，Server guard 保证安全和不落越权数据；完整 Skill 的推理前条件加载仍待后续实现。
 
 ## 7. 常见问题
 

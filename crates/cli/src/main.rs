@@ -843,10 +843,22 @@ fn remove_hook_session_scope(agent: &str, session_id: &str) {
 }
 
 #[derive(Debug)]
-struct HookEventAttribution {
-    repository_ids: BTreeSet<RepositoryId>,
-    workspace_hint: PathBuf,
-    file_hints: Vec<PathBuf>,
+enum HookEventAttribution {
+    Registered {
+        workspace_hint: PathBuf,
+        file_hints: Vec<PathBuf>,
+    },
+    NonLocating,
+}
+
+#[derive(Debug)]
+enum SafePathAttribution {
+    Registered {
+        repository_id: RepositoryId,
+        checkout_path: PathBuf,
+        file_hint: Option<PathBuf>,
+    },
+    Unregistered,
 }
 
 fn attribute_post_tool_action(
@@ -865,9 +877,6 @@ fn attribute_post_tool_action(
     };
     let attribution =
         resolve_post_tool_attribution(context.cwd.as_path(), path_hints, scope, catalog)?;
-    if attribution.repository_ids.is_empty() {
-        return Err(invariant("PostToolUse attribution resolved no Repository"));
-    }
     let Some(TaskRuntimeOperation::MergeObservations {
         cwd,
         workspace_roots,
@@ -877,14 +886,28 @@ fn attribute_post_tool_action(
     else {
         return Err(invariant("enabled PostToolUse has no merge operation"));
     };
-    cwd.clone_from(&attribution.workspace_hint);
-    *workspace_roots = vec![attribution.workspace_hint.clone()];
-    file_hints.clone_from(&attribution.file_hints);
     let Some(breadcrumb) = action.breadcrumb.as_mut() else {
         return Err(invariant("enabled PostToolUse has no Breadcrumb"));
     };
-    breadcrumb.workspace_hint = Some(attribution.workspace_hint);
-    breadcrumb.file_hints = attribution.file_hints;
+    match attribution {
+        HookEventAttribution::Registered {
+            workspace_hint,
+            file_hints: attributed_files,
+        } => {
+            cwd.clone_from(&workspace_hint);
+            *workspace_roots = vec![workspace_hint.clone()];
+            file_hints.clone_from(&attributed_files);
+            breadcrumb.workspace_hint = Some(workspace_hint);
+            breadcrumb.file_hints = attributed_files;
+        }
+        HookEventAttribution::NonLocating => {
+            *cwd = PathBuf::new();
+            workspace_roots.clear();
+            file_hints.clear();
+            breadcrumb.workspace_hint = None;
+            breadcrumb.file_hints.clear();
+        }
+    }
     Ok(action)
 }
 
@@ -894,67 +917,45 @@ fn resolve_post_tool_attribution(
     scope: &AuthorizedSessionScope,
     catalog: &RepositoryCatalogSnapshot,
 ) -> Result<HookEventAttribution> {
-    let allowed_repository_ids = scope
-        .allowed_repository_ids
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    if allowed_repository_ids.is_empty()
-        || matches!(scope.decision, AuthorizedSessionScopeDecision::Disabled)
-    {
+    if matches!(scope.decision, AuthorizedSessionScopeDecision::Disabled) {
         return Err(invalid("PostToolUse requires an enabled Session scope"));
     }
 
     let mut repository_ids = BTreeSet::new();
     let mut checkout_paths = BTreeSet::new();
     let mut file_hints = BTreeSet::new();
+    let mut has_unregistered_path = false;
     if path_hints.is_empty() {
-        let (repository_id, checkout_path) = resolve_attributed_directory(event_cwd, catalog)?;
-        ensure_repository_allowed(repository_id, &allowed_repository_ids)?;
-        repository_ids.insert(repository_id);
-        checkout_paths.insert(checkout_path);
+        collect_safe_path_attribution(
+            resolve_safe_directory(event_cwd, catalog)?,
+            &mut repository_ids,
+            &mut checkout_paths,
+            &mut file_hints,
+            &mut has_unregistered_path,
+        );
     } else {
         for hint in path_hints {
-            resolve_structured_path_hint(
-                hint,
-                catalog,
-                &allowed_repository_ids,
+            collect_safe_path_attribution(
+                resolve_structured_path_hint(hint, catalog)?,
                 &mut repository_ids,
                 &mut checkout_paths,
                 &mut file_hints,
-            )?;
+                &mut has_unregistered_path,
+            );
         }
     }
 
-    let workspace_hint = match scope.decision {
-        AuthorizedSessionScopeDecision::Direct { repository_id } => {
-            if repository_ids
-                .iter()
-                .any(|resolved| *resolved != repository_id)
-            {
-                return Err(invalid("PostToolUse is outside its Direct Repository"));
-            }
-            checkout_paths
-                .into_iter()
-                .next()
-                .ok_or_else(|| invariant("Direct attribution has no checkout"))?
-        }
-        AuthorizedSessionScopeDecision::Group {
-            repository_group_id,
-        } => catalog
-            .repository_groups
-            .iter()
-            .find(|group| group.repository_group_id == repository_group_id)
-            .filter(|group| group.member_repository_ids == scope.allowed_repository_ids)
-            .map(|group| group.root_path.clone())
-            .ok_or_else(|| invariant("Group lease does not match the current Catalog"))?,
-        AuthorizedSessionScopeDecision::Disabled => {
-            return Err(invalid("PostToolUse requires an enabled Session scope"));
-        }
+    if has_unregistered_path {
+        return Ok(HookEventAttribution::NonLocating);
+    }
+    if repository_ids.is_empty() || checkout_paths.is_empty() {
+        return Err(invariant("PostToolUse attribution resolved no safe path"));
+    }
+    let Some(workspace_hint) = resolve_registered_capture_workspace(&checkout_paths, catalog)
+    else {
+        return Ok(HookEventAttribution::NonLocating);
     };
-
-    Ok(HookEventAttribution {
-        repository_ids,
+    Ok(HookEventAttribution::Registered {
         workspace_hint,
         file_hints: file_hints.into_iter().collect(),
     })
@@ -963,104 +964,144 @@ fn resolve_post_tool_attribution(
 fn resolve_structured_path_hint(
     hint: &PathHint,
     catalog: &RepositoryCatalogSnapshot,
-    allowed_repository_ids: &BTreeSet<RepositoryId>,
-    repository_ids: &mut BTreeSet<RepositoryId>,
-    checkout_paths: &mut BTreeSet<PathBuf>,
-    file_hints: &mut BTreeSet<PathBuf>,
-) -> Result<()> {
+) -> Result<SafePathAttribution> {
     match hint {
-        PathHint::File(path) => resolve_attributed_file(
-            path,
-            catalog,
-            allowed_repository_ids,
-            repository_ids,
-            checkout_paths,
-            file_hints,
-        ),
+        PathHint::File(path) => resolve_safe_file(path, catalog),
         PathHint::Path(path) => {
-            let metadata = fs::symlink_metadata(path).map_err(|error| {
-                Error::new(ErrorKind::Io, format!("inspect structured path: {error}"))
-            })?;
-            if metadata.file_type().is_symlink() {
-                return Err(invalid("PostToolUse path must not be a symlink"));
-            }
+            let metadata = validate_safe_existing_path(path)?;
             if metadata.is_file() {
-                return resolve_attributed_file(
-                    path,
-                    catalog,
-                    allowed_repository_ids,
-                    repository_ids,
-                    checkout_paths,
-                    file_hints,
-                );
+                return resolve_safe_file(path, catalog);
             }
-            if !metadata.is_dir() {
-                return Err(invalid(
-                    "PostToolUse path must identify a regular file or directory",
-                ));
-            }
-            let (repository_id, checkout_path) = resolve_attributed_directory(path, catalog)?;
-            ensure_repository_allowed(repository_id, allowed_repository_ids)?;
-            repository_ids.insert(repository_id);
-            checkout_paths.insert(checkout_path);
-            Ok(())
+            resolve_safe_directory(path, catalog)
         }
-        PathHint::WorkingDirectory(path) => {
-            let (repository_id, checkout_path) = resolve_attributed_directory(path, catalog)?;
-            ensure_repository_allowed(repository_id, allowed_repository_ids)?;
-            repository_ids.insert(repository_id);
-            checkout_paths.insert(checkout_path);
-            Ok(())
-        }
+        PathHint::WorkingDirectory(path) => resolve_safe_directory(path, catalog),
         PathHint::Ambiguous => Err(invalid("PostToolUse contains an ambiguous path hint")),
     }
 }
 
-fn resolve_attributed_file(
+fn resolve_safe_file(
     path: &Path,
     catalog: &RepositoryCatalogSnapshot,
-    allowed_repository_ids: &BTreeSet<RepositoryId>,
-    repository_ids: &mut BTreeSet<RepositoryId>,
-    checkout_paths: &mut BTreeSet<PathBuf>,
-    file_hints: &mut BTreeSet<PathBuf>,
-) -> Result<()> {
-    let declared = catalog.resolve_declared_path(path)?;
-    ensure_repository_allowed(declared.repository_id, allowed_repository_ids)?;
+) -> Result<SafePathAttribution> {
+    let metadata = validate_safe_existing_path(path)?;
+    if !metadata.is_file() {
+        return Err(invalid(
+            "PostToolUse file path must identify a regular file",
+        ));
+    }
+    let declared = match catalog.resolve_declared_path(path) {
+        Ok(declared) => declared,
+        Err(error) if error.kind() == ErrorKind::RepositoryNotConfigured => {
+            return Ok(SafePathAttribution::Unregistered);
+        }
+        Err(error) => return Err(error),
+    };
     let resolved =
         catalog.resolve_file_path(path, std::slice::from_ref(&declared.checkout_path))?;
-    repository_ids.insert(resolved.repository_id);
-    checkout_paths.insert(resolved.checkout_path);
-    file_hints.insert(path.to_path_buf());
-    Ok(())
+    Ok(SafePathAttribution::Registered {
+        repository_id: resolved.repository_id,
+        checkout_path: resolved.checkout_path,
+        file_hint: Some(path.to_path_buf()),
+    })
 }
 
-fn resolve_attributed_directory(
+fn resolve_safe_directory(
     directory: &Path,
     catalog: &RepositoryCatalogSnapshot,
-) -> Result<(RepositoryId, PathBuf)> {
+) -> Result<SafePathAttribution> {
+    let metadata = validate_safe_existing_path(directory)?;
+    if !metadata.is_dir() {
+        return Err(invalid(
+            "PostToolUse working directory must identify a directory",
+        ));
+    }
     match catalog.resolve_activation_scope(directory)?.decision {
         sctx_local_state::ActivationScopeDecision::Direct {
             repository_id,
             checkout_path,
-        } => Ok((repository_id, checkout_path)),
+        } => Ok(SafePathAttribution::Registered {
+            repository_id,
+            checkout_path,
+            file_hint: None,
+        }),
         sctx_local_state::ActivationScopeDecision::Group { .. }
-        | sctx_local_state::ActivationScopeDecision::Disabled => Err(invalid(
-            "PostToolUse working directory is not inside a configured Repository checkout",
-        )),
+        | sctx_local_state::ActivationScopeDecision::Disabled => {
+            Ok(SafePathAttribution::Unregistered)
+        }
     }
 }
 
-fn ensure_repository_allowed(
-    repository_id: RepositoryId,
-    allowed_repository_ids: &BTreeSet<RepositoryId>,
-) -> Result<()> {
-    if allowed_repository_ids.contains(&repository_id) {
-        Ok(())
-    } else {
-        Err(invalid(
-            "PostToolUse Repository is outside the Session scope",
-        ))
+fn validate_safe_existing_path(path: &Path) -> Result<fs::Metadata> {
+    if !path.is_absolute() {
+        return Err(invalid("PostToolUse path must be absolute"));
     }
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| Error::new(ErrorKind::Io, format!("inspect PostToolUse path: {error}")))?;
+    if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
+        return Err(invalid(
+            "PostToolUse path must identify a non-symlink regular file or directory",
+        ));
+    }
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        Error::new(
+            ErrorKind::Io,
+            format!("canonicalize PostToolUse path: {error}"),
+        )
+    })?;
+    if canonical != path {
+        return Err(invalid(
+            "PostToolUse path must be canonical and contain no symlink components",
+        ));
+    }
+    Ok(metadata)
+}
+
+fn collect_safe_path_attribution(
+    attribution: SafePathAttribution,
+    repository_ids: &mut BTreeSet<RepositoryId>,
+    checkout_paths: &mut BTreeSet<PathBuf>,
+    file_hints: &mut BTreeSet<PathBuf>,
+    has_unregistered_path: &mut bool,
+) {
+    if let SafePathAttribution::Registered {
+        repository_id,
+        checkout_path,
+        file_hint,
+    } = attribution
+    {
+        repository_ids.insert(repository_id);
+        checkout_paths.insert(checkout_path);
+        file_hints.extend(file_hint);
+    } else {
+        *has_unregistered_path = true;
+    }
+}
+
+fn resolve_registered_capture_workspace(
+    checkout_paths: &BTreeSet<PathBuf>,
+    catalog: &RepositoryCatalogSnapshot,
+) -> Option<PathBuf> {
+    if checkout_paths.len() == 1 {
+        return checkout_paths.first().cloned();
+    }
+    let mut groups = catalog
+        .repository_groups
+        .iter()
+        .filter(|group| {
+            checkout_paths
+                .iter()
+                .all(|checkout| checkout.starts_with(&group.root_path))
+        })
+        .collect::<Vec<_>>();
+    groups.sort_by(|left, right| {
+        right
+            .root_path
+            .components()
+            .count()
+            .cmp(&left.root_path.components().count())
+            .then_with(|| left.repository_group_id.cmp(&right.repository_group_id))
+    });
+    groups.first().map(|group| group.root_path.clone())
 }
 
 fn agent_capabilities(

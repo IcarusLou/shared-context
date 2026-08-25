@@ -6,12 +6,17 @@ use std::{
 };
 
 use sctx_domain::{
-    ExternalSessionLocator, NormalizedBreadcrumbKind, NormalizedWorkObservation, TaskId,
-    WorkSourceRef, WorkingIntentSnapshot,
+    Applicability, ContextKind, ExternalSessionLocator, NormalizedBreadcrumbKind,
+    NormalizedWorkObservation, TaskId, WorkSourceRef, WorkingIntentSnapshot,
 };
 use sctx_git_store::GitStore;
 use sctx_local_state::{
     CaptureClaim, CaptureDiagnosticKind, CaptureStore, UserConfigStore, map_capture_artifacts,
+};
+use sctx_mcp::{
+    CandidateGetInput, TaskCheckpointBoundary, TaskCheckpointClaimInput,
+    TaskCheckpointEvidenceInput, TaskCheckpointInput, candidate_get_at_root,
+    task_checkpoint_at_root,
 };
 use sctx_task_runtime::{CaptureIngestion, TaskRuntime, WorkEpisodeDiagnosticKind};
 use serde_json::{Value, json};
@@ -321,26 +326,156 @@ fn hook_capture_keeps_locator_then_explicit_claim_and_ingestion_are_verifiable()
     let captures_after_sibling = store.list(32).unwrap().captures;
     assert_eq!(
         captures_after_sibling.len(),
-        capture_count_before_sibling,
-        "unexpected Capture after sibling event: {captures_after_sibling:#?}"
+        capture_count_before_sibling + 1,
+        "safe unregistered work must preserve one non-locating Capture"
     );
-    assert!(captures_after_sibling.iter().all(|capture| {
-        !capture.record.summary.contains("SiblingInspect")
-            && !capture
-                .record
-                .file_hints
-                .iter()
-                .any(|path| path.contains("unconfigured"))
-    }));
-    assert!(!fs::read_dir(store.directory()).unwrap().any(|entry| {
-        fs::read_to_string(entry.unwrap().path())
-            .is_ok_and(|contents| contents.contains("RAW_UNCONFIGURED_PATH"))
-    }));
+    let sibling_capture = captures_after_sibling
+        .iter()
+        .find(|capture| capture.record.summary.contains("SiblingInspect"))
+        .unwrap();
+    assert_eq!(sibling_capture.record.task_owner, Some(task_owner));
+    assert!(sibling_capture.record.workspace_hint.is_none());
+    assert!(sibling_capture.record.file_hints.is_empty());
+    let sibling_record = fs::read_to_string(
+        store
+            .directory()
+            .join(format!("{}.json", sibling_capture.record.capture_id)),
+    )
+    .unwrap();
+    for forbidden in [
+        "RAW_UNCONFIGURED_PATH",
+        sibling.to_str().unwrap(),
+        "transcript_path",
+        "tool_response",
+        "command",
+    ] {
+        assert!(!sibling_record.contains(forbidden));
+    }
+
+    assert!(
+        store
+            .claim(sibling_capture.record.capture_id, claim)
+            .unwrap()
+            .newly_claimed
+    );
+    let sibling_claimed = store
+        .read(sibling_capture.record.capture_id)
+        .unwrap()
+        .record;
+    let sibling_mapping = map_capture_artifacts(&sibling_claimed, &catalog);
+    assert!(sibling_mapping.artifact_refs.is_empty());
+    assert!(sibling_mapping.diagnostics.is_empty());
+    let sibling_ingested = runtime
+        .ingest_capture(&CaptureIngestion {
+            capture_id: sibling_claimed.capture_id,
+            episode_id: opened.episode.episode_id,
+            expected_episode_version: 1,
+            task_session_id: active.task_session_id,
+            task_id: active.task_id,
+            intent_revision_id: task_owner.intent_revision_id,
+            additional_sources: Vec::new(),
+            observation: NormalizedWorkObservation::Breadcrumb {
+                category: NormalizedBreadcrumbKind::Exploration,
+                summary: sibling_claimed.summary.clone(),
+            },
+            diagnostics: Vec::new(),
+        })
+        .unwrap();
+    assert!(sibling_ingested.inserted);
+    let observation = sibling_ingested
+        .episode
+        .episode
+        .observations
+        .iter()
+        .find(|observation| observation.observation_id == sibling_ingested.observation_id)
+        .unwrap();
+    assert_eq!(
+        observation.source_refs,
+        vec![WorkSourceRef::Capture(sctx_domain::CaptureSourceRef {
+            capture_id: sibling_claimed.capture_id,
+            task_session_id: active.task_session_id,
+            task_id: active.task_id,
+        })]
+    );
+    let observation_text = serde_json::to_string(observation).unwrap();
+    assert!(!observation_text.contains(sibling.to_str().unwrap()));
+    assert!(!observation_text.contains("RAW_UNCONFIGURED_PATH"));
+
+    let checkpoint = task_checkpoint_at_root(
+        harness.root(),
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: "capture-owned".to_owned(),
+            expected_task_id: active.task_id.to_string(),
+            expected_intent_revision_id: task_owner.intent_revision_id.to_string(),
+            expected_episode_version: 2,
+            boundary: TaskCheckpointBoundary::Close,
+            claims: vec![TaskCheckpointClaimInput {
+                context_kind_hint: Some(ContextKind::Validation),
+                topic_key_hint: None,
+                statement:
+                    "The unregistered investigation completed with bounded non-locating meaning"
+                        .to_owned(),
+                rationale: "The Agent explicitly cites its owned normalized Observation".to_owned(),
+                applicability: Applicability {
+                    domains: vec!["testing".to_owned()],
+                    platforms: Vec::new(),
+                    conditions: vec!["target Repository remains unregistered".to_owned()],
+                },
+                assumptions: Vec::new(),
+                recheck_when: vec!["the target Repository is registered".to_owned()],
+                evidence: vec![TaskCheckpointEvidenceInput::Observation {
+                    observation_id: sibling_ingested.observation_id.to_string(),
+                }],
+                artifact_refs: Vec::new(),
+                related_contexts: Vec::new(),
+            }],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap();
+    let candidate_id = checkpoint.candidate_build.as_ref().unwrap().items[0]
+        .candidate_id
+        .unwrap();
+    let review = candidate_get_at_root(
+        harness.root(),
+        &CandidateGetInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: "capture-owned".to_owned(),
+            candidate_id: candidate_id.to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(review.content.evidence.len(), 1);
+    assert_eq!(
+        review.content.evidence[0].limitations,
+        vec![
+            "Only normalized engineering meaning is preserved; the raw Capture payload is excluded"
+                .to_owned()
+        ]
+    );
+    let review_text = serde_json::to_string(&review).unwrap();
+    let configured_repository_id = catalog
+        .resolve_declared_path(&repository.join("src/feature.rs"))
+        .unwrap()
+        .repository_id;
+    let configured_repository_id = configured_repository_id.to_string();
+    for forbidden in [
+        "RAW_UNCONFIGURED_PATH",
+        sibling.to_str().unwrap(),
+        configured_repository_id.as_str(),
+        "artifact_refs",
+    ] {
+        assert!(
+            !review_text.contains(forbidden),
+            "Candidate leaked {forbidden:?}"
+        );
+    }
     let verified = runtime
         .verify_source_episode(opened.episode.episode_id)
         .unwrap()
         .unwrap();
-    assert_eq!(verified.observation_count, 1);
+    assert_eq!(verified.observation_count, 2);
     assert!(
         runtime
             .read_work_episode(opened.episode.episode_id)

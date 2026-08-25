@@ -11,7 +11,7 @@ use sctx_domain::{ExternalSessionLocator, RepositoryId};
 use sctx_git_store::GitStore;
 use sctx_local_state::{
     AuthorizedSessionScope, AuthorizedSessionScopeDecision, AuthorizedSessionScopeRead,
-    AuthorizedSessionScopeStore, UserConfigStore,
+    AuthorizedSessionScopeStore, CaptureStore, UserConfigStore,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -515,7 +515,7 @@ fn documented_codex_direct_lifecycle_activates_before_prompt_and_keeps_git_clean
 }
 
 #[test]
-fn documented_cursor_group_lifecycle_accepts_members_and_drops_sibling_or_mixed_events() {
+fn documented_cursor_group_lifecycle_records_members_and_safe_non_locating_investigation() {
     let fixture = Fixture::new();
     let oracle = oracle();
     let session = "synthetic-cursor-group";
@@ -542,12 +542,11 @@ fn documented_cursor_group_lifecycle_accepts_members_and_drops_sibling_or_mixed_
     assert_output(&fixture.run("cursor", &events[2]), &oracle.wire.neutral);
     assert_eq!(capture_record_count(&fixture.root()), 1);
 
-    let before_rejected = fixture.business_snapshot();
     let mut sibling = events[2].clone();
     set_event_cwd("cursor", &mut sibling, &fixture.sibling);
     sibling["tool_input"] = json!({});
     assert_output(&fixture.run("cursor", &sibling), &oracle.wire.neutral);
-    assert_eq!(fixture.business_snapshot(), before_rejected);
+    assert_eq!(capture_record_count(&fixture.root()), 2);
 
     let mut mixed = events[2].clone();
     mixed["tool_input"] = json!({
@@ -555,7 +554,36 @@ fn documented_cursor_group_lifecycle_accepts_members_and_drops_sibling_or_mixed_
         "nested": {"path": fixture.sibling_file}
     });
     assert_output(&fixture.run("cursor", &mixed), &oracle.wire.neutral);
-    assert_eq!(fixture.business_snapshot(), before_rejected);
+    assert_eq!(capture_record_count(&fixture.root()), 3);
+    let captures = CaptureStore::initialize(fixture.root())
+        .unwrap()
+        .list(16)
+        .unwrap()
+        .captures;
+    assert_eq!(captures.len(), 3);
+    assert_eq!(
+        captures
+            .iter()
+            .filter(|capture| {
+                capture.record.workspace_hint.is_none() && capture.record.file_hints.is_empty()
+            })
+            .count(),
+        2
+    );
+    let captures = serde_json::to_string(
+        &captures
+            .into_iter()
+            .map(|capture| capture.record)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    for forbidden in [
+        fixture.sibling.to_str().unwrap(),
+        fixture.sibling_file.to_str().unwrap(),
+        "SYNTHETIC_TOOL_OUTPUT",
+    ] {
+        assert!(!captures.contains(forbidden));
+    }
 
     assert_output(
         &fixture.run("cursor", &events[3]),
@@ -567,7 +595,7 @@ fn documented_cursor_group_lifecycle_accepts_members_and_drops_sibling_or_mixed_
         fixture.read_scope("cursor", session),
         AuthorizedSessionScopeRead::Missing
     ));
-    assert_eq!(capture_record_count(&fixture.root()), 3);
+    assert_eq!(capture_record_count(&fixture.root()), 5);
     assert_eq!(report_file_count(&fixture.root()), 0);
     assert_eq!(git_snapshot(&fixture.repository()), git_before);
 }
