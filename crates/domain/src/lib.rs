@@ -97,6 +97,8 @@ pub enum ErrorKind {
     RepositoryNotConfigured,
     /// A stable idempotency key was reused with different authoritative content.
     IdempotencyKeyConflict,
+    /// Another process currently owns the installation-wide maintenance boundary.
+    MaintenanceBusy,
 }
 
 /// The shared, user-presentable error type for workspace crates.

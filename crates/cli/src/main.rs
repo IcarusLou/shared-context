@@ -38,7 +38,7 @@ use sctx_index::{
 use sctx_local_state::{
     AuthorizedSessionScope, AuthorizedSessionScopeDecision, AuthorizedSessionScopeRead,
     AuthorizedSessionScopeStore, Breadcrumb, BreadcrumbKind, CaptureDiagnosticKind, CaptureStore,
-    CaptureTaskOwner, CatalogCheckoutStatus, CatalogRepositoryGroupStatus,
+    CaptureTaskOwner, CatalogCheckoutStatus, CatalogRepositoryGroupStatus, MaintenanceLock,
     RepositoryCatalogSnapshot, UserConfigStore,
 };
 use sctx_mcp::{
@@ -134,6 +134,36 @@ fn utf8_args(args: Vec<OsString>) -> Result<Vec<String>> {
 }
 
 fn run(args: &[String], json_output: bool) -> Result<()> {
+    let _maintenance = if requires_shared_maintenance_guard(args) {
+        Some(MaintenanceLock::initialize(installation_root()?)?.try_shared()?)
+    } else {
+        None
+    };
+    run_without_maintenance(args, json_output)
+}
+
+fn requires_shared_maintenance_guard(args: &[String]) -> bool {
+    args.first().is_some_and(|command| {
+        matches!(
+            command.as_str(),
+            "demo"
+                | "space"
+                | "candidate"
+                | "context"
+                | "semantic"
+                | "task"
+                | "repository"
+                | "engineering-reference"
+                | "association"
+                | "search"
+                | "index"
+                | "pending"
+                | "validate"
+        )
+    })
+}
+
+fn run_without_maintenance(args: &[String], json_output: bool) -> Result<()> {
     match args {
         [] => {
             print!("{HELP}");
@@ -199,6 +229,7 @@ fn run_install_lifecycle(command: &str, args: &[String], json_output: bool) -> R
         installer.upgrade(&setup)?
     };
     if options.has("--demo") {
+        let _maintenance = MaintenanceLock::open_or_create(&report.root)?.try_shared()?;
         let (demo, metadata) = complete_demo(&report.root)?;
         emit(
             "setup.demo",
@@ -722,7 +753,15 @@ fn run_hook(args: &[String]) -> Result<()> {
     };
     let trust = parse_trust(agent, None, true)?;
     let capabilities = agent_capabilities(agent, version.as_deref(), true, trust);
-    let authorization = resolve_hook_authorization(agent, &event);
+    let maintenance = installation_root()
+        .and_then(MaintenanceLock::open_or_create)
+        .and_then(|lock| lock.try_shared())
+        .ok();
+    let authorization = if maintenance.is_some() {
+        resolve_hook_authorization(agent, &event)
+    } else {
+        HookAuthorization::disabled()
+    };
     let activation = authorization.activation;
     let activated = matches!(
         activation,
@@ -742,7 +781,7 @@ fn run_hook(args: &[String]) -> Result<()> {
         action
     };
     let resolved = resolve_hook_action(action)?;
-    if event.kind() == CanonicalAgentEventKind::SessionEnd {
+    if maintenance.is_some() && event.kind() == CanonicalAgentEventKind::SessionEnd {
         remove_hook_session_scope(agent, &event.context().session_id);
     }
     let output = if agent == "cursor" {
@@ -3271,6 +3310,7 @@ const fn error_code(kind: ErrorKind) -> &'static str {
         ErrorKind::Unsupported => "unsupported",
         ErrorKind::RepositoryNotConfigured => "repository_not_configured",
         ErrorKind::IdempotencyKeyConflict => "idempotency_key_conflict",
+        ErrorKind::MaintenanceBusy => "maintenance_busy",
         _ => "unknown_error",
     }
 }

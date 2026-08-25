@@ -26,7 +26,7 @@ use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
 use sctx_index::ProjectionIndex;
 use sctx_local_state::{
     ActivationScope, ActivationScopeDecision, AuthorizedSessionScopePolicy,
-    AuthorizedSessionScopeStore, UserConfigStore,
+    AuthorizedSessionScopeStore, MaintenanceLock, UserConfigStore,
 };
 use sctx_mcp::{
     CandidateBuildItemResponseStatus, CandidateBuildResponseStatus, CandidateConfirmInput,
@@ -300,6 +300,59 @@ const PUBLIC_TOOLS: [&str; 16] = [
     "candidate_confirm",
     "space_list",
 ];
+
+#[test]
+fn public_tool_call_returns_typed_busy_without_business_residue_during_maintenance() {
+    let fixture = Fixture::new();
+    let session = "maintenance-busy";
+    authorize_direct_session(&fixture, "codex", session);
+    let before = business_residue(&fixture.root);
+    let maintenance = MaintenanceLock::open_or_create(&fixture.root).unwrap();
+    let exclusive = maintenance.try_exclusive().unwrap();
+    let mut server = fixture.server(ClientKind::Codex);
+    let responses = run_session(
+        &mut server,
+        FixtureFraming::Newline,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(
+                2,
+                "context_search",
+                json!({
+                    "agent_kind": "codex",
+                    "external_session_id": session,
+                    "query": "maintenance"
+                }),
+            ),
+        ],
+    );
+    assert_eq!(responses[1]["result"]["isError"], true);
+    assert_eq!(
+        responses[1]["result"]["structuredContent"]["error"]["code"],
+        "maintenance_busy"
+    );
+    assert_eq!(
+        responses[1]["result"]["structuredContent"]["error"]["kind"],
+        "maintenance_busy"
+    );
+    assert_eq!(business_residue(&fixture.root), before);
+
+    drop(exclusive);
+    let released = run_session(
+        &mut server,
+        FixtureFraming::Newline,
+        &[tool_call(
+            3,
+            "context_search",
+            json!({
+                "agent_kind": "codex",
+                "external_session_id": session,
+                "query": "stdio MCP"
+            }),
+        )],
+    );
+    assert_eq!(released[0]["result"]["isError"], false);
+}
 
 #[derive(Debug, Eq, PartialEq)]
 struct BusinessResidue {

@@ -691,6 +691,7 @@ Task Retrieval 默认只扩展一至两跳：
 │   ├── index.sqlite
 │   ├── runtime.sqlite
 │   ├── repository-registry.sqlite
+│   ├── maintenance.lock
 │   ├── writer.lock
 │   ├── index.lock
 │   ├── runtime.lock
@@ -707,7 +708,10 @@ Task Retrieval 默认只扩展一至两跳：
 - `runtime.sqlite`：Task、WorkEpisode 和 Candidate 短期状态，不是知识事实。
 - `capture/`：受 TTL 和容量限制的临时 Evidence/Observation 材料。
 - `authorized-session-scopes/`：按 external Session locator digest 隔离、Catalog-bound、TTL-bounded 的私有 activation lease；不是 Task/Context 事实。
+- `maintenance.lock`：安装级非阻塞读写门禁；业务 CLI、Hook 和单次 MCP tool call 持共享锁，Setup/Upgrade/Uninstall、知识删除与 data reset 持排他锁。
 - `config.toml`：固定 Context Store 与本机显式 Repository Catalog，不包含 Workspace-to-Space 映射。
+
+所有组件统一使用 `maintenance → setup/config/writer/index/runtime` 锁顺序。排他维护期间 CLI/MCP 返回 bounded `maintenance_busy`，Hook 保持 neutral；不得在持有组件锁后反向申请 maintenance lock。
 
 Repository Catalog 的配置语义：
 

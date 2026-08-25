@@ -49,7 +49,8 @@ use sctx_git_store::{
 use sctx_index::{DomainSnapshot, ProjectionIndex};
 use sctx_local_state::{
     AuthorizedSessionScope, AuthorizedSessionScopeDecision, AuthorizedSessionScopeRead,
-    AuthorizedSessionScopeStore, PrivacyScanner, RepositoryCatalogSnapshot, UserConfigStore,
+    AuthorizedSessionScopeStore, MaintenanceLock, PrivacyScanner, RepositoryCatalogSnapshot,
+    UserConfigStore,
 };
 use sctx_search::{
     CandidateAnalysisRequest, ConflictView, ContextPackOmitted, ContextStatus,
@@ -3346,7 +3347,10 @@ impl McpServer {
             return Err(invalid(format!("unknown tool: {}", call.name)));
         }
         self.runtime = None;
-        let result = self.authorize_and_call(&call);
+        let result = MaintenanceLock::open_or_create(&self.root)
+            .and_then(|lock| lock.try_shared())
+            .map_err(ToolFailure::maintenance_failed)
+            .and_then(|_maintenance| self.authorize_and_call(&call));
         match result {
             Ok(data) => tool_success(data),
             Err(failure) => tool_failure(failure),
@@ -3673,6 +3677,30 @@ struct ToolFailure {
 }
 
 impl ToolFailure {
+    fn maintenance_failed(error: Error) -> Self {
+        let busy = error.kind() == ErrorKind::MaintenanceBusy;
+        drop(error);
+        Self {
+            code: if busy {
+                "maintenance_busy"
+            } else {
+                "maintenance_unavailable"
+            },
+            error: Error::new(
+                if busy {
+                    ErrorKind::MaintenanceBusy
+                } else {
+                    ErrorKind::External
+                },
+                if busy {
+                    "Shared Context installation is busy with maintenance"
+                } else {
+                    "Shared Context maintenance coordination is unavailable"
+                },
+            ),
+        }
+    }
+
     fn authorization_failed() -> Self {
         Self {
             code: "session_not_authorized",
@@ -5231,6 +5259,7 @@ const fn error_code(kind: ErrorKind) -> &'static str {
         ErrorKind::Unsupported => "unsupported",
         ErrorKind::RepositoryNotConfigured => "repository_not_configured",
         ErrorKind::IdempotencyKeyConflict => "idempotency_key_conflict",
+        ErrorKind::MaintenanceBusy => "maintenance_busy",
         _ => "unknown_error",
     }
 }

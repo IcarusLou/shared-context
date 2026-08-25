@@ -8,6 +8,7 @@
 
 mod capture;
 mod config;
+mod maintenance;
 mod privacy;
 mod session_scope;
 
@@ -25,6 +26,7 @@ pub use config::{
     RepositoryGroupCatalogEntry, RepositoryGroupCatalogRemoveOutcome,
     RepositoryGroupCatalogUpdateOutcome, ResolvedRepositoryPath, UserConfigStore,
 };
+pub use maintenance::{MaintenanceGuard, MaintenanceLock};
 pub use privacy::{PrivacyFinding, PrivacyFindingKind, PrivacyScan, PrivacyScanner, RedactedText};
 pub use sctx_domain::{Error, ErrorKind, Result};
 pub use session_scope::{

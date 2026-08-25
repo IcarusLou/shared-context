@@ -22,7 +22,7 @@ use sctx_git_store::{
     AppendRequest, CandidateSubmissionRequest, CrashInjector, CrashSeam, GitStore,
 };
 use sctx_index::ProjectionIndex;
-use sctx_local_state::UserConfigStore;
+use sctx_local_state::{MaintenanceLock, UserConfigStore};
 use sctx_mcp::{
     ExpectedRevisionId, TaskBoundary, TaskCheckpointBoundary, TaskCheckpointClaimInput,
     TaskCheckpointEvidenceInput, TaskCheckpointInput, TaskIntentUpdateInput,
@@ -37,6 +37,31 @@ const EVIDENCE: &str = r#"{"kind":"experiment_record","supports":"CLI command co
 struct Harness {
     _temporary: TempDir,
     home: PathBuf,
+}
+
+#[test]
+fn business_cli_returns_typed_busy_while_exclusive_maintenance_is_active() {
+    let harness = Harness::new();
+    let store = GitStore::initialize(harness.root()).unwrap();
+    let before = git_output(store.repository(), &["rev-parse", "HEAD"]);
+    let maintenance = MaintenanceLock::open_or_create(harness.root()).unwrap();
+    let exclusive = maintenance.try_exclusive().unwrap();
+
+    let busy = harness.failure(&["repository", "list"]);
+    assert_eq!(busy["error"]["code"], "maintenance_busy");
+    assert_eq!(
+        git_output(store.repository(), &["rev-parse", "HEAD"]),
+        before
+    );
+
+    drop(exclusive);
+    let listed = harness.success(&["repository", "list"]);
+    assert!(
+        listed["data"]["repositories"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 impl Harness {

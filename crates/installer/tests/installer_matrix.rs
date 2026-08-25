@@ -11,7 +11,7 @@ use sctx_installer::{
     Agent, Architecture, CheckStatus, Host, InstallContext, Installer, SetupOptions, SetupStage,
     SkillStatus,
 };
-use sctx_local_state::UserConfigStore;
+use sctx_local_state::{MaintenanceLock, UserConfigStore};
 use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 
@@ -316,6 +316,37 @@ fn setup_three_times_is_idempotent_and_preserves_existing_configuration() {
         fs::read_link(harness.root.join("bin/current")).unwrap(),
         PathBuf::from("1.2.3/arm64")
     );
+}
+
+#[test]
+fn installer_mutations_are_exclusive_and_doctor_reports_active_maintenance() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.2.3");
+    installer.setup(&SetupOptions::default()).unwrap();
+    let maintenance = MaintenanceLock::open_or_create(&harness.root).unwrap();
+
+    let shared = maintenance.try_shared().unwrap();
+    assert_eq!(
+        installer
+            .setup(&SetupOptions::default())
+            .unwrap_err()
+            .kind(),
+        sctx_installer::ErrorKind::MaintenanceBusy
+    );
+    assert_eq!(
+        installer.uninstall().unwrap_err().kind(),
+        sctx_installer::ErrorKind::MaintenanceBusy
+    );
+    drop(shared);
+
+    let exclusive = maintenance.try_exclusive().unwrap();
+    let doctor = installer.doctor();
+    assert!(!doctor.healthy);
+    assert_eq!(doctor.checks.len(), 1);
+    assert_eq!(doctor.checks[0].name, "maintenance");
+    drop(exclusive);
+
+    assert!(!installer.setup(&SetupOptions::default()).unwrap().changed);
 }
 
 #[test]

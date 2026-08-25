@@ -155,6 +155,7 @@ sctx doctor
 健康检查会检查：
 
 - 安装目录和当前版本运行时。
+- 安装级 maintenance 门禁是否可用；排他维护进行中时只报告 `maintenance` 忙，不并发读取 Git/SQLite。
 - 本机知识 Git 仓库与 SQLite 索引。
 - Repository Catalog。
 - Cursor/Codex 配置和 Shared Context Skill。

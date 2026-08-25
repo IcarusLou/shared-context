@@ -24,7 +24,7 @@ use sctx_adapter_codex::TrustState;
 pub use sctx_domain::{Error, ErrorKind, Result};
 use sctx_git_store::GitStore;
 use sctx_index::ProjectionIndex;
-use sctx_local_state::{CatalogCheckoutStatus, UserConfigStore};
+use sctx_local_state::{CatalogCheckoutStatus, MaintenanceLock, UserConfigStore};
 use sctx_mcp::{ClientKind, McpServer};
 use sctx_search::{SearchEngine, SearchFilters, SearchRequest};
 use serde::{Deserialize, Serialize};
@@ -467,6 +467,7 @@ impl Installer {
         for directory in ["bin", "state", "backups", "logs"] {
             ensure_private_directory(&self.context.root.join(directory))?;
         }
+        let _maintenance = MaintenanceLock::initialize(&self.context.root)?.try_exclusive()?;
         let lock = open_lock(&self.context.root.join("state/setup.lock"))?;
         lock.lock_exclusive()
             .map_err(io_error("lock setup transaction"))?;
@@ -631,6 +632,23 @@ impl Installer {
     #[must_use]
     pub fn doctor(&self) -> DoctorReport {
         let root = &self.context.root;
+        let _maintenance = match MaintenanceLock::open_or_create(root)
+            .and_then(|maintenance| maintenance.try_shared())
+        {
+            Ok(guard) => Some(guard),
+            Err(error) if error.kind() == ErrorKind::MaintenanceBusy => {
+                return DoctorReport {
+                    healthy: false,
+                    root: root.clone(),
+                    checks: vec![failed(
+                        "maintenance",
+                        "installation maintenance is currently active",
+                    )],
+                    capabilities: self.capabilities(&SetupOptions::default()),
+                };
+            }
+            Err(_) => None,
+        };
         let mut checks = Vec::new();
         check_directory(root, &mut checks);
         check_runtime(root, &mut checks);
@@ -720,6 +738,7 @@ impl Installer {
         if !root.exists() {
             return Ok(report);
         }
+        let _maintenance = MaintenanceLock::open_or_create(root)?.try_exclusive()?;
         let lock = open_lock(&root.join("state/setup.lock"))?;
         lock.lock_exclusive().map_err(io_error("lock uninstall"))?;
         recover_incomplete_journals(root)?;
@@ -818,6 +837,7 @@ impl Installer {
                 "second confirmation must be DELETE-SHARED-CONTEXT-KNOWLEDGE",
             ));
         }
+        let _maintenance = MaintenanceLock::open_or_create(&self.context.root)?.try_exclusive()?;
         if repository.exists() {
             fs::remove_dir_all(&repository).map_err(io_error("delete knowledge repository"))?;
             sync_directory(

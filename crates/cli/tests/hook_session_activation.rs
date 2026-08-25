@@ -15,7 +15,7 @@ use sctx_domain::{ExternalSessionLocator, RepositoryId};
 use sctx_git_store::GitStore;
 use sctx_local_state::{
     AuthorizedSessionScopeDecision, AuthorizedSessionScopePolicy, AuthorizedSessionScopeRead,
-    AuthorizedSessionScopeStore, UserConfigStore,
+    AuthorizedSessionScopeStore, MaintenanceLock, UserConfigStore,
 };
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
@@ -186,8 +186,10 @@ fn assert_neutral(output: &Output) {
 
 fn scope_records(root: &Path) -> Vec<PathBuf> {
     let directory = root.join("state/authorized-session-scopes");
-    let mut records = fs::read_dir(directory)
-        .unwrap()
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut records = entries
         .map(|entry| entry.unwrap().path())
         .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
         .collect::<Vec<_>>();
@@ -199,6 +201,32 @@ fn assert_no_runtime_or_capture(root: &Path) {
     assert!(!root.join("state/runtime.sqlite").exists());
     let capture = root.join("state/capture");
     assert!(!capture.exists() || fs::read_dir(capture).unwrap().next().is_none());
+}
+
+#[test]
+fn exclusive_maintenance_keeps_session_start_neutral_without_business_residue() {
+    let fixture = Fixture::new();
+    let before_records = scope_records(&fixture.root());
+    let maintenance = MaintenanceLock::open_or_create(fixture.root()).unwrap();
+    let exclusive = maintenance.try_exclusive().unwrap();
+
+    assert_neutral(&fixture.hook(
+        "codex",
+        &codex_start("maintenance-busy", &fixture.direct_repository, "startup"),
+    ));
+    assert_eq!(scope_records(&fixture.root()), before_records);
+    assert_no_runtime_or_capture(&fixture.root());
+
+    drop(exclusive);
+    let activated = fixture.hook(
+        "codex",
+        &codex_start(
+            "maintenance-released",
+            &fixture.direct_repository,
+            "startup",
+        ),
+    );
+    assert!(String::from_utf8_lossy(&activated.stdout).contains(SHARED_CONTEXT_ACTIVATION_MARKER));
 }
 
 #[test]
