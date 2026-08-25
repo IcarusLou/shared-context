@@ -78,7 +78,7 @@ test('binary verification enforces checksum before code signature', (context) =>
 
 test('launcher forwards argv, inherited stdio, and native exit code unchanged', () => {
   const calls = [];
-  const status = launch(['setup', '--yes', 'space and 中文'], {
+  const status = launch(['knowledge', 'sync', '--root', 'space and 中文'], {
     platform: 'darwin',
     arch: 'arm64',
     resolve(request) {
@@ -97,7 +97,7 @@ test('launcher forwards argv, inherited stdio, and native exit code unchanged', 
   assert.deepEqual(calls, [
     {
       command: '/fixture/sctx',
-      args: ['setup', '--yes', 'space and 中文'],
+      args: ['knowledge', 'sync', '--root', 'space and 中文'],
       options: { stdio: 'inherit' },
     },
   ]);

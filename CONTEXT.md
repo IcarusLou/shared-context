@@ -165,11 +165,11 @@ A typed, resolvable provenance target for an engineering claim, such as immutabl
 _Avoid_: evidence string, unverified reference
 
 **KnowledgeStore**:
-The append-only Git fact store that carries durable Shared Context knowledge. It is independent of every business source RepositoryIdentity and may be distributed through one team Git remote.
+The append-only fact store that carries durable Shared Context knowledge across installations. Integrated team facts and installation-local proposals remain distinct from every business source RepositoryIdentity.
 _Avoid_: source repository, RepositoryCatalog, ContextSpace
 
 **InstallationWorkBranch**:
-The stable KnowledgeStore branch owned by one Shared Context installation, based on the remote default branch and used for that installation's knowledge writes. The remote default branch is a read-only integration base, never an installation write target.
+The stable KnowledgeStore proposal boundary owned by one Shared Context installation. It carries that installation's knowledge changes while the remote default remains the integrated, read-only team baseline.
 _Avoid_: main branch, source-code feature branch, RepositoryId
 
 **RepositoryCatalog**:

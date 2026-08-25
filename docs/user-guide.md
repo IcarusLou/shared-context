@@ -823,6 +823,13 @@ npm run install:local
 
 npm 测试会检查 launcher、平台包、离线 Bundle 和安装契约。Apple Silicon 主机可以执行 arm64 真实安装 smoke；没有 Intel 主机时，x64 交叉构建测试只证明包结构、Mach-O、签名和 CPU 契约，不等同于 Intel 原生运行验证。
 
+团队共享的固定端到端验收使用两个独立安装、同一个 `FE` RepositoryId、两个不同 checkout 和一个本地 bare remote，覆盖 A 发布工作分支、人工合入默认分支、B 同步并按 B 本地路径命中同一 Context，以及 B reset 不修改远端：
+
+```bash
+cargo test -p sctx-installer --test installer_matrix \
+  fixed_two_installation_team_sharing_and_local_reset_oracle
+```
+
 ## 9. 当前明确不支持的能力
 
 - 后台定时同步、自动创建/合并 Pull Request 和无人值守跨电脑分发。

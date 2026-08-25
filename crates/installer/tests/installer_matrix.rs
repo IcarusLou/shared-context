@@ -6,6 +6,12 @@ use std::{
     sync::Arc,
 };
 
+use sctx_domain::{
+    Applicability, ArtifactKind, ArtifactLocator, ContextId, ContextKind, ContextRevisionDraft,
+    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, PublicationAction,
+    PublicationDraft, ReferenceRelation, RepoRelativePath, ReviewDraft, ReviewVerdict, RevisionId,
+    WorkingIntentSnapshot,
+};
 use sctx_engineering_graph::{EngineeringProjectionStore, RepositoryRegistry};
 use sctx_event_schema::{Event, IntentSnapshot};
 use sctx_git_store::{AppendRequest, GitStore, TextObject};
@@ -14,12 +20,41 @@ use sctx_installer::{
     Agent, Architecture, CheckStatus, DataResetOptions, Host, InstallContext, Installer,
     KnowledgeRemoteType, KnowledgeStoreUrl, ResetStage, SetupOptions, SetupStage, SkillStatus,
 };
-use sctx_local_state::{MaintenanceLock, UserConfigStore};
+use sctx_local_state::{MaintenanceLock, PrivacyScanner, UserConfigStore};
+use sctx_mcp::{
+    ArtifactFocusQuery, ArtifactFocusQueryCoordinates, AssociationExplainInput,
+    AssociationRebuildInput, EngineeringReferenceRecordInput, ExpectedRevisionId,
+    RepositoryScanInput, TaskBoundary, TaskIntentUpdateInput, association_explain_at_root,
+    association_rebuild_at_root, engineering_reference_record_at_root, repository_scan_at_root,
+    task_artifact_focus_at_root, task_intent_update_at_root,
+};
+use sctx_search::TaskRetrievalPath;
 use sctx_task_runtime::TaskRuntime;
 use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 
 const KNOWLEDGE_SYNC_PUSH_ATTEMPTS_FOR_TEST: usize = 3;
+
+#[derive(serde::Deserialize)]
+struct TeamSharingOracle {
+    schema: String,
+    version: u32,
+    repository_id: String,
+    relative_path: String,
+    source: String,
+    context_statement: String,
+    context_topic: String,
+    base_branch: String,
+    work_branch_prefix: String,
+}
+
+fn team_sharing_oracle() -> TeamSharingOracle {
+    let raw = include_str!("../../../fixtures/team-sharing/team-sharing-v1.json");
+    assert!(PrivacyScanner::default().scan(raw).unwrap().is_clean());
+    assert!(!raw.to_ascii_lowercase().contains("/users/"));
+    assert!(!raw.contains(".codex/") && !raw.contains(".cursor/"));
+    serde_json::from_str(raw).unwrap()
+}
 
 #[derive(Clone)]
 struct FakeHost {
@@ -376,6 +411,121 @@ fn commit_event_variant(repository: &Path, event: &Event, pretty: bool) -> Strin
     git(repository, &["add", "--", &relative]);
     git(repository, &["commit", "-m", "add sync conflict fixture"]);
     git(repository, &["rev-parse", "HEAD"])
+}
+
+fn init_team_checkout(path: &Path, oracle: &TeamSharingOracle) -> PathBuf {
+    fs::create_dir_all(path).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .arg(path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    git(path, &["config", "user.name", "Team Sharing Fixture"]);
+    git(path, &["config", "user.email", "team-sharing@localhost"]);
+    let file = path.join(&oracle.relative_path);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, &oracle.source).unwrap();
+    git(path, &["add", "--", &oracle.relative_path]);
+    git(path, &["commit", "--quiet", "-m", "team sharing fixture"]);
+    fs::canonicalize(path).unwrap()
+}
+
+fn append_accepted_team_context(
+    root: &Path,
+    oracle: &TeamSharingOracle,
+) -> (ContextId, RevisionId) {
+    let store = GitStore::open_existing(root).unwrap();
+    let space = Event::space_created(
+        IntentSnapshot {
+            title: "Team Shared FE Contract".to_owned(),
+            problem: "Independent FE installations need the same governed fact".to_owned(),
+            desired_outcome: "Both installations retrieve one accepted Context".to_owned(),
+            in_scope: vec![oracle.relative_path.clone()],
+            out_of_scope: Vec::new(),
+            acceptance_conditions: vec!["B resolves the A-authored reference".to_owned()],
+            domain_terms: vec!["KnowledgeStore".to_owned(), "RepositoryId".to_owned()],
+        },
+        None,
+    )
+    .unwrap();
+    let space_id = match space.payload() {
+        sctx_event_schema::EventPayload::SpaceCreated { space_id, .. } => *space_id,
+        _ => unreachable!(),
+    };
+    store.append_event(AppendRequest::event(space)).unwrap();
+    let revision = Event::context_revision_added(
+        space_id,
+        ContextRevisionDraft {
+            kind: ContextKind::Contract,
+            topic_key: Some(oracle.context_topic.clone()),
+            statement: oracle.context_statement.clone(),
+            rationale: "A fixed tracked FE artifact proves the cross-install contract".to_owned(),
+            applicability: Applicability {
+                domains: vec!["team-sharing".to_owned()],
+                platforms: vec!["FE".to_owned()],
+                conditions: vec!["shared KnowledgeStore".to_owned()],
+            },
+            assumptions: Vec::new(),
+            recheck_when: vec!["sharedSearch implementation changes".to_owned()],
+            relations: Vec::new(),
+            evidence: vec![EvidenceSnapshotDraft {
+                kind: EvidenceType::ExperimentRecord,
+                supports: "Both checkouts contain the fixed tracked artifact".to_owned(),
+                content: serde_json::json!({
+                    "oracle": "shared-context.team-sharing-oracle",
+                    "relative_path": oracle.relative_path,
+                    "result": "tracked"
+                }),
+                interpretation: "RepositoryId plus locator is portable across checkout paths"
+                    .to_owned(),
+                limitations: vec!["Synthetic two-installation fixture".to_owned()],
+            }],
+        },
+        None,
+    )
+    .unwrap();
+    let (context_id, revision_id) = match revision.payload() {
+        sctx_event_schema::EventPayload::ContextRevisionAdded {
+            context_id,
+            revision,
+            ..
+        } => (*context_id, revision.revision_id),
+        _ => unreachable!(),
+    };
+    store.append_event(AppendRequest::event(revision)).unwrap();
+    let review = Event::context_reviewed(
+        space_id,
+        context_id,
+        ReviewDraft {
+            revision_id,
+            verdict: ReviewVerdict::Approve,
+            reason: "Fixed cross-install evidence is complete".to_owned(),
+        },
+        None,
+    )
+    .unwrap();
+    let review_event_id = review.event_id();
+    store.append_event(AppendRequest::event(review)).unwrap();
+    store
+        .append_event(AppendRequest::event(
+            Event::publication_changed(
+                space_id,
+                context_id,
+                PublicationDraft {
+                    previous_publication_ids: Vec::new(),
+                    action: PublicationAction::Publish,
+                    revision_id,
+                    review_event_ids: vec![review_event_id],
+                },
+                None,
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    (context_id, revision_id)
 }
 
 struct SeededResetState {
@@ -2173,6 +2323,255 @@ fn knowledge_sync_rejects_local_store_and_rolls_back_invalid_remote_facts() {
     assert_eq!(
         git(&modified_fixture.remote, &["rev-parse", "refs/heads/main"]),
         modified_default
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn fixed_two_installation_team_sharing_and_local_reset_oracle() {
+    let oracle = team_sharing_oracle();
+    assert_eq!(oracle.schema, "shared-context.team-sharing-oracle");
+    assert_eq!(oracle.version, 1);
+    assert_eq!(oracle.repository_id, "FE");
+    assert!(!oracle.source.contains("/Users/"));
+
+    let machine_a = Harness::new();
+    let machine_b = Harness::new();
+    let shared = remote_fixture(&machine_a, "team-sharing-final");
+    let options = remote_setup_options(&shared.remote);
+    let setup_a = machine_a.installer("1.0.0").setup(&options).unwrap();
+    let setup_b = machine_b.installer("1.0.0").setup(&options).unwrap();
+    assert_ne!(
+        setup_a.knowledge_store.installation_id,
+        setup_b.knowledge_store.installation_id
+    );
+    let branch_a = setup_a.knowledge_store.work_branch.unwrap();
+    let branch_b = setup_b.knowledge_store.work_branch.unwrap();
+    assert!(branch_a.starts_with(&oracle.work_branch_prefix));
+    assert!(branch_b.starts_with(&oracle.work_branch_prefix));
+    assert_ne!(branch_a, branch_b);
+
+    let checkout_a = init_team_checkout(&machine_a.home.join("A FE checkout"), &oracle);
+    let checkout_b = init_team_checkout(&machine_b.home.join("B FE checkout"), &oracle);
+    assert_ne!(checkout_a, checkout_b);
+    let repository_id: sctx_domain::RepositoryId = oracle.repository_id.parse().unwrap();
+    for (root, checkout) in [
+        (&machine_a.root, &checkout_a),
+        (&machine_b.root, &checkout_b),
+    ] {
+        UserConfigStore::open_existing(root)
+            .unwrap()
+            .add_repository(repository_id.clone(), std::slice::from_ref(checkout))
+            .unwrap();
+    }
+
+    let scan_a = repository_scan_at_root(
+        &machine_a.root,
+        &RepositoryScanInput {
+            checkout_path: checkout_a.to_string_lossy().into_owned(),
+            paths: vec![oracle.relative_path.clone()],
+            max_artifacts: 20,
+        },
+    )
+    .unwrap();
+    assert_eq!(scan_a.repository_id, repository_id);
+    let (context_id, revision_id) = append_accepted_team_context(&machine_a.root, &oracle);
+    let recorded = engineering_reference_record_at_root(
+        &machine_a.root,
+        &EngineeringReferenceRecordInput {
+            context_id: context_id.to_string(),
+            revision_id: revision_id.to_string(),
+            repository_id: repository_id.to_string(),
+            artifact_kind: ArtifactKind::File,
+            relation: ReferenceRelation::Implements,
+            locator: ArtifactLocator::File {
+                path: RepoRelativePath::new(&oracle.relative_path).unwrap(),
+            },
+            supports: "Machine A inspected the fixed tracked FE artifact".to_owned(),
+            limitations: vec!["Resolution must be rebuilt on each installation".to_owned()],
+        },
+    )
+    .unwrap();
+    let default_ref = format!("refs/heads/{}", oracle.base_branch);
+    let default_before_a = git(&shared.remote, &["rev-parse", &default_ref]);
+    let sync_a = machine_a.installer("1.0.0").sync_knowledge().unwrap();
+    assert!(sync_a.pushed);
+    assert!(sync_a.needs_merge);
+    assert_eq!(sync_a.base_branch, oracle.base_branch);
+    assert_eq!(
+        git(&shared.remote, &["rev-parse", &default_ref]),
+        default_before_a
+    );
+
+    let branch_a_ref = format!("refs/heads/{branch_a}");
+    let integrated_head = git(&shared.remote, &["rev-parse", &branch_a_ref]);
+    git(
+        &shared.remote,
+        &["update-ref", &default_ref, &integrated_head],
+    );
+    git(&shared.remote, &["update-ref", "-d", &branch_a_ref]);
+    let default_before_b = git(&shared.remote, &["rev-parse", &default_ref]);
+    let sync_b = machine_b.installer("1.0.0").sync_knowledge().unwrap();
+    assert!(sync_b.pushed);
+    assert!(!sync_b.needs_merge);
+    assert_eq!(sync_b.ahead, 0);
+    assert_eq!(sync_b.behind, 0);
+    assert_eq!(
+        git(&shared.remote, &["rev-parse", &default_ref]),
+        default_before_b
+    );
+
+    let scan_b = repository_scan_at_root(
+        &machine_b.root,
+        &RepositoryScanInput {
+            checkout_path: checkout_b.to_string_lossy().into_owned(),
+            paths: vec![oracle.relative_path.clone()],
+            max_artifacts: 20,
+        },
+    )
+    .unwrap();
+    assert_eq!(scan_b.repository_id, repository_id);
+    let rebuilt = association_rebuild_at_root(
+        &machine_b.root,
+        &AssociationRebuildInput {
+            diagnose_only: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(rebuilt.reference_count, 1);
+    assert_eq!(rebuilt.status_counts.resolved, 1);
+    assert_eq!(rebuilt.repositories.len(), 1);
+    assert_eq!(rebuilt.repositories[0].repository_id, repository_id);
+    assert_eq!(
+        rebuilt.repositories[0].checkout_path.as_ref(),
+        Some(&checkout_b)
+    );
+    let explained = association_explain_at_root(
+        &machine_b.root,
+        &AssociationExplainInput {
+            reference_id: recorded.reference_id.to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(explained.context_id, context_id);
+    assert_eq!(explained.repository_id, repository_id);
+    assert_eq!(explained.status, sctx_domain::ResolutionStatus::Resolved);
+    let artifact = explained.resolved_artifact.unwrap();
+    assert_eq!(artifact.repository_id(), repository_id);
+    assert_eq!(
+        artifact.locator(),
+        &ArtifactLocator::File {
+            path: RepoRelativePath::new(&oracle.relative_path).unwrap()
+        }
+    );
+
+    let task = task_intent_update_at_root(
+        &machine_b.root,
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: "team-sharing-machine-b".to_owned(),
+            task_boundary: TaskBoundary::New,
+            expected_revision_id: ExpectedRevisionId::Null(()),
+            intent: WorkingIntentSnapshot::new("Use the shared FE contract").unwrap(),
+        },
+    )
+    .unwrap();
+    let focused = task_artifact_focus_at_root(
+        &machine_b.root,
+        &ArtifactFocusQuery {
+            agent_kind: "codex".to_owned(),
+            external_session_id: "team-sharing-machine-b".to_owned(),
+            expected_revision_id: task.context.intent_revision_id.to_string(),
+            absolute_file_path: checkout_b
+                .join(&oracle.relative_path)
+                .to_string_lossy()
+                .into_owned(),
+            locator: ArtifactFocusQueryCoordinates::File,
+            token_budget: 4_000,
+            max_spaces: 8,
+        },
+    )
+    .unwrap();
+    assert_eq!(focused.resolved_focus.repository_id, repository_id);
+    assert!(focused.context.items.iter().any(|item| {
+        item.context.context_id == context_id
+            && item
+                .retrieval_paths
+                .iter()
+                .any(|path| matches!(path, TaskRetrievalPath::EngineeringGraph { .. }))
+    }));
+
+    let preserved_paths = [
+        machine_b.root.join("bin/current/sctx"),
+        machine_b.root.join("state/install-manifest.json"),
+        machine_b.home.join(".cursor/mcp.json"),
+        machine_b.home.join(".cursor/hooks.json"),
+        machine_b.home.join(".codex/config.toml"),
+        machine_b.home.join(".codex/hooks.json"),
+        machine_b.skill_root().join("SKILL.md"),
+    ];
+    let preserved = preserved_paths
+        .iter()
+        .map(|path| (path.clone(), fs::read(path).unwrap()))
+        .collect::<Vec<_>>();
+    let remote_before_reset = git(&shared.remote, &["show-ref"]);
+    let reset = machine_b
+        .installer("1.0.0")
+        .reset_data(DataResetOptions {
+            confirmed: true,
+            dry_run: false,
+        })
+        .unwrap();
+    assert!(reset.remote_detached);
+    assert!(!reset.remote_mutated);
+    assert_eq!(reset.repository_count_cleared, 1);
+    for (path, bytes) in preserved {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+    assert_eq!(git(&shared.remote, &["show-ref"]), remote_before_reset);
+    let reset_store = GitStore::open_existing(&machine_b.root).unwrap();
+    assert!(git(reset_store.repository(), &["remote"]).is_empty());
+    assert_eq!(
+        git(reset_store.repository(), &["rev-list", "--count", "HEAD"]),
+        "1"
+    );
+    let empty = ProjectionIndex::for_store(&reset_store)
+        .domain_snapshot()
+        .unwrap();
+    assert!(empty.projection.spaces.is_empty());
+    assert!(empty.projection.engineering_references.is_empty());
+    let empty_catalog = UserConfigStore::open_existing(&machine_b.root)
+        .unwrap()
+        .repository_catalog()
+        .unwrap();
+    assert!(empty_catalog.repositories.is_empty());
+    assert!(empty_catalog.repository_groups.is_empty());
+    assert!(
+        RepositoryRegistry::initialize(&machine_b.root)
+            .unwrap()
+            .list()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        TaskRuntime::initialize(&machine_b.root)
+            .unwrap()
+            .read_external_session_by_locator(
+                &ExternalSessionLocator::new("codex", "team-sharing-machine-b").unwrap()
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(machine_b.installer("1.0.0").doctor().healthy);
+    let a_snapshot = ProjectionIndex::for_store(&GitStore::open_existing(&machine_a.root).unwrap())
+        .domain_snapshot()
+        .unwrap();
+    assert!(
+        a_snapshot
+            .projection
+            .spaces
+            .values()
+            .any(|space| space.contexts.contains_key(&context_id))
     );
 }
 

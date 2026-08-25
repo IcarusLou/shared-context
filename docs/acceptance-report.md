@@ -134,6 +134,7 @@ Mandatory Gates #114/#117 are implemented: stable `submission_id` and exact clos
 | Local data reset is transactional and remote-safe | PROVEN | `data reset --dry-run/--yes` covers corrupt SQLite, non-empty Git/Catalog and every temporary store; default backup retains old data, installation/Agent/Skill/log bytes remain identical, a local bare remote ref is unchanged, repeated reset is empty and healthy, and five crash seams plus Setup recovery expose no partial business state |
 | Existing remote Knowledge Store can bootstrap Setup safely | PROVEN | A non-empty local bare remote is cloned and strictly validated in transaction staging, atomically activated on a stable `shared-context/<installation-id>` branch, repeated same-URL Setup is network-free and idempotent, different/existing-local/empty/credential-bearing/corrupt sources are rejected, rollback leaves no active clone, raw URL is absent from manifest/output, and the remote default ref receives zero writes |
 | Protected default branch synchronization uses only installation work branches | PROVEN | `knowledge sync` creates/recreates only `shared-context/<installation-id>`, merges remote default/work advances, validates append-only Event/Object/Reducer/Index state, rolls back conflicts/corrupt or modified facts, retries one deterministic non-fast-forward race, reports divergence/PR need, and read-only rejection observes only the work-branch ref while the default OID remains unchanged |
+| Two independent installations share knowledge without sharing local paths | PROVEN | Hand-authored `team-sharing-v1.json` drives two HOME/root pairs with exact `FE`, different tracked checkouts and one remote: A publishes an accepted Context/EngineeringReference, a simulated human merge advances protected default, B syncs and resolves/focuses that same fact through B's absolute path, then B reset preserves install bytes, empties local facts/Catalog and leaves every remote ref unchanged |
 | Cross Workspace mapping is isolated and non-discovering | PROVEN | Real-structure CLI E2E configures FE/Android/iOS repos under one parent Workspace, maps equal relative paths to each owning stable RepositoryId, leaves an unconfigured sibling signal-free, and converges root/subdirectory/parent Workspace inputs |
 | Hook observations are bounded, non-locating, and Git-free | PROVEN | A fake `git` sentinel proves PostTool never launches Git; File observations remain Breadcrumb-only, TestOutcome is non-locating, and Catalog/Registry failures return sanitized success responses without Focus submission |
 | Catalog and Registry validation are explicit | PROVEN | CLI `repository add/list/doctor`, installer setup/doctor, and MCP Runtime open synchronize only trusted local Catalog IDs; unsafe names and ASCII case-only collisions are typed errors, and public `repository_scan` rejects unconfigured checkout or caller Repository identity fields |
@@ -157,11 +158,23 @@ Mandatory Gates #114/#117 are implemented: stable `submission_id` and exact clos
 
 #150 remains an accepted product boundary: untracked files are not scanned, and no ActiveTask untracked scan entry was added.
 
-#154 replaces the unlaunched #151/#152 persistence model: `task_artifact_focus` is a read-only ArtifactFocusQuery, Catalog supplies a request-local `ResolvedFocus`, and Search consumes only that value for the current Pack. Runtime owns no Focus state, and later Focus queries, ordinary `task_context`, MCP restart, Task switch, or compaction restore nothing. Repository Catalog remains local-only; team synchronization is not claimed.
+#154 replaces the unlaunched #151/#152 persistence model: `task_artifact_focus` is a read-only ArtifactFocusQuery, Catalog supplies a request-local `ResolvedFocus`, and Search consumes only that value for the current Pack. Runtime owns no Focus state, and later Focus queries, ordinary `task_context`, MCP restart, Task switch, or compaction restore nothing. Repository Catalog and absolute checkout paths remain local-only; explicit Knowledge Store synchronization exchanges RepositoryId-based facts, never Catalog mappings.
 
 #157 exposes explicit AgentCheckpoint through MCP/CLI/Skill without Hook-authored Claims. #114/#117 connect internal Builder submissions to closed Episode verification, submission-idempotent Git admission, and malformed-Event isolation. #158 deterministically builds unassigned drafts at close and through an internal CLI retry. #163 lets verified PreCompact/TurnStop Hooks close only an already checkpointed Episode and invoke that same Builder. #136 stores optional, non-factual Working Intent snapshots with canonical retry convergence, and #169 adds typed Hint Text recall without Graph semantics. #164 closes the chain with a hand-authored fixed oracle covering exact Episode provenance, no-retype Review, Candidate isolation, and atomic existing/new confirmation.
 
 The fixed #136 oracle proves goal-only input, created/already-current continue, real changes, old-parent retry convergence, 20-way concurrency, stale zero-write, explicit new, Task switch and Runtime deletion. Artifact/interface Hints retrieve only through `WorkingIntentHintText`; they create no Git Event, Candidate, EngineeringReference, Graph path, Evidence, or automatic eligibility. Existing `episode_lifecycle_hooks`, `work_episode_capture`, and `hook_fail_open` suites cover PreCompact/TurnStop and Intent/Capture/Hook fail-open.
+
+## Team-sharing completion audit — Mew #197–#204
+
+| Requirement | Authoritative evidence | Result |
+|---|---|---|
+| Team-chosen human-readable RepositoryId | `repository add --repository-id FE`, exact-case Catalog tests, ADR-0001 and the fixed A/B oracle use one `FE` across different paths | PROVEN |
+| One-click local data reset without structural damage | #201 crash/rollback matrix plus the A/B oracle compare runtime, manifest, Agent configs and Skill bytes; active Git/Catalog/Context/Reference are empty and remote refs are byte-identical | PROVEN |
+| Setup from one existing remote Git address | #202 local-bare fixtures cover valid clone, immediate first append, empty/corrupt/auth/different URL rejection, rollback, URL redaction and offline idempotency | PROVEN |
+| Protected default branch synchronization | #203 tests observe only installation work-branch push refs, conflict rollback, append-only/full projection validation, branch recreation, read-only failure and bounded non-fast-forward retry | PROVEN |
+| Cross-install Context and EngineeringReference portability | `fixed_two_installation_team_sharing_and_local_reset_oracle` proves A-authored IDs survive default integration while B resolves `FE + src/shared-search.ts` through B's checkout and retrieves the same Context | PROVEN |
+| Explicit non-goals remain closed | Source/CLI/Hook/MCP audit shows no background networking, force/delete/default push, hosting-provider API, automatic PR, path-derived RepositoryId or automatic conflict resolution | PROVEN |
+| Atomic issue, commit and human gates | Mew #198–#204 messages/status plus commits `791aa34`, `5a8ad2f`, `41bfa33`, `7e0cea0`, `1c44dc7`, `30c0f01` and the #204 acceptance commit | PROVEN after final #204 commit/gate |
 
 ## Residue gates
 
@@ -204,6 +217,7 @@ cargo test --locked -p sctx-cli --test milestone_one_contract
 cargo test --locked -p sctx-cli --test milestone_two_contract
 cargo test --locked -p sctx-cli --test milestone_three_contract
 cargo test --locked -p sctx-cli --test milestone_four_contract
+cargo test --locked -p sctx-installer --test installer_matrix fixed_two_installation_team_sharing_and_local_reset_oracle
 
 # Required repository gates
 cargo fmt --all -- --check
@@ -216,10 +230,10 @@ Current repository gate results:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: passed with no warnings.
-- `cargo test --workspace --locked`: 504 passed, 0 failed, 3 ignored across 77 test targets; 22 zero-test library/doc targets completed successfully and were not counted as behavioral evidence.
+- `cargo test --workspace --locked`: passed with no failed non-ignored test; intentionally ignored long-run/replay cases remain explicitly labeled and are not used as blocking evidence.
 - `npm test`: 15 passed, 0 failed, 1 explicit Mew #195 skip.
 - Shared Context Skill `quick_validate.py`: passed (`Skill is valid!`).
 - Repository resolver p95: 3µs; Hook Repository mapping p95: 559µs; established-Session Artifact Focus p95: 123.989ms.
 - Release 100k-row warm Search p95: 42.172ms (`needle`), 45.421ms (`search_result_parser`), 43.601ms（中文检索）, 75.661ms（empty query）。
 
-The complete historical V1 storage, lifecycle, installer, adapter, and NPM regression coverage remains in the workspace suites. M1–M3 establish Task-first runtime retrieval and Engineering Graph truth. The hand-authored `fixtures/m4/fixed-oracle.json` and `fixtures/m5/repository-scoped-context-v1.json`, Working Intent oracle, cross-platform M3 oracle, real Cursor/Codex Hook suites, privacy/performance contracts, and Builder/Review/Confirmation recovery tests close M4 and the Repository-scoped implementation evidence without claiming team synchronization, billing-token measurement, physical MCP removal, or untracked-file scanning beyond accepted #150.
+The complete historical V1 storage, lifecycle, installer, adapter, and NPM regression coverage remains in the workspace suites. M1–M3 establish Task-first runtime retrieval and Engineering Graph truth. The hand-authored `fixtures/m4/fixed-oracle.json`, `fixtures/m5/repository-scoped-context-v1.json`, and `fixtures/team-sharing/team-sharing-v1.json`, Working Intent oracle, cross-platform M3 oracle, real Cursor/Codex Hook suites, privacy/performance contracts, and Builder/Review/Confirmation recovery tests close local lifecycle, Repository-scoped activation, and explicit team-sharing evidence without claiming background synchronization, automatic Pull Requests, billing-token measurement, physical MCP removal, or untracked-file scanning beyond accepted #150.

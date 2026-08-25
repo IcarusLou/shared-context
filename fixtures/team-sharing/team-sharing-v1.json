@@ -1,0 +1,11 @@
+{
+  "schema": "shared-context.team-sharing-oracle",
+  "version": 1,
+  "repository_id": "FE",
+  "relative_path": "src/shared-search.ts",
+  "source": "export function sharedSearch(): string { return \"team-context\"; }\n",
+  "context_statement": "FE sharedSearch returns the governed team-context contract",
+  "context_topic": "team-sharing/shared-search",
+  "base_branch": "main",
+  "work_branch_prefix": "shared-context/"
+}

@@ -70,6 +70,16 @@ still starts setup with its defaults; callers must not include an extra `setup` 
 The optional Knowledge Store URL is forwarded unchanged as an argv value; Setup rejects embedded
 credentials and never prints or stores the raw URL in its install manifest.
 
+After teammates merge an installation work branch into the protected default branch, explicitly
+receive it and publish this installation's own proposal branch with:
+
+```bash
+sctx knowledge sync
+```
+
+The thin launcher forwards this command unchanged. Shared Context does not create or merge a Pull
+Request automatically.
+
 Do not pass `--demo` as an install acceptance check. Mew #195 records a human-accepted, non-core
 known limitation: offline `setup --demo` has no authorized Agent Session lease, so its public MCP
 search is rejected by the Server guard. Normal install/setup, Hook activation, Skill loading, and

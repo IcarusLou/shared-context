@@ -1400,6 +1400,13 @@ Evidence 继续只约束 WorkObservation、CheckpointClaim、Candidate、Context
 - #156 的 WorkEpisode query 已接入 Candidate admission；不存在、Open、跨 Task 或 stale Intent 的来源在任何 Git 写入前拒绝。
 - #164 固定 oracle 位于 `fixtures/m4/fixed-oracle.json`，直接驱动 WorkingIntent→Checkpoint close→Builder→Review list/get→existing/new Confirm，并与固定 Working Intent Hint、跨端 Graph、真实 Cursor/Codex Hook/Capture、submission crash/concurrency、analysis safety、pagination/budget/privacy 套件共同关闭 M4。Oracle 输入为手写 fixture，不从 production 结果生成。
 
+### Team-shared Knowledge Store — 已实现
+
+- RepositoryId 由团队约定为 exact-case 可读字符串；每台安装的 Catalog 只绑定自己的 checkout，因此 `FE + RepoRelativePath` 可跨机器保持身份而不共享绝对路径。
+- 远端 Setup、InstallationWorkBranch 和显式 `knowledge sync` 形成受保护默认分支协议：安装只 clone，sync 只发布本安装工作分支，人工 PR/merge 才能推进 integrated default。
+- 手写 `fixtures/team-sharing/team-sharing-v1.json` 驱动两个独立 HOME/root、两个不同 FE checkout 与一个 bare remote。A 创建 accepted Context 和 EngineeringReference 后发布工作分支；测试模拟人工合并，B 同步并用 B 的绝对路径形成同一 RepositoryId/Locator 的 ResolvedFocus 与 EngineeringGraph retrieval。
+- 同一 oracle 随后对 B 执行真实 data reset，逐字节证明 runtime、manifest、Agent 配置和 Skill 保留；活动 Git、Catalog、Context/Reference 与派生状态为空，远端全部 refs 不变。该证据不外推为后台同步、自动 PR 或 Git 托管平台集成。
+
 ## 19. 验收标准
 
 ### 19.1 Task-first Retrieval
