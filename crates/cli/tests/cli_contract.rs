@@ -438,7 +438,7 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
         "upgrade [--agents cursor,codex]",
         "uninstall [--root PATH]",
         "data reset [--dry-run] [--yes]",
-        "knowledge delete --confirm-path PATH",
+        "knowledge sync|delete",
         "space create|intent revise|list|get",
         "candidate list|get|discard|confirm|build-closed-episode|analyze",
         "context revise|review|publish|withdraw|get",

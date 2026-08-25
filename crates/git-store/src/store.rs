@@ -941,6 +941,45 @@ impl GitStore {
         Ok(paths.len())
     }
 
+    /// Verifies that every committed change since one trusted revision is an append-only managed
+    /// file addition.
+    ///
+    /// # Errors
+    ///
+    /// Rejects modified, deleted, renamed, copied, or foreign paths between the supplied revision
+    /// and current `HEAD`.
+    pub fn validate_append_only_since(&self, base_revision: &str) -> Result<usize> {
+        let git = Git::new(&self.repository);
+        git.run([
+            "rev-parse",
+            "--verify",
+            &format!("{base_revision}^{{commit}}"),
+        ])?;
+        let changed = git.changed_between(base_revision)?;
+        let mut path_count = 0;
+        for entry in changed {
+            if entry.status != "A" {
+                return Err(invariant(format!(
+                    "committed change {} is not append-only",
+                    entry.status
+                )));
+            }
+            for path in entry.paths {
+                let path = path_string(path)?;
+                if !MANAGED_ROOTS
+                    .iter()
+                    .any(|root| path.starts_with(&format!("{root}/")))
+                {
+                    return Err(invariant(format!(
+                        "committed foreign path is not part of the Shared Context store: {path}"
+                    )));
+                }
+                path_count += 1;
+            }
+        }
+        Ok(path_count)
+    }
+
     /// Validates staged changes as append-only additions and reduces the exact
     /// staged event set before a manual commit.
     ///

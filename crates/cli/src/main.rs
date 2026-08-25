@@ -66,7 +66,7 @@ Commands:
   upgrade [--agents cursor,codex] [--root PATH] [--runtime-source PATH]
   uninstall [--root PATH]
   data reset [--dry-run] [--yes]
-  knowledge delete --confirm-path PATH --confirm DELETE-SHARED-CONTEXT-KNOWLEDGE
+  knowledge sync|delete
   space create|intent revise|list|get
   candidate list|get|discard|confirm|build-closed-episode|analyze
   context revise|review|publish|withdraw|get
@@ -303,11 +303,17 @@ fn run_data(args: &[String], json_output: bool) -> Result<()> {
 fn run_knowledge(args: &[String], json_output: bool) -> Result<()> {
     let [command, rest @ ..] = args else {
         return Err(invalid(
-            "Usage: sctx knowledge delete --confirm-path <ABSOLUTE_PATH> --confirm DELETE-SHARED-CONTEXT-KNOWLEDGE",
+            "Usage: sctx knowledge sync | sctx knowledge delete --confirm-path <ABSOLUTE_PATH> --confirm DELETE-SHARED-CONTEXT-KNOWLEDGE",
         ));
     };
+    if command == "sync" {
+        let options = Options::parse(rest, &[])?;
+        options.allow_only(&["--root", "--runtime-source", "--runtime-version"], &[])?;
+        let report = installer_from_options(&options)?.sync_knowledge()?;
+        return emit_lifecycle(&report, json_output);
+    }
     if command != "delete" {
-        return Err(invalid("knowledge command must be delete"));
+        return Err(invalid("knowledge command must be sync or delete"));
     }
     let options = Options::parse(rest, &[])?;
     options.allow_only(

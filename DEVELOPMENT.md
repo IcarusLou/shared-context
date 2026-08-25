@@ -14,6 +14,7 @@
 - `state/maintenance.lock` 是安装级最外层门禁：业务 CLI、Hook 和每次 MCP tool call 持共享锁，Setup/Upgrade/Uninstall、知识删除与 reset 持排他锁；冲突非阻塞返回 typed `maintenance_busy`，Hook neutral，锁顺序固定为 maintenance 后进入现有组件锁。
 - `data reset` 在 `backups/reset-<id>/new` 构造空 Git/Catalog/Index/Runtime/Engineering/Registry 后，以 `state/reset-journal.json` 驱动同文件系统 rename；5 个 crash seam 的下一次 reset/setup 会先回滚完整旧态。成功保留 old backup 与安装/Agent/Skill/logs，活动知识仓不保留 remote，任何远端 ref 都不修改。
 - 首次 `setup --knowledge-store-url` 只接受无内嵌 secret 的非空远端 Store：系统 Git 在事务目录 clone，严格验证 committed Event/Object、Reducer 与 scratch Index 后才 rename 到活动 `repository`。安装清单只保存 remote transport、default branch、stable installation ID、`shared-context/<installation-id>` work branch 和 URL digest；Setup 不 push，Hook/MCP/业务 CLI 只 `open_existing`，不 init/clone 或访问网络。
+- `knowledge sync` 在安装级排他门禁内显式 fetch `origin/<default>` 与可选的远端 InstallationWorkBranch，合并后验证 append-only、Event/Object、Reducer 和 Index；冲突恢复原本机 HEAD，push race 最多重试 3 次。唯一 push refspec 固定为 `HEAD:refs/heads/shared-context/<installation-id>`，禁止默认分支、force 和 delete；Hook/MCP 不触发同步。
 - SessionStart 在模型推理前同步读取本机 Catalog，并以 non-blocking try-lock 解析或复用 exact locator 的 `AuthorizedSessionScope`。Direct/显式 Group 才返回固定 bounded activation marker；Disabled、Catalog/lease 锁忙或异常返回 neutral。PromptSubmit 不重复 marker，也不访问 Runtime/Search。
 - Enabled PostTool Hook 不运行 Git、Scanner、Graph rebuild，也不发起 ArtifactFocusQuery；lease 是 Session-level 准入，不再限制本次调查的目标 Repository。全部结构化路径属于同一或可由显式 Group root 安全表示的已登记 checkout 时，Breadcrumb 保留真实 Catalog 归属；安全的未登记路径、registered/unregistered mixed 或无法用单一 workspace 安全表示的多 Repo 事件整条降级为无 workspace/file hint 的非定位 Breadcrumb，可识别 Test/Check/Lint 仍形成非事实、非定位的 TestOutcome TaskSignal；ambiguous、relative、missing、symlink 或其他 unsafe 输入整条丢弃。TaskSignal 可影响 Working Intent retrieval，但不是工程 Evidence；setup、doctor 与显式 Runtime open 才验证 Catalog。
 - Engineering Graph 是围绕已有 Context/EngineeringReference 的稀疏历史知识快照，不是全仓代码搜索引擎或当前 Context Store 镜像。Builder 只固化 Reference roots 与最多两跳的 build-time ContextRelation closure；`association_rebuild` 按 RepositoryId 分组并去重 Reference 的精确 repo-relative path，Scanner 只读取该有界计划。
@@ -38,7 +39,7 @@ Mew #193 用手写固定 oracle `fixtures/m5/repository-scoped-context-v1.json` 
 
 以下能力**尚未实现**，不得在代码、测试报告或评审中宣称已经具备：
 
-- **团队自动同步：未实现** — Setup 可以安全接入已有远端 Knowledge Store，但尚无自动 fetch/merge/push/PR；Repository Catalog 仍是单机显式配置，不是团队事实。
+- **后台同步与 PR 自动化：未实现** — 用户可显式执行 `knowledge sync`，但没有定时任务、托管平台识别或自动创建/合并 PR；Repository Catalog 仍是单机显式配置，不是团队事实。
 - **真实 token/物理进程隔离证明：未实现** — #193 已关闭 activation/reference/MCP call/result bytes proxy 与 NPM/分发回归，不得把这些 bytes 当作 tokenizer 输出或真实计费 token。MCP 进程与工具 Schema 仍可能由用户级配置全局启动或可见；Server 拒绝只证明安全，不倒推出调用前 token 节省。
 
 Cursor 与 Codex 都通过显式 `task_intent_update` 建立 TaskSession 的首个 `TaskIntentRevision`；SessionStart 的固定 marker 只声明本地范围已授权，Prompt Hook 不重复提示。已有 ActiveTask 可通过只读 `task_context` 再取 Pack。

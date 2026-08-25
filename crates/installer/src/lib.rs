@@ -13,7 +13,7 @@ use std::{
     io::{BufReader, Cursor, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
     str::FromStr,
     sync::Arc,
     thread,
@@ -44,6 +44,7 @@ const RESET_JOURNAL_VERSION: u32 = 1;
 const MANIFEST_VERSION: u32 = 1;
 const MINIMUM_FREE_SPACE_BYTES: u64 = 64 * 1024 * 1024;
 const AGENT_VERSION_TIMEOUT: Duration = Duration::from_secs(2);
+const KNOWLEDGE_SYNC_PUSH_ATTEMPTS: usize = 3;
 const PRODUCT_KEY: &str = "shared-context";
 const GLOBAL_SKILL_DIRECTORY: &str = ".agents/skills/shared-context";
 const SKILL_ASSETS: [(&str, &[u8]); 3] = [
@@ -495,6 +496,17 @@ pub struct DataResetReport {
     pub remote_mutated: bool,
 }
 
+/// Completed protected-branch Knowledge Store synchronization.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct KnowledgeSyncReport {
+    pub base_branch: String,
+    pub work_branch: String,
+    pub ahead: u64,
+    pub behind: u64,
+    pub pushed: bool,
+    pub needs_merge: bool,
+}
+
 /// Installer entry point.
 pub struct Installer {
     context: InstallContext,
@@ -941,6 +953,29 @@ impl Installer {
         }
         FileExt::unlock(&lock).map_err(io_error("unlock uninstall"))?;
         Ok(report)
+    }
+
+    /// Fetches shared knowledge into this installation's work branch and publishes only that
+    /// branch. The remote default branch is never a push target.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed installation, validation, merge-conflict, authentication, or bounded push
+    /// retry error. Supported local writers are excluded for the complete operation.
+    pub fn sync_knowledge(&self) -> Result<KnowledgeSyncReport> {
+        validate_context(&self.context)?;
+        require_existing_installation(&self.context.root)?;
+        let _maintenance = MaintenanceLock::open_or_create(&self.context.root)?.try_exclusive()?;
+        let setup_lock = open_lock(&self.context.root.join("state/setup.lock"))?;
+        setup_lock
+            .lock_exclusive()
+            .map_err(io_error("lock knowledge synchronization"))?;
+        recover_incomplete_data_reset(&self.context.root)?;
+        recover_incomplete_journals(&self.context.root)?;
+        require_existing_installation(&self.context.root)?;
+        let result = sync_knowledge_locked(&self.context.root);
+        FileExt::unlock(&setup_lock).map_err(io_error("unlock knowledge synchronization"))?;
+        result
     }
 
     /// Deletes the knowledge repository only after two explicit confirmations.
@@ -1485,6 +1520,312 @@ struct KnowledgeStoreInstall {
     store: GitStore,
     source: KnowledgeStoreSource,
     changed: bool,
+}
+
+fn sync_knowledge_locked(root: &Path) -> Result<KnowledgeSyncReport> {
+    let manifest = read_manifest(root)?
+        .ok_or_else(|| invalid("knowledge sync requires an install manifest"))?;
+    let installation_id = installation_id(Some(&manifest))?;
+    let KnowledgeStoreSource::Remote {
+        default_branch,
+        work_branch,
+        url_digest,
+        ..
+    } = &manifest.knowledge_store
+    else {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            "knowledge sync requires a remotely bootstrapped Knowledge Store",
+        ));
+    };
+    let expected_work_branch = format!("shared-context/{installation_id}");
+    if work_branch != &expected_work_branch || work_branch == default_branch {
+        return Err(invalid(
+            "install manifest Knowledge Store branches are inconsistent",
+        ));
+    }
+
+    let store = GitStore::open_existing(root)?;
+    verify_remote_store(&store, default_branch, work_branch, url_digest)?;
+    if !store.list_pending()?.is_empty() {
+        return Err(invalid(
+            "knowledge sync requires all pending batches to be committed or moved aside",
+        ));
+    }
+    validate_sync_head(&store, None)?;
+    let repository = store.repository();
+    let original_head = git_output(
+        repository,
+        &["rev-parse", "--verify", "HEAD"],
+        "inspect Knowledge Store HEAD",
+    )?;
+    let base_ref = format!("refs/remotes/origin/{default_branch}");
+    let work_ref = format!("refs/remotes/origin/{work_branch}");
+
+    fetch_required_branch(repository, default_branch, &base_ref)?;
+    let remote_work_oid = fetch_optional_work_branch(repository, work_branch, &work_ref)?;
+    let merge_result = (|| {
+        if remote_work_oid.is_some() {
+            merge_sync_ref(repository, &work_ref)?;
+        }
+        merge_sync_ref(repository, &base_ref)?;
+        validate_sync_head(&store, Some(&original_head))
+    })();
+    if let Err(error) = merge_result {
+        rollback_sync_head(&store, &original_head)?;
+        return Err(error);
+    }
+
+    let pushed = push_synchronized_work_branch(
+        &store,
+        &original_head,
+        work_branch,
+        &work_ref,
+        remote_work_oid,
+    )?;
+
+    let (behind, ahead) = divergence(repository, &base_ref)?;
+    if behind != 0 {
+        return Err(invariant(
+            "synchronized work branch is still behind the fetched default branch",
+        ));
+    }
+    Ok(KnowledgeSyncReport {
+        base_branch: default_branch.clone(),
+        work_branch: work_branch.clone(),
+        ahead,
+        behind,
+        pushed,
+        needs_merge: ahead > 0,
+    })
+}
+
+fn push_synchronized_work_branch(
+    store: &GitStore,
+    original_head: &str,
+    work_branch: &str,
+    work_ref: &str,
+    mut remote_work_oid: Option<String>,
+) -> Result<bool> {
+    let repository = store.repository();
+    for attempt in 0..KNOWLEDGE_SYNC_PUSH_ATTEMPTS {
+        let local_head = git_output(
+            repository,
+            &["rev-parse", "--verify", "HEAD"],
+            "inspect synchronized Knowledge Store HEAD",
+        )?;
+        if remote_work_oid.as_deref() == Some(local_head.as_str()) {
+            return Ok(false);
+        }
+        let destination = format!("HEAD:refs/heads/{work_branch}");
+        let output = git_command(
+            repository,
+            &["push", "--porcelain", "origin", &destination],
+            "push Knowledge Store work branch",
+        )?;
+        if output.status.success() {
+            return Ok(true);
+        }
+        if attempt + 1 == KNOWLEDGE_SYNC_PUSH_ATTEMPTS {
+            return Err(Error::new(
+                ErrorKind::External,
+                "push Knowledge Store work branch failed after 3 attempts; verify write access and retry",
+            ));
+        }
+        remote_work_oid = fetch_optional_work_branch(repository, work_branch, work_ref)?;
+        let race_merge = (|| {
+            if remote_work_oid.is_some() {
+                merge_sync_ref(repository, work_ref)?;
+            }
+            validate_sync_head(store, Some(original_head))
+        })();
+        if let Err(error) = race_merge {
+            rollback_sync_head(store, original_head)?;
+            return Err(error);
+        }
+    }
+    Err(invariant(
+        "Knowledge Store push retry loop did not terminate",
+    ))
+}
+
+fn validate_sync_head(store: &GitStore, base_revision: Option<&str>) -> Result<()> {
+    store.validate_committed_objects()?;
+    store.validate_committed_events()?;
+    if let Some(base_revision) = base_revision {
+        store.validate_append_only_since(base_revision)?;
+    }
+    let snapshot = ProjectionIndex::for_store(store).domain_snapshot()?;
+    if !snapshot.projection.quarantined_event_ids.is_empty() {
+        return Err(invariant(
+            "synchronized Knowledge Store contains quarantined Events",
+        ));
+    }
+    let status = git_output(
+        store.repository(),
+        &["status", "--porcelain", "--untracked-files=all"],
+        "inspect synchronized Knowledge Store status",
+    )?;
+    if !status.is_empty() {
+        return Err(invalid(
+            "synchronized Knowledge Store worktree is not clean",
+        ));
+    }
+    Ok(())
+}
+
+fn fetch_required_branch(repository: &Path, branch: &str, tracking_ref: &str) -> Result<()> {
+    let refspec = format!("refs/heads/{branch}:{tracking_ref}");
+    let output = git_command(
+        repository,
+        &["fetch", "--no-tags", "origin", &refspec],
+        "fetch Knowledge Store default branch",
+    )?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::new(
+            ErrorKind::External,
+            "fetch Knowledge Store default branch failed; verify read access and retry",
+        ))
+    }
+}
+
+fn fetch_optional_work_branch(
+    repository: &Path,
+    branch: &str,
+    tracking_ref: &str,
+) -> Result<Option<String>> {
+    let remote_ref = format!("refs/heads/{branch}");
+    let probe = git_command(
+        repository,
+        &["ls-remote", "--exit-code", "--heads", "origin", &remote_ref],
+        "inspect remote Knowledge Store work branch",
+    )?;
+    match probe.status.code() {
+        Some(0) => {
+            let refspec = format!("{remote_ref}:{tracking_ref}");
+            let fetch = git_command(
+                repository,
+                &["fetch", "--no-tags", "origin", &refspec],
+                "fetch Knowledge Store work branch",
+            )?;
+            if !fetch.status.success() {
+                return Err(Error::new(
+                    ErrorKind::External,
+                    "fetch Knowledge Store work branch failed; verify read access and retry",
+                ));
+            }
+            git_output(
+                repository,
+                &["rev-parse", "--verify", tracking_ref],
+                "inspect fetched Knowledge Store work branch",
+            )
+            .map(Some)
+        }
+        Some(2) => {
+            let remove = git_command(
+                repository,
+                &["update-ref", "-d", tracking_ref],
+                "remove stale Knowledge Store work tracking ref",
+            )?;
+            if !remove.status.success() {
+                return Err(Error::new(
+                    ErrorKind::External,
+                    "remove stale Knowledge Store work tracking ref failed",
+                ));
+            }
+            Ok(None)
+        }
+        _ => Err(Error::new(
+            ErrorKind::External,
+            "inspect remote Knowledge Store work branch failed; verify read access and retry",
+        )),
+    }
+}
+
+fn merge_sync_ref(repository: &Path, reference: &str) -> Result<()> {
+    let output = git_command(
+        repository,
+        &["merge", "--no-edit", reference],
+        "merge Knowledge Store branch",
+    )?;
+    if output.status.success() {
+        return Ok(());
+    }
+    abort_merge_if_needed(repository)?;
+    Err(Error::new(
+        ErrorKind::Conflict,
+        "Knowledge Store branch merge conflicted; local sync changes were rolled back",
+    ))
+}
+
+fn abort_merge_if_needed(repository: &Path) -> Result<()> {
+    let merge_head = git_command(
+        repository,
+        &["rev-parse", "--verify", "-q", "MERGE_HEAD"],
+        "inspect Knowledge Store merge state",
+    )?;
+    if !merge_head.status.success() {
+        return Ok(());
+    }
+    let abort = git_command(
+        repository,
+        &["merge", "--abort"],
+        "abort Knowledge Store merge",
+    )?;
+    if abort.status.success() {
+        Ok(())
+    } else {
+        Err(invariant("abort Knowledge Store merge failed"))
+    }
+}
+
+fn rollback_sync_head(store: &GitStore, original_head: &str) -> Result<()> {
+    abort_merge_if_needed(store.repository())?;
+    let reset = git_command(
+        store.repository(),
+        &["reset", "--hard", original_head],
+        "restore Knowledge Store after failed sync",
+    )?;
+    if !reset.status.success() {
+        return Err(invariant(
+            "restore Knowledge Store after failed sync failed",
+        ));
+    }
+    validate_sync_head(store, None)
+}
+
+fn divergence(repository: &Path, base_ref: &str) -> Result<(u64, u64)> {
+    let range = format!("{base_ref}...HEAD");
+    let counts = git_output(
+        repository,
+        &["rev-list", "--left-right", "--count", &range],
+        "measure Knowledge Store branch divergence",
+    )?;
+    let mut values = counts.split_whitespace();
+    let behind = values
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| invariant("Git returned invalid behind count"))?;
+    let ahead = values
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| invariant("Git returned invalid ahead count"))?;
+    if values.next().is_some() {
+        return Err(invariant("Git returned extra branch divergence fields"));
+    }
+    Ok((behind, ahead))
+}
+
+fn git_command(repository: &Path, args: &[&str], context: &str) -> Result<Output> {
+    Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|error| Error::new(ErrorKind::External, format!("{context}: {error}")))
 }
 
 fn installation_id(prior: Option<&InstallManifest>) -> Result<String> {

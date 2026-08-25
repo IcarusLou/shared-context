@@ -20,7 +20,7 @@ Shared Context 是一个给 Cursor、Codex 等编程 Agent 使用的“工程记
 - 验证（Validation）：运行了什么验证，结论和局限是什么。
 - 发现（Discovery）和进度（Progress）：已经查清或完成了什么。
 
-当前版本是本机优先的实现：知识保存在本机 Git 仓库中，Cursor/Codex 通过 MCP 和 Hook 使用它。首次安装可以从团队已有的非空远端 Git Knowledge Store 克隆，但**自动拉取、合并、推送和跨电脑同步尚未实现**。
+当前版本是本机优先的实现：知识保存在本机 Git 仓库中，Cursor/Codex 通过 MCP 和 Hook 使用它。首次安装可以从团队已有的非空远端 Git Knowledge Store 克隆，并通过显式 `sctx knowledge sync` 收取共享知识、发布本机工作分支；后台自动同步和自动创建 Pull Request 尚未实现。
 
 ## 2. 三分钟快速开始
 
@@ -148,7 +148,13 @@ sctx setup --agents cursor,codex \
 
 Setup 使用系统 Git 的 credential helper 或 SSH Agent 完成认证；URL 中不能嵌入 token、密码、查询参数或 fragment。克隆会先进入事务临时目录，只有 HEAD、工作树、Event、对象哈希、Reducer 和 Index 全部通过校验后才原子安装。空远端不受支持。
 
-安装器会从远端默认分支创建稳定的 `shared-context/<installation-id>` 本机工作分支。默认分支只作为只读基线，Setup 不向任何远端分支 push；自动同步将在后续版本提供。
+安装器会从远端默认分支创建稳定的 `shared-context/<installation-id>` 本机工作分支。默认分支只作为只读基线，Setup 不向任何远端分支 push。需要同步时显式执行：
+
+```bash
+sctx knowledge sync
+```
+
+该命令 fetch 远端默认分支和本机工作分支，合并到当前 InstallationWorkBranch，并只 push `HEAD:refs/heads/shared-context/<installation-id>`。输出中的 `needs_merge=true` 表示需要由用户在 Git 托管平台上把该工作分支合入默认分支；命令不识别 GitHub/GitLab，也不自动创建 Pull Request。
 
 `setup --demo` 目前是非核心已知限制（Mew #195）：MCP Session guard 启用后，offline setup 没有 Agent Session lease，演示内的 public MCP search 会被正确拒绝。请不要把它用于安装验收；普通 `setup`、Hook、Skill 与授权后的 MCP 流程不受影响。
 
@@ -491,6 +497,7 @@ sctx candidate discard \
 | `sctx upgrade [--agents cursor,codex]` | 安装新版本并原子切换 `bin/current`。 |
 | `sctx data reset --dry-run` / `--yes` | 预览或确认事务式清空活动数据；保留安装结构、Agent 接入和默认恢复备份，不修改远端 Git。 |
 | `sctx uninstall` | 精确移除安装器拥有的运行时和接入配置，保留知识库。 |
+| `sctx knowledge sync` | 显式收取远端默认/工作分支，验证并合并到本机 InstallationWorkBranch，只发布该工作分支。 |
 | `sctx knowledge delete ...` | 双重确认后永久删除知识 Git 仓库。 |
 
 `--root`、`--runtime-source`、`--runtime-version` 主要用于安装包、测试和受控部署。普通命令固定读取 `~/.shared-context`，日常用户应使用默认根目录，避免“setup 到自定义目录、运行时却读取默认目录”的混淆。
@@ -793,7 +800,7 @@ sctx index rebuild
 
 ### 7.8 能否团队共享或跨电脑同步
 
-可以从同一个团队远端 Git 地址初始化多台机器，每台安装都会使用自己的 `shared-context/<installation-id>` 工作分支；但当前版本还不会自动 fetch、merge、push 或创建 Pull Request。因此它只完成团队 Store 的安全接入，不等同于已完成跨电脑自动同步。Repository Catalog 仍是每台机器的本机显式配置，团队成员需要为同一业务源码仓约定相同的 RepositoryId。
+可以从同一个团队远端 Git 地址初始化多台机器，每台安装都会使用自己的 `shared-context/<installation-id>` 工作分支。各机器显式运行 `sctx knowledge sync` 后，会把远端默认分支和自己的远端工作分支合入本机，再只发布自己的工作分支。用户仍需在托管平台创建/合并 Pull Request，其他机器再显式同步；没有后台定时同步。Repository Catalog 仍是每台机器的本机显式配置，团队成员需要为同一业务源码仓约定相同的 RepositoryId。
 
 ## 8. 开发与验证
 
@@ -818,7 +825,7 @@ npm 测试会检查 launcher、平台包、离线 Bundle 和安装契约。Apple
 
 ## 9. 当前明确不支持的能力
 
-- 团队远端的自动 fetch/merge/push、Pull Request 和跨电脑自动分发。
+- 后台定时同步、自动创建/合并 Pull Request 和无人值守跨电脑分发。
 - 把 Workspace 自动绑定成某个 Space。
 - 把文本 Hint、Prompt、文件路径或测试结果自动当成可信工程证据。
 - 未经用户审核，自动确认、发布或注入 Candidate。

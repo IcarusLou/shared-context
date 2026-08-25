@@ -19,6 +19,8 @@ use sctx_task_runtime::TaskRuntime;
 use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 
+const KNOWLEDGE_SYNC_PUSH_ATTEMPTS_FOR_TEST: usize = 3;
+
 #[derive(Clone)]
 struct FakeHost {
     platform: &'static str,
@@ -305,6 +307,77 @@ fn remote_setup_options(remote: &Path) -> SetupOptions {
     }
 }
 
+fn append_space(store: &GitStore, title: &str) -> String {
+    let event = Event::space_created(
+        IntentSnapshot {
+            title: title.to_owned(),
+            problem: format!("{title} needs shared knowledge"),
+            desired_outcome: format!("{title} is synchronized"),
+            in_scope: vec!["knowledge sync".to_owned()],
+            out_of_scope: Vec::new(),
+            acceptance_conditions: vec!["the Event is present".to_owned()],
+            domain_terms: vec!["KnowledgeStore".to_owned()],
+        },
+        None,
+    )
+    .unwrap();
+    store
+        .append_event(AppendRequest::event(event))
+        .unwrap()
+        .commit_oid
+}
+
+fn clone_work_store(root: &Path, remote: &Path, branch: &str) -> GitStore {
+    let config = UserConfigStore::initialize(root).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["clone", "--quiet", "--branch", branch, "--"])
+            .arg(remote)
+            .arg(config.repository())
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::create_dir_all(root.join("state/pending")).unwrap();
+    git(
+        config.repository(),
+        &["config", "user.name", "Sync Race Writer"],
+    );
+    git(
+        config.repository(),
+        &["config", "user.email", "sync-race@localhost"],
+    );
+    GitStore::open_existing(root).unwrap()
+}
+
+fn install_remote_hook(remote: &Path, script: &str) -> PathBuf {
+    let hook = remote.join("hooks/pre-receive");
+    fs::write(&hook, script).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    hook
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+fn commit_event_variant(repository: &Path, event: &Event, pretty: bool) -> String {
+    let event_id = event.event_id().to_string();
+    let uuid = event_id.strip_prefix("evt_").unwrap();
+    let relative = format!("events/{}/{event_id}.json", &uuid[..2]);
+    let path = repository.join(&relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let bytes = if pretty {
+        serde_json::to_vec_pretty(event).unwrap()
+    } else {
+        serde_json::to_vec(event).unwrap()
+    };
+    fs::write(path, bytes).unwrap();
+    git(repository, &["add", "--", &relative]);
+    git(repository, &["commit", "-m", "add sync conflict fixture"]);
+    git(repository, &["rev-parse", "HEAD"])
+}
+
 struct SeededResetState {
     preserved: Vec<(PathBuf, Vec<u8>)>,
     remote: PathBuf,
@@ -527,6 +600,10 @@ fn installer_mutations_are_exclusive_and_doctor_reports_active_maintenance() {
             })
             .unwrap_err()
             .kind(),
+        sctx_installer::ErrorKind::MaintenanceBusy
+    );
+    assert_eq!(
+        installer.sync_knowledge().unwrap_err().kind(),
         sctx_installer::ErrorKind::MaintenanceBusy
     );
     drop(shared);
@@ -1801,6 +1878,302 @@ fn remote_setup_rejects_an_empty_remote_without_creating_a_default_branch() {
         .output()
         .unwrap();
     assert!(refs.stdout.is_empty());
+}
+
+#[test]
+fn knowledge_sync_uses_only_the_protected_installation_branch_and_recreates_it() {
+    let harness = Harness::new();
+    let fixture = remote_fixture(&harness, "protected-sync");
+    let setup = harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&fixture.remote))
+        .unwrap();
+    let work_branch = setup.knowledge_store.work_branch.unwrap();
+
+    let source_root = fixture.repository.parent().unwrap();
+    let source = GitStore::open_existing(source_root).unwrap();
+    append_space(&source, "remote default advance");
+    git(&fixture.repository, &["push", "origin", "main"]);
+    let default_before = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+
+    let seen_refs = fixture.remote.join("hooks/seen-refs");
+    let protected_hook = format!(
+        "#!/bin/sh\nwhile read old new ref; do\n  printf '%s\\n' \"$ref\" >> {}\n  if [ \"$ref\" = refs/heads/main ]; then exit 1; fi\ndone\nexit 0\n",
+        shell_quote(&seen_refs)
+    );
+    install_remote_hook(&fixture.remote, &protected_hook);
+
+    let local = GitStore::open_existing(&harness.root).unwrap();
+    append_space(&local, "local work advance");
+    let first = harness.installer("1.0.0").sync_knowledge().unwrap();
+    assert_eq!(first.base_branch, "main");
+    assert_eq!(first.work_branch, work_branch);
+    assert_eq!(first.behind, 0);
+    assert!(first.ahead > 0);
+    assert!(first.pushed);
+    assert!(first.needs_merge);
+    assert_eq!(
+        git(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        default_before
+    );
+    let work_ref = format!("refs/heads/{work_branch}");
+    let published = git(&fixture.remote, &["rev-parse", &work_ref]);
+    assert_eq!(published, git(local.repository(), &["rev-parse", "HEAD"]));
+
+    git(
+        &fixture.remote,
+        &["update-ref", "refs/heads/main", &published],
+    );
+    git(&fixture.remote, &["update-ref", "-d", &work_ref]);
+    let merged_default = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    let recreated = harness.installer("1.0.0").sync_knowledge().unwrap();
+    assert!(recreated.pushed);
+    assert_eq!(recreated.ahead, 0);
+    assert_eq!(recreated.behind, 0);
+    assert!(!recreated.needs_merge);
+    assert_eq!(
+        git(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        merged_default
+    );
+    assert_eq!(
+        git(&fixture.remote, &["rev-parse", &work_ref]),
+        merged_default
+    );
+    let unchanged = harness.installer("1.0.0").sync_knowledge().unwrap();
+    assert!(!unchanged.pushed);
+    assert_eq!(unchanged.ahead, 0);
+    assert_eq!(unchanged.behind, 0);
+    assert!(!unchanged.needs_merge);
+    assert!(
+        fs::read_to_string(seen_refs)
+            .unwrap()
+            .lines()
+            .all(|reference| reference == work_ref)
+    );
+}
+
+#[test]
+fn knowledge_sync_aborts_conflicts_and_restores_the_original_local_head() {
+    let harness = Harness::new();
+    let fixture = remote_fixture(&harness, "sync-conflict");
+    let setup = harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&fixture.remote))
+        .unwrap();
+    let work_branch = setup.knowledge_store.work_branch.unwrap();
+    harness.installer("1.0.0").sync_knowledge().unwrap();
+    let alternate_root = harness.home.join("conflicting work clone");
+    let alternate = clone_work_store(&alternate_root, &fixture.remote, &work_branch);
+
+    let event = Event::space_created(
+        IntentSnapshot {
+            title: "same Event different encoding".to_owned(),
+            problem: "two writers add the same path".to_owned(),
+            desired_outcome: "sync aborts instead of choosing bytes".to_owned(),
+            in_scope: vec!["merge conflict".to_owned()],
+            out_of_scope: Vec::new(),
+            acceptance_conditions: vec!["original local HEAD is restored".to_owned()],
+            domain_terms: Vec::new(),
+        },
+        None,
+    )
+    .unwrap();
+    let local = GitStore::open_existing(&harness.root).unwrap();
+    let original_local = commit_event_variant(local.repository(), &event, true);
+    commit_event_variant(alternate.repository(), &event, false);
+    let destination = format!("HEAD:refs/heads/{work_branch}");
+    git(alternate.repository(), &["push", "origin", &destination]);
+    let default_before = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+
+    let error = harness.installer("1.0.0").sync_knowledge().unwrap_err();
+    assert_eq!(error.kind(), sctx_installer::ErrorKind::Conflict);
+    assert_eq!(
+        git(local.repository(), &["rev-parse", "HEAD"]),
+        original_local
+    );
+    assert!(git(local.repository(), &["status", "--porcelain"]).is_empty());
+    assert_eq!(
+        git(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        default_before
+    );
+}
+
+#[test]
+fn knowledge_sync_retries_a_non_fast_forward_push_race_and_merges_both_heads() {
+    let harness = Harness::new();
+    let fixture = remote_fixture(&harness, "sync-race");
+    let setup = harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&fixture.remote))
+        .unwrap();
+    let work_branch = setup.knowledge_store.work_branch.unwrap();
+    harness.installer("1.0.0").sync_knowledge().unwrap();
+
+    let race_root = harness.home.join("race work clone");
+    let race = clone_work_store(&race_root, &fixture.remote, &work_branch);
+    let race_head = append_space(&race, "remote race Event");
+    let local = GitStore::open_existing(&harness.root).unwrap();
+    let local_head = append_space(&local, "local race Event");
+    let default_before = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+
+    let hook = local.repository().join(".git/hooks/pre-push");
+    let destination = format!("HEAD:refs/heads/{work_branch}");
+    let script = format!(
+        "#!/bin/sh\nrm -- \"$0\"\n/usr/bin/git -C {} push origin {} >/dev/null 2>&1\n",
+        shell_quote(race.repository()),
+        shell_quote(Path::new(&destination))
+    );
+    fs::write(&hook, script).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let report = harness.installer("1.0.0").sync_knowledge().unwrap();
+    assert!(report.pushed);
+    assert_eq!(report.behind, 0);
+    assert!(report.needs_merge);
+    let final_head = git(local.repository(), &["rev-parse", "HEAD"]);
+    assert_eq!(
+        git(
+            &fixture.remote,
+            &["rev-parse", &format!("refs/heads/{work_branch}")]
+        ),
+        final_head
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(local.repository())
+            .args(["merge-base", "--is-ancestor", &local_head, &final_head])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(local.repository())
+            .args(["merge-base", "--is-ancestor", &race_head, &final_head])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        git(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        default_before
+    );
+}
+
+#[test]
+fn knowledge_sync_reports_read_only_push_failure_without_targeting_default() {
+    let harness = Harness::new();
+    let fixture = remote_fixture(&harness, "read-only-sync");
+    let setup = harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&fixture.remote))
+        .unwrap();
+    let work_branch = setup.knowledge_store.work_branch.unwrap();
+    let local = GitStore::open_existing(&harness.root).unwrap();
+    let local_head = append_space(&local, "read-only local Event");
+    let default_before = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    let seen_refs = fixture.remote.join("hooks/rejected-refs");
+    let reject = format!(
+        "#!/bin/sh\nwhile read old new ref; do printf '%s\\n' \"$ref\" >> {}; done\nexit 1\n",
+        shell_quote(&seen_refs)
+    );
+    install_remote_hook(&fixture.remote, &reject);
+
+    let error = harness.installer("1.0.0").sync_knowledge().unwrap_err();
+    assert_eq!(error.kind(), sctx_installer::ErrorKind::External);
+    assert!(error.message().contains("write access"));
+    assert_eq!(git(local.repository(), &["rev-parse", "HEAD"]), local_head);
+    assert!(git(local.repository(), &["status", "--porcelain"]).is_empty());
+    assert_eq!(
+        git(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        default_before
+    );
+    let expected = format!("refs/heads/{work_branch}");
+    let refs = fs::read_to_string(seen_refs).unwrap();
+    assert_eq!(refs.lines().count(), KNOWLEDGE_SYNC_PUSH_ATTEMPTS_FOR_TEST);
+    assert!(refs.lines().all(|reference| reference == expected));
+}
+
+#[test]
+fn knowledge_sync_rejects_local_store_and_rolls_back_invalid_remote_facts() {
+    let local = Harness::new();
+    local
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let error = local.installer("1.0.0").sync_knowledge().unwrap_err();
+    assert_eq!(error.kind(), sctx_installer::ErrorKind::Unsupported);
+
+    let malformed = Harness::new();
+    let malformed_fixture = remote_fixture(&malformed, "malformed-sync");
+    malformed
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&malformed_fixture.remote))
+        .unwrap();
+    let malformed_local = GitStore::open_existing(&malformed.root).unwrap();
+    let malformed_original = git(malformed_local.repository(), &["rev-parse", "HEAD"]);
+    let invalid_path = malformed_fixture.repository.join("events/invalid.json");
+    fs::write(&invalid_path, b"{invalid Event").unwrap();
+    git(
+        &malformed_fixture.repository,
+        &["add", "--", "events/invalid.json"],
+    );
+    git(
+        &malformed_fixture.repository,
+        &["commit", "-m", "add malformed sync Event"],
+    );
+    git(&malformed_fixture.repository, &["push", "origin", "main"]);
+    let malformed_default = git(&malformed_fixture.remote, &["rev-parse", "refs/heads/main"]);
+    let error = malformed.installer("1.0.0").sync_knowledge().unwrap_err();
+    assert_eq!(error.kind(), sctx_installer::ErrorKind::InvariantViolation);
+    assert_eq!(
+        git(malformed_local.repository(), &["rev-parse", "HEAD"]),
+        malformed_original
+    );
+    assert!(git(malformed_local.repository(), &["status", "--porcelain"]).is_empty());
+    assert_eq!(
+        git(&malformed_fixture.remote, &["rev-parse", "refs/heads/main"]),
+        malformed_default
+    );
+
+    let modified = Harness::new();
+    let modified_fixture = remote_fixture(&modified, "modified-sync");
+    modified
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&modified_fixture.remote))
+        .unwrap();
+    let modified_local = GitStore::open_existing(&modified.root).unwrap();
+    let modified_original = git(modified_local.repository(), &["rev-parse", "HEAD"]);
+    let event_path = git(&modified_fixture.repository, &["ls-files", "events"])
+        .lines()
+        .next()
+        .unwrap()
+        .to_owned();
+    let event_file = modified_fixture.repository.join(&event_path);
+    let mut bytes = fs::read(&event_file).unwrap();
+    bytes.push(b'\n');
+    fs::write(&event_file, bytes).unwrap();
+    git(&modified_fixture.repository, &["add", "--", &event_path]);
+    git(
+        &modified_fixture.repository,
+        &["commit", "-m", "modify existing sync Event"],
+    );
+    git(&modified_fixture.repository, &["push", "origin", "main"]);
+    let modified_default = git(&modified_fixture.remote, &["rev-parse", "refs/heads/main"]);
+    let error = modified.installer("1.0.0").sync_knowledge().unwrap_err();
+    assert_eq!(error.kind(), sctx_installer::ErrorKind::InvariantViolation);
+    assert!(error.message().contains("not append-only"));
+    assert_eq!(
+        git(modified_local.repository(), &["rev-parse", "HEAD"]),
+        modified_original
+    );
+    assert!(git(modified_local.repository(), &["status", "--porcelain"]).is_empty());
+    assert_eq!(
+        git(&modified_fixture.remote, &["rev-parse", "refs/heads/main"]),
+        modified_default
+    );
 }
 
 #[test]

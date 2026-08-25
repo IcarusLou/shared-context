@@ -1259,9 +1259,19 @@ Setup 不要求选择业务仓库或 Space。业务 Workspace 只提供非定位
 
 远端 Setup 使用系统 Git credential helper 或 SSH Agent，拒绝内嵌 credential、query 和 fragment。Clone 必须在临时目录通过 HEAD/toplevel/clean、committed Event/Object、Reducer 与 scratch Index 校验，随后以同文件系统 rename 原子安装。安装清单只持久化 remote transport、默认分支、stable installation ID、`shared-context/<installation-id>` 工作分支和 URL digest，不保存或输出原始 URL。
 
-Setup 从 `origin/<default>` 创建不跟踪 upstream 的 InstallationWorkBranch，既不提交到本地默认分支，也不 push 任何远端 ref。同 URL 重复 Setup 仅核对本地 manifest/checkout 并保持幂等；不同 URL、既有 local Store、空远端或校验失败全部拒绝覆盖。Hook、MCP 和普通业务 CLI 只能 `open_existing`，不得隐式 init、clone 或访问网络。Fetch/merge/push/PR 属于后续同步里程碑。
+Setup 从 `origin/<default>` 创建不跟踪 upstream 的 InstallationWorkBranch，既不提交到本地默认分支，也不 push 任何远端 ref。同 URL 重复 Setup 仅核对本地 manifest/checkout 并保持幂等；不同 URL、既有 local Store、空远端或校验失败全部拒绝覆盖。Hook、MCP 和普通业务 CLI 只能 `open_existing`，不得隐式 init、clone 或访问网络。
 
-### 17.2 Demo
+### 17.2 Knowledge Sync
+
+```bash
+sctx knowledge sync
+```
+
+同步持安装级排他 maintenance guard 与 setup lock，要求当前分支严格等于 manifest 中的 `shared-context/<installation-id>`、工作树 clean 且无 pending batch。命令显式 fetch `origin/<default>` 和可选 `origin/<work>`，先合并远端工作分支，再合并默认分支；每次合并后的当前 Tree 必须只包含 managed append additions，并通过 committed Event/Object、Reducer 和 Index projection 校验。
+
+Merge conflict 会 abort 并 `reset --hard` 到本次同步开始时已证明 clean 的精确 HEAD；该 reset 不覆盖用户未提交内容，因为 dirty/untracked 输入在联网前就被拒绝。Push refspec 唯一允许 `HEAD:refs/heads/shared-context/<installation-id>`，不使用 force/delete；非快进 race 重新 fetch/merge/validate，最多尝试三次。输出 `base_branch`、`work_branch`、`ahead`、`behind`、`pushed`、`needs_merge`，由用户在任意 Git 托管平台完成 PR。Hook/MCP 不调用此流程，不实现后台同步或平台 API。
+
+### 17.3 Demo
 
 ```bash
 sctx demo seed
@@ -1280,7 +1290,7 @@ Demo 验证：
 8. 确认 Candidate 并生成 Context、SpaceAssociation 和 Lifecycle Events。
 9. 删除并重建 SQLite 后得到相同知识 Projection，并重新解析工程关联。
 
-### 17.3 Doctor
+### 17.4 Doctor
 
 ```bash
 sctx doctor
@@ -1299,7 +1309,7 @@ sctx doctor --json
 
 `doctor --fix` 只执行安全、可重建的修复，例如重建 SQLite 和工程关联；不得自动改写 Git 事实或确认 Candidate。
 
-### 17.4 Data Reset
+### 17.5 Data Reset
 
 ```bash
 sctx data reset --dry-run
@@ -1308,7 +1318,7 @@ sctx data reset --yes
 
 Reset 在安装级排他 maintenance guard 下执行：先在同文件系统 `backups/reset-<id>/new` 构造并 smoke 空 Git/Catalog/SQLite/临时目录，再通过持久 `state/reset-journal.json` 逐项 rename。任何中断后普通业务入口保持 `maintenance_busy`；下一次 reset 或 setup 先回滚到完整旧状态再继续。成功后删除 active marker、保留 backup journal 和旧数据。远端只做本地 remote 存在性读取，禁止 fetch/push/force/delete。
 
-### 17.5 Uninstall
+### 17.6 Uninstall
 
 默认移除：
 
