@@ -71,7 +71,7 @@ impl MilestoneTwoFixture {
         assert!(status.success());
         let workspace = fs::canonicalize(workspace).unwrap();
 
-        let store = GitStore::initialize(&root).unwrap();
+        let store = GitStore::bootstrap_local(&root).unwrap();
         UserConfigStore::initialize(&root)
             .unwrap()
             .add_repository(

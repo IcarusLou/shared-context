@@ -145,7 +145,7 @@ fn runtime_diagnostics(values: &[CaptureDiagnosticKind]) -> Vec<WorkEpisodeDiagn
 #[allow(clippy::too_many_lines)]
 fn hook_capture_keeps_locator_then_explicit_claim_and_ingestion_are_verifiable() {
     let harness = Harness::new();
-    GitStore::initialize(harness.root()).unwrap();
+    GitStore::bootstrap_local(harness.root()).unwrap();
     let cross = harness.home.join("cross workspace");
     let repository = git_repo(&cross.join("fe/repo"));
     let sibling = git_repo(&cross.join("unconfigured/repo"));

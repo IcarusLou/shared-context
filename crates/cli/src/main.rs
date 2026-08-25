@@ -59,7 +59,8 @@ const HELP: &str = r"Shared Context command-line interface
 Usage: sctx [--json] <COMMAND>
 
 Commands:
-  setup [--demo] [--agents cursor,codex] [--root PATH] [--runtime-source PATH]
+  setup [--demo] [--agents cursor,codex] [--knowledge-store-url GIT_URL]
+      [--root PATH] [--runtime-source PATH]
   demo
   doctor [--fix] [--root PATH]
   upgrade [--agents cursor,codex] [--root PATH] [--runtime-source PATH]
@@ -217,11 +218,15 @@ fn run_install_lifecycle(command: &str, args: &[String], json_output: bool) -> R
             "--root",
             "--runtime-source",
             "--runtime-version",
+            "--knowledge-store-url",
         ],
         &["--yes", "--demo"],
     )?;
     if command != "setup" && options.has("--demo") {
         return Err(invalid("--demo applies only to setup"));
+    }
+    if command != "setup" && options.provided("--knowledge-store-url") {
+        return Err(invalid("--knowledge-store-url applies only to setup"));
     }
     let installer = installer_from_options(&options)?;
     let setup = setup_options(&options)?;
@@ -356,29 +361,38 @@ fn installer_from_options(options: &Options) -> Result<sctx_installer::Installer
 }
 
 fn setup_options(options: &Options) -> Result<sctx_installer::SetupOptions> {
-    let Some(value) = options.optional("--agents")? else {
-        return Ok(sctx_installer::SetupOptions::default());
-    };
-    let mut agents = BTreeSet::new();
-    for agent in value.split(',') {
-        match agent.trim() {
-            "cursor" => {
-                agents.insert(sctx_installer::Agent::Cursor);
-            }
-            "codex" => {
-                agents.insert(sctx_installer::Agent::Codex);
-            }
-            value => {
-                return Err(invalid(format!(
-                    "unsupported setup Agent {value:?}; expected cursor,codex"
-                )));
+    let agents = if let Some(value) = options.optional("--agents")? {
+        let mut agents = BTreeSet::new();
+        for agent in value.split(',') {
+            match agent.trim() {
+                "cursor" => {
+                    agents.insert(sctx_installer::Agent::Cursor);
+                }
+                "codex" => {
+                    agents.insert(sctx_installer::Agent::Codex);
+                }
+                value => {
+                    return Err(invalid(format!(
+                        "unsupported setup Agent {value:?}; expected cursor,codex"
+                    )));
+                }
             }
         }
-    }
-    if agents.is_empty() {
-        return Err(invalid("--agents must select cursor and/or codex"));
-    }
-    Ok(sctx_installer::SetupOptions { agents })
+        if agents.is_empty() {
+            return Err(invalid("--agents must select cursor and/or codex"));
+        }
+        agents
+    } else {
+        sctx_installer::SetupOptions::default().agents
+    };
+    let knowledge_store_url = options
+        .optional("--knowledge-store-url")?
+        .map(str::parse)
+        .transpose()?;
+    Ok(sctx_installer::SetupOptions {
+        agents,
+        knowledge_store_url,
+    })
 }
 
 fn emit_lifecycle(value: &impl Serialize, json_output: bool) -> Result<()> {
@@ -1536,7 +1550,7 @@ impl Runtime {
     }
 
     fn open_at(root: &Path) -> Result<Self> {
-        let base_store = GitStore::initialize(root)?;
+        let base_store = GitStore::open_existing(root)?;
         let index = ProjectionIndex::for_store(&base_store);
         let store = base_store
             .with_candidate_submission_index(Arc::new(index.clone()))
@@ -2640,7 +2654,7 @@ fn parse_repository_group_members(options: &Options) -> Result<Vec<RepositoryId>
 }
 
 fn repository_command_metadata(root: &Path) -> Result<IndexMetadata> {
-    let store = GitStore::initialize(root)?;
+    let store = GitStore::open_existing(root)?;
     Ok(ProjectionIndex::for_store(&store).synchronize()?.metadata)
 }
 

@@ -16,8 +16,8 @@ pub use store::{
     CandidateConfirmationWriteStatus, CandidateSubmissionIndex, CandidateSubmissionLookup,
     CandidateSubmissionOutcome, CandidateSubmissionRecord, CandidateSubmissionRequest,
     CandidateSubmissionStatus, CommitObserver, CrashInjector, CrashSeam, GitStore,
-    NoopCommitObserver, NoopCrashInjector, ObjectRef, StagedValidation, TextObject,
-    UnavailableCandidateConfirmationIndex, UnavailableCandidateSubmissionIndex,
+    NoopCommitObserver, NoopCrashInjector, ObjectRef, RemoteBootstrap, StagedValidation,
+    TextObject, UnavailableCandidateConfirmationIndex, UnavailableCandidateSubmissionIndex,
 };
 
 /// Stable marker used for the retryable case where an object exists outside

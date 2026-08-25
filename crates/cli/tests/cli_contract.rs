@@ -42,7 +42,7 @@ struct Harness {
 #[test]
 fn business_cli_returns_typed_busy_while_exclusive_maintenance_is_active() {
     let harness = Harness::new();
-    let store = GitStore::initialize(harness.root()).unwrap();
+    let store = GitStore::bootstrap_local(harness.root()).unwrap();
     let before = git_output(store.repository(), &["rev-parse", "HEAD"]);
     let maintenance = MaintenanceLock::open_or_create(harness.root()).unwrap();
     let exclusive = maintenance.try_exclusive().unwrap();
@@ -116,6 +116,9 @@ impl Harness {
     }
 
     fn success(&self, args: &[&str]) -> Value {
+        if !self.repository().is_dir() {
+            GitStore::bootstrap_local(self.root()).unwrap();
+        }
         let output = self.run(args);
         assert!(
             output.status.success(),
@@ -219,7 +222,7 @@ fn seed_context(harness: &Harness, space_id: &str, statement: &str) -> (String, 
         } => (*context_id, revision.revision_id),
         _ => unreachable!(),
     };
-    GitStore::initialize(harness.root())
+    GitStore::bootstrap_local(harness.root())
         .unwrap()
         .append_event(AppendRequest::event(event))
         .unwrap();
@@ -290,7 +293,7 @@ fn submit_git_only_candidate(
         .unwrap()
         .unwrap()
         .ownership;
-    let base = GitStore::initialize(harness.root()).unwrap();
+    let base = GitStore::bootstrap_local(harness.root()).unwrap();
     let index = ProjectionIndex::for_store(&base);
     base.with_candidate_submission_index(Arc::new(index))
         .submit_candidate(CandidateSubmissionRequest {
@@ -427,6 +430,7 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&help.stdout);
     assert!(help.status.success());
+    assert!(stdout.contains("--knowledge-store-url GIT_URL"));
     for command in [
         "setup [--demo] [--agents cursor,codex]",
         "demo",
@@ -460,6 +464,38 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
         String::from_utf8_lossy(&version.stdout),
         format!("sctx {}\n", env!("CARGO_PKG_VERSION"))
     );
+}
+
+#[test]
+fn setup_rejects_embedded_remote_credentials_without_echoing_them() {
+    let harness = Harness::new();
+    let secret = "https://private-token@example.invalid/team/context.git";
+    let error = harness.failure(&["setup", "--knowledge-store-url", secret]);
+    assert_eq!(error["error"]["code"], "invalid_input");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("embedded credentials")
+    );
+    assert!(
+        !serde_json::to_string(&error)
+            .unwrap()
+            .contains("private-token")
+    );
+    assert!(!harness.root().join("repository").exists());
+}
+
+#[test]
+fn business_cli_never_bootstraps_a_missing_knowledge_store() {
+    let harness = Harness::new();
+    let error = harness.failure(&["space", "list"]);
+    assert!(matches!(
+        error["error"]["code"].as_str(),
+        Some("io_error" | "invalid_input" | "invariant_violation")
+    ));
+    assert!(!harness.repository().exists());
+    assert!(!harness.root().join("config.toml").exists());
 }
 
 #[test]
@@ -959,7 +995,7 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
 #[allow(clippy::too_many_lines)]
 fn hook_catalog_mapping_never_discovers_sibling_repositories() {
     let harness = Harness::new();
-    GitStore::initialize(harness.root()).unwrap();
+    GitStore::bootstrap_local(harness.root()).unwrap();
     let siblings = harness.home.join("三个 sibling repos");
     let repositories = ["alpha", "明确 beta", "gamma"]
         .into_iter()
@@ -1104,7 +1140,7 @@ fn hook_catalog_mapping_never_discovers_sibling_repositories() {
 #[allow(clippy::too_many_lines)]
 fn cross_parent_workspace_maps_three_catalog_repositories_without_cross_contamination() {
     let harness = Harness::new();
-    GitStore::initialize(harness.root()).unwrap();
+    GitStore::bootstrap_local(harness.root()).unwrap();
     let cross = harness.home.join("workspace cross");
     let repositories = [
         cross.join("fe/search_web_monorepo"),
@@ -1397,7 +1433,7 @@ fn engineering_graph_cli_commands_scan_record_rebuild_and_explain() {
 #[test]
 fn repository_doctor_rejects_invalid_catalog_identity_with_typed_error() {
     let harness = Harness::new();
-    GitStore::initialize(harness.root()).unwrap();
+    GitStore::bootstrap_local(harness.root()).unwrap();
     let config_path = harness.root().join("config.toml");
     let mut config = fs::read_to_string(&config_path).unwrap();
     config.push_str("\n[[repositories]]\nid = \"FE/mobile\"\npaths = []\n");
@@ -2001,7 +2037,7 @@ fn task_context_cli_entry_is_locator_only_and_read_only() {
 #[allow(clippy::too_many_lines)]
 fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts() {
     let harness = Harness::new();
-    GitStore::initialize(harness.root()).unwrap();
+    GitStore::bootstrap_local(harness.root()).unwrap();
     let update_path = harness.home.join("task-update.json");
     fs::write(
         &update_path,
@@ -2700,7 +2736,7 @@ fn unrelated_unknown_schema_isolated_while_target_and_head_checks_stay_closed() 
     assert_eq!(harness.head(), head_before);
     assert_eq!(harness.event_count(), events_before);
 
-    let store = GitStore::initialize(harness.root()).unwrap();
+    let store = GitStore::bootstrap_local(harness.root()).unwrap();
     let concurrent = Event::publication_changed(
         SpaceId::from_str(&space_id).unwrap(),
         published.context_id.parse().unwrap(),
@@ -2877,7 +2913,7 @@ fn pending_commit_and_move_aside_are_explicit_and_validate_staged_rejects_modifi
     let harness = Harness::new();
     create_space(&harness, "Pending baseline");
     let pending_store =
-        GitStore::initialize(harness.root())?.with_crash_injector(Arc::new(StopAfterJournal));
+        GitStore::bootstrap_local(harness.root())?.with_crash_injector(Arc::new(StopAfterJournal));
     let pending_event = Event::space_created(intent("Pending commit"), None)?;
     assert!(
         pending_store
@@ -2898,7 +2934,7 @@ fn pending_commit_and_move_aside_are_explicit_and_validate_staged_rejects_modifi
     );
 
     let pending_store =
-        GitStore::initialize(harness.root())?.with_crash_injector(Arc::new(StopAfterJournal));
+        GitStore::bootstrap_local(harness.root())?.with_crash_injector(Arc::new(StopAfterJournal));
     let pending_event = Event::space_created(intent("Pending aside"), None)?;
     assert!(
         pending_store

@@ -104,7 +104,7 @@ impl Fixture {
         let sibling_file = sibling.join("src/fixture.rs");
 
         let root = home.join(".shared-context");
-        GitStore::initialize(&root).unwrap();
+        GitStore::bootstrap_local(&root).unwrap();
         let config = UserConfigStore::open_existing(&root).unwrap();
         let first_id = config
             .add_repository(

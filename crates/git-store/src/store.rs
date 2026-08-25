@@ -354,23 +354,30 @@ pub struct GitStore {
     confirmation_index: Arc<dyn CandidateConfirmationIndex>,
 }
 
+/// Safe metadata discovered while cloning a remote Knowledge Store.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteBootstrap {
+    pub default_branch: String,
+    pub work_branch: String,
+}
+
 impl GitStore {
-    /// Initializes or opens the unique store under `home/.shared-context`.
+    /// Bootstraps or opens the local-only store under `home/.shared-context`.
     ///
     /// # Errors
     ///
     /// Returns an error if the fixed repository path is not a valid standalone
     /// Git worktree or if initialization cannot be completed.
-    pub fn initialize_for_home(home: impl AsRef<Path>) -> Result<Self> {
-        Self::initialize(home.as_ref().join(".shared-context"))
+    pub fn bootstrap_local_for_home(home: impl AsRef<Path>) -> Result<Self> {
+        Self::bootstrap_local(home.as_ref().join(".shared-context"))
     }
 
-    /// Initializes or opens the unique store at an explicit installation root.
+    /// Bootstraps or opens a local-only store at an explicit installation root.
     ///
     /// # Errors
     ///
     /// Returns an error if filesystem or Git initialization fails.
-    pub fn initialize(root: impl AsRef<Path>) -> Result<Self> {
+    pub fn bootstrap_local(root: impl AsRef<Path>) -> Result<Self> {
         let root = absolute(root.as_ref())?;
         let config = UserConfigStore::initialize(&root)?;
         let state = root.join("state");
@@ -420,7 +427,112 @@ impl GitStore {
         }
         FileExt::unlock(&lock).map_err(io_error("unlock writer.lock"))?;
 
-        Ok(Self {
+        Ok(Self::from_paths(root, repository, state))
+    }
+
+    /// Clones a non-empty remote Knowledge Store into a new installation root.
+    ///
+    /// The caller is responsible for using a staging installation root and atomically moving the
+    /// validated repository into its final location. This method never pushes or mutates a remote
+    /// ref. It checks out a new, untracked installation work branch from the remote default branch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an existing destination, embedded URL credentials, an empty or invalid
+    /// remote, a dirty clone, or a work branch that is not a valid Git branch name.
+    pub fn bootstrap_remote(
+        root: impl AsRef<Path>,
+        remote_url: &str,
+        work_branch: &str,
+    ) -> Result<(Self, RemoteBootstrap)> {
+        validate_remote_url(remote_url)?;
+        let root = absolute(root.as_ref())?;
+        let config = UserConfigStore::initialize(&root)?;
+        let state = root.join("state");
+        let repository = config.repository().to_path_buf();
+        fs::create_dir_all(state.join("pending")).map_err(io_error("create pending root"))?;
+        let lock = open_lock(&state.join("writer.lock"))?;
+        lock.lock_exclusive()
+            .map_err(io_error("lock writer.lock"))?;
+        if fs::symlink_metadata(&repository).is_ok() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "remote Knowledge Store destination already exists",
+            ));
+        }
+        let output = std::process::Command::new("git")
+            .args(["clone", "--origin", "origin", "--no-tags", "--"])
+            .arg(remote_url)
+            .arg(&repository)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::External,
+                    format!("failed to execute git clone: {error}"),
+                )
+            })?;
+        if !output.status.success() {
+            return Err(Error::new(
+                ErrorKind::External,
+                format!(
+                    "git clone failed with {}; verify the Knowledge Store URL and Git credentials",
+                    output.status
+                ),
+            ));
+        }
+        verify_repository(&repository)?;
+        let git = Git::new(&repository);
+        let remote_head = git.output_text([
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])?;
+        let default_branch = remote_head
+            .strip_prefix("origin/")
+            .filter(|branch| !branch.is_empty())
+            .ok_or_else(|| invariant("remote default branch could not be determined"))?
+            .to_owned();
+        git.run(["check-ref-format", "--branch", work_branch])?;
+        let base = format!("origin/{default_branch}");
+        git.run(["checkout", "--no-track", "-b", work_branch, &base])?;
+        git.run(["config", "user.name", "Shared Context Writer"])?;
+        git.run(["config", "user.email", "shared-context@localhost"])?;
+        verify_clean_repository(&repository)?;
+        FileExt::unlock(&lock).map_err(io_error("unlock writer.lock"))?;
+
+        Ok((
+            Self::from_paths(root, repository, state),
+            RemoteBootstrap {
+                default_branch,
+                work_branch: work_branch.to_owned(),
+            },
+        ))
+    }
+
+    /// Opens an already bootstrapped store without initializing or cloning repository state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fixed config, state, or repository layout is absent or invalid.
+    pub fn open_existing(root: impl AsRef<Path>) -> Result<Self> {
+        let root = absolute(root.as_ref())?;
+        let config = UserConfigStore::open_existing(&root)?;
+        let state = root.join("state");
+        if !state.is_dir() {
+            return Err(invariant(format!(
+                "state directory does not exist: {}",
+                state.display()
+            )));
+        }
+        let repository = config.repository().to_path_buf();
+        verify_repository(&repository)?;
+        Ok(Self::from_paths(root, repository, state))
+    }
+
+    fn from_paths(root: PathBuf, repository: PathBuf, state: PathBuf) -> Self {
+        Self {
             root,
             repository,
             state,
@@ -428,7 +540,7 @@ impl GitStore {
             observer: Arc::new(NoopCommitObserver),
             candidate_index: Arc::new(UnavailableCandidateSubmissionIndex),
             confirmation_index: Arc::new(UnavailableCandidateConfirmationIndex),
-        })
+        }
     }
 
     /// Replaces the crash injector, primarily for seam testing.
@@ -759,6 +871,74 @@ impl GitStore {
         sync_directory(&aside_root)?;
         FileExt::unlock(&lock).map_err(io_error("unlock writer.lock"))?;
         Ok(destination)
+    }
+
+    /// Validates every committed content-addressed object in the current `HEAD` tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an object path is not canonical or its SHA-256 digest does not match
+    /// the committed bytes.
+    pub fn validate_committed_objects(&self) -> Result<usize> {
+        let git = Git::new(&self.repository);
+        let paths = git.head_paths("objects")?;
+        for path in &paths {
+            let bytes = git
+                .head_file(path)?
+                .ok_or_else(|| invariant(format!("object disappeared while validating: {path}")))?;
+            let digest = path.rsplit('/').next().unwrap_or_default();
+            if digest.len() != 64 || sha256(&bytes) != digest || object_path(digest) != *path {
+                return Err(invariant(format!(
+                    "committed object path or digest does not match content: {path}"
+                )));
+            }
+        }
+        Ok(paths.len())
+    }
+
+    /// Strictly validates committed Events before a remote Store is first activated.
+    ///
+    /// Known Events must use their canonical path and parse into one reducer input set without
+    /// quarantine. Unknown future schemas remain forward-compatible, while malformed JSON or a
+    /// malformed known schema is rejected instead of being silently inherited by a new install.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed, misplaced, or reducer-quarantined committed Events.
+    pub fn validate_committed_events(&self) -> Result<usize> {
+        let git = Git::new(&self.repository);
+        let paths = git.head_paths("events")?;
+        let mut reducer_events = Vec::new();
+        for path in &paths {
+            let bytes = git
+                .head_file(path)?
+                .ok_or_else(|| invariant(format!("event disappeared while validating: {path}")))?;
+            match parse_event(&bytes) {
+                Ok(ParsedEvent::Known(event)) => {
+                    if generated_event_path(event.event_id()) != *path {
+                        return Err(invariant(format!(
+                            "committed Event path is not canonical: {path}"
+                        )));
+                    }
+                    if let Some(event) = event.reducer_event() {
+                        reducer_events.push(event);
+                    }
+                }
+                Ok(ParsedEvent::UnknownSchema(_)) => {}
+                Err(error) => {
+                    return Err(invariant(format!(
+                        "committed Event is invalid at {path}: {error}"
+                    )));
+                }
+            }
+        }
+        let projection = reduce(&reducer_events);
+        if let Some(event_id) = projection.quarantined_event_ids.iter().next() {
+            return Err(invariant(format!(
+                "committed Event set is quarantined at {event_id}"
+            )));
+        }
+        Ok(paths.len())
     }
 
     /// Validates staged changes as append-only additions and reduces the exact
@@ -1415,6 +1595,61 @@ fn verify_repository(repository: &Path) -> Result<()> {
         )));
     }
     git.head_oid()?;
+    Ok(())
+}
+
+fn verify_clean_repository(repository: &Path) -> Result<()> {
+    let status =
+        Git::new(repository).output_text(["status", "--porcelain", "--untracked-files=all"])?;
+    if status.is_empty() {
+        Ok(())
+    } else {
+        Err(invariant("cloned Knowledge Store is not clean"))
+    }
+}
+
+fn validate_remote_url(remote_url: &str) -> Result<()> {
+    if remote_url.is_empty() || remote_url.trim() != remote_url {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Knowledge Store URL must be non-empty and have no surrounding whitespace",
+        ));
+    }
+    if remote_url.chars().any(char::is_control) || remote_url.starts_with('-') {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Knowledge Store URL contains unsafe characters",
+        ));
+    }
+    if remote_url.contains(['?', '#']) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Knowledge Store URL must not contain query parameters or fragments",
+        ));
+    }
+    if let Some((scheme, remainder)) = remote_url.split_once("://") {
+        if !matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "file" | "http" | "https" | "ssh" | "git"
+        ) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "unsupported Knowledge Store URL scheme",
+            ));
+        }
+        let authority = remainder.split('/').next().unwrap_or_default();
+        if let Some((userinfo, _)) = authority.rsplit_once('@') {
+            let ssh_username_only = scheme.eq_ignore_ascii_case("ssh")
+                && !userinfo.is_empty()
+                && !userinfo.contains(':');
+            if !ssh_username_only {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "Knowledge Store URL must not contain embedded credentials",
+                ));
+            }
+        }
+    }
     Ok(())
 }
 

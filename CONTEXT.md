@@ -164,6 +164,14 @@ _Avoid_: Task clue, retrieval match, Artifact association alone
 A typed, resolvable provenance target for an engineering claim, such as immutable Context Evidence or a current unique Engineering Resolution. WorkingIntentSnapshot, its Hints, ArtifactFocusQuery, generic TestOutcome, and unavailable/ambiguous targets are not EvidenceSources.
 _Avoid_: evidence string, unverified reference
 
+**KnowledgeStore**:
+The append-only Git fact store that carries durable Shared Context knowledge. It is independent of every business source RepositoryIdentity and may be distributed through one team Git remote.
+_Avoid_: source repository, RepositoryCatalog, ContextSpace
+
+**InstallationWorkBranch**:
+The stable KnowledgeStore branch owned by one Shared Context installation, based on the remote default branch and used for that installation's knowledge writes. The remote default branch is a read-only integration base, never an installation write target.
+_Avoid_: main branch, source-code feature branch, RepositoryId
+
 **RepositoryCatalog**:
 The local explicit binding from team-stable RepositoryIds to this installation’s checkout or worktree locations. It is authoritative for local path ownership but never assigns identity or routes a Workspace or Task to a ContextSpace.
 _Avoid_: repository discovery, Workspace binding, team registry

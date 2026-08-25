@@ -53,7 +53,7 @@ impl Fixture {
         let temporary = tempfile::tempdir().unwrap();
         let home = temporary.path().join("temporary home 中文");
         fs::create_dir(&home).unwrap();
-        let store = GitStore::initialize_for_home(&home).unwrap();
+        let store = GitStore::bootstrap_local_for_home(&home).unwrap();
         Self {
             _temporary: temporary,
             home,
@@ -214,7 +214,7 @@ fn git_append_boundary_rejects_every_shared_privacy_fixture() {
 #[test]
 fn initialization_is_idempotent_and_uses_one_fixed_repository() {
     let fixture = Fixture::new();
-    let reopened = GitStore::initialize_for_home(&fixture.home).unwrap();
+    let reopened = GitStore::open_existing(fixture.home.join(".shared-context")).unwrap();
 
     assert_eq!(fixture.store.repository(), reopened.repository());
     assert_eq!(
@@ -632,7 +632,7 @@ fn every_crash_seam_recovers_stable_content_with_at_most_one_semantic_commit() {
             "{seam:?}"
         );
 
-        let reopened = GitStore::initialize_for_home(&fixture.home).unwrap();
+        let reopened = GitStore::open_existing(fixture.home.join(".shared-context")).unwrap();
         reopened.recover_pending().unwrap();
         assert!(reopened.list_pending().unwrap().is_empty(), "{seam:?}");
         let matches = fixture.git(&["ls-tree", "-r", "--name-only", "HEAD", "--", "events"]);
@@ -747,6 +747,19 @@ fn recovery_rejects_missing_payload_and_a_partially_committed_batch() {
         error.message().contains("partially present in HEAD"),
         "{error}"
     );
+}
+
+#[test]
+fn open_existing_never_bootstraps_missing_repository_state() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("missing-installation");
+    let error = GitStore::open_existing(&root).err().unwrap();
+    assert!(matches!(
+        error.kind(),
+        ErrorKind::InvalidInput | ErrorKind::InvariantViolation | ErrorKind::Io
+    ));
+    assert!(!root.join("repository").exists());
+    assert!(!root.join("config.toml").exists());
 }
 
 fn sha256(bytes: &[u8]) -> String {

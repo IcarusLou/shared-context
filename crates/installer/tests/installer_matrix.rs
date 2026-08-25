@@ -7,10 +7,12 @@ use std::{
 };
 
 use sctx_engineering_graph::{EngineeringProjectionStore, RepositoryRegistry};
+use sctx_event_schema::{Event, IntentSnapshot};
+use sctx_git_store::{AppendRequest, GitStore, TextObject};
 use sctx_index::ProjectionIndex;
 use sctx_installer::{
     Agent, Architecture, CheckStatus, DataResetOptions, Host, InstallContext, Installer,
-    ResetStage, SetupOptions, SetupStage, SkillStatus,
+    KnowledgeRemoteType, KnowledgeStoreUrl, ResetStage, SetupOptions, SetupStage, SkillStatus,
 };
 use sctx_local_state::{MaintenanceLock, UserConfigStore};
 use sctx_task_runtime::TaskRuntime;
@@ -243,6 +245,64 @@ fn git(path: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+struct RemoteFixture {
+    repository: PathBuf,
+    remote: PathBuf,
+}
+
+fn remote_fixture(harness: &Harness, name: &str) -> RemoteFixture {
+    let seed_root = harness.home.join(format!("{name}-seed-installation"));
+    let store = GitStore::bootstrap_local(&seed_root).unwrap();
+    let event = Event::space_created(
+        IntentSnapshot {
+            title: "Remote setup fixture".to_owned(),
+            problem: "A second installation needs governed team knowledge".to_owned(),
+            desired_outcome: "The remote Event and object validate before activation".to_owned(),
+            in_scope: vec!["remote bootstrap".to_owned()],
+            out_of_scope: Vec::new(),
+            acceptance_conditions: vec!["projection rebuild succeeds".to_owned()],
+            domain_terms: vec!["KnowledgeStore".to_owned()],
+        },
+        None,
+    )
+    .unwrap();
+    store
+        .append_event(
+            AppendRequest::event(event).with_object(TextObject::new("remote evidence object")),
+        )
+        .unwrap();
+    let repository = store.repository().to_path_buf();
+    let remote = harness.home.join(format!("{name}-knowledge.git"));
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare", "--quiet", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success()
+    );
+    git(
+        &repository,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&repository, &["push", "origin", "main"]);
+    git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    RemoteFixture { repository, remote }
+}
+
+fn remote_setup_options(remote: &Path) -> SetupOptions {
+    SetupOptions {
+        knowledge_store_url: Some(
+            remote
+                .to_str()
+                .unwrap()
+                .parse::<KnowledgeStoreUrl>()
+                .unwrap(),
+        ),
+        ..SetupOptions::default()
+    }
 }
 
 struct SeededResetState {
@@ -765,9 +825,11 @@ fn cursor_and_codex_share_one_global_skill_installation() {
     let harness = Harness::new();
     let cursor = SetupOptions {
         agents: [Agent::Cursor].into_iter().collect(),
+        ..SetupOptions::default()
     };
     let codex = SetupOptions {
         agents: [Agent::Codex].into_iter().collect(),
+        ..SetupOptions::default()
     };
     let first = harness.installer("1.0.0").setup(&cursor).unwrap();
     let second = harness.installer("1.0.0").setup(&codex).unwrap();
@@ -1495,6 +1557,250 @@ fn knowledge_deletion_requires_path_and_phrase_as_two_confirmations() {
         repository
     );
     assert!(!repository.exists());
+}
+
+#[test]
+fn remote_setup_clones_once_to_stable_work_branch_without_mutating_default() {
+    let harness = Harness::new();
+    let fixture = remote_fixture(&harness, "team");
+    let remote_main = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    let options = remote_setup_options(&fixture.remote);
+
+    let first = harness.installer("1.0.0").setup(&options).unwrap();
+    assert!(first.changed);
+    assert_eq!(first.knowledge_store.source, "remote");
+    assert_eq!(
+        first.knowledge_store.remote_type,
+        Some(KnowledgeRemoteType::Local)
+    );
+    assert_eq!(first.knowledge_store.default_branch, "main");
+    let work_branch = first.knowledge_store.work_branch.as_deref().unwrap();
+    assert_eq!(
+        work_branch,
+        format!("shared-context/{}", first.knowledge_store.installation_id)
+    );
+    assert_eq!(
+        git(
+            &harness.root.join("repository"),
+            &["symbolic-ref", "--short", "HEAD"]
+        ),
+        work_branch
+    );
+    assert_eq!(
+        git(
+            &harness.root.join("repository"),
+            &["rev-parse", "refs/heads/main"]
+        ),
+        remote_main
+    );
+    assert_eq!(
+        git(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        remote_main
+    );
+    let projection = ProjectionIndex::for_store(&GitStore::open_existing(&harness.root).unwrap())
+        .domain_snapshot()
+        .unwrap();
+    assert_eq!(projection.projection.spaces.len(), 1);
+    let installed_store = GitStore::open_existing(&harness.root).unwrap();
+    let first_write = Event::space_created(
+        IntentSnapshot {
+            title: "First post-Setup write".to_owned(),
+            problem: "Remote bootstrap must leave the Writer usable".to_owned(),
+            desired_outcome: "The first Event commits without layout repair".to_owned(),
+            in_scope: vec!["active pending state".to_owned()],
+            out_of_scope: Vec::new(),
+            acceptance_conditions: vec!["append succeeds".to_owned()],
+            domain_terms: vec!["KnowledgeStore".to_owned()],
+        },
+        None,
+    )
+    .unwrap();
+    let appended_head = installed_store
+        .append_event(AppendRequest::event(first_write))
+        .unwrap()
+        .commit_oid;
+    assert_eq!(
+        git(installed_store.repository(), &["rev-parse", "HEAD"]),
+        appended_head
+    );
+    assert!(harness.root.join("state/pending").is_dir());
+    assert!(
+        !Command::new("git")
+            .arg("-C")
+            .arg(&fixture.remote)
+            .args(["show-ref", "--verify", &format!("refs/heads/{work_branch}")])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let unavailable_remote = harness.home.join("team-knowledge-unavailable.git");
+    fs::rename(&fixture.remote, &unavailable_remote).unwrap();
+    let second = harness.installer("1.0.0").setup(&options).unwrap();
+    assert!(!second.changed);
+    assert_eq!(second.knowledge_store, first.knowledge_store);
+    fs::rename(&unavailable_remote, &fixture.remote).unwrap();
+    assert_eq!(
+        git(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        remote_main
+    );
+    let manifest = fs::read_to_string(harness.root.join("state/install-manifest.json")).unwrap();
+    assert!(!manifest.contains(fixture.remote.to_str().unwrap()));
+    assert!(manifest.contains("url_digest"));
+    assert!(manifest.contains("installation_id"));
+}
+
+#[test]
+fn remote_setup_rejects_a_different_url_and_an_existing_local_store() {
+    let harness = Harness::new();
+    let first = remote_fixture(&harness, "first");
+    let second = remote_fixture(&harness, "second");
+    harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&first.remote))
+        .unwrap();
+    let work_head = git(&harness.root.join("repository"), &["rev-parse", "HEAD"]);
+    let error = harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&second.remote))
+        .unwrap_err();
+    assert!(error.message().contains("does not match"));
+    assert!(!error.message().contains(second.remote.to_str().unwrap()));
+    assert_eq!(
+        git(&harness.root.join("repository"), &["rev-parse", "HEAD"]),
+        work_head
+    );
+
+    let local = Harness::new();
+    local
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let error = local
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&second.remote))
+        .unwrap_err();
+    assert!(error.message().contains("cannot replace"));
+    assert!(local.root.join("repository/.git").is_dir());
+}
+
+#[test]
+fn remote_setup_rolls_back_the_active_clone_after_a_later_failure() {
+    let harness = Harness::new();
+    let fixture = remote_fixture(&harness, "rollback");
+    let remote_main = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    let options = remote_setup_options(&fixture.remote);
+    let error = harness
+        .installer("1.0.0")
+        .with_failure_after(SetupStage::RepositoryInitialized)
+        .setup(&options)
+        .unwrap_err();
+    assert!(error.message().contains("injected setup failure"));
+    assert!(!harness.root.join("repository").exists());
+    assert_eq!(
+        git(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        remote_main
+    );
+
+    let recovered = harness.installer("1.0.0").setup(&options).unwrap();
+    assert_eq!(recovered.knowledge_store.source, "remote");
+    assert!(harness.root.join("repository/.git").is_dir());
+}
+
+#[test]
+fn remote_setup_rejects_corrupt_committed_objects_before_activation() {
+    let harness = Harness::new();
+    let fixture = remote_fixture(&harness, "corrupt-object");
+    let digest = "0".repeat(64);
+    let object = fixture.repository.join("objects/sha256/00").join(&digest);
+    fs::create_dir_all(object.parent().unwrap()).unwrap();
+    fs::write(&object, b"content whose digest is not zero").unwrap();
+    git(
+        &fixture.repository,
+        &["add", "--", object.to_str().unwrap()],
+    );
+    git(&fixture.repository, &["commit", "-m", "add corrupt object"]);
+    git(&fixture.repository, &["push", "origin", "main"]);
+
+    let error = harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&fixture.remote))
+        .unwrap_err();
+    assert!(error.message().contains("object path or digest"));
+    assert!(!harness.root.join("repository").exists());
+}
+
+#[test]
+fn remote_setup_rejects_invalid_events_before_activation() {
+    let harness = Harness::new();
+    let fixture = remote_fixture(&harness, "corrupt-event");
+    let event = fixture.repository.join("events/invalid.json");
+    fs::create_dir_all(event.parent().unwrap()).unwrap();
+    fs::write(&event, b"{not valid JSON").unwrap();
+    git(&fixture.repository, &["add", "--", "events/invalid.json"]);
+    git(&fixture.repository, &["commit", "-m", "add invalid event"]);
+    git(&fixture.repository, &["push", "origin", "main"]);
+
+    let error = harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&fixture.remote))
+        .unwrap_err();
+    assert!(
+        error.message().contains("parse")
+            || error.message().contains("JSON")
+            || error.message().contains("event")
+    );
+    assert!(!harness.root.join("repository").exists());
+}
+
+#[test]
+fn remote_url_validation_rejects_secrets_and_clone_errors_are_redacted() {
+    let secret = "https://token-value@example.invalid/team/context.git";
+    let error = secret.parse::<KnowledgeStoreUrl>().unwrap_err();
+    assert!(error.message().contains("embedded credentials"));
+    assert!(!error.message().contains("token-value"));
+
+    let harness = Harness::new();
+    let missing = harness.home.join("sensitive-project-name.git");
+    let error = harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&missing))
+        .unwrap_err();
+    assert!(error.message().contains("git clone failed"));
+    assert!(!error.message().contains("sensitive-project-name"));
+    assert!(!harness.root.join("repository").exists());
+}
+
+#[test]
+fn remote_setup_rejects_an_empty_remote_without_creating_a_default_branch() {
+    let harness = Harness::new();
+    let remote = harness.home.join("empty-knowledge.git");
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare", "--quiet", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let error = harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&remote))
+        .unwrap_err();
+    assert!(
+        error.message().contains("HEAD")
+            || error.message().contains("default branch")
+            || error.message().contains("git exited")
+    );
+    assert!(!harness.root.join("repository").exists());
+    let refs = Command::new("git")
+        .arg("-C")
+        .arg(&remote)
+        .arg("show-ref")
+        .output()
+        .unwrap();
+    assert!(refs.stdout.is_empty());
 }
 
 #[test]

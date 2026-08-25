@@ -176,7 +176,7 @@ fn submit_candidate(store: &GitStore, request: CandidateSubmissionRequest) -> Pa
 
 fn fixture() -> Fixture {
     let temporary = tempfile::tempdir().unwrap();
-    let base_store = GitStore::initialize(temporary.path().join("installation")).unwrap();
+    let base_store = GitStore::bootstrap_local(temporary.path().join("installation")).unwrap();
     let index = ProjectionIndex::for_store(&base_store);
     let store = base_store.with_candidate_submission_index(Arc::new(index.clone()));
 
@@ -435,7 +435,7 @@ fn deletion_rebuilds_complete_projection_and_dirty_tree_is_never_read() {
 #[allow(clippy::too_many_lines)]
 fn engineering_reference_incremental_projection_matches_scratch_and_isolates_bad_targets() {
     let temporary = tempfile::tempdir().unwrap();
-    let store = GitStore::initialize(temporary.path().join("reference-installation")).unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("reference-installation")).unwrap();
     let space_event = Event::space_created(intent("Reference projection"), None).unwrap();
     let (space_id, _) = space_ids(&space_event);
     append(&store, space_event);
@@ -562,7 +562,7 @@ fn engineering_reference_incremental_projection_matches_scratch_and_isolates_bad
 #[test]
 fn context_relations_keep_cross_space_history_and_fts_across_incremental_and_scratch() {
     let temporary = tempfile::tempdir().unwrap();
-    let store = GitStore::initialize(temporary.path().join("relation-installation")).unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("relation-installation")).unwrap();
     let target_space_event = Event::space_created(intent("Target Space"), None).unwrap();
     let (target_space_id, _) = space_ids(&target_space_event);
     append(&store, target_space_event);
@@ -1324,7 +1324,8 @@ fn count_fts_matches(connection: &Connection, table: &str, query: &str) -> i64 {
 #[allow(clippy::too_many_lines)]
 fn candidate_confirmation_projection_is_incremental_scratch_and_deletion_equivalent() {
     let temporary = tempfile::tempdir().unwrap();
-    let base_store = GitStore::initialize(temporary.path().join("confirmation-index")).unwrap();
+    let base_store =
+        GitStore::bootstrap_local(temporary.path().join("confirmation-index")).unwrap();
     let index = ProjectionIndex::for_store(&base_store);
     let store = base_store.with_candidate_submission_index(Arc::new(index.clone()));
     let request = candidate("Confirmed Candidate content");

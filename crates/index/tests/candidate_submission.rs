@@ -57,7 +57,7 @@ fn request(submission_id: SubmissionId, statement: &str) -> CandidateSubmissionR
 
 fn configured_store() -> (tempfile::TempDir, GitStore, ProjectionIndex) {
     let temporary = tempfile::tempdir().unwrap();
-    let base = GitStore::initialize(temporary.path().join("installation")).unwrap();
+    let base = GitStore::bootstrap_local(temporary.path().join("installation")).unwrap();
     let index = ProjectionIndex::for_store(&base);
     let store = base
         .with_candidate_submission_index(Arc::new(index.clone()))

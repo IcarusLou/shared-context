@@ -11,6 +11,7 @@ use std::{
 };
 
 use sctx_domain::{ExternalSessionLocator, RepositoryGroupId, RepositoryId};
+use sctx_git_store::GitStore;
 use sctx_local_state::{
     ActivationScope, ActivationScopeDecision, AuthorizedSessionScopeDecision,
     AuthorizedSessionScopePolicy, AuthorizedSessionScopeRead, AuthorizedSessionScopeStore,
@@ -57,6 +58,9 @@ impl Harness {
     }
 
     fn success(&self, args: &[&str]) -> Value {
+        if !self.root().join("repository").is_dir() {
+            GitStore::bootstrap_local(self.root()).unwrap();
+        }
         let output = self.run(args);
         assert!(
             output.status.success(),

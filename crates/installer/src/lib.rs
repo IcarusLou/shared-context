@@ -14,6 +14,7 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    str::FromStr,
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -311,14 +312,72 @@ impl InstallContext {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetupOptions {
     pub agents: BTreeSet<Agent>,
+    pub knowledge_store_url: Option<KnowledgeStoreUrl>,
 }
 
 impl Default for SetupOptions {
     fn default() -> Self {
         Self {
             agents: [Agent::Cursor, Agent::Codex].into_iter().collect(),
+            knowledge_store_url: None,
         }
     }
+}
+
+/// Validated Git URL used only during remote Knowledge Store setup.
+#[derive(Clone, Eq, PartialEq)]
+pub struct KnowledgeStoreUrl(String);
+
+impl KnowledgeStoreUrl {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn remote_type(&self) -> KnowledgeRemoteType {
+        classify_remote_type(&self.0)
+    }
+
+    fn digest(&self) -> String {
+        sha256(self.0.as_bytes())
+    }
+}
+
+impl std::fmt::Debug for KnowledgeStoreUrl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("KnowledgeStoreUrl(<redacted>)")
+    }
+}
+
+impl FromStr for KnowledgeStoreUrl {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        validate_knowledge_store_url(value)?;
+        Ok(Self(value.to_owned()))
+    }
+}
+
+/// Transport class retained without persisting the remote URL itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeRemoteType {
+    Local,
+    Http,
+    Https,
+    Ssh,
+    Git,
+}
+
+/// Safe Knowledge Store identity returned by setup without exposing credentials or URLs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct KnowledgeStoreReport {
+    pub installation_id: String,
+    pub source: String,
+    pub remote_type: Option<KnowledgeRemoteType>,
+    pub default_branch: String,
+    pub work_branch: Option<String>,
+    pub url_digest: Option<String>,
 }
 
 /// One preflight observation.
@@ -341,6 +400,7 @@ pub struct SetupReport {
     pub runtime: PathBuf,
     pub journal: PathBuf,
     pub changed: bool,
+    pub knowledge_store: KnowledgeStoreReport,
     pub preflight: PreflightReport,
     pub capabilities: Vec<sctx_agent_adapter::AgentCapabilities>,
     pub skill: SkillReport,
@@ -569,7 +629,19 @@ impl Installer {
         let changed_current = switch_current(transaction, &current, &relative_target)?;
         self.fail(SetupStage::CurrentSwitched)?;
 
-        let store = GitStore::initialize(&self.context.root)?;
+        let prior_manifest = read_manifest(&self.context.root)?;
+        let installation_id = installation_id(prior_manifest.as_ref())?;
+        let KnowledgeStoreInstall {
+            store,
+            source: knowledge_store_source,
+            changed: knowledge_store_changed,
+        } = install_knowledge_store(
+            &self.context.root,
+            options.knowledge_store_url.as_ref(),
+            prior_manifest.as_ref(),
+            &installation_id,
+            transaction,
+        )?;
         self.fail(SetupStage::RepositoryInitialized)?;
         let index = ProjectionIndex::for_store(&store);
         index.synchronize()?;
@@ -577,7 +649,6 @@ impl Installer {
         self.fail(SetupStage::IndexInitialized)?;
 
         let stable_binary = current.join("sctx");
-        let prior_manifest = read_manifest(&self.context.root)?;
         let mut ownership = prior_manifest
             .as_ref()
             .map_or_else(Vec::new, |manifest| manifest.configs.clone());
@@ -641,6 +712,8 @@ impl Installer {
             version: MANIFEST_VERSION,
             installed_version: self.context.version.clone(),
             architecture,
+            installation_id: installation_id.clone(),
+            knowledge_store: knowledge_store_source.clone(),
             configs: ownership,
             skills: skill_install.ownership,
         };
@@ -664,9 +737,11 @@ impl Installer {
             journal: transaction.journal_path.clone(),
             changed: changed_runtime
                 || changed_current
+                || knowledge_store_changed
                 || config_changed
                 || skill_install.changed
                 || manifest_changed,
+            knowledge_store: knowledge_store_source.report(&installation_id),
             preflight,
             capabilities,
             skill: SkillReport {
@@ -1356,9 +1431,340 @@ struct InstallManifest {
     version: u32,
     installed_version: String,
     architecture: Architecture,
+    #[serde(default)]
+    installation_id: String,
+    #[serde(default)]
+    knowledge_store: KnowledgeStoreSource,
     configs: Vec<OwnedConfig>,
     #[serde(default)]
     skills: Vec<OwnedSkill>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+enum KnowledgeStoreSource {
+    #[default]
+    Local,
+    Remote {
+        remote_type: KnowledgeRemoteType,
+        default_branch: String,
+        work_branch: String,
+        url_digest: String,
+    },
+}
+
+impl KnowledgeStoreSource {
+    fn report(&self, installation_id: &str) -> KnowledgeStoreReport {
+        match self {
+            Self::Local => KnowledgeStoreReport {
+                installation_id: installation_id.to_owned(),
+                source: "local".to_owned(),
+                remote_type: None,
+                default_branch: "main".to_owned(),
+                work_branch: None,
+                url_digest: None,
+            },
+            Self::Remote {
+                remote_type,
+                default_branch,
+                work_branch,
+                url_digest,
+            } => KnowledgeStoreReport {
+                installation_id: installation_id.to_owned(),
+                source: "remote".to_owned(),
+                remote_type: Some(*remote_type),
+                default_branch: default_branch.clone(),
+                work_branch: Some(work_branch.clone()),
+                url_digest: Some(url_digest.clone()),
+            },
+        }
+    }
+}
+
+struct KnowledgeStoreInstall {
+    store: GitStore,
+    source: KnowledgeStoreSource,
+    changed: bool,
+}
+
+fn installation_id(prior: Option<&InstallManifest>) -> Result<String> {
+    let Some(existing) = prior
+        .map(|manifest| manifest.installation_id.as_str())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Uuid::new_v4().to_string());
+    };
+    Uuid::parse_str(existing)
+        .map_err(|_| invalid("install manifest contains an invalid installation ID"))?;
+    Ok(existing.to_owned())
+}
+
+fn install_knowledge_store(
+    root: &Path,
+    requested_url: Option<&KnowledgeStoreUrl>,
+    prior: Option<&InstallManifest>,
+    installation_id: &str,
+    transaction: &mut Transaction,
+) -> Result<KnowledgeStoreInstall> {
+    let repository = root.join("repository");
+    let prior_source = prior.map(|manifest| &manifest.knowledge_store);
+    match prior_source {
+        Some(KnowledgeStoreSource::Remote {
+            remote_type,
+            default_branch,
+            work_branch,
+            url_digest,
+        }) => {
+            if let Some(url) = requested_url
+                && url.digest() != *url_digest
+            {
+                return Err(invalid(
+                    "Knowledge Store URL does not match the installed remote",
+                ));
+            }
+            let source = KnowledgeStoreSource::Remote {
+                remote_type: *remote_type,
+                default_branch: default_branch.clone(),
+                work_branch: work_branch.clone(),
+                url_digest: url_digest.clone(),
+            };
+            if fs::symlink_metadata(&repository).is_ok() {
+                let store = GitStore::open_existing(root)?;
+                verify_remote_store(&store, default_branch, work_branch, url_digest)?;
+                return Ok(KnowledgeStoreInstall {
+                    store,
+                    source,
+                    changed: false,
+                });
+            }
+            let url = requested_url.ok_or_else(|| {
+                invalid(
+                    "remote Knowledge Store is missing; rerun setup with the original --knowledge-store-url",
+                )
+            })?;
+            clone_remote_store(root, url, installation_id, transaction)
+        }
+        Some(KnowledgeStoreSource::Local) => {
+            if requested_url.is_some() {
+                return Err(invalid(
+                    "cannot replace an installed local Knowledge Store with a remote URL",
+                ));
+            }
+            let existed = repository.exists();
+            Ok(KnowledgeStoreInstall {
+                store: GitStore::bootstrap_local(root)?,
+                source: KnowledgeStoreSource::Local,
+                changed: !existed,
+            })
+        }
+        None => {
+            if let Some(url) = requested_url {
+                if fs::symlink_metadata(&repository).is_ok() {
+                    return Err(invalid(
+                        "cannot replace an existing Knowledge Store with a remote URL",
+                    ));
+                }
+                clone_remote_store(root, url, installation_id, transaction)
+            } else {
+                let existed = repository.exists();
+                Ok(KnowledgeStoreInstall {
+                    store: GitStore::bootstrap_local(root)?,
+                    source: KnowledgeStoreSource::Local,
+                    changed: !existed,
+                })
+            }
+        }
+    }
+}
+
+fn clone_remote_store(
+    root: &Path,
+    url: &KnowledgeStoreUrl,
+    installation_id: &str,
+    transaction: &mut Transaction,
+) -> Result<KnowledgeStoreInstall> {
+    UserConfigStore::initialize(root)?;
+    let work_branch = format!("shared-context/{installation_id}");
+    let staging_root = transaction.backup_dir.join("remote-bootstrap");
+    let (staged_store, bootstrap) =
+        GitStore::bootstrap_remote(&staging_root, url.as_str(), &work_branch)?;
+    staged_store.validate_committed_objects()?;
+    staged_store.validate_committed_events()?;
+    let snapshot = ProjectionIndex::for_store(&staged_store).domain_snapshot()?;
+    if !snapshot.projection.quarantined_event_ids.is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvariantViolation,
+            "remote Knowledge Store contains quarantined Events",
+        ));
+    }
+
+    ensure_private_directory(&root.join("state/pending"))?;
+
+    let repository = root.join("repository");
+    if fs::symlink_metadata(&repository).is_ok() {
+        return Err(invalid(
+            "cannot replace an existing Knowledge Store with a remote URL",
+        ));
+    }
+    transaction.record(&repository)?;
+    fs::rename(staged_store.repository(), &repository)
+        .map_err(io_error("atomically install remote Knowledge Store"))?;
+    sync_directory(root)?;
+    transaction.phase("remote_repository_installed")?;
+
+    let source = KnowledgeStoreSource::Remote {
+        remote_type: url.remote_type(),
+        default_branch: bootstrap.default_branch,
+        work_branch: bootstrap.work_branch,
+        url_digest: url.digest(),
+    };
+    let store = GitStore::open_existing(root)?;
+    if let KnowledgeStoreSource::Remote {
+        default_branch,
+        work_branch,
+        url_digest,
+        ..
+    } = &source
+    {
+        verify_remote_store(&store, default_branch, work_branch, url_digest)?;
+    }
+    Ok(KnowledgeStoreInstall {
+        store,
+        source,
+        changed: true,
+    })
+}
+
+fn verify_remote_store(
+    store: &GitStore,
+    default_branch: &str,
+    work_branch: &str,
+    expected_url_digest: &str,
+) -> Result<()> {
+    let repository = store.repository();
+    let current_branch = git_output(
+        repository,
+        &["symbolic-ref", "--short", "HEAD"],
+        "inspect Knowledge Store branch",
+    )?;
+    if current_branch != work_branch {
+        return Err(invalid(
+            "remote Knowledge Store is not on its installation work branch",
+        ));
+    }
+    let remote_url = git_output(
+        repository,
+        &["config", "--get", "remote.origin.url"],
+        "inspect Knowledge Store origin",
+    )?;
+    if sha256(remote_url.as_bytes()) != expected_url_digest {
+        return Err(invalid(
+            "remote Knowledge Store origin does not match the install manifest",
+        ));
+    }
+    let default_ref = format!("refs/remotes/origin/{default_branch}");
+    git_output(
+        repository,
+        &["rev-parse", "--verify", &default_ref],
+        "verify remote default branch",
+    )?;
+    let status = git_output(
+        repository,
+        &["status", "--porcelain", "--untracked-files=all"],
+        "inspect Knowledge Store status",
+    )?;
+    if !status.is_empty() {
+        return Err(invalid("remote Knowledge Store worktree is not clean"));
+    }
+    Ok(())
+}
+
+fn git_output(repository: &Path, args: &[&str], context: &str) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(args)
+        .output()
+        .map_err(|error| Error::new(ErrorKind::External, format!("{context}: {error}")))?;
+    if !output.status.success() {
+        return Err(Error::new(
+            ErrorKind::External,
+            format!("{context} failed with {}", output.status),
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_owned())
+        .map_err(|_| {
+            Error::new(
+                ErrorKind::External,
+                format!("{context} returned non-UTF-8 output"),
+            )
+        })
+}
+
+fn validate_knowledge_store_url(value: &str) -> Result<()> {
+    if value.is_empty() || value.trim() != value {
+        return Err(invalid(
+            "Knowledge Store URL must be non-empty and have no surrounding whitespace",
+        ));
+    }
+    if value.starts_with('-') || value.chars().any(char::is_control) {
+        return Err(invalid("Knowledge Store URL contains unsafe characters"));
+    }
+    if value.contains(['?', '#']) {
+        return Err(invalid(
+            "Knowledge Store URL must not contain query parameters or fragments",
+        ));
+    }
+    if let Some((scheme, remainder)) = value.split_once("://") {
+        if !matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "file" | "http" | "https" | "ssh" | "git"
+        ) {
+            return Err(invalid("unsupported Knowledge Store URL scheme"));
+        }
+        let authority = remainder.split('/').next().unwrap_or_default();
+        if authority.is_empty() && !scheme.eq_ignore_ascii_case("file") {
+            return Err(invalid("Knowledge Store URL has no remote host"));
+        }
+        if let Some((userinfo, _)) = authority.rsplit_once('@') {
+            let ssh_username_only = scheme.eq_ignore_ascii_case("ssh")
+                && !userinfo.is_empty()
+                && !userinfo.contains(':');
+            if !ssh_username_only {
+                return Err(invalid(
+                    "Knowledge Store URL must not contain embedded credentials",
+                ));
+            }
+        }
+    } else if let Some((userinfo, tail)) = value.split_once('@')
+        && tail.contains(':')
+        && (userinfo.is_empty() || userinfo.contains(':'))
+    {
+        return Err(invalid(
+            "Knowledge Store URL must not contain embedded credentials",
+        ));
+    }
+    Ok(())
+}
+
+fn classify_remote_type(value: &str) -> KnowledgeRemoteType {
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        KnowledgeRemoteType::Https
+    } else if lower.starts_with("http://") {
+        KnowledgeRemoteType::Http
+    } else if lower.starts_with("ssh://")
+        || value
+            .split_once('@')
+            .is_some_and(|(_, tail)| tail.contains(':'))
+    {
+        KnowledgeRemoteType::Ssh
+    } else if lower.starts_with("git://") {
+        KnowledgeRemoteType::Git
+    } else {
+        KnowledgeRemoteType::Local
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2535,7 +2941,7 @@ fn validate_reset_active_targets(root: &Path) -> Result<()> {
 
 fn build_pristine_reset_root(final_root: &Path, staging_root: &Path) -> Result<()> {
     ensure_private_directory(staging_root)?;
-    let store = GitStore::initialize(staging_root)?;
+    let store = GitStore::bootstrap_local(staging_root)?;
     ProjectionIndex::for_store(&store).synchronize()?;
     let _runtime = TaskRuntime::initialize(staging_root.to_path_buf())?;
     let registry = RepositoryRegistry::initialize(staging_root.to_path_buf())?;
@@ -2680,7 +3086,7 @@ fn remove_reset_marker(root: &Path) -> Result<()> {
 }
 
 fn smoke_pristine_reset_root(root: &Path) -> Result<()> {
-    let store = GitStore::initialize(root)?;
+    let store = GitStore::bootstrap_local(root)?;
     let snapshot = ProjectionIndex::for_store(&store).domain_snapshot()?;
     if !snapshot.projection.spaces.is_empty()
         || !snapshot.projection.candidates.is_empty()

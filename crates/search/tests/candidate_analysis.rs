@@ -138,7 +138,7 @@ fn add_context(
 fn fixture() -> Fixture {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("candidate analysis root");
-    let base = GitStore::initialize(&root).unwrap();
+    let base = GitStore::bootstrap_local(&root).unwrap();
     let (exact_space, exact_intent_initial) =
         add_space(&base, "Search Requirement", "searchcandidate");
     let (related_space, _) = add_space(&base, "Protocol Contract", "protocolcandidate");
@@ -269,7 +269,7 @@ fn conflicted_space_is_related_only_and_keeps_a_proposed_primary_option() {
 fn empty_context_store_yields_zero_existing_spaces_and_does_not_write_git() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("empty candidate analysis root");
-    let store = GitStore::initialize(&root).unwrap();
+    let store = GitStore::bootstrap_local(&root).unwrap();
     let index = ProjectionIndex::for_store(&store);
     index.synchronize().unwrap();
     let head = || {
@@ -330,7 +330,7 @@ fn empty_context_store_yields_zero_existing_spaces_and_does_not_write_git() {
 fn one_safe_exact_owner_yields_one_existing_primary_space() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("single candidate analysis root");
-    let store = GitStore::initialize(&root).unwrap();
+    let store = GitStore::bootstrap_local(&root).unwrap();
     let (space_id, _) = add_space(&store, "Single Requirement", "single-owner");
     let content = draft(
         Some("candidate/single"),
@@ -686,7 +686,7 @@ fn symbol_locator() -> ArtifactLocator {
 fn exact_artifact_graph_reaches_cross_end_space_with_frozen_generation() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("candidate graph root");
-    let store = GitStore::initialize(&root).unwrap();
+    let store = GitStore::bootstrap_local(&root).unwrap();
     let (source_space, _) = add_space(&store, "Frontend Source", "frontend-graph");
     let (contract_space, _) = add_space(&store, "Server Contract", "server-graph");
     let contract = add_context(

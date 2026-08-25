@@ -126,7 +126,7 @@ fn input(
 fn fixed_working_intent_cross_layer_oracle() {
     let temporary = TempDir::new().unwrap();
     let root = temporary.path().join("working-intent-oracle");
-    let store = GitStore::initialize(&root).unwrap();
+    let store = GitStore::bootstrap_local(&root).unwrap();
     let event_count = seed_text_context(&store);
     let goal_only: WorkingIntentSnapshot =
         serde_json::from_value(serde_json::json!({"goal": "Implement search"})).unwrap();

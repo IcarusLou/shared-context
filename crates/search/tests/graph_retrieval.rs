@@ -321,7 +321,7 @@ fn snapshot(
 fn graph_fixture() -> GraphFixture {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("installation");
-    let store = GitStore::initialize(&root).unwrap();
+    let store = GitStore::bootstrap_local(&root).unwrap();
     let source_space = add_space(
         &store,
         "FrontendImplementation",
@@ -1297,7 +1297,7 @@ fn sparse_graph_builder_excludes_large_unrelated_context_corpus_from_projection_
 fn build_time_candidate_incomplete_and_conflicted_contexts_never_cross_automatic_graph_boundary() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("unsafe-graph");
-    let store = GitStore::initialize(&root).unwrap();
+    let store = GitStore::bootstrap_local(&root).unwrap();
     let space = add_space(&store, "Unsafe Graph", "unsafe graph diagnostics");
     let (candidate_context, candidate_revision) = add_unpublished_context(
         &store,

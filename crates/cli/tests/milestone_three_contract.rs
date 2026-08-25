@@ -106,7 +106,7 @@ impl MilestoneThreeFixture {
         init_git_repository(&repository_path);
 
         let oracle: Oracle = serde_json::from_str(ORACLE_JSON).unwrap();
-        let store = GitStore::initialize(&root).unwrap();
+        let store = GitStore::bootstrap_local(&root).unwrap();
         install_event_oracle(&store, &oracle.events);
         let index = ProjectionIndex::for_store(&store);
         let metadata = index.synchronize().unwrap().metadata;

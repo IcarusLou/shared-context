@@ -74,7 +74,7 @@ impl Fixture {
         let far_file = far_repository.join("src/file.rs");
         let outside_file = outside.join("outside.rs");
         let root = home.join(".shared-context");
-        GitStore::initialize(&root).unwrap();
+        GitStore::bootstrap_local(&root).unwrap();
         let config = UserConfigStore::open_existing(&root).unwrap();
         let first_id = config
             .add_repository(
@@ -590,7 +590,7 @@ fn safe_unregistered_mixed_and_unrepresentable_multi_repo_events_are_non_locatin
         assert!(!persisted.contains(forbidden), "leaked {forbidden:?}");
     }
     assert!(
-        GitStore::initialize(fixture.root())
+        GitStore::bootstrap_local(fixture.root())
             .unwrap()
             .list_pending()
             .unwrap()

@@ -70,7 +70,7 @@
 
 ### 3.1 已确认约束
 
-- 一次安装维护一个本地 `ContextStore`，对应唯一 Git 仓库。
+- 一次安装维护一个本地 `KnowledgeStore`，对应唯一 Git 仓库。
 - `ContextSpace` 表示一项内部 Requirement 或长期工作目标，不依赖外部需求系统维持身份。
 - Workspace 只说明代码位置和当前工程现场，不能决定当前 Task 属于哪个 Space。
 - 一个 Task 可以同时关联零个、一个或多个 Space。
@@ -146,7 +146,8 @@
 
 | 术语 | 定义 |
 |---|---|
-| `ContextStore` | 一次安装唯一的本地 Git 知识仓库 |
+| `KnowledgeStore` | 一次安装唯一的 Git 知识事实仓；可以从团队远端初始化，但独立于业务源码 RepositoryIdentity |
+| `InstallationWorkBranch` | 每次安装稳定拥有的 `shared-context/<installation-id>` 知识写分支；远端默认分支只作为只读集成基线 |
 | `ContextSpace` | 一项内部 Requirement 或长期工作目标的 Intent 与 Context 组织容器 |
 | `IntentRevision` | ContextSpace 目标、范围和验收条件的一版完整快照 |
 | `TaskSession` | 一次 Agent 工程任务的本地运行实例，与 Agent Session 隔离 |
@@ -1241,13 +1242,13 @@ Agent 配置引用：
 ### 17.1 Setup
 
 ```bash
-npx -y @company/shared-context@<version> setup --agents cursor,codex
+sctx setup --agents cursor,codex [--knowledge-store-url <GIT_URL>]
 ```
 
 Setup：
 
 1. 检查 macOS、CPU、Git、签名和磁盘空间。
-2. 创建 `~/.shared-context/` 和唯一 Context Git Store。
+2. 创建 `~/.shared-context/` 和唯一 Knowledge Store；若提供 URL，则在事务目录 clone 已有非空远端。
 3. 创建或重建 `index.sqlite` 与 `runtime.sqlite`。
 4. 检测 Cursor/Codex 能力。
 5. 展示并原子合并 Hook/MCP 配置。
@@ -1255,6 +1256,10 @@ Setup：
 7. 显示需要重启或 Trust 的 Agent。
 
 Setup 不要求选择业务仓库或 Space。业务 Workspace 只提供非定位 TaskSignal/Breadcrumb，不自动生成 Artifact Focus。
+
+远端 Setup 使用系统 Git credential helper 或 SSH Agent，拒绝内嵌 credential、query 和 fragment。Clone 必须在临时目录通过 HEAD/toplevel/clean、committed Event/Object、Reducer 与 scratch Index 校验，随后以同文件系统 rename 原子安装。安装清单只持久化 remote transport、默认分支、stable installation ID、`shared-context/<installation-id>` 工作分支和 URL digest，不保存或输出原始 URL。
+
+Setup 从 `origin/<default>` 创建不跟踪 upstream 的 InstallationWorkBranch，既不提交到本地默认分支，也不 push 任何远端 ref。同 URL 重复 Setup 仅核对本地 manifest/checkout 并保持幂等；不同 URL、既有 local Store、空远端或校验失败全部拒绝覆盖。Hook、MCP 和普通业务 CLI 只能 `open_existing`，不得隐式 init、clone 或访问网络。Fetch/merge/push/PR 属于后续同步里程碑。
 
 ### 17.2 Demo
 

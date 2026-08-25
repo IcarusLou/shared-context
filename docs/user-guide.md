@@ -20,7 +20,7 @@ Shared Context 是一个给 Cursor、Codex 等编程 Agent 使用的“工程记
 - 验证（Validation）：运行了什么验证，结论和局限是什么。
 - 发现（Discovery）和进度（Progress）：已经查清或完成了什么。
 
-当前版本是本机优先的实现：知识保存在本机 Git 仓库中，Cursor/Codex 通过 MCP 和 Hook 使用它。**团队远程同步尚未实现**，不能把它当成已经可跨电脑自动同步的团队知识服务。
+当前版本是本机优先的实现：知识保存在本机 Git 仓库中，Cursor/Codex 通过 MCP 和 Hook 使用它。首次安装可以从团队已有的非空远端 Git Knowledge Store 克隆，但**自动拉取、合并、推送和跨电脑同步尚未实现**。
 
 ## 2. 三分钟快速开始
 
@@ -139,11 +139,18 @@ npm run install:local -- --profile debug --prefix /absolute/path/to/prefix
 sctx setup --agents cursor,codex
 ```
 
-`setup --demo` 目前是非核心已知限制（Mew #195）：MCP Session guard 启用后，offline setup 没有 Agent Session lease，演示内的 public MCP search 会被正确拒绝。请不要把它用于安装验收；普通 `setup`、Hook、Skill 与授权后的 MCP 流程不受影响。
+如果团队已经有一个非空的 Shared Context Git 仓库，可以在首次安装时只提供 Git 地址：
 
 ```bash
-sctx setup --agents cursor,codex
+sctx setup --agents cursor,codex \
+  --knowledge-store-url git@github.example.com:team/shared-context.git
 ```
+
+Setup 使用系统 Git 的 credential helper 或 SSH Agent 完成认证；URL 中不能嵌入 token、密码、查询参数或 fragment。克隆会先进入事务临时目录，只有 HEAD、工作树、Event、对象哈希、Reducer 和 Index 全部通过校验后才原子安装。空远端不受支持。
+
+安装器会从远端默认分支创建稳定的 `shared-context/<installation-id>` 本机工作分支。默认分支只作为只读基线，Setup 不向任何远端分支 push；自动同步将在后续版本提供。
+
+`setup --demo` 目前是非核心已知限制（Mew #195）：MCP Session guard 启用后，offline setup 没有 Agent Session lease，演示内的 public MCP search 会被正确拒绝。请不要把它用于安装验收；普通 `setup`、Hook、Skill 与授权后的 MCP 流程不受影响。
 
 ### 3.4 验证安装
 
@@ -175,7 +182,7 @@ sctx doctor --fix
 默认安装根目录是 `~/.shared-context`。`setup` 会：
 
 - 安装稳定运行时到 `~/.shared-context/bin/<版本>/<架构>/sctx`，并维护 `bin/current`。
-- 初始化知识 Git 仓库 `~/.shared-context/repository`。
+- 初始化本地知识 Git 仓库 `~/.shared-context/repository`，或通过 `--knowledge-store-url` 原子安装已存在的非空远端 Store。
 - 初始化本地索引和运行时状态。
 - 按选择写入 `~/.cursor/mcp.json`、`~/.cursor/hooks.json`。
 - 按选择写入 `~/.codex/config.toml`、`~/.codex/hooks.json`。
@@ -477,7 +484,7 @@ sctx candidate discard \
 
 | 命令 | 功能 |
 |---|---|
-| `sctx setup [--demo] [--agents cursor,codex]` | 首次安装运行时、知识库、索引、MCP、Hook 和 Skill；幂等执行。`--demo` 是 #195 已接受的非核心已知限制，不作为安装验收。 |
+| `sctx setup [--demo] [--agents cursor,codex] [--knowledge-store-url GIT_URL]` | 首次安装运行时、知识库、索引、MCP、Hook 和 Skill；可从已有非空远端 Store 克隆并幂等执行。`--demo` 是 #195 已接受的非核心已知限制，不作为安装验收。 |
 | `sctx demo` | 建立并验证固定演示闭环；重复执行可复用已有演示数据。 |
 | `sctx doctor` | 只读检查安装、索引、配置、MCP 和 Agent 能力。 |
 | `sctx doctor --fix` | 重做安全、可逆的注册和索引设置后再次检查。 |
@@ -786,7 +793,7 @@ sctx index rebuild
 
 ### 7.8 能否团队共享或跨电脑同步
 
-当前版本不能。Repository Catalog 是单机配置，知识 Store 也没有实现团队远程同步。可以把当前版本理解为“先在一台 Mac 上让多个本机 Agent/Session 继承工程认知”。
+可以从同一个团队远端 Git 地址初始化多台机器，每台安装都会使用自己的 `shared-context/<installation-id>` 工作分支；但当前版本还不会自动 fetch、merge、push 或创建 Pull Request。因此它只完成团队 Store 的安全接入，不等同于已完成跨电脑自动同步。Repository Catalog 仍是每台机器的本机显式配置，团队成员需要为同一业务源码仓约定相同的 RepositoryId。
 
 ## 8. 开发与验证
 
@@ -811,7 +818,7 @@ npm 测试会检查 launcher、平台包、离线 Bundle 和安装契约。Apple
 
 ## 9. 当前明确不支持的能力
 
-- 团队远程同步和跨电脑自动分发。
+- 团队远端的自动 fetch/merge/push、Pull Request 和跨电脑自动分发。
 - 把 Workspace 自动绑定成某个 Space。
 - 把文本 Hint、Prompt、文件路径或测试结果自动当成可信工程证据。
 - 未经用户审核，自动确认、发布或注入 Candidate。

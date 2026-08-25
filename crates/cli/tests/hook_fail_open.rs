@@ -226,7 +226,7 @@ fn assert_fail_open(
 }
 
 fn initialize_store(harness: &Harness) -> GitStore {
-    GitStore::initialize(harness.root()).unwrap()
+    GitStore::bootstrap_local(harness.root()).unwrap()
 }
 
 fn task_intent() -> WorkingIntentSnapshot {

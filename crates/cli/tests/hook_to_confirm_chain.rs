@@ -319,7 +319,7 @@ fn one_real_hook_to_confirm_identity_chain() {
     let home = temporary.path().join("中文 M4 home");
     fs::create_dir_all(&home).unwrap();
     let root = home.join(".shared-context");
-    let store = GitStore::initialize(&root).unwrap();
+    let store = GitStore::bootstrap_local(&root).unwrap();
     let source_repository = initialize_source_repository(
         &home.join("工程 repo"),
         &oracle.source_relative_path,

@@ -97,7 +97,7 @@ test('npm pack main package contains only the thin launcher surface', (context) 
   assert.match(verbose, /-rwxr-xr-x.*package\/bin\/sctx\.js/);
 });
 
-test('offline install entrypoint invokes setup even without user arguments', (context) => {
+test('offline install invokes setup and forwards a remote Knowledge Store URL', (context) => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sctx-install-entrypoint-'));
   context.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
   const bundle = path.join(temporary, 'bundle');
@@ -122,6 +122,19 @@ test('offline install entrypoint invokes setup even without user arguments', (co
     env: { ...process.env, PATH: `${fakeBin}:/usr/bin:/bin` },
   });
   assert.equal(fs.readFileSync(invocation, 'utf8'), 'setup\n');
+
+  run(
+    path.join(bundle, 'install'),
+    ['--knowledge-store-url', 'git@example.invalid:team/shared-context.git'],
+    {
+      cwd: bundle,
+      env: { ...process.env, PATH: `${fakeBin}:/usr/bin:/bin` },
+    },
+  );
+  assert.equal(
+    fs.readFileSync(invocation, 'utf8'),
+    'setup\n--knowledge-store-url\ngit@example.invalid:team/shared-context.git\n',
+  );
 });
 
 test(

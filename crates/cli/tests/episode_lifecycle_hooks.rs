@@ -47,7 +47,7 @@ impl Harness {
                 .success()
         );
         let workspace = fs::canonicalize(workspace).unwrap();
-        GitStore::initialize(&root).unwrap();
+        GitStore::bootstrap_local(&root).unwrap();
         UserConfigStore::initialize(&root)
             .unwrap()
             .add_repository(
@@ -374,7 +374,7 @@ fn real_hooks_close_checkpointed_episodes_build_once_and_keep_sessions_isolated(
         assert_eq!(build.items.len(), 1);
         assert!(build.items[0].candidate_id.is_some());
     }
-    let index = ProjectionIndex::for_store(&GitStore::initialize(&harness.root).unwrap());
+    let index = ProjectionIndex::for_store(&GitStore::bootstrap_local(&harness.root).unwrap());
     let before = index.domain_snapshot().unwrap().projection.candidates.len();
     assert_eq!(before, 2);
     let started = Instant::now();
@@ -616,7 +616,7 @@ fn concurrent_turn_stop_processes_converge_on_one_build_and_candidate() {
     let build = runtime.read_candidate_build(episode_id).unwrap().unwrap();
     assert_eq!(build.status, CandidateBuildStatus::Complete);
     assert_eq!(build.items.len(), 1);
-    let index = ProjectionIndex::for_store(&GitStore::initialize(&harness.root).unwrap());
+    let index = ProjectionIndex::for_store(&GitStore::bootstrap_local(&harness.root).unwrap());
     assert_eq!(
         index.domain_snapshot().unwrap().projection.candidates.len(),
         1

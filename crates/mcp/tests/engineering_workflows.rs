@@ -243,7 +243,7 @@ fn append(store: &GitStore, event: Event) {
 }
 
 fn accepted_context(root: &Path, statement: &str) -> (ContextId, RevisionId) {
-    let store = GitStore::initialize(root).unwrap();
+    let store = GitStore::bootstrap_local(root).unwrap();
     let space = Event::space_created(
         IntentSnapshot {
             title: statement.to_owned(),
@@ -567,6 +567,7 @@ fn public_mcp_artifact_focus_is_query_scoped_across_six_kinds_and_hot_path() {
 
     let temporary = TempDir::new().unwrap();
     let root = temporary.path().join("focus MCP root");
+    GitStore::bootstrap_local(&root).unwrap();
     let cross = temporary.path().join("workspace cross");
     let main_repository = cross.join("main/multilanguage");
     seed_six_kinds(&main_repository);
@@ -699,7 +700,7 @@ fn public_mcp_artifact_focus_is_query_scoped_across_six_kinds_and_hot_path() {
     let graph_store =
         sctx_engineering_graph::EngineeringProjectionStore::initialize(&root).unwrap();
     let graph_before = graph_store.canonical_bytes().unwrap().unwrap();
-    let store = GitStore::initialize(&root).unwrap();
+    let store = GitStore::bootstrap_local(&root).unwrap();
     let knowledge_head_before = git(store.repository(), &["rev-parse", "HEAD"]);
 
     fs::remove_dir_all(&main_repository).unwrap();

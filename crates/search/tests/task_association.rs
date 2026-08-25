@@ -185,7 +185,7 @@ fn applicability(domain: &str, platform: &str, condition: &str) -> Applicability
 
 fn polarity_fixture() -> PolarityFixture {
     let temporary = tempfile::tempdir().unwrap();
-    let store = GitStore::initialize(temporary.path().join("polarity-installation")).unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("polarity-installation")).unwrap();
     let event = Event::space_created(
         sctx_domain::IntentSnapshot {
             title: "RankingRequirement".to_owned(),
@@ -224,7 +224,7 @@ fn fusion_corpus_fixture() -> FusionCorpusFixture {
     const GENERIC_SPACE_COUNT: usize = 40;
 
     let temporary = tempfile::tempdir().unwrap();
-    let store = GitStore::initialize(temporary.path().join("fusion-installation")).unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("fusion-installation")).unwrap();
     for index in 0..GENERIC_SPACE_COUNT {
         add_space(
             &store,
@@ -284,7 +284,7 @@ fn handoff_intent(title: &str, outcome: &str) -> sctx_domain::IntentSnapshot {
 
 fn intent_handoff_fixture() -> IntentHandoffFixture {
     let temporary = tempfile::tempdir().unwrap();
-    let store = GitStore::initialize(temporary.path().join("handoff-installation")).unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("handoff-installation")).unwrap();
     let base = Event::space_created(
         handoff_intent("HandoffBase", "establish the initial handoff boundary"),
         None,
@@ -347,7 +347,8 @@ fn intent_handoff_fixture() -> IntentHandoffFixture {
 #[allow(clippy::too_many_lines)]
 fn fixture() -> AssociationFixture {
     let temporary = tempfile::tempdir().unwrap();
-    let store = GitStore::initialize(temporary.path().join("association-installation")).unwrap();
+    let store =
+        GitStore::bootstrap_local(temporary.path().join("association-installation")).unwrap();
 
     let page_space = add_space(
         &store,

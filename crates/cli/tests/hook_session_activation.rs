@@ -57,7 +57,7 @@ impl Fixture {
         let second_repository = fs::canonicalize(second_repository).unwrap();
         let outside = fs::canonicalize(outside).unwrap();
         let root = home.join(".shared-context");
-        GitStore::initialize(&root).unwrap();
+        GitStore::bootstrap_local(&root).unwrap();
         let config = UserConfigStore::open_existing(&root).unwrap();
         let direct_repository_id = config
             .add_repository(

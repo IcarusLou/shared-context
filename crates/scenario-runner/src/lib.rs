@@ -39,7 +39,7 @@ pub use report::{
     ReplayReport, ReplayReportItem, ReplayScenario,
 };
 use schedule::{PlannedDisposition, PlannedStep, ScheduledBatch, compile_schedule};
-use sctx_local_state::PrivacyScanner;
+use sctx_local_state::{PrivacyScanner, UserConfigStore};
 use sctx_scenario_contract::{
     ActionExpectation, ActionKind, ActorKind, AgentProfile, AgentVendor, ConfirmationEventCount,
     CrashTiming, ExpectedFailureKind, InvariantKind, ProductAction, RawContentKind, SandboxBuiltin,
@@ -388,6 +388,7 @@ impl Sandbox {
             resource_roots: BTreeMap::new(),
             resource_files: BTreeMap::new(),
         };
+        initialize_sandbox_knowledge_store(config, definition, seed, &sandbox.root)?;
         sandbox.materialize_resources(config, definition, seed)?;
         Ok(sandbox)
     }
@@ -436,6 +437,84 @@ impl Sandbox {
         }
         Ok(())
     }
+}
+
+fn initialize_sandbox_knowledge_store(
+    config: &RunnerConfig,
+    scenario: &ScenarioDefinition,
+    seed: u64,
+    root: &Path,
+) -> Result<(), RunnerFailure> {
+    let store = UserConfigStore::initialize(root).map_err(|_| {
+        RunnerFailure::new(
+            scenario.name.as_str(),
+            seed,
+            None,
+            FailureClassification::ProcessFailure,
+            "isolated Knowledge Store config could not be initialized",
+        )
+    })?;
+    fs::create_dir_all(root.join("state/pending")).map_err(|_| resource_failure(scenario, seed))?;
+    let repository = store.repository();
+    fs::create_dir_all(repository).map_err(|_| resource_failure(scenario, seed))?;
+    for arguments in [
+        &[
+            "init",
+            "--quiet",
+            "--initial-branch=main",
+            repository
+                .to_str()
+                .ok_or_else(|| resource_failure(scenario, seed))?,
+        ][..],
+        &[
+            "-C",
+            repository
+                .to_str()
+                .ok_or_else(|| resource_failure(scenario, seed))?,
+            "config",
+            "user.name",
+            "Shared Context Writer",
+        ][..],
+        &[
+            "-C",
+            repository
+                .to_str()
+                .ok_or_else(|| resource_failure(scenario, seed))?,
+            "config",
+            "user.email",
+            "shared-context@localhost",
+        ][..],
+        &[
+            "-C",
+            repository
+                .to_str()
+                .ok_or_else(|| resource_failure(scenario, seed))?,
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "Initialize Shared Context repository",
+        ][..],
+    ] {
+        let status = Command::new(&config.git_binary)
+            .args(arguments)
+            .env_clear()
+            .env("PATH", &config.search_path)
+            .env("HOME", root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ALLOW_PROTOCOL", "file")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|_| resource_failure(scenario, seed))?;
+        if !status.success() {
+            return Err(resource_failure(scenario, seed));
+        }
+    }
+    Ok(())
 }
 
 fn preflight_resources(scenario: &ScenarioDefinition, seed: u64) -> Result<(), RunnerFailure> {

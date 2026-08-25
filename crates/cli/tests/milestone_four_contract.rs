@@ -124,7 +124,7 @@ fn fixed_milestone_four_builder_review_confirm_oracle() {
     assert_eq!(oracle.version, 1);
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("m4 fixed oracle");
-    let store = GitStore::initialize(&root).unwrap();
+    let store = GitStore::bootstrap_local(&root).unwrap();
     let space = Event::space_created(
         IntentSnapshot {
             title: "Shared result contract".to_owned(),

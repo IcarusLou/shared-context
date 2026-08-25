@@ -59,12 +59,16 @@ After transferring the matching archive to the target Mac:
 ```bash
 tar -xzf shared-context-0.1.0-darwin-arm64-offline.tar.gz
 ./shared-context-0.1.0-darwin-arm64-offline/install \
-  --agents cursor,codex --yes
+  --agents cursor,codex \
+  --knowledge-store-url git@github.example.com:team/shared-context.git \
+  --yes
 ```
 
 `install` verifies `SHA256SUMS`, runs npm in offline mode with lifecycle scripts disabled, and then
 always invokes `sctx setup` with the supplied options. Calling `./install` with no options therefore
 still starts setup with its defaults; callers must not include an extra `setup` argument.
+The optional Knowledge Store URL is forwarded unchanged as an argv value; Setup rejects embedded
+credentials and never prints or stores the raw URL in its install manifest.
 
 Do not pass `--demo` as an install acceptance check. Mew #195 records a human-accepted, non-core
 known limitation: offline `setup --demo` has no authorized Agent Session lease, so its public MCP

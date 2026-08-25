@@ -141,7 +141,7 @@ fn publish(
 #[allow(clippy::too_many_lines)]
 fn fixture() -> Fixture {
     let temporary = tempfile::tempdir().unwrap();
-    let store = GitStore::initialize(temporary.path().join("installation")).unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("installation")).unwrap();
     let created = Event::space_created(intent("Search Context"), None).unwrap();
     let space_id = space_id(&created);
     append(&store, created);
@@ -364,7 +364,7 @@ fn chinese_english_unicode_and_code_identifiers_hit_normalized_fts() {
 #[test]
 fn relation_kind_rationale_support_and_target_id_are_searchable_from_source_revision() {
     let temporary = tempfile::tempdir().unwrap();
-    let store = GitStore::initialize(temporary.path().join("relation-search")).unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("relation-search")).unwrap();
     let target_space_event = Event::space_created(intent("Relation Target"), None).unwrap();
     let target_space_id = space_id(&target_space_event);
     append(&store, target_space_event);
@@ -524,7 +524,7 @@ fn minimal_intent(title: &str, domain_term: &str) -> sctx_domain::IntentSnapshot
 
 fn intent_fixture() -> IntentFixture {
     let temporary = tempfile::tempdir().unwrap();
-    let store = GitStore::initialize(temporary.path().join("intent-installation")).unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("intent-installation")).unwrap();
 
     let rich = Event::space_created(rich_intent(), None).unwrap();
     let rich_space_id = space_id(&rich);

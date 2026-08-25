@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use sctx_domain::WorkingIntentSnapshot;
+use sctx_git_store::GitStore;
 use sctx_mcp::{
     ExpectedRevisionId, TaskBoundary, TaskIntentUpdateInput, task_intent_update_at_root,
 };
@@ -451,6 +452,7 @@ fn real_stale_failure_continues_to_readonly_observer_with_zero_state_change() {
 fn direct_product_stale_cas_keeps_semantics_despite_infrastructure_bytes() {
     let temporary = tempdir().unwrap();
     let root = temporary.path().join("root");
+    GitStore::bootstrap_local(&root).unwrap();
     let input = |boundary, expected_revision_id, goal: &str| TaskIntentUpdateInput {
         agent_kind: "codex".to_owned(),
         external_session_id: "direct-stale-session".to_owned(),

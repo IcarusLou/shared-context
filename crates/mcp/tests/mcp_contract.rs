@@ -69,7 +69,7 @@ impl Fixture {
     fn new() -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("shared context root");
-        let store = GitStore::initialize(&root).unwrap();
+        let store = GitStore::bootstrap_local(&root).unwrap();
         let created = Event::space_created(intent(), None).unwrap();
         let space_id = match created.payload() {
             EventPayload::SpaceCreated { space_id, .. } => *space_id,
@@ -1796,7 +1796,7 @@ fn candidate_builder_converts_six_typed_sources_without_raw_capture_or_search_in
     assert_ne!(other.context.task_id, active.task_id);
 
     let index = ProjectionIndex::for_store(&fixture.store);
-    GitStore::initialize(&fixture.root)
+    GitStore::bootstrap_local(&fixture.root)
         .unwrap()
         .with_candidate_submission_index(Arc::new(index))
         .submit_candidate(CandidateSubmissionRequest {
@@ -2598,7 +2598,7 @@ fn candidate_confirm_recovers_reserved_before_git_and_git_before_runtime_finaliz
             &second_plan,
         )
         .unwrap();
-    let base = GitStore::initialize(&fixture.root).unwrap();
+    let base = GitStore::bootstrap_local(&fixture.root).unwrap();
     let index = ProjectionIndex::for_store(&base);
     let store = base
         .with_candidate_submission_index(Arc::new(index.clone()))
@@ -2768,7 +2768,7 @@ fn candidate_builder_recovers_both_crash_windows_and_twenty_concurrent_retries()
         )
         .unwrap();
     let index = ProjectionIndex::for_store(&fixture.store);
-    let store = GitStore::initialize(&fixture.root)
+    let store = GitStore::bootstrap_local(&fixture.root)
         .unwrap()
         .with_candidate_submission_index(Arc::new(index));
     let direct = store

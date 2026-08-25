@@ -1000,7 +1000,7 @@ impl ClaimBuildMaterial {
 
 impl Runtime {
     fn open(root: &Path) -> Result<Self> {
-        let _store = GitStore::initialize(root)?;
+        let _store = GitStore::open_existing(root)?;
         let catalog = UserConfigStore::open_existing(root)?.repository_catalog_wait()?;
         Self::open_with_catalog(root, catalog)
     }
@@ -1008,7 +1008,7 @@ impl Runtime {
     /// Opens business state against the exact Catalog snapshot that authorized
     /// this call. Public MCP dispatch must never re-read a newer Catalog here.
     fn open_with_catalog(root: &Path, catalog: RepositoryCatalogSnapshot) -> Result<Self> {
-        let base_store = GitStore::initialize(root)?;
+        let base_store = GitStore::open_existing(root)?;
         let index = ProjectionIndex::for_store(&base_store);
         let store = base_store
             .with_candidate_submission_index(Arc::new(index.clone()))
