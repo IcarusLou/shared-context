@@ -427,16 +427,17 @@ impl UserConfigStore {
                 .repositories
                 .iter()
                 .flat_map(|repository| {
+                    let repository_id = repository.id.clone();
                     repository
                         .paths
                         .iter()
-                        .map(move |path| (path.as_str(), repository.id))
+                        .map(move |path| (path.as_str(), repository_id.clone()))
                 })
                 .collect::<BTreeMap<_, _>>();
             for path in &paths {
                 let text = path_text(path)?;
                 if let Some(owner) = configured_owner.get(text.as_str())
-                    && repository_id != Some(*owner)
+                    && repository_id.as_ref() != Some(owner)
                 {
                     return Err(invalid(format!(
                         "checkout path is already configured for Repository {owner}"
@@ -471,7 +472,7 @@ impl UserConfigStore {
                 repository
             } else {
                 document.repositories.push(RepositoryConfigDocument {
-                    id: repository_id,
+                    id: repository_id.clone(),
                     paths: Vec::new(),
                 });
                 let index = document.repositories.len().saturating_sub(1);
@@ -543,7 +544,7 @@ impl UserConfigStore {
         }
         let members = member_repository_ids
             .iter()
-            .copied()
+            .cloned()
             .collect::<BTreeSet<_>>();
         if members.len() != member_repository_ids.len() {
             return Err(invalid(
@@ -741,7 +742,7 @@ impl UserConfigStore {
         for repository in &catalog.repositories {
             for path in &repository.checkout_paths {
                 checkouts.push(RepositoryCatalogCheckoutCheck {
-                    repository_id: repository.repository_id,
+                    repository_id: repository.repository_id.clone(),
                     checkout_path: path.clone(),
                     status: checkout_status(path)?,
                 });
@@ -841,7 +842,7 @@ impl RepositoryCatalogSnapshot {
         let mut canonical = self.clone();
         canonical
             .repositories
-            .sort_by_key(|repository| repository.repository_id);
+            .sort_by_key(|repository| repository.repository_id.clone());
         for repository in &mut canonical.repositories {
             repository.checkout_paths.sort();
         }
@@ -884,7 +885,7 @@ impl RepositoryCatalogSnapshot {
                     .filter_map(move |checkout| {
                         canonical_startup_cwd
                             .starts_with(checkout)
-                            .then_some((repository.repository_id, checkout))
+                            .then_some((repository.repository_id.clone(), checkout))
                     })
             })
             .collect::<Vec<_>>();
@@ -896,9 +897,9 @@ impl RepositoryCatalogSnapshot {
                 .cmp(&left.1.components().count())
                 .then_with(|| left.0.cmp(&right.0))
         });
-        if let Some((repository_id, checkout_path)) = direct_matches.first().copied() {
+        if let Some((repository_id, checkout_path)) = direct_matches.first().cloned() {
             if direct_matches.iter().skip(1).any(|(other_id, other_path)| {
-                *other_path == checkout_path && *other_id != repository_id
+                *other_path == checkout_path && other_id != &repository_id
             }) {
                 return Err(invariant(
                     "ActivationScope has ambiguous checkout ownership",
@@ -906,7 +907,7 @@ impl RepositoryCatalogSnapshot {
             }
             return Ok(ActivationScope {
                 decision: ActivationScopeDecision::Direct {
-                    repository_id,
+                    repository_id: repository_id.clone(),
                     checkout_path: checkout_path.clone(),
                 },
                 allowed_repository_ids: vec![repository_id],
@@ -992,7 +993,7 @@ impl RepositoryCatalogSnapshot {
                     .filter_map(move |checkout| {
                         declared_path
                             .starts_with(checkout)
-                            .then_some((repository.repository_id, checkout))
+                            .then_some((repository.repository_id.clone(), checkout))
                     })
             })
             .collect::<Vec<_>>();
@@ -1004,7 +1005,7 @@ impl RepositoryCatalogSnapshot {
                 .cmp(&left.1.components().count())
                 .then_with(|| left.0.cmp(&right.0))
         });
-        let Some((repository_id, checkout_path)) = matches.first().copied() else {
+        let Some((repository_id, checkout_path)) = matches.first().cloned() else {
             return Err(Error::new(
                 ErrorKind::RepositoryNotConfigured,
                 "declared Artifact path is not inside a configured Repository checkout",
@@ -1053,7 +1054,7 @@ impl RepositoryCatalogSnapshot {
                     .filter_map(move |checkout| {
                         canonical_file
                             .starts_with(checkout)
-                            .then_some((repository.repository_id, checkout))
+                            .then_some((repository.repository_id.clone(), checkout))
                     })
             })
             .collect::<Vec<_>>();
@@ -1065,7 +1066,7 @@ impl RepositoryCatalogSnapshot {
                 .cmp(&left.1.components().count())
                 .then_with(|| left.0.cmp(&right.0))
         });
-        let Some((repository_id, checkout_path)) = matches.first().copied() else {
+        let Some((repository_id, checkout_path)) = matches.first().cloned() else {
             return Err(Error::new(
                 ErrorKind::RepositoryNotConfigured,
                 "file path is not inside a configured Repository checkout",
@@ -1091,7 +1092,7 @@ fn catalog_snapshot(document: &ConfigDocument) -> RepositoryCatalogSnapshot {
             .repositories
             .iter()
             .map(|repository| RepositoryCatalogEntry {
-                repository_id: repository.id,
+                repository_id: repository.id.clone(),
                 checkout_paths: repository.paths.iter().map(PathBuf::from).collect(),
             })
             .collect(),
@@ -1138,7 +1139,7 @@ fn validate_repository_documents(repositories: &[RepositoryConfigDocument]) -> R
     let mut ids = BTreeSet::new();
     let mut paths = BTreeMap::<String, RepositoryId>::new();
     for repository in repositories {
-        if !ids.insert(repository.id) {
+        if !ids.insert(repository.id.clone()) {
             return Err(invalid(format!(
                 "duplicate Repository Catalog identity: {}",
                 repository.id
@@ -1160,7 +1161,7 @@ fn validate_repository_documents(repositories: &[RepositoryConfigDocument]) -> R
                     repository.id
                 )));
             }
-            if let Some(owner) = paths.insert(path.clone(), repository.id) {
+            if let Some(owner) = paths.insert(path.clone(), repository.id.clone()) {
                 return Err(invalid(format!(
                     "checkout path belongs to multiple Repository identities: {owner} and {}",
                     repository.id
@@ -1209,7 +1210,7 @@ fn validate_repository_group_documents_structure(
                 group.id
             )));
         }
-        let members = group.members.iter().copied().collect::<BTreeSet<_>>();
+        let members = group.members.iter().cloned().collect::<BTreeSet<_>>();
         if members.len() != group.members.len() {
             return Err(invalid(format!(
                 "RepositoryGroup {} contains duplicate member Repository identities",
@@ -1260,7 +1261,7 @@ fn validate_repository_group_member_input(
     }
     let members = member_repository_ids
         .iter()
-        .copied()
+        .cloned()
         .collect::<BTreeSet<_>>();
     if members.len() != member_repository_ids.len() {
         return Err(invalid(
@@ -1294,7 +1295,7 @@ fn validate_repository_group_members(
     for member in members {
         let repository = repositories
             .iter()
-            .find(|repository| repository.id == *member)
+            .find(|repository| &repository.id == member)
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::RepositoryNotConfigured,
@@ -1392,7 +1393,7 @@ fn validate_current_repository_group_members(
     for member in members {
         let repository = repositories
             .iter()
-            .find(|repository| repository.id == *member)
+            .find(|repository| &repository.id == member)
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::RepositoryNotConfigured,

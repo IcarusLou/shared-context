@@ -631,7 +631,7 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         .as_str()
         .unwrap()
         .to_owned();
-    assert!(configured_repository_id.starts_with("rpo_"));
+    assert!(configured_repository_id.starts_with("Repository-"));
 
     let prompt = |session_id: &str, text: &str| {
         serde_json::json!({
@@ -1267,7 +1267,7 @@ fn engineering_graph_cli_commands_scan_record_rebuild_and_explain() {
         added["data"]["catalog"]["repository"]["repository_id"]
             .as_str()
             .unwrap()
-            .starts_with("rpo_")
+            .starts_with("Repository-")
     );
     let listed = harness.success(&["repository", "list"]);
     assert_eq!(listed["data"]["repositories"].as_array().unwrap().len(), 1);
@@ -1332,7 +1332,7 @@ fn repository_doctor_rejects_invalid_catalog_identity_with_typed_error() {
     GitStore::initialize(harness.root()).unwrap();
     let config_path = harness.root().join("config.toml");
     let mut config = fs::read_to_string(&config_path).unwrap();
-    config.push_str("\n[[repositories]]\nid = \"rpo_short\"\npaths = []\n");
+    config.push_str("\n[[repositories]]\nid = \"FE/mobile\"\npaths = []\n");
     fs::write(config_path, config).unwrap();
 
     let doctor = harness.failure(&["repository", "doctor"]);
@@ -1341,7 +1341,7 @@ fn repository_doctor_rejects_invalid_catalog_identity_with_typed_error() {
         doctor["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("rpo_short")
+            .contains("FE/mobile")
     );
 }
 

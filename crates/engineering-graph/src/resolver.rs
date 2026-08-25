@@ -629,13 +629,14 @@ fn snapshot_map(
     let mut map = BTreeMap::new();
     for snapshot in snapshots {
         let (repository_id, state) = match snapshot {
-            RepositoryScanOutcome::Available(snapshot) => {
-                (snapshot.repository_id, SnapshotState::Available(snapshot))
-            }
+            RepositoryScanOutcome::Available(snapshot) => (
+                snapshot.repository_id.clone(),
+                SnapshotState::Available(snapshot),
+            ),
             RepositoryScanOutcome::Unavailable {
                 repository_id,
                 reason,
-            } => (*repository_id, SnapshotState::Unavailable(reason)),
+            } => (repository_id.clone(), SnapshotState::Unavailable(reason)),
         };
         if map.insert(repository_id, state).is_some() {
             return Err(invalid(
@@ -848,7 +849,7 @@ fn projection_for_status(
         artifact_generation: String::new(),
         resolution: ArtifactResolution {
             reference_id: projected.reference.reference_id,
-            repository_id: projected.reference.repository_id,
+            repository_id: projected.reference.repository_id.clone(),
             status,
             resolved_artifact,
             candidates,

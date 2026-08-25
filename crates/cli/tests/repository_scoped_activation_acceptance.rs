@@ -117,7 +117,7 @@ impl Fixture {
             .repository
             .repository_id;
         config
-            .add_repository_group(&group_root, &[first_id, second_id])
+            .add_repository_group(&group_root, &[first_id.clone(), second_id.clone()])
             .unwrap();
         Self {
             _temporary: temporary,
@@ -489,7 +489,7 @@ fn documented_codex_direct_lifecycle_activates_before_prompt_and_keeps_git_clean
         fixture.read_scope("codex", session),
         AuthorizedSessionScopeRead::Current(scope)
             if scope.decision == AuthorizedSessionScopeDecision::Direct {
-                repository_id: fixture.repository_a_id
+                repository_id: fixture.repository_a_id.clone()
             }
     ));
     assert_output(&fixture.run("codex", &events[1]), &oracle.wire.neutral);
@@ -531,7 +531,10 @@ fn documented_cursor_group_lifecycle_records_members_and_safe_non_locating_inves
         &oracle.wire.cursor_enabled_session_start,
     );
     let scope = fixture.current_scope("cursor", session);
-    let mut expected_members = vec![fixture.repository_a_id, fixture.repository_b_id];
+    let mut expected_members = vec![
+        fixture.repository_a_id.clone(),
+        fixture.repository_b_id.clone(),
+    ];
     expected_members.sort();
     assert!(matches!(
         scope.decision,
@@ -658,8 +661,8 @@ fn resume_compact_and_concurrent_repeated_starts_keep_the_first_successful_scope
     let first = fixture.current_scope("codex", session);
     assert!(matches!(
         first.decision,
-        AuthorizedSessionScopeDecision::Direct { repository_id }
-            if repository_id == fixture.repository_a_id
+        AuthorizedSessionScopeDecision::Direct { ref repository_id }
+            if repository_id == &fixture.repository_a_id
     ));
 
     for (source, cwd) in [

@@ -9,8 +9,8 @@ use std::{
 use sctx_domain::{
     Applicability, ArtifactKind, ContextGovernanceStatus, ContextId, ContextKind,
     ContextRelationKind, ContextRevisionDraft, EvidenceSnapshotDraft, EvidenceType,
-    PublicationAction, PublicationDraft, ReferenceId, RepositoryIdentity, ResolutionStatus,
-    ResolvedFocus, SpaceId, TaskId, WorkingIntentSnapshot,
+    PublicationAction, PublicationDraft, ReferenceId, RepositoryId, RepositoryIdentity,
+    ResolutionStatus, ResolvedFocus, SpaceId, TaskId, WorkingIntentSnapshot,
 };
 use sctx_engineering_graph::{
     EngineeringProjection, EngineeringProjectionStore, EngineeringReferenceResolver,
@@ -140,9 +140,9 @@ impl MilestoneThreeFixture {
             "Context Revision IDs are fixed oracle input rather than captured output"
         );
 
-        let repository_id = parse_id(&oracle.expected.repository_id);
+        let repository_id: RepositoryId = parse_id(&oracle.expected.repository_id);
         let repository = RepositoryIdentity {
-            repository_id,
+            repository_id: repository_id.clone(),
             canonical_name: "milestone-three-multilingual-fixture".to_owned(),
         };
         let projected = domain
@@ -385,7 +385,7 @@ fn fixed_multilanguage_oracle_marks_moves_and_renames_missing_and_rebuilds() {
         .engine()
         .task_context_pack(&task_request(
             ResolvedFocus {
-                repository_id: fixture.repository.repository_id,
+                repository_id: fixture.repository.repository_id.clone(),
                 locator: sctx_domain::ArtifactLocator::File {
                     path: sctx_domain::RepoRelativePath::new(moved.new_path.as_deref().unwrap())
                         .unwrap(),
@@ -417,7 +417,7 @@ fn fixed_multilanguage_oracle_marks_moves_and_renames_missing_and_rebuilds() {
         .engine()
         .task_context_pack(&task_request(
             ResolvedFocus {
-                repository_id: fixture.repository.repository_id,
+                repository_id: fixture.repository.repository_id.clone(),
                 locator: renamed_locator,
             },
             ContextPackMode::AutomaticInjection,
@@ -450,7 +450,7 @@ fn fixed_graph_oracle_opens_requirement_decision_contract_and_cross_platform_val
         .engine()
         .task_context_pack(&task_request(
             ResolvedFocus {
-                repository_id: fixture.repository.repository_id,
+                repository_id: fixture.repository.repository_id.clone(),
                 locator: symbol_signal.clone(),
             },
             ContextPackMode::AutomaticInjection,
@@ -508,7 +508,7 @@ fn fixed_graph_oracle_opens_requirement_decision_contract_and_cross_platform_val
             .engine()
             .task_context_pack(&task_request(
                 ResolvedFocus {
-                    repository_id: fixture.repository.repository_id,
+                    repository_id: fixture.repository.repository_id.clone(),
                     locator: exact_signal,
                 },
                 ContextPackMode::AutomaticInjection,
@@ -536,7 +536,7 @@ fn fixed_graph_oracle_opens_requirement_decision_contract_and_cross_platform_val
 
     let mut bounded_request = task_request(
         ResolvedFocus {
-            repository_id: fixture.repository.repository_id,
+            repository_id: fixture.repository.repository_id.clone(),
             locator: symbol_signal,
         },
         ContextPackMode::AutomaticInjection,
@@ -571,7 +571,7 @@ fn ambiguous_and_unavailable_edges_diagnose_or_fall_back_without_automatic_graph
         .engine()
         .task_context_pack(&task_request(
             ResolvedFocus {
-                repository_id: fixture.repository.repository_id,
+                repository_id: fixture.repository.repository_id.clone(),
                 locator: ambiguous_locator.clone(),
             },
             ContextPackMode::Explicit,
@@ -593,7 +593,7 @@ fn ambiguous_and_unavailable_edges_diagnose_or_fall_back_without_automatic_graph
         .engine()
         .task_context_pack(&task_request(
             ResolvedFocus {
-                repository_id: fixture.repository.repository_id,
+                repository_id: fixture.repository.repository_id.clone(),
                 locator: ambiguous_locator,
             },
             ContextPackMode::AutomaticInjection,
@@ -631,7 +631,7 @@ fn ambiguous_and_unavailable_edges_diagnose_or_fall_back_without_automatic_graph
         .resolve(
             &references,
             &[RepositoryScanOutcome::Unavailable {
-                repository_id: fixture.repository.repository_id,
+                repository_id: fixture.repository.repository_id.clone(),
                 reason: "fixed oracle checkout unavailable".to_owned(),
             }],
             &fixture.projection.contexts,
@@ -649,7 +649,7 @@ fn ambiguous_and_unavailable_edges_diagnose_or_fall_back_without_automatic_graph
         .engine()
         .task_context_pack(&task_request(
             ResolvedFocus {
-                repository_id: fixture.repository.repository_id,
+                repository_id: fixture.repository.repository_id.clone(),
                 locator: fixture
                     .projection
                     .references
@@ -812,7 +812,7 @@ fn adapter_injects_frozen_safe_revision_after_current_revision_is_withdrawn() {
         .engine()
         .task_context_pack(&task_request(
             ResolvedFocus {
-                repository_id: fixture.repository.repository_id,
+                repository_id: fixture.repository.repository_id.clone(),
                 locator,
             },
             ContextPackMode::AutomaticInjection,

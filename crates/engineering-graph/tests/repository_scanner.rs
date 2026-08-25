@@ -56,7 +56,7 @@ fn identity(name: &str) -> RepositoryIdentity {
 
 fn plan(repository: &RepositoryIdentity, paths: &[&str]) -> RepositoryScanPlan {
     RepositoryScanPlan::new(
-        repository.repository_id,
+        repository.repository_id.clone(),
         paths
             .iter()
             .map(|path| RepoRelativePath::new(*path).unwrap())
@@ -565,7 +565,7 @@ fn sparse_plan_reads_only_deduplicated_reference_paths() {
     commit_all(&repo);
     let repository = identity("sparse");
     let scan_plan = RepositoryScanPlan::new(
-        repository.repository_id,
+        repository.repository_id.clone(),
         vec![
             RepoRelativePath::new("src/referenced.rs").unwrap(),
             RepoRelativePath::new("src/referenced.rs").unwrap(),
@@ -613,10 +613,10 @@ fn empty_or_missing_plan_never_falls_back_to_repository_enumeration() {
     );
     commit_all(&repo);
     let repository = identity("missing-plan");
-    assert!(RepositoryScanPlan::new(repository.repository_id, Vec::new()).is_err());
+    assert!(RepositoryScanPlan::new(repository.repository_id.clone(), Vec::new()).is_err());
     assert!(
         RepositoryScanPlan::new(
-            repository.repository_id,
+            repository.repository_id.clone(),
             (0..=MAX_REPOSITORY_SCAN_PLAN_PATHS)
                 .map(|index| RepoRelativePath::new(format!("src/path_{index}.rs")).unwrap())
                 .collect(),

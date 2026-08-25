@@ -949,7 +949,7 @@ fn setup_and_doctor_restore_registry_from_catalog_and_report_invalid_config() {
 
     let config_path = harness.root.join("config.toml");
     let mut config = fs::read_to_string(&config_path).unwrap();
-    config.push_str("\n[[repositories]]\nid = \"rpo_short\"\npaths = []\n");
+    config.push_str("\n[[repositories]]\nid = \"FE/mobile\"\npaths = []\n");
     fs::write(config_path, config).unwrap();
     let invalid = installer.doctor();
     assert!(!invalid.healthy);

@@ -716,7 +716,7 @@ fn run_enabled_chain(
     session: &str,
     startup: &Path,
     target_file: &Path,
-    target_repository_id: sctx_domain::RepositoryId,
+    target_repository_id: &sctx_domain::RepositoryId,
     oracle: &Oracle,
 ) -> McpTrace {
     assert_eq!(
@@ -803,7 +803,7 @@ fn run_enabled_chain(
     );
     let mapped = map_capture_artifacts(&captures[0].record, &fixture.catalog());
     assert_eq!(mapped.artifact_refs.len(), 1);
-    assert_eq!(mapped.artifact_refs[0].repository_id, target_repository_id);
+    assert_eq!(&mapped.artifact_refs[0].repository_id, target_repository_id);
     let capture_records = captures
         .iter()
         .map(|capture| &capture.record)
@@ -929,7 +929,7 @@ fn fixed_oracle_closes_direct_group_disabled_and_token_proxy_contract() {
         "synthetic-direct-flow",
         &fixture.repository_a,
         &fixture.file_b,
-        fixture.repository_id(&fixture.file_b),
+        &fixture.repository_id(&fixture.file_b),
         &oracle,
     );
     let group = run_enabled_chain(
@@ -938,7 +938,7 @@ fn fixed_oracle_closes_direct_group_disabled_and_token_proxy_contract() {
         "synthetic-group-flow",
         &fixture.group_root,
         &fixture.file_c,
-        fixture.repository_id(&fixture.file_c),
+        &fixture.repository_id(&fixture.file_c),
         &oracle,
     );
     for trace in [&direct, &group] {
@@ -1120,7 +1120,7 @@ fn authorize_short_lived(fixture: &Fixture, session: &str) {
         &ExternalSessionLocator::new("codex", session).unwrap(),
         &ActivationScope {
             decision: ActivationScopeDecision::Direct {
-                repository_id,
+                repository_id: repository_id.clone(),
                 checkout_path: fixture.repository_a.clone(),
             },
             allowed_repository_ids: vec![repository_id],

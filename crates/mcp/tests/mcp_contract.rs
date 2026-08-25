@@ -125,14 +125,14 @@ fn authorize_session(root: &Path, agent_kind: &str, external_session_id: &str) {
     let members = catalog
         .repositories
         .iter()
-        .map(|repository| repository.repository_id)
+        .map(|repository| repository.repository_id.clone())
         .collect::<Vec<_>>();
     let locator = ExternalSessionLocator::new(agent_kind, external_session_id).unwrap();
     let activation = if catalog.repositories.len() == 1 {
         let repository = &catalog.repositories[0];
         ActivationScope {
             decision: ActivationScopeDecision::Direct {
-                repository_id: repository.repository_id,
+                repository_id: repository.repository_id.clone(),
                 checkout_path: repository.checkout_paths[0].clone(),
             },
             allowed_repository_ids: members,
@@ -181,10 +181,10 @@ fn authorize_direct_session(fixture: &Fixture, agent_kind: &str, external_sessio
             &locator,
             &ActivationScope {
                 decision: ActivationScopeDecision::Direct {
-                    repository_id: fixture.repository_id,
+                    repository_id: fixture.repository_id.clone(),
                     checkout_path: fixture.checkout_path.clone(),
                 },
-                allowed_repository_ids: vec![fixture.repository_id],
+                allowed_repository_ids: vec![fixture.repository_id.clone()],
             },
             &catalog,
         )
@@ -3166,6 +3166,20 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
         }
         assert_eq!(reference_schema["properties"]["limitations"]["minItems"], 1);
         assert_eq!(
+            reference_schema["properties"]["repository_id"],
+            json!({
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$"
+            })
+        );
+        assert_eq!(
+            checkpoint_schema["properties"]["claims"]["items"]["properties"]["artifact_refs"]["items"]
+                ["properties"]["repository_id"],
+            reference_schema["properties"]["repository_id"]
+        );
+        assert_eq!(
             tools
                 .iter()
                 .find(|tool| tool["name"] == "association_explain")
@@ -3387,10 +3401,10 @@ fn authorization_states_cross_agent_and_busy_or_unsafe_storage_fail_identically(
             &ExternalSessionLocator::new("codex", "expired").unwrap(),
             &ActivationScope {
                 decision: ActivationScopeDecision::Direct {
-                    repository_id: expired.repository_id,
+                    repository_id: expired.repository_id.clone(),
                     checkout_path: expired.checkout_path.clone(),
                 },
-                allowed_repository_ids: vec![expired.repository_id],
+                allowed_repository_ids: vec![expired.repository_id.clone()],
             },
             &catalog,
         )
@@ -3815,8 +3829,16 @@ fn enabled_direct_and_group_sessions_can_investigate_other_registered_repositori
             }),
         )
     };
-    let first_reference = record(fixture.repository_id, &first_path, "first Repository");
-    let second_reference = record(second_repository_id, "src/lib.rs", "second Repository");
+    let first_reference = record(
+        fixture.repository_id.clone(),
+        &first_path,
+        "first Repository",
+    );
+    let second_reference = record(
+        second_repository_id.clone(),
+        "src/lib.rs",
+        "second Repository",
+    );
     assert_eq!(
         first_reference["result"]["isError"], false,
         "{first_reference:#}"
@@ -3945,7 +3967,7 @@ fn enabled_direct_and_group_sessions_can_investigate_other_registered_repositori
     let group = config
         .add_repository_group(
             &fs::canonicalize(&fixture.root).unwrap(),
-            &[fixture.repository_id],
+            std::slice::from_ref(&fixture.repository_id),
         )
         .unwrap()
         .repository_group;
@@ -3959,7 +3981,7 @@ fn enabled_direct_and_group_sessions_can_investigate_other_registered_repositori
                     repository_group_id: group.repository_group_id,
                     root_path: group.root_path,
                 },
-                allowed_repository_ids: vec![fixture.repository_id],
+                allowed_repository_ids: vec![fixture.repository_id.clone()],
             },
             &catalog,
         )

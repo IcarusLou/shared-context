@@ -324,7 +324,7 @@ fn event_count(root: &Path) -> usize {
 fn reference_input(
     context_id: ContextId,
     revision_id: RevisionId,
-    repository_id: sctx_domain::RepositoryId,
+    repository_id: &sctx_domain::RepositoryId,
     kind: ArtifactKind,
     relation: ReferenceRelation,
     locator: ArtifactLocator,
@@ -444,7 +444,7 @@ fn scan_record_rebuild_explain_and_task_pack_cross_two_repositories_and_a_worktr
         &reference_input(
             context_id,
             revision_id,
-            first_scan.repository_id,
+            &first_scan.repository_id,
             ArtifactKind::File,
             ReferenceRelation::Implements,
             ArtifactLocator::File {
@@ -591,8 +591,8 @@ fn public_mcp_artifact_focus_is_query_scoped_across_six_kinds_and_hot_path() {
             .repository
             .repository_id
     });
-    let members = std::iter::once(main_id)
-        .chain(cross_ids.iter().copied())
+    let members = std::iter::once(main_id.clone())
+        .chain(cross_ids.iter().cloned())
         .collect::<Vec<_>>();
     config
         .add_repository_group(&fs::canonicalize(temporary.path()).unwrap(), &members)
@@ -630,7 +630,7 @@ fn public_mcp_artifact_focus_is_query_scoped_across_six_kinds_and_hot_path() {
             &reference_input(
                 context_id,
                 revision_id,
-                main_id,
+                &main_id,
                 kind,
                 reference_relation(kind),
                 artifact.locator.clone(),
@@ -639,7 +639,7 @@ fn public_mcp_artifact_focus_is_query_scoped_across_six_kinds_and_hot_path() {
         .unwrap();
         cases.push(FocusCase {
             repository_path: main_repository.clone(),
-            repository_id: main_id,
+            repository_id: main_id.clone(),
             context_id,
             locator: artifact.locator.clone(),
         });
@@ -662,7 +662,7 @@ fn public_mcp_artifact_focus_is_query_scoped_across_six_kinds_and_hot_path() {
             &reference_input(
                 context_id,
                 revision_id,
-                repository_id,
+                &repository_id,
                 ArtifactKind::Symbol,
                 ReferenceRelation::Implements,
                 artifact.locator.clone(),
@@ -1131,7 +1131,7 @@ fn reference_recording_is_concurrent_private_and_rejects_unsafe_or_incomplete_in
     let mut incomplete = reference_input(
         context_id,
         revision_id,
-        scan.repository_id,
+        &scan.repository_id,
         ArtifactKind::File,
         ReferenceRelation::Implements,
         ArtifactLocator::File {
@@ -1155,7 +1155,7 @@ fn reference_recording_is_concurrent_private_and_rejects_unsafe_or_incomplete_in
         let mut input = reference_input(
             context_id,
             revision_id,
-            scan.repository_id,
+            &scan.repository_id,
             ArtifactKind::File,
             ReferenceRelation::Implements,
             ArtifactLocator::File {
@@ -1221,7 +1221,7 @@ fn ambiguous_and_unavailable_explanations_never_choose_and_graph_failure_degrade
     let ambiguous_input = reference_input(
         context_id,
         revision_id,
-        scan.repository_id,
+        &scan.repository_id,
         ArtifactKind::Symbol,
         ReferenceRelation::Defines,
         locator,

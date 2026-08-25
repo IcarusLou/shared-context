@@ -248,7 +248,8 @@ fn symbol_locator(name: &str) -> ArtifactLocator {
 }
 
 fn symbol_artifact(repository: &RepositoryIdentity, name: &str) -> SnapshotArtifact {
-    let artifact_key = ArtifactKey::derive(repository.repository_id, symbol_locator(name)).unwrap();
+    let artifact_key =
+        ArtifactKey::derive(repository.repository_id.clone(), symbol_locator(name)).unwrap();
     SnapshotArtifact {
         artifact: EngineeringArtifact {
             repository: repository.clone(),
@@ -277,7 +278,7 @@ fn reference(
         revision_id,
         reference: EngineeringReference {
             reference_id: ReferenceId::new(),
-            repository_id: repository.repository_id,
+            repository_id: repository.repository_id.clone(),
             artifact_kind: ArtifactKind::Symbol,
             relation: ReferenceRelation::Implements,
             locator: symbol_locator(symbol),
@@ -303,7 +304,7 @@ fn snapshot(
         .into_iter()
         .collect();
     RepositoryScanOutcome::Available(RepositorySnapshot {
-        repository_id: repository.repository_id,
+        repository_id: repository.repository_id.clone(),
         source_policy: SnapshotSourcePolicy::PlannedPathsWithSafeTrackedModifications,
         policy_version: "planned-paths-plus-safe-tracked-modifications-v2",
         head_tree_oid: "repo-tree".to_owned(),
@@ -489,7 +490,7 @@ fn exact_graph_priority_reaches_cross_end_contexts_in_two_cycle_safe_hops() {
     let engine =
         SearchEngine::with_engineering_graph(fixture.index.clone(), fixture.graph_store.clone());
     let request = task_request(
-        fixture.repository.repository_id,
+        fixture.repository.repository_id.clone(),
         ContextPackMode::AutomaticInjection,
         12_000,
     );
@@ -640,7 +641,7 @@ fn focus_pack_unions_hint_text_with_graph_without_persisting_focus_or_hint_state
     let engine =
         SearchEngine::with_engineering_graph(fixture.index.clone(), fixture.graph_store.clone());
     let mut focused = task_request(
-        fixture.repository.repository_id,
+        fixture.repository.repository_id.clone(),
         ContextPackMode::AutomaticInjection,
         20_000,
     );
@@ -757,7 +758,7 @@ fn identical_locator_in_two_repositories_retrieves_only_focused_repository_conte
         .unwrap();
     let engine = SearchEngine::with_engineering_graph(fixture.index, fixture.graph_store);
     let mut request = task_request(
-        second_repository.repository_id,
+        second_repository.repository_id.clone(),
         ContextPackMode::AutomaticInjection,
         12_000,
     );
@@ -810,7 +811,7 @@ fn generic_test_outcome_never_matches_qualified_test_artifact() {
         revision_id: fixture.source_revision,
         reference: EngineeringReference {
             reference_id: ReferenceId::new(),
-            repository_id: fixture.repository.repository_id,
+            repository_id: fixture.repository.repository_id.clone(),
             artifact_kind: ArtifactKind::Test,
             relation: ReferenceRelation::Validates,
             locator: locator.clone(),
@@ -821,8 +822,11 @@ fn generic_test_outcome_never_matches_qualified_test_artifact() {
     let artifact = SnapshotArtifact {
         artifact: EngineeringArtifact {
             repository: fixture.repository.clone(),
-            artifact_key: ArtifactKey::derive(fixture.repository.repository_id, locator.clone())
-                .unwrap(),
+            artifact_key: ArtifactKey::derive(
+                fixture.repository.repository_id.clone(),
+                locator.clone(),
+            )
+            .unwrap(),
             display_name: "search::returns_results".to_owned(),
         },
         snapshot_generation: "test-outcome".to_owned(),
@@ -852,7 +856,7 @@ fn generic_test_outcome_never_matches_qualified_test_artifact() {
         .unwrap();
     let engine = SearchEngine::with_engineering_graph(fixture.index, fixture.graph_store);
     let mut request = task_request(
-        fixture.repository.repository_id,
+        fixture.repository.repository_id.clone(),
         ContextPackMode::AutomaticInjection,
         8_000,
     );
@@ -883,7 +887,7 @@ fn context_tree_mismatch_preserves_historical_graph_while_unavailable_artifacts_
         SearchEngine::with_engineering_graph(fixture.index.clone(), fixture.graph_store.clone());
     let mismatched = engine
         .task_context_pack(&task_request(
-            fixture.repository.repository_id,
+            fixture.repository.repository_id.clone(),
             ContextPackMode::AutomaticInjection,
             8_000,
         ))
@@ -924,7 +928,7 @@ fn context_tree_mismatch_preserves_historical_graph_while_unavailable_artifacts_
         .resolve(
             std::slice::from_ref(&fixture.reference),
             &[RepositoryScanOutcome::Unavailable {
-                repository_id: fixture.repository.repository_id,
+                repository_id: fixture.repository.repository_id.clone(),
                 reason: "checkout is offline".to_owned(),
             }],
             &fixture.context_snapshots,
@@ -937,7 +941,7 @@ fn context_tree_mismatch_preserves_historical_graph_while_unavailable_artifacts_
         .unwrap();
     let fallback = engine
         .task_context_pack(&task_request(
-            fixture.repository.repository_id,
+            fixture.repository.repository_id.clone(),
             ContextPackMode::AutomaticInjection,
             8_000,
         ))
@@ -965,7 +969,7 @@ fn context_tree_mismatch_preserves_historical_graph_while_unavailable_artifacts_
     );
 
     let mut diagnostic_request = task_request(
-        fixture.repository.repository_id,
+        fixture.repository.repository_id.clone(),
         ContextPackMode::Explicit,
         8_000,
     );
@@ -1011,7 +1015,7 @@ fn historical_graph_revision_survives_append_new_revision_withdraw_and_index_reb
             fixture.source_context,
             fixture.source_revision,
             EngineeringReferenceDraft {
-                repository_id: fixture.repository.repository_id,
+                repository_id: fixture.repository.repository_id.clone(),
                 artifact_kind: ArtifactKind::Symbol,
                 relation: ReferenceRelation::Implements,
                 locator: symbol_locator("SearchSymbol"),
@@ -1050,7 +1054,7 @@ fn historical_graph_revision_survives_append_new_revision_withdraw_and_index_reb
     let engine =
         SearchEngine::with_engineering_graph(fixture.index.clone(), fixture.graph_store.clone());
     let mut collision_request = task_request(
-        fixture.repository.repository_id,
+        fixture.repository.repository_id.clone(),
         ContextPackMode::AutomaticInjection,
         20_000,
     );
@@ -1405,7 +1409,7 @@ fn build_time_candidate_incomplete_and_conflicted_contexts_never_cross_automatic
         (conflict_context, "ConflictSymbol"),
     ] {
         let mut automatic = task_request(
-            repository.repository_id,
+            repository.repository_id.clone(),
             ContextPackMode::AutomaticInjection,
             8_000,
         );
@@ -1478,7 +1482,7 @@ fn ambiguous_edges_are_explicit_diagnostics_only_and_never_raise_automatic_eligi
         .unwrap();
     let engine = SearchEngine::with_engineering_graph(fixture.index, fixture.graph_store);
     let mut request = task_request(
-        fixture.repository.repository_id,
+        fixture.repository.repository_id.clone(),
         ContextPackMode::Explicit,
         12_000,
     );
@@ -1536,7 +1540,7 @@ fn graph_paths_remain_budgeted_and_top_k_deterministic() {
     let fixture = graph_fixture();
     let engine = SearchEngine::with_engineering_graph(fixture.index, fixture.graph_store);
     let mut request = task_request(
-        fixture.repository.repository_id,
+        fixture.repository.repository_id.clone(),
         ContextPackMode::AutomaticInjection,
         900,
     );
@@ -1565,7 +1569,7 @@ fn exact_file_signal_uses_repository_relative_path_locator() {
         path: RepoRelativePath::new("src/search.ts").unwrap(),
     };
     let artifact_key =
-        ArtifactKey::derive(fixture.repository.repository_id, locator.clone()).unwrap();
+        ArtifactKey::derive(fixture.repository.repository_id.clone(), locator.clone()).unwrap();
     let file = SnapshotArtifact {
         artifact: EngineeringArtifact {
             repository: fixture.repository.clone(),
@@ -1586,7 +1590,7 @@ fn exact_file_signal_uses_repository_relative_path_locator() {
         revision_id: fixture.source_revision,
         reference: EngineeringReference {
             reference_id: ReferenceId::new(),
-            repository_id: fixture.repository.repository_id,
+            repository_id: fixture.repository.repository_id.clone(),
             artifact_kind: ArtifactKind::File,
             relation: ReferenceRelation::Implements,
             locator: locator.clone(),
@@ -1609,12 +1613,12 @@ fn exact_file_signal_uses_repository_relative_path_locator() {
         .unwrap();
     let engine = SearchEngine::with_engineering_graph(fixture.index, fixture.graph_store);
     let mut request = task_request(
-        fixture.repository.repository_id,
+        fixture.repository.repository_id.clone(),
         ContextPackMode::AutomaticInjection,
         8_000,
     );
     request.resolved_focus = Some(resolved_focus(
-        fixture.repository.repository_id,
+        fixture.repository.repository_id.clone(),
         locator.clone(),
     ));
     let pack = engine.task_context_pack(&request).unwrap();

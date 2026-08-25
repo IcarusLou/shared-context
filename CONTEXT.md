@@ -165,11 +165,15 @@ A typed, resolvable provenance target for an engineering claim, such as immutabl
 _Avoid_: evidence string, unverified reference
 
 **RepositoryCatalog**:
-The local explicit record of logical Repository identities and their configured checkout or worktree locations. It is authoritative for RepositoryId assignment but never routes a Workspace or Task to a ContextSpace.
+The local explicit binding from team-stable RepositoryIds to this installation’s checkout or worktree locations. It is authoritative for local path ownership but never assigns identity or routes a Workspace or Task to a ContextSpace.
 _Avoid_: repository discovery, Workspace binding, team registry
 
+**RepositoryId**:
+A user-visible, exact-case ASCII name shared by a team for one logical source repository, such as `Android`, `iOS`, or `FE`. Paths, remotes, and local checkout names never derive or normalize it.
+_Avoid_: generated repository UUID, repository URL, local path alias
+
 **RepositoryIdentity**:
-A stable identity for one logical source repository across its configured checkouts and worktrees in one local installation. Paths, basenames, remotes, common parents, branches, and Commits never create or merge this identity.
+A stable RepositoryId for one logical source repository across team members’ configured checkouts and worktrees. Paths, basenames, remotes, common parents, branches, and Commits never create or merge this identity.
 _Avoid_: checkout path, repository URL as identity, inferred repository identity
 
 **RepositoryGroup**:

@@ -667,6 +667,7 @@ name = "sctx-scenario-runner"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
+ "sctx-domain",
  "sctx-local-state",
  "sctx-scenario-contract",
  "serde",

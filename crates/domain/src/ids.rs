@@ -1,4 +1,4 @@
-use std::{error, fmt, str::FromStr};
+use std::{error, fmt, str::FromStr, sync::Arc};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha2::{Digest, Sha256};
@@ -28,6 +28,13 @@ impl IdParseError {
 
 impl fmt::Display for IdParseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.expected_prefix.is_empty() {
+            return write!(
+                formatter,
+                "expected a Repository ID of 1..64 ASCII bytes matching [A-Za-z][A-Za-z0-9._-]*: {}",
+                self.message
+            );
+        }
         write!(
             formatter,
             "expected {} followed by a canonical RFC 4122 UUIDv4: {}",
@@ -121,11 +128,107 @@ macro_rules! opaque_id {
 }
 
 opaque_id!(SpaceId, "spc_", "Opaque identity of a `ContextSpace`.");
-opaque_id!(
-    RepositoryId,
-    "rpo_",
-    "Opaque identity of one logical source repository."
-);
+
+/// Maximum encoded length of one user-visible [`RepositoryId`].
+pub const REPOSITORY_ID_MAX_BYTES: usize = 64;
+
+/// JSON Schema-compatible pattern for one user-visible [`RepositoryId`].
+pub const REPOSITORY_ID_PATTERN: &str = r"^[A-Za-z][A-Za-z0-9._-]{0,63}$";
+
+/// User-visible, team-stable identity of one logical source repository.
+///
+/// The exact ASCII spelling is the identity: `Android` and `android` are
+/// distinct. Clones share one bounded immutable string allocation.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RepositoryId(Arc<str>);
+
+impl RepositoryId {
+    /// Creates a unique syntactically valid identity for internal fixtures.
+    ///
+    /// Product Catalog creation requires an explicit user-supplied identity;
+    /// this constructor is retained for deterministic domain seam tests.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::from(format!("Repository-{}", Uuid::new_v4())))
+    }
+
+    /// Returns the exact user-visible spelling.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for RepositoryId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for RepositoryId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("RepositoryId")
+            .field(&self.as_str())
+            .finish()
+    }
+}
+
+impl fmt::Display for RepositoryId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for RepositoryId {
+    type Err = IdParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let bytes = value.as_bytes();
+        if bytes.is_empty() {
+            return Err(IdParseError::new("", "value is empty"));
+        }
+        if bytes.len() > REPOSITORY_ID_MAX_BYTES {
+            return Err(IdParseError::new("", "value exceeds 64 bytes"));
+        }
+        if !bytes[0].is_ascii_alphabetic() {
+            return Err(IdParseError::new(
+                "",
+                "the first byte must be an ASCII letter",
+            ));
+        }
+        if let Some(byte) = bytes[1..]
+            .iter()
+            .find(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')))
+        {
+            return Err(IdParseError::new(
+                "",
+                format!("byte 0x{byte:02x} is not allowed"),
+            ));
+        }
+        Ok(Self(Arc::from(value)))
+    }
+}
+
+impl Serialize for RepositoryId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for RepositoryId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(de::Error::custom)
+    }
+}
+
 opaque_id!(
     RepositoryGroupId,
     "rpg_",
@@ -297,6 +400,56 @@ mod tests {
     }
 
     #[test]
+    fn repository_ids_are_bounded_readable_exact_and_legacy_compatible() {
+        assert!(
+            std::mem::size_of::<RepositoryId>() <= 2 * std::mem::size_of::<usize>(),
+            "RepositoryId must remain a compact shared string handle"
+        );
+        for value in [
+            "Android",
+            "iOS",
+            "FE",
+            "server.api_v2",
+            "rpo_00000000-0000-4000-8000-000000000901",
+        ] {
+            let id = RepositoryId::from_str(value).unwrap();
+            assert_eq!(id.as_str(), value);
+            assert_eq!(id.to_string(), value);
+            assert_eq!(serde_json::to_string(&id).unwrap(), format!("\"{value}\""));
+            assert_eq!(
+                serde_json::from_str::<RepositoryId>(&format!("\"{value}\"")).unwrap(),
+                id
+            );
+        }
+        assert_ne!(
+            RepositoryId::from_str("Android").unwrap(),
+            RepositoryId::from_str("android").unwrap()
+        );
+        let mut sorted = [
+            RepositoryId::from_str("Server").unwrap(),
+            RepositoryId::from_str("FE").unwrap(),
+            RepositoryId::from_str("Android").unwrap(),
+        ];
+        sorted.sort();
+        assert_eq!(
+            sorted.map(|repository_id| repository_id.to_string()),
+            ["Android", "FE", "Server"]
+        );
+        for value in [
+            "",
+            "1Android",
+            "Android/iOS",
+            "Android iOS",
+            "Android\\iOS",
+            "安卓",
+        ] {
+            assert!(RepositoryId::from_str(value).is_err(), "accepted {value:?}");
+        }
+        assert!(RepositoryId::from_str(&format!("A{}", "x".repeat(63))).is_ok());
+        assert!(RepositoryId::from_str(&format!("A{}", "x".repeat(64))).is_err());
+    }
+
+    #[test]
     fn every_domain_id_type_uses_its_stable_prefix_and_uuid_v4() {
         macro_rules! assert_generated_id {
             ($id:expr, $prefix:literal) => {{
@@ -308,7 +461,9 @@ mod tests {
         }
 
         assert_generated_id!(SpaceId::new(), "spc_");
-        assert_generated_id!(RepositoryId::new(), "rpo_");
+        let repository_id = RepositoryId::new();
+        assert!(repository_id.to_string().starts_with("Repository-"));
+        assert!(RepositoryId::from_str(repository_id.as_str()).is_ok());
         assert_generated_id!(RepositoryGroupId::new(), "rpg_");
         assert_generated_id!(ReferenceId::new(), "ref_");
         assert_generated_id!(TaskId::new(), "tsk_");

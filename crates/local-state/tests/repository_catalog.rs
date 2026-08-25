@@ -78,11 +78,11 @@ fn catalog_assigns_typed_ids_atomically_and_supports_explicit_worktrees() {
             .repository
             .repository_id
             .to_string()
-            .starts_with("rpo_")
+            .starts_with("Repository-")
     );
     let extended = config
         .add_repository(
-            Some(created.repository.repository_id),
+            Some(created.repository.repository_id.clone()),
             std::slice::from_ref(&worktree),
         )
         .unwrap();
@@ -142,7 +142,11 @@ fn cross_workspace_resolution_is_stable_isolated_and_rejects_unsafe_paths() {
     let catalog = config.repository_catalog().unwrap();
     let cross = fs::canonicalize(cross).unwrap();
 
-    for (repository, expected_id) in [(&fe, fe_id), (&android, android_id), (&ios, ios_id)] {
+    for (repository, expected_id) in [
+        (&fe, fe_id.clone()),
+        (&android, android_id.clone()),
+        (&ios, ios_id.clone()),
+    ] {
         let file = repository.join("src/search/Search.kt");
         for workspace in [&cross, repository, &repository.join("src")] {
             let resolved = catalog
@@ -409,10 +413,12 @@ fn activation_scope_is_direct_group_or_disabled_only_at_explicit_boundaries() {
         .repository_id;
     let cross = fs::canonicalize(cross).unwrap();
     let cross_group = config
-        .add_repository_group(&cross, &[ios_id, android_id])
+        .add_repository_group(&cross, &[ios_id.clone(), android_id.clone()])
         .unwrap()
         .repository_group;
-    config.add_repository_group(&outer, &[nested_id]).unwrap();
+    config
+        .add_repository_group(&outer, std::slice::from_ref(&nested_id))
+        .unwrap();
 
     let catalog = config.repository_catalog().unwrap();
     let direct = catalog
@@ -425,7 +431,7 @@ fn activation_scope_is_direct_group_or_disabled_only_at_explicit_boundaries() {
             ref checkout_path,
         } if repository_id == android_id && checkout_path == &android
     ));
-    assert_eq!(direct.allowed_repository_ids, vec![android_id]);
+    assert_eq!(direct.allowed_repository_ids, vec![android_id.clone()]);
 
     let nested_direct = catalog
         .resolve_activation_scope(&nested.join("src/search"))
@@ -437,7 +443,10 @@ fn activation_scope_is_direct_group_or_disabled_only_at_explicit_boundaries() {
             ref checkout_path,
         } if repository_id == nested_id && checkout_path == &nested
     ));
-    assert_eq!(nested_direct.allowed_repository_ids, vec![nested_id]);
+    assert_eq!(
+        nested_direct.allowed_repository_ids,
+        vec![nested_id.clone()]
+    );
 
     let direct_precedes_exact_group = catalog.resolve_activation_scope(&outer).unwrap();
     assert!(matches!(
@@ -447,7 +456,7 @@ fn activation_scope_is_direct_group_or_disabled_only_at_explicit_boundaries() {
     ));
     assert_eq!(
         direct_precedes_exact_group.allowed_repository_ids,
-        vec![outer_id]
+        vec![outer_id.clone()]
     );
 
     let group = catalog.resolve_activation_scope(&cross).unwrap();
@@ -458,12 +467,14 @@ fn activation_scope_is_direct_group_or_disabled_only_at_explicit_boundaries() {
             ref root_path,
         } if repository_group_id == cross_group.repository_group_id && root_path == &cross
     ));
-    let expected_members = [android_id, ios_id].into_iter().collect::<BTreeSet<_>>();
+    let expected_members = [android_id.clone(), ios_id.clone()]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     assert_eq!(
         group
             .allowed_repository_ids
             .iter()
-            .copied()
+            .cloned()
             .collect::<BTreeSet<_>>(),
         expected_members
     );
@@ -514,7 +525,7 @@ fn repository_groups_reject_unsafe_roots_unknown_or_ineligible_members_and_drift
     );
     assert_eq!(
         config
-            .add_repository_group(&root, &[member_id, member_id])
+            .add_repository_group(&root, &[member_id.clone(), member_id.clone()])
             .unwrap_err()
             .kind(),
         ErrorKind::InvalidInput
@@ -535,7 +546,7 @@ fn repository_groups_reject_unsafe_roots_unknown_or_ineligible_members_and_drift
     );
     assert_eq!(
         config
-            .add_repository_group(&member, &[member_id])
+            .add_repository_group(&member, std::slice::from_ref(&member_id))
             .unwrap_err()
             .kind(),
         ErrorKind::InvalidInput,
@@ -543,7 +554,7 @@ fn repository_groups_reject_unsafe_roots_unknown_or_ineligible_members_and_drift
     );
     assert_eq!(
         config
-            .add_repository_group(&root.join("member-a/.."), &[member_id])
+            .add_repository_group(&root.join("member-a/.."), std::slice::from_ref(&member_id))
             .unwrap_err()
             .kind(),
         ErrorKind::InvalidInput
@@ -552,7 +563,7 @@ fn repository_groups_reject_unsafe_roots_unknown_or_ineligible_members_and_drift
     fs::write(&file_root, "fixture").unwrap();
     assert_eq!(
         config
-            .add_repository_group(&file_root, &[member_id])
+            .add_repository_group(&file_root, std::slice::from_ref(&member_id))
             .unwrap_err()
             .kind(),
         ErrorKind::InvalidInput
@@ -563,14 +574,16 @@ fn repository_groups_reject_unsafe_roots_unknown_or_ineligible_members_and_drift
         std::os::unix::fs::symlink(&root, &symlink_root).unwrap();
         assert_eq!(
             config
-                .add_repository_group(&symlink_root, &[member_id])
+                .add_repository_group(&symlink_root, std::slice::from_ref(&member_id))
                 .unwrap_err()
                 .kind(),
             ErrorKind::InvalidInput
         );
     }
 
-    let created = config.add_repository_group(&root, &[member_id]).unwrap();
+    let created = config
+        .add_repository_group(&root, std::slice::from_ref(&member_id))
+        .unwrap();
     assert!(created.created);
     assert!(
         created
@@ -579,7 +592,9 @@ fn repository_groups_reject_unsafe_roots_unknown_or_ineligible_members_and_drift
             .to_string()
             .starts_with("rpg_")
     );
-    let retry = config.add_repository_group(&root, &[member_id]).unwrap();
+    let retry = config
+        .add_repository_group(&root, std::slice::from_ref(&member_id))
+        .unwrap();
     assert!(!retry.created);
     assert_eq!(
         retry.repository_group.repository_group_id,
@@ -587,7 +602,7 @@ fn repository_groups_reject_unsafe_roots_unknown_or_ineligible_members_and_drift
     );
     assert_eq!(
         config
-            .add_repository_group(&root, &[member_id, second_member_id])
+            .add_repository_group(&root, &[member_id.clone(), second_member_id])
             .unwrap_err()
             .kind(),
         ErrorKind::InvalidInput,
@@ -671,7 +686,10 @@ fn repository_group_inspection_update_and_remove_repair_drift_without_touching_r
         .repository
         .repository_id;
     config
-        .add_repository(Some(first_id), std::slice::from_ref(&replacement_first))
+        .add_repository(
+            Some(first_id.clone()),
+            std::slice::from_ref(&replacement_first),
+        )
         .unwrap();
     let second_id = config
         .add_repository(None, std::slice::from_ref(&second))
@@ -679,10 +697,13 @@ fn repository_group_inspection_update_and_remove_repair_drift_without_touching_r
         .repository
         .repository_id;
     config
-        .add_repository(Some(second_id), std::slice::from_ref(&replacement_second))
+        .add_repository(
+            Some(second_id.clone()),
+            std::slice::from_ref(&replacement_second),
+        )
         .unwrap();
     let group = config
-        .add_repository_group(&original_root, &[first_id])
+        .add_repository_group(&original_root, std::slice::from_ref(&first_id))
         .unwrap()
         .repository_group;
 
@@ -725,7 +746,7 @@ fn repository_group_inspection_update_and_remove_repair_drift_without_touching_r
         .update_repository_group(
             group.repository_group_id,
             Some(&replacement_root),
-            Some(&[first_id, second_id]),
+            Some(&[first_id.clone(), second_id.clone()]),
         )
         .unwrap();
     assert!(updated.changed);
@@ -735,9 +756,9 @@ fn repository_group_inspection_update_and_remove_repair_drift_without_touching_r
             .repository_group
             .member_repository_ids
             .iter()
-            .copied()
+            .cloned()
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from([first_id, second_id])
+        BTreeSet::from([first_id.clone(), second_id.clone()])
     );
     let retry = config
         .update_repository_group(
@@ -781,10 +802,10 @@ fn activation_scope_absolute_paths_are_local_decision_metadata() {
     let repository_id = RepositoryId::new();
     let scope = ActivationScope {
         decision: ActivationScopeDecision::Direct {
-            repository_id,
+            repository_id: repository_id.clone(),
             checkout_path: checkout.clone(),
         },
-        allowed_repository_ids: vec![repository_id],
+        allowed_repository_ids: vec![repository_id.clone()],
     };
     let serialized = serde_json::to_value(scope).unwrap();
     let top_level = serialized.as_object().unwrap();
@@ -818,7 +839,7 @@ fn activation_scope_absolute_paths_are_local_decision_metadata() {
             repository_group_id,
             root_path: checkout.clone(),
         },
-        allowed_repository_ids: vec![repository_id],
+        allowed_repository_ids: vec![repository_id.clone()],
     };
     let serialized_group = serde_json::to_value(group_scope).unwrap();
     let group_decision = serialized_group["decision"].as_object().unwrap();
@@ -883,13 +904,13 @@ fn activation_scope_without_git_child() {
     let repository_group_id = RepositoryGroupId::new();
     let catalog = RepositoryCatalogSnapshot {
         repositories: vec![RepositoryCatalogEntry {
-            repository_id,
+            repository_id: repository_id.clone(),
             checkout_paths: vec![checkout.clone()],
         }],
         repository_groups: vec![RepositoryGroupCatalogEntry {
             repository_group_id,
             root_path: group_root.clone(),
-            member_repository_ids: vec![repository_id],
+            member_repository_ids: vec![repository_id.clone()],
         }],
     };
 
@@ -932,6 +953,7 @@ fn concurrent_repository_group_add_is_atomic_and_semantically_idempotent() {
         let barrier = Arc::clone(&barrier);
         let config = config.clone();
         let root = root.clone();
+        let member_id = member_id.clone();
         workers.push(thread::spawn(move || {
             barrier.wait();
             config.add_repository_group(&root, &[member_id]).unwrap()

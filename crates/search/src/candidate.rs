@@ -353,7 +353,7 @@ fn add_graph_channel(
         .collect::<BTreeMap<_, _>>();
     let mut ranked = Vec::new();
     for artifact in artifacts {
-        let key = ArtifactKey::derive(artifact.repository_id, artifact.locator.clone())?;
+        let key = ArtifactKey::derive(artifact.repository_id.clone(), artifact.locator.clone())?;
         for reference in &graph.projection.references {
             if reference.resolution.resolved_artifact.as_ref() != Some(&key)
                 || reference.association.is_none()

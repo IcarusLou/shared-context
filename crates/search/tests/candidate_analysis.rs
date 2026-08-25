@@ -718,7 +718,8 @@ fn exact_artifact_graph_reaches_cross_end_space_with_frozen_generation() {
         repository_id: RepositoryId::new(),
         canonical_name: "candidate-graph".to_owned(),
     };
-    let artifact_key = ArtifactKey::derive(repository.repository_id, symbol_locator()).unwrap();
+    let artifact_key =
+        ArtifactKey::derive(repository.repository_id.clone(), symbol_locator()).unwrap();
     let artifact = SnapshotArtifact {
         artifact: EngineeringArtifact {
             repository: repository.clone(),
@@ -739,7 +740,7 @@ fn exact_artifact_graph_reaches_cross_end_space_with_frozen_generation() {
         revision_id: source.revision_id,
         reference: EngineeringReference {
             reference_id: ReferenceId::new(),
-            repository_id: repository.repository_id,
+            repository_id: repository.repository_id.clone(),
             artifact_kind: ArtifactKind::Symbol,
             relation: ReferenceRelation::Implements,
             locator: symbol_locator(),
@@ -756,7 +757,7 @@ fn exact_artifact_graph_reaches_cross_end_space_with_frozen_generation() {
         .resolve(
             std::slice::from_ref(&reference),
             &[RepositoryScanOutcome::Available(RepositorySnapshot {
-                repository_id: repository.repository_id,
+                repository_id: repository.repository_id.clone(),
                 source_policy: SnapshotSourcePolicy::PlannedPathsWithSafeTrackedModifications,
                 policy_version: "planned-paths-plus-safe-tracked-modifications-v2",
                 head_tree_oid: "candidate-graph-tree".to_owned(),
@@ -789,7 +790,7 @@ fn exact_artifact_graph_reaches_cross_end_space_with_frozen_generation() {
             candidate,
             explicit_related_contexts: Vec::new(),
             artifact_refs: vec![ArtifactRef {
-                repository_id: repository.repository_id,
+                repository_id: repository.repository_id.clone(),
                 locator: symbol_locator(),
             }],
             token_budget: 8_000,

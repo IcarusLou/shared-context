@@ -207,9 +207,9 @@ fn setup_foundation() -> FoundationFixture {
 }
 
 fn repository_alias(
-    repository_id: RepositoryId,
-    outer_repository_id: RepositoryId,
-    nested_repository_id: RepositoryId,
+    repository_id: &RepositoryId,
+    outer_repository_id: &RepositoryId,
+    nested_repository_id: &RepositoryId,
 ) -> &'static str {
     if repository_id == outer_repository_id {
         "outer"
@@ -221,12 +221,12 @@ fn repository_alias(
 }
 
 fn normalized_scope(case: &str, scope: &ActivationScope, fixture: &FoundationFixture) -> Value {
-    let kind = match scope.decision {
+    let kind = match &scope.decision {
         ActivationScopeDecision::Direct { repository_id, .. } => {
             repository_alias(
                 repository_id,
-                fixture.outer_repository_id,
-                fixture.nested_repository_id,
+                &fixture.outer_repository_id,
+                &fixture.nested_repository_id,
             );
             "direct"
         }
@@ -234,7 +234,7 @@ fn normalized_scope(case: &str, scope: &ActivationScope, fixture: &FoundationFix
             repository_group_id,
             ..
         } => {
-            assert_eq!(repository_group_id, fixture.repository_group_id);
+            assert_eq!(*repository_group_id, fixture.repository_group_id);
             "group"
         }
         ActivationScopeDecision::Disabled => "disabled",
@@ -244,9 +244,9 @@ fn normalized_scope(case: &str, scope: &ActivationScope, fixture: &FoundationFix
         .iter()
         .map(|repository_id| {
             repository_alias(
-                *repository_id,
-                fixture.outer_repository_id,
-                fixture.nested_repository_id,
+                repository_id,
+                &fixture.outer_repository_id,
+                &fixture.nested_repository_id,
             )
         })
         .collect::<Vec<_>>();
@@ -254,12 +254,15 @@ fn normalized_scope(case: &str, scope: &ActivationScope, fixture: &FoundationFix
     json!({"case": case, "kind": kind, "allowed": allowed})
 }
 
-fn scope_for_repository(scope: &ActivationScope, expected: RepositoryId) {
+fn scope_for_repository(scope: &ActivationScope, expected: &RepositoryId) {
     assert!(matches!(
-        scope.decision,
+        &scope.decision,
         ActivationScopeDecision::Direct { repository_id, .. } if repository_id == expected
     ));
-    assert_eq!(scope.allowed_repository_ids, [expected]);
+    assert_eq!(
+        scope.allowed_repository_ids.as_slice(),
+        std::slice::from_ref(expected)
+    );
 }
 
 #[test]
@@ -274,8 +277,8 @@ fn fixed_cross_layer_oracle_closes_routing_group_lifecycle_and_no_scan_boundarie
     let nested = fixture.resolve(&fixture.nested_checkout.join("feature/deep"));
     let ancestor = fixture.resolve(&fixture.harness.home);
     let sibling = fixture.resolve(&fixture.sibling);
-    scope_for_repository(&outer, fixture.outer_repository_id);
-    scope_for_repository(&nested, fixture.nested_repository_id);
+    scope_for_repository(&outer, &fixture.outer_repository_id);
+    scope_for_repository(&nested, &fixture.nested_repository_id);
     let actual_routing = json!([
         normalized_scope("group_exact_root", &group, &fixture),
         normalized_scope("outer_checkout", &outer, &fixture),
@@ -457,9 +460,12 @@ fn fixed_cross_layer_oracle_closes_routing_group_lifecycle_and_no_scan_boundarie
             .catalog
             .repositories
             .iter()
-            .map(|repository| repository.repository_id)
+            .map(|repository| repository.repository_id.clone())
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from([fixture.outer_repository_id, fixture.nested_repository_id])
+        BTreeSet::from([
+            fixture.outer_repository_id.clone(),
+            fixture.nested_repository_id.clone(),
+        ])
     );
     assert_eq!(
         fs::read_to_string(moved_group_root.join("unregistered sibling/business.txt")).unwrap(),
@@ -544,7 +550,7 @@ fn fixed_lease_oracle_closes_privacy_identity_retry_ttl_and_stale_catalog_bounda
         store.read(&direct_locator, &catalog).unwrap(),
         AuthorizedSessionScopeRead::Current(scope)
             if scope.decision == AuthorizedSessionScopeDecision::Direct {
-                repository_id: fixture.nested_repository_id
+                repository_id: fixture.nested_repository_id.clone()
             }
     ));
     assert!(matches!(

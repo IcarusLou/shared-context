@@ -1663,7 +1663,14 @@ fn capture_step_variables(
 fn validate_captured_value(kind: VariableKind, value: &Value) -> Result<(), ()> {
     let prefix = match kind {
         VariableKind::SpaceId => Some("spc_"),
-        VariableKind::RepositoryId => Some("rpo_"),
+        VariableKind::RepositoryId => {
+            return value
+                .as_str()
+                .ok_or(())?
+                .parse::<sctx_domain::RepositoryId>()
+                .map(|_| ())
+                .map_err(|_| ());
+        }
         VariableKind::ReferenceId => Some("ref_"),
         VariableKind::TaskId => Some("tsk_"),
         VariableKind::TaskSessionId => Some("tss_"),
@@ -2279,7 +2286,26 @@ fn map_process_error(
 
 #[cfg(test)]
 mod tests {
-    use super::is_domain_id;
+    use sctx_scenario_contract::VariableKind;
+    use serde_json::json;
+
+    use super::{is_domain_id, validate_captured_value};
+
+    #[test]
+    fn captured_repository_identity_uses_the_readable_domain_contract() {
+        for value in ["Android", "iOS", "FE", "rpo_legacy"] {
+            assert!(
+                validate_captured_value(VariableKind::RepositoryId, &json!(value)).is_ok(),
+                "{value}"
+            );
+        }
+        for value in ["", "FE/mobile", "安卓"] {
+            assert!(
+                validate_captured_value(VariableKind::RepositoryId, &json!(value)).is_err(),
+                "{value}"
+            );
+        }
+    }
 
     #[test]
     fn repository_group_identity_is_recognized_without_flagging_business_text() {

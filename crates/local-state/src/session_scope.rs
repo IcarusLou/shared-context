@@ -82,7 +82,7 @@ impl AuthorizedSessionScope {
         let unique = self
             .allowed_repository_ids
             .iter()
-            .copied()
+            .cloned()
             .collect::<BTreeSet<_>>();
         if unique.len() != self.allowed_repository_ids.len()
             || !self
@@ -94,12 +94,13 @@ impl AuthorizedSessionScope {
                 "AuthorizedSessionScope Repository identities must be unique and sorted",
             ));
         }
-        match self.decision {
+        match &self.decision {
             AuthorizedSessionScopeDecision::Disabled if self.allowed_repository_ids.is_empty() => {
                 Ok(())
             }
             AuthorizedSessionScopeDecision::Direct { repository_id }
-                if self.allowed_repository_ids == [repository_id] =>
+                if self.allowed_repository_ids.as_slice()
+                    == std::slice::from_ref(repository_id) =>
             {
                 Ok(())
             }
@@ -791,17 +792,18 @@ fn validated_persisted_decision(
         ActivationScopeDecision::Direct {
             repository_id,
             checkout_path,
-        } if activation_scope.allowed_repository_ids == [*repository_id]
+        } if activation_scope.allowed_repository_ids.as_slice()
+            == std::slice::from_ref(repository_id)
             && catalog.repositories.iter().any(|repository| {
-                repository.repository_id == *repository_id
+                &repository.repository_id == repository_id
                     && repository.checkout_paths.contains(checkout_path)
             }) =>
         {
             Ok((
                 AuthorizedSessionScopeDecision::Direct {
-                    repository_id: *repository_id,
+                    repository_id: repository_id.clone(),
                 },
-                vec![*repository_id],
+                vec![repository_id.clone()],
             ))
         }
         ActivationScopeDecision::Group {
@@ -846,19 +848,19 @@ fn scope_matches_catalog(
     if scope.catalog_revision != catalog.revision()? {
         return Ok(false);
     }
-    Ok(match scope.decision {
+    Ok(match &scope.decision {
         AuthorizedSessionScopeDecision::Disabled => scope.allowed_repository_ids.is_empty(),
         AuthorizedSessionScopeDecision::Direct { repository_id } => {
-            scope.allowed_repository_ids == [repository_id]
+            scope.allowed_repository_ids.as_slice() == std::slice::from_ref(repository_id)
                 && catalog
                     .repositories
                     .iter()
-                    .any(|repository| repository.repository_id == repository_id)
+                    .any(|repository| &repository.repository_id == repository_id)
         }
         AuthorizedSessionScopeDecision::Group {
             repository_group_id,
         } => catalog.repository_groups.iter().any(|group| {
-            group.repository_group_id == repository_group_id
+            group.repository_group_id == *repository_group_id
                 && group.member_repository_ids == scope.allowed_repository_ids
                 && catalog_contains_repositories(catalog, &group.member_repository_ids)
         }),
@@ -873,7 +875,7 @@ fn catalog_contains_repositories(
         catalog
             .repositories
             .iter()
-            .any(|repository| repository.repository_id == *repository_id)
+            .any(|repository| &repository.repository_id == repository_id)
     })
 }
 
@@ -1050,13 +1052,13 @@ mod tests {
         (
             RepositoryCatalogSnapshot {
                 repositories: vec![RepositoryCatalogEntry {
-                    repository_id,
+                    repository_id: repository_id.clone(),
                     checkout_paths: vec!["/private/checkouts/member".into()],
                 }],
                 repository_groups: vec![RepositoryGroupCatalogEntry {
                     repository_group_id,
                     root_path: "/private/checkouts".into(),
-                    member_repository_ids: vec![repository_id],
+                    member_repository_ids: vec![repository_id.clone()],
                 }],
             },
             repository_id,
@@ -1064,18 +1066,18 @@ mod tests {
         )
     }
 
-    fn direct_scope(repository_id: RepositoryId) -> ActivationScope {
+    fn direct_scope(repository_id: &RepositoryId) -> ActivationScope {
         ActivationScope {
             decision: ActivationScopeDecision::Direct {
-                repository_id,
+                repository_id: repository_id.clone(),
                 checkout_path: "/private/checkouts/member".into(),
             },
-            allowed_repository_ids: vec![repository_id],
+            allowed_repository_ids: vec![repository_id.clone()],
         }
     }
 
     fn group_scope(
-        repository_id: RepositoryId,
+        repository_id: &RepositoryId,
         repository_group_id: RepositoryGroupId,
     ) -> ActivationScope {
         ActivationScope {
@@ -1083,7 +1085,7 @@ mod tests {
                 repository_group_id,
                 root_path: "/private/checkouts".into(),
             },
-            allowed_repository_ids: vec![repository_id],
+            allowed_repository_ids: vec![repository_id.clone()],
         }
     }
 
@@ -1172,7 +1174,7 @@ mod tests {
         let temporary = tempdir().unwrap();
         let store = Arc::new(AuthorizedSessionScopeStore::initialize(temporary.path()).unwrap());
         let (catalog, repository_id, _) = fixture_catalog();
-        let scope = direct_scope(repository_id);
+        let scope = direct_scope(&repository_id);
         let external = locator("same/session");
         let workers = 8;
         let barrier = Arc::new(Barrier::new(workers));
@@ -1241,7 +1243,7 @@ mod tests {
         assert!(store.try_read(&external, &catalog).is_err());
         assert!(
             store
-                .try_authorize_missing(&external, &direct_scope(repository_id), &catalog)
+                .try_authorize_missing(&external, &direct_scope(&repository_id), &catalog)
                 .is_err()
         );
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -1264,7 +1266,7 @@ mod tests {
         let preserve = locator("preserve-exact");
         for locator in [&remove, &preserve] {
             store
-                .authorize(locator, &direct_scope(repository_id), &catalog)
+                .authorize(locator, &direct_scope(&repository_id), &catalog)
                 .unwrap();
         }
         let lock = OpenOptions::new()
@@ -1297,7 +1299,7 @@ mod tests {
         let (catalog, repository_id, repository_group_id) = fixture_catalog();
         let external = locator("sticky-first");
         let direct = store
-            .try_authorize_missing(&external, &direct_scope(repository_id), &catalog)
+            .try_authorize_missing(&external, &direct_scope(&repository_id), &catalog)
             .unwrap();
         assert!(matches!(
             direct.decision,
@@ -1307,7 +1309,7 @@ mod tests {
         let retained = store
             .try_authorize_missing(
                 &external,
-                &group_scope(repository_id, repository_group_id),
+                &group_scope(&repository_id, repository_group_id),
                 &catalog,
             )
             .unwrap();
@@ -1328,7 +1330,7 @@ mod tests {
         let different = locator("shared-different");
         for external in [&same, &different] {
             store
-                .authorize(external, &direct_scope(repository_id), &catalog)
+                .authorize(external, &direct_scope(&repository_id), &catalog)
                 .unwrap();
         }
 
@@ -1374,7 +1376,7 @@ mod tests {
         let external = locator("shared-expired");
         let start = UNIX_EPOCH + Duration::from_secs(100);
         store
-            .authorize_at(&external, &direct_scope(repository_id), &catalog, start)
+            .authorize_at(&external, &direct_scope(&repository_id), &catalog, start)
             .unwrap();
         let expired = start + Duration::from_secs(3);
 
@@ -1407,13 +1409,13 @@ mod tests {
         let start = UNIX_EPOCH + Duration::from_secs(100);
         let expired = start + Duration::from_secs(3);
         store
-            .authorize_at(&expired_a, &direct_scope(repository_id), &catalog, start)
+            .authorize_at(&expired_a, &direct_scope(&repository_id), &catalog, start)
             .unwrap();
         assert!(
             store
                 .try_authorize_missing_at(
                     &expired_a,
-                    &direct_scope(repository_id),
+                    &direct_scope(&repository_id),
                     &catalog,
                     expired,
                 )
@@ -1425,7 +1427,7 @@ mod tests {
         );
 
         let authorized_b = store
-            .try_authorize_missing_at(&new_b, &direct_scope(repository_id), &catalog, expired)
+            .try_authorize_missing_at(&new_b, &direct_scope(&repository_id), &catalog, expired)
             .unwrap();
         assert!(matches!(
             authorized_b.decision,
@@ -1449,7 +1451,7 @@ mod tests {
             store
                 .try_authorize_missing_at(
                     &new_b,
-                    &direct_scope(repository_id),
+                    &direct_scope(&repository_id),
                     &changed_catalog,
                     expired,
                 )
@@ -1486,7 +1488,7 @@ mod tests {
         let external = locator("ttl");
         let start = UNIX_EPOCH + Duration::from_secs(100);
         store
-            .authorize_at(&external, &direct_scope(repository_id), &catalog, start)
+            .authorize_at(&external, &direct_scope(&repository_id), &catalog, start)
             .unwrap();
         assert!(matches!(
             store
@@ -1497,7 +1499,7 @@ mod tests {
         let retry = store
             .authorize_at(
                 &external,
-                &direct_scope(repository_id),
+                &direct_scope(&repository_id),
                 &catalog,
                 start + Duration::from_secs(1),
             )
@@ -1527,7 +1529,7 @@ mod tests {
                 repository_group_id,
                 root_path: "/private/checkouts".into(),
             },
-            allowed_repository_ids: vec![repository_id],
+            allowed_repository_ids: vec![repository_id.clone()],
         };
         store
             .authorize_at(&external, &group_scope, &catalog, start)
@@ -1535,7 +1537,7 @@ mod tests {
         let mut stale = catalog.clone();
         let replacement_repository_id = RepositoryId::new();
         stale.repositories.push(RepositoryCatalogEntry {
-            repository_id: replacement_repository_id,
+            repository_id: replacement_repository_id.clone(),
             checkout_paths: vec!["/private/checkouts/replacement".into()],
         });
         stale.repository_groups[0].member_repository_ids = vec![replacement_repository_id];
@@ -1573,7 +1575,7 @@ mod tests {
         let start = UNIX_EPOCH + Duration::from_secs(100);
         let expired = locator("expired");
         store
-            .authorize_at(&expired, &direct_scope(repository_id), &catalog, start)
+            .authorize_at(&expired, &direct_scope(&repository_id), &catalog, start)
             .unwrap();
 
         let corrupt = store.directory().join("scope-corrupt.json");
@@ -1628,7 +1630,7 @@ mod tests {
         )
         .unwrap();
         let (catalog, repository_id, _) = fixture_catalog();
-        let scope = direct_scope(repository_id);
+        let scope = direct_scope(&repository_id);
 
         let corrupt = locator("corrupt/exact");
         store.authorize(&corrupt, &scope, &catalog).unwrap();
@@ -1667,7 +1669,7 @@ mod tests {
         let (mut catalog, _, _) = fixture_catalog();
         let second_repository_id = RepositoryId::new();
         catalog.repositories.push(RepositoryCatalogEntry {
-            repository_id: second_repository_id,
+            repository_id: second_repository_id.clone(),
             checkout_paths: vec!["/private/checkouts/second-b".into()],
         });
         catalog.repositories[0]
@@ -1715,7 +1717,7 @@ mod tests {
         )
         .unwrap();
         let (catalog, repository_id, _) = fixture_catalog();
-        let scope = direct_scope(repository_id);
+        let scope = direct_scope(&repository_id);
         let first = locator("first");
         store.authorize(&first, &scope, &catalog).unwrap();
         assert!(
@@ -1729,10 +1731,10 @@ mod tests {
 
         let fabricated = ActivationScope {
             decision: ActivationScopeDecision::Direct {
-                repository_id,
+                repository_id: repository_id.clone(),
                 checkout_path: "/not/the/catalog/path".into(),
             },
-            allowed_repository_ids: vec![repository_id],
+            allowed_repository_ids: vec![repository_id.clone()],
         };
         assert!(store.authorize(&first, &fabricated, &catalog).is_err());
         assert!(

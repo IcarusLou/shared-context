@@ -26,12 +26,13 @@ use sctx_domain::{
     CandidateSpaceRecommendation, CaptureEvidenceRef, CaptureUnknown, CheckpointClaim,
     CheckpointClaimId, ContextId, ContextKind, ContextRevisionDraft, ContextRevisionRef,
     EngineeringReferenceDraft, Error, ErrorKind, EvidenceSnapshotDraft, EvidenceType,
-    ExternalSessionLocator, NormalizedWorkObservation, OptionalCandidateEdits, ReferenceId,
-    ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionStatus, ResolvedFocus, Result,
-    RevisionId, SignalId, SpaceId, SpaceRecommendationId, SubmissionId, TaskId,
-    TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignalKind, TaskSignalLifecycle,
-    TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId, WorkEpisodeStatus, WorkObservation,
-    WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
+    ExternalSessionLocator, NormalizedWorkObservation, OptionalCandidateEdits,
+    REPOSITORY_ID_MAX_BYTES, REPOSITORY_ID_PATTERN, ReferenceId, ReferenceRelation,
+    RepoRelativePath, RepositoryId, ResolutionStatus, ResolvedFocus, Result, RevisionId, SignalId,
+    SpaceId, SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId,
+    TaskSessionSnapshot, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord,
+    TaskSpaceAssociation, WorkEpisodeId, WorkEpisodeStatus, WorkObservation, WorkObservationId,
+    WorkSourceRef, WorkingIntentSnapshot,
 };
 use sctx_engineering_graph::{
     CandidateMatchEvidence, CatalogRepositorySpec, EngineeringProjectionStore,
@@ -2096,7 +2097,7 @@ impl Runtime {
                     && locator.checkout_path.exists()
             })
             .ok_or_else(|| invalid("configured Repository has no available local checkout"))?;
-        let plan = RepositoryScanPlan::new(registered.identity.repository_id, paths)?;
+        let plan = RepositoryScanPlan::new(registered.identity.repository_id.clone(), paths)?;
         let outcome = RepositoryScanner::default().scan(
             &registered.identity,
             &locator.checkout_path,
@@ -2126,7 +2127,7 @@ impl Runtime {
                 "revision {revision_id} does not belong to Context {context_id}"
             )));
         }
-        if self.repositories.resolve_by_id(repository_id)?.is_none() {
+        if self.repositories.resolve_by_id(&repository_id)?.is_none() {
             return Err(invalid(format!(
                 "Repository does not exist: {repository_id}"
             )));
@@ -2134,7 +2135,7 @@ impl Runtime {
         let event = Event::engineering_reference_recorded(
             context_id,
             revision_id,
-            input.draft(repository_id)?,
+            input.draft(repository_id.clone())?,
             None,
         )?;
         let reference_id = match event.payload() {
@@ -2264,7 +2265,7 @@ fn repository_scan_response(
                 .map(artifact_summary)
                 .collect::<Vec<_>>();
             RepositoryScanResponse {
-                repository_id: repository.identity.repository_id,
+                repository_id: repository.identity.repository_id.clone(),
                 canonical_name: repository.identity.canonical_name.clone(),
                 checkout_path: checkout_path.to_path_buf(),
                 status: "available".to_owned(),
@@ -2333,23 +2334,23 @@ fn scan_registered_repositories(
     let scanner = RepositoryScanner::default();
     let repositories = repositories
         .iter()
-        .map(|repository| (repository.identity.repository_id, repository))
+        .map(|repository| (repository.identity.repository_id.clone(), repository))
         .collect::<BTreeMap<_, _>>();
     let mut paths_by_repository = BTreeMap::<RepositoryId, Vec<RepoRelativePath>>::new();
     for reference in references {
         paths_by_repository
-            .entry(reference.reference.repository_id)
+            .entry(reference.reference.repository_id.clone())
             .or_default()
             .push(reference.reference.locator.path().clone());
     }
     let mut outcomes = Vec::with_capacity(paths_by_repository.len());
     let mut summaries = Vec::with_capacity(paths_by_repository.len());
     for (repository_id, paths) in paths_by_repository {
-        let plan = RepositoryScanPlan::new(repository_id, paths)?;
+        let plan = RepositoryScanPlan::new(repository_id.clone(), paths)?;
         let Some(repository) = repositories.get(&repository_id).copied() else {
             let reason = "Repository is not registered".to_owned();
             outcomes.push(RepositoryScanOutcome::Unavailable {
-                repository_id,
+                repository_id: repository_id.clone(),
                 reason: reason.clone(),
             });
             summaries.push(RepositoryRebuildSummary {
@@ -2371,13 +2372,13 @@ fn scan_registered_repositories(
             scanner.scan(&repository.identity, &locator.checkout_path, &plan)?
         } else {
             RepositoryScanOutcome::Unavailable {
-                repository_id: repository.identity.repository_id,
+                repository_id: repository.identity.repository_id.clone(),
                 reason: "Repository has no available registered checkout".to_owned(),
             }
         };
         let summary = match &outcome {
             RepositoryScanOutcome::Available(snapshot) => RepositoryRebuildSummary {
-                repository_id: snapshot.repository_id,
+                repository_id: snapshot.repository_id.clone(),
                 status: "available".to_owned(),
                 checkout_path: locator.map(|locator| locator.checkout_path.clone()),
                 planned_path_count: plan.paths().len(),
@@ -2389,7 +2390,7 @@ fn scan_registered_repositories(
                 repository_id,
                 reason,
             } => RepositoryRebuildSummary {
-                repository_id: *repository_id,
+                repository_id: repository_id.clone(),
                 status: "unavailable".to_owned(),
                 checkout_path: None,
                 planned_path_count: plan.paths().len(),
@@ -2479,7 +2480,7 @@ fn association_explain_response(
         context_id: projected.context_id,
         revision_id: projected.revision_id,
         reference_id: projected.reference_id,
-        repository_id: projected.resolution.repository_id,
+        repository_id: projected.resolution.repository_id.clone(),
         status: projected.resolution.status,
         resolved_artifact: projected.resolution.resolved_artifact.clone(),
         ambiguity_candidates: projected.resolution.candidates.clone(),
@@ -2898,7 +2899,7 @@ fn sync_repository_catalog_snapshot(
         .repositories
         .iter()
         .map(|repository| CatalogRepositorySpec {
-            repository_id: repository.repository_id,
+            repository_id: repository.repository_id.clone(),
             checkout_paths: repository.checkout_paths.clone(),
         })
         .collect::<Vec<_>>();
@@ -4431,7 +4432,7 @@ fn engineering_reference_record_schema() -> Value {
             "external_session_id": {"type": "string", "minLength": 1},
             "context_id": id_schema("ctx_"),
             "revision_id": id_schema("rev_"),
-            "repository_id": id_schema("rpo_"),
+            "repository_id": repository_id_schema(),
             "artifact_kind": {"type": "string", "enum": ["module", "file", "symbol", "api", "schema", "test"]},
             "relation": {"type": "string", "enum": ["implements", "defines", "consumes", "validates", "constrains", "depends_on"]},
             "locator": artifact_locator_input_schema(),
@@ -4608,7 +4609,7 @@ fn task_checkpoint_schema() -> Value {
     let artifact_ref = json!({
         "type": "object", "additionalProperties": false,
         "required": ["repository_id", "locator"],
-        "properties": {"repository_id": id_schema("rpo_"), "locator": artifact_locator_input_schema()}
+        "properties": {"repository_id": repository_id_schema(), "locator": artifact_locator_input_schema()}
     });
     let claim = json!({
         "type": "object", "additionalProperties": false,
@@ -4875,6 +4876,15 @@ fn string_array_schema() -> Value {
 
 fn id_schema(prefix: &str) -> Value {
     json!({"type": "string", "pattern": format!("^{prefix}[0-9a-fA-F-]+$")})
+}
+
+fn repository_id_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": REPOSITORY_ID_MAX_BYTES,
+        "pattern": REPOSITORY_ID_PATTERN
+    })
 }
 
 fn read_frame<R: BufRead>(reader: &mut R) -> std::result::Result<Option<Frame>, TransportError> {

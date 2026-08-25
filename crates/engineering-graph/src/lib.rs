@@ -154,7 +154,7 @@ impl RepositoryRegistry {
                     .iter()
                     .map(|path| inspect_catalog_checkout(path))
                     .collect::<Result<Vec<_>>>()
-                    .map(|locators| (repository.repository_id, locators))
+                    .map(|locators| (repository.repository_id.clone(), locators))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -173,7 +173,7 @@ impl RepositoryRegistry {
                 .iter()
                 .any(|locator| locator.availability == RepositoryAvailability::Available);
             let identity = RepositoryIdentity {
-                repository_id: *repository_id,
+                repository_id: repository_id.clone(),
                 canonical_name: repository_id.to_string(),
             };
             identity.validate()?;
@@ -225,7 +225,7 @@ impl RepositoryRegistry {
     /// Returns typed Registry read or invariant errors.
     pub fn resolve_by_id(
         &self,
-        repository_id: RepositoryId,
+        repository_id: &RepositoryId,
     ) -> Result<Option<RegisteredRepository>> {
         read_repository(&self.open_connection()?, repository_id)
     }
@@ -263,7 +263,7 @@ impl RepositoryRegistry {
             .map(|value| parse_repository_id(&value))
             .transpose()?;
         repository_id
-            .map(|repository_id| read_repository(&connection, repository_id))
+            .map(|repository_id| read_repository(&connection, &repository_id))
             .transpose()
             .map(Option::flatten)
     }
@@ -287,7 +287,7 @@ impl RepositoryRegistry {
         ids.into_iter()
             .map(|value| {
                 let repository_id = parse_repository_id(&value)?;
-                read_repository(&connection, repository_id)?
+                read_repository(&connection, &repository_id)?
                     .ok_or_else(|| invariant("listed Repository disappeared during read"))
             })
             .collect()
@@ -343,14 +343,15 @@ fn normalize_catalog(repositories: &[CatalogRepositorySpec]) -> Result<Vec<Catal
                     path.display()
                 )));
             }
-            if let Some(owner) = path_owners.insert(path.clone(), repository.repository_id) {
+            if let Some(owner) = path_owners.insert(path.clone(), repository.repository_id.clone())
+            {
                 return Err(invalid(format!(
                     "Catalog checkout path belongs to both {owner} and {}",
                     repository.repository_id
                 )));
             }
         }
-        by_id.insert(repository.repository_id, paths);
+        by_id.insert(repository.repository_id.clone(), paths);
     }
     Ok(by_id
         .into_iter()
@@ -474,7 +475,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
 
 fn read_repository(
     connection: &Connection,
-    repository_id: RepositoryId,
+    repository_id: &RepositoryId,
 ) -> Result<Option<RegisteredRepository>> {
     let row = connection
         .query_row(
@@ -489,7 +490,7 @@ fn read_repository(
         return Ok(None);
     };
     let identity = RepositoryIdentity {
-        repository_id,
+        repository_id: repository_id.clone(),
         canonical_name,
     };
     identity.validate()?;

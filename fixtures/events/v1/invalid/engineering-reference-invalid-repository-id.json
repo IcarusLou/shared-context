@@ -6,7 +6,7 @@
   "revision_id": "rev_00000000-0000-4000-8000-000000000211",
   "reference": {
     "reference_id": "ref_00000000-0000-4000-8000-000000000904",
-    "repository_id": "repo_00000000-0000-4000-8000-000000000901",
+    "repository_id": "FE/mobile",
     "artifact_kind": "file",
     "relation": "implements",
     "locator": {
@@ -14,6 +14,6 @@
       "path": "src/search.ts"
     },
     "supports": "Invalid repository identity fixture.",
-    "limitations": []
+    "limitations": ["The Repository ID contains a slash."]
   }
 }

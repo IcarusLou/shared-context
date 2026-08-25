@@ -1569,23 +1569,25 @@ mod tests {
     use super::{DOMAIN_ID_PREFIXES, find_domain_id_prefix, validate_raw_capacity};
 
     #[test]
-    fn domain_id_prefix_table_covers_every_current_uuid_type() {
+    fn domain_id_prefix_table_covers_current_uuid_types_and_legacy_repository_ids() {
         let domain_ids = include_str!("../../domain/src/ids.rs");
         let declarations = domain_ids
             .split("#[cfg(test)]")
             .next()
             .expect("domain ID declarations precede tests");
         assert_eq!(
-            declarations.match_indices("opaque_id!(").count(),
+            declarations.match_indices("opaque_id!(").count() + 1,
             DOMAIN_ID_PREFIXES.len(),
-            "the scenario denylist must change with the product's opaque ID declarations"
+            "the scenario denylist must cover current opaque IDs plus legacy Repository UUIDs"
         );
         assert_eq!(DOMAIN_ID_PREFIXES.len(), 28);
         for prefix in DOMAIN_ID_PREFIXES {
-            assert!(
-                declarations.contains(&format!("\"{prefix}\"")),
-                "missing current domain ID prefix {prefix}"
-            );
+            if prefix != "rpo_" {
+                assert!(
+                    declarations.contains(&format!("\"{prefix}\"")),
+                    "missing current domain ID prefix {prefix}"
+                );
+            }
             let value = format!("{prefix}123e4567-e89b-42d3-a456-426614174000");
             assert_eq!(find_domain_id_prefix(&value), Some(prefix));
         }

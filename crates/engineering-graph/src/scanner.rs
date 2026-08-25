@@ -149,8 +149,8 @@ impl RepositoryScanPlan {
     }
 
     #[must_use]
-    pub const fn repository_id(&self) -> sctx_domain::RepositoryId {
-        self.repository_id
+    pub fn repository_id(&self) -> sctx_domain::RepositoryId {
+        self.repository_id.clone()
     }
 
     #[must_use]
@@ -206,7 +206,7 @@ impl RepositoryScanner {
         }
         if !checkout_path.exists() {
             return Ok(RepositoryScanOutcome::Unavailable {
-                repository_id: repository.repository_id,
+                repository_id: repository.repository_id.clone(),
                 reason: "Repository checkout is unavailable".to_owned(),
             });
         }
@@ -334,7 +334,7 @@ impl RepositoryScanner {
         }
         let artifacts = builder.finish();
         Ok(RepositoryScanOutcome::Available(RepositorySnapshot {
-            repository_id: repository.repository_id,
+            repository_id: repository.repository_id.clone(),
             source_policy: SnapshotSourcePolicy::PlannedPathsWithSafeTrackedModifications,
             policy_version: POLICY_VERSION,
             head_tree_oid,
@@ -492,7 +492,7 @@ fn artifact(
 ) -> Result<EngineeringArtifact> {
     let artifact = EngineeringArtifact {
         repository: repository.clone(),
-        artifact_key: ArtifactKey::derive(repository.repository_id, locator)?,
+        artifact_key: ArtifactKey::derive(repository.repository_id.clone(), locator)?,
         display_name: display_name.to_owned(),
     };
     artifact.validate()?;

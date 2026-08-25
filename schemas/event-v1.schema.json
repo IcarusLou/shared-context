@@ -165,7 +165,9 @@
     },
     "repository_id": {
       "type": "string",
-      "pattern": "^rpo_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$"
     },
     "reference_id": {
       "type": "string",

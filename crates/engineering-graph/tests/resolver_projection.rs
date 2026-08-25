@@ -78,7 +78,7 @@ fn artifact(
     let display_name = locator.path().as_str().to_owned();
     let artifact = EngineeringArtifact {
         repository: repository.clone(),
-        artifact_key: ArtifactKey::derive(repository.repository_id, locator).unwrap(),
+        artifact_key: ArtifactKey::derive(repository.repository_id.clone(), locator).unwrap(),
         display_name,
     };
     artifact.validate().unwrap();
@@ -113,7 +113,7 @@ fn snapshot(
         .into_iter()
         .collect();
     RepositoryScanOutcome::Available(RepositorySnapshot {
-        repository_id: repository.repository_id,
+        repository_id: repository.repository_id.clone(),
         source_policy: SnapshotSourcePolicy::PlannedPathsWithSafeTrackedModifications,
         policy_version: "planned-paths-plus-safe-tracked-modifications-v2",
         head_tree_oid: format!("tree-{generation}"),
@@ -145,7 +145,7 @@ fn reference(
         revision_id: RevisionId::new(),
         reference: EngineeringReference {
             reference_id: ReferenceId::new(),
-            repository_id: repository.repository_id,
+            repository_id: repository.repository_id.clone(),
             artifact_kind: locator.kind(),
             relation: relation(locator.kind()),
             locator,
@@ -320,7 +320,7 @@ fn unavailable_repository_recovers_only_when_exact_locator_returns() {
         .resolve(
             std::slice::from_ref(&projected),
             &[RepositoryScanOutcome::Unavailable {
-                repository_id: repository.repository_id,
+                repository_id: repository.repository_id.clone(),
                 reason: "checkout offline".to_owned(),
             }],
             &graph_contexts(std::slice::from_ref(&projected)),

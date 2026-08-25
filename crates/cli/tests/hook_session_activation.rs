@@ -70,7 +70,10 @@ impl Fixture {
             .repository
             .repository_id;
         config
-            .add_repository_group(&group_root, &[direct_repository_id, second_repository_id])
+            .add_repository_group(
+                &group_root,
+                &[direct_repository_id.clone(), second_repository_id.clone()],
+            )
             .unwrap();
         Self {
             _temporary: temporary,
@@ -209,7 +212,7 @@ fn real_codex_and_cursor_session_start_wire_outputs_follow_durable_scope() {
         fixture.read_scope("codex", "codex-direct"),
         AuthorizedSessionScopeRead::Current(scope)
             if scope.decision == AuthorizedSessionScopeDecision::Direct {
-                repository_id: fixture.direct_repository_id
+                repository_id: fixture.direct_repository_id.clone()
             }
     ));
 
@@ -219,7 +222,10 @@ fn real_codex_and_cursor_session_start_wire_outputs_follow_durable_scope() {
         serde_json::from_slice::<Value>(&group.stdout).unwrap(),
         json!({"additional_context": SHARED_CONTEXT_ACTIVATION_MARKER})
     );
-    let mut expected_members = vec![fixture.direct_repository_id, fixture.second_repository_id];
+    let mut expected_members = vec![
+        fixture.direct_repository_id.clone(),
+        fixture.second_repository_id.clone(),
+    ];
     expected_members.sort();
     assert!(matches!(
         fixture.read_scope("cursor", "cursor-group"),
@@ -305,9 +311,9 @@ fn repeated_session_start_keeps_the_first_disabled_direct_or_group_decision() {
         fixture.read_scope("codex", "sticky-direct"),
         AuthorizedSessionScopeRead::Current(scope)
             if scope.decision == AuthorizedSessionScopeDecision::Direct {
-                repository_id: fixture.direct_repository_id
+                repository_id: fixture.direct_repository_id.clone()
             }
-                && scope.allowed_repository_ids == [fixture.direct_repository_id]
+                && scope.allowed_repository_ids == [fixture.direct_repository_id.clone()]
     ));
 
     let group = fixture.hook("cursor", &cursor_start("sticky-group", &fixture.group_root));

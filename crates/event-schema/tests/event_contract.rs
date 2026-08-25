@@ -572,6 +572,15 @@ fn bundled_schema_is_versioned_and_matches_the_exported_id() {
     assert_eq!(schema["$id"], V1_SCHEMA_ID);
     assert_eq!(schema["properties"]["schema_version"]["const"], "1");
     assert_eq!(schema["unevaluatedProperties"], false);
+    assert_eq!(
+        schema["$defs"]["repository_id"],
+        json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$"
+        })
+    );
 }
 
 #[test]

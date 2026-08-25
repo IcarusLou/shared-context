@@ -1890,7 +1890,7 @@ fn query_graph_context_evidence(
                 .push(TaskRetrievalPath::GraphDiagnostic {
                     diagnostic: GraphResolutionDiagnosticPath {
                         resolved_focus: resolved_focus.clone(),
-                        repository_id: resolved.resolution.repository_id,
+                        repository_id: resolved.resolution.repository_id.clone(),
                         reference_id: resolved.reference_id,
                         resolution_status: resolved.resolution.status,
                         candidate_artifact_keys: candidates
