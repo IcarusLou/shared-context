@@ -473,7 +473,10 @@ fn fixed_oracle_is_hand_written_bounded_and_privacy_safe() {
     }
     assert_eq!(
         oracle.wire.codex_enabled_session_start,
-        json!({"systemMessage": oracle.activation_marker})
+        json!({"hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": oracle.activation_marker
+        }})
     );
     assert_eq!(oracle.wire.neutral, json!({}));
 }

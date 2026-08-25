@@ -165,11 +165,15 @@ impl Harness {
             })
         };
         let response = self.hook(agent, &payload);
-        assert!(
-            serde_json::to_string(&response)
-                .unwrap()
-                .contains(SHARED_CONTEXT_ACTIVATION_MARKER)
-        );
+        let expected = if agent == "codex" {
+            json!({"hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+            }})
+        } else {
+            json!({"additional_context": SHARED_CONTEXT_ACTIVATION_MARKER})
+        };
+        assert_eq!(response, expected);
     }
 }
 

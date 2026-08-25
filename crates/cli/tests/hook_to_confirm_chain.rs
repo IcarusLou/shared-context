@@ -356,7 +356,10 @@ fn one_real_hook_to_confirm_identity_chain() {
     );
     assert_eq!(
         session_start,
-        json!({"systemMessage": SHARED_CONTEXT_ACTIVATION_MARKER})
+        json!({"hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+        }})
     );
 
     let prompt = run_hook(

@@ -342,6 +342,9 @@ pub struct CanonicalAgentAction {
     /// Typed Task Runtime operation. `None` means no Task state access.
     pub task_operation: Option<TaskRuntimeOperation>,
     pub breadcrumb: Option<CanonicalBreadcrumb>,
+    /// Model-visible, read-only context supplied by the lifecycle Hook.
+    #[serde(default)]
+    pub additional_context: Option<String>,
     /// User-visible capability guidance or diagnostic. Never contains Context data.
     pub system_message: Option<String>,
 }
@@ -352,6 +355,7 @@ impl CanonicalAgentAction {
         Self {
             task_operation: None,
             breadcrumb: None,
+            additional_context: None,
             system_message: None,
         }
     }
@@ -361,6 +365,7 @@ impl CanonicalAgentAction {
         Self {
             task_operation: None,
             breadcrumb: None,
+            additional_context: None,
             system_message: Some(diagnostic),
         }
     }
@@ -395,7 +400,8 @@ fn plan_enabled_action(
         CanonicalAgentEvent::SessionStart { .. } => CanonicalAgentAction {
             task_operation: None,
             breadcrumb: None,
-            system_message: Some(SHARED_CONTEXT_ACTIVATION_MARKER.to_owned()),
+            additional_context: Some(SHARED_CONTEXT_ACTIVATION_MARKER.to_owned()),
+            system_message: None,
         },
         CanonicalAgentEvent::PromptSubmit { .. } => CanonicalAgentAction::neutral(),
         CanonicalAgentEvent::PostToolUse {
@@ -438,6 +444,7 @@ fn plan_enabled_action(
                     workspace_hint: explicit_workspace_hint.or_else(|| workspace_hint(context)),
                     file_hints,
                 }),
+                additional_context: None,
                 system_message: None,
             }
         }
@@ -464,6 +471,7 @@ fn plan_enabled_action(
                 locator: task_locator(capabilities.agent, context),
             }),
             breadcrumb: None,
+            additional_context: None,
             system_message: None,
         },
     }
@@ -488,6 +496,7 @@ fn checkpoint(
             workspace_hint: workspace_hint(context),
             file_hints: Vec::new(),
         }),
+        additional_context: None,
         system_message: request_checkpoint.then(|| {
             "Before compaction or turn completion, use $shared-context and call task_checkpoint with complete Claims/Unknowns. Hook summary text is not Claim evidence."
                 .to_owned()
@@ -850,9 +859,10 @@ mod tests {
         let action =
             plan_action_for_activation(&start, &capabilities, ResolvedActivationDecision::Direct);
         assert_eq!(
-            action.system_message.as_deref(),
+            action.additional_context.as_deref(),
             Some(SHARED_CONTEXT_ACTIVATION_MARKER)
         );
+        assert!(action.system_message.is_none());
         assert_eq!(
             SHARED_CONTEXT_ACTIVATION_MARKER.len(),
             SHARED_CONTEXT_ACTIVATION_MARKER_MAX_BYTES
@@ -887,9 +897,10 @@ mod tests {
         assert!(start_action.task_operation.is_none());
         assert!(start_action.breadcrumb.is_none());
         assert_eq!(
-            start_action.system_message.as_deref(),
+            start_action.additional_context.as_deref(),
             Some(SHARED_CONTEXT_ACTIVATION_MARKER)
         );
+        assert!(start_action.system_message.is_none());
 
         let prompt_action = plan(1);
         assert_eq!(prompt_action, CanonicalAgentAction::neutral());
@@ -905,6 +916,7 @@ mod tests {
             Some(&CanonicalBreadcrumbKind::ToolOutcome)
         );
         assert!(post_action.system_message.is_none());
+        assert!(post_action.additional_context.is_none());
 
         for (index, expected_trigger) in [
             (3, EpisodeFinalizationTrigger::PreCompact),
@@ -934,6 +946,7 @@ mod tests {
             Some(TaskRuntimeOperation::CleanupSessionState { .. })
         ));
         assert!(end_action.breadcrumb.is_none());
+        assert!(end_action.additional_context.is_none());
         assert!(end_action.system_message.is_none());
     }
 
@@ -955,6 +968,7 @@ mod tests {
             let action = plan_action_for_activation(&event, &capabilities, activation);
             assert_eq!(action.task_operation, None);
             assert_eq!(action.breadcrumb, None);
+            assert_eq!(action.additional_context, None);
             assert_eq!(
                 action.system_message.as_deref(),
                 Some(capabilities.diagnostic.as_str())

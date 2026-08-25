@@ -732,7 +732,10 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
     ] {
         assert_eq!(
             response,
-            serde_json::json!({"systemMessage": SHARED_CONTEXT_ACTIVATION_MARKER})
+            serde_json::json!({"hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+            }})
         );
     }
     assert_eq!(
@@ -864,7 +867,10 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
     .unwrap();
     assert_eq!(
         start("session-subdir", &workspace.join("src")),
-        serde_json::json!({"systemMessage": SHARED_CONTEXT_ACTIVATION_MARKER})
+        serde_json::json!({"hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+        }})
     );
     let subdirectory_post = hook(&serde_json::json!({
         "session_id": "session-subdir",

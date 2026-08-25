@@ -1121,6 +1121,7 @@ fn resolve_hook_action(action: CanonicalAgentAction) -> Result<ResolvedAgentActi
     let CanonicalAgentAction {
         task_operation,
         breadcrumb,
+        additional_context,
         system_message,
     } = action;
     let lifecycle_operation = task_operation.as_ref().is_some_and(|operation| {
@@ -1149,7 +1150,7 @@ fn resolve_hook_action(action: CanonicalAgentAction) -> Result<ResolvedAgentActi
         }
     }
     Ok(ResolvedAgentAction {
-        additional_context: task_resolution.additional_context,
+        additional_context: task_resolution.additional_context.or(additional_context),
         system_message: task_resolution.system_message.or(system_message),
     })
 }

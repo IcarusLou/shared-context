@@ -765,7 +765,7 @@ fn post_tool_file_is_breadcrumb_only_and_test_outcome_refreshes_active_task() {
         "source": "startup"
     }));
     assert!(
-        activation["systemMessage"]
+        activation["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .is_some_and(|message| message.contains("<shared-context-active>"))
     );

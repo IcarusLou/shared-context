@@ -50,7 +50,7 @@ fn verified_and_trusted_codex_prompt_never_repeats_activation_marker() {
     let output = encode_hook_output(
         event.kind(),
         &ResolvedAgentAction {
-            additional_context: None,
+            additional_context: action.additional_context,
             system_message: action.system_message,
         },
     )
@@ -90,7 +90,7 @@ fn codex_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_cl
 }
 
 #[test]
-fn codex_session_start_encodes_disabled_as_neutral_and_both_enabled_scopes_identically() {
+fn codex_session_start_encodes_enabled_marker_as_model_context_and_disabled_as_neutral() {
     let event = decode_hook_input(&serde_json::to_vec(&fixtures().remove(0)).unwrap()).unwrap();
     let capability = capabilities(Some("codex-cli 0.147.0"), true, TrustState::Confirmed);
 
@@ -101,7 +101,7 @@ fn codex_session_start_encodes_disabled_as_neutral_and_both_enabled_scopes_ident
     let disabled_output = encode_hook_output(
         event.kind(),
         &ResolvedAgentAction {
-            additional_context: None,
+            additional_context: disabled.additional_context,
             system_message: disabled.system_message,
         },
     )
@@ -123,7 +123,7 @@ fn codex_session_start_encodes_disabled_as_neutral_and_both_enabled_scopes_ident
             encode_hook_output(
                 event.kind(),
                 &ResolvedAgentAction {
-                    additional_context: None,
+                    additional_context: action.additional_context,
                     system_message: action.system_message,
                 },
             )
@@ -133,7 +133,10 @@ fn codex_session_start_encodes_disabled_as_neutral_and_both_enabled_scopes_ident
     assert_eq!(outputs[0], outputs[1]);
     assert_eq!(
         serde_json::from_slice::<Value>(&outputs[0]).unwrap(),
-        serde_json::json!({"systemMessage": SHARED_CONTEXT_ACTIVATION_MARKER})
+        serde_json::json!({"hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+        }})
     );
 }
 

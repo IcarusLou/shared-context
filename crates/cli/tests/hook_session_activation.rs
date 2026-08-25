@@ -212,7 +212,10 @@ fn real_codex_and_cursor_session_start_wire_outputs_follow_durable_scope() {
     assert!(direct.status.success());
     assert_eq!(
         serde_json::from_slice::<Value>(&direct.stdout).unwrap(),
-        json!({"systemMessage": SHARED_CONTEXT_ACTIVATION_MARKER})
+        json!({"hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+        }})
     );
     assert!(matches!(
         fixture.read_scope("codex", "codex-direct"),
@@ -265,7 +268,10 @@ fn marker_reappears_only_at_explicit_session_start_resume_or_compact_boundaries(
         assert!(output.status.success());
         assert_eq!(
             serde_json::from_slice::<Value>(&output.stdout).unwrap(),
-            json!({"systemMessage": SHARED_CONTEXT_ACTIVATION_MARKER})
+            json!({"hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+            }})
         );
         assert!(matches!(
             fixture.read_scope("codex", session),
@@ -563,7 +569,12 @@ fn concurrent_and_repeated_session_start_reuses_one_locator_record() {
         let output = handle.join().unwrap();
         assert!(output.status.success());
         let response = serde_json::from_slice::<Value>(&output.stdout).unwrap();
-        if response == json!({"systemMessage": SHARED_CONTEXT_ACTIVATION_MARKER}) {
+        if response
+            == json!({"hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+            }})
+        {
             activated += 1;
         } else {
             assert_eq!(response, json!({}));

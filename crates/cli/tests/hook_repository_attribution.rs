@@ -145,7 +145,10 @@ impl Fixture {
         assert!(output.status.success());
         assert_eq!(
             serde_json::from_slice::<Value>(&output.stdout).unwrap(),
-            json!({"systemMessage": SHARED_CONTEXT_ACTIVATION_MARKER})
+            json!({"hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+            }})
         );
     }
 

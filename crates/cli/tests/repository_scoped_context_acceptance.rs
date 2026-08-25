@@ -120,7 +120,10 @@ impl AgentProfile {
 
     fn activation(self, marker: &str) -> Value {
         match self {
-            Self::Codex => json!({"systemMessage": marker}),
+            Self::Codex => json!({"hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": marker
+            }}),
             Self::Cursor => json!({"additional_context": marker}),
         }
     }

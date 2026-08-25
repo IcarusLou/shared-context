@@ -4,7 +4,10 @@
   "activation_marker_max_bytes": 128,
   "wire": {
     "codex_enabled_session_start": {
-      "systemMessage": "<shared-context-active>Shared Context is authorized; the installed skill may be used.</shared-context-active>"
+      "hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": "<shared-context-active>Shared Context is authorized; the installed skill may be used.</shared-context-active>"
+      }
     },
     "cursor_enabled_session_start": {
       "additional_context": "<shared-context-active>Shared Context is authorized; the installed skill may be used.</shared-context-active>"

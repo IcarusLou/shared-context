@@ -158,12 +158,14 @@ fn hook_capture_keeps_locator_then_explicit_claim_and_ingestion_are_verifiable()
         )
         .unwrap();
     assert!(
-        harness.hook(&session_start("capture-before-task", &repository))["systemMessage"]
+        harness.hook(&session_start("capture-before-task", &repository))["hookSpecificOutput"]
+            ["additionalContext"]
             .as_str()
             .is_some_and(|message| message.contains("<shared-context-active>"))
     );
     assert!(
-        harness.hook(&session_start("capture-owned", &repository))["systemMessage"]
+        harness.hook(&session_start("capture-owned", &repository))["hookSpecificOutput"]
+            ["additionalContext"]
             .as_str()
             .is_some_and(|message| message.contains("<shared-context-active>"))
     );

@@ -53,7 +53,7 @@ fn cursor_prompt_hook_never_repeats_activation_marker() {
     let output = encode_hook_output(
         event.kind(),
         &ResolvedAgentAction {
-            additional_context: None,
+            additional_context: action.additional_context,
             system_message: action.system_message,
         },
     )
@@ -105,7 +105,7 @@ fn cursor_session_start_encodes_disabled_as_neutral_and_both_enabled_scopes_iden
     let disabled_output = encode_hook_output(
         event.kind(),
         &ResolvedAgentAction {
-            additional_context: None,
+            additional_context: disabled.additional_context,
             system_message: disabled.system_message,
         },
     )
@@ -127,7 +127,7 @@ fn cursor_session_start_encodes_disabled_as_neutral_and_both_enabled_scopes_iden
             encode_hook_output(
                 event.kind(),
                 &ResolvedAgentAction {
-                    additional_context: None,
+                    additional_context: action.additional_context,
                     system_message: action.system_message,
                 },
             )
