@@ -6,12 +6,14 @@ use std::{
     sync::Arc,
 };
 
-use sctx_engineering_graph::RepositoryRegistry;
+use sctx_engineering_graph::{EngineeringProjectionStore, RepositoryRegistry};
+use sctx_index::ProjectionIndex;
 use sctx_installer::{
-    Agent, Architecture, CheckStatus, Host, InstallContext, Installer, SetupOptions, SetupStage,
-    SkillStatus,
+    Agent, Architecture, CheckStatus, DataResetOptions, Host, InstallContext, Installer,
+    ResetStage, SetupOptions, SetupStage, SkillStatus,
 };
 use sctx_local_state::{MaintenanceLock, UserConfigStore};
+use sctx_task_runtime::TaskRuntime;
 use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 
@@ -228,6 +230,126 @@ fn init_catalog_repo(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap()
 }
 
+fn git(path: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+struct SeededResetState {
+    preserved: Vec<(PathBuf, Vec<u8>)>,
+    remote: PathBuf,
+    remote_head: String,
+}
+
+fn seed_reset_state(harness: &Harness) -> SeededResetState {
+    let installer = harness.installer("1.2.3");
+    installer.setup(&SetupOptions::default()).unwrap();
+    let catalog_root = harness.home.join("team repositories");
+    let fe = init_catalog_repo(&catalog_root.join("fe"));
+    let android = init_catalog_repo(&catalog_root.join("android"));
+    let catalog_root = fs::canonicalize(catalog_root).unwrap();
+    let config = UserConfigStore::open_existing(&harness.root).unwrap();
+    let fe_id: sctx_domain::RepositoryId = "FE".parse().unwrap();
+    let android_id: sctx_domain::RepositoryId = "Android".parse().unwrap();
+    config
+        .add_repository(fe_id.clone(), std::slice::from_ref(&fe))
+        .unwrap();
+    config
+        .add_repository(android_id.clone(), std::slice::from_ref(&android))
+        .unwrap();
+    config
+        .add_repository_group(&catalog_root, &[fe_id, android_id])
+        .unwrap();
+
+    let repository = harness.root.join("repository");
+    git(
+        &repository,
+        &["commit", "--allow-empty", "-m", "seed reset knowledge"],
+    );
+    let remote = harness.home.join("knowledge-remote.git");
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success()
+    );
+    git(
+        &repository,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&repository, &["push", "-u", "origin", "main"]);
+    let remote_head = git(&remote, &["rev-parse", "refs/heads/main"]);
+
+    for database in [
+        "index.sqlite",
+        "runtime.sqlite",
+        "engineering.sqlite",
+        "repository-registry.sqlite",
+    ] {
+        fs::write(
+            harness.root.join("state").join(database),
+            format!("seeded-{database}"),
+        )
+        .unwrap();
+    }
+    for (directory, file) in [
+        ("pending", "batch.json"),
+        ("pending-aside", "aside.json"),
+        ("capture", "capture.json"),
+        ("authorized-session-scopes", "scope.json"),
+    ] {
+        let directory = harness.root.join("state").join(directory);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(file),
+            format!("seeded-{}", directory.display()),
+        )
+        .unwrap();
+    }
+    fs::write(
+        harness.root.join("logs/reset-sentinel.log"),
+        "preserve logs",
+    )
+    .unwrap();
+
+    let preserved_paths = [
+        harness.root.join("bin/current/sctx"),
+        harness.root.join("state/install-manifest.json"),
+        harness.root.join("logs/reset-sentinel.log"),
+        harness.home.join(".cursor/mcp.json"),
+        harness.home.join(".cursor/hooks.json"),
+        harness.home.join(".codex/config.toml"),
+        harness.home.join(".codex/hooks.json"),
+        harness.skill_root().join("SKILL.md"),
+        harness.skill_root().join("references/workflow.md"),
+        harness.skill_root().join("agents/openai.yaml"),
+    ];
+    let preserved = preserved_paths
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    SeededResetState {
+        preserved,
+        remote,
+        remote_head,
+    }
+}
+
 #[test]
 fn setup_three_times_is_idempotent_and_preserves_existing_configuration() {
     let harness = Harness::new();
@@ -337,6 +459,16 @@ fn installer_mutations_are_exclusive_and_doctor_reports_active_maintenance() {
         installer.uninstall().unwrap_err().kind(),
         sctx_installer::ErrorKind::MaintenanceBusy
     );
+    assert_eq!(
+        installer
+            .reset_data(DataResetOptions {
+                confirmed: true,
+                dry_run: false,
+            })
+            .unwrap_err()
+            .kind(),
+        sctx_installer::ErrorKind::MaintenanceBusy
+    );
     drop(shared);
 
     let exclusive = maintenance.try_exclusive().unwrap();
@@ -347,6 +479,285 @@ fn installer_mutations_are_exclusive_and_doctor_reports_active_maintenance() {
     drop(exclusive);
 
     assert!(!installer.setup(&SetupOptions::default()).unwrap().changed);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn data_reset_dry_run_is_read_only_and_confirmed_reset_preserves_installation() {
+    let harness = Harness::new();
+    let seeded = seed_reset_state(&harness);
+    let installer = harness.installer("1.2.3");
+    let repository = harness.root.join("repository");
+    let head_before = git(&repository, &["rev-parse", "HEAD"]);
+    let config_before = fs::read(harness.root.join("config.toml")).unwrap();
+    let reset_backups_before = fs::read_dir(harness.root.join("backups"))
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("reset-"))
+        .count();
+
+    assert!(
+        installer
+            .reset_data(DataResetOptions::default())
+            .unwrap_err()
+            .message()
+            .contains("--yes")
+    );
+    let dry_run = installer
+        .reset_data(DataResetOptions {
+            confirmed: false,
+            dry_run: true,
+        })
+        .unwrap();
+    assert!(dry_run.dry_run);
+    assert_eq!(dry_run.repository_count_cleared, 2);
+    assert_eq!(dry_run.repository_group_count_cleared, 1);
+    assert!(dry_run.backup.is_none());
+    assert!(!dry_run.remote_detached);
+    assert!(!dry_run.remote_mutated);
+    assert_eq!(git(&repository, &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(
+        fs::read(harness.root.join("config.toml")).unwrap(),
+        config_before
+    );
+    assert_eq!(
+        fs::read_dir(harness.root.join("backups"))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("reset-"))
+            .count(),
+        reset_backups_before
+    );
+
+    let report = installer
+        .reset_data(DataResetOptions {
+            confirmed: true,
+            dry_run: false,
+        })
+        .unwrap();
+    assert!(!report.dry_run);
+    assert_eq!(report.repository_count_cleared, 2);
+    assert_eq!(report.repository_group_count_cleared, 1);
+    assert!(report.remote_detached);
+    assert!(!report.remote_mutated);
+    let backup = report.backup.as_ref().unwrap();
+    assert!(backup.join("journal.json").is_file());
+    assert!(backup.join("old/repository/.git").is_dir());
+    assert!(
+        fs::read_to_string(backup.join("old/config.toml"))
+            .unwrap()
+            .contains("FE")
+    );
+    assert_eq!(
+        git(&seeded.remote, &["rev-parse", "refs/heads/main"]),
+        seeded.remote_head
+    );
+    assert_eq!(git(&repository, &["rev-list", "--count", "HEAD"]), "1");
+    assert!(git(&repository, &["remote"]).is_empty());
+    assert!(
+        UserConfigStore::open_existing(&harness.root)
+            .unwrap()
+            .repository_catalog()
+            .unwrap()
+            .repositories
+            .is_empty()
+    );
+    assert!(
+        ProjectionIndex::new(&repository, harness.root.join("state"))
+            .quick_check()
+            .unwrap()
+            .healthy
+    );
+    TaskRuntime::initialize(harness.root.clone()).unwrap();
+    assert!(
+        RepositoryRegistry::initialize(harness.root.clone())
+            .unwrap()
+            .list()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        EngineeringProjectionStore::initialize(harness.root.clone())
+            .unwrap()
+            .read_projection()
+            .unwrap()
+            .is_none()
+    );
+    for directory in [
+        "pending",
+        "pending-aside",
+        "capture",
+        "authorized-session-scopes",
+    ] {
+        assert!(
+            fs::read_dir(harness.root.join("state").join(directory))
+                .unwrap()
+                .next()
+                .is_none(),
+            "{directory} is not empty"
+        );
+    }
+    for (path, expected) in &seeded.preserved {
+        assert_eq!(&fs::read(path).unwrap(), expected, "{}", path.display());
+    }
+    assert!(installer.doctor().healthy);
+
+    let repeated = installer
+        .reset_data(DataResetOptions {
+            confirmed: true,
+            dry_run: false,
+        })
+        .unwrap();
+    assert_eq!(repeated.repository_count_cleared, 0);
+    assert_eq!(repeated.repository_group_count_cleared, 0);
+    assert_ne!(repeated.backup, report.backup);
+    assert!(installer.doctor().healthy);
+}
+
+#[test]
+fn every_reset_crash_seam_blocks_business_and_recovers_on_retry() {
+    for stage in [
+        ResetStage::Staged,
+        ResetStage::FirstOriginalMoved,
+        ResetStage::FirstReplacementInstalled,
+        ResetStage::Swapped,
+        ResetStage::SmokeTested,
+    ] {
+        let harness = Harness::new();
+        let seeded = seed_reset_state(&harness);
+        let crashing = harness.installer("1.2.3").with_reset_crash_after(stage);
+        let error = crashing
+            .reset_data(DataResetOptions {
+                confirmed: true,
+                dry_run: false,
+            })
+            .unwrap_err();
+        assert!(
+            error.message().contains("injected reset crash"),
+            "{stage:?}"
+        );
+        assert!(harness.root.join("state/reset-journal.json").is_file());
+        assert_eq!(
+            MaintenanceLock::open_or_create(&harness.root)
+                .unwrap()
+                .try_shared()
+                .unwrap_err()
+                .kind(),
+            sctx_installer::ErrorKind::MaintenanceBusy
+        );
+
+        let recovered = harness
+            .installer("1.2.3")
+            .reset_data(DataResetOptions {
+                confirmed: true,
+                dry_run: false,
+            })
+            .unwrap();
+        assert!(!harness.root.join("state/reset-journal.json").exists());
+        assert!(
+            recovered
+                .backup
+                .as_ref()
+                .unwrap()
+                .join("journal.json")
+                .is_file()
+        );
+        assert_eq!(
+            git(&seeded.remote, &["rev-parse", "refs/heads/main"]),
+            seeded.remote_head
+        );
+        assert!(harness.installer("1.2.3").doctor().healthy, "{stage:?}");
+    }
+}
+
+#[test]
+fn setup_recovers_an_incomplete_reset_before_reapplying_installation() {
+    let harness = Harness::new();
+    let seeded = seed_reset_state(&harness);
+    for database in [
+        "index.sqlite",
+        "runtime.sqlite",
+        "engineering.sqlite",
+        "repository-registry.sqlite",
+    ] {
+        for suffix in ["", "-wal", "-shm"] {
+            let path = harness
+                .root
+                .join("state")
+                .join(format!("{database}{suffix}"));
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("remove seeded database: {error}"),
+            }
+        }
+    }
+    ProjectionIndex::new(harness.root.join("repository"), harness.root.join("state"))
+        .synchronize()
+        .unwrap();
+    TaskRuntime::initialize(harness.root.clone()).unwrap();
+    sctx_mcp::sync_repository_catalog_at_root(&harness.root).unwrap();
+    EngineeringProjectionStore::initialize(harness.root.clone()).unwrap();
+    let crashing = harness
+        .installer("1.2.3")
+        .with_reset_crash_after(ResetStage::Swapped);
+    assert!(
+        crashing
+            .reset_data(DataResetOptions {
+                confirmed: true,
+                dry_run: false,
+            })
+            .is_err()
+    );
+    assert!(harness.root.join("state/reset-journal.json").is_file());
+
+    harness
+        .installer("1.2.3")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert!(!harness.root.join("state/reset-journal.json").exists());
+    let catalog = UserConfigStore::open_existing(&harness.root)
+        .unwrap()
+        .repository_catalog()
+        .unwrap();
+    assert_eq!(catalog.repositories.len(), 2);
+    assert_eq!(catalog.repository_groups.len(), 1);
+    assert_eq!(git(&harness.root.join("repository"), &["remote"]), "origin");
+    assert_eq!(
+        git(&seeded.remote, &["rev-parse", "refs/heads/main"]),
+        seeded.remote_head
+    );
+}
+
+#[test]
+fn reset_rejects_symlinked_targets_without_touching_the_target() {
+    let harness = Harness::new();
+    harness
+        .installer("1.2.3")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let capture = harness.root.join("state/capture");
+    if capture.exists() {
+        fs::remove_dir_all(&capture).unwrap();
+    }
+    let outside = harness.home.join("outside-capture");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("preserve.txt"), "preserve").unwrap();
+    symlink(&outside, &capture).unwrap();
+
+    let error = harness
+        .installer("1.2.3")
+        .reset_data(DataResetOptions {
+            confirmed: true,
+            dry_run: false,
+        })
+        .unwrap_err();
+    assert!(error.message().contains("must not be a symlink"));
+    assert_eq!(
+        fs::read_to_string(outside.join("preserve.txt")).unwrap(),
+        "preserve"
+    );
+    assert!(!harness.root.join("state/reset-journal.json").exists());
 }
 
 #[test]

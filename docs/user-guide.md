@@ -200,6 +200,15 @@ sctx upgrade --agents cursor,codex
 sctx uninstall
 ```
 
+只清空 Shared Context 活动数据、保留安装和 Agent 接入时，先查看计划，再显式确认：
+
+```bash
+sctx data reset --dry-run
+sctx data reset --yes
+```
+
+Reset 会把知识 Git、Repository Catalog、四个 SQLite 和 pending/capture/session 临时状态重建为空，同时保留 `bin`、安装清单、Cursor/Codex 配置、Skill、日志和已有 backups。每次实际 reset 默认在 `backups/reset-<ID>` 保留可恢复旧数据；若旧知识仓配置了 Git remote，只解除新活动仓的本地绑定，绝不修改远端 ref。
+
 卸载只移除安装器能够确认由自己拥有、且未被用户改写的配置项、运行时、日志、临时 Capture 和可重建索引。**知识仓库 `~/.shared-context/repository` 默认保留**。用户修改过的配置或 Skill 也会保留，并在报告中给出警告。
 
 彻底删除知识仓库是不可恢复操作，必须同时提供精确绝对路径和固定确认词：
@@ -473,6 +482,7 @@ sctx candidate discard \
 | `sctx doctor` | 只读检查安装、索引、配置、MCP 和 Agent 能力。 |
 | `sctx doctor --fix` | 重做安全、可逆的注册和索引设置后再次检查。 |
 | `sctx upgrade [--agents cursor,codex]` | 安装新版本并原子切换 `bin/current`。 |
+| `sctx data reset --dry-run` / `--yes` | 预览或确认事务式清空活动数据；保留安装结构、Agent 接入和默认恢复备份，不修改远端 Git。 |
 | `sctx uninstall` | 精确移除安装器拥有的运行时和接入配置，保留知识库。 |
 | `sctx knowledge delete ...` | 双重确认后永久删除知识 Git 仓库。 |
 

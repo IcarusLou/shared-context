@@ -15,11 +15,13 @@ sctx-adapter-codex.workspace = true
 sctx-adapter-cursor.workspace = true
 sctx-agent-adapter.workspace = true
 sctx-domain.workspace = true
+sctx-engineering-graph.workspace = true
 sctx-git-store.workspace = true
 sctx-index.workspace = true
 sctx-local-state.workspace = true
 sctx-mcp.workspace = true
 sctx-search.workspace = true
+sctx-task-runtime.workspace = true
 toml_edit.workspace = true
 uuid.workspace = true
 
@@ -27,5 +29,4 @@ uuid.workspace = true
 workspace = true
 
 [dev-dependencies]
-sctx-engineering-graph.workspace = true
 tempfile = "3.20"

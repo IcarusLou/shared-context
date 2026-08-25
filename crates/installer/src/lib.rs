@@ -22,11 +22,16 @@ use std::{
 use fs2::FileExt;
 use sctx_adapter_codex::TrustState;
 pub use sctx_domain::{Error, ErrorKind, Result};
+use sctx_engineering_graph::{EngineeringProjectionStore, RepositoryRegistry};
 use sctx_git_store::GitStore;
 use sctx_index::ProjectionIndex;
-use sctx_local_state::{CatalogCheckoutStatus, MaintenanceLock, UserConfigStore};
+use sctx_local_state::{
+    AuthorizedSessionScopeStore, CaptureStore, CatalogCheckoutStatus, MaintenanceLock,
+    UserConfigStore,
+};
 use sctx_mcp::{ClientKind, McpServer};
 use sctx_search::{SearchEngine, SearchFilters, SearchRequest};
+use sctx_task_runtime::TaskRuntime;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -34,6 +39,7 @@ use toml_edit::{Array, DocumentMut, Item, Table, value};
 use uuid::Uuid;
 
 const JOURNAL_VERSION: u32 = 1;
+const RESET_JOURNAL_VERSION: u32 = 1;
 const MANIFEST_VERSION: u32 = 1;
 const MINIMUM_FREE_SPACE_BYTES: u64 = 64 * 1024 * 1024;
 const AGENT_VERSION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -396,11 +402,45 @@ pub struct UninstallReport {
     pub warnings: Vec<String>,
 }
 
+/// One deterministic reset crash seam exposed only for recovery testing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResetStage {
+    Staged,
+    FirstOriginalMoved,
+    FirstReplacementInstalled,
+    Swapped,
+    SmokeTested,
+}
+
+/// Destructive reset selection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DataResetOptions {
+    pub confirmed: bool,
+    pub dry_run: bool,
+}
+
+/// Completed reset or read-only reset plan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DataResetReport {
+    pub root: PathBuf,
+    pub dry_run: bool,
+    pub reset_id: Option<String>,
+    pub backup: Option<PathBuf>,
+    pub repository_count_cleared: usize,
+    pub repository_group_count_cleared: usize,
+    pub cleared_targets: Vec<PathBuf>,
+    pub preserved: Vec<PathBuf>,
+    pub remote_detached: bool,
+    pub remote_mutated: bool,
+}
+
 /// Installer entry point.
 pub struct Installer {
     context: InstallContext,
     host: Arc<dyn Host>,
     fail_after: Option<SetupStage>,
+    reset_crash_after: Option<ResetStage>,
     codex_trust: TrustState,
 }
 
@@ -424,6 +464,7 @@ impl Installer {
             context,
             host,
             fail_after: None,
+            reset_crash_after: None,
             codex_trust: TrustState::Unconfirmed,
         }
     }
@@ -432,6 +473,13 @@ impl Installer {
     #[must_use]
     pub const fn with_failure_after(mut self, stage: SetupStage) -> Self {
         self.fail_after = Some(stage);
+        self
+    }
+
+    /// Simulates a process crash after one reset stage, leaving recovery journal state.
+    #[must_use]
+    pub const fn with_reset_crash_after(mut self, stage: ResetStage) -> Self {
+        self.reset_crash_after = Some(stage);
         self
     }
 
@@ -471,6 +519,7 @@ impl Installer {
         let lock = open_lock(&self.context.root.join("state/setup.lock"))?;
         lock.lock_exclusive()
             .map_err(io_error("lock setup transaction"))?;
+        recover_incomplete_data_reset(&self.context.root)?;
         recover_incomplete_journals(&self.context.root)?;
         if operation == Operation::Upgrade {
             require_existing_installation(&self.context.root)?;
@@ -713,6 +762,7 @@ impl Installer {
             context,
             host: Arc::clone(&self.host),
             fail_after: None,
+            reset_crash_after: None,
             codex_trust: self.codex_trust,
         };
         fixer.setup(options)?;
@@ -741,6 +791,7 @@ impl Installer {
         let _maintenance = MaintenanceLock::open_or_create(root)?.try_exclusive()?;
         let lock = open_lock(&root.join("state/setup.lock"))?;
         lock.lock_exclusive().map_err(io_error("lock uninstall"))?;
+        recover_incomplete_data_reset(root)?;
         recover_incomplete_journals(root)?;
         if let Some(manifest) = read_manifest(root)? {
             for config in &manifest.configs {
@@ -838,6 +889,11 @@ impl Installer {
             ));
         }
         let _maintenance = MaintenanceLock::open_or_create(&self.context.root)?.try_exclusive()?;
+        let setup_lock = open_lock(&self.context.root.join("state/setup.lock"))?;
+        setup_lock
+            .lock_exclusive()
+            .map_err(io_error("lock knowledge deletion"))?;
+        recover_incomplete_data_reset(&self.context.root)?;
         if repository.exists() {
             fs::remove_dir_all(&repository).map_err(io_error("delete knowledge repository"))?;
             sync_directory(
@@ -846,7 +902,184 @@ impl Installer {
                     .ok_or_else(|| invalid("repository has no parent"))?,
             )?;
         }
+        FileExt::unlock(&setup_lock).map_err(io_error("unlock knowledge deletion"))?;
         Ok(repository)
+    }
+
+    /// Restores active Shared Context data to the empty post-install state.
+    ///
+    /// A read-only dry run needs no confirmation. An actual reset requires
+    /// `confirmed=true`, retains one recoverable backup, and never invokes a
+    /// remote Git mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation, maintenance, staging, journal, component
+    /// smoke, or rollback error. Injected crash seams deliberately leave the
+    /// journal for the next reset/setup recovery path.
+    pub fn reset_data(&self, options: DataResetOptions) -> Result<DataResetReport> {
+        validate_context(&self.context)?;
+        if !options.dry_run && !options.confirmed {
+            return Err(invalid(
+                "data reset is destructive; rerun with --yes or use --dry-run",
+            ));
+        }
+        let maintenance = MaintenanceLock::open_or_create(&self.context.root)?;
+        if options.dry_run {
+            let _guard = maintenance.try_shared()?;
+            require_existing_installation(&self.context.root)?;
+            validate_reset_active_targets(&self.context.root)?;
+            let inspection =
+                UserConfigStore::open_existing(&self.context.root)?.inspect_repository_catalog()?;
+            let cleared_targets = existing_reset_targets(&self.context.root);
+            return Ok(reset_report(
+                &self.context.root,
+                DataResetReportMaterial {
+                    dry_run: true,
+                    reset_id: None,
+                    backup: None,
+                    had_remote: knowledge_has_remote(&self.context.root.join("repository"))?,
+                    repository_count_cleared: inspection.catalog.repositories.len(),
+                    repository_group_count_cleared: inspection.catalog.repository_groups.len(),
+                    cleared_targets,
+                },
+            ));
+        }
+
+        let _guard = maintenance.try_exclusive()?;
+        let setup_lock = open_lock(&self.context.root.join("state/setup.lock"))?;
+        setup_lock
+            .lock_exclusive()
+            .map_err(io_error("lock data reset transaction"))?;
+        recover_incomplete_data_reset(&self.context.root)?;
+        recover_incomplete_journals(&self.context.root)?;
+        require_existing_installation(&self.context.root)?;
+        let result = self.reset_data_locked();
+        let result = match result {
+            Ok(report) => Ok(report),
+            Err(error) if is_injected_reset_crash(&error) => Err(error),
+            Err(error) => match recover_incomplete_data_reset(&self.context.root) {
+                Ok(_) => Err(error),
+                Err(rollback) => Err(Error::new(
+                    ErrorKind::InvariantViolation,
+                    format!("{error}; reset rollback also failed: {rollback}"),
+                )),
+            },
+        };
+        FileExt::unlock(&setup_lock).map_err(io_error("unlock data reset transaction"))?;
+        result
+    }
+
+    fn reset_data_locked(&self) -> Result<DataResetReport> {
+        validate_reset_active_targets(&self.context.root)?;
+        let remote_detached = knowledge_has_remote(&self.context.root.join("repository"))?;
+        let inspection =
+            UserConfigStore::open_existing(&self.context.root)?.inspect_repository_catalog()?;
+        let repository_count = inspection.catalog.repositories.len();
+        let repository_group_count = inspection.catalog.repository_groups.len();
+        let id = format!("reset-{}", Uuid::new_v4());
+        let backup_dir = self.context.root.join("backups").join(&id);
+        ensure_private_directory(&backup_dir)?;
+        let staging_root = backup_dir.join("new");
+        build_pristine_reset_root(&self.context.root, &staging_root)?;
+        let entries = build_reset_entries(&self.context.root, &backup_dir, &staging_root)?;
+        let mut journal = DataResetJournal {
+            version: RESET_JOURNAL_VERSION,
+            id: id.clone(),
+            root: self.context.root.clone(),
+            backup_dir: backup_dir.clone(),
+            staging_root,
+            phase: "prepared".to_owned(),
+            complete: false,
+            applied_entries: 0,
+            entries,
+        };
+        let cleared_targets = journal
+            .entries
+            .iter()
+            .filter(|entry| entry.original_present)
+            .map(|entry| entry.active.clone())
+            .collect();
+        persist_reset_journal(&journal, true)?;
+        self.fail_reset(ResetStage::Staged)?;
+
+        for index in 0..journal.entries.len() {
+            let entry = &journal.entries[index];
+            if entry.original_present {
+                ensure_private_directory(
+                    entry
+                        .backup
+                        .parent()
+                        .ok_or_else(|| invalid("reset backup target has no parent"))?,
+                )?;
+                fs::rename(&entry.active, &entry.backup)
+                    .map_err(io_error("move active reset target to backup"))?;
+                sync_parent(&entry.active)?;
+                sync_parent(&entry.backup)?;
+            }
+            if index == 0 {
+                "first_original_moved".clone_into(&mut journal.phase);
+                persist_reset_journal(&journal, true)?;
+                self.fail_reset(ResetStage::FirstOriginalMoved)?;
+            }
+            if entry.staged_present {
+                let staged = entry
+                    .staged
+                    .as_ref()
+                    .ok_or_else(|| invariant("staged reset target is missing from journal"))?;
+                if let Some(parent) = entry.active.parent() {
+                    ensure_private_directory(parent)?;
+                }
+                fs::rename(staged, &entry.active)
+                    .map_err(io_error("install staged reset target"))?;
+                sync_parent(staged)?;
+                sync_parent(&entry.active)?;
+            }
+            if index == 0 {
+                "first_replacement_installed".clone_into(&mut journal.phase);
+                persist_reset_journal(&journal, true)?;
+                self.fail_reset(ResetStage::FirstReplacementInstalled)?;
+            }
+            journal.applied_entries = index + 1;
+            journal.phase = format!("applied_{}", journal.applied_entries);
+            persist_reset_journal(&journal, true)?;
+        }
+        "swapped".clone_into(&mut journal.phase);
+        persist_reset_journal(&journal, true)?;
+        self.fail_reset(ResetStage::Swapped)?;
+        smoke_pristine_reset_root(&self.context.root)?;
+        "smoke_tested".clone_into(&mut journal.phase);
+        persist_reset_journal(&journal, true)?;
+        self.fail_reset(ResetStage::SmokeTested)?;
+
+        let report = reset_report(
+            &self.context.root,
+            DataResetReportMaterial {
+                dry_run: false,
+                reset_id: Some(id),
+                backup: Some(backup_dir),
+                had_remote: remote_detached,
+                repository_count_cleared: repository_count,
+                repository_group_count_cleared: repository_group_count,
+                cleared_targets,
+            },
+        );
+        "complete".clone_into(&mut journal.phase);
+        journal.complete = true;
+        persist_reset_journal(&journal, false)?;
+        remove_reset_marker(&self.context.root)?;
+        Ok(report)
+    }
+
+    fn fail_reset(&self, stage: ResetStage) -> Result<()> {
+        if self.reset_crash_after == Some(stage) {
+            Err(Error::new(
+                ErrorKind::External,
+                format!("injected reset crash after {stage:?}"),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn preflight(&self) -> Result<PreflightReport> {
@@ -960,6 +1193,38 @@ struct SetupJournal {
     phase: String,
     complete: bool,
     entries: Vec<Snapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DataResetJournal {
+    version: u32,
+    id: String,
+    root: PathBuf,
+    backup_dir: PathBuf,
+    staging_root: PathBuf,
+    phase: String,
+    complete: bool,
+    applied_entries: usize,
+    entries: Vec<DataResetEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct DataResetEntry {
+    active: PathBuf,
+    backup: PathBuf,
+    staged: Option<PathBuf>,
+    original_present: bool,
+    staged_present: bool,
+}
+
+struct DataResetReportMaterial {
+    dry_run: bool,
+    reset_id: Option<String>,
+    backup: Option<PathBuf>,
+    had_remote: bool,
+    repository_count_cleared: usize,
+    repository_group_count_cleared: usize,
+    cleared_targets: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2192,6 +2457,9 @@ fn recover_incomplete_journals(root: &Path) -> Result<()> {
     }
     for entry in fs::read_dir(&backups).map_err(io_error("read backups directory"))? {
         let entry = entry.map_err(io_error("read backup entry"))?;
+        if !entry.file_name().to_string_lossy().starts_with("setup-") {
+            continue;
+        }
         let path = entry.path().join("journal.json");
         if path.is_file() {
             journals.push(path);
@@ -2214,6 +2482,300 @@ fn recover_incomplete_journals(root: &Path) -> Result<()> {
         atomic_write(&path, &bytes, 0o600)?;
     }
     Ok(())
+}
+
+fn reset_marker_path(root: &Path) -> PathBuf {
+    root.join("state/reset-journal.json")
+}
+
+fn reset_relative_targets() -> Vec<PathBuf> {
+    let mut targets = vec![PathBuf::from("repository"), PathBuf::from("config.toml")];
+    for database in [
+        "index.sqlite",
+        "runtime.sqlite",
+        "engineering.sqlite",
+        "repository-registry.sqlite",
+    ] {
+        for suffix in ["", "-wal", "-shm"] {
+            targets.push(PathBuf::from(format!("state/{database}{suffix}")));
+        }
+    }
+    targets.extend([
+        PathBuf::from("state/pending"),
+        PathBuf::from("state/pending-aside"),
+        PathBuf::from("state/capture"),
+        PathBuf::from("state/authorized-session-scopes"),
+    ]);
+    targets
+}
+
+fn validate_reset_active_targets(root: &Path) -> Result<()> {
+    for relative in reset_relative_targets() {
+        let active = root.join(&relative);
+        match fs::symlink_metadata(&active) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(invalid(format!(
+                    "data reset target must not be a symlink: {}",
+                    active.display()
+                )));
+            }
+            Ok(metadata) if relative == Path::new("repository") && !metadata.is_dir() => {
+                return Err(invalid("data reset repository target must be a directory"));
+            }
+            Ok(metadata) if relative == Path::new("config.toml") && !metadata.is_file() => {
+                return Err(invalid("data reset config target must be a regular file"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("inspect data reset target")(error)),
+        }
+    }
+    Ok(())
+}
+
+fn build_pristine_reset_root(final_root: &Path, staging_root: &Path) -> Result<()> {
+    ensure_private_directory(staging_root)?;
+    let store = GitStore::initialize(staging_root)?;
+    ProjectionIndex::for_store(&store).synchronize()?;
+    let _runtime = TaskRuntime::initialize(staging_root.to_path_buf())?;
+    let registry = RepositoryRegistry::initialize(staging_root.to_path_buf())?;
+    registry.sync_catalog(&[])?;
+    let _engineering = EngineeringProjectionStore::initialize(staging_root.to_path_buf())?;
+    let _capture = CaptureStore::initialize(staging_root)?;
+    let _scopes = AuthorizedSessionScopeStore::initialize(staging_root)?;
+    ensure_private_directory(&staging_root.join("state/pending-aside"))?;
+    let empty_config = UserConfigStore::empty_document(final_root)?;
+    atomic_write(
+        &staging_root.join("config.toml"),
+        empty_config.as_bytes(),
+        0o600,
+    )?;
+    Ok(())
+}
+
+fn build_reset_entries(
+    root: &Path,
+    backup_dir: &Path,
+    staging_root: &Path,
+) -> Result<Vec<DataResetEntry>> {
+    reset_relative_targets()
+        .into_iter()
+        .map(|relative| {
+            let active = root.join(&relative);
+            let staged = staging_root.join(&relative);
+            Ok(DataResetEntry {
+                original_present: reset_path_present(&active)?,
+                staged_present: reset_path_present(&staged)?,
+                backup: backup_dir.join("old").join(&relative),
+                active,
+                staged: Some(staged),
+            })
+        })
+        .collect()
+}
+
+fn persist_reset_journal(journal: &DataResetJournal, active_marker: bool) -> Result<()> {
+    validate_reset_journal(journal, &journal.root)?;
+    let bytes = serde_json::to_vec_pretty(journal)
+        .map_err(|error| io_value("serialize data reset journal", error))?;
+    atomic_write(&journal.backup_dir.join("journal.json"), &bytes, 0o600)?;
+    if active_marker {
+        atomic_write(&reset_marker_path(&journal.root), &bytes, 0o600)?;
+    }
+    Ok(())
+}
+
+fn validate_reset_journal(journal: &DataResetJournal, root: &Path) -> Result<()> {
+    if journal.version != RESET_JOURNAL_VERSION || journal.root != root {
+        return Err(invalid("data reset journal version or root is invalid"));
+    }
+    let raw_id = journal
+        .id
+        .strip_prefix("reset-")
+        .ok_or_else(|| invalid("data reset journal ID prefix is invalid"))?;
+    Uuid::parse_str(raw_id).map_err(|_| invalid("data reset journal ID is invalid"))?;
+    let expected_backup = root.join("backups").join(&journal.id);
+    if journal.backup_dir != expected_backup
+        || journal.staging_root != expected_backup.join("new")
+        || journal.entries.len() != reset_relative_targets().len()
+    {
+        return Err(invalid("data reset journal paths are invalid"));
+    }
+    for (entry, relative) in journal.entries.iter().zip(reset_relative_targets()) {
+        if entry.active != root.join(&relative)
+            || entry.backup != expected_backup.join("old").join(&relative)
+            || entry.staged.as_ref() != Some(&expected_backup.join("new").join(&relative))
+        {
+            return Err(invalid("data reset journal target is invalid"));
+        }
+    }
+    if journal.applied_entries > journal.entries.len() {
+        return Err(invalid("data reset journal applied count is invalid"));
+    }
+    Ok(())
+}
+
+fn read_active_reset_journal(root: &Path) -> Result<Option<DataResetJournal>> {
+    let marker = reset_marker_path(root);
+    let metadata = match fs::symlink_metadata(&marker) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error("inspect data reset journal")(error)),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(invalid(
+            "active data reset journal must be a private regular file",
+        ));
+    }
+    let bytes = fs::read(&marker).map_err(io_error("read data reset journal"))?;
+    let journal: DataResetJournal = serde_json::from_slice(&bytes)
+        .map_err(|error| invalid(format!("invalid data reset journal: {error}")))?;
+    validate_reset_journal(&journal, root)?;
+    Ok(Some(journal))
+}
+
+fn recover_incomplete_data_reset(root: &Path) -> Result<Option<PathBuf>> {
+    let Some(mut journal) = read_active_reset_journal(root)? else {
+        return Ok(None);
+    };
+    if journal.complete {
+        remove_reset_marker(root)?;
+        return Ok(Some(journal.backup_dir));
+    }
+    for entry in journal.entries.iter().rev() {
+        if reset_path_present(&entry.backup)? {
+            remove_any(&entry.active)?;
+            if let Some(parent) = entry.active.parent() {
+                ensure_private_directory(parent)?;
+            }
+            fs::rename(&entry.backup, &entry.active)
+                .map_err(io_error("restore data reset backup"))?;
+            sync_parent(&entry.backup)?;
+            sync_parent(&entry.active)?;
+        } else if !entry.original_present {
+            remove_any(&entry.active)?;
+        }
+    }
+    "recovered_rollback".clone_into(&mut journal.phase);
+    journal.complete = true;
+    persist_reset_journal(&journal, false)?;
+    remove_reset_marker(root)?;
+    Ok(Some(journal.backup_dir))
+}
+
+fn remove_reset_marker(root: &Path) -> Result<()> {
+    let marker = reset_marker_path(root);
+    match fs::remove_file(&marker) {
+        Ok(()) => sync_directory(
+            marker
+                .parent()
+                .ok_or_else(|| invalid("reset marker has no parent"))?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error("remove data reset journal")(error)),
+    }
+}
+
+fn smoke_pristine_reset_root(root: &Path) -> Result<()> {
+    let store = GitStore::initialize(root)?;
+    let snapshot = ProjectionIndex::for_store(&store).domain_snapshot()?;
+    if !snapshot.projection.spaces.is_empty()
+        || !snapshot.projection.candidates.is_empty()
+        || !snapshot.projection.engineering_references.is_empty()
+    {
+        return Err(invariant("reset Index is not empty"));
+    }
+    let catalog = UserConfigStore::open_existing(root)?.repository_catalog_wait()?;
+    if !catalog.repositories.is_empty() || !catalog.repository_groups.is_empty() {
+        return Err(invariant("reset Repository Catalog is not empty"));
+    }
+    let _runtime = TaskRuntime::initialize(root.to_path_buf())?;
+    if !RepositoryRegistry::initialize(root.to_path_buf())?
+        .list()?
+        .is_empty()
+    {
+        return Err(invariant("reset Repository Registry is not empty"));
+    }
+    if EngineeringProjectionStore::initialize(root.to_path_buf())?
+        .read_projection()?
+        .is_some()
+    {
+        return Err(invariant("reset Engineering projection is not empty"));
+    }
+    if knowledge_has_remote(store.repository())? {
+        return Err(invariant("reset Knowledge Store retained a Git remote"));
+    }
+    Ok(())
+}
+
+fn reset_report(root: &Path, material: DataResetReportMaterial) -> DataResetReport {
+    DataResetReport {
+        root: root.to_path_buf(),
+        dry_run: material.dry_run,
+        reset_id: material.reset_id,
+        backup: material.backup,
+        repository_count_cleared: material.repository_count_cleared,
+        repository_group_count_cleared: material.repository_group_count_cleared,
+        cleared_targets: material.cleared_targets,
+        preserved: vec![
+            root.join("bin"),
+            root.join("state/install-manifest.json"),
+            root.join("logs"),
+            root.join("backups"),
+        ],
+        remote_detached: !material.dry_run && material.had_remote,
+        remote_mutated: false,
+    }
+}
+
+fn existing_reset_targets(root: &Path) -> Vec<PathBuf> {
+    reset_relative_targets()
+        .into_iter()
+        .map(|relative| root.join(relative))
+        .filter(|path| path.exists())
+        .collect()
+}
+
+fn reset_path_present(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(invalid(format!(
+            "data reset path must not be a symlink: {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error("inspect data reset path")(error)),
+    }
+}
+
+fn knowledge_has_remote(repository: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["remote"])
+        .output()
+        .map_err(external_error("inspect Knowledge Store remotes"))?;
+    if !output.status.success() {
+        return Err(Error::new(
+            ErrorKind::External,
+            "inspect Knowledge Store remotes failed",
+        ));
+    }
+    Ok(!output.stdout.is_empty())
+}
+
+fn sync_parent(path: &Path) -> Result<()> {
+    sync_directory(
+        path.parent()
+            .ok_or_else(|| invalid("reset target has no parent"))?,
+    )
+}
+
+fn is_injected_reset_crash(error: &Error) -> bool {
+    error.kind() == ErrorKind::External && error.message().starts_with("injected reset crash after")
 }
 
 fn restore_journal(journal: &SetupJournal) -> Result<()> {
@@ -3038,6 +3600,10 @@ fn command_stdout(command: &mut Command, operation: &'static str) -> Result<Stri
 
 fn invalid(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::InvalidInput, message)
+}
+
+fn invariant(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvariantViolation, message)
 }
 
 fn io_error(operation: &'static str) -> impl FnOnce(std::io::Error) -> Error {

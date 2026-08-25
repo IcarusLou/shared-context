@@ -64,6 +64,7 @@ Commands:
   doctor [--fix] [--root PATH]
   upgrade [--agents cursor,codex] [--root PATH] [--runtime-source PATH]
   uninstall [--root PATH]
+  data reset [--dry-run] [--yes]
   knowledge delete --confirm-path PATH --confirm DELETE-SHARED-CONTEXT-KNOWLEDGE
   space create|intent revise|list|get
   candidate list|get|discard|confirm|build-closed-episode|analyze
@@ -186,6 +187,7 @@ fn run_without_maintenance(args: &[String], json_output: bool) -> Result<()> {
             run_install_lifecycle("upgrade", rest, json_output)
         }
         [command, rest @ ..] if command == "uninstall" => run_uninstall(rest, json_output),
+        [group, rest @ ..] if group == "data" => run_data(rest, json_output),
         [group, rest @ ..] if group == "knowledge" => run_knowledge(rest, json_output),
         [group, rest @ ..] if group == "space" => run_space(rest, json_output),
         [group, rest @ ..] if group == "candidate" => run_candidate(rest, json_output),
@@ -270,6 +272,26 @@ fn run_uninstall(args: &[String], json_output: bool) -> Result<()> {
     let options = Options::parse(args, &[])?;
     options.allow_only(&["--root", "--runtime-source", "--runtime-version"], &[])?;
     let report = installer_from_options(&options)?.uninstall()?;
+    emit_lifecycle(&report, json_output)
+}
+
+fn run_data(args: &[String], json_output: bool) -> Result<()> {
+    let [command, rest @ ..] = args else {
+        return Err(invalid("Usage: sctx data reset [--dry-run] [--yes]"));
+    };
+    if command != "reset" {
+        return Err(invalid("data command must be reset"));
+    }
+    let options = Options::parse(rest, &["--dry-run", "--yes"])?;
+    options.allow_only(
+        &["--root", "--runtime-source", "--runtime-version"],
+        &["--dry-run", "--yes"],
+    )?;
+    let report =
+        installer_from_options(&options)?.reset_data(sctx_installer::DataResetOptions {
+            confirmed: options.has("--yes"),
+            dry_run: options.has("--dry-run"),
+        })?;
     emit_lifecycle(&report, json_output)
 }
 

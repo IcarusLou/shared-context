@@ -611,6 +611,7 @@ dependencies = [
  "sctx-local-state",
  "sctx-mcp",
  "sctx-search",
+ "sctx-task-runtime",
  "serde",
  "serde_json",
  "sha2",

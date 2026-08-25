@@ -433,6 +433,7 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
         "doctor [--fix]",
         "upgrade [--agents cursor,codex]",
         "uninstall [--root PATH]",
+        "data reset [--dry-run] [--yes]",
         "knowledge delete --confirm-path PATH",
         "space create|intent revise|list|get",
         "candidate list|get|discard|confirm|build-closed-episode|analyze",
@@ -459,6 +460,20 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
         String::from_utf8_lossy(&version.stdout),
         format!("sctx {}\n", env!("CARGO_PKG_VERSION"))
     );
+}
+
+#[test]
+fn data_reset_requires_explicit_confirmation_before_initializing_state() {
+    let harness = Harness::new();
+    let rejected = harness.failure(&["data", "reset"]);
+    assert_eq!(rejected["error"]["code"], "invalid_input");
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--yes")
+    );
+    assert!(!harness.root().exists());
 }
 
 #[test]

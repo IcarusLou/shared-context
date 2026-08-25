@@ -66,6 +66,16 @@ impl MaintenanceLock {
     /// Returns [`ErrorKind::MaintenanceBusy`] while exclusive maintenance owns
     /// the installation, or a typed storage error for an unsafe lock file.
     pub fn try_shared(&self) -> Result<MaintenanceGuard> {
+        if self
+            .path
+            .parent()
+            .is_some_and(|state| state.join("reset-journal.json").exists())
+        {
+            return Err(Error::new(
+                ErrorKind::MaintenanceBusy,
+                "Shared Context installation requires reset recovery",
+            ));
+        }
         self.try_lock(false)
     }
 

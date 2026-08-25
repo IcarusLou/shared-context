@@ -692,6 +692,7 @@ Task Retrieval 默认只扩展一至两跳：
 │   ├── runtime.sqlite
 │   ├── repository-registry.sqlite
 │   ├── maintenance.lock
+│   ├── reset-journal.json        # 仅 reset 进行中或待恢复时存在
 │   ├── writer.lock
 │   ├── index.lock
 │   ├── runtime.lock
@@ -709,6 +710,7 @@ Task Retrieval 默认只扩展一至两跳：
 - `capture/`：受 TTL 和容量限制的临时 Evidence/Observation 材料。
 - `authorized-session-scopes/`：按 external Session locator digest 隔离、Catalog-bound、TTL-bounded 的私有 activation lease；不是 Task/Context 事实。
 - `maintenance.lock`：安装级非阻塞读写门禁；业务 CLI、Hook 和单次 MCP tool call 持共享锁，Setup/Upgrade/Uninstall、知识删除与 data reset 持排他锁。
+- `reset-journal.json`：活动 reset 的固定恢复 marker；存在时全部共享业务入口返回 `maintenance_busy`，只有持排他锁的 reset/setup/uninstall/知识删除可以先回滚恢复。
 - `config.toml`：固定 Context Store 与本机显式 Repository Catalog，不包含 Workspace-to-Space 映射。
 
 所有组件统一使用 `maintenance → setup/config/writer/index/runtime` 锁顺序。排他维护期间 CLI/MCP 返回 bounded `maintenance_busy`，Hook 保持 neutral；不得在持有组件锁后反向申请 maintenance lock。
@@ -1292,7 +1294,16 @@ sctx doctor --json
 
 `doctor --fix` 只执行安全、可重建的修复，例如重建 SQLite 和工程关联；不得自动改写 Git 事实或确认 Candidate。
 
-### 17.4 Uninstall
+### 17.4 Data Reset
+
+```bash
+sctx data reset --dry-run
+sctx data reset --yes
+```
+
+Reset 在安装级排他 maintenance guard 下执行：先在同文件系统 `backups/reset-<id>/new` 构造并 smoke 空 Git/Catalog/SQLite/临时目录，再通过持久 `state/reset-journal.json` 逐项 rename。任何中断后普通业务入口保持 `maintenance_busy`；下一次 reset 或 setup 先回滚到完整旧状态再继续。成功后删除 active marker、保留 backup journal 和旧数据。远端只做本地 remote 存在性读取，禁止 fetch/push/force/delete。
+
+### 17.5 Uninstall
 
 默认移除：
 

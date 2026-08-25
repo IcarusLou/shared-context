@@ -243,6 +243,31 @@ pub struct UserConfigStore {
 }
 
 impl UserConfigStore {
+    /// Serializes one empty Catalog for the final fixed Store under `root`.
+    ///
+    /// This is a pure staging helper for transactional reset; it does not create
+    /// or modify the installation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsafe root or serialization failure.
+    pub fn empty_document(root: impl AsRef<Path>) -> Result<String> {
+        let root = absolute(root.as_ref())?;
+        let document = ConfigDocument {
+            version: CONFIG_VERSION,
+            store: path_text(&root.join("repository"))?,
+            repositories: Vec::new(),
+            repository_groups: Vec::new(),
+        };
+        validate_document_structure(&document, &root.join("repository"))?;
+        toml::to_string_pretty(&document).map_err(|error| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("serialize empty config.toml: {error}"),
+            )
+        })
+    }
+
     /// Creates or validates the one user configuration and fixed repository.
     ///
     /// # Errors
