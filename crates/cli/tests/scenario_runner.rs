@@ -8,9 +8,9 @@ use sctx_scenario_contract::{
     ActionExpectation, ActionKind, ActorId, ActorKind, AgentFraming, AgentProfile, AgentVendor,
     AgentVersion, AssertionId, CaptureSource, EventClassification, EventSupport,
     ExpectedFailureCode, ExpectedFailureKind, InvariantAssertion, InvariantKind, JsonPointer,
-    ObservationSource, ProductAction, SandboxBuiltin, ScenarioAction, ScenarioActor,
-    ScenarioContractVersion, ScenarioDefinition, ScenarioSchema, ScenarioVariable, StepId,
-    TemplateValue, VariableKind, VariableName, WireName,
+    ObservationSource, ProductAction, ResourceId, SandboxBuiltin, SandboxFile, SandboxResource,
+    ScenarioAction, ScenarioActor, ScenarioContractVersion, ScenarioDefinition, ScenarioSchema,
+    ScenarioVariable, StepId, TemplateValue, VariableKind, VariableName, WireName,
 };
 use sctx_scenario_runner::state_fingerprint;
 use sctx_scenario_runner::{ReadOnlyObserver, RunnerConfig, ScenarioRunner, StepStatus};
@@ -58,6 +58,12 @@ fn capture(name: &str, kind: VariableKind, source: &str, pointer: &str) -> Scena
 
 #[allow(clippy::too_many_lines)]
 fn real_protocol_contract() -> ScenarioDefinition {
+    let resource = ResourceId::new("activation-repo").unwrap();
+    let resource_root = || {
+        builtin(SandboxBuiltin::ResourceRoot {
+            resource: resource.clone(),
+        })
+    };
     ScenarioDefinition {
         schema: ScenarioSchema::DynamicScenario,
         version: ScenarioContractVersion::V1,
@@ -81,13 +87,27 @@ fn real_protocol_contract() -> ScenarioDefinition {
         ],
         actions: vec![
             ScenarioAction {
+                id: step("repository-add"),
+                actor: ActorId::new("task").unwrap(),
+                after: vec![],
+                expectation: ActionExpectation::default(),
+                action: ActionKind::CliJson {
+                    arguments: vec![
+                        string("repository"),
+                        string("add"),
+                        string("--path"),
+                        resource_root(),
+                    ],
+                },
+            },
+            ScenarioAction {
                 id: step("session-start"),
                 actor: ActorId::new("session").unwrap(),
-                after: vec![],
+                after: vec![step("repository-add")],
                 expectation: ActionExpectation::default(),
                 action: ActionKind::HookEvent {
                     event: WireName::new("SessionStart").unwrap(),
-                    payload: object([("source", string("startup"))]),
+                    payload: object([("cwd", resource_root()), ("source", string("startup"))]),
                 },
             },
             ScenarioAction {
@@ -146,7 +166,14 @@ fn real_protocol_contract() -> ScenarioDefinition {
                 },
             },
         ],
-        resources: vec![],
+        resources: vec![SandboxResource {
+            id: resource,
+            synthetic_git: true,
+            files: vec![SandboxFile {
+                path: sctx_scenario_contract::ResourcePath::new("README.md").unwrap(),
+                content: "activation fixture\n".to_owned(),
+            }],
+        }],
         variables: vec![
             capture("task-id", VariableKind::TaskId, "intent-update", "/task_id"),
             capture(
@@ -220,6 +247,7 @@ fn real_sctx_runs_hook_content_length_mcp_cli_and_readonly_observer() {
 
 #[allow(clippy::too_many_lines)]
 fn stale_contract() -> ScenarioDefinition {
+    let resource = ResourceId::new("activation-repo").unwrap();
     let session_builtin = || {
         builtin(SandboxBuiltin::ActorSessionKey {
             actor: ActorId::new("session").unwrap(),
@@ -285,9 +313,43 @@ fn stale_contract() -> ScenarioDefinition {
             },
         ],
         actions: vec![
+            ScenarioAction {
+                id: step("repository-add"),
+                actor: ActorId::new("task").unwrap(),
+                after: vec![],
+                expectation: ActionExpectation::default(),
+                action: ActionKind::CliJson {
+                    arguments: vec![
+                        string("repository"),
+                        string("add"),
+                        string("--path"),
+                        builtin(SandboxBuiltin::ResourceRoot {
+                            resource: resource.clone(),
+                        }),
+                    ],
+                },
+            },
+            ScenarioAction {
+                id: step("session-start"),
+                actor: ActorId::new("session").unwrap(),
+                after: vec![step("repository-add")],
+                expectation: ActionExpectation::default(),
+                action: ActionKind::HookEvent {
+                    event: WireName::new("SessionStart").unwrap(),
+                    payload: object([
+                        (
+                            "cwd",
+                            builtin(SandboxBuiltin::ResourceRoot {
+                                resource: resource.clone(),
+                            }),
+                        ),
+                        ("source", string("startup")),
+                    ]),
+                },
+            },
             update(
                 "intent-one",
-                vec![],
+                vec![step("session-start")],
                 "new",
                 TemplateValue::Null,
                 "establish the first synthetic direction",
@@ -315,7 +377,14 @@ fn stale_contract() -> ScenarioDefinition {
             ),
             observe("after-stale", "stale-attempt"),
         ],
-        resources: vec![],
+        resources: vec![SandboxResource {
+            id: resource,
+            synthetic_git: true,
+            files: vec![SandboxFile {
+                path: sctx_scenario_contract::ResourcePath::new("README.md").unwrap(),
+                content: "activation fixture\n".to_owned(),
+            }],
+        }],
         variables: vec![
             capture("task-id", VariableKind::TaskId, "intent-one", "/task_id"),
             capture(

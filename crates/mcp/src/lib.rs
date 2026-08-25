@@ -46,7 +46,10 @@ use sctx_git_store::{
     CandidateSubmissionStatus, GitStore,
 };
 use sctx_index::{DomainSnapshot, ProjectionIndex};
-use sctx_local_state::{PrivacyScanner, RepositoryCatalogSnapshot, UserConfigStore};
+use sctx_local_state::{
+    AuthorizedSessionScope, AuthorizedSessionScopeDecision, AuthorizedSessionScopeRead,
+    AuthorizedSessionScopeStore, PrivacyScanner, RepositoryCatalogSnapshot, UserConfigStore,
+};
 use sctx_search::{
     CandidateAnalysisRequest, ConflictView, ContextPackOmitted, ContextStatus,
     DEFAULT_TASK_MAX_SPACES, MAX_CANDIDATE_ANALYSIS_TOKEN_BUDGET, MAX_CANDIDATE_ANALYSIS_TOP_K,
@@ -995,13 +998,20 @@ impl ClaimBuildMaterial {
 
 impl Runtime {
     fn open(root: &Path) -> Result<Self> {
+        let _store = GitStore::initialize(root)?;
+        let catalog = UserConfigStore::open_existing(root)?.repository_catalog_wait()?;
+        Self::open_with_catalog(root, catalog)
+    }
+
+    /// Opens business state against the exact Catalog snapshot that authorized
+    /// this call. Public MCP dispatch must never re-read a newer Catalog here.
+    fn open_with_catalog(root: &Path, catalog: RepositoryCatalogSnapshot) -> Result<Self> {
         let base_store = GitStore::initialize(root)?;
         let index = ProjectionIndex::for_store(&base_store);
         let store = base_store
             .with_candidate_submission_index(Arc::new(index.clone()))
             .with_candidate_confirmation_index(Arc::new(index.clone()));
         let repositories = RepositoryRegistry::initialize(root)?;
-        let catalog = UserConfigStore::open_existing(root)?.repository_catalog_wait()?;
         sync_repository_catalog_snapshot(&repositories, &catalog)?;
         let engineering_graph = EngineeringProjectionStore::initialize(root).ok();
         let tasks = TaskRuntime::initialize(root)?;
@@ -3145,23 +3155,49 @@ fn build_task_context_response(
 
 /// Stateful MCP request dispatcher for one stdio session.
 pub struct McpServer {
-    runtime: Runtime,
+    root: PathBuf,
+    runtime: Option<Runtime>,
     client: ClientKind,
     initialized: bool,
+    authorization_linearization_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[derive(Clone, Debug)]
+struct AuthorizedCallSnapshot {
+    catalog: RepositoryCatalogSnapshot,
+    _scope: AuthorizedSessionScope,
 }
 
 impl McpServer {
-    /// Opens the unique store, rebuildable projection, and local Task Runtime.
+    /// Constructs a lazy server without opening Store, Index, Graph, or Task Runtime state.
     ///
     /// # Errors
     ///
-    /// Returns storage/configuration errors from the existing runtime boundaries.
+    /// Returns an I/O error only when the installation root cannot be made absolute.
     pub fn new(root: impl AsRef<Path>, client: ClientKind) -> Result<Self> {
+        let root = std::path::absolute(root.as_ref()).map_err(|error| {
+            Error::new(ErrorKind::Io, format!("make MCP root absolute: {error}"))
+        })?;
         Ok(Self {
-            runtime: Runtime::open(root.as_ref())?,
+            root,
+            runtime: None,
             client,
             initialized: false,
+            authorization_linearization_hook: None,
         })
+    }
+
+    /// Installs a controlled test seam immediately after authorization has
+    /// linearized and before any business Runtime is opened.
+    #[doc(hidden)]
+    pub fn set_authorization_linearization_hook(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.authorization_linearization_hook = Some(hook);
+    }
+
+    fn runtime(&self) -> &Runtime {
+        self.runtime
+            .as_ref()
+            .expect("authorized MCP dispatch must open Runtime")
     }
 
     /// Runs requests until stdin reaches a clean EOF.
@@ -3305,35 +3341,70 @@ impl McpServer {
     fn tools_call(&mut self, params: Value) -> Result<Value> {
         let call: ToolCall = serde_json::from_value(params)
             .map_err(|error| invalid(format!("invalid tools/call params: {error}")))?;
-        let result = match call.name.as_str() {
-            "task_intent_update" => self.task_intent_update(call.arguments),
-            "task_artifact_focus" => self.task_artifact_focus(call.arguments),
-            "task_signal_supersede" => self.task_signal_supersede(call.arguments),
-            "task_checkpoint" => self.task_checkpoint(call.arguments),
-            "task_context" => self.task_context(call.arguments),
-            "repository_scan" => self.repository_scan(call.arguments),
-            "engineering_reference_record" => self.engineering_reference_record(call.arguments),
-            "association_explain" => self.association_explain(call.arguments),
-            "association_rebuild" => self.association_rebuild(call.arguments),
-            "context_search" => self.context_search(call.arguments),
-            "context_get" => self.context_get(call.arguments),
-            "candidate_list" => self.candidate_list(call.arguments),
-            "candidate_get" => self.candidate_get(call.arguments),
-            "candidate_discard" => self.candidate_discard(call.arguments),
-            "candidate_confirm" => self.candidate_confirm(call.arguments),
-            "space_list" => self.space_list(call.arguments),
-            _ => return Err(invalid(format!("unknown tool: {}", call.name))),
-        };
+        if !is_public_tool(&call.name) {
+            return Err(invalid(format!("unknown tool: {}", call.name)));
+        }
+        self.runtime = None;
+        let result = self.authorize_and_call(&call);
         match result {
             Ok(data) => tool_success(data),
             Err(failure) => tool_failure(failure),
         }
     }
 
+    fn authorize_and_call(&mut self, call: &ToolCall) -> ToolResult {
+        validate_public_arguments(&call.name, &call.arguments)?;
+        let locator = locator_from_arguments(&call.arguments)?;
+        if locator.agent_kind
+            != match self.client {
+                ClientKind::Cursor => "cursor",
+                ClientKind::Codex => "codex",
+            }
+        {
+            return Err(ToolFailure::authorization_failed());
+        }
+        let authorization = authorize_public_call(&self.root, &locator)?;
+        if let Some(hook) = &self.authorization_linearization_hook {
+            hook();
+        }
+        if requires_runtime_identity_preflight(&call.name) {
+            let runtime_database = self.root.join("state/runtime.sqlite");
+            if !runtime_database.is_file() {
+                return Err(identity_target_unavailable(&call.name));
+            }
+            let tasks = TaskRuntime::initialize(&self.root)
+                .map_err(|error| runtime_open_failure(&call.name, error))?;
+            authorize_runtime_identity_target(&call.name, &call.arguments, &tasks)?;
+        }
+        let runtime = Runtime::open_with_catalog(&self.root, authorization.catalog.clone())
+            .map_err(|error| runtime_open_failure(&call.name, error))?;
+        self.runtime = Some(runtime);
+        let arguments = call.arguments.clone();
+        match call.name.as_str() {
+            "task_intent_update" => self.task_intent_update(arguments),
+            "task_artifact_focus" => self.task_artifact_focus(arguments),
+            "task_signal_supersede" => self.task_signal_supersede(arguments),
+            "task_checkpoint" => self.task_checkpoint(arguments),
+            "task_context" => self.task_context(arguments),
+            "repository_scan" => self.repository_scan(arguments),
+            "engineering_reference_record" => self.engineering_reference_record(arguments),
+            "association_explain" => self.association_explain(arguments),
+            "association_rebuild" => self.association_rebuild(arguments),
+            "context_search" => self.context_search(arguments),
+            "context_get" => self.context_get(arguments),
+            "candidate_list" => self.candidate_list(arguments),
+            "candidate_get" => self.candidate_get(arguments),
+            "candidate_discard" => self.candidate_discard(arguments),
+            "candidate_confirm" => self.candidate_confirm(arguments),
+            "space_list" => self.space_list(arguments),
+            _ => unreachable!("public tool was validated before dispatch"),
+        }
+    }
+
     fn context_search(&self, arguments: Value) -> ToolResult {
         let input: SearchInput = decode_arguments(arguments)?;
         let response =
-            SearchEngine::new(self.runtime.index.clone()).search(&input.into_request()?)?;
+            SearchEngine::new(self.runtime().index.clone()).search(&input.into_request()?)?;
         let conflicts = collect_conflicts(&response.results);
         let mut data = serde_json::to_value(response).map_err(serialization_failure)?;
         insert_fields(
@@ -3356,7 +3427,7 @@ impl McpServer {
         let input: TaskContextReadInput = decode_arguments(arguments)?;
         input.validate()?;
         let response = self
-            .runtime
+            .runtime()
             .task_context_readonly(&input)
             .map_err(ToolFailure::task_context_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
@@ -3365,7 +3436,7 @@ impl McpServer {
     fn task_intent_update(&self, arguments: Value) -> ToolResult {
         let input: TaskIntentUpdateInput = decode_arguments(arguments)?;
         let response = self
-            .runtime
+            .runtime()
             .task_intent_update(&input)
             .map_err(ToolFailure::intent_update_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
@@ -3374,7 +3445,7 @@ impl McpServer {
     fn task_artifact_focus(&self, arguments: Value) -> ToolResult {
         let input: ArtifactFocusQuery = decode_arguments(arguments)?;
         let response = self
-            .runtime
+            .runtime()
             .task_artifact_focus(&input)
             .map_err(ToolFailure::task_context_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
@@ -3383,7 +3454,7 @@ impl McpServer {
     fn task_signal_supersede(&self, arguments: Value) -> ToolResult {
         let input: TaskSignalSupersedeInput = decode_arguments(arguments)?;
         let response = self
-            .runtime
+            .runtime()
             .task_signal_supersede(&input)
             .map_err(ToolFailure::task_context_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
@@ -3392,43 +3463,49 @@ impl McpServer {
     fn task_checkpoint(&self, arguments: Value) -> ToolResult {
         let input: TaskCheckpointInput = decode_arguments(arguments)?;
         let response = self
-            .runtime
+            .runtime()
             .task_checkpoint(&input)
             .map_err(ToolFailure::task_context_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
     }
 
     fn repository_scan(&self, arguments: Value) -> ToolResult {
-        let input: RepositoryScanInput = decode_arguments(arguments)?;
+        let input = decode_arguments::<McpRepositoryScanInput>(arguments)?.into_inner();
         let response = self
-            .runtime
+            .runtime()
             .repository_scan(&input)
             .map_err(ToolFailure::engineering_graph_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
     }
 
     fn engineering_reference_record(&self, arguments: Value) -> ToolResult {
-        let input: EngineeringReferenceRecordInput = decode_arguments(arguments)?;
+        let input = decode_arguments::<McpEngineeringReferenceRecordInput>(arguments)?.into_inner();
         let response = self
-            .runtime
+            .runtime()
             .engineering_reference_record(&input)
             .map_err(ToolFailure::engineering_graph_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
     }
 
     fn association_explain(&self, arguments: Value) -> ToolResult {
-        let input: AssociationExplainInput = decode_arguments(arguments)?;
+        let input: McpAssociationExplainInput = decode_arguments(arguments)?;
+        let input = AssociationExplainInput {
+            reference_id: input.reference_id,
+        };
         let response = self
-            .runtime
+            .runtime()
             .association_explain(&input)
             .map_err(ToolFailure::engineering_graph_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
     }
 
     fn association_rebuild(&self, arguments: Value) -> ToolResult {
-        let input: AssociationRebuildInput = decode_arguments(arguments)?;
+        let input: McpAssociationRebuildInput = decode_arguments(arguments)?;
+        let input = AssociationRebuildInput {
+            diagnose_only: input.diagnose_only,
+        };
         let response = self
-            .runtime
+            .runtime()
             .association_rebuild(&input)
             .map_err(ToolFailure::engineering_graph_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
@@ -3447,7 +3524,7 @@ impl McpServer {
             .as_deref()
             .map(|value| parse_id::<SpaceId>(value, "space_id"))
             .transpose()?;
-        let snapshot = self.runtime.snapshot()?;
+        let snapshot = self.runtime().snapshot()?;
         let (found_space_id, context) = find_context(&snapshot, space_id, context_id)?;
         let value = if let Some(revision_id) = revision_id {
             let revision = context.revisions.get(&revision_id).ok_or_else(|| {
@@ -3471,8 +3548,8 @@ impl McpServer {
     }
 
     fn space_list(&self, arguments: Value) -> ToolResult {
-        let _: EmptyInput = decode_arguments(arguments)?;
-        let snapshot = self.runtime.snapshot()?;
+        let _: SessionInput = decode_arguments(arguments)?;
+        let snapshot = self.runtime().snapshot()?;
         let spaces = snapshot
             .projection
             .spaces
@@ -3508,7 +3585,7 @@ impl McpServer {
 
     fn candidate_list(&self, arguments: Value) -> ToolResult {
         let input: CandidateListInput = decode_arguments(arguments)?;
-        self.runtime
+        self.runtime()
             .candidate_list(&input)
             .and_then(|response| {
                 serde_json::to_value(response).map_err(|error| {
@@ -3523,7 +3600,7 @@ impl McpServer {
 
     fn candidate_get(&self, arguments: Value) -> ToolResult {
         let input: CandidateGetInput = decode_arguments(arguments)?;
-        self.runtime
+        self.runtime()
             .candidate_get(&input)
             .and_then(|response| {
                 serde_json::to_value(response).map_err(|error| {
@@ -3538,7 +3615,7 @@ impl McpServer {
 
     fn candidate_discard(&self, arguments: Value) -> ToolResult {
         let input: CandidateDiscardInput = decode_arguments(arguments)?;
-        self.runtime
+        self.runtime()
             .candidate_discard(&input)
             .and_then(|response| {
                 serde_json::to_value(response).map_err(|error| {
@@ -3553,7 +3630,7 @@ impl McpServer {
 
     fn candidate_confirm(&self, arguments: Value) -> ToolResult {
         let input: CandidateConfirmInput = decode_arguments(arguments)?;
-        self.runtime
+        self.runtime()
             .candidate_confirm(&input)
             .and_then(|response| {
                 serde_json::to_value(response).map_err(|error| {
@@ -3595,6 +3672,16 @@ struct ToolFailure {
 }
 
 impl ToolFailure {
+    fn authorization_failed() -> Self {
+        Self {
+            code: "session_not_authorized",
+            error: Error::new(
+                ErrorKind::External,
+                "Shared Context MCP call is not authorized for this Agent Session",
+            ),
+        }
+    }
+
     fn task_context_failed(error: Error) -> Self {
         let code = match error.kind() {
             ErrorKind::InvalidInput => "invalid_input",
@@ -3647,6 +3734,31 @@ impl ToolFailure {
         };
         Self { code, error }
     }
+
+    fn task_target_failed(error: Error) -> Self {
+        if error.kind() == ErrorKind::InvalidInput {
+            Self {
+                code: "task_target_unavailable",
+                error: Error::new(ErrorKind::External, "Task target is unavailable"),
+            }
+        } else {
+            Self::task_context_failed(error)
+        }
+    }
+
+    fn candidate_target_failed(error: Error) -> Self {
+        if error.kind() == ErrorKind::InvalidInput {
+            Self {
+                code: "candidate_review_unavailable",
+                error: Error::new(
+                    ErrorKind::External,
+                    "Candidate Review target is unavailable",
+                ),
+            }
+        } else {
+            Self::candidate_review_failed(error)
+        }
+    }
 }
 
 impl From<Error> for ToolFailure {
@@ -3668,14 +3780,99 @@ struct ToolCall {
     _meta: Option<Value>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EmptyInput {}
+struct SessionInput {
+    #[serde(rename = "agent_kind")]
+    _agent_kind: String,
+    #[serde(rename = "external_session_id")]
+    _external_session_id: String,
+}
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpRepositoryScanInput {
+    #[serde(rename = "agent_kind")]
+    _agent_kind: String,
+    #[serde(rename = "external_session_id")]
+    _external_session_id: String,
+    checkout_path: String,
+    paths: Vec<String>,
+    #[serde(default = "default_scan_artifact_limit")]
+    max_artifacts: usize,
+}
+
+impl McpRepositoryScanInput {
+    fn into_inner(self) -> RepositoryScanInput {
+        RepositoryScanInput {
+            checkout_path: self.checkout_path,
+            paths: self.paths,
+            max_artifacts: self.max_artifacts,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpEngineeringReferenceRecordInput {
+    #[serde(rename = "agent_kind")]
+    _agent_kind: String,
+    #[serde(rename = "external_session_id")]
+    _external_session_id: String,
+    context_id: String,
+    revision_id: String,
+    repository_id: String,
+    artifact_kind: ArtifactKind,
+    relation: ReferenceRelation,
+    locator: ArtifactLocator,
+    supports: String,
+    limitations: Vec<String>,
+}
+
+impl McpEngineeringReferenceRecordInput {
+    fn into_inner(self) -> EngineeringReferenceRecordInput {
+        EngineeringReferenceRecordInput {
+            context_id: self.context_id,
+            revision_id: self.revision_id,
+            repository_id: self.repository_id,
+            artifact_kind: self.artifact_kind,
+            relation: self.relation,
+            locator: self.locator,
+            supports: self.supports,
+            limitations: self.limitations,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpAssociationExplainInput {
+    #[serde(rename = "agent_kind")]
+    _agent_kind: String,
+    #[serde(rename = "external_session_id")]
+    _external_session_id: String,
+    reference_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpAssociationRebuildInput {
+    #[serde(rename = "agent_kind")]
+    _agent_kind: String,
+    #[serde(rename = "external_session_id")]
+    _external_session_id: String,
+    #[serde(default)]
+    diagnose_only: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(clippy::struct_field_names)]
 struct GetInput {
+    #[serde(rename = "agent_kind")]
+    _agent_kind: String,
+    #[serde(rename = "external_session_id")]
+    _external_session_id: String,
     context_id: String,
     #[serde(default)]
     space_id: Option<String>,
@@ -3683,9 +3880,13 @@ struct GetInput {
     revision_id: Option<String>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SearchInput {
+    #[serde(rename = "agent_kind")]
+    _agent_kind: String,
+    #[serde(rename = "external_session_id")]
+    _external_session_id: String,
     #[serde(default)]
     query: String,
     #[serde(default)]
@@ -3731,6 +3932,261 @@ impl SearchInput {
 }
 
 type ToolResultSearch = std::result::Result<SearchRequest, ToolFailure>;
+
+fn is_public_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "task_intent_update"
+            | "task_artifact_focus"
+            | "task_signal_supersede"
+            | "task_checkpoint"
+            | "task_context"
+            | "repository_scan"
+            | "engineering_reference_record"
+            | "association_explain"
+            | "association_rebuild"
+            | "context_search"
+            | "context_get"
+            | "candidate_list"
+            | "candidate_get"
+            | "candidate_discard"
+            | "candidate_confirm"
+            | "space_list"
+    )
+}
+
+fn runtime_open_failure(name: &str, error: Error) -> ToolFailure {
+    match name {
+        "task_intent_update" => ToolFailure::intent_update_failed(error),
+        "task_artifact_focus" | "task_signal_supersede" | "task_checkpoint" | "task_context" => {
+            ToolFailure::task_context_failed(error)
+        }
+        "repository_scan"
+        | "engineering_reference_record"
+        | "association_explain"
+        | "association_rebuild" => ToolFailure::engineering_graph_failed(error),
+        "candidate_list" | "candidate_get" | "candidate_discard" | "candidate_confirm" => {
+            ToolFailure::candidate_review_failed(error)
+        }
+        _ => ToolFailure::from(error),
+    }
+}
+
+fn validate_public_arguments(
+    name: &str,
+    arguments: &Value,
+) -> std::result::Result<(), ToolFailure> {
+    macro_rules! decode {
+        ($input:ty) => {{
+            let _: $input = decode_arguments(arguments.clone())?;
+        }};
+    }
+    match name {
+        "task_intent_update" => decode!(TaskIntentUpdateInput),
+        "task_artifact_focus" => decode!(ArtifactFocusQuery),
+        "task_signal_supersede" => decode!(TaskSignalSupersedeInput),
+        "task_checkpoint" => decode!(TaskCheckpointInput),
+        "task_context" => decode!(TaskContextReadInput),
+        "repository_scan" => decode!(McpRepositoryScanInput),
+        "engineering_reference_record" => decode!(McpEngineeringReferenceRecordInput),
+        "association_explain" => decode!(McpAssociationExplainInput),
+        "association_rebuild" => decode!(McpAssociationRebuildInput),
+        "context_search" => decode!(SearchInput),
+        "context_get" => decode!(GetInput),
+        "candidate_list" => decode!(CandidateListInput),
+        "candidate_get" => decode!(CandidateGetInput),
+        "candidate_discard" => decode!(CandidateDiscardInput),
+        "candidate_confirm" => decode!(CandidateConfirmInput),
+        "space_list" => decode!(SessionInput),
+        _ => unreachable!("public tool name was checked"),
+    }
+    Ok(())
+}
+
+fn locator_from_arguments(
+    arguments: &Value,
+) -> std::result::Result<ExternalSessionLocator, ToolFailure> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(ToolFailure::authorization_failed)?;
+    let agent_kind = object
+        .get("agent_kind")
+        .and_then(Value::as_str)
+        .ok_or_else(ToolFailure::authorization_failed)?;
+    let external_session_id = object
+        .get("external_session_id")
+        .and_then(Value::as_str)
+        .ok_or_else(ToolFailure::authorization_failed)?;
+    ExternalSessionLocator::new(agent_kind, external_session_id)
+        .map_err(|_| ToolFailure::authorization_failed())
+}
+
+fn authorize_public_call(
+    root: &Path,
+    locator: &ExternalSessionLocator,
+) -> std::result::Result<AuthorizedCallSnapshot, ToolFailure> {
+    // The successful nonblocking lease classification against this exact Catalog is the call's
+    // authorization linearization point. Later expiry, SessionEnd, or Catalog replacement affects
+    // the next call; this call carries the frozen Catalog and allowed Repository identities.
+    let authorization = || -> Result<AuthorizedCallSnapshot> {
+        let catalog = UserConfigStore::open_existing(root)?.repository_catalog()?;
+        let store = AuthorizedSessionScopeStore::initialize(root)?;
+        match store.try_read(locator, &catalog)? {
+            AuthorizedSessionScopeRead::Current(scope)
+                if !matches!(scope.decision, AuthorizedSessionScopeDecision::Disabled)
+                    && !scope.allowed_repository_ids.is_empty() =>
+            {
+                Ok(AuthorizedCallSnapshot {
+                    catalog,
+                    _scope: scope,
+                })
+            }
+            AuthorizedSessionScopeRead::Missing
+            | AuthorizedSessionScopeRead::Expired
+            | AuthorizedSessionScopeRead::StaleCatalog
+            | AuthorizedSessionScopeRead::Current(_) => Err(unavailable("unauthorized")),
+        }
+    };
+    authorization().map_err(|_| ToolFailure::authorization_failed())
+}
+
+fn authorize_runtime_identity_target(
+    name: &str,
+    arguments: &Value,
+    tasks: &TaskRuntime,
+) -> std::result::Result<(), ToolFailure> {
+    match name {
+        "task_signal_supersede" => {
+            let input: TaskSignalSupersedeInput = serde_json::from_value(arguments.clone())
+                .map_err(|error| ToolFailure::from(invalid(error.to_string())))?;
+            let locator =
+                ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)
+                    .map_err(ToolFailure::from)?;
+            let expected_task_id =
+                parse_id_value(&input.task_id, "task_id").map_err(ToolFailure::from)?;
+            let active = tasks
+                .read_snapshot_by_locator(&locator)
+                .map_err(ToolFailure::task_context_failed)?;
+            if active.as_ref().map(|task| task.task_id) != Some(expected_task_id) {
+                return Err(ToolFailure::task_target_failed(invalid(
+                    "Task target is unavailable",
+                )));
+            }
+        }
+        "task_checkpoint" => {
+            let input: TaskCheckpointInput = serde_json::from_value(arguments.clone())
+                .map_err(|error| ToolFailure::from(invalid(error.to_string())))?;
+            let locator =
+                ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)
+                    .map_err(ToolFailure::from)?;
+            let expected_task_id = parse_id_value(&input.expected_task_id, "expected_task_id")
+                .map_err(ToolFailure::from)?;
+            let active = tasks
+                .read_snapshot_by_locator(&locator)
+                .map_err(ToolFailure::task_context_failed)?;
+            if active.as_ref().map(|task| task.task_id) != Some(expected_task_id) {
+                return Err(ToolFailure::task_target_failed(invalid(
+                    "Task target is unavailable",
+                )));
+            }
+        }
+        "candidate_get" => {
+            let input: CandidateGetInput = serde_json::from_value(arguments.clone())
+                .map_err(|error| ToolFailure::from(invalid(error.to_string())))?;
+            require_owned_candidate(
+                tasks,
+                &input.agent_kind,
+                &input.external_session_id,
+                &input.candidate_id,
+            )?;
+        }
+        "candidate_discard" => {
+            let input: CandidateDiscardInput = serde_json::from_value(arguments.clone())
+                .map_err(|error| ToolFailure::from(invalid(error.to_string())))?;
+            require_owned_task_and_candidate(
+                tasks,
+                &input.agent_kind,
+                &input.external_session_id,
+                &input.expected_task_id,
+                &input.candidate_id,
+            )?;
+        }
+        "candidate_confirm" => {
+            let input: CandidateConfirmInput = serde_json::from_value(arguments.clone())
+                .map_err(|error| ToolFailure::from(invalid(error.to_string())))?;
+            require_owned_task_and_candidate(
+                tasks,
+                &input.agent_kind,
+                &input.external_session_id,
+                &input.expected_task_id,
+                &input.candidate_id,
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn require_owned_task_and_candidate(
+    tasks: &TaskRuntime,
+    agent_kind: &str,
+    external_session_id: &str,
+    expected_task_id: &str,
+    candidate_id: &str,
+) -> std::result::Result<(), ToolFailure> {
+    let locator =
+        ExternalSessionLocator::new(agent_kind, external_session_id).map_err(ToolFailure::from)?;
+    let expected_task_id =
+        parse_id_value(expected_task_id, "expected_task_id").map_err(ToolFailure::from)?;
+    let active = tasks
+        .read_snapshot_by_locator(&locator)
+        .map_err(ToolFailure::candidate_review_failed)?;
+    if active.as_ref().map(|task| task.task_id) != Some(expected_task_id) {
+        return Err(ToolFailure::candidate_target_failed(invalid(
+            "Candidate Review target is unavailable",
+        )));
+    }
+    require_owned_candidate(tasks, agent_kind, external_session_id, candidate_id)
+}
+
+fn require_owned_candidate(
+    tasks: &TaskRuntime,
+    agent_kind: &str,
+    external_session_id: &str,
+    candidate_id: &str,
+) -> std::result::Result<(), ToolFailure> {
+    let locator =
+        ExternalSessionLocator::new(agent_kind, external_session_id).map_err(ToolFailure::from)?;
+    let candidate_id = parse_id_value(candidate_id, "candidate_id").map_err(ToolFailure::from)?;
+    let owned = tasks
+        .read_candidate_review(&locator, candidate_id)
+        .map_err(ToolFailure::candidate_review_failed)?;
+    if owned.is_none() {
+        return Err(ToolFailure::candidate_target_failed(invalid(
+            "Candidate Review target is unavailable",
+        )));
+    }
+    Ok(())
+}
+
+fn requires_runtime_identity_preflight(name: &str) -> bool {
+    matches!(
+        name,
+        "task_signal_supersede"
+            | "task_checkpoint"
+            | "candidate_get"
+            | "candidate_discard"
+            | "candidate_confirm"
+    )
+}
+
+fn identity_target_unavailable(name: &str) -> ToolFailure {
+    if matches!(name, "task_signal_supersede" | "task_checkpoint") {
+        ToolFailure::task_target_failed(invalid("Task target is unavailable"))
+    } else {
+        ToolFailure::candidate_target_failed(invalid("Candidate Review target is unavailable"))
+    }
+}
 
 #[allow(clippy::too_many_lines)]
 fn tools_list() -> Value {
@@ -3786,8 +4242,12 @@ fn tools_list() -> Value {
             json!({
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["reference_id"],
-                "properties": {"reference_id": id_schema("ref_")}
+                "required": ["agent_kind", "external_session_id", "reference_id"],
+                "properties": {
+                    "agent_kind": {"type": "string", "minLength": 1},
+                    "external_session_id": {"type": "string", "minLength": 1},
+                    "reference_id": id_schema("ref_")
+                }
             })
         ),
         tool_schema(
@@ -3796,7 +4256,12 @@ fn tools_list() -> Value {
             json!({
                 "type": "object",
                 "additionalProperties": false,
-                "properties": {"diagnose_only": {"type": "boolean", "default": false}}
+                "required": ["agent_kind", "external_session_id"],
+                "properties": {
+                    "agent_kind": {"type": "string", "minLength": 1},
+                    "external_session_id": {"type": "string", "minLength": 1},
+                    "diagnose_only": {"type": "boolean", "default": false}
+                }
             })
         ),
         tool_schema(
@@ -3810,8 +4275,10 @@ fn tools_list() -> Value {
             json!({
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["context_id"],
+                "required": ["agent_kind", "external_session_id", "context_id"],
                 "properties": {
+                    "agent_kind": {"type": "string", "minLength": 1},
+                    "external_session_id": {"type": "string", "minLength": 1},
                     "context_id": id_schema("ctx_"),
                     "space_id": id_schema("spc_"),
                     "revision_id": id_schema("rev_")
@@ -3841,7 +4308,15 @@ fn tools_list() -> Value {
         tool_schema(
             "space_list",
             "List available ContextSpaces from a deterministic Git tree.",
-            json!({"type": "object", "additionalProperties": false, "properties": {}})
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["agent_kind", "external_session_id"],
+                "properties": {
+                    "agent_kind": {"type": "string", "minLength": 1},
+                    "external_session_id": {"type": "string", "minLength": 1}
+                }
+            })
         )
     ]})
 }
@@ -3850,8 +4325,10 @@ fn repository_scan_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["checkout_path", "paths"],
+        "required": ["agent_kind", "external_session_id", "checkout_path", "paths"],
         "properties": {
+            "agent_kind": {"type": "string", "minLength": 1},
+            "external_session_id": {"type": "string", "minLength": 1},
             "checkout_path": {"type": "string", "minLength": 1},
             "paths": {
                 "type": "array",
@@ -3948,8 +4425,10 @@ fn engineering_reference_record_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["context_id", "revision_id", "repository_id", "artifact_kind", "relation", "locator", "supports", "limitations"],
+        "required": ["agent_kind", "external_session_id", "context_id", "revision_id", "repository_id", "artifact_kind", "relation", "locator", "supports", "limitations"],
         "properties": {
+            "agent_kind": {"type": "string", "minLength": 1},
+            "external_session_id": {"type": "string", "minLength": 1},
             "context_id": id_schema("ctx_"),
             "revision_id": id_schema("rev_"),
             "repository_id": id_schema("rpo_"),
@@ -4197,7 +4676,10 @@ fn search_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
+        "required": ["agent_kind", "external_session_id"],
         "properties": {
+            "agent_kind": {"type": "string", "minLength": 1},
+            "external_session_id": {"type": "string", "minLength": 1},
             "query": {"type": "string", "default": ""},
             "space_ids": {"type": "array", "items": id_schema("spc_")},
             "domains": string_array_schema(),

@@ -16,7 +16,9 @@ use sctx_domain::{
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
-use sctx_local_state::UserConfigStore;
+use sctx_local_state::{
+    ActivationScope, ActivationScopeDecision, AuthorizedSessionScopeStore, UserConfigStore,
+};
 use sctx_mcp::{
     ArtifactFocusQuery, ArtifactFocusQueryCoordinates, AssociationExplainInput,
     AssociationRebuildInput, ClientKind, DisconnectReason, EngineeringReferenceRecordInput,
@@ -91,6 +93,28 @@ fn task_update_arguments(session: &str) -> Value {
             "current_direction": "zyqnebula"
         }
     })
+}
+
+fn authorize_group_session(root: &Path, session: &str) {
+    let catalog = UserConfigStore::open_existing(root)
+        .unwrap()
+        .repository_catalog_wait()
+        .unwrap();
+    let group = catalog.repository_groups.first().unwrap();
+    AuthorizedSessionScopeStore::initialize(root)
+        .unwrap()
+        .authorize(
+            &ExternalSessionLocator::new("codex", session).unwrap(),
+            &ActivationScope {
+                decision: ActivationScopeDecision::Group {
+                    repository_group_id: group.repository_group_id,
+                    root_path: group.root_path.clone(),
+                },
+                allowed_repository_ids: group.member_repository_ids.clone(),
+            },
+            &catalog,
+        )
+        .unwrap();
 }
 
 fn focus_coordinates(locator: &ArtifactLocator) -> Value {
@@ -567,6 +591,12 @@ fn public_mcp_artifact_focus_is_query_scoped_across_six_kinds_and_hot_path() {
             .repository
             .repository_id
     });
+    let members = std::iter::once(main_id)
+        .chain(cross_ids.iter().copied())
+        .collect::<Vec<_>>();
+    config
+        .add_repository_group(&fs::canonicalize(temporary.path()).unwrap(), &members)
+        .unwrap();
     let main_scan = repository_scan_at_root(
         &root,
         &scan_input(
@@ -678,6 +708,7 @@ fn public_mcp_artifact_focus_is_query_scoped_across_six_kinds_and_hot_path() {
     let mut first_session = None;
     for (index, case) in cases.iter().enumerate() {
         let session = TaskId::new().to_string();
+        authorize_group_session(&root, &session);
         let created_task = run_mcp(
             &mut server,
             &[tool_call(
@@ -909,6 +940,7 @@ fn public_mcp_artifact_focus_is_query_scoped_across_six_kinds_and_hot_path() {
     );
 
     let missing_session_id = TaskId::new().to_string();
+    authorize_group_session(&root, &missing_session_id);
     let missing_task = run_mcp(
         &mut server,
         &[tool_call(

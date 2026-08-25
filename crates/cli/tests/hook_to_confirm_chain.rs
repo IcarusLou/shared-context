@@ -87,7 +87,7 @@ fn run_hook(home: &Path, payload: &Value) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-fn mcp_tool(home: &Path, name: &str, arguments: &Value) -> Value {
+fn mcp_tool(home: &Path, session: &str, name: &str, arguments: &Value) -> Value {
     let mut child = Command::new(env!("CARGO_BIN_EXE_sctx"))
         .args(["mcp", "serve", "--client", "codex"])
         .env("HOME", home)
@@ -106,6 +106,14 @@ fn mcp_tool(home: &Path, name: &str, arguments: &Value) -> Value {
             "clientInfo": {"name": "m4-hook-chain", "version": "1"}
         }
     });
+    let mut arguments = arguments.clone();
+    let arguments_object = arguments.as_object_mut().unwrap();
+    arguments_object
+        .entry("agent_kind".to_owned())
+        .or_insert_with(|| json!("codex"));
+    arguments_object
+        .entry("external_session_id".to_owned())
+        .or_insert_with(|| json!(session));
     let call = json!({
         "jsonrpc": "2.0",
         "id": 2,
@@ -366,6 +374,7 @@ fn one_real_hook_to_confirm_identity_chain() {
 
     let task = mcp_tool(
         &home,
+        &oracle.session,
         "task_intent_update",
         &json!({
             "agent_kind": "codex",
@@ -385,6 +394,7 @@ fn one_real_hook_to_confirm_identity_chain() {
     let seeded = seed_accepted_context(&store, &oracle);
     let scan = mcp_tool(
         &home,
+        &oracle.session,
         "repository_scan",
         &json!({
             "checkout_path": source_repository,
@@ -403,6 +413,7 @@ fn one_real_hook_to_confirm_identity_chain() {
         .clone();
     let reference = mcp_tool(
         &home,
+        &oracle.session,
         "engineering_reference_record",
         &json!({
             "context_id": seeded.context,
@@ -423,6 +434,7 @@ fn one_real_hook_to_confirm_identity_chain() {
     );
     let rebuilt = mcp_tool(
         &home,
+        &oracle.session,
         "association_rebuild",
         &json!({"diagnose_only": false}),
     );
@@ -430,6 +442,7 @@ fn one_real_hook_to_confirm_identity_chain() {
 
     let focus = mcp_tool(
         &home,
+        &oracle.session,
         "task_artifact_focus",
         &json!({
             "agent_kind": "codex",
@@ -451,6 +464,7 @@ fn one_real_hook_to_confirm_identity_chain() {
     assert!(focus_json.contains(&seeded.context));
     let ordinary = mcp_tool(
         &home,
+        &oracle.session,
         "task_context",
         &json!({
             "agent_kind": "codex",
@@ -558,6 +572,7 @@ fn one_real_hook_to_confirm_identity_chain() {
 
     let checkpoint = mcp_tool(
         &home,
+        &oracle.session,
         "task_checkpoint",
         &json!({
             "agent_kind": "codex",
@@ -644,7 +659,7 @@ fn one_real_hook_to_confirm_identity_chain() {
         "limit": 10,
         "token_budget": 32768
     });
-    let listed = mcp_tool(&home, "candidate_list", &owner);
+    let listed = mcp_tool(&home, &oracle.session, "candidate_list", &owner);
     assert_eq!(listed["reviews"].as_array().unwrap().len(), 1);
     let candidate_id = listed["reviews"][0]["candidate_id"]
         .as_str()
@@ -657,12 +672,13 @@ fn one_real_hook_to_confirm_identity_chain() {
             .unwrap()
             .contains(&oracle.raw_stop_marker)
     );
-    let repeated_list = mcp_tool(&home, "candidate_list", &owner);
+    let repeated_list = mcp_tool(&home, &oracle.session, "candidate_list", &owner);
     assert_eq!(repeated_list["reviews"].as_array().unwrap().len(), 1);
     assert_eq!(repeated_list["reviews"][0]["candidate_id"], candidate_id);
 
     let review = mcp_tool(
         &home,
+        &oracle.session,
         "candidate_get",
         &json!({
             "agent_kind": "codex",
@@ -691,6 +707,7 @@ fn one_real_hook_to_confirm_identity_chain() {
     }
     let unconfirmed_pack = mcp_tool(
         &home,
+        &oracle.session,
         "task_context",
         &json!({
             "agent_kind": "codex",
@@ -717,7 +734,12 @@ fn one_real_hook_to_confirm_identity_chain() {
         "primary": {"existing_space_id": seeded.space},
         "related_space_ids": []
     });
-    let confirmed = mcp_tool(&home, "candidate_confirm", &confirm_arguments);
+    let confirmed = mcp_tool(
+        &home,
+        &oracle.session,
+        "candidate_confirm",
+        &confirm_arguments,
+    );
     assert_eq!(confirmed["status"], "confirmed");
     assert_eq!(confirmed["created"], true);
     assert_eq!(
@@ -734,7 +756,12 @@ fn one_real_hook_to_confirm_identity_chain() {
         event_count(store.repository()),
         events_before + oracle.expected_confirmation_events
     );
-    let retried = mcp_tool(&home, "candidate_confirm", &confirm_arguments);
+    let retried = mcp_tool(
+        &home,
+        &oracle.session,
+        "candidate_confirm",
+        &confirm_arguments,
+    );
     assert_eq!(retried["status"], "already_confirmed");
     assert_eq!(retried["created"], false);
     assert_eq!(retried["confirmation_id"], confirmed["confirmation_id"]);
@@ -747,6 +774,7 @@ fn one_real_hook_to_confirm_identity_chain() {
     );
     let search = mcp_tool(
         &home,
+        &oracle.session,
         "context_search",
         &json!({
             "query": oracle.claim_statement,

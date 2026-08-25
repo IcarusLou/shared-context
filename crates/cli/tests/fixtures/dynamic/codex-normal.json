@@ -201,6 +201,8 @@
     {
       "id": "repository-scan", "actor": "task", "after": ["candidate-confirm"],
       "action": {"type": "mcp_request", "method": "repository_scan", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
         "checkout_path": {"type": "builtin", "builtin": {"type": "resource_root", "resource": "focus-repo"}},
         "paths": {"type": "array", "items": [{"type": "string", "value": "src/focus.rs"}]},
         "max_artifacts": {"type": "unsigned", "value": 20}
@@ -209,6 +211,8 @@
     {
       "id": "reference-record", "actor": "task", "after": ["repository-scan"],
       "action": {"type": "mcp_request", "method": "engineering_reference_record", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
         "context_id": {"type": "variable", "name": "context-id"},
         "revision_id": {"type": "variable", "name": "context-revision-id"},
         "repository_id": {"type": "variable", "name": "repository-id"},
@@ -225,6 +229,8 @@
     {
       "id": "association-rebuild", "actor": "task", "after": ["reference-record"],
       "action": {"type": "mcp_request", "method": "association_rebuild", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
         "diagnose_only": {"type": "boolean", "value": false}
       }}}
     },

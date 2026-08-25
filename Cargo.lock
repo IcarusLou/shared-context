@@ -637,6 +637,7 @@ dependencies = [
 name = "sctx-mcp"
 version = "0.1.0"
 dependencies = [
+ "fs2",
  "rusqlite",
  "sctx-domain",
  "sctx-engineering-graph",

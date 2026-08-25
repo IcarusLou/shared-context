@@ -134,9 +134,19 @@ fn contract() -> ScenarioDefinition {
                     resource_root(),
                 ],
             ),
+            ScenarioAction {
+                id: step("session-start"),
+                actor: ActorId::new("session").unwrap(),
+                after: vec![step("repository-add")],
+                expectation: ActionExpectation::default(),
+                action: ActionKind::HookEvent {
+                    event: WireName::new("SessionStart").unwrap(),
+                    payload: object([("cwd", resource_root()), ("source", text("startup"))]),
+                },
+            },
             mcp(
                 "intent-update",
-                "repository-add",
+                "session-start",
                 "task_intent_update",
                 object([
                     ("agent_kind", text("codex")),
@@ -257,6 +267,8 @@ fn contract() -> ScenarioDefinition {
                 "candidate-confirm",
                 "repository_scan",
                 object([
+                    ("agent_kind", text("codex")),
+                    ("external_session_id", session()),
                     ("checkout_path", resource_root()),
                     ("paths", array([text("src/focus.rs")])),
                     ("max_artifacts", count(20)),
@@ -267,6 +279,8 @@ fn contract() -> ScenarioDefinition {
                 "repository-scan",
                 "engineering_reference_record",
                 object([
+                    ("agent_kind", text("codex")),
+                    ("external_session_id", session()),
                     ("context_id", variable("context-id")),
                     ("revision_id", variable("context-revision-id")),
                     ("repository_id", variable("repository-id")),
@@ -290,7 +304,11 @@ fn contract() -> ScenarioDefinition {
                 "association-rebuild",
                 "reference-record",
                 "association_rebuild",
-                object([("diagnose_only", TemplateValue::Boolean { value: false })]),
+                object([
+                    ("agent_kind", text("codex")),
+                    ("external_session_id", session()),
+                    ("diagnose_only", TemplateValue::Boolean { value: false }),
+                ]),
             ),
             mcp(
                 "artifact-focus",

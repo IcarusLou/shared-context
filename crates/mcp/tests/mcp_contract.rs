@@ -1,12 +1,14 @@
 use std::{
-    fs,
+    fs::{self, OpenOptions},
     io::{BufReader, Cursor},
     path::Path,
     process::Command,
     sync::{Arc, Barrier},
     thread,
+    time::Duration,
 };
 
+use fs2::FileExt;
 use rusqlite::Connection;
 use sctx_domain::{
     Applicability, ArtifactAction, ArtifactLocator, ArtifactRef, CandidateConfirmationOperation,
@@ -22,7 +24,10 @@ use sctx_domain::{
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
 use sctx_index::ProjectionIndex;
-use sctx_local_state::UserConfigStore;
+use sctx_local_state::{
+    ActivationScope, ActivationScopeDecision, AuthorizedSessionScopePolicy,
+    AuthorizedSessionScopeStore, UserConfigStore,
+};
 use sctx_mcp::{
     CandidateBuildItemResponseStatus, CandidateBuildResponseStatus, CandidateConfirmInput,
     CandidateConfirmPrimaryInput, CandidateConfirmResponseStatus, CandidateDiscardInput,
@@ -30,10 +35,10 @@ use sctx_mcp::{
     DisconnectReason, ExistingCandidatePrimaryInput, ExpectedRevisionId, McpServer,
     NewCandidatePrimaryInput, TaskBoundary, TaskCheckpointBoundary, TaskCheckpointClaimInput,
     TaskCheckpointEvidenceInput, TaskCheckpointInput, TaskContextReadInput, TaskIntentUpdateInput,
-    TaskSignalSupersedeInput, TransportErrorKind, build_closed_episode_at_root,
-    candidate_confirm_at_root, candidate_discard_at_root, candidate_get_at_root,
-    candidate_list_at_root, task_checkpoint_at_root, task_context_readonly_at_root,
-    task_intent_update_at_root, task_signal_supersede_at_root,
+    TaskSignalSupersedeInput, TransportErrorKind, association_rebuild_at_root,
+    build_closed_episode_at_root, candidate_confirm_at_root, candidate_discard_at_root,
+    candidate_get_at_root, candidate_list_at_root, task_checkpoint_at_root,
+    task_context_readonly_at_root, task_intent_update_at_root, task_signal_supersede_at_root,
 };
 use sctx_search::{TaskRetrievalPath, WorkingIntentHintField, WorkingIntentHintTarget};
 use sctx_task_runtime::{
@@ -56,6 +61,8 @@ struct Fixture {
     space_id: SpaceId,
     context_id: ContextId,
     revision_id: RevisionId,
+    repository_id: RepositoryId,
+    checkout_path: std::path::PathBuf,
 }
 
 impl Fixture {
@@ -88,6 +95,13 @@ impl Fixture {
             )
             .unwrap(),
         );
+        let checkout_path = fs::canonicalize(store.repository()).unwrap();
+        let repository_id = UserConfigStore::initialize(&root)
+            .unwrap()
+            .add_repository(None, std::slice::from_ref(&checkout_path))
+            .unwrap()
+            .repository
+            .repository_id;
         Self {
             _temporary: temporary,
             root,
@@ -95,12 +109,332 @@ impl Fixture {
             space_id,
             context_id,
             revision_id,
+            repository_id,
+            checkout_path,
         }
     }
 
     fn server(&self, client: ClientKind) -> McpServer {
         McpServer::new(&self.root, client).unwrap()
     }
+}
+
+fn authorize_session(root: &Path, agent_kind: &str, external_session_id: &str) {
+    let config = UserConfigStore::open_existing(root).unwrap();
+    let mut catalog = config.repository_catalog_wait().unwrap();
+    let members = catalog
+        .repositories
+        .iter()
+        .map(|repository| repository.repository_id)
+        .collect::<Vec<_>>();
+    let locator = ExternalSessionLocator::new(agent_kind, external_session_id).unwrap();
+    let activation = if catalog.repositories.len() == 1 {
+        let repository = &catalog.repositories[0];
+        ActivationScope {
+            decision: ActivationScopeDecision::Direct {
+                repository_id: repository.repository_id,
+                checkout_path: repository.checkout_paths[0].clone(),
+            },
+            allowed_repository_ids: members,
+        }
+    } else {
+        let group_root = fs::canonicalize(root).unwrap();
+        let group = match catalog.repository_groups.first() {
+            Some(group) if group.member_repository_ids == members => group.clone(),
+            Some(group) => {
+                config
+                    .update_repository_group(group.repository_group_id, None, Some(&members))
+                    .unwrap()
+                    .repository_group
+            }
+            None => {
+                config
+                    .add_repository_group(&group_root, &members)
+                    .unwrap()
+                    .repository_group
+            }
+        };
+        catalog = config.repository_catalog_wait().unwrap();
+        ActivationScope {
+            decision: ActivationScopeDecision::Group {
+                repository_group_id: group.repository_group_id,
+                root_path: group.root_path,
+            },
+            allowed_repository_ids: members,
+        }
+    };
+    AuthorizedSessionScopeStore::initialize(root)
+        .unwrap()
+        .authorize(&locator, &activation, &catalog)
+        .unwrap();
+}
+
+fn authorize_direct_session(fixture: &Fixture, agent_kind: &str, external_session_id: &str) {
+    let catalog = UserConfigStore::open_existing(&fixture.root)
+        .unwrap()
+        .repository_catalog_wait()
+        .unwrap();
+    let locator = ExternalSessionLocator::new(agent_kind, external_session_id).unwrap();
+    AuthorizedSessionScopeStore::initialize(&fixture.root)
+        .unwrap()
+        .authorize(
+            &locator,
+            &ActivationScope {
+                decision: ActivationScopeDecision::Direct {
+                    repository_id: fixture.repository_id,
+                    checkout_path: fixture.checkout_path.clone(),
+                },
+                allowed_repository_ids: vec![fixture.repository_id],
+            },
+            &catalog,
+        )
+        .unwrap();
+}
+
+fn authorize_disabled_session(fixture: &Fixture, session: &str) {
+    let catalog = UserConfigStore::open_existing(&fixture.root)
+        .unwrap()
+        .repository_catalog_wait()
+        .unwrap();
+    AuthorizedSessionScopeStore::initialize(&fixture.root)
+        .unwrap()
+        .authorize(
+            &ExternalSessionLocator::new("codex", session).unwrap(),
+            &ActivationScope {
+                decision: ActivationScopeDecision::Disabled,
+                allowed_repository_ids: Vec::new(),
+            },
+            &catalog,
+        )
+        .unwrap();
+}
+
+fn public_tool_arguments(fixture: &Fixture, tool: &str, agent: &str, session: &str) -> Value {
+    let locator = json!({"agent_kind": agent, "external_session_id": session});
+    match tool {
+        "task_intent_update" => serde_json::to_value(TaskIntentUpdateInput {
+            agent_kind: agent.to_owned(),
+            ..update_input(session, TaskBoundary::New, None, "authorization matrix")
+        })
+        .unwrap(),
+        "task_artifact_focus" => json!({
+            "agent_kind": agent, "external_session_id": session,
+            "expected_revision_id": sctx_domain::TaskIntentRevisionId::new(),
+            "absolute_file_path": fixture.checkout_path.join("README.md"),
+            "locator": {"locator_kind": "file"}
+        }),
+        "task_signal_supersede" => json!({
+            "agent_kind": agent, "external_session_id": session,
+            "task_id": TaskId::new(), "expected_revision_id": sctx_domain::TaskIntentRevisionId::new(),
+            "signal_ids": [sctx_domain::SignalId::new()]
+        }),
+        "task_checkpoint" => json!({
+            "agent_kind": agent, "external_session_id": session,
+            "expected_task_id": TaskId::new(),
+            "expected_intent_revision_id": sctx_domain::TaskIntentRevisionId::new(),
+            "expected_episode_version": 0, "boundary": "close", "claims": [], "unknowns": []
+        }),
+        "task_context" | "context_search" | "candidate_list" => {
+            json!({"agent_kind": agent, "external_session_id": session})
+        }
+        "repository_scan" => json!({
+            "agent_kind": agent, "external_session_id": session,
+            "checkout_path": fixture.checkout_path, "paths": ["README.md"]
+        }),
+        "engineering_reference_record" => json!({
+            "agent_kind": agent, "external_session_id": session,
+            "context_id": fixture.context_id, "revision_id": fixture.revision_id,
+            "repository_id": fixture.repository_id, "artifact_kind": "file",
+            "relation": "implements", "locator": {"locator_kind": "file", "path": "README.md"},
+            "supports": "authorization matrix", "limitations": ["fixture"]
+        }),
+        "association_explain" => json!({
+            "agent_kind": agent, "external_session_id": session,
+            "reference_id": sctx_domain::ReferenceId::new()
+        }),
+        "association_rebuild" => json!({
+            "agent_kind": agent, "external_session_id": session, "diagnose_only": true
+        }),
+        "context_get" => json!({
+            "agent_kind": agent, "external_session_id": session, "context_id": fixture.context_id
+        }),
+        "candidate_get" => json!({
+            "agent_kind": agent, "external_session_id": session, "candidate_id": CandidateId::new()
+        }),
+        "candidate_discard" => json!({
+            "agent_kind": agent, "external_session_id": session,
+            "expected_task_id": TaskId::new(),
+            "expected_intent_revision_id": sctx_domain::TaskIntentRevisionId::new(),
+            "candidate_id": CandidateId::new(), "expected_review_version": 1, "reason": "discard"
+        }),
+        "candidate_confirm" => json!({
+            "agent_kind": agent, "external_session_id": session,
+            "expected_task_id": TaskId::new(),
+            "expected_intent_revision_id": sctx_domain::TaskIntentRevisionId::new(),
+            "candidate_id": CandidateId::new(), "expected_review_version": 1,
+            "primary": {"existing_space_id": fixture.space_id}, "related_space_ids": [], "edits": {}
+        }),
+        "space_list" => locator,
+        _ => panic!("unknown public tool {tool}"),
+    }
+}
+
+const PUBLIC_TOOLS: [&str; 16] = [
+    "task_intent_update",
+    "task_artifact_focus",
+    "task_signal_supersede",
+    "task_checkpoint",
+    "task_context",
+    "repository_scan",
+    "engineering_reference_record",
+    "association_explain",
+    "association_rebuild",
+    "context_search",
+    "context_get",
+    "candidate_list",
+    "candidate_get",
+    "candidate_discard",
+    "candidate_confirm",
+    "space_list",
+];
+
+#[derive(Debug, Eq, PartialEq)]
+struct BusinessResidue {
+    files: Vec<(std::path::PathBuf, Vec<u8>)>,
+    git_head: String,
+    git_tree: String,
+    git_status: String,
+}
+
+fn business_residue(root: &Path) -> BusinessResidue {
+    let mut files = Vec::new();
+    collect_business_residue(&root.join("state"), &root.join("state"), &mut files);
+    for reports in [root.join("report"), root.join("reports")] {
+        collect_all_residue(&reports, root, &mut files);
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let repository = root.join("repository");
+    BusinessResidue {
+        files,
+        git_head: git(&repository, &["rev-parse", "HEAD"]),
+        git_tree: git(&repository, &["rev-parse", "HEAD^{tree}"]),
+        git_status: git(&repository, &["status", "--short"]),
+    }
+}
+
+fn collect_business_residue(
+    directory: &Path,
+    relative_to: &Path,
+    files: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries {
+        let path = entry.unwrap().path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let is_database = matches!(
+            name,
+            "runtime.sqlite" | "index.sqlite" | "engineering.sqlite" | "repository-registry.sqlite"
+        );
+        let is_payload = matches!(name, "capture" | "report" | "reports");
+        if path.is_dir() {
+            if is_payload {
+                collect_all_residue(&path, relative_to, files);
+            }
+        } else if is_database {
+            files.push((
+                path.strip_prefix(relative_to).unwrap().to_path_buf(),
+                Vec::new(),
+            ));
+        } else if is_payload {
+            files.push((
+                path.strip_prefix(relative_to).unwrap().to_path_buf(),
+                fs::read(path).unwrap(),
+            ));
+        }
+    }
+}
+
+fn collect_all_residue(
+    directory: &Path,
+    relative_to: &Path,
+    files: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            collect_all_residue(&path, relative_to, files);
+        } else {
+            files.push((
+                path.strip_prefix(relative_to).unwrap().to_path_buf(),
+                fs::read(path).unwrap(),
+            ));
+        }
+    }
+}
+
+fn authorization_error(fixture: &Fixture, agent: &str, session: &str, client: ClientKind) -> Value {
+    let responses = run_session(
+        &mut fixture.server(client),
+        FixtureFraming::Newline,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(
+                2,
+                "context_get",
+                public_tool_arguments(fixture, "context_get", agent, session),
+            ),
+        ],
+    );
+    responses[1]["result"]["structuredContent"]["error"].clone()
+}
+
+fn expected_authorization_error() -> Value {
+    json!({
+        "code": "session_not_authorized",
+        "kind": "external_error",
+        "message": "Shared Context MCP call is not authorized for this Agent Session"
+    })
+}
+
+fn add_git_repository(fixture: &Fixture, name: &str) -> (std::path::PathBuf, RepositoryId) {
+    let repository = fixture.root.join(name);
+    fs::create_dir_all(&repository).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&repository)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let repository = fs::canonicalize(repository).unwrap();
+    let repository_id = UserConfigStore::open_existing(&fixture.root)
+        .unwrap()
+        .add_repository(None, std::slice::from_ref(&repository))
+        .unwrap()
+        .repository
+        .repository_id;
+    (repository, repository_id)
+}
+
+fn call_public_tool(fixture: &Fixture, tool: &str, arguments: Value) -> Value {
+    run_session(
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::Newline,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(2, tool, arguments),
+        ],
+    )[1]
+    .clone()
 }
 
 fn intent() -> IntentSnapshot {
@@ -180,15 +514,27 @@ fn build_review_candidate(
     session: &str,
     statement: &str,
 ) -> (sctx_mcp::TaskIntentUpdateResponse, CandidateId) {
+    build_review_candidate_for_agent(fixture, "codex", session, statement)
+}
+
+fn build_review_candidate_for_agent(
+    fixture: &Fixture,
+    agent_kind: &str,
+    session: &str,
+    statement: &str,
+) -> (sctx_mcp::TaskIntentUpdateResponse, CandidateId) {
     let task = task_intent_update_at_root(
         &fixture.root,
-        &update_input(session, TaskBoundary::New, None, statement),
+        &TaskIntentUpdateInput {
+            agent_kind: agent_kind.to_owned(),
+            ..update_input(session, TaskBoundary::New, None, statement)
+        },
     )
     .unwrap();
     let closed = task_checkpoint_at_root(
         &fixture.root,
         &TaskCheckpointInput {
-            agent_kind: "codex".to_owned(),
+            agent_kind: agent_kind.to_owned(),
             external_session_id: session.to_owned(),
             expected_task_id: task.context.task_id.to_string(),
             expected_intent_revision_id: task.context.intent_revision_id.to_string(),
@@ -366,6 +712,26 @@ fn run_session(server: &mut McpServer, framing: FixtureFraming, requests: &[Valu
     assert_eq!(outcome.disconnect, DisconnectReason::CleanEof);
     assert_eq!(outcome.requests_handled, requests.len() as u64);
     decode_frames(&output, framing)
+}
+
+fn run_authorized_session(
+    root: &Path,
+    server: &mut McpServer,
+    framing: FixtureFraming,
+    requests: &[Value],
+) -> Vec<Value> {
+    let mut locators = std::collections::BTreeSet::new();
+    for request in requests {
+        let arguments = &request["params"]["arguments"];
+        if let (Some(agent_kind), Some(external_session_id)) = (
+            arguments.get("agent_kind").and_then(Value::as_str),
+            arguments.get("external_session_id").and_then(Value::as_str),
+        ) && locators.insert((agent_kind.to_owned(), external_session_id.to_owned()))
+        {
+            authorize_session(root, agent_kind, external_session_id);
+        }
+    }
+    run_session(server, framing, requests)
 }
 
 fn encode_frames(values: &[Value], framing: FixtureFraming) -> Vec<u8> {
@@ -634,7 +1000,8 @@ fn checkpoint_rejects_dangling_private_stale_conflicting_and_forged_input_withou
     forged["space_id"] = json!(SpaceId::new());
     let mut private_rpc = private.clone();
     private_rpc.claims[0].statement = "contact person@example.com".to_owned();
-    let responses = run_session(
+    let responses = run_authorized_session(
+        &fixture.root,
         &mut server,
         FixtureFraming::Newline,
         &[
@@ -683,7 +1050,8 @@ fn codex_and_cursor_checkpoint_inline_evidence_builds_only_after_close() {
         let before_events = event_count(fixture.store.repository());
         let session = format!("checkpoint-{agent_kind}");
         let mut server = fixture.server(client);
-        let started = run_session(
+        let started = run_authorized_session(
+            &fixture.root,
             &mut server,
             framing,
             &[
@@ -737,7 +1105,8 @@ fn codex_and_cursor_checkpoint_inline_evidence_builds_only_after_close() {
             claims,
             json!([]),
         );
-        let continued = run_session(
+        let continued = run_authorized_session(
+            &fixture.root,
             &mut server,
             framing,
             &[tool_call(3, "task_checkpoint", continued_arguments.clone())],
@@ -764,7 +1133,8 @@ fn codex_and_cursor_checkpoint_inline_evidence_builds_only_after_close() {
             "inline_validation_recorded"
         );
 
-        let retried = run_session(
+        let retried = run_authorized_session(
+            &fixture.root,
             &mut server,
             framing,
             &[tool_call(4, "task_checkpoint", continued_arguments)],
@@ -773,7 +1143,8 @@ fn codex_and_cursor_checkpoint_inline_evidence_builds_only_after_close() {
         assert_eq!(retried["created"], false);
         assert_eq!(retried["checkpoint_id"], continued["checkpoint_id"]);
 
-        let closed = run_session(
+        let closed = run_authorized_session(
+            &fixture.root,
             &mut server,
             framing,
             &[tool_call(
@@ -1658,11 +2029,13 @@ fn cursor_and_codex_candidate_review_tools_list_get_and_discard_without_confirma
         let candidate_id = closed.candidate_build.as_ref().unwrap().items[0]
             .candidate_id
             .unwrap();
+        let _group_member = add_git_repository(&fixture, "candidate review group member");
         let owner = json!({
             "agent_kind": agent_kind,
             "external_session_id": session,
         });
-        let responses = run_session(
+        let responses = run_authorized_session(
+            &fixture.root,
             &mut fixture.server(client),
             framing,
             &[
@@ -1905,7 +2278,8 @@ fn candidate_confirm_existing_and_recommended_new_space_are_atomic_idempotent_an
         Some(created.confirmation_id)
     );
 
-    let search = run_session(
+    let search = run_authorized_session(
+        &fixture.root,
         &mut fixture.server(ClientKind::Codex),
         FixtureFraming::Newline,
         &[
@@ -1914,6 +2288,8 @@ fn candidate_confirm_existing_and_recommended_new_space_are_atomic_idempotent_an
                 51,
                 "context_search",
                 json!({
+                    "agent_kind": "codex",
+                    "external_session_id": "confirm-existing",
                     "query": "Edited Candidate statement accepted atomically",
                     "statuses": ["accepted"]
                 }),
@@ -2026,13 +2402,14 @@ fn cursor_and_codex_candidate_confirm_tool_is_strict_and_idempotent() {
     ] {
         let fixture = Fixture::new();
         let session = format!("confirm-tool-{agent_kind}");
-        let (task, candidate_id) = build_review_candidate(
+        let (task, candidate_id) = build_review_candidate_for_agent(
             &fixture,
+            agent_kind,
             &session,
             "MCP candidate_confirm writes one atomic fact closure",
         );
         let arguments = json!({
-            "agent_kind": "codex",
+            "agent_kind": agent_kind,
             "external_session_id": session,
             "expected_task_id": task.context.task_id,
             "expected_intent_revision_id": task.context.intent_revision_id,
@@ -2042,7 +2419,9 @@ fn cursor_and_codex_candidate_confirm_tool_is_strict_and_idempotent() {
             "related_space_ids": [],
             "edits": {}
         });
-        let responses = run_session(
+        let _group_member = add_git_repository(&fixture, "candidate confirm group member");
+        let responses = run_authorized_session(
+            &fixture.root,
             &mut fixture.server(client),
             framing,
             &[
@@ -2481,6 +2860,11 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
         (ClientKind::Codex, FixtureFraming::ContentLength),
     ] {
         let fixture = Fixture::new();
+        let agent_kind = match client {
+            ClientKind::Cursor => "cursor",
+            ClientKind::Codex => "codex",
+        };
+        let session = "stdio-contract";
         let before_count = event_count(fixture.store.repository());
         let requests = vec![
             request(
@@ -2498,6 +2882,8 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
                 3,
                 "context_search",
                 json!({
+                    "agent_kind": agent_kind,
+                    "external_session_id": session,
                     "query": "stdio MCP",
                     "space_ids": [fixture.space_id],
                     "statuses": ["accepted"]
@@ -2507,6 +2893,8 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
                 4,
                 "context_get",
                 json!({
+                    "agent_kind": agent_kind,
+                    "external_session_id": session,
                     "space_id": fixture.space_id,
                     "context_id": fixture.context_id,
                     "revision_id": fixture.revision_id
@@ -2515,17 +2903,29 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
             tool_call(
                 5,
                 "task_intent_update",
-                serde_json::to_value(update_input(
-                    "stdio-contract",
-                    TaskBoundary::New,
-                    None,
-                    "verify stdio MCP contract",
-                ))
+                serde_json::to_value(TaskIntentUpdateInput {
+                    agent_kind: agent_kind.to_owned(),
+                    ..update_input(
+                        session,
+                        TaskBoundary::New,
+                        None,
+                        "verify stdio MCP contract",
+                    )
+                })
                 .unwrap(),
             ),
-            tool_call(6, "space_list", json!({})),
+            tool_call(
+                6,
+                "space_list",
+                json!({"agent_kind": agent_kind, "external_session_id": session}),
+            ),
         ];
-        let responses = run_session(&mut fixture.server(client), framing, &requests);
+        let responses = run_authorized_session(
+            &fixture.root,
+            &mut fixture.server(client),
+            framing,
+            &requests,
+        );
         assert_eq!(responses.len(), requests.len() - 1);
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
 
@@ -2732,7 +3132,12 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
             .unwrap()["inputSchema"];
         assert_eq!(
             repository_scan_schema["required"],
-            json!(["checkout_path", "paths"])
+            json!([
+                "agent_kind",
+                "external_session_id",
+                "checkout_path",
+                "paths"
+            ])
         );
         assert_eq!(repository_scan_schema["properties"]["paths"]["minItems"], 1);
         assert_eq!(
@@ -2765,7 +3170,7 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
                 .iter()
                 .find(|tool| tool["name"] == "association_explain")
                 .unwrap()["inputSchema"]["required"],
-            json!(["reference_id"])
+            json!(["agent_kind", "external_session_id", "reference_id"])
         );
         assert!(
             tools
@@ -2866,14 +3271,936 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
 }
 
 #[test]
+fn every_public_tool_requires_a_strict_locator_and_rejects_before_business_state() {
+    let fixture = Fixture::new();
+    let before = business_residue(&fixture.root);
+    let before_events = event_count(fixture.store.repository());
+    let mut requests = vec![request(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2024-11-05"}),
+    )];
+    for (index, tool) in PUBLIC_TOOLS.iter().enumerate() {
+        requests.push(tool_call(
+            index as u64 + 2,
+            tool,
+            public_tool_arguments(&fixture, tool, "codex", "missing-lease"),
+        ));
+    }
+    let responses = run_session(
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::Newline,
+        &requests,
+    );
+    let expected = expected_authorization_error();
+    for (tool, response) in PUBLIC_TOOLS.iter().zip(&responses[1..]) {
+        assert_eq!(response["result"]["isError"], true, "{tool}: {response:#}");
+        assert_eq!(
+            response["result"]["structuredContent"]["error"], expected,
+            "{tool} disclosed a distinct authorization state"
+        );
+    }
+    assert_eq!(business_residue(&fixture.root), before);
+    assert_eq!(event_count(fixture.store.repository()), before_events);
+
+    let listed = run_session(
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::Newline,
+        &[
+            request(100, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            request(101, "tools/list", json!({})),
+        ],
+    );
+    for tool in listed[1]["result"]["tools"].as_array().unwrap() {
+        let required = tool["inputSchema"]["required"].as_array().unwrap();
+        assert!(required.iter().any(|field| field == "agent_kind"));
+        assert!(required.iter().any(|field| field == "external_session_id"));
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+    }
+
+    for (index, tool) in PUBLIC_TOOLS.iter().enumerate() {
+        let mut missing = public_tool_arguments(&fixture, tool, "codex", "strict");
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("external_session_id");
+        let missing = run_session(
+            &mut fixture.server(ClientKind::Codex),
+            FixtureFraming::Newline,
+            &[
+                request(200, "initialize", json!({"protocolVersion": "2024-11-05"})),
+                tool_call(index as u64 + 201, tool, missing),
+            ],
+        );
+        assert_eq!(
+            missing[1]["result"]["structuredContent"]["error"]["code"], "invalid_input",
+            "{tool} accepted a missing locator"
+        );
+
+        let mut forged = public_tool_arguments(&fixture, tool, "codex", "strict");
+        forged.as_object_mut().unwrap().insert(
+            "allowed_repository_ids".to_owned(),
+            json!([fixture.repository_id]),
+        );
+        let forged = run_session(
+            &mut fixture.server(ClientKind::Codex),
+            FixtureFraming::Newline,
+            &[
+                request(300, "initialize", json!({"protocolVersion": "2024-11-05"})),
+                tool_call(index as u64 + 301, tool, forged),
+            ],
+        );
+        assert_eq!(
+            forged[1]["result"]["structuredContent"]["error"]["code"], "invalid_input",
+            "{tool} accepted forged authorization"
+        );
+    }
+    assert_eq!(business_residue(&fixture.root), before);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn authorization_states_cross_agent_and_busy_or_unsafe_storage_fail_identically() {
+    let expected = expected_authorization_error();
+
+    let disabled = Fixture::new();
+    authorize_disabled_session(&disabled, "disabled");
+    let before = business_residue(&disabled.root);
+    assert_eq!(
+        authorization_error(&disabled, "codex", "disabled", ClientKind::Codex),
+        expected
+    );
+    assert_eq!(business_residue(&disabled.root), before);
+
+    let expired = Fixture::new();
+    let catalog = UserConfigStore::open_existing(&expired.root)
+        .unwrap()
+        .repository_catalog_wait()
+        .unwrap();
+    let policy = AuthorizedSessionScopePolicy {
+        ttl: Duration::from_secs(1),
+        ..AuthorizedSessionScopePolicy::default()
+    };
+    AuthorizedSessionScopeStore::with_policy(&expired.root, policy)
+        .unwrap()
+        .authorize(
+            &ExternalSessionLocator::new("codex", "expired").unwrap(),
+            &ActivationScope {
+                decision: ActivationScopeDecision::Direct {
+                    repository_id: expired.repository_id,
+                    checkout_path: expired.checkout_path.clone(),
+                },
+                allowed_repository_ids: vec![expired.repository_id],
+            },
+            &catalog,
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(1_100));
+    assert_eq!(
+        authorization_error(&expired, "codex", "expired", ClientKind::Codex),
+        expected
+    );
+
+    let stale = Fixture::new();
+    authorize_direct_session(&stale, "codex", "stale");
+    let added = stale.root.join("stale catalog repository");
+    fs::create_dir_all(&added).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&added)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let added = fs::canonicalize(added).unwrap();
+    UserConfigStore::open_existing(&stale.root)
+        .unwrap()
+        .add_repository(None, &[added])
+        .unwrap();
+    assert_eq!(
+        authorization_error(&stale, "codex", "stale", ClientKind::Codex),
+        expected
+    );
+
+    let corrupt = Fixture::new();
+    authorize_direct_session(&corrupt, "codex", "corrupt");
+    let scope_store = AuthorizedSessionScopeStore::initialize(&corrupt.root).unwrap();
+    let record = fs::read_dir(scope_store.directory())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .unwrap();
+    fs::write(&record, b"{}").unwrap();
+    assert_eq!(
+        authorization_error(&corrupt, "codex", "corrupt", ClientKind::Codex),
+        expected
+    );
+
+    let unsafe_scope = Fixture::new();
+    authorize_direct_session(&unsafe_scope, "codex", "symlink");
+    let scope_store = AuthorizedSessionScopeStore::initialize(&unsafe_scope.root).unwrap();
+    let record = fs::read_dir(scope_store.directory())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .unwrap();
+    let target = unsafe_scope.root.join("unsafe-scope-target.json");
+    fs::write(&target, b"{}").unwrap();
+    fs::remove_file(&record).unwrap();
+    std::os::unix::fs::symlink(&target, &record).unwrap();
+    assert_eq!(
+        authorization_error(&unsafe_scope, "codex", "symlink", ClientKind::Codex),
+        expected
+    );
+
+    let scope_busy = Fixture::new();
+    authorize_direct_session(&scope_busy, "codex", "scope-busy");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(scope_busy.root.join("state/authorized-session-scopes.lock"))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    assert_eq!(
+        authorization_error(&scope_busy, "codex", "scope-busy", ClientKind::Codex),
+        expected
+    );
+    FileExt::unlock(&lock).unwrap();
+
+    let catalog_busy = Fixture::new();
+    authorize_direct_session(&catalog_busy, "codex", "catalog-busy");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(catalog_busy.root.join("state/config.lock"))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    assert_eq!(
+        authorization_error(&catalog_busy, "codex", "catalog-busy", ClientKind::Codex),
+        expected
+    );
+    FileExt::unlock(&lock).unwrap();
+
+    let cross_agent = Fixture::new();
+    authorize_direct_session(&cross_agent, "codex", "borrowed");
+    assert_eq!(
+        authorization_error(&cross_agent, "codex", "borrowed", ClientKind::Cursor),
+        expected
+    );
+    assert_eq!(
+        authorization_error(&cross_agent, "cursor", "borrowed", ClientKind::Cursor),
+        expected
+    );
+    assert_eq!(
+        authorization_error(&cross_agent, "codex", "other", ClientKind::Cursor),
+        expected
+    );
+}
+
+#[test]
+fn authorization_snapshot_linearizes_before_catalog_mutation_without_toctou_expansion() {
+    let fixture = Fixture::new();
+    let session = "linearized-call";
+    let nested = fixture.checkout_path.join("nested checkout");
+    fs::create_dir_all(nested.join("src")).unwrap();
+    fs::write(nested.join("src/lib.rs"), b"pub fn nested() {}\n").unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&nested)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let nested = fs::canonicalize(nested).unwrap();
+    let task = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            session,
+            TaskBoundary::New,
+            None,
+            "prove Catalog snapshot linearization",
+        ),
+    )
+    .unwrap();
+    authorize_direct_session(&fixture, "codex", session);
+    let reached = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let mut server = fixture.server(ClientKind::Codex);
+    server.set_authorization_linearization_hook({
+        let reached = Arc::clone(&reached);
+        let release = Arc::clone(&release);
+        Arc::new(move || {
+            reached.wait();
+            release.wait();
+        })
+    });
+    let arguments = json!({
+        "agent_kind": "codex", "external_session_id": session,
+        "expected_revision_id": task.context.intent_revision_id,
+        "absolute_file_path": nested.join("src/lib.rs"),
+        "locator": {"locator_kind": "file"}
+    });
+    let worker = thread::spawn(move || {
+        run_session(
+            &mut server,
+            FixtureFraming::Newline,
+            &[
+                request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+                tool_call(2, "task_artifact_focus", arguments),
+            ],
+        )
+    });
+    reached.wait();
+    UserConfigStore::open_existing(&fixture.root)
+        .unwrap()
+        .add_repository(None, std::slice::from_ref(&nested))
+        .unwrap();
+    release.wait();
+    let responses = worker.join().unwrap();
+    assert_eq!(responses[1]["result"]["isError"], false, "{responses:#?}");
+    assert_eq!(
+        responses[1]["result"]["structuredContent"]["resolved_focus"]["repository_id"],
+        fixture.repository_id.to_string(),
+        "the in-flight call must resolve the nested path under Catalog R1, not the newer R2 owner"
+    );
+    assert_eq!(
+        authorization_error(&fixture, "codex", session, ClientKind::Codex),
+        expected_authorization_error(),
+        "the stale lease must fail on the next independently linearized call"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn public_task_and_candidate_targets_remain_exact_session_owned_and_non_observable() {
+    let fixture = Fixture::new();
+    let (owner_task, candidate_id) = build_review_candidate(
+        &fixture,
+        "owner-session",
+        "Candidate must remain exact-session owned",
+    );
+    let other_task = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            "other-session",
+            TaskBoundary::New,
+            None,
+            "exercise cross-session denial",
+        ),
+    )
+    .unwrap();
+    authorize_session(&fixture.root, "codex", "owner-session");
+    authorize_session(&fixture.root, "codex", "other-session");
+    let before_events = event_count(fixture.store.repository());
+    let before_residue = business_residue(&fixture.root);
+    let runtime = TaskRuntime::initialize(&fixture.root).unwrap();
+    let semantic_state = || {
+        format!(
+            "{:#?}",
+            (
+                runtime
+                    .read_snapshot(owner_task.context.task_session_id)
+                    .unwrap(),
+                runtime
+                    .read_snapshot(other_task.context.task_session_id)
+                    .unwrap(),
+                runtime
+                    .list_work_episodes(owner_task.context.task_session_id, 100)
+                    .unwrap(),
+                runtime
+                    .list_work_episodes(other_task.context.task_session_id, 100)
+                    .unwrap(),
+                runtime
+                    .read_candidate_review(
+                        &ExternalSessionLocator::new("codex", "owner-session").unwrap(),
+                        candidate_id,
+                    )
+                    .unwrap(),
+            )
+        )
+    };
+    let before_semantics = semantic_state();
+
+    let call_candidate = |candidate_id: CandidateId| {
+        run_session(
+            &mut fixture.server(ClientKind::Codex),
+            FixtureFraming::Newline,
+            &[
+                request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+                tool_call(
+                    2,
+                    "candidate_get",
+                    json!({
+                        "agent_kind": "codex", "external_session_id": "other-session",
+                        "candidate_id": candidate_id
+                    }),
+                ),
+            ],
+        )[1]["result"]["structuredContent"]["error"]
+            .clone()
+    };
+    let cross_candidate = call_candidate(candidate_id);
+    let nonexistent_candidate = call_candidate(CandidateId::new());
+    assert_eq!(cross_candidate, nonexistent_candidate);
+    assert_eq!(cross_candidate["code"], "candidate_review_unavailable");
+    let candidate_error = cross_candidate.to_string();
+    assert!(!candidate_error.contains(&candidate_id.to_string()));
+    assert!(!candidate_error.contains("owner-session"));
+
+    let call_task = |task_id: TaskId| {
+        run_session(
+            &mut fixture.server(ClientKind::Codex),
+            FixtureFraming::Newline,
+            &[
+                request(3, "initialize", json!({"protocolVersion": "2024-11-05"})),
+                tool_call(
+                    4,
+                    "task_signal_supersede",
+                    json!({
+                        "agent_kind": "codex", "external_session_id": "other-session",
+                        "task_id": task_id,
+                        "expected_revision_id": other_task.context.intent_revision_id,
+                        "signal_ids": [sctx_domain::SignalId::new()]
+                    }),
+                ),
+            ],
+        )[1]["result"]["structuredContent"]["error"]
+            .clone()
+    };
+    let cross_task = call_task(owner_task.context.task_id);
+    let nonexistent_task = call_task(TaskId::new());
+    assert_eq!(cross_task, nonexistent_task);
+    assert_eq!(cross_task["code"], "task_target_unavailable");
+
+    let call_checkpoint = |task_id: TaskId| {
+        run_session(
+            &mut fixture.server(ClientKind::Codex),
+            FixtureFraming::Newline,
+            &[
+                request(5, "initialize", json!({"protocolVersion": "2024-11-05"})),
+                tool_call(
+                    6,
+                    "task_checkpoint",
+                    json!({
+                        "agent_kind": "codex", "external_session_id": "other-session",
+                        "expected_task_id": task_id,
+                        "expected_intent_revision_id": other_task.context.intent_revision_id,
+                        "expected_episode_version": 0, "boundary": "close",
+                        "claims": [], "unknowns": []
+                    }),
+                ),
+            ],
+        )[1]["result"]["structuredContent"]["error"]
+            .clone()
+    };
+    assert_eq!(
+        call_checkpoint(owner_task.context.task_id),
+        call_checkpoint(TaskId::new())
+    );
+
+    let call_candidate_mutation = |tool: &str, candidate_id: CandidateId| {
+        let arguments = match tool {
+            "candidate_discard" => json!({
+                "agent_kind": "codex", "external_session_id": "other-session",
+                "expected_task_id": other_task.context.task_id,
+                "expected_intent_revision_id": other_task.context.intent_revision_id,
+                "candidate_id": candidate_id, "expected_review_version": 1,
+                "reason": "cross-session target must remain unavailable"
+            }),
+            "candidate_confirm" => json!({
+                "agent_kind": "codex", "external_session_id": "other-session",
+                "expected_task_id": other_task.context.task_id,
+                "expected_intent_revision_id": other_task.context.intent_revision_id,
+                "candidate_id": candidate_id, "expected_review_version": 1,
+                "primary": {"existing_space_id": fixture.space_id},
+                "related_space_ids": [], "edits": {}
+            }),
+            _ => unreachable!(),
+        };
+        call_public_tool(&fixture, tool, arguments)["result"]["structuredContent"]["error"].clone()
+    };
+    for tool in ["candidate_discard", "candidate_confirm"] {
+        let foreign = call_candidate_mutation(tool, candidate_id);
+        let nonexistent = call_candidate_mutation(tool, CandidateId::new());
+        assert_eq!(foreign, nonexistent, "{tool} leaked target existence");
+        assert_eq!(foreign["code"], "candidate_review_unavailable");
+    }
+    assert_eq!(event_count(fixture.store.repository()), before_events);
+    assert_eq!(business_residue(&fixture.root), before_residue);
+    assert_eq!(semantic_state(), before_semantics);
+    let review = candidate_get_at_root(
+        &fixture.root,
+        &CandidateGetInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: "owner-session".to_owned(),
+            candidate_id: candidate_id.to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(review.review_status, CandidateReviewStatus::Pending);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn enabled_direct_and_group_sessions_can_investigate_other_registered_repositories() {
+    let fixture = Fixture::new();
+    let (second_path, second_repository_id) = add_git_repository(&fixture, "group member two");
+    fs::create_dir_all(second_path.join("src")).unwrap();
+    fs::write(second_path.join("src/lib.rs"), b"pub fn grouped() {}\n").unwrap();
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&second_path)
+            .args(["add", "src/lib.rs"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&second_path)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "fixture",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    authorize_direct_session(&fixture, "codex", "engineering-direct");
+
+    let first_path = git(&fixture.checkout_path, &["ls-files"])
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap()
+        .to_owned();
+    let first_scan = call_public_tool(
+        &fixture,
+        "repository_scan",
+        json!({
+            "agent_kind": "codex", "external_session_id": "engineering-direct",
+            "checkout_path": fixture.checkout_path, "paths": [first_path.clone()]
+        }),
+    );
+    assert_eq!(first_scan["result"]["isError"], false, "{first_scan:#}");
+    let second_scan = call_public_tool(
+        &fixture,
+        "repository_scan",
+        json!({
+            "agent_kind": "codex", "external_session_id": "engineering-direct",
+            "checkout_path": second_path, "paths": ["src/lib.rs"]
+        }),
+    );
+    assert_eq!(second_scan["result"]["isError"], false, "{second_scan:#}");
+
+    let record = |repository_id: RepositoryId, path: &str, supports: &str| {
+        call_public_tool(
+            &fixture,
+            "engineering_reference_record",
+            json!({
+                "agent_kind": "codex", "external_session_id": "engineering-direct",
+                "context_id": fixture.context_id, "revision_id": fixture.revision_id,
+                "repository_id": repository_id, "artifact_kind": "file", "relation": "implements",
+                "locator": {"locator_kind": "file", "path": path},
+                "supports": supports, "limitations": ["fixture"]
+            }),
+        )
+    };
+    let first_reference = record(fixture.repository_id, &first_path, "first Repository");
+    let second_reference = record(second_repository_id, "src/lib.rs", "second Repository");
+    assert_eq!(
+        first_reference["result"]["isError"], false,
+        "{first_reference:#}"
+    );
+    assert_eq!(
+        second_reference["result"]["isError"], false,
+        "{second_reference:#}"
+    );
+    let first_reference_id = first_reference["result"]["structuredContent"]["reference_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let second_reference_id = second_reference["result"]["structuredContent"]["reference_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let direct_rebuild = call_public_tool(
+        &fixture,
+        "association_rebuild",
+        json!({
+            "agent_kind": "codex", "external_session_id": "engineering-direct",
+            "diagnose_only": false
+        }),
+    );
+    assert_eq!(
+        direct_rebuild["result"]["isError"], false,
+        "{direct_rebuild:#}"
+    );
+    assert_eq!(
+        direct_rebuild["result"]["structuredContent"]["reference_count"],
+        2
+    );
+    let direct_task = call_public_tool(
+        &fixture,
+        "task_intent_update",
+        serde_json::to_value(TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            ..update_input(
+                "engineering-direct",
+                TaskBoundary::New,
+                None,
+                "focus another registered Repository from a Direct Session",
+            )
+        })
+        .unwrap(),
+    );
+    let direct_focus = call_public_tool(
+        &fixture,
+        "task_artifact_focus",
+        json!({
+            "agent_kind": "codex", "external_session_id": "engineering-direct",
+            "expected_revision_id": direct_task["result"]["structuredContent"]["intent_revision_id"],
+            "absolute_file_path": second_path.join("src/lib.rs"),
+            "locator": {"locator_kind": "file"}
+        }),
+    );
+    assert_eq!(direct_focus["result"]["isError"], false, "{direct_focus:#}");
+
+    let direct_explain = call_public_tool(
+        &fixture,
+        "association_explain",
+        json!({
+            "agent_kind": "codex", "external_session_id": "engineering-direct",
+            "reference_id": second_reference_id
+        }),
+    );
+    assert_eq!(
+        direct_explain["result"]["isError"], false,
+        "{direct_explain:#}"
+    );
+    let direct_retry = call_public_tool(
+        &fixture,
+        "association_rebuild",
+        json!({
+            "agent_kind": "codex", "external_session_id": "engineering-direct",
+            "diagnose_only": false
+        }),
+    );
+    assert_eq!(
+        direct_rebuild["result"]["structuredContent"]["artifact_generation"],
+        direct_retry["result"]["structuredContent"]["artifact_generation"],
+        "full incremental rebuild must retain canonical generation"
+    );
+    let direct_graph =
+        sctx_engineering_graph::EngineeringProjectionStore::initialize(&fixture.root)
+            .unwrap()
+            .read_snapshot()
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        direct_graph.context_tree_oid.as_deref(),
+        direct_rebuild["result"]["structuredContent"]["context_tree_oid"].as_str()
+    );
+
+    let (third_path, third_repository_id) = add_git_repository(&fixture, "registered nonmember C");
+    fs::create_dir_all(third_path.join("src")).unwrap();
+    fs::write(third_path.join("src/lib.rs"), b"pub fn nonmember() {}\n").unwrap();
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&third_path)
+            .args(["add", "src/lib.rs"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&third_path)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "fixture",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let config = UserConfigStore::open_existing(&fixture.root).unwrap();
+    let group = config
+        .add_repository_group(
+            &fs::canonicalize(&fixture.root).unwrap(),
+            &[fixture.repository_id],
+        )
+        .unwrap()
+        .repository_group;
+    let catalog = config.repository_catalog_wait().unwrap();
+    AuthorizedSessionScopeStore::initialize(&fixture.root)
+        .unwrap()
+        .authorize(
+            &ExternalSessionLocator::new("codex", "engineering-group").unwrap(),
+            &ActivationScope {
+                decision: ActivationScopeDecision::Group {
+                    repository_group_id: group.repository_group_id,
+                    root_path: group.root_path,
+                },
+                allowed_repository_ids: vec![fixture.repository_id],
+            },
+            &catalog,
+        )
+        .unwrap();
+    let third_scan = call_public_tool(
+        &fixture,
+        "repository_scan",
+        json!({
+            "agent_kind": "codex", "external_session_id": "engineering-group",
+            "checkout_path": third_path, "paths": ["src/lib.rs"]
+        }),
+    );
+    assert_eq!(third_scan["result"]["isError"], false, "{third_scan:#}");
+    let third_reference = call_public_tool(
+        &fixture,
+        "engineering_reference_record",
+        json!({
+            "agent_kind": "codex", "external_session_id": "engineering-group",
+            "context_id": fixture.context_id, "revision_id": fixture.revision_id,
+            "repository_id": third_repository_id, "artifact_kind": "file",
+            "relation": "implements", "locator": {"locator_kind": "file", "path": "src/lib.rs"},
+            "supports": "Group Session investigated a registered nonmember",
+            "limitations": ["fixture"]
+        }),
+    );
+    assert_eq!(
+        third_reference["result"]["isError"], false,
+        "{third_reference:#}"
+    );
+    let third_reference_id = third_reference["result"]["structuredContent"]["reference_id"]
+        .as_str()
+        .unwrap();
+    let group_rebuild = call_public_tool(
+        &fixture,
+        "association_rebuild",
+        json!({
+            "agent_kind": "codex", "external_session_id": "engineering-group",
+            "diagnose_only": false
+        }),
+    );
+    assert_eq!(
+        group_rebuild["result"]["isError"], false,
+        "{group_rebuild:#}"
+    );
+    assert_eq!(
+        group_rebuild["result"]["structuredContent"]["reference_count"],
+        3
+    );
+    let rebuilt_repository_ids = group_rebuild["result"]["structuredContent"]["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|repository| repository["repository_id"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(rebuilt_repository_ids.len(), 3);
+    for repository_id in [
+        fixture.repository_id.to_string(),
+        second_repository_id.to_string(),
+        third_repository_id.to_string(),
+    ] {
+        assert!(rebuilt_repository_ids.contains(repository_id.as_str()));
+    }
+    let group_explain = call_public_tool(
+        &fixture,
+        "association_explain",
+        json!({
+            "agent_kind": "codex", "external_session_id": "engineering-group",
+            "reference_id": third_reference_id
+        }),
+    );
+    assert_eq!(
+        group_explain["result"]["isError"], false,
+        "{group_explain:#}"
+    );
+    let graph = sctx_engineering_graph::EngineeringProjectionStore::initialize(&fixture.root)
+        .unwrap()
+        .read_snapshot()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        graph.context_tree_oid.as_deref(),
+        group_rebuild["result"]["structuredContent"]["context_tree_oid"].as_str()
+    );
+
+    let cli = association_rebuild_at_root(
+        &fixture.root,
+        &sctx_mcp::AssociationRebuildInput {
+            diagnose_only: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        cli.reference_count, 3,
+        "CLI full rebuild must remain unguarded"
+    );
+    assert_eq!(
+        cli.artifact_generation,
+        group_rebuild["result"]["structuredContent"]["artifact_generation"]
+    );
+    assert_ne!(first_reference_id, second_reference_id);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn unregistered_repository_error_does_not_revoke_enabled_session_or_require_artifact_identity() {
+    let fixture = Fixture::new();
+    let session = "unregistered-investigation";
+    authorize_direct_session(&fixture, "codex", session);
+    let unregistered = fixture.root.join("unregistered repository D");
+    fs::create_dir_all(unregistered.join("src")).unwrap();
+    let raw_marker = "raw-unregistered-source-must-not-persist";
+    fs::write(
+        unregistered.join("src/private.rs"),
+        format!("// {raw_marker}\npub fn private() {{}}\n"),
+    )
+    .unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&unregistered)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let unregistered = fs::canonicalize(unregistered).unwrap();
+    let catalog_before = UserConfigStore::open_existing(&fixture.root)
+        .unwrap()
+        .repository_catalog_wait()
+        .unwrap();
+
+    let task = call_public_tool(
+        &fixture,
+        "task_intent_update",
+        serde_json::to_value(update_input(
+            session,
+            TaskBoundary::New,
+            None,
+            "record a non-locating investigation result",
+        ))
+        .unwrap(),
+    );
+    assert_eq!(task["result"]["isError"], false, "{task:#}");
+    let scan = call_public_tool(
+        &fixture,
+        "repository_scan",
+        json!({
+            "agent_kind": "codex", "external_session_id": session,
+            "checkout_path": unregistered, "paths": ["src/private.rs"]
+        }),
+    );
+    assert_eq!(scan["result"]["isError"], true);
+    assert_eq!(
+        scan["result"]["structuredContent"]["error"]["code"],
+        "repository_not_configured"
+    );
+    let scan_error = scan["result"]["structuredContent"]["error"].to_string();
+    assert!(!scan_error.contains(raw_marker));
+    assert!(!scan_error.contains(unregistered.to_str().unwrap()));
+    assert!(!scan_error.contains("session_not_authorized"));
+
+    let checkpoint = call_public_tool(
+        &fixture,
+        "task_checkpoint",
+        json!({
+            "agent_kind": "codex", "external_session_id": session,
+            "expected_task_id": task["result"]["structuredContent"]["task_id"],
+            "expected_intent_revision_id": task["result"]["structuredContent"]["intent_revision_id"],
+            "expected_episode_version": 0, "boundary": "close",
+            "claims": [{
+                "context_kind_hint": "validation",
+                "statement": "The investigation produced a non-locating validation result",
+                "rationale": "No stable Repository identity exists for a durable association",
+                "applicability": {"domains": ["testing"], "platforms": [], "conditions": []},
+                "assumptions": [],
+                "recheck_when": ["the Repository is explicitly registered"],
+                "evidence": [{
+                    "kind": "inline_validation",
+                    "evidence": {
+                        "kind": "experiment_record",
+                        "supports": "the bounded investigation conclusion was recorded",
+                        "content": {"outcome": "recorded_without_repository_identity"},
+                        "interpretation": "the Task can retain meaning without a forged Repository identity",
+                        "limitations": ["unregistered Repository; no stable Artifact association"]
+                    }
+                }],
+                "artifact_refs": [], "related_contexts": []
+            }],
+            "unknowns": []
+        }),
+    );
+    assert_eq!(checkpoint["result"]["isError"], false, "{checkpoint:#}");
+    let candidate_id =
+        checkpoint["result"]["structuredContent"]["candidate_build"]["items"][0]["candidate_id"]
+            .as_str()
+            .unwrap();
+    let review = call_public_tool(
+        &fixture,
+        "candidate_get",
+        json!({
+            "agent_kind": "codex", "external_session_id": session,
+            "candidate_id": candidate_id
+        }),
+    );
+    assert_eq!(review["result"]["isError"], false, "{review:#}");
+    let review_text = review["result"]["structuredContent"].to_string();
+    assert!(!review_text.contains(raw_marker));
+    assert!(!review_text.contains(unregistered.to_str().unwrap()));
+    assert!(!review_text.contains("ArtifactRef"));
+    assert!(review_text.contains("unregistered Repository; no stable Artifact association"));
+
+    let catalog_after = UserConfigStore::open_existing(&fixture.root)
+        .unwrap()
+        .repository_catalog_wait()
+        .unwrap();
+    assert_eq!(catalog_after, catalog_before);
+    assert!(
+        catalog_after
+            .repositories
+            .iter()
+            .all(|repository| !repository.checkout_paths.contains(&unregistered))
+    );
+}
+
+#[test]
 fn engineering_graph_tool_dispatch_uses_a_distinct_diagnose_contract() {
     let fixture = Fixture::new();
-    let responses = run_session(
+    let responses = run_authorized_session(
+        &fixture.root,
         &mut fixture.server(ClientKind::Codex),
         FixtureFraming::Newline,
         &[
             request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
-            tool_call(2, "association_rebuild", json!({"diagnose_only": true})),
+            tool_call(
+                2,
+                "association_rebuild",
+                json!({
+                    "agent_kind": "codex",
+                    "external_session_id": "engineering-diagnose",
+                    "diagnose_only": true
+                }),
+            ),
         ],
     );
     let response = &responses[1]["result"]["structuredContent"];
@@ -2910,7 +4237,8 @@ fn task_context_rejects_caller_owned_identity_and_space_or_workspace_routes() {
             .as_object_mut()
             .unwrap()
             .extend(forbidden.as_object().unwrap().clone());
-        let responses = run_session(
+        let responses = run_authorized_session(
+            &fixture.root,
             &mut fixture.server(ClientKind::Codex),
             FixtureFraming::Newline,
             &[
@@ -2940,7 +4268,8 @@ fn task_context_rejects_unsafe_budget_or_space_bounds() {
             .as_object_mut()
             .unwrap()
             .extend(invalid.as_object().unwrap().clone());
-        let responses = run_session(
+        let responses = run_authorized_session(
+            &fixture.root,
             &mut fixture.server(ClientKind::Codex),
             FixtureFraming::Newline,
             &[
@@ -2970,7 +4299,8 @@ fn task_context_read_is_stable_for_an_authoritative_session() {
     )
     .unwrap();
     let first = task_arguments("codex", "evolving-session");
-    let responses = run_session(
+    let responses = run_authorized_session(
+        &fixture.root,
         &mut fixture.server(ClientKind::Codex),
         FixtureFraming::Newline,
         &[
@@ -3066,7 +4396,8 @@ fn different_sessions_with_the_same_workspace_signal_remain_isolated() {
         .unwrap();
     let frontend = task_arguments("codex", "frontend-session");
     let backend = task_arguments("codex", "backend-session");
-    let responses = run_session(
+    let responses = run_authorized_session(
+        &fixture.root,
         &mut fixture.server(ClientKind::Codex),
         FixtureFraming::Newline,
         &[
@@ -3211,10 +4542,12 @@ fn concurrent_task_context_reads_do_not_mutate_the_authoritative_task() {
 fn task_context_runtime_storage_failure_is_typed() {
     let fixture = Fixture::new();
     let mut server = fixture.server(ClientKind::Codex);
+    TaskRuntime::initialize(&fixture.root).unwrap();
     let runtime_database = fixture.root.join("state/runtime.sqlite");
     fs::remove_file(&runtime_database).unwrap();
     fs::create_dir(&runtime_database).unwrap();
-    let responses = run_session(
+    let responses = run_authorized_session(
+        &fixture.root,
         &mut server,
         FixtureFraming::Newline,
         &[
@@ -3292,7 +4625,8 @@ fn task_intent_update_supports_created_already_current_continue_and_explicit_new
         "divergent retry intent",
     ))
     .unwrap();
-    let divergent_responses = run_session(
+    let divergent_responses = run_authorized_session(
+        &fixture.root,
         &mut fixture.server(ClientKind::Codex),
         FixtureFraming::Newline,
         &[
@@ -3559,6 +4893,7 @@ fn concurrent_mcp_intent_retries_converge_on_one_successor() {
         .unwrap(),
     );
     let worker_count = 20;
+    authorize_session(&fixture.root, "codex", "intent-concurrent-retry");
     let barrier = Arc::new(Barrier::new(worker_count));
     let root = Arc::new(fixture.root.clone());
     let responses = (0..worker_count)
@@ -3748,7 +5083,8 @@ fn task_intent_update_enforces_cas_optional_shape_and_rejects_legacy_fields() {
         "expected_revision_id": null,
         "intent": {"goal": "goal-only intent"}
     });
-    let responses = run_session(
+    let responses = run_authorized_session(
+        &fixture.root,
         &mut fixture.server(ClientKind::Codex),
         FixtureFraming::Newline,
         &[
@@ -3898,7 +5234,8 @@ fn shared_context_skill_contract_drives_mcp_runtime_and_search_response() {
         "MCP Contract",
     ))
     .unwrap();
-    let responses = run_session(
+    let responses = run_authorized_session(
+        &fixture.root,
         &mut fixture.server(ClientKind::Codex),
         FixtureFraming::Newline,
         &[

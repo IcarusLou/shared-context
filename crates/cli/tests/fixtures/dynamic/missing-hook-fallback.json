@@ -9,7 +9,23 @@
   ],
   "actions": [
     {
-      "id": "intent-new", "actor": "task", "after": [],
+      "id": "repository-add", "actor": "task", "after": [],
+      "action": {"type": "cli_json", "arguments": [
+        {"type": "string", "value": "repository"},
+        {"type": "string", "value": "add"},
+        {"type": "string", "value": "--path"},
+        {"type": "builtin", "builtin": {"type": "resource_root", "resource": "activation-repo"}}
+      ]}
+    },
+    {
+      "id": "session-start", "actor": "session", "after": ["repository-add"],
+      "action": {"type": "hook_event", "event": "SessionStart", "payload": {"type": "object", "fields": {
+        "cwd": {"type": "builtin", "builtin": {"type": "resource_root", "resource": "activation-repo"}},
+        "source": {"type": "string", "value": "startup"}
+      }}}
+    },
+    {
+      "id": "intent-new", "actor": "task", "after": ["session-start"],
       "action": {"type": "mcp_request", "method": "task_intent_update", "params": {"type": "object", "fields": {
         "agent_kind": {"type": "string", "value": "codex"},
         "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
@@ -91,7 +107,10 @@
       }}}
     }
   ],
-  "resources": [],
+  "resources": [{
+    "id": "activation-repo", "synthetic_git": true,
+    "files": [{"path": "README.md", "content": "activation fixture\n"}]
+  }],
   "variables": [
     {"name": "task-id", "value_type": "task_id", "capture": {"step": "intent-new", "pointer": "/task_id"}},
     {"name": "intent-revision-id", "value_type": "intent_revision_id", "capture": {"step": "intent-new", "pointer": "/intent_revision_id"}},
