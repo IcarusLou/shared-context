@@ -10,7 +10,7 @@
 
 本项目尚未上线，本文直接定义目标模型、接口和存储结构。
 
-### 1.1 当前实现状态（Mew #170）
+### 1.1 当前实现状态（Mew #193）
 
 本文的大部分章节描述目标架构，不代表代码已经全部实现。当前里程碑边界如下：
 
@@ -20,7 +20,7 @@
 | **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、`TaskIntentRevision`、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、严格 `task_intent_update` 与只读 `task_context` 已通过跨 crate/E2E 验收 |
 | **M3：Engineering Graph** | **已实现** | 稳定本机 Repository Catalog、可重建 Registry、Reference-derived 有界扫描、build-time immutable Context/safety snapshot、历史 Graph Retrieval、ContextRelation 1–2 跳及 MCP/CLI 工作流已通过固定跨 crate/E2E oracle |
 | **M4：Low-tax Capture** | **已实现** | #117、#136、#156–#164 与 #169 已实现旁路 Working Intent、Hint Text retrieval、WorkEpisode、Hook lifecycle、Candidate Builder/analysis/Review/Confirm，并通过固定跨层 E2E、privacy、performance 与恢复验收 |
-| **Repository 范围推理前准入与 Session 授权** | **实现中** | #181–#191/#194 已实现 Direct/显式 Group/Disabled、短期 Session lease、SessionStart 固定 marker、MCP Session guard、registered cross-Repo / safe non-locating / unsafe drop 与 SessionEnd 清理；#192 已把完整 Skill workflow 改为可信 marker 后的 installer-owned 渐进加载，最终 token proxy/NPM 验收仍待 #193 |
+| **Repository 范围推理前准入与 Session 授权** | **实现完成，待最终人工验收** | #181–#191/#194 实现 Direct/显式 Group/Disabled、短期 Session lease、SessionStart marker、MCP Session guard、registered cross-Repo / safe non-locating / unsafe drop 与 SessionEnd 清理；#192 提供 marker-gated installer-owned workflow，#196 补齐 Group ID 隐私表，#193 以手写 oracle 关闭 token bytes proxy、Direct/Group 黑盒链、installer 与 NPM 回归证据 |
 
 当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订承载 `WorkingIntentSnapshot` 的 `TaskIntentRevision`，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。SessionStart 先在本地同步完成 Repository 范围准入，只有 Enabled lease 才向 Agent 返回固定短 marker；PromptSubmit 始终不重复 marker，也不读取 Runtime/Search。Enabled lease 是 Session-level 准入：PostToolUse 的安全已登记路径按 Catalog 保留真实 Repository 归属，安全未登记或 mixed/unrepresentable multi-Repo 事件只形成无 workspace/file hint 的 non-locating Breadcrumb，可识别测试工具仍形成非事实、非定位的 TestOutcome；unsafe 输入整条丢弃。TaskSignal 可影响 Working Intent retrieval，但不是工程 Evidence。Hook 不运行 Git discovery、Scanner、Registry sync、Graph rebuild、Focus 提交、Episode open/ingest，也不伪造 Claim。PreCompact/TurnStop 只能关闭已有 current-Intent Checkpoint 的 Episode并调用共享 Builder。显式 Graph 工具完成 bounded scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。Candidate 只由 closed WorkEpisode 的 Builder 调用内部 submission service 创建，公开面仅提供 list/get/discard/confirm。
 
@@ -37,7 +37,7 @@
 - Disabled 的 Prompt/Tool/PreCompact/Stop/End 全部保持 Agent-neutral 且不打开 Runtime/Capture；SessionEnd 只按 exact locator 尝试移除 lease，不跨 Session 清理。Catalog/lease 锁忙或异常均 fail-open 让 Agent 继续，同时 fail-closed 为 Disabled。
 - scope 解析与 lease 热路径不运行 Git 或 Repository scan；安装仍是用户级配置，不需要 launcher，不在业务仓库写项目级 MCP/Hook 文件。
 
-当前 MCP Server 已按 current Enabled `AuthorizedSessionScope` 实施 Session-level authorization guard；Disabled/Missing/Expired/Stale/busy/corrupt Session 调用被拒绝，Enabled Session 可调查任意已登记 Repository或提交不伪造 Artifact identity 的非定位 Evidence。全局 Skill 主入口是最小 activation gate：没有可信 SessionStart marker 时自动路径不读取完整 workflow reference、不产生 Shared Context MCP 调用提示；有 marker 时才完整读取一次 installer-owned reference。Server guard 只负责安全和不落越权数据，Skill gate 负责调用前的指令准入。MCP 进程和工具 Schema 仍由用户级配置全局提供，可能物理启动或可见；#192 的 reference-read/MCP-call 字节合约不等于真实计费 token 测量，最终 proxy 与 NPM/分发闭环仍由 #193 验收。
+当前 MCP Server 已按 current Enabled `AuthorizedSessionScope` 实施 Session-level authorization guard；Disabled/Missing/Expired/Stale/busy/corrupt Session 调用被拒绝，Enabled Session 可调查任意已登记 Repository或提交不伪造 Artifact identity 的非定位 Evidence。全局 Skill 主入口是最小 activation gate：没有可信 SessionStart marker 时自动路径不读取完整 workflow reference、不产生 Shared Context MCP 调用提示；有 marker 时才完整读取一次 installer-owned reference。Server guard 只负责安全和不落越权数据，Skill gate 负责调用前的指令准入。#193 固定 oracle 证明 Disabled 的 activation/reference/MCP call/result/business residue proxy 全 0，Enabled 每条链 marker 为 109 bytes、完整 workflow 读取一次、实际 public MCP 调用 5 次且清洗后的 result bytes 落在手写上限内；source gate/workflow/metadata 分别为 1472/10390/263 bytes。Bytes 不等于 token，MCP 进程和工具 Schema 仍由用户级配置全局提供，可能物理启动或可见。
 
 ## 2. 背景与目标
 
@@ -1322,7 +1322,7 @@ M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命�
 - Workspace 位置 observation 保留在 Session 但不参与 FTS 或 Task fingerprint；裸 Repository/File 工程 Signal 已删除。
 - Cursor Prompt 仍为显式 MCP；Symbol/Diff/API/Schema 的代码扫描、解析和关系扩展属于 M3，不冒充 M2 RetrievalPath。
 - 固定 expected `fixtures/m2/repository-scoped-activation-v1.json` 与真实文档化 Codex/Cursor payload 验收 Direct、显式多成员 Group、Disabled、Catalog unavailable、resume/compact、并发重复 SessionStart、Prompt 前 marker 顺序以及完整生命周期残留；expected 不由 production 输出生成。
-- MCP Server authorization 已由 #191 按 current Enabled Session lease 实现；#192 用最小 gate 让完整 workflow 只在可信 marker 后渐进加载。该指令级合约不物理卸载用户级 MCP 进程/工具 Schema，也不测量真实计费 token；最终 token proxy/NPM 验收仍待 #193。
+- MCP Server authorization 已由 #191 按 current Enabled Session lease 实现；#192 用最小 gate 让完整 workflow 只在可信 marker 后渐进加载；#193 已用固定 Direct/Group/Disabled wire oracle 和 NPM gate 关闭字节 proxy 验收。该合约不物理卸载用户级 MCP 进程/工具 Schema，也不测量真实计费 token。
 
 ### M3：Engineering Graph — 已实现
 

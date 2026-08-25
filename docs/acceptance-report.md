@@ -1,7 +1,7 @@
 # Task-first Retrieval Integration Acceptance Report
 
 Date: 2026-08-25
-Scope: production acceptance through Mew #170/#164 is unchanged, including #136/#169; Repository-scoped pre-inference Hook acceptance through #189 is human-accepted, #191 adds MCP Session authorization, #194 aligns Enabled cross-Repository Hook recording, and #192 adds marker-gated progressive Skill loading pending #193 final token-proxy/NPM acceptance; additive non-blocking replay evidence extends through #171/#176
+Scope: production acceptance through Mew #170/#164 is unchanged, including #136/#169; Repository-scoped pre-inference Hook acceptance through #189 is human-accepted, #191 adds MCP Session authorization, #194 aligns Enabled cross-Repository Hook recording, #192 adds marker-gated progressive Skill loading, and #193 closes the fixed token-bytes proxy/NPM evidence pending final human acceptance; additive non-blocking replay evidence extends through #171/#176
 Documentation baseline before the #170 language alignment: `main@e03193b`
 
 Production acceptance remains closed by final M4 Gate #164.
@@ -19,7 +19,7 @@ SessionStart now performs synchronous local Repository-scope admission before mo
 | M3 — Engineering Graph | IMPLEMENTED | Reference-derived bounded ScanPlan, deterministic Artifact locators, sparse build-time Context/safety snapshots, historical exact retrieval, frozen 1–2 hop relations, diagnostics, fallback, rebuild equivalence, and budget bounds pass cross-crate/E2E oracles |
 | M4 — Low-tax Capture | IMPLEMENTED | #117, #136, #156–#164 and #169 provide lightweight idempotent Working Intent, Hint Text retrieval, exact WorkEpisode/Checkpoint automation, Builder/analysis/Review, and atomic existing/new Candidate Confirmation, closed by a fixed cross-layer oracle plus Hook/Capture/privacy/performance suites |
 | Repository-scoped pre-inference activation — Mew #185 | IMPLEMENTED; HUMAN ACCEPTED | #181–#189 provide explicit RepositoryGroup/Direct/Disabled resolution, sticky short-lived Session lease, SessionStart marker, exact SessionEnd cleanup, and a fixed Codex/Cursor lifecycle oracle |
-| Session authorization and cross-Repository investigation — Mew #190 | IN PROGRESS | #191 provides MCP Session-level authorization; #194 records registered cross-Repo investigation with real Catalog mapping, safe unregistered/mixed work as path-free non-locating meaning, and unsafe input as neutral; #192 uses a minimal trusted-marker gate to load the installer-owned complete workflow only for Enabled sessions; #193 final proxy/NPM acceptance remains pending |
+| Session authorization and cross-Repository investigation — Mew #190 | IMPLEMENTED; HUMAN REVIEW PENDING | #191 provides MCP Session-level authorization; #194 records registered cross-Repo investigation with real Catalog mapping, safe unregistered/mixed work as path-free non-locating meaning, and unsafe input as neutral; #192 uses a minimal trusted-marker gate; #193 closes the fixed Direct/Group/Disabled token-bytes proxy, installer, privacy, and NPM evidence |
 
 ## Repository-scoped activation gate — Mew #181–#189
 
@@ -33,7 +33,24 @@ The fixed acceptance proves:
 - Disabled and Catalog-unavailable Codex/Cursor lifecycles execute SessionStart→Prompt→Tool→PreCompact/Stop→End with empty wire output and zero Runtime, Capture, Report, or knowledge-Git residue.
 - A current Enabled lease authorizes the Session rather than a fixed target set. Structured paths in any registered Repository retain their real Catalog mapping, including registered nonmembers reached from a Group Session. Safe unregistered, registered/unregistered mixed, and multi-checkout events without a safe explicit workspace retain only path-free non-locating Capture/TestOutcome meaning; ambiguous, relative, missing, symlink, and non-file/directory inputs remain neutral before Runtime/Capture. Catalog and knowledge Git remain unchanged.
 
-#191 separately implements MCP Server authorization from the same current Enabled Session lease. #192 makes the installed Skill entry a minimal gate: marker-absent automatic selection reads no complete workflow reference and emits no Shared Context MCP call prompt, while the exact trusted Hook marker loads the installer-owned workflow once. This still does **not** prove physical MCP process/Schema removal, project-level Agent configuration, a launcher, real transcript replay, or measured billing tokens. MCP remains configured at user level, so Server rejection must not be described as preventing pre-call token spend; #192 supplies only reference-read and MCP-call/result-byte contract evidence, with final token proxy and NPM/distribution acceptance reserved for #193.
+#191 separately implements MCP Server authorization from the same current Enabled Session lease. #192 makes the installed Skill entry a minimal gate: marker-absent automatic selection reads no complete workflow reference and emits no Shared Context MCP call prompt, while the exact trusted Hook marker loads the installer-owned workflow once. #193 adds the hand-written [`fixtures/m5/repository-scoped-context-v1.json`](../fixtures/m5/repository-scoped-context-v1.json) oracle and `repository_scoped_context_acceptance`: real Codex Direct and Cursor explicit-Group wires each perform five public MCP calls through Intent→cross-Repo Focus/PostTool→Checkpoint→Hook Builder→Candidate list/get, while Disabled sibling/ancestor stays zero across every proxy field and business store. It also fixes source/installed gate, workflow, and metadata at 1472/10390/263 bytes and verifies installer conflict, rollback, uninstall, and no business-Repository writes.
+
+These are byte proxies, not tokens: Enabled marker output is exactly 109 bytes under a 128-byte ceiling, full workflow reads equal one, MCP call count equals five per fixed chain, and sanitized result bytes must remain within the independent 1500–24576 range. Disabled activation bytes, workflow reads, MCP calls, result bytes, and business residue are all exactly zero. This still does **not** prove physical MCP process/Schema removal, project-level Agent configuration, a launcher, real transcript replay, tokenizer output, or vendor billing tokens. MCP remains configured at user level, so Server rejection must not be described as preventing pre-call token spend.
+
+## Repository-scoped completion audit — Mew #193
+
+| Requirement or approved correction | Authoritative evidence | Result |
+|---|---|---|
+| Record only for registered Repository scope; exact explicit parent Group is enabled, arbitrary ancestor and sibling are disabled | `repository_scoped_context_acceptance` Direct/Group/ancestor/sibling black-box matrix plus `repository_scope_foundation` | PROVEN |
+| #187 synchronous non-blocking SessionStart and sticky first locator decision | Current/Disabled lease reuse, repeated resume/compact from changed cwd, and busy/error negative gates | PROVEN |
+| Disabled work spends no Shared Context instruction/call/result proxy and leaves no Task/Capture/Report/knowledge-Git residue | Hand-written zero matrix and byte-equivalent business snapshots across full Codex/Cursor lifecycles | PROVEN |
+| #191 authorization is Session-level, not Repository-target-level | Direct and Group Sessions Focus/PostTool into other registered Repositories; cross-agent/session and expired/stale/busy/corrupt calls return the same sanitized denial with zero writes | PROVEN |
+| #194 safe unregistered/mixed work is non-locating; unsafe input drops | Owned path-free Capture is explicitly ingested as a normalized Observation with a limitation and no Artifact identity; relative/missing/symlink events create no Capture or Signal | PROVEN |
+| #192 minimal gate loads complete workflow once only after trusted marker | Gate/workflow behavioral contract plus source and installed exact-byte checks | PROVEN |
+| Installer does not require a launcher or project-level configuration and never writes business Repositories | Exact three-asset install/rollback/conflict/uninstall fixture and business-tree byte snapshot | PROVEN |
+| #195 offline `setup --demo` regression | One NPM test is explicitly skipped with the human decision; normal install/setup and core authorized flows remain blocking | ACCEPTED NON-CORE LIMITATION |
+| #196 RepositoryGroupId scenario privacy coverage | Separate verified commit `b19bd31` keeps validation, runner, and replay-report denylist aligned with all 28 domain opaque ID prefixes; canonical `rpg_` UUIDs are rejected without flagging ordinary business text | PROVEN |
+| No overclaim about token or physical MCP isolation | Docs label every number as bytes proxy and retain user-level MCP process/Schema limitations | PROVEN |
 
 ## #171 Dynamic Replay Phase One — NON-BLOCKING EVIDENCE
 
@@ -179,6 +196,7 @@ cargo test --locked -p sctx-cli --test work_episode_capture
 cargo test --locked -p sctx-cli --test hook_session_activation
 cargo test --locked -p sctx-cli --test hook_repository_attribution
 cargo test --locked -p sctx-cli --test repository_scoped_activation_acceptance
+cargo test --locked -p sctx-cli --test repository_scoped_context_acceptance
 cargo test --locked -p sctx-cli --test milestone_one_contract
 cargo test --locked -p sctx-cli --test milestone_two_contract
 cargo test --locked -p sctx-cli --test milestone_three_contract
@@ -195,8 +213,10 @@ Current repository gate results:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: passed with no warnings.
-- `cargo test --workspace --locked`: passed with no failures and one ignored manual benchmark.
-- `npm test`: 16 passed, 0 failed, 0 skipped.
+- `cargo test --workspace --locked`: 504 passed, 0 failed, 3 ignored across 77 test targets; 22 zero-test library/doc targets completed successfully and were not counted as behavioral evidence.
+- `npm test`: 15 passed, 0 failed, 1 explicit Mew #195 skip.
 - Shared Context Skill `quick_validate.py`: passed (`Skill is valid!`).
+- Repository resolver p95: 3µs; Hook Repository mapping p95: 559µs; established-Session Artifact Focus p95: 123.989ms.
+- Release 100k-row warm Search p95: 42.172ms (`needle`), 45.421ms (`search_result_parser`), 43.601ms（中文检索）, 75.661ms（empty query）。
 
-The complete historical V1 storage, lifecycle, installer, adapter, and NPM regression coverage remains in the workspace suites. M1–M3 establish Task-first runtime retrieval and Engineering Graph truth. The hand-authored `fixtures/m4/fixed-oracle.json`, Working Intent oracle, cross-platform M3 oracle, real Cursor/Codex Hook suites, privacy/performance contracts, and Builder/Review/Confirmation recovery tests close M4 without claiming team synchronization or untracked-file scanning beyond accepted #150.
+The complete historical V1 storage, lifecycle, installer, adapter, and NPM regression coverage remains in the workspace suites. M1–M3 establish Task-first runtime retrieval and Engineering Graph truth. The hand-authored `fixtures/m4/fixed-oracle.json` and `fixtures/m5/repository-scoped-context-v1.json`, Working Intent oracle, cross-platform M3 oracle, real Cursor/Codex Hook suites, privacy/performance contracts, and Builder/Review/Confirmation recovery tests close M4 and the Repository-scoped implementation evidence without claiming team synchronization, billing-token measurement, physical MCP removal, or untracked-file scanning beyond accepted #150.

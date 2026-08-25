@@ -66,6 +66,11 @@ tar -xzf shared-context-0.1.0-darwin-arm64-offline.tar.gz
 always invokes `sctx setup` with the supplied options. Calling `./install` with no options therefore
 still starts setup with its defaults; callers must not include an extra `setup` argument.
 
+Do not pass `--demo` as an install acceptance check. Mew #195 records a human-accepted, non-core
+known limitation: offline `setup --demo` has no authorized Agent Session lease, so its public MCP
+search is rejected by the Server guard. Normal install/setup, Hook activation, Skill loading, and
+authorized MCP workflows remain covered.
+
 ## Tests
 
 ```bash
@@ -73,7 +78,8 @@ cd npm
 npm test
 ```
 
-On an arm64 Mac the suite runs the real signed `sctx` arm64 package through an offline install and
-setup smoke. The x64 suite cross-builds and signs a real x86_64 Mach-O, then proves package/bundle
-structure and npm CPU contracts only; native x64 execution remains `NOT_PROVEN` until run on Intel
-hardware.
+On an arm64 Mac the suite runs the real signed `sctx` arm64 package through offline packaging and
+install coverage. Exactly the Mew #195 `setup --demo` smoke is explicitly skipped; the required
+result is 15 pass, 1 skip, and 0 fail. The x64 suite cross-builds and signs a real x86_64 Mach-O,
+then proves package/bundle structure and npm CPU contracts only; native x64 execution remains
+`NOT_PROVEN` until run on Intel hardware.

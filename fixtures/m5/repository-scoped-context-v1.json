@@ -1,0 +1,43 @@
+{
+  "schema": "sctx.repository-scoped-context.acceptance.v1",
+  "activation_marker": "<shared-context-active>Shared Context is authorized; the installed skill may be used.</shared-context-active>",
+  "source_assets": {
+    "gate_bytes": 1472,
+    "workflow_bytes": 10390,
+    "metadata_bytes": 263
+  },
+  "token_proxy": {
+    "disabled": {
+      "activation_bytes": 0,
+      "workflow_reads": 0,
+      "mcp_calls": 0,
+      "tool_result_bytes": 0,
+      "business_residue": 0
+    },
+    "enabled": {
+      "activation_bytes": 109,
+      "activation_max_bytes": 128,
+      "workflow_reads": 1,
+      "mcp_calls": 5,
+      "sanitized_tool_result_bytes_min": 1500,
+      "sanitized_tool_result_bytes_max": 24576
+    }
+  },
+  "enabled_chain": {
+    "mcp_tools": [
+      "task_intent_update",
+      "task_artifact_focus",
+      "task_checkpoint",
+      "candidate_list",
+      "candidate_get"
+    ],
+    "pending_candidates": 1,
+    "confirmed_candidates": 0
+  },
+  "disabled_residue": {
+    "runtime_files": 0,
+    "capture_records": 0,
+    "report_files": 0,
+    "knowledge_commits_delta": 0
+  }
+}

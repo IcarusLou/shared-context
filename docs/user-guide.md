@@ -139,10 +139,10 @@ npm run install:local -- --profile debug --prefix /absolute/path/to/prefix
 sctx setup --agents cursor,codex
 ```
 
-如果希望安装后立即跑完整演示：
+`setup --demo` 目前是非核心已知限制（Mew #195）：MCP Session guard 启用后，offline setup 没有 Agent Session lease，演示内的 public MCP search 会被正确拒绝。请不要把它用于安装验收；普通 `setup`、Hook、Skill 与授权后的 MCP 流程不受影响。
 
 ```bash
-sctx setup --agents cursor,codex --demo
+sctx setup --agents cursor,codex
 ```
 
 ### 3.4 验证安装
@@ -467,7 +467,7 @@ sctx candidate discard \
 
 | 命令 | 功能 |
 |---|---|
-| `sctx setup [--demo] [--agents cursor,codex]` | 首次安装运行时、知识库、索引、MCP、Hook 和 Skill；幂等执行。 |
+| `sctx setup [--demo] [--agents cursor,codex]` | 首次安装运行时、知识库、索引、MCP、Hook 和 Skill；幂等执行。`--demo` 是 #195 已接受的非核心已知限制，不作为安装验收。 |
 | `sctx demo` | 建立并验证固定演示闭环；重复执行可复用已有演示数据。 |
 | `sctx doctor` | 只读检查安装、索引、配置、MCP 和 Agent 能力。 |
 | `sctx doctor --fix` | 重做安全、可逆的注册和索引设置后再次检查。 |
@@ -697,6 +697,8 @@ sctx search \
 CLI 还提供 Space/Context 写入治理、语义冲突、索引和 Pending Batch 等管理员能力；这些没有全部开放成 Agent MCP 写工具，以维持显式审核和生命周期边界。
 
 当前 Repository 准入控制 Hook 的 Agent-visible activation 与生命周期记录路径；MCP Server 也用 current Enabled Session lease 实现授权校验，Disabled/Missing/Expired/Stale/busy/corrupt Session 的调用会被拒绝。已安装的全局 Skill 主入口只包含最小 activation gate：没有可信 SessionStart marker 时不读取完整 workflow reference、不产生 Shared Context MCP 调用提示；有 marker 时才完整读取一次 installer-owned reference。这个 Skill gate 是 Agent 推理前的指令准入机制，Server guard 则负责安全和不落越权数据。MCP 进程和工具 Schema 仍由用户级 Agent 配置提供，可能物理启动或可见；不要把 Disabled 理解为进程必然未启动，也不要把合约中的 reference-read/MCP-call 字节代理外推为真实计费 token 已被测量。当前还已证明 Disabled Hook 不向模型注入 Shared Context 文本，也不产生 Runtime/Capture/Report/知识 Git 记录。
+
+#193 的固定 bytes proxy 进一步量化该边界：Disabled 的 Agent-visible activation、完整 workflow read、Shared Context MCP call/result 与业务 residue 都是 0；Enabled 每个 SessionStart marker 为 109 bytes（上限 128），完整 workflow 读取一次，并在固定 Direct/Group 验收链中产生 5 次真实 public MCP 调用。最小 gate、workflow、metadata 源文件分别为 1472、10390、263 bytes。这些值用于回归比较，不是 tokenizer 结果或供应商计费 token。
 
 ## 7. 常见问题
 

@@ -31,10 +31,12 @@ Repository 范围推理前准入（Mew #181–#189）已接入 Hook：产品私�
 
 Mew #191 已在 MCP Server 实现基于 current Enabled `AuthorizedSessionScope` 的 Session-level authorization guard：Disabled/Missing/Expired/Stale/busy/corrupt Session 调用被拒绝，Enabled Session 可以显式调查任意已登记 Repository，并可在不伪造 Artifact identity 的前提下保留自包含的非定位工程 Evidence。Mew #192 把全局 Skill 拆为最小 activation gate 与 installer-owned 完整 workflow reference：没有可信 Hook marker 的自动路径不读取 reference、不产生 Shared Context MCP 调用提示；有 marker 才完整读取一次 workflow。Server guard 保证安全和不落越权数据，Skill gate 负责模型推理前的指令准入，两者不能互相替代。
 
+Mew #193 用手写固定 oracle `fixtures/m5/repository-scoped-context-v1.json` 和真实 `sctx hook`/public MCP wire harness 关闭最终证据：Codex Direct 与 Cursor explicit Group 各执行 SessionStart→Skill gate→Intent→registered cross-Repo Focus/PostTool→Checkpoint→Hook Builder→Candidate list/get，Candidate 保持 Pending；Disabled sibling/ancestor 的 activation bytes、完整 workflow read、Shared Context MCP call/result bytes 与业务 residue 全为 0。固定代理还覆盖 sticky locator、expired/stale/cross-agent/cross-session/busy/corrupt、safe non-locating owned Observation、unsafe drop，以及 installer 三资产精确安装/回滚/冲突/卸载。#196 已把 `RepositoryGroupId` 的 `rpg_` 同步到 scenario validation、runner 和 replay report 的 28 项 opaque-ID privacy denylist。它测量的是确定性 instruction/call/result **bytes proxy**，不是模型 token 或供应商计费；MCP 进程/Schema 仍可能由用户级配置加载。
+
 以下能力**尚未实现**，不得在代码、测试报告或评审中宣称已经具备：
 
 - **团队同步：未实现** — Repository Catalog 是单机显式配置，不是团队事实或知识 Store。
-- **真实 token/物理进程隔离证明：未实现** — Skill gate 已用 reference-read 与 MCP-call/result bytes 合约证明 Disabled 自动路径不加载完整 workflow 或生成 Shared Context 调用提示，但尚未测量真实计费 token。MCP 进程与工具 Schema 仍可能由用户级配置全局启动或可见；最终 token proxy 与 NPM/分发闭环由 #193 验收，不能从 Server 拒绝或 #192 的静态/行为合约外推。
+- **真实 token/物理进程隔离证明：未实现** — #193 已关闭 activation/reference/MCP call/result bytes proxy 与 NPM/分发回归，不得把这些 bytes 当作 tokenizer 输出或真实计费 token。MCP 进程与工具 Schema 仍可能由用户级配置全局启动或可见；Server 拒绝只证明安全，不倒推出调用前 token 节省。
 
 Cursor 与 Codex 都通过显式 `task_intent_update` 建立 TaskSession 的首个 `TaskIntentRevision`；SessionStart 的固定 marker 只声明本地范围已授权，Prompt Hook 不重复提示。已有 ActiveTask 可通过只读 `task_context` 再取 Pack。
 
@@ -72,6 +74,7 @@ cargo test --locked -p sctx-cli --test milestone_four_contract
 cargo test --locked -p sctx-cli --test hook_to_confirm_chain
 cargo test --locked -p sctx-cli --test repository_scope_foundation
 cargo test --locked -p sctx-cli --test repository_scoped_activation_acceptance
+cargo test --locked -p sctx-cli --test repository_scoped_context_acceptance
 ```
 
 提交 `Cargo.lock`，确保 CLI workspace 的本地与 CI 构建使用相同依赖解析结果。
@@ -111,7 +114,7 @@ cd npm
 npm test
 ```
 
-macOS 测试会为 `aarch64-apple-darwin` 和 `x86_64-apple-darwin` 构建真实 CLI，因此两种 Rust target 都必须安装。arm64 主机执行当前架构二进制的 launcher、offline install 和 setup smoke；没有 Intel 主机时，x64 只证明 Mach-O、签名、包内容、`os/cpu`、离线 lock 和 checksum 契约，不构成原生执行证据。
+macOS 测试会为 `aarch64-apple-darwin` 和 `x86_64-apple-darwin` 构建真实 CLI，因此两种 Rust target 都必须安装。arm64 主机执行当前架构二进制的 launcher 与 offline install；`setup --demo` 的 public MCP smoke 因 #195 已由人工明确接受为非核心已知限制，唯一对应测试必须显式 skip，其他 15 项必须通过。没有 Intel 主机时，x64 只证明 Mach-O、签名、包内容、`os/cpu`、离线 lock 和 checksum 契约，不构成原生执行证据。
 
 本地构建与离线安装说明见 [`npm/README.md`](./npm/README.md)。构建脚本只写本地产物，不执行 publish 或 upload。
 

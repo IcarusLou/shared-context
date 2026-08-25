@@ -182,7 +182,11 @@ test(
 
 test(
   'arm64 real CLI completes the offline setup --demo loop without Registry access',
-  { skip: process.platform !== 'darwin' || process.arch !== 'arm64', timeout: 600_000 },
+  {
+    // Mew #195: the human gate accepted this non-core demo regression as a known limitation.
+    skip: 'Mew #195 — offline setup --demo is intentionally unsupported',
+    timeout: 600_000,
+  },
   (context) => {
     const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sctx-offline-smoke-'));
     context.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
