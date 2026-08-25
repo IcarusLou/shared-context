@@ -1,7 +1,7 @@
 # Task-first Retrieval Integration Acceptance Report
 
 Date: 2026-08-25
-Scope: production acceptance through Mew #170/#164 is unchanged, including #136/#169; Repository-scoped pre-inference Hook acceptance through #189 is human-accepted, #191 adds MCP Session authorization, and #194 aligns Enabled cross-Repository Hook recording pending atomic review; additive non-blocking replay evidence extends through #171/#176
+Scope: production acceptance through Mew #170/#164 is unchanged, including #136/#169; Repository-scoped pre-inference Hook acceptance through #189 is human-accepted, #191 adds MCP Session authorization, #194 aligns Enabled cross-Repository Hook recording, and #192 adds marker-gated progressive Skill loading pending #193 final token-proxy/NPM acceptance; additive non-blocking replay evidence extends through #171/#176
 Documentation baseline before the #170 language alignment: `main@e03193b`
 
 Production acceptance remains closed by final M4 Gate #164.
@@ -19,7 +19,7 @@ SessionStart now performs synchronous local Repository-scope admission before mo
 | M3 — Engineering Graph | IMPLEMENTED | Reference-derived bounded ScanPlan, deterministic Artifact locators, sparse build-time Context/safety snapshots, historical exact retrieval, frozen 1–2 hop relations, diagnostics, fallback, rebuild equivalence, and budget bounds pass cross-crate/E2E oracles |
 | M4 — Low-tax Capture | IMPLEMENTED | #117, #136, #156–#164 and #169 provide lightweight idempotent Working Intent, Hint Text retrieval, exact WorkEpisode/Checkpoint automation, Builder/analysis/Review, and atomic existing/new Candidate Confirmation, closed by a fixed cross-layer oracle plus Hook/Capture/privacy/performance suites |
 | Repository-scoped pre-inference activation — Mew #185 | IMPLEMENTED; HUMAN ACCEPTED | #181–#189 provide explicit RepositoryGroup/Direct/Disabled resolution, sticky short-lived Session lease, SessionStart marker, exact SessionEnd cleanup, and a fixed Codex/Cursor lifecycle oracle |
-| Session authorization and cross-Repository investigation — Mew #190 | IN PROGRESS | #191 provides MCP Session-level authorization; #194 records registered cross-Repo investigation with real Catalog mapping, safe unregistered/mixed work as path-free non-locating meaning, and unsafe input as neutral; conditional complete-Skill loading remains #192 |
+| Session authorization and cross-Repository investigation — Mew #190 | IN PROGRESS | #191 provides MCP Session-level authorization; #194 records registered cross-Repo investigation with real Catalog mapping, safe unregistered/mixed work as path-free non-locating meaning, and unsafe input as neutral; #192 uses a minimal trusted-marker gate to load the installer-owned complete workflow only for Enabled sessions; #193 final proxy/NPM acceptance remains pending |
 
 ## Repository-scoped activation gate — Mew #181–#189
 
@@ -33,7 +33,7 @@ The fixed acceptance proves:
 - Disabled and Catalog-unavailable Codex/Cursor lifecycles execute SessionStart→Prompt→Tool→PreCompact/Stop→End with empty wire output and zero Runtime, Capture, Report, or knowledge-Git residue.
 - A current Enabled lease authorizes the Session rather than a fixed target set. Structured paths in any registered Repository retain their real Catalog mapping, including registered nonmembers reached from a Group Session. Safe unregistered, registered/unregistered mixed, and multi-checkout events without a safe explicit workspace retain only path-free non-locating Capture/TestOutcome meaning; ambiguous, relative, missing, symlink, and non-file/directory inputs remain neutral before Runtime/Capture. Catalog and knowledge Git remain unchanged.
 
-#191 separately implements MCP Server authorization from the same current Enabled Session lease. This gate still does **not** prove conditional loading/unloading of the complete installed Skill, project-level Agent configuration, a launcher, or real transcript replay. MCP remains configured at user level, so Server rejection must not be described as preventing the Agent from spending tokens before an unauthorized call; complete-Skill pre-inference gating remains #192.
+#191 separately implements MCP Server authorization from the same current Enabled Session lease. #192 makes the installed Skill entry a minimal gate: marker-absent automatic selection reads no complete workflow reference and emits no Shared Context MCP call prompt, while the exact trusted Hook marker loads the installer-owned workflow once. This still does **not** prove physical MCP process/Schema removal, project-level Agent configuration, a launcher, real transcript replay, or measured billing tokens. MCP remains configured at user level, so Server rejection must not be described as preventing pre-call token spend; #192 supplies only reference-read and MCP-call/result-byte contract evidence, with final token proxy and NPM/distribution acceptance reserved for #193.
 
 ## #171 Dynamic Replay Phase One — NON-BLOCKING EVIDENCE
 

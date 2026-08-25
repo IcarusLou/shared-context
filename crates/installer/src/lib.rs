@@ -39,10 +39,14 @@ const MINIMUM_FREE_SPACE_BYTES: u64 = 64 * 1024 * 1024;
 const AGENT_VERSION_TIMEOUT: Duration = Duration::from_secs(2);
 const PRODUCT_KEY: &str = "shared-context";
 const GLOBAL_SKILL_DIRECTORY: &str = ".agents/skills/shared-context";
-const SKILL_ASSETS: [(&str, &[u8]); 2] = [
+const SKILL_ASSETS: [(&str, &[u8]); 3] = [
     (
         "SKILL.md",
         include_bytes!("../../../skills/shared-context/SKILL.md"),
+    ),
+    (
+        "references/workflow.md",
+        include_bytes!("../../../skills/shared-context/references/workflow.md"),
     ),
     (
         "agents/openai.yaml",
@@ -95,6 +99,9 @@ pub enum SetupStage {
     CursorHooksWritten,
     CodexMcpWritten,
     CodexHooksWritten,
+    GlobalSkillGateWritten,
+    GlobalSkillWorkflowWritten,
+    GlobalSkillMetadataWritten,
     GlobalSkillWritten,
     ManifestWritten,
     SmokeTested,
@@ -576,6 +583,7 @@ impl Installer {
             &self.context.home,
             &prior_skill_ownership,
             &mut notices,
+            self.fail_after,
         )?;
         self.fail(SetupStage::GlobalSkillWritten)?;
 
@@ -744,10 +752,19 @@ impl Installer {
             }
             if had_expected_skill_ownership {
                 for directory in [
+                    global_skill_root(&self.context.home).join("references"),
                     global_skill_root(&self.context.home).join("agents"),
                     global_skill_root(&self.context.home),
                 ] {
-                    if remove_empty_directory(&directory)? {
+                    if !global_skill_directory_is_safe(&self.context.home, &directory)? {
+                        if fs::symlink_metadata(&directory).is_ok() {
+                            report.preserved.push(directory.clone());
+                            report.warnings.push(format!(
+                                "preserved global Agent Skill directory because it or a parent is not a non-symlink directory: {}",
+                                directory.display()
+                            ));
+                        }
+                    } else if remove_empty_directory(&directory)? {
                         report.removed.push(directory);
                     }
                 }
@@ -1102,8 +1119,6 @@ struct SkillInstall {
 #[derive(Default)]
 struct SkillAssetInstall {
     changed: bool,
-    modified: bool,
-    conflict: bool,
 }
 
 fn global_skill_root(home: &Path) -> PathBuf {
@@ -1146,6 +1161,7 @@ fn install_global_skill(
     home: &Path,
     prior_ownership: &[OwnedSkill],
     notices: &mut Vec<String>,
+    fail_after: Option<SetupStage>,
 ) -> Result<SkillInstall> {
     let root = global_skill_root(home);
     let assets = global_skill_assets(home);
@@ -1172,29 +1188,30 @@ fn install_global_skill(
             ownership,
         });
     }
+    if let Some(status) = global_skill_bundle_conflict(&assets, prior_ownership, notices)? {
+        return Ok(SkillInstall {
+            changed: false,
+            status,
+            ownership,
+        });
+    }
 
     let mut aggregate = SkillAssetInstall::default();
     for (path, desired) in assets {
         let prior = prior_ownership.iter().find(|owned| owned.path == path);
-        let result = install_global_skill_asset(
-            transaction,
-            home,
-            path,
-            desired,
-            prior,
-            &mut ownership,
-            notices,
-        )?;
+        let stage = global_skill_asset_stage(&path)?;
+        let result =
+            install_global_skill_asset(transaction, home, path, desired, prior, &mut ownership)?;
         aggregate.changed |= result.changed;
-        aggregate.modified |= result.modified;
-        aggregate.conflict |= result.conflict;
+        if fail_after == Some(stage) {
+            return Err(Error::new(
+                ErrorKind::Io,
+                format!("injected setup failure after {stage:?}"),
+            ));
+        }
     }
 
-    let status = if aggregate.modified {
-        SkillStatus::Modified
-    } else if aggregate.conflict {
-        SkillStatus::Conflict
-    } else if aggregate.changed {
+    let status = if aggregate.changed {
         SkillStatus::Installed
     } else {
         SkillStatus::Current
@@ -1204,6 +1221,91 @@ fn install_global_skill(
         status,
         ownership,
     })
+}
+
+fn global_skill_asset_stage(path: &Path) -> Result<SetupStage> {
+    if path.ends_with("SKILL.md") {
+        Ok(SetupStage::GlobalSkillGateWritten)
+    } else if path.ends_with("references/workflow.md") {
+        Ok(SetupStage::GlobalSkillWorkflowWritten)
+    } else if path.ends_with("agents/openai.yaml") {
+        Ok(SetupStage::GlobalSkillMetadataWritten)
+    } else {
+        Err(Error::new(
+            ErrorKind::InvariantViolation,
+            format!("unexpected global Agent Skill asset: {}", path.display()),
+        ))
+    }
+}
+
+fn global_skill_bundle_conflict(
+    assets: &[(PathBuf, &'static [u8])],
+    prior_ownership: &[OwnedSkill],
+    notices: &mut Vec<String>,
+) -> Result<Option<SkillStatus>> {
+    let mut modified = false;
+    let mut conflict = false;
+    for (path, _) in assets {
+        let prior = prior_ownership.iter().find(|owned| owned.path == *path);
+        if let Some(parent) = path.parent() {
+            match fs::symlink_metadata(parent) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    notices.push(format!(
+                        "preserved global Agent Skill bundle because an asset parent is not a non-symlink directory: {}",
+                        parent.display()
+                    ));
+                    modified |= prior.is_some();
+                    conflict |= prior.is_none();
+                    continue;
+                }
+                Err(error) => {
+                    return Err(io_error("inspect global Agent Skill bundle parent")(error));
+                }
+            }
+        }
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                let current =
+                    fs::read(path).map_err(io_error("read global Agent Skill bundle asset"))?;
+                match prior {
+                    Some(owned) if sha256(&current) == owned.sha256 => {}
+                    Some(_) => {
+                        notices.push(format!(
+                            "preserved user-modified global Agent Skill file: {}",
+                            path.display()
+                        ));
+                        modified = true;
+                    }
+                    None => {
+                        notices.push(format!(
+                            "preserved user-owned global Agent Skill file: {}; Shared Context did not overwrite or claim it",
+                            path.display()
+                        ));
+                        conflict = true;
+                    }
+                }
+            }
+            Ok(_) => {
+                notices.push(format!(
+                    "preserved global Agent Skill path because it is not a regular file: {}",
+                    path.display()
+                ));
+                modified |= prior.is_some();
+                conflict |= prior.is_none();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("inspect global Agent Skill bundle asset")(error)),
+        }
+    }
+    if modified {
+        Ok(Some(SkillStatus::Modified))
+    } else if conflict {
+        Ok(Some(SkillStatus::Conflict))
+    } else {
+        Ok(None)
+    }
 }
 
 fn global_skill_location_conflict(
@@ -1257,51 +1359,41 @@ fn install_global_skill_asset(
     desired: &'static [u8],
     prior: Option<&OwnedSkill>,
     ownership: &mut Vec<OwnedSkill>,
-    notices: &mut Vec<String>,
 ) -> Result<SkillAssetInstall> {
     if let Some(parent) = path.parent() {
         match fs::symlink_metadata(parent) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Ok(_) => {
-                notices.push(format!(
-                    "preserved global Agent Skill file because its parent is not a non-symlink directory: {}",
-                    parent.display()
+                return Err(Error::new(
+                    ErrorKind::InvariantViolation,
+                    format!(
+                        "global Agent Skill bundle parent changed after preflight: {}",
+                        parent.display()
+                    ),
                 ));
-                return Ok(SkillAssetInstall {
-                    modified: prior.is_some(),
-                    conflict: prior.is_none(),
-                    ..SkillAssetInstall::default()
-                });
             }
             Err(error) => return Err(io_error("inspect global Agent Skill file parent")(error)),
         }
     }
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-            install_existing_skill_asset(transaction, path, desired, prior, ownership, notices)
+            install_existing_skill_asset(transaction, path, desired, prior, ownership)
         }
-        Ok(_) => {
-            notices.push(format!(
-                "preserved global Agent Skill path because it is not a regular file: {}",
+        Ok(_) => Err(Error::new(
+            ErrorKind::InvariantViolation,
+            format!(
+                "global Agent Skill bundle asset changed after preflight: {}",
                 path.display()
-            ));
-            Ok(SkillAssetInstall {
-                modified: prior.is_some(),
-                conflict: prior.is_none(),
-                ..SkillAssetInstall::default()
-            })
-        }
+            ),
+        )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let cleanup_empty_dirs = absent_parent_directories(&path, home)?;
             transaction.record_with_cleanup(&path, cleanup_empty_dirs)?;
             atomic_write(&path, desired, 0o644)?;
             transaction.phase("global_skill_installed")?;
             upsert_owned_skill(ownership, path, sha256(desired));
-            Ok(SkillAssetInstall {
-                changed: true,
-                ..SkillAssetInstall::default()
-            })
+            Ok(SkillAssetInstall { changed: true })
         }
         Err(error) => Err(io_error("inspect global Agent Skill file")(error)),
     }
@@ -1313,7 +1405,6 @@ fn install_existing_skill_asset(
     desired: &'static [u8],
     prior: Option<&OwnedSkill>,
     ownership: &mut Vec<OwnedSkill>,
-    notices: &mut Vec<String>,
 ) -> Result<SkillAssetInstall> {
     let current = fs::read(&path).map_err(io_error("read global Agent Skill file"))?;
     match prior {
@@ -1325,31 +1416,15 @@ fn install_existing_skill_asset(
                 transaction.phase("global_skill_updated")?;
             }
             upsert_owned_skill(ownership, path, sha256(desired));
-            Ok(SkillAssetInstall {
-                changed,
-                ..SkillAssetInstall::default()
-            })
+            Ok(SkillAssetInstall { changed })
         }
-        Some(_) => {
-            notices.push(format!(
-                "preserved user-modified global Agent Skill file: {}",
+        Some(_) | None => Err(Error::new(
+            ErrorKind::InvariantViolation,
+            format!(
+                "global Agent Skill bundle asset changed after preflight: {}",
                 path.display()
-            ));
-            Ok(SkillAssetInstall {
-                modified: true,
-                ..SkillAssetInstall::default()
-            })
-        }
-        None => {
-            notices.push(format!(
-                "preserved user-owned global Agent Skill file: {}; Shared Context did not overwrite or claim it",
-                path.display()
-            ));
-            Ok(SkillAssetInstall {
-                conflict: true,
-                ..SkillAssetInstall::default()
-            })
-        }
+            ),
+        )),
     }
 }
 
@@ -1827,6 +1902,17 @@ fn skill_parent_directories_are_safe(home: &Path, path: &Path) -> Result<bool> {
         current = directory.parent();
     }
     Ok(false)
+}
+
+fn global_skill_directory_is_safe(home: &Path, directory: &Path) -> Result<bool> {
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            skill_parent_directories_are_safe(home, &directory.join(".sctx-prune-check"))
+        }
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(io_error("inspect global Agent Skill directory")(error)),
+    }
 }
 
 fn uninstall_owned_skill(
@@ -2466,6 +2552,8 @@ fn check_global_skill(root: &Path, home: &Path, checks: &mut Vec<DoctorCheck>) {
     for (path, desired) in assets {
         let name = if path.ends_with("SKILL.md") {
             "global_skill.skill_md"
+        } else if path.ends_with("references/workflow.md") {
+            "global_skill.workflow_reference"
         } else {
             "global_skill.openai_yaml"
         };

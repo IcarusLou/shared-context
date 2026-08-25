@@ -29,12 +29,12 @@
 
 Repository 范围推理前准入（Mew #181–#189）已接入 Hook：产品私有 Catalog 支持显式 `RepositoryGroup` 管理与漂移修复，纯 `ScopeResolver` 只把注册 checkout 内目录判为 `Direct`、显式 Group exact root 判为 `Group`，其他目录判为 `Disabled`；`AuthorizedSessionScopeStore` 以 locator digest 文件名保存短期、Catalog-bound、无业务正文的 typed lease。SessionStart 只让 Missing locator 解析 cwd 并先持久化决定，Current 直接复用，Stale/Expired/锁忙/异常立即 Disabled；同一 locator 的首次成功决定不会被后续 SessionStart cwd 改写。Enabled marker 只在 startup/resume/compact 的 SessionStart 边界出现，PromptSubmit neutral；PostTool 在 Runtime/Capture 前区分真实 registered 归属、隐私安全的 non-locating meaning 与 unsafe drop，SessionEnd 删除 exact lease。解析与 lease 热路径不运行 Git 或 Repository scan，不需要 launcher，也不写业务仓库配置。固定 `repository_scoped_activation_acceptance` 使用手写隐私安全 oracle 和文档化 Codex/Cursor payload 验收完整生命周期。
 
-Mew #191 已在 MCP Server 实现基于 current Enabled `AuthorizedSessionScope` 的 Session-level authorization guard：Disabled/Missing/Expired/Stale/busy/corrupt Session 调用被拒绝，Enabled Session 可以显式调查任意已登记 Repository，并可在不伪造 Artifact identity 的前提下保留自包含的非定位工程 Evidence。Server guard 保证安全和不落越权数据；它不替代模型推理前的 Skill 条件加载。
+Mew #191 已在 MCP Server 实现基于 current Enabled `AuthorizedSessionScope` 的 Session-level authorization guard：Disabled/Missing/Expired/Stale/busy/corrupt Session 调用被拒绝，Enabled Session 可以显式调查任意已登记 Repository，并可在不伪造 Artifact identity 的前提下保留自包含的非定位工程 Evidence。Mew #192 把全局 Skill 拆为最小 activation gate 与 installer-owned 完整 workflow reference：没有可信 Hook marker 的自动路径不读取 reference、不产生 Shared Context MCP 调用提示；有 marker 才完整读取一次 workflow。Server guard 保证安全和不落越权数据，Skill gate 负责模型推理前的指令准入，两者不能互相替代。
 
 以下能力**尚未实现**，不得在代码、测试报告或评审中宣称已经具备：
 
 - **团队同步：未实现** — Repository Catalog 是单机显式配置，不是团队事实或知识 Store。
-- **完整 Skill 条件加载：未实现** — Skill 仍按用户级方式安装，尚未按 lease 在 Agent 上下文中加载/卸载；当前只证明 Disabled Hook 不注入 Shared Context 文本并且不产生 Hook 业务记录，不能外推为全部 Skill/MCP token 成本均已消除。
+- **真实 token/物理进程隔离证明：未实现** — Skill gate 已用 reference-read 与 MCP-call/result bytes 合约证明 Disabled 自动路径不加载完整 workflow 或生成 Shared Context 调用提示，但尚未测量真实计费 token。MCP 进程与工具 Schema 仍可能由用户级配置全局启动或可见；最终 token proxy 与 NPM/分发闭环由 #193 验收，不能从 Server 拒绝或 #192 的静态/行为合约外推。
 
 Cursor 与 Codex 都通过显式 `task_intent_update` 建立 TaskSession 的首个 `TaskIntentRevision`；SessionStart 的固定 marker 只声明本地范围已授权，Prompt Hook 不重复提示。已有 ActiveTask 可通过只读 `task_context` 再取 Pack。
 

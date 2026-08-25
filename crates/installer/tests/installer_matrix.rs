@@ -194,6 +194,27 @@ fn replace_owned_skill_bytes(path: &Path, bytes: &[u8], manifest_path: &Path) {
     fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
 }
 
+fn remove_owned_skill(path: &Path, manifest_path: &Path) {
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+    manifest["skills"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|owned| owned["path"] != path.to_string_lossy().as_ref());
+    fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+}
+
+fn manifest_skill_paths(manifest_path: &Path) -> Vec<PathBuf> {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+    manifest["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|owned| PathBuf::from(owned["path"].as_str().unwrap()))
+        .collect()
+}
+
 fn init_catalog_repo(path: &Path) -> PathBuf {
     fs::create_dir_all(path).unwrap();
     assert!(
@@ -229,6 +250,28 @@ fn setup_three_times_is_idempotent_and_preserves_existing_configuration() {
     assert_eq!(
         fs::read(harness.skill_root().join("agents/openai.yaml")).unwrap(),
         include_bytes!("../../../skills/shared-context/agents/openai.yaml")
+    );
+    assert_eq!(
+        fs::read(harness.skill_root().join("references/workflow.md")).unwrap(),
+        include_bytes!("../../../skills/shared-context/references/workflow.md")
+    );
+    for asset in [
+        harness.skill_root().join("SKILL.md"),
+        harness.skill_root().join("references/workflow.md"),
+        harness.skill_root().join("agents/openai.yaml"),
+    ] {
+        assert_eq!(
+            fs::metadata(asset).unwrap().permissions().mode() & 0o7777,
+            0o644
+        );
+    }
+    assert_eq!(
+        manifest_skill_paths(&harness.root.join("state/install-manifest.json")),
+        vec![
+            harness.skill_root().join("SKILL.md"),
+            harness.skill_root().join("agents/openai.yaml"),
+            harness.skill_root().join("references/workflow.md"),
+        ]
     );
 
     let cursor_mcp: serde_json::Value =
@@ -292,6 +335,12 @@ fn cursor_and_codex_share_one_global_skill_installation() {
     assert_eq!(first.skill.path, second.skill.path);
     assert!(harness.skill_root().join("SKILL.md").is_file());
     assert!(harness.skill_root().join("agents/openai.yaml").is_file());
+    assert!(
+        harness
+            .skill_root()
+            .join("references/workflow.md")
+            .is_file()
+    );
 }
 
 #[test]
@@ -322,6 +371,7 @@ fn setup_preserves_and_does_not_claim_an_external_same_name_skill() {
     let uninstall = installer.uninstall().unwrap();
     assert!(skill.join("SKILL.md").is_file());
     assert!(skill.join("agents/openai.yaml").is_file());
+    assert!(!skill.join("references/workflow.md").exists());
     assert!(!uninstall.removed.contains(&skill));
 }
 
@@ -336,6 +386,9 @@ fn every_setup_write_seam_restores_exact_agent_bytes_and_permissions() {
         SetupStage::CursorHooksWritten,
         SetupStage::CodexMcpWritten,
         SetupStage::CodexHooksWritten,
+        SetupStage::GlobalSkillGateWritten,
+        SetupStage::GlobalSkillWorkflowWritten,
+        SetupStage::GlobalSkillMetadataWritten,
         SetupStage::GlobalSkillWritten,
         SetupStage::ManifestWritten,
         SetupStage::SmokeTested,
@@ -505,6 +558,7 @@ fn upgrade_and_uninstall_preserve_only_the_user_modified_skill_file() {
         .unwrap();
     let skill_md = harness.skill_root().join("SKILL.md");
     let openai_yaml = harness.skill_root().join("agents/openai.yaml");
+    let workflow = harness.skill_root().join("references/workflow.md");
     fs::write(&skill_md, b"user modified skill\n").unwrap();
     fs::write(&harness.runtime, b"signed-runtime-v2").unwrap();
 
@@ -513,6 +567,7 @@ fn upgrade_and_uninstall_preserve_only_the_user_modified_skill_file() {
     assert_eq!(upgrade.skill.status, SkillStatus::Modified);
     assert_eq!(fs::read(&skill_md).unwrap(), b"user modified skill\n");
     assert!(openai_yaml.is_file());
+    assert!(workflow.is_file());
     assert!(
         upgrade
             .notices
@@ -523,6 +578,7 @@ fn upgrade_and_uninstall_preserve_only_the_user_modified_skill_file() {
     let uninstall = installer.uninstall().unwrap();
     assert!(skill_md.is_file());
     assert!(!openai_yaml.exists());
+    assert!(!workflow.exists());
     assert!(harness.skill_root().is_dir());
     assert!(uninstall.preserved.contains(&skill_md));
     assert!(uninstall.removed.contains(&openai_yaml));
@@ -554,12 +610,14 @@ fn uninstall_never_follows_a_replaced_skill_parent_symlink() {
         include_bytes!("../../../skills/shared-context/agents/openai.yaml"),
     )
     .unwrap();
+    fs::create_dir_all(outside.join("references")).unwrap();
     symlink(&outside, &skill).unwrap();
 
     let report = installer.uninstall().unwrap();
     assert!(skill.is_symlink());
     assert!(outside.join("SKILL.md").is_file());
     assert!(outside.join("agents/openai.yaml").is_file());
+    assert!(outside.join("references").is_dir());
     assert!(
         report
             .warnings
@@ -576,9 +634,16 @@ fn upgrade_replaces_an_unchanged_managed_skill_from_an_older_build() {
         .setup(&SetupOptions::default())
         .unwrap();
     let skill_md = harness.skill_root().join("SKILL.md");
+    let workflow = harness.skill_root().join("references/workflow.md");
+    let openai_yaml = harness.skill_root().join("agents/openai.yaml");
     let manifest = harness.root.join("state/install-manifest.json");
     replace_owned_skill_bytes(&skill_md, b"older managed skill\n", &manifest);
+    replace_owned_skill_bytes(&openai_yaml, b"older: metadata\n", &manifest);
+    remove_owned_skill(&workflow, &manifest);
+    fs::remove_file(&workflow).unwrap();
+    fs::remove_dir(workflow.parent().unwrap()).unwrap();
     fs::set_permissions(&skill_md, fs::Permissions::from_mode(0o640)).unwrap();
+    fs::set_permissions(&openai_yaml, fs::Permissions::from_mode(0o604)).unwrap();
     fs::write(&harness.runtime, b"signed-runtime-v2").unwrap();
 
     let report = harness
@@ -594,6 +659,94 @@ fn upgrade_replaces_an_unchanged_managed_skill_from_an_older_build() {
         fs::metadata(&skill_md).unwrap().permissions().mode() & 0o7777,
         0o640
     );
+    assert_eq!(
+        fs::read(&workflow).unwrap(),
+        include_bytes!("../../../skills/shared-context/references/workflow.md")
+    );
+    assert_eq!(
+        fs::metadata(&workflow).unwrap().permissions().mode() & 0o7777,
+        0o644
+    );
+    assert_eq!(
+        fs::read(&openai_yaml).unwrap(),
+        include_bytes!("../../../skills/shared-context/agents/openai.yaml")
+    );
+    assert_eq!(
+        fs::metadata(&openai_yaml).unwrap().permissions().mode() & 0o7777,
+        0o604
+    );
+    assert_eq!(manifest_skill_paths(&manifest).len(), 3);
+}
+
+#[test]
+fn hostile_unowned_reference_blocks_the_complete_managed_bundle_upgrade() {
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let skill_md = harness.skill_root().join("SKILL.md");
+    let workflow = harness.skill_root().join("references/workflow.md");
+    let openai_yaml = harness.skill_root().join("agents/openai.yaml");
+    let manifest = harness.root.join("state/install-manifest.json");
+    replace_owned_skill_bytes(&skill_md, b"older managed gate\n", &manifest);
+    replace_owned_skill_bytes(&openai_yaml, b"older: managed metadata\n", &manifest);
+    remove_owned_skill(&workflow, &manifest);
+    fs::write(&workflow, b"hostile user-owned workflow\n").unwrap();
+    let before_paths = manifest_skill_paths(&manifest);
+    fs::write(&harness.runtime, b"signed-runtime-v2").unwrap();
+
+    let report = harness
+        .installer("2.0.0")
+        .upgrade(&SetupOptions::default())
+        .unwrap();
+
+    assert_eq!(report.skill.status, SkillStatus::Conflict);
+    assert_eq!(fs::read(&skill_md).unwrap(), b"older managed gate\n");
+    assert_eq!(
+        fs::read(&openai_yaml).unwrap(),
+        b"older: managed metadata\n"
+    );
+    assert_eq!(
+        fs::read(&workflow).unwrap(),
+        b"hostile user-owned workflow\n"
+    );
+    assert_eq!(manifest_skill_paths(&manifest), before_paths);
+    assert!(report.notices.iter().any(|notice| {
+        notice.contains("user-owned global Agent Skill file")
+            && notice.contains("references/workflow.md")
+    }));
+}
+
+#[test]
+fn modified_owned_reference_is_preserved_by_setup_upgrade_and_uninstall() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.0.0");
+    installer.setup(&SetupOptions::default()).unwrap();
+    let skill_md = harness.skill_root().join("SKILL.md");
+    let workflow = harness.skill_root().join("references/workflow.md");
+    let gate_before = fs::read(&skill_md).unwrap();
+    fs::write(&workflow, b"user-modified workflow\n").unwrap();
+
+    let repeat = installer.setup(&SetupOptions::default()).unwrap();
+    assert_eq!(repeat.skill.status, SkillStatus::Modified);
+    assert_eq!(fs::read(&workflow).unwrap(), b"user-modified workflow\n");
+    assert_eq!(fs::read(&skill_md).unwrap(), gate_before);
+
+    fs::write(&harness.runtime, b"signed-runtime-v2").unwrap();
+    let upgrade = harness
+        .installer("2.0.0")
+        .upgrade(&SetupOptions::default())
+        .unwrap();
+    assert_eq!(upgrade.skill.status, SkillStatus::Modified);
+    assert_eq!(fs::read(&workflow).unwrap(), b"user-modified workflow\n");
+    assert_eq!(fs::read(&skill_md).unwrap(), gate_before);
+
+    let uninstall = harness.installer("2.0.0").uninstall().unwrap();
+    assert!(workflow.is_file());
+    assert_eq!(fs::read(&workflow).unwrap(), b"user-modified workflow\n");
+    assert!(uninstall.preserved.contains(&workflow));
+    assert!(!skill_md.exists());
 }
 
 #[test]
@@ -607,6 +760,9 @@ fn failed_upgrade_restores_managed_skill_bytes_and_permissions() {
         SetupStage::CursorHooksWritten,
         SetupStage::CodexMcpWritten,
         SetupStage::CodexHooksWritten,
+        SetupStage::GlobalSkillGateWritten,
+        SetupStage::GlobalSkillWorkflowWritten,
+        SetupStage::GlobalSkillMetadataWritten,
         SetupStage::GlobalSkillWritten,
         SetupStage::ManifestWritten,
         SetupStage::SmokeTested,
@@ -633,6 +789,11 @@ fn failed_upgrade_restores_managed_skill_bytes_and_permissions() {
                 harness.skill_root().join("SKILL.md"),
                 b"old skill\n".as_slice(),
                 0o640,
+            ),
+            (
+                harness.skill_root().join("references/workflow.md"),
+                b"old workflow\n".as_slice(),
+                0o644,
             ),
             (
                 harness.skill_root().join("agents/openai.yaml"),
@@ -708,6 +869,9 @@ fn doctor_reports_codex_trust_as_action_required() {
     assert!(report.checks.iter().any(|check| {
         check.name == "global_skill.openai_yaml" && check.status == CheckStatus::Ok
     }));
+    assert!(report.checks.iter().any(|check| {
+        check.name == "global_skill.workflow_reference" && check.status == CheckStatus::Ok
+    }));
 }
 
 #[test]
@@ -716,6 +880,11 @@ fn doctor_distinguishes_modified_and_missing_managed_skill_files() {
     let installer = harness.installer("1.0.0");
     installer.setup(&SetupOptions::default()).unwrap();
     fs::write(harness.skill_root().join("SKILL.md"), b"modified\n").unwrap();
+    fs::write(
+        harness.skill_root().join("references/workflow.md"),
+        b"modified workflow\n",
+    )
+    .unwrap();
     fs::remove_file(harness.skill_root().join("agents/openai.yaml")).unwrap();
 
     let report = installer.doctor();
@@ -725,6 +894,10 @@ fn doctor_distinguishes_modified_and_missing_managed_skill_files() {
     }));
     assert!(report.checks.iter().any(|check| {
         check.name == "global_skill.openai_yaml" && check.status == CheckStatus::Error
+    }));
+    assert!(report.checks.iter().any(|check| {
+        check.name == "global_skill.workflow_reference"
+            && check.status == CheckStatus::ActionRequired
     }));
 }
 

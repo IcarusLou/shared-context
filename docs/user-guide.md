@@ -178,7 +178,7 @@ sctx doctor --fix
 - 初始化本地索引和运行时状态。
 - 按选择写入 `~/.cursor/mcp.json`、`~/.cursor/hooks.json`。
 - 按选择写入 `~/.codex/config.toml`、`~/.codex/hooks.json`。
-- 安装用户级 Skill 到 `~/.agents/skills/shared-context`。
+- 安装用户级最小 activation Skill 与 installer-owned 完整 workflow reference 到 `~/.agents/skills/shared-context`。
 - 写安装清单，用于后续升级、诊断和精确卸载。
 
 安装器会记录每次写入并支持失败回滚。已有配置会合并，不会把整个配置文件直接覆盖成模板。
@@ -696,7 +696,7 @@ sctx search \
 
 CLI 还提供 Space/Context 写入治理、语义冲突、索引和 Pending Batch 等管理员能力；这些没有全部开放成 Agent MCP 写工具，以维持显式审核和生命周期边界。
 
-当前 Repository 准入控制 Hook 的 Agent-visible activation 与生命周期记录路径；MCP Server 也已用 current Enabled Session lease 实现授权校验，Disabled/Missing/Expired/Stale/busy/corrupt Session 的调用会被拒绝。MCP 进程仍由用户级 Agent 配置提供，完整 Skill 也尚未按目录条件加载/卸载。因此不要把 Disabled 理解为 MCP 进程物理未启动，也不要把 Server 端拒绝外推为已经节省 Agent 产生调用前的 token。当前已经证明的是：Disabled Hook 不向模型注入 Shared Context 文本、不产生 Runtime/Capture/Report/知识 Git 记录，Server guard 保证安全和不落越权数据；完整 Skill 的推理前条件加载仍待后续实现。
+当前 Repository 准入控制 Hook 的 Agent-visible activation 与生命周期记录路径；MCP Server 也用 current Enabled Session lease 实现授权校验，Disabled/Missing/Expired/Stale/busy/corrupt Session 的调用会被拒绝。已安装的全局 Skill 主入口只包含最小 activation gate：没有可信 SessionStart marker 时不读取完整 workflow reference、不产生 Shared Context MCP 调用提示；有 marker 时才完整读取一次 installer-owned reference。这个 Skill gate 是 Agent 推理前的指令准入机制，Server guard 则负责安全和不落越权数据。MCP 进程和工具 Schema 仍由用户级 Agent 配置提供，可能物理启动或可见；不要把 Disabled 理解为进程必然未启动，也不要把合约中的 reference-read/MCP-call 字节代理外推为真实计费 token 已被测量。当前还已证明 Disabled Hook 不向模型注入 Shared Context 文本，也不产生 Runtime/Capture/Report/知识 Git 记录。
 
 ## 7. 常见问题
 
