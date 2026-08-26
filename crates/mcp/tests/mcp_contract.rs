@@ -2992,7 +2992,7 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
 
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
         let names = tools
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
@@ -3001,6 +3001,7 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
             names,
             [
                 "task_intent_update",
+                "task_capture_list",
                 "task_artifact_focus",
                 "task_signal_supersede",
                 "task_checkpoint",

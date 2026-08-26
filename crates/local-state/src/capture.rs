@@ -361,6 +361,67 @@ impl CaptureStore {
         Ok(report)
     }
 
+    /// Lists recent, live, unclaimed Captures owned by one exact active Task.
+    ///
+    /// Filtering happens before the public bound is applied, so unrelated Sessions or Tasks
+    /// cannot crowd the requested owner out of the result. Unsafe entries remain private store
+    /// diagnostics and are not exposed through this owner-scoped view.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid bound or inaccessible Capture storage.
+    pub fn list_unclaimed_for_task(
+        &self,
+        locator: &ExternalSessionLocator,
+        task_session_id: TaskSessionId,
+        task_id: TaskId,
+        limit: usize,
+    ) -> Result<CaptureListReport> {
+        if limit == 0 || limit > MAX_LIST_LIMIT {
+            return Err(invalid(format!(
+                "capture list limit must be between 1 and {MAX_LIST_LIMIT}"
+            )));
+        }
+        locator.validate()?;
+        let lock = self.lock()?;
+        let now = unix_seconds(SystemTime::now())?;
+        let mut captures = Vec::new();
+        for entry in sorted_entries(&self.directory)? {
+            let path = entry.path();
+            let Ok(record) = self.read_record_path(&path) else {
+                continue;
+            };
+            let owned = record.task_owner.is_some_and(|owner| {
+                owner.task_session_id == task_session_id && owner.task_id == task_id
+            });
+            if record.external_session_locator == *locator
+                && owned
+                && record.claim.is_none()
+                && record.expires_at_unix_seconds > now
+            {
+                captures.push(CaptureRead {
+                    record,
+                    expired: false,
+                });
+            }
+        }
+        captures.sort_by(|left, right| {
+            right
+                .record
+                .recorded_at_unix_seconds
+                .cmp(&left.record.recorded_at_unix_seconds)
+                .then_with(|| left.record.capture_id.cmp(&right.record.capture_id))
+        });
+        let truncated = captures.len() > limit;
+        captures.truncate(limit);
+        FileExt::unlock(&lock).map_err(io_error("unlock capture.lock"))?;
+        Ok(CaptureListReport {
+            captures,
+            diagnostics: Vec::new(),
+            truncated,
+        })
+    }
+
     /// Idempotently reserves a Capture for its exact owned Work Episode.
     ///
     /// A claim is retained after crashes and never removes the source record.
@@ -770,7 +831,7 @@ mod tests {
         path::PathBuf,
         sync::{Arc, Barrier},
         thread,
-        time::Duration,
+        time::{Duration, SystemTime},
     };
 
     use sctx_domain::{
@@ -887,6 +948,51 @@ mod tests {
         assert!(bounded.truncated);
         assert!(store.list(0).is_err());
         assert!(store.list(257).is_err());
+    }
+
+    #[test]
+    fn owner_scoped_list_filters_before_bounding_and_excludes_claimed_or_expired() {
+        let temporary = tempdir().unwrap();
+        let store = CaptureStore::initialize(temporary.path()).unwrap();
+        let breadcrumb = owned_breadcrumb("live owned Capture");
+        let task_owner = breadcrumb.task_owner.unwrap();
+        let live = store.capture(&breadcrumb).unwrap();
+
+        let mut unrelated = breadcrumb.clone();
+        unrelated.external_session_locator = locator("another-session");
+        unrelated.summary = "unrelated Capture".to_owned();
+        store.capture(&unrelated).unwrap();
+
+        let mut claimed = breadcrumb.clone();
+        claimed.summary = "claimed Capture".to_owned();
+        let claimed = store.capture(&claimed).unwrap();
+        store
+            .claim(
+                claimed.capture_id,
+                CaptureClaim {
+                    episode_id: WorkEpisodeId::new(),
+                    task_session_id: task_owner.task_session_id,
+                    task_id: task_owner.task_id,
+                },
+            )
+            .unwrap();
+
+        let mut expired = breadcrumb.clone();
+        expired.summary = "expired Capture".to_owned();
+        store.capture_at(&expired, SystemTime::UNIX_EPOCH).unwrap();
+
+        let report = store
+            .list_unclaimed_for_task(
+                &breadcrumb.external_session_locator,
+                task_owner.task_session_id,
+                task_owner.task_id,
+                1,
+            )
+            .unwrap();
+        assert_eq!(report.captures.len(), 1);
+        assert_eq!(report.captures[0].record.capture_id, live.capture_id);
+        assert!(!report.truncated);
+        assert!(report.diagnostics.is_empty());
     }
 
     #[test]

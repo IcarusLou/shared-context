@@ -66,6 +66,54 @@ impl Harness {
         );
         serde_json::from_slice(&output.stdout).unwrap()
     }
+
+    fn mcp(&self, requests: &[Value]) -> Vec<Value> {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_sctx"))
+            .args(["mcp", "serve", "--client", "codex"])
+            .env("HOME", &self.home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.as_mut().unwrap();
+        for request in requests {
+            stdin
+                .write_all(&serde_json::to_vec(request).unwrap())
+                .unwrap();
+            stdin.write_all(b"\n").unwrap();
+        }
+        drop(child.stdin.take());
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn rpc(id: u64, method: &str, params: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn tool_call(id: u64, name: &str, arguments: Value) -> Value {
+    rpc(
+        id,
+        "tools/call",
+        json!({"name": name, "arguments": arguments}),
+    )
+}
+
+fn initialize(id: u64) -> Value {
+    rpc(id, "initialize", json!({"protocolVersion": "2024-11-05"}))
 }
 
 fn git_repo(path: &Path) -> PathBuf {
@@ -488,5 +536,206 @@ fn hook_capture_keeps_locator_then_explicit_claim_and_ingestion_are_verifiable()
             .unwrap()
             .diagnostics
             .is_empty()
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn public_mcp_lists_and_ingests_owned_capture_into_candidate_evidence() {
+    let harness = Harness::new();
+    GitStore::bootstrap_local(harness.root()).unwrap();
+    let repository = git_repo(&harness.home.join("public capture/repo"));
+    UserConfigStore::initialize(harness.root())
+        .unwrap()
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(&repository),
+        )
+        .unwrap();
+    let session = "public-capture";
+    assert!(
+        harness.hook(&session_start(session, &repository))["hookSpecificOutput"]
+            ["additionalContext"]
+            .as_str()
+            .is_some_and(|message| message.contains("<shared-context-active>"))
+    );
+
+    let started = harness.mcp(&[
+        initialize(1),
+        tool_call(
+            2,
+            "task_intent_update",
+            json!({
+                "agent_kind": "codex",
+                "external_session_id": session,
+                "task_boundary": "new",
+                "expected_revision_id": null,
+                "intent": {"goal": "Consume one real Hook Capture through public MCP"}
+            }),
+        ),
+    ]);
+    let task = &started[1]["result"]["structuredContent"];
+    let task_id = task["task_id"].as_str().unwrap();
+    let intent_revision_id = task["intent_revision_id"].as_str().unwrap();
+
+    let raw = "RAW_PUBLIC_CAPTURE_PAYLOAD_MUST_NOT_PERSIST";
+    assert_eq!(
+        harness.hook(&post_tool(
+            session,
+            &repository,
+            &repository.join("src/feature.rs"),
+            raw,
+            "Inspect",
+        )),
+        json!({})
+    );
+    let listed = harness.mcp(&[
+        initialize(3),
+        tool_call(
+            4,
+            "task_capture_list",
+            json!({
+                "agent_kind": "codex",
+                "external_session_id": session,
+                "limit": 10
+            }),
+        ),
+    ]);
+    let captures = listed[1]["result"]["structuredContent"]["captures"]
+        .as_array()
+        .unwrap();
+    assert_eq!(captures.len(), 1);
+    let capture_id = captures[0]["capture_id"].as_str().unwrap();
+    let listed_text = serde_json::to_string(&listed[1]).unwrap();
+    assert!(!listed_text.contains(raw));
+    assert!(!listed_text.contains(repository.to_str().unwrap()));
+
+    let checkpoint_arguments = json!({
+        "agent_kind": "codex",
+        "external_session_id": session,
+        "expected_task_id": task_id,
+        "expected_intent_revision_id": intent_revision_id,
+        "expected_episode_version": 0,
+        "boundary": "close",
+        "claims": [{
+            "context_kind_hint": "validation",
+            "statement": "A real Hook Capture can support a reviewed Candidate",
+            "rationale": "The Agent explicitly selected its owned normalized Capture",
+            "applicability": {"domains": ["capture"], "platforms": [], "conditions": []},
+            "assumptions": [],
+            "recheck_when": ["the Capture evidence contract changes"],
+            "evidence": [{"kind": "capture", "capture_id": capture_id}],
+            "artifact_refs": [],
+            "related_contexts": []
+        }],
+        "unknowns": []
+    });
+    let mut invalid_checkpoint = checkpoint_arguments.clone();
+    invalid_checkpoint["claims"][0]["artifact_refs"] = json!([{
+        "repository_id": "Ghost",
+        "locator": {"locator_kind": "file", "path": "src/feature.rs"}
+    }]);
+    let invalid = harness.mcp(&[
+        initialize(5),
+        tool_call(6, "task_checkpoint", invalid_checkpoint),
+        tool_call(
+            7,
+            "task_capture_list",
+            json!({"agent_kind": "codex", "external_session_id": session}),
+        ),
+    ]);
+    assert_eq!(invalid[1]["result"]["isError"], true);
+    assert_eq!(
+        invalid[2]["result"]["structuredContent"]["captures"][0]["capture_id"],
+        capture_id
+    );
+
+    let checkpoint = harness.mcp(&[
+        initialize(8),
+        tool_call(9, "task_checkpoint", checkpoint_arguments.clone()),
+    ]);
+    let checkpoint = &checkpoint[1]["result"]["structuredContent"];
+    assert_eq!(checkpoint["created"], true);
+    assert_eq!(checkpoint["episode_version"], 2);
+    assert_eq!(checkpoint["diagnostics"][0]["kind"], "capture_ingested");
+    assert_eq!(checkpoint["diagnostics"][0]["capture_id"], capture_id);
+    assert_eq!(checkpoint["diagnostics"][0]["inserted"], true);
+    let candidate_id = checkpoint["candidate_build"]["items"][0]["candidate_id"]
+        .as_str()
+        .unwrap();
+
+    let after = harness.mcp(&[
+        initialize(10),
+        tool_call(
+            11,
+            "task_capture_list",
+            json!({"agent_kind": "codex", "external_session_id": session}),
+        ),
+        tool_call(12, "task_checkpoint", checkpoint_arguments.clone()),
+        tool_call(
+            13,
+            "candidate_get",
+            json!({
+                "agent_kind": "codex",
+                "external_session_id": session,
+                "candidate_id": candidate_id
+            }),
+        ),
+    ]);
+    assert!(
+        after[1]["result"]["structuredContent"]["captures"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(after[2]["result"]["structuredContent"]["created"], false);
+    assert_eq!(
+        after[2]["result"]["structuredContent"]["diagnostics"][0]["inserted"],
+        false
+    );
+    let review = &after[3]["result"]["structuredContent"];
+    assert_eq!(review["content"]["evidence"].as_array().unwrap().len(), 1);
+    let review_text = serde_json::to_string(review).unwrap();
+    assert!(review_text.contains("Only normalized engineering meaning is preserved"));
+    assert!(!review_text.contains(raw));
+    assert!(!review_text.contains(repository.to_str().unwrap()));
+
+    let switched = harness.mcp(&[
+        initialize(14),
+        tool_call(
+            15,
+            "task_intent_update",
+            json!({
+                "agent_kind": "codex",
+                "external_session_id": session,
+                "task_boundary": "new",
+                "expected_revision_id": intent_revision_id,
+                "intent": {"goal": "Start a distinct Task after Capture ingestion"}
+            }),
+        ),
+    ]);
+    let next_task = &switched[1]["result"]["structuredContent"];
+    let mut cross_task = checkpoint_arguments;
+    cross_task["expected_task_id"] = next_task["task_id"].clone();
+    cross_task["expected_intent_revision_id"] = next_task["intent_revision_id"].clone();
+    let rejected = harness.mcp(&[
+        initialize(16),
+        tool_call(
+            17,
+            "task_capture_list",
+            json!({"agent_kind": "codex", "external_session_id": session}),
+        ),
+        tool_call(18, "task_checkpoint", cross_task),
+    ]);
+    assert!(
+        rejected[1]["result"]["structuredContent"]["captures"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(rejected[2]["result"]["isError"], true);
+    assert_eq!(
+        rejected[2]["result"]["structuredContent"]["error"]["code"],
+        "invalid_input"
     );
 }

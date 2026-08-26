@@ -2511,7 +2511,8 @@ fn mcp_stdio_entry_serves_cursor_and_codex_without_extra_stdout() {
         assert_eq!(responses.len(), 2);
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
+        assert!(tools.iter().any(|tool| tool["name"] == "task_capture_list"));
         assert!(tools.iter().any(|tool| tool["name"] == "task_checkpoint"));
         for name in [
             "candidate_list",
