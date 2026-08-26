@@ -9,8 +9,8 @@ use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value as 
 use sctx_domain::{
     Applicability, ArtifactAssociationKind, ArtifactKey, ArtifactKind, ContextId, ContextKind,
     ContextRelationKind, EvidenceId, EvidenceType, ReferenceId, RepositoryId, ResolutionStatus,
-    ResolvedFocus, RevisionId, SpaceId, TaskId, TaskSignal, TaskSignalKind, TaskSpaceAssociation,
-    WorkingIntentSnapshot,
+    ResolvedFocus, RevisionId, SpaceAssociationId, SpaceId, TaskId, TaskSignal, TaskSignalKind,
+    TaskSpaceAssociation, WorkingIntentSnapshot,
 };
 use sctx_engineering_graph::{
     EngineeringProjection, EngineeringProjectionSnapshot, EngineeringProjectionStore,
@@ -446,6 +446,14 @@ pub struct ContextRelationRetrievalPath {
     pub depth: u8,
 }
 
+/// Current organization role through which one Context matched a Task-associated Space.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpaceAssociationRole {
+    Primary,
+    Related,
+}
+
 /// Explicit-only diagnostic for an Artifact edge that was not safe to resolve.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GraphResolutionDiagnosticPath {
@@ -510,6 +518,11 @@ pub enum TaskRetrievalPath {
     },
     ContextRelation {
         hops: Vec<ContextRelationRetrievalPath>,
+    },
+    SpaceAssociation {
+        association_id: SpaceAssociationId,
+        role: SpaceAssociationRole,
+        matched_space_id: SpaceId,
     },
     GraphDiagnostic {
         diagnostic: GraphResolutionDiagnosticPath,
@@ -1408,6 +1421,24 @@ struct GraphContextEvidence {
 
 type GraphContextKey = (SpaceId, ContextId, RevisionId);
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct EffectiveSpaceRole {
+    matched_space_id: SpaceId,
+    role: SpaceAssociationRole,
+}
+
+#[derive(Clone, Debug)]
+struct EffectiveContextSpaces {
+    association_id: SpaceAssociationId,
+    roles: Vec<EffectiveSpaceRole>,
+}
+
+#[derive(Clone, Debug)]
+struct MatchedContextSpace {
+    association_space_id: SpaceId,
+    association_path: Option<TaskRetrievalPath>,
+}
+
 const SAFE_ACCEPTED_CONTEXT_PREDICATE: &str = "item.governance_status = 'accepted'
      AND item.accepted_revision_id = revision.revision_id
      AND item.auto_injection_eligible = 1
@@ -1456,6 +1487,7 @@ struct TaskAssociationInference {
     evidence: BTreeMap<SpaceId, AssociationEvidence>,
     contexts: BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>,
     graph_contexts: BTreeMap<GraphContextKey, GraphContextEvidence>,
+    effective_spaces: BTreeMap<ContextId, EffectiveContextSpaces>,
     graph_context_tree_oid: Option<String>,
     graph_artifact_generation: Option<String>,
     focus_reachable: bool,
@@ -1482,6 +1514,7 @@ fn infer_task_space_associations(
     mode: ContextPackMode,
 ) -> Result<TaskAssociationInference> {
     let intent_candidates = query_space_intent_candidates(connection, query_tokens, query_phrases)?;
+    let effective_spaces = query_effective_context_spaces(connection)?;
     let mut contexts =
         query_accepted_context_evidence(connection, query_tokens, query_phrases, scope_targets)?;
     let mut evidence = BTreeMap::<SpaceId, AssociationEvidence>::new();
@@ -1496,11 +1529,19 @@ fn infer_task_space_associations(
     }
     expand_current_context_relation_evidence(connection, mode, &mut contexts)?;
     for ((space_id, context_id), context) in &contexts {
-        aggregate_context_evidence(evidence.entry(*space_id).or_default(), *context_id, context);
+        aggregate_context_across_effective_spaces(
+            &mut evidence,
+            &effective_spaces,
+            *space_id,
+            *context_id,
+            context,
+        );
     }
     for ((space_id, context_id, _revision_id), graph) in &graph_contexts {
-        aggregate_context_evidence(
-            evidence.entry(*space_id).or_default(),
+        aggregate_context_across_effective_spaces(
+            &mut evidence,
+            &effective_spaces,
+            *space_id,
             *context_id,
             &graph.evidence,
         );
@@ -1523,10 +1564,93 @@ fn infer_task_space_associations(
         evidence,
         contexts,
         graph_contexts,
+        effective_spaces,
         graph_context_tree_oid: graph_context_tree_oid.map(ToOwned::to_owned),
         graph_artifact_generation: engineering_graph.map(|graph| graph.artifact_generation.clone()),
         focus_reachable,
     })
+}
+
+fn query_effective_context_spaces(
+    connection: &Connection,
+) -> Result<BTreeMap<ContextId, EffectiveContextSpaces>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT association.association_id, association.context_id,
+                    association.primary_space_id, association.related_space_ids_json
+             FROM context_space_association_head AS head
+             JOIN context_space_association AS association USING(association_id)
+             WHERE head.context_id IN (
+                 SELECT context_id FROM context_space_association_head
+                 GROUP BY context_id HAVING COUNT(*) = 1
+             )
+             ORDER BY association.context_id, association.association_id",
+        )
+        .map_err(sql_error("prepare effective Context Space associations"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(sql_error("read effective Context Space associations"))?;
+    let mut effective = BTreeMap::new();
+    for row in rows {
+        let (association_id, context_id, primary_space_id, related) =
+            row.map_err(sql_error("collect effective Context Space association"))?;
+        let association_id = parse_id(&association_id)?;
+        let context_id = parse_id(&context_id)?;
+        let primary_space_id = parse_id(&primary_space_id)?;
+        let related_space_ids = from_json::<Vec<SpaceId>>(&related)?;
+        let mut roles = Vec::with_capacity(related_space_ids.len() + 1);
+        roles.push(EffectiveSpaceRole {
+            matched_space_id: primary_space_id,
+            role: SpaceAssociationRole::Primary,
+        });
+        roles.extend(
+            related_space_ids
+                .into_iter()
+                .map(|matched_space_id| EffectiveSpaceRole {
+                    matched_space_id,
+                    role: SpaceAssociationRole::Related,
+                }),
+        );
+        effective.insert(
+            context_id,
+            EffectiveContextSpaces {
+                association_id,
+                roles,
+            },
+        );
+    }
+    Ok(effective)
+}
+
+fn aggregate_context_across_effective_spaces(
+    evidence: &mut BTreeMap<SpaceId, AssociationEvidence>,
+    effective_spaces: &BTreeMap<ContextId, EffectiveContextSpaces>,
+    fallback_space_id: SpaceId,
+    context_id: ContextId,
+    context: &AcceptedContextEvidence,
+) {
+    if let Some(effective) = effective_spaces.get(&context_id) {
+        for role in &effective.roles {
+            aggregate_context_evidence(
+                evidence.entry(role.matched_space_id).or_default(),
+                context_id,
+                context,
+            );
+        }
+    } else {
+        aggregate_context_evidence(
+            evidence.entry(fallback_space_id).or_default(),
+            context_id,
+            context,
+        );
+    }
 }
 
 fn aggregate_context_evidence(
@@ -3090,14 +3214,38 @@ fn load_task_context_candidates(
          FROM context_revision AS revision
          JOIN context_item AS item USING(context_id)
          JOIN space_projection AS space USING(space_id)
-         WHERE revision.space_id IN ({placeholders})
+         WHERE (
+               revision.space_id IN ({placeholders})
+               OR revision.context_id IN (
+                   SELECT association.context_id
+                   FROM context_space_association_head AS head
+                   JOIN context_space_association AS association USING(association_id)
+                   WHERE head.context_id IN (
+                       SELECT context_id FROM context_space_association_head
+                       GROUP BY context_id HAVING COUNT(*) = 1
+                   )
+                     AND (
+                         association.primary_space_id IN ({placeholders})
+                         OR EXISTS (
+                             SELECT 1 FROM json_each(association.related_space_ids_json) AS related
+                             WHERE related.value IN ({placeholders})
+                         )
+                     )
+               )
+           )
            AND {revision_clause}
          ORDER BY revision.space_id, revision.context_id, revision.revision_id",
         status = status_expression(),
     );
-    let parameters = association_rank
+    let association_parameters = association_rank
         .keys()
         .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let parameters = association_parameters
+        .iter()
+        .chain(&association_parameters)
+        .chain(&association_parameters)
+        .cloned()
         .collect::<Vec<_>>();
     let mut statement = connection
         .prepare(&sql)
@@ -3195,6 +3343,44 @@ fn load_task_context_candidates(
     })
 }
 
+fn matched_context_space(
+    inference: &TaskAssociationInference,
+    association_rank: &BTreeMap<SpaceId, usize>,
+    context_id: ContextId,
+    fallback_space_id: SpaceId,
+) -> Option<MatchedContextSpace> {
+    if let Some(effective) = inference.effective_spaces.get(&context_id) {
+        let role = effective
+            .roles
+            .iter()
+            .filter_map(|role| {
+                association_rank
+                    .get(&role.matched_space_id)
+                    .map(|rank| (*rank, *role))
+            })
+            .min_by(|left, right| {
+                left.0
+                    .cmp(&right.0)
+                    .then_with(|| left.1.matched_space_id.cmp(&right.1.matched_space_id))
+            })?
+            .1;
+        return Some(MatchedContextSpace {
+            association_space_id: role.matched_space_id,
+            association_path: Some(TaskRetrievalPath::SpaceAssociation {
+                association_id: effective.association_id,
+                role: role.role,
+                matched_space_id: role.matched_space_id,
+            }),
+        });
+    }
+    association_rank
+        .contains_key(&fallback_space_id)
+        .then_some(MatchedContextSpace {
+            association_space_id: fallback_space_id,
+            association_path: None,
+        })
+}
+
 fn graph_context_candidate(
     inference: &TaskAssociationInference,
     association_rank: &BTreeMap<SpaceId, usize>,
@@ -3202,9 +3388,17 @@ fn graph_context_candidate(
     mode: ContextPackMode,
 ) -> Result<Option<TaskContextCandidate>> {
     let snapshot = &graph.snapshot;
-    let Some(rank) = association_rank.get(&snapshot.space_id) else {
+    let Some(matched_space) = matched_context_space(
+        inference,
+        association_rank,
+        snapshot.context_id,
+        snapshot.space_id,
+    ) else {
         return Ok(None);
     };
+    let rank = association_rank
+        .get(&matched_space.association_space_id)
+        .expect("matched Graph Context Space has an association rank");
     if mode == ContextPackMode::AutomaticInjection && !snapshot.safety.automatic_injection_eligible
     {
         return Ok(None);
@@ -3214,13 +3408,15 @@ fn graph_context_candidate(
             "Graph Context candidate is missing its Artifact Generation",
         ));
     };
-    let paths = task_retrieval_paths(
+    let mut paths = task_retrieval_paths(
         inference
             .evidence
-            .get(&snapshot.space_id)
+            .get(&matched_space.association_space_id)
             .ok_or_else(|| invariant("Graph Context candidate has no Space association"))?,
         Some(&graph.evidence),
     );
+    paths.extend(matched_space.association_path);
+    sort_dedup_paths(&mut paths);
     if paths.is_empty() {
         return Ok(None);
     }
@@ -3245,7 +3441,7 @@ fn graph_context_candidate(
         association_rank: *rank,
         direct_path_count,
         item: TaskContextItem {
-            association_space_id: snapshot.space_id,
+            association_space_id: matched_space.association_space_id,
             context: ContextPackItem {
                 space_id: snapshot.space_id,
                 context_id: snapshot.context_id,
@@ -3295,6 +3491,7 @@ const fn evidence_type_name(kind: EvidenceType) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn task_context_candidate_from_row(
     connection: &Connection,
     row: &rusqlite::Row<'_>,
@@ -3314,7 +3511,12 @@ fn task_context_candidate_from_row(
         &row.get::<_, String>(2)
             .map_err(sql_error("read Revision ID"))?,
     )?;
-    let Some(space_evidence) = inference.evidence.get(&space_id) else {
+    let Some(matched_space) =
+        matched_context_space(inference, association_rank, context_id, space_id)
+    else {
+        return Ok(None);
+    };
+    let Some(space_evidence) = inference.evidence.get(&matched_space.association_space_id) else {
         return Ok(None);
     };
     let context_evidence = inference.contexts.get(&(space_id, context_id));
@@ -3326,7 +3528,9 @@ fn task_context_candidate_from_row(
     if context_evidence.is_none() && !inherited {
         return Ok(None);
     }
-    let paths = task_retrieval_paths(space_evidence, context_evidence);
+    let mut paths = task_retrieval_paths(space_evidence, context_evidence);
+    paths.extend(matched_space.association_path.clone());
+    sort_dedup_paths(&mut paths);
     if paths.is_empty() {
         return Ok(None);
     }
@@ -3373,11 +3577,11 @@ fn task_context_candidate_from_row(
         .count();
     Ok(Some(TaskContextCandidate {
         association_rank: *association_rank
-            .get(&space_id)
+            .get(&matched_space.association_space_id)
             .expect("candidate Space comes from association set"),
         direct_path_count,
         item: TaskContextItem {
-            association_space_id: space_id,
+            association_space_id: matched_space.association_space_id,
             context: ContextPackItem {
                 space_id,
                 context_id,

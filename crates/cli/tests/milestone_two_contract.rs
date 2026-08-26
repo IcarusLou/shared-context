@@ -548,6 +548,14 @@ fn assert_typed_m2_path(path: &TaskRetrievalPath) {
             assert!(!hops.is_empty());
             assert!(hops.len() <= 2);
         }
+        TaskRetrievalPath::SpaceAssociation {
+            association_id,
+            matched_space_id,
+            ..
+        } => {
+            assert!(association_id.to_string().starts_with("asc_"));
+            assert!(matched_space_id.to_string().starts_with("spc_"));
+        }
         TaskRetrievalPath::GraphDiagnostic { diagnostic } => {
             assert!(!diagnostic.resolved_focus.locator.canonical_key().is_empty());
             assert!(!diagnostic.artifact_generation.is_empty());

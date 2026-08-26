@@ -145,7 +145,7 @@ A budgeted retrieval result for one WorkingIntentSnapshot revision, one current 
 _Avoid_: Space-scoped search result, manually routed Context Pack
 
 **RetrievalPath**:
-A typed explanation of how Working Intent text or this request’s ResolvedFocus made one Context relevant. Hint text and Applicability paths remain distinct from Engineering Graph paths; only an exact ResolvedFocus reachable in that Graph Snapshot can claim an engineering edge.
+A typed explanation of how Working Intent text, ContextSpaceAssociation role, or this request’s ResolvedFocus made one Context relevant. A Primary/Related Space path remains distinct from ContextRelation and Engineering Graph paths; only an exact ResolvedFocus reachable in that Graph Snapshot can claim an engineering edge.
 _Avoid_: opaque relevance score, inferred code relation
 
 **EngineeringGraphSnapshot**:

@@ -1,19 +1,25 @@
+use std::sync::Arc;
+
 use sctx_domain::{
-    Applicability, ConflictParticipant, ContextId, ContextKind, ContextRevisionDraft,
-    EvidenceSnapshotDraft, EvidenceType, PublicationAction, PublicationDraft, RevisionId,
-    SemanticConflictDraft, SpaceId, TaskId, TaskSignal, TaskSignalKind, TaskSpaceAssociation,
-    WorkingIntentSnapshot,
+    Applicability, CandidateConfirmationOperation, CandidateConfirmationPlan,
+    CandidateConfirmationPrimaryReference, CandidatePrimarySelection, ConflictParticipant,
+    ContextId, ContextKind, ContextRevisionDraft, ContextSpaceAssociationDraft,
+    ContextSpaceAssociationOrigin, EvidenceSnapshotDraft, EvidenceType, OptionalCandidateEdits,
+    PublicationAction, PublicationDraft, RevisionId, SemanticConflictDraft, SpaceId, SubmissionId,
+    TaskId, TaskSessionId, TaskSignal, TaskSignalKind, TaskSpaceAssociation, WorkEpisodeId,
+    WorkEpisodeRef, WorkingIntentSnapshot,
 };
 use sctx_event_schema::{Event, EventPayload};
-use sctx_git_store::{AppendRequest, GitStore};
+use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
 use sctx_index::ProjectionIndex;
 use sctx_search::{
     ContextPackMode, ContextStatus, IntentConflictActor, IntentConflictDecision,
     IntentConflictHandoffExplanation, IntentConflictKind, IntentConflictSelection,
     IntentConflictValidation, IntentScopeConflictExplanation, IntentScopeConflictKind,
-    IntentScopeConflictPolicy, SearchEngine, SpaceIntentField, TaskAssociationChannel,
-    TaskAssociationFusionExplanation, TaskContextRequest, TaskRetrievalPath,
-    WorkingIntentHintField, WorkingIntentHintTarget, estimate_task_context_payload_tokens,
+    IntentScopeConflictPolicy, SearchEngine, SpaceAssociationRole, SpaceIntentField,
+    TaskAssociationChannel, TaskAssociationFusionExplanation, TaskContextRequest,
+    TaskRetrievalPath, WorkingIntentHintField, WorkingIntentHintTarget,
+    estimate_task_context_payload_tokens,
 };
 use tempfile::TempDir;
 
@@ -1209,6 +1215,142 @@ fn task_context_pack_supports_zero_one_and_many_spaces_with_explicit_m2_paths() 
     let metadata = fixture.index.metadata().unwrap();
     assert_eq!(many.indexed_tree_oid, metadata.indexed_tree_oid);
     assert_eq!(many.projection_generation, metadata.projection_generation);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn related_space_retrieval_preserves_primary_owner_and_exposes_typed_association_path() {
+    let temporary = tempfile::tempdir().unwrap();
+    let base_store =
+        GitStore::bootstrap_local(temporary.path().join("related-space-installation")).unwrap();
+    let index = ProjectionIndex::for_store(&base_store);
+    let store = base_store
+        .with_candidate_submission_index(Arc::new(index.clone()))
+        .with_candidate_confirmation_index(Arc::new(index.clone()));
+    let primary_space = add_space(&store, "PrimaryRequirement", "primaryonlyneedle");
+    let related_space = add_space(&store, "RelatedRequirement", "relatedonlyneedle");
+    let alternate_space = add_space(&store, "AlternateRequirement", "alternateonlyneedle");
+    let submission = store
+        .submit_candidate(CandidateSubmissionRequest {
+            submission_id: SubmissionId::new(),
+            source_episode: WorkEpisodeRef {
+                episode_id: WorkEpisodeId::new(),
+                task_session_id: TaskSessionId::new(),
+                task_id: TaskId::new(),
+            },
+            content: context(
+                "directcontextneedle remains owned by the Primary Requirement",
+                applicability("related-space", "server", "active"),
+            ),
+        })
+        .unwrap();
+    let candidate = index.domain_snapshot().unwrap().projection.candidates
+        [&submission.record.candidate_id]
+        .candidate
+        .clone();
+    let plan = CandidateConfirmationPlan::reserve(
+        &candidate,
+        CandidateConfirmationOperation {
+            candidate_id: candidate.candidate_id,
+            review_parent_version: 1,
+            analysis_generation: 1,
+            primary: CandidateConfirmationPrimaryReference::ExistingSpace {
+                space_id: primary_space,
+            },
+            related_space_ids: vec![related_space],
+            edits: OptionalCandidateEdits::default(),
+        },
+        CandidatePrimarySelection::Existing {
+            space_id: primary_space,
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    store.confirm_candidate(&plan).unwrap();
+    let engine = SearchEngine::new(index.clone());
+    let request = TaskContextRequest::automatic(
+        TaskId::new(),
+        task("relatedonlyneedle"),
+        Vec::new(),
+        100_000,
+    );
+    let first = engine.task_context_pack(&request).unwrap();
+    let second = engine.task_context_pack(&request).unwrap();
+    assert_eq!(first, second);
+    assert!(first.estimated_tokens <= request.token_budget);
+    assert_eq!(
+        first.estimated_tokens,
+        estimate_task_context_payload_tokens(&first)
+    );
+    assert_eq!(first.associations.len(), 1);
+    assert_eq!(first.associations[0].space_id, related_space);
+    assert_eq!(first.items.len(), 1);
+    let item = &first.items[0];
+    assert_eq!(item.association_space_id, related_space);
+    assert_eq!(item.context.space_id, primary_space);
+    assert_eq!(item.context.context_id, plan.result_context_id);
+    assert!(item.retrieval_paths.iter().any(|path| {
+        matches!(
+            path,
+            TaskRetrievalPath::SpaceAssociation {
+                association_id,
+                role: SpaceAssociationRole::Related,
+                matched_space_id,
+            } if *association_id == plan.space_association.association_id
+                && *matched_space_id == related_space
+        )
+    }));
+    assert!(
+        item.retrieval_paths
+            .iter()
+            .all(|path| { !matches!(path, TaskRetrievalPath::ContextRelation { .. }) })
+    );
+
+    let direct = engine
+        .task_context_pack(&TaskContextRequest::automatic(
+            TaskId::new(),
+            task("directcontextneedle"),
+            Vec::new(),
+            100_000,
+        ))
+        .unwrap();
+    assert_eq!(direct.items.len(), 1);
+    assert_eq!(direct.items[0].context.context_id, plan.result_context_id);
+    assert_eq!(
+        direct
+            .associations
+            .iter()
+            .map(|association| association.space_id)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [primary_space, related_space].into_iter().collect()
+    );
+
+    for related_space_ids in [vec![related_space], vec![alternate_space]] {
+        append(
+            &store,
+            Event::context_space_association_changed(
+                ContextSpaceAssociationDraft {
+                    context_id: plan.result_context_id,
+                    primary_space_id: primary_space,
+                    related_space_ids,
+                    previous_association_ids: vec![plan.space_association.association_id],
+                    origin: ContextSpaceAssociationOrigin::Correction,
+                },
+                None,
+            )
+            .unwrap(),
+        );
+    }
+    index.synchronize().unwrap();
+    let conflicted = SearchEngine::new(index)
+        .task_context_pack(&request)
+        .unwrap();
+    assert!(
+        conflicted
+            .items
+            .iter()
+            .all(|item| item.context.context_id != plan.result_context_id)
+    );
 }
 
 #[test]
