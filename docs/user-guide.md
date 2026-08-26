@@ -269,11 +269,14 @@ Context（长期工程知识）
 | Signal | Prompt、Workspace、Diff、测试结果等工作线索。它能帮助检索，但不能单独证明一个工程事实。 |
 | Work Episode | 当前 Task 中一段连续的探索、实现和验证过程。 |
 | Checkpoint | Agent 明确写下的结论（Claims）和未知项（Unknowns）。 |
+| Capture | Hook 保存的短期、已脱敏工程工作摘要；只有当前 Task 拥有的 Capture 才能被显式选入 Checkpoint。 |
 | Candidate | 从已关闭 Episode 生成的待审核知识草稿。默认是不可信数据。 |
 | Context | 用户确认后进入长期事实层的工程知识。 |
 | Revision | Intent 或 Context 的不可变版本。修改不会覆盖旧版本，而是新增 Revision。 |
 | Evidence | 能独立阅读的证据快照，例如源码快照、实验记录或工程对象快照。 |
 | Engineering Reference | 一条 Context 与文件、模块、符号、API、Schema 或测试之间的已验证关系。 |
+| Context Relation | 两条 Context 之间由用户确认的稳定知识关系，例如 implements 或 validated_by；它不同于文本相关性。 |
+| Related Space | Context 的辅助组织和召回角色；Context 仍由一个 Primary Space 拥有，不会复制到 Related Space。 |
 | Projection / Index | 从 Git 事实重建出的 SQLite 查询视图。损坏时可以重建。 |
 
 ### 4.3 为什么同时使用 Git 和 SQLite
@@ -326,7 +329,7 @@ Agent 在合适时机会：
 1. 用 `task_intent_update` 建立或更新当前任务理解。
 2. 用 `task_context` 获取与整个任务相关的历史 Context。
 3. 需要某个具体文件、符号或接口历史时，用 `task_artifact_focus` 做一次即时查询。
-4. 形成重要结论、压缩上下文或结束一轮工作前，用 `task_checkpoint` 保存结构化结论和未知项。
+4. 形成重要结论、压缩上下文或结束一轮工作前，先用 `task_capture_list` 选择当前 Task 的已脱敏 Capture，再用 `task_checkpoint` 保存结构化结论、关系/工程引用提案和未知项；也可以继续使用自包含 inline Validation。
 5. Episode 关闭后，用 `candidate_list` 和 `candidate_get` 展示待审核 Candidate。
 6. 只有在你明确同意后，才调用 `candidate_confirm`；你拒绝保留时调用 `candidate_discard`。
 
@@ -415,6 +418,8 @@ sctx task context \
         }
       ],
       "artifact_refs": [],
+      "relations": [],
+      "engineering_references": [],
       "related_contexts": []
     }
   ],
@@ -544,20 +549,24 @@ Intent JSON 的字段是：
 
 Artifact Focus 的 `locator_kind` 支持：`file`、`module`、`symbol`、`api`、`schema`、`test`。请求提供绝对文件路径；Repository ID 和仓库相对路径由本机 Catalog 解析，调用者不要猜。
 
+Agent 还可以通过公开 MCP `task_capture_list` 有界列出当前 ActiveTask 拥有的 Capture。响应只有 `capture_id`、归一化摘要和安全诊断，不含原始工具输入/输出；Checkpoint 用 `{"kind":"capture","capture_id":"cap_..."}` 显式选择后，Runtime 才把它转换为 owned WorkObservation。CLI 当前没有独立的 Capture list 子命令。
+
 ### 6.4 Candidate 审核
 
 | 命令 | 功能 |
 |---|---|
 | `sctx candidate list --agent-kind ... --external-session-id ...` | 分页列出当前 Task 的 Candidate Review；默认只列 `pending`。可用 `--status`、`--limit`、`--cursor`、`--token-budget`。 |
-| `sctx candidate get ... --candidate-id <ID>` | 获取完整草稿、证据、来源、冲突分析、置信度、未知项和 Space 推荐。 |
+| `sctx candidate get ... --candidate-id <ID>` | 获取完整草稿、证据、来源、typed ContextRelation/EngineeringReference 提案、冲突分析、置信度、未知项和 Space 推荐。 |
 | `sctx candidate analyze --candidate-id <ID> [--token-budget 4096] [--top-k 16]` | 重新计算与已有 Context 的重复、支持、修订、潜在冲突和相关性分析；不写入 Git。 |
-| `sctx candidate confirm --input <JSON>` | 用户明确确认后，把 Candidate、Primary/Related Space 和可选编辑作为一个原子事实批次写入。 |
+| `sctx candidate confirm --input <JSON>` | 用户明确确认后，把 Candidate、Primary/Related Space、ContextRelation、EngineeringReference 和可选编辑作为一个原子事实批次写入。 |
 | `sctx candidate discard ... --reason <TEXT>` | 用户明确拒绝保留时丢弃 Candidate Review；不会发布任何 Context。 |
 | `sctx candidate build-closed-episode --episode-id <ID>` | 在 Episode 已关闭但 Builder 响应丢失或待恢复时重建；属于恢复命令。 |
 
 Candidate 状态支持 `pending`、`discarded`、`expired`、`confirmed`。只有完整分析且 `ready_for_review` 的 Candidate 才适合让用户决策。`potential_contradiction` 和 `unresolved_related` 是审核线索，不是已经成立的事实。
 
 确认时的 `edits` 可以只替换用户明确要求修改的字段：`kind`、`topic_key`、`statement`、`rationale`、`applicability`、`assumptions`、`recheck_when`、`relations`、`evidence`。省略字段表示保留原草稿；`topic_key` 使用 `{"action":"clear"}` 才表示显式清空。
+
+`relations` 只接受 `depends_on`、`constrains`、`implements`、`validated_by`、`contradicts`、`related_to`；分析用 `related_contexts` 不会自动变成关系。Engineering Reference 必须使用已登记 RepositoryId、确定性 locator 和非空 `supports`；Checkpoint 提案允许空 `limitations` 列表，但列表中的每一项都必须非空，直接调用 `engineering-reference record` 仍要求至少一项限制说明。Confirm 成功后会尝试重建 Engineering Graph；响应中的 `graph_rebuild_pending=true` 表示知识事实已原子提交，但派生图需要稍后重试，并不表示可以重复创建事实。
 
 ### 6.5 Context 内容与治理
 
@@ -701,24 +710,25 @@ sctx search \
 | `sctx mcp serve --client cursor` | 通过标准输入/输出运行 Cursor MCP Server。 |
 | `sctx mcp serve --client codex` | 通过标准输入/输出运行 Codex MCP Server。 |
 
-安装后的 MCP 一共暴露 16 个工具：
+安装后的 MCP 一共暴露 17 个工具：
 
 1. `task_intent_update`
-2. `task_artifact_focus`
-3. `task_signal_supersede`
-4. `task_checkpoint`
-5. `task_context`
-6. `repository_scan`
-7. `engineering_reference_record`
-8. `association_explain`
-9. `association_rebuild`
-10. `context_search`
-11. `context_get`
-12. `candidate_list`
-13. `candidate_get`
-14. `candidate_discard`
-15. `candidate_confirm`
-16. `space_list`
+2. `task_capture_list`
+3. `task_artifact_focus`
+4. `task_signal_supersede`
+5. `task_checkpoint`
+6. `task_context`
+7. `repository_scan`
+8. `engineering_reference_record`
+9. `association_explain`
+10. `association_rebuild`
+11. `context_search`
+12. `context_get`
+13. `candidate_list`
+14. `candidate_get`
+15. `candidate_discard`
+16. `candidate_confirm`
+17. `space_list`
 
 CLI 还提供 Space/Context 写入治理、语义冲突、索引和 Pending Batch 等管理员能力；这些没有全部开放成 Agent MCP 写工具，以维持显式审核和生命周期边界。
 
