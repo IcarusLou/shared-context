@@ -460,6 +460,11 @@ fn event_impact(path: &str, event: &Event) -> EventImpact {
             {
                 references.insert(identity("event", &causal_event));
             }
+            add_references(
+                &mut references,
+                "event",
+                &confirmation.causal_refs.engineering_reference_event_ids,
+            );
             Some(confirmation.primary_space_id)
         }
         EventPayload::SpaceCreated {

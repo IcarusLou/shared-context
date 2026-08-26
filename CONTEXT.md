@@ -77,11 +77,11 @@ A fail-open lifecycle transition that may close one Open WorkEpisode only at its
 _Avoid_: automatic Checkpoint, Hook-authored Claim, SessionEnd Candidate build
 
 **CheckpointClaim**:
-A structured engineering assertion containing its statement, rationale, applicability, assumptions, recheck conditions, typed Evidence references, Artifact associations, proposed ContextRelations, and analysis-only related Context revisions. Artifact associations and related Context revisions are not Evidence or durable relations by themselves.
+A structured engineering assertion containing its statement, rationale, applicability, assumptions, recheck conditions, typed Evidence references, Artifact associations, proposed ContextRelations, proposed EngineeringReferences, and analysis-only related Context revisions. Artifact associations, EngineeringReference proposals, and related Context revisions are not Evidence or durable facts by themselves.
 _Avoid_: unsupported conclusion, free-form note
 
 **CandidateBuilderProvenance**:
-The typed ownership and exact Checkpoint and WorkObservation inputs of one automatic Candidate build. It makes the source WorkEpisode verifiable without retaining raw Agent payloads.
+The typed ownership, exact Checkpoint and WorkObservation inputs, and proposed EngineeringReferences of one automatic Candidate build. It makes the source WorkEpisode and Reference proposals verifiable without retaining raw Agent payloads.
 _Avoid_: opaque source_episode_id, transcript pointer
 
 **CandidateBuilder**:

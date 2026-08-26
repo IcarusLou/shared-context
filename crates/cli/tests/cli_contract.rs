@@ -1838,6 +1838,7 @@ fn twenty_cli_processes_confirm_one_review_in_one_atomic_commit() {
                 }],
                 artifact_refs: Vec::new(),
                 relations: Vec::new(),
+                engineering_references: Vec::new(),
                 related_contexts: Vec::new(),
             }],
             unknowns: Vec::new(),

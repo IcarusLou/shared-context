@@ -457,7 +457,7 @@ impl Event {
         )
     }
 
-    /// Materializes one reserved Confirmation plan into its exact four/five immutable Events.
+    /// Materializes one reserved Confirmation plan into its exact atomic immutable Events.
     ///
     /// All IDs come from the server-owned plan; the caller supplies only the Writer batch.
     ///
@@ -480,7 +480,7 @@ impl Event {
             event.validate()?;
             Ok(event)
         };
-        let mut events = Vec::with_capacity(if plan.new_space.is_some() { 5 } else { 4 });
+        let mut events = Vec::with_capacity(plan.expected_event_count());
         if let Some(new_space) = &plan.new_space {
             events.push(exact(
                 plan.event_ids
@@ -518,6 +518,23 @@ impl Event {
             },
             base_annotations.clone(),
         )?);
+        for (event_id, reference) in plan
+            .event_ids
+            .engineering_reference_event_ids
+            .iter()
+            .copied()
+            .zip(&plan.engineering_references)
+        {
+            events.push(exact(
+                event_id,
+                EventPayload::EngineeringReferenceRecorded {
+                    context_id: plan.result_context_id,
+                    revision_id: plan.result_revision.revision_id,
+                    reference: reference.clone(),
+                },
+                base_annotations.clone(),
+            )?);
+        }
         let mut confirmation_annotations = base_annotations;
         confirmation_annotations.additional.insert(
             "confirmation_operation_hash".to_owned(),

@@ -628,7 +628,12 @@
         },
         "context_revision_event_id": { "$ref": "#/$defs/event_id" },
         "space_association_event_id": { "$ref": "#/$defs/event_id" },
-        "publication_event_id": { "$ref": "#/$defs/event_id" }
+        "publication_event_id": { "$ref": "#/$defs/event_id" },
+        "engineering_reference_event_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/event_id" }
+        }
       },
       "additionalProperties": false
     },

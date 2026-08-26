@@ -11,13 +11,14 @@ use std::{
 use fs2::FileExt;
 use rusqlite::Connection;
 use sctx_domain::{
-    Applicability, ArtifactAction, ArtifactLocator, ArtifactRef, CandidateConfirmationOperation,
-    CandidateConfirmationPlan, CandidateConfirmationPrimaryReference, CandidateId,
-    CandidatePrimarySelection, CandidateReviewDiagnostic, CandidateReviewStatus, CaptureId,
-    CaptureUnknown, ContextId, ContextKind, ContextRelation, ContextRelationKind,
-    ContextRevisionDraft, ContextRevisionRef, ContextUseDisposition, EvidenceSnapshotDraft,
-    EvidenceType, ExternalSessionLocator, IntentSnapshot, NormalizedBreadcrumbKind,
-    NormalizedWorkObservation, OptionalCandidateEdits, PublicationAction, PublicationDraft,
+    Applicability, ArtifactAction, ArtifactKind, ArtifactLocator, ArtifactRef,
+    CandidateConfirmationOperation, CandidateConfirmationPlan,
+    CandidateConfirmationPrimaryReference, CandidateId, CandidatePrimarySelection,
+    CandidateReviewDiagnostic, CandidateReviewStatus, CaptureId, CaptureUnknown, ContextId,
+    ContextKind, ContextRelation, ContextRelationKind, ContextRevisionDraft, ContextRevisionRef,
+    ContextUseDisposition, EngineeringReferenceDraft, EvidenceSnapshotDraft, EvidenceType,
+    ExternalSessionLocator, IntentSnapshot, NormalizedBreadcrumbKind, NormalizedWorkObservation,
+    OptionalCandidateEdits, PublicationAction, PublicationDraft, ReferenceRelation,
     RepoRelativePath, RepositoryId, ReviewDraft, ReviewVerdict, RevisionId, SpaceId, SubmissionId,
     TaskId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkSourceRef, WorkingIntentSnapshot,
     candidate_submission_content_hash,
@@ -30,16 +31,17 @@ use sctx_local_state::{
     AuthorizedSessionScopeStore, MaintenanceLock, UserConfigStore,
 };
 use sctx_mcp::{
-    CandidateBuildItemResponseStatus, CandidateBuildResponseStatus, CandidateConfirmInput,
-    CandidateConfirmPrimaryInput, CandidateConfirmResponseStatus, CandidateDiscardInput,
-    CandidateDiscardResponseStatus, CandidateGetInput, CandidateListInput, ClientKind,
-    DisconnectReason, ExistingCandidatePrimaryInput, ExpectedRevisionId, McpServer,
+    AssociationExplainInput, CandidateBuildItemResponseStatus, CandidateBuildResponseStatus,
+    CandidateConfirmInput, CandidateConfirmPrimaryInput, CandidateConfirmResponseStatus,
+    CandidateDiscardInput, CandidateDiscardResponseStatus, CandidateGetInput, CandidateListInput,
+    ClientKind, DisconnectReason, ExistingCandidatePrimaryInput, ExpectedRevisionId, McpServer,
     NewCandidatePrimaryInput, TaskBoundary, TaskCheckpointBoundary, TaskCheckpointClaimInput,
     TaskCheckpointEvidenceInput, TaskCheckpointInput, TaskContextReadInput, TaskIntentUpdateInput,
-    TaskSignalSupersedeInput, TransportErrorKind, association_rebuild_at_root,
-    build_closed_episode_at_root, candidate_confirm_at_root, candidate_discard_at_root,
-    candidate_get_at_root, candidate_list_at_root, task_checkpoint_at_root,
-    task_context_readonly_at_root, task_intent_update_at_root, task_signal_supersede_at_root,
+    TaskSignalSupersedeInput, TransportErrorKind, association_explain_at_root,
+    association_rebuild_at_root, build_closed_episode_at_root, candidate_confirm_at_root,
+    candidate_discard_at_root, candidate_get_at_root, candidate_list_at_root,
+    task_checkpoint_at_root, task_context_readonly_at_root, task_intent_update_at_root,
+    task_signal_supersede_at_root,
 };
 use sctx_search::{TaskRetrievalPath, WorkingIntentHintField, WorkingIntentHintTarget};
 use sctx_task_runtime::{
@@ -619,6 +621,7 @@ fn build_review_candidate_for_agent(
                 }],
                 artifact_refs: Vec::new(),
                 relations: Vec::new(),
+                engineering_references: Vec::new(),
                 related_contexts: Vec::new(),
             }],
             unknowns: Vec::new(),
@@ -680,6 +683,7 @@ fn directly_close_builder_episode(
                 inline_validations: vec![evidence.clone()],
                 artifact_refs: Vec::new(),
                 relations: Vec::new(),
+                engineering_references: Vec::new(),
                 related_contexts: Vec::new(),
             }],
             unknowns: Vec::new(),
@@ -899,6 +903,7 @@ fn typed_checkpoint_input(
             evidence,
             artifact_refs: Vec::new(),
             relations: Vec::new(),
+            engineering_references: Vec::new(),
             related_contexts: Vec::new(),
         }],
         unknowns: Vec::new(),
@@ -1495,6 +1500,7 @@ fn candidate_builder_converts_six_typed_sources_without_raw_capture_or_search_in
             evidence: vec![TaskCheckpointEvidenceInput::InlineValidation { evidence: inline }],
             artifact_refs: Vec::new(),
             relations: Vec::new(),
+            engineering_references: Vec::new(),
             related_contexts: Vec::new(),
         },
         TaskCheckpointClaimInput {
@@ -1510,6 +1516,7 @@ fn candidate_builder_converts_six_typed_sources_without_raw_capture_or_search_in
             }],
             artifact_refs: Vec::new(),
             relations: Vec::new(),
+            engineering_references: Vec::new(),
             related_contexts: Vec::new(),
         },
         TaskCheckpointClaimInput {
@@ -1525,6 +1532,7 @@ fn candidate_builder_converts_six_typed_sources_without_raw_capture_or_search_in
             }],
             artifact_refs: Vec::new(),
             relations: Vec::new(),
+            engineering_references: Vec::new(),
             related_contexts: vec![ContextRevisionRef {
                 context_id: fixture.context_id,
                 revision_id: fixture.revision_id,
@@ -1543,6 +1551,7 @@ fn candidate_builder_converts_six_typed_sources_without_raw_capture_or_search_in
             }],
             artifact_refs: Vec::new(),
             relations: Vec::new(),
+            engineering_references: Vec::new(),
             related_contexts: Vec::new(),
         },
         TaskCheckpointClaimInput {
@@ -1560,6 +1569,7 @@ fn candidate_builder_converts_six_typed_sources_without_raw_capture_or_search_in
             }],
             artifact_refs: Vec::new(),
             relations: Vec::new(),
+            engineering_references: Vec::new(),
             related_contexts: Vec::new(),
         },
         TaskCheckpointClaimInput {
@@ -1575,6 +1585,7 @@ fn candidate_builder_converts_six_typed_sources_without_raw_capture_or_search_in
             }],
             artifact_refs: Vec::new(),
             relations: Vec::new(),
+            engineering_references: Vec::new(),
             related_contexts: Vec::new(),
         },
     ];
@@ -2093,6 +2104,7 @@ fn cursor_and_codex_candidate_review_tools_list_get_and_discard_without_confirma
                     }],
                     artifact_refs: Vec::new(),
                     relations: Vec::new(),
+                    engineering_references: Vec::new(),
                     related_contexts: Vec::new(),
                 }],
                 unknowns: Vec::new(),
@@ -2293,6 +2305,7 @@ fn checkpoint_typed_relations_round_trip_without_promoting_related_context_hints
             }],
             artifact_refs: Vec::new(),
             relations,
+            engineering_references: Vec::new(),
             related_contexts,
         }
     };
@@ -2465,6 +2478,220 @@ fn checkpoint_typed_relations_round_trip_without_promoting_related_context_hints
 
 #[test]
 #[allow(clippy::too_many_lines)]
+fn candidate_confirmation_atomically_persists_claim_engineering_references_and_retries_graph() {
+    let fixture = Fixture::new();
+    let (repository, repository_id) = add_git_repository(&fixture, "confirmed-reference-repo");
+    fs::create_dir_all(repository.join("src")).unwrap();
+    fs::write(
+        repository.join("src/confirmed.rs"),
+        "pub fn confirmed_reference() {}\n",
+    )
+    .unwrap();
+    git(
+        &repository,
+        &["config", "user.email", "shared-context@example.invalid"],
+    );
+    git(&repository, &["config", "user.name", "Shared Context Test"]);
+    git(&repository, &["add", "src/confirmed.rs"]);
+    git(
+        &repository,
+        &["commit", "-m", "Add confirmed reference fixture"],
+    );
+    let reference = EngineeringReferenceDraft {
+        repository_id,
+        artifact_kind: ArtifactKind::File,
+        relation: ReferenceRelation::Implements,
+        locator: ArtifactLocator::File {
+            path: RepoRelativePath::new("src/confirmed.rs").unwrap(),
+        },
+        supports: "The confirmed Context is implemented by this tracked file".to_owned(),
+        limitations: Vec::new(),
+    };
+    let claim = |session: &str, engineering_references: Vec<EngineeringReferenceDraft>| {
+        TaskCheckpointClaimInput {
+            context_kind_hint: Some(ContextKind::Validation),
+            topic_key_hint: Some(format!("references/{session}")),
+            statement: format!("{session} preserves an Engineering Reference atomically"),
+            rationale: "The Agent supplied exact tracked coordinates".to_owned(),
+            applicability: Applicability::default(),
+            assumptions: Vec::new(),
+            recheck_when: vec!["the tracked file moves".to_owned()],
+            evidence: vec![TaskCheckpointEvidenceInput::InlineValidation {
+                evidence: EvidenceSnapshotDraft {
+                    kind: EvidenceType::ExperimentRecord,
+                    supports: "The tracked reference fixture was inspected".to_owned(),
+                    content: json!({"actual": "passed", "session": session}),
+                    interpretation: "The Claim has self-contained validation".to_owned(),
+                    limitations: Vec::new(),
+                },
+            }],
+            artifact_refs: Vec::new(),
+            relations: Vec::new(),
+            engineering_references,
+            related_contexts: Vec::new(),
+        }
+    };
+    let build = |session: &str| {
+        let task = task_intent_update_at_root(
+            &fixture.root,
+            &update_input(
+                session,
+                TaskBoundary::New,
+                None,
+                "confirm one Claim-owned Engineering Reference",
+            ),
+        )
+        .unwrap();
+        let closed = task_checkpoint_at_root(
+            &fixture.root,
+            &TaskCheckpointInput {
+                agent_kind: "codex".to_owned(),
+                external_session_id: session.to_owned(),
+                expected_task_id: task.context.task_id.to_string(),
+                expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+                expected_episode_version: 0,
+                boundary: TaskCheckpointBoundary::Close,
+                claims: vec![claim(session, vec![reference.clone()])],
+                unknowns: Vec::new(),
+            },
+        )
+        .unwrap();
+        let candidate_id = closed.candidate_build.unwrap().items[0]
+            .candidate_id
+            .unwrap();
+        (task, candidate_id)
+    };
+    let confirm = |session: &str,
+                   task: &sctx_mcp::TaskIntentUpdateResponse,
+                   candidate_id: CandidateId| CandidateConfirmInput {
+        agent_kind: "codex".to_owned(),
+        external_session_id: session.to_owned(),
+        expected_task_id: task.context.task_id.to_string(),
+        expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+        candidate_id: candidate_id.to_string(),
+        expected_review_version: 1,
+        primary: CandidateConfirmPrimaryInput::Existing(ExistingCandidatePrimaryInput {
+            existing_space_id: fixture.space_id.to_string(),
+        }),
+        related_space_ids: Vec::new(),
+        edits: OptionalCandidateEdits::default(),
+    };
+
+    let invalid_session = "confirm-reference-invalid";
+    let invalid_task = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            invalid_session,
+            TaskBoundary::New,
+            None,
+            "reject invalid Claim Engineering References",
+        ),
+    )
+    .unwrap();
+    let invalid_checkpoint = |engineering_reference| TaskCheckpointInput {
+        agent_kind: "codex".to_owned(),
+        external_session_id: invalid_session.to_owned(),
+        expected_task_id: invalid_task.context.task_id.to_string(),
+        expected_intent_revision_id: invalid_task.context.intent_revision_id.to_string(),
+        expected_episode_version: 0,
+        boundary: TaskCheckpointBoundary::Close,
+        claims: vec![claim(invalid_session, vec![engineering_reference])],
+        unknowns: Vec::new(),
+    };
+    let before_invalid = event_count(fixture.store.repository());
+    let mut unknown_repository = reference.clone();
+    unknown_repository.repository_id = RepositoryId::new();
+    assert_eq!(
+        task_checkpoint_at_root(&fixture.root, &invalid_checkpoint(unknown_repository))
+            .unwrap_err()
+            .kind(),
+        sctx_domain::ErrorKind::InvalidInput
+    );
+    let mut incompatible = reference.clone();
+    incompatible.relation = ReferenceRelation::Consumes;
+    assert_eq!(
+        task_checkpoint_at_root(&fixture.root, &invalid_checkpoint(incompatible))
+            .unwrap_err()
+            .kind(),
+        sctx_domain::ErrorKind::InvalidInput
+    );
+    assert_eq!(event_count(fixture.store.repository()), before_invalid);
+
+    let success_session = "confirm-reference-success";
+    let (success_task, success_candidate) = build(success_session);
+    let review = candidate_get_at_root(
+        &fixture.root,
+        &CandidateGetInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: success_session.to_owned(),
+            candidate_id: success_candidate.to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(review.engineering_references, vec![reference.clone()]);
+    let before_success = event_count(fixture.store.repository());
+    let success_input = confirm(success_session, &success_task, success_candidate);
+    let success = candidate_confirm_at_root(&fixture.root, &success_input).unwrap();
+    assert_eq!(success.event_ids.len(), 5);
+    assert!(!success.graph_rebuild_pending);
+    assert_eq!(event_count(fixture.store.repository()), before_success + 5);
+    let snapshot = ProjectionIndex::for_store(&fixture.store)
+        .domain_snapshot()
+        .unwrap();
+    let projected = snapshot
+        .projection
+        .engineering_references
+        .values()
+        .find(|projection| {
+            projection.context_id == success.context_id
+                && projection.revision_id == success.revision_id
+        })
+        .unwrap();
+    let explained = association_explain_at_root(
+        &fixture.root,
+        &AssociationExplainInput {
+            reference_id: projected.reference.reference_id.to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(explained.status, sctx_domain::ResolutionStatus::Resolved);
+    let retried = candidate_confirm_at_root(&fixture.root, &success_input).unwrap();
+    assert_eq!(retried.event_ids, success.event_ids);
+    assert!(!retried.graph_rebuild_pending);
+    assert_eq!(event_count(fixture.store.repository()), before_success + 5);
+
+    let pending_session = "confirm-reference-pending";
+    let (pending_task, pending_candidate) = build(pending_session);
+    let pending_input = confirm(pending_session, &pending_task, pending_candidate);
+    let graph_database = fixture.root.join("state/engineering.sqlite");
+    if graph_database.exists() {
+        fs::remove_file(&graph_database).unwrap();
+    }
+    for suffix in ["engineering.sqlite-wal", "engineering.sqlite-shm"] {
+        let path = fixture.root.join("state").join(suffix);
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+    }
+    fs::create_dir(&graph_database).unwrap();
+    let before_pending = event_count(fixture.store.repository());
+    let pending = candidate_confirm_at_root(&fixture.root, &pending_input).unwrap();
+    assert!(pending.graph_rebuild_pending);
+    assert_eq!(pending.event_ids.len(), 5);
+    assert_eq!(event_count(fixture.store.repository()), before_pending + 5);
+    fs::remove_dir(&graph_database).unwrap();
+    let recovered = candidate_confirm_at_root(&fixture.root, &pending_input).unwrap();
+    assert!(!recovered.graph_rebuild_pending);
+    assert_eq!(recovered.event_ids, pending.event_ids);
+    assert_eq!(event_count(fixture.store.repository()), before_pending + 5);
+    let snapshot = ProjectionIndex::for_store(&fixture.store)
+        .domain_snapshot()
+        .unwrap();
+    assert_eq!(snapshot.projection.engineering_references.len(), 2);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn candidate_confirm_existing_and_recommended_new_space_are_atomic_idempotent_and_searchable() {
     let fixture = Fixture::new();
     let related_space = |title: &str| {
@@ -2506,6 +2733,7 @@ fn candidate_confirm_existing_and_recommended_new_space_are_atomic_idempotent_an
     assert_eq!(created.status, CandidateConfirmResponseStatus::Confirmed);
     assert!(created.created);
     assert_eq!(created.event_ids.len(), 4);
+    assert!(!created.graph_rebuild_pending);
     assert_eq!(created.primary_space_id, fixture.space_id);
     assert_eq!(created.related_space_ids, vec![related_one, related_two]);
     assert!(!created.assessment_acknowledgments.is_empty());
@@ -2783,6 +3011,7 @@ fn candidate_confirm_recovers_reserved_before_git_and_git_before_runtime_finaliz
             CandidatePrimarySelection::Existing {
                 space_id: fixture.space_id,
             },
+            Vec::new(),
         )
         .unwrap();
         let input = CandidateConfirmInput {
@@ -2909,6 +3138,7 @@ fn candidate_builder_emits_zero_git_events_for_unknown_only_or_insufficient_evid
                 }],
                 artifact_refs: Vec::new(),
                 relations: Vec::new(),
+                engineering_references: Vec::new(),
                 related_contexts: Vec::new(),
             }],
             unknowns: Vec::new(),
@@ -3112,6 +3342,7 @@ fn distinct_claims_with_identical_drafts_keep_distinct_stable_submissions() {
         inline_validations: vec![evidence],
         artifact_refs: Vec::new(),
         relations: Vec::new(),
+        engineering_references: Vec::new(),
         related_contexts: Vec::new(),
     };
     let revision_id = task.current_intent_revision().unwrap().revision_id;
@@ -3341,6 +3572,26 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
                 .unwrap()
                 .iter()
                 .any(|field| field == "relations")
+        );
+        let reference_schema = &checkpoint_claim["properties"]["engineering_references"]["items"];
+        assert_eq!(reference_schema["additionalProperties"], false);
+        assert_eq!(
+            reference_schema["required"],
+            json!([
+                "repository_id",
+                "artifact_kind",
+                "relation",
+                "locator",
+                "supports",
+                "limitations"
+            ])
+        );
+        assert!(
+            !checkpoint_claim["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "engineering_references")
         );
         let confirm_schema = &tools
             .iter()

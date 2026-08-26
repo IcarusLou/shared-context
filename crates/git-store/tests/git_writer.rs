@@ -335,6 +335,7 @@ fn generic_append_rejects_candidate_confirmation_and_candidate_origin_associatio
                 context_revision_event_id: EventId::new(),
                 space_association_event_id: EventId::new(),
                 publication_event_id: EventId::new(),
+                engineering_reference_event_ids: Vec::new(),
             },
         },
         "bat_00000000-0000-4000-8000-000000000821",

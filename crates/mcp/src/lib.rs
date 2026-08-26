@@ -214,6 +214,8 @@ pub struct TaskCheckpointClaimInput {
     pub artifact_refs: Vec<ArtifactRef>,
     #[serde(default)]
     pub relations: Vec<ContextRelation>,
+    #[serde(default)]
+    pub engineering_references: Vec<EngineeringReferenceDraft>,
     pub related_contexts: Vec<ContextRevisionRef>,
 }
 
@@ -464,6 +466,7 @@ pub struct CandidateConfirmResponse {
     pub indexed_tree_oid: String,
     pub projection_generation: u64,
     pub assessment_acknowledgments: Vec<CandidateRelationAssessment>,
+    pub graph_rebuild_pending: bool,
 }
 
 /// Public Claim-scoped submission state.
@@ -1405,6 +1408,7 @@ impl Runtime {
                 validate_context_revision_ref(&snapshot, *context)?;
             }
             validate_context_relation_targets(&snapshot, &claim.relations)?;
+            validate_claim_engineering_references(&self.catalog, &claim.engineering_references)?;
             claims.push(CheckpointClaimDraft {
                 context_kind_hint: claim.context_kind_hint,
                 topic_key_hint: claim.topic_key_hint.clone(),
@@ -1417,6 +1421,7 @@ impl Runtime {
                 inline_validations,
                 artifact_refs: claim.artifact_refs.clone(),
                 relations: claim.relations.clone(),
+                engineering_references: claim.engineering_references.clone(),
                 related_contexts: claim.related_contexts.clone(),
             });
         }
@@ -1569,6 +1574,7 @@ impl Runtime {
                 validate_context_revision_ref(snapshot, *context)?;
             }
             validate_context_relation_targets(snapshot, &claim.relations)?;
+            validate_claim_engineering_references(&self.catalog, &claim.engineering_references)?;
         }
         Ok(())
     }
@@ -1963,6 +1969,7 @@ impl Runtime {
             source_episode: episode.episode.ownership(),
             checkpoint_ids,
             observation_ids,
+            engineering_references: claim.engineering_references.clone(),
         };
         let unknowns = material.unknowns;
         let (analysis, recommendations, confidence, mut status) = match derived {
@@ -2240,8 +2247,12 @@ impl Runtime {
             related_space_ids,
             edits: input.edits.clone(),
         };
-        let proposed_plan =
-            CandidateConfirmationPlan::reserve(persisted, operation, resolved_primary)?;
+        let proposed_plan = CandidateConfirmationPlan::reserve(
+            persisted,
+            operation,
+            resolved_primary,
+            review.engineering_references.clone(),
+        )?;
         let reservation = self.tasks.reserve_candidate_confirmation(
             &locator,
             expected_task_id,
@@ -2256,6 +2267,14 @@ impl Runtime {
             write.record.confirmation_id,
             write.record.result_context_id,
         )?;
+        let graph_rebuild_pending = if plan.engineering_references.is_empty() {
+            false
+        } else {
+            self.association_rebuild(&AssociationRebuildInput {
+                diagnose_only: false,
+            })
+            .is_err()
+        };
         let snapshot = self.snapshot()?;
         let status = if finalized.already_confirmed
             || write.status == CandidateConfirmationWriteStatus::AlreadyExists
@@ -2279,6 +2298,7 @@ impl Runtime {
             indexed_tree_oid: snapshot.metadata.indexed_tree_oid,
             projection_generation: snapshot.metadata.projection_generation,
             assessment_acknowledgments: review.analysis.assessments,
+            graph_rebuild_pending,
         })
     }
 
@@ -2337,6 +2357,13 @@ impl Runtime {
             ));
         }
         let analysis_view = self.tasks.read_candidate_analysis(record.candidate_id)?;
+        if analysis_view.as_ref().is_some_and(|view| {
+            view.candidate.builder_provenance.engineering_references != claim.engineering_references
+        }) {
+            return Err(invariant(
+                "Candidate Review Engineering Reference provenance changed",
+            ));
+        }
         let (analysis, recommendations, confidence, unknowns, candidate_status, generation) =
             analysis_view.map_or_else(
                 || {
@@ -2393,6 +2420,7 @@ impl Runtime {
             checkpoint_id: record.checkpoint_id,
             claim_id: record.claim_id,
             content: persisted.content.clone(),
+            engineering_references: claim.engineering_references.clone(),
             analysis,
             space_recommendations: recommendations,
             confidence,
@@ -4858,6 +4886,29 @@ fn engineering_reference_record_schema() -> Value {
     })
 }
 
+fn engineering_reference_draft_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "repository_id", "artifact_kind", "relation", "locator", "supports", "limitations"
+        ],
+        "properties": {
+            "repository_id": repository_id_schema(),
+            "artifact_kind": {
+                "type": "string", "enum": ["module", "file", "symbol", "api", "schema", "test"]
+            },
+            "relation": {
+                "type": "string",
+                "enum": ["implements", "defines", "consumes", "validates", "constrains", "depends_on"]
+            },
+            "locator": artifact_locator_input_schema(),
+            "supports": {"type": "string", "minLength": 1},
+            "limitations": {"type": "array", "items": {"type": "string", "minLength": 1}}
+        }
+    })
+}
+
 fn artifact_locator_input_schema() -> Value {
     json!({
         "oneOf": [
@@ -5068,6 +5119,9 @@ fn task_checkpoint_schema() -> Value {
             "evidence": {"type": "array", "minItems": 1, "items": evidence},
             "artifact_refs": {"type": "array", "items": artifact_ref},
             "relations": {"type": "array", "items": context_relation_schema()},
+            "engineering_references": {
+                "type": "array", "items": engineering_reference_draft_schema()
+            },
             "related_contexts": {"type": "array", "items": context_revision()}
         }
     });
@@ -5753,6 +5807,31 @@ fn validate_context_relation_targets(
         }
         find_context(snapshot, None, relation.target_context_id)
             .map_err(|_| invalid("Context Relation target Context does not exist"))?;
+    }
+    Ok(())
+}
+
+fn validate_claim_engineering_references(
+    catalog: &RepositoryCatalogSnapshot,
+    references: &[EngineeringReferenceDraft],
+) -> Result<()> {
+    for (index, reference) in references.iter().enumerate() {
+        reference.validate()?;
+        if references[..index].contains(reference) {
+            return Err(invalid(
+                "Checkpoint Engineering References must not contain duplicates",
+            ));
+        }
+        if !catalog
+            .repositories
+            .iter()
+            .any(|repository| repository.repository_id == reference.repository_id)
+        {
+            return Err(invalid(format!(
+                "Checkpoint Engineering Reference Repository does not exist: {}",
+                reference.repository_id
+            )));
+        }
     }
     Ok(())
 }

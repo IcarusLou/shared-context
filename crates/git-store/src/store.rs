@@ -712,7 +712,7 @@ impl GitStore {
 
     /// Atomically appends one reserved Candidate Confirmation fact closure.
     ///
-    /// The Confirmation lock spans index synchronization, pending recovery, the four/five Event
+    /// The Confirmation lock spans index synchronization, pending recovery, the complete Event
     /// commit, and post-commit lookup. Public generic append remains single-Event only.
     ///
     /// # Errors
@@ -761,9 +761,9 @@ impl GitStore {
         }
         let batch_id = BatchId::new();
         let events = Event::from_candidate_confirmation_plan(plan, batch_id.as_str())?;
-        if !matches!(events.len(), 4 | 5) {
+        if events.len() != plan.expected_event_count() {
             return Err(invariant(
-                "Candidate Confirmation plan must materialize four or five Events",
+                "Candidate Confirmation plan materialized an unexpected Event count",
             ));
         }
         let journal = self.prepare_internal_event_batch(&events, batch_id)?;

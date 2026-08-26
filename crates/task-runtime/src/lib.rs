@@ -124,6 +124,7 @@ pub struct CheckpointClaimDraft {
     pub inline_validations: Vec<EvidenceSnapshotDraft>,
     pub artifact_refs: Vec<ArtifactRef>,
     pub relations: Vec<sctx_domain::ContextRelation>,
+    pub engineering_references: Vec<sctx_domain::EngineeringReferenceDraft>,
     pub related_contexts: Vec<ContextRevisionRef>,
 }
 
@@ -1206,6 +1207,7 @@ impl TaskRuntime {
                 evidence_refs,
                 claim.artifact_refs.clone(),
                 claim.relations.clone(),
+                claim.engineering_references.clone(),
                 claim.related_contexts.clone(),
             )?);
         }
@@ -2972,6 +2974,7 @@ fn checkpoint_semantic_json(input: &AgentCheckpointWrite) -> Result<String> {
                 "inline_validations": claim.inline_validations,
                 "artifact_refs": claim.artifact_refs,
                 "relations": claim.relations,
+                "engineering_references": claim.engineering_references,
                 "related_contexts": claim.related_contexts,
             })
         })

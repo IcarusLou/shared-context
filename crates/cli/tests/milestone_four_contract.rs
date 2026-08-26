@@ -70,6 +70,7 @@ fn checkpoint_claim(claim: &Claim) -> TaskCheckpointClaimInput {
         }],
         artifact_refs: Vec::new(),
         relations: Vec::new(),
+        engineering_references: Vec::new(),
         related_contexts: Vec::new(),
     }
 }

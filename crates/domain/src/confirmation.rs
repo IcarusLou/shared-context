@@ -5,10 +5,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     Applicability, CandidateId, ConfirmationId, ContextCandidate, ContextId, ContextKind,
-    ContextRelation, ContextRevision, ContextRevisionDraft, Error, ErrorKind, EventId,
-    EvidenceSnapshotDraft, IntentRevision, IntentSnapshot, Publication, PublicationAction,
-    PublicationDraft, PublicationId, Result, RevisionId, SpaceAssociationId, SpaceId,
-    SpaceRecommendationId, SubmissionId, WorkEpisodeRef,
+    ContextRelation, ContextRevision, ContextRevisionDraft, EngineeringReference,
+    EngineeringReferenceDraft, Error, ErrorKind, EventId, EvidenceSnapshotDraft, IntentRevision,
+    IntentSnapshot, Publication, PublicationAction, PublicationDraft, PublicationId, Result,
+    RevisionId, SpaceAssociationId, SpaceId, SpaceRecommendationId, SubmissionId, WorkEpisodeRef,
 };
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -329,13 +329,15 @@ impl ContextSpaceAssociation {
 }
 
 /// Exact sibling Events that causally close one Candidate confirmation fact.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateConfirmationCausalRefs {
     pub space_created_event_id: Option<EventId>,
     pub context_revision_event_id: EventId,
     pub space_association_event_id: EventId,
     pub publication_event_id: EventId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engineering_reference_event_ids: Vec<EventId>,
 }
 
 impl CandidateConfirmationCausalRefs {
@@ -348,6 +350,7 @@ impl CandidateConfirmationCausalRefs {
         if let Some(space_created_event_id) = self.space_created_event_id {
             ids.push(space_created_event_id);
         }
+        ids.extend(self.engineering_reference_event_ids.iter().copied());
         require_unique(&ids, "candidate_confirmation.causal_refs")
     }
 }
@@ -468,20 +471,22 @@ impl CandidateConfirmation {
             created_space_id: self.created_space_id,
             edits: self.edits.clone(),
             final_content_hash: self.final_content_hash.clone(),
-            causal_refs: self.causal_refs,
+            causal_refs: self.causal_refs.clone(),
         }
         .validate()
     }
 }
 
 /// Server-owned Event identities for one atomic Confirmation fact closure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateConfirmationPlanEventIds {
     pub space_created_event_id: Option<EventId>,
     pub context_revision_event_id: EventId,
     pub space_association_event_id: EventId,
     pub publication_event_id: EventId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engineering_reference_event_ids: Vec<EventId>,
     pub confirmation_event_id: EventId,
 }
 
@@ -504,6 +509,8 @@ pub struct CandidateConfirmationPlan {
     pub result_revision: ContextRevision,
     pub space_association: ContextSpaceAssociation,
     pub publication: Publication,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engineering_references: Vec<EngineeringReference>,
     pub confirmation: CandidateConfirmation,
     pub event_ids: CandidateConfirmationPlanEventIds,
 }
@@ -519,6 +526,7 @@ impl CandidateConfirmationPlan {
         candidate: &ContextCandidate,
         operation: CandidateConfirmationOperation,
         resolved_primary: CandidatePrimarySelection,
+        engineering_reference_drafts: Vec<EngineeringReferenceDraft>,
     ) -> Result<Self> {
         operation.validate()?;
         if operation.candidate_id != candidate.candidate_id {
@@ -550,6 +558,22 @@ impl CandidateConfirmationPlan {
         let final_draft = request.final_draft(candidate)?;
         let result_revision = ContextRevision::from_draft(Vec::new(), final_draft.clone())?;
         let result_context_id = ContextId::new();
+        for (index, reference) in engineering_reference_drafts.iter().enumerate() {
+            reference.validate()?;
+            if engineering_reference_drafts[..index].contains(reference) {
+                return Err(invalid(
+                    "Candidate Confirmation Engineering References must not contain duplicates",
+                ));
+            }
+        }
+        let engineering_references = engineering_reference_drafts
+            .into_iter()
+            .map(EngineeringReference::from_draft)
+            .collect::<Result<Vec<_>>>()?;
+        let engineering_reference_event_ids = engineering_references
+            .iter()
+            .map(|_| EventId::new())
+            .collect::<Vec<_>>();
         let (primary_space_id, new_space, space_created_event_id) = match resolved_primary {
             CandidatePrimarySelection::Existing { space_id } => (space_id, None, None),
             CandidatePrimarySelection::ProposedNew { intent } => {
@@ -606,6 +630,7 @@ impl CandidateConfirmationPlan {
                 context_revision_event_id,
                 space_association_event_id,
                 publication_event_id,
+                engineering_reference_event_ids: engineering_reference_event_ids.clone(),
             },
         })?;
         let plan = Self {
@@ -616,12 +641,14 @@ impl CandidateConfirmationPlan {
             result_revision,
             space_association,
             publication,
+            engineering_references,
             confirmation,
             event_ids: CandidateConfirmationPlanEventIds {
                 space_created_event_id,
                 context_revision_event_id,
                 space_association_event_id,
                 publication_event_id,
+                engineering_reference_event_ids,
                 confirmation_event_id,
             },
         };
@@ -641,6 +668,12 @@ impl CandidateConfirmationPlan {
         format!("sha256:{:x}", Sha256::digest(bytes))
     }
 
+    /// Returns the exact number of immutable Events materialized by this plan.
+    #[must_use]
+    pub fn expected_event_count(&self) -> usize {
+        4 + usize::from(self.new_space.is_some()) + self.engineering_references.len()
+    }
+
     /// Validates all local identities and causal references in the reserved closure.
     ///
     /// # Errors
@@ -658,6 +691,13 @@ impl CandidateConfirmationPlan {
             || self.space_association.context_id != self.result_context_id
             || self.space_association.primary_space_id != self.confirmation.primary_space_id
             || self.space_association.related_space_ids != self.confirmation.related_space_ids
+            || self.event_ids.engineering_reference_event_ids
+                != self
+                    .confirmation
+                    .causal_refs
+                    .engineering_reference_event_ids
+            || self.event_ids.engineering_reference_event_ids.len()
+                != self.engineering_references.len()
             || context_revision_content_hash(&context_revision_as_draft(&self.result_revision))
                 != self.confirmation.final_content_hash
         {
@@ -668,6 +708,19 @@ impl CandidateConfirmationPlan {
         self.result_revision.validate()?;
         self.space_association.validate()?;
         self.publication.validate()?;
+        let mut reference_ids = HashSet::new();
+        for (index, reference) in self.engineering_references.iter().enumerate() {
+            reference.validate()?;
+            if !reference_ids.insert(reference.reference_id)
+                || self.engineering_references[..index]
+                    .iter()
+                    .any(|existing| same_engineering_reference_content(existing, reference))
+            {
+                return Err(invalid(
+                    "Candidate Confirmation Engineering References must be unique",
+                ));
+            }
+        }
         self.confirmation.validate()?;
         if self.event_ids.space_created_event_id
             != self.confirmation.causal_refs.space_created_event_id
@@ -702,8 +755,26 @@ impl CandidateConfirmationPlan {
         if let Some(event_id) = self.event_ids.space_created_event_id {
             event_ids.push(event_id);
         }
+        event_ids.extend(
+            self.event_ids
+                .engineering_reference_event_ids
+                .iter()
+                .copied(),
+        );
         require_unique(&event_ids, "candidate_confirmation_plan.event_ids")
     }
+}
+
+fn same_engineering_reference_content(
+    left: &EngineeringReference,
+    right: &EngineeringReference,
+) -> bool {
+    left.repository_id == right.repository_id
+        && left.artifact_kind == right.artifact_kind
+        && left.relation == right.relation
+        && left.locator == right.locator
+        && left.supports == right.supports
+        && left.limitations == right.limitations
 }
 
 /// Hashes only authoritative Context draft semantics, excluding generated Revision/Evidence IDs.

@@ -241,6 +241,7 @@ fn confirmation_fixture(new_primary: bool, withdraw_after: bool) -> Confirmation
                 context_revision_event_id: revision.event_id(),
                 space_association_event_id: association.event_id(),
                 publication_event_id: publication.event_id(),
+                engineering_reference_event_ids: Vec::new(),
             },
         },
         "bat_00000000-0000-4000-8000-000000000802",

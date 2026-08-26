@@ -11,10 +11,12 @@ use std::{
 
 use rusqlite::{Connection, params};
 use sctx_domain::{
-    Applicability, CandidateConfirmationOperation, CandidateConfirmationPlan,
-    CandidateConfirmationPrimaryReference, CandidateId, CandidatePrimarySelection, ContextKind,
-    ContextRevisionDraft, EventId, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot,
-    OptionalCandidateEdits, SubmissionId, TaskId, TaskSessionId, WorkEpisodeId, WorkEpisodeRef,
+    Applicability, ArtifactKind, ArtifactLocator, CandidateConfirmationOperation,
+    CandidateConfirmationPlan, CandidateConfirmationPrimaryReference, CandidateId,
+    CandidatePrimarySelection, ContextKind, ContextRevisionDraft, EngineeringReferenceDraft,
+    EventId, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, OptionalCandidateEdits,
+    ReferenceRelation, RepoRelativePath, RepositoryId, SubmissionId, TaskId, TaskSessionId,
+    WorkEpisodeId, WorkEpisodeRef,
 };
 use sctx_event_schema::Event;
 use sctx_git_store::{
@@ -106,6 +108,16 @@ fn confirmation_plan(store: &GitStore, index: &ProjectionIndex) -> CandidateConf
             edits: OptionalCandidateEdits::default(),
         },
         CandidatePrimarySelection::Existing { space_id },
+        vec![EngineeringReferenceDraft {
+            repository_id: RepositoryId::new(),
+            artifact_kind: ArtifactKind::File,
+            relation: ReferenceRelation::Implements,
+            locator: ArtifactLocator::File {
+                path: RepoRelativePath::new("src/confirmed.rs").unwrap(),
+            },
+            supports: "The confirmed Context is implemented by this file".to_owned(),
+            limitations: Vec::new(),
+        }],
     )
     .unwrap()
 }
@@ -634,7 +646,7 @@ fn one_hundred_concurrent_confirmation_retries_converge_to_one_atomic_commit() {
             && outcome.record.result_context_id == outcomes[0].record.result_context_id
             && outcome.record.batch_id == outcomes[0].record.batch_id
             && outcome.record.commit_oid == outcomes[0].record.commit_oid
-            && outcome.record.event_ids.len() == 4
+            && outcome.record.event_ids.len() == 5
     }));
     let after = Command::new("git")
         .arg("-C")
@@ -674,8 +686,8 @@ fn confirmation_crash_seams_recover_all_events_and_index_deletion_rebuilds_mappi
             .with_crash_injector(Arc::new(FailOnce::at(seam)));
         assert!(crashing.confirm_candidate(&plan).is_err(), "{seam:?}");
         let recovered = store.confirm_candidate(&plan).unwrap();
-        assert_eq!(recovered.record.event_ids.len(), 4, "{seam:?}");
-        assert_eq!(recovered.record.event_paths.len(), 4, "{seam:?}");
+        assert_eq!(recovered.record.event_ids.len(), 5, "{seam:?}");
+        assert_eq!(recovered.record.event_paths.len(), 5, "{seam:?}");
         assert!(store.list_pending().unwrap().is_empty(), "{seam:?}");
         let record = recovered.record;
         fs::remove_file(index.database_path()).unwrap();
@@ -685,6 +697,16 @@ fn confirmation_crash_seams_recover_all_events_and_index_deletion_rebuilds_mappi
             CandidateConfirmationWriteStatus::AlreadyExists
         );
         assert_eq!(rebuilt.record, record, "{seam:?}");
+        assert_eq!(
+            index
+                .domain_snapshot()
+                .unwrap()
+                .projection
+                .engineering_references
+                .len(),
+            1,
+            "{seam:?}"
+        );
     }
 }
 
@@ -709,6 +731,7 @@ fn confirmation_privacy_failure_writes_no_event_or_pending_journal() {
         CandidatePrimarySelection::Existing {
             space_id: primary_space_id,
         },
+        Vec::new(),
     )
     .unwrap();
     let before = Command::new("git")

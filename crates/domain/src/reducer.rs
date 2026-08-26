@@ -1819,6 +1819,20 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
             }),
             None => confirmation.causal_refs.space_created_event_id.is_none(),
         };
+        let engineering_reference_events_match = confirmation
+            .causal_refs
+            .engineering_reference_event_ids
+            .iter()
+            .all(|event_id| {
+                reference_definitions.values().any(|definitions| {
+                    definitions.len() == 1
+                        && definitions[0].event_id == *event_id
+                        && definitions[0].context_id == confirmation.result_context_id
+                        && definitions[0].revision_id == confirmation.result_revision_id
+                        && definitions[0].reference.validate().is_ok()
+                        && !invalid_event_ids.contains(event_id)
+                })
+            });
         let content_matches = candidate
             .and_then(|candidate| confirmation.edits.apply(&candidate.content).ok())
             .zip(result_revision)
@@ -1838,6 +1852,7 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
             && causal_publication_matches
             && publication_event_matches
             && created_space_matches
+            && engineering_reference_events_match
             && content_matches
             && spaces_match
         {

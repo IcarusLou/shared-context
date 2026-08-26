@@ -92,6 +92,7 @@ fn checkpoint_claim(statement: &str) -> CheckpointClaimDraft {
         }],
         artifact_refs: Vec::new(),
         relations: Vec::new(),
+        engineering_references: Vec::new(),
         related_contexts: Vec::new(),
     }
 }
@@ -971,6 +972,7 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
             source_episode: closed.episode.episode.ownership(),
             checkpoint_ids: vec![closed.checkpoint.checkpoint_id],
             observation_ids,
+            engineering_references: Vec::new(),
         },
         CandidateAnalysis {
             status: CandidateAnalysisStatus::Complete,

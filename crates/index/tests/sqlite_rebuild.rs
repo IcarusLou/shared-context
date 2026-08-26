@@ -1402,6 +1402,7 @@ fn candidate_confirmation_projection_is_incremental_scratch_and_deletion_equival
                 context_revision_event_id: revision_event_id,
                 space_association_event_id: association_event.event_id(),
                 publication_event_id: publication_event.event_id(),
+                engineering_reference_event_ids: Vec::new(),
             },
         },
         "bat_00000000-0000-4000-8000-000000000811",

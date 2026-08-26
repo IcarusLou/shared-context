@@ -5,10 +5,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AgentCheckpointId, Applicability, ArtifactLocator, CandidateBuildId, CandidateId, CaptureId,
-    CheckpointClaimId, ConfirmationId, ContextId, ContextRelationKind, ContextRevisionDraft, Error,
-    ErrorKind, EvidenceId, EvidenceSnapshotDraft, IntentSnapshot, RepositoryId, Result, RevisionId,
-    SignalId, SpaceId, SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId,
-    TaskSessionId, TaskSignalKind, WorkEpisodeId, WorkObservationId,
+    CheckpointClaimId, ConfirmationId, ContextId, ContextRelationKind, ContextRevisionDraft,
+    EngineeringReferenceDraft, Error, ErrorKind, EvidenceId, EvidenceSnapshotDraft, IntentSnapshot,
+    RepositoryId, Result, RevisionId, SignalId, SpaceId, SpaceRecommendationId, SubmissionId,
+    TaskId, TaskIntentRevisionId, TaskSessionId, TaskSignalKind, WorkEpisodeId, WorkObservationId,
 };
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -29,6 +29,27 @@ fn require_text_items(values: &[String], field: &str) -> Result<()> {
         if !seen.insert(value) {
             return Err(invalid(format!("{field} must not contain duplicates")));
         }
+    }
+    Ok(())
+}
+
+fn validate_engineering_reference_drafts(
+    references: &[EngineeringReferenceDraft],
+    field: &str,
+) -> Result<()> {
+    for (index, reference) in references.iter().enumerate() {
+        reference.validate()?;
+        if references[..index].contains(reference) {
+            return Err(invalid(format!("{field} must not contain duplicates")));
+        }
+    }
+    Ok(())
+}
+
+fn validate_capture_unknowns(values: &[CaptureUnknown], field: &str) -> Result<()> {
+    require_unique(values, field)?;
+    for unknown in values {
+        unknown.validate(field)?;
     }
     Ok(())
 }
@@ -588,6 +609,8 @@ pub struct CheckpointClaim {
     pub artifact_refs: Vec<ArtifactRef>,
     #[serde(default)]
     pub relations: Vec<crate::ContextRelation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engineering_references: Vec<EngineeringReferenceDraft>,
     pub related_contexts: Vec<ContextRevisionRef>,
 }
 
@@ -609,6 +632,7 @@ impl CheckpointClaim {
         evidence_refs: Vec<CaptureEvidenceRef>,
         artifact_refs: Vec<ArtifactRef>,
         relations: Vec<crate::ContextRelation>,
+        engineering_references: Vec<EngineeringReferenceDraft>,
         related_contexts: Vec<ContextRevisionRef>,
     ) -> Result<Self> {
         let claim = Self {
@@ -623,6 +647,7 @@ impl CheckpointClaim {
             evidence_refs,
             artifact_refs,
             relations,
+            engineering_references,
             related_contexts,
         };
         claim.validate("checkpoint_claim")?;
@@ -657,6 +682,10 @@ impl CheckpointClaim {
                 .map(|relation| (relation.target_context_id, relation.kind))
                 .collect::<Vec<_>>(),
             &format!("{field}.relations target/kind"),
+        )?;
+        validate_engineering_reference_drafts(
+            &self.engineering_references,
+            &format!("{field}.engineering_references"),
         )?;
         require_unique(&self.related_contexts, &format!("{field}.related_contexts"))
     }
@@ -771,6 +800,8 @@ pub struct CandidateBuilderProvenance {
     pub source_episode: WorkEpisodeRef,
     pub checkpoint_ids: Vec<AgentCheckpointId>,
     pub observation_ids: Vec<WorkObservationId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engineering_references: Vec<EngineeringReferenceDraft>,
 }
 
 impl CandidateBuilderProvenance {
@@ -790,6 +821,7 @@ impl CandidateBuilderProvenance {
             source_episode,
             checkpoint_ids,
             observation_ids,
+            engineering_references: Vec::new(),
         };
         provenance.validate()?;
         Ok(provenance)
@@ -808,6 +840,10 @@ impl CandidateBuilderProvenance {
         require_unique(
             &self.observation_ids,
             "candidate_builder_provenance.observation_ids",
+        )?;
+        validate_engineering_reference_drafts(
+            &self.engineering_references,
+            "candidate_builder_provenance.engineering_references",
         )
     }
 }
@@ -1369,6 +1405,8 @@ pub struct CandidateReviewView {
     pub checkpoint_id: AgentCheckpointId,
     pub claim_id: CheckpointClaimId,
     pub content: ContextRevisionDraft,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engineering_references: Vec<EngineeringReferenceDraft>,
     pub analysis: CandidateAnalysis,
     pub space_recommendations: Vec<CandidateSpaceRecommendation>,
     pub confidence: CandidateConfidence,
@@ -1398,13 +1436,11 @@ impl CandidateReviewView {
     /// Review that could be mistaken for trusted or ready data.
     pub fn validate(&self) -> Result<()> {
         self.content.validate()?;
+        validate_engineering_reference_drafts(&self.engineering_references, "review.references")?;
         self.analysis.validate()?;
         validate_recommendations(&self.space_recommendations)?;
         self.confidence.validate("candidate_review.confidence")?;
-        require_unique(&self.unknowns, "candidate_review.unknowns")?;
-        for unknown in &self.unknowns {
-            unknown.validate("candidate_review.unknown")?;
-        }
+        validate_capture_unknowns(&self.unknowns, "candidate_review.unknowns")?;
         if self.review_version == 0
             || self.expires_at_unix_seconds <= self.created_at_unix_seconds
             || !self.untrusted_data
@@ -1968,6 +2004,7 @@ mod tests {
             vec![artifact("src/search.ts")],
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         )
         .unwrap();
         let checkpoint =
@@ -2238,6 +2275,7 @@ mod tests {
                 "Claim without Evidence",
                 "Cannot be grounded",
                 Applicability::default(),
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),

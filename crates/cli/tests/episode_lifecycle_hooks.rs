@@ -217,6 +217,7 @@ fn checkpoint_claim(session: &str) -> CheckpointClaimDraft {
         }],
         artifact_refs: Vec::new(),
         relations: Vec::new(),
+        engineering_references: Vec::new(),
         related_contexts: Vec::new(),
     }
 }
