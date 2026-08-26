@@ -327,6 +327,48 @@ fn empty_context_store_yields_zero_existing_spaces_and_does_not_write_git() {
 }
 
 #[test]
+fn canonically_duplicate_evidence_supports_do_not_invalidate_candidate_intent() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("duplicate evidence support root");
+    let store = GitStore::bootstrap_local(&root).unwrap();
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    let mut content = draft(
+        Some("candidate/duplicate-support"),
+        "Duplicate support Candidate",
+        "Distinct Evidence may support the same acceptance condition",
+        "duplicate-support-domain",
+    );
+    content.evidence[0].supports = "The implementation satisfies the contract".to_owned();
+    content.evidence.push(EvidenceSnapshotDraft {
+        kind: EvidenceType::SourceSnapshot,
+        supports: "  the implementation   SATISFIES the contract  ".to_owned(),
+        content: serde_json::json!({"source": "independent capture"}),
+        interpretation: "a second observation supports the same conclusion".to_owned(),
+        limitations: vec!["the observations remain independently reviewable".to_owned()],
+    });
+    let candidate = candidate(content);
+
+    let result = SearchEngine::new(index)
+        .analyze_candidate(&CandidateAnalysisRequest {
+            source_task_id: candidate.source_episode.task_id,
+            source_working_intent: source_intent(candidate.source_episode.task_id),
+            source_task_signals: Vec::new(),
+            candidate,
+            explicit_related_contexts: Vec::new(),
+            artifact_refs: Vec::new(),
+            token_budget: 4_000,
+            top_k: 4,
+        })
+        .unwrap();
+
+    assert_eq!(
+        result.analysis.status,
+        sctx_domain::CandidateAnalysisStatus::Complete
+    );
+}
+
+#[test]
 fn one_safe_exact_owner_yields_one_existing_primary_space() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("single candidate analysis root");

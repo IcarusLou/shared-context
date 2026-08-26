@@ -857,6 +857,22 @@ fn candidate_query(candidate: &ContextRevisionDraft) -> String {
 }
 
 fn candidate_working_intent(candidate: &ContextRevisionDraft) -> WorkingIntentSnapshot {
+    let mut seen_acceptance_conditions = BTreeSet::new();
+    let acceptance_conditions = candidate
+        .evidence
+        .iter()
+        .filter_map(|evidence| {
+            let canonical = evidence
+                .supports
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            seen_acceptance_conditions
+                .insert(canonical)
+                .then(|| evidence.supports.clone())
+        })
+        .collect();
     WorkingIntentSnapshot {
         goal: candidate.statement.clone(),
         current_direction: Some(candidate.rationale.clone()),
@@ -865,11 +881,7 @@ fn candidate_working_intent(candidate: &ContextRevisionDraft) -> WorkingIntentSn
         domains: candidate.applicability.domains.clone(),
         platforms: candidate.applicability.platforms.clone(),
         constraints: candidate.assumptions.clone(),
-        acceptance_conditions: candidate
-            .evidence
-            .iter()
-            .map(|evidence| evidence.supports.clone())
-            .collect(),
+        acceptance_conditions,
         artifact_hints: Vec::new(),
         interface_hints: Vec::new(),
         open_questions: Vec::new(),
