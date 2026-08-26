@@ -1912,6 +1912,7 @@ fn run_context(args: &[String], json_output: bool) -> Result<()> {
                 &context.revision_heads,
                 &parents.iter().copied().collect(),
             )?;
+            validate_context_relation_targets(&snapshot.projection, context_id, &draft)?;
             let event = Event::context_revised(space_id, context_id, parents, draft, None)?;
             let (_, revision_id) = context_identity(&event);
             let event_id = event.event_id();
@@ -2846,6 +2847,8 @@ struct ContextDraftInput {
     assumptions: Vec<String>,
     #[serde(default)]
     recheck_when: Vec<String>,
+    #[serde(default)]
+    relations: Vec<sctx_domain::ContextRelation>,
     evidence: Vec<EvidenceInput>,
 }
 
@@ -2870,7 +2873,7 @@ impl From<ContextDraftInput> for ContextRevisionDraft {
             applicability: input.applicability,
             assumptions: input.assumptions,
             recheck_when: input.recheck_when,
-            relations: Vec::new(),
+            relations: input.relations,
             evidence: input.evidence.into_iter().map(Into::into).collect(),
         }
     }
@@ -3072,6 +3075,29 @@ fn require_context(
                 "Context {context_id} does not belong to Space {space_id}"
             ))
         })
+}
+
+fn validate_context_relation_targets(
+    projection: &DomainProjection,
+    source_context_id: ContextId,
+    draft: &ContextRevisionDraft,
+) -> Result<()> {
+    for relation in &draft.relations {
+        if relation.target_context_id == source_context_id {
+            return Err(invalid("Context Relation cannot target its source Context"));
+        }
+        let exists = projection
+            .spaces
+            .values()
+            .any(|space| space.contexts.contains_key(&relation.target_context_id));
+        if !exists {
+            return Err(invalid(format!(
+                "Context Relation target does not exist: {}",
+                relation.target_context_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn require_revision(

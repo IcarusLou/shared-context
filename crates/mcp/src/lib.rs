@@ -24,9 +24,9 @@ use sctx_domain::{
     CandidateConfirmationPrimaryReference, CandidatePrimarySelection, CandidateRelationAssessment,
     CandidateReviewDiagnostic, CandidateReviewStatus, CandidateReviewSummary, CandidateReviewView,
     CandidateSpaceRecommendation, CaptureEvidenceRef, CaptureId, CaptureUnknown, CheckpointClaim,
-    CheckpointClaimId, ContextId, ContextKind, ContextRevisionDraft, ContextRevisionRef,
-    EngineeringReferenceDraft, Error, ErrorKind, EvidenceSnapshotDraft, EvidenceType,
-    ExternalSessionLocator, NormalizedBreadcrumbKind, NormalizedWorkObservation,
+    CheckpointClaimId, ContextId, ContextKind, ContextRelation, ContextRevisionDraft,
+    ContextRevisionRef, EngineeringReferenceDraft, Error, ErrorKind, EvidenceSnapshotDraft,
+    EvidenceType, ExternalSessionLocator, NormalizedBreadcrumbKind, NormalizedWorkObservation,
     OptionalCandidateEdits, REPOSITORY_ID_MAX_BYTES, REPOSITORY_ID_PATTERN, ReferenceId,
     ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionStatus, ResolvedFocus, Result,
     RevisionId, SignalId, SpaceId, SpaceRecommendationId, SubmissionId, TaskId,
@@ -212,6 +212,8 @@ pub struct TaskCheckpointClaimInput {
     pub recheck_when: Vec<String>,
     pub evidence: Vec<TaskCheckpointEvidenceInput>,
     pub artifact_refs: Vec<ArtifactRef>,
+    #[serde(default)]
+    pub relations: Vec<ContextRelation>,
     pub related_contexts: Vec<ContextRevisionRef>,
 }
 
@@ -1402,6 +1404,7 @@ impl Runtime {
             for context in &claim.related_contexts {
                 validate_context_revision_ref(&snapshot, *context)?;
             }
+            validate_context_relation_targets(&snapshot, &claim.relations)?;
             claims.push(CheckpointClaimDraft {
                 context_kind_hint: claim.context_kind_hint,
                 topic_key_hint: claim.topic_key_hint.clone(),
@@ -1413,6 +1416,7 @@ impl Runtime {
                 evidence_refs,
                 inline_validations,
                 artifact_refs: claim.artifact_refs.clone(),
+                relations: claim.relations.clone(),
                 related_contexts: claim.related_contexts.clone(),
             });
         }
@@ -1564,6 +1568,7 @@ impl Runtime {
             for context in &claim.related_contexts {
                 validate_context_revision_ref(snapshot, *context)?;
             }
+            validate_context_relation_targets(snapshot, &claim.relations)?;
         }
         Ok(())
     }
@@ -2216,6 +2221,7 @@ impl Runtime {
             .map(|projection| &projection.candidate)
             .ok_or_else(|| invalid("Candidate Confirmation payload is unavailable"))?;
         let final_draft = input.edits.apply(&persisted.content)?;
+        validate_context_relation_targets(&snapshot, &final_draft.relations)?;
         let final_json = serde_json::to_string(&final_draft).map_err(|error| {
             Error::new(ErrorKind::Io, format!("serialize final draft: {error}"))
         })?;
@@ -2938,7 +2944,7 @@ fn build_claim_material(
         applicability: claim.applicability.clone(),
         assumptions: claim.assumptions.clone(),
         recheck_when: claim.recheck_when.clone(),
-        relations: Vec::new(),
+        relations: claim.relations.clone(),
         evidence,
     });
     ClaimBuildMaterial {
@@ -5061,6 +5067,7 @@ fn task_checkpoint_schema() -> Value {
             "recheck_when": string_list(),
             "evidence": {"type": "array", "minItems": 1, "items": evidence},
             "artifact_refs": {"type": "array", "items": artifact_ref},
+            "relations": {"type": "array", "items": context_relation_schema()},
             "related_contexts": {"type": "array", "items": context_revision()}
         }
     });
@@ -5264,19 +5271,7 @@ fn candidate_edits_schema() -> Value {
             },
             "assumptions": string_array_schema(),
             "recheck_when": string_array_schema(),
-            "relations": {
-                "type": "array",
-                "items": {
-                    "type": "object", "additionalProperties": false,
-                    "required": ["target_context_id", "kind", "rationale", "supports"],
-                    "properties": {
-                        "target_context_id": id_schema("ctx_"),
-                        "kind": {"type": "string", "enum": ["depends_on", "supersedes", "contradicts", "related_to"]},
-                        "rationale": {"type": "string", "minLength": 1},
-                        "supports": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
-                    }
-                }
-            },
+            "relations": {"type": "array", "items": context_relation_schema()},
             "evidence": {
                 "type": "array", "minItems": 1,
                 "items": {
@@ -5297,6 +5292,29 @@ fn candidate_edits_schema() -> Value {
 
 fn kind_schema() -> Value {
     json!({"type": "string", "enum": ["decision", "contract", "issue", "risk", "validation", "discovery", "progress"]})
+}
+
+fn context_relation_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["target_context_id", "kind", "rationale", "supports"],
+        "properties": {
+            "target_context_id": id_schema("ctx_"),
+            "kind": {
+                "type": "string",
+                "enum": [
+                    "depends_on", "constrains", "implements", "validated_by",
+                    "contradicts", "related_to"
+                ]
+            },
+            "rationale": {"type": "string", "minLength": 1},
+            "supports": {
+                "type": "array", "minItems": 1,
+                "items": {"type": "string", "minLength": 1}
+            }
+        }
+    })
 }
 
 fn kind_array_schema() -> Value {
@@ -5719,6 +5737,22 @@ fn validate_context_revision_ref(
             "Revision {} does not belong to Context {} in the selected Index snapshot",
             reference.revision_id, reference.context_id
         )));
+    }
+    Ok(())
+}
+
+fn validate_context_relation_targets(
+    snapshot: &DomainSnapshot,
+    relations: &[ContextRelation],
+) -> Result<()> {
+    let mut identities = BTreeSet::new();
+    for relation in relations {
+        relation.validate()?;
+        if !identities.insert((relation.target_context_id, relation.kind)) {
+            return Err(invalid("Context Relation target/kind pairs must be unique"));
+        }
+        find_context(snapshot, None, relation.target_context_id)
+            .map_err(|_| invalid("Context Relation target Context does not exist"))?;
     }
     Ok(())
 }

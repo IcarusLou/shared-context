@@ -77,7 +77,7 @@ A fail-open lifecycle transition that may close one Open WorkEpisode only at its
 _Avoid_: automatic Checkpoint, Hook-authored Claim, SessionEnd Candidate build
 
 **CheckpointClaim**:
-A structured engineering assertion containing its statement, rationale, applicability, assumptions, recheck conditions, typed Evidence references, Artifact associations, and related Context revisions. An Artifact association is not Evidence by itself.
+A structured engineering assertion containing its statement, rationale, applicability, assumptions, recheck conditions, typed Evidence references, Artifact associations, proposed ContextRelations, and analysis-only related Context revisions. Artifact associations and related Context revisions are not Evidence or durable relations by themselves.
 _Avoid_: unsupported conclusion, free-form note
 
 **CandidateBuilderProvenance**:
@@ -217,7 +217,7 @@ A derived, explainable link between a Context revision and a resolved Engineerin
 _Avoid_: Context ownership, immutable relation
 
 **ContextRelation**:
-A stable knowledge edge between two Context revisions, such as dependency, constraint, implementation, validation, conflict, or supersession. Unlike engineering associations, it remains meaningful without access to source repositories.
+A stable knowledge edge between two Context revisions expressing dependency, constraint, implementation, validation, contradiction, or general relatedness. Supersession belongs to Revision and governance causality, not ContextRelation.
 _Avoid_: inferred code edge, retrieval score
 
 **Workspace**:

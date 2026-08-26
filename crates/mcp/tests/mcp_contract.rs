@@ -14,12 +14,13 @@ use sctx_domain::{
     Applicability, ArtifactAction, ArtifactLocator, ArtifactRef, CandidateConfirmationOperation,
     CandidateConfirmationPlan, CandidateConfirmationPrimaryReference, CandidateId,
     CandidatePrimarySelection, CandidateReviewDiagnostic, CandidateReviewStatus, CaptureId,
-    CaptureUnknown, ContextId, ContextKind, ContextRevisionDraft, ContextRevisionRef,
-    ContextUseDisposition, EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator,
-    IntentSnapshot, NormalizedBreadcrumbKind, NormalizedWorkObservation, OptionalCandidateEdits,
-    PublicationAction, PublicationDraft, RepoRelativePath, RepositoryId, ReviewDraft,
-    ReviewVerdict, RevisionId, SpaceId, SubmissionId, TaskId, TaskSignal, TaskSignalKind,
-    WorkEpisodeId, WorkSourceRef, WorkingIntentSnapshot, candidate_submission_content_hash,
+    CaptureUnknown, ContextId, ContextKind, ContextRelation, ContextRelationKind,
+    ContextRevisionDraft, ContextRevisionRef, ContextUseDisposition, EvidenceSnapshotDraft,
+    EvidenceType, ExternalSessionLocator, IntentSnapshot, NormalizedBreadcrumbKind,
+    NormalizedWorkObservation, OptionalCandidateEdits, PublicationAction, PublicationDraft,
+    RepoRelativePath, RepositoryId, ReviewDraft, ReviewVerdict, RevisionId, SpaceId, SubmissionId,
+    TaskId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkSourceRef, WorkingIntentSnapshot,
+    candidate_submission_content_hash,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
@@ -617,6 +618,7 @@ fn build_review_candidate_for_agent(
                     },
                 }],
                 artifact_refs: Vec::new(),
+                relations: Vec::new(),
                 related_contexts: Vec::new(),
             }],
             unknowns: Vec::new(),
@@ -677,6 +679,7 @@ fn directly_close_builder_episode(
                 evidence_refs: Vec::new(),
                 inline_validations: vec![evidence.clone()],
                 artifact_refs: Vec::new(),
+                relations: Vec::new(),
                 related_contexts: Vec::new(),
             }],
             unknowns: Vec::new(),
@@ -895,6 +898,7 @@ fn typed_checkpoint_input(
             recheck_when: vec!["the schema changes".to_owned()],
             evidence,
             artifact_refs: Vec::new(),
+            relations: Vec::new(),
             related_contexts: Vec::new(),
         }],
         unknowns: Vec::new(),
@@ -1490,6 +1494,7 @@ fn candidate_builder_converts_six_typed_sources_without_raw_capture_or_search_in
             recheck_when: Vec::new(),
             evidence: vec![TaskCheckpointEvidenceInput::InlineValidation { evidence: inline }],
             artifact_refs: Vec::new(),
+            relations: Vec::new(),
             related_contexts: Vec::new(),
         },
         TaskCheckpointClaimInput {
@@ -1504,6 +1509,7 @@ fn candidate_builder_converts_six_typed_sources_without_raw_capture_or_search_in
                 observation_id: artifact_observation_id.to_string(),
             }],
             artifact_refs: Vec::new(),
+            relations: Vec::new(),
             related_contexts: Vec::new(),
         },
         TaskCheckpointClaimInput {
@@ -1518,6 +1524,7 @@ fn candidate_builder_converts_six_typed_sources_without_raw_capture_or_search_in
                 observation_id: context_use_observation_id.to_string(),
             }],
             artifact_refs: Vec::new(),
+            relations: Vec::new(),
             related_contexts: vec![ContextRevisionRef {
                 context_id: fixture.context_id,
                 revision_id: fixture.revision_id,
@@ -1535,6 +1542,7 @@ fn candidate_builder_converts_six_typed_sources_without_raw_capture_or_search_in
                 signal_id: signal.signal_id.to_string(),
             }],
             artifact_refs: Vec::new(),
+            relations: Vec::new(),
             related_contexts: Vec::new(),
         },
         TaskCheckpointClaimInput {
@@ -1551,6 +1559,7 @@ fn candidate_builder_converts_six_typed_sources_without_raw_capture_or_search_in
                 evidence_id: source_evidence.evidence_id.to_string(),
             }],
             artifact_refs: Vec::new(),
+            relations: Vec::new(),
             related_contexts: Vec::new(),
         },
         TaskCheckpointClaimInput {
@@ -1565,6 +1574,7 @@ fn candidate_builder_converts_six_typed_sources_without_raw_capture_or_search_in
                 observation_id: capture.observation_id.to_string(),
             }],
             artifact_refs: Vec::new(),
+            relations: Vec::new(),
             related_contexts: Vec::new(),
         },
     ];
@@ -2082,6 +2092,7 @@ fn cursor_and_codex_candidate_review_tools_list_get_and_discard_without_confirma
                         },
                     }],
                     artifact_refs: Vec::new(),
+                    relations: Vec::new(),
                     related_contexts: Vec::new(),
                 }],
                 unknowns: Vec::new(),
@@ -2228,6 +2239,228 @@ fn cursor_and_codex_candidate_review_tools_list_get_and_discard_without_confirma
             assert!(!response_text.contains(forbidden));
         }
     }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn checkpoint_typed_relations_round_trip_without_promoting_related_context_hints() {
+    let fixture = Fixture::new();
+    let session = "checkpoint-relations";
+    let task = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            session,
+            TaskBoundary::New,
+            None,
+            "persist six typed Context Relations",
+        ),
+    )
+    .unwrap();
+    let relation_kinds = [
+        ContextRelationKind::DependsOn,
+        ContextRelationKind::Constrains,
+        ContextRelationKind::Implements,
+        ContextRelationKind::ValidatedBy,
+        ContextRelationKind::Contradicts,
+        ContextRelationKind::RelatedTo,
+    ];
+    let relations = relation_kinds
+        .into_iter()
+        .map(|kind| ContextRelation {
+            target_context_id: fixture.context_id,
+            kind,
+            rationale: format!("The Agent explicitly selected the {kind:?} relation"),
+            supports: vec![format!("Direct validation supports {kind:?}")],
+        })
+        .collect::<Vec<_>>();
+    let claim = |relations: Vec<ContextRelation>, related_contexts: Vec<ContextRevisionRef>| {
+        TaskCheckpointClaimInput {
+            context_kind_hint: Some(ContextKind::Validation),
+            topic_key_hint: Some("relations/typed-checkpoint".to_owned()),
+            statement: "Typed Checkpoint relations survive Candidate confirmation".to_owned(),
+            rationale: "Only explicit typed relations become durable knowledge edges".to_owned(),
+            applicability: Applicability::default(),
+            assumptions: Vec::new(),
+            recheck_when: vec!["the relation contract changes".to_owned()],
+            evidence: vec![TaskCheckpointEvidenceInput::InlineValidation {
+                evidence: EvidenceSnapshotDraft {
+                    kind: EvidenceType::ExperimentRecord,
+                    supports: "The typed relation round trip completed".to_owned(),
+                    content: json!({"actual": "passed", "relation_count": relations.len()}),
+                    interpretation: "The Candidate has self-contained validation".to_owned(),
+                    limitations: Vec::new(),
+                },
+            }],
+            artifact_refs: Vec::new(),
+            relations,
+            related_contexts,
+        }
+    };
+
+    let missing_target = ContextRelation {
+        target_context_id: ContextId::new(),
+        kind: ContextRelationKind::RelatedTo,
+        rationale: "Missing targets must fail before Episode state".to_owned(),
+        supports: vec!["The target is intentionally absent".to_owned()],
+    };
+    let invalid_target = task_checkpoint_at_root(
+        &fixture.root,
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: task.context.task_id.to_string(),
+            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+            expected_episode_version: 0,
+            boundary: TaskCheckpointBoundary::Close,
+            claims: vec![claim(vec![missing_target], Vec::new())],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(invalid_target.kind(), sctx_domain::ErrorKind::InvalidInput);
+    let empty_supports = task_checkpoint_at_root(
+        &fixture.root,
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: task.context.task_id.to_string(),
+            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+            expected_episode_version: 0,
+            boundary: TaskCheckpointBoundary::Close,
+            claims: vec![claim(
+                vec![ContextRelation {
+                    target_context_id: fixture.context_id,
+                    kind: ContextRelationKind::RelatedTo,
+                    rationale: "Empty supports are invalid".to_owned(),
+                    supports: Vec::new(),
+                }],
+                Vec::new(),
+            )],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(empty_supports.kind(), sctx_domain::ErrorKind::InvalidInput);
+
+    let closed = task_checkpoint_at_root(
+        &fixture.root,
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: task.context.task_id.to_string(),
+            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+            expected_episode_version: 0,
+            boundary: TaskCheckpointBoundary::Close,
+            claims: vec![claim(relations.clone(), Vec::new())],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap();
+    let candidate_id = closed.candidate_build.unwrap().items[0]
+        .candidate_id
+        .unwrap();
+    let review = candidate_get_at_root(
+        &fixture.root,
+        &CandidateGetInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            candidate_id: candidate_id.to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(review.content.relations, relations);
+    let confirm = CandidateConfirmInput {
+        agent_kind: "codex".to_owned(),
+        external_session_id: session.to_owned(),
+        expected_task_id: task.context.task_id.to_string(),
+        expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+        candidate_id: candidate_id.to_string(),
+        expected_review_version: 1,
+        primary: CandidateConfirmPrimaryInput::Existing(ExistingCandidatePrimaryInput {
+            existing_space_id: fixture.space_id.to_string(),
+        }),
+        related_space_ids: Vec::new(),
+        edits: OptionalCandidateEdits::default(),
+    };
+    let before_invalid_confirm = event_count(fixture.store.repository());
+    let mut invalid_confirm = confirm.clone();
+    invalid_confirm.edits.relations = Some(vec![ContextRelation {
+        target_context_id: ContextId::new(),
+        kind: ContextRelationKind::RelatedTo,
+        rationale: "Confirmation edits must not introduce a missing target".to_owned(),
+        supports: vec!["The target is intentionally absent".to_owned()],
+    }]);
+    assert_eq!(
+        candidate_confirm_at_root(&fixture.root, &invalid_confirm)
+            .unwrap_err()
+            .kind(),
+        sctx_domain::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        event_count(fixture.store.repository()),
+        before_invalid_confirm
+    );
+    let confirmed = candidate_confirm_at_root(&fixture.root, &confirm).unwrap();
+    let snapshot = ProjectionIndex::for_store(&fixture.store)
+        .domain_snapshot()
+        .unwrap();
+    let persisted = &snapshot.projection.spaces[&fixture.space_id].contexts[&confirmed.context_id]
+        .revisions[&confirmed.revision_id]
+        .revision;
+    assert_eq!(persisted.relations, relations);
+
+    let hint_session = "checkpoint-related-context-hint";
+    let hint_task = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            hint_session,
+            TaskBoundary::New,
+            None,
+            "keep related Contexts analysis-only",
+        ),
+    )
+    .unwrap();
+    let hinted = task_checkpoint_at_root(
+        &fixture.root,
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: hint_session.to_owned(),
+            expected_task_id: hint_task.context.task_id.to_string(),
+            expected_intent_revision_id: hint_task.context.intent_revision_id.to_string(),
+            expected_episode_version: 0,
+            boundary: TaskCheckpointBoundary::Close,
+            claims: vec![claim(
+                Vec::new(),
+                vec![ContextRevisionRef {
+                    context_id: fixture.context_id,
+                    revision_id: fixture.revision_id,
+                }],
+            )],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap();
+    let hinted_id = hinted.candidate_build.unwrap().items[0]
+        .candidate_id
+        .unwrap();
+    let hinted_review = candidate_get_at_root(
+        &fixture.root,
+        &CandidateGetInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: hint_session.to_owned(),
+            candidate_id: hinted_id.to_string(),
+        },
+    )
+    .unwrap();
+    assert!(hinted_review.content.relations.is_empty());
+    assert!(hinted_review.analysis.assessments.iter().any(|assessment| {
+        assessment.paths.iter().any(|path| {
+            matches!(
+                path,
+                sctx_domain::CandidateAssessmentPath::ExplicitRelatedContext
+            )
+        })
+    }));
 }
 
 #[test]
@@ -2675,6 +2908,7 @@ fn candidate_builder_emits_zero_git_events_for_unknown_only_or_insufficient_evid
                     signal_id: signal.to_string(),
                 }],
                 artifact_refs: Vec::new(),
+                relations: Vec::new(),
                 related_contexts: Vec::new(),
             }],
             unknowns: Vec::new(),
@@ -2877,6 +3111,7 @@ fn distinct_claims_with_identical_drafts_keep_distinct_stable_submissions() {
         evidence_refs: Vec::new(),
         inline_validations: vec![evidence],
         artifact_refs: Vec::new(),
+        relations: Vec::new(),
         related_contexts: Vec::new(),
     };
     let revision_id = task.current_intent_revision().unwrap().revision_id;
@@ -3087,6 +3322,39 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
                 .unwrap()
                 .iter()
                 .any(|field| field == "context_kind_hint" || field == "topic_key_hint")
+        );
+        let expected_relation_kinds = json!([
+            "depends_on",
+            "constrains",
+            "implements",
+            "validated_by",
+            "contradicts",
+            "related_to"
+        ]);
+        assert_eq!(
+            checkpoint_claim["properties"]["relations"]["items"]["properties"]["kind"]["enum"],
+            expected_relation_kinds
+        );
+        assert!(
+            !checkpoint_claim["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "relations")
+        );
+        let confirm_schema = &tools
+            .iter()
+            .find(|tool| tool["name"] == "candidate_confirm")
+            .unwrap()["inputSchema"];
+        assert_eq!(
+            confirm_schema["properties"]["edits"]["properties"]["relations"]["items"]["properties"]
+                ["kind"]["enum"],
+            expected_relation_kinds
+        );
+        assert!(
+            !serde_json::to_string(confirm_schema)
+                .unwrap()
+                .contains("supersedes")
         );
         assert_eq!(
             checkpoint_schema["anyOf"][2],

@@ -1837,6 +1837,7 @@ fn twenty_cli_processes_confirm_one_review_in_one_atomic_commit() {
                     },
                 }],
                 artifact_refs: Vec::new(),
+                relations: Vec::new(),
                 related_contexts: Vec::new(),
             }],
             unknowns: Vec::new(),
@@ -2465,6 +2466,114 @@ fn post_tool_hook_captures_a_bounded_breadcrumb_not_raw_payload() {
     assert!(stored.contains("tool Shell succeeded"));
     assert!(!stored.contains("RAW_COMMAND_MUST_NOT_BE_CAPTURED"));
     assert!(!stored.contains("RAW_OUTPUT_MUST_NOT_BE_CAPTURED"));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn context_json_input_preserves_typed_relations() {
+    let harness = Harness::new();
+    let (space_id, _) = create_space(&harness, "CLI typed relations");
+    let (target_context_id, _) = seed_context(&harness, &space_id, "relation target");
+    let (source_context_id, source_revision_id) =
+        seed_context(&harness, &space_id, "relation source");
+    let input = harness.home.join("context-relations.json");
+    fs::write(
+        &input,
+        serde_json::to_vec(&serde_json::json!({
+            "kind": "decision",
+            "topic_key": "cli/typed-relation",
+            "statement": "The CLI JSON input preserves typed relations",
+            "rationale": "Manual revision input uses the same domain enum",
+            "applicability": {"domains": ["cli"], "platforms": [], "conditions": []},
+            "assumptions": [],
+            "recheck_when": ["the CLI input contract changes"],
+            "relations": [{
+                "target_context_id": target_context_id,
+                "kind": "implements",
+                "rationale": "The source implements the target decision",
+                "supports": ["Direct CLI fixture validation"]
+            }],
+            "evidence": [{
+                "kind": "experiment_record",
+                "supports": "The CLI accepted the typed relation",
+                "content": {"actual": "passed"},
+                "interpretation": "The relation reached the immutable revision",
+                "limitations": []
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let revised = harness.success(&[
+        "context",
+        "revise",
+        "--space-id",
+        &space_id,
+        "--context-id",
+        &source_context_id,
+        "--parent-revision-id",
+        &source_revision_id,
+        "--input",
+        input.to_str().unwrap(),
+    ]);
+    let revision_id = text(&revised, "revision_id");
+    let stored = harness.success(&[
+        "context",
+        "get",
+        "--space-id",
+        &space_id,
+        "--context-id",
+        &source_context_id,
+        "--revision-id",
+        revision_id,
+    ]);
+    assert_eq!(
+        stored["data"]["revision"]["relations"],
+        serde_json::json!([{
+            "target_context_id": target_context_id,
+            "kind": "implements",
+            "rationale": "The source implements the target decision",
+            "supports": ["Direct CLI fixture validation"]
+        }])
+    );
+    let before_self_edge = harness.event_count();
+    fs::write(
+        &input,
+        serde_json::to_vec(&serde_json::json!({
+            "kind": "decision",
+            "statement": "Self edges must not enter the journal",
+            "rationale": "The source and target Context are identical",
+            "relations": [{
+                "target_context_id": source_context_id,
+                "kind": "related_to",
+                "rationale": "This edge is intentionally invalid",
+                "supports": ["Negative CLI fixture"]
+            }],
+            "evidence": [{
+                "kind": "experiment_record",
+                "supports": "The negative fixture is explicit",
+                "content": {"actual": "rejected"},
+                "interpretation": "No invalid relation should be appended",
+                "limitations": []
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let rejected = harness.failure(&[
+        "context",
+        "revise",
+        "--space-id",
+        &space_id,
+        "--context-id",
+        &source_context_id,
+        "--parent-revision-id",
+        revision_id,
+        "--input",
+        input.to_str().unwrap(),
+    ]);
+    assert_eq!(rejected["error"]["code"], "invalid_input");
+    assert_eq!(harness.event_count(), before_self_edge);
 }
 
 #[test]

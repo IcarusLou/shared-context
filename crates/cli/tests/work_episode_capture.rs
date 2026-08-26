@@ -481,6 +481,7 @@ fn hook_capture_keeps_locator_then_explicit_claim_and_ingestion_are_verifiable()
                     observation_id: sibling_ingested.observation_id.to_string(),
                 }],
                 artifact_refs: Vec::new(),
+                relations: Vec::new(),
                 related_contexts: Vec::new(),
             }],
             unknowns: Vec::new(),

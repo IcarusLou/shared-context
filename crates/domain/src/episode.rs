@@ -586,6 +586,8 @@ pub struct CheckpointClaim {
     pub recheck_when: Vec<String>,
     pub evidence_refs: Vec<CaptureEvidenceRef>,
     pub artifact_refs: Vec<ArtifactRef>,
+    #[serde(default)]
+    pub relations: Vec<crate::ContextRelation>,
     pub related_contexts: Vec<ContextRevisionRef>,
 }
 
@@ -606,6 +608,7 @@ impl CheckpointClaim {
         recheck_when: Vec<String>,
         evidence_refs: Vec<CaptureEvidenceRef>,
         artifact_refs: Vec<ArtifactRef>,
+        relations: Vec<crate::ContextRelation>,
         related_contexts: Vec<ContextRevisionRef>,
     ) -> Result<Self> {
         let claim = Self {
@@ -619,6 +622,7 @@ impl CheckpointClaim {
             recheck_when,
             evidence_refs,
             artifact_refs,
+            relations,
             related_contexts,
         };
         claim.validate("checkpoint_claim")?;
@@ -643,6 +647,17 @@ impl CheckpointClaim {
         for artifact in &self.artifact_refs {
             artifact.validate()?;
         }
+        for relation in &self.relations {
+            relation.validate()?;
+        }
+        require_unique(
+            &self
+                .relations
+                .iter()
+                .map(|relation| (relation.target_context_id, relation.kind))
+                .collect::<Vec<_>>(),
+            &format!("{field}.relations target/kind"),
+        )?;
         require_unique(&self.related_contexts, &format!("{field}.related_contexts"))
     }
 }
@@ -1952,6 +1967,7 @@ mod tests {
             vec![CaptureEvidenceRef::Observation { observation_id }],
             vec![artifact("src/search.ts")],
             Vec::new(),
+            Vec::new(),
         )
         .unwrap();
         let checkpoint =
@@ -2222,6 +2238,7 @@ mod tests {
                 "Claim without Evidence",
                 "Cannot be grounded",
                 Applicability::default(),
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
