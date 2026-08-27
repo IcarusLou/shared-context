@@ -3,10 +3,12 @@ use sctx_adapter_codex::{
     encode_hook_output,
 };
 use sctx_agent_adapter::{
-    CapabilityMode, EpisodeFinalizationTrigger, ResolvedActivationDecision,
-    SHARED_CONTEXT_ACTIVATION_MARKER, TaskRuntimeOperation, plan_action_for_activation,
+    CapabilityMode, EpisodeFinalizationTrigger, PathHint, ResolvedActivationDecision,
+    SHARED_CONTEXT_ACTIVATION_MARKER, TaskRuntimeOperation, ToolCategory,
+    plan_action_for_activation,
 };
 use serde_json::Value;
+use std::path::PathBuf;
 
 fn fixtures() -> Vec<Value> {
     serde_json::from_str(include_str!("../../../fixtures/agents/codex-0.147.json")).unwrap()
@@ -32,6 +34,26 @@ fn documented_codex_0_147_shapes_map_to_all_canonical_events() {
             CanonicalAgentEventKind::TurnStop,
             CanonicalAgentEventKind::SessionEnd,
         ]
+    );
+}
+
+#[test]
+fn codex_structured_tool_payload_emits_a_typed_file_operation() {
+    let event = decode_hook_input(&serde_json::to_vec(&fixtures().remove(2)).unwrap()).unwrap();
+    let sctx_adapter_codex::CanonicalAgentEvent::PostToolUse {
+        tool_category,
+        path_hints,
+        ..
+    } = event
+    else {
+        panic!("fixture must decode as PostToolUse");
+    };
+    assert_eq!(tool_category, ToolCategory::FileOperation);
+    assert_eq!(
+        path_hints,
+        vec![PathHint::File(PathBuf::from(
+            "/workspace/shared context/src/lib.rs"
+        ))]
     );
 }
 

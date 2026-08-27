@@ -678,13 +678,13 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
     approve_publish(
         &harness,
         &alpha_space_id,
-        "alphaquartz src/alpha_feature.rs AlphaContractTest succeeded",
+        "alphaquartz src/alpha_feature.rs test runner succeeded",
     );
     let (beta_space_id, _) = create_space(&harness, "betacobalt");
     approve_publish(
         &harness,
         &beta_space_id,
-        "betacobalt src/beta_feature.rs BetaContractTest succeeded",
+        "betacobalt src/beta_feature.rs test runner succeeded",
     );
 
     let workspace = harness.home.join("repo-9x7");
@@ -833,19 +833,9 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
     )
     .unwrap();
 
-    for (session_id, tool_name, file, raw_marker) in [
-        (
-            "session-alpha",
-            "AlphaContractTest",
-            &alpha_file,
-            "RAW_ALPHA_MUST_NOT_PERSIST",
-        ),
-        (
-            "session-beta",
-            "BetaContractTest",
-            &beta_file,
-            "RAW_BETA_MUST_NOT_PERSIST",
-        ),
+    for (session_id, file, raw_marker) in [
+        ("session-alpha", &alpha_file, "RAW_ALPHA_MUST_NOT_PERSIST"),
+        ("session-beta", &beta_file, "RAW_BETA_MUST_NOT_PERSIST"),
     ] {
         let response = hook(&serde_json::json!({
             "session_id": session_id,
@@ -855,11 +845,13 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
             "model": "gpt-5.6-sol",
             "permission_mode": "default",
             "turn_id": format!("turn-{session_id}"),
-            "tool_name": tool_name,
+            "tool_name": "Shell",
             "tool_use_id": format!("tool-{session_id}"),
             "tool_input": {
-                "file_path": file,
-                "command": raw_marker
+                "working_directory": workspace,
+                "command": "cargo test",
+                "ignored_file_path": file,
+                "raw_marker": raw_marker
             },
             "tool_response": {"output": raw_marker}
         }));
@@ -972,12 +964,9 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         registered.identity.repository_id
     );
     assert_eq!(after_subdirectory.locators.len(), 1);
-    for (snapshot, own_test) in [
-        (&alpha_snapshot, "AlphaContractTest succeeded"),
-        (&beta_snapshot, "BetaContractTest succeeded"),
-    ] {
+    for snapshot in [&alpha_snapshot, &beta_snapshot] {
         assert!(snapshot.task_signals.iter().any(|signal| {
-            signal.kind == TaskSignalKind::TestOutcome && signal.content == own_test
+            signal.kind == TaskSignalKind::TestOutcome && signal.content == "test runner succeeded"
         }));
         assert!(!snapshot.task_signals.iter().any(|signal| {
             signal.content.contains("outside.rs") || signal.content.contains("missing.rs")
@@ -2466,7 +2455,8 @@ fn post_tool_hook_captures_a_bounded_breadcrumb_not_raw_payload() {
         .unwrap();
     assert_eq!(captures.len(), 1);
     let stored = fs::read_to_string(captures[0].path()).unwrap();
-    assert!(stored.contains("tool Shell succeeded"));
+    assert!(stored.contains("shell succeeded"));
+    assert!(!stored.contains("Shell"));
     assert!(!stored.contains("RAW_COMMAND_MUST_NOT_BE_CAPTURED"));
     assert!(!stored.contains("RAW_OUTPUT_MUST_NOT_BE_CAPTURED"));
 }

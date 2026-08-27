@@ -11,7 +11,7 @@ pub use sctx_agent_adapter::{
 };
 use sctx_agent_adapter::{
     AgentEventContext, AgentKind, ToolOutcome, TrustState, evaluate_capabilities,
-    path_hints_from_tool_input,
+    normalize_tool_use,
 };
 pub use sctx_domain::{Error, ErrorKind, Result};
 use serde::Deserialize;
@@ -212,11 +212,12 @@ pub fn decode_hook_input(bytes: &[u8]) -> Result<(CanonicalAgentEvent, String)> 
             require_nonempty("tool_name", &input.tool_name)?;
             require_nonempty("tool_use_id", &input.tool_use_id)?;
             require_nonempty("cwd", &input.cwd)?;
+            let normalized = normalize_tool_use(&input.tool_name, &input.tool_input);
             CanonicalAgentEvent::PostToolUse {
                 context: input.common.context(None, Some(&input.cwd)),
-                tool_name: input.tool_name,
+                tool_category: normalized.category,
                 tool_use_id: input.tool_use_id,
-                path_hints: path_hints_from_tool_input(&input.tool_input),
+                path_hints: normalized.path_hints,
                 outcome: ToolOutcome::Succeeded,
             }
         }

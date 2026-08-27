@@ -779,10 +779,7 @@ fn run_enabled_chain(
         focus["resolved_focus"]["repository_id"],
         target_repository_id.to_string()
     );
-    let tool = match profile {
-        AgentProfile::Codex => "DirectCrossRepositoryTest",
-        AgentProfile::Cursor => "GroupCrossRepositoryTest",
-    };
+    let tool = "test";
     let raw_marker = format!("RAW_{}_TOOL_OUTPUT", profile.agent().to_uppercase());
     assert_eq!(
         fixture.hook(

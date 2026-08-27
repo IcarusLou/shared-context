@@ -40,6 +40,10 @@ _Avoid_: TaskSessionId, knowledge identifier
 A non-factual, non-locating work clue such as a Prompt, Workspace, Diff, or TestOutcome. It may influence a WorkingIntentSnapshot or retrieval, but it is not engineering Evidence, Artifact identity, or a declaration of Space membership.
 _Avoid_: Evidence, Space binding, routing key
 
+**ToolCategory**:
+A vendor-neutral structural class emitted by an Agent adapter for one completed tool call: FileOperation, TestRunner, Shell, SharedContext, or Other. Shell classification may recognize only bounded simple test-runner commands; normalized Runtime and Capture meaning retain neither command text nor vendor tool names, and SharedContext calls are excluded from capture.
+_Avoid_: substring guess, raw command, vendor tool log, tool-output classification
+
 **ArtifactFocusQuery**:
 A one-request question asking for historical Context around one Artifact. It is transient retrieval input, not Task state, Evidence, or an engineering fact.
 _Avoid_: Active Focus, Focus Signal, saved Focus

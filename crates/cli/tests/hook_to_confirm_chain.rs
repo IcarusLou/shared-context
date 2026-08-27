@@ -294,6 +294,11 @@ fn post_tool_payload(
     tool: &str,
     raw_marker: &str,
 ) -> Value {
+    let command = if tool == "Shell" {
+        "cargo test"
+    } else {
+        raw_marker
+    };
     json!({
         "session_id": oracle.session,
         "transcript_path": format!("/tmp/{raw_marker}.jsonl"),
@@ -304,7 +309,12 @@ fn post_tool_payload(
         "turn_id": format!("turn-{}", oracle.session),
         "tool_name": tool,
         "tool_use_id": format!("tool-{tool}"),
-        "tool_input": {"file_path": file, "command": raw_marker},
+        "tool_input": {
+            "file_path": file,
+            "working_directory": workspace,
+            "command": command,
+            "raw_marker": raw_marker
+        },
         "tool_response": {"output": raw_marker}
     })
 }
@@ -526,7 +536,7 @@ fn one_real_hook_to_confirm_identity_chain() {
         .into_iter()
         .find(|record| record.signal.kind == TaskSignalKind::TestOutcome)
         .unwrap();
-    assert!(test_signal.signal.content.contains(&oracle.test_tool));
+    assert_eq!(test_signal.signal.content, "test runner succeeded");
     let signal_id = test_signal.signal_id;
     let captures = CaptureStore::initialize(&root).unwrap().list(256).unwrap();
     let owned_captures = captures
@@ -543,7 +553,7 @@ fn one_real_hook_to_confirm_identity_chain() {
     assert!(
         owned_captures
             .iter()
-            .any(|capture| capture.record.summary.contains(&oracle.test_tool))
+            .any(|capture| capture.record.summary == "test runner succeeded")
     );
     assert!(owned_captures.iter().any(|capture| {
         capture

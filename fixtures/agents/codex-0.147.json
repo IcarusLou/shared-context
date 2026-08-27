@@ -28,7 +28,7 @@
     "turn_id": "turn_01",
     "tool_name": "apply_patch",
     "tool_use_id": "call_01",
-    "tool_input": {"command":"*** Begin Patch","file_path":"/workspace/shared context/src/lib.rs"},
+    "tool_input": {"command":"*** Begin Patch","absolute_file_path":"/workspace/shared context/src/lib.rs"},
     "tool_response": {"output":"Done!"}
   },
   {

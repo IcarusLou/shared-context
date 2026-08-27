@@ -837,9 +837,13 @@ fn post_tool_file_is_breadcrumb_only_and_test_outcome_refreshes_active_task() {
         "model": "gpt-5.6-sol",
         "permission_mode": "default",
         "turn_id": "m2-turn",
-        "tool_name": "LegacyCompatibilityTest",
+        "tool_name": "Shell",
         "tool_use_id": "m2-tool",
-        "tool_input": {"file_path": fixture.workspace.join("src/search_results_page.tsx")},
+        "tool_input": {
+            "command": "cargo test",
+            "working_directory": fixture.workspace,
+            "ignored_file_path": fixture.workspace.join("src/search_results_page.tsx")
+        },
         "tool_response": {"output": "passed"}
     }));
     assert_eq!(post_tool, serde_json::json!({}));
@@ -884,7 +888,6 @@ fn post_tool_file_is_breadcrumb_only_and_test_outcome_refreshes_active_task() {
             .any(|signal| signal.content == "src/search_results_page.tsx")
     );
     assert!(snapshot.task_signals.iter().any(|signal| {
-        signal.kind == TaskSignalKind::TestOutcome
-            && signal.content == "LegacyCompatibilityTest succeeded"
+        signal.kind == TaskSignalKind::TestOutcome && signal.content == "test runner succeeded"
     }));
 }

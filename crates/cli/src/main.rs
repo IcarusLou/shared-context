@@ -20,7 +20,8 @@ use args::Options;
 use sctx_agent_adapter::{
     AgentCapabilities, CanonicalAgentAction, CanonicalAgentEvent, CanonicalAgentEventKind,
     CanonicalBreadcrumbKind, EpisodeFinalizationTrigger, PathHint, ResolvedActivationDecision,
-    ResolvedAgentAction, TaskRuntimeOperation, ToolOutcome, TrustState, plan_action_for_activation,
+    ResolvedAgentAction, TaskRuntimeOperation, ToolCategory, ToolOutcome, TrustState,
+    plan_action_for_activation,
 };
 use sctx_domain::{
     Applicability, CandidateReviewStatus, ConflictParticipant, ConflictResolutionDraft,
@@ -1297,7 +1298,7 @@ fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<ResolvedTas
             cwd,
             workspace_roots,
             file_hints,
-            tool_name,
+            tool_category,
             outcome,
         } => {
             let root = installation_root()?;
@@ -1320,7 +1321,7 @@ fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<ResolvedTas
                 &cwd,
                 &workspace_roots,
                 &file_hints,
-                &tool_name,
+                tool_category,
                 outcome,
             );
             if !signals.is_empty() {
@@ -1461,14 +1462,13 @@ fn normalized_observation_signals(
     _cwd: &Path,
     _workspace_roots: &[PathBuf],
     _file_hints: &[PathBuf],
-    tool_name: &str,
+    tool_category: ToolCategory,
     outcome: ToolOutcome,
 ) -> Vec<TaskSignal> {
     let mut signals = Vec::new();
-    if is_test_tool(tool_name) {
+    if tool_category == ToolCategory::TestRunner {
         let test_outcome = format!(
-            "{} {}",
-            tool_name.trim(),
+            "test runner {}",
             match outcome {
                 ToolOutcome::Succeeded => "succeeded",
                 ToolOutcome::Failed => "failed",
@@ -1477,13 +1477,6 @@ fn normalized_observation_signals(
         push_signal(&mut signals, TaskSignalKind::TestOutcome, &test_outcome);
     }
     signals
-}
-
-fn is_test_tool(tool_name: &str) -> bool {
-    let name = tool_name.trim().to_ascii_lowercase();
-    ["test", "check", "lint"]
-        .iter()
-        .any(|word| name.contains(word))
 }
 
 fn push_signal(signals: &mut Vec<TaskSignal>, kind: TaskSignalKind, content: &str) {

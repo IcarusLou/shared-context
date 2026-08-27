@@ -422,8 +422,10 @@ fn direct_scope_records_another_registered_repository_with_its_real_identity() {
         expected.repository_id
     );
     let signals = runtime.read_signal_history(task.task_session_id).unwrap();
-    assert_eq!(signals.len(), 1);
-    assert_eq!(signals[0].signal.content, "CrossRepositoryTest succeeded");
+    assert!(
+        signals.is_empty(),
+        "arbitrary tool names must not be inferred as test runners"
+    );
     assert_eq!(
         fs::read(fixture.root().join("config.toml")).unwrap(),
         catalog_before,
@@ -587,12 +589,10 @@ fn safe_unregistered_mixed_and_unrepresentable_multi_repo_events_are_non_locatin
         capture.record.workspace_hint.is_none() && capture.record.file_hints.is_empty()
     }));
     let signals = runtime.read_signal_history(task.task_session_id).unwrap();
-    assert_eq!(signals.len(), 5);
-    assert!(signals.iter().all(|signal| {
-        signal.signal.content.ends_with(" succeeded")
-            && !signal.signal.content.contains('/')
-            && !signal.signal.content.contains("RAW_")
-    }));
+    assert!(
+        signals.is_empty(),
+        "arbitrary tool names must remain non-factual breadcrumbs"
+    );
     let capture_records = captures
         .into_iter()
         .map(|capture| capture.record)
@@ -725,12 +725,12 @@ fn real_cursor_payload_uses_the_same_registered_and_non_locating_contract() {
     assert!(captures.iter().any(|capture| {
         capture.record.workspace_hint.is_none() && capture.record.file_hints.is_empty()
     }));
-    assert_eq!(
+    assert!(
         runtime
             .read_signal_history(task.task_session_id)
             .unwrap()
-            .len(),
-        2
+            .is_empty(),
+        "Cursor tool names must not be classified by substring"
     );
     let capture_records = captures
         .into_iter()

@@ -3,10 +3,12 @@ use sctx_adapter_cursor::{
     encode_hook_output,
 };
 use sctx_agent_adapter::{
-    CapabilityMode, EpisodeFinalizationTrigger, ResolvedActivationDecision,
-    SHARED_CONTEXT_ACTIVATION_MARKER, TaskRuntimeOperation, plan_action_for_activation,
+    CapabilityMode, EpisodeFinalizationTrigger, PathHint, ResolvedActivationDecision,
+    SHARED_CONTEXT_ACTIVATION_MARKER, TaskRuntimeOperation, ToolCategory,
+    plan_action_for_activation,
 };
 use serde_json::Value;
+use std::path::PathBuf;
 
 fn fixtures() -> Vec<Value> {
     serde_json::from_str(include_str!("../../../fixtures/agents/cursor-3.13.json")).unwrap()
@@ -33,6 +35,27 @@ fn documented_cursor_3_13_shapes_map_to_all_canonical_events() {
             CanonicalAgentEventKind::TurnStop,
             CanonicalAgentEventKind::SessionEnd,
         ]
+    );
+}
+
+#[test]
+fn cursor_shell_fixture_emits_a_strict_test_runner_with_only_its_working_directory() {
+    let (event, _) =
+        decode_hook_input(&serde_json::to_vec(&fixtures().remove(2)).unwrap()).unwrap();
+    let sctx_adapter_cursor::CanonicalAgentEvent::PostToolUse {
+        tool_category,
+        path_hints,
+        ..
+    } = event
+    else {
+        panic!("fixture must decode as PostToolUse");
+    };
+    assert_eq!(tool_category, ToolCategory::TestRunner);
+    assert_eq!(
+        path_hints,
+        vec![PathHint::WorkingDirectory(PathBuf::from(
+            "/workspace/shared context"
+        ))]
     );
 }
 

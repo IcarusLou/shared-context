@@ -597,7 +597,8 @@ fn documented_cursor_group_lifecycle_records_members_and_safe_non_locating_inves
                 capture.record.workspace_hint.is_none() && capture.record.file_hints.is_empty()
             })
             .count(),
-        2
+        3,
+        "Shell payload file fields are ignored; only its structured working directory may locate"
     );
     let captures = serde_json::to_string(
         &captures

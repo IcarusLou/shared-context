@@ -54,7 +54,7 @@ pub enum CanonicalAgentEvent {
     },
     PostToolUse {
         context: AgentEventContext,
-        tool_name: String,
+        tool_category: ToolCategory,
         tool_use_id: String,
         path_hints: Vec<PathHint>,
         /// Only a structured success/failure marker is retained. This is never raw tool output.
@@ -105,6 +105,40 @@ impl CanonicalAgentEvent {
 pub enum ToolOutcome {
     Succeeded,
     Failed,
+}
+
+/// Vendor-neutral meaning of one completed tool call.
+///
+/// The category is derived only from the structured tool name and, for a bounded set of shell
+/// tools, a strict test-runner command whitelist. Raw command text is never carried across the
+/// adapter seam.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCategory {
+    FileOperation,
+    TestRunner,
+    Shell,
+    SharedContext,
+    Other,
+}
+
+impl ToolCategory {
+    const fn breadcrumb_label(self) -> &'static str {
+        match self {
+            Self::FileOperation => "file operation",
+            Self::TestRunner => "test runner",
+            Self::Shell => "shell",
+            Self::SharedContext => "shared context",
+            Self::Other => "tool",
+        }
+    }
+}
+
+/// Safe, bounded translation of the structured portion of one vendor tool call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormalizedToolUse {
+    pub category: ToolCategory,
+    pub path_hints: Vec<PathHint>,
 }
 
 /// One bounded structured path field translated from a vendor tool input.
@@ -317,7 +351,7 @@ pub enum TaskRuntimeOperation {
         cwd: PathBuf,
         workspace_roots: Vec<PathBuf>,
         file_hints: Vec<PathBuf>,
-        tool_name: String,
+        tool_category: ToolCategory,
         outcome: ToolOutcome,
     },
     FinalizeCheckpointedEpisode {
@@ -407,11 +441,14 @@ fn plan_enabled_action(
         CanonicalAgentEvent::PromptSubmit { .. } => CanonicalAgentAction::neutral(),
         CanonicalAgentEvent::PostToolUse {
             context,
-            tool_name,
+            tool_category,
             outcome,
             path_hints,
             ..
         } => {
+            if *tool_category == ToolCategory::SharedContext {
+                return CanonicalAgentAction::neutral();
+            }
             let file_hints = path_hints
                 .iter()
                 .filter_map(|hint| match hint {
@@ -429,14 +466,15 @@ fn plan_enabled_action(
                     cwd: context.cwd.clone(),
                     workspace_roots: context.workspace_roots.clone(),
                     file_hints: file_hints.clone(),
-                    tool_name: tool_name.clone(),
+                    tool_category: *tool_category,
                     outcome: *outcome,
                 }),
                 breadcrumb: Some(CanonicalBreadcrumb {
                     external_session_locator: task_locator(capabilities.agent, context),
                     kind: CanonicalBreadcrumbKind::ToolOutcome,
                     summary: format!(
-                        "tool {tool_name} {}",
+                        "{} {}",
+                        tool_category.breadcrumb_label(),
                         match outcome {
                             ToolOutcome::Succeeded => "succeeded",
                             ToolOutcome::Failed => "failed",
@@ -619,6 +657,163 @@ pub fn render_untrusted_task_context_pack(pack: &TaskContextPack) -> Result<Stri
     ))
 }
 
+/// Normalize one vendor tool call without retaining its input or command text.
+///
+/// Shell tools are locating only through an explicit structured working directory. Their command
+/// may select [`ToolCategory::TestRunner`] only when it is one simple invocation from the bounded
+/// whitelist below. Shared Context's own tools are marked explicitly so policy can omit them from
+/// the capture loop.
+#[must_use]
+pub fn normalize_tool_use(tool_name: &str, input: &Value) -> NormalizedToolUse {
+    let normalized_name = tool_name.trim().to_ascii_lowercase();
+    if is_shared_context_tool(&normalized_name) {
+        return NormalizedToolUse {
+            category: ToolCategory::SharedContext,
+            path_hints: Vec::new(),
+        };
+    }
+    if is_shell_tool(&normalized_name) {
+        return NormalizedToolUse {
+            category: if input
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(is_strict_test_runner_command)
+            {
+                ToolCategory::TestRunner
+            } else {
+                ToolCategory::Shell
+            },
+            path_hints: working_directory_hints_from_tool_input(input),
+        };
+    }
+    NormalizedToolUse {
+        category: if is_file_operation_tool(&normalized_name) {
+            ToolCategory::FileOperation
+        } else if is_dedicated_test_tool(&normalized_name) {
+            ToolCategory::TestRunner
+        } else {
+            ToolCategory::Other
+        },
+        path_hints: path_hints_from_tool_input(input),
+    }
+}
+
+fn is_shell_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "bash"
+            | "shell"
+            | "exec_command"
+            | "run_shell_command"
+            | "run_terminal_cmd"
+            | "write_stdin"
+    )
+}
+
+fn is_file_operation_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "apply_patch"
+            | "delete"
+            | "delete_file"
+            | "edit"
+            | "edit_file"
+            | "multiedit"
+            | "read"
+            | "read_file"
+            | "str_replace"
+            | "view_image"
+            | "write"
+            | "write_file"
+    )
+}
+
+fn is_dedicated_test_tool(name: &str) -> bool {
+    matches!(name, "pytest" | "run_test" | "run_tests" | "test")
+}
+
+fn is_shared_context_tool(name: &str) -> bool {
+    const TOOL_NAMES: [&str; 17] = [
+        "association_explain",
+        "association_rebuild",
+        "candidate_confirm",
+        "candidate_discard",
+        "candidate_get",
+        "candidate_list",
+        "context_get",
+        "context_search",
+        "engineering_reference_record",
+        "repository_scan",
+        "space_list",
+        "task_artifact_focus",
+        "task_capture_list",
+        "task_checkpoint",
+        "task_context",
+        "task_intent_update",
+        "task_signal_supersede",
+    ];
+    let unqualified = name.strip_prefix("mcp:").unwrap_or(name);
+    TOOL_NAMES.contains(&unqualified)
+        || name.starts_with("mcp__shared-context__")
+        || name.starts_with("mcp__shared_context__")
+}
+
+fn is_strict_test_runner_command(command: &str) -> bool {
+    if command.is_empty()
+        || command.len() > 1_024
+        || command.bytes().any(|byte| {
+            matches!(
+                byte,
+                b'\n'
+                    | b'\r'
+                    | b'\0'
+                    | b'|'
+                    | b'&'
+                    | b';'
+                    | b'<'
+                    | b'>'
+                    | b'`'
+                    | b'$'
+                    | b'('
+                    | b')'
+                    | b'{'
+                    | b'}'
+                    | b'\''
+                    | b'"'
+            )
+        })
+    {
+        return false;
+    }
+    let tokens = command.split_ascii_whitespace().collect::<Vec<_>>();
+    matches!(
+        tokens.as_slice(),
+        [
+            "cargo"
+                | "npm"
+                | "pnpm"
+                | "yarn"
+                | "bun"
+                | "go"
+                | "dotnet"
+                | "swift"
+                | "mvn"
+                | "mvnw"
+                | "./mvnw"
+                | "gradle"
+                | "gradlew"
+                | "./gradlew"
+                | "bazel"
+                | "make",
+            "test",
+            ..
+        ] | ["cargo", "nextest", "run", ..]
+            | ["npm" | "pnpm" | "yarn" | "bun", "run", "test", ..]
+            | ["pytest", ..]
+            | ["python" | "python3", "-m", "pytest", ..]
+    )
+}
+
 /// Extract bounded structured file and working-directory hints without retaining tool input or
 /// command text.
 ///
@@ -626,15 +821,32 @@ pub fn render_untrusted_task_context_pack(pack: &TaskContextPack) -> Result<Stri
 /// [`PathHint::Ambiguous`] marker. Attribution must reject an event containing that marker.
 #[must_use]
 pub fn path_hints_from_tool_input(input: &Value) -> Vec<PathHint> {
-    const FILE_KEYS: [&str; 2] = ["file_path", "filepath"];
+    const FILE_KEYS: [&str; 3] = ["absolute_file_path", "file_path", "filepath"];
     const PATH_KEYS: [&str; 1] = ["path"];
-    const WORKING_DIRECTORY_KEYS: [&str; 2] = ["workdir", "working_directory"];
+    const WORKING_DIRECTORY_KEYS: [&str; 3] = ["cwd", "workdir", "working_directory"];
     let mut paths = Vec::new();
     collect_paths(
         input,
         &FILE_KEYS,
         &PATH_KEYS,
         &WORKING_DIRECTORY_KEYS,
+        &mut paths,
+    );
+    if paths.len() > 16 {
+        return vec![PathHint::Ambiguous];
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn working_directory_hints_from_tool_input(input: &Value) -> Vec<PathHint> {
+    let mut paths = Vec::new();
+    collect_paths(
+        input,
+        &[],
+        &[],
+        &["cwd", "workdir", "working_directory"],
         &mut paths,
     );
     if paths.len() > 16 {
@@ -708,7 +920,7 @@ mod tests {
     #[test]
     fn structured_path_hints_keep_kind_and_ambiguity_without_parsing_command_text() {
         let hints = path_hints_from_tool_input(&serde_json::json!({
-            "file_path": "/repo/src/lib.rs",
+            "absolute_file_path": "/repo/src/lib.rs",
             "nested": {"working_directory": "/repo"},
             "command": "cd /outside && read /outside/secret.rs"
         }));
@@ -737,6 +949,93 @@ mod tests {
         assert_eq!(
             path_hints_from_tool_input(&Value::Array(too_many)),
             vec![PathHint::Ambiguous]
+        );
+    }
+
+    #[test]
+    fn tool_use_normalization_is_typed_bounded_and_never_treats_compound_shell_as_tests() {
+        let file = normalize_tool_use(
+            "Read",
+            &serde_json::json!({"absolute_file_path": "/repo/src/lib.rs"}),
+        );
+        assert_eq!(file.category, ToolCategory::FileOperation);
+        assert_eq!(
+            file.path_hints,
+            vec![PathHint::File(PathBuf::from("/repo/src/lib.rs"))]
+        );
+
+        for command in [
+            "cargo test",
+            "npm test -- --runInBand",
+            "python3 -m pytest -q",
+        ] {
+            let shell = normalize_tool_use(
+                "Shell",
+                &serde_json::json!({
+                    "command": command,
+                    "working_directory": "/repo",
+                    "file_path": "/repo/ignored.rs"
+                }),
+            );
+            assert_eq!(shell.category, ToolCategory::TestRunner);
+            assert_eq!(
+                shell.path_hints,
+                vec![PathHint::WorkingDirectory(PathBuf::from("/repo"))]
+            );
+        }
+
+        for command in [
+            "cargo check",
+            "cargo test | tee results.txt",
+            "cargo test > results.txt",
+            "cargo test && echo done",
+            "run-contract-check",
+        ] {
+            assert_eq!(
+                normalize_tool_use("Bash", &serde_json::json!({"command": command})).category,
+                ToolCategory::Shell,
+                "{command:?} must not be inferred as a test runner"
+            );
+        }
+
+        for name in [
+            "task_checkpoint",
+            "MCP:task_intent_update",
+            "mcp__shared-context__context_search",
+        ] {
+            let tool = normalize_tool_use(
+                name,
+                &serde_json::json!({"absolute_file_path": "/repo/must-not-locate.rs"}),
+            );
+            assert_eq!(tool.category, ToolCategory::SharedContext);
+            assert!(tool.path_hints.is_empty());
+        }
+        assert_eq!(
+            normalize_tool_use("ContractCheck", &Value::Null).category,
+            ToolCategory::Other
+        );
+    }
+
+    #[test]
+    fn shared_context_tool_use_never_reenters_the_capture_plan() {
+        let event = CanonicalAgentEvent::PostToolUse {
+            context: AgentEventContext {
+                session_id: "session".to_owned(),
+                cwd: PathBuf::from("/repo"),
+                workspace_roots: vec![PathBuf::from("/repo")],
+            },
+            tool_category: ToolCategory::SharedContext,
+            tool_use_id: "tool-1".to_owned(),
+            path_hints: Vec::new(),
+            outcome: ToolOutcome::Succeeded,
+        };
+        assert_eq!(
+            plan_action_for_activation(
+                &event,
+                &verified_codex_capabilities(),
+                ResolvedActivationDecision::Direct,
+            ),
+            CanonicalAgentAction::neutral()
         );
     }
 
@@ -1011,7 +1310,7 @@ mod tests {
             },
             CanonicalAgentEvent::PostToolUse {
                 context: context.clone(),
-                tool_name: "ContractTest".to_owned(),
+                tool_category: ToolCategory::TestRunner,
                 tool_use_id: "tool-1".to_owned(),
                 path_hints: vec![PathHint::File(PathBuf::from("src/lib.rs"))],
                 outcome: ToolOutcome::Succeeded,

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -369,7 +370,12 @@ fn hook_capture_keeps_locator_then_explicit_claim_and_ingestion_are_verifiable()
     assert!(ingested.inserted);
     assert!(!runtime.ingest_capture(&input).unwrap().inserted);
 
-    let capture_count_before_sibling = store.list(32).unwrap().captures.len();
+    let captures_before_sibling = store.list(32).unwrap().captures;
+    let capture_ids_before_sibling = captures_before_sibling
+        .iter()
+        .map(|capture| capture.record.capture_id)
+        .collect::<BTreeSet<_>>();
+    let capture_count_before_sibling = captures_before_sibling.len();
     assert_eq!(
         harness.hook(&post_tool(
             "capture-owned",
@@ -388,7 +394,7 @@ fn hook_capture_keeps_locator_then_explicit_claim_and_ingestion_are_verifiable()
     );
     let sibling_capture = captures_after_sibling
         .iter()
-        .find(|capture| capture.record.summary.contains("SiblingInspect"))
+        .find(|capture| !capture_ids_before_sibling.contains(&capture.record.capture_id))
         .unwrap();
     assert_eq!(sibling_capture.record.task_owner, Some(task_owner));
     assert!(sibling_capture.record.workspace_hint.is_none());
