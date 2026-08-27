@@ -301,6 +301,8 @@ Shared Context 把数据分成两类：
 
 Workspace 路径不会自动绑定一个 Space，文本 Hint 也不会冒充已验证工程证据。
 
+自动任务检索还会过滤 stopword、过短词、通用工程词和大语料中的高频词。剩余文本至少满足“完整短语、高覆盖率、两个独立文本通道、Context 文本加精确适用范围”之一，或拥有精确 Graph/ContextRelation 路径，才会进入自动 Context Pack；同一 Space 中的弱文本命中不会把无关 Context 一起带入。显式搜索/Explicit 模式不受这个自动门槛限制，仍可用于排查。
+
 ### 4.5 隐私和信任边界
 
 - SessionStart 在模型推理前用本机 Repository Catalog 判定范围，不读取 Prompt，也不调用模型。已登记 checkout 是 `Direct`；只有显式登记且精确匹配的 Group root 才是 `Group`；普通父目录、未登记 sibling 和其他目录都是 `Disabled`。

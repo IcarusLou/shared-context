@@ -156,6 +156,10 @@ _Avoid_: Space-scoped search result, manually routed Context Pack
 A typed explanation of how Working Intent text, ContextSpaceAssociation role, or this request’s ResolvedFocus made one Context relevant. A Primary/Related Space path remains distinct from ContextRelation and Engineering Graph paths; only an exact ResolvedFocus reachable in that Graph Snapshot can claim an engineering edge.
 _Avoid_: opaque relevance score, inferred code relation
 
+**AutomaticTextEligibility**:
+The request-local safety decision that lets text retrieval enter an automatic TaskContextPack only with a strong phrase, sufficient query coverage, independent corroborating channels, Context text plus exact scope, or an exact Graph/ContextRelation path. Explicit exploration remains available, while weak Space text cannot make unrelated sibling Context automatically eligible.
+_Avoid_: any BM25 hit, Space-wide Context inheritance, explicit-search filter
+
 **EngineeringGraphSnapshot**:
 An explicitly built, sparse historical knowledge view rooted at EngineeringReferences and their bounded ContextRelation closure. Its Context revisions and safety decisions remain immutable until another explicit Graph build, independently of later Context Store appends.
 _Avoid_: current Context view, automatic index refresh

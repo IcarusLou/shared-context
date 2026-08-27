@@ -1054,6 +1054,151 @@ fn association_query_phrases(
     normalized_phrases(texts)
 }
 
+const MAX_AUTOMATIC_QUERY_TOKENS: usize = 64;
+const AUTOMATIC_TEXT_COVERAGE_THRESHOLD_BASIS_POINTS: u16 = 6_000;
+const AUTOMATIC_HIGH_DF_MIN_DOCUMENTS: usize = 20;
+const AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS: usize = 3_000;
+
+fn automatic_eligible_query_tokens(
+    connection: &Connection,
+    tokens: &[String],
+    mode: ContextPackMode,
+) -> Result<Vec<String>> {
+    if mode == ContextPackMode::Explicit {
+        return Ok(tokens.to_vec());
+    }
+    let mut filtered = tokens
+        .iter()
+        .filter(|token| !automatic_generic_token(token))
+        .cloned()
+        .collect::<Vec<_>>();
+    filtered.sort_by(|left, right| {
+        right
+            .chars()
+            .count()
+            .cmp(&left.chars().count())
+            .then_with(|| left.cmp(right))
+    });
+    filtered.truncate(MAX_AUTOMATIC_QUERY_TOKENS);
+    filtered.sort();
+    let document_count = automatic_text_document_count(connection)?;
+    if document_count < AUTOMATIC_HIGH_DF_MIN_DOCUMENTS {
+        return Ok(filtered);
+    }
+    let mut eligible = Vec::new();
+    for token in filtered {
+        let frequency = automatic_token_document_frequency(connection, &token)?;
+        if frequency.saturating_mul(BASIS_POINTS_SCALE)
+            < document_count.saturating_mul(AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS)
+        {
+            eligible.push(token);
+        }
+    }
+    Ok(eligible)
+}
+
+fn automatic_generic_token(token: &str) -> bool {
+    let short = if token.is_ascii() {
+        token.len() < 3
+    } else {
+        token.chars().count() < 2
+    };
+    short
+        || matches!(
+            token,
+            "a" | "an"
+                | "and"
+                | "are"
+                | "as"
+                | "at"
+                | "be"
+                | "by"
+                | "code"
+                | "context"
+                | "data"
+                | "file"
+                | "for"
+                | "from"
+                | "in"
+                | "is"
+                | "it"
+                | "of"
+                | "on"
+                | "or"
+                | "system"
+                | "task"
+                | "test"
+                | "that"
+                | "the"
+                | "this"
+                | "to"
+                | "update"
+                | "with"
+                | "work"
+        )
+}
+
+fn automatic_text_document_count(connection: &Connection) -> Result<usize> {
+    let sql = format!(
+        "SELECT
+            (SELECT COUNT(*) FROM space_fts
+             JOIN intent_head ON intent_head.space_id = space_fts.space_id
+               AND intent_head.revision_id = space_fts.revision_id)
+            +
+            (SELECT COUNT(*) FROM context_fts
+             JOIN context_revision AS revision USING(revision_id)
+             JOIN context_item AS item USING(context_id)
+             WHERE {SAFE_ACCEPTED_CONTEXT_PREDICATE})"
+    );
+    let count = connection
+        .query_row(&sql, [], |row| row.get::<_, i64>(0))
+        .map_err(sql_error("count automatic text documents"))?;
+    usize::try_from(count).map_err(|_| invariant("automatic text document count is negative"))
+}
+
+fn automatic_token_document_frequency(connection: &Connection, token: &str) -> Result<usize> {
+    let Some(expression) = fts_or_match_expression(&[token.to_owned()]) else {
+        return Ok(0);
+    };
+    let intent_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM space_fts
+             JOIN intent_head ON intent_head.space_id = space_fts.space_id
+               AND intent_head.revision_id = space_fts.revision_id
+             WHERE space_fts MATCH ?1",
+            [&expression],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(sql_error("count automatic Space Intent token frequency"))?;
+    let context_sql = format!(
+        "SELECT COUNT(*) FROM context_fts
+         JOIN context_revision AS revision USING(revision_id)
+         JOIN context_item AS item USING(context_id)
+         WHERE context_fts MATCH ?1 AND {SAFE_ACCEPTED_CONTEXT_PREDICATE}"
+    );
+    let context_count = connection
+        .query_row(&context_sql, [&expression], |row| row.get::<_, i64>(0))
+        .map_err(sql_error("count automatic Context token frequency"))?;
+    usize::try_from(intent_count.saturating_add(context_count))
+        .map_err(|_| invariant("automatic token document frequency is negative"))
+}
+
+fn eligible_query_phrases(phrases: &[String], tokens: &[String]) -> Vec<String> {
+    let allowed = tokens.iter().collect::<BTreeSet<_>>();
+    phrases
+        .iter()
+        .filter(|phrase| {
+            search_tokens(phrase)
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .intersection(&allowed)
+                .count()
+                >= 2
+        })
+        .cloned()
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 struct WorkingIntentHintQuery {
     source_field: WorkingIntentHintField,
@@ -1491,6 +1636,7 @@ struct TaskAssociationInference {
     graph_context_tree_oid: Option<String>,
     graph_artifact_generation: Option<String>,
     focus_reachable: bool,
+    query_tokens: Vec<String>,
 }
 
 fn normalized_values(values: &[String]) -> BTreeSet<String> {
@@ -1513,13 +1659,27 @@ fn infer_task_space_associations(
     graph_context_tree_oid: Option<&str>,
     mode: ContextPackMode,
 ) -> Result<TaskAssociationInference> {
-    let intent_candidates = query_space_intent_candidates(connection, query_tokens, query_phrases)?;
+    let query_tokens = automatic_eligible_query_tokens(connection, query_tokens, mode)?;
+    let query_phrases = eligible_query_phrases(query_phrases, &query_tokens);
+    let hint_queries = hint_queries
+        .iter()
+        .map(|query| {
+            let tokens = automatic_eligible_query_tokens(connection, &query.tokens, mode)?;
+            Ok(WorkingIntentHintQuery {
+                source_field: query.source_field,
+                phrases: eligible_query_phrases(&query.phrases, &tokens),
+                tokens,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let intent_candidates =
+        query_space_intent_candidates(connection, &query_tokens, &query_phrases)?;
     let effective_spaces = query_effective_context_spaces(connection)?;
     let mut contexts =
-        query_accepted_context_evidence(connection, query_tokens, query_phrases, scope_targets)?;
+        query_accepted_context_evidence(connection, &query_tokens, &query_phrases, scope_targets)?;
     let mut evidence = BTreeMap::<SpaceId, AssociationEvidence>::new();
     apply_intent_evidence(&mut evidence, intent_candidates);
-    apply_working_intent_hint_evidence(connection, hint_queries, &mut evidence, &mut contexts)?;
+    apply_working_intent_hint_evidence(connection, &hint_queries, &mut evidence, &mut contexts)?;
     let mut graph_contexts = BTreeMap::new();
     let mut focus_reachable = false;
     if let Some(graph) = engineering_graph {
@@ -1527,7 +1687,7 @@ fn infer_task_space_associations(
             query_graph_context_evidence(graph, resolved_focus, mode, &mut graph_contexts);
         expand_graph_context_relation_evidence(graph, mode, &mut graph_contexts)?;
     }
-    expand_current_context_relation_evidence(connection, mode, &mut contexts)?;
+    expand_current_context_relation_evidence(connection, mode, &query_tokens, &mut contexts)?;
     for ((space_id, context_id), context) in &contexts {
         aggregate_context_across_effective_spaces(
             &mut evidence,
@@ -1547,10 +1707,12 @@ fn infer_task_space_associations(
         );
     }
     hydrate_intent_conflict_state(connection, &mut evidence)?;
-    assign_channel_features(&mut evidence, query_tokens);
+    assign_channel_features(&mut evidence, &query_tokens);
     let mut associations = evidence
         .iter()
-        .filter_map(|(space_id, evidence)| association(task_id, *space_id, evidence))
+        .filter_map(|(space_id, evidence)| {
+            association(task_id, *space_id, evidence, &query_tokens, mode)
+        })
         .collect::<Vec<_>>();
     associations.sort_by(|left, right| {
         right
@@ -1568,6 +1730,7 @@ fn infer_task_space_associations(
         graph_context_tree_oid: graph_context_tree_oid.map(ToOwned::to_owned),
         graph_artifact_generation: engineering_graph.map(|graph| graph.artifact_generation.clone()),
         focus_reachable,
+        query_tokens,
     })
 }
 
@@ -2219,6 +2382,7 @@ fn expand_graph_context_relation_evidence(
 fn expand_current_context_relation_evidence(
     connection: &Connection,
     mode: ContextPackMode,
+    query_tokens: &[String],
     contexts: &mut BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>,
 ) -> Result<()> {
     let edges = load_active_context_relations(connection, mode)?;
@@ -2234,7 +2398,7 @@ fn expand_current_context_relation_evidence(
     }
     let seeds = contexts
         .iter()
-        .filter(|(_, evidence)| context_is_positive_seed(evidence))
+        .filter(|(_, evidence)| context_is_positive_seed(evidence, mode, query_tokens))
         .map(|((space_id, context_id), _evidence)| (*space_id, *context_id))
         .collect::<Vec<_>>();
     for (_space_id, seed_context_id) in seeds {
@@ -2287,18 +2451,27 @@ fn expand_current_context_relation_evidence(
     Ok(())
 }
 
-fn context_is_positive_seed(evidence: &AcceptedContextEvidence) -> bool {
-    evidence.textual_match
-        || !evidence.hint_text.is_empty()
-        || !evidence.matched_artifacts.is_empty()
-        || !evidence.matched_scopes.is_empty()
-        || evidence.graph_paths.iter().any(|path| {
-            matches!(
-                path,
-                TaskRetrievalPath::EngineeringGraph { relation_hops, .. }
-                    if relation_hops.is_empty()
-            )
-        })
+fn context_is_positive_seed(
+    evidence: &AcceptedContextEvidence,
+    mode: ContextPackMode,
+    query_tokens: &[String],
+) -> bool {
+    if evidence.graph_paths.iter().any(|path| {
+        matches!(
+            path,
+            TaskRetrievalPath::EngineeringGraph { relation_hops, .. }
+                if relation_hops.is_empty()
+        )
+    }) || !evidence.matched_artifacts.is_empty()
+    {
+        return true;
+    }
+    if mode == ContextPackMode::Explicit {
+        return evidence.textual_match
+            || !evidence.hint_text.is_empty()
+            || !evidence.matched_scopes.is_empty();
+    }
+    automatic_direct_context_text_eligible(evidence, query_tokens)
 }
 
 fn load_active_context_relations(
@@ -2932,6 +3105,8 @@ fn association(
     task_id: TaskId,
     space_id: SpaceId,
     evidence: &AssociationEvidence,
+    query_tokens: &[String],
+    mode: ContextPackMode,
 ) -> Option<TaskSpaceAssociation> {
     if !evidence.intent_matched
         && evidence.hint_text.is_empty()
@@ -2942,6 +3117,11 @@ fn association(
         return None;
     }
     if evidence.fused_score_basis_points < MINIMUM_ASSOCIATION_SCORE_BASIS_POINTS {
+        return None;
+    }
+    if mode == ContextPackMode::AutomaticInjection
+        && !automatic_space_text_eligible(evidence, query_tokens)
+    {
         return None;
     }
     let score = association_score(evidence);
@@ -2956,6 +3136,39 @@ fn association(
         relation_paths: evidence.relation_paths.iter().cloned().collect(),
         reasons,
     })
+}
+
+fn automatic_space_text_eligible(evidence: &AssociationEvidence, query_tokens: &[String]) -> bool {
+    if !evidence.graph_exact_contexts.is_empty() || !evidence.relation_contexts.is_empty() {
+        return true;
+    }
+    let hint_phrase = evidence.hint_text.values().any(|hint| hint.phrase_match);
+    if evidence.intent_phrase_match || evidence.context_phrase_match || hint_phrase {
+        return true;
+    }
+    let coverage = token_coverage_basis_points(&evidence.intent_tokens, query_tokens)
+        .max(token_coverage_basis_points(
+            &evidence.context_tokens,
+            query_tokens,
+        ))
+        .max(
+            evidence
+                .hint_text
+                .values()
+                .map(HintTextEvidence::coverage_basis_points)
+                .max()
+                .unwrap_or(0),
+        );
+    if coverage >= AUTOMATIC_TEXT_COVERAGE_THRESHOLD_BASIS_POINTS {
+        return true;
+    }
+    let text_channel_count = usize::from(evidence.intent_matched)
+        + usize::from(evidence.context_bm25.is_some())
+        + evidence.hint_text.len();
+    if text_channel_count >= 2 {
+        return true;
+    }
+    evidence.context_bm25.is_some() && !evidence.matched_scopes.is_empty()
 }
 
 const BASIS_POINTS_SCALE: usize = 10_000;
@@ -3528,6 +3741,15 @@ fn task_context_candidate_from_row(
     if context_evidence.is_none() && !inherited {
         return Ok(None);
     }
+    if mode == ContextPackMode::AutomaticInjection
+        && !automatic_context_text_eligible(
+            space_evidence,
+            context_evidence,
+            &inference.query_tokens,
+        )
+    {
+        return Ok(None);
+    }
     let mut paths = task_retrieval_paths(space_evidence, context_evidence);
     paths.extend(matched_space.association_path.clone());
     sort_dedup_paths(&mut paths);
@@ -3602,6 +3824,87 @@ fn task_context_candidate_from_row(
             retrieval_paths: paths,
         },
     }))
+}
+
+fn automatic_context_text_eligible(
+    space: &AssociationEvidence,
+    context: Option<&AcceptedContextEvidence>,
+    query_tokens: &[String],
+) -> bool {
+    let Some(context) = context else {
+        return automatic_inherited_space_text_eligible(space, query_tokens);
+    };
+    if !context.matched_artifacts.is_empty()
+        || context.graph_paths.iter().any(|path| {
+            matches!(
+                path,
+                TaskRetrievalPath::EngineeringGraph { .. }
+                    | TaskRetrievalPath::ContextRelation { .. }
+            )
+        })
+    {
+        return true;
+    }
+    if automatic_direct_context_text_eligible(context, query_tokens) {
+        return true;
+    }
+    let direct_text_channels = usize::from(context.textual_match) + context.hint_text.len();
+    let all_text_channels = direct_text_channels
+        + usize::from(space.intent_matched)
+        + space
+            .hint_text
+            .keys()
+            .filter(|channel| channel.target == WorkingIntentHintTarget::SpaceIntentFts)
+            .count();
+    direct_text_channels > 0 && all_text_channels >= 2
+}
+
+fn automatic_inherited_space_text_eligible(
+    space: &AssociationEvidence,
+    query_tokens: &[String],
+) -> bool {
+    let space_hints = space
+        .hint_text
+        .iter()
+        .filter(|(channel, _)| channel.target == WorkingIntentHintTarget::SpaceIntentFts)
+        .map(|(_, hint)| hint)
+        .collect::<Vec<_>>();
+    if space.intent_phrase_match || space_hints.iter().any(|hint| hint.phrase_match) {
+        return true;
+    }
+    let coverage = token_coverage_basis_points(&space.intent_tokens, query_tokens).max(
+        space_hints
+            .iter()
+            .map(|hint| hint.coverage_basis_points())
+            .max()
+            .unwrap_or(0),
+    );
+    if coverage >= AUTOMATIC_TEXT_COVERAGE_THRESHOLD_BASIS_POINTS {
+        return true;
+    }
+    usize::from(space.intent_matched) + space_hints.len() >= 2
+}
+
+fn automatic_direct_context_text_eligible(
+    context: &AcceptedContextEvidence,
+    query_tokens: &[String],
+) -> bool {
+    if context.phrase_match || context.hint_text.values().any(|hint| hint.phrase_match) {
+        return true;
+    }
+    let coverage = token_coverage_basis_points(&context.matched_tokens, query_tokens).max(
+        context
+            .hint_text
+            .values()
+            .map(HintTextEvidence::coverage_basis_points)
+            .max()
+            .unwrap_or(0),
+    );
+    if coverage >= AUTOMATIC_TEXT_COVERAGE_THRESHOLD_BASIS_POINTS {
+        return true;
+    }
+    let direct_text_channels = usize::from(context.textual_match) + context.hint_text.len();
+    direct_text_channels >= 2 || (direct_text_channels > 0 && !context.matched_scopes.is_empty())
 }
 
 fn task_retrieval_paths(

@@ -578,14 +578,8 @@ fn fe_task_associates_requirement_protocol_compatibility_and_analytics_spaces() 
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         actual_spaces,
-        [
-            fixture.feature_spaces[0],
-            fixture.feature_spaces[2],
-            fixture.feature_spaces[3],
-        ]
-        .into_iter()
-        .collect(),
-        "only Intent, Context BM25, and Scope evidence may associate without an Engineering Graph"
+        [fixture.feature_spaces[3]].into_iter().collect(),
+        "weak one-channel text or exact Scope without Context text must not associate"
     );
     for association in &response.associations {
         assert!(association.score > 0.0 && association.score <= 1.0);
@@ -611,7 +605,6 @@ fn fe_task_associates_requirement_protocol_compatibility_and_analytics_spaces() 
     assert_eq!(
         channels,
         [
-            TaskAssociationChannel::SpaceIntentBm25,
             TaskAssociationChannel::AcceptedContextBm25,
             TaskAssociationChannel::ExactScope,
         ]
@@ -625,9 +618,7 @@ fn fe_task_associates_requirement_protocol_compatibility_and_analytics_spaces() 
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         matched_contexts,
-        [fixture.feature_contexts[1], fixture.feature_contexts[2]]
-            .into_iter()
-            .collect()
+        [fixture.feature_contexts[2]].into_iter().collect()
     );
     let matched_artifacts = response
         .associations
@@ -980,16 +971,13 @@ fn forty_space_corpus_is_rrf_ranked_top_k_bounded_and_fully_budgeted() {
         serde_json::to_string(&first).unwrap().len().div_ceil(4) <= first.estimated_tokens,
         "charged envelope reserve must conservatively cover the complete ASCII fixture response"
     );
-    let top_k = first
-        .omitted
-        .iter()
-        .find(|omitted| omitted.reason == "space_top_k")
-        .expect("fixed corpus must report top-k Space omissions");
-    assert_eq!(
-        top_k.count,
-        fixture.total_spaces.saturating_sub(request.max_spaces)
+    assert!(
+        first
+            .omitted
+            .iter()
+            .all(|omitted| omitted.reason != "space_top_k"),
+        "generic corpus rows must be filtered before top-k"
     );
-    assert!(top_k.estimated_tokens > 0);
 
     let precise_fusion = first.associations[0]
         .reasons
@@ -1065,12 +1053,9 @@ fn forty_space_corpus_is_rrf_ranked_top_k_bounded_and_fully_budgeted() {
         generic.estimated_tokens,
         estimate_task_context_payload_tokens(&generic)
     );
-    assert!(
-        generic
-            .omitted
-            .iter()
-            .any(|item| item.reason == "space_top_k")
-    );
+    assert!(generic.associations.is_empty());
+    assert!(generic.items.is_empty());
+    assert!(generic.omitted.is_empty());
 }
 
 #[test]
@@ -1155,20 +1140,14 @@ fn task_context_pack_supports_zero_one_and_many_spaces_with_explicit_m2_paths() 
             100_000,
         ))
         .unwrap();
-    assert_eq!(many.associations.len(), 3);
-    assert_eq!(many.items.len(), 3);
+    assert_eq!(many.associations.len(), 1);
+    assert_eq!(many.items.len(), 1);
     assert_eq!(
         many.items
             .iter()
             .map(|item| item.context.context_id)
             .collect::<std::collections::BTreeSet<_>>(),
-        [
-            fixture.pack_contexts[0],
-            fixture.pack_contexts[2],
-            fixture.pack_contexts[3],
-        ]
-        .into_iter()
-        .collect()
+        [fixture.pack_contexts[3]].into_iter().collect()
     );
     let association_spaces = many
         .associations
@@ -1192,11 +1171,6 @@ fn task_context_pack_supports_zero_one_and_many_spaces_with_explicit_m2_paths() 
     assert!(
         paths
             .iter()
-            .any(|path| matches!(path, TaskRetrievalPath::IntentFts { .. }))
-    );
-    assert!(
-        paths
-            .iter()
             .any(|path| matches!(path, TaskRetrievalPath::ContextFts { .. }))
     );
     assert!(
@@ -1204,17 +1178,118 @@ fn task_context_pack_supports_zero_one_and_many_spaces_with_explicit_m2_paths() 
             .iter()
             .any(|path| matches!(path, TaskRetrievalPath::ExactScope { .. }))
     );
-    assert!(paths.iter().all(|path| {
-        matches!(
-            path,
-            TaskRetrievalPath::IntentFts { .. }
-                | TaskRetrievalPath::ContextFts { .. }
-                | TaskRetrievalPath::ExactScope { .. }
-        )
-    }));
+    assert!(paths.iter().all(|path| matches!(
+        path,
+        TaskRetrievalPath::ContextFts { .. } | TaskRetrievalPath::ExactScope { .. }
+    )));
     let metadata = fixture.index.metadata().unwrap();
     assert_eq!(many.indexed_tree_oid, metadata.indexed_tree_oid);
     assert_eq!(many.projection_generation, metadata.projection_generation);
+}
+
+#[test]
+fn automatic_text_quality_keeps_phrase_and_drops_weak_or_generic_space_inheritance() {
+    let fixture = fixture();
+    let engine = SearchEngine::new(fixture.index);
+
+    let phrase = engine
+        .task_context_pack(&TaskContextRequest::automatic(
+            TaskId::new(),
+            task("pageintentneedle SearchResultsPage.tsx"),
+            Vec::new(),
+            100_000,
+        ))
+        .unwrap();
+    assert_eq!(phrase.associations.len(), 1);
+    assert_eq!(phrase.items.len(), 1);
+    assert_eq!(phrase.items[0].context.context_id, fixture.pack_contexts[0]);
+    let fusion = phrase.associations[0]
+        .reasons
+        .iter()
+        .find_map(|reason| serde_json::from_str::<TaskAssociationFusionExplanation>(reason).ok())
+        .unwrap();
+    assert!(fusion.channels.iter().any(|feature| {
+        feature.channel == TaskAssociationChannel::SpaceIntentBm25 && feature.phrase_match
+    }));
+
+    let generic = engine
+        .task_context_pack(&TaskContextRequest::automatic(
+            TaskId::new(),
+            task("the to code file task"),
+            Vec::new(),
+            100_000,
+        ))
+        .unwrap();
+    assert!(generic.associations.is_empty());
+    assert!(generic.items.is_empty());
+
+    let weak_intent =
+        task("pageintentneedle unrelatedalpha unrelatedbravo unrelatedcharlie unrelateddelta");
+    let automatic = engine
+        .task_context_pack(&TaskContextRequest::automatic(
+            TaskId::new(),
+            weak_intent.clone(),
+            Vec::new(),
+            100_000,
+        ))
+        .unwrap();
+    assert!(automatic.associations.is_empty());
+    assert!(automatic.items.is_empty());
+
+    let mut explicit_request =
+        TaskContextRequest::automatic(TaskId::new(), weak_intent, Vec::new(), 100_000);
+    explicit_request.mode = ContextPackMode::Explicit;
+    let explicit = engine.task_context_pack(&explicit_request).unwrap();
+    assert_eq!(explicit.associations.len(), 1);
+    assert_eq!(explicit.items.len(), 1);
+    assert_eq!(
+        explicit.items[0].context.context_id,
+        fixture.pack_contexts[0]
+    );
+}
+
+#[test]
+fn strong_context_phrase_does_not_promote_an_unrelated_same_space_sibling() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("text inheritance gate")).unwrap();
+    let space_id = add_space(&store, "WeakSpace", "weakspaceanchor");
+    let (strong_context_id, _, _) = add_accepted_context(
+        &store,
+        space_id,
+        "strong context phrase is directly relevant",
+        applicability("quality", "server", "active"),
+    );
+    let (unrelated_context_id, _, _) = add_accepted_context(
+        &store,
+        space_id,
+        "unrelated sibling material must stay private",
+        applicability("other", "client", "inactive"),
+    );
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    let mut intent = task("weakspaceanchor absentalpha absentbravo absentcharlie absentdelta");
+    intent.current_direction = Some("strong context phrase".to_owned());
+    let pack = SearchEngine::new(index)
+        .task_context_pack(&TaskContextRequest::automatic(
+            TaskId::new(),
+            intent,
+            Vec::new(),
+            100_000,
+        ))
+        .unwrap();
+    assert_eq!(pack.associations.len(), 1);
+    assert!(pack.items.iter().any(|item| {
+        item.context.context_id == strong_context_id
+            && item
+                .retrieval_paths
+                .iter()
+                .any(|path| matches!(path, TaskRetrievalPath::ContextFts { .. }))
+    }));
+    assert!(
+        pack.items
+            .iter()
+            .all(|item| item.context.context_id != unrelated_context_id)
+    );
 }
 
 #[test]
@@ -1620,7 +1695,7 @@ fn high_coverage_hint_text_outranks_generic_text_and_remains_budgeted() {
     assert!(channels.contains(&TaskAssociationChannel::InterfaceHintSpaceIntentBm25));
     assert!(channels.contains(&TaskAssociationChannel::InterfaceHintAcceptedContextBm25));
     assert!(full.associations.len() <= request.max_spaces);
-    assert!(!full.omitted.is_empty());
+    assert!(full.omitted.iter().all(|item| item.reason != "space_top_k"));
 
     request.token_budget = 512;
     let limited_first = SearchEngine::new(index.clone())
@@ -1641,12 +1716,19 @@ fn high_coverage_hint_text_outranks_generic_text_and_remains_budgeted() {
     let generic_first = SearchEngine::new(fixture.index.clone())
         .task_context_pack(&generic_request)
         .unwrap();
-    let generic_second = SearchEngine::new(fixture.index)
+    let generic_second = SearchEngine::new(fixture.index.clone())
         .task_context_pack(&generic_request)
         .unwrap();
     assert_eq!(generic_first, generic_second);
-    assert_eq!(generic_first.associations.len(), generic_request.max_spaces);
-    assert!(generic_first.omitted.iter().any(|item| {
+    assert!(generic_first.associations.is_empty());
+    assert!(generic_first.items.is_empty());
+
+    generic_request.mode = ContextPackMode::Explicit;
+    let explicit = SearchEngine::new(fixture.index)
+        .task_context_pack(&generic_request)
+        .unwrap();
+    assert_eq!(explicit.associations.len(), generic_request.max_spaces);
+    assert!(explicit.omitted.iter().any(|item| {
         item.reason == "space_top_k"
             && item.count == fixture.total_spaces - generic_request.max_spaces
     }));

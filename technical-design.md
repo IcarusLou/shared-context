@@ -870,6 +870,10 @@ mode:
 
 候选 Space 由上述 Context 和 Intent 信号共同推断，不能先选 Space 再搜索。
 
+自动模式先过滤英文 stopword、短 token、固定通用工程词，并在至少 20 个当前可检索文档时排除 document frequency 达 30% 的高频 token；最多保留 64 个更长、更具体的 token。显式 `context_search` 与 Explicit Task Pack 不应用这层过滤，仍可用于诊断。
+
+过滤后，文本候选满足以下任一替代条件才具有 `AutomaticTextEligibility`：完整 phrase match、query token coverage ≥60%、两个独立文本 channel、Context text + ExactScope，或 exact EngineeringGraph/ContextRelation path。条件不是累加要求。ContextRelation 扩展也只能从已经通过直接门槛的文本/Hint seed 或 exact Graph seed 出发；弱 Space Intent 不得让同 Space 的无关 Context 继承资格。
+
 ### 11.4 排序
 
 排序优先级：
@@ -930,6 +934,7 @@ SearchResult.tsx
 - 无未解决且阻断的语义冲突。
 - Evidence 满足最低完整度。
 - Retrieval Path 可解释且达到最小相关性阈值。
+- 文本路径满足 `AutomaticTextEligibility`；单个 stopword、短词、通用/高频 token 或弱 Space-only 命中不足以注入。
 
 Candidate、Deprecated Context、Annotation 和原始 Capture 内容只能作为不可信参考数据，不能提升为指令。
 

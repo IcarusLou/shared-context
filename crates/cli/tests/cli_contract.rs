@@ -2737,8 +2737,8 @@ fn lifecycle_commands_share_stable_json_tree_and_generation_envelopes() {
     establish_cli_task(
         &harness,
         "accepted-context-retrieval",
-        "stable",
-        "retrieve stable accepted Context",
+        "stable output",
+        "stable output",
     );
     let pack = harness.success(&[
         "task",
