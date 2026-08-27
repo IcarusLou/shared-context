@@ -1424,6 +1424,14 @@ Evidence 继续只约束 WorkObservation、CheckpointClaim、Candidate、Context
 - #156 的 WorkEpisode query 已接入 Candidate admission；不存在、Open、跨 Task 或 stale Intent 的来源在任何 Git 写入前拒绝。
 - #164 固定 oracle 位于 `fixtures/m4/fixed-oracle.json`，直接驱动 WorkingIntent→Checkpoint close→Builder→Review list/get→existing/new Confirm，并与固定 Working Intent Hint、跨端 Graph、真实 Cursor/Codex Hook/Capture、submission crash/concurrency、analysis safety、pagination/budget/privacy 套件共同关闭 M4。Oracle 输入为手写 fixture，不从 production 结果生成。
 
+### Retrieval quality（Mew #207）— 已实现，待人工验收
+
+- #214 的 126-byte SessionStart marker 明确要求 substantive work 前调用 `task_intent_update`；Enabled no-ActiveTask PostToolUse 只提醒一次，Prompt 不读取/持久化，PreCompact/TurnStop 只留 typed local diagnostic，不自动创建 Task。
+- #215 以 exact `(TaskId, TaskIntentRevisionId)` 派生稳定 `psg_`，同 revision Claims 共用 goal-derived Proposed Space Intent；首次 new-Space Confirmation 在 Git 前原子预留 mapping，后续 Review 推荐 Existing Space，不合并 Candidate。
+- #222 对自动文本执行 stopword/short/generic/high-DF 过滤和五类替代准入门；Explicit 查询保持诊断能力，弱 Space/context 文本与关系 seed 不得扩散无关 Context。
+- #216 只在 Graph snapshot 不可用时启用 RepositoryId + full locator canonical-key strict fallback；available Graph 的 resolved/missing/ambiguous/unreachable 全部保持 Graph 语义，不 fuzzy、不持久化、不声称 Artifact edge。
+- #217 黑盒 `retrieval_quality_workflow` 通过真实 CLI binary 的 Hook/MCP/CLI public surfaces 串联 bootstrap→two-Claim group→Existing reuse→strong/generic FTS→strict File fallback；不直接调用 Runtime/Reducer/Index/CaptureStore。
+
 ### Team-shared Knowledge Store — 已实现
 
 - RepositoryId 由团队约定为 exact-case 可读字符串；每台安装的 Catalog 只绑定自己的 checkout，因此 `FE + RepoRelativePath` 可跨机器保持身份而不共享绝对路径。

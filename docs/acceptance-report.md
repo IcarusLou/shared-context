@@ -1,10 +1,10 @@
 # Task-first Retrieval Integration Acceptance Report
 
 Date: 2026-08-27
-Scope: production acceptance through Mew #170/#164 is unchanged, including #136/#169; Repository-scoped pre-inference Hook acceptance through #189 is human-accepted, #191 adds MCP Session authorization, #194 aligns Enabled cross-Repository Hook recording, #192 adds marker-gated progressive Skill loading, and #193 closes the fixed token-bytes proxy/NPM evidence pending final human acceptance. Mew #206/#209–#213 add the deterministic public Capture→Relation→EngineeringReference→Related Space path, excluding every section 10.2 Session lease change; additive non-blocking replay evidence extends through #171/#176
+Scope: production acceptance through Mew #170/#164 is unchanged, including #136/#169; Repository-scoped pre-inference Hook acceptance through #189 is human-accepted, #191 adds MCP Session authorization, #194 aligns Enabled cross-Repository Hook recording, #192 adds marker-gated progressive Skill loading, and #193 closes the fixed token-bytes proxy/NPM evidence pending final human acceptance. Mew #206/#209–#213 add the human-accepted Capture→Relation→EngineeringReference→Related Space path. Mew #207/#214–#217 add Intent bootstrap, TaskIntent-scoped Space grouping, automatic text quality gates and strict Focus fallback, excluding every section 10.2 Session lease change; additive non-blocking replay evidence extends through #171/#176
 Documentation baseline before the #170 language alignment: `main@e03193b`
 
-The original production baseline remains closed by final M4 Gate #164. The additive Mew #206 milestone is implemented through its deterministic public-surface gate and is pending the human milestone decision recorded after this report.
+The original production baseline remains closed by final M4 Gate #164. The additive Mew #206 milestone is human-accepted; Mew #207 is implemented through its deterministic public-surface gate and is pending the next human milestone decision.
 
 ## Verdict
 
@@ -21,6 +21,21 @@ SessionStart now performs synchronous local Repository-scope admission before mo
 | Repository-scoped pre-inference activation — Mew #185 | IMPLEMENTED; HUMAN ACCEPTED | #181–#189 provide explicit RepositoryGroup/Direct/Disabled resolution, sticky short-lived Session lease, SessionStart marker, exact SessionEnd cleanup, and a fixed Codex/Cursor lifecycle oracle |
 | Session authorization and cross-Repository investigation — Mew #190 | IMPLEMENTED; HUMAN REVIEW PENDING | #191 provides MCP Session-level authorization; #194 records registered cross-Repo investigation with real Catalog mapping, safe unregistered/mixed work as path-free non-locating meaning, and unsafe input as neutral; #192 uses a minimal trusted-marker gate; #193 closes the fixed Direct/Group/Disabled token-bytes proxy, installer, privacy, and NPM evidence |
 | Captured relation/reference workflow — Mew #206 | IMPLEMENTED; HUMAN ACCEPTED | #209–#213 expose owned Capture summaries, ingest selected Capture Evidence, persist typed ContextRelations and EngineeringReferences atomically, retrieve Primary-owned Context through Related Space roles, and close one sanitized Codex-A/Cursor-B public path across two checkouts of the same RepositoryId |
+| Retrieval quality workflow — Mew #207 | IMPLEMENTED; HUMAN REVIEW PENDING | #214/#215/#222/#216/#217 provide one-shot Intent bootstrap, exact TaskIntentRevision ProposedSpaceGroup reuse, absolute automatic-text gates, and Graph-unavailable-only strict Focus fallback through one public Hook/MCP/CLI acceptance chain |
+
+## Retrieval quality public gate — Mew #207/#214–#217
+
+`retrieval_quality_workflow` invokes the real `sctx` binary through sanitized Codex Hook input, public MCP tools and explicit CLI search. One authorized Session sees the 126-byte bootstrap marker, receives exactly one pre-Task PostTool reminder, creates a Working Intent with two independent Claims, confirms one proposed new Space and reuses it for the sibling Candidate, switches Tasks to prove strong-vs-generic automatic text behavior, then resolves the same accepted Context through strict File Focus while no Graph snapshot exists.
+
+| Requirement | Authoritative evidence | Result |
+|---|---|---|
+| First substantive work bootstraps Intent without Prompt semantics | SessionStart names only `task_intent_update`; first safe PostTool emits one bounded reminder, retry is neutral, and no Hook creates a Task or derives Working Intent text | PROVEN |
+| Candidates from one TaskIntentRevision converge on one proposed Space | Two independent Claims expose the same `psg_` key and cleaned goal-derived Intent/title; first Confirm writes 5 new-Space Events, sibling Review becomes Existing Primary and writes only its 4 Context facts | PROVEN |
+| Automatic text quality is absolute and explicit search remains available | Exact Context phrase returns only the strong Context, unrelated same-Space sibling is absent, generic `the code file task` returns zero automatic items, and CLI explicit search still finds the sibling | PROVEN |
+| Strict Focus fallback is honest | With `artifact_generation=null`, exact `Server + src/quality/fallback.rs` returns the strong Context only through `resolved_focus_text_fallback`; no `engineering_graph` path is present | PROVEN |
+| Non-goals remain closed | No vector/embedding, automatic Task, Candidate merge/dedupe, Active Space, fuzzy basename match, saved Focus, indexed-fact rewrite, production adapter/schema/hot-path work, or section 10.2 Session lease behavior | PROVEN |
+
+This is the deterministic M2 public-surface gate, not the final installed live-host acceptance owned by #221. M3 remains blocked until the human accepts #207.
 
 ## Captured relation/reference public gate — Mew #206/#209–#213
 
@@ -242,6 +257,7 @@ cargo test --locked -p sctx-cli --test milestone_two_contract
 cargo test --locked -p sctx-cli --test milestone_three_contract
 cargo test --locked -p sctx-cli --test milestone_four_contract
 cargo test --locked -p sctx-cli --test captured_relation_workflow
+cargo test --locked -p sctx-cli --test retrieval_quality_workflow
 cargo test --locked -p sctx-installer --test installer_matrix fixed_two_installation_team_sharing_and_local_reset_oracle
 
 # Required repository gates
