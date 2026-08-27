@@ -49,6 +49,7 @@ pub struct CaptureTaskOwner {
 #[serde(rename_all = "snake_case")]
 pub enum CaptureDiagnosticKind {
     NoActiveTask,
+    IntentBootstrapRequired,
     RuntimeUnavailable,
     RepositoryNotConfigured,
     UnsafeArtifactPath,

@@ -53,6 +53,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const HOOK_TASK_UNAVAILABLE: &str = "Shared Context task retrieval is temporarily unavailable. Coding can continue; retry through MCP or CLI later.";
+const INTENT_BOOTSTRAP_REMINDER: &str = "Shared Context: no ActiveTask exists. Call task_intent_update for this substantive task before continuing.";
+const _: () = assert!(INTENT_BOOTSTRAP_REMINDER.len() <= 128);
 
 const HELP: &str = r"Shared Context command-line interface
 
@@ -1223,7 +1225,10 @@ fn resolve_hook_action(action: CanonicalAgentAction) -> Result<ResolvedAgentActi
     };
     if let Some(breadcrumb) = breadcrumb {
         let root = installation_root()?;
-        if capture_breadcrumb(&root, breadcrumb).is_err() && !lifecycle_operation {
+        if capture_breadcrumb(&root, breadcrumb).is_err()
+            && !lifecycle_operation
+            && task_resolution.system_message.is_none()
+        {
             return Ok(ResolvedAgentAction {
                 additional_context: None,
                 system_message: Some(HOOK_TASK_UNAVAILABLE.to_owned()),
@@ -1246,6 +1251,7 @@ fn capture_breadcrumb(
     root: &Path,
     breadcrumb: sctx_agent_adapter::CanonicalBreadcrumb,
 ) -> Result<()> {
+    let intent_bootstrap_required = breadcrumb.kind == CanonicalBreadcrumbKind::Checkpoint;
     let (task_owner, diagnostics) = match TaskRuntime::initialize(root)
         .and_then(|runtime| runtime.read_snapshot_by_locator(&breadcrumb.external_session_locator))
     {
@@ -1260,7 +1266,13 @@ fn capture_breadcrumb(
             }),
             Vec::new(),
         ),
-        Ok(None) => (None, vec![CaptureDiagnosticKind::NoActiveTask]),
+        Ok(None) => {
+            let mut diagnostics = vec![CaptureDiagnosticKind::NoActiveTask];
+            if intent_bootstrap_required {
+                diagnostics.push(CaptureDiagnosticKind::IntentBootstrapRequired);
+            }
+            (None, diagnostics)
+        }
         Err(_) => (None, vec![CaptureDiagnosticKind::RuntimeUnavailable]),
     };
     CaptureStore::initialize(root)?.capture(&Breadcrumb {
@@ -1291,7 +1303,16 @@ fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<ResolvedTas
             let root = installation_root()?;
             let runtime = TaskRuntime::initialize(&root)?;
             if runtime.read_snapshot_by_locator(&locator)?.is_none() {
-                return Ok(ResolvedTaskOperation::default());
+                let notify = (|| {
+                    let catalog = UserConfigStore::open_existing(&root)?.repository_catalog()?;
+                    AuthorizedSessionScopeStore::initialize(&root)?
+                        .try_mark_intent_bootstrap_notified(&locator, &catalog)
+                })()
+                .unwrap_or(false);
+                return Ok(ResolvedTaskOperation {
+                    additional_context: None,
+                    system_message: notify.then(|| INTENT_BOOTSTRAP_REMINDER.to_owned()),
+                });
             }
             let catalog = UserConfigStore::open_existing(&root)?.repository_catalog()?;
             let signals = normalized_observation_signals(

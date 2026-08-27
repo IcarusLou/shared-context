@@ -41,6 +41,7 @@ struct WireOracle {
 
 #[derive(Debug, Deserialize)]
 struct LifecycleOracle {
+    post_tool: String,
     pre_compact: String,
     turn_stop: String,
 }
@@ -502,7 +503,15 @@ fn documented_codex_direct_lifecycle_activates_before_prompt_and_keeps_git_clean
             }
     ));
     assert_output(&fixture.run("codex", &events[1]), &oracle.wire.neutral);
-    assert_output(&fixture.run("codex", &events[2]), &oracle.wire.neutral);
+    assert_codex_lifecycle_message(
+        &fixture.run("codex", &events[2]),
+        &oracle.enabled_without_active_task.post_tool,
+    );
+    assert!(
+        fixture
+            .current_scope("codex", session)
+            .intent_bootstrap_notified
+    );
     assert_codex_lifecycle_message(
         &fixture.run("codex", &events[3]),
         &oracle.enabled_without_active_task.pre_compact,
@@ -551,7 +560,15 @@ fn documented_cursor_group_lifecycle_records_members_and_safe_non_locating_inves
     ));
     assert_eq!(scope.allowed_repository_ids, expected_members);
     assert_output(&fixture.run("cursor", &events[1]), &oracle.wire.neutral);
-    assert_output(&fixture.run("cursor", &events[2]), &oracle.wire.neutral);
+    assert_output(
+        &fixture.run("cursor", &events[2]),
+        &json!({"additional_context": &oracle.enabled_without_active_task.post_tool}),
+    );
+    assert!(
+        fixture
+            .current_scope("cursor", session)
+            .intent_bootstrap_notified
+    );
     assert_eq!(capture_record_count(&fixture.root()), 1);
 
     let mut sibling = events[2].clone();

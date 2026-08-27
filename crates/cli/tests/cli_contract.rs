@@ -2455,7 +2455,9 @@ fn post_tool_hook_captures_a_bounded_breadcrumb_not_raw_payload() {
     );
     assert_eq!(
         serde_json::from_slice::<Value>(&output.stdout).unwrap(),
-        serde_json::json!({})
+        serde_json::json!({
+            "additional_context": "Shared Context: no ActiveTask exists. Call task_intent_update for this substantive task before continuing."
+        })
     );
 
     let captures = fs::read_dir(harness.root().join("state/capture"))

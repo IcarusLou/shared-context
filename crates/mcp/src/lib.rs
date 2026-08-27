@@ -5720,7 +5720,9 @@ fn capture_runtime_diagnostics(
             CaptureDiagnosticKind::UnsafeArtifactPath => {
                 Some(WorkEpisodeDiagnosticKind::CaptureUnsafeArtifactPath)
             }
-            CaptureDiagnosticKind::NoActiveTask | CaptureDiagnosticKind::RuntimeUnavailable => None,
+            CaptureDiagnosticKind::NoActiveTask
+            | CaptureDiagnosticKind::IntentBootstrapRequired
+            | CaptureDiagnosticKind::RuntimeUnavailable => None,
         })
         .collect()
 }

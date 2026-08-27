@@ -15,8 +15,10 @@ use sctx_domain::{ExternalSessionLocator, RepositoryId};
 use sctx_git_store::GitStore;
 use sctx_local_state::{
     AuthorizedSessionScopeDecision, AuthorizedSessionScopePolicy, AuthorizedSessionScopeRead,
-    AuthorizedSessionScopeStore, MaintenanceLock, UserConfigStore,
+    AuthorizedSessionScopeStore, CaptureDiagnosticKind, CaptureStore, MaintenanceLock,
+    UserConfigStore,
 };
+use sctx_task_runtime::TaskRuntime;
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 
@@ -159,16 +161,54 @@ fn codex_prompt(session: &str, cwd: &Path) -> Value {
     codex_payload(1, session, cwd)
 }
 
-fn cursor_start(session: &str, cwd: &Path) -> Value {
-    let mut payload: Value = serde_json::from_str::<Vec<Value>>(include_str!(
+fn codex_post_tool(session: &str, cwd: &Path) -> Value {
+    let mut payload = codex_payload(2, session, cwd);
+    payload["transcript_path"] = Value::Null;
+    payload["tool_input"] = json!({"file_path": cwd.join("bootstrap.rs")});
+    payload["tool_response"] = json!({"output": "SANITIZED_BOOTSTRAP_TOOL_OUTPUT"});
+    payload
+}
+
+fn codex_precompact(session: &str, cwd: &Path) -> Value {
+    let mut payload = codex_payload(3, session, cwd);
+    payload["transcript_path"] = Value::Null;
+    payload
+}
+
+fn cursor_payload(index: usize, session: &str, cwd: &Path) -> Value {
+    let mut payload = serde_json::from_str::<Vec<Value>>(include_str!(
         "../../../fixtures/agents/cursor-3.13.json"
     ))
     .unwrap()
-    .remove(0);
+    .remove(index);
     payload["conversation_id"] = Value::String(session.to_owned());
-    payload["session_id"] = Value::String(session.to_owned());
     payload["workspace_roots"] = json!([cwd]);
+    payload["transcript_path"] = Value::Null;
+    if payload.get("session_id").is_some() {
+        payload["session_id"] = Value::String(session.to_owned());
+    }
+    if payload.get("cwd").is_some() {
+        payload["cwd"] = json!(cwd);
+    }
     payload
+}
+
+fn cursor_start(session: &str, cwd: &Path) -> Value {
+    cursor_payload(0, session, cwd)
+}
+
+fn cursor_post_tool(session: &str, cwd: &Path) -> Value {
+    let mut payload = cursor_payload(2, session, cwd);
+    payload["tool_input"] = json!({
+        "command": "SANITIZED_BOOTSTRAP_TOOL_COMMAND",
+        "working_directory": cwd
+    });
+    payload["tool_output"] = Value::String("SANITIZED_BOOTSTRAP_TOOL_OUTPUT".to_owned());
+    payload
+}
+
+fn cursor_stop(session: &str, cwd: &Path) -> Value {
+    cursor_payload(4, session, cwd)
 }
 
 fn assert_neutral(output: &Output) {
@@ -201,6 +241,25 @@ fn assert_no_runtime_or_capture(root: &Path) {
     assert!(!root.join("state/runtime.sqlite").exists());
     let capture = root.join("state/capture");
     assert!(!capture.exists() || fs::read_dir(capture).unwrap().next().is_none());
+}
+
+fn tree_contains(path: &Path, needle: &[u8]) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() {
+        return false;
+    }
+    if metadata.is_file() {
+        return fs::read(path)
+            .is_ok_and(|bytes| bytes.windows(needle.len()).any(|window| window == needle));
+    }
+    metadata.is_dir()
+        && fs::read_dir(path).is_ok_and(|entries| {
+            entries
+                .filter_map(std::result::Result::ok)
+                .any(|entry| tree_contains(&entry.path(), needle))
+        })
 }
 
 #[test]
@@ -282,6 +341,164 @@ fn real_codex_and_cursor_session_start_wire_outputs_follow_durable_scope() {
             if scope.decision == AuthorizedSessionScopeDecision::Disabled
     ));
     assert_no_runtime_or_capture(&fixture.root());
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn enabled_tool_work_gets_one_intent_bootstrap_reminder_without_prompt_or_task_creation() {
+    const REMINDER: &str = "Shared Context: no ActiveTask exists. Call task_intent_update for this substantive task before continuing.";
+    const PROMPT_CANARY: &str = "RAW_INTENT_BOOTSTRAP_PROMPT_MUST_NOT_PERSIST";
+
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.direct_repository.join("bootstrap.rs"),
+        "fn bootstrap_fixture() {}\n",
+    )
+    .unwrap();
+    let codex_session = "intent-bootstrap-codex";
+    let cursor_session = "intent-bootstrap-cursor";
+    for (agent, session, start) in [
+        (
+            "codex",
+            codex_session,
+            codex_start(codex_session, &fixture.direct_repository, "startup"),
+        ),
+        (
+            "cursor",
+            cursor_session,
+            cursor_start(cursor_session, &fixture.direct_repository),
+        ),
+    ] {
+        let activated = fixture.hook(agent, &start);
+        assert!(activated.status.success());
+        assert!(String::from_utf8_lossy(&activated.stdout).contains("task_intent_update"));
+        assert!(matches!(
+            fixture.read_scope(agent, session),
+            AuthorizedSessionScopeRead::Current(scope)
+                if !scope.intent_bootstrap_notified
+                    && matches!(scope.decision, AuthorizedSessionScopeDecision::Direct { .. })
+        ));
+    }
+
+    let mut prompt = codex_prompt(codex_session, &fixture.direct_repository);
+    prompt["prompt"] = Value::String(PROMPT_CANARY.to_owned());
+    assert_neutral(&fixture.hook("codex", &prompt));
+
+    let first_codex = fixture.hook(
+        "codex",
+        &codex_post_tool(codex_session, &fixture.direct_repository),
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&first_codex.stdout).unwrap(),
+        json!({"systemMessage": REMINDER}),
+        "scope={:#?} stderr={}",
+        fixture.read_scope("codex", codex_session),
+        String::from_utf8_lossy(&first_codex.stderr)
+    );
+    assert_neutral(&fixture.hook(
+        "codex",
+        &codex_post_tool(codex_session, &fixture.direct_repository),
+    ));
+
+    let first_cursor = fixture.hook(
+        "cursor",
+        &cursor_post_tool(cursor_session, &fixture.direct_repository),
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&first_cursor.stdout).unwrap(),
+        json!({"additional_context": REMINDER})
+    );
+    assert_neutral(&fixture.hook(
+        "cursor",
+        &cursor_post_tool(cursor_session, &fixture.direct_repository),
+    ));
+
+    for (agent, session) in [("codex", codex_session), ("cursor", cursor_session)] {
+        assert!(matches!(
+            fixture.read_scope(agent, session),
+            AuthorizedSessionScopeRead::Current(scope)
+                if scope.intent_bootstrap_notified
+                    && matches!(scope.decision, AuthorizedSessionScopeDecision::Direct { .. })
+        ));
+        assert!(
+            TaskRuntime::initialize(fixture.root())
+                .unwrap()
+                .read_snapshot_by_locator(&ExternalSessionLocator::new(agent, session).unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    let resumed = fixture.hook(
+        "codex",
+        &codex_start(codex_session, &fixture.direct_repository, "resume"),
+    );
+    assert!(String::from_utf8_lossy(&resumed.stdout).contains(SHARED_CONTEXT_ACTIVATION_MARKER));
+    assert_neutral(&fixture.hook(
+        "codex",
+        &codex_post_tool(codex_session, &fixture.direct_repository),
+    ));
+
+    let precompact = fixture.hook(
+        "codex",
+        &codex_precompact(codex_session, &fixture.direct_repository),
+    );
+    assert!(
+        serde_json::from_slice::<Value>(&precompact.stdout).unwrap()["systemMessage"]
+            .as_str()
+            .is_some_and(|message| message.contains("no ActiveTask exists"))
+    );
+    let stopped = fixture.hook(
+        "cursor",
+        &cursor_stop(cursor_session, &fixture.direct_repository),
+    );
+    assert_neutral(&stopped);
+
+    let captures = CaptureStore::initialize(fixture.root())
+        .unwrap()
+        .list(32)
+        .unwrap()
+        .captures;
+    for (agent, session) in [("codex", codex_session), ("cursor", cursor_session)] {
+        let locator = ExternalSessionLocator::new(agent, session).unwrap();
+        assert!(captures.iter().any(|capture| {
+            capture.record.external_session_locator == locator
+                && capture.record.kind == sctx_local_state::BreadcrumbKind::Checkpoint
+                && capture
+                    .record
+                    .diagnostics
+                    .contains(&CaptureDiagnosticKind::IntentBootstrapRequired)
+        }));
+    }
+    assert!(!tree_contains(
+        &fixture.root().join("state"),
+        PROMPT_CANARY.as_bytes()
+    ));
+
+    let disabled = Fixture::new();
+    let disabled_session = "intent-bootstrap-disabled";
+    assert_neutral(&disabled.hook(
+        "codex",
+        &codex_start(disabled_session, &disabled.outside, "startup"),
+    ));
+    let mut disabled_prompt = codex_prompt(disabled_session, &disabled.direct_repository);
+    disabled_prompt["prompt"] = Value::String(PROMPT_CANARY.to_owned());
+    assert_neutral(&disabled.hook("codex", &disabled_prompt));
+    assert_neutral(&disabled.hook(
+        "codex",
+        &codex_post_tool(disabled_session, &disabled.direct_repository),
+    ));
+    assert!(matches!(
+        disabled.read_scope("codex", disabled_session),
+        AuthorizedSessionScopeRead::Current(scope)
+            if !scope.intent_bootstrap_notified
+                && scope.decision == AuthorizedSessionScopeDecision::Disabled
+    ));
+    assert_no_runtime_or_capture(&disabled.root());
+    assert!(!tree_contains(
+        &disabled.root().join("state"),
+        PROMPT_CANARY.as_bytes()
+    ));
 }
 
 #[test]

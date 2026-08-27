@@ -55,6 +55,10 @@ pub struct AuthorizedSessionScope {
     pub catalog_revision: RepositoryCatalogRevision,
     pub issued_at_unix_seconds: u64,
     pub expires_at_unix_seconds: u64,
+    /// Delivery-only marker for the one-shot Intent bootstrap reminder. It does not participate
+    /// in authorization, Catalog matching, TTL, renewal, or reauthorization semantics.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub intent_bootstrap_notified: bool,
 }
 
 impl AuthorizedSessionScope {
@@ -376,6 +380,50 @@ impl AuthorizedSessionScopeStore {
         self.with_try_lock(|| self.remove_exact_unlocked(external_session_locator))
     }
 
+    /// Non-blockingly records delivery of the one-shot Intent bootstrap reminder.
+    ///
+    /// The exact current Enabled authorization must already exist. This changes only
+    /// `intent_bootstrap_notified`; it preserves the decision, Repository identities, Catalog
+    /// revision, issue time, and expiry. `true` means this caller recorded the first delivery;
+    /// `false` means it was already recorded or the current decision is Disabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns immediately for lock contention and rejects missing, expired, stale, unsafe, or
+    /// invalid scope state without changing it.
+    pub fn try_mark_intent_bootstrap_notified(
+        &self,
+        external_session_locator: &ExternalSessionLocator,
+        catalog: &RepositoryCatalogSnapshot,
+    ) -> Result<bool> {
+        validate_locator(external_session_locator)?;
+        self.with_try_lock(|| {
+            let path = self.record_path(external_session_locator);
+            let mut record = self
+                .read_optional_record(&path)?
+                .ok_or_else(|| invalid("AuthorizedSessionScope is missing"))?;
+            verify_record_locator(&record, external_session_locator)?;
+            if record.expires_at_unix_seconds <= unix_seconds(SystemTime::now())? {
+                return Err(invalid("AuthorizedSessionScope is expired"));
+            }
+            if !scope_matches_catalog(&record, catalog)? {
+                return Err(invalid("AuthorizedSessionScope is stale for this Catalog"));
+            }
+            if record.decision == AuthorizedSessionScopeDecision::Disabled
+                || record.intent_bootstrap_notified
+            {
+                return Ok(false);
+            }
+            record.intent_bootstrap_notified = true;
+            record.validate()?;
+            let bytes = self.serialize_scope(&record)?;
+            let usage = self.usage(Some(path.as_path()))?;
+            self.validate_new_usage(&usage, false, bytes.len())?;
+            self.replace_record(&path, &bytes, true)?;
+            Ok(true)
+        })
+    }
+
     /// Removes all expired valid records in deterministic filename order.
     ///
     /// Corrupt, oversized, symlink, or non-regular entries are diagnosed and
@@ -395,9 +443,8 @@ impl AuthorizedSessionScopeStore {
         catalog: &RepositoryCatalogSnapshot,
         now: SystemTime,
     ) -> Result<AuthorizedSessionScopeAuthorizeOutcome> {
-        let scope =
+        let mut scope =
             self.scope_for_authorization(external_session_locator, activation_scope, catalog, now)?;
-        let bytes = self.serialize_scope(&scope)?;
 
         self.with_lock(|| {
             self.cleanup_expired_at(now)?;
@@ -407,7 +454,11 @@ impl AuthorizedSessionScopeStore {
             if let Some(existing) = &existing {
                 verify_record_locator(existing, external_session_locator)?;
                 semantic_changed = !existing.semantically_matches(&scope);
+                if !semantic_changed {
+                    scope.intent_bootstrap_notified = existing.intent_bootstrap_notified;
+                }
             }
+            let bytes = self.serialize_scope(&scope)?;
             let usage = self.usage(existing.as_ref().map(|_| path.as_path()))?;
             self.validate_new_usage(&usage, existing.is_none(), bytes.len())?;
             self.replace_record(&path, &bytes, existing.is_some())?;
@@ -487,6 +538,7 @@ impl AuthorizedSessionScopeStore {
             catalog_revision,
             issued_at_unix_seconds,
             expires_at_unix_seconds: unix_seconds(expires_at)?,
+            intent_bootstrap_notified: false,
         };
         scope.validate()?;
         Ok(scope)
@@ -1011,6 +1063,11 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::InvalidInput, message)
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip predicate receives `&T`.
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn invariant(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::InvariantViolation, message)
 }
@@ -1110,6 +1167,7 @@ mod tests {
         };
         let outcome = store.authorize(&external, &disabled, &catalog).unwrap();
         assert!(outcome.semantic_changed);
+        assert!(!outcome.scope.intent_bootstrap_notified);
         assert_eq!(
             outcome.scope.decision,
             AuthorizedSessionScopeDecision::Disabled
@@ -1150,6 +1208,7 @@ mod tests {
         );
 
         let stored = fs::read_to_string(path).unwrap();
+        assert!(!stored.contains("intent_bootstrap_notified"));
         for forbidden in [
             "prompt",
             "transcript",
@@ -1166,6 +1225,78 @@ mod tests {
             store.read(&external, &catalog).unwrap(),
             AuthorizedSessionScopeRead::Current(scope)
                 if scope.decision == AuthorizedSessionScopeDecision::Disabled
+        ));
+    }
+
+    #[test]
+    fn intent_bootstrap_notification_is_one_shot_and_outside_authorization_semantics() {
+        let temporary = tempdir().unwrap();
+        let store = AuthorizedSessionScopeStore::initialize(temporary.path()).unwrap();
+        let (catalog, repository_id, _) = fixture_catalog();
+        let external = locator("intent-bootstrap");
+        let authorized = store
+            .authorize(&external, &direct_scope(&repository_id), &catalog)
+            .unwrap()
+            .scope;
+        assert!(!authorized.intent_bootstrap_notified);
+
+        assert!(
+            store
+                .try_mark_intent_bootstrap_notified(&external, &catalog)
+                .unwrap()
+        );
+        let notified = match store.try_read(&external, &catalog).unwrap() {
+            AuthorizedSessionScopeRead::Current(scope) => scope,
+            other => panic!("expected current scope, got {other:?}"),
+        };
+        assert!(notified.intent_bootstrap_notified);
+        assert_eq!(notified.decision, authorized.decision);
+        assert_eq!(
+            notified.allowed_repository_ids,
+            authorized.allowed_repository_ids
+        );
+        assert_eq!(notified.catalog_revision, authorized.catalog_revision);
+        assert_eq!(
+            notified.issued_at_unix_seconds,
+            authorized.issued_at_unix_seconds
+        );
+        assert_eq!(
+            notified.expires_at_unix_seconds,
+            authorized.expires_at_unix_seconds
+        );
+        assert!(
+            !store
+                .try_mark_intent_bootstrap_notified(&external, &catalog)
+                .unwrap()
+        );
+
+        let retry = store
+            .authorize(&external, &direct_scope(&repository_id), &catalog)
+            .unwrap();
+        assert!(!retry.semantic_changed);
+        assert!(retry.scope.intent_bootstrap_notified);
+
+        let disabled = locator("intent-bootstrap-disabled");
+        store
+            .authorize(
+                &disabled,
+                &ActivationScope {
+                    decision: ActivationScopeDecision::Disabled,
+                    allowed_repository_ids: Vec::new(),
+                },
+                &catalog,
+            )
+            .unwrap();
+        assert!(
+            !store
+                .try_mark_intent_bootstrap_notified(&disabled, &catalog)
+                .unwrap()
+        );
+        assert!(matches!(
+            store.try_read(&disabled, &catalog).unwrap(),
+            AuthorizedSessionScopeRead::Current(scope)
+                if !scope.intent_bootstrap_notified
+                    && scope.decision == AuthorizedSessionScopeDecision::Disabled
         ));
     }
 
@@ -1228,6 +1359,10 @@ mod tests {
         let store = AuthorizedSessionScopeStore::initialize(temporary.path()).unwrap();
         let (catalog, repository_id, _) = fixture_catalog();
         let external = locator("held-lock");
+        let notify_external = locator("held-notification-lock");
+        store
+            .authorize(&notify_external, &direct_scope(&repository_id), &catalog)
+            .unwrap();
         assert_eq!(
             store.try_read(&external, &catalog).unwrap(),
             AuthorizedSessionScopeRead::Missing
@@ -1246,6 +1381,11 @@ mod tests {
                 .try_authorize_missing(&external, &direct_scope(&repository_id), &catalog)
                 .is_err()
         );
+        assert!(
+            store
+                .try_mark_intent_bootstrap_notified(&notify_external, &catalog)
+                .is_err()
+        );
         assert!(started.elapsed() < Duration::from_secs(1));
         FileExt::unlock(&lock).unwrap();
         thread::sleep(Duration::from_millis(50));
@@ -1254,7 +1394,12 @@ mod tests {
             store.try_read(&external, &catalog).unwrap(),
             AuthorizedSessionScopeRead::Missing
         );
-        assert_eq!(fs::read_dir(store.directory()).unwrap().count(), 0);
+        assert!(matches!(
+            store.try_read(&notify_external, &catalog).unwrap(),
+            AuthorizedSessionScopeRead::Current(scope)
+                if !scope.intent_bootstrap_notified
+        ));
+        assert_eq!(fs::read_dir(store.directory()).unwrap().count(), 1);
     }
 
     #[test]

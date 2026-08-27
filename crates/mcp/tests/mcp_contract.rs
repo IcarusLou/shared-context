@@ -5815,7 +5815,7 @@ fn signal_supersede_is_cas_guarded_and_removed_from_paths_but_retained_in_histor
     assert!(!encoded_paths.contains("MCP Contract"));
 }
 
-const SHARED_CONTEXT_ACTIVATION_MARKER: &str = "<shared-context-active>Shared Context is authorized; the installed skill may be used.</shared-context-active>";
+const SHARED_CONTEXT_ACTIVATION_MARKER: &str = "<shared-context-active>Shared Context is authorized. Before substantive work, call task_intent_update.</shared-context-active>";
 
 #[derive(Clone, Copy)]
 enum SkillInvocation {
@@ -5895,9 +5895,13 @@ fn assert_skill_bundle_contract(gate: &str, workflow: &str, metadata: &str) {
     assert!(metadata.contains("default_prompt: \"Use $shared-context"));
     assert!(metadata.contains("allow_implicit_invocation: true"));
     assert!(!metadata.contains("task_intent_update"));
+    assert_eq!(
+        gate.matches("task_intent_update").count(),
+        1,
+        "minimal gate may name only the one approved Intent bootstrap tool"
+    );
 
     let workflow_tool_names = [
-        "task_intent_update",
         "task_checkpoint",
         "candidate_list",
         "candidate_get",
@@ -5907,6 +5911,7 @@ fn assert_skill_bundle_contract(gate: &str, workflow: &str, metadata: &str) {
         "task_artifact_focus",
         "engineering_reference_record",
     ];
+    assert!(workflow.contains("task_intent_update"));
     for tool_name in workflow_tool_names {
         assert!(
             !gate.contains(tool_name),

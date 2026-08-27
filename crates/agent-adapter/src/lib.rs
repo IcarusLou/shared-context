@@ -156,9 +156,10 @@ impl ResolvedActivationDecision {
 
 /// The complete Agent-visible activation marker.
 ///
-/// This fixed value contains no Repository identity, path, membership, Prompt, transcript,
-/// historical Context, or executable instruction. Direct and Group activation use the same value.
-pub const SHARED_CONTEXT_ACTIVATION_MARKER: &str = "<shared-context-active>Shared Context is authorized; the installed skill may be used.</shared-context-active>";
+/// This fixed value contains no Repository identity, path, membership, Prompt, transcript, or
+/// historical Context. Its only action guidance is the bounded explicit Intent bootstrap call;
+/// Direct and Group activation use the same value.
+pub const SHARED_CONTEXT_ACTIVATION_MARKER: &str = "<shared-context-active>Shared Context is authorized. Before substantive work, call task_intent_update.</shared-context-active>";
 
 /// Exact upper bound for Agent-visible activation policy output.
 pub const SHARED_CONTEXT_ACTIVATION_MARKER_MAX_BYTES: usize =
@@ -867,6 +868,7 @@ mod tests {
             SHARED_CONTEXT_ACTIVATION_MARKER.len(),
             SHARED_CONTEXT_ACTIVATION_MARKER_MAX_BYTES
         );
+        assert!(SHARED_CONTEXT_ACTIVATION_MARKER.contains("task_intent_update"));
         for private_data in [
             "rpo_",
             "grp_",
@@ -874,7 +876,6 @@ mod tests {
             "implement private task",
             "transcript",
             "Context data",
-            "task_intent_update",
         ] {
             assert!(!SHARED_CONTEXT_ACTIVATION_MARKER.contains(private_data));
         }

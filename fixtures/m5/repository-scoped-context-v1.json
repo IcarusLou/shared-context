@@ -1,8 +1,8 @@
 {
   "schema": "sctx.repository-scoped-context.acceptance.v1",
-  "activation_marker": "<shared-context-active>Shared Context is authorized; the installed skill may be used.</shared-context-active>",
+  "activation_marker": "<shared-context-active>Shared Context is authorized. Before substantive work, call task_intent_update.</shared-context-active>",
   "source_assets": {
-    "gate_bytes": 1472,
+    "gate_bytes": 1543,
     "workflow_bytes": 10390,
     "metadata_bytes": 263
   },
@@ -15,7 +15,7 @@
       "business_residue": 0
     },
     "enabled": {
-      "activation_bytes": 109,
+      "activation_bytes": 126,
       "activation_max_bytes": 128,
       "workflow_reads": 1,
       "mcp_calls": 5,

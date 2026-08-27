@@ -24,6 +24,10 @@ _Avoid_: Task, Workspace, knowledge owner
 The one TaskSession currently selected for new TaskIntentRevisions, non-locating TaskSignals, and retrieval within an ExternalSession. Changing it is an explicit task-boundary decision, not a Workspace-derived guess.
 _Avoid_: Active Space, latest Prompt
 
+**IntentBootstrapReminder**:
+A bounded, one-shot advisory for an authorized Agent session that reaches substantive tool work before an ActiveTask exists. It asks the Agent to call task_intent_update explicitly, without interpreting Prompt text or creating a Task.
+_Avoid_: automatic Task, Prompt-derived Intent, recurring reminder
+
 **TaskIntentRevision**:
 One immutable version of a WorkingIntentSnapshot in a TaskSession's parent chain. It records how task understanding evolves without selecting or owning a ContextSpace.
 _Avoid_: Space revision, Prompt history

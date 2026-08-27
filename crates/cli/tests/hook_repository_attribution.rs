@@ -337,6 +337,28 @@ fn assert_neutral(output: &Output, forbidden: &[&str]) {
     }
 }
 
+fn assert_bootstrap_reminder(output: &Output, forbidden: &[&str]) {
+    assert!(
+        output.status.success(),
+        "Hook must fail open: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({
+            "systemMessage": "Shared Context: no ActiveTask exists. Call task_intent_update for this substantive task before continuing."
+        })
+    );
+    let observable = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for value in forbidden {
+        assert!(!observable.contains(value), "Hook leaked {value:?}");
+    }
+}
+
 fn task_intent() -> WorkingIntentSnapshot {
     WorkingIntentSnapshot {
         goal: "Prove repository-scoped Hook attribution".to_owned(),
@@ -433,16 +455,18 @@ fn group_scope_records_registered_nonmembers_and_preserves_multi_checkout_mappin
             3,
         ),
     ] {
-        assert_neutral(
-            &fixture.hook(&post_tool(
-                session,
-                &fixture.group_root,
-                input,
-                "Inspect",
-                "RAW_GROUP_ALLOWED",
-            )),
-            &["RAW_GROUP_ALLOWED"],
-        );
+        let output = fixture.hook(&post_tool(
+            session,
+            &fixture.group_root,
+            input,
+            "Inspect",
+            "RAW_GROUP_ALLOWED",
+        ));
+        if expected_count == 1 {
+            assert_bootstrap_reminder(&output, &["RAW_GROUP_ALLOWED"]);
+        } else {
+            assert_neutral(&output, &["RAW_GROUP_ALLOWED"]);
+        }
         assert_eq!(fixture.capture_count(session), expected_count);
     }
     let captures = fixture.captures(session);

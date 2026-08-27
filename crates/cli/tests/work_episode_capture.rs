@@ -184,7 +184,9 @@ fn runtime_diagnostics(values: &[CaptureDiagnosticKind]) -> Vec<WorkEpisodeDiagn
             CaptureDiagnosticKind::UnsafeArtifactPath => {
                 Some(WorkEpisodeDiagnosticKind::CaptureUnsafeArtifactPath)
             }
-            CaptureDiagnosticKind::NoActiveTask | CaptureDiagnosticKind::RuntimeUnavailable => None,
+            CaptureDiagnosticKind::NoActiveTask
+            | CaptureDiagnosticKind::IntentBootstrapRequired
+            | CaptureDiagnosticKind::RuntimeUnavailable => None,
         })
         .collect()
 }
@@ -227,7 +229,9 @@ fn hook_capture_keeps_locator_then_explicit_claim_and_ingestion_are_verifiable()
             no_task_raw,
             "Inspect",
         )),
-        json!({})
+        json!({
+            "systemMessage": "Shared Context: no ActiveTask exists. Call task_intent_update for this substantive task before continuing."
+        })
     );
     let store = CaptureStore::initialize(harness.root()).unwrap();
     let before_task = store
