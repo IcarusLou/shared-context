@@ -11,8 +11,8 @@ use std::{
 use sctx_domain::{
     Applicability, ArtifactKind, ArtifactLocator, ContextId, ContextKind, ContextRevisionDraft,
     EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot, PublicationAction,
-    PublicationDraft, ReferenceRelation, RepoRelativePath, ReviewDraft, ReviewVerdict, RevisionId,
-    TaskId, TaskSignal, TaskSignalKind, WorkingIntentSnapshot,
+    PublicationDraft, ReferenceRelation, RepoRelativePath, RepositoryId, ReviewDraft,
+    ReviewVerdict, RevisionId, TaskId, TaskSignal, TaskSignalKind, WorkingIntentSnapshot,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
@@ -301,6 +301,89 @@ fn accepted_context(root: &Path, statement: &str) -> (ContextId, RevisionId) {
         .unwrap(),
     );
     (context_id, revision_id)
+}
+
+#[test]
+fn public_artifact_focus_uses_strict_text_only_while_graph_is_unavailable() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("public focus fallback root");
+    GitStore::bootstrap_local(&root).unwrap();
+    let checkout = temporary.path().join("public focus fallback checkout");
+    init_repo(
+        &checkout,
+        &[(
+            "src/contracts/fallback.rs",
+            "pub fn fallback_contract() {}\n",
+        )],
+    );
+    let checkout = fs::canonicalize(checkout).unwrap();
+    let config = UserConfigStore::open_existing(&root).unwrap();
+    let repository_id = config
+        .add_repository(RepositoryId::new(), std::slice::from_ref(&checkout))
+        .unwrap()
+        .repository
+        .repository_id;
+    let expected_context = accepted_context(
+        &root,
+        &format!("{repository_id} src/contracts/fallback.rs owns the strict fallback contract"),
+    )
+    .0;
+    let session = "public-focus-text-fallback";
+    let catalog = config.repository_catalog().unwrap();
+    AuthorizedSessionScopeStore::initialize(&root)
+        .unwrap()
+        .authorize(
+            &ExternalSessionLocator::new("codex", session).unwrap(),
+            &catalog.resolve_activation_scope(&checkout).unwrap(),
+            &catalog,
+        )
+        .unwrap();
+    let task = task_intent_update_at_root(
+        &root,
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            task_boundary: TaskBoundary::New,
+            expected_revision_id: ExpectedRevisionId::Null(()),
+            intent: WorkingIntentSnapshot::new("zzzzabsentpublicfallbackgoal").unwrap(),
+        },
+    )
+    .unwrap();
+    let focused = task_artifact_focus_at_root(
+        &root,
+        &ArtifactFocusQuery {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_revision_id: task.context.intent_revision_id.to_string(),
+            absolute_file_path: checkout
+                .join("src/contracts/fallback.rs")
+                .to_string_lossy()
+                .into_owned(),
+            locator: ArtifactFocusQueryCoordinates::File,
+            token_budget: 8_000,
+            max_spaces: 8,
+        },
+    )
+    .unwrap();
+    assert_eq!(focused.resolved_focus.repository_id, repository_id);
+    assert!(focused.context.artifact_generation.is_none());
+    assert!(focused.context.items.iter().any(|item| {
+        item.context.context_id == expected_context
+            && item.retrieval_paths.iter().any(|path| {
+                matches!(
+                    path,
+                    TaskRetrievalPath::ResolvedFocusTextFallback { explanation }
+                        if explanation.resolved_focus == focused.resolved_focus
+                )
+            })
+            && item
+                .retrieval_paths
+                .iter()
+                .all(|path| !matches!(path, TaskRetrievalPath::EngineeringGraph { .. }))
+    }));
+    assert!(focused.context.candidate_spaces.iter().all(|association| {
+        association.matched_artifacts.is_empty() && association.relation_paths.is_empty()
+    }));
 }
 
 fn scan_input(path: &Path, paths: &[&str]) -> RepositoryScanInput {

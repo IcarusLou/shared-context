@@ -827,6 +827,8 @@ task_signal_fingerprint
 
 业务仓库不可访问时，知识 Projection 仍必须可用；Artifact Resolution 标记为 unavailable，检索退化到 Intent、Context、Scope 和稳定 ContextRelation。
 
+若整个 Engineering Graph snapshot 不可用且请求带有服务端已解析的 `ResolvedFocus`，Search 可使用 `ResolvedFocusTextFallback`：只查询安全 Accepted Context，并要求 RepositoryId 与完整 kind-specific `ArtifactLocator.canonical_key()` 的规范化 token 序列都精确出现。返回路径显式标记 `resolved_focus_text_fallback`，`matched_artifacts`/Graph generation 保持为空，不扩展 ContextRelation，也不持久化 Focus。只要 Graph snapshot 存在——即使该 locator 在 Graph 中 missing、ambiguous 或 unreachable——都禁止 fallback；basename、部分路径、缺少 API/Symbol 坐标和跨 Repository 文本碰撞同样不匹配。
+
 ## 11. Task-first Retrieval
 
 ### 11.1 TaskContextRequest

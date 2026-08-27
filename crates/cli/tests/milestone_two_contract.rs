@@ -532,6 +532,17 @@ fn assert_typed_m2_path(path: &TaskRetrievalPath) {
             assert!(explanation.query_token_coverage_basis_points > 0);
             assert!(explanation.fusion_contribution_micros > 0);
         }
+        TaskRetrievalPath::ResolvedFocusTextFallback { explanation } => {
+            assert!(
+                !explanation
+                    .resolved_focus
+                    .locator
+                    .canonical_key()
+                    .is_empty()
+            );
+            assert!(!explanation.matched_components.is_empty());
+            assert!(!explanation.matched_fields.is_empty());
+        }
         TaskRetrievalPath::ExactScope { dimension, value } => {
             assert!(!dimension.is_empty());
             assert!(!value.is_empty());

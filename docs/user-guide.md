@@ -551,6 +551,8 @@ Intent JSON 的字段是：
 
 Artifact Focus 的 `locator_kind` 支持：`file`、`module`、`symbol`、`api`、`schema`、`test`。请求提供绝对文件路径；Repository ID 和仓库相对路径由本机 Catalog 解析，调用者不要猜。
 
+Engineering Graph 整体不可用时，Artifact Focus 会尝试严格文本 fallback：只有安全 Context 同时包含精确 RepositoryId 与完整 kind-specific locator key 才返回，并用 `resolved_focus_text_fallback` 路径明确说明它不是 Graph 证据。它不按 basename 或相似名称猜测；Graph 已存在但结果为 missing、ambiguous 或 unreachable 时也不会启用。
+
 Agent 还可以通过公开 MCP `task_capture_list` 有界列出当前 ActiveTask 拥有的 Capture。响应只有 `capture_id`、归一化摘要和安全诊断，不含原始工具输入/输出；Checkpoint 用 `{"kind":"capture","capture_id":"cap_..."}` 显式选择后，Runtime 才把它转换为 owned WorkObservation。CLI 当前没有独立的 Capture list 子命令。
 
 ### 6.4 Candidate 审核

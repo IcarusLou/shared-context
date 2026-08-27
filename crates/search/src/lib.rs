@@ -376,6 +376,7 @@ pub struct IntentConflictHandoffExplanation {
 pub enum TaskAssociationChannel {
     ResolvedArtifactExact,
     ContextRelation,
+    ResolvedFocusTextFallback,
     ArtifactHintSpaceIntentBm25,
     ArtifactHintAcceptedContextBm25,
     InterfaceHintSpaceIntentBm25,
@@ -508,6 +509,14 @@ pub struct WorkingIntentHintTextExplanation {
     pub fusion_contribution_micros: u32,
 }
 
+/// Strict text-only explanation used only when no Engineering Graph snapshot is available.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedFocusTextFallbackExplanation {
+    pub resolved_focus: ResolvedFocus,
+    pub matched_components: Vec<String>,
+    pub matched_fields: Vec<MatchField>,
+}
+
 /// Explainable route from the Task to one returned Context.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
@@ -537,6 +546,9 @@ pub enum TaskRetrievalPath {
     },
     WorkingIntentHintText {
         explanation: WorkingIntentHintTextExplanation,
+    },
+    ResolvedFocusTextFallback {
+        explanation: ResolvedFocusTextFallbackExplanation,
     },
     ExactScope {
         dimension: String,
@@ -765,6 +777,7 @@ impl SearchEngine {
                     graph_snapshot
                         .as_ref()
                         .and_then(|snapshot| snapshot.context_tree_oid.as_deref()),
+                    resolved_focus.is_some() && graph.is_none(),
                     ContextPackMode::AutomaticInjection,
                 )
             })?;
@@ -817,6 +830,7 @@ impl SearchEngine {
                     graph_snapshot
                         .as_ref()
                         .and_then(|snapshot| snapshot.context_tree_oid.as_deref()),
+                    request.resolved_focus.is_some() && graph.is_none(),
                     request.mode,
                 )?;
                 let omitted_spaces = inference
@@ -1621,6 +1635,7 @@ struct AssociationEvidence {
     matched_scopes: BTreeSet<ScopeEvidence>,
     graph_exact_contexts: BTreeSet<ContextId>,
     relation_contexts: BTreeSet<ContextId>,
+    focus_text_fallback_contexts: BTreeSet<ContextId>,
     relation_paths: BTreeSet<Vec<String>>,
     channel_features: Vec<TaskAssociationChannelFeature>,
     fused_score_basis_points: u16,
@@ -1657,6 +1672,7 @@ fn infer_task_space_associations(
     resolved_focus: Option<&ResolvedFocus>,
     engineering_graph: Option<&EngineeringProjection>,
     graph_context_tree_oid: Option<&str>,
+    focus_text_fallback_enabled: bool,
     mode: ContextPackMode,
 ) -> Result<TaskAssociationInference> {
     let query_tokens = automatic_eligible_query_tokens(connection, query_tokens, mode)?;
@@ -1680,6 +1696,11 @@ fn infer_task_space_associations(
     let mut evidence = BTreeMap::<SpaceId, AssociationEvidence>::new();
     apply_intent_evidence(&mut evidence, intent_candidates);
     apply_working_intent_hint_evidence(connection, &hint_queries, &mut evidence, &mut contexts)?;
+    if focus_text_fallback_enabled {
+        if let Some(resolved_focus) = resolved_focus {
+            query_resolved_focus_text_fallback(connection, resolved_focus, &mut contexts)?;
+        }
+    }
     let mut graph_contexts = BTreeMap::new();
     let mut focus_reachable = false;
     if let Some(graph) = engineering_graph {
@@ -1861,6 +1882,13 @@ fn aggregate_context_evidence(
     }
     if context.relation_depth.is_some() {
         aggregate.relation_contexts.insert(context_id);
+    }
+    if context
+        .graph_paths
+        .iter()
+        .any(|path| matches!(path, TaskRetrievalPath::ResolvedFocusTextFallback { .. }))
+    {
+        aggregate.focus_text_fallback_contexts.insert(context_id);
     }
     aggregate.relation_paths.extend(
         context
@@ -2618,6 +2646,106 @@ fn query_accepted_context_text(
     Ok(())
 }
 
+fn query_resolved_focus_text_fallback(
+    connection: &Connection,
+    resolved_focus: &ResolvedFocus,
+    evidence: &mut BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>,
+) -> Result<()> {
+    let components = resolved_focus_text_components(resolved_focus);
+    let tokens = components
+        .iter()
+        .flat_map(|component| search_tokens(component))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let Some(match_expression) = fts_or_match_expression(&tokens) else {
+        return Ok(());
+    };
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT revision.space_id, revision.context_id,
+                    bm25(context_fts, 0.0, 0.0, 10.0, 8.0, 4.0, 2.0),
+                    context_fts.title, context_fts.statement,
+                    context_fts.rationale, context_fts.evidence
+             FROM context_fts
+             JOIN context_revision AS revision USING(revision_id)
+             JOIN context_item AS item USING(context_id)
+             WHERE context_fts MATCH ?1
+               AND {SAFE_ACCEPTED_CONTEXT_PREDICATE}
+             ORDER BY revision.space_id, revision.context_id"
+        ))
+        .map_err(sql_error("prepare Resolved Focus text fallback"))?;
+    let rows = statement
+        .query_map([match_expression], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f64>(2)?,
+                [
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ],
+            ))
+        })
+        .map_err(sql_error("query Resolved Focus text fallback"))?;
+    let field_names = [
+        MatchField::Title,
+        MatchField::Statement,
+        MatchField::Rationale,
+        MatchField::Evidence,
+    ];
+    for row in rows {
+        let (space_id, context_id, bm25, fields) =
+            row.map_err(sql_error("collect Resolved Focus text fallback"))?;
+        let mut matched_fields = BTreeSet::new();
+        let all_components_match = components.iter().all(|component| {
+            let component_fields = fields
+                .iter()
+                .enumerate()
+                .filter_map(|(index, field)| {
+                    strict_text_component_match(field, component).then_some(field_names[index])
+                })
+                .collect::<Vec<_>>();
+            matched_fields.extend(component_fields.iter().copied());
+            !component_fields.is_empty()
+        });
+        if !all_components_match {
+            continue;
+        }
+        let entry = evidence
+            .entry((parse_id(&space_id)?, parse_id(&context_id)?))
+            .or_default();
+        entry.matched_fields.extend(matched_fields.iter().copied());
+        entry.matched_tokens.extend(tokens.iter().cloned());
+        entry.bm25 = Some(entry.bm25.map_or(bm25, |current| current.min(bm25)));
+        entry
+            .graph_paths
+            .push(TaskRetrievalPath::ResolvedFocusTextFallback {
+                explanation: ResolvedFocusTextFallbackExplanation {
+                    resolved_focus: resolved_focus.clone(),
+                    matched_components: components.clone(),
+                    matched_fields: matched_fields.into_iter().collect(),
+                },
+            });
+    }
+    Ok(())
+}
+
+fn resolved_focus_text_components(resolved_focus: &ResolvedFocus) -> Vec<String> {
+    vec![
+        resolved_focus.repository_id.to_string(),
+        resolved_focus.locator.canonical_key(),
+    ]
+}
+
+fn strict_text_component_match(field: &str, component: &str) -> bool {
+    let field = format!(" {} ", field.trim());
+    let component = format!(" {} ", normalize_search_text(component));
+    component != "  " && field.contains(&component)
+}
+
 fn explain_context_text_match(
     query_tokens: &[String],
     fields: &[String; 4],
@@ -2708,9 +2836,11 @@ const RRF_SCALE: usize = 1_000_000;
 const M2_FUSION_CHANNEL_WEIGHT: usize = 1;
 const GRAPH_ARTIFACT_CHANNEL_WEIGHT: usize = 13;
 const CONTEXT_RELATION_CHANNEL_WEIGHT: usize = 10;
+const FOCUS_TEXT_FALLBACK_CHANNEL_WEIGHT: usize = 6;
 const HINT_TEXT_CHANNEL_WEIGHT: usize = 3;
 const FUSION_CHANNEL_WEIGHT: usize = GRAPH_ARTIFACT_CHANNEL_WEIGHT
     + CONTEXT_RELATION_CHANNEL_WEIGHT
+    + FOCUS_TEXT_FALLBACK_CHANNEL_WEIGHT
     + (4 * HINT_TEXT_CHANNEL_WEIGHT)
     + 3;
 const MINIMUM_ASSOCIATION_SCORE_BASIS_POINTS: u16 = 100;
@@ -2999,6 +3129,33 @@ fn assign_graph_channel_features(evidence: &mut BTreeMap<SpaceId, AssociationEvi
                 CONTEXT_RELATION_CHANNEL_WEIGHT,
             ));
     }
+
+    let mut fallbacks = evidence
+        .iter()
+        .filter_map(|(space_id, value)| {
+            (!value.focus_text_fallback_contexts.is_empty())
+                .then_some((*space_id, value.focus_text_fallback_contexts.len()))
+        })
+        .collect::<Vec<_>>();
+    fallbacks.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    previous = None;
+    rank = 0;
+    for (offset, (space_id, strength)) in fallbacks.into_iter().enumerate() {
+        if previous != Some(strength) {
+            rank = offset + 1;
+            previous = Some(strength);
+        }
+        evidence
+            .get_mut(&space_id)
+            .expect("ranked Focus fallback Space exists")
+            .channel_features
+            .push(weighted_exact_channel_feature(
+                TaskAssociationChannel::ResolvedFocusTextFallback,
+                rank,
+                strength,
+                FOCUS_TEXT_FALLBACK_CHANNEL_WEIGHT,
+            ));
+    }
 }
 
 fn text_channel_feature(
@@ -3139,7 +3296,10 @@ fn association(
 }
 
 fn automatic_space_text_eligible(evidence: &AssociationEvidence, query_tokens: &[String]) -> bool {
-    if !evidence.graph_exact_contexts.is_empty() || !evidence.relation_contexts.is_empty() {
+    if !evidence.graph_exact_contexts.is_empty()
+        || !evidence.relation_contexts.is_empty()
+        || !evidence.focus_text_fallback_contexts.is_empty()
+    {
         return true;
     }
     let hint_phrase = evidence.hint_text.values().any(|hint| hint.phrase_match);
@@ -3840,6 +4000,7 @@ fn automatic_context_text_eligible(
                 path,
                 TaskRetrievalPath::EngineeringGraph { .. }
                     | TaskRetrievalPath::ContextRelation { .. }
+                    | TaskRetrievalPath::ResolvedFocusTextFallback { .. }
             )
         })
     {

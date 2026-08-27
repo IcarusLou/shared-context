@@ -48,6 +48,10 @@ _Avoid_: Active Focus, Focus Signal, saved Focus
 The server’s transient RepositoryIdentity plus complete ArtifactLocator interpretation of one ArtifactFocusQuery. It exists only for that query and is never restored, superseded, or reused implicitly.
 _Avoid_: Focus ID, Artifact evidence, persistent query state
 
+**ResolvedFocusTextFallback**:
+A strict, request-only text RetrievalPath requiring the complete RepositoryId plus canonical ArtifactLocator key when no EngineeringGraphSnapshot is available. It is not Graph evidence, never uses basename/fuzzy matching, and is disabled whenever a Graph snapshot exists, including missing or ambiguous resolution.
+_Avoid_: inferred Artifact edge, fuzzy Focus, saved fallback
+
 **TestOutcome**:
 A non-locating observation about a test tool execution, such as success or failure. It cannot identify or match a qualified Test Artifact; a request that needs that lookup supplies a separate ArtifactFocusQuery.
 _Avoid_: Test Artifact, qualified Test locator
@@ -153,7 +157,7 @@ A budgeted retrieval result for one WorkingIntentSnapshot revision, one current 
 _Avoid_: Space-scoped search result, manually routed Context Pack
 
 **RetrievalPath**:
-A typed explanation of how Working Intent text, ContextSpaceAssociation role, or this request’s ResolvedFocus made one Context relevant. A Primary/Related Space path remains distinct from ContextRelation and Engineering Graph paths; only an exact ResolvedFocus reachable in that Graph Snapshot can claim an engineering edge.
+A typed explanation of how Working Intent text, ContextSpaceAssociation role, or this request’s ResolvedFocus made one Context relevant. A Primary/Related Space path and ResolvedFocusTextFallback remain distinct from ContextRelation and Engineering Graph paths; only an exact ResolvedFocus reachable in that Graph Snapshot can claim an engineering edge.
 _Avoid_: opaque relevance score, inferred code relation
 
 **AutomaticTextEligibility**:

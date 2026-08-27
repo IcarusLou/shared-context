@@ -800,6 +800,162 @@ fn identical_locator_in_two_repositories_retrieves_only_focused_repository_conte
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn unavailable_graph_uses_strict_resolved_focus_text_without_fuzzy_collisions() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("focus text fallback")).unwrap();
+    let index = ProjectionIndex::for_store(&store);
+    let repository_id = RepositoryId::new();
+    let space_id = add_space(
+        &store,
+        "Strict Focus Fallback",
+        "strict focus fallback contexts",
+    );
+    let add = |statement: String| {
+        add_context(
+            &store,
+            space_id,
+            draft(ContextKind::Contract, &statement, "server", Vec::new()),
+        )
+        .0
+    };
+    let file_path = "src/contracts/order.rs";
+    let file_context = add(format!(
+        "{repository_id} {file_path} owns the order contract"
+    ));
+    let file_collision = add(format!(
+        "{repository_id} tests/contracts/order.rs is only a basename collision"
+    ));
+    let api_locator = ArtifactLocator::Api {
+        path: RepoRelativePath::new("src/api/orders.rs").unwrap(),
+        protocol: "https".to_owned(),
+        operation: "GET".to_owned(),
+        normalized_route: "/v2/orders/{order_id}".to_owned(),
+    };
+    let api_context = add(format!(
+        "{repository_id} src/api/orders.rs https GET /v2/orders/{{order_id}} defines the exact API"
+    ));
+    let api_collision = add(format!(
+        "{repository_id} src/api/orders.rs https POST /v2/orders/{{order_id}} is a collision"
+    ));
+    let symbol_locator = ArtifactLocator::Symbol {
+        path: RepoRelativePath::new("src/domain/order.rs").unwrap(),
+        language: "rust".to_owned(),
+        module: "domain::order".to_owned(),
+        enclosing_type: Some("OrderService".to_owned()),
+        symbol_name: "load_order".to_owned(),
+        signature: "load_order(order_id: Uuid) -> Result<Order>".to_owned(),
+    };
+    let symbol_context = add(format!(
+        "{repository_id} src/domain/order.rs rust domain::order OrderService load_order load_order(order_id: Uuid) -> Result<Order>"
+    ));
+    let symbol_collision = add(format!(
+        "{repository_id} src/domain/order.rs rust domain::legacy OrderService load_order load_order(order_id: Uuid) -> Result<Order>"
+    ));
+    index.synchronize().unwrap();
+    let engine = SearchEngine::new(index);
+    let focus = |locator: ArtifactLocator| {
+        let mut request = task_request(
+            repository_id.clone(),
+            ContextPackMode::AutomaticInjection,
+            20_000,
+        );
+        request.working_intent = WorkingIntentSnapshot::new("zzzzabsentfocustextgoal").unwrap();
+        request.resolved_focus = Some(resolved_focus(repository_id.clone(), locator));
+        engine.task_context_pack(&request).unwrap()
+    };
+    let assert_exact =
+        |pack: &sctx_search::TaskContextPack, expected: ContextId, collision: ContextId| {
+            assert!(pack.artifact_generation.is_none());
+            assert!(pack.graph_context_tree_oid.is_none());
+            assert!(
+                pack.items.iter().any(|item| {
+                    item.context.context_id == expected
+                        && item.retrieval_paths.iter().any(|path| {
+                            matches!(
+                                path,
+                                TaskRetrievalPath::ResolvedFocusTextFallback { explanation }
+                                    if explanation.resolved_focus.repository_id == repository_id
+                                        && !explanation.matched_components.is_empty()
+                                        && !explanation.matched_fields.is_empty()
+                            )
+                        })
+                        && item
+                            .retrieval_paths
+                            .iter()
+                            .all(|path| !matches!(path, TaskRetrievalPath::EngineeringGraph { .. }))
+                }),
+                "{pack:#?}"
+            );
+            assert!(
+                pack.items
+                    .iter()
+                    .all(|item| item.context.context_id != collision),
+                "{pack:#?}"
+            );
+            assert!(pack.associations.iter().all(|association| {
+                association.matched_artifacts.is_empty() && association.relation_paths.is_empty()
+            }));
+            assert!(pack.graph_diagnostics.iter().any(|diagnostic| {
+                diagnostic.kind == TaskGraphDiagnosticKind::ArtifactNotReachableInGraph
+            }));
+        };
+    assert_exact(
+        &focus(ArtifactLocator::File {
+            path: RepoRelativePath::new(file_path).unwrap(),
+        }),
+        file_context,
+        file_collision,
+    );
+    assert_exact(&focus(api_locator), api_context, api_collision);
+    assert_exact(&focus(symbol_locator), symbol_context, symbol_collision);
+}
+
+#[test]
+fn available_graph_missing_focus_never_uses_text_fallback() {
+    let fixture = graph_fixture();
+    let missing_path = "src/not-in-graph.rs";
+    let (text_context, _, _) = add_context(
+        &fixture.store,
+        fixture.source_space,
+        draft(
+            ContextKind::Contract,
+            &format!(
+                "{} {missing_path} is textually present but not in the available Graph",
+                fixture.repository.repository_id
+            ),
+            "server",
+            Vec::new(),
+        ),
+    );
+    fixture.index.synchronize().unwrap();
+    let engine = SearchEngine::with_engineering_graph(fixture.index, fixture.graph_store);
+    let mut request = task_request(
+        fixture.repository.repository_id.clone(),
+        ContextPackMode::AutomaticInjection,
+        12_000,
+    );
+    request.working_intent = WorkingIntentSnapshot::new("zzzzabsentavailablegraphgoal").unwrap();
+    request.resolved_focus = Some(resolved_focus(
+        fixture.repository.repository_id,
+        ArtifactLocator::File {
+            path: RepoRelativePath::new(missing_path).unwrap(),
+        },
+    ));
+    let pack = engine.task_context_pack(&request).unwrap();
+    assert!(pack.items.iter().all(|item| {
+        item.context.context_id != text_context
+            && item
+                .retrieval_paths
+                .iter()
+                .all(|path| !matches!(path, TaskRetrievalPath::ResolvedFocusTextFallback { .. }))
+    }));
+    assert!(pack.graph_diagnostics.iter().any(|diagnostic| {
+        diagnostic.kind == TaskGraphDiagnosticKind::ArtifactNotReachableInGraph
+    }));
+}
+
+#[test]
 fn generic_test_outcome_never_matches_qualified_test_artifact() {
     let fixture = graph_fixture();
     let locator = ArtifactLocator::Test {
@@ -1530,6 +1686,7 @@ fn ambiguous_edges_are_explicit_diagnostics_only_and_never_raise_automatic_eligi
                     path,
                     TaskRetrievalPath::EngineeringGraph { .. }
                         | TaskRetrievalPath::GraphDiagnostic { .. }
+                        | TaskRetrievalPath::ResolvedFocusTextFallback { .. }
                 )
             })
     );
