@@ -76,6 +76,10 @@ _Avoid_: transcript, tool log, ownerless Task attribution
 A nonblocking attempt to persist one complete CaptureRecord from an Agent Hook. It either publishes one atomic record or returns Busy with no delayed write; busy and storage failure remain fail-open for the Agent and create no engineering fact.
 _Avoid_: queued capture, partial record, blocking audit log
 
+**InstalledHostAcceptance**:
+A black-box acceptance path that begins with the installed Agent configuration and invokes only its configured Hook command, public MCP process, public CLI, and observable Git output. Sanitized payload fixtures remain regression inputs but cannot substitute for this installed-process boundary.
+_Avoid_: direct Runtime/store assertion, fixture-only host proof, model-transcript replay claim
+
 **CaptureClaim**:
 An idempotent reservation of one CaptureRecord for its exact Task owner. It neither deletes the CaptureRecord nor proves that Runtime ingestion committed.
 _Avoid_: Observation commit, Capture deletion, cross-Task handoff

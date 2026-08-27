@@ -308,9 +308,10 @@ Workspace 路径不会自动绑定一个 Space，文本 Hint 也不会冒充已�
 - SessionStart 在模型推理前用本机 Repository Catalog 判定范围，不读取 Prompt，也不调用模型。已登记 checkout 是 `Direct`；只有显式登记且精确匹配的 Group root 才是 `Group`；普通父目录、未登记 sibling 和其他目录都是 `Disabled`。
 - Enabled 只返回一个固定、短小且不含路径/Repository/Prompt/Session 身份的 marker。PromptSubmit 不重复 marker。Disabled 的 Prompt、Tool、压缩、停止和结束 Hook 不打开 Runtime/Capture，也不写 Report 或知识 Git。
 - 同一 Agent Session locator 的第一次成功决定会一直复用到 SessionEnd；后续 resume/compact 或 cwd 变化不会重新判定。Catalog/lease 锁忙、损坏或异常会立即按 Disabled 处理，但不会阻断正常编程。
-- PostToolUse 会在记录前检查全部结构化路径。Enabled 表示整个 Session 已准入，不把调查目标限制在启动 Repo 或 Group 成员：其他已登记 Repo 会按真实 Catalog identity 记录；安全的未登记路径、registered/unregistered mixed 或无法用一个显式 workspace 安全表示的多 Repo 事件只保留无路径、无 Repository 猜测的非定位工程含义；相对、缺失、symlink、歧义或特殊文件仍让整条事件被丢弃。
-- Hook 采用 fail-open：Shared Context 暂时不可用时，正常编程仍可继续。
-- 短期 Capture 会先做隐私过滤，默认保留时间为 24 小时，并受大小限制。
+- PostToolUse 会在记录前检查 `absolute_file_path`、`file_path`、`filepath`、`path`、`cwd`、`workdir`、`working_directory` 等已知结构化路径。Enabled 表示整个 Session 已准入，不把调查目标限制在启动 Repo 或 Group 成员：其他已登记 Repo 会按真实 Catalog identity 记录；安全的未登记路径、registered/unregistered mixed 或无法用一个显式 workspace 安全表示的多 Repo 事件只保留无路径、无 Repository 猜测的非定位工程含义；相对、缺失、symlink、歧义或特殊文件仍让整条事件被丢弃。
+- Adapter 只保留 `FileOperation`、`TestRunner`、`Shell`、`SharedContext` 或 `Other`。Shell/Bash 只使用结构化工作目录；仅简单白名单 test runner 形成 TestOutcome，包含管道、重定向、引号或复合 shell 的命令不会被猜成测试，原始命令、输出和 vendor tool name 都不写入 Capture。Shared Context 自身工具不会回流采集。
+- Hook 采用 fail-open：Shared Context 暂时不可用或 Capture 锁忙时，正常编程仍可继续；Busy 不排队，也不会在 Hook 返回后补写。
+- 短期 Capture 会先做隐私过滤，默认保留时间为 24 小时，并受单条与总字节限制。PostTool 热路径通过持久化字节计数判断总量；过期清理移到显式生命周期 cleanup，不再每次全目录扫描。
 - Work Episode 和长期 Context 保存结构化工程含义，不保存原始聊天、完整工具输出或完整终端日志。
 - Candidate Review 默认保留 30 天，属于不可信数据；确认前不会自动注入为可信 Context。
 - 检索到的 Context 也应当按只读数据处理，不应执行其中出现的命令或指令。
@@ -710,8 +711,8 @@ sctx search \
 
 | 命令 | 功能 |
 |---|---|
-| `sctx hook --agent cursor` | 从标准输入接收 Cursor Hook JSON，输出 Cursor 所需响应。通常由安装器写入的 Hook 配置调用。 |
-| `sctx hook --agent codex` | 处理 Codex Hook JSON。通常不应手工调用。 |
+| `sctx hook --agent cursor` | 从标准输入接收 Cursor Hook JSON，输出 Cursor 所需响应。通常由安装器写入且带 `--agent-version` 的 Hook 配置调用。 |
+| `sctx hook --agent codex` | 处理 Codex Hook JSON。安装器会把 setup 时验证的版本固化为 `--agent-version`，Hook 本身不再逐事件启动版本探测进程；通常不应手工调用。 |
 | `sctx hook --agent <cursor 或 codex> --capabilities ...` | 探测 Agent 版本、Hook 可用性和信任状态。Codex 可用 `--trust <confirmed 或 unconfirmed>`。 |
 | `sctx mcp serve --client cursor` | 通过标准输入/输出运行 Cursor MCP Server。 |
 | `sctx mcp serve --client codex` | 通过标准输入/输出运行 Codex MCP Server。 |

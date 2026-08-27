@@ -10,7 +10,7 @@
 
 本项目尚未上线，本文直接定义目标模型、接口和存储结构。
 
-### 1.1 当前实现状态（Mew #193）
+### 1.1 当前实现状态（Mew #208）
 
 本文的大部分章节描述目标架构，不代表代码已经全部实现。当前里程碑边界如下：
 
@@ -21,6 +21,7 @@
 | **M3：Engineering Graph** | **已实现** | 稳定本机 Repository Catalog、可重建 Registry、Reference-derived 有界扫描、build-time immutable Context/safety snapshot、历史 Graph Retrieval、ContextRelation 1–2 跳及 MCP/CLI 工作流已通过固定跨 crate/E2E oracle |
 | **M4：Low-tax Capture** | **已实现** | #117、#136、#156–#164 与 #169 已实现旁路 Working Intent、Hint Text retrieval、WorkEpisode、Hook lifecycle、Candidate Builder/analysis/Review/Confirm，并通过固定跨层 E2E、privacy、performance 与恢复验收 |
 | **Repository 范围推理前准入与 Session 授权** | **实现完成，待最终人工验收** | #181–#191/#194 实现 Direct/显式 Group/Disabled、短期 Session lease、SessionStart marker、MCP Session guard、registered cross-Repo / safe non-locating / unsafe drop 与 SessionEnd 清理；#192 提供 marker-gated installer-owned workflow，#196 补齐 Group ID 隐私表，#193 以手写 oracle 关闭 token bytes proxy、Direct/Group 黑盒链、installer 与 NPM 回归证据 |
+| **真实宿主契约与 Hook 热路径** | **实现完成，待 #208 最终人工验收** | #218–#221 以 typed ToolCategory 归一化 Codex/Cursor payload，统一 Rust/MCP/derived host declaration，使用 try-lock/atomic Capture 和短 SQLite timeout，并通过 installed Codex A/B、Cursor lifecycle 与 32-way p99 gate |
 
 当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订承载 `WorkingIntentSnapshot` 的 `TaskIntentRevision`，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。SessionStart 先在本地同步完成 Repository 范围准入，只有 Enabled lease 才向 Agent 返回固定短 marker，并明确要求在 substantive work 前显式调用 `task_intent_update`；PromptSubmit 始终不重复 marker，也不读取 Runtime/Search。若 Enabled Session 在没有 ActiveTask 时先发生 PostToolUse，Hook 只返回一次 bounded IntentBootstrapReminder，不读取 Prompt、不创建 Task；PreCompact/TurnStop 的 ownerless Capture 记录 typed `intent_bootstrap_required` diagnostic。Enabled lease 是 Session-level 准入：PostToolUse 的安全已登记路径按 Catalog 保留真实 Repository 归属，安全未登记或 mixed/unrepresentable multi-Repo 事件只形成无 workspace/file hint 的 non-locating Breadcrumb，可识别测试工具仍形成非事实、非定位的 TestOutcome；unsafe 输入整条丢弃。TaskSignal 可影响 Working Intent retrieval，但不是工程 Evidence。Hook 不运行 Git discovery、Scanner、Registry sync、Graph rebuild、Focus 提交、Episode open/ingest，也不伪造 Claim。PreCompact/TurnStop 只能关闭已有 current-Intent Checkpoint 的 Episode并调用共享 Builder。显式 Graph 工具完成 bounded scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。Candidate 只由 closed WorkEpisode 的 Builder 调用内部 submission service 创建，公开面仅提供 list/get/discard/confirm。
 
@@ -33,9 +34,13 @@
 - `AuthorizedSessionScope` 是按 `ExternalSessionLocator` 隔离、Catalog revision 约束、最长 24 小时的产品私有 lease。文件名只含 locator digest，记录只含 typed decision、允许的 RepositoryId、Catalog revision 与 TTL；不保存 checkout/Group root、Prompt、transcript、tool output、report 或业务正文。
 - SessionStart 同步读取 Catalog，并对 Catalog/lease 使用 non-blocking try-lock。只有 Missing locator 可以按本次 canonical cwd 解析并先持久化 lease；Current 直接复用，Stale/Expired/锁忙/解析异常立即返回 `Disabled`。同一 locator 的首次成功决定是 sticky，后续 startup/resume/compact 即使 cwd 改变也不重新判归属。
 - `Direct` 与 `Group` 使用同一个不超过 128 bytes、无 Repository/路径/Prompt/身份的 activation marker；marker 只出现在显式 SessionStart（包括 Codex resume/compact）边界，PromptSubmit 返回 neutral wire output。
-- Enabled PostToolUse 在 Runtime/Capture 之前验证结构化 `file_path`/`filepath`/`path`/`workdir`/`working_directory`。启动时的 Direct/Group 与 `allowed_repository_ids` 不限制 Session 后续调查目标：任意已登记 Repository 使用 Catalog longest-prefix 与真实 File mapping；显式 Group root 可安全表示覆盖其下多个 registered checkout 的单一 Capture workspace。安全未登记路径、registered/unregistered mixed 或无显式 root 可表示的多 checkout 事件整条降级为 path-free non-locating meaning；ambiguous、missing、relative、symlink 或非 file/directory 输入整条丢弃。
+- Enabled PostToolUse 在 Runtime/Capture 之前验证结构化 `absolute_file_path`/`file_path`/`filepath`/`path`/`cwd`/`workdir`/`working_directory`。Adapter 只输出 `FileOperation`、`TestRunner`、`Shell`、`SharedContext` 或 `Other`；Shell/Bash 只保留 cwd，只有无管道、重定向、引号或 compound construct 的白名单简单 runner 可形成 TestOutcome，Shared Context 自身工具不回流 Capture。启动时的 Direct/Group 与 `allowed_repository_ids` 不限制 Session 后续调查目标：任意已登记 Repository 使用 Catalog longest-prefix 与真实 File mapping；显式 Group root 可安全表示覆盖其下多个 registered checkout 的单一 Capture workspace。安全未登记路径、registered/unregistered mixed 或无显式 root 可表示的多 checkout 事件整条降级为 path-free non-locating meaning；ambiguous、missing、relative、symlink 或非 file/directory 输入整条丢弃。
 - Disabled 的 Prompt/Tool/PreCompact/Stop/End 全部保持 Agent-neutral 且不打开 Runtime/Capture；SessionEnd 只按 exact locator 尝试移除 lease，不跨 Session 清理。Catalog/lease 锁忙或异常均 fail-open 让 Agent 继续，同时 fail-closed 为 Disabled。
 - scope 解析与 lease 热路径不运行 Git 或 Repository scan；安装仍是用户级配置，不需要 launcher，不在业务仓库写项目级 MCP/Hook 文件。
+
+`task_checkpoint` 的 Rust request type 是组合校验权威；MCP `inputSchema` 不再用顶层 `anyOf` 表达 Claim/Unknown/empty-close 组合，避免宿主声明分叉。必填字段、Claim 可选字段以及 Boundary/Context/Evidence/Artifact/Reference/Relation 枚举由 Rust serialization 与真实 `tools/list` 对齐，并生成 Codex TypeScript golden 作为派生视图。
+
+PostTool Capture 使用 nonblocking `try_lock_exclusive`；Busy 立即 neutral，既不排队也不迟到写入。完整 record 先写私有临时文件再原子发布，versioned byte metadata 维护 aggregate bytes/count；expired cleanup 只在显式 lifecycle cleanup 执行，不再位于每次 Capture 热路径。Hook Runtime 使用 25ms SQLite busy timeout，existing database 不重复执行 schema-writing PRAGMA；普通 CLI/MCP 仍保留 10s 交互超时。Installer 每次 setup 只探测一次 Agent 版本，将 bounded version token 固化进所有托管 Hook 命令，并在临时探测失败时沿用 manifest 中上次版本；Hook 事件不再启动版本子进程。
 
 当前 MCP Server 已按 current Enabled `AuthorizedSessionScope` 实施 Session-level authorization guard；Disabled/Missing/Expired/Stale/busy/corrupt Session 调用被拒绝，Enabled Session 可调查任意已登记 Repository或提交不伪造 Artifact identity 的非定位 Evidence。全局 Skill 主入口是最小 activation gate：没有可信 SessionStart marker 时自动路径不读取完整 workflow reference、不产生 Shared Context MCP 调用提示；有 marker 时才完整读取一次 installer-owned reference。Server guard 只负责安全和不落越权数据，Skill gate 负责调用前的指令准入。#214 更新后的固定 oracle 证明 Disabled 的 activation/reference/MCP call/result/business residue proxy 全 0，Enabled 每条链 marker 为 126 bytes、完整 workflow 读取一次、实际 public MCP 调用 5 次且清洗后的 result bytes 落在手写上限内；source gate/workflow/metadata 分别为 1543/10390/263 bytes。Bytes 不等于 token，MCP 进程和工具 Schema 仍由用户级配置全局提供，可能物理启动或可见。
 

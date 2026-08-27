@@ -1,10 +1,10 @@
 # Task-first Retrieval Integration Acceptance Report
 
 Date: 2026-08-27
-Scope: production acceptance through Mew #170/#164 is unchanged, including #136/#169; Repository-scoped pre-inference Hook acceptance through #189 is human-accepted, #191 adds MCP Session authorization, #194 aligns Enabled cross-Repository Hook recording, #192 adds marker-gated progressive Skill loading, and #193 closes the fixed token-bytes proxy/NPM evidence pending final human acceptance. Mew #206/#209–#213 add the human-accepted Capture→Relation→EngineeringReference→Related Space path. Mew #207/#214–#217 add Intent bootstrap, TaskIntent-scoped Space grouping, automatic text quality gates and strict Focus fallback, excluding every section 10.2 Session lease change; additive non-blocking replay evidence extends through #171/#176
+Scope: production acceptance through Mew #170/#164 is unchanged, including #136/#169; Repository-scoped pre-inference Hook acceptance through #189 is human-accepted, #191 adds MCP Session authorization, #194 aligns Enabled cross-Repository Hook recording, #192 adds marker-gated progressive Skill loading, and #193 closes the fixed token-bytes proxy/NPM evidence pending final human acceptance. Mew #206/#209–#213 add the human-accepted Capture→Relation→EngineeringReference→Related Space path. Mew #207/#214–#217 is human-accepted and adds Intent bootstrap, TaskIntent-scoped Space grouping, automatic text quality gates and strict Focus fallback. Mew #208/#218–#221 aligns real structured Tool payloads and host declarations, bounds the Capture hot path, and closes installed Codex/Cursor public-process acceptance, excluding every section 10.2 Session lease change; additive non-blocking replay evidence extends through #171/#176
 Documentation baseline before the #170 language alignment: `main@e03193b`
 
-The original production baseline remains closed by final M4 Gate #164. The additive Mew #206 milestone is human-accepted; Mew #207 is implemented through its deterministic public-surface gate and is pending the next human milestone decision.
+The original production baseline remains closed by final M4 Gate #164. The additive Mew #206 and #207 milestones are human-accepted. Mew #208 is implemented through its installed live-host gate and is pending final human acceptance.
 
 ## Verdict
 
@@ -21,7 +21,39 @@ SessionStart now performs synchronous local Repository-scope admission before mo
 | Repository-scoped pre-inference activation — Mew #185 | IMPLEMENTED; HUMAN ACCEPTED | #181–#189 provide explicit RepositoryGroup/Direct/Disabled resolution, sticky short-lived Session lease, SessionStart marker, exact SessionEnd cleanup, and a fixed Codex/Cursor lifecycle oracle |
 | Session authorization and cross-Repository investigation — Mew #190 | IMPLEMENTED; HUMAN REVIEW PENDING | #191 provides MCP Session-level authorization; #194 records registered cross-Repo investigation with real Catalog mapping, safe unregistered/mixed work as path-free non-locating meaning, and unsafe input as neutral; #192 uses a minimal trusted-marker gate; #193 closes the fixed Direct/Group/Disabled token-bytes proxy, installer, privacy, and NPM evidence |
 | Captured relation/reference workflow — Mew #206 | IMPLEMENTED; HUMAN ACCEPTED | #209–#213 expose owned Capture summaries, ingest selected Capture Evidence, persist typed ContextRelations and EngineeringReferences atomically, retrieve Primary-owned Context through Related Space roles, and close one sanitized Codex-A/Cursor-B public path across two checkouts of the same RepositoryId |
-| Retrieval quality workflow — Mew #207 | IMPLEMENTED; HUMAN REVIEW PENDING | #214/#215/#222/#216/#217 provide one-shot Intent bootstrap, exact TaskIntentRevision ProposedSpaceGroup reuse, absolute automatic-text gates, and Graph-unavailable-only strict Focus fallback through one public Hook/MCP/CLI acceptance chain |
+| Retrieval quality workflow — Mew #207 | IMPLEMENTED; HUMAN ACCEPTED | #214/#215/#222/#216/#217 provide one-shot Intent bootstrap, exact TaskIntentRevision ProposedSpaceGroup reuse, absolute automatic-text gates, and Graph-unavailable-only strict Focus fallback through one public Hook/MCP/CLI acceptance chain |
+| Real host contract and Hook hot path — Mew #208 | IMPLEMENTED; HUMAN REVIEW PENDING | #218–#221 normalize real Tool payloads, align Rust/MCP/derived Codex declarations, enforce nonblocking atomic Capture with 32-way p99 below 500ms, and run installed Codex A/B plus Cursor lifecycle through public processes |
+
+## Installed live-host gate — Mew #208/#218–#221
+
+`installed_live_host_workflow` invokes the signed test-built `sctx setup` command in an isolated HOME, then reads and executes the exact Hook commands written to the installed Codex and Cursor configurations. Every CLI and MCP request uses `~/.shared-context/bin/current/sctx`; the test never calls `CaptureStore`, `TaskRuntime`, Reducer, or Index APIs. Host-version shims are generated at runtime only to keep the isolated HOME probe deterministic; the final local gate separately executed the installed real hosts and observed `codex-cli 0.149.1` and Cursor `3.13.10` on arm64. No model inference, paid transcript replay, or real user content is required.
+
+Codex Session A starts in checkout A, creates an explicit Task, scans only `src/live.rs`, records one normalized File Capture, closes a Checkpoint with Capture Evidence plus a File EngineeringReference, and confirms the Candidate through its public new-Space recommendation. Codex Session B starts in a different absolute checkout registered under the same exact `RepositoryId=Server`, then retrieves A's accepted Context through exact Artifact Focus and an `engineering_graph` RetrievalPath. A public installed CLI search returns the same Context. Cursor then exercises `sessionStart → beforeSubmitPrompt → postToolUse → preCompact → stop → sessionEnd`; the MCP Session is rejected after SessionEnd.
+
+| Requirement | Authoritative evidence | Result |
+|---|---|---|
+| Real structured Tool inputs become typed safe meaning | #218 adapter contracts accept `absolute_file_path` and current path keys, emit `ToolCategory`, retain only Shell cwd, reject compound-shell test inference, omit Shared Context calls, and persist neither command nor vendor tool name | PROVEN |
+| Rust, MCP and host declarations cannot drift | #219 removes top-level Checkpoint `anyOf`, retains Rust composition validation, derives enum Schema values from Rust serialization, and compares real Codex `tools/list` to the checked-in TypeScript declaration golden | PROVEN |
+| Capture is bounded, fail-open and atomic | #220 uses Capture try-lock, conservative byte metadata, explicit cleanup, atomic publish, 25ms Hook SQLite timeout, no per-event version process, and a 32-process test whose post-commit p99 was 156.20ms (other runs 116–127ms) | PROVEN |
+| Same RepositoryId survives different absolute Codex checkouts | Installed Session A publishes from checkout A; installed Session B resolves `Server + src/live.rs` from checkout B and retrieves the same accepted Context through Graph Focus | PROVEN |
+| Cursor's supported public lifecycle is live and isolated | The installed Cursor Hook command processes all six supported lifecycle events; raw output is absent and MCP returns `session_not_authorized` after exact SessionEnd cleanup | PROVEN |
+| Privacy, packaging and public-boundary constraints hold | Knowledge Git contains neither raw Hook markers nor either checkout path; setup-generated Hook/MCP commands point at the installed binary; the E2E imports none of the forbidden internal state/projection APIs | PROVEN |
+| Excluded lease work remains excluded | No TTL renewal, reauthorization, lease extension, or other section 10.2 behavior is implemented or claimed | PROVEN |
+
+## Mew #205 completion audit — section 10.2 excluded
+
+| #205 outcome or invariant | Evidence | Result |
+|---|---|---|
+| Minimally connect Capture to reviewed Candidate | #209/#210/#213 plus `captured_relation_workflow` and installed Session A prove public list → selected Capture Evidence → normalized Observation → closed Candidate Review | PROVEN |
+| Persist typed ContextRelation and EngineeringReference | #211/#213 confirmation facts and Graph rebuild tests preserve exact typed relation/reference provenance; #221 additionally confirms a File EngineeringReference through the installed MCP process | PROVEN |
+| Consume Related Spaces without changing ownership | #212/#213 return Primary-owned Context through a distinct Related association path; ContextRelation remains separate | PROVEN |
+| Improve bootstrap, organization and retrieval quality | #214/#215/#222/#216/#217 prove one-shot Intent bootstrap, TaskIntent-scoped proposed Space reuse, absolute text eligibility and strict Graph-unavailable Focus fallback | PROVEN |
+| Adapt real Tool payloads and remove shell guessing | #218 real-shape adapter contracts plus installed Codex/Cursor PostTool events prove typed categories, bounded paths, cwd-only Shell and no raw/vendor string persistence | PROVEN |
+| Repair MCP/host Schema drift | #219 Rust/MCP/TypeScript golden proves exact required/properties/enums while Rust retains Checkpoint composition authority | PROVEN |
+| Harden Hook concurrency | #220 full workspace regression and 32-process p99/no-half-write/busy tests prove fail-open bounded behavior | PROVEN |
+| Preserve Git facts, SQLite runtime/projections, human confirmation and bounded Graph | No storage-role replacement was introduced; installed A/B uses explicit Candidate Review/Confirm and exact bounded scan/Focus | PROVEN |
+| Keep non-goals closed | Source/tests/docs contain no vector DB, background knowledge service, automatic confirmation/publication, arbitrary shell parser or automatic full-repository scan | PROVEN |
+| Exclude all section 10.2 work | No lease TTL increase, renewal, refresh write path, or expired/stale SessionStart reauthorization is present in #209–#221 | PROVEN |
 
 ## Retrieval quality public gate — Mew #207/#214–#217
 
@@ -35,7 +67,7 @@ SessionStart now performs synchronous local Repository-scope admission before mo
 | Strict Focus fallback is honest | With `artifact_generation=null`, exact `Server + src/quality/fallback.rs` returns the strong Context only through `resolved_focus_text_fallback`; no `engineering_graph` path is present | PROVEN |
 | Non-goals remain closed | No vector/embedding, automatic Task, Candidate merge/dedupe, Active Space, fuzzy basename match, saved Focus, indexed-fact rewrite, production adapter/schema/hot-path work, or section 10.2 Session lease behavior | PROVEN |
 
-This is the deterministic M2 public-surface gate, not the final installed live-host acceptance owned by #221. M3 remains blocked until the human accepts #207.
+This deterministic M2 public-surface gate is complemented by the installed live-host acceptance in #221. M3 remains at its final #208 human gate.
 
 ## Captured relation/reference public gate — Mew #206/#209–#213
 
@@ -50,7 +82,7 @@ This is the deterministic M2 public-surface gate, not the final installed live-h
 | Privacy and local path portability hold across the chain | Knowledge Git contains neither sanitized raw tool markers nor either checkout's absolute path; the stable RepositoryId and repo-relative locator survive the path change | PROVEN |
 | Candidate analysis accepts repeated Evidence conclusions | #224 regression proves canonically duplicate Evidence `supports` are deduplicated only in the derived WorkingIntent acceptance list while authoritative Candidate Evidence remains distinct | PROVEN |
 
-This is a deterministic public-surface regression gate, not execution inside live Codex/Cursor host processes. Final installed live-host Session A/B acceptance remains owned by Mew #221 after #218–#220. The gate does not implement or validate section 10.2 Session lease changes.
+This deterministic fixture-based regression gate is complemented, not replaced, by the installed Codex A/B and Cursor public-process acceptance in #221. Neither gate implements or validates section 10.2 Session lease changes.
 
 ## Repository-scoped activation gate — Mew #181–#189
 
@@ -258,6 +290,8 @@ cargo test --locked -p sctx-cli --test milestone_three_contract
 cargo test --locked -p sctx-cli --test milestone_four_contract
 cargo test --locked -p sctx-cli --test captured_relation_workflow
 cargo test --locked -p sctx-cli --test retrieval_quality_workflow
+cargo test --locked -p sctx-cli --test hook_hot_path
+cargo test --locked -p sctx-cli --test installed_live_host_workflow
 cargo test --locked -p sctx-installer --test installer_matrix fixed_two_installation_team_sharing_and_local_reset_oracle
 
 # Required repository gates
@@ -271,7 +305,7 @@ Current repository gate results:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: passed with no warnings.
-- `cargo test --workspace --locked`: passed with no failed non-ignored test; intentionally ignored long-run/replay cases remain explicitly labeled and are not used as blocking evidence.
+- `cargo test --workspace --locked`: the #220 product-code run passed with no failed non-ignored test. The final #221 run compiled and passed the installed live-host test plus every preceding functional suite, but the existing `task_artifact_focus` performance assertion observed p95 1.50s under severe local scheduler/security-scanner pressure (250ms gate); a RAM-disk retry remained externally throttled. The threshold was not changed. Final human acceptance should require a normal-load rerun or explicitly accept this environmental gate exception.
 - `npm test`: 15 passed, 0 failed, 1 explicit Mew #195 skip.
 - Shared Context Skill `quick_validate.py`: passed (`Skill is valid!`).
 - Repository resolver p95: 3µs; Hook Repository mapping p95: 559µs; established-Session Artifact Focus p95: 123.989ms.
