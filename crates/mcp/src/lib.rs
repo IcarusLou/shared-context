@@ -23,16 +23,17 @@ use sctx_domain::{
     CandidateConfirmationOperation, CandidateConfirmationPlan,
     CandidateConfirmationPrimaryReference, CandidatePrimarySelection, CandidateRelationAssessment,
     CandidateReviewDiagnostic, CandidateReviewStatus, CandidateReviewSummary, CandidateReviewView,
-    CandidateSpaceRecommendation, CaptureEvidenceRef, CaptureId, CaptureUnknown, CheckpointClaim,
-    CheckpointClaimId, ContextId, ContextKind, ContextRelation, ContextRevisionDraft,
-    ContextRevisionRef, EngineeringReferenceDraft, Error, ErrorKind, EvidenceSnapshotDraft,
-    EvidenceType, ExternalSessionLocator, NormalizedBreadcrumbKind, NormalizedWorkObservation,
-    OptionalCandidateEdits, REPOSITORY_ID_MAX_BYTES, REPOSITORY_ID_PATTERN, ReferenceId,
-    ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionStatus, ResolvedFocus, Result,
-    RevisionId, SignalId, SpaceId, SpaceRecommendationId, SubmissionId, TaskId,
-    TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignalKind, TaskSignalLifecycle,
-    TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId, WorkEpisodeStatus, WorkObservation,
-    WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
+    CandidateSpaceRecommendation, CandidateSpaceRecommendationPath, CaptureEvidenceRef, CaptureId,
+    CaptureUnknown, CheckpointClaim, CheckpointClaimId, ContextId, ContextKind, ContextRelation,
+    ContextRevisionDraft, ContextRevisionRef, EngineeringReferenceDraft, Error, ErrorKind,
+    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, NormalizedBreadcrumbKind,
+    NormalizedWorkObservation, OptionalCandidateEdits, ProposedSpaceGroupKey,
+    REPOSITORY_ID_MAX_BYTES, REPOSITORY_ID_PATTERN, ReferenceId, ReferenceRelation,
+    RepoRelativePath, RepositoryId, ResolutionStatus, ResolvedFocus, Result, RevisionId, SignalId,
+    SpaceId, SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId,
+    TaskSessionSnapshot, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord,
+    TaskSpaceAssociation, WorkEpisodeId, WorkEpisodeStatus, WorkObservation, WorkObservationId,
+    WorkSourceRef, WorkingIntentSnapshot,
 };
 use sctx_engineering_graph::{
     CandidateMatchEvidence, CatalogRepositorySpec, EngineeringProjectionStore,
@@ -64,8 +65,8 @@ use sctx_task_runtime::{
     AgentCheckpointWrite, AutomatedEpisodeBoundary, CandidateBuildItemPreparation,
     CandidateBuildItemStatus, CandidateBuildStatus, CandidateBuildView, CandidateReviewDiscard,
     CandidateReviewDiscardStatus, CandidateReviewRecord, CaptureIngestion, CheckpointBoundary,
-    CheckpointClaimDraft, IntentRevisionWriteStatus, TaskRuntime, WorkEpisodeDiagnosticKind,
-    WorkEpisodeView,
+    CheckpointClaimDraft, IntentRevisionWriteStatus, ProposedSpaceGroupMappingStatus, TaskRuntime,
+    WorkEpisodeDiagnosticKind, WorkEpisodeView,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -1926,6 +1927,16 @@ impl Runtime {
             .find(|revision| revision.revision_id == source_intent_id)
             .map(|revision| revision.working_intent.clone())
             .ok_or_else(|| invariant("Candidate source Intent revision disappeared"))?;
+        let proposed_space_group_key =
+            ProposedSpaceGroupKey::from_task_intent(task.task_id, source_intent_id);
+        let proposed_space_group_space_id = self
+            .tasks
+            .read_proposed_space_group(proposed_space_group_key)?
+            .filter(|mapping| {
+                mapping.status == ProposedSpaceGroupMappingStatus::Committed
+                    && mapping.candidate_id != persisted.candidate_id
+            })
+            .map(|mapping| mapping.space_id);
         let signal_history = self
             .tasks
             .read_signal_history(episode.episode.task_session_id)?;
@@ -1944,10 +1955,12 @@ impl Runtime {
         let derived = engine.analyze_candidate(&CandidateAnalysisRequest {
             candidate: persisted.clone(),
             source_task_id: task.task_id,
+            source_intent_revision_id: source_intent_id,
             source_working_intent: source_intent,
             source_task_signals: task.task_signals.clone(),
             explicit_related_contexts: claim.related_contexts.clone(),
             artifact_refs: claim.artifact_refs.clone(),
+            proposed_space_group_space_id,
             token_budget: input.token_budget,
             top_k: input.top_k,
         });
@@ -2156,35 +2169,42 @@ impl Runtime {
                 "Candidate Confirmation requires complete current analysis and reviewable Evidence",
             ));
         }
-        let (primary_reference, resolved_primary, primary_space_id) = match &input.primary {
-            CandidateConfirmPrimaryInput::Existing(existing) => {
-                let space_id = parse_id_value(&existing.existing_space_id, "existing_space_id")?;
-                if !snapshot.projection.spaces.contains_key(&space_id) {
-                    return Err(invalid(
-                        "Candidate Confirmation Primary Space does not exist",
-                    ));
+        let (primary_reference, resolved_primary, primary_space_id, proposed_space_group_key) =
+            match &input.primary {
+                CandidateConfirmPrimaryInput::Existing(existing) => {
+                    let space_id =
+                        parse_id_value(&existing.existing_space_id, "existing_space_id")?;
+                    if !snapshot.projection.spaces.contains_key(&space_id) {
+                        return Err(invalid(
+                            "Candidate Confirmation Primary Space does not exist",
+                        ));
+                    }
+                    (
+                        CandidateConfirmationPrimaryReference::ExistingSpace { space_id },
+                        CandidatePrimarySelection::Existing { space_id },
+                        Some(space_id),
+                        None,
+                    )
                 }
-                (
-                    CandidateConfirmationPrimaryReference::ExistingSpace { space_id },
-                    CandidatePrimarySelection::Existing { space_id },
-                    Some(space_id),
-                )
-            }
-            CandidateConfirmPrimaryInput::Proposed(proposed) => {
-                let recommendation_id = parse_id_value::<SpaceRecommendationId>(
-                    &proposed.new_space_recommendation_id,
-                    "new_space_recommendation_id",
-                )?;
-                let intent = review
+                CandidateConfirmPrimaryInput::Proposed(proposed) => {
+                    let recommendation_id = parse_id_value::<SpaceRecommendationId>(
+                        &proposed.new_space_recommendation_id,
+                        "new_space_recommendation_id",
+                    )?;
+                    let (intent, proposed_space_group_key) = review
                     .space_recommendations
                     .iter()
                     .find_map(|recommendation| match recommendation {
                         CandidateSpaceRecommendation::ProposedNewSpaceIntent {
                             recommendation_id: actual,
+                            proposed_space_group_key,
                             proposed_new_space_intent,
                             ..
                         } if *actual == recommendation_id => {
-                            Some(proposed_new_space_intent.clone())
+                            Some((
+                                proposed_new_space_intent.clone(),
+                                proposed_space_group_key.as_ref().copied()?,
+                            ))
                         }
                         _ => None,
                     })
@@ -2193,15 +2213,16 @@ impl Runtime {
                             "new_space_recommendation_id is not an exact current proposed recommendation",
                         )
                     })?;
-                (
-                    CandidateConfirmationPrimaryReference::ProposedRecommendation {
-                        recommendation_id,
-                    },
-                    CandidatePrimarySelection::ProposedNew { intent },
-                    None,
-                )
-            }
-        };
+                    (
+                        CandidateConfirmationPrimaryReference::ProposedRecommendation {
+                            recommendation_id,
+                        },
+                        CandidatePrimarySelection::ProposedNew { intent },
+                        None,
+                        Some(proposed_space_group_key),
+                    )
+                }
+            };
         let related_space_ids = input
             .related_space_ids
             .iter()
@@ -2258,6 +2279,7 @@ impl Runtime {
             expected_task_id,
             expected_intent_revision_id,
             &proposed_plan,
+            proposed_space_group_key,
         )?;
         let plan = reservation.operation.plan;
         let write = self.store.confirm_candidate(&plan)?;
@@ -2364,7 +2386,7 @@ impl Runtime {
                 "Candidate Review Engineering Reference provenance changed",
             ));
         }
-        let (analysis, recommendations, confidence, unknowns, candidate_status, generation) =
+        let (analysis, mut recommendations, confidence, unknowns, candidate_status, generation) =
             analysis_view.map_or_else(
                 || {
                     (
@@ -2387,6 +2409,53 @@ impl Runtime {
                     )
                 },
             );
+        let proposed_space_group_key =
+            recommendations
+                .iter()
+                .find_map(|recommendation| match recommendation {
+                    CandidateSpaceRecommendation::ProposedNewSpaceIntent {
+                        proposed_space_group_key,
+                        ..
+                    } => *proposed_space_group_key,
+                    CandidateSpaceRecommendation::Existing { .. } => None,
+                });
+        if let Some(proposed_space_group_key) = proposed_space_group_key {
+            if let Some(mapping) = self
+                .tasks
+                .read_proposed_space_group(proposed_space_group_key)?
+                .filter(|mapping| {
+                    mapping.status == ProposedSpaceGroupMappingStatus::Committed
+                        && mapping.candidate_id != record.candidate_id
+                })
+            {
+                if !snapshot.projection.spaces.contains_key(&mapping.space_id) {
+                    return Err(invariant(
+                        "committed proposed Space group points to a missing Space",
+                    ));
+                }
+                recommendations.retain(|recommendation| match recommendation {
+                    CandidateSpaceRecommendation::ProposedNewSpaceIntent { .. } => false,
+                    CandidateSpaceRecommendation::Existing { space_id, .. } => {
+                        *space_id != mapping.space_id
+                    }
+                });
+                recommendations.insert(
+                    0,
+                    CandidateSpaceRecommendation::existing_with_paths(
+                        mapping.space_id,
+                        sctx_domain::RecommendedSpaceRole::Primary,
+                        "The first confirmed Candidate for this Task Intent revision created this Space",
+                        CandidateConfidence {
+                            basis_points: 10_000,
+                            rationale: "Exact proposed Space group mapping".to_owned(),
+                        },
+                        vec![CandidateSpaceRecommendationPath::ProposedSpaceGroupResolved {
+                            proposed_space_group_key,
+                        }],
+                    ),
+                );
+            }
+        }
         let diagnostics = if record.status == CandidateReviewStatus::Expired {
             vec![CandidateReviewDiagnostic::ReviewExpired]
         } else {

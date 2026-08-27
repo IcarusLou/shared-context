@@ -2918,6 +2918,242 @@ fn candidate_confirm_existing_and_recommended_new_space_are_atomic_idempotent_an
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn candidates_from_one_intent_revision_share_and_reuse_one_proposed_space() {
+    let fixture = Fixture::new();
+    let session = "grouped-proposed-space";
+    let goal = "System suggestion: Group checkout compatibility decisions for every supported client without duplicating review spaces";
+    let task = task_intent_update_at_root(
+        &fixture.root,
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            ..update_input(session, TaskBoundary::New, None, goal)
+        },
+    )
+    .unwrap();
+    let claim = |suffix: &str| TaskCheckpointClaimInput {
+        context_kind_hint: Some(ContextKind::Decision),
+        topic_key_hint: Some(format!("grouped-space/{suffix}")),
+        statement: format!("Grouped Candidate {suffix} remains independently reviewable"),
+        rationale: format!("Claim {suffix} has independent rationale and Evidence"),
+        applicability: Applicability::default(),
+        assumptions: Vec::new(),
+        recheck_when: vec!["the grouped Space policy changes".to_owned()],
+        evidence: vec![TaskCheckpointEvidenceInput::InlineValidation {
+            evidence: EvidenceSnapshotDraft {
+                kind: EvidenceType::ExperimentRecord,
+                supports: format!("Grouped Candidate {suffix} fixture passed"),
+                content: json!({"claim": suffix, "actual": "passed"}),
+                interpretation: "The Claim remains separate while its Space proposal is grouped"
+                    .to_owned(),
+                limitations: vec!["local grouped-space fixture".to_owned()],
+            },
+        }],
+        artifact_refs: Vec::new(),
+        relations: Vec::new(),
+        engineering_references: Vec::new(),
+        related_contexts: Vec::new(),
+    };
+    let closed = task_checkpoint_at_root(
+        &fixture.root,
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: task.context.task_id.to_string(),
+            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+            expected_episode_version: 0,
+            boundary: TaskCheckpointBoundary::Close,
+            claims: vec![claim("alpha"), claim("beta")],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap();
+    let candidate_ids = closed
+        .candidate_build
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|item| item.candidate_id.unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(candidate_ids.len(), 2);
+
+    let review = |candidate_id: CandidateId| {
+        candidate_get_at_root(
+            &fixture.root,
+            &CandidateGetInput {
+                agent_kind: "codex".to_owned(),
+                external_session_id: session.to_owned(),
+                candidate_id: candidate_id.to_string(),
+            },
+        )
+        .unwrap()
+    };
+    let first_review = review(candidate_ids[0]);
+    let second_review = review(candidate_ids[1]);
+    let proposed = |review: &sctx_domain::CandidateReviewView| {
+        review
+            .space_recommendations
+            .iter()
+            .find_map(|recommendation| match recommendation {
+                sctx_domain::CandidateSpaceRecommendation::ProposedNewSpaceIntent {
+                    recommendation_id,
+                    proposed_space_group_key,
+                    proposed_new_space_intent,
+                    ..
+                } => Some((
+                    *recommendation_id,
+                    proposed_space_group_key.unwrap(),
+                    proposed_new_space_intent.clone(),
+                )),
+                sctx_domain::CandidateSpaceRecommendation::Existing { .. } => None,
+            })
+            .unwrap()
+    };
+    let first_proposed = proposed(&first_review);
+    let second_proposed = proposed(&second_review);
+    assert_eq!(first_proposed, second_proposed);
+    assert_eq!(
+        first_proposed.2.title,
+        "Group checkout compatibility decisions for every supported client without"
+    );
+    assert!(!first_proposed.2.title.contains("System suggestion"));
+
+    let first_input = CandidateConfirmInput {
+        agent_kind: "codex".to_owned(),
+        external_session_id: session.to_owned(),
+        expected_task_id: task.context.task_id.to_string(),
+        expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+        candidate_id: candidate_ids[0].to_string(),
+        expected_review_version: first_review.review_version,
+        primary: CandidateConfirmPrimaryInput::Proposed(NewCandidatePrimaryInput {
+            new_space_recommendation_id: first_proposed.0.to_string(),
+        }),
+        related_space_ids: Vec::new(),
+        edits: OptionalCandidateEdits::default(),
+    };
+    let first_confirmed = candidate_confirm_at_root(&fixture.root, &first_input).unwrap();
+    assert_eq!(first_confirmed.event_ids.len(), 5);
+    let mapping = TaskRuntime::initialize(&fixture.root)
+        .unwrap()
+        .read_proposed_space_group(first_proposed.1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        mapping.status,
+        sctx_task_runtime::ProposedSpaceGroupMappingStatus::Committed
+    );
+    assert_eq!(mapping.candidate_id, candidate_ids[0]);
+    assert_eq!(mapping.space_id, first_confirmed.primary_space_id);
+    let first_retry = candidate_confirm_at_root(&fixture.root, &first_input).unwrap();
+    assert_eq!(
+        first_retry.status,
+        CandidateConfirmResponseStatus::AlreadyConfirmed
+    );
+    assert_eq!(first_retry.event_ids, first_confirmed.event_ids);
+
+    let mapped_review = review(candidate_ids[1]);
+    assert!(
+        !mapped_review
+            .space_recommendations
+            .iter()
+            .any(|recommendation| matches!(
+                recommendation,
+                sctx_domain::CandidateSpaceRecommendation::ProposedNewSpaceIntent { .. }
+            ))
+    );
+    assert!(mapped_review.space_recommendations.iter().any(|recommendation| matches!(
+        recommendation,
+        sctx_domain::CandidateSpaceRecommendation::Existing {
+            space_id,
+            role: sctx_domain::RecommendedSpaceRole::Primary,
+            paths,
+            ..
+        } if *space_id == first_confirmed.primary_space_id && paths.iter().any(|path| matches!(
+            path,
+            sctx_domain::CandidateSpaceRecommendationPath::ProposedSpaceGroupResolved {
+                proposed_space_group_key
+            } if *proposed_space_group_key == first_proposed.1
+        ))
+    )));
+
+    let before_stale = event_count(fixture.store.repository());
+    let stale_proposed = candidate_confirm_at_root(
+        &fixture.root,
+        &CandidateConfirmInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: task.context.task_id.to_string(),
+            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+            candidate_id: candidate_ids[1].to_string(),
+            expected_review_version: mapped_review.review_version,
+            primary: CandidateConfirmPrimaryInput::Proposed(NewCandidatePrimaryInput {
+                new_space_recommendation_id: second_proposed.0.to_string(),
+            }),
+            related_space_ids: Vec::new(),
+            edits: OptionalCandidateEdits::default(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(stale_proposed.kind(), sctx_domain::ErrorKind::InvalidInput);
+    assert_eq!(event_count(fixture.store.repository()), before_stale);
+
+    let second_confirmed = candidate_confirm_at_root(
+        &fixture.root,
+        &CandidateConfirmInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: task.context.task_id.to_string(),
+            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+            candidate_id: candidate_ids[1].to_string(),
+            expected_review_version: mapped_review.review_version,
+            primary: CandidateConfirmPrimaryInput::Existing(ExistingCandidatePrimaryInput {
+                existing_space_id: first_confirmed.primary_space_id.to_string(),
+            }),
+            related_space_ids: Vec::new(),
+            edits: OptionalCandidateEdits::default(),
+        },
+    )
+    .unwrap();
+    assert_eq!(second_confirmed.event_ids.len(), 4);
+    assert_eq!(
+        second_confirmed.primary_space_id,
+        first_confirmed.primary_space_id
+    );
+
+    let next = task_intent_update_at_root(
+        &fixture.root,
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            ..update_input(
+                session,
+                TaskBoundary::Continue,
+                Some(task.context.intent_revision_id.to_string()),
+                "A newly revised Task goal owns a distinct proposed Space group",
+            )
+        },
+    )
+    .unwrap();
+    let next_closed = task_checkpoint_at_root(
+        &fixture.root,
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: next.context.task_id.to_string(),
+            expected_intent_revision_id: next.context.intent_revision_id.to_string(),
+            expected_episode_version: 0,
+            boundary: TaskCheckpointBoundary::Close,
+            claims: vec![claim("next-revision")],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap();
+    let next_candidate = next_closed.candidate_build.unwrap().items[0]
+        .candidate_id
+        .unwrap();
+    assert_ne!(proposed(&review(next_candidate)).1, first_proposed.1);
+}
+
+#[test]
 fn cursor_and_codex_candidate_confirm_tool_is_strict_and_idempotent() {
     for (client, framing, agent_kind) in [
         (ClientKind::Cursor, FixtureFraming::Newline, "cursor"),
@@ -3041,6 +3277,7 @@ fn candidate_confirm_recovers_reserved_before_git_and_git_before_runtime_finaliz
             first_task.context.task_id,
             first_task.context.intent_revision_id,
             &first_plan,
+            None,
         )
         .unwrap();
     let recovered = candidate_confirm_at_root(&fixture.root, &first_input).unwrap();
@@ -3058,6 +3295,7 @@ fn candidate_confirm_recovers_reserved_before_git_and_git_before_runtime_finaliz
             second_task.context.task_id,
             second_task.context.intent_revision_id,
             &second_plan,
+            None,
         )
         .unwrap();
     let base = GitStore::bootstrap_local(&fixture.root).unwrap();

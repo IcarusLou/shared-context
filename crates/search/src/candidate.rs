@@ -5,8 +5,9 @@ use sctx_domain::{
     CandidateAnalysisStatus, CandidateAssessmentPath, CandidateAssessmentRelation,
     CandidateConfidence, CandidateRelationAssessment, CandidateSpaceRecommendation,
     CandidateSpaceRecommendationPath, ContextCandidate, ContextRevision, ContextRevisionDraft,
-    ContextRevisionRef, EvidenceSnapshotDraft, IntentSnapshot, RecommendedSpaceRole,
-    RevisionLifecycle, SpaceId, TaskId, TaskSignal, TaskSpaceAssociation, WorkingIntentSnapshot,
+    ContextRevisionRef, EvidenceSnapshotDraft, IntentSnapshot, ProposedSpaceGroupKey,
+    RecommendedSpaceRole, RevisionLifecycle, SpaceId, TaskId, TaskIntentRevisionId, TaskSignal,
+    TaskSpaceAssociation, WorkingIntentSnapshot,
 };
 use sctx_engineering_graph::EngineeringProjectionSnapshot;
 use sctx_index::{DomainSnapshot, normalize_search_text, search_tokens};
@@ -21,16 +22,21 @@ pub const MAX_CANDIDATE_ANALYSIS_TOKEN_BUDGET: usize = 32_768;
 pub const MAX_CANDIDATE_ANALYSIS_TOP_K: usize = 32;
 const PRIMARY_SPACE_THRESHOLD: u64 = 90_000;
 const RRF_K: u64 = 60;
+const PROPOSED_SPACE_GROUP_SCORE: u64 = 1_000_000;
+const PROPOSED_SPACE_TITLE_MAX_CHARS: usize = 80;
+const PROPOSED_SPACE_TITLE_MAX_WORDS: usize = 12;
 
 /// Complete, Task-owned input to one rebuildable Candidate analysis.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateAnalysisRequest {
     pub candidate: ContextCandidate,
     pub source_task_id: TaskId,
+    pub source_intent_revision_id: TaskIntentRevisionId,
     pub source_working_intent: WorkingIntentSnapshot,
     pub source_task_signals: Vec<TaskSignal>,
     pub explicit_related_contexts: Vec<ContextRevisionRef>,
     pub artifact_refs: Vec<ArtifactRef>,
+    pub proposed_space_group_space_id: Option<SpaceId>,
     pub token_budget: usize,
     pub top_k: usize,
 }
@@ -79,6 +85,15 @@ impl SearchEngine {
         request.source_working_intent.validate()?;
         TaskSignal::validate_collection(&request.source_task_signals)?;
         let snapshot = self.index.domain_snapshot()?;
+        if request
+            .proposed_space_group_space_id
+            .is_some_and(|space_id| !snapshot.projection.spaces.contains_key(&space_id))
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Proposed Space group mapping points to an unavailable Space",
+            ));
+        }
         let graph = self
             .engineering_graph
             .as_ref()
@@ -169,7 +184,12 @@ impl SearchEngine {
             &safe_targets,
             &source_spaces.associations,
             &candidate_spaces.associations,
-            &request.candidate.content,
+            &request.source_working_intent,
+            ProposedSpaceGroupKey::from_task_intent(
+                request.source_task_id,
+                request.source_intent_revision_id,
+            ),
+            request.proposed_space_group_space_id,
             request.top_k,
         );
         let confidence = aggregate_confidence(&assessments);
@@ -569,14 +589,16 @@ fn novel_assessment() -> CandidateRelationAssessment {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn recommend_spaces(
     snapshot: &DomainSnapshot,
     assessments: &[CandidateRelationAssessment],
     safe_targets: &BTreeMap<ContextRevisionRef, bool>,
     source_associations: &[TaskSpaceAssociation],
     candidate_associations: &[TaskSpaceAssociation],
-    candidate: &ContextRevisionDraft,
+    source_working_intent: &WorkingIntentSnapshot,
+    proposed_space_group_key: ProposedSpaceGroupKey,
+    proposed_space_group_space_id: Option<SpaceId>,
     top_k: usize,
 ) -> Vec<CandidateSpaceRecommendation> {
     let owners = snapshot
@@ -630,6 +652,17 @@ fn recommend_spaces(
     }
     add_association_spaces(&mut spaces, source_associations, 500, false);
     add_association_spaces(&mut spaces, candidate_associations, 600, true);
+    if let Some(space_id) = proposed_space_group_space_id {
+        let state = spaces.entry(space_id).or_default();
+        state.score = state.score.saturating_add(PROPOSED_SPACE_GROUP_SCORE);
+        state.safe_strong_target = true;
+        push_space_path(
+            state,
+            CandidateSpaceRecommendationPath::ProposedSpaceGroupResolved {
+                proposed_space_group_key,
+            },
+        );
+    }
     for (space_id, state) in &mut spaces {
         if snapshot
             .projection
@@ -687,17 +720,25 @@ fn recommend_spaces(
             )
         })
         .collect::<Vec<_>>();
-    if primary.is_none() {
-        recommendations.push(CandidateSpaceRecommendation::proposed_new_with_paths(
-            proposed_intent(candidate),
-            "System suggestion: no safe existing Space exceeded the Primary threshold",
-            CandidateConfidence {
-                basis_points: 6_000,
-                rationale: "No safe fused existing-Space candidate reached the Primary threshold"
-                    .to_owned(),
-            },
-            vec![CandidateSpaceRecommendationPath::ProposedFromCandidate],
-        ));
+    if primary.is_none() && proposed_space_group_space_id.is_none() {
+        recommendations.push(
+            CandidateSpaceRecommendation::proposed_new_for_group_with_paths(
+                proposed_space_group_key,
+                proposed_intent(source_working_intent),
+                "System suggestion: no safe existing Space exceeded the Primary threshold",
+                CandidateConfidence {
+                    basis_points: 6_000,
+                    rationale:
+                        "No safe fused existing-Space candidate reached the Primary threshold"
+                            .to_owned(),
+                },
+                vec![
+                    CandidateSpaceRecommendationPath::ProposedFromTaskIntentRevision {
+                        proposed_space_group_key,
+                    },
+                ],
+            ),
+        );
     }
     recommendations
 }
@@ -729,35 +770,63 @@ fn add_association_spaces(
     }
 }
 
-fn proposed_intent(candidate: &ContextRevisionDraft) -> IntentSnapshot {
-    let title_source = candidate
-        .topic_key
-        .as_deref()
-        .unwrap_or(&candidate.statement);
-    let title = title_source.chars().take(80).collect::<String>();
-    let mut in_scope = candidate
-        .applicability
-        .domains
-        .iter()
-        .chain(&candidate.applicability.platforms)
-        .chain(&candidate.applicability.conditions)
-        .cloned()
-        .collect::<Vec<_>>();
+fn proposed_intent(source: &WorkingIntentSnapshot) -> IntentSnapshot {
+    let mut in_scope = source.in_scope.clone();
     if in_scope.is_empty() {
-        in_scope.push(candidate.statement.clone());
+        in_scope.push(source.goal.clone());
+    }
+    let mut acceptance_conditions = source.acceptance_conditions.clone();
+    if acceptance_conditions.is_empty() {
+        acceptance_conditions.push(source.goal.clone());
     }
     IntentSnapshot {
-        title: format!("System suggestion: {title}"),
-        problem: candidate.rationale.clone(),
-        desired_outcome: candidate.statement.clone(),
+        title: proposed_space_title(&source.goal),
+        problem: source
+            .current_direction
+            .clone()
+            .unwrap_or_else(|| source.goal.clone()),
+        desired_outcome: source.goal.clone(),
         in_scope,
-        out_of_scope: candidate.assumptions.clone(),
-        acceptance_conditions: candidate
-            .evidence
-            .iter()
-            .map(|evidence| evidence.supports.clone())
-            .collect(),
-        domain_terms: candidate.applicability.domains.clone(),
+        out_of_scope: source.out_of_scope.clone(),
+        acceptance_conditions,
+        domain_terms: source.domains.clone(),
+    }
+}
+
+fn proposed_space_title(goal: &str) -> String {
+    let normalized = goal.split_whitespace().collect::<Vec<_>>();
+    let mut start = 0;
+    if normalized.len() >= 2
+        && normalized[0].eq_ignore_ascii_case("system")
+        && normalized[1]
+            .trim_end_matches([':', '-', '—'])
+            .eq_ignore_ascii_case("suggestion")
+    {
+        start = 2;
+        if normalized.get(start).is_some_and(|word| {
+            word.chars()
+                .all(|character| matches!(character, ':' | '-' | '—'))
+        }) {
+            start += 1;
+        }
+    }
+    let words = &normalized[start..];
+    let mut title = String::new();
+    for word in words.iter().take(PROPOSED_SPACE_TITLE_MAX_WORDS) {
+        let next_chars =
+            title.chars().count() + usize::from(!title.is_empty()) + word.chars().count();
+        if next_chars > PROPOSED_SPACE_TITLE_MAX_CHARS {
+            break;
+        }
+        if !title.is_empty() {
+            title.push(' ');
+        }
+        title.push_str(word);
+    }
+    if title.is_empty() {
+        words.first().copied().unwrap_or("Task intent").to_owned()
+    } else {
+        title
     }
 }
 

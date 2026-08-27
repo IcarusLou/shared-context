@@ -18,10 +18,10 @@ const CLASSIFICATIONS: [&str; 6] = [
     "infrastructure_flake",
     "product_invariant_violation",
 ];
-const DOMAIN_ID_PREFIXES: [&str; 28] = [
+const DOMAIN_ID_PREFIXES: [&str; 29] = [
     "spc_", "rpo_", "rpg_", "ref_", "tsk_", "tss_", "xss_", "tir_", "sig_", "cap_", "wep_", "wob_",
-    "ckp_", "clm_", "bld_", "rec_", "cnd_", "sub_", "cfm_", "asc_", "ctx_", "rev_", "evt_", "pub_",
-    "evd_", "rvw_", "cnf_", "rsl_",
+    "ckp_", "clm_", "bld_", "rec_", "psg_", "cnd_", "sub_", "cfm_", "asc_", "ctx_", "rev_", "evt_",
+    "pub_", "evd_", "rvw_", "cnf_", "rsl_",
 ];
 
 fn workspace_root() -> std::path::PathBuf {

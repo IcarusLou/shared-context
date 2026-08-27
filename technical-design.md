@@ -333,6 +333,7 @@ rsl_<random>   ConflictResolution
 tsk_<random>   TaskSession
 cnd_<random>   ContextCandidate
 wep_<random>   WorkEpisode
+psg_<stable>   一个 TaskIntentRevision 的 ProposedSpaceGroup
 ```
 
 禁止使用标题、路径、时间、用户名、外部单号或内容 Hash 作为领域 ID。
@@ -797,6 +798,8 @@ repository/
 | `agent_checkpoint` | Episode parent-version 语义幂等的完整 Claims/Unknowns、server IDs 与 continue/close boundary |
 | `candidate_build` / `candidate_build_item` | closed Episode/Claim-scoped Builder reservation、submission identity 与#117结果 |
 | `candidate_analysis` | 可删除重算、按CandidateId替换的current derived review JSON与固定Context/Graph generations |
+| `candidate_review` / `candidate_confirmation_operation` | Task-scoped Review lifecycle 与 Git 前完整 ConfirmationPlan reservation |
+| `proposed_space_group` | exact TaskIntentRevision 的 `psg_` → first new Space reservation/committed mapping；不合并 Candidate |
 | `work_episode_diagnostic` | unconfigured/unsafe Capture Artifact 映射诊断 |
 
 Capture 文件设置 TTL；Runtime Episode 不进入 Git。删除 `runtime.sqlite` 只会丢失 Task/Episode，不改变 Context Git、Index 或 `state/capture`。
@@ -1398,7 +1401,7 @@ Evidence 继续只约束 WorkObservation、CheckpointClaim、Candidate、Context
 - Candidate Builder 与最小充分 Evidence 组装已实现：closed Episode 的每个充分 Claim 形成一个无 Space Draft；Inline Validation 原样复用，normalized WorkObservation 可转换为 self-contained snapshot，Context Evidence 从一个 exact Index snapshot 复用。TaskSignal 本身仍是非事实线索；只有 Claim 显式引用的 owned Diff/TestOutcome 才由 Builder 转换为带完整解释与限制的 EvidenceSnapshot，Prompt/Workspace 线索不能成为工程 Evidence；原始 Capture 不进 Git。
 - Builder 在 Git 前用 Runtime v8 固化 BuildId、Claim-scoped SubmissionId 和 content hash，#117 后回填 CandidateId/EventId；两个 crash window、语义重试和并发 close/build 均复用同一操作身份。缺 Claim、Unknown-only、Evidence 不充分为零 Git 写；kind 无 hint 固定 Discovery，topic 缺失保留 Unknown，不做关键词推断。
 - Candidate relationship assessment 与 Space 推荐已实现为 Runtime derived review state：只有完整 canonical draft equality 是 exact duplicate；same statement/different Evidence 是 supports；same topic 加 explicit Context 或 exact Artifact Graph 是 revises；topic/scope 不同 statement 只是 potential contradiction；纯 FTS 是 unresolved related；无候选才 novel。所有结果固定 Context/Graph generation、typed path、confidence、RRF/top-k/token budget 与 stable target tie。
-- Existing Space 推荐融合 assessment targets、source Task associations 与 Space Intent；conflicted Intent/unsafe Context 只作诊断或 Related，无安全 Primary 时生成一个完整 system-suggested Intent。分析可由 `candidate analyze` 重跑替换，不写 Git、不改变 Candidate submission/content/ID，不参与 Context Search、Hook 或自动注入。
+- Existing Space 推荐融合 assessment targets、source Task associations 与 Space Intent；conflicted Intent/unsafe Context 只作诊断或 Related。无安全 Primary 时，所有来自同一 `(TaskId, TaskIntentRevisionId)` 的 Candidates 使用同一个稳定 ProposedSpaceGroupKey 和由 `WorkingIntent.goal` 清洗、按词边界截断的完整 Space Intent；不从单个 Candidate statement 派生标题。首次 new-Space Confirm 在 Runtime reservation 中独占该 group 并映射到服务端 SpaceId，提交后的其他 Pending Review 推荐这个 Existing Primary；旧 proposed ID 拒绝且不写 Git，新 Intent revision 使用不同 group。该机制不合并 Candidate、不做语义去重，也不产生 Active Space。分析可由 `candidate analyze` 重跑替换，不写 Git、不改变 Candidate submission/content/ID，不参与 Context Search、Hook 或自动注入。
 - Runtime v9 只在 finalized Builder item 同事务初始化 Pending Candidate Review；list/get 以 ExternalSession ActiveTask 为发现边界，返回完整 draft/Evidence/provenance/analysis/Space 推荐并标记为不可信数据。手工或孤立 Git Candidate 不进入 Review，runtime 删除后也不会从 Git 复活。
 - Review list 使用稳定 cursor、limit 和 whole-summary token budget；analysis pending/failed 以 typed diagnostic 可见但不 ready。discard 使用 Task/Intent/Review version CAS，同 reason timeout retry幂等，默认 list 隐藏 Discarded。
 - Checkpoint Claim 的 typed ContextRelation 与 EngineeringReference 提案贯穿 Builder provenance/Review；确认时 Relation 固化到 ContextRevision，Reference 由服务端分配 ID，并与 Context/Association/Publication/Confirmation 一起进入一个 4/5+N Event 原子批次。`related_contexts` 仍只参与分析，不提升为关系事实。

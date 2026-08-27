@@ -1519,10 +1519,10 @@ fn reject_hardcoded_domain_ids(value: &Value) -> Result<(), ContractError> {
     }
 }
 
-const DOMAIN_ID_PREFIXES: [&str; 28] = [
+const DOMAIN_ID_PREFIXES: [&str; 29] = [
     "spc_", "rpo_", "rpg_", "ref_", "tsk_", "tss_", "xss_", "tir_", "sig_", "cap_", "wep_", "wob_",
-    "ckp_", "clm_", "bld_", "rec_", "cnd_", "sub_", "cfm_", "asc_", "ctx_", "rev_", "evt_", "pub_",
-    "evd_", "rvw_", "cnf_", "rsl_",
+    "ckp_", "clm_", "bld_", "rec_", "psg_", "cnd_", "sub_", "cfm_", "asc_", "ctx_", "rev_", "evt_",
+    "pub_", "evd_", "rvw_", "cnf_", "rsl_",
 ];
 
 fn find_domain_id_prefix(value: &str) -> Option<&'static str> {
@@ -1576,11 +1576,11 @@ mod tests {
             .next()
             .expect("domain ID declarations precede tests");
         assert_eq!(
-            declarations.match_indices("opaque_id!(").count() + 1,
+            declarations.match_indices("opaque_id!(").count() + 2,
             DOMAIN_ID_PREFIXES.len(),
-            "the scenario denylist must cover current opaque IDs plus legacy Repository UUIDs"
+            "the scenario denylist must cover current IDs plus legacy Repository UUIDs"
         );
-        assert_eq!(DOMAIN_ID_PREFIXES.len(), 28);
+        assert_eq!(DOMAIN_ID_PREFIXES.len(), 29);
         for prefix in DOMAIN_ID_PREFIXES {
             if prefix != "rpo_" {
                 assert!(

@@ -19,11 +19,11 @@ use sctx_domain::{
     CaptureEvidenceRef, CaptureId, CaptureSourceRef, CaptureUnknown, CheckpointClaim,
     CheckpointClaimId, ConfirmationId, ContextId, ContextRevisionRef, Error, ErrorKind, EventId,
     EvidenceSnapshotDraft, ExternalSessionId, ExternalSessionLocator, ExternalSessionSnapshot,
-    IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation, Result, SignalId,
-    SubmissionId, TaskId, TaskIntentRevision, TaskIntentRevisionId, TaskSessionId,
-    TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord,
-    WorkEpisode, WorkEpisodeId, WorkEpisodeRef, WorkEpisodeStatus, WorkObservation,
-    WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
+    IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation, ProposedSpaceGroupKey,
+    Result, SignalId, SpaceId, SubmissionId, TaskId, TaskIntentRevision, TaskIntentRevisionId,
+    TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle,
+    TaskSignalRecord, WorkEpisode, WorkEpisodeId, WorkEpisodeRef, WorkEpisodeStatus,
+    WorkObservation, WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
 };
 
 const SCHEMA_VERSION: i64 = 11;
@@ -154,6 +154,24 @@ pub struct AgentCheckpointOutcome {
 pub struct CandidateAnalysisView {
     pub candidate: AutomaticContextCandidate,
     pub analysis_generation: u64,
+}
+
+/// Lifecycle of one Task-Intent-scoped proposed Space reservation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProposedSpaceGroupMappingStatus {
+    Reserved,
+    Committed,
+}
+
+/// Runtime mapping from one exact Task Intent revision to its first confirmed new Space.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProposedSpaceGroupMapping {
+    pub proposed_space_group_key: ProposedSpaceGroupKey,
+    pub task_id: TaskId,
+    pub intent_revision_id: TaskIntentRevisionId,
+    pub candidate_id: CandidateId,
+    pub space_id: SpaceId,
+    pub status: ProposedSpaceGroupMappingStatus,
 }
 
 /// Minimal durable discovery/audit record for one finalized automatic Candidate.
@@ -1829,6 +1847,18 @@ impl TaskRuntime {
             .transpose()
     }
 
+    /// Reads the current reservation or committed mapping for one proposed Space group.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed parse or storage failures; absence remains `None`.
+    pub fn read_proposed_space_group(
+        &self,
+        proposed_space_group_key: ProposedSpaceGroupKey,
+    ) -> Result<Option<ProposedSpaceGroupMapping>> {
+        read_proposed_space_group_mapping(&self.open_connection()?, proposed_space_group_key)
+    }
+
     /// Lists one stable bounded page of Reviews owned by the locator's exact `ActiveTask`.
     ///
     /// # Errors
@@ -2077,6 +2107,7 @@ impl TaskRuntime {
         expected_task_id: TaskId,
         expected_intent_revision_id: TaskIntentRevisionId,
         plan: &CandidateConfirmationPlan,
+        proposed_space_group_key: Option<ProposedSpaceGroupKey>,
     ) -> Result<CandidateConfirmationReservation> {
         locator.validate()?;
         plan.validate()?;
@@ -2114,6 +2145,15 @@ impl TaskRuntime {
                     "Candidate Confirmation operation already has different semantics",
                 ));
             }
+            if let Some(proposed_space_group_key) = proposed_space_group_key {
+                reserve_proposed_space_group(
+                    &transaction,
+                    proposed_space_group_key,
+                    expected_task_id,
+                    expected_intent_revision_id,
+                    &existing.plan,
+                )?;
+            }
             transaction.commit().map_err(sql_error(
                 "commit existing Candidate Confirmation reservation",
             ))?;
@@ -2121,6 +2161,15 @@ impl TaskRuntime {
                 operation: existing,
                 created: false,
             });
+        }
+        if let Some(proposed_space_group_key) = proposed_space_group_key {
+            reserve_proposed_space_group(
+                &transaction,
+                proposed_space_group_key,
+                expected_task_id,
+                expected_intent_revision_id,
+                plan,
+            )?;
         }
         if review.status != CandidateReviewStatus::Pending {
             return Err(Error::new(
@@ -2221,6 +2270,15 @@ impl TaskRuntime {
                     "committed Candidate Confirmation and Review audit disagree",
                 ));
             }
+            if let Some(mapping) =
+                read_proposed_space_group_mapping_for_candidate(&transaction, candidate_id)?
+            {
+                if mapping.status != ProposedSpaceGroupMappingStatus::Committed {
+                    return Err(invariant(
+                        "committed Candidate Confirmation has an uncommitted proposed Space group",
+                    ));
+                }
+            }
             transaction.commit().map_err(sql_error(
                 "commit idempotent Candidate Confirmation finalize",
             ))?;
@@ -2259,6 +2317,13 @@ impl TaskRuntime {
                 [candidate_id.to_string()],
             )
             .map_err(sql_error("commit Candidate Confirmation operation status"))?;
+        transaction
+            .execute(
+                "UPDATE proposed_space_group SET status = 'committed'
+                 WHERE candidate_id = ?1 AND status = 'reserved'",
+                [candidate_id.to_string()],
+            )
+            .map_err(sql_error("commit proposed Space group mapping"))?;
         let operation = read_candidate_confirmation_operation(&transaction, candidate_id)?
             .ok_or_else(|| invariant("committed Candidate Confirmation operation disappeared"))?;
         let review = read_candidate_review_record(&transaction, candidate_id)?
@@ -2726,6 +2791,17 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 status TEXT NOT NULL CHECK (status IN ('reserved', 'committed')),
                 UNIQUE (candidate_id, review_parent_version),
                 FOREIGN KEY (candidate_id) REFERENCES candidate_review (candidate_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS proposed_space_group (
+                proposed_space_group_key TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                intent_revision_id TEXT NOT NULL,
+                candidate_id TEXT NOT NULL UNIQUE,
+                space_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('reserved', 'committed')),
+                UNIQUE (task_id, intent_revision_id),
+                FOREIGN KEY (candidate_id) REFERENCES candidate_review (candidate_id),
+                FOREIGN KEY (intent_revision_id) REFERENCES task_intent_revision (revision_id)
             ) STRICT;
             CREATE TABLE IF NOT EXISTS work_episode_diagnostic (
                 episode_id TEXT NOT NULL,
@@ -3512,6 +3588,150 @@ fn parse_candidate_review_record(row: CandidateReviewRow) -> Result<CandidateRev
             .map(|value| parse_id(value, "candidate_review.result_context_id"))
             .transpose()?,
     })
+}
+
+type ProposedSpaceGroupRow = (String, String, String, String, String, String);
+
+fn parse_proposed_space_group_mapping(
+    row: &ProposedSpaceGroupRow,
+) -> Result<ProposedSpaceGroupMapping> {
+    let mapping = ProposedSpaceGroupMapping {
+        proposed_space_group_key: parse_id(
+            &row.0,
+            "proposed_space_group.proposed_space_group_key",
+        )?,
+        task_id: parse_id(&row.1, "proposed_space_group.task_id")?,
+        intent_revision_id: parse_id(&row.2, "proposed_space_group.intent_revision_id")?,
+        candidate_id: parse_id(&row.3, "proposed_space_group.candidate_id")?,
+        space_id: parse_id(&row.4, "proposed_space_group.space_id")?,
+        status: match row.5.as_str() {
+            "reserved" => ProposedSpaceGroupMappingStatus::Reserved,
+            "committed" => ProposedSpaceGroupMappingStatus::Committed,
+            _ => {
+                return Err(invariant(
+                    "persisted proposed Space group status is invalid",
+                ));
+            }
+        },
+    };
+    if mapping.proposed_space_group_key
+        != ProposedSpaceGroupKey::from_task_intent(mapping.task_id, mapping.intent_revision_id)
+    {
+        return Err(invariant(
+            "persisted proposed Space group key disagrees with Task Intent ownership",
+        ));
+    }
+    Ok(mapping)
+}
+
+fn read_proposed_space_group_mapping(
+    connection: &Connection,
+    proposed_space_group_key: ProposedSpaceGroupKey,
+) -> Result<Option<ProposedSpaceGroupMapping>> {
+    connection
+        .query_row(
+            "SELECT proposed_space_group_key, task_id, intent_revision_id,
+                    candidate_id, space_id, status
+             FROM proposed_space_group WHERE proposed_space_group_key = ?1",
+            [proposed_space_group_key.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error("read proposed Space group mapping"))?
+        .map(|row| parse_proposed_space_group_mapping(&row))
+        .transpose()
+}
+
+fn read_proposed_space_group_mapping_for_candidate(
+    connection: &Connection,
+    candidate_id: CandidateId,
+) -> Result<Option<ProposedSpaceGroupMapping>> {
+    connection
+        .query_row(
+            "SELECT proposed_space_group_key, task_id, intent_revision_id,
+                    candidate_id, space_id, status
+             FROM proposed_space_group WHERE candidate_id = ?1",
+            [candidate_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error("read Candidate proposed Space group mapping"))?
+        .map(|row| parse_proposed_space_group_mapping(&row))
+        .transpose()
+}
+
+fn reserve_proposed_space_group(
+    transaction: &Transaction<'_>,
+    proposed_space_group_key: ProposedSpaceGroupKey,
+    task_id: TaskId,
+    intent_revision_id: TaskIntentRevisionId,
+    plan: &CandidateConfirmationPlan,
+) -> Result<()> {
+    if proposed_space_group_key
+        != ProposedSpaceGroupKey::from_task_intent(task_id, intent_revision_id)
+    {
+        return Err(invalid(
+            "proposed Space group key does not match the exact Task Intent revision",
+        ));
+    }
+    let space_id = plan
+        .confirmation
+        .created_space_id
+        .ok_or_else(|| invalid("proposed Space group requires a new Primary Space plan"))?;
+    if space_id != plan.confirmation.primary_space_id {
+        return Err(invariant(
+            "proposed Space group plan does not create its Primary Space",
+        ));
+    }
+    if let Some(existing) =
+        read_proposed_space_group_mapping(transaction, proposed_space_group_key)?
+    {
+        if existing.task_id == task_id
+            && existing.intent_revision_id == intent_revision_id
+            && existing.candidate_id == plan.operation.candidate_id
+            && existing.space_id == space_id
+        {
+            return Ok(());
+        }
+        return Err(Error::new(
+            ErrorKind::Conflict,
+            "proposed Space group is already reserved by another Candidate",
+        ));
+    }
+    transaction
+        .execute(
+            "INSERT INTO proposed_space_group (
+                proposed_space_group_key, task_id, intent_revision_id,
+                candidate_id, space_id, status
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved')",
+            params![
+                proposed_space_group_key.to_string(),
+                task_id.to_string(),
+                intent_revision_id.to_string(),
+                plan.operation.candidate_id.to_string(),
+                space_id.to_string(),
+            ],
+        )
+        .map_err(sql_error("reserve proposed Space group"))?;
+    Ok(())
 }
 
 fn read_candidate_review_record(

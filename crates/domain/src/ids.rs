@@ -300,6 +300,78 @@ opaque_id!(
     "Opaque identity of one Candidate Space recommendation."
 );
 
+/// Stable grouping key for Candidates produced from one Task Intent revision.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProposedSpaceGroupKey(Uuid);
+
+impl ProposedSpaceGroupKey {
+    pub const PREFIX: &'static str = "psg_";
+
+    /// Derives the stable grouping identity for one exact Task Intent revision.
+    #[must_use]
+    pub fn from_task_intent(task_id: TaskId, intent_revision_id: TaskIntentRevisionId) -> Self {
+        let mut seed = Vec::new();
+        for value in [task_id.to_string(), intent_revision_id.to_string()] {
+            seed.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            seed.extend_from_slice(value.as_bytes());
+        }
+        let digest = Sha256::digest(seed);
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Self(Uuid::from_bytes(bytes))
+    }
+
+    /// Returns the stable UUID portion of the key.
+    #[must_use]
+    pub const fn uuid(self) -> Uuid {
+        self.0
+    }
+
+    pub(crate) fn from_stable_seed(seed: &[u8]) -> Self {
+        let digest = Sha256::digest(seed);
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Self(Uuid::from_bytes(bytes))
+    }
+}
+
+impl fmt::Display for ProposedSpaceGroupKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}{}", Self::PREFIX, self.0.hyphenated())
+    }
+}
+
+impl FromStr for ProposedSpaceGroupKey {
+    type Err = IdParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        parse_uuid(value, Self::PREFIX).map(Self)
+    }
+}
+
+impl Serialize for ProposedSpaceGroupKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProposedSpaceGroupKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_str(&value).map_err(de::Error::custom)
+    }
+}
+
 impl SpaceRecommendationId {
     pub(crate) fn from_stable_seed(seed: &[u8]) -> Self {
         let digest = Sha256::digest(seed);
@@ -368,9 +440,10 @@ mod tests {
     use super::{
         AgentCheckpointId, CandidateBuildId, CandidateId, CaptureId, CheckpointClaimId,
         ConfirmationId, ConflictId, ContextId, EventId, EvidenceId, ExternalSessionId,
-        PublicationId, ReferenceId, RepositoryGroupId, RepositoryId, ResolutionId, ReviewId,
-        RevisionId, SignalId, SpaceAssociationId, SpaceId, SpaceRecommendationId, SubmissionId,
-        TaskId, TaskIntentRevisionId, TaskSessionId, WorkEpisodeId, WorkObservationId,
+        ProposedSpaceGroupKey, PublicationId, ReferenceId, RepositoryGroupId, RepositoryId,
+        ResolutionId, ReviewId, RevisionId, SignalId, SpaceAssociationId, SpaceId,
+        SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId,
+        WorkEpisodeId, WorkObservationId,
     };
 
     #[test]
@@ -490,5 +563,27 @@ mod tests {
         assert_generated_id!(ReviewId::new(), "rvw_");
         assert_generated_id!(ConflictId::new(), "cnf_");
         assert_generated_id!(ResolutionId::new(), "rsl_");
+    }
+
+    #[test]
+    fn proposed_space_group_key_is_stable_per_task_intent_revision() {
+        let task_id = TaskId::new();
+        let intent_revision_id = TaskIntentRevisionId::new();
+        let key = ProposedSpaceGroupKey::from_task_intent(task_id, intent_revision_id);
+        assert!(key.to_string().starts_with("psg_"));
+        assert_eq!(key.uuid().get_version(), Some(Version::Random));
+        assert_eq!(key.uuid().get_variant(), Variant::RFC4122);
+        assert_eq!(
+            key,
+            ProposedSpaceGroupKey::from_task_intent(task_id, intent_revision_id)
+        );
+        assert_ne!(
+            key,
+            ProposedSpaceGroupKey::from_task_intent(task_id, TaskIntentRevisionId::new())
+        );
+        assert_ne!(
+            key,
+            ProposedSpaceGroupKey::from_task_intent(TaskId::new(), intent_revision_id)
+        );
     }
 }

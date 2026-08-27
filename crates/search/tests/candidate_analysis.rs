@@ -7,8 +7,8 @@ use sctx_domain::{
     ContextRevisionRef, EngineeringArtifact, EngineeringReference, EvidenceSnapshotDraft,
     EvidenceType, IntentSnapshot, PublicationAction, PublicationDraft, RecommendedSpaceRole,
     ReferenceId, ReferenceRelation, RepoRelativePath, RepositoryId, RepositoryIdentity, RevisionId,
-    SpaceId, SubmissionId, TaskId, TaskSessionId, WorkEpisodeId, WorkEpisodeRef,
-    WorkingIntentSnapshot,
+    SpaceId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId, WorkEpisodeId,
+    WorkEpisodeRef, WorkingIntentSnapshot,
 };
 use sctx_engineering_graph::{
     ArtifactObservation, ArtifactSourceState, EngineeringProjectionStore,
@@ -294,11 +294,13 @@ fn empty_context_store_yields_zero_existing_spaces_and_does_not_write_git() {
     let result = SearchEngine::new(index)
         .analyze_candidate(&CandidateAnalysisRequest {
             source_task_id: candidate.source_episode.task_id,
+            source_intent_revision_id: TaskIntentRevisionId::new(),
             source_working_intent: source_intent(candidate.source_episode.task_id),
             source_task_signals: Vec::new(),
             candidate,
             explicit_related_contexts: Vec::new(),
             artifact_refs: Vec::new(),
+            proposed_space_group_space_id: None,
             token_budget: 2_000,
             top_k: 4,
         })
@@ -352,11 +354,13 @@ fn canonically_duplicate_evidence_supports_do_not_invalidate_candidate_intent() 
     let result = SearchEngine::new(index)
         .analyze_candidate(&CandidateAnalysisRequest {
             source_task_id: candidate.source_episode.task_id,
+            source_intent_revision_id: TaskIntentRevisionId::new(),
             source_working_intent: source_intent(candidate.source_episode.task_id),
             source_task_signals: Vec::new(),
             candidate,
             explicit_related_contexts: Vec::new(),
             artifact_refs: Vec::new(),
+            proposed_space_group_space_id: None,
             token_budget: 4_000,
             top_k: 4,
         })
@@ -387,11 +391,13 @@ fn one_safe_exact_owner_yields_one_existing_primary_space() {
     let result = SearchEngine::new(index)
         .analyze_candidate(&CandidateAnalysisRequest {
             source_task_id: candidate.source_episode.task_id,
+            source_intent_revision_id: TaskIntentRevisionId::new(),
             source_working_intent: source_intent(candidate.source_episode.task_id),
             source_task_signals: Vec::new(),
             candidate,
             explicit_related_contexts: Vec::new(),
             artifact_refs: Vec::new(),
+            proposed_space_group_space_id: None,
             token_budget: 2_000,
             top_k: 4,
         })
@@ -430,6 +436,19 @@ fn candidate(content: ContextRevisionDraft) -> ContextCandidate {
         .unwrap()
 }
 
+fn candidate_for_task(content: ContextRevisionDraft, task_id: TaskId) -> ContextCandidate {
+    ContextCandidate::from_verified_submission(
+        SubmissionId::new(),
+        WorkEpisodeRef {
+            episode_id: WorkEpisodeId::new(),
+            task_session_id: TaskSessionId::new(),
+            task_id,
+        },
+        content,
+    )
+    .unwrap()
+}
+
 fn source_intent(_task_id: TaskId) -> WorkingIntentSnapshot {
     WorkingIntentSnapshot {
         goal: "ZXQ review objective".to_owned(),
@@ -446,6 +465,146 @@ fn source_intent(_task_id: TaskId) -> WorkingIntentSnapshot {
     }
 }
 
+#[test]
+#[allow(clippy::too_many_lines)]
+fn proposed_space_group_is_stable_per_task_intent_and_resolves_to_its_first_space() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("proposed Space group root");
+    let store = GitStore::bootstrap_local(&root).unwrap();
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    let task_id = TaskId::new();
+    let intent_revision_id = TaskIntentRevisionId::new();
+    let working_intent = WorkingIntentSnapshot {
+        goal: "  System suggestion: Build grouped checkout compatibility knowledge for every supported client without duplicating candidate spaces after review  ".to_owned(),
+        current_direction: Some("Keep one review boundary per Task Intent revision".to_owned()),
+        in_scope: vec!["grouped Candidate review".to_owned()],
+        out_of_scope: vec!["semantic Candidate deduplication".to_owned()],
+        domains: vec!["candidate".to_owned()],
+        platforms: Vec::new(),
+        constraints: Vec::new(),
+        acceptance_conditions: vec!["all sibling Claims share one proposed Space".to_owned()],
+        artifact_hints: Vec::new(),
+        interface_hints: Vec::new(),
+        open_questions: Vec::new(),
+    };
+    let analyze = |content: ContextRevisionDraft,
+                   revision_id: TaskIntentRevisionId,
+                   mapped_space_id: Option<SpaceId>| {
+        SearchEngine::new(index.clone())
+            .analyze_candidate(&CandidateAnalysisRequest {
+                source_task_id: task_id,
+                source_intent_revision_id: revision_id,
+                source_working_intent: working_intent.clone(),
+                source_task_signals: Vec::new(),
+                candidate: candidate_for_task(content, task_id),
+                explicit_related_contexts: Vec::new(),
+                artifact_refs: Vec::new(),
+                proposed_space_group_space_id: mapped_space_id,
+                token_budget: 8_000,
+                top_k: 8,
+            })
+            .unwrap()
+    };
+    let first = analyze(
+        draft(
+            Some("candidate/group-a"),
+            "First grouped Candidate",
+            "First Claim rationale",
+            "group-a",
+        ),
+        intent_revision_id,
+        None,
+    );
+    let second = analyze(
+        draft(
+            Some("candidate/group-b"),
+            "Second grouped Candidate",
+            "Second Claim rationale",
+            "group-b",
+        ),
+        intent_revision_id,
+        None,
+    );
+    let proposed = |result: &sctx_search::CandidateAnalysisResult| {
+        result
+            .space_recommendations
+            .iter()
+            .find_map(|recommendation| match recommendation {
+                CandidateSpaceRecommendation::ProposedNewSpaceIntent {
+                    recommendation_id,
+                    proposed_space_group_key,
+                    proposed_new_space_intent,
+                    ..
+                } => Some((
+                    *recommendation_id,
+                    proposed_space_group_key.unwrap(),
+                    proposed_new_space_intent.clone(),
+                )),
+                CandidateSpaceRecommendation::Existing { .. } => None,
+            })
+            .unwrap()
+    };
+    let first_proposed = proposed(&first);
+    let second_proposed = proposed(&second);
+    assert_eq!(first_proposed, second_proposed);
+    assert_eq!(
+        first_proposed.2.title,
+        "Build grouped checkout compatibility knowledge for every supported client"
+    );
+    assert!(!first_proposed.2.title.contains("System suggestion"));
+    assert!(first_proposed.2.title.split_whitespace().count() <= 12);
+    assert!(first_proposed.2.title.chars().count() <= 80);
+    assert_eq!(first_proposed.2.desired_outcome, working_intent.goal);
+
+    let next_revision = analyze(
+        draft(
+            Some("candidate/group-c"),
+            "Third grouped Candidate",
+            "Third Claim rationale",
+            "group-c",
+        ),
+        TaskIntentRevisionId::new(),
+        None,
+    );
+    assert_ne!(proposed(&next_revision).1, first_proposed.1);
+
+    let (mapped_space_id, _) = add_space(&store, "Mapped Task Intent", "mapped-task-intent");
+    index.synchronize().unwrap();
+    let mapped = analyze(
+        draft(
+            Some("candidate/group-d"),
+            "Fourth grouped Candidate",
+            "Fourth Claim rationale",
+            "group-d",
+        ),
+        intent_revision_id,
+        Some(mapped_space_id),
+    );
+    assert!(mapped.space_recommendations.iter().any(|recommendation| matches!(
+        recommendation,
+        CandidateSpaceRecommendation::Existing {
+            space_id,
+            role: RecommendedSpaceRole::Primary,
+            paths,
+            ..
+        } if *space_id == mapped_space_id && paths.iter().any(|path| matches!(
+            path,
+            sctx_domain::CandidateSpaceRecommendationPath::ProposedSpaceGroupResolved { proposed_space_group_key }
+                if *proposed_space_group_key == first_proposed.1
+        ))
+    )));
+    assert!(
+        !mapped
+            .space_recommendations
+            .iter()
+            .any(|recommendation| matches!(
+                recommendation,
+                CandidateSpaceRecommendation::ProposedNewSpaceIntent { .. }
+            ))
+    );
+}
+
 fn analyze(
     fixture: &Fixture,
     content: ContextRevisionDraft,
@@ -457,11 +616,13 @@ fn analyze(
     SearchEngine::new(fixture.index.clone())
         .analyze_candidate(&CandidateAnalysisRequest {
             source_task_id: candidate.source_episode.task_id,
+            source_intent_revision_id: TaskIntentRevisionId::new(),
             source_working_intent: source_intent(candidate.source_episode.task_id),
             source_task_signals: Vec::new(),
             candidate,
             explicit_related_contexts: explicit,
             artifact_refs: Vec::new(),
+            proposed_space_group_space_id: None,
             token_budget: budget,
             top_k,
         })
@@ -827,6 +988,7 @@ fn exact_artifact_graph_reaches_cross_end_space_with_frozen_generation() {
     let result = SearchEngine::with_engineering_graph(index, graph_store)
         .analyze_candidate(&CandidateAnalysisRequest {
             source_task_id: candidate.source_episode.task_id,
+            source_intent_revision_id: TaskIntentRevisionId::new(),
             source_working_intent: source_intent(candidate.source_episode.task_id),
             source_task_signals: Vec::new(),
             candidate,
@@ -835,6 +997,7 @@ fn exact_artifact_graph_reaches_cross_end_space_with_frozen_generation() {
                 repository_id: repository.repository_id.clone(),
                 locator: symbol_locator(),
             }],
+            proposed_space_group_space_id: None,
             token_budget: 8_000,
             top_k: 16,
         })

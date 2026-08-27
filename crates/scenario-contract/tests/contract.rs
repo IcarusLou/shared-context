@@ -186,10 +186,10 @@ fn capture_sources_must_exist_precede_consumers_and_produce_output() {
 
 #[test]
 fn every_domain_id_prefix_is_rejected_but_business_prefix_text_is_allowed() {
-    const PREFIXES: [&str; 28] = [
+    const PREFIXES: [&str; 29] = [
         "spc_", "rpo_", "rpg_", "ref_", "tsk_", "tss_", "xss_", "tir_", "sig_", "cap_", "wep_",
-        "wob_", "ckp_", "clm_", "bld_", "rec_", "cnd_", "sub_", "cfm_", "asc_", "ctx_", "rev_",
-        "evt_", "pub_", "evd_", "rvw_", "cnf_", "rsl_",
+        "wob_", "ckp_", "clm_", "bld_", "rec_", "psg_", "cnd_", "sub_", "cfm_", "asc_", "ctx_",
+        "rev_", "evt_", "pub_", "evd_", "rvw_", "cnf_", "rsl_",
     ];
     for prefix in PREFIXES {
         let mut scenario = value(CODEX);

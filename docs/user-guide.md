@@ -564,6 +564,8 @@ Agent 还可以通过公开 MCP `task_capture_list` 有界列出当前 ActiveTas
 
 Candidate 状态支持 `pending`、`discarded`、`expired`、`confirmed`。只有完整分析且 `ready_for_review` 的 Candidate 才适合让用户决策。`potential_contradiction` 和 `unresolved_related` 是审核线索，不是已经成立的事实。
 
+同一 Task Intent Revision 产生多个 Claims 时，每个 Claim 仍是独立 Candidate，但它们共享一个 `ProposedSpaceGroup`：建议的新 Space 标题只来自 Working Intent 的 `goal`，会移除内部 `System suggestion:` 前缀、规范空白并在词边界截断。第一个 Candidate 确认创建新 Space 后，其他待审核 Candidate 会推荐该 Existing Space；新的 Intent Revision 使用新分组。这个机制不会按文本合并 Candidate，也不是全局 Active Space。
+
 确认时的 `edits` 可以只替换用户明确要求修改的字段：`kind`、`topic_key`、`statement`、`rationale`、`applicability`、`assumptions`、`recheck_when`、`relations`、`evidence`。省略字段表示保留原草稿；`topic_key` 使用 `{"action":"clear"}` 才表示显式清空。
 
 `relations` 只接受 `depends_on`、`constrains`、`implements`、`validated_by`、`contradicts`、`related_to`；分析用 `related_contexts` 不会自动变成关系。Engineering Reference 必须使用已登记 RepositoryId、确定性 locator 和非空 `supports`；Checkpoint 提案允许空 `limitations` 列表，但列表中的每一项都必须非空，直接调用 `engineering-reference record` 仍要求至少一项限制说明。Confirm 成功后会尝试重建 Engineering Graph；响应中的 `graph_rebuild_pending=true` 表示知识事实已原子提交，但派生图需要稍后重试，并不表示可以重复创建事实。

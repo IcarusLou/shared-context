@@ -7,8 +7,9 @@ use crate::{
     AgentCheckpointId, Applicability, ArtifactLocator, CandidateBuildId, CandidateId, CaptureId,
     CheckpointClaimId, ConfirmationId, ContextId, ContextRelationKind, ContextRevisionDraft,
     EngineeringReferenceDraft, Error, ErrorKind, EvidenceId, EvidenceSnapshotDraft, IntentSnapshot,
-    RepositoryId, Result, RevisionId, SignalId, SpaceId, SpaceRecommendationId, SubmissionId,
-    TaskId, TaskIntentRevisionId, TaskSessionId, TaskSignalKind, WorkEpisodeId, WorkObservationId,
+    ProposedSpaceGroupKey, RepositoryId, Result, RevisionId, SignalId, SpaceId,
+    SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId,
+    TaskSignalKind, WorkEpisodeId, WorkObservationId,
 };
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -1123,6 +1124,12 @@ pub enum CandidateSpaceRecommendationPath {
     IntentConflict {
         head_count: usize,
     },
+    ProposedFromTaskIntentRevision {
+        proposed_space_group_key: ProposedSpaceGroupKey,
+    },
+    ProposedSpaceGroupResolved {
+        proposed_space_group_key: ProposedSpaceGroupKey,
+    },
     ProposedFromCandidate,
     ManualReview,
 }
@@ -1153,7 +1160,10 @@ impl CandidateSpaceRecommendationPath {
                 }
                 Ok(())
             }
-            Self::ProposedFromCandidate | Self::ManualReview => Ok(()),
+            Self::ProposedFromTaskIntentRevision { .. }
+            | Self::ProposedSpaceGroupResolved { .. }
+            | Self::ProposedFromCandidate
+            | Self::ManualReview => Ok(()),
         }
     }
 }
@@ -1172,6 +1182,8 @@ pub enum CandidateSpaceRecommendation {
     },
     ProposedNewSpaceIntent {
         recommendation_id: SpaceRecommendationId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proposed_space_group_key: Option<ProposedSpaceGroupKey>,
         proposed_new_space_intent: IntentSnapshot,
         rationale: String,
         confidence: CandidateConfidence,
@@ -1213,12 +1225,39 @@ impl CandidateSpaceRecommendation {
         rationale: impl Into<String>,
         confidence: CandidateConfidence,
     ) -> Self {
+        Self::proposed_new_for_group_with_paths(
+            fallback_proposed_space_group_key(&intent),
+            intent,
+            rationale,
+            confidence,
+            vec![CandidateSpaceRecommendationPath::ProposedFromCandidate],
+        )
+    }
+
+    /// Recommends one proposed Space Intent for an exact Task Intent revision.
+    pub fn proposed_new_for_group(
+        proposed_space_group_key: ProposedSpaceGroupKey,
+        intent: IntentSnapshot,
+        rationale: impl Into<String>,
+        confidence: CandidateConfidence,
+    ) -> Self {
         let rationale = rationale.into();
-        let paths = vec![CandidateSpaceRecommendationPath::ProposedFromCandidate];
-        let recommendation_id =
-            stable_recommendation_id(&("proposed_new", &intent, &rationale, &confidence, &paths));
+        let paths = vec![
+            CandidateSpaceRecommendationPath::ProposedFromTaskIntentRevision {
+                proposed_space_group_key,
+            },
+        ];
+        let recommendation_id = stable_recommendation_id(&(
+            "proposed_new",
+            proposed_space_group_key,
+            &intent,
+            &rationale,
+            &confidence,
+            &paths,
+        ));
         Self::ProposedNewSpaceIntent {
             recommendation_id,
+            proposed_space_group_key: Some(proposed_space_group_key),
             proposed_new_space_intent: intent,
             rationale,
             confidence,
@@ -1260,11 +1299,35 @@ impl CandidateSpaceRecommendation {
         confidence: CandidateConfidence,
         paths: Vec<CandidateSpaceRecommendationPath>,
     ) -> Self {
+        Self::proposed_new_for_group_with_paths(
+            fallback_proposed_space_group_key(&intent),
+            intent,
+            rationale,
+            confidence,
+            paths,
+        )
+    }
+
+    /// Recommends one Task-Intent-grouped Space Intent with explicit derived paths.
+    pub fn proposed_new_for_group_with_paths(
+        proposed_space_group_key: ProposedSpaceGroupKey,
+        intent: IntentSnapshot,
+        rationale: impl Into<String>,
+        confidence: CandidateConfidence,
+        paths: Vec<CandidateSpaceRecommendationPath>,
+    ) -> Self {
         let rationale = rationale.into();
-        let recommendation_id =
-            stable_recommendation_id(&("proposed_new", &intent, &rationale, &confidence, &paths));
+        let recommendation_id = stable_recommendation_id(&(
+            "proposed_new",
+            proposed_space_group_key,
+            &intent,
+            &rationale,
+            &confidence,
+            &paths,
+        ));
         Self::ProposedNewSpaceIntent {
             recommendation_id,
+            proposed_space_group_key: Some(proposed_space_group_key),
             proposed_new_space_intent: intent,
             rationale,
             confidence,
@@ -1285,6 +1348,7 @@ impl CandidateSpaceRecommendation {
                 validate_recommendation_paths(paths, field)
             }
             Self::ProposedNewSpaceIntent {
+                proposed_space_group_key,
                 proposed_new_space_intent,
                 rationale,
                 confidence,
@@ -1294,7 +1358,26 @@ impl CandidateSpaceRecommendation {
                 proposed_new_space_intent.validate()?;
                 require_text(rationale, &format!("{field}.rationale"))?;
                 confidence.validate(&format!("{field}.confidence"))?;
-                validate_recommendation_paths(paths, field)
+                validate_recommendation_paths(paths, field)?;
+                let grouped_path_key = paths.iter().find_map(|path| match path {
+                    CandidateSpaceRecommendationPath::ProposedFromTaskIntentRevision {
+                        proposed_space_group_key,
+                    } => Some(*proposed_space_group_key),
+                    _ => None,
+                });
+                if paths.iter().any(|path| {
+                    matches!(
+                        path,
+                        CandidateSpaceRecommendationPath::ProposedSpaceGroupResolved { .. }
+                    )
+                }) || grouped_path_key.is_some_and(|path_key| {
+                    proposed_space_group_key.is_none_or(|group_key| path_key != group_key)
+                }) {
+                    return Err(invalid(format!(
+                        "{field}.paths disagree with the proposed Space group"
+                    )));
+                }
+                Ok(())
             }
         }
     }
@@ -1304,6 +1387,12 @@ fn stable_recommendation_id(value: &impl Serialize) -> SpaceRecommendationId {
     let bytes = serde_json::to_vec(value)
         .expect("serializing Candidate Space recommendation identity cannot fail");
     SpaceRecommendationId::from_stable_seed(&bytes)
+}
+
+fn fallback_proposed_space_group_key(intent: &IntentSnapshot) -> ProposedSpaceGroupKey {
+    let seed = serde_json::to_vec(intent)
+        .expect("serializing fallback proposed Space group key cannot fail");
+    ProposedSpaceGroupKey::from_stable_seed(&seed)
 }
 
 fn validate_recommendation_paths(
@@ -2366,6 +2455,14 @@ mod tests {
         assert!(!encoded.contains("transcript"));
         assert!(!encoded.contains("tool_output"));
         assert!(!encoded.contains("raw_payload"));
+
+        let mut legacy = serde_json::to_value(&candidate.space_recommendations[2]).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("proposed_space_group_key");
+        let legacy: CandidateSpaceRecommendation = serde_json::from_value(legacy).unwrap();
+        legacy.validate("legacy_recommendation").unwrap();
     }
 
     #[test]

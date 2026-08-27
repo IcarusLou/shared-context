@@ -116,6 +116,10 @@ _Avoid_: similarity label, authoritative ContextRelation
 A non-binding, path-explained assessment that an AutomaticContextCandidate may be Primary or Related to an existing ContextSpace, or that a complete system-suggested new Space Intent may be needed. Recommendations never create, select, or resolve a conflicted Space Intent.
 _Avoid_: Candidate ownership, Active Space, automatic Space creation
 
+**ProposedSpaceGroup**:
+The stable review grouping shared by all Candidates produced from one exact TaskIntentRevision. Its first confirmed new Space becomes the existing-Space recommendation for remaining group members without merging their Claims or Candidates.
+_Avoid_: semantic Candidate deduplication, Active Space, global Space default
+
 **CandidateReview**:
 A Task-scoped, untrusted presentation of one finalized AutomaticContextCandidate, preserving its complete draft, provenance, analysis, recommendations, confidence, and unknowns for a human decision.
 _Avoid_: Context fact, Candidate approval, Git Candidate browser
