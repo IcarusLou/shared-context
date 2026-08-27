@@ -44,6 +44,10 @@ _Avoid_: Evidence, Space binding, routing key
 A vendor-neutral structural class emitted by an Agent adapter for one completed tool call: FileOperation, TestRunner, Shell, SharedContext, or Other. Shell classification may recognize only bounded simple test-runner commands; normalized Runtime and Capture meaning retain neither command text nor vendor tool names, and SharedContext calls are excluded from capture.
 _Avoid_: substring guess, raw command, vendor tool log, tool-output classification
 
+**ToolInputContract**:
+The single public input contract shared by a Rust request type and its MCP JSON Schema, with host-facing declarations treated only as deterministic derived views. Required properties and enum values stay identical across views, while cross-field composition remains authoritative server validation when a host declaration cannot express it safely.
+_Avoid_: independent host type, schema-only business rule, duplicated enum strings
+
 **ArtifactFocusQuery**:
 A one-request question asking for historical Context around one Artifact. It is transient retrieval input, not Task state, Evidence, or an engineering fact.
 _Avoid_: Active Focus, Focus Signal, saved Focus

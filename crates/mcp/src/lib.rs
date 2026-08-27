@@ -234,6 +234,27 @@ pub struct TaskCheckpointInput {
     pub unknowns: Vec<CaptureUnknown>,
 }
 
+impl TaskCheckpointInput {
+    /// Validates the cross-field Checkpoint composition that host declarations intentionally do
+    /// not encode.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty `continue`. An empty `close` remains the explicit recovery form that may
+    /// reuse an already persisted current-Intent Checkpoint.
+    pub fn validate_composition(&self) -> Result<()> {
+        if self.boundary == TaskCheckpointBoundary::Continue
+            && self.claims.is_empty()
+            && self.unknowns.is_empty()
+        {
+            return Err(invalid(
+                "task_checkpoint continue requires at least one Claim or Unknown",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Safe, typed Checkpoint diagnostic without Agent-authored source text.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -1316,6 +1337,7 @@ impl Runtime {
 
     #[allow(clippy::too_many_lines)]
     fn task_checkpoint(&self, input: &TaskCheckpointInput) -> Result<TaskCheckpointResponse> {
+        input.validate_composition()?;
         let input_json = serde_json::to_string(input).map_err(|error| {
             invalid(format!(
                 "serialize task_checkpoint privacy boundary: {error}"
@@ -4946,8 +4968,15 @@ fn engineering_reference_record_schema() -> Value {
             "context_id": id_schema("ctx_"),
             "revision_id": id_schema("rev_"),
             "repository_id": repository_id_schema(),
-            "artifact_kind": {"type": "string", "enum": ["module", "file", "symbol", "api", "schema", "test"]},
-            "relation": {"type": "string", "enum": ["implements", "defines", "consumes", "validates", "constrains", "depends_on"]},
+            "artifact_kind": enum_schema([
+                ArtifactKind::Module, ArtifactKind::File, ArtifactKind::Symbol,
+                ArtifactKind::Api, ArtifactKind::Schema, ArtifactKind::Test
+            ]),
+            "relation": enum_schema([
+                ReferenceRelation::Implements, ReferenceRelation::Defines,
+                ReferenceRelation::Consumes, ReferenceRelation::Validates,
+                ReferenceRelation::Constrains, ReferenceRelation::DependsOn
+            ]),
             "locator": artifact_locator_input_schema(),
             "supports": {"type": "string", "minLength": 1},
             "limitations": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
@@ -4964,13 +4993,15 @@ fn engineering_reference_draft_schema() -> Value {
         ],
         "properties": {
             "repository_id": repository_id_schema(),
-            "artifact_kind": {
-                "type": "string", "enum": ["module", "file", "symbol", "api", "schema", "test"]
-            },
-            "relation": {
-                "type": "string",
-                "enum": ["implements", "defines", "consumes", "validates", "constrains", "depends_on"]
-            },
+            "artifact_kind": enum_schema([
+                ArtifactKind::Module, ArtifactKind::File, ArtifactKind::Symbol,
+                ArtifactKind::Api, ArtifactKind::Schema, ArtifactKind::Test
+            ]),
+            "relation": enum_schema([
+                ReferenceRelation::Implements, ReferenceRelation::Defines,
+                ReferenceRelation::Consumes, ReferenceRelation::Validates,
+                ReferenceRelation::Constrains, ReferenceRelation::DependsOn
+            ]),
             "locator": artifact_locator_input_schema(),
             "supports": {"type": "string", "minLength": 1},
             "limitations": {"type": "array", "items": {"type": "string", "minLength": 1}}
@@ -5051,7 +5082,7 @@ fn task_intent_update_schema() -> Value {
         "properties": {
             "agent_kind": {"type": "string", "minLength": 1},
             "external_session_id": {"type": "string", "minLength": 1},
-            "task_boundary": {"type": "string", "enum": ["continue", "new"]},
+            "task_boundary": enum_schema([TaskBoundary::Continue, TaskBoundary::New]),
             "expected_revision_id": {
                 "anyOf": [id_schema("tir_"), {"type": "null"}]
             },
@@ -5125,7 +5156,10 @@ fn task_checkpoint_schema() -> Value {
             "type": "object", "additionalProperties": false,
             "required": ["kind", "supports", "content", "interpretation", "limitations"],
             "properties": {
-                "kind": {"type": "string", "enum": ["source_snapshot", "experiment_record", "artifact_snapshot"]},
+                "kind": enum_schema([
+                    EvidenceType::SourceSnapshot, EvidenceType::ExperimentRecord,
+                    EvidenceType::ArtifactSnapshot
+                ]),
                 "supports": {"type": "string", "minLength": 1},
                 "content": {"type": "object", "minProperties": 1},
                 "interpretation": {"type": "string", "minLength": 1},
@@ -5207,24 +5241,15 @@ fn task_checkpoint_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "required": ["agent_kind", "external_session_id", "expected_task_id", "expected_intent_revision_id", "expected_episode_version", "boundary", "claims", "unknowns"],
-        "anyOf": [
-            {"properties": {"claims": {"minItems": 1}}},
-            {"properties": {"unknowns": {"minItems": 1}}},
-            {
-                "properties": {
-                    "boundary": {"const": "close"},
-                    "claims": {"maxItems": 0},
-                    "unknowns": {"maxItems": 0}
-                }
-            }
-        ],
         "properties": {
             "agent_kind": {"type": "string", "minLength": 1},
             "external_session_id": {"type": "string", "minLength": 1},
             "expected_task_id": id_schema("tsk_"),
             "expected_intent_revision_id": id_schema("tir_"),
             "expected_episode_version": {"type": "integer", "minimum": 0},
-            "boundary": {"type": "string", "enum": ["continue", "close"]},
+            "boundary": enum_schema([
+                TaskCheckpointBoundary::Continue, TaskCheckpointBoundary::Close
+            ]),
             "claims": {"type": "array", "items": claim},
             "unknowns": {"type": "array", "items": unknown}
         }
@@ -5401,7 +5426,10 @@ fn candidate_edits_schema() -> Value {
                     "type": "object", "additionalProperties": false,
                     "required": ["kind", "supports", "content", "interpretation", "limitations"],
                     "properties": {
-                        "kind": {"type": "string", "enum": ["source_snapshot", "experiment_record", "artifact_snapshot"]},
+                        "kind": enum_schema([
+                            EvidenceType::SourceSnapshot, EvidenceType::ExperimentRecord,
+                            EvidenceType::ArtifactSnapshot
+                        ]),
                         "supports": {"type": "string", "minLength": 1},
                         "content": {"type": "object", "minProperties": 1},
                         "interpretation": {"type": "string", "minLength": 1},
@@ -5414,7 +5442,15 @@ fn candidate_edits_schema() -> Value {
 }
 
 fn kind_schema() -> Value {
-    json!({"type": "string", "enum": ["decision", "contract", "issue", "risk", "validation", "discovery", "progress"]})
+    enum_schema([
+        ContextKind::Decision,
+        ContextKind::Contract,
+        ContextKind::Issue,
+        ContextKind::Risk,
+        ContextKind::Validation,
+        ContextKind::Discovery,
+        ContextKind::Progress,
+    ])
 }
 
 fn context_relation_schema() -> Value {
@@ -5424,13 +5460,14 @@ fn context_relation_schema() -> Value {
         "required": ["target_context_id", "kind", "rationale", "supports"],
         "properties": {
             "target_context_id": id_schema("ctx_"),
-            "kind": {
-                "type": "string",
-                "enum": [
-                    "depends_on", "constrains", "implements", "validated_by",
-                    "contradicts", "related_to"
-                ]
-            },
+            "kind": enum_schema([
+                sctx_domain::ContextRelationKind::DependsOn,
+                sctx_domain::ContextRelationKind::Constrains,
+                sctx_domain::ContextRelationKind::Implements,
+                sctx_domain::ContextRelationKind::ValidatedBy,
+                sctx_domain::ContextRelationKind::Contradicts,
+                sctx_domain::ContextRelationKind::RelatedTo,
+            ]),
             "rationale": {"type": "string", "minLength": 1},
             "supports": {
                 "type": "array", "minItems": 1,
@@ -5446,6 +5483,14 @@ fn kind_array_schema() -> Value {
 
 fn string_array_schema() -> Value {
     json!({"type": "array", "items": {"type": "string", "minLength": 1}})
+}
+
+fn enum_schema<T, const N: usize>(values: [T; N]) -> Value
+where
+    T: Serialize,
+{
+    let values = values.into_iter().collect::<Vec<_>>();
+    json!({"type": "string", "enum": values})
 }
 
 fn id_schema(prefix: &str) -> Value {

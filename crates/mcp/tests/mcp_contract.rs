@@ -125,6 +125,90 @@ impl Fixture {
     }
 }
 
+fn codex_typescript_declaration(name: &str, schema: &Value) -> String {
+    format!(
+        "// Generated from the Codex MCP tools/list inputSchema; Rust validation remains authoritative.\nexport type {name} = {};\n",
+        typescript_type(schema, 0)
+    )
+}
+
+fn typescript_type(schema: &Value, depth: usize) -> String {
+    if let Some(value) = schema.get("const") {
+        return serde_json::to_string(value).unwrap();
+    }
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        return values
+            .iter()
+            .map(|value| serde_json::to_string(value).unwrap())
+            .collect::<Vec<_>>()
+            .join(" | ");
+    }
+    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
+        let padding = "  ".repeat(depth);
+        let variant_padding = "  ".repeat(depth + 1);
+        let variants = variants
+            .iter()
+            .map(|variant| format!("{variant_padding}| {}", typescript_type(variant, depth + 1)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return format!("(\n{variants}\n{padding})");
+    }
+    let Some(kind) = schema.get("type") else {
+        return "unknown".to_owned();
+    };
+    if let Some(kinds) = kind.as_array() {
+        return kinds
+            .iter()
+            .map(|kind| typescript_primitive(kind.as_str().unwrap()))
+            .collect::<Vec<_>>()
+            .join(" | ");
+    }
+    match kind.as_str().unwrap() {
+        "array" => format!("Array<{}>", typescript_type(&schema["items"], depth + 1)),
+        "object" => {
+            let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+                return "Record<string, unknown>".to_owned();
+            };
+            let required = schema
+                .get("required")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            let padding = "  ".repeat(depth);
+            let property_padding = "  ".repeat(depth + 1);
+            let properties = properties
+                .iter()
+                .map(|(name, property)| {
+                    let optional = if required.contains(name.as_str()) {
+                        ""
+                    } else {
+                        "?"
+                    };
+                    format!(
+                        "{property_padding}{name}{optional}: {};",
+                        typescript_type(property, depth + 1)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{{\n{properties}\n{padding}}}")
+        }
+        kind => typescript_primitive(kind).to_owned(),
+    }
+}
+
+fn typescript_primitive(kind: &str) -> &'static str {
+    match kind {
+        "string" => "string",
+        "integer" | "number" => "number",
+        "boolean" => "boolean",
+        "null" => "null",
+        _ => "unknown",
+    }
+}
+
 fn authorize_session(root: &Path, agent_kind: &str, external_session_id: &str) {
     let config = UserConfigStore::open_existing(root).unwrap();
     let mut catalog = config.repository_catalog_wait().unwrap();
@@ -3845,15 +3929,9 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
                 .unwrap()
                 .contains("supersedes")
         );
-        assert_eq!(
-            checkpoint_schema["anyOf"][2],
-            json!({
-                "properties": {
-                    "boundary": {"const": "close"},
-                    "claims": {"maxItems": 0},
-                    "unknowns": {"maxItems": 0}
-                }
-            })
+        assert!(
+            checkpoint_schema.get("anyOf").is_none(),
+            "Checkpoint composition remains a Rust invariant, not a top-level host union"
         );
         let task_schema = &tools
             .iter()
@@ -4102,6 +4180,266 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
         let spaces = &responses[5]["result"]["structuredContent"];
         assert_eq!(spaces["spaces"].as_array().unwrap().len(), 1);
     }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn codex_checkpoint_declaration_golden_matches_rust_and_mcp_schema() {
+    let fixture = Fixture::new();
+    let responses = run_session(
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::Newline,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            request(2, "tools/list", json!({})),
+        ],
+    );
+    let schema = responses[1]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "task_checkpoint")
+        .unwrap()["inputSchema"]
+        .clone();
+    assert!(schema.get("anyOf").is_none());
+
+    let sample = TaskCheckpointInput {
+        agent_kind: "codex".to_owned(),
+        external_session_id: "schema-contract".to_owned(),
+        expected_task_id: TaskId::new().to_string(),
+        expected_intent_revision_id: sctx_domain::TaskIntentRevisionId::new().to_string(),
+        expected_episode_version: 0,
+        boundary: TaskCheckpointBoundary::Continue,
+        claims: Vec::new(),
+        unknowns: vec![CaptureUnknown {
+            statement: "schema contract question".to_owned(),
+            blocking: false,
+            recheck_when: vec!["contract changes".to_owned()],
+        }],
+    };
+    assert!(sample.validate_composition().is_ok());
+    let rust_value = serde_json::to_value(&sample).unwrap();
+    let rust_properties = rust_value
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let schema_properties = schema["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let schema_required = schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(schema_properties, rust_properties);
+    assert_eq!(schema_required, rust_properties);
+    for required in &rust_properties {
+        let mut missing = rust_value.clone();
+        missing.as_object_mut().unwrap().remove(required);
+        assert!(
+            serde_json::from_value::<TaskCheckpointInput>(missing).is_err(),
+            "Rust accepted missing required property {required}"
+        );
+    }
+    let mut unknown_property = rust_value;
+    unknown_property
+        .as_object_mut()
+        .unwrap()
+        .insert("host_only".to_owned(), json!(true));
+    assert!(serde_json::from_value::<TaskCheckpointInput>(unknown_property).is_err());
+
+    assert_eq!(
+        schema["properties"]["boundary"]["enum"],
+        serde_json::to_value([
+            TaskCheckpointBoundary::Continue,
+            TaskCheckpointBoundary::Close
+        ])
+        .unwrap()
+    );
+    let claim = &schema["properties"]["claims"]["items"];
+    let rust_claim = serde_json::to_value(TaskCheckpointClaimInput {
+        context_kind_hint: Some(ContextKind::Validation),
+        topic_key_hint: Some("schema/checkpoint".to_owned()),
+        statement: "the checkpoint schema matches Rust".to_owned(),
+        rationale: "the golden is generated from tools/list".to_owned(),
+        applicability: Applicability {
+            domains: vec!["schema".to_owned()],
+            platforms: Vec::new(),
+            conditions: Vec::new(),
+        },
+        assumptions: Vec::new(),
+        recheck_when: vec!["the Rust type changes".to_owned()],
+        evidence: vec![TaskCheckpointEvidenceInput::Capture {
+            capture_id: CaptureId::new().to_string(),
+        }],
+        artifact_refs: Vec::new(),
+        relations: Vec::new(),
+        engineering_references: Vec::new(),
+        related_contexts: Vec::new(),
+    })
+    .unwrap();
+    let rust_claim_properties = rust_claim
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let schema_claim_properties = claim["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let schema_claim_required = claim["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(schema_claim_properties, rust_claim_properties);
+    for property in &rust_claim_properties {
+        let mut missing = rust_claim.clone();
+        missing.as_object_mut().unwrap().remove(property);
+        assert_eq!(
+            serde_json::from_value::<TaskCheckpointClaimInput>(missing).is_err(),
+            schema_claim_required.contains(property),
+            "Rust/schema required mismatch for Claim property {property}"
+        );
+    }
+    let mut unknown_claim_property = rust_claim;
+    unknown_claim_property
+        .as_object_mut()
+        .unwrap()
+        .insert("host_only".to_owned(), json!(true));
+    assert!(serde_json::from_value::<TaskCheckpointClaimInput>(unknown_claim_property).is_err());
+    assert_eq!(
+        claim["properties"]["context_kind_hint"]["enum"],
+        serde_json::to_value([
+            ContextKind::Decision,
+            ContextKind::Contract,
+            ContextKind::Issue,
+            ContextKind::Risk,
+            ContextKind::Validation,
+            ContextKind::Discovery,
+            ContextKind::Progress,
+        ])
+        .unwrap()
+    );
+    let evidence_draft = EvidenceSnapshotDraft {
+        kind: EvidenceType::ExperimentRecord,
+        supports: "schema contract".to_owned(),
+        content: json!({"status": "passed"}),
+        interpretation: "the schema remains aligned".to_owned(),
+        limitations: vec!["fixture only".to_owned()],
+    };
+    let evidence_variants = [
+        TaskCheckpointEvidenceInput::Capture {
+            capture_id: CaptureId::new().to_string(),
+        },
+        TaskCheckpointEvidenceInput::Observation {
+            observation_id: sctx_domain::WorkObservationId::new().to_string(),
+        },
+        TaskCheckpointEvidenceInput::TaskSignal {
+            signal_id: sctx_domain::SignalId::new().to_string(),
+        },
+        TaskCheckpointEvidenceInput::ContextEvidence {
+            context_id: ContextId::new().to_string(),
+            revision_id: RevisionId::new().to_string(),
+            evidence_id: sctx_domain::EvidenceId::new().to_string(),
+        },
+        TaskCheckpointEvidenceInput::InlineValidation {
+            evidence: evidence_draft,
+        },
+    ];
+    let rust_evidence_kinds = evidence_variants
+        .iter()
+        .map(|evidence| serde_json::to_value(evidence).unwrap()["kind"].clone())
+        .collect::<Vec<_>>();
+    let schema_evidence_kinds = claim["properties"]["evidence"]["items"]["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|variant| variant["properties"]["kind"]["const"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(schema_evidence_kinds, rust_evidence_kinds);
+    assert_eq!(
+        claim["properties"]["evidence"]["items"]["oneOf"][4]["properties"]["evidence"]["properties"]
+            ["kind"]["enum"],
+        serde_json::to_value([
+            EvidenceType::SourceSnapshot,
+            EvidenceType::ExperimentRecord,
+            EvidenceType::ArtifactSnapshot,
+        ])
+        .unwrap()
+    );
+    assert_eq!(
+        claim["properties"]["engineering_references"]["items"]["properties"]["artifact_kind"]["enum"],
+        serde_json::to_value([
+            ArtifactKind::Module,
+            ArtifactKind::File,
+            ArtifactKind::Symbol,
+            ArtifactKind::Api,
+            ArtifactKind::Schema,
+            ArtifactKind::Test,
+        ])
+        .unwrap()
+    );
+    assert_eq!(
+        claim["properties"]["engineering_references"]["items"]["properties"]["relation"]["enum"],
+        serde_json::to_value([
+            ReferenceRelation::Implements,
+            ReferenceRelation::Defines,
+            ReferenceRelation::Consumes,
+            ReferenceRelation::Validates,
+            ReferenceRelation::Constrains,
+            ReferenceRelation::DependsOn,
+        ])
+        .unwrap()
+    );
+    assert_eq!(
+        claim["properties"]["relations"]["items"]["properties"]["kind"]["enum"],
+        serde_json::to_value([
+            ContextRelationKind::DependsOn,
+            ContextRelationKind::Constrains,
+            ContextRelationKind::Implements,
+            ContextRelationKind::ValidatedBy,
+            ContextRelationKind::Contradicts,
+            ContextRelationKind::RelatedTo,
+        ])
+        .unwrap()
+    );
+
+    let empty_continue = TaskCheckpointInput {
+        unknowns: Vec::new(),
+        ..sample.clone()
+    };
+    assert!(empty_continue.validate_composition().is_err());
+    let error = task_checkpoint_at_root(&fixture.root, &empty_continue).unwrap_err();
+    assert_eq!(error.kind(), sctx_domain::ErrorKind::InvalidInput);
+    assert_eq!(
+        error.message(),
+        "task_checkpoint continue requires at least one Claim or Unknown"
+    );
+    assert!(
+        TaskCheckpointInput {
+            boundary: TaskCheckpointBoundary::Close,
+            ..empty_continue
+        }
+        .validate_composition()
+        .is_ok()
+    );
+
+    let declaration = codex_typescript_declaration("TaskCheckpointInput", &schema);
+    assert_eq!(
+        declaration,
+        include_str!("../../../fixtures/agents/codex-task-checkpoint.d.ts")
+    );
 }
 
 #[test]
