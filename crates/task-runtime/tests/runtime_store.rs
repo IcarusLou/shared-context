@@ -2,6 +2,7 @@ use std::{
     fs,
     sync::{Arc, Barrier},
     thread,
+    time::{Duration, Instant},
 };
 
 use rusqlite::Connection;
@@ -1015,4 +1016,38 @@ fn deleting_runtime_database_loses_sessions_without_touching_knowledge_files() {
     assert!(recreated.read_snapshot(session_id).unwrap().is_none());
     assert_eq!(fs::read(knowledge).unwrap(), b"durable knowledge");
     assert_eq!(fs::read(index).unwrap(), b"knowledge projection");
+}
+
+#[test]
+fn hook_runtime_busy_timeout_is_short_and_fail_open_ready() {
+    let root = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(root.path()).unwrap();
+    let locator = locator("hook-busy-timeout");
+    runtime
+        .open_or_create(
+            locator.clone(),
+            TaskId::new(),
+            intent(TaskId::new(), "hook busy timeout"),
+            Vec::new(),
+        )
+        .unwrap();
+    let lock = Connection::open(runtime.database_path()).unwrap();
+    lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+    let started = Instant::now();
+    let hook_runtime = TaskRuntime::initialize_for_hook(root.path()).unwrap();
+    assert!(
+        hook_runtime
+            .merge_signals_by_locator(
+                &locator,
+                vec![signal(TaskSignalKind::TestOutcome, "busy test runner")],
+            )
+            .is_err()
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "Hook Runtime waited {:?}",
+        started.elapsed()
+    );
+    lock.execute_batch("ROLLBACK").unwrap();
 }

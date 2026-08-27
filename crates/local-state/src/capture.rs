@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use crate::{PrivacyFindingKind, PrivacyScanner, RepositoryCatalogSnapshot};
 
 const MAX_LIST_LIMIT: usize = 256;
+const CAPTURE_METADATA_VERSION: u32 = 1;
+const MAX_CAPTURE_METADATA_BYTES: usize = 4 * 1024;
 
 /// Typed on-disk Capture schema version.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -181,6 +183,21 @@ pub struct CaptureReceipt {
     pub diagnostics: Vec<CaptureDiagnosticKind>,
 }
 
+/// Nonblocking result for the latency-sensitive Hook capture path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CaptureAttempt {
+    Captured(CaptureReceipt),
+    Busy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureStoreMetadata {
+    version: u32,
+    total_bytes: u64,
+    record_count: u64,
+}
+
 /// One bounded Capture read with explicit TTL state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaptureRead {
@@ -277,11 +294,20 @@ pub struct CleanupReport {
     pub reclaimed_bytes: u64,
 }
 
+/// Nonblocking result for lifecycle cleanup outside the `PostTool` capture path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CleanupAttempt {
+    Cleaned(CleanupReport),
+    Busy,
+}
+
 /// Private, bounded `state/capture` storage outside the Git repository.
 #[derive(Clone, Debug)]
 pub struct CaptureStore {
+    state: PathBuf,
     directory: PathBuf,
     lock_path: PathBuf,
+    metadata_path: PathBuf,
     policy: CapturePolicy,
     scanner: PrivacyScanner,
 }
@@ -311,8 +337,10 @@ impl CaptureStore {
         let directory = state.join("capture");
         ensure_private_directory(&directory)?;
         Ok(Self {
+            state: state.clone(),
             directory,
             lock_path: state.join("capture.lock"),
+            metadata_path: state.join("capture-metadata.json"),
             policy,
             scanner: PrivacyScanner::default(),
         })
@@ -331,6 +359,16 @@ impl CaptureStore {
     /// filesystem entries. Raw input is never included in diagnostics.
     pub fn capture(&self, breadcrumb: &Breadcrumb) -> Result<CaptureReceipt> {
         self.capture_at(breadcrumb, SystemTime::now())
+    }
+
+    /// Tries to store one normalized Breadcrumb without waiting for another Capture writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, privacy, byte-limit, or filesystem errors after this caller acquires
+    /// the lock. Contention itself is returned as [`CaptureAttempt::Busy`].
+    pub fn try_capture(&self, breadcrumb: &Breadcrumb) -> Result<CaptureAttempt> {
+        self.try_capture_at(breadcrumb, SystemTime::now())
     }
 
     /// Reads one typed Capture by ID without following filesystem input.
@@ -475,12 +513,46 @@ impl CaptureStore {
         Ok(report)
     }
 
+    /// Tries to clean expired records without waiting for an in-flight Capture writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns filesystem or record inspection errors only after acquiring the lock; contention
+    /// is returned as [`CleanupAttempt::Busy`].
+    pub fn try_cleanup_expired(&self) -> Result<CleanupAttempt> {
+        let Some(lock) = self.try_lock()? else {
+            return Ok(CleanupAttempt::Busy);
+        };
+        let report = self.cleanup_expired_at(SystemTime::now())?;
+        FileExt::unlock(&lock).map_err(io_error("unlock capture.lock"))?;
+        Ok(CleanupAttempt::Cleaned(report))
+    }
+
     fn capture_at(&self, breadcrumb: &Breadcrumb, now: SystemTime) -> Result<CaptureReceipt> {
         breadcrumb.external_session_locator.validate()?;
         if breadcrumb.summary.trim().is_empty() {
             return Err(invalid("breadcrumb summary must not be empty"));
         }
         let lock = self.lock()?;
+        let receipt = self.capture_locked(breadcrumb, now)?;
+        FileExt::unlock(&lock).map_err(io_error("unlock capture.lock"))?;
+        Ok(receipt)
+    }
+
+    fn try_capture_at(&self, breadcrumb: &Breadcrumb, now: SystemTime) -> Result<CaptureAttempt> {
+        breadcrumb.external_session_locator.validate()?;
+        if breadcrumb.summary.trim().is_empty() {
+            return Err(invalid("breadcrumb summary must not be empty"));
+        }
+        let Some(lock) = self.try_lock()? else {
+            return Ok(CaptureAttempt::Busy);
+        };
+        let receipt = self.capture_locked(breadcrumb, now)?;
+        FileExt::unlock(&lock).map_err(io_error("unlock capture.lock"))?;
+        Ok(CaptureAttempt::Captured(receipt))
+    }
+
+    fn capture_locked(&self, breadcrumb: &Breadcrumb, now: SystemTime) -> Result<CaptureReceipt> {
         let now_seconds = unix_seconds(now)?;
         let expires_at = now
             .checked_add(self.policy.ttl)
@@ -534,18 +606,23 @@ impl CaptureStore {
         };
         record.validate()?;
         let bytes = self.serialize_record(&record)?;
-        self.cleanup_expired_at(now)?;
-        let current_size = self.current_size()?;
-        if current_size.saturating_add(bytes.len() as u64) > self.policy.max_total_bytes {
+        let mut metadata = self.read_or_rebuild_metadata()?;
+        let prior_metadata = metadata;
+        metadata.total_bytes = metadata.total_bytes.saturating_add(bytes.len() as u64);
+        metadata.record_count = metadata.record_count.saturating_add(1);
+        if metadata.total_bytes > self.policy.max_total_bytes {
             return Err(invalid(format!(
                 "capture state would exceed aggregate limit of {} bytes",
                 self.policy.max_total_bytes
             )));
         }
+        self.write_metadata(metadata)?;
         let path = self.capture_path(capture_id);
-        write_private_new(&path, &bytes)?;
+        if let Err(error) = write_private_atomic(&self.state, &path, &bytes, false) {
+            let _rollback = self.write_metadata(prior_metadata);
+            return Err(error);
+        }
         sync_directory(&self.directory)?;
-        FileExt::unlock(&lock).map_err(io_error("unlock capture.lock"))?;
         Ok(CaptureReceipt {
             capture_id,
             path,
@@ -620,6 +697,7 @@ impl CaptureStore {
         if !report.removed.is_empty() {
             sync_directory(&self.directory)?;
         }
+        self.write_metadata(self.rebuild_metadata()?)?;
         Ok(report)
     }
 
@@ -651,15 +729,39 @@ impl CaptureStore {
     fn replace_record(&self, record: &CaptureRecord) -> Result<()> {
         let path = self.capture_path(record.capture_id);
         reject_symlink(&path)?;
+        let old_bytes = fs::symlink_metadata(&path)
+            .map_err(io_error("inspect capture record before replace"))?
+            .len();
         let bytes = self.serialize_record(record)?;
-        let temporary = self.directory.join(format!(
-            ".{}.{}.tmp",
-            record.capture_id,
-            uuid::Uuid::new_v4()
-        ));
-        write_private_new(&temporary, &bytes)?;
-        fs::rename(&temporary, &path).map_err(io_error("replace capture record"))?;
-        sync_directory(&self.directory)
+        let new_bytes = bytes.len() as u64;
+        let mut metadata = self.read_or_rebuild_metadata()?;
+        if metadata.total_bytes < old_bytes {
+            metadata = self.rebuild_metadata()?;
+        }
+        let exact_total = metadata
+            .total_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes);
+        let reserved_total = metadata.total_bytes.max(exact_total);
+        if reserved_total > self.policy.max_total_bytes {
+            return Err(invalid(format!(
+                "capture state would exceed aggregate limit of {} bytes",
+                self.policy.max_total_bytes
+            )));
+        }
+        let prior_metadata = metadata;
+        metadata.total_bytes = reserved_total;
+        self.write_metadata(metadata)?;
+        if let Err(error) = write_private_atomic(&self.state, &path, &bytes, true) {
+            let _rollback = self.write_metadata(prior_metadata);
+            return Err(error);
+        }
+        sync_directory(&self.directory)?;
+        if exact_total < reserved_total {
+            metadata.total_bytes = exact_total;
+            self.write_metadata(metadata)?;
+        }
+        Ok(())
     }
 
     fn serialize_record(&self, record: &CaptureRecord) -> Result<Vec<u8>> {
@@ -690,20 +792,81 @@ impl CaptureStore {
         self.directory.join(format!("{capture_id}.json"))
     }
 
-    fn current_size(&self) -> Result<u64> {
-        let mut size = 0_u64;
+    fn rebuild_metadata(&self) -> Result<CaptureStoreMetadata> {
+        let mut metadata = CaptureStoreMetadata {
+            version: CAPTURE_METADATA_VERSION,
+            total_bytes: 0,
+            record_count: 0,
+        };
         for entry in fs::read_dir(&self.directory).map_err(io_error("read capture directory"))? {
             let entry = entry.map_err(io_error("read capture entry"))?;
-            let metadata =
+            let entry_metadata =
                 fs::symlink_metadata(entry.path()).map_err(io_error("inspect capture entry"))?;
-            if metadata.file_type().is_file() {
-                size = size.saturating_add(metadata.len());
+            if entry_metadata.file_type().is_file() {
+                metadata.total_bytes = metadata.total_bytes.saturating_add(entry_metadata.len());
+                metadata.record_count = metadata.record_count.saturating_add(1);
             }
         }
-        Ok(size)
+        Ok(metadata)
+    }
+
+    fn read_or_rebuild_metadata(&self) -> Result<CaptureStoreMetadata> {
+        let metadata = match fs::symlink_metadata(&self.metadata_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let metadata = self.rebuild_metadata()?;
+                self.write_metadata(metadata)?;
+                return Ok(metadata);
+            }
+            Err(error) => return Err(io_error("inspect capture metadata")(error)),
+        };
+        if !metadata.file_type().is_file()
+            || metadata.permissions().mode() & 0o077 != 0
+            || metadata.len() > MAX_CAPTURE_METADATA_BYTES as u64
+        {
+            return Err(invalid("capture metadata is unsafe"));
+        }
+        let bytes = fs::read(&self.metadata_path).map_err(io_error("read capture metadata"))?;
+        let metadata: CaptureStoreMetadata =
+            serde_json::from_slice(&bytes).map_err(|_| invalid("capture metadata is invalid"))?;
+        if metadata.version != CAPTURE_METADATA_VERSION {
+            return Err(invalid("capture metadata version is unsupported"));
+        }
+        Ok(metadata)
+    }
+
+    fn write_metadata(&self, metadata: CaptureStoreMetadata) -> Result<()> {
+        let mut bytes = serde_json::to_vec_pretty(&metadata)
+            .map_err(|_| invalid("serialize capture metadata"))?;
+        bytes.push(b'\n');
+        if bytes.len() > MAX_CAPTURE_METADATA_BYTES {
+            return Err(invariant("capture metadata exceeds its byte limit"));
+        }
+        write_private_atomic(&self.state, &self.metadata_path, &bytes, true)?;
+        let parent = self
+            .metadata_path
+            .parent()
+            .ok_or_else(|| invariant("capture metadata has no parent directory"))?;
+        sync_directory(parent)
     }
 
     fn lock(&self) -> Result<File> {
+        let lock = self.open_lock()?;
+        lock.lock_exclusive()
+            .map_err(io_error("lock capture.lock"))?;
+        Ok(lock)
+    }
+
+    fn try_lock(&self) -> Result<Option<File>> {
+        let lock = self.open_lock()?;
+        match lock.try_lock_exclusive() {
+            Ok(()) => Ok(Some(lock)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(io_error("try lock capture.lock")(error)),
+        }
+    }
+
+    fn open_lock(&self) -> Result<File> {
         reject_symlink(&self.lock_path)?;
         let lock = OpenOptions::new()
             .read(true)
@@ -715,8 +878,6 @@ impl CaptureStore {
             .map_err(io_error("open capture.lock"))?;
         fs::set_permissions(&self.lock_path, fs::Permissions::from_mode(0o600))
             .map_err(io_error("set capture.lock permissions"))?;
-        lock.lock_exclusive()
-            .map_err(io_error("lock capture.lock"))?;
         Ok(lock)
     }
 }
@@ -779,16 +940,43 @@ fn reject_symlink(path: &Path) -> Result<()> {
     }
 }
 
-fn write_private_new(path: &Path, bytes: &[u8]) -> Result<()> {
+fn write_private_atomic(
+    temporary_directory: &Path,
+    path: &Path,
+    bytes: &[u8],
+    replace: bool,
+) -> Result<()> {
+    let temporary =
+        temporary_directory.join(format!(".capture-write-{}.tmp", uuid::Uuid::new_v4()));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)
+        .open(&temporary)
         .map_err(io_error("create capture record"))?;
-    file.write_all(bytes)
-        .map_err(io_error("write capture record"))?;
-    file.sync_all().map_err(io_error("sync capture record"))
+    if let Err(error) = file
+        .write_all(bytes)
+        .map_err(io_error("write capture record"))
+        .and_then(|()| file.sync_all().map_err(io_error("sync capture record")))
+    {
+        let _removed = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    drop(file);
+    let published = if replace {
+        reject_symlink(path)
+            .and_then(|()| fs::rename(&temporary, path).map_err(io_error("replace capture record")))
+    } else {
+        fs::hard_link(&temporary, path).map_err(io_error("publish capture record"))
+    };
+    if let Err(error) = published {
+        let _removed = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if !replace {
+        let _removed = fs::remove_file(&temporary);
+    }
+    Ok(())
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
@@ -832,7 +1020,7 @@ mod tests {
         path::PathBuf,
         sync::{Arc, Barrier},
         thread,
-        time::{Duration, SystemTime},
+        time::{Duration, Instant, SystemTime},
     };
 
     use sctx_domain::{
@@ -841,8 +1029,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        Breadcrumb, BreadcrumbKind, CaptureClaim, CaptureDiagnosticKind, CapturePolicy,
-        CaptureStore, CaptureStoreDiagnosticKind, CaptureTaskOwner,
+        Breadcrumb, BreadcrumbKind, CaptureAttempt, CaptureClaim, CaptureDiagnosticKind,
+        CapturePolicy, CaptureStore, CaptureStoreDiagnosticKind, CaptureTaskOwner,
     };
 
     fn locator(key: &str) -> ExternalSessionLocator {
@@ -1131,5 +1319,95 @@ mod tests {
         let breadcrumb = owned_breadcrumb(&"x".repeat(60));
         store.capture(&breadcrumb).unwrap();
         assert!(store.capture(&breadcrumb).is_err());
+    }
+
+    #[test]
+    fn hook_try_capture_skips_busy_and_metadata_tracks_claim_and_cleanup_without_half_writes() {
+        let temporary = tempdir().unwrap();
+        let store = CaptureStore::initialize(temporary.path()).unwrap();
+        let lock = store.open_lock().unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            store
+                .try_capture(&owned_breadcrumb("busy capture must skip"))
+                .unwrap(),
+            CaptureAttempt::Busy
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(fs::read_dir(store.directory()).unwrap().count(), 0);
+        fs2::FileExt::unlock(&lock).unwrap();
+
+        let breadcrumb = owned_breadcrumb("metadata-backed capture");
+        let owner = breadcrumb.task_owner.unwrap();
+        let CaptureAttempt::Captured(receipt) = store.try_capture(&breadcrumb).unwrap() else {
+            panic!("uncontended capture must be stored");
+        };
+        let before_claim = store.read_or_rebuild_metadata().unwrap();
+        assert_eq!(before_claim.record_count, 1);
+        assert_eq!(
+            before_claim.total_bytes,
+            fs::metadata(&receipt.path).unwrap().len()
+        );
+        store
+            .claim(
+                receipt.capture_id,
+                CaptureClaim {
+                    episode_id: WorkEpisodeId::new(),
+                    task_session_id: owner.task_session_id,
+                    task_id: owner.task_id,
+                },
+            )
+            .unwrap();
+        let after_claim = store.read_or_rebuild_metadata().unwrap();
+        assert_eq!(after_claim.record_count, 1);
+        assert!(after_claim.total_bytes > before_claim.total_bytes);
+
+        let cleanup = store
+            .cleanup_expired_at(SystemTime::now() + Duration::from_secs(2 * 24 * 60 * 60))
+            .unwrap();
+        assert_eq!(cleanup.removed, vec![receipt.path]);
+        let after_cleanup = store.read_or_rebuild_metadata().unwrap();
+        assert_eq!(after_cleanup.record_count, 0);
+        assert_eq!(after_cleanup.total_bytes, 0);
+        assert!(fs::read_dir(&store.state).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+    }
+
+    #[test]
+    fn capture_hot_path_defers_expired_cleanup_to_the_explicit_boundary() {
+        let temporary = tempdir().unwrap();
+        let store = CaptureStore::with_policy(
+            temporary.path(),
+            CapturePolicy {
+                ttl: Duration::from_secs(1),
+                max_entry_bytes: 4_096,
+                max_total_bytes: 16_384,
+            },
+        )
+        .unwrap();
+        let recorded_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let expired = store
+            .capture_at(&owned_breadcrumb("expired but retained"), recorded_at)
+            .unwrap();
+        store
+            .capture_at(
+                &owned_breadcrumb("new capture does not sweep"),
+                recorded_at + Duration::from_secs(2),
+            )
+            .unwrap();
+        assert!(expired.path.exists());
+        assert_eq!(store.read_or_rebuild_metadata().unwrap().record_count, 2);
+
+        let cleanup = store
+            .cleanup_expired_at(recorded_at + Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(cleanup.removed, vec![expired.path]);
+        assert_eq!(store.read_or_rebuild_metadata().unwrap().record_count, 1);
     }
 }

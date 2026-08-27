@@ -28,6 +28,7 @@ use sctx_domain::{
 
 const SCHEMA_VERSION: i64 = 11;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+const HOOK_BUSY_TIMEOUT: Duration = Duration::from_millis(25);
 const MAX_EPISODE_LIST_LIMIT: usize = 256;
 pub const DEFAULT_CANDIDATE_REVIEW_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 pub const MAX_CANDIDATE_REVIEW_TTL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
@@ -446,6 +447,8 @@ pub struct TaskRuntime {
     root: PathBuf,
     state: PathBuf,
     database: PathBuf,
+    busy_timeout: Duration,
+    configure_schema_on_open: bool,
 }
 
 impl TaskRuntime {
@@ -464,13 +467,34 @@ impl TaskRuntime {
     ///
     /// Returns typed filesystem, `SQLite`, or schema-version errors.
     pub fn initialize(root: impl Into<PathBuf>) -> Result<Self> {
-        let root = root.into();
+        Self::initialize_with_busy_timeout(root.into(), BUSY_TIMEOUT, true)
+    }
+
+    /// Initializes Runtime state with the short fail-open timeout used only by Agent Hooks.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed filesystem, `SQLite`, or schema-version errors without waiting through the
+    /// normal interactive-operation busy window.
+    pub fn initialize_for_hook(root: impl Into<PathBuf>) -> Result<Self> {
+        Self::initialize_with_busy_timeout(root.into(), HOOK_BUSY_TIMEOUT, false)
+    }
+
+    fn initialize_with_busy_timeout(
+        root: PathBuf,
+        busy_timeout: Duration,
+        configure_existing_schema: bool,
+    ) -> Result<Self> {
         let state = root.join("state");
         fs::create_dir_all(&state).map_err(io_error("create task runtime state directory"))?;
+        let database = state.join("runtime.sqlite");
+        let configure_schema_on_open = configure_existing_schema || !database.is_file();
         let runtime = Self {
-            database: state.join("runtime.sqlite"),
             root,
             state,
+            database,
+            busy_timeout,
+            configure_schema_on_open,
         };
         let _connection = runtime.open_connection()?;
         Ok(runtime)
@@ -2487,18 +2511,22 @@ impl TaskRuntime {
         let connection =
             Connection::open(&self.database).map_err(sql_error("open task runtime database"))?;
         connection
-            .busy_timeout(BUSY_TIMEOUT)
+            .busy_timeout(self.busy_timeout)
             .map_err(sql_error("configure task runtime busy timeout"))?;
-        connection
-            .pragma_update(None, "journal_mode", "WAL")
-            .map_err(sql_error("configure task runtime journal mode"))?;
-        connection
-            .pragma_update(None, "synchronous", "NORMAL")
-            .map_err(sql_error("configure task runtime synchronous mode"))?;
+        if self.configure_schema_on_open {
+            connection
+                .pragma_update(None, "journal_mode", "WAL")
+                .map_err(sql_error("configure task runtime journal mode"))?;
+            connection
+                .pragma_update(None, "synchronous", "NORMAL")
+                .map_err(sql_error("configure task runtime synchronous mode"))?;
+        }
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(sql_error("enable task runtime foreign keys"))?;
-        ensure_schema(&connection)?;
+        if self.configure_schema_on_open {
+            ensure_schema(&connection)?;
+        }
         Ok(connection)
     }
 }

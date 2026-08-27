@@ -785,16 +785,13 @@ fn run_hook(args: &[String]) -> Result<()> {
         return Err(invalid("hook stdin must contain one JSON payload"));
     }
 
+    let installed_agent_version = options.optional("--agent-version")?.map(str::to_owned);
     let (event, version) = if agent == "cursor" {
         let (event, payload_version) = sctx_adapter_cursor::decode_hook_input(&input)?;
         (event, Some(payload_version))
     } else {
         let event = sctx_adapter_codex::decode_hook_input(&input)?;
-        let version = options
-            .optional("--agent-version")?
-            .map(str::to_owned)
-            .or_else(|| detect_agent_version(agent));
-        (event, version)
+        (event, installed_agent_version)
     };
     let trust = parse_trust(agent, None, true)?;
     let capabilities = agent_capabilities(agent, version.as_deref(), true, trust);
@@ -1253,7 +1250,7 @@ fn capture_breadcrumb(
     breadcrumb: sctx_agent_adapter::CanonicalBreadcrumb,
 ) -> Result<()> {
     let intent_bootstrap_required = breadcrumb.kind == CanonicalBreadcrumbKind::Checkpoint;
-    let (task_owner, diagnostics) = match TaskRuntime::initialize(root)
+    let (task_owner, diagnostics) = match TaskRuntime::initialize_for_hook(root)
         .and_then(|runtime| runtime.read_snapshot_by_locator(&breadcrumb.external_session_locator))
     {
         Ok(Some(snapshot)) => (
@@ -1276,7 +1273,7 @@ fn capture_breadcrumb(
         }
         Err(_) => (None, vec![CaptureDiagnosticKind::RuntimeUnavailable]),
     };
-    CaptureStore::initialize(root)?.capture(&Breadcrumb {
+    let _capture_attempt = CaptureStore::initialize(root)?.try_capture(&Breadcrumb {
         external_session_locator: breadcrumb.external_session_locator,
         task_owner,
         kind: match breadcrumb.kind {
@@ -1302,7 +1299,7 @@ fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<ResolvedTas
             outcome,
         } => {
             let root = installation_root()?;
-            let runtime = TaskRuntime::initialize(&root)?;
+            let runtime = TaskRuntime::initialize_for_hook(&root)?;
             if runtime.read_snapshot_by_locator(&locator)?.is_none() {
                 let notify = (|| {
                     let catalog = UserConfigStore::open_existing(&root)?.repository_catalog()?;
@@ -1334,10 +1331,10 @@ fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<ResolvedTas
         }
         TaskRuntimeOperation::CleanupSessionState { locator } => {
             let root = installation_root()?;
-            let runtime = TaskRuntime::initialize(&root)?;
+            let runtime = TaskRuntime::initialize_for_hook(&root)?;
             let _active = runtime.read_snapshot_by_locator(&locator)?;
             let _reviews = runtime.cleanup_expired_candidate_reviews()?;
-            let _captures = CaptureStore::initialize(root)?.cleanup_expired()?;
+            let _capture_cleanup = CaptureStore::initialize(root)?.try_cleanup_expired()?;
             Ok(ResolvedTaskOperation::default())
         }
     }
@@ -1348,7 +1345,7 @@ fn finalize_checkpointed_episode(
     trigger: EpisodeFinalizationTrigger,
 ) -> Result<ResolvedTaskOperation> {
     let root = installation_root()?;
-    let runtime = TaskRuntime::initialize(&root)?;
+    let runtime = TaskRuntime::initialize_for_hook(&root)?;
     let boundary = runtime.close_checkpointed_work_episode(locator)?;
     let trigger_name = match trigger {
         EpisodeFinalizationTrigger::PreCompact => "PreCompact",

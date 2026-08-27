@@ -63,6 +63,8 @@ struct FakeHost {
     git_ok: bool,
     signature_ok: bool,
     space: u64,
+    cursor_version: Option<&'static str>,
+    codex_version: Option<&'static str>,
 }
 
 impl Default for FakeHost {
@@ -73,6 +75,8 @@ impl Default for FakeHost {
             git_ok: true,
             signature_ok: true,
             space: u64::MAX,
+            cursor_version: Some("3.13.10"),
+            codex_version: Some("0.147.0"),
         }
     }
 }
@@ -113,13 +117,11 @@ impl Host for FakeHost {
     }
 
     fn agent_version(&self, agent: Agent) -> Option<String> {
-        Some(
-            match agent {
-                Agent::Cursor => "3.13.10",
-                Agent::Codex => "0.147.0",
-            }
-            .to_owned(),
-        )
+        match agent {
+            Agent::Cursor => self.cursor_version,
+            Agent::Codex => self.codex_version,
+        }
+        .map(str::to_owned)
     }
 }
 
@@ -634,6 +636,7 @@ fn seed_reset_state(harness: &Harness) -> SeededResetState {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn setup_three_times_is_idempotent_and_preserves_existing_configuration() {
     let harness = Harness::new();
     harness.seed_configs();
@@ -697,6 +700,26 @@ fn setup_three_times_is_idempotent_and_preserves_existing_configuration() {
         ),
         7
     );
+    let cursor_hooks: serde_json::Value =
+        serde_json::from_slice(&fs::read(harness.home.join(".cursor/hooks.json")).unwrap())
+            .unwrap();
+    for event in [
+        "sessionStart",
+        "beforeSubmitPrompt",
+        "postToolUse",
+        "preCompact",
+        "stop",
+        "sessionEnd",
+    ] {
+        let command = cursor_hooks["hooks"][event]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|hook| hook["command"].as_str())
+            .find(|command| command.contains(" hook --agent cursor "))
+            .unwrap();
+        assert!(command.ends_with("--agent-version '3.13.10'"));
+    }
     assert_eq!(
         hook_count(
             &harness.home.join(".codex/hooks.json"),
@@ -711,6 +734,25 @@ fn setup_three_times_is_idempotent_and_preserves_existing_configuration() {
         ),
         7
     );
+    let codex_hooks: serde_json::Value =
+        serde_json::from_slice(&fs::read(harness.home.join(".codex/hooks.json")).unwrap()).unwrap();
+    for event in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PostToolUse",
+        "PreCompact",
+        "Stop",
+        "SessionEnd",
+    ] {
+        let command = codex_hooks["hooks"][event]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|hook| hook["hooks"][0]["command"].as_str())
+            .find(|command| command.contains(" hook --agent codex "))
+            .unwrap();
+        assert!(command.ends_with("--agent-version '0.147.0'"));
+    }
     let toml = fs::read_to_string(harness.home.join(".codex/config.toml")).unwrap();
     assert!(toml.contains("# keep this leading comment"));
     assert!(toml.contains("# keep inline"));
@@ -720,6 +762,53 @@ fn setup_three_times_is_idempotent_and_preserves_existing_configuration() {
     assert_eq!(
         fs::read_link(harness.root.join("bin/current")).unwrap(),
         PathBuf::from("1.2.3/arm64")
+    );
+}
+
+#[test]
+fn setup_refreshes_unchanged_managed_hooks_when_verified_agent_versions_change() {
+    let harness = Harness::new();
+    harness
+        .installer("1.2.3")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let refreshed = Installer::new(
+        harness.context("1.2.3"),
+        Arc::new(FakeHost {
+            cursor_version: Some("4.0.0"),
+            codex_version: Some("0.149.1"),
+            ..FakeHost::default()
+        }),
+    )
+    .setup(&SetupOptions::default())
+    .unwrap();
+    assert!(refreshed.changed);
+
+    let cursor = fs::read_to_string(harness.home.join(".cursor/hooks.json")).unwrap();
+    assert_eq!(cursor.matches("--agent-version '4.0.0'").count(), 6);
+    assert!(!cursor.contains("--agent-version '3.13.10'"));
+    let codex = fs::read_to_string(harness.home.join(".codex/hooks.json")).unwrap();
+    assert_eq!(codex.matches("--agent-version '0.149.1'").count(), 6);
+    assert!(!codex.contains("--agent-version '0.147.0'"));
+
+    let unavailable = Installer::new(
+        harness.context("1.2.3"),
+        Arc::new(FakeHost {
+            cursor_version: None,
+            codex_version: None,
+            ..FakeHost::default()
+        }),
+    )
+    .setup(&SetupOptions::default())
+    .unwrap();
+    assert!(!unavailable.changed);
+    assert_eq!(
+        fs::read_to_string(harness.home.join(".cursor/hooks.json")).unwrap(),
+        cursor
+    );
+    assert_eq!(
+        fs::read_to_string(harness.home.join(".codex/hooks.json")).unwrap(),
+        codex
     );
 }
 

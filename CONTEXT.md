@@ -72,6 +72,10 @@ _Avoid_: deletion, global signal state
 A redacted, TTL-bounded local Breadcrumb identified by CaptureId and carrying its ExternalSessionLocator plus any exactly resolved ActiveTask owner. It is an ingestion source, not yet a WorkObservation or durable knowledge.
 _Avoid_: transcript, tool log, ownerless Task attribution
 
+**HookCaptureAttempt**:
+A nonblocking attempt to persist one complete CaptureRecord from an Agent Hook. It either publishes one atomic record or returns Busy with no delayed write; busy and storage failure remain fail-open for the Agent and create no engineering fact.
+_Avoid_: queued capture, partial record, blocking audit log
+
 **CaptureClaim**:
 An idempotent reservation of one CaptureRecord for its exact Task owner. It neither deletes the CaptureRecord nor proves that Runtime ingestion committed.
 _Avoid_: Observation commit, Capture deletion, cross-Task handoff

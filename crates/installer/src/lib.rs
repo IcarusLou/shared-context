@@ -6,7 +6,7 @@
 //! interrupted earlier invocation.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsStr,
     fs::{self, File, OpenOptions},
@@ -660,10 +660,19 @@ impl Installer {
         sctx_mcp::sync_repository_catalog_at_root(&self.context.root)?;
         self.fail(SetupStage::IndexInitialized)?;
 
-        let stable_binary = current.join("sctx");
         let mut ownership = prior_manifest
             .as_ref()
             .map_or_else(Vec::new, |manifest| manifest.configs.clone());
+        let mut manifest_agent_versions = prior_manifest
+            .as_ref()
+            .map_or_else(BTreeMap::new, |manifest| manifest.agent_versions.clone());
+        let stable_binary = current.join("sctx");
+        let agent_versions = self.agent_versions_with_fallback(options, &manifest_agent_versions);
+        for (agent, version) in &agent_versions {
+            if let Some(version) = version {
+                manifest_agent_versions.insert(*agent, version.clone());
+            }
+        }
         let prior_skill_ownership = prior_manifest
             .as_ref()
             .map_or_else(Vec::new, |manifest| manifest.skills.clone());
@@ -684,6 +693,9 @@ impl Installer {
                 &self.context.home.join(".cursor/hooks.json"),
                 Agent::Cursor,
                 &stable_binary,
+                agent_versions
+                    .get(&Agent::Cursor)
+                    .and_then(Option::as_deref),
                 &mut ownership,
                 &mut notices,
             )?;
@@ -703,6 +715,7 @@ impl Installer {
                 &self.context.home.join(".codex/hooks.json"),
                 Agent::Codex,
                 &stable_binary,
+                agent_versions.get(&Agent::Codex).and_then(Option::as_deref),
                 &mut ownership,
                 &mut notices,
             )?;
@@ -725,6 +738,7 @@ impl Installer {
             installed_version: self.context.version.clone(),
             architecture,
             installation_id: installation_id.clone(),
+            agent_versions: manifest_agent_versions,
             knowledge_store: knowledge_store_source.clone(),
             configs: ownership,
             skills: skill_install.ownership,
@@ -734,7 +748,7 @@ impl Installer {
         mcp_smoke(&self.context.root)?;
         self.fail(SetupStage::SmokeTested)?;
 
-        let capabilities = self.capabilities(options);
+        let capabilities = self.capabilities_with_versions(options, &agent_versions);
         notices.extend(
             capabilities
                 .iter()
@@ -1248,18 +1262,51 @@ impl Installer {
     }
 
     fn capabilities(&self, options: &SetupOptions) -> Vec<sctx_agent_adapter::AgentCapabilities> {
+        let versions = self.agent_versions(options);
+        self.capabilities_with_versions(options, &versions)
+    }
+
+    fn agent_versions(&self, options: &SetupOptions) -> BTreeMap<Agent, Option<String>> {
+        self.agent_versions_with_fallback(options, &BTreeMap::new())
+    }
+
+    fn agent_versions_with_fallback(
+        &self,
+        options: &SetupOptions,
+        fallback: &BTreeMap<Agent, String>,
+    ) -> BTreeMap<Agent, Option<String>> {
+        options
+            .agents
+            .iter()
+            .copied()
+            .map(|agent| {
+                let version = self
+                    .host
+                    .agent_version(agent)
+                    .and_then(|value| normalize_agent_version_argument(&value))
+                    .or_else(|| fallback.get(&agent).cloned());
+                (agent, version)
+            })
+            .collect()
+    }
+
+    fn capabilities_with_versions(
+        &self,
+        options: &SetupOptions,
+        versions: &BTreeMap<Agent, Option<String>>,
+    ) -> Vec<sctx_agent_adapter::AgentCapabilities> {
         let mut capabilities = Vec::new();
         if options.agents.contains(&Agent::Cursor) {
-            let version = self.host.agent_version(Agent::Cursor);
+            let version = versions.get(&Agent::Cursor).and_then(Option::as_deref);
             capabilities.push(sctx_adapter_cursor::capabilities(
-                version.as_deref(),
+                version,
                 hooks_available(&self.context.home, Agent::Cursor),
             ));
         }
         if options.agents.contains(&Agent::Codex) {
-            let version = self.host.agent_version(Agent::Codex);
+            let version = versions.get(&Agent::Codex).and_then(Option::as_deref);
             capabilities.push(sctx_adapter_codex::capabilities(
-                version.as_deref(),
+                version,
                 hooks_available(&self.context.home, Agent::Codex),
                 self.codex_trust,
             ));
@@ -1468,6 +1515,8 @@ struct InstallManifest {
     architecture: Architecture,
     #[serde(default)]
     installation_id: String,
+    #[serde(default)]
+    agent_versions: BTreeMap<Agent, String>,
     #[serde(default)]
     knowledge_store: KnowledgeStoreSource,
     configs: Vec<OwnedConfig>,
@@ -2601,6 +2650,7 @@ fn merge_json_hooks(
     path: &Path,
     agent: Agent,
     binary: &Path,
+    agent_version: Option<&str>,
     ownership: &mut Vec<OwnedConfig>,
     notices: &mut Vec<String>,
 ) -> Result<bool> {
@@ -2621,10 +2671,12 @@ fn merge_json_hooks(
     }
     let mut changed = document != original;
     let hooks = object_field_mut(&mut document, "hooks")?;
+    let agent_version = agent_version.unwrap_or("unavailable");
     let command = format!(
-        "{} hook --agent {}",
+        "{} hook --agent {} --agent-version {}",
         shell_quote(binary)?,
-        agent_name(agent)
+        agent_name(agent),
+        shell_quote(Path::new(agent_version))?
     );
     let desired = match agent {
         Agent::Cursor => json!({"command": command}),
@@ -2659,11 +2711,22 @@ fn merge_json_hooks(
         let prior = prior_entries.iter().find(|entry| entry.selector == *event);
         if let Some(index) = prior.and_then(|entry| entry.original_index) {
             if index < array.len() {
+                let prior = prior.expect("prior entry exists");
+                if hash_value(&array[index])? == prior.hash {
+                    array[index] = desired.clone();
+                    changed = true;
+                    entries.push(OwnedEntry {
+                        selector: (*event).to_owned(),
+                        hash: desired_hash.clone(),
+                        original_index: Some(index),
+                    });
+                    continue;
+                }
                 notices.push(format!(
                     "preserved user-modified {event} hook at index {index} in {}",
                     path.display()
                 ));
-                entries.push(prior.cloned().expect("prior entry exists"));
+                entries.push(prior.clone());
                 continue;
             }
         }
@@ -4171,6 +4234,22 @@ const fn agent_name(agent: Agent) -> &'static str {
     }
 }
 
+fn normalize_agent_version_argument(value: &str) -> Option<String> {
+    value
+        .split_ascii_whitespace()
+        .find(|part| {
+            part.len() <= 64
+                && part
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_digit())
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-'))
+        })
+        .map(str::to_owned)
+}
+
 fn path_text(path: &Path) -> Result<String> {
     path.to_str()
         .map(ToOwned::to_owned)
@@ -4375,7 +4454,7 @@ fn io_value(operation: &'static str, error: impl std::fmt::Display) -> Error {
 mod tests {
     use std::{process::Command, time::Duration};
 
-    use super::command_stdout_with_timeout;
+    use super::{command_stdout_with_timeout, normalize_agent_version_argument};
 
     #[test]
     fn agent_version_probe_has_a_hard_timeout() {
@@ -4388,5 +4467,19 @@ mod tests {
             .is_none()
         );
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn embedded_agent_version_is_one_bounded_semver_like_token() {
+        assert_eq!(
+            normalize_agent_version_argument("codex-cli 0.147.0 (build secret)"),
+            Some("0.147.0".to_owned())
+        );
+        assert_eq!(
+            normalize_agent_version_argument("Cursor 3.13.10-beta.1"),
+            Some("3.13.10-beta.1".to_owned())
+        );
+        assert!(normalize_agent_version_argument("unavailable token=secret").is_none());
+        assert!(normalize_agent_version_argument(&"1".repeat(65)).is_none());
     }
 }

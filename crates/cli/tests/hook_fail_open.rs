@@ -1,6 +1,7 @@
 use std::{
     fs::{self, OpenOptions},
     io::{BufRead as _, BufReader, Write as _},
+    os::unix::fs::PermissionsExt,
     path::Path,
     process::{Child, Command, Stdio},
 };
@@ -289,6 +290,47 @@ fn disabled_codex_prompt_does_not_wait_for_busy_runtime_database() {
 
     let output = harness.hook("codex", &codex_prompt(&harness.home, "busy-fault", secret));
     assert_neutral(&output, &harness.root(), secret);
+}
+
+#[test]
+fn codex_hook_without_embedded_version_never_spawns_a_per_event_probe() {
+    let harness = Harness::new();
+    let binaries = harness.home.join("fake bin");
+    fs::create_dir_all(&binaries).unwrap();
+    let marker = harness.home.join("codex-version-probe-ran");
+    let codex = binaries.join("codex");
+    fs::write(
+        &codex,
+        "#!/bin/sh\nprintf called > \"$CODEX_PROBE_MARKER\"\nprintf '0.147.0\\n'\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&codex).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&codex, permissions).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sctx"))
+        .args(["hook", "--agent", "codex"])
+        .env("HOME", &harness.home)
+        .env("PATH", &binaries)
+        .env("CODEX_PROBE_MARKER", &marker)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serde_json::to_writer(
+        child.stdin.as_mut().unwrap(),
+        &codex_prompt(&harness.home, "no-version-probe", "safe prompt"),
+    )
+    .unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({})
+    );
+    assert!(!marker.exists());
 }
 
 #[test]
