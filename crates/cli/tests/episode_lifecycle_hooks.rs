@@ -183,7 +183,7 @@ fn intent(session: &str) -> WorkingIntentSnapshot {
         current_direction: Some("close only explicitly checkpointed cognition".to_owned()),
         in_scope: vec!["Agent lifecycle automation".to_owned()],
         out_of_scope: Vec::new(),
-        domains: vec!["capture".to_owned()],
+        domains: vec!["lifecycle".to_owned()],
         platforms: Vec::new(),
         constraints: Vec::new(),
         acceptance_conditions: vec!["one closed Episode produces one Candidate".to_owned()],
@@ -200,7 +200,7 @@ fn checkpoint_claim(session: &str) -> CheckpointClaimDraft {
         statement: format!("{session} keeps lifecycle automation idempotent"),
         rationale: "A direct validation records the expected lifecycle result".to_owned(),
         applicability: Applicability {
-            domains: vec!["capture".to_owned()],
+            domains: vec!["lifecycle".to_owned()],
             platforms: Vec::new(),
             conditions: vec![session.to_owned()],
         },

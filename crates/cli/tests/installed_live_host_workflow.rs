@@ -78,6 +78,7 @@ struct InstalledMcp {
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    error_codes: Vec<String>,
 }
 
 impl InstalledMcp {
@@ -98,6 +99,7 @@ impl InstalledMcp {
             stdin: Some(stdin),
             stdout,
             next_id: 2,
+            error_codes: Vec::new(),
         };
         process.write(&json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -123,8 +125,30 @@ impl InstalledMcp {
             "params": {"name": name, "arguments": arguments}
         }));
         let response = self.read();
-        assert_eq!(response["id"], id);
+        self.record_error_code(&response);
+        assert_eq!(response["id"], id, "{response:#}");
         response
+    }
+
+    fn call_serialized_arguments(&mut self, name: &str, serialized_arguments: &[u8]) -> Value {
+        let arguments: Value = serde_json::from_slice(serialized_arguments).unwrap();
+        assert!(arguments.is_object());
+        let id = self.next_id;
+        self.next_id += 1;
+        let prefix = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\"params\":{{\"name\":{},\"arguments\":",
+            serde_json::to_string(name).unwrap()
+        );
+        let stdin = self.stdin.as_mut().unwrap();
+        stdin.write_all(prefix.as_bytes()).unwrap();
+        stdin.write_all(serialized_arguments).unwrap();
+        stdin.write_all(b"}}\n").unwrap();
+        stdin.flush().unwrap();
+        let response = self.read();
+        self.record_error_code(&response);
+        assert_eq!(response["id"], id, "{response:#}");
+        assert_eq!(response["result"]["isError"], false, "{response:#}");
+        response["result"]["structuredContent"].clone()
     }
 
     fn call(&mut self, session: &str, name: &str, arguments: Value) -> Value {
@@ -141,6 +165,30 @@ impl InstalledMcp {
             Duration::from_secs(30),
         );
         assert!(status.success());
+    }
+
+    fn assert_no_invalid_stale_or_conflict(&self) {
+        let rejected = self
+            .error_codes
+            .iter()
+            .filter(|code| {
+                code.as_str() == "invalid_input"
+                    || code.contains("stale")
+                    || code.contains("conflict")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rejected.is_empty(),
+            "unexpected MCP rejections: {rejected:?}"
+        );
+    }
+
+    fn record_error_code(&mut self, response: &Value) {
+        if response["result"]["isError"] == true
+            && let Some(code) = response["result"]["structuredContent"]["error"]["code"].as_str()
+        {
+            self.error_codes.push(code.to_owned());
+        }
     }
 
     fn write(&mut self, value: &Value) {
@@ -345,9 +393,97 @@ fn git_contains(repository: &Path, needle: &str) -> bool {
         .success()
 }
 
+fn git(repository: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn event_count(repository: &Path) -> usize {
+    git(
+        repository,
+        &["ls-tree", "-r", "--name-only", "HEAD", "--", "events"],
+    )
+    .lines()
+    .filter(|path| !path.is_empty())
+    .count()
+}
+
+fn commit_count(repository: &Path) -> usize {
+    git(repository, &["rev-list", "--count", "HEAD"])
+        .parse()
+        .unwrap()
+}
+
+fn assert_zero_capture_residue(root: &Path) {
+    for removed in ["capture", "capture.lock", "capture-metadata.json"] {
+        assert!(!root.join("state").join(removed).exists());
+    }
+    for runtime_file in ["runtime.sqlite", "runtime.sqlite-wal"] {
+        let path = root.join("state").join(runtime_file);
+        if path.is_file() {
+            let mut bytes = fs::read(path).unwrap();
+            bytes.make_ascii_lowercase();
+            assert!(
+                !bytes
+                    .windows(b"capture".len())
+                    .any(|window| window == b"capture"),
+                "runtime storage retained a Capture schema or row"
+            );
+        }
+    }
+}
+
+fn assert_checkpoint_replay(first: &Value, replay: &Value) {
+    assert_eq!(replay["status"], "accepted");
+    assert_eq!(replay["replayed"], true);
+    for field in [
+        "operation_id",
+        "checkpoint_id",
+        "claim_ids",
+        "episode_id",
+        "episode_version",
+        "episode_status",
+        "candidate_build",
+    ] {
+        assert_eq!(replay[field], first[field], "replay changed {field}");
+    }
+}
+
+fn assert_only_untrusted_candidate_precedes_confirmation(
+    repository: &Path,
+    commits_before_checkpoint: usize,
+    events_before_checkpoint: usize,
+) {
+    assert_eq!(commit_count(repository), commits_before_checkpoint + 1);
+    assert_eq!(event_count(repository), events_before_checkpoint + 1);
+    assert!(git_contains(repository, "context_candidate.created"));
+    for forbidden in [
+        "candidate.confirmed",
+        "context.revision_added",
+        "context.reviewed",
+        "context.publication_changed",
+        "context.space_association_changed",
+    ] {
+        assert!(
+            !git_contains(repository, forbidden),
+            "governed fact {forbidden} appeared before explicit confirmation"
+        );
+    }
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
-fn installed_codex_ab_and_cursor_lifecycle_use_only_public_live_processes() {
+fn installed_codex_direct_evidence_replay_recovery_and_cursor_lifecycle_use_public_processes() {
     let temporary = tempfile::tempdir().unwrap();
     let home = temporary.path().join("installed live hosts home");
     fs::create_dir_all(&home).unwrap();
@@ -471,33 +607,78 @@ fn installed_codex_ab_and_cursor_lifecycle_use_only_public_live_processes() {
         ),
         json!({})
     );
-    for removed in ["capture", "capture.lock", "capture-metadata.json"] {
-        assert!(!root.join("state").join(removed).exists());
-    }
-    let checkpoint = codex_mcp.call(
-        session_a,
-        "task_checkpoint",
-        json!({
-            "claims": [{
-                "context_kind": "contract",
-                "statement": "livehostportablecontract resolves across installed Codex checkouts",
-                "rationale": "Session A authored a focused portable contract conclusion",
-                "conditions": [],
-                "evidence": [{
-                    "evidence_type": "source_snapshot",
-                    "summary": "the installed source contract was reviewed",
-                    "limitations": ["local installed-host fixture"]
-                }]
-            }],
-            "unknowns": []
-        }),
-    );
+    assert_zero_capture_residue(&root);
+    let knowledge = root.join("repository");
+    let knowledge_head_before_checkpoint = git(&knowledge, &["rev-parse", "HEAD"]);
+    let commits_before_checkpoint = commit_count(&knowledge);
+    let events_before_checkpoint = event_count(&knowledge);
+    let claim_statement = "livehostportablecontract resolves across installed Codex checkouts";
+    let claim_rationale = "Session A authored a focused portable contract conclusion";
+    let evidence_summary = "the installed source contract was reviewed";
+    let evidence_limitations = json!(["local installed-host fixture"]);
+    let checkpoint_arguments = json!({
+        "agent_kind": "codex",
+        "external_session_id": session_a,
+        "claims": [{
+            "context_kind": "contract",
+            "statement": claim_statement,
+            "rationale": claim_rationale,
+            "conditions": [],
+            "evidence": [{
+                "evidence_type": "source_snapshot",
+                "summary": evidence_summary,
+                "limitations": evidence_limitations
+            }]
+        }],
+        "unknowns": []
+    });
+    let checkpoint_bytes = serde_json::to_vec(&checkpoint_arguments).unwrap();
+    let checkpoint = codex_mcp.call_serialized_arguments("task_checkpoint", &checkpoint_bytes);
+    assert_eq!(checkpoint["status"], "accepted");
+    assert_eq!(checkpoint["replayed"], false);
     assert_eq!(checkpoint["candidate_build"]["status"], "pending");
+    assert_eq!(
+        git(&knowledge, &["rev-parse", "HEAD"]),
+        knowledge_head_before_checkpoint
+    );
+    assert_eq!(event_count(&knowledge), events_before_checkpoint);
+
+    let byte_same_replay =
+        codex_mcp.call_serialized_arguments("task_checkpoint", &checkpoint_bytes);
+    assert_checkpoint_replay(&checkpoint, &byte_same_replay);
+    let mut semantic_replay_bytes = checkpoint_bytes.clone();
+    semantic_replay_bytes.push(b' ');
+    assert_ne!(semantic_replay_bytes, checkpoint_bytes);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&semantic_replay_bytes).unwrap(),
+        checkpoint_arguments
+    );
+    let semantic_same_replay =
+        codex_mcp.call_serialized_arguments("task_checkpoint", &semantic_replay_bytes);
+    assert_checkpoint_replay(&checkpoint, &semantic_same_replay);
+    assert_eq!(
+        git(&knowledge, &["rev-parse", "HEAD"]),
+        knowledge_head_before_checkpoint
+    );
+    assert_eq!(event_count(&knowledge), events_before_checkpoint);
+    assert_zero_capture_residue(&root);
+
     let candidates = codex_mcp.call(
         session_a,
         "candidate_list",
         json!({"status": "pending", "limit": 10, "token_budget": 32768}),
     );
+    assert_eq!(
+        candidates["recovery"],
+        json!({
+            "attempted": 1,
+            "recovered": 1,
+            "failed_attempts": 0,
+            "pending": 0,
+            "incomplete": 0
+        })
+    );
+    assert_eq!(candidates["reviews"].as_array().unwrap().len(), 1);
     let candidate_id = candidates["reviews"][0]["candidate_id"].as_str().unwrap();
     let review = codex_mcp.call(
         session_a,
@@ -505,6 +686,49 @@ fn installed_codex_ab_and_cursor_lifecycle_use_only_public_live_processes() {
         json!({"candidate_id": candidate_id}),
     );
     assert_eq!(review["ready_for_review"], true, "{review:#}");
+    assert_eq!(review["untrusted_data"], true);
+    assert_eq!(review["review_status"], "pending");
+    assert_eq!(
+        review["unknowns"],
+        json!([{
+            "statement": "Decision or Contract topic key remains unclassified",
+            "blocking": false,
+            "recheck_when": ["Before Candidate confirmation"]
+        }])
+    );
+    assert_eq!(
+        review["source_episode"]["episode_id"],
+        checkpoint["episode_id"]
+    );
+    assert_eq!(review["final_checkpoint_id"], checkpoint["checkpoint_id"]);
+    assert_eq!(review["checkpoint_id"], checkpoint["checkpoint_id"]);
+    assert_eq!(review["claim_id"], checkpoint["claim_ids"][0]);
+    assert_eq!(review["content"]["kind"], "contract");
+    assert_eq!(review["content"]["statement"], claim_statement);
+    assert_eq!(review["content"]["rationale"], claim_rationale);
+    assert_eq!(review["content"]["applicability"]["conditions"], json!([]));
+    let evidence = &review["content"]["evidence"][0];
+    assert_eq!(evidence["kind"], "source_snapshot");
+    assert_eq!(evidence["supports"], claim_statement);
+    assert_eq!(evidence["content"], json!({"summary": evidence_summary}));
+    assert_eq!(evidence["interpretation"], claim_rationale);
+    assert_eq!(evidence["limitations"], evidence_limitations);
+    assert_only_untrusted_candidate_precedes_confirmation(
+        &knowledge,
+        commits_before_checkpoint,
+        events_before_checkpoint,
+    );
+    let unconfirmed_search = codex_mcp.call(
+        session_a,
+        "context_search",
+        json!({
+            "query": claim_statement,
+            "statuses": ["accepted"],
+            "page_size": 10
+        }),
+    );
+    assert!(unconfirmed_search["results"].as_array().unwrap().is_empty());
+    assert_zero_capture_residue(&root);
     let recommendation_id = review["space_recommendations"]
         .as_array()
         .unwrap()
@@ -527,6 +751,12 @@ fn installed_codex_ab_and_cursor_lifecycle_use_only_public_live_processes() {
     eprintln!("live-host stage=codex-a-confirmed");
     assert_eq!(confirmed["event_ids"].as_array().unwrap().len(), 5);
     assert_eq!(confirmed["graph_rebuild_pending"], false);
+    assert_eq!(commit_count(&knowledge), commits_before_checkpoint + 2);
+    assert_eq!(event_count(&knowledge), events_before_checkpoint + 6);
+    assert!(git_contains(&knowledge, "candidate.confirmed"));
+    assert!(git_contains(&knowledge, "context.revision_added"));
+    assert!(git_contains(&knowledge, "context.publication_changed"));
+    assert_zero_capture_residue(&root);
     let reference = codex_mcp.call(
         session_a,
         "engineering_reference_record",
@@ -708,8 +938,8 @@ fn installed_codex_ab_and_cursor_lifecycle_use_only_public_live_processes() {
         );
     }
     cursor_mcp.finish();
+    codex_mcp.assert_no_invalid_stale_or_conflict();
     codex_mcp.finish();
-    let knowledge = home.join(".shared-context/repository");
     for forbidden in [
         "RAW_LIVE_HOST_CODEX_A",
         "RAW_LIVE_HOST_CURSOR",

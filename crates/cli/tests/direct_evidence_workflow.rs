@@ -144,7 +144,7 @@ fn post_tool(session_id: &str, cwd: &Path, file: &Path, raw: &str) -> Value {
 }
 
 #[test]
-fn hook_writes_zero_capture_state_and_direct_evidence_builds_candidate() {
+fn hook_writes_zero_mechanical_state_and_direct_evidence_builds_candidate() {
     let harness = Harness::new();
     GitStore::bootstrap_local(harness.root()).unwrap();
     let repository = git_repo(&harness.home.join("repository"));
@@ -155,7 +155,7 @@ fn hook_writes_zero_capture_state_and_direct_evidence_builds_candidate() {
             std::slice::from_ref(&repository),
         )
         .unwrap();
-    let session = "zero-capture-direct-evidence";
+    let session = "zero-mechanical-state-direct-evidence";
     assert_eq!(
         harness.hook(&session_start(session, &repository)),
         json!({"hookSpecificOutput": {

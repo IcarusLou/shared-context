@@ -3,7 +3,7 @@
   "activation_marker": "<shared-context-active>Shared Context is authorized. Before substantive work, call task_intent_update.</shared-context-active>",
   "source_assets": {
     "gate_bytes": 1543,
-    "workflow_bytes": 10390,
+    "workflow_bytes": 9098,
     "metadata_bytes": 263
   },
   "token_proxy": {

@@ -37,11 +37,11 @@ An Agent kind and its external session key used only to find the corresponding l
 _Avoid_: TaskSessionId, knowledge identifier
 
 **TaskSignal**:
-A non-factual, non-locating work clue such as a Prompt, Workspace, Diff, or TestOutcome. It may influence a WorkingIntentSnapshot or retrieval, but it is not engineering Evidence, Artifact identity, or a declaration of Space membership.
+A non-factual, non-locating clue about current work. Hook mechanics may add TaskSignals, but a TaskSignal is never engineering Evidence, Artifact identity, or a declaration of Space membership.
 _Avoid_: Evidence, Space binding, routing key
 
 **ToolCategory**:
-A vendor-neutral structural class emitted by an Agent adapter for one completed tool call: FileOperation, TestRunner, Shell, SharedContext, or Other. Shell classification may recognize only bounded simple test-runner commands; normalized Runtime and Capture meaning retain neither command text nor vendor tool names, and SharedContext calls are excluded from capture.
+A vendor-neutral structural class for one completed tool call. It can produce a non-factual TaskSignal but never supplies Claim Evidence.
 _Avoid_: substring guess, raw command, vendor tool log, tool-output classification
 
 **ToolInputContract**:
@@ -68,48 +68,44 @@ _Avoid_: Test Artifact, qualified Test locator
 The current relevance of one identified non-locating TaskSignal within its Task: Active signals participate in retrieval, while Superseded signals remain historical work records but do not participate.
 _Avoid_: deletion, global signal state
 
-**CaptureRecord**:
-A redacted, TTL-bounded local Breadcrumb identified by CaptureId and carrying its ExternalSessionLocator plus any exactly resolved ActiveTask owner. It is an ingestion source, not yet a WorkObservation or durable knowledge.
-_Avoid_: transcript, tool log, ownerless Task attribution
-
-**HookCaptureAttempt**:
-A nonblocking attempt to persist one complete CaptureRecord from an Agent Hook. It either publishes one atomic record or returns Busy with no delayed write; busy and storage failure remain fail-open for the Agent and create no engineering fact.
-_Avoid_: queued capture, partial record, blocking audit log
-
 **InstalledHostAcceptance**:
 A black-box acceptance path that begins with the installed Agent configuration and invokes only its configured Hook command, public MCP process, public CLI, and observable Git output. Sanitized payload fixtures remain regression inputs but cannot substitute for this installed-process boundary.
 _Avoid_: direct Runtime/store assertion, fixture-only host proof, model-transcript replay claim
 
-**CaptureClaim**:
-An idempotent reservation of one CaptureRecord for its exact Task owner. It neither deletes the CaptureRecord nor proves that Runtime ingestion committed.
-_Avoid_: Observation commit, Capture deletion, cross-Task handoff
-
 **WorkEpisode**:
-A server-identified, TaskSession- and Task-owned interval that aggregates normalized engineering observations across an explicit range of TaskIntentRevisions. It remains Open while work is accumulating and becomes Closed at a final AgentCheckpoint; it never embeds raw Prompt, transcript, tool output, or Space routing.
+A server-identified, Task-owned interval closed by a final AgentCheckpoint. It never embeds raw Prompt, transcript, tool output, or Space routing.
 _Avoid_: chat transcript, tool log, Workspace-to-Space binding
 
 **WorkObservation**:
-A server-identified, normalized statement about engineering work under one WorkEpisode, owned by an exact TaskIntentRevision and grounded by typed source references or self-contained inline Validation evidence. It preserves extracted meaning rather than raw source payloads.
-_Avoid_: raw Breadcrumb, terminal output, untyped artifact string
+A server-identified, normalized statement about engineering work under one WorkEpisode, owned by an exact TaskIntentRevision and grounded by a DirectEvidenceDraft or typed internal provenance. It preserves extracted meaning rather than raw source payloads.
+_Avoid_: raw work log, terminal output, untyped artifact string
 
 **AgentCheckpoint**:
-An Agent-authored, server-identified snapshot of Claims and Unknowns owned by one WorkEpisode, TaskSession, Task, TaskIntentRevision, and exact parent Episode version. It may continue or close the Episode without selecting a ContextSpace; an Unknown-only Checkpoint records uncertainty without asserting knowledge.
+A server-identified final snapshot of direct Agent-authored Claims and Unknowns for the current Task and Intent. It closes one WorkEpisode without selecting a ContextSpace; an Unknown-only Checkpoint records uncertainty without asserting knowledge.
 _Avoid_: conversation summary, Candidate approval, Space selection
 
-**AutomatedEpisodeBoundary**:
-A fail-open lifecycle transition that may close one Open WorkEpisode only at its latest persisted AgentCheckpoint for the current TaskIntentRevision, then ask the shared CandidateBuilder to process that exact Closed Episode. PreCompact and TurnStop may trigger it; it never authors Claims or Unknowns, and repeated or concurrent triggers reuse the same Episode and Candidate identities. SessionEnd is retention cleanup, not an AutomatedEpisodeBoundary.
-_Avoid_: automatic Checkpoint, Hook-authored Claim, SessionEnd Candidate build
-
 **CheckpointClaim**:
-A structured engineering assertion containing its statement, rationale, applicability, assumptions, recheck conditions, typed Evidence references, Artifact associations, proposed ContextRelations, proposed EngineeringReferences, and analysis-only related Context revisions. Artifact associations, EngineeringReference proposals, and related Context revisions are not Evidence or durable facts by themselves.
-_Avoid_: unsupported conclusion, free-form note
+A focused engineering assertion containing a Context kind, statement, rationale, conditions, and one or more self-contained DirectEvidenceDrafts.
+_Avoid_: unsupported conclusion, tool-event summary, free-form note
+
+**CheckpointOperation**:
+A Task- and Intent-scoped, content-addressed Checkpoint mutation with a durable receipt and a reserved CandidateBuildOutbox. Replaying the same scoped semantic content returns the same operation; callers do not name the operation.
+_Avoid_: transport request key, caller-generated operation ID, semantic deduplication across Tasks
+
+**DirectEvidenceDraft**:
+A self-contained, Agent-attested Evidence type, summary, and limitations for one CheckpointClaim. It remains untrusted until the resulting Candidate is explicitly confirmed by a human.
+_Avoid_: Hook event, automatically verified fact, raw tool output
+
+**CandidateBuildOutbox**:
+A durable, server-owned queue that carries a closed WorkEpisode's Claims into recoverable Candidate creation. Its queued or recovered Candidates remain untrusted proposals.
+_Avoid_: synchronous Candidate publication, Agent retry queue, accepted Context
 
 **CandidateBuilderProvenance**:
-The typed ownership, exact Checkpoint and WorkObservation inputs, and proposed EngineeringReferences of one automatic Candidate build. It makes the source WorkEpisode and Reference proposals verifiable without retaining raw Agent payloads.
+The typed ownership and exact Checkpoint inputs of one automatic Candidate build. It makes the source WorkEpisode and Claim verifiable without retaining raw Agent payloads.
 _Avoid_: opaque source_episode_id, transcript pointer
 
 **CandidateBuilder**:
-A deterministic converter that turns each sufficiently evidenced Claim in one Closed WorkEpisode into an unowned Context draft. It preserves explicit Claim classification when present, uses a conservative Discovery fallback when absent, and never performs semantic deduplication, conflict analysis, or Space selection.
+A deterministic converter that turns each evidenced Claim in one Closed WorkEpisode into an unowned Context draft. It consumes a CandidateBuildOutbox and never confirms or publishes the result.
 _Avoid_: recommendation engine, keyword classifier, Candidate confirmer
 
 **SubmissionId**:
@@ -189,7 +185,7 @@ One immutable Context revision, its fixed relation targets, and its automatic-sa
 _Avoid_: current Context head, live governance lookup
 
 **Evidence**:
-A self-contained or typed, resolvable provenance record supporting a normalized WorkObservation or an engineering assertion in a CheckpointClaim, Candidate, ContextRevision, or EngineeringReference. A WorkingIntentSnapshot, TaskSignal, Hint, or ArtifactFocusQuery may guide work or retrieval but is not Evidence.
+A self-contained or typed, resolvable provenance record supporting an engineering assertion. A DirectEvidenceDraft supports an untrusted Candidate only; it becomes durable trusted Context Evidence only through explicit human confirmation.
 _Avoid_: Task clue, retrieval match, Artifact association alone
 
 **EvidenceSource**:
@@ -253,5 +249,5 @@ A stable knowledge edge between two Context revisions expressing dependency, con
 _Avoid_: inferred code edge, retrieval score
 
 **Workspace**:
-A location containing code or a repository that may supply non-locating TaskSignals and Breadcrumbs about the current engineering scene. It does not identify an Artifact, requirement, ContextSpace, or durable knowledge owner.
+A location containing code or a repository that may supply non-locating TaskSignals about the current engineering scene. It does not identify an Artifact, requirement, ContextSpace, or durable knowledge owner.
 _Avoid_: Requirement, Space binding

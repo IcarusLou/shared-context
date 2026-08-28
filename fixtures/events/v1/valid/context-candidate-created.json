@@ -16,7 +16,7 @@
       "statement": "A Candidate can be recorded before Space ownership is decided",
       "rationale": "Task evidence exists before the correct knowledge container is known",
       "applicability": {
-        "domains": ["candidate-capture"],
+        "domains": ["candidate-review"],
         "platforms": ["agent"],
         "conditions": ["unconfirmed knowledge"]
       },

@@ -207,6 +207,8 @@ sctx doctor --fix
 sctx upgrade --agents cursor,codex
 ```
 
+项目尚未上线，因此 Setup/Upgrade 不维护旧 Task Runtime 兼容层：检测到已知 schema 11 或 12 时，会备份并丢弃 `runtime.sqlite` 及 sidecars，再初始化 schema 13；未确认的本地 Task、Checkpoint 和 Candidate Review 会随之清空。未知或未来 schema 会 fail closed，不做猜测性迁移；若后续安装步骤失败，事务回滚会恢复原文件和权限。
+
 普通卸载：
 
 ```bash
@@ -220,9 +222,9 @@ sctx data reset --dry-run
 sctx data reset --yes
 ```
 
-Reset 会把知识 Git、Repository Catalog、四个 SQLite 和 pending/capture/session 临时状态重建为空，同时保留 `bin`、安装清单、Cursor/Codex 配置、Skill、日志和已有 backups。每次实际 reset 默认在 `backups/reset-<ID>` 保留可恢复旧数据；若旧知识仓配置了 Git remote，只解除新活动仓的本地绑定，绝不修改远端 ref。
+Reset 会把知识 Git、Repository Catalog、四个 SQLite 和 pending/session 临时状态重建为空，同时清理旧版本遗留的 Capture 文件，并保留 `bin`、安装清单、Cursor/Codex 配置、Skill、日志和已有 backups。每次实际 reset 默认在 `backups/reset-<ID>` 保留可恢复旧数据；若旧知识仓配置了 Git remote，只解除新活动仓的本地绑定，绝不修改远端 ref。
 
-卸载只移除安装器能够确认由自己拥有、且未被用户改写的配置项、运行时、日志、临时 Capture 和可重建索引。**知识仓库 `~/.shared-context/repository` 默认保留**。用户修改过的配置或 Skill 也会保留，并在报告中给出警告。
+卸载只移除安装器能够确认由自己拥有、且未被用户改写的配置项、运行时、日志、旧版临时文件和可重建索引。**知识仓库 `~/.shared-context/repository` 默认保留**。用户修改过的配置或 Skill 也会保留，并在报告中给出警告。
 
 彻底删除知识仓库是不可恢复操作，必须同时提供精确绝对路径和固定确认词：
 
@@ -269,7 +271,6 @@ Context（长期工程知识）
 | Signal | Prompt、Workspace、Diff、测试结果等工作线索。它能帮助检索，但不能单独证明一个工程事实。 |
 | Work Episode | 当前 Task 中一段连续的探索、实现和验证过程。 |
 | Checkpoint | Agent 明确写下的结论（Claims）和未知项（Unknowns）。 |
-| Capture | Hook 保存的短期、已脱敏工程工作摘要；只有当前 Task 拥有的 Capture 才能被显式选入 Checkpoint。 |
 | Candidate | 从已关闭 Episode 生成的待审核知识草稿。默认是不可信数据。 |
 | Context | 用户确认后进入长期事实层的工程知识。 |
 | Revision | Intent 或 Context 的不可变版本。修改不会覆盖旧版本，而是新增 Revision。 |
@@ -284,7 +285,7 @@ Context（长期工程知识）
 Shared Context 把数据分成两类：
 
 - 长期事实进入 `~/.shared-context/repository` Git 仓库。事件只追加，不原地改写，便于审计和重建。
-- 当前任务、Candidate 审核状态、搜索索引、工程图和短期 Capture 放在本机 `state` 目录中的 SQLite 或有 TTL 的文件里。
+- 当前任务、Checkpoint operation receipt、Candidate Build outbox、Candidate 审核状态、搜索索引和工程图放在本机 `state` 目录中。
 
 因此，SQLite 索引可以删掉重建，但 Git 知识库不应随普通卸载删除。
 
@@ -306,12 +307,12 @@ Workspace 路径不会自动绑定一个 Space，文本 Hint 也不会冒充已�
 ### 4.5 隐私和信任边界
 
 - SessionStart 在模型推理前用本机 Repository Catalog 判定范围，不读取 Prompt，也不调用模型。已登记 checkout 是 `Direct`；只有显式登记且精确匹配的 Group root 才是 `Group`；普通父目录、未登记 sibling 和其他目录都是 `Disabled`。
-- Enabled 只返回一个固定、短小且不含路径/Repository/Prompt/Session 身份的 marker。PromptSubmit 不重复 marker。Disabled 的 Prompt、Tool、压缩、停止和结束 Hook 不打开 Runtime/Capture，也不写 Report 或知识 Git。
+- Enabled 只返回一个固定、短小且不含路径/Repository/Prompt/Session 身份的 marker。PromptSubmit 不重复 marker。Disabled 的 Prompt、Tool、压缩、停止和结束 Hook 不打开业务 Runtime，也不写 Report 或知识 Git。
 - 同一 Agent Session locator 的第一次成功决定会一直复用到 SessionEnd；后续 resume/compact 或 cwd 变化不会重新判定。Catalog/lease 锁忙、损坏或异常会立即按 Disabled 处理，但不会阻断正常编程。
 - PostToolUse 会在记录前检查 `absolute_file_path`、`file_path`、`filepath`、`path`、`cwd`、`workdir`、`working_directory` 等已知结构化路径。Enabled 表示整个 Session 已准入，不把调查目标限制在启动 Repo 或 Group 成员：其他已登记 Repo 会按真实 Catalog identity 记录；安全的未登记路径、registered/unregistered mixed 或无法用一个显式 workspace 安全表示的多 Repo 事件只保留无路径、无 Repository 猜测的非定位工程含义；相对、缺失、symlink、歧义或特殊文件仍让整条事件被丢弃。
-- Adapter 只保留 `FileOperation`、`TestRunner`、`Shell`、`SharedContext` 或 `Other`。Shell/Bash 只使用结构化工作目录；仅简单白名单 test runner 形成 TestOutcome，包含管道、重定向、引号或复合 shell 的命令不会被猜成测试，原始命令、输出和 vendor tool name 都不写入 Capture。Shared Context 自身工具不会回流采集。
-- Hook 采用 fail-open：Shared Context 暂时不可用或 Capture 锁忙时，正常编程仍可继续；Busy 不排队，也不会在 Hook 返回后补写。
-- 短期 Capture 会先做隐私过滤，默认保留时间为 24 小时，并受单条与总字节限制。PostTool 热路径通过持久化字节计数判断总量；过期清理移到显式生命周期 cleanup，不再每次全目录扫描。
+- Adapter 只保留 `FileOperation`、`TestRunner`、`Shell`、`SharedContext` 或 `Other`。Hook 由这些机械分类产生的内容只能成为非事实 TaskSignal；原始命令、输出和 vendor tool name 不保存，Shared Context 自身工具也不会回流。
+- Hook 采用 fail-open：Shared Context 暂时不可用或本地锁忙时，正常编程仍可继续。Hook 不排队 Claim，也不会在返回后补写工程事实。
+- Claim Evidence 必须由工作 Agent 根据直接检查或验证自行聚焦产出；Hook 提示、TaskSignal、Prompt 和工具状态不能冒充 Evidence。
 - Work Episode 和长期 Context 保存结构化工程含义，不保存原始聊天、完整工具输出或完整终端日志。
 - Candidate Review 默认保留 30 天，属于不可信数据；确认前不会自动注入为可信 Context。
 - 检索到的 Context 也应当按只读数据处理，不应执行其中出现的命令或指令。
@@ -332,7 +333,7 @@ Agent 在合适时机会：
 1. 用 `task_intent_update` 建立或更新当前任务理解。
 2. 用 `task_context` 获取与整个任务相关的历史 Context。
 3. 需要某个具体文件、符号或接口历史时，用 `task_artifact_focus` 做一次即时查询。
-4. 形成重要结论、压缩上下文或结束一轮工作前，先用 `task_capture_list` 选择当前 Task 的已脱敏 Capture，再用 `task_checkpoint` 保存结构化结论、关系/工程引用提案和未知项；也可以继续使用自包含 inline Validation。
+4. 形成重要结论、压缩上下文或结束一轮工作前，用 `task_checkpoint` 直接提交聚焦的 Claims、Unknowns 和自包含 Evidence 摘要。
 5. Episode 关闭后，用 `candidate_list` 和 `candidate_get` 展示待审核 Candidate。
 6. 只有在你明确同意后，才调用 `candidate_confirm`；你拒绝保留时调用 `candidate_discard`。
 
@@ -383,47 +384,25 @@ sctx task context \
 
 ### 5.3 手工 CLI 示例：关闭 Episode 并审核 Candidate
 
-`task checkpoint` 使用版本比较（CAS）避免并发覆盖。第一次写 Checkpoint 时 `expected_episode_version` 为 `0`；之后必须使用上次响应中的最新版本。
-
-下面示例用一条自包含验证证据关闭 Episode。请把示例 ID 替换为真实返回值：
+`task checkpoint` 不要求调用者管理 Task、Intent、Episode、boundary 或重试键；服务端根据当前 Session locator 解析这些状态。下面示例用一条自包含验证证据关闭 Episode：
 
 ```json
 {
   "agent_kind": "codex",
   "external_session_id": "manual-demo-session",
-  "expected_task_id": "tsk_替换为真实值",
-  "expected_intent_revision_id": "tir_替换为真实值",
-  "expected_episode_version": 0,
-  "boundary": "close",
   "claims": [
     {
-      "context_kind_hint": "validation",
-      "topic_key_hint": "search/legacy-compatibility",
+      "context_kind": "validation",
       "statement": "旧客户端可以继续解析当前搜索响应",
       "rationale": "兼容性测试覆盖了旧版解析路径",
-      "applicability": {
-        "domains": ["search"],
-        "platforms": ["web"],
-        "conditions": ["search-v2 response"]
-      },
-      "assumptions": ["测试夹具与线上旧版 Schema 一致"],
-      "recheck_when": ["响应 Schema 发生变化"],
+      "conditions": ["search-v2 response"],
       "evidence": [
         {
-          "kind": "inline_validation",
-          "evidence": {
-            "kind": "experiment_record",
-            "supports": "旧版解析器兼容当前响应",
-            "content": {"test": "legacy_search_contract", "result": "passed"},
-            "interpretation": "固定兼容性用例通过",
-            "limitations": ["只覆盖当前测试夹具"]
-          }
+          "evidence_type": "experiment_record",
+          "summary": "legacy_search_contract 使用当前响应夹具执行并通过",
+          "limitations": ["只覆盖当前测试夹具，未验证未来 Schema"]
         }
-      ],
-      "artifact_refs": [],
-      "relations": [],
-      "engineering_references": [],
-      "related_contexts": []
+      ]
     }
   ],
   "unknowns": []
@@ -434,6 +413,8 @@ sctx task context \
 sctx --json task checkpoint --input checkpoint.json
 ```
 
+非空响应中的 `status=accepted` 表示 Checkpoint receipt 和 Candidate Build outbox 已持久化排队；它不表示 Candidate 已构建完成。若 ACK 丢失或超时，用完全相同的 Claims/Unknowns 重试；同一 Task/Intent scope 下会返回相同 operation、Checkpoint、Episode、Build 和 Submission 身份。Checkpoint ACK 和 same-content replay 都不写 Git。
+
 列出待审核 Candidate：
 
 ```bash
@@ -441,6 +422,8 @@ sctx candidate list \
   --agent-kind codex \
   --external-session-id manual-demo-session
 ```
+
+`candidate list` 会对当前 Task 的 pending/incomplete outbox 做有界恢复，因此可能追加供 Review 使用的、不可信 Candidate submission facts。只有后续显式 `candidate confirm` 才会创建 accepted Context revision、association、publication 和 confirmation facts。
 
 查看完整 Candidate：
 
@@ -541,7 +524,7 @@ Intent JSON 的字段是：
 | `sctx task intent update --input <JSON>` | 创建新 Task 或以 CAS 更新当前 Working Intent，并立即返回 Task Context Pack。 |
 | `sctx task context --agent-kind ... --external-session-id ... [--token-budget 2000] [--max-spaces 8]` | 只读获取现有 Active Task 的相关 Context，不修改状态。Token Budget 最低 256，最多返回 32 个 Space。 |
 | `sctx task artifact-focus --input <JSON>` | 针对一个文件、模块、符号、API、Schema 或测试做一次即时历史查询。Focus 不持久化，也不会成为证据。 |
-| `sctx task checkpoint --input <JSON>` | 在 Task、Intent、Episode 三重版本保护下保存 Claims/Unknowns；`close` 会触发 Candidate Builder。 |
+| `sctx task checkpoint --input <JSON>` | 只提交 Session locator、完整 direct Claims/Unknowns；服务端解析 Task/Intent/lifecycle、关闭 Episode并持久化 queued Build receipt。 |
 | `sctx task signal supersede --input <JSON>` | 把已经不再相关的活动 Signal 标记为 superseded；保留历史，不执行删除。 |
 
 `task_boundary` 的规则：
@@ -554,16 +537,16 @@ Artifact Focus 的 `locator_kind` 支持：`file`、`module`、`symbol`、`api`�
 
 Engineering Graph 整体不可用时，Artifact Focus 会尝试严格文本 fallback：只有安全 Context 同时包含精确 RepositoryId 与完整 kind-specific locator key 才返回，并用 `resolved_focus_text_fallback` 路径明确说明它不是 Graph 证据。它不按 basename 或相似名称猜测；Graph 已存在但结果为 missing、ambiguous 或 unreachable 时也不会启用。
 
-Agent 还可以通过公开 MCP `task_capture_list` 有界列出当前 ActiveTask 拥有的 Capture。响应只有 `capture_id`、归一化摘要和安全诊断，不含原始工具输入/输出；Checkpoint 用 `{"kind":"capture","capture_id":"cap_..."}` 显式选择后，Runtime 才把它转换为 owned WorkObservation。CLI 当前没有独立的 Capture list 子命令。
+Checkpoint Claim 必须严格包含 `context_kind`、`statement`、`rationale`、`conditions`、`evidence`；每条 Evidence 严格包含 `evidence_type`、`summary`、`limitations`；Unknown 严格包含 `statement`、`blocking`。不要额外提交 Task/Intent/Episode/version/boundary、transport key、关系/工程引用或调用者生成的 ID。
 
 ### 6.4 Candidate 审核
 
 | 命令 | 功能 |
 |---|---|
 | `sctx candidate list --agent-kind ... --external-session-id ...` | 分页列出当前 Task 的 Candidate Review；默认只列 `pending`。可用 `--status`、`--limit`、`--cursor`、`--token-budget`。 |
-| `sctx candidate get ... --candidate-id <ID>` | 获取完整草稿、证据、来源、typed ContextRelation/EngineeringReference 提案、冲突分析、置信度、未知项和 Space 推荐。 |
+| `sctx candidate get ... --candidate-id <ID>` | 获取完整草稿、证据、来源、冲突分析、置信度、未知项和 Space 推荐。 |
 | `sctx candidate analyze --candidate-id <ID> [--token-budget 4096] [--top-k 16]` | 重新计算与已有 Context 的重复、支持、修订、潜在冲突和相关性分析；不写入 Git。 |
-| `sctx candidate confirm --input <JSON>` | 用户明确确认后，把 Candidate、Primary/Related Space、ContextRelation、EngineeringReference 和可选编辑作为一个原子事实批次写入。 |
+| `sctx candidate confirm --input <JSON>` | 用户明确确认后，把 Candidate、Primary/Related Space、最终 Context Revision、Association、Publication、Confirmation 和可选编辑作为一个原子事实批次写入。 |
 | `sctx candidate discard ... --reason <TEXT>` | 用户明确拒绝保留时丢弃 Candidate Review；不会发布任何 Context。 |
 | `sctx candidate build-closed-episode --episode-id <ID>` | 在 Episode 已关闭但 Builder 响应丢失或待恢复时重建；属于恢复命令。 |
 
@@ -573,7 +556,7 @@ Candidate 状态支持 `pending`、`discarded`、`expired`、`confirmed`。只�
 
 确认时的 `edits` 可以只替换用户明确要求修改的字段：`kind`、`topic_key`、`statement`、`rationale`、`applicability`、`assumptions`、`recheck_when`、`relations`、`evidence`。省略字段表示保留原草稿；`topic_key` 使用 `{"action":"clear"}` 才表示显式清空。
 
-`relations` 只接受 `depends_on`、`constrains`、`implements`、`validated_by`、`contradicts`、`related_to`；分析用 `related_contexts` 不会自动变成关系。Engineering Reference 必须使用已登记 RepositoryId、确定性 locator 和非空 `supports`；Checkpoint 提案允许空 `limitations` 列表，但列表中的每一项都必须非空，直接调用 `engineering-reference record` 仍要求至少一项限制说明。Confirm 成功后会尝试重建 Engineering Graph；响应中的 `graph_rebuild_pending=true` 表示知识事实已原子提交，但派生图需要稍后重试，并不表示可以重复创建事实。
+确认编辑中的 `relations` 只接受 `depends_on`、`constrains`、`implements`、`validated_by`、`contradicts`、`related_to`。Engineering Reference 在 Context 确认后通过独立的 `engineering-reference record` 记录；它必须使用已登记 RepositoryId、确定性 locator、非空 `supports` 和至少一项限制说明。图重建失败不会使已提交的确认事实重复创建。
 
 ### 6.5 Context 内容与治理
 
@@ -717,31 +700,30 @@ sctx search \
 | `sctx mcp serve --client cursor` | 通过标准输入/输出运行 Cursor MCP Server。 |
 | `sctx mcp serve --client codex` | 通过标准输入/输出运行 Codex MCP Server。 |
 
-安装后的 MCP 一共暴露 17 个工具：
+安装后的 MCP 一共暴露 16 个工具：
 
 1. `task_intent_update`
-2. `task_capture_list`
-3. `task_artifact_focus`
-4. `task_signal_supersede`
-5. `task_checkpoint`
-6. `task_context`
-7. `repository_scan`
-8. `engineering_reference_record`
-9. `association_explain`
-10. `association_rebuild`
-11. `context_search`
-12. `context_get`
-13. `candidate_list`
-14. `candidate_get`
-15. `candidate_discard`
-16. `candidate_confirm`
-17. `space_list`
+2. `task_artifact_focus`
+3. `task_signal_supersede`
+4. `task_checkpoint`
+5. `task_context`
+6. `repository_scan`
+7. `engineering_reference_record`
+8. `association_explain`
+9. `association_rebuild`
+10. `context_search`
+11. `context_get`
+12. `candidate_list`
+13. `candidate_get`
+14. `candidate_discard`
+15. `candidate_confirm`
+16. `space_list`
 
 CLI 还提供 Space/Context 写入治理、语义冲突、索引和 Pending Batch 等管理员能力；这些没有全部开放成 Agent MCP 写工具，以维持显式审核和生命周期边界。
 
-当前 Repository 准入控制 Hook 的 Agent-visible activation 与生命周期记录路径；MCP Server 也用 current Enabled Session lease 实现授权校验，Disabled/Missing/Expired/Stale/busy/corrupt Session 的调用会被拒绝。已安装的全局 Skill 主入口只包含最小 activation gate：没有可信 SessionStart marker 时不读取完整 workflow reference、不产生 Shared Context MCP 调用提示；有 marker 时才完整读取一次 installer-owned reference。这个 Skill gate 是 Agent 推理前的指令准入机制，Server guard 则负责安全和不落越权数据。MCP 进程和工具 Schema 仍由用户级 Agent 配置提供，可能物理启动或可见；不要把 Disabled 理解为进程必然未启动，也不要把合约中的 reference-read/MCP-call 字节代理外推为真实计费 token 已被测量。当前还已证明 Disabled Hook 不向模型注入 Shared Context 文本，也不产生 Runtime/Capture/Report/知识 Git 记录。
+当前 Repository 准入控制 Hook 的 Agent-visible activation 与机械 TaskSignal 路径；MCP Server 也用 current Enabled Session lease 实现授权校验，Disabled/Missing/Expired/Stale/busy/corrupt Session 的调用会被拒绝。已安装的全局 Skill 主入口只包含最小 activation gate：没有可信 SessionStart marker 时不读取完整 workflow reference、不产生 Shared Context MCP 调用提示；有 marker 时才完整读取一次 installer-owned reference。这个 Skill gate 是 Agent 推理前的指令准入机制，Server guard 则负责安全和不落越权数据。MCP 进程和工具 Schema 仍由用户级 Agent 配置提供，可能物理启动或可见；不要把 Disabled 理解为进程必然未启动，也不要把合约中的 reference-read/MCP-call 字节代理外推为真实计费 token 已被测量。当前还已证明 Disabled Hook 不向模型注入 Shared Context 文本，也不产生业务 Runtime/Report/知识 Git 记录。
 
-#214 更新后的固定 bytes proxy 进一步量化该边界：Disabled 的 Agent-visible activation、完整 workflow read、Shared Context MCP call/result 与业务 residue 都是 0；Enabled 每个 SessionStart marker 为 126 bytes（上限 128），完整 workflow 读取一次，并在固定 Direct/Group 验收链中产生 5 次真实 public MCP 调用。最小 gate、workflow、metadata 源文件分别为 1543、10390、263 bytes。若 Enabled Session 在没有 ActiveTask 时先发生安全 PostToolUse，Hook 只提醒一次调用 `task_intent_update`，不读取 Prompt、不自动创建 Task；PreCompact/TurnStop 只留下 typed 本地诊断。这些值用于回归比较，不是 tokenizer 结果或供应商计费 token。
+#214 更新后的固定 bytes proxy 进一步量化该边界：Disabled 的 Agent-visible activation、完整 workflow read、Shared Context MCP call/result 与业务 residue 都是 0；Enabled 每个 SessionStart marker 为 126 bytes（上限 128），完整 workflow 读取一次，并在固定 Direct/Group 验收链中产生 5 次真实 public MCP 调用。当前最小 gate、workflow、metadata 源文件分别为 1543、9098、263 bytes。若 Enabled Session 在没有 ActiveTask 时先发生安全 PostToolUse，Hook 只提醒一次调用 `task_intent_update`，不读取 Prompt、不自动创建 Task；PreCompact/TurnStop 只给出 bounded Checkpoint guidance并尝试恢复已有 outbox，不创作 Claim。这些值用于回归比较，不是 tokenizer 结果或供应商计费 token。
 
 ## 7. 常见问题
 
@@ -757,11 +739,11 @@ CLI 还提供 Space/Context 写入治理、语义冲突、索引和 Pending Batc
 sctx doctor
 ```
 
-如果报告为 `ACTION REQUIRED`，按报告中的 Agent 能力提示完成信任设置，再运行 `sctx doctor --fix`。Hook 不可用时系统会降级；正常编程不会被阻断，但 Agent 应在结束前用显式 `task_checkpoint boundary=close` 完成 Episode。
+如果报告为 `ACTION REQUIRED`，按报告中的 Agent 能力提示完成信任设置，再运行 `sctx doctor --fix`。Hook 不可用时系统会降级；正常编程不会被阻断，但 Agent 应在结束前用 flat `task_checkpoint` 直接提交完整 Claims/Unknowns。
 
-### 7.3 报 `intent_stale`、`checkpoint_stale` 或 Review 版本过期
+### 7.3 报 `intent_stale` 或 Review 版本过期
 
-这是并发保护在生效，不是数据损坏。重新读取当前 Task/Candidate，使用最新的 `intent_revision_id`、`episode_version` 或 `review_version`，核对内容后重试。不要猜 ID，也不要用旧版本覆盖新状态。
+这是并发保护在生效，不是数据损坏。重新读取当前 Task/Candidate，使用最新的 `intent_revision_id` 或 `review_version`，核对内容后重试。`task_checkpoint` 不接受调用者提供的 Task/Intent/Episode CAS；同 scoped content 应原样重试，不要猜 ID 或添加重试键。
 
 ### 7.4 搜不到某个文件的历史 Context
 
@@ -790,7 +772,7 @@ Group 只匹配这个 canonical root 的精确路径；父目录的父目录、�
 
 ### 7.6 Candidate 没有生成
 
-常见原因是 Episode 未关闭、Checkpoint 只有 Unknown、Claim 没有充分 Evidence，或者 Builder 返回 `needs_evidence`。先查看 `task checkpoint` 响应；如果 Episode 已关闭但构建响应丢失，可使用：
+常见原因是提交为空而得到 `no_op`、Checkpoint 只有 Unknown、Build outbox 仍为 pending/incomplete，或 Candidate recovery 失败。先查看 `task checkpoint` 的 queued receipt，再调用 `candidate list` 触发有界恢复；如果已知 Episode 仍需显式恢复，可使用：
 
 ```bash
 sctx candidate build-closed-episode --episode-id <EPISODE_ID>

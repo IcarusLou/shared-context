@@ -66,7 +66,7 @@ fn collect_files(directory: &Path, files: &mut Vec<PathBuf>) {
 }
 
 #[test]
-fn post_tool_attribution_persists_no_breadcrumb_or_unregistered_path() {
+fn post_tool_attribution_persists_no_evidence_or_unregistered_path() {
     let temporary = tempfile::tempdir().unwrap();
     let home = temporary.path().join("repository attribution home");
     let root = home.join(".shared-context");

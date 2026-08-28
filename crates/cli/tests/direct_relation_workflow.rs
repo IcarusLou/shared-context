@@ -67,7 +67,7 @@ fn repository(path: &Path) -> PathBuf {
 }
 
 #[test]
-fn direct_evidence_replaces_capture_relation_pipeline() {
+fn direct_evidence_reaches_review_with_no_hook_derived_relation() {
     let temporary = tempfile::tempdir().unwrap();
     let home = temporary.path().join("direct Evidence workflow");
     let root = home.join(".shared-context");
@@ -81,7 +81,7 @@ fn direct_evidence_replaces_capture_relation_pipeline() {
             std::slice::from_ref(&checkout),
         )
         .unwrap();
-    let session = "direct-evidence-relation-replacement";
+    let session = "direct-evidence-relation-workflow";
     assert_eq!(
         run_hook(
             &home,
@@ -152,6 +152,10 @@ fn direct_evidence_replaces_capture_relation_pipeline() {
             .unwrap()
             .len(),
         1
+    );
+    assert_eq!(
+        responses[3]["result"]["structuredContent"]["reviews"][0]["content"]["relations"],
+        json!([])
     );
     let review = responses[3]["result"]["structuredContent"].to_string();
     assert!(!review.contains("RAW_RELATION"));

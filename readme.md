@@ -16,6 +16,8 @@
 在正确时机重新注入工作流
 ```
 
+当前实现不存在 Hook 记录列表或人工筛选步骤。工作 Agent 直接用 `task_checkpoint` 提交聚焦的 Claims、Unknowns 和自包含 Evidence 摘要；服务端负责解析当前 Task/Intent、关闭 Work Episode、生成稳定重试身份并持久化 Candidate Build 队列。Checkpoint ACK 与同内容重放不写 Git，`candidate_list/get` 可恢复不可信 Candidate 提案，只有用户显式 `candidate_confirm` 才生成 accepted Context 事实。
+
 ---
 
 ## 第一性原理：让有效认知随工作自然传承
@@ -121,13 +123,7 @@ Engineering Context Sharing
 
 的转变。
 
-原始 Agent Conversation / Trace 更多是：
-
-- Source
-- Evidence
-- Breadcrumb
-
-而不是最终直接注入其他 Agent 的知识。
+原始 Agent Conversation / Trace 不作为产品输入。工作 Agent 直接把已经形成的结论、理由、适用条件、证据摘要与局限写成 Checkpoint；这些内容在人工确认前仍是不可信 Candidate。
 
 ---
 
@@ -219,9 +215,9 @@ Cross-platform Constraints
 因此整个系统需要同时解决两个问题：
 
 ```text
-Capture
+Checkpoint
   ↓
-沉淀什么 Context？
+Agent 认为哪些结论值得沉淀？
 
 Retrieve
   ↓
@@ -362,11 +358,11 @@ Session 结束
 ```text
 正常使用 IDE / Agent
         ↓
-自动捕获 Trace / Breadcrumb
+Agent 直接提交聚焦的 Claim / Unknown / Evidence 摘要
         ↓
-识别 Candidate Context
+服务端可靠排队生成 Candidate
         ↓
-聚合 / Validate
+人工 Review / Validate
         ↓
 形成 Team Context
 ```
@@ -568,7 +564,7 @@ Engineering Knowledge
 可以进一步抽象为：
 
 ```text
-Capture Once
+Conclude Once
     ↓
 Validate Once
     ↓

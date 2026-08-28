@@ -771,7 +771,7 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn post_tool_file_is_breadcrumb_only_and_test_outcome_refreshes_active_task() {
+fn post_tool_file_is_non_factual_signal_only_and_test_outcome_refreshes_active_task() {
     let fixture = MilestoneTwoFixture::new();
     let session_id = "hook-signal-session";
     let activation = fixture.hook(&serde_json::json!({

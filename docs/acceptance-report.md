@@ -1,314 +1,168 @@
-# Task-first Retrieval Integration Acceptance Report
+# Shared Context Acceptance Report
 
-Date: 2026-08-27
-Scope: production acceptance through Mew #170/#164 is unchanged, including #136/#169; Repository-scoped pre-inference Hook acceptance through #189 is human-accepted, #191 adds MCP Session authorization, #194 aligns Enabled cross-Repository Hook recording, #192 adds marker-gated progressive Skill loading, and #193 closes the fixed token-bytes proxy/NPM evidence pending final human acceptance. Mew #206/#209–#213 add the human-accepted Capture→Relation→EngineeringReference→Related Space path. Mew #207/#214–#217 is human-accepted and adds Intent bootstrap, TaskIntent-scoped Space grouping, automatic text quality gates and strict Focus fallback. Mew #208/#218–#221 aligns real structured Tool payloads and host declarations, bounds the Capture hot path, and closes installed Codex/Cursor public-process acceptance, excluding every section 10.2 Session lease change; additive non-blocking replay evidence extends through #171/#176
-Documentation baseline before the #170 language alignment: `main@e03193b`
+Date: 2026-08-28
 
-The original production baseline remains closed by final M4 Gate #164. The additive Mew #206 and #207 milestones are human-accepted. Mew #208 is implemented through its installed live-host gate and is pending final human acceptance.
+Implementation baseline: `8ea7136` plus the Mew #229 acceptance changes in this commit
+
+Scope: Mew #226–#229 direct Checkpoint final truth plus the unchanged Task-first, Engineering Graph, Repository activation, Candidate governance, and team Knowledge Store baselines.
 
 ## Verdict
 
-M1 closes the Task-first domain and entry-point foundation. M2 closes the local Task Runtime and explainable multi-Space retrieval path. M3 closes the Engineering Graph through a local Repository Registry, bounded multi-language scanner, persistent Engineering References, rebuildable resolution projection, bounded ContextRelation traversal, graph retrieval, and explicit MCP/CLI workflows.
+The public Checkpoint path is now a flat, model-owned submission contract backed by a server-owned lifecycle and durable recovery queue. The former Hook Capture selection pipeline, public list tool, client lifecycle CAS, caller transport key, and versioned `task_checkpoint_v2` alternative are explicitly superseded by [ADR-0003](./adr/0003-direct-checkpoints-and-server-owned-lifecycle.md).
 
-SessionStart now performs synchronous local Repository-scope admission before model inference. Direct and explicit Group receive one fixed bounded activation marker; Disabled receives no Shared Context text. PromptSubmit never repeats the marker, infers Working Intent, or runs an automatic knowledge query. Task-aware retrieval begins only after the Agent explicitly calls `task_intent_update`; subsequent `task_context` calls are read-only.
+The product exposes exactly 16 MCP tools. `task_checkpoint` accepts exactly `agent_kind`, `external_session_id`, `claims`, and `unknowns`; the server resolves the current Task and Intent, closes the Work Episode, derives a scoped content-addressed operation identity, and atomically persists the Checkpoint receipt and Candidate Build outbox. Direct Agent Evidence remains untrusted until a human confirms the resulting Candidate.
 
-| Milestone | Status | Boundary |
-|---|---|---|
-| M1 — Task-first primitives | IMPLEMENTED | Covered below |
-| M2 — Task Runtime and multi-Space retrieval | IMPLEMENTED | TaskSession persistence, strict `task_intent_update`, read-only `task_context`, association inference, typed RetrievalPaths, and TaskContextPack pass focused cross-crate/E2E oracles |
-| M3 — Engineering Graph | IMPLEMENTED | Reference-derived bounded ScanPlan, deterministic Artifact locators, sparse build-time Context/safety snapshots, historical exact retrieval, frozen 1–2 hop relations, diagnostics, fallback, rebuild equivalence, and budget bounds pass cross-crate/E2E oracles |
-| M4 — Low-tax Capture | IMPLEMENTED | #117, #136, #156–#164 and #169 provide lightweight idempotent Working Intent, Hint Text retrieval, exact WorkEpisode/Checkpoint automation, Builder/analysis/Review, and atomic existing/new Candidate Confirmation, closed by a fixed cross-layer oracle plus Hook/Capture/privacy/performance suites |
-| Repository-scoped pre-inference activation — Mew #185 | IMPLEMENTED; HUMAN ACCEPTED | #181–#189 provide explicit RepositoryGroup/Direct/Disabled resolution, sticky short-lived Session lease, SessionStart marker, exact SessionEnd cleanup, and a fixed Codex/Cursor lifecycle oracle |
-| Session authorization and cross-Repository investigation — Mew #190 | IMPLEMENTED; HUMAN REVIEW PENDING | #191 provides MCP Session-level authorization; #194 records registered cross-Repo investigation with real Catalog mapping, safe unregistered/mixed work as path-free non-locating meaning, and unsafe input as neutral; #192 uses a minimal trusted-marker gate; #193 closes the fixed Direct/Group/Disabled token-bytes proxy, installer, privacy, and NPM evidence |
-| Captured relation/reference workflow — Mew #206 | IMPLEMENTED; HUMAN ACCEPTED | #209–#213 expose owned Capture summaries, ingest selected Capture Evidence, persist typed ContextRelations and EngineeringReferences atomically, retrieve Primary-owned Context through Related Space roles, and close one sanitized Codex-A/Cursor-B public path across two checkouts of the same RepositoryId |
-| Retrieval quality workflow — Mew #207 | IMPLEMENTED; HUMAN ACCEPTED | #214/#215/#222/#216/#217 provide one-shot Intent bootstrap, exact TaskIntentRevision ProposedSpaceGroup reuse, absolute automatic-text gates, and Graph-unavailable-only strict Focus fallback through one public Hook/MCP/CLI acceptance chain |
-| Real host contract and Hook hot path — Mew #208 | IMPLEMENTED; HUMAN REVIEW PENDING | #218–#221 normalize real Tool payloads, align Rust/MCP/derived Codex declarations, enforce nonblocking atomic Capture with 32-way p99 below 500ms, and run installed Codex A/B plus Cursor lifecycle through public processes |
+## Superseded historical claims
 
-## Installed live-host gate — Mew #208/#218–#221
+Earlier versions of this report described `task_capture_list`, `CaptureId`, Capture ingestion, caller-provided Task/Intent/Episode versions, `continue|close` boundaries, Hook-driven Episode closure, and Checkpoint relation/reference proposal fields as current product behavior. Mew #226–#228 removed those surfaces and state. Historical tests and fixture chains remain valuable only where they have been rewritten for the direct Evidence contract; historical filenames have been renamed to `direct_evidence_workflow` and `direct_relation_workflow`.
 
-`installed_live_host_workflow` invokes the signed test-built `sctx setup` command in an isolated HOME, then reads and executes the exact Hook commands written to the installed Codex and Cursor configurations. Every CLI and MCP request uses `~/.shared-context/bin/current/sctx`; the test never calls `CaptureStore`, `TaskRuntime`, Reducer, or Index APIs. Host-version shims are generated at runtime only to keep the isolated HOME probe deterministic; the final local gate separately executed the installed real hosts and observed `codex-cli 0.149.1` and Cursor `3.13.10` on arm64. No model inference, paid transcript replay, or real user content is required.
+The following older milestones remain valid and are not re-proven here: Task-first retrieval without Workspace-to-Space routing, strict request-scoped Artifact Focus, sparse Engineering Graph snapshots, explicit Repository Catalog identities, Direct/Group/Disabled Session admission, untrusted Candidate Review, atomic human Confirmation, append-only Git facts, explicit team synchronization through InstallationWorkBranch, and transactional reset/uninstall. Their old Capture-specific evidence is not retained as present-tense proof.
 
-Codex Session A starts in checkout A, creates an explicit Task, scans only `src/live.rs`, records one normalized File Capture, closes a Checkpoint with Capture Evidence plus a File EngineeringReference, and confirms the Candidate through its public new-Space recommendation. Codex Session B starts in a different absolute checkout registered under the same exact `RepositoryId=Server`, then retrieves A's accepted Context through exact Artifact Focus and an `engineering_graph` RetrievalPath. A public installed CLI search returns the same Context. Cursor then exercises `sessionStart → beforeSubmitPrompt → postToolUse → preCompact → stop → sessionEnd`; the MCP Session is rejected after SessionEnd.
+The Task-first baseline still uses `task_intent_update` to create or revise a non-factual `WorkingIntentSnapshot` as an immutable `TaskIntentRevision`; this retrieval state is not Checkpoint Evidence.
 
-| Requirement | Authoritative evidence | Result |
-|---|---|---|
-| Real structured Tool inputs become typed safe meaning | #218 adapter contracts accept `absolute_file_path` and current path keys, emit `ToolCategory`, retain only Shell cwd, reject compound-shell test inference, omit Shared Context calls, and persist neither command nor vendor tool name | PROVEN |
-| Rust, MCP and host declarations cannot drift | #219 removes top-level Checkpoint `anyOf`, retains Rust composition validation, derives enum Schema values from Rust serialization, and compares real Codex `tools/list` to the checked-in TypeScript declaration golden | PROVEN |
-| Capture is bounded, fail-open and atomic | #220 uses Capture try-lock, conservative byte metadata, explicit cleanup, atomic publish, 25ms Hook SQLite timeout, no per-event version process, and a 32-process test whose post-commit p99 was 156.20ms (other runs 116–127ms) | PROVEN |
-| Same RepositoryId survives different absolute Codex checkouts | Installed Session A publishes from checkout A; installed Session B resolves `Server + src/live.rs` from checkout B and retrieves the same accepted Context through Graph Focus | PROVEN |
-| Cursor's supported public lifecycle is live and isolated | The installed Cursor Hook command processes all six supported lifecycle events; raw output is absent and MCP returns `session_not_authorized` after exact SessionEnd cleanup | PROVEN |
-| Privacy, packaging and public-boundary constraints hold | Knowledge Git contains neither raw Hook markers nor either checkout path; setup-generated Hook/MCP commands point at the installed binary; the E2E imports none of the forbidden internal state/projection APIs | PROVEN |
-| Excluded lease work remains excluded | No TTL renewal, reauthorization, lease extension, or other section 10.2 behavior is implemented or claimed | PROVEN |
+### Historical Dynamic Replay Phase One
 
-## Mew #205 completion audit — section 10.2 excluded
+**NON-BLOCKING EVIDENCE.** The Phase One report's original conclusion that “production acceptance through Mew #170/#164 is unchanged” remains a clearly superseded historical statement, not evidence for the current direct Checkpoint or Codex model loop. Its sanitized fixture replay is still useful for deterministic regression diagnosis under the separate Phase One policy.
 
-| #205 outcome or invariant | Evidence | Result |
-|---|---|---|
-| Minimally connect Capture to reviewed Candidate | #209/#210/#213 plus `captured_relation_workflow` and installed Session A prove public list → selected Capture Evidence → normalized Observation → closed Candidate Review | PROVEN |
-| Persist typed ContextRelation and EngineeringReference | #211/#213 confirmation facts and Graph rebuild tests preserve exact typed relation/reference provenance; #221 additionally confirms a File EngineeringReference through the installed MCP process | PROVEN |
-| Consume Related Spaces without changing ownership | #212/#213 return Primary-owned Context through a distinct Related association path; ContextRelation remains separate | PROVEN |
-| Improve bootstrap, organization and retrieval quality | #214/#215/#222/#216/#217 prove one-shot Intent bootstrap, TaskIntent-scoped proposed Space reuse, absolute text eligibility and strict Graph-unavailable Focus fallback | PROVEN |
-| Adapt real Tool payloads and remove shell guessing | #218 real-shape adapter contracts plus installed Codex/Cursor PostTool events prove typed categories, bounded paths, cwd-only Shell and no raw/vendor string persistence | PROVEN |
-| Repair MCP/host Schema drift | #219 Rust/MCP/TypeScript golden proves exact required/properties/enums while Rust retains Checkpoint composition authority | PROVEN |
-| Harden Hook concurrency | #220 full workspace regression and 32-process p99/no-half-write/busy tests prove fail-open bounded behavior | PROVEN |
-| Preserve Git facts, SQLite runtime/projections, human confirmation and bounded Graph | No storage-role replacement was introduced; installed A/B uses explicit Candidate Review/Confirm and exact bounded scan/Focus | PROVEN |
-| Keep non-goals closed | Source/tests/docs contain no vector DB, background knowledge service, automatic confirmation/publication, arbitrary shell parser or automatic full-repository scan | PROVEN |
-| Exclude all section 10.2 work | No lease TTL increase, renewal, refresh write path, or expired/stale SessionStart reauthorization is present in #209–#221 | PROVEN |
+## Public Checkpoint contract
 
-## Retrieval quality public gate — Mew #207/#214–#217
+```json
+{
+  "agent_kind": "codex",
+  "external_session_id": "external-session",
+  "claims": [
+    {
+      "context_kind": "validation",
+      "statement": "A focused engineering conclusion",
+      "rationale": "Why the evidence supports it",
+      "conditions": ["The condition under which it applies"],
+      "evidence": [
+        {
+          "evidence_type": "experiment_record",
+          "summary": "The directly observed result",
+          "limitations": ["What was not established"]
+        }
+      ]
+    }
+  ],
+  "unknowns": [
+    {"statement": "One unresolved question", "blocking": false}
+  ]
+}
+```
 
-`retrieval_quality_workflow` invokes the real `sctx` binary through sanitized Codex Hook input, public MCP tools and explicit CLI search. One authorized Session sees the 126-byte bootstrap marker, receives exactly one pre-Task PostTool reminder, creates a Working Intent with two independent Claims, confirms one proposed new Space and reuses it for the sibling Candidate, switches Tasks to prove strong-vs-generic automatic text behavior, then resolves the same accepted Context through strict File Focus while no Graph snapshot exists.
+Required and only fields:
 
-| Requirement | Authoritative evidence | Result |
-|---|---|---|
-| First substantive work bootstraps Intent without Prompt semantics | SessionStart names only `task_intent_update`; first safe PostTool emits one bounded reminder, retry is neutral, and no Hook creates a Task or derives Working Intent text | PROVEN |
-| Candidates from one TaskIntentRevision converge on one proposed Space | Two independent Claims expose the same `psg_` key and cleaned goal-derived Intent/title; first Confirm writes 5 new-Space Events, sibling Review becomes Existing Primary and writes only its 4 Context facts | PROVEN |
-| Automatic text quality is absolute and explicit search remains available | Exact Context phrase returns only the strong Context, unrelated same-Space sibling is absent, generic `the code file task` returns zero automatic items, and CLI explicit search still finds the sibling | PROVEN |
-| Strict Focus fallback is honest | With `artifact_generation=null`, exact `Server + src/quality/fallback.rs` returns the strong Context only through `resolved_focus_text_fallback`; no `engineering_graph` path is present | PROVEN |
-| Non-goals remain closed | No vector/embedding, automatic Task, Candidate merge/dedupe, Active Space, fuzzy basename match, saved Focus, indexed-fact rewrite, production adapter/schema/hot-path work, or section 10.2 Session lease behavior | PROVEN |
+| Object | Exact fields |
+|---|---|
+| Checkpoint | `agent_kind`, `external_session_id`, `claims`, `unknowns` |
+| Claim | `context_kind`, `statement`, `rationale`, `conditions`, `evidence` |
+| Evidence | `evidence_type`, `summary`, `limitations` |
+| Unknown | `statement`, `blocking` |
 
-This deterministic M2 public-surface gate is complemented by the installed live-host acceptance in #221. M3 remains at its final #208 human gate.
+Evidence types are `source_snapshot`, `experiment_record`, and `artifact_snapshot`. Every Claim requires at least one Evidence item. Empty Claims and Unknowns are a successful mutation-free `no_op`. Every object uses `additionalProperties=false`; no Task ID, Intent revision, Episode version, boundary, Capture reference, relation/reference proposal, request key, or caller-generated identity is accepted.
 
-## Captured relation/reference public gate — Mew #206/#209–#213
+## Retry, ACK, and recovery truth
 
-`captured_relation_workflow` uses the repository's sanitized Codex 0.147 and Cursor 3.13 fixture shapes and public Hook/MCP/CLI boundaries. Codex Session A starts in checkout A, records real-shape File/Test PostToolUse Captures, lists them through `task_capture_list`, closes a Checkpoint carrying Capture Evidence, one typed `implements` ContextRelation and one File EngineeringReference, reviews the untrusted Candidate, and confirms it into an existing Primary plus one Related Space. Cursor Session B starts from a different absolute checkout registered under the same exact `RepositoryId=Server` and retrieves the confirmed Context first through the Related Space role and then through exact Artifact Focus plus the frozen ContextRelation hop.
+The Server canonicalizes Claims/Unknowns and derives the Checkpoint operation key from exact TaskSession, Task, current Intent revision, and semantic content. Same scoped content therefore replays one stable operation, Checkpoint, Episode, Build, and set of Submission identities. A Task or Intent change creates a new scope; the protocol does not semantically deduplicate conclusions across Tasks.
 
-| Requirement | Authoritative evidence | Result |
-|---|---|---|
-| Capture selection is public, bounded and Task-owned | Public `task_capture_list` returns only Session A's two redacted current-Task summaries; Checkpoint selects their typed CaptureIds and produces two normalized Evidence snapshots without raw payload | PROVEN |
-| Typed Claim relations survive Review and confirmation | Candidate Review exposes `implements`; the confirmed Context Revision carries the same typed target/rationale/support and Graph Focus reaches the accepted target by one `relation_hops` edge | PROVEN |
-| EngineeringReference confirmation is atomic and rebuildable | Existing-Space confirmation commits 4 base facts + 1 EngineeringReference in one batch, causal confirmation includes the Reference event, `graph_rebuild_pending=false`, and Cursor B resolves the same File through its own checkout | PROVEN |
-| Related Space is a retrieval role, not ownership or relation | Task text matching Related B returns the Primary A-owned Context with `association_space_id=B`, `context.space_id=A`, and `space_association/related`; the typed ContextRelation remains a separate path | PROVEN |
-| Privacy and local path portability hold across the chain | Knowledge Git contains neither sanitized raw tool markers nor either checkout's absolute path; the stable RepositoryId and repo-relative locator survive the path change | PROVEN |
-| Candidate analysis accepts repeated Evidence conclusions | #224 regression proves canonically duplicate Evidence `supports` are deduplicated only in the derived WorkingIntent acceptance list while authoritative Candidate Evidence remains distinct | PROVEN |
+The write layers are deliberately distinct:
 
-This deterministic fixture-based regression gate is complemented, not replaced, by the installed Codex A/B and Cursor public-process acceptance in #221. Neither gate implements or validates section 10.2 Session lease changes.
+| Boundary | Durable result | Git effect | Trust state |
+|---|---|---|---|
+| `task_checkpoint` first ACK | Closed Episode, Checkpoint receipt, queued Build outbox | Zero Git writes | Agent attestation only |
+| Same scoped content replay | Same durable receipt and identities, `replayed=true` | Zero Git writes | Agent attestation only |
+| `candidate_list` / `candidate_get` recovery | Bounded/fair or target-aware outbox progress and Pending Review | May append only untrusted Candidate proposal facts needed for review | Untrusted Candidate |
+| `candidate_confirm` | Atomic final revision, association, publication, confirmation and selected Space closure | Appends accepted knowledge facts | Human-confirmed Context |
 
-## Repository-scoped activation gate — Mew #181–#189
+It is incorrect to claim blanket zero Git writes through Candidate reads. The precise invariant is: before explicit `candidate_confirm`, there are zero accepted Context revision, association, publication, or confirmation facts.
 
-The blocking test-only oracle is hand-written at [`fixtures/m2/repository-scoped-activation-v1.json`](../fixtures/m2/repository-scoped-activation-v1.json). `repository_scoped_activation_acceptance` applies the repository's documented Codex 0.147 and Cursor 3.13 payload shapes to isolated, synthetic checkouts and invokes the real `sctx hook` binary. The oracle contains no real path, Prompt, transcript, tool output, user identity, or Session identity and is not generated from production output.
+Lost or timed-out Checkpoint ACKs must be retried with the same Session locator and the same Claims/Unknowns field values and list ordering. Invalid shapes are corrected once rather than retried mechanically. No `transport_request_key`, `task_checkpoint_v2`, or caller lifecycle field exists. Pending/incomplete Candidate recovery is retried through list/get or the operator-only `candidate build-closed-episode` command, not by altering the Checkpoint.
 
-The fixed acceptance proves:
+## Hook and Evidence boundary
 
-- SessionStart resolves and durably records Direct, explicit multi-member Group, or Disabled before returning any Agent-visible marker. Authorization uses local synchronous non-blocking Catalog/lease access and never invokes the model, Git discovery, or Repository scan.
-- Direct and Group return the same fixed marker, bounded to 128 bytes. Codex startup/resume/compact SessionStart boundaries may return it; PromptSubmit always returns the vendor-neutral empty response and never repeats it.
-- The first successful decision for one exact external Session locator remains byte-for-byte sticky across later cwd changes and 12 concurrent repeated SessionStart calls. SessionEnd removes only that exact lease.
-- Disabled and Catalog-unavailable Codex/Cursor lifecycles execute SessionStart→Prompt→Tool→PreCompact/Stop→End with empty wire output and zero Runtime, Capture, Report, or knowledge-Git residue.
-- A current Enabled lease authorizes the Session rather than a fixed target set. Structured paths in any registered Repository retain their real Catalog mapping, including registered nonmembers reached from a Group Session. Safe unregistered, registered/unregistered mixed, and multi-checkout events without a safe explicit workspace retain only path-free non-locating Capture/TestOutcome meaning; ambiguous, relative, missing, symlink, and non-file/directory inputs remain neutral before Runtime/Capture. Catalog and knowledge Git remain unchanged.
+Hook adapters may merge bounded, non-factual TaskSignals from structural tool category/outcome information. They may also provide activation, bootstrap, and Checkpoint guidance. They do not select evidence, author Claims, store raw command/output/transcript content, or establish Artifact identity.
 
-#191 separately implements MCP Server authorization from the same current Enabled Session lease. #192 makes the installed Skill entry a minimal gate: marker-absent automatic selection reads no complete workflow reference and emits no Shared Context MCP call prompt, while the exact trusted Hook marker loads the installer-owned workflow once. #193 adds the hand-written [`fixtures/m5/repository-scoped-context-v1.json`](../fixtures/m5/repository-scoped-context-v1.json) oracle and `repository_scoped_context_acceptance`: real Codex Direct and Cursor explicit-Group wires each perform five public MCP calls through Intent→cross-Repo Focus/PostTool→Checkpoint→Hook Builder→Candidate list/get, while Disabled sibling/ancestor stays zero across every proxy field and business store. #214 strengthens the exact marker and gate without changing workflow/metadata, so source/installed gate, workflow, and metadata are now 1543/10390/263 bytes. The same acceptance verifies installer conflict, rollback, uninstall, and no business-Repository writes.
-
-These are byte proxies, not tokens: Enabled marker output is exactly 126 bytes under a 128-byte ceiling, full workflow reads equal one, MCP call count equals five per fixed chain, and sanitized result bytes must remain within the independent 1500–24576 range. Disabled activation bytes, workflow reads, MCP calls, result bytes, and business residue are all exactly zero. Enabled PostToolUse before ActiveTask emits one bounded bootstrap reminder and persists only its delivery bit; PromptSubmit remains neutral and unpersisted, and no Task is created automatically. This still does **not** prove physical MCP process/Schema removal, project-level Agent configuration, a launcher, real transcript replay, tokenizer output, or vendor billing tokens. MCP remains configured at user level, so Server rejection must not be described as preventing pre-call token spend.
-
-## Repository-scoped completion audit — Mew #193
-
-| Requirement or approved correction | Authoritative evidence | Result |
-|---|---|---|
-| Record only for registered Repository scope; exact explicit parent Group is enabled, arbitrary ancestor and sibling are disabled | `repository_scoped_context_acceptance` Direct/Group/ancestor/sibling black-box matrix plus `repository_scope_foundation` | PROVEN |
-| #187 synchronous non-blocking SessionStart and sticky first locator decision | Current/Disabled lease reuse, repeated resume/compact from changed cwd, and busy/error negative gates | PROVEN |
-| Disabled work spends no Shared Context instruction/call/result proxy and leaves no Task/Capture/Report/knowledge-Git residue | Hand-written zero matrix and byte-equivalent business snapshots across full Codex/Cursor lifecycles | PROVEN |
-| #191 authorization is Session-level, not Repository-target-level | Direct and Group Sessions Focus/PostTool into other registered Repositories; cross-agent/session and expired/stale/busy/corrupt calls return the same sanitized denial with zero writes | PROVEN |
-| #194 safe unregistered/mixed work is non-locating; unsafe input drops | Owned path-free Capture is explicitly ingested as a normalized Observation with a limitation and no Artifact identity; relative/missing/symlink events create no Capture or Signal | PROVEN |
-| #192 minimal gate loads complete workflow once only after trusted marker | Gate/workflow behavioral contract plus source and installed exact-byte checks | PROVEN |
-| Installer does not require a launcher or project-level configuration and never writes business Repositories | Exact three-asset install/rollback/conflict/uninstall fixture and business-tree byte snapshot | PROVEN |
-| #195 offline `setup --demo` regression | One NPM test is explicitly skipped with the human decision; normal install/setup and core authorized flows remain blocking | ACCEPTED NON-CORE LIMITATION |
-| #196 RepositoryGroupId scenario privacy coverage | Separate verified commit `b19bd31`, extended by #215 for `psg_`, keeps validation, runner, and replay-report denylist aligned with all 29 domain opaque ID prefixes; canonical IDs are rejected without flagging ordinary business text | PROVEN |
-| No overclaim about token or physical MCP isolation | Docs label every number as bytes proxy and retain user-level MCP process/Schema limitations | PROVEN |
-
-## #171 Dynamic Replay Phase One — NON-BLOCKING EVIDENCE
-
-#176 adds sanitized reporting around six hand-written synthetic scenarios executed against the real local `sctx` binary in isolated runner-owned sandboxes. It does not replay a real Session and changes no product logic, product Schema, scenario contract semantics, Agent Adapter, or fixture. Real local Codex/Cursor material influenced only human-reviewed aggregate pacing; no Prompt, transcript, tool output, path, user/Session identity, domain ID, or per-session event sequence is an input or committed artifact.
-
-The explicit 6×20 run completed all 120 isolated runs with zero failures: 100 normal `Passed` dispositions and 20 declared `expected_fail_open` stale-CAS results whose downstream closed assertions all passed. The other report classes—invalid scenario, unsupported version, corrupt data, infrastructure flake, and product invariant violation—were zero. Timing is committed only as rounded aggregate data, while a semantic digest excludes timing and runtime-generated identities. See [`dynamic-replay-phase-one.md`](./dynamic-replay-phase-one.md) and the audited [`dynamic-replay-phase-one-v1.json`](../tests/reports/dynamic-replay-phase-one-v1.json).
-
-This is additive, non-blocking evidence. Codex `0.147.0` and Cursor `3.13.2` are fixture profiles rather than a compatibility matrix. The fixed M4 oracle, `hook_to_confirm_chain`, workspace Rust/NPM gates, and accepted #150 untracked-file boundary remain blocking. A replay result can authorize a production-fix proposal only for a supported profile, after stable non-infrastructure reproduction of a named primary-flow closed invariant at ROI-1, and only with explicit human approval of a new atomic production Issue. Actual Session replay, collection/sanitization, model-in-the-loop execution, a multi-version matrix, and promotion to merge-blocking all remain unimplemented and require new Issues plus fresh privacy/design review and approval.
-
-`task_intent_update` is the only public Working Intent write path. It creates or advances a `TaskIntentRevision` containing one `WorkingIntentSnapshot`. `task_context` accepts only an external Session locator and output bounds, and reads the already-authoritative ActiveTask without mutating Runtime. PromptSubmit supplies guidance rather than inferred Intent. Explicit `context_search.space_ids` remains available as a hard filter for diagnosis and exploration.
-
-Mandatory Gates #114/#117 are implemented: stable `submission_id` and exact closed Episode ownership are represented in Git, rebuilt into SQLite submission/conflict indexes, and admitted only after Task/Intent/source Episode verification. Same-ID retries reuse the original Candidate while conflicting or identifiable malformed same-ID Events fail closed; different IDs and unrelated invalid/unknown Events remain isolated. The write path uses indexed lookup rather than Event scans or commit subjects.
+Evidence in a direct Checkpoint is an Agent attestation. `evidence_type`, `summary`, and `limitations` make it self-contained enough for Review, but do not make it a trusted team fact. Candidate Analysis and Space recommendations are also review data. Only explicit human `candidate_confirm` crosses the trust boundary.
 
 ## Acceptance matrix
 
-| Requirement | Result | Authoritative evidence |
+| Requirement | Current evidence | Result |
 |---|---|---|
-| `WorkingIntentSnapshot` has no Space or Workspace route | PROVEN | `sctx-domain` serialization contract and historical test identifier `milestone_one_contract::task_intent_has_no_route_and_accepts_zero_or_many_space_associations` |
-| One Task accepts zero or multiple Space associations | PROVEN | `TaskSpaceAssociation::validate_collection` domain contract and the cross-crate milestone test |
-| Search request has no preferred-Space ranking input | PROVEN | `SearchRequest` contract; Search cursor/ranking contains only BM25, Evidence completeness, and stable IDs |
-| Explicit exploration can still hard-filter by Space | PROVEN | MCP contract sends `context_search.space_ids`; `SearchFilters.space_ids` is applied in SQL before ranking |
-| `task_context` is truthful and read-only | PROVEN | MCP schema accepts only locator/budget/max fields; route, Task, Intent, Workspace and Signal fields are strictly rejected; concurrent reads preserve Task/Revision/Signal bytes |
-| Workspace cannot select or persist a Space | PROVEN | `config.toml` contains the fixed Store and local Repository Catalog only; Repository entries contain IDs/paths but no Space, Requirement, Task, or ranking route |
-| Automatic Candidate creation requires no Space | PROVEN | Closed-Episode Builder output carries exact source ownership and no Space; Primary/Related selection occurs only during explicit confirmation |
-| Manual Candidate creation is absent from public product surfaces | PROVEN | MCP dispatch/schema/tool list and CLI help/command expose no manual submission; the fixed residue gate dynamically checks the removed name while internal `submit_candidate` remains Builder-only |
-| Candidate submission retry is exact and rebuildable | PROVEN | 20-thread and 20-process concurrency converge to one Candidate; all writer crash seams recover stable batch/commit metadata; deleting SQLite rebuilds the same submission mapping; same-ID/different-content is typed conflict while different IDs never deduplicate |
-| Malformed Candidate Events are submission-local | PROVEN | Bounded known-v1 hint extraction accepts only exact Candidate envelopes with a valid SubmissionId; same-ID malformed/duplicate/conflicting Events populate only that submission's conflict row, while unknown schema, missing hint and different IDs retain diagnostics without blocking valid creation; incremental, scratch and DB-deletion rebuilds agree |
-| Manual Candidate staging cannot bypass submission admission | PROVEN | Generic append rejects valid Candidate Events, while `validate_staged` explicitly rejects both known Candidate additions and identifiable malformed Candidate additions as requiring the Candidate submission service; unrelated parse errors remain strict rather than swallowed |
-| Candidate admission verifies source ownership before Git | PROVEN | MCP adversarial coverage rejects missing, open, cross-Task and stale-Intent Episode sources with zero Event writes |
-| Unconfirmed Candidate cannot enter automatic injection | PROVEN | Candidate projection is outside Context FTS; CLI/MCP candidate retrieval tests and Codex hook test return only Accepted eligible Context |
-| Review discovery is automatic-Candidate-only and Task-isolated | PROVEN | Runtime v9 initializes Review exactly when a Builder item finalizes; same-Workspace dual Sessions and multiple Episodes/Candidates remain isolated, while a directly submitted Git-only internal fixture never appears in list/get |
-| Candidate Review is complete, bounded, and untrusted | PROVEN | Cursor/Codex MCP and CLI list/get return whole draft/Evidence/provenance/analysis/Space recommendations with an untrusted marker; stable cursor, limit, token-budget omission and complete get pass adversarial tests |
-| Discard is explicit, audited, and idempotent | PROVEN | Task/Intent/Review CAS changes Pending to Discarded once; same-reason timeout retry returns already_discarded, different reason/stale/cross-Task/Confirmed/secret input fail typed, and default list hides discarded |
-| Expired Reviews cannot revive | PROVEN | TTL cleanup deletes heavy Runtime analysis, advances a terminal Expired tombstone, never touches Git, and a later Builder retry cannot recreate Pending; deleting runtime removes all unconfirmed Review discovery |
-| Existing confirmed Context fixtures use neutral revision terminology | PROVEN | Event constructor is `context_revision_added`; no Context-Propose API or constructor remains |
-| SessionStart gates Shared Context before Prompt inference; PromptSubmit stays neutral | PROVEN | `repository_scoped_activation_acceptance` invokes the real Codex/Cursor Hook with documented payload shapes and a hand-written wire oracle: Enabled SessionStart returns the fixed marker, Disabled returns `{}`, PromptSubmit always returns `{}`, and no lifecycle path retrieves knowledge before explicit `task_intent_update` |
-| Missing ActiveTask gets one bounded Intent bootstrap reminder | PROVEN | Codex/Cursor Enabled PostToolUse each emit the vendor-correct reminder once, preserve `intent_bootstrap_notified` across repeated SessionStart, create no Task, persist no Prompt, and attach `intent_bootstrap_required` only to ownerless PreCompact/TurnStop Capture diagnostics; Disabled remains zero-residue |
-| Repeated SessionStart cannot change an established locator authorization | PROVEN | A first successful Direct lease remains byte-for-byte unchanged across resume/compact cwd changes and 12 concurrent repeated starts from another Repository, Group root, and unregistered directory; every repeated boundary returns only the original enabled policy |
-| Disabled and unsafe Hook events leave no business residue | PROVEN | Full Disabled/Catalog-unavailable Codex and Cursor lifecycles preserve zero Runtime/Capture/Report files and the exact knowledge Git snapshot; ambiguous/relative/missing/symlink/special-file events remain neutral. Enabled safe sibling/mixed events deliberately retain only path-free non-locating Capture/TestOutcome while Catalog and knowledge Git stay unchanged |
-| Codex dynamic sessions are isolated and incorporate later non-locating outcomes | PROVEN | CLI adversarial contract runs two Codex sessions in one Git Workspace, proves pre-Prompt PostToolUse cannot create a Session, File observations remain Breadcrumb-only, and TestOutcome changes only the owning Task fingerprint without Graph semantics |
-| Task retrieval accepts no caller Space or Workspace route | PROVEN | `milestone_two_contract` serializes the accepted input and rejects injected `space_id`, `space_ids`, `workspace`, and `workspace_id` fields |
-| Task retrieval returns zero, one, or many Space candidates | PROVEN | The M2 oracle executes unrelated, page-only, and multi-Space tasks through the shared Runtime/MCP/Search/Index path |
-| One FE task retrieves Requirement, server Contract, and cross-platform Validation Context | PROVEN | The fixed M3 oracle uses frontend Symbol and FE API/Schema Focuses, then asserts exact hand-authored Requirement/Decision/Contract/iOS/Android identities through Graph plus ContextRelation paths |
-| Every returned Context links to a Space association and typed RetrievalPath | PROVEN | M2 validates Intent FTS, Context FTS, and Scope; M3 validates uniquely resolved EngineeringGraph and ContextRelation paths. Textual Task Signals no longer claim Graph semantics |
-| Automatic text retrieval has absolute quality gates | PROVEN | Automatic mode filters stopword/short/generic tokens, caps specific tokens and removes ≥30%-DF terms in a 20+ document corpus; phrase, ≥60% coverage, two text channels, Context text+ExactScope, or exact Graph/ContextRelation independently admits a result. Generic single-token and weak same-Space inheritance are empty, while the same query remains visible in Explicit mode and token-budget output is deterministic |
-| Same Workspace external Sessions remain isolated | PROVEN | Page and server calls share one Workspace signal but receive distinct TaskSession/Task IDs and disjoint Space/Context sets |
-| Workspace paths cannot create Space or Artifact priors | PROVEN | Workspace signals remain non-locating; RepositoryId enters Graph retrieval only inside the complete `ResolvedFocus` of one ArtifactFocusQuery and never as a global filter |
-| Artifact Focus is query-scoped and leaves no Runtime state | PROVEN | Domain and Runtime contain no Focus record, ID, lifecycle, history, table or snapshot field; repeated A, A→B, ordinary no-Focus reads and MCP restart preserve stable serialized ExternalSession/Task/Intent/Signal state and retrieval fingerprint |
-| Public Artifact Focus contract is strict and server-resolved | PROVEN | MCP `task_artifact_focus` exposes only Session locator, expected Revision, absolute path, six no-path coordinate shapes and output bounds with recursive `additionalProperties=false`; forged identity/route/generation/Hook fields fail |
-| Public MCP queries reach Graph for all six kinds | PROVEN | Real MCP frames create ActiveTasks and query File/Module/Symbol/API/Schema/Test Focuses, immediately return exact Graph Context, return no ID/lifecycle metadata, isolate equal locators by Repository, and leave the next ordinary `task_context` without Focus |
-| Repository-scoped exact Focus never crosses repositories | PROVEN | Search builds two historical Graph nodes with identical locators under different RepositoryIds and proves each Focus returns only its named Repository Context |
-| Cross-parent Catalog mapping never mixes repositories | PROVEN | Real MCP Focuses use equal `src/shared.ts` locators under configured FE/Android/iOS checkouts and return only the Context owned by each stable Catalog RepositoryId |
-| Unreachable Focus has typed zero-result semantics | PROVEN | Wrong-Repository and unavailable-Graph Focuses return no Graph Context and a budgeted `artifact_not_reachable_in_graph` diagnostic; they never claim current-code `missing` |
-| Unavailable Graph has an honest strict text fallback | PROVEN | With no Graph snapshot, File path, API canonical key and qualified Symbol canonical key retrieve only Context text containing exact RepositoryId+full locator sequence through `resolved_focus_text_fallback`; basename/route/module collisions stay out, matched_artifacts and Graph paths remain empty. Available Graph missing/ambiguous cases never fallback |
-| Reachability reflects actual selected-mode output | PROVEN | Unsafe/ambiguous automatic Focus remains unreachable; Explicit marks reachable only after a GraphDiagnostic, preventing false suppression of `artifact_not_reachable_in_graph` |
-| PostTool observations never fabricate Artifact identity | PROVEN | A real Codex Hook Prompt→PostTool sequence retains one Task ID, keeps File data out of engineering Signals/Focus, records TestOutcome as non-locating, and creates no Graph edge |
-| Capture identity and ownership are verifiable | PROVEN | Typed `CaptureId`, ExternalSessionLocator and optional exact ActiveTask/Intent owner are stored after redaction; pre-Task Capture remains TTL-bound with `no_active_task` and cannot be claimed or attributed elsewhere |
-| Current Task Capture summaries are publicly selectable | PROVEN | `task_capture_list` is authorized by exact external Session locator, returns only bounded redacted Captures owned by the ActiveTask, and rejects missing/cross-owner selection before Checkpoint mutation |
-| Capture storage is bounded, private and retryable | PROVEN | CaptureStore read/list/claim/cleanup enforce limits, 0700/0600, privacy redaction, TTL, symlink/invalid preservation, same-owner claim idempotency and cross-Task/Episode rejection; no transcript/command/tool output is accepted |
-| WorkEpisode persistence is Task-isolated and CAS-guarded | PROVEN | Runtime v8 enforces one Open Episode per TaskSession, server IDs, ordered Intent/Signal refs, normalized Observation sources, Episode version CAS, inactive-Task rejection and same-Workspace dual-Session isolation; Candidate Build and derived analysis remain Episode-owned |
-| Public AgentCheckpoint is strict and transactionally owned | PROVEN | MCP/CLI require external Session, Task/Intent/Episode CAS, boundary, complete Claims/Unknowns and typed refs with recursive `additionalProperties=false`; Runtime atomically opens/advances Episode, assigns WorkObservation/Claim/Checkpoint IDs and continues or closes |
-| Checkpoint retries are semantic and concurrent-safe | PROVEN | `(episode_id,parent_episode_version)` is unique; eight concurrent identical writes return one created Checkpoint and stable IDs, identical timeout retries return the original, changed content conflicts and stale versions have distinct typed errors |
-| Checkpoint Evidence is verified and private | PROVEN | One Index snapshot validates Context→Revision→Evidence, Episode/Task validates WorkObservation ownership, and inline Validation is self-contained. TaskSignal references are validated only as owned, non-factual source clues: Prompt/Workspace cannot become engineering Evidence, while explicitly cited normalized Diff/TestOutcome clues are converted by the Builder into self-contained EvidenceSnapshot content. PrivacyScanner rejects Secret/PII, and ArtifactRef alone cannot satisfy Evidence |
-| Checkpoint Capture, ContextRelation and EngineeringReference proposals remain typed | PROVEN | Selected CaptureIds ingest once into owned normalized Observations; relation targets/kinds and Repository/locator/reference fields are validated before mutation, preserved through Candidate provenance/Review, and raw Capture payload is absent from Git |
-| Codex and Cursor close Episodes without Hook claims | PROVEN | Real newline Cursor and Content-Length Codex MCP sessions execute Intent→inline Validation Checkpoint→unknown-only close; continue writes no Candidate, while close builds the earlier evidenced Claim exactly once and returns stable Candidate summaries |
-| Candidate Builder is deterministic, evidence-bounded and crash-safe | PROVEN | Typed WorkObservation, Context Evidence, normalized Diff/TestOutcome source conversion, and inline Validation paths produce complete drafts; Unknown-only and unsupported Prompt clues produce zero Git writes; missing kind uses Discovery and missing topic remains a non-blocking Unknown; Runtime-before-Git, Git-before-Runtime, semantic retry, identical-text distinct Claims, and 20 concurrent builds preserve stable operation identities |
-| Candidate relationship analysis is typed and conservative | PROVEN | Full canonical draft equality alone yields exact duplicate; equal statement with different rationale/Evidence yields support; same topic plus explicit Context or exact Graph path yields revision; differing topic/scope statements yield potential contradiction; pure BM25 remains unresolved related; no candidate yields novel |
-| Candidate Space recommendation is non-binding and generation-pinned | PROVEN | Deterministic RRF fuses assessment targets, source Task associations and Space Intent evidence under top-k/token budget; fixed Context/Graph generations and stable target ties survive Index rebuild; conflicted/unsafe Spaces cannot become Primary and absence of a safe Primary produces one complete system-suggested Intent |
-| Proposed Space grouping is exact to one Task Intent revision | PROVEN | Distinct Claims under one `(TaskId, TaskIntentRevisionId)` share the same `psg_` key, cleaned goal-derived Intent/title and recommendation; first new-Space confirmation reserves/maps exactly one Space, retry reuses its facts, sibling Review switches to Existing Primary, stale proposed confirmation writes zero Git, and a new Intent revision receives a distinct key |
-| Candidate Confirmation facts are causal and conflict-explicit | PROVEN | Existing/new Primary, multiple Related Spaces and field edits reduce identically under Event permutation; exact Candidate/source, embedded owner, Association, causal Publish and generated-ID-free content hash are verified; duplicate Confirmations and Association heads remain explicit conflicts, while later Withdraw preserves historical confirmation and current lifecycle exclusion |
-| Candidate Confirmation is recoverable and atomic | PROVEN | Runtime reserves a complete stable 4/5-Event plan before Git; every Writer crash seam, pending recovery, Git-before-Runtime recovery and index deletion converge to one batch/commit with no partial facts |
-| Candidate Confirmation includes proposed EngineeringReferences | PROVEN | The reserved plan expands to 4/5+N Events, confirmation causal refs include every Reference Event, post-commit Graph rebuild is retryable through `graph_rebuild_pending`, and repeated confirmation creates no duplicate facts |
-| Related Space retrieval preserves Context ownership | PROVEN | Unique current ContextSpaceAssociation heads let a Related Space contribute a typed association path while returned Context metadata retains its Primary nested owner; conflicted multi-head associations derive no automatic Related role |
-| Confirmation input keeps identities server-owned | PROVEN | MCP primary is strict oneOf existing Space or current proposed recommendation ID; full new Intent and Confirmation/Context/Revision/Evidence/Event/Batch/Git IDs are absent and additional properties fail |
-| Explicit confirmation closes Review and exposes accepted Context | PROVEN | Existing/new Primary, two Related Spaces and optional edits return assessment acknowledgments; 100 threads and 20 CLI processes converge, Pending list clears, Confirmed audit remains, and Context Search returns the published revision |
-| Candidate analysis is disposable Runtime review state | PROVEN | Runtime v8 atomically replaces current analysis with monotonically increasing analysis generation; failed analysis remains Draft and retryable; deleting the derived row permits recomputation; Builder and internal CLI rerun preserve Candidate/Submission/Event identity and add no Git, Search, Hook or auto-injection state |
-| Capture ingestion survives claim/commit races | PROVEN | `capture_ingestion.capture_id` is unique; concurrent/retried ingestion returns one Observation, changed retry content/cross owner is rejected, and claim-before-failed-commit remains retryable without source deletion |
-| Capture File hints never guess Repository | PROVEN | Catalog maps only safe existing Workspace-allowed configured paths to File ArtifactRef; unconfigured/unsafe paths retain Capture source/summary plus typed Runtime diagnostic |
-| Source Episode is query-verifiable without Candidate creation | PROVEN | Explicit Runtime and Checkpoint APIs return exact Episode owner/version/status/Observation/Checkpoint state; deleting runtime loses Episode and Checkpoint only while Git/Index/Capture bytes remain |
-| Hook automates only a persisted Checkpoint boundary | PROVEN | Real Codex PreCompact and Cursor TurnStop fixtures close only an already checkpointed current-Intent Episode and invoke the shared Builder; missing/stale Checkpoints remain Open, 12 concurrent processes and repeated events converge, same-Workspace Sessions stay isolated, and Hook never opens an Episode or fabricates Claim content |
-| One black-box identity chain reaches accepted Context | PROVEN | `hook_to_confirm_chain` uses supported Codex Hook and MCP framing plus the real CLI: one external Session supplies Task/Revision IDs, exact request-scoped Graph Focus, redacted File/Test Captures and a real TestOutcome SignalId; a continue Checkpoint cites that Signal and exact ArtifactRef, TurnStop alone closes/builds, repeated Stop reuses one Candidate, Review preserves exact Episode/Checkpoint/Claim/content, and one 4-Event confirmation commit is retry-idempotent and searchable |
-| Missing or failed Hook has a no-retype fallback | PROVEN | `task_checkpoint boundary=close` with current Episode version and empty Claims/Unknowns closes the previously persisted Checkpoint under Task/Intent/Episode CAS, returns that same Checkpoint ID, and invokes the same Builder without inventing an Unknown or duplicate Claim |
-| Automatic TaskContextPack excludes every unsafe state | PROVEN | The oracle seeds an unassigned Candidate plus Space-associated Candidate, Deprecated, semantic-conflict, and incomplete-Evidence Context; automatic output is empty while a direct SearchEngine diagnostic query proves each fixture state exists |
-| Tree, Generation, and Task fingerprint are consistent | PROVEN | M2 response Tree equals Git `HEAD^{tree}` and index metadata; Generation equals the same projection; identical Session input returns identical fingerprint, associations, items, and paths |
-| Engineering workflows preserve identity, privacy, and ambiguity | PROVEN | Two-Repository/multi-worktree tests execute scan→record→rebuild→explain→Task Pack; concurrent Writer calls produce unique server-owned IDs; unsafe paths, incomplete evidence, and secrets are rejected; ambiguous candidates are returned without selection |
-| Graph build is sparse and Reference-derived | PROVEN | Scanner tests seed 200 unreferenced tracked files plus an unreadable sentinel and prove zero observations/Artifacts for them; duplicate Reference paths collapse to one planned path; public `repository_scan` requires `paths` with `minItems: 1`/`maxItems: 10000`; `association_rebuild` reports the deduplicated planned-path count |
-| Missing and empty plans never broaden scanning | PROVEN | Empty typed ScanPlan and empty MCP/CLI `paths` fail; an explicit missing path returns a typed `missing` skip with zero scanned files/Artifacts and no directory or Repository fallback |
-| Repository identity is explicit and rebuildable | PROVEN | `repository add --repository-id` requires an exact-case readable team ID; one Catalog ID accepts multiple explicit worktrees; SQLite deletion followed by Runtime/doctor/list restores the same IDs and locators; Registry has no basename/remote/common-dir merge API |
-| Local data reset is transactional and remote-safe | PROVEN | `data reset --dry-run/--yes` covers corrupt SQLite, non-empty Git/Catalog and every temporary store; default backup retains old data, installation/Agent/Skill/log bytes remain identical, a local bare remote ref is unchanged, repeated reset is empty and healthy, and five crash seams plus Setup recovery expose no partial business state |
-| Existing remote Knowledge Store can bootstrap Setup safely | PROVEN | A non-empty local bare remote is cloned and strictly validated in transaction staging, atomically activated on a stable `shared-context/<installation-id>` branch, repeated same-URL Setup is network-free and idempotent, different/existing-local/empty/credential-bearing/corrupt sources are rejected, rollback leaves no active clone, raw URL is absent from manifest/output, and the remote default ref receives zero writes |
-| Protected default branch synchronization uses only installation work branches | PROVEN | `knowledge sync` creates/recreates only `shared-context/<installation-id>`, merges remote default/work advances, validates append-only Event/Object/Reducer/Index state, rolls back conflicts/corrupt or modified facts, retries one deterministic non-fast-forward race, reports divergence/PR need, and read-only rejection observes only the work-branch ref while the default OID remains unchanged |
-| Two independent installations share knowledge without sharing local paths | PROVEN | Hand-authored `team-sharing-v1.json` drives two HOME/root pairs with exact `FE`, different tracked checkouts and one remote: A publishes an accepted Context/EngineeringReference, a simulated human merge advances protected default, B syncs and resolves/focuses that same fact through B's absolute path, then B reset preserves install bytes, empties local facts/Catalog and leaves every remote ref unchanged |
-| Cross Workspace mapping is isolated and non-discovering | PROVEN | Real-structure CLI E2E configures FE/Android/iOS repos under one parent Workspace, maps equal relative paths to each owning stable RepositoryId, leaves an unconfigured sibling signal-free, and converges root/subdirectory/parent Workspace inputs |
-| Hook observations are bounded, non-locating, and Git-free | PROVEN | A fake `git` sentinel proves PostTool never launches Git; File observations remain Breadcrumb-only, TestOutcome is non-locating, and Catalog/Registry failures return sanitized success responses without Focus submission |
-| Catalog and Registry validation are explicit | PROVEN | CLI `repository add/list/doctor`, installer setup/doctor, and MCP Runtime open synchronize only trusted local Catalog IDs; unsafe names and ASCII case-only collisions are typed errors, and public `repository_scan` rejects unconfigured checkout or caller Repository identity fields |
-| Declared missing paths resolve safely without code inspection | PROVEN | Catalog accepts missing leaf/tail below an exact configured checkout while rejecting dot segments, symlink components, existing non-directory parents, and unconfigured paths; historical Graph remains reachable after checkout deletion |
-| Focus hot path has no engineering or Task mutation and no Hook dependency | PROVEN | Git HEAD, Graph canonical bytes, and canonical Runtime authoritative bytes remain unchanged; source sentinel rejects Command/Scanner/rebuild/Reference/Hook calls; real established-session MCP p95 stays below 250ms |
-| Engineering failure is advisory to Task Retrieval | PROVEN | Rebuild reports unavailable registered Repositories explicitly, Explain reports typed projection availability, and a corrupt Engineering projection degrades Task responses to `artifact_generation: null` instead of blocking Context-only retrieval |
-| Multi-language Artifact discovery has an independent bounded oracle | PROVEN | `milestone-three-v1.json` fixes hand-authored IDs/References and the exact Reference-derived path plan; a separate Scanner contract explicitly plans Rust, TS, JS, Swift, Kotlin, JSON, OpenAPI and Proto paths and validates exact API/Schema/Qualified Symbol/Test locators without full-repository enumeration |
-| File move and Symbol rename never trigger guessing | PROVEN | M3 oracle moves a JS file and renames a TS Symbol, then proves both original deterministic locators become `missing`, create no Edge, and remain unchanged without Git-history or Agent repair workflow |
-| Exact Graph retrieval expands cross-platform Context at bounded depth | PROVEN | Symbol→Decision→Contract→iOS/Android and FE API/Schema→Contract→Decision/iOS/Android paths match fixed Context IDs, relation kinds and depths; cycles never repeat a Context and all paths stop at depth two |
-| Ambiguous edges are diagnostic-only | PROVEN | Explicit mode exposes both fixed candidates; automatic mode cannot use the edge to inject or raise Graph relevance |
-| Engineering projection is disposable and generation-consistent | PROVEN | The oracle deletes `engineering.sqlite`, rebuilds byte-equivalent canonical projection, and proves every Graph path shares one Artifact Generation while Graph build Tree remains explicit provenance |
-| Incremental and scratch scans are equivalent | PROVEN | The Scanner contract runs both paths with the same RepositoryId and deduplicated ScanPlan and asserts byte-for-byte equal RepositorySnapshot output |
-| Associations, paths and omissions obey Token Budget | PROVEN | Full and constrained fixed Graph packs recompute exact charged tokens, stay within budget, obey top-k, and emit omissions when bounded |
-| #136 removes Intent maturity and Evidence while preserving knowledge Evidence | PROVEN | `WorkingIntentSnapshot`, its Hints, and TaskSignals are explicitly non-factual and carry no maturity or Evidence binding. M3 typed Context Evidence, EngineeringReference support, Graph safety provenance, and exact Revision ownership continue to serve CheckpointClaim, Candidate and ContextRevision assertion chains |
-| Historical Graph remains active across current Tree changes | PROVEN | Tree mismatch plus unrelated Candidate/Reference/Context/Publication append, new Revision and Withdraw preserve the old Graph path and exact frozen Revision without implicit rebuild |
-| Graph safety is decided at build time | PROVEN | Candidate, incomplete-Evidence and semantic-conflict roots remain explicit-only; withdrawn-after-build safe Revision passes Agent Adapter only with matching Graph provenance, generation, identity and empty blockers |
-| Current and historical revisions never collide | PROVEN | One Task returns the same ContextId's frozen old Graph Revision and current FTS Revision as separate revision-aware items; each path remains attached to its exact Revision |
-| Graph ContextRelation traversal is historical | PROVEN | Frozen source/target Revision IDs survive a new current Revision with different relations; current fallback relations never extend an EngineeringGraph path |
-| Sparse Context snapshot closure excludes unrelated corpus | PROVEN | Adding 64 unrelated Spaces/Contexts leaves Graph snapshot row count and Artifact Generation unchanged; only Reference roots plus two-hop closure are persisted |
-| Concurrent Graph reads observe one stable generation | PROVEN | Concurrent repeated Graph rebuilds and Task reads return one Artifact Generation and the exact frozen historical Revision |
+| Flat exact Checkpoint fields | Rust structs, MCP JSON Schema, strict decoding, Codex declaration golden and MCP contract negative-field matrix | PROVEN |
+| Session identity remains simple | Existing AuthorizedSessionScope guard accepts the Agent-provided `agent_kind + external_session_id` locator; no new MCP transport-binding handshake exists | PROVEN |
+| Server-owned Task/Intent/lifecycle | Runtime locates exact ActiveTask from the submitted Session locator and creates/closes the Episode without caller lifecycle fields | PROVEN |
+| Content-addressed same-scope replay | Runtime operation receipt includes TaskSession/Task/Intent plus canonical content; timeout, delayed retry and concurrency tests reuse every durable identity | PROVEN |
+| Durable ACK excludes Candidate Git work | Checkpoint transaction persists receipt + outbox; ACK performance test compares committed Event state before/after 100 submissions | PROVEN |
+| Recovery is bounded and fair | Candidate list limits recoverable Episodes, advances attempt generation, exposes pending/incomplete counts and is concurrency tested | PROVEN |
+| Target-aware recovery | Candidate get checks exact Task ownership before recovering one Episode | PROVEN |
+| Trust layering | Recovery may append Candidate proposal Event(s); confirmation tests assert accepted revision/association/publication/confirmation appear only after explicit Confirm | PROVEN |
+| Direct Evidence is untrusted | Candidate list/get label Reviews untrusted; no Hook/TaskSignal evidence path exists; confirmation is explicit and CAS-guarded | PROVEN |
+| No Capture product surface | No Capture domain/store/ingestion table/public tool; tool list rejects `task_capture_list`; installed flows assert no runtime Capture state | PROVEN |
+| Exactly 16 MCP tools | MCP contract, installer smoke, CLI tools-list and installed client initialization | PROVEN |
+| Codex first-submission legality | Exact-shape ordinary-MCP probe with CLI 0.149.1 / gpt-5.6-luna produced 99/100 accepted host Sessions and 99/99 legal submitted argument objects, with no retry or other tool call | PROVEN |
+| Runtime schema policy | Setup/Upgrade discards known schema 11/12 DB + sidecars and initializes schema 13; unknown/future schemas fail closed | PROVEN |
+| Transactional compatibility handling | Installer matrix verifies later failure restores schema 12 DB/sidecars bytes and permissions; schema 13 is retained | PROVEN |
+| Reset/uninstall residue | Installer matrix removes runtime sidecars and cleanup-only legacy Capture paths | PROVEN |
+| Candidate governance | Pending Review remains non-injectable; discard is explicit; confirm atomically produces existing/new Space fact closure | PROVEN |
+| Task-first retrieval and Graph boundaries | Existing M1–M3 fixed oracles, strict Focus fallback, sparse Graph and retrieval-quality workflows remain unchanged | PROVEN |
+| Repository activation and authorization | Sanitized Codex Direct and Cursor explicit-Group public Hook/MCP wire contracts plus Disabled zero-business-residue matrix | PROVEN AS CONTRACT |
+| Team Knowledge Store | Two-installation hand-authored oracle retains exact RepositoryId across different checkouts and explicit work-branch synchronization | PROVEN |
 
-#150 remains an accepted product boundary: untracked files are not scanned, and no ActiveTask untracked scan entry was added.
+## Codex-measured evidence
 
-#154 replaces the unlaunched #151/#152 persistence model: `task_artifact_focus` is a read-only ArtifactFocusQuery, Catalog supplies a request-local `ResolvedFocus`, and Search consumes only that value for the current Pack. Runtime owns no Focus state, and later Focus queries, ordinary `task_context`, MCP restart, Task switch, or compaction restore nothing. Repository Catalog and absolute checkout paths remain local-only; explicit Knowledge Store synchronization exchanges RepositoryId-based facts, never Catalog mappings.
+The final #229 review recorded these local gates:
 
-#157 exposes explicit AgentCheckpoint through MCP/CLI/Skill without Hook-authored Claims. #114/#117 connect internal Builder submissions to closed Episode verification, submission-idempotent Git admission, and malformed-Event isolation. #158 deterministically builds unassigned drafts at close and through an internal CLI retry. #163 lets verified PreCompact/TurnStop Hooks close only an already checkpointed Episode and invoke that same Builder. #136 stores optional, non-factual Working Intent snapshots with canonical retry convergence, and #169 adds typed Hint Text recall without Graph semantics. #164 closes the chain with a hand-authored fixed oracle covering exact Episode provenance, no-retype Review, Candidate isolation, and atomic existing/new confirmation.
+- Installer passed 2 unit tests and all 45 `installer_matrix` tests with the installed 9098-byte workflow asset.
+- The complete MCP package passed 1 unit test, the dedicated creation-ACK gate, 5 engineering workflows, and all 40 contract tests. A quiet dedicated ACK run measured p95 `234.574ms` and p99 `310.217ms`, below the 250ms/500ms gates; an earlier aggregate run after several heavy packages measured p95 `270.926ms` and was not used as passing evidence.
+- Domain, Runtime, Local State, Engineering Graph, Event, Git, Index, Scenario Contract/Runner, Search, all remaining CLI binaries, and NPM packaging passed in explicit package/test runs. NPM reported 15 passed, one chartered skip, and zero failures.
+- `cargo test --workspace --locked` was run twice from a quiet machine and both runs stopped at the same `retrieval_quality_workflow` `context_fts` eligibility assertion. The exact test passed immediately after each failure, and every test binary skipped by the early stop was run explicitly. No threshold or retrieval path was changed; this report does not claim that the monolithic workspace command was green.
+- Workspace clippy with `-D warnings`, rustfmt, Skill validation, Markdown JSON parsing, privacy/residue checks, and `git diff --check` passed.
 
-The fixed #136 oracle proves goal-only input, created/already-current continue, real changes, old-parent retry convergence, 20-way concurrency, stale zero-write, explicit new, Task switch and Runtime deletion. Artifact/interface Hints retrieve only through `WorkingIntentHintText`; they create no Git Event, Candidate, EngineeringReference, Graph path, Evidence, or automatic eligibility. Existing `episode_lifecycle_hooks`, `work_episode_capture`, and `hook_fail_open` suites cover PreCompact/TurnStop and Intent/Capture/Hook fail-open.
+Manual validation Session `01a0433a-9996-7db3-b00a-591903d1faf9` exposed the old wrong-field rejection and repeated-retry behavior that motivated this redesign. It is diagnostic input, not post-change proof.
 
-## Team-sharing completion audit — Mew #197–#204
+A failed interim prompt that described fields without showing the exact shape produced 89 valid Checkpoint calls out of 100; the 11 failures were 9 invalid nested-Evidence shapes and 2 no-call results. This is retained as evidence that field descriptions alone do not meet the acceptance threshold. A later safe auto-approval trial that omitted explicit authorization wording reached only 98/100 and was also rejected as final evidence.
 
-| Requirement | Authoritative evidence | Result |
-|---|---|---|
-| Team-chosen human-readable RepositoryId | `repository add --repository-id FE`, exact-case Catalog tests, ADR-0001 and the fixed A/B oracle use one `FE` across different paths | PROVEN |
-| One-click local data reset without structural damage | #201 crash/rollback matrix plus the A/B oracle compare runtime, manifest, Agent configs and Skill bytes; active Git/Catalog/Context/Reference are empty and remote refs are byte-identical | PROVEN |
-| Setup from one existing remote Git address | #202 local-bare fixtures cover valid clone, immediate first append, empty/corrupt/auth/different URL rejection, rollback, URL redaction and offline idempotency | PROVEN |
-| Protected default branch synchronization | #203 tests observe only installation work-branch push refs, conflict rollback, append-only/full projection validation, branch recreation, read-only failure and bounded non-fast-forward retry | PROVEN |
-| Cross-install Context and EngineeringReference portability | `fixed_two_installation_team_sharing_and_local_reset_oracle` proves A-authored IDs survive default integration while B resolves `FE + src/shared-search.ts` through B's checkout and retrieves the same Context | PROVEN |
-| Explicit non-goals remain closed | Source/CLI/Hook/MCP audit shows no background networking, force/delete/default push, hosting-provider API, automatic PR, path-derived RepositoryId or automatic conflict resolution | PROVEN |
-| Atomic issue, commit and human gates | Mew #198–#204 messages/status plus commits `791aa34`, `5a8ad2f`, `41bfa33`, `7e0cea0`, `1c44dc7`, `30c0f01` and the #204 acceptance commit | PROVEN after final #204 commit/gate |
+The final exact-shape probe used Codex CLI `0.149.1`, `gpt-5.6-luna`, 8 parallel workers, ordinary MCP tool calling, 16 tools, and Checkpoint schema hash `fe13a5df7adc7e891236fedb519e58d52ec3c34ca4a1ea35bcbdf8cabe4eaa5a`. Codex `--approve-for-me` provided automatic approval in its workspace-write sandbox; the probe used no output schema, constrained decoding, or retry. It produced 99 accepted host Sessions out of 100, meeting the 99% charter threshold. All 99 actual first submissions used legal fields, returned `accepted` with `candidate_build.status=pending`, and produced 99 distinct operation IDs; forbidden field/validation errors, duplicate Checkpoint calls, and other tool calls were zero. Trial 023 reported the MCP tool unavailable and made zero calls, leaving zero residue. Knowledge Git was unchanged, and Capture paths/tables remained zero across the run.
 
-## Residue gates
+**POST-CHANGE CODEX MODEL-LOOP RESULT: PASSED — 99/100 host Sessions accepted and 99/99 submitted first calls were legal with the exact JSON-shape workflow guidance.** Raw probe artifacts remain under ignored `target/` output and are not committed.
 
-The M1–M3 gate searches product code, tests, fixtures, scripts, and docs (excluding build output and the user-owned `readme.md`) for:
+## Cursor contract evidence
 
-- the removed preferred-Space request/ranking field and CLI spelling;
-- removed Space ranking cursor fields and exact-Space match reason;
-- the removed Workspace-to-Space binding type and command surface;
-- the removed Context-Propose API/constructor spelling.
-- the removed task-text MCP bridge, bare-query Agent action, legacy Hook lookup helper, and non-Task automatic Context Pack CLI surface.
-- the removed textual TaskSignal channel/path that previously looked like an Engineering Graph edge.
-- the removed Repository auto-registration types, remote/declared/common-dir merge hints, and Hook `git rev-parse` discovery path;
-- caller-supplied RepositoryId, RepoRelativePath, ArtifactKey, Generation, Workspace, Hook or corroboration fields in `task_artifact_focus`.
-- persistent Focus records, Signal IDs, active/superseded Focus state, canonical Focus identities, Runtime Focus tables, and Focus fields in Task snapshots or fingerprints.
-- bare-string Capture IDs, raw transcript/command/tool-output fields in Capture/Observation state, or ownerless Capture ingestion;
-- Hook calls that open/checkpoint/ingest Episodes or derive Claims from summaries; implemented lifecycle automation may only advance ordered refs and close an already checkpointed Episode.
+Cursor evidence is currently deterministic contract/public-process evidence, not a model-loop measurement. Cursor adapter payload tests, sanitized lifecycle fixtures, repository-scoped public Hook/MCP wire tests, installer-generated configuration, and the installed-host process workflow validate decoding, Session admission, flat Checkpoint submission, queued recovery, Candidate Review, and SessionEnd isolation.
 
-Expected result: zero matches. Generic target-design language such as a proposed new Space Intent is not a Context-Propose API. `context_search` and its explicit `space_ids` hard filter are intentionally present.
+**POST-CHANGE CURSOR MODEL-LOOP RESULT: PENDING — no live Cursor model inference result is claimed.** Fixture profile/version fields are payload compatibility inputs, not evidence that the named model executed the workflow.
 
 ## Reproduction commands
 
 ```bash
-# Focused M1–M3 contracts
 cargo test --locked -p sctx-domain
-cargo test --locked -p sctx-search --test search_contract
-cargo test --locked -p sctx-mcp --test mcp_contract
-cargo test --locked -p sctx-mcp --test engineering_workflows
-cargo test --locked -p sctx-engineering-graph
-cargo test --locked -p sctx-local-state --test repository_catalog
-cargo test --locked -p sctx-task-runtime --test runtime_store
 cargo test --locked -p sctx-task-runtime --test work_episode_store
-cargo test --locked -p sctx-cli --test cli_contract
-cargo test --locked -p sctx-cli --test hook_fail_open
-cargo test --locked -p sctx-cli --test work_episode_capture
-cargo test --locked -p sctx-cli --test hook_session_activation
-cargo test --locked -p sctx-cli --test hook_repository_attribution
+cargo test --locked -p sctx-mcp --test mcp_contract
+cargo test --locked -p sctx-mcp --test checkpoint_ack_performance
+cargo test --locked -p sctx-cli --test direct_evidence_workflow
+cargo test --locked -p sctx-cli --test direct_relation_workflow
+cargo test --locked -p sctx-cli --test episode_lifecycle_hooks
+cargo test --locked -p sctx-cli --test installed_live_host_workflow
 cargo test --locked -p sctx-cli --test repository_scoped_activation_acceptance
 cargo test --locked -p sctx-cli --test repository_scoped_context_acceptance
-cargo test --locked -p sctx-cli --test milestone_one_contract
-cargo test --locked -p sctx-cli --test milestone_two_contract
-cargo test --locked -p sctx-cli --test milestone_three_contract
-cargo test --locked -p sctx-cli --test milestone_four_contract
-cargo test --locked -p sctx-cli --test captured_relation_workflow
 cargo test --locked -p sctx-cli --test retrieval_quality_workflow
-cargo test --locked -p sctx-cli --test hook_hot_path
-cargo test --locked -p sctx-cli --test installed_live_host_workflow
-cargo test --locked -p sctx-installer --test installer_matrix fixed_two_installation_team_sharing_and_local_reset_oracle
+cargo test --locked -p sctx-installer
+cargo test --locked -p sctx-installer --test installer_matrix
+python3 -B tests/scripts/codex_checkpoint_model_probe.py --trials 100 --parallelism 8
 
-# Required repository gates
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked
 (cd npm && npm test)
 ```
 
-Current repository gate results:
+## Residue gate
 
-- `cargo fmt --all -- --check`: passed.
-- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: passed with no warnings.
-- `cargo test --workspace --locked`: the #220 product-code run passed with no failed non-ignored test. The final #221 run compiled and passed the installed live-host test plus every preceding functional suite, but the existing `task_artifact_focus` performance assertion observed p95 1.50s under severe local scheduler/security-scanner pressure (250ms gate); a RAM-disk retry remained externally throttled. The threshold was not changed. Final human acceptance should require a normal-load rerun or explicitly accept this environmental gate exception.
-- `npm test`: 15 passed, 0 failed, 1 explicit Mew #195 skip.
-- Shared Context Skill `quick_validate.py`: passed (`Skill is valid!`).
-- Repository resolver p95: 3µs; Hook Repository mapping p95: 559µs; established-Session Artifact Focus p95: 123.989ms.
-- Release 100k-row warm Search p95: 42.172ms (`needle`), 45.421ms (`search_result_parser`), 43.601ms（中文检索）, 75.661ms（empty query）。
+The expected product result is zero Capture types, IDs, stores, ingestion tables, task tools, workflow steps, runtime directories, or metadata files. Allowed textual residue is limited to:
 
-The complete historical V1 storage, lifecycle, installer, adapter, and NPM regression coverage remains in the workspace suites. M1–M3 establish Task-first runtime retrieval and Engineering Graph truth. The hand-authored `fixtures/m4/fixed-oracle.json`, `fixtures/m5/repository-scoped-context-v1.json`, and `fixtures/team-sharing/team-sharing-v1.json`, Working Intent oracle, cross-platform M3 oracle, real Cursor/Codex Hook suites, privacy/performance contracts, and Builder/Review/Confirmation recovery tests close local lifecycle, Repository-scoped activation, and explicit team-sharing evidence without claiming background synchronization, automatic Pull Requests, billing-token measurement, physical MCP removal, or untracked-file scanning beyond accepted #150.
+- ADR-0003 and this report identifying the rejected/superseded design;
+- installer cleanup-only handling of legacy `state/capture`, `capture.lock`, and `capture-metadata.json`;
+- negative assertions proving those surfaces and files remain absent.
+
+No result in this report proves background synchronization, automatic Pull Requests, token billing reduction, physical MCP process removal, untracked-file scanning, or a Codex/Cursor model loop unless explicitly identified as such.

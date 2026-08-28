@@ -391,8 +391,11 @@ fn working_intent_document_language_is_current_and_bounded() {
         "**WorkingIntentSnapshot**:",
         "**TaskIntentRevision**:",
         "**TaskSignal**:",
+        "**DirectEvidenceDraft**:",
+        "**CheckpointOperation**:",
+        "**CandidateBuildOutbox**:",
         "**Evidence**:",
-        "it is not engineering Evidence",
+        "never engineering Evidence",
     ] {
         assert!(
             context.contains(required),
@@ -416,12 +419,12 @@ fn working_intent_document_language_is_current_and_bounded() {
             "Evidence 绑定 WorkObservation、CheckpointClaim、Candidate、ContextRevision 或 EngineeringReference"
         )
     );
-    assert!(development.contains("M4：Low-tax Capture"));
-    assert!(acceptance.contains("#136/#169"));
+    assert!(development.contains("M4：Direct Checkpoint / Candidate Review"));
+    assert!(acceptance.contains("Mew #226–#229"));
     assert!(
         development.contains("#164 固定 oracle")
             && technical.contains("#164 固定 oracle")
-            && acceptance.contains("final M4 Gate #164")
+            && acceptance.contains("direct_evidence_workflow")
     );
 
     let current_state = [context, development, technical, acceptance]
