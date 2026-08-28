@@ -171,18 +171,10 @@ fn contract() -> ScenarioDefinition {
                 object([
                     ("agent_kind", text("codex")),
                     ("external_session_id", session()),
-                    ("expected_task_id", variable("task-id")),
-                    (
-                        "expected_intent_revision_id",
-                        variable("intent-revision-id"),
-                    ),
-                    ("expected_episode_version", count(0)),
-                    ("boundary", text("close")),
                     (
                         "claims",
                         array([object([
-                            ("context_kind_hint", text("validation")),
-                            ("topic_key_hint", text("testing/resource-focus")),
+                            ("context_kind", text("validation")),
                             (
                                 "statement",
                                 text("The synthetic focus resource resolves through the graph"),
@@ -191,43 +183,15 @@ fn contract() -> ScenarioDefinition {
                                 "rationale",
                                 text("A fixed offline validation exercises the path"),
                             ),
-                            (
-                                "applicability",
-                                object([
-                                    ("domains", array([text("testing")])),
-                                    ("platforms", array([])),
-                                    ("conditions", array([])),
-                                ]),
-                            ),
-                            ("assumptions", array([])),
-                            (
-                                "recheck_when",
-                                array([text("the scenario protocol changes")]),
-                            ),
+                            ("conditions", array([])),
                             (
                                 "evidence",
                                 array([object([
-                                    ("kind", text("inline_validation")),
-                                    (
-                                        "evidence",
-                                        object([
-                                            ("kind", text("experiment_record")),
-                                            ("supports", text("the synthetic resource exists")),
-                                            ("content", object([("actual", text("passed"))])),
-                                            (
-                                                "interpretation",
-                                                text("the local test controls the resource"),
-                                            ),
-                                            (
-                                                "limitations",
-                                                array([text("synthetic offline fixture")]),
-                                            ),
-                                        ]),
-                                    ),
+                                    ("evidence_type", text("experiment_record")),
+                                    ("summary", text("the synthetic resource exists")),
+                                    ("limitations", array([text("synthetic offline fixture")])),
                                 ])]),
                             ),
-                            ("artifact_refs", array([])),
-                            ("related_contexts", array([])),
                         ])]),
                     ),
                     ("unknowns", array([])),

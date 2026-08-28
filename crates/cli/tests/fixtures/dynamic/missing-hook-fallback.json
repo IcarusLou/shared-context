@@ -41,34 +41,16 @@
       "action": {"type": "mcp_request", "method": "task_checkpoint", "params": {"type": "object", "fields": {
         "agent_kind": {"type": "string", "value": "codex"},
         "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
-        "expected_task_id": {"type": "variable", "name": "task-id"},
-        "expected_intent_revision_id": {"type": "variable", "name": "intent-revision-id"},
-        "expected_episode_version": {"type": "unsigned", "value": 0},
-        "boundary": {"type": "string", "value": "continue"},
         "claims": {"type": "array", "items": [{"type": "object", "fields": {
-          "context_kind_hint": {"type": "string", "value": "validation"},
-          "topic_key_hint": {"type": "string", "value": "testing/missing-hook"},
+          "context_kind": {"type": "string", "value": "validation"},
           "statement": {"type": "string", "value": "The empty close fallback preserves checkpoint content"},
           "rationale": {"type": "string", "value": "The explicit close follows a successful continue"},
-          "applicability": {"type": "object", "fields": {
-            "domains": {"type": "array", "items": [{"type": "string", "value": "testing"}]},
-            "platforms": {"type": "array", "items": []},
-            "conditions": {"type": "array", "items": []}
-          }},
-          "assumptions": {"type": "array", "items": []},
-          "recheck_when": {"type": "array", "items": [{"type": "string", "value": "the fallback contract changes"}]},
+          "conditions": {"type": "array", "items": []},
           "evidence": {"type": "array", "items": [{"type": "object", "fields": {
-            "kind": {"type": "string", "value": "inline_validation"},
-            "evidence": {"type": "object", "fields": {
-              "kind": {"type": "string", "value": "experiment_record"},
-              "supports": {"type": "string", "value": "the continue checkpoint completed"},
-              "content": {"type": "object", "fields": {"actual": {"type": "string", "value": "passed"}}},
-              "interpretation": {"type": "string", "value": "the checkpoint can be closed without retyping"},
-              "limitations": {"type": "array", "items": [{"type": "string", "value": "synthetic offline fixture"}]}
-            }}
-          }}]},
-          "artifact_refs": {"type": "array", "items": []},
-          "related_contexts": {"type": "array", "items": []}
+            "evidence_type": {"type": "string", "value": "experiment_record"},
+            "summary": {"type": "string", "value": "the checkpoint completed and closed directly"},
+            "limitations": {"type": "array", "items": [{"type": "string", "value": "synthetic offline fixture"}]}
+          }}]}
         }}]},
         "unknowns": {"type": "array", "items": []}
       }}}
@@ -92,10 +74,6 @@
       "action": {"type": "mcp_request", "method": "task_checkpoint", "params": {"type": "object", "fields": {
         "agent_kind": {"type": "string", "value": "codex"},
         "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
-        "expected_task_id": {"type": "variable", "name": "task-id"},
-        "expected_intent_revision_id": {"type": "variable", "name": "intent-revision-id"},
-        "expected_episode_version": {"type": "unsigned", "value": 1},
-        "boundary": {"type": "string", "value": "close"},
         "claims": {"type": "array", "items": []},
         "unknowns": {"type": "array", "items": []}
       }}}
@@ -117,13 +95,12 @@
     {"name": "task-id", "value_type": "task_id", "capture": {"step": "intent-new", "pointer": "/task_id"}},
     {"name": "intent-revision-id", "value_type": "intent_revision_id", "capture": {"step": "intent-new", "pointer": "/intent_revision_id"}},
     {"name": "episode-id", "value_type": "work_episode_id", "capture": {"step": "checkpoint-continue", "pointer": "/episode_id"}},
-    {"name": "built-candidate-id", "value_type": "candidate_id", "capture": {"step": "empty-close", "pointer": "/candidate_build/items/0/candidate_id"}},
+    {"name": "built-candidate-id", "value_type": "candidate_id", "capture": {"step": "checkpoint-continue", "pointer": "/candidate_build/items/0/candidate_id"}},
     {"name": "candidate-id", "value_type": "candidate_id", "capture": {"step": "candidate-get", "pointer": "/candidate_id"}},
     {"name": "candidate-episode-id", "value_type": "work_episode_id", "capture": {"step": "candidate-get", "pointer": "/source_episode/episode_id"}}
   ],
   "faults": [],
   "assertions": [
-    {"id": "open-before-fallback", "invariant": {"type": "open_episode_has_no_candidate", "episode": "episode-id", "episode_observation": "episode-observe", "candidate_observation": "candidate-zero"}},
     {"id": "fallback-candidate-source", "invariant": {"type": "candidate_source_episode", "response": "candidate-get", "candidate": "candidate-id", "episode": "candidate-episode-id"}}
   ],
   "events": [

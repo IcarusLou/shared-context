@@ -110,34 +110,16 @@
       "action": {"type": "mcp_request", "method": "task_checkpoint", "params": {"type": "object", "fields": {
         "agent_kind": {"type": "string", "value": "codex"},
         "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
-        "expected_task_id": {"type": "variable", "name": "task-id"},
-        "expected_intent_revision_id": {"type": "variable", "name": "revision-two"},
-        "expected_episode_version": {"type": "unsigned", "value": 0},
-        "boundary": {"type": "string", "value": "continue"},
         "claims": {"type": "array", "items": [{"type": "object", "fields": {
-          "context_kind_hint": {"type": "string", "value": "validation"},
-          "topic_key_hint": {"type": "string", "value": "testing/codex-normal"},
+          "context_kind": {"type": "string", "value": "validation"},
           "statement": {"type": "string", "value": "The synthetic focus resource resolves through the graph"},
           "rationale": {"type": "string", "value": "A fixed offline validation exercises the dynamic chain"},
-          "applicability": {"type": "object", "fields": {
-            "domains": {"type": "array", "items": [{"type": "string", "value": "testing"}]},
-            "platforms": {"type": "array", "items": []},
-            "conditions": {"type": "array", "items": []}
-          }},
-          "assumptions": {"type": "array", "items": []},
-          "recheck_when": {"type": "array", "items": [{"type": "string", "value": "the dynamic protocol changes"}]},
+          "conditions": {"type": "array", "items": []},
           "evidence": {"type": "array", "items": [{"type": "object", "fields": {
-            "kind": {"type": "string", "value": "inline_validation"},
-            "evidence": {"type": "object", "fields": {
-              "kind": {"type": "string", "value": "experiment_record"},
-              "supports": {"type": "string", "value": "the synthetic action completed"},
-              "content": {"type": "object", "fields": {"actual": {"type": "string", "value": "passed"}}},
-              "interpretation": {"type": "string", "value": "the scenario controls the observation"},
-              "limitations": {"type": "array", "items": [{"type": "string", "value": "synthetic offline fixture"}]}
-            }}
-          }}]},
-          "artifact_refs": {"type": "array", "items": []},
-          "related_contexts": {"type": "array", "items": []}
+            "evidence_type": {"type": "string", "value": "experiment_record"},
+            "summary": {"type": "string", "value": "the synthetic action completed"},
+            "limitations": {"type": "array", "items": [{"type": "string", "value": "synthetic offline fixture"}]}
+          }}]}
         }}]},
         "unknowns": {"type": "array", "items": []}
       }}}
@@ -283,7 +265,6 @@
     {"id": "active-task", "invariant": {"type": "active_task_per_session", "observation": "active-observe", "session": "session", "task": "task-id"}},
     {"id": "same-revision", "invariant": {"type": "canonical_continue_keeps_revision", "first_revision": "revision-one", "retry_revision": "revision-retry"}},
     {"id": "stale-zero-write", "invariant": {"type": "stale_cas_zero_writes", "attempt": "stale-attempt", "before_observation": "semantic-before", "after_observation": "semantic-after"}},
-    {"id": "open-no-candidate", "invariant": {"type": "open_episode_has_no_candidate", "episode": "episode-id", "episode_observation": "episode-observe", "candidate_observation": "candidate-zero"}},
     {"id": "candidate-source", "invariant": {"type": "candidate_source_episode", "response": "candidate-get", "candidate": "candidate-id", "episode": "candidate-episode-id"}},
     {"id": "candidate-not-injected", "invariant": {"type": "candidate_is_not_auto_injected", "candidate": "candidate-id", "response": "context-before-confirm"}},
     {"id": "confirmation-five", "invariant": {"type": "confirmation_is_atomic", "confirmation": "confirmation-id", "response": "candidate-confirm", "event_count": "five"}},

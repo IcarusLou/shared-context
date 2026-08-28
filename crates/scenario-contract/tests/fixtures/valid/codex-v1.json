@@ -59,9 +59,10 @@
         "params": {
           "type": "object",
           "fields": {
-            "task_id": { "type": "variable", "name": "task-id" },
-            "intent_revision_id": { "type": "variable", "name": "intent-revision-id" },
-            "boundary": { "type": "string", "value": "continue" }
+            "agent_kind": { "type": "string", "value": "codex" },
+            "external_session_id": { "type": "builtin", "builtin": { "type": "actor_session_key", "actor": "session" } },
+            "claims": { "type": "array", "items": [] },
+            "unknowns": { "type": "array", "items": [] }
           }
         }
       }

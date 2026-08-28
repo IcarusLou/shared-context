@@ -41,34 +41,16 @@
       "action": {"type": "mcp_request", "method": "task_checkpoint", "params": {"type": "object", "fields": {
         "agent_kind": {"type": "string", "value": "codex"},
         "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
-        "expected_task_id": {"type": "variable", "name": "task-id"},
-        "expected_intent_revision_id": {"type": "variable", "name": "intent-revision-id"},
-        "expected_episode_version": {"type": "unsigned", "value": 0},
-        "boundary": {"type": "string", "value": "continue"},
         "claims": {"type": "array", "items": [{"type": "object", "fields": {
-          "context_kind_hint": {"type": "string", "value": "validation"},
-          "topic_key_hint": {"type": "string", "value": "testing/precompact"},
+          "context_kind": {"type": "string", "value": "validation"},
           "statement": {"type": "string", "value": "Synthetic compaction closes the checkpointed episode"},
           "rationale": {"type": "string", "value": "The lifecycle Hook follows the explicit checkpoint"},
-          "applicability": {"type": "object", "fields": {
-            "domains": {"type": "array", "items": [{"type": "string", "value": "testing"}]},
-            "platforms": {"type": "array", "items": []},
-            "conditions": {"type": "array", "items": []}
-          }},
-          "assumptions": {"type": "array", "items": []},
-          "recheck_when": {"type": "array", "items": [{"type": "string", "value": "the compaction protocol changes"}]},
+          "conditions": {"type": "array", "items": []},
           "evidence": {"type": "array", "items": [{"type": "object", "fields": {
-            "kind": {"type": "string", "value": "inline_validation"},
-            "evidence": {"type": "object", "fields": {
-              "kind": {"type": "string", "value": "experiment_record"},
-              "supports": {"type": "string", "value": "the checkpoint was written"},
-              "content": {"type": "object", "fields": {"actual": {"type": "string", "value": "passed"}}},
-              "interpretation": {"type": "string", "value": "the fixed lifecycle is reproducible"},
-              "limitations": {"type": "array", "items": [{"type": "string", "value": "synthetic offline fixture"}]}
-            }}
-          }}]},
-          "artifact_refs": {"type": "array", "items": []},
-          "related_contexts": {"type": "array", "items": []}
+            "evidence_type": {"type": "string", "value": "experiment_record"},
+            "summary": {"type": "string", "value": "the checkpoint was written and closed"},
+            "limitations": {"type": "array", "items": [{"type": "string", "value": "synthetic offline fixture"}]}
+          }}]}
         }}]},
         "unknowns": {"type": "array", "items": []}
       }}}
@@ -126,34 +108,16 @@
       "action": {"type": "mcp_request", "method": "task_checkpoint", "params": {"type": "object", "fields": {
         "agent_kind": {"type": "string", "value": "codex"},
         "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
-        "expected_task_id": {"type": "variable", "name": "task-id"},
-        "expected_intent_revision_id": {"type": "variable", "name": "intent-revision-id"},
-        "expected_episode_version": {"type": "unsigned", "value": 0},
-        "boundary": {"type": "string", "value": "continue"},
         "claims": {"type": "array", "items": [{"type": "object", "fields": {
-          "context_kind_hint": {"type": "string", "value": "validation"},
-          "topic_key_hint": {"type": "string", "value": "testing/resume"},
+          "context_kind": {"type": "string", "value": "validation"},
           "statement": {"type": "string", "value": "Resume creates Episode two without changing Task"},
           "rationale": {"type": "string", "value": "The different checkpoint follows a closed Episode"},
-          "applicability": {"type": "object", "fields": {
-            "domains": {"type": "array", "items": [{"type": "string", "value": "testing"}]},
-            "platforms": {"type": "array", "items": []},
-            "conditions": {"type": "array", "items": []}
-          }},
-          "assumptions": {"type": "array", "items": []},
-          "recheck_when": {"type": "array", "items": [{"type": "string", "value": "the Episode retry boundary changes"}]},
+          "conditions": {"type": "array", "items": []},
           "evidence": {"type": "array", "items": [{"type": "object", "fields": {
-            "kind": {"type": "string", "value": "inline_validation"},
-            "evidence": {"type": "object", "fields": {
-              "kind": {"type": "string", "value": "experiment_record"},
-              "supports": {"type": "string", "value": "Episode two was written through MCP"},
-              "content": {"type": "object", "fields": {"actual": {"type": "string", "value": "passed"}}},
-              "interpretation": {"type": "string", "value": "the closed parent is not mistaken for a retry"},
-              "limitations": {"type": "array", "items": [{"type": "string", "value": "synthetic offline fixture"}]}
-            }}
-          }}]},
-          "artifact_refs": {"type": "array", "items": []},
-          "related_contexts": {"type": "array", "items": []}
+            "evidence_type": {"type": "string", "value": "experiment_record"},
+            "summary": {"type": "string", "value": "Episode two was written through MCP"},
+            "limitations": {"type": "array", "items": [{"type": "string", "value": "synthetic offline fixture"}]}
+          }}]}
         }}]},
         "unknowns": {"type": "array", "items": []}
       }}}
@@ -199,15 +163,10 @@
       "action": {"type": "mcp_request", "method": "task_checkpoint", "params": {"type": "object", "fields": {
         "agent_kind": {"type": "string", "value": "codex"},
         "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
-        "expected_task_id": {"type": "variable", "name": "task-id"},
-        "expected_intent_revision_id": {"type": "variable", "name": "intent-revision-id"},
-        "expected_episode_version": {"type": "unsigned", "value": 0},
-        "boundary": {"type": "string", "value": "continue"},
         "claims": {"type": "array", "items": []},
         "unknowns": {"type": "array", "items": [{"type": "object", "fields": {
           "statement": {"type": "string", "value": "the third synthetic Episode remains open"},
-          "blocking": {"type": "boolean", "value": false},
-          "recheck_when": {"type": "array", "items": [{"type": "string", "value": "the resumed work completes"}]}
+          "blocking": {"type": "boolean", "value": false}
         }}]}
       }}}
     },
@@ -260,9 +219,7 @@
   "assertions": [
     {"id": "same-active-task-after-resume", "invariant": {"type": "active_task_per_session", "observation": "active-after-resume", "session": "session", "task": "task-id"}},
     {"id": "first-candidate-source", "invariant": {"type": "candidate_source_episode", "response": "candidate-get", "candidate": "candidate-id", "episode": "episode-one-id"}},
-    {"id": "resumed-open-no-candidate", "invariant": {"type": "open_episode_has_no_candidate", "episode": "episode-two-id", "episode_observation": "episode-two-observe", "candidate_observation": "candidate-two-zero"}},
-    {"id": "second-candidate-source", "invariant": {"type": "candidate_source_episode", "response": "candidate-get-two", "candidate": "candidate-two-id", "episode": "candidate-two-episode-id"}},
-    {"id": "third-open-no-candidate", "invariant": {"type": "open_episode_has_no_candidate", "episode": "episode-three-id", "episode_observation": "episode-three-observe", "candidate_observation": "candidate-three-zero"}}
+    {"id": "second-candidate-source", "invariant": {"type": "candidate_source_episode", "response": "candidate-get-two", "candidate": "candidate-two-id", "episode": "candidate-two-episode-id"}}
   ],
   "events": [
     {"event": "PreCompact", "classification": "supported", "product_action": "pre_compact"},

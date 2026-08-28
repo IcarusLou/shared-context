@@ -76,15 +76,10 @@
       "action": {"type": "mcp_request", "method": "task_checkpoint", "params": {"type": "object", "fields": {
         "agent_kind": {"type": "string", "value": "cursor"},
         "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session-a"}},
-        "expected_task_id": {"type": "variable", "name": "task-a-id"},
-        "expected_intent_revision_id": {"type": "variable", "name": "revision-a-id"},
-        "expected_episode_version": {"type": "unsigned", "value": 0},
-        "boundary": {"type": "string", "value": "continue"},
         "claims": {"type": "array", "items": []},
         "unknowns": {"type": "array", "items": [{"type": "object", "fields": {
           "statement": {"type": "string", "value": "session A remains independently open"},
-          "blocking": {"type": "boolean", "value": false},
-          "recheck_when": {"type": "array", "items": [{"type": "string", "value": "session A completes"}]}
+          "blocking": {"type": "boolean", "value": false}
         }}]}
       }}}
     },
@@ -93,34 +88,16 @@
       "action": {"type": "mcp_request", "method": "task_checkpoint", "params": {"type": "object", "fields": {
         "agent_kind": {"type": "string", "value": "cursor"},
         "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session-b"}},
-        "expected_task_id": {"type": "variable", "name": "task-b-id"},
-        "expected_intent_revision_id": {"type": "variable", "name": "revision-b-id"},
-        "expected_episode_version": {"type": "unsigned", "value": 0},
-        "boundary": {"type": "string", "value": "continue"},
         "claims": {"type": "array", "items": [{"type": "object", "fields": {
-          "context_kind_hint": {"type": "string", "value": "validation"},
-          "topic_key_hint": {"type": "string", "value": "testing/dual-session"},
+          "context_kind": {"type": "string", "value": "validation"},
           "statement": {"type": "string", "value": "Session B closes without changing session A"},
           "rationale": {"type": "string", "value": "Each actor owns an independent persistent protocol child"},
-          "applicability": {"type": "object", "fields": {
-            "domains": {"type": "array", "items": [{"type": "string", "value": "testing"}]},
-            "platforms": {"type": "array", "items": []},
-            "conditions": {"type": "array", "items": []}
-          }},
-          "assumptions": {"type": "array", "items": []},
-          "recheck_when": {"type": "array", "items": [{"type": "string", "value": "the session ownership contract changes"}]},
+          "conditions": {"type": "array", "items": []},
           "evidence": {"type": "array", "items": [{"type": "object", "fields": {
-            "kind": {"type": "string", "value": "inline_validation"},
-            "evidence": {"type": "object", "fields": {
-              "kind": {"type": "string", "value": "experiment_record"},
-              "supports": {"type": "string", "value": "the session B checkpoint completed"},
-              "content": {"type": "object", "fields": {"actual": {"type": "string", "value": "passed"}}},
-              "interpretation": {"type": "string", "value": "the two session actors retain separate identities"},
-              "limitations": {"type": "array", "items": [{"type": "string", "value": "synthetic offline fixture"}]}
-            }}
-          }}]},
-          "artifact_refs": {"type": "array", "items": []},
-          "related_contexts": {"type": "array", "items": []}
+            "evidence_type": {"type": "string", "value": "experiment_record"},
+            "summary": {"type": "string", "value": "the session B checkpoint completed"},
+            "limitations": {"type": "array", "items": [{"type": "string", "value": "synthetic offline fixture"}]}
+          }}]}
         }}]},
         "unknowns": {"type": "array", "items": []}
       }}}
@@ -190,8 +167,6 @@
   "assertions": [
     {"id": "active-a-isolated", "invariant": {"type": "active_task_per_session", "observation": "active-a", "session": "session-a", "task": "task-a-id"}},
     {"id": "active-b-isolated", "invariant": {"type": "active_task_per_session", "observation": "active-b", "session": "session-b", "task": "task-b-id"}},
-    {"id": "session-end-a-keeps-open", "invariant": {"type": "session_end_does_not_close_episode", "session_end": "session-end-a", "observation": "episode-a-observe", "episode": "episode-a-id"}},
-    {"id": "session-a-open-no-candidate", "invariant": {"type": "open_episode_has_no_candidate", "episode": "episode-a-id", "episode_observation": "episode-a-observe", "candidate_observation": "candidate-a-zero"}},
     {"id": "session-b-candidate-source", "invariant": {"type": "candidate_source_episode", "response": "candidate-get-b", "candidate": "candidate-b-id", "episode": "candidate-b-episode-id"}}
   ],
   "events": [

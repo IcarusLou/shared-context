@@ -66,34 +66,16 @@
       "action": {"type": "mcp_request", "method": "task_checkpoint", "params": {"type": "object", "fields": {
         "agent_kind": {"type": "string", "value": "cursor"},
         "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
-        "expected_task_id": {"type": "variable", "name": "task-id"},
-        "expected_intent_revision_id": {"type": "variable", "name": "intent-revision-id"},
-        "expected_episode_version": {"type": "unsigned", "value": 0},
-        "boundary": {"type": "string", "value": "continue"},
         "claims": {"type": "array", "items": [{"type": "object", "fields": {
-          "context_kind_hint": {"type": "string", "value": "contract"},
-          "topic_key_hint": {"type": "string", "value": "cursor-synthetic-contract"},
+          "context_kind": {"type": "string", "value": "contract"},
           "statement": {"type": "string", "value": "Cursor synthetic contract validation passed"},
           "rationale": {"type": "string", "value": "The deterministic offline scenario completed"},
-          "applicability": {"type": "object", "fields": {
-            "domains": {"type": "array", "items": [{"type": "string", "value": "cursor-synthetic-contract"}]},
-            "platforms": {"type": "array", "items": []},
-            "conditions": {"type": "array", "items": []}
-          }},
-          "assumptions": {"type": "array", "items": []},
-          "recheck_when": {"type": "array", "items": [{"type": "string", "value": "the Cursor protocol changes"}]},
+          "conditions": {"type": "array", "items": []},
           "evidence": {"type": "array", "items": [{"type": "object", "fields": {
-            "kind": {"type": "string", "value": "inline_validation"},
-            "evidence": {"type": "object", "fields": {
-              "kind": {"type": "string", "value": "experiment_record"},
-              "supports": {"type": "string", "value": "the Cursor path completed"},
-              "content": {"type": "object", "fields": {"actual": {"type": "string", "value": "passed"}}},
-              "interpretation": {"type": "string", "value": "the fixed input is reproducible"},
-              "limitations": {"type": "array", "items": [{"type": "string", "value": "synthetic offline fixture"}]}
-            }}
-          }}]},
-          "artifact_refs": {"type": "array", "items": []},
-          "related_contexts": {"type": "array", "items": []}
+            "evidence_type": {"type": "string", "value": "experiment_record"},
+            "summary": {"type": "string", "value": "the Cursor path completed"},
+            "limitations": {"type": "array", "items": [{"type": "string", "value": "synthetic offline fixture"}]}
+          }}]}
         }}]},
         "unknowns": {"type": "array", "items": []}
       }}}

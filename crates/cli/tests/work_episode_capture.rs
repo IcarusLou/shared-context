@@ -7,7 +7,7 @@ use std::{
 };
 
 use sctx_domain::{
-    Applicability, ContextKind, ExternalSessionLocator, NormalizedBreadcrumbKind,
+    ContextKind, EvidenceType, ExternalSessionLocator, NormalizedBreadcrumbKind,
     NormalizedWorkObservation, TaskId, WorkSourceRef, WorkingIntentSnapshot,
 };
 use sctx_git_store::GitStore;
@@ -15,9 +15,8 @@ use sctx_local_state::{
     CaptureClaim, CaptureDiagnosticKind, CaptureStore, UserConfigStore, map_capture_artifacts,
 };
 use sctx_mcp::{
-    CandidateGetInput, TaskCheckpointBoundary, TaskCheckpointClaimInput,
-    TaskCheckpointEvidenceInput, TaskCheckpointInput, candidate_get_at_root,
-    task_checkpoint_at_root,
+    CandidateGetInput, TaskCheckpointClaimInput, TaskCheckpointEvidenceInput, TaskCheckpointInput,
+    candidate_get_at_root, task_checkpoint_at_root,
 };
 use sctx_task_runtime::{CaptureIngestion, TaskRuntime, WorkEpisodeDiagnosticKind};
 use serde_json::{Value, json};
@@ -469,36 +468,29 @@ fn hook_capture_keeps_locator_then_explicit_claim_and_ingestion_are_verifiable()
         &TaskCheckpointInput {
             agent_kind: "codex".to_owned(),
             external_session_id: "capture-owned".to_owned(),
-            expected_task_id: active.task_id.to_string(),
-            expected_intent_revision_id: task_owner.intent_revision_id.to_string(),
-            expected_episode_version: 2,
-            boundary: TaskCheckpointBoundary::Close,
             claims: vec![TaskCheckpointClaimInput {
-                context_kind_hint: Some(ContextKind::Validation),
-                topic_key_hint: None,
+                context_kind: ContextKind::Validation,
                 statement:
                     "The unregistered investigation completed with bounded non-locating meaning"
                         .to_owned(),
-                rationale: "The Agent explicitly cites its owned normalized Observation".to_owned(),
-                applicability: Applicability {
-                    domains: vec!["testing".to_owned()],
-                    platforms: Vec::new(),
-                    conditions: vec!["target Repository remains unregistered".to_owned()],
-                },
-                assumptions: Vec::new(),
-                recheck_when: vec!["the target Repository is registered".to_owned()],
-                evidence: vec![TaskCheckpointEvidenceInput::Observation {
-                    observation_id: sibling_ingested.observation_id.to_string(),
+                rationale: "The Agent submits focused non-locating Evidence".to_owned(),
+                conditions: vec!["target Repository remains unregistered".to_owned()],
+                evidence: vec![TaskCheckpointEvidenceInput {
+                    evidence_type: EvidenceType::ExperimentRecord,
+                    summary: "The bounded investigation completed without a stable Artifact identity"
+                        .to_owned(),
+                    limitations: vec![
+                        "Only Agent-attested engineering meaning is preserved; raw Hook data is excluded"
+                            .to_owned(),
+                    ],
                 }],
-                artifact_refs: Vec::new(),
-                relations: Vec::new(),
-                engineering_references: Vec::new(),
-                related_contexts: Vec::new(),
             }],
             unknowns: Vec::new(),
         },
     )
-    .unwrap();
+    .unwrap()
+    .into_accepted()
+    .expect("nonempty Checkpoint must be accepted");
     let candidate_id = checkpoint.candidate_build.as_ref().unwrap().items[0]
         .candidate_id
         .unwrap();
@@ -515,7 +507,7 @@ fn hook_capture_keeps_locator_then_explicit_claim_and_ingestion_are_verifiable()
     assert_eq!(
         review.content.evidence[0].limitations,
         vec![
-            "Only normalized engineering meaning is preserved; the raw Capture payload is excluded"
+            "Only Agent-attested engineering meaning is preserved; raw Hook data is excluded"
                 .to_owned()
         ]
     );
@@ -540,7 +532,7 @@ fn hook_capture_keeps_locator_then_explicit_claim_and_ingestion_are_verifiable()
         .verify_source_episode(opened.episode.episode_id)
         .unwrap()
         .unwrap();
-    assert_eq!(verified.observation_count, 2);
+    assert_eq!(verified.observation_count, 3);
     assert!(
         runtime
             .read_work_episode(opened.episode.episode_id)
@@ -553,7 +545,7 @@ fn hook_capture_keeps_locator_then_explicit_claim_and_ingestion_are_verifiable()
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn public_mcp_lists_and_ingests_owned_capture_into_candidate_evidence() {
+fn public_mcp_lists_capture_but_checkpoint_uses_direct_agent_evidence() {
     let harness = Harness::new();
     GitStore::bootstrap_local(harness.root()).unwrap();
     let repository = git_repo(&harness.home.join("public capture/repo"));
@@ -586,9 +578,11 @@ fn public_mcp_lists_and_ingests_owned_capture_into_candidate_evidence() {
             }),
         ),
     ]);
-    let task = &started[1]["result"]["structuredContent"];
-    let task_id = task["task_id"].as_str().unwrap();
-    let intent_revision_id = task["intent_revision_id"].as_str().unwrap();
+    assert!(
+        started[1]["result"]["structuredContent"]["task_id"]
+            .as_str()
+            .is_some()
+    );
 
     let raw = "RAW_PUBLIC_CAPTURE_PAYLOAD_MUST_NOT_PERSIST";
     assert_eq!(
@@ -625,20 +619,16 @@ fn public_mcp_lists_and_ingests_owned_capture_into_candidate_evidence() {
     let checkpoint_arguments = json!({
         "agent_kind": "codex",
         "external_session_id": session,
-        "expected_task_id": task_id,
-        "expected_intent_revision_id": intent_revision_id,
-        "expected_episode_version": 0,
-        "boundary": "close",
         "claims": [{
-            "context_kind_hint": "validation",
-            "statement": "A real Hook Capture can support a reviewed Candidate",
-            "rationale": "The Agent explicitly selected its owned normalized Capture",
-            "applicability": {"domains": ["capture"], "platforms": [], "conditions": []},
-            "assumptions": [],
-            "recheck_when": ["the Capture evidence contract changes"],
-            "evidence": [{"kind": "capture", "capture_id": capture_id}],
-            "artifact_refs": [],
-            "related_contexts": []
+            "context_kind": "validation",
+            "statement": "A focused investigation can support a reviewed Candidate",
+            "rationale": "The Agent authors the high-value conclusion directly",
+            "conditions": [],
+            "evidence": [{
+                "evidence_type": "experiment_record",
+                "summary": "The focused public MCP investigation passed",
+                "limitations": ["Hook Capture remains diagnostic and is not Candidate Evidence"]
+            }]
         }],
         "unknowns": []
     });
@@ -668,10 +658,11 @@ fn public_mcp_lists_and_ingests_owned_capture_into_candidate_evidence() {
     ]);
     let checkpoint = &checkpoint[1]["result"]["structuredContent"];
     assert_eq!(checkpoint["created"], true);
-    assert_eq!(checkpoint["episode_version"], 2);
-    assert_eq!(checkpoint["diagnostics"][0]["kind"], "capture_ingested");
-    assert_eq!(checkpoint["diagnostics"][0]["capture_id"], capture_id);
-    assert_eq!(checkpoint["diagnostics"][0]["inserted"], true);
+    assert_eq!(checkpoint["episode_version"], 1);
+    assert_eq!(
+        checkpoint["diagnostics"][0]["kind"],
+        "inline_validation_recorded"
+    );
     let candidate_id = checkpoint["candidate_build"]["items"][0]["candidate_id"]
         .as_str()
         .unwrap();
@@ -683,9 +674,8 @@ fn public_mcp_lists_and_ingests_owned_capture_into_candidate_evidence() {
             "task_capture_list",
             json!({"agent_kind": "codex", "external_session_id": session}),
         ),
-        tool_call(12, "task_checkpoint", checkpoint_arguments.clone()),
         tool_call(
-            13,
+            12,
             "candidate_get",
             json!({
                 "agent_kind": "codex",
@@ -695,59 +685,15 @@ fn public_mcp_lists_and_ingests_owned_capture_into_candidate_evidence() {
         ),
     ]);
     assert!(
-        after[1]["result"]["structuredContent"]["captures"]
+        !after[1]["result"]["structuredContent"]["captures"]
             .as_array()
             .unwrap()
             .is_empty()
     );
-    assert_eq!(after[2]["result"]["structuredContent"]["created"], false);
-    assert_eq!(
-        after[2]["result"]["structuredContent"]["diagnostics"][0]["inserted"],
-        false
-    );
-    let review = &after[3]["result"]["structuredContent"];
+    let review = &after[2]["result"]["structuredContent"];
     assert_eq!(review["content"]["evidence"].as_array().unwrap().len(), 1);
     let review_text = serde_json::to_string(review).unwrap();
-    assert!(review_text.contains("Only normalized engineering meaning is preserved"));
+    assert!(review_text.contains("Hook Capture remains diagnostic"));
     assert!(!review_text.contains(raw));
     assert!(!review_text.contains(repository.to_str().unwrap()));
-
-    let switched = harness.mcp(&[
-        initialize(14),
-        tool_call(
-            15,
-            "task_intent_update",
-            json!({
-                "agent_kind": "codex",
-                "external_session_id": session,
-                "task_boundary": "new",
-                "expected_revision_id": intent_revision_id,
-                "intent": {"goal": "Start a distinct Task after Capture ingestion"}
-            }),
-        ),
-    ]);
-    let next_task = &switched[1]["result"]["structuredContent"];
-    let mut cross_task = checkpoint_arguments;
-    cross_task["expected_task_id"] = next_task["task_id"].clone();
-    cross_task["expected_intent_revision_id"] = next_task["intent_revision_id"].clone();
-    let rejected = harness.mcp(&[
-        initialize(16),
-        tool_call(
-            17,
-            "task_capture_list",
-            json!({"agent_kind": "codex", "external_session_id": session}),
-        ),
-        tool_call(18, "task_checkpoint", cross_task),
-    ]);
-    assert!(
-        rejected[1]["result"]["structuredContent"]["captures"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(rejected[2]["result"]["isError"], true);
-    assert_eq!(
-        rejected[2]["result"]["structuredContent"]["error"]["code"],
-        "invalid_input"
-    );
 }

@@ -11,7 +11,7 @@ use std::{
 
 use sctx_agent_adapter::SHARED_CONTEXT_ACTIVATION_MARKER;
 use sctx_domain::{
-    Applicability, CaptureUnknown, ContextKind, ContextRevisionDraft, Error, ErrorKind, EventId,
+    Applicability, ContextKind, ContextRevisionDraft, Error, ErrorKind, EventId,
     EvidenceSnapshotDraft, ExternalSessionLocator, IntentSnapshot, PublicationAction,
     PublicationDraft, Result, SpaceId, SubmissionId, TaskSignalKind, WorkEpisodeId,
     WorkingIntentSnapshot,
@@ -24,8 +24,8 @@ use sctx_git_store::{
 use sctx_index::ProjectionIndex;
 use sctx_local_state::{MaintenanceLock, UserConfigStore};
 use sctx_mcp::{
-    ExpectedRevisionId, TaskBoundary, TaskCheckpointBoundary, TaskCheckpointClaimInput,
-    TaskCheckpointEvidenceInput, TaskCheckpointInput, TaskIntentUpdateInput,
+    ExpectedRevisionId, TaskBoundary, TaskCheckpointClaimInput, TaskCheckpointEvidenceInput,
+    TaskCheckpointInput, TaskCheckpointUnknownInput, TaskIntentUpdateInput,
     task_checkpoint_at_root, task_intent_update_at_root,
 };
 use sctx_task_runtime::TaskRuntime;
@@ -235,7 +235,7 @@ struct CandidateOwner {
 }
 
 fn closed_candidate_owner(harness: &Harness, session: &str) -> CandidateOwner {
-    let task = task_intent_update_at_root(
+    let _task = task_intent_update_at_root(
         harness.root(),
         &TaskIntentUpdateInput {
             agent_kind: "codex".to_owned(),
@@ -263,19 +263,16 @@ fn closed_candidate_owner(harness: &Harness, session: &str) -> CandidateOwner {
         &TaskCheckpointInput {
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
-            expected_task_id: task.context.task_id.to_string(),
-            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
-            expected_episode_version: 0,
-            boundary: TaskCheckpointBoundary::Close,
             claims: Vec::new(),
-            unknowns: vec![CaptureUnknown {
+            unknowns: vec![TaskCheckpointUnknownInput {
                 statement: "Candidate confirmation remains outside creation".to_owned(),
                 blocking: false,
-                recheck_when: Vec::new(),
             }],
         },
     )
-    .unwrap();
+    .unwrap()
+    .into_accepted()
+    .expect("unknown-only Checkpoint must be accepted");
     CandidateOwner {
         source_episode_id: closed.episode_id,
     }
@@ -1804,37 +1801,24 @@ fn twenty_cli_processes_confirm_one_review_in_one_atomic_commit() {
         &TaskCheckpointInput {
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
-            expected_task_id: task.context.task_id.to_string(),
-            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
-            expected_episode_version: 0,
-            boundary: TaskCheckpointBoundary::Close,
             claims: vec![TaskCheckpointClaimInput {
-                context_kind_hint: Some(ContextKind::Decision),
-                topic_key_hint: Some("cli/confirmation".to_owned()),
+                context_kind: ContextKind::Decision,
                 statement: "CLI processes share one Confirmation operation".to_owned(),
                 rationale: "The Writer lock and Runtime reservation converge".to_owned(),
-                applicability: Applicability::default(),
-                assumptions: Vec::new(),
-                recheck_when: Vec::new(),
-                evidence: vec![TaskCheckpointEvidenceInput::InlineValidation {
-                    evidence: EvidenceSnapshotDraft {
-                        kind: sctx_domain::EvidenceType::ExperimentRecord,
-                        supports: "The CLI confirmation fixture passed".to_owned(),
-                        content: serde_json::json!({"actual": "passed"}),
-                        interpretation: "The Candidate is confirmable".to_owned(),
-                        limitations: Vec::new(),
-                    },
+                conditions: Vec::new(),
+                evidence: vec![TaskCheckpointEvidenceInput {
+                    evidence_type: sctx_domain::EvidenceType::ExperimentRecord,
+                    summary: "The CLI confirmation fixture passed".to_owned(),
+                    limitations: Vec::new(),
                 }],
-                artifact_refs: Vec::new(),
-                relations: Vec::new(),
-                engineering_references: Vec::new(),
-                related_contexts: Vec::new(),
             }],
             unknowns: Vec::new(),
         },
     )
-    .unwrap();
-    let candidate_id = closed.candidate_build.unwrap().items[0]
+    .unwrap()
+    .into_accepted()
+    .expect("nonempty Checkpoint must be accepted");
+    let candidate_id = closed.candidate_build.as_ref().unwrap().items[0]
         .candidate_id
         .unwrap();
     let input_path = harness.home.join("candidate-confirm.json");
@@ -2064,28 +2048,16 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
         serde_json::to_vec(&serde_json::json!({
             "agent_kind": "codex",
             "external_session_id": "cli-authoritative",
-            "expected_task_id": updated["data"]["task_id"],
-            "expected_intent_revision_id": updated["data"]["intent_revision_id"],
-            "expected_episode_version": 0,
-            "boundary": "continue",
             "claims": [{
+                "context_kind": "validation",
                 "statement": "The CLI Checkpoint completed",
                 "rationale": "The strict JSON entry called the shared MCP workflow",
-                "applicability": {"domains": ["cli"], "platforms": [], "conditions": ["checkpoint"]},
-                "assumptions": [],
-                "recheck_when": ["the CLI contract changes"],
+                "conditions": ["checkpoint"],
                 "evidence": [{
-                    "kind": "inline_validation",
-                    "evidence": {
-                        "kind": "experiment_record",
-                        "supports": "the CLI returned a Checkpoint",
-                        "content": {"command": "task.checkpoint", "actual": "success"},
-                        "interpretation": "the explicit workflow is executable",
-                        "limitations": []
-                    }
-                }],
-                "artifact_refs": [],
-                "related_contexts": []
+                    "evidence_type": "experiment_record",
+                    "summary": "the CLI returned a Checkpoint",
+                    "limitations": []
+                }]
             }],
             "unknowns": []
         }))
@@ -2102,43 +2074,7 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
     assert_eq!(checkpoint["data"]["created"], true);
     assert_eq!(checkpoint["data"]["episode_version"], 1);
     assert!(text(&checkpoint, "checkpoint_id").starts_with("ckp_"));
-    let retried_checkpoint = harness.success(&[
-        "task",
-        "checkpoint",
-        "--input",
-        checkpoint_path.to_str().unwrap(),
-    ]);
-    assert_eq!(retried_checkpoint["data"]["created"], false);
-    assert_eq!(
-        retried_checkpoint["data"]["checkpoint_id"],
-        checkpoint["data"]["checkpoint_id"]
-    );
-    let close_path = harness.home.join("task-checkpoint-close.json");
-    fs::write(
-        &close_path,
-        serde_json::to_vec(&serde_json::json!({
-            "agent_kind": "codex",
-            "external_session_id": "cli-authoritative",
-            "expected_task_id": updated["data"]["task_id"],
-            "expected_intent_revision_id": updated["data"]["intent_revision_id"],
-            "expected_episode_version": 1,
-            "boundary": "close",
-            "claims": [],
-            "unknowns": [{
-                "statement": "Candidate confirmation remains separate",
-                "blocking": false,
-                "recheck_when": []
-            }]
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    let closed = harness.success(&[
-        "task",
-        "checkpoint",
-        "--input",
-        close_path.to_str().unwrap(),
-    ]);
+    let closed = checkpoint;
     assert_eq!(closed["data"]["candidate_build"]["status"], "complete");
     assert_eq!(
         closed["data"]["candidate_build"]["items"][0]["status"],
