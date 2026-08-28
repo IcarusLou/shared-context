@@ -17,14 +17,14 @@ use std::{
 };
 
 use sctx_domain::{
-    AgentCheckpointId, Applicability, ArtifactKey, ArtifactKind, ArtifactLocator,
-    AutomaticCandidateStatus, AutomaticContextCandidate, CandidateAnalysis,
-    CandidateAnalysisStatus, CandidateBuilderProvenance, CandidateConfidence,
-    CandidateConfirmationOperation, CandidateConfirmationPlan,
-    CandidateConfirmationPrimaryReference, CandidatePrimarySelection, CandidateRelationAssessment,
-    CandidateReviewDiagnostic, CandidateReviewStatus, CandidateReviewSummary, CandidateReviewView,
-    CandidateSpaceRecommendation, CandidateSpaceRecommendationPath, CaptureEvidenceRef, CaptureId,
-    CaptureUnknown, CheckpointClaim, CheckpointClaimId, ContextId, ContextKind, ContextRelation,
+    AgentCheckpointId, ArtifactKey, ArtifactKind, ArtifactLocator, AutomaticCandidateStatus,
+    AutomaticContextCandidate, CandidateAnalysis, CandidateAnalysisStatus,
+    CandidateBuilderProvenance, CandidateConfidence, CandidateConfirmationOperation,
+    CandidateConfirmationPlan, CandidateConfirmationPrimaryReference, CandidatePrimarySelection,
+    CandidateRelationAssessment, CandidateReviewDiagnostic, CandidateReviewStatus,
+    CandidateReviewSummary, CandidateReviewView, CandidateSpaceRecommendation,
+    CandidateSpaceRecommendationPath, CaptureEvidenceRef, CaptureId, CaptureUnknown,
+    CheckpointClaim, CheckpointClaimId, ContextId, ContextKind, ContextRelation,
     ContextRevisionDraft, EngineeringReferenceDraft, Error, ErrorKind, EvidenceSnapshotDraft,
     EvidenceType, ExternalSessionLocator, NormalizedWorkObservation, OptionalCandidateEdits,
     ProposedSpaceGroupKey, REPOSITORY_ID_MAX_BYTES, REPOSITORY_ID_PATTERN, ReferenceId,
@@ -60,10 +60,10 @@ use sctx_search::{
     TaskGraphDiagnostic, TaskRetrievalPath,
 };
 use sctx_task_runtime::{
-    AgentCheckpointWrite, CandidateBuildItemPreparation, CandidateBuildItemStatus,
+    AgentCheckpointSubmission, CandidateBuildItemPreparation, CandidateBuildItemStatus,
     CandidateBuildStatus, CandidateBuildView, CandidateReviewDiscard, CandidateReviewDiscardStatus,
-    CandidateReviewRecord, CheckpointBoundary, CheckpointClaimDraft, IntentRevisionWriteStatus,
-    ProposedSpaceGroupMappingStatus, TaskRuntime, WorkEpisodeView,
+    CandidateReviewRecord, DirectCheckpointClaimDraft, DirectEvidenceDraft,
+    IntentRevisionWriteStatus, ProposedSpaceGroupMappingStatus, TaskRuntime, WorkEpisodeView,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -79,6 +79,13 @@ const MIN_CANDIDATE_REVIEW_TOKEN_BUDGET: usize = 512;
 const MAX_CANDIDATE_REVIEW_TOKEN_BUDGET: usize = 32_768;
 const DEFAULT_TASK_CAPTURE_LIST_LIMIT: usize = 20;
 const MAX_TASK_CAPTURE_LIST_LIMIT: usize = 128;
+const MAX_TASK_CHECKPOINT_BYTES: usize = 64 * 1024;
+const MAX_TASK_CHECKPOINT_CLAIMS: usize = 64;
+const MAX_TASK_CHECKPOINT_UNKNOWNS: usize = 64;
+const MAX_TASK_CHECKPOINT_EVIDENCE_PER_CLAIM: usize = 32;
+const MAX_TASK_CHECKPOINT_LIST_ITEMS: usize = 64;
+const MAX_TASK_CHECKPOINT_TEXT_BYTES: usize = 4 * 1024;
+const MAX_RECOVERABLE_BUILDS_PER_READ: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -210,15 +217,30 @@ pub enum TaskCheckpointDiagnostic {
 /// One accepted server-owned Checkpoint and resulting closed Episode boundary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TaskCheckpointAcceptedResponse {
+    pub status: TaskCheckpointAcceptedStatus,
+    pub operation_id: String,
     pub checkpoint_id: AgentCheckpointId,
     pub claim_ids: Vec<CheckpointClaimId>,
     pub episode_id: WorkEpisodeId,
     pub episode_version: u64,
     pub episode_status: WorkEpisodeStatus,
-    pub created: bool,
+    pub replayed: bool,
     pub diagnostics: Vec<TaskCheckpointDiagnostic>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub candidate_build: Option<CandidateBuildResponse>,
+    pub candidate_build: CandidateBuildReceipt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCheckpointAcceptedStatus {
+    Accepted,
+}
+
+/// Durable Build outbox identity and current recovery status returned by Checkpoint ACK.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateBuildReceipt {
+    pub build_id: sctx_domain::CandidateBuildId,
+    pub episode_id: WorkEpisodeId,
+    pub status: CandidateBuildResponseStatus,
 }
 
 /// Successful Checkpoint result. Empty submissions are explicit mutation-free no-ops.
@@ -385,6 +407,17 @@ pub struct CandidateListResponse {
     pub next_cursor: Option<String>,
     pub estimated_tokens: usize,
     pub token_budget: usize,
+    pub recovery: CandidateRecoverySummary,
+}
+
+/// Non-sensitive current status of bounded Candidate Build recovery.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateRecoverySummary {
+    pub attempted: usize,
+    pub recovered: usize,
+    pub failed_attempts: usize,
+    pub pending: usize,
+    pub incomplete: usize,
 }
 
 /// Exact public discard disposition.
@@ -472,6 +505,7 @@ pub struct CandidateConfirmResponse {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateBuildItemResponseStatus {
+    Queued,
     Prepared,
     NeedsEvidence,
     Created,
@@ -482,6 +516,7 @@ pub enum CandidateBuildItemResponseStatus {
 impl From<CandidateBuildItemStatus> for CandidateBuildItemResponseStatus {
     fn from(value: CandidateBuildItemStatus) -> Self {
         match value {
+            CandidateBuildItemStatus::Queued => Self::Queued,
             CandidateBuildItemStatus::Prepared => Self::Prepared,
             CandidateBuildItemStatus::NeedsEvidence => Self::NeedsEvidence,
             CandidateBuildItemStatus::Created => Self::Created,
@@ -1305,13 +1340,13 @@ impl Runtime {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     fn task_checkpoint(&self, input: &TaskCheckpointInput) -> Result<TaskCheckpointResponse> {
         let input_json = serde_json::to_string(input).map_err(|error| {
             invalid(format!(
                 "serialize task_checkpoint privacy boundary: {error}"
             ))
         })?;
+        validate_task_checkpoint_input(input, input_json.len())?;
         let privacy = PrivacyScanner::default().scan(&input_json)?;
         if !privacy.is_clean() {
             return Err(Error::new(
@@ -1323,90 +1358,53 @@ impl Runtime {
             ));
         }
         let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
-        let active = self
-            .tasks
-            .read_snapshot_by_locator(&locator)?
-            .ok_or_else(|| invalid("ExternalSession has no ActiveTask for Agent Checkpoint"))?;
-        let intent = active
-            .current_intent_revision()
-            .ok_or_else(|| invariant("ActiveTask has no Intent Head"))?;
         if input.claims.is_empty() && input.unknowns.is_empty() {
+            if self.tasks.read_snapshot_by_locator(&locator)?.is_none() {
+                return Err(invalid(
+                    "ExternalSession has no ActiveTask for Agent Checkpoint",
+                ));
+            }
             return Ok(TaskCheckpointResponse::NoOp(TaskCheckpointNoOpResponse {
                 status: TaskCheckpointNoOpStatus::NoOp,
             }));
         }
-
-        let mut claims = Vec::with_capacity(input.claims.len());
-        for claim in &input.claims {
-            if claim.evidence.is_empty() {
-                return Err(invalid("Checkpoint Claim Evidence must not be empty"));
-            }
-            let applicability = Applicability {
-                domains: intent.working_intent.domains.clone(),
-                platforms: intent.working_intent.platforms.clone(),
-                conditions: claim.conditions.clone(),
-            };
-            applicability.validate("task_checkpoint.claim.applicability")?;
-            let inline_validations = claim
-                .evidence
-                .iter()
-                .map(|evidence| {
-                    if evidence.summary.trim().is_empty() {
-                        return Err(invalid(
-                            "task_checkpoint.claim.evidence.summary must not be empty",
-                        ));
-                    }
-                    let draft = EvidenceSnapshotDraft {
-                        kind: evidence.evidence_type,
-                        supports: claim.statement.clone(),
-                        content: json!({"summary": evidence.summary}),
-                        interpretation: claim.rationale.clone(),
-                        limitations: evidence.limitations.clone(),
-                    };
-                    draft.validate("task_checkpoint.claim.evidence")?;
-                    Ok(draft)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            claims.push(CheckpointClaimDraft {
-                context_kind_hint: Some(claim.context_kind),
-                topic_key_hint: None,
-                statement: claim.statement.clone(),
-                rationale: claim.rationale.clone(),
-                applicability,
-                assumptions: Vec::new(),
-                recheck_when: Vec::new(),
-                evidence_refs: Vec::new(),
-                inline_validations,
-                artifact_refs: Vec::new(),
-                relations: Vec::new(),
-                engineering_references: Vec::new(),
-                related_contexts: Vec::new(),
-            });
-        }
-
-        let opened = self
+        let outcome = self
             .tasks
-            .open_work_episode(&locator, active.task_id, intent.revision_id)?;
-        let outcome = self.tasks.write_agent_checkpoint(&AgentCheckpointWrite {
-            locator,
-            expected_task_id: active.task_id,
-            expected_intent_revision_id: intent.revision_id,
-            expected_episode_version: opened.episode.episode.version,
-            boundary: CheckpointBoundary::Close,
-            claims,
-            unknowns: input
-                .unknowns
-                .iter()
-                .map(|unknown| CaptureUnknown {
-                    statement: unknown.statement.clone(),
-                    blocking: unknown.blocking,
-                    recheck_when: Vec::new(),
-                })
-                .collect(),
-        })?;
-        let candidate_build = Some(self.build_closed_episode(outcome.episode.episode.episode_id)?);
+            .submit_agent_checkpoint(&AgentCheckpointSubmission {
+                locator,
+                claims: input
+                    .claims
+                    .iter()
+                    .map(|claim| DirectCheckpointClaimDraft {
+                        context_kind: claim.context_kind,
+                        statement: claim.statement.clone(),
+                        rationale: claim.rationale.clone(),
+                        conditions: claim.conditions.clone(),
+                        evidence: claim
+                            .evidence
+                            .iter()
+                            .map(|evidence| DirectEvidenceDraft {
+                                evidence_type: evidence.evidence_type,
+                                summary: evidence.summary.clone(),
+                                limitations: evidence.limitations.clone(),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+                unknowns: input
+                    .unknowns
+                    .iter()
+                    .map(|unknown| CaptureUnknown {
+                        statement: unknown.statement.clone(),
+                        blocking: unknown.blocking,
+                        recheck_when: Vec::new(),
+                    })
+                    .collect(),
+            })?;
         Ok(TaskCheckpointResponse::Accepted(
             TaskCheckpointAcceptedResponse {
+                status: TaskCheckpointAcceptedStatus::Accepted,
+                operation_id: outcome.operation_id,
                 checkpoint_id: outcome.checkpoint.checkpoint_id,
                 claim_ids: outcome
                     .checkpoint
@@ -1417,7 +1415,7 @@ impl Runtime {
                 episode_id: outcome.episode.episode.episode_id,
                 episode_version: outcome.episode.episode.version,
                 episode_status: outcome.episode.episode.status,
-                created: outcome.created,
+                replayed: outcome.replayed,
                 diagnostics: outcome
                     .inline_observation_ids
                     .into_iter()
@@ -1427,7 +1425,11 @@ impl Runtime {
                         },
                     )
                     .collect(),
-                candidate_build,
+                candidate_build: CandidateBuildReceipt {
+                    build_id: outcome.build.build_id,
+                    episode_id: outcome.build.source_episode.episode_id,
+                    status: outcome.build.status.into(),
+                },
             },
         ))
     }
@@ -1494,7 +1496,12 @@ impl Runtime {
         for item in build.items.clone() {
             if item.status.is_finalized() {
                 if let Some(candidate_id) = item.candidate_id
-                    && self.tasks.read_candidate_analysis(candidate_id)?.is_none()
+                    && self
+                        .tasks
+                        .read_candidate_analysis(candidate_id)?
+                        .is_none_or(|view| {
+                            view.candidate.analysis.status != CandidateAnalysisStatus::Complete
+                        })
                 {
                     self.analyze_candidate(&CandidateAnalyzeInput {
                         candidate_id: candidate_id.to_string(),
@@ -1567,6 +1574,47 @@ impl Runtime {
             }
         }
         Ok(response)
+    }
+
+    fn recover_candidate_build_episode(&self, episode_id: WorkEpisodeId) -> Result<bool> {
+        match self.build_closed_episode(episode_id) {
+            Ok(build) => {
+                self.tasks
+                    .record_candidate_build_recovery_attempt(episode_id, None)?;
+                Ok(build.status == CandidateBuildResponseStatus::Complete)
+            }
+            Err(error) => {
+                self.tasks.record_candidate_build_recovery_attempt(
+                    episode_id,
+                    Some(candidate_builder_error_code(&error)),
+                )?;
+                Ok(false)
+            }
+        }
+    }
+
+    fn recover_candidate_builds(
+        &self,
+        locator: &ExternalSessionLocator,
+    ) -> Result<CandidateRecoverySummary> {
+        let episodes = self
+            .tasks
+            .list_recoverable_candidate_build_episodes(locator, MAX_RECOVERABLE_BUILDS_PER_READ)?;
+        let mut summary = CandidateRecoverySummary {
+            attempted: episodes.len(),
+            ..CandidateRecoverySummary::default()
+        };
+        for episode_id in episodes {
+            if self.recover_candidate_build_episode(episode_id)? {
+                summary.recovered += 1;
+            } else {
+                summary.failed_attempts += 1;
+            }
+        }
+        let current = self.tasks.candidate_build_recovery_status(locator)?;
+        summary.pending = current.pending;
+        summary.incomplete = current.incomplete;
+        Ok(summary)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1739,6 +1787,7 @@ impl Runtime {
             ));
         }
         let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
+        let recovery = self.recover_candidate_builds(&locator)?;
         let page = self.tasks.list_candidate_reviews(
             &locator,
             input.status,
@@ -1782,18 +1831,50 @@ impl Runtime {
             next_cursor: page.next_cursor,
             estimated_tokens,
             token_budget: input.token_budget,
+            recovery,
         })
     }
 
     fn candidate_get(&self, input: &CandidateGetInput) -> Result<CandidateReviewView> {
         let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
         let candidate_id = parse_id_value(&input.candidate_id, "candidate_id")?;
-        let record = self
-            .tasks
-            .read_candidate_review(&locator, candidate_id)?
-            .ok_or_else(|| invalid("Candidate Review does not exist for the ActiveTask"))?;
+        let mut record = self.tasks.read_candidate_review(&locator, candidate_id)?;
+        let target_episode = if let Some(record) = &record {
+            self.tasks
+                .read_candidate_analysis(candidate_id)?
+                .is_none_or(|view| {
+                    view.candidate.analysis.status != CandidateAnalysisStatus::Complete
+                })
+                .then_some(record.source_episode.episode_id)
+        } else {
+            let snapshot = self.snapshot()?;
+            snapshot
+                .projection
+                .candidates
+                .get(&candidate_id)
+                .map(|candidate| candidate.candidate.source_episode.episode_id)
+        };
+        if let Some(episode_id) = target_episode
+            && self
+                .tasks
+                .owns_candidate_recovery_episode(&locator, episode_id)?
+        {
+            let _recovered = self.recover_candidate_build_episode(episode_id)?;
+            record = self.tasks.read_candidate_review(&locator, candidate_id)?;
+        }
+        let record = record.ok_or_else(|| {
+            invalid(
+                "Candidate Review does not exist or recovery remains pending for the ActiveTask",
+            )
+        })?;
         let snapshot = self.snapshot()?;
-        self.candidate_review_view(&record, &snapshot)
+        let view = self.candidate_review_view(&record, &snapshot)?;
+        if view.analysis.status != CandidateAnalysisStatus::Complete {
+            return Err(invalid(
+                "Candidate Review recovery remains pending for the ActiveTask",
+            ));
+        }
+        Ok(view)
     }
 
     fn candidate_discard(&self, input: &CandidateDiscardInput) -> Result<CandidateDiscardResponse> {
@@ -4421,7 +4502,7 @@ fn tools_list() -> Value {
         ),
         tool_schema(
             "task_checkpoint",
-            "Finalize one Agent-authored Checkpoint for the current ActiveTask and Intent. Submit focused Claims with self-contained Evidence summaries; the server resolves lifecycle state and builds untrusted Candidate drafts for human review. Empty Claims and Unknowns are a successful no-op.",
+            "Finalize one content-addressed Agent Checkpoint for the current ActiveTask and Intent. Submit focused Claims with self-contained Evidence summaries; the server durably queues untrusted Candidate drafts for bounded recovery by Candidate review reads. Empty Claims and Unknowns are a successful no-op.",
             task_checkpoint_schema()
         ),
         tool_schema(
@@ -4794,7 +4875,14 @@ fn task_capture_list_schema() -> Value {
 }
 
 fn task_checkpoint_schema() -> Value {
-    let string_list = || json!({"type": "array", "items": {"type": "string", "minLength": 1}});
+    let string_list = || {
+        json!({
+            "type": "array", "maxItems": MAX_TASK_CHECKPOINT_LIST_ITEMS,
+            "items": {
+                "type": "string", "minLength": 1, "maxLength": MAX_TASK_CHECKPOINT_TEXT_BYTES
+            }
+        })
+    };
     let evidence = json!({
         "type": "object", "additionalProperties": false,
         "required": ["evidence_type", "summary", "limitations"],
@@ -4803,7 +4891,9 @@ fn task_checkpoint_schema() -> Value {
                 EvidenceType::SourceSnapshot, EvidenceType::ExperimentRecord,
                 EvidenceType::ArtifactSnapshot
             ]),
-            "summary": {"type": "string", "minLength": 1},
+            "summary": {
+                "type": "string", "minLength": 1, "maxLength": MAX_TASK_CHECKPOINT_TEXT_BYTES
+            },
             "limitations": string_list()
         }
     });
@@ -4812,17 +4902,26 @@ fn task_checkpoint_schema() -> Value {
         "required": ["context_kind", "statement", "rationale", "conditions", "evidence"],
         "properties": {
             "context_kind": kind_schema(),
-            "statement": {"type": "string", "minLength": 1},
-            "rationale": {"type": "string", "minLength": 1},
+            "statement": {
+                "type": "string", "minLength": 1, "maxLength": MAX_TASK_CHECKPOINT_TEXT_BYTES
+            },
+            "rationale": {
+                "type": "string", "minLength": 1, "maxLength": MAX_TASK_CHECKPOINT_TEXT_BYTES
+            },
             "conditions": string_list(),
-            "evidence": {"type": "array", "minItems": 1, "items": evidence},
+            "evidence": {
+                "type": "array", "minItems": 1,
+                "maxItems": MAX_TASK_CHECKPOINT_EVIDENCE_PER_CLAIM, "items": evidence
+            },
         }
     });
     let unknown = json!({
         "type": "object", "additionalProperties": false,
         "required": ["statement", "blocking"],
         "properties": {
-            "statement": {"type": "string", "minLength": 1},
+            "statement": {
+                "type": "string", "minLength": 1, "maxLength": MAX_TASK_CHECKPOINT_TEXT_BYTES
+            },
             "blocking": {"type": "boolean"}
         }
     });
@@ -4831,10 +4930,18 @@ fn task_checkpoint_schema() -> Value {
         "additionalProperties": false,
         "required": ["agent_kind", "external_session_id", "claims", "unknowns"],
         "properties": {
-            "agent_kind": {"type": "string", "minLength": 1},
-            "external_session_id": {"type": "string", "minLength": 1},
-            "claims": {"type": "array", "items": claim},
-            "unknowns": {"type": "array", "items": unknown}
+            "agent_kind": {
+                "type": "string", "minLength": 1, "maxLength": MAX_TASK_CHECKPOINT_TEXT_BYTES
+            },
+            "external_session_id": {
+                "type": "string", "minLength": 1, "maxLength": MAX_TASK_CHECKPOINT_TEXT_BYTES
+            },
+            "claims": {
+                "type": "array", "maxItems": MAX_TASK_CHECKPOINT_CLAIMS, "items": claim
+            },
+            "unknowns": {
+                "type": "array", "maxItems": MAX_TASK_CHECKPOINT_UNKNOWNS, "items": unknown
+            }
         }
     })
 }
@@ -5423,6 +5530,104 @@ fn estimate_candidate_review_tokens(summary: &CandidateReviewSummary) -> Result<
     let bytes = serde_json::to_vec(summary)
         .map_err(|error| Error::new(ErrorKind::Io, format!("serialize Review summary: {error}")))?;
     Ok(bytes.len().div_ceil(4).max(1))
+}
+
+fn validate_task_checkpoint_input(
+    input: &TaskCheckpointInput,
+    serialized_bytes: usize,
+) -> Result<()> {
+    let mut violations = Vec::new();
+    if serialized_bytes > MAX_TASK_CHECKPOINT_BYTES {
+        violations.push(format!(
+            "serialized payload exceeds {MAX_TASK_CHECKPOINT_BYTES} bytes"
+        ));
+    }
+    validate_checkpoint_text(&input.agent_kind, "agent_kind", &mut violations);
+    validate_checkpoint_text(
+        &input.external_session_id,
+        "external_session_id",
+        &mut violations,
+    );
+    if input.claims.len() > MAX_TASK_CHECKPOINT_CLAIMS {
+        violations.push(format!("claims exceeds {MAX_TASK_CHECKPOINT_CLAIMS} items"));
+    }
+    if input.unknowns.len() > MAX_TASK_CHECKPOINT_UNKNOWNS {
+        violations.push(format!(
+            "unknowns exceeds {MAX_TASK_CHECKPOINT_UNKNOWNS} items"
+        ));
+    }
+    for (claim_index, claim) in input.claims.iter().enumerate() {
+        validate_checkpoint_text(
+            &claim.statement,
+            &format!("claims[{claim_index}].statement"),
+            &mut violations,
+        );
+        validate_checkpoint_text(
+            &claim.rationale,
+            &format!("claims[{claim_index}].rationale"),
+            &mut violations,
+        );
+        validate_checkpoint_string_list(
+            &claim.conditions,
+            &format!("claims[{claim_index}].conditions"),
+            &mut violations,
+        );
+        if claim.evidence.is_empty() {
+            violations.push(format!("claims[{claim_index}].evidence must not be empty"));
+        } else if claim.evidence.len() > MAX_TASK_CHECKPOINT_EVIDENCE_PER_CLAIM {
+            violations.push(format!(
+                "claims[{claim_index}].evidence exceeds {MAX_TASK_CHECKPOINT_EVIDENCE_PER_CLAIM} items"
+            ));
+        }
+        for (evidence_index, evidence) in claim.evidence.iter().enumerate() {
+            validate_checkpoint_text(
+                &evidence.summary,
+                &format!("claims[{claim_index}].evidence[{evidence_index}].summary"),
+                &mut violations,
+            );
+            validate_checkpoint_string_list(
+                &evidence.limitations,
+                &format!("claims[{claim_index}].evidence[{evidence_index}].limitations"),
+                &mut violations,
+            );
+        }
+    }
+    for (unknown_index, unknown) in input.unknowns.iter().enumerate() {
+        validate_checkpoint_text(
+            &unknown.statement,
+            &format!("unknowns[{unknown_index}].statement"),
+            &mut violations,
+        );
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "task_checkpoint validation failed: {}",
+            violations.join("; ")
+        )))
+    }
+}
+
+fn validate_checkpoint_string_list(values: &[String], field: &str, violations: &mut Vec<String>) {
+    if values.len() > MAX_TASK_CHECKPOINT_LIST_ITEMS {
+        violations.push(format!(
+            "{field} exceeds {MAX_TASK_CHECKPOINT_LIST_ITEMS} items"
+        ));
+    }
+    for (index, value) in values.iter().enumerate() {
+        validate_checkpoint_text(value, &format!("{field}[{index}]"), violations);
+    }
+}
+
+fn validate_checkpoint_text(value: &str, field: &str, violations: &mut Vec<String>) {
+    if value.trim().is_empty() {
+        violations.push(format!("{field} must not be empty"));
+    } else if value.len() > MAX_TASK_CHECKPOINT_TEXT_BYTES {
+        violations.push(format!(
+            "{field} exceeds {MAX_TASK_CHECKPOINT_TEXT_BYTES} bytes"
+        ));
+    }
 }
 
 const fn error_code(kind: ErrorKind) -> &'static str {

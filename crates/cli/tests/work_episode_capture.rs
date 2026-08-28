@@ -7,16 +7,17 @@ use std::{
 };
 
 use sctx_domain::{
-    ContextKind, EvidenceType, ExternalSessionLocator, NormalizedBreadcrumbKind,
-    NormalizedWorkObservation, TaskId, WorkSourceRef, WorkingIntentSnapshot,
+    CandidateReviewStatus, ContextKind, EvidenceType, ExternalSessionLocator,
+    NormalizedBreadcrumbKind, NormalizedWorkObservation, TaskId, WorkSourceRef,
+    WorkingIntentSnapshot,
 };
 use sctx_git_store::GitStore;
 use sctx_local_state::{
     CaptureClaim, CaptureDiagnosticKind, CaptureStore, UserConfigStore, map_capture_artifacts,
 };
 use sctx_mcp::{
-    CandidateGetInput, TaskCheckpointClaimInput, TaskCheckpointEvidenceInput, TaskCheckpointInput,
-    candidate_get_at_root, task_checkpoint_at_root,
+    CandidateGetInput, CandidateListInput, TaskCheckpointClaimInput, TaskCheckpointEvidenceInput,
+    TaskCheckpointInput, candidate_get_at_root, candidate_list_at_root, task_checkpoint_at_root,
 };
 use sctx_task_runtime::{CaptureIngestion, TaskRuntime, WorkEpisodeDiagnosticKind};
 use serde_json::{Value, json};
@@ -491,9 +492,25 @@ fn hook_capture_keeps_locator_then_explicit_claim_and_ingestion_are_verifiable()
     .unwrap()
     .into_accepted()
     .expect("nonempty Checkpoint must be accepted");
-    let candidate_id = checkpoint.candidate_build.as_ref().unwrap().items[0]
-        .candidate_id
-        .unwrap();
+    assert_eq!(
+        checkpoint.candidate_build.status,
+        sctx_mcp::CandidateBuildResponseStatus::Pending
+    );
+    let candidate_id = candidate_list_at_root(
+        harness.root(),
+        &CandidateListInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: "capture-owned".to_owned(),
+            status: CandidateReviewStatus::Pending,
+            limit: 10,
+            cursor: None,
+            token_budget: 32_768,
+        },
+    )
+    .unwrap()
+    .reviews[0]
+        .0
+        .candidate_id;
     let review = candidate_get_at_root(
         harness.root(),
         &CandidateGetInput {
@@ -657,25 +674,35 @@ fn public_mcp_lists_capture_but_checkpoint_uses_direct_agent_evidence() {
         tool_call(9, "task_checkpoint", checkpoint_arguments.clone()),
     ]);
     let checkpoint = &checkpoint[1]["result"]["structuredContent"];
-    assert_eq!(checkpoint["created"], true);
+    assert_eq!(checkpoint["status"], "accepted");
+    assert_eq!(checkpoint["replayed"], false);
     assert_eq!(checkpoint["episode_version"], 1);
     assert_eq!(
         checkpoint["diagnostics"][0]["kind"],
         "inline_validation_recorded"
     );
-    let candidate_id = checkpoint["candidate_build"]["items"][0]["candidate_id"]
+    assert_eq!(checkpoint["candidate_build"]["status"], "pending");
+    let recovered = harness.mcp(&[
+        initialize(10),
+        tool_call(
+            11,
+            "candidate_list",
+            json!({"agent_kind": "codex", "external_session_id": session}),
+        ),
+    ]);
+    let candidate_id = recovered[1]["result"]["structuredContent"]["reviews"][0]["candidate_id"]
         .as_str()
         .unwrap();
 
     let after = harness.mcp(&[
-        initialize(10),
+        initialize(12),
         tool_call(
-            11,
+            13,
             "task_capture_list",
             json!({"agent_kind": "codex", "external_session_id": session}),
         ),
         tool_call(
-            12,
+            14,
             "candidate_get",
             json!({
                 "agent_kind": "codex",

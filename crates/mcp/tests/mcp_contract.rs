@@ -11,9 +11,9 @@ use std::{
 use fs2::FileExt;
 use rusqlite::Connection;
 use sctx_domain::{
-    Applicability, CandidateConfirmationOperation, CandidateConfirmationPlan,
-    CandidateConfirmationPrimaryReference, CandidateId, CandidatePrimarySelection,
-    CandidateReviewDiagnostic, CandidateReviewStatus, CaptureEvidenceRef, ContextId, ContextKind,
+    Applicability, CandidateAnalysisStatus, CandidateConfirmationOperation,
+    CandidateConfirmationPlan, CandidateConfirmationPrimaryReference, CandidateId,
+    CandidatePrimarySelection, CandidateReviewStatus, CaptureEvidenceRef, ContextId, ContextKind,
     ContextRevisionDraft, EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator,
     IntentSnapshot, NormalizedBreadcrumbKind, NormalizedWorkObservation, OptionalCandidateEdits,
     PublicationAction, PublicationDraft, RepositoryId, ReviewDraft, ReviewVerdict, RevisionId,
@@ -41,8 +41,9 @@ use sctx_mcp::{
 };
 use sctx_search::{TaskRetrievalPath, WorkingIntentHintField, WorkingIntentHintTarget};
 use sctx_task_runtime::{
-    AgentCheckpointWrite, CandidateBuildItemPreparation, CandidateBuildItemStatus,
-    CheckpointBoundary, CheckpointClaimDraft, TaskRuntime,
+    AgentCheckpointSubmission, AgentCheckpointWrite, CandidateBuildItemPreparation,
+    CandidateBuildItemStatus, CandidateBuildStatus, CheckpointBoundary, CheckpointClaimDraft,
+    DirectCheckpointClaimDraft, DirectEvidenceDraft, TaskRuntime,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -690,10 +691,37 @@ fn build_review_candidate_for_agent(
     .unwrap()
     .into_accepted()
     .expect("nonempty Checkpoint must be accepted");
-    let candidate_id = closed.candidate_build.as_ref().unwrap().items[0]
-        .candidate_id
-        .unwrap();
+    assert_eq!(
+        closed.candidate_build.status,
+        CandidateBuildResponseStatus::Pending
+    );
+    let candidate_id = recover_candidate_ids(fixture, agent_kind, session, 1)[0];
     (task, candidate_id)
+}
+
+fn recover_candidate_ids(
+    fixture: &Fixture,
+    agent_kind: &str,
+    session: &str,
+    expected: usize,
+) -> Vec<CandidateId> {
+    let list = candidate_list_at_root(
+        &fixture.root,
+        &CandidateListInput {
+            agent_kind: agent_kind.to_owned(),
+            external_session_id: session.to_owned(),
+            status: CandidateReviewStatus::Pending,
+            limit: 100,
+            cursor: None,
+            token_budget: 32_768,
+        },
+    )
+    .unwrap();
+    assert_eq!(list.reviews.len(), expected);
+    list.reviews
+        .into_iter()
+        .map(|review| review.0.candidate_id)
+        .collect()
 }
 
 fn directly_close_builder_episode(
@@ -964,10 +992,58 @@ fn typed_checkpoint_input(
     }
 }
 
+fn recovery_submission(
+    locator: &ExternalSessionLocator,
+    index: usize,
+) -> (AgentCheckpointSubmission, ContextRevisionDraft) {
+    let statement = format!("Fair recovery statement {index}");
+    let rationale = format!("Fair recovery rationale {index}");
+    let summary = format!("Fair recovery evidence {index}");
+    (
+        AgentCheckpointSubmission {
+            locator: locator.clone(),
+            claims: vec![DirectCheckpointClaimDraft {
+                context_kind: ContextKind::Validation,
+                statement: statement.clone(),
+                rationale: rationale.clone(),
+                conditions: vec!["fair recovery".to_owned()],
+                evidence: vec![DirectEvidenceDraft {
+                    evidence_type: EvidenceType::ExperimentRecord,
+                    summary: summary.clone(),
+                    limitations: Vec::new(),
+                }],
+            }],
+            unknowns: Vec::new(),
+        },
+        ContextRevisionDraft {
+            kind: ContextKind::Validation,
+            topic_key: None,
+            statement: statement.clone(),
+            rationale: rationale.clone(),
+            applicability: Applicability {
+                domains: vec!["mcp".to_owned()],
+                platforms: Vec::new(),
+                conditions: vec!["fair recovery".to_owned()],
+            },
+            assumptions: Vec::new(),
+            recheck_when: Vec::new(),
+            relations: Vec::new(),
+            evidence: vec![EvidenceSnapshotDraft {
+                kind: EvidenceType::ExperimentRecord,
+                supports: statement,
+                content: json!({"summary": summary}),
+                interpretation: rationale,
+                limitations: Vec::new(),
+            }],
+        },
+    )
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn checkpoint_rejects_unknown_private_and_cross_session_input_without_residue() {
     let fixture = Fixture::new();
+    let before_events = event_count(fixture.store.repository());
     let session = "checkpoint-validation";
     let mut intent = update_input(
         session,
@@ -1029,6 +1105,46 @@ fn checkpoint_rejects_unknown_private_and_cross_session_input_without_residue() 
         "unknown fields must fail before opening an Episode"
     );
 
+    let mut oversized = private.clone();
+    oversized.claims[0].evidence[0].summary = "x".repeat(70 * 1024);
+    assert_eq!(
+        task_checkpoint_at_root(&fixture.root, &oversized)
+            .unwrap_err()
+            .kind(),
+        sctx_domain::ErrorKind::InvalidInput
+    );
+    let mut invalid_fields = private.clone();
+    invalid_fields.claims[0].statement = " ".to_owned();
+    invalid_fields.claims[0].rationale.clear();
+    invalid_fields.claims[0].evidence[0].summary.clear();
+    let invalid_fields = task_checkpoint_at_root(&fixture.root, &invalid_fields).unwrap_err();
+    assert!(
+        invalid_fields
+            .message()
+            .contains("statement must not be empty")
+    );
+    assert!(
+        invalid_fields
+            .message()
+            .contains("rationale must not be empty")
+    );
+    assert!(
+        invalid_fields
+            .message()
+            .contains("summary must not be empty")
+    );
+    let runtime_connection = Connection::open(runtime.database_path()).unwrap();
+    assert_eq!(
+        runtime_connection
+            .query_row("SELECT COUNT(*) FROM checkpoint_operation", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0,
+        "privacy, unknown-field, oversized and invalid inputs must reserve no operation"
+    );
+    assert_eq!(event_count(fixture.store.repository()), before_events);
+
     let cross_session = TaskCheckpointInput {
         external_session_id: "checkpoint-other-session".to_owned(),
         ..private.clone()
@@ -1056,7 +1172,16 @@ fn checkpoint_rejects_unknown_private_and_cross_session_input_without_residue() 
         .unwrap()
         .into_accepted()
         .expect("nonempty Checkpoint must be accepted");
-    assert!(persisted.created);
+    assert!(!persisted.replayed);
+    assert_eq!(
+        persisted.status,
+        sctx_mcp::TaskCheckpointAcceptedStatus::Accepted
+    );
+    assert_eq!(
+        persisted.candidate_build.status,
+        CandidateBuildResponseStatus::Pending
+    );
+    assert_eq!(event_count(fixture.store.repository()), before_events);
     let episode = runtime
         .read_work_episode(persisted.episode_id)
         .unwrap()
@@ -1079,7 +1204,7 @@ fn checkpoint_rejects_unknown_private_and_cross_session_input_without_residue() 
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn codex_and_cursor_checkpoint_inline_evidence_builds_only_after_close() {
+fn codex_and_cursor_checkpoint_ack_is_queued_and_candidate_list_recovers_build() {
     for (client, framing, agent_kind) in [
         (ClientKind::Cursor, FixtureFraming::Newline, "cursor"),
         (ClientKind::Codex, FixtureFraming::ContentLength, "codex"),
@@ -1142,7 +1267,8 @@ fn codex_and_cursor_checkpoint_inline_evidence_builds_only_after_close() {
             &[tool_call(3, "task_checkpoint", checkpoint_arguments)],
         );
         let closed = &closed[0]["result"]["structuredContent"];
-        assert_eq!(closed["created"], true);
+        assert_eq!(closed["status"], "accepted");
+        assert_eq!(closed["replayed"], false);
         assert_eq!(closed["episode_version"], 1);
         assert!(
             closed["checkpoint_id"]
@@ -1167,25 +1293,28 @@ fn codex_and_cursor_checkpoint_inline_evidence_builds_only_after_close() {
             .unwrap();
         assert_eq!(persisted.checkpoints.len(), 1);
         assert_eq!(persisted.episode.observations.len(), 1);
-        assert_eq!(closed["candidate_build"]["status"], "complete");
+        assert_eq!(closed["candidate_build"]["status"], "pending");
+        assert_eq!(event_count(fixture.store.repository()), before_events);
         assert_eq!(
-            closed["candidate_build"]["items"].as_array().unwrap().len(),
+            recover_candidate_ids(&fixture, agent_kind, &session, 1).len(),
             1
         );
-        assert_eq!(closed["candidate_build"]["items"][0]["status"], "created");
-        assert!(
-            closed["candidate_build"]["items"][0]["candidate_id"]
-                .as_str()
-                .unwrap()
-                .starts_with("cnd_")
+        let build = build_closed_episode_at_root(&fixture.root, episode_id).unwrap();
+        assert_eq!(build.status, CandidateBuildResponseStatus::Complete);
+        assert_eq!(build.items.len(), 1);
+        assert_eq!(
+            build.items[0].status,
+            CandidateBuildItemResponseStatus::Created
         );
         assert_eq!(event_count(fixture.store.repository()), before_events + 1);
     }
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn mcp_checkpoint_finalizes_each_nonempty_call_and_empty_is_noop() {
     let fixture = Fixture::new();
+    let before_events = event_count(fixture.store.repository());
     let session = "mcp-multiple-episodes";
     let task = task_intent_update_at_root(
         &fixture.root,
@@ -1215,9 +1344,24 @@ fn mcp_checkpoint_finalizes_each_nonempty_call_and_empty_is_noop() {
         .into_accepted()
         .expect("nonempty Checkpoint must be accepted");
     let first_episode_id = first_checkpoint.episode_id;
+    assert!(!first_checkpoint.replayed);
     assert_eq!(
-        first_checkpoint.candidate_build.as_ref().unwrap().status,
-        CandidateBuildResponseStatus::Complete
+        first_checkpoint.candidate_build.status,
+        CandidateBuildResponseStatus::Pending
+    );
+    assert_eq!(event_count(fixture.store.repository()), before_events);
+
+    let lost_ack_retry = task_checkpoint_at_root(&fixture.root, &first)
+        .unwrap()
+        .into_accepted()
+        .expect("nonempty Checkpoint retry must be accepted");
+    assert!(lost_ack_retry.replayed);
+    assert_eq!(lost_ack_retry.operation_id, first_checkpoint.operation_id);
+    assert_eq!(lost_ack_retry.checkpoint_id, first_checkpoint.checkpoint_id);
+    assert_eq!(lost_ack_retry.episode_id, first_checkpoint.episode_id);
+    assert_eq!(
+        lost_ack_retry.candidate_build.build_id,
+        first_checkpoint.candidate_build.build_id
     );
 
     let empty = TaskCheckpointInput {
@@ -1242,18 +1386,37 @@ fn mcp_checkpoint_finalizes_each_nonempty_call_and_empty_is_noop() {
         .into_accepted()
         .expect("nonempty Checkpoint must be accepted");
     let second_episode_id = second_checkpoint.episode_id;
-    assert!(second_checkpoint.created);
+    assert!(!second_checkpoint.replayed);
     assert_ne!(second_episode_id, first_episode_id);
     assert_eq!(second_checkpoint.episode_version, 1);
-    assert_eq!(
-        second_checkpoint.candidate_build.as_ref().unwrap().status,
-        CandidateBuildResponseStatus::Complete
+    assert_ne!(
+        second_checkpoint.operation_id,
+        first_checkpoint.operation_id
     );
+
+    let delayed_first = task_checkpoint_at_root(&fixture.root, &first)
+        .unwrap()
+        .into_accepted()
+        .expect("delayed Checkpoint retry must be accepted");
+    assert!(delayed_first.replayed);
+    assert_eq!(delayed_first.operation_id, first_checkpoint.operation_id);
+    assert_eq!(delayed_first.episode_id, first_episode_id);
+    assert_eq!(event_count(fixture.store.repository()), before_events);
 
     let runtime = TaskRuntime::initialize(&fixture.root).unwrap();
     let locator = ExternalSessionLocator::new("codex", session).unwrap();
     let active = runtime.read_snapshot_by_locator(&locator).unwrap().unwrap();
     assert_eq!(active.task_id, task_id);
+    assert_eq!(
+        runtime
+            .list_work_episodes(active.task_session_id, 10)
+            .unwrap()
+            .len(),
+        2
+    );
+    let candidates = recover_candidate_ids(&fixture, "codex", session, 2);
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(event_count(fixture.store.repository()), before_events + 2);
     let sources = runtime
         .list_candidate_reviews(&locator, CandidateReviewStatus::Pending, 10, None)
         .unwrap()
@@ -1265,6 +1428,364 @@ fn mcp_checkpoint_finalizes_each_nonempty_call_and_empty_is_noop() {
         sources,
         std::collections::BTreeSet::from([first_episode_id, second_episode_id])
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn candidate_list_recovers_git_committed_outbox_once_under_concurrency() {
+    let fixture = Fixture::new();
+    let session = "candidate-list-outbox-recovery";
+    let task = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            session,
+            TaskBoundary::New,
+            None,
+            "recover one Git-committed Candidate outbox",
+        ),
+    )
+    .unwrap();
+    let statement = "Candidate list recovers the durable outbox";
+    let rationale = "The same SubmissionId survives the Git/runtime crash window";
+    let summary = "the outbox recovery fixture passed";
+    let input = TaskCheckpointInput {
+        agent_kind: "codex".to_owned(),
+        external_session_id: session.to_owned(),
+        claims: vec![TaskCheckpointClaimInput {
+            context_kind: ContextKind::Validation,
+            statement: statement.to_owned(),
+            rationale: rationale.to_owned(),
+            conditions: Vec::new(),
+            evidence: vec![TaskCheckpointEvidenceInput {
+                evidence_type: EvidenceType::ExperimentRecord,
+                summary: summary.to_owned(),
+                limitations: Vec::new(),
+            }],
+        }],
+        unknowns: Vec::new(),
+    };
+    let ack = task_checkpoint_at_root(&fixture.root, &input)
+        .unwrap()
+        .into_accepted()
+        .unwrap();
+    assert_eq!(
+        ack.candidate_build.status,
+        CandidateBuildResponseStatus::Pending
+    );
+    let runtime = TaskRuntime::initialize(&fixture.root).unwrap();
+    let queued = runtime
+        .read_candidate_build(ack.episode_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(queued.items[0].status, CandidateBuildItemStatus::Queued);
+    let content = ContextRevisionDraft {
+        kind: ContextKind::Validation,
+        topic_key: None,
+        statement: statement.to_owned(),
+        rationale: rationale.to_owned(),
+        applicability: Applicability {
+            domains: vec!["mcp".to_owned()],
+            platforms: Vec::new(),
+            conditions: Vec::new(),
+        },
+        assumptions: Vec::new(),
+        recheck_when: Vec::new(),
+        relations: Vec::new(),
+        evidence: vec![EvidenceSnapshotDraft {
+            kind: EvidenceType::ExperimentRecord,
+            supports: statement.to_owned(),
+            content: json!({"summary": summary}),
+            interpretation: rationale.to_owned(),
+            limitations: Vec::new(),
+        }],
+    };
+    let recovery_store = GitStore::bootstrap_local(&fixture.root).unwrap();
+    let recovery_index = ProjectionIndex::for_store(&recovery_store);
+    let committed = recovery_store
+        .with_candidate_submission_index(Arc::new(recovery_index))
+        .submit_candidate(CandidateSubmissionRequest {
+            submission_id: queued.items[0].submission_id,
+            source_episode: queued.source_episode,
+            content,
+        })
+        .unwrap();
+    let before_recovery_events = event_count(fixture.store.repository());
+    let barrier = Arc::new(Barrier::new(8));
+    let handles = (0..8)
+        .map(|_| {
+            let root = fixture.root.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                candidate_list_at_root(
+                    root,
+                    &CandidateListInput {
+                        agent_kind: "codex".to_owned(),
+                        external_session_id: session.to_owned(),
+                        status: CandidateReviewStatus::Pending,
+                        limit: 10,
+                        cursor: None,
+                        token_budget: 32_768,
+                    },
+                )
+                .unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    let pages = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert!(pages.iter().all(|page| page.reviews.len() == 1));
+    assert!(
+        pages
+            .iter()
+            .all(|page| { page.reviews[0].0.candidate_id == committed.record.candidate_id })
+    );
+    assert_eq!(
+        event_count(fixture.store.repository()),
+        before_recovery_events,
+        "Git-committed recovery must not append a duplicate Candidate"
+    );
+    Connection::open(runtime.database_path())
+        .unwrap()
+        .execute(
+            "DELETE FROM candidate_analysis WHERE candidate_id = ?1",
+            [committed.record.candidate_id.to_string()],
+        )
+        .unwrap();
+    assert_eq!(
+        recover_candidate_ids(&fixture, "codex", session, 1).len(),
+        1
+    );
+    assert_eq!(
+        runtime
+            .read_candidate_analysis(committed.record.candidate_id)
+            .unwrap()
+            .unwrap()
+            .candidate
+            .analysis
+            .status,
+        CandidateAnalysisStatus::Complete
+    );
+    assert_eq!(
+        event_count(fixture.store.repository()),
+        before_recovery_events
+    );
+    assert_eq!(task.context.task_id, queued.source_episode.task_id);
+}
+
+#[test]
+fn build_failure_after_ack_stays_pending_and_candidate_list_retries() {
+    let fixture = Fixture::new();
+    let session = "candidate-build-failure-retry";
+    let task = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            session,
+            TaskBoundary::New,
+            None,
+            "recover a failed Candidate Build",
+        ),
+    )
+    .unwrap();
+    let input = typed_checkpoint_input(
+        session,
+        task.context.task_id,
+        task.context.intent_revision_id,
+        0,
+        vec![checkpoint_evidence(
+            EvidenceType::ExperimentRecord,
+            "Candidate Build retry passed",
+        )],
+    );
+    let ack = task_checkpoint_at_root(&fixture.root, &input)
+        .unwrap()
+        .into_accepted()
+        .unwrap();
+    assert_eq!(
+        ack.candidate_build.status,
+        CandidateBuildResponseStatus::Pending
+    );
+    let connection = Connection::open(
+        TaskRuntime::initialize(&fixture.root)
+            .unwrap()
+            .database_path(),
+    )
+    .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_build_item_recovery
+             BEFORE UPDATE ON candidate_build_item
+             BEGIN SELECT RAISE(ABORT, 'injected recovery failure'); END;",
+        )
+        .unwrap();
+    let failed_page = candidate_list_at_root(
+        &fixture.root,
+        &CandidateListInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            status: CandidateReviewStatus::Pending,
+            limit: 10,
+            cursor: None,
+            token_budget: 32_768,
+        },
+    )
+    .unwrap();
+    assert!(failed_page.reviews.is_empty());
+    assert_eq!(failed_page.recovery.attempted, 1);
+    assert_eq!(failed_page.recovery.failed_attempts, 1);
+    assert_eq!(failed_page.recovery.pending, 1);
+    let pending = TaskRuntime::initialize(&fixture.root)
+        .unwrap()
+        .read_candidate_build(ack.episode_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.status, CandidateBuildStatus::Pending);
+    assert_eq!(pending.items[0].status, CandidateBuildItemStatus::Queued);
+    connection
+        .execute_batch("DROP TRIGGER reject_build_item_recovery;")
+        .unwrap();
+    assert_eq!(
+        recover_candidate_ids(&fixture, "codex", session, 1).len(),
+        1
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn target_get_bypasses_poisoned_prefix_and_generic_recovery_rotates_fairly() {
+    let fixture = Fixture::new();
+    let session = "fair-recovery-owner";
+    let task = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            session,
+            TaskBoundary::New,
+            None,
+            "recover beyond a poisoned Build prefix",
+        ),
+    )
+    .unwrap();
+    let runtime = TaskRuntime::initialize(&fixture.root).unwrap();
+    let locator = ExternalSessionLocator::new("codex", session).unwrap();
+    let mut outboxes = Vec::new();
+    for index in 0..34 {
+        let (submission, content) = recovery_submission(&locator, index);
+        outboxes.push((
+            runtime.submit_agent_checkpoint(&submission).unwrap(),
+            content,
+        ));
+    }
+    let target = &outboxes[32];
+    let fair_tail = &outboxes[33];
+    let recovery_store = GitStore::bootstrap_local(&fixture.root).unwrap();
+    let recovery_index = ProjectionIndex::for_store(&recovery_store);
+    let recovery_store = recovery_store.with_candidate_submission_index(Arc::new(recovery_index));
+    let target_candidate = recovery_store
+        .submit_candidate(CandidateSubmissionRequest {
+            submission_id: target.0.build.items[0].submission_id,
+            source_episode: target.0.build.source_episode,
+            content: target.1.clone(),
+        })
+        .unwrap()
+        .record
+        .candidate_id;
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    connection
+        .execute_batch(&format!(
+            "CREATE TRIGGER poison_old_recovery_prefix
+             BEFORE UPDATE ON candidate_build_item
+             WHEN (SELECT episode_id FROM candidate_build WHERE build_id = OLD.build_id)
+                  NOT IN ('{}', '{}')
+             BEGIN SELECT RAISE(ABORT, 'persistent poisoned recovery prefix'); END;",
+            target.0.episode.episode.episode_id, fair_tail.0.episode.episode.episode_id,
+        ))
+        .unwrap();
+
+    let recovered_target = candidate_get_at_root(
+        &fixture.root,
+        &CandidateGetInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            candidate_id: target_candidate.to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(recovered_target.candidate_id, target_candidate);
+
+    let other_session = "fair-recovery-other-task";
+    task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            other_session,
+            TaskBoundary::New,
+            None,
+            "own a cross-task Candidate",
+        ),
+    )
+    .unwrap();
+    let other_locator = ExternalSessionLocator::new("codex", other_session).unwrap();
+    let (other_submission, other_content) = recovery_submission(&other_locator, 99);
+    let other_outbox = runtime.submit_agent_checkpoint(&other_submission).unwrap();
+    let other_candidate = recovery_store
+        .submit_candidate(CandidateSubmissionRequest {
+            submission_id: other_outbox.build.items[0].submission_id,
+            source_episode: other_outbox.build.source_episode,
+            content: other_content,
+        })
+        .unwrap()
+        .record
+        .candidate_id;
+    let cross_task = candidate_get_at_root(
+        &fixture.root,
+        &CandidateGetInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            candidate_id: other_candidate.to_string(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(cross_task.kind(), sctx_domain::ErrorKind::InvalidInput);
+    assert!(
+        cross_task
+            .message()
+            .contains("does not exist or recovery remains pending")
+    );
+    assert_eq!(
+        runtime
+            .read_candidate_build(other_outbox.episode.episode.episode_id)
+            .unwrap()
+            .unwrap()
+            .items[0]
+            .status,
+        CandidateBuildItemStatus::Queued,
+        "cross-task target lookup must not mutate the foreign outbox"
+    );
+
+    let list_input = CandidateListInput {
+        agent_kind: "codex".to_owned(),
+        external_session_id: session.to_owned(),
+        status: CandidateReviewStatus::Pending,
+        limit: 100,
+        cursor: None,
+        token_budget: 32_768,
+    };
+    let first_page = candidate_list_at_root(&fixture.root, &list_input).unwrap();
+    assert_eq!(first_page.recovery.attempted, 32);
+    assert_eq!(first_page.recovery.failed_attempts, 32);
+    assert_eq!(first_page.recovery.pending, 33);
+    assert_eq!(first_page.reviews.len(), 1);
+
+    let second_page = candidate_list_at_root(&fixture.root, &list_input).unwrap();
+    assert_eq!(second_page.recovery.attempted, 32);
+    assert_eq!(second_page.recovery.recovered, 1);
+    assert_eq!(second_page.recovery.failed_attempts, 31);
+    assert_eq!(second_page.recovery.pending, 32);
+    assert!(second_page.reviews.iter().any(|review| {
+        review.0.source_episode.episode_id == fair_tail.0.episode.episode.episode_id
+    }));
+    assert_eq!(task.context.task_id, target.0.episode.episode.task_id);
 }
 
 #[test]
@@ -1346,7 +1867,16 @@ fn candidate_builder_converts_six_flat_agent_attested_evidence_drafts() {
     .unwrap()
     .into_accepted()
     .expect("nonempty Checkpoint must be accepted");
-    let build = closed.candidate_build.clone().unwrap();
+    assert_eq!(
+        closed.candidate_build.status,
+        CandidateBuildResponseStatus::Pending
+    );
+    assert_eq!(event_count(fixture.store.repository()), before_events);
+    assert_eq!(
+        recover_candidate_ids(&fixture, "codex", session, 6).len(),
+        6
+    );
+    let build = build_closed_episode_at_root(&fixture.root, closed.episode_id).unwrap();
     assert_eq!(build.status, CandidateBuildResponseStatus::Complete);
     assert_eq!(build.items.len(), 6);
     assert!(
@@ -1612,12 +2142,11 @@ fn candidate_builder_converts_six_flat_agent_attested_evidence_drafts() {
         },
     )
     .unwrap();
-    assert!(!failed_review.ready_for_review);
+    assert!(failed_review.ready_for_review);
+    assert!(failed_review.diagnostics.is_empty());
     assert_eq!(
-        failed_review.diagnostics,
-        vec![CandidateReviewDiagnostic::AnalysisFailed {
-            error_code: "analysis_dependency_unavailable".to_owned()
-        }]
+        failed_review.analysis.status,
+        CandidateAnalysisStatus::Complete
     );
     let missing_review = candidate_get_at_root(
         &fixture.root,
@@ -1628,10 +2157,11 @@ fn candidate_builder_converts_six_flat_agent_attested_evidence_drafts() {
         },
     )
     .unwrap();
-    assert!(!missing_review.ready_for_review);
+    assert!(missing_review.ready_for_review);
+    assert!(missing_review.diagnostics.is_empty());
     assert_eq!(
-        missing_review.diagnostics,
-        vec![CandidateReviewDiagnostic::AnalysisPending]
+        missing_review.analysis.status,
+        CandidateAnalysisStatus::Complete
     );
 
     let discarded = candidate_discard_at_root(
@@ -1736,8 +2266,6 @@ fn candidate_builder_converts_six_flat_agent_attested_evidence_drafts() {
         related_space_ids: Vec::new(),
         edits: OptionalCandidateEdits::default(),
     };
-    assert!(candidate_confirm_at_root(&fixture.root, &confirm_for(failed_candidate_id)).is_err());
-    assert!(candidate_confirm_at_root(&fixture.root, &confirm_for(missing_candidate_id)).is_err());
     assert!(candidate_confirm_at_root(&fixture.root, &confirm_for(review_candidate_id)).is_err());
     let pending_candidate_id = build.items[3].candidate_id.unwrap();
     let mut invalid_recommendation = confirm_for(pending_candidate_id);
@@ -1950,9 +2478,7 @@ fn cursor_and_codex_candidate_review_tools_list_get_and_discard_without_confirma
         .unwrap()
         .into_accepted()
         .expect("nonempty Checkpoint must be accepted");
-        let candidate_id = closed.candidate_build.as_ref().unwrap().items[0]
-            .candidate_id
-            .unwrap();
+        let candidate_id = recover_candidate_ids(&fixture, agent_kind, &session, 1)[0];
         let _group_member = add_git_repository(&fixture, "candidate review group member");
         let owner = json!({
             "agent_kind": agent_kind,
@@ -2056,12 +2582,7 @@ fn cursor_and_codex_candidate_review_tools_list_get_and_discard_without_confirma
         );
         let got = &responses[2]["result"]["structuredContent"];
         assert_eq!(got["candidate_id"], candidate_id.to_string());
-        assert_eq!(
-            got["claim_id"],
-            closed.candidate_build.as_ref().unwrap().items[0]
-                .claim_id
-                .to_string()
-        );
+        assert_eq!(got["claim_id"], closed.claim_ids[0].to_string());
         assert_eq!(
             responses[3]["result"]["structuredContent"]["status"],
             "discarded"
@@ -2356,14 +2877,11 @@ fn candidates_from_one_intent_revision_share_and_reuse_one_proposed_space() {
     .unwrap()
     .into_accepted()
     .expect("nonempty Checkpoint must be accepted");
-    let candidate_ids = closed
-        .candidate_build
-        .as_ref()
-        .unwrap()
-        .items
-        .iter()
-        .map(|item| item.candidate_id.unwrap())
-        .collect::<Vec<_>>();
+    assert_eq!(
+        closed.candidate_build.status,
+        CandidateBuildResponseStatus::Pending
+    );
+    let candidate_ids = recover_candidate_ids(&fixture, "codex", session, 2);
     assert_eq!(candidate_ids.len(), 2);
 
     let review = |candidate_id: CandidateId| {
@@ -2534,9 +3052,11 @@ fn candidates_from_one_intent_revision_share_and_reuse_one_proposed_space() {
     .unwrap()
     .into_accepted()
     .expect("nonempty Checkpoint must be accepted");
-    let next_candidate = next_closed.candidate_build.as_ref().unwrap().items[0]
-        .candidate_id
-        .unwrap();
+    assert_eq!(
+        next_closed.candidate_build.status,
+        CandidateBuildResponseStatus::Pending
+    );
+    let next_candidate = recover_candidate_ids(&fixture, "codex", session, 1)[0];
     assert_ne!(proposed(&review(next_candidate)).1, first_proposed.1);
 }
 
@@ -3478,7 +3998,11 @@ fn codex_checkpoint_declaration_golden_matches_rust_and_mcp_schema() {
         .insert("host_only".to_owned(), json!(true));
     assert!(serde_json::from_value::<TaskCheckpointInput>(unknown_property).is_err());
 
+    assert_eq!(schema["properties"]["claims"]["maxItems"], 64);
+    assert_eq!(schema["properties"]["unknowns"]["maxItems"], 64);
     let claim = &schema["properties"]["claims"]["items"];
+    assert_eq!(claim["properties"]["evidence"]["maxItems"], 32);
+    assert_eq!(claim["properties"]["statement"]["maxLength"], 4096);
     let rust_claim = serde_json::to_value(&sample.claims[0]).unwrap();
     let rust_claim_properties = rust_claim
         .as_object()
@@ -4475,10 +4999,18 @@ fn unregistered_repository_error_does_not_revoke_enabled_session_or_require_arti
         }),
     );
     assert_eq!(checkpoint["result"]["isError"], false, "{checkpoint:#}");
-    let candidate_id =
-        checkpoint["result"]["structuredContent"]["candidate_build"]["items"][0]["candidate_id"]
-            .as_str()
-            .unwrap();
+    assert_eq!(
+        checkpoint["result"]["structuredContent"]["candidate_build"]["status"],
+        "pending"
+    );
+    let listed = call_public_tool(
+        &fixture,
+        "candidate_list",
+        json!({"agent_kind": "codex", "external_session_id": session}),
+    );
+    let candidate_id = listed["result"]["structuredContent"]["reviews"][0]["candidate_id"]
+        .as_str()
+        .unwrap();
     let review = call_public_tool(
         &fixture,
         "candidate_get",

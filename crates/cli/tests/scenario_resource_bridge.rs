@@ -198,8 +198,17 @@ fn contract() -> ScenarioDefinition {
                 ]),
             ),
             mcp(
-                "candidate-get",
+                "candidate-list",
                 "checkpoint-close",
+                "candidate_list",
+                object([
+                    ("agent_kind", text("codex")),
+                    ("external_session_id", session()),
+                ]),
+            ),
+            mcp(
+                "candidate-get",
+                "candidate-list",
                 "candidate_get",
                 object([
                     ("agent_kind", text("codex")),
@@ -327,8 +336,8 @@ fn contract() -> ScenarioDefinition {
             capture(
                 "built-candidate-id",
                 VariableKind::CandidateId,
-                "checkpoint-close",
-                "/candidate_build/items/0/candidate_id",
+                "candidate-list",
+                "/reviews/0/candidate_id",
             ),
             capture(
                 "candidate-id",

@@ -79,7 +79,14 @@
       }}}
     },
     {
-      "id": "candidate-get", "actor": "task", "after": ["empty-close"],
+      "id": "candidate-list", "actor": "task", "after": ["empty-close"],
+      "action": {"type": "mcp_request", "method": "candidate_list", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}}
+      }}}
+    },
+    {
+      "id": "candidate-get", "actor": "task", "after": ["candidate-list"],
       "action": {"type": "mcp_request", "method": "candidate_get", "params": {"type": "object", "fields": {
         "agent_kind": {"type": "string", "value": "codex"},
         "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
@@ -95,7 +102,7 @@
     {"name": "task-id", "value_type": "task_id", "capture": {"step": "intent-new", "pointer": "/task_id"}},
     {"name": "intent-revision-id", "value_type": "intent_revision_id", "capture": {"step": "intent-new", "pointer": "/intent_revision_id"}},
     {"name": "episode-id", "value_type": "work_episode_id", "capture": {"step": "checkpoint-continue", "pointer": "/episode_id"}},
-    {"name": "built-candidate-id", "value_type": "candidate_id", "capture": {"step": "checkpoint-continue", "pointer": "/candidate_build/items/0/candidate_id"}},
+    {"name": "built-candidate-id", "value_type": "candidate_id", "capture": {"step": "candidate-list", "pointer": "/reviews/0/candidate_id"}},
     {"name": "candidate-id", "value_type": "candidate_id", "capture": {"step": "candidate-get", "pointer": "/candidate_id"}},
     {"name": "candidate-episode-id", "value_type": "work_episode_id", "capture": {"step": "candidate-get", "pointer": "/source_episode/episode_id"}}
   ],

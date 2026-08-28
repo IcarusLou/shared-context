@@ -18,15 +18,16 @@ use sctx_domain::{
     CandidateBuildId, CandidateConfirmationPlan, CandidateId, CandidateReviewStatus,
     CaptureEvidenceRef, CaptureId, CaptureSourceRef, CaptureUnknown, CheckpointClaim,
     CheckpointClaimId, ConfirmationId, ContextId, ContextRevisionRef, Error, ErrorKind, EventId,
-    EvidenceSnapshotDraft, ExternalSessionId, ExternalSessionLocator, ExternalSessionSnapshot,
-    IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation, ProposedSpaceGroupKey,
-    Result, SignalId, SpaceId, SubmissionId, TaskId, TaskIntentRevision, TaskIntentRevisionId,
-    TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle,
-    TaskSignalRecord, WorkEpisode, WorkEpisodeId, WorkEpisodeRef, WorkEpisodeStatus,
-    WorkObservation, WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
+    EvidenceSnapshotDraft, EvidenceType, ExternalSessionId, ExternalSessionLocator,
+    ExternalSessionSnapshot, IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation,
+    ProposedSpaceGroupKey, Result, SignalId, SpaceId, SubmissionId, TaskId, TaskIntentRevision,
+    TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalKind,
+    TaskSignalLifecycle, TaskSignalRecord, WorkEpisode, WorkEpisodeId, WorkEpisodeRef,
+    WorkEpisodeStatus, WorkObservation, WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
 };
+use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const HOOK_BUSY_TIMEOUT: Duration = Duration::from_millis(25);
 const MAX_EPISODE_LIST_LIMIT: usize = 256;
@@ -148,6 +149,55 @@ pub struct AgentCheckpointOutcome {
     pub episode: WorkEpisodeView,
     pub created: bool,
     pub inline_observation_ids: Vec<WorkObservationId>,
+}
+
+/// One bounded, self-contained Evidence input authored directly by the Agent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectEvidenceDraft {
+    pub evidence_type: EvidenceType,
+    pub summary: String,
+    pub limitations: Vec<String>,
+}
+
+/// One model-facing Claim after transport identity fields have been removed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectCheckpointClaimDraft {
+    pub context_kind: sctx_domain::ContextKind,
+    pub statement: String,
+    pub rationale: String,
+    pub conditions: Vec<String>,
+    pub evidence: Vec<DirectEvidenceDraft>,
+}
+
+/// One content-addressed Checkpoint submission. Runtime resolves all lifecycle identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentCheckpointSubmission {
+    pub locator: ExternalSessionLocator,
+    pub claims: Vec<DirectCheckpointClaimDraft>,
+    pub unknowns: Vec<CaptureUnknown>,
+}
+
+/// Durable receipt for one content-addressed Checkpoint operation and Build outbox.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointOperationOutcome {
+    pub operation_id: String,
+    pub checkpoint: AgentCheckpoint,
+    pub episode: WorkEpisodeView,
+    pub build: CandidateBuildView,
+    pub replayed: bool,
+    pub inline_observation_ids: Vec<WorkObservationId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CheckpointOperationRecord {
+    operation_id: String,
+    semantic_json: String,
+    task_session_id: TaskSessionId,
+    task_id: TaskId,
+    intent_revision_id: TaskIntentRevisionId,
+    checkpoint_id: AgentCheckpointId,
+    episode_id: WorkEpisodeId,
+    build_id: CandidateBuildId,
 }
 
 /// Current rebuildable Candidate analysis stored outside Git knowledge facts.
@@ -288,6 +338,7 @@ impl CandidateBuildStatus {
 /// Durable state of one Claim-scoped Candidate creation operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CandidateBuildItemStatus {
+    Queued,
     Prepared,
     NeedsEvidence,
     Created,
@@ -298,6 +349,7 @@ pub enum CandidateBuildItemStatus {
 impl CandidateBuildItemStatus {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Queued => "queued",
             Self::Prepared => "prepared",
             Self::NeedsEvidence => "needs_evidence",
             Self::Created => "created",
@@ -343,6 +395,13 @@ pub struct CandidateBuildView {
     pub final_checkpoint_id: AgentCheckpointId,
     pub status: CandidateBuildStatus,
     pub items: Vec<CandidateBuildItemView>,
+}
+
+/// Non-sensitive aggregate state of one `ActiveTask`'s durable Build recovery queue.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CandidateBuildRecoveryStatus {
+    pub pending: usize,
+    pub incomplete: usize,
 }
 
 /// Result of explicitly opening at most one Episode for an `ActiveTask`.
@@ -489,7 +548,7 @@ impl TaskRuntime {
         fs::create_dir_all(&state).map_err(io_error("create task runtime state directory"))?;
         let database = state.join("runtime.sqlite");
         let configure_schema_on_open = configure_existing_schema || !database.is_file();
-        let runtime = Self {
+        let mut runtime = Self {
             root,
             state,
             database,
@@ -497,6 +556,7 @@ impl TaskRuntime {
             configure_schema_on_open,
         };
         let _connection = runtime.open_connection()?;
+        runtime.configure_schema_on_open = false;
         Ok(runtime)
     }
 
@@ -1312,6 +1372,255 @@ impl TaskRuntime {
         })
     }
 
+    /// Atomically persists or replays one content-addressed, final Checkpoint operation.
+    ///
+    /// Runtime resolves the exact current `ActiveTask`, Intent and Episode, closes the Episode,
+    /// and reserves its Candidate Build outbox in the same transaction. The caller supplies no
+    /// lifecycle CAS or idempotency key.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a missing `ActiveTask`, invalid direct Evidence, task-local reference drift,
+    /// operation hash collision, or storage failure.
+    #[allow(clippy::too_many_lines)]
+    pub fn submit_agent_checkpoint(
+        &self,
+        input: &AgentCheckpointSubmission,
+    ) -> Result<CheckpointOperationOutcome> {
+        input.locator.validate()?;
+        if input.claims.is_empty() && input.unknowns.is_empty() {
+            return Err(invalid(
+                "checkpoint submission must contain at least one Claim or Unknown",
+            ));
+        }
+        let semantic_json = direct_checkpoint_semantic_json(input)?;
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Checkpoint operation transaction")?;
+        let external = read_external_identity(&transaction, &input.locator)?
+            .ok_or_else(|| invalid("ExternalSession has no ActiveTask for Agent Checkpoint"))?;
+        let (task_id, intent_revision_id) =
+            read_active_task_head(&transaction, external.active_task_session_id)?
+                .ok_or_else(|| invariant("located ActiveTask is not active"))?;
+        if task_id != external.active_task_id {
+            return Err(invariant(
+                "ExternalSession ActiveTask identity disagrees with its TaskSession",
+            ));
+        }
+        let intent = read_intent_revision(&transaction, intent_revision_id)?;
+        let claims = materialize_direct_checkpoint_claims(&input.claims, &intent.working_intent)?;
+        let (operation_key, operation_id) = checkpoint_operation_identity(
+            external.active_task_session_id,
+            task_id,
+            intent_revision_id,
+            &semantic_json,
+        );
+
+        if let Some(operation) = read_checkpoint_operation(&transaction, &operation_key)? {
+            if operation.operation_id != operation_id
+                || operation.semantic_json != semantic_json
+                || operation.task_session_id != external.active_task_session_id
+                || operation.task_id != task_id
+                || operation.intent_revision_id != intent_revision_id
+            {
+                return Err(invariant(
+                    "Checkpoint operation key resolved to conflicting persisted content",
+                ));
+            }
+            let episode = require_episode_view(&transaction, operation.episode_id)?;
+            let checkpoint = episode
+                .checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.checkpoint_id == operation.checkpoint_id)
+                .cloned()
+                .ok_or_else(|| invariant("Checkpoint operation receipt lost its Checkpoint"))?;
+            let build = require_candidate_build_view(&transaction, operation.build_id)?;
+            let inline_observation_ids = inline_observation_ids(&checkpoint, &claims)?;
+            transaction
+                .commit()
+                .map_err(sql_error("commit replayed Checkpoint operation"))?;
+            return Ok(CheckpointOperationOutcome {
+                operation_id,
+                checkpoint,
+                episode,
+                build,
+                replayed: true,
+                inline_observation_ids,
+            });
+        }
+
+        let episode_id = if let Some(episode_id) =
+            find_open_episode(&transaction, external.active_task_session_id)?
+        {
+            episode_id
+        } else {
+            insert_open_episode(&transaction, external.active_task_session_id, task_id)?
+        };
+        let (task_session_id, episode_task_id, episode_version, status) =
+            require_episode_head(&transaction, episode_id)?;
+        require_open_episode_version(episode_version, &status, episode_version)?;
+        if task_session_id != external.active_task_session_id || episode_task_id != task_id {
+            return Err(invariant("ActiveTask Work Episode ownership changed"));
+        }
+        insert_all_missing_episode_refs(&transaction, episode_id, task_session_id, task_id)?;
+        let episode_before = require_episode_view(&transaction, episode_id)?.episode;
+        validate_checkpoint_task_local_refs(&episode_before, &claims)?;
+
+        let mut persisted_claims = Vec::with_capacity(claims.len());
+        let mut inline_observation_ids = Vec::new();
+        for claim in &claims {
+            let mut evidence_refs = claim.evidence_refs.clone();
+            for evidence in &claim.inline_validations {
+                evidence.validate("checkpoint_submission.evidence")?;
+                let observation = WorkObservation::from_parts(
+                    task_session_id,
+                    task_id,
+                    intent_revision_id,
+                    Vec::new(),
+                    NormalizedWorkObservation::InlineValidation {
+                        evidence: evidence.clone(),
+                    },
+                )?;
+                insert_observation_rows(&transaction, episode_id, &observation)?;
+                evidence_refs.push(CaptureEvidenceRef::Observation {
+                    observation_id: observation.observation_id,
+                });
+                inline_observation_ids.push(observation.observation_id);
+            }
+            persisted_claims.push(CheckpointClaim::from_parts(
+                claim.context_kind_hint,
+                claim.topic_key_hint.clone(),
+                claim.statement.clone(),
+                claim.rationale.clone(),
+                claim.applicability.clone(),
+                claim.assumptions.clone(),
+                claim.recheck_when.clone(),
+                evidence_refs,
+                claim.artifact_refs.clone(),
+                claim.relations.clone(),
+                claim.engineering_references.clone(),
+                claim.related_contexts.clone(),
+            )?);
+        }
+        let episode_with_inline = require_episode_view(&transaction, episode_id)?.episode;
+        let checkpoint = AgentCheckpoint::from_parts(
+            &episode_with_inline,
+            intent_revision_id,
+            persisted_claims,
+            input.unknowns.clone(),
+        )?;
+        let checkpoint_json =
+            serde_json::to_string(&checkpoint).map_err(json_error("serialize Agent Checkpoint"))?;
+        let checkpoint_ordinal = next_checkpoint_ordinal(&transaction, episode_id)?;
+        transaction
+            .execute(
+                "INSERT INTO agent_checkpoint (
+                    checkpoint_id, episode_id, task_session_id, task_id,
+                    intent_revision_id, parent_episode_version, boundary,
+                    semantic_json, checkpoint_json, checkpoint_ordinal
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'close', ?7, ?8, ?9)",
+                params![
+                    checkpoint.checkpoint_id.to_string(),
+                    episode_id.to_string(),
+                    task_session_id.to_string(),
+                    task_id.to_string(),
+                    intent_revision_id.to_string(),
+                    i64::try_from(episode_version)
+                        .map_err(|_| invalid("Work Episode version exceeds SQLite range"))?,
+                    semantic_json,
+                    checkpoint_json,
+                    checkpoint_ordinal,
+                ],
+            )
+            .map_err(sql_error("insert content-addressed Agent Checkpoint"))?;
+        let mut validation_episode = episode_with_inline;
+        validation_episode.close(&checkpoint)?;
+        close_episode_version(
+            &transaction,
+            episode_id,
+            episode_version,
+            checkpoint.checkpoint_id,
+        )?;
+
+        let build_id = CandidateBuildId::new();
+        transaction
+            .execute(
+                "INSERT INTO candidate_build (
+                    build_id, episode_id, task_session_id, task_id,
+                    final_checkpoint_id, status
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending')",
+                params![
+                    build_id.to_string(),
+                    episode_id.to_string(),
+                    task_session_id.to_string(),
+                    task_id.to_string(),
+                    checkpoint.checkpoint_id.to_string(),
+                ],
+            )
+            .map_err(sql_error("reserve Candidate Build outbox"))?;
+        let closed_episode = require_episode_view(&transaction, episode_id)?;
+        for (item_ordinal, (checkpoint_id, claim_id)) in closed_episode
+            .checkpoints
+            .iter()
+            .flat_map(|checkpoint| {
+                checkpoint
+                    .claims
+                    .iter()
+                    .map(move |claim| (checkpoint.checkpoint_id, claim.claim_id))
+            })
+            .enumerate()
+        {
+            transaction
+                .execute(
+                    "INSERT INTO candidate_build_item (
+                        build_id, item_ordinal, checkpoint_id, claim_id, submission_id,
+                        content_hash, status, candidate_id, event_id, error_code
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'queued', NULL, NULL, NULL)",
+                    params![
+                        build_id.to_string(),
+                        i64::try_from(item_ordinal).map_err(|_| {
+                            invalid("Candidate Build item ordinal exceeds SQLite range")
+                        })?,
+                        checkpoint_id.to_string(),
+                        claim_id.to_string(),
+                        SubmissionId::new().to_string(),
+                    ],
+                )
+                .map_err(sql_error("reserve Candidate Build outbox item"))?;
+        }
+        transaction
+            .execute(
+                "INSERT INTO checkpoint_operation (
+                    operation_key, operation_id, semantic_json, task_session_id, task_id,
+                    intent_revision_id, checkpoint_id, episode_id, build_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    operation_key,
+                    operation_id,
+                    semantic_json,
+                    task_session_id.to_string(),
+                    task_id.to_string(),
+                    intent_revision_id.to_string(),
+                    checkpoint.checkpoint_id.to_string(),
+                    episode_id.to_string(),
+                    build_id.to_string(),
+                ],
+            )
+            .map_err(sql_error("persist Checkpoint operation receipt"))?;
+        let episode = closed_episode;
+        let build = require_candidate_build_view(&transaction, build_id)?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit Checkpoint operation"))?;
+        Ok(CheckpointOperationOutcome {
+            operation_id,
+            checkpoint,
+            episode,
+            build,
+            replayed: false,
+            inline_observation_ids,
+        })
+    }
+
     /// Reads one persisted Work Episode by server-owned ID.
     ///
     /// # Errors
@@ -1756,6 +2065,171 @@ impl TaskRuntime {
         read_candidate_build_id(&connection, episode_id)?
             .map(|build_id| require_candidate_build_view(&connection, build_id))
             .transpose()
+    }
+
+    /// Lists a bounded set of pending or incomplete Build outboxes for the exact `ActiveTask`.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a missing Session, an invalid bound, or storage failure.
+    pub fn list_recoverable_candidate_build_episodes(
+        &self,
+        locator: &ExternalSessionLocator,
+        limit: usize,
+    ) -> Result<Vec<WorkEpisodeId>> {
+        locator.validate()?;
+        if limit == 0 || limit > 64 {
+            return Err(invalid(
+                "Candidate Build recovery limit must be between 1 and 64",
+            ));
+        }
+        let connection = self.open_connection()?;
+        let external = read_external_identity(&connection, locator)?
+            .ok_or_else(|| invalid("ExternalSession has no ActiveTask for Candidate recovery"))?;
+        let mut statement = connection
+            .prepare(
+                "SELECT build.episode_id
+                 FROM candidate_build AS build
+                 JOIN work_episode AS episode ON episode.episode_id = build.episode_id
+                 WHERE build.task_session_id = ?1 AND build.task_id = ?2
+                   AND (
+                       build.status IN ('pending', 'incomplete') OR EXISTS (
+                           SELECT 1
+                           FROM candidate_build_item AS item
+                           LEFT JOIN candidate_analysis AS analysis
+                             ON analysis.candidate_id = item.candidate_id
+                           WHERE item.build_id = build.build_id
+                             AND item.status IN ('created', 'already_exists')
+                             AND (analysis.candidate_id IS NULL
+                                  OR analysis.analysis_status != 'complete')
+                       )
+                   )
+                 ORDER BY build.recovery_attempt_generation ASC,
+                          CASE build.status WHEN 'pending' THEN 0 ELSE 1 END,
+                          episode.episode_ordinal ASC LIMIT ?3",
+            )
+            .map_err(sql_error("prepare recoverable Candidate Build list"))?;
+        let limit = i64::try_from(limit)
+            .map_err(|_| invalid("Candidate Build recovery limit overflows SQLite"))?;
+        statement
+            .query_map(
+                params![
+                    external.active_task_session_id.to_string(),
+                    external.active_task_id.to_string(),
+                    limit,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(sql_error("query recoverable Candidate Builds"))?
+            .map(|row| {
+                row.map_err(sql_error("read recoverable Candidate Build row"))
+                    .and_then(|value| parse_id(&value, "candidate_build.episode_id"))
+            })
+            .collect()
+    }
+
+    /// Persists one safe recovery attempt outcome and advances fair queue ordering.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown Build, unsafe error code, or storage failure.
+    pub fn record_candidate_build_recovery_attempt(
+        &self,
+        episode_id: WorkEpisodeId,
+        error_code: Option<&str>,
+    ) -> Result<()> {
+        if error_code.is_some_and(|code| !valid_error_code(code)) {
+            return Err(invalid("Candidate Build recovery error code is invalid"));
+        }
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Candidate Build recovery attempt")?;
+        let changed = transaction
+            .execute(
+                "UPDATE candidate_build
+                 SET recovery_attempt_generation = recovery_attempt_generation + 1,
+                     last_recovery_status = ?1, last_recovery_error_code = ?2
+                 WHERE episode_id = ?3",
+                params![
+                    if error_code.is_some() {
+                        "failed"
+                    } else {
+                        "succeeded"
+                    },
+                    error_code,
+                    episode_id.to_string(),
+                ],
+            )
+            .map_err(sql_error("record Candidate Build recovery attempt"))?;
+        if changed != 1 {
+            return Err(invalid("Candidate Build recovery Episode does not exist"));
+        }
+        transaction
+            .commit()
+            .map_err(sql_error("commit Candidate Build recovery attempt"))
+    }
+
+    /// Returns non-sensitive pending/incomplete counts for one exact `ActiveTask`.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a missing Session or storage failure.
+    pub fn candidate_build_recovery_status(
+        &self,
+        locator: &ExternalSessionLocator,
+    ) -> Result<CandidateBuildRecoveryStatus> {
+        locator.validate()?;
+        let connection = self.open_connection()?;
+        let external = read_external_identity(&connection, locator)?
+            .ok_or_else(|| invalid("ExternalSession has no ActiveTask for Candidate recovery"))?;
+        let (pending, incomplete) = connection
+            .query_row(
+                "SELECT
+                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status = 'incomplete' THEN 1 ELSE 0 END)
+                 FROM candidate_build WHERE task_session_id = ?1 AND task_id = ?2",
+                params![
+                    external.active_task_session_id.to_string(),
+                    external.active_task_id.to_string(),
+                ],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .map_err(sql_error("read Candidate Build recovery status"))?;
+        Ok(CandidateBuildRecoveryStatus {
+            pending: usize::try_from(pending.unwrap_or(0))
+                .map_err(|_| invariant("pending Candidate Build count is invalid"))?,
+            incomplete: usize::try_from(incomplete.unwrap_or(0))
+                .map_err(|_| invariant("incomplete Candidate Build count is invalid"))?,
+        })
+    }
+
+    /// Checks exact `ActiveTask` ownership before target-aware Candidate recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns only locator/storage errors; missing or cross-owner Episodes are `false`.
+    pub fn owns_candidate_recovery_episode(
+        &self,
+        locator: &ExternalSessionLocator,
+        episode_id: WorkEpisodeId,
+    ) -> Result<bool> {
+        locator.validate()?;
+        let connection = self.open_connection()?;
+        let external = read_external_identity(&connection, locator)?
+            .ok_or_else(|| invalid("ExternalSession has no ActiveTask for Candidate recovery"))?;
+        connection
+            .query_row(
+                "SELECT 1 FROM work_episode
+                 WHERE episode_id = ?1 AND task_session_id = ?2 AND task_id = ?3",
+                params![
+                    episode_id.to_string(),
+                    external.active_task_session_id.to_string(),
+                    external.active_task_id.to_string(),
+                ],
+                |_row| Ok(()),
+            )
+            .optional()
+            .map(|value| value.is_some())
+            .map_err(sql_error("check Candidate recovery Episode ownership"))
     }
 
     /// Atomically replaces the current rebuildable review analysis for one persisted Candidate.
@@ -2708,10 +3182,39 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 task_id TEXT NOT NULL,
                 final_checkpoint_id TEXT NOT NULL,
                 status TEXT NOT NULL CHECK (status IN ('pending', 'complete', 'incomplete')),
+                recovery_attempt_generation INTEGER NOT NULL DEFAULT 0
+                    CHECK (recovery_attempt_generation >= 0),
+                last_recovery_status TEXT CHECK (
+                    last_recovery_status IS NULL OR last_recovery_status IN ('succeeded', 'failed')
+                ),
+                last_recovery_error_code TEXT,
+                CHECK (
+                    (last_recovery_status = 'failed' AND last_recovery_error_code IS NOT NULL) OR
+                    (last_recovery_status IS NULL AND last_recovery_error_code IS NULL) OR
+                    (last_recovery_status = 'succeeded' AND last_recovery_error_code IS NULL)
+                ),
                 FOREIGN KEY (episode_id, task_session_id, task_id)
                     REFERENCES work_episode (episode_id, task_session_id, task_id),
                 FOREIGN KEY (final_checkpoint_id, episode_id)
                     REFERENCES agent_checkpoint (checkpoint_id, episode_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS checkpoint_operation (
+                operation_key TEXT PRIMARY KEY,
+                operation_id TEXT NOT NULL UNIQUE,
+                semantic_json TEXT NOT NULL CHECK (json_valid(semantic_json)),
+                task_session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                intent_revision_id TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL UNIQUE,
+                episode_id TEXT NOT NULL UNIQUE,
+                build_id TEXT NOT NULL UNIQUE,
+                FOREIGN KEY (task_session_id) REFERENCES task_session (task_session_id),
+                FOREIGN KEY (task_id) REFERENCES task_session (task_id),
+                FOREIGN KEY (intent_revision_id)
+                    REFERENCES task_intent_revision (revision_id),
+                FOREIGN KEY (checkpoint_id, episode_id)
+                    REFERENCES agent_checkpoint (checkpoint_id, episode_id),
+                FOREIGN KEY (build_id) REFERENCES candidate_build (build_id)
             ) STRICT;
             CREATE TABLE IF NOT EXISTS candidate_build_item (
                 build_id TEXT NOT NULL,
@@ -2721,7 +3224,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 submission_id TEXT NOT NULL UNIQUE,
                 content_hash TEXT,
                 status TEXT NOT NULL CHECK (status IN (
-                    'prepared', 'needs_evidence', 'created', 'already_exists', 'failed'
+                    'queued', 'prepared', 'needs_evidence', 'created', 'already_exists', 'failed'
                 )),
                 candidate_id TEXT,
                 event_id TEXT,
@@ -2729,6 +3232,8 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 PRIMARY KEY (build_id, claim_id),
                 UNIQUE (build_id, item_ordinal),
                 CHECK (
+                    (status = 'queued' AND content_hash IS NULL
+                        AND candidate_id IS NULL AND event_id IS NULL AND error_code IS NULL) OR
                     (status = 'prepared' AND content_hash IS NOT NULL
                         AND candidate_id IS NULL AND event_id IS NULL AND error_code IS NULL) OR
                     (status = 'needs_evidence' AND content_hash IS NULL
@@ -2843,7 +3348,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 UNIQUE (episode_id, capture_id, kind),
                 FOREIGN KEY (episode_id) REFERENCES work_episode (episode_id)
             ) STRICT;
-            PRAGMA user_version = 11;",
+            PRAGMA user_version = 12;",
         )
         .map_err(sql_error("initialize task runtime schema"))
 }
@@ -3093,6 +3598,155 @@ fn checkpoint_semantic_json(input: &AgentCheckpointWrite) -> Result<String> {
     .map_err(json_error("serialize Agent Checkpoint semantics"))
 }
 
+fn direct_checkpoint_semantic_json(input: &AgentCheckpointSubmission) -> Result<String> {
+    let claims = input
+        .claims
+        .iter()
+        .map(|claim| {
+            let evidence = claim
+                .evidence
+                .iter()
+                .map(|evidence| {
+                    serde_json::json!({
+                        "evidence_type": evidence.evidence_type,
+                        "summary": evidence.summary,
+                        "limitations": evidence.limitations,
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "context_kind": claim.context_kind,
+                "statement": claim.statement,
+                "rationale": claim.rationale,
+                "conditions": claim.conditions,
+                "evidence": evidence,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&serde_json::json!({
+        "claims": claims,
+        "unknowns": input.unknowns,
+    }))
+    .map_err(json_error("serialize direct Checkpoint semantics"))
+}
+
+fn materialize_direct_checkpoint_claims(
+    claims: &[DirectCheckpointClaimDraft],
+    intent: &WorkingIntentSnapshot,
+) -> Result<Vec<CheckpointClaimDraft>> {
+    claims
+        .iter()
+        .map(|claim| {
+            if claim.evidence.is_empty() {
+                return Err(invalid("Checkpoint Claim Evidence must not be empty"));
+            }
+            let applicability = Applicability {
+                domains: intent.domains.clone(),
+                platforms: intent.platforms.clone(),
+                conditions: claim.conditions.clone(),
+            };
+            applicability.validate("checkpoint_submission.claim.applicability")?;
+            let inline_validations = claim
+                .evidence
+                .iter()
+                .map(|evidence| {
+                    if evidence.summary.trim().is_empty() {
+                        return Err(invalid(
+                            "checkpoint_submission.claim.evidence.summary must not be empty",
+                        ));
+                    }
+                    let draft = EvidenceSnapshotDraft {
+                        kind: evidence.evidence_type,
+                        supports: claim.statement.clone(),
+                        content: serde_json::json!({"summary": evidence.summary}),
+                        interpretation: claim.rationale.clone(),
+                        limitations: evidence.limitations.clone(),
+                    };
+                    draft.validate("checkpoint_submission.claim.evidence")?;
+                    Ok(draft)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(CheckpointClaimDraft {
+                context_kind_hint: Some(claim.context_kind),
+                topic_key_hint: None,
+                statement: claim.statement.clone(),
+                rationale: claim.rationale.clone(),
+                applicability,
+                assumptions: Vec::new(),
+                recheck_when: Vec::new(),
+                evidence_refs: Vec::new(),
+                inline_validations,
+                artifact_refs: Vec::new(),
+                relations: Vec::new(),
+                engineering_references: Vec::new(),
+                related_contexts: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+fn checkpoint_operation_identity(
+    task_session_id: TaskSessionId,
+    task_id: TaskId,
+    intent_revision_id: TaskIntentRevisionId,
+    semantic_json: &str,
+) -> (String, String) {
+    let mut hasher = Sha256::new();
+    hasher.update(b"shared-context-checkpoint-operation-v1");
+    for value in [
+        task_session_id.to_string(),
+        task_id.to_string(),
+        intent_revision_id.to_string(),
+        semantic_json.to_owned(),
+    ] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    let operation_key = format!("sha256:{digest}");
+    (operation_key.clone(), operation_key)
+}
+
+fn read_checkpoint_operation(
+    connection: &Connection,
+    operation_key: &str,
+) -> Result<Option<CheckpointOperationRecord>> {
+    let row = connection
+        .query_row(
+            "SELECT operation_id, semantic_json, task_session_id, task_id,
+                    intent_revision_id, checkpoint_id, episode_id, build_id
+             FROM checkpoint_operation WHERE operation_key = ?1",
+            [operation_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error("read Checkpoint operation"))?;
+    row.map(|row| {
+        Ok(CheckpointOperationRecord {
+            operation_id: row.0,
+            semantic_json: row.1,
+            task_session_id: parse_id(&row.2, "checkpoint_operation.task_session_id")?,
+            task_id: parse_id(&row.3, "checkpoint_operation.task_id")?,
+            intent_revision_id: parse_id(&row.4, "checkpoint_operation.intent_revision_id")?,
+            checkpoint_id: parse_id(&row.5, "checkpoint_operation.checkpoint_id")?,
+            episode_id: parse_id(&row.6, "checkpoint_operation.episode_id")?,
+            build_id: parse_id(&row.7, "checkpoint_operation.build_id")?,
+        })
+    })
+    .transpose()
+}
+
 fn validate_checkpoint_task_local_refs(
     episode: &WorkEpisode,
     claims: &[CheckpointClaimDraft],
@@ -3208,7 +3862,8 @@ fn validate_build_preparations(items: &[CandidateBuildItemPreparation]) -> Resul
                     "Candidate Build preparation readiness metadata is incomplete",
                 ));
             }
-            CandidateBuildItemStatus::Created
+            CandidateBuildItemStatus::Queued
+            | CandidateBuildItemStatus::Created
             | CandidateBuildItemStatus::AlreadyExists
             | CandidateBuildItemStatus::Failed => {
                 return Err(invalid(
@@ -3278,9 +3933,11 @@ fn validate_build_item_result(
         | CandidateBuildItemStatus::Failed => Err(invalid(
             "Candidate Build result identity or safe error code is incomplete",
         )),
-        CandidateBuildItemStatus::Prepared | CandidateBuildItemStatus::NeedsEvidence => Err(
-            invalid("Candidate Build result requires a terminal submission status"),
-        ),
+        CandidateBuildItemStatus::Queued
+        | CandidateBuildItemStatus::Prepared
+        | CandidateBuildItemStatus::NeedsEvidence => Err(invalid(
+            "Candidate Build result requires a terminal submission status",
+        )),
     }
 }
 
@@ -3379,10 +4036,12 @@ fn refresh_candidate_build_status(
     build_id: CandidateBuildId,
 ) -> Result<()> {
     let items = read_candidate_build_items(transaction, build_id)?;
-    let status = if items
-        .iter()
-        .any(|item| item.status == CandidateBuildItemStatus::Prepared)
-    {
+    let status = if items.iter().any(|item| {
+        matches!(
+            item.status,
+            CandidateBuildItemStatus::Queued | CandidateBuildItemStatus::Prepared
+        )
+    }) {
         CandidateBuildStatus::Pending
     } else if items.iter().any(|item| {
         matches!(
@@ -3508,6 +4167,7 @@ fn parse_candidate_build_status(value: &str) -> Result<CandidateBuildStatus> {
 
 fn parse_candidate_build_item_status(value: &str) -> Result<CandidateBuildItemStatus> {
     match value {
+        "queued" => Ok(CandidateBuildItemStatus::Queued),
         "prepared" => Ok(CandidateBuildItemStatus::Prepared),
         "needs_evidence" => Ok(CandidateBuildItemStatus::NeedsEvidence),
         "created" => Ok(CandidateBuildItemStatus::Created),
@@ -4588,10 +5248,10 @@ fn find_active_signal(
 }
 
 fn read_external_identity(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     locator: &ExternalSessionLocator,
 ) -> Result<Option<ExternalIdentity>> {
-    transaction
+    connection
         .query_row(
             "SELECT external_session_id, active_task_session_id, active_task_id
              FROM external_session

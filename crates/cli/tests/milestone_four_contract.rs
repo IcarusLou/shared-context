@@ -93,10 +93,24 @@ fn build_review(
     .unwrap()
     .into_accepted()
     .expect("nonempty Checkpoint must be accepted");
-    let build = closed.candidate_build.as_ref().unwrap();
-    assert_eq!(build.items.len(), expected_builder_items);
-    let item = &build.items[0];
-    (task, item.candidate_id.unwrap(), closed.episode_id)
+    assert_eq!(
+        closed.candidate_build.status,
+        sctx_mcp::CandidateBuildResponseStatus::Pending
+    );
+    let recovered = candidate_list_at_root(
+        root,
+        &CandidateListInput {
+            agent_kind: agent_kind.to_owned(),
+            external_session_id: session.to_owned(),
+            status: CandidateReviewStatus::Pending,
+            limit: 10,
+            cursor: None,
+            token_budget: 32_768,
+        },
+    )
+    .unwrap();
+    assert_eq!(recovered.reviews.len(), expected_builder_items);
+    (task, recovered.reviews[0].0.candidate_id, closed.episode_id)
 }
 
 #[test]

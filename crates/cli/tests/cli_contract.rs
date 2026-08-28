@@ -11,8 +11,8 @@ use std::{
 
 use sctx_agent_adapter::SHARED_CONTEXT_ACTIVATION_MARKER;
 use sctx_domain::{
-    Applicability, ContextKind, ContextRevisionDraft, Error, ErrorKind, EventId,
-    EvidenceSnapshotDraft, ExternalSessionLocator, IntentSnapshot, PublicationAction,
+    Applicability, CandidateReviewStatus, ContextKind, ContextRevisionDraft, Error, ErrorKind,
+    EventId, EvidenceSnapshotDraft, ExternalSessionLocator, IntentSnapshot, PublicationAction,
     PublicationDraft, Result, SpaceId, SubmissionId, TaskSignalKind, WorkEpisodeId,
     WorkingIntentSnapshot,
 };
@@ -24,9 +24,10 @@ use sctx_git_store::{
 use sctx_index::ProjectionIndex;
 use sctx_local_state::{MaintenanceLock, UserConfigStore};
 use sctx_mcp::{
-    ExpectedRevisionId, TaskBoundary, TaskCheckpointClaimInput, TaskCheckpointEvidenceInput,
-    TaskCheckpointInput, TaskCheckpointUnknownInput, TaskIntentUpdateInput,
-    task_checkpoint_at_root, task_intent_update_at_root,
+    CandidateListInput, ExpectedRevisionId, TaskBoundary, TaskCheckpointClaimInput,
+    TaskCheckpointEvidenceInput, TaskCheckpointInput, TaskCheckpointUnknownInput,
+    TaskIntentUpdateInput, candidate_list_at_root, task_checkpoint_at_root,
+    task_intent_update_at_root,
 };
 use sctx_task_runtime::TaskRuntime;
 use serde_json::Value;
@@ -1818,9 +1819,25 @@ fn twenty_cli_processes_confirm_one_review_in_one_atomic_commit() {
     .unwrap()
     .into_accepted()
     .expect("nonempty Checkpoint must be accepted");
-    let candidate_id = closed.candidate_build.as_ref().unwrap().items[0]
-        .candidate_id
-        .unwrap();
+    assert_eq!(
+        closed.candidate_build.status,
+        sctx_mcp::CandidateBuildResponseStatus::Pending
+    );
+    let candidate_id = candidate_list_at_root(
+        harness.root(),
+        &CandidateListInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            status: CandidateReviewStatus::Pending,
+            limit: 10,
+            cursor: None,
+            token_budget: 32_768,
+        },
+    )
+    .unwrap()
+    .reviews[0]
+        .0
+        .candidate_id;
     let input_path = harness.home.join("candidate-confirm.json");
     fs::write(
         &input_path,
@@ -2071,15 +2088,12 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
         checkpoint_path.to_str().unwrap(),
     ]);
     assert_eq!(checkpoint["command"], "task.checkpoint");
-    assert_eq!(checkpoint["data"]["created"], true);
+    assert_eq!(checkpoint["data"]["status"], "accepted");
+    assert_eq!(checkpoint["data"]["replayed"], false);
     assert_eq!(checkpoint["data"]["episode_version"], 1);
     assert!(text(&checkpoint, "checkpoint_id").starts_with("ckp_"));
     let closed = checkpoint;
-    assert_eq!(closed["data"]["candidate_build"]["status"], "complete");
-    assert_eq!(
-        closed["data"]["candidate_build"]["items"][0]["status"],
-        "created"
-    );
+    assert_eq!(closed["data"]["candidate_build"]["status"], "pending");
     let episode_id = closed["data"]["episode_id"].as_str().unwrap();
     let rebuilt = harness.success(&[
         "candidate",
@@ -2092,11 +2106,8 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
         rebuilt["data"]["build_id"],
         closed["data"]["candidate_build"]["build_id"]
     );
-    assert_eq!(
-        rebuilt["data"]["items"][0]["submission_id"],
-        closed["data"]["candidate_build"]["items"][0]["submission_id"]
-    );
-    let candidate_id = closed["data"]["candidate_build"]["items"][0]["candidate_id"]
+    assert_eq!(rebuilt["data"]["items"][0]["status"], "created");
+    let candidate_id = rebuilt["data"]["items"][0]["candidate_id"]
         .as_str()
         .unwrap();
     let analyzed = harness.success(&[

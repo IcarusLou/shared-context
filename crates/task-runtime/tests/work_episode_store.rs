@@ -16,10 +16,11 @@ use sctx_domain::{
     WorkEpisodeStatus, WorkSourceRef, WorkingIntentSnapshot,
 };
 use sctx_task_runtime::{
-    AgentCheckpointWrite, AutomatedEpisodeBoundary, CandidateBuildItemPreparation,
-    CandidateBuildItemStatus, CandidateBuildStatus, CandidateReviewDiscard,
-    CandidateReviewDiscardStatus, CaptureIngestion, CheckpointBoundary, CheckpointClaimDraft,
-    DEFAULT_CANDIDATE_REVIEW_TTL, IntentRevisionWriteStatus, MAX_CANDIDATE_REVIEW_TTL, TaskRuntime,
+    AgentCheckpointSubmission, AgentCheckpointWrite, AutomatedEpisodeBoundary,
+    CandidateBuildItemPreparation, CandidateBuildItemStatus, CandidateBuildStatus,
+    CandidateReviewDiscard, CandidateReviewDiscardStatus, CaptureIngestion, CheckpointBoundary,
+    CheckpointClaimDraft, DEFAULT_CANDIDATE_REVIEW_TTL, DirectCheckpointClaimDraft,
+    DirectEvidenceDraft, IntentRevisionWriteStatus, MAX_CANDIDATE_REVIEW_TTL, TaskRuntime,
     WorkEpisodeDiagnosticKind,
 };
 use tempfile::TempDir;
@@ -136,6 +137,27 @@ fn checkpoint_write(
     }
 }
 
+fn direct_submission(
+    locator: &ExternalSessionLocator,
+    statement: &str,
+) -> AgentCheckpointSubmission {
+    AgentCheckpointSubmission {
+        locator: locator.clone(),
+        claims: vec![DirectCheckpointClaimDraft {
+            context_kind: ContextKind::Validation,
+            statement: statement.to_owned(),
+            rationale: "The direct Checkpoint operation is durable".to_owned(),
+            conditions: vec!["content addressed".to_owned()],
+            evidence: vec![DirectEvidenceDraft {
+                evidence_type: EvidenceType::ExperimentRecord,
+                summary: format!("{statement} passed"),
+                limitations: Vec::new(),
+            }],
+        }],
+        unknowns: Vec::new(),
+    }
+}
+
 fn finalize_review(
     runtime: &TaskRuntime,
     locator: &ExternalSessionLocator,
@@ -187,6 +209,176 @@ fn finalize_review(
         .read_candidate_review(locator, candidate_id)
         .unwrap()
         .unwrap()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn content_addressed_checkpoint_operations_converge_across_concurrency_and_delayed_retry() {
+    let temporary = TempDir::new().unwrap();
+    let runtime = Arc::new(TaskRuntime::initialize(temporary.path()).unwrap());
+    let (locator, task) = open_task(&runtime, "content-operation", "persist direct Checkpoints");
+
+    let a = direct_submission(&locator, "Operation A");
+    let first_a = runtime.submit_agent_checkpoint(&a).unwrap();
+    assert!(!first_a.replayed);
+    assert_eq!(first_a.build.status, CandidateBuildStatus::Pending);
+    assert_eq!(first_a.build.items.len(), 1);
+    assert_eq!(
+        first_a.build.items[0].status,
+        CandidateBuildItemStatus::Queued
+    );
+
+    let b = direct_submission(&locator, "Operation B");
+    let first_b = runtime.submit_agent_checkpoint(&b).unwrap();
+    assert!(!first_b.replayed);
+    assert_ne!(first_b.operation_id, first_a.operation_id);
+    assert_ne!(
+        first_b.checkpoint.checkpoint_id,
+        first_a.checkpoint.checkpoint_id
+    );
+    assert_ne!(
+        first_b.episode.episode.episode_id,
+        first_a.episode.episode.episode_id
+    );
+
+    let delayed_a = runtime.submit_agent_checkpoint(&a).unwrap();
+    assert!(delayed_a.replayed);
+    assert_eq!(delayed_a.operation_id, first_a.operation_id);
+    assert_eq!(
+        delayed_a.checkpoint.checkpoint_id,
+        first_a.checkpoint.checkpoint_id
+    );
+    assert_eq!(
+        delayed_a.episode.episode.episode_id,
+        first_a.episode.episode.episode_id
+    );
+    assert_eq!(delayed_a.build.build_id, first_a.build.build_id);
+    assert_eq!(
+        runtime
+            .list_work_episodes(task.task_session_id, 10)
+            .unwrap()
+            .len(),
+        2,
+        "A/B/A must not create a third Episode"
+    );
+
+    let parallel = direct_submission(&locator, "Operation C concurrent");
+    let barrier = Arc::new(Barrier::new(8));
+    let handles = (0..8)
+        .map(|_| {
+            let runtime = Arc::clone(&runtime);
+            let barrier = Arc::clone(&barrier);
+            let submission = parallel.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                runtime.submit_agent_checkpoint(&submission).unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    let outcomes = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes.iter().filter(|outcome| !outcome.replayed).count(),
+        1
+    );
+    assert!(outcomes.iter().all(|outcome| {
+        outcome.operation_id == outcomes[0].operation_id
+            && outcome.checkpoint.checkpoint_id == outcomes[0].checkpoint.checkpoint_id
+            && outcome.episode.episode.episode_id == outcomes[0].episode.episode.episode_id
+            && outcome.build.build_id == outcomes[0].build.build_id
+            && outcome.build.items[0].submission_id == outcomes[0].build.items[0].submission_id
+    }));
+    assert_eq!(
+        runtime
+            .list_work_episodes(task.task_session_id, 10)
+            .unwrap()
+            .len(),
+        3
+    );
+    let revised = runtime
+        .append_intent_revision(
+            task.task_session_id,
+            task.current_intent_revision().unwrap().revision_id,
+            intent("persist direct Checkpoints under a revised Intent"),
+        )
+        .unwrap();
+    assert_eq!(revised.status, IntentRevisionWriteStatus::Created);
+    let revised_a = runtime.submit_agent_checkpoint(&a).unwrap();
+    assert!(!revised_a.replayed);
+    assert_ne!(revised_a.operation_id, first_a.operation_id);
+    let (other_locator, other_task) = open_task(
+        &runtime,
+        "content-operation-other",
+        "persist direct Checkpoints",
+    );
+    let other_a = runtime
+        .submit_agent_checkpoint(&direct_submission(&other_locator, "Operation A"))
+        .unwrap();
+    assert!(!other_a.replayed);
+    assert_ne!(other_a.operation_id, first_a.operation_id);
+    assert_ne!(other_task.task_id, task.task_id);
+    assert_eq!(
+        runtime
+            .list_recoverable_candidate_build_episodes(&locator, 10)
+            .unwrap()
+            .len(),
+        4
+    );
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    let persisted_semantics = connection
+        .query_row(
+            "SELECT semantic_json FROM checkpoint_operation WHERE operation_id = ?1",
+            [&first_a.operation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    assert!(persisted_semantics.contains("Operation A"));
+    assert!(!persisted_semantics.contains("content-operation"));
+    assert!(!persisted_semantics.contains(&task.task_id.to_string()));
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM checkpoint_operation", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        5
+    );
+}
+
+#[test]
+fn checkpoint_operation_rolls_back_episode_checkpoint_and_outbox_together() {
+    let temporary = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(temporary.path()).unwrap();
+    let (locator, _task) = open_task(&runtime, "operation-rollback", "prove atomic outbox");
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_candidate_build
+             BEFORE INSERT ON candidate_build
+             BEGIN SELECT RAISE(ABORT, 'injected build reservation failure'); END;",
+        )
+        .unwrap();
+    let error = runtime
+        .submit_agent_checkpoint(&direct_submission(&locator, "Atomic rollback"))
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Io);
+    for table in [
+        "work_episode",
+        "work_observation",
+        "agent_checkpoint",
+        "candidate_build",
+        "candidate_build_item",
+        "checkpoint_operation",
+    ] {
+        let count = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "{table} retained partial operation residue");
+    }
 }
 
 #[test]
