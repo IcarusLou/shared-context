@@ -97,14 +97,14 @@ impl PrivacyScan {
     }
 }
 
-/// Redacted capture text plus safe diagnostics.
+/// Redacted untrusted text plus safe diagnostics.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RedactedText {
     pub text: String,
     pub finding_kinds: Vec<PrivacyFindingKind>,
 }
 
-/// Deterministic, offline Secret/PII scanner shared by capture and Git append.
+/// Deterministic, offline Secret/PII scanner shared by local and Git boundaries.
 #[derive(Clone, Debug)]
 pub struct PrivacyScanner {
     max_scan_bytes: usize,
@@ -156,7 +156,7 @@ impl PrivacyScanner {
         Ok(PrivacyScan { findings })
     }
 
-    /// Redacts every supported match for short-lived capture storage.
+    /// Redacts every supported match in untrusted text.
     ///
     /// # Errors
     ///

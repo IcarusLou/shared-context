@@ -1732,7 +1732,7 @@ mod tests {
         let outside = temporary.path().join("outside");
         fs::write(&outside, "preserve").unwrap();
         let sibling_sentinels = [
-            temporary.path().join("state/capture/sentinel.json"),
+            temporary.path().join("state/diagnostics/sentinel.json"),
             temporary.path().join("state/runtime/sentinel.sqlite"),
             temporary.path().join("repository/context-sentinel.json"),
         ];

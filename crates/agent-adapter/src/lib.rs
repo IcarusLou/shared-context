@@ -41,7 +41,7 @@ pub struct AgentEventContext {
 }
 
 /// A strict vendor-neutral lifecycle event. Transcript paths, user identity, timestamps, and raw
-/// tool output are deliberately excluded: none is a domain fact or safe breadcrumb content.
+/// tool output are deliberately excluded: none is a domain fact or safe runtime input.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum CanonicalAgentEvent {
@@ -120,18 +120,6 @@ pub enum ToolCategory {
     Shell,
     SharedContext,
     Other,
-}
-
-impl ToolCategory {
-    const fn breadcrumb_label(self) -> &'static str {
-        match self {
-            Self::FileOperation => "file operation",
-            Self::TestRunner => "test runner",
-            Self::Shell => "shell",
-            Self::SharedContext => "shared context",
-            Self::Other => "tool",
-        }
-    }
 }
 
 /// Safe, bounded translation of the structured portion of one vendor tool call.
@@ -326,27 +314,11 @@ fn normalize_version(value: &str) -> Option<&str> {
     })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CanonicalBreadcrumbKind {
-    ToolOutcome,
-    Checkpoint,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CanonicalBreadcrumb {
-    pub external_session_locator: ExternalSessionLocator,
-    pub kind: CanonicalBreadcrumbKind,
-    pub summary: String,
-    pub workspace_hint: Option<PathBuf>,
-    pub file_hints: Vec<PathBuf>,
-}
-
 /// Typed local Task Runtime work planned from one canonical Agent event.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum TaskRuntimeOperation {
-    MergeObservations {
+    MergeSignals {
         locator: ExternalSessionLocator,
         cwd: PathBuf,
         workspace_roots: Vec<PathBuf>,
@@ -376,7 +348,6 @@ pub enum EpisodeFinalizationTrigger {
 pub struct CanonicalAgentAction {
     /// Typed Task Runtime operation. `None` means no Task state access.
     pub task_operation: Option<TaskRuntimeOperation>,
-    pub breadcrumb: Option<CanonicalBreadcrumb>,
     /// Model-visible, read-only context supplied by the lifecycle Hook.
     #[serde(default)]
     pub additional_context: Option<String>,
@@ -389,7 +360,6 @@ impl CanonicalAgentAction {
     pub const fn neutral() -> Self {
         Self {
             task_operation: None,
-            breadcrumb: None,
             additional_context: None,
             system_message: None,
         }
@@ -399,7 +369,6 @@ impl CanonicalAgentAction {
     pub fn degraded(diagnostic: String) -> Self {
         Self {
             task_operation: None,
-            breadcrumb: None,
             additional_context: None,
             system_message: Some(diagnostic),
         }
@@ -434,7 +403,6 @@ fn plan_enabled_action(
     match event {
         CanonicalAgentEvent::SessionStart { .. } => CanonicalAgentAction {
             task_operation: None,
-            breadcrumb: None,
             additional_context: Some(SHARED_CONTEXT_ACTIVATION_MARKER.to_owned()),
             system_message: None,
         },
@@ -456,60 +424,33 @@ fn plan_enabled_action(
                     PathHint::Path(_) | PathHint::WorkingDirectory(_) | PathHint::Ambiguous => None,
                 })
                 .collect::<Vec<_>>();
-            let explicit_workspace_hint = path_hints.iter().find_map(|hint| match hint {
-                PathHint::WorkingDirectory(path) => Some(path.clone()),
-                PathHint::File(_) | PathHint::Path(_) | PathHint::Ambiguous => None,
-            });
             CanonicalAgentAction {
-                task_operation: Some(TaskRuntimeOperation::MergeObservations {
+                task_operation: Some(TaskRuntimeOperation::MergeSignals {
                     locator: task_locator(capabilities.agent, context),
                     cwd: context.cwd.clone(),
                     workspace_roots: context.workspace_roots.clone(),
-                    file_hints: file_hints.clone(),
+                    file_hints,
                     tool_category: *tool_category,
                     outcome: *outcome,
-                }),
-                breadcrumb: Some(CanonicalBreadcrumb {
-                    external_session_locator: task_locator(capabilities.agent, context),
-                    kind: CanonicalBreadcrumbKind::ToolOutcome,
-                    summary: format!(
-                        "{} {}",
-                        tool_category.breadcrumb_label(),
-                        match outcome {
-                            ToolOutcome::Succeeded => "succeeded",
-                            ToolOutcome::Failed => "failed",
-                        }
-                    ),
-                    workspace_hint: explicit_workspace_hint.or_else(|| workspace_hint(context)),
-                    file_hints,
                 }),
                 additional_context: None,
                 system_message: None,
             }
         }
-        CanonicalAgentEvent::PreCompact {
-            context, trigger, ..
-        } => checkpoint(
+        CanonicalAgentEvent::PreCompact { context, .. } => checkpoint(
             capabilities.agent,
             context,
-            format!("context compaction requested ({trigger})"),
-            true,
-            Some(EpisodeFinalizationTrigger::PreCompact),
+            EpisodeFinalizationTrigger::PreCompact,
         ),
-        CanonicalAgentEvent::TurnStop {
-            context, status, ..
-        } => checkpoint(
+        CanonicalAgentEvent::TurnStop { context, .. } => checkpoint(
             capabilities.agent,
             context,
-            format!("agent turn stopped ({status})"),
-            true,
-            Some(EpisodeFinalizationTrigger::TurnStop),
+            EpisodeFinalizationTrigger::TurnStop,
         ),
         CanonicalAgentEvent::SessionEnd { context, .. } => CanonicalAgentAction {
             task_operation: Some(TaskRuntimeOperation::CleanupSessionState {
                 locator: task_locator(capabilities.agent, context),
             }),
-            breadcrumb: None,
             additional_context: None,
             system_message: None,
         },
@@ -519,27 +460,18 @@ fn plan_enabled_action(
 fn checkpoint(
     agent: AgentKind,
     context: &AgentEventContext,
-    summary: String,
-    request_checkpoint: bool,
-    trigger: Option<EpisodeFinalizationTrigger>,
+    trigger: EpisodeFinalizationTrigger,
 ) -> CanonicalAgentAction {
     CanonicalAgentAction {
-        task_operation: trigger.map(|trigger| TaskRuntimeOperation::FinalizeCheckpointedEpisode {
+        task_operation: Some(TaskRuntimeOperation::FinalizeCheckpointedEpisode {
             locator: task_locator(agent, context),
             trigger,
         }),
-        breadcrumb: Some(CanonicalBreadcrumb {
-            external_session_locator: task_locator(agent, context),
-            kind: CanonicalBreadcrumbKind::Checkpoint,
-            summary,
-            workspace_hint: workspace_hint(context),
-            file_hints: Vec::new(),
-        }),
         additional_context: None,
-        system_message: request_checkpoint.then(|| {
-            "Before compaction or turn completion, use $shared-context and call task_checkpoint with complete Claims/Unknowns. Hook summary text is not Claim evidence."
-                .to_owned()
-        }),
+        system_message: Some(
+            "Before compaction or turn completion, use $shared-context and call task_checkpoint with complete direct Claims/Unknowns; the server resolves the current Task, Intent, and lifecycle. Hook lifecycle data is not Claim evidence."
+                .to_owned(),
+        ),
     }
 }
 
@@ -552,14 +484,6 @@ fn task_locator(agent: AgentKind, context: &AgentEventContext) -> ExternalSessio
         .to_owned(),
         external_session_id: context.session_id.clone(),
     }
-}
-
-fn workspace_hint(context: &AgentEventContext) -> Option<PathBuf> {
-    context
-        .workspace_roots
-        .first()
-        .cloned()
-        .or_else(|| Some(context.cwd.clone()))
 }
 
 /// Runtime-resolved action passed back to a vendor output adapter.
@@ -662,7 +586,7 @@ pub fn render_untrusted_task_context_pack(pack: &TaskContextPack) -> Result<Stri
 /// Shell tools are locating only through an explicit structured working directory. Their command
 /// may select [`ToolCategory::TestRunner`] only when it is one simple invocation from the bounded
 /// whitelist below. Shared Context's own tools are marked explicitly so policy can omit them from
-/// the capture loop.
+/// Task Runtime observation handling.
 #[must_use]
 pub fn normalize_tool_use(tool_name: &str, input: &Value) -> NormalizedToolUse {
     let normalized_name = tool_name.trim().to_ascii_lowercase();
@@ -733,7 +657,7 @@ fn is_dedicated_test_tool(name: &str) -> bool {
 }
 
 fn is_shared_context_tool(name: &str) -> bool {
-    const TOOL_NAMES: [&str; 17] = [
+    const TOOL_NAMES: [&str; 16] = [
         "association_explain",
         "association_rebuild",
         "candidate_confirm",
@@ -746,7 +670,6 @@ fn is_shared_context_tool(name: &str) -> bool {
         "repository_scan",
         "space_list",
         "task_artifact_focus",
-        "task_capture_list",
         "task_checkpoint",
         "task_context",
         "task_intent_update",
@@ -1017,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_context_tool_use_never_reenters_the_capture_plan() {
+    fn shared_context_tool_use_never_reenters_runtime_observation_handling() {
         let event = CanonicalAgentEvent::PostToolUse {
             context: AgentEventContext {
                 session_id: "session".to_owned(),
@@ -1195,7 +1118,6 @@ mod tests {
 
         let start_action = plan(0);
         assert!(start_action.task_operation.is_none());
-        assert!(start_action.breadcrumb.is_none());
         assert_eq!(
             start_action.additional_context.as_deref(),
             Some(SHARED_CONTEXT_ACTIVATION_MARKER)
@@ -1209,12 +1131,8 @@ mod tests {
         let post_action = plan(2);
         assert!(matches!(
             post_action.task_operation,
-            Some(TaskRuntimeOperation::MergeObservations { .. })
+            Some(TaskRuntimeOperation::MergeSignals { .. })
         ));
-        assert_eq!(
-            post_action.breadcrumb.as_ref().map(|value| &value.kind),
-            Some(&CanonicalBreadcrumbKind::ToolOutcome)
-        );
         assert!(post_action.system_message.is_none());
         assert!(post_action.additional_context.is_none());
 
@@ -1228,10 +1146,6 @@ mod tests {
                 Some(TaskRuntimeOperation::FinalizeCheckpointedEpisode { trigger, .. })
                     if trigger == expected_trigger
             ));
-            assert_eq!(
-                action.breadcrumb.as_ref().map(|value| &value.kind),
-                Some(&CanonicalBreadcrumbKind::Checkpoint)
-            );
             assert!(
                 action
                     .system_message
@@ -1245,7 +1159,6 @@ mod tests {
             end_action.task_operation,
             Some(TaskRuntimeOperation::CleanupSessionState { .. })
         ));
-        assert!(end_action.breadcrumb.is_none());
         assert!(end_action.additional_context.is_none());
         assert!(end_action.system_message.is_none());
     }
@@ -1267,7 +1180,6 @@ mod tests {
         ] {
             let action = plan_action_for_activation(&event, &capabilities, activation);
             assert_eq!(action.task_operation, None);
-            assert_eq!(action.breadcrumb, None);
             assert_eq!(action.additional_context, None);
             assert_eq!(
                 action.system_message.as_deref(),

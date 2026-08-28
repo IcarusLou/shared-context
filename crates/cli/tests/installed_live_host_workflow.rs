@@ -373,6 +373,7 @@ fn installed_codex_ab_and_cursor_lifecycle_use_only_public_live_processes() {
     let setup: Value = serde_json::from_slice(&fs::read(setup_stdout.path()).unwrap()).unwrap();
     eprintln!("live-host stage=installed");
     let installed = home.join(".shared-context/bin/current/sctx");
+    let root = home.join(".shared-context");
     assert!(installed.is_file());
     assert_eq!(setup["runtime"], installed.to_string_lossy().as_ref());
 
@@ -470,48 +471,34 @@ fn installed_codex_ab_and_cursor_lifecycle_use_only_public_live_processes() {
         ),
         json!({})
     );
-    let captures = codex_mcp.call(session_a, "task_capture_list", json!({"limit": 10}));
-    eprintln!("live-host stage=codex-a-captures");
-    assert_eq!(captures["captures"].as_array().unwrap().len(), 1);
-    let capture_id = captures["captures"][0]["capture_id"].clone();
+    for removed in ["capture", "capture.lock", "capture-metadata.json"] {
+        assert!(!root.join("state").join(removed).exists());
+    }
     let checkpoint = codex_mcp.call(
         session_a,
         "task_checkpoint",
         json!({
-            "expected_task_id": task_a["task_id"],
-            "expected_intent_revision_id": task_a["intent_revision_id"],
-            "expected_episode_version": 0,
-            "boundary": "close",
             "claims": [{
-                "context_kind_hint": "contract",
-                "topic_key_hint": "m3/live-host-portability",
+                "context_kind": "contract",
                 "statement": "livehostportablecontract resolves across installed Codex checkouts",
-                "rationale": "Session A selected a normalized File Capture from checkout A",
-                "applicability": {"domains": ["hooks"], "platforms": ["codex"], "conditions": []},
-                "assumptions": [],
-                "recheck_when": ["src/live.rs moves"],
-                "evidence": [{"kind": "capture", "capture_id": capture_id}],
-                "artifact_refs": [{
-                    "repository_id": "Server",
-                    "locator": {"locator_kind": "file", "path": "src/live.rs"}
-                }],
-                "relations": [],
-                "engineering_references": [{
-                    "repository_id": "Server",
-                    "artifact_kind": "file",
-                    "relation": "implements",
-                    "locator": {"locator_kind": "file", "path": "src/live.rs"},
-                    "supports": "The selected Capture identifies the tracked implementation",
-                    "limitations": []
-                }],
-                "related_contexts": []
+                "rationale": "Session A authored a focused portable contract conclusion",
+                "conditions": [],
+                "evidence": [{
+                    "evidence_type": "source_snapshot",
+                    "summary": "the installed source contract was reviewed",
+                    "limitations": ["local installed-host fixture"]
+                }]
             }],
             "unknowns": []
         }),
     );
-    let candidate_id = checkpoint["candidate_build"]["items"][0]["candidate_id"]
-        .as_str()
-        .unwrap();
+    assert_eq!(checkpoint["candidate_build"]["status"], "pending");
+    let candidates = codex_mcp.call(
+        session_a,
+        "candidate_list",
+        json!({"status": "pending", "limit": 10, "token_budget": 32768}),
+    );
+    let candidate_id = candidates["reviews"][0]["candidate_id"].as_str().unwrap();
     let review = codex_mcp.call(
         session_a,
         "candidate_get",
@@ -538,8 +525,33 @@ fn installed_codex_ab_and_cursor_lifecycle_use_only_public_live_processes() {
         }),
     );
     eprintln!("live-host stage=codex-a-confirmed");
-    assert_eq!(confirmed["event_ids"].as_array().unwrap().len(), 6);
+    assert_eq!(confirmed["event_ids"].as_array().unwrap().len(), 5);
     assert_eq!(confirmed["graph_rebuild_pending"], false);
+    let reference = codex_mcp.call(
+        session_a,
+        "engineering_reference_record",
+        json!({
+            "context_id": confirmed["context_id"],
+            "revision_id": confirmed["revision_id"],
+            "repository_id": "Server",
+            "artifact_kind": "file",
+            "relation": "implements",
+            "locator": {"locator_kind": "file", "path": "src/live.rs"},
+            "supports": "The confirmed direct Evidence Context is implemented by src/live.rs",
+            "limitations": ["local installed-host fixture"]
+        }),
+    );
+    assert!(
+        reference["reference_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("ref_"))
+    );
+    let rebuilt = codex_mcp.call(
+        session_a,
+        "association_rebuild",
+        json!({"diagnose_only": false}),
+    );
+    assert!(rebuilt["generation"].as_u64().is_some());
 
     let session_b = "live-codex-session-b";
     assert_eq!(

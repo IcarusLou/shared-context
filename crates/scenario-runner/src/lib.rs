@@ -1756,7 +1756,6 @@ fn validate_captured_value(kind: VariableKind, value: &Value) -> Result<(), ()> 
         VariableKind::ExternalSessionId => Some("xss_"),
         VariableKind::IntentRevisionId => Some("tir_"),
         VariableKind::SignalId => Some("sig_"),
-        VariableKind::CaptureId => Some("cap_"),
         VariableKind::WorkEpisodeId => Some("wep_"),
         VariableKind::WorkObservationId => Some("wob_"),
         VariableKind::CheckpointId => Some("ckp_"),
@@ -1844,10 +1843,10 @@ fn validate_domain_id(value: &Value, prefix: &str) -> Result<(), ()> {
 }
 
 fn is_domain_id(value: &str) -> bool {
-    const PREFIXES: [&str; 29] = [
-        "spc_", "rpo_", "rpg_", "ref_", "tsk_", "tss_", "xss_", "tir_", "sig_", "cap_", "wep_",
-        "wob_", "ckp_", "clm_", "bld_", "rec_", "psg_", "cnd_", "sub_", "cfm_", "asc_", "ctx_",
-        "rev_", "evt_", "pub_", "evd_", "rvw_", "cnf_", "rsl_",
+    const PREFIXES: [&str; 28] = [
+        "spc_", "rpo_", "rpg_", "ref_", "tsk_", "tss_", "xss_", "tir_", "sig_", "wep_", "wob_",
+        "ckp_", "clm_", "bld_", "rec_", "psg_", "cnd_", "sub_", "cfm_", "asc_", "ctx_", "rev_",
+        "evt_", "pub_", "evd_", "rvw_", "cnf_", "rsl_",
     ];
     PREFIXES
         .iter()

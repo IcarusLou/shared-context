@@ -13,12 +13,12 @@ use rusqlite::Connection;
 use sctx_domain::{
     Applicability, CandidateAnalysisStatus, CandidateConfirmationOperation,
     CandidateConfirmationPlan, CandidateConfirmationPrimaryReference, CandidateId,
-    CandidatePrimarySelection, CandidateReviewStatus, CaptureEvidenceRef, ContextId, ContextKind,
-    ContextRevisionDraft, EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator,
-    IntentSnapshot, NormalizedBreadcrumbKind, NormalizedWorkObservation, OptionalCandidateEdits,
-    PublicationAction, PublicationDraft, RepositoryId, ReviewDraft, ReviewVerdict, RevisionId,
-    SpaceId, SubmissionId, TaskId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkSourceRef,
-    WorkingIntentSnapshot, candidate_submission_content_hash,
+    CandidatePrimarySelection, CandidateReviewStatus, CheckpointEvidenceRef, ContextId,
+    ContextKind, ContextRevisionDraft, EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator,
+    IntentSnapshot, NormalizedWorkObservation, OptionalCandidateEdits, PublicationAction,
+    PublicationDraft, RepositoryId, ReviewDraft, ReviewVerdict, RevisionId, SpaceId, SubmissionId,
+    TaskId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkSourceRef, WorkingIntentSnapshot,
+    candidate_submission_content_hash,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
@@ -2350,9 +2350,14 @@ fn internal_builder_preserves_observation_signal_and_context_evidence_sources() 
             vec![WorkSourceRef::TaskSignal(
                 opened.episode.episode.signal_refs[0],
             )],
-            NormalizedWorkObservation::Breadcrumb {
-                category: NormalizedBreadcrumbKind::Validation,
-                summary: "normalized internal observation".to_owned(),
+            NormalizedWorkObservation::InlineValidation {
+                evidence: EvidenceSnapshotDraft {
+                    kind: EvidenceType::ExperimentRecord,
+                    supports: "the normalized internal Observation".to_owned(),
+                    content: json!({"summary": "normalized internal observation"}),
+                    interpretation: "the internal Builder resolves Observation Evidence".to_owned(),
+                    limitations: Vec::new(),
+                },
             },
         )
         .unwrap();
@@ -2391,17 +2396,17 @@ fn internal_builder_preserves_observation_signal_and_context_evidence_sources() 
             claims: vec![
                 claim(
                     "The normalized Observation is retained",
-                    CaptureEvidenceRef::Observation {
+                    CheckpointEvidenceRef::Observation {
                         observation_id: observation.observation_id,
                     },
                 ),
                 claim(
                     "The normalized Diff Signal is retained",
-                    CaptureEvidenceRef::TaskSignal { signal_id },
+                    CheckpointEvidenceRef::TaskSignal { signal_id },
                 ),
                 claim(
                     "The accepted Context Evidence is retained",
-                    CaptureEvidenceRef::ContextEvidence {
+                    CheckpointEvidenceRef::ContextEvidence {
                         context_id: fixture.context_id,
                         revision_id: fixture.revision_id,
                         evidence_id: source.evidence_id,
@@ -3545,7 +3550,7 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
 
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 16);
         let names = tools
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
@@ -3554,7 +3559,6 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
             names,
             [
                 "task_intent_update",
-                "task_capture_list",
                 "task_artifact_focus",
                 "task_signal_supersede",
                 "task_checkpoint",

@@ -2322,7 +2322,7 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
 }
 
 #[test]
-fn post_tool_hook_captures_a_bounded_breadcrumb_not_raw_payload() {
+fn post_tool_hook_is_bounded_and_persists_no_raw_payload_or_capture_state() {
     let harness = Harness::new();
     let (space_id, _) = create_space(&harness, "Capture contract");
     assert!(!space_id.is_empty());
@@ -2396,16 +2396,9 @@ fn post_tool_hook_captures_a_bounded_breadcrumb_not_raw_payload() {
         })
     );
 
-    let captures = fs::read_dir(harness.root().join("state/capture"))
-        .unwrap()
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .unwrap();
-    assert_eq!(captures.len(), 1);
-    let stored = fs::read_to_string(captures[0].path()).unwrap();
-    assert!(stored.contains("shell succeeded"));
-    assert!(!stored.contains("Shell"));
-    assert!(!stored.contains("RAW_COMMAND_MUST_NOT_BE_CAPTURED"));
-    assert!(!stored.contains("RAW_OUTPUT_MUST_NOT_BE_CAPTURED"));
+    for removed in ["capture", "capture.lock", "capture-metadata.json"] {
+        assert!(!harness.root().join("state").join(removed).exists());
+    }
 }
 
 #[test]
@@ -2560,8 +2553,8 @@ fn mcp_stdio_entry_serves_cursor_and_codex_without_extra_stdout() {
         assert_eq!(responses.len(), 2);
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17);
-        assert!(tools.iter().any(|tool| tool["name"] == "task_capture_list"));
+        assert_eq!(tools.len(), 16);
+        assert!(tools.iter().all(|tool| tool["name"] != "task_capture_list"));
         assert!(tools.iter().any(|tool| tool["name"] == "task_checkpoint"));
         for name in [
             "candidate_list",

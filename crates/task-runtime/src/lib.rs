@@ -16,18 +16,18 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use sctx_domain::{
     AgentCheckpoint, AgentCheckpointId, Applicability, ArtifactRef, AutomaticContextCandidate,
     CandidateBuildId, CandidateConfirmationPlan, CandidateId, CandidateReviewStatus,
-    CaptureEvidenceRef, CaptureId, CaptureSourceRef, CaptureUnknown, CheckpointClaim,
-    CheckpointClaimId, ConfirmationId, ContextId, ContextRevisionRef, Error, ErrorKind, EventId,
-    EvidenceSnapshotDraft, EvidenceType, ExternalSessionId, ExternalSessionLocator,
-    ExternalSessionSnapshot, IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation,
-    ProposedSpaceGroupKey, Result, SignalId, SpaceId, SubmissionId, TaskId, TaskIntentRevision,
-    TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalKind,
-    TaskSignalLifecycle, TaskSignalRecord, WorkEpisode, WorkEpisodeId, WorkEpisodeRef,
-    WorkEpisodeStatus, WorkObservation, WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
+    CheckpointClaim, CheckpointClaimId, CheckpointEvidenceRef, CheckpointUnknown, ConfirmationId,
+    ContextId, ContextRevisionRef, Error, ErrorKind, EventId, EvidenceSnapshotDraft, EvidenceType,
+    ExternalSessionId, ExternalSessionLocator, ExternalSessionSnapshot, IntentRevisionRange,
+    NonLocatingSignalRef, NormalizedWorkObservation, ProposedSpaceGroupKey, Result, SignalId,
+    SpaceId, SubmissionId, TaskId, TaskIntentRevision, TaskIntentRevisionId, TaskSessionId,
+    TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord,
+    WorkEpisode, WorkEpisodeId, WorkEpisodeRef, WorkEpisodeStatus, WorkObservation,
+    WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
 };
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const HOOK_BUSY_TIMEOUT: Duration = Duration::from_millis(25);
 const MAX_EPISODE_LIST_LIMIT: usize = 256;
@@ -93,7 +93,6 @@ pub struct SupersedeSignalsOutcome {
 pub struct WorkEpisodeView {
     pub episode: WorkEpisode,
     pub checkpoints: Vec<AgentCheckpoint>,
-    pub diagnostics: Vec<WorkEpisodeDiagnostic>,
 }
 
 /// Whether a Checkpoint preserves the open Episode or closes its final boundary.
@@ -122,7 +121,7 @@ pub struct CheckpointClaimDraft {
     pub applicability: Applicability,
     pub assumptions: Vec<String>,
     pub recheck_when: Vec<String>,
-    pub evidence_refs: Vec<CaptureEvidenceRef>,
+    pub evidence_refs: Vec<CheckpointEvidenceRef>,
     pub inline_validations: Vec<EvidenceSnapshotDraft>,
     pub artifact_refs: Vec<ArtifactRef>,
     pub relations: Vec<sctx_domain::ContextRelation>,
@@ -139,7 +138,7 @@ pub struct AgentCheckpointWrite {
     pub expected_episode_version: u64,
     pub boundary: CheckpointBoundary,
     pub claims: Vec<CheckpointClaimDraft>,
-    pub unknowns: Vec<CaptureUnknown>,
+    pub unknowns: Vec<CheckpointUnknown>,
 }
 
 /// Idempotent result of one atomic Checkpoint and Episode transition.
@@ -174,7 +173,7 @@ pub struct DirectCheckpointClaimDraft {
 pub struct AgentCheckpointSubmission {
     pub locator: ExternalSessionLocator,
     pub claims: Vec<DirectCheckpointClaimDraft>,
-    pub unknowns: Vec<CaptureUnknown>,
+    pub unknowns: Vec<CheckpointUnknown>,
 }
 
 /// Durable receipt for one content-addressed Checkpoint operation and Build outbox.
@@ -424,42 +423,6 @@ pub struct AdvanceWorkEpisodeOutcome {
 pub struct AppendWorkObservationOutcome {
     pub episode: WorkEpisodeView,
     pub observation_id: WorkObservationId,
-}
-
-/// Safe diagnostic category stored with an Episode.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum WorkEpisodeDiagnosticKind {
-    CaptureRepositoryNotConfigured,
-    CaptureUnsafeArtifactPath,
-}
-
-/// One persisted safe Episode diagnostic; it never contains source payload text.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorkEpisodeDiagnostic {
-    pub capture_id: CaptureId,
-    pub kind: WorkEpisodeDiagnosticKind,
-}
-
-/// Normalized, already-redacted Capture ingestion request.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CaptureIngestion {
-    pub capture_id: CaptureId,
-    pub episode_id: WorkEpisodeId,
-    pub expected_episode_version: u64,
-    pub task_session_id: TaskSessionId,
-    pub task_id: TaskId,
-    pub intent_revision_id: TaskIntentRevisionId,
-    pub additional_sources: Vec<WorkSourceRef>,
-    pub observation: NormalizedWorkObservation,
-    pub diagnostics: Vec<WorkEpisodeDiagnosticKind>,
-}
-
-/// Idempotent Capture-to-Observation commit result.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IngestCaptureOutcome {
-    pub episode: WorkEpisodeView,
-    pub observation_id: WorkObservationId,
-    pub inserted: bool,
 }
 
 /// Prepared close boundary consumed later by Checkpoint persistence (#157).
@@ -1021,14 +984,11 @@ impl TaskRuntime {
         })
     }
 
-    /// Appends a normalized non-Capture observation under Episode-version CAS.
-    ///
-    /// Capture sources must use [`Self::ingest_capture`] so `CaptureId`
-    /// idempotency cannot be bypassed.
+    /// Appends a normalized Work Observation under Episode-version CAS.
     ///
     /// # Errors
     ///
-    /// Rejects stale/closed ownership, Capture sources, invalid meaning, or storage failures.
+    /// Rejects stale/closed ownership, invalid meaning, or storage failures.
     pub fn append_work_observation(
         &self,
         episode_id: WorkEpisodeId,
@@ -1037,14 +997,6 @@ impl TaskRuntime {
         source_refs: Vec<WorkSourceRef>,
         observation: NormalizedWorkObservation,
     ) -> Result<AppendWorkObservationOutcome> {
-        if source_refs
-            .iter()
-            .any(|source| matches!(source, WorkSourceRef::Capture(_)))
-        {
-            return Err(invalid(
-                "Capture sources require the idempotent ingest_capture API",
-            ));
-        }
         let mut connection = self.open_connection()?;
         let transaction = immediate(&mut connection, "begin Work Observation append")?;
         let observation_id = append_observation_in_transaction(
@@ -1062,127 +1014,6 @@ impl TaskRuntime {
         Ok(AppendWorkObservationOutcome {
             episode,
             observation_id,
-        })
-    }
-
-    /// Atomically and idempotently converts one already-claimed redacted Capture
-    /// into one server-identified Work Observation.
-    ///
-    /// # Errors
-    ///
-    /// Rejects stale/closed/cross-Task input or conflicting Capture reuse.
-    #[allow(clippy::too_many_lines)]
-    pub fn ingest_capture(&self, input: &CaptureIngestion) -> Result<IngestCaptureOutcome> {
-        if input
-            .additional_sources
-            .iter()
-            .any(|source| matches!(source, WorkSourceRef::Capture(_)))
-        {
-            return Err(invalid(
-                "Capture ingestion supplies its Capture source server-side",
-            ));
-        }
-        let mut connection = self.open_connection()?;
-        let transaction = immediate(&mut connection, "begin Capture ingestion")?;
-        if let Some((episode_id, observation_id, task_session_id, task_id)) =
-            read_capture_ingestion(&transaction, input.capture_id)?
-        {
-            if episode_id != input.episode_id
-                || task_session_id != input.task_session_id
-                || task_id != input.task_id
-            {
-                return Err(invalid(
-                    "CaptureId is already ingested by another Task/Episode",
-                ));
-            }
-            let episode = require_episode_view(&transaction, episode_id)?;
-            let observation = episode
-                .episode
-                .observations
-                .iter()
-                .find(|observation| observation.observation_id == observation_id)
-                .ok_or_else(|| invariant("Capture ingestion Observation disappeared"))?;
-            let mut expected_sources = Vec::with_capacity(input.additional_sources.len() + 1);
-            expected_sources.push(WorkSourceRef::Capture(CaptureSourceRef {
-                capture_id: input.capture_id,
-                task_session_id: input.task_session_id,
-                task_id: input.task_id,
-            }));
-            expected_sources.extend(input.additional_sources.clone());
-            let actual_diagnostics = episode
-                .diagnostics
-                .iter()
-                .filter(|diagnostic| diagnostic.capture_id == input.capture_id)
-                .map(|diagnostic| diagnostic.kind)
-                .collect::<BTreeSet<_>>();
-            let expected_diagnostics = input.diagnostics.iter().copied().collect::<BTreeSet<_>>();
-            if observation.intent_revision_id != input.intent_revision_id
-                || observation.source_refs != expected_sources
-                || observation.observation != input.observation
-                || actual_diagnostics != expected_diagnostics
-            {
-                return Err(invalid(
-                    "CaptureId retry content differs from persisted ingestion",
-                ));
-            }
-            transaction
-                .commit()
-                .map_err(sql_error("commit idempotent Capture ingestion"))?;
-            return Ok(IngestCaptureOutcome {
-                episode,
-                observation_id,
-                inserted: false,
-            });
-        }
-        let (task_session_id, task_id, version, status) =
-            require_episode_head(&transaction, input.episode_id)?;
-        require_open_episode_version(version, &status, input.expected_episode_version)?;
-        if task_session_id != input.task_session_id || task_id != input.task_id {
-            return Err(invalid("Capture ingestion owner differs from Work Episode"));
-        }
-        let mut source_refs = Vec::with_capacity(input.additional_sources.len() + 1);
-        source_refs.push(WorkSourceRef::Capture(CaptureSourceRef {
-            capture_id: input.capture_id,
-            task_session_id,
-            task_id,
-        }));
-        source_refs.extend(input.additional_sources.clone());
-        let observation_id = append_observation_in_transaction(
-            &transaction,
-            input.episode_id,
-            input.expected_episode_version,
-            input.intent_revision_id,
-            source_refs,
-            input.observation.clone(),
-        )?;
-        transaction
-            .execute(
-                "INSERT INTO capture_ingestion (
-                    capture_id, episode_id, observation_id, task_session_id, task_id
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    input.capture_id.to_string(),
-                    input.episode_id.to_string(),
-                    observation_id.to_string(),
-                    task_session_id.to_string(),
-                    task_id.to_string(),
-                ],
-            )
-            .map_err(sql_error("record Capture ingestion"))?;
-        insert_episode_diagnostics(
-            &transaction,
-            input.episode_id,
-            input.capture_id,
-            &input.diagnostics,
-        )?;
-        let episode = require_episode_view(&transaction, input.episode_id)?;
-        transaction
-            .commit()
-            .map_err(sql_error("commit Capture ingestion"))?;
-        Ok(IngestCaptureOutcome {
-            episode,
-            observation_id,
-            inserted: true,
         })
     }
 
@@ -1293,7 +1124,7 @@ impl TaskRuntime {
                     },
                 )?;
                 insert_observation_rows(&transaction, episode_id, &observation)?;
-                evidence_refs.push(CaptureEvidenceRef::Observation {
+                evidence_refs.push(CheckpointEvidenceRef::Observation {
                     observation_id: observation.observation_id,
                 });
                 inserted_inline_observations.push(observation.observation_id);
@@ -1481,7 +1312,7 @@ impl TaskRuntime {
                     },
                 )?;
                 insert_observation_rows(&transaction, episode_id, &observation)?;
-                evidence_refs.push(CaptureEvidenceRef::Observation {
+                evidence_refs.push(CheckpointEvidenceRef::Observation {
                     observation_id: observation.observation_id,
                 });
                 inline_observation_ids.push(observation.observation_id);
@@ -3145,17 +2976,6 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 PRIMARY KEY (observation_id, source_ordinal),
                 FOREIGN KEY (observation_id) REFERENCES work_observation (observation_id)
             ) STRICT;
-            CREATE TABLE IF NOT EXISTS capture_ingestion (
-                capture_id TEXT PRIMARY KEY,
-                episode_id TEXT NOT NULL,
-                observation_id TEXT NOT NULL UNIQUE,
-                task_session_id TEXT NOT NULL,
-                task_id TEXT NOT NULL,
-                FOREIGN KEY (observation_id, episode_id)
-                    REFERENCES work_observation (observation_id, episode_id),
-                FOREIGN KEY (episode_id, task_session_id, task_id)
-                    REFERENCES work_episode (episode_id, task_session_id, task_id)
-            ) STRICT;
             CREATE TABLE IF NOT EXISTS agent_checkpoint (
                 checkpoint_id TEXT PRIMARY KEY,
                 episode_id TEXT NOT NULL,
@@ -3336,19 +3156,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 FOREIGN KEY (candidate_id) REFERENCES candidate_review (candidate_id),
                 FOREIGN KEY (intent_revision_id) REFERENCES task_intent_revision (revision_id)
             ) STRICT;
-            CREATE TABLE IF NOT EXISTS work_episode_diagnostic (
-                episode_id TEXT NOT NULL,
-                diagnostic_ordinal INTEGER NOT NULL CHECK (diagnostic_ordinal >= 0),
-                capture_id TEXT NOT NULL,
-                kind TEXT NOT NULL CHECK (kind IN (
-                    'capture_repository_not_configured',
-                    'capture_unsafe_artifact_path'
-                )),
-                PRIMARY KEY (episode_id, diagnostic_ordinal),
-                UNIQUE (episode_id, capture_id, kind),
-                FOREIGN KEY (episode_id) REFERENCES work_episode (episode_id)
-            ) STRICT;
-            PRAGMA user_version = 12;",
+            PRAGMA user_version = 13;",
         )
         .map_err(sql_error("initialize task runtime schema"))
 }
@@ -3763,21 +3571,21 @@ fn validate_checkpoint_task_local_refs(
         .collect::<HashSet<_>>();
     for evidence in claims.iter().flat_map(|claim| &claim.evidence_refs) {
         match evidence {
-            CaptureEvidenceRef::Observation { observation_id }
+            CheckpointEvidenceRef::Observation { observation_id }
                 if !observations.contains(observation_id) =>
             {
                 return Err(invalid(
                     "Checkpoint Observation evidence does not belong to its Work Episode",
                 ));
             }
-            CaptureEvidenceRef::TaskSignal { signal_id } if !signals.contains(signal_id) => {
+            CheckpointEvidenceRef::TaskSignal { signal_id } if !signals.contains(signal_id) => {
                 return Err(invalid(
                     "Checkpoint TaskSignal evidence does not belong to its Task",
                 ));
             }
-            CaptureEvidenceRef::Observation { .. }
-            | CaptureEvidenceRef::TaskSignal { .. }
-            | CaptureEvidenceRef::ContextEvidence { .. } => {}
+            CheckpointEvidenceRef::Observation { .. }
+            | CheckpointEvidenceRef::TaskSignal { .. }
+            | CheckpointEvidenceRef::ContextEvidence { .. } => {}
         }
     }
     Ok(())
@@ -3828,7 +3636,7 @@ fn inline_observation_ids(
             ));
         }
         for evidence in claim.evidence_refs.iter().skip(draft.evidence_refs.len()) {
-            let CaptureEvidenceRef::Observation { observation_id } = evidence else {
+            let CheckpointEvidenceRef::Observation { observation_id } = evidence else {
                 return Err(invariant(
                     "persisted inline Validation does not reference an Observation",
                 ));
@@ -4876,78 +4684,6 @@ fn next_checkpoint_ordinal(
     )
 }
 
-fn read_capture_ingestion(
-    connection: &Connection,
-    capture_id: CaptureId,
-) -> Result<Option<(WorkEpisodeId, WorkObservationId, TaskSessionId, TaskId)>> {
-    connection
-        .query_row(
-            "SELECT episode_id, observation_id, task_session_id, task_id
-             FROM capture_ingestion WHERE capture_id = ?1",
-            [capture_id.to_string()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(sql_error("read Capture ingestion"))?
-        .map(|(episode_id, observation_id, task_session_id, task_id)| {
-            Ok((
-                parse_id(&episode_id, "capture_ingestion.episode_id")?,
-                parse_id(&observation_id, "capture_ingestion.observation_id")?,
-                parse_id(&task_session_id, "capture_ingestion.task_session_id")?,
-                parse_id(&task_id, "capture_ingestion.task_id")?,
-            ))
-        })
-        .transpose()
-}
-
-fn insert_episode_diagnostics(
-    transaction: &Transaction<'_>,
-    episode_id: WorkEpisodeId,
-    capture_id: CaptureId,
-    diagnostics: &[WorkEpisodeDiagnosticKind],
-) -> Result<()> {
-    let mut next_ordinal: i64 = transaction
-        .query_row(
-            "SELECT COALESCE(MAX(diagnostic_ordinal), -1) + 1
-             FROM work_episode_diagnostic WHERE episode_id = ?1",
-            [episode_id.to_string()],
-            |row| row.get(0),
-        )
-        .map_err(sql_error("read next Episode diagnostic ordinal"))?;
-    let mut unique = HashSet::new();
-    for diagnostic in diagnostics.iter().copied() {
-        if !unique.insert(diagnostic) {
-            continue;
-        }
-        let changed = transaction
-            .execute(
-                "INSERT OR IGNORE INTO work_episode_diagnostic (
-                    episode_id, diagnostic_ordinal, capture_id, kind
-                 ) VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    episode_id.to_string(),
-                    next_ordinal,
-                    capture_id.to_string(),
-                    episode_diagnostic_kind_name(diagnostic),
-                ],
-            )
-            .map_err(sql_error("insert Work Episode diagnostic"))?;
-        if changed == 1 {
-            next_ordinal = next_ordinal
-                .checked_add(1)
-                .ok_or_else(|| invariant("Episode diagnostic ordinal overflow"))?;
-        }
-    }
-    Ok(())
-}
-
 fn read_episode_view(
     connection: &Connection,
     episode_id: WorkEpisodeId,
@@ -5029,7 +4765,6 @@ fn read_episode_view(
     Ok(Some(WorkEpisodeView {
         episode,
         checkpoints,
-        diagnostics: read_episode_diagnostics(connection, episode_id)?,
     }))
 }
 
@@ -5178,50 +4913,6 @@ fn read_observation_sources(
             .map_err(json_error("parse Work Observation source"))
     })
     .collect()
-}
-
-fn read_episode_diagnostics(
-    connection: &Connection,
-    episode_id: WorkEpisodeId,
-) -> Result<Vec<WorkEpisodeDiagnostic>> {
-    let mut statement = connection
-        .prepare(
-            "SELECT capture_id, kind FROM work_episode_diagnostic
-             WHERE episode_id = ?1 ORDER BY diagnostic_ordinal ASC",
-        )
-        .map_err(sql_error("prepare Work Episode diagnostics"))?;
-    let rows = statement
-        .query_map([episode_id.to_string()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(sql_error("query Work Episode diagnostics"))?;
-    rows.map(|row| {
-        let (capture_id, kind) = row.map_err(sql_error("read Work Episode diagnostic"))?;
-        Ok(WorkEpisodeDiagnostic {
-            capture_id: parse_id(&capture_id, "work_episode_diagnostic.capture_id")?,
-            kind: parse_episode_diagnostic_kind(&kind)?,
-        })
-    })
-    .collect()
-}
-
-const fn episode_diagnostic_kind_name(kind: WorkEpisodeDiagnosticKind) -> &'static str {
-    match kind {
-        WorkEpisodeDiagnosticKind::CaptureRepositoryNotConfigured => {
-            "capture_repository_not_configured"
-        }
-        WorkEpisodeDiagnosticKind::CaptureUnsafeArtifactPath => "capture_unsafe_artifact_path",
-    }
-}
-
-fn parse_episode_diagnostic_kind(value: &str) -> Result<WorkEpisodeDiagnosticKind> {
-    match value {
-        "capture_repository_not_configured" => {
-            Ok(WorkEpisodeDiagnosticKind::CaptureRepositoryNotConfigured)
-        }
-        "capture_unsafe_artifact_path" => Ok(WorkEpisodeDiagnosticKind::CaptureUnsafeArtifactPath),
-        _ => Err(invariant("unknown persisted Work Episode diagnostic kind")),
-    }
 }
 
 fn find_active_signal(

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AgentCheckpointId, Applicability, ArtifactLocator, CandidateBuildId, CandidateId, CaptureId,
+    AgentCheckpointId, Applicability, ArtifactLocator, CandidateBuildId, CandidateId,
     CheckpointClaimId, ConfirmationId, ContextId, ContextRelationKind, ContextRevisionDraft,
     EngineeringReferenceDraft, Error, ErrorKind, EvidenceId, EvidenceSnapshotDraft, IntentSnapshot,
     ProposedSpaceGroupKey, RepositoryId, Result, RevisionId, SignalId, SpaceId,
@@ -47,7 +47,7 @@ fn validate_engineering_reference_drafts(
     Ok(())
 }
 
-fn validate_capture_unknowns(values: &[CaptureUnknown], field: &str) -> Result<()> {
+fn validate_checkpoint_unknowns(values: &[CheckpointUnknown], field: &str) -> Result<()> {
     require_unique(values, field)?;
     for unknown in values {
         unknown.validate(field)?;
@@ -139,32 +139,12 @@ impl NonLocatingSignalRef {
     }
 }
 
-/// Stable repository-scoped Artifact coordinates used by Capture contracts.
+/// Stable repository-scoped Artifact coordinates used by checkpoint contracts.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactRef {
     pub repository_id: RepositoryId,
     pub locator: ArtifactLocator,
-}
-
-/// Exact Task ownership carried by one redacted Capture source.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CaptureSourceRef {
-    pub capture_id: CaptureId,
-    pub task_session_id: TaskSessionId,
-    pub task_id: TaskId,
-}
-
-impl CaptureSourceRef {
-    fn validate_owner(&self, task_session_id: TaskSessionId, task_id: TaskId) -> Result<()> {
-        if self.task_session_id != task_session_id || self.task_id != task_id {
-            return Err(invalid(
-                "capture_source_ref must belong to the Work Episode Task",
-            ));
-        }
-        Ok(())
-    }
 }
 
 impl ArtifactRef {
@@ -184,7 +164,7 @@ pub struct ContextRevisionRef {
 /// Typed Evidence provenance that never contains raw payload text.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum CaptureEvidenceRef {
+pub enum CheckpointEvidenceRef {
     Observation {
         observation_id: WorkObservationId,
     },
@@ -202,7 +182,6 @@ pub enum CaptureEvidenceRef {
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "source_kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkSourceRef {
-    Capture(CaptureSourceRef),
     TaskSignal(NonLocatingSignalRef),
     Artifact(ArtifactRef),
     ContextRevision(ContextRevisionRef),
@@ -216,7 +195,6 @@ pub enum WorkSourceRef {
 impl WorkSourceRef {
     fn validate_owner(&self, task_session_id: TaskSessionId, task_id: TaskId) -> Result<()> {
         match self {
-            Self::Capture(capture) => capture.validate_owner(task_session_id, task_id),
             Self::TaskSignal(signal) => signal.validate_owner(task_session_id, task_id),
             Self::Artifact(artifact) => artifact.validate(),
             Self::ContextRevision(_) | Self::ContextEvidence { .. } => Ok(()),
@@ -240,16 +218,6 @@ pub enum ArtifactAction {
     Modified,
 }
 
-/// Bounded normalized Breadcrumb category.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NormalizedBreadcrumbKind {
-    Exploration,
-    Implementation,
-    Validation,
-    Decision,
-}
-
 /// Normalized test result without raw tool output.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -263,10 +231,6 @@ pub enum TestOutcomeStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NormalizedWorkObservation {
-    Breadcrumb {
-        category: NormalizedBreadcrumbKind,
-        summary: String,
-    },
     TestOutcome {
         test_name: String,
         status: TestOutcomeStatus,
@@ -292,7 +256,7 @@ pub enum NormalizedWorkObservation {
     },
     Validation {
         conclusion: String,
-        evidence_refs: Vec<CaptureEvidenceRef>,
+        evidence_refs: Vec<CheckpointEvidenceRef>,
     },
     InlineValidation {
         evidence: EvidenceSnapshotDraft,
@@ -305,7 +269,6 @@ pub enum NormalizedWorkObservation {
 impl NormalizedWorkObservation {
     fn validate(&self, field: &str) -> Result<()> {
         match self {
-            Self::Breadcrumb { summary, .. } => require_text(summary, &format!("{field}.summary")),
             Self::TestOutcome {
                 test_name, summary, ..
             } => {
@@ -581,13 +544,13 @@ impl WorkEpisode {
 /// Structured unresolved engineering question retained by a Checkpoint or Candidate.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CaptureUnknown {
+pub struct CheckpointUnknown {
     pub statement: String,
     pub blocking: bool,
     pub recheck_when: Vec<String>,
 }
 
-impl CaptureUnknown {
+impl CheckpointUnknown {
     fn validate(&self, field: &str) -> Result<()> {
         require_text(&self.statement, &format!("{field}.statement"))?;
         require_text_items(&self.recheck_when, &format!("{field}.recheck_when"))
@@ -606,7 +569,7 @@ pub struct CheckpointClaim {
     pub applicability: Applicability,
     pub assumptions: Vec<String>,
     pub recheck_when: Vec<String>,
-    pub evidence_refs: Vec<CaptureEvidenceRef>,
+    pub evidence_refs: Vec<CheckpointEvidenceRef>,
     pub artifact_refs: Vec<ArtifactRef>,
     #[serde(default)]
     pub relations: Vec<crate::ContextRelation>,
@@ -630,7 +593,7 @@ impl CheckpointClaim {
         applicability: Applicability,
         assumptions: Vec<String>,
         recheck_when: Vec<String>,
-        evidence_refs: Vec<CaptureEvidenceRef>,
+        evidence_refs: Vec<CheckpointEvidenceRef>,
         artifact_refs: Vec<ArtifactRef>,
         relations: Vec<crate::ContextRelation>,
         engineering_references: Vec<EngineeringReferenceDraft>,
@@ -702,7 +665,7 @@ pub struct AgentCheckpoint {
     pub task_id: TaskId,
     pub intent_revision_id: TaskIntentRevisionId,
     pub claims: Vec<CheckpointClaim>,
-    pub unknowns: Vec<CaptureUnknown>,
+    pub unknowns: Vec<CheckpointUnknown>,
 }
 
 impl AgentCheckpoint {
@@ -715,7 +678,7 @@ impl AgentCheckpoint {
         episode: &WorkEpisode,
         intent_revision_id: TaskIntentRevisionId,
         claims: Vec<CheckpointClaim>,
-        unknowns: Vec<CaptureUnknown>,
+        unknowns: Vec<CheckpointUnknown>,
     ) -> Result<Self> {
         let checkpoint = Self {
             checkpoint_id: AgentCheckpointId::new(),
@@ -774,11 +737,11 @@ impl AgentCheckpoint {
                 return Err(invalid("agent_checkpoint.claims must not repeat Claims"));
             }
             if claim.evidence_refs.iter().any(|evidence| match evidence {
-                CaptureEvidenceRef::Observation { observation_id } => {
+                CheckpointEvidenceRef::Observation { observation_id } => {
                     !observation_ids.contains(observation_id)
                 }
-                CaptureEvidenceRef::TaskSignal { signal_id } => !signal_ids.contains(signal_id),
-                CaptureEvidenceRef::ContextEvidence { .. } => false,
+                CheckpointEvidenceRef::TaskSignal { signal_id } => !signal_ids.contains(signal_id),
+                CheckpointEvidenceRef::ContextEvidence { .. } => false,
             }) {
                 return Err(invalid(
                     "agent_checkpoint Evidence must belong to the source Work Episode when Task-local",
@@ -1499,7 +1462,7 @@ pub struct CandidateReviewView {
     pub analysis: CandidateAnalysis,
     pub space_recommendations: Vec<CandidateSpaceRecommendation>,
     pub confidence: CandidateConfidence,
-    pub unknowns: Vec<CaptureUnknown>,
+    pub unknowns: Vec<CheckpointUnknown>,
     pub candidate_status: AutomaticCandidateStatus,
     pub review_status: CandidateReviewStatus,
     pub review_version: u64,
@@ -1529,7 +1492,7 @@ impl CandidateReviewView {
         self.analysis.validate()?;
         validate_recommendations(&self.space_recommendations)?;
         self.confidence.validate("candidate_review.confidence")?;
-        validate_capture_unknowns(&self.unknowns, "candidate_review.unknowns")?;
+        validate_checkpoint_unknowns(&self.unknowns, "candidate_review.unknowns")?;
         if self.review_version == 0
             || self.expires_at_unix_seconds <= self.created_at_unix_seconds
             || !self.untrusted_data
@@ -1647,7 +1610,7 @@ pub struct AutomaticContextCandidate {
     pub analysis: CandidateAnalysis,
     pub space_recommendations: Vec<CandidateSpaceRecommendation>,
     pub confidence: CandidateConfidence,
-    pub unknowns: Vec<CaptureUnknown>,
+    pub unknowns: Vec<CheckpointUnknown>,
     pub status: AutomaticCandidateStatus,
 }
 
@@ -1667,7 +1630,7 @@ impl AutomaticContextCandidate {
         analysis: CandidateAnalysis,
         space_recommendations: Vec<CandidateSpaceRecommendation>,
         confidence: CandidateConfidence,
-        unknowns: Vec<CaptureUnknown>,
+        unknowns: Vec<CheckpointUnknown>,
         status: AutomaticCandidateStatus,
     ) -> Result<Self> {
         let candidate = Self {
@@ -1700,7 +1663,7 @@ impl AutomaticContextCandidate {
         analysis: CandidateAnalysis,
         space_recommendations: Vec<CandidateSpaceRecommendation>,
         confidence: CandidateConfidence,
-        unknowns: Vec<CaptureUnknown>,
+        unknowns: Vec<CheckpointUnknown>,
         status: AutomaticCandidateStatus,
     ) -> Result<Self> {
         let candidate = Self {
@@ -1965,7 +1928,7 @@ mod tests {
     fn content() -> ContextRevisionDraft {
         ContextRevisionDraft {
             kind: ContextKind::Decision,
-            topic_key: Some("capture/fallback-owner".to_owned()),
+            topic_key: Some("checkpoint/fallback-owner".to_owned()),
             statement: "Keep fallback ownership server-side".to_owned(),
             rationale: "Every client consumes one contract".to_owned(),
             applicability: Applicability {
@@ -1986,8 +1949,8 @@ mod tests {
         }
     }
 
-    fn unknown(blocking: bool) -> CaptureUnknown {
-        CaptureUnknown {
+    fn unknown(blocking: bool) -> CheckpointUnknown {
+        CheckpointUnknown {
             statement: "Confirm the v3 rollout date".to_owned(),
             blocking,
             recheck_when: vec!["The rollout plan changes".to_owned()],
@@ -2050,13 +2013,13 @@ mod tests {
         }
     }
 
-    struct CaptureFixture {
+    struct CheckpointFixture {
         episode: WorkEpisode,
         checkpoint: AgentCheckpoint,
         observation_id: WorkObservationId,
     }
 
-    fn capture_fixture() -> CaptureFixture {
+    fn checkpoint_fixture() -> CheckpointFixture {
         let task_session_id = TaskSessionId::new();
         let task_id = TaskId::new();
         let revisions = IntentRevisionRange::new(vec![
@@ -2083,13 +2046,13 @@ mod tests {
         episode.add_observation(observation).unwrap();
         let claim = CheckpointClaim::from_parts(
             Some(ContextKind::Decision),
-            Some("capture/fallback-owner".to_owned()),
+            Some("checkpoint/fallback-owner".to_owned()),
             "Keep fallback ownership server-side",
             "Every client consumes one contract",
             Applicability::default(),
             Vec::new(),
             vec!["The v3 contract ships".to_owned()],
-            vec![CaptureEvidenceRef::Observation { observation_id }],
+            vec![CheckpointEvidenceRef::Observation { observation_id }],
             vec![artifact("src/search.ts")],
             Vec::new(),
             Vec::new(),
@@ -2100,14 +2063,14 @@ mod tests {
             AgentCheckpoint::from_parts(&episode, revisions.last(), vec![claim], Vec::new())
                 .unwrap();
         episode.close(&checkpoint).unwrap();
-        CaptureFixture {
+        CheckpointFixture {
             episode,
             checkpoint,
             observation_id,
         }
     }
 
-    fn provenance(fixture: &CaptureFixture) -> CandidateBuilderProvenance {
+    fn provenance(fixture: &CheckpointFixture) -> CandidateBuilderProvenance {
         CandidateBuilderProvenance::from_parts(
             fixture.episode.ownership(),
             vec![fixture.checkpoint.checkpoint_id],
@@ -2118,7 +2081,7 @@ mod tests {
 
     #[test]
     fn episode_open_close_and_serialization_keep_only_typed_normalized_inputs() {
-        let fixture = capture_fixture();
+        let fixture = checkpoint_fixture();
         assert!(matches!(
             fixture.episode.status,
             WorkEpisodeStatus::Closed {
@@ -2174,9 +2137,8 @@ mod tests {
             TaskId::new(),
             range.first(),
             vec![WorkSourceRef::Artifact(artifact("src/cross.ts"))],
-            NormalizedWorkObservation::Breadcrumb {
-                category: NormalizedBreadcrumbKind::Exploration,
-                summary: "Cross Task observation".to_owned(),
+            NormalizedWorkObservation::UnresolvedQuestion {
+                question: "Cross Task observation?".to_owned(),
             },
         )
         .unwrap();
@@ -2198,9 +2160,8 @@ mod tests {
             task,
             range.first(),
             vec![WorkSourceRef::TaskSignal(unlisted_signal)],
-            NormalizedWorkObservation::Breadcrumb {
-                category: NormalizedBreadcrumbKind::Exploration,
-                summary: "Signal is not part of this Episode".to_owned(),
+            NormalizedWorkObservation::UnresolvedQuestion {
+                question: "Is this Signal part of the Episode?".to_owned(),
             },
         )
         .unwrap();
@@ -2224,7 +2185,7 @@ mod tests {
 
     #[test]
     fn duplicate_sources_claims_and_recommendations_are_rejected() {
-        let fixture = capture_fixture();
+        let fixture = checkpoint_fixture();
         let source = WorkSourceRef::Artifact(artifact("src/duplicate.ts"));
         assert!(
             WorkObservation::from_parts(
@@ -2232,9 +2193,8 @@ mod tests {
                 fixture.episode.task_id,
                 fixture.episode.intent_revisions.last(),
                 vec![source.clone(), source],
-                NormalizedWorkObservation::Breadcrumb {
-                    category: NormalizedBreadcrumbKind::Decision,
-                    summary: "Duplicate source".to_owned(),
+                NormalizedWorkObservation::UnresolvedQuestion {
+                    question: "Is the source duplicated?".to_owned(),
                 },
             )
             .is_err()
@@ -2251,7 +2211,7 @@ mod tests {
 
         let mut unowned_evidence = fixture.checkpoint.claims[0].clone();
         unowned_evidence.claim_id = CheckpointClaimId::new();
-        unowned_evidence.evidence_refs = vec![CaptureEvidenceRef::Observation {
+        unowned_evidence.evidence_refs = vec![CheckpointEvidenceRef::Observation {
             observation_id: WorkObservationId::new(),
         }];
         assert!(
@@ -2325,7 +2285,7 @@ mod tests {
 
     #[test]
     fn candidate_builder_must_include_the_episode_final_checkpoint() {
-        let fixture = capture_fixture();
+        let fixture = checkpoint_fixture();
         let alternate_checkpoint = AgentCheckpoint::from_parts(
             &fixture.episode,
             fixture.episode.intent_revisions.last(),
@@ -2375,7 +2335,7 @@ mod tests {
             .is_err()
         );
 
-        let fixture = capture_fixture();
+        let fixture = checkpoint_fixture();
         let mut missing = content();
         missing.evidence.clear();
         assert!(
@@ -2396,7 +2356,7 @@ mod tests {
 
     #[test]
     fn candidate_allows_no_space_multiple_recommendations_and_proposed_new_intent() {
-        let fixture = capture_fixture();
+        let fixture = checkpoint_fixture();
         let no_space = AutomaticContextCandidate::from_builder(
             &fixture.episode,
             std::slice::from_ref(&fixture.checkpoint),
@@ -2527,7 +2487,7 @@ mod tests {
 
     #[test]
     fn automatic_candidate_source_ownership_and_status_are_verifiable() {
-        let fixture = capture_fixture();
+        let fixture = checkpoint_fixture();
         let mut unkeyed_decision = content();
         unkeyed_decision.topic_key = None;
         assert!(unkeyed_decision.validate().is_ok());
@@ -2606,7 +2566,7 @@ mod tests {
 
     #[test]
     fn legacy_git_candidate_remains_unowned_and_noninjectable() {
-        let fixture = capture_fixture();
+        let fixture = checkpoint_fixture();
         let candidate =
             ContextCandidate::from_episode(SubmissionId::new(), &fixture.episode, content())
                 .unwrap();

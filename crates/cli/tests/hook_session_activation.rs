@@ -15,8 +15,7 @@ use sctx_domain::{ExternalSessionLocator, RepositoryId};
 use sctx_git_store::GitStore;
 use sctx_local_state::{
     AuthorizedSessionScopeDecision, AuthorizedSessionScopePolicy, AuthorizedSessionScopeRead,
-    AuthorizedSessionScopeStore, CaptureDiagnosticKind, CaptureStore, MaintenanceLock,
-    UserConfigStore,
+    AuthorizedSessionScopeStore, MaintenanceLock, UserConfigStore,
 };
 use sctx_task_runtime::TaskRuntime;
 use serde_json::{Value, json};
@@ -454,21 +453,8 @@ fn enabled_tool_work_gets_one_intent_bootstrap_reminder_without_prompt_or_task_c
     );
     assert_neutral(&stopped);
 
-    let captures = CaptureStore::initialize(fixture.root())
-        .unwrap()
-        .list(32)
-        .unwrap()
-        .captures;
-    for (agent, session) in [("codex", codex_session), ("cursor", cursor_session)] {
-        let locator = ExternalSessionLocator::new(agent, session).unwrap();
-        assert!(captures.iter().any(|capture| {
-            capture.record.external_session_locator == locator
-                && capture.record.kind == sctx_local_state::BreadcrumbKind::Checkpoint
-                && capture
-                    .record
-                    .diagnostics
-                    .contains(&CaptureDiagnosticKind::IntentBootstrapRequired)
-        }));
+    for removed in ["capture", "capture.lock", "capture-metadata.json"] {
+        assert!(!fixture.root().join("state").join(removed).exists());
     }
     assert!(!tree_contains(
         &fixture.root().join("state"),

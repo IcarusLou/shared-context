@@ -13,7 +13,6 @@ use sctx_domain::{
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
-use sctx_local_state::{BreadcrumbKind, CaptureStore};
 use sctx_task_runtime::TaskRuntime;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -537,53 +536,9 @@ fn one_real_hook_to_confirm_identity_chain() {
         .find(|record| record.signal.kind == TaskSignalKind::TestOutcome)
         .unwrap();
     assert_eq!(test_signal.signal.content, "test runner succeeded");
-    let signal_id = test_signal.signal_id;
-    let captures = CaptureStore::initialize(&root).unwrap().list(256).unwrap();
-    let owned_captures = captures
-        .captures
-        .iter()
-        .filter(|capture| capture.record.external_session_locator == locator)
-        .collect::<Vec<_>>();
-    assert_eq!(owned_captures.len(), 2);
-    assert!(
-        owned_captures
-            .iter()
-            .all(|capture| capture.record.kind == BreadcrumbKind::ToolOutcome)
-    );
-    assert!(
-        owned_captures
-            .iter()
-            .any(|capture| capture.record.summary == "test runner succeeded")
-    );
-    assert!(owned_captures.iter().any(|capture| {
-        capture
-            .record
-            .file_hints
-            .iter()
-            .any(|path| path.ends_with(&oracle.source_relative_path))
-    }));
-    assert_ne!(
-        owned_captures[0].record.capture_id,
-        owned_captures[1].record.capture_id
-    );
-    let capture_records = owned_captures
-        .iter()
-        .map(|capture| &capture.record)
-        .collect::<Vec<_>>();
-    let capture_json = serde_json::to_string(&capture_records).unwrap();
-    for raw in [
-        &oracle.raw_file_marker,
-        &oracle.raw_test_marker,
-        &oracle.prompt,
-    ] {
-        assert!(!capture_json.contains(raw));
+    for removed in ["capture", "capture.lock", "capture-metadata.json"] {
+        assert!(!root.join("state").join(removed).exists());
     }
-    assert!(owned_captures.iter().all(|capture| {
-        capture
-            .record
-            .task_owner
-            .is_some_and(|owner| owner.task_id.to_string() == task_id)
-    }));
 
     let checkpoint = mcp_tool(
         &home,
@@ -592,25 +547,16 @@ fn one_real_hook_to_confirm_identity_chain() {
         &json!({
             "agent_kind": "codex",
             "external_session_id": oracle.session,
-            "expected_task_id": task_id,
-            "expected_intent_revision_id": intent_revision_id,
-            "expected_episode_version": 0,
-            "boundary": "continue",
             "claims": [{
-                "context_kind_hint": "validation",
-                "topic_key_hint": "m4/hook-chain-result",
+                "context_kind": "validation",
                 "statement": oracle.claim_statement,
                 "rationale": oracle.claim_rationale,
-                "applicability": {
-                    "domains": ["search"],
-                    "platforms": ["fe", "ios", "android"],
-                    "conditions": []
-                },
-                "assumptions": [],
-                "recheck_when": ["the result path changes"],
-                "evidence": [{"kind": "task_signal", "signal_id": signal_id}],
-                "artifact_refs": [focus["resolved_focus"].clone()],
-                "related_contexts": []
+                "conditions": [],
+                "evidence": [{
+                    "evidence_type": "experiment_record",
+                    "summary": "the Hook-to-confirm workflow passed",
+                    "limitations": ["local acceptance fixture"]
+                }]
             }],
             "unknowns": []
         }),
@@ -619,7 +565,7 @@ fn one_real_hook_to_confirm_identity_chain() {
     let claim_id = checkpoint["claim_ids"][0].as_str().unwrap().to_owned();
     let episode_id = checkpoint["episode_id"].as_str().unwrap().to_owned();
     assert_eq!(checkpoint["episode_version"], 1);
-    assert!(checkpoint.get("candidate_build").is_none());
+    assert_eq!(checkpoint["candidate_build"]["status"], "pending");
     let episode_before = runtime
         .list_work_episodes(active.task_session_id, 10)
         .unwrap()
@@ -628,15 +574,12 @@ fn one_real_hook_to_confirm_identity_chain() {
         .unwrap();
     assert!(matches!(
         episode_before.episode.status,
-        WorkEpisodeStatus::Open
+        WorkEpisodeStatus::Closed { .. }
     ));
-    assert_eq!(
-        episode_before.checkpoints[0].claims[0].evidence_refs[0],
-        sctx_domain::CaptureEvidenceRef::TaskSignal { signal_id }
-    );
-    assert_eq!(
-        serde_json::to_value(&episode_before.checkpoints[0].claims[0].artifact_refs[0]).unwrap(),
-        focus["resolved_focus"]
+    assert!(
+        episode_before.checkpoints[0].claims[0]
+            .artifact_refs
+            .is_empty()
     );
 
     let turn_stop_payload = json!({

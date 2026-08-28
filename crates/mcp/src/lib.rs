@@ -23,16 +23,16 @@ use sctx_domain::{
     CandidateConfirmationPlan, CandidateConfirmationPrimaryReference, CandidatePrimarySelection,
     CandidateRelationAssessment, CandidateReviewDiagnostic, CandidateReviewStatus,
     CandidateReviewSummary, CandidateReviewView, CandidateSpaceRecommendation,
-    CandidateSpaceRecommendationPath, CaptureEvidenceRef, CaptureId, CaptureUnknown,
-    CheckpointClaim, CheckpointClaimId, ContextId, ContextKind, ContextRelation,
-    ContextRevisionDraft, EngineeringReferenceDraft, Error, ErrorKind, EvidenceSnapshotDraft,
-    EvidenceType, ExternalSessionLocator, NormalizedWorkObservation, OptionalCandidateEdits,
+    CandidateSpaceRecommendationPath, CheckpointClaim, CheckpointClaimId, CheckpointEvidenceRef,
+    CheckpointUnknown, ContextId, ContextKind, ContextRelation, ContextRevisionDraft,
+    EngineeringReferenceDraft, Error, ErrorKind, EvidenceSnapshotDraft, EvidenceType,
+    ExternalSessionLocator, NormalizedWorkObservation, OptionalCandidateEdits,
     ProposedSpaceGroupKey, REPOSITORY_ID_MAX_BYTES, REPOSITORY_ID_PATTERN, ReferenceId,
     ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionStatus, ResolvedFocus, Result,
     RevisionId, SignalId, SpaceId, SpaceRecommendationId, SubmissionId, TaskId,
     TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignalKind, TaskSignalLifecycle,
     TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId, WorkEpisodeStatus, WorkObservation,
-    WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
+    WorkObservationId, WorkingIntentSnapshot,
 };
 use sctx_engineering_graph::{
     CandidateMatchEvidence, CatalogRepositorySpec, EngineeringProjectionStore,
@@ -49,8 +49,8 @@ use sctx_git_store::{
 use sctx_index::{DomainSnapshot, ProjectionIndex};
 use sctx_local_state::{
     AuthorizedSessionScope, AuthorizedSessionScopeDecision, AuthorizedSessionScopeRead,
-    AuthorizedSessionScopeStore, BreadcrumbKind, CaptureDiagnosticKind, CaptureStore,
-    MaintenanceLock, PrivacyScanner, RepositoryCatalogSnapshot, UserConfigStore,
+    AuthorizedSessionScopeStore, MaintenanceLock, PrivacyScanner, RepositoryCatalogSnapshot,
+    UserConfigStore,
 };
 use sctx_search::{
     CandidateAnalysisRequest, ConflictView, ContextPackOmitted, ContextStatus,
@@ -77,8 +77,6 @@ const DEFAULT_CANDIDATE_REVIEW_LIST_LIMIT: usize = 20;
 const DEFAULT_CANDIDATE_REVIEW_TOKEN_BUDGET: usize = 4_096;
 const MIN_CANDIDATE_REVIEW_TOKEN_BUDGET: usize = 512;
 const MAX_CANDIDATE_REVIEW_TOKEN_BUDGET: usize = 32_768;
-const DEFAULT_TASK_CAPTURE_LIST_LIMIT: usize = 20;
-const MAX_TASK_CAPTURE_LIST_LIMIT: usize = 128;
 const MAX_TASK_CHECKPOINT_BYTES: usize = 64 * 1024;
 const MAX_TASK_CHECKPOINT_CLAIMS: usize = 64;
 const MAX_TASK_CHECKPOINT_UNKNOWNS: usize = 64;
@@ -142,35 +140,6 @@ pub struct TaskCheckpointEvidenceInput {
     pub limitations: Vec<String>,
 }
 
-/// Bounded owner-scoped view of recent Capture inputs available to one `ActiveTask`.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TaskCaptureListInput {
-    pub agent_kind: String,
-    pub external_session_id: String,
-    #[serde(default = "default_task_capture_list_limit")]
-    pub limit: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TaskCaptureSummary {
-    pub capture_id: CaptureId,
-    pub recorded_at_unix_seconds: u64,
-    pub expires_at_unix_seconds: u64,
-    pub intent_revision_id: TaskIntentRevisionId,
-    pub kind: BreadcrumbKind,
-    pub summary: String,
-    pub diagnostics: Vec<CaptureDiagnosticKind>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TaskCaptureListResponse {
-    pub task_session_id: TaskSessionId,
-    pub task_id: TaskId,
-    pub captures: Vec<TaskCaptureSummary>,
-    pub truncated: bool,
-}
-
 /// Complete Claim draft without caller-owned Claim or Observation identity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -204,14 +173,7 @@ pub struct TaskCheckpointInput {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskCheckpointDiagnostic {
-    CaptureIngested {
-        capture_id: CaptureId,
-        observation_id: WorkObservationId,
-        inserted: bool,
-    },
-    InlineValidationRecorded {
-        observation_id: WorkObservationId,
-    },
+    InlineValidationRecorded { observation_id: WorkObservationId },
 }
 
 /// One accepted server-owned Checkpoint and resulting closed Episode boundary.
@@ -323,7 +285,7 @@ pub struct CandidateBuildItemSummary {
     pub candidate_status: AutomaticCandidateStatus,
     pub analysis: CandidateAnalysis,
     pub confidence: CandidateConfidence,
-    pub unknowns: Vec<CaptureUnknown>,
+    pub unknowns: Vec<CheckpointUnknown>,
     pub space_recommendations: Vec<CandidateSpaceRecommendation>,
 }
 
@@ -1035,7 +997,6 @@ struct Frame {
 }
 
 struct Runtime {
-    root: PathBuf,
     store: GitStore,
     index: ProjectionIndex,
     repositories: RepositoryRegistry,
@@ -1050,7 +1011,7 @@ struct ClaimBuildMaterial {
     claim_id: CheckpointClaimId,
     draft: Option<ContextRevisionDraft>,
     confidence: CandidateConfidence,
-    unknowns: Vec<CaptureUnknown>,
+    unknowns: Vec<CheckpointUnknown>,
     error_code: Option<&'static str>,
 }
 
@@ -1101,7 +1062,6 @@ impl Runtime {
         let engineering_graph = EngineeringProjectionStore::initialize(root).ok();
         let tasks = TaskRuntime::initialize(root)?;
         Ok(Self {
-            root: root.to_path_buf(),
             store,
             index,
             repositories,
@@ -1132,50 +1092,6 @@ impl Runtime {
             input.token_budget,
             input.max_spaces,
         )
-    }
-
-    fn task_capture_list(&self, input: &TaskCaptureListInput) -> Result<TaskCaptureListResponse> {
-        if input.limit == 0 || input.limit > MAX_TASK_CAPTURE_LIST_LIMIT {
-            return Err(invalid(format!(
-                "task_capture_list limit must be between 1 and {MAX_TASK_CAPTURE_LIST_LIMIT}"
-            )));
-        }
-        let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
-        let active = self
-            .tasks
-            .read_snapshot_by_locator(&locator)?
-            .ok_or_else(|| invalid("task_capture_list requires an existing ActiveTask"))?;
-        let report = CaptureStore::initialize(&self.root)?.list_unclaimed_for_task(
-            &locator,
-            active.task_session_id,
-            active.task_id,
-            input.limit,
-        )?;
-        let captures = report
-            .captures
-            .into_iter()
-            .map(|capture| {
-                let owner = capture
-                    .record
-                    .task_owner
-                    .ok_or_else(|| invariant("owner-scoped Capture listing returned no owner"))?;
-                Ok(TaskCaptureSummary {
-                    capture_id: capture.record.capture_id,
-                    recorded_at_unix_seconds: capture.record.recorded_at_unix_seconds,
-                    expires_at_unix_seconds: capture.record.expires_at_unix_seconds,
-                    intent_revision_id: owner.intent_revision_id,
-                    kind: capture.record.kind,
-                    summary: capture.record.summary,
-                    diagnostics: capture.record.diagnostics,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(TaskCaptureListResponse {
-            task_session_id: active.task_session_id,
-            task_id: active.task_id,
-            captures,
-            truncated: report.truncated,
-        })
     }
 
     fn task_artifact_focus(
@@ -1394,7 +1310,7 @@ impl Runtime {
                 unknowns: input
                     .unknowns
                     .iter()
-                    .map(|unknown| CaptureUnknown {
+                    .map(|unknown| CheckpointUnknown {
                         statement: unknown.statement.clone(),
                         blocking: unknown.blocking,
                         recheck_when: Vec::new(),
@@ -1721,9 +1637,9 @@ impl Runtime {
             .evidence_refs
             .iter()
             .filter_map(|evidence| match evidence {
-                CaptureEvidenceRef::Observation { observation_id } => Some(*observation_id),
-                CaptureEvidenceRef::TaskSignal { .. }
-                | CaptureEvidenceRef::ContextEvidence { .. } => None,
+                CheckpointEvidenceRef::Observation { observation_id } => Some(*observation_id),
+                CheckpointEvidenceRef::TaskSignal { .. }
+                | CheckpointEvidenceRef::ContextEvidence { .. } => None,
             })
             .collect::<Vec<_>>();
         let provenance = CandidateBuilderProvenance {
@@ -2788,7 +2704,7 @@ fn build_claim_material(
     let mut confidence = if claim.context_kind_hint.is_some() {
         8_000_u16
     } else {
-        unknowns.push(CaptureUnknown {
+        unknowns.push(CheckpointUnknown {
             statement: "Context kind was not explicitly classified; conservative Discovery fallback applied"
                 .to_owned(),
             blocking: false,
@@ -2799,7 +2715,7 @@ fn build_claim_material(
     if matches!(kind, ContextKind::Decision | ContextKind::Contract)
         && claim.topic_key_hint.is_none()
     {
-        unknowns.push(CaptureUnknown {
+        unknowns.push(CheckpointUnknown {
             statement: "Decision or Contract topic key remains unclassified".to_owned(),
             blocking: false,
             recheck_when: vec!["Before Candidate confirmation".to_owned()],
@@ -2847,7 +2763,7 @@ fn build_claim_material(
 
 #[allow(clippy::too_many_arguments)]
 fn collect_candidate_evidence(
-    reference: &CaptureEvidenceRef,
+    reference: &CheckpointEvidenceRef,
     claim: &CheckpointClaim,
     episode: &WorkEpisodeView,
     signals: &[TaskSignalRecord],
@@ -2857,7 +2773,7 @@ fn collect_candidate_evidence(
     evidence: &mut Vec<EvidenceSnapshotDraft>,
 ) -> std::result::Result<(), &'static str> {
     match reference {
-        CaptureEvidenceRef::Observation { observation_id } => {
+        CheckpointEvidenceRef::Observation { observation_id } => {
             let observation = episode
                 .episode
                 .observations
@@ -2875,7 +2791,7 @@ fn collect_candidate_evidence(
                 evidence,
             )
         }
-        CaptureEvidenceRef::TaskSignal { signal_id } => {
+        CheckpointEvidenceRef::TaskSignal { signal_id } => {
             let signal = signals
                 .iter()
                 .find(|signal| signal.signal_id == *signal_id)
@@ -2909,7 +2825,7 @@ fn collect_candidate_evidence(
             });
             Ok(())
         }
-        CaptureEvidenceRef::ContextEvidence {
+        CheckpointEvidenceRef::ContextEvidence {
             context_id,
             revision_id,
             evidence_id,
@@ -2997,8 +2913,7 @@ fn collect_observation_evidence(
                 NormalizedWorkObservation::Diff { .. }
                 | NormalizedWorkObservation::Artifact { .. }
                 | NormalizedWorkObservation::Interface { .. } => EvidenceType::ArtifactSnapshot,
-                NormalizedWorkObservation::Breadcrumb { .. }
-                | NormalizedWorkObservation::ContextUse { .. } => EvidenceType::SourceSnapshot,
+                NormalizedWorkObservation::ContextUse { .. } => EvidenceType::SourceSnapshot,
                 NormalizedWorkObservation::Validation { .. }
                 | NormalizedWorkObservation::InlineValidation { .. }
                 | NormalizedWorkObservation::UnresolvedQuestion { .. } => {
@@ -3021,19 +2936,8 @@ fn collect_observation_evidence(
     }
 }
 
-fn normalized_observation_limitations(observation: &WorkObservation) -> Vec<String> {
-    if observation
-        .source_refs
-        .iter()
-        .any(|source| matches!(source, WorkSourceRef::Capture(_)))
-    {
-        vec![
-            "Only normalized engineering meaning is preserved; the raw Capture payload is excluded"
-                .to_owned(),
-        ]
-    } else {
-        vec!["The snapshot excludes raw transcript and tool output".to_owned()]
-    }
+fn normalized_observation_limitations(_observation: &WorkObservation) -> Vec<String> {
+    vec!["The snapshot excludes raw transcript and tool output".to_owned()]
 }
 
 fn deduplicate_candidate_evidence(evidence: &mut Vec<EvidenceSnapshotDraft>) {
@@ -3615,7 +3519,6 @@ impl McpServer {
         let arguments = call.arguments.clone();
         match call.name.as_str() {
             "task_intent_update" => self.task_intent_update(arguments),
-            "task_capture_list" => self.task_capture_list(arguments),
             "task_artifact_focus" => self.task_artifact_focus(arguments),
             "task_signal_supersede" => self.task_signal_supersede(arguments),
             "task_checkpoint" => self.task_checkpoint(arguments),
@@ -3663,15 +3566,6 @@ impl McpServer {
         let response = self
             .runtime()
             .task_context_readonly(&input)
-            .map_err(ToolFailure::task_context_failed)?;
-        serde_json::to_value(response).map_err(serialization_failure)
-    }
-
-    fn task_capture_list(&self, arguments: Value) -> ToolResult {
-        let input: TaskCaptureListInput = decode_arguments(arguments)?;
-        let response = self
-            .runtime()
-            .task_capture_list(&input)
             .map_err(ToolFailure::task_context_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
     }
@@ -4204,7 +4098,6 @@ fn is_public_tool(name: &str) -> bool {
     matches!(
         name,
         "task_intent_update"
-            | "task_capture_list"
             | "task_artifact_focus"
             | "task_signal_supersede"
             | "task_checkpoint"
@@ -4226,11 +4119,9 @@ fn is_public_tool(name: &str) -> bool {
 fn runtime_open_failure(name: &str, error: Error) -> ToolFailure {
     match name {
         "task_intent_update" => ToolFailure::intent_update_failed(error),
-        "task_capture_list"
-        | "task_artifact_focus"
-        | "task_signal_supersede"
-        | "task_checkpoint"
-        | "task_context" => ToolFailure::task_context_failed(error),
+        "task_artifact_focus" | "task_signal_supersede" | "task_checkpoint" | "task_context" => {
+            ToolFailure::task_context_failed(error)
+        }
         "repository_scan"
         | "engineering_reference_record"
         | "association_explain"
@@ -4253,7 +4144,6 @@ fn validate_public_arguments(
     }
     match name {
         "task_intent_update" => decode!(TaskIntentUpdateInput),
-        "task_capture_list" => decode!(TaskCaptureListInput),
         "task_artifact_focus" => decode!(ArtifactFocusQuery),
         "task_signal_supersede" => decode!(TaskSignalSupersedeInput),
         "task_checkpoint" => decode!(TaskCheckpointInput),
@@ -4327,22 +4217,6 @@ fn authorize_runtime_identity_target(
     tasks: &TaskRuntime,
 ) -> std::result::Result<(), ToolFailure> {
     match name {
-        "task_capture_list" => {
-            let input: TaskCaptureListInput = serde_json::from_value(arguments.clone())
-                .map_err(|error| ToolFailure::from(invalid(error.to_string())))?;
-            let locator =
-                ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)
-                    .map_err(ToolFailure::from)?;
-            if tasks
-                .read_snapshot_by_locator(&locator)
-                .map_err(ToolFailure::task_context_failed)?
-                .is_none()
-            {
-                return Err(ToolFailure::task_target_failed(invalid(
-                    "Task target is unavailable",
-                )));
-            }
-        }
         "task_signal_supersede" => {
             let input: TaskSignalSupersedeInput = serde_json::from_value(arguments.clone())
                 .map_err(|error| ToolFailure::from(invalid(error.to_string())))?;
@@ -4457,8 +4331,7 @@ fn require_owned_candidate(
 fn requires_runtime_identity_preflight(name: &str) -> bool {
     matches!(
         name,
-        "task_capture_list"
-            | "task_signal_supersede"
+        "task_signal_supersede"
             | "task_checkpoint"
             | "candidate_get"
             | "candidate_discard"
@@ -4467,10 +4340,7 @@ fn requires_runtime_identity_preflight(name: &str) -> bool {
 }
 
 fn identity_target_unavailable(name: &str) -> ToolFailure {
-    if matches!(
-        name,
-        "task_capture_list" | "task_signal_supersede" | "task_checkpoint"
-    ) {
+    if matches!(name, "task_signal_supersede" | "task_checkpoint") {
         ToolFailure::task_target_failed(invalid("Task target is unavailable"))
     } else {
         ToolFailure::candidate_target_failed(invalid("Candidate Review target is unavailable"))
@@ -4484,11 +4354,6 @@ fn tools_list() -> Value {
             "task_intent_update",
             "CAS-record a lightweight Working Intent snapshot, optionally start a new explicit Task, and return its TaskContextPack.",
             task_intent_update_schema()
-        ),
-        tool_schema(
-            "task_capture_list",
-            "List recent live unclaimed Capture summaries owned by the exact ActiveTask. Captures remain non-factual until explicitly cited by task_checkpoint.",
-            task_capture_list_schema()
         ),
         tool_schema(
             "task_artifact_focus",
@@ -4852,24 +4717,6 @@ fn task_signal_supersede_schema() -> Value {
             "task_id": id_schema("tsk_"),
             "expected_revision_id": id_schema("tir_"),
             "signal_ids": {"type": "array", "minItems": 1, "items": id_schema("sig_")}
-        }
-    })
-}
-
-fn task_capture_list_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["agent_kind", "external_session_id"],
-        "properties": {
-            "agent_kind": {"type": "string", "minLength": 1},
-            "external_session_id": {"type": "string", "minLength": 1},
-            "limit": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": MAX_TASK_CAPTURE_LIST_LIMIT,
-                "default": DEFAULT_TASK_CAPTURE_LIST_LIMIT
-            }
         }
     })
 }
@@ -5488,10 +5335,6 @@ fn empty_object() -> Value {
 
 const fn default_page_size() -> usize {
     20
-}
-
-const fn default_task_capture_list_limit() -> usize {
-    DEFAULT_TASK_CAPTURE_LIST_LIMIT
 }
 
 const fn default_token_budget() -> usize {

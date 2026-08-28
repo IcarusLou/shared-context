@@ -10,17 +10,16 @@ use std::{
 };
 
 use fs2::FileExt;
-use sctx_domain::{ExternalSessionLocator, NormalizedBreadcrumbKind, NormalizedWorkObservation};
+use sctx_domain::ExternalSessionLocator;
 use sctx_git_store::GitStore;
 use sctx_installer::{
     Agent, Architecture, Host, InstallContext, Installer, SetupOptions, SetupStage, SkillStatus,
 };
 use sctx_local_state::{
     ActivationScope, ActivationScopeDecision, AuthorizedSessionScope, AuthorizedSessionScopePolicy,
-    AuthorizedSessionScopeRead, AuthorizedSessionScopeStore, CaptureClaim, CaptureStore,
-    UserConfigStore, map_capture_artifacts,
+    AuthorizedSessionScopeRead, AuthorizedSessionScopeStore, UserConfigStore,
 };
-use sctx_task_runtime::{CaptureIngestion, TaskRuntime};
+use sctx_task_runtime::TaskRuntime;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
@@ -88,7 +87,6 @@ struct EnabledChain {
 #[derive(Debug, Deserialize)]
 struct Residue {
     runtime_files: usize,
-    capture_records: usize,
     report_files: usize,
     knowledge_commits_delta: usize,
 }
@@ -680,17 +678,10 @@ fn runtime_file_count(root: &Path) -> usize {
         .count()
 }
 
-fn capture_record_count(root: &Path) -> usize {
-    fs::read_dir(root.join("state/capture"))
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter(|entry| {
-            entry.as_ref().ok().is_some_and(|entry| {
-                entry.path().extension().and_then(|value| value.to_str()) == Some("json")
-            })
-        })
-        .count()
+fn assert_no_capture_state(root: &Path) {
+    for removed in ["capture", "capture.lock", "capture-metadata.json"] {
+        assert!(!root.join("state").join(removed).exists());
+    }
 }
 
 fn report_file_count(root: &Path) -> usize {
@@ -797,27 +788,8 @@ fn run_enabled_chain(
         .into_iter()
         .find(|signal| signal.signal.content.contains(tool))
         .unwrap();
-    let captures = CaptureStore::initialize(&fixture.root)
-        .unwrap()
-        .list(64)
-        .unwrap()
-        .captures
-        .into_iter()
-        .filter(|capture| capture.record.external_session_locator == locator)
-        .collect::<Vec<_>>();
-    assert_eq!(captures.len(), 1);
-    assert_eq!(
-        captures[0].record.file_hints,
-        [target_file.to_str().unwrap()]
-    );
-    let mapped = map_capture_artifacts(&captures[0].record, &fixture.catalog());
-    assert_eq!(mapped.artifact_refs.len(), 1);
-    assert_eq!(&mapped.artifact_refs[0].repository_id, target_repository_id);
-    let capture_records = captures
-        .iter()
-        .map(|capture| &capture.record)
-        .collect::<Vec<_>>();
-    let persisted = serde_json::to_string(&(capture_records, &signal)).unwrap();
+    assert_no_capture_state(&fixture.root);
+    let persisted = serde_json::to_string(&signal).unwrap();
     assert!(!persisted.contains(&raw_marker));
 
     let checkpoint = traced_call(
@@ -827,36 +799,29 @@ fn run_enabled_chain(
         session,
         "task_checkpoint",
         &json!({
-            "expected_task_id": task_id,
-            "expected_intent_revision_id": intent_revision_id,
-            "expected_episode_version": 0,
-            "boundary": "continue",
             "claims": [{
-                "context_kind_hint": "validation",
+                "context_kind": "validation",
                 "statement": format!("The {} registered cross-Repository check passed", profile.agent()),
                 "rationale": "The owned normalized test outcome and exact resolved Focus agree",
-                "applicability": {"domains": ["acceptance"], "platforms": [], "conditions": []},
-                "assumptions": [],
-                "recheck_when": ["the Repository Catalog or result path changes"],
-                "evidence": [{"kind": "task_signal", "signal_id": signal.signal_id}],
-                "artifact_refs": [focus["resolved_focus"].clone()],
-                "related_contexts": []
+                "conditions": [],
+                "evidence": [{
+                    "evidence_type": "experiment_record",
+                    "summary": "the registered cross-Repository check passed",
+                    "limitations": ["local acceptance fixture"]
+                }]
             }],
             "unknowns": []
         }),
     );
     assert_eq!(checkpoint["episode_version"], 1);
-    assert!(checkpoint.get("candidate_build").is_none());
+    assert_eq!(checkpoint["candidate_build"]["status"], "pending");
     let episode = runtime
         .list_work_episodes(active.task_session_id, 4)
         .unwrap()
         .into_iter()
         .next()
         .unwrap();
-    assert_eq!(
-        serde_json::to_value(&episode.checkpoints[0].claims[0].artifact_refs[0]).unwrap(),
-        focus["resolved_focus"]
-    );
+    assert!(episode.checkpoints[0].claims[0].artifact_refs.is_empty());
     let boundary = fixture.hook(profile, &lifecycle_boundary(profile, session, startup));
     assert!(
         boundary.get("systemMessage").is_some()
@@ -1092,10 +1057,7 @@ fn first_locator_decision_is_sticky_and_disabled_residue_is_exactly_zero() {
         runtime_file_count(&fixture.root),
         oracle.disabled_residue.runtime_files
     );
-    assert_eq!(
-        capture_record_count(&fixture.root),
-        oracle.disabled_residue.capture_records
-    );
+    assert_no_capture_state(&fixture.root);
     assert_eq!(
         report_file_count(&fixture.root),
         oracle.disabled_residue.report_files
@@ -1335,78 +1297,40 @@ fn safe_unregistered_claim_requires_owned_non_locating_observation_and_unsafe_pa
     let locator = ExternalSessionLocator::new("codex", session).unwrap();
     let runtime = TaskRuntime::initialize(&fixture.root).unwrap();
     let active = runtime.read_snapshot_by_locator(&locator).unwrap().unwrap();
-    let capture_store = CaptureStore::initialize(&fixture.root).unwrap();
-    let capture = capture_store
-        .list(32)
-        .unwrap()
-        .captures
-        .into_iter()
-        .find(|capture| capture.record.external_session_locator == locator)
-        .unwrap()
-        .record;
-    assert!(capture.workspace_hint.is_none());
-    assert!(capture.file_hints.is_empty());
-    let owner = capture.task_owner.unwrap();
-    let episode = runtime
-        .open_work_episode(&locator, active.task_id, owner.intent_revision_id)
-        .unwrap()
-        .episode;
-    let claim = CaptureClaim {
-        episode_id: episode.episode.episode_id,
-        task_session_id: active.task_session_id,
-        task_id: active.task_id,
-    };
-    capture_store.claim(capture.capture_id, claim).unwrap();
-    let claimed = capture_store.read(capture.capture_id).unwrap().record;
-    let mapped = map_capture_artifacts(&claimed, &fixture.catalog());
-    assert!(mapped.artifact_refs.is_empty());
-    assert!(mapped.diagnostics.is_empty());
-    let ingested = runtime
-        .ingest_capture(&CaptureIngestion {
-            capture_id: claimed.capture_id,
-            episode_id: episode.episode.episode_id,
-            expected_episode_version: 0,
-            task_session_id: active.task_session_id,
-            task_id: active.task_id,
-            intent_revision_id: owner.intent_revision_id,
-            additional_sources: Vec::new(),
-            observation: NormalizedWorkObservation::Breadcrumb {
-                category: NormalizedBreadcrumbKind::Exploration,
-                summary: claimed.summary,
-            },
-            diagnostics: Vec::new(),
-        })
-        .unwrap();
+    assert_no_capture_state(&fixture.root);
     let checkpoint = mcp_call(
         &fixture.home,
         AgentProfile::Codex,
         session,
         "task_checkpoint",
         &json!({
-            "expected_task_id": task.structured["task_id"],
-            "expected_intent_revision_id": task.structured["intent_revision_id"],
-            "expected_episode_version": 1,
-            "boundary": "close",
             "claims": [{
-                "context_kind_hint": "validation",
+                "context_kind": "validation",
                 "statement": "The unregistered investigation retained only bounded non-locating meaning",
-                "rationale": "The Claim explicitly cites its exact owned normalized Observation",
-                "applicability": {
-                    "domains": ["acceptance"],
-                    "platforms": [],
-                    "conditions": ["the investigated Repository remains unregistered"]
-                },
-                "assumptions": [],
-                "recheck_when": ["the investigated Repository is registered"],
-                "evidence": [{"kind": "observation", "observation_id": ingested.observation_id}],
-                "artifact_refs": [],
-                "related_contexts": []
+                "rationale": "The Agent retained only the focused engineering conclusion",
+                "conditions": ["the investigated Repository remains unregistered"],
+                "evidence": [{
+                    "evidence_type": "experiment_record",
+                    "summary": "the bounded non-locating investigation completed",
+                    "limitations": ["the Repository identity remains unregistered"]
+                }]
             }],
             "unknowns": []
         }),
     );
     assert!(!checkpoint.is_error, "{:#}", checkpoint.structured);
-    let candidate_id = checkpoint.structured["candidate_build"]["items"][0]["candidate_id"]
+    assert_eq!(
+        checkpoint.structured["candidate_build"]["status"],
+        "pending"
+    );
+    let candidates = mcp_call(
+        &fixture.home,
+        AgentProfile::Codex,
+        session,
+        "candidate_list",
+        &json!({"status": "pending", "limit": 10, "token_budget": 32768}),
+    );
+    let candidate_id = candidates.structured["reviews"][0]["candidate_id"]
         .as_str()
         .unwrap();
     let review = mcp_call(
@@ -1419,7 +1343,7 @@ fn safe_unregistered_claim_requires_owned_non_locating_observation_and_unsafe_pa
     assert!(!review.is_error, "{:#}", review.structured);
     assert_eq!(
         review.structured["content"]["evidence"][0]["limitations"][0],
-        "Only normalized engineering meaning is preserved; the raw Capture payload is excluded"
+        "the Repository identity remains unregistered"
     );
     let review_text = review.structured.to_string();
     for forbidden in [
@@ -1435,7 +1359,6 @@ fn safe_unregistered_claim_requires_owned_non_locating_observation_and_unsafe_pa
     }
     assert!(review.structured["content"].get("artifact_refs").is_none());
 
-    let captures_before = capture_record_count(&fixture.root);
     let signals_before = runtime
         .read_signal_history(active.task_session_id)
         .unwrap()
@@ -1462,7 +1385,7 @@ fn safe_unregistered_claim_requires_owned_non_locating_observation_and_unsafe_pa
             json!({})
         );
     }
-    assert_eq!(capture_record_count(&fixture.root), captures_before);
+    assert_no_capture_state(&fixture.root);
     assert_eq!(
         runtime
             .read_signal_history(active.task_session_id)

@@ -172,27 +172,15 @@ fn post_tool(session: &str, checkout: &Path, sequence: usize) -> Value {
 
 fn claim(statement: &str, suffix: &str) -> Value {
     json!({
-        "context_kind_hint": "decision",
-        "topic_key_hint": format!("retrieval-quality/{suffix}"),
+        "context_kind": "decision",
         "statement": statement,
         "rationale": format!("Independent Claim {suffix} validates the retrieval quality boundary"),
-        "applicability": {"domains": ["retrieval"], "platforms": ["server"], "conditions": []},
-        "assumptions": [],
-        "recheck_when": ["the retrieval quality policy changes"],
+        "conditions": [],
         "evidence": [{
-            "kind": "inline_validation",
-            "evidence": {
-                "kind": "experiment_record",
-                "supports": format!("Retrieval quality Claim {suffix} passed"),
-                "content": {"claim": suffix, "actual": "passed"},
-                "interpretation": "The Claim remains independently reviewable",
-                "limitations": ["sanitized M2 acceptance fixture"]
-            }
-        }],
-        "artifact_refs": [],
-        "relations": [],
-        "engineering_references": [],
-        "related_contexts": []
+            "evidence_type": "experiment_record",
+            "summary": format!("Retrieval quality Claim {suffix} passed"),
+            "limitations": ["sanitized M2 acceptance fixture"]
+        }]
     })
 }
 
@@ -269,19 +257,22 @@ fn public_m2_retrieval_quality_workflow() {
         session,
         "task_checkpoint",
         json!({
-            "expected_task_id": grouped_task["task_id"],
-            "expected_intent_revision_id": grouped_task["intent_revision_id"],
-            "expected_episode_version": 0,
-            "boundary": "close",
             "claims": [claim(alpha_statement, "alpha"), claim(beta_statement, "beta")],
             "unknowns": []
         }),
     );
-    let candidate_ids = checkpoint["candidate_build"]["items"]
+    assert_eq!(checkpoint["candidate_build"]["status"], "pending");
+    let recovered = mcp_tool(
+        &home,
+        session,
+        "candidate_list",
+        json!({"status": "pending", "limit": 10, "token_budget": 32768}),
+    );
+    let candidate_ids = recovered["reviews"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|item| item["candidate_id"].as_str().unwrap().to_owned())
+        .map(|review| review["candidate_id"].as_str().unwrap().to_owned())
         .collect::<Vec<_>>();
     assert_eq!(candidate_ids.len(), 2);
     let first_review = mcp_tool(

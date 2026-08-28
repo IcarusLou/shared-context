@@ -473,7 +473,6 @@ pub enum VariableKind {
     ExternalSessionId,
     IntentRevisionId,
     SignalId,
-    CaptureId,
     WorkEpisodeId,
     WorkObservationId,
     CheckpointId,

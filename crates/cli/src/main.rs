@@ -19,9 +19,8 @@ use std::{
 use args::Options;
 use sctx_agent_adapter::{
     AgentCapabilities, CanonicalAgentAction, CanonicalAgentEvent, CanonicalAgentEventKind,
-    CanonicalBreadcrumbKind, EpisodeFinalizationTrigger, PathHint, ResolvedActivationDecision,
-    ResolvedAgentAction, TaskRuntimeOperation, ToolCategory, ToolOutcome, TrustState,
-    plan_action_for_activation,
+    EpisodeFinalizationTrigger, PathHint, ResolvedActivationDecision, ResolvedAgentAction,
+    TaskRuntimeOperation, ToolCategory, ToolOutcome, TrustState, plan_action_for_activation,
 };
 use sctx_domain::{
     Applicability, CandidateReviewStatus, ConflictParticipant, ConflictResolutionDraft,
@@ -38,9 +37,8 @@ use sctx_index::{
 };
 use sctx_local_state::{
     AuthorizedSessionScope, AuthorizedSessionScopeDecision, AuthorizedSessionScopeRead,
-    AuthorizedSessionScopeStore, Breadcrumb, BreadcrumbKind, CaptureDiagnosticKind, CaptureStore,
-    CaptureTaskOwner, CatalogCheckoutStatus, CatalogRepositoryGroupStatus, MaintenanceLock,
-    RepositoryCatalogSnapshot, UserConfigStore,
+    AuthorizedSessionScopeStore, CatalogCheckoutStatus, CatalogRepositoryGroupStatus,
+    MaintenanceLock, RepositoryCatalogSnapshot, UserConfigStore,
 };
 use sctx_mcp::{
     ArtifactFocusQuery, AssociationExplainInput, AssociationRebuildInput, CandidateAnalyzeInput,
@@ -822,7 +820,7 @@ fn run_hook(args: &[String]) -> Result<()> {
     } else {
         action
     };
-    let resolved = resolve_hook_action(action)?;
+    let resolved = resolve_hook_action(action);
     if maintenance.is_some() && event.kind() == CanonicalAgentEventKind::SessionEnd {
         remove_hook_session_scope(agent, &event.context().session_id);
     }
@@ -958,7 +956,7 @@ fn attribute_post_tool_action(
     };
     let attribution =
         resolve_post_tool_attribution(context.cwd.as_path(), path_hints, scope, catalog)?;
-    let Some(TaskRuntimeOperation::MergeObservations {
+    let Some(TaskRuntimeOperation::MergeSignals {
         cwd,
         workspace_roots,
         file_hints,
@@ -966,9 +964,6 @@ fn attribute_post_tool_action(
     }) = action.task_operation.as_mut()
     else {
         return Err(invariant("enabled PostToolUse has no merge operation"));
-    };
-    let Some(breadcrumb) = action.breadcrumb.as_mut() else {
-        return Err(invariant("enabled PostToolUse has no Breadcrumb"));
     };
     match attribution {
         HookEventAttribution::Registered {
@@ -978,15 +973,11 @@ fn attribute_post_tool_action(
             cwd.clone_from(&workspace_hint);
             *workspace_roots = vec![workspace_hint.clone()];
             file_hints.clone_from(&attributed_files);
-            breadcrumb.workspace_hint = Some(workspace_hint);
-            breadcrumb.file_hints = attributed_files;
         }
         HookEventAttribution::NonLocating => {
             *cwd = PathBuf::new();
             workspace_roots.clear();
             file_hints.clear();
-            breadcrumb.workspace_hint = None;
-            breadcrumb.file_hints.clear();
         }
     }
     Ok(action)
@@ -1032,8 +1023,7 @@ fn resolve_post_tool_attribution(
     if repository_ids.is_empty() || checkout_paths.is_empty() {
         return Err(invariant("PostToolUse attribution resolved no safe path"));
     }
-    let Some(workspace_hint) = resolve_registered_capture_workspace(&checkout_paths, catalog)
-    else {
+    let Some(workspace_hint) = resolve_registered_workspace(&checkout_paths, catalog) else {
         return Ok(HookEventAttribution::NonLocating);
     };
     Ok(HookEventAttribution::Registered {
@@ -1158,7 +1148,7 @@ fn collect_safe_path_attribution(
     }
 }
 
-fn resolve_registered_capture_workspace(
+fn resolve_registered_workspace(
     checkout_paths: &BTreeSet<PathBuf>,
     catalog: &RepositoryCatalogSnapshot,
 ) -> Option<PathBuf> {
@@ -1198,45 +1188,25 @@ fn agent_capabilities(
     }
 }
 
-fn resolve_hook_action(action: CanonicalAgentAction) -> Result<ResolvedAgentAction> {
+fn resolve_hook_action(action: CanonicalAgentAction) -> ResolvedAgentAction {
     let CanonicalAgentAction {
         task_operation,
-        breadcrumb,
         additional_context,
         system_message,
     } = action;
-    let lifecycle_operation = task_operation.as_ref().is_some_and(|operation| {
-        matches!(
-            operation,
-            TaskRuntimeOperation::FinalizeCheckpointedEpisode { .. }
-                | TaskRuntimeOperation::CleanupSessionState { .. }
-        )
-    });
     let task_resolution = match task_operation.map(resolve_task_operation).transpose() {
         Ok(resolution) => resolution.unwrap_or_default(),
         Err(_) => {
-            return Ok(ResolvedAgentAction {
+            return ResolvedAgentAction {
                 additional_context: None,
                 system_message: Some(HOOK_TASK_UNAVAILABLE.to_owned()),
-            });
+            };
         }
     };
-    if let Some(breadcrumb) = breadcrumb {
-        let root = installation_root()?;
-        if capture_breadcrumb(&root, breadcrumb).is_err()
-            && !lifecycle_operation
-            && task_resolution.system_message.is_none()
-        {
-            return Ok(ResolvedAgentAction {
-                additional_context: None,
-                system_message: Some(HOOK_TASK_UNAVAILABLE.to_owned()),
-            });
-        }
-    }
-    Ok(ResolvedAgentAction {
+    ResolvedAgentAction {
         additional_context: task_resolution.additional_context.or(additional_context),
         system_message: task_resolution.system_message.or(system_message),
-    })
+    }
 }
 
 #[derive(Default)]
@@ -1245,52 +1215,9 @@ struct ResolvedTaskOperation {
     system_message: Option<String>,
 }
 
-fn capture_breadcrumb(
-    root: &Path,
-    breadcrumb: sctx_agent_adapter::CanonicalBreadcrumb,
-) -> Result<()> {
-    let intent_bootstrap_required = breadcrumb.kind == CanonicalBreadcrumbKind::Checkpoint;
-    let (task_owner, diagnostics) = match TaskRuntime::initialize_for_hook(root)
-        .and_then(|runtime| runtime.read_snapshot_by_locator(&breadcrumb.external_session_locator))
-    {
-        Ok(Some(snapshot)) => (
-            Some(CaptureTaskOwner {
-                task_session_id: snapshot.task_session_id,
-                task_id: snapshot.task_id,
-                intent_revision_id: snapshot
-                    .current_intent_revision()
-                    .ok_or_else(|| invariant("ActiveTask has no Intent Head"))?
-                    .revision_id,
-            }),
-            Vec::new(),
-        ),
-        Ok(None) => {
-            let mut diagnostics = vec![CaptureDiagnosticKind::NoActiveTask];
-            if intent_bootstrap_required {
-                diagnostics.push(CaptureDiagnosticKind::IntentBootstrapRequired);
-            }
-            (None, diagnostics)
-        }
-        Err(_) => (None, vec![CaptureDiagnosticKind::RuntimeUnavailable]),
-    };
-    let _capture_attempt = CaptureStore::initialize(root)?.try_capture(&Breadcrumb {
-        external_session_locator: breadcrumb.external_session_locator,
-        task_owner,
-        kind: match breadcrumb.kind {
-            CanonicalBreadcrumbKind::ToolOutcome => BreadcrumbKind::ToolOutcome,
-            CanonicalBreadcrumbKind::Checkpoint => BreadcrumbKind::Checkpoint,
-        },
-        summary: breadcrumb.summary,
-        workspace_hint: breadcrumb.workspace_hint,
-        file_hints: breadcrumb.file_hints,
-        diagnostics,
-    })?;
-    Ok(())
-}
-
 fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<ResolvedTaskOperation> {
     match operation {
-        TaskRuntimeOperation::MergeObservations {
+        TaskRuntimeOperation::MergeSignals {
             locator,
             cwd,
             workspace_roots,
@@ -1313,7 +1240,7 @@ fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<ResolvedTas
                 });
             }
             let catalog = UserConfigStore::open_existing(&root)?.repository_catalog()?;
-            let signals = normalized_observation_signals(
+            let signals = normalized_tool_signals(
                 &catalog,
                 &cwd,
                 &workspace_roots,
@@ -1334,7 +1261,6 @@ fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<ResolvedTas
             let runtime = TaskRuntime::initialize_for_hook(&root)?;
             let _active = runtime.read_snapshot_by_locator(&locator)?;
             let _reviews = runtime.cleanup_expired_candidate_reviews()?;
-            let _capture_cleanup = CaptureStore::initialize(root)?.try_cleanup_expired()?;
             Ok(ResolvedTaskOperation::default())
         }
     }
@@ -1355,19 +1281,11 @@ fn finalize_checkpointed_episode(
         AutomatedEpisodeBoundary::NoActiveTask => format!(
             "Shared Context {trigger_name}: no ActiveTask exists. Continue coding normally; use $shared-context and task_intent_update before checkpointing."
         ),
-        AutomatedEpisodeBoundary::NoEpisode {
-            task_id,
-            intent_revision_id,
-            ..
-        } => format!(
-            "Shared Context {trigger_name}: no Work Episode is open for Task {task_id}. Use $shared-context and call task_checkpoint with expected_intent_revision_id {intent_revision_id}; Hook text is not Claim evidence."
+        AutomatedEpisodeBoundary::NoEpisode { task_id, .. } => format!(
+            "Shared Context {trigger_name}: no Work Episode is open for Task {task_id}. Use $shared-context and call task_checkpoint with complete direct Claims/Unknowns; the server resolves the current Task, Intent, and lifecycle. Hook text is not Claim evidence."
         ),
-        AutomatedEpisodeBoundary::CheckpointRequired {
-            episode,
-            intent_revision_id,
-        } => format!(
-            "Shared Context {trigger_name}: Work Episode {} remains open at version {} because no current-Intent Checkpoint exists. Before compaction or completion, call task_checkpoint for Task {} with expected_intent_revision_id {intent_revision_id} and complete Claims/Unknowns. Hook text is not Claim evidence.",
-            episode.episode.episode_id, episode.episode.version, episode.episode.task_id,
+        AutomatedEpisodeBoundary::CheckpointRequired { .. } => format!(
+            "Shared Context {trigger_name}: current work has no Checkpoint. Before compaction or completion, call task_checkpoint with complete direct Claims/Unknowns; the server resolves the current Task, Intent, and lifecycle. Hook text is not Claim evidence."
         ),
         AutomatedEpisodeBoundary::Closed {
             episode,
@@ -1454,7 +1372,7 @@ fn recover_one_pending_episode_build(
     Ok(())
 }
 
-fn normalized_observation_signals(
+fn normalized_tool_signals(
     _catalog: &RepositoryCatalogSnapshot,
     _cwd: &Path,
     _workspace_roots: &[PathBuf],

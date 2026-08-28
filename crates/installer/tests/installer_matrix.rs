@@ -6,11 +6,12 @@ use std::{
     sync::Arc,
 };
 
+use rusqlite::Connection;
 use sctx_domain::{
     Applicability, ArtifactKind, ArtifactLocator, ContextId, ContextKind, ContextRevisionDraft,
     EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, PublicationAction,
     PublicationDraft, ReferenceRelation, RepoRelativePath, ReviewDraft, ReviewVerdict, RevisionId,
-    WorkingIntentSnapshot,
+    TaskId, WorkingIntentSnapshot,
 };
 use sctx_engineering_graph::{EngineeringProjectionStore, RepositoryRegistry};
 use sctx_event_schema::{Event, IntentSnapshot};
@@ -213,6 +214,167 @@ impl Harness {
             })
             .collect()
     }
+}
+
+fn runtime_database(root: &Path) -> PathBuf {
+    root.join("state/runtime.sqlite")
+}
+
+fn runtime_files(root: &Path) -> [PathBuf; 3] {
+    let database = runtime_database(root);
+    [
+        database.clone(),
+        database.with_extension("sqlite-wal"),
+        database.with_extension("sqlite-shm"),
+    ]
+}
+
+fn mark_runtime_as_legacy_schema(root: &Path, version: u32, with_operation: bool) {
+    assert!(matches!(version, 11 | 12));
+    let connection = Connection::open(runtime_database(root)).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+            CREATE TABLE IF NOT EXISTS capture_ingestion (
+                capture_id TEXT PRIMARY KEY,
+                episode_id TEXT NOT NULL,
+                observation_id TEXT NOT NULL UNIQUE,
+                task_session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                FOREIGN KEY (observation_id, episode_id)
+                    REFERENCES work_observation (observation_id, episode_id),
+                FOREIGN KEY (episode_id, task_session_id, task_id)
+                    REFERENCES work_episode (episode_id, task_session_id, task_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS work_episode_diagnostic (
+                episode_id TEXT NOT NULL,
+                diagnostic_ordinal INTEGER NOT NULL CHECK (diagnostic_ordinal >= 0),
+                capture_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN (
+                    'capture_repository_not_configured',
+                    'capture_unsafe_artifact_path'
+                )),
+                PRIMARY KEY (episode_id, diagnostic_ordinal),
+                UNIQUE (episode_id, capture_id, kind),
+                FOREIGN KEY (episode_id) REFERENCES work_episode (episode_id)
+            ) STRICT;",
+        )
+        .unwrap();
+    if with_operation {
+        connection
+            .execute_batch(
+                "INSERT INTO checkpoint_operation (
+                    operation_key, operation_id, semantic_json, task_session_id, task_id,
+                    intent_revision_id, checkpoint_id, episode_id, build_id
+                ) VALUES (
+                    'legacy-operation-key', 'cop_00000000-0000-4000-8000-000000000001', '{}',
+                    'tss_00000000-0000-4000-8000-000000000002',
+                    'tsk_00000000-0000-4000-8000-000000000003',
+                    'tir_00000000-0000-4000-8000-000000000004',
+                    'ckp_00000000-0000-4000-8000-000000000005',
+                    'wep_00000000-0000-4000-8000-000000000006',
+                    'bld_00000000-0000-4000-8000-000000000007'
+                );",
+            )
+            .unwrap();
+    } else {
+        connection
+            .execute_batch("DROP TABLE checkpoint_operation;")
+            .unwrap();
+    }
+    connection
+        .pragma_update(None, "user_version", version)
+        .unwrap();
+    let stored_version = connection
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    assert_eq!(stored_version, i64::from(version));
+    assert_eq!(
+        sqlite_table_exists(&connection, "checkpoint_operation"),
+        with_operation
+    );
+    assert!(sqlite_table_exists(&connection, "capture_ingestion"));
+    assert!(sqlite_table_exists(&connection, "work_episode_diagnostic"));
+    if with_operation {
+        assert_eq!(runtime_operation_count(&connection), 1);
+    }
+}
+
+fn mark_runtime_as_schema_12(root: &Path) {
+    mark_runtime_as_legacy_schema(root, 12, true);
+}
+
+fn set_runtime_schema_version(root: &Path, version: u32) {
+    let connection = Connection::open(runtime_database(root)).unwrap();
+    connection
+        .pragma_update(None, "user_version", version)
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        i64::from(version)
+    );
+}
+
+fn sqlite_table_exists(connection: &Connection, name: &str) -> bool {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [name],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+}
+
+fn runtime_operation_count(connection: &Connection) -> i64 {
+    connection
+        .query_row("SELECT COUNT(*) FROM checkpoint_operation", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+fn assert_runtime_schema_13(root: &Path) {
+    let connection = Connection::open(runtime_database(root)).unwrap();
+    let version = connection
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    assert_eq!(version, 13);
+    assert!(sqlite_table_exists(&connection, "task_signal"));
+    assert!(!sqlite_table_exists(&connection, "capture_ingestion"));
+    assert!(!sqlite_table_exists(&connection, "work_episode_diagnostic"));
+    assert_eq!(runtime_operation_count(&connection), 0);
+}
+
+fn seed_runtime_task(root: &Path, session_id: &str) -> ExternalSessionLocator {
+    let locator = ExternalSessionLocator::new("codex", session_id).unwrap();
+    TaskRuntime::initialize(root)
+        .unwrap()
+        .open_or_create(
+            locator.clone(),
+            TaskId::new(),
+            WorkingIntentSnapshot::new("Retain the compatible Runtime task").unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+    locator
+}
+
+fn legacy_capture_paths(root: &Path) -> [PathBuf; 3] {
+    [
+        root.join("state/capture"),
+        root.join("state/capture.lock"),
+        root.join("state/capture-metadata.json"),
+    ]
+}
+
+fn seed_legacy_capture_state(root: &Path) {
+    let [directory, lock, metadata] = legacy_capture_paths(root);
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("cap-legacy.json"), b"legacy capture").unwrap();
+    fs::write(lock, b"legacy lock").unwrap();
+    fs::write(metadata, b"legacy metadata").unwrap();
 }
 
 fn hook_count(path: &Path, events: &[&str]) -> usize {
@@ -579,7 +741,6 @@ fn seed_reset_state(harness: &Harness) -> SeededResetState {
 
     for database in [
         "index.sqlite",
-        "runtime.sqlite",
         "engineering.sqlite",
         "repository-registry.sqlite",
     ] {
@@ -589,10 +750,13 @@ fn seed_reset_state(harness: &Harness) -> SeededResetState {
         )
         .unwrap();
     }
+    for sidecar in runtime_files(&harness.root).into_iter().skip(1) {
+        fs::write(&sidecar, format!("seeded-{}", sidecar.display())).unwrap();
+    }
+    seed_legacy_capture_state(&harness.root);
     for (directory, file) in [
         ("pending", "batch.json"),
         ("pending-aside", "aside.json"),
-        ("capture", "capture.json"),
         ("authorized-session-scopes", "scope.json"),
     ] {
         let directory = harness.root.join("state").join(directory);
@@ -763,6 +927,231 @@ fn setup_three_times_is_idempotent_and_preserves_existing_configuration() {
         fs::read_link(harness.root.join("bin/current")).unwrap(),
         PathBuf::from("1.2.3/arm64")
     );
+}
+
+#[test]
+fn setup_rebuilds_schema_12_runtime_and_discards_cached_task_and_operation() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.2.3");
+    installer.setup(&SetupOptions::default()).unwrap();
+    let locator = seed_runtime_task(&harness.root, "schema-12-rebuild");
+    mark_runtime_as_schema_12(&harness.root);
+    seed_legacy_capture_state(&harness.root);
+
+    let report = installer.setup(&SetupOptions::default()).unwrap();
+
+    assert!(report.changed);
+    assert_runtime_schema_13(&harness.root);
+    for path in legacy_capture_paths(&harness.root) {
+        assert!(
+            !path.exists(),
+            "legacy Capture state survived setup: {}",
+            path.display()
+        );
+    }
+    assert!(
+        TaskRuntime::initialize(&harness.root)
+            .unwrap()
+            .read_external_session_by_locator(&locator)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn setup_rebuilds_schema_11_runtime_and_discards_cached_task_and_capture_state() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.2.3");
+    installer.setup(&SetupOptions::default()).unwrap();
+    let locator = seed_runtime_task(&harness.root, "schema-11-rebuild");
+    mark_runtime_as_legacy_schema(&harness.root, 11, false);
+    seed_legacy_capture_state(&harness.root);
+
+    let report = installer.setup(&SetupOptions::default()).unwrap();
+
+    assert!(report.changed);
+    assert_runtime_schema_13(&harness.root);
+    for path in legacy_capture_paths(&harness.root) {
+        assert!(
+            !path.exists(),
+            "legacy Capture state survived setup: {}",
+            path.display()
+        );
+    }
+    assert!(
+        TaskRuntime::initialize(&harness.root)
+            .unwrap()
+            .read_external_session_by_locator(&locator)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn setup_rejects_unknown_or_future_runtime_schemas_without_mutating_state() {
+    for version in [10_u32, 14, 999] {
+        let harness = Harness::new();
+        let installer = harness.installer("1.2.3");
+        installer.setup(&SetupOptions::default()).unwrap();
+        seed_runtime_task(&harness.root, &format!("schema-{version}-rejected"));
+        set_runtime_schema_version(&harness.root, version);
+        seed_legacy_capture_state(&harness.root);
+        let paths = runtime_files(&harness.root);
+        fs::write(&paths[1], []).unwrap();
+        fs::write(&paths[2], []).unwrap();
+        fs::set_permissions(&paths[0], fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(&paths[1], fs::Permissions::from_mode(0o620)).unwrap();
+        fs::set_permissions(&paths[2], fs::Permissions::from_mode(0o600)).unwrap();
+        let prior = paths
+            .iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    fs::read(path).unwrap(),
+                    fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+                )
+            })
+            .collect::<Vec<_>>();
+        let [capture_directory, capture_lock, capture_metadata] =
+            legacy_capture_paths(&harness.root);
+        let legacy_prior = [
+            capture_directory.join("cap-legacy.json"),
+            capture_lock,
+            capture_metadata,
+        ]
+        .map(|path| {
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        });
+
+        let error = installer.setup(&SetupOptions::default()).unwrap_err();
+
+        assert_eq!(
+            error.message(),
+            format!("unsupported task runtime schema version {version}; expected 13")
+        );
+        for (path, bytes, mode) in prior {
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+                mode,
+                "{}",
+                path.display()
+            );
+        }
+        assert!(capture_directory.is_dir());
+        for (path, bytes) in legacy_prior {
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+        }
+        let connection = Connection::open(runtime_database(&harness.root)).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            i64::from(version)
+        );
+    }
+}
+
+#[test]
+fn later_setup_failure_restores_schema_12_runtime_and_sidecars_exactly() {
+    let harness = Harness::new();
+    harness
+        .installer("1.2.3")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    seed_runtime_task(&harness.root, "schema-12-rollback");
+    mark_runtime_as_schema_12(&harness.root);
+    seed_legacy_capture_state(&harness.root);
+    let paths = runtime_files(&harness.root);
+    fs::write(&paths[1], []).unwrap();
+    fs::write(&paths[2], []).unwrap();
+    fs::set_permissions(&paths[0], fs::Permissions::from_mode(0o640)).unwrap();
+    fs::set_permissions(&paths[1], fs::Permissions::from_mode(0o620)).unwrap();
+    fs::set_permissions(&paths[2], fs::Permissions::from_mode(0o600)).unwrap();
+    let prior = paths
+        .iter()
+        .map(|path| {
+            (
+                path.clone(),
+                fs::read(path).unwrap(),
+                fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+            )
+        })
+        .collect::<Vec<_>>();
+    let [capture_directory, capture_lock, capture_metadata] = legacy_capture_paths(&harness.root);
+    let capture_record = capture_directory.join("cap-legacy.json");
+    let legacy_prior = [capture_record, capture_lock, capture_metadata].map(|path| {
+        let bytes = fs::read(&path).unwrap();
+        (path, bytes)
+    });
+
+    let error = harness
+        .installer("1.2.3")
+        .with_failure_after(SetupStage::GlobalSkillWritten)
+        .setup(&SetupOptions::default())
+        .unwrap_err();
+
+    assert!(error.message().contains("injected setup failure"));
+    for (path, bytes, mode) in prior {
+        assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            mode,
+            "{}",
+            path.display()
+        );
+    }
+    assert!(capture_directory.is_dir());
+    for (path, bytes) in legacy_prior {
+        assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+    }
+    let connection = Connection::open(runtime_database(&harness.root)).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        12
+    );
+    assert_eq!(runtime_operation_count(&connection), 1);
+}
+
+#[test]
+fn idempotent_setup_retains_compatible_schema_13_runtime_data() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.2.3");
+    installer.setup(&SetupOptions::default()).unwrap();
+    let locator = seed_runtime_task(&harness.root, "schema-13-retained");
+
+    let report = installer.setup(&SetupOptions::default()).unwrap();
+
+    assert!(!report.changed);
+    assert_runtime_schema_13(&harness.root);
+    assert!(
+        TaskRuntime::initialize(&harness.root)
+            .unwrap()
+            .read_external_session_by_locator(&locator)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn setup_rejects_symlinked_legacy_capture_directory_without_following_it() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.2.3");
+    installer.setup(&SetupOptions::default()).unwrap();
+    let capture = harness.root.join("state/capture");
+    let outside = harness.home.join("outside-legacy-capture");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("preserve.txt"), b"preserve").unwrap();
+    symlink(&outside, &capture).unwrap();
+
+    let error = installer.setup(&SetupOptions::default()).unwrap_err();
+
+    assert!(error.message().contains("non-symlink directory"));
+    assert!(capture.is_symlink());
+    assert_eq!(fs::read(outside.join("preserve.txt")).unwrap(), b"preserve");
 }
 
 #[test]
@@ -945,6 +1334,14 @@ fn data_reset_dry_run_is_read_only_and_confirmed_reset_preserves_installation() 
             .healthy
     );
     TaskRuntime::initialize(harness.root.clone()).unwrap();
+    assert_runtime_schema_13(&harness.root);
+    for path in legacy_capture_paths(&harness.root) {
+        assert!(
+            !path.exists(),
+            "legacy Capture state survived reset: {}",
+            path.display()
+        );
+    }
     assert!(
         RepositoryRegistry::initialize(harness.root.clone())
             .unwrap()
@@ -959,12 +1356,7 @@ fn data_reset_dry_run_is_read_only_and_confirmed_reset_preserves_installation() 
             .unwrap()
             .is_none()
     );
-    for directory in [
-        "pending",
-        "pending-aside",
-        "capture",
-        "authorized-session-scopes",
-    ] {
+    for directory in ["pending", "pending-aside", "authorized-session-scopes"] {
         assert!(
             fs::read_dir(harness.root.join("state").join(directory))
                 .unwrap()
@@ -1786,6 +2178,10 @@ fn uninstall_removes_only_exact_owned_entries_and_retains_repository() {
     let originals = harness.seed_configs();
     let installer = harness.installer("1.0.0");
     installer.setup(&SetupOptions::default()).unwrap();
+    seed_legacy_capture_state(&harness.root);
+    let runtime_paths = runtime_files(&harness.root);
+    fs::write(&runtime_paths[1], b"legacy wal").unwrap();
+    fs::write(&runtime_paths[2], b"legacy shm").unwrap();
 
     let cursor_hooks_path = harness.home.join(".cursor/hooks.json");
     let mut cursor_hooks: serde_json::Value =
@@ -1803,6 +2199,13 @@ fn uninstall_removes_only_exact_owned_entries_and_retains_repository() {
     assert!(harness.root.join("repository/.git").is_dir());
     assert!(!harness.root.join("bin").exists());
     assert!(!harness.skill_root().exists());
+    for path in runtime_paths
+        .into_iter()
+        .chain(legacy_capture_paths(&harness.root))
+    {
+        assert!(!path.exists(), "uninstall retained {}", path.display());
+        assert!(report.removed.contains(&path));
+    }
     assert!(
         report
             .warnings

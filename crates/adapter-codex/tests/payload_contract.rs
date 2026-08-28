@@ -66,7 +66,6 @@ fn verified_and_trusted_codex_prompt_never_repeats_activation_marker() {
     let action =
         plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Direct);
     assert!(action.task_operation.is_none());
-    assert!(action.breadcrumb.is_none());
     assert!(action.system_message.is_none());
 
     let output = encode_hook_output(
@@ -104,10 +103,24 @@ fn codex_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_cl
             Some(TaskRuntimeOperation::FinalizeCheckpointedEpisode { trigger, .. })
                 if trigger == expected_trigger
         ));
-        assert!(action.system_message.as_deref().is_some_and(|message| {
-            message.contains("task_checkpoint")
-                && message.contains("Hook summary text is not Claim evidence")
-        }));
+        let message = action.system_message.as_deref().unwrap();
+        assert!(message.contains("task_checkpoint"));
+        assert!(message.contains("complete direct Claims/Unknowns"));
+        assert!(message.contains("server resolves the current Task, Intent, and lifecycle"));
+        assert!(message.contains("Hook lifecycle data is not Claim evidence"));
+        for forbidden in [
+            "expected_task_id",
+            "expected_intent_revision_id",
+            "expected_episode_version",
+            "boundary",
+            "inline_validation",
+            "capture",
+        ] {
+            assert!(
+                !message.contains(forbidden),
+                "stale Hook guidance: {message}"
+            );
+        }
     }
 }
 
@@ -119,7 +132,6 @@ fn codex_session_start_encodes_enabled_marker_as_model_context_and_disabled_as_n
     let disabled =
         plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Disabled);
     assert!(disabled.task_operation.is_none());
-    assert!(disabled.breadcrumb.is_none());
     let disabled_output = encode_hook_output(
         event.kind(),
         &ResolvedAgentAction {
@@ -140,7 +152,6 @@ fn codex_session_start_encodes_enabled_marker_as_model_context_and_disabled_as_n
     ] {
         let action = plan_action_for_activation(&event, &capability, activation);
         assert!(action.task_operation.is_none());
-        assert!(action.breadcrumb.is_none());
         outputs.push(
             encode_hook_output(
                 event.kind(),

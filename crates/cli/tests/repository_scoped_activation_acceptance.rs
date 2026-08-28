@@ -11,7 +11,7 @@ use sctx_domain::{ExternalSessionLocator, RepositoryId};
 use sctx_git_store::GitStore;
 use sctx_local_state::{
     AuthorizedSessionScope, AuthorizedSessionScopeDecision, AuthorizedSessionScopeRead,
-    AuthorizedSessionScopeStore, CaptureStore, UserConfigStore,
+    AuthorizedSessionScopeStore, UserConfigStore,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -49,7 +49,6 @@ struct LifecycleOracle {
 #[derive(Debug, Deserialize)]
 struct ResidueOracle {
     runtime_files: usize,
-    capture_records: usize,
     report_files: usize,
     knowledge_commits_delta: usize,
 }
@@ -337,7 +336,7 @@ fn collect_business_files(
             .and_then(|name| name.to_str())
             .unwrap_or("");
         let is_business_root =
-            name.starts_with("runtime.sqlite") || matches!(name, "capture" | "report" | "reports");
+            name.starts_with("runtime.sqlite") || matches!(name, "report" | "reports");
         if path.is_dir() {
             if is_business_root {
                 collect_all_files(&path, relative_to, files);
@@ -383,17 +382,10 @@ fn runtime_file_count(root: &Path) -> usize {
         .count()
 }
 
-fn capture_record_count(root: &Path) -> usize {
-    fs::read_dir(root.join("state/capture"))
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter(|entry| {
-            entry.as_ref().ok().is_some_and(|entry| {
-                entry.path().extension().and_then(|value| value.to_str()) == Some("json")
-            })
-        })
-        .count()
+fn assert_no_capture_state(root: &Path) {
+    for removed in ["capture", "capture.lock", "capture-metadata.json"] {
+        assert!(!root.join("state").join(removed).exists());
+    }
 }
 
 fn report_file_count(root: &Path) -> usize {
@@ -430,10 +422,7 @@ fn assert_disabled_residue(
     let current = fixture.business_snapshot();
     assert_eq!(&current, baseline);
     assert_eq!(runtime_file_count(&fixture.root()), expected.runtime_files);
-    assert_eq!(
-        capture_record_count(&fixture.root()),
-        expected.capture_records
-    );
+    assert_no_capture_state(&fixture.root());
     assert_eq!(report_file_count(&fixture.root()), expected.report_files);
     let commits_before = git_output(
         &fixture.repository(),
@@ -526,7 +515,7 @@ fn documented_codex_direct_lifecycle_activates_before_prompt_and_keeps_git_clean
         fixture.read_scope("codex", session),
         AuthorizedSessionScopeRead::Missing
     ));
-    assert_eq!(capture_record_count(&fixture.root()), 3);
+    assert_no_capture_state(&fixture.root());
     assert!(runtime_file_count(&fixture.root()) >= 1);
     assert_eq!(report_file_count(&fixture.root()), 0);
     assert_eq!(git_snapshot(&fixture.repository()), git_before);
@@ -569,13 +558,13 @@ fn documented_cursor_group_lifecycle_records_members_and_safe_non_locating_inves
             .current_scope("cursor", session)
             .intent_bootstrap_notified
     );
-    assert_eq!(capture_record_count(&fixture.root()), 1);
+    assert_no_capture_state(&fixture.root());
 
     let mut sibling = events[2].clone();
     set_event_cwd("cursor", &mut sibling, &fixture.sibling);
     sibling["tool_input"] = json!({});
     assert_output(&fixture.run("cursor", &sibling), &oracle.wire.neutral);
-    assert_eq!(capture_record_count(&fixture.root()), 2);
+    assert_no_capture_state(&fixture.root());
 
     let mut mixed = events[2].clone();
     mixed["tool_input"] = json!({
@@ -583,38 +572,7 @@ fn documented_cursor_group_lifecycle_records_members_and_safe_non_locating_inves
         "nested": {"path": fixture.sibling_file}
     });
     assert_output(&fixture.run("cursor", &mixed), &oracle.wire.neutral);
-    assert_eq!(capture_record_count(&fixture.root()), 3);
-    let captures = CaptureStore::initialize(fixture.root())
-        .unwrap()
-        .list(16)
-        .unwrap()
-        .captures;
-    assert_eq!(captures.len(), 3);
-    assert_eq!(
-        captures
-            .iter()
-            .filter(|capture| {
-                capture.record.workspace_hint.is_none() && capture.record.file_hints.is_empty()
-            })
-            .count(),
-        3,
-        "Shell payload file fields are ignored; only its structured working directory may locate"
-    );
-    let captures = serde_json::to_string(
-        &captures
-            .into_iter()
-            .map(|capture| capture.record)
-            .collect::<Vec<_>>(),
-    )
-    .unwrap();
-    for forbidden in [
-        fixture.sibling.to_str().unwrap(),
-        fixture.sibling_file.to_str().unwrap(),
-        "SYNTHETIC_TOOL_OUTPUT",
-    ] {
-        assert!(!captures.contains(forbidden));
-    }
-
+    assert_no_capture_state(&fixture.root());
     assert_output(
         &fixture.run("cursor", &events[3]),
         &json!({"user_message": oracle.enabled_without_active_task.pre_compact}),
@@ -625,7 +583,7 @@ fn documented_cursor_group_lifecycle_records_members_and_safe_non_locating_inves
         fixture.read_scope("cursor", session),
         AuthorizedSessionScopeRead::Missing
     ));
-    assert_eq!(capture_record_count(&fixture.root()), 5);
+    assert_no_capture_state(&fixture.root());
     assert_eq!(report_file_count(&fixture.root()), 0);
     assert_eq!(git_snapshot(&fixture.repository()), git_before);
 }

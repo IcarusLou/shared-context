@@ -1,6 +1,5 @@
 use std::{
-    fs::{self, OpenOptions},
-    os::unix::fs::OpenOptionsExt,
+    fs,
     path::Path,
     process::{Command, Stdio},
     sync::{Arc, Barrier},
@@ -8,11 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use fs2::FileExt;
 use sctx_agent_adapter::SHARED_CONTEXT_ACTIVATION_MARKER;
 use sctx_domain::{ExternalSessionLocator, TaskId, WorkingIntentSnapshot};
 use sctx_git_store::GitStore;
-use sctx_local_state::{CaptureStore, UserConfigStore};
+use sctx_local_state::UserConfigStore;
 use sctx_task_runtime::TaskRuntime;
 use serde_json::{Value, json};
 
@@ -21,7 +19,7 @@ const HOOK_DIAGNOSTIC: &str = "Shared Context task retrieval is temporarily unav
 
 fn intent() -> WorkingIntentSnapshot {
     WorkingIntentSnapshot {
-        goal: "Bound the concurrent Hook capture path".to_owned(),
+        goal: "Bound the concurrent Hook signal path".to_owned(),
         current_direction: Some("Run structured test tools concurrently".to_owned()),
         in_scope: Vec::new(),
         out_of_scope: Vec::new(),
@@ -90,7 +88,7 @@ fn post_tool(session: &str, workspace: &Path, file: &Path, index: usize) -> Valu
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn thirty_two_post_tool_hooks_are_bounded_fail_open_and_never_half_write_capture() {
+fn thirty_two_post_tool_hooks_are_bounded_fail_open_and_write_zero_capture_state() {
     let temporary = tempfile::tempdir().unwrap();
     let home = temporary.path().join("Hook 热路径 home");
     let root = home.join(".shared-context");
@@ -174,26 +172,9 @@ fn thirty_two_post_tool_hooks_are_bounded_fail_open_and_never_half_write_capture
     eprintln!("32-way PostToolUse p99={p99:?}");
     assert!(p99 < Duration::from_millis(500), "Hook p99 was {p99:?}");
 
-    let store = CaptureStore::initialize(&root).unwrap();
-    let captures = store.list(256).unwrap();
-    assert!(!captures.captures.is_empty());
-    assert!(captures.captures.len() <= WORKERS);
-    assert!(captures.diagnostics.is_empty());
-    assert!(captures.captures.iter().all(|capture| {
-        capture.record.summary == "file operation succeeded"
-            && !serde_json::to_string(&capture.record)
-                .unwrap()
-                .contains("RAW_HOT_PATH_")
-    }));
-    let capture_bytes = fs::read_dir(store.directory())
-        .unwrap()
-        .map(|entry| fs::metadata(entry.unwrap().path()).unwrap().len())
-        .sum::<u64>();
-    let metadata: Value =
-        serde_json::from_slice(&fs::read(root.join("state/capture-metadata.json")).unwrap())
-            .unwrap();
-    assert_eq!(metadata["record_count"], captures.captures.len());
-    assert_eq!(metadata["total_bytes"], capture_bytes);
+    for removed in ["capture", "capture.lock", "capture-metadata.json"] {
+        assert!(!root.join("state").join(removed).exists());
+    }
     assert!(fs::read_dir(root.join("state")).unwrap().all(|entry| {
         !entry
             .unwrap()
@@ -201,29 +182,4 @@ fn thirty_two_post_tool_hooks_are_bounded_fail_open_and_never_half_write_capture
             .to_string_lossy()
             .ends_with(".tmp")
     }));
-
-    let lock_path = root.join("state/capture.lock");
-    let capture_lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(lock_path)
-        .unwrap();
-    capture_lock.lock_exclusive().unwrap();
-    let before_busy = captures.captures.len();
-    let (busy, elapsed) = run_hook(&home, &post_tool(session, &workspace, &source, WORKERS));
-    assert!(busy.status.success());
-    assert!(elapsed < Duration::from_millis(500));
-    FileExt::unlock(&capture_lock).unwrap();
-    assert_eq!(
-        CaptureStore::initialize(&root)
-            .unwrap()
-            .list(256)
-            .unwrap()
-            .captures
-            .len(),
-        before_busy
-    );
 }

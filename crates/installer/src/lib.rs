@@ -27,8 +27,7 @@ use sctx_engineering_graph::{EngineeringProjectionStore, RepositoryRegistry};
 use sctx_git_store::GitStore;
 use sctx_index::ProjectionIndex;
 use sctx_local_state::{
-    AuthorizedSessionScopeStore, CaptureStore, CatalogCheckoutStatus, MaintenanceLock,
-    UserConfigStore,
+    AuthorizedSessionScopeStore, CatalogCheckoutStatus, MaintenanceLock, UserConfigStore,
 };
 use sctx_mcp::{ClientKind, McpServer};
 use sctx_search::{SearchEngine, SearchFilters, SearchRequest};
@@ -640,6 +639,8 @@ impl Installer {
         let relative_target = PathBuf::from(&self.context.version).join(architecture.directory());
         let changed_current = switch_current(transaction, &current, &relative_target)?;
         self.fail(SetupStage::CurrentSwitched)?;
+        let task_runtime_changed = ensure_current_task_runtime(transaction, &self.context.root)?;
+        let legacy_capture_changed = remove_legacy_capture_state(transaction, &self.context.root)?;
 
         let prior_manifest = read_manifest(&self.context.root)?;
         let installation_id = installation_id(prior_manifest.as_ref())?;
@@ -763,6 +764,8 @@ impl Installer {
             journal: transaction.journal_path.clone(),
             changed: changed_runtime
                 || changed_current
+                || task_runtime_changed
+                || legacy_capture_changed
                 || knowledge_store_changed
                 || config_changed
                 || skill_install.changed
@@ -946,19 +949,23 @@ impl Installer {
                     .to_owned(),
             );
         }
-        for path in [
-            root.join("bin"),
-            root.join("logs"),
-            root.join("backups"),
-            root.join("state/capture"),
-        ] {
+        for path in [root.join("bin"), root.join("logs"), root.join("backups")] {
             remove_path_if_exists(&path, &mut report.removed)?;
         }
-        for suffix in ["", "-wal", "-shm"] {
-            remove_path_if_exists(
-                &root.join(format!("state/index.sqlite{suffix}")),
-                &mut report.removed,
-            )?;
+        for database in ["index.sqlite", "runtime.sqlite"] {
+            for suffix in ["", "-wal", "-shm"] {
+                remove_path_if_exists(
+                    &root.join(format!("state/{database}{suffix}")),
+                    &mut report.removed,
+                )?;
+            }
+        }
+        for legacy in [
+            root.join("state/capture"),
+            root.join("state/capture.lock"),
+            root.join("state/capture-metadata.json"),
+        ] {
+            remove_path_if_exists(&legacy, &mut report.removed)?;
         }
         let manifest_path = manifest_path(root);
         remove_path_if_exists(&manifest_path, &mut report.removed)?;
@@ -1404,6 +1411,9 @@ enum Original {
     Symlink {
         target: PathBuf,
     },
+    Directory {
+        backup: PathBuf,
+    },
 }
 
 struct Transaction {
@@ -1478,6 +1488,41 @@ impl Transaction {
     fn phase(&mut self, phase: impl Into<String>) -> Result<()> {
         self.journal.phase = phase.into();
         self.persist()
+    }
+
+    fn move_directory_to_backup(&mut self, path: &Path) -> Result<bool> {
+        if self.journal.entries.iter().any(|entry| entry.path == path) {
+            return Err(invariant(format!(
+                "transaction target was already recorded: {}",
+                path.display()
+            )));
+        }
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(invalid(format!(
+                    "legacy Capture directory must be a non-symlink directory: {}",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(io_error("inspect legacy Capture directory")(error)),
+        }
+        let backup = self
+            .backup_dir
+            .join(format!("directory-{}", self.journal.entries.len()));
+        self.journal.entries.push(Snapshot {
+            path: path.to_path_buf(),
+            original: Original::Directory {
+                backup: backup.clone(),
+            },
+            cleanup_empty_dirs: Vec::new(),
+        });
+        self.persist()?;
+        fs::rename(path, &backup).map_err(io_error("back up legacy Capture directory"))?;
+        sync_parent(path)?;
+        sync_parent(&backup)?;
+        Ok(true)
     }
 
     fn original(&self, path: &Path) -> Option<&Original> {
@@ -3130,7 +3175,10 @@ fn finalize_ownership(transaction: &mut Transaction, configs: &mut [OwnedConfig]
             (None, _) => true,
             (Some(prior), None) => current_hash == *prior,
             (Some(prior), Some(Original::File { sha256, .. })) => sha256 == prior,
-            (Some(_), Some(Original::Absent | Original::Symlink { .. })) => false,
+            (
+                Some(_),
+                Some(Original::Absent | Original::Symlink { .. } | Original::Directory { .. }),
+            ) => false,
         };
         if safe_to_refresh {
             config.installed_file_hash = Some(current_hash);
@@ -3173,6 +3221,15 @@ fn restore_unchanged_config(config: &OwnedConfig, report: &mut UninstallReport) 
                 ErrorKind::InvariantViolation,
                 format!(
                     "Agent config baseline cannot be a symlink: {}",
+                    config.path.display()
+                ),
+            ));
+        }
+        Some(Original::Directory { .. }) => {
+            return Err(Error::new(
+                ErrorKind::InvariantViolation,
+                format!(
+                    "Agent config baseline cannot be a directory: {}",
                     config.path.display()
                 ),
             ));
@@ -3313,8 +3370,10 @@ fn reset_relative_targets() -> Vec<PathBuf> {
     targets.extend([
         PathBuf::from("state/pending"),
         PathBuf::from("state/pending-aside"),
-        PathBuf::from("state/capture"),
         PathBuf::from("state/authorized-session-scopes"),
+        PathBuf::from("state/capture"),
+        PathBuf::from("state/capture.lock"),
+        PathBuf::from("state/capture-metadata.json"),
     ]);
     targets
 }
@@ -3351,7 +3410,6 @@ fn build_pristine_reset_root(final_root: &Path, staging_root: &Path) -> Result<(
     let registry = RepositoryRegistry::initialize(staging_root.to_path_buf())?;
     registry.sync_catalog(&[])?;
     let _engineering = EngineeringProjectionStore::initialize(staging_root.to_path_buf())?;
-    let _capture = CaptureStore::initialize(staging_root)?;
     let _scopes = AuthorizedSessionScopeStore::initialize(staging_root)?;
     ensure_private_directory(&staging_root.join("state/pending-aside"))?;
     let empty_config = UserConfigStore::empty_document(final_root)?;
@@ -3613,6 +3671,47 @@ fn restore_journal(journal: &SetupJournal) -> Result<()> {
                 }
                 atomic_write(&snapshot.path, &bytes, *mode)?;
             }
+            Original::Directory { backup } => match fs::symlink_metadata(backup) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                    remove_any(&snapshot.path)?;
+                    if let Some(parent) = snapshot.path.parent() {
+                        ensure_private_directory(parent)?;
+                    }
+                    fs::rename(backup, &snapshot.path)
+                        .map_err(io_error("restore original directory"))?;
+                    sync_parent(backup)?;
+                }
+                Ok(_) => {
+                    return Err(invariant(format!(
+                        "rollback directory backup is not a non-symlink directory: {}",
+                        backup.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match fs::symlink_metadata(&snapshot.path) {
+                        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                        }
+                        Ok(_) => {
+                            return Err(invariant(format!(
+                                "rollback directory target is not a non-symlink directory: {}",
+                                snapshot.path.display()
+                            )));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return Err(invariant(format!(
+                                "rollback directory backup is missing: {}",
+                                backup.display()
+                            )));
+                        }
+                        Err(error) => {
+                            return Err(io_error("inspect rollback directory target")(error));
+                        }
+                    }
+                }
+                Err(error) => {
+                    return Err(io_error("inspect rollback directory backup")(error));
+                }
+            },
         }
         if let Some(parent) = snapshot.path.parent() {
             sync_directory(parent)?;
@@ -3624,7 +3723,79 @@ fn restore_journal(journal: &SetupJournal) -> Result<()> {
     Ok(())
 }
 
+fn ensure_current_task_runtime(transaction: &mut Transaction, root: &Path) -> Result<bool> {
+    let state = root.join("state");
+    let paths = [
+        state.join("runtime.sqlite"),
+        state.join("runtime.sqlite-wal"),
+        state.join("runtime.sqlite-shm"),
+    ];
+    for path in &paths {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                return Err(invalid(format!(
+                    "Task Runtime state must be a regular file: {}",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("inspect Task Runtime state")(error)),
+        }
+        transaction.record(path)?;
+    }
+    let database_existed = paths[0].is_file();
+    match TaskRuntime::initialize(root.to_path_buf()) {
+        Ok(_) => Ok(!database_existed),
+        Err(error) if is_discardable_task_runtime_schema(&error) => {
+            for path in paths.iter().rev() {
+                remove_any(path)?;
+            }
+            sync_directory(&state)?;
+            let _runtime = TaskRuntime::initialize(root.to_path_buf())?;
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_discardable_task_runtime_schema(error: &Error) -> bool {
+    error.kind() == ErrorKind::InvariantViolation
+        && matches!(
+            error.message(),
+            "unsupported task runtime schema version 11; expected 13"
+                | "unsupported task runtime schema version 12; expected 13"
+        )
+}
+
+fn remove_legacy_capture_state(transaction: &mut Transaction, root: &Path) -> Result<bool> {
+    let state = root.join("state");
+    let mut changed = transaction.move_directory_to_backup(&state.join("capture"))?;
+    for path in [
+        state.join("capture.lock"),
+        state.join("capture-metadata.json"),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(invalid(format!(
+                    "legacy Capture state must be a regular file: {}",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_error("inspect legacy Capture state")(error)),
+        }
+        transaction.record(&path)?;
+        remove_any(&path)?;
+        sync_directory(&state)?;
+        changed = true;
+    }
+    Ok(changed)
+}
+
 fn mcp_smoke(root: &Path) -> Result<()> {
+    let _runtime = TaskRuntime::initialize(root.to_path_buf())?;
     for client in [ClientKind::Cursor, ClientKind::Codex] {
         let mut server = McpServer::new(root, client)?;
         let input = concat!(
@@ -3651,9 +3822,8 @@ fn mcp_smoke(root: &Path) -> Result<()> {
         if values.len() != 2
             || values.iter().any(|value| value.get("error").is_some())
             || tools.is_none_or(|tools| {
-                tools.len() != 17
+                tools.len() != 16
                     || [
-                        "task_capture_list",
                         "task_checkpoint",
                         "candidate_list",
                         "candidate_get",
@@ -3662,6 +3832,7 @@ fn mcp_smoke(root: &Path) -> Result<()> {
                     ]
                     .iter()
                     .any(|name| !tools.iter().any(|tool| tool["name"] == *name))
+                    || tools.iter().any(|tool| tool["name"] == "task_capture_list")
             })
         {
             return Err(Error::new(

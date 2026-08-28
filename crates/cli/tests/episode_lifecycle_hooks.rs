@@ -222,6 +222,26 @@ fn checkpoint_claim(session: &str) -> CheckpointClaimDraft {
     }
 }
 
+fn assert_flat_checkpoint_guidance(response: &Value) {
+    let message = response["systemMessage"].as_str().unwrap();
+    assert!(message.contains("task_checkpoint"));
+    assert!(message.contains("complete direct Claims/Unknowns"));
+    assert!(message.contains("server resolves the current Task, Intent, and lifecycle"));
+    for forbidden in [
+        "expected_task_id",
+        "expected_intent_revision_id",
+        "expected_episode_version",
+        "boundary",
+        "inline_validation",
+        "capture",
+    ] {
+        assert!(
+            !message.contains(forbidden),
+            "stale Hook guidance: {message}"
+        );
+    }
+}
+
 fn open_checkpoint(
     runtime: &TaskRuntime,
     agent: &str,
@@ -417,37 +437,20 @@ fn precompact_resume_and_turn_stop_use_new_episodes_under_the_same_mcp_task() {
         }),
     );
     let task_id = task["task_id"].as_str().unwrap().to_owned();
-    let revision_id = task["intent_revision_id"].as_str().unwrap().to_owned();
     let checkpoint = |statement: &str, episode: u64| {
         json!({
             "agent_kind": "codex",
             "external_session_id": session,
-            "expected_task_id": task_id,
-            "expected_intent_revision_id": revision_id,
-            "expected_episode_version": 0,
-            "boundary": "continue",
             "claims": [{
+                "context_kind": "validation",
                 "statement": statement,
                 "rationale": "A real MCP write validates the lifecycle boundary",
-                "applicability": {
-                    "domains": ["capture"],
-                    "platforms": [],
-                    "conditions": ["resume"]
-                },
-                "assumptions": [],
-                "recheck_when": ["the lifecycle boundary changes"],
+                "conditions": ["resume"],
                 "evidence": [{
-                    "kind": "inline_validation",
-                    "evidence": {
-                        "kind": "experiment_record",
-                        "supports": format!("Episode {episode} MCP write passed"),
-                        "content": {"episode": episode, "actual": "passed"},
-                        "interpretation": "The persisted checkpoint is self-contained",
-                        "limitations": []
-                    }
-                }],
-                "artifact_refs": [],
-                "related_contexts": []
+                    "evidence_type": "experiment_record",
+                    "summary": format!("Episode {episode} MCP write passed"),
+                    "limitations": []
+                }]
             }],
             "unknowns": []
         })
@@ -471,7 +474,7 @@ fn precompact_resume_and_turn_stop_use_new_episodes_under_the_same_mcp_task() {
             .is_some_and(|message| message.contains("durably closed"))
     );
     let first_retry = harness.mcp("task_checkpoint", &first_input);
-    assert_eq!(first_retry["created"], false);
+    assert_eq!(first_retry["replayed"], true);
     assert_eq!(first_retry["episode_id"], first_episode_id);
 
     let second = harness.mcp(
@@ -479,7 +482,7 @@ fn precompact_resume_and_turn_stop_use_new_episodes_under_the_same_mcp_task() {
         &checkpoint("Resume creates Episode two without changing Task", 2),
     );
     let second_episode_id = second["episode_id"].as_str().unwrap().to_owned();
-    assert_eq!(second["created"], true);
+    assert_eq!(second["replayed"], false);
     assert_ne!(second_episode_id, first_episode_id);
     assert_eq!(second["episode_version"], 1);
     let stopped = harness.hook(
@@ -496,7 +499,7 @@ fn precompact_resume_and_turn_stop_use_new_episodes_under_the_same_mcp_task() {
         &checkpoint("TurnStop permits Episode three without changing Task", 3),
     );
     let third_episode_id = third["episode_id"].as_str().unwrap().to_owned();
-    assert_eq!(third["created"], true);
+    assert_eq!(third["replayed"], false);
     assert_ne!(third_episode_id, first_episode_id);
     assert_ne!(third_episode_id, second_episode_id);
 
@@ -513,11 +516,11 @@ fn precompact_resume_and_turn_stop_use_new_episodes_under_the_same_mcp_task() {
             .iter()
             .filter(|episode| matches!(episode.episode.status, WorkEpisodeStatus::Closed { .. }))
             .count(),
-        2
+        3
     );
     assert!(episodes.iter().any(|episode| {
         episode.episode.episode_id.to_string() == third_episode_id
-            && episode.episode.status == WorkEpisodeStatus::Open
+            && matches!(episode.episode.status, WorkEpisodeStatus::Closed { .. })
     }));
     let candidate_sources = runtime
         .list_candidate_reviews(&locator, CandidateReviewStatus::Pending, 10, None)
@@ -541,24 +544,37 @@ fn out_of_order_stop_requires_checkpoint_and_session_end_never_closes_or_builds(
     harness.activate("codex", "session-end-only");
     let locator = ExternalSessionLocator::new("codex", session).unwrap();
     let snapshot = runtime
-        .open_or_create(locator, TaskId::new(), intent(session), Vec::new())
+        .open_or_create(locator.clone(), TaskId::new(), intent(session), Vec::new())
         .unwrap()
         .snapshot;
     let stop = harness.hook(
         "codex",
         &codex_event(session, &harness.home, "Stop", "RAW_OUT_OF_ORDER"),
     );
-    assert!(
-        stop["systemMessage"]
-            .as_str()
-            .is_some_and(|message| message.contains("no Work Episode is open"))
-    );
+    assert_flat_checkpoint_guidance(&stop);
     assert!(
         runtime
             .list_work_episodes(snapshot.task_session_id, 10)
             .unwrap()
             .is_empty()
     );
+    let opened = runtime
+        .open_work_episode(
+            &locator,
+            snapshot.task_id,
+            snapshot.current_intent_revision().unwrap().revision_id,
+        )
+        .unwrap();
+    let checkpoint_required = harness.hook(
+        "codex",
+        &codex_event(session, &harness.home, "Stop", "RAW_CHECKPOINT_REQUIRED"),
+    );
+    assert_flat_checkpoint_guidance(&checkpoint_required);
+    let still_open = runtime
+        .read_work_episode(opened.episode.episode.episode_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(still_open.episode.status, WorkEpisodeStatus::Open);
 
     let (_, episode_id) = open_checkpoint(&runtime, "codex", "session-end-only");
     let ended = harness.hook(
@@ -609,12 +625,16 @@ fn concurrent_turn_stop_processes_converge_on_one_build_and_candidate() {
             .as_str()
             .is_some_and(|message| message.contains("durably closed"))
     }));
-    assert!(outputs.iter().all(|output| {
-        output == &json!({})
-            || output["systemMessage"]
-                .as_str()
-                .is_some_and(|message| message.contains("durably closed"))
-    }));
+    assert!(
+        outputs.iter().all(|output| {
+            output == &json!({})
+                || output["systemMessage"].as_str().is_some_and(|message| {
+                    message.contains("durably closed")
+                        || message.contains("temporarily unavailable")
+                })
+        }),
+        "unexpected concurrent Hook outputs: {outputs:#?}"
+    );
     let build = runtime.read_candidate_build(episode_id).unwrap().unwrap();
     assert_eq!(build.status, CandidateBuildStatus::Complete);
     assert_eq!(build.items.len(), 1);
@@ -715,16 +735,11 @@ fn turn_stop_fails_open_after_close_and_later_retry_recovers_builder() {
 }
 
 #[test]
-fn lifecycle_boundary_does_not_depend_on_noncritical_breadcrumb_storage() {
+fn lifecycle_boundary_creates_no_capture_storage() {
     let harness = Harness::new();
     let runtime = TaskRuntime::initialize(&harness.root).unwrap();
     harness.activate("codex", "capture-unavailable");
     let (_, episode_id) = open_checkpoint(&runtime, "codex", "capture-unavailable");
-    let capture = harness.root.join("state/capture");
-    if capture.exists() {
-        fs::remove_dir_all(&capture).unwrap();
-    }
-    fs::write(&capture, b"capture path intentionally unavailable").unwrap();
     let response = harness.hook(
         "codex",
         &codex_event(
@@ -758,4 +773,7 @@ fn lifecycle_boundary_does_not_depend_on_noncritical_breadcrumb_storage() {
             .status,
         CandidateBuildStatus::Complete
     );
+    for removed in ["capture", "capture.lock", "capture-metadata.json"] {
+        assert!(!harness.root.join("state").join(removed).exists());
+    }
 }

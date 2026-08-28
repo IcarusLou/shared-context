@@ -9,19 +9,18 @@ use sctx_domain::{
     Applicability, AutomaticCandidateStatus, AutomaticContextCandidate, CandidateAnalysis,
     CandidateAnalysisStatus, CandidateAssessmentPath, CandidateAssessmentRelation,
     CandidateBuilderProvenance, CandidateConfidence, CandidateId, CandidateRelationAssessment,
-    CandidateReviewStatus, CaptureEvidenceRef, CaptureId, CaptureUnknown, ConfirmationId,
+    CandidateReviewStatus, CheckpointEvidenceRef, CheckpointUnknown, ConfirmationId,
     ContextCandidate, ContextId, ContextKind, ContextRevisionDraft, ErrorKind, EventId,
-    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, NormalizedBreadcrumbKind,
-    NormalizedWorkObservation, TaskId, TaskSignal, TaskSignalKind, TestOutcomeStatus,
-    WorkEpisodeStatus, WorkSourceRef, WorkingIntentSnapshot,
+    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, NormalizedWorkObservation, TaskId,
+    TaskSignal, TaskSignalKind, TestOutcomeStatus, WorkEpisodeStatus, WorkSourceRef,
+    WorkingIntentSnapshot,
 };
 use sctx_task_runtime::{
     AgentCheckpointSubmission, AgentCheckpointWrite, AutomatedEpisodeBoundary,
     CandidateBuildItemPreparation, CandidateBuildItemStatus, CandidateBuildStatus,
-    CandidateReviewDiscard, CandidateReviewDiscardStatus, CaptureIngestion, CheckpointBoundary,
-    CheckpointClaimDraft, DEFAULT_CANDIDATE_REVIEW_TTL, DirectCheckpointClaimDraft,
-    DirectEvidenceDraft, IntentRevisionWriteStatus, MAX_CANDIDATE_REVIEW_TTL, TaskRuntime,
-    WorkEpisodeDiagnosticKind,
+    CandidateReviewDiscard, CandidateReviewDiscardStatus, CheckpointBoundary, CheckpointClaimDraft,
+    DEFAULT_CANDIDATE_REVIEW_TTL, DirectCheckpointClaimDraft, DirectEvidenceDraft,
+    IntentRevisionWriteStatus, MAX_CANDIDATE_REVIEW_TTL, TaskRuntime,
 };
 use tempfile::TempDir;
 
@@ -63,10 +62,15 @@ fn open_task(
     (locator, snapshot)
 }
 
-fn breadcrumb(summary: &str) -> NormalizedWorkObservation {
-    NormalizedWorkObservation::Breadcrumb {
-        category: NormalizedBreadcrumbKind::Exploration,
-        summary: summary.to_owned(),
+fn validation_observation(summary: &str) -> NormalizedWorkObservation {
+    NormalizedWorkObservation::InlineValidation {
+        evidence: EvidenceSnapshotDraft {
+            kind: EvidenceType::ExperimentRecord,
+            supports: summary.to_owned(),
+            content: serde_json::json!({"summary": summary}),
+            interpretation: "The Runtime test produced a normalized Observation".to_owned(),
+            limitations: Vec::new(),
+        },
     }
 }
 
@@ -124,7 +128,7 @@ fn checkpoint_write(
     expected_episode_version: u64,
     boundary: CheckpointBoundary,
     claims: Vec<CheckpointClaimDraft>,
-    unknowns: Vec<CaptureUnknown>,
+    unknowns: Vec<CheckpointUnknown>,
 ) -> AgentCheckpointWrite {
     AgentCheckpointWrite {
         locator: locator.clone(),
@@ -441,7 +445,7 @@ fn checkpoint_is_atomic_semantically_idempotent_and_closes_without_hook_observat
         1,
         CheckpointBoundary::Close,
         Vec::new(),
-        vec![CaptureUnknown {
+        vec![CheckpointUnknown {
             statement: "Compatibility remains to be checked".to_owned(),
             blocking: true,
             recheck_when: vec!["the client matrix is available".to_owned()],
@@ -477,7 +481,7 @@ fn checkpoint_is_atomic_semantically_idempotent_and_closes_without_hook_observat
     let other_locator = ExternalSessionLocator::new("codex", "checkpoint-other").unwrap();
     let mut cross_task_claim = checkpoint_claim("cross Task evidence is rejected");
     cross_task_claim.inline_validations.clear();
-    cross_task_claim.evidence_refs = vec![CaptureEvidenceRef::Observation {
+    cross_task_claim.evidence_refs = vec![CheckpointEvidenceRef::Observation {
         observation_id: continued.inline_observation_ids[0],
     }];
     let cross_task = checkpoint_write(
@@ -587,7 +591,7 @@ fn checkpoint_disambiguates_closed_retries_new_episodes_and_open_episode_version
         2,
         CheckpointBoundary::Close,
         Vec::new(),
-        vec![CaptureUnknown {
+        vec![CheckpointUnknown {
             statement: "Episode two follow-up is recorded".to_owned(),
             blocking: false,
             recheck_when: vec!["the follow-up is resolved".to_owned()],
@@ -1151,7 +1155,7 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
         .evidence_refs
         .iter()
         .filter_map(|evidence| match evidence {
-            CaptureEvidenceRef::Observation { observation_id } => Some(*observation_id),
+            CheckpointEvidenceRef::Observation { observation_id } => Some(*observation_id),
             _ => None,
         })
         .collect();
@@ -1666,10 +1670,10 @@ fn intent_and_signal_refs_advance_only_through_explicit_episode_api() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn concurrent_append_is_version_guarded_and_capture_ingestion_is_idempotent() {
+fn concurrent_work_observation_append_is_version_guarded() {
     let temporary = TempDir::new().unwrap();
     let runtime = Arc::new(TaskRuntime::initialize(temporary.path()).unwrap());
-    let (locator, task) = open_task(&runtime, "episode-ingest", "capture work");
+    let (locator, task) = open_task(&runtime, "episode-ingest", "observe work");
     let opened = runtime
         .open_work_episode(
             &locator,
@@ -1695,7 +1699,7 @@ fn concurrent_append_is_version_guarded_and_capture_ingestion_is_idempotent() {
                 0,
                 intent_revision_id,
                 vec![source],
-                breadcrumb(&format!("concurrent observation {index}")),
+                validation_observation(&format!("concurrent observation {index}")),
             )
         }));
     }
@@ -1719,73 +1723,20 @@ fn concurrent_append_is_version_guarded_and_capture_ingestion_is_idempotent() {
     assert_eq!(episode.episode.version, 1);
     assert_eq!(episode.episode.observations.len(), 1);
 
-    let capture_id = CaptureId::new();
-    let input = CaptureIngestion {
-        capture_id,
-        episode_id: episode.episode.episode_id,
-        expected_episode_version: 1,
-        task_session_id: task.task_session_id,
-        task_id: task.task_id,
-        intent_revision_id: episode.episode.intent_revisions.last(),
-        additional_sources: Vec::new(),
-        observation: breadcrumb("claimed Capture meaning"),
-        diagnostics: vec![WorkEpisodeDiagnosticKind::CaptureRepositoryNotConfigured],
-    };
-    let barrier = Arc::new(Barrier::new(workers));
-    let mut ingesters = Vec::new();
-    for _ in 0..workers {
-        let runtime = Arc::clone(&runtime);
-        let barrier = Arc::clone(&barrier);
-        let input = input.clone();
-        ingesters.push(thread::spawn(move || {
-            barrier.wait();
-            runtime.ingest_capture(&input).unwrap()
-        }));
-    }
-    let ingested = ingesters
-        .into_iter()
-        .map(|worker| worker.join().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        ingested.iter().filter(|outcome| outcome.inserted).count(),
-        1
-    );
-    assert_eq!(
-        ingested
-            .iter()
-            .map(|outcome| outcome.observation_id)
-            .collect::<std::collections::BTreeSet<_>>()
-            .len(),
-        1
-    );
-    let retried = runtime.ingest_capture(&input).unwrap();
-    assert!(!retried.inserted);
-    assert_eq!(retried.episode.episode.version, 2);
-    assert_eq!(retried.episode.episode.observations.len(), 2);
-    assert_eq!(retried.episode.diagnostics.len(), 1);
-    let mut conflicting_retry = input.clone();
-    conflicting_retry.observation = breadcrumb("different Capture meaning");
-    assert!(runtime.ingest_capture(&conflicting_retry).is_err());
-
-    let (_, other_task) = open_task(&runtime, "episode-other", "other owner");
-    let mut cross_task = input.clone();
-    cross_task.task_session_id = other_task.task_session_id;
-    cross_task.task_id = other_task.task_id;
-    assert!(runtime.ingest_capture(&cross_task).is_err());
     assert_eq!(
         runtime
-            .prepare_work_episode_close(episode.episode.episode_id, 2)
+            .prepare_work_episode_close(episode.episode.episode_id, 1)
             .unwrap()
             .observation_ids
             .len(),
-        2
+        1
     );
     let verification = runtime
         .verify_source_episode(episode.episode.episode_id)
         .unwrap()
         .unwrap();
     assert_eq!(verification.status, WorkEpisodeStatus::Open);
-    assert_eq!(verification.observation_count, 2);
+    assert_eq!(verification.observation_count, 1);
 }
 
 #[test]
@@ -1801,7 +1752,7 @@ fn deleting_runtime_loses_episode_only_and_preserves_other_state() {
             0,
             CheckpointBoundary::Close,
             Vec::new(),
-            vec![CaptureUnknown {
+            vec![CheckpointUnknown {
                 statement: "Runtime deletion removes local Checkpoint state".to_owned(),
                 blocking: false,
                 recheck_when: Vec::new(),
@@ -1812,8 +1763,8 @@ fn deleting_runtime_loses_episode_only_and_preserves_other_state() {
     fs::create_dir_all(root.join("repository")).unwrap();
     fs::write(root.join("repository/fact"), b"git fact").unwrap();
     fs::write(root.join("state/index.sqlite"), b"index").unwrap();
-    fs::create_dir_all(root.join("state/capture")).unwrap();
-    fs::write(root.join("state/capture/cap-safe.json"), b"capture").unwrap();
+    fs::create_dir_all(root.join("state/unrelated")).unwrap();
+    fs::write(root.join("state/unrelated/safe.json"), b"unrelated").unwrap();
     let database = runtime.database_path().to_path_buf();
     drop(runtime);
     for suffix in ["", "-wal", "-shm"] {
@@ -1834,7 +1785,7 @@ fn deleting_runtime_loses_episode_only_and_preserves_other_state() {
     assert_eq!(fs::read(root.join("repository/fact")).unwrap(), b"git fact");
     assert_eq!(fs::read(root.join("state/index.sqlite")).unwrap(), b"index");
     assert_eq!(
-        fs::read(root.join("state/capture/cap-safe.json")).unwrap(),
-        b"capture"
+        fs::read(root.join("state/unrelated/safe.json")).unwrap(),
+        b"unrelated"
     );
 }

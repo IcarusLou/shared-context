@@ -1519,10 +1519,10 @@ fn reject_hardcoded_domain_ids(value: &Value) -> Result<(), ContractError> {
     }
 }
 
-const DOMAIN_ID_PREFIXES: [&str; 29] = [
-    "spc_", "rpo_", "rpg_", "ref_", "tsk_", "tss_", "xss_", "tir_", "sig_", "cap_", "wep_", "wob_",
-    "ckp_", "clm_", "bld_", "rec_", "psg_", "cnd_", "sub_", "cfm_", "asc_", "ctx_", "rev_", "evt_",
-    "pub_", "evd_", "rvw_", "cnf_", "rsl_",
+const DOMAIN_ID_PREFIXES: [&str; 28] = [
+    "spc_", "rpo_", "rpg_", "ref_", "tsk_", "tss_", "xss_", "tir_", "sig_", "wep_", "wob_", "ckp_",
+    "clm_", "bld_", "rec_", "psg_", "cnd_", "sub_", "cfm_", "asc_", "ctx_", "rev_", "evt_", "pub_",
+    "evd_", "rvw_", "cnf_", "rsl_",
 ];
 
 fn find_domain_id_prefix(value: &str) -> Option<&'static str> {
@@ -1580,7 +1580,7 @@ mod tests {
             DOMAIN_ID_PREFIXES.len(),
             "the scenario denylist must cover current IDs plus legacy Repository UUIDs"
         );
-        assert_eq!(DOMAIN_ID_PREFIXES.len(), 29);
+        assert_eq!(DOMAIN_ID_PREFIXES.len(), 28);
         for prefix in DOMAIN_ID_PREFIXES {
             if prefix != "rpo_" {
                 assert!(

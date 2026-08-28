@@ -21,7 +21,6 @@
   },
   "disabled_business_residue": {
     "runtime_files": 0,
-    "capture_records": 0,
     "report_files": 0,
     "knowledge_commits_delta": 0
   }

@@ -727,7 +727,7 @@ impl UserConfigStore {
     ///
     /// Repeating removal of the same ID succeeds with `removed=false`. This
     /// operation never deletes Repository identities, checkouts, Runtime,
-    /// Capture, durable Context, or files below the configured root.
+    /// durable Context, or files below the configured root.
     ///
     /// # Errors
     ///
