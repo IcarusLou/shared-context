@@ -80,6 +80,8 @@ fn draft(
 ) -> ContextRevisionDraft {
     ContextRevisionDraft {
         kind,
+        problem_view: None,
+        hints: Vec::new(),
         topic_key: Some("graph/retrieval".to_owned()),
         statement: statement.to_owned(),
         rationale: "the Graph retrieval fixture captures durable cross-end behavior".to_owned(),

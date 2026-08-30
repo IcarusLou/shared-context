@@ -297,6 +297,9 @@ fn contract() -> ScenarioDefinition {
                     ("locator", object([("locator_kind", text("file"))])),
                     ("token_budget", count(4_000)),
                     ("max_spaces", count(8)),
+                    // The request-scoped Focus invariant reads the per-item Retrieval Paths, which
+                    // only the explainable `full` payload carries.
+                    ("detail_level", text("full")),
                 ]),
             ),
             mcp(
@@ -308,6 +311,7 @@ fn contract() -> ScenarioDefinition {
                     ("external_session_id", session()),
                     ("token_budget", count(4_000)),
                     ("max_spaces", count(8)),
+                    ("detail_level", text("full")),
                 ]),
             ),
         ],

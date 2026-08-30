@@ -1,19 +1,21 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use rusqlite::{OptionalExtension, Transaction, params};
 use sctx_domain::{
-    ContextGovernanceStatus, ContextSpaceAssociationOrigin, PublicationAction, RevisionLifecycle,
-    SemanticConflictStatus,
+    ArtifactLocator, ContextGovernanceStatus, ContextSpaceAssociationOrigin, PublicationAction,
+    RevisionId, RevisionLifecycle, SemanticConflictStatus, hints,
 };
 use sctx_event_schema::{EvidenceType, ReviewVerdict};
 
 use crate::{
     IMPLEMENTATION_VERSIONS, normalize_search_text,
     project::{BuildInput, ProjectionDiagnostic},
-    sql_error,
+    search_tokens, sql_error,
 };
 
 pub(crate) const NEXT_PREFIX: &str = "_next_";
 
-const TABLES: [&str; 28] = [
+const TABLES: [&str; 29] = [
     "meta",
     "source_file",
     "context_candidate",
@@ -42,22 +44,21 @@ const TABLES: [&str; 28] = [
     "diagnostic",
     "context_fts",
     "space_fts",
+    "token_alias",
 ];
 
 pub(crate) fn is_complete(connection: &rusqlite::Connection) -> crate::Result<bool> {
-    for table in TABLES {
-        let exists = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
-                [table],
-                |row| row.get::<_, bool>(0),
-            )
-            .map_err(sql_error("inspect core projection schema"))?;
-        if !exists {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    // Every read synchronizes first, so this runs on the hot path: one scan of `sqlite_schema`
+    // answers it instead of one statement per projection table.
+    let present = connection
+        .query_row(
+            "SELECT COUNT(DISTINCT name) FROM sqlite_schema
+             WHERE type = 'table' AND name IN (SELECT value FROM json_each(?1))",
+            [serde_json::Value::from(TABLES.to_vec()).to_string()],
+            |row| row.get::<_, usize>(0),
+        )
+        .map_err(sql_error("inspect core projection schema"))?;
+    Ok(present == TABLES.len())
 }
 
 pub(crate) fn replace_projection(
@@ -91,6 +92,98 @@ pub(crate) fn read_generation(connection: &rusqlite::Connection) -> crate::Resul
         .optional()
         .map_err(sql_error("read projection generation"))?;
     Ok(value.and_then(|value| value.parse::<u64>().ok()))
+}
+
+/// Physical table holding the append-only Event introduction cache.
+///
+/// This table is deliberately *not* part of [`TABLES`]: it is a rebuildable memo of a Git fact,
+/// not a projection aggregate, so the shadow-table swap of a full rebuild leaves it in place and
+/// a new process starts warm instead of re-walking history.
+const EVENT_COMMIT_TABLE: &str = "event_commit";
+
+const EVENT_COMMIT_DDL: &str = "CREATE TABLE IF NOT EXISTS event_commit (
+    event_path TEXT NOT NULL,
+    commit_oid TEXT NOT NULL,
+    commit_time INTEGER NOT NULL,
+    PRIMARY KEY (event_path, commit_oid)
+) WITHOUT ROWID;";
+
+/// Reads the memoized Event introductions, treating an absent table as an empty memo.
+pub(crate) fn read_event_commits(
+    connection: &rusqlite::Connection,
+) -> crate::Result<BTreeMap<String, Vec<crate::git_tree::EventAddition>>> {
+    let exists = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+            [EVENT_COMMIT_TABLE],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sql_error("inspect Event introduction cache"))?;
+    if !exists {
+        return Ok(BTreeMap::new());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT event_path, commit_oid, commit_time FROM event_commit
+             ORDER BY event_path, commit_time, commit_oid",
+        )
+        .map_err(sql_error("prepare Event introduction read"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(sql_error("read Event introductions"))?;
+    let mut cached: BTreeMap<String, Vec<crate::git_tree::EventAddition>> = BTreeMap::new();
+    for row in rows {
+        let (event_path, commit_oid, commit_time) =
+            row.map_err(sql_error("collect Event introductions"))?;
+        cached
+            .entry(event_path)
+            .or_default()
+            .push(crate::git_tree::EventAddition {
+                commit_oid,
+                commit_time,
+            });
+    }
+    Ok(cached)
+}
+
+/// Replaces the memo with everything one history walk observed.
+pub(crate) fn write_event_commits(
+    connection: &mut rusqlite::Connection,
+    additions: &BTreeMap<String, Vec<crate::git_tree::EventAddition>>,
+) -> crate::Result<()> {
+    let transaction = connection
+        .transaction()
+        .map_err(sql_error("begin Event introduction cache write"))?;
+    transaction
+        .execute_batch(EVENT_COMMIT_DDL)
+        .map_err(sql_error("create Event introduction cache"))?;
+    transaction
+        .execute_batch("DELETE FROM event_commit;")
+        .map_err(sql_error("clear Event introduction cache"))?;
+    {
+        let mut statement = transaction
+            .prepare(
+                "INSERT OR REPLACE INTO event_commit(event_path, commit_oid, commit_time)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .map_err(sql_error("prepare Event introduction write"))?;
+        for (event_path, entries) in additions {
+            for entry in entries {
+                statement
+                    .execute(params![event_path, entry.commit_oid, entry.commit_time])
+                    .map_err(sql_error("write Event introduction"))?;
+            }
+        }
+    }
+    transaction
+        .commit()
+        .map_err(sql_error("commit Event introduction cache write"))
 }
 
 pub(crate) fn read_meta_value(
@@ -132,11 +225,14 @@ CREATE TABLE {prefix}context_candidate (
     submission_content_hash TEXT NOT NULL,
     kind TEXT NOT NULL,
     topic_key TEXT,
+    problem_view TEXT,
     statement TEXT NOT NULL,
     rationale TEXT NOT NULL,
     applicability_json TEXT NOT NULL,
     assumptions_json TEXT NOT NULL,
     recheck_when_json TEXT NOT NULL,
+    hints_json TEXT NOT NULL,
+    hint_text TEXT NOT NULL,
     evidence_json TEXT NOT NULL,
     auto_injection_eligible INTEGER NOT NULL CHECK (auto_injection_eligible = 0),
     projection_json TEXT NOT NULL
@@ -166,6 +262,7 @@ CREATE TABLE {prefix}space_projection (
     problem TEXT,
     desired_outcome TEXT,
     intent_conflicted INTEGER NOT NULL CHECK (intent_conflicted IN (0, 1)),
+    provisional INTEGER NOT NULL CHECK (provisional IN (0, 1)),
     projection_json TEXT NOT NULL
 ) WITHOUT ROWID;
 CREATE TABLE {prefix}intent_revision (
@@ -186,6 +283,9 @@ CREATE TABLE {prefix}context_item (
     accepted_revision_id TEXT,
     accepted_publication_id TEXT,
     auto_injection_eligible INTEGER NOT NULL CHECK (auto_injection_eligible IN (0, 1)),
+    accepted_at_unix_seconds INTEGER,
+    superseded_by TEXT,
+    stale_reason TEXT,
     projection_json TEXT NOT NULL
 ) WITHOUT ROWID;
 CREATE TABLE {prefix}context_revision (
@@ -195,11 +295,14 @@ CREATE TABLE {prefix}context_revision (
     parent_revision_ids_json TEXT NOT NULL,
     kind TEXT NOT NULL,
     topic_key TEXT,
+    problem_view TEXT,
     statement TEXT NOT NULL,
     rationale TEXT NOT NULL,
     applicability_json TEXT NOT NULL,
     assumptions_json TEXT NOT NULL,
     recheck_when_json TEXT NOT NULL,
+    hints_json TEXT NOT NULL,
+    hint_text TEXT NOT NULL,
     review_summary TEXT NOT NULL,
     lifecycle TEXT NOT NULL,
     evidence_completeness INTEGER NOT NULL CHECK (evidence_completeness BETWEEN 0 AND 1000),
@@ -366,7 +469,9 @@ CREATE VIRTUAL TABLE {prefix}context_fts USING fts5(
     title,
     statement,
     rationale,
-    evidence
+    evidence,
+    problem_view,
+    hint_text
 );
 CREATE VIRTUAL TABLE {prefix}space_fts USING fts5(
     space_id UNINDEXED,
@@ -379,6 +484,13 @@ CREATE VIRTUAL TABLE {prefix}space_fts USING fts5(
     acceptance_conditions,
     domain_terms
 );
+CREATE TABLE {prefix}token_alias (
+    token TEXT NOT NULL,
+    alias TEXT NOT NULL,
+    source TEXT NOT NULL,
+    group_key TEXT NOT NULL,
+    PRIMARY KEY (token, alias, source, group_key)
+) WITHOUT ROWID;
 "
     );
     transaction
@@ -437,7 +549,11 @@ fn create_indexes(transaction: &Transaction<'_>) -> crate::Result<()> {
              CREATE INDEX context_relation_target_idx
                  ON context_relation(target_context_id, kind, source_revision_id);
              CREATE INDEX context_relation_source_idx
-                 ON context_relation(source_context_id, source_revision_id, kind);",
+                 ON context_relation(source_context_id, source_revision_id, kind);
+             CREATE INDEX token_alias_token_idx
+                 ON token_alias(token, source, alias);
+             CREATE INDEX token_alias_group_idx
+                 ON token_alias(group_key, token, alias);",
         )
         .map_err(sql_error("create projection query indexes"))
 }
@@ -486,8 +602,23 @@ fn populate(
             .map_err(sql_error("write source-file projection"))?;
     }
 
+    let mut alias_rows = BTreeSet::new();
     for (candidate_id, projection) in &input.projection.candidates {
         let content = &projection.candidate.content;
+        let candidate_prose = prose_hints(
+            &content.statement,
+            &content.rationale,
+            content.evidence.iter().map(|evidence| {
+                (
+                    evidence.supports.as_str(),
+                    &evidence.content,
+                    evidence.interpretation.as_str(),
+                )
+            }),
+        );
+        for term in &candidate_prose.alias_seeds {
+            collect_alias_rows(term, "identifier_split", &mut alias_rows);
+        }
         let submission = input
             .projection
             .candidate_submissions
@@ -530,7 +661,7 @@ fn populate(
         transaction
             .execute(
                 &format!(
-                    "INSERT INTO {prefix}context_candidate(candidate_id, event_id, submission_id, source_episode_id, source_task_session_id, source_task_id, submission_content_hash, kind, topic_key, statement, rationale, applicability_json, assumptions_json, recheck_when_json, evidence_json, auto_injection_eligible, projection_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0, ?16)"
+                    "INSERT INTO {prefix}context_candidate(candidate_id, event_id, submission_id, source_episode_id, source_task_session_id, source_task_id, submission_content_hash, kind, topic_key, problem_view, statement, rationale, applicability_json, assumptions_json, recheck_when_json, hints_json, hint_text, evidence_json, auto_injection_eligible, projection_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 0, ?19)"
                 ),
                 params![
                     candidate_id.to_string(),
@@ -542,11 +673,14 @@ fn populate(
                     submission.content_hash,
                     enum_text(content.kind),
                     content.topic_key,
+                    content.problem_view,
                     content.statement,
                     content.rationale,
                     json(&content.applicability)?,
                     json(&content.assumptions)?,
                     json(&content.recheck_when)?,
+                    json(&content.hints)?,
+                    hint_text(&[&content.hints], &candidate_prose.terms),
                     json(&content.evidence)?,
                     json(projection)?
                 ],
@@ -588,6 +722,13 @@ fn populate(
             .map_err(sql_error("write Candidate submission conflict"))?;
     }
 
+    let reference_hints = revision_reference_hints(input);
+    for projection in input.projection.engineering_references.values() {
+        for term in locator_identifier_sources(&projection.reference.locator) {
+            collect_alias_rows(&term, "identifier_split", &mut alias_rows);
+        }
+    }
+
     for (space_id, space) in &input.projection.spaces {
         let current_intent = (space.intent.heads.len() == 1)
             .then(|| space.intent.heads.first().copied())
@@ -597,7 +738,7 @@ fn populate(
         transaction
             .execute(
                 &format!(
-                    "INSERT INTO {prefix}space_projection(space_id, current_intent_revision_id, title, problem, desired_outcome, intent_conflicted, projection_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                    "INSERT INTO {prefix}space_projection(space_id, current_intent_revision_id, title, problem, desired_outcome, intent_conflicted, provisional, projection_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
                 ),
                 params![
                     space_id.to_string(),
@@ -606,6 +747,9 @@ fn populate(
                     intent.map(|revision| revision.intent.problem.as_str()),
                     intent.map(|revision| revision.intent.desired_outcome.as_str()),
                     i64::from(space.intent.heads.len() > 1),
+                    // Only a single resolved Intent head can say whether the Space is still the
+                    // server's provisional proposal; a conflicted Space reports 0.
+                    i64::from(intent.is_some_and(|revision| revision.provisional)),
                     json(space)?
                 ],
             )
@@ -657,6 +801,9 @@ fn populate(
                     ],
                 )
                 .map_err(sql_error("write Space Intent FTS5 projection"))?;
+            for term in &revision.intent.domain_terms {
+                collect_alias_rows(term, "domain_term", &mut alias_rows);
+            }
         }
         if space.intent.heads.len() > 1 {
             insert_conflict(
@@ -671,25 +818,17 @@ fn populate(
             )?;
         }
 
-        let fts_title = if let Some(intent) = intent {
-            intent.intent.title.clone()
-        } else {
-            space
-                .intent
-                .heads
-                .iter()
-                .filter_map(|id| space.intent.revisions.get(id))
-                .map(|revision| revision.intent.title.as_str())
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
         for (context_id, context) in &space.contexts {
             let (governance_status, accepted_publication, accepted_revision) =
                 governance_columns(&context.governance);
+            let accepted_publication_id = match &context.governance {
+                ContextGovernanceStatus::Accepted { publication_id, .. } => Some(*publication_id),
+                _ => None,
+            };
             transaction
                 .execute(
                     &format!(
-                        "INSERT INTO {prefix}context_item(context_id, space_id, governance_status, accepted_revision_id, accepted_publication_id, auto_injection_eligible, projection_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                        "INSERT INTO {prefix}context_item(context_id, space_id, governance_status, accepted_revision_id, accepted_publication_id, auto_injection_eligible, accepted_at_unix_seconds, superseded_by, stale_reason, projection_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8)"
                     ),
                     params![
                         context_id.to_string(),
@@ -698,6 +837,8 @@ fn populate(
                         accepted_revision,
                         accepted_publication,
                         i64::from(context.auto_injection.eligible),
+                        accepted_publication_id
+                            .and_then(|id| input.publication_times.get(&id).copied()),
                         json(context)?
                     ],
                 )
@@ -705,10 +846,33 @@ fn populate(
 
             for (revision_id, revision_projection) in &context.revisions {
                 let revision = &revision_projection.revision;
+                let prose = prose_hints(
+                    &revision.statement,
+                    &revision.rationale,
+                    revision.evidence.iter().map(|evidence| {
+                        (
+                            evidence.supports.as_str(),
+                            &evidence.content,
+                            evidence.interpretation.as_str(),
+                        )
+                    }),
+                );
+                for term in &prose.alias_seeds {
+                    collect_alias_rows(term, "identifier_split", &mut alias_rows);
+                }
+                let hint_text = hint_text(
+                    &[
+                        reference_hints
+                            .get(revision_id)
+                            .map_or(&[][..], Vec::as_slice),
+                        &revision.hints,
+                    ],
+                    &prose.terms,
+                );
                 transaction
                     .execute(
                         &format!(
-                            "INSERT INTO {prefix}context_revision(revision_id, context_id, space_id, parent_revision_ids_json, kind, topic_key, statement, rationale, applicability_json, assumptions_json, recheck_when_json, review_summary, lifecycle, evidence_completeness, is_head) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
+                            "INSERT INTO {prefix}context_revision(revision_id, context_id, space_id, parent_revision_ids_json, kind, topic_key, problem_view, statement, rationale, applicability_json, assumptions_json, recheck_when_json, hints_json, hint_text, review_summary, lifecycle, evidence_completeness, is_head) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
                         ),
                         params![
                             revision_id.to_string(),
@@ -717,11 +881,14 @@ fn populate(
                             json(&revision.parent_revision_ids)?,
                             enum_text(revision.kind),
                             revision.topic_key,
+                            revision.problem_view,
                             revision.statement,
                             revision.rationale,
                             json(&revision.applicability)?,
                             json(&revision.assumptions)?,
                             json(&revision.recheck_when)?,
+                            json(&revision.hints)?,
+                            hint_text.as_str(),
                             enum_text(revision_projection.review_summary),
                             lifecycle_text(revision_projection.lifecycle),
                             evidence_completeness(&revision.evidence),
@@ -787,15 +954,17 @@ fn populate(
                 transaction
                     .execute(
                         &format!(
-                            "INSERT INTO {prefix}context_fts(context_id, revision_id, title, statement, rationale, evidence) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+                            "INSERT INTO {prefix}context_fts(context_id, revision_id, title, statement, rationale, evidence, problem_view, hint_text) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
                         ),
                         params![
                             context_id.to_string(),
                             revision_id.to_string(),
-                            normalize_search_text(&fts_title),
+                            normalize_search_text(&context_display_title(&revision.statement)),
                             normalize_search_text(&revision.statement),
                             normalize_search_text(&revision.rationale),
-                            normalize_search_text(&evidence_search.join(" "))
+                            normalize_search_text(&evidence_search.join(" ")),
+                            normalize_search_text(revision.problem_view.as_deref().unwrap_or("")),
+                            hint_text.as_str()
                         ],
                     )
                     .map_err(sql_error("write FTS5 projection"))?;
@@ -1104,10 +1273,44 @@ fn populate(
         )?;
     }
 
+    let insert_alias = format!(
+        "INSERT OR IGNORE INTO {prefix}token_alias(token, alias, source, group_key) VALUES (?1, ?2, ?3, ?4)"
+    );
+    for (token, alias, source, group_key) in &alias_rows {
+        transaction
+            .execute(&insert_alias, params![token, alias, source, group_key])
+            .map_err(sql_error("write token alias projection"))?;
+    }
+
     for diagnostic in &input.diagnostics {
         insert_diagnostic(transaction, prefix, diagnostic)?;
     }
+    refresh_superseded_by(transaction, prefix)?;
     Ok(())
+}
+
+/// Recomputes the local `superseded_by` derivation for every projected Context.
+///
+/// `Supersedes` is an ordinary immutable Relation on the superseding revision; nothing in Git
+/// marks the target. Only an *accepted* revision's Relation counts, and the derivation is a pure
+/// function of the projected Relations, so it is recomputed rather than incrementally patched.
+/// Deterministic tie-break: the lowest superseding Context ID wins when several claim one target.
+fn refresh_superseded_by(transaction: &Transaction<'_>, prefix: &str) -> crate::Result<()> {
+    transaction
+        .execute_batch(&format!(
+            "UPDATE {prefix}context_item SET superseded_by = (
+                 SELECT MIN(relation.source_context_id)
+                 FROM {prefix}context_relation AS relation
+                 JOIN {prefix}context_item AS source
+                   ON source.context_id = relation.source_context_id
+                 WHERE relation.kind = 'supersedes'
+                   AND relation.target_context_id = {prefix}context_item.context_id
+                   AND relation.source_context_id <> {prefix}context_item.context_id
+                   AND source.governance_status = 'accepted'
+                   AND source.accepted_revision_id = relation.source_revision_id
+             );"
+        ))
+        .map_err(sql_error("derive superseded Context state"))
 }
 
 pub(crate) fn cached_blobs(
@@ -1175,6 +1378,8 @@ pub(crate) fn replace_projection_incremental(
              INSERT INTO candidate_submission_conflict SELECT * FROM _next_candidate_submission_conflict;
              DELETE FROM diagnostic;
              INSERT INTO diagnostic SELECT * FROM _next_diagnostic;
+             DELETE FROM token_alias;
+             INSERT INTO token_alias SELECT * FROM _next_token_alias;
 
              DELETE FROM space_fts WHERE space_id IN (SELECT space_id FROM _affected_space);
              DELETE FROM context_fts WHERE revision_id IN (
@@ -1263,11 +1468,233 @@ pub(crate) fn replace_projection_incremental(
              INSERT INTO meta SELECT * FROM _next_meta;",
         )
         .map_err(sql_error("replace affected projection closure"))?;
+    // `Supersedes` can cross Space boundaries, so the derivation is recomputed over the whole
+    // live projection instead of only the replaced Space closure.
+    refresh_superseded_by(transaction, "")?;
     drop_tables(transaction, NEXT_PREFIX)?;
     transaction
         .execute_batch("DROP TABLE _affected_space;")
         .map_err(sql_error("drop affected Space closure"))?;
     Ok(())
+}
+
+/// Maximum characters of a Context statement used as its own display title.
+const CONTEXT_TITLE_MAX_CHARS: usize = 60;
+
+/// Mirrors the retrieval-side Context title derivation so FTS `title` indexes the Context itself.
+fn context_display_title(statement: &str) -> String {
+    let trimmed = statement.trim();
+    if trimmed.chars().count() <= CONTEXT_TITLE_MAX_CHARS {
+        return trimmed.to_owned();
+    }
+    let mut title = trimmed
+        .chars()
+        .take(CONTEXT_TITLE_MAX_CHARS)
+        .collect::<String>();
+    title.push('\u{2026}');
+    title
+}
+
+/// Path, basename, and extension-free basename forms of one repository-relative path.
+fn path_hint_terms(path: &str) -> Vec<String> {
+    let mut terms = vec![path.to_owned()];
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    if basename != path && !basename.is_empty() {
+        terms.push(basename.to_owned());
+    }
+    if let Some((stem, _)) = basename.rsplit_once('.')
+        && !stem.is_empty()
+    {
+        terms.push(stem.to_owned());
+    }
+    terms
+}
+
+/// Identifier-shaped coordinates of one Artifact locator, used for alias groups.
+fn locator_identifier_sources(locator: &ArtifactLocator) -> Vec<String> {
+    let path = locator.path().as_str();
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    let stem = basename
+        .rsplit_once('.')
+        .map_or(basename, |(stem, _)| stem)
+        .to_owned();
+    let mut sources = Vec::new();
+    if !stem.is_empty() {
+        sources.push(stem);
+    }
+    match locator {
+        ArtifactLocator::File { .. } | ArtifactLocator::Module { .. } => {}
+        ArtifactLocator::Api {
+            operation,
+            normalized_route,
+            ..
+        } => {
+            sources.push(operation.clone());
+            sources.push(normalized_route.clone());
+        }
+        ArtifactLocator::Schema {
+            namespace,
+            qualified_name,
+            ..
+        } => {
+            sources.push(namespace.clone());
+            sources.push(qualified_name.clone());
+        }
+        ArtifactLocator::Symbol {
+            module,
+            enclosing_type,
+            symbol_name,
+            ..
+        } => {
+            sources.push(module.clone());
+            if let Some(enclosing_type) = enclosing_type {
+                sources.push(enclosing_type.clone());
+            }
+            sources.push(symbol_name.clone());
+        }
+        ArtifactLocator::Test {
+            qualified_test_name,
+            ..
+        } => sources.push(qualified_test_name.clone()),
+    }
+    sources
+}
+
+/// Every searchable hint term contributed by the Engineering References of one revision.
+fn revision_reference_hints(input: &BuildInput) -> BTreeMap<RevisionId, Vec<String>> {
+    let mut hints: BTreeMap<RevisionId, Vec<String>> = BTreeMap::new();
+    for projection in input.projection.engineering_references.values() {
+        let entry = hints.entry(projection.revision_id).or_default();
+        entry.extend(path_hint_terms(
+            projection.reference.locator.path().as_str(),
+        ));
+        entry.extend(locator_identifier_sources(&projection.reference.locator));
+    }
+    for terms in hints.values_mut() {
+        terms.sort();
+        terms.dedup();
+    }
+    hints
+}
+
+/// Normalized searchable text built from every hint source of one revision or Candidate.
+///
+/// The sources are the derived Engineering Reference locators, the identifiers and path spellings
+/// read out of the free prose, and the unresolved hints the Claim carried. Merging them here is
+/// what gives a Context accepted before server-side derivation existed a populated `hint_text`
+/// after one `index rebuild`.
+fn hint_text(sources: &[&[String]], prose_terms: &[String]) -> String {
+    let terms = sources
+        .iter()
+        .flat_map(|source| source.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let mut text = normalize_search_text(&terms.into_iter().collect::<Vec<_>>().join(" "));
+    // Authored hints and derived locators are indexed in full, split parts included: a reviewer
+    // wrote them down precisely because they are the retrieval handle. Prose identifiers are not
+    // authored hints — they are a by-product of how the Claim happens to be worded — so only the
+    // whole identifier is indexed. Indexing `compile`, `debug` and `kotlin` because a summary said
+    // `compileDebugKotlin` would let one incidental spelling outrank the Context that a natural
+    // language question is actually about, which is the ranking regression this guards.
+    let present = text
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    for compound in prose_terms
+        .iter()
+        .filter_map(|term| compound_hint_token(term))
+        .collect::<BTreeSet<_>>()
+    {
+        if present.contains(&compound) {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(&compound);
+    }
+    text
+}
+
+/// The whole-identifier form of one prose term, or `None` when the term is a path spelling.
+///
+/// Path spellings reach retrieval through the Evidence text that carried them; folding a whole
+/// directory path into one token would only add an unsearchable string.
+fn compound_hint_token(term: &str) -> Option<String> {
+    if term.contains('/') || term.contains('.') {
+        return None;
+    }
+    let folded = search_tokens(term).concat();
+    (!folded.is_empty()).then_some(folded)
+}
+
+/// What one revision's or Candidate's free prose contributes to retrieval.
+struct ProseHints {
+    /// Every identifier and path spelling, for `hint_text`.
+    terms: Vec<String>,
+    /// Only the file-backed spellings, for `token_alias` groups.
+    alias_seeds: Vec<String>,
+}
+
+/// Identifier and path terms read out of the free prose of one revision or Candidate draft.
+///
+/// Evidence content is read as its string leaves only: an object key like `source_kind` is schema,
+/// not a repository coordinate, and must never become a retrieval hint.
+///
+/// Alias groups are seeded from the path spellings alone. A whole-word alias group is a strong
+/// claim — it says any part of the name may stand in for the whole — and an incidental CamelCase
+/// word in a sentence does not earn it: turning `compileDebugKotlin` into a `debug` alias hub made
+/// the question "did the debug app build?" retrieve whichever Context merely mentioned a Gradle
+/// task. A file name is a coordinate a reviewer can open, so it does earn it.
+fn prose_hints<'a>(
+    statement: &str,
+    rationale: &str,
+    evidence: impl IntoIterator<Item = (&'a str, &'a serde_json::Value, &'a str)>,
+) -> ProseHints {
+    let mut texts = vec![statement.to_owned(), rationale.to_owned()];
+    for (supports, content, interpretation) in evidence {
+        texts.push(supports.to_owned());
+        texts.push(interpretation.to_owned());
+        hints::json_string_leaves(content, &mut texts);
+    }
+    ProseHints {
+        terms: hints::derived_hint_terms(texts.iter().map(String::as_str)),
+        alias_seeds: hints::derived_path_stems(texts.iter().map(String::as_str)),
+    }
+}
+
+/// Emits every ordered alias pair of one identifier or domain term as a single alias group.
+fn collect_alias_rows(
+    source: &str,
+    origin: &str,
+    rows: &mut BTreeSet<(String, String, String, String)>,
+) {
+    for run in source.split(|character: char| !character.is_alphanumeric()) {
+        if run.is_empty() || !run.is_ascii() {
+            continue;
+        }
+        let parts = search_tokens(run);
+        if parts.len() < 2 {
+            continue;
+        }
+        let group_key = parts.join("-");
+        let mut members = vec![parts.concat()];
+        members.extend(parts);
+        members.sort();
+        members.dedup();
+        for token in &members {
+            for alias in &members {
+                if token == alias {
+                    continue;
+                }
+                rows.insert((
+                    token.clone(),
+                    alias.clone(),
+                    origin.to_owned(),
+                    group_key.clone(),
+                ));
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

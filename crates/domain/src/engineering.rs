@@ -693,6 +693,9 @@ pub enum ContextRelationKind {
     Implements,
     ValidatedBy,
     Contradicts,
+    /// This revision replaces the target Context. The target keeps its accepted Git facts; only
+    /// the local projection derives a `superseded_by` state from this edge.
+    Supersedes,
     RelatedTo,
 }
 

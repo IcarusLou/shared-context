@@ -7,7 +7,7 @@ use std::{
 };
 
 use fs2::FileExt;
-use sctx_agent_adapter::SHARED_CONTEXT_ACTIVATION_MARKER;
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
 use sctx_domain::{ExternalSessionLocator, IntentSnapshot, TaskId, WorkingIntentSnapshot};
 use sctx_event_schema::Event;
 use sctx_git_store::{AppendRequest, GitStore};
@@ -393,7 +393,10 @@ fn cursor_post_tool_hook_fails_open_when_runtime_is_unavailable() {
     assert!(start.status.success());
     assert_eq!(
         serde_json::from_slice::<Value>(&start.stdout).unwrap(),
-        json!({"additional_context": SHARED_CONTEXT_ACTIVATION_MARKER})
+        json!({
+            "additional_context":
+                shared_context_activation_marker(AgentKind::Cursor, "cursor-fail-open")
+        })
     );
     fs::create_dir(harness.root().join("state/runtime.sqlite")).unwrap();
     let secret = "CURSOR_RAW_SECRET_MUST_NOT_LEAK";
@@ -449,7 +452,10 @@ fn cursor_post_tool_hook_ignores_repository_registry_failure() {
     assert!(start.status.success());
     assert_eq!(
         serde_json::from_slice::<Value>(&start.stdout).unwrap(),
-        json!({"additional_context": SHARED_CONTEXT_ACTIVATION_MARKER})
+        json!({
+            "additional_context":
+                shared_context_activation_marker(AgentKind::Cursor, "cursor-fail-open")
+        })
     );
     fs::create_dir(harness.root().join("state/repository-registry.sqlite")).unwrap();
     let secret = "CURSOR_REGISTRY_HOT_PATH_MUST_NOT_RUN";

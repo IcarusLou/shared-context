@@ -2,7 +2,9 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    fmt,
     str::FromStr,
+    sync::Arc,
 };
 
 use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value as SqlValue};
@@ -78,6 +80,20 @@ pub struct SearchFilters {
     pub statuses: Vec<ContextStatus>,
 }
 
+/// How explicit search matches a multi-token query.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMatchMode {
+    /// Any query token may match. Results are ordered by BM25 combined with query token coverage
+    /// and truncated below [`RANKED_MIN_COVERAGE_BASIS_POINTS`], so a caller who phrases a known
+    /// fact differently still recalls it.
+    #[default]
+    Ranked,
+    /// Every query token must be present in the same revision. This is the strict lookup used to
+    /// confirm an exact identifier.
+    Exact,
+}
+
 /// One stable-cursor search request.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SearchRequest {
@@ -85,6 +101,9 @@ pub struct SearchRequest {
     pub filters: SearchFilters,
     pub page_size: usize,
     pub cursor: Option<String>,
+    /// Defaults to [`SearchMatchMode::Ranked`].
+    #[serde(default)]
+    pub match_mode: SearchMatchMode,
 }
 
 impl Default for SearchRequest {
@@ -94,6 +113,7 @@ impl Default for SearchRequest {
             filters: SearchFilters::default(),
             page_size: DEFAULT_PAGE_SIZE,
             cursor: None,
+            match_mode: SearchMatchMode::Ranked,
         }
     }
 }
@@ -106,6 +126,19 @@ pub enum MatchField {
     Statement,
     Rationale,
     Evidence,
+    ProblemView,
+    HintText,
+}
+
+/// One hit a query token only reached after `token_alias` expansion.
+///
+/// It names the original query token, the alias that actually occurs in the indexed text, and the
+/// alias group both belong to, so a reader can tell a literal match from an expanded one.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct AliasMatch {
+    pub token: String,
+    pub alias: String,
+    pub group_key: String,
 }
 
 /// Explainable ranking inputs returned with every hit.
@@ -114,8 +147,15 @@ pub struct MatchReason {
     pub matched_fields: Vec<MatchField>,
     pub matched_tokens: Vec<String>,
     pub bm25: f64,
+    /// Share of the distinct query tokens this revision matched, in basis points. It is the
+    /// second ranking key of [`SearchMatchMode::Ranked`] and the truncation input.
+    pub coverage_basis_points: u16,
     pub evidence_completeness: u16,
     pub structured_filter_match: bool,
+    /// Query tokens that only matched through a `token_alias` expansion. Empty when every hit was
+    /// literal, so an unexpanded query serializes exactly as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_via_alias: Vec<AliasMatch>,
 }
 
 /// Self-contained Evidence attached to one search result.
@@ -147,13 +187,127 @@ pub struct ConflictView {
     pub participants: Vec<ConflictSide>,
 }
 
+/// Locally derived Context state that no immutable Git fact carries.
+///
+/// Every field is a projection or evaluation this machine performed: `supersedes` Relations
+/// declared by another accepted revision, the outcome of evaluating structured `recheck_when`
+/// entries against the local checkouts, and the configured `[context_ttl]` policy. None of them
+/// changes the accepted facts in Git; they only change how the Context is ranked and whether it
+/// is eligible for automatic injection.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContextDerivedState {
+    /// Context whose accepted revision declares `supersedes` on this Context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<ContextId>,
+    /// Why the last structured `recheck_when` evaluation considered this Context stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
+    /// Why the configured Context time-to-live considers this Context historical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historical_reason: Option<String>,
+    /// Product of every ranking multiplier applied to this item after Space fusion, in basis
+    /// points. Present only when something demoted it, and only in a Context Pack: an explicit
+    /// `search` page has no fused Space score to demote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demotion_basis_points: Option<u16>,
+}
+
+impl ContextDerivedState {
+    /// Whether nothing was derived, which is the common case.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.superseded_by.is_none()
+            && self.stale_reason.is_none()
+            && self.historical_reason.is_none()
+            && self.demotion_basis_points.is_none()
+    }
+
+    /// Superseded and historical Contexts stay searchable and explainable but never inject.
+    #[must_use]
+    pub const fn blocks_automatic_injection(&self) -> bool {
+        self.superseded_by.is_some() || self.historical_reason.is_some()
+    }
+}
+
+/// Ranking multiplier for a Context that participates in an unresolved semantic conflict.
+pub const CONFLICT_SCORE_MULTIPLIER_BASIS_POINTS: u16 = 7_000;
+
+/// Ranking multiplier for a Context whose structured `recheck_when` evaluation fired.
+pub const STALE_SCORE_MULTIPLIER_BASIS_POINTS: u16 = 6_000;
+
+/// Explicit Context time-to-live policy evaluated at query time.
+///
+/// The caller owns the policy because it comes from `config.toml`, and it owns the clock because
+/// expiry must be reproducible in tests. `now_unix_seconds` defaults to the wall clock.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContextTtlSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now_unix_seconds: Option<i64>,
+}
+
+impl ContextTtlSettings {
+    #[must_use]
+    const fn lifetime_seconds(&self, kind: ContextKind) -> Option<i64> {
+        match kind {
+            ContextKind::Validation => self.validation_seconds,
+            ContextKind::Progress => self.progress_seconds,
+            _ => None,
+        }
+    }
+
+    fn now(&self) -> i64 {
+        self.now_unix_seconds.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| {
+                    i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+                })
+        })
+    }
+
+    /// Explains why one accepted Context has outlived its configured lifetime.
+    fn historical_reason(&self, kind: ContextKind, accepted_at: Option<i64>) -> Option<String> {
+        let lifetime = self.lifetime_seconds(kind)?;
+        let accepted_at = accepted_at?;
+        let age = self.now().checked_sub(accepted_at)?;
+        (age > lifetime).then(|| {
+            format!(
+                "context_ttl: {} Context published {age}s ago exceeds the configured {lifetime}s lifetime",
+                context_kind_name(kind)
+            )
+        })
+    }
+}
+
+const fn context_kind_name(kind: ContextKind) -> &'static str {
+    match kind {
+        ContextKind::Decision => "decision",
+        ContextKind::Contract => "contract",
+        ContextKind::Issue => "issue",
+        ContextKind::Risk => "risk",
+        ContextKind::Validation => "validation",
+        ContextKind::Discovery => "discovery",
+        ContextKind::Progress => "progress",
+    }
+}
+
 /// Search hit for one immutable revision.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SearchResult {
     pub space_id: SpaceId,
     pub context_id: ContextId,
     pub revision_id: RevisionId,
+    /// Context-owned display title derived from the immutable revision statement. Context
+    /// revisions carry no stored title, so the first [`CONTEXT_TITLE_MAX_CHARS`] characters of
+    /// the statement identify the Context instead of borrowing its Space Intent title.
     pub title: String,
+    /// Title of the owning `ContextSpace` Intent head. Reported separately so a Space label is
+    /// never mistaken for the Context's own identity.
+    pub space_title: String,
     pub kind: ContextKind,
     pub status: ContextStatus,
     pub statement: String,
@@ -163,6 +317,10 @@ pub struct SearchResult {
     pub recheck_when: Vec<String>,
     pub evidence: Vec<EvidenceView>,
     pub conflicts: Vec<ConflictView>,
+    /// Locally derived lifecycle state. Superseded, stale, and historical Contexts stay fully
+    /// searchable; the derivation is reported instead of hiding the row.
+    #[serde(default, skip_serializing_if = "ContextDerivedState::is_empty")]
+    pub derived_state: ContextDerivedState,
     pub auto_injection_eligible: bool,
     pub match_reason: MatchReason,
 }
@@ -418,6 +576,42 @@ pub struct TaskAssociationFusionExplanation {
     pub final_score_basis_points: u16,
 }
 
+/// Why one query token was not used for automatic retrieval.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomaticQueryTokenFilter {
+    /// Too short to carry retrievable meaning, independent of corpus size.
+    ShortToken,
+    /// Dropped by the built-in stop-word table, which only applies while the corpus is too small
+    /// for document frequency to discriminate.
+    StopWordFallback,
+    /// Dropped because the token appears in too large a share of the indexed corpus (low IDF).
+    HighDocumentFrequency,
+    /// Dropped because rarer tokens already filled the automatic token budget.
+    TokenBudget,
+}
+
+/// One dropped automatic query token and the exact filter responsible for it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomaticQueryTokenDrop {
+    pub token: String,
+    pub filter: AutomaticQueryTokenFilter,
+    /// Observed document frequency, present only when the corpus was large enough to measure it.
+    pub document_frequency: Option<usize>,
+}
+
+/// Typed automatic query-token selection explanation serialized into a [`TaskSpaceAssociation`]
+/// reason. It makes IDF filtering and stop-word fallback distinguishable after the fact.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomaticQueryTokenExplanation {
+    pub document_count: usize,
+    pub high_document_frequency_min_documents: usize,
+    pub high_document_frequency_threshold_basis_points: usize,
+    pub stop_word_fallback_active: bool,
+    pub selected_tokens: Vec<String>,
+    pub dropped_tokens: Vec<AutomaticQueryTokenDrop>,
+}
+
 /// One exact active Artifact Focus to a historical Engineering Artifact association.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GraphArtifactRetrievalPath {
@@ -577,9 +771,25 @@ pub struct TaskContextPack {
     pub token_budget: usize,
     pub estimated_tokens: usize,
     pub mode: ContextPackMode,
+    /// Payload shape this Pack was budgeted for. `items` and `compact_items` are never both
+    /// populated; the budgeter charges exactly the representation named here.
+    pub detail_level: ContextPackDetailLevel,
     pub associations: Vec<TaskSpaceAssociation>,
+    /// Compact projection of the surviving associations. Empty under
+    /// [`ContextPackDetailLevel::Full`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compact_associations: Vec<CompactSpaceAssociation>,
     pub items: Vec<TaskContextItem>,
+    /// Compact projection of the same budgeted selection. Empty under
+    /// [`ContextPackDetailLevel::Full`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compact_items: Vec<CompactTaskContextItem>,
     pub graph_diagnostics: Vec<TaskGraphDiagnostic>,
+    /// Automatic query-token selection for this Task, reported once at the top level so token
+    /// filtering stays visible even when no Space association survived. Present under
+    /// [`ContextPackDetailLevel::Full`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_token_explanation: Option<AutomaticQueryTokenExplanation>,
     pub omitted: Vec<ContextPackOmitted>,
 }
 
@@ -612,9 +822,139 @@ pub enum ContextPackMode {
 pub struct ContextPackOmitted {
     pub context_id: Option<ContextId>,
     pub revision_id: Option<RevisionId>,
+    /// Context-owned display title of the omitted Context. Present whenever the omission names one
+    /// Context, so an Agent can decide whether the missing item is worth an explicit read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub reason: String,
     pub estimated_tokens: usize,
     pub count: usize,
+}
+
+/// Payload shape requested for one Task Context Pack.
+///
+/// `Compact` keeps only the fields an Agent needs to inherit a fact (identity, title, statement,
+/// applicability conditions, Evidence summaries, Relations, and short reasons). `Full` keeps the
+/// complete explainable payload, including per-item Retrieval Paths, match reasons, and the
+/// authoritative safety source.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextPackDetailLevel {
+    #[default]
+    Compact,
+    Full,
+}
+
+/// Maximum characters retained from one Evidence summary in a compact Context Pack.
+pub const COMPACT_EVIDENCE_SUMMARY_MAX_CHARS: usize = 200;
+
+/// Maximum one-sentence reasons attached to one compact Context Pack item.
+pub const COMPACT_ITEM_REASON_LIMIT: usize = 3;
+
+/// Maximum Engineering Reference locations attached to one compact Evidence entry.
+pub const COMPACT_EVIDENCE_LOCATION_LIMIT: usize = 4;
+
+/// Share of a compact token budget reserved for Context items before anything else is packed.
+///
+/// A real payload spent more than half its budget on Space explanations and omission notices and
+/// returned two Contexts out of ten. The facts are the payload; the explanations are the margin.
+pub const COMPACT_ITEM_BUDGET_BASIS_POINTS: usize = 7_000;
+
+/// Compact items the budgeter refuses to drop, even when a single item exceeds its share.
+pub const COMPACT_MIN_ITEMS: usize = 3;
+
+/// Evidence summary length one oversized item is squeezed to so it still reaches the Agent.
+pub const COMPACT_SQUEEZED_EVIDENCE_SUMMARY_MAX_CHARS: usize = 120;
+
+/// Human-readable Space reasons kept in one compact association.
+pub const COMPACT_ASSOCIATION_REASON_LIMIT: usize = 2;
+
+/// Individually named omissions in a compact payload; the rest collapse into one counted entry.
+pub const COMPACT_NAMED_OMISSION_LIMIT: usize = 5;
+
+/// Title characters kept on one named compact omission.
+pub const COMPACT_OMITTED_TITLE_MAX_CHARS: usize = 40;
+
+/// Retrieval channel names kept on one compact item.
+pub const COMPACT_RETRIEVAL_CHANNEL_LIMIT: usize = 6;
+
+/// Bounded Evidence projection used by [`ContextPackDetailLevel::Compact`]. The Evidence identity
+/// and full content stay reachable through `context_get`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompactEvidenceView {
+    pub kind: String,
+    pub summary: String,
+    /// `<repository_id>:<repository-relative path>` for every Engineering Reference recorded on the
+    /// same immutable revision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locations: Vec<String>,
+}
+
+/// Compact Space association: which Space the facts came from, how confident the match was, and a
+/// sentence or two of why.
+///
+/// Everything an Agent cannot act on is dropped. `relation_paths` in particular carried a whole
+/// Relation rationale per hop and, on a real payload, cost more characters than the Contexts it
+/// was explaining; the same Relations already reach the Agent on `CompactTaskContextItem`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CompactSpaceAssociation {
+    pub space_id: SpaceId,
+    /// Intent-head title of the Space, so the Agent can name the Space without a second call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub score: f64,
+    /// True when the Space is still the server's provisional proposal rather than a curated one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub provisional: bool,
+    pub reasons: Vec<String>,
+}
+
+/// Space headline fields the compact payload needs but a [`TaskSpaceAssociation`] does not carry.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SpaceHeader {
+    title: Option<String>,
+    provisional: bool,
+}
+
+/// One active outgoing Context Relation, reduced to kind and target identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompactContextRelation {
+    pub kind: ContextRelationKind,
+    pub target_context_id: ContextId,
+}
+
+/// Compact Context Pack item. It carries the inheritable fact and drops every ranking, fusion, and
+/// provenance channel; `ContextPackDetailLevel::Full` remains available for the explainable form.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompactTaskContextItem {
+    pub context_id: ContextId,
+    pub revision_id: RevisionId,
+    pub space_id: SpaceId,
+    pub kind: ContextKind,
+    pub status: ContextStatus,
+    pub title: String,
+    pub statement: String,
+    /// Only `applicability.conditions`; the inherited domain/platform dimensions stay in `full`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<String>,
+    pub evidence: Vec<CompactEvidenceView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relations: Vec<CompactContextRelation>,
+    /// Unresolved conflict sides are never dropped: hiding them would make a compact payload less
+    /// safe than the full one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<ConflictView>,
+    /// Locally derived lifecycle state, never dropped for the same reason conflicts are not.
+    #[serde(default, skip_serializing_if = "ContextDerivedState::is_empty")]
+    pub derived_state: ContextDerivedState,
+    /// Deduplicated `retrieval_paths[].source` names that produced this item, at most
+    /// [`COMPACT_RETRIEVAL_CHANNEL_LIMIT`] of them.
+    ///
+    /// The full explanation carries whole path payloads; the channel names alone are cheap and
+    /// still answer the only question a compact reader asks of them: which route found this.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retrieval_channels: Vec<String>,
+    pub why: Vec<String>,
 }
 
 /// Detail tier selected by the budgeter. Summary items retain identity, status, statement, match
@@ -632,7 +972,10 @@ pub struct ContextPackItem {
     pub space_id: SpaceId,
     pub context_id: ContextId,
     pub revision_id: RevisionId,
+    /// Context-owned display title derived from the immutable revision statement.
     pub title: String,
+    /// Title of the owning `ContextSpace` Intent head.
+    pub space_title: String,
     pub kind: ContextKind,
     pub status: ContextStatus,
     pub statement: String,
@@ -640,9 +983,15 @@ pub struct ContextPackItem {
     pub applicability: Applicability,
     pub evidence: Vec<EvidenceView>,
     pub conflicts: Vec<ConflictView>,
+    #[serde(default, skip_serializing_if = "ContextDerivedState::is_empty")]
+    pub derived_state: ContextDerivedState,
     pub auto_injection_eligible: bool,
     pub safety_source: ContextSafetySource,
     pub match_reason: MatchReason,
+    /// How earlier Tasks used this Context after it was injected into them. Empty whenever no
+    /// usage prior is attached, and never serialized in that case.
+    #[serde(default, skip_serializing_if = "ContextUsageCounts::is_empty")]
+    pub usage: ContextUsageCounts,
     pub detail: ContextPackDetail,
 }
 
@@ -660,11 +1009,57 @@ pub enum ContextSafetySource {
     },
 }
 
+/// How earlier Tasks used one Context after it was injected into them.
+///
+/// The counts are installation-local derived state: they come from the disposable Task Runtime,
+/// never from the Context Store, and they are absent whenever no usage source is attached.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContextUsageCounts {
+    /// Tasks whose Checkpoint restated this Context.
+    pub reused: u32,
+    /// Tasks that had it injected and checkpointed nothing resembling it.
+    pub ignored: u32,
+    /// Tasks that confirmed a Context contradicting it.
+    pub refuted: u32,
+}
+
+impl ContextUsageCounts {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.reused == 0 && self.ignored == 0 && self.refuted == 0
+    }
+}
+
+/// Optional prior that reports how earlier Tasks used the retrieved Contexts.
+///
+/// The knowledge index cannot answer this: injection outcomes live in installation-local Runtime
+/// state that is never projected from Git. The engine therefore takes the prior as an injected
+/// read-only boundary and behaves exactly as before when none is attached.
+pub trait UsagePriorSource: fmt::Debug + Send + Sync {
+    /// Returns the recorded counts of the requested Contexts. A Context with no recorded usage
+    /// may be absent from the map. Implementations degrade to an empty map instead of failing:
+    /// the prior is advisory and must never turn a retrieval into an error.
+    fn usage_counts(&self, context_ids: &[ContextId]) -> BTreeMap<ContextId, ContextUsageCounts>;
+}
+
+/// Score multiplier for a Context at least one earlier Task's Checkpoint restated.
+pub const USAGE_REUSED_BONUS_BASIS_POINTS: u16 = 11_500;
+
+/// Score multiplier for a Context repeatedly injected and never restated.
+pub const USAGE_IGNORED_PENALTY_BASIS_POINTS: u16 = 9_000;
+
+/// Tasks that must have ignored a Context before the ignore penalty applies.
+pub const USAGE_IGNORED_PENALTY_MINIMUM_TASKS: u32 = 3;
+
 /// Query boundary that always delegates reads to one [`sctx_index::QuerySnapshot`] transaction.
 #[derive(Clone, Debug)]
 pub struct SearchEngine {
     index: ProjectionIndex,
     engineering_graph: Option<EngineeringProjectionStore>,
+    context_ttl: ContextTtlSettings,
+    /// Installation-local prior on how earlier Tasks used each Context. `None` keeps ranking
+    /// identical to an installation that never recorded an injection.
+    usage_prior: Option<Arc<dyn UsagePriorSource>>,
 }
 
 impl SearchEngine {
@@ -673,7 +1068,34 @@ impl SearchEngine {
         Self {
             index,
             engineering_graph: None,
+            context_ttl: ContextTtlSettings {
+                validation_seconds: None,
+                progress_seconds: None,
+                now_unix_seconds: None,
+            },
+            usage_prior: None,
         }
+    }
+
+    /// Attaches the installation-local usage prior read from Task Runtime state.
+    ///
+    /// It only reweights an already fused Context Pack item; it never admits a Context the
+    /// safety and eligibility rules excluded, and it is applied after every demotion so a
+    /// conflicting or stale Context cannot be promoted back by past reuse.
+    #[must_use]
+    pub fn with_usage_prior(mut self, usage_prior: Arc<dyn UsagePriorSource>) -> Self {
+        self.usage_prior = Some(usage_prior);
+        self
+    }
+
+    /// Applies the explicit `[context_ttl]` policy read from `config.toml`.
+    ///
+    /// An expired Context becomes `historical`: it stays searchable and explainable and reports
+    /// why, but it is never injected automatically.
+    #[must_use]
+    pub const fn with_context_ttl(mut self, context_ttl: ContextTtlSettings) -> Self {
+        self.context_ttl = context_ttl;
+        self
     }
 
     /// Adds the optional local Engineering Graph projection used for exact
@@ -687,6 +1109,12 @@ impl SearchEngine {
         Self {
             index,
             engineering_graph: Some(engineering_graph),
+            context_ttl: ContextTtlSettings {
+                validation_seconds: None,
+                progress_seconds: None,
+                now_unix_seconds: None,
+            },
+            usage_prior: None,
         }
     }
 
@@ -797,6 +1225,48 @@ impl SearchEngine {
         ))
     }
 
+    /// Reads the immutable statements of the named Context revisions.
+    ///
+    /// This is the cheap read behind the injection/Claim comparison: it answers "what text did we
+    /// actually hand this Task" from the projection index alone, without reducing the Event log
+    /// into a full domain snapshot. Revisions the index no longer carries are absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage errors propagated by index synchronization and snapshot reads.
+    pub fn context_statements(
+        &self,
+        revisions: &[(ContextId, RevisionId)],
+    ) -> Result<BTreeMap<ContextId, String>> {
+        let requested = revisions.iter().copied().collect::<BTreeSet<_>>();
+        if requested.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let snapshot = self.index.query_snapshot(|connection| {
+            let mut statements = BTreeMap::new();
+            let mut statement = connection
+                .prepare(
+                    "SELECT statement FROM context_revision
+                     WHERE context_id = ?1 AND revision_id = ?2",
+                )
+                .map_err(sql_error("prepare Context statement read"))?;
+            for (context_id, revision_id) in &requested {
+                let text = statement
+                    .query_row(
+                        rusqlite::params![context_id.to_string(), revision_id.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(sql_error("read Context statement"))?;
+                if let Some(text) = text {
+                    statements.insert(*context_id, text);
+                }
+            }
+            Ok(statements)
+        })?;
+        Ok(snapshot.data)
+    }
+
     /// Builds an explainable Task-first Context Pack from one Context `QuerySnapshot` and, when
     /// available, one generation-stable historical Engineering projection. Its Context Tree is
     /// provenance only; build-time immutable revisions and safety remain authoritative until an
@@ -807,6 +1277,22 @@ impl SearchEngine {
     /// Returns an input error for an invalid Task, signals, budget, or candidate limit, and
     /// storage errors propagated by index synchronization and snapshot reads.
     pub fn task_context_pack(&self, request: &TaskContextRequest) -> Result<TaskContextPack> {
+        self.task_context_pack_with_detail(request, ContextPackDetailLevel::Full)
+    }
+
+    /// Builds the same Task-first Context Pack in one explicit payload shape.
+    ///
+    /// [`ContextPackDetailLevel::Compact`] budgets and returns only the inheritable fact fields,
+    /// so a small `token_budget` carries several Contexts instead of one explainable Context.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same input and storage errors as [`Self::task_context_pack`].
+    pub fn task_context_pack_with_detail(
+        &self,
+        request: &TaskContextRequest,
+        detail_level: ContextPackDetailLevel,
+    ) -> Result<TaskContextPack> {
         validate_task_context_request(request)?;
         let fingerprint = task_fingerprint(&request.working_intent, &request.task_signals)?;
         let query_tokens = association_query_tokens(&request.working_intent, &request.task_signals);
@@ -848,6 +1334,9 @@ impl SearchEngine {
                     &inference,
                     request.mode,
                     request.candidate_limit,
+                    detail_level,
+                    &self.context_ttl,
+                    self.usage_prior.as_deref(),
                 )?;
                 let graph_diagnostics = artifact_focus_diagnostics(
                     request.resolved_focus.as_ref(),
@@ -860,6 +1349,7 @@ impl SearchEngine {
                     graph_diagnostics,
                     omitted_spaces,
                     omitted_space_tokens,
+                    detail_level,
                 ))
             })?;
             let used_graph = graph_projection(graph_snapshot.as_ref());
@@ -878,9 +1368,13 @@ impl SearchEngine {
                 token_budget: request.token_budget,
                 estimated_tokens: snapshot.data.estimated_tokens,
                 mode: request.mode,
+                detail_level,
                 associations: snapshot.data.associations,
+                compact_associations: snapshot.data.compact_associations,
                 items: snapshot.data.items,
+                compact_items: snapshot.data.compact_items,
                 graph_diagnostics: snapshot.data.graph_diagnostics,
+                query_token_explanation: snapshot.data.query_token_explanation,
                 omitted: snapshot.data.omitted,
             });
         }
@@ -910,7 +1404,7 @@ impl SearchEngine {
         validate_search_request(request)?;
         let snapshot = self.index.query_snapshot(|connection| {
             let tree_oid = meta(connection, "indexed_tree_oid")?;
-            search_in_snapshot(connection, request, &tree_oid, false)
+            search_in_snapshot(connection, request, &tree_oid, false, &self.context_ttl)
         })?;
         Ok(response_from_page(snapshot.metadata, snapshot.data))
     }
@@ -936,7 +1430,8 @@ impl SearchEngine {
             let mut pages = Vec::new();
             let mut next_cursor = None;
             for _ in 0..maximum_pages {
-                let page = search_in_snapshot(connection, &request, &tree_oid, false)?;
+                let page =
+                    search_in_snapshot(connection, &request, &tree_oid, false, &self.context_ttl)?;
                 next_cursor.clone_from(&page.next_cursor);
                 pages.push(SearchPageResponse {
                     results: page.results,
@@ -1070,54 +1565,220 @@ fn association_query_phrases(
 
 const MAX_AUTOMATIC_QUERY_TOKENS: usize = 64;
 const AUTOMATIC_TEXT_COVERAGE_THRESHOLD_BASIS_POINTS: u16 = 6_000;
-const AUTOMATIC_HIGH_DF_MIN_DOCUMENTS: usize = 20;
-const AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS: usize = 3_000;
+/// How many plain query tokens one identifier-channel token is worth in the automatic coverage
+/// gate.
+///
+/// A Context spells the identifiers it names verbatim whatever language its prose is in, so an
+/// English question asked of a Chinese knowledge base can only ever land on that channel: two of
+/// its six or seven tokens match, coverage reads 30% and
+/// [`AUTOMATIC_TEXT_COVERAGE_THRESHOLD_BASIS_POINTS`] rejects an association that explicit search
+/// ranks first. Weighting those tokens says what the plain count cannot: naming the artifact is
+/// worth more than sharing prose.
+const AUTOMATIC_IDENTIFIER_TOKEN_COVERAGE_WEIGHT: usize = 3;
+/// Fewest identifier-channel tokens before the weighting applies. One shared word (`service`,
+/// `manager`) is vocabulary that happens to occur inside some identifier; two words of the same
+/// `identifier_split` group are the query naming that identifier.
+const AUTOMATIC_MIN_IDENTIFIER_QUERY_TOKENS: usize = 2;
+/// Smallest corpus that lets observed document frequency stand in for the built-in stop-word
+/// table. Below it the table is the only available fallback; at or above it the corpus decides,
+/// so real domain vocabulary such as `search` stays eligible.
+const AUTOMATIC_HIGH_DF_MIN_DOCUMENTS: usize = 5;
+/// Smallest corpus in which a high document frequency is evidence of a generic word rather than
+/// of a small fixture. Below it document frequency only orders tokens and never drops one.
+const AUTOMATIC_HIGH_DF_DROP_MIN_DOCUMENTS: usize = 20;
+const AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS: usize = 5_000;
+/// Number of rarest tokens that are never dropped for being merely frequent. It keeps a
+/// single-token or short intent intact, because dropping its only discriminating word retrieves
+/// nothing at all.
+const AUTOMATIC_MIN_RETAINED_QUERY_TOKENS: usize = 8;
+/// Document frequency at which a token selects essentially the whole corpus and therefore carries
+/// no retrieval signal at all. Such a token is dropped even inside the retained floor, because
+/// keeping it would turn a bare generic intent into an unbounded automatic injection.
+const AUTOMATIC_UNIVERSAL_DF_THRESHOLD_BASIS_POINTS: usize = 9_000;
 
+/// Deterministic query-token selection for automatic injection plus its explanation.
+struct AutomaticTokenSelection {
+    tokens: Vec<String>,
+    explanation: AutomaticQueryTokenExplanation,
+}
+
+/// Selects the query tokens used for automatic retrieval.
+///
+/// Document frequency always orders the tokens (rarest first, so the most discriminating survive
+/// truncation), but it only *drops* a token in a corpus large enough for frequency to mean
+/// "generic" instead of "this fixture is small", and never below
+/// [`AUTOMATIC_MIN_RETAINED_QUERY_TOKENS`] surviving tokens.
 fn automatic_eligible_query_tokens(
     connection: &Connection,
     tokens: &[String],
     mode: ContextPackMode,
-) -> Result<Vec<String>> {
+) -> Result<AutomaticTokenSelection> {
     if mode == ContextPackMode::Explicit {
-        return Ok(tokens.to_vec());
+        return Ok(AutomaticTokenSelection {
+            tokens: tokens.to_vec(),
+            explanation: AutomaticQueryTokenExplanation {
+                document_count: 0,
+                high_document_frequency_min_documents: AUTOMATIC_HIGH_DF_DROP_MIN_DOCUMENTS,
+                high_document_frequency_threshold_basis_points:
+                    AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS,
+                stop_word_fallback_active: false,
+                selected_tokens: tokens.to_vec(),
+                dropped_tokens: Vec::new(),
+            },
+        });
     }
-    let mut filtered = tokens
-        .iter()
-        .filter(|token| !automatic_generic_token(token))
-        .cloned()
-        .collect::<Vec<_>>();
-    filtered.sort_by(|left, right| {
-        right
-            .chars()
-            .count()
-            .cmp(&left.chars().count())
-            .then_with(|| left.cmp(right))
-    });
-    filtered.truncate(MAX_AUTOMATIC_QUERY_TOKENS);
-    filtered.sort();
     let document_count = automatic_text_document_count(connection)?;
-    if document_count < AUTOMATIC_HIGH_DF_MIN_DOCUMENTS {
-        return Ok(filtered);
-    }
-    let mut eligible = Vec::new();
-    for token in filtered {
-        let frequency = automatic_token_document_frequency(connection, &token)?;
-        if frequency.saturating_mul(BASIS_POINTS_SCALE)
-            < document_count.saturating_mul(AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS)
-        {
-            eligible.push(token);
+    let stop_word_fallback_active = document_count < AUTOMATIC_HIGH_DF_MIN_DOCUMENTS;
+    let mut dropped = Vec::new();
+
+    let mut candidates = Vec::new();
+    for token in tokens.iter().collect::<BTreeSet<_>>() {
+        if automatic_short_token(token) {
+            dropped.push(AutomaticQueryTokenDrop {
+                token: token.clone(),
+                filter: AutomaticQueryTokenFilter::ShortToken,
+                document_frequency: None,
+            });
+        } else {
+            candidates.push(token.clone());
         }
     }
-    Ok(eligible)
+
+    if stop_word_fallback_active {
+        let (kept, stop_words): (Vec<_>, Vec<_>) = candidates
+            .iter()
+            .cloned()
+            .partition(|token| !automatic_stop_word(token));
+        // An intent written entirely in generic words still has to retrieve something, so the
+        // fallback never empties the query.
+        if !kept.is_empty() {
+            dropped.extend(stop_words.into_iter().map(|token| AutomaticQueryTokenDrop {
+                token,
+                filter: AutomaticQueryTokenFilter::StopWordFallback,
+                document_frequency: None,
+            }));
+            candidates = kept;
+        }
+    }
+
+    // Rarest first: low document frequency is high IDF. Length and lexicographic order only break
+    // exact frequency ties so the selection stays deterministic.
+    let mut ranked = Vec::with_capacity(candidates.len());
+    for token in candidates {
+        let frequency = automatic_token_document_frequency(connection, &token)?;
+        ranked.push((frequency, token));
+    }
+    ranked.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| right.1.chars().count().cmp(&left.1.chars().count()))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+
+    if document_count >= AUTOMATIC_HIGH_DF_DROP_MIN_DOCUMENTS {
+        ranked = drop_high_document_frequency_tokens(ranked, document_count, &mut dropped);
+    }
+
+    for (frequency, token) in ranked.iter().skip(MAX_AUTOMATIC_QUERY_TOKENS) {
+        dropped.push(AutomaticQueryTokenDrop {
+            token: token.clone(),
+            filter: AutomaticQueryTokenFilter::TokenBudget,
+            document_frequency: Some(*frequency),
+        });
+    }
+    ranked.truncate(MAX_AUTOMATIC_QUERY_TOKENS);
+    let mut eligible = ranked
+        .into_iter()
+        .map(|(_, token)| token)
+        .collect::<Vec<_>>();
+    eligible.sort();
+    dropped.sort_by(|left, right| left.token.cmp(&right.token));
+    Ok(AutomaticTokenSelection {
+        explanation: AutomaticQueryTokenExplanation {
+            document_count,
+            high_document_frequency_min_documents: AUTOMATIC_HIGH_DF_DROP_MIN_DOCUMENTS,
+            high_document_frequency_threshold_basis_points:
+                AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS,
+            stop_word_fallback_active,
+            selected_tokens: eligible.clone(),
+            dropped_tokens: dropped,
+        },
+        tokens: eligible,
+    })
 }
 
-fn automatic_generic_token(token: &str) -> bool {
-    let short = if token.is_ascii() {
+/// Removes the tokens whose document frequency makes them useless discriminators. `ranked` is
+/// ordered rarest first, so the retained floor is simply its prefix: a frequent token survives
+/// while the query is short, unless it is present in nearly every document and would therefore
+/// select the whole corpus.
+fn drop_high_document_frequency_tokens(
+    ranked: Vec<(usize, String)>,
+    document_count: usize,
+    dropped: &mut Vec<AutomaticQueryTokenDrop>,
+) -> Vec<(usize, String)> {
+    let minimum_frequency = document_count.saturating_mul(AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS);
+    let universal_frequency =
+        document_count.saturating_mul(AUTOMATIC_UNIVERSAL_DF_THRESHOLD_BASIS_POINTS);
+    let mut retained = Vec::with_capacity(ranked.len());
+    for (position, (frequency, token)) in ranked.into_iter().enumerate() {
+        let scaled = frequency.saturating_mul(BASIS_POINTS_SCALE);
+        let frequent =
+            position >= AUTOMATIC_MIN_RETAINED_QUERY_TOKENS && scaled >= minimum_frequency;
+        if frequent || scaled >= universal_frequency {
+            dropped.push(AutomaticQueryTokenDrop {
+                token,
+                filter: AutomaticQueryTokenFilter::HighDocumentFrequency,
+                document_frequency: Some(frequency),
+            });
+        } else {
+            retained.push((frequency, token));
+        }
+    }
+    retained
+}
+
+/// Structural noise that never carries retrievable meaning, independent of corpus size.
+fn automatic_short_token(token: &str) -> bool {
+    if token.is_ascii() {
         token.len() < 3
     } else {
         token.chars().count() < 2
-    };
-    short
+    }
+}
+
+/// Built-in stop-word fallback. It only applies while the corpus is too small for document
+/// frequency to discriminate, and never empties a query. It deliberately excludes words such as
+/// `search` that are genuine domain vocabulary in this repository; only observed frequency in a
+/// large enough corpus may drop those.
+fn automatic_stop_word(token: &str) -> bool {
+    matches!(
+        token,
+        "代码"
+            | "分支"
+            | "文件"
+            | "功能"
+            | "问题"
+            | "修改"
+            | "当前"
+            | "实现"
+            | "方法"
+            | "逻辑"
+            | "相关"
+            | "需要"
+            | "是否"
+            | "进行"
+            | "android"
+            | "app"
+            | "branch"
+            | "change"
+            | "ios"
+            | "review"
+            | "tiktok"
+    ) || automatic_generic_token(token)
+}
+
+fn automatic_generic_token(token: &str) -> bool {
+    automatic_short_token(token)
         || matches!(
             token,
             "a" | "an"
@@ -1295,7 +1956,10 @@ fn query_space_intent_candidates(
     query_tokens: &[String],
     query_phrases: &[String],
 ) -> Result<Vec<SpaceIntentCandidate>> {
-    let Some(match_expression) = fts_or_match_expression(query_tokens) else {
+    // Automatic retrieval is always the ranked, recall-oriented mode, so it always expands.
+    let alias = AliasExpansion::load(connection, query_tokens)?;
+    let Some(match_expression) = fts_or_match_expression(&alias.expanded_tokens(query_tokens))
+    else {
         return Ok(Vec::new());
     };
     let mut statement = connection
@@ -1323,6 +1987,7 @@ fn query_space_intent_candidates(
                 &row.map_err(sql_error("collect Space Intent candidate row"))?,
                 query_tokens,
                 query_phrases,
+                &alias,
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1405,6 +2070,7 @@ fn parse_intent_fts_match(
     row: &StoredIntentFtsMatch,
     query_tokens: &[String],
     query_phrases: &[String],
+    alias: &AliasExpansion,
 ) -> Result<RawIntentHeadMatch> {
     let field_names = [
         SpaceIntentField::Title,
@@ -1417,7 +2083,7 @@ fn parse_intent_fts_match(
     ];
     let fields: [(SpaceIntentField, &str); 7] =
         std::array::from_fn(|index| (field_names[index], row.fields[index].as_str()));
-    let field_matches = explain_intent_match(query_tokens, fields);
+    let field_matches = explain_intent_match(query_tokens, alias, fields);
     let positive_fields = [
         row.fields[0].as_str(),
         row.fields[1].as_str(),
@@ -1463,6 +2129,7 @@ fn load_intent_head_ids(connection: &Connection, space_id: SpaceId) -> Result<Ve
 
 fn explain_intent_match<const N: usize>(
     query_tokens: &[String],
+    alias: &AliasExpansion,
     fields: [(SpaceIntentField, &str); N],
 ) -> Vec<SpaceIntentFieldMatch> {
     let wanted = query_tokens.iter().cloned().collect::<BTreeSet<_>>();
@@ -1470,10 +2137,12 @@ fn explain_intent_match<const N: usize>(
         .into_iter()
         .filter_map(|(field, text)| {
             let available = search_tokens(text).into_iter().collect::<BTreeSet<_>>();
-            let matched_tokens = wanted.intersection(&available).cloned().collect::<Vec<_>>();
-            (!matched_tokens.is_empty()).then_some(SpaceIntentFieldMatch {
+            // An alias hit is reported as its origin query token, so Intent field coverage keeps
+            // the original denominator.
+            let (matched, _aliases) = alias.resolve(&wanted, &available);
+            (!matched.is_empty()).then_some(SpaceIntentFieldMatch {
                 field,
-                matched_tokens,
+                matched_tokens: matched.into_iter().collect(),
             })
         })
         .collect()
@@ -1482,28 +2151,97 @@ fn explain_intent_match<const N: usize>(
 #[derive(Debug, Default)]
 struct ScopeTargets {
     domains: BTreeSet<String>,
+    /// Alias spellings of [`ScopeTargets::domains`]; empty until `with_domain_aliases` runs.
+    domain_aliases: BTreeSet<String>,
     platforms: BTreeSet<String>,
+    /// Normalized tokens of the Task goal and in-scope items, not whole constraint strings.
     conditions: BTreeSet<String>,
 }
 
 impl ScopeTargets {
     fn from_intent(intent: &WorkingIntentSnapshot) -> Self {
+        // `condition` compares tokens, not whole strings: a Context condition is a phrase written
+        // by whoever recorded the fact, while the Task states the same situation as its goal and
+        // in-scope items. Comparing the Task's constraints as whole strings almost never matched.
+        let mut conditions = search_tokens(&intent.goal)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        for entry in &intent.in_scope {
+            conditions.extend(search_tokens(entry));
+        }
         Self {
             domains: normalized_values(&intent.domains),
+            domain_aliases: BTreeSet::new(),
             platforms: normalized_values(&intent.platforms),
-            conditions: normalized_values(&intent.constraints),
+            conditions,
         }
     }
 
+    /// Adds the `token_alias` expansions of the Task's domains, so a Context recorded under one
+    /// spelling of a domain still matches a Task that names another spelling of the same group.
+    fn with_domain_aliases(&self, connection: &Connection) -> Result<Self> {
+        let domain_tokens = self
+            .domains
+            .iter()
+            .flat_map(|domain| search_tokens(domain))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let alias = AliasExpansion::load(connection, &domain_tokens)?;
+        let mut domain_aliases = BTreeSet::new();
+        if !alias.is_empty() {
+            for domain in &self.domains {
+                let tokens = search_tokens(domain);
+                for expanded in expanded_value_spellings(&alias, &tokens) {
+                    if !self.domains.contains(&expanded) {
+                        domain_aliases.insert(expanded);
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            domains: self.domains.clone(),
+            domain_aliases,
+            platforms: self.platforms.clone(),
+            conditions: self.conditions.clone(),
+        })
+    }
+
     fn matches(&self, dimension: &str, value: &str) -> bool {
-        let value = normalize_search_text(value);
         match dimension {
-            "domain" => self.domains.contains(&value),
-            "platform" => self.platforms.contains(&value),
-            "condition" => self.conditions.contains(&value),
+            "domain" => {
+                let normalized = normalize_search_text(value);
+                self.domains.contains(&normalized) || self.domain_aliases.contains(&normalized)
+            }
+            "platform" => self.platforms.contains(&normalize_search_text(value)),
+            // Every token of the Context condition must be stated by the Task, so a condition
+            // matches only when the Task already describes that situation.
+            "condition" => {
+                let tokens = search_tokens(value);
+                !tokens.is_empty() && tokens.iter().all(|token| self.conditions.contains(token))
+            }
             _ => false,
         }
     }
+}
+
+/// Every one-token substitution of `tokens` through `alias`, joined back into a normalized value.
+///
+/// Only one token is substituted at a time: the point is to accept another spelling of the same
+/// domain, not to enumerate the cross product of every alias group in the value.
+fn expanded_value_spellings(alias: &AliasExpansion, tokens: &[String]) -> BTreeSet<String> {
+    let mut spellings = BTreeSet::new();
+    for (index, token) in tokens.iter().enumerate() {
+        for replacement in alias.token_group(token) {
+            if replacement == *token {
+                continue;
+            }
+            let mut candidate = tokens.to_vec();
+            candidate[index] = replacement;
+            spellings.insert(candidate.join(" "));
+        }
+    }
+    spellings
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1517,6 +2255,10 @@ struct AcceptedContextEvidence {
     textual_match: bool,
     matched_fields: BTreeSet<MatchField>,
     matched_tokens: BTreeSet<String>,
+    /// Subset of `matched_tokens` that names part of a code identifier this Tree indexes; see
+    /// [`AliasExpansion::identifier_tokens`].
+    identifier_matched_tokens: BTreeSet<String>,
+    alias_matches: BTreeSet<AliasMatch>,
     bm25: Option<f64>,
     phrase_match: bool,
     matched_artifacts: BTreeSet<String>,
@@ -1601,6 +2343,7 @@ struct MatchedContextSpace {
 const SAFE_ACCEPTED_CONTEXT_PREDICATE: &str = "item.governance_status = 'accepted'
      AND item.accepted_revision_id = revision.revision_id
      AND item.auto_injection_eligible = 1
+     AND item.superseded_by IS NULL
      AND revision.lifecycle = 'accepted'
      AND revision.evidence_completeness = 1000
      AND EXISTS (
@@ -1627,6 +2370,8 @@ struct AssociationEvidence {
     matched_contexts: BTreeSet<ContextId>,
     textual_contexts: BTreeSet<ContextId>,
     context_tokens: BTreeSet<String>,
+    /// Subset of `context_tokens` that names part of a code identifier this Tree indexes.
+    context_identifier_tokens: BTreeSet<String>,
     context_fields: BTreeSet<MatchField>,
     context_bm25: Option<f64>,
     context_phrase_match: bool,
@@ -1652,6 +2397,7 @@ struct TaskAssociationInference {
     graph_artifact_generation: Option<String>,
     focus_reachable: bool,
     query_tokens: Vec<String>,
+    query_token_explanation: AutomaticQueryTokenExplanation,
 }
 
 fn normalized_values(values: &[String]) -> BTreeSet<String> {
@@ -1675,16 +2421,19 @@ fn infer_task_space_associations(
     focus_text_fallback_enabled: bool,
     mode: ContextPackMode,
 ) -> Result<TaskAssociationInference> {
-    let query_tokens = automatic_eligible_query_tokens(connection, query_tokens, mode)?;
+    let selection = automatic_eligible_query_tokens(connection, query_tokens, mode)?;
+    let mut token_explanation = selection.explanation;
+    let query_tokens = selection.tokens;
     let query_phrases = eligible_query_phrases(query_phrases, &query_tokens);
     let hint_queries = hint_queries
         .iter()
         .map(|query| {
-            let tokens = automatic_eligible_query_tokens(connection, &query.tokens, mode)?;
+            let selection = automatic_eligible_query_tokens(connection, &query.tokens, mode)?;
+            merge_token_explanations(&mut token_explanation, selection.explanation);
             Ok(WorkingIntentHintQuery {
                 source_field: query.source_field,
-                phrases: eligible_query_phrases(&query.phrases, &tokens),
-                tokens,
+                phrases: eligible_query_phrases(&query.phrases, &selection.tokens),
+                tokens: selection.tokens,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1696,6 +2445,7 @@ fn infer_task_space_associations(
     let mut evidence = BTreeMap::<SpaceId, AssociationEvidence>::new();
     apply_intent_evidence(&mut evidence, intent_candidates);
     apply_working_intent_hint_evidence(connection, &hint_queries, &mut evidence, &mut contexts)?;
+    retain_only_negative_intent_tokens(&mut evidence);
     if focus_text_fallback_enabled {
         if let Some(resolved_focus) = resolved_focus {
             query_resolved_focus_text_fallback(connection, resolved_focus, &mut contexts)?;
@@ -1732,7 +2482,14 @@ fn infer_task_space_associations(
     let mut associations = evidence
         .iter()
         .filter_map(|(space_id, evidence)| {
-            association(task_id, *space_id, evidence, &query_tokens, mode)
+            association(
+                task_id,
+                *space_id,
+                evidence,
+                &query_tokens,
+                mode,
+                &token_explanation,
+            )
         })
         .collect::<Vec<_>>();
     associations.sort_by(|left, right| {
@@ -1752,6 +2509,7 @@ fn infer_task_space_associations(
         graph_artifact_generation: engineering_graph.map(|graph| graph.artifact_generation.clone()),
         focus_reachable,
         query_tokens,
+        query_token_explanation: token_explanation,
     })
 }
 
@@ -1848,6 +2606,9 @@ fn aggregate_context_evidence(
         aggregate
             .context_tokens
             .extend(context.matched_tokens.iter().cloned());
+        aggregate
+            .context_identifier_tokens
+            .extend(context.identifier_matched_tokens.iter().cloned());
         if let Some(bm25) = context.bm25 {
             aggregate.context_bm25 = Some(
                 aggregate
@@ -1973,6 +2734,27 @@ fn apply_intent_evidence(
     }
 }
 
+/// Keeps only the query tokens that are exclusively negative for one Space. A token that also
+/// matched any positive Intent field of the same Space (`title`, `problem`, `desired_outcome`,
+/// `in_scope`, `acceptance_conditions`, `domain_terms`) is shared vocabulary, not an exclusion,
+/// so it must not raise a scope conflict or reduce the association score.
+fn retain_only_negative_intent_tokens(evidence: &mut BTreeMap<SpaceId, AssociationEvidence>) {
+    for aggregate in evidence.values_mut() {
+        if aggregate.excluded_intent_tokens.is_empty() {
+            continue;
+        }
+        let mut positive = aggregate.intent_tokens.clone();
+        for (channel, hint) in &aggregate.hint_text {
+            if channel.target == WorkingIntentHintTarget::SpaceIntentFts {
+                positive.extend(hint.matched_tokens.iter().cloned());
+            }
+        }
+        aggregate
+            .excluded_intent_tokens
+            .retain(|token| !positive.contains(token));
+    }
+}
+
 fn apply_working_intent_hint_evidence(
     connection: &Connection,
     queries: &[WorkingIntentHintQuery],
@@ -2078,12 +2860,12 @@ const fn intent_field_weight(field: SpaceIntentField) -> u16 {
     }
 }
 
+/// Mirrors [`CONTEXT_FTS_BM25_WEIGHTS`] for the fusion feature that ranks by which fields matched.
 const fn context_field_weight(field: MatchField) -> u16 {
     match field {
-        MatchField::Title => 10,
-        MatchField::Statement => 8,
+        MatchField::Title | MatchField::Statement | MatchField::ProblemView => 8,
         MatchField::Rationale => 4,
-        MatchField::Evidence => 2,
+        MatchField::Evidence | MatchField::HintText => 2,
     }
 }
 
@@ -2598,15 +3380,19 @@ fn query_accepted_context_text(
     query_phrases: &[String],
     evidence: &mut BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>,
 ) -> Result<()> {
-    let Some(match_expression) = fts_or_match_expression(query_tokens) else {
+    // Automatic retrieval is always the ranked, recall-oriented mode, so it always expands.
+    let alias = &AliasExpansion::load(connection, query_tokens)?;
+    let Some(match_expression) = fts_or_match_expression(&alias.expanded_tokens(query_tokens))
+    else {
         return Ok(());
     };
     let mut statement = connection
         .prepare(&format!(
             "SELECT revision.space_id, revision.context_id,
-                    bm25(context_fts, 0.0, 0.0, 10.0, 8.0, 4.0, 2.0),
+                    bm25(context_fts, {CONTEXT_FTS_BM25_WEIGHTS}),
                     context_fts.title, context_fts.statement,
-                    context_fts.rationale, context_fts.evidence
+                    context_fts.rationale, context_fts.evidence,
+                    context_fts.problem_view, context_fts.hint_text
              FROM context_fts
              JOIN context_revision AS revision USING(revision_id)
              JOIN context_item AS item USING(context_id)
@@ -2626,6 +3412,8 @@ fn query_accepted_context_text(
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
                 ],
             ))
         })
@@ -2633,13 +3421,21 @@ fn query_accepted_context_text(
     for row in rows {
         let (space_id, context_id, bm25, fields) =
             row.map_err(sql_error("collect accepted Context association text"))?;
-        let (matched_fields, matched_tokens) = explain_context_text_match(query_tokens, &fields);
+        let (matched_fields, matched_tokens, alias_matches) =
+            explain_context_text_match(query_tokens, alias, &fields);
         let entry = evidence
             .entry((parse_id(&space_id)?, parse_id(&context_id)?))
             .or_default();
         entry.textual_match = true;
         entry.matched_fields.extend(matched_fields);
+        entry.identifier_matched_tokens.extend(
+            matched_tokens
+                .iter()
+                .filter(|token| alias.identifier_tokens().contains(*token))
+                .cloned(),
+        );
         entry.matched_tokens.extend(matched_tokens);
+        entry.alias_matches.extend(alias_matches);
         entry.phrase_match |= contains_any_phrase(&fields, query_phrases);
         entry.bm25 = Some(entry.bm25.map_or(bm25, |current| current.min(bm25)));
     }
@@ -2664,9 +3460,10 @@ fn query_resolved_focus_text_fallback(
     let mut statement = connection
         .prepare(&format!(
             "SELECT revision.space_id, revision.context_id,
-                    bm25(context_fts, 0.0, 0.0, 10.0, 8.0, 4.0, 2.0),
+                    bm25(context_fts, {CONTEXT_FTS_BM25_WEIGHTS}),
                     context_fts.title, context_fts.statement,
-                    context_fts.rationale, context_fts.evidence
+                    context_fts.rationale, context_fts.evidence,
+                    context_fts.problem_view, context_fts.hint_text
              FROM context_fts
              JOIN context_revision AS revision USING(revision_id)
              JOIN context_item AS item USING(context_id)
@@ -2686,16 +3483,13 @@ fn query_resolved_focus_text_fallback(
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
                 ],
             ))
         })
         .map_err(sql_error("query Resolved Focus text fallback"))?;
-    let field_names = [
-        MatchField::Title,
-        MatchField::Statement,
-        MatchField::Rationale,
-        MatchField::Evidence,
-    ];
+    let field_names = CONTEXT_FTS_TEXT_FIELDS;
     for row in rows {
         let (space_id, context_id, bm25, fields) =
             row.map_err(sql_error("collect Resolved Focus text fallback"))?;
@@ -2746,40 +3540,52 @@ fn strict_text_component_match(field: &str, component: &str) -> bool {
     component != "  " && field.contains(&component)
 }
 
+/// Column order of [`CONTEXT_FTS_TEXT_FIELDS`]' owning query, mapped onto explainable names.
+const CONTEXT_FTS_TEXT_FIELDS: [MatchField; 6] = [
+    MatchField::Title,
+    MatchField::Statement,
+    MatchField::Rationale,
+    MatchField::Evidence,
+    MatchField::ProblemView,
+    MatchField::HintText,
+];
+
 fn explain_context_text_match(
     query_tokens: &[String],
-    fields: &[String; 4],
-) -> (Vec<MatchField>, Vec<String>) {
-    let names = [
-        MatchField::Title,
-        MatchField::Statement,
-        MatchField::Rationale,
-        MatchField::Evidence,
-    ];
-    let named_fields: [(MatchField, &str); 4] =
-        std::array::from_fn(|index| (names[index], fields[index].as_str()));
-    explain_token_fields(query_tokens, named_fields)
+    alias: &AliasExpansion,
+    fields: &[String; 6],
+) -> (Vec<MatchField>, Vec<String>, Vec<AliasMatch>) {
+    let named_fields: [(MatchField, &str); 6] =
+        std::array::from_fn(|index| (CONTEXT_FTS_TEXT_FIELDS[index], fields[index].as_str()));
+    explain_token_fields(query_tokens, alias, named_fields)
 }
 
 fn explain_token_fields<T, const N: usize>(
     query_tokens: &[String],
+    alias: &AliasExpansion,
     fields: [(T, &str); N],
-) -> (Vec<T>, Vec<String>)
+) -> (Vec<T>, Vec<String>, Vec<AliasMatch>)
 where
     T: Copy,
 {
     let wanted = query_tokens.iter().cloned().collect::<BTreeSet<_>>();
     let mut matched_fields = Vec::new();
     let mut matched_tokens = BTreeSet::new();
+    let mut alias_matches = BTreeSet::new();
     for (field, text) in fields {
         let available = search_tokens(text).into_iter().collect::<BTreeSet<_>>();
-        let intersection = wanted.intersection(&available).cloned().collect::<Vec<_>>();
-        if !intersection.is_empty() {
+        let (matched, aliases) = alias.resolve(&wanted, &available);
+        if !matched.is_empty() {
             matched_fields.push(field);
-            matched_tokens.extend(intersection);
+            matched_tokens.extend(matched);
+            alias_matches.extend(aliases);
         }
     }
-    (matched_fields, matched_tokens.into_iter().collect())
+    (
+        matched_fields,
+        matched_tokens.into_iter().collect(),
+        alias_matches.into_iter().collect(),
+    )
 }
 
 fn query_accepted_context_scope(
@@ -2787,6 +3593,7 @@ fn query_accepted_context_scope(
     targets: &ScopeTargets,
     evidence: &mut BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>,
 ) -> Result<()> {
+    let targets = targets.with_domain_aliases(connection)?;
     let mut statement = connection
         .prepare(&format!(
             "SELECT revision.space_id, revision.context_id, scope.dimension, scope.value
@@ -3249,6 +4056,42 @@ fn token_coverage_basis_points(matched: &BTreeSet<String>, query_tokens: &[Strin
     .expect("coverage basis points fit u16")
 }
 
+/// Query token coverage in which every matched identifier-channel token counts
+/// [`AUTOMATIC_IDENTIFIER_TOKEN_COVERAGE_WEIGHT`] times over, capped at full coverage.
+///
+/// Falls back to the plain coverage until the query names at least
+/// [`AUTOMATIC_MIN_IDENTIFIER_QUERY_TOKENS`] identifier tokens, so a single incidental word never
+/// buys a Context past the automatic gate.
+fn identifier_weighted_coverage_basis_points(
+    matched: &BTreeSet<String>,
+    identifier_matched: &BTreeSet<String>,
+    query_tokens: &[String],
+) -> u16 {
+    let plain = token_coverage_basis_points(matched, query_tokens);
+    if query_tokens.is_empty() {
+        return plain;
+    }
+    let query = query_tokens.iter().collect::<BTreeSet<_>>();
+    let matched_count = matched.iter().filter(|token| query.contains(token)).count();
+    let identifier_count = identifier_matched
+        .iter()
+        .filter(|token| query.contains(token) && matched.contains(*token))
+        .count();
+    if identifier_count < AUTOMATIC_MIN_IDENTIFIER_QUERY_TOKENS {
+        return plain;
+    }
+    let weighted = matched_count
+        + identifier_count.saturating_mul(AUTOMATIC_IDENTIFIER_TOKEN_COVERAGE_WEIGHT - 1);
+    let basis_points = weighted
+        .saturating_mul(BASIS_POINTS_SCALE)
+        .checked_div(query.len())
+        .unwrap_or(0)
+        .min(BASIS_POINTS_SCALE);
+    u16::try_from(basis_points)
+        .expect("coverage basis points fit u16")
+        .max(plain)
+}
+
 #[allow(clippy::cast_possible_truncation)]
 fn scale_bm25(value: f64) -> i64 {
     (value * 1_000_000.0).round() as i64
@@ -3258,12 +4101,39 @@ fn scale_idf_bm25_contribution(value: f64) -> u32 {
     u32::try_from(scale_bm25(value).saturating_neg()).unwrap_or(u32::MAX)
 }
 
+fn merge_token_explanations(
+    target: &mut AutomaticQueryTokenExplanation,
+    source: AutomaticQueryTokenExplanation,
+) {
+    target.document_count = target.document_count.max(source.document_count);
+    target.stop_word_fallback_active |= source.stop_word_fallback_active;
+    let mut selected = target
+        .selected_tokens
+        .iter()
+        .cloned()
+        .chain(source.selected_tokens)
+        .collect::<BTreeSet<_>>();
+    target.dropped_tokens.extend(source.dropped_tokens);
+    target.dropped_tokens.sort_by(|left, right| {
+        left.token
+            .cmp(&right.token)
+            .then(left.filter.cmp(&right.filter))
+    });
+    target.dropped_tokens.dedup();
+    // A token selected by any channel is never reported as dropped.
+    target
+        .dropped_tokens
+        .retain(|drop| !selected.contains(&drop.token));
+    target.selected_tokens = std::mem::take(&mut selected).into_iter().collect();
+}
+
 fn association(
     task_id: TaskId,
     space_id: SpaceId,
     evidence: &AssociationEvidence,
     query_tokens: &[String],
     mode: ContextPackMode,
+    token_explanation: &AutomaticQueryTokenExplanation,
 ) -> Option<TaskSpaceAssociation> {
     if !evidence.intent_matched
         && evidence.hint_text.is_empty()
@@ -3282,7 +4152,13 @@ fn association(
         return None;
     }
     let score = association_score(evidence);
-    let reasons = association_reasons(evidence);
+    let mut reasons = association_reasons(evidence);
+    if !token_explanation.dropped_tokens.is_empty() {
+        reasons.push(
+            serde_json::to_string(token_explanation)
+                .expect("automatic query token explanation is always serializable"),
+        );
+    }
     Some(TaskSpaceAssociation {
         task_id,
         space_id,
@@ -3307,8 +4183,9 @@ fn automatic_space_text_eligible(evidence: &AssociationEvidence, query_tokens: &
         return true;
     }
     let coverage = token_coverage_basis_points(&evidence.intent_tokens, query_tokens)
-        .max(token_coverage_basis_points(
+        .max(identifier_weighted_coverage_basis_points(
             &evidence.context_tokens,
+            &evidence.context_identifier_tokens,
             query_tokens,
         ))
         .max(
@@ -3345,6 +4222,113 @@ fn final_score_basis_points(evidence: &AssociationEvidence) -> u16 {
             / BASIS_POINTS_SCALE;
     }
     u16::try_from(points).expect("association score basis points fit u16")
+}
+
+/// Reweights fused item scores by how earlier Tasks used each Context.
+///
+/// The prior runs after every demotion, so it reorders equally ranked Contexts without ever
+/// undoing a conflict, stale, or historical demotion decision. Without a source, nothing is read
+/// and no score changes.
+fn apply_usage_prior(
+    candidates: &mut [TaskContextCandidate],
+    usage_prior: Option<&dyn UsagePriorSource>,
+) {
+    let Some(source) = usage_prior else {
+        return;
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    let context_ids = candidates
+        .iter()
+        .map(|candidate| candidate.item.context.context_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let counts = source.usage_counts(&context_ids);
+    for candidate in candidates {
+        let Some(usage) = counts.get(&candidate.item.context.context_id).copied() else {
+            continue;
+        };
+        if usage.is_empty() {
+            continue;
+        }
+        candidate.item.context.usage = usage;
+        candidate.injection_score_basis_points = usage_prior_score(
+            candidate.injection_score_basis_points,
+            usage_multiplier_basis_points(usage),
+        );
+    }
+}
+
+/// Multiplier applied to one fused item score, in basis points.
+///
+/// A refuted Context is not demoted here: an open semantic conflict is already the stronger and
+/// explainable signal, and demoting twice for the same fact would double-count it.
+const fn usage_multiplier_basis_points(usage: ContextUsageCounts) -> u16 {
+    if usage.reused >= 1 {
+        return USAGE_REUSED_BONUS_BASIS_POINTS;
+    }
+    if usage.ignored >= USAGE_IGNORED_PENALTY_MINIMUM_TASKS {
+        return USAGE_IGNORED_PENALTY_BASIS_POINTS;
+    }
+    BASIS_POINTS
+}
+
+const BASIS_POINTS: u16 = 10_000;
+
+fn usage_prior_score(injection_score_basis_points: u16, multiplier_basis_points: u16) -> u16 {
+    if multiplier_basis_points == BASIS_POINTS {
+        return injection_score_basis_points;
+    }
+    u16::try_from(
+        usize::from(injection_score_basis_points)
+            .saturating_mul(usize::from(multiplier_basis_points))
+            / BASIS_POINTS_SCALE,
+    )
+    .unwrap_or(u16::MAX)
+}
+
+/// Demotes one already fused item score for state the Space association cannot see.
+///
+/// The Space's fused RRF score is the base: items in one Space start equal, so a demoted item
+/// sorts behind its undemoted siblings without inventing a second ranking signal. Demotions
+/// compose multiplicatively and are reported on the item that carries them.
+fn demoted_item_score(
+    fused_score_basis_points: u16,
+    conflicts: &[ConflictView],
+    derived_state: &ContextDerivedState,
+) -> u16 {
+    let multiplier = usize::from(item_demotion_basis_points(conflicts, derived_state));
+    u16::try_from(
+        usize::from(fused_score_basis_points).saturating_mul(multiplier) / BASIS_POINTS_SCALE,
+    )
+    .unwrap_or(u16::MAX)
+}
+
+/// Product of every per-item ranking multiplier, in basis points; `BASIS_POINTS_SCALE` is none.
+fn item_demotion_basis_points(
+    conflicts: &[ConflictView],
+    derived_state: &ContextDerivedState,
+) -> u16 {
+    let mut points = BASIS_POINTS_SCALE;
+    if has_unresolved_semantic_conflict(conflicts) {
+        points = points * usize::from(CONFLICT_SCORE_MULTIPLIER_BASIS_POINTS) / BASIS_POINTS_SCALE;
+    }
+    if derived_state.stale_reason.is_some() {
+        points = points * usize::from(STALE_SCORE_MULTIPLIER_BASIS_POINTS) / BASIS_POINTS_SCALE;
+    }
+    u16::try_from(points).unwrap_or(u16::MAX)
+}
+
+/// Whether any expanded conflict side is an open *semantic* conflict.
+///
+/// Governance conflicts are a different fact: they mean the Context has several publication heads,
+/// which stays a hard automatic-injection blocker rather than a ranking demotion.
+fn has_unresolved_semantic_conflict(conflicts: &[ConflictView]) -> bool {
+    conflicts
+        .iter()
+        .any(|conflict| conflict.kind == "semantic" && conflict.status == "open")
 }
 
 fn has_intent_scope_conflict(evidence: &AssociationEvidence) -> bool {
@@ -3420,6 +4404,19 @@ fn association_reasons(evidence: &AssociationEvidence) -> Vec<String> {
             evidence.textual_contexts.len()
         ));
     }
+    if evidence.context_identifier_tokens.len() >= AUTOMATIC_MIN_IDENTIFIER_QUERY_TOKENS {
+        reasons.push(format!(
+            "Identifier coverage: Task text named code identifier token(s) {} that the Context \
+             spells verbatim, each counted {AUTOMATIC_IDENTIFIER_TOKEN_COVERAGE_WEIGHT} times \
+             over in the automatic text-coverage gate",
+            evidence
+                .context_identifier_tokens
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     if !evidence.hint_text.is_empty() {
         reasons.push(format!(
             "Working Intent Hint text matched {} positive FTS channel(s)",
@@ -3456,22 +4453,34 @@ fn association_reasons(evidence: &AssociationEvidence) -> Vec<String> {
 #[derive(Debug)]
 struct TaskContextCandidate {
     association_rank: usize,
+    /// The matched Space's fused RRF score after every per-item demotion (unresolved semantic
+    /// conflict, structured `recheck_when` staleness). Items inside one Space share a base score,
+    /// so this only reorders demoted items behind their undemoted siblings.
+    injection_score_basis_points: u16,
     direct_path_count: usize,
     item: TaskContextItem,
+    /// Compact projection of `item`, materialized only for
+    /// [`ContextPackDetailLevel::Compact`] so the budgeter charges the emitted representation.
+    compact: Option<CompactTaskContextItem>,
 }
 
 #[derive(Debug)]
 struct LoadedTaskContexts {
     candidates: Vec<TaskContextCandidate>,
     omitted: Vec<ContextPackOmitted>,
+    /// Title and provisional flag of every associated Space, for the compact payload.
+    space_headers: BTreeMap<SpaceId, SpaceHeader>,
 }
 
 #[derive(Debug)]
 struct PackedTaskContexts {
     estimated_tokens: usize,
     associations: Vec<TaskSpaceAssociation>,
+    compact_associations: Vec<CompactSpaceAssociation>,
     items: Vec<TaskContextItem>,
+    compact_items: Vec<CompactTaskContextItem>,
     graph_diagnostics: Vec<TaskGraphDiagnostic>,
+    query_token_explanation: Option<AutomaticQueryTokenExplanation>,
     omitted: Vec<ContextPackOmitted>,
 }
 
@@ -3558,19 +4567,30 @@ fn load_task_context_candidates(
     inference: &TaskAssociationInference,
     mode: ContextPackMode,
     candidate_limit: usize,
+    detail_level: ContextPackDetailLevel,
+    context_ttl: &ContextTtlSettings,
+    usage_prior: Option<&dyn UsagePriorSource>,
 ) -> Result<LoadedTaskContexts> {
     if inference.associations.is_empty() {
         return Ok(LoadedTaskContexts {
             candidates: Vec::new(),
             omitted: Vec::new(),
+            space_headers: BTreeMap::new(),
         });
     }
-    let association_rank = inference
-        .associations
-        .iter()
-        .enumerate()
-        .map(|(rank, association)| (association.space_id, rank))
-        .collect::<BTreeMap<_, _>>();
+    // Dense rank: Spaces that fused to exactly the same score share one rank, so item ordering
+    // falls through to the Context identity tie-break below instead of following the arbitrary
+    // Space ID that happened to sort first.
+    let mut association_rank = BTreeMap::new();
+    let mut previous_score: Option<f64> = None;
+    let mut current_rank = 0_usize;
+    for (offset, association) in inference.associations.iter().enumerate() {
+        if previous_score.is_none_or(|score| !score.total_cmp(&association.score).is_eq()) {
+            current_rank = offset;
+            previous_score = Some(association.score);
+        }
+        association_rank.insert(association.space_id, current_rank);
+    }
     let placeholders = std::iter::repeat_n("?", association_rank.len())
         .collect::<Vec<_>>()
         .join(", ");
@@ -3583,7 +4603,8 @@ fn load_task_context_candidates(
         "SELECT revision.space_id, revision.context_id, revision.revision_id,
                 COALESCE(space.title, ''), revision.kind, {status} AS result_status,
                 revision.statement, revision.rationale, revision.applicability_json,
-                item.auto_injection_eligible, revision.evidence_completeness
+                item.auto_injection_eligible, revision.evidence_completeness,
+                item.superseded_by, item.stale_reason, item.accepted_at_unix_seconds
          FROM context_revision AS revision
          JOIN context_item AS item USING(context_id)
          JOIN space_projection AS space USING(space_id)
@@ -3614,6 +4635,7 @@ fn load_task_context_candidates(
         .keys()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
+    let space_headers = load_space_headers(connection, &association_parameters)?;
     let parameters = association_parameters
         .iter()
         .chain(&association_parameters)
@@ -3631,9 +4653,14 @@ fn load_task_context_candidates(
         .next()
         .map_err(sql_error("read Task Context candidate row"))?
     {
-        if let Some(candidate) =
-            task_context_candidate_from_row(connection, row, inference, &association_rank, mode)?
-        {
+        if let Some(candidate) = task_context_candidate_from_row(
+            connection,
+            row,
+            inference,
+            &association_rank,
+            mode,
+            context_ttl,
+        )? {
             candidates.push(candidate);
         }
     }
@@ -3677,10 +4704,34 @@ fn load_task_context_candidates(
         revision_aware.insert(key, candidate);
     }
     let mut candidates = revision_aware.into_values().collect::<Vec<_>>();
+    apply_usage_prior(&mut candidates, usage_prior);
     candidates.sort_by(|left, right| {
-        left.association_rank
-            .cmp(&right.association_rank)
+        reached_only_by_a_hop(left)
+            .cmp(&reached_only_by_a_hop(right))
+            .then_with(|| {
+                coverage_weighted_item_score_basis_points(right)
+                    .cmp(&coverage_weighted_item_score_basis_points(left))
+            })
+            .then_with(|| left.association_rank.cmp(&right.association_rank))
             .then_with(|| right.direct_path_count.cmp(&left.direct_path_count))
+            // Whatever the Space ranking cannot separate is separated by how much of the query the
+            // Context itself answered. Falling straight through to the Context ID would order
+            // equally ranked Contexts by an identity that carries no meaning.
+            .then_with(|| {
+                right
+                    .item
+                    .context
+                    .match_reason
+                    .coverage_basis_points
+                    .cmp(&left.item.context.match_reason.coverage_basis_points)
+            })
+            .then_with(|| {
+                left.item
+                    .context
+                    .match_reason
+                    .bm25
+                    .total_cmp(&right.item.context.match_reason.bm25)
+            })
             .then_with(|| {
                 left.item
                     .context
@@ -3694,26 +4745,422 @@ fn load_task_context_candidates(
                     .cmp(&right.item.context.revision_id)
             })
     });
-    let omitted_count = candidates.len().saturating_sub(candidate_limit);
-    let omitted_tokens = candidates[candidate_limit.min(candidates.len())..]
-        .iter()
-        .map(|candidate| serialized_tokens(&candidate.item))
-        .sum();
-    candidates.truncate(candidate_limit);
-    let omitted = (omitted_count > 0)
-        .then(|| ContextPackOmitted {
+    let dropped = candidates.split_off(candidate_limit.min(candidates.len()));
+    let omitted = if dropped.is_empty() {
+        Vec::new()
+    } else if detail_level == ContextPackDetailLevel::Compact {
+        dropped
+            .iter()
+            .map(|candidate| ContextPackOmitted {
+                context_id: Some(candidate.item.context.context_id),
+                revision_id: Some(candidate.item.context.revision_id),
+                title: Some(candidate.item.context.title.clone()),
+                reason: "item_candidate_limit".to_owned(),
+                estimated_tokens: serialized_tokens(&candidate.item),
+                count: 1,
+            })
+            .collect()
+    } else {
+        vec![ContextPackOmitted {
             context_id: None,
             revision_id: None,
+            title: None,
             reason: "item_candidate_limit".to_owned(),
-            estimated_tokens: omitted_tokens,
-            count: omitted_count,
-        })
-        .into_iter()
-        .collect();
+            estimated_tokens: dropped
+                .iter()
+                .map(|candidate| serialized_tokens(&candidate.item))
+                .sum(),
+            count: dropped.len(),
+        }]
+    };
+    if detail_level == ContextPackDetailLevel::Compact {
+        let relations = load_compact_relations(connection, &candidates)?;
+        let locations = load_compact_locations(connection, &candidates)?;
+        for candidate in &mut candidates {
+            candidate.compact = Some(compact_task_context_item(
+                &candidate.item,
+                relations
+                    .get(&candidate.item.context.revision_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                locations
+                    .get(&candidate.item.context.revision_id)
+                    .map_or(&[] as &[String], Vec::as_slice),
+            ));
+        }
+    }
     Ok(LoadedTaskContexts {
         candidates,
         omitted,
+        space_headers,
     })
+}
+
+/// Reads the Intent-head title and provisional flag of every associated Space.
+fn load_space_headers(
+    connection: &Connection,
+    space_ids: &[String],
+) -> Result<BTreeMap<SpaceId, SpaceHeader>> {
+    let mut headers = BTreeMap::new();
+    if space_ids.is_empty() {
+        return Ok(headers);
+    }
+    let placeholders = std::iter::repeat_n("?", space_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT space_id, title, provisional FROM space_projection
+             WHERE space_id IN ({placeholders})"
+        ))
+        .map_err(sql_error("prepare Space header retrieval"))?;
+    let mut rows = statement
+        .query(rusqlite::params_from_iter(space_ids.iter()))
+        .map_err(sql_error("execute Space header retrieval"))?;
+    while let Some(row) = rows.next().map_err(sql_error("read Space header row"))? {
+        let space_id = parse_id::<SpaceId>(
+            &row.get::<_, String>(0)
+                .map_err(sql_error("read projected Space identity"))?,
+        )?;
+        let title = row
+            .get::<_, Option<String>>(1)
+            .map_err(sql_error("read projected Space title"))?
+            .filter(|title| !title.is_empty());
+        let provisional = row
+            .get::<_, bool>(2)
+            .map_err(sql_error("read projected Space provisional flag"))?;
+        headers.insert(space_id, SpaceHeader { title, provisional });
+    }
+    Ok(headers)
+}
+
+/// Reads the active outgoing Context Relations of every loaded candidate revision.
+fn load_compact_relations(
+    connection: &Connection,
+    candidates: &[TaskContextCandidate],
+) -> Result<BTreeMap<RevisionId, Vec<CompactContextRelation>>> {
+    let mut relations = BTreeMap::<RevisionId, Vec<CompactContextRelation>>::new();
+    if candidates.is_empty() {
+        return Ok(relations);
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT target_context_id, kind FROM context_relation
+             WHERE source_revision_id = ?1 ORDER BY target_context_id, kind",
+        )
+        .map_err(sql_error("prepare compact Context Relation retrieval"))?;
+    for revision_id in candidates
+        .iter()
+        .map(|candidate| candidate.item.context.revision_id)
+        .collect::<BTreeSet<_>>()
+    {
+        let mut rows = statement
+            .query([revision_id.to_string()])
+            .map_err(sql_error("execute compact Context Relation retrieval"))?;
+        let mut edges = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(sql_error("read compact Context Relation row"))?
+        {
+            let target_context_id: ContextId = parse_id(
+                &row.get::<_, String>(0)
+                    .map_err(sql_error("read Context Relation target"))?,
+            )?;
+            let kind = parse_context_relation_kind(
+                &row.get::<_, String>(1)
+                    .map_err(sql_error("read Context Relation kind"))?,
+            )?;
+            edges.push(CompactContextRelation {
+                kind,
+                target_context_id,
+            });
+        }
+        if !edges.is_empty() {
+            relations.insert(revision_id, edges);
+        }
+    }
+    Ok(relations)
+}
+
+/// Repository-qualified Artifact paths recorded as Engineering References on each candidate
+/// revision. They are provenance the Agent can open directly, so a compact Evidence entry keeps
+/// them even though it drops the Evidence body.
+fn load_compact_locations(
+    connection: &Connection,
+    candidates: &[TaskContextCandidate],
+) -> Result<BTreeMap<RevisionId, Vec<String>>> {
+    let mut locations = BTreeMap::<RevisionId, Vec<String>>::new();
+    if candidates.is_empty() {
+        return Ok(locations);
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT repository_id, locator_json FROM engineering_reference
+             WHERE revision_id = ?1 ORDER BY reference_id",
+        )
+        .map_err(sql_error("prepare compact Engineering Reference retrieval"))?;
+    for revision_id in candidates
+        .iter()
+        .map(|candidate| candidate.item.context.revision_id)
+        .collect::<BTreeSet<_>>()
+    {
+        let mut rows = statement
+            .query([revision_id.to_string()])
+            .map_err(sql_error("execute compact Engineering Reference retrieval"))?;
+        let mut paths = BTreeSet::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(sql_error("read compact Engineering Reference row"))?
+        {
+            let repository_id: String = row
+                .get(0)
+                .map_err(sql_error("read Engineering Reference Repository"))?;
+            let locator: LocatorPath = from_json(
+                &row.get::<_, String>(1)
+                    .map_err(sql_error("read Engineering Reference locator"))?,
+            )?;
+            paths.insert(format!("{repository_id}:{}", locator.path));
+        }
+        if !paths.is_empty() {
+            locations.insert(
+                revision_id,
+                paths
+                    .into_iter()
+                    .take(COMPACT_EVIDENCE_LOCATION_LIMIT)
+                    .collect(),
+            );
+        }
+    }
+    Ok(locations)
+}
+
+/// Path shared by every `ArtifactLocator` variant. Kind-specific coordinates are irrelevant to a
+/// compact location hint.
+#[derive(Debug, Deserialize)]
+struct LocatorPath {
+    path: String,
+}
+
+fn compact_task_context_item(
+    item: &TaskContextItem,
+    relations: Vec<CompactContextRelation>,
+    locations: &[String],
+) -> CompactTaskContextItem {
+    CompactTaskContextItem {
+        context_id: item.context.context_id,
+        revision_id: item.context.revision_id,
+        space_id: item.context.space_id,
+        kind: item.context.kind,
+        status: item.context.status,
+        title: item.context.title.clone(),
+        statement: item.context.statement.clone(),
+        conditions: item.context.applicability.conditions.clone(),
+        evidence: item
+            .context
+            .evidence
+            .iter()
+            .map(|evidence| CompactEvidenceView {
+                kind: evidence.kind.clone(),
+                summary: truncate_chars(
+                    &evidence_summary(evidence),
+                    COMPACT_EVIDENCE_SUMMARY_MAX_CHARS,
+                ),
+                locations: locations.to_vec(),
+            })
+            .collect(),
+        relations,
+        conflicts: item.context.conflicts.clone(),
+        derived_state: item.context.derived_state.clone(),
+        retrieval_channels: retrieval_channels(&item.retrieval_paths),
+        why: compact_item_reasons(item),
+    }
+}
+
+/// Deduplicated `source` discriminants of one item's Retrieval Paths, in first-seen order.
+fn retrieval_channels(paths: &[TaskRetrievalPath]) -> Vec<String> {
+    let mut channels = Vec::new();
+    for path in paths {
+        let channel = retrieval_channel_name(path);
+        if !channels.iter().any(|seen| seen == channel) {
+            channels.push(channel.to_owned());
+        }
+        if channels.len() == COMPACT_RETRIEVAL_CHANNEL_LIMIT {
+            break;
+        }
+    }
+    channels
+}
+
+/// The `source` tag one Retrieval Path serializes under, kept in step with its `serde` rename.
+const fn retrieval_channel_name(path: &TaskRetrievalPath) -> &'static str {
+    match path {
+        TaskRetrievalPath::EngineeringGraph { .. } => "engineering_graph",
+        TaskRetrievalPath::ContextRelation { .. } => "context_relation",
+        TaskRetrievalPath::SpaceAssociation { .. } => "space_association",
+        TaskRetrievalPath::GraphDiagnostic { .. } => "graph_diagnostic",
+        TaskRetrievalPath::IntentFts { .. } => "intent_fts",
+        TaskRetrievalPath::ContextFts { .. } => "context_fts",
+        TaskRetrievalPath::WorkingIntentHintText { .. } => "working_intent_hint_text",
+        TaskRetrievalPath::ResolvedFocusTextFallback { .. } => "resolved_focus_text_fallback",
+        TaskRetrievalPath::ExactScope { .. } => "exact_scope",
+    }
+}
+
+/// Self-contained Evidence summary. Checkpoint Evidence stores it as `content.summary`; other
+/// Evidence falls back to its interpretation and then to its supported statement.
+fn evidence_summary(evidence: &EvidenceView) -> String {
+    if let Some(summary) = evidence
+        .content
+        .get("summary")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+    {
+        return summary.to_owned();
+    }
+    if !evidence.interpretation.trim().is_empty() {
+        return evidence.interpretation.clone();
+    }
+    evidence.supports.clone()
+}
+
+fn truncate_chars(value: &str, maximum: usize) -> String {
+    if value.chars().count() <= maximum {
+        return value.to_owned();
+    }
+    let mut truncated = value.chars().take(maximum).collect::<String>();
+    truncated.push('\u{2026}');
+    truncated
+}
+
+/// At most [`COMPACT_ITEM_REASON_LIMIT`] one-sentence reasons, ordered from the strongest
+/// retrieval path to the weakest, so a compact item stays explainable without its path payload.
+fn compact_item_reasons(item: &TaskContextItem) -> Vec<String> {
+    let mut reasons = Vec::new();
+    let mut relation_hops = 0;
+    let mut graph = false;
+    let mut focus_fallback = false;
+    let mut text = false;
+    let mut scopes = Vec::new();
+    for path in &item.retrieval_paths {
+        match path {
+            TaskRetrievalPath::EngineeringGraph { .. } => graph = true,
+            TaskRetrievalPath::ContextRelation { hops } => {
+                relation_hops = relation_hops.max(hops.len());
+            }
+            TaskRetrievalPath::ResolvedFocusTextFallback { .. } => focus_fallback = true,
+            TaskRetrievalPath::IntentFts { .. }
+            | TaskRetrievalPath::ContextFts { .. }
+            | TaskRetrievalPath::WorkingIntentHintText { .. } => text = true,
+            TaskRetrievalPath::ExactScope { dimension, value } => {
+                scopes.push(format!("{dimension}={value}"));
+            }
+            TaskRetrievalPath::SpaceAssociation { .. }
+            | TaskRetrievalPath::GraphDiagnostic { .. } => {}
+        }
+    }
+    if graph {
+        reasons.push(
+            "Resolved a current-generation Engineering Artifact association for this Task focus."
+                .to_owned(),
+        );
+    }
+    if relation_hops > 0 {
+        reasons.push(format!(
+            "Reached through {relation_hops} stable Context Relation hop(s)."
+        ));
+    }
+    if focus_fallback {
+        reasons.push("Matched the resolved Artifact Focus by text only.".to_owned());
+    }
+    if text && !item.context.match_reason.matched_tokens.is_empty() {
+        reasons.push(format!(
+            "Matched Task text on: {} (coverage-weighted rank: this Context answered {}% of the \
+             query itself).",
+            item.context
+                .match_reason
+                .matched_tokens
+                .iter()
+                .take(6)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+            item.context.match_reason.coverage_basis_points / 100
+        ));
+    } else if text {
+        reasons.push("Matched the Task Intent text of its ContextSpace.".to_owned());
+    }
+    if !scopes.is_empty() {
+        reasons.push(format!(
+            "Applicability matched the Task scope: {}.",
+            scopes.join(", ")
+        ));
+    }
+    for sentence in derived_state_reasons(&item.context) {
+        reasons.push(sentence);
+    }
+    if let Some(sentence) = usage_prior_reason(item.context.usage) {
+        reasons.push(sentence);
+    }
+    reasons.truncate(COMPACT_ITEM_REASON_LIMIT);
+    reasons
+}
+
+/// One sentence for the usage prior, and only when the prior actually moved the score.
+///
+/// Reporting an ignore that changed nothing would read as a warning the ranking never applied.
+fn usage_prior_reason(usage: ContextUsageCounts) -> Option<String> {
+    if usage.reused >= 1 {
+        return Some(format!("Reused in {} prior task(s).", usage.reused));
+    }
+    (usage.ignored >= USAGE_IGNORED_PENALTY_MINIMUM_TASKS)
+        .then(|| format!("Ignored in {} prior task(s).", usage.ignored))
+}
+
+/// One-sentence reasons for state the retrieval paths cannot express.
+///
+/// They are appended last but survive truncation in practice because they replace the generic
+/// conflict sentence with the identity an Agent needs to read the other side.
+fn derived_state_reasons(context: &ContextPackItem) -> Vec<String> {
+    let mut reasons = Vec::new();
+    let mut opposing = context
+        .conflicts
+        .iter()
+        .filter(|conflict| conflict.kind == "semantic" && conflict.status == "open")
+        .flat_map(|conflict| conflict.participants.iter())
+        .map(|side| side.context_id)
+        .filter(|participant| *participant != context.context_id)
+        .collect::<Vec<_>>();
+    opposing.sort_unstable();
+    opposing.dedup();
+    if !opposing.is_empty() {
+        reasons.push(format!(
+            "Unresolved semantic conflict with {}; read both sides before relying on it.",
+            opposing
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    } else if !context.conflicts.is_empty() {
+        reasons.push(
+            "Carries an unresolved conflict; read both sides before relying on it.".to_owned(),
+        );
+    }
+    if let Some(reason) = &context.derived_state.stale_reason {
+        reasons.push(format!("Possibly stale: {reason}."));
+    }
+    if let Some(context_id) = context.derived_state.superseded_by {
+        reasons.push(format!(
+            "Superseded by {context_id}; excluded from automatic injection."
+        ));
+    }
+    if let Some(reason) = &context.derived_state.historical_reason {
+        reasons.push(format!(
+            "Historical: {reason}; excluded from automatic injection."
+        ));
+    }
+    reasons
 }
 
 fn matched_context_space(
@@ -3812,6 +5259,10 @@ fn graph_context_candidate(
         .count();
     Ok(Some(TaskContextCandidate {
         association_rank: *rank,
+        injection_score_basis_points: inference
+            .evidence
+            .get(&matched_space.association_space_id)
+            .map_or(0, final_score_basis_points),
         direct_path_count,
         item: TaskContextItem {
             association_space_id: matched_space.association_space_id,
@@ -3819,7 +5270,8 @@ fn graph_context_candidate(
                 space_id: snapshot.space_id,
                 context_id: snapshot.context_id,
                 revision_id: snapshot.revision.revision_id,
-                title: snapshot.space_title.clone(),
+                title: context_display_title(&snapshot.revision.statement),
+                space_title: snapshot.space_title.clone(),
                 kind: snapshot.revision.kind,
                 status: graph_context_status(snapshot.status),
                 statement: snapshot.revision.statement.clone(),
@@ -3827,6 +5279,7 @@ fn graph_context_candidate(
                 applicability: snapshot.revision.applicability.clone(),
                 evidence,
                 conflicts: Vec::new(),
+                derived_state: ContextDerivedState::default(),
                 auto_injection_eligible: snapshot.safety.automatic_injection_eligible,
                 safety_source: ContextSafetySource::EngineeringGraphSnapshot {
                     context_tree_oid: inference.graph_context_tree_oid.clone(),
@@ -3838,11 +5291,14 @@ fn graph_context_candidate(
                 match_reason: context_match_reason(
                     Some(&graph.evidence),
                     i64::from(snapshot.evidence_completeness),
+                    &inference.query_tokens,
                 ),
+                usage: ContextUsageCounts::default(),
                 detail: ContextPackDetail::Full,
             },
             retrieval_paths: paths,
         },
+        compact: None,
     }))
 }
 
@@ -3871,6 +5327,7 @@ fn task_context_candidate_from_row(
     inference: &TaskAssociationInference,
     association_rank: &BTreeMap<SpaceId, usize>,
     mode: ContextPackMode,
+    context_ttl: &ContextTtlSettings,
 ) -> Result<Option<TaskContextCandidate>> {
     let space_id: SpaceId = parse_id(
         &row.get::<_, String>(0)
@@ -3916,7 +5373,9 @@ fn task_context_candidate_from_row(
     if paths.is_empty() {
         return Ok(None);
     }
-    let title = row.get(3).map_err(sql_error("read Task Context title"))?;
+    let space_title = row
+        .get(3)
+        .map_err(sql_error("read Task Context Space title"))?;
     let kind = parse_kind(
         &row.get::<_, String>(4)
             .map_err(sql_error("read Task Context kind"))?,
@@ -3925,9 +5384,10 @@ fn task_context_candidate_from_row(
         &row.get::<_, String>(5)
             .map_err(sql_error("read Task Context status"))?,
     )?;
-    let statement = row
+    let statement: String = row
         .get(6)
         .map_err(sql_error("read Task Context statement"))?;
+    let title = context_display_title(&statement);
     let rationale = row
         .get(7)
         .map_err(sql_error("read Task Context rationale"))?;
@@ -3942,8 +5402,30 @@ fn task_context_candidate_from_row(
     let evidence_completeness = row
         .get::<_, i64>(10)
         .map_err(sql_error("read Task Context Evidence completeness"))?;
+    let superseded_by = row
+        .get::<_, Option<String>>(11)
+        .map_err(sql_error("read Task Context superseding Context"))?
+        .map(|value| parse_id(&value))
+        .transpose()?;
+    let stale_reason = row
+        .get::<_, Option<String>>(12)
+        .map_err(sql_error("read Task Context stale reason"))?;
+    let accepted_at = row
+        .get::<_, Option<i64>>(13)
+        .map_err(sql_error("read Task Context publication time"))?;
+    let mut derived_state = ContextDerivedState {
+        superseded_by,
+        stale_reason,
+        historical_reason: context_ttl.historical_reason(kind, accepted_at),
+        demotion_basis_points: None,
+    };
     let evidence = load_evidence(connection, revision_id)?;
     let conflicts = load_conflicts(connection, context_id, revision_id)?;
+    let demotion = item_demotion_basis_points(&conflicts, &derived_state);
+    derived_state.demotion_basis_points =
+        (usize::from(demotion) < BASIS_POINTS_SCALE).then_some(demotion);
+    let auto_injection_eligible =
+        auto_injection_eligible && !derived_state.blocks_automatic_injection();
     if mode == ContextPackMode::AutomaticInjection
         && (status != ContextStatus::Accepted
             || !auto_injection_eligible
@@ -3952,7 +5434,11 @@ fn task_context_candidate_from_row(
     {
         return Ok(None);
     }
-    let match_reason = context_match_reason(context_evidence, evidence_completeness);
+    let match_reason = context_match_reason(
+        context_evidence,
+        evidence_completeness,
+        &inference.query_tokens,
+    );
     let direct_path_count = paths
         .iter()
         .filter(|path| !matches!(path, TaskRetrievalPath::IntentFts { .. }))
@@ -3961,6 +5447,11 @@ fn task_context_candidate_from_row(
         association_rank: *association_rank
             .get(&matched_space.association_space_id)
             .expect("candidate Space comes from association set"),
+        injection_score_basis_points: demoted_item_score(
+            final_score_basis_points(space_evidence),
+            &conflicts,
+            &derived_state,
+        ),
         direct_path_count,
         item: TaskContextItem {
             association_space_id: matched_space.association_space_id,
@@ -3969,6 +5460,7 @@ fn task_context_candidate_from_row(
                 context_id,
                 revision_id,
                 title,
+                space_title,
                 kind,
                 status,
                 statement,
@@ -3976,13 +5468,16 @@ fn task_context_candidate_from_row(
                 applicability,
                 evidence,
                 conflicts,
+                derived_state,
                 auto_injection_eligible,
                 safety_source: ContextSafetySource::CurrentProjection,
                 match_reason,
+                usage: ContextUsageCounts::default(),
                 detail: ContextPackDetail::Full,
             },
             retrieval_paths: paths,
         },
+        compact: None,
     }))
 }
 
@@ -4053,7 +5548,12 @@ fn automatic_direct_context_text_eligible(
     if context.phrase_match || context.hint_text.values().any(|hint| hint.phrase_match) {
         return true;
     }
-    let coverage = token_coverage_basis_points(&context.matched_tokens, query_tokens).max(
+    let coverage = identifier_weighted_coverage_basis_points(
+        &context.matched_tokens,
+        &context.identifier_matched_tokens,
+        query_tokens,
+    )
+    .max(
         context
             .hint_text
             .values()
@@ -4146,43 +5646,377 @@ fn working_intent_hint_path(
 fn context_match_reason(
     context: Option<&AcceptedContextEvidence>,
     evidence_completeness: i64,
+    query_tokens: &[String],
 ) -> MatchReason {
+    let matched_tokens = context
+        .into_iter()
+        .flat_map(|value| value.matched_tokens.iter().cloned())
+        .collect::<BTreeSet<_>>();
     MatchReason {
         matched_fields: context
             .into_iter()
             .flat_map(|value| value.matched_fields.iter().copied())
             .collect(),
-        matched_tokens: context
-            .into_iter()
-            .flat_map(|value| value.matched_tokens.iter().cloned())
-            .collect(),
+        coverage_basis_points: token_coverage_basis_points(&matched_tokens, query_tokens),
+        matched_tokens: matched_tokens.into_iter().collect(),
         bm25: context.and_then(|value| value.bm25).unwrap_or(0.0),
         evidence_completeness: u16::try_from(evidence_completeness).unwrap_or(u16::MAX),
         structured_filter_match: true,
+        matched_via_alias: context
+            .into_iter()
+            .flat_map(|value| value.alias_matches.iter().cloned())
+            .collect(),
     }
+}
+
+/// True when a Context never mentions any of the query text and was reached only by following a
+/// relation out of another Context in its Space.
+///
+/// Such a Context is background for the answer, not the answer: the contradicted side of a
+/// contradiction, or a sibling in the same Space. It is still returned and still explains its own
+/// route, but it never leads the Pack ahead of a Context that answered the query directly.
+/// Coverage at which a text-matched Context counts as having answered the query in full for
+/// ranking. Han bigrams and English stop words both make full coverage unreachable in practice, so
+/// saturating early keeps the multiplier a separator of *materially* different answers rather than
+/// a second BM25.
+const ITEM_TEXT_COVERAGE_SATURATION_BASIS_POINTS: u16 = 3_000;
+/// Multiplier a text-matched Context keeps when it covered none of the query beyond the token that
+/// found it. It is a demotion, never an exclusion: such a Context is still an answer, just not the
+/// one that answered most of the question.
+const ITEM_TEXT_COVERAGE_MULTIPLIER_FLOOR_BASIS_POINTS: u16 = 5_000;
+
+/// The matched Space's fused score, scaled by how much of the query this Context's own text
+/// answered.
+///
+/// The fused score is a property of the *Space*: every Context a Space contributes carries the
+/// same one, so ordering by it alone lets the Space that won on Intent text put forward whichever
+/// of its Contexts happens to share one phrase with the query, ahead of a Context in a
+/// marginally lower-ranked Space whose own statement answered most of it. Coverage-weighting the
+/// score is what stops a short near-duplicate from outranking the longer Context that actually
+/// covers the question.
+///
+/// Contexts that were not reached by their own text at all — Engineering Graph hits, Relation hops,
+/// scope matches — keep the Space score unscaled: their coverage is zero because text played no
+/// part in finding them, not because they answered little.
+fn coverage_weighted_item_score_basis_points(candidate: &TaskContextCandidate) -> u16 {
+    let multiplier = item_text_coverage_multiplier_basis_points(candidate);
+    u16::try_from(
+        usize::from(candidate.injection_score_basis_points).saturating_mul(usize::from(multiplier))
+            / BASIS_POINTS_SCALE,
+    )
+    .unwrap_or(u16::MAX)
+}
+
+/// Ranking multiplier in basis points; `BASIS_POINTS_SCALE` is none.
+fn item_text_coverage_multiplier_basis_points(candidate: &TaskContextCandidate) -> u16 {
+    let matched_by_own_text = candidate.item.retrieval_paths.iter().any(|path| {
+        matches!(
+            path,
+            TaskRetrievalPath::ContextFts { .. } | TaskRetrievalPath::WorkingIntentHintText { .. }
+        )
+    });
+    if !matched_by_own_text {
+        return u16::try_from(BASIS_POINTS_SCALE).unwrap_or(u16::MAX);
+    }
+    let coverage = candidate
+        .item
+        .context
+        .match_reason
+        .coverage_basis_points
+        .min(ITEM_TEXT_COVERAGE_SATURATION_BASIS_POINTS);
+    let span = BASIS_POINTS_SCALE - usize::from(ITEM_TEXT_COVERAGE_MULTIPLIER_FLOOR_BASIS_POINTS);
+    let earned = span.saturating_mul(usize::from(coverage))
+        / usize::from(ITEM_TEXT_COVERAGE_SATURATION_BASIS_POINTS);
+    ITEM_TEXT_COVERAGE_MULTIPLIER_FLOOR_BASIS_POINTS
+        .saturating_add(u16::try_from(earned).unwrap_or(u16::MAX))
+}
+
+fn reached_only_by_a_hop(candidate: &TaskContextCandidate) -> bool {
+    candidate.item.context.match_reason.coverage_basis_points == 0
+        && candidate.item.retrieval_paths.iter().all(|path| {
+            matches!(
+                path,
+                TaskRetrievalPath::ContextRelation { .. }
+                    | TaskRetrievalPath::SpaceAssociation { .. }
+            )
+        })
 }
 
 fn pack_task_context_candidates(
     loaded: LoadedTaskContexts,
     token_budget: usize,
     inference: TaskAssociationInference,
-    mut graph_diagnostics: Vec<TaskGraphDiagnostic>,
+    graph_diagnostics: Vec<TaskGraphDiagnostic>,
     omitted_space_count: usize,
     omitted_space_tokens: usize,
+    detail_level: ContextPackDetailLevel,
 ) -> PackedTaskContexts {
     let mut omitted = loaded.omitted;
     if omitted_space_count > 0 {
         omitted.push(ContextPackOmitted {
             context_id: None,
             revision_id: None,
+            title: None,
             reason: "space_top_k".to_owned(),
             estimated_tokens: omitted_space_tokens,
             count: omitted_space_count,
         });
     }
-    let mut associations = inference.associations;
-    let mut items = loaded
-        .candidates
+    let query_token_explanation = match detail_level {
+        ContextPackDetailLevel::Full => Some(inference.query_token_explanation.clone()),
+        ContextPackDetailLevel::Compact => None,
+    };
+    match detail_level {
+        ContextPackDetailLevel::Full => pack_full_task_context(
+            loaded.candidates,
+            inference.associations,
+            graph_diagnostics,
+            &omitted,
+            token_budget,
+            query_token_explanation,
+        ),
+        ContextPackDetailLevel::Compact => {
+            let associations = inference
+                .associations
+                .into_iter()
+                .map(|association| {
+                    let header = loaded
+                        .space_headers
+                        .get(&association.space_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    compact_association(association, &header)
+                })
+                .collect();
+            pack_compact_task_context(
+                loaded.candidates,
+                associations,
+                graph_diagnostics,
+                &omitted,
+                token_budget,
+            )
+        }
+    }
+}
+
+/// Drops the Task identity, the machine-readable fusion payload, the Artifact/Context match lists
+/// already carried by the returned items, and the Relation path explanations.
+fn compact_association(
+    association: TaskSpaceAssociation,
+    header: &SpaceHeader,
+) -> CompactSpaceAssociation {
+    CompactSpaceAssociation {
+        space_id: association.space_id,
+        title: header.title.clone(),
+        score: association.score,
+        provisional: header.provisional,
+        reasons: association
+            .reasons
+            .into_iter()
+            .filter(|reason| !reason.starts_with('{'))
+            .take(COMPACT_ASSOCIATION_REASON_LIMIT)
+            .collect(),
+    }
+}
+
+/// Packs a compact payload facts-first.
+///
+/// Items are placed in rank order until they have used [`COMPACT_ITEM_BUDGET_BASIS_POINTS`] of the
+/// budget; only then do Space associations, Graph diagnostics and omission notices compete for
+/// what is left. [`COMPACT_MIN_ITEMS`] items are never dropped for want of room: an oversized item
+/// has its Evidence summaries squeezed to [`COMPACT_SQUEEZED_EVIDENCE_SUMMARY_MAX_CHARS`] and is
+/// packed anyway, because an Agent that receives one truncated fact is better off than one that
+/// receives a longer list of what it did not get.
+fn pack_compact_task_context(
+    candidates: Vec<TaskContextCandidate>,
+    mut associations: Vec<CompactSpaceAssociation>,
+    mut graph_diagnostics: Vec<TaskGraphDiagnostic>,
+    base_omitted: &[ContextPackOmitted],
+    token_budget: usize,
+) -> PackedTaskContexts {
+    let ranked = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(rank, candidate)| {
+            (
+                rank,
+                candidate
+                    .compact
+                    .expect("compact Task Context candidates carry their compact projection"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let item_budget = token_budget.saturating_mul(COMPACT_ITEM_BUDGET_BASIS_POINTS) / 10_000;
+    let mut items: Vec<RankedItem> = Vec::new();
+    let mut dropped: Vec<RankedItem> = Vec::new();
+    for (rank, item) in ranked {
+        if dropped.is_empty() && fits(&items, &item, item_budget) {
+            items.push((rank, item));
+            continue;
+        }
+        if items.len() < COMPACT_MIN_ITEMS {
+            let squeezed = squeeze_compact_item(item.clone());
+            if fits(&items, &squeezed, token_budget) {
+                items.push((rank, squeezed));
+                continue;
+            }
+        }
+        dropped.push((rank, item));
+    }
+
+    let mut space_omitted = OmissionAggregate::default();
+    let mut diagnostic_omitted = OmissionAggregate::default();
+    loop {
+        let carried = ranked_values(&items);
+        let current_omitted = compact_budget_omissions(
+            base_omitted,
+            &ranked_values(&dropped),
+            space_omitted,
+            diagnostic_omitted,
+        );
+        let estimated_tokens = charged_task_context_tokens(
+            &associations,
+            &carried,
+            &graph_diagnostics,
+            &current_omitted,
+            None,
+        );
+        if estimated_tokens <= token_budget {
+            // The item share is a floor, not a ceiling: whatever the explanations left unspent
+            // goes back to the highest ranked Context the first pass could not afford.
+            if let Some((probe_items, probe_dropped)) = backfill(
+                &items,
+                &dropped,
+                &associations,
+                &graph_diagnostics,
+                base_omitted,
+                space_omitted,
+                diagnostic_omitted,
+                token_budget,
+            ) {
+                items = probe_items;
+                dropped = probe_dropped;
+                continue;
+            }
+            return PackedTaskContexts {
+                estimated_tokens,
+                associations: Vec::new(),
+                compact_associations: associations,
+                items: Vec::new(),
+                compact_items: carried,
+                graph_diagnostics,
+                query_token_explanation: None,
+                omitted: current_omitted,
+            };
+        }
+        // Explanations yield to facts: the Space list and the Graph diagnostics go first, and only
+        // then is an item given up.
+        if let Some(association) = associations.pop() {
+            space_omitted.add(serialized_tokens(&association));
+            continue;
+        }
+        if let Some(diagnostic) = graph_diagnostics.pop() {
+            diagnostic_omitted.add(serialized_tokens(&diagnostic));
+            continue;
+        }
+        if let Some(item) = items.pop() {
+            dropped.push(item);
+            dropped.sort_by_key(|(rank, _)| *rank);
+            continue;
+        }
+        let current_omitted = compact_budget_omissions(
+            base_omitted,
+            &ranked_values(&dropped),
+            space_omitted,
+            diagnostic_omitted,
+        );
+        return exhausted_task_context(&current_omitted);
+    }
+}
+
+/// Strips the packing ranks off a rank-ordered item list.
+fn ranked_values(items: &[RankedItem]) -> Vec<CompactTaskContextItem> {
+    items.iter().map(|(_, item)| item.clone()).collect()
+}
+
+/// Tries to re-admit the highest ranked dropped item into the unspent remainder of the budget.
+/// One item paired with the packing rank that keeps the emitted order stable.
+type RankedItem = (usize, CompactTaskContextItem);
+
+#[allow(clippy::too_many_arguments)]
+fn backfill(
+    items: &[RankedItem],
+    dropped: &[RankedItem],
+    associations: &[CompactSpaceAssociation],
+    graph_diagnostics: &[TaskGraphDiagnostic],
+    base_omitted: &[ContextPackOmitted],
+    space_omitted: OmissionAggregate,
+    diagnostic_omitted: OmissionAggregate,
+    token_budget: usize,
+) -> Option<(Vec<RankedItem>, Vec<RankedItem>)> {
+    let position = dropped
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, (rank, _))| *rank)
+        .map(|(position, _)| position)?;
+    let mut probe_items = items.to_vec();
+    probe_items.push(dropped[position].clone());
+    probe_items.sort_by_key(|(rank, _)| *rank);
+    let mut probe_dropped = dropped.to_vec();
+    probe_dropped.remove(position);
+    let probe_omitted = compact_budget_omissions(
+        base_omitted,
+        &ranked_values(&probe_dropped),
+        space_omitted,
+        diagnostic_omitted,
+    );
+    let probe_tokens = charged_task_context_tokens(
+        associations,
+        &ranked_values(&probe_items),
+        graph_diagnostics,
+        &probe_omitted,
+        None,
+    );
+    (probe_tokens <= token_budget).then_some((probe_items, probe_dropped))
+}
+
+/// True when `item` still fits beside the already packed items inside `budget`.
+fn fits(items: &[RankedItem], item: &CompactTaskContextItem, budget: usize) -> bool {
+    let mut probe = ranked_values(items);
+    probe.push(item.clone());
+    charged_task_context_tokens::<CompactSpaceAssociation, _>(&[], &probe, &[], &[], None) <= budget
+}
+
+/// Squeezes one oversized item to its shortest still-useful form.
+fn squeeze_compact_item(mut item: CompactTaskContextItem) -> CompactTaskContextItem {
+    for evidence in &mut item.evidence {
+        evidence.summary = elide(
+            &evidence.summary,
+            COMPACT_SQUEEZED_EVIDENCE_SUMMARY_MAX_CHARS,
+        );
+    }
+    item
+}
+
+/// Truncates one text to `max_chars` characters, marking the elision.
+fn elide(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    let mut elided = value.chars().take(max_chars).collect::<String>();
+    elided.push('\u{2026}');
+    elided
+}
+
+fn pack_full_task_context(
+    candidates: Vec<TaskContextCandidate>,
+    mut associations: Vec<TaskSpaceAssociation>,
+    mut graph_diagnostics: Vec<TaskGraphDiagnostic>,
+    omitted: &[ContextPackOmitted],
+    token_budget: usize,
+    query_token_explanation: Option<AutomaticQueryTokenExplanation>,
+) -> PackedTaskContexts {
+    let mut items = candidates
         .into_iter()
         .map(|candidate| candidate.item)
         .collect::<Vec<_>>();
@@ -4193,24 +6027,42 @@ fn pack_task_context_candidates(
 
     loop {
         let current_omitted = task_budget_omissions(
-            &omitted,
+            omitted,
             detail_omitted,
             item_omitted,
             space_omitted,
             diagnostic_omitted,
         );
-        let estimated_tokens = charged_task_context_tokens(
+        let estimated_tokens = charged_task_context_tokens::<TaskSpaceAssociation, _>(
             &associations,
             &items,
             &graph_diagnostics,
             &current_omitted,
+            None,
         );
         if estimated_tokens <= token_budget {
+            // The token-selection explanation is a diagnostic, never a Context fact: it is added
+            // only when the budgeted payload leaves room, so it can never displace an item.
+            let with_explanation = charged_task_context_tokens(
+                &associations,
+                &items,
+                &graph_diagnostics,
+                &current_omitted,
+                query_token_explanation.as_ref(),
+            );
+            let (estimated_tokens, query_token_explanation) = if with_explanation <= token_budget {
+                (with_explanation, query_token_explanation)
+            } else {
+                (estimated_tokens, None)
+            };
             return PackedTaskContexts {
                 estimated_tokens,
                 associations,
+                compact_associations: Vec::new(),
                 items,
+                compact_items: Vec::new(),
                 graph_diagnostics,
+                query_token_explanation,
                 omitted: current_omitted,
             };
         }
@@ -4247,24 +6099,39 @@ fn pack_task_context_candidates(
             continue;
         }
 
-        let count = current_omitted.iter().map(|item| item.count).sum();
-        let compact = vec![ContextPackOmitted {
-            context_id: None,
-            revision_id: None,
-            reason: "omitted".to_owned(),
-            estimated_tokens: current_omitted
-                .iter()
-                .map(|item| item.estimated_tokens)
-                .sum(),
-            count,
-        }];
-        return PackedTaskContexts {
-            estimated_tokens: charged_task_context_tokens(&[], &[], &[], &compact),
-            associations: Vec::new(),
-            items: Vec::new(),
-            graph_diagnostics: Vec::new(),
-            omitted: compact,
-        };
+        return exhausted_task_context(&current_omitted);
+    }
+}
+
+/// Last resort when even one aggregated omission list exceeds the budget: keep nothing but one
+/// collapsed omission so the caller still learns that the Pack was dropped.
+fn exhausted_task_context(current_omitted: &[ContextPackOmitted]) -> PackedTaskContexts {
+    let collapsed = vec![ContextPackOmitted {
+        context_id: None,
+        revision_id: None,
+        title: None,
+        reason: "omitted".to_owned(),
+        estimated_tokens: current_omitted
+            .iter()
+            .map(|omitted| omitted.estimated_tokens)
+            .sum(),
+        count: current_omitted.iter().map(|omitted| omitted.count).sum(),
+    }];
+    PackedTaskContexts {
+        estimated_tokens: charged_task_context_tokens::<TaskSpaceAssociation, TaskContextItem>(
+            &[],
+            &[],
+            &[],
+            &collapsed,
+            None,
+        ),
+        associations: Vec::new(),
+        compact_associations: Vec::new(),
+        items: Vec::new(),
+        compact_items: Vec::new(),
+        graph_diagnostics: Vec::new(),
+        query_token_explanation: None,
+        omitted: collapsed,
     }
 }
 
@@ -4299,6 +6166,7 @@ fn task_budget_omissions(
             omitted.push(ContextPackOmitted {
                 context_id: None,
                 revision_id: None,
+                title: None,
                 reason: reason.to_owned(),
                 estimated_tokens: aggregate.estimated_tokens,
                 count: aggregate.count,
@@ -4308,29 +6176,96 @@ fn task_budget_omissions(
     omitted
 }
 
-fn charged_task_context_tokens(
-    associations: &[TaskSpaceAssociation],
-    items: &[TaskContextItem],
+/// Names the first [`COMPACT_NAMED_OMISSION_LIMIT`] dropped Contexts and collapses the rest.
+///
+/// A named omission is an invitation to fetch one Context by ID; past a handful of them the list
+/// stops being actionable and starts competing with the facts for the same budget, which is the
+/// failure this packer exists to prevent. Each name is a Context ID and an elided title, nothing
+/// more: the revision identity and the full title are one `context_get` away.
+fn compact_budget_omissions(
+    base: &[ContextPackOmitted],
+    dropped_items: &[CompactTaskContextItem],
+    space: OmissionAggregate,
+    diagnostic: OmissionAggregate,
+) -> Vec<ContextPackOmitted> {
+    let mut omitted = base.to_vec();
+    for item in dropped_items.iter().take(COMPACT_NAMED_OMISSION_LIMIT) {
+        omitted.push(ContextPackOmitted {
+            context_id: Some(item.context_id),
+            revision_id: None,
+            title: Some(elide(&item.title, COMPACT_OMITTED_TITLE_MAX_CHARS)),
+            reason: "item_token_budget".to_owned(),
+            estimated_tokens: serialized_tokens(item),
+            count: 1,
+        });
+    }
+    let collapsed = dropped_items
+        .iter()
+        .skip(COMPACT_NAMED_OMISSION_LIMIT)
+        .collect::<Vec<_>>();
+    if !collapsed.is_empty() {
+        omitted.push(ContextPackOmitted {
+            context_id: None,
+            revision_id: None,
+            title: None,
+            reason: "item_token_budget".to_owned(),
+            estimated_tokens: collapsed.iter().copied().map(serialized_tokens).sum(),
+            count: collapsed.len(),
+        });
+    }
+    for (reason, aggregate) in [
+        ("space_token_budget", space),
+        ("diagnostic_token_budget", diagnostic),
+    ] {
+        if aggregate.count > 0 {
+            omitted.push(ContextPackOmitted {
+                context_id: None,
+                revision_id: None,
+                title: None,
+                reason: reason.to_owned(),
+                estimated_tokens: aggregate.estimated_tokens,
+                count: aggregate.count,
+            });
+        }
+    }
+    omitted
+}
+
+fn charged_task_context_tokens<A: Serialize, T: Serialize>(
+    associations: &[A],
+    items: &[T],
     graph_diagnostics: &[TaskGraphDiagnostic],
     omitted: &[ContextPackOmitted],
+    query_token_explanation: Option<&AutomaticQueryTokenExplanation>,
 ) -> usize {
     TASK_CONTEXT_ENVELOPE_TOKEN_RESERVE.saturating_add(serialized_tokens(&(
         associations,
         items,
         graph_diagnostics,
         omitted,
+        query_token_explanation,
     )))
 }
 
 /// Recomputes the charged Association, item/path, omission, and deterministic envelope reserve.
 #[must_use]
 pub fn estimate_task_context_payload_tokens(pack: &TaskContextPack) -> usize {
-    charged_task_context_tokens(
-        &pack.associations,
-        &pack.items,
-        &pack.graph_diagnostics,
-        &pack.omitted,
-    )
+    match pack.detail_level {
+        ContextPackDetailLevel::Full => charged_task_context_tokens(
+            &pack.associations,
+            &pack.items,
+            &pack.graph_diagnostics,
+            &pack.omitted,
+            pack.query_token_explanation.as_ref(),
+        ),
+        ContextPackDetailLevel::Compact => charged_task_context_tokens(
+            &pack.compact_associations,
+            &pack.compact_items,
+            &pack.graph_diagnostics,
+            &pack.omitted,
+            None,
+        ),
+    }
 }
 
 #[derive(Debug)]
@@ -4359,15 +6294,168 @@ struct RankedRow {
     evidence_completeness: i64,
 }
 
+/// `bm25()` column weights for `context_fts`, in its exact column order:
+/// `context_id, revision_id, title, statement, rationale, evidence, problem_view, hint_text`.
+///
+/// `problem_view` ranks with `statement` because it is the question the Context answers, and
+/// `hint_text` ranks with `evidence` because it is unresolved locating text rather than a fact.
+/// `title` sits at the same weight as `statement` rather than above it: the title is derived from
+/// the first characters of the statement, so a higher weight would score that prefix twice.
+const CONTEXT_FTS_BM25_WEIGHTS: &str = "0.0, 0.0, 8.0, 8.0, 4.0, 2.0, 8.0, 2.0";
+
+/// Minimum share of distinct query tokens a revision must match to stay in a ranked page.
+/// Below it the row is a single incidental term overlap rather than a plausible answer.
+pub const RANKED_MIN_COVERAGE_BASIS_POINTS: u16 = 2_500;
+
+/// Deterministic per-revision query token coverage computed inside the same read transaction.
+/// It is a CTE rather than post-processing so ranking, truncation, totals and the stable cursor
+/// all observe exactly the same value.
+///
+/// The denominator is the query's *answerable* tokens: those the Tree indexes at all. A token no
+/// stored revision contains cannot be covered by any answer, so counting it would measure the
+/// question's spelling rather than the answer's fit. This matters most for Han text, where the
+/// bigram tokenizer turns a thirteen-character question into thirteen tokens of which only three
+/// name anything the corpus knows; charging the other ten against every candidate held the whole
+/// query under [`RANKED_MIN_COVERAGE_BASIS_POINTS`] and returned nothing at all. Dropping them
+/// rescales every candidate's coverage by the same factor, so the ranked order is untouched and
+/// only the truncation floor moves.
+struct QueryTokenCoverage {
+    /// One OR group per original query token: the token plus its bounded alias expansion. An
+    /// alias hit therefore stays a hit of the query token the caller actually typed.
+    groups: Vec<Vec<String>>,
+}
+
+impl QueryTokenCoverage {
+    fn plan(tokens: &[String], alias: &AliasExpansion, matching: bool) -> Self {
+        Self {
+            groups: if matching {
+                tokens
+                    .iter()
+                    .map(|token| alias.token_group(token))
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        !self.groups.is_empty()
+    }
+
+    fn with_clause(&self) -> String {
+        if !self.is_active() {
+            return String::new();
+        }
+        let unions = self
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                format!(
+                    "SELECT revision_id, {index} AS token_index FROM context_fts                      WHERE context_fts MATCH ?"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        format!(
+            "WITH query_token_hit AS ({unions}),
+             query_token_coverage AS (
+               SELECT revision_id, COUNT(DISTINCT token_index) AS matched_query_tokens
+               FROM query_token_hit
+               GROUP BY revision_id
+             ),
+             answerable_query_token AS (
+               SELECT MAX(1, COUNT(DISTINCT token_index)) AS answerable_query_tokens
+               FROM query_token_hit
+             ) "
+        )
+    }
+
+    fn parameters(&self) -> Vec<SqlValue> {
+        self.groups
+            .iter()
+            .map(|group| {
+                SqlValue::Text(
+                    fts_or_match_expression(group)
+                        .expect("a coverage group always contains its own query token"),
+                )
+            })
+            .collect()
+    }
+
+    fn join_sql(&self) -> &'static str {
+        if self.is_active() {
+            "LEFT JOIN query_token_coverage
+             ON query_token_coverage.revision_id = context_fts.revision_id"
+        } else {
+            ""
+        }
+    }
+
+    fn matched_expression(&self) -> String {
+        if self.is_active() {
+            "COALESCE(query_token_coverage.matched_query_tokens, 0)".to_owned()
+        } else {
+            "0".to_owned()
+        }
+    }
+
+    /// Number of query tokens the Tree can answer at all, never zero so it is always a legal
+    /// divisor. A query whose every token is unknown matches no row, so the value is unused.
+    fn denominator_expression() -> &'static str {
+        "(SELECT answerable_query_tokens FROM answerable_query_token)"
+    }
+
+    fn basis_points_expression(&self) -> String {
+        if !self.is_active() {
+            return "0".to_owned();
+        }
+        format!(
+            "({} * {BASIS_POINTS_SCALE} / {})",
+            self.matched_expression(),
+            Self::denominator_expression()
+        )
+    }
+
+    fn minimum_clause(&self) -> Option<String> {
+        self.is_active().then(|| {
+            format!(
+                "{} * {BASIS_POINTS_SCALE} >= {} * {RANKED_MIN_COVERAGE_BASIS_POINTS}",
+                self.matched_expression(),
+                Self::denominator_expression()
+            )
+        })
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn search_in_snapshot(
     connection: &Connection,
     request: &SearchRequest,
     tree_oid: &str,
     eligible_only: bool,
+    context_ttl: &ContextTtlSettings,
 ) -> Result<SearchPage> {
     let query_tokens = search_tokens(&request.query);
-    let match_expression = fts_match_expression(&query_tokens);
+    let coverage_tokens = query_tokens
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let ranked_mode = request.match_mode == SearchMatchMode::Ranked;
+    // `exact` is the literal-spelling mode, so it never expands through `token_alias`.
+    let alias = if ranked_mode {
+        AliasExpansion::load(connection, &coverage_tokens)?
+    } else {
+        AliasExpansion::default()
+    };
+    let match_expression = if ranked_mode {
+        fts_or_match_expression(&alias.expanded_tokens(&coverage_tokens))
+    } else {
+        fts_match_expression(&coverage_tokens)
+    };
     let fingerprint = query_fingerprint(request, eligible_only)?;
     let cursor = request.cursor.as_deref().map(decode_cursor).transpose()?;
     if let Some(cursor) = &cursor {
@@ -4381,19 +6469,52 @@ fn search_in_snapshot(
         }
     }
 
-    let (where_sql, base_parameters) =
+    let (mut where_sql, where_parameters) =
         search_where(request, match_expression.as_deref(), eligible_only);
+    let coverage = QueryTokenCoverage::plan(&coverage_tokens, &alias, match_expression.is_some());
     let from_sql = if match_expression.is_some() {
-        "context_fts
+        format!(
+            "context_fts
          JOIN context_revision AS revision USING(revision_id)
          JOIN context_item AS item USING(context_id)
-         JOIN space_projection AS space USING(space_id)"
+         JOIN space_projection AS space USING(space_id)
+         {}",
+            coverage.join_sql()
+        )
     } else {
         "context_revision AS revision
          JOIN context_item AS item USING(context_id)
          JOIN space_projection AS space USING(space_id)"
+            .to_owned()
     };
-    let total_sql = format!("SELECT COUNT(*) FROM {from_sql} WHERE {where_sql}");
+    let mut base_parameters = coverage.parameters();
+    base_parameters.extend(where_parameters);
+    let unranked_total = if ranked_mode && coverage.is_active() {
+        let total_sql = format!(
+            "{}SELECT COUNT(*) FROM {from_sql} WHERE {where_sql}",
+            coverage.with_clause()
+        );
+        Some(
+            connection
+                .query_row(
+                    &total_sql,
+                    params_from_iter(base_parameters.iter()),
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(sql_error("count ranked search matches before truncation"))?,
+        )
+    } else {
+        None
+    };
+    if ranked_mode {
+        if let Some(clause) = coverage.minimum_clause() {
+            where_sql = format!("{where_sql} AND {clause}");
+        }
+    }
+    let total_sql = format!(
+        "{}SELECT COUNT(*) FROM {from_sql} WHERE {where_sql}",
+        coverage.with_clause()
+    );
     let total = connection
         .query_row(
             &total_sql,
@@ -4404,10 +6525,20 @@ fn search_in_snapshot(
 
     let status = status_expression();
     let evidence = evidence_expression();
+    let coverage_sql = coverage.basis_points_expression();
     let relevance = if match_expression.is_some() {
-        "bm25(context_fts, 0.0, 0.0, 10.0, 8.0, 4.0, 2.0)"
+        if ranked_mode {
+            // BM25 is negative and ascending, so scaling it by the matched share of the query
+            // makes broader coverage strictly better while keeping BM25 the tie-breaker.
+            format!(
+                "bm25(context_fts, {CONTEXT_FTS_BM25_WEIGHTS}) * ({} / 10000.0)",
+                coverage.basis_points_expression()
+            )
+        } else {
+            format!("bm25(context_fts, {CONTEXT_FTS_BM25_WEIGHTS})")
+        }
     } else {
-        "0.0"
+        "0.0".to_owned()
     };
     let mut parameters = base_parameters;
     let simple_rank = match_expression.is_none();
@@ -4455,19 +6586,23 @@ fn search_in_snapshot(
         "relevance ASC, evidence_completeness DESC, context_id ASC, revision_id ASC"
     };
     let sql = format!(
-        "WITH ranked AS (
+        "{with_clause}{ranked_keyword} ranked AS (
            SELECT revision.space_id, revision.context_id, revision.revision_id,
                   COALESCE(space.title, ''), revision.kind, {status} AS result_status,
                   revision.statement, revision.rationale, revision.applicability_json,
                   revision.assumptions_json, revision.recheck_when_json,
                   item.auto_injection_eligible, {relevance} AS relevance,
-                  {evidence} AS evidence_completeness
+                  {evidence} AS evidence_completeness, {coverage_sql} AS coverage_basis_points,
+                  COALESCE(revision.problem_view, '') AS problem_view, revision.hint_text,
+                  item.superseded_by, item.stale_reason, item.accepted_at_unix_seconds
            FROM {from_sql}
            WHERE {where_sql}
          )
          SELECT * FROM ranked {cursor_sql}
          ORDER BY {order_sql}
-         LIMIT ?"
+         LIMIT ?",
+        with_clause = coverage.with_clause(),
+        ranked_keyword = if coverage.is_active() { "," } else { "WITH" },
     );
     let mut statement = connection
         .prepare(&sql)
@@ -4489,7 +6624,7 @@ fn search_in_snapshot(
         let space_id = parse_id(&space_id_text)?;
         let context_id = parse_id(&context_id_text)?;
         let revision_id = parse_id(&revision_id_text)?;
-        let title: String = row.get(3).map_err(sql_error("read search title"))?;
+        let space_title: String = row.get(3).map_err(sql_error("read search Space title"))?;
         let kind_text: String = row.get(4).map_err(sql_error("read Context kind"))?;
         let status_text: String = row.get(5).map_err(sql_error("read Context status"))?;
         let statement: String = row.get(6).map_err(sql_error("read statement"))?;
@@ -4514,24 +6649,54 @@ fn search_in_snapshot(
         let row_evidence = row
             .get(13)
             .map_err(sql_error("read Evidence completeness"))?;
+        let row_coverage = row
+            .get::<_, i64>(14)
+            .map_err(sql_error("read query token coverage"))?;
+        let problem_view: String = row.get(15).map_err(sql_error("read problem view"))?;
+        let hint_text: String = row.get(16).map_err(sql_error("read hint text"))?;
+        let superseded_by = row
+            .get::<_, Option<String>>(17)
+            .map_err(sql_error("read superseding Context"))?
+            .map(|value| parse_id(&value))
+            .transpose()?;
+        let stale_reason = row
+            .get::<_, Option<String>>(18)
+            .map_err(sql_error("read stale reason"))?;
+        let accepted_at = row
+            .get::<_, Option<i64>>(19)
+            .map_err(sql_error("read publication time"))?;
+        let kind = parse_kind(&kind_text)?;
+        let derived_state = ContextDerivedState {
+            superseded_by,
+            stale_reason,
+            historical_reason: context_ttl.historical_reason(kind, accepted_at),
+            demotion_basis_points: None,
+        };
+        let auto_injection_eligible =
+            auto_injection_eligible && !derived_state.blocks_automatic_injection();
         let evidence = load_evidence(connection, revision_id)?;
         let conflicts = load_conflicts(connection, context_id, revision_id)?;
-        let match_reason = explain_match(
-            &query_tokens,
-            &title,
-            &statement,
-            &rationale,
-            &evidence,
-            row_relevance,
-            row_evidence,
-        );
+        let match_reason = explain_match(&ExplainMatchInput {
+            query_tokens: &coverage_tokens,
+            alias: &alias,
+            title: &space_title,
+            statement: &statement,
+            rationale: &rationale,
+            problem_view: &problem_view,
+            hint_text: &hint_text,
+            evidence: &evidence,
+            bm25: row_relevance,
+            evidence_completeness: row_evidence,
+            coverage_basis_points: u16::try_from(row_coverage).unwrap_or(u16::MAX),
+        });
         ranked.push(RankedRow {
             result: SearchResult {
                 space_id,
                 context_id,
                 revision_id,
-                title,
-                kind: parse_kind(&kind_text)?,
+                title: context_display_title(&statement),
+                space_title,
+                kind,
                 status: parse_status(&status_text)?,
                 statement,
                 rationale,
@@ -4540,6 +6705,7 @@ fn search_in_snapshot(
                 recheck_when,
                 evidence,
                 conflicts,
+                derived_state,
                 auto_injection_eligible,
                 match_reason,
             },
@@ -4572,13 +6738,22 @@ fn search_in_snapshot(
     let remaining = usize::try_from(total)
         .unwrap_or(usize::MAX)
         .saturating_sub(returned_before + ranked.len());
-    let omitted = (remaining > 0)
+    let mut omitted = (remaining > 0)
         .then(|| SearchOmitted {
             count: remaining,
             reason: "page_limit".to_owned(),
         })
         .into_iter()
-        .collect();
+        .collect::<Vec<_>>();
+    if let Some(unranked_total) = unranked_total {
+        let truncated = usize::try_from(unranked_total.saturating_sub(total)).unwrap_or(0);
+        if truncated > 0 {
+            omitted.push(SearchOmitted {
+                count: truncated,
+                reason: "low_query_token_coverage".to_owned(),
+            });
+        }
+    }
     Ok(SearchPage {
         results: ranked.into_iter().map(|row| row.result).collect(),
         next_cursor,
@@ -4851,17 +7026,43 @@ fn load_conflicts(
     Ok(conflicts)
 }
 
-fn explain_match(
-    query_tokens: &[String],
-    title: &str,
-    statement: &str,
-    rationale: &str,
-    evidence: &[EvidenceView],
+/// Maximum character length of the Context-owned display title derived from a statement.
+const CONTEXT_TITLE_MAX_CHARS: usize = 60;
+
+/// Derives the Context-owned display title from an immutable revision statement. Context
+/// revisions have no stored title field, so the leading characters of the statement are the
+/// only Context-owned identity available; truncation is by `char` and marks elision.
+fn context_display_title(statement: &str) -> String {
+    let trimmed = statement.trim();
+    if trimmed.chars().count() <= CONTEXT_TITLE_MAX_CHARS {
+        return trimmed.to_owned();
+    }
+    let mut title = trimmed
+        .chars()
+        .take(CONTEXT_TITLE_MAX_CHARS)
+        .collect::<String>();
+    title.push('…');
+    title
+}
+
+/// Every input one ranked row needs to explain itself, in `context_fts` column order.
+struct ExplainMatchInput<'a> {
+    query_tokens: &'a [String],
+    alias: &'a AliasExpansion,
+    title: &'a str,
+    statement: &'a str,
+    rationale: &'a str,
+    problem_view: &'a str,
+    hint_text: &'a str,
+    evidence: &'a [EvidenceView],
     bm25: f64,
     evidence_completeness: i64,
-) -> MatchReason {
-    let wanted = query_tokens.iter().cloned().collect::<BTreeSet<_>>();
-    let evidence_text = evidence
+    coverage_basis_points: u16,
+}
+
+fn explain_match(input: &ExplainMatchInput<'_>) -> MatchReason {
+    let evidence_text = input
+        .evidence
         .iter()
         .map(|item| {
             format!(
@@ -4875,30 +7076,23 @@ fn explain_match(
         .collect::<Vec<_>>()
         .join(" ");
     let fields = [
-        (MatchField::Title, title),
-        (MatchField::Statement, statement),
-        (MatchField::Rationale, rationale),
+        (MatchField::Title, input.title),
+        (MatchField::Statement, input.statement),
+        (MatchField::Rationale, input.rationale),
         (MatchField::Evidence, evidence_text.as_str()),
+        (MatchField::ProblemView, input.problem_view),
+        (MatchField::HintText, input.hint_text),
     ];
-    let mut matched_fields = Vec::new();
-    let mut matched_tokens = BTreeSet::new();
-    for (field, text) in fields {
-        let field_tokens = search_tokens(text).into_iter().collect::<BTreeSet<_>>();
-        let intersection = wanted
-            .intersection(&field_tokens)
-            .cloned()
-            .collect::<Vec<_>>();
-        if !intersection.is_empty() {
-            matched_fields.push(field);
-            matched_tokens.extend(intersection);
-        }
-    }
+    let (matched_fields, matched_tokens, matched_via_alias) =
+        explain_token_fields(input.query_tokens, input.alias, fields);
     MatchReason {
         matched_fields,
-        matched_tokens: matched_tokens.into_iter().collect(),
-        bm25,
-        evidence_completeness: u16::try_from(evidence_completeness).unwrap_or(u16::MAX),
+        matched_tokens,
+        bm25: input.bm25,
+        coverage_basis_points: input.coverage_basis_points,
+        evidence_completeness: u16::try_from(input.evidence_completeness).unwrap_or(u16::MAX),
         structured_filter_match: true,
+        matched_via_alias,
     }
 }
 
@@ -4928,6 +7122,211 @@ fn is_han(character: char) -> bool {
         character as u32,
         0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x323AF
     )
+}
+
+/// Upper bound on how many aliases one query token may pull in. Expansion widens recall, so it
+/// stays bounded and deterministic rather than following the whole alias group transitively.
+pub const MAX_ALIASES_PER_QUERY_TOKEN: usize = 8;
+
+/// Upper bound on the aliases one whole query may add. Automatic retrieval submits every eligible
+/// Intent token at once, and each extra `OR` term widens the FTS scan on a latency-bounded path.
+pub const MAX_ALIAS_EXPANSIONS_PER_QUERY: usize = 16;
+
+/// `token_alias.source` values, ranked: an identifier split is a spelling of the same artifact,
+/// a domain term is only a vocabulary neighbour, so the identifier split is kept first.
+const ALIAS_SOURCE_RANK: [&str; 2] = [IDENTIFIER_SPLIT_ALIAS_SOURCE, "domain_term"];
+
+/// `token_alias.source` of a group produced by splitting a code identifier into its words.
+const IDENTIFIER_SPLIT_ALIAS_SOURCE: &str = "identifier_split";
+
+/// Least number of an alias group's members a query must already name before that group may
+/// expand one of them. A single shared word such as `page` names no identifier in particular, so
+/// expanding it would pull in every identifier that happens to contain it.
+const MIN_ALIAS_GROUP_MEMBERS_IN_QUERY: usize = 2;
+
+/// Bounded, deterministic `token_alias` expansion of one query's tokens.
+///
+/// Expansion never changes the coverage denominator: an alias hit is reported as a hit of the
+/// original query token it was expanded from, so a query is not made to look better covered
+/// merely because the corpus spells one of its tokens several ways.
+#[derive(Clone, Debug, Default)]
+struct AliasExpansion {
+    aliases: BTreeMap<String, Vec<(String, String)>>,
+    /// Query tokens that spell part of a code identifier the corpus names: every token of an
+    /// `identifier_split` group the query already names
+    /// [`MIN_ALIAS_GROUP_MEMBERS_IN_QUERY`] members of. Such a token is language-neutral
+    /// evidence — a Context spells `ProductAnchorAssem` the same way whatever language its prose
+    /// is written in — so [`identifier_weighted_coverage_basis_points`] weights it above prose.
+    identifier_tokens: BTreeSet<String>,
+}
+
+impl AliasExpansion {
+    /// Reads at most [`MAX_ALIASES_PER_QUERY_TOKEN`] aliases per token inside the caller's
+    /// snapshot transaction. An absent or empty `token_alias` table yields no expansion.
+    ///
+    /// One statement covers the whole query: this runs on the automatic retrieval hot path, so a
+    /// per-token round trip would be paid once per channel on every Intent update.
+    fn load(connection: &Connection, tokens: &[String]) -> Result<Self> {
+        if tokens.is_empty() {
+            return Ok(Self::default());
+        }
+        let original = tokens.iter().cloned().collect::<BTreeSet<_>>();
+        let placeholders = std::iter::repeat_n("?", original.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT token, alias, source, group_key FROM token_alias
+                 WHERE token IN ({placeholders})
+                 ORDER BY token ASC, group_key ASC, source ASC, alias ASC"
+            ))
+            .map_err(sql_error("prepare query token alias expansion"))?;
+        let rows = statement
+            .query_map(params_from_iter(original.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(sql_error("read query token alias expansion"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error("collect query token alias expansion"))?;
+        let mut grouped = BTreeMap::<(String, String), Vec<(String, String)>>::new();
+        for (token, alias, source, group_key) in rows {
+            if alias == token {
+                continue;
+            }
+            grouped
+                .entry((token, group_key))
+                .or_default()
+                .push((alias, source));
+        }
+        let mut ranked = Vec::new();
+        let mut identifier_tokens = BTreeSet::new();
+        for ((token, group_key), members) in grouped {
+            let named = 1 + members
+                .iter()
+                .filter(|(alias, _)| original.contains(alias))
+                .count();
+            if named < MIN_ALIAS_GROUP_MEMBERS_IN_QUERY {
+                continue;
+            }
+            if members
+                .iter()
+                .any(|(_, source)| source == IDENTIFIER_SPLIT_ALIAS_SOURCE)
+            {
+                identifier_tokens.insert(token.clone());
+            }
+            for (alias, source) in members {
+                if original.contains(&alias) {
+                    continue;
+                }
+                ranked.push((
+                    std::cmp::Reverse(named),
+                    alias_source_rank(&source),
+                    token.clone(),
+                    alias,
+                    group_key.clone(),
+                ));
+            }
+        }
+        // The more of an alias group the query already names, the more likely the group is the
+        // identifier the author meant, so those expansions are kept first when the budget binds.
+        ranked.sort();
+        let mut aliases = BTreeMap::<String, Vec<(String, String)>>::new();
+        let mut total = 0_usize;
+        let mut seen = BTreeSet::new();
+        for (_named, _source, token, alias, group_key) in ranked {
+            if total == MAX_ALIAS_EXPANSIONS_PER_QUERY
+                || !seen.insert((token.clone(), alias.clone()))
+            {
+                continue;
+            }
+            let selected = aliases.entry(token).or_default();
+            if selected.len() == MAX_ALIASES_PER_QUERY_TOKEN {
+                continue;
+            }
+            selected.push((alias, group_key));
+            total += 1;
+        }
+        aliases.retain(|_token, selected| !selected.is_empty());
+        Ok(Self {
+            aliases,
+            identifier_tokens,
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.aliases.is_empty()
+    }
+
+    /// The query tokens this Tree knows as parts of a code identifier.
+    fn identifier_tokens(&self) -> &BTreeSet<String> {
+        &self.identifier_tokens
+    }
+
+    /// One OR group per original query token: the token itself plus its aliases. Coverage counts
+    /// the group, so an alias hit is exactly one covered original token.
+    fn token_group(&self, token: &str) -> Vec<String> {
+        let mut group = vec![token.to_owned()];
+        if let Some(aliases) = self.aliases.get(token) {
+            group.extend(aliases.iter().map(|(alias, _)| alias.clone()));
+        }
+        group
+    }
+
+    /// Every spelling the FTS `MATCH` expression must accept.
+    fn expanded_tokens(&self, tokens: &[String]) -> Vec<String> {
+        tokens
+            .iter()
+            .flat_map(|token| self.token_group(token))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Resolves the tokens present in one indexed text back onto the query tokens they answer.
+    ///
+    /// Returns the covered original tokens and the alias hits that explain the expanded ones.
+    fn resolve(
+        &self,
+        wanted: &BTreeSet<String>,
+        available: &BTreeSet<String>,
+    ) -> (BTreeSet<String>, BTreeSet<AliasMatch>) {
+        let mut matched = wanted
+            .intersection(available)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut alias_matches = BTreeSet::new();
+        if self.aliases.is_empty() {
+            return (matched, alias_matches);
+        }
+        for (token, aliases) in &self.aliases {
+            if !wanted.contains(token) {
+                continue;
+            }
+            for (alias, group_key) in aliases {
+                if available.contains(alias) {
+                    matched.insert(token.clone());
+                    alias_matches.insert(AliasMatch {
+                        token: token.clone(),
+                        alias: alias.clone(),
+                        group_key: group_key.clone(),
+                    });
+                }
+            }
+        }
+        (matched, alias_matches)
+    }
+}
+
+fn alias_source_rank(source: &str) -> usize {
+    ALIAS_SOURCE_RANK
+        .iter()
+        .position(|known| *known == source)
+        .unwrap_or(ALIAS_SOURCE_RANK.len())
 }
 
 fn fts_match_expression(tokens: &[String]) -> Option<String> {
@@ -5095,6 +7494,32 @@ fn invariant(message: impl Into<String>) -> Error {
 
 #[cfg(test)]
 mod tests {
+    /// The compact channel names are hand-written; this pins them to what `serde` actually emits.
+    #[test]
+    fn compact_retrieval_channel_names_match_the_serialized_source_tag() {
+        for path in [
+            super::TaskRetrievalPath::ExactScope {
+                dimension: "domain".to_owned(),
+                value: "search".to_owned(),
+            },
+            super::TaskRetrievalPath::ContextRelation { hops: Vec::new() },
+            super::TaskRetrievalPath::ContextFts {
+                matched_fields: Vec::new(),
+                matched_tokens: Vec::new(),
+            },
+            super::TaskRetrievalPath::IntentFts {
+                matched_fields: Vec::new(),
+                matched_tokens: Vec::new(),
+            },
+        ] {
+            let encoded = serde_json::to_value(&path).unwrap();
+            assert_eq!(
+                encoded["source"].as_str(),
+                Some(super::retrieval_channel_name(&path))
+            );
+        }
+    }
+
     use std::time::{Duration, Instant};
 
     use rusqlite::params;
@@ -5102,9 +7527,65 @@ mod tests {
     use sctx_index::normalize_search_text;
 
     use super::{
-        ContextStatus, ScopeFilter, SearchFilters, SearchRequest, estimate_tokens, hex_decode,
-        hex_encode, search_in_snapshot,
+        ContextStatus, ContextTtlSettings, ContextUsageCounts, ScopeFilter, SearchFilters,
+        SearchRequest, USAGE_IGNORED_PENALTY_BASIS_POINTS, USAGE_REUSED_BONUS_BASIS_POINTS,
+        estimate_tokens, hex_decode, hex_encode, search_in_snapshot, usage_multiplier_basis_points,
+        usage_prior_reason, usage_prior_score,
     };
+
+    #[test]
+    fn usage_prior_promotes_reuse_and_only_penalizes_repeated_ignores() {
+        let reused = ContextUsageCounts {
+            reused: 2,
+            ignored: 9,
+            refuted: 0,
+        };
+        assert_eq!(
+            usage_multiplier_basis_points(reused),
+            USAGE_REUSED_BONUS_BASIS_POINTS
+        );
+        let ignored_once = ContextUsageCounts {
+            reused: 0,
+            ignored: 2,
+            refuted: 0,
+        };
+        assert_eq!(usage_multiplier_basis_points(ignored_once), 10_000);
+        let ignored_often = ContextUsageCounts {
+            reused: 0,
+            ignored: 3,
+            refuted: 0,
+        };
+        assert_eq!(
+            usage_multiplier_basis_points(ignored_often),
+            USAGE_IGNORED_PENALTY_BASIS_POINTS
+        );
+        // A refuted Context is demoted by its open semantic conflict, never twice here.
+        let refuted = ContextUsageCounts {
+            reused: 0,
+            ignored: 0,
+            refuted: 4,
+        };
+        assert_eq!(usage_multiplier_basis_points(refuted), 10_000);
+        assert_eq!(usage_prior_score(4_000, 10_000), 4_000);
+        assert_eq!(
+            usage_prior_score(4_000, USAGE_REUSED_BONUS_BASIS_POINTS),
+            4_600
+        );
+        assert_eq!(
+            usage_prior_score(4_000, USAGE_IGNORED_PENALTY_BASIS_POINTS),
+            3_600
+        );
+        assert_eq!(
+            usage_prior_reason(reused).as_deref(),
+            Some("Reused in 2 prior task(s).")
+        );
+        assert_eq!(usage_prior_reason(ignored_once), None);
+        assert_eq!(
+            usage_prior_reason(ignored_often).as_deref(),
+            Some("Ignored in 3 prior task(s).")
+        );
+        assert_eq!(usage_prior_reason(ContextUsageCounts::default()), None);
+    }
 
     #[test]
     fn cursor_hex_round_trips() {
@@ -5133,14 +7614,16 @@ mod tests {
                  CREATE TABLE space_projection(space_id TEXT PRIMARY KEY, title TEXT) WITHOUT ROWID;
                  CREATE TABLE context_item(
                    context_id TEXT PRIMARY KEY, space_id TEXT NOT NULL,
-                   governance_status TEXT NOT NULL, auto_injection_eligible INTEGER NOT NULL
+                   governance_status TEXT NOT NULL, auto_injection_eligible INTEGER NOT NULL,
+                   accepted_at_unix_seconds INTEGER, superseded_by TEXT, stale_reason TEXT
                  ) WITHOUT ROWID;
                  CREATE TABLE context_revision(
                    revision_id TEXT PRIMARY KEY, context_id TEXT NOT NULL, space_id TEXT NOT NULL,
                    kind TEXT NOT NULL, statement TEXT NOT NULL, rationale TEXT NOT NULL,
                    applicability_json TEXT NOT NULL, assumptions_json TEXT NOT NULL,
                    recheck_when_json TEXT NOT NULL, lifecycle TEXT NOT NULL,
-                   evidence_completeness INTEGER NOT NULL
+                   evidence_completeness INTEGER NOT NULL,
+                   problem_view TEXT, hint_text TEXT NOT NULL DEFAULT ''
                  ) WITHOUT ROWID;
                  CREATE INDEX context_revision_space_kind_status_idx
                    ON context_revision(space_id, kind, lifecycle, revision_id);
@@ -5171,8 +7654,12 @@ mod tests {
                  CREATE TABLE publication(publication_id TEXT, revision_id TEXT);
                  CREATE VIRTUAL TABLE context_fts USING fts5(
                    context_id UNINDEXED, revision_id UNINDEXED,
-                   title, statement, rationale, evidence
-                 );",
+                   title, statement, rationale, evidence, problem_view, hint_text
+                 );
+                 CREATE TABLE token_alias(
+                   token TEXT NOT NULL, alias TEXT NOT NULL, source TEXT NOT NULL,
+                   group_key TEXT NOT NULL, PRIMARY KEY(token, alias, source, group_key)
+                 ) WITHOUT ROWID;",
             )
             .unwrap();
         let space_id = "spc_00000000-0000-4000-8000-000000000001";
@@ -5190,7 +7677,7 @@ mod tests {
             let mut revision = transaction
                 .prepare(
                     "INSERT INTO context_revision VALUES (
-                       ?, ?, ?, 'decision', ?, ?, ?, '[]', '[]', 'accepted', 1000
+                       ?, ?, ?, 'decision', ?, ?, ?, '[]', '[]', 'accepted', 1000, NULL, ''
                      )",
                 )
                 .unwrap();
@@ -5205,7 +7692,7 @@ mod tests {
                 .prepare("INSERT INTO scope VALUES (?, 'domain', 'search')")
                 .unwrap();
             let mut fts = transaction
-                .prepare("INSERT INTO context_fts VALUES (?, ?, ?, ?, ?, ?)")
+                .prepare("INSERT INTO context_fts VALUES (?, ?, ?, ?, ?, ?, '', '')")
                 .unwrap();
             for index in 0..ROWS {
                 let context_id = format!("ctx_00000000-0000-4000-8000-{index:012x}");
@@ -5267,11 +7754,25 @@ mod tests {
                 page_size: 20,
                 ..SearchRequest::default()
             };
-            search_in_snapshot(&connection, &request, "benchmark-tree", false).unwrap();
+            search_in_snapshot(
+                &connection,
+                &request,
+                "benchmark-tree",
+                false,
+                &ContextTtlSettings::default(),
+            )
+            .unwrap();
             let mut samples = Vec::with_capacity(ITERATIONS);
             for _ in 0..ITERATIONS {
                 let started = Instant::now();
-                search_in_snapshot(&connection, &request, "benchmark-tree", false).unwrap();
+                search_in_snapshot(
+                    &connection,
+                    &request,
+                    "benchmark-tree",
+                    false,
+                    &ContextTtlSettings::default(),
+                )
+                .unwrap();
                 samples.push(started.elapsed());
             }
             samples.sort_unstable();

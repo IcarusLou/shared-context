@@ -722,6 +722,8 @@ fn adapter_injects_frozen_safe_revision_after_current_revision_is_withdrawn() {
         decision_context,
         vec![decision_revision],
         ContextRevisionDraft {
+            problem_view: None,
+            hints: Vec::new(),
             kind: ContextKind::Decision,
             topic_key: Some("search/frontend-rendering".to_owned()),
             statement: "withdrawncurrentneedle replaces the historical Graph decision".to_owned(),
@@ -1119,6 +1121,7 @@ const fn relation_kind_name(kind: ContextRelationKind) -> &'static str {
         ContextRelationKind::Implements => "implements",
         ContextRelationKind::ValidatedBy => "validated_by",
         ContextRelationKind::Contradicts => "contradicts",
+        ContextRelationKind::Supersedes => "supersedes",
         ContextRelationKind::RelatedTo => "related_to",
     }
 }

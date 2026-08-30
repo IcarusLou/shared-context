@@ -21,7 +21,8 @@ use sctx_domain::{
 use sctx_event_schema::Event;
 use sctx_git_store::{
     CandidateConfirmationWriteStatus, CandidateSubmissionIndex, CandidateSubmissionLookup,
-    CandidateSubmissionRequest, CrashInjector, CrashSeam, Error, ErrorKind, GitStore, Result,
+    CandidateSubmissionRequest, CandidateSubmissionStatus, CrashInjector, CrashSeam, Error,
+    ErrorKind, GitStore, Result,
 };
 use sctx_index::{IndexUpdateKind, ProjectionIndex};
 
@@ -34,6 +35,8 @@ fn request(submission_id: SubmissionId, statement: &str) -> CandidateSubmissionR
             task_id: TaskId::new(),
         },
         content: ContextRevisionDraft {
+            problem_view: None,
+            hints: Vec::new(),
             kind: ContextKind::Discovery,
             topic_key: Some("candidate/submission-idempotency".to_owned()),
             statement: statement.to_owned(),
@@ -118,6 +121,7 @@ fn confirmation_plan(store: &GitStore, index: &ProjectionIndex) -> CandidateConf
             supports: "The confirmed Context is implemented by this file".to_owned(),
             limitations: Vec::new(),
         }],
+        Vec::new(),
     )
     .unwrap()
 }
@@ -732,6 +736,7 @@ fn confirmation_privacy_failure_writes_no_event_or_pending_journal() {
             space_id: primary_space_id,
         },
         Vec::new(),
+        Vec::new(),
     )
     .unwrap();
     let before = Command::new("git")
@@ -752,4 +757,188 @@ fn confirmation_privacy_failure_writes_no_event_or_pending_journal() {
         .unwrap()
         .stdout;
     assert_eq!(after, before);
+}
+
+fn batch_requests(count: usize) -> Vec<CandidateSubmissionRequest> {
+    let episode = WorkEpisodeRef {
+        episode_id: WorkEpisodeId::new(),
+        task_session_id: TaskSessionId::new(),
+        task_id: TaskId::new(),
+    };
+    (0..count)
+        .map(|index| CandidateSubmissionRequest {
+            source_episode: episode,
+            ..request(
+                SubmissionId::new(),
+                &format!("one Episode produced Candidate {index}"),
+            )
+        })
+        .collect()
+}
+
+fn head_commit_count(store: &GitStore) -> usize {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(store.repository())
+        .args(["rev-list", "--count", "HEAD"])
+        .output()
+        .unwrap();
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn one_hundred_concurrent_batch_submissions_converge_to_one_atomic_commit() {
+    let (_temporary, store, _index) = configured_store();
+    let requests = Arc::new(batch_requests(5));
+    let before = head_commit_count(&store);
+    let store = Arc::new(store);
+    let barrier = Arc::new(Barrier::new(100));
+    let writes = (0..100)
+        .map(|_| {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let requests = Arc::clone(&requests);
+            thread::spawn(move || {
+                barrier.wait();
+                store.submit_candidates(&requests).unwrap()
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        writes
+            .iter()
+            .filter(|write| write.status == CandidateSubmissionStatus::Created)
+            .count(),
+        1
+    );
+    for write in &writes {
+        assert_eq!(write.entries.len(), 5);
+        for (entry, expected) in write.entries.iter().zip(writes[0].entries.iter()) {
+            assert_eq!(entry.submission_id, expected.submission_id);
+            assert_eq!(entry.record, expected.record);
+            assert_eq!(entry.append.batch_id, expected.record.batch_id);
+        }
+    }
+    // Every Candidate keeps its own Writer batch id even though one commit carries the slice.
+    let batch_ids = writes[0]
+        .entries
+        .iter()
+        .map(|entry| entry.record.batch_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(batch_ids.len(), 5);
+    let commit_oids = writes[0]
+        .entries
+        .iter()
+        .map(|entry| entry.record.commit_oid.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(commit_oids.len(), 1);
+    assert_eq!(head_commit_count(&store), before + 1);
+}
+
+#[test]
+fn batch_submission_crash_seams_recover_every_candidate_with_stable_metadata() {
+    for seam in [
+        CrashSeam::AfterJournal,
+        CrashSeam::BeforeCreate,
+        CrashSeam::AfterCreate,
+        CrashSeam::BeforeAdd,
+        CrashSeam::AfterAdd,
+        CrashSeam::BeforeCommit,
+        CrashSeam::AfterCommit,
+        CrashSeam::BeforeCommitOid,
+        CrashSeam::AfterCommitOid,
+        CrashSeam::BeforeIndex,
+        CrashSeam::AfterIndex,
+        CrashSeam::BeforeCleanup,
+        CrashSeam::AfterCleanup,
+    ] {
+        let (_temporary, store, index) = configured_store();
+        let requests = batch_requests(3);
+        let before = head_commit_count(&store);
+        let crashing = store
+            .clone()
+            .with_crash_injector(Arc::new(FailOnce::at(seam)));
+        assert!(crashing.submit_candidates(&requests).is_err(), "{seam:?}");
+
+        let recovered = store.submit_candidates(&requests).unwrap();
+        assert_eq!(recovered.entries.len(), 3, "{seam:?}");
+        assert!(store.list_pending().unwrap().is_empty(), "{seam:?}");
+        assert_eq!(head_commit_count(&store), before + 1, "{seam:?}");
+        let records = recovered
+            .entries
+            .iter()
+            .map(|entry| entry.record.clone())
+            .collect::<Vec<_>>();
+
+        // Replaying the same Episode build returns the same Candidate identities.
+        let replayed = store.submit_candidates(&requests).unwrap();
+        assert_eq!(replayed.status, CandidateSubmissionStatus::AlreadyExists);
+        assert!(replayed.written.is_none(), "{seam:?}");
+        for (entry, record) in replayed.entries.iter().zip(&records) {
+            assert_eq!(&entry.record, record, "{seam:?}");
+            assert_eq!(entry.status, CandidateSubmissionStatus::AlreadyExists);
+        }
+
+        fs::remove_file(index.database_path()).unwrap();
+        let rebuilt = store.submit_candidates(&requests).unwrap();
+        assert_eq!(rebuilt.status, CandidateSubmissionStatus::AlreadyExists);
+        for (entry, record) in rebuilt.entries.iter().zip(&records) {
+            assert_eq!(&entry.record, record, "{seam:?}");
+        }
+        assert_eq!(head_commit_count(&store), before + 1, "{seam:?}");
+    }
+}
+
+#[test]
+fn batch_submission_writes_only_the_members_that_are_not_already_present() {
+    let (_temporary, store, _index) = configured_store();
+    let requests = batch_requests(3);
+    let first = store
+        .submit_candidates(std::slice::from_ref(&requests[0]))
+        .unwrap();
+    let before = head_commit_count(&store);
+    let mixed = store.submit_candidates(&requests).unwrap();
+    assert_eq!(mixed.status, CandidateSubmissionStatus::Created);
+    assert_eq!(
+        mixed.entries[0].status,
+        CandidateSubmissionStatus::AlreadyExists
+    );
+    assert_eq!(mixed.entries[0].record, first.entries[0].record);
+    assert_eq!(mixed.entries[1].status, CandidateSubmissionStatus::Created);
+    assert_eq!(mixed.entries[2].status, CandidateSubmissionStatus::Created);
+    assert_eq!(mixed.written.as_ref().unwrap().event_ids.len(), 2);
+    assert_eq!(head_commit_count(&store), before + 1);
+}
+
+#[test]
+fn batch_submission_rejects_a_conflicting_member_before_writing_anything() {
+    let (_temporary, store, _index) = configured_store();
+    let requests = batch_requests(3);
+    store
+        .submit_candidates(std::slice::from_ref(&requests[1]))
+        .unwrap();
+    let before = head_commit_count(&store);
+    let mut conflicting = requests.clone();
+    conflicting[1].content.statement = "the same SubmissionId cannot change content".to_owned();
+    let error = store.submit_candidates(&conflicting).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::IdempotencyKeyConflict);
+    assert!(error.message().contains("batch item 1"), "{error}");
+    assert!(store.list_pending().unwrap().is_empty());
+    assert_eq!(head_commit_count(&store), before);
+
+    let repeated = vec![requests[0].clone(), requests[0].clone()];
+    let error = store.submit_candidates(&repeated).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(error.message().contains("batch item 1"), "{error}");
+    assert_eq!(head_commit_count(&store), before);
+
+    let error = store.submit_candidates(&[]).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
 }

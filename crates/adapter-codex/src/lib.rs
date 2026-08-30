@@ -2,6 +2,13 @@
 //!
 //! Supports Codex CLI 0.147.0 and newer. Codex Hook Trust is explicit: an unconfirmed state is
 //! reported as `ACTION REQUIRED` and disables all Hook capabilities while MCP + CLI remain usable.
+//!
+//! The documented payload carries exactly one identity field, `session_id`, and Codex reports the
+//! same `session_id` to a thread spawned from a parent conversation. The spawned thread's own
+//! identity and its parent link exist only in the local rollout record, never in a Hook payload or
+//! an MCP argument, and the `external_session_id` an Agent supplies is model-authored. Concurrent
+//! Agents inside one Codex conversation therefore cannot be separated here; the Runtime separates
+//! their Working Intent lineages instead (see `TaskRuntime::continue_working_intent`).
 
 use std::path::PathBuf;
 

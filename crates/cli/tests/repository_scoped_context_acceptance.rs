@@ -10,6 +10,7 @@ use std::{
 };
 
 use fs2::FileExt;
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
 use sctx_domain::ExternalSessionLocator;
 use sctx_git_store::GitStore;
 use sctx_installer::{
@@ -35,7 +36,7 @@ const SKILL_METADATA_BYTES: &[u8] =
 #[derive(Debug, Deserialize)]
 struct Oracle {
     schema: String,
-    activation_marker: String,
+    activation_marker_template: String,
     source_assets: SourceAssets,
     token_proxy: TokenProxy,
     enabled_chain: EnabledChain,
@@ -69,7 +70,7 @@ struct DisabledProxy {
 
 #[derive(Debug, Deserialize)]
 struct EnabledProxy {
-    activation_bytes: usize,
+    activation_fixed_bytes: usize,
     activation_max_bytes: usize,
     workflow_reads: usize,
     mcp_calls: usize,
@@ -256,6 +257,15 @@ struct McpResponse {
 
 fn oracle() -> Oracle {
     serde_json::from_slice(ORACLE_BYTES).unwrap()
+}
+
+impl Oracle {
+    /// The exact marker the Hook must emit for one Agent profile and host Session id.
+    fn activation_marker(&self, profile: AgentProfile, session: &str) -> String {
+        self.activation_marker_template
+            .replace("{host_session_id}", session)
+            .replace("{agent_kind}", profile.agent())
+    }
 }
 
 fn initialize_repository(path: &Path) {
@@ -588,9 +598,9 @@ fn sanitize_dynamic_data(value: &mut Value, private_root: &Path) {
     }
 }
 
-fn activate_skill(marker: Option<&str>, oracle: &Oracle) -> (usize, usize) {
+fn activate_skill(marker: Option<&str>, expected: &str) -> (usize, usize) {
     match marker {
-        Some(marker) if marker == oracle.activation_marker => {
+        Some(marker) if marker == expected => {
             let workflow = fs::read("../../skills/shared-context/references/workflow.md")
                 .or_else(|_| fs::read("skills/shared-context/references/workflow.md"))
                 .unwrap();
@@ -727,13 +737,14 @@ fn run_enabled_chain(
             profile,
             &session_start(profile, session, startup, "startup")
         ),
-        profile.activation(&oracle.activation_marker)
+        profile.activation(&oracle.activation_marker(profile, session))
     );
     assert_eq!(
         fixture.hook(profile, &prompt_submit(profile, session, startup)),
         json!({})
     );
-    let (workflow_reads, workflow_bytes) = activate_skill(Some(&oracle.activation_marker), oracle);
+    let marker = oracle.activation_marker(profile, session);
+    let (workflow_reads, workflow_bytes) = activate_skill(Some(&marker), &marker);
     assert_eq!(workflow_reads, oracle.token_proxy.enabled.workflow_reads);
     assert_eq!(workflow_bytes, oracle.source_assets.workflow);
 
@@ -872,21 +883,47 @@ fn fixed_oracle_closes_direct_group_disabled_and_token_proxy_contract() {
     assert_eq!(WORKFLOW_BYTES.len(), oracle.source_assets.workflow);
     assert_eq!(SKILL_METADATA_BYTES.len(), oracle.source_assets.metadata);
     assert_eq!(
-        oracle.activation_marker.len(),
-        oracle.token_proxy.enabled.activation_bytes
+        oracle
+            .activation_marker_template
+            .replace("{host_session_id}", "")
+            .replace("{agent_kind}", "")
+            .len(),
+        oracle.token_proxy.enabled.activation_fixed_bytes,
+        "only the host Session id and Agent kind may vary between markers"
     );
-    assert!(
-        oracle.token_proxy.enabled.activation_bytes
-            <= oracle.token_proxy.enabled.activation_max_bytes
-    );
+    for (profile, agent, session) in [
+        (
+            AgentProfile::Codex,
+            AgentKind::Codex,
+            "synthetic-proxy-codex",
+        ),
+        (
+            AgentProfile::Cursor,
+            AgentKind::Cursor,
+            "synthetic-proxy-cursor",
+        ),
+    ] {
+        let marker = oracle.activation_marker(profile, session);
+        assert_eq!(
+            marker,
+            shared_context_activation_marker(agent, session),
+            "the oracle marker must match the shipped renderer"
+        );
+        assert!(marker.len() <= oracle.token_proxy.enabled.activation_max_bytes);
+        assert_eq!(
+            marker.len(),
+            oracle.token_proxy.enabled.activation_fixed_bytes
+                + profile.agent().len()
+                + 2 * session.len()
+        );
+    }
     let fixed_oracle = String::from_utf8(ORACLE_BYTES.to_vec()).unwrap();
     for forbidden in [
         "/Users/",
         "/home/",
         "bytedance",
         "transcript_path",
-        "external_session_id",
-        "conversation_id",
+        "synthetic-",
         "user_email",
         "SYNTHETIC_PRIVATE_PROMPT",
     ] {
@@ -972,7 +1009,10 @@ fn fixed_oracle_closes_direct_group_disabled_and_token_proxy_contract() {
             json!({})
         );
         assert_eq!(fixture.business_snapshot(), before);
-        assert_eq!(activate_skill(None, &oracle), (0, 0));
+        assert_eq!(
+            activate_skill(None, &oracle.activation_marker(profile, session)),
+            (0, 0)
+        );
     }
     assert_eq!(
         oracle.token_proxy.disabled,
@@ -1001,7 +1041,7 @@ fn first_locator_decision_is_sticky_and_disabled_residue_is_exactly_zero() {
                 "startup"
             )
         ),
-        AgentProfile::Codex.activation(&oracle.activation_marker)
+        AgentProfile::Codex.activation(&oracle.activation_marker(AgentProfile::Codex, enabled))
     );
     let AuthorizedSessionScopeRead::Current(first) = fixture.scope(AgentProfile::Codex, enabled)
     else {
@@ -1016,7 +1056,7 @@ fn first_locator_decision_is_sticky_and_disabled_residue_is_exactly_zero() {
                 AgentProfile::Codex,
                 &session_start(AgentProfile::Codex, enabled, cwd, source)
             ),
-            AgentProfile::Codex.activation(&oracle.activation_marker)
+            AgentProfile::Codex.activation(&oracle.activation_marker(AgentProfile::Codex, enabled))
         );
         assert!(matches!(
             fixture.scope(AgentProfile::Codex, enabled),
@@ -1266,7 +1306,7 @@ fn safe_unregistered_claim_requires_owned_non_locating_observation_and_unsafe_pa
                 "startup"
             )
         ),
-        AgentProfile::Codex.activation(&oracle.activation_marker)
+        AgentProfile::Codex.activation(&oracle.activation_marker(AgentProfile::Codex, session))
     );
     let task = mcp_call(
         &fixture.home,

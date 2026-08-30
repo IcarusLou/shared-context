@@ -11,8 +11,8 @@ use std::{
 use sctx_domain::{ArtifactLocator, ErrorKind, RepositoryGroupId, RepositoryId};
 use sctx_local_state::{
     ActivationScope, ActivationScopeDecision, CatalogCheckoutStatus, CatalogRepositoryGroupStatus,
-    RepositoryCatalogEntry, RepositoryCatalogSnapshot, RepositoryGroupCatalogEntry,
-    UserConfigStore,
+    RepositoryCatalogDiagnostic, RepositoryCatalogEntry, RepositoryCatalogSnapshot,
+    RepositoryGroupCatalogEntry, UserConfigStore,
 };
 use tempfile::TempDir;
 
@@ -372,6 +372,142 @@ fn catalog_writes_are_concurrent_and_doctor_reports_checkout_drift() {
             .filter(|checkout| checkout.status == CatalogCheckoutStatus::Missing)
             .count(),
         1
+    );
+}
+
+#[test]
+fn doctor_reports_legacy_repository_ids_with_a_stable_kind_without_affecting_healthy() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("catalog root");
+    let legacy_repository = init_repo(&temporary.path().join("legacy repo"), "legacy");
+    let readable_repository = init_repo(&temporary.path().join("readable repo"), "readable");
+    let config = UserConfigStore::initialize(&root).unwrap();
+    let legacy_id: RepositoryId = "rpo_00000000-0000-4000-8000-000000000901".parse().unwrap();
+    let readable_id: RepositoryId = "FE".parse().unwrap();
+    config
+        .add_repository(legacy_id.clone(), std::slice::from_ref(&legacy_repository))
+        .unwrap();
+    config
+        .add_repository(
+            readable_id.clone(),
+            std::slice::from_ref(&readable_repository),
+        )
+        .unwrap();
+
+    let doctor = config.doctor_repository_catalog().unwrap();
+    assert!(
+        doctor.healthy,
+        "a legacy identity spelling is a migration hint, not a health failure"
+    );
+    assert_eq!(doctor.diagnostics.len(), 1);
+    let RepositoryCatalogDiagnostic::LegacyRepositoryId {
+        repository_id,
+        message,
+        migration_command,
+    } = &doctor.diagnostics[0];
+    assert_eq!(*repository_id, legacy_id);
+    assert!(message.contains("ADR-0001"));
+    assert_eq!(
+        migration_command,
+        &format!("sctx repository rename --from {legacy_id} --to <ReadableRepositoryId>")
+    );
+
+    // Renaming the legacy identity away clears the diagnostic.
+    config
+        .rename_repository(&legacy_id, &"Android".parse().unwrap())
+        .unwrap();
+    assert!(
+        config
+            .doctor_repository_catalog()
+            .unwrap()
+            .diagnostics
+            .is_empty()
+    );
+}
+
+#[test]
+fn rename_repository_is_local_only_updates_group_membership_and_rejects_conflicts() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("catalog root");
+    let group_root = temporary.path().join("group");
+    let first = init_repo(&group_root.join("first"), "first");
+    let second = init_repo(&temporary.path().join("second"), "second");
+    let group_root = fs::canonicalize(group_root).unwrap();
+    let config = UserConfigStore::initialize(&root).unwrap();
+    let legacy_id: RepositoryId = "rpo_00000000-0000-4000-8000-000000000902".parse().unwrap();
+    let existing_id: RepositoryId = "FE".parse().unwrap();
+    config
+        .add_repository(legacy_id.clone(), std::slice::from_ref(&first))
+        .unwrap();
+    config
+        .add_repository(existing_id.clone(), std::slice::from_ref(&second))
+        .unwrap();
+    let group = config
+        .add_repository_group(&group_root, std::slice::from_ref(&legacy_id))
+        .unwrap()
+        .repository_group;
+
+    let readable_id: RepositoryId = "Android".parse().unwrap();
+    let renamed = config.rename_repository(&legacy_id, &readable_id).unwrap();
+    assert_eq!(renamed.previous_repository_id, legacy_id);
+    assert_eq!(renamed.repository.repository_id, readable_id);
+    assert_eq!(renamed.repository.checkout_paths, vec![first.clone()]);
+    assert_eq!(renamed.renamed_repository_group_members, 1);
+
+    let catalog = config.repository_catalog().unwrap();
+    assert!(
+        catalog
+            .repositories
+            .iter()
+            .any(|repository| repository.repository_id == readable_id)
+    );
+    assert!(
+        !catalog
+            .repositories
+            .iter()
+            .any(|repository| repository.repository_id == legacy_id)
+    );
+    let group_check = catalog
+        .repository_groups
+        .iter()
+        .find(|check| check.repository_group_id == group.repository_group_id)
+        .unwrap();
+    assert_eq!(group_check.member_repository_ids, vec![readable_id.clone()]);
+
+    // Same-content replay after a successful rename now reports the old
+    // identity as not configured.
+    assert_eq!(
+        config
+            .rename_repository(&legacy_id, &"iOS".parse().unwrap())
+            .unwrap_err()
+            .kind(),
+        ErrorKind::RepositoryNotConfigured
+    );
+
+    // The target identity already names a configured Repository (exact and
+    // case-insensitive) -- both are rejected as a typed Conflict.
+    assert_eq!(
+        config
+            .rename_repository(&readable_id, &existing_id)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Conflict
+    );
+    assert_eq!(
+        config
+            .rename_repository(&readable_id, &"fe".parse().unwrap())
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Conflict
+    );
+
+    // Renaming an identity to itself is rejected before any lock is taken.
+    assert_eq!(
+        config
+            .rename_repository(&readable_id, &readable_id)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidInput
     );
 }
 
@@ -1138,5 +1274,57 @@ fn pure_longest_prefix_resolution_meets_the_hot_path_budget() {
     assert!(
         hook_p99 < 25_000,
         "Hook Repository mapping p99 {hook_p99}us >= 25ms"
+    );
+}
+
+#[test]
+fn hook_switches_default_to_off_and_survive_an_explicit_catalog_write() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("共享 配置");
+    let repository = init_repo(&temporary.path().join("switch repo"), "switch");
+    let store = UserConfigStore::initialize(&root).unwrap();
+
+    let (catalog, hooks) = store.repository_catalog_with_hooks().unwrap();
+    assert!(catalog.repositories.is_empty());
+    assert!(
+        !hooks.artifact_focus_reminder,
+        "an absent [hooks] table means every switch is off"
+    );
+
+    let config_path = root.join("config.toml");
+    let mut text = fs::read_to_string(&config_path).unwrap();
+    text.push_str("\n[hooks]\nartifact_focus_reminder = true\n");
+    fs::write(&config_path, text).unwrap();
+    assert!(
+        store
+            .repository_catalog_with_hooks()
+            .unwrap()
+            .1
+            .artifact_focus_reminder
+    );
+
+    // A later explicit Catalog write must round-trip the switch, not drop it.
+    store
+        .add_repository(
+            "FE".parse::<RepositoryId>().unwrap(),
+            std::slice::from_ref(&repository),
+        )
+        .unwrap();
+    let (catalog, hooks) = store.repository_catalog_with_hooks().unwrap();
+    assert_eq!(catalog.repositories.len(), 1);
+    assert!(hooks.artifact_focus_reminder);
+    assert!(
+        fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("[hooks]")
+    );
+
+    let mut text = fs::read_to_string(&config_path).unwrap();
+    text.push_str("unknown_switch = true\n");
+    fs::write(&config_path, text).unwrap();
+    assert_eq!(
+        store.repository_catalog_with_hooks().unwrap_err().kind(),
+        ErrorKind::InvalidInput,
+        "an undocumented [hooks] key is refused instead of silently ignored"
     );
 }

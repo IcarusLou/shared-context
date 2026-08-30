@@ -106,6 +106,8 @@ fn candidate_event(submission_id: SubmissionId, statement: &str) -> Event {
             task_id: TaskId::new(),
         },
         ContextRevisionDraft {
+            problem_view: None,
+            hints: Vec::new(),
             kind: ContextKind::Discovery,
             topic_key: None,
             statement: statement.to_owned(),

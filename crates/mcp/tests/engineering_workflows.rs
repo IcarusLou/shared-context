@@ -218,6 +218,8 @@ export function webSearch() { return fetch("/api/search"); }
 
 fn context_draft(statement: &str) -> ContextRevisionDraft {
     ContextRevisionDraft {
+        problem_view: None,
+        hints: Vec::new(),
         kind: ContextKind::Decision,
         topic_key: Some(format!("graph/{statement}")),
         statement: statement.to_owned(),
@@ -301,6 +303,133 @@ fn accepted_context(root: &Path, statement: &str) -> (ContextId, RevisionId) {
         .unwrap(),
     );
     (context_id, revision_id)
+}
+
+/// A Direct-scoped Checkpoint acknowledges without deriving, and Candidate Build places the
+/// spellings once (WP-P). The ACK is receipt plus outbox; nothing in it reads a checkout.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn checkpoint_ack_derives_nothing_and_candidate_build_places_the_spellings_once() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("build derivation root");
+    let checkout = temporary.path().join("derivation checkout");
+    init_repo(
+        &checkout,
+        &[("app/src/anchor/ProductAnchorAssem.kt", "// fixture\n")],
+    );
+    let checkout = fs::canonicalize(&checkout).unwrap();
+    GitStore::bootstrap_local(&root).unwrap();
+    let repository = UserConfigStore::initialize(&root)
+        .unwrap()
+        .add_repository(
+            "Derivation".parse().unwrap(),
+            std::slice::from_ref(&checkout),
+        )
+        .unwrap()
+        .repository;
+    let session = "build-derivation";
+    let locator = ExternalSessionLocator::new("codex", session).unwrap();
+    let catalog = UserConfigStore::open_existing(&root)
+        .unwrap()
+        .repository_catalog_wait()
+        .unwrap();
+    AuthorizedSessionScopeStore::initialize(&root)
+        .unwrap()
+        .authorize(
+            &locator,
+            &ActivationScope {
+                decision: ActivationScopeDecision::Direct {
+                    repository_id: repository.repository_id.clone(),
+                    checkout_path: checkout,
+                },
+                allowed_repository_ids: vec![repository.repository_id.clone()],
+            },
+            &catalog,
+        )
+        .unwrap();
+    task_intent_update_at_root(
+        &root,
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            task_boundary: TaskBoundary::New,
+            expected_revision_id: ExpectedRevisionId::Null(()),
+            intent: WorkingIntentSnapshot::new("place the spellings at build time").unwrap(),
+        },
+    )
+    .unwrap();
+    let accepted = sctx_mcp::task_checkpoint_at_root(
+        &root,
+        &sctx_mcp::TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            claims: vec![sctx_mcp::TaskCheckpointClaimInput {
+                context_kind: ContextKind::Issue,
+                statement: "ProductAnchorAssem.kt:202 returns early and skips navigation"
+                    .to_owned(),
+                rationale: "The early return observably diverges from the baseline".to_owned(),
+                conditions: vec!["live entry service is absent".to_owned()],
+                evidence: vec![sctx_mcp::TaskCheckpointEvidenceInput {
+                    evidence_type: EvidenceType::SourceSnapshot,
+                    summary: "ProductAnchorAssem.kt:202 returns before dispatch".to_owned(),
+                    limitations: Vec::new(),
+                }],
+            }],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap()
+    .into_accepted()
+    .expect("a nonempty Checkpoint is accepted");
+    let runtime = TaskRuntime::initialize(&root).unwrap();
+    let episode = runtime
+        .read_work_episode(accepted.episode_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        episode.checkpoints[0].claims[0]
+            .engineering_references
+            .is_empty(),
+        "the durable ACK never consults a checkout"
+    );
+
+    // The Build drains the outbox without the authoring session's scope in hand and still resolves
+    // the checkout, because the scope is looked up by the Episode's own locator.
+    sctx_mcp::build_closed_episode_at_root(&root, accepted.episode_id).unwrap();
+    let derived = runtime
+        .read_work_episode(accepted.episode_id)
+        .unwrap()
+        .unwrap();
+    let references = &derived.checkpoints[0].claims[0].engineering_references;
+    assert_eq!(references.len(), 1, "{references:#?}");
+    assert_eq!(
+        references[0].locator.path().as_str(),
+        "app/src/anchor/ProductAnchorAssem.kt"
+    );
+    assert_eq!(references[0].repository_id, repository.repository_id);
+    assert_eq!(
+        derived.checkpoints[0].claims[0].topic_key_hint.as_deref(),
+        Some("issue:Derivation:app/src/anchor/ProductAnchorAssem.kt")
+    );
+    assert!(
+        runtime
+            .pending_claim_reference_candidates(accepted.episode_id)
+            .unwrap()
+            .is_none(),
+        "a placed Episode never asks Git again"
+    );
+    sctx_mcp::build_closed_episode_at_root(&root, accepted.episode_id).unwrap();
+    assert_eq!(
+        &runtime
+            .read_work_episode(accepted.episode_id)
+            .unwrap()
+            .unwrap()
+            .checkpoints[0]
+            .claims[0]
+            .engineering_references,
+        references,
+        "a Build rerun reports the first derivation"
+    );
 }
 
 #[test]
@@ -879,7 +1008,7 @@ fn public_mcp_artifact_focus_is_query_scoped_across_six_kinds_and_hot_path() {
             data["context"]["items"]
         );
         assert_eq!(
-            data["context"]["items"][0]["context"]["context_id"],
+            data["context"]["items"][0]["context_id"],
             case.context_id.to_string()
         );
         assert_eq!(data["context"]["graph_diagnostics"], json!([]));
@@ -938,7 +1067,7 @@ fn public_mcp_artifact_focus_is_query_scoped_across_six_kinds_and_hot_path() {
     let only_second = &only_second[0]["result"]["structuredContent"];
     assert_eq!(only_second["context"]["items"].as_array().unwrap().len(), 1);
     assert_eq!(
-        only_second["context"]["items"][0]["context"]["context_id"],
+        only_second["context"]["items"][0]["context_id"],
         second_case.context_id.to_string()
     );
     let stable_task_fingerprint = only_second["context"]["task_fingerprint"].clone();
@@ -995,7 +1124,7 @@ fn public_mcp_artifact_focus_is_query_scoped_across_six_kinds_and_hot_path() {
         1
     );
     assert_eq!(
-        after_restart["context"]["items"][0]["context"]["context_id"],
+        after_restart["context"]["items"][0]["context_id"],
         first_case.context_id.to_string()
     );
     assert_eq!(

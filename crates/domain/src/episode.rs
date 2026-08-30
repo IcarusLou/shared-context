@@ -853,6 +853,14 @@ pub enum CandidateAssessmentPath {
     ContextFullText {
         matched_terms: Vec<String>,
     },
+    /// Repository identifiers both the Candidate and the target spell out in their own prose.
+    ///
+    /// Two Claims can describe the same defect in different natural languages and share almost no
+    /// statement tokens, yet both name `SearchProductAnchorAssem`. The shared spelling is an
+    /// engineering-strength signal that survives translation and rewording.
+    SharedIdentifier {
+        identifiers: Vec<String>,
+    },
     ScopeOverlap {
         domains: Vec<String>,
         platforms: Vec<String>,
@@ -886,6 +894,14 @@ impl CandidateAssessmentPath {
                     return Err(invalid(format!("{field}.matched_terms must not be empty")));
                 }
                 require_text_items(matched_terms, &format!("{field}.matched_terms"))
+            }
+            Self::SharedIdentifier { identifiers } => {
+                if identifiers.len() < 2 {
+                    return Err(invalid(format!(
+                        "{field}.identifiers requires at least two shared identifiers"
+                    )));
+                }
+                require_text_items(identifiers, &format!("{field}.identifiers"))
             }
             Self::ScopeOverlap {
                 domains,
@@ -1927,6 +1943,8 @@ mod tests {
 
     fn content() -> ContextRevisionDraft {
         ContextRevisionDraft {
+            problem_view: None,
+            hints: Vec::new(),
             kind: ContextKind::Decision,
             topic_key: Some("checkpoint/fallback-owner".to_owned()),
             statement: "Keep fallback ownership server-side".to_owned(),

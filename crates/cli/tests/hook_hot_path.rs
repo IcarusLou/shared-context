@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sctx_agent_adapter::SHARED_CONTEXT_ACTIVATION_MARKER;
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
 use sctx_domain::{ExternalSessionLocator, TaskId, WorkingIntentSnapshot};
 use sctx_git_store::GitStore;
 use sctx_local_state::UserConfigStore;
@@ -121,7 +121,7 @@ fn thirty_two_post_tool_hooks_are_bounded_fail_open_and_write_zero_capture_state
     assert!(start.status.success());
     assert_eq!(
         serde_json::from_slice::<Value>(&start.stdout).unwrap(),
-        json!({"additional_context": SHARED_CONTEXT_ACTIVATION_MARKER})
+        json!({"additional_context": shared_context_activation_marker(AgentKind::Cursor, session)})
     );
     TaskRuntime::initialize(&root)
         .unwrap()

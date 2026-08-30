@@ -10,7 +10,7 @@ use std::{
 };
 
 use fs2::FileExt;
-use sctx_agent_adapter::SHARED_CONTEXT_ACTIVATION_MARKER;
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
 use sctx_domain::{ExternalSessionLocator, RepositoryId};
 use sctx_git_store::GitStore;
 use sctx_local_state::{
@@ -20,6 +20,28 @@ use sctx_local_state::{
 use sctx_task_runtime::TaskRuntime;
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
+
+fn codex_marker(session: &str) -> String {
+    shared_context_activation_marker(AgentKind::Codex, session)
+}
+
+fn cursor_marker(session: &str) -> String {
+    shared_context_activation_marker(AgentKind::Cursor, session)
+}
+
+/// Asserts one Hook wire output activated exactly this Agent kind and host Session id.
+fn assert_activated(output: &Output, agent: AgentKind, session: &str) {
+    assert!(output.status.success());
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let actual = match agent {
+        AgentKind::Codex => &response["hookSpecificOutput"]["additionalContext"],
+        AgentKind::Cursor => &response["additional_context"],
+    };
+    assert_eq!(
+        actual.as_str(),
+        Some(shared_context_activation_marker(agent, session).as_str())
+    );
+}
 
 struct Fixture {
     _temporary: TempDir,
@@ -284,7 +306,7 @@ fn exclusive_maintenance_keeps_session_start_neutral_without_business_residue() 
             "startup",
         ),
     );
-    assert!(String::from_utf8_lossy(&activated.stdout).contains(SHARED_CONTEXT_ACTIVATION_MARKER));
+    assert_activated(&activated, AgentKind::Codex, "maintenance-released");
 }
 
 #[test]
@@ -300,7 +322,7 @@ fn real_codex_and_cursor_session_start_wire_outputs_follow_durable_scope() {
         serde_json::from_slice::<Value>(&direct.stdout).unwrap(),
         json!({"hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+            "additionalContext": codex_marker("codex-direct")
         }})
     );
     assert!(matches!(
@@ -315,7 +337,7 @@ fn real_codex_and_cursor_session_start_wire_outputs_follow_durable_scope() {
     assert!(group.status.success());
     assert_eq!(
         serde_json::from_slice::<Value>(&group.stdout).unwrap(),
-        json!({"additional_context": SHARED_CONTEXT_ACTIVATION_MARKER})
+        json!({"additional_context": cursor_marker("cursor-group")})
     );
     let mut expected_members = vec![
         fixture.direct_repository_id.clone(),
@@ -432,7 +454,7 @@ fn enabled_tool_work_gets_one_intent_bootstrap_reminder_without_prompt_or_task_c
         "codex",
         &codex_start(codex_session, &fixture.direct_repository, "resume"),
     );
-    assert!(String::from_utf8_lossy(&resumed.stdout).contains(SHARED_CONTEXT_ACTIVATION_MARKER));
+    assert_activated(&resumed, AgentKind::Codex, codex_session);
     assert_neutral(&fixture.hook(
         "codex",
         &codex_post_tool(codex_session, &fixture.direct_repository),
@@ -501,7 +523,7 @@ fn marker_reappears_only_at_explicit_session_start_resume_or_compact_boundaries(
             serde_json::from_slice::<Value>(&output.stdout).unwrap(),
             json!({"hookSpecificOutput": {
                 "hookEventName": "SessionStart",
-                "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+                "additionalContext": codex_marker(session)
             }})
         );
         assert!(matches!(
@@ -539,16 +561,14 @@ fn repeated_session_start_keeps_the_first_disabled_direct_or_group_decision() {
         "codex",
         &codex_start("sticky-direct", &fixture.direct_repository, "startup"),
     );
-    assert!(String::from_utf8_lossy(&direct.stdout).contains(SHARED_CONTEXT_ACTIVATION_MARKER));
+    assert_activated(&direct, AgentKind::Codex, "sticky-direct");
     for (cwd, source) in [
         (&fixture.second_repository, "startup"),
         (&fixture.outside, "resume"),
         (&fixture.group_root, "compact"),
     ] {
         let repeated = fixture.hook("codex", &codex_start("sticky-direct", cwd, source));
-        assert!(
-            String::from_utf8_lossy(&repeated.stdout).contains(SHARED_CONTEXT_ACTIVATION_MARKER)
-        );
+        assert_activated(&repeated, AgentKind::Codex, "sticky-direct");
     }
     assert!(matches!(
         fixture.read_scope("codex", "sticky-direct"),
@@ -560,12 +580,12 @@ fn repeated_session_start_keeps_the_first_disabled_direct_or_group_decision() {
     ));
 
     let group = fixture.hook("cursor", &cursor_start("sticky-group", &fixture.group_root));
-    assert!(String::from_utf8_lossy(&group.stdout).contains(SHARED_CONTEXT_ACTIVATION_MARKER));
+    assert_activated(&group, AgentKind::Cursor, "sticky-group");
     let repeated = fixture.hook(
         "cursor",
         &cursor_start("sticky-group", &fixture.direct_repository),
     );
-    assert!(String::from_utf8_lossy(&repeated.stdout).contains(SHARED_CONTEXT_ACTIVATION_MARKER));
+    assert_activated(&repeated, AgentKind::Cursor, "sticky-group");
     assert!(matches!(
         fixture.read_scope("cursor", "sticky-group"),
         AuthorizedSessionScopeRead::Current(scope)
@@ -609,7 +629,7 @@ fn non_session_start_missing_expired_stale_and_disabled_leases_are_neutral() {
             "startup",
         ),
     );
-    assert!(String::from_utf8_lossy(&unrelated.stdout).contains(SHARED_CONTEXT_ACTIVATION_MARKER));
+    assert_activated(&unrelated, AgentKind::Codex, "unrelated-after-expiry");
     assert_neutral(&fixture.hook(
         "codex",
         &codex_start("expired", &fixture.second_repository, "resume"),
@@ -632,9 +652,7 @@ fn non_session_start_missing_expired_stale_and_disabled_leases_are_neutral() {
         "codex",
         &codex_start("stale", &fixture.direct_repository, "startup"),
     );
-    assert!(
-        String::from_utf8_lossy(&stale_start.stdout).contains(SHARED_CONTEXT_ACTIVATION_MARKER)
-    );
+    assert_activated(&stale_start, AgentKind::Codex, "stale");
     let third_repository = fixture.group_root.join("third app");
     fs::create_dir_all(&third_repository).unwrap();
     assert!(
@@ -745,7 +763,7 @@ fn busy_corrupt_and_symlink_lease_state_never_emit_activation() {
         "codex",
         &codex_start("lease-busy", &busy.direct_repository, "resume"),
     );
-    assert!(String::from_utf8_lossy(&retry.stdout).contains(SHARED_CONTEXT_ACTIVATION_MARKER));
+    assert_activated(&retry, AgentKind::Codex, "lease-busy");
     assert_no_runtime_or_capture(&busy.root());
 
     let corrupt = Fixture::new();
@@ -753,7 +771,7 @@ fn busy_corrupt_and_symlink_lease_state_never_emit_activation() {
         "codex",
         &codex_start("lease-corrupt", &corrupt.direct_repository, "startup"),
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains(SHARED_CONTEXT_ACTIVATION_MARKER));
+    assert_activated(&output, AgentKind::Codex, "lease-corrupt");
     let record = scope_records(&corrupt.root()).pop().unwrap();
     fs::write(record, "RAW_SCOPE_PARSE_ERROR").unwrap();
     assert_neutral(&corrupt.hook(
@@ -767,7 +785,7 @@ fn busy_corrupt_and_symlink_lease_state_never_emit_activation() {
         "cursor",
         &cursor_start("lease-symlink", &unsafe_state.direct_repository),
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains(SHARED_CONTEXT_ACTIVATION_MARKER));
+    assert_activated(&output, AgentKind::Cursor, "lease-symlink");
     let record = scope_records(&unsafe_state.root()).pop().unwrap();
     let target = unsafe_state.home.join("outside-scope-record.json");
     fs::write(&target, "{}\n").unwrap();
@@ -803,7 +821,7 @@ fn concurrent_and_repeated_session_start_reuses_one_locator_record() {
         if response
             == json!({"hookSpecificOutput": {
                 "hookEventName": "SessionStart",
-                "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+                "additionalContext": codex_marker("same-session")
             }})
         {
             activated += 1;
@@ -821,7 +839,7 @@ fn concurrent_and_repeated_session_start_reuses_one_locator_record() {
         "codex",
         &codex_start("same-session", &fixture.direct_repository, "resume"),
     );
-    assert!(String::from_utf8_lossy(&repeated.stdout).contains(SHARED_CONTEXT_ACTIVATION_MARKER));
+    assert_activated(&repeated, AgentKind::Codex, "same-session");
     let retained = match fixture.read_scope("codex", "same-session") {
         AuthorizedSessionScopeRead::Current(scope) => scope,
         other => panic!("expected refreshed scope, got {other:?}"),
@@ -837,7 +855,7 @@ fn locator_decisions_are_isolated_and_production_has_no_unscoped_planner() {
         "codex",
         &codex_start("locator-a", &fixture.direct_repository, "startup"),
     );
-    assert!(String::from_utf8_lossy(&enabled.stdout).contains(SHARED_CONTEXT_ACTIVATION_MARKER));
+    assert_activated(&enabled, AgentKind::Codex, "locator-a");
     assert_neutral(&fixture.hook(
         "codex",
         &codex_start("locator-b", &fixture.outside, "startup"),
@@ -871,7 +889,7 @@ fn unverified_authorized_hook_retains_degradation_but_disabled_is_neutral() {
     let response: Value = serde_json::from_slice(&output.stdout).unwrap();
     let diagnostic = response["additional_context"].as_str().unwrap();
     assert!(diagnostic.contains("MCP + CLI fallback"));
-    assert!(!diagnostic.contains(SHARED_CONTEXT_ACTIVATION_MARKER));
+    assert!(!diagnostic.contains("<shared-context-active"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("MCP + CLI fallback"));
     assert!(matches!(
         fixture.read_scope("cursor", "old-authorized"),

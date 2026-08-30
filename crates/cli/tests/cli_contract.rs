@@ -9,7 +9,7 @@ use std::{
     thread,
 };
 
-use sctx_agent_adapter::SHARED_CONTEXT_ACTIVATION_MARKER;
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
 use sctx_domain::{
     Applicability, CandidateReviewStatus, ContextKind, ContextRevisionDraft, Error, ErrorKind,
     EventId, EvidenceSnapshotDraft, ExternalSessionLocator, IntentSnapshot, PublicationAction,
@@ -199,6 +199,8 @@ fn seed_context(harness: &Harness, space_id: &str, statement: &str) -> (String, 
     let event = Event::context_revision_added(
         SpaceId::from_str(space_id).unwrap(),
         ContextRevisionDraft {
+            problem_view: None,
+            hints: Vec::new(),
             kind: ContextKind::Decision,
             topic_key: Some("cli/output".to_owned()),
             statement: statement.to_owned(),
@@ -236,7 +238,17 @@ struct CandidateOwner {
 }
 
 fn closed_candidate_owner(harness: &Harness, session: &str) -> CandidateOwner {
-    let _task = task_intent_update_at_root(
+    task_owned_candidate_source(harness, session).1
+}
+
+/// Establishes one fresh `ActiveTask` for `session` and closes an unknown-only Checkpoint,
+/// returning both the Task Intent response (for CLI CAS arguments) and the resulting Candidate
+/// ownership so a caller can submit git-only Candidates and then confirm/discard them by CLI.
+fn task_owned_candidate_source(
+    harness: &Harness,
+    session: &str,
+) -> (sctx_mcp::TaskIntentUpdateResponse, CandidateOwner) {
+    let task = task_intent_update_at_root(
         harness.root(),
         &TaskIntentUpdateInput {
             agent_kind: "codex".to_owned(),
@@ -274,9 +286,12 @@ fn closed_candidate_owner(harness: &Harness, session: &str) -> CandidateOwner {
     .unwrap()
     .into_accepted()
     .expect("unknown-only Checkpoint must be accepted");
-    CandidateOwner {
-        source_episode_id: closed.episode_id,
-    }
+    (
+        task,
+        CandidateOwner {
+            source_episode_id: closed.episode_id,
+        },
+    )
 }
 
 fn submit_git_only_candidate(
@@ -298,6 +313,8 @@ fn submit_git_only_candidate(
             submission_id,
             source_episode,
             content: ContextRevisionDraft {
+                problem_view: None,
+                hints: Vec::new(),
                 kind: ContextKind::Discovery,
                 topic_key: None,
                 statement: statement.to_owned(),
@@ -800,15 +817,16 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         "PostToolUse without a Prompt must not invent a Task Session"
     );
 
-    for response in [
-        start("session-alpha", &workspace),
-        start("session-beta", &workspace),
+    for (session, response) in [
+        ("session-alpha", start("session-alpha", &workspace)),
+        ("session-beta", start("session-beta", &workspace)),
     ] {
         assert_eq!(
             response,
             serde_json::json!({"hookSpecificOutput": {
                 "hookEventName": "SessionStart",
-                "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+                "additionalContext":
+                    shared_context_activation_marker(AgentKind::Codex, session)
             }})
         );
     }
@@ -935,7 +953,8 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         start("session-subdir", &workspace.join("src")),
         serde_json::json!({"hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+            "additionalContext":
+                shared_context_activation_marker(AgentKind::Codex, "session-subdir")
         }})
     );
     let subdirectory_post = hook(&serde_json::json!({
@@ -2027,6 +2046,156 @@ fn task_context_cli_entry_is_locator_only_and_read_only() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+fn task_context_and_candidate_list_cli_entries_support_compact_detail_level() {
+    let harness = Harness::new();
+    GitStore::bootstrap_local(harness.root()).unwrap();
+    let session = "cli-compact-detail-level";
+    task_intent_update_at_root(
+        harness.root(),
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            task_boundary: TaskBoundary::New,
+            expected_revision_id: ExpectedRevisionId::Null(()),
+            intent: WorkingIntentSnapshot {
+                goal: "exercise the CLI --compact flag".to_owned(),
+                current_direction: None,
+                in_scope: Vec::new(),
+                out_of_scope: Vec::new(),
+                domains: Vec::new(),
+                platforms: Vec::new(),
+                constraints: Vec::new(),
+                acceptance_conditions: Vec::new(),
+                artifact_hints: Vec::new(),
+                interface_hints: Vec::new(),
+                open_questions: Vec::new(),
+            },
+        },
+    )
+    .unwrap();
+
+    // `task context` defaults to the Rust entry point's Full detail level, matching the direct
+    // `task_context_readonly_at_root` behavior; `--compact` switches to a genuinely re-budgeted
+    // Compact payload rather than a client-side re-shaping of the Full result.
+    let full_context = harness.success(&[
+        "task",
+        "context",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        session,
+    ]);
+    assert_eq!(full_context["data"]["detail_level"], "full");
+    assert!(full_context["data"]["retrieval_paths"].is_array());
+    assert!(full_context["data"]["candidate_spaces"].is_array());
+
+    let compact_context = harness.success(&[
+        "task",
+        "context",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        session,
+        "--compact",
+    ]);
+    assert_eq!(compact_context["data"]["detail_level"], "compact");
+    assert!(compact_context["data"]["retrieval_paths"].is_null());
+    assert!(compact_context["data"]["candidate_spaces"].is_array());
+    assert!(compact_context["data"]["items"].is_array());
+    assert_eq!(
+        compact_context["data"]["task_session_id"],
+        full_context["data"]["task_session_id"]
+    );
+
+    let rejected_compact_value = harness.failure(&[
+        "task",
+        "context",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        session,
+        "--compact",
+        "true",
+    ]);
+    assert_eq!(rejected_compact_value["error"]["code"], "invalid_input");
+
+    // Produce one Pending Candidate so the compact/full Candidate list shapes are observably
+    // different, not merely both empty.
+    task_checkpoint_at_root(
+        harness.root(),
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            claims: vec![TaskCheckpointClaimInput {
+                context_kind: ContextKind::Discovery,
+                statement: "The CLI --compact flag reaches candidate_list_with_detail_at_root"
+                    .to_owned(),
+                rationale: "The compact and full rows are observably different shapes".to_owned(),
+                conditions: Vec::new(),
+                evidence: vec![TaskCheckpointEvidenceInput {
+                    evidence_type: sctx_domain::EvidenceType::ExperimentRecord,
+                    summary: "cli_contract.rs exercised both detail levels".to_owned(),
+                    limitations: Vec::new(),
+                }],
+            }],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap()
+    .into_accepted()
+    .expect("nonempty Checkpoint must be accepted");
+
+    let full_list = harness.success(&[
+        "candidate",
+        "list",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        session,
+    ]);
+    assert_eq!(full_list["data"]["detail_level"], "full");
+    let full_row = &full_list["data"]["reviews"][0];
+    assert!(full_row["content"].is_object());
+    assert!(full_row["analysis"].is_object());
+    assert!(full_row.get("top_assessment").is_none());
+
+    let compact_list = harness.success(&[
+        "candidate",
+        "list",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        session,
+        "--compact",
+    ]);
+    assert_eq!(compact_list["data"]["detail_level"], "compact");
+    let compact_row = &compact_list["data"]["reviews"][0];
+    assert_eq!(compact_row["untrusted_data"], true);
+    assert!(compact_row.get("content").is_none());
+    assert!(compact_row.get("analysis").is_none());
+    assert_eq!(compact_row["candidate_id"], full_row["candidate_id"]);
+
+    // Leaving `--status` at its default still recovers the same Pending Candidate under a
+    // repeated `--compact` call, so the flag composes with the existing filters unchanged.
+    let compact_pending = harness.success(&[
+        "candidate",
+        "list",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        session,
+        "--status",
+        "pending",
+        "--compact",
+    ]);
+    assert_eq!(
+        compact_pending["data"]["reviews"][0]["candidate_id"],
+        compact_row["candidate_id"]
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts() {
     let harness = Harness::new();
     GitStore::bootstrap_local(harness.root()).unwrap();
@@ -2362,7 +2531,10 @@ fn post_tool_hook_is_bounded_and_persists_no_raw_payload_or_capture_state() {
     assert!(start_output.status.success());
     assert_eq!(
         serde_json::from_slice::<Value>(&start_output.stdout).unwrap(),
-        serde_json::json!({"additional_context": SHARED_CONTEXT_ACTIVATION_MARKER})
+        serde_json::json!({
+            "additional_context":
+                shared_context_activation_marker(AgentKind::Cursor, "conv_contract")
+        })
     );
     let payload = serde_json::json!({
         "conversation_id": "conv_contract",
@@ -3019,4 +3191,358 @@ fn intent(title: &str) -> IntentSnapshot {
         acceptance_conditions: vec!["recoverable".to_owned()],
         domain_terms: Vec::new(),
     }
+}
+
+/// WP-C2: `candidate confirm --input` accepts either a strict single `candidate_id` shape or a
+/// `candidate_ids` batch shape, and `candidate discard` repeats `--candidate-id` to route to the
+/// same batch entry point; both keep the single-Candidate CLI output shape unchanged.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn candidate_confirm_and_discard_batches_are_atomic_and_single_id_keeps_prior_shape() {
+    let harness = Harness::new();
+    let (primary_space_id, _) = create_space(&harness, "CLI Batch Candidates");
+    let session = "cli-batch-candidates";
+    let task = task_intent_update_at_root(
+        harness.root(),
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            task_boundary: TaskBoundary::New,
+            expected_revision_id: ExpectedRevisionId::Null(()),
+            intent: WorkingIntentSnapshot {
+                goal: "confirm and discard several CLI Candidates".to_owned(),
+                current_direction: Some("write batch operations".to_owned()),
+                in_scope: Vec::new(),
+                out_of_scope: Vec::new(),
+                domains: Vec::new(),
+                platforms: Vec::new(),
+                constraints: Vec::new(),
+                acceptance_conditions: Vec::new(),
+                artifact_hints: Vec::new(),
+                interface_hints: Vec::new(),
+                open_questions: Vec::new(),
+            },
+        },
+    )
+    .unwrap();
+    let expected_task_id = task.context.task_id.to_string();
+    let expected_intent_revision_id = task.context.intent_revision_id.to_string();
+    let closed = task_checkpoint_at_root(
+        harness.root(),
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            claims: vec![
+                TaskCheckpointClaimInput {
+                    context_kind: ContextKind::Decision,
+                    statement: "Batch confirm keeps one atomic operation for candidate alpha"
+                        .to_owned(),
+                    rationale: "The alpha Candidate is provable independently".to_owned(),
+                    conditions: Vec::new(),
+                    evidence: vec![TaskCheckpointEvidenceInput {
+                        evidence_type: sctx_domain::EvidenceType::ExperimentRecord,
+                        summary: "The alpha CLI batch fixture passed".to_owned(),
+                        limitations: Vec::new(),
+                    }],
+                },
+                TaskCheckpointClaimInput {
+                    context_kind: ContextKind::Decision,
+                    statement: "Batch confirm keeps one atomic operation for candidate beta"
+                        .to_owned(),
+                    rationale: "The beta Candidate is provable independently".to_owned(),
+                    conditions: Vec::new(),
+                    evidence: vec![TaskCheckpointEvidenceInput {
+                        evidence_type: sctx_domain::EvidenceType::ExperimentRecord,
+                        summary: "The beta CLI batch fixture passed".to_owned(),
+                        limitations: Vec::new(),
+                    }],
+                },
+            ],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap()
+    .into_accepted()
+    .expect("nonempty Checkpoint must be accepted");
+    assert_eq!(
+        closed.candidate_build.status,
+        sctx_mcp::CandidateBuildResponseStatus::Pending
+    );
+    let candidate_ids = candidate_list_at_root(
+        harness.root(),
+        &CandidateListInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            status: CandidateReviewStatus::Pending,
+            limit: 10,
+            cursor: None,
+            token_budget: 32_768,
+        },
+    )
+    .unwrap()
+    .reviews
+    .into_iter()
+    .map(|review| review.0.candidate_id.to_string())
+    .collect::<Vec<_>>();
+    assert_eq!(candidate_ids.len(), 2);
+
+    // Both `candidate_id` and `candidate_ids` present is a typed CLI-layer error.
+    let both_path = harness.home.join("candidate-confirm-both.json");
+    fs::write(
+        &both_path,
+        serde_json::to_vec(&serde_json::json!({
+            "agent_kind": "codex",
+            "external_session_id": session,
+            "expected_task_id": expected_task_id,
+            "expected_intent_revision_id": expected_intent_revision_id,
+            "candidate_id": candidate_ids[0],
+            "candidate_ids": candidate_ids,
+            "expected_review_version": 1,
+            "primary": {"existing_space_id": primary_space_id},
+            "related_space_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let both_failure = harness.failure(&[
+        "candidate",
+        "confirm",
+        "--input",
+        both_path.to_str().unwrap(),
+    ]);
+    assert_eq!(both_failure["error"]["code"], "invalid_input");
+
+    // Neither `candidate_id` nor `candidate_ids` present is also a typed CLI-layer error.
+    let neither_path = harness.home.join("candidate-confirm-neither.json");
+    fs::write(
+        &neither_path,
+        serde_json::to_vec(&serde_json::json!({
+            "agent_kind": "codex",
+            "external_session_id": session,
+            "expected_task_id": expected_task_id,
+            "expected_intent_revision_id": expected_intent_revision_id,
+            "expected_review_version": 1,
+            "primary": {"existing_space_id": primary_space_id},
+            "related_space_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let neither_failure = harness.failure(&[
+        "candidate",
+        "confirm",
+        "--input",
+        neither_path.to_str().unwrap(),
+    ]);
+    assert_eq!(neither_failure["error"]["code"], "invalid_input");
+
+    // A `candidate_ids` batch confirms every Candidate in one atomic operation.
+    let before = harness.event_count();
+    let confirm_path = harness.home.join("candidate-confirm-batch.json");
+    fs::write(
+        &confirm_path,
+        serde_json::to_vec(&serde_json::json!({
+            "agent_kind": "codex",
+            "external_session_id": session,
+            "expected_task_id": expected_task_id,
+            "expected_intent_revision_id": expected_intent_revision_id,
+            "candidate_ids": candidate_ids,
+            "expected_review_version": 1,
+            "primary": {"existing_space_id": primary_space_id},
+            "related_space_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let confirmed = harness.success(&[
+        "candidate",
+        "confirm",
+        "--input",
+        confirm_path.to_str().unwrap(),
+    ]);
+    assert_eq!(confirmed["command"], "candidate.confirm");
+    assert_eq!(confirmed["data"]["batch"], true);
+    assert_eq!(confirmed["data"]["status"], "confirmed");
+    let confirmations = confirmed["data"]["confirmations"].as_array().unwrap();
+    assert_eq!(confirmations.len(), 2);
+    assert!(
+        confirmations
+            .iter()
+            .all(|confirmation| confirmation["created"] == true)
+    );
+    assert_eq!(
+        confirmations
+            .iter()
+            .map(|confirmation| confirmation["context_id"].as_str().unwrap())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        2
+    );
+    // Each Candidate confirmation appends 4 events (matching the single-Candidate path
+    // exercised by `twenty_cli_processes_confirm_one_review_in_one_atomic_commit`); a batch of
+    // two therefore appends 8.
+    assert_eq!(harness.event_count(), before + 8);
+
+    // A fresh Task/session with three Checkpoint-derived Candidates feeds both a single-id
+    // discard (keeping the original non-batch CLI response shape) and a `--candidate-id`-repeated
+    // batch discard.
+    let discard_session = "cli-discard-candidates";
+    let discard_task = task_intent_update_at_root(
+        harness.root(),
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: discard_session.to_owned(),
+            task_boundary: TaskBoundary::New,
+            expected_revision_id: ExpectedRevisionId::Null(()),
+            intent: WorkingIntentSnapshot {
+                goal: "create several CLI Candidates to discard".to_owned(),
+                current_direction: Some("record discardable Candidates".to_owned()),
+                in_scope: Vec::new(),
+                out_of_scope: Vec::new(),
+                domains: Vec::new(),
+                platforms: Vec::new(),
+                constraints: Vec::new(),
+                acceptance_conditions: Vec::new(),
+                artifact_hints: Vec::new(),
+                interface_hints: Vec::new(),
+                open_questions: Vec::new(),
+            },
+        },
+    )
+    .unwrap();
+    let discard_expected_task_id = discard_task.context.task_id.to_string();
+    let discard_expected_intent_revision_id = discard_task.context.intent_revision_id.to_string();
+    let claim = |statement: &str| TaskCheckpointClaimInput {
+        context_kind: ContextKind::Decision,
+        statement: statement.to_owned(),
+        rationale: "The Candidate is provable independently".to_owned(),
+        conditions: Vec::new(),
+        evidence: vec![TaskCheckpointEvidenceInput {
+            evidence_type: sctx_domain::EvidenceType::ExperimentRecord,
+            summary: "The discard CLI fixture passed".to_owned(),
+            limitations: Vec::new(),
+        }],
+    };
+    let discard_closed = task_checkpoint_at_root(
+        harness.root(),
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: discard_session.to_owned(),
+            claims: vec![
+                claim("single discard keeps the prior CLI response shape"),
+                claim("batch discard candidate alpha statement"),
+                claim("batch discard candidate beta statement"),
+            ],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap()
+    .into_accepted()
+    .expect("nonempty Checkpoint must be accepted");
+    assert_eq!(
+        discard_closed.candidate_build.status,
+        sctx_mcp::CandidateBuildResponseStatus::Pending
+    );
+    let discard_candidate_ids = candidate_list_at_root(
+        harness.root(),
+        &CandidateListInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: discard_session.to_owned(),
+            status: CandidateReviewStatus::Pending,
+            limit: 10,
+            cursor: None,
+            token_budget: 32_768,
+        },
+    )
+    .unwrap()
+    .reviews
+    .into_iter()
+    .map(|review| review.0.candidate_id.to_string())
+    .collect::<Vec<_>>();
+    assert_eq!(discard_candidate_ids.len(), 3);
+    let single_candidate_id = &discard_candidate_ids[0];
+    let discard_alpha = &discard_candidate_ids[1];
+    let discard_beta = &discard_candidate_ids[2];
+
+    // A single owned Candidate still keeps the original non-batch CLI response shape.
+    let single_discarded = harness.success(&[
+        "candidate",
+        "discard",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        discard_session,
+        "--expected-task-id",
+        &discard_expected_task_id,
+        "--expected-intent-revision-id",
+        &discard_expected_intent_revision_id,
+        "--candidate-id",
+        single_candidate_id,
+        "--expected-review-version",
+        "1",
+        "--reason",
+        "single CLI discard keeps its prior shape",
+    ]);
+    assert_eq!(single_discarded["command"], "candidate.discard");
+    assert_eq!(single_discarded["data"]["status"], "discarded");
+    assert!(single_discarded["data"].get("batch").is_none());
+    assert!(single_discarded["data"]["review"].is_object());
+
+    // A batch of `--candidate-id` flags discards the remaining owned Candidates atomically.
+    let batch_discarded = harness.success(&[
+        "candidate",
+        "discard",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        discard_session,
+        "--expected-task-id",
+        &discard_expected_task_id,
+        "--expected-intent-revision-id",
+        &discard_expected_intent_revision_id,
+        "--candidate-id",
+        discard_alpha,
+        "--candidate-id",
+        discard_beta,
+        "--expected-review-version",
+        "1",
+        "--reason",
+        "batch CLI discard covers several Candidates",
+    ]);
+    assert_eq!(batch_discarded["command"], "candidate.discard");
+    assert_eq!(batch_discarded["data"]["batch"], true);
+    assert_eq!(batch_discarded["data"]["status"], "discarded");
+    let reviews = batch_discarded["data"]["reviews"].as_array().unwrap();
+    assert_eq!(reviews.len(), 2);
+    assert!(
+        reviews
+            .iter()
+            .all(|review| review["review_status"] == "discarded")
+    );
+    assert_eq!(
+        reviews
+            .iter()
+            .map(|review| review["candidate_id"].as_str().unwrap())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([discard_alpha.as_str(), discard_beta.as_str()])
+    );
+
+    // `--candidate-id` without a value is still a typed parse-layer error.
+    let missing_candidate = harness.failure(&[
+        "candidate",
+        "discard",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        discard_session,
+        "--expected-task-id",
+        &discard_expected_task_id,
+        "--expected-intent-revision-id",
+        &discard_expected_intent_revision_id,
+        "--expected-review-version",
+        "1",
+        "--reason",
+        "missing candidate id",
+    ]);
+    assert_eq!(missing_candidate["error"]["code"], "invalid_input");
 }

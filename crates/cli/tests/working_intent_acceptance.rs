@@ -46,6 +46,8 @@ fn seed_text_context(store: &GitStore) -> usize {
     let context = Event::context_revision_added(
         space_id,
         ContextRevisionDraft {
+            problem_view: None,
+            hints: Vec::new(),
             kind: ContextKind::Contract,
             topic_key: Some("search/v2".to_owned()),
             statement: "SearchResultRenderer consumes search-v2-endpoint".to_owned(),

@@ -163,6 +163,8 @@ fn graph_contexts(references: &[ProjectedEngineeringReference]) -> Vec<GraphCont
             space_title: "Resolver fixture".to_owned(),
             context_id: reference.context_id,
             revision: ContextRevision {
+                problem_view: None,
+                hints: Vec::new(),
                 revision_id: reference.revision_id,
                 parent_revision_ids: Vec::new(),
                 kind: ContextKind::Decision,

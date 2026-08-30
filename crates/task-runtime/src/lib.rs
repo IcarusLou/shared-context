@@ -5,7 +5,7 @@
 //! explicit: the runtime never guesses a new Task from Prompt or Workspace text.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs,
     path::{Path, PathBuf},
     str::FromStr,
@@ -17,23 +17,34 @@ use sctx_domain::{
     AgentCheckpoint, AgentCheckpointId, Applicability, ArtifactRef, AutomaticContextCandidate,
     CandidateBuildId, CandidateConfirmationPlan, CandidateId, CandidateReviewStatus,
     CheckpointClaim, CheckpointClaimId, CheckpointEvidenceRef, CheckpointUnknown, ConfirmationId,
-    ContextId, ContextRevisionRef, Error, ErrorKind, EventId, EvidenceSnapshotDraft, EvidenceType,
-    ExternalSessionId, ExternalSessionLocator, ExternalSessionSnapshot, IntentRevisionRange,
-    NonLocatingSignalRef, NormalizedWorkObservation, ProposedSpaceGroupKey, Result, SignalId,
-    SpaceId, SubmissionId, TaskId, TaskIntentRevision, TaskIntentRevisionId, TaskSessionId,
-    TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord,
-    WorkEpisode, WorkEpisodeId, WorkEpisodeRef, WorkEpisodeStatus, WorkObservation,
-    WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
+    ContextId, ContextKind, ContextRevisionRef, Error, ErrorKind, EventId, EvidenceSnapshotDraft,
+    EvidenceType, ExternalSessionId, ExternalSessionLocator, ExternalSessionSnapshot,
+    IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation, ProposedSpaceGroupKey,
+    Result, RevisionId, SignalId, SpaceId, SubmissionId, TaskId, TaskIntentRevision,
+    TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalKind,
+    TaskSignalLifecycle, TaskSignalRecord, WorkEpisode, WorkEpisodeId, WorkEpisodeRef,
+    WorkEpisodeStatus, WorkObservation, WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
 };
 use sha2::{Digest, Sha256};
+
+pub mod reference_derivation;
+
+pub use reference_derivation::{
+    CheckoutReferenceResolver, ClaimReferenceDerivation, DerivedClaimReferences, PathCandidate,
+    ResolvedReference, derive_claim_references, unresolvable,
+};
 
 const SCHEMA_VERSION: i64 = 13;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const HOOK_BUSY_TIMEOUT: Duration = Duration::from_millis(25);
 const MAX_EPISODE_LIST_LIMIT: usize = 256;
+/// Maximum Context identities bound into one usage-totals query.
+const USAGE_TOTALS_QUERY_CHUNK: usize = 256;
 pub const DEFAULT_CANDIDATE_REVIEW_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 pub const MAX_CANDIDATE_REVIEW_TTL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 pub const MAX_CANDIDATE_REVIEW_LIST_LIMIT: usize = 100;
+/// Bound on the `ExternalSession` Candidate corpus one Candidate Build may compare against.
+pub const MAX_SESSION_CANDIDATE_REVIEW_SCAN: usize = 200;
 
 /// Result of atomically locating or creating one `ExternalSession`'s first Task.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,10 +70,15 @@ pub struct StartNewTaskOutcome {
 }
 
 /// Exact semantic disposition of one CAS-guarded Working Intent continue.
+///
+/// `Forked` is only reachable through [`TaskRuntime::continue_working_intent`]: a superseded CAS
+/// parent whose replacement Head states a different normalized goal is treated as a concurrent
+/// Agent inside one `ExternalSession` rather than a stale caller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IntentRevisionWriteStatus {
     Created,
     AlreadyCurrent,
+    Forked,
 }
 
 /// Current or newly-created Working Intent revision.
@@ -70,6 +86,16 @@ pub enum IntentRevisionWriteStatus {
 pub struct AppendIntentRevisionOutcome {
     pub revision: TaskIntentRevision,
     pub status: IntentRevisionWriteStatus,
+}
+
+/// Result of continuing one Working Intent lineage inside an `ExternalSession`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContinueWorkingIntentOutcome {
+    pub snapshot: TaskSessionSnapshot,
+    pub revision: TaskIntentRevision,
+    pub status: IntentRevisionWriteStatus,
+    /// True when this continue re-selected a different retained Task as the `ActiveTask`.
+    pub active_task_switched: bool,
 }
 
 /// Result of explicitly selecting a retained Task as active.
@@ -308,6 +334,15 @@ pub struct CandidateConfirmationReservation {
     pub created: bool,
 }
 
+/// One Git-committed Candidate Confirmation to record in the Runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateConfirmationFinalize {
+    pub candidate_id: CandidateId,
+    pub operation_hash: String,
+    pub confirmation_id: ConfirmationId,
+    pub result_context_id: ContextId,
+}
+
 /// Result of finalizing Runtime after the Git fact closure is committed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateConfirmationFinalizeOutcome {
@@ -386,6 +421,27 @@ pub struct CandidateBuildItemView {
     pub error_code: Option<String>,
 }
 
+/// Builder decision that one Claim restates an existing Task-owned Candidate.
+///
+/// A deduplicated Claim never reserves a `SubmissionId` and never reaches Git, so equal content
+/// under different `SubmissionIds` still cannot converge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CandidateBuildDuplicatePreparation {
+    pub checkpoint_id: AgentCheckpointId,
+    pub claim_id: CheckpointClaimId,
+    pub duplicate_of_candidate_id: CandidateId,
+    pub similarity_basis_points: u16,
+}
+
+/// One durable Claim-scoped deduplication decision of a Candidate Build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CandidateBuildDuplicateView {
+    pub checkpoint_id: AgentCheckpointId,
+    pub claim_id: CheckpointClaimId,
+    pub duplicate_of_candidate_id: CandidateId,
+    pub similarity_basis_points: u16,
+}
+
 /// Durable deterministic build state for one exact closed Episode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateBuildView {
@@ -394,6 +450,7 @@ pub struct CandidateBuildView {
     pub final_checkpoint_id: AgentCheckpointId,
     pub status: CandidateBuildStatus,
     pub items: Vec<CandidateBuildItemView>,
+    pub duplicates: Vec<CandidateBuildDuplicateView>,
 }
 
 /// Non-sensitive aggregate state of one `ActiveTask`'s durable Build recovery queue.
@@ -461,6 +518,108 @@ pub struct SourceEpisodeVerification {
     pub version: u64,
     pub status: WorkEpisodeStatus,
     pub observation_count: usize,
+}
+
+/// Retrieval entry point that returned one injected Context item to an Agent.
+///
+/// The three public read entry points are recorded separately so a later usage signal can be read
+/// back to the exact retrieval surface that produced it.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ContextInjectionSource {
+    IntentUpdate,
+    TaskContext,
+    ArtifactFocus,
+}
+
+impl ContextInjectionSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IntentUpdate => "intent_update",
+            Self::TaskContext => "task_context",
+            Self::ArtifactFocus => "artifact_focus",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "intent_update" => Ok(Self::IntentUpdate),
+            "task_context" => Ok(Self::TaskContext),
+            "artifact_focus" => Ok(Self::ArtifactFocus),
+            other => Err(invariant(format!("unknown injection source {other}"))),
+        }
+    }
+}
+
+/// One immutable Context revision handed to an Agent by a retrieval entry point.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct InjectedContext {
+    pub context_id: ContextId,
+    pub revision_id: RevisionId,
+}
+
+/// One recorded injection of a Context into a Task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskInjectionRecord {
+    pub task_id: TaskId,
+    pub context_id: ContextId,
+    pub revision_id: RevisionId,
+    pub intent_revision_id: TaskIntentRevisionId,
+    pub injected_at_unix_seconds: u64,
+    pub source: ContextInjectionSource,
+}
+
+/// What one Task did with a Context that was injected into it.
+///
+/// `Refuted` is the highest priority: a Context an Agent contradicted must never be downgraded
+/// back to `Reused` or `Ignored` by a later write for the same Task.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ContextUsageOutcome {
+    Ignored,
+    Reused,
+    Refuted,
+}
+
+impl ContextUsageOutcome {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ignored => "ignored",
+            Self::Reused => "reused",
+            Self::Refuted => "refuted",
+        }
+    }
+
+    /// Higher wins when two writes disagree about the same `(context, task)` pair.
+    const fn priority(self) -> u8 {
+        match self {
+            Self::Ignored | Self::Reused => 0,
+            Self::Refuted => 1,
+        }
+    }
+}
+
+/// One `(context, task)` usage decision derived by the server from a Checkpoint or Confirmation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextUsageRecord {
+    pub context_id: ContextId,
+    pub task_id: TaskId,
+    pub outcome: ContextUsageOutcome,
+}
+
+/// Per-Context usage totals across every Task that ever had it injected.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ContextUsageTotals {
+    pub reused: u32,
+    pub ignored: u32,
+    pub refuted: u32,
+}
+
+impl ContextUsageTotals {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.reused == 0 && self.ignored == 0 && self.refuted == 0
+    }
 }
 
 /// Owner of the installation-local `state/runtime.sqlite` database.
@@ -743,33 +902,128 @@ impl TaskRuntime {
                 status: IntentRevisionWriteStatus::AlreadyCurrent,
             });
         }
-        let revision = TaskIntentRevision::successor(&current, working_intent)?;
-        let ordinal = read_revision_ordinal(&transaction, current_revision_id)?
-            .checked_add(1)
-            .ok_or_else(|| invariant("Task Intent revision ordinal overflow"))?;
-        insert_intent_revision(&transaction, task_session_id, ordinal, &revision)?;
-        let changed = transaction
-            .execute(
-                "UPDATE task_session SET current_intent_revision_id = ?1
-                 WHERE task_session_id = ?2 AND current_intent_revision_id = ?3",
-                params![
-                    revision.revision_id.to_string(),
-                    task_session_id.to_string(),
-                    parent_revision_id.to_string(),
-                ],
-            )
-            .map_err(sql_error("advance Task Intent Head"))?;
-        if changed != 1 {
-            return Err(invariant(
-                "Task Intent Head changed inside write transaction",
-            ));
-        }
+        let revision = append_revision_in_transaction(
+            &transaction,
+            task_session_id,
+            &current,
+            working_intent,
+        )?;
         transaction
             .commit()
             .map_err(sql_error("commit Intent append transaction"))?;
         Ok(AppendIntentRevisionOutcome {
             revision,
             status: IntentRevisionWriteStatus::Created,
+        })
+    }
+
+    /// Continues one Working Intent lineage owned by this `ExternalSession`.
+    ///
+    /// Unlike [`Self::append_intent_revision`], the CAS parent selects the lineage instead of the
+    /// current `ActiveTask`: a parent that is still the Head of any retained Task appends there and
+    /// re-selects that Task, and a superseded parent whose replacement Head states a different
+    /// normalized goal forks a parallel `TaskSession`. Concurrent Agents that an Agent host
+    /// cannot distinguish keep separate Intent chains instead of overwriting one Head.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input error for a missing Session or cross-Session parent, and a stale-state
+    /// error when the parent is unknown or superseded by the same normalized goal.
+    pub fn continue_working_intent(
+        &self,
+        locator: &ExternalSessionLocator,
+        parent_revision_id: TaskIntentRevisionId,
+        working_intent: WorkingIntentSnapshot,
+    ) -> Result<ContinueWorkingIntentOutcome> {
+        locator.validate()?;
+        working_intent.validate()?;
+        let semantic_hash = working_intent.canonical_semantic_hash()?;
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Working Intent continue transaction")?;
+        let external = read_external_identity(&transaction, locator)?
+            .ok_or_else(|| invalid("ExternalSessionLocator does not identify a runtime Session"))?;
+        let owner = read_intent_revision_owner(&transaction, parent_revision_id)?
+            .ok_or_else(|| stale("Intent parent is stale: unknown or no longer retained"))?;
+        if owner.external_session != external.external_session_id {
+            return Err(invalid("Intent parent belongs to another Task Session"));
+        }
+        let head = read_intent_revision(&transaction, owner.head_revision)?;
+        let (task_session_id, task_id, revision, status) =
+            if owner.head_revision == parent_revision_id {
+                if head.semantic_hash == semantic_hash {
+                    (
+                        owner.task_session,
+                        owner.task,
+                        head,
+                        IntentRevisionWriteStatus::AlreadyCurrent,
+                    )
+                } else {
+                    let revision = append_revision_in_transaction(
+                        &transaction,
+                        owner.task_session,
+                        &head,
+                        working_intent,
+                    )?;
+                    (
+                        owner.task_session,
+                        owner.task,
+                        revision,
+                        IntentRevisionWriteStatus::Created,
+                    )
+                }
+            } else if head.parent_revision_id == Some(parent_revision_id)
+                && head.semantic_hash == semantic_hash
+            {
+                (
+                    owner.task_session,
+                    owner.task,
+                    head,
+                    IntentRevisionWriteStatus::AlreadyCurrent,
+                )
+            } else if normalized_goal(&working_intent.goal)
+                == normalized_goal(&head.working_intent.goal)
+            {
+                return Err(stale(
+                    "Intent parent is no longer the current Head of its Task lineage",
+                ));
+            } else {
+                let task_id = TaskId::new();
+                let forked = TaskSessionSnapshot::from_initial(
+                    locator.clone(),
+                    task_id,
+                    working_intent,
+                    Vec::new(),
+                )?;
+                let ordinal = next_task_ordinal(&transaction, external.external_session_id)?;
+                insert_task(&transaction, external.external_session_id, ordinal, &forked)?;
+                let revision = forked
+                    .current_intent_revision()
+                    .ok_or_else(|| invariant("forked TaskSession has no Working Intent Head"))?
+                    .clone();
+                (
+                    forked.task_session_id,
+                    task_id,
+                    revision,
+                    IntentRevisionWriteStatus::Forked,
+                )
+            };
+        let active_task_switched = external.active_task_id != task_id;
+        compare_and_switch(
+            &transaction,
+            external.external_session_id,
+            external.active_task_id,
+            task_session_id,
+            task_id,
+        )?;
+        let snapshot = require_snapshot(&transaction, task_session_id)?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit Working Intent continue transaction"))?;
+        Ok(ContinueWorkingIntentOutcome {
+            snapshot,
+            revision,
+            status,
+            active_task_switched,
         })
     }
 
@@ -1452,6 +1706,117 @@ impl TaskRuntime {
         })
     }
 
+    /// Path spellings one Episode's Claims still need placed, or `None` once they were placed.
+    ///
+    /// Candidate Build asks this first so a rebuilt Episode never spawns `git` again: the answer
+    /// is `None` as soon as [`TaskRuntime::derive_episode_claim_references`] recorded the first
+    /// derivation, whatever that derivation resolved.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage or invariant errors.
+    pub fn pending_claim_reference_candidates(
+        &self,
+        episode_id: WorkEpisodeId,
+    ) -> Result<Option<Vec<PathCandidate>>> {
+        let connection = self.open_connection()?;
+        if claim_references_derived(&connection, episode_id)? {
+            return Ok(None);
+        }
+        let Some(episode) = read_episode_view(&connection, episode_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(episode_path_candidates(&episode)))
+    }
+
+    /// Derives every Claim's engineering coordinates for one Episode exactly once.
+    ///
+    /// This is Candidate Build work, never Checkpoint ACK work. The first call resolves each
+    /// path-shaped spelling through `resolve`, writes the resulting References and topic hint back
+    /// onto the persisted Claims, and records that this Episode is derived. Every later call
+    /// reports that persisted answer and calls `resolve` for nothing, so a Build rerun after the
+    /// checkout moved on cannot change a Candidate that already reached review.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage or invariant errors. A resolver that places nothing is not an error:
+    /// the spellings stay retrieval hints.
+    pub fn derive_episode_claim_references(
+        &self,
+        episode_id: WorkEpisodeId,
+        resolve: &dyn Fn(&PathCandidate) -> Option<ResolvedReference>,
+    ) -> Result<Vec<DerivedClaimReferences>> {
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Claim derivation transaction")?;
+        let episode = require_episode_view(&transaction, episode_id)?;
+        let already_derived = claim_references_derived(&transaction, episode_id)?;
+        let mut derivations = Vec::new();
+        for checkpoint in &episode.checkpoints {
+            let mut updated = checkpoint.clone();
+            for claim in &mut updated.claims {
+                let summaries = claim_evidence_summaries(&episode.episode, claim);
+                let borrowed = summaries.iter().map(String::as_str).collect::<Vec<_>>();
+                let derivation = if already_derived {
+                    ClaimReferenceDerivation {
+                        engineering_references: claim.engineering_references.clone(),
+                        topic_key_hint: claim.topic_key_hint.clone(),
+                        unresolved_hints: reference_derivation::claim_hints(
+                            &claim.statement,
+                            &claim.rationale,
+                            &borrowed,
+                            &claim.engineering_references,
+                        ),
+                    }
+                } else {
+                    let derived = derive_claim_references(
+                        claim.context_kind_hint.unwrap_or(ContextKind::Discovery),
+                        &claim.statement,
+                        &claim.rationale,
+                        &borrowed,
+                        resolve,
+                    );
+                    claim
+                        .engineering_references
+                        .clone_from(&derived.engineering_references);
+                    claim.topic_key_hint.clone_from(&derived.topic_key_hint);
+                    derived
+                };
+                derivations.push(DerivedClaimReferences {
+                    checkpoint_id: updated.checkpoint_id,
+                    claim_id: claim.claim_id,
+                    engineering_references: derivation.engineering_references,
+                    topic_key_hint: derivation.topic_key_hint,
+                    unresolved_hints: derivation.unresolved_hints,
+                    applicability_inherited: true,
+                });
+            }
+            if already_derived {
+                continue;
+            }
+            updated.validate_against_episode(&episode.episode)?;
+            let checkpoint_json = serde_json::to_string(&updated)
+                .map_err(json_error("serialize derived Agent Checkpoint"))?;
+            transaction
+                .execute(
+                    "UPDATE agent_checkpoint SET checkpoint_json = ?1 WHERE checkpoint_id = ?2",
+                    params![checkpoint_json, updated.checkpoint_id.to_string()],
+                )
+                .map_err(sql_error("persist derived Claim references"))?;
+        }
+        if !already_derived {
+            transaction
+                .execute(
+                    "INSERT INTO checkpoint_reference_derivation (episode_id) VALUES (?1)",
+                    params![episode_id.to_string()],
+                )
+                .map_err(sql_error("record Claim reference derivation"))?;
+        }
+        transaction
+            .commit()
+            .map_err(sql_error("commit Claim derivation transaction"))?;
+        Ok(derivations)
+    }
+
     /// Reads one persisted Work Episode by server-owned ID.
     ///
     /// # Errors
@@ -1722,6 +2087,26 @@ impl TaskRuntime {
         episode_id: WorkEpisodeId,
         items: &[CandidateBuildItemPreparation],
     ) -> Result<CandidateBuildView> {
+        self.prepare_candidate_build_with_duplicates(episode_id, items, &[])
+    }
+
+    /// Prepares one Candidate Build whose Claims are split into submittable drafts and durable
+    /// deduplication decisions.
+    ///
+    /// Every persisted Claim must appear exactly once across `items` and `duplicates`. A Claim that
+    /// a previous preparation already classified keeps that first durable decision, so recovering
+    /// or replaying the same closed Episode never produces a second Candidate for one fact.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an open Episode, incomplete readiness metadata, a Claim classified twice and a
+    /// duplicate target that is not an already-created Candidate of another Claim.
+    pub fn prepare_candidate_build_with_duplicates(
+        &self,
+        episode_id: WorkEpisodeId,
+        items: &[CandidateBuildItemPreparation],
+        duplicates: &[CandidateBuildDuplicatePreparation],
+    ) -> Result<CandidateBuildView> {
         validate_build_preparations(items)?;
         let mut connection = self.open_connection()?;
         let transaction = immediate(&mut connection, "begin Candidate Build preparation")?;
@@ -1734,7 +2119,7 @@ impl TaskRuntime {
                 "Candidate Builder requires an exact closed Work Episode",
             ));
         };
-        validate_build_claim_coverage(&episode, items)?;
+        validate_build_claim_coverage(&episode, items, duplicates)?;
         let build_id = if let Some(build_id) = read_candidate_build_id(&transaction, episode_id)? {
             build_id
         } else {
@@ -1757,7 +2142,40 @@ impl TaskRuntime {
                 .map_err(sql_error("insert Candidate Build"))?;
             build_id
         };
-        upsert_candidate_build_items(&transaction, build_id, items)?;
+        // A Claim that already reached Git keeps its Candidate, and a Claim already recorded as a
+        // duplicate keeps that decision, so recovery and replay cannot fork one fact into two.
+        let submitted_claims = read_candidate_build_items(&transaction, build_id)?
+            .into_iter()
+            .filter(|item| item.status.is_finalized())
+            .map(|item| item.claim_id)
+            .collect::<BTreeSet<_>>();
+        let persisted_duplicates = read_candidate_build_duplicates(&transaction, build_id)?
+            .into_iter()
+            .map(|duplicate| duplicate.claim_id)
+            .collect::<BTreeSet<_>>();
+        let items = items
+            .iter()
+            .filter(|item| !persisted_duplicates.contains(&item.claim_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let duplicates = duplicates
+            .iter()
+            .filter(|duplicate| !submitted_claims.contains(&duplicate.claim_id))
+            .copied()
+            .collect::<Vec<_>>();
+        for duplicate in &duplicates {
+            transaction
+                .execute(
+                    "DELETE FROM candidate_build_item
+                     WHERE build_id = ?1 AND claim_id = ?2 AND candidate_id IS NULL",
+                    params![build_id.to_string(), duplicate.claim_id.to_string()],
+                )
+                .map_err(sql_error(
+                    "release deduplicated Candidate Build outbox item",
+                ))?;
+        }
+        upsert_candidate_build_items(&transaction, build_id, &items)?;
+        insert_candidate_build_duplicates(&transaction, build_id, &duplicates)?;
         refresh_candidate_build_status(&transaction, build_id)?;
         let view = require_candidate_build_view(&transaction, build_id)?;
         transaction
@@ -2275,6 +2693,63 @@ impl TaskRuntime {
         })
     }
 
+    /// Lists Pending and Confirmed Candidate Reviews owned by every Task of one `ExternalSession`.
+    ///
+    /// Candidate Build uses it as the deduplication corpus: concurrent Agents that share one
+    /// `external_session_id` may hold parallel Tasks, so Task-local scope alone would miss the
+    /// restatements this exists to collapse.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown Task Session, an invalid bound, or storage failure.
+    pub fn list_session_candidate_reviews(
+        &self,
+        task_session_id: TaskSessionId,
+        limit: usize,
+    ) -> Result<Vec<CandidateReviewRecord>> {
+        if limit == 0 || limit > MAX_SESSION_CANDIDATE_REVIEW_SCAN {
+            return Err(invalid(
+                "Candidate Review session scan limit is outside the safe bound",
+            ));
+        }
+        let connection = self.open_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT review.candidate_id, review.submission_id, review.episode_id,
+                        review.task_session_id, review.task_id, review.build_id,
+                        review.final_checkpoint_id, review.checkpoint_id, review.claim_id,
+                        review.review_version, review.status, review.discard_reason,
+                        review.created_at_unix_seconds, review.expires_at_unix_seconds,
+                        review.discarded_at_unix_seconds, review.expired_at_unix_seconds,
+                        review.confirmation_id, review.result_context_id
+                 FROM candidate_review AS review
+                 JOIN task_session AS task ON task.task_session_id = review.task_session_id
+                 WHERE review.status IN ('pending', 'confirmed')
+                   AND task.external_session_id = (
+                       SELECT external_session_id FROM task_session WHERE task_session_id = ?1
+                   )
+                 ORDER BY review.created_at_unix_seconds ASC, review.candidate_id ASC
+                 LIMIT ?2",
+            )
+            .map_err(sql_error("prepare ExternalSession Candidate Review scan"))?;
+        let rows = statement
+            .query_map(
+                params![
+                    task_session_id.to_string(),
+                    i64::try_from(limit).map_err(|_| invalid(
+                        "Candidate Review session scan limit exceeds SQLite range"
+                    ))?,
+                ],
+                candidate_review_row,
+            )
+            .map_err(sql_error("query ExternalSession Candidate Reviews"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error("read ExternalSession Candidate Reviews"))?;
+        rows.into_iter()
+            .map(parse_candidate_review_record)
+            .collect()
+    }
+
     /// Reads one complete Review identity only when it belongs to the locator's `ActiveTask`.
     ///
     /// # Errors
@@ -2322,106 +2797,79 @@ impl TaskRuntime {
         &self,
         request: &CandidateReviewDiscard,
     ) -> Result<CandidateReviewDiscardOutcome> {
-        request.locator.validate()?;
-        let reason = request.reason.trim();
-        if reason.is_empty() || reason.len() > 512 || request.expected_review_version == 0 {
-            return Err(invalid(
-                "Candidate discard requires a non-empty bounded reason and positive review version",
-            ));
+        self.discard_candidate_reviews(std::slice::from_ref(request))?
+            .pop()
+            .ok_or_else(|| invariant("Candidate Review discard produced no outcome"))
+    }
+
+    /// Applies several CAS-guarded discards inside one transaction.
+    ///
+    /// Every request must name the same `ExternalSession` and the same Task/Intent CAS. Any
+    /// rejected member rolls the whole batch back and names the failing `CandidateId`, so a batch
+    /// Review decision never leaves a partially discarded Task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input error for an empty or cross-Session batch, a stale-state error for a stale
+    /// Task/Intent/Review CAS, and a conflict for an already decided Review.
+    pub fn discard_candidate_reviews(
+        &self,
+        requests: &[CandidateReviewDiscard],
+    ) -> Result<Vec<CandidateReviewDiscardOutcome>> {
+        let Some(first) = requests.first() else {
+            return Err(invalid("Candidate discard requires at least one Candidate"));
+        };
+        first.locator.validate()?;
+        let mut seen = BTreeSet::new();
+        for request in requests {
+            if request.locator != first.locator
+                || request.expected_task_id != first.expected_task_id
+                || request.expected_intent_revision_id != first.expected_intent_revision_id
+            {
+                return Err(invalid(
+                    "Candidate discard batch must share one ExternalSession and Task/Intent CAS",
+                ));
+            }
+            if !seen.insert(request.candidate_id) {
+                return Err(invalid(
+                    "Candidate discard batch must not repeat a Candidate",
+                ));
+            }
+            let reason = request.reason.trim();
+            if reason.is_empty() || reason.len() > 512 || request.expected_review_version == 0 {
+                return Err(invalid(
+                    "Candidate discard requires a non-empty bounded reason and positive review version",
+                ));
+            }
         }
         self.cleanup_expired_candidate_reviews()?;
         let now = unix_seconds(SystemTime::now())?;
         let mut connection = self.open_connection()?;
         let transaction = immediate(&mut connection, "begin Candidate Review discard")?;
-        let task_session_id = find_active_task_by_locator(&transaction, &request.locator)?
+        let task_session_id = find_active_task_by_locator(&transaction, &first.locator)?
             .ok_or_else(|| invalid("ExternalSession has no ActiveTask"))?;
         let task = require_snapshot(&transaction, task_session_id)?;
-        if task.task_id != request.expected_task_id
+        if task.task_id != first.expected_task_id
             || task
                 .current_intent_revision()
-                .is_none_or(|revision| revision.revision_id != request.expected_intent_revision_id)
+                .is_none_or(|revision| revision.revision_id != first.expected_intent_revision_id)
         {
             return Err(Error::new(
                 ErrorKind::StaleState,
                 "Candidate discard Task/Intent ownership CAS is stale",
             ));
         }
-        let mut record = read_candidate_review_record(&transaction, request.candidate_id)?
-            .ok_or_else(|| invalid("Candidate Review does not exist for the ActiveTask"))?;
-        if record.source_episode.task_session_id != task.task_session_id
-            || record.source_episode.task_id != task.task_id
-        {
-            return Err(invalid(
-                "Candidate Review does not belong to the ExternalSession ActiveTask",
-            ));
+        let mut outcomes = Vec::with_capacity(requests.len());
+        for request in requests {
+            outcomes.push(
+                discard_one_candidate_review(&transaction, &task, request, now)
+                    .map_err(candidate_scoped_error(request.candidate_id))?,
+            );
         }
-        match record.status {
-            CandidateReviewStatus::Discarded => {
-                if record.discard_reason.as_deref() != Some(reason) {
-                    return Err(Error::new(
-                        ErrorKind::Conflict,
-                        "Candidate Review was already discarded with a different reason",
-                    ));
-                }
-                transaction
-                    .commit()
-                    .map_err(sql_error("commit idempotent Candidate Review discard"))?;
-                return Ok(CandidateReviewDiscardOutcome {
-                    record,
-                    status: CandidateReviewDiscardStatus::AlreadyDiscarded,
-                });
-            }
-            CandidateReviewStatus::Expired => {
-                return Err(Error::new(
-                    ErrorKind::Conflict,
-                    "Expired Candidate Review cannot be discarded",
-                ));
-            }
-            CandidateReviewStatus::Confirmed => {
-                return Err(Error::new(
-                    ErrorKind::Conflict,
-                    "Confirmed Candidate Review cannot be discarded",
-                ));
-            }
-            CandidateReviewStatus::Pending => {}
-        }
-        if record.review_version != request.expected_review_version {
-            return Err(Error::new(
-                ErrorKind::StaleState,
-                "Candidate Review version is stale",
-            ));
-        }
-        let changed = transaction
-            .execute(
-                "UPDATE candidate_review
-                 SET status = 'discarded', review_version = review_version + 1,
-                     discard_reason = ?1, discarded_at_unix_seconds = ?2
-                 WHERE candidate_id = ?3 AND review_version = ?4 AND status = 'pending'",
-                params![
-                    reason,
-                    i64::try_from(now)
-                        .map_err(|_| invalid("Candidate discard timestamp exceeds SQLite range"))?,
-                    request.candidate_id.to_string(),
-                    i64::try_from(request.expected_review_version)
-                        .map_err(|_| invalid("Candidate Review version exceeds SQLite range"))?,
-                ],
-            )
-            .map_err(sql_error("discard Candidate Review"))?;
-        if changed != 1 {
-            return Err(Error::new(
-                ErrorKind::StaleState,
-                "Candidate Review changed during discard",
-            ));
-        }
-        record = read_candidate_review_record(&transaction, request.candidate_id)?
-            .ok_or_else(|| invariant("discarded Candidate Review disappeared"))?;
         transaction
             .commit()
             .map_err(sql_error("commit Candidate Review discard"))?;
-        Ok(CandidateReviewDiscardOutcome {
-            record,
-            status: CandidateReviewDiscardStatus::Discarded,
-        })
+        Ok(outcomes)
     }
 
     /// Reserves one complete server-owned Confirmation plan before any Git write.
@@ -2575,96 +3023,56 @@ impl TaskRuntime {
         confirmation_id: ConfirmationId,
         result_context_id: ContextId,
     ) -> Result<CandidateConfirmationFinalizeOutcome> {
-        let mut connection = self.open_connection()?;
-        let transaction = immediate(&mut connection, "begin Candidate Confirmation finalize")?;
-        let operation = read_candidate_confirmation_operation(&transaction, candidate_id)?
-            .ok_or_else(|| invalid("Candidate Confirmation operation is not reserved"))?;
-        if operation.operation_hash != operation_hash
-            || operation.plan.confirmation.confirmation_id != confirmation_id
-            || operation.plan.result_context_id != result_context_id
-        {
-            return Err(Error::new(
-                ErrorKind::Conflict,
-                "Committed Candidate Confirmation does not match the reserved operation",
+        self.finalize_candidate_confirmations(&[CandidateConfirmationFinalize {
+            candidate_id,
+            operation_hash: operation_hash.to_owned(),
+            confirmation_id,
+            result_context_id,
+        }])?
+        .pop()
+        .ok_or_else(|| invariant("Candidate Confirmation finalize produced no outcome"))
+    }
+
+    /// Marks several Git-committed Confirmations terminal inside one transaction.
+    ///
+    /// The Git batch that committed these Confirmations was atomic, so the Runtime side is too:
+    /// a rejected member rolls every Review and operation status back and names the failing
+    /// `CandidateId`. Retrying the same batch replays the Git write and finalizes again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input error for an empty or repeating batch, and typed operation-hash,
+    /// plan-identity, Review CAS, or storage errors for any member.
+    pub fn finalize_candidate_confirmations(
+        &self,
+        requests: &[CandidateConfirmationFinalize],
+    ) -> Result<Vec<CandidateConfirmationFinalizeOutcome>> {
+        if requests.is_empty() {
+            return Err(invalid(
+                "Candidate Confirmation finalize requires at least one Candidate",
             ));
         }
-        if operation.status == CandidateConfirmationOperationStatus::Committed {
-            let review = read_candidate_review_record(&transaction, candidate_id)?
-                .ok_or_else(|| invariant("confirmed Candidate Review disappeared"))?;
-            if review.status != CandidateReviewStatus::Confirmed
-                || review.confirmation_id != Some(confirmation_id)
-                || review.result_context_id != Some(result_context_id)
-            {
-                return Err(invariant(
-                    "committed Candidate Confirmation and Review audit disagree",
+        let mut seen = BTreeSet::new();
+        for request in requests {
+            if !seen.insert(request.candidate_id) {
+                return Err(invalid(
+                    "Candidate Confirmation finalize batch must not repeat a Candidate",
                 ));
             }
-            if let Some(mapping) =
-                read_proposed_space_group_mapping_for_candidate(&transaction, candidate_id)?
-            {
-                if mapping.status != ProposedSpaceGroupMappingStatus::Committed {
-                    return Err(invariant(
-                        "committed Candidate Confirmation has an uncommitted proposed Space group",
-                    ));
-                }
-            }
-            transaction.commit().map_err(sql_error(
-                "commit idempotent Candidate Confirmation finalize",
-            ))?;
-            return Ok(CandidateConfirmationFinalizeOutcome {
-                operation,
-                review,
-                already_confirmed: true,
-            });
         }
-        let changed = transaction
-            .execute(
-                "UPDATE candidate_review
-                 SET status = 'confirmed', review_version = review_version + 1,
-                     confirmation_id = ?1, result_context_id = ?2
-                 WHERE candidate_id = ?3 AND status = 'pending' AND review_version = ?4",
-                params![
-                    confirmation_id.to_string(),
-                    result_context_id.to_string(),
-                    candidate_id.to_string(),
-                    i64::try_from(operation.review_parent_version).map_err(|_| invalid(
-                        "Candidate Review parent version exceeds SQLite range"
-                    ))?,
-                ],
-            )
-            .map_err(sql_error("confirm Candidate Review"))?;
-        if changed != 1 {
-            return Err(Error::new(
-                ErrorKind::StaleState,
-                "Candidate Review changed before Confirmation finalized",
-            ));
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Candidate Confirmation finalize")?;
+        let mut outcomes = Vec::with_capacity(requests.len());
+        for request in requests {
+            outcomes.push(
+                finalize_one_candidate_confirmation(&transaction, request)
+                    .map_err(confirmation_scoped_error(request.candidate_id))?,
+            );
         }
-        transaction
-            .execute(
-                "UPDATE candidate_confirmation_operation SET status = 'committed'
-                 WHERE candidate_id = ?1 AND status = 'reserved'",
-                [candidate_id.to_string()],
-            )
-            .map_err(sql_error("commit Candidate Confirmation operation status"))?;
-        transaction
-            .execute(
-                "UPDATE proposed_space_group SET status = 'committed'
-                 WHERE candidate_id = ?1 AND status = 'reserved'",
-                [candidate_id.to_string()],
-            )
-            .map_err(sql_error("commit proposed Space group mapping"))?;
-        let operation = read_candidate_confirmation_operation(&transaction, candidate_id)?
-            .ok_or_else(|| invariant("committed Candidate Confirmation operation disappeared"))?;
-        let review = read_candidate_review_record(&transaction, candidate_id)?
-            .ok_or_else(|| invariant("confirmed Candidate Review disappeared"))?;
         transaction
             .commit()
             .map_err(sql_error("commit Candidate Confirmation finalize"))?;
-        Ok(CandidateConfirmationFinalizeOutcome {
-            operation,
-            review,
-            already_confirmed: false,
-        })
+        Ok(outcomes)
     }
 
     /// Expires retained Pending/Discarded Reviews and removes only heavy Runtime analysis.
@@ -2810,6 +3218,236 @@ impl TaskRuntime {
         task_session_id: TaskSessionId,
     ) -> Result<Vec<TaskSignalRecord>> {
         read_signal_records(&self.open_connection()?, task_session_id)
+    }
+
+    /// Records the Contexts one retrieval entry point just injected into a Task.
+    ///
+    /// `(task_id, context_id)` is unique: re-injecting the same Context into the same Task only
+    /// refreshes `injected_at_unix_seconds`, so the first Intent revision, revision and entry
+    /// point that produced the injection stay the recorded provenance.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage errors. Callers treat them as advisory: a failed injection record
+    /// must never change the retrieval response.
+    pub fn record_task_injections(
+        &self,
+        task_id: TaskId,
+        intent_revision_id: TaskIntentRevisionId,
+        source: ContextInjectionSource,
+        contexts: &[InjectedContext],
+    ) -> Result<usize> {
+        self.record_task_injections_at(
+            task_id,
+            intent_revision_id,
+            source,
+            contexts,
+            unix_seconds(SystemTime::now())?,
+        )
+    }
+
+    /// Records injections against an explicit clock reading.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage errors.
+    pub fn record_task_injections_at(
+        &self,
+        task_id: TaskId,
+        intent_revision_id: TaskIntentRevisionId,
+        source: ContextInjectionSource,
+        contexts: &[InjectedContext],
+        now_unix_seconds: u64,
+    ) -> Result<usize> {
+        if contexts.is_empty() {
+            return Ok(0);
+        }
+        let injected_at = i64::try_from(now_unix_seconds)
+            .map_err(|_| invalid("injection timestamp exceeds the supported range"))?;
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Task injection record")?;
+        let mut written = 0;
+        for context in contexts.iter().collect::<BTreeSet<_>>() {
+            written += transaction
+                .execute(
+                    "INSERT INTO task_injection (
+                        task_id, context_id, intent_revision_id, revision_id,
+                        injected_at_unix_seconds, source
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT (task_id, context_id) DO UPDATE SET
+                        injected_at_unix_seconds = excluded.injected_at_unix_seconds",
+                    params![
+                        task_id.to_string(),
+                        context.context_id.to_string(),
+                        intent_revision_id.to_string(),
+                        context.revision_id.to_string(),
+                        injected_at,
+                        source.as_str(),
+                    ],
+                )
+                .map_err(sql_error("record Task injection"))?;
+        }
+        transaction
+            .commit()
+            .map_err(sql_error("commit Task injection record"))?;
+        Ok(written)
+    }
+
+    /// Reads every Context injected into one Task, ordered by Context identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage errors.
+    pub fn read_task_injections(&self, task_id: TaskId) -> Result<Vec<TaskInjectionRecord>> {
+        let connection = self.open_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT context_id, intent_revision_id, revision_id,
+                        injected_at_unix_seconds, source
+                 FROM task_injection WHERE task_id = ?1 ORDER BY context_id ASC",
+            )
+            .map_err(sql_error("prepare Task injection read"))?;
+        let rows = statement
+            .query_map(params![task_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(sql_error("read Task injections"))?;
+        let mut records = Vec::new();
+        for row in rows {
+            let row = row.map_err(sql_error("read Task injection row"))?;
+            records.push(TaskInjectionRecord {
+                task_id,
+                context_id: parse_id(&row.0, "task_injection.context_id")?,
+                intent_revision_id: parse_id(&row.1, "task_injection.intent_revision_id")?,
+                revision_id: parse_id(&row.2, "task_injection.revision_id")?,
+                injected_at_unix_seconds: u64::try_from(row.3).map_err(|_| {
+                    invariant("task_injection.injected_at_unix_seconds is negative")
+                })?,
+                source: ContextInjectionSource::parse(&row.4)?,
+            });
+        }
+        Ok(records)
+    }
+
+    /// Records what one Task did with the Contexts injected into it.
+    ///
+    /// The last write for a `(context, task)` pair wins, except that `refuted` is never
+    /// downgraded. Re-deriving the same outcomes writes the same rows, so a same-content
+    /// Checkpoint replay leaves the table unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage errors.
+    pub fn record_context_usage(&self, records: &[ContextUsageRecord]) -> Result<usize> {
+        self.record_context_usage_at(records, unix_seconds(SystemTime::now())?)
+    }
+
+    /// Records usage outcomes against an explicit clock reading.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage errors.
+    pub fn record_context_usage_at(
+        &self,
+        records: &[ContextUsageRecord],
+        now_unix_seconds: u64,
+    ) -> Result<usize> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+        let recorded_at = i64::try_from(now_unix_seconds)
+            .map_err(|_| invalid("Context usage timestamp exceeds the supported range"))?;
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Context usage record")?;
+        let mut written = 0;
+        for record in records {
+            written += transaction
+                .execute(
+                    "INSERT INTO context_usage (
+                        context_id, task_id, outcome, recorded_at_unix_seconds
+                     ) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (context_id, task_id) DO UPDATE SET
+                        outcome = excluded.outcome,
+                        recorded_at_unix_seconds = excluded.recorded_at_unix_seconds
+                     WHERE ?5 >= (CASE context_usage.outcome WHEN 'refuted' THEN 1 ELSE 0 END)",
+                    params![
+                        record.context_id.to_string(),
+                        record.task_id.to_string(),
+                        record.outcome.as_str(),
+                        recorded_at,
+                        i64::from(record.outcome.priority()),
+                    ],
+                )
+                .map_err(sql_error("record Context usage"))?;
+        }
+        transaction
+            .commit()
+            .map_err(sql_error("commit Context usage record"))?;
+        Ok(written)
+    }
+
+    /// Aggregates the recorded usage outcomes of the requested Contexts.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage errors.
+    pub fn context_usage_totals(
+        &self,
+        context_ids: &[ContextId],
+    ) -> Result<BTreeMap<ContextId, ContextUsageTotals>> {
+        let mut totals = BTreeMap::new();
+        let requested = context_ids.iter().copied().collect::<BTreeSet<_>>();
+        if requested.is_empty() {
+            return Ok(totals);
+        }
+        let connection = self.open_connection()?;
+        for chunk in requested
+            .into_iter()
+            .collect::<Vec<_>>()
+            .chunks(USAGE_TOTALS_QUERY_CHUNK)
+        {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut statement = connection
+                .prepare(&format!(
+                    "SELECT context_id, outcome, COUNT(*) FROM context_usage
+                     WHERE context_id IN ({placeholders})
+                     GROUP BY context_id, outcome"
+                ))
+                .map_err(sql_error("prepare Context usage totals"))?;
+            let parameters = chunk.iter().map(ToString::to_string).collect::<Vec<_>>();
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(parameters.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(sql_error("read Context usage totals"))?;
+            for row in rows {
+                let row = row.map_err(sql_error("read Context usage totals row"))?;
+                let context_id = parse_id::<ContextId>(&row.0, "context_usage.context_id")?;
+                let count = u32::try_from(row.2).unwrap_or(u32::MAX);
+                let entry = totals
+                    .entry(context_id)
+                    .or_insert_with(ContextUsageTotals::default);
+                match row.1.as_str() {
+                    "reused" => entry.reused = count,
+                    "ignored" => entry.ignored = count,
+                    "refuted" => entry.refuted = count,
+                    other => return Err(invariant(format!("unknown usage outcome {other}"))),
+                }
+            }
+        }
+        Ok(totals)
     }
 
     fn open_connection(&self) -> Result<Connection> {
@@ -3067,6 +3705,20 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 FOREIGN KEY (build_id) REFERENCES candidate_build (build_id),
                 FOREIGN KEY (checkpoint_id) REFERENCES agent_checkpoint (checkpoint_id)
             ) STRICT;
+            CREATE TABLE IF NOT EXISTS candidate_build_duplicate (
+                build_id TEXT NOT NULL,
+                duplicate_ordinal INTEGER NOT NULL CHECK (duplicate_ordinal >= 0),
+                checkpoint_id TEXT NOT NULL,
+                claim_id TEXT NOT NULL,
+                duplicate_of_candidate_id TEXT NOT NULL,
+                similarity_basis_points INTEGER NOT NULL CHECK (
+                    similarity_basis_points BETWEEN 0 AND 10000
+                ),
+                PRIMARY KEY (build_id, claim_id),
+                UNIQUE (build_id, duplicate_ordinal),
+                FOREIGN KEY (build_id) REFERENCES candidate_build (build_id),
+                FOREIGN KEY (checkpoint_id) REFERENCES agent_checkpoint (checkpoint_id)
+            ) STRICT;
             CREATE TABLE IF NOT EXISTS candidate_analysis (
                 candidate_id TEXT PRIMARY KEY,
                 episode_id TEXT NOT NULL,
@@ -3155,6 +3807,36 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 UNIQUE (task_id, intent_revision_id),
                 FOREIGN KEY (candidate_id) REFERENCES candidate_review (candidate_id),
                 FOREIGN KEY (intent_revision_id) REFERENCES task_intent_revision (revision_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS task_injection (
+                task_id TEXT NOT NULL,
+                context_id TEXT NOT NULL,
+                intent_revision_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL,
+                injected_at_unix_seconds INTEGER NOT NULL CHECK (
+                    injected_at_unix_seconds >= 0
+                ),
+                source TEXT NOT NULL CHECK (
+                    source IN ('intent_update', 'task_context', 'artifact_focus')
+                ),
+                PRIMARY KEY (task_id, context_id),
+                FOREIGN KEY (task_id) REFERENCES task_session (task_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS context_usage (
+                context_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK (
+                    outcome IN ('reused', 'ignored', 'refuted')
+                ),
+                recorded_at_unix_seconds INTEGER NOT NULL CHECK (
+                    recorded_at_unix_seconds >= 0
+                ),
+                PRIMARY KEY (context_id, task_id),
+                FOREIGN KEY (task_id) REFERENCES task_session (task_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS checkpoint_reference_derivation (
+                episode_id TEXT PRIMARY KEY,
+                FOREIGN KEY (episode_id) REFERENCES work_episode (episode_id)
             ) STRICT;
             PRAGMA user_version = 13;",
         )
@@ -3444,53 +4126,63 @@ fn materialize_direct_checkpoint_claims(
 ) -> Result<Vec<CheckpointClaimDraft>> {
     claims
         .iter()
-        .map(|claim| {
-            if claim.evidence.is_empty() {
-                return Err(invalid("Checkpoint Claim Evidence must not be empty"));
-            }
-            let applicability = Applicability {
-                domains: intent.domains.clone(),
-                platforms: intent.platforms.clone(),
-                conditions: claim.conditions.clone(),
-            };
-            applicability.validate("checkpoint_submission.claim.applicability")?;
-            let inline_validations = claim
-                .evidence
-                .iter()
-                .map(|evidence| {
-                    if evidence.summary.trim().is_empty() {
-                        return Err(invalid(
-                            "checkpoint_submission.claim.evidence.summary must not be empty",
-                        ));
-                    }
-                    let draft = EvidenceSnapshotDraft {
-                        kind: evidence.evidence_type,
-                        supports: claim.statement.clone(),
-                        content: serde_json::json!({"summary": evidence.summary}),
-                        interpretation: claim.rationale.clone(),
-                        limitations: evidence.limitations.clone(),
-                    };
-                    draft.validate("checkpoint_submission.claim.evidence")?;
-                    Ok(draft)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(CheckpointClaimDraft {
-                context_kind_hint: Some(claim.context_kind),
-                topic_key_hint: None,
-                statement: claim.statement.clone(),
-                rationale: claim.rationale.clone(),
-                applicability,
-                assumptions: Vec::new(),
-                recheck_when: Vec::new(),
-                evidence_refs: Vec::new(),
-                inline_validations,
-                artifact_refs: Vec::new(),
-                relations: Vec::new(),
-                engineering_references: Vec::new(),
-                related_contexts: Vec::new(),
-            })
-        })
+        .map(|claim| materialize_direct_checkpoint_claim(claim, intent))
         .collect()
+}
+
+/// Turns one direct Claim into its persisted shape without consulting any checkout.
+///
+/// The durable ACK is receipt plus outbox: it validates Evidence, inherits applicability from the
+/// Working Intent, and stops there. Engineering coordinates and the topic hint stay empty until
+/// Candidate Build derives them once through [`TaskRuntime::derive_episode_claim_references`].
+fn materialize_direct_checkpoint_claim(
+    claim: &DirectCheckpointClaimDraft,
+    intent: &WorkingIntentSnapshot,
+) -> Result<CheckpointClaimDraft> {
+    if claim.evidence.is_empty() {
+        return Err(invalid("Checkpoint Claim Evidence must not be empty"));
+    }
+    let applicability = Applicability {
+        domains: intent.domains.clone(),
+        platforms: intent.platforms.clone(),
+        conditions: claim.conditions.clone(),
+    };
+    applicability.validate("checkpoint_submission.claim.applicability")?;
+    let inline_validations = claim
+        .evidence
+        .iter()
+        .map(|evidence| {
+            if evidence.summary.trim().is_empty() {
+                return Err(invalid(
+                    "checkpoint_submission.claim.evidence.summary must not be empty",
+                ));
+            }
+            let draft = EvidenceSnapshotDraft {
+                kind: evidence.evidence_type,
+                supports: claim.statement.clone(),
+                content: serde_json::json!({"summary": evidence.summary}),
+                interpretation: claim.rationale.clone(),
+                limitations: evidence.limitations.clone(),
+            };
+            draft.validate("checkpoint_submission.claim.evidence")?;
+            Ok(draft)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(CheckpointClaimDraft {
+        context_kind_hint: Some(claim.context_kind),
+        topic_key_hint: None,
+        statement: claim.statement.clone(),
+        rationale: claim.rationale.clone(),
+        applicability,
+        assumptions: Vec::new(),
+        recheck_when: Vec::new(),
+        evidence_refs: Vec::new(),
+        inline_validations,
+        artifact_refs: Vec::new(),
+        relations: Vec::new(),
+        engineering_references: Vec::new(),
+        related_contexts: Vec::new(),
+    })
 }
 
 fn checkpoint_operation_identity(
@@ -3694,6 +4386,7 @@ fn valid_error_code(value: &str) -> bool {
 fn validate_build_claim_coverage(
     episode: &WorkEpisodeView,
     items: &[CandidateBuildItemPreparation],
+    duplicates: &[CandidateBuildDuplicatePreparation],
 ) -> Result<()> {
     let persisted = episode
         .checkpoints
@@ -3708,11 +4401,49 @@ fn validate_build_claim_coverage(
     let supplied = items
         .iter()
         .map(|item| (item.checkpoint_id, item.claim_id))
+        .chain(
+            duplicates
+                .iter()
+                .map(|duplicate| (duplicate.checkpoint_id, duplicate.claim_id)),
+        )
         .collect::<BTreeSet<_>>();
-    if persisted.len() != items.len() || persisted != supplied {
+    if persisted.len() != items.len() + duplicates.len() || persisted != supplied {
         return Err(invalid(
-            "Candidate Build must prepare every persisted Checkpoint Claim exactly once",
+            "Candidate Build must classify every persisted Checkpoint Claim exactly once",
         ));
+    }
+    Ok(())
+}
+
+fn insert_candidate_build_duplicates(
+    transaction: &Transaction<'_>,
+    build_id: CandidateBuildId,
+    duplicates: &[CandidateBuildDuplicatePreparation],
+) -> Result<()> {
+    for duplicate in duplicates {
+        let ordinal = next_ordinal(
+            transaction,
+            "SELECT COALESCE(MAX(duplicate_ordinal), -1) + 1
+             FROM candidate_build_duplicate WHERE build_id = ?1",
+            build_id.to_string(),
+            "read next Candidate Build duplicate ordinal",
+        )?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO candidate_build_duplicate (
+                    build_id, duplicate_ordinal, checkpoint_id, claim_id,
+                    duplicate_of_candidate_id, similarity_basis_points
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    build_id.to_string(),
+                    ordinal,
+                    duplicate.checkpoint_id.to_string(),
+                    duplicate.claim_id.to_string(),
+                    duplicate.duplicate_of_candidate_id.to_string(),
+                    i64::from(duplicate.similarity_basis_points),
+                ],
+            )
+            .map_err(sql_error("record Candidate Build duplicate"))?;
     }
     Ok(())
 }
@@ -3902,7 +4633,45 @@ fn require_candidate_build_view(
         final_checkpoint_id: parse_id(&row.3, "candidate_build.final_checkpoint_id")?,
         status: parse_candidate_build_status(&row.4)?,
         items: read_candidate_build_items(connection, build_id)?,
+        duplicates: read_candidate_build_duplicates(connection, build_id)?,
     })
+}
+
+fn read_candidate_build_duplicates(
+    connection: &Connection,
+    build_id: CandidateBuildId,
+) -> Result<Vec<CandidateBuildDuplicateView>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT checkpoint_id, claim_id, duplicate_of_candidate_id, similarity_basis_points
+             FROM candidate_build_duplicate WHERE build_id = ?1 ORDER BY duplicate_ordinal ASC",
+        )
+        .map_err(sql_error("prepare Candidate Build duplicates"))?;
+    let rows = statement
+        .query_map([build_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(sql_error("query Candidate Build duplicates"))?;
+    rows.map(|row| {
+        let row = row.map_err(sql_error("read Candidate Build duplicate row"))?;
+        Ok(CandidateBuildDuplicateView {
+            checkpoint_id: parse_id(&row.0, "candidate_build_duplicate.checkpoint_id")?,
+            claim_id: parse_id(&row.1, "candidate_build_duplicate.claim_id")?,
+            duplicate_of_candidate_id: parse_id(
+                &row.2,
+                "candidate_build_duplicate.duplicate_of_candidate_id",
+            )?,
+            similarity_basis_points: u16::try_from(row.3).map_err(|_| {
+                invariant("Candidate Build duplicate similarity is outside the safe bound")
+            })?,
+        })
+    })
+    .collect()
 }
 
 fn read_candidate_build_items(
@@ -4768,6 +5537,65 @@ fn read_episode_view(
     }))
 }
 
+/// Whether Candidate Build already placed this Episode's Claim spellings.
+fn claim_references_derived(connection: &Connection, episode_id: WorkEpisodeId) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT 1 FROM checkpoint_reference_derivation WHERE episode_id = ?1",
+            [episode_id.to_string()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|found| found.is_some())
+        .map_err(sql_error("read Claim reference derivation marker"))
+}
+
+/// Every path-shaped spelling in one Episode, so one `git ls-files` answers the whole Build.
+fn episode_path_candidates(episode: &WorkEpisodeView) -> Vec<PathCandidate> {
+    let mut candidates = Vec::new();
+    for checkpoint in &episode.checkpoints {
+        for claim in &checkpoint.claims {
+            let summaries = claim_evidence_summaries(&episode.episode, claim);
+            let borrowed = summaries.iter().map(String::as_str).collect::<Vec<_>>();
+            candidates.extend(reference_derivation::claim_path_candidates(
+                &claim.statement,
+                &claim.rationale,
+                &borrowed,
+            ));
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+/// Recovers the Evidence summaries one persisted Claim was submitted with.
+///
+/// Direct Checkpoint Evidence becomes an inline-validation Observation whose content carries the
+/// Agent's own `summary`, so Candidate Build reads back exactly the text the ACK saw.
+fn claim_evidence_summaries(episode: &WorkEpisode, claim: &CheckpointClaim) -> Vec<String> {
+    claim
+        .evidence_refs
+        .iter()
+        .filter_map(|reference| match reference {
+            CheckpointEvidenceRef::Observation { observation_id } => episode
+                .observations
+                .iter()
+                .find(|observation| observation.observation_id == *observation_id),
+            CheckpointEvidenceRef::TaskSignal { .. }
+            | CheckpointEvidenceRef::ContextEvidence { .. } => None,
+        })
+        .filter_map(|observation| match &observation.observation {
+            NormalizedWorkObservation::InlineValidation { evidence } => evidence
+                .content
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            _ => None,
+        })
+        .collect()
+}
+
 fn require_episode_view(
     connection: &Connection,
     episode_id: WorkEpisodeId,
@@ -5059,6 +5887,308 @@ fn read_active_task_head(
         ))
     })
     .transpose()
+}
+
+/// Owning Task lineage of one persisted Working Intent revision.
+struct IntentRevisionOwner {
+    external_session: ExternalSessionId,
+    task_session: TaskSessionId,
+    task: TaskId,
+    head_revision: TaskIntentRevisionId,
+}
+
+/// Marks one Git-committed Confirmation and its Review terminal inside an open transaction.
+fn finalize_one_candidate_confirmation(
+    transaction: &Transaction<'_>,
+    request: &CandidateConfirmationFinalize,
+) -> Result<CandidateConfirmationFinalizeOutcome> {
+    let CandidateConfirmationFinalize {
+        candidate_id,
+        operation_hash,
+        confirmation_id,
+        result_context_id,
+    } = request;
+    let candidate_id = *candidate_id;
+    let confirmation_id = *confirmation_id;
+    let result_context_id = *result_context_id;
+    let operation = read_candidate_confirmation_operation(transaction, candidate_id)?
+        .ok_or_else(|| invalid("Candidate Confirmation operation is not reserved"))?;
+    if operation.operation_hash != *operation_hash
+        || operation.plan.confirmation.confirmation_id != confirmation_id
+        || operation.plan.result_context_id != result_context_id
+    {
+        return Err(Error::new(
+            ErrorKind::Conflict,
+            "Committed Candidate Confirmation does not match the reserved operation",
+        ));
+    }
+    if operation.status == CandidateConfirmationOperationStatus::Committed {
+        let review = read_candidate_review_record(transaction, candidate_id)?
+            .ok_or_else(|| invariant("confirmed Candidate Review disappeared"))?;
+        if review.status != CandidateReviewStatus::Confirmed
+            || review.confirmation_id != Some(confirmation_id)
+            || review.result_context_id != Some(result_context_id)
+        {
+            return Err(invariant(
+                "committed Candidate Confirmation and Review audit disagree",
+            ));
+        }
+        if let Some(mapping) =
+            read_proposed_space_group_mapping_for_candidate(transaction, candidate_id)?
+            && mapping.status != ProposedSpaceGroupMappingStatus::Committed
+        {
+            return Err(invariant(
+                "committed Candidate Confirmation has an uncommitted proposed Space group",
+            ));
+        }
+        return Ok(CandidateConfirmationFinalizeOutcome {
+            operation,
+            review,
+            already_confirmed: true,
+        });
+    }
+    let changed = transaction
+        .execute(
+            "UPDATE candidate_review
+                 SET status = 'confirmed', review_version = review_version + 1,
+                     confirmation_id = ?1, result_context_id = ?2
+                 WHERE candidate_id = ?3 AND status = 'pending' AND review_version = ?4",
+            params![
+                confirmation_id.to_string(),
+                result_context_id.to_string(),
+                candidate_id.to_string(),
+                i64::try_from(operation.review_parent_version)
+                    .map_err(|_| invalid("Candidate Review parent version exceeds SQLite range"))?,
+            ],
+        )
+        .map_err(sql_error("confirm Candidate Review"))?;
+    if changed != 1 {
+        return Err(Error::new(
+            ErrorKind::StaleState,
+            "Candidate Review changed before Confirmation finalized",
+        ));
+    }
+    transaction
+        .execute(
+            "UPDATE candidate_confirmation_operation SET status = 'committed'
+                 WHERE candidate_id = ?1 AND status = 'reserved'",
+            [candidate_id.to_string()],
+        )
+        .map_err(sql_error("commit Candidate Confirmation operation status"))?;
+    transaction
+        .execute(
+            "UPDATE proposed_space_group SET status = 'committed'
+                 WHERE candidate_id = ?1 AND status = 'reserved'",
+            [candidate_id.to_string()],
+        )
+        .map_err(sql_error("commit proposed Space group mapping"))?;
+    let operation = read_candidate_confirmation_operation(transaction, candidate_id)?
+        .ok_or_else(|| invariant("committed Candidate Confirmation operation disappeared"))?;
+    let review = read_candidate_review_record(transaction, candidate_id)?
+        .ok_or_else(|| invariant("confirmed Candidate Review disappeared"))?;
+    Ok(CandidateConfirmationFinalizeOutcome {
+        operation,
+        review,
+        already_confirmed: false,
+    })
+}
+
+fn discard_one_candidate_review(
+    transaction: &Transaction<'_>,
+    task: &TaskSessionSnapshot,
+    request: &CandidateReviewDiscard,
+    now: u64,
+) -> Result<CandidateReviewDiscardOutcome> {
+    let reason = request.reason.trim();
+    let mut record = read_candidate_review_record(transaction, request.candidate_id)?
+        .ok_or_else(|| invalid("Candidate Review does not exist for the ActiveTask"))?;
+    if record.source_episode.task_session_id != task.task_session_id
+        || record.source_episode.task_id != task.task_id
+    {
+        return Err(invalid(
+            "Candidate Review does not belong to the ExternalSession ActiveTask",
+        ));
+    }
+    match record.status {
+        CandidateReviewStatus::Discarded => {
+            if record.discard_reason.as_deref() != Some(reason) {
+                return Err(Error::new(
+                    ErrorKind::Conflict,
+                    "Candidate Review was already discarded with a different reason",
+                ));
+            }
+            return Ok(CandidateReviewDiscardOutcome {
+                record,
+                status: CandidateReviewDiscardStatus::AlreadyDiscarded,
+            });
+        }
+        CandidateReviewStatus::Expired => {
+            return Err(Error::new(
+                ErrorKind::Conflict,
+                "Expired Candidate Review cannot be discarded",
+            ));
+        }
+        CandidateReviewStatus::Confirmed => {
+            return Err(Error::new(
+                ErrorKind::Conflict,
+                "Confirmed Candidate Review cannot be discarded",
+            ));
+        }
+        CandidateReviewStatus::Pending => {}
+    }
+    if record.review_version != request.expected_review_version {
+        return Err(Error::new(
+            ErrorKind::StaleState,
+            "Candidate Review version is stale",
+        ));
+    }
+    let changed = transaction
+        .execute(
+            "UPDATE candidate_review
+             SET status = 'discarded', review_version = review_version + 1,
+                 discard_reason = ?1, discarded_at_unix_seconds = ?2
+             WHERE candidate_id = ?3 AND review_version = ?4 AND status = 'pending'",
+            params![
+                reason,
+                i64::try_from(now)
+                    .map_err(|_| invalid("Candidate discard timestamp exceeds SQLite range"))?,
+                request.candidate_id.to_string(),
+                i64::try_from(request.expected_review_version)
+                    .map_err(|_| invalid("Candidate Review version exceeds SQLite range"))?,
+            ],
+        )
+        .map_err(sql_error("discard Candidate Review"))?;
+    if changed != 1 {
+        return Err(Error::new(
+            ErrorKind::StaleState,
+            "Candidate Review changed during discard",
+        ));
+    }
+    record = read_candidate_review_record(transaction, request.candidate_id)?
+        .ok_or_else(|| invariant("discarded Candidate Review disappeared"))?;
+    Ok(CandidateReviewDiscardOutcome {
+        record,
+        status: CandidateReviewDiscardStatus::Discarded,
+    })
+}
+
+/// Names the exact batch member that rolled a Review decision back.
+fn confirmation_scoped_error(candidate_id: CandidateId) -> impl Fn(Error) -> Error {
+    move |error| {
+        Error::new(
+            error.kind(),
+            format!(
+                "{} (candidate {candidate_id}); no Candidate in this batch was finalized",
+                error.message()
+            ),
+        )
+    }
+}
+
+fn candidate_scoped_error(candidate_id: CandidateId) -> impl Fn(Error) -> Error {
+    move |error| {
+        Error::new(
+            error.kind(),
+            format!(
+                "{} (candidate {candidate_id}); no Candidate in this batch was discarded",
+                error.message()
+            ),
+        )
+    }
+}
+
+fn read_intent_revision_owner(
+    transaction: &Transaction<'_>,
+    revision_id: TaskIntentRevisionId,
+) -> Result<Option<IntentRevisionOwner>> {
+    transaction
+        .query_row(
+            "SELECT task.external_session_id, task.task_session_id, task.task_id,
+                    task.current_intent_revision_id
+             FROM task_intent_revision AS revision
+             JOIN task_session AS task ON task.task_session_id = revision.task_session_id
+             WHERE revision.revision_id = ?1",
+            [revision_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error("read Working Intent revision owner"))?
+        .map(
+            |(external_session_id, task_session_id, task_id, current_intent_revision_id)| {
+                Ok(IntentRevisionOwner {
+                    external_session: parse_id(
+                        &external_session_id,
+                        "task_session.external_session_id",
+                    )?,
+                    task_session: parse_id(&task_session_id, "task_session.task_session_id")?,
+                    task: parse_id(&task_id, "task_session.task_id")?,
+                    head_revision: parse_id(
+                        &current_intent_revision_id,
+                        "task_session.current_intent_revision_id",
+                    )?,
+                })
+            },
+        )
+        .transpose()
+}
+
+/// Appends one successor revision and advances the owning Task Head in the same transaction.
+fn append_revision_in_transaction(
+    transaction: &Transaction<'_>,
+    task_session_id: TaskSessionId,
+    current: &TaskIntentRevision,
+    working_intent: WorkingIntentSnapshot,
+) -> Result<TaskIntentRevision> {
+    let revision = TaskIntentRevision::successor(current, working_intent)?;
+    let ordinal = read_revision_ordinal(transaction, current.revision_id)?
+        .checked_add(1)
+        .ok_or_else(|| invariant("Task Intent revision ordinal overflow"))?;
+    insert_intent_revision(transaction, task_session_id, ordinal, &revision)?;
+    let changed = transaction
+        .execute(
+            "UPDATE task_session SET current_intent_revision_id = ?1
+             WHERE task_session_id = ?2 AND current_intent_revision_id = ?3",
+            params![
+                revision.revision_id.to_string(),
+                task_session_id.to_string(),
+                current.revision_id.to_string(),
+            ],
+        )
+        .map_err(sql_error("advance Task Intent Head"))?;
+    if changed != 1 {
+        return Err(invariant(
+            "Task Intent Head changed inside write transaction",
+        ));
+    }
+    Ok(revision)
+}
+
+/// Deterministic goal comparison key used only for the concurrent-Agent fork decision.
+///
+/// It lowercases, keeps alphanumeric runs and collapses every other character into one separator.
+/// It is not a retrieval tokenizer and never leaves this decision.
+fn normalized_goal(goal: &str) -> String {
+    let mut normalized = String::with_capacity(goal.len());
+    let mut pending_separator = false;
+    for character in goal.chars() {
+        if character.is_alphanumeric() {
+            if pending_separator && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            pending_separator = false;
+            normalized.extend(character.to_lowercase());
+        } else {
+            pending_separator = true;
+        }
+    }
+    normalized
 }
 
 fn reject_invalid_parent(

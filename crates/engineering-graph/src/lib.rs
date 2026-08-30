@@ -4,10 +4,14 @@
 //! Catalog. The `SQLite` Registry is a disposable projection of that Catalog;
 //! paths, basenames, remotes, and Git topology never create or merge identity.
 
+mod artifact_focus;
 mod projection;
 mod resolver;
 mod scanner;
 
+pub use artifact_focus::{
+    ARTIFACT_FOCUS_QUERY_BUDGET, ArtifactFocusHit, ArtifactFocusReader, MAX_ARTIFACT_FOCUS_HITS,
+};
 pub use projection::{EngineeringProjectionSnapshot, EngineeringProjectionStore};
 pub use resolver::{
     CandidateMatchEvidence, EngineeringProjection, EngineeringReferenceResolver,
@@ -27,17 +31,37 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
     process::Command,
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sctx_domain::{Error, ErrorKind, RepositoryId, RepositoryIdentity, Result};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
+/// Registry schema versions that reach [`SCHEMA_VERSION`] by additive
+/// `CREATE TABLE IF NOT EXISTS` alone. The projection rows are unchanged, so an
+/// older disposable Registry is upgraded in place instead of rejected.
+const ADDITIVE_UPGRADE_VERSIONS: [i64; 1] = [3];
+/// Version tag of the Catalog fingerprint recipe. Bumping it invalidates every
+/// persisted fingerprint, which only forces one extra full synchronization.
+const CATALOG_FINGERPRINT_VERSION: &str = "catalog-fingerprint-v1";
+/// `projection_meta` key holding the fingerprint of the Catalog this Registry
+/// was last projected from, together with the report that projection returned.
+const CATALOG_FINGERPRINT_KEY: &str = "catalog_fingerprint";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CATALOG_REPOSITORIES: usize = 256;
 const MAX_CHECKOUTS_PER_REPOSITORY: usize = 32;
+/// Bounded retry policy for `PRAGMA journal_mode=WAL`, which requires an
+/// exclusive lock and is not protected by `busy_timeout`. Only
+/// `SQLITE_BUSY`/`SQLITE_LOCKED` is retried; every other error is returned
+/// immediately.
+const WAL_RETRY_MAX_ATTEMPTS: u32 = 20;
+const WAL_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(25);
+const WAL_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(250);
+const WAL_RETRY_BUDGET: Duration = Duration::from_secs(3);
 
 /// Current local accessibility of one configured checkout or Repository.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -146,6 +170,15 @@ impl RepositoryRegistry {
         repositories: &[CatalogRepositorySpec],
     ) -> Result<RepositoryCatalogSyncReport> {
         let repositories = normalize_catalog(repositories)?;
+        // Request-serving code synchronizes on every call, and an unchanged Catalog against
+        // unchanged checkout states can only reproduce the projection already stored. The
+        // fingerprint turns that case into one read: no `git` process per checkout, and no
+        // write transaction competing with concurrent readers of the same Registry.
+        let fingerprint = catalog_fingerprint(&repositories)?;
+        let mut connection = self.open_connection()?;
+        if let Some(report) = read_catalog_projection_report(&connection, &fingerprint)? {
+            return Ok(report);
+        }
         let observations = repositories
             .iter()
             .map(|repository| {
@@ -158,7 +191,6 @@ impl RepositoryRegistry {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let mut connection = self.open_connection()?;
         let transaction = immediate(&mut connection, "begin Repository Catalog sync")?;
         transaction
             .execute("DELETE FROM repository_locator", [])
@@ -208,14 +240,16 @@ impl RepositoryRegistry {
                     .map_err(sql_error("project Catalog Repository locator"))?;
             }
         }
-        transaction
-            .commit()
-            .map_err(sql_error("commit Repository Catalog sync"))?;
-        Ok(RepositoryCatalogSyncReport {
+        let report = RepositoryCatalogSyncReport {
             repository_count: observations.len(),
             locator_count,
             unavailable_locator_count,
-        })
+        };
+        write_catalog_projection_report(&transaction, &fingerprint, &report)?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit Repository Catalog sync"))?;
+        Ok(report)
     }
 
     /// Resolves one stable Repository identity.
@@ -299,9 +333,7 @@ impl RepositoryRegistry {
         connection
             .busy_timeout(BUSY_TIMEOUT)
             .map_err(sql_error("configure Repository Registry busy timeout"))?;
-        connection
-            .pragma_update(None, "journal_mode", "WAL")
-            .map_err(sql_error("configure Repository Registry journal mode"))?;
+        enable_wal_journal_mode(&connection)?;
         connection
             .pragma_update(None, "synchronous", "NORMAL")
             .map_err(sql_error("configure Repository Registry synchronous mode"))?;
@@ -360,6 +392,116 @@ fn normalize_catalog(repositories: &[CatalogRepositorySpec]) -> Result<Vec<Catal
             checkout_paths: checkout_paths.into_iter().collect(),
         })
         .collect())
+}
+
+/// Deterministic fingerprint of one already-normalized Catalog together with the
+/// local state of every configured checkout.
+///
+/// It covers exactly the inputs [`RepositoryRegistry::sync_catalog`] projects:
+/// the stable identities, their configured paths, and the cheap filesystem facts
+/// that decide whether [`inspect_catalog_checkout`] resolves a path to an
+/// available locator, an unavailable one, or a typed rejection. Every transition
+/// between those outcomes changes a signature, so an unchanged fingerprint means
+/// the stored projection is exactly what a full synchronization would rewrite.
+fn catalog_fingerprint(repositories: &[CatalogRepositorySpec]) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hash_component(&mut hasher, CATALOG_FINGERPRINT_VERSION);
+    for repository in repositories {
+        hash_component(&mut hasher, &repository.repository_id.to_string());
+        for path in &repository.checkout_paths {
+            hash_component(&mut hasher, &path_text(path)?);
+            hash_component(&mut hasher, &checkout_state_signature(path)?);
+        }
+    }
+    Ok(format!("cat_{:x}", hasher.finalize()))
+}
+
+/// Cheap local signature of one configured checkout: only `lstat` calls, never a
+/// `git` process. Each distinct signature maps to one [`inspect_catalog_checkout`]
+/// outcome, so a signature change is the trigger for the full inspection.
+fn checkout_state_signature(path: &Path) -> Result<String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok("missing".to_owned());
+        }
+        Err(error) => return Err(io_error("inspect configured Repository checkout")(error)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok("symlink".to_owned());
+    }
+    if !metadata.is_dir() {
+        return Ok("not-a-directory".to_owned());
+    }
+    if fs::symlink_metadata(path.join(".git")).is_ok() {
+        Ok("worktree-root".to_owned())
+    } else {
+        Ok("directory".to_owned())
+    }
+}
+
+/// Reads the report of the projection stored for `fingerprint`, or `None` when
+/// this Registry was last projected from a different Catalog state.
+fn read_catalog_projection_report(
+    connection: &Connection,
+    fingerprint: &str,
+) -> Result<Option<RepositoryCatalogSyncReport>> {
+    connection
+        .query_row(
+            "SELECT repository_count, locator_count, unavailable_locator_count
+             FROM projection_meta WHERE key = ?1 AND fingerprint = ?2",
+            params![CATALOG_FINGERPRINT_KEY, fingerprint],
+            |row| {
+                Ok(RepositoryCatalogSyncReport {
+                    repository_count: projected_count(row.get::<_, i64>(0)?),
+                    locator_count: projected_count(row.get::<_, i64>(1)?),
+                    unavailable_locator_count: projected_count(row.get::<_, i64>(2)?),
+                })
+            },
+        )
+        .optional()
+        .map_err(sql_error("read Repository Catalog projection fingerprint"))
+}
+
+/// Reads back one persisted projection count. The Registry only ever stores counts
+/// it produced itself, so an out-of-range value is disposable state, not an error.
+fn projected_count(value: i64) -> usize {
+    usize::try_from(value).unwrap_or(0)
+}
+
+/// Records the fingerprint and report of the projection this transaction wrote.
+fn write_catalog_projection_report(
+    transaction: &Transaction<'_>,
+    fingerprint: &str,
+    report: &RepositoryCatalogSyncReport,
+) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT OR REPLACE INTO projection_meta (
+                key, fingerprint, repository_count, locator_count, unavailable_locator_count
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                CATALOG_FINGERPRINT_KEY,
+                fingerprint,
+                i64::try_from(report.repository_count).map_err(|_| invariant(
+                    "Repository count exceeds the Registry integer range"
+                ))?,
+                i64::try_from(report.locator_count)
+                    .map_err(|_| invariant("locator count exceeds the Registry integer range"))?,
+                i64::try_from(report.unavailable_locator_count).map_err(|_| invariant(
+                    "unavailable locator count exceeds the Registry integer range"
+                ))?,
+            ],
+        )
+        .map_err(sql_error(
+            "record Repository Catalog projection fingerprint",
+        ))?;
+    Ok(())
+}
+
+fn hash_component(hasher: &mut Sha256, value: &str) {
+    hasher.update(value.len().to_be_bytes());
+    hasher.update(value.as_bytes());
 }
 
 fn inspect_catalog_checkout(path: &Path) -> Result<LocalRepositoryLocator> {
@@ -437,6 +579,61 @@ fn path_text(path: &Path) -> Result<String> {
         .ok_or_else(|| invalid("Repository checkout path must be valid UTF-8"))
 }
 
+/// Enables `WAL` journal mode with a bounded, backed-off retry against
+/// `SQLITE_BUSY`/`SQLITE_LOCKED`.
+///
+/// `PRAGMA journal_mode=WAL` needs a brief exclusive lock to rewrite the
+/// database header the first time a database switches into `WAL` mode, and
+/// that exclusive-lock acquisition is not covered by `busy_timeout`. When
+/// several connections race to `initialize` the same new database, one may
+/// observe the file as locked. Retries here are deterministic (fixed
+/// attempt count and backoff schedule, bounded by both an attempt ceiling
+/// and a wall-clock budget) and only ever apply to busy/locked failures;
+/// every other error is returned immediately.
+fn enable_wal_journal_mode(connection: &Connection) -> Result<()> {
+    let current: String = connection
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .map_err(sql_error("read Repository Registry journal mode"))?;
+    if current.eq_ignore_ascii_case("wal") {
+        return Ok(());
+    }
+    let deadline = Instant::now() + WAL_RETRY_BUDGET;
+    let mut backoff = WAL_RETRY_INITIAL_BACKOFF;
+    let mut last_error = None;
+    for attempt in 0..WAL_RETRY_MAX_ATTEMPTS {
+        match connection.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let retryable = is_database_busy(&error);
+                let attempts_remain = attempt + 1 < WAL_RETRY_MAX_ATTEMPTS;
+                let now = Instant::now();
+                last_error = Some(error);
+                if !retryable || !attempts_remain || now >= deadline {
+                    break;
+                }
+                thread::sleep(backoff.min(deadline.saturating_duration_since(now)));
+                backoff = (backoff * 2).min(WAL_RETRY_MAX_BACKOFF);
+            }
+        }
+    }
+    Err(sql_error("configure Repository Registry journal mode")(
+        last_error.expect("the retry loop always records the failing pragma_update error"),
+    ))
+}
+
+/// Returns `true` for `SQLITE_BUSY`/`SQLITE_LOCKED` failures, the only
+/// `SQLite` errors safe to retry for `enable_wal_journal_mode`.
+fn is_database_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if matches!(
+                inner.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
 fn immediate<'a>(connection: &'a mut Connection, context: &'static str) -> Result<Transaction<'a>> {
     connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -447,7 +644,10 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
     let version = connection
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .map_err(sql_error("read Repository Registry schema version"))?;
-    if version != 0 && version != SCHEMA_VERSION {
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    if version != 0 && !ADDITIVE_UPGRADE_VERSIONS.contains(&version) {
         return Err(invariant(format!(
             "unsupported Repository Registry schema version {version}"
         )));
@@ -468,7 +668,14 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
             ) STRICT;
             CREATE INDEX IF NOT EXISTS repository_locator_repository
                 ON repository_locator (repository_id);
-            PRAGMA user_version = 3;",
+            CREATE TABLE IF NOT EXISTS projection_meta (
+                key TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                repository_count INTEGER NOT NULL,
+                locator_count INTEGER NOT NULL,
+                unavailable_locator_count INTEGER NOT NULL
+            ) STRICT;
+            PRAGMA user_version = 4;",
         )
         .map_err(sql_error("initialize Repository Registry schema"))
 }

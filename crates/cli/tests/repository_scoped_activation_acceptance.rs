@@ -7,6 +7,7 @@ use std::{
     thread,
 };
 
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
 use sctx_domain::{ExternalSessionLocator, RepositoryId};
 use sctx_git_store::GitStore;
 use sctx_local_state::{
@@ -25,7 +26,7 @@ const CURSOR_FIXTURE: &str = include_str!("../../../fixtures/agents/cursor-3.13.
 #[derive(Debug, Deserialize)]
 struct Oracle {
     schema: String,
-    activation_marker: String,
+    activation_marker_template: String,
     activation_marker_max_bytes: usize,
     wire: WireOracle,
     enabled_without_active_task: LifecycleOracle,
@@ -51,6 +52,40 @@ struct ResidueOracle {
     runtime_files: usize,
     report_files: usize,
     knowledge_commits_delta: usize,
+}
+
+impl Oracle {
+    /// The exact marker the Hook must emit for one Agent kind and host Session id.
+    fn activation_marker(&self, agent_kind: &str, session: &str) -> String {
+        self.activation_marker_template
+            .replace("{host_session_id}", session)
+            .replace("{agent_kind}", agent_kind)
+    }
+
+    /// The documented enabled `SessionStart` wire output for one Agent kind and host Session id.
+    fn activation(&self, agent_kind: &str, session: &str) -> Value {
+        let mut wire = match agent_kind {
+            "codex" => self.wire.codex_enabled_session_start.clone(),
+            "cursor" => self.wire.cursor_enabled_session_start.clone(),
+            other => panic!("unknown agent kind {other}"),
+        };
+        substitute_marker(&mut wire, &self.activation_marker(agent_kind, session));
+        wire
+    }
+}
+
+/// Replaces the fixture's `{activation_marker}` placeholder with one rendered marker.
+fn substitute_marker(value: &mut Value, marker: &str) {
+    match value {
+        Value::String(text) if text == "{activation_marker}" => marker.clone_into(text),
+        Value::Object(fields) => fields
+            .values_mut()
+            .for_each(|field| substitute_marker(field, marker)),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| substitute_marker(item, marker)),
+        _ => {}
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -446,26 +481,46 @@ fn fixed_oracle_is_hand_written_bounded_and_privacy_safe() {
         oracle.schema,
         "sctx.repository-scoped-activation.acceptance.v1"
     );
-    assert!(oracle.activation_marker.len() <= oracle.activation_marker_max_bytes);
-    assert_eq!(oracle.activation_marker_max_bytes, 128);
+    assert_eq!(oracle.activation_marker_max_bytes, 512);
     let raw = String::from_utf8(ORACLE_BYTES.to_vec()).unwrap();
     for forbidden in [
         "/Users/",
         "/home/",
         "bytedance",
         "transcript_path",
-        "session_id",
-        "conversation_id",
+        "synthetic-",
         "prompt",
         "tool_output",
     ] {
         assert!(!raw.contains(forbidden), "oracle leaked {forbidden:?}");
     }
     assert_eq!(
-        oracle.wire.codex_enabled_session_start,
+        oracle
+            .activation_marker_template
+            .matches("{host_session_id}")
+            .count(),
+        2,
+        "the marker template must quote the host Session id and nothing concrete"
+    );
+    for (agent_kind, agent, session) in [
+        ("codex", AgentKind::Codex, "synthetic-marker-codex"),
+        ("cursor", AgentKind::Cursor, "synthetic-marker-cursor"),
+    ] {
+        let marker = oracle.activation_marker(agent_kind, session);
+        assert_eq!(
+            marker,
+            shared_context_activation_marker(agent, session),
+            "the oracle marker must match the shipped renderer"
+        );
+        assert!(marker.len() <= oracle.activation_marker_max_bytes);
+        assert!(marker.contains(session));
+    }
+    assert_eq!(
+        oracle.activation("codex", "synthetic-marker-codex"),
         json!({"hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": oracle.activation_marker
+            "additionalContext":
+                shared_context_activation_marker(AgentKind::Codex, "synthetic-marker-codex")
         }})
     );
     assert_eq!(oracle.wire.neutral, json!({}));
@@ -482,7 +537,7 @@ fn documented_codex_direct_lifecycle_activates_before_prompt_and_keeps_git_clean
 
     assert_output(
         &fixture.run("codex", &events[0]),
-        &oracle.wire.codex_enabled_session_start,
+        &oracle.activation("codex", session),
     );
     assert!(matches!(
         fixture.read_scope("codex", session),
@@ -535,7 +590,7 @@ fn documented_cursor_group_lifecycle_records_members_and_safe_non_locating_inves
 
     assert_output(
         &fixture.run("cursor", &events[0]),
-        &oracle.wire.cursor_enabled_session_start,
+        &oracle.activation("cursor", session),
     );
     let scope = fixture.current_scope("cursor", session);
     let mut expected_members = vec![
@@ -641,7 +696,7 @@ fn resume_compact_and_concurrent_repeated_starts_keep_the_first_successful_scope
     let mut events = documented_events("codex", session, &fixture.repository_a);
     assert_output(
         &fixture.run("codex", &events[0]),
-        &oracle.wire.codex_enabled_session_start,
+        &oracle.activation("codex", session),
     );
     let first = fixture.current_scope("codex", session);
     assert!(matches!(
@@ -658,7 +713,7 @@ fn resume_compact_and_concurrent_repeated_starts_keep_the_first_successful_scope
         events[0]["source"] = Value::String(source.to_owned());
         assert_output(
             &fixture.run("codex", &events[0]),
-            &oracle.wire.codex_enabled_session_start,
+            &oracle.activation("codex", session),
         );
         set_event_cwd("codex", &mut events[1], cwd);
         assert_output(&fixture.run("codex", &events[1]), &oracle.wire.neutral);
@@ -686,7 +741,7 @@ fn resume_compact_and_concurrent_repeated_starts_keep_the_first_successful_scope
     for handle in handles {
         assert_output(
             &handle.join().unwrap(),
-            &oracle.wire.codex_enabled_session_start,
+            &oracle.activation("codex", session),
         );
     }
     assert_eq!(fixture.current_scope("codex", session), first);

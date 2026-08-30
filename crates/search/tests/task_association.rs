@@ -13,6 +13,7 @@ use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
 use sctx_index::ProjectionIndex;
 use sctx_search::{
+    AutomaticQueryTokenExplanation, AutomaticQueryTokenFilter, ContextPackDetailLevel,
     ContextPackMode, ContextStatus, IntentConflictActor, IntentConflictDecision,
     IntentConflictHandoffExplanation, IntentConflictKind, IntentConflictSelection,
     IntentConflictValidation, IntentScopeConflictExplanation, IntentScopeConflictKind,
@@ -72,6 +73,8 @@ fn intent(title: &str, intent_text: &str) -> sctx_domain::IntentSnapshot {
 fn context(statement: &str, applicability: Applicability) -> ContextRevisionDraft {
     ContextRevisionDraft {
         kind: ContextKind::Contract,
+        problem_view: None,
+        hints: Vec::new(),
         topic_key: Some("task/association-fixture".to_owned()),
         statement: statement.to_owned(),
         rationale: "the accepted fixture captures durable engineering behavior".to_owned(),
@@ -701,6 +704,79 @@ fn out_of_scope_only_text_or_code_signal_stays_diagnostic_and_never_associates()
         )
         .unwrap();
     assert!(code_signal_only.associations.is_empty());
+}
+
+#[test]
+fn shared_vocabulary_in_out_of_scope_never_penalizes_a_positive_association() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("shared-vocabulary")).unwrap();
+    let event = Event::space_created(
+        sctx_domain::IntentSnapshot {
+            title: "RankingRequirement".to_owned(),
+            problem: "SearchRankingEngine needs stable behavior".to_owned(),
+            desired_outcome: "Ranking remains deterministic".to_owned(),
+            in_scope: vec!["SearchRankingEngine 搜索排序".to_owned()],
+            // The exclusion re-uses the Space's own vocabulary to narrow one case; the shared
+            // tokens must stay positive.
+            out_of_scope: vec!["SearchRankingEngine 支付迁移".to_owned()],
+            acceptance_conditions: vec!["ranking tests remain stable".to_owned()],
+            domain_terms: vec!["ranking".to_owned()],
+        },
+        None,
+    )
+    .unwrap();
+    let space_id = match event.payload() {
+        EventPayload::SpaceCreated { space_id, .. } => *space_id,
+        _ => unreachable!(),
+    };
+    append(&store, event);
+    add_accepted_context(
+        &store,
+        space_id,
+        "SearchRankingEngine keeps the ranking order stable",
+        applicability("ranking", "server", "active"),
+    );
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    let engine = SearchEngine::new(index);
+
+    let shared = engine
+        .task_space_associations(TaskId::new(), &task("SearchRankingEngine 搜索排序"), &[])
+        .unwrap();
+    assert_eq!(shared.associations.len(), 1);
+    assert_eq!(shared.associations[0].space_id, space_id);
+    assert!(
+        shared.associations[0].reasons.iter().all(|reason| {
+            serde_json::from_str::<IntentScopeConflictExplanation>(reason).is_err()
+        }),
+        "a token that also matched a positive Intent field is not an exclusion"
+    );
+
+    // A token that only appears in `out_of_scope` still penalizes the association.
+    let negative = engine
+        .task_space_associations(
+            TaskId::new(),
+            &task("SearchRankingEngine 搜索排序 支付迁移"),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(negative.associations.len(), 1);
+    let explanation = negative.associations[0]
+        .reasons
+        .iter()
+        .find_map(|reason| serde_json::from_str::<IntentScopeConflictExplanation>(reason).ok())
+        .expect("an exclusive out-of-scope token is still explained as a scope conflict");
+    assert_eq!(
+        explanation.kind,
+        IntentScopeConflictKind::ContextSpaceOutOfScope
+    );
+    assert!(
+        explanation
+            .matched_tokens
+            .iter()
+            .all(|token| !token.contains("search") && !token.contains("ranking"))
+    );
+    assert!(negative.associations[0].score < shared.associations[0].score);
 }
 
 #[test]
@@ -1339,6 +1415,7 @@ fn related_space_retrieval_preserves_primary_owner_and_exposes_typed_association
             space_id: primary_space,
         },
         Vec::new(),
+        Vec::new(),
     )
     .unwrap();
     store.confirm_candidate(&plan).unwrap();
@@ -1573,6 +1650,139 @@ fn automatic_task_pack_excludes_every_unsafe_state_while_explicit_expands_confli
 }
 
 #[test]
+fn a_large_corpus_drops_generic_tokens_only_beyond_the_retained_rarest_floor() {
+    let fixture = fusion_corpus_fixture();
+    let engine = SearchEngine::new(fixture.index);
+    // `implement`, `shared` and `workflow` appear in every generic Space Intent of this corpus;
+    // the remaining tokens are rare and carry the actual meaning of the intent.
+    let response = engine
+        .task_context_pack(&TaskContextRequest::automatic(
+            TaskId::new(),
+            task(
+                "SearchV9RareEndpoint ExactResultSchema precise protocol implement shared workflow",
+            ),
+            Vec::new(),
+            100_000,
+        ))
+        .unwrap();
+    let association = response
+        .associations
+        .iter()
+        .find(|association| association.space_id == fixture.precise_space_id)
+        .expect("the rare tokens still associate the precise Space");
+    let explanation = association
+        .reasons
+        .iter()
+        .find_map(|reason| serde_json::from_str::<AutomaticQueryTokenExplanation>(reason).ok())
+        .expect("automatic query token selection is explained");
+
+    assert!(explanation.document_count >= 20);
+    assert!(!explanation.stop_word_fallback_active);
+    for generic in ["implement", "shared", "workflow"] {
+        let drop = explanation
+            .dropped_tokens
+            .iter()
+            .find(|drop| drop.token == generic)
+            .unwrap_or_else(|| panic!("{generic} is dropped: {explanation:?}"));
+        assert_eq!(
+            drop.filter,
+            AutomaticQueryTokenFilter::HighDocumentFrequency
+        );
+        assert!(
+            drop.document_frequency
+                .is_some_and(|frequency| frequency > 0)
+        );
+    }
+    // Frequency never removes a rare token, and the retained floor keeps at least the rarest
+    // tokens whatever the corpus looks like.
+    assert!(explanation.selected_tokens.len() >= 8);
+    for rare in ["search", "endpoint", "schema", "precise"] {
+        assert!(
+            explanation
+                .selected_tokens
+                .iter()
+                .any(|token| token == rare),
+            "{rare} is genuine domain vocabulary here"
+        );
+        assert!(
+            explanation
+                .dropped_tokens
+                .iter()
+                .all(|drop| drop.token != rare)
+        );
+    }
+    assert!(
+        response
+            .items
+            .iter()
+            .any(|item| item.context.context_id == fixture.precise_context_id)
+    );
+}
+
+#[test]
+fn the_retained_floor_keeps_frequent_tokens_but_never_a_corpus_wide_one() {
+    const CARRIER_SPACE_COUNT: usize = 21;
+    const MIDDLE_FREQUENCY_SPACE_COUNT: usize = 12;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("frequency-floor")).unwrap();
+    for index in 0..CARRIER_SPACE_COUNT {
+        let mut intent_text = "universalterm".to_owned();
+        if index < MIDDLE_FREQUENCY_SPACE_COUNT {
+            intent_text.push_str(" middlefrequencyterm");
+        }
+        if index == 0 {
+            intent_text.push_str(" rareneedle");
+        }
+        add_space(&store, &format!("Carrier{index:02}"), &intent_text);
+    }
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+
+    let response = SearchEngine::new(index)
+        .task_space_associations(
+            TaskId::new(),
+            &task("rareneedle middlefrequencyterm universalterm"),
+            &[],
+        )
+        .unwrap();
+    assert!(!response.associations.is_empty());
+    let explanation = response.associations[0]
+        .reasons
+        .iter()
+        .find_map(|reason| serde_json::from_str::<AutomaticQueryTokenExplanation>(reason).ok())
+        .expect("automatic query token selection is explained");
+
+    assert!(explanation.document_count >= 20);
+    // 12 of 21 documents: frequent enough to trip the ordinary rule, but the query is short so the
+    // retained floor keeps it.
+    assert!(
+        explanation
+            .selected_tokens
+            .iter()
+            .any(|token| token == "middlefrequencyterm"),
+        "{explanation:?}"
+    );
+    assert!(
+        explanation
+            .selected_tokens
+            .iter()
+            .any(|token| token == "rareneedle")
+    );
+    // Present in every document: it selects the whole corpus, so the floor does not protect it.
+    let universal = explanation
+        .dropped_tokens
+        .iter()
+        .find(|drop| drop.token == "universalterm")
+        .unwrap_or_else(|| panic!("a corpus-wide token is dropped: {explanation:?}"));
+    assert_eq!(
+        universal.filter,
+        AutomaticQueryTokenFilter::HighDocumentFrequency
+    );
+    assert_eq!(universal.document_frequency, Some(CARRIER_SPACE_COUNT));
+}
+
+#[test]
 fn artifact_and_interface_hints_recall_context_only_text_without_graph_semantics() {
     let fixture = fixture();
     let index = fixture.index.clone();
@@ -1732,4 +1942,591 @@ fn high_coverage_hint_text_outranks_generic_text_and_remains_budgeted() {
         item.reason == "space_top_k"
             && item.count == fixture.total_spaces - generic_request.max_spaces
     }));
+}
+
+/// One Space holding eight injection-safe Contexts that all answer the same rare query token.
+/// A 2000-token budget cannot carry eight explainable items, so it is the exact shape that made
+/// automatic injection return a single Context before compact packing existed.
+fn compact_budget_fixture() -> (TempDir, ProjectionIndex, Vec<ContextId>) {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("compact-installation")).unwrap();
+    let space_id = add_space(
+        &store,
+        "CompactBudgetSpace",
+        "compactbudgetneedle retrieval payload",
+    );
+    let mut contexts = Vec::new();
+    for index in 0..8_u8 {
+        let (context_id, _, _) = add_accepted_context(
+            &store,
+            space_id,
+            &format!(
+                "compactbudgetneedle case {index}: the reviewed branch keeps the documented \
+                 fallback behavior when the optional module is absent, so the caller observes a \
+                 safe degradation instead of an unresolved-service failure"
+            ),
+            applicability("compactbudget", "server", &format!("case-{index}")),
+        );
+        contexts.push(context_id);
+    }
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    (temporary, index, contexts)
+}
+
+#[test]
+fn compact_detail_level_fits_more_evidenced_items_in_the_default_budget() {
+    let (_temporary, index, contexts) = compact_budget_fixture();
+    let engine = SearchEngine::new(index);
+    let request = TaskContextRequest::automatic(
+        TaskId::new(),
+        task("compactbudgetneedle"),
+        Vec::new(),
+        2_000,
+    );
+
+    let full = engine
+        .task_context_pack_with_detail(&request, ContextPackDetailLevel::Full)
+        .unwrap();
+    let compact = engine
+        .task_context_pack_with_detail(&request, ContextPackDetailLevel::Compact)
+        .unwrap();
+
+    assert_eq!(full.detail_level, ContextPackDetailLevel::Full);
+    assert!(full.compact_items.is_empty());
+    assert_eq!(compact.detail_level, ContextPackDetailLevel::Compact);
+    assert!(compact.items.is_empty());
+    assert!(compact.associations.is_empty());
+    assert_eq!(compact.compact_associations.len(), 1);
+
+    assert!(
+        compact.compact_items.len() >= 6,
+        "compact packing must carry at least six Contexts in the default budget, got {}",
+        compact.compact_items.len()
+    );
+    assert!(
+        compact.compact_items.len() > full.items.len(),
+        "compact must carry strictly more than the explainable shape at the same budget"
+    );
+    assert!(compact.estimated_tokens <= request.token_budget);
+    assert_eq!(
+        compact.estimated_tokens,
+        estimate_task_context_payload_tokens(&compact)
+    );
+    assert!(
+        serde_json::to_string(&compact.compact_items)
+            .unwrap()
+            .len()
+            .div_ceil(4)
+            <= compact.estimated_tokens
+    );
+
+    for item in &compact.compact_items {
+        assert!(contexts.contains(&item.context_id));
+        assert_eq!(item.status, ContextStatus::Accepted);
+        assert!(
+            !item.evidence.is_empty(),
+            "every compact item keeps its Evidence: {item:?}"
+        );
+        assert!(item.evidence.iter().all(|evidence| {
+            !evidence.summary.is_empty() && evidence.summary.chars().count() <= 201
+        }));
+        assert!(!item.conditions.is_empty());
+        assert!(!item.why.is_empty() && item.why.len() <= 3);
+        assert!(item.conflicts.is_empty());
+    }
+
+    // Every omitted Context is named, so the Agent can fetch exactly what the budget dropped.
+    for omitted in &compact.omitted {
+        if omitted.context_id.is_some() {
+            assert!(omitted.title.is_some());
+            assert_eq!(omitted.count, 1);
+        }
+    }
+    let carried = compact
+        .compact_items
+        .iter()
+        .map(|item| item.context_id)
+        .chain(
+            compact
+                .omitted
+                .iter()
+                .filter_map(|omitted| omitted.context_id),
+        )
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        carried,
+        contexts
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "compact packing accounts for every retrieved Context, returned or named as omitted"
+    );
+}
+
+#[test]
+fn compact_detail_level_drops_machine_channels_and_full_keeps_the_token_explanation() {
+    let (_temporary, index, _contexts) = compact_budget_fixture();
+    let engine = SearchEngine::new(index);
+    let request = TaskContextRequest::automatic(
+        TaskId::new(),
+        task("compactbudgetneedle"),
+        Vec::new(),
+        100_000,
+    );
+
+    let full = engine
+        .task_context_pack_with_detail(&request, ContextPackDetailLevel::Full)
+        .unwrap();
+    let compact = engine
+        .task_context_pack_with_detail(&request, ContextPackDetailLevel::Compact)
+        .unwrap();
+
+    // A Task with no dropped tokens still reports its selection at the top level in `full`.
+    let explanation = full
+        .query_token_explanation
+        .as_ref()
+        .expect("full packs expose the automatic query token selection at the top level");
+    assert!(
+        explanation
+            .selected_tokens
+            .contains(&"compactbudgetneedle".to_owned())
+    );
+    assert!(compact.query_token_explanation.is_none());
+
+    assert!(
+        full.associations.iter().any(|association| association
+            .reasons
+            .iter()
+            .any(|reason| reason.starts_with('{'))),
+        "the explainable shape keeps the machine-readable fusion reason"
+    );
+    assert!(
+        compact
+            .compact_associations
+            .iter()
+            .all(|association| association
+                .reasons
+                .iter()
+                .all(|reason| !reason.starts_with('{'))),
+        "compact associations keep only human-readable sentences"
+    );
+
+    let encoded = serde_json::to_value(&compact.compact_items).unwrap();
+    let encoded = serde_json::to_string(&encoded).unwrap();
+    for dropped in [
+        "match_reason",
+        "safety_source",
+        "retrieval_paths",
+        "rationale",
+        "bm25",
+        "auto_injection_eligible",
+    ] {
+        assert!(
+            !encoded.contains(dropped),
+            "compact items must not carry `{dropped}`"
+        );
+    }
+    assert!(
+        serde_json::to_string(&full.items)
+            .unwrap()
+            .contains("match_reason"),
+        "the explainable shape keeps its match reasons"
+    );
+
+    // Identical requests remain byte-stable in both shapes.
+    assert_eq!(
+        compact,
+        engine
+            .task_context_pack_with_detail(&request, ContextPackDetailLevel::Compact)
+            .unwrap()
+    );
+}
+
+#[test]
+fn a_condition_matches_the_stated_task_scope_rather_than_its_constraint_list() {
+    let fixture = fixture();
+    let engine = SearchEngine::new(fixture.index);
+
+    // The Task never lists a constraint: it states the situation in its goal and in-scope items,
+    // which is how an Agent actually writes a Working Intent.
+    let mut stated = task("legacyclient compatibility fallback");
+    stated.in_scope = vec!["legacyclient".to_owned()];
+    let matched = engine
+        .task_context_pack(&TaskContextRequest::automatic(
+            TaskId::new(),
+            stated,
+            Vec::new(),
+            100_000,
+        ))
+        .unwrap();
+    let conditions = matched
+        .items
+        .iter()
+        .flat_map(|item| item.retrieval_paths.iter())
+        .filter_map(|path| match path {
+            TaskRetrievalPath::ExactScope { dimension, value } if dimension == "condition" => {
+                Some(value.clone())
+            }
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        conditions.contains("legacyclient"),
+        "an in-scope item must be able to match a Context condition: {conditions:?}"
+    );
+
+    // A Task that never states the situation still must not match the condition.
+    let silent = engine
+        .task_context_pack(&TaskContextRequest::automatic(
+            TaskId::new(),
+            task("compatibility fallback"),
+            Vec::new(),
+            100_000,
+        ))
+        .unwrap();
+    assert!(
+        !silent
+            .items
+            .iter()
+            .flat_map(|item| item.retrieval_paths.iter())
+            .any(|path| matches!(
+                path,
+                TaskRetrievalPath::ExactScope { dimension, value }
+                    if dimension == "condition" && value == "legacyclient"
+            )),
+        "an unstated condition must stay unmatched"
+    );
+}
+
+/// Six accepted Contexts written the way a real review writes them: a long Chinese statement, a
+/// Chinese Evidence summary, and one cross-Space Relation whose rationale is a whole Chinese
+/// paragraph. This is the payload shape that made a real 2000-token injection return two
+/// Contexts and name seven more as omitted.
+fn real_shape_compact_fixture() -> (TempDir, ProjectionIndex, SpaceId) {
+    let temporary = tempfile::tempdir().unwrap();
+    let store =
+        GitStore::bootstrap_local(temporary.path().join("real-shape-installation")).unwrap();
+    let space_id = add_space(
+        &store,
+        "分支功能等价性评审",
+        "realshapeneedle 等价性 降级 注入",
+    );
+    let neighbour_space = add_space(&store, "构建与编译", "realshapeneedle 构建 编译");
+    let (neighbour_context, neighbour_revision) = add_context(
+        &store,
+        neighbour_space,
+        "realshapeneedle 直接改动的库模块都能通过 Debug Kotlin 任务完成编译，构建产物可用于回归验证。",
+        applicability("realshape", "android", "debug-build"),
+    );
+    publish(
+        &store,
+        neighbour_space,
+        neighbour_context,
+        neighbour_revision,
+        Vec::new(),
+        PublicationAction::Publish,
+    );
+
+    let statements = [
+        "realshapeneedle 当垂类实现模块缺席时，分支把未解析服务的失败行为有意改成安全降级，因此严格意义上的全配置功能等价并不成立，评审需要按配置分别给出结论，而不是笼统地宣称行为不变；两套配置的差异点集中在服务解析失败之后的兜底分支上。",
+        "realshapeneedle 当直播入口服务没有真实实现或参数拼装返回空时，商品锚点点击回调会提前返回，跳过配置分发与进入直播间导航，基线仍会导航，因此该路径不功能等价；复现步骤是在缺少垂类模块的调试包里点击商品锚点，观察不到任何页面跳转。",
+        "realshapeneedle 底栏的空保护发生得过晚：当垂类领域服务返回空且展示判定为真时，入口组件已注册到优先级管理器，随后以空容器抢占底栏槽位，阻止默认评论栏兜底，用户看到的是一条没有输入框的空白底栏，且没有任何错误提示。",
+        "realshapeneedle 无真实实现时，占位实现与旧动态代理在基本类型、空返回与可空返回值上大多等价，只有日志方法由空值变为空映射，影响范围限于埋点；这一差异不会改变调用方的控制流，但会让下游统计把缺失事件记成空事件。",
+        "realshapeneedle 引入真实垂类实现后，评审分支保留了运行期服务解析能力，调试包可以正常构建并进入直播间，说明降级路径只在模块缺席时生效，完整配置下的行为与基线一致。",
+        "realshapeneedle 评审范围内的所有直接改动模块都保留了原有的公开接口签名，调用方无需同步修改，二进制兼容性由接口快照比对确认。",
+    ];
+    for (index, statement) in statements.iter().enumerate() {
+        let mut draft = context(statement, applicability("realshape", "android", "review"));
+        "评审需要逐条区分配置差异，避免把安全降级误读成功能回归，因此每条结论都单独沉淀。"
+            .clone_into(&mut draft.rationale);
+        draft.evidence[0].content = serde_json::json!({
+            "summary": format!(
+                "第 {index} 条结论的证据：对照基线逐行比较调用链，记录了进入直播间导航与底栏兜底两条路径的实际行为差异，并附带缺少垂类模块与包含垂类模块两种配置下的构建与运行日志摘要。"
+            ),
+        });
+        if index == 0 {
+            draft.relations = vec![sctx_domain::ContextRelation {
+                kind: sctx_domain::ContextRelationKind::RelatedTo,
+                target_context_id: neighbour_context,
+                rationale:
+                    "编译结论与等价性结论互为前提：只有在直接改动模块全部编译通过的前提下，才能把行为差异归因于分支改动而不是构建失败，因此两条结论必须一起阅读。"
+                        .to_owned(),
+                supports: vec![
+                    "编译通过是等价性判断的前置条件".to_owned(),
+                    "行为差异不能归因于构建失败".to_owned(),
+                ],
+            }];
+        }
+        let (context_id, revision_id) = add_context_draft(&store, space_id, draft);
+        publish(
+            &store,
+            space_id,
+            context_id,
+            revision_id,
+            Vec::new(),
+            PublicationAction::Publish,
+        );
+    }
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    (temporary, index, space_id)
+}
+
+#[test]
+fn compact_packing_keeps_the_top_ranked_chinese_contexts_in_the_default_budget() {
+    let (_temporary, index, _space_id) = real_shape_compact_fixture();
+    let engine = SearchEngine::new(index);
+    let request =
+        TaskContextRequest::automatic(TaskId::new(), task("realshapeneedle"), Vec::new(), 2_000);
+
+    let reference = engine
+        .task_context_pack_with_detail(
+            &TaskContextRequest {
+                token_budget: 100_000,
+                ..request.clone()
+            },
+            ContextPackDetailLevel::Compact,
+        )
+        .unwrap();
+    let compact = engine
+        .task_context_pack_with_detail(&request, ContextPackDetailLevel::Compact)
+        .unwrap();
+
+    let item_tokens = reference
+        .compact_items
+        .iter()
+        .map(|item| serde_json::to_string(item).unwrap().chars().count())
+        .collect::<Vec<_>>();
+    println!(
+        "real-shape compact: {} items at 2000 tokens ({} estimated), unbudgeted item chars {:?}",
+        compact.compact_items.len(),
+        compact.estimated_tokens,
+        item_tokens
+    );
+
+    assert!(compact.estimated_tokens <= request.token_budget);
+    assert!(
+        compact.compact_items.len() >= 4,
+        "a 2000 token budget must carry at least four real-shape Contexts, got {}",
+        compact.compact_items.len()
+    );
+    let carried = compact
+        .compact_items
+        .iter()
+        .map(|item| item.context_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    for expected in reference.compact_items.iter().take(3) {
+        assert!(
+            carried.contains(&expected.context_id),
+            "the three highest ranked Contexts are never omitted: {:?}",
+            expected.context_id
+        );
+    }
+
+    // The Space explanation no longer carries a Relation rationale paragraph.
+    let associations = serde_json::to_string(&compact.compact_associations).unwrap();
+    assert!(!associations.contains("relation_paths"));
+    assert!(!associations.contains("matched_intent_fields"));
+    assert!(!associations.contains("编译结论与等价性结论互为前提"));
+    for association in &compact.compact_associations {
+        assert!(association.reasons.len() <= 2);
+        assert!(association.title.is_some());
+    }
+
+    // Omissions name at most five Contexts; anything beyond that is one counted entry.
+    let named = compact
+        .omitted
+        .iter()
+        .filter(|omitted| omitted.context_id.is_some())
+        .count();
+    assert!(named <= 5, "at most five omissions are named, got {named}");
+    for omitted in &compact.omitted {
+        if omitted.context_id.is_some() {
+            assert!(omitted.revision_id.is_none());
+            assert!(
+                omitted
+                    .title
+                    .as_ref()
+                    .is_some_and(|title| title.chars().count() <= 41)
+            );
+        }
+    }
+}
+
+/// A Chinese-first knowledge base plus filler, so document frequency rather than the small-corpus
+/// stop-word fallback governs automatic query-token selection.
+///
+/// The one interesting Context states its fact in Chinese but spells `ProductAnchorAssem`
+/// verbatim, which is the only channel an English question has into it.
+fn cross_language_identifier_fixture() -> (TempDir, ProjectionIndex, ContextId) {
+    let temporary = tempfile::tempdir().unwrap();
+    let store =
+        GitStore::bootstrap_local(temporary.path().join("identifier-installation")).unwrap();
+    let space_id = add_space(&store, "商品锚点导航", "复查商品锚点进入直播间的导航缺口");
+    let (context_id, _, _) = add_accepted_context(
+        &store,
+        space_id,
+        "当 ProductAnchorAssem 在商品锚点点击回调中提前 return 时，跳过配置分发与进入直播间导航（ProductAnchorAssem.kt:202）。",
+        applicability("anchordomain", "android", "无真实实现"),
+    );
+    for filler in 0..6_u8 {
+        let filler_space = add_space(
+            &store,
+            &format!("无关空间{filler}"),
+            &format!("无关意图{filler} 发布清单"),
+        );
+        add_accepted_context(
+            &store,
+            filler_space,
+            &format!("无关事实{filler}：发布清单会在发版之前校验版本号。"),
+            applicability("fillerdomain", "server", "active"),
+        );
+    }
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    (temporary, index, context_id)
+}
+
+/// WP-L8: identifier-derived query tokens carry extra weight in the automatic coverage gate.
+///
+/// Two of six English tokens match a Chinese Context, which reads as 33% coverage and used to sit
+/// below `AUTOMATIC_TEXT_COVERAGE_THRESHOLD_BASIS_POINTS` with only one text channel behind it, so
+/// automatic injection returned nothing at all for a question explicit search answers first.
+#[test]
+fn identifier_coverage_carries_an_english_question_into_a_chinese_knowledge_base() {
+    let (_temporary, index, context_id) = cross_language_identifier_fixture();
+    let engine = SearchEngine::new(index);
+
+    let request = TaskContextRequest::automatic(
+        TaskId::new(),
+        task("product anchor click does not navigate"),
+        Vec::new(),
+        100_000,
+    );
+    let pack = engine.task_context_pack(&request).unwrap();
+    assert_eq!(
+        pack.items
+            .iter()
+            .map(|item| item.context.context_id)
+            .collect::<Vec<_>>(),
+        vec![context_id],
+        "the query names two words of one identifier the Context spells verbatim"
+    );
+    assert!(
+        pack.associations[0]
+            .reasons
+            .iter()
+            .any(|reason| reason.starts_with("Identifier coverage:")),
+        "the weighting explains itself: {:?}",
+        pack.associations[0].reasons
+    );
+
+    // One shared word is vocabulary, not a named identifier, so the weighting stays off.
+    let single_word = TaskContextRequest::automatic(
+        TaskId::new(),
+        task("anchor rollout timeline review"),
+        Vec::new(),
+        100_000,
+    );
+    let single = engine.task_context_pack(&single_word).unwrap();
+    assert!(
+        single.items.is_empty(),
+        "a single incidental identifier word must not buy an association: {:?}",
+        single.items
+    );
+}
+
+/// A Space that wins on Intent text but offers a Context sharing a single query token, a Space
+/// that offers the Context answering most of the query, and filler that crowds the accepted-Context
+/// channel so the two Spaces fuse to close but distinct scores.
+fn near_duplicate_coverage_fixture() -> (TempDir, ProjectionIndex, ContextId, ContextId) {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("coverage-installation")).unwrap();
+    let short_space = add_space(
+        &store,
+        "SlotSurface",
+        "zulpraneedle bantiqneedle korvethneedle mildapneedle glavikneedle",
+    );
+    let (short_context, _, _) = add_accepted_context(
+        &store,
+        short_space,
+        "zulpraneedle",
+        applicability("surfacedomain", "android", "active"),
+    );
+    for filler in 0..6_u8 {
+        let filler_space = add_space(
+            &store,
+            &format!("Filler{filler}"),
+            "unrelated filler intent",
+        );
+        add_accepted_context(
+            &store,
+            filler_space,
+            "bantiqneedle korvethneedle mildapneedle glavikneedle",
+            applicability("fillerdomain", "server", "active"),
+        );
+    }
+    let long_space = add_space(
+        &store,
+        "SlotCause",
+        "zulpraneedle bantiqneedle korvethneedle mildapneedle glavikneedle plus a much longer \
+         intent body whose extra words push this Space one rank down on the Intent channel",
+    );
+    let (long_context, _, _) = add_accepted_context(
+        &store,
+        long_space,
+        "bantiqneedle korvethneedle mildapneedle glavikneedle: the registration happens before \
+         the null guard, so the empty container keeps the slot and the default fallback never \
+         runs for the surface the shorter Context only names",
+        applicability("causedomain", "android", "active"),
+    );
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    (temporary, index, short_context, long_context)
+}
+
+/// WP-L8: the injection ranking scales each Space's fused score by how much of the query the
+/// Context itself answered.
+///
+/// The fused score is a property of the Space, so every Context a Space contributes carries the
+/// same one. Ordering by it alone let the Space that won on Intent text put forward whichever of
+/// its Contexts shared a phrase with the query, ahead of the Context that actually covers the
+/// question.
+#[test]
+fn coverage_weighted_rank_puts_the_covering_context_ahead_of_a_short_near_duplicate() {
+    let (_temporary, index, short_context, long_context) = near_duplicate_coverage_fixture();
+    let mut request = TaskContextRequest::automatic(
+        TaskId::new(),
+        task("zulpraneedle bantiqneedle korvethneedle mildapneedle glavikneedle"),
+        Vec::new(),
+        100_000,
+    );
+    request.max_spaces = 10;
+    let pack = SearchEngine::new(index)
+        .task_context_pack(&request)
+        .unwrap();
+    let position = |context_id: ContextId| {
+        pack.items
+            .iter()
+            .position(|item| item.context.context_id == context_id)
+    };
+    let short_position = position(short_context).expect("the near duplicate is still an answer");
+    let long_position = position(long_context).expect("the covering Context is an answer");
+    assert!(
+        long_position < short_position,
+        "the Context that answered more of the query must lead: long={long_position} \
+         short={short_position}"
+    );
+    assert_eq!(long_position, 0);
+    assert!(
+        pack.items[long_position]
+            .context
+            .match_reason
+            .coverage_basis_points
+            > pack.items[short_position]
+                .context
+                .match_reason
+                .coverage_basis_points
+    );
 }

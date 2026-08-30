@@ -1,9 +1,9 @@
 {
   "schema": "sctx.repository-scoped-context.acceptance.v1",
-  "activation_marker": "<shared-context-active>Shared Context is authorized. Before substantive work, call task_intent_update.</shared-context-active>",
+  "activation_marker_template": "<shared-context-active external_session_id=\"{host_session_id}\">Shared Context is authorized for this session. Before substantive work, call task_intent_update with agent_kind \"{agent_kind}\" and external_session_id \"{host_session_id}\" (copy it verbatim; never invent one).</shared-context-active>",
   "source_assets": {
-    "gate_bytes": 1543,
-    "workflow_bytes": 9098,
+    "gate_bytes": 1882,
+    "workflow_bytes": 14720,
     "metadata_bytes": 263
   },
   "token_proxy": {
@@ -15,8 +15,8 @@
       "business_residue": 0
     },
     "enabled": {
-      "activation_bytes": 126,
-      "activation_max_bytes": 128,
+      "activation_fixed_bytes": 249,
+      "activation_max_bytes": 512,
       "workflow_reads": 1,
       "mcp_calls": 5,
       "sanitized_tool_result_bytes_min": 1500,

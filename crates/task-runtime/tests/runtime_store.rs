@@ -1051,3 +1051,118 @@ fn hook_runtime_busy_timeout_is_short_and_fail_open_ready() {
     );
     lock.execute_batch("ROLLBACK").unwrap();
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn concurrent_agents_sharing_one_session_fork_parallel_lineages_instead_of_going_stale() {
+    let root = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(root.path()).unwrap();
+    let session_locator = locator("shared-fork");
+    let session = runtime
+        .open_or_create(
+            session_locator.clone(),
+            TaskId::new(),
+            working("Review the POI entrance branch"),
+            Vec::new(),
+        )
+        .unwrap()
+        .snapshot;
+    let root_revision = session.current_intent_revision().unwrap().revision_id;
+
+    // First concurrent Agent wins the shared Head with its own goal.
+    let first = runtime
+        .continue_working_intent(
+            &session_locator,
+            root_revision,
+            working("Audit the comment bottom bar"),
+        )
+        .unwrap();
+    assert_eq!(first.status, IntentRevisionWriteStatus::Created);
+    assert_eq!(first.snapshot.task_session_id, session.task_session_id);
+
+    // Second Agent still holds the superseded parent and states a different goal: it forks.
+    let second = runtime
+        .continue_working_intent(
+            &session_locator,
+            root_revision,
+            working("Audit the product anchor navigation"),
+        )
+        .unwrap();
+    assert_eq!(second.status, IntentRevisionWriteStatus::Forked);
+    assert_ne!(second.snapshot.task_session_id, session.task_session_id);
+    assert_ne!(second.snapshot.task_id, first.snapshot.task_id);
+    assert!(second.active_task_switched);
+    assert_eq!(second.snapshot.intent_revisions.len(), 1);
+
+    // The forked Agent keeps continuing inside its own lineage.
+    let second_next = runtime
+        .continue_working_intent(
+            &session_locator,
+            second.revision.revision_id,
+            working("Audit the product anchor navigation callback"),
+        )
+        .unwrap();
+    assert_eq!(second_next.status, IntentRevisionWriteStatus::Created);
+    assert_eq!(
+        second_next.snapshot.task_session_id,
+        second.snapshot.task_session_id
+    );
+
+    // A superseded parent whose replacement states the same normalized goal stays stale.
+    let mut same_goal = working("audit   the COMMENT bottom bar");
+    same_goal.current_direction = Some("Take a third direction".to_owned());
+    let stale = runtime
+        .continue_working_intent(&session_locator, root_revision, same_goal)
+        .unwrap_err();
+    assert_eq!(stale.kind(), ErrorKind::StaleState);
+
+    // Replaying an exact concurrent continue is idempotent and never forks again.
+    let replay = runtime
+        .continue_working_intent(
+            &session_locator,
+            root_revision,
+            working("Audit the comment bottom bar"),
+        )
+        .unwrap();
+    assert_eq!(replay.status, IntentRevisionWriteStatus::AlreadyCurrent);
+    assert_eq!(replay.revision.revision_id, first.revision.revision_id);
+    assert!(
+        replay.active_task_switched,
+        "continuing an owned lineage re-selects it as the ActiveTask"
+    );
+    // The first Agent continues from its own Head even though another Task became active, and
+    // that continue re-selects its lineage as the ActiveTask without touching the other chain.
+    let first_next = runtime
+        .continue_working_intent(
+            &session_locator,
+            first.revision.revision_id,
+            working("Audit the comment bottom bar fallback"),
+        )
+        .unwrap();
+    assert_eq!(first_next.status, IntentRevisionWriteStatus::Created);
+    assert_eq!(
+        first_next.snapshot.task_session_id, session.task_session_id,
+        "an owned Head must append to its own lineage, not to the current ActiveTask"
+    );
+    assert!(
+        !first_next.active_task_switched,
+        "the previous continue already re-selected this lineage"
+    );
+    assert_eq!(
+        runtime
+            .read_snapshot_by_locator(&session_locator)
+            .unwrap()
+            .unwrap()
+            .task_session_id,
+        session.task_session_id
+    );
+    assert_eq!(
+        runtime
+            .read_snapshot(second.snapshot.task_session_id)
+            .unwrap()
+            .unwrap()
+            .intent_revisions
+            .len(),
+        2
+    );
+}

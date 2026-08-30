@@ -5,7 +5,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use sctx_agent_adapter::SHARED_CONTEXT_ACTIVATION_MARKER;
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
 use sctx_git_store::GitStore;
 use sctx_local_state::UserConfigStore;
 use serde_json::{Value, json};
@@ -92,7 +92,8 @@ fn direct_evidence_reaches_review_with_no_hook_derived_relation() {
             }),
         ),
         json!({"hookSpecificOutput":{
-            "hookEventName":"SessionStart","additionalContext":SHARED_CONTEXT_ACTIVATION_MARKER
+            "hookEventName":"SessionStart",
+            "additionalContext":shared_context_activation_marker(AgentKind::Codex, session)
         }})
     );
     let post_tool = run_hook(
@@ -138,7 +139,11 @@ fn direct_evidence_reaches_review_with_no_hook_derived_relation() {
             tool(
                 4,
                 "candidate_list",
-                json!({"agent_kind":"codex","external_session_id":session}),
+                json!({
+                    "agent_kind": "codex",
+                    "external_session_id": session,
+                    "detail_level": "full"
+                }),
             ),
         ],
     );

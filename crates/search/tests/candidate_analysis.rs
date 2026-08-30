@@ -77,6 +77,8 @@ fn draft(
 ) -> ContextRevisionDraft {
     ContextRevisionDraft {
         kind: ContextKind::Discovery,
+        problem_view: None,
+        hints: Vec::new(),
         topic_key: topic.map(ToOwned::to_owned),
         statement: statement.to_owned(),
         rationale: rationale.to_owned(),
@@ -548,13 +550,14 @@ fn proposed_space_group_is_stable_per_task_intent_and_resolves_to_its_first_spac
     let first_proposed = proposed(&first);
     let second_proposed = proposed(&second);
     assert_eq!(first_proposed, second_proposed);
+    // The goal is normalized (prefix stripped, whitespace collapsed) and elided at 40 `char`s,
+    // so the title stays a scannable handle while `desired_outcome` keeps the whole goal.
     assert_eq!(
         first_proposed.2.title,
-        "Build grouped checkout compatibility knowledge for every supported client"
+        "Build grouped checkout compatibility kno\u{2026}"
     );
     assert!(!first_proposed.2.title.contains("System suggestion"));
-    assert!(first_proposed.2.title.split_whitespace().count() <= 12);
-    assert!(first_proposed.2.title.chars().count() <= 80);
+    assert!(first_proposed.2.title.chars().count() <= 41);
     assert_eq!(first_proposed.2.desired_outcome, working_intent.goal);
 
     let next_revision = analyze(
@@ -747,6 +750,147 @@ fn exact_support_revise_potential_fts_and_novel_remain_distinct_assessments() {
     assert_eq!(
         novel.candidate_status,
         sctx_domain::AutomaticCandidateStatus::NeedsSpaceReview
+    );
+}
+
+const NEAR_TARGET_STATEMENT: &str =
+    "Retry budget is enforced by the gateway before the request reaches upstream";
+const NEAR_CANDIDATE_STATEMENT: &str =
+    "Retry budget is enforced by the gateway before the request reaches the upstream service";
+
+/// Builds one accepted Context whose Evidence text does not embed the statement, so a reworded
+/// Candidate can be compared field by field.
+fn near_duplicate_base() -> ContextRevisionDraft {
+    let mut base = draft(
+        Some("candidate/near-duplicate"),
+        NEAR_TARGET_STATEMENT,
+        "Existing rationale for the enforced retry budget",
+        "near-duplicate-domain",
+    );
+    "The retry budget enforcement was validated".clone_into(&mut base.evidence[0].supports);
+    base.evidence[0].content = serde_json::json!({"actual": "retry budget enforcement"});
+    base
+}
+
+#[test]
+fn a_reworded_statement_supports_an_accepted_context_instead_of_contradicting_it() {
+    let fixture = fixture();
+    let base = near_duplicate_base();
+    let target = add_context(&fixture.store, fixture.exact_space, base.clone());
+    fixture.index.synchronize().unwrap();
+
+    let mut reworded = base.clone();
+    NEAR_CANDIDATE_STATEMENT.clone_into(&mut reworded.statement);
+    "New Evidence changed why the retry budget is enforced".clone_into(&mut reworded.rationale);
+    let supports = analyze(&fixture, reworded, Vec::new(), 8_000, 16);
+    assert_eq!(
+        relation_for(&supports, target),
+        CandidateAssessmentRelation::Supports
+    );
+    let assessment = supports
+        .analysis
+        .assessments
+        .iter()
+        .find(|assessment| assessment.target == Some(target))
+        .unwrap();
+    assert!(
+        assessment
+            .paths
+            .iter()
+            .any(|path| matches!(path, CandidateAssessmentPath::StatementEquality)),
+        "a near-duplicate statement enters the statement channel: {:?}",
+        assessment.paths
+    );
+    assert!(
+        assessment
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("statement similarity")),
+        "reasons name the triggering path: {:?}",
+        assessment.reasons
+    );
+
+    let mut identical = base;
+    NEAR_CANDIDATE_STATEMENT.clone_into(&mut identical.statement);
+    let duplicate = analyze(&fixture, identical, Vec::new(), 8_000, 16);
+    assert_eq!(
+        relation_for(&duplicate, target),
+        CandidateAssessmentRelation::ExactDuplicate
+    );
+}
+
+#[test]
+fn a_negated_near_duplicate_statement_is_a_contradiction_not_support() {
+    let fixture = fixture();
+    let mut base = near_duplicate_base();
+    "Retry budget is reached by the gateway before upstream".clone_into(&mut base.statement);
+    let target = add_context(&fixture.store, fixture.exact_space, base.clone());
+    fixture.index.synchronize().unwrap();
+
+    let mut negated = base;
+    "Retry budget is not reached by the gateway before upstream".clone_into(&mut negated.statement);
+    let result = analyze(&fixture, negated, Vec::new(), 8_000, 16);
+    let assessment = result
+        .analysis
+        .assessments
+        .iter()
+        .find(|assessment| assessment.target == Some(target))
+        .expect("the near-duplicate statement is still retrieved");
+    assert_eq!(
+        assessment.relation,
+        CandidateAssessmentRelation::PotentialContradiction
+    );
+    assert!(
+        !assessment.paths.iter().any(|path| matches!(
+            path,
+            CandidateAssessmentPath::StatementEquality
+                | CandidateAssessmentPath::CanonicalDraftEquality
+        )),
+        "a negated statement never claims an equality path: {:?}",
+        assessment.paths
+    );
+    assert!(
+        assessment
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("negation markers differ")),
+        "reasons name the negation guard: {:?}",
+        assessment.reasons
+    );
+}
+
+#[test]
+fn applicability_domain_overlap_alone_no_longer_contradicts() {
+    let fixture = fixture();
+    let scope_only = analyze(
+        &fixture,
+        draft(
+            Some("candidate/scope-overlap-only"),
+            "Candidate negative policy",
+            "Only the inherited Intent domain is shared",
+            "potential-domain",
+        ),
+        Vec::new(),
+        8_000,
+        16,
+    );
+    let assessment = scope_only
+        .analysis
+        .assessments
+        .iter()
+        .find(|assessment| assessment.target == Some(fixture.potential))
+        .expect("the scope channel still retrieves the target");
+    assert!(
+        assessment
+            .paths
+            .iter()
+            .any(|path| matches!(path, CandidateAssessmentPath::ScopeOverlap { .. })),
+        "scope overlap is still explained: {:?}",
+        assessment.paths
+    );
+    assert_eq!(
+        assessment.relation,
+        CandidateAssessmentRelation::UnresolvedRelated
     );
 }
 
@@ -984,24 +1128,28 @@ fn exact_artifact_graph_reaches_cross_end_space_with_frozen_generation() {
         "Exact Artifact allows revision review",
         "frontend-graph-candidate",
     );
-    let candidate = candidate(content);
-    let result = SearchEngine::with_engineering_graph(index, graph_store)
-        .analyze_candidate(&CandidateAnalysisRequest {
-            source_task_id: candidate.source_episode.task_id,
-            source_intent_revision_id: TaskIntentRevisionId::new(),
-            source_working_intent: source_intent(candidate.source_episode.task_id),
-            source_task_signals: Vec::new(),
-            candidate,
-            explicit_related_contexts: Vec::new(),
-            artifact_refs: vec![ArtifactRef {
-                repository_id: repository.repository_id.clone(),
-                locator: symbol_locator(),
-            }],
-            proposed_space_group_space_id: None,
-            token_budget: 8_000,
-            top_k: 16,
-        })
-        .unwrap();
+    let engine = SearchEngine::with_engineering_graph(index, graph_store);
+    let analyze_with_graph = |content: ContextRevisionDraft| {
+        let candidate = candidate(content);
+        engine
+            .analyze_candidate(&CandidateAnalysisRequest {
+                source_task_id: candidate.source_episode.task_id,
+                source_intent_revision_id: TaskIntentRevisionId::new(),
+                source_working_intent: source_intent(candidate.source_episode.task_id),
+                source_task_signals: Vec::new(),
+                candidate,
+                explicit_related_contexts: Vec::new(),
+                artifact_refs: vec![ArtifactRef {
+                    repository_id: repository.repository_id.clone(),
+                    locator: symbol_locator(),
+                }],
+                proposed_space_group_space_id: None,
+                token_budget: 8_000,
+                top_k: 16,
+            })
+            .unwrap()
+    };
+    let result = analyze_with_graph(content);
     assert_eq!(
         relation_for(&result, source),
         CandidateAssessmentRelation::Revises
@@ -1029,5 +1177,260 @@ fn exact_artifact_graph_reaches_cross_end_space_with_frozen_generation() {
                 CandidateSpaceRecommendation::Existing { space_id, .. }
                     if *space_id == contract_space
             ))
+    );
+    assert_eq!(
+        relation_for(&result, contract),
+        CandidateAssessmentRelation::UnresolvedRelated,
+        "a shared Artifact with unrelated wording stays unresolved"
+    );
+
+    // A shared exact Artifact plus a statement in the middle similarity band is the one new
+    // contradiction path: close enough to be about the same fact, different enough to need review.
+    let near = analyze_with_graph(draft(
+        Some("candidate/graph-near"),
+        "Server contract is reached across the client Graph boundary",
+        "The reviewed branch disagrees about the same contract",
+        "server-graph-candidate",
+    ));
+    let assessment = near
+        .analysis
+        .assessments
+        .iter()
+        .find(|assessment| assessment.target == Some(contract))
+        .unwrap();
+    assert_eq!(
+        assessment.relation,
+        CandidateAssessmentRelation::PotentialContradiction
+    );
+    assert!(
+        assessment
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("shared exact Artifact")),
+        "reasons name the shared Artifact path: {:?}",
+        assessment.reasons
+    );
+}
+
+/// Three accepted Chinese Contexts, each restated by an English Claim that shares nothing but the
+/// repository identifiers. This is the real-session shape that used to produce
+/// `unresolved_related` for every duplicate: statement Jaccard sat around 2000 basis points, the
+/// Contexts predate server-side Reference derivation so no Artifact is shared, and the Claim and
+/// its target are written in different natural languages.
+struct IdentifierFixture {
+    _temporary: TempDir,
+    index: ProjectionIndex,
+    anchor: ContextRevisionRef,
+    dummy: ContextRevisionRef,
+    bottom_bar: ContextRevisionRef,
+}
+
+fn identifier_draft(
+    kind: ContextKind,
+    topic: &str,
+    statement: &str,
+    rationale: &str,
+    domain: &str,
+) -> ContextRevisionDraft {
+    let mut draft = draft(Some(topic), statement, rationale, domain);
+    draft.kind = kind;
+    draft
+}
+
+fn identifier_fixture() -> IdentifierFixture {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("identifier analysis root");
+    let store = GitStore::bootstrap_local(&root).unwrap();
+    let (space_id, _) = add_space(&store, "直播入口评审", "liveentryreview");
+    let anchor = add_context(
+        &store,
+        space_id,
+        identifier_draft(
+            ContextKind::Issue,
+            "identifier/anchor",
+            "当 ISearchLiveEntryService 无真实实现或 addParamsForLiveAnchor 返回空时，\
+             SearchProductAnchorAssem 会在商品锚点点击回调中提前返回，跳过配置分发与进入直播间导航。",
+            "基线仍会导航，因此该路径不功能等价。",
+            "anchor-domain",
+        ),
+    );
+    let dummy = add_context(
+        &store,
+        space_id,
+        identifier_draft(
+            ContextKind::Discovery,
+            "identifier/dummy",
+            "无真实实现时，SearchDummyVerticalDomainService 与旧动态代理在基本类型与空返回值上大多等价；\
+             SearchMusicDetailAssem 的日志方法由空值变为空映射。",
+            "差异只影响埋点统计，不改变控制流。",
+            "dummy-domain",
+        ),
+    );
+    let bottom_bar = add_context(
+        &store,
+        space_id,
+        identifier_draft(
+            ContextKind::Validation,
+            "identifier/bottombar",
+            "包含真实垂类实现时，SearchPoiEntranceAssem 与 SearchBottomBarProtocolManager 的注册顺序保持不变，调试包构建成功。",
+            "完整配置下的注册顺序与基线一致。",
+            "bottombar-domain",
+        ),
+    );
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    IdentifierFixture {
+        _temporary: temporary,
+        index,
+        anchor,
+        dummy,
+        bottom_bar,
+    }
+}
+
+fn analyze_identifier_claim(
+    fixture: &IdentifierFixture,
+    content: ContextRevisionDraft,
+) -> sctx_search::CandidateAnalysisResult {
+    let candidate = candidate(content);
+    SearchEngine::new(fixture.index.clone())
+        .analyze_candidate(&CandidateAnalysisRequest {
+            source_task_id: candidate.source_episode.task_id,
+            source_intent_revision_id: TaskIntentRevisionId::new(),
+            source_working_intent: source_intent(candidate.source_episode.task_id),
+            source_task_signals: Vec::new(),
+            candidate,
+            explicit_related_contexts: Vec::new(),
+            artifact_refs: Vec::new(),
+            proposed_space_group_space_id: None,
+            token_budget: 4_000,
+            top_k: 8,
+        })
+        .unwrap()
+}
+
+fn assessment_for(
+    result: &sctx_search::CandidateAnalysisResult,
+    target: ContextRevisionRef,
+) -> &sctx_domain::CandidateRelationAssessment {
+    result
+        .analysis
+        .assessments
+        .iter()
+        .find(|assessment| assessment.target == Some(target))
+        .unwrap_or_else(|| panic!("missing assessment for {target:?}"))
+}
+
+fn shared_identifiers(assessment: &sctx_domain::CandidateRelationAssessment) -> Vec<String> {
+    assessment
+        .paths
+        .iter()
+        .find_map(|path| match path {
+            CandidateAssessmentPath::SharedIdentifier { identifiers } => Some(identifiers.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn three_shared_identifiers_on_one_kind_make_a_cross_language_restatement_supporting() {
+    let fixture = identifier_fixture();
+    let result = analyze_identifier_claim(
+        &fixture,
+        identifier_draft(
+            ContextKind::Issue,
+            "claim/anchor",
+            "SearchProductAnchorAssem returns early inside the product anchor click callback \
+             whenever ISearchLiveEntryService resolves to no implementation, so \
+             addParamsForLiveAnchor never dispatches the live room navigation.",
+            "The baseline still navigates, so this path is not functionally equivalent.",
+            "claim-anchor-domain",
+        ),
+    );
+    let assessment = assessment_for(&result, fixture.anchor);
+    let shared = shared_identifiers(assessment);
+    assert_eq!(
+        shared,
+        vec![
+            "addparamsforliveanchor".to_owned(),
+            "isearchliveentryservice".to_owned(),
+            "searchproductanchorassem".to_owned(),
+        ]
+    );
+    assert_eq!(assessment.relation, CandidateAssessmentRelation::Supports);
+    assert!(
+        assessment
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("Shared repository identifiers:")
+                && reason.contains("searchproductanchorassem")),
+        "{:?}",
+        assessment.reasons
+    );
+}
+
+#[test]
+fn two_shared_identifiers_on_one_kind_are_sent_to_contradiction_review_not_dropped() {
+    let fixture = identifier_fixture();
+    let result = analyze_identifier_claim(
+        &fixture,
+        identifier_draft(
+            ContextKind::Discovery,
+            "claim/dummy",
+            "SearchDummyVerticalDomainService keeps the previous dynamic proxy semantics for \
+             primitive and void returns, while SearchMusicDetailAssem now yields an empty map \
+             from its logging method.",
+            "Only analytics observe the difference.",
+            "claim-dummy-domain",
+        ),
+    );
+    let assessment = assessment_for(&result, fixture.dummy);
+    assert_eq!(
+        shared_identifiers(assessment),
+        vec![
+            "searchdummyverticaldomainservice".to_owned(),
+            "searchmusicdetailassem".to_owned(),
+        ]
+    );
+    assert_eq!(
+        assessment.relation,
+        CandidateAssessmentRelation::PotentialContradiction,
+        "two shared identifiers below the restatement threshold need human review: {:?}",
+        assessment.reasons
+    );
+}
+
+#[test]
+fn shared_identifiers_across_kinds_stay_unresolved_but_name_the_shared_code() {
+    let fixture = identifier_fixture();
+    let result = analyze_identifier_claim(
+        &fixture,
+        identifier_draft(
+            ContextKind::Issue,
+            "claim/bottombar",
+            "SearchPoiEntranceAssem registers itself with SearchBottomBarProtocolManager before \
+             its own container has been populated.",
+            "The empty container then wins the slot.",
+            "claim-bottombar-domain",
+        ),
+    );
+    let assessment = assessment_for(&result, fixture.bottom_bar);
+    assert_eq!(
+        shared_identifiers(assessment),
+        vec![
+            "searchbottombarprotocolmanager".to_owned(),
+            "searchpoientranceassem".to_owned(),
+        ]
+    );
+    assert_eq!(
+        assessment.relation,
+        CandidateAssessmentRelation::UnresolvedRelated
+    );
+    assert!(
+        assessment.reasons.iter().any(|reason| reason
+            .contains("Shared repository identifiers on a different Context kind:")
+            && reason.contains("searchpoientranceassem")),
+        "{:?}",
+        assessment.reasons
     );
 }

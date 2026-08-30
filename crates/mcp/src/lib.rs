@@ -8,6 +8,7 @@
 //! writes only disposable local Task Runtime state.
 
 use std::{
+    cell::OnceCell,
     collections::{BTreeMap, BTreeSet, HashSet},
     fmt, fs,
     io::{self, BufRead, Write},
@@ -17,22 +18,26 @@ use std::{
 };
 
 use sctx_domain::{
-    AgentCheckpointId, ArtifactKey, ArtifactKind, ArtifactLocator, AutomaticCandidateStatus,
-    AutomaticContextCandidate, CandidateAnalysis, CandidateAnalysisStatus,
-    CandidateBuilderProvenance, CandidateConfidence, CandidateConfirmationOperation,
-    CandidateConfirmationPlan, CandidateConfirmationPrimaryReference, CandidatePrimarySelection,
+    AgentCheckpointId, Applicability, ArtifactKey, ArtifactKind, ArtifactLocator, ArtifactRef,
+    AutomaticCandidateStatus, AutomaticContextCandidate, CandidateAnalysis,
+    CandidateAnalysisStatus, CandidateAssessmentRelation, CandidateBuilderProvenance,
+    CandidateConfidence, CandidateConfirmationOperation, CandidateConfirmationPlan,
+    CandidateConfirmationPrimaryReference, CandidateId, CandidatePrimarySelection,
     CandidateRelationAssessment, CandidateReviewDiagnostic, CandidateReviewStatus,
     CandidateReviewSummary, CandidateReviewView, CandidateSpaceRecommendation,
     CandidateSpaceRecommendationPath, CheckpointClaim, CheckpointClaimId, CheckpointEvidenceRef,
-    CheckpointUnknown, ContextId, ContextKind, ContextRelation, ContextRevisionDraft,
-    EngineeringReferenceDraft, Error, ErrorKind, EvidenceSnapshotDraft, EvidenceType,
-    ExternalSessionLocator, NormalizedWorkObservation, OptionalCandidateEdits,
-    ProposedSpaceGroupKey, REPOSITORY_ID_MAX_BYTES, REPOSITORY_ID_PATTERN, ReferenceId,
+    CheckpointUnknown, ConflictParticipant, ContextGovernanceStatus, ContextId, ContextKind,
+    ContextRelation, ContextRelationKind, ContextRevisionDraft, EngineeringReferenceDraft, Error,
+    ErrorKind, EventId, EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator,
+    NormalizedWorkObservation, OptionalCandidateEdits, ProblemViewEdit, ProposedSpaceGroupKey,
+    REPOSITORY_ID_MAX_BYTES, REPOSITORY_ID_PATTERN, RecommendedSpaceRole, ReferenceId,
     ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionStatus, ResolvedFocus, Result,
-    RevisionId, SignalId, SpaceId, SpaceRecommendationId, SubmissionId, TaskId,
-    TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignalKind, TaskSignalLifecycle,
-    TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId, WorkEpisodeStatus, WorkObservation,
-    WorkObservationId, WorkingIntentSnapshot,
+    RevisionId, SemanticConflictOpeningDraft, SemanticConflictStatus, SignalId, SpaceId,
+    SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId,
+    TaskSessionSnapshot, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord,
+    TaskSpaceAssociation, WorkEpisodeId, WorkEpisodeRef, WorkEpisodeStatus, WorkObservation,
+    WorkObservationId, WorkingIntentSnapshot, context_revision_as_draft,
+    context_revision_content_hash,
 };
 use sctx_engineering_graph::{
     CandidateMatchEvidence, CatalogRepositorySpec, EngineeringProjectionStore,
@@ -43,8 +48,9 @@ use sctx_engineering_graph::{
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{
-    AppendRequest, CandidateConfirmationWriteStatus, CandidateSubmissionRequest,
-    CandidateSubmissionStatus, GitStore,
+    AppendBatchOutcome, AppendRequest, CandidateConfirmationWriteStatus,
+    CandidateSubmissionRequest, CandidateSubmissionStatus, GitStore,
+    MAX_CANDIDATE_SUBMISSION_BATCH,
 };
 use sctx_index::{DomainSnapshot, ProjectionIndex};
 use sctx_local_state::{
@@ -53,17 +59,22 @@ use sctx_local_state::{
     UserConfigStore,
 };
 use sctx_search::{
-    CandidateAnalysisRequest, ConflictView, ContextPackOmitted, ContextStatus,
-    DEFAULT_TASK_MAX_SPACES, MAX_CANDIDATE_ANALYSIS_TOKEN_BUDGET, MAX_CANDIDATE_ANALYSIS_TOP_K,
-    MAX_TASK_MAX_SPACES, MIN_CANDIDATE_ANALYSIS_TOKEN_BUDGET, MIN_TASK_CONTEXT_TOKEN_BUDGET,
-    ScopeFilter, SearchEngine, SearchFilters, SearchRequest, TaskContextItem, TaskContextRequest,
-    TaskGraphDiagnostic, TaskRetrievalPath,
+    AutomaticQueryTokenExplanation, CandidateAnalysisRequest, CompactSpaceAssociation,
+    CompactTaskContextItem, ConflictView, ContextPackDetailLevel, ContextPackOmitted,
+    ContextStatus, ContextTtlSettings, ContextUsageCounts, DEFAULT_TASK_MAX_SPACES,
+    MAX_CANDIDATE_ANALYSIS_TOKEN_BUDGET, MAX_CANDIDATE_ANALYSIS_TOP_K, MAX_TASK_MAX_SPACES,
+    MIN_CANDIDATE_ANALYSIS_TOKEN_BUDGET, MIN_TASK_CONTEXT_TOKEN_BUDGET, ScopeFilter, SearchEngine,
+    SearchFilters, SearchMatchMode, SearchRequest, TaskContextItem, TaskContextRequest,
+    TaskGraphDiagnostic, TaskRetrievalPath, UsagePriorSource,
 };
 use sctx_task_runtime::{
-    AgentCheckpointSubmission, CandidateBuildItemPreparation, CandidateBuildItemStatus,
-    CandidateBuildStatus, CandidateBuildView, CandidateReviewDiscard, CandidateReviewDiscardStatus,
-    CandidateReviewRecord, DirectCheckpointClaimDraft, DirectEvidenceDraft,
+    AgentCheckpointSubmission, CandidateBuildDuplicatePreparation, CandidateBuildItemPreparation,
+    CandidateBuildItemStatus, CandidateBuildStatus, CandidateBuildView,
+    CandidateConfirmationFinalize, CandidateReviewDiscard, CandidateReviewDiscardStatus,
+    CandidateReviewRecord, CheckoutReferenceResolver, ContextInjectionSource, ContextUsageOutcome,
+    ContextUsageRecord, DirectCheckpointClaimDraft, DirectEvidenceDraft, InjectedContext,
     IntentRevisionWriteStatus, ProposedSpaceGroupMappingStatus, TaskRuntime, WorkEpisodeView,
+    reference_derivation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -78,12 +89,18 @@ const DEFAULT_CANDIDATE_REVIEW_TOKEN_BUDGET: usize = 4_096;
 const MIN_CANDIDATE_REVIEW_TOKEN_BUDGET: usize = 512;
 const MAX_CANDIDATE_REVIEW_TOKEN_BUDGET: usize = 32_768;
 const MAX_TASK_CHECKPOINT_BYTES: usize = 64 * 1024;
+/// Normalized statement token Jaccard above which a Checkpoint Claim counts as restating one
+/// injected Context.
+const USAGE_REUSED_SIMILARITY_BASIS_POINTS: u16 = 6_000;
 const MAX_TASK_CHECKPOINT_CLAIMS: usize = 64;
 const MAX_TASK_CHECKPOINT_UNKNOWNS: usize = 64;
 const MAX_TASK_CHECKPOINT_EVIDENCE_PER_CLAIM: usize = 32;
 const MAX_TASK_CHECKPOINT_LIST_ITEMS: usize = 64;
 const MAX_TASK_CHECKPOINT_TEXT_BYTES: usize = 4 * 1024;
 const MAX_RECOVERABLE_BUILDS_PER_READ: usize = 32;
+/// Token Jaccard at or above which one Claim is treated as restating an existing Candidate.
+/// It is a Builder-local deduplication threshold, never a knowledge relation or analysis fact.
+const CANDIDATE_DUPLICATE_SIMILARITY_BASIS_POINTS: u16 = 8_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -251,6 +268,16 @@ pub struct CandidateBuildResponse {
     pub episode_id: WorkEpisodeId,
     pub status: CandidateBuildResponseStatus,
     pub items: Vec<CandidateBuildItemSummary>,
+    pub duplicates: Vec<CandidateBuildDuplicateSummary>,
+}
+
+/// One Claim the Builder collapsed onto an existing Candidate instead of proposing it twice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateBuildDuplicateSummary {
+    pub checkpoint_id: AgentCheckpointId,
+    pub claim_id: CheckpointClaimId,
+    pub duplicate_of_candidate_id: sctx_domain::CandidateId,
+    pub similarity_basis_points: u16,
 }
 
 /// Public aggregate Candidate Build status without exposing `SQLite` details.
@@ -361,15 +388,339 @@ pub struct CandidateReviewOmitted {
     pub estimated_tokens: usize,
 }
 
+/// Number of accepted Contexts at which a provisional Space has stopped being a scratch bucket
+/// and is worth naming or folding into a human-defined Space.
+pub const PROVISIONAL_SPACE_MERGE_THRESHOLD: usize = 5;
+
+/// Upper bound on advisories one Candidate list carries. The advisory is a nudge, not a report.
+const MAX_SPACE_ADVISORIES: usize = 5;
+
+/// Non-binding hint that one server-proposed Space now deserves a human decision.
+///
+/// Nothing is merged or renamed automatically: the advisory only names the Space and says why it
+/// showed up, and the reviewer decides whether to name it or move its Contexts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SpaceAdvisory {
+    pub space_id: SpaceId,
+    pub title: String,
+    pub reason: String,
+}
+
+/// Collects the Spaces whose single current Intent head is still the server's proposal.
+///
+/// A Space with conflicting Intent heads is never reported as provisional: no head won, so no
+/// head can speak for the Space.
+fn provisional_space_ids(snapshot: &DomainSnapshot) -> BTreeSet<SpaceId> {
+    snapshot
+        .projection
+        .spaces
+        .iter()
+        .filter(|(_, space)| {
+            space.intent.heads.len() == 1
+                && space
+                    .intent
+                    .heads
+                    .first()
+                    .and_then(|revision_id| space.intent.revisions.get(revision_id))
+                    .is_some_and(|revision| revision.provisional)
+        })
+        .map(|(space_id, _)| *space_id)
+        .collect()
+}
+
+/// Builds the merge advisories for every provisional Space that has grown past a review nudge.
+///
+/// Two independent signals qualify a Space, and both are read from the same immutable projection
+/// the rest of the response is read from:
+///
+/// * it has accumulated at least [`PROVISIONAL_SPACE_MERGE_THRESHOLD`] accepted Contexts, or
+/// * an accepted Context in a different Space points at one of its Contexts with a `related_to`
+///   relation, which means the knowledge is already being read as part of a named boundary.
+fn provisional_space_advisories(snapshot: &DomainSnapshot) -> Vec<SpaceAdvisory> {
+    let provisional = provisional_space_ids(snapshot);
+    if provisional.is_empty() {
+        return Vec::new();
+    }
+    let owners = snapshot
+        .projection
+        .spaces
+        .iter()
+        .flat_map(|(space_id, space)| {
+            space
+                .contexts
+                .keys()
+                .map(move |context_id| (*context_id, *space_id))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut incoming_related = BTreeMap::<SpaceId, usize>::new();
+    for (space_id, space) in &snapshot.projection.spaces {
+        for context in space.contexts.values() {
+            let ContextGovernanceStatus::Accepted { revision_id, .. } = &context.governance else {
+                continue;
+            };
+            let Some(revision) = context.revisions.get(revision_id) else {
+                continue;
+            };
+            for relation in &revision.revision.relations {
+                if relation.kind != ContextRelationKind::RelatedTo {
+                    continue;
+                }
+                let Some(target_space_id) = owners.get(&relation.target_context_id).copied() else {
+                    continue;
+                };
+                if target_space_id == *space_id || !provisional.contains(&target_space_id) {
+                    continue;
+                }
+                *incoming_related.entry(target_space_id).or_default() += 1;
+            }
+        }
+    }
+    let mut advisories = Vec::new();
+    for space_id in provisional {
+        let Some(space) = snapshot.projection.spaces.get(&space_id) else {
+            continue;
+        };
+        let accepted = space
+            .contexts
+            .values()
+            .filter(|context| {
+                matches!(context.governance, ContextGovernanceStatus::Accepted { .. })
+            })
+            .count();
+        let referenced = incoming_related.get(&space_id).copied().unwrap_or(0);
+        if accepted < PROVISIONAL_SPACE_MERGE_THRESHOLD && referenced == 0 {
+            continue;
+        }
+        let title = space
+            .intent
+            .heads
+            .first()
+            .and_then(|revision_id| space.intent.revisions.get(revision_id))
+            .map(|revision| revision.intent.title.clone())
+            .unwrap_or_default();
+        let referenced_clause = if referenced == 0 {
+            String::new()
+        } else {
+            format!(" and {referenced} related Context relations from other Spaces")
+        };
+        advisories.push(SpaceAdvisory {
+            space_id,
+            title,
+            reason: format!(
+                "Provisional Space has {accepted} accepted Contexts{referenced_clause}; consider `sctx space intent revise` to name it or merge into a human-defined Space"
+            ),
+        });
+        if advisories.len() == MAX_SPACE_ADVISORIES {
+            break;
+        }
+    }
+    advisories
+}
+
 /// Stable page of whole untrusted Summaries; no Review content is truncated.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CandidateListResponse {
     pub reviews: Vec<CandidateReviewSummary>,
+    pub detail_level: ContextPackDetailLevel,
+    /// Compact projection of the same budgeted page; empty under `full`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compact_reviews: Vec<CompactCandidateReview>,
+    /// Merge nudges for provisional Spaces, outside the per-Review token budget. Never present
+    /// when no provisional Space has grown past the threshold.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub space_advisories: Vec<SpaceAdvisory>,
+    /// Spaces whose current Intent head is still the server's proposal. This is an in-process
+    /// aid for marking the Full Review rows; it never reaches the wire.
+    #[serde(skip)]
+    pub provisional_space_ids: BTreeSet<SpaceId>,
     pub omitted: Vec<CandidateReviewOmitted>,
     pub next_cursor: Option<String>,
     pub estimated_tokens: usize,
     pub token_budget: usize,
     pub recovery: CandidateRecoverySummary,
+}
+
+impl CandidateListResponse {
+    /// Projects the page onto the triage list an Agent reads before expanding one Review.
+    #[must_use]
+    pub fn compact(&self) -> CompactCandidateListResponse {
+        CompactCandidateListResponse {
+            reviews: self.compact_reviews.clone(),
+            detail_level: ContextPackDetailLevel::Compact,
+            space_advisories: self.space_advisories.clone(),
+            omitted: self.omitted.clone(),
+            next_cursor: self.next_cursor.clone(),
+            estimated_tokens: self.estimated_tokens,
+            token_budget: self.token_budget,
+            recovery: self.recovery,
+        }
+    }
+}
+
+/// Compact Candidate Review triage page. Every entry stays addressable by `candidate_id`, and
+/// `candidate_get` still returns the whole untrusted Review.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompactCandidateListResponse {
+    pub reviews: Vec<CompactCandidateReview>,
+    pub detail_level: ContextPackDetailLevel,
+    /// Merge nudges for provisional Spaces, outside the per-Review token budget.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub space_advisories: Vec<SpaceAdvisory>,
+    pub omitted: Vec<CandidateReviewOmitted>,
+    pub next_cursor: Option<String>,
+    pub estimated_tokens: usize,
+    pub token_budget: usize,
+    pub recovery: CandidateRecoverySummary,
+}
+
+/// Strongest relation the analyzer found for one Candidate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompactCandidateAssessment {
+    pub relation: CandidateAssessmentRelation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_context_id: Option<ContextId>,
+    pub confidence_basis_points: u16,
+}
+
+/// Non-binding primary Space recommendation, reduced to what a reviewer decides on.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CompactSpaceRecommendation {
+    Existing {
+        recommendation_id: SpaceRecommendationId,
+        space_id: SpaceId,
+        role: RecommendedSpaceRole,
+        /// True when the recommended Space is still the server's unnamed provisional proposal.
+        provisional: bool,
+    },
+    ProposedNewSpaceIntent {
+        recommendation_id: SpaceRecommendationId,
+        title: String,
+        /// Always true: confirming a proposed recommendation opens a provisional Space.
+        provisional: bool,
+    },
+}
+
+/// One compact Candidate Review row.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompactCandidateReview {
+    pub candidate_id: sctx_domain::CandidateId,
+    pub kind: ContextKind,
+    pub statement: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_assessment: Option<CompactCandidateAssessment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_space_recommendation: Option<CompactSpaceRecommendation>,
+    pub ready_for_review: bool,
+    /// Non-blocking reminder that the knowledge base default language is Chinese. See
+    /// [`language_hint`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_hint: Option<String>,
+    /// Whether `applicability.domains`/`platforms` came from the Task Working Intent rather than
+    /// from the Claim. See [`APPLICABILITY_INHERITED`].
+    pub applicability_inherited: bool,
+    /// Always true; the row stays marked as untrusted Agent-authored content.
+    pub untrusted_data: bool,
+}
+
+/// Every Candidate reaches Candidate Build through a direct Checkpoint, and a direct Checkpoint
+/// Claim carries only `conditions`: its `domains` and `platforms` are always copied from the Task
+/// Working Intent. Runtime keeps no per-Claim flag, so the response reports the constant this is
+/// rather than inventing a per-Candidate answer.
+const APPLICABILITY_INHERITED: bool = true;
+
+/// Advisory text offered when a Candidate statement carries no Chinese at all.
+const CHINESE_KNOWLEDGE_BASE_HINT: &str =
+    "knowledge base default language is Chinese; consider restating in Chinese";
+
+/// Non-blocking language advisory for one Candidate statement.
+///
+/// The knowledge base is written in Chinese, but the Checkpoint contract stays language-agnostic:
+/// nothing is rejected or rewritten here. A statement with no CJK character at all simply carries a
+/// reminder a reviewer may act on. Code identifiers, paths, and commands legitimately stay Latin,
+/// so the test is "contains no Chinese", never "contains only Chinese".
+fn language_hint(statement: &str) -> Option<String> {
+    (!statement.chars().any(is_cjk)).then(|| CHINESE_KNOWLEDGE_BASE_HINT.to_owned())
+}
+
+/// True for the CJK ranges a Chinese statement is written in.
+const fn is_cjk(character: char) -> bool {
+    matches!(character,
+        '\u{3400}'..='\u{4dbf}'
+            | '\u{4e00}'..='\u{9fff}'
+            | '\u{f900}'..='\u{faff}'
+            | '\u{20000}'..='\u{2a6df}')
+}
+
+/// Projects one whole Review onto its compact triage row.
+fn compact_candidate_review(
+    review: &CandidateReviewView,
+    provisional_space_ids: &BTreeSet<SpaceId>,
+) -> CompactCandidateReview {
+    let top_assessment = review
+        .analysis
+        .assessments
+        .iter()
+        .max_by_key(|assessment| assessment.confidence.basis_points)
+        .map(|assessment| CompactCandidateAssessment {
+            relation: assessment.relation,
+            target_context_id: assessment.target.map(|target| target.context_id),
+            confidence_basis_points: assessment.confidence.basis_points,
+        });
+    let primary = review
+        .space_recommendations
+        .iter()
+        .find(|recommendation| {
+            matches!(
+                recommendation,
+                CandidateSpaceRecommendation::Existing {
+                    role: RecommendedSpaceRole::Primary,
+                    ..
+                }
+            )
+        })
+        .or_else(|| {
+            review.space_recommendations.iter().find(|recommendation| {
+                matches!(
+                    recommendation,
+                    CandidateSpaceRecommendation::ProposedNewSpaceIntent { .. }
+                )
+            })
+        })
+        .or_else(|| review.space_recommendations.first());
+    let primary_space_recommendation = primary.map(|recommendation| match recommendation {
+        CandidateSpaceRecommendation::Existing {
+            recommendation_id,
+            space_id,
+            role,
+            ..
+        } => CompactSpaceRecommendation::Existing {
+            recommendation_id: *recommendation_id,
+            space_id: *space_id,
+            role: *role,
+            provisional: provisional_space_ids.contains(space_id),
+        },
+        CandidateSpaceRecommendation::ProposedNewSpaceIntent {
+            recommendation_id,
+            proposed_new_space_intent,
+            ..
+        } => CompactSpaceRecommendation::ProposedNewSpaceIntent {
+            recommendation_id: *recommendation_id,
+            title: proposed_new_space_intent.title.clone(),
+            provisional: true,
+        },
+    });
+    CompactCandidateReview {
+        candidate_id: review.candidate_id,
+        kind: review.content.kind,
+        statement: review.content.statement.clone(),
+        top_assessment,
+        primary_space_recommendation,
+        ready_for_review: review.ready_for_review,
+        language_hint: language_hint(&review.content.statement),
+        applicability_inherited: APPLICABILITY_INHERITED,
+        untrusted_data: review.untrusted_data,
+    }
 }
 
 /// Non-sensitive current status of bounded Candidate Build recovery.
@@ -435,6 +786,82 @@ pub struct CandidateConfirmInput {
     pub edits: OptionalCandidateEdits,
 }
 
+/// Strict explicit human confirmation of several owned Pending Candidates.
+///
+/// It shares one Space organization and one Review version across the batch; per-Candidate field
+/// `edits` and proposed new Space recommendations stay single-Candidate operations.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateConfirmBatchInput {
+    pub agent_kind: String,
+    pub external_session_id: String,
+    pub expected_task_id: String,
+    pub expected_intent_revision_id: String,
+    pub candidate_ids: Vec<String>,
+    pub expected_review_version: u64,
+    pub primary: CandidateConfirmPrimaryInput,
+    pub related_space_ids: Vec<String>,
+}
+
+/// Batch discard request; the Review version and reason apply to every listed Candidate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateDiscardBatchInput {
+    pub agent_kind: String,
+    pub external_session_id: String,
+    pub expected_task_id: String,
+    pub expected_intent_revision_id: String,
+    pub candidate_ids: Vec<String>,
+    pub expected_review_version: u64,
+    pub reason: String,
+}
+
+/// Either public shape accepted by `candidate_confirm`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CandidateConfirmRequest {
+    Single(Box<CandidateConfirmInput>),
+    Batch(Box<CandidateConfirmBatchInput>),
+}
+
+/// Either public shape accepted by `candidate_discard`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CandidateDiscardRequest {
+    Single(Box<CandidateDiscardInput>),
+    Batch(Box<CandidateDiscardBatchInput>),
+}
+
+/// Result of one atomically validated Candidate Confirmation batch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateConfirmBatchResponse {
+    pub status: CandidateConfirmResponseStatus,
+    pub confirmations: Vec<CandidateConfirmResponse>,
+}
+
+/// Result of one atomic Candidate Review discard batch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateDiscardBatchResponse {
+    pub status: CandidateDiscardResponseStatus,
+    pub reviews: Vec<CandidateReviewView>,
+}
+
+/// Either public shape returned by `candidate_confirm`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CandidateConfirmOutcome {
+    Single(Box<CandidateConfirmResponse>),
+    Batch(CandidateConfirmBatchResponse),
+}
+
+/// Either public shape returned by `candidate_discard`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CandidateDiscardOutcome {
+    Single(Box<CandidateDiscardResponse>),
+    Batch(CandidateDiscardBatchResponse),
+}
+
 /// Exact idempotent Candidate Confirmation result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -496,12 +923,14 @@ pub struct TaskIntentUpdateResponse {
     pub active_signals: Vec<TaskSignalRecord>,
 }
 
-/// Whether one Working Intent call created a Revision or matched current canonical semantics.
+/// Whether one Working Intent call created a Revision, matched current canonical semantics, or
+/// forked a parallel `TaskSession` for a concurrent Agent sharing one `external_session_id`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntentRevisionStatus {
     Created,
     AlreadyCurrent,
+    Forked,
 }
 
 impl From<IntentRevisionWriteStatus> for IntentRevisionStatus {
@@ -509,6 +938,7 @@ impl From<IntentRevisionWriteStatus> for IntentRevisionStatus {
         match value {
             IntentRevisionWriteStatus::Created => Self::Created,
             IntentRevisionWriteStatus::AlreadyCurrent => Self::AlreadyCurrent,
+            IntentRevisionWriteStatus::Forked => Self::Forked,
         }
     }
 }
@@ -732,15 +1162,28 @@ pub struct TaskContextRetrievalPaths {
 }
 
 /// Session-aware Task Context result shared by MCP and the CLI test entry.
+///
+/// The Rust entry points always build the explainable [`ContextPackDetailLevel::Full`] shape.
+/// The MCP tool surface defaults to `compact` and returns [`CompactTaskContextResponse`] instead,
+/// which is this response projected onto the fields an Agent needs to inherit a fact.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TaskContextResponse {
     pub task_session_id: TaskSessionId,
     pub task_id: TaskId,
     pub intent_revision_id: TaskIntentRevisionId,
+    pub detail_level: ContextPackDetailLevel,
     pub candidate_spaces: Vec<TaskSpaceAssociation>,
+    /// Compact projection of the surviving Space associations; empty under `full`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compact_candidate_spaces: Vec<CompactSpaceAssociation>,
     pub items: Vec<TaskContextItem>,
+    /// Compact projection of the same budgeted selection; empty under `full`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compact_items: Vec<CompactTaskContextItem>,
     pub retrieval_paths: Vec<TaskContextRetrievalPaths>,
     pub graph_diagnostics: Vec<TaskGraphDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_token_explanation: Option<AutomaticQueryTokenExplanation>,
     pub task_fingerprint: String,
     pub tree: String,
     pub generation: u64,
@@ -751,11 +1194,71 @@ pub struct TaskContextResponse {
     pub omitted: Vec<ContextPackOmitted>,
 }
 
+impl TaskContextResponse {
+    /// Projects the budgeted selection onto the compact injection payload. Ranking, fusion, and
+    /// per-item Retrieval Path details are dropped; each item keeps its `relations` and the
+    /// deduplicated `retrieval_channels` names, while compact `candidate_spaces` carry only
+    /// `space_id`, `title`, `score`, `provisional`, and up to two human-readable reasons.
+    #[must_use]
+    pub fn compact(&self) -> CompactTaskContextResponse {
+        CompactTaskContextResponse {
+            task_session_id: self.task_session_id,
+            task_id: self.task_id,
+            intent_revision_id: self.intent_revision_id,
+            detail_level: ContextPackDetailLevel::Compact,
+            candidate_spaces: self.compact_candidate_spaces.clone(),
+            items: self.compact_items.clone(),
+            graph_diagnostics: self.graph_diagnostics.clone(),
+            task_fingerprint: self.task_fingerprint.clone(),
+            tree: self.tree.clone(),
+            generation: self.generation,
+            token_budget: self.token_budget,
+            estimated_tokens: self.estimated_tokens,
+            omitted: self.omitted.clone(),
+        }
+    }
+}
+
+/// Compact Task Context payload. It keeps identity, budget accounting, and the inheritable facts
+/// while dropping every explanation channel that only a debugging reader can act on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CompactTaskContextResponse {
+    pub task_session_id: TaskSessionId,
+    pub task_id: TaskId,
+    pub intent_revision_id: TaskIntentRevisionId,
+    pub detail_level: ContextPackDetailLevel,
+    pub candidate_spaces: Vec<CompactSpaceAssociation>,
+    pub items: Vec<CompactTaskContextItem>,
+    pub graph_diagnostics: Vec<TaskGraphDiagnostic>,
+    pub task_fingerprint: String,
+    pub tree: String,
+    pub generation: u64,
+    pub token_budget: usize,
+    pub estimated_tokens: usize,
+    pub omitted: Vec<ContextPackOmitted>,
+}
+
+/// Compact form of [`TaskIntentUpdateResponse`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CompactTaskIntentUpdateResponse {
+    #[serde(flatten)]
+    pub context: CompactTaskContextResponse,
+    pub revision_status: IntentRevisionStatus,
+    pub active_signals: Vec<TaskSignalRecord>,
+}
+
 /// Result of one request-local Focus resolution and its immediate Task Context retrieval.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactFocusQueryResponse {
     pub resolved_focus: ResolvedFocus,
     pub context: TaskContextResponse,
+}
+
+/// Compact form of [`ArtifactFocusQueryResponse`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CompactArtifactFocusQueryResponse {
+    pub resolved_focus: ResolvedFocus,
+    pub context: CompactTaskContextResponse,
 }
 
 /// Register-and-scan request for one canonical local Git worktree root.
@@ -895,6 +1398,79 @@ pub struct AssociationRebuildResponse {
     pub generation: u64,
 }
 
+/// Prefix of the only structured `recheck_when` entries the server evaluates.
+pub const RECHECK_BRANCH_ADVANCED_PREFIX: &str = "branch_advanced:";
+
+/// Prefix of the structured `file_changed_since:<commit>:<repository-relative path>` entry.
+pub const RECHECK_FILE_CHANGED_SINCE_PREFIX: &str = "file_changed_since:";
+
+/// One Context's structured `recheck_when` evaluation on this machine.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContextRecheckResult {
+    pub context_id: ContextId,
+    pub revision_id: RevisionId,
+    /// Why this Context is considered stale; absent means every structured entry still holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
+    /// Structured entries no local checkout could answer. They are not a failure: an unreachable
+    /// checkout, a missing commit, an absent `git`, or a timeout all land here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unevaluated: Vec<String>,
+}
+
+/// Outcome of one `recheck_when` evaluation pass over every accepted Context.
+///
+/// The result is written to the local `context_item.stale_reason` projection column only. It is
+/// never an Event: staleness is this machine's reading of its own checkouts, not a shared fact.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContextRecheckResponse {
+    pub evaluated_contexts: usize,
+    pub stale_contexts: usize,
+    pub unevaluated_entries: usize,
+    pub results: Vec<ContextRecheckResult>,
+    pub tree: String,
+    pub generation: u64,
+}
+
+/// Structured `recheck_when` entry the server can answer deterministically from a local checkout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RecheckCondition {
+    /// `branch_advanced:<branch>@<commit>` — the named branch no longer points at `<commit>`.
+    BranchAdvanced { branch: String, commit: String },
+    /// `file_changed_since:<commit>:<path>` — `<path>` changed between `<commit>` and `HEAD`.
+    FileChangedSince { commit: String, path: String },
+}
+
+impl RecheckCondition {
+    /// Parses the structured subset. Every other `recheck_when` entry stays free text and is
+    /// returned untouched to the reader.
+    fn parse(entry: &str) -> Option<Self> {
+        let entry = entry.trim();
+        if let Some(rest) = entry.strip_prefix(RECHECK_BRANCH_ADVANCED_PREFIX) {
+            let (branch, commit) = rest.rsplit_once('@')?;
+            let (branch, commit) = (branch.trim(), commit.trim());
+            return (!branch.is_empty() && is_commit_ish(commit)).then(|| Self::BranchAdvanced {
+                branch: branch.to_owned(),
+                commit: commit.to_owned(),
+            });
+        }
+        let rest = entry.strip_prefix(RECHECK_FILE_CHANGED_SINCE_PREFIX)?;
+        let (commit, path) = rest.split_once(':')?;
+        let (commit, path) = (commit.trim(), path.trim());
+        (is_commit_ish(commit) && !path.is_empty() && !path.starts_with('-')).then(|| {
+            Self::FileChangedSince {
+                commit: commit.to_owned(),
+                path: path.to_owned(),
+            }
+        })
+    }
+}
+
+/// Accepts only abbreviated-or-full hexadecimal object names, so no entry can smuggle a Git flag.
+fn is_commit_ish(value: &str) -> bool {
+    (7..=40).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 impl RepositoryScanInput {
     fn validate(&self) -> Result<()> {
         if self.checkout_path.trim().is_empty() {
@@ -997,12 +1573,28 @@ struct Frame {
 }
 
 struct Runtime {
-    store: GitStore,
+    /// Installation root. Candidate Build resolves the checkout of the `ExternalSession` that
+    /// authored a Checkpoint, which is not always the session draining the outbox.
+    root: PathBuf,
+    /// Append-only Knowledge Store, opened on first write.
+    ///
+    /// `GitStore::open_existing` verifies the fixed worktree with two `git` child processes,
+    /// which is the single largest fixed cost of opening this Runtime. Read-only tools never
+    /// append an event, so they never pay it; every writing tool still opens and verifies the
+    /// Store before it writes anything.
+    store: OnceCell<GitStore>,
     index: ProjectionIndex,
     repositories: RepositoryRegistry,
     engineering_graph: Option<EngineeringProjectionStore>,
     tasks: TaskRuntime,
     catalog: RepositoryCatalogSnapshot,
+    /// Explicit `[context_ttl]` policy. Contexts past their configured lifetime are `historical`:
+    /// still searchable and explainable, never automatically injected.
+    context_ttl: ContextTtlSettings,
+    /// Activation scope that authorized this exact call, when the caller is public MCP dispatch.
+    /// Internal entry points carry `None` and fall back to the scope recorded for the Episode's
+    /// own `ExternalSession`.
+    session_scope: Option<AuthorizedSessionScope>,
 }
 
 #[derive(Clone)]
@@ -1042,40 +1634,93 @@ impl ClaimBuildMaterial {
     }
 }
 
+/// State a caller already opened for this exact call, handed to [`Runtime::open_with_catalog`]
+/// instead of being opened a second time.
+#[derive(Default)]
+struct RuntimeOpenParts {
+    /// Activation scope that authorized this exact call, when the caller is public MCP dispatch.
+    session_scope: Option<AuthorizedSessionScope>,
+    /// `[context_ttl]` already read from the same `config.toml` read that froze the Catalog.
+    context_ttl: Option<ContextTtlSettings>,
+    /// Task Runtime already opened by the identity preflight of this call.
+    tasks: Option<TaskRuntime>,
+}
+
 impl Runtime {
     fn open(root: &Path) -> Result<Self> {
         let _store = GitStore::open_existing(root)?;
         let catalog = UserConfigStore::open_existing(root)?.repository_catalog_wait()?;
-        Self::open_with_catalog(root, catalog)
+        Self::open_with_catalog(root, catalog, RuntimeOpenParts::default())
     }
 
     /// Opens business state against the exact Catalog snapshot that authorized
     /// this call. Public MCP dispatch must never re-read a newer Catalog here.
-    fn open_with_catalog(root: &Path, catalog: RepositoryCatalogSnapshot) -> Result<Self> {
-        let base_store = GitStore::open_existing(root)?;
-        let index = ProjectionIndex::for_store(&base_store);
-        let store = base_store
-            .with_candidate_submission_index(Arc::new(index.clone()))
-            .with_candidate_confirmation_index(Arc::new(index.clone()));
+    fn open_with_catalog(
+        root: &Path,
+        catalog: RepositoryCatalogSnapshot,
+        parts: RuntimeOpenParts,
+    ) -> Result<Self> {
+        // Same two paths `GitStore::open_existing` would hand `ProjectionIndex::for_store`,
+        // without the Git worktree verification that only a writing tool needs.
+        let config = UserConfigStore::open_existing(root)?;
+        let index = ProjectionIndex::new(config.repository(), config.root().join("state"));
         let repositories = RepositoryRegistry::initialize(root)?;
         sync_repository_catalog_snapshot(&repositories, &catalog)?;
         let engineering_graph = EngineeringProjectionStore::initialize(root).ok();
-        let tasks = TaskRuntime::initialize(root)?;
+        let tasks = match parts.tasks {
+            Some(tasks) => tasks,
+            None => TaskRuntime::initialize(root)?,
+        };
+        let context_ttl = match parts.context_ttl {
+            Some(context_ttl) => context_ttl,
+            None => context_ttl_settings(&config.context_ttl_policy()?),
+        };
         Ok(Self {
-            store,
+            root: root.to_path_buf(),
+            store: OnceCell::new(),
             index,
             repositories,
             engineering_graph,
             tasks,
             catalog,
+            context_ttl,
+            session_scope: parts.session_scope,
         })
     }
 
-    fn snapshot(&self) -> Result<DomainSnapshot> {
-        self.index.domain_snapshot()
+    /// Opens and verifies the append-only Knowledge Store, once per Runtime.
+    fn store(&self) -> Result<&GitStore> {
+        if let Some(store) = self.store.get() {
+            return Ok(store);
+        }
+        let store = GitStore::open_existing(&self.root)?
+            .with_candidate_submission_index(Arc::new(self.index.clone()))
+            .with_candidate_confirmation_index(Arc::new(self.index.clone()));
+        let _ = self.store.set(store);
+        Ok(self
+            .store
+            .get()
+            .expect("the Knowledge Store was just initialized"))
+    }
+
+    /// One reduced Domain Snapshot, shared with every other reader of the same indexed Tree.
+    ///
+    /// The index reuses the reduction it already performed for this exact projection identity, so
+    /// a tool call that reads the Snapshot once and then analyzes several Candidates against it
+    /// pays for one reduction, not one per read.
+    fn snapshot(&self) -> Result<Arc<DomainSnapshot>> {
+        self.index.shared_domain_snapshot()
     }
 
     fn task_context_readonly(&self, input: &TaskContextReadInput) -> Result<TaskContextResponse> {
+        self.task_context_readonly_with_detail(input, ContextPackDetailLevel::Full)
+    }
+
+    fn task_context_readonly_with_detail(
+        &self,
+        input: &TaskContextReadInput,
+        detail_level: ContextPackDetailLevel,
+    ) -> Result<TaskContextResponse> {
         input.validate()?;
         let locator = input.locator()?;
         let snapshot = self
@@ -1087,16 +1732,28 @@ impl Runtime {
         build_task_context_response(
             &self.index,
             self.engineering_graph.as_ref(),
+            &self.tasks,
+            ContextInjectionSource::TaskContext,
             &snapshot,
             None,
             input.token_budget,
             input.max_spaces,
+            detail_level,
+            self.context_ttl,
         )
     }
 
     fn task_artifact_focus(
         &self,
         input: &ArtifactFocusQuery,
+    ) -> Result<ArtifactFocusQueryResponse> {
+        self.task_artifact_focus_with_detail(input, ContextPackDetailLevel::Full)
+    }
+
+    fn task_artifact_focus_with_detail(
+        &self,
+        input: &ArtifactFocusQuery,
+        detail_level: ContextPackDetailLevel,
     ) -> Result<ArtifactFocusQueryResponse> {
         input.validate_bounds()?;
         let session_locator = input.locator()?;
@@ -1120,10 +1777,14 @@ impl Runtime {
         let context = build_task_context_response(
             &self.index,
             self.engineering_graph.as_ref(),
+            &self.tasks,
+            ContextInjectionSource::ArtifactFocus,
             &active,
             Some(resolved_focus.clone()),
             input.token_budget,
             input.max_spaces,
+            detail_level,
+            self.context_ttl,
         )?;
         Ok(ArtifactFocusQueryResponse {
             resolved_focus,
@@ -1135,14 +1796,24 @@ impl Runtime {
         &self,
         input: &TaskIntentUpdateInput,
     ) -> Result<TaskIntentUpdateResponse> {
+        self.task_intent_update_with_detail(input, ContextPackDetailLevel::Full)
+    }
+
+    fn task_intent_update_with_detail(
+        &self,
+        input: &TaskIntentUpdateInput,
+        detail_level: ContextPackDetailLevel,
+    ) -> Result<TaskIntentUpdateResponse> {
         let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
         let active = self.tasks.read_snapshot_by_locator(&locator)?;
         input.intent.validate()?;
         let (snapshot, revision_status) = match input.task_boundary {
             TaskBoundary::Continue => {
-                let active = active.ok_or_else(|| {
-                    invalid("task_boundary=continue requires an existing ActiveTask")
-                })?;
+                if active.is_none() {
+                    return Err(invalid(
+                        "task_boundary=continue requires an existing ActiveTask",
+                    ));
+                }
                 let parent = input
                     .expected_revision_id
                     .as_deref()
@@ -1153,17 +1824,10 @@ impl Runtime {
                     })?
                     .parse::<TaskIntentRevisionId>()
                     .map_err(|error| invalid(format!("invalid expected_revision_id: {error}")))?;
-                let outcome = self.tasks.append_intent_revision(
-                    active.task_session_id,
-                    parent,
-                    input.intent.clone(),
-                )?;
-                (
+                let outcome =
                     self.tasks
-                        .read_snapshot(active.task_session_id)?
-                        .ok_or_else(|| invariant("updated ActiveTask disappeared"))?,
-                    outcome.status.into(),
-                )
+                        .continue_working_intent(&locator, parent, input.intent.clone())?;
+                (outcome.snapshot, outcome.status.into())
             }
             TaskBoundary::New => {
                 if let Some(active) = active {
@@ -1201,10 +1865,14 @@ impl Runtime {
         let context = build_task_context_response(
             &self.index,
             self.engineering_graph.as_ref(),
+            &self.tasks,
+            ContextInjectionSource::IntentUpdate,
             &snapshot,
             None,
             default_token_budget(),
             default_max_spaces(),
+            detail_level,
+            self.context_ttl,
         )?;
         Ok(TaskIntentUpdateResponse {
             active_signals: active_signal_records(&self.tasks, snapshot.task_session_id)?,
@@ -1257,6 +1925,22 @@ impl Runtime {
     }
 
     fn task_checkpoint(&self, input: &TaskCheckpointInput) -> Result<TaskCheckpointResponse> {
+        durable_checkpoint(&self.tasks, input)
+    }
+}
+
+/// The whole durable Checkpoint ACK, over Runtime state alone.
+///
+/// ADR-0003 makes the ACK a receipt plus a Candidate Build outbox entry: it appends no Git event,
+/// reads no retrieval index, consults no checkout, and touches no Repository Registry. It is
+/// therefore given the Runtime database and nothing else, so public dispatch can answer a
+/// Checkpoint without opening the stores only Candidate Build and retrieval need.
+#[allow(clippy::too_many_lines)]
+fn durable_checkpoint(
+    tasks: &TaskRuntime,
+    input: &TaskCheckpointInput,
+) -> Result<TaskCheckpointResponse> {
+    {
         let input_json = serde_json::to_string(input).map_err(|error| {
             invalid(format!(
                 "serialize task_checkpoint privacy boundary: {error}"
@@ -1275,7 +1959,7 @@ impl Runtime {
         }
         let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
         if input.claims.is_empty() && input.unknowns.is_empty() {
-            if self.tasks.read_snapshot_by_locator(&locator)?.is_none() {
+            if tasks.read_snapshot_by_locator(&locator)?.is_none() {
                 return Err(invalid(
                     "ExternalSession has no ActiveTask for Agent Checkpoint",
                 ));
@@ -1284,39 +1968,41 @@ impl Runtime {
                 status: TaskCheckpointNoOpStatus::NoOp,
             }));
         }
-        let outcome = self
-            .tasks
-            .submit_agent_checkpoint(&AgentCheckpointSubmission {
-                locator,
-                claims: input
-                    .claims
-                    .iter()
-                    .map(|claim| DirectCheckpointClaimDraft {
-                        context_kind: claim.context_kind,
-                        statement: claim.statement.clone(),
-                        rationale: claim.rationale.clone(),
-                        conditions: claim.conditions.clone(),
-                        evidence: claim
-                            .evidence
-                            .iter()
-                            .map(|evidence| DirectEvidenceDraft {
-                                evidence_type: evidence.evidence_type,
-                                summary: evidence.summary.clone(),
-                                limitations: evidence.limitations.clone(),
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-                unknowns: input
-                    .unknowns
-                    .iter()
-                    .map(|unknown| CheckpointUnknown {
-                        statement: unknown.statement.clone(),
-                        blocking: unknown.blocking,
-                        recheck_when: Vec::new(),
-                    })
-                    .collect(),
-            })?;
+        let submission = AgentCheckpointSubmission {
+            locator,
+            claims: input
+                .claims
+                .iter()
+                .map(|claim| DirectCheckpointClaimDraft {
+                    context_kind: claim.context_kind,
+                    statement: claim.statement.clone(),
+                    rationale: claim.rationale.clone(),
+                    conditions: claim.conditions.clone(),
+                    evidence: claim
+                        .evidence
+                        .iter()
+                        .map(|evidence| DirectEvidenceDraft {
+                            evidence_type: evidence.evidence_type,
+                            summary: evidence.summary.clone(),
+                            limitations: evidence.limitations.clone(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            unknowns: input
+                .unknowns
+                .iter()
+                .map(|unknown| CheckpointUnknown {
+                    statement: unknown.statement.clone(),
+                    blocking: unknown.blocking,
+                    recheck_when: Vec::new(),
+                })
+                .collect(),
+        };
+        // ADR-0003: the durable ACK is receipt plus outbox. Reference derivation, duplicate
+        // collapsing and injection-usage comparison are all Candidate Build work, so nothing here
+        // reads a checkout, spawns a process, or opens the retrieval index.
+        let outcome = tasks.submit_agent_checkpoint(&submission)?;
         Ok(TaskCheckpointResponse::Accepted(
             TaskCheckpointAcceptedResponse {
                 status: TaskCheckpointAcceptedStatus::Accepted,
@@ -1349,6 +2035,231 @@ impl Runtime {
             },
         ))
     }
+}
+
+impl Runtime {
+    /// Places one Episode's Claim path spellings inside the Repository that Session was scoped to.
+    ///
+    /// Returns whether this call wrote the derivation. At most one `git ls-files` runs per Episode
+    /// for the life of the installation: the runtime records the first answer, and a Build rerun
+    /// after recovery reports it without consulting the checkout again. Without a Direct
+    /// activation there is no checkout, and every spelling stays an unresolved retrieval hint.
+    fn derive_episode_claim_references(&self, episode: &WorkEpisodeView) -> Result<bool> {
+        let episode_id = episode.episode.episode_id;
+        let Some(candidates) = self.tasks.pending_claim_reference_candidates(episode_id)? else {
+            return Ok(false);
+        };
+        let resolver = self
+            .episode_checkout(episode)?
+            .map(|(repository_id, checkout)| {
+                CheckoutReferenceResolver::from_checkout(repository_id, &checkout, &candidates)
+            });
+        match &resolver {
+            Some(resolver) => self
+                .tasks
+                .derive_episode_claim_references(episode_id, &|candidate| {
+                    resolver.resolve(candidate)
+                })?,
+            None => self
+                .tasks
+                .derive_episode_claim_references(episode_id, &reference_derivation::unresolvable)?,
+        };
+        Ok(true)
+    }
+
+    /// Resolves the checkout of the `ExternalSession` that authored this Episode's Checkpoints.
+    ///
+    /// A Build can be drained by an Agent Hook or by the CLI, neither of which carries the
+    /// authoring session's activation scope, so the scope is looked up by the Episode's own
+    /// locator. Anything other than a live Direct activation yields `None` and derives nothing.
+    fn episode_checkout(
+        &self,
+        episode: &WorkEpisodeView,
+    ) -> Result<Option<(RepositoryId, PathBuf)>> {
+        let Some(task) = self.tasks.read_snapshot(episode.episode.task_session_id)? else {
+            return Ok(None);
+        };
+        let locator = task.external_session_locator;
+        let repository_id = match &self.session_scope {
+            Some(scope) if scope.external_session_locator == locator => match &scope.decision {
+                AuthorizedSessionScopeDecision::Direct { repository_id } => repository_id.clone(),
+                _ => return Ok(None),
+            },
+            _ => {
+                let Ok(store) = AuthorizedSessionScopeStore::initialize(&self.root) else {
+                    return Ok(None);
+                };
+                match store.try_read(&locator, &self.catalog) {
+                    Ok(AuthorizedSessionScopeRead::Current(scope)) => match scope.decision {
+                        AuthorizedSessionScopeDecision::Direct { repository_id } => repository_id,
+                        _ => return Ok(None),
+                    },
+                    _ => return Ok(None),
+                }
+            }
+        };
+        Ok(self
+            .catalog
+            .repositories
+            .iter()
+            .find(|entry| entry.repository_id == repository_id)
+            .and_then(|entry| entry.checkout_paths.first().cloned())
+            .map(|checkout| (repository_id, checkout)))
+    }
+
+    /// Records the injection outcome for every Claim this Episode carries.
+    fn record_episode_context_usage(&self, episode: &WorkEpisodeView) -> Result<()> {
+        let claims = episode
+            .checkpoints
+            .iter()
+            .flat_map(|checkpoint| checkpoint.claims.iter().cloned())
+            .collect::<Vec<_>>();
+        if claims.is_empty() {
+            return Ok(());
+        }
+        self.record_checkpoint_context_usage(episode.episode.task_id, &claims)
+    }
+
+    /// Compares what this Task was given with what it just claimed.
+    ///
+    /// Every Context injected into the Task is matched against the Checkpoint Claims by
+    /// normalized statement token Jaccard. A Claim that restates an injected Context marks it
+    /// `reused`; an injected Context no Claim restates is `ignored`. The model fills in nothing:
+    /// both outcomes are derived from text it wrote for its own purpose. This runs during
+    /// Candidate Build rather than in the ACK because it reads the retrieval index; writing the
+    /// same rows again is a no-op, so a Build rerun and a Checkpoint replay both stay idempotent.
+    fn record_checkpoint_context_usage(
+        &self,
+        task_id: TaskId,
+        claims: &[CheckpointClaim],
+    ) -> Result<()> {
+        let injections = self.tasks.read_task_injections(task_id)?;
+        if injections.is_empty() {
+            return Ok(());
+        }
+        let claim_tokens = claims
+            .iter()
+            .map(|claim| statement_tokens(&claim.statement))
+            .collect::<Vec<_>>();
+        let injected = injections
+            .iter()
+            .map(|injection| (injection.context_id, injection.revision_id))
+            .collect::<Vec<_>>();
+        let statements = SearchEngine::new(self.index.clone()).context_statements(&injected)?;
+        let mut records = Vec::new();
+        for injection in &injections {
+            let Some(statement) = statements.get(&injection.context_id) else {
+                continue;
+            };
+            let injected_tokens = statement_tokens(statement);
+            let reused = claim_tokens.iter().any(|claim| {
+                jaccard_basis_points(&injected_tokens, claim)
+                    >= USAGE_REUSED_SIMILARITY_BASIS_POINTS
+            });
+            records.push(ContextUsageRecord {
+                context_id: injection.context_id,
+                task_id,
+                outcome: if reused {
+                    ContextUsageOutcome::Reused
+                } else {
+                    ContextUsageOutcome::Ignored
+                },
+            });
+        }
+        self.tasks.record_context_usage(&records)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    /// Collapses Claims that only restate a Candidate this `ExternalSession` already proposed.
+    ///
+    /// The decision compares normalized statement tokens with Jaccard similarity and never runs on
+    /// a Claim whose Candidate already reached Git, so it cannot retract a submitted proposal or
+    /// change a Candidate that a human is already reviewing.
+    fn deduplicated_claims(
+        &self,
+        episode: &WorkEpisodeView,
+        materials: &[ClaimBuildMaterial],
+        snapshot: &DomainSnapshot,
+    ) -> Result<Vec<CandidateBuildDuplicatePreparation>> {
+        let submitted = self
+            .tasks
+            .read_candidate_build(episode.episode.episode_id)?
+            .map(|build| {
+                build
+                    .items
+                    .iter()
+                    .filter(|item| item.status.is_finalized())
+                    .map(|item| item.claim_id)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let comparable = materials
+            .iter()
+            .filter(|material| material.draft.is_some() && !submitted.contains(&material.claim_id))
+            .count();
+        if comparable == 0 {
+            return Ok(Vec::new());
+        }
+        // Candidates built from this same Episode are excluded so the decision does not depend on
+        // how far this Build already progressed.
+        let corpus = self
+            .tasks
+            .list_session_candidate_reviews(
+                episode.episode.task_session_id,
+                sctx_task_runtime::MAX_SESSION_CANDIDATE_REVIEW_SCAN,
+            )?
+            .into_iter()
+            .filter(|record| record.source_episode.episode_id != episode.episode.episode_id)
+            .filter_map(|record| {
+                snapshot
+                    .projection
+                    .candidates
+                    .get(&record.candidate_id)
+                    .map(|projection| {
+                        (
+                            record.candidate_id,
+                            statement_tokens(&projection.candidate.content.statement),
+                        )
+                    })
+            })
+            .filter(|(_, tokens)| !tokens.is_empty())
+            .collect::<Vec<_>>();
+        if corpus.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut duplicates = Vec::new();
+        for material in materials {
+            if submitted.contains(&material.claim_id) {
+                continue;
+            }
+            let Some(draft) = material.draft.as_ref() else {
+                continue;
+            };
+            let tokens = statement_tokens(&draft.statement);
+            if tokens.is_empty() {
+                continue;
+            }
+            let best = corpus
+                .iter()
+                .map(|(candidate_id, existing)| {
+                    (jaccard_basis_points(&tokens, existing), *candidate_id)
+                })
+                .filter(|(similarity, _)| {
+                    *similarity >= CANDIDATE_DUPLICATE_SIMILARITY_BASIS_POINTS
+                })
+                .max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)));
+            if let Some((similarity_basis_points, duplicate_of_candidate_id)) = best {
+                duplicates.push(CandidateBuildDuplicatePreparation {
+                    checkpoint_id: material.checkpoint_id,
+                    claim_id: material.claim_id,
+                    duplicate_of_candidate_id,
+                    similarity_basis_points,
+                });
+            }
+        }
+        Ok(duplicates)
+    }
 
     #[allow(clippy::too_many_lines)]
     fn build_closed_episode(&self, episode_id: WorkEpisodeId) -> Result<CandidateBuildResponse> {
@@ -1364,6 +2275,17 @@ impl Runtime {
                 "Candidate Builder source Work Episode must be closed",
             ));
         };
+        // Everything the ACK deliberately skipped happens here, once per Episode: place the path
+        // spellings the Claims carried, then compare what this Task was injected with against what
+        // it claimed. Both are best-effort derivations over text the Agent wrote for itself.
+        let episode = if self.derive_episode_claim_references(&episode)? {
+            self.tasks
+                .read_work_episode(episode_id)?
+                .ok_or_else(|| invariant("Candidate Builder source Work Episode disappeared"))?
+        } else {
+            episode
+        };
+        let _ = self.record_episode_context_usage(&episode);
         let final_checkpoint = episode
             .checkpoints
             .iter()
@@ -1374,14 +2296,14 @@ impl Runtime {
             .iter()
             .map(|checkpoint| checkpoint.claims.len())
             .sum::<usize>();
-        let materials = if claim_count == 0 {
-            Vec::new()
+        let (materials, duplicates) = if claim_count == 0 {
+            (Vec::new(), Vec::new())
         } else {
             let snapshot = self.snapshot()?;
             let signals = self
                 .tasks
                 .read_signal_history(episode.episode.task_session_id)?;
-            episode
+            let materials = episode
                 .checkpoints
                 .iter()
                 .flat_map(|checkpoint| {
@@ -1396,20 +2318,37 @@ impl Runtime {
                         )
                     })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            let duplicates = self.deduplicated_claims(&episode, &materials, &snapshot)?;
+            (materials, duplicates)
         };
+        let deduplicated = duplicates
+            .iter()
+            .map(|duplicate| duplicate.claim_id)
+            .collect::<BTreeSet<_>>();
         let preparations = materials
             .iter()
+            .filter(|material| !deduplicated.contains(&material.claim_id))
             .map(|material| material.preparation(&episode.episode.ownership()))
             .collect::<Vec<_>>();
-        let mut build = self
-            .tasks
-            .prepare_candidate_build(episode_id, &preparations)?;
+        let mut build = self.tasks.prepare_candidate_build_with_duplicates(
+            episode_id,
+            &preparations,
+            &duplicates,
+        )?;
         let materials = materials
             .iter()
             .map(|material| (material.claim_id, material))
             .collect::<BTreeMap<_, _>>();
-        for item in build.items.clone() {
+        // Analysis is deferred to one pass after every Candidate of this Episode is committed:
+        // it reads the Knowledge Store but writes only local analysis rows, so running it once
+        // over one Domain Snapshot is equivalent to running it per Candidate, minus N-1 full
+        // projection reads. Sibling Candidates of the same build are never analysis targets
+        // (targets come from Spaces, which an unconfirmed Candidate has not joined), so the
+        // deferral cannot change what any Candidate is compared against.
+        let mut pending_analysis = Vec::new();
+        let mut submissions = Vec::new();
+        for item in &build.items {
             if item.status.is_finalized() {
                 if let Some(candidate_id) = item.candidate_id
                     && self
@@ -1419,11 +2358,7 @@ impl Runtime {
                             view.candidate.analysis.status != CandidateAnalysisStatus::Complete
                         })
                 {
-                    self.analyze_candidate(&CandidateAnalyzeInput {
-                        candidate_id: candidate_id.to_string(),
-                        token_budget: default_candidate_analysis_token_budget(),
-                        top_k: default_candidate_analysis_top_k(),
-                    })?;
+                    pending_analysis.push(candidate_id);
                 }
                 continue;
             }
@@ -1437,43 +2372,58 @@ impl Runtime {
                 .draft
                 .as_ref()
                 .ok_or_else(|| invariant("prepared Candidate Build item lacks a draft"))?;
-            match self.store.submit_candidate(CandidateSubmissionRequest {
+            submissions.push(CandidateSubmissionRequest {
                 submission_id: item.submission_id,
                 source_episode: episode.episode.ownership(),
                 content: draft.clone(),
-            }) {
-                Ok(outcome) => {
-                    let submission_status = match outcome.status {
-                        CandidateSubmissionStatus::Created => CandidateBuildItemStatus::Created,
-                        CandidateSubmissionStatus::AlreadyExists => {
-                            CandidateBuildItemStatus::AlreadyExists
-                        }
-                    };
-                    build = self.tasks.record_candidate_build_item_result(
-                        build.build_id,
-                        item.submission_id,
-                        submission_status,
-                        Some(outcome.record.candidate_id),
-                        Some(outcome.record.event_id),
-                        None,
-                    )?;
-                    self.analyze_candidate(&CandidateAnalyzeInput {
-                        candidate_id: outcome.record.candidate_id.to_string(),
-                        token_budget: default_candidate_analysis_token_budget(),
-                        top_k: default_candidate_analysis_top_k(),
-                    })?;
+            });
+        }
+        // One lock cycle, one index synchronization pair, one journal and one Git commit carry
+        // every Candidate this Episode still owes. Each Candidate keeps its own SubmissionId
+        // idempotency and its own Writer batch id, so replaying the build returns exactly the
+        // same Candidate identities and writes nothing.
+        for chunk in submissions.chunks(MAX_CANDIDATE_SUBMISSION_BATCH) {
+            for (submission_id, result) in self.submit_candidate_chunk(chunk)? {
+                match result {
+                    Ok(record) => {
+                        let submission_status = match record.status {
+                            CandidateSubmissionStatus::Created => CandidateBuildItemStatus::Created,
+                            CandidateSubmissionStatus::AlreadyExists => {
+                                CandidateBuildItemStatus::AlreadyExists
+                            }
+                        };
+                        build = self.tasks.record_candidate_build_item_result(
+                            build.build_id,
+                            submission_id,
+                            submission_status,
+                            Some(record.candidate_id),
+                            Some(record.event_id),
+                            None,
+                        )?;
+                        pending_analysis.push(record.candidate_id);
+                    }
+                    Err(error_code) => {
+                        build = self.tasks.record_candidate_build_item_result(
+                            build.build_id,
+                            submission_id,
+                            CandidateBuildItemStatus::Failed,
+                            None,
+                            None,
+                            Some(error_code),
+                        )?;
+                    }
                 }
-                Err(error) => {
-                    let error_code = candidate_builder_error_code(&error);
-                    build = self.tasks.record_candidate_build_item_result(
-                        build.build_id,
-                        item.submission_id,
-                        CandidateBuildItemStatus::Failed,
-                        None,
-                        None,
-                        Some(error_code),
-                    )?;
-                }
+            }
+        }
+        if !pending_analysis.is_empty() {
+            let snapshot = self.snapshot()?;
+            for candidate_id in pending_analysis {
+                self.analyze_candidate_in_snapshot(
+                    candidate_id,
+                    default_candidate_analysis_token_budget(),
+                    default_candidate_analysis_top_k(),
+                    &snapshot,
+                )?;
             }
         }
         let mut response = candidate_build_response(build, &materials)?;
@@ -1490,6 +2440,56 @@ impl Runtime {
             }
         }
         Ok(response)
+    }
+
+    /// Submits one Candidate slice atomically, degrading to per-Candidate writes on rejection.
+    ///
+    /// The batch entry point rejects the whole slice when one member is at fault, so a rejected
+    /// batch is retried one Candidate at a time. That keeps the pre-batch Builder behaviour where
+    /// exactly the offending Candidate is recorded as `Failed` and its siblings still land.
+    #[allow(clippy::type_complexity)]
+    fn submit_candidate_chunk(
+        &self,
+        requests: &[CandidateSubmissionRequest],
+    ) -> Result<
+        Vec<(
+            SubmissionId,
+            std::result::Result<CandidateSubmissionOutcomeRecord, &'static str>,
+        )>,
+    > {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Ok(write) = self.store()?.submit_candidates(requests) {
+            return Ok(write
+                .entries
+                .into_iter()
+                .map(|entry| {
+                    (
+                        entry.submission_id,
+                        Ok(CandidateSubmissionOutcomeRecord {
+                            candidate_id: entry.record.candidate_id,
+                            event_id: entry.record.event_id,
+                            status: entry.status,
+                        }),
+                    )
+                })
+                .collect());
+        }
+        let mut results = Vec::with_capacity(requests.len());
+        for request in requests {
+            let submission_id = request.submission_id;
+            let result = match self.store()?.submit_candidate(request.clone()) {
+                Ok(outcome) => Ok(CandidateSubmissionOutcomeRecord {
+                    candidate_id: outcome.record.candidate_id,
+                    event_id: outcome.record.event_id,
+                    status: outcome.status,
+                }),
+                Err(error) => Err(candidate_builder_error_code(&error)),
+            };
+            results.push((submission_id, result));
+        }
+        Ok(results)
     }
 
     fn recover_candidate_build_episode(&self, episode_id: WorkEpisodeId) -> Result<bool> {
@@ -1533,7 +2533,6 @@ impl Runtime {
         Ok(summary)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn analyze_candidate(&self, input: &CandidateAnalyzeInput) -> Result<CandidateAnalyzeResponse> {
         if input.token_budget < MIN_CANDIDATE_ANALYSIS_TOKEN_BUDGET
             || input.token_budget > MAX_CANDIDATE_ANALYSIS_TOKEN_BUDGET
@@ -1544,6 +2543,21 @@ impl Runtime {
         }
         let candidate_id = parse_id_value(&input.candidate_id, "candidate_id")?;
         let snapshot = self.snapshot()?;
+        self.analyze_candidate_in_snapshot(candidate_id, input.token_budget, input.top_k, &snapshot)
+    }
+
+    /// Analyzes one Candidate against an already read Domain Snapshot.
+    ///
+    /// Analysis only reads the Knowledge Store and writes local analysis rows, so several
+    /// Candidates committed by the same Git commit share one snapshot read.
+    #[allow(clippy::too_many_lines)]
+    fn analyze_candidate_in_snapshot(
+        &self,
+        candidate_id: CandidateId,
+        token_budget: usize,
+        top_k: usize,
+        snapshot: &DomainSnapshot,
+    ) -> Result<CandidateAnalyzeResponse> {
         let persisted = snapshot
             .projection
             .candidates
@@ -1611,7 +2625,7 @@ impl Runtime {
             checkpoint,
             claim,
             &signal_history,
-            &snapshot,
+            snapshot,
         );
         let engine = self.engineering_graph.as_ref().map_or_else(
             || SearchEngine::new(self.index.clone()),
@@ -1624,10 +2638,12 @@ impl Runtime {
             source_working_intent: source_intent,
             source_task_signals: task.task_signals.clone(),
             explicit_related_contexts: claim.related_contexts.clone(),
-            artifact_refs: claim.artifact_refs.clone(),
+            // Server-derived References are the only Artifact coordinates most Claims carry, so
+            // the analyzer's shared-Artifact path sees them alongside any Agent-authored ref.
+            artifact_refs: candidate_artifact_refs(claim),
             proposed_space_group_space_id,
-            token_budget: input.token_budget,
-            top_k: input.top_k,
+            token_budget,
+            top_k,
         });
         let mut checkpoint_ids = vec![item.checkpoint_id];
         if !checkpoint_ids.contains(&build.final_checkpoint_id) {
@@ -1695,6 +2711,14 @@ impl Runtime {
     }
 
     fn candidate_list(&self, input: &CandidateListInput) -> Result<CandidateListResponse> {
+        self.candidate_list_with_detail(input, ContextPackDetailLevel::Full)
+    }
+
+    fn candidate_list_with_detail(
+        &self,
+        input: &CandidateListInput,
+        detail_level: ContextPackDetailLevel,
+    ) -> Result<CandidateListResponse> {
         if input.token_budget < MIN_CANDIDATE_REVIEW_TOKEN_BUDGET
             || input.token_budget > MAX_CANDIDATE_REVIEW_TOKEN_BUDGET
         {
@@ -1711,7 +2735,10 @@ impl Runtime {
             input.cursor.as_deref(),
         )?;
         let snapshot = self.snapshot()?;
+        let provisional_space_ids = provisional_space_ids(&snapshot);
+        let space_advisories = provisional_space_advisories(&snapshot);
         let mut reviews = Vec::new();
+        let mut compact_reviews = Vec::new();
         let mut omitted = Vec::new();
         let mut estimated_tokens = 0_usize;
         for record in page.records {
@@ -1729,7 +2756,11 @@ impl Runtime {
             }
             let summary =
                 CandidateReviewSummary::from(self.candidate_review_view(&record, &snapshot)?);
-            let tokens = estimate_candidate_review_tokens(&summary)?;
+            let compact = compact_candidate_review(&summary.0, &provisional_space_ids);
+            let tokens = match detail_level {
+                ContextPackDetailLevel::Full => estimate_candidate_review_tokens(&summary)?,
+                ContextPackDetailLevel::Compact => estimate_candidate_review_tokens(&compact)?,
+            };
             if estimated_tokens.saturating_add(tokens) > input.token_budget {
                 omitted.push(CandidateReviewOmitted {
                     candidate_id: record.candidate_id,
@@ -1739,10 +2770,18 @@ impl Runtime {
             } else {
                 estimated_tokens = estimated_tokens.saturating_add(tokens);
                 reviews.push(summary);
+                compact_reviews.push(compact);
             }
+        }
+        if detail_level == ContextPackDetailLevel::Full {
+            compact_reviews.clear();
         }
         Ok(CandidateListResponse {
             reviews,
+            detail_level,
+            compact_reviews,
+            space_advisories,
+            provisional_space_ids,
             omitted,
             next_cursor: page.next_cursor,
             estimated_tokens,
@@ -1832,7 +2871,54 @@ impl Runtime {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Discards several owned Pending Candidates in one atomic Runtime transaction.
+    fn candidate_discard_batch(
+        &self,
+        input: &CandidateDiscardBatchInput,
+    ) -> Result<CandidateDiscardBatchResponse> {
+        let scan = PrivacyScanner::default().scan(&input.reason)?;
+        if !scan.is_clean() {
+            return Err(Error::new(
+                ErrorKind::PrivacyRejected,
+                "Candidate discard reason failed the privacy boundary",
+            ));
+        }
+        let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
+        let expected_task_id = parse_id_value(&input.expected_task_id, "expected_task_id")?;
+        let expected_intent_revision_id = parse_id_value(
+            &input.expected_intent_revision_id,
+            "expected_intent_revision_id",
+        )?;
+        let requests = parse_batch_candidate_ids(&input.candidate_ids)?
+            .into_iter()
+            .map(|candidate_id| CandidateReviewDiscard {
+                locator: locator.clone(),
+                expected_task_id,
+                expected_intent_revision_id,
+                candidate_id,
+                expected_review_version: input.expected_review_version,
+                reason: input.reason.clone(),
+            })
+            .collect::<Vec<_>>();
+        let outcomes = self.tasks.discard_candidate_reviews(&requests)?;
+        let snapshot = self.snapshot()?;
+        let reviews = outcomes
+            .iter()
+            .map(|outcome| self.candidate_review_view(&outcome.record, &snapshot))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(CandidateDiscardBatchResponse {
+            status: if outcomes
+                .iter()
+                .all(|outcome| outcome.status == CandidateReviewDiscardStatus::AlreadyDiscarded)
+            {
+                CandidateDiscardResponseStatus::AlreadyDiscarded
+            } else {
+                CandidateDiscardResponseStatus::Discarded
+            },
+            reviews,
+        })
+    }
+
     fn candidate_confirm(&self, input: &CandidateConfirmInput) -> Result<CandidateConfirmResponse> {
         let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
         let expected_task_id = parse_id_value(&input.expected_task_id, "expected_task_id")?;
@@ -1841,9 +2927,132 @@ impl Runtime {
             "expected_intent_revision_id",
         )?;
         let candidate_id = parse_id_value(&input.candidate_id, "candidate_id")?;
+        let snapshot = self.snapshot()?;
+        let prepared = self.prepare_candidate_confirmation(
+            &snapshot,
+            &locator,
+            candidate_id,
+            input.expected_review_version,
+            &input.primary,
+            &input.related_space_ids,
+            &input.edits,
+        )?;
+        self.commit_candidate_confirmation(
+            &locator,
+            expected_task_id,
+            expected_intent_revision_id,
+            prepared,
+        )
+    }
+
+    /// Confirms several owned Pending Candidates under one Space organization.
+    ///
+    /// Every Candidate is fully validated and planned before the first Git write, so a rejected
+    /// batch writes nothing and names the exact Candidate that failed. Field edits and a proposed
+    /// new Space are Candidate-scoped and stay single-Candidate operations.
+    fn candidate_confirm_batch(
+        &self,
+        input: &CandidateConfirmBatchInput,
+    ) -> Result<CandidateConfirmBatchResponse> {
+        let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
+        let expected_task_id = parse_id_value(&input.expected_task_id, "expected_task_id")?;
+        let expected_intent_revision_id = parse_id_value(
+            &input.expected_intent_revision_id,
+            "expected_intent_revision_id",
+        )?;
+        let candidate_ids = parse_batch_candidate_ids(&input.candidate_ids)?;
+        if matches!(input.primary, CandidateConfirmPrimaryInput::Proposed(_)) {
+            return Err(invalid(
+                "batch candidate_confirm requires existing_space_id; a proposed new Space recommendation identifies one Candidate only",
+            ));
+        }
+        let snapshot = self.snapshot()?;
+        let mut prepared = Vec::with_capacity(candidate_ids.len());
+        for (position, candidate_id) in candidate_ids.iter().enumerate() {
+            prepared.push(
+                self.prepare_candidate_confirmation(
+                    &snapshot,
+                    &locator,
+                    *candidate_id,
+                    input.expected_review_version,
+                    &input.primary,
+                    &input.related_space_ids,
+                    &OptionalCandidateEdits::default(),
+                )
+                .map_err(|error| batch_preparation_error(position, *candidate_id, &error))?,
+            );
+        }
+        let mut reserved = Vec::with_capacity(prepared.len());
+        for (position, prepared) in prepared.into_iter().enumerate() {
+            let candidate_id = prepared.candidate_id;
+            reserved.push(
+                self.reserve_candidate_confirmation(
+                    &locator,
+                    expected_task_id,
+                    expected_intent_revision_id,
+                    prepared,
+                )
+                .map_err(|error| batch_preparation_error(position, candidate_id, &error))?,
+            );
+        }
+        // One Confirmation lock, one Writer batch, one Git commit for the whole slice: a rejected
+        // member leaves no Candidate written, and every accepted member shares one commit.
+        let plans = reserved
+            .iter()
+            .map(|reserved| reserved.plan.clone())
+            .collect::<Vec<_>>();
+        let write = self.store()?.confirm_candidates(&plans)?;
+        let finalized = self.tasks.finalize_candidate_confirmations(
+            &write
+                .entries
+                .iter()
+                .map(|entry| CandidateConfirmationFinalize {
+                    candidate_id: entry.candidate_id,
+                    operation_hash: entry.record.operation_hash.clone(),
+                    confirmation_id: entry.record.confirmation_id,
+                    result_context_id: entry.record.result_context_id,
+                })
+                .collect::<Vec<_>>(),
+        )?;
+        let written = write
+            .entries
+            .into_iter()
+            .zip(&finalized)
+            .map(|(entry, finalized)| WrittenCandidateConfirmation {
+                append: entry.append,
+                already_confirmed: finalized.already_confirmed
+                    || entry.status == CandidateConfirmationWriteStatus::AlreadyExists,
+            })
+            .collect::<Vec<_>>();
+        let confirmations =
+            self.finish_candidate_confirmations(expected_task_id, reserved, written)?;
+        Ok(CandidateConfirmBatchResponse {
+            status: if confirmations.iter().all(|confirmation| {
+                confirmation.status == CandidateConfirmResponseStatus::AlreadyConfirmed
+            }) {
+                CandidateConfirmResponseStatus::AlreadyConfirmed
+            } else {
+                CandidateConfirmResponseStatus::Confirmed
+            },
+            confirmations,
+        })
+    }
+
+    /// Validates one Candidate Confirmation and reserves nothing.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    fn prepare_candidate_confirmation(
+        &self,
+        snapshot: &DomainSnapshot,
+        locator: &ExternalSessionLocator,
+        candidate_id: sctx_domain::CandidateId,
+        expected_review_version: u64,
+        primary: &CandidateConfirmPrimaryInput,
+        related_space_ids: &[String],
+        edits: &OptionalCandidateEdits,
+    ) -> Result<PreparedCandidateConfirmation> {
         let review_record = self
             .tasks
-            .read_candidate_review(&locator, candidate_id)?
+            .read_candidate_review(locator, candidate_id)?
             .ok_or_else(|| invalid("Candidate Review does not exist for the ActiveTask"))?;
         if !matches!(
             review_record.status,
@@ -1854,8 +3063,7 @@ impl Runtime {
                 "Only an owned Pending Candidate Review can be confirmed",
             ));
         }
-        let snapshot = self.snapshot()?;
-        let review = self.candidate_review_view(&review_record, &snapshot)?;
+        let review = self.candidate_review_view(&review_record, snapshot)?;
         if review.analysis.status != CandidateAnalysisStatus::Complete
             || review.analysis_generation.is_none()
             || matches!(
@@ -1868,7 +3076,7 @@ impl Runtime {
             ));
         }
         let (primary_reference, resolved_primary, primary_space_id, proposed_space_group_key) =
-            match &input.primary {
+            match primary {
                 CandidateConfirmPrimaryInput::Existing(existing) => {
                     let space_id =
                         parse_id_value(&existing.existing_space_id, "existing_space_id")?;
@@ -1921,8 +3129,7 @@ impl Runtime {
                     )
                 }
             };
-        let related_space_ids = input
-            .related_space_ids
+        let related_space_ids = related_space_ids
             .iter()
             .map(|value| parse_id_value::<SpaceId>(value, "related_space_ids"))
             .collect::<Result<Vec<_>>>()?;
@@ -1946,8 +3153,19 @@ impl Runtime {
             .get(&candidate_id)
             .map(|projection| &projection.candidate)
             .ok_or_else(|| invalid("Candidate Confirmation payload is unavailable"))?;
-        let final_draft = input.edits.apply(&persisted.content)?;
-        validate_context_relation_targets(&snapshot, &final_draft.relations)?;
+        // Derived, overridable `problem_view`: Candidate Build has no Task Intent to read, so the
+        // question the source Task was answering is attached here instead. An explicit
+        // `edits.problem_view` always wins, `clear` included.
+        let mut edits = edits.clone();
+        if edits.problem_view.is_none()
+            && persisted.content.problem_view.is_none()
+            && let Some(value) = self.derived_problem_view(review_record.source_episode)?
+        {
+            edits.problem_view = Some(ProblemViewEdit::Set { value });
+        }
+        let edits = &edits;
+        let final_draft = edits.apply(&persisted.content)?;
+        validate_context_relation_targets(snapshot, &final_draft.relations)?;
         let final_json = serde_json::to_string(&final_draft).map_err(|error| {
             Error::new(ErrorKind::Io, format!("serialize final draft: {error}"))
         })?;
@@ -1960,34 +3178,112 @@ impl Runtime {
         }
         let operation = CandidateConfirmationOperation {
             candidate_id,
-            review_parent_version: input.expected_review_version,
+            review_parent_version: expected_review_version,
             analysis_generation: review.analysis_generation.unwrap_or_default(),
             primary: primary_reference,
             related_space_ids,
-            edits: input.edits.clone(),
+            edits: edits.clone(),
         };
+        let final_content_hash = context_revision_content_hash(&final_draft);
+        let conflict_openings = contradiction_conflict_openings(
+            snapshot,
+            &final_draft,
+            primary_space_id,
+            &final_content_hash,
+        );
         let proposed_plan = CandidateConfirmationPlan::reserve(
             persisted,
             operation,
             resolved_primary,
             review.engineering_references.clone(),
+            conflict_openings,
         )?;
-        let reservation = self.tasks.reserve_candidate_confirmation(
-            &locator,
+        Ok(PreparedCandidateConfirmation {
+            candidate_id,
+            proposed_plan,
+            proposed_space_group_key,
+            assessments: review.analysis.assessments,
+        })
+    }
+
+    /// Reserves, writes and finalizes one already validated Candidate Confirmation.
+    fn commit_candidate_confirmation(
+        &self,
+        locator: &ExternalSessionLocator,
+        expected_task_id: TaskId,
+        expected_intent_revision_id: TaskIntentRevisionId,
+        prepared: PreparedCandidateConfirmation,
+    ) -> Result<CandidateConfirmResponse> {
+        let reserved = self.reserve_candidate_confirmation(
+            locator,
             expected_task_id,
             expected_intent_revision_id,
-            &proposed_plan,
-            proposed_space_group_key,
+            prepared,
         )?;
-        let plan = reservation.operation.plan;
-        let write = self.store.confirm_candidate(&plan)?;
+        let write = self.store()?.confirm_candidate(&reserved.plan)?;
         let finalized = self.tasks.finalize_candidate_confirmation(
-            candidate_id,
-            &plan.operation_hash,
+            reserved.candidate_id,
+            &reserved.plan.operation_hash,
             write.record.confirmation_id,
             write.record.result_context_id,
         )?;
-        let graph_rebuild_pending = if plan.engineering_references.is_empty() {
+        let written = vec![WrittenCandidateConfirmation {
+            append: write.append,
+            already_confirmed: finalized.already_confirmed
+                || write.status == CandidateConfirmationWriteStatus::AlreadyExists,
+        }];
+        self.finish_candidate_confirmations(expected_task_id, vec![reserved], written)?
+            .pop()
+            .ok_or_else(|| invariant("Candidate Confirmation produced no response"))
+    }
+
+    /// Reserves one server-owned plan without writing any Git fact.
+    fn reserve_candidate_confirmation(
+        &self,
+        locator: &ExternalSessionLocator,
+        expected_task_id: TaskId,
+        expected_intent_revision_id: TaskIntentRevisionId,
+        prepared: PreparedCandidateConfirmation,
+    ) -> Result<ReservedCandidateConfirmation> {
+        let reservation = self.tasks.reserve_candidate_confirmation(
+            locator,
+            expected_task_id,
+            expected_intent_revision_id,
+            &prepared.proposed_plan,
+            prepared.proposed_space_group_key,
+        )?;
+        Ok(ReservedCandidateConfirmation {
+            candidate_id: prepared.candidate_id,
+            plan: reservation.operation.plan,
+            assessments: prepared.assessments,
+        })
+    }
+
+    /// Records usage, refreshes derived state once, and answers for every written Confirmation.
+    fn finish_candidate_confirmations(
+        &self,
+        expected_task_id: TaskId,
+        reserved: Vec<ReservedCandidateConfirmation>,
+        written: Vec<WrittenCandidateConfirmation>,
+    ) -> Result<Vec<CandidateConfirmResponse>> {
+        if reserved.len() != written.len() {
+            return Err(invariant(
+                "Candidate Confirmation results do not match their reserved plans",
+            ));
+        }
+        // Late usage signal: a Context this Task was given and then explicitly contradicted is
+        // `refuted`, which no later Checkpoint may downgrade. Best effort, like every other
+        // usage record.
+        for reserved in &reserved {
+            let _ = self.record_confirmation_context_usage(
+                expected_task_id,
+                &reserved.plan.result_revision,
+            );
+        }
+        let graph_rebuild_pending = if reserved
+            .iter()
+            .all(|reserved| reserved.plan.engineering_references.is_empty())
+        {
             false
         } else {
             self.association_rebuild(&AssociationRebuildInput {
@@ -1996,30 +3292,92 @@ impl Runtime {
             .is_err()
         };
         let snapshot = self.snapshot()?;
-        let status = if finalized.already_confirmed
-            || write.status == CandidateConfirmationWriteStatus::AlreadyExists
-        {
-            CandidateConfirmResponseStatus::AlreadyConfirmed
-        } else {
-            CandidateConfirmResponseStatus::Confirmed
+        Ok(reserved
+            .into_iter()
+            .zip(written)
+            .map(|(reserved, written)| {
+                let plan = reserved.plan;
+                let status = if written.already_confirmed {
+                    CandidateConfirmResponseStatus::AlreadyConfirmed
+                } else {
+                    CandidateConfirmResponseStatus::Confirmed
+                };
+                CandidateConfirmResponse {
+                    status,
+                    created: status == CandidateConfirmResponseStatus::Confirmed,
+                    candidate_id: reserved.candidate_id,
+                    confirmation_id: plan.confirmation.confirmation_id,
+                    context_id: plan.result_context_id,
+                    revision_id: plan.result_revision.revision_id,
+                    primary_space_id: plan.confirmation.primary_space_id,
+                    related_space_ids: plan.confirmation.related_space_ids,
+                    batch_id: written.append.batch_id,
+                    commit_oid: written.append.commit_oid,
+                    event_ids: written.append.event_ids,
+                    indexed_tree_oid: snapshot.metadata.indexed_tree_oid.clone(),
+                    projection_generation: snapshot.metadata.projection_generation,
+                    assessment_acknowledgments: reserved.assessments,
+                    graph_rebuild_pending,
+                }
+            })
+            .collect())
+    }
+
+    /// Records the Contexts this Confirmation explicitly contradicted as `refuted`.
+    ///
+    /// Only Contexts that were actually injected into the confirming Task are recorded: the table
+    /// answers "what happened to what we injected", and a contradiction of a Context this Task
+    /// never received is a graph fact the Relation and its conflict already carry.
+    fn record_confirmation_context_usage(
+        &self,
+        task_id: TaskId,
+        revision: &sctx_domain::ContextRevision,
+    ) -> Result<()> {
+        let contradicted = revision
+            .relations
+            .iter()
+            .filter(|relation| relation.kind == ContextRelationKind::Contradicts)
+            .map(|relation| relation.target_context_id)
+            .collect::<BTreeSet<_>>();
+        if contradicted.is_empty() {
+            return Ok(());
+        }
+        let injected = self
+            .tasks
+            .read_task_injections(task_id)?
+            .into_iter()
+            .map(|injection| injection.context_id)
+            .collect::<BTreeSet<_>>();
+        let records = contradicted
+            .intersection(&injected)
+            .map(|context_id| ContextUsageRecord {
+                context_id: *context_id,
+                task_id,
+                outcome: ContextUsageOutcome::Refuted,
+            })
+            .collect::<Vec<_>>();
+        self.tasks.record_context_usage(&records)?;
+        Ok(())
+    }
+
+    /// The question the Candidate's source Task was working on, condensed for `problem_view`.
+    ///
+    /// It reads the Working Intent revision the source Episode closed under: the goal, what the
+    /// Task declared in scope, and the questions it left open. `None` whenever the Episode or its
+    /// Intent revision is no longer resolvable, which only leaves the field absent.
+    fn derived_problem_view(&self, source_episode: WorkEpisodeRef) -> Result<Option<String>> {
+        let Some(episode) = self.tasks.read_work_episode(source_episode.episode_id)? else {
+            return Ok(None);
         };
-        Ok(CandidateConfirmResponse {
-            status,
-            created: status == CandidateConfirmResponseStatus::Confirmed,
-            candidate_id,
-            confirmation_id: plan.confirmation.confirmation_id,
-            context_id: plan.result_context_id,
-            revision_id: plan.result_revision.revision_id,
-            primary_space_id: plan.confirmation.primary_space_id,
-            related_space_ids: plan.confirmation.related_space_ids,
-            batch_id: write.append.batch_id,
-            commit_oid: write.append.commit_oid,
-            event_ids: write.append.event_ids,
-            indexed_tree_oid: snapshot.metadata.indexed_tree_oid,
-            projection_generation: snapshot.metadata.projection_generation,
-            assessment_acknowledgments: review.analysis.assessments,
-            graph_rebuild_pending,
-        })
+        let intent_revision_id = episode.episode.intent_revisions.last();
+        let Some(task) = self.tasks.read_snapshot(episode.episode.task_session_id)? else {
+            return Ok(None);
+        };
+        Ok(task
+            .intent_revisions
+            .iter()
+            .find(|revision| revision.revision_id == intent_revision_id)
+            .and_then(|revision| compose_problem_view(&revision.working_intent)))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2288,7 +3646,7 @@ impl Runtime {
             _ => unreachable!(),
         };
         let event_id = event.event_id();
-        let append = self.store.append_event(AppendRequest::event(event))?;
+        let append = self.store()?.append_event(AppendRequest::event(event))?;
         let metadata = self.index.synchronize()?.metadata;
         debug_assert!(snapshot.projection.spaces.contains_key(&space_id));
         Ok(EngineeringReferenceRecordResponse {
@@ -2302,6 +3660,95 @@ impl Runtime {
             tree: metadata.indexed_tree_oid,
             generation: metadata.projection_generation,
         })
+    }
+
+    /// Evaluates every accepted Context's structured `recheck_when` entries against the local
+    /// checkouts and records the outcome in the local `context_item.stale_reason` column.
+    ///
+    /// Nothing here becomes an Event. A Context whose entries all still hold has its previous
+    /// stale marking cleared; a Context with no structured entry is left exactly as it was, since
+    /// this pass has nothing to say about it. Every Git read is bounded and read-only, and any
+    /// failure — no checkout, no `git`, unknown commit, timeout — is reported as "unevaluated"
+    /// rather than as staleness or an error.
+    fn context_recheck(&self) -> Result<ContextRecheckResponse> {
+        let snapshot = self.snapshot()?;
+        let checkouts = self.recheck_checkouts()?;
+        let mut results = Vec::new();
+        let mut rows = Vec::new();
+        let mut unevaluated_entries = 0;
+        for space in snapshot.projection.spaces.values() {
+            for (context_id, context) in &space.contexts {
+                let ContextGovernanceStatus::Accepted { revision_id, .. } = context.governance
+                else {
+                    continue;
+                };
+                let Some(revision) = context.revisions.get(&revision_id) else {
+                    continue;
+                };
+                let conditions = revision
+                    .revision
+                    .recheck_when
+                    .iter()
+                    .filter_map(|entry| {
+                        RecheckCondition::parse(entry).map(|condition| (entry.clone(), condition))
+                    })
+                    .collect::<Vec<_>>();
+                if conditions.is_empty() {
+                    continue;
+                }
+                let mut stale_reason = None;
+                let mut unevaluated = Vec::new();
+                for (entry, condition) in conditions {
+                    match evaluate_recheck_condition(&condition, &checkouts) {
+                        RecheckAnswer::Stale(reason) => {
+                            stale_reason.get_or_insert(reason);
+                        }
+                        RecheckAnswer::Current => {}
+                        RecheckAnswer::Unevaluated => unevaluated.push(entry),
+                    }
+                }
+                unevaluated_entries += unevaluated.len();
+                rows.push((context_id.to_string(), stale_reason.clone()));
+                results.push(ContextRecheckResult {
+                    context_id: *context_id,
+                    revision_id,
+                    stale_reason,
+                    unevaluated,
+                });
+            }
+        }
+        self.index.record_stale_reasons(&rows)?;
+        let metadata = self.index.synchronize()?.metadata;
+        Ok(ContextRecheckResponse {
+            evaluated_contexts: results.len(),
+            stale_contexts: results
+                .iter()
+                .filter(|result| result.stale_reason.is_some())
+                .count(),
+            unevaluated_entries,
+            results,
+            tree: metadata.indexed_tree_oid,
+            generation: metadata.projection_generation,
+        })
+    }
+
+    /// Every available local checkout in the Catalog, in Repository order.
+    ///
+    /// A `recheck_when` entry names a commit and a Repository-relative path but not a Repository,
+    /// so evaluation asks each configured checkout in turn and uses the first that knows the
+    /// commit. Deterministic because the Catalog order is.
+    fn recheck_checkouts(&self) -> Result<Vec<PathBuf>> {
+        Ok(self
+            .repositories
+            .list()?
+            .into_iter()
+            .flat_map(|repository| repository.locators)
+            .filter(|locator| {
+                locator.availability == RepositoryAvailability::Available
+                    && locator.checkout_path.is_dir()
+            })
+            .map(|locator| locator.checkout_path)
+            .collect())
     }
 
     fn association_rebuild(
@@ -2358,7 +3805,7 @@ impl Runtime {
             reference_count: projection.references.len(),
             repositories: repository_summaries,
             status_counts,
-            tree: snapshot.metadata.indexed_tree_oid,
+            tree: snapshot.metadata.indexed_tree_oid.clone(),
             generation: snapshot.metadata.projection_generation,
         })
     }
@@ -2470,6 +3917,117 @@ fn artifact_summary(artifact: &sctx_engineering_graph::SnapshotArtifact) -> Arti
         display_name: artifact.artifact.display_name.clone(),
         locator: artifact.artifact.artifact_key.locator().clone(),
     }
+}
+
+/// What one local checkout could say about a structured `recheck_when` entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RecheckAnswer {
+    /// The condition fired; the payload explains it in one sentence.
+    Stale(String),
+    /// The condition was answered and still holds.
+    Current,
+    /// No configured checkout could answer it: unknown commit, missing `git`, or a timeout.
+    Unevaluated,
+}
+
+/// Answers one structured condition against the first checkout that knows its commit.
+fn evaluate_recheck_condition(
+    condition: &RecheckCondition,
+    checkouts: &[PathBuf],
+) -> RecheckAnswer {
+    for checkout in checkouts {
+        let answer = match condition {
+            RecheckCondition::BranchAdvanced { branch, commit } => {
+                let Some(head) = bounded_git(checkout, &["rev-parse", "--verify", branch]) else {
+                    continue;
+                };
+                let head = head.trim();
+                if head.is_empty() {
+                    continue;
+                }
+                if head.starts_with(commit.as_str()) {
+                    RecheckAnswer::Current
+                } else {
+                    RecheckAnswer::Stale(format!(
+                        "branch_advanced: {branch} moved from {commit} to {head}"
+                    ))
+                }
+            }
+            RecheckCondition::FileChangedSince { commit, path } => {
+                if bounded_git(
+                    checkout,
+                    &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+                )
+                .is_none()
+                {
+                    continue;
+                }
+                let Some(changed) = bounded_git(
+                    checkout,
+                    &[
+                        "log",
+                        "--format=%H",
+                        "-1",
+                        &format!("{commit}..HEAD"),
+                        "--",
+                        path,
+                    ],
+                ) else {
+                    continue;
+                };
+                let changed = changed.trim().to_owned();
+                if changed.is_empty() {
+                    RecheckAnswer::Current
+                } else {
+                    RecheckAnswer::Stale(format!(
+                        "file_changed_since: {path} changed after {commit} in {changed}"
+                    ))
+                }
+            }
+        };
+        return answer;
+    }
+    RecheckAnswer::Unevaluated
+}
+
+/// Runs one read-only `git` query under the same bounded timeout Reference derivation uses.
+///
+/// Returns `None` for a missing `git`, a non-zero exit, non-UTF-8 output, or a timeout, so a
+/// broken or slow checkout can never fail or hang the caller.
+fn bounded_git(checkout: &Path, arguments: &[&str]) -> Option<String> {
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut buffer)
+            .ok()
+            .map(|_| buffer)
+    });
+    let deadline = std::time::Instant::now() + reference_derivation::GIT_QUERY_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(_) => break None,
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let output = reader.join().ok().flatten()?;
+    status?.success().then_some(())?;
+    String::from_utf8(output).ok()
 }
 
 fn scan_registered_repositories(
@@ -2672,6 +4230,142 @@ fn active_signal_records(
         .collect())
 }
 
+/// Artifact coordinates one Claim can be compared on: its own refs plus the coordinates the
+/// server derived from its text. Deduplicated and ordered so analysis stays reproducible.
+fn serialize_candidate_reviews(value: &impl Serialize) -> Result<Value> {
+    serde_json::to_value(value).map_err(|error| {
+        Error::new(
+            ErrorKind::Io,
+            format!("serialize Candidate Review response: {error}"),
+        )
+    })
+}
+
+/// Adds the two response-only Candidate Review aids that no Git fact carries: whether the Claim's
+/// applicability was inherited from the Task Intent, and the `problem_view` that confirmation
+/// would write. Both exist so a reviewer can correct them before confirming.
+/// Marks each recommended Space in one serialized Full Review row with whether that Space is
+/// still the server's provisional proposal.
+///
+/// This is response-side only: the stored recommendation carries no such field, and a proposed
+/// new Space is provisional by construction because confirming it is what creates the Space.
+fn insert_space_recommendation_provisional(row: &mut Value, provisional: &BTreeSet<SpaceId>) {
+    let provisional = provisional
+        .iter()
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+    let Some(recommendations) = row
+        .get_mut("space_recommendations")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for recommendation in recommendations {
+        let Some(object) = recommendation.as_object_mut() else {
+            continue;
+        };
+        let is_provisional = match object.get("kind").and_then(Value::as_str) {
+            Some("proposed_new_space_intent") => true,
+            Some("existing") => object
+                .get("space_id")
+                .and_then(Value::as_str)
+                .is_some_and(|space_id| provisional.contains(space_id)),
+            _ => continue,
+        };
+        object.insert("provisional".to_owned(), Value::Bool(is_provisional));
+    }
+}
+
+fn insert_review_aids(
+    runtime: &Runtime,
+    row: &mut Value,
+    view: &CandidateReviewView,
+) -> Result<()> {
+    let derived = match view.content.problem_view.clone() {
+        Some(problem_view) => Some(problem_view),
+        None => runtime.derived_problem_view(view.source_episode)?,
+    };
+    let Some(object) = row.as_object_mut() else {
+        return Ok(());
+    };
+    object.insert(
+        "applicability_inherited".to_owned(),
+        Value::Bool(APPLICABILITY_INHERITED),
+    );
+    if let Some(problem_view) = derived {
+        object.insert(
+            "derived_problem_view".to_owned(),
+            Value::String(problem_view),
+        );
+    }
+    Ok(())
+}
+
+/// Adds the non-blocking Chinese-default advisory to one serialized full Review row.
+fn insert_language_hint(row: &mut Value, statement: &str) {
+    let Some(hint) = language_hint(statement) else {
+        return;
+    };
+    if let Some(object) = row.as_object_mut() {
+        object.insert("language_hint".to_owned(), Value::String(hint));
+    }
+}
+
+/// Upper bound on a derived `problem_view`. It is a retrieval and orientation aid, not a second
+/// copy of the Intent, so it is truncated rather than allowed to grow with the Task.
+const MAX_DERIVED_PROBLEM_VIEW_CHARS: usize = 400;
+
+/// Renders one Working Intent as the problem a Context answers: the goal first, then the declared
+/// scope, then what stayed open. Returns `None` when the Intent says nothing usable.
+fn compose_problem_view(intent: &WorkingIntentSnapshot) -> Option<String> {
+    let mut parts = Vec::new();
+    let goal = intent.goal.trim();
+    if !goal.is_empty() {
+        parts.push(goal.to_owned());
+    }
+    for (label, values) in [
+        ("In scope", &intent.in_scope),
+        ("Open questions", &intent.open_questions),
+    ] {
+        let joined = values
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ");
+        if !joined.is_empty() {
+            parts.push(format!("{label}: {joined}"));
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let composed = parts.join(" | ");
+    if composed.chars().count() <= MAX_DERIVED_PROBLEM_VIEW_CHARS {
+        return Some(composed);
+    }
+    let mut truncated = composed
+        .chars()
+        .take(MAX_DERIVED_PROBLEM_VIEW_CHARS - 1)
+        .collect::<String>();
+    truncated.push('…');
+    Some(truncated)
+}
+
+fn candidate_artifact_refs(claim: &CheckpointClaim) -> Vec<ArtifactRef> {
+    let mut refs = claim.artifact_refs.clone();
+    for reference in &claim.engineering_references {
+        let derived = ArtifactRef {
+            repository_id: reference.repository_id.clone(),
+            locator: reference.locator.clone(),
+        };
+        if !refs.contains(&derived) {
+            refs.push(derived);
+        }
+    }
+    refs
+}
+
 fn build_claim_material(
     episode: &WorkEpisodeView,
     final_checkpoint: &sctx_domain::AgentCheckpoint,
@@ -2731,7 +4425,31 @@ fn build_claim_material(
             None
         }
     });
+    // Path and identifier spellings the Checkpoint's own Evidence text carried but the checkout
+    // could not place. They are retrieval text only, never graph facts, and are recomputed from
+    // the persisted Claim so a rebuild reproduces the same searchable Candidate.
+    let evidence_summaries = evidence
+        .iter()
+        .filter_map(|snapshot| {
+            snapshot
+                .content
+                .get("summary")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    let hints = reference_derivation::claim_hints(
+        &claim.statement,
+        &claim.rationale,
+        &evidence_summaries
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        &claim.engineering_references,
+    );
     let draft = error_code.is_none().then(|| ContextRevisionDraft {
+        problem_view: None,
+        hints,
         kind,
         topic_key: claim.topic_key_hint.clone(),
         statement: claim.statement.clone(),
@@ -2947,6 +4665,13 @@ fn deduplicate_candidate_evidence(evidence: &mut Vec<EvidenceSnapshotDraft>) {
     });
 }
 
+/// Identity of one committed Candidate submission, as the Builder records it.
+struct CandidateSubmissionOutcomeRecord {
+    candidate_id: CandidateId,
+    event_id: EventId,
+    status: CandidateSubmissionStatus,
+}
+
 fn candidate_builder_error_code(error: &Error) -> &'static str {
     match error.kind() {
         ErrorKind::IdempotencyKeyConflict => "idempotency_key_conflict",
@@ -3013,7 +4738,124 @@ fn candidate_build_response(
                 })
             })
             .collect::<Result<Vec<_>>>()?,
+        duplicates: view
+            .duplicates
+            .into_iter()
+            .map(|duplicate| CandidateBuildDuplicateSummary {
+                checkpoint_id: duplicate.checkpoint_id,
+                claim_id: duplicate.claim_id,
+                duplicate_of_candidate_id: duplicate.duplicate_of_candidate_id,
+                similarity_basis_points: duplicate.similarity_basis_points,
+            })
+            .collect(),
     })
+}
+
+/// Server-owned plan for one validated Candidate Confirmation that has not been written yet.
+struct PreparedCandidateConfirmation {
+    candidate_id: sctx_domain::CandidateId,
+    proposed_plan: CandidateConfirmationPlan,
+    proposed_space_group_key: Option<ProposedSpaceGroupKey>,
+    assessments: Vec<CandidateRelationAssessment>,
+}
+
+/// One reserved server-owned plan waiting for its shared Git batch.
+struct ReservedCandidateConfirmation {
+    candidate_id: sctx_domain::CandidateId,
+    plan: CandidateConfirmationPlan,
+    assessments: Vec<CandidateRelationAssessment>,
+}
+
+/// Git and Runtime result of writing one reserved plan.
+struct WrittenCandidateConfirmation {
+    append: AppendBatchOutcome,
+    already_confirmed: bool,
+}
+
+/// Maximum Candidates one batch Review decision may carry.
+const MAX_CANDIDATE_BATCH_ITEMS: usize = 32;
+
+/// Chooses the single or batch `candidate_discard` shape from the exact declared field.
+fn decode_candidate_discard_request(
+    arguments: Value,
+) -> std::result::Result<CandidateDiscardRequest, ToolFailure> {
+    if candidate_batch_requested(&arguments) {
+        decode_arguments(arguments).map(|input| CandidateDiscardRequest::Batch(Box::new(input)))
+    } else {
+        decode_arguments(arguments).map(|input| CandidateDiscardRequest::Single(Box::new(input)))
+    }
+}
+
+/// Chooses the single or batch `candidate_confirm` shape from the exact declared field.
+fn decode_candidate_confirm_request(
+    arguments: Value,
+) -> std::result::Result<CandidateConfirmRequest, ToolFailure> {
+    if candidate_batch_requested(&arguments) {
+        decode_arguments(arguments).map(|input| CandidateConfirmRequest::Batch(Box::new(input)))
+    } else {
+        decode_arguments(arguments).map(|input| CandidateConfirmRequest::Single(Box::new(input)))
+    }
+}
+
+fn candidate_batch_requested(arguments: &Value) -> bool {
+    arguments
+        .as_object()
+        .is_some_and(|object| object.contains_key("candidate_ids"))
+}
+
+fn parse_batch_candidate_ids(values: &[String]) -> Result<Vec<sctx_domain::CandidateId>> {
+    if values.is_empty() {
+        return Err(invalid("candidate_ids must not be empty"));
+    }
+    if values.len() > MAX_CANDIDATE_BATCH_ITEMS {
+        return Err(invalid(format!(
+            "candidate_ids must not exceed {MAX_CANDIDATE_BATCH_ITEMS} Candidates"
+        )));
+    }
+    let candidate_ids = values
+        .iter()
+        .map(|value| parse_id_value::<sctx_domain::CandidateId>(value, "candidate_ids"))
+        .collect::<Result<Vec<_>>>()?;
+    if candidate_ids.iter().collect::<BTreeSet<_>>().len() != candidate_ids.len() {
+        return Err(invalid("candidate_ids must be unique"));
+    }
+    Ok(candidate_ids)
+}
+
+/// Reports the exact batch member that failed before anything was written.
+fn batch_preparation_error(
+    position: usize,
+    candidate_id: sctx_domain::CandidateId,
+    error: &Error,
+) -> Error {
+    Error::new(
+        error.kind(),
+        format!(
+            "{} (batch item {position}, candidate {candidate_id}); no Candidate in this batch was written",
+            error.message()
+        ),
+    )
+}
+
+/// Normalized statement tokens used only for Builder deduplication.
+fn statement_tokens(statement: &str) -> BTreeSet<String> {
+    sctx_index::normalize_search_text(statement)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Deterministic token Jaccard in basis points.
+fn jaccard_basis_points(left: &BTreeSet<String>, right: &BTreeSet<String>) -> u16 {
+    if left.is_empty() || right.is_empty() {
+        return 0;
+    }
+    let intersection = left.intersection(right).count();
+    let union = left.len() + right.len() - intersection;
+    if union == 0 {
+        return 0;
+    }
+    u16::try_from(intersection.saturating_mul(10_000) / union).unwrap_or(10_000)
 }
 
 fn sync_repository_catalog(
@@ -3062,6 +4904,22 @@ pub fn task_context_readonly_at_root(
     input: &TaskContextReadInput,
 ) -> Result<TaskContextResponse> {
     Runtime::open(root.as_ref())?.task_context_readonly(input)
+}
+
+/// Reads a Context Pack for an already-authoritative `ActiveTask` without mutation, budgeting the
+/// item/association selection itself against the requested `detail_level` instead of only
+/// re-shaping a Full-selected result. Local operator tooling (for example the CLI `--compact`
+/// flag) uses this so a Compact request actually admits more items under one token budget.
+///
+/// # Errors
+///
+/// Returns an input error when no Working Intent update established the Task.
+pub fn task_context_readonly_with_detail_at_root(
+    root: impl AsRef<Path>,
+    input: &TaskContextReadInput,
+    detail_level: ContextPackDetailLevel,
+) -> Result<TaskContextResponse> {
+    Runtime::open(root.as_ref())?.task_context_readonly_with_detail(input, detail_level)
 }
 
 /// Resolves one request-local Artifact Focus under `ActiveTask` Intent CAS and returns its Pack.
@@ -3150,6 +5008,22 @@ pub fn candidate_list_at_root(
     Runtime::open(root.as_ref())?.candidate_list(input)
 }
 
+/// Lists bounded whole Candidate Review summaries for one exact `ActiveTask`, budgeting the
+/// per-review token estimate against the requested `detail_level` instead of only re-shaping a
+/// Full-selected page. Local operator tooling (for example the CLI `--compact` flag) uses this so
+/// a Compact request actually admits more triage rows under one token budget.
+///
+/// # Errors
+///
+/// Returns typed Session, cursor, budget, Runtime, index, or Review assembly errors.
+pub fn candidate_list_with_detail_at_root(
+    root: impl AsRef<Path>,
+    input: &CandidateListInput,
+    detail_level: ContextPackDetailLevel,
+) -> Result<CandidateListResponse> {
+    Runtime::open(root.as_ref())?.candidate_list_with_detail(input, detail_level)
+}
+
 /// Gets one complete untrusted Candidate Review for one exact `ActiveTask`.
 ///
 /// # Errors
@@ -3174,6 +5048,18 @@ pub fn candidate_discard_at_root(
     Runtime::open(root.as_ref())?.candidate_discard(input)
 }
 
+/// Atomically discards several owned Pending Candidate Reviews.
+///
+/// # Errors
+///
+/// Returns typed validation, CAS, conflict or storage errors naming the failing `CandidateId`.
+pub fn candidate_discard_batch_at_root(
+    root: impl AsRef<Path>,
+    input: &CandidateDiscardBatchInput,
+) -> Result<CandidateDiscardBatchResponse> {
+    Runtime::open(root.as_ref())?.candidate_discard_batch(input)
+}
+
 /// Confirms one owned Pending Candidate Review into an atomic knowledge fact closure.
 ///
 /// # Errors
@@ -3184,6 +5070,19 @@ pub fn candidate_confirm_at_root(
     input: &CandidateConfirmInput,
 ) -> Result<CandidateConfirmResponse> {
     Runtime::open(root.as_ref())?.candidate_confirm(input)
+}
+
+/// Confirms several owned Pending Candidates under one Space organization.
+///
+/// # Errors
+///
+/// Returns typed validation, CAS, conflict, privacy or storage errors naming the failing
+/// `CandidateId`; a rejected plan is reported before any Candidate is written.
+pub fn candidate_confirm_batch_at_root(
+    root: impl AsRef<Path>,
+    input: &CandidateConfirmBatchInput,
+) -> Result<CandidateConfirmBatchResponse> {
+    Runtime::open(root.as_ref())?.candidate_confirm_batch(input)
 }
 
 /// Registers and scans one canonical local Git Repository without returning source text.
@@ -3219,7 +5118,27 @@ pub fn association_rebuild_at_root(
     root: impl AsRef<Path>,
     input: &AssociationRebuildInput,
 ) -> Result<AssociationRebuildResponse> {
-    Runtime::open(root.as_ref())?.association_rebuild(input)
+    let runtime = Runtime::open(root.as_ref())?;
+    let response = runtime.association_rebuild(input)?;
+    if !input.diagnose_only {
+        // A rebuild is the moment the local checkouts were just read anyway, so the structured
+        // `recheck_when` evaluation rides along. It is advisory local state: a failure here must
+        // not turn a successful Graph rebuild into an error.
+        let _ = runtime.context_recheck();
+    }
+    Ok(response)
+}
+
+/// Evaluates every accepted Context's structured `recheck_when` entries against local checkouts.
+///
+/// The outcome is recorded in this machine's `context_item.stale_reason` projection column and
+/// never written to Git. It is cleared by any projection rebuild, so re-run it after new Events.
+///
+/// # Errors
+///
+/// Returns typed storage errors. An unanswerable condition is reported, not raised.
+pub fn context_recheck_at_root(root: impl AsRef<Path>) -> Result<ContextRecheckResponse> {
+    Runtime::open(root.as_ref())?.context_recheck()
 }
 
 /// Explains one current Reference resolution without selecting ambiguous candidates.
@@ -3234,13 +5153,93 @@ pub fn association_explain_at_root(
     Runtime::open(root.as_ref())?.association_explain(input)
 }
 
+/// Translates the explicit local `[context_ttl]` policy into query-time retrieval settings.
+const fn context_ttl_settings(policy: &sctx_local_state::ContextTtlPolicy) -> ContextTtlSettings {
+    ContextTtlSettings {
+        validation_seconds: policy.validation_seconds,
+        progress_seconds: policy.progress_seconds,
+        now_unix_seconds: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Reads the installation-local Context usage prior out of Task Runtime state.
+///
+/// Every failure degrades to "no prior": the ranking signal is advisory local state, and a busy
+/// or unreadable Runtime database must never turn a retrieval into an error or a different Pack
+/// than the one an installation without recorded usage would return.
+#[derive(Clone, Debug)]
+struct RuntimeUsagePrior {
+    tasks: TaskRuntime,
+}
+
+impl UsagePriorSource for RuntimeUsagePrior {
+    fn usage_counts(&self, context_ids: &[ContextId]) -> BTreeMap<ContextId, ContextUsageCounts> {
+        self.tasks
+            .context_usage_totals(context_ids)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(context_id, totals)| {
+                (
+                    context_id,
+                    ContextUsageCounts {
+                        reused: totals.reused,
+                        ignored: totals.ignored,
+                        refuted: totals.refuted,
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+/// Records which Contexts one retrieval entry point just handed to the Agent.
+///
+/// The record is disposable local state and strictly best effort: it is written after the
+/// response is already built, and any storage failure is dropped so the Agent still receives the
+/// Pack it was going to receive.
+fn record_injected_contexts(
+    tasks: &TaskRuntime,
+    response: &TaskContextResponse,
+    source: ContextInjectionSource,
+) {
+    let injected = response
+        .items
+        .iter()
+        .map(|item| InjectedContext {
+            context_id: item.context.context_id,
+            revision_id: item.context.revision_id,
+        })
+        .chain(response.compact_items.iter().map(|item| InjectedContext {
+            context_id: item.context_id,
+            revision_id: item.revision_id,
+        }))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if injected.is_empty() {
+        return;
+    }
+    let _ = tasks.record_task_injections(
+        response.task_id,
+        response.intent_revision_id,
+        source,
+        &injected,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_task_context_response(
     index: &ProjectionIndex,
     engineering_graph: Option<&EngineeringProjectionStore>,
+    tasks: &TaskRuntime,
+    injection_source: ContextInjectionSource,
     snapshot: &TaskSessionSnapshot,
     resolved_focus: Option<ResolvedFocus>,
     token_budget: usize,
     max_spaces: usize,
+    detail_level: ContextPackDetailLevel,
+    context_ttl: ContextTtlSettings,
 ) -> Result<TaskContextResponse> {
     let current = snapshot
         .current_intent_revision()
@@ -3253,12 +5252,17 @@ fn build_task_context_response(
     );
     request.resolved_focus = resolved_focus;
     request.max_spaces = max_spaces;
-    let pack = if let Some(engineering_graph) = engineering_graph {
+    let engine = if let Some(engineering_graph) = engineering_graph {
         SearchEngine::with_engineering_graph(index.clone(), engineering_graph.clone())
-            .task_context_pack(&request)?
     } else {
-        SearchEngine::new(index.clone()).task_context_pack(&request)?
+        SearchEngine::new(index.clone())
     };
+    let pack = engine
+        .with_context_ttl(context_ttl)
+        .with_usage_prior(Arc::new(RuntimeUsagePrior {
+            tasks: tasks.clone(),
+        }))
+        .task_context_pack_with_detail(&request, detail_level)?;
     let retrieval_paths = pack
         .items
         .iter()
@@ -3267,15 +5271,19 @@ fn build_task_context_response(
             context_id: item.context.context_id,
             paths: item.retrieval_paths.clone(),
         })
-        .collect();
-    Ok(TaskContextResponse {
+        .collect::<Vec<_>>();
+    let response = TaskContextResponse {
         task_session_id: snapshot.task_session_id,
         task_id: snapshot.task_id,
         intent_revision_id: current.revision_id,
+        detail_level: pack.detail_level,
         candidate_spaces: pack.associations,
+        compact_candidate_spaces: pack.compact_associations,
         items: pack.items,
+        compact_items: pack.compact_items,
         retrieval_paths,
         graph_diagnostics: pack.graph_diagnostics,
+        query_token_explanation: pack.query_token_explanation,
         task_fingerprint: pack.task_fingerprint,
         tree: pack.indexed_tree_oid,
         generation: pack.projection_generation,
@@ -3284,7 +5292,9 @@ fn build_task_context_response(
         token_budget: pack.token_budget,
         estimated_tokens: pack.estimated_tokens,
         omitted: pack.omitted,
-    })
+    };
+    record_injected_contexts(tasks, &response, injection_source);
+    Ok(response)
 }
 
 /// Stateful MCP request dispatcher for one stdio session.
@@ -3299,7 +5309,9 @@ pub struct McpServer {
 #[derive(Clone, Debug)]
 struct AuthorizedCallSnapshot {
     catalog: RepositoryCatalogSnapshot,
-    _scope: AuthorizedSessionScope,
+    scope: AuthorizedSessionScope,
+    /// `[context_ttl]` read from the same `config.toml` read that froze `catalog`.
+    context_ttl: ContextTtlSettings,
 }
 
 impl McpServer {
@@ -3504,7 +5516,7 @@ impl McpServer {
         if let Some(hook) = &self.authorization_linearization_hook {
             hook();
         }
-        if requires_runtime_identity_preflight(&call.name) {
+        let preflight_tasks = if requires_runtime_identity_preflight(&call.name) {
             let runtime_database = self.root.join("state/runtime.sqlite");
             if !runtime_database.is_file() {
                 return Err(identity_target_unavailable(&call.name));
@@ -3512,16 +5524,39 @@ impl McpServer {
             let tasks = TaskRuntime::initialize(&self.root)
                 .map_err(|error| runtime_open_failure(&call.name, error))?;
             authorize_runtime_identity_target(&call.name, &call.arguments, &tasks)?;
+            Some(tasks)
+        } else {
+            None
+        };
+        // A durable Checkpoint ACK is Runtime state only (ADR-0003), so it answers from the
+        // database the identity preflight already opened. Opening the Git store, the retrieval
+        // index and the Repository Registry here would be latency the receipt never spends.
+        if call.name == "task_checkpoint" {
+            let tasks = preflight_tasks.ok_or_else(|| identity_target_unavailable(&call.name))?;
+            let input: TaskCheckpointInput = decode_arguments(call.arguments.clone())?;
+            let response =
+                durable_checkpoint(&tasks, &input).map_err(ToolFailure::task_context_failed)?;
+            return serde_json::to_value(response).map_err(serialization_failure);
         }
-        let runtime = Runtime::open_with_catalog(&self.root, authorization.catalog.clone())
-            .map_err(|error| runtime_open_failure(&call.name, error))?;
+        // Every remaining tool reuses exactly what authorization and the identity preflight
+        // already opened: the frozen Catalog, its `[context_ttl]` from the same read, and the
+        // Task Runtime the preflight resolved this call's identity target against.
+        let runtime = Runtime::open_with_catalog(
+            &self.root,
+            authorization.catalog.clone(),
+            RuntimeOpenParts {
+                session_scope: Some(authorization.scope.clone()),
+                context_ttl: Some(authorization.context_ttl),
+                tasks: preflight_tasks,
+            },
+        )
+        .map_err(|error| runtime_open_failure(&call.name, error))?;
         self.runtime = Some(runtime);
         let arguments = call.arguments.clone();
         match call.name.as_str() {
             "task_intent_update" => self.task_intent_update(arguments),
             "task_artifact_focus" => self.task_artifact_focus(arguments),
             "task_signal_supersede" => self.task_signal_supersede(arguments),
-            "task_checkpoint" => self.task_checkpoint(arguments),
             "task_context" => self.task_context(arguments),
             "repository_scan" => self.repository_scan(arguments),
             "engineering_reference_record" => self.engineering_reference_record(arguments),
@@ -3540,9 +5575,23 @@ impl McpServer {
 
     fn context_search(&self, arguments: Value) -> ToolResult {
         let input: SearchInput = decode_arguments(arguments)?;
-        let response =
-            SearchEngine::new(self.runtime().index.clone()).search(&input.into_request()?)?;
+        let request = input.into_request()?;
+        let match_mode = request.match_mode;
+        let response = SearchEngine::new(self.runtime().index.clone())
+            .with_context_ttl(self.runtime().context_ttl)
+            .search(&request)?;
         let conflicts = collect_conflicts(&response.results);
+        let coverage_basis_points = response
+            .results
+            .iter()
+            .map(|result| {
+                json!({
+                    "context_id": result.context_id,
+                    "revision_id": result.revision_id,
+                    "coverage_basis_points": result.match_reason.coverage_basis_points,
+                })
+            })
+            .collect::<Vec<_>>();
         let mut data = serde_json::to_value(response).map_err(serialization_failure)?;
         insert_fields(
             &mut data,
@@ -3551,6 +5600,11 @@ impl McpServer {
                     "conflicts",
                     serde_json::to_value(conflicts).map_err(serialization_failure)?,
                 ),
+                (
+                    "match_mode",
+                    serde_json::to_value(match_mode).map_err(serialization_failure)?,
+                ),
+                ("coverage_basis_points", Value::Array(coverage_basis_points)),
                 (
                     "match_reason",
                     json!("structured_filters_and_full_text_rank"),
@@ -3561,31 +5615,64 @@ impl McpServer {
     }
 
     fn task_context(&self, arguments: Value) -> ToolResult {
+        let (arguments, detail_level) = split_detail_level(arguments)?;
         let input: TaskContextReadInput = decode_arguments(arguments)?;
         input.validate()?;
         let response = self
             .runtime()
-            .task_context_readonly(&input)
+            .task_context_readonly_with_detail(&input, detail_level)
             .map_err(ToolFailure::task_context_failed)?;
-        serde_json::to_value(response).map_err(serialization_failure)
+        match detail_level {
+            ContextPackDetailLevel::Compact => {
+                serde_json::to_value(response.compact()).map_err(serialization_failure)
+            }
+            ContextPackDetailLevel::Full => {
+                serde_json::to_value(response).map_err(serialization_failure)
+            }
+        }
     }
 
     fn task_intent_update(&self, arguments: Value) -> ToolResult {
+        let (arguments, detail_level) = split_detail_level(arguments)?;
         let input: TaskIntentUpdateInput = decode_arguments(arguments)?;
         let response = self
             .runtime()
-            .task_intent_update(&input)
+            .task_intent_update_with_detail(&input, detail_level)
             .map_err(ToolFailure::intent_update_failed)?;
-        serde_json::to_value(response).map_err(serialization_failure)
+        match detail_level {
+            ContextPackDetailLevel::Compact => {
+                serde_json::to_value(CompactTaskIntentUpdateResponse {
+                    context: response.context.compact(),
+                    revision_status: response.revision_status,
+                    active_signals: response.active_signals,
+                })
+                .map_err(serialization_failure)
+            }
+            ContextPackDetailLevel::Full => {
+                serde_json::to_value(response).map_err(serialization_failure)
+            }
+        }
     }
 
     fn task_artifact_focus(&self, arguments: Value) -> ToolResult {
+        let (arguments, detail_level) = split_detail_level(arguments)?;
         let input: ArtifactFocusQuery = decode_arguments(arguments)?;
         let response = self
             .runtime()
-            .task_artifact_focus(&input)
+            .task_artifact_focus_with_detail(&input, detail_level)
             .map_err(ToolFailure::task_context_failed)?;
-        serde_json::to_value(response).map_err(serialization_failure)
+        match detail_level {
+            ContextPackDetailLevel::Compact => {
+                serde_json::to_value(CompactArtifactFocusQueryResponse {
+                    resolved_focus: response.resolved_focus,
+                    context: response.context.compact(),
+                })
+                .map_err(serialization_failure)
+            }
+            ContextPackDetailLevel::Full => {
+                serde_json::to_value(response).map_err(serialization_failure)
+            }
+        }
     }
 
     fn task_signal_supersede(&self, arguments: Value) -> ToolResult {
@@ -3593,15 +5680,6 @@ impl McpServer {
         let response = self
             .runtime()
             .task_signal_supersede(&input)
-            .map_err(ToolFailure::task_context_failed)?;
-        serde_json::to_value(response).map_err(serialization_failure)
-    }
-
-    fn task_checkpoint(&self, arguments: Value) -> ToolResult {
-        let input: TaskCheckpointInput = decode_arguments(arguments)?;
-        let response = self
-            .runtime()
-            .task_checkpoint(&input)
             .map_err(ToolFailure::task_context_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
     }
@@ -3704,6 +5782,14 @@ impl McpServer {
                     "intent_heads": space.intent.heads,
                     "titles": titles,
                     "context_count": space.contexts.len(),
+                    // A conflicted Space has no winning head, so it never reports provisional.
+                    "provisional": space.intent.heads.len() == 1
+                        && space
+                            .intent
+                            .heads
+                            .first()
+                            .and_then(|revision_id| space.intent.revisions.get(revision_id))
+                            .is_some_and(|revision| revision.provisional),
                     "conflicts": if space.intent.heads.len() > 1 {
                         vec![json!({"kind": "intent", "status": "open", "heads": space.intent.heads})]
                     } else { Vec::new() },
@@ -3721,63 +5807,88 @@ impl McpServer {
     }
 
     fn candidate_list(&self, arguments: Value) -> ToolResult {
+        let (arguments, detail_level) = split_detail_level(arguments)?;
         let input: CandidateListInput = decode_arguments(arguments)?;
-        self.runtime()
-            .candidate_list(&input)
+        let runtime = self.runtime();
+        runtime
+            .candidate_list_with_detail(&input, detail_level)
             .and_then(|response| {
-                serde_json::to_value(response).map_err(|error| {
-                    Error::new(
-                        ErrorKind::Io,
-                        format!("serialize Candidate Review list: {error}"),
-                    )
-                })
+                if detail_level == ContextPackDetailLevel::Compact {
+                    return serialize_candidate_reviews(&response.compact());
+                }
+                let mut value = serialize_candidate_reviews(&response)?;
+                if let Some(rows) = value.get_mut("reviews").and_then(Value::as_array_mut) {
+                    for (row, summary) in rows.iter_mut().zip(response.reviews.iter()) {
+                        insert_review_aids(runtime, row, &summary.0)?;
+                        insert_language_hint(row, &summary.0.content.statement);
+                        insert_space_recommendation_provisional(
+                            row,
+                            &response.provisional_space_ids,
+                        );
+                    }
+                }
+                Ok(value)
             })
             .map_err(ToolFailure::candidate_review_failed)
     }
 
     fn candidate_get(&self, arguments: Value) -> ToolResult {
         let input: CandidateGetInput = decode_arguments(arguments)?;
-        self.runtime()
+        let runtime = self.runtime();
+        runtime
             .candidate_get(&input)
             .and_then(|response| {
-                serde_json::to_value(response).map_err(|error| {
-                    Error::new(
-                        ErrorKind::Io,
-                        format!("serialize Candidate Review: {error}"),
-                    )
-                })
+                let mut value = serialize_candidate_reviews(&response)?;
+                insert_review_aids(runtime, &mut value, &response)?;
+                insert_space_recommendation_provisional(
+                    &mut value,
+                    &provisional_space_ids(runtime.snapshot()?.as_ref()),
+                );
+                Ok(value)
             })
             .map_err(ToolFailure::candidate_review_failed)
     }
 
     fn candidate_discard(&self, arguments: Value) -> ToolResult {
-        let input: CandidateDiscardInput = decode_arguments(arguments)?;
-        self.runtime()
-            .candidate_discard(&input)
-            .and_then(|response| {
-                serde_json::to_value(response).map_err(|error| {
-                    Error::new(
-                        ErrorKind::Io,
-                        format!("serialize Candidate discard response: {error}"),
-                    )
-                })
+        let runtime = self.runtime();
+        match decode_candidate_discard_request(arguments)? {
+            CandidateDiscardRequest::Single(input) => runtime
+                .candidate_discard(&input)
+                .map(|response| CandidateDiscardOutcome::Single(Box::new(response))),
+            CandidateDiscardRequest::Batch(input) => runtime
+                .candidate_discard_batch(&input)
+                .map(CandidateDiscardOutcome::Batch),
+        }
+        .and_then(|response| {
+            serde_json::to_value(response).map_err(|error| {
+                Error::new(
+                    ErrorKind::Io,
+                    format!("serialize Candidate discard response: {error}"),
+                )
             })
-            .map_err(ToolFailure::candidate_review_failed)
+        })
+        .map_err(ToolFailure::candidate_review_failed)
     }
 
     fn candidate_confirm(&self, arguments: Value) -> ToolResult {
-        let input: CandidateConfirmInput = decode_arguments(arguments)?;
-        self.runtime()
-            .candidate_confirm(&input)
-            .and_then(|response| {
-                serde_json::to_value(response).map_err(|error| {
-                    Error::new(
-                        ErrorKind::Io,
-                        format!("serialize Candidate Confirmation response: {error}"),
-                    )
-                })
+        let runtime = self.runtime();
+        match decode_candidate_confirm_request(arguments)? {
+            CandidateConfirmRequest::Single(input) => runtime
+                .candidate_confirm(&input)
+                .map(|response| CandidateConfirmOutcome::Single(Box::new(response))),
+            CandidateConfirmRequest::Batch(input) => runtime
+                .candidate_confirm_batch(&input)
+                .map(CandidateConfirmOutcome::Batch),
+        }
+        .and_then(|response| {
+            serde_json::to_value(response).map_err(|error| {
+                Error::new(
+                    ErrorKind::Io,
+                    format!("serialize Candidate Confirmation response: {error}"),
+                )
             })
-            .map_err(ToolFailure::candidate_review_failed)
+        })
+        .map_err(ToolFailure::candidate_review_failed)
     }
 }
 
@@ -3838,7 +5949,7 @@ impl ToolFailure {
             code: "session_not_authorized",
             error: Error::new(
                 ErrorKind::External,
-                "Shared Context MCP call is not authorized for this Agent Session",
+                "Shared Context MCP call is not authorized for this Agent Session: external_session_id must be the host session id shown in the <shared-context-active> marker (Codex: also $CODEX_SESSION_ID; Cursor: the conversation id); do not invent one",
             ),
         }
     }
@@ -4066,6 +6177,9 @@ struct SearchInput {
     page_size: usize,
     #[serde(default)]
     cursor: Option<String>,
+    /// Defaults to `ranked`; `exact` keeps the strict all-tokens lookup.
+    #[serde(default)]
+    match_mode: SearchMatchMode,
 }
 
 impl SearchInput {
@@ -4088,6 +6202,7 @@ impl SearchInput {
             },
             page_size: self.page_size,
             cursor: self.cursor,
+            match_mode: self.match_mode,
         })
     }
 }
@@ -4133,6 +6248,26 @@ fn runtime_open_failure(name: &str, error: Error) -> ToolFailure {
     }
 }
 
+/// Splits the optional `detail_level` selector out of one tool call. Every strict input struct
+/// keeps `deny_unknown_fields`, so the selector is removed before the typed decode and defaults to
+/// [`ContextPackDetailLevel::Compact`] when absent.
+fn split_detail_level(
+    mut arguments: Value,
+) -> std::result::Result<(Value, ContextPackDetailLevel), ToolFailure> {
+    let selector = arguments
+        .as_object_mut()
+        .and_then(|object| object.remove("detail_level"));
+    let detail_level = match selector {
+        None => ContextPackDetailLevel::default(),
+        Some(value) => serde_json::from_value(value).map_err(|error| {
+            ToolFailure::from(invalid(format!(
+                "detail_level must be \"compact\" or \"full\": {error}"
+            )))
+        })?,
+    };
+    Ok((arguments, detail_level))
+}
+
 fn validate_public_arguments(
     name: &str,
     arguments: &Value,
@@ -4142,22 +6277,32 @@ fn validate_public_arguments(
             let _: $input = decode_arguments(arguments.clone())?;
         }};
     }
+    macro_rules! decode_detail_leveled {
+        ($input:ty) => {{
+            let (arguments, _) = split_detail_level(arguments.clone())?;
+            let _: $input = decode_arguments(arguments)?;
+        }};
+    }
     match name {
-        "task_intent_update" => decode!(TaskIntentUpdateInput),
-        "task_artifact_focus" => decode!(ArtifactFocusQuery),
+        "task_intent_update" => decode_detail_leveled!(TaskIntentUpdateInput),
+        "task_artifact_focus" => decode_detail_leveled!(ArtifactFocusQuery),
         "task_signal_supersede" => decode!(TaskSignalSupersedeInput),
         "task_checkpoint" => decode!(TaskCheckpointInput),
-        "task_context" => decode!(TaskContextReadInput),
+        "task_context" => decode_detail_leveled!(TaskContextReadInput),
         "repository_scan" => decode!(McpRepositoryScanInput),
         "engineering_reference_record" => decode!(McpEngineeringReferenceRecordInput),
         "association_explain" => decode!(McpAssociationExplainInput),
         "association_rebuild" => decode!(McpAssociationRebuildInput),
         "context_search" => decode!(SearchInput),
         "context_get" => decode!(GetInput),
-        "candidate_list" => decode!(CandidateListInput),
+        "candidate_list" => decode_detail_leveled!(CandidateListInput),
         "candidate_get" => decode!(CandidateGetInput),
-        "candidate_discard" => decode!(CandidateDiscardInput),
-        "candidate_confirm" => decode!(CandidateConfirmInput),
+        "candidate_discard" => {
+            let _ = decode_candidate_discard_request(arguments.clone())?;
+        }
+        "candidate_confirm" => {
+            let _ = decode_candidate_confirm_request(arguments.clone())?;
+        }
         "space_list" => decode!(SessionInput),
         _ => unreachable!("public tool name was checked"),
     }
@@ -4190,7 +6335,9 @@ fn authorize_public_call(
     // authorization linearization point. Later expiry, SessionEnd, or Catalog replacement affects
     // the next call; this call carries the frozen Catalog and allowed Repository identities.
     let authorization = || -> Result<AuthorizedCallSnapshot> {
-        let catalog = UserConfigStore::open_existing(root)?.repository_catalog()?;
+        let (catalog, context_ttl) =
+            UserConfigStore::open_existing(root)?.repository_catalog_with_context_ttl()?;
+        let context_ttl = context_ttl_settings(&context_ttl);
         let store = AuthorizedSessionScopeStore::initialize(root)?;
         match store.try_read(locator, &catalog)? {
             AuthorizedSessionScopeRead::Current(scope)
@@ -4199,7 +6346,8 @@ fn authorize_public_call(
             {
                 Ok(AuthorizedCallSnapshot {
                     catalog,
-                    _scope: scope,
+                    scope,
+                    context_ttl,
                 })
             }
             AuthorizedSessionScopeRead::Missing
@@ -4259,28 +6407,46 @@ fn authorize_runtime_identity_target(
                 &input.candidate_id,
             )?;
         }
-        "candidate_discard" => {
-            let input: CandidateDiscardInput = serde_json::from_value(arguments.clone())
-                .map_err(|error| ToolFailure::from(invalid(error.to_string())))?;
-            require_owned_task_and_candidate(
+        "candidate_discard" => match decode_candidate_discard_request(arguments.clone())? {
+            CandidateDiscardRequest::Single(input) => require_owned_task_and_candidate(
                 tasks,
                 &input.agent_kind,
                 &input.external_session_id,
                 &input.expected_task_id,
                 &input.candidate_id,
-            )?;
-        }
-        "candidate_confirm" => {
-            let input: CandidateConfirmInput = serde_json::from_value(arguments.clone())
-                .map_err(|error| ToolFailure::from(invalid(error.to_string())))?;
-            require_owned_task_and_candidate(
+            )?,
+            CandidateDiscardRequest::Batch(input) => {
+                for candidate_id in &input.candidate_ids {
+                    require_owned_task_and_candidate(
+                        tasks,
+                        &input.agent_kind,
+                        &input.external_session_id,
+                        &input.expected_task_id,
+                        candidate_id,
+                    )?;
+                }
+            }
+        },
+        "candidate_confirm" => match decode_candidate_confirm_request(arguments.clone())? {
+            CandidateConfirmRequest::Single(input) => require_owned_task_and_candidate(
                 tasks,
                 &input.agent_kind,
                 &input.external_session_id,
                 &input.expected_task_id,
                 &input.candidate_id,
-            )?;
-        }
+            )?,
+            CandidateConfirmRequest::Batch(input) => {
+                for candidate_id in &input.candidate_ids {
+                    require_owned_task_and_candidate(
+                        tasks,
+                        &input.agent_kind,
+                        &input.external_session_id,
+                        &input.expected_task_id,
+                        candidate_id,
+                    )?;
+                }
+            }
+        },
         _ => {}
     }
     Ok(())
@@ -4352,12 +6518,12 @@ fn tools_list() -> Value {
     json!({"tools": [
         tool_schema(
             "task_intent_update",
-            "CAS-record a lightweight Working Intent snapshot, optionally start a new explicit Task, and return its TaskContextPack.",
+            "CAS-record a lightweight Working Intent snapshot, optionally start a new explicit Task, and return its TaskContextPack. detail_level defaults to compact, which returns only the inheritable Context fields; pass full for retrieval paths, match reasons, and the automatic query token explanation.",
             task_intent_update_schema()
         ),
         tool_schema(
             "task_artifact_focus",
-            "Declare one current File/Module/Symbol/API/Schema/Test focus under ActiveTask CAS and immediately retrieve exact historical Graph context. Repository identity and relative path are resolved by the configured local Catalog.",
+            "Declare one current File/Module/Symbol/API/Schema/Test focus under ActiveTask CAS and immediately retrieve exact historical Graph context. Repository identity and relative path are resolved by the configured local Catalog. detail_level defaults to compact.",
             task_artifact_focus_schema()
         ),
         tool_schema(
@@ -4372,7 +6538,7 @@ fn tools_list() -> Value {
         ),
         tool_schema(
             "task_context",
-            "Read the Context Pack for an existing authoritative ActiveTask without changing runtime state.",
+            "Read the Context Pack for an existing authoritative ActiveTask without changing runtime state. detail_level defaults to compact; omitted Contexts are named by context_id and title so they can be read explicitly.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -4381,7 +6547,8 @@ fn tools_list() -> Value {
                     "agent_kind": {"type": "string", "minLength": 1},
                     "external_session_id": {"type": "string", "minLength": 1},
                     "token_budget": {"type": "integer", "minimum": MIN_TASK_CONTEXT_TOKEN_BUDGET, "default": 2000},
-                    "max_spaces": {"type": "integer", "minimum": 1, "maximum": MAX_TASK_MAX_SPACES, "default": DEFAULT_TASK_MAX_SPACES}
+                    "max_spaces": {"type": "integer", "minimum": 1, "maximum": MAX_TASK_MAX_SPACES, "default": DEFAULT_TASK_MAX_SPACES},
+                    "detail_level": detail_level_schema()
                 }
             })
         ),
@@ -4425,7 +6592,7 @@ fn tools_list() -> Value {
         ),
         tool_schema(
             "context_search",
-            "Search Context revisions with stable filters, pagination, conflicts, and match reasons.",
+            "Search Context revisions with stable filters, pagination, conflicts, and match reasons. match_mode defaults to ranked (any token, ordered by BM25 and query token coverage); pass exact for the strict all-tokens lookup.",
             search_schema()
         ),
         tool_schema(
@@ -4446,7 +6613,7 @@ fn tools_list() -> Value {
         ),
         tool_schema(
             "candidate_list",
-            "List whole untrusted automatic Candidate Review summaries for the exact ActiveTask; Pending is the default lifecycle filter.",
+            "List untrusted automatic Candidate Reviews for the exact ActiveTask; Pending is the default lifecycle filter. detail_level defaults to compact, which returns one triage row per Candidate; pass full for the whole untrusted drafts, or read one with candidate_get.",
             candidate_list_schema()
         ),
         tool_schema(
@@ -4515,7 +6682,8 @@ fn task_artifact_focus_schema() -> Value {
             "absolute_file_path": {"type": "string", "minLength": 1},
             "locator": task_artifact_focus_coordinates_schema(),
             "token_budget": {"type": "integer", "minimum": MIN_TASK_CONTEXT_TOKEN_BUDGET, "default": 2000},
-            "max_spaces": {"type": "integer", "minimum": 1, "maximum": MAX_TASK_MAX_SPACES, "default": DEFAULT_TASK_MAX_SPACES}
+            "max_spaces": {"type": "integer", "minimum": 1, "maximum": MAX_TASK_MAX_SPACES, "default": DEFAULT_TASK_MAX_SPACES},
+            "detail_level": detail_level_schema()
         }
     })
 }
@@ -4701,8 +6869,19 @@ fn task_intent_update_schema() -> Value {
                     "interface_hints": intent_list(),
                     "open_questions": intent_list()
                 }
-            }
+            },
+            "detail_level": detail_level_schema()
         }
+    })
+}
+
+/// Optional Task Context payload shape shared by every retrieval tool.
+fn detail_level_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["compact", "full"],
+        "default": "compact",
+        "description": "compact returns only the inheritable fact fields; full returns the explainable payload with retrieval paths and match reasons."
     })
 }
 
@@ -4814,7 +6993,13 @@ fn search_schema() -> Value {
             "kinds": kind_array_schema(),
             "statuses": {"type": "array", "items": {"type": "string", "enum": ["candidate", "accepted", "deprecated", "superseded", "governance_conflict"]}},
             "page_size": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20},
-            "cursor": {"type": "string"}
+            "cursor": {"type": "string"},
+            "match_mode": {
+                "type": "string",
+                "enum": ["ranked", "exact"],
+                "default": "ranked",
+                "description": "ranked matches any query token and orders by BM25 combined with query token coverage; exact requires every token."
+            }
         }
     })
 }
@@ -4842,7 +7027,8 @@ fn candidate_list_schema() -> Value {
                 "type": "integer", "minimum": MIN_CANDIDATE_REVIEW_TOKEN_BUDGET,
                 "maximum": MAX_CANDIDATE_REVIEW_TOKEN_BUDGET,
                 "default": DEFAULT_CANDIDATE_REVIEW_TOKEN_BUDGET
-            }
+            },
+            "detail_level": detail_level_schema()
         }
     })
 }
@@ -4866,7 +7052,11 @@ fn candidate_discard_schema() -> Value {
         "additionalProperties": false,
         "required": [
             "agent_kind", "external_session_id", "expected_task_id",
-            "expected_intent_revision_id", "candidate_id", "expected_review_version", "reason"
+            "expected_intent_revision_id", "expected_review_version", "reason"
+        ],
+        "oneOf": [
+            {"required": ["candidate_id"]},
+            {"required": ["candidate_ids"]}
         ],
         "properties": {
             "agent_kind": {"type": "string", "minLength": 1},
@@ -4874,6 +7064,11 @@ fn candidate_discard_schema() -> Value {
             "expected_task_id": id_schema("tsk_"),
             "expected_intent_revision_id": id_schema("tir_"),
             "candidate_id": id_schema("cnd_"),
+            "candidate_ids": {
+                "type": "array", "uniqueItems": true,
+                "minItems": 1, "maxItems": MAX_CANDIDATE_BATCH_ITEMS,
+                "items": id_schema("cnd_")
+            },
             "expected_review_version": {"type": "integer", "minimum": 1},
             "reason": {"type": "string", "minLength": 1, "maxLength": 512}
         }
@@ -4886,8 +7081,12 @@ fn candidate_confirm_schema() -> Value {
         "additionalProperties": false,
         "required": [
             "agent_kind", "external_session_id", "expected_task_id",
-            "expected_intent_revision_id", "candidate_id", "expected_review_version",
+            "expected_intent_revision_id", "expected_review_version",
             "primary", "related_space_ids"
+        ],
+        "oneOf": [
+            {"required": ["candidate_id"]},
+            {"required": ["candidate_ids"], "not": {"required": ["edits"]}}
         ],
         "properties": {
             "agent_kind": {"type": "string", "minLength": 1},
@@ -4895,6 +7094,11 @@ fn candidate_confirm_schema() -> Value {
             "expected_task_id": id_schema("tsk_"),
             "expected_intent_revision_id": id_schema("tir_"),
             "candidate_id": id_schema("cnd_"),
+            "candidate_ids": {
+                "type": "array", "uniqueItems": true,
+                "minItems": 1, "maxItems": MAX_CANDIDATE_BATCH_ITEMS,
+                "items": id_schema("cnd_")
+            },
             "expected_review_version": {"type": "integer", "minimum": 1},
             "primary": {
                 "oneOf": [
@@ -4944,8 +7148,26 @@ fn candidate_edits_schema() -> Value {
                     }
                 ]
             },
+            "problem_view": {
+                "oneOf": [
+                    {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["action", "value"],
+                        "properties": {
+                            "action": {"const": "set"},
+                            "value": {"type": "string", "minLength": 1}
+                        }
+                    },
+                    {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["action"],
+                        "properties": {"action": {"const": "clear"}}
+                    }
+                ]
+            },
             "statement": {"type": "string", "minLength": 1},
             "rationale": {"type": "string", "minLength": 1},
+            "hints": string_array_schema(),
             "applicability": {
                 "type": "object", "additionalProperties": false,
                 "properties": {
@@ -5003,6 +7225,7 @@ fn context_relation_schema() -> Value {
                 sctx_domain::ContextRelationKind::Implements,
                 sctx_domain::ContextRelationKind::ValidatedBy,
                 sctx_domain::ContextRelationKind::Contradicts,
+                sctx_domain::ContextRelationKind::Supersedes,
                 sctx_domain::ContextRelationKind::RelatedTo,
             ]),
             "rationale": {"type": "string", "minLength": 1},
@@ -5369,7 +7592,7 @@ const fn default_candidate_review_token_budget() -> usize {
     DEFAULT_CANDIDATE_REVIEW_TOKEN_BUDGET
 }
 
-fn estimate_candidate_review_tokens(summary: &CandidateReviewSummary) -> Result<usize> {
+fn estimate_candidate_review_tokens(summary: &impl Serialize) -> Result<usize> {
     let bytes = serde_json::to_vec(summary)
         .map_err(|error| Error::new(ErrorKind::Io, format!("serialize Review summary: {error}")))?;
     Ok(bytes.len().div_ceil(4).max(1))
@@ -5490,6 +7713,132 @@ const fn error_code(kind: ErrorKind) -> &'static str {
     }
 }
 
+/// Turns every `contradicts` Relation on the confirming revision into a `SemanticConflictOpened`
+/// reservation, so confirming a contradiction is the same batch as declaring it.
+///
+/// A target that is not currently accepted has no publication head to name as the other side, so
+/// it is skipped instead of failing the Confirmation: the Relation itself is still recorded.
+/// A pair already covered by an open conflict is skipped too, which is what makes a same-content
+/// re-confirmation (a duplicate Candidate carrying the identical draft) idempotent rather than
+/// conflict-spamming.
+fn contradiction_conflict_openings(
+    snapshot: &DomainSnapshot,
+    final_draft: &ContextRevisionDraft,
+    primary_space_id: Option<SpaceId>,
+    final_content_hash: &str,
+) -> Vec<SemanticConflictOpeningDraft> {
+    let mut openings = Vec::new();
+    for relation in final_draft
+        .relations
+        .iter()
+        .filter(|relation| relation.kind == ContextRelationKind::Contradicts)
+    {
+        let Some(target) =
+            projectable_conflict_participant(snapshot, final_draft, primary_space_id, relation)
+        else {
+            continue;
+        };
+        if conflict_already_open(snapshot, relation.target_context_id, final_content_hash) {
+            continue;
+        }
+        openings.push(SemanticConflictOpeningDraft {
+            target,
+            reason: relation.rationale.clone(),
+        });
+    }
+    openings
+}
+
+/// The other conflict side, but only when the reducer would admit the resulting conflict.
+///
+/// A `SemanticConflictOpened` Event is only projected when both sides are accepted publish heads
+/// in one Space, both are `decision` or `contract`, both carry the same `topic_key`, and their
+/// applicabilities overlap. Emitting one that fails those rules would write a permanently
+/// diagnostic Event, so a contradiction that cannot be projected records only its Relation.
+fn projectable_conflict_participant(
+    snapshot: &DomainSnapshot,
+    final_draft: &ContextRevisionDraft,
+    primary_space_id: Option<SpaceId>,
+    relation: &ContextRelation,
+) -> Option<ConflictParticipant> {
+    if !conflictable_kind(final_draft.kind) {
+        return None;
+    }
+    let (space_id, context) = find_context(snapshot, None, relation.target_context_id).ok()?;
+    if primary_space_id != Some(space_id) {
+        return None;
+    }
+    let ContextGovernanceStatus::Accepted {
+        publication_id,
+        revision_id,
+    } = context.governance
+    else {
+        return None;
+    };
+    let target = &context.revisions.get(&revision_id)?.revision;
+    if !conflictable_kind(target.kind)
+        || target.topic_key != final_draft.topic_key
+        || !applicability_overlaps(&final_draft.applicability, &target.applicability)
+    {
+        return None;
+    }
+    Some(ConflictParticipant {
+        context_id: relation.target_context_id,
+        revision_id,
+        publication_id,
+    })
+}
+
+/// Only settled `decision` and `contract` statements can semantically conflict.
+const fn conflictable_kind(kind: ContextKind) -> bool {
+    matches!(kind, ContextKind::Decision | ContextKind::Contract)
+}
+
+/// Mirrors the reducer's V1 rule: an omitted dimension is unrestricted, otherwise an exact match.
+fn applicability_overlaps(left: &Applicability, right: &Applicability) -> bool {
+    let dimension = |left: &[String], right: &[String]| {
+        left.is_empty() || right.is_empty() || left.iter().any(|value| right.contains(value))
+    };
+    dimension(&left.domains, &right.domains)
+        && dimension(&left.platforms, &right.platforms)
+        && dimension(&left.conditions, &right.conditions)
+}
+
+/// Whether an unresolved conflict already pairs `target_context_id` with this exact content.
+fn conflict_already_open(
+    snapshot: &DomainSnapshot,
+    target_context_id: ContextId,
+    final_content_hash: &str,
+) -> bool {
+    snapshot
+        .projection
+        .semantic_conflicts
+        .values()
+        .filter(|projection| matches!(projection.status, SemanticConflictStatus::Open { .. }))
+        .any(|projection| {
+            projection
+                .conflict
+                .participants
+                .iter()
+                .any(|participant| participant.context_id == target_context_id)
+                && projection.conflict.participants.iter().any(|participant| {
+                    accepted_content_hash(snapshot, participant.context_id).as_deref()
+                        == Some(final_content_hash)
+                })
+        })
+}
+
+/// Content hash of one Context's currently accepted revision, excluding generated identities.
+fn accepted_content_hash(snapshot: &DomainSnapshot, context_id: ContextId) -> Option<String> {
+    let (_, context) = find_context(snapshot, None, context_id).ok()?;
+    let ContextGovernanceStatus::Accepted { revision_id, .. } = context.governance else {
+        return None;
+    };
+    context.revisions.get(&revision_id).map(|projection| {
+        context_revision_content_hash(&context_revision_as_draft(&projection.revision))
+    })
+}
+
 fn validate_context_relation_targets(
     snapshot: &DomainSnapshot,
     relations: &[ContextRelation],
@@ -5533,6 +7882,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn language_hint_only_flags_statements_without_any_chinese() {
+        assert_eq!(
+            language_hint("The reviewed branch preserves runtime service resolution"),
+            Some(CHINESE_KNOWLEDGE_BASE_HINT.to_owned())
+        );
+        assert_eq!(
+            language_hint("PoiEntranceAssem.kt:202 的 null 保护发生得过晚"),
+            None,
+            "a Chinese statement keeps its Latin identifiers and needs no advisory"
+        );
+        assert_eq!(language_hint("仅中文"), None);
+    }
+
+    #[test]
     fn intent_update_conflict_and_stale_errors_have_intent_specific_codes() {
         let conflict = ToolFailure::intent_update_failed(Error::new(
             ErrorKind::Conflict,
@@ -5544,5 +7907,204 @@ mod tests {
         ));
         assert_eq!(conflict.code, "intent_conflict");
         assert_eq!(stale.code, "intent_stale");
+    }
+
+    #[test]
+    fn full_review_rows_mark_every_recommended_space_as_provisional_or_not() {
+        let provisional_space = SpaceId::new();
+        let named_space = SpaceId::new();
+        let mut row = json!({
+            "space_recommendations": [
+                {"kind": "existing", "space_id": provisional_space.to_string()},
+                {"kind": "existing", "space_id": named_space.to_string()},
+                {"kind": "proposed_new_space_intent", "recommendation_id": "srx"},
+            ]
+        });
+        insert_space_recommendation_provisional(&mut row, &BTreeSet::from([provisional_space]));
+        let rows = row["space_recommendations"].as_array().unwrap();
+        assert_eq!(rows[0]["provisional"], Value::Bool(true));
+        assert_eq!(rows[1]["provisional"], Value::Bool(false));
+        // Confirming a proposed recommendation is what creates the Space, so it is always
+        // provisional and needs no lookup.
+        assert_eq!(rows[2]["provisional"], Value::Bool(true));
+    }
+
+    /// Builds one provisional Space by patching the serialized `space.created` event: only
+    /// Candidate Confirmation writes the flag, and this test is about how the flag is read.
+    fn provisional_space_event(title: &str) -> Event {
+        let human = Event::space_created(advisory_intent(title), None).expect("valid Intent");
+        let mut json = serde_json::to_value(&human).expect("event serializes");
+        json["intent_revision"]["provisional"] = Value::Bool(true);
+        let bytes = serde_json::to_vec(&json).expect("event serializes");
+        sctx_event_schema::parse_event(&bytes)
+            .expect("patched event stays a valid V1 event")
+            .known()
+            .expect("patched event stays a known V1 event")
+            .clone()
+    }
+
+    fn advisory_intent(title: &str) -> sctx_domain::IntentSnapshot {
+        sctx_domain::IntentSnapshot {
+            title: title.to_owned(),
+            problem: "provisional Spaces accumulate without a human boundary".to_owned(),
+            desired_outcome: "a reviewer names or merges the Space".to_owned(),
+            in_scope: vec!["provisional Space advisories".to_owned()],
+            out_of_scope: vec!["automatic merging".to_owned()],
+            acceptance_conditions: vec!["the advisory only nudges".to_owned()],
+            domain_terms: vec!["space".to_owned()],
+        }
+    }
+
+    fn advisory_context(statement: &str, relations: Vec<ContextRelation>) -> ContextRevisionDraft {
+        ContextRevisionDraft {
+            kind: ContextKind::Discovery,
+            topic_key: None,
+            problem_view: None,
+            statement: statement.to_owned(),
+            rationale: "recorded by the advisory fixture".to_owned(),
+            applicability: Applicability::default(),
+            assumptions: Vec::new(),
+            recheck_when: Vec::new(),
+            hints: Vec::new(),
+            relations,
+            evidence: vec![EvidenceSnapshotDraft {
+                kind: EvidenceType::ExperimentRecord,
+                supports: statement.to_owned(),
+                content: json!({"command": "fixture", "actual": "recorded"}),
+                interpretation: "fixture observation".to_owned(),
+                limitations: vec!["fixture".to_owned()],
+            }],
+        }
+    }
+
+    /// Appends one accepted Context and returns its `ContextId`.
+    fn accept_context(
+        store: &GitStore,
+        space_id: SpaceId,
+        statement: &str,
+        relations: Vec<ContextRelation>,
+    ) -> ContextId {
+        let event =
+            Event::context_revision_added(space_id, advisory_context(statement, relations), None)
+                .expect("valid Context revision");
+        let (context_id, revision_id) = match event.payload() {
+            EventPayload::ContextRevisionAdded {
+                context_id,
+                revision,
+                ..
+            } => (*context_id, revision.revision_id),
+            _ => unreachable!("context.revision_added"),
+        };
+        store
+            .append_event(AppendRequest::event(event))
+            .expect("append Context revision");
+        let publication = Event::publication_changed(
+            space_id,
+            context_id,
+            sctx_domain::PublicationDraft {
+                previous_publication_ids: Vec::new(),
+                action: sctx_domain::PublicationAction::Publish,
+                revision_id,
+                review_event_ids: Vec::new(),
+            },
+            None,
+        )
+        .expect("valid publication");
+        store
+            .append_event(AppendRequest::event(publication))
+            .expect("append publication");
+        context_id
+    }
+
+    fn space_id_of(event: &Event) -> SpaceId {
+        match event.payload() {
+            EventPayload::SpaceCreated { space_id, .. } => *space_id,
+            _ => unreachable!("space.created"),
+        }
+    }
+
+    #[test]
+    fn only_provisional_spaces_past_the_threshold_or_referenced_get_an_advisory() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let store =
+            GitStore::bootstrap_local(temporary.path().join("installation")).expect("bootstrap");
+        let index = ProjectionIndex::for_store(&store);
+
+        let grown = provisional_space_event("Grown provisional Space");
+        let grown_id = space_id_of(&grown);
+        store
+            .append_event(AppendRequest::event(grown))
+            .expect("append provisional Space");
+        let small = provisional_space_event("Small provisional Space");
+        let small_id = space_id_of(&small);
+        store
+            .append_event(AppendRequest::event(small))
+            .expect("append provisional Space");
+        let human =
+            Event::space_created(advisory_intent("Human named Space"), None).expect("valid Intent");
+        let human_id = space_id_of(&human);
+        store
+            .append_event(AppendRequest::event(human))
+            .expect("append human Space");
+
+        for index_of in 0..PROVISIONAL_SPACE_MERGE_THRESHOLD {
+            accept_context(
+                &store,
+                grown_id,
+                &format!("Grown provisional fact {index_of}"),
+                Vec::new(),
+            );
+        }
+        let small_context = accept_context(
+            &store,
+            small_id,
+            "The only fact in the small provisional Space",
+            Vec::new(),
+        );
+
+        index.synchronize().expect("synchronize");
+        let snapshot = index.domain_snapshot().expect("snapshot");
+        // The small Space is provisional but has one accepted Context and no inbound relation.
+        let advisories = provisional_space_advisories(&snapshot);
+        assert_eq!(advisories.len(), 1);
+        assert_eq!(advisories[0].space_id, grown_id);
+        assert_eq!(advisories[0].title, "Grown provisional Space");
+        assert_eq!(
+            advisories[0].reason,
+            format!(
+                "Provisional Space has {PROVISIONAL_SPACE_MERGE_THRESHOLD} accepted Contexts; consider `sctx space intent revise` to name it or merge into a human-defined Space"
+            )
+        );
+        assert_eq!(
+            provisional_space_ids(&snapshot),
+            BTreeSet::from([grown_id, small_id])
+        );
+
+        // A `related_to` edge from a human-defined Space is the second, independent trigger.
+        accept_context(
+            &store,
+            human_id,
+            "The human Space already reads the provisional knowledge",
+            vec![ContextRelation {
+                target_context_id: small_context,
+                kind: ContextRelationKind::RelatedTo,
+                rationale: "the named boundary already depends on this fact".to_owned(),
+                supports: vec!["fixture relation".to_owned()],
+            }],
+        );
+        index.synchronize().expect("synchronize");
+        let snapshot = index.domain_snapshot().expect("snapshot");
+        let advisories = provisional_space_advisories(&snapshot);
+        assert_eq!(advisories.len(), 2);
+        let small_advisory = advisories
+            .iter()
+            .find(|advisory| advisory.space_id == small_id)
+            .expect("the referenced provisional Space is advised");
+        assert_eq!(
+            small_advisory.reason,
+            "Provisional Space has 1 accepted Contexts and 1 related Context relations from other Spaces; consider `sctx space intent revise` to name it or merge into a human-defined Space"
+        );
+        // Nothing was merged or renamed: both Spaces still exist with their proposed titles.
+        assert_eq!(snapshot.projection.spaces.len(), 3);
     }
 }

@@ -3977,7 +3977,7 @@ fn check_index(root: &Path, checks: &mut Vec<DoctorCheck>) {
         query: String::new(),
         filters: SearchFilters::default(),
         page_size: 1,
-        cursor: None,
+        ..SearchRequest::default()
     };
     match SearchEngine::new(index).search(&request) {
         Ok(_) => checks.push(ok("fts", "FTS query smoke passed")),

@@ -1,0 +1,184 @@
+{
+  "fixture_version": "probe-zh-v1",
+  "repository_id": "Server",
+  "repository_files": {
+    "app/src/main/kotlin/comment/CommentBottomBarManager.kt": "package comment\n\nclass CommentBottomBarManager(private val slots: PrioritySlots) {\n    fun bindDefaultInput() {\n        if (slots.isFree(\"POI_ENTRY\")) {\n            slots.attachDefaultCommentInput()\n        }\n    }\n\n    fun onWindowInsets(bottom: Int) {\n        slots.container().setPadding(0, 0, 0, bottom)\n    }\n}\n",
+    "app/src/main/kotlin/poi/PoiEntranceAssem.kt": "package poi\n\nclass PoiEntranceAssem(private val service: DummyVerticalDomainService?) {\n    fun canShow(): Boolean = true\n\n    fun register(slots: PrioritySlots) {\n        slots.claim(\"POI_ENTRY\", this)\n    }\n}\n",
+    "app/src/main/kotlin/anchor/ProductAnchorAssem.kt": "package anchor\n\nclass ProductAnchorAssem(private val entry: ILiveEntryService?) {\n    fun onAnchorClick(params: Map<String, String>) {\n        val enriched = entry?.addParamsForLiveAnchor(params) ?: return\n        entry.navigateToLiveRoom(enriched)\n    }\n}\n",
+    "app/src/main/kotlin/live/ILiveEntryService.kt": "package live\n\ninterface ILiveEntryService {\n    fun addParamsForLiveAnchor(params: Map<String, String>): Map<String, String>?\n\n    fun navigateToLiveRoom(params: Map<String, String>)\n}\n",
+    "app/src/main/kotlin/vertical/DummyVerticalDomainService.kt": "package vertical\n\nclass DummyVerticalDomainService {\n    fun resolveEntrance(): Any? = null\n\n    fun logMusicDetail(): Map<String, String> = emptyMap()\n}\n"
+  },
+  "contexts": [
+    {
+      "index": 1,
+      "label": "poi-empty-container-preempts",
+      "goal": "复查 POI 入口底栏兜底回归",
+      "acceptance_conditions": ["POI 入口的 null 保护链路被完整追踪"],
+      "context_kind": "issue",
+      "statement": "POI 底栏的 null 保护发生得过晚：当 DummyVerticalDomainService 返回 null 且 canShow() 为 true 时，PoiEntranceAssem 已注册到优先级管理器，随后以空容器抢占 POI_ENTRY，阻止默认评论栏兜底。",
+      "rationale": "优先级注册早于 null 判定，因此空容器仍然占位，默认评论输入栏的兜底分支拿不到槽位。",
+      "conditions": ["enterFrom 为 search_result"],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "PoiEntranceAssem.kt:118 在 DummyVerticalDomainService 返回 null 时仍然完成注册；CommentBottomBarManager.kt:96 的默认输入栏兜底因此被跳过。",
+          "limitations": ["合成的联想探针夹具"]
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "label": "absent-module-safe-degradation",
+      "goal": "评估缺少 vertical 领域实现模块时的降级行为",
+      "acceptance_conditions": ["缺少实现模块时的降级行为被写下来"],
+      "context_kind": "discovery",
+      "statement": "在不包含 vertical 领域实现模块的构建里，本分支把服务解析失败改成了安全降级，因此严格意义上的全配置功能等价并不成立。",
+      "rationale": "分支用一个降级但仍可用的入口替换了硬性的解析失败，这是有意的行为变更而不是缺陷。",
+      "conditions": ["构建中排除了实现模块"],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "VerticalDomainRegistry.kt:44 显示分支在实现模块缺席时用 Dummy 兜底替换了服务解析失败。",
+          "limitations": ["合成的联想探针夹具"]
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "label": "product-anchor-early-return",
+      "goal": "复查商品锚点进入直播间的导航缺口",
+      "acceptance_conditions": ["商品锚点点击路径与基线做过对比"],
+      "context_kind": "issue",
+      "statement": "当 ILiveEntryService 无真实实现或 addParamsForLiveAnchor 返回 null 时，ProductAnchorAssem 会在商品锚点点击回调中提前 return，跳过配置分发与进入直播间导航；基线仍会导航，因此该路径不功能等价。",
+      "rationale": "提前 return 让点击回调既不分发配置也不发起导航，与基线行为出现可观察差异。",
+      "conditions": ["无真实 vertical 实现模块"],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "ProductAnchorAssem.kt:202 商品锚点点击回调在 addParamsForLiveAnchor 返回 null 时提前 return；ILiveEntryService.kt:31 在该配置下没有真实实现。",
+          "limitations": ["合成的联想探针夹具"]
+        }
+      ]
+    },
+    {
+      "index": 4,
+      "label": "real-implementation-debug-build",
+      "goal": "在包含真实 vertical 实现的配置下验证 Debug 构建",
+      "acceptance_conditions": ["实现模块在位时构建出 Debug 变体"],
+      "context_kind": "validation",
+      "statement": "包含真实的 vertical 领域实现之后，被复查分支保持了运行时服务解析，Debug 包构建成功。",
+      "rationale": "运行时解析仍然返回真实实现，因此该配置下永远不会进入降级路径。",
+      "conditions": ["真实实现模块在位"],
+      "evidence": [
+        {
+          "evidence_type": "experiment_record",
+          "summary": "把真实的 vertical 领域实现模块加回之后，assembleDebug 以 BUILD SUCCESSFUL 结束（build.log:512）。",
+          "limitations": ["合成的联想探针夹具"]
+        }
+      ]
+    },
+    {
+      "index": 5,
+      "label": "dummy-return-value-contract",
+      "goal": "对比 Dummy 服务与旧动态代理的返回值",
+      "acceptance_conditions": ["按类型分类记录返回值等价性"],
+      "context_kind": "discovery",
+      "statement": "无真实实现时，Dummy 与旧动态代理在 primitive、void 和 nullable 返回值上大多等价；music-detail 日志方法由 null 变为空 Map。",
+      "rationale": "逐类型比较返回值之后，只有 music-detail 日志方法出现了可观察的返回值差异。",
+      "conditions": ["无真实实现"],
+      "evidence": [
+        {
+          "evidence_type": "experiment_record",
+          "summary": "DummyRegistry.kt:57 的 Dummy 实现对 primitive 返回 0、对 void 返回 Unit、对 nullable 返回 null；music-detail 日志方法返回空 Map。",
+          "limitations": ["合成的联想探针夹具"]
+        }
+      ]
+    },
+    {
+      "index": 6,
+      "label": "changed-modules-compile",
+      "goal": "验证直接改动的库模块的 Debug Kotlin 编译",
+      "acceptance_conditions": ["每一个直接改动的模块都能编译"],
+      "context_kind": "validation",
+      "statement": "所有直接改动的库模块都通过了各自的 compileDebugKotlin 任务。",
+      "rationale": "每个改动模块单独编译，这样任何失败都能归因到具体模块。",
+      "conditions": [],
+      "evidence": [
+        {
+          "evidence_type": "experiment_record",
+          "summary": "gradle :feature-comment:compileDebugKotlin :feature-poi:compileDebugKotlin :feature-anchor:compileDebugKotlin 全部报告 BUILD SUCCESSFUL（build.log:41）。",
+          "limitations": ["合成的联想探针夹具"]
+        }
+      ]
+    },
+    {
+      "index": 7,
+      "label": "unrelated-cli-version-check",
+      "goal": "跟踪发布清单的版本断言进展",
+      "acceptance_conditions": ["发布清单的这一步被记录下来"],
+      "context_kind": "progress",
+      "statement": "发布清单现在会在发版之前校验打包出来的命令行工具是否报告了预期的语义化版本号。",
+      "rationale": "此前发布过版本号不一致的包，因此清单里补上了显式的断言步骤。",
+      "conditions": [],
+      "evidence": [
+        {
+          "evidence_type": "artifact_snapshot",
+          "summary": "release-checklist.md:12 记录了打包版本断言步骤。",
+          "limitations": ["合成的联想探针夹具"]
+        }
+      ]
+    },
+    {
+      "index": 8,
+      "label": "comment-input-covered-by-keyboard",
+      "goal": "排查评论区输入框被软键盘遮挡",
+      "acceptance_conditions": ["软键盘弹起时的底部内边距行为被确认"],
+      "context_kind": "issue",
+      "statement": "软键盘弹起时评论列表没有调整底部内边距，CommentBottomBarManager 挂载的输入栏被键盘盖住；输入栏本身挂载正确，与 POI 入口抢占槽位无关。",
+      "rationale": "窗口 insets 回调没有把键盘高度传给列表容器，输入栏因此被覆盖而不是被替换。",
+      "conditions": ["软键盘弹起"],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "CommentBottomBarManager.kt:143 在 insets 变化时没有更新底部内边距，输入栏被键盘覆盖。",
+          "limitations": ["合成的联想探针夹具"]
+        }
+      ]
+    }
+  ],
+  "relations": [
+    {
+      "from": 2,
+      "to": 1,
+      "kind": "contradicts",
+      "rationale": "有意的安全降级与过晚的 null 保护描述的是同一个缺少实现模块的配置，却给出了相反的结论。",
+      "supports": ["严格意义上的全配置功能等价并不成立"]
+    }
+  ],
+  "probes": [
+    {"id": "zh-01", "category": "chinese_natural_language", "query": "评论页最底下那条输入栏怎么没了", "expected": [1]},
+    {"id": "zh-02", "category": "chinese_natural_language", "query": "什么东西提前占住了底部槽位导致兜底失效", "expected": [1]},
+    {"id": "zh-03", "category": "chinese_natural_language", "query": "入口拿到空结果之后仍然注册进了优先级队列", "expected": [1]},
+    {"id": "zh-04", "category": "chinese_natural_language", "query": "直播卡片上的商品点了没反应", "expected": [3]},
+    {"id": "zh-05", "category": "chinese_natural_language", "query": "点了之后没有跳进直播间", "expected": [3]},
+    {"id": "zh-06", "category": "chinese_natural_language", "query": "参数拼装拿到空值就直接退出了回调", "expected": [3]},
+    {"id": "zh-07", "category": "chinese_natural_language", "query": "把那个实现模块砍掉之后会怎样", "expected": [2]},
+    {"id": "zh-08", "category": "chinese_natural_language", "query": "缺少依赖的时候行为从报错变成了兜底", "expected": [2]},
+    {"id": "zh-09", "category": "chinese_natural_language", "query": "为什么不能说所有配置下行为都一样", "expected": [2, 3]},
+    {"id": "zh-10", "category": "chinese_natural_language", "query": "带上真实模块打包能不能成功", "expected": [4]},
+    {"id": "zh-11", "category": "chinese_natural_language", "query": "假实现和原来的代理在返回值上有什么差别", "expected": [5]},
+    {"id": "zh-12", "category": "chinese_natural_language", "query": "音乐详情的埋点方法返回值变了", "expected": [5]},
+    {"id": "zh-13", "category": "chinese_natural_language", "query": "改过的库能不能编过", "expected": [6]},
+    {"id": "zh-14", "category": "chinese_natural_language", "query": "每个模块单独跑编译任务的结果", "expected": [6]},
+    {"id": "zh-15", "category": "chinese_natural_language", "query": "键盘弹出来把输入框挡住了", "expected": [8]},
+    {"id": "zh-16", "category": "chinese_natural_language", "query": "列表底部没有留出软键盘的高度", "expected": [8]},
+    {"id": "id-01", "category": "identifier", "query": "PoiEntranceAssem", "expected": [1]},
+    {"id": "id-02", "category": "identifier", "query": "ProductAnchorAssem 提前 return", "expected": [3]},
+    {"id": "id-03", "category": "identifier", "query": "ILiveEntryService.addParamsForLiveAnchor", "expected": [3]},
+    {"id": "id-04", "category": "identifier", "query": "compileDebugKotlin", "expected": [6]},
+    {"id": "en-01", "category": "english_natural_language", "query": "comment input bar covered by soft keyboard", "expected": [8]},
+    {"id": "en-02", "category": "english_natural_language", "query": "product anchor click does not navigate", "expected": [3]},
+    {"id": "noise-01", "category": "noise", "query": "kubernetes ingress timeout", "expected": []},
+    {"id": "noise-02", "category": "noise", "query": "冷链仓储温控告警", "expected": []}
+  ]
+}

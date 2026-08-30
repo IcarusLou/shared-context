@@ -5,7 +5,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use sctx_agent_adapter::SHARED_CONTEXT_ACTIVATION_MARKER;
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
 use sctx_git_store::GitStore;
 use serde_json::{Value, json};
 
@@ -223,10 +223,12 @@ fn public_m2_retrieval_quality_workflow() {
         run_hook(&home, &session_start(session, &checkout)),
         json!({"hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+            "additionalContext": shared_context_activation_marker(AgentKind::Codex, session)
         }})
     );
-    assert!(SHARED_CONTEXT_ACTIVATION_MARKER.contains("task_intent_update"));
+    assert!(
+        shared_context_activation_marker(AgentKind::Codex, session).contains("task_intent_update")
+    );
     assert_eq!(
         run_hook(&home, &post_tool(session, &checkout, 1)),
         json!({"systemMessage": BOOTSTRAP_REMINDER})
@@ -275,18 +277,31 @@ fn public_m2_retrieval_quality_workflow() {
         .map(|review| review["candidate_id"].as_str().unwrap().to_owned())
         .collect::<Vec<_>>();
     assert_eq!(candidate_ids.len(), 2);
-    let first_review = mcp_tool(
-        &home,
-        session,
-        "candidate_get",
-        json!({"candidate_id": candidate_ids[0]}),
-    );
-    let second_review = mcp_tool(
-        &home,
-        session,
-        "candidate_get",
-        json!({"candidate_id": candidate_ids[1]}),
-    );
+    // Candidate identities are random, so the bounded page order never follows Claim order.
+    // Order the two Reviews by their Claim so the rest of the workflow stays deterministic.
+    let mut reviews = candidate_ids
+        .iter()
+        .map(|candidate_id| {
+            (
+                candidate_id.clone(),
+                mcp_tool(
+                    &home,
+                    session,
+                    "candidate_get",
+                    json!({"candidate_id": candidate_id}),
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    reviews.sort_by_key(|(_, review)| review["content"]["statement"] != alpha_statement);
+    let candidate_ids = reviews
+        .iter()
+        .map(|(candidate_id, _)| candidate_id.clone())
+        .collect::<Vec<_>>();
+    let first_review = reviews[0].1.clone();
+    let second_review = reviews[1].1.clone();
+    assert_eq!(first_review["content"]["statement"], alpha_statement);
+    assert_eq!(second_review["content"]["statement"], beta_statement);
     let first_proposed = proposed(&first_review);
     let second_proposed = proposed(&second_review);
     assert_eq!(first_proposed.1, second_proposed.1);
@@ -309,7 +324,9 @@ fn public_m2_retrieval_quality_workflow() {
             "related_space_ids": []
         }),
     );
-    assert_eq!(first_confirmed["event_ids"].as_array().unwrap().len(), 5);
+    // Four base Confirmation Events, one created Space, and one server-derived Engineering
+    // Reference for the `src/quality/fallback.rs` locator the Claim statement already names.
+    assert_eq!(first_confirmed["event_ids"].as_array().unwrap().len(), 6);
     let mapped_second = mcp_tool(
         &home,
         session,
@@ -360,7 +377,8 @@ fn public_m2_retrieval_quality_workflow() {
         json!({
             "task_boundary": "new",
             "expected_revision_id": grouped_task["intent_revision_id"],
-            "intent": {"goal": "qualitystrong exact phrase"}
+            "intent": {"goal": "qualitystrong exact phrase"},
+            "detail_level": "full"
         }),
     );
     let strong_items = strong_task["items"].as_array().unwrap();
@@ -427,28 +445,34 @@ fn public_m2_retrieval_quality_workflow() {
             "absolute_file_path": checkout.join("src/quality/fallback.rs"),
             "locator": {"locator_kind": "file"},
             "token_budget": 12000,
-            "max_spaces": 8
+            "max_spaces": 8,
+            "detail_level": "full"
         }),
     );
-    assert!(focused["context"]["artifact_generation"].is_null());
-    let fallback_item = focused["context"]["items"]
+    // The Claim statement names `src/quality/fallback.rs`, so confirmation records a
+    // server-derived Engineering Reference for it and the Focus now resolves through the
+    // Engineering Graph instead of the text fallback. The text-fallback path itself stays
+    // covered by `sctx-search`'s graph_retrieval suite and the MCP engineering workflow.
+    assert!(focused["context"]["artifact_generation"].is_string());
+    let focused_item = focused["context"]["items"]
         .as_array()
         .unwrap()
         .iter()
         .find(|item| item["context"]["context_id"] == first_confirmed["context_id"])
-        .unwrap_or_else(|| panic!("missing public fallback item: {focused:#}"));
+        .unwrap_or_else(|| panic!("missing public focused item: {focused:#}"));
     assert!(
-        fallback_item["retrieval_paths"]
+        focused_item["retrieval_paths"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|path| path["source"] == "resolved_focus_text_fallback")
+            .any(|path| path["source"] == "engineering_graph")
     );
     assert!(
-        fallback_item["retrieval_paths"]
+        focused["context"]["items"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|path| path["source"] != "engineering_graph")
+            .all(|item| item["context"]["context_id"] != second_confirmed["context_id"]),
+        "the unreferenced sibling Context must stay out of the Focus payload: {focused:#}"
     );
 }

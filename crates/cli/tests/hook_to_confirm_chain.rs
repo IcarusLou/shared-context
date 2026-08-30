@@ -5,7 +5,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use sctx_agent_adapter::SHARED_CONTEXT_ACTIVATION_MARKER;
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
 use sctx_domain::{
     Applicability, ContextKind, ContextRevisionDraft, EvidenceSnapshotDraft, EvidenceType,
     ExternalSessionLocator, IntentSnapshot, PublicationAction, PublicationDraft, ReviewDraft,
@@ -211,6 +211,8 @@ fn seed_accepted_context(store: &GitStore, oracle: &HookOracle) -> SeededContext
     let revision = Event::context_revision_added(
         space_id,
         ContextRevisionDraft {
+            problem_view: None,
+            hints: Vec::new(),
             kind: ContextKind::Contract,
             topic_key: Some("m4/hook-chain".to_owned()),
             statement: oracle.context_statement.clone(),
@@ -367,7 +369,7 @@ fn one_real_hook_to_confirm_identity_chain() {
         session_start,
         json!({"hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+            "additionalContext": shared_context_activation_marker(AgentKind::Codex, &oracle.session)
         }})
     );
 

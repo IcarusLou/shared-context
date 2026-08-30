@@ -238,7 +238,7 @@ fn fixed_milestone_four_builder_review_confirm_oracle() {
                 ..SearchFilters::default()
             },
             page_size: 10,
-            cursor: None,
+            ..SearchRequest::default()
         })
         .unwrap();
     assert!(

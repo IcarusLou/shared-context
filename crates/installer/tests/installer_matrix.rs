@@ -623,6 +623,8 @@ fn append_accepted_team_context(
     let revision = Event::context_revision_added(
         space_id,
         ContextRevisionDraft {
+            problem_view: None,
+            hints: Vec::new(),
             kind: ContextKind::Contract,
             topic_key: Some(oracle.context_topic.clone()),
             statement: oracle.context_statement.clone(),

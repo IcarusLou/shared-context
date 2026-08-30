@@ -22,14 +22,14 @@ pub use sctx_domain::{
     ContextSpaceProjection, DomainProjection, EngineeringReference, EngineeringReferenceDraft,
     Error, ErrorKind, EventId, EvidenceId, EvidenceSnapshot, EvidenceSnapshotDraft, EvidenceType,
     IdParseError, IntentProjection, IntentRevision, IntentSnapshot, OptionalCandidateEdits,
-    Publication, PublicationAction, PublicationDraft, PublicationId, ReducerDiagnostic,
-    ReducerDiagnosticCode, ReducerEvent, ReducerPayload, ReferenceId, ReferenceRelation,
-    RepoRelativePath, RepositoryId, ResolutionId, ResolutionOutcome, Result, Review, ReviewDraft,
-    ReviewId, ReviewSummary, ReviewVerdict, RevisionId, RevisionLifecycle, RevisionProjection,
-    SemanticConflict, SemanticConflictCandidate, SemanticConflictDraft, SemanticConflictOpenReason,
-    SemanticConflictProjection, SemanticConflictStatus, SpaceAssociationId, SpaceId, SubmissionId,
-    TaskId, TaskSessionId, TopicKeyEdit, WorkEpisodeId, WorkEpisodeRef,
-    context_revision_content_hash, reduce,
+    ProblemViewEdit, Publication, PublicationAction, PublicationDraft, PublicationId,
+    ReducerDiagnostic, ReducerDiagnosticCode, ReducerEvent, ReducerPayload, ReferenceId,
+    ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionId, ResolutionOutcome, Result,
+    Review, ReviewDraft, ReviewId, ReviewSummary, ReviewVerdict, RevisionId, RevisionLifecycle,
+    RevisionProjection, SemanticConflict, SemanticConflictCandidate, SemanticConflictDraft,
+    SemanticConflictOpenReason, SemanticConflictProjection, SemanticConflictStatus,
+    SpaceAssociationId, SpaceId, SubmissionId, TaskId, TaskSessionId, TopicKeyEdit, WorkEpisodeId,
+    WorkEpisodeRef, context_revision_as_draft, context_revision_content_hash, reduce,
 };
 
 /// Immutable identifier for the bundled V1 JSON Schema.
@@ -535,6 +535,22 @@ impl Event {
                 base_annotations.clone(),
             )?);
         }
+        for (event_id, opening) in plan
+            .event_ids
+            .semantic_conflict_event_ids
+            .iter()
+            .copied()
+            .zip(&plan.opened_conflicts)
+        {
+            events.push(exact(
+                event_id,
+                EventPayload::SemanticConflictOpened {
+                    space_id: opening.space_id,
+                    conflict: opening.conflict.clone(),
+                },
+                base_annotations.clone(),
+            )?);
+        }
         let mut confirmation_annotations = base_annotations;
         confirmation_annotations.additional.insert(
             "confirmation_operation_hash".to_owned(),
@@ -633,6 +649,8 @@ impl Event {
                     revision_id: RevisionId::new(),
                     parent_revision_ids: Vec::new(),
                     intent,
+                    // A human wrote this Intent, so the Space is never provisional.
+                    provisional: false,
                 },
             },
             annotations,
@@ -657,6 +675,9 @@ impl Event {
                     revision_id: RevisionId::new(),
                     parent_revision_ids,
                     intent,
+                    // Revising the Intent by hand is exactly how a provisional Space stops
+                    // being provisional, so a revision never carries the flag forward.
+                    provisional: false,
                 },
             },
             annotations,

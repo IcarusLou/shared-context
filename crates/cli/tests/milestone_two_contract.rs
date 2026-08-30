@@ -362,6 +362,8 @@ fn applicability(domain: &str, platform: &str, condition: &str) -> Applicability
 
 fn complete_context(statement: &str, applicability: Applicability) -> ContextRevisionDraft {
     ContextRevisionDraft {
+        problem_view: None,
+        hints: Vec::new(),
         kind: ContextKind::Contract,
         topic_key: Some("milestone-two/acceptance".to_owned()),
         statement: statement.to_owned(),
@@ -786,7 +788,10 @@ fn post_tool_file_is_non_factual_signal_only_and_test_outcome_refreshes_active_t
     assert!(
         activation["hookSpecificOutput"]["additionalContext"]
             .as_str()
-            .is_some_and(|message| message.contains("<shared-context-active>"))
+            .is_some_and(|message| {
+                message.contains("<shared-context-active external_session_id=")
+                    && message.contains(session_id)
+            })
     );
     let update = |boundary: TaskBoundary, expected: Option<String>| TaskIntentUpdateInput {
         agent_kind: "codex".to_owned(),

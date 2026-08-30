@@ -962,7 +962,7 @@ fn validate_locator_size(locator: &ExternalSessionLocator) -> Result<()> {
     Ok(())
 }
 
-fn locator_digest(locator: &ExternalSessionLocator) -> String {
+pub(crate) fn locator_digest(locator: &ExternalSessionLocator) -> String {
     let mut hasher = Sha256::new();
     hasher.update((locator.agent_kind.len() as u64).to_be_bytes());
     hasher.update(locator.agent_kind.as_bytes());

@@ -43,7 +43,7 @@ sctx demo
 
 `sctx demo` 会在本机创建一组固定的演示数据，完成“创建 Space → 写入 Context → 审核 → 发布 → CLI/MCP 搜索”的闭环。重复执行不会反复创建相同数据。
 
-然后用 `sctx repository add` 登记希望启用 Shared Context 的本机代码仓库，再重启已经打开的 Cursor 或 Codex。只有从已登记 checkout 内启动，或从显式登记的 Repository Group 精确根目录启动时，SessionStart 才会向 Agent 注入简短授权 marker；未登记目录保持 neutral，不进入 Hook 记录流程。进入授权范围后，Agent 才按已安装的 Shared Context Skill、MCP 工具和生命周期 Hook 维护任务意图、取回相关历史、记录检查点，并把值得长期保存的结论整理成待审核 Candidate。
+然后用 `sctx repository add` 登记希望启用 Shared Context 的本机代码仓库，再重启已经打开的 Cursor 或 Codex。只有从已登记 checkout 内启动，或从显式登记的 Repository Group 精确根目录启动时，SessionStart 才会向 Agent 注入简短授权 marker（其中带有本会话的 `external_session_id`，供 Agent 原样回传）；未登记目录保持 neutral，不进入 Hook 记录流程。进入授权范围后，Agent 才按已安装的 Shared Context Skill、MCP 工具和生命周期 Hook 维护任务意图、取回相关历史、记录检查点，并把值得长期保存的结论整理成待审核 Candidate。
 
 ## 3. 安装步骤
 
@@ -192,7 +192,7 @@ sctx doctor --fix
 - 初始化本地索引和运行时状态。
 - 按选择写入 `~/.cursor/mcp.json`、`~/.cursor/hooks.json`。
 - 按选择写入 `~/.codex/config.toml`、`~/.codex/hooks.json`。
-- 安装用户级最小 activation Skill 与 installer-owned 完整 workflow reference 到 `~/.agents/skills/shared-context`。
+- 安装用户级最小 activation Skill 与 installer-owned 完整 workflow reference 到 `~/.agents/skills/shared-context`。该 workflow 规定知识库正文默认用中文书写（intent 的 goal/current_direction/in_scope，claim 的 statement/rationale/conditions，evidence.summary），代码标识符、路径与命令保持原文；这只约束沉淀内容，不改变 Agent 与用户交流使用的语言。
 - 写安装清单，用于后续升级、诊断和精确卸载。
 
 安装器会记录每次写入并支持失败回滚。已有配置会合并，不会把整个配置文件直接覆盖成模板。
@@ -207,7 +207,7 @@ sctx doctor --fix
 sctx upgrade --agents cursor,codex
 ```
 
-项目尚未上线，因此 Setup/Upgrade 不维护旧 Task Runtime 兼容层：检测到已知 schema 11 或 12 时，会备份并丢弃 `runtime.sqlite` 及 sidecars，再初始化 schema 13；未确认的本地 Task、Checkpoint 和 Candidate Review 会随之清空。未知或未来 schema 会 fail closed，不做猜测性迁移；若后续安装步骤失败，事务回滚会恢复原文件和权限。
+项目尚未上线，因此 Setup/Upgrade 不维护旧 Task Runtime 兼容层：检测到已知 schema 11 或 12 时，会备份并丢弃 `runtime.sqlite` 及 sidecars，再初始化 schema 13；未确认的本地 Task、Checkpoint 和 Candidate Review 会随之清空。未知或未来 schema 会 fail closed，不做猜测性迁移；若后续安装步骤失败，事务回滚会恢复原文件和权限。SQLite 索引 `index.sqlite` 走独立的 schema 版本（当前 15）：升级检测到旧版本时会整表重建索引，不需要用户手动干预，也不影响上面的 `runtime.sqlite`（仍是 schema 13）；索引本身可以随时删掉重建，Git 知识库不受影响。
 
 普通卸载：
 
@@ -307,7 +307,7 @@ Workspace 路径不会自动绑定一个 Space，文本 Hint 也不会冒充已�
 ### 4.5 隐私和信任边界
 
 - SessionStart 在模型推理前用本机 Repository Catalog 判定范围，不读取 Prompt，也不调用模型。已登记 checkout 是 `Direct`；只有显式登记且精确匹配的 Group root 才是 `Group`；普通父目录、未登记 sibling 和其他目录都是 `Disabled`。
-- Enabled 只返回一个固定、短小且不含路径/Repository/Prompt/Session 身份的 marker。PromptSubmit 不重复 marker。Disabled 的 Prompt、Tool、压缩、停止和结束 Hook 不打开业务 Runtime，也不写 Report 或知识 Git。
+- Enabled 只返回一个形状固定、短小且不含路径/Repository/Prompt 身份的 marker，例如：`<shared-context-active external_session_id="…">Shared Context is authorized for this session. Before substantive work, call task_intent_update with agent_kind "codex" and external_session_id "…" (copy it verbatim; never invent one).</shared-context-active>`（硬上限 512 bytes）；marker 里唯一随会话变化的是 host session id 与 `agent_kind`，Agent 必须把这个 id 原样当作 `external_session_id` 回传（Codex 也可用 `printenv CODEX_SESSION_ID` 核对，Cursor 即 conversation id），不得自行编造。host session id 本身不合法（为空、超长或含非常见字符）时，marker 会退化成不带 `external_session_id` 属性的版本，改用一句话说明去哪里找这个 id，同样不会让 Agent 编造。PromptSubmit 不重复 marker。Disabled 的 Prompt、Tool、压缩、停止和结束 Hook 不打开业务 Runtime，也不写 Report 或知识 Git。
 - 同一 Agent Session locator 的第一次成功决定会一直复用到 SessionEnd；后续 resume/compact 或 cwd 变化不会重新判定。Catalog/lease 锁忙、损坏或异常会立即按 Disabled 处理，但不会阻断正常编程。
 - PostToolUse 会在记录前检查 `absolute_file_path`、`file_path`、`filepath`、`path`、`cwd`、`workdir`、`working_directory` 等已知结构化路径。Enabled 表示整个 Session 已准入，不把调查目标限制在启动 Repo 或 Group 成员：其他已登记 Repo 会按真实 Catalog identity 记录；安全的未登记路径、registered/unregistered mixed 或无法用一个显式 workspace 安全表示的多 Repo 事件只保留无路径、无 Repository 猜测的非定位工程含义；相对、缺失、symlink、歧义或特殊文件仍让整条事件被丢弃。
 - Adapter 只保留 `FileOperation`、`TestRunner`、`Shell`、`SharedContext` 或 `Other`。Hook 由这些机械分类产生的内容只能成为非事实 TaskSignal；原始命令、输出和 vendor tool name 不保存，Shared Context 自身工具也不会回流。
@@ -327,6 +327,8 @@ Workspace 路径不会自动绑定一个 Space，文本 Hint 也不会冒充已�
 ```text
 请修复搜索结果页的旧版本兼容问题，并使用 Shared Context 查找相关历史决策。
 ```
+
+开始一项新需求时，建议先显式调用一次 `space create`（或 Agent 对应的 MCP 能力）建立归属的 Space；如果跳过这一步，`candidate_confirm` 时系统仍会按 Task Intent 自动生成一个 `provisional` Space 兜底，但显式建 Space 能让后续 Candidate 归类更准确。
 
 Agent 在合适时机会：
 
@@ -485,6 +487,7 @@ sctx candidate discard \
 | `sctx demo` | 建立并验证固定演示闭环；重复执行可复用已有演示数据。 |
 | `sctx doctor` | 只读检查安装、索引、配置、MCP 和 Agent 能力。 |
 | `sctx doctor --fix` | 重做安全、可逆的注册和索引设置后再次检查。 |
+| `sctx doctor --recheck` | 只读评估所有 accepted Context 里结构化的 `recheck_when` 条目（见 6.5），把命中结果写入本机索引的 `stale_reason`；不能与 `--fix` 同时使用。 |
 | `sctx upgrade [--agents cursor,codex]` | 安装新版本并原子切换 `bin/current`。 |
 | `sctx data reset --dry-run` / `--yes` | 预览或确认事务式清空活动数据；保留安装结构、Agent 接入和默认恢复备份，不修改远端 Git。 |
 | `sctx uninstall` | 精确移除安装器拥有的运行时和接入配置，保留知识库。 |
@@ -522,7 +525,7 @@ Intent JSON 的字段是：
 | 命令 | 功能 |
 |---|---|
 | `sctx task intent update --input <JSON>` | 创建新 Task 或以 CAS 更新当前 Working Intent，并立即返回 Task Context Pack。 |
-| `sctx task context --agent-kind ... --external-session-id ... [--token-budget 2000] [--max-spaces 8]` | 只读获取现有 Active Task 的相关 Context，不修改状态。Token Budget 最低 256，最多返回 32 个 Space。 |
+| `sctx task context --agent-kind ... --external-session-id ... [--token-budget 2000] [--max-spaces 8] [--compact]` | 只读获取现有 Active Task 的相关 Context，不修改状态。Token Budget 最低 256，最多返回 32 个 Space。 |
 | `sctx task artifact-focus --input <JSON>` | 针对一个文件、模块、符号、API、Schema 或测试做一次即时历史查询。Focus 不持久化，也不会成为证据。 |
 | `sctx task checkpoint --input <JSON>` | 只提交 Session locator、完整 direct Claims/Unknowns；服务端解析 Task/Intent/lifecycle、关闭 Episode并持久化 queued Build receipt。 |
 | `sctx task signal supersede --input <JSON>` | 把已经不再相关的活动 Signal 标记为 superseded；保留历史，不执行删除。 |
@@ -539,22 +542,26 @@ Engineering Graph 整体不可用时，Artifact Focus 会尝试严格文本 fall
 
 Checkpoint Claim 必须严格包含 `context_kind`、`statement`、`rationale`、`conditions`、`evidence`；每条 Evidence 严格包含 `evidence_type`、`summary`、`limitations`；Unknown 严格包含 `statement`、`blocking`。不要额外提交 Task/Intent/Episode/version/boundary、transport key、关系/工程引用或调用者生成的 ID。
 
+`task context` 和 `task_context`/`task_intent_update`/`task_artifact_focus` MCP 工具都支持 `detail_level: "compact"`（MCP 侧默认就是 `compact`；CLI 侧为保持与 Rust 直接入口一致，默认仍是 `full`，需要加 `--compact` 才切换）。`compact` 只保留可直接继承的字段：`statement`、`applicability.conditions`、截断到 200 字符的 `evidence.summary`、`relations` 和最多 3 条一句话 `why`；去掉逐项 `match_reason`、`retrieval_paths` 和 RRF 明细。需要看排序依据或调试召回时才用默认/`full`。`task_checkpoint` 本身只做一次持久 ACK（记录 Checkpoint 收据并把 Episode 排进 Candidate Build 队列），不在这一步解析文件路径。文件路径与类名到 Engineering Reference、`topic_key` 的确定性抽取发生在随后的 Candidate Build 阶段（Episode 关闭后、`candidate_list`/`candidate_get` 能看到结果前），对同一 Episode 只做一次、结果落盘复用；调用方不需要、也不应该额外提交这些字段。
+
 ### 6.4 Candidate 审核
 
 | 命令 | 功能 |
 |---|---|
-| `sctx candidate list --agent-kind ... --external-session-id ...` | 分页列出当前 Task 的 Candidate Review；默认只列 `pending`。可用 `--status`、`--limit`、`--cursor`、`--token-budget`。 |
+| `sctx candidate list --agent-kind ... --external-session-id ... [--compact]` | 分页列出当前 Task 的 Candidate Review；默认只列 `pending`。可用 `--status`、`--limit`、`--cursor`、`--token-budget`。 |
 | `sctx candidate get ... --candidate-id <ID>` | 获取完整草稿、证据、来源、冲突分析、置信度、未知项和 Space 推荐。 |
 | `sctx candidate analyze --candidate-id <ID> [--token-budget 4096] [--top-k 16]` | 重新计算与已有 Context 的重复、支持、修订、潜在冲突和相关性分析；不写入 Git。 |
-| `sctx candidate confirm --input <JSON>` | 用户明确确认后，把 Candidate、Primary/Related Space、最终 Context Revision、Association、Publication、Confirmation 和可选编辑作为一个原子事实批次写入。 |
-| `sctx candidate discard ... --reason <TEXT>` | 用户明确拒绝保留时丢弃 Candidate Review；不会发布任何 Context。 |
+| `sctx candidate confirm --input <JSON>` | 用户明确确认后，把 Candidate、Primary/Related Space、最终 Context Revision、Association、Publication、Confirmation 和可选编辑作为一个原子事实批次写入。JSON 用 `candidate_id` 确认一个，或用 `candidate_ids` 数组原子确认多个（写入前对每个 Candidate 做完整校验，任何一个失败整批都不写；批量模式不支持 `edits` 和新建 Space 推荐，只能用于已有 Space）。 |
+| `sctx candidate discard --candidate-id <ID> [--candidate-id <ID> ...] --reason <TEXT>` | 用户明确拒绝保留时丢弃 Candidate Review；不会发布任何 Context。重复 `--candidate-id` 原子丢弃多个自己名下的 Pending Candidate。 |
 | `sctx candidate build-closed-episode --episode-id <ID>` | 在 Episode 已关闭但 Builder 响应丢失或待恢复时重建；属于恢复命令。 |
 
 Candidate 状态支持 `pending`、`discarded`、`expired`、`confirmed`。只有完整分析且 `ready_for_review` 的 Candidate 才适合让用户决策。`potential_contradiction` 和 `unresolved_related` 是审核线索，不是已经成立的事实。
 
-同一 Task Intent Revision 产生多个 Claims 时，每个 Claim 仍是独立 Candidate，但它们共享一个 `ProposedSpaceGroup`：建议的新 Space 标题只来自 Working Intent 的 `goal`，会移除内部 `System suggestion:` 前缀、规范空白并在词边界截断。第一个 Candidate 确认创建新 Space 后，其他待审核 Candidate 会推荐该 Existing Space；新的 Intent Revision 使用新分组。这个机制不会按文本合并 Candidate，也不是全局 Active Space。
+`candidate list` 默认（MCP 侧）和 `--compact`（CLI 侧）返回精简三角视图：每条只有 `candidate_id`、`kind`、`statement`、置信度最高的 `top_assessment`（`relation` + `confidence_basis_points`）、`primary_space_recommendation` 和 `ready_for_review`；不含完整证据、来源和分析明细。推荐的审核顺序是：先看这份精简列表，只对 `top_assessment.relation` 为 `potential_contradiction` 或 `revises` 的 Candidate 用 `candidate get` 展开完整 Review，再决定是否用 `candidate_ids` 批量确认或丢弃其余同批次的 `supports`/`exact_duplicate`/`novel` 项，避免逐条重复展开明显不需要人工细看的 Candidate。
 
-确认时的 `edits` 可以只替换用户明确要求修改的字段：`kind`、`topic_key`、`statement`、`rationale`、`applicability`、`assumptions`、`recheck_when`、`relations`、`evidence`。省略字段表示保留原草稿；`topic_key` 使用 `{"action":"clear"}` 才表示显式清空。
+同一 Task Intent Revision 产生多个 Claims 时，每个 Claim 仍是独立 Candidate，但它们共享一个 `ProposedSpaceGroup`：建议的新 Space 标题只来自 Working Intent 的 `goal`，会移除内部 `System suggestion:` 前缀、规范空白后按字符截断到 40 个字符并加省略号（不是按词边界截断，goal 为空时用固定标题 "Task intent"）。第一个 Candidate 确认创建新 Space 后，其他待审核 Candidate 会推荐该 Existing Space；新的 Intent Revision 使用新分组。这个机制不会按文本合并 Candidate，也不是全局 Active Space。这类系统生成的 Space 会带 `provisional` 标记，出现在 `space list`/`space get` 与候选的 Space 推荐里；当它积累的已接受 Context 达到一定数量，或出现跨 Space 的相关引用时，`candidate list` 顶层会给出合并/命名到人工 Space 的提示，人工执行一次 `space intent revise` 才会让它不再是 `provisional`。
+
+确认时的 `edits` 可以只替换用户明确要求修改的字段：`kind`、`topic_key`、`problem_view`、`hints`、`statement`、`rationale`、`applicability`、`assumptions`、`recheck_when`、`relations`、`evidence`。省略字段表示保留原草稿；`topic_key`/`problem_view` 都要用 `{"action":"clear"}` 才表示显式清空，`hints` 直接给字符串数组整体替换。`problem_view` 省略且草稿本身没有值时，服务端会用来源 Task 的 Working Intent（goal/in-scope/未决问题）自动补一份摘要，不需要手工填写。
 
 确认编辑中的 `relations` 只接受 `depends_on`、`constrains`、`implements`、`validated_by`、`contradicts`、`related_to`。Engineering Reference 在 Context 确认后通过独立的 `engineering-reference record` 记录；它必须使用已登记 RepositoryId、确定性 locator、非空 `supports` 和至少一项限制说明。图重建失败不会使已提交的确认事实重复创建。
 
@@ -613,6 +620,15 @@ Context 内容可通过 `--input` JSON 提供：
 
 搜索可见状态包括 `candidate`、`accepted`、`deprecated`、`superseded`、`governance_conflict`。
 
+`recheck_when` 里绝大多数条目仍是给人看的自由文本，但两种固定前缀会被服务端自动评估：
+
+- `branch_advanced:<分支名>@<commit>`：分支已经不再指向该 commit 时判定过期。
+- `file_changed_since:<commit>:<仓库相对路径>`：该文件在 commit 之后发生过变更时判定过期。
+
+评估只在 `sctx doctor --recheck` 或 `sctx association rebuild` 之后执行一次，命中的 Context 会在本机索引标上 `stale_reason`，在 `search`/`task_context` 里仍然可见，但会被降权且排除出自动注入；这是纯本机派生状态，不写入知识 Git，也不会被其他机器看到，`sctx index rebuild` 之类的整表重建会把它清空，需要再跑一次 `sctx doctor --recheck` 才能恢复。
+
+`context revise` 或 `candidate confirm` 的 `edits.relations` 里，`supersedes` 表示这条新 Revision 取代了某个已有 Context：被取代的 Revision 在 Git 里的事实不会被改写或删除，只是本机投影会把它标记为已被取代，排除出自动注入，但仍可以被显式 `search`/`context get` 查到、也能在 explain 里看到取代关系，适合"旧结论仍值得追溯，但不该再被继承"的场景。
+
 ### 6.6 语义冲突
 
 语义冲突用于表示多个已经发布的 Context 在同一适用范围内互相冲突，而不是简单的文本不同。
@@ -634,7 +650,8 @@ CONTEXT_ID:REVISION_ID:retained|revised|withdrawn|scope_split
 |---|---|
 | `sctx repository add --repository-id <ID> --path <绝对仓库路径> [--path ...]` | 用团队约定的 ID 创建本机 Catalog 身份，或给已有 exact ID 增加 canonical checkout/worktree。 |
 | `sctx repository list` | 查看 Repository Catalog，并同步本地 Registry。 |
-| `sctx repository doctor` | 检查 checkout 是可用、缺失还是不安全，并在安全时同步 Registry。 |
+| `sctx repository doctor` | 检查 checkout 是可用、缺失还是不安全，并在安全时同步 Registry；对每个早期安装留下的 legacy `rpo_<uuid>` 身份给出 typed 警告（`--json` 下稳定 `kind: "legacy_repository_id"`），并统计本机 Index 里还有多少条 Engineering Reference 引用该 legacy id。 |
+| `sctx repository rename --from <OLD_ID> --to <NEW_ID>` | 只改本机 Catalog / repository-registry 里的 RepositoryId；`--to` 必须满足 ADR-0001 的 1–64 字节可读 ASCII 语法，目标已存在或来源不存在都返回 typed 错误。已经写入 Git 的 EngineeringReference 事件仍保留旧 id 原文，不会被重写——`repository doctor` 报告的引用计数就是用来衡量这批历史事件的规模。 |
 | `sctx repository group add --root <绝对父目录> --member-repository-id <ID> [--member-repository-id <ID> ...]` | 显式登记一个精确父目录为 Repository Group；只有该 root 本身可以启用 Group，普通祖先目录不会自动启用。 |
 | `sctx repository group update --repository-group-id <ID> [--root <路径>] [--member-repository-id <ID> ...]` | 显式修复或更新 Group root/成员。 |
 | `sctx repository group remove --repository-group-id <ID>` | 移除 Group；不删除成员 Repository。 |
@@ -674,6 +691,8 @@ sctx search \
 - `--status`
 
 还支持 `--cursor` 翻页。空 `--query` 也合法，可以只使用结构化过滤。结果会给出匹配理由、索引 Tree/Generation 和冲突信息。
+
+`--query` 默认按 `ranked` 模式匹配：只要命中任意 query token 就可能入选，排序综合 BM25 与 token coverage（命中 token 数 / query token 数），coverage 过低的结果会被截断；每条结果的 `match_reason` 会给出 `matched_tokens` 和 `coverage_basis_points`。`ranked` 模式下 query token 还会按已积累的别名表（来自代码标识符拆分与 Space 领域术语）做有限展开，例如查询里的一个缩写命中另一种拼法的同一标识符/术语时也能召回；被别名展开命中的 token 会在 `match_reason.matched_via_alias` 里单独列出，覆盖率仍按原始 token 计。需要旧的"全部 token 都必须命中、不做别名展开"的严格匹配时加 `--exact`（映射到 `SearchRequest.match_mode = "exact"`）。
 
 ### 6.9 索引、待提交批次与事件校验
 
@@ -723,7 +742,23 @@ CLI 还提供 Space/Context 写入治理、语义冲突、索引和 Pending Batc
 
 当前 Repository 准入控制 Hook 的 Agent-visible activation 与机械 TaskSignal 路径；MCP Server 也用 current Enabled Session lease 实现授权校验，Disabled/Missing/Expired/Stale/busy/corrupt Session 的调用会被拒绝。已安装的全局 Skill 主入口只包含最小 activation gate：没有可信 SessionStart marker 时不读取完整 workflow reference、不产生 Shared Context MCP 调用提示；有 marker 时才完整读取一次 installer-owned reference。这个 Skill gate 是 Agent 推理前的指令准入机制，Server guard 则负责安全和不落越权数据。MCP 进程和工具 Schema 仍由用户级 Agent 配置提供，可能物理启动或可见；不要把 Disabled 理解为进程必然未启动，也不要把合约中的 reference-read/MCP-call 字节代理外推为真实计费 token 已被测量。当前还已证明 Disabled Hook 不向模型注入 Shared Context 文本，也不产生业务 Runtime/Report/知识 Git 记录。
 
-#214 更新后的固定 bytes proxy 进一步量化该边界：Disabled 的 Agent-visible activation、完整 workflow read、Shared Context MCP call/result 与业务 residue 都是 0；Enabled 每个 SessionStart marker 为 126 bytes（上限 128），完整 workflow 读取一次，并在固定 Direct/Group 验收链中产生 5 次真实 public MCP 调用。当前最小 gate、workflow、metadata 源文件分别为 1543、9098、263 bytes。若 Enabled Session 在没有 ActiveTask 时先发生安全 PostToolUse，Hook 只提醒一次调用 `task_intent_update`，不读取 Prompt、不自动创建 Task；PreCompact/TurnStop 只给出 bounded Checkpoint guidance并尝试恢复已有 outbox，不创作 Claim。这些值用于回归比较，不是 tokenizer 结果或供应商计费 token。
+#214 更新后的固定 bytes proxy 进一步量化该边界：Disabled 的 Agent-visible activation、完整 workflow read、Shared Context MCP call/result 与业务 residue 都是 0；Enabled 每个 SessionStart marker 的固定部分为 249 bytes，加上 `agent_kind` 与两处 host session id（36 字符的 UUID 会话约 326 bytes，硬上限 512 bytes），完整 workflow 读取一次，并在固定 Direct/Group 验收链中产生 5 次真实 public MCP 调用。当前最小 gate、workflow、metadata 源文件分别为 1882、14720、263 bytes。若 Enabled Session 在没有 ActiveTask 时先发生安全 PostToolUse，Hook 只提醒一次调用 `task_intent_update`，不读取 Prompt、不自动创建 Task；PreCompact/TurnStop 只给出 bounded Checkpoint guidance并尝试恢复已有 outbox，不创作 Claim。这些值用于回归比较，不是 tokenizer 结果或供应商计费 token。
+
+### 6.11 可选 `config.toml` 设置
+
+安装根目录下的 `config.toml`（`~/.shared-context/config.toml`）可以手工添加以下可选表，不写就是默认行为：
+
+```toml
+[hooks]
+artifact_focus_reminder = false
+
+[context_ttl]
+validation = "30d"
+progress = "14d"
+```
+
+- `[hooks] artifact_focus_reminder`：默认 `false`（关闭）。关闭时 PostTool Hook 与该开关引入前逐字节一致。显式改成 `true` 后，仅在 Direct 会话里对被识别为单个文件操作的工具事件，用本机 Catalog 把绝对路径解析到已登记 Repository，再对 `engineering.sqlite` 做一次只读查询（不加锁、不跑 Git、不 scan、不 rebuild）；命中已接受且可自动注入的 Graph Context 时，追加一条不超过 800 字节的提示（最多 3 个 Context ID、每个标题截断到 60 字符，加一句固定的“可以调用 `task_artifact_focus` 查看”提示文案），不包含 statement/evidence 正文，也不写任何事实。同一 Session 对同一文件只提示一次。这个开关只影响 Direct 会话里以绝对文件路径命中的工具事件，不覆盖 Group 会话或模块/符号/API/Schema/测试等其他定位方式。
+- `[context_ttl]`：按 Context 类型（`decision`/`contract`/`issue`/`risk`/`validation`/`discovery`/`progress`）配置一个带单位的正时长（`s`/`m`/`h`/`d`/`w`），不配置的类型没有时效。到期起点是该 Context 被接受时所在 commit 的时间，不是本机当前时间。过期后状态变为 `historical`：排除自动注入，仍可以被 `search`/`context get` 查到。
 
 ## 7. 常见问题
 

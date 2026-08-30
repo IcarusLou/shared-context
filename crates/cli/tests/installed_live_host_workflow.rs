@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sctx_agent_adapter::SHARED_CONTEXT_ACTIVATION_MARKER;
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
 use serde_json::{Value, json};
 
 fn wait_child(child: &mut Child, label: &str, timeout: Duration) -> ExitStatus {
@@ -570,7 +570,7 @@ fn installed_codex_direct_evidence_replay_recovery_and_cursor_lifecycle_use_publ
         ),
         json!({"hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+            "additionalContext": shared_context_activation_marker(AgentKind::Codex, session_a)
         }})
     );
     let mut codex_mcp = InstalledMcp::start(&installed, &home, "codex");
@@ -792,7 +792,7 @@ fn installed_codex_direct_evidence_replay_recovery_and_cursor_lifecycle_use_publ
         ),
         json!({"hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+            "additionalContext": shared_context_activation_marker(AgentKind::Codex, session_b)
         }})
     );
     let task_b = codex_mcp.call(
@@ -812,7 +812,8 @@ fn installed_codex_direct_evidence_replay_recovery_and_cursor_lifecycle_use_publ
             "absolute_file_path": checkout_b.join("src/live.rs"),
             "locator": {"locator_kind": "file"},
             "token_budget": 12_000,
-            "max_spaces": 8
+            "max_spaces": 8,
+            "detail_level": "full"
         }),
     );
     eprintln!("live-host stage=codex-b-focus");
@@ -858,7 +859,10 @@ fn installed_codex_direct_evidence_replay_recovery_and_cursor_lifecycle_use_publ
             &cursor_hook,
             &cursor_event("sessionStart", cursor_session, &checkout_b, &cursor_version)
         ),
-        json!({"additional_context": SHARED_CONTEXT_ACTIVATION_MARKER})
+        json!({
+            "additional_context":
+                shared_context_activation_marker(AgentKind::Cursor, cursor_session)
+        })
     );
     assert_eq!(
         run_configured_hook(

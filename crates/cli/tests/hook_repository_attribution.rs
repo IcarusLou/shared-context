@@ -5,7 +5,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use sctx_agent_adapter::SHARED_CONTEXT_ACTIVATION_MARKER;
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
 use sctx_domain::{ExternalSessionLocator, TaskId, WorkingIntentSnapshot};
 use sctx_git_store::GitStore;
 use sctx_local_state::UserConfigStore;
@@ -93,7 +93,7 @@ fn post_tool_attribution_persists_no_evidence_or_unregistered_path() {
         ),
         json!({"hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+            "additionalContext": shared_context_activation_marker(AgentKind::Codex, session)
         }})
     );
     TaskRuntime::initialize(&root)

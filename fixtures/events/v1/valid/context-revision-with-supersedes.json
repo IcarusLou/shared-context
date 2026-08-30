@@ -1,0 +1,40 @@
+{
+  "schema_version": "1",
+  "event_id": "evt_00000000-0000-4000-8000-0000000000b1",
+  "event_type": "context.revision_added",
+  "space_id": "spc_11111111-1111-4111-8111-111111111111",
+  "context_id": "ctx_22222222-2222-4222-8222-2222222222b1",
+  "revision": {
+    "revision_id": "rev_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaa0b1",
+    "parent_revision_ids": [],
+    "kind": "decision",
+    "topic_key": "index/superseded-state",
+    "statement": "The router contract is versioned per release train instead of per build.",
+    "rationale": "Per-build versioning made every consumer re-pin on unrelated changes",
+    "applicability": {
+      "domains": ["index"],
+      "platforms": ["macos"],
+      "conditions": ["release train"]
+    },
+    "assumptions": ["Release trains keep their current cadence"],
+    "recheck_when": ["branch_advanced:main@0123456789abcdef0123456789abcdef01234567"],
+    "relations": [
+      {
+        "target_context_id": "ctx_22222222-2222-4222-8222-2222222222a1",
+        "kind": "supersedes",
+        "rationale": "The per-build decision no longer describes the shipped router contract",
+        "supports": ["The release-train decision replaces it in full"]
+      }
+    ],
+    "evidence": [
+      {
+        "evidence_id": "evd_eeeeeeee-eeee-4eee-8eee-eeeeeeeee0b1",
+        "kind": "source_snapshot",
+        "supports": "The superseding decision names its predecessor",
+        "content": { "relation": "supersedes" },
+        "interpretation": "The target keeps its accepted Git facts; only the projection derives superseded_by",
+        "limitations": ["The derived state is local to one projection"]
+      }
+    ]
+  }
+}

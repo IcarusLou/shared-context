@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sctx_domain::{
     CandidateId, CandidateSubmissionConflict, ConfirmationId, ContextId, DomainProjection, EventId,
-    ReducerDiagnostic, ReducerEvent, SubmissionId, reduce,
+    PublicationId, ReducerDiagnostic, ReducerEvent, SubmissionId, reduce,
 };
 use sctx_event_schema::{
     CandidateSubmissionHint, Event, EventPayload, ParsedEvent, candidate_submission_hint,
@@ -49,6 +49,10 @@ pub(crate) struct BuildInput {
     pub(crate) impacts: Vec<EventImpact>,
     pub(crate) candidate_events: BTreeMap<EventId, CandidateEventMetadata>,
     pub(crate) confirmation_events: BTreeMap<EventId, ConfirmationEventMetadata>,
+    /// Event path that introduced each Publication, resolved to a commit time by the caller.
+    pub(crate) publication_event_paths: BTreeMap<PublicationId, String>,
+    /// Unix-seconds commit time of the commit that first added each Publication Event.
+    pub(crate) publication_times: BTreeMap<PublicationId, i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,6 +89,7 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
     let mut confirmation_events = BTreeMap::new();
     let mut event_batches = BTreeMap::<String, Vec<(EventId, String)>>::new();
     let mut malformed_candidate_hints = Vec::new();
+    let mut publication_event_paths = BTreeMap::<PublicationId, String>::new();
 
     for blob in blobs {
         if blob.path.starts_with("events/") {
@@ -133,6 +138,12 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
                                 commit_oid: None,
                             },
                         );
+                    }
+                    if let EventPayload::ContextPublicationChanged { publication, .. } =
+                        event.payload()
+                    {
+                        publication_event_paths
+                            .insert(publication.publication_id, blob.path.clone());
                     }
                     event_paths
                         .entry(event_id)
@@ -275,6 +286,8 @@ pub(crate) fn build(blobs: &[TreeBlob]) -> BuildInput {
         impacts,
         candidate_events,
         confirmation_events,
+        publication_event_paths,
+        publication_times: BTreeMap::new(),
     }
 }
 

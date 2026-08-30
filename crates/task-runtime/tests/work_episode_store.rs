@@ -104,6 +104,8 @@ fn checkpoint_claim(statement: &str) -> CheckpointClaimDraft {
 
 fn candidate_content(statement: &str) -> ContextRevisionDraft {
     ContextRevisionDraft {
+        problem_view: None,
+        hints: Vec::new(),
         kind: ContextKind::Discovery,
         topic_key: Some("candidate/runtime-analysis".to_owned()),
         statement: statement.to_owned(),

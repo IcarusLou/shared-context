@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sctx_agent_adapter::SHARED_CONTEXT_ACTIVATION_MARKER;
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
 use sctx_domain::{
     Applicability, CandidateReviewStatus, EvidenceSnapshotDraft, EvidenceType,
     ExternalSessionLocator, TaskId, WorkEpisodeStatus, WorkingIntentSnapshot,
@@ -168,10 +168,14 @@ impl Harness {
         let expected = if agent == "codex" {
             json!({"hookSpecificOutput": {
                 "hookEventName": "SessionStart",
-                "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+                "additionalContext":
+                    shared_context_activation_marker(AgentKind::Codex, session)
             }})
         } else {
-            json!({"additional_context": SHARED_CONTEXT_ACTIVATION_MARKER})
+            json!({
+                "additional_context":
+                    shared_context_activation_marker(AgentKind::Cursor, session)
+            })
         };
         assert_eq!(response, expected);
     }
@@ -700,7 +704,14 @@ fn turn_stop_fails_open_after_close_and_later_retry_recovers_builder() {
             expected_intent_revision_id: active.current_intent_revision().unwrap().revision_id,
             expected_episode_version: 0,
             boundary: CheckpointBoundary::Continue,
-            claims: vec![checkpoint_claim("builder-recovery-newer")],
+            // The newer Episode states a distinct fact on purpose: a near-restatement of the
+            // first Episode's Claim is collapsed by Builder deduplication, which would hide the
+            // recovery this test closes.
+            claims: vec![CheckpointClaimDraft {
+                statement: "The recovered Builder drafts an independent durable Candidate"
+                    .to_owned(),
+                ..checkpoint_claim("builder-recovery-newer")
+            }],
             unknowns: Vec::new(),
         })
         .unwrap()

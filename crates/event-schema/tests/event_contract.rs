@@ -96,6 +96,8 @@ fn intent(title: &str) -> IntentSnapshot {
 
 fn context_draft() -> ContextRevisionDraft {
     ContextRevisionDraft {
+        problem_view: None,
+        hints: Vec::new(),
         kind: ContextKind::Decision,
         topic_key: Some("event-schema/compatibility".to_owned()),
         statement: "Unknown schemas are quarantined".to_owned(),
@@ -119,9 +121,9 @@ fn context_draft() -> ContextRevisionDraft {
 }
 
 #[test]
-fn all_eleven_v1_fixtures_round_trip_without_semantic_loss() {
+fn all_fourteen_v1_fixtures_round_trip_without_semantic_loss() {
     let paths = json_files(&fixture_root().join("events/v1/valid"));
-    assert_eq!(paths.len(), 11);
+    assert_eq!(paths.len(), 14);
 
     let mut event_types = Vec::new();
     for path in paths {
@@ -147,11 +149,14 @@ fn all_eleven_v1_fixtures_round_trip_without_semantic_loss() {
             "context.publication_changed",
             "context.reviewed",
             "context.revision_added",
+            "context.revision_added",
+            "context.revision_added",
             "context.space_association_changed",
             "context_candidate.created",
             "engineering_reference.recorded",
             "semantic_conflict.opened",
             "semantic_conflict.resolution_added",
+            "space.created",
             "space.created",
             "space.intent_revision_added",
         ]

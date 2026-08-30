@@ -5,7 +5,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use sctx_agent_adapter::SHARED_CONTEXT_ACTIVATION_MARKER;
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
 use sctx_git_store::GitStore;
 use sctx_local_state::UserConfigStore;
 use serde_json::{Value, json};
@@ -160,7 +160,7 @@ fn hook_writes_zero_mechanical_state_and_direct_evidence_builds_candidate() {
         harness.hook(&session_start(session, &repository)),
         json!({"hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": SHARED_CONTEXT_ACTIVATION_MARKER
+            "additionalContext": shared_context_activation_marker(AgentKind::Codex, session)
         }})
     );
     let started = harness.mcp(&[
@@ -214,7 +214,11 @@ fn hook_writes_zero_mechanical_state_and_direct_evidence_builds_candidate() {
         tool_call(
             5,
             "candidate_list",
-            json!({"agent_kind": "codex", "external_session_id": session}),
+            json!({
+                "agent_kind": "codex",
+                "external_session_id": session,
+                "detail_level": "full"
+            }),
         ),
     ]);
     assert_eq!(

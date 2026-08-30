@@ -354,7 +354,8 @@
           "maxItems": 0,
           "items": { "$ref": "#/$defs/revision_id" }
         },
-        "intent": { "$ref": "#/$defs/intent" }
+        "intent": { "$ref": "#/$defs/intent" },
+        "provisional": { "type": "boolean" }
       },
       "additionalProperties": false
     },
@@ -445,6 +446,7 @@
             "implements",
             "validated_by",
             "contradicts",
+            "supersedes",
             "related_to"
           ]
         },
@@ -483,11 +485,13 @@
           ]
         },
         "topic_key": { "$ref": "#/$defs/non_empty_string" },
+        "problem_view": { "$ref": "#/$defs/non_empty_string" },
         "statement": { "$ref": "#/$defs/non_empty_string" },
         "rationale": { "$ref": "#/$defs/non_empty_string" },
         "applicability": { "$ref": "#/$defs/applicability" },
         "assumptions": { "$ref": "#/$defs/string_list" },
         "recheck_when": { "$ref": "#/$defs/string_list" },
+        "hints": { "$ref": "#/$defs/string_list" },
         "relations": {
           "type": "array",
           "uniqueItems": true,
@@ -546,11 +550,31 @@
             }
           ]
         },
+        "problem_view": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["action", "value"],
+              "properties": {
+                "action": { "const": "set" },
+                "value": { "$ref": "#/$defs/non_empty_string" }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": ["action"],
+              "properties": { "action": { "const": "clear" } },
+              "additionalProperties": false
+            }
+          ]
+        },
         "statement": { "$ref": "#/$defs/non_empty_string" },
         "rationale": { "$ref": "#/$defs/non_empty_string" },
         "applicability": { "$ref": "#/$defs/applicability" },
         "assumptions": { "$ref": "#/$defs/string_list" },
         "recheck_when": { "$ref": "#/$defs/string_list" },
+        "hints": { "$ref": "#/$defs/string_list" },
         "relations": {
           "type": "array",
           "uniqueItems": true,
@@ -727,11 +751,13 @@
           ]
         },
         "topic_key": { "$ref": "#/$defs/non_empty_string" },
+        "problem_view": { "$ref": "#/$defs/non_empty_string" },
         "statement": { "$ref": "#/$defs/non_empty_string" },
         "rationale": { "$ref": "#/$defs/non_empty_string" },
         "applicability": { "$ref": "#/$defs/applicability" },
         "assumptions": { "$ref": "#/$defs/string_list" },
         "recheck_when": { "$ref": "#/$defs/string_list" },
+        "hints": { "$ref": "#/$defs/string_list" },
         "relations": {
           "type": "array",
           "uniqueItems": true,

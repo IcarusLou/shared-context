@@ -10,6 +10,7 @@ use std::{
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     str::FromStr,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use fs2::FileExt;
@@ -32,7 +33,7 @@ pub use sctx_domain::{Error, ErrorKind, Result};
 pub use tokenizer::{normalize_search_text, search_tokens};
 
 /// Current physical `SQLite` schema version.
-pub const DB_SCHEMA_VERSION: &str = "11";
+pub const DB_SCHEMA_VERSION: &str = "15";
 /// Event parser implementation version recorded in every projection.
 pub const EVENT_PARSER_VERSION: &str = "1";
 /// Pure reducer implementation version recorded in every projection.
@@ -201,11 +202,46 @@ pub struct DatabasePragmas {
 }
 
 /// Projection manager for one repository and its external state directory.
+///
+/// Clones share one [`IndexCaches`], so a long-lived server that hands clones to its Search
+/// Engine and its Runtime reduces one Git tree at most once.
 #[derive(Clone, Debug)]
 pub struct ProjectionIndex {
     repository: PathBuf,
     state: PathBuf,
     database: PathBuf,
+    caches: Arc<IndexCaches>,
+}
+
+/// Derived state that is a pure function of the indexed Git tree and may therefore be reused
+/// until that tree changes. Nothing here is authoritative: every entry can be recomputed.
+#[derive(Debug, Default)]
+struct IndexCaches {
+    snapshot: Mutex<Option<CachedDomainSnapshot>>,
+    event_commits: Mutex<EventCommitCache>,
+    head_trees: Mutex<BTreeMap<String, String>>,
+}
+
+/// Bound on remembered `HEAD commit -> Tree` pairs. Only the current commit is ever asked for.
+const MAX_REMEMBERED_HEAD_TREES: usize = 8;
+
+/// One reduced Domain Snapshot together with the exact projection identity it was reduced from.
+#[derive(Debug)]
+struct CachedDomainSnapshot {
+    metadata: IndexMetadata,
+    snapshot: Arc<DomainSnapshot>,
+}
+
+/// Memoized `event_path -> introducing commits`, warmed from the projection database once per
+/// process and refreshed by one history walk whenever an Event path is still unknown.
+#[derive(Debug, Default)]
+struct EventCommitCache {
+    entries: BTreeMap<String, Vec<git_tree::EventAddition>>,
+    warmed: bool,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl ProjectionIndex {
@@ -217,6 +253,7 @@ impl ProjectionIndex {
             repository: repository.into(),
             database: state.join("index.sqlite"),
             state,
+            caches: Arc::default(),
         }
     }
 
@@ -330,11 +367,39 @@ impl ProjectionIndex {
     /// Returns an error when synchronization, Git object access, parsing, or
     /// deterministic reduction cannot complete.
     pub fn domain_snapshot(&self) -> Result<DomainSnapshot> {
+        let snapshot = self.shared_domain_snapshot()?;
+        Ok(DomainSnapshot::clone(&snapshot))
+    }
+
+    /// Shared, reference-counted form of [`Self::domain_snapshot`] for callers that only read.
+    ///
+    /// Reduction is a pure function of the indexed Git tree and the implementation versions, so
+    /// this index and every clone of it reuse the snapshot they already reduced until that exact
+    /// projection identity changes. A changed Tree, a new Generation, or a changed implementation
+    /// version all invalidate the reuse, which keeps `same Tree => same snapshot` intact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when synchronization, Git object access, parsing, or deterministic
+    /// reduction cannot complete.
+    pub fn shared_domain_snapshot(&self) -> Result<Arc<DomainSnapshot>> {
         let outcome = self.synchronize()?;
+        if let Some(cached) = self.cached_domain_snapshot(&outcome.metadata) {
+            return Ok(cached);
+        }
         let tree = git_tree::read_tree(&self.repository, &outcome.metadata.indexed_tree_oid)?;
         let input = self.build_input(&tree.blobs)?;
-        Ok(DomainSnapshot {
-            metadata: outcome.metadata,
+        Ok(self.publish_domain_snapshot(&outcome.metadata, input))
+    }
+
+    /// Records one reduced projection as the snapshot for exactly `metadata`.
+    fn publish_domain_snapshot(
+        &self,
+        metadata: &IndexMetadata,
+        input: project::BuildInput,
+    ) -> Arc<DomainSnapshot> {
+        let snapshot = Arc::new(DomainSnapshot {
+            metadata: metadata.clone(),
             projection: input.projection,
             diagnostics: input
                 .diagnostics
@@ -348,7 +413,20 @@ impl ProjectionIndex {
                     message: diagnostic.message,
                 })
                 .collect(),
-        })
+        });
+        *lock(&self.caches.snapshot) = Some(CachedDomainSnapshot {
+            metadata: metadata.clone(),
+            snapshot: Arc::clone(&snapshot),
+        });
+        snapshot
+    }
+
+    fn cached_domain_snapshot(&self, metadata: &IndexMetadata) -> Option<Arc<DomainSnapshot>> {
+        let cached = lock(&self.caches.snapshot);
+        cached
+            .as_ref()
+            .filter(|entry| &entry.metadata == metadata)
+            .map(|entry| Arc::clone(&entry.snapshot))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -433,7 +511,7 @@ impl ProjectionIndex {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error("begin shadow rebuild transaction"))?;
-            match plan {
+            let projected = match plan {
                 UpdatePlan::Incremental {
                     input,
                     affected_spaces,
@@ -448,6 +526,7 @@ impl ProjectionIndex {
                     if update_kind == IndexUpdateKind::Current {
                         update_kind = IndexUpdateKind::Incremental;
                     }
+                    input
                 }
                 UpdatePlan::Full {
                     input,
@@ -460,26 +539,32 @@ impl ProjectionIndex {
                         incremental_fallback = fallback;
                     }
                     operational_warnings.extend(warnings);
+                    input
                 }
-            }
+            };
             transaction
                 .commit()
                 .map_err(sql_error("commit shadow rebuild transaction"))?;
             require_quick_check(&connection)?;
 
-            let observed_tree = git_tree::tree_oid(&self.repository)?;
+            let observed_tree = self.head_tree_oid()?;
             if observed_tree != head_oid {
                 force_next = false;
                 continue;
             }
-            break Ok(outcome_from_database(
+            let outcome = outcome_from_database(
                 &connection,
                 reason,
                 isolated_database,
                 update_kind,
                 incremental_fallback,
                 operational_warnings,
-            )?);
+            )?;
+            // Both plans project the complete new Tree, and `observed_tree` just proved that Tree
+            // is still `HEAD`. Reduction is a pure function of exactly that input, so the snapshot
+            // this rebuild already computed is the snapshot the next reader would recompute.
+            self.publish_domain_snapshot(&outcome.metadata, projected);
+            break Ok(outcome);
         };
 
         let unlock = FileExt::unlock(&lock).map_err(io_error("unlock index.lock"));
@@ -489,11 +574,34 @@ impl ProjectionIndex {
         }
     }
 
+    /// Reads `HEAD^{tree}`, reusing the answer while `HEAD` still names the same commit.
+    ///
+    /// Every read synchronizes, and every synchronization resolves this twice, so the steady state
+    /// used to spend two `git` processes per read. A commit's Tree cannot change, so resolving
+    /// `HEAD` from Git's own files is an exact substitute whenever it succeeds.
+    fn head_tree_oid(&self) -> Result<String> {
+        let head_commit = git_tree::head_commit_oid(&self.repository);
+        if let Some(commit) = head_commit.as_ref()
+            && let Some(tree) = lock(&self.caches.head_trees).get(commit).cloned()
+        {
+            return Ok(tree);
+        }
+        let tree = git_tree::tree_oid(&self.repository)?;
+        if let Some(commit) = head_commit {
+            let mut remembered = lock(&self.caches.head_trees);
+            if remembered.len() >= MAX_REMEMBERED_HEAD_TREES {
+                remembered.clear();
+            }
+            remembered.insert(commit, tree.clone());
+        }
+        Ok(tree)
+    }
+
     fn current_without_lock(&self) -> Result<Option<RebuildOutcome>> {
         if !self.database.exists() {
             return Ok(None);
         }
-        let before = git_tree::tree_oid(&self.repository)?;
+        let before = self.head_tree_oid()?;
         let Ok(connection) = self.open_read_only() else {
             return Ok(None);
         };
@@ -514,7 +622,7 @@ impl ProjectionIndex {
             None,
             Vec::new(),
         )?;
-        let after = git_tree::tree_oid(&self.repository)?;
+        let after = self.head_tree_oid()?;
         Ok((before == after).then_some(outcome))
     }
 
@@ -604,19 +712,93 @@ impl ProjectionIndex {
 
     fn build_input(&self, blobs: &[git_tree::TreeBlob]) -> Result<project::BuildInput> {
         let mut input = project::build(blobs);
+        let wanted = input
+            .candidate_events
+            .values()
+            .map(|metadata| metadata.event_path.clone())
+            .chain(
+                input
+                    .confirmation_events
+                    .values()
+                    .map(|metadata| metadata.event_path.clone()),
+            )
+            .chain(input.publication_event_paths.values().cloned())
+            .collect::<BTreeSet<_>>();
+        let additions = self.event_additions(&wanted)?;
         for metadata in input.candidate_events.values_mut() {
-            metadata.commit_oid = Some(git_tree::introducing_commit_oid(
-                &self.repository,
-                &metadata.event_path,
-            )?);
+            metadata.commit_oid = Some(introducing_commit_oid(&additions, &metadata.event_path)?);
         }
         for metadata in input.confirmation_events.values_mut() {
-            metadata.commit_oid = Some(git_tree::introducing_commit_oid(
-                &self.repository,
-                &metadata.event_path,
-            )?);
+            metadata.commit_oid = Some(introducing_commit_oid(&additions, &metadata.event_path)?);
         }
+        input.publication_times = input
+            .publication_event_paths
+            .iter()
+            .filter_map(|(publication_id, path)| {
+                additions
+                    .get(path)
+                    .and_then(|entries| entries.first())
+                    .map(|entry| (*publication_id, entry.commit_time))
+            })
+            .collect();
         Ok(input)
+    }
+
+    /// Answers `event_path -> introducing commits` for `wanted`, spending at most one Git process.
+    ///
+    /// Event paths are append-only, so an answer for a path never changes: this memo is warmed
+    /// from the projection database once per process, and only a path it has never seen forces
+    /// the single history walk that re-answers every path at once.
+    fn event_additions(
+        &self,
+        wanted: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, Vec<git_tree::EventAddition>>> {
+        if wanted.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let mut cache = lock(&self.caches.event_commits);
+        if !cache.warmed {
+            cache.warmed = true;
+            if let Ok(connection) = self.open_read_only()
+                && let Ok(persisted) = schema::read_event_commits(&connection)
+            {
+                cache.entries.extend(persisted);
+            }
+        }
+        if wanted.iter().any(|path| !cache.entries.contains_key(path)) {
+            let scanned = git_tree::introducing_commits(&self.repository)?;
+            self.persist_event_commits(&scanned);
+            cache.entries.extend(scanned);
+        }
+        Ok(wanted
+            .iter()
+            .filter_map(|path| {
+                cache
+                    .entries
+                    .get(path)
+                    .map(|entries| (path.clone(), entries.clone()))
+            })
+            .collect())
+    }
+
+    /// Best-effort write of the Event introduction memo; a failure only costs the next walk.
+    fn persist_event_commits(&self, additions: &BTreeMap<String, Vec<git_tree::EventAddition>>) {
+        if !self.database.exists() {
+            return;
+        }
+        let Ok(mut connection) = Connection::open_with_flags(
+            &self.database,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            return;
+        };
+        if connection
+            .busy_timeout(std::time::Duration::from_secs(3))
+            .is_err()
+        {
+            return;
+        }
+        let _ = schema::write_event_commits(&mut connection, additions);
     }
 
     fn open_healthy_or_replace(&self) -> Result<(Connection, Option<PathBuf>)> {
@@ -639,6 +821,43 @@ impl ProjectionIndex {
             .map_err(sql_error("create replacement projection database"))?;
         configure(&connection)?;
         Ok((connection, Some(quarantined)))
+    }
+
+    /// Records the local-only `context_item.stale_reason` derivation for a set of Contexts.
+    ///
+    /// `stale_reason` is *not* a Git fact: it is the outcome of evaluating a Context's structured
+    /// `recheck_when` entries against the current local checkouts. It therefore lives only in this
+    /// machine's projection and is cleared whenever the projection is rebuilt or a Space closure
+    /// is replaced; re-run the evaluator (`sctx doctor --recheck`) after new Events land.
+    ///
+    /// Contexts absent from `reasons` keep whatever they already carry; pass `None` to clear one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when synchronization or the write transaction fails.
+    pub fn record_stale_reasons(&self, reasons: &[(String, Option<String>)]) -> Result<usize> {
+        self.synchronize()?;
+        let mut connection = Connection::open(&self.database)
+            .map_err(sql_error("open projection for stale write"))?;
+        configure(&connection)?;
+        let transaction = connection
+            .transaction()
+            .map_err(sql_error("begin stale-reason transaction"))?;
+        let mut updated = 0;
+        {
+            let mut statement = transaction
+                .prepare("UPDATE context_item SET stale_reason = ?2 WHERE context_id = ?1")
+                .map_err(sql_error("prepare stale-reason update"))?;
+            for (context_id, reason) in reasons {
+                updated += statement
+                    .execute(rusqlite::params![context_id, reason])
+                    .map_err(sql_error("write stale-reason derivation"))?;
+            }
+        }
+        transaction
+            .commit()
+            .map_err(sql_error("commit stale-reason transaction"))?;
+        Ok(updated)
     }
 
     fn open_read_only(&self) -> Result<Connection> {
@@ -1046,6 +1265,27 @@ fn read_metadata(connection: &Connection) -> Result<Option<IndexMetadata>> {
         normalizer_tokenizer_version,
         search_ranking_version,
     }))
+}
+
+/// Resolves the one commit that introduced an append-only Event path.
+///
+/// The zero and many cases stay hard errors: a Candidate or Confirmation Event whose introduction
+/// is not unique has no defensible publication identity.
+fn introducing_commit_oid(
+    additions: &BTreeMap<String, Vec<git_tree::EventAddition>>,
+    path: &str,
+) -> Result<String> {
+    match additions.get(path).map(Vec::as_slice) {
+        Some([entry]) => Ok(entry.commit_oid.clone()),
+        None | Some([]) => Err(Error::new(
+            ErrorKind::External,
+            format!("Candidate event has no introducing commit: {path}"),
+        )),
+        Some(_) => Err(Error::new(
+            ErrorKind::External,
+            format!("Candidate event has multiple introducing commits: {path}"),
+        )),
+    }
 }
 
 fn versions_are_current(metadata: &IndexMetadata) -> bool {

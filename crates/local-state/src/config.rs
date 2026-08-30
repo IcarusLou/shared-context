@@ -30,6 +30,123 @@ struct ConfigDocument {
     repositories: Vec<RepositoryConfigDocument>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     repository_groups: Vec<RepositoryGroupConfigDocument>,
+    /// Optional experimental Hook switches. Absent means every switch is off and
+    /// the serialized document keeps its previous bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hooks: Option<HookConfigDocument>,
+    /// Optional Context time-to-live policy. Absent means no Context ever expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_ttl: Option<ContextTtlConfigDocument>,
+}
+
+/// Optional `[context_ttl]` table: how long an accepted Context of one kind stays current.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextTtlConfigDocument {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    validation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    progress: Option<String>,
+}
+
+/// Configured lifetime per Context kind, in whole seconds.
+///
+/// An absent entry disables expiry for that kind, and the default policy expires nothing. Expiry
+/// is measured from the publication time of the accepted revision. V1 Events carry no timestamp
+/// of their own, so that time is the commit time of the Event that published the revision.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ContextTtlPolicy {
+    pub validation_seconds: Option<i64>,
+    pub progress_seconds: Option<i64>,
+}
+
+impl ContextTtlPolicy {
+    /// Whether any Context kind has a configured lifetime.
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        self.validation_seconds.is_some() || self.progress_seconds.is_some()
+    }
+
+    fn from_document(document: Option<&ContextTtlConfigDocument>) -> Result<Self> {
+        let Some(document) = document else {
+            return Ok(Self::default());
+        };
+        Ok(Self {
+            validation_seconds: document
+                .validation
+                .as_deref()
+                .map(|value| parse_ttl_duration(value, "validation"))
+                .transpose()?,
+            progress_seconds: document
+                .progress
+                .as_deref()
+                .map(|value| parse_ttl_duration(value, "progress"))
+                .transpose()?,
+        })
+    }
+}
+
+/// Parses `<positive integer><s|m|h|d|w>` into whole seconds.
+fn parse_ttl_duration(value: &str, field: &str) -> Result<i64> {
+    let trimmed = value.trim();
+    let split = trimmed
+        .find(|character: char| !character.is_ascii_digit())
+        .ok_or_else(|| invalid(format!("[context_ttl] {field} requires a unit suffix")))?;
+    let (digits, unit) = trimmed.split_at(split);
+    let amount = digits
+        .parse::<i64>()
+        .map_err(|_| invalid(format!("[context_ttl] {field} is not a positive duration")))?;
+    if amount <= 0 {
+        return Err(invalid(format!(
+            "[context_ttl] {field} must be a positive duration"
+        )));
+    }
+    let multiplier = match unit {
+        "s" => 1_i64,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        "w" => 604_800,
+        _ => {
+            return Err(invalid(format!(
+                "[context_ttl] {field} unit must be one of s, m, h, d, w"
+            )));
+        }
+    };
+    amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| invalid(format!("[context_ttl] {field} duration overflows")))
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HookConfigDocument {
+    #[serde(default)]
+    artifact_focus_reminder: bool,
+}
+
+/// Explicit local Hook switches read on the bounded Hook hot path.
+///
+/// Every switch is an off-by-default experiment: a missing `[hooks]` table, a
+/// missing key, and an explicit `false` are the same decision.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct HookSettings {
+    /// P4.1 experiment: the `PostTool` Hook may run one read-only Engineering Graph lookup
+    /// for a located file and emit one bounded Artifact focus reminder.
+    pub artifact_focus_reminder: bool,
+}
+
+impl HookSettings {
+    const fn from_document(document: Option<HookConfigDocument>) -> Self {
+        match document {
+            Some(hooks) => Self {
+                artifact_focus_reminder: hooks.artifact_focus_reminder,
+            },
+            None => Self {
+                artifact_focus_reminder: false,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -108,6 +225,19 @@ pub struct RepositoryCatalogAddOutcome {
     pub repository: RepositoryCatalogEntry,
     pub created_identity: bool,
     pub added_paths: usize,
+}
+
+/// Result of one atomic local-only Catalog `RepositoryId` rename (ADR-0001, Mew #235).
+///
+/// Only the local Catalog identity changes. Append-only Git history is never
+/// rewritten, so any `EngineeringReference` recorded under `previous_repository_id`
+/// keeps that spelling; `sctx repository doctor` reports how many such References
+/// remain.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RepositoryCatalogRenameOutcome {
+    pub previous_repository_id: RepositoryId,
+    pub repository: RepositoryCatalogEntry,
+    pub renamed_repository_group_members: usize,
 }
 
 /// Result of one atomic, semantically idempotent `RepositoryGroup` add operation.
@@ -207,6 +337,26 @@ pub struct RepositoryCatalogInspection {
     pub repository_groups: Vec<RepositoryCatalogGroupCheck>,
 }
 
+/// Prefix of the pre-ADR-0001 opaque `RepositoryId` spelling. Values with this
+/// prefix remain valid and readable (ADR-0001 does not rewrite Git history) but
+/// are flagged by `doctor_repository_catalog` for team-name migration via
+/// [`UserConfigStore::rename_repository`].
+pub const LEGACY_REPOSITORY_ID_PREFIX: &str = "rpo_";
+
+/// One typed, JSON-stable Catalog diagnosis finding. Each variant serializes
+/// with a fixed `kind` tag so CLI/MCP callers can match on it without parsing
+/// free text.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RepositoryCatalogDiagnostic {
+    /// A Catalog entry still uses the legacy `rpo_<uuid>` identity spelling.
+    LegacyRepositoryId {
+        repository_id: RepositoryId,
+        message: String,
+        migration_command: String,
+    },
+}
+
 /// Bounded explicit Catalog diagnosis.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RepositoryCatalogDoctorReport {
@@ -216,6 +366,7 @@ pub struct RepositoryCatalogDoctorReport {
     pub repository_group_count: usize,
     pub checkouts: Vec<RepositoryCatalogCheckoutCheck>,
     pub repository_groups: Vec<RepositoryCatalogGroupCheck>,
+    pub diagnostics: Vec<RepositoryCatalogDiagnostic>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -258,6 +409,8 @@ impl UserConfigStore {
             store: path_text(&root.join("repository"))?,
             repositories: Vec::new(),
             repository_groups: Vec::new(),
+            hooks: None,
+            context_ttl: None,
         };
         validate_document_structure(&document, &root.join("repository"))?;
         toml::to_string_pretty(&document).map_err(|error| {
@@ -296,6 +449,8 @@ impl UserConfigStore {
                     store: path_text(&manager.repository)?,
                     repositories: Vec::new(),
                     repository_groups: Vec::new(),
+                    hooks: None,
+                    context_ttl: None,
                 })?;
             }
             Ok(())
@@ -360,6 +515,68 @@ impl UserConfigStore {
         let outcome = self
             .read_document()
             .map(|document| catalog_snapshot(&document));
+        finish_locked(&lock, outcome)
+    }
+
+    /// Reads the Catalog and the explicit Hook switches from the same bounded,
+    /// non-blocking `config.toml` read.
+    ///
+    /// The Hook hot path uses this instead of a second file open: the disabled
+    /// decision costs exactly the read it already performed.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or filesystem errors.
+    pub fn repository_catalog_with_hooks(
+        &self,
+    ) -> Result<(RepositoryCatalogSnapshot, HookSettings)> {
+        let lock = self.lock_shared()?;
+        let outcome = self.read_document().map(|document| {
+            let hooks = HookSettings::from_document(document.hooks);
+            (catalog_snapshot(&document), hooks)
+        });
+        finish_locked(&lock, outcome)
+    }
+
+    /// Reads the Catalog and the explicit `[context_ttl]` policy from the same
+    /// bounded, non-blocking `config.toml` read.
+    ///
+    /// Public MCP dispatch authorizes every call against a frozen Catalog and
+    /// then serves it under that same Catalog's Context lifetime policy. Both
+    /// come from one file, so they come from one read: a second open would add
+    /// a lock acquisition per call and could observe a newer `config.toml` than
+    /// the one that authorized the call.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or filesystem errors.
+    pub fn repository_catalog_with_context_ttl(
+        &self,
+    ) -> Result<(RepositoryCatalogSnapshot, ContextTtlPolicy)> {
+        let lock = self.lock_shared()?;
+        let outcome = self.read_document().and_then(|document| {
+            let context_ttl = ContextTtlPolicy::from_document(document.context_ttl.as_ref())?;
+            Ok((catalog_snapshot(&document), context_ttl))
+        });
+        finish_locked(&lock, outcome)
+    }
+
+    /// Reads the explicit `[context_ttl]` policy from `config.toml`.
+    ///
+    /// A missing table is the default policy: nothing expires. Invalid durations are a typed
+    /// configuration error rather than a silently ignored setting.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or filesystem errors.
+    pub fn context_ttl_policy(&self) -> Result<ContextTtlPolicy> {
+        // Request-serving code reads this on every call, so it waits for a concurrent explicit
+        // configuration writer instead of failing the call the way the Hook hot path does.
+        let lock = open_private_file(&self.lock_path)?;
+        FileExt::lock_shared(&lock).map_err(io_error("lock config.lock shared"))?;
+        let outcome = self
+            .read_document()
+            .and_then(|document| ContextTtlPolicy::from_document(document.context_ttl.as_ref()));
         finish_locked(&lock, outcome)
     }
 
@@ -782,6 +999,31 @@ impl UserConfigStore {
                 .repository_groups
                 .iter()
                 .all(|group| group.status == CatalogRepositoryGroupStatus::Available);
+        let diagnostics = catalog
+            .repositories
+            .iter()
+            .filter(|repository| {
+                repository
+                    .repository_id
+                    .as_str()
+                    .starts_with(LEGACY_REPOSITORY_ID_PREFIX)
+            })
+            .map(
+                |repository| RepositoryCatalogDiagnostic::LegacyRepositoryId {
+                    repository_id: repository.repository_id.clone(),
+                    message: format!(
+                        "Repository {} still uses the pre-ADR-0001 legacy identity spelling; \
+                     rename it to a team-chosen readable name. Existing EngineeringReference \
+                     events keep the legacy spelling (ADR-0001 does not rewrite Git history).",
+                        repository.repository_id
+                    ),
+                    migration_command: format!(
+                        "sctx repository rename --from {} --to <ReadableRepositoryId>",
+                        repository.repository_id
+                    ),
+                },
+            )
+            .collect();
         Ok(RepositoryCatalogDoctorReport {
             healthy,
             repository_count: catalog.repositories.len(),
@@ -789,7 +1031,86 @@ impl UserConfigStore {
             repository_group_count: inspection.repository_groups.len(),
             checkouts,
             repository_groups: inspection.repository_groups,
+            diagnostics,
         })
+    }
+
+    /// Atomically renames one local Catalog `RepositoryId` identity.
+    ///
+    /// Only the local Catalog changes: no Git Event is appended or rewritten,
+    /// so any `EngineeringReference` recorded under `from` durably keeps that
+    /// spelling (ADR-0001). Any `RepositoryGroup` that names `from` as a member
+    /// is updated in the same atomic write to keep the Catalog internally
+    /// consistent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ErrorKind::InvalidInput` when `from` and `to` are identical,
+    /// `ErrorKind::RepositoryNotConfigured` when `from` is not configured, and
+    /// `ErrorKind::Conflict` when `to` already names a configured identity
+    /// (exact or case-insensitive match).
+    pub fn rename_repository(
+        &self,
+        from: &RepositoryId,
+        to: &RepositoryId,
+    ) -> Result<RepositoryCatalogRenameOutcome> {
+        if from.as_str() == to.as_str() {
+            return Err(invalid(
+                "repository rename requires a --to identity different from --from",
+            ));
+        }
+        let lock = self.lock()?;
+        let outcome = (|| {
+            let mut document = self.read_document_for_repair()?;
+            let index = document
+                .repositories
+                .iter()
+                .position(|repository| &repository.id == from)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::RepositoryNotConfigured,
+                        format!("Repository identity is not configured: {from}"),
+                    )
+                })?;
+            if let Some(conflict) = document
+                .repositories
+                .iter()
+                .find(|repository| repository.id.as_str().eq_ignore_ascii_case(to.as_str()))
+            {
+                return Err(Error::new(
+                    ErrorKind::Conflict,
+                    format!(
+                        "Repository ID {to} already names configured identity {}",
+                        conflict.id
+                    ),
+                ));
+            }
+            document.repositories[index].id = to.clone();
+            let mut renamed_repository_group_members = 0usize;
+            for group in &mut document.repository_groups {
+                if let Some(position) = group.members.iter().position(|member| member == from) {
+                    group.members[position] = to.clone();
+                    group.members.sort();
+                    renamed_repository_group_members += 1;
+                }
+            }
+            document
+                .repositories
+                .sort_by_key(|repository| repository.id.to_string());
+            self.validate_document(&document)?;
+            self.write_document(&document)?;
+            let repository = catalog_snapshot(&document)
+                .repositories
+                .into_iter()
+                .find(|repository| &repository.repository_id == to)
+                .ok_or_else(|| invariant("renamed Repository disappeared before commit"))?;
+            Ok(RepositoryCatalogRenameOutcome {
+                previous_repository_id: from.clone(),
+                repository,
+                renamed_repository_group_members,
+            })
+        })();
+        finish_locked(&lock, outcome)
     }
 
     fn lock(&self) -> Result<File> {

@@ -1,0 +1,165 @@
+{
+  "fixture_version": "probe-v1",
+  "repository_id": "Server",
+  "repository_files": {
+    "app/src/main/kotlin/comment/CommentBottomBarManager.kt": "package comment\n\nclass CommentBottomBarManager(private val slots: PrioritySlots) {\n    fun bindDefaultInput() {\n        if (slots.isFree(\"POI_ENTRY\")) {\n            slots.attachDefaultCommentInput()\n        }\n    }\n}\n",
+    "app/src/main/kotlin/poi/PoiEntranceAssem.kt": "package poi\n\nclass PoiEntranceAssem(private val service: DummyVerticalDomainService?) {\n    fun canShow(): Boolean = true\n\n    fun register(slots: PrioritySlots) {\n        slots.claim(\"POI_ENTRY\", this)\n    }\n}\n",
+    "app/src/main/kotlin/anchor/ProductAnchorAssem.kt": "package anchor\n\nclass ProductAnchorAssem(private val entry: ILiveEntryService?) {\n    fun onAnchorClick(params: Map<String, String>) {\n        val enriched = entry?.addParamsForLiveAnchor(params) ?: return\n        entry.navigateToLiveRoom(enriched)\n    }\n}\n",
+    "app/src/main/kotlin/live/ILiveEntryService.kt": "package live\n\ninterface ILiveEntryService {\n    fun addParamsForLiveAnchor(params: Map<String, String>): Map<String, String>?\n\n    fun navigateToLiveRoom(params: Map<String, String>)\n}\n",
+    "app/src/main/kotlin/vertical/DummyVerticalDomainService.kt": "package vertical\n\nclass DummyVerticalDomainService {\n    fun resolveEntrance(): Any? = null\n\n    fun logMusicDetail(): Map<String, String> = emptyMap()\n}\n"
+  },
+  "contexts": [
+    {
+      "index": 1,
+      "label": "poi-null-guard-too-late",
+      "goal": "Review POI entrance bottom bar fallback regression",
+      "acceptance_conditions": ["the POI entrance null guard is traced end to end"],
+      "context_kind": "issue",
+      "statement": "POI 底栏的 null 保护发生得过晚：当 DummyVerticalDomainService 返回 null 且 canShow() 为 true 时，PoiEntranceAssem 已注册到优先级管理器，随后以空容器抢占 POI_ENTRY，阻止默认评论栏兜底。",
+      "rationale": "优先级注册早于 null 判定，因此空容器仍然占位并让兜底逻辑无法执行。",
+      "conditions": ["enterFrom 为 search_result"],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "PoiEntranceAssem.kt:118 在 DummyVerticalDomainService 返回 null 时仍然完成注册；CommentBottomBarManager.kt:96 的默认输入栏兜底因此被跳过。",
+          "limitations": ["synthetic association probe fixture"]
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "label": "absent-module-safe-degradation",
+      "goal": "Assess vertical domain module absence degradation",
+      "acceptance_conditions": ["degradation behaviour without implementation modules is written down"],
+      "context_kind": "discovery",
+      "statement": "When vertical-domain implementation modules are absent, the branch intentionally changes behavior from unresolved-service failure to safe degradation, so strict all-configuration functional equivalence does not hold.",
+      "rationale": "The reviewed branch trades a hard resolution failure for a degraded but survivable entrance, which is a deliberate behavioural change rather than a defect.",
+      "conditions": ["implementation modules excluded from the build"],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "VerticalDomainRegistry.kt:44 shows the branch replacing unresolved-service failure with a dummy fallback whenever implementation modules are absent.",
+          "limitations": ["synthetic association probe fixture"]
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "label": "product-anchor-early-return",
+      "goal": "Review product anchor live entry navigation gap",
+      "acceptance_conditions": ["the product anchor click path is compared against the baseline"],
+      "context_kind": "issue",
+      "statement": "当 ILiveEntryService 无真实实现或 addParamsForLiveAnchor 返回 null 时，ProductAnchorAssem 会在商品锚点点击回调中提前 return，跳过配置分发与进入直播间导航；基线仍会导航，因此该路径不功能等价。",
+      "rationale": "提前 return 让点击回调既不分发配置也不发起导航，与基线行为出现可观察差异。",
+      "conditions": ["无真实 vertical 实现模块"],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "ProductAnchorAssem.kt:202 商品锚点点击回调在 addParamsForLiveAnchor 返回 null 时提前 return；ILiveEntryService.kt:31 在该配置下没有真实实现。",
+          "limitations": ["synthetic association probe fixture"]
+        }
+      ]
+    },
+    {
+      "index": 4,
+      "label": "real-implementation-debug-build",
+      "goal": "Validate debug build with the real vertical domain implementation",
+      "acceptance_conditions": ["the debug variant is built with the implementation module present"],
+      "context_kind": "validation",
+      "statement": "With the real vertical-domain implementation included, the reviewed branch preserves runtime service resolution and the debug app builds successfully.",
+      "rationale": "Runtime resolution keeps returning the real implementation, so the degraded path is never entered in this configuration.",
+      "conditions": ["real implementation module present"],
+      "evidence": [
+        {
+          "evidence_type": "experiment_record",
+          "summary": "assembleDebug finished with BUILD SUCCESSFUL after the real vertical-domain implementation module was added back (build.log:512).",
+          "limitations": ["synthetic association probe fixture"]
+        }
+      ]
+    },
+    {
+      "index": 5,
+      "label": "dummy-versus-dynamic-proxy",
+      "goal": "Compare dummy service and legacy dynamic proxy return values",
+      "acceptance_conditions": ["return-value equivalence per type category is recorded"],
+      "context_kind": "discovery",
+      "statement": "无真实实现时，Dummy 与旧动态代理在 primitive、void 和 nullable 返回值上大多等价；music-detail 日志方法由 null 变为空 Map。",
+      "rationale": "逐类型比较返回值后，只有 music-detail 日志方法出现了可观察的返回值差异。",
+      "conditions": ["无真实实现"],
+      "evidence": [
+        {
+          "evidence_type": "experiment_record",
+          "summary": "DummyRegistry.kt:57 的 Dummy 实现对 primitive 返回 0、对 void 返回 Unit、对 nullable 返回 null；music-detail 日志方法返回空 Map。",
+          "limitations": ["synthetic association probe fixture"]
+        }
+      ]
+    },
+    {
+      "index": 6,
+      "label": "changed-modules-compile",
+      "goal": "Verify Debug Kotlin compilation for changed library modules",
+      "acceptance_conditions": ["every directly changed module compiles"],
+      "context_kind": "validation",
+      "statement": "All directly changed library modules compile successfully with their Debug Kotlin tasks.",
+      "rationale": "Each changed module was compiled on its own so a failure could be attributed to one module.",
+      "conditions": [],
+      "evidence": [
+        {
+          "evidence_type": "experiment_record",
+          "summary": "gradle :feature-comment:compileDebugKotlin :feature-poi:compileDebugKotlin :feature-anchor:compileDebugKotlin all reported BUILD SUCCESSFUL (build.log:41).",
+          "limitations": ["synthetic association probe fixture"]
+        }
+      ]
+    },
+    {
+      "index": 7,
+      "label": "unrelated-cli-version-check",
+      "goal": "Track release checklist version assertion progress",
+      "acceptance_conditions": ["the release checklist step is recorded"],
+      "context_kind": "progress",
+      "statement": "The release checklist now verifies that the packaged command line tool reports the expected semantic version before publishing.",
+      "rationale": "A mismatched packaged version had previously shipped, so the checklist gained an explicit assertion step.",
+      "conditions": [],
+      "evidence": [
+        {
+          "evidence_type": "artifact_snapshot",
+          "summary": "release-checklist.md:12 records the packaged version assertion step.",
+          "limitations": ["synthetic association probe fixture"]
+        }
+      ]
+    }
+  ],
+  "relations": [
+    {
+      "from": 2,
+      "to": 1,
+      "kind": "contradicts",
+      "rationale": "Deliberate safe degradation and the too-late null guard describe the same absent-module configuration with opposite verdicts.",
+      "supports": ["strict all-configuration functional equivalence does not hold"]
+    }
+  ],
+  "probes": [
+    {"id": "zh-01", "category": "chinese_natural_language", "query": "评论详情页底栏为什么没有默认评论输入框", "expected": [1]},
+    {"id": "zh-02", "category": "chinese_natural_language", "query": "评论区底栏被空容器抢占", "expected": [1]},
+    {"id": "zh-03", "category": "chinese_natural_language", "query": "POI 底栏 null 保护", "expected": [1]},
+    {"id": "zh-04", "category": "chinese_natural_language", "query": "直播商品锚点点击没反应", "expected": [3]},
+    {"id": "zh-05", "category": "chinese_natural_language", "query": "去掉 vertical 模块后哪些功能受影响", "expected": [2]},
+    {"id": "zh-06", "category": "chinese_natural_language", "query": "不包含真实实现时的降级行为", "expected": [2]},
+    {"id": "zh-07", "category": "chinese_natural_language", "query": "功能等价", "expected": [3, 2]},
+    {"id": "zh-08", "category": "chinese_natural_language", "query": "music-detail 日志 空 Map", "expected": [5]},
+    {"id": "zh-09", "category": "chinese_natural_language", "query": "编译 Debug Kotlin", "expected": [6]},
+    {"id": "en-01", "category": "english_natural_language", "query": "comment bottom bar missing default input", "expected": [1]},
+    {"id": "en-02", "category": "english_natural_language", "query": "product anchor click does not navigate", "expected": [3]},
+    {"id": "en-03", "category": "english_natural_language", "query": "safe degradation when module absent", "expected": [2]},
+    {"id": "en-04", "category": "english_natural_language", "query": "functional equivalence", "expected": [2]},
+    {"id": "en-05", "category": "english_natural_language", "query": "debug app builds successfully", "expected": [4]},
+    {"id": "id-01", "category": "identifier", "query": "CommentBottomBarManager", "expected": [1]},
+    {"id": "id-02", "category": "identifier", "query": "PoiEntranceAssem", "expected": [1]},
+    {"id": "id-03", "category": "identifier", "query": "ProductAnchorAssem", "expected": [3]},
+    {"id": "id-04", "category": "identifier", "query": "ILiveEntryService", "expected": [3]},
+    {"id": "id-05", "category": "identifier", "query": "ILiveEntryService 返回 null", "expected": [3]},
+    {"id": "id-06", "category": "identifier", "query": "DummyVerticalDomainService", "expected": [1, 2]},
+    {"id": "id-07", "category": "identifier", "query": "compileDebugKotlin", "expected": [6]},
+    {"id": "noise-01", "category": "noise", "query": "kubernetes ingress timeout", "expected": []}
+  ]
+}

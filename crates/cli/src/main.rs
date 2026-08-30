@@ -3,7 +3,7 @@
 mod args;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
     fs,
@@ -18,9 +18,10 @@ use std::{
 
 use args::Options;
 use sctx_agent_adapter::{
-    AgentCapabilities, CanonicalAgentAction, CanonicalAgentEvent, CanonicalAgentEventKind,
-    EpisodeFinalizationTrigger, PathHint, ResolvedActivationDecision, ResolvedAgentAction,
-    TaskRuntimeOperation, ToolCategory, ToolOutcome, TrustState, plan_action_for_activation,
+    AgentCapabilities, ArtifactFocusReminderContext, CanonicalAgentAction, CanonicalAgentEvent,
+    CanonicalAgentEventKind, EpisodeFinalizationTrigger, PathHint, ResolvedActivationDecision,
+    ResolvedAgentAction, TaskRuntimeOperation, ToolCategory, ToolOutcome, TrustState,
+    artifact_focus_reminder_file, plan_action_for_activation, render_artifact_focus_reminder,
 };
 use sctx_domain::{
     Applicability, CandidateReviewStatus, ConflictParticipant, ConflictResolutionDraft,
@@ -30,23 +31,31 @@ use sctx_domain::{
     RepositoryId, ResolutionOutcome, Result, ReviewDraft, ReviewSummary, ReviewVerdict, RevisionId,
     SemanticConflictDraft, SpaceId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkEpisodeStatus,
 };
+use sctx_engineering_graph::{
+    ARTIFACT_FOCUS_QUERY_BUDGET, ArtifactFocusReader, MAX_ARTIFACT_FOCUS_HITS,
+};
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendOutcome, AppendRequest, BatchId, GitStore};
 use sctx_index::{
     DomainSnapshot, IndexMetadata, ProjectionDiagnosticView, ProjectionIndex, RebuildOutcome,
 };
 use sctx_local_state::{
-    AuthorizedSessionScope, AuthorizedSessionScopeDecision, AuthorizedSessionScopeRead,
-    AuthorizedSessionScopeStore, CatalogCheckoutStatus, CatalogRepositoryGroupStatus,
-    MaintenanceLock, RepositoryCatalogSnapshot, UserConfigStore,
+    ArtifactReminderKey, ArtifactReminderMark, ArtifactReminderStore, AuthorizedSessionScope,
+    AuthorizedSessionScopeDecision, AuthorizedSessionScopeRead, AuthorizedSessionScopeStore,
+    CatalogCheckoutStatus, CatalogRepositoryGroupStatus, HookSettings, MaintenanceLock,
+    RepositoryCatalogDiagnostic, RepositoryCatalogSnapshot, UserConfigStore,
 };
 use sctx_mcp::{
     ArtifactFocusQuery, AssociationExplainInput, AssociationRebuildInput, CandidateAnalyzeInput,
-    CandidateConfirmInput, CandidateDiscardInput, CandidateGetInput, CandidateListInput,
-    EngineeringReferenceRecordInput, RepositoryScanInput, TaskCheckpointInput,
-    TaskContextReadInput, TaskIntentUpdateInput, TaskSignalSupersedeInput,
+    CandidateConfirmBatchInput, CandidateConfirmInput, CandidateDiscardBatchInput,
+    CandidateDiscardInput, CandidateGetInput, CandidateListInput, EngineeringReferenceRecordInput,
+    RepositoryScanInput, TaskCheckpointInput, TaskContextReadInput, TaskIntentUpdateInput,
+    TaskSignalSupersedeInput,
 };
-use sctx_search::{ContextStatus, ScopeFilter, SearchEngine, SearchFilters, SearchRequest};
+use sctx_search::{
+    ContextPackDetailLevel, ContextStatus, ScopeFilter, SearchEngine, SearchFilters,
+    SearchMatchMode, SearchRequest,
+};
 use sctx_task_runtime::{AutomatedEpisodeBoundary, CandidateBuildStatus, TaskRuntime};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -63,7 +72,7 @@ Commands:
   setup [--demo] [--agents cursor,codex] [--knowledge-store-url GIT_URL]
       [--root PATH] [--runtime-source PATH]
   demo
-  doctor [--fix] [--root PATH]
+  doctor [--fix] [--recheck] [--root PATH]
   upgrade [--agents cursor,codex] [--root PATH] [--runtime-source PATH]
   uninstall [--root PATH]
   data reset [--dry-run] [--yes]
@@ -255,7 +264,7 @@ fn run_install_lifecycle(command: &str, args: &[String], json_output: bool) -> R
 }
 
 fn run_doctor(args: &[String], json_output: bool) -> Result<()> {
-    let options = Options::parse(args, &["--fix"])?;
+    let options = Options::parse(args, &["--fix", "--recheck"])?;
     options.allow_only(
         &[
             "--root",
@@ -263,8 +272,16 @@ fn run_doctor(args: &[String], json_output: bool) -> Result<()> {
             "--runtime-version",
             "--agents",
         ],
-        &["--fix"],
+        &["--fix", "--recheck"],
     )?;
+    if options.has("--recheck") {
+        if options.has("--fix") {
+            return Err(invalid(
+                "sctx doctor --recheck evaluates recheck_when only; run --fix separately",
+            ));
+        }
+        return run_doctor_recheck(&options, json_output);
+    }
     let installer = installer_from_options(&options)?;
     let report = if options.has("--fix") {
         installer.doctor_fix(&setup_options(&options)?)?
@@ -272,6 +289,26 @@ fn run_doctor(args: &[String], json_output: bool) -> Result<()> {
         installer.doctor()
     };
     emit_lifecycle(&report, json_output)
+}
+
+/// Evaluates the structured `recheck_when` subset against the local Repository checkouts.
+///
+/// The outcome is local derived state written to this machine's projection: it never becomes an
+/// Event, and a projection rebuild clears it, so this is the command to re-run afterwards.
+fn run_doctor_recheck(options: &Options, json_output: bool) -> Result<()> {
+    let root = options
+        .optional("--root")?
+        .map_or_else(installation_root, |value| Ok(PathBuf::from(value)))?;
+    let response = sctx_mcp::context_recheck_at_root(root)?;
+    let data =
+        serde_json::to_value(&response).map_err(json_error("serialize recheck evaluation"))?;
+    emit_raw(
+        "doctor.recheck",
+        &response.tree,
+        response.generation,
+        &data,
+        json_output,
+    )
 }
 
 fn run_uninstall(args: &[String], json_output: bool) -> Result<()> {
@@ -450,6 +487,10 @@ fn demo_intent() -> IntentSnapshot {
 
 fn demo_context() -> ContextRevisionDraft {
     ContextRevisionDraft {
+        // The fixed demo fixture has no derived problem framing or unresolved locator hints to
+        // carry (WP-D's reference derivation only runs over real checkpoint claims).
+        problem_view: None,
+        hints: Vec::new(),
         kind: ContextKind::Validation,
         topic_key: Some(DEMO_TOPIC.to_owned()),
         statement: DEMO_STATEMENT.to_owned(),
@@ -807,19 +848,7 @@ fn run_hook(args: &[String]) -> Result<()> {
         activation,
         ResolvedActivationDecision::Direct | ResolvedActivationDecision::Group
     );
-    let action = plan_action_for_activation(&event, &capabilities, activation);
-    let action = if event.kind() == CanonicalAgentEventKind::PostToolUse && activated {
-        authorization
-            .scope
-            .as_ref()
-            .zip(authorization.catalog.as_ref())
-            .and_then(|(scope, catalog)| {
-                attribute_post_tool_action(&event, action, scope, catalog).ok()
-            })
-            .unwrap_or_else(CanonicalAgentAction::neutral)
-    } else {
-        action
-    };
+    let action = plan_hook_action(agent, &event, &capabilities, &authorization);
     let resolved = resolve_hook_action(action);
     if maintenance.is_some() && event.kind() == CanonicalAgentEventKind::SessionEnd {
         remove_hook_session_scope(agent, &event.context().session_id);
@@ -841,11 +870,52 @@ fn run_hook(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Resolves the complete Hook policy for one event: pure activation policy,
+/// then `PostToolUse` Catalog attribution, then the off-by-default P4.1 reminder.
+fn plan_hook_action(
+    agent: &str,
+    event: &CanonicalAgentEvent,
+    capabilities: &AgentCapabilities,
+    authorization: &HookAuthorization,
+) -> CanonicalAgentAction {
+    let activation = authorization.activation;
+    let action = plan_action_for_activation(event, capabilities, activation);
+    let action = if event.kind() == CanonicalAgentEventKind::PostToolUse
+        && matches!(
+            activation,
+            ResolvedActivationDecision::Direct | ResolvedActivationDecision::Group
+        ) {
+        authorization
+            .scope
+            .as_ref()
+            .zip(authorization.catalog.as_ref())
+            .and_then(|(scope, catalog)| {
+                attribute_post_tool_action(event, action, scope, catalog).ok()
+            })
+            .unwrap_or_else(CanonicalAgentAction::neutral)
+    } else {
+        action
+    };
+    if authorization.hooks.artifact_focus_reminder {
+        add_artifact_focus_reminder(
+            agent,
+            event,
+            action,
+            activation,
+            capabilities,
+            authorization,
+        )
+    } else {
+        action
+    }
+}
+
 #[derive(Debug)]
 struct HookAuthorization {
     activation: ResolvedActivationDecision,
     scope: Option<AuthorizedSessionScope>,
     catalog: Option<RepositoryCatalogSnapshot>,
+    hooks: HookSettings,
 }
 
 impl HookAuthorization {
@@ -854,6 +924,9 @@ impl HookAuthorization {
             activation: ResolvedActivationDecision::Disabled,
             scope: None,
             catalog: None,
+            hooks: HookSettings {
+                artifact_focus_reminder: false,
+            },
         }
     }
 }
@@ -878,7 +951,7 @@ fn resolve_hook_authorization_inner(
     let root = installation_root()?;
     let locator = ExternalSessionLocator::new(agent, session_id)?;
     let config = UserConfigStore::open_existing(&root)?;
-    let catalog = config.repository_catalog()?;
+    let (catalog, hooks) = config.repository_catalog_with_hooks()?;
     let store = AuthorizedSessionScopeStore::initialize(&root)?;
 
     let scope = match store.try_read(&locator, &catalog)? {
@@ -907,6 +980,7 @@ fn resolve_hook_authorization_inner(
         activation,
         scope,
         catalog: Some(catalog),
+        hooks,
     })
 }
 
@@ -917,8 +991,102 @@ fn remove_hook_session_scope(agent: &str, session_id: &str) {
     else {
         return;
     };
+    if root.join("state").join("artifact-reminders").is_dir() {
+        if let Ok(store) = ArtifactReminderStore::open(&root) {
+            store.forget(&locator);
+        }
+    }
     let _removed =
         AuthorizedSessionScopeStore::initialize(root).and_then(|store| store.try_remove(&locator));
+}
+
+/// P4.1 experiment (`[hooks] artifact_focus_reminder`, default off).
+///
+/// When explicitly enabled, one located `PostToolUse` file operation may add one
+/// bounded Artifact focus reminder. The path stays read-only: it runs no Git, no
+/// Repository scan, and no Graph rebuild, opens `state/engineering.sqlite`
+/// read-only without waiting for a lock, and writes no fact. Every failure —
+/// unresolved path, absent projection, query budget, unusable reminder state —
+/// degrades to the disabled output.
+fn add_artifact_focus_reminder(
+    agent: &str,
+    event: &CanonicalAgentEvent,
+    mut action: CanonicalAgentAction,
+    activation: ResolvedActivationDecision,
+    capabilities: &AgentCapabilities,
+    authorization: &HookAuthorization,
+) -> CanonicalAgentAction {
+    if action.additional_context.is_some() {
+        return action;
+    }
+    if let Some(reminder) =
+        resolve_artifact_focus_reminder(agent, event, activation, capabilities, authorization)
+    {
+        action.additional_context = Some(reminder);
+    }
+    action
+}
+
+fn resolve_artifact_focus_reminder(
+    agent: &str,
+    event: &CanonicalAgentEvent,
+    activation: ResolvedActivationDecision,
+    capabilities: &AgentCapabilities,
+    authorization: &HookAuthorization,
+) -> Option<String> {
+    let file = artifact_focus_reminder_file(
+        event,
+        activation,
+        capabilities,
+        authorization.hooks.artifact_focus_reminder,
+    )?;
+    let catalog = authorization.catalog.as_ref()?;
+    let AuthorizedSessionScopeDecision::Direct {
+        repository_id: authorized_repository_id,
+    } = &authorization.scope.as_ref()?.decision
+    else {
+        return None;
+    };
+    let declared = catalog.resolve_declared_path(file).ok()?;
+    let resolved = catalog
+        .resolve_file_path(file, std::slice::from_ref(&declared.checkout_path))
+        .ok()?;
+    if resolved.repository_id != *authorized_repository_id {
+        return None;
+    }
+    let root = installation_root().ok()?;
+    let hits = ArtifactFocusReader::new(&root)
+        .accepted_contexts_for_file(
+            &resolved.repository_id,
+            &resolved.relative_path,
+            MAX_ARTIFACT_FOCUS_HITS,
+            ARTIFACT_FOCUS_QUERY_BUDGET,
+        )
+        .ok()?;
+    if hits.is_empty() {
+        return None;
+    }
+    let contexts = hits
+        .into_iter()
+        .map(|hit| ArtifactFocusReminderContext {
+            context_id: hit.context_id,
+            title: hit.statement,
+        })
+        .collect::<Vec<_>>();
+    let reminder = render_artifact_focus_reminder(resolved.relative_path.as_str(), &contexts)?;
+    let locator = ExternalSessionLocator::new(agent, &event.context().session_id).ok()?;
+    let key = ArtifactReminderKey::new(
+        &resolved.repository_id.to_string(),
+        resolved.relative_path.as_str(),
+    )
+    .ok()?;
+    match ArtifactReminderStore::open(&root)
+        .ok()?
+        .mark_reminded(&locator, &key)
+    {
+        ArtifactReminderMark::FirstReminder => Some(reminder),
+        ArtifactReminderMark::AlreadyReminded => None,
+    }
 }
 
 #[derive(Debug)]
@@ -1594,8 +1762,17 @@ fn run_space(args: &[String], json_output: bool) -> Result<()> {
                         .filter_map(|id| space.intent.revisions.get(id))
                         .map(|revision| revision.intent.title.clone())
                         .collect::<Vec<_>>();
+                    // A conflicted Space has no winning head, so it never reports provisional.
+                    let provisional = space.intent.heads.len() == 1
+                        && space
+                            .intent
+                            .heads
+                            .first()
+                            .and_then(|revision_id| space.intent.revisions.get(revision_id))
+                            .is_some_and(|revision| revision.provisional);
                     json!({"space_id": space.space_id, "intent_heads": space.intent.heads,
-                           "titles": titles, "context_count": space.contexts.len()})
+                           "titles": titles, "context_count": space.contexts.len(),
+                           "provisional": provisional})
                 })
                 .collect::<Vec<_>>();
             emit(
@@ -1635,11 +1812,11 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
         [command, rest @ ..] if command == "list" => {
             if is_help(rest) {
                 println!(
-                    "Usage: sctx candidate list --agent-kind <KIND> --external-session-id <ID> [--status pending|discarded|expired|confirmed] [--limit <N>] [--cursor <CURSOR>] [--token-budget <N>]"
+                    "Usage: sctx candidate list --agent-kind <KIND> --external-session-id <ID> [--status pending|discarded|expired|confirmed] [--limit <N>] [--cursor <CURSOR>] [--token-budget <N>] [--compact]"
                 );
                 return Ok(());
             }
-            let options = Options::parse(rest, &[])?;
+            let options = Options::parse(rest, &["--compact"])?;
             options.allow_only(
                 &[
                     "--agent-kind",
@@ -1649,7 +1826,7 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
                     "--cursor",
                     "--token-budget",
                 ],
-                &[],
+                &["--compact"],
             )?;
             let input = CandidateListInput {
                 agent_kind: options.required("--agent-kind")?.to_owned(),
@@ -1664,15 +1841,26 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
                     "token budget",
                 )?,
             };
-            let response = sctx_mcp::candidate_list_at_root(installation_root()?, &input)?;
+            // `--compact` mirrors the MCP `detail_level: "compact"` selector: the Full Rust entry
+            // point stays the default so existing behavior is unchanged when the flag is absent.
+            let detail_level = if options.has("--compact") {
+                ContextPackDetailLevel::Compact
+            } else {
+                ContextPackDetailLevel::Full
+            };
+            let response = sctx_mcp::candidate_list_with_detail_at_root(
+                installation_root()?,
+                &input,
+                detail_level,
+            )?;
             let metadata = Runtime::open()?.index.synchronize()?.metadata;
-            emit(
-                "candidate.list",
-                &metadata,
-                serde_json::to_value(response)
+            let data = match detail_level {
+                ContextPackDetailLevel::Compact => serde_json::to_value(response.compact())
+                    .map_err(json_error("serialize compact Candidate Review list"))?,
+                ContextPackDetailLevel::Full => serde_json::to_value(response)
                     .map_err(json_error("serialize Candidate Review list"))?,
-                json_output,
-            )
+            };
+            emit("candidate.list", &metadata, data, json_output)
         }
         [command, rest @ ..] if command == "get" => {
             if is_help(rest) {
@@ -1703,7 +1891,7 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
         [command, rest @ ..] if command == "discard" => {
             if is_help(rest) {
                 println!(
-                    "Usage: sctx candidate discard --agent-kind <KIND> --external-session-id <ID> --expected-task-id <ID> --expected-intent-revision-id <ID> --candidate-id <ID> --expected-review-version <N> --reason <TEXT>"
+                    "Usage: sctx candidate discard --agent-kind <KIND> --external-session-id <ID> --expected-task-id <ID> --expected-intent-revision-id <ID> --candidate-id <ID> [--candidate-id <ID> ...] --expected-review-version <N> --reason <TEXT>\n  (repeat --candidate-id to discard several owned Pending Candidates atomically)"
                 );
                 return Ok(());
             }
@@ -1720,48 +1908,115 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
                 ],
                 &[],
             )?;
-            let input = CandidateDiscardInput {
-                agent_kind: options.required("--agent-kind")?.to_owned(),
-                external_session_id: options.required("--external-session-id")?.to_owned(),
-                expected_task_id: options.required("--expected-task-id")?.to_owned(),
-                expected_intent_revision_id: options
-                    .required("--expected-intent-revision-id")?
-                    .to_owned(),
-                candidate_id: options.required("--candidate-id")?.to_owned(),
-                expected_review_version: parse_u64(
-                    options.required("--expected-review-version")?,
-                    "expected Review version",
-                )?,
-                reason: options.required("--reason")?.to_owned(),
-            };
-            let response = sctx_mcp::candidate_discard_at_root(installation_root()?, &input)?;
-            let metadata = Runtime::open()?.index.synchronize()?.metadata;
-            emit(
-                "candidate.discard",
-                &metadata,
-                serde_json::to_value(response)
-                    .map_err(json_error("serialize Candidate discard response"))?,
-                json_output,
-            )
+            let candidate_ids = strings(options.many("--candidate-id"));
+            if candidate_ids.is_empty() {
+                return Err(invalid("missing required option --candidate-id"));
+            }
+            let agent_kind = options.required("--agent-kind")?.to_owned();
+            let external_session_id = options.required("--external-session-id")?.to_owned();
+            let expected_task_id = options.required("--expected-task-id")?.to_owned();
+            let expected_intent_revision_id = options
+                .required("--expected-intent-revision-id")?
+                .to_owned();
+            let expected_review_version = parse_u64(
+                options.required("--expected-review-version")?,
+                "expected Review version",
+            )?;
+            let reason = options.required("--reason")?.to_owned();
+            if let [candidate_id] = candidate_ids.as_slice() {
+                let input = CandidateDiscardInput {
+                    agent_kind,
+                    external_session_id,
+                    expected_task_id,
+                    expected_intent_revision_id,
+                    candidate_id: candidate_id.clone(),
+                    expected_review_version,
+                    reason,
+                };
+                let response = sctx_mcp::candidate_discard_at_root(installation_root()?, &input)?;
+                let metadata = Runtime::open()?.index.synchronize()?.metadata;
+                emit(
+                    "candidate.discard",
+                    &metadata,
+                    serde_json::to_value(response)
+                        .map_err(json_error("serialize Candidate discard response"))?,
+                    json_output,
+                )
+            } else {
+                let input = CandidateDiscardBatchInput {
+                    agent_kind,
+                    external_session_id,
+                    expected_task_id,
+                    expected_intent_revision_id,
+                    candidate_ids,
+                    expected_review_version,
+                    reason,
+                };
+                let response =
+                    sctx_mcp::candidate_discard_batch_at_root(installation_root()?, &input)?;
+                let metadata = Runtime::open()?.index.synchronize()?.metadata;
+                let mut data = serde_json::to_value(response)
+                    .map_err(json_error("serialize Candidate discard batch response"))?;
+                if let Value::Object(ref mut map) = data {
+                    map.insert("batch".to_owned(), Value::Bool(true));
+                }
+                emit("candidate.discard", &metadata, data, json_output)
+            }
         }
         [command, rest @ ..] if command == "confirm" => {
             if is_help(rest) {
-                println!("Usage: sctx candidate confirm --input <JSON_FILE>");
+                println!(
+                    "Usage: sctx candidate confirm --input <JSON_FILE>\n  (JSON with candidate_ids confirms several owned Pending Candidates atomically; candidate_id confirms one)"
+                );
                 return Ok(());
             }
             let options = Options::parse(rest, &[])?;
             options.allow_only(&["--input"], &[])?;
-            let input: CandidateConfirmInput =
-                read_json(options.required("--input")?, "Candidate Confirmation input")?;
-            let response = sctx_mcp::candidate_confirm_at_root(installation_root()?, &input)?;
-            let metadata = Runtime::open()?.index.synchronize()?.metadata;
-            emit(
-                "candidate.confirm",
-                &metadata,
-                serde_json::to_value(response)
-                    .map_err(json_error("serialize Candidate Confirmation response"))?,
-                json_output,
-            )
+            let path = options.required("--input")?;
+            let raw: Value = read_json(path, "Candidate Confirmation input")?;
+            let has_single = raw.get("candidate_id").is_some();
+            let has_batch = raw.get("candidate_ids").is_some();
+            match (has_single, has_batch) {
+                (true, false) => {
+                    let input: CandidateConfirmInput =
+                        serde_json::from_value(raw).map_err(|error| {
+                            invalid(format!(
+                                "invalid Candidate Confirmation input JSON in {path}: {error}"
+                            ))
+                        })?;
+                    let response =
+                        sctx_mcp::candidate_confirm_at_root(installation_root()?, &input)?;
+                    let metadata = Runtime::open()?.index.synchronize()?.metadata;
+                    emit(
+                        "candidate.confirm",
+                        &metadata,
+                        serde_json::to_value(response)
+                            .map_err(json_error("serialize Candidate Confirmation response"))?,
+                        json_output,
+                    )
+                }
+                (false, true) => {
+                    let input: CandidateConfirmBatchInput =
+                        serde_json::from_value(raw).map_err(|error| {
+                            invalid(format!(
+                                "invalid Candidate Confirmation batch input JSON in {path}: {error}"
+                            ))
+                        })?;
+                    let response =
+                        sctx_mcp::candidate_confirm_batch_at_root(installation_root()?, &input)?;
+                    let metadata = Runtime::open()?.index.synchronize()?.metadata;
+                    let mut data = serde_json::to_value(response).map_err(json_error(
+                        "serialize Candidate Confirmation batch response",
+                    ))?;
+                    if let Value::Object(ref mut map) = data {
+                        map.insert("batch".to_owned(), Value::Bool(true));
+                    }
+                    emit("candidate.confirm", &metadata, data, json_output)
+                }
+                _ => Err(invalid(
+                    "Candidate Confirmation input must include exactly one of candidate_id or candidate_ids",
+                )),
+            }
         }
         [command, rest @ ..] if command == "analyze" => {
             if is_help(rest) {
@@ -2243,8 +2498,8 @@ fn run_conflict_resolve(args: &[String], json_output: bool) -> Result<()> {
 }
 
 fn run_search(args: &[String], json_output: bool) -> Result<()> {
-    let options = Options::parse(args, &[])?;
-    allow_search_options(&options, &[])?;
+    let options = Options::parse(args, &["--exact"])?;
+    allow_search_options(&options, &["--exact"])?;
     let request = search_request(&options)?;
     let runtime = Runtime::open()?;
     let response = SearchEngine::new(runtime.index).search(&request)?;
@@ -2326,7 +2581,7 @@ fn run_task(args: &[String], json_output: bool) -> Result<()> {
 }
 
 fn run_task_context(args: &[String], json_output: bool) -> Result<()> {
-    let options = Options::parse(args, &[])?;
+    let options = Options::parse(args, &["--compact"])?;
     options.allow_only(
         &[
             "--agent-kind",
@@ -2334,7 +2589,7 @@ fn run_task_context(args: &[String], json_output: bool) -> Result<()> {
             "--token-budget",
             "--max-spaces",
         ],
-        &[],
+        &["--compact"],
     )?;
     let input = TaskContextReadInput {
         agent_kind: options.required("--agent-kind")?.to_owned(),
@@ -2348,22 +2603,38 @@ fn run_task_context(args: &[String], json_output: bool) -> Result<()> {
             "max spaces",
         )?,
     };
-    let response = sctx_mcp::task_context_readonly_at_root(installation_root()?, &input)?;
-    let data =
-        serde_json::to_value(&response).map_err(json_error("serialize Task Context response"))?;
-    emit_raw(
-        "task.context",
-        &response.tree,
-        response.generation,
-        &data,
-        json_output,
-    )
+    // `--compact` mirrors the MCP `detail_level: "compact"` selector: the Full Rust entry point
+    // stays the default so existing behavior is unchanged when the flag is absent.
+    let detail_level = if options.has("--compact") {
+        ContextPackDetailLevel::Compact
+    } else {
+        ContextPackDetailLevel::Full
+    };
+    let response = sctx_mcp::task_context_readonly_with_detail_at_root(
+        installation_root()?,
+        &input,
+        detail_level,
+    )?;
+    let (tree, generation, data) = match detail_level {
+        ContextPackDetailLevel::Compact => {
+            let compact = response.compact();
+            let data = serde_json::to_value(&compact)
+                .map_err(json_error("serialize compact Task Context response"))?;
+            (compact.tree.clone(), compact.generation, data)
+        }
+        ContextPackDetailLevel::Full => {
+            let data = serde_json::to_value(&response)
+                .map_err(json_error("serialize Task Context response"))?;
+            (response.tree.clone(), response.generation, data)
+        }
+    };
+    emit_raw("task.context", &tree, generation, &data, json_output)
 }
 
 fn run_repository(args: &[String], json_output: bool) -> Result<()> {
     let [command, rest @ ..] = args else {
         return Err(invalid(
-            "Usage: sctx repository add|list|doctor|scan|group [OPTIONS]",
+            "Usage: sctx repository add|list|doctor|rename|scan|group [OPTIONS]",
         ));
     };
     let root = installation_root()?;
@@ -2391,6 +2662,7 @@ fn run_repository(args: &[String], json_output: bool) -> Result<()> {
         }
         "list" => run_repository_list(rest, json_output, &root),
         "doctor" => run_repository_doctor(rest, json_output, &root),
+        "rename" => run_repository_rename(rest, json_output, &root),
         "group" => run_repository_group(rest, json_output, &root),
         "scan" => {
             let options = Options::parse(rest, &[])?;
@@ -2419,7 +2691,7 @@ fn run_repository(args: &[String], json_output: bool) -> Result<()> {
             )
         }
         _ => Err(invalid(
-            "repository command must be add, list, doctor, scan, or group",
+            "repository command must be add, list, doctor, rename, scan, or group",
         )),
     }
 }
@@ -2463,11 +2735,61 @@ fn run_repository_doctor(args: &[String], json_output: bool, root: &Path) -> Res
     let sync = syncable
         .then(|| sctx_mcp::sync_repository_catalog_at_root(root))
         .transpose()?;
+    let legacy_engineering_reference_counts =
+        legacy_repository_engineering_reference_counts(root, &report.diagnostics)?;
     let metadata = repository_repair_command_metadata(root)?;
     emit(
         "repository.doctor",
         &metadata,
-        json!({"catalog": report, "registry": sync}),
+        json!({
+            "catalog": report,
+            "registry": sync,
+            "legacy_repository_engineering_reference_counts": legacy_engineering_reference_counts,
+        }),
+        json_output,
+    )
+}
+
+/// Counts, per legacy (pre-ADR-0001) `RepositoryId`, how many locally indexed
+/// `EngineeringReference` events still name it. This is informational only: it
+/// never rewrites Git history and a missing/uninitialized Store simply reports
+/// zero counts rather than failing `sctx repository doctor`.
+fn legacy_repository_engineering_reference_counts(
+    root: &Path,
+    diagnostics: &[RepositoryCatalogDiagnostic],
+) -> Result<BTreeMap<String, usize>> {
+    let mut counts = diagnostics
+        .iter()
+        .map(|diagnostic| {
+            let RepositoryCatalogDiagnostic::LegacyRepositoryId { repository_id, .. } = diagnostic;
+            (repository_id.to_string(), 0usize)
+        })
+        .collect::<BTreeMap<_, _>>();
+    if counts.is_empty() || !root.join("repository").exists() {
+        return Ok(counts);
+    }
+    let projection =
+        ProjectionIndex::new(root.join("repository"), root.join("state")).domain_snapshot()?;
+    for reference in projection.projection.engineering_references.values() {
+        if let Some(count) = counts.get_mut(reference.reference.repository_id.as_str()) {
+            *count += 1;
+        }
+    }
+    Ok(counts)
+}
+
+fn run_repository_rename(args: &[String], json_output: bool, root: &Path) -> Result<()> {
+    let options = Options::parse(args, &[])?;
+    options.allow_only(&["--from", "--to"], &[])?;
+    let from = parse_id::<RepositoryId>(options.required("--from")?, "Repository ID")?;
+    let to = parse_id::<RepositoryId>(options.required("--to")?, "Repository ID")?;
+    let outcome = UserConfigStore::open_existing(root)?.rename_repository(&from, &to)?;
+    let sync = sctx_mcp::sync_repository_catalog_at_root(root)?;
+    let metadata = repository_repair_command_metadata(root)?;
+    emit(
+        "repository.rename",
+        &metadata,
+        json!({"catalog": outcome, "registry": sync}),
         json_output,
     )
 }
@@ -2768,6 +3090,10 @@ struct ContextDraftInput {
     kind: ContextKind,
     #[serde(default)]
     topic_key: Option<String>,
+    /// Optional restatement of the problem this Context answers (WP-E1's
+    /// `ContextRevisionDraft::problem_view`), passed through verbatim when supplied.
+    #[serde(default)]
+    problem_view: Option<String>,
     statement: String,
     rationale: String,
     #[serde(default)]
@@ -2776,6 +3102,9 @@ struct ContextDraftInput {
     assumptions: Vec<String>,
     #[serde(default)]
     recheck_when: Vec<String>,
+    /// Unresolved locator hints (paths, basenames, identifiers) kept as searchable text only.
+    #[serde(default)]
+    hints: Vec<String>,
     #[serde(default)]
     relations: Vec<sctx_domain::ContextRelation>,
     evidence: Vec<EvidenceInput>,
@@ -2797,6 +3126,8 @@ impl From<ContextDraftInput> for ContextRevisionDraft {
         Self {
             kind: input.kind,
             topic_key: input.topic_key,
+            problem_view: input.problem_view,
+            hints: input.hints,
             statement: input.statement,
             rationale: input.rationale,
             applicability: input.applicability,
@@ -2876,6 +3207,11 @@ fn context_draft(options: &Options) -> Result<ContextRevisionDraft> {
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(ContextRevisionDraft {
+        // The individual-flag form of `context revise` has no flag for a derived problem
+        // framing or unresolved locator hints; use `--input` with `problem_view`/`hints` to set
+        // them (WP-E1's `ContextRevisionDraft` fields).
+        problem_view: None,
+        hints: Vec::new(),
         kind: parse_kind(options.required("--kind")?)?,
         topic_key: options.optional("--topic-key")?.map(ToOwned::to_owned),
         statement: options.required("--statement")?.to_owned(),
@@ -2898,6 +3234,13 @@ fn applicability(options: &Options) -> Applicability {
 
 fn search_request(options: &Options) -> Result<SearchRequest> {
     Ok(SearchRequest {
+        // `--exact` keeps the strict all-token lookup; the default recalls a known fact that the
+        // caller phrased differently.
+        match_mode: if options.has("--exact") {
+            SearchMatchMode::Exact
+        } else {
+            SearchMatchMode::Ranked
+        },
         query: options.optional("--query")?.unwrap_or_default().to_owned(),
         filters: SearchFilters {
             space_ids: parse_many_ids(options, "--space-id", "space ID")?,
@@ -2972,7 +3315,7 @@ fn allow_search_options(options: &Options, extra: &[&str]) -> Result<()> {
     ];
     let mut switches = Vec::new();
     for option in extra {
-        if *option == "--automatic" {
+        if matches!(*option, "--automatic" | "--exact") {
             switches.push(*option);
         } else {
             allowed.push(*option);
@@ -3306,6 +3649,7 @@ const fn error_code(kind: ErrorKind) -> &'static str {
         ErrorKind::External => "external_error",
         ErrorKind::Unsupported => "unsupported",
         ErrorKind::RepositoryNotConfigured => "repository_not_configured",
+        ErrorKind::Conflict => "conflict",
         ErrorKind::IdempotencyKeyConflict => "idempotency_key_conflict",
         ErrorKind::MaintenanceBusy => "maintenance_busy",
         _ => "unknown_error",

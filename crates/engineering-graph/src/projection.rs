@@ -308,7 +308,13 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
     let version = connection
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .map_err(sql_error("read Engineering projection schema version"))?;
-    if version != 0 && version != SCHEMA_VERSION {
+    if version == SCHEMA_VERSION {
+        // Every request-serving open lands here. The batch below is idempotent but still
+        // writes `PRAGMA user_version`, which takes the database write lock and can queue
+        // behind a concurrent reader on a hot path that only ever reads.
+        return Ok(());
+    }
+    if version != 0 {
         return Err(invariant(format!(
             "unsupported Engineering projection schema version {version}"
         )));

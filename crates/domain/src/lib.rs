@@ -7,6 +7,7 @@ use std::fmt;
 mod confirmation;
 mod engineering;
 mod episode;
+pub mod hints;
 mod ids;
 mod model;
 mod reducer;
@@ -19,7 +20,8 @@ pub use confirmation::{
     CandidateConfirmationPlanEventIds, CandidateConfirmationPrimaryReference,
     CandidateConfirmationRequest, CandidatePrimarySelection, ContextSpaceAssociation,
     ContextSpaceAssociationDraft, ContextSpaceAssociationOrigin, OptionalCandidateEdits,
-    TopicKeyEdit, context_revision_as_draft, context_revision_content_hash,
+    ProblemViewEdit, SemanticConflictOpening, SemanticConflictOpeningDraft, TopicKeyEdit,
+    context_revision_as_draft, context_revision_content_hash,
 };
 pub use engineering::{
     ArtifactAssociationKind, ArtifactKey, ArtifactKind, ArtifactLocator, ArtifactRelationKind,

@@ -256,12 +256,18 @@ fn stale_contract() -> ScenarioDefinition {
             actor: ActorId::new("session").unwrap(),
         })
     };
-    let intent = |goal: &str| object([("goal", string(goal))]);
+    let intent = |goal: &str, direction: &str| {
+        object([
+            ("goal", string(goal)),
+            ("current_direction", string(direction)),
+        ])
+    };
     let update = |id: &str,
                   after: Vec<StepId>,
                   boundary: &str,
                   expected: TemplateValue,
                   goal: &str,
+                  direction: &str,
                   expectation: ActionExpectation|
      -> ScenarioAction {
         ScenarioAction {
@@ -276,7 +282,7 @@ fn stale_contract() -> ScenarioDefinition {
                     ("external_session_id", session_builtin()),
                     ("task_boundary", string(boundary)),
                     ("expected_revision_id", expected),
-                    ("intent", intent(goal)),
+                    ("intent", intent(goal, direction)),
                 ]),
             },
         }
@@ -358,6 +364,7 @@ fn stale_contract() -> ScenarioDefinition {
                 "new",
                 TemplateValue::Null,
                 "establish the first synthetic direction",
+                "open the synthetic lineage",
                 ActionExpectation::default(),
             ),
             update(
@@ -366,15 +373,20 @@ fn stale_contract() -> ScenarioDefinition {
                 "continue",
                 variable("revision-one"),
                 "move to the second synthetic direction",
+                "advance the synthetic lineage",
                 ActionExpectation::default(),
             ),
             observe("before-stale", "intent-two"),
+            // The stale attempt restates the current Head goal and only changes the direction: a
+            // superseded parent that states a different goal is a concurrent-Agent fork, so the
+            // stale CAS rejection is only reachable through a same-goal replay.
             update(
                 "stale-attempt",
                 vec![step("before-stale")],
                 "continue",
                 variable("revision-one"),
-                "attempt a stale third synthetic direction",
+                "move to the second synthetic direction",
+                "replay from a superseded parent",
                 ActionExpectation::TypedFailure {
                     code: ExpectedFailureCode::new("intent_stale").unwrap(),
                     kind: ExpectedFailureKind::StaleState,
@@ -453,31 +465,33 @@ fn direct_product_stale_cas_keeps_semantics_despite_infrastructure_bytes() {
     let temporary = tempdir().unwrap();
     let root = temporary.path().join("root");
     GitStore::bootstrap_local(&root).unwrap();
-    let input = |boundary, expected_revision_id, goal: &str| TaskIntentUpdateInput {
-        agent_kind: "codex".to_owned(),
-        external_session_id: "direct-stale-session".to_owned(),
-        task_boundary: boundary,
-        expected_revision_id,
-        intent: WorkingIntentSnapshot {
-            goal: goal.to_owned(),
-            current_direction: None,
-            in_scope: vec![],
-            out_of_scope: vec![],
-            domains: vec![],
-            platforms: vec![],
-            constraints: vec![],
-            acceptance_conditions: vec![],
-            artifact_hints: vec![],
-            interface_hints: vec![],
-            open_questions: vec![],
-        },
-    };
+    let input =
+        |boundary, expected_revision_id, goal: &str, direction: &str| TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: "direct-stale-session".to_owned(),
+            task_boundary: boundary,
+            expected_revision_id,
+            intent: WorkingIntentSnapshot {
+                goal: goal.to_owned(),
+                current_direction: Some(direction.to_owned()),
+                in_scope: vec![],
+                out_of_scope: vec![],
+                domains: vec![],
+                platforms: vec![],
+                constraints: vec![],
+                acceptance_conditions: vec![],
+                artifact_hints: vec![],
+                interface_hints: vec![],
+                open_questions: vec![],
+            },
+        };
     let first = task_intent_update_at_root(
         &root,
         &input(
             TaskBoundary::New,
             ExpectedRevisionId::Null(()),
             "first direct direction",
+            "open the direct lineage",
         ),
     )
     .unwrap();
@@ -487,6 +501,7 @@ fn direct_product_stale_cas_keeps_semantics_despite_infrastructure_bytes() {
             TaskBoundary::Continue,
             ExpectedRevisionId::Revision(first.context.intent_revision_id.to_string()),
             "second direct direction",
+            "advance the direct lineage",
         ),
     )
     .unwrap();
@@ -502,12 +517,15 @@ fn direct_product_stale_cas_keeps_semantics_despite_infrastructure_bytes() {
         )
         .unwrap();
     let before = state_fingerprint(&root).unwrap();
+    // The stale replay keeps the current Head goal: a superseded parent that states a different
+    // goal now forks a parallel TaskSession instead of failing the CAS.
     task_intent_update_at_root(
         &root,
         &input(
             TaskBoundary::Continue,
             ExpectedRevisionId::Revision(first.context.intent_revision_id.to_string()),
-            "stale direct direction",
+            "second direct direction",
+            "replay from a superseded parent",
         ),
     )
     .unwrap_err();

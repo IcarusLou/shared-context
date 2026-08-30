@@ -7,7 +7,7 @@ use sctx_domain::{
     CandidateSpaceRecommendationPath, ContextCandidate, ContextRevision, ContextRevisionDraft,
     ContextRevisionRef, EvidenceSnapshotDraft, IntentSnapshot, ProposedSpaceGroupKey,
     RecommendedSpaceRole, RevisionLifecycle, SpaceId, TaskId, TaskIntentRevisionId, TaskSignal,
-    TaskSpaceAssociation, WorkingIntentSnapshot,
+    TaskSpaceAssociation, WorkingIntentSnapshot, hints,
 };
 use sctx_engineering_graph::EngineeringProjectionSnapshot;
 use sctx_index::{DomainSnapshot, normalize_search_text, search_tokens};
@@ -23,8 +23,23 @@ pub const MAX_CANDIDATE_ANALYSIS_TOP_K: usize = 32;
 const PRIMARY_SPACE_THRESHOLD: u64 = 90_000;
 const RRF_K: u64 = 60;
 const PROPOSED_SPACE_GROUP_SCORE: u64 = 1_000_000;
-const PROPOSED_SPACE_TITLE_MAX_CHARS: usize = 80;
-const PROPOSED_SPACE_TITLE_MAX_WORDS: usize = 12;
+/// Maximum `char` length of a proposed Space title before elision.
+///
+/// A proposed title is a short handle a reviewer scans in a Candidate list, not a restatement of
+/// the goal: the whole goal already reaches the Space as `desired_outcome`.
+const PROPOSED_SPACE_TITLE_MAX_CHARS: usize = 40;
+/// Normalized statement token Jaccard at or above which two Claims state the same fact.
+pub const STATEMENT_SIMILARITY_STRONG_BASIS_POINTS: u64 = 8_000;
+/// Lower bound of the band where two Claims are close enough to need human contradiction review.
+pub const STATEMENT_SIMILARITY_REVIEW_BASIS_POINTS: u64 = 5_000;
+/// Shared repository identifiers at or above which two Claims are about the same code.
+///
+/// One shared identifier is a coincidence of vocabulary; two independently written spellings of
+/// the same type, service or symbol are not. This is the only strong-association path that
+/// survives a Claim being written in a different natural language from its target.
+pub const SHARED_IDENTIFIER_STRONG_OVERLAP: usize = 2;
+/// Shared identifiers at or above which the two Claims restate one another regardless of wording.
+pub const SHARED_IDENTIFIER_SUPPORT_OVERLAP: usize = 3;
 
 /// Complete, Task-owned input to one rebuildable Candidate analysis.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,6 +73,12 @@ struct TargetState {
     channels: BTreeMap<&'static str, usize>,
     paths: Vec<CandidateAssessmentPath>,
     score: u64,
+    /// Normalized statement token Jaccard against the Candidate, in basis points.
+    statement_similarity: u64,
+    /// True when a near-duplicate statement negates the Candidate instead of restating it.
+    negation_conflict: bool,
+    /// Normalized repository identifiers this accepted, safe target shares with the Candidate.
+    shared_identifiers: Vec<String>,
 }
 
 #[derive(Default)]
@@ -84,7 +105,9 @@ impl SearchEngine {
         request.candidate.content.validate()?;
         request.source_working_intent.validate()?;
         TaskSignal::validate_collection(&request.source_task_signals)?;
-        let snapshot = self.index.domain_snapshot()?;
+        // The index reuses the snapshot it already reduced for this Tree, so the Builder's own
+        // read and every per-Candidate analysis of the same commit share one reduction.
+        let snapshot = self.index.shared_domain_snapshot()?;
         if request
             .proposed_space_group_space_id
             .is_some_and(|space_id| !snapshot.projection.spaces.contains_key(&space_id))
@@ -117,6 +140,9 @@ impl SearchEngine {
             },
             page_size: request.top_k.saturating_mul(4).clamp(1, 128),
             cursor: None,
+            // The Candidate query is a single token, so ranked and exact matching agree; ranked
+            // keeps the coverage explanation consistent with every other search caller.
+            match_mode: crate::SearchMatchMode::Ranked,
         })?;
         let source_spaces = self.task_space_associations(
             request.source_task_id,
@@ -149,6 +175,7 @@ impl SearchEngine {
 
         let mut targets = collect_targets(&snapshot);
         add_exact_channels(&request.candidate.content, &mut targets);
+        add_identifier_channel(&request.candidate.content, &mut targets);
         add_explicit_channel(&request.explicit_related_contexts, &mut targets);
         add_graph_channel(graph.as_ref(), &request.artifact_refs, &mut targets)?;
         add_bm25_channel(&bm25.results, &mut targets);
@@ -267,6 +294,9 @@ fn collect_targets(snapshot: &DomainSnapshot) -> BTreeMap<ContextRevisionRef, Ta
                                 channels: BTreeMap::new(),
                                 paths: Vec::new(),
                                 score: 0,
+                                statement_similarity: 0,
+                                negation_conflict: false,
+                                shared_identifiers: Vec::new(),
                             },
                         )
                     })
@@ -280,6 +310,8 @@ fn add_exact_channels(
     targets: &mut BTreeMap<ContextRevisionRef, TargetState>,
 ) {
     let candidate_statement = normalize_search_text(&candidate.statement);
+    let candidate_tokens = token_set(&candidate_statement);
+    let candidate_negations = negation_markers(&candidate.statement);
     let candidate_topic = candidate
         .topic_key
         .as_deref()
@@ -290,13 +322,37 @@ fn add_exact_channels(
     let mut topics = Vec::new();
     let mut scopes = Vec::new();
     for (target, state) in targets.iter_mut() {
-        let draft = revision_draft(&state.revision);
-        if &draft == candidate {
-            canonical.push(*target);
-            add_path(state, CandidateAssessmentPath::CanonicalDraftEquality);
-        } else if normalize_search_text(&state.revision.statement) == candidate_statement {
-            statements.push(*target);
-            add_path(state, CandidateAssessmentPath::StatementEquality);
+        let target_statement = normalize_search_text(&state.revision.statement);
+        let equal_statement = target_statement == candidate_statement;
+        state.statement_similarity = if equal_statement {
+            10_000
+        } else {
+            jaccard_basis_points(&candidate_tokens, &token_set(&target_statement))
+        };
+        // A near-duplicate statement is the same fact stated differently. Aligning the statement
+        // before comparing the rest of the draft keeps "same fact, same evidence" an exact
+        // duplicate and "same fact, different evidence" a supporting Claim, instead of letting the
+        // wording difference fall through to a contradiction review.
+        if state.statement_similarity >= STATEMENT_SIMILARITY_STRONG_BASIS_POINTS {
+            // Token overlap cannot see a negation: "is reached" and "is not reached" share every
+            // other token. Differing negation markers mean the two Claims disagree about the same
+            // fact, which is a contradiction to review, never a duplicate or supporting Claim.
+            state.negation_conflict =
+                negation_markers(&state.revision.statement) != candidate_negations;
+            if state.negation_conflict {
+                // Still retrieved and ranked as a near-duplicate, but no equality path is claimed.
+                statements.push(*target);
+            } else {
+                let mut aligned = revision_draft(&state.revision);
+                aligned.statement.clone_from(&candidate.statement);
+                if &aligned == candidate {
+                    canonical.push(*target);
+                    add_path(state, CandidateAssessmentPath::CanonicalDraftEquality);
+                } else {
+                    statements.push(*target);
+                    add_path(state, CandidateAssessmentPath::StatementEquality);
+                }
+            }
         }
         if let (Some(candidate_topic), Some(target_topic)) = (
             candidate_topic.as_ref(),
@@ -332,6 +388,70 @@ fn add_exact_channels(
     add_ranked_channel(targets, "statement", statements);
     add_ranked_channel(targets, "topic", topics);
     add_ranked_channel(targets, "scope", scopes);
+}
+
+/// Intersects the repository identifiers the Candidate and each target spell out in their prose.
+///
+/// Only accepted, automatically injectable revisions are considered: a shared identifier is a
+/// strong association path, and a strong path must never be drawn to a fact the Task is not
+/// allowed to inherit. The target's identifiers are read from its own text, so a Context recorded
+/// long before server-side derivation existed participates without any Engineering Reference.
+fn add_identifier_channel(
+    candidate: &ContextRevisionDraft,
+    targets: &mut BTreeMap<ContextRevisionRef, TargetState>,
+) {
+    let candidate_identifiers =
+        hints::normalized_identifiers(draft_prose(candidate).iter().map(String::as_str));
+    if candidate_identifiers.len() < SHARED_IDENTIFIER_STRONG_OVERLAP {
+        return;
+    }
+    let mut ranked = Vec::new();
+    for (target, state) in targets.iter_mut() {
+        if !state.safe {
+            continue;
+        }
+        let target_identifiers = hints::normalized_identifiers(
+            revision_prose(&state.revision).iter().map(String::as_str),
+        );
+        let shared = candidate_identifiers
+            .intersection(&target_identifiers)
+            .cloned()
+            .collect::<Vec<_>>();
+        if shared.len() < SHARED_IDENTIFIER_STRONG_OVERLAP {
+            continue;
+        }
+        state.shared_identifiers.clone_from(&shared);
+        ranked.push(*target);
+        add_path(
+            state,
+            CandidateAssessmentPath::SharedIdentifier {
+                identifiers: shared,
+            },
+        );
+    }
+    add_ranked_channel(targets, "identifier", ranked);
+}
+
+/// Free prose of one Candidate draft: statement, rationale and every Evidence text leaf.
+fn draft_prose(draft: &ContextRevisionDraft) -> Vec<String> {
+    let mut texts = vec![draft.statement.clone(), draft.rationale.clone()];
+    for evidence in &draft.evidence {
+        texts.push(evidence.supports.clone());
+        texts.push(evidence.interpretation.clone());
+        hints::json_string_leaves(&evidence.content, &mut texts);
+    }
+    texts
+}
+
+/// Free prose of one immutable revision, read exactly the way [`draft_prose`] reads a draft.
+fn revision_prose(revision: &ContextRevision) -> Vec<String> {
+    let mut texts = vec![revision.statement.clone(), revision.rationale.clone()];
+    for evidence in &revision.evidence {
+        texts.push(evidence.supports.clone());
+        texts.push(evidence.interpretation.clone());
+        hints::json_string_leaves(&evidence.content, &mut texts);
+    }
+    texts
 }
 
 fn add_explicit_channel(
@@ -486,6 +606,7 @@ fn channel_weight(channel: &str) -> u64 {
         "canonical" => 1_000,
         "explicit" | "graph" => 900,
         "statement" => 850,
+        "identifier" => 800,
         "topic" => 700,
         "scope" => 400,
         "bm25" => 200,
@@ -497,6 +618,7 @@ fn rrf(weight: u64, rank: usize) -> u64 {
     weight.saturating_mul(10_000) / (RRF_K + u64::try_from(rank).unwrap_or(u64::MAX))
 }
 
+#[allow(clippy::too_many_lines)]
 fn assess_target(
     candidate: &ContextRevisionDraft,
     target: ContextRevisionRef,
@@ -507,25 +629,82 @@ fn assess_target(
     let topic = state.channels.contains_key("topic");
     let explicit_or_graph =
         state.channels.contains_key("explicit") || state.channels.contains_key("graph");
-    let strong_scope = state.paths.iter().any(|path| {
-        matches!(
-            path,
-            CandidateAssessmentPath::ScopeOverlap { domains, .. } if !domains.is_empty()
-        )
-    });
-    let relation = if canonical {
+    // Sharing at least one exact Artifact is the engineering-strength scope signal. A bare
+    // applicability domain overlap is not: every Claim of one Task inherits the same Intent
+    // domains, so it used to make unrelated Claims contradict each other.
+    let shared_artifact = state
+        .paths
+        .iter()
+        .any(|path| matches!(path, CandidateAssessmentPath::ExactArtifactGraph { .. }));
+    let similarity = state.statement_similarity;
+    let statement_differs = normalize_search_text(&state.revision.statement)
+        != normalize_search_text(&candidate.statement);
+    let negation_conflict = state.negation_conflict;
+    // A shared identifier set is only strong within one Context kind: an `issue` and the
+    // `validation` that exercises the same class are related, not the same fact.
+    let shared_identifiers = state.shared_identifiers.len();
+    let same_kind = state.revision.kind == candidate.kind;
+    let strong_identifier = shared_identifiers >= SHARED_IDENTIFIER_STRONG_OVERLAP && same_kind;
+    let identifier_restates = similarity >= STATEMENT_SIMILARITY_REVIEW_BASIS_POINTS
+        || shared_identifiers >= SHARED_IDENTIFIER_SUPPORT_OVERLAP;
+    let relation = if negation_conflict {
+        CandidateAssessmentRelation::PotentialContradiction
+    } else if canonical {
         CandidateAssessmentRelation::ExactDuplicate
     } else if statement {
         CandidateAssessmentRelation::Supports
     } else if topic && explicit_or_graph {
         CandidateAssessmentRelation::Revises
-    } else if (topic || strong_scope)
-        && normalize_search_text(&state.revision.statement)
-            != normalize_search_text(&candidate.statement)
+    } else if strong_identifier {
+        if identifier_restates {
+            CandidateAssessmentRelation::Supports
+        } else {
+            CandidateAssessmentRelation::PotentialContradiction
+        }
+    } else if statement_differs
+        && (topic || (shared_artifact && similarity >= STATEMENT_SIMILARITY_REVIEW_BASIS_POINTS))
     {
         CandidateAssessmentRelation::PotentialContradiction
     } else {
         CandidateAssessmentRelation::UnresolvedRelated
+    };
+    let trigger = if negation_conflict {
+        format!("Path: statement similarity {similarity} basis points but negation markers differ")
+    } else if canonical {
+        format!("Path: canonical draft equality at statement similarity {similarity} basis points")
+    } else if statement {
+        if similarity >= 10_000 {
+            "Path: normalized statement equality".to_owned()
+        } else {
+            format!(
+                "Path: statement similarity {similarity} basis points at or above the {STATEMENT_SIMILARITY_STRONG_BASIS_POINTS} threshold"
+            )
+        }
+    } else if topic && explicit_or_graph {
+        "Path: topic equality with an explicit Context or exact Artifact Graph link".to_owned()
+    } else if strong_identifier {
+        if identifier_restates {
+            format!(
+                "Path: {shared_identifiers} shared repository identifiers on the same Context kind, statement similarity {similarity} basis points"
+            )
+        } else {
+            format!(
+                "Path: {shared_identifiers} shared repository identifiers on the same Context kind while the statement differs, similarity {similarity} basis points"
+            )
+        }
+    } else if topic && statement_differs {
+        "Path: topic equality with a differing statement".to_owned()
+    } else if matches!(
+        relation,
+        CandidateAssessmentRelation::PotentialContradiction
+    ) {
+        format!("Path: a shared exact Artifact with statement similarity {similarity} basis points")
+    } else if shared_artifact {
+        format!(
+            "Path: a shared exact Artifact with statement similarity {similarity} basis points below the {STATEMENT_SIMILARITY_REVIEW_BASIS_POINTS} review threshold"
+        )
+    } else {
+        format!("Path: retrieval proximity only, statement similarity {similarity} basis points")
     };
     if !state.safe {
         let reason = if state.space_conflicted {
@@ -569,8 +748,78 @@ fn assess_target(
             rationale: relation_reason.to_owned(),
         },
         paths: state.paths,
-        reasons: vec![relation_reason.to_owned()],
+        reasons: identifier_reason(&state.shared_identifiers, same_kind)
+            .into_iter()
+            .fold(
+                vec![relation_reason.to_owned(), trigger],
+                |mut reasons, reason| {
+                    reasons.push(reason);
+                    reasons
+                },
+            ),
     }
+}
+
+/// Names the shared identifiers so a reviewer can see why two differently worded Claims met.
+///
+/// A cross-kind overlap stays `unresolved_related`, but the reviewer still learns which code the
+/// two Claims have in common, which is the whole reason the target was retrieved.
+fn identifier_reason(shared: &[String], same_kind: bool) -> Option<String> {
+    if shared.len() < SHARED_IDENTIFIER_STRONG_OVERLAP {
+        return None;
+    }
+    let named = shared.join(", ");
+    Some(if same_kind {
+        format!("Shared repository identifiers: {named}")
+    } else {
+        format!("Shared repository identifiers on a different Context kind: {named}")
+    })
+}
+
+/// English negation words compared as whole tokens.
+const ENGLISH_NEGATION_MARKERS: &[&str] = &["not", "no", "never", "cannot", "without", "fails"];
+/// Chinese negation markers compared as substrings of the raw statement.
+const CHINESE_NEGATION_MARKERS: &[&str] = &["没有", "不会", "不能", "不", "无", "未"];
+
+/// Collects the negation markers of one raw statement.
+///
+/// This reads the raw statement rather than the normalized token stream so a Chinese marker is
+/// found regardless of how the tokenizer segments the surrounding characters.
+fn negation_markers(statement: &str) -> BTreeSet<&'static str> {
+    let lowered = statement.to_lowercase();
+    let mut markers = BTreeSet::new();
+    for word in lowered.split(|character: char| !character.is_alphanumeric()) {
+        if let Some(marker) = ENGLISH_NEGATION_MARKERS
+            .iter()
+            .find(|marker| **marker == word)
+        {
+            markers.insert(*marker);
+        }
+    }
+    for marker in CHINESE_NEGATION_MARKERS {
+        if statement.contains(marker) {
+            markers.insert(*marker);
+        }
+    }
+    markers
+}
+
+/// Splits one already normalized statement into its deduplicated search token set.
+fn token_set(normalized: &str) -> BTreeSet<&str> {
+    normalized.split_whitespace().collect()
+}
+
+/// Jaccard overlap of two token sets in basis points; two empty sets never overlap.
+fn jaccard_basis_points(left: &BTreeSet<&str>, right: &BTreeSet<&str>) -> u64 {
+    if left.is_empty() || right.is_empty() {
+        return 0;
+    }
+    let intersection = left.intersection(right).count() as u64;
+    let union = left.union(right).count() as u64;
+    if union == 0 {
+        return 0;
+    }
+    intersection.saturating_mul(10_000) / union
 }
 
 fn novel_assessment() -> CandidateRelationAssessment {
@@ -725,7 +974,7 @@ fn recommend_spaces(
             CandidateSpaceRecommendation::proposed_new_for_group_with_paths(
                 proposed_space_group_key,
                 proposed_intent(source_working_intent),
-                "System suggestion: no safe existing Space exceeded the Primary threshold",
+                "No safe existing Space exceeded the Primary threshold; confirming here opens a provisional Space named from the Task goal",
                 CandidateConfidence {
                     basis_points: 6_000,
                     rationale:
@@ -794,40 +1043,50 @@ fn proposed_intent(source: &WorkingIntentSnapshot) -> IntentSnapshot {
 }
 
 fn proposed_space_title(goal: &str) -> String {
-    let normalized = goal.split_whitespace().collect::<Vec<_>>();
+    let words = strip_system_suggestion_prefix(goal);
+    let normalized = words.join(" ");
+    if normalized.is_empty() {
+        return FALLBACK_PROPOSED_SPACE_TITLE.to_owned();
+    }
+    if normalized.chars().count() <= PROPOSED_SPACE_TITLE_MAX_CHARS {
+        return normalized;
+    }
+    let mut title = normalized
+        .chars()
+        .take(PROPOSED_SPACE_TITLE_MAX_CHARS)
+        .collect::<String>();
+    // Elide at the exact character bound rather than a word bound: a goal can be written in a
+    // script without spaces, where word truncation either keeps everything or nothing.
+    while title.ends_with(char::is_whitespace) {
+        title.pop();
+    }
+    title.push('\u{2026}');
+    title
+}
+
+/// Title used when a Working Intent goal carries nothing but the historical prefix.
+const FALLBACK_PROPOSED_SPACE_TITLE: &str = "Task intent";
+
+/// Splits a goal into whitespace-collapsed words with any historical `System suggestion:` prefix
+/// removed. Older goals were written with that prefix, and it says nothing about the work.
+fn strip_system_suggestion_prefix(goal: &str) -> Vec<&str> {
+    let words = goal.split_whitespace().collect::<Vec<_>>();
     let mut start = 0;
-    if normalized.len() >= 2
-        && normalized[0].eq_ignore_ascii_case("system")
-        && normalized[1]
-            .trim_end_matches([':', '-', '—'])
+    if words.len() >= 2
+        && words[0].eq_ignore_ascii_case("system")
+        && words[1]
+            .trim_end_matches([':', '-', '\u{2014}'])
             .eq_ignore_ascii_case("suggestion")
     {
         start = 2;
-        if normalized.get(start).is_some_and(|word| {
+        if words.get(start).is_some_and(|word| {
             word.chars()
-                .all(|character| matches!(character, ':' | '-' | '—'))
+                .all(|character| matches!(character, ':' | '-' | '\u{2014}'))
         }) {
             start += 1;
         }
     }
-    let words = &normalized[start..];
-    let mut title = String::new();
-    for word in words.iter().take(PROPOSED_SPACE_TITLE_MAX_WORDS) {
-        let next_chars =
-            title.chars().count() + usize::from(!title.is_empty()) + word.chars().count();
-        if next_chars > PROPOSED_SPACE_TITLE_MAX_CHARS {
-            break;
-        }
-        if !title.is_empty() {
-            title.push(' ');
-        }
-        title.push_str(word);
-    }
-    if title.is_empty() {
-        words.first().copied().unwrap_or("Task intent").to_owned()
-    } else {
-        title
-    }
+    words[start..].to_vec()
 }
 
 fn enforce_budget(
@@ -961,11 +1220,13 @@ fn revision_draft(revision: &ContextRevision) -> ContextRevisionDraft {
     ContextRevisionDraft {
         kind: revision.kind,
         topic_key: revision.topic_key.clone(),
+        problem_view: revision.problem_view.clone(),
         statement: revision.statement.clone(),
         rationale: revision.rationale.clone(),
         applicability: revision.applicability.clone(),
         assumptions: revision.assumptions.clone(),
         recheck_when: revision.recheck_when.clone(),
+        hints: revision.hints.clone(),
         relations: revision.relations.clone(),
         evidence: revision
             .evidence
@@ -1011,5 +1272,57 @@ fn add_path(state: &mut TargetState, path: CandidateAssessmentPath) {
 fn push_space_path(state: &mut SpaceState, path: CandidateSpaceRecommendationPath) {
     if !state.paths.contains(&path) {
         state.paths.push(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PROPOSED_SPACE_TITLE_MAX_CHARS, proposed_space_title};
+
+    #[test]
+    fn a_short_goal_is_its_own_title_after_normalization() {
+        assert_eq!(
+            proposed_space_title("  Repair   association   recall  "),
+            "Repair association recall"
+        );
+    }
+
+    #[test]
+    fn the_historical_system_suggestion_prefix_is_stripped() {
+        assert_eq!(
+            proposed_space_title("System suggestion: Repair association recall"),
+            "Repair association recall"
+        );
+        assert_eq!(
+            proposed_space_title("System Suggestion — Repair association recall"),
+            "Repair association recall"
+        );
+    }
+
+    #[test]
+    fn a_long_goal_is_elided_at_the_character_bound_in_any_script() {
+        let latin = proposed_space_title(
+            "Build grouped checkout compatibility knowledge for every supported client",
+        );
+        assert_eq!(latin, "Build grouped checkout compatibility kno\u{2026}");
+        assert_eq!(latin.chars().count(), PROPOSED_SPACE_TITLE_MAX_CHARS + 1);
+
+        // A goal written without spaces must still be elided; word truncation could not do this.
+        let han = proposed_space_title(&"评论底栏".repeat(20));
+        assert_eq!(han.chars().count(), PROPOSED_SPACE_TITLE_MAX_CHARS + 1);
+        assert!(han.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn elision_never_leaves_a_dangling_space_before_the_ellipsis() {
+        // The 40th `char` of this goal is the space after "or", which must not be kept.
+        let title = proposed_space_title("Repair association recall in Chinese or English queries");
+        assert_eq!(title, "Repair association recall in Chinese or\u{2026}");
+    }
+
+    #[test]
+    fn a_goal_carrying_only_the_prefix_falls_back_to_a_named_title() {
+        assert_eq!(proposed_space_title("System suggestion:"), "Task intent");
+        assert_eq!(proposed_space_title("   "), "Task intent");
     }
 }

@@ -4,7 +4,7 @@
 //! resolved [`CanonicalAgentAction`] back to the vendor wire shape. This crate owns the common
 //! capability, downgrade, action-planning, and untrusted Context Pack rendering policy.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use sctx_domain::{Error, ErrorKind, ExternalSessionLocator, Result};
 use sctx_search::{ContextStatus, TaskContextPack};
@@ -176,17 +176,207 @@ impl ResolvedActivationDecision {
     }
 }
 
-/// The complete Agent-visible activation marker.
+/// Wire token for one supported Agent integration.
 ///
-/// This fixed value contains no Repository identity, path, membership, Prompt, transcript, or
-/// historical Context. Its only action guidance is the bounded explicit Intent bootstrap call;
-/// Direct and Group activation use the same value.
-pub const SHARED_CONTEXT_ACTIVATION_MARKER: &str = "<shared-context-active>Shared Context is authorized. Before substantive work, call task_intent_update.</shared-context-active>";
+/// It is the exact `agent_kind` value every public Shared Context MCP tool expects.
+#[must_use]
+pub const fn agent_kind_token(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::Cursor => "cursor",
+        AgentKind::Codex => "codex",
+    }
+}
+
+/// Longest host Session id the activation marker may quote verbatim.
+pub const ACTIVATION_MARKER_SESSION_ID_MAX_BYTES: usize = 128;
 
 /// Exact upper bound for Agent-visible activation policy output.
-pub const SHARED_CONTEXT_ACTIVATION_MARKER_MAX_BYTES: usize =
-    SHARED_CONTEXT_ACTIVATION_MARKER.len();
-const _: () = assert!(SHARED_CONTEXT_ACTIVATION_MARKER_MAX_BYTES <= 128);
+pub const SHARED_CONTEXT_ACTIVATION_MARKER_MAX_BYTES: usize = 512;
+
+const ACTIVATION_MARKER_OPEN: &str = "<shared-context-active";
+const ACTIVATION_MARKER_CLOSE: &str = "</shared-context-active>";
+
+/// True when a host Session id can be quoted verbatim inside the activation marker.
+///
+/// The marker is model-visible text built from an external identity, so only an unambiguous,
+/// bounded, quote-free ASCII token may enter it. Anything else falls back to the marker form that
+/// names no id at all instead of escaping or truncating one the Agent would then copy wrongly.
+#[must_use]
+pub fn is_quotable_session_id(external_session_id: &str) -> bool {
+    !external_session_id.is_empty()
+        && external_session_id.len() <= ACTIVATION_MARKER_SESSION_ID_MAX_BYTES
+        && external_session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+/// Renders the complete Agent-visible activation marker for one host Session.
+///
+/// The marker carries no Repository identity, path, membership, Prompt, transcript, or historical
+/// Context. Beyond the fixed Intent bootstrap reminder it carries exactly one datum the Agent
+/// cannot otherwise guess: the host Session id it must send back as `external_session_id`. Real
+/// sessions showed models inventing that id from a documentation example, so the marker states it
+/// verbatim and says never to invent one. Direct and Group activation render the same text; only
+/// the Agent kind and the host Session id vary. The result never exceeds
+/// [`SHARED_CONTEXT_ACTIVATION_MARKER_MAX_BYTES`].
+#[must_use]
+pub fn shared_context_activation_marker(agent: AgentKind, external_session_id: &str) -> String {
+    let agent_kind = agent_kind_token(agent);
+    let marker = if is_quotable_session_id(external_session_id) {
+        format!(
+            "{ACTIVATION_MARKER_OPEN} external_session_id=\"{external_session_id}\">Shared Context is authorized for this session. Before substantive work, call task_intent_update with agent_kind \"{agent_kind}\" and external_session_id \"{external_session_id}\" (copy it verbatim; never invent one).{ACTIVATION_MARKER_CLOSE}"
+        )
+    } else {
+        format!(
+            "{ACTIVATION_MARKER_OPEN}>Shared Context is authorized for this session. Before substantive work, call task_intent_update with agent_kind \"{agent_kind}\" and the host Session id (Codex: $CODEX_SESSION_ID; Cursor: the conversation id); never invent one.{ACTIVATION_MARKER_CLOSE}"
+        )
+    };
+    debug_assert!(marker.len() <= SHARED_CONTEXT_ACTIVATION_MARKER_MAX_BYTES);
+    marker
+}
+
+/// Exact upper bound in bytes for one Agent-visible Artifact focus reminder.
+///
+/// The reminder replaces roughly 200 model tokens at worst; the byte bound is
+/// the enforced one because it is the only deterministic measure available here.
+pub const ARTIFACT_FOCUS_REMINDER_MAX_BYTES: usize = 800;
+
+/// Maximum Context identities one reminder may name.
+pub const ARTIFACT_FOCUS_REMINDER_MAX_CONTEXTS: usize = 3;
+
+/// Maximum characters of one Context title carried by a reminder.
+pub const ARTIFACT_FOCUS_REMINDER_TITLE_MAX_CHARS: usize = 60;
+
+const ARTIFACT_FOCUS_REMINDER_OPEN: &str = "<shared-context-artifact-focus>";
+const ARTIFACT_FOCUS_REMINDER_CLOSE: &str = "</shared-context-artifact-focus>";
+
+/// One Context identity plus a bounded display title offered by a reminder.
+///
+/// A reminder never carries statements, rationale, Evidence, Prompt text, or any
+/// other Context body: the title exists only so the model can decide whether the
+/// explicit `task_artifact_focus` call is worth making.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactFocusReminderContext {
+    pub context_id: String,
+    pub title: String,
+}
+
+/// Selects the single located file a `PostToolUse` event may look up.
+///
+/// The decision is pure and fails closed. It requires the explicit experiment
+/// switch, a `Direct` Session (Group activation spans Repositories and is out of
+/// scope for this experiment), a file-operation tool classified by
+/// [`normalize_tool_use`], and exactly one structured file hint. No substring or
+/// command-text guessing participates.
+#[must_use]
+pub fn artifact_focus_reminder_file<'event>(
+    event: &'event CanonicalAgentEvent,
+    activation: ResolvedActivationDecision,
+    capabilities: &AgentCapabilities,
+    enabled: bool,
+) -> Option<&'event Path> {
+    if !enabled
+        || activation != ResolvedActivationDecision::Direct
+        || !capabilities.hooks_verified()
+    {
+        return None;
+    }
+    let CanonicalAgentEvent::PostToolUse {
+        tool_category,
+        path_hints,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    if *tool_category != ToolCategory::FileOperation {
+        return None;
+    }
+    let mut files = path_hints.iter().filter_map(|hint| match hint {
+        PathHint::File(path) => Some(path.as_path()),
+        PathHint::Path(_) | PathHint::WorkingDirectory(_) | PathHint::Ambiguous => None,
+    });
+    let file = files.next()?;
+    files.next().is_none().then_some(file)
+}
+
+/// Renders one bounded Artifact focus reminder.
+///
+/// The output names at most [`ARTIFACT_FOCUS_REMINDER_MAX_CONTEXTS`] Context
+/// identities with truncated titles and one fixed instruction sentence. It never
+/// exceeds [`ARTIFACT_FOCUS_REMINDER_MAX_BYTES`]; Contexts are dropped whole
+/// rather than cut mid-character, and an input that cannot fit at all yields
+/// `None` so the caller stays neutral.
+#[must_use]
+pub fn render_artifact_focus_reminder(
+    relative_path: &str,
+    contexts: &[ArtifactFocusReminderContext],
+) -> Option<String> {
+    if contexts.is_empty() || relative_path.trim().is_empty() {
+        return None;
+    }
+    let call = format!(
+        "call task_artifact_focus for {} to load them",
+        sanitize_line(relative_path, relative_path.chars().count())
+    );
+    let envelope = ARTIFACT_FOCUS_REMINDER_OPEN.len()
+        + 1
+        + call.len()
+        + 1
+        + ARTIFACT_FOCUS_REMINDER_CLOSE.len();
+    if envelope > ARTIFACT_FOCUS_REMINDER_MAX_BYTES {
+        return None;
+    }
+    let mut lines = Vec::new();
+    let mut used = envelope;
+    for context in contexts.iter().take(ARTIFACT_FOCUS_REMINDER_MAX_CONTEXTS) {
+        let context_id =
+            sanitize_line(&context.context_id, ARTIFACT_FOCUS_REMINDER_TITLE_MAX_CHARS);
+        if context_id.is_empty() {
+            continue;
+        }
+        let title = sanitize_line(&context.title, ARTIFACT_FOCUS_REMINDER_TITLE_MAX_CHARS);
+        let line = if title.is_empty() {
+            context_id
+        } else {
+            format!("{context_id}: {title}")
+        };
+        if used + line.len() + 1 > ARTIFACT_FOCUS_REMINDER_MAX_BYTES {
+            break;
+        }
+        used += line.len() + 1;
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let reminder = format!(
+        "{ARTIFACT_FOCUS_REMINDER_OPEN}\n{}\n{call}\n{ARTIFACT_FOCUS_REMINDER_CLOSE}",
+        lines.join("\n")
+    );
+    (reminder.len() <= ARTIFACT_FOCUS_REMINDER_MAX_BYTES).then_some(reminder)
+}
+
+/// Collapses control characters and truncates on a character boundary.
+fn sanitize_line(value: &str, max_chars: usize) -> String {
+    let collapsed = value
+        .chars()
+        .map(|character| {
+            if character.is_control() || character == '\u{feff}' {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let collapsed = collapsed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+    let mut truncated = collapsed.chars().take(max_chars).collect::<String>();
+    truncated.push('\u{2026}');
+    truncated
+}
 
 /// Explicit, serializable capability matrix for one detected Agent installation.
 #[allow(clippy::struct_excessive_bools)]
@@ -401,9 +591,12 @@ fn plan_enabled_action(
     capabilities: &AgentCapabilities,
 ) -> CanonicalAgentAction {
     match event {
-        CanonicalAgentEvent::SessionStart { .. } => CanonicalAgentAction {
+        CanonicalAgentEvent::SessionStart { context, .. } => CanonicalAgentAction {
             task_operation: None,
-            additional_context: Some(SHARED_CONTEXT_ACTIVATION_MARKER.to_owned()),
+            additional_context: Some(shared_context_activation_marker(
+                capabilities.agent,
+                &context.session_id,
+            )),
             system_message: None,
         },
         CanonicalAgentEvent::PromptSubmit { .. } => CanonicalAgentAction::neutral(),
@@ -477,11 +670,7 @@ fn checkpoint(
 
 fn task_locator(agent: AgentKind, context: &AgentEventContext) -> ExternalSessionLocator {
     ExternalSessionLocator {
-        agent_kind: match agent {
-            AgentKind::Cursor => "cursor",
-            AgentKind::Codex => "codex",
-        }
-        .to_owned(),
+        agent_kind: agent_kind_token(agent).to_owned(),
         external_session_id: context.session_id.clone(),
     }
 }
@@ -1081,16 +1270,17 @@ mod tests {
         let start = lifecycle_events().remove(0);
         let action =
             plan_action_for_activation(&start, &capabilities, ResolvedActivationDecision::Direct);
-        assert_eq!(
-            action.additional_context.as_deref(),
-            Some(SHARED_CONTEXT_ACTIVATION_MARKER)
-        );
+        let marker = shared_context_activation_marker(AgentKind::Codex, "session");
+        assert_eq!(action.additional_context.as_deref(), Some(marker.as_str()));
         assert!(action.system_message.is_none());
-        assert_eq!(
-            SHARED_CONTEXT_ACTIVATION_MARKER.len(),
-            SHARED_CONTEXT_ACTIVATION_MARKER_MAX_BYTES
+        assert!(marker.len() <= SHARED_CONTEXT_ACTIVATION_MARKER_MAX_BYTES);
+        assert!(
+            shared_context_activation_marker(AgentKind::Cursor, &"x".repeat(1024)).len()
+                <= SHARED_CONTEXT_ACTIVATION_MARKER_MAX_BYTES
         );
-        assert!(SHARED_CONTEXT_ACTIVATION_MARKER.contains("task_intent_update"));
+        assert!(marker.contains("task_intent_update"));
+        assert!(marker.contains("external_session_id=\"session\""));
+        assert!(marker.contains("agent_kind \"codex\""));
         for private_data in [
             "rpo_",
             "grp_",
@@ -1099,7 +1289,7 @@ mod tests {
             "transcript",
             "Context data",
         ] {
-            assert!(!SHARED_CONTEXT_ACTIVATION_MARKER.contains(private_data));
+            assert!(!marker.contains(private_data));
         }
     }
 
@@ -1116,17 +1306,18 @@ mod tests {
             )
         };
 
+        let marker = shared_context_activation_marker(AgentKind::Codex, "session");
         let start_action = plan(0);
         assert!(start_action.task_operation.is_none());
         assert_eq!(
             start_action.additional_context.as_deref(),
-            Some(SHARED_CONTEXT_ACTIVATION_MARKER)
+            Some(marker.as_str())
         );
         assert!(start_action.system_message.is_none());
 
         let prompt_action = plan(1);
         assert_eq!(prompt_action, CanonicalAgentAction::neutral());
-        assert!(!format!("{prompt_action:?}").contains(SHARED_CONTEXT_ACTIVATION_MARKER));
+        assert!(!format!("{prompt_action:?}").contains(&marker));
 
         let post_action = plan(2);
         assert!(matches!(
@@ -1190,7 +1381,7 @@ mod tests {
                     .system_message
                     .as_deref()
                     .unwrap_or_default()
-                    .contains(SHARED_CONTEXT_ACTIVATION_MARKER)
+                    .contains("<shared-context-active")
             );
         }
     }
@@ -1255,6 +1446,10 @@ mod tests {
             token_budget: 2_000,
             estimated_tokens: 10,
             mode: ContextPackMode::AutomaticInjection,
+            detail_level: sctx_search::ContextPackDetailLevel::Full,
+            compact_associations: Vec::new(),
+            compact_items: Vec::new(),
+            query_token_explanation: None,
             associations: vec![TaskSpaceAssociation {
                 task_id,
                 space_id,
@@ -1268,10 +1463,13 @@ mod tests {
             items: vec![TaskContextItem {
                 association_space_id: space_id,
                 context: ContextPackItem {
+                    derived_state: sctx_search::ContextDerivedState::default(),
+                    usage: sctx_search::ContextUsageCounts::default(),
                     space_id,
                     context_id: ContextId::new(),
                     revision_id: RevisionId::new(),
                     title: "Unsafe data contract".to_owned(),
+                    space_title: "Fixture Space".to_owned(),
                     kind: ContextKind::Decision,
                     status,
                     statement: statement.to_owned(),
@@ -1292,8 +1490,10 @@ mod tests {
                         matched_fields: Vec::new(),
                         matched_tokens: Vec::new(),
                         bm25: 0.0,
+                        coverage_basis_points: 0,
                         evidence_completeness: 1,
                         structured_filter_match: true,
+                        matched_via_alias: Vec::new(),
                     },
                     detail: ContextPackDetail::Summary,
                 },

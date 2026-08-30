@@ -6,7 +6,7 @@ use std::{
     thread,
 };
 
-use sctx_domain::RepositoryId;
+use sctx_domain::{RepositoryId, Result as SctxResult};
 use sctx_engineering_graph::{CatalogRepositorySpec, RepositoryAvailability, RepositoryRegistry};
 use tempfile::TempDir;
 
@@ -188,16 +188,22 @@ fn concurrent_same_catalog_sync_converges_without_identity_drift() {
         let root = root.clone();
         let repository = repository.clone();
         let repository_id = repository_id.clone();
-        threads.push(thread::spawn(move || {
-            let registry = RepositoryRegistry::initialize(root).unwrap();
+        threads.push(thread::spawn(move || -> SctxResult<()> {
+            // Run every fallible step before `barrier.wait()`: an early
+            // `unwrap()`/`?` here would panic ahead of the rendezvous and
+            // strand the other workers on the barrier forever, turning a
+            // single failure into a silent whole-binary hang. Instead, carry
+            // the `Result` across the barrier and only report it afterwards.
+            let outcome = RepositoryRegistry::initialize(root).and_then(|registry| {
+                registry.sync_catalog(&[spec(&repository_id, &[repository])])?;
+                Ok(())
+            });
             barrier.wait();
-            registry
-                .sync_catalog(&[spec(&repository_id, &[repository])])
-                .unwrap();
+            outcome
         }));
     }
     for worker in threads {
-        worker.join().unwrap();
+        worker.join().unwrap().unwrap();
     }
     let repositories = RepositoryRegistry::initialize(root)
         .unwrap()
@@ -206,6 +212,38 @@ fn concurrent_same_catalog_sync_converges_without_identity_drift() {
     assert_eq!(repositories.len(), 1);
     assert_eq!(repositories[0].identity.repository_id, repository_id);
     assert_eq!(repositories[0].locators.len(), 1);
+}
+
+/// Stress-tests `RepositoryRegistry::initialize` under heavy concurrent
+/// contention on a brand-new database, where `PRAGMA journal_mode=WAL`
+/// previously raced ahead of `busy_timeout` and could fail with
+/// `SQLITE_BUSY`/"database is locked". Kept small (8 threads, few rounds)
+/// so it stays fast enough to run by default; not `#[ignore]`d because the
+/// whole point is to catch the regression in normal CI runs.
+#[test]
+fn concurrent_initialize_of_new_registry_never_reports_database_locked() {
+    for _round in 0..4 {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("registry");
+        let workers = 8;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut threads = Vec::new();
+        for _ in 0..workers {
+            let barrier = Arc::clone(&barrier);
+            let root = root.clone();
+            threads.push(thread::spawn(move || -> SctxResult<()> {
+                barrier.wait();
+                RepositoryRegistry::initialize(&root)?;
+                Ok(())
+            }));
+        }
+        for worker in threads {
+            worker
+                .join()
+                .unwrap()
+                .expect("concurrent initialize of a new Registry must not report database locked");
+        }
+    }
 }
 
 #[test]
@@ -265,4 +303,93 @@ fn deleting_registry_never_touches_context_or_runtime_state() {
         fs::read(root.join("state/runtime.sqlite")).unwrap(),
         b"task-runtime"
     );
+}
+
+/// The Catalog projection is rewritten only when the Catalog or a checkout's
+/// local state actually changed. An unchanged Catalog must reach exactly the
+/// same report without touching the Registry, and every change that can flip an
+/// inspection outcome — a new identity, a new path, a checkout disappearing, a
+/// checkout returning — must still rewrite it.
+#[test]
+fn unchanged_catalog_is_reprojected_only_when_its_content_or_checkout_state_changes() {
+    let temporary = TempDir::new().unwrap();
+    let repository = init_repo(&temporary.path().join("repo"));
+    let repository_id = RepositoryId::new();
+    let registry = RepositoryRegistry::initialize(temporary.path().join("registry")).unwrap();
+    let catalog = [spec(&repository_id, std::slice::from_ref(&repository))];
+    let first = registry.sync_catalog(&catalog).unwrap();
+    assert_eq!(first.repository_count, 1);
+    assert_eq!(first.locator_count, 1);
+    assert_eq!(first.unavailable_locator_count, 0);
+    let projected = registry.list().unwrap();
+
+    // A skipped synchronization is observable exactly where it matters: rows the
+    // Registry did not rewrite stay as they are, and the report is unchanged.
+    let connection = rusqlite::Connection::open(registry.database_path()).unwrap();
+    connection
+        .execute("DELETE FROM repository_locator", [])
+        .unwrap();
+    drop(connection);
+    assert_eq!(registry.sync_catalog(&catalog).unwrap(), first);
+    assert!(registry.list().unwrap()[0].locators.is_empty());
+
+    // A second identity is different Catalog content, so the projection is rebuilt.
+    let other = init_repo(&temporary.path().join("other"));
+    let other_id = RepositoryId::new();
+    let widened = [
+        spec(&repository_id, std::slice::from_ref(&repository)),
+        spec(&other_id, std::slice::from_ref(&other)),
+    ];
+    let second = registry.sync_catalog(&widened).unwrap();
+    assert_eq!(second.repository_count, 2);
+    assert_eq!(second.locator_count, 2);
+    assert_eq!(registry.list().unwrap().len(), 2);
+
+    // Returning to the first Catalog is again different content.
+    assert_eq!(registry.sync_catalog(&catalog).unwrap(), first);
+    assert_eq!(registry.list().unwrap(), projected);
+
+    // Local checkout state is part of the fingerprint in both directions.
+    fs::remove_dir_all(&repository).unwrap();
+    let unavailable = registry.sync_catalog(&catalog).unwrap();
+    assert_eq!(unavailable.unavailable_locator_count, 1);
+    assert_eq!(
+        registry
+            .resolve_by_id(&repository_id)
+            .unwrap()
+            .unwrap()
+            .availability,
+        RepositoryAvailability::Unavailable
+    );
+    init_repo(&repository);
+    assert_eq!(registry.sync_catalog(&catalog).unwrap(), first);
+    assert_eq!(
+        registry
+            .resolve_by_id(&repository_id)
+            .unwrap()
+            .unwrap()
+            .availability,
+        RepositoryAvailability::Available
+    );
+
+    // A dropped Registry has no fingerprint, so it fully reprojects.
+    remove_database(registry.database_path());
+    let restored = RepositoryRegistry::initialize(registry.root()).unwrap();
+    assert_eq!(restored.sync_catalog(&catalog).unwrap(), first);
+    assert_eq!(restored.list().unwrap(), projected);
+}
+
+/// A configured checkout that stops being a Git worktree root must still be
+/// rejected, even though the previous synchronization accepted the same path.
+#[test]
+fn checkout_that_stops_being_a_worktree_root_is_rejected_after_a_successful_sync() {
+    let temporary = TempDir::new().unwrap();
+    let repository = init_repo(&temporary.path().join("repo"));
+    let repository_id = RepositoryId::new();
+    let registry = RepositoryRegistry::initialize(temporary.path().join("registry")).unwrap();
+    let catalog = [spec(&repository_id, std::slice::from_ref(&repository))];
+    registry.sync_catalog(&catalog).unwrap();
+
+    fs::remove_dir_all(repository.join(".git")).unwrap();
+    assert!(registry.sync_catalog(&catalog).is_err());
 }

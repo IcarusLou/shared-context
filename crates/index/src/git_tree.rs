@@ -1,7 +1,8 @@
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
-    path::Path,
+    fs,
+    path::{Path, PathBuf},
     process::{Command, Output},
 };
 
@@ -49,6 +50,78 @@ impl TreeChange {
 
 pub(crate) fn tree_oid(repository: &Path) -> Result<String> {
     output_text(repository, ["rev-parse", "HEAD^{tree}"])
+}
+
+/// Resolves the `HEAD` commit from Git's own files, without spawning a process.
+///
+/// This is only ever a cache key for [`tree_oid`]: a commit's Tree is immutable, so a `HEAD` that
+/// still names the same commit still names the same Tree. Any layout this cannot read returns
+/// `None`, which simply costs the `git` process it was trying to avoid.
+pub(crate) fn head_commit_oid(repository: &Path) -> Option<String> {
+    let git_dir = resolve_git_dir(repository)?;
+    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim().to_owned();
+    if head.is_empty() {
+        return None;
+    }
+    let Some(reference) = head.strip_prefix("ref:").map(str::trim) else {
+        return Some(head);
+    };
+    let mut bases = vec![git_dir.clone()];
+    if let Ok(common) = fs::read_to_string(git_dir.join("commondir")) {
+        let common = common.trim();
+        if !common.is_empty() {
+            let common = Path::new(common);
+            bases.push(if common.is_absolute() {
+                common.to_path_buf()
+            } else {
+                git_dir.join(common)
+            });
+        }
+    }
+    for base in &bases {
+        if let Ok(loose) = fs::read_to_string(base.join(reference)) {
+            let oid = loose.trim();
+            if !oid.is_empty() {
+                return Some(oid.to_owned());
+            }
+        }
+        if let Some(oid) = packed_reference(&base.join("packed-refs"), reference) {
+            return Some(oid);
+        }
+    }
+    None
+}
+
+fn resolve_git_dir(repository: &Path) -> Option<PathBuf> {
+    let dot_git = repository.join(".git");
+    let metadata = fs::metadata(&dot_git).ok()?;
+    if metadata.is_dir() {
+        return Some(dot_git);
+    }
+    let pointer = fs::read_to_string(&dot_git).ok()?;
+    let target = pointer.trim().strip_prefix("gitdir:")?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let target = Path::new(target);
+    Some(if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        repository.join(target)
+    })
+}
+
+fn packed_reference(packed_refs: &Path, reference: &str) -> Option<String> {
+    let packed = fs::read_to_string(packed_refs).ok()?;
+    packed.lines().find_map(|line| {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with('^') {
+            return None;
+        }
+        let (oid, name) = line.split_once(' ')?;
+        (name.trim() == reference).then(|| oid.trim().to_owned())
+    })
 }
 
 pub(crate) fn tree_exists(repository: &Path, oid: &str) -> bool {
@@ -100,33 +173,64 @@ pub(crate) fn read_blob(repository: &Path, oid: &str) -> Result<Vec<u8>> {
     .stdout)
 }
 
-/// Resolves the unique commit that added one append-only Event path.
+/// One observed addition of one append-only Event path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EventAddition {
+    pub(crate) commit_oid: String,
+    pub(crate) commit_time: i64,
+}
+
+/// Every addition of every append-only Event path, read in one `git log` pass.
 ///
-/// This rebuild-only metadata lookup never reads commit subjects.
-pub(crate) fn introducing_commit_oid(repository: &Path, path: &str) -> Result<String> {
+/// Introducing commit and publication time are the same fact about the same walk, so both are
+/// answered by a single process instead of one process per Event. Additions of one path are
+/// returned oldest first, so the head of the list is the authoritative introduction.
+pub(crate) fn introducing_commits(
+    repository: &Path,
+) -> Result<BTreeMap<String, Vec<EventAddition>>> {
     let output = output_text(
         repository,
         [
             OsString::from("log"),
-            OsString::from("--format=%H"),
+            OsString::from("--format=%x01%H %ct"),
             OsString::from("--diff-filter=A"),
+            OsString::from("--name-only"),
+            OsString::from("--no-renames"),
             OsString::from("--"),
-            OsString::from(path),
+            OsString::from("events/"),
         ],
     )?;
-    let commits = output
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect::<Vec<_>>();
-    match commits.as_slice() {
-        [commit] => Ok((*commit).to_owned()),
-        [] => Err(external(format!(
-            "Candidate event has no introducing commit: {path}"
-        ))),
-        _ => Err(external(format!(
-            "Candidate event has multiple introducing commits: {path}"
-        ))),
+    let mut additions: BTreeMap<String, Vec<EventAddition>> = BTreeMap::new();
+    let mut current: Option<EventAddition> = None;
+    for line in output.lines() {
+        if let Some(header) = line.strip_prefix('\u{1}') {
+            let mut fields = header.split_ascii_whitespace();
+            current = match (fields.next(), fields.next()) {
+                (Some(commit_oid), Some(stamp)) => {
+                    stamp.parse::<i64>().ok().map(|commit_time| EventAddition {
+                        commit_oid: commit_oid.to_owned(),
+                        commit_time,
+                    })
+                }
+                _ => None,
+            };
+            continue;
+        }
+        let path = line.trim();
+        if path.is_empty() {
+            continue;
+        }
+        if let Some(addition) = current.clone() {
+            additions.entry(path.to_owned()).or_default().push(addition);
+        }
     }
+    for entries in additions.values_mut() {
+        entries.sort_by(|left, right| {
+            (left.commit_time, &left.commit_oid).cmp(&(right.commit_time, &right.commit_oid))
+        });
+        entries.dedup();
+    }
+    Ok(additions)
 }
 
 pub(crate) fn diff_trees(

@@ -83,6 +83,22 @@ pub struct IntentRevision {
     pub revision_id: RevisionId,
     pub parent_revision_ids: Vec<RevisionId>,
     pub intent: IntentSnapshot,
+    /// True when the server proposed this Space Intent from a Task Working Intent instead of a
+    /// human writing it.
+    ///
+    /// The flag is serialized only when it is true, so every already written event and every
+    /// human-authored revision keeps byte-identical encoding, and an event written before the
+    /// flag existed reads back as `false`. A human `space intent revise` writes a new revision
+    /// without the flag, which is how a provisional Space stops being provisional.
+    #[serde(default, skip_serializing_if = "is_not_provisional")]
+    pub provisional: bool,
+}
+
+/// Keeps a `false` `provisional` flag out of the serialized form. Named for the field so the
+/// serde attribute reads as the invariant it protects.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_not_provisional(provisional: &bool) -> bool {
+    !*provisional
 }
 
 impl IntentRevision {
@@ -222,11 +238,17 @@ impl EvidenceSnapshot {
 pub struct ContextRevisionDraft {
     pub kind: ContextKind,
     pub topic_key: Option<String>,
+    /// Optional restatement of the problem this Context answers, used for retrieval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub problem_view: Option<String>,
     pub statement: String,
     pub rationale: String,
     pub applicability: Applicability,
     pub assumptions: Vec<String>,
     pub recheck_when: Vec<String>,
+    /// Unresolved locator hints (paths, basenames, identifiers) kept as searchable text only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<String>,
     pub relations: Vec<ContextRelation>,
     pub evidence: Vec<EvidenceSnapshotDraft>,
 }
@@ -241,12 +263,16 @@ impl ContextRevisionDraft {
         if let Some(topic_key) = &self.topic_key {
             require_text(topic_key, "context revision topic_key")?;
         }
+        if let Some(problem_view) = &self.problem_view {
+            require_text(problem_view, "context revision problem_view")?;
+        }
         require_text(&self.statement, "context revision statement")?;
         require_text(&self.rationale, "context revision rationale")?;
         self.applicability
             .validate("context revision applicability")?;
         require_text_items(&self.assumptions, "context revision assumptions")?;
         require_text_items(&self.recheck_when, "context revision recheck_when")?;
+        require_text_items(&self.hints, "context revision hints")?;
         for (index, relation) in self.relations.iter().enumerate() {
             relation.validate().map_err(|error| {
                 invalid(format!(
@@ -283,11 +309,17 @@ pub struct ContextRevision {
     pub kind: ContextKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic_key: Option<String>,
+    /// Optional restatement of the problem this Context answers, used for retrieval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub problem_view: Option<String>,
     pub statement: String,
     pub rationale: String,
     pub applicability: Applicability,
     pub assumptions: Vec<String>,
     pub recheck_when: Vec<String>,
+    /// Unresolved locator hints (paths, basenames, identifiers) kept as searchable text only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<String>,
     pub relations: Vec<ContextRelation>,
     pub evidence: Vec<EvidenceSnapshot>,
 }
@@ -309,11 +341,13 @@ impl ContextRevision {
             parent_revision_ids,
             kind: draft.kind,
             topic_key: draft.topic_key,
+            problem_view: draft.problem_view,
             statement: draft.statement,
             rationale: draft.rationale,
             applicability: draft.applicability,
             assumptions: draft.assumptions,
             recheck_when: draft.recheck_when,
+            hints: draft.hints,
             relations: draft.relations,
             evidence: draft
                 .evidence
@@ -341,11 +375,13 @@ impl ContextRevision {
         ContextRevisionDraft {
             kind: self.kind,
             topic_key: self.topic_key.clone(),
+            problem_view: self.problem_view.clone(),
             statement: self.statement.clone(),
             rationale: self.rationale.clone(),
             applicability: self.applicability.clone(),
             assumptions: self.assumptions.clone(),
             recheck_when: self.recheck_when.clone(),
+            hints: self.hints.clone(),
             relations: self.relations.clone(),
             evidence: self
                 .evidence
