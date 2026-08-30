@@ -46,6 +46,9 @@ pub const SHARED_IDENTIFIER_SUPPORT_OVERLAP: usize = 3;
 pub struct CandidateAnalysisRequest {
     pub candidate: ContextCandidate,
     pub source_task_id: TaskId,
+    /// The Intent revision the source Episode closed under. Kept as provenance only: the proposed
+    /// Space group is derived from `source_task_id` alone, so the recommendation stays confirmable
+    /// after later governance turns advance the Intent head.
     pub source_intent_revision_id: TaskIntentRevisionId,
     pub source_working_intent: WorkingIntentSnapshot,
     pub source_task_signals: Vec<TaskSignal>,
@@ -212,10 +215,7 @@ impl SearchEngine {
             &source_spaces.associations,
             &candidate_spaces.associations,
             &request.source_working_intent,
-            ProposedSpaceGroupKey::from_task_intent(
-                request.source_task_id,
-                request.source_intent_revision_id,
-            ),
+            ProposedSpaceGroupKey::from_task(request.source_task_id),
             request.proposed_space_group_space_id,
             request.top_k,
         );

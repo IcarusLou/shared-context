@@ -243,6 +243,6 @@ fn hook_writes_zero_mechanical_state_and_direct_evidence_builds_candidate() {
         rpc(7, "tools/list", json!({})),
     ]);
     let tools = listed[1]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 16);
+    assert_eq!(tools.len(), 17);
     assert!(tools.iter().all(|tool| tool["name"] != "task_capture_list"));
 }

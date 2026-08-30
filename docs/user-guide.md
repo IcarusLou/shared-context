@@ -328,7 +328,7 @@ Workspace 路径不会自动绑定一个 Space，文本 Hint 也不会冒充已�
 请修复搜索结果页的旧版本兼容问题，并使用 Shared Context 查找相关历史决策。
 ```
 
-开始一项新需求时，建议先显式调用一次 `space create`（或 Agent 对应的 MCP 能力）建立归属的 Space；如果跳过这一步，`candidate_confirm` 时系统仍会按 Task Intent 自动生成一个 `provisional` Space 兜底，但显式建 Space 能让后续 Candidate 归类更准确。
+开始一项新需求时，建议先显式建立归属的 Space。Agent 在会话内用 MCP `space_create` 工具（输入 `agent_kind`、`external_session_id` 和一个完整的 `intent` 对象，校验与 CLI `sctx space create` 完全一致，返回 `space_id` 与 `intent_revision_id`，`provisional` 恒为 `false`）；`sctx space create` 保留给终端前的 operator，因为沙箱会话里执行 shell 需要额外提权。如果跳过这一步，`candidate_confirm` 时系统仍会按 Task 自动生成一个 `provisional` Space 兜底（同一个 Task 的所有 Candidate 都落在这一个 Space 上），但显式建 Space 能让后续 Candidate 归类更准确。
 
 Agent 在合适时机会：
 
@@ -719,7 +719,7 @@ sctx search \
 | `sctx mcp serve --client cursor` | 通过标准输入/输出运行 Cursor MCP Server。 |
 | `sctx mcp serve --client codex` | 通过标准输入/输出运行 Codex MCP Server。 |
 
-安装后的 MCP 一共暴露 16 个工具：
+安装后的 MCP 一共暴露 17 个工具：
 
 1. `task_intent_update`
 2. `task_artifact_focus`
@@ -737,12 +737,13 @@ sctx search \
 14. `candidate_discard`
 15. `candidate_confirm`
 16. `space_list`
+17. `space_create`
 
 CLI 还提供 Space/Context 写入治理、语义冲突、索引和 Pending Batch 等管理员能力；这些没有全部开放成 Agent MCP 写工具，以维持显式审核和生命周期边界。
 
 当前 Repository 准入控制 Hook 的 Agent-visible activation 与机械 TaskSignal 路径；MCP Server 也用 current Enabled Session lease 实现授权校验，Disabled/Missing/Expired/Stale/busy/corrupt Session 的调用会被拒绝。已安装的全局 Skill 主入口只包含最小 activation gate：没有可信 SessionStart marker 时不读取完整 workflow reference、不产生 Shared Context MCP 调用提示；有 marker 时才完整读取一次 installer-owned reference。这个 Skill gate 是 Agent 推理前的指令准入机制，Server guard 则负责安全和不落越权数据。MCP 进程和工具 Schema 仍由用户级 Agent 配置提供，可能物理启动或可见；不要把 Disabled 理解为进程必然未启动，也不要把合约中的 reference-read/MCP-call 字节代理外推为真实计费 token 已被测量。当前还已证明 Disabled Hook 不向模型注入 Shared Context 文本，也不产生业务 Runtime/Report/知识 Git 记录。
 
-#214 更新后的固定 bytes proxy 进一步量化该边界：Disabled 的 Agent-visible activation、完整 workflow read、Shared Context MCP call/result 与业务 residue 都是 0；Enabled 每个 SessionStart marker 的固定部分为 249 bytes，加上 `agent_kind` 与两处 host session id（36 字符的 UUID 会话约 326 bytes，硬上限 512 bytes），完整 workflow 读取一次，并在固定 Direct/Group 验收链中产生 5 次真实 public MCP 调用。当前最小 gate、workflow、metadata 源文件分别为 1882、17523、263 bytes。若 Enabled Session 在没有 ActiveTask 时先发生安全 PostToolUse，Hook 只提醒一次调用 `task_intent_update`，不读取 Prompt、不自动创建 Task；PreCompact/TurnStop 只给出 bounded Checkpoint guidance并尝试恢复已有 outbox，不创作 Claim。这些值用于回归比较，不是 tokenizer 结果或供应商计费 token。
+#214 更新后的固定 bytes proxy 进一步量化该边界：Disabled 的 Agent-visible activation、完整 workflow read、Shared Context MCP call/result 与业务 residue 都是 0；Enabled 每个 SessionStart marker 的固定部分为 249 bytes，加上 `agent_kind` 与两处 host session id（36 字符的 UUID 会话约 326 bytes，硬上限 512 bytes），完整 workflow 读取一次，并在固定 Direct/Group 验收链中产生 5 次真实 public MCP 调用。当前最小 gate、workflow、metadata 源文件分别为 1882、18671、263 bytes。若 Enabled Session 在没有 ActiveTask 时先发生安全 PostToolUse，Hook 只提醒一次调用 `task_intent_update`，不读取 Prompt、不自动创建 Task；PreCompact/TurnStop 只给出 bounded Checkpoint guidance并尝试恢复已有 outbox，不创作 Claim。这些值用于回归比较，不是 tokenizer 结果或供应商计费 token。
 
 ### 6.11 可选 `config.toml` 设置
 

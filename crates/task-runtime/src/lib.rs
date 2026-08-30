@@ -4879,11 +4879,9 @@ fn parse_proposed_space_group_mapping(
             }
         },
     };
-    if mapping.proposed_space_group_key
-        != ProposedSpaceGroupKey::from_task_intent(mapping.task_id, mapping.intent_revision_id)
-    {
+    if mapping.proposed_space_group_key != ProposedSpaceGroupKey::from_task(mapping.task_id) {
         return Err(invariant(
-            "persisted proposed Space group key disagrees with Task Intent ownership",
+            "persisted proposed Space group key disagrees with Task ownership",
         ));
     }
     Ok(mapping)
@@ -4943,6 +4941,10 @@ fn read_proposed_space_group_mapping_for_candidate(
         .transpose()
 }
 
+/// Recovery guidance for every proposed Space group rejection a caller can actually repair.
+const PROPOSED_SPACE_GROUP_RECOVERY: &str = "proposed Space group does not belong to this Task: use candidate_get to refresh \
+     recommendations, or confirm into an existing Space with primary.existing_space_id";
+
 fn reserve_proposed_space_group(
     transaction: &Transaction<'_>,
     proposed_space_group_key: ProposedSpaceGroupKey,
@@ -4950,12 +4952,11 @@ fn reserve_proposed_space_group(
     intent_revision_id: TaskIntentRevisionId,
     plan: &CandidateConfirmationPlan,
 ) -> Result<()> {
-    if proposed_space_group_key
-        != ProposedSpaceGroupKey::from_task_intent(task_id, intent_revision_id)
-    {
-        return Err(invalid(
-            "proposed Space group key does not match the exact Task Intent revision",
-        ));
+    // The group is bound to the Task, never to the current Intent head: governance turns
+    // legitimately advance the Intent between the recommendation being generated and being
+    // confirmed. `expected_intent_revision_id` still guards the head through the caller's CAS.
+    if proposed_space_group_key != ProposedSpaceGroupKey::from_task(task_id) {
+        return Err(invalid(PROPOSED_SPACE_GROUP_RECOVERY));
     }
     let space_id = plan
         .confirmation
@@ -4978,7 +4979,9 @@ fn reserve_proposed_space_group(
         }
         return Err(Error::new(
             ErrorKind::Conflict,
-            "proposed Space group is already reserved by another Candidate",
+            "proposed Space group is already reserved by another Candidate of this Task: \
+             use candidate_get to refresh recommendations, or confirm into an existing Space \
+             with primary.existing_space_id",
         ));
     }
     transaction

@@ -363,11 +363,21 @@ fn public_tool_arguments(fixture: &Fixture, tool: &str, agent: &str, session: &s
             "primary": {"existing_space_id": fixture.space_id}, "related_space_ids": [], "edits": {}
         }),
         "space_list" => locator,
+        "space_create" => json!({
+            "agent_kind": agent, "external_session_id": session,
+            "intent": {
+                "title": "Authorization matrix Space",
+                "problem": "The matrix has no owning Space",
+                "desired_outcome": "Every matrix decision has one home",
+                "in_scope": ["authorization matrix"],
+                "acceptance_conditions": ["one Space exists"]
+            }
+        }),
         _ => panic!("unknown public tool {tool}"),
     }
 }
 
-const PUBLIC_TOOLS: [&str; 16] = [
+const PUBLIC_TOOLS: [&str; 17] = [
     "task_intent_update",
     "task_artifact_focus",
     "task_signal_supersede",
@@ -384,6 +394,7 @@ const PUBLIC_TOOLS: [&str; 16] = [
     "candidate_discard",
     "candidate_confirm",
     "space_list",
+    "space_create",
 ];
 
 #[test]
@@ -2877,9 +2888,246 @@ fn candidate_confirm_existing_and_recommended_new_space_are_atomic_idempotent_an
     );
 }
 
+/// `space_create` is the MCP path an Agent uses to seed a Space, so no sandboxed session has to
+/// escalate into the operator CLI just to open one.
+#[test]
+fn space_create_tool_opens_one_named_space_that_is_never_provisional() {
+    let fixture = Fixture::new();
+    let session = "space-create-tool";
+    let arguments = json!({
+        "agent_kind": "codex",
+        "external_session_id": session,
+        "intent": {
+            "title": "评论详情页底栏兜底",
+            "problem": "缺少默认评论输入框时无人知道兜底链路",
+            "desired_outcome": "底栏兜底的判定与优先级有据可查",
+            "in_scope": ["评论底栏优先级注册"],
+            "acceptance_conditions": ["能解释某次底栏被抢占的原因"]
+        }
+    });
+    let responses = run_authorized_session(
+        &fixture.root,
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::ContentLength,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(2, "space_create", arguments.clone()),
+            tool_call(
+                3,
+                "space_create",
+                json!({
+                    "agent_kind": "codex",
+                    "external_session_id": session,
+                    "intent": {
+                        "title": "缺少验收条件",
+                        "problem": "验收条件为空",
+                        "desired_outcome": "应当被拒绝",
+                        "in_scope": ["x"],
+                        "acceptance_conditions": []
+                    }
+                }),
+            ),
+            tool_call(
+                4,
+                "space_list",
+                json!({
+                    "agent_kind": "codex", "external_session_id": session
+                }),
+            ),
+        ],
+    );
+    assert_eq!(responses[1]["result"]["isError"], false);
+    let created = &responses[1]["result"]["structuredContent"];
+    let space_id = created["space_id"].as_str().unwrap();
+    assert!(space_id.starts_with("spc_"));
+    assert!(
+        created["intent_revision_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("rev_")
+    );
+    // A human or Agent named this Space on purpose, so it is not the provisional fallback the
+    // Candidate Confirmation path opens.
+    assert_eq!(created["provisional"], false);
+
+    // The same validation the operator CLI applies: an empty acceptance list is rejected.
+    assert_eq!(responses[2]["result"]["isError"], true);
+
+    let listed = responses[3]["result"]["structuredContent"]["spaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|space| space["space_id"] == space_id)
+        .expect("the created Space is listed");
+    assert_eq!(listed["titles"], json!(["评论详情页底栏兜底"]));
+    assert_eq!(listed["provisional"], false);
+}
+
+/// A proposed new Space recommendation stays confirmable after governance turns moved the Task
+/// Intent head, and every Candidate of the same Task lands in the one Space that group opened.
 #[test]
 #[allow(clippy::too_many_lines)]
-fn candidates_from_one_intent_revision_share_and_reuse_one_proposed_space() {
+fn proposed_space_recommendation_survives_governance_intent_revisions() {
+    let fixture = Fixture::new();
+    let session = "governance-intent-advance";
+    let first = task_intent_update_at_root(
+        &fixture.root,
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            ..update_input(
+                session,
+                TaskBoundary::New,
+                None,
+                "Explain why the review bottom bar loses its default input",
+            )
+        },
+    )
+    .unwrap();
+    let claim = |suffix: &str| TaskCheckpointClaimInput {
+        context_kind: ContextKind::Discovery,
+        statement: format!("Governance turn {suffix} keeps its own reviewable conclusion"),
+        rationale: format!("Conclusion {suffix} rests on its own inspected evidence"),
+        conditions: Vec::new(),
+        evidence: vec![TaskCheckpointEvidenceInput {
+            evidence_type: EvidenceType::SourceSnapshot,
+            summary: format!("Inspected the {suffix} path directly"),
+            limitations: vec!["local governance fixture".to_owned()],
+        }],
+    };
+    task_checkpoint_at_root(
+        &fixture.root,
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            claims: vec![claim("alpha"), claim("beta")],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap()
+    .into_accepted()
+    .expect("nonempty Checkpoint must be accepted");
+    let candidate_ids = recover_candidate_ids(&fixture, "codex", session, 2);
+    let review = |candidate_id: CandidateId| {
+        candidate_get_at_root(
+            &fixture.root,
+            &CandidateGetInput {
+                agent_kind: "codex".to_owned(),
+                external_session_id: session.to_owned(),
+                candidate_id: candidate_id.to_string(),
+            },
+        )
+        .unwrap()
+    };
+    let proposed = |review: &sctx_domain::CandidateReviewView| {
+        review
+            .space_recommendations
+            .iter()
+            .find_map(|recommendation| match recommendation {
+                sctx_domain::CandidateSpaceRecommendation::ProposedNewSpaceIntent {
+                    recommendation_id,
+                    proposed_space_group_key,
+                    ..
+                } => Some((*recommendation_id, proposed_space_group_key.unwrap())),
+                sctx_domain::CandidateSpaceRecommendation::Existing { .. } => None,
+            })
+            .expect("a Task with no Space of its own is offered a proposed Space Intent")
+    };
+    let first_review = review(candidate_ids[0]);
+    let second_review = review(candidate_ids[1]);
+    let first_proposed = proposed(&first_review);
+    let second_proposed = proposed(&second_review);
+    assert_eq!(first_proposed.1, second_proposed.1);
+
+    // Two governance turns, each one legitimately advancing the Intent head before the reviewer
+    // decides anything. The recommendation was generated under the first revision.
+    let second = task_intent_update_at_root(
+        &fixture.root,
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            ..update_input(
+                session,
+                TaskBoundary::Continue,
+                Some(first.context.intent_revision_id.to_string()),
+                "Explain why the review bottom bar loses its default input on the search path",
+            )
+        },
+    )
+    .unwrap();
+    let third = task_intent_update_at_root(
+        &fixture.root,
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            ..update_input(
+                session,
+                TaskBoundary::Continue,
+                Some(second.context.intent_revision_id.to_string()),
+                "Explain why the review bottom bar loses its default input and how to restore it",
+            )
+        },
+    )
+    .unwrap();
+    assert_ne!(
+        third.context.intent_revision_id,
+        first.context.intent_revision_id
+    );
+    assert_eq!(third.context.task_id, first.context.task_id);
+
+    let confirmed = candidate_confirm_at_root(
+        &fixture.root,
+        &CandidateConfirmInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: third.context.task_id.to_string(),
+            expected_intent_revision_id: third.context.intent_revision_id.to_string(),
+            candidate_id: candidate_ids[0].to_string(),
+            expected_review_version: first_review.review_version,
+            primary: CandidateConfirmPrimaryInput::Proposed(NewCandidatePrimaryInput {
+                new_space_recommendation_id: first_proposed.0.to_string(),
+            }),
+            related_space_ids: Vec::new(),
+            edits: OptionalCandidateEdits::default(),
+        },
+    )
+    .unwrap();
+    assert_eq!(confirmed.status, CandidateConfirmResponseStatus::Confirmed);
+    let mapping = TaskRuntime::initialize(&fixture.root)
+        .unwrap()
+        .read_proposed_space_group(first_proposed.1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        mapping.status,
+        sctx_task_runtime::ProposedSpaceGroupMappingStatus::Committed
+    );
+    assert_eq!(mapping.space_id, confirmed.primary_space_id);
+
+    // The sibling Candidate still holds the recommendation it was handed before the first
+    // confirmation, and confirming it lands in the Space the group already opened.
+    let sibling = candidate_confirm_at_root(
+        &fixture.root,
+        &CandidateConfirmInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: third.context.task_id.to_string(),
+            expected_intent_revision_id: third.context.intent_revision_id.to_string(),
+            candidate_id: candidate_ids[1].to_string(),
+            expected_review_version: second_review.review_version,
+            primary: CandidateConfirmPrimaryInput::Proposed(NewCandidatePrimaryInput {
+                new_space_recommendation_id: second_proposed.0.to_string(),
+            }),
+            related_space_ids: Vec::new(),
+            edits: OptionalCandidateEdits::default(),
+        },
+    )
+    .unwrap();
+    assert_eq!(sibling.status, CandidateConfirmResponseStatus::Confirmed);
+    assert_eq!(sibling.primary_space_id, confirmed.primary_space_id);
+    assert_ne!(sibling.context_id, confirmed.context_id);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn candidates_of_one_task_share_and_reuse_one_proposed_space() {
     let fixture = Fixture::new();
     let session = "grouped-proposed-space";
     let goal = "System suggestion: Group checkout compatibility decisions for every supported client without duplicating review spaces";
@@ -3062,8 +3310,10 @@ fn candidates_from_one_intent_revision_share_and_reuse_one_proposed_space() {
     // One accepted Context is below the merge threshold and nothing references it yet.
     assert!(compact.space_advisories.is_empty());
 
-    let before_stale = event_count(fixture.store.repository());
-    let stale_proposed = candidate_confirm_at_root(
+    // The recommendation this Candidate was handed before its sibling confirmed no longer appears
+    // in the refreshed view, but it still names this Task's proposed group: confirming it lands in
+    // the Space the group already opened rather than failing on an unrepairable identity.
+    let second_confirmed = candidate_confirm_at_root(
         &fixture.root,
         &CandidateConfirmInput {
             agent_kind: "codex".to_owned(),
@@ -3079,11 +3329,17 @@ fn candidates_from_one_intent_revision_share_and_reuse_one_proposed_space() {
             edits: OptionalCandidateEdits::default(),
         },
     )
-    .unwrap_err();
-    assert_eq!(stale_proposed.kind(), sctx_domain::ErrorKind::InvalidInput);
-    assert_eq!(event_count(fixture.store.repository()), before_stale);
+    .unwrap();
+    assert_eq!(second_confirmed.event_ids.len(), 4);
+    assert_eq!(
+        second_confirmed.primary_space_id,
+        first_confirmed.primary_space_id
+    );
 
-    let second_confirmed = candidate_confirm_at_root(
+    // Naming that same Space explicitly is the very same operation, so it replays instead of
+    // writing a second Confirmation.
+    let before_replay = event_count(fixture.store.repository());
+    let replayed = candidate_confirm_at_root(
         &fixture.root,
         &CandidateConfirmInput {
             agent_kind: "codex".to_owned(),
@@ -3100,11 +3356,12 @@ fn candidates_from_one_intent_revision_share_and_reuse_one_proposed_space() {
         },
     )
     .unwrap();
-    assert_eq!(second_confirmed.event_ids.len(), 4);
     assert_eq!(
-        second_confirmed.primary_space_id,
-        first_confirmed.primary_space_id
+        replayed.status,
+        CandidateConfirmResponseStatus::AlreadyConfirmed
     );
+    assert_eq!(replayed.event_ids, second_confirmed.event_ids);
+    assert_eq!(event_count(fixture.store.repository()), before_replay);
 
     let _next = task_intent_update_at_root(
         &fixture.root,
@@ -3114,7 +3371,7 @@ fn candidates_from_one_intent_revision_share_and_reuse_one_proposed_space() {
                 session,
                 TaskBoundary::Continue,
                 Some(task.context.intent_revision_id.to_string()),
-                "A newly revised Task goal owns a distinct proposed Space group",
+                "A newly revised Task goal still owns the same proposed Space group",
             )
         },
     )
@@ -3135,8 +3392,30 @@ fn candidates_from_one_intent_revision_share_and_reuse_one_proposed_space() {
         next_closed.candidate_build.status,
         CandidateBuildResponseStatus::Pending
     );
+    // The Intent head advanced twice by now, but the proposed Space group is bound to the Task:
+    // a Candidate built under the newest revision resolves to the Space the group already opened
+    // instead of proposing a second provisional Space for the same Task.
     let next_candidate = recover_candidate_ids(&fixture, "codex", session, 1)[0];
-    assert_ne!(proposed(&review(next_candidate)).1, first_proposed.1);
+    let next_review = review(next_candidate);
+    assert!(
+        !next_review
+            .space_recommendations
+            .iter()
+            .any(|recommendation| matches!(
+                recommendation,
+                sctx_domain::CandidateSpaceRecommendation::ProposedNewSpaceIntent { .. }
+            ))
+    );
+    assert!(next_review.space_recommendations.iter().any(|recommendation| matches!(
+        recommendation,
+        sctx_domain::CandidateSpaceRecommendation::Existing { space_id, paths, .. }
+            if *space_id == first_confirmed.primary_space_id && paths.iter().any(|path| matches!(
+                path,
+                sctx_domain::CandidateSpaceRecommendationPath::ProposedSpaceGroupResolved {
+                    proposed_space_group_key
+                } if *proposed_space_group_key == first_proposed.1
+            ))
+    )));
 }
 
 #[test]
@@ -3635,7 +3914,7 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
 
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
         let names = tools
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
@@ -3658,7 +3937,8 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
                 "candidate_get",
                 "candidate_discard",
                 "candidate_confirm",
-                "space_list"
+                "space_list",
+                "space_create"
             ]
         );
         let removed_manual_tool = ["candidate", "create"].join("_");

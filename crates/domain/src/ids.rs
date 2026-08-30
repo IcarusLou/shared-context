@@ -295,27 +295,28 @@ opaque_id!(
     "Opaque identity of one Candidate Space recommendation."
 );
 
-/// Stable grouping key for Candidates produced from one Task Intent revision.
+/// Stable grouping key for every Candidate produced by one Task.
+///
+/// The key binds the Task and nothing else on purpose. A proposed new Space recommendation is
+/// generated from the Candidate's source Episode, but it is confirmed one or more governance
+/// turns later, and every governance turn may legitimately advance the Task Intent head. Binding
+/// the group to an exact Intent revision made those recommendations unconfirmable the moment the
+/// Intent moved; binding it to the Task keeps one Task's Candidates converging on one provisional
+/// Space no matter how the Intent evolved in between.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProposedSpaceGroupKey(Uuid);
 
 impl ProposedSpaceGroupKey {
     pub const PREFIX: &'static str = "psg_";
 
-    /// Derives the stable grouping identity for one exact Task Intent revision.
+    /// Derives the stable grouping identity for one Task.
     #[must_use]
-    pub fn from_task_intent(task_id: TaskId, intent_revision_id: TaskIntentRevisionId) -> Self {
+    pub fn from_task(task_id: TaskId) -> Self {
+        let value = task_id.to_string();
         let mut seed = Vec::new();
-        for value in [task_id.to_string(), intent_revision_id.to_string()] {
-            seed.extend_from_slice(&(value.len() as u64).to_be_bytes());
-            seed.extend_from_slice(value.as_bytes());
-        }
-        let digest = Sha256::digest(seed);
-        let mut bytes = [0_u8; 16];
-        bytes.copy_from_slice(&digest[..16]);
-        bytes[6] = (bytes[6] & 0x0f) | 0x40;
-        bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        Self(Uuid::from_bytes(bytes))
+        seed.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        seed.extend_from_slice(value.as_bytes());
+        Self::from_stable_seed(&seed)
     }
 
     /// Returns the stable UUID portion of the key.
@@ -559,24 +560,14 @@ mod tests {
     }
 
     #[test]
-    fn proposed_space_group_key_is_stable_per_task_intent_revision() {
+    fn proposed_space_group_key_is_stable_per_task_and_survives_intent_revisions() {
         let task_id = TaskId::new();
-        let intent_revision_id = TaskIntentRevisionId::new();
-        let key = ProposedSpaceGroupKey::from_task_intent(task_id, intent_revision_id);
+        let key = ProposedSpaceGroupKey::from_task(task_id);
         assert!(key.to_string().starts_with("psg_"));
         assert_eq!(key.uuid().get_version(), Some(Version::Random));
         assert_eq!(key.uuid().get_variant(), Variant::RFC4122);
-        assert_eq!(
-            key,
-            ProposedSpaceGroupKey::from_task_intent(task_id, intent_revision_id)
-        );
-        assert_ne!(
-            key,
-            ProposedSpaceGroupKey::from_task_intent(task_id, TaskIntentRevisionId::new())
-        );
-        assert_ne!(
-            key,
-            ProposedSpaceGroupKey::from_task_intent(TaskId::new(), intent_revision_id)
-        );
+        // Governance turns advance the Intent head; the group key must not move with it.
+        assert_eq!(key, ProposedSpaceGroupKey::from_task(task_id));
+        assert_ne!(key, ProposedSpaceGroupKey::from_task(TaskId::new()));
     }
 }

@@ -469,7 +469,7 @@ fn source_intent(_task_id: TaskId) -> WorkingIntentSnapshot {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn proposed_space_group_is_stable_per_task_intent_and_resolves_to_its_first_space() {
+fn proposed_space_group_is_stable_per_task_and_resolves_to_its_first_space() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("proposed Space group root");
     let store = GitStore::bootstrap_local(&root).unwrap();
@@ -479,7 +479,7 @@ fn proposed_space_group_is_stable_per_task_intent_and_resolves_to_its_first_spac
     let intent_revision_id = TaskIntentRevisionId::new();
     let working_intent = WorkingIntentSnapshot {
         goal: "  System suggestion: Build grouped checkout compatibility knowledge for every supported client without duplicating candidate spaces after review  ".to_owned(),
-        current_direction: Some("Keep one review boundary per Task Intent revision".to_owned()),
+        current_direction: Some("Keep one review boundary per Task".to_owned()),
         in_scope: vec!["grouped Candidate review".to_owned()],
         out_of_scope: vec!["semantic Candidate deduplication".to_owned()],
         domains: vec!["candidate".to_owned()],
@@ -560,6 +560,8 @@ fn proposed_space_group_is_stable_per_task_intent_and_resolves_to_its_first_spac
     assert!(first_proposed.2.title.chars().count() <= 41);
     assert_eq!(first_proposed.2.desired_outcome, working_intent.goal);
 
+    // The group is bound to the Task alone: a later Intent revision — every governance turn
+    // makes one — must keep proposing the same Space rather than a second one.
     let next_revision = analyze(
         draft(
             Some("candidate/group-c"),
@@ -570,7 +572,7 @@ fn proposed_space_group_is_stable_per_task_intent_and_resolves_to_its_first_spac
         TaskIntentRevisionId::new(),
         None,
     );
-    assert_ne!(proposed(&next_revision).1, first_proposed.1);
+    assert_eq!(proposed(&next_revision).1, first_proposed.1);
 
     let (mapped_space_id, _) = add_space(&store, "Mapped Task Intent", "mapped-task-intent");
     index.synchronize().unwrap();

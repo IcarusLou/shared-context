@@ -29,12 +29,12 @@ use sctx_domain::{
     CheckpointUnknown, ConflictParticipant, ContextGovernanceStatus, ContextId, ContextKind,
     ContextRelation, ContextRelationKind, ContextRevisionDraft, EngineeringReferenceDraft, Error,
     ErrorKind, EventId, EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator,
-    NormalizedWorkObservation, OptionalCandidateEdits, ProblemViewEdit, ProposedSpaceGroupKey,
-    REPOSITORY_ID_MAX_BYTES, REPOSITORY_ID_PATTERN, RecommendedSpaceRole, ReferenceId,
-    ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionStatus, ResolvedFocus, Result,
-    RevisionId, SemanticConflictOpeningDraft, SemanticConflictStatus, SignalId, SpaceId,
-    SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId,
-    TaskSessionSnapshot, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord,
+    IntentSnapshot, NormalizedWorkObservation, OptionalCandidateEdits, ProblemViewEdit,
+    ProposedSpaceGroupKey, REPOSITORY_ID_MAX_BYTES, REPOSITORY_ID_PATTERN, RecommendedSpaceRole,
+    ReferenceId, ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionStatus,
+    ResolvedFocus, Result, RevisionId, SemanticConflictOpeningDraft, SemanticConflictStatus,
+    SignalId, SpaceId, SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId,
+    TaskSessionId, TaskSessionSnapshot, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord,
     TaskSpaceAssociation, WorkEpisodeId, WorkEpisodeRef, WorkEpisodeStatus, WorkObservation,
     WorkObservationId, WorkingIntentSnapshot, context_revision_as_draft,
     context_revision_content_hash,
@@ -1335,6 +1335,27 @@ pub struct EngineeringReferenceRecordResponse {
     pub generation: u64,
 }
 
+/// Explicit Space creation input. The Intent carries exactly the fields `sctx space create`
+/// requires and is validated by the same [`IntentSnapshot::validate`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpaceCreateInput {
+    pub intent: IntentSnapshot,
+}
+
+/// One Space a human or Agent named on purpose; it is never provisional.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SpaceCreateResponse {
+    pub space_id: SpaceId,
+    pub intent_revision_id: RevisionId,
+    pub provisional: bool,
+    pub event_id: sctx_domain::EventId,
+    pub batch_id: String,
+    pub commit_oid: String,
+    pub tree: String,
+    pub generation: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AssociationExplainInput {
@@ -2606,8 +2627,7 @@ impl Runtime {
             .find(|revision| revision.revision_id == source_intent_id)
             .map(|revision| revision.working_intent.clone())
             .ok_or_else(|| invariant("Candidate source Intent revision disappeared"))?;
-        let proposed_space_group_key =
-            ProposedSpaceGroupKey::from_task_intent(task.task_id, source_intent_id);
+        let proposed_space_group_key = ProposedSpaceGroupKey::from_task(task.task_id);
         let proposed_space_group_space_id = self
             .tasks
             .read_proposed_space_group(proposed_space_group_key)?
@@ -3097,35 +3117,71 @@ impl Runtime {
                         &proposed.new_space_recommendation_id,
                         "new_space_recommendation_id",
                     )?;
-                    let (intent, proposed_space_group_key) = review
-                    .space_recommendations
-                    .iter()
-                    .find_map(|recommendation| match recommendation {
-                        CandidateSpaceRecommendation::ProposedNewSpaceIntent {
-                            recommendation_id: actual,
-                            proposed_space_group_key,
-                            proposed_new_space_intent,
-                            ..
-                        } if *actual == recommendation_id => {
-                            Some((
-                                proposed_new_space_intent.clone(),
-                                proposed_space_group_key.as_ref().copied()?,
-                            ))
-                        }
-                        _ => None,
-                    })
+                    let find_proposed = |recommendations: &[CandidateSpaceRecommendation]| {
+                        recommendations
+                            .iter()
+                            .find_map(|recommendation| match recommendation {
+                                CandidateSpaceRecommendation::ProposedNewSpaceIntent {
+                                    recommendation_id: actual,
+                                    proposed_space_group_key,
+                                    proposed_new_space_intent,
+                                    ..
+                                } if *actual == recommendation_id => Some((
+                                    proposed_new_space_intent.clone(),
+                                    proposed_space_group_key.as_ref().copied()?,
+                                )),
+                                _ => None,
+                            })
+                    };
+                    // Once a sibling Candidate of this Task has opened the proposed Space,
+                    // `candidate_review_view` replaces the proposal with the resolved Space, so the
+                    // recommendation a caller was handed earlier is no longer in the current view.
+                    // It is still the analysis the server itself produced, so fall back to it and
+                    // land in the Space the group already opened rather than rejecting a caller
+                    // who cannot repair the identity on its own.
+                    let analyzed = self
+                        .tasks
+                        .read_candidate_analysis(candidate_id)?
+                        .map(|view| view.candidate.space_recommendations)
+                        .unwrap_or_default();
+                    let (intent, proposed_space_group_key) = find_proposed(
+                        &review.space_recommendations,
+                    )
+                    .or_else(|| find_proposed(&analyzed))
                     .ok_or_else(|| {
                         invalid(
-                            "new_space_recommendation_id is not an exact current proposed recommendation",
+                            "new_space_recommendation_id is not a proposed recommendation this \
+                             Candidate analysis produced: use candidate_get to refresh \
+                             recommendations, or confirm into an existing Space with \
+                             primary.existing_space_id",
                         )
                     })?;
-                    (
-                        CandidateConfirmationPrimaryReference::ProposedRecommendation {
-                            recommendation_id,
+                    let committed = self
+                        .tasks
+                        .read_proposed_space_group(proposed_space_group_key)?
+                        .filter(|mapping| {
+                            mapping.status == ProposedSpaceGroupMappingStatus::Committed
+                                && mapping.candidate_id != candidate_id
+                                && snapshot.projection.spaces.contains_key(&mapping.space_id)
+                        })
+                        .map(|mapping| mapping.space_id);
+                    committed.map_or(
+                        (
+                            CandidateConfirmationPrimaryReference::ProposedRecommendation {
+                                recommendation_id,
+                            },
+                            CandidatePrimarySelection::ProposedNew { intent },
+                            None,
+                            Some(proposed_space_group_key),
+                        ),
+                        |space_id| {
+                            (
+                                CandidateConfirmationPrimaryReference::ExistingSpace { space_id },
+                                CandidatePrimarySelection::Existing { space_id },
+                                Some(space_id),
+                                None,
+                            )
                         },
-                        CandidatePrimarySelection::ProposedNew { intent },
-                        None,
-                        Some(proposed_space_group_key),
                     )
                 }
             };
@@ -3615,6 +3671,38 @@ impl Runtime {
             metadata.indexed_tree_oid,
             metadata.projection_generation,
         ))
+    }
+
+    /// Creates one explicitly named Space through the exact `sctx space create` path.
+    ///
+    /// The Intent is validated by [`IntentSnapshot::validate`] and appended as one
+    /// `SpaceCreated` Event, so an Agent no longer needs an escalated shell to seed a Space.
+    fn space_create(&self, input: &SpaceCreateInput) -> Result<SpaceCreateResponse> {
+        let event = Event::space_created(input.intent.clone(), None)?;
+        let (space_id, intent_revision_id, provisional) = match event.payload() {
+            EventPayload::SpaceCreated {
+                space_id,
+                intent_revision,
+            } => (
+                *space_id,
+                intent_revision.revision_id,
+                intent_revision.provisional,
+            ),
+            _ => unreachable!("space_created builds exactly one SpaceCreated payload"),
+        };
+        let event_id = event.event_id();
+        let append = self.store()?.append_event(AppendRequest::event(event))?;
+        let metadata = self.index.synchronize()?.metadata;
+        Ok(SpaceCreateResponse {
+            space_id,
+            intent_revision_id,
+            provisional,
+            event_id,
+            batch_id: append.batch_id.to_string(),
+            commit_oid: append.commit_oid,
+            tree: metadata.indexed_tree_oid,
+            generation: metadata.projection_generation,
+        })
     }
 
     fn engineering_reference_record(
@@ -5152,6 +5240,18 @@ pub fn engineering_reference_record_at_root(
     Runtime::open(root.as_ref())?.engineering_reference_record(input)
 }
 
+/// Creates one explicitly named Space from a complete Intent snapshot.
+///
+/// # Errors
+///
+/// Returns typed Intent validation, privacy, Writer, or projection errors.
+pub fn space_create_at_root(
+    root: impl AsRef<Path>,
+    input: &SpaceCreateInput,
+) -> Result<SpaceCreateResponse> {
+    Runtime::open(root.as_ref())?.space_create(input)
+}
+
 /// Rebuilds or diagnoses the current Engineering projection from registered Repositories.
 ///
 /// # Errors
@@ -5612,6 +5712,7 @@ impl McpServer {
             "candidate_discard" => self.candidate_discard(arguments),
             "candidate_confirm" => self.candidate_confirm(arguments),
             "space_list" => self.space_list(arguments),
+            "space_create" => self.space_create(arguments),
             _ => unreachable!("public tool was validated before dispatch"),
         }
     }
@@ -5733,6 +5834,12 @@ impl McpServer {
             .runtime()
             .repository_scan(&input)
             .map_err(ToolFailure::engineering_graph_failed)?;
+        serde_json::to_value(response).map_err(serialization_failure)
+    }
+
+    fn space_create(&self, arguments: Value) -> ToolResult {
+        let input = decode_arguments::<McpSpaceCreateInput>(arguments)?.into_inner();
+        let response = self.runtime().space_create(&input)?;
         serde_json::to_value(response).map_err(serialization_failure)
     }
 
@@ -6129,6 +6236,48 @@ impl McpRepositoryScanInput {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct McpSpaceCreateInput {
+    #[serde(rename = "agent_kind")]
+    _agent_kind: String,
+    #[serde(rename = "external_session_id")]
+    _external_session_id: String,
+    intent: McpSpaceIntentInput,
+}
+
+/// Flat Intent object; `out_of_scope` and `domain_terms` are the only optional lists, exactly as
+/// on `sctx space create`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpSpaceIntentInput {
+    title: String,
+    problem: String,
+    desired_outcome: String,
+    in_scope: Vec<String>,
+    acceptance_conditions: Vec<String>,
+    #[serde(default)]
+    out_of_scope: Vec<String>,
+    #[serde(default)]
+    domain_terms: Vec<String>,
+}
+
+impl McpSpaceCreateInput {
+    fn into_inner(self) -> SpaceCreateInput {
+        SpaceCreateInput {
+            intent: IntentSnapshot {
+                title: self.intent.title,
+                problem: self.intent.problem,
+                desired_outcome: self.intent.desired_outcome,
+                in_scope: self.intent.in_scope,
+                out_of_scope: self.intent.out_of_scope,
+                acceptance_conditions: self.intent.acceptance_conditions,
+                domain_terms: self.intent.domain_terms,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct McpEngineeringReferenceRecordInput {
     #[serde(rename = "agent_kind")]
     _agent_kind: String,
@@ -6271,6 +6420,7 @@ fn is_public_tool(name: &str) -> bool {
             | "candidate_discard"
             | "candidate_confirm"
             | "space_list"
+            | "space_create"
     )
 }
 
@@ -6353,6 +6503,7 @@ fn validate_public_arguments(
             let _ = decode_candidate_confirm_request(arguments.clone())?;
         }
         "space_list" => decode!(SessionInput),
+        "space_create" => decode!(McpSpaceCreateInput),
         _ => unreachable!("public tool name was checked"),
     }
     Ok(())
@@ -6751,8 +6902,50 @@ fn tools_list() -> Value {
                     "external_session_id": {"type": "string", "minLength": 1}
                 }
             })
+        ),
+        tool_schema(
+            "space_create",
+            "Create one explicitly named ContextSpace from a complete Space Intent. Use this once when a new requirement has no owning Space yet; the Space is never provisional because a human or Agent named it on purpose. Same validation as the operator CLI `sctx space create`.",
+            space_create_schema()
         )
     ]})
+}
+
+fn space_create_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["agent_kind", "external_session_id", "intent"],
+        "properties": {
+            "agent_kind": {"type": "string", "minLength": 1},
+            "external_session_id": {"type": "string", "minLength": 1},
+            "intent": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Complete Space Intent; out_of_scope and domain_terms are the only optional lists.",
+                "required": [
+                    "title", "problem", "desired_outcome", "in_scope", "acceptance_conditions"
+                ],
+                "properties": {
+                    "title": {"type": "string", "minLength": 1},
+                    "problem": {"type": "string", "minLength": 1},
+                    "desired_outcome": {"type": "string", "minLength": 1},
+                    "in_scope": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "string", "minLength": 1}
+                    },
+                    "acceptance_conditions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "string", "minLength": 1}
+                    },
+                    "out_of_scope": {"type": "array", "items": {"type": "string", "minLength": 1}},
+                    "domain_terms": {"type": "array", "items": {"type": "string", "minLength": 1}}
+                }
+            }
+        }
+    })
 }
 
 fn repository_scan_schema() -> Value {
