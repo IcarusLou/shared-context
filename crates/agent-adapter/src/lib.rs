@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 
 use sctx_domain::{Error, ErrorKind, ExternalSessionLocator, Result};
 use sctx_search::{ContextStatus, TaskContextPack};
-use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -383,8 +382,10 @@ fn sanitize_line(value: &str, max_chars: usize) -> String {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentCapabilities {
     pub agent: AgentKind,
+    /// Raw host-reported version string, passed through verbatim. Informational only.
     pub detected_version: Option<String>,
-    pub verified_version_requirement: String,
+    /// Checked-in fixture profile this adapter's payload contract was authored against.
+    pub fixture_profile_version: String,
     pub mode: CapabilityMode,
     pub cli: bool,
     pub mcp: bool,
@@ -406,28 +407,25 @@ impl AgentCapabilities {
     }
 }
 
-/// Evaluate a minimum supported version requirement and hook/trust prerequisites.
+/// Evaluate Hook availability and Codex Hook Trust prerequisites.
+///
+/// Agent versions are never gated. A host version string is an opaque, informational label:
+/// hosts publish incompatible shapes (Cursor CLI reports the date-like `2026.08.25-3e8eec8`,
+/// Codex reports `codex-cli 0.147.0`) and safety comes from the strict payload decoders, not
+/// from a version comparison. `fixture_profile_version` records the checked-in fixture profile
+/// the adapter's payload contract was authored against; it never changes the capability mode.
 #[must_use]
 pub fn evaluate_capabilities(
     agent: AgentKind,
     version_text: Option<&str>,
-    verified_requirement: &str,
+    fixture_profile_version: &str,
     hook_available: bool,
     trust: TrustState,
     cursor_prompt_is_observable_only: bool,
 ) -> AgentCapabilities {
-    let version = version_text
-        .and_then(normalize_version)
-        .and_then(|value| Version::parse(value).ok());
-    let requirement = VersionReq::parse(verified_requirement).ok();
-    let version_verified = version
-        .as_ref()
-        .zip(requirement.as_ref())
-        .is_some_and(|(version, requirement)| requirement.matches(version));
-    let trust_required = trust == TrustState::Unconfirmed;
-    let mode = if trust_required {
+    let mode = if trust == TrustState::Unconfirmed {
         CapabilityMode::ActionRequired
-    } else if hook_available && version_verified {
+    } else if hook_available {
         CapabilityMode::VerifiedHooks
     } else {
         CapabilityMode::McpCliFallback
@@ -435,7 +433,7 @@ pub fn evaluate_capabilities(
     let hooks = mode == CapabilityMode::VerifiedHooks;
     let diagnostic = match mode {
         CapabilityMode::VerifiedHooks => format!(
-            "verified {agent:?} hook contract for {}",
+            "verified {agent:?} hook contract; detected version {}",
             version_text.unwrap_or("unknown")
         ),
         CapabilityMode::ActionRequired => concat!(
@@ -443,18 +441,14 @@ pub fn evaluate_capabilities(
             "Codex. Shared Context remains available through MCP + CLI."
         )
         .to_owned(),
-        CapabilityMode::McpCliFallback if !hook_available => {
+        CapabilityMode::McpCliFallback => {
             "Agent hooks are unavailable; using MCP + CLI fallback.".to_owned()
         }
-        CapabilityMode::McpCliFallback => format!(
-            "Agent version {} does not meet minimum supported version requirement {verified_requirement}; using MCP + CLI fallback.",
-            version_text.unwrap_or("unknown")
-        ),
     };
     AgentCapabilities::capabilities(
         agent,
         version_text,
-        verified_requirement,
+        fixture_profile_version,
         mode,
         hooks,
         trust,
@@ -468,7 +462,7 @@ impl AgentCapabilities {
     fn capabilities(
         agent: AgentKind,
         version_text: Option<&str>,
-        verified_requirement: &str,
+        fixture_profile_version: &str,
         mode: CapabilityMode,
         hooks: bool,
         trust: TrustState,
@@ -479,7 +473,7 @@ impl AgentCapabilities {
         Self {
             agent,
             detected_version: version_text.map(str::to_owned),
-            verified_version_requirement: verified_requirement.to_owned(),
+            fixture_profile_version: fixture_profile_version.to_owned(),
             mode,
             cli: true,
             mcp: true,
@@ -494,14 +488,6 @@ impl AgentCapabilities {
             diagnostic,
         }
     }
-}
-
-fn normalize_version(value: &str) -> Option<&str> {
-    value.split_ascii_whitespace().find(|part| {
-        part.bytes()
-            .next()
-            .is_some_and(|byte| byte.is_ascii_digit())
-    })
 }
 
 /// Typed local Task Runtime work planned from one canonical Agent event.
@@ -1152,33 +1138,45 @@ mod tests {
     }
 
     #[test]
-    fn versions_below_minimum_and_untrusted_codex_fail_closed() {
-        let below_minimum = evaluate_capabilities(
-            AgentKind::Cursor,
+    fn any_host_version_string_keeps_hooks_and_only_trust_or_hooks_downgrade() {
+        for version in [
+            Some("2026.08.25-3e8eec8"),
             Some("3.12.99"),
-            ">=3.13.0",
-            true,
-            TrustState::NotRequired,
-            true,
-        );
-        assert_eq!(below_minimum.mode, CapabilityMode::McpCliFallback);
-        assert!(below_minimum.mcp && below_minimum.cli);
-        assert!(!below_minimum.session_start);
+            Some(""),
+            Some("nightly"),
+            None,
+        ] {
+            let capabilities = evaluate_capabilities(
+                AgentKind::Cursor,
+                version,
+                "3.13.0",
+                true,
+                TrustState::NotRequired,
+                true,
+            );
+            assert_eq!(capabilities.mode, CapabilityMode::VerifiedHooks);
+            assert!(capabilities.session_start);
+            assert_eq!(capabilities.detected_version.as_deref(), version);
+            assert_eq!(capabilities.fixture_profile_version, "3.13.0");
+        }
 
-        let newer = evaluate_capabilities(
+        let without_hooks = evaluate_capabilities(
             AgentKind::Cursor,
-            Some("99.0.0"),
-            ">=3.13.0",
-            true,
+            Some("2026.08.25-3e8eec8"),
+            "3.13.0",
+            false,
             TrustState::NotRequired,
             true,
         );
-        assert_eq!(newer.mode, CapabilityMode::VerifiedHooks);
+        assert_eq!(without_hooks.mode, CapabilityMode::McpCliFallback);
+        assert!(without_hooks.mcp && without_hooks.cli);
+        assert!(!without_hooks.session_start);
+        assert!(!without_hooks.diagnostic.contains("version"));
 
         let trust = evaluate_capabilities(
             AgentKind::Codex,
             Some("codex-cli 0.147.0"),
-            ">=0.147.0",
+            "0.147.0",
             true,
             TrustState::Unconfirmed,
             false,
@@ -1359,9 +1357,9 @@ mod tests {
         let event = lifecycle_events().remove(0);
         let capabilities = evaluate_capabilities(
             AgentKind::Codex,
-            Some("0.146.0"),
-            ">=0.147.0",
-            true,
+            Some("0.147.0"),
+            "0.147.0",
+            false,
             TrustState::Confirmed,
             false,
         );
@@ -1390,7 +1388,7 @@ mod tests {
         evaluate_capabilities(
             AgentKind::Codex,
             Some("0.147.0"),
-            ">=0.147.0",
+            "0.147.0",
             true,
             TrustState::Confirmed,
             false,

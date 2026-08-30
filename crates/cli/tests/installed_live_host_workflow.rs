@@ -254,12 +254,20 @@ fn initialize_repository(path: &Path, source: &str) -> PathBuf {
     fs::canonicalize(path).unwrap()
 }
 
+/// Builds a probe `PATH` that mimics a real Cursor install: `cursor-agent` is the CLI that runs
+/// the Hook and reports a date-like build id, while `cursor` is the desktop shim reporting semver.
+/// Setup must record the `cursor-agent` value, because that is the host the Hook belongs to.
 fn live_host_probe_path(temporary_home: &Path) -> (String, String, String) {
     let codex_version = "0.147.0".to_owned();
-    let cursor_version = "3.13.10".to_owned();
+    let cursor_version = "2026.08.25-3e8eec8".to_owned();
+    let cursor_shim_version = "3.13.10".to_owned();
     let wrappers = temporary_home.join("live host probe bin");
     fs::create_dir_all(&wrappers).unwrap();
-    for (agent, version) in [("codex", &codex_version), ("cursor", &cursor_version)] {
+    for (agent, version) in [
+        ("codex", &codex_version),
+        ("cursor-agent", &cursor_version),
+        ("cursor", &cursor_shim_version),
+    ] {
         let wrapper = wrappers.join(agent);
         fs::write(
             &wrapper,

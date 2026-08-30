@@ -714,8 +714,18 @@ sctx search \
 | 命令 | 功能 |
 |---|---|
 | `sctx hook --agent cursor` | 从标准输入接收 Cursor Hook JSON，输出 Cursor 所需响应。通常由安装器写入且带 `--agent-version` 的 Hook 配置调用。 |
-| `sctx hook --agent codex` | 处理 Codex Hook JSON。安装器会把 setup 时验证的版本固化为 `--agent-version`，Hook 本身不再逐事件启动版本探测进程；通常不应手工调用。 |
-| `sctx hook --agent <cursor 或 codex> --capabilities ...` | 探测 Agent 版本、Hook 可用性和信任状态。Codex 可用 `--trust <confirmed 或 unconfirmed>`。 |
+| `sctx hook --agent codex` | 处理 Codex Hook JSON。安装器会把 setup 时探测到的版本固化为 `--agent-version`，Hook 本身不再逐事件启动版本探测进程；通常不应手工调用。 |
+| `sctx hook --agent <cursor 或 codex> --capabilities ...` | 报告 Agent 版本、Hook 可用性和信任状态。Codex 可用 `--trust <confirmed 或 unconfirmed>`。 |
+
+**不做版本门控。** `--agent-version` 与 Cursor payload 里的 `cursor_version` 只作信息上报：它们原样透传到能力报告的 `detected_version`，不参与任何比较，也不会让系统降级。宿主的版本字符串本来就不统一——运行 Hook 的 Cursor CLI（`cursor-agent --version`）给的是日期形 `2026.08.25-3e8eec8`，桌面端 `cursor --version` 给的是 semver，Codex 给的是 `codex-cli 0.147.0`——安全性来自严格的 payload 解码器，不是版本比较。能力模式只由两件事决定：Hook 是否可用，以及 Codex Hook Trust 是否已确认。
+
+| 条件 | 模式 |
+|---|---|
+| Codex Hook Trust 未确认 | `action_required`（Hook 全部关闭，MCP + CLI 可用） |
+| Hook 可用 | `verified_hooks` |
+| Hook 不可用 | `mcp_cli_fallback` |
+
+能力报告里的 `fixture_profile_version` 是该 Adapter 的 payload 契约所对照的仓库内 fixture profile（Cursor `3.13.0`、Codex `0.147.0`），同样只是信息，不是最低版本要求。
 | `sctx mcp serve --client cursor` | 通过标准输入/输出运行 Cursor MCP Server。 |
 | `sctx mcp serve --client codex` | 通过标准输入/输出运行 Codex MCP Server。 |
 
@@ -775,7 +785,7 @@ progress = "14d"
 sctx doctor
 ```
 
-如果报告为 `ACTION REQUIRED`，按报告中的 Agent 能力提示完成信任设置，再运行 `sctx doctor --fix`。Hook 不可用时系统会降级；正常编程不会被阻断，但 Agent 应在结束前用 flat `task_checkpoint` 直接提交完整 Claims/Unknowns。
+如果报告为 `ACTION REQUIRED`，按报告中的 Agent 能力提示完成信任设置，再运行 `sctx doctor --fix`。Hook 不可用时系统会降级；正常编程不会被阻断，但 Agent 应在结束前用 flat `task_checkpoint` 直接提交完整 Claims/Unknowns。`doctor` 报告里的 `adapter_capability.*` 只反映 Hook 可用性与信任状态，附带上报检测到的版本；版本本身无论是什么形态都不会把检查降级为 Warning。
 
 ### 7.3 报 `intent_stale` 或 Review 版本过期
 

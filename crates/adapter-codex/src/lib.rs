@@ -1,7 +1,9 @@
 //! Strict Codex hook payload/output adapter.
 //!
-//! Supports Codex CLI 0.147.0 and newer. Codex Hook Trust is explicit: an unconfirmed state is
-//! reported as `ACTION REQUIRED` and disables all Hook capabilities while MCP + CLI remain usable.
+//! Codex host versions are never gated; the reported version is an informational label and the
+//! strict payload decoder below is what keeps the contract safe. Codex Hook Trust is explicit: an
+//! unconfirmed state is reported as `ACTION REQUIRED` and disables all Hook capabilities while
+//! MCP + CLI remain usable.
 //!
 //! The documented payload carries exactly one identity field, `session_id`, and Codex reports the
 //! same `session_id` to a thread spawned from a parent conversation. The spawned thread's own
@@ -23,8 +25,9 @@ pub use sctx_domain::{Error, ErrorKind, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-/// Minimum supported version exercised by checked-in fixtures and the local Codex CLI build.
-pub const VERIFIED_VERSION_REQUIREMENT: &str = ">=0.147.0";
+/// Checked-in fixture profile this payload contract was authored against. Informational only:
+/// it never gates capabilities.
+pub const FIXTURE_PROFILE_VERSION: &str = "0.147.0";
 
 #[must_use]
 pub fn capabilities(
@@ -35,7 +38,7 @@ pub fn capabilities(
     evaluate_capabilities(
         AgentKind::Codex,
         version,
-        VERIFIED_VERSION_REQUIREMENT,
+        FIXTURE_PROFILE_VERSION,
         hook_available,
         trust,
         false,

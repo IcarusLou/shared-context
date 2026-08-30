@@ -1,8 +1,11 @@
 //! Strict Cursor hook payload/output adapter.
 //!
-//! Supports Cursor 3.13.0 and newer. Missing, malformed, or older versions retain MCP + CLI while
-//! all Hook actions are disabled. `beforeSubmitPrompt` is translated for completeness but never
-//! drives Context Pack injection.
+//! Cursor host versions are never gated. The host reports incompatible shapes across surfaces
+//! (`cursor-agent --version` is date-like, e.g. `2026.08.25-3e8eec8`, while the desktop shim
+//! reports semver), so the version is carried through as an informational label only; the strict
+//! payload decoder below is what keeps the contract safe. Hook actions are disabled only when the
+//! host provides no Hook. `beforeSubmitPrompt` is translated for completeness but never drives
+//! Context Pack injection.
 
 use std::path::PathBuf;
 
@@ -17,15 +20,16 @@ pub use sctx_domain::{Error, ErrorKind, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-/// Minimum supported version exercised by checked-in fixtures and the local Cursor build.
-pub const VERIFIED_VERSION_REQUIREMENT: &str = ">=3.13.0";
+/// Checked-in fixture profile this payload contract was authored against. Informational only:
+/// it never gates capabilities.
+pub const FIXTURE_PROFILE_VERSION: &str = "3.13.0";
 
 #[must_use]
 pub fn capabilities(version: Option<&str>, hook_available: bool) -> AgentCapabilities {
     evaluate_capabilities(
         AgentKind::Cursor,
         version,
-        VERIFIED_VERSION_REQUIREMENT,
+        FIXTURE_PROFILE_VERSION,
         hook_available,
         TrustState::NotRequired,
         true,

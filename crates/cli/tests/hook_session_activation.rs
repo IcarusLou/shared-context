@@ -140,10 +140,20 @@ impl Fixture {
 }
 
 fn run_hook(home: &Path, agent: &str, payload: &Value) -> Output {
+    let version = (agent == "codex").then_some("0.147.0");
+    run_hook_with_agent_version(home, agent, payload, version)
+}
+
+fn run_hook_with_agent_version(
+    home: &Path,
+    agent: &str,
+    payload: &Value,
+    agent_version: Option<&str>,
+) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_sctx"));
     command.args(["hook", "--agent", agent]).env("HOME", home);
-    if agent == "codex" {
-        command.args(["--agent-version", "0.147.0"]);
+    if let Some(version) = agent_version {
+        command.args(["--agent-version", version]);
     }
     let mut child = command
         .stdin(Stdio::piped())
@@ -879,25 +889,64 @@ fn locator_decisions_are_isolated_and_production_has_no_unscoped_planner() {
     assert!(!adapter.contains("pub fn plan_action("));
 }
 
+/// Host version strings never gate activation.
+///
+/// `cursor-agent --version` reports a date-like build id (`2026.08.25-3e8eec8`) that is not
+/// semver, and the same string arrives in the `cursor_version` payload field. When that string
+/// was parsed and compared against a minimum, every Cursor CLI Session fell back to MCP + CLI and
+/// `SessionStart` never emitted the activation marker, so the Skill gate could not open. A Direct
+/// Session must activate for any host version string the strict decoder accepts.
 #[test]
-fn unverified_authorized_hook_retains_degradation_but_disabled_is_neutral() {
+fn any_cursor_or_codex_host_version_string_activates_a_direct_session() {
     let fixture = Fixture::new();
-    let mut authorized = cursor_start("old-authorized", &fixture.direct_repository);
-    authorized["cursor_version"] = Value::String("3.12.99".to_owned());
-    let output = fixture.hook("cursor", &authorized);
-    assert!(output.status.success());
-    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let diagnostic = response["additional_context"].as_str().unwrap();
-    assert!(diagnostic.contains("MCP + CLI fallback"));
-    assert!(!diagnostic.contains("<shared-context-active"));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("MCP + CLI fallback"));
-    assert!(matches!(
-        fixture.read_scope("cursor", "old-authorized"),
-        AuthorizedSessionScopeRead::Current(scope)
-            if matches!(scope.decision, AuthorizedSessionScopeDecision::Direct { .. })
-    ));
 
+    // The decoder still rejects an absent or empty `cursor_version`; every non-empty shape must
+    // activate, whatever its syntax.
+    for (index, version) in ["2026.08.25-3e8eec8", "3.12.99", "nightly"]
+        .into_iter()
+        .enumerate()
+    {
+        let session = format!("cursor-version-{index}");
+        let mut payload = cursor_start(&session, &fixture.direct_repository);
+        payload["cursor_version"] = Value::String(version.to_owned());
+        let output = fixture.hook("cursor", &payload);
+        assert!(
+            output.stderr.is_empty(),
+            "version {version:?} must not emit a capability diagnostic: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_activated(&output, AgentKind::Cursor, &session);
+        assert!(matches!(
+            fixture.read_scope("cursor", &session),
+            AuthorizedSessionScopeRead::Current(scope)
+                if matches!(scope.decision, AuthorizedSessionScopeDecision::Direct { .. })
+        ));
+    }
+
+    for (index, version) in ["2026.08.25-3e8eec8", "0.146.0", "codex-cli 0.149.1"]
+        .into_iter()
+        .enumerate()
+    {
+        let session = format!("codex-version-{index}");
+        let output = run_hook_with_agent_version(
+            &fixture.home,
+            "codex",
+            &codex_start(&session, &fixture.direct_repository, "startup"),
+            Some(version),
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "version {version:?} must not emit a capability diagnostic: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_activated(&output, AgentKind::Codex, &session);
+    }
+}
+
+#[test]
+fn an_unusual_host_version_outside_a_registered_repository_stays_neutral() {
+    let fixture = Fixture::new();
     let mut disabled = cursor_start("old-disabled", &fixture.outside);
-    disabled["cursor_version"] = Value::String("3.12.99".to_owned());
+    disabled["cursor_version"] = Value::String("2026.08.25-3e8eec8".to_owned());
     assert_neutral(&fixture.hook("cursor", &disabled));
 }

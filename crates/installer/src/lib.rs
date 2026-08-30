@@ -211,15 +211,23 @@ impl Host for SystemHost {
         Ok(blocks.saturating_mul(1024))
     }
 
+    /// Probes the executable that actually runs the Hook.
+    ///
+    /// Cursor ships two of them: the Hook-running CLI `cursor-agent`, whose version is a date-like
+    /// build id (`2026.08.25-3e8eec8`), and the desktop shim `cursor`, which reports semver. The
+    /// shim's version says nothing about the Hook host, so probe `cursor-agent` first and fall back
+    /// to `cursor` only when it is absent. The recorded value is informational; nothing gates on it.
     fn agent_version(&self, agent: Agent) -> Option<String> {
-        let executable = match agent {
-            Agent::Cursor => "cursor",
-            Agent::Codex => "codex",
+        let executables: &[&str] = match agent {
+            Agent::Cursor => &["cursor-agent", "cursor"],
+            Agent::Codex => &["codex"],
         };
-        command_stdout_with_timeout(
-            Command::new(executable).arg("--version"),
-            AGENT_VERSION_TIMEOUT,
-        )
+        executables.iter().find_map(|executable| {
+            command_stdout_with_timeout(
+                Command::new(executable).arg("--version"),
+                AGENT_VERSION_TIMEOUT,
+            )
+        })
     }
 }
 
@@ -826,6 +834,8 @@ impl Installer {
         }
         let options = SetupOptions::default();
         let capabilities = self.capabilities(&options);
+        // Agent versions are never gated: the detected version is reported for diagnosis only and
+        // never downgrades a check. Only missing Hook wiring or unconfirmed Codex Hook Trust does.
         for capability in &capabilities {
             let (status, name) = if capability.diagnostic.starts_with("ACTION REQUIRED:") {
                 (CheckStatus::ActionRequired, "codex_hook_trust")
@@ -834,10 +844,15 @@ impl Installer {
             } else {
                 (CheckStatus::Warning, "adapter_capability")
             };
+            let message = format!(
+                "{} (detected version {})",
+                capability.diagnostic,
+                capability.detected_version.as_deref().unwrap_or("unknown")
+            );
             checks.push(DoctorCheck {
                 name: format!("{name}.{:?}", capability.agent).to_lowercase(),
                 status,
-                message: capability.diagnostic.clone(),
+                message,
             });
         }
         let healthy = !checks

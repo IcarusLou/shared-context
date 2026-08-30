@@ -528,7 +528,7 @@ fn data_reset_requires_explicit_confirmation_before_initializing_state() {
 }
 
 #[test]
-fn hook_capabilities_require_only_minimum_versions_and_codex_trust() {
+fn hook_capabilities_depend_only_on_hook_availability_and_codex_trust() {
     let harness = Harness::new();
     let output = harness.run(&[
         "hook",
@@ -570,7 +570,8 @@ fn hook_capabilities_require_only_minimum_versions_and_codex_trust() {
     assert!(output.status.success());
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["mode"], "verified_hooks");
-    assert_eq!(report["verified_version_requirement"], ">=0.147.0");
+    assert_eq!(report["detected_version"], "codex-cli 0.149.1");
+    assert_eq!(report["fixture_profile_version"], "0.147.0");
 
     let output = harness.run(&[
         "hook",
@@ -585,7 +586,26 @@ fn hook_capabilities_require_only_minimum_versions_and_codex_trust() {
     assert!(output.status.success());
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["mode"], "verified_hooks");
-    assert_eq!(report["verified_version_requirement"], ">=3.13.0");
+    assert_eq!(report["detected_version"], "99.0.0");
+    assert_eq!(report["fixture_profile_version"], "3.13.0");
+
+    // `cursor-agent --version` reports a date-like build id that is not semver; it must still
+    // keep every Hook capability.
+    let output = harness.run(&[
+        "hook",
+        "--agent",
+        "cursor",
+        "--capabilities",
+        "--agent-version",
+        "2026.08.25-3e8eec8",
+        "--hook-available",
+        "true",
+    ]);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["mode"], "verified_hooks");
+    assert_eq!(report["session_start"], true);
+    assert_eq!(report["detected_version"], "2026.08.25-3e8eec8");
 
     let output = harness.run(&[
         "hook",
@@ -595,18 +615,16 @@ fn hook_capabilities_require_only_minimum_versions_and_codex_trust() {
         "--agent-version",
         "3.12.99",
         "--hook-available",
-        "true",
+        "false",
     ]);
     assert!(output.status.success());
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["mode"], "mcp_cli_fallback");
     assert_eq!(report["session_start"], false);
-    assert!(
-        report["diagnostic"]
-            .as_str()
-            .unwrap()
-            .contains("MCP + CLI fallback")
-    );
+    assert_eq!(report["detected_version"], "3.12.99");
+    let diagnostic = report["diagnostic"].as_str().unwrap();
+    assert!(diagnostic.contains("MCP + CLI fallback"));
+    assert!(!diagnostic.contains("version"));
 }
 
 #[test]

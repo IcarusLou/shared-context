@@ -180,25 +180,38 @@ fn cursor_session_start_encodes_disabled_as_neutral_and_both_enabled_scopes_iden
 }
 
 #[test]
-fn cursor_accepts_every_version_at_or_above_the_minimum() {
-    for version in ["3.13.0", "4.0.0"] {
-        let capability = capabilities(Some(version), true);
+fn cursor_accepts_every_host_version_string_when_a_hook_is_available() {
+    for version in [
+        Some("3.13.0"),
+        Some("4.0.0"),
+        Some("3.12.99"),
+        // `cursor-agent --version` reports a date-like build id that is not semver.
+        Some("2026.08.25-3e8eec8"),
+        Some(""),
+        None,
+    ] {
+        let capability = capabilities(version, true);
         assert_eq!(capability.mode, CapabilityMode::VerifiedHooks);
         assert!(capability.session_start);
-        assert_eq!(capability.verified_version_requirement, ">=3.13.0");
+        assert_eq!(capability.detected_version.as_deref(), version);
+        assert_eq!(capability.fixture_profile_version, "3.13.0");
     }
 }
 
 #[test]
-fn cursor_below_minimum_missing_version_or_hooks_keep_only_mcp_cli() {
+fn cursor_keeps_only_mcp_cli_when_no_hook_is_available() {
     for capability in [
-        capabilities(Some("3.12.99"), true),
         capabilities(Some("3.13.10"), false),
-        capabilities(None, true),
+        capabilities(Some("2026.08.25-3e8eec8"), false),
+        capabilities(None, false),
     ] {
         assert_eq!(capability.mode, CapabilityMode::McpCliFallback);
         assert!(capability.mcp && capability.cli);
         assert!(!capability.session_start);
+        assert_eq!(
+            capability.diagnostic,
+            "Agent hooks are unavailable; using MCP + CLI fallback."
+        );
     }
 }
 

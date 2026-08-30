@@ -1572,8 +1572,20 @@ fn push_signal(signals: &mut Vec<TaskSignal>, kind: TaskSignalKind, content: &st
     }
 }
 
+/// Probes the Agent that actually runs the Hook.
+///
+/// Cursor ships two executables: the Hook-running CLI `cursor-agent` (date-like build ids such as
+/// `2026.08.25-3e8eec8`) and the desktop shim `cursor` (semver). Probe `cursor-agent` first so the
+/// reported version belongs to the Hook host; fall back to the shim only when it is absent. The
+/// value is informational and never gates capabilities.
 fn detect_agent_version(agent: &str) -> Option<String> {
-    let executable = if agent == "cursor" { "cursor" } else { "codex" };
+    if agent == "cursor" {
+        return agent_version_output("cursor-agent").or_else(|| agent_version_output("cursor"));
+    }
+    agent_version_output("codex")
+}
+
+fn agent_version_output(executable: &str) -> Option<String> {
     let mut child = Command::new(executable)
         .arg("--version")
         .stdout(Stdio::piped())

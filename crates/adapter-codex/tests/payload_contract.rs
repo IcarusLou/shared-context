@@ -187,18 +187,30 @@ fn codex_unconfirmed_trust_is_action_required() {
 }
 
 #[test]
-fn codex_accepts_every_version_at_or_above_the_minimum() {
-    for version in ["codex-cli 0.147.0", "codex-cli 0.149.1"] {
-        let capability = capabilities(Some(version), true, TrustState::Confirmed);
+fn codex_accepts_every_host_version_string_when_a_hook_is_available() {
+    for version in [
+        Some("codex-cli 0.147.0"),
+        Some("codex-cli 0.149.1"),
+        Some("0.146.99"),
+        Some("2026.08.25-3e8eec8"),
+        Some(""),
+        None,
+    ] {
+        let capability = capabilities(version, true, TrustState::Confirmed);
         assert_eq!(capability.mode, CapabilityMode::VerifiedHooks);
         assert!(capability.prompt_aware_injection);
-        assert_eq!(capability.verified_version_requirement, ">=0.147.0");
+        assert_eq!(capability.detected_version.as_deref(), version);
+        assert_eq!(capability.fixture_profile_version, "0.147.0");
     }
 
-    let below_minimum = capabilities(Some("0.146.99"), true, TrustState::Confirmed);
-    assert_eq!(below_minimum.mode, CapabilityMode::McpCliFallback);
-    assert!(below_minimum.mcp && below_minimum.cli);
-    assert!(!below_minimum.prompt_aware_injection);
+    let without_hooks = capabilities(Some("0.149.1"), false, TrustState::Confirmed);
+    assert_eq!(without_hooks.mode, CapabilityMode::McpCliFallback);
+    assert!(without_hooks.mcp && without_hooks.cli);
+    assert!(!without_hooks.prompt_aware_injection);
+    assert_eq!(
+        without_hooks.diagnostic,
+        "Agent hooks are unavailable; using MCP + CLI fallback."
+    );
 }
 
 #[test]
@@ -356,7 +368,8 @@ fn codex_reminder_target_requires_direct_activation_a_file_tool_and_one_path() {
         assert!(artifact_focus_reminder_file(&event, activation, &capabilities, true).is_none());
     }
 
-    let unverified = sctx_adapter_codex::capabilities(Some("0.146.0"), true, TrustState::Confirmed);
+    let unverified =
+        sctx_adapter_codex::capabilities(Some("0.146.0"), false, TrustState::Confirmed);
     assert!(
         artifact_focus_reminder_file(
             &event,
