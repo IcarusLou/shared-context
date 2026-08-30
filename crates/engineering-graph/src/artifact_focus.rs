@@ -22,7 +22,7 @@ pub const MAX_ARTIFACT_FOCUS_HITS: usize = 3;
 
 /// Default wall-clock budget for one read-only lookup. Exceeding it yields no
 /// hit, which the caller renders as a neutral Hook result.
-pub const ARTIFACT_FOCUS_QUERY_BUDGET: Duration = Duration::from_millis(50);
+pub const ARTIFACT_FOCUS_QUERY_BUDGET: Duration = Duration::from_millis(150);
 
 /// One accepted Graph Context associated with the queried File Artifact.
 #[derive(Clone, Debug, Eq, PartialEq)]

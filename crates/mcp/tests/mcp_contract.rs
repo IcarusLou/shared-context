@@ -3964,13 +3964,51 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
             .find(|tool| tool["name"] == "candidate_confirm")
             .unwrap()["inputSchema"];
         assert_eq!(confirm_schema["additionalProperties"], false);
+        // The Primary selection is one flat object naming both alternatives, because a host union
+        // declaration degrades into an untyped map; exclusivity is server validation.
+        let primary_schema = &confirm_schema["properties"]["primary"];
+        assert_eq!(primary_schema["type"], "object");
+        assert_eq!(primary_schema["additionalProperties"], false);
         assert_eq!(
-            confirm_schema["properties"]["primary"]["oneOf"]
+            primary_schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                "existing_space_id".to_owned(),
+                "new_space_recommendation_id".to_owned(),
+            ])
+        );
+        assert!(
+            primary_schema["description"]
+                .as_str()
+                .unwrap()
+                .contains("exactly one of")
+        );
+        for exclusive in [confirm_schema, discard_schema] {
+            let properties = exclusive["properties"].as_object().unwrap();
+            assert!(properties.contains_key("candidate_id"));
+            assert!(properties.contains_key("candidate_ids"));
+            let required = exclusive["required"]
                 .as_array()
                 .unwrap()
-                .len(),
-            2
-        );
+                .iter()
+                .map(|value| value.as_str().unwrap())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert!(!required.contains("candidate_id"));
+            assert!(!required.contains("candidate_ids"));
+            for field in ["candidate_id", "candidate_ids"] {
+                assert!(
+                    properties[field]["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains("exactly one of candidate_id or candidate_ids"),
+                    "{field} must declare the exclusive selection in one sentence"
+                );
+            }
+        }
         let confirm_properties = confirm_schema["properties"].as_object().unwrap();
         for forbidden in [
             "new_space_intent",
@@ -7359,4 +7397,279 @@ fn git_head(checkout: &Path) -> String {
         .unwrap();
     assert!(output.status.success());
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+/// Collects every JSON Schema composition keyword reachable from one declared tool schema.
+fn composition_keywords(schema: &Value, path: &str, found: &mut Vec<String>) {
+    match schema {
+        Value::Object(object) => {
+            for keyword in ["oneOf", "anyOf", "allOf", "not", "if", "then", "else"] {
+                if object.contains_key(keyword) {
+                    found.push(format!("{path}.{keyword}"));
+                }
+            }
+            for (key, value) in object {
+                composition_keywords(value, &format!("{path}.{key}"), found);
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                composition_keywords(item, &format!("{path}[{index}]"), found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Asserts every declared object that names properties also closes the property set.
+fn assert_strict_objects(schema: &Value, path: &str) {
+    if let Some(object) = schema.as_object() {
+        if object.get("type") == Some(&json!("object")) && object.contains_key("properties") {
+            assert_eq!(
+                object.get("additionalProperties"),
+                Some(&json!(false)),
+                "{path} declares properties without additionalProperties:false"
+            );
+        }
+        for (key, value) in object {
+            assert_strict_objects(value, &format!("{path}.{key}"));
+        }
+    }
+    if let Some(items) = schema.as_array() {
+        for (index, item) in items.iter().enumerate() {
+            assert_strict_objects(item, &format!("{path}[{index}]"));
+        }
+    }
+}
+
+/// Codex renders a declared JSON Schema union as an untyped `{[key: string]: unknown}` map and
+/// drops the sibling `properties`, so a Model reading the declaration cannot see one field name.
+/// Every public tool therefore declares one flat object; every cross-field composition rule stays
+/// authoritative server validation.
+#[test]
+fn every_public_tool_declares_one_flat_object_without_schema_unions() {
+    let fixture = Fixture::new();
+    for client in [ClientKind::Codex, ClientKind::Cursor] {
+        let responses = run_session(
+            &mut fixture.server(client),
+            FixtureFraming::Newline,
+            &[
+                request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+                request(2, "tools/list", json!({})),
+            ],
+        );
+        let tools = responses[1]["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), PUBLIC_TOOLS.len());
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            let schema = &tool["inputSchema"];
+            let mut found = Vec::new();
+            composition_keywords(schema, name, &mut found);
+            assert!(
+                found.is_empty(),
+                "{name} declares schema composition a host cannot render: {found:?}"
+            );
+            assert_eq!(schema["type"], "object", "{name} is not one flat object");
+            assert_eq!(
+                schema["additionalProperties"], false,
+                "{name} does not close its property set"
+            );
+            let properties = schema["properties"].as_object().unwrap();
+            assert!(
+                !properties.is_empty(),
+                "{name} declares no property a Model could read"
+            );
+            for required in schema["required"].as_array().unwrap() {
+                let required = required.as_str().unwrap();
+                assert!(
+                    properties.contains_key(required),
+                    "{name} requires undeclared property {required}"
+                );
+            }
+            assert_strict_objects(schema, name);
+        }
+    }
+}
+
+/// The exclusive selections the flat declaration cannot state are typed `invalid_input` before
+/// authorization, business state, or any Git write.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn exclusive_selections_and_locator_composition_are_typed_server_validation() {
+    let fixture = Fixture::new();
+    let before = business_residue(&fixture.root);
+    let session = "flat-schema-validation";
+    let task_id = TaskId::new();
+    let intent_revision_id = sctx_domain::TaskIntentRevisionId::new();
+    let space_id = fixture.space_id;
+    let confirm = |extra: Value| {
+        let mut arguments = json!({
+            "agent_kind": "codex", "external_session_id": session,
+            "expected_task_id": task_id,
+            "expected_intent_revision_id": intent_revision_id,
+            "expected_review_version": 1,
+            "primary": {"existing_space_id": space_id},
+            "related_space_ids": []
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            arguments
+                .as_object_mut()
+                .unwrap()
+                .insert(key.clone(), value.clone());
+        }
+        arguments
+    };
+    let discard = |extra: Value| {
+        let mut arguments = json!({
+            "agent_kind": "codex", "external_session_id": session,
+            "expected_task_id": task_id,
+            "expected_intent_revision_id": intent_revision_id,
+            "expected_review_version": 1,
+            "reason": "explicit decision"
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            arguments
+                .as_object_mut()
+                .unwrap()
+                .insert(key.clone(), value.clone());
+        }
+        arguments
+    };
+    let first = CandidateId::new();
+    let second = CandidateId::new();
+    let cases: Vec<(&str, Value, &str)> = vec![
+        (
+            "candidate_confirm",
+            confirm(json!({"candidate_id": first, "candidate_ids": [first, second]})),
+            "send exactly one of candidate_id or candidate_ids, not both",
+        ),
+        (
+            "candidate_confirm",
+            confirm(json!({})),
+            "send exactly one of candidate_id or candidate_ids",
+        ),
+        (
+            "candidate_confirm",
+            confirm(json!({
+                "candidate_ids": [first, second],
+                "edits": {"statement": "batch edit"}
+            })),
+            "batch candidate_confirm does not accept edits",
+        ),
+        (
+            "candidate_confirm",
+            json!({
+                "agent_kind": "codex", "external_session_id": session,
+                "expected_task_id": task_id,
+                "expected_intent_revision_id": intent_revision_id,
+                "expected_review_version": 1, "candidate_id": first,
+                "primary": {
+                    "existing_space_id": space_id,
+                    "new_space_recommendation_id": sctx_domain::SpaceRecommendationId::new()
+                },
+                "related_space_ids": []
+            }),
+            "primary must send exactly one of existing_space_id or new_space_recommendation_id, not both",
+        ),
+        (
+            "candidate_confirm",
+            json!({
+                "agent_kind": "codex", "external_session_id": session,
+                "expected_task_id": task_id,
+                "expected_intent_revision_id": intent_revision_id,
+                "expected_review_version": 1, "candidate_id": first,
+                "primary": {}, "related_space_ids": []
+            }),
+            "primary must send exactly one of existing_space_id or new_space_recommendation_id",
+        ),
+        (
+            "candidate_discard",
+            discard(json!({"candidate_id": first, "candidate_ids": [first]})),
+            "send exactly one of candidate_id or candidate_ids, not both",
+        ),
+        (
+            "candidate_discard",
+            discard(json!({})),
+            "send exactly one of candidate_id or candidate_ids",
+        ),
+        (
+            "task_artifact_focus",
+            json!({
+                "agent_kind": "codex", "external_session_id": session,
+                "expected_revision_id": intent_revision_id,
+                "absolute_file_path": fixture.checkout_path.join("README.md"),
+                "locator": {"locator_kind": "api", "protocol": "http"}
+            }),
+            "locator_kind api requires locator.operation",
+        ),
+        (
+            "task_artifact_focus",
+            json!({
+                "agent_kind": "codex", "external_session_id": session,
+                "expected_revision_id": intent_revision_id,
+                "absolute_file_path": fixture.checkout_path.join("README.md"),
+                "locator": {"locator_kind": "file", "protocol": "http"}
+            }),
+            "locator_kind file does not accept locator.protocol",
+        ),
+        (
+            "engineering_reference_record",
+            json!({
+                "agent_kind": "codex", "external_session_id": session,
+                "context_id": fixture.context_id, "revision_id": fixture.revision_id,
+                "repository_id": fixture.repository_id, "artifact_kind": "symbol",
+                "relation": "implements",
+                "locator": {
+                    "locator_kind": "symbol", "path": "README.md", "language": "rust",
+                    "module": "m", "symbol_name": "s", "signature": "fn s()"
+                },
+                "supports": "flat locator", "limitations": ["fixture"]
+            }),
+            "locator_kind symbol requires locator.enclosing_type",
+        ),
+    ];
+    for (index, (tool, arguments, expected)) in cases.iter().enumerate() {
+        let responses = run_session(
+            &mut fixture.server(ClientKind::Codex),
+            FixtureFraming::Newline,
+            &[
+                request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+                tool_call(index as u64 + 2, tool, arguments.clone()),
+            ],
+        );
+        let error = &responses[1]["result"]["structuredContent"]["error"];
+        assert_eq!(error["code"], "invalid_input", "{tool}: {responses:#?}");
+        assert!(
+            error["message"].as_str().unwrap().contains(expected),
+            "{tool} did not name the composition rule {expected}: {error:#}"
+        );
+    }
+    // The accepted flat shapes still reach authorization instead of a shape rejection.
+    for (tool, arguments) in [
+        ("candidate_confirm", confirm(json!({"candidate_id": first}))),
+        (
+            "candidate_confirm",
+            confirm(json!({"candidate_ids": [first, second]})),
+        ),
+        ("candidate_discard", discard(json!({"candidate_id": first}))),
+        (
+            "candidate_discard",
+            discard(json!({"candidate_ids": [first, second]})),
+        ),
+    ] {
+        let responses = run_session(
+            &mut fixture.server(ClientKind::Codex),
+            FixtureFraming::Newline,
+            &[
+                request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+                tool_call(2, tool, arguments),
+            ],
+        );
+        assert_eq!(
+            responses[1]["result"]["structuredContent"]["error"],
+            expected_authorization_error(),
+            "{tool} rejected an accepted flat shape"
+        );
+    }
+    assert_eq!(business_residue(&fixture.root), before);
 }

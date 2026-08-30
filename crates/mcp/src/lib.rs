@@ -4779,7 +4779,7 @@ const MAX_CANDIDATE_BATCH_ITEMS: usize = 32;
 fn decode_candidate_discard_request(
     arguments: Value,
 ) -> std::result::Result<CandidateDiscardRequest, ToolFailure> {
-    if candidate_batch_requested(&arguments) {
+    if candidate_batch_requested(&arguments)? {
         decode_arguments(arguments).map(|input| CandidateDiscardRequest::Batch(Box::new(input)))
     } else {
         decode_arguments(arguments).map(|input| CandidateDiscardRequest::Single(Box::new(input)))
@@ -4790,17 +4790,60 @@ fn decode_candidate_discard_request(
 fn decode_candidate_confirm_request(
     arguments: Value,
 ) -> std::result::Result<CandidateConfirmRequest, ToolFailure> {
-    if candidate_batch_requested(&arguments) {
+    if candidate_batch_requested(&arguments)? {
+        if arguments
+            .as_object()
+            .is_some_and(|object| object.contains_key("edits"))
+        {
+            return Err(invalid(
+                "batch candidate_confirm does not accept edits; confirm that Candidate with candidate_id instead",
+            )
+            .into());
+        }
+        validate_candidate_primary(&arguments)?;
         decode_arguments(arguments).map(|input| CandidateConfirmRequest::Batch(Box::new(input)))
     } else {
+        validate_candidate_primary(&arguments)?;
         decode_arguments(arguments).map(|input| CandidateConfirmRequest::Single(Box::new(input)))
     }
 }
 
-fn candidate_batch_requested(arguments: &Value) -> bool {
-    arguments
-        .as_object()
-        .is_some_and(|object| object.contains_key("candidate_ids"))
+/// Resolves the exclusive `candidate_id` / `candidate_ids` selection the flat host view cannot state.
+///
+/// The host declaration lists both fields as optional properties, because a top-level union
+/// declaration degrades into an untyped map on at least one host; the exclusivity is therefore
+/// authoritative server validation.
+fn candidate_batch_requested(arguments: &Value) -> std::result::Result<bool, ToolFailure> {
+    let object = arguments.as_object();
+    let single = object.is_some_and(|object| object.contains_key("candidate_id"));
+    let batch = object.is_some_and(|object| object.contains_key("candidate_ids"));
+    match (single, batch) {
+        (true, true) => {
+            Err(invalid("send exactly one of candidate_id or candidate_ids, not both").into())
+        }
+        (false, false) => Err(invalid("send exactly one of candidate_id or candidate_ids").into()),
+        _ => Ok(batch),
+    }
+}
+
+/// Resolves the exclusive Primary Space selection the flat host view cannot state.
+fn validate_candidate_primary(arguments: &Value) -> std::result::Result<(), ToolFailure> {
+    let Some(primary) = arguments.get("primary").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let existing = primary.contains_key("existing_space_id");
+    let proposed = primary.contains_key("new_space_recommendation_id");
+    match (existing, proposed) {
+        (true, true) => Err(invalid(
+            "primary must send exactly one of existing_space_id or new_space_recommendation_id, not both",
+        )
+        .into()),
+        (false, false) => Err(invalid(
+            "primary must send exactly one of existing_space_id or new_space_recommendation_id",
+        )
+        .into()),
+        _ => Ok(()),
+    }
 }
 
 fn parse_batch_candidate_ids(values: &[String]) -> Result<Vec<sctx_domain::CandidateId>> {
@@ -6285,12 +6328,18 @@ fn validate_public_arguments(
     }
     match name {
         "task_intent_update" => decode_detail_leveled!(TaskIntentUpdateInput),
-        "task_artifact_focus" => decode_detail_leveled!(ArtifactFocusQuery),
+        "task_artifact_focus" => {
+            validate_locator_composition(arguments.get("locator"), false)?;
+            decode_detail_leveled!(ArtifactFocusQuery);
+        }
         "task_signal_supersede" => decode!(TaskSignalSupersedeInput),
         "task_checkpoint" => decode!(TaskCheckpointInput),
         "task_context" => decode_detail_leveled!(TaskContextReadInput),
         "repository_scan" => decode!(McpRepositoryScanInput),
-        "engineering_reference_record" => decode!(McpEngineeringReferenceRecordInput),
+        "engineering_reference_record" => {
+            validate_locator_composition(arguments.get("locator"), true)?;
+            decode!(McpEngineeringReferenceRecordInput);
+        }
         "association_explain" => decode!(McpAssociationExplainInput),
         "association_rebuild" => decode!(McpAssociationRebuildInput),
         "context_search" => decode!(SearchInput),
@@ -6305,6 +6354,65 @@ fn validate_public_arguments(
         }
         "space_list" => decode!(SessionInput),
         _ => unreachable!("public tool name was checked"),
+    }
+    Ok(())
+}
+
+/// Exact coordinate fields each Artifact locator kind carries beyond `locator_kind`.
+const LOCATOR_KIND_COORDINATES: [(&str, &[&str]); 6] = [
+    ("file", &[]),
+    ("module", &[]),
+    ("api", &["protocol", "operation", "normalized_route"]),
+    ("schema", &["namespace", "version", "qualified_name"]),
+    (
+        "symbol",
+        &[
+            "language",
+            "module",
+            "enclosing_type",
+            "symbol_name",
+            "signature",
+        ],
+    ),
+    ("test", &["qualified_test_name"]),
+];
+
+/// Validates the kind-specific Artifact locator composition the flat host view cannot state.
+///
+/// The declared view lists every coordinate field as optional, because a host union declaration
+/// degrades into an untyped map; the exact per-kind field set therefore stays authoritative server
+/// validation and names the exact missing or foreign field.
+fn validate_locator_composition(
+    locator: Option<&Value>,
+    with_path: bool,
+) -> std::result::Result<(), ToolFailure> {
+    let Some(object) = locator.and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let Some(kind) = object.get("locator_kind").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let Some((_, coordinates)) = LOCATOR_KIND_COORDINATES
+        .iter()
+        .find(|(candidate, _)| *candidate == kind)
+    else {
+        return Ok(());
+    };
+    for field in *coordinates {
+        if !object.contains_key(*field) {
+            return Err(invalid(format!("locator_kind {kind} requires locator.{field}")).into());
+        }
+    }
+    for field in object.keys() {
+        if field == "locator_kind" || (with_path && field == "path") {
+            continue;
+        }
+        if !coordinates.contains(&field.as_str()) {
+            return Err(invalid(format!(
+                "locator_kind {kind} does not accept locator.{field}"
+            ))
+            .into());
+        }
     }
     Ok(())
 }
@@ -6690,61 +6798,28 @@ fn task_artifact_focus_schema() -> Value {
 
 fn task_artifact_focus_coordinates_schema() -> Value {
     json!({
-        "oneOf": [
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind"],
-                "properties": {"locator_kind": {"const": "file"}}
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["locator_kind"],
+        "description": "Kind-specific Artifact coordinates. Send locator_kind plus exactly the fields that kind requires and no others: file and module require nothing else; api requires protocol, operation and normalized_route; schema requires namespace, version and qualified_name; symbol requires language, module, enclosing_type (string or null), symbol_name and signature; test requires qualified_test_name. The server names the missing or foreign coordinate field.",
+        "properties": {
+            "locator_kind": {
+                "type": "string",
+                "enum": ["file", "module", "api", "schema", "symbol", "test"]
             },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind"],
-                "properties": {"locator_kind": {"const": "module"}}
-            },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind", "protocol", "operation", "normalized_route"],
-                "properties": {
-                    "locator_kind": {"const": "api"},
-                    "protocol": {"type": "string", "minLength": 1},
-                    "operation": {"type": "string", "minLength": 1},
-                    "normalized_route": {"type": "string", "minLength": 1}
-                }
-            },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind", "namespace", "version", "qualified_name"],
-                "properties": {
-                    "locator_kind": {"const": "schema"},
-                    "namespace": {"type": "string", "minLength": 1},
-                    "version": {"type": "string", "minLength": 1},
-                    "qualified_name": {"type": "string", "minLength": 1}
-                }
-            },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": [
-                    "locator_kind", "language", "module", "enclosing_type",
-                    "symbol_name", "signature"
-                ],
-                "properties": {
-                    "locator_kind": {"const": "symbol"},
-                    "language": {"type": "string", "minLength": 1},
-                    "module": {"type": "string", "minLength": 1},
-                    "enclosing_type": {"type": ["string", "null"], "minLength": 1},
-                    "symbol_name": {"type": "string", "minLength": 1},
-                    "signature": {"type": "string", "minLength": 1}
-                }
-            },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind", "qualified_test_name"],
-                "properties": {
-                    "locator_kind": {"const": "test"},
-                    "qualified_test_name": {"type": "string", "minLength": 1}
-                }
-            }
-        ]
+            "protocol": {"type": "string", "minLength": 1},
+            "operation": {"type": "string", "minLength": 1},
+            "normalized_route": {"type": "string", "minLength": 1},
+            "namespace": {"type": "string", "minLength": 1},
+            "version": {"type": "string", "minLength": 1},
+            "qualified_name": {"type": "string", "minLength": 1},
+            "language": {"type": "string", "minLength": 1},
+            "module": {"type": "string", "minLength": 1},
+            "enclosing_type": {"type": ["string", "null"], "minLength": 1},
+            "symbol_name": {"type": "string", "minLength": 1},
+            "signature": {"type": "string", "minLength": 1},
+            "qualified_test_name": {"type": "string", "minLength": 1}
+        }
     })
 }
 
@@ -6777,54 +6852,29 @@ fn engineering_reference_record_schema() -> Value {
 
 fn artifact_locator_input_schema() -> Value {
     json!({
-        "oneOf": [
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind", "path"],
-                "properties": {"locator_kind": {"const": "file"}, "path": {"type": "string", "minLength": 1}}
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["locator_kind", "path"],
+        "description": "Kind-specific Artifact coordinates plus the repository-relative path. Send locator_kind and path plus exactly the fields that kind requires and no others: file and module require nothing else; api requires protocol, operation and normalized_route; schema requires namespace, version and qualified_name; symbol requires language, module, enclosing_type (string or null), symbol_name and signature; test requires qualified_test_name. The server names the missing or foreign coordinate field.",
+        "properties": {
+            "locator_kind": {
+                "type": "string",
+                "enum": ["file", "module", "api", "schema", "symbol", "test"]
             },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind", "path"],
-                "properties": {"locator_kind": {"const": "module"}, "path": {"type": "string", "minLength": 1}}
-            },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind", "path", "protocol", "operation", "normalized_route"],
-                "properties": {
-                    "locator_kind": {"const": "api"}, "path": {"type": "string", "minLength": 1},
-                    "protocol": {"type": "string", "minLength": 1}, "operation": {"type": "string", "minLength": 1},
-                    "normalized_route": {"type": "string", "minLength": 1}
-                }
-            },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind", "path", "namespace", "version", "qualified_name"],
-                "properties": {
-                    "locator_kind": {"const": "schema"}, "path": {"type": "string", "minLength": 1},
-                    "namespace": {"type": "string", "minLength": 1}, "version": {"type": "string", "minLength": 1},
-                    "qualified_name": {"type": "string", "minLength": 1}
-                }
-            },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind", "path", "language", "module", "enclosing_type", "symbol_name", "signature"],
-                "properties": {
-                    "locator_kind": {"const": "symbol"}, "path": {"type": "string", "minLength": 1},
-                    "language": {"type": "string", "minLength": 1}, "module": {"type": "string", "minLength": 1},
-                    "enclosing_type": {"type": ["string", "null"], "minLength": 1},
-                    "symbol_name": {"type": "string", "minLength": 1}, "signature": {"type": "string", "minLength": 1}
-                }
-            },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind", "path", "qualified_test_name"],
-                "properties": {
-                    "locator_kind": {"const": "test"}, "path": {"type": "string", "minLength": 1},
-                    "qualified_test_name": {"type": "string", "minLength": 1}
-                }
-            }
-        ]
+            "path": {"type": "string", "minLength": 1},
+            "protocol": {"type": "string", "minLength": 1},
+            "operation": {"type": "string", "minLength": 1},
+            "normalized_route": {"type": "string", "minLength": 1},
+            "namespace": {"type": "string", "minLength": 1},
+            "version": {"type": "string", "minLength": 1},
+            "qualified_name": {"type": "string", "minLength": 1},
+            "language": {"type": "string", "minLength": 1},
+            "module": {"type": "string", "minLength": 1},
+            "enclosing_type": {"type": ["string", "null"], "minLength": 1},
+            "symbol_name": {"type": "string", "minLength": 1},
+            "signature": {"type": "string", "minLength": 1},
+            "qualified_test_name": {"type": "string", "minLength": 1}
+        }
     })
 }
 
@@ -6850,7 +6900,9 @@ fn task_intent_update_schema() -> Value {
             "external_session_id": {"type": "string", "minLength": 1},
             "task_boundary": enum_schema([TaskBoundary::Continue, TaskBoundary::New]),
             "expected_revision_id": {
-                "anyOf": [id_schema("tir_"), {"type": "null"}]
+                "type": ["string", "null"],
+                "pattern": "^tir_[0-9a-fA-F-]+$",
+                "description": "The last returned intent_revision_id, or null only for the first new Task in a new external Session."
             },
             "intent": {
                 "type": "object",
@@ -7054,20 +7106,21 @@ fn candidate_discard_schema() -> Value {
             "agent_kind", "external_session_id", "expected_task_id",
             "expected_intent_revision_id", "expected_review_version", "reason"
         ],
-        "oneOf": [
-            {"required": ["candidate_id"]},
-            {"required": ["candidate_ids"]}
-        ],
         "properties": {
             "agent_kind": {"type": "string", "minLength": 1},
             "external_session_id": {"type": "string", "minLength": 1},
             "expected_task_id": id_schema("tsk_"),
             "expected_intent_revision_id": id_schema("tir_"),
-            "candidate_id": id_schema("cnd_"),
+            "candidate_id": {
+                "type": "string",
+                "pattern": "^cnd_[0-9a-fA-F-]+$",
+                "description": "Send exactly one of candidate_id or candidate_ids; sending both or neither is rejected."
+            },
             "candidate_ids": {
                 "type": "array", "uniqueItems": true,
                 "minItems": 1, "maxItems": MAX_CANDIDATE_BATCH_ITEMS,
-                "items": id_schema("cnd_")
+                "items": id_schema("cnd_"),
+                "description": "Send exactly one of candidate_id or candidate_ids; the batch form discards every listed Candidate atomically under the same Review version and reason."
             },
             "expected_review_version": {"type": "integer", "minimum": 1},
             "reason": {"type": "string", "minLength": 1, "maxLength": 512}
@@ -7084,37 +7137,31 @@ fn candidate_confirm_schema() -> Value {
             "expected_intent_revision_id", "expected_review_version",
             "primary", "related_space_ids"
         ],
-        "oneOf": [
-            {"required": ["candidate_id"]},
-            {"required": ["candidate_ids"], "not": {"required": ["edits"]}}
-        ],
         "properties": {
             "agent_kind": {"type": "string", "minLength": 1},
             "external_session_id": {"type": "string", "minLength": 1},
             "expected_task_id": id_schema("tsk_"),
             "expected_intent_revision_id": id_schema("tir_"),
-            "candidate_id": id_schema("cnd_"),
+            "candidate_id": {
+                "type": "string",
+                "pattern": "^cnd_[0-9a-fA-F-]+$",
+                "description": "Send exactly one of candidate_id or candidate_ids; sending both or neither is rejected."
+            },
             "candidate_ids": {
                 "type": "array", "uniqueItems": true,
                 "minItems": 1, "maxItems": MAX_CANDIDATE_BATCH_ITEMS,
-                "items": id_schema("cnd_")
+                "items": id_schema("cnd_"),
+                "description": "Send exactly one of candidate_id or candidate_ids; the batch form shares one Space organization and rejects edits, so per-Candidate edits stay single-Candidate calls."
             },
             "expected_review_version": {"type": "integer", "minimum": 1},
             "primary": {
-                "oneOf": [
-                    {
-                        "type": "object", "additionalProperties": false,
-                        "required": ["existing_space_id"],
-                        "properties": {"existing_space_id": id_schema("spc_")}
-                    },
-                    {
-                        "type": "object", "additionalProperties": false,
-                        "required": ["new_space_recommendation_id"],
-                        "properties": {
-                            "new_space_recommendation_id": id_schema("rec_")
-                        }
-                    }
-                ]
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Send exactly one of existing_space_id or new_space_recommendation_id; sending both or neither is rejected, and a proposed new Space is single-Candidate only.",
+                "properties": {
+                    "existing_space_id": id_schema("spc_"),
+                    "new_space_recommendation_id": id_schema("rec_")
+                }
             },
             "related_space_ids": {
                 "type": "array", "uniqueItems": true,
@@ -7131,40 +7178,8 @@ fn candidate_edits_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "kind": kind_schema(),
-            "topic_key": {
-                "oneOf": [
-                    {
-                        "type": "object", "additionalProperties": false,
-                        "required": ["action", "value"],
-                        "properties": {
-                            "action": {"const": "set"},
-                            "value": {"type": "string", "minLength": 1}
-                        }
-                    },
-                    {
-                        "type": "object", "additionalProperties": false,
-                        "required": ["action"],
-                        "properties": {"action": {"const": "clear"}}
-                    }
-                ]
-            },
-            "problem_view": {
-                "oneOf": [
-                    {
-                        "type": "object", "additionalProperties": false,
-                        "required": ["action", "value"],
-                        "properties": {
-                            "action": {"const": "set"},
-                            "value": {"type": "string", "minLength": 1}
-                        }
-                    },
-                    {
-                        "type": "object", "additionalProperties": false,
-                        "required": ["action"],
-                        "properties": {"action": {"const": "clear"}}
-                    }
-                ]
-            },
+            "topic_key": nullable_field_edit_schema("topic key"),
+            "problem_view": nullable_field_edit_schema("problem view"),
             "statement": {"type": "string", "minLength": 1},
             "rationale": {"type": "string", "minLength": 1},
             "hints": string_array_schema(),
@@ -7239,6 +7254,26 @@ fn context_relation_schema() -> Value {
 
 fn kind_array_schema() -> Value {
     json!({"type": "array", "items": kind_schema()})
+}
+
+/// Flat replacement declaration for one nullable Candidate field.
+///
+/// The host view lists both `action` values and the optional `value`; the exclusive
+/// `set` requires `value` / `clear` forbids `value` composition stays authoritative Rust
+/// validation, because a host union declaration degrades into an untyped map.
+fn nullable_field_edit_schema(field: &str) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["action"],
+        "description": format!(
+            "Replace the {field}: action set requires value; action clear removes it and must omit value."
+        ),
+        "properties": {
+            "action": {"type": "string", "enum": ["set", "clear"]},
+            "value": {"type": "string", "minLength": 1}
+        }
+    })
 }
 
 fn string_array_schema() -> Value {
