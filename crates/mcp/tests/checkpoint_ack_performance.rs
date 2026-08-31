@@ -6,9 +6,7 @@ use std::{
 
 use sctx_domain::{ExternalSessionLocator, WorkingIntentSnapshot};
 use sctx_git_store::GitStore;
-use sctx_local_state::{
-    ActivationScope, ActivationScopeDecision, AuthorizedSessionScopeStore, UserConfigStore,
-};
+use sctx_local_state::{AuthorizedSessionScopeStore, UserConfigStore};
 use sctx_mcp::{
     ClientKind, DisconnectReason, ExpectedRevisionId, McpServer, TaskBoundary,
     TaskIntentUpdateInput, task_intent_update_at_root,
@@ -54,7 +52,7 @@ fn one_hundred_distinct_checkpoint_creations_meet_durable_ack_slo() {
     let root = temporary.path().join("checkpoint ACK performance");
     let store = GitStore::bootstrap_local(&root).unwrap();
     let checkout_path = fs::canonicalize(store.repository()).unwrap();
-    let repository = UserConfigStore::initialize(&root)
+    let _repository = UserConfigStore::initialize(&root)
         .unwrap()
         .add_repository(
             sctx_domain::RepositoryId::new(),
@@ -70,17 +68,7 @@ fn one_hundred_distinct_checkpoint_creations_meet_durable_ack_slo() {
         .unwrap();
     AuthorizedSessionScopeStore::initialize(&root)
         .unwrap()
-        .authorize(
-            &locator,
-            &ActivationScope {
-                decision: ActivationScopeDecision::Direct {
-                    repository_id: repository.repository_id.clone(),
-                    checkout_path,
-                },
-                allowed_repository_ids: vec![repository.repository_id],
-            },
-            &catalog,
-        )
+        .try_authorize_missing(&locator, &catalog, &checkout_path)
         .unwrap();
     task_intent_update_at_root(
         &root,

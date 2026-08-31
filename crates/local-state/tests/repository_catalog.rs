@@ -8,11 +8,11 @@ use std::{
     time::Instant,
 };
 
-use sctx_domain::{ArtifactLocator, ErrorKind, RepositoryGroupId, RepositoryId};
+use sctx_domain::{ArtifactLocator, ErrorKind, RepositoryId};
 use sctx_local_state::{
-    ActivationScope, ActivationScopeDecision, CatalogCheckoutStatus, CatalogRepositoryGroupStatus,
-    RepositoryCatalogDiagnostic, RepositoryCatalogEntry, RepositoryCatalogSnapshot,
-    RepositoryGroupCatalogEntry, UserConfigStore,
+    ActivationScope, ActivationSettings, CatalogCheckoutStatus, RepositoryCatalogDiagnostic,
+    RepositoryCatalogEntry, RepositoryCatalogSnapshot, UserConfigStore,
+    migrate_legacy_repository_groups,
 };
 use tempfile::TempDir;
 
@@ -107,13 +107,13 @@ fn catalog_binds_readable_ids_atomically_and_supports_explicit_worktrees() {
     assert!(!document.contains("space"));
     assert!(!document.contains("workspace"));
     assert!(
-        UserConfigStore::open_existing(&root)
+        !UserConfigStore::open_existing(&root)
             .unwrap()
             .repository_catalog()
             .unwrap()
-            .repository_groups
-            .is_empty(),
-        "configuration written before RepositoryGroups remains readable with an empty default"
+            .activation
+            .allow_home,
+        "an absent [activation] table keeps the home-directory guard on"
     );
     let metadata = fs::metadata(root.join("config.toml")).unwrap();
     #[cfg(unix)]
@@ -426,13 +426,11 @@ fn doctor_reports_legacy_repository_ids_with_a_stable_kind_without_affecting_hea
 }
 
 #[test]
-fn rename_repository_is_local_only_updates_group_membership_and_rejects_conflicts() {
+fn rename_repository_is_local_only_and_rejects_conflicts() {
     let temporary = TempDir::new().unwrap();
     let root = temporary.path().join("catalog root");
-    let group_root = temporary.path().join("group");
-    let first = init_repo(&group_root.join("first"), "first");
+    let first = init_repo(&temporary.path().join("parent/first"), "first");
     let second = init_repo(&temporary.path().join("second"), "second");
-    let group_root = fs::canonicalize(group_root).unwrap();
     let config = UserConfigStore::initialize(&root).unwrap();
     let legacy_id: RepositoryId = "rpo_00000000-0000-4000-8000-000000000902".parse().unwrap();
     let existing_id: RepositoryId = "FE".parse().unwrap();
@@ -442,17 +440,12 @@ fn rename_repository_is_local_only_updates_group_membership_and_rejects_conflict
     config
         .add_repository(existing_id.clone(), std::slice::from_ref(&second))
         .unwrap();
-    let group = config
-        .add_repository_group(&group_root, std::slice::from_ref(&legacy_id))
-        .unwrap()
-        .repository_group;
 
     let readable_id: RepositoryId = "Android".parse().unwrap();
     let renamed = config.rename_repository(&legacy_id, &readable_id).unwrap();
     assert_eq!(renamed.previous_repository_id, legacy_id);
     assert_eq!(renamed.repository.repository_id, readable_id);
     assert_eq!(renamed.repository.checkout_paths, vec![first.clone()]);
-    assert_eq!(renamed.renamed_repository_group_members, 1);
 
     let catalog = config.repository_catalog().unwrap();
     assert!(
@@ -467,12 +460,6 @@ fn rename_repository_is_local_only_updates_group_membership_and_rejects_conflict
             .iter()
             .any(|repository| repository.repository_id == legacy_id)
     );
-    let group_check = catalog
-        .repository_groups
-        .iter()
-        .find(|check| check.repository_group_id == group.repository_group_id)
-        .unwrap();
-    assert_eq!(group_check.member_repository_ids, vec![readable_id.clone()]);
 
     // Same-content replay after a successful rename now reports the old
     // identity as not configured.
@@ -594,12 +581,12 @@ fn failed_config_write_releases_exclusive_lock_before_immediate_catalog_read() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn activation_scope_is_direct_group_or_disabled_only_at_explicit_boundaries() {
+fn activation_is_derived_from_registered_checkouts_and_the_directories_above_them() {
     let temporary = TempDir::new().unwrap();
     let cross = temporary.path().join("activation cross");
-    let android = init_repo(&cross.join("android/TikTok"), "android");
-    let ios = init_repo(&cross.join("ios/TikTok"), "ios");
-    let sibling = init_repo(&cross.join("unregistered/TikTok"), "sibling");
+    let android = init_repo(&cross.join("android/Product"), "android");
+    let ios = init_repo(&cross.join("ios/Product"), "ios");
+    let sibling = init_repo(&cross.join("unregistered/Product"), "sibling");
     let outer = init_repo(&cross.join("nested/outer"), "outer");
     let nested = init_repo(&outer.join("components/inner"), "nested");
     let common_dir_sibling = cross.join("unregistered-worktree");
@@ -615,24 +602,6 @@ fn activation_scope_is_direct_group_or_disabled_only_at_explicit_boundaries() {
         ],
     );
     let common_dir_sibling = fs::canonicalize(common_dir_sibling).unwrap();
-    git(
-        &android,
-        &[
-            "remote",
-            "add",
-            "origin",
-            "https://example.invalid/shared.git",
-        ],
-    );
-    git(
-        &sibling,
-        &[
-            "remote",
-            "add",
-            "origin",
-            "https://example.invalid/shared.git",
-        ],
-    );
 
     let config = UserConfigStore::initialize(temporary.path().join("activation state")).unwrap();
     let android_id = config
@@ -656,439 +625,236 @@ fn activation_scope_is_direct_group_or_disabled_only_at_explicit_boundaries() {
         .repository
         .repository_id;
     let cross = fs::canonicalize(cross).unwrap();
-    let cross_group = config
-        .add_repository_group(&cross, &[ios_id.clone(), android_id.clone()])
-        .unwrap()
-        .repository_group;
-    config
-        .add_repository_group(&outer, std::slice::from_ref(&nested_id))
-        .unwrap();
-
     let catalog = config.repository_catalog().unwrap();
-    let direct = catalog
-        .resolve_activation_scope(&android.join("src/search"))
-        .unwrap();
-    assert!(matches!(
-        direct.decision,
-        ActivationScopeDecision::Direct {
-            repository_id,
-            ref checkout_path,
-        } if repository_id == android_id && checkout_path == &android
-    ));
-    assert_eq!(direct.allowed_repository_ids, vec![android_id.clone()]);
 
-    let nested_direct = catalog
-        .resolve_activation_scope(&nested.join("src/search"))
-        .unwrap();
-    assert!(matches!(
-        nested_direct.decision,
-        ActivationScopeDecision::Direct {
-            repository_id,
-            ref checkout_path,
-        } if repository_id == nested_id && checkout_path == &nested
-    ));
+    let enabled = |cwd: &Path| match catalog.resolve_activation_scope(cwd).unwrap() {
+        ActivationScope::Enabled { repository_ids } => {
+            repository_ids.into_iter().collect::<BTreeSet<_>>()
+        }
+        ActivationScope::Disabled => BTreeSet::new(),
+    };
+
+    // Rule 1: inside a registered checkout, the deepest checkout owns the Session.
     assert_eq!(
-        nested_direct.allowed_repository_ids,
-        vec![nested_id.clone()]
+        enabled(&android.join("src/search")),
+        BTreeSet::from([android_id.clone()])
+    );
+    assert_eq!(
+        enabled(&nested.join("src/search")),
+        BTreeSet::from([nested_id.clone()])
+    );
+    // Standing on a checkout root that itself contains another registered checkout is
+    // still rule 1: the Session is inside `Outer`, so that is what it records for.
+    assert_eq!(enabled(&outer), BTreeSet::from([outer_id.clone()]));
+
+    // Rule 2: the common parent of several checkouts derives every one of them, with no
+    // Group registered anywhere.
+    assert_eq!(
+        enabled(&cross),
+        BTreeSet::from([
+            android_id.clone(),
+            ios_id.clone(),
+            outer_id.clone(),
+            nested_id.clone(),
+        ])
+    );
+    // An intermediate directory derives only what actually lives below it.
+    assert_eq!(
+        enabled(&fs::canonicalize(cross.join("android")).unwrap()),
+        BTreeSet::from([android_id.clone()])
     );
 
-    let direct_precedes_exact_group = catalog.resolve_activation_scope(&outer).unwrap();
-    assert!(matches!(
-        direct_precedes_exact_group.decision,
-        ActivationScopeDecision::Direct { repository_id, .. }
-            if repository_id == outer_id
-    ));
-    assert_eq!(
-        direct_precedes_exact_group.allowed_repository_ids,
-        vec![outer_id.clone()]
-    );
-
-    let group = catalog.resolve_activation_scope(&cross).unwrap();
-    assert!(matches!(
-        group.decision,
-        ActivationScopeDecision::Group {
-            repository_group_id,
-            ref root_path,
-        } if repository_group_id == cross_group.repository_group_id && root_path == &cross
-    ));
-    let expected_members = [android_id.clone(), ios_id.clone()]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        group
-            .allowed_repository_ids
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>(),
-        expected_members
-    );
-    assert!(!group.allowed_repository_ids.contains(&outer_id));
-    assert!(!group.allowed_repository_ids.contains(&nested_id));
-
+    // Everything else stays Disabled: an unregistered checkout, an unregistered worktree,
+    // and a directory that contains no registered checkout at all.
     for disabled_path in [
-        fs::canonicalize(temporary.path()).unwrap(),
-        fs::canonicalize(cross.join("android")).unwrap(),
         sibling,
         common_dir_sibling,
+        fs::canonicalize(cross.join("unregistered")).unwrap(),
     ] {
-        let disabled = catalog.resolve_activation_scope(&disabled_path).unwrap();
-        assert_eq!(disabled.decision, ActivationScopeDecision::Disabled);
-        assert!(disabled.allowed_repository_ids.is_empty());
+        assert_eq!(
+            catalog.resolve_activation_scope(&disabled_path).unwrap(),
+            ActivationScope::Disabled
+        );
     }
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
-fn repository_groups_reject_unsafe_roots_unknown_or_ineligible_members_and_drift() {
-    let temporary = TempDir::new().unwrap();
-    let root = temporary.path().join("group root");
-    let member = init_repo(&root.join("member-a"), "member-a");
-    let second_member = init_repo(&root.join("member-b"), "member-b");
-    let outside = init_repo(&temporary.path().join("outside"), "outside");
-    let root = fs::canonicalize(root).unwrap();
-    let config = UserConfigStore::initialize(temporary.path().join("group state")).unwrap();
-    let member_id = config
-        .add_repository(RepositoryId::new(), std::slice::from_ref(&member))
-        .unwrap()
-        .repository
-        .repository_id;
-    let second_member_id = config
-        .add_repository(RepositoryId::new(), std::slice::from_ref(&second_member))
-        .unwrap()
-        .repository
-        .repository_id;
-    let outside_id = config
-        .add_repository(RepositoryId::new(), std::slice::from_ref(&outside))
-        .unwrap()
-        .repository
-        .repository_id;
+fn the_filesystem_root_and_the_home_directory_never_derive_activation() {
+    // The guard reads `$HOME`, so the assertions run in a child with a controlled one.
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "home_guard_child", "--nocapture"])
+        .env("HOME", GUARDED_HOME)
+        .env("SCTX_HOME_GUARD_CHILD", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "home guard child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
 
-    assert_eq!(
-        config.add_repository_group(&root, &[]).unwrap_err().kind(),
-        ErrorKind::InvalidInput
-    );
-    assert_eq!(
-        config
-            .add_repository_group(&root, &[member_id.clone(), member_id.clone()])
-            .unwrap_err()
-            .kind(),
-        ErrorKind::InvalidInput
-    );
-    assert_eq!(
-        config
-            .add_repository_group(&root, &[RepositoryId::new()])
-            .unwrap_err()
-            .kind(),
-        ErrorKind::RepositoryNotConfigured
-    );
-    assert_eq!(
-        config
-            .add_repository_group(&root, &[outside_id])
-            .unwrap_err()
-            .kind(),
-        ErrorKind::InvalidInput
-    );
-    assert_eq!(
-        config
-            .add_repository_group(&member, std::slice::from_ref(&member_id))
-            .unwrap_err()
-            .kind(),
-        ErrorKind::InvalidInput,
-        "a member checkout must be strictly below, not equal to, the Group root"
-    );
-    assert_eq!(
-        config
-            .add_repository_group(&root.join("member-a/.."), std::slice::from_ref(&member_id))
-            .unwrap_err()
-            .kind(),
-        ErrorKind::InvalidInput
-    );
-    let file_root = root.join("not-a-directory");
-    fs::write(&file_root, "fixture").unwrap();
-    assert_eq!(
-        config
-            .add_repository_group(&file_root, std::slice::from_ref(&member_id))
-            .unwrap_err()
-            .kind(),
-        ErrorKind::InvalidInput
-    );
-    #[cfg(unix)]
-    {
-        let symlink_root = temporary.path().join("group root link");
-        std::os::unix::fs::symlink(&root, &symlink_root).unwrap();
+const GUARDED_HOME: &str = "/private/guarded-home";
+
+#[test]
+fn home_guard_child() {
+    if std::env::var_os("SCTX_HOME_GUARD_CHILD").is_none() {
+        return;
+    }
+    let home = PathBuf::from(GUARDED_HOME);
+    let checkout = home.join("work/product");
+    let repository_id = RepositoryId::new();
+    let guarded = RepositoryCatalogSnapshot {
+        repositories: vec![RepositoryCatalogEntry {
+            repository_id: repository_id.clone(),
+            checkout_paths: vec![checkout],
+        }],
+        ..RepositoryCatalogSnapshot::default()
+    };
+    let permissive = RepositoryCatalogSnapshot {
+        activation: ActivationSettings { allow_home: true },
+        ..guarded.clone()
+    };
+    let home_parent = home.parent().unwrap().to_path_buf();
+    let expected = ActivationScope::Enabled {
+        repository_ids: vec![repository_id],
+    };
+
+    // Starting at home, at the directory that holds home, or at the filesystem root would
+    // otherwise sweep in every registered Repository on the machine.
+    for guarded_cwd in [home.clone(), home_parent.clone(), PathBuf::from("/")] {
         assert_eq!(
-            config
-                .add_repository_group(&symlink_root, std::slice::from_ref(&member_id))
-                .unwrap_err()
-                .kind(),
-            ErrorKind::InvalidInput
+            guarded
+                .resolve_recorded_activation_scope(&guarded_cwd)
+                .unwrap(),
+            ActivationScope::Disabled,
+            "{} must not derive activation",
+            guarded_cwd.display()
         );
     }
 
-    let created = config
-        .add_repository_group(&root, std::slice::from_ref(&member_id))
-        .unwrap();
-    assert!(created.created);
-    assert!(
-        created
-            .repository_group
-            .repository_group_id
-            .to_string()
-            .starts_with("rpg_")
-    );
-    let retry = config
-        .add_repository_group(&root, std::slice::from_ref(&member_id))
-        .unwrap();
-    assert!(!retry.created);
+    // A directory between home and the checkout is an ordinary parent and still derives.
     assert_eq!(
-        retry.repository_group.repository_group_id,
-        created.repository_group.repository_group_id
-    );
-    assert_eq!(
-        config
-            .add_repository_group(&root, &[member_id.clone(), second_member_id])
-            .unwrap_err()
-            .kind(),
-        ErrorKind::InvalidInput,
-        "one root cannot identify two different RepositoryGroups"
+        guarded
+            .resolve_recorded_activation_scope(&home.join("work"))
+            .unwrap(),
+        expected
     );
 
-    let snapshot = config.repository_catalog().unwrap();
-    fs::rename(&member, root.join("moved-member")).unwrap();
-    let cached_scope = snapshot.resolve_activation_scope(&root).unwrap();
-    assert!(matches!(
-        cached_scope.decision,
-        ActivationScopeDecision::Group { .. }
-    ));
-    let refreshed_scope = config.resolve_activation_scope(&root).unwrap();
-    assert!(matches!(
-        refreshed_scope.decision,
-        ActivationScopeDecision::Group { .. }
-    ));
+    // `[activation] allow_home` lifts the two home guards, and only those.
+    for allowed_cwd in [home, home_parent] {
+        assert_eq!(
+            permissive
+                .resolve_recorded_activation_scope(&allowed_cwd)
+                .unwrap(),
+            expected
+        );
+    }
     assert_eq!(
-        config
-            .doctor_repository_catalog()
+        permissive
+            .resolve_recorded_activation_scope(Path::new("/"))
+            .unwrap(),
+        ActivationScope::Disabled,
+        "the filesystem root is never derivable"
+    );
+}
+
+#[test]
+fn a_config_document_that_still_declares_repository_groups_is_migrated_once() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("legacy state");
+    let repository = init_repo(&temporary.path().join("legacy/member"), "member");
+    let store = UserConfigStore::initialize(&root).unwrap();
+    store
+        .add_repository("FE".parse::<RepositoryId>().unwrap(), &[repository])
+        .unwrap();
+
+    let config_path = root.join("config.toml");
+    let current = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        migrate_legacy_repository_groups(&current)
             .unwrap()
-            .checkouts
-            .iter()
-            .filter(|checkout| checkout.status == CatalogCheckoutStatus::Missing)
-            .count(),
-        1,
-        "SessionStart trusts Catalog while doctor owns checkout health drift"
+            .is_none(),
+        "a document without the removed section is left byte-identical"
     );
-}
 
-#[test]
-#[cfg(unix)]
-fn configured_repository_group_root_error_names_identity_path_and_reason() {
-    let temporary = TempDir::new().unwrap();
-    let root = temporary.path().join("drifting group root");
-    let member = init_repo(&root.join("member"), "member");
-    let root = fs::canonicalize(root).unwrap();
-    let config = UserConfigStore::initialize(temporary.path().join("drift state")).unwrap();
-    let member_id = config
-        .add_repository(RepositoryId::new(), std::slice::from_ref(&member))
+    let legacy = format!(
+        "{current}\n[[repository_groups]]\n\
+         id = \"rpg_00000000-0000-4000-8000-000000000001\"\n\
+         root = \"/legacy\"\n\
+         members = [\"FE\"]\n"
+    );
+    fs::write(&config_path, &legacy).unwrap();
+    assert_eq!(
+        store.repository_catalog().unwrap_err().kind(),
+        ErrorKind::InvalidInput,
+        "the removed section is refused rather than silently ignored"
+    );
+
+    let migrated = migrate_legacy_repository_groups(&legacy)
         .unwrap()
-        .repository
-        .repository_id;
-    let group = config
-        .add_repository_group(&root, &[member_id])
-        .unwrap()
-        .repository_group;
-
-    let moved_root = temporary.path().join("moved group root");
-    fs::rename(&root, &moved_root).unwrap();
-    std::os::unix::fs::symlink(&moved_root, &root).unwrap();
-
-    let error = config.repository_catalog().unwrap_err();
-    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        .expect("the legacy section is migrated");
+    assert!(!migrated.contains("repository_groups"));
+    fs::write(&config_path, &migrated).unwrap();
+    let catalog = store.repository_catalog().unwrap();
+    assert_eq!(catalog.repositories.len(), 1);
+    assert!(!catalog.activation.allow_home);
     assert!(
-        error
-            .message()
-            .contains(&group.repository_group_id.to_string())
+        migrate_legacy_repository_groups(&migrated)
+            .unwrap()
+            .is_none(),
+        "migration is idempotent"
     );
-    assert!(error.message().contains(root.to_str().unwrap()));
-    assert!(error.message().contains("must not be a symlink"));
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
-fn repository_group_inspection_update_and_remove_repair_drift_without_touching_repositories() {
-    let temporary = TempDir::new().unwrap();
-    let original_root = temporary.path().join("original group");
-    let first = init_repo(&original_root.join("first"), "first");
-    let second = init_repo(&original_root.join("second"), "second");
-    let original_root = fs::canonicalize(original_root).unwrap();
-    let replacement_root = temporary.path().join("replacement group");
-    let replacement_first = init_repo(&replacement_root.join("first"), "replacement-first");
-    let replacement_second = init_repo(&replacement_root.join("second"), "replacement-second");
-    let replacement_root = fs::canonicalize(replacement_root).unwrap();
-    let config = UserConfigStore::initialize(temporary.path().join("repair state")).unwrap();
-    let first_id = config
-        .add_repository(RepositoryId::new(), std::slice::from_ref(&first))
-        .unwrap()
-        .repository
-        .repository_id;
-    config
-        .add_repository(first_id.clone(), std::slice::from_ref(&replacement_first))
-        .unwrap();
-    let second_id = config
-        .add_repository(RepositoryId::new(), std::slice::from_ref(&second))
-        .unwrap()
-        .repository
-        .repository_id;
-    config
-        .add_repository(second_id.clone(), std::slice::from_ref(&replacement_second))
-        .unwrap();
-    let group = config
-        .add_repository_group(&original_root, std::slice::from_ref(&first_id))
-        .unwrap()
-        .repository_group;
-
-    let moved_original = temporary.path().join("moved original group");
-    fs::rename(&original_root, &moved_original).unwrap();
-    assert!(config.repository_catalog().is_err());
-    let inspection = config.inspect_repository_catalog().unwrap();
-    assert_eq!(inspection.catalog.repositories.len(), 2);
-    assert_eq!(inspection.repository_groups.len(), 1);
-    assert_eq!(
-        inspection.repository_groups[0].status,
-        CatalogRepositoryGroupStatus::Missing
-    );
-    assert_eq!(inspection.repository_groups[0].root_path, original_root);
-    assert_eq!(
-        inspection.repository_groups[0].repository_group_id,
-        group.repository_group_id
-    );
-    let doctor = config.doctor_repository_catalog().unwrap();
-    assert!(!doctor.healthy);
-    assert_eq!(doctor.repository_group_count, 1);
-    assert_eq!(
-        doctor.repository_groups[0].status,
-        CatalogRepositoryGroupStatus::Missing
-    );
-
-    let unknown_member = RepositoryId::new();
-    assert_eq!(
-        config
-            .update_repository_group(
-                group.repository_group_id,
-                Some(&replacement_root),
-                Some(&[unknown_member]),
-            )
-            .unwrap_err()
-            .kind(),
-        ErrorKind::RepositoryNotConfigured
-    );
-    let updated = config
-        .update_repository_group(
-            group.repository_group_id,
-            Some(&replacement_root),
-            Some(&[first_id.clone(), second_id.clone()]),
-        )
-        .unwrap();
-    assert!(updated.changed);
-    assert_eq!(updated.repository_group.root_path, replacement_root);
-    assert_eq!(
-        updated
-            .repository_group
-            .member_repository_ids
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from([first_id.clone(), second_id.clone()])
-    );
-    let retry = config
-        .update_repository_group(
-            group.repository_group_id,
-            Some(&replacement_root),
-            Some(&[first_id, second_id]),
-        )
-        .unwrap();
-    assert!(!retry.changed);
-
-    let moved_replacement = temporary.path().join("moved replacement group");
-    fs::rename(&replacement_root, &moved_replacement).unwrap();
-    let removed = config
-        .remove_repository_group(group.repository_group_id)
-        .unwrap();
-    assert!(removed.removed);
-    let removal_retry = config
-        .remove_repository_group(group.repository_group_id)
-        .unwrap();
-    assert!(!removal_retry.removed);
-    let repaired = config.repository_catalog().unwrap();
-    assert!(repaired.repository_groups.is_empty());
-    assert_eq!(repaired.repositories.len(), 2);
-    assert!(moved_original.exists());
-    assert!(moved_replacement.exists());
-}
-
-#[test]
-fn activation_scope_absolute_paths_are_local_decision_metadata() {
+fn an_activation_decision_carries_repository_identity_and_never_a_path() {
     fn assert_local_metadata_type<T: Clone + std::fmt::Debug + Eq + serde::Serialize>() {}
 
     assert_local_metadata_type::<ActivationScope>();
-    assert_local_metadata_type::<ActivationScopeDecision>();
     assert!(
-        std::any::type_name::<ActivationScopeDecision>().starts_with("sctx_local_state::"),
-        "ActivationScopeDecision must remain a local-state type, not a durable domain type"
+        std::any::type_name::<ActivationScope>().starts_with("sctx_local_state::"),
+        "ActivationScope must remain a local-state type, not a durable domain type"
     );
 
-    let temporary = TempDir::new().unwrap();
-    let checkout = fs::canonicalize(temporary.path()).unwrap();
     let repository_id = RepositoryId::new();
-    let scope = ActivationScope {
-        decision: ActivationScopeDecision::Direct {
-            repository_id: repository_id.clone(),
-            checkout_path: checkout.clone(),
-        },
-        allowed_repository_ids: vec![repository_id.clone()],
+    let sibling_id = RepositoryId::new();
+    let scope = ActivationScope::Enabled {
+        repository_ids: vec![repository_id.clone(), sibling_id.clone()],
     };
-    let serialized = serde_json::to_value(scope).unwrap();
-    let top_level = serialized.as_object().unwrap();
+    let serialized = serde_json::to_value(&scope).unwrap();
+    let object = serialized.as_object().unwrap();
     assert_eq!(
-        top_level
-            .keys()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from(["allowed_repository_ids", "decision"])
+        object.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        BTreeSet::from(["kind", "repository_ids"])
     );
-    let decision = top_level["decision"].as_object().unwrap();
+    assert_eq!(object["kind"], "enabled");
+    assert_eq!(scope.repository_ids().len(), 2);
+    assert!(scope.is_enabled());
+
+    let disabled = serde_json::to_value(ActivationScope::Disabled).unwrap();
     assert_eq!(
-        decision.keys().map(String::as_str).collect::<BTreeSet<_>>(),
-        BTreeSet::from(["checkout_path", "kind", "repository_id"])
+        disabled.as_object().unwrap().keys().collect::<Vec<_>>(),
+        vec!["kind"]
     );
-    assert_eq!(decision["checkout_path"], checkout.to_str().unwrap());
-    for forbidden_boundary in [
-        "activation_hint",
+    assert_eq!(disabled["kind"], "disabled");
+    assert!(ActivationScope::Disabled.repository_ids().is_empty());
+
+    // No location, and no boundary the decision must never cross, appears anywhere in it.
+    let text = serde_json::to_string(&scope).unwrap();
+    for forbidden in [
+        "checkout_path",
+        "root_path",
+        "repository_group",
+        "startup_cwd",
         "prompt",
         "mcp_response",
         "report",
         "durable_context",
     ] {
-        assert!(!top_level.contains_key(forbidden_boundary));
-        assert!(!decision.contains_key(forbidden_boundary));
+        assert!(!text.contains(forbidden), "{forbidden} must not be present");
     }
-
-    let repository_group_id = RepositoryGroupId::new();
-    let group_scope = ActivationScope {
-        decision: ActivationScopeDecision::Group {
-            repository_group_id,
-            root_path: checkout.clone(),
-        },
-        allowed_repository_ids: vec![repository_id.clone()],
-    };
-    let serialized_group = serde_json::to_value(group_scope).unwrap();
-    let group_decision = serialized_group["decision"].as_object().unwrap();
-    assert_eq!(
-        group_decision
-            .keys()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from(["kind", "repository_group_id", "root_path"])
-    );
-    assert_eq!(group_decision["root_path"], checkout.to_str().unwrap());
 }
 
 #[test]
@@ -1127,94 +893,38 @@ fn activation_scope_without_git_child() {
     );
 
     let temporary = TempDir::new().unwrap();
-    let group_root = temporary.path().join("group");
-    let checkout = group_root.join("member");
+    let parent = temporary.path().join("parent");
+    let checkout = parent.join("member");
     let direct_cwd = checkout.join("src");
-    let sibling = group_root.join("unregistered sibling");
+    let sibling = parent.join("unregistered sibling");
     for directory in [&direct_cwd, &sibling] {
         fs::create_dir_all(directory).unwrap();
     }
-    let group_root = fs::canonicalize(group_root).unwrap();
+    let parent = fs::canonicalize(parent).unwrap();
     let checkout = fs::canonicalize(checkout).unwrap();
     let direct_cwd = fs::canonicalize(direct_cwd).unwrap();
     let sibling = fs::canonicalize(sibling).unwrap();
     let repository_id = RepositoryId::new();
-    let repository_group_id = RepositoryGroupId::new();
     let catalog = RepositoryCatalogSnapshot {
         repositories: vec![RepositoryCatalogEntry {
             repository_id: repository_id.clone(),
-            checkout_paths: vec![checkout.clone()],
+            checkout_paths: vec![checkout],
         }],
-        repository_groups: vec![RepositoryGroupCatalogEntry {
-            repository_group_id,
-            root_path: group_root.clone(),
-            member_repository_ids: vec![repository_id.clone()],
-        }],
+        ..RepositoryCatalogSnapshot::default()
     };
 
-    let direct = catalog.resolve_activation_scope(&direct_cwd).unwrap();
-    assert!(matches!(
-        direct.decision,
-        ActivationScopeDecision::Direct {
-            repository_id: matched,
-            ref checkout_path,
-        } if matched == repository_id && checkout_path == &checkout
-    ));
-    let group = catalog.resolve_activation_scope(&group_root).unwrap();
-    assert!(matches!(
-        group.decision,
-        ActivationScopeDecision::Group {
-            repository_group_id: matched,
-            ..
-        } if matched == repository_group_id
-    ));
-    let disabled = catalog.resolve_activation_scope(&sibling).unwrap();
-    assert_eq!(disabled.decision, ActivationScopeDecision::Disabled);
-}
-
-#[test]
-fn concurrent_repository_group_add_is_atomic_and_semantically_idempotent() {
-    let temporary = TempDir::new().unwrap();
-    let root = temporary.path().join("concurrent group");
-    let member = init_repo(&root.join("member"), "member");
-    let root = fs::canonicalize(root).unwrap();
-    let config = UserConfigStore::initialize(temporary.path().join("concurrent state")).unwrap();
-    let member_id = config
-        .add_repository(RepositoryId::new(), std::slice::from_ref(&member))
-        .unwrap()
-        .repository
-        .repository_id;
-    let worker_count = 8;
-    let barrier = Arc::new(Barrier::new(worker_count));
-    let mut workers = Vec::new();
-    for _ in 0..worker_count {
-        let barrier = Arc::clone(&barrier);
-        let config = config.clone();
-        let root = root.clone();
-        let member_id = member_id.clone();
-        workers.push(thread::spawn(move || {
-            barrier.wait();
-            config.add_repository_group(&root, &[member_id]).unwrap()
-        }));
-    }
-    let outcomes = workers
-        .into_iter()
-        .map(|worker| worker.join().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(outcomes.iter().filter(|outcome| outcome.created).count(), 1);
-    let ids = outcomes
-        .iter()
-        .map(|outcome| outcome.repository_group.repository_group_id)
-        .collect::<BTreeSet<_>>();
-    assert_eq!(ids.len(), 1);
-    let catalog = config.repository_catalog_wait().unwrap();
-    assert_eq!(catalog.repository_groups.len(), 1);
-    let group = catalog.resolve_activation_scope(&root).unwrap();
-    assert!(matches!(
-        group.decision,
-        ActivationScopeDecision::Group { .. }
-    ));
-    assert_eq!(group.allowed_repository_ids, vec![member_id]);
+    let expected = ActivationScope::Enabled {
+        repository_ids: vec![repository_id],
+    };
+    assert_eq!(
+        catalog.resolve_activation_scope(&direct_cwd).unwrap(),
+        expected
+    );
+    assert_eq!(catalog.resolve_activation_scope(&parent).unwrap(), expected);
+    assert_eq!(
+        catalog.resolve_activation_scope(&sibling).unwrap(),
+        ActivationScope::Disabled
+    );
 }
 
 #[test]

@@ -160,18 +160,19 @@ pub enum CapabilityMode {
 
 /// Already-resolved, vendor-neutral activation input for pure Hook policy.
 ///
-/// Repository and Group identities deliberately do not cross this seam. Local startup code owns
-/// scope resolution and supplies only the resulting policy state.
+/// Activation is two-state here on purpose. Which Repositories a Session may record for —
+/// one when it started inside a checkout, several when it started at their common parent —
+/// is a Catalog fact, and Repository identities deliberately do not cross this seam. Local
+/// startup code owns scope resolution and supplies only the resulting policy state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResolvedActivationDecision {
     Disabled,
-    Direct,
-    Group,
+    Enabled,
 }
 
 impl ResolvedActivationDecision {
     const fn is_enabled(self) -> bool {
-        matches!(self, Self::Direct | Self::Group)
+        matches!(self, Self::Enabled)
     }
 }
 
@@ -263,10 +264,10 @@ pub struct ArtifactFocusReminderContext {
 /// Selects the single located file a `PostToolUse` event may look up.
 ///
 /// The decision is pure and fails closed. It requires the explicit experiment
-/// switch, a `Direct` Session (Group activation spans Repositories and is out of
-/// scope for this experiment), a file-operation tool classified by
+/// switch, an Enabled Session, a file-operation tool classified by
 /// [`normalize_tool_use`], and exactly one structured file hint. No substring or
-/// command-text guessing participates.
+/// command-text guessing participates. Which Repository the file belongs to is
+/// decided by the caller against the Catalog, not here.
 #[must_use]
 pub fn artifact_focus_reminder_file<'event>(
     event: &'event CanonicalAgentEvent,
@@ -274,10 +275,7 @@ pub fn artifact_focus_reminder_file<'event>(
     capabilities: &AgentCapabilities,
     enabled: bool,
 ) -> Option<&'event Path> {
-    if !enabled
-        || activation != ResolvedActivationDecision::Direct
-        || !capabilities.hooks_verified()
-    {
+    if !enabled || !activation.is_enabled() || !capabilities.hooks_verified() {
         return None;
     }
     let CanonicalAgentEvent::PostToolUse {
@@ -555,8 +553,7 @@ impl CanonicalAgentAction {
 ///
 /// This function does no I/O and cannot inspect Repository Catalog, lease storage, `SQLite`, the
 /// filesystem, Git, Prompt text, transcript content, or historical Context. Enabled behavior
-/// requires an explicit [`ResolvedActivationDecision::Direct`] or
-/// [`ResolvedActivationDecision::Group`] input.
+/// requires an explicit [`ResolvedActivationDecision::Enabled`] input.
 #[must_use]
 pub fn plan_action_for_activation(
     event: &CanonicalAgentEvent,
@@ -1131,7 +1128,7 @@ mod tests {
             plan_action_for_activation(
                 &event,
                 &verified_codex_capabilities(),
-                ResolvedActivationDecision::Direct,
+                ResolvedActivationDecision::Enabled,
             ),
             CanonicalAgentAction::neutral()
         );
@@ -1249,25 +1246,11 @@ mod tests {
     }
 
     #[test]
-    fn direct_and_group_have_identical_bounded_public_policy_for_all_events() {
+    fn enabled_activation_has_one_bounded_public_policy_for_all_events() {
         let capabilities = verified_codex_capabilities();
-        for event in lifecycle_events() {
-            let direct = plan_action_for_activation(
-                &event,
-                &capabilities,
-                ResolvedActivationDecision::Direct,
-            );
-            let group = plan_action_for_activation(
-                &event,
-                &capabilities,
-                ResolvedActivationDecision::Group,
-            );
-            assert_eq!(direct, group);
-        }
-
         let start = lifecycle_events().remove(0);
         let action =
-            plan_action_for_activation(&start, &capabilities, ResolvedActivationDecision::Direct);
+            plan_action_for_activation(&start, &capabilities, ResolvedActivationDecision::Enabled);
         let marker = shared_context_activation_marker(AgentKind::Codex, "session");
         assert_eq!(action.additional_context.as_deref(), Some(marker.as_str()));
         assert!(action.system_message.is_none());
@@ -1300,7 +1283,7 @@ mod tests {
             plan_action_for_activation(
                 &events[index],
                 &capabilities,
-                ResolvedActivationDecision::Direct,
+                ResolvedActivationDecision::Enabled,
             )
         };
 
@@ -1363,25 +1346,21 @@ mod tests {
             TrustState::Confirmed,
             false,
         );
-        for activation in [
-            ResolvedActivationDecision::Direct,
-            ResolvedActivationDecision::Group,
-        ] {
-            let action = plan_action_for_activation(&event, &capabilities, activation);
-            assert_eq!(action.task_operation, None);
-            assert_eq!(action.additional_context, None);
-            assert_eq!(
-                action.system_message.as_deref(),
-                Some(capabilities.diagnostic.as_str())
-            );
-            assert!(
-                !action
-                    .system_message
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("<shared-context-active")
-            );
-        }
+        let action =
+            plan_action_for_activation(&event, &capabilities, ResolvedActivationDecision::Enabled);
+        assert_eq!(action.task_operation, None);
+        assert_eq!(action.additional_context, None);
+        assert_eq!(
+            action.system_message.as_deref(),
+            Some(capabilities.diagnostic.as_str())
+        );
+        assert!(
+            !action
+                .system_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("<shared-context-active")
+        );
     }
 
     fn verified_codex_capabilities() -> AgentCapabilities {

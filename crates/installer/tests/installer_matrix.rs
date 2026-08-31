@@ -706,7 +706,6 @@ fn seed_reset_state(harness: &Harness) -> SeededResetState {
     let catalog_root = harness.home.join("team repositories");
     let fe = init_catalog_repo(&catalog_root.join("fe"));
     let android = init_catalog_repo(&catalog_root.join("android"));
-    let catalog_root = fs::canonicalize(catalog_root).unwrap();
     let config = UserConfigStore::open_existing(&harness.root).unwrap();
     let fe_id: sctx_domain::RepositoryId = "FE".parse().unwrap();
     let android_id: sctx_domain::RepositoryId = "Android".parse().unwrap();
@@ -715,9 +714,6 @@ fn seed_reset_state(harness: &Harness) -> SeededResetState {
         .unwrap();
     config
         .add_repository(android_id.clone(), std::slice::from_ref(&android))
-        .unwrap();
-    config
-        .add_repository_group(&catalog_root, &[fe_id, android_id])
         .unwrap();
 
     let repository = harness.root.join("repository");
@@ -1278,7 +1274,6 @@ fn data_reset_dry_run_is_read_only_and_confirmed_reset_preserves_installation() 
         .unwrap();
     assert!(dry_run.dry_run);
     assert_eq!(dry_run.repository_count_cleared, 2);
-    assert_eq!(dry_run.repository_group_count_cleared, 1);
     assert!(dry_run.backup.is_none());
     assert!(!dry_run.remote_detached);
     assert!(!dry_run.remote_mutated);
@@ -1304,7 +1299,6 @@ fn data_reset_dry_run_is_read_only_and_confirmed_reset_preserves_installation() 
         .unwrap();
     assert!(!report.dry_run);
     assert_eq!(report.repository_count_cleared, 2);
-    assert_eq!(report.repository_group_count_cleared, 1);
     assert!(report.remote_detached);
     assert!(!report.remote_mutated);
     let backup = report.backup.as_ref().unwrap();
@@ -1379,7 +1373,6 @@ fn data_reset_dry_run_is_read_only_and_confirmed_reset_preserves_installation() 
         })
         .unwrap();
     assert_eq!(repeated.repository_count_cleared, 0);
-    assert_eq!(repeated.repository_group_count_cleared, 0);
     assert_ne!(repeated.backup, report.backup);
     assert!(installer.doctor().healthy);
 }
@@ -1491,7 +1484,6 @@ fn setup_recovers_an_incomplete_reset_before_reapplying_installation() {
         .repository_catalog()
         .unwrap();
     assert_eq!(catalog.repositories.len(), 2);
-    assert_eq!(catalog.repository_groups.len(), 1);
     assert_eq!(git(&harness.root.join("repository"), &["remote"]), "origin");
     assert_eq!(
         git(&seeded.remote, &["rev-parse", "refs/heads/main"]),
@@ -1761,6 +1753,117 @@ fn upgrade_switches_atomically_and_failed_upgrade_restores_previous_runtime() {
         PathBuf::from("2.0.0/arm64")
     );
     assert!(!harness.root.join("bin/3.0.0/arm64/sctx").exists());
+}
+
+/// An installation that configured explicit `RepositoryGroups` keeps working after the
+/// upgrade that removed them: the section is dropped in the same transaction that would
+/// roll it back, and one notice explains what replaced it (WP-N2).
+#[test]
+fn upgrade_migrates_a_configuration_that_still_declares_repository_groups() {
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let member = init_catalog_repo(&harness.home.join("team repositories/fe"));
+    let config_path = harness.root.join("config.toml");
+    UserConfigStore::open_existing(&harness.root)
+        .unwrap()
+        .add_repository("FE".parse().unwrap(), std::slice::from_ref(&member))
+        .unwrap();
+    let before = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        format!(
+            "{before}\n[[repository_groups]]\n\
+             id = \"rpg_00000000-0000-4000-8000-000000000001\"\n\
+             root = \"{}\"\nmembers = [\"FE\"]\n",
+            member.parent().unwrap().display()
+        ),
+    )
+    .unwrap();
+    assert!(
+        UserConfigStore::open_existing(&harness.root)
+            .unwrap()
+            .repository_catalog()
+            .is_err(),
+        "the removed section makes the document unreadable until it is migrated"
+    );
+
+    let report = harness
+        .installer("2.0.0")
+        .upgrade(&SetupOptions::default())
+        .unwrap();
+    assert!(report.changed);
+    assert!(
+        report.notices.iter().any(|notice| {
+            notice.contains("repository groups are deprecated")
+                && notice.contains("derived from registered checkouts")
+        }),
+        "the upgrade explains what replaced Groups: {:#?}",
+        report.notices
+    );
+    let migrated = fs::read_to_string(&config_path).unwrap();
+    assert!(!migrated.contains("repository_groups"));
+    let catalog = UserConfigStore::open_existing(&harness.root)
+        .unwrap()
+        .repository_catalog()
+        .unwrap();
+    assert_eq!(catalog.repositories.len(), 1);
+    assert_eq!(
+        catalog.repositories[0].checkout_paths,
+        vec![member.clone()],
+        "the Repository registration itself is untouched"
+    );
+
+    // The pre-migration document is recoverable from the upgrade's own backup.
+    let backups = fs::read_dir(harness.root.join("backups"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    let mut recovered = Vec::new();
+    for backup in &backups {
+        let mut files = Vec::new();
+        collect_files_recursive(backup, &mut files);
+        recovered.extend(
+            files
+                .into_iter()
+                .filter_map(|path| fs::read_to_string(path).ok())
+                .filter(|text| text.contains("[[repository_groups]]")),
+        );
+    }
+    assert!(
+        !recovered.is_empty(),
+        "the original document is retained as a backup"
+    );
+
+    // Repeating the upgrade finds nothing left to migrate and says nothing about it.
+    let repeated = harness
+        .installer("3.0.0")
+        .upgrade(&SetupOptions::default())
+        .unwrap();
+    assert!(
+        !repeated
+            .notices
+            .iter()
+            .any(|notice| notice.contains("repository groups are deprecated")),
+        "migration is announced once: {:#?}",
+        repeated.notices
+    );
+}
+
+fn collect_files_recursive(directory: &std::path::Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            collect_files_recursive(&path, files);
+        } else {
+            files.push(path);
+        }
+    }
 }
 
 #[test]
@@ -3039,7 +3142,6 @@ fn fixed_two_installation_team_sharing_and_local_reset_oracle() {
         .repository_catalog()
         .unwrap();
     assert!(empty_catalog.repositories.is_empty());
-    assert!(empty_catalog.repository_groups.is_empty());
     assert!(
         RepositoryRegistry::initialize(&machine_b.root)
             .unwrap()

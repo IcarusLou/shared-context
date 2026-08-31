@@ -43,7 +43,7 @@ sctx demo
 
 `sctx demo` 会在本机创建一组固定的演示数据，完成“创建 Space → 写入 Context → 审核 → 发布 → CLI/MCP 搜索”的闭环。重复执行不会反复创建相同数据。
 
-然后用 `sctx repository add` 登记希望启用 Shared Context 的本机代码仓库，再重启已经打开的 Cursor 或 Codex。只有从已登记 checkout 内启动，或从显式登记的 Repository Group 精确根目录启动时，SessionStart 才会向 Agent 注入简短授权 marker（其中带有本会话的 `external_session_id`，供 Agent 原样回传）；未登记目录保持 neutral，不进入 Hook 记录流程。进入授权范围后，Agent 才按已安装的 Shared Context Skill、MCP 工具和生命周期 Hook 维护任务意图、取回相关历史、记录检查点，并把值得长期保存的结论整理成待审核 Candidate。
+然后用 `sctx repository add` 登记希望启用 Shared Context 的本机代码仓库，再重启已经打开的 Cursor 或 Codex。只有从已登记 checkout 内启动，或从一个下面放着已登记 checkout 的父目录启动时，SessionStart 才会向 Agent 注入简短授权 marker（其中带有本会话的 `external_session_id`，供 Agent 原样回传）；未登记目录保持 neutral，不进入 Hook 记录流程。进入授权范围后，Agent 才按已安装的 Shared Context Skill、MCP 工具和生命周期 Hook 维护任务意图、取回相关历史、记录检查点，并把值得长期保存的结论整理成待审核 Candidate。
 
 ## 3. 安装步骤
 
@@ -306,10 +306,13 @@ Workspace 路径不会自动绑定一个 Space，文本 Hint 也不会冒充已�
 
 ### 4.5 隐私和信任边界
 
-- SessionStart 在模型推理前用本机 Repository Catalog 判定范围，不读取 Prompt，也不调用模型。已登记 checkout 是 `Direct`；只有显式登记且精确匹配的 Group root 才是 `Group`；普通父目录、未登记 sibling 和其他目录都是 `Disabled`。
+- SessionStart 在模型推理前用本机 Repository Catalog 推导范围，不读取 Prompt，也不调用模型。启动目录在某个已登记 checkout 内 → 为该仓库 `Enabled`（最深的 checkout 说了算）；否则启动目录下面有几个已登记 checkout，就为那几个仓库 `Enabled`；两者都不满足则 `Disabled`。文件系统根、你的 HOME 目录本身以及 HOME 的上一级永远不会用第二条规则启用——从那里推导会把整机所有已登记仓库一次性拉进来。未登记 sibling、下面没有任何已登记仓库的目录同样是 `Disabled`。
 - Enabled 只返回一个形状固定、短小且不含路径/Repository/Prompt 身份的 marker，例如：`<shared-context-active external_session_id="…">Shared Context is authorized for this session. Before substantive work, call task_intent_update with agent_kind "codex" and external_session_id "…" (copy it verbatim; never invent one).</shared-context-active>`（硬上限 512 bytes）；marker 里唯一随会话变化的是 host session id 与 `agent_kind`，Agent 必须把这个 id 原样当作 `external_session_id` 回传（Codex 也可用 `printenv CODEX_SESSION_ID` 核对，Cursor 即 conversation id），不得自行编造。host session id 本身不合法（为空、超长或含非常见字符）时，marker 会退化成不带 `external_session_id` 属性的版本，改用一句话说明去哪里找这个 id，同样不会让 Agent 编造。PromptSubmit 不重复 marker。Disabled 的 Prompt、Tool、压缩、停止和结束 Hook 不打开业务 Runtime，也不写 Report 或知识 Git。
-- 同一 Agent Session locator 的第一次成功决定会一直复用到 SessionEnd；后续 resume/compact 或 cwd 变化不会重新判定。Catalog/lease 锁忙、损坏或异常会立即按 Disabled 处理，但不会阻断正常编程。
-- PostToolUse 会在记录前检查 `absolute_file_path`、`file_path`、`filepath`、`path`、`cwd`、`workdir`、`working_directory` 等已知结构化路径。Enabled 表示整个 Session 已准入，不把调查目标限制在启动 Repo 或 Group 成员：其他已登记 Repo 会按真实 Catalog identity 记录；安全的未登记路径、registered/unregistered mixed 或无法用一个显式 workspace 安全表示的多 Repo 事件只保留无路径、无 Repository 猜测的非定位工程含义；相对、缺失、symlink、歧义或特殊文件仍让整条事件被丢弃。
+- 同一 Agent Session 的准入 lease 与该会话**永久绑定、不过期**：会话再长也不会中途变成"未授权"。第一次成功决定记录的是会话启动目录，后续 resume/compact 或 cwd 变化都不会改写它。
+- lease 会跟随 Repository 登记变化：每次 Hook 事件与 MCP 调用都用记录的启动目录对当前 Catalog 重新判定一次（纯内存，不跑 Git 也不扫描仓库）。所以 `sctx repository add` 之后正在运行的会话下一次调用就生效，取消登记之后立刻变回 Disabled，不必重开会话。
+- Catalog/lease 锁忙、记录损坏或异常会立即按 Disabled 处理，但不会阻断正常编程；损坏或旧版本的 lease 记录一律当作不存在，由下一次 SessionStart 重写。
+- lease 由 SessionEnd 删除。部分宿主（例如 Codex 桌面版）不发送 SessionEnd，留下的 lease 由回收兜底：`sctx doctor` 会报告可回收数量，`sctx doctor --fix`、`setup` 与 `upgrade` 会删除超过 30 天以及永远无法再使用的 lease 记录。记录目录仍有 4096 条 / 8MB 上限，写满时淘汰最旧的 lease，而不是拒绝新会话。
+- PostToolUse 会在记录前检查 `absolute_file_path`、`file_path`、`filepath`、`path`、`cwd`、`workdir`、`working_directory` 等已知结构化路径。Enabled 表示整个 Session 已准入，不把调查目标限制在启动时推导出的那几个 Repo：其他已登记 Repo 会按真实 Catalog identity 记录；安全的未登记路径、registered/unregistered mixed 或无法用一个显式 workspace 安全表示的多 Repo 事件只保留无路径、无 Repository 猜测的非定位工程含义；相对、缺失、symlink、歧义或特殊文件仍让整条事件被丢弃。
 - Adapter 只保留 `FileOperation`、`TestRunner`、`Shell`、`SharedContext` 或 `Other`。Hook 由这些机械分类产生的内容只能成为非事实 TaskSignal；原始命令、输出和 vendor tool name 不保存，Shared Context 自身工具也不会回流。
 - Hook 采用 fail-open：Shared Context 暂时不可用或本地锁忙时，正常编程仍可继续。Hook 不排队 Claim，也不会在返回后补写工程事实。
 - Claim Evidence 必须由工作 Agent 根据直接检查或验证自行聚焦产出；Hook 提示、TaskSignal、Prompt 和工具状态不能冒充 Evidence。
@@ -652,10 +655,6 @@ CONTEXT_ID:REVISION_ID:retained|revised|withdrawn|scope_split
 | `sctx repository list` | 查看 Repository Catalog，并同步本地 Registry。 |
 | `sctx repository doctor` | 检查 checkout 是可用、缺失还是不安全，并在安全时同步 Registry；对每个早期安装留下的 legacy `rpo_<uuid>` 身份给出 typed 警告（`--json` 下稳定 `kind: "legacy_repository_id"`），并统计本机 Index 里还有多少条 Engineering Reference 引用该 legacy id。 |
 | `sctx repository rename --from <OLD_ID> --to <NEW_ID>` | 只改本机 Catalog / repository-registry 里的 RepositoryId；`--to` 必须满足 ADR-0001 的 1–64 字节可读 ASCII 语法，目标已存在或来源不存在都返回 typed 错误。已经写入 Git 的 EngineeringReference 事件仍保留旧 id 原文，不会被重写——`repository doctor` 报告的引用计数就是用来衡量这批历史事件的规模。 |
-| `sctx repository group add --root <绝对父目录> --member-repository-id <ID> [--member-repository-id <ID> ...]` | 显式登记一个精确父目录为 Repository Group；只有该 root 本身可以启用 Group，普通祖先目录不会自动启用。 |
-| `sctx repository group update --repository-group-id <ID> [--root <路径>] [--member-repository-id <ID> ...]` | 显式修复或更新 Group root/成员。 |
-| `sctx repository group remove --repository-group-id <ID>` | 移除 Group；不删除成员 Repository。 |
-| `sctx repository group list` / `doctor` | 查看 Group 与成员、检查 root 漂移或不可用状态。 |
 | `sctx repository scan --checkout-path <路径> [--path <仓库相对路径>] [--max-artifacts 200]` | 显式扫描有界路径并返回工程对象摘要，不返回源码正文。最多请求 1000 个 Artifact。 |
 | `sctx engineering-reference record --input <JSON>` | 把现有 Context Revision 与已验证的工程对象关系写入长期事实层。 |
 | `sctx association explain --reference-id <ID>` | 解释一条 Reference 当前解析到了什么、依据是什么、是否存在歧义、有哪些图路径。 |
@@ -667,7 +666,7 @@ RepositoryId 是 1–64 字节、大小写敏感的可读 ASCII 名称，例如 
 
 `engineering-reference record` 只应在直接检查或验证后调用。它要求完整、确定性的 locator、非空 `supports` 和至少一条 `limitations`。不要用相似文件名猜移动或重命名关系。
 
-例如多个 Android 仓库位于同一父目录，而你希望从父目录启动 Agent，应先分别用显式 Repository ID 登记，再用 `repository list` 核对并创建 Group。仅仅把已登记仓库放在同一个父目录下不会自动产生 Group；从更高层祖先目录启动仍是 Disabled。这条规则避免系统把未登记 sibling 猜测成 Group 成员或 Repository identity；Session 已准入后对安全未登记位置的调查最多形成非定位工程含义。
+例如多个 Android 仓库位于同一父目录，而你希望从父目录启动 Agent：只要每个仓库都用显式 Repository ID 登记过，从这个父目录启动就会自动为它们全部启用，不需要再登记这个目录本身。未登记的 sibling 不会因为在同一个父目录下就被猜成一个 Repository identity；Session 已准入后对安全未登记位置的调查最多形成非定位工程含义。
 
 ### 6.8 搜索与读取
 
@@ -751,9 +750,9 @@ sctx search \
 
 CLI 还提供 Space/Context 写入治理、语义冲突、索引和 Pending Batch 等管理员能力；这些没有全部开放成 Agent MCP 写工具，以维持显式审核和生命周期边界。
 
-当前 Repository 准入控制 Hook 的 Agent-visible activation 与机械 TaskSignal 路径；MCP Server 也用 current Enabled Session lease 实现授权校验，Disabled/Missing/Expired/Stale/busy/corrupt Session 的调用会被拒绝。已安装的全局 Skill 主入口只包含最小 activation gate：没有可信 SessionStart marker 时不读取完整 workflow reference、不产生 Shared Context MCP 调用提示；有 marker 时才完整读取一次 installer-owned reference。这个 Skill gate 是 Agent 推理前的指令准入机制，Server guard 则负责安全和不落越权数据。MCP 进程和工具 Schema 仍由用户级 Agent 配置提供，可能物理启动或可见；不要把 Disabled 理解为进程必然未启动，也不要把合约中的 reference-read/MCP-call 字节代理外推为真实计费 token 已被测量。当前还已证明 Disabled Hook 不向模型注入 Shared Context 文本，也不产生业务 Runtime/Report/知识 Git 记录。
+当前 Repository 准入控制 Hook 的 Agent-visible activation 与机械 TaskSignal 路径；MCP Server 也用 current Enabled Session lease 实现授权校验，Disabled/缺失/锁忙/损坏 Session 的调用会被拒绝。已安装的全局 Skill 主入口只包含最小 activation gate：没有可信 SessionStart marker 时不读取完整 workflow reference、不产生 Shared Context MCP 调用提示；有 marker 时才完整读取一次 installer-owned reference。这个 Skill gate 是 Agent 推理前的指令准入机制，Server guard 则负责安全和不落越权数据。MCP 进程和工具 Schema 仍由用户级 Agent 配置提供，可能物理启动或可见；不要把 Disabled 理解为进程必然未启动，也不要把合约中的 reference-read/MCP-call 字节代理外推为真实计费 token 已被测量。当前还已证明 Disabled Hook 不向模型注入 Shared Context 文本，也不产生业务 Runtime/Report/知识 Git 记录。
 
-#214 更新后的固定 bytes proxy 进一步量化该边界：Disabled 的 Agent-visible activation、完整 workflow read、Shared Context MCP call/result 与业务 residue 都是 0；Enabled 每个 SessionStart marker 的固定部分为 249 bytes，加上 `agent_kind` 与两处 host session id（36 字符的 UUID 会话约 326 bytes，硬上限 512 bytes），完整 workflow 读取一次，并在固定 Direct/Group 验收链中产生 5 次真实 public MCP 调用。当前最小 gate、workflow、metadata 源文件分别为 1882、18671、263 bytes。若 Enabled Session 在没有 ActiveTask 时先发生安全 PostToolUse，Hook 只提醒一次调用 `task_intent_update`，不读取 Prompt、不自动创建 Task；PreCompact/TurnStop 只给出 bounded Checkpoint guidance并尝试恢复已有 outbox，不创作 Claim。这些值用于回归比较，不是 tokenizer 结果或供应商计费 token。
+#214 更新后的固定 bytes proxy 进一步量化该边界：Disabled 的 Agent-visible activation、完整 workflow read、Shared Context MCP call/result 与业务 residue 都是 0；Enabled 每个 SessionStart marker 的固定部分为 249 bytes，加上 `agent_kind` 与两处 host session id（36 字符的 UUID 会话约 326 bytes，硬上限 512 bytes），完整 workflow 读取一次，并在固定的单仓库/共同父目录验收链中产生 5 次真实 public MCP 调用。当前最小 gate、workflow、metadata 源文件分别为 1882、18671、263 bytes。若 Enabled Session 在没有 ActiveTask 时先发生安全 PostToolUse，Hook 只提醒一次调用 `task_intent_update`，不读取 Prompt、不自动创建 Task；PreCompact/TurnStop 只给出 bounded Checkpoint guidance并尝试恢复已有 outbox，不创作 Claim。这些值用于回归比较，不是 tokenizer 结果或供应商计费 token。
 
 ### 6.11 可选 `config.toml` 设置
 
@@ -768,7 +767,7 @@ validation = "30d"
 progress = "14d"
 ```
 
-- `[hooks] artifact_focus_reminder`：默认 `false`（关闭）。关闭时 PostTool Hook 与该开关引入前逐字节一致。显式改成 `true` 后，仅在 Direct 会话里对被识别为单个文件操作的工具事件，用本机 Catalog 把绝对路径解析到已登记 Repository，再对 `engineering.sqlite` 做一次只读查询（不加锁、不跑 Git、不 scan、不 rebuild）；命中已接受且可自动注入的 Graph Context 时，追加一条不超过 800 字节的提示（最多 3 个 Context ID、每个标题截断到 60 字符，加一句固定的“可以调用 `task_artifact_focus` 查看”提示文案），不包含 statement/evidence 正文，也不写任何事实。同一 Session 对同一文件只提示一次。这个开关只影响 Direct 会话里以绝对文件路径命中的工具事件，不覆盖 Group 会话或模块/符号/API/Schema/测试等其他定位方式。
+- `[hooks] artifact_focus_reminder`：默认 `false`（关闭）。关闭时 PostTool Hook 与该开关引入前逐字节一致。显式改成 `true` 后，仅对被识别为单个文件操作的工具事件，用本机 Catalog 把绝对路径解析到已登记 Repository（该 Repository 必须在本会话准入范围内，所以父目录会话会按文件选对仓库），再对 `engineering.sqlite` 做一次只读查询（不加锁、不跑 Git、不 scan、不 rebuild）；命中已接受且可自动注入的 Graph Context 时，追加一条不超过 800 字节的提示（最多 3 个 Context ID、每个标题截断到 60 字符，加一句固定的“可以调用 `task_artifact_focus` 查看”提示文案），不包含 statement/evidence 正文，也不写任何事实。同一 Session 对同一文件只提示一次。这个开关只影响以绝对文件路径命中的工具事件，不覆盖模块/符号/API/Schema/测试等其他定位方式。
 - `[context_ttl]`：按 Context 类型（`decision`/`contract`/`issue`/`risk`/`validation`/`discovery`/`progress`）配置一个带单位的正时长（`s`/`m`/`h`/`d`/`w`），不配置的类型没有时效。到期起点是该 Context 被接受时所在 commit 的时间，不是本机当前时间。过期后状态变为 `historical`：排除自动注入，仍可以被 `search`/`context get` 查到。
 
 ## 7. 常见问题
@@ -805,16 +804,20 @@ sctx association rebuild --diagnose
 
 ### 7.5 在多个仓库的父目录启动时为什么没有激活
 
-父目录不会因为下面恰好有多个已登记仓库而自动获得权限。先确认每个成员都已用 `sctx repository add` 登记，再显式执行：
+从父目录启动会自动为它下面所有已登记仓库启用，不需要登记这个目录。没有激活通常是下面三种情况之一：
 
-```bash
-sctx repository group add \
-  --root /absolute/path/to/android-parent \
-  --member-repository-id <REPOSITORY_A_ID> \
-  --member-repository-id <REPOSITORY_B_ID>
-```
+1. **成员还没登记**。用 `sctx repository list` 核对；缺哪个就 `sctx repository add --repository-id <ID> --path <绝对路径>` 补上。
+2. **启动目录下面一个已登记 checkout 都没有**（例如漂移后的旧路径，或只放着未登记 sibling）。`sctx repository doctor` 会指出 checkout 是缺失还是不可用。
+3. **启动目录是被保护的位置**：文件系统根 `/`、你的 HOME 目录本身，或 HOME 的上一级。从这些位置推导会把整机所有已登记仓库一次性拉进来，与"只在登记过的仓库下记录"相反，所以默认不启用。确实需要时可在 `~/.shared-context/config.toml` 写：
 
-Group 只匹配这个 canonical root 的精确路径；父目录的父目录、未登记 sibling、漂移后的旧路径都保持 Disabled。用 `sctx repository group doctor` 检查当前状态。创建 Group 后应新开一个 Agent Session；同一 Session 已经形成的 Enabled/Disabled lease 不会因为 cwd 或 Catalog 随后变化而改写。
+   ```toml
+   [activation]
+   allow_home = true
+   ```
+
+   它只解除两条 HOME 保护，文件系统根永远不会用这条规则启用。
+
+登记变化不需要新开 Agent Session：正在运行的会话会用它的启动目录对新的 Catalog 重新判定，下一次 Hook 事件或 MCP 调用即生效——父目录会话会因此多出或少掉一个仓库。会话启动目录本身不会被改写，所以在未登记目录启动的会话即使后来 `cd` 进已登记 Repo 也仍然是 Disabled——那种情况才需要新开会话。
 
 ### 7.6 Candidate 没有生成
 

@@ -16,21 +16,19 @@ pub use artifact_reminder::{
     ARTIFACT_REMINDER_MAX_ENTRIES, ArtifactReminderKey, ArtifactReminderMark, ArtifactReminderStore,
 };
 pub use config::{
-    ActivationScope, ActivationScopeDecision, CatalogCheckoutStatus, CatalogRepositoryGroupStatus,
-    ContextTtlPolicy, HookSettings, LEGACY_REPOSITORY_ID_PREFIX, RepositoryCatalogAddOutcome,
-    RepositoryCatalogCheckoutCheck, RepositoryCatalogDiagnostic, RepositoryCatalogDoctorReport,
-    RepositoryCatalogEntry, RepositoryCatalogGroupCheck, RepositoryCatalogInspection,
+    ActivationScope, ActivationSettings, CatalogCheckoutStatus, ContextTtlPolicy, HookSettings,
+    LEGACY_REPOSITORY_ID_PREFIX, RepositoryCatalogAddOutcome, RepositoryCatalogCheckoutCheck,
+    RepositoryCatalogDiagnostic, RepositoryCatalogDoctorReport, RepositoryCatalogEntry,
     RepositoryCatalogRenameOutcome, RepositoryCatalogRevision, RepositoryCatalogSnapshot,
-    RepositoryGroupCatalogAddOutcome, RepositoryGroupCatalogEntry,
-    RepositoryGroupCatalogRemoveOutcome, RepositoryGroupCatalogUpdateOutcome,
-    ResolvedRepositoryPath, UserConfigStore,
+    ResolvedRepositoryPath, UserConfigStore, migrate_legacy_repository_groups,
 };
 pub use maintenance::{MaintenanceGuard, MaintenanceLock};
 pub use privacy::{PrivacyFinding, PrivacyFindingKind, PrivacyScan, PrivacyScanner, RedactedText};
 pub use sctx_domain::{Error, ErrorKind, Result};
 pub use session_scope::{
-    AuthorizedSessionScope, AuthorizedSessionScopeAuthorizeOutcome, AuthorizedSessionScopeCleanup,
+    AuthorizedSessionScope, AuthorizedSessionScopeAuthorizeOutcome,
     AuthorizedSessionScopeCleanupDiagnostic, AuthorizedSessionScopeCleanupDiagnosticKind,
     AuthorizedSessionScopeDecision, AuthorizedSessionScopePolicy, AuthorizedSessionScopeRead,
-    AuthorizedSessionScopeRecordVersion, AuthorizedSessionScopeStore,
+    AuthorizedSessionScopeReclaim, AuthorizedSessionScopeRecordVersion,
+    AuthorizedSessionScopeStore, AuthorizedSessionScopeSurvey, ORPHAN_LEASE_MAX_AGE,
 };

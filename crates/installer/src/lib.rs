@@ -27,7 +27,8 @@ use sctx_engineering_graph::{EngineeringProjectionStore, RepositoryRegistry};
 use sctx_git_store::GitStore;
 use sctx_index::ProjectionIndex;
 use sctx_local_state::{
-    AuthorizedSessionScopeStore, CatalogCheckoutStatus, MaintenanceLock, UserConfigStore,
+    AuthorizedSessionScopeStore, CatalogCheckoutStatus, MaintenanceLock, ORPHAN_LEASE_MAX_AGE,
+    UserConfigStore, migrate_legacy_repository_groups,
 };
 use sctx_mcp::{ClientKind, McpServer};
 use sctx_search::{SearchEngine, SearchFilters, SearchRequest};
@@ -496,7 +497,6 @@ pub struct DataResetReport {
     pub reset_id: Option<String>,
     pub backup: Option<PathBuf>,
     pub repository_count_cleared: usize,
-    pub repository_group_count_cleared: usize,
     pub cleared_targets: Vec<PathBuf>,
     pub preserved: Vec<PathBuf>,
     pub remote_detached: bool,
@@ -649,6 +649,12 @@ impl Installer {
         self.fail(SetupStage::CurrentSwitched)?;
         let task_runtime_changed = ensure_current_task_runtime(transaction, &self.context.root)?;
         let legacy_capture_changed = remove_legacy_capture_state(transaction, &self.context.root)?;
+        let mut notices = Vec::new();
+        // Activation is derived from registered checkouts now, so a `config.toml` that still
+        // carries the removed section no longer parses. Drop it before anything reads the
+        // Catalog, inside this transaction, which keeps the original document as a backup.
+        let repository_groups_migrated =
+            migrate_repository_groups(transaction, &self.context.root, &mut notices)?;
 
         let prior_manifest = read_manifest(&self.context.root)?;
         let installation_id = installation_id(prior_manifest.as_ref())?;
@@ -685,7 +691,6 @@ impl Installer {
         let prior_skill_ownership = prior_manifest
             .as_ref()
             .map_or_else(Vec::new, |manifest| manifest.skills.clone());
-        let mut notices = Vec::new();
         let mut config_changed = false;
 
         if options.agents.contains(&Agent::Cursor) {
@@ -742,6 +747,8 @@ impl Installer {
         )?;
         self.fail(SetupStage::GlobalSkillWritten)?;
 
+        reclaim_orphan_leases(&self.context.root, &mut notices);
+
         let manifest = InstallManifest {
             version: MANIFEST_VERSION,
             installed_version: self.context.version.clone(),
@@ -774,6 +781,7 @@ impl Installer {
                 || changed_current
                 || task_runtime_changed
                 || legacy_capture_changed
+                || repository_groups_migrated
                 || knowledge_store_changed
                 || config_changed
                 || skill_install.changed
@@ -818,6 +826,7 @@ impl Installer {
         check_repository_catalog(root, &mut checks);
         check_configs(root, &self.context.home, &mut checks);
         check_global_skill(root, &self.context.home, &mut checks);
+        check_session_scope_leases(root, &mut checks);
         if root.join("repository/.git").is_dir() && root.join("bin/current/sctx").is_file() {
             match mcp_smoke(root) {
                 Ok(()) => checks.push(ok(
@@ -1075,7 +1084,7 @@ impl Installer {
             let _guard = maintenance.try_shared()?;
             require_existing_installation(&self.context.root)?;
             validate_reset_active_targets(&self.context.root)?;
-            let inspection =
+            let catalog =
                 UserConfigStore::open_existing(&self.context.root)?.inspect_repository_catalog()?;
             let cleared_targets = existing_reset_targets(&self.context.root);
             return Ok(reset_report(
@@ -1085,8 +1094,7 @@ impl Installer {
                     reset_id: None,
                     backup: None,
                     had_remote: knowledge_has_remote(&self.context.root.join("repository"))?,
-                    repository_count_cleared: inspection.catalog.repositories.len(),
-                    repository_group_count_cleared: inspection.catalog.repository_groups.len(),
+                    repository_count_cleared: catalog.repositories.len(),
                     cleared_targets,
                 },
             ));
@@ -1119,10 +1127,9 @@ impl Installer {
     fn reset_data_locked(&self) -> Result<DataResetReport> {
         validate_reset_active_targets(&self.context.root)?;
         let remote_detached = knowledge_has_remote(&self.context.root.join("repository"))?;
-        let inspection =
+        let catalog =
             UserConfigStore::open_existing(&self.context.root)?.inspect_repository_catalog()?;
-        let repository_count = inspection.catalog.repositories.len();
-        let repository_group_count = inspection.catalog.repository_groups.len();
+        let repository_count = catalog.repositories.len();
         let id = format!("reset-{}", Uuid::new_v4());
         let backup_dir = self.context.root.join("backups").join(&id);
         ensure_private_directory(&backup_dir)?;
@@ -1206,7 +1213,6 @@ impl Installer {
                 backup: Some(backup_dir),
                 had_remote: remote_detached,
                 repository_count_cleared: repository_count,
-                repository_group_count_cleared: repository_group_count,
                 cleared_targets,
             },
         );
@@ -1402,7 +1408,6 @@ struct DataResetReportMaterial {
     backup: Option<PathBuf>,
     had_remote: bool,
     repository_count_cleared: usize,
-    repository_group_count_cleared: usize,
     cleared_targets: Vec<PathBuf>,
 }
 
@@ -3572,7 +3577,7 @@ fn smoke_pristine_reset_root(root: &Path) -> Result<()> {
         return Err(invariant("reset Index is not empty"));
     }
     let catalog = UserConfigStore::open_existing(root)?.repository_catalog_wait()?;
-    if !catalog.repositories.is_empty() || !catalog.repository_groups.is_empty() {
+    if !catalog.repositories.is_empty() {
         return Err(invariant("reset Repository Catalog is not empty"));
     }
     let _runtime = TaskRuntime::initialize(root.to_path_buf())?;
@@ -3601,7 +3606,6 @@ fn reset_report(root: &Path, material: DataResetReportMaterial) -> DataResetRepo
         reset_id: material.reset_id,
         backup: material.backup,
         repository_count_cleared: material.repository_count_cleared,
-        repository_group_count_cleared: material.repository_group_count_cleared,
         cleared_targets: material.cleared_targets,
         preserved: vec![
             root.join("bin"),
@@ -4283,6 +4287,98 @@ fn hooks_available(home: &Path, agent: Agent) -> bool {
         }
     }
     true
+}
+
+/// Drops the removed `[[repository_groups]]` section from an existing `config.toml`.
+///
+/// Explicit Groups were the hand-registered form of "this parent directory activates these
+/// Repositories". Activation now derives that from the registered checkouts themselves, so the
+/// section names no decision any more — and, because the Catalog document rejects unknown keys,
+/// a document that still carries it cannot be read at all. Rewriting it here is what lets an
+/// installation that used Groups keep working after the upgrade; the transaction retains the
+/// original document, and nothing else in the file is touched.
+fn migrate_repository_groups(
+    transaction: &mut Transaction,
+    root: &Path,
+    notices: &mut Vec<String>,
+) -> Result<bool> {
+    let config_path = root.join("config.toml");
+    let document = match fs::read_to_string(&config_path) {
+        Ok(document) => document,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_error("read config.toml for migration")(error)),
+    };
+    let Some(migrated) = migrate_legacy_repository_groups(&document)? else {
+        return Ok(false);
+    };
+    transaction.record(&config_path)?;
+    atomic_write(&config_path, migrated.as_bytes(), 0o600)?;
+    notices.push(
+        "repository groups are deprecated; activation is now derived from registered checkouts \
+         and their parent directories"
+            .to_owned(),
+    );
+    Ok(true)
+}
+
+/// Removes activation leases left behind by Sessions that never delivered
+/// `SessionEnd`.
+///
+/// Leases are permanently bound to their Agent Session and never expire, and
+/// Codex desktop in particular never sends `SessionEnd`, so `setup`, `upgrade`,
+/// and `doctor --fix` are the only paths that bound the record directory over a
+/// machine's lifetime. Failure is never fatal: this is disposable local
+/// authorization state, so an unreadable or busy store is silently left alone.
+fn reclaim_orphan_leases(root: &Path, notices: &mut Vec<String>) {
+    let Ok(reclaim) = AuthorizedSessionScopeStore::initialize(root)
+        .and_then(|store| store.reclaim_stale_leases(ORPHAN_LEASE_MAX_AGE))
+    else {
+        return;
+    };
+    let removed = reclaim
+        .removed_entry_keys
+        .len()
+        .saturating_add(reclaim.removed_unreadable_entry_keys.len());
+    if removed > 0 {
+        notices.push(format!(
+            "reclaimed {removed} orphaned Agent Session activation lease(s); {} remain",
+            reclaim.retained_entries
+        ));
+    }
+}
+
+/// Reports how many activation leases orphan reclamation would remove. This
+/// check never fails the installation: leases are disposable local state, and it
+/// stays read-only by skipping an installation that has no lease directory yet.
+fn check_session_scope_leases(root: &Path, checks: &mut Vec<DoctorCheck>) {
+    if !root.join("state/authorized-session-scopes").is_dir() {
+        checks.push(ok(
+            "session_scope_leases",
+            "no Agent Session activation lease has been issued on this machine",
+        ));
+        return;
+    }
+    let survey = match AuthorizedSessionScopeStore::initialize(root)
+        .and_then(|store| store.survey_stale_leases(ORPHAN_LEASE_MAX_AGE))
+    {
+        Ok(survey) => survey,
+        Err(error) => {
+            checks.push(warning("session_scope_leases", error.to_string()));
+            return;
+        }
+    };
+    let reclaimable = survey
+        .stale_entries
+        .saturating_add(survey.unreadable_entries);
+    let message = format!(
+        "{} activation lease(s); {reclaimable} reclaimable by sctx doctor --fix ({} older than 30d, {} unreadable)",
+        survey.total_entries, survey.stale_entries, survey.unreadable_entries
+    );
+    checks.push(if reclaimable == 0 {
+        ok("session_scope_leases", message)
+    } else {
+        warning("session_scope_leases", message)
+    });
 }
 
 fn ok(name: impl Into<String>, message: impl Into<String>) -> DoctorCheck {

@@ -45,9 +45,9 @@ pub use ids::{
     AgentCheckpointId, CandidateBuildId, CandidateId, CheckpointClaimId, ConfirmationId,
     ConflictId, ContextId, EventId, EvidenceId, ExternalSessionId, IdParseError,
     ProposedSpaceGroupKey, PublicationId, REPOSITORY_ID_MAX_BYTES, REPOSITORY_ID_PATTERN,
-    ReferenceId, RepositoryGroupId, RepositoryId, ResolutionId, ReviewId, RevisionId, SignalId,
-    SpaceAssociationId, SpaceId, SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId,
-    TaskSessionId, WorkEpisodeId, WorkObservationId,
+    ReferenceId, RepositoryId, ResolutionId, ReviewId, RevisionId, SignalId, SpaceAssociationId,
+    SpaceId, SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId,
+    WorkEpisodeId, WorkObservationId,
 };
 pub use model::{
     Applicability, ConflictParticipant, ConflictResolution, ConflictResolutionDraft,

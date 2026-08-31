@@ -5,8 +5,6 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::Arc,
-    thread,
-    time::Duration,
 };
 
 use fs2::FileExt;
@@ -17,8 +15,8 @@ use sctx_installer::{
     Agent, Architecture, Host, InstallContext, Installer, SetupOptions, SetupStage, SkillStatus,
 };
 use sctx_local_state::{
-    ActivationScope, ActivationScopeDecision, AuthorizedSessionScope, AuthorizedSessionScopePolicy,
-    AuthorizedSessionScopeRead, AuthorizedSessionScopeStore, UserConfigStore,
+    AuthorizedSessionScope, AuthorizedSessionScopeRead, AuthorizedSessionScopeStore,
+    UserConfigStore,
 };
 use sctx_task_runtime::TaskRuntime;
 use serde::Deserialize;
@@ -133,14 +131,19 @@ struct Fixture {
     home: PathBuf,
     root: PathBuf,
     ancestor: PathBuf,
-    group_root: PathBuf,
+    /// The directory `repository_a` and `repository_b` share; a Session that starts here
+    /// derives both without anything being registered for the directory itself.
+    common_parent: PathBuf,
     repository_a: PathBuf,
     repository_b: PathBuf,
     sibling: PathBuf,
+    /// A directory holding no registered checkout at all.
+    outside: PathBuf,
     file_a: PathBuf,
     file_b: PathBuf,
     file_c: PathBuf,
     sibling_file: PathBuf,
+    repository_a_id: sctx_domain::RepositoryId,
 }
 
 impl Fixture {
@@ -148,17 +151,20 @@ impl Fixture {
         let temporary = tempdir().unwrap();
         let home = temporary.path().join("acceptance home");
         let ancestor = temporary.path().join("workspace parent");
-        let group_root = ancestor.join("explicit group");
-        let repository_a = group_root.join("member a");
-        let repository_b = group_root.join("member b");
-        let sibling = group_root.join("unregistered sibling");
-        let repository_c = ancestor.join("registered nonmember");
+        let common_parent = ancestor.join("shared parent");
+        let repository_a = common_parent.join("member a");
+        let repository_b = common_parent.join("member b");
+        let sibling = common_parent.join("unregistered sibling");
+        let repository_c = ancestor.join("registered elsewhere");
+        let outside = temporary.path().join("outside catalog");
         fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&outside).unwrap();
         for repository in [&repository_a, &repository_b, &repository_c, &sibling] {
             initialize_repository(repository);
         }
         let ancestor = fs::canonicalize(ancestor).unwrap();
-        let group_root = fs::canonicalize(group_root).unwrap();
+        let common_parent = fs::canonicalize(common_parent).unwrap();
+        let outside = fs::canonicalize(outside).unwrap();
         let repository_a = fs::canonicalize(repository_a).unwrap();
         let repository_b = fs::canonicalize(repository_b).unwrap();
         let repository_c = fs::canonicalize(repository_c).unwrap();
@@ -170,7 +176,7 @@ impl Fixture {
         let root = home.join(".shared-context");
         GitStore::bootstrap_local(&root).unwrap();
         let config = UserConfigStore::open_existing(&root).unwrap();
-        let first = config
+        let repository_a_id = config
             .add_repository(
                 sctx_domain::RepositoryId::new(),
                 std::slice::from_ref(&repository_a),
@@ -178,7 +184,7 @@ impl Fixture {
             .unwrap()
             .repository
             .repository_id;
-        let second = config
+        let _second = config
             .add_repository(
                 sctx_domain::RepositoryId::new(),
                 std::slice::from_ref(&repository_b),
@@ -192,22 +198,21 @@ impl Fixture {
                 std::slice::from_ref(&repository_c),
             )
             .unwrap();
-        config
-            .add_repository_group(&group_root, &[first, second])
-            .unwrap();
         Self {
             _temporary: temporary,
             home,
             root,
             ancestor,
-            group_root,
+            common_parent,
             repository_a,
             repository_b,
             sibling,
+            outside,
             file_a,
             file_b,
             file_c,
             sibling_file,
+            repository_a_id,
         }
     }
 
@@ -228,10 +233,7 @@ impl Fixture {
     fn scope(&self, profile: AgentProfile, session: &str) -> AuthorizedSessionScopeRead {
         AuthorizedSessionScopeStore::initialize(&self.root)
             .unwrap()
-            .read(
-                &ExternalSessionLocator::new(profile.agent(), session).unwrap(),
-                &self.catalog(),
-            )
+            .read(&ExternalSessionLocator::new(profile.agent(), session).unwrap())
             .unwrap()
     }
 
@@ -873,7 +875,7 @@ fn run_enabled_chain(
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn fixed_oracle_closes_direct_group_disabled_and_token_proxy_contract() {
+fn fixed_oracle_closes_single_and_multi_repository_disabled_and_token_proxy_contract() {
     let oracle = oracle();
     assert_eq!(
         oracle.schema,
@@ -943,16 +945,16 @@ fn fixed_oracle_closes_direct_group_disabled_and_token_proxy_contract() {
         &fixture.repository_id(&fixture.file_b),
         &oracle,
     );
-    let group = run_enabled_chain(
+    let parent = run_enabled_chain(
         &fixture,
         AgentProfile::Cursor,
-        "synthetic-group-flow",
-        &fixture.group_root,
+        "synthetic-parent-flow",
+        &fixture.common_parent,
         &fixture.file_c,
         &fixture.repository_id(&fixture.file_c),
         &oracle,
     );
-    for trace in [&direct, &group] {
+    for trace in [&direct, &parent] {
         assert_eq!(trace.tool_names, oracle.enabled_chain.mcp_tools);
         assert_eq!(trace.tool_names.len(), oracle.token_proxy.enabled.mcp_calls);
         assert!(
@@ -973,8 +975,8 @@ fn fixed_oracle_closes_direct_group_disabled_and_token_proxy_contract() {
         ),
         (
             AgentProfile::Cursor,
-            "synthetic-disabled-ancestor",
-            fixture.ancestor.as_path(),
+            "synthetic-disabled-outside",
+            fixture.outside.as_path(),
         ),
     ] {
         let before = fixture.business_snapshot();
@@ -1113,32 +1115,7 @@ fn assert_denied(response: &McpResponse, fixture: &Fixture) {
     );
     let text = response.structured.to_string();
     assert!(!text.contains(fixture.ancestor.to_str().unwrap()));
-    assert!(!text.contains(&fixture.repository_id(&fixture.file_a).to_string()));
-}
-
-fn authorize_short_lived(fixture: &Fixture, session: &str) {
-    let catalog = fixture.catalog();
-    let repository_id = fixture.repository_id(&fixture.file_a);
-    AuthorizedSessionScopeStore::with_policy(
-        &fixture.root,
-        AuthorizedSessionScopePolicy {
-            ttl: Duration::from_secs(1),
-            ..AuthorizedSessionScopePolicy::default()
-        },
-    )
-    .unwrap()
-    .authorize(
-        &ExternalSessionLocator::new("codex", session).unwrap(),
-        &ActivationScope {
-            decision: ActivationScopeDecision::Direct {
-                repository_id: repository_id.clone(),
-                checkout_path: fixture.repository_a.clone(),
-            },
-            allowed_repository_ids: vec![repository_id],
-        },
-        &catalog,
-    )
-    .unwrap();
+    assert!(!text.contains(&fixture.repository_a_id.to_string()));
 }
 
 #[test]
@@ -1165,47 +1142,64 @@ fn server_negative_matrix_is_uniform_and_writes_no_business_state() {
     assert_denied(&response, &disabled);
     assert_eq!(disabled.business_snapshot(), before);
 
-    let expired = Fixture::new();
-    authorize_short_lived(&expired, "negative-expired");
-    thread::sleep(Duration::from_millis(1_100));
-    let before = expired.business_snapshot();
-    let response = mcp_call(
-        &expired.home,
-        AgentProfile::Codex,
-        "negative-expired",
-        "context_search",
-        &json!({"query": "bounded"}),
-    );
-    assert_denied(&response, &expired);
-    assert_eq!(expired.business_snapshot(), before);
-
-    let stale = Fixture::new();
-    stale.hook(
-        AgentProfile::Codex,
+    // A lease never expires and an unrelated registration no longer demotes a live
+    // Session; losing the registration under the Session's own startup directory does.
+    let deregistered = Fixture::new();
+    deregistered.hook(
+        AgentProfile::Cursor,
         &session_start(
-            AgentProfile::Codex,
-            "negative-stale",
-            &stale.repository_a,
+            AgentProfile::Cursor,
+            "negative-deregistered",
+            &deregistered.common_parent,
             "startup",
         ),
     );
-    let added = stale.ancestor.join("registered after lease");
-    initialize_repository(&added);
-    let added = fs::canonicalize(added).unwrap();
-    UserConfigStore::open_existing(&stale.root)
-        .unwrap()
-        .add_repository(sctx_domain::RepositoryId::new(), &[added])
+    let unrelated = deregistered.ancestor.join("registered after lease");
+    initialize_repository(&unrelated);
+    let unrelated = fs::canonicalize(unrelated).unwrap();
+    let config = UserConfigStore::open_existing(&deregistered.root).unwrap();
+    config
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(&unrelated),
+        )
         .unwrap();
-    let before = stale.business_snapshot();
-    let response = mcp_call(
-        &stale.home,
-        AgentProfile::Codex,
-        "negative-stale",
+    let still_authorized = mcp_call(
+        &deregistered.home,
+        AgentProfile::Cursor,
+        "negative-deregistered",
         "context_search",
         &json!({"query": "bounded"}),
     );
-    assert_denied(&response, &stale);
-    assert_eq!(stale.business_snapshot(), before);
+    assert!(
+        !still_authorized.is_error,
+        "an unrelated registration must not demote a live Session"
+    );
+    // Losing every registration under the Session's own startup directory does demote it,
+    // even though the Catalog still configures Repositories elsewhere.
+    fs::write(
+        deregistered.root.join("config.toml"),
+        UserConfigStore::empty_document(&deregistered.root).unwrap(),
+    )
+    .unwrap();
+    for elsewhere in [
+        deregistered.ancestor.join("registered elsewhere"),
+        unrelated,
+    ] {
+        config
+            .add_repository(sctx_domain::RepositoryId::new(), &[elsewhere])
+            .unwrap();
+    }
+    let before = deregistered.business_snapshot();
+    let response = mcp_call(
+        &deregistered.home,
+        AgentProfile::Cursor,
+        "negative-deregistered",
+        "context_search",
+        &json!({"query": "bounded"}),
+    );
+    assert_denied(&response, &deregistered);
+    assert_eq!(deregistered.business_snapshot(), before);
 
     let cross = Fixture::new();
     cross.hook(

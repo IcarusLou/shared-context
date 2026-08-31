@@ -54,9 +54,8 @@ use sctx_git_store::{
 };
 use sctx_index::{DomainSnapshot, ProjectionIndex};
 use sctx_local_state::{
-    AuthorizedSessionScope, AuthorizedSessionScopeDecision, AuthorizedSessionScopeRead,
-    AuthorizedSessionScopeStore, MaintenanceLock, PrivacyScanner, RepositoryCatalogSnapshot,
-    UserConfigStore,
+    AuthorizedSessionScope, AuthorizedSessionScopeRead, AuthorizedSessionScopeStore,
+    MaintenanceLock, PrivacyScanner, RepositoryCatalogSnapshot, UserConfigStore,
 };
 use sctx_search::{
     AutomaticQueryTokenExplanation, CandidateAnalysisRequest, CompactSpaceAssociation,
@@ -2059,73 +2058,76 @@ fn durable_checkpoint(
 }
 
 impl Runtime {
-    /// Places one Episode's Claim path spellings inside the Repository that Session was scoped to.
+    /// Places one Episode's Claim path spellings inside the Repositories that Session was
+    /// scoped to.
     ///
-    /// Returns whether this call wrote the derivation. At most one `git ls-files` runs per Episode
-    /// for the life of the installation: the runtime records the first answer, and a Build rerun
-    /// after recovery reports it without consulting the checkout again. Without a Direct
-    /// activation there is no checkout, and every spelling stays an unresolved retrieval hint.
+    /// Returns whether this call wrote the derivation. At most one `git ls-files` runs per
+    /// checkout per Episode for the life of the installation: the runtime records the first
+    /// answer, and a Build rerun after recovery reports it without consulting the checkout
+    /// again. A Session started at the common parent of several checkouts carries several
+    /// Repositories, so a spelling is placed by which checkout actually tracks it: exactly
+    /// one resolving checkout wins, none or several leaves an unresolved retrieval hint.
     fn derive_episode_claim_references(&self, episode: &WorkEpisodeView) -> Result<bool> {
         let episode_id = episode.episode.episode_id;
         let Some(candidates) = self.tasks.pending_claim_reference_candidates(episode_id)? else {
             return Ok(false);
         };
-        let resolver = self
-            .episode_checkout(episode)?
+        let resolvers = self
+            .episode_checkouts(episode)?
+            .into_iter()
             .map(|(repository_id, checkout)| {
                 CheckoutReferenceResolver::from_checkout(repository_id, &checkout, &candidates)
-            });
-        match &resolver {
-            Some(resolver) => self
-                .tasks
-                .derive_episode_claim_references(episode_id, &|candidate| {
-                    resolver.resolve(candidate)
-                })?,
-            None => self
-                .tasks
-                .derive_episode_claim_references(episode_id, &reference_derivation::unresolvable)?,
-        };
+            })
+            .collect::<Vec<_>>();
+        if resolvers.is_empty() {
+            self.tasks
+                .derive_episode_claim_references(episode_id, &reference_derivation::unresolvable)?;
+            return Ok(true);
+        }
+        self.tasks
+            .derive_episode_claim_references(episode_id, &|candidate| {
+                let mut resolved = resolvers
+                    .iter()
+                    .filter_map(|resolver| resolver.resolve(candidate));
+                let first = resolved.next()?;
+                resolved.next().is_none().then_some(first)
+            })?;
         Ok(true)
     }
 
-    /// Resolves the checkout of the `ExternalSession` that authored this Episode's Checkpoints.
+    /// Resolves the checkouts of the `ExternalSession` that authored this Episode's Checkpoints.
     ///
     /// A Build can be drained by an Agent Hook or by the CLI, neither of which carries the
     /// authoring session's activation scope, so the scope is looked up by the Episode's own
-    /// locator. Anything other than a live Direct activation yields `None` and derives nothing.
-    fn episode_checkout(
-        &self,
-        episode: &WorkEpisodeView,
-    ) -> Result<Option<(RepositoryId, PathBuf)>> {
+    /// locator. A Disabled or absent lease yields no checkout and derives nothing. The order is
+    /// the lease's own sorted Repository order, so the derivation is deterministic across runs.
+    fn episode_checkouts(&self, episode: &WorkEpisodeView) -> Result<Vec<(RepositoryId, PathBuf)>> {
         let Some(task) = self.tasks.read_snapshot(episode.episode.task_session_id)? else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         let locator = task.external_session_locator;
-        let repository_id = match &self.session_scope {
-            Some(scope) if scope.external_session_locator == locator => match &scope.decision {
-                AuthorizedSessionScopeDecision::Direct { repository_id } => repository_id.clone(),
-                _ => return Ok(None),
-            },
-            _ => {
-                let Ok(store) = AuthorizedSessionScopeStore::initialize(&self.root) else {
-                    return Ok(None);
-                };
-                match store.try_read(&locator, &self.catalog) {
-                    Ok(AuthorizedSessionScopeRead::Current(scope)) => match scope.decision {
-                        AuthorizedSessionScopeDecision::Direct { repository_id } => repository_id,
-                        _ => return Ok(None),
-                    },
-                    _ => return Ok(None),
-                }
+        let repository_ids = match &self.session_scope {
+            Some(scope) if scope.external_session_locator == locator => {
+                scope.decision.repository_ids().to_vec()
             }
+            _ => match read_reconciled_session_scope(&self.root, &locator, &self.catalog) {
+                Ok(AuthorizedSessionScopeRead::Current(scope)) => {
+                    scope.decision.repository_ids().to_vec()
+                }
+                _ => return Ok(Vec::new()),
+            },
         };
-        Ok(self
-            .catalog
-            .repositories
-            .iter()
-            .find(|entry| entry.repository_id == repository_id)
-            .and_then(|entry| entry.checkout_paths.first().cloned())
-            .map(|checkout| (repository_id, checkout)))
+        Ok(repository_ids
+            .into_iter()
+            .filter_map(|repository_id| {
+                self.catalog
+                    .repositories
+                    .iter()
+                    .find(|entry| entry.repository_id == repository_id)
+                    .and_then(|entry| entry.checkout_paths.first().cloned())
+                    .map(|checkout| (repository_id, checkout))
+            })
+            .collect())
     }
 
     /// Records the injection outcome for every Claim this Episode carries.
@@ -6597,25 +6599,36 @@ fn authorize_public_call(
         let (catalog, context_ttl) =
             UserConfigStore::open_existing(root)?.repository_catalog_with_context_ttl()?;
         let context_ttl = context_ttl_settings(&context_ttl);
-        let store = AuthorizedSessionScopeStore::initialize(root)?;
-        match store.try_read(locator, &catalog)? {
-            AuthorizedSessionScopeRead::Current(scope)
-                if !matches!(scope.decision, AuthorizedSessionScopeDecision::Disabled)
-                    && !scope.allowed_repository_ids.is_empty() =>
-            {
+        match read_reconciled_session_scope(root, locator, &catalog)? {
+            AuthorizedSessionScopeRead::Current(scope) if scope.decision.is_enabled() => {
                 Ok(AuthorizedCallSnapshot {
                     catalog,
                     scope,
                     context_ttl,
                 })
             }
-            AuthorizedSessionScopeRead::Missing
-            | AuthorizedSessionScopeRead::Expired
-            | AuthorizedSessionScopeRead::StaleCatalog
-            | AuthorizedSessionScopeRead::Current(_) => Err(unavailable("unauthorized")),
+            AuthorizedSessionScopeRead::Missing | AuthorizedSessionScopeRead::Current(_) => {
+                Err(unavailable("unauthorized"))
+            }
         }
     };
     authorization().map_err(|_| ToolFailure::authorization_failed())
+}
+
+/// The single lease read every MCP path uses.
+///
+/// A lease is permanently bound to its Agent Session and never expires, so the
+/// only thing that can change under a running Session is the Catalog. This one
+/// non-blocking read therefore re-derives the decision from the lease's recorded
+/// canonical `startup_cwd` against the Catalog frozen for this call, which is
+/// pure: no filesystem stat, no Git, no Repository scan. A Repository registered
+/// or removed mid-Session takes effect on the very next call.
+fn read_reconciled_session_scope(
+    root: &Path,
+    locator: &ExternalSessionLocator,
+    catalog: &RepositoryCatalogSnapshot,
+) -> Result<AuthorizedSessionScopeRead> {
+    AuthorizedSessionScopeStore::initialize(root)?.try_read_reconciled(locator, catalog)
 }
 
 fn authorize_runtime_identity_target(

@@ -27,8 +27,8 @@ use sctx_domain::{
     Applicability, CandidateReviewStatus, ConflictParticipant, ConflictResolutionDraft,
     ConflictResolutionResult, ContextGovernanceStatus, ContextId, ContextKind,
     ContextRevisionDraft, DomainProjection, Error, ErrorKind, EvidenceSnapshotDraft, EvidenceType,
-    ExternalSessionLocator, IntentSnapshot, PublicationAction, PublicationDraft, RepositoryGroupId,
-    RepositoryId, ResolutionOutcome, Result, ReviewDraft, ReviewSummary, ReviewVerdict, RevisionId,
+    ExternalSessionLocator, IntentSnapshot, PublicationAction, PublicationDraft, RepositoryId,
+    ResolutionOutcome, Result, ReviewDraft, ReviewSummary, ReviewVerdict, RevisionId,
     SemanticConflictDraft, SpaceId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkEpisodeStatus,
 };
 use sctx_engineering_graph::{
@@ -41,9 +41,8 @@ use sctx_index::{
 };
 use sctx_local_state::{
     ArtifactReminderKey, ArtifactReminderMark, ArtifactReminderStore, AuthorizedSessionScope,
-    AuthorizedSessionScopeDecision, AuthorizedSessionScopeRead, AuthorizedSessionScopeStore,
-    CatalogCheckoutStatus, CatalogRepositoryGroupStatus, HookSettings, MaintenanceLock,
-    RepositoryCatalogDiagnostic, RepositoryCatalogSnapshot, UserConfigStore,
+    AuthorizedSessionScopeRead, AuthorizedSessionScopeStore, CatalogCheckoutStatus, HookSettings,
+    MaintenanceLock, RepositoryCatalogDiagnostic, RepositoryCatalogSnapshot, UserConfigStore,
 };
 use sctx_mcp::{
     ArtifactFocusQuery, AssociationExplainInput, AssociationRebuildInput, CandidateAnalyzeInput,
@@ -82,8 +81,7 @@ Commands:
   context revise|review|publish|withdraw|get
   semantic conflict open|resolve
   task context|artifact-focus|checkpoint|intent update|signal supersede
-  repository add|list|doctor|scan
-  repository group add|update|remove|list|doctor
+  repository add|list|doctor|rename|scan
   engineering-reference record
   association explain|rebuild
   search
@@ -844,10 +842,7 @@ fn run_hook(args: &[String]) -> Result<()> {
         HookAuthorization::disabled()
     };
     let activation = authorization.activation;
-    let activated = matches!(
-        activation,
-        ResolvedActivationDecision::Direct | ResolvedActivationDecision::Group
-    );
+    let activated = activation == ResolvedActivationDecision::Enabled;
     let action = plan_hook_action(agent, &event, &capabilities, &authorization);
     let resolved = resolve_hook_action(action);
     if maintenance.is_some() && event.kind() == CanonicalAgentEventKind::SessionEnd {
@@ -881,10 +876,8 @@ fn plan_hook_action(
     let activation = authorization.activation;
     let action = plan_action_for_activation(event, capabilities, activation);
     let action = if event.kind() == CanonicalAgentEventKind::PostToolUse
-        && matches!(
-            activation,
-            ResolvedActivationDecision::Direct | ResolvedActivationDecision::Group
-        ) {
+        && activation == ResolvedActivationDecision::Enabled
+    {
         authorization
             .scope
             .as_ref()
@@ -954,7 +947,13 @@ fn resolve_hook_authorization_inner(
     let (catalog, hooks) = config.repository_catalog_with_hooks()?;
     let store = AuthorizedSessionScopeStore::initialize(&root)?;
 
-    let scope = match store.try_read(&locator, &catalog)? {
+    // A lease is permanent, but its decision is not: the recorded canonical
+    // `startup_cwd` is re-resolved against the Catalog this Hook just read, so a
+    // `repository add` or removal reaches an already running Session on its next
+    // event — including a Session started at a common parent, which simply gains or
+    // loses one of the Repositories it records for. Re-resolution is pure — no stat, no Git, no scan — so this stays on
+    // the Hook hot path.
+    let scope = match store.try_read_reconciled(&locator, &catalog)? {
         AuthorizedSessionScopeRead::Current(scope) => Some(scope),
         AuthorizedSessionScopeRead::Missing
             if event_kind == CanonicalAgentEventKind::SessionStart =>
@@ -962,19 +961,21 @@ fn resolve_hook_authorization_inner(
             let canonical_startup_cwd = fs::canonicalize(startup_cwd).map_err(|error| {
                 Error::new(ErrorKind::Io, format!("canonicalize startup cwd: {error}"))
             })?;
-            let scope = catalog.resolve_activation_scope(&canonical_startup_cwd)?;
-            Some(store.try_authorize_missing(&locator, &scope, &catalog)?)
+            Some(
+                store
+                    .try_authorize_missing(&locator, &catalog, &canonical_startup_cwd)?
+                    .scope,
+            )
         }
-        AuthorizedSessionScopeRead::Expired
-        | AuthorizedSessionScopeRead::StaleCatalog
-        | AuthorizedSessionScopeRead::Missing => None,
+        AuthorizedSessionScopeRead::Missing => None,
     };
-    let activation = match scope.as_ref().map(|scope| &scope.decision) {
-        None | Some(AuthorizedSessionScopeDecision::Disabled) => {
-            ResolvedActivationDecision::Disabled
-        }
-        Some(AuthorizedSessionScopeDecision::Direct { .. }) => ResolvedActivationDecision::Direct,
-        Some(AuthorizedSessionScopeDecision::Group { .. }) => ResolvedActivationDecision::Group,
+    let activation = if scope
+        .as_ref()
+        .is_some_and(|scope| scope.decision.is_enabled())
+    {
+        ResolvedActivationDecision::Enabled
+    } else {
+        ResolvedActivationDecision::Disabled
     };
     Ok(HookAuthorization {
         activation,
@@ -1041,17 +1042,18 @@ fn resolve_artifact_focus_reminder(
         authorization.hooks.artifact_focus_reminder,
     )?;
     let catalog = authorization.catalog.as_ref()?;
-    let AuthorizedSessionScopeDecision::Direct {
-        repository_id: authorized_repository_id,
-    } = &authorization.scope.as_ref()?.decision
-    else {
+    let authorized_repository_ids = authorization.scope.as_ref()?.decision.repository_ids();
+    if authorized_repository_ids.is_empty() {
         return None;
-    };
+    }
+    // A Session started at a common parent records for several Repositories, so the file
+    // itself decides which one this reminder is about: the Catalog places it, and the
+    // placement must land inside this Session's own activation.
     let declared = catalog.resolve_declared_path(file).ok()?;
     let resolved = catalog
         .resolve_file_path(file, std::slice::from_ref(&declared.checkout_path))
         .ok()?;
-    if resolved.repository_id != *authorized_repository_id {
+    if !authorized_repository_ids.contains(&resolved.repository_id) {
         return None;
     }
     let root = installation_root().ok()?;
@@ -1157,7 +1159,7 @@ fn resolve_post_tool_attribution(
     scope: &AuthorizedSessionScope,
     catalog: &RepositoryCatalogSnapshot,
 ) -> Result<HookEventAttribution> {
-    if matches!(scope.decision, AuthorizedSessionScopeDecision::Disabled) {
+    if !scope.decision.is_enabled() {
         return Err(invalid("PostToolUse requires an enabled Session scope"));
     }
 
@@ -1191,7 +1193,7 @@ fn resolve_post_tool_attribution(
     if repository_ids.is_empty() || checkout_paths.is_empty() {
         return Err(invariant("PostToolUse attribution resolved no safe path"));
     }
-    let Some(workspace_hint) = resolve_registered_workspace(&checkout_paths, catalog) else {
+    let Some(workspace_hint) = resolve_registered_workspace(&checkout_paths, scope) else {
         return Ok(HookEventAttribution::NonLocating);
     };
     Ok(HookEventAttribution::Registered {
@@ -1254,19 +1256,16 @@ fn resolve_safe_directory(
             "PostToolUse working directory must identify a directory",
         ));
     }
-    match catalog.resolve_activation_scope(directory)?.decision {
-        sctx_local_state::ActivationScopeDecision::Direct {
-            repository_id,
-            checkout_path,
-        } => Ok(SafePathAttribution::Registered {
+    // Only a directory *inside* a registered checkout attributes an event. A parent
+    // directory that merely contains checkouts activates the Session but locates nothing,
+    // so it stays unregistered here.
+    match catalog.deepest_checkout_for(directory)? {
+        Some((repository_id, checkout_path)) => Ok(SafePathAttribution::Registered {
             repository_id,
             checkout_path,
             file_hint: None,
         }),
-        sctx_local_state::ActivationScopeDecision::Group { .. }
-        | sctx_local_state::ActivationScopeDecision::Disabled => {
-            Ok(SafePathAttribution::Unregistered)
-        }
+        None => Ok(SafePathAttribution::Unregistered),
     }
 }
 
@@ -1316,31 +1315,23 @@ fn collect_safe_path_attribution(
     }
 }
 
+/// Picks the one Workspace root that covers every checkout this event touched.
+///
+/// A single checkout is its own Workspace. Several checkouts only belong together when
+/// the Session itself started at a directory that contains all of them — which is exactly
+/// the common-parent activation the lease already recorded. Anything wider is not this
+/// Session's Workspace, so the event stays non-locating.
 fn resolve_registered_workspace(
     checkout_paths: &BTreeSet<PathBuf>,
-    catalog: &RepositoryCatalogSnapshot,
+    scope: &AuthorizedSessionScope,
 ) -> Option<PathBuf> {
     if checkout_paths.len() == 1 {
         return checkout_paths.first().cloned();
     }
-    let mut groups = catalog
-        .repository_groups
+    checkout_paths
         .iter()
-        .filter(|group| {
-            checkout_paths
-                .iter()
-                .all(|checkout| checkout.starts_with(&group.root_path))
-        })
-        .collect::<Vec<_>>();
-    groups.sort_by(|left, right| {
-        right
-            .root_path
-            .components()
-            .count()
-            .cmp(&left.root_path.components().count())
-            .then_with(|| left.repository_group_id.cmp(&right.repository_group_id))
-    });
-    groups.first().map(|group| group.root_path.clone())
+        .all(|checkout| checkout.starts_with(&scope.startup_cwd))
+        .then(|| scope.startup_cwd.clone())
 }
 
 fn agent_capabilities(
@@ -1396,12 +1387,9 @@ fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<ResolvedTas
             let root = installation_root()?;
             let runtime = TaskRuntime::initialize_for_hook(&root)?;
             if runtime.read_snapshot_by_locator(&locator)?.is_none() {
-                let notify = (|| {
-                    let catalog = UserConfigStore::open_existing(&root)?.repository_catalog()?;
-                    AuthorizedSessionScopeStore::initialize(&root)?
-                        .try_mark_intent_bootstrap_notified(&locator, &catalog)
-                })()
-                .unwrap_or(false);
+                let notify = AuthorizedSessionScopeStore::initialize(&root)
+                    .and_then(|store| store.try_mark_intent_bootstrap_notified(&locator))
+                    .unwrap_or(false);
                 return Ok(ResolvedTaskOperation {
                     additional_context: None,
                     system_message: notify.then(|| INTENT_BOOTSTRAP_REMINDER.to_owned()),
@@ -2646,7 +2634,7 @@ fn run_task_context(args: &[String], json_output: bool) -> Result<()> {
 fn run_repository(args: &[String], json_output: bool) -> Result<()> {
     let [command, rest @ ..] = args else {
         return Err(invalid(
-            "Usage: sctx repository add|list|doctor|rename|scan|group [OPTIONS]",
+            "Usage: sctx repository add|list|doctor|rename|scan [OPTIONS]",
         ));
     };
     let root = installation_root()?;
@@ -2675,7 +2663,6 @@ fn run_repository(args: &[String], json_output: bool) -> Result<()> {
         "list" => run_repository_list(rest, json_output, &root),
         "doctor" => run_repository_doctor(rest, json_output, &root),
         "rename" => run_repository_rename(rest, json_output, &root),
-        "group" => run_repository_group(rest, json_output, &root),
         "scan" => {
             let options = Options::parse(rest, &[])?;
             options.allow_only(&["--checkout-path", "--path", "--max-artifacts"], &[])?;
@@ -2703,7 +2690,7 @@ fn run_repository(args: &[String], json_output: bool) -> Result<()> {
             )
         }
         _ => Err(invalid(
-            "repository command must be add, list, doctor, rename, scan, or group",
+            "repository command must be add, list, doctor, rename, or scan",
         )),
     }
 }
@@ -2711,20 +2698,15 @@ fn run_repository(args: &[String], json_output: bool) -> Result<()> {
 fn run_repository_list(args: &[String], json_output: bool, root: &Path) -> Result<()> {
     let options = Options::parse(args, &[])?;
     options.allow_only(&[], &[])?;
-    let inspection = UserConfigStore::open_existing(root)?.inspect_repository_catalog()?;
-    let sync = inspection
-        .repository_groups
-        .iter()
-        .all(|group| group.status == CatalogRepositoryGroupStatus::Available)
-        .then(|| sctx_mcp::sync_repository_catalog_at_root(root))
-        .transpose()?;
+    let catalog = UserConfigStore::open_existing(root)?.inspect_repository_catalog()?;
+    let sync = sctx_mcp::sync_repository_catalog_at_root(root)?;
     let metadata = repository_repair_command_metadata(root)?;
     emit(
         "repository.list",
         &metadata,
         json!({
-            "repositories": inspection.catalog.repositories,
-            "repository_groups": inspection.repository_groups,
+            "repositories": catalog.repositories,
+            "activation": catalog.activation,
             "registry": sync,
         }),
         json_output,
@@ -2740,10 +2722,7 @@ fn run_repository_doctor(args: &[String], json_output: bool, root: &Path) -> Res
             checkout.status,
             CatalogCheckoutStatus::Available | CatalogCheckoutStatus::Missing
         )
-    }) && report
-        .repository_groups
-        .iter()
-        .all(|group| group.status == CatalogRepositoryGroupStatus::Available);
+    });
     let sync = syncable
         .then(|| sctx_mcp::sync_repository_catalog_at_root(root))
         .transpose()?;
@@ -2804,123 +2783,6 @@ fn run_repository_rename(args: &[String], json_output: bool, root: &Path) -> Res
         json!({"catalog": outcome, "registry": sync}),
         json_output,
     )
-}
-
-fn run_repository_group(args: &[String], json_output: bool, root: &Path) -> Result<()> {
-    let [command, rest @ ..] = args else {
-        return Err(invalid(
-            "Usage: sctx repository group add|update|remove|list|doctor [OPTIONS]",
-        ));
-    };
-    match command.as_str() {
-        "add" => {
-            let options = Options::parse(rest, &[])?;
-            options.allow_only(&["--root", "--member-repository-id"], &[])?;
-            let group_root = PathBuf::from(options.required("--root")?);
-            let members = parse_repository_group_members(&options)?;
-            let outcome =
-                UserConfigStore::initialize(root)?.add_repository_group(&group_root, &members)?;
-            let metadata = repository_command_metadata(root)?;
-            emit(
-                "repository.group.add",
-                &metadata,
-                json!({"catalog": outcome}),
-                json_output,
-            )
-        }
-        "update" => {
-            let options = Options::parse(rest, &[])?;
-            options.allow_only(
-                &["--repository-group-id", "--root", "--member-repository-id"],
-                &[],
-            )?;
-            let repository_group_id = parse_id::<RepositoryGroupId>(
-                options.required("--repository-group-id")?,
-                "RepositoryGroup ID",
-            )?;
-            let replacement_root = options.optional("--root")?.map(PathBuf::from);
-            let replacement_members = options
-                .provided("--member-repository-id")
-                .then(|| parse_repository_group_members(&options))
-                .transpose()?;
-            let outcome = UserConfigStore::open_existing(root)?.update_repository_group(
-                repository_group_id,
-                replacement_root.as_deref(),
-                replacement_members.as_deref(),
-            )?;
-            let metadata = repository_repair_command_metadata(root)?;
-            emit(
-                "repository.group.update",
-                &metadata,
-                json!({"catalog": outcome}),
-                json_output,
-            )
-        }
-        "remove" => {
-            let options = Options::parse(rest, &[])?;
-            options.allow_only(&["--repository-group-id"], &[])?;
-            let repository_group_id = parse_id::<RepositoryGroupId>(
-                options.required("--repository-group-id")?,
-                "RepositoryGroup ID",
-            )?;
-            let outcome = UserConfigStore::open_existing(root)?
-                .remove_repository_group(repository_group_id)?;
-            let metadata = repository_repair_command_metadata(root)?;
-            emit(
-                "repository.group.remove",
-                &metadata,
-                json!({"catalog": outcome}),
-                json_output,
-            )
-        }
-        "list" => run_repository_group_list(rest, json_output, root),
-        "doctor" => run_repository_group_doctor(rest, json_output, root),
-        _ => Err(invalid(
-            "repository group command must be add, update, remove, list, or doctor",
-        )),
-    }
-}
-
-fn run_repository_group_list(args: &[String], json_output: bool, root: &Path) -> Result<()> {
-    let options = Options::parse(args, &[])?;
-    options.allow_only(&[], &[])?;
-    let inspection = UserConfigStore::open_existing(root)?.inspect_repository_catalog()?;
-    let metadata = repository_repair_command_metadata(root)?;
-    emit(
-        "repository.group.list",
-        &metadata,
-        json!({"repository_groups": inspection.repository_groups}),
-        json_output,
-    )
-}
-
-fn run_repository_group_doctor(args: &[String], json_output: bool, root: &Path) -> Result<()> {
-    let options = Options::parse(args, &[])?;
-    options.allow_only(&[], &[])?;
-    let report = UserConfigStore::open_existing(root)?.doctor_repository_catalog()?;
-    let healthy = report
-        .repository_groups
-        .iter()
-        .all(|group| group.status == CatalogRepositoryGroupStatus::Available);
-    let metadata = repository_repair_command_metadata(root)?;
-    emit(
-        "repository.group.doctor",
-        &metadata,
-        json!({
-            "healthy": healthy,
-            "repository_group_count": report.repository_group_count,
-            "repository_groups": report.repository_groups,
-        }),
-        json_output,
-    )
-}
-
-fn parse_repository_group_members(options: &Options) -> Result<Vec<RepositoryId>> {
-    options
-        .many("--member-repository-id")
-        .into_iter()
-        .map(|value| parse_id::<RepositoryId>(value, "member Repository ID"))
-        .collect()
 }
 
 fn repository_command_metadata(root: &Path) -> Result<IndexMetadata> {

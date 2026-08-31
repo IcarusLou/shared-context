@@ -69,7 +69,7 @@ fn cursor_prompt_hook_never_repeats_activation_marker() {
     assert!(capability.prompt_submit);
     assert!(!capability.prompt_aware_injection);
     let action =
-        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Direct);
+        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled);
     assert!(action.task_operation.is_none());
     assert!(action.system_message.is_none());
 
@@ -102,7 +102,7 @@ fn cursor_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_c
         let (event, _) =
             decode_hook_input(&serde_json::to_vec(&fixtures().remove(index)).unwrap()).unwrap();
         let action =
-            plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Direct);
+            plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled);
         assert!(matches!(
             action.task_operation,
             Some(TaskRuntimeOperation::FinalizeCheckpointedEpisode { trigger, .. })
@@ -151,27 +151,19 @@ fn cursor_session_start_encodes_disabled_as_neutral_and_both_enabled_scopes_iden
         serde_json::json!({})
     );
 
-    let mut outputs = Vec::new();
-    for activation in [
-        ResolvedActivationDecision::Direct,
-        ResolvedActivationDecision::Group,
-    ] {
-        let action = plan_action_for_activation(&event, &capability, activation);
-        assert!(action.task_operation.is_none());
-        outputs.push(
-            encode_hook_output(
-                event.kind(),
-                &ResolvedAgentAction {
-                    additional_context: action.additional_context,
-                    system_message: action.system_message,
-                },
-            )
-            .unwrap(),
-        );
-    }
-    assert_eq!(outputs[0], outputs[1]);
+    let action =
+        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled);
+    assert!(action.task_operation.is_none());
+    let enabled_output = encode_hook_output(
+        event.kind(),
+        &ResolvedAgentAction {
+            additional_context: action.additional_context,
+            system_message: action.system_message,
+        },
+    )
+    .unwrap();
     assert_eq!(
-        serde_json::from_slice::<Value>(&outputs[0]).unwrap(),
+        serde_json::from_slice::<Value>(&enabled_output).unwrap(),
         serde_json::json!({
             "additional_context":
                 shared_context_activation_marker(AgentKind::Cursor, "conv-real-shape-01")
@@ -286,12 +278,12 @@ fn cursor_post_tool_reminder_is_off_by_default_and_keeps_the_current_bytes() {
         decode_hook_input(&serde_json::to_vec(&cursor_file_operation_payload()).unwrap()).unwrap();
     let capabilities = capabilities(Some("3.13.10"), true);
     let action =
-        plan_action_for_activation(&event, &capabilities, ResolvedActivationDecision::Direct);
+        plan_action_for_activation(&event, &capabilities, ResolvedActivationDecision::Enabled);
     assert!(action.additional_context.is_none());
     assert!(
         artifact_focus_reminder_file(
             &event,
-            ResolvedActivationDecision::Direct,
+            ResolvedActivationDecision::Enabled,
             &capabilities,
             false,
         )
@@ -314,7 +306,7 @@ fn cursor_enabled_reminder_is_bounded_and_encoded_as_read_only_additional_contex
     let capabilities = capabilities(Some("3.13.10"), true);
     let file = artifact_focus_reminder_file(
         &event,
-        ResolvedActivationDecision::Direct,
+        ResolvedActivationDecision::Enabled,
         &capabilities,
         true,
     )
@@ -348,7 +340,7 @@ fn cursor_shell_and_group_activation_never_reach_the_reminder_lookup() {
     assert!(
         artifact_focus_reminder_file(
             &shell,
-            ResolvedActivationDecision::Direct,
+            ResolvedActivationDecision::Enabled,
             &capabilities,
             true,
         )
@@ -357,12 +349,13 @@ fn cursor_shell_and_group_activation_never_reach_the_reminder_lookup() {
 
     let (file_event, _) =
         decode_hook_input(&serde_json::to_vec(&cursor_file_operation_payload()).unwrap()).unwrap();
-    for activation in [
-        ResolvedActivationDecision::Group,
-        ResolvedActivationDecision::Disabled,
-    ] {
-        assert!(
-            artifact_focus_reminder_file(&file_event, activation, &capabilities, true).is_none()
-        );
-    }
+    assert!(
+        artifact_focus_reminder_file(
+            &file_event,
+            ResolvedActivationDecision::Disabled,
+            &capabilities,
+            true,
+        )
+        .is_none()
+    );
 }

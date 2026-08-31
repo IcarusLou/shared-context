@@ -11,8 +11,8 @@ use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
 use sctx_domain::{ExternalSessionLocator, RepositoryId};
 use sctx_git_store::GitStore;
 use sctx_local_state::{
-    AuthorizedSessionScope, AuthorizedSessionScopeDecision, AuthorizedSessionScopeRead,
-    AuthorizedSessionScopeStore, UserConfigStore,
+    AuthorizedSessionScope, AuthorizedSessionScopeRead, AuthorizedSessionScopeStore,
+    UserConfigStore,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -103,7 +103,9 @@ struct BusinessSnapshot {
 struct Fixture {
     _temporary: TempDir,
     home: PathBuf,
-    group_root: PathBuf,
+    /// The directory both registered checkouts live under; a Session that starts here
+    /// derives both Repositories without anything being registered for the directory.
+    common_parent: PathBuf,
     repository_a: PathBuf,
     repository_b: PathBuf,
     sibling: PathBuf,
@@ -119,17 +121,17 @@ impl Fixture {
     fn new() -> Self {
         let temporary = tempdir().unwrap();
         let home = temporary.path().join("acceptance home");
-        let group_root = temporary.path().join("registered parent");
-        let repository_a = group_root.join("member a");
-        let repository_b = group_root.join("member b");
-        let sibling = group_root.join("unregistered sibling");
+        let common_parent = temporary.path().join("registered parent");
+        let repository_a = common_parent.join("member a");
+        let repository_b = common_parent.join("member b");
+        let sibling = common_parent.join("unregistered sibling");
         let outside = temporary.path().join("outside catalog");
         fs::create_dir_all(&home).unwrap();
         for path in [&repository_a, &repository_b, &sibling] {
             initialize_repository(path);
         }
         fs::create_dir_all(&outside).unwrap();
-        let group_root = fs::canonicalize(group_root).unwrap();
+        let common_parent = fs::canonicalize(common_parent).unwrap();
         let repository_a = fs::canonicalize(repository_a).unwrap();
         let repository_b = fs::canonicalize(repository_b).unwrap();
         let sibling = fs::canonicalize(sibling).unwrap();
@@ -157,13 +159,10 @@ impl Fixture {
             .unwrap()
             .repository
             .repository_id;
-        config
-            .add_repository_group(&group_root, &[first_id.clone(), second_id.clone()])
-            .unwrap();
         Self {
             _temporary: temporary,
             home,
-            group_root,
+            common_parent,
             repository_a,
             repository_b,
             sibling,
@@ -189,23 +188,18 @@ impl Fixture {
     }
 
     fn read_scope(&self, agent: &str, session: &str) -> AuthorizedSessionScopeRead {
-        let catalog = UserConfigStore::open_existing(self.root())
-            .unwrap()
-            .repository_catalog()
-            .unwrap();
         AuthorizedSessionScopeStore::initialize(self.root())
             .unwrap()
-            .read(
-                &ExternalSessionLocator::new(agent, session).unwrap(),
-                &catalog,
-            )
+            .read(&ExternalSessionLocator::new(agent, session).unwrap())
             .unwrap()
     }
 
     fn current_scope(&self, agent: &str, session: &str) -> AuthorizedSessionScope {
         match self.read_scope(agent, session) {
             AuthorizedSessionScopeRead::Current(scope) => scope,
-            other => panic!("expected Current scope, got {other:?}"),
+            other @ AuthorizedSessionScopeRead::Missing => {
+                panic!("expected Current scope, got {other:?}")
+            }
         }
     }
 
@@ -542,9 +536,8 @@ fn documented_codex_direct_lifecycle_activates_before_prompt_and_keeps_git_clean
     assert!(matches!(
         fixture.read_scope("codex", session),
         AuthorizedSessionScopeRead::Current(scope)
-            if scope.decision == AuthorizedSessionScopeDecision::Direct {
-                repository_id: fixture.repository_a_id.clone()
-            }
+            if scope.decision.repository_ids()
+                == std::slice::from_ref(&fixture.repository_a_id)
     ));
     assert_output(&fixture.run("codex", &events[1]), &oracle.wire.neutral);
     assert_codex_lifecycle_message(
@@ -577,11 +570,12 @@ fn documented_codex_direct_lifecycle_activates_before_prompt_and_keeps_git_clean
 }
 
 #[test]
-fn documented_cursor_group_lifecycle_records_members_and_safe_non_locating_investigation() {
+fn documented_cursor_parent_lifecycle_records_both_repositories_and_safe_non_locating_investigation()
+ {
     let fixture = Fixture::new();
     let oracle = oracle();
-    let session = "synthetic-cursor-group";
-    let mut events = documented_events("cursor", session, &fixture.group_root);
+    let session = "synthetic-cursor-parent";
+    let mut events = documented_events("cursor", session, &fixture.common_parent);
     events[2]["tool_input"] = json!({
         "file_path": fixture.file_a,
         "nested": {"filepath": fixture.file_b}
@@ -598,11 +592,7 @@ fn documented_cursor_group_lifecycle_records_members_and_safe_non_locating_inves
         fixture.repository_b_id.clone(),
     ];
     expected_members.sort();
-    assert!(matches!(
-        scope.decision,
-        AuthorizedSessionScopeDecision::Group { .. }
-    ));
-    assert_eq!(scope.allowed_repository_ids, expected_members);
+    assert_eq!(scope.decision.repository_ids(), expected_members);
     assert_output(&fixture.run("cursor", &events[1]), &oracle.wire.neutral);
     assert_output(
         &fixture.run("cursor", &events[2]),
@@ -699,11 +689,10 @@ fn resume_compact_and_concurrent_repeated_starts_keep_the_first_successful_scope
         &oracle.activation("codex", session),
     );
     let first = fixture.current_scope("codex", session);
-    assert!(matches!(
-        first.decision,
-        AuthorizedSessionScopeDecision::Direct { ref repository_id }
-            if repository_id == &fixture.repository_a_id
-    ));
+    assert_eq!(
+        first.decision.repository_ids(),
+        std::slice::from_ref(&fixture.repository_a_id)
+    );
 
     for (source, cwd) in [
         ("resume", fixture.repository_b.as_path()),
@@ -728,7 +717,7 @@ fn resume_compact_and_concurrent_repeated_starts_keep_the_first_successful_scope
         let home = fixture.home.clone();
         let cwd = match index % 3 {
             0 => fixture.repository_b.clone(),
-            1 => fixture.group_root.clone(),
+            1 => fixture.common_parent.clone(),
             _ => fixture.outside.clone(),
         };
         let mut payload = documented_events("codex", session, &cwd).remove(0);

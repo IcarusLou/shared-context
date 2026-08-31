@@ -140,3 +140,101 @@ fn post_tool_attribution_persists_no_evidence_or_unregistered_path() {
     assert!(!persisted.contains("RAW_ATTRIBUTION_"));
     assert!(!persisted.contains(sibling.to_str().unwrap()));
 }
+
+/// A Session started at the common parent of two registered checkouts attributes a
+/// `PostToolUse` that touches both, using its own startup directory as the Workspace root
+/// (WP-N2). A path outside every registered checkout still makes the event non-locating.
+#[test]
+fn a_common_parent_session_attributes_across_its_registered_checkouts() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path().join("common parent home");
+    let root = home.join(".shared-context");
+    fs::create_dir_all(&home).unwrap();
+    GitStore::bootstrap_local(&root).unwrap();
+    let parent = home.join("workspace");
+    let first = git_repo(&parent.join("first"));
+    let second = git_repo(&parent.join("second"));
+    let sibling = git_repo(&parent.join("unregistered"));
+    let parent = fs::canonicalize(&parent).unwrap();
+    let config = UserConfigStore::initialize(&root).unwrap();
+    for checkout in [&first, &second] {
+        config
+            .add_repository(
+                sctx_domain::RepositoryId::new(),
+                std::slice::from_ref(checkout),
+            )
+            .unwrap();
+    }
+
+    let session = "common-parent-attribution";
+    assert_eq!(
+        hook(
+            &home,
+            &json!({
+                "session_id": session, "transcript_path": null, "cwd": parent,
+                "hook_event_name": "SessionStart", "model": "gpt-5.6-sol",
+                "permission_mode": "default", "source": "startup"
+            }),
+        ),
+        json!({"hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": shared_context_activation_marker(AgentKind::Codex, session)
+        }}),
+        "the common parent of two registered checkouts activates the Session"
+    );
+    TaskRuntime::initialize(&root)
+        .unwrap()
+        .open_or_create(
+            ExternalSessionLocator::new("codex", session).unwrap(),
+            TaskId::new(),
+            WorkingIntentSnapshot::new("attribute across both registered checkouts").unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+
+    // Both files are registered, so the event locates and stays inside this Session's scope.
+    assert_eq!(
+        hook(
+            &home,
+            &json!({
+                "session_id": session, "transcript_path": null, "cwd": parent,
+                "hook_event_name": "PostToolUse", "model": "gpt-5.6-sol",
+                "permission_mode": "default", "turn_id": "turn-both",
+                "tool_name": "Read", "tool_use_id": "tool-both",
+                "tool_input": {
+                    "absolute_file_path": first.join("src/lib.rs"),
+                    "nested": {"absolute_file_path": second.join("src/lib.rs")}
+                },
+                "tool_response": {"output": "RAW_PARENT_BOTH"}
+            }),
+        ),
+        json!({})
+    );
+
+    // One unregistered path makes the whole event non-locating.
+    assert_eq!(
+        hook(
+            &home,
+            &json!({
+                "session_id": session, "transcript_path": null, "cwd": parent,
+                "hook_event_name": "PostToolUse", "model": "gpt-5.6-sol",
+                "permission_mode": "default", "turn_id": "turn-sibling",
+                "tool_name": "Read", "tool_use_id": "tool-sibling",
+                "tool_input": {"absolute_file_path": sibling.join("src/lib.rs")},
+                "tool_response": {"output": "RAW_PARENT_SIBLING"}
+            }),
+        ),
+        json!({})
+    );
+
+    let mut files = Vec::new();
+    collect_files(&root.join("state"), &mut files);
+    let persisted = files
+        .into_iter()
+        .filter_map(|path| fs::read(path).ok())
+        .flatten()
+        .collect::<Vec<_>>();
+    let persisted = String::from_utf8_lossy(&persisted);
+    assert!(!persisted.contains("RAW_PARENT_"));
+    assert!(!persisted.contains(sibling.to_str().unwrap()));
+}

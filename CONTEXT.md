@@ -212,16 +212,12 @@ _Avoid_: generated repository UUID, repository URL, local path alias
 A stable RepositoryId for one logical source repository across team members’ configured checkouts and worktrees. Paths, basenames, remotes, common parents, branches, and Commits never create or merge this identity.
 _Avoid_: checkout path, repository URL as identity, inferred repository identity
 
-**RepositoryGroup**:
-A local, explicitly declared activation boundary containing a closed set of RepositoryIdentities that may participate together in one Agent session. It is neither repository discovery nor Workspace-to-ContextSpace routing or knowledge identity.
-_Avoid_: inferred repository family, Workspace Space, monorepo identity
-
 **ActivationScope**:
-The local authorization decision for whether Shared Context may participate in an Agent session: one Direct RepositoryIdentity, one explicitly matched RepositoryGroup, or Disabled. It never selects a ContextSpace or owns durable knowledge.
-_Avoid_: Workspace route, Active Space, repository discovery
+The local authorization decision for whether Shared Context may participate in an Agent session, derived from the session's startup directory alone: Enabled naming the registered RepositoryIdentities that directory belongs to or contains, or Disabled. It never selects a ContextSpace or owns durable knowledge.
+_Avoid_: registered activation boundary, repository group, inferred repository family, Workspace route, Active Space, repository discovery
 
 **AuthorizedSessionScope**:
-An ExternalSessionLocator-owned, TTL-bounded local activation lease holding one Disabled, Direct, or Group decision. It is neither a TaskSession, Workspace route, Context fact, nor durable knowledge.
+An ExternalSessionLocator-owned local activation lease, permanently bound to its Agent session and never expiring, holding one Enabled or Disabled decision plus the canonical startup directory that decision is re-derived from. It is bounded by orphan reclamation, not by a TTL, and it is neither a TaskSession, Workspace route, Context fact, nor durable knowledge.
 _Avoid_: Task authorization, Workspace binding, durable session knowledge
 
 **EngineeringReference**:

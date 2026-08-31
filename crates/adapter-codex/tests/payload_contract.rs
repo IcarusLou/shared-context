@@ -65,7 +65,7 @@ fn verified_and_trusted_codex_prompt_never_repeats_activation_marker() {
     assert_eq!(capability.mode, CapabilityMode::VerifiedHooks);
     assert!(capability.prompt_aware_injection);
     let action =
-        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Direct);
+        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled);
     assert!(action.task_operation.is_none());
     assert!(action.system_message.is_none());
 
@@ -98,7 +98,7 @@ fn codex_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_cl
         let event =
             decode_hook_input(&serde_json::to_vec(&fixtures().remove(index)).unwrap()).unwrap();
         let action =
-            plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Direct);
+            plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled);
         assert!(matches!(
             action.task_operation,
             Some(TaskRuntimeOperation::FinalizeCheckpointedEpisode { trigger, .. })
@@ -146,27 +146,19 @@ fn codex_session_start_encodes_enabled_marker_as_model_context_and_disabled_as_n
         serde_json::json!({})
     );
 
-    let mut outputs = Vec::new();
-    for activation in [
-        ResolvedActivationDecision::Direct,
-        ResolvedActivationDecision::Group,
-    ] {
-        let action = plan_action_for_activation(&event, &capability, activation);
-        assert!(action.task_operation.is_none());
-        outputs.push(
-            encode_hook_output(
-                event.kind(),
-                &ResolvedAgentAction {
-                    additional_context: action.additional_context,
-                    system_message: action.system_message,
-                },
-            )
-            .unwrap(),
-        );
-    }
-    assert_eq!(outputs[0], outputs[1]);
+    let action =
+        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled);
+    assert!(action.task_operation.is_none());
+    let enabled_output = encode_hook_output(
+        event.kind(),
+        &ResolvedAgentAction {
+            additional_context: action.additional_context,
+            system_message: action.system_message,
+        },
+    )
+    .unwrap();
     assert_eq!(
-        serde_json::from_slice::<Value>(&outputs[0]).unwrap(),
+        serde_json::from_slice::<Value>(&enabled_output).unwrap(),
         serde_json::json!({"hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": shared_context_activation_marker(
@@ -292,12 +284,12 @@ fn codex_post_tool_reminder_is_off_by_default_and_keeps_the_current_bytes() {
     let event = codex_post_tool_event();
     let capabilities = codex_capabilities();
     let action =
-        plan_action_for_activation(&event, &capabilities, ResolvedActivationDecision::Direct);
+        plan_action_for_activation(&event, &capabilities, ResolvedActivationDecision::Enabled);
     assert!(action.additional_context.is_none());
     assert!(
         artifact_focus_reminder_file(
             &event,
-            ResolvedActivationDecision::Direct,
+            ResolvedActivationDecision::Enabled,
             &capabilities,
             false,
         )
@@ -319,7 +311,7 @@ fn codex_enabled_reminder_is_bounded_names_context_ids_and_carries_no_context_bo
     let capabilities = codex_capabilities();
     let file = artifact_focus_reminder_file(
         &event,
-        ResolvedActivationDecision::Direct,
+        ResolvedActivationDecision::Enabled,
         &capabilities,
         true,
     )
@@ -358,22 +350,25 @@ fn codex_enabled_reminder_is_bounded_names_context_ids_and_carries_no_context_bo
 }
 
 #[test]
-fn codex_reminder_target_requires_direct_activation_a_file_tool_and_one_path() {
+fn codex_reminder_target_requires_enabled_activation_a_file_tool_and_one_path() {
     let event = codex_post_tool_event();
     let capabilities = codex_capabilities();
-    for activation in [
-        ResolvedActivationDecision::Group,
-        ResolvedActivationDecision::Disabled,
-    ] {
-        assert!(artifact_focus_reminder_file(&event, activation, &capabilities, true).is_none());
-    }
+    assert!(
+        artifact_focus_reminder_file(
+            &event,
+            ResolvedActivationDecision::Disabled,
+            &capabilities,
+            true,
+        )
+        .is_none()
+    );
 
     let unverified =
         sctx_adapter_codex::capabilities(Some("0.146.0"), false, TrustState::Confirmed);
     assert!(
         artifact_focus_reminder_file(
             &event,
-            ResolvedActivationDecision::Direct,
+            ResolvedActivationDecision::Enabled,
             &unverified,
             true,
         )
@@ -386,7 +381,7 @@ fn codex_reminder_target_requires_direct_activation_a_file_tool_and_one_path() {
     assert!(
         artifact_focus_reminder_file(
             &ambiguous,
-            ResolvedActivationDecision::Direct,
+            ResolvedActivationDecision::Enabled,
             &capabilities,
             true,
         )
@@ -407,7 +402,7 @@ fn codex_reminder_target_requires_direct_activation_a_file_tool_and_one_path() {
     assert!(
         artifact_focus_reminder_file(
             &shell,
-            ResolvedActivationDecision::Direct,
+            ResolvedActivationDecision::Enabled,
             &capabilities,
             true,
         )

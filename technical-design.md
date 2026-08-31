@@ -20,7 +20,7 @@
 | **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、`TaskIntentRevision`、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、严格 `task_intent_update` 与只读 `task_context` 已通过跨 crate/E2E 验收 |
 | **M3：Engineering Graph** | **已实现** | 稳定本机 Repository Catalog、可重建 Registry、Reference-derived 有界扫描、build-time immutable Context/safety snapshot、历史 Graph Retrieval、ContextRelation 1–2 跳及 MCP/CLI 工作流已通过固定跨 crate/E2E oracle |
 | **M4：Direct Checkpoint / Candidate Review** | **已实现** | #226–#228 用 flat direct Claims/Unknowns、内容寻址 operation receipt、durable Build outbox 和人工 Candidate Confirmation 取代机械 Capture 选择链路 |
-| **Repository 范围推理前准入与 Session 授权** | **实现完成，待最终人工验收** | #181–#191/#194 实现 Direct/显式 Group/Disabled、短期 Session lease、SessionStart marker、MCP Session guard、registered cross-Repo / safe non-locating / unsafe drop 与 SessionEnd 清理；#192 提供 marker-gated installer-owned workflow，#196 补齐 Group ID 隐私表，#193 以手写 oracle 关闭 token bytes proxy、Direct/Group 黑盒链、installer 与 NPM 回归证据 |
+| **Repository 范围推理前准入与 Session 授权** | **实现完成，待最终人工验收** | #181–#191/#194 实现准入判定、Session lease、SessionStart marker、MCP Session guard、registered cross-Repo / safe non-locating / unsafe drop 与 SessionEnd 清理；#192 提供 marker-gated installer-owned workflow，#193 以手写 oracle 关闭 token bytes proxy、黑盒链、installer 与 NPM 回归证据。方案 B 后准入改为从已登记 checkout 与其父目录推导的二态 `Enabled`/`Disabled`，显式 `RepositoryGroup` 及其五个 CLI 子命令整体删除 |
 | **真实宿主契约与 Hook 热路径** | **已实现；模型循环实测另行验收** | Codex/Cursor Adapter 把结构化工具事件归一化为非事实 TaskSignals；Hook 不保存或筛选 Claim Evidence，MCP/host schema 共享一个严格输入契约 |
 
 当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订承载 `WorkingIntentSnapshot` 的 `TaskIntentRevision`，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask。SessionStart 先在本地同步完成 Repository 范围准入，只有 Enabled lease 才向 Agent 返回固定短 marker；PromptSubmit 不重复 marker，也不读取 Runtime/Search。Enabled PostToolUse 只合并机械化、非事实的 TaskSignals，不能产生 Claim Evidence。`task_checkpoint` 只接收 locator + direct Claims/Unknowns，服务端解析 Task/Intent/lifecycle并 durable queue Candidate Build；Candidate 只在 bounded recovery 后成为不可信 Review，公开面仅提供 list/get/discard/confirm。
@@ -29,12 +29,12 @@
 
 当前已把本地范围组件接入 Agent Hook；整个准入发生在模型推理前，不读取 Prompt，也不经过模型：
 
-- `RepositoryGroup` 是产品私有 `config.toml` 中的显式本机配置。Group root、成员 Repository 与 `RepositoryGroupId` 由 typed CLI 进行 add/update/remove/list/doctor；配置与修复不会在业务仓库中创建项目级 Agent 文件。
-- `ScopeResolver` 对 canonical Session 启动目录返回 `Direct`、`Group` 或 `Disabled`。`Direct` 使用已注册 checkout 的 longest-prefix 并优先于 Group；`Group` 只匹配显式 root 的精确相等；任意祖先目录和未注册 sibling 都是 `Disabled`。
-- `AuthorizedSessionScope` 是按 `ExternalSessionLocator` 隔离、Catalog revision 约束、最长 24 小时的产品私有 lease。文件名只含 locator digest，记录只含 typed decision、允许的 RepositoryId、Catalog revision 与 TTL；不保存 checkout/Group root、Prompt、transcript、tool output、report 或业务正文。
-- SessionStart 同步读取 Catalog，并对 Catalog/lease 使用 non-blocking try-lock。只有 Missing locator 可以按本次 canonical cwd 解析并先持久化 lease；Current 直接复用，Stale/Expired/锁忙/解析异常立即返回 `Disabled`。同一 locator 的首次成功决定是 sticky，后续 startup/resume/compact 即使 cwd 改变也不重新判归属。
-- `Direct` 与 `Group` 使用同一个不超过 128 bytes、无 Repository/路径/Prompt/身份的 activation marker；marker 只出现在显式 SessionStart（包括 Codex resume/compact）边界，PromptSubmit 返回 neutral wire output。
-- Enabled PostToolUse 在 Runtime 前验证结构化 path hints。Adapter 只输出 `FileOperation`、`TestRunner`、`Shell`、`SharedContext` 或 `Other`，并只允许安全的机械含义进入非事实 TaskSignals；Shared Context 自身工具不回流。启动时的 Direct/Group 不限制 Session 后续显式调查目标。
+- 产品私有 `config.toml` 只显式登记 Repository checkout（typed CLI `repository add|list|doctor|rename|scan`），不再有任何手工登记的激活边界；配置与修复不会在业务仓库中创建项目级 Agent 文件。
+- `ScopeResolver` 对 canonical Session 启动目录返回二态 `Enabled { repository_ids }` 或 `Disabled`，全部推导自已登记 checkout：①目录在某个已登记 checkout 内 → 该 checkout 的 Repository（longest-prefix，归属歧义是 typed 错误）；②否则收集所有位于该目录之下的已登记 checkout，非空即 Enabled（去重排序后的 Repository 身份集合），这就是"共同父目录下启动 Agent"；③其余 Disabled。规则②对文件系统根、用户 HOME 本身与 HOME 的直接父级永不启用——从这些位置推导会一次性拉进整机所有登记仓库；可选 `[activation] allow_home = true`（默认 false）解除两条 HOME 保护，文件系统根永不可推导。决定只含 Repository 身份，不含任何路径。
+- `AuthorizedSessionScope` 是按 `ExternalSessionLocator` 隔离、与 Agent Session 永久绑定、不过期的产品私有 lease。文件名只含 locator digest，记录只含 typed decision、允许的 RepositoryId、canonical `startup_cwd` 与 `issued_at`；不保存 Prompt、transcript、tool output、report 或业务正文。`startup_cwd` 是后端本机元数据，只用于对当前 Catalog 重解析决定，不进 prompt、MCP 响应或持久 Context。lease 的边界由 `SessionEnd` 删除、30 天孤儿回收（`ORPHAN_LEASE_MAX_AGE`）与 4096 条 / 8MB 上限下的 LRU 淘汰共同保证，不再由 TTL 保证。
+- SessionStart 同步读取 Catalog，并对 Catalog/lease 使用 non-blocking try-lock。只有 Missing locator 可以按本次 canonical cwd 解析并先持久化 lease；Current 复用记录的 `startup_cwd` 对当前 Catalog 纯函数重解析（不 stat、不跑 Git、不扫描），结果变化时才在 non-blocking 排他锁下回写；锁忙或解析异常立即返回 `Disabled`。同一 locator 的首次成功决定所绑定的 `startup_cwd` 是 sticky，后续 startup/resume/compact 即使 cwd 改变也不重新判归属，但登记变化会改变该 `startup_cwd` 的判定结果。
+- Enabled 会话（单仓库或共同父目录）使用同一个 bounded、无 Repository/路径/Prompt/身份的 activation marker；marker 只出现在显式 SessionStart（包括 Codex resume/compact）边界，PromptSubmit 返回 neutral wire output。
+- Enabled PostToolUse 在 Runtime 前验证结构化 path hints。Adapter 只输出 `FileOperation`、`TestRunner`、`Shell`、`SharedContext` 或 `Other`，并只允许安全的机械含义进入非事实 TaskSignals；Shared Context 自身工具不回流。启动时推导出的 Enabled 不限制 Session 后续显式调查目标。
 - Disabled 的 Prompt/Tool/PreCompact/Stop/End 全部保持 Agent-neutral 且不打开业务 Runtime；SessionEnd 只按 exact locator 尝试移除 lease，不跨 Session 清理。Catalog/lease 锁忙或异常均 fail-open 让 Agent 继续，同时 fail-closed 为 Disabled。
 - scope 解析与 lease 热路径不运行 Git 或 Repository scan；安装仍是用户级配置，不需要 launcher，不在业务仓库写项目级 MCP/Hook 文件。
 
@@ -42,7 +42,7 @@
 
 Hook Runtime 使用短 SQLite busy timeout且 fail-open；普通 CLI/MCP 保留交互超时。Installer 每次 setup 只探测一次 Agent 版本，将 bounded version token 固化进托管 Hook 命令；Hook 事件不启动版本子进程，也不维护 Evidence 缓存。
 
-当前 MCP Server 已按 current Enabled `AuthorizedSessionScope` 实施 Session-level authorization guard；Disabled/Missing/Expired/Stale/busy/corrupt Session 调用被拒绝，Enabled Session 可调查任意已登记 Repository或提交不伪造 Artifact identity 的非定位 Evidence。全局 Skill 主入口是最小 activation gate：没有可信 SessionStart marker 时自动路径不读取完整 workflow reference、不产生 Shared Context MCP 调用提示；有 marker 时才完整读取一次 installer-owned reference。Server guard 只负责安全和不落越权数据，Skill gate 负责调用前的指令准入。#214 更新后的固定 oracle 证明 Disabled 的 activation/reference/MCP call/result/business residue proxy 全 0，Enabled 每条链 marker 为 126 bytes、完整 workflow 读取一次、实际 public MCP 调用 5 次且清洗后的 result bytes 落在手写上限内；当前 source gate/workflow/metadata 分别为 1543/9098/263 bytes。Bytes 不等于 token，MCP 进程和工具 Schema 仍由用户级配置全局提供，可能物理启动或可见。
+当前 MCP Server 已按 current Enabled `AuthorizedSessionScope` 实施 Session-level authorization guard，每次公开调用只做一次 lease 读取并按 `startup_cwd` 对冻结的 Catalog 重解析；Disabled/Missing/busy/corrupt Session 调用被拒绝，Enabled Session 可调查任意已登记 Repository或提交不伪造 Artifact identity 的非定位 Evidence。全局 Skill 主入口是最小 activation gate：没有可信 SessionStart marker 时自动路径不读取完整 workflow reference、不产生 Shared Context MCP 调用提示；有 marker 时才完整读取一次 installer-owned reference。Server guard 只负责安全和不落越权数据，Skill gate 负责调用前的指令准入。#214 更新后的固定 oracle 证明 Disabled 的 activation/reference/MCP call/result/business residue proxy 全 0，Enabled 每条链 marker 为 126 bytes、完整 workflow 读取一次、实际 public MCP 调用 5 次且清洗后的 result bytes 落在手写上限内；当前 source gate/workflow/metadata 分别为 1543/9098/263 bytes。Bytes 不等于 token，MCP 进程和工具 Schema 仍由用户级配置全局提供，可能物理启动或可见。
 
 ## 2. 背景与目标
 
@@ -1042,8 +1042,7 @@ sctx space create|revise|list|get
 sctx task context|artifact-focus|checkpoint|intent update|signal supersede
 sctx candidate list|get|confirm|discard
 sctx context get|search|revise|deprecate
-sctx repository add|list|doctor|scan
-sctx repository group add|update|remove|list|doctor
+sctx repository add|list|doctor|rename|scan
 sctx engineering-reference record
 sctx association explain|rebuild
 sctx index rebuild
@@ -1359,13 +1358,13 @@ M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命�
 - `runtime.sqlite`、TaskSession、TaskIntentRevision 及并发线性 Head 已实现。
 - 完整 Space Intent FTS、Task 多路召回、Space 关联推断、解释路径和 Session 隔离已实现。
 - `task_intent_update` 按 external Session Locator 与 Revision CAS 更新 Runtime；只读 `task_context` 仅重取固定 Task Revision 与知识 Projection 上的 TaskContextPack。
-- SessionStart 在模型推理前以本地 Catalog/lease 决定 Direct、显式 Group 或 Disabled；Enabled 才返回固定 bounded marker。PromptSubmit 始终 neutral，不重复 marker、不访问 Runtime 或 Search。
+- SessionStart 在模型推理前以本地 Catalog/lease 推导 Enabled（一个或多个已登记 Repository）或 Disabled；Enabled 才返回固定 bounded marker。PromptSubmit 始终 neutral，不重复 marker、不访问 Runtime 或 Search。
 - Enabled PostToolUse 把 lease 作为 Session-level 准入，只合并 safe non-locating TaskSignals；unsafe 事件保持零 Signal/Report/Git residue。结构化 TestOutcome 可进入 Task fingerprint，但不参与 FTS 或 qualified Test 匹配，也不独立产生工程关联或 Claim Evidence。
 - M2 跨 crate/E2E oracle 已证明严格 Intent 更新、只读 Locator 请求、无 Space 路由、`0/1/N` Space、同 Workspace Session 隔离、PostTool Signal 生命周期，以及 Tree/Generation/fingerprint 一致性。
 - Workspace 位置 observation 保留在 Session 但不参与 FTS 或 Task fingerprint；裸 Repository/File 工程 Signal 已删除。
 - Cursor Prompt 仍为显式 MCP；Symbol/Diff/API/Schema 的代码扫描、解析和关系扩展属于 M3，不冒充 M2 RetrievalPath。
-- 固定 expected `fixtures/m2/repository-scoped-activation-v1.json` 与真实文档化 Codex/Cursor payload 验收 Direct、显式多成员 Group、Disabled、Catalog unavailable、resume/compact、并发重复 SessionStart、Prompt 前 marker 顺序以及完整生命周期残留；expected 不由 production 输出生成。
-- MCP Server authorization 已由 #191 按 current Enabled Session lease 实现；#192 用最小 gate 让完整 workflow 只在可信 marker 后渐进加载；#193 已用固定 Direct/Group/Disabled wire oracle 和 NPM gate 关闭字节 proxy 验收。该合约不物理卸载用户级 MCP 进程/工具 Schema，也不测量真实计费 token。
+- 固定 expected `fixtures/m2/repository-scoped-activation-v1.json` 与真实文档化 Codex/Cursor payload 验收单仓库会话、共同父目录派生的多仓库会话、Disabled、Catalog unavailable、resume/compact、并发重复 SessionStart、Prompt 前 marker 顺序以及完整生命周期残留；expected 不由 production 输出生成。
+- MCP Server authorization 已由 #191 按 current Enabled Session lease 实现；#192 用最小 gate 让完整 workflow 只在可信 marker 后渐进加载；#193 已用固定 Enabled/Disabled wire oracle 和 NPM gate 关闭字节 proxy 验收。该合约不物理卸载用户级 MCP 进程/工具 Schema，也不测量真实计费 token。
 
 ### M3：Engineering Graph — 已实现
 

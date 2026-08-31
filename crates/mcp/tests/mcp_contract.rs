@@ -5,7 +5,6 @@ use std::{
     process::Command,
     sync::{Arc, Barrier},
     thread,
-    time::Duration,
 };
 
 use fs2::FileExt;
@@ -24,10 +23,7 @@ use sctx_domain::{
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
 use sctx_index::ProjectionIndex;
-use sctx_local_state::{
-    ActivationScope, ActivationScopeDecision, AuthorizedSessionScopePolicy,
-    AuthorizedSessionScopeStore, MaintenanceLock, UserConfigStore,
-};
+use sctx_local_state::{AuthorizedSessionScopeStore, MaintenanceLock, UserConfigStore};
 use sctx_mcp::{
     CandidateBuildItemResponseStatus, CandidateBuildResponseStatus, CandidateConfirmInput,
     CandidateConfirmPrimaryInput, CandidateConfirmResponseStatus, CandidateDiscardInput,
@@ -209,54 +205,50 @@ fn typescript_primitive(kind: &str) -> &'static str {
     }
 }
 
+/// Authorizes one Session for every configured Repository.
+///
+/// A single Repository is authorized from inside its own checkout; several are authorized
+/// the way a real multi-Repository Session is — by starting at the directory those
+/// checkouts share, which activation derives without anything being registered for it.
 fn authorize_session(root: &Path, agent_kind: &str, external_session_id: &str) {
     let config = UserConfigStore::open_existing(root).unwrap();
-    let mut catalog = config.repository_catalog_wait().unwrap();
-    let members = catalog
-        .repositories
-        .iter()
-        .map(|repository| repository.repository_id.clone())
-        .collect::<Vec<_>>();
+    let catalog = config.repository_catalog_wait().unwrap();
     let locator = ExternalSessionLocator::new(agent_kind, external_session_id).unwrap();
-    let activation = if catalog.repositories.len() == 1 {
-        let repository = &catalog.repositories[0];
-        ActivationScope {
-            decision: ActivationScopeDecision::Direct {
-                repository_id: repository.repository_id.clone(),
-                checkout_path: repository.checkout_paths[0].clone(),
-            },
-            allowed_repository_ids: members,
-        }
+    let startup_cwd = if catalog.repositories.len() == 1 {
+        catalog.repositories[0].checkout_paths[0].clone()
     } else {
-        let group_root = fs::canonicalize(root).unwrap();
-        let group = match catalog.repository_groups.first() {
-            Some(group) if group.member_repository_ids == members => group.clone(),
-            Some(group) => {
-                config
-                    .update_repository_group(group.repository_group_id, None, Some(&members))
-                    .unwrap()
-                    .repository_group
-            }
-            None => {
-                config
-                    .add_repository_group(&group_root, &members)
-                    .unwrap()
-                    .repository_group
-            }
-        };
-        catalog = config.repository_catalog_wait().unwrap();
-        ActivationScope {
-            decision: ActivationScopeDecision::Group {
-                repository_group_id: group.repository_group_id,
-                root_path: group.root_path,
-            },
-            allowed_repository_ids: members,
-        }
+        common_checkout_parent(&catalog)
     };
     AuthorizedSessionScopeStore::initialize(root)
         .unwrap()
-        .authorize(&locator, &activation, &catalog)
+        .try_authorize_missing(&locator, &catalog, &startup_cwd)
         .unwrap();
+}
+
+/// Deepest directory that contains every configured checkout.
+fn common_checkout_parent(
+    catalog: &sctx_local_state::RepositoryCatalogSnapshot,
+) -> std::path::PathBuf {
+    let mut checkouts = catalog
+        .repositories
+        .iter()
+        .flat_map(|repository| repository.checkout_paths.iter());
+    let mut common = checkouts
+        .next()
+        .expect("at least one configured checkout")
+        .clone();
+    for checkout in checkouts {
+        while !checkout.starts_with(&common) {
+            common = common
+                .parent()
+                .expect("configured checkouts share a directory")
+                .to_path_buf();
+        }
+    }
+    common
+        .parent()
+        .expect("the shared directory is not the filesystem root")
+        .to_path_buf()
 }
 
 fn authorize_direct_session(fixture: &Fixture, agent_kind: &str, external_session_id: &str) {
@@ -267,18 +259,18 @@ fn authorize_direct_session(fixture: &Fixture, agent_kind: &str, external_sessio
     let locator = ExternalSessionLocator::new(agent_kind, external_session_id).unwrap();
     AuthorizedSessionScopeStore::initialize(&fixture.root)
         .unwrap()
-        .authorize(
-            &locator,
-            &ActivationScope {
-                decision: ActivationScopeDecision::Direct {
-                    repository_id: fixture.repository_id.clone(),
-                    checkout_path: fixture.checkout_path.clone(),
-                },
-                allowed_repository_ids: vec![fixture.repository_id.clone()],
-            },
-            &catalog,
-        )
+        .try_authorize_missing(&locator, &catalog, &fixture.checkout_path)
         .unwrap();
+}
+
+/// Exact on-disk path of the single activation lease this Fixture holds.
+fn lease_record_path(root: &Path) -> std::path::PathBuf {
+    let store = AuthorizedSessionScopeStore::initialize(root).unwrap();
+    fs::read_dir(store.directory())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .expect("one activation lease")
 }
 
 fn authorize_disabled_session(fixture: &Fixture, session: &str) {
@@ -288,13 +280,10 @@ fn authorize_disabled_session(fixture: &Fixture, session: &str) {
         .unwrap();
     AuthorizedSessionScopeStore::initialize(&fixture.root)
         .unwrap()
-        .authorize(
+        .try_authorize_missing(
             &ExternalSessionLocator::new("codex", session).unwrap(),
-            &ActivationScope {
-                decision: ActivationScopeDecision::Disabled,
-                allowed_repository_ids: Vec::new(),
-            },
             &catalog,
+            &fixture.root.join("unregistered startup directory"),
         )
         .unwrap();
 }
@@ -4637,54 +4626,65 @@ fn authorization_states_cross_agent_and_busy_or_unsafe_storage_fail_identically(
     );
     assert_eq!(business_residue(&disabled.root), before);
 
-    let expired = Fixture::new();
-    let catalog = UserConfigStore::open_existing(&expired.root)
-        .unwrap()
-        .repository_catalog_wait()
-        .unwrap();
-    let policy = AuthorizedSessionScopePolicy {
-        ttl: Duration::from_secs(1),
-        ..AuthorizedSessionScopePolicy::default()
-    };
-    AuthorizedSessionScopeStore::with_policy(&expired.root, policy)
-        .unwrap()
-        .authorize(
-            &ExternalSessionLocator::new("codex", "expired").unwrap(),
-            &ActivationScope {
-                decision: ActivationScopeDecision::Direct {
-                    repository_id: expired.repository_id.clone(),
-                    checkout_path: expired.checkout_path.clone(),
-                },
-                allowed_repository_ids: vec![expired.repository_id.clone()],
-            },
-            &catalog,
-        )
-        .unwrap();
-    thread::sleep(Duration::from_millis(1_100));
-    assert_eq!(
-        authorization_error(&expired, "codex", "expired", ClientKind::Codex),
-        expected
-    );
-
-    let stale = Fixture::new();
-    authorize_direct_session(&stale, "codex", "stale");
-    let added = stale.root.join("stale catalog repository");
-    fs::create_dir_all(&added).unwrap();
+    // A lease never expires, and an unrelated Catalog edit no longer silently
+    // demotes a live Session; only losing the registration under the Session's own
+    // startup directory does.
+    let aged = Fixture::new();
+    authorize_direct_session(&aged, "codex", "aged");
+    let aged_record = lease_record_path(&aged.root);
+    let mut aged_lease: Value = serde_json::from_slice(&fs::read(&aged_record).unwrap()).unwrap();
+    aged_lease["issued_at_unix_seconds"] = json!(1_000);
+    fs::write(
+        &aged_record,
+        serde_json::to_vec_pretty(&aged_lease).unwrap(),
+    )
+    .unwrap();
+    let unrelated = aged.root.join("unrelated catalog repository");
+    fs::create_dir_all(&unrelated).unwrap();
     assert!(
         Command::new("git")
             .args(["init", "-q", "-b", "main"])
-            .arg(&added)
+            .arg(&unrelated)
             .status()
             .unwrap()
             .success()
     );
-    let added = fs::canonicalize(added).unwrap();
-    UserConfigStore::open_existing(&stale.root)
+    let unrelated = fs::canonicalize(unrelated).unwrap();
+    UserConfigStore::open_existing(&aged.root)
         .unwrap()
-        .add_repository(sctx_domain::RepositoryId::new(), &[added])
+        .add_repository(sctx_domain::RepositoryId::new(), &[unrelated])
         .unwrap();
+    let aged_call = call_public_tool(
+        &aged,
+        "task_context",
+        json!({"agent_kind": "codex", "external_session_id": "aged"}),
+    );
+    assert_ne!(
+        aged_call["result"]["structuredContent"]["error"]["code"],
+        json!("session_not_authorized"),
+        "an aged lease under an unchanged registration still authorizes: {aged_call:#?}"
+    );
+
+    // A Session authorized from the directory above its checkout loses that authorization
+    // as soon as the checkout stops being registered.
+    let deregistered = Fixture::new();
+    let config = UserConfigStore::open_existing(&deregistered.root).unwrap();
+    let parent = fs::canonicalize(&deregistered.root).unwrap();
+    AuthorizedSessionScopeStore::initialize(&deregistered.root)
+        .unwrap()
+        .try_authorize_missing(
+            &ExternalSessionLocator::new("codex", "deregistered").unwrap(),
+            &config.repository_catalog_wait().unwrap(),
+            &parent,
+        )
+        .unwrap();
+    fs::write(
+        deregistered.root.join("config.toml"),
+        UserConfigStore::empty_document(&deregistered.root).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
-        authorization_error(&stale, "codex", "stale", ClientKind::Codex),
+        authorization_error(&deregistered, "codex", "deregistered", ClientKind::Codex),
         expected
     );
 
@@ -4801,9 +4801,10 @@ fn authorization_snapshot_linearizes_before_catalog_mutation_without_toctou_expa
             release.wait();
         })
     });
+    let intent_revision_id = task.context.intent_revision_id;
     let arguments = json!({
         "agent_kind": "codex", "external_session_id": session,
-        "expected_revision_id": task.context.intent_revision_id,
+        "expected_revision_id": intent_revision_id,
         "absolute_file_path": nested.join("src/lib.rs"),
         "locator": {"locator_kind": "file"}
     });
@@ -4818,13 +4819,15 @@ fn authorization_snapshot_linearizes_before_catalog_mutation_without_toctou_expa
         )
     });
     reached.wait();
-    UserConfigStore::open_existing(&fixture.root)
+    let nested_repository_id = UserConfigStore::open_existing(&fixture.root)
         .unwrap()
         .add_repository(
             sctx_domain::RepositoryId::new(),
             std::slice::from_ref(&nested),
         )
-        .unwrap();
+        .unwrap()
+        .repository
+        .repository_id;
     release.wait();
     let responses = worker.join().unwrap();
     assert_eq!(responses[1]["result"]["isError"], false, "{responses:#?}");
@@ -4833,10 +4836,24 @@ fn authorization_snapshot_linearizes_before_catalog_mutation_without_toctou_expa
         fixture.repository_id.to_string(),
         "the in-flight call must resolve the nested path under Catalog R1, not the newer R2 owner"
     );
+    // The lease is permanently bound to this Session and its startup directory is
+    // still registered, so the next independently linearized call stays authorized
+    // and simply sees the newer Catalog.
+    let after = call_public_tool(
+        &fixture,
+        "task_artifact_focus",
+        json!({
+            "agent_kind": "codex", "external_session_id": session,
+            "expected_revision_id": intent_revision_id,
+            "absolute_file_path": nested.join("src/lib.rs"),
+            "locator": {"locator_kind": "file"}
+        }),
+    );
+    assert_eq!(after["result"]["isError"], false, "{after:#?}");
     assert_eq!(
-        authorization_error(&fixture, "codex", session, ClientKind::Codex),
-        expected_authorization_error(),
-        "the stale lease must fail on the next independently linearized call"
+        after["result"]["structuredContent"]["resolved_focus"]["repository_id"],
+        nested_repository_id.to_string(),
+        "the next call must resolve the nested path under the newer Catalog owner"
     );
 }
 
@@ -5217,27 +5234,15 @@ fn enabled_direct_and_group_sessions_can_investigate_other_registered_repositori
             .unwrap()
             .success()
     );
+    // A Session started at the directory that holds every checkout records for all of them.
     let config = UserConfigStore::open_existing(&fixture.root).unwrap();
-    let group = config
-        .add_repository_group(
-            &fs::canonicalize(&fixture.root).unwrap(),
-            std::slice::from_ref(&fixture.repository_id),
-        )
-        .unwrap()
-        .repository_group;
     let catalog = config.repository_catalog_wait().unwrap();
     AuthorizedSessionScopeStore::initialize(&fixture.root)
         .unwrap()
-        .authorize(
+        .try_authorize_missing(
             &ExternalSessionLocator::new("codex", "engineering-group").unwrap(),
-            &ActivationScope {
-                decision: ActivationScopeDecision::Group {
-                    repository_group_id: group.repository_group_id,
-                    root_path: group.root_path,
-                },
-                allowed_repository_ids: vec![fixture.repository_id.clone()],
-            },
             &catalog,
+            &fs::canonicalize(&fixture.root).unwrap(),
         )
         .unwrap();
     let third_scan = call_public_tool(
@@ -5257,7 +5262,7 @@ fn enabled_direct_and_group_sessions_can_investigate_other_registered_repositori
             "context_id": fixture.context_id, "revision_id": fixture.revision_id,
             "repository_id": third_repository_id, "artifact_kind": "file",
             "relation": "implements", "locator": {"locator_kind": "file", "path": "src/lib.rs"},
-            "supports": "Group Session investigated a registered nonmember",
+            "supports": "A parent-directory Session investigated a second Repository",
             "limitations": ["fixture"]
         }),
     );

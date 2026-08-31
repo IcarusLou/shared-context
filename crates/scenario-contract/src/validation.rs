@@ -1576,13 +1576,14 @@ mod tests {
             .next()
             .expect("domain ID declarations precede tests");
         assert_eq!(
-            declarations.match_indices("opaque_id!(").count() + 2,
+            declarations.match_indices("opaque_id!(").count() + 3,
             DOMAIN_ID_PREFIXES.len(),
-            "the scenario denylist must cover current IDs plus legacy Repository UUIDs"
+            "the scenario denylist must cover current IDs plus the legacy rpo_/rpg_ \
+             Repository and RepositoryGroup prefixes retained for historical redaction"
         );
         assert_eq!(DOMAIN_ID_PREFIXES.len(), 28);
         for prefix in DOMAIN_ID_PREFIXES {
-            if prefix != "rpo_" {
+            if prefix != "rpo_" && prefix != "rpg_" {
                 assert!(
                     declarations.contains(&format!("\"{prefix}\"")),
                     "missing current domain ID prefix {prefix}"

@@ -14,8 +14,8 @@ use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
 use sctx_domain::{ExternalSessionLocator, RepositoryId};
 use sctx_git_store::GitStore;
 use sctx_local_state::{
-    AuthorizedSessionScopeDecision, AuthorizedSessionScopePolicy, AuthorizedSessionScopeRead,
-    AuthorizedSessionScopeStore, MaintenanceLock, UserConfigStore,
+    AuthorizedSessionScopeDecision, AuthorizedSessionScopeRead, AuthorizedSessionScopeStore,
+    MaintenanceLock, UserConfigStore,
 };
 use sctx_task_runtime::TaskRuntime;
 use serde_json::{Value, json};
@@ -46,7 +46,9 @@ fn assert_activated(output: &Output, agent: AgentKind, session: &str) {
 struct Fixture {
     _temporary: TempDir,
     home: PathBuf,
-    group_root: PathBuf,
+    /// The directory both registered checkouts live under. Nobody registered it: a
+    /// Session that starts here derives both Repositories.
+    common_parent: PathBuf,
     direct_repository: PathBuf,
     second_repository: PathBuf,
     outside: PathBuf,
@@ -58,9 +60,9 @@ impl Fixture {
     fn new() -> Self {
         let temporary = tempdir().unwrap();
         let home = temporary.path().join("activation home");
-        let group_root = temporary.path().join("android fels");
-        let direct_repository = group_root.join("direct app");
-        let second_repository = group_root.join("second app");
+        let common_parent = temporary.path().join("android fels");
+        let direct_repository = common_parent.join("direct app");
+        let second_repository = common_parent.join("second app");
         let outside = temporary.path().join("unregistered work");
         for path in [&home, &direct_repository, &second_repository, &outside] {
             fs::create_dir_all(path).unwrap();
@@ -75,7 +77,7 @@ impl Fixture {
                     .success()
             );
         }
-        let group_root = fs::canonicalize(group_root).unwrap();
+        let common_parent = fs::canonicalize(common_parent).unwrap();
         let direct_repository = fs::canonicalize(direct_repository).unwrap();
         let second_repository = fs::canonicalize(second_repository).unwrap();
         let outside = fs::canonicalize(outside).unwrap();
@@ -98,16 +100,10 @@ impl Fixture {
             .unwrap()
             .repository
             .repository_id;
-        config
-            .add_repository_group(
-                &group_root,
-                &[direct_repository_id.clone(), second_repository_id.clone()],
-            )
-            .unwrap();
         Self {
             _temporary: temporary,
             home,
-            group_root,
+            common_parent,
             direct_repository,
             second_repository,
             outside,
@@ -125,18 +121,36 @@ impl Fixture {
     }
 
     fn read_scope(&self, agent: &str, session: &str) -> AuthorizedSessionScopeRead {
-        let catalog = UserConfigStore::open_existing(self.root())
-            .unwrap()
-            .repository_catalog()
-            .unwrap();
         AuthorizedSessionScopeStore::initialize(self.root())
             .unwrap()
-            .read(
-                &ExternalSessionLocator::new(agent, session).unwrap(),
-                &catalog,
-            )
+            .read(&ExternalSessionLocator::new(agent, session).unwrap())
             .unwrap()
     }
+}
+
+/// Exact on-disk lease path for one locator, found by removing and re-creating nothing:
+/// the `SessionStart` that produced it is the only writer, so the newest entry is unique.
+fn lease_record_path(root: &Path, agent: &str, session: &str) -> PathBuf {
+    let store = AuthorizedSessionScopeStore::initialize(root).unwrap();
+    let locator = ExternalSessionLocator::new(agent, session).unwrap();
+    let expected = match store.read(&locator).unwrap() {
+        AuthorizedSessionScopeRead::Current(scope) => scope,
+        AuthorizedSessionScopeRead::Missing => panic!("expected a lease for {agent}/{session}"),
+    };
+    fs::read_dir(store.directory())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .is_some_and(|value| {
+                    value["external_session_locator"]["external_session_id"] == session
+                        && value["external_session_locator"]["agent_kind"] == agent
+                })
+        })
+        .filter(|_| expected.external_session_locator == locator)
+        .expect("one lease entry")
 }
 
 fn run_hook(home: &Path, agent: &str, payload: &Value) -> Output {
@@ -338,16 +352,20 @@ fn real_codex_and_cursor_session_start_wire_outputs_follow_durable_scope() {
     assert!(matches!(
         fixture.read_scope("codex", "codex-direct"),
         AuthorizedSessionScopeRead::Current(scope)
-            if scope.decision == AuthorizedSessionScopeDecision::Direct {
-                repository_id: fixture.direct_repository_id.clone()
-            }
+            if scope.decision.repository_ids()
+                == std::slice::from_ref(&fixture.direct_repository_id)
     ));
 
-    let group = fixture.hook("cursor", &cursor_start("cursor-group", &fixture.group_root));
-    assert!(group.status.success());
+    // Starting at the directory both checkouts share activates the Session for both,
+    // with the same marker and no Group registered anywhere.
+    let parent = fixture.hook(
+        "cursor",
+        &cursor_start("cursor-parent", &fixture.common_parent),
+    );
+    assert!(parent.status.success());
     assert_eq!(
-        serde_json::from_slice::<Value>(&group.stdout).unwrap(),
-        json!({"additional_context": cursor_marker("cursor-group")})
+        serde_json::from_slice::<Value>(&parent.stdout).unwrap(),
+        json!({"additional_context": cursor_marker("cursor-parent")})
     );
     let mut expected_members = vec![
         fixture.direct_repository_id.clone(),
@@ -355,10 +373,9 @@ fn real_codex_and_cursor_session_start_wire_outputs_follow_durable_scope() {
     ];
     expected_members.sort();
     assert!(matches!(
-        fixture.read_scope("cursor", "cursor-group"),
-        AuthorizedSessionScopeRead::Current(scope)
-            if matches!(scope.decision, AuthorizedSessionScopeDecision::Group { .. })
-                && scope.allowed_repository_ids == expected_members
+        fixture.read_scope("cursor", "cursor-parent"),
+        AuthorizedSessionScopeRead::Current(ref scope)
+            if scope.decision.repository_ids() == expected_members
     ));
 
     let disabled = fixture.hook(
@@ -407,7 +424,7 @@ fn enabled_tool_work_gets_one_intent_bootstrap_reminder_without_prompt_or_task_c
             fixture.read_scope(agent, session),
             AuthorizedSessionScopeRead::Current(scope)
                 if !scope.intent_bootstrap_notified
-                    && matches!(scope.decision, AuthorizedSessionScopeDecision::Direct { .. })
+                    && scope.decision.is_enabled()
         ));
     }
 
@@ -449,7 +466,7 @@ fn enabled_tool_work_gets_one_intent_bootstrap_reminder_without_prompt_or_task_c
             fixture.read_scope(agent, session),
             AuthorizedSessionScopeRead::Current(scope)
                 if scope.intent_bootstrap_notified
-                    && matches!(scope.decision, AuthorizedSessionScopeDecision::Direct { .. })
+                    && scope.decision.is_enabled()
         ));
         assert!(
             TaskRuntime::initialize(fixture.root())
@@ -575,7 +592,7 @@ fn repeated_session_start_keeps_the_first_disabled_direct_or_group_decision() {
     for (cwd, source) in [
         (&fixture.second_repository, "startup"),
         (&fixture.outside, "resume"),
-        (&fixture.group_root, "compact"),
+        (&fixture.common_parent, "compact"),
     ] {
         let repeated = fixture.hook("codex", &codex_start("sticky-direct", cwd, source));
         assert_activated(&repeated, AgentKind::Codex, "sticky-direct");
@@ -583,87 +600,52 @@ fn repeated_session_start_keeps_the_first_disabled_direct_or_group_decision() {
     assert!(matches!(
         fixture.read_scope("codex", "sticky-direct"),
         AuthorizedSessionScopeRead::Current(scope)
-            if scope.decision == AuthorizedSessionScopeDecision::Direct {
-                repository_id: fixture.direct_repository_id.clone()
-            }
-                && scope.allowed_repository_ids == [fixture.direct_repository_id.clone()]
+            if scope.decision.repository_ids()
+                == std::slice::from_ref(&fixture.direct_repository_id)
     ));
 
-    let group = fixture.hook("cursor", &cursor_start("sticky-group", &fixture.group_root));
-    assert_activated(&group, AgentKind::Cursor, "sticky-group");
+    let parent = fixture.hook(
+        "cursor",
+        &cursor_start("sticky-parent", &fixture.common_parent),
+    );
+    assert_activated(&parent, AgentKind::Cursor, "sticky-parent");
     let repeated = fixture.hook(
         "cursor",
-        &cursor_start("sticky-group", &fixture.direct_repository),
+        &cursor_start("sticky-parent", &fixture.direct_repository),
     );
-    assert_activated(&repeated, AgentKind::Cursor, "sticky-group");
+    assert_activated(&repeated, AgentKind::Cursor, "sticky-parent");
     assert!(matches!(
-        fixture.read_scope("cursor", "sticky-group"),
-        AuthorizedSessionScopeRead::Current(scope)
-            if matches!(scope.decision, AuthorizedSessionScopeDecision::Group { .. })
+        fixture.read_scope("cursor", "sticky-parent"),
+        AuthorizedSessionScopeRead::Current(scope) if scope.decision.repository_ids().len() == 2
     ));
 }
 
 #[test]
-fn non_session_start_missing_expired_stale_and_disabled_leases_are_neutral() {
+fn a_permanent_lease_survives_age_and_unrelated_catalog_edits() {
     let fixture = Fixture::new();
     assert_neutral(&fixture.hook(
         "codex",
         &codex_prompt("missing", &fixture.direct_repository),
     ));
 
-    let catalog = UserConfigStore::open_existing(fixture.root())
-        .unwrap()
-        .repository_catalog()
-        .unwrap();
-    let scope = catalog
-        .resolve_activation_scope(&fixture.direct_repository)
-        .unwrap();
-    let expiring = AuthorizedSessionScopeStore::with_policy(
-        fixture.root(),
-        AuthorizedSessionScopePolicy {
-            ttl: Duration::from_secs(1),
-            ..AuthorizedSessionScopePolicy::default()
-        },
-    )
-    .unwrap();
-    let expired_locator = ExternalSessionLocator::new("codex", "expired").unwrap();
-    expiring
-        .authorize(&expired_locator, &scope, &catalog)
-        .unwrap();
-    thread::sleep(Duration::from_millis(1_100));
-    let unrelated = fixture.hook(
+    // A lease issued long ago still authorizes: there is no TTL to run out mid-review.
+    let aged = fixture.hook(
         "codex",
-        &codex_start(
-            "unrelated-after-expiry",
-            &fixture.direct_repository,
-            "startup",
-        ),
+        &codex_start("aged", &fixture.direct_repository, "startup"),
     );
-    assert_activated(&unrelated, AgentKind::Codex, "unrelated-after-expiry");
-    assert_neutral(&fixture.hook(
-        "codex",
-        &codex_start("expired", &fixture.second_repository, "resume"),
-    ));
-    assert_neutral(&fixture.hook(
-        "codex",
-        &codex_start("expired", &fixture.group_root, "compact"),
-    ));
-    assert_eq!(
-        expiring.try_read(&expired_locator, &catalog).unwrap(),
-        AuthorizedSessionScopeRead::Expired
-    );
-    assert!(expiring.expire(&expired_locator).unwrap());
-    assert_eq!(
-        expiring.try_read(&expired_locator, &catalog).unwrap(),
-        AuthorizedSessionScopeRead::Missing
+    assert_activated(&aged, AgentKind::Codex, "aged");
+    let record = lease_record_path(&fixture.root(), "codex", "aged");
+    let mut lease: Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    lease["issued_at_unix_seconds"] = json!(1_000);
+    fs::write(&record, serde_json::to_vec_pretty(&lease).unwrap()).unwrap();
+    assert_activated(
+        &fixture.hook("codex", &codex_start("aged", &fixture.outside, "resume")),
+        AgentKind::Codex,
+        "aged",
     );
 
-    let stale_start = fixture.hook(
-        "codex",
-        &codex_start("stale", &fixture.direct_repository, "startup"),
-    );
-    assert_activated(&stale_start, AgentKind::Codex, "stale");
-    let third_repository = fixture.group_root.join("third app");
+    // An unrelated registration no longer silently demotes a running Session.
+    let third_repository = fixture.common_parent.join("third app");
     fs::create_dir_all(&third_repository).unwrap();
     assert!(
         Command::new("git")
@@ -680,18 +662,55 @@ fn non_session_start_missing_expired_stale_and_disabled_leases_are_neutral() {
             std::slice::from_ref(&fs::canonicalize(third_repository).unwrap()),
         )
         .unwrap();
-    assert_neutral(&fixture.hook(
-        "codex",
-        &codex_start("stale", &fixture.second_repository, "resume"),
-    ));
-    assert_neutral(&fixture.hook(
-        "codex",
-        &codex_start("stale", &fixture.group_root, "compact"),
-    ));
+    assert_activated(
+        &fixture.hook(
+            "codex",
+            &codex_start("aged", &fixture.common_parent, "compact"),
+        ),
+        AgentKind::Codex,
+        "aged",
+    );
     assert!(matches!(
-        fixture.read_scope("codex", "stale"),
-        AuthorizedSessionScopeRead::StaleCatalog
+        fixture.read_scope("codex", "aged"),
+        AuthorizedSessionScopeRead::Current(ref scope)
+            if scope.decision.repository_ids()
+                == std::slice::from_ref(&fixture.direct_repository_id)
+                && scope.issued_at_unix_seconds == 1_000
     ));
+
+    // A superseded-schema lease reads as Missing, so only SessionStart revives it.
+    fs::write(
+        &record,
+        json!({
+            "version": "v1",
+            "external_session_locator": {
+                "agent_kind": "codex", "external_session_id": "aged"
+            },
+            "decision": {
+                "kind": "direct",
+                "repository_id": fixture.direct_repository_id.to_string()
+            },
+            "allowed_repository_ids": [fixture.direct_repository_id.to_string()],
+            "catalog_revision": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "issued_at_unix_seconds": 1_000,
+            "expires_at_unix_seconds": 8_200,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        fixture.read_scope("codex", "aged"),
+        AuthorizedSessionScopeRead::Missing
+    );
+    assert_neutral(&fixture.hook("codex", &codex_prompt("aged", &fixture.direct_repository)));
+    assert_activated(
+        &fixture.hook(
+            "codex",
+            &codex_start("aged", &fixture.direct_repository, "resume"),
+        ),
+        AgentKind::Codex,
+        "aged",
+    );
 
     assert_neutral(&fixture.hook(
         "codex",
@@ -735,7 +754,7 @@ fn catalog_busy_corrupt_and_drift_errors_are_neutral_and_agent_successful() {
     assert_no_runtime_or_capture(&corrupt.root());
 
     let drift = Fixture::new();
-    let moved = drift.group_root.join("moved direct app");
+    let moved = drift.common_parent.join("moved direct app");
     fs::rename(&drift.direct_repository, &moved).unwrap();
     assert_neutral(&drift.hook(
         "codex",
@@ -783,10 +802,31 @@ fn busy_corrupt_and_symlink_lease_state_never_emit_activation() {
     );
     assert_activated(&output, AgentKind::Codex, "lease-corrupt");
     let record = scope_records(&corrupt.root()).pop().unwrap();
-    fs::write(record, "RAW_SCOPE_PARSE_ERROR").unwrap();
+    fs::write(&record, "RAW_SCOPE_PARSE_ERROR").unwrap();
+    // A record that cannot be interpreted never authorizes; outside SessionStart the
+    // Session simply degrades to neutral.
     assert_neutral(&corrupt.hook(
         "codex",
-        &codex_start("lease-corrupt", &corrupt.direct_repository, "resume"),
+        &codex_prompt("lease-corrupt", &corrupt.direct_repository),
+    ));
+    assert_eq!(
+        corrupt.read_scope("codex", "lease-corrupt"),
+        AuthorizedSessionScopeRead::Missing
+    );
+    // Only an explicit SessionStart boundary may overwrite it in place.
+    assert_activated(
+        &corrupt.hook(
+            "codex",
+            &codex_start("lease-corrupt", &corrupt.direct_repository, "resume"),
+        ),
+        AgentKind::Codex,
+        "lease-corrupt",
+    );
+    assert_eq!(scope_records(&corrupt.root()).len(), 1);
+    assert!(matches!(
+        corrupt.read_scope("codex", "lease-corrupt"),
+        AuthorizedSessionScopeRead::Current(scope)
+            if scope.decision.is_enabled()
     ));
     assert_no_runtime_or_capture(&corrupt.root());
 
@@ -843,7 +883,9 @@ fn concurrent_and_repeated_session_start_reuses_one_locator_record() {
     assert_eq!(scope_records(&fixture.root()).len(), 1);
     let first = match fixture.read_scope("codex", "same-session") {
         AuthorizedSessionScopeRead::Current(scope) => scope,
-        other => panic!("expected current scope, got {other:?}"),
+        other @ AuthorizedSessionScopeRead::Missing => {
+            panic!("expected current scope, got {other:?}")
+        }
     };
     let repeated = fixture.hook(
         "codex",
@@ -852,7 +894,9 @@ fn concurrent_and_repeated_session_start_reuses_one_locator_record() {
     assert_activated(&repeated, AgentKind::Codex, "same-session");
     let retained = match fixture.read_scope("codex", "same-session") {
         AuthorizedSessionScopeRead::Current(scope) => scope,
-        other => panic!("expected refreshed scope, got {other:?}"),
+        other @ AuthorizedSessionScopeRead::Missing => {
+            panic!("expected refreshed scope, got {other:?}")
+        }
     };
     assert_eq!(retained, first);
     assert_eq!(scope_records(&fixture.root()).len(), 1);
@@ -873,7 +917,7 @@ fn locator_decisions_are_isolated_and_production_has_no_unscoped_planner() {
     assert!(matches!(
         fixture.read_scope("codex", "locator-a"),
         AuthorizedSessionScopeRead::Current(scope)
-            if matches!(scope.decision, AuthorizedSessionScopeDecision::Direct { .. })
+            if scope.decision.is_enabled()
     ));
     assert!(matches!(
         fixture.read_scope("codex", "locator-b"),
@@ -919,7 +963,7 @@ fn any_cursor_or_codex_host_version_string_activates_a_direct_session() {
         assert!(matches!(
             fixture.read_scope("cursor", &session),
             AuthorizedSessionScopeRead::Current(scope)
-                if matches!(scope.decision, AuthorizedSessionScopeDecision::Direct { .. })
+                if scope.decision.is_enabled()
         ));
     }
 

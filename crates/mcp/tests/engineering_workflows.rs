@@ -16,9 +16,7 @@ use sctx_domain::{
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
-use sctx_local_state::{
-    ActivationScope, ActivationScopeDecision, AuthorizedSessionScopeStore, UserConfigStore,
-};
+use sctx_local_state::{AuthorizedSessionScopeStore, UserConfigStore};
 use sctx_mcp::{
     ArtifactFocusQuery, ArtifactFocusQueryCoordinates, AssociationExplainInput,
     AssociationRebuildInput, ClientKind, DisconnectReason, EngineeringReferenceRecordInput,
@@ -95,24 +93,33 @@ fn task_update_arguments(session: &str) -> Value {
     })
 }
 
+/// Authorizes one Session started at the directory every configured checkout lives under,
+/// which is how a multi-Repository Session is derived now that Groups are gone.
 fn authorize_group_session(root: &Path, session: &str) {
     let catalog = UserConfigStore::open_existing(root)
         .unwrap()
         .repository_catalog_wait()
         .unwrap();
-    let group = catalog.repository_groups.first().unwrap();
+    let mut checkouts = catalog
+        .repositories
+        .iter()
+        .flat_map(|repository| repository.checkout_paths.iter());
+    let mut parent = checkouts.next().expect("one configured checkout").clone();
+    for checkout in checkouts {
+        while !checkout.starts_with(&parent) {
+            parent = parent.parent().expect("a shared directory").to_path_buf();
+        }
+    }
+    let parent = parent
+        .parent()
+        .expect("not the filesystem root")
+        .to_path_buf();
     AuthorizedSessionScopeStore::initialize(root)
         .unwrap()
-        .authorize(
+        .try_authorize_missing(
             &ExternalSessionLocator::new("codex", session).unwrap(),
-            &ActivationScope {
-                decision: ActivationScopeDecision::Group {
-                    repository_group_id: group.repository_group_id,
-                    root_path: group.root_path.clone(),
-                },
-                allowed_repository_ids: group.member_repository_ids.clone(),
-            },
             &catalog,
+            &parent,
         )
         .unwrap();
 }
@@ -335,17 +342,7 @@ fn checkpoint_ack_derives_nothing_and_candidate_build_places_the_spellings_once(
         .unwrap();
     AuthorizedSessionScopeStore::initialize(&root)
         .unwrap()
-        .authorize(
-            &locator,
-            &ActivationScope {
-                decision: ActivationScopeDecision::Direct {
-                    repository_id: repository.repository_id.clone(),
-                    checkout_path: checkout,
-                },
-                allowed_repository_ids: vec![repository.repository_id.clone()],
-            },
-            &catalog,
-        )
+        .try_authorize_missing(&locator, &catalog, &checkout)
         .unwrap();
     task_intent_update_at_root(
         &root,
@@ -432,6 +429,134 @@ fn checkpoint_ack_derives_nothing_and_candidate_build_places_the_spellings_once(
     );
 }
 
+/// A Session started at the common parent of two checkouts derives references for both, and
+/// picks the checkout by where the spelling actually is (WP-N2).
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_common_parent_session_places_each_spelling_in_the_checkout_that_tracks_it() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("parent derivation root");
+    let parent = temporary.path().join("parent workspace");
+    let android = parent.join("android");
+    let ios = parent.join("ios");
+    init_repo(
+        &android,
+        &[
+            ("app/src/anchor/ProductAnchorAssem.kt", "// fixture\n"),
+            ("app/src/shared/Ambiguous.kt", "// fixture\n"),
+        ],
+    );
+    init_repo(
+        &ios,
+        &[
+            ("Sources/Anchor/ProductAnchorView.swift", "// fixture\n"),
+            ("Sources/Shared/Ambiguous.kt", "// fixture\n"),
+        ],
+    );
+    let parent = fs::canonicalize(&parent).unwrap();
+    let android = fs::canonicalize(&android).unwrap();
+    let ios = fs::canonicalize(&ios).unwrap();
+    GitStore::bootstrap_local(&root).unwrap();
+    let config = UserConfigStore::initialize(&root).unwrap();
+    let android_id = config
+        .add_repository("Android".parse().unwrap(), std::slice::from_ref(&android))
+        .unwrap()
+        .repository
+        .repository_id;
+    let ios_id = config
+        .add_repository("iOS".parse().unwrap(), std::slice::from_ref(&ios))
+        .unwrap()
+        .repository
+        .repository_id;
+
+    let session = "parent-derivation";
+    let locator = ExternalSessionLocator::new("codex", session).unwrap();
+    let catalog = config.repository_catalog_wait().unwrap();
+    let scope = AuthorizedSessionScopeStore::initialize(&root)
+        .unwrap()
+        .try_authorize_missing(&locator, &catalog, &parent)
+        .unwrap()
+        .scope;
+    assert_eq!(
+        scope.decision.repository_ids().len(),
+        2,
+        "starting at the common parent records for both Repositories"
+    );
+
+    task_intent_update_at_root(
+        &root,
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            task_boundary: TaskBoundary::New,
+            expected_revision_id: ExpectedRevisionId::Null(()),
+            intent: WorkingIntentSnapshot::new("compare the anchor across both platforms").unwrap(),
+        },
+    )
+    .unwrap();
+    let accepted = sctx_mcp::task_checkpoint_at_root(
+        &root,
+        &sctx_mcp::TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            claims: vec![sctx_mcp::TaskCheckpointClaimInput {
+                context_kind: ContextKind::Issue,
+                statement: "ProductAnchorAssem.kt:202 and ProductAnchorView.swift:88 both return \
+                            early, and Ambiguous.kt hides it"
+                    .to_owned(),
+                rationale: "Both platforms skip navigation on the same condition".to_owned(),
+                conditions: vec!["live entry service is absent".to_owned()],
+                evidence: vec![sctx_mcp::TaskCheckpointEvidenceInput {
+                    evidence_type: EvidenceType::SourceSnapshot,
+                    summary: "ProductAnchorAssem.kt:202 returns before dispatch".to_owned(),
+                    limitations: Vec::new(),
+                }],
+            }],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap()
+    .into_accepted()
+    .expect("a nonempty Checkpoint is accepted");
+
+    sctx_mcp::build_closed_episode_at_root(&root, accepted.episode_id).unwrap();
+    let runtime = TaskRuntime::initialize(&root).unwrap();
+    let derived = runtime
+        .read_work_episode(accepted.episode_id)
+        .unwrap()
+        .unwrap();
+    let references = &derived.checkpoints[0].claims[0].engineering_references;
+    let placed = references
+        .iter()
+        .map(|reference| {
+            (
+                reference.repository_id.clone(),
+                reference.locator.path().as_str().to_owned(),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        placed,
+        std::collections::BTreeSet::from([
+            (
+                android_id.clone(),
+                "app/src/anchor/ProductAnchorAssem.kt".to_owned()
+            ),
+            (
+                ios_id.clone(),
+                "Sources/Anchor/ProductAnchorView.swift".to_owned()
+            ),
+        ]),
+        "each spelling is placed in the one checkout that tracks it: {references:#?}"
+    );
+    assert!(
+        !placed
+            .iter()
+            .any(|(_, path)| path.ends_with("Ambiguous.kt")),
+        "a basename both checkouts track stays an unresolved hint"
+    );
+}
+
 #[test]
 fn public_artifact_focus_uses_strict_text_only_while_graph_is_unavailable() {
     let temporary = tempfile::tempdir().unwrap();
@@ -461,10 +586,10 @@ fn public_artifact_focus_uses_strict_text_only_while_graph_is_unavailable() {
     let catalog = config.repository_catalog().unwrap();
     AuthorizedSessionScopeStore::initialize(&root)
         .unwrap()
-        .authorize(
+        .try_authorize_missing(
             &ExternalSessionLocator::new("codex", session).unwrap(),
-            &catalog.resolve_activation_scope(&checkout).unwrap(),
             &catalog,
+            &checkout,
         )
         .unwrap();
     let task = task_intent_update_at_root(
@@ -816,12 +941,6 @@ fn public_mcp_artifact_focus_is_query_scoped_across_six_kinds_and_hot_path() {
             .repository
             .repository_id
     });
-    let members = std::iter::once(main_id.clone())
-        .chain(cross_ids.iter().cloned())
-        .collect::<Vec<_>>();
-    config
-        .add_repository_group(&fs::canonicalize(temporary.path()).unwrap(), &members)
-        .unwrap();
     let main_scan = repository_scan_at_root(
         &root,
         &scan_input(

@@ -230,11 +230,6 @@ impl<'de> Deserialize<'de> for RepositoryId {
 }
 
 opaque_id!(
-    RepositoryGroupId,
-    "rpg_",
-    "Opaque identity of one explicitly configured local repository group."
-);
-opaque_id!(
     ReferenceId,
     "ref_",
     "Opaque identity of one persistent Engineering Reference observation."
@@ -436,9 +431,9 @@ mod tests {
     use super::{
         AgentCheckpointId, CandidateBuildId, CandidateId, CheckpointClaimId, ConfirmationId,
         ConflictId, ContextId, EventId, EvidenceId, ExternalSessionId, ProposedSpaceGroupKey,
-        PublicationId, ReferenceId, RepositoryGroupId, RepositoryId, ResolutionId, ReviewId,
-        RevisionId, SignalId, SpaceAssociationId, SpaceId, SpaceRecommendationId, SubmissionId,
-        TaskId, TaskIntentRevisionId, TaskSessionId, WorkEpisodeId, WorkObservationId,
+        PublicationId, ReferenceId, RepositoryId, ResolutionId, ReviewId, RevisionId, SignalId,
+        SpaceAssociationId, SpaceId, SpaceRecommendationId, SubmissionId, TaskId,
+        TaskIntentRevisionId, TaskSessionId, WorkEpisodeId, WorkObservationId,
     };
 
     #[test]
@@ -462,9 +457,9 @@ mod tests {
         assert!(SpaceId::from_str("spc_00000000-0000-1000-8000-000000000000").is_err());
         assert!(SpaceId::from_str("spc_00000000000040008000000000000000").is_err());
 
-        let repository_group = RepositoryGroupId::new().to_string();
-        assert!(RepositoryGroupId::from_str(&repository_group).is_ok());
-        assert!(RepositoryGroupId::from_str(&repository_group.replace("rpg_", "rpo_")).is_err());
+        let reference = ReferenceId::new().to_string();
+        assert!(ReferenceId::from_str(&reference).is_ok());
+        assert!(ReferenceId::from_str(&reference.replace("ref_", "rpo_")).is_err());
     }
 
     #[test]
@@ -532,7 +527,6 @@ mod tests {
         let repository_id = RepositoryId::new();
         assert!(repository_id.to_string().starts_with("Repository-"));
         assert!(RepositoryId::from_str(repository_id.as_str()).is_ok());
-        assert_generated_id!(RepositoryGroupId::new(), "rpg_");
         assert_generated_id!(ReferenceId::new(), "ref_");
         assert_generated_id!(TaskId::new(), "tsk_");
         assert_generated_id!(TaskSessionId::new(), "tss_");
