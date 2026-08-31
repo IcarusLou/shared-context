@@ -6,6 +6,12 @@
 //! payload decoder below is what keeps the contract safe. Hook actions are disabled only when the
 //! host provides no Hook. `beforeSubmitPrompt` is translated for completeness but never drives
 //! Context Pack injection.
+//!
+//! The decoder accepts both documented host shapes: the cursor-agent CLI (fixture profile
+//! `3.13.0`) and the desktop IDE (observed `3.17.21`), which sends an empty `generation_id`
+//! on session-level events, a floating-point `postToolUse` `duration`, an empty or missing
+//! `postToolUse` `cwd`, and undocumented lifecycle enum values. Identity fields the runtime
+//! actually relies on (`conversation_id`, `workspace_roots`) stay strictly validated.
 
 use std::path::PathBuf;
 
@@ -45,6 +51,8 @@ struct Envelope {
 #[derive(Deserialize)]
 struct Common {
     conversation_id: String,
+    /// Informational only: the desktop IDE sends an empty string on session-level events.
+    #[allow(dead_code)]
     generation_id: String,
     model: String,
     #[allow(dead_code)]
@@ -66,7 +74,6 @@ impl Common {
     fn validate(&self, expected_event: &str) -> Result<()> {
         for (name, value) in [
             ("conversation_id", self.conversation_id.as_str()),
-            ("generation_id", self.generation_id.as_str()),
             ("model", self.model.as_str()),
             ("cursor_version", self.cursor_version.as_str()),
         ] {
@@ -124,9 +131,12 @@ struct PostToolInput {
     #[allow(dead_code)]
     tool_output: String,
     tool_use_id: String,
-    cwd: String,
+    /// The desktop IDE sends an empty string or omits the field entirely.
+    #[serde(default)]
+    cwd: Option<String>,
+    /// The desktop IDE sends fractional milliseconds; serde's `f64` also accepts integers.
     #[allow(dead_code)]
-    duration: u64,
+    duration: f64,
 }
 
 #[derive(Deserialize)]
@@ -135,16 +145,22 @@ struct PreCompactInput {
     common: Common,
     trigger: String,
     #[allow(dead_code)]
+    #[serde(default)]
     context_usage_percent: f64,
     #[allow(dead_code)]
+    #[serde(default)]
     context_tokens: u64,
     #[allow(dead_code)]
+    #[serde(default)]
     context_window_size: u64,
     #[allow(dead_code)]
+    #[serde(default)]
     message_count: u64,
     #[allow(dead_code)]
+    #[serde(default)]
     messages_to_compact: u64,
     #[allow(dead_code)]
+    #[serde(default)]
     is_first_compaction: bool,
 }
 
@@ -162,8 +178,9 @@ struct SessionEndInput {
     common: Common,
     session_id: String,
     reason: String,
+    /// The desktop IDE may send fractional milliseconds; serde's `f64` also accepts integers.
     #[allow(dead_code)]
-    duration_ms: u64,
+    duration_ms: f64,
     #[allow(dead_code)]
     is_background_agent: bool,
     #[allow(dead_code)]
@@ -177,8 +194,10 @@ struct SessionEndInput {
 ///
 /// # Errors
 ///
-/// Rejects malformed JSON, unsupported Hook names, wrong field types, empty required identity
-/// fields, and undocumented enum values used by policy.
+/// Rejects malformed JSON, unsupported Hook names, wrong field types, and empty required
+/// identity fields. Lifecycle enum values (`trigger`, `status`, `reason`) pass through
+/// verbatim: no downstream policy branches on them, so an undocumented value must not
+/// block the host session.
 pub fn decode_hook_input(bytes: &[u8]) -> Result<(CanonicalAgentEvent, String)> {
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| invalid(format!("invalid Cursor hook JSON: {error}")))?;
@@ -215,10 +234,14 @@ pub fn decode_hook_input(bytes: &[u8]) -> Result<(CanonicalAgentEvent, String)> 
             input.common.validate("postToolUse")?;
             require_nonempty("tool_name", &input.tool_name)?;
             require_nonempty("tool_use_id", &input.tool_use_id)?;
-            require_nonempty("cwd", &input.cwd)?;
+            let cwd = input
+                .cwd
+                .as_deref()
+                .map(str::trim)
+                .filter(|cwd| !cwd.is_empty());
             let normalized = normalize_tool_use(&input.tool_name, &input.tool_input);
             CanonicalAgentEvent::PostToolUse {
-                context: input.common.context(None, Some(&input.cwd)),
+                context: input.common.context(None, cwd),
                 tool_category: normalized.category,
                 tool_use_id: input.tool_use_id,
                 path_hints: normalized.path_hints,
@@ -228,11 +251,7 @@ pub fn decode_hook_input(bytes: &[u8]) -> Result<(CanonicalAgentEvent, String)> 
         "preCompact" => {
             let input: PreCompactInput = decode(value, "preCompact")?;
             input.common.validate("preCompact")?;
-            require_one_of(
-                "Cursor preCompact trigger",
-                &input.trigger,
-                &["auto", "manual"],
-            )?;
+            require_nonempty("trigger", &input.trigger)?;
             CanonicalAgentEvent::PreCompact {
                 context: input.common.context(None, None),
                 trigger: input.trigger,
@@ -241,11 +260,7 @@ pub fn decode_hook_input(bytes: &[u8]) -> Result<(CanonicalAgentEvent, String)> 
         "stop" => {
             let input: StopInput = decode(value, "stop")?;
             input.common.validate("stop")?;
-            require_one_of(
-                "Cursor stop status",
-                &input.status,
-                &["completed", "aborted", "error"],
-            )?;
+            require_nonempty("status", &input.status)?;
             let _ = input.loop_count;
             CanonicalAgentEvent::TurnStop {
                 context: input.common.context(None, None),
@@ -255,17 +270,7 @@ pub fn decode_hook_input(bytes: &[u8]) -> Result<(CanonicalAgentEvent, String)> 
         "sessionEnd" => {
             let input: SessionEndInput = decode(value, "sessionEnd")?;
             input.common.validate("sessionEnd")?;
-            require_one_of(
-                "Cursor sessionEnd reason",
-                &input.reason,
-                &[
-                    "completed",
-                    "aborted",
-                    "error",
-                    "window_close",
-                    "user_close",
-                ],
-            )?;
+            require_nonempty("reason", &input.reason)?;
             CanonicalAgentEvent::SessionEnd {
                 context: input.common.context(Some(&input.session_id), None),
                 reason: input.reason,
@@ -325,14 +330,6 @@ fn require_nonempty(name: &str, value: &str) -> Result<()> {
         Err(invalid(format!("Cursor {name} must not be empty")))
     } else {
         Ok(())
-    }
-}
-
-fn require_one_of(name: &str, value: &str, accepted: &[&str]) -> Result<()> {
-    if accepted.contains(&value) {
-        Ok(())
-    } else {
-        Err(invalid(format!("{name} has unsupported value {value:?}")))
     }
 }
 

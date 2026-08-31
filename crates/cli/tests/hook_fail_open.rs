@@ -527,3 +527,87 @@ fn cursor_post_tool_hook_is_neutral_immediately_when_catalog_lock_is_busy() {
     assert_neutral(&output, &harness.root(), secret);
     FileExt::unlock(&lock).unwrap();
 }
+
+fn hook_raw_stdin(harness: &Harness, agent: &str, payload: &[u8]) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sctx"))
+        .args(["hook", "--agent", agent])
+        .env("HOME", &harness.home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(payload).unwrap();
+    drop(child.stdin.take());
+    child.wait_with_output().unwrap()
+}
+
+/// Payload-shape faults must fail open exactly like runtime faults: the desktop IDE renders a
+/// non-zero Hook exit as a blocked action, so an undecodable payload degrades to a neutral no-op.
+#[test]
+fn cursor_undecodable_payload_shapes_fail_open_with_a_neutral_output() {
+    let harness = Harness::new();
+    let secret = "CURSOR_UNDECODABLE_MUST_NOT_BLOCK";
+
+    let mut empty_roots = cursor_session_start(&harness.home, "undecodable-roots");
+    empty_roots["workspace_roots"] = json!([]);
+    let mut unknown_event = cursor_session_start(&harness.home, "undecodable-event");
+    unknown_event["hook_event_name"] = json!("futureHook");
+    for payload in [empty_roots, unknown_event] {
+        let output = harness.hook("cursor", &payload);
+        assert_neutral(&output, &harness.root(), secret);
+        assert!(
+            !output.stderr.is_empty(),
+            "an ignored payload must leave a diagnostic"
+        );
+    }
+
+    let output = hook_raw_stdin(&harness, "cursor", b"RAW_NOT_JSON_PAYLOAD");
+    assert_neutral(&output, &harness.root(), secret);
+}
+
+/// The desktop IDE 3.17.21 shapes observed in production: an empty `generation_id` on
+/// session-level events, a fractional `postToolUse` duration with an empty or missing `cwd`,
+/// and an undocumented `final_status`. All must decode and stay neutral while disabled.
+#[test]
+fn cursor_desktop_3_17_payload_shapes_decode_and_stay_neutral_when_disabled() {
+    let harness = Harness::new();
+    initialize_store(&harness);
+    let workspace = harness.home.join("desktop workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let file = workspace.join("contract.rs");
+    fs::write(&file, "fn contract() {}\n").unwrap();
+    let secret = "CURSOR_DESKTOP_SHAPE_MUST_NOT_LEAK";
+
+    let mut start = cursor_session_start(&workspace, "desktop-shape");
+    start["generation_id"] = json!("");
+    start["model"] = json!("unknown");
+    assert_neutral(&harness.hook("cursor", &start), &harness.root(), secret);
+
+    for remove_cwd in [false, true] {
+        let mut post = cursor_post_tool(&workspace, &file, secret);
+        post["duration"] = json!(9.299);
+        post["cwd"] = json!("");
+        if remove_cwd {
+            post.as_object_mut().unwrap().remove("cwd");
+        }
+        assert_neutral(&harness.hook("cursor", &post), &harness.root(), secret);
+    }
+
+    let end = json!({
+        "conversation_id": "desktop-shape",
+        "generation_id": "",
+        "model": "unknown",
+        "hook_event_name": "sessionEnd",
+        "cursor_version": "3.17.21",
+        "workspace_roots": [workspace],
+        "user_email": null,
+        "transcript_path": null,
+        "session_id": "desktop-shape",
+        "reason": "window_close",
+        "duration_ms": 0,
+        "is_background_agent": false,
+        "final_status": "unknown"
+    });
+    assert_neutral(&harness.hook("cursor", &end), &harness.root(), secret);
+}

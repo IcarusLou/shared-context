@@ -823,12 +823,23 @@ fn run_hook(args: &[String]) -> Result<()> {
     }
 
     let installed_agent_version = options.optional("--agent-version")?.map(str::to_owned);
-    let (event, version) = if agent == "cursor" {
-        let (event, payload_version) = sctx_adapter_cursor::decode_hook_input(&input)?;
-        (event, Some(payload_version))
+    let decoded = if agent == "cursor" {
+        sctx_adapter_cursor::decode_hook_input(&input)
+            .map(|(event, payload_version)| (event, Some(payload_version)))
     } else {
-        let event = sctx_adapter_codex::decode_hook_input(&input)?;
-        (event, installed_agent_version)
+        sctx_adapter_codex::decode_hook_input(&input).map(|event| (event, installed_agent_version))
+    };
+    let (event, version) = match decoded {
+        Ok(decoded) => decoded,
+        // The payload comes from the Agent host, not the user. An undecodable shape (for
+        // example a new desktop build) fails open as a neutral no-op instead of exit 2,
+        // which hosts render as a blocked action. Exit 2 stays reserved for CLI usage errors.
+        Err(error) if error.kind() == ErrorKind::InvalidInput => {
+            eprintln!("sctx hook: ignoring undecodable {agent} payload: {error}");
+            println!("{{}}");
+            return Ok(());
+        }
+        Err(error) => return Err(error),
     };
     let trust = parse_trust(agent, None, true)?;
     let capabilities = agent_capabilities(agent, version.as_deref(), true, trust);

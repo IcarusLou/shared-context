@@ -359,3 +359,78 @@ fn cursor_shell_and_group_activation_never_reach_the_reminder_lookup() {
         .is_none()
     );
 }
+
+fn desktop_fixtures() -> Vec<Value> {
+    serde_json::from_str(include_str!(
+        "../../../fixtures/agents/cursor-3.17-desktop.json"
+    ))
+    .unwrap()
+}
+
+#[test]
+fn observed_cursor_3_17_desktop_shapes_map_to_all_canonical_events() {
+    let actual = desktop_fixtures()
+        .into_iter()
+        .map(|payload| {
+            let (event, version) =
+                decode_hook_input(&serde_json::to_vec(&payload).unwrap()).unwrap();
+            assert_eq!(version, "3.17.21");
+            event.kind()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        [
+            CanonicalAgentEventKind::SessionStart,
+            CanonicalAgentEventKind::PromptSubmit,
+            CanonicalAgentEventKind::PostToolUse,
+            CanonicalAgentEventKind::PreCompact,
+            CanonicalAgentEventKind::TurnStop,
+            CanonicalAgentEventKind::SessionEnd,
+        ]
+    );
+}
+
+#[test]
+fn desktop_post_tool_empty_or_missing_cwd_falls_back_to_the_first_workspace_root() {
+    for remove_cwd in [false, true] {
+        let mut payload = desktop_fixtures().remove(2);
+        if remove_cwd {
+            payload.as_object_mut().unwrap().remove("cwd");
+        } else {
+            assert_eq!(payload["cwd"], Value::String(String::new()));
+        }
+        let (event, _) = decode_hook_input(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        assert_eq!(event.kind(), CanonicalAgentEventKind::PostToolUse);
+        assert_eq!(
+            event.context().cwd,
+            PathBuf::from("/workspace/cross/android/TikTok")
+        );
+    }
+}
+
+#[test]
+fn desktop_lifecycle_events_tolerate_undocumented_enum_values() {
+    let mut compact = desktop_fixtures().remove(3);
+    compact["trigger"] = Value::String("background".to_owned());
+    assert!(decode_hook_input(&serde_json::to_vec(&compact).unwrap()).is_ok());
+
+    let mut stop = desktop_fixtures().remove(4);
+    stop["status"] = Value::String("requeued".to_owned());
+    assert!(decode_hook_input(&serde_json::to_vec(&stop).unwrap()).is_ok());
+
+    let mut end = desktop_fixtures().remove(5);
+    end["reason"] = Value::String("power_loss".to_owned());
+    let (event, _) = decode_hook_input(&serde_json::to_vec(&end).unwrap()).unwrap();
+    let sctx_adapter_cursor::CanonicalAgentEvent::SessionEnd { reason, .. } = event else {
+        panic!("payload must decode as SessionEnd");
+    };
+    assert_eq!(reason, "power_loss");
+}
+
+#[test]
+fn empty_workspace_roots_still_fail_the_adapter_guard() {
+    let mut payload = desktop_fixtures().remove(0);
+    payload["workspace_roots"] = serde_json::json!([]);
+    assert!(decode_hook_input(&serde_json::to_vec(&payload).unwrap()).is_err());
+}
