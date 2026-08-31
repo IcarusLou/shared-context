@@ -1,0 +1,65 @@
+name: Publish internal NPM packages
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: internal-npm-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build, verify, and publish
+    runs-on: macos-latest
+    environment: internal-npm
+    env:
+      CI_NAME: allow_same_version_${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://bnpm.byted.org
+          scope: '@bytedance-dev'
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Select Rust toolchain and packaging targets
+        run: |
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Test package and installer contracts
+        working-directory: npm
+        run: |
+          npm ci
+          npm test
+
+      - name: Build publishable tarballs
+        working-directory: npm
+        run: npm run release:prepare
+
+      - name: Install and verify the exact release tarballs
+        working-directory: npm
+        run: npm run install:release
+
+      - name: Preserve release evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-context-npm-${{ github.ref_name }}
+          path: target/npm-release
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish platform packages, then launcher
+        working-directory: npm
+        run: npm run release:publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.BNPM_TOKEN }}

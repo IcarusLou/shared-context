@@ -104,9 +104,16 @@ tar -xzf shared-context-0.1.0-darwin-arm64-offline.tar.gz
 
 离线安装器会校验文件 SHA-256，使用 npm 的离线模式安装平台包，并自动执行 `sctx setup`。不要在 `install` 后面额外添加一个 `setup` 单词。
 
-### 3.3 方式二：从当前仓库构建并安装（开发者）
+### 3.3 方式二：内网 NPM 或源码开发安装
 
-当前仓库中的 npm 包是未公开发布的内部包，不能假设 `npm install -g @company/shared-context` 可以从公共 Registry 获取。仓库提供的可用方式是本地构建安装：
+正式版本从内网 Registry 安装；包不会发布到公共 npm：
+
+```bash
+npm install -g @bytedance-dev/shared-context \
+  --registry=https://bnpm.byted.org
+```
+
+安装待发布代码或做本地开发验证时，可从当前仓库一键构建并安装：
 
 ```bash
 cd npm
@@ -132,6 +139,20 @@ export PATH="$(pwd)/../target/npm-local/bin:$PATH"
 npm run install:local -- --prefix /absolute/path/to/prefix
 npm run install:local -- --profile debug --prefix /absolute/path/to/prefix
 ```
+
+需要验证与正式流水线完全一致的三个待发布 tarball 时，运行：
+
+```bash
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+npm run release:version -- 0.2.0
+npm run release:test
+```
+
+`release:version` 会先同步 Cargo、Cargo.lock、三个发布包及 optionalDependencies 的版本；
+`release:test` 随后重新编译并确认安装后的 `sctx --version` 与该版本完全一致。
+
+产物保存在 `target/npm-release`，隔离安装前缀为 `target/npm-release-test`；该命令不会上传
+package，也不会修改 Cursor/Codex 配置。
 
 本地 npm 安装**只安装命令，不会修改 Cursor/Codex 配置**。接着必须显式执行：
 

@@ -16,8 +16,8 @@ const {
 } = require('../packages/shared-context/lib/launcher');
 
 test('launcher selects the package matching darwin CPU', () => {
-  assert.equal(packageFor('darwin', 'arm64'), '@company/shared-context-darwin-arm64');
-  assert.equal(packageFor('darwin', 'x64'), '@company/shared-context-darwin-x64');
+  assert.equal(packageFor('darwin', 'arm64'), '@bytedance-dev/shared-context-darwin-arm64');
+  assert.equal(packageFor('darwin', 'x64'), '@bytedance-dev/shared-context-darwin-x64');
   assert.throws(
     () => packageFor('linux', 'x64'),
     /does not support linux\/x64.*darwin\/arm64 and darwin\/x64/,
@@ -38,7 +38,7 @@ test('missing optional platform package reports the exact repair', () => {
       }),
     (error) =>
       error instanceof LauncherError &&
-      error.message.includes('@company/shared-context-darwin-arm64') &&
+      error.message.includes('@bytedance-dev/shared-context-darwin-arm64') &&
       error.message.includes('optional dependencies enabled') &&
       error.message.includes('matching offline bundle'),
   );
@@ -82,7 +82,7 @@ test('launcher forwards argv, inherited stdio, and native exit code unchanged', 
     platform: 'darwin',
     arch: 'arm64',
     resolve(request) {
-      assert.equal(request, '@company/shared-context-darwin-arm64/bin/sctx');
+      assert.equal(request, '@bytedance-dev/shared-context-darwin-arm64/bin/sctx');
       return '/fixture/sctx';
     },
     verify(binary) {

@@ -42,6 +42,7 @@ test('local NPM install is offline, script-free, and contains both tgz packages'
     platformTarball: '/tmp/shared-context-darwin-arm64.tgz',
   });
   assert.ok(arguments_.includes('--global'));
+  assert.ok(arguments_.includes('--force'));
   assert.ok(arguments_.includes('--offline'));
   assert.ok(arguments_.includes('--ignore-scripts'));
   assert.ok(arguments_.includes('--omit=optional'));

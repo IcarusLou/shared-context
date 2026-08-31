@@ -106,9 +106,9 @@ function buildOfflineBundle({ arch, binary, outputDirectory }) {
       name: `shared-context-offline-darwin-${arch}`,
       version: mainPackage.version,
       private: true,
-      description: `Offline installer for @company/shared-context on darwin/${arch}`,
+      description: `Offline installer for @bytedance-dev/shared-context on darwin/${arch}`,
       dependencies: {
-        '@company/shared-context': 'file:packages/shared-context.tgz',
+        '@bytedance-dev/shared-context': 'file:packages/shared-context.tgz',
         [target.packageName]: `file:packages/${platformTarballName}`,
       },
     };
@@ -156,7 +156,7 @@ function buildOfflineBundle({ arch, binary, outputDirectory }) {
     });
     const manifest = {
       formatVersion: 1,
-      package: '@company/shared-context',
+      package: '@bytedance-dev/shared-context',
       version: mainPackage.version,
       target: {
         os: 'darwin',

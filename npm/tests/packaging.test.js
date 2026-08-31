@@ -60,9 +60,11 @@ function assertChecksums(bundle) {
 test('package metadata has exact optional, os, and cpu contracts with no lifecycle mutation', () => {
   const main = readJson(path.join(PACKAGES_ROOT, 'shared-context/package.json'));
   assert.deepEqual(main.optionalDependencies, {
-    '@company/shared-context-darwin-arm64': main.version,
-    '@company/shared-context-darwin-x64': main.version,
+    '@bytedance-dev/shared-context-darwin-arm64': main.version,
+    '@bytedance-dev/shared-context-darwin-x64': main.version,
   });
+  assert.equal(main.name, '@bytedance-dev/shared-context');
+  assert.deepEqual(main.publishConfig, { registry: 'https://bnpm.byted.org' });
   assert.equal(main.scripts, undefined);
 
   for (const [arch, cpu] of [
@@ -75,6 +77,8 @@ test('package metadata has exact optional, os, and cpu contracts with no lifecyc
     assert.deepEqual(platform.os, ['darwin']);
     assert.deepEqual(platform.cpu, [cpu]);
     assert.equal(platform.version, main.version);
+    assert.equal(platform.name, `@bytedance-dev/shared-context-darwin-${arch}`);
+    assert.deepEqual(platform.publishConfig, { registry: 'https://bnpm.byted.org' });
     assert.equal(platform.scripts, undefined);
   }
 });

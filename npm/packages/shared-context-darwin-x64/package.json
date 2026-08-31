@@ -1,5 +1,5 @@
 {
-  "name": "@company/shared-context-darwin-x64",
+  "name": "@bytedance-dev/shared-context-darwin-x64",
   "version": "0.1.0",
   "description": "Shared Context native CLI for macOS x64",
   "license": "UNLICENSED",
@@ -13,5 +13,8 @@
     "bin/sctx",
     "bin/sctx.sha256",
     "README.md"
-  ]
+  ],
+  "publishConfig": {
+    "registry": "https://bnpm.byted.org"
+  }
 }

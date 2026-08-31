@@ -1228,9 +1228,9 @@ crates/
 ### 16.2 NPM 分发
 
 ```text
-@company/shared-context
-@company/shared-context-darwin-arm64
-@company/shared-context-darwin-x64
+@bytedance-dev/shared-context
+@bytedance-dev/shared-context-darwin-arm64
+@bytedance-dev/shared-context-darwin-x64
 ```
 
 - 主包提供极薄的 JavaScript Launcher。

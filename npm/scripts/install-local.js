@@ -82,6 +82,7 @@ function installArguments({ prefix, cache, mainTarball, platformTarball }) {
     '--global',
     '--prefix',
     prefix,
+    '--force',
     '--offline',
     '--ignore-scripts',
     '--omit=optional',

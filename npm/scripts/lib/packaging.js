@@ -14,14 +14,14 @@ const TARGETS = Object.freeze({
     arch: 'arm64',
     cpu: 'arm64',
     machoArch: 'arm64',
-    packageName: '@company/shared-context-darwin-arm64',
+    packageName: '@bytedance-dev/shared-context-darwin-arm64',
     sourceDirectory: 'shared-context-darwin-arm64',
   },
   x64: {
     arch: 'x64',
     cpu: 'x64',
     machoArch: 'x86_64',
-    packageName: '@company/shared-context-darwin-x64',
+    packageName: '@bytedance-dev/shared-context-darwin-x64',
     sourceDirectory: 'shared-context-darwin-x64',
   },
 });
