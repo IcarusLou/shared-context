@@ -14,7 +14,7 @@ use sctx_domain::{
     candidate_submission_content_hash, reduce,
 };
 use sctx_event_schema::{
-    ContextSpaceAssociationOrigin, Event, EventPayload, EventType, ParsedEvent,
+    ContextSpaceAssociationOrigin, Event, EventPayload, EventType, ParsedEvent, V1_JSON_SCHEMA,
     candidate_submission_hint, parse_event,
 };
 use sctx_local_state::{PrivacyScan, PrivacyScanner, UserConfigStore};
@@ -29,6 +29,7 @@ use crate::{
 
 const JOURNAL_VERSION: u32 = 1;
 const MANAGED_ROOTS: [&str; 3] = ["events", "objects", "schemas"];
+const V1_SCHEMA_PATH: &str = "schemas/event-v1.schema.json";
 /// Upper bound on the Events one internal atomic batch may commit together.
 const MAX_INTERNAL_BATCH_EVENTS: usize = 512;
 
@@ -562,12 +563,9 @@ impl GitStore {
                 fs::create_dir_all(repository.join(directory))
                     .map_err(io_error("create managed repository directory"))?;
             }
-            git.run([
-                "commit",
-                "--allow-empty",
-                "-m",
-                "Initialize Shared Context repository",
-            ])?;
+            write_bundled_v1_schema(&repository)?;
+            git.stage_paths(&[V1_SCHEMA_PATH.to_owned()])?;
+            git.run(["commit", "-m", "Initialize Shared Context repository"])?;
         }
         FileExt::unlock(&lock).map_err(io_error("unlock writer.lock"))?;
 
@@ -737,6 +735,72 @@ impl GitStore {
     #[must_use]
     pub fn state(&self) -> &Path {
         &self.state
+    }
+
+    /// Installs the bundled immutable Event schemas when opening a legacy Store.
+    ///
+    /// Existing committed schema bytes are never overwritten. A missing schema is added in one
+    /// append-only commit, while an existing conflicting or dirty schema path fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schema path is unsafe, existing bytes differ from the bundled
+    /// contract, or Git cannot commit the missing schema.
+    pub fn ensure_bundled_schemas(&self) -> Result<bool> {
+        let lock = self.writer_lock()?;
+        let result = self.ensure_bundled_schemas_locked();
+        let unlock = FileExt::unlock(&lock).map_err(io_error("unlock writer.lock"));
+        match (result, unlock) {
+            (Ok(changed), Ok(())) => Ok(changed),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    fn ensure_bundled_schemas_locked(&self) -> Result<bool> {
+        let git = Git::new(&self.repository);
+        if let Some(committed) = git.head_file(V1_SCHEMA_PATH)? {
+            if committed != V1_JSON_SCHEMA.as_bytes() {
+                return Err(invariant(format!(
+                    "committed Event schema differs from the bundled immutable contract: {V1_SCHEMA_PATH}"
+                )));
+            }
+            verify_worktree_v1_schema(&self.repository)?;
+            return Ok(false);
+        }
+
+        let schema = self.repository.join(V1_SCHEMA_PATH);
+        match fs::symlink_metadata(&schema) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                let bytes = fs::read(&schema).map_err(io_error("read untracked Event schema"))?;
+                if bytes != V1_JSON_SCHEMA.as_bytes() {
+                    return Err(invariant(format!(
+                        "untracked Event schema differs from the bundled immutable contract: {V1_SCHEMA_PATH}"
+                    )));
+                }
+            }
+            Ok(_) => {
+                return Err(invariant(format!(
+                    "Event schema path is not a regular file: {V1_SCHEMA_PATH}"
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                write_bundled_v1_schema(&self.repository)?;
+            }
+            Err(error) => return Err(io_error("inspect Event schema path")(error)),
+        }
+
+        let paths = [V1_SCHEMA_PATH.to_owned()];
+        git.stage_paths(&paths)?;
+        git.commit_paths("Install Shared Context event schema v1", &paths)?;
+        let committed = git
+            .head_file(V1_SCHEMA_PATH)?
+            .ok_or_else(|| invariant("committed Event schema is missing after installation"))?;
+        if committed != V1_JSON_SCHEMA.as_bytes() {
+            return Err(invariant(
+                "committed Event schema differs after installation",
+            ));
+        }
+        Ok(true)
     }
 
     /// Appends one immutable event and its text objects in one Git commit.
@@ -2110,6 +2174,46 @@ fn verify_repository(repository: &Path) -> Result<()> {
         )));
     }
     git.head_oid()?;
+    Ok(())
+}
+
+fn write_bundled_v1_schema(repository: &Path) -> Result<()> {
+    let schemas = repository.join("schemas");
+    match fs::symlink_metadata(&schemas) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Err(invariant("managed schemas path is not a directory")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&schemas).map_err(io_error("create schemas directory"))?;
+        }
+        Err(error) => return Err(io_error("inspect schemas directory")(error)),
+    }
+    let path = repository.join(V1_SCHEMA_PATH);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(io_error("create bundled Event schema"))?;
+    file.write_all(V1_JSON_SCHEMA.as_bytes())
+        .map_err(io_error("write bundled Event schema"))?;
+    file.sync_all()
+        .map_err(io_error("sync bundled Event schema"))?;
+    sync_directory(&schemas)
+}
+
+fn verify_worktree_v1_schema(repository: &Path) -> Result<()> {
+    let path = repository.join(V1_SCHEMA_PATH);
+    let metadata = fs::symlink_metadata(&path).map_err(io_error("inspect Event schema path"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(invariant(format!(
+            "Event schema path is not a regular file: {V1_SCHEMA_PATH}"
+        )));
+    }
+    let bytes = fs::read(path).map_err(io_error("read Event schema"))?;
+    if bytes != V1_JSON_SCHEMA.as_bytes() {
+        return Err(invariant(format!(
+            "working Event schema differs from the bundled immutable contract: {V1_SCHEMA_PATH}"
+        )));
+    }
     Ok(())
 }
 

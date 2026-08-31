@@ -661,7 +661,7 @@ impl Installer {
         let KnowledgeStoreInstall {
             store,
             source: knowledge_store_source,
-            changed: knowledge_store_changed,
+            changed: mut knowledge_store_changed,
         } = install_knowledge_store(
             &self.context.root,
             options.knowledge_store_url.as_ref(),
@@ -669,6 +669,7 @@ impl Installer {
             &installation_id,
             transaction,
         )?;
+        knowledge_store_changed |= store.ensure_bundled_schemas()?;
         self.fail(SetupStage::RepositoryInitialized)?;
         let index = ProjectionIndex::for_store(&store);
         index.synchronize()?;

@@ -16,7 +16,7 @@ use sctx_event_schema::{
     ContextSpaceAssociationDraft, ContextSpaceAssociationOrigin, EngineeringReferenceDraft, Event,
     EventId, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, OptionalCandidateEdits,
     PublicationId, ReferenceRelation, RepoRelativePath, RepositoryId, RevisionId, SpaceId,
-    SubmissionId, TaskId, TaskSessionId, WorkEpisodeId, WorkEpisodeRef,
+    SubmissionId, TaskId, TaskSessionId, V1_JSON_SCHEMA, WorkEpisodeId, WorkEpisodeRef,
 };
 use sctx_git_store::{
     AppendRequest, CrashInjector, CrashSeam, Error, ErrorKind, GitStore, OBJECT_PENDING,
@@ -224,12 +224,81 @@ fn initialization_is_idempotent_and_uses_one_fixed_repository() {
         fixture.home.join(".shared-context/repository")
     );
     assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), "1");
+    assert_eq!(
+        fs::read_to_string(reopened.repository().join("schemas/event-v1.schema.json")).unwrap(),
+        V1_JSON_SCHEMA
+    );
+    assert_eq!(
+        fixture.git(&["ls-files", "--", "schemas/event-v1.schema.json"]),
+        "schemas/event-v1.schema.json"
+    );
     assert!(
         fixture
             .home
             .join(".shared-context/state/writer.lock")
             .is_file()
     );
+}
+
+#[test]
+fn missing_bundled_schema_is_repaired_once_for_a_legacy_repository() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("legacy installation");
+    let config = sctx_local_state::UserConfigStore::initialize(&root).unwrap();
+    fs::create_dir_all(root.join("state/pending")).unwrap();
+    let repository = config.repository();
+    fs::create_dir_all(repository).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .arg(repository)
+            .status()
+            .unwrap()
+            .success()
+    );
+    git(repository, &["config", "user.name", "Legacy Writer"]);
+    git(
+        repository,
+        &["config", "user.email", "legacy-writer@localhost"],
+    );
+    git(
+        repository,
+        &[
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "legacy empty repository",
+        ],
+    );
+
+    let store = GitStore::open_existing(&root).unwrap();
+    assert!(store.ensure_bundled_schemas().unwrap());
+    assert!(!store.ensure_bundled_schemas().unwrap());
+    assert_eq!(git(repository, &["rev-list", "--count", "HEAD"]), "2");
+    assert_eq!(
+        fs::read_to_string(repository.join("schemas/event-v1.schema.json")).unwrap(),
+        V1_JSON_SCHEMA
+    );
+    assert_eq!(git(repository, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn conflicting_committed_schema_is_rejected_without_overwrite() {
+    let fixture = Fixture::new();
+    let schema = fixture
+        .store
+        .repository()
+        .join("schemas/event-v1.schema.json");
+    fs::write(&schema, b"{\"conflicting\":true}\n").unwrap();
+    fixture.git(&["add", "--", "schemas/event-v1.schema.json"]);
+    fixture.git(&["commit", "-m", "conflicting schema fixture"]);
+    let head = fixture.git(&["rev-parse", "HEAD"]);
+
+    let error = fixture.store.ensure_bundled_schemas().unwrap_err();
+    assert!(error.message().contains("immutable contract"));
+    assert_eq!(fixture.git(&["rev-parse", "HEAD"]), head);
+    assert_eq!(fs::read(schema).unwrap(), b"{\"conflicting\":true}\n");
 }
 
 #[test]

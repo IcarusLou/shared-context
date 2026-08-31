@@ -14,7 +14,7 @@ use sctx_domain::{
     TaskId, WorkingIntentSnapshot,
 };
 use sctx_engineering_graph::{EngineeringProjectionStore, RepositoryRegistry};
-use sctx_event_schema::{Event, IntentSnapshot};
+use sctx_event_schema::{Event, IntentSnapshot, V1_JSON_SCHEMA};
 use sctx_git_store::{AppendRequest, GitStore, TextObject};
 use sctx_index::ProjectionIndex;
 use sctx_installer::{
@@ -2384,6 +2384,27 @@ fn knowledge_deletion_requires_path_and_phrase_as_two_confirmations() {
 }
 
 #[test]
+fn repeated_setup_repairs_a_missing_bundled_schema_and_reports_the_change() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.0.0");
+    installer.setup(&SetupOptions::default()).unwrap();
+    let repository = harness.root.join("repository");
+    git(&repository, &["rm", "--", "schemas/event-v1.schema.json"]);
+    git(
+        &repository,
+        &["commit", "-m", "legacy repository without bundled schema"],
+    );
+
+    let repaired = installer.setup(&SetupOptions::default()).unwrap();
+    assert!(repaired.changed);
+    assert_eq!(
+        fs::read_to_string(repository.join("schemas/event-v1.schema.json")).unwrap(),
+        V1_JSON_SCHEMA
+    );
+    assert_eq!(git(&repository, &["status", "--porcelain"]), "");
+}
+
+#[test]
 fn remote_setup_clones_once_to_stable_work_branch_without_mutating_default() {
     let harness = Harness::new();
     let fixture = remote_fixture(&harness, "team");
@@ -2398,6 +2419,10 @@ fn remote_setup_clones_once_to_stable_work_branch_without_mutating_default() {
         Some(KnowledgeRemoteType::Local)
     );
     assert_eq!(first.knowledge_store.default_branch, "main");
+    assert_eq!(
+        fs::read_to_string(harness.root.join("repository/schemas/event-v1.schema.json")).unwrap(),
+        V1_JSON_SCHEMA
+    );
     let work_branch = first.knowledge_store.work_branch.as_deref().unwrap();
     assert_eq!(
         work_branch,
