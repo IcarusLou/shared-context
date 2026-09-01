@@ -1762,6 +1762,75 @@ fn file_identity(path: &Path) -> u64 {
 }
 
 #[test]
+fn topic_key_is_searchable_text_and_seeds_its_own_alias_group() {
+    let temporary = tempfile::tempdir().unwrap();
+    let base_store = GitStore::bootstrap_local(temporary.path().join("topic-key")).unwrap();
+    let index = ProjectionIndex::for_store(&base_store);
+    let store = base_store.with_candidate_submission_index(Arc::new(index.clone()));
+
+    let space_event = Event::space_created(intent("Topic key projection"), None).unwrap();
+    let (space_id, _) = space_ids(&space_event);
+    append(&store, space_event);
+
+    let mut content = context("The reviewed branch keeps the fallback bar rendered");
+    // The shape Candidate Build derives: kind, the Repository that placed the spelling, and the
+    // coordinate itself.
+    content.topic_key = Some("decision:Server:app/src/main/kotlin/SampleTopicAssem.kt".to_owned());
+    let revision_event = Event::context_revision_added(space_id, content, None).unwrap();
+    let (_, revision_id) = context_ids(&revision_event);
+    append(&store, revision_event);
+
+    index.rebuild().unwrap();
+    let connection = Connection::open(index.database_path()).unwrap();
+
+    let hint_text: String = connection
+        .query_row(
+            "SELECT hint_text FROM context_revision WHERE revision_id = ?1",
+            [revision_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    // The coordinate the topic names becomes retrieval text; the kind and the Repository segment
+    // are identity, not words a question is asked in, and stay out of it.
+    let terms = hint_text.split_whitespace().collect::<Vec<_>>();
+    assert!(terms.contains(&"sampletopicassem"), "{hint_text}");
+    assert!(terms.contains(&"kotlin"), "{hint_text}");
+    assert!(!terms.contains(&"server"), "{hint_text}");
+    assert!(!terms.contains(&"decision"), "{hint_text}");
+    assert_eq!(
+        count_fts_matches(&connection, "context_fts", "sampletopicassem"),
+        1
+    );
+
+    let topic_aliases: Vec<String> = connection
+        .prepare(
+            "SELECT alias FROM token_alias
+             WHERE token = 'sampletopicassem' AND source = 'identifier_split'
+             ORDER BY alias",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(topic_aliases, ["assem", "sample", "topic"]);
+    assert_eq!(
+        count_where(
+            &connection,
+            "token_alias",
+            "source = 'identifier_split' AND group_key = 'sample-topic-assem'"
+        ),
+        12
+    );
+    drop(connection);
+
+    let expected = projection_dump(index.database_path());
+    let scratch = ProjectionIndex::new(store.repository(), temporary.path().join("scratch"));
+    scratch.rebuild().unwrap();
+    assert_eq!(projection_dump(scratch.database_path()), expected);
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn problem_view_hints_and_alias_groups_project_deterministically() {
     let temporary = tempfile::tempdir().unwrap();
