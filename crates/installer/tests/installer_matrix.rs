@@ -3224,3 +3224,85 @@ fn next_setup_recovers_an_incomplete_durable_journal_before_reapplying() {
     assert_eq!(recovered_journal["phase"], "recovered_rollback");
     assert_eq!(recovered_journal["complete"], true);
 }
+
+/// A dark Graph channel is silent by construction: every Task Context Pack degrades to text, and
+/// that degradation is the normal path for an installation with no Graph at all. So `doctor` is
+/// where it has to become visible, and the warning has to name the command that repairs it.
+#[test]
+fn doctor_names_the_repair_when_engineering_references_resolve_against_no_graph() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.0.0");
+    installer.setup(&SetupOptions::default()).unwrap();
+
+    let graph_check = |report: &sctx_installer::DoctorReport| {
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "engineering_graph")
+            .expect("doctor always reports the Graph channel")
+            .clone()
+    };
+    let empty = installer.doctor();
+    assert_eq!(graph_check(&empty).status, CheckStatus::Ok);
+    assert!(
+        graph_check(&empty)
+            .message
+            .contains("no Engineering Reference")
+    );
+
+    let oracle = team_sharing_oracle();
+    let checkout = init_team_checkout(&harness.home.join("doctor graph checkout"), &oracle);
+    let repository_id: sctx_domain::RepositoryId = oracle.repository_id.parse().unwrap();
+    UserConfigStore::open_existing(&harness.root)
+        .unwrap()
+        .add_repository(repository_id.clone(), std::slice::from_ref(&checkout))
+        .unwrap();
+    // The opt-out reproduces the shape a real installation reached before the Confirmation-time
+    // rescan existed: References in the Store, nothing scanned, and no complaint anywhere.
+    let config_path = harness.root.join("config.toml");
+    let mut text = fs::read_to_string(&config_path).unwrap();
+    text.push_str("\n[engineering]\nauto_scan = false\n");
+    fs::write(&config_path, text).unwrap();
+
+    let (context_id, revision_id) = append_accepted_team_context(&harness.root, &oracle);
+    engineering_reference_record_at_root(
+        &harness.root,
+        &EngineeringReferenceRecordInput {
+            context_id: context_id.to_string(),
+            revision_id: revision_id.to_string(),
+            repository_id: repository_id.to_string(),
+            artifact_kind: ArtifactKind::File,
+            relation: ReferenceRelation::Implements,
+            locator: ArtifactLocator::File {
+                path: RepoRelativePath::new(&oracle.relative_path).unwrap(),
+            },
+            supports: "The doctor fixture inspected the fixed tracked artifact".to_owned(),
+            limitations: vec!["Synthetic doctor fixture".to_owned()],
+        },
+    )
+    .unwrap();
+
+    let dark = graph_check(&installer.doctor());
+    assert_eq!(dark.status, CheckStatus::Warning);
+    assert!(
+        dark.message.contains("sctx association rebuild"),
+        "{}",
+        dark.message
+    );
+    assert!(dark.message.contains("auto_scan"), "{}", dark.message);
+
+    association_rebuild_at_root(
+        &harness.root,
+        &AssociationRebuildInput {
+            diagnose_only: false,
+        },
+    )
+    .unwrap();
+    let repaired = graph_check(&installer.doctor());
+    assert_eq!(repaired.status, CheckStatus::Ok);
+    assert!(
+        repaired.message.contains("Graph Context snapshots"),
+        "{}",
+        repaired.message
+    );
+}

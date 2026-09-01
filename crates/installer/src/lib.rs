@@ -30,7 +30,7 @@ use sctx_local_state::{
     AuthorizedSessionScopeStore, CatalogCheckoutStatus, MaintenanceLock, ORPHAN_LEASE_MAX_AGE,
     UserConfigStore, migrate_legacy_repository_groups,
 };
-use sctx_mcp::{ClientKind, McpServer};
+use sctx_mcp::{AssociationRebuildInput, ClientKind, McpServer};
 use sctx_search::{SearchEngine, SearchFilters, SearchRequest};
 use sctx_task_runtime::TaskRuntime;
 use serde::{Deserialize, Serialize};
@@ -824,6 +824,7 @@ impl Installer {
         check_runtime(root, &mut checks);
         check_repository(root, &mut checks);
         check_index(root, &mut checks);
+        check_engineering_graph(root, &mut checks);
         check_repository_catalog(root, &mut checks);
         check_configs(root, &self.context.home, &mut checks);
         check_global_skill(root, &self.context.home, &mut checks);
@@ -895,6 +896,16 @@ impl Installer {
             codex_trust: self.codex_trust,
         };
         fixer.setup(options)?;
+        // The Graph is derived local state, so repairing it is exactly what `--fix` is for, and it
+        // is the repair for the one diagnosis `--fix` could otherwise only keep reporting. Every
+        // way it can fail -- an unavailable checkout, an unreadable projection -- is best effort,
+        // because the diagnosis that follows is what tells the operator where they actually stand.
+        let _ = sctx_mcp::association_rebuild_at_root(
+            &self.context.root,
+            &AssociationRebuildInput {
+                diagnose_only: false,
+            },
+        );
         Ok(self.doctor())
     }
 
@@ -4010,6 +4021,61 @@ fn check_index(root: &Path, checks: &mut Vec<DoctorCheck>) {
     match SearchEngine::new(index).search(&request) {
         Ok(_) => checks.push(ok("fts", "FTS query smoke passed")),
         Err(error) => checks.push(failed("fts", error.to_string())),
+    }
+}
+
+/// Diagnoses the one failure that leaves an installation quietly without a Graph channel.
+///
+/// Engineering References live in the Knowledge Store and the Artifacts they name live in a local
+/// checkout; only a scan joins the two. An installation that has recorded References but has never
+/// produced a `graph_context_snapshot` retrieves nothing through the Graph and says nothing about
+/// it, because every Task Context Pack degrades to text and the degradation is the normal path
+/// when no Graph exists at all. So the count comparison is the check: References without Contexts
+/// is the shape of that silence, and it has one command as its fix.
+fn check_engineering_graph(root: &Path, checks: &mut Vec<DoctorCheck>) {
+    let index = ProjectionIndex::new(root.join("repository"), root.join("state"));
+    let reference_count = match index.domain_snapshot() {
+        Ok(snapshot) => snapshot.projection.engineering_references.len(),
+        Err(error) => {
+            checks.push(failed("engineering_graph", error.to_string()));
+            return;
+        }
+    };
+    let context_count = match EngineeringProjectionStore::initialize(root)
+        .and_then(|store| store.read_snapshot())
+    {
+        Ok(Some(snapshot)) => snapshot.projection.contexts.len(),
+        Ok(None) => 0,
+        Err(error) => {
+            checks.push(failed(
+                "engineering_graph",
+                format!("Engineering projection is unreadable: {error}"),
+            ));
+            return;
+        }
+    };
+    if reference_count == 0 {
+        checks.push(ok(
+            "engineering_graph",
+            "no Engineering Reference is recorded yet",
+        ));
+    } else if context_count == 0 {
+        checks.push(warning(
+            "engineering_graph",
+            format!(
+                "{reference_count} Engineering References resolve against no Graph Context \
+                 snapshot; Artifact-anchored retrieval is silently unavailable. \
+                 Run `sctx association rebuild` (or `sctx doctor --fix`) to scan the registered \
+                 checkouts, and check that `[engineering] auto_scan` is not disabled."
+            ),
+        ));
+    } else {
+        checks.push(ok(
+            "engineering_graph",
+            format!(
+                "{reference_count} Engineering References over {context_count} Graph Context snapshots"
+            ),
+        ));
     }
 }
 
