@@ -3137,9 +3137,9 @@ const fn intent_field_weight(field: SpaceIntentField) -> u16 {
 /// Mirrors [`CONTEXT_FTS_BM25_WEIGHTS`] for the fusion feature that ranks by which fields matched.
 const fn context_field_weight(field: MatchField) -> u16 {
     match field {
-        MatchField::Title | MatchField::Statement | MatchField::ProblemView => 8,
+        MatchField::Statement | MatchField::ProblemView => 8,
         MatchField::Rationale => 4,
-        MatchField::Evidence | MatchField::HintText => 2,
+        MatchField::Title | MatchField::Evidence | MatchField::HintText => 2,
     }
 }
 
@@ -6746,9 +6746,14 @@ struct RankedRow {
 ///
 /// `problem_view` ranks with `statement` because it is the question the Context answers, and
 /// `hint_text` ranks with `evidence` because it is unresolved locating text rather than a fact.
-/// `title` sits at the same weight as `statement` rather than above it: the title is derived from
-/// the first characters of the statement, so a higher weight would score that prefix twice.
-const CONTEXT_FTS_BM25_WEIGHTS: &str = "0.0, 0.0, 8.0, 8.0, 4.0, 2.0, 8.0, 2.0";
+///
+/// `title` is not a field an author wrote: it is the first sixty characters of `statement`, cut at
+/// a character bound. Weighting it alongside `statement` therefore scored that prefix twice and
+/// made where in a sentence a term happens to fall decide the ranking -- two Contexts covering
+/// exactly the same query tokens were separated by which of them said the shared word early. It
+/// keeps the lowest weight instead of none at all so the prefix still counts as text the Context
+/// contains, without deciding anything on its own.
+const CONTEXT_FTS_BM25_WEIGHTS: &str = "0.0, 0.0, 2.0, 8.0, 4.0, 2.0, 8.0, 2.0";
 
 /// Minimum share of distinct query tokens a revision must match to stay in a ranked page.
 /// Below it the row is a single incidental term overlap rather than a plausible answer.
