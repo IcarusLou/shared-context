@@ -8071,21 +8071,25 @@ fn serialized_tokens(value: &impl Serialize) -> usize {
     estimate_tokens(&serde_json::to_string(value).unwrap_or_default())
 }
 
+/// Approximates the token cost of one serialized Pack fragment.
+///
+/// Non-Han text is charged at four UTF-8 bytes per token, the usual byte-per-token ratio of a
+/// byte-pair vocabulary. A Han character is one morpheme worth three UTF-8 bytes, and a production
+/// vocabulary packs roughly one and a half of them into a single token, so Han is charged two
+/// tokens per three characters — about 0.67 token each. Charging one token per Han character, as
+/// this did before, spent a Chinese Pack budget three to four times faster than the identical
+/// English Pack and truncated Chinese Packs that were nowhere near the model limit.
 fn estimate_tokens(text: &str) -> usize {
-    let mut tokens: usize = 0;
-    let mut non_han_bytes: usize = 0;
+    let mut han_characters: usize = 0;
+    let mut other_bytes: usize = 0;
     for character in text.chars() {
         if is_han(character) {
-            tokens += 1;
-            if non_han_bytes > 0 {
-                tokens += non_han_bytes.div_ceil(4);
-                non_han_bytes = 0;
-            }
+            han_characters += 1;
         } else {
-            non_han_bytes += character.len_utf8();
+            other_bytes += character.len_utf8();
         }
     }
-    tokens + non_han_bytes.div_ceil(4)
+    han_characters.saturating_mul(2).div_ceil(3) + other_bytes.div_ceil(4)
 }
 
 fn is_han(character: char) -> bool {
@@ -9077,8 +9081,14 @@ mod tests {
     }
 
     #[test]
-    fn token_estimate_charges_han_individually() {
+    fn token_estimate_charges_han_by_morpheme_not_by_character() {
+        // Two Han characters cost two tokens per three characters, and "abcd" is one four-byte
+        // token: the mixed string stays at three tokens.
         assert_eq!(estimate_tokens("中文abcd"), 3);
+        // Thirty Han characters used to cost thirty tokens; they now cost twenty.
+        assert_eq!(estimate_tokens(&"重复".repeat(15)), 20);
+        // An ASCII sentence of the same byte length is charged the same way it always was.
+        assert_eq!(estimate_tokens("abcdefgh"), 2);
     }
 
     /// Manual fixed-corpus baseline; run with:
