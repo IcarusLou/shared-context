@@ -128,7 +128,7 @@ struct PostToolInput {
     common: Common,
     tool_name: String,
     tool_input: Value,
-    #[allow(dead_code)]
+    /// Read only for a structured success/failure marker; never retained.
     tool_output: String,
     tool_use_id: String,
     /// The desktop IDE sends an empty string or omits the field entirely.
@@ -245,7 +245,8 @@ pub fn decode_hook_input(bytes: &[u8]) -> Result<(CanonicalAgentEvent, String)> 
                 tool_category: normalized.category,
                 tool_use_id: input.tool_use_id,
                 path_hints: normalized.path_hints,
-                outcome: ToolOutcome::Succeeded,
+                file_access: normalized.file_access,
+                outcome: tool_outcome(&input.tool_output),
             }
         }
         "preCompact" => {
@@ -329,6 +330,48 @@ pub fn encode_hook_output(
     };
     serde_json::to_vec(&value)
         .map_err(|error| Error::new(ErrorKind::Io, format!("encode Cursor hook output: {error}")))
+}
+
+/// Derives the one structured success/failure marker a Cursor `postToolUse` carries.
+///
+/// Cursor sends `tool_output` as a JSON *string* whose content is the tool's own JSON result
+/// object — `{"exitCode":0,"stdout":"..."}` for shell tools, `{"contents":"..."}` for reads.
+/// Only the small set of explicit failure fields below is read; the payload is otherwise
+/// discarded and never crosses the adapter seam. Anything undecodable, non-object, or without
+/// one of those fields carries no failure information and stays `Succeeded`, which is exactly
+/// the value this adapter hard-coded before.
+fn tool_outcome(tool_output: &str) -> ToolOutcome {
+    let Ok(Value::Object(result)) = serde_json::from_str::<Value>(tool_output) else {
+        return ToolOutcome::Succeeded;
+    };
+    let failed = result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || result.get("success").and_then(Value::as_bool) == Some(false)
+        || result.get("error").is_some_and(is_present_error)
+        || ["exitCode", "exit_code"]
+            .iter()
+            .filter_map(|key| result.get(*key))
+            .any(|code| code.as_i64().is_some_and(|code| code != 0));
+    if failed {
+        ToolOutcome::Failed
+    } else {
+        ToolOutcome::Succeeded
+    }
+}
+
+/// An `error` field states a failure only when it actually carries one. Hosts routinely send
+/// `null`, `""`, or `{}` on success, and none of those is evidence that the tool failed.
+fn is_present_error(error: &Value) -> bool {
+    match error {
+        Value::Null => false,
+        Value::String(message) => !message.trim().is_empty(),
+        Value::Object(fields) => !fields.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Bool(flag) => *flag,
+        Value::Number(_) => true,
+    }
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(value: Value, event: &str) -> Result<T> {
