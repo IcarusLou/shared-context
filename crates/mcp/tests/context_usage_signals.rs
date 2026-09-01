@@ -360,6 +360,7 @@ fn confirming_a_contradiction_refutes_the_injected_context() {
     let candidate_id: CandidateId = candidate_list_at_root(
         &root,
         &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             status: sctx_domain::CandidateReviewStatus::Pending,

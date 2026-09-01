@@ -2300,6 +2300,7 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
                     "--agent-kind",
                     "--external-session-id",
                     "--status",
+                    "--scope",
                     "--limit",
                     "--cursor",
                     "--token-budget",
@@ -2311,6 +2312,9 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
                 external_session_id: options.required("--external-session-id")?.to_owned(),
                 status: parse_candidate_review_status(
                     options.optional("--status")?.unwrap_or("pending"),
+                )?,
+                scope: parse_candidate_review_scope(
+                    options.optional("--scope")?.unwrap_or("task"),
                 )?,
                 limit: parse_usize(options.optional("--limit")?.unwrap_or("20"), "limit")?,
                 cursor: options.optional("--cursor")?.map(str::to_owned),
@@ -3813,6 +3817,18 @@ fn parse_status(value: &str) -> Result<ContextStatus> {
         "superseded" => Ok(ContextStatus::Superseded),
         "governance_conflict" => Ok(ContextStatus::GovernanceConflict),
         _ => Err(invalid(format!("invalid Context status: {value}"))),
+    }
+}
+
+/// Mirrors the MCP `scope` selector: `task` is the Task-local default, `session` widens the
+/// listing to every Task of the Session read-only.
+fn parse_candidate_review_scope(value: &str) -> Result<sctx_domain::CandidateReviewScope> {
+    match value {
+        "task" => Ok(sctx_domain::CandidateReviewScope::Task),
+        "session" => Ok(sctx_domain::CandidateReviewScope::Session),
+        other => Err(invalid(format!(
+            "unsupported Candidate Review scope: {other}"
+        ))),
     }
 }
 

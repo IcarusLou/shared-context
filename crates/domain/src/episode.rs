@@ -1497,6 +1497,24 @@ pub enum CandidateReviewStatus {
     Confirmed,
 }
 
+/// How wide a Candidate Review listing reaches.
+///
+/// Ownership is unaffected either way: a Review is confirmed, discarded and edited only through
+/// the Task that owns it, and the wider scope is read-only. It exists because concurrent Agents
+/// sharing one `external_session_id` hold parallel Tasks, and a Candidate left Pending by a
+/// sibling Task used to be invisible from every other Task — nobody could see it to act on it.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateReviewScope {
+    /// Only the locator's exact `ActiveTask`.
+    #[default]
+    Task,
+    /// Every Task of the locator's `ExternalSession`, read-only.
+    Session,
+}
+
 /// Safe reason why a Candidate Review is visible but not ready for a decision.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]

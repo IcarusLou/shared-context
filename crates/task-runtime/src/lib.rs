@@ -17,15 +17,16 @@ use rusqlite::{
 };
 use sctx_domain::{
     AgentCheckpoint, AgentCheckpointId, Applicability, ArtifactRef, AutomaticContextCandidate,
-    CandidateBuildId, CandidateConfirmationPlan, CandidateId, CandidateReviewStatus,
-    CheckpointClaim, CheckpointClaimId, CheckpointEvidenceRef, CheckpointUnknown, ConfirmationId,
-    ContextId, ContextKind, ContextRevisionRef, Error, ErrorKind, EventId, EvidenceSnapshotDraft,
-    EvidenceType, ExternalSessionId, ExternalSessionLocator, ExternalSessionSnapshot,
-    IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation, ProposedSpaceGroupKey,
-    Result, RevisionId, SignalId, SpaceId, SubmissionId, TaskId, TaskIntentRevision,
-    TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalKind,
-    TaskSignalLifecycle, TaskSignalRecord, WorkEpisode, WorkEpisodeId, WorkEpisodeRef,
-    WorkEpisodeStatus, WorkObservation, WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
+    CandidateBuildId, CandidateConfirmationPlan, CandidateId, CandidateReviewScope,
+    CandidateReviewStatus, CheckpointClaim, CheckpointClaimId, CheckpointEvidenceRef,
+    CheckpointUnknown, ConfirmationId, ContextId, ContextKind, ContextRevisionRef, Error,
+    ErrorKind, EventId, EvidenceSnapshotDraft, EvidenceType, ExternalSessionId,
+    ExternalSessionLocator, ExternalSessionSnapshot, IntentRevisionRange, NonLocatingSignalRef,
+    NormalizedWorkObservation, ProposedSpaceGroupKey, Result, RevisionId, SignalId, SpaceId,
+    SubmissionId, TaskId, TaskIntentRevision, TaskIntentRevisionId, TaskSessionId,
+    TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord,
+    WorkEpisode, WorkEpisodeId, WorkEpisodeRef, WorkEpisodeStatus, WorkObservation,
+    WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
 };
 use sha2::{Digest, Sha256};
 
@@ -2797,6 +2798,31 @@ impl TaskRuntime {
         limit: usize,
         cursor: Option<&str>,
     ) -> Result<CandidateReviewPage> {
+        self.list_candidate_reviews_in_scope(
+            locator,
+            CandidateReviewScope::Task,
+            status,
+            limit,
+            cursor,
+        )
+    }
+
+    /// Lists one stable bounded page of Reviews at the requested scope.
+    ///
+    /// The page is ordered and cursored identically at both scopes, so a caller widening the scope
+    /// keeps its pagination contract and simply sees more rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed locator, cursor, bound, parse, or storage failures.
+    pub fn list_candidate_reviews_in_scope(
+        &self,
+        locator: &ExternalSessionLocator,
+        scope: CandidateReviewScope,
+        status: CandidateReviewStatus,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<CandidateReviewPage> {
         locator.validate()?;
         if limit == 0 || limit > MAX_CANDIDATE_REVIEW_LIST_LIMIT {
             return Err(invalid(
@@ -2826,11 +2852,19 @@ impl TaskRuntime {
                         review_version, status, discard_reason, created_at_unix_seconds,
                         expires_at_unix_seconds, discarded_at_unix_seconds,
                         expired_at_unix_seconds, confirmation_id, result_context_id
-                 FROM candidate_review
-                 WHERE task_session_id = ?1 AND task_id = ?2 AND status = ?3
-                   AND (created_at_unix_seconds > ?4 OR
-                        (created_at_unix_seconds = ?4 AND candidate_id > ?5))
-                 ORDER BY created_at_unix_seconds ASC, candidate_id ASC
+                 FROM candidate_review AS review
+                 WHERE ((?7 = 'task'
+                         AND review.task_session_id = ?1 AND review.task_id = ?2)
+                     OR (?7 = 'session'
+                         AND review.task_session_id IN (
+                             SELECT sibling.task_session_id FROM task_session AS sibling
+                             WHERE sibling.external_session_id = (
+                                 SELECT owner.external_session_id FROM task_session AS owner
+                                 WHERE owner.task_session_id = ?1))))
+                   AND review.status = ?3
+                   AND (review.created_at_unix_seconds > ?4 OR
+                        (review.created_at_unix_seconds = ?4 AND review.candidate_id > ?5))
+                 ORDER BY review.created_at_unix_seconds ASC, review.candidate_id ASC
                  LIMIT ?6",
             )
             .map_err(sql_error("prepare Candidate Review page"))?;
@@ -2845,6 +2879,7 @@ impl TaskRuntime {
                         .map_err(|_| invalid("Candidate Review cursor exceeds SQLite range"))?,
                     cursor_candidate,
                     query_limit,
+                    candidate_review_scope_name(scope),
                 ],
                 candidate_review_row,
             )
@@ -2870,6 +2905,39 @@ impl TaskRuntime {
             records,
             next_cursor,
         })
+    }
+
+    /// Counts Pending Candidate Reviews this Task's `ExternalSession` holds outside this Task.
+    ///
+    /// It is a bare count and nothing else. A sibling Task's Candidate is untrusted Agent-authored
+    /// content the current Task never asked for, so its statement stays out of this Task's Pack;
+    /// the number alone is enough to tell a reviewer that `candidate_list` with `scope: "session"`
+    /// has something to show.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage failures.
+    pub fn count_pending_candidates_in_other_tasks(
+        &self,
+        task_session_id: TaskSessionId,
+        task_id: TaskId,
+    ) -> Result<u32> {
+        let connection = self.open_connection()?;
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM candidate_review AS review
+                 WHERE review.status = 'pending'
+                   AND review.task_id <> ?2
+                   AND review.task_session_id IN (
+                       SELECT sibling.task_session_id FROM task_session AS sibling
+                       WHERE sibling.external_session_id = (
+                           SELECT owner.external_session_id FROM task_session AS owner
+                           WHERE owner.task_session_id = ?1))",
+                params![task_session_id.to_string(), task_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(sql_error("count sibling Candidate Reviews"))?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
     }
 
     /// Lists Pending and Confirmed Candidate Reviews owned by every Task of one `ExternalSession`.
@@ -5482,6 +5550,14 @@ fn read_candidate_review_record(
         .map_err(sql_error("read Candidate Review"))?
         .map(parse_candidate_review_record)
         .transpose()
+}
+
+/// The scope discriminator bound into the Candidate Review page query.
+const fn candidate_review_scope_name(scope: CandidateReviewScope) -> &'static str {
+    match scope {
+        CandidateReviewScope::Task => "task",
+        CandidateReviewScope::Session => "session",
+    }
 }
 
 const fn candidate_review_status_name(status: CandidateReviewStatus) -> &'static str {
