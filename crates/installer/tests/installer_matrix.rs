@@ -335,13 +335,17 @@ fn runtime_operation_count(connection: &Connection) -> i64 {
         .unwrap()
 }
 
-fn assert_runtime_schema_13(root: &Path) {
+fn assert_runtime_schema_current(root: &Path) {
     let connection = Connection::open(runtime_database(root)).unwrap();
     let version = connection
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .unwrap();
-    assert_eq!(version, 13);
+    // 14 is the current schema version: 13 gained an in-place, additive `hook_event` migration
+    // rather than becoming a discardable/unsupported version, so a fresh or rebuilt Runtime
+    // always lands on 14.
+    assert_eq!(version, 14);
     assert!(sqlite_table_exists(&connection, "task_signal"));
+    assert!(sqlite_table_exists(&connection, "hook_event"));
     assert!(!sqlite_table_exists(&connection, "capture_ingestion"));
     assert!(!sqlite_table_exists(&connection, "work_episode_diagnostic"));
     assert_eq!(runtime_operation_count(&connection), 0);
@@ -939,7 +943,7 @@ fn setup_rebuilds_schema_12_runtime_and_discards_cached_task_and_operation() {
     let report = installer.setup(&SetupOptions::default()).unwrap();
 
     assert!(report.changed);
-    assert_runtime_schema_13(&harness.root);
+    assert_runtime_schema_current(&harness.root);
     for path in legacy_capture_paths(&harness.root) {
         assert!(
             !path.exists(),
@@ -968,7 +972,7 @@ fn setup_rebuilds_schema_11_runtime_and_discards_cached_task_and_capture_state()
     let report = installer.setup(&SetupOptions::default()).unwrap();
 
     assert!(report.changed);
-    assert_runtime_schema_13(&harness.root);
+    assert_runtime_schema_current(&harness.root);
     for path in legacy_capture_paths(&harness.root) {
         assert!(
             !path.exists(),
@@ -987,7 +991,7 @@ fn setup_rebuilds_schema_11_runtime_and_discards_cached_task_and_capture_state()
 
 #[test]
 fn setup_rejects_unknown_or_future_runtime_schemas_without_mutating_state() {
-    for version in [10_u32, 14, 999] {
+    for version in [10_u32, 15, 999] {
         let harness = Harness::new();
         let installer = harness.installer("1.2.3");
         installer.setup(&SetupOptions::default()).unwrap();
@@ -1026,7 +1030,7 @@ fn setup_rejects_unknown_or_future_runtime_schemas_without_mutating_state() {
 
         assert_eq!(
             error.message(),
-            format!("unsupported task runtime schema version {version}; expected 13")
+            format!("unsupported task runtime schema version {version}; expected 14")
         );
         for (path, bytes, mode) in prior {
             assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
@@ -1124,7 +1128,7 @@ fn idempotent_setup_retains_compatible_schema_13_runtime_data() {
     let report = installer.setup(&SetupOptions::default()).unwrap();
 
     assert!(!report.changed);
-    assert_runtime_schema_13(&harness.root);
+    assert_runtime_schema_current(&harness.root);
     assert!(
         TaskRuntime::initialize(&harness.root)
             .unwrap()
@@ -1330,7 +1334,7 @@ fn data_reset_dry_run_is_read_only_and_confirmed_reset_preserves_installation() 
             .healthy
     );
     TaskRuntime::initialize(harness.root.clone()).unwrap();
-    assert_runtime_schema_13(&harness.root);
+    assert_runtime_schema_current(&harness.root);
     for path in legacy_capture_paths(&harness.root) {
         assert!(
             !path.exists(),

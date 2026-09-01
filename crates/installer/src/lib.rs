@@ -3780,12 +3780,19 @@ fn ensure_current_task_runtime(transaction: &mut Transaction, root: &Path) -> Re
 }
 
 fn is_discardable_task_runtime_schema(error: &Error) -> bool {
+    // Matched by version prefix only, deliberately not the full message: `TaskRuntime` migrates
+    // version 13 forward in place (adding `hook_event`) rather than erroring, and the "expected
+    // N" suffix names whatever `sctx_task_runtime::TaskRuntime`'s current `SCHEMA_VERSION` is,
+    // which this crate does not otherwise depend on. Versions below 13 predate that in-place
+    // migration and have no supported upgrade path, so their databases are discarded and
+    // rebuilt from scratch instead.
     error.kind() == ErrorKind::InvariantViolation
-        && matches!(
-            error.message(),
-            "unsupported task runtime schema version 11; expected 13"
-                | "unsupported task runtime schema version 12; expected 13"
-        )
+        && [
+            "unsupported task runtime schema version 11;",
+            "unsupported task runtime schema version 12;",
+        ]
+        .iter()
+        .any(|prefix| error.message().starts_with(prefix))
 }
 
 fn remove_legacy_capture_state(transaction: &mut Transaction, root: &Path) -> Result<bool> {

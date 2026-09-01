@@ -10,11 +10,11 @@ use sctx_domain::{
     RepositoryIdentity, RevisionId, SpaceId,
 };
 use sctx_engineering_graph::{
-    ARTIFACT_FOCUS_QUERY_BUDGET, ArtifactFocusReader, ArtifactObservation, ArtifactSourceState,
-    EngineeringProjectionStore, EngineeringReferenceResolver, GraphContextSafety,
-    GraphContextSafetyBlocker, GraphContextSnapshot, GraphContextStatus, MAX_ARTIFACT_FOCUS_HITS,
-    ProjectedEngineeringReference, RepositoryScanOutcome, RepositorySnapshot, SnapshotArtifact,
-    SnapshotSourcePolicy, SourceLanguage,
+    ARTIFACT_FOCUS_QUERY_BUDGET, ArtifactFocusOutcome, ArtifactFocusReader, ArtifactObservation,
+    ArtifactSourceState, EngineeringProjectionStore, EngineeringReferenceResolver,
+    GraphContextSafety, GraphContextSafetyBlocker, GraphContextSnapshot, GraphContextStatus,
+    MAX_ARTIFACT_FOCUS_HITS, ProjectedEngineeringReference, RepositoryScanOutcome,
+    RepositorySnapshot, SnapshotArtifact, SnapshotSourcePolicy, SourceLanguage,
 };
 use tempfile::TempDir;
 
@@ -190,7 +190,7 @@ fn build(accepted: bool) -> Fixture {
 #[test]
 fn exact_file_artifact_returns_only_accepted_injection_eligible_context() {
     let fixture = build(true);
-    let hits = fixture
+    let lookup = fixture
         .reader
         .accepted_contexts_for_file(
             &fixture.repository.repository_id,
@@ -199,52 +199,53 @@ fn exact_file_artifact_returns_only_accepted_injection_eligible_context() {
             ARTIFACT_FOCUS_QUERY_BUDGET,
         )
         .unwrap();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].context_id, fixture.context_id.to_string());
-    assert_eq!(hits[0].statement, STATEMENT);
+    assert_eq!(lookup.outcome, ArtifactFocusOutcome::Completed);
+    assert_eq!(lookup.hits.len(), 1);
+    assert_eq!(lookup.hits[0].context_id, fixture.context_id.to_string());
+    assert_eq!(lookup.hits[0].statement, STATEMENT);
 }
 
 #[test]
 fn unaccepted_context_missing_path_and_foreign_repository_all_return_no_hit() {
     let candidate = build(false);
-    assert!(
-        candidate
-            .reader
-            .accepted_contexts_for_file(
-                &candidate.repository.repository_id,
-                &path("src/PoiEntranceAssem.kt"),
-                MAX_ARTIFACT_FOCUS_HITS,
-                ARTIFACT_FOCUS_QUERY_BUDGET,
-            )
-            .unwrap()
-            .is_empty()
-    );
+    let candidate_lookup = candidate
+        .reader
+        .accepted_contexts_for_file(
+            &candidate.repository.repository_id,
+            &path("src/PoiEntranceAssem.kt"),
+            MAX_ARTIFACT_FOCUS_HITS,
+            ARTIFACT_FOCUS_QUERY_BUDGET,
+        )
+        .unwrap();
+    assert_eq!(candidate_lookup.outcome, ArtifactFocusOutcome::Completed);
+    assert!(candidate_lookup.hits.is_empty());
 
     let accepted = build(true);
-    assert!(
-        accepted
-            .reader
-            .accepted_contexts_for_file(
-                &accepted.repository.repository_id,
-                &path("src/Unrelated.kt"),
-                MAX_ARTIFACT_FOCUS_HITS,
-                ARTIFACT_FOCUS_QUERY_BUDGET,
-            )
-            .unwrap()
-            .is_empty()
+    let missing_path_lookup = accepted
+        .reader
+        .accepted_contexts_for_file(
+            &accepted.repository.repository_id,
+            &path("src/Unrelated.kt"),
+            MAX_ARTIFACT_FOCUS_HITS,
+            ARTIFACT_FOCUS_QUERY_BUDGET,
+        )
+        .unwrap();
+    assert_eq!(missing_path_lookup.outcome, ArtifactFocusOutcome::Completed);
+    assert!(missing_path_lookup.hits.is_empty());
+    let foreign_repository_lookup = accepted
+        .reader
+        .accepted_contexts_for_file(
+            &RepositoryId::new(),
+            &path("src/PoiEntranceAssem.kt"),
+            MAX_ARTIFACT_FOCUS_HITS,
+            ARTIFACT_FOCUS_QUERY_BUDGET,
+        )
+        .unwrap();
+    assert_eq!(
+        foreign_repository_lookup.outcome,
+        ArtifactFocusOutcome::Completed
     );
-    assert!(
-        accepted
-            .reader
-            .accepted_contexts_for_file(
-                &RepositoryId::new(),
-                &path("src/PoiEntranceAssem.kt"),
-                MAX_ARTIFACT_FOCUS_HITS,
-                ARTIFACT_FOCUS_QUERY_BUDGET,
-            )
-            .unwrap()
-            .is_empty()
-    );
+    assert!(foreign_repository_lookup.hits.is_empty());
 }
 
 #[test]
@@ -252,34 +253,32 @@ fn absent_projection_database_is_no_hit_instead_of_an_error() {
     let temporary = TempDir::new().unwrap();
     let reader = ArtifactFocusReader::new(temporary.path().join(".shared-context"));
     assert!(!reader.database_path().exists());
-    assert!(
-        reader
-            .accepted_contexts_for_file(
-                &RepositoryId::new(),
-                &path("src/PoiEntranceAssem.kt"),
-                MAX_ARTIFACT_FOCUS_HITS,
-                ARTIFACT_FOCUS_QUERY_BUDGET,
-            )
-            .unwrap()
-            .is_empty()
-    );
+    let lookup = reader
+        .accepted_contexts_for_file(
+            &RepositoryId::new(),
+            &path("src/PoiEntranceAssem.kt"),
+            MAX_ARTIFACT_FOCUS_HITS,
+            ARTIFACT_FOCUS_QUERY_BUDGET,
+        )
+        .unwrap();
+    assert_eq!(lookup.outcome, ArtifactFocusOutcome::ProjectionAbsent);
+    assert!(lookup.hits.is_empty());
 }
 
 #[test]
 fn exhausted_query_budget_degrades_to_no_hit() {
     let fixture = build(true);
-    assert!(
-        fixture
-            .reader
-            .accepted_contexts_for_file(
-                &fixture.repository.repository_id,
-                &path("src/PoiEntranceAssem.kt"),
-                MAX_ARTIFACT_FOCUS_HITS,
-                Duration::ZERO,
-            )
-            .unwrap()
-            .is_empty()
-    );
+    let lookup = fixture
+        .reader
+        .accepted_contexts_for_file(
+            &fixture.repository.repository_id,
+            &path("src/PoiEntranceAssem.kt"),
+            MAX_ARTIFACT_FOCUS_HITS,
+            Duration::ZERO,
+        )
+        .unwrap();
+    assert_eq!(lookup.outcome, ArtifactFocusOutcome::BudgetExceeded);
+    assert!(lookup.hits.is_empty());
 }
 
 #[test]
@@ -291,7 +290,7 @@ fn read_only_lookup_meets_the_hook_hot_path_budget() {
     // `exhausted_query_budget_degrades_to_no_hit` already covers.
     for _ in 0..100 {
         let started = Instant::now();
-        let hits = fixture
+        let lookup = fixture
             .reader
             .accepted_contexts_for_file(
                 &fixture.repository.repository_id,
@@ -301,7 +300,7 @@ fn read_only_lookup_meets_the_hook_hot_path_budget() {
             )
             .unwrap();
         samples.push(started.elapsed());
-        assert_eq!(hits.len(), 1);
+        assert_eq!(lookup.hits.len(), 1);
     }
     samples.sort_unstable();
     let p99 = samples[98];
