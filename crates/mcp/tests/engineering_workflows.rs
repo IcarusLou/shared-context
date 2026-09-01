@@ -14,6 +14,7 @@ use sctx_domain::{
     PublicationDraft, ReferenceRelation, RepoRelativePath, RepositoryId, ReviewDraft,
     ReviewVerdict, RevisionId, TaskId, TaskSignal, TaskSignalKind, WorkingIntentSnapshot,
 };
+use sctx_engineering_graph::EngineeringProjectionStore;
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_local_state::{AuthorizedSessionScopeStore, UserConfigStore};
@@ -1658,4 +1659,263 @@ fn ambiguous_and_unavailable_explanations_never_choose_and_graph_failure_degrade
     )
     .unwrap();
     assert!(degraded.artifact_generation.is_none());
+}
+
+/// Registers one Repository, records one Engineering Reference against an accepted Context, and
+/// returns the installation root. Nothing here ever calls `association_rebuild`.
+fn auto_scan_root(
+    temporary: &TempDir,
+    auto_scan: Option<bool>,
+) -> (std::path::PathBuf, sctx_domain::ReferenceId) {
+    let root = temporary.path().join("auto scan root");
+    let checkout = temporary.path().join("auto scan checkout");
+    init_repo(
+        &checkout,
+        &[(
+            "src/anchor.rs",
+            "pub fn auto_scan_anchor() -> bool { true }\n",
+        )],
+    );
+    let checkout = fs::canonicalize(&checkout).unwrap();
+    let (context_id, revision_id) = accepted_context(&root, "auto scan decision");
+    let config = UserConfigStore::initialize(&root).unwrap();
+    let repository = config
+        .add_repository("AutoScan".parse().unwrap(), std::slice::from_ref(&checkout))
+        .unwrap()
+        .repository;
+    if let Some(auto_scan) = auto_scan {
+        let config_path = root.join("config.toml");
+        let mut text = fs::read_to_string(&config_path).unwrap();
+        text.push_str(&format!("\n[engineering]\nauto_scan = {auto_scan}\n"));
+        fs::write(&config_path, text).unwrap();
+    }
+    let recorded = engineering_reference_record_at_root(
+        &root,
+        &reference_input(
+            context_id,
+            revision_id,
+            &repository.repository_id,
+            ArtifactKind::File,
+            ReferenceRelation::Implements,
+            ArtifactLocator::File {
+                path: RepoRelativePath::new("src/anchor.rs").unwrap(),
+            },
+        ),
+    )
+    .unwrap();
+    (root, recorded.reference_id)
+}
+
+/// The Graph channel has to be live in a real installation, not only in one that remembers to run
+/// `sctx association rebuild` by hand. Recording an Engineering Reference is an interactive MCP
+/// write, so it spends its bounded budget scanning the Repository the Reference points into.
+#[test]
+fn recording_an_engineering_reference_scans_the_repository_it_names() {
+    let temporary = TempDir::new().unwrap();
+    let (root, reference_id) = auto_scan_root(&temporary, None);
+
+    let snapshot = EngineeringProjectionStore::initialize(&root)
+        .unwrap()
+        .read_snapshot()
+        .unwrap()
+        .expect("the default [engineering] table scans without being asked");
+    assert!(
+        !snapshot.projection.contexts.is_empty(),
+        "an installation whose graph_context_snapshot is empty has no Graph channel at all"
+    );
+    assert_eq!(snapshot.projection.references.len(), 1);
+    assert_eq!(
+        snapshot.projection.references[0].resolution.status,
+        sctx_domain::ResolutionStatus::Resolved,
+        "the Reference resolves against the snapshot the same write produced"
+    );
+
+    let explained = association_explain_at_root(
+        &root,
+        &AssociationExplainInput {
+            reference_id: reference_id.to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(explained.status, sctx_domain::ResolutionStatus::Resolved);
+}
+
+/// `auto_scan = false` is the explicit opt-out, and it is silent: the write succeeds and the
+/// Graph is simply left where the last explicit rebuild put it.
+#[test]
+fn auto_scan_false_leaves_the_graph_exactly_where_it_was() {
+    let temporary = TempDir::new().unwrap();
+    let (root, _) = auto_scan_root(&temporary, Some(false));
+
+    assert!(
+        EngineeringProjectionStore::initialize(&root)
+            .unwrap()
+            .read_snapshot()
+            .unwrap()
+            .is_none(),
+        "the opt-out writes no projection at all"
+    );
+
+    // The explicit command still works, and is what the doctor warning points at.
+    let rebuilt = association_rebuild_at_root(
+        &root,
+        &AssociationRebuildInput {
+            diagnose_only: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(rebuilt.status_counts.resolved, 1);
+}
+
+/// The same rescan on the path that actually produces most References: a Confirmation whose
+/// Claim named a file. `candidate_confirm` is an interactive MCP call, so it pays the bounded
+/// budget once and reports `graph_rebuild_pending` when it could not.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_confirmation_that_names_engineering_references_rescans_within_its_budget() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("confirm scan root");
+    let checkout = temporary.path().join("confirm scan checkout");
+    init_repo(
+        &checkout,
+        &[("app/src/anchor/ProductAnchorAssem.kt", "// fixture\n")],
+    );
+    let checkout = fs::canonicalize(&checkout).unwrap();
+    GitStore::bootstrap_local(&root).unwrap();
+    UserConfigStore::initialize(&root)
+        .unwrap()
+        .add_repository(
+            "ConfirmScan".parse().unwrap(),
+            std::slice::from_ref(&checkout),
+        )
+        .unwrap();
+    let session = "confirm-scan";
+    let locator = ExternalSessionLocator::new("codex", session).unwrap();
+    let catalog = UserConfigStore::open_existing(&root)
+        .unwrap()
+        .repository_catalog_wait()
+        .unwrap();
+    AuthorizedSessionScopeStore::initialize(&root)
+        .unwrap()
+        .try_authorize_missing(&locator, &catalog, &checkout)
+        .unwrap();
+    let space = sctx_mcp::space_create_at_root(
+        &root,
+        &sctx_mcp::SpaceCreateInput {
+            intent: IntentSnapshot {
+                title: "Anchor assembly navigation".to_owned(),
+                problem: "The anchor assembly skips navigation".to_owned(),
+                desired_outcome: "Every confirmed Claim reaches the Graph".to_owned(),
+                in_scope: vec!["Engineering Graph".to_owned()],
+                out_of_scope: Vec::new(),
+                acceptance_conditions: vec!["The Reference resolves".to_owned()],
+                domain_terms: vec!["anchor".to_owned()],
+            },
+        },
+    )
+    .unwrap();
+    let task = task_intent_update_at_root(
+        &root,
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            task_boundary: TaskBoundary::New,
+            expected_revision_id: ExpectedRevisionId::Null(()),
+            intent: WorkingIntentSnapshot::new("confirm the anchor assembly finding").unwrap(),
+        },
+    )
+    .unwrap();
+    let accepted = sctx_mcp::task_checkpoint_at_root(
+        &root,
+        &sctx_mcp::TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            claims: vec![sctx_mcp::TaskCheckpointClaimInput {
+                context_kind: ContextKind::Issue,
+                statement: "ProductAnchorAssem.kt:202 returns early and skips navigation"
+                    .to_owned(),
+                rationale: "The early return observably diverges from the baseline".to_owned(),
+                conditions: vec!["live entry service is absent".to_owned()],
+                evidence: vec![sctx_mcp::TaskCheckpointEvidenceInput {
+                    evidence_type: EvidenceType::SourceSnapshot,
+                    summary: "ProductAnchorAssem.kt:202 returns before dispatch".to_owned(),
+                    limitations: Vec::new(),
+                }],
+            }],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap()
+    .into_accepted()
+    .expect("a nonempty Checkpoint is accepted");
+    sctx_mcp::build_closed_episode_at_root(&root, accepted.episode_id).unwrap();
+
+    assert!(
+        EngineeringProjectionStore::initialize(&root)
+            .unwrap()
+            .read_snapshot()
+            .unwrap()
+            .is_none(),
+        "nothing before the Confirmation has written a Graph"
+    );
+
+    let listed = sctx_mcp::candidate_list_at_root(
+        &root,
+        &sctx_mcp::CandidateListInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            status: sctx_domain::CandidateReviewStatus::Pending,
+            limit: 100,
+            cursor: None,
+            token_budget: 32_768,
+        },
+    )
+    .unwrap();
+    assert_eq!(listed.reviews.len(), 1);
+    let candidate_id = listed.reviews[0].0.candidate_id;
+
+    let confirmed = sctx_mcp::candidate_confirm_at_root(
+        &root,
+        &sctx_mcp::CandidateConfirmInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: task.context.task_id.to_string(),
+            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+            candidate_id: candidate_id.to_string(),
+            expected_review_version: 1,
+            primary: sctx_mcp::CandidateConfirmPrimaryInput::Existing(
+                sctx_mcp::ExistingCandidatePrimaryInput {
+                    existing_space_id: space.space_id.to_string(),
+                },
+            ),
+            related_space_ids: Vec::new(),
+            edits: sctx_domain::OptionalCandidateEdits::default(),
+        },
+    )
+    .unwrap();
+    assert!(
+        !confirmed.graph_rebuild_pending,
+        "the bounded rescan finished inside the Confirmation"
+    );
+
+    let snapshot = EngineeringProjectionStore::initialize(&root)
+        .unwrap()
+        .read_snapshot()
+        .unwrap()
+        .expect("the Confirmation built the Graph");
+    assert!(
+        !snapshot.projection.contexts.is_empty(),
+        "graph_context_snapshot is what a Task Context Pack reads; an empty one is no channel"
+    );
+    assert!(!snapshot.projection.references.is_empty());
+    assert!(
+        snapshot
+            .projection
+            .references
+            .iter()
+            .all(|reference| reference.resolution.status
+                == sctx_domain::ResolutionStatus::Resolved),
+        "{:#?}",
+        snapshot.projection.references
+    );
 }

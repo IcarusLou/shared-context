@@ -15,6 +15,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use sctx_domain::{
@@ -1423,6 +1424,12 @@ pub struct AssociationRebuildResponse {
     pub tree: String,
     pub generation: u64,
 }
+
+/// Wall-clock budget for the bounded Graph rescan that follows an interactive Engineering write.
+///
+/// Short enough that an Agent waiting on `candidate_confirm` never notices it, and the scan it
+/// bounds only ever visits the paths the Engineering References actually name.
+const AUTO_SCAN_BUDGET: Duration = Duration::from_secs(2);
 
 /// Prefix of the only structured `recheck_when` entries the server evaluates.
 pub const RECHECK_BRANCH_ADVANCED_PREFIX: &str = "branch_advanced:";
@@ -3357,10 +3364,7 @@ impl Runtime {
         {
             false
         } else {
-            self.association_rebuild(&AssociationRebuildInput {
-                diagnose_only: false,
-            })
-            .is_err()
+            self.auto_scan_engineering_graph()
         };
         let snapshot = self.snapshot()?;
         Ok(reserved
@@ -3777,6 +3781,10 @@ impl Runtime {
         let append = self.store()?.append_event(AppendRequest::event(event))?;
         let metadata = self.index.synchronize()?.metadata;
         debug_assert!(snapshot.projection.spaces.contains_key(&space_id));
+        // The other half of the same gap a Confirmation closes: a Reference recorded after the
+        // fact is the common way an installation acquires one, and until something scans the
+        // Repository it names, the Reference resolves against nothing.
+        let _ = self.auto_scan_engineering_graph();
         Ok(EngineeringReferenceRecordResponse {
             context_id,
             revision_id,
@@ -3883,6 +3891,20 @@ impl Runtime {
         &self,
         input: &AssociationRebuildInput,
     ) -> Result<AssociationRebuildResponse> {
+        self.association_rebuild_before(input, None)?
+            .ok_or_else(|| invariant("an unbudgeted Graph rebuild cannot be abandoned"))
+    }
+
+    /// Rebuilds the Engineering projection under an optional wall-clock budget.
+    ///
+    /// `Ok(None)` means the budget ran out during the Repository scan and nothing was written.
+    /// The previous projection stays exactly as it was: an abandoned rebuild is never a smaller
+    /// Graph, only an older one.
+    fn association_rebuild_before(
+        &self,
+        input: &AssociationRebuildInput,
+        deadline: Option<Instant>,
+    ) -> Result<Option<AssociationRebuildResponse>> {
         let engineering_graph = self
             .engineering_graph
             .as_ref()
@@ -3899,8 +3921,11 @@ impl Runtime {
             })
             .collect::<Vec<_>>();
         let repositories = self.repositories.list()?;
-        let (scan_outcomes, repository_summaries) =
-            scan_registered_repositories(&repositories, &references)?;
+        let Some((scan_outcomes, repository_summaries)) =
+            scan_registered_repositories_before(&repositories, &references, deadline)?
+        else {
+            return Ok(None);
+        };
         let context_snapshots = build_graph_context_snapshots(&snapshot.projection, &references)?;
         let previous = engineering_graph.read_projection()?;
         let projection = previous.as_ref().map_or_else(
@@ -3925,7 +3950,7 @@ impl Runtime {
                 .rebuild_for_context_tree(&projection, Some(&snapshot.metadata.indexed_tree_oid))?;
         }
         let status_counts = resolution_status_counts(&projection.references);
-        Ok(AssociationRebuildResponse {
+        Ok(Some(AssociationRebuildResponse {
             diagnose_only: input.diagnose_only,
             stored: !input.diagnose_only,
             artifact_generation: projection.artifact_generation,
@@ -3935,7 +3960,47 @@ impl Runtime {
             status_counts,
             tree: snapshot.metadata.indexed_tree_oid.clone(),
             generation: snapshot.metadata.projection_generation,
-        })
+        }))
+    }
+
+    /// Bounded, best-effort Graph rescan for one interactive write that named Engineering
+    /// References. Returns whether the Graph is still behind the Store afterwards.
+    ///
+    /// This is the only automatic scan in the product and it is deliberately synchronous: the
+    /// caller is an MCP tool call an Agent is waiting on, so the rescan gets one explicit budget
+    /// and the answer to "did it finish" rather than a background job nobody observes. It never
+    /// runs on a Hook path. Everything it can fail at -- unreadable configuration, an unavailable
+    /// checkout, an exhausted budget -- leaves the Confirmation that triggered it untouched and
+    /// is reported as `graph_rebuild_pending`, which names `sctx association rebuild` as the fix.
+    fn auto_scan_engineering_graph(&self) -> bool {
+        let enabled = UserConfigStore::open_existing(&self.root)
+            .and_then(|config| config.engineering_settings())
+            .is_ok_and(|settings| settings.auto_scan);
+        if !enabled {
+            return true;
+        }
+        let deadline = Instant::now().checked_add(AUTO_SCAN_BUDGET);
+        match self.association_rebuild_before(
+            &AssociationRebuildInput {
+                diagnose_only: false,
+            },
+            deadline,
+        ) {
+            Ok(Some(_)) => false,
+            Ok(None) => {
+                eprintln!(
+                    "sctx: Engineering Graph rescan exceeded its {}s budget; run `sctx association rebuild`",
+                    AUTO_SCAN_BUDGET.as_secs()
+                );
+                true
+            }
+            Err(error) => {
+                eprintln!(
+                    "sctx: Engineering Graph rescan failed ({error}); run `sctx association rebuild`"
+                );
+                true
+            }
+        }
     }
 
     fn association_explain(
@@ -4158,10 +4223,16 @@ fn bounded_git(checkout: &Path, arguments: &[&str]) -> Option<String> {
     String::from_utf8(output).ok()
 }
 
-fn scan_registered_repositories(
+/// Scans every Repository named by `references`, optionally under one shared wall-clock budget.
+///
+/// `Ok(None)` means the budget ran out and no Repository set was produced. The whole rebuild is
+/// abandoned rather than resolved against a half-scanned set, because a Repository that was not
+/// reached would resolve as `Missing` and that is a claim about the checkout, not about the clock.
+fn scan_registered_repositories_before(
     repositories: &[RegisteredRepository],
     references: &[ProjectedEngineeringReference],
-) -> Result<(Vec<RepositoryScanOutcome>, Vec<RepositoryRebuildSummary>)> {
+    deadline: Option<Instant>,
+) -> Result<Option<(Vec<RepositoryScanOutcome>, Vec<RepositoryRebuildSummary>)>> {
     let scanner = RepositoryScanner::default();
     let repositories = repositories
         .iter()
@@ -4200,7 +4271,16 @@ fn scan_registered_repositories(
                 && locator.checkout_path.exists()
         });
         let outcome = if let Some(locator) = locator {
-            scanner.scan(&repository.identity, &locator.checkout_path, &plan)?
+            let Some(outcome) = scanner.scan_before(
+                &repository.identity,
+                &locator.checkout_path,
+                &plan,
+                deadline,
+            )?
+            else {
+                return Ok(None);
+            };
+            outcome
         } else {
             RepositoryScanOutcome::Unavailable {
                 repository_id: repository.identity.repository_id.clone(),
@@ -4233,7 +4313,7 @@ fn scan_registered_repositories(
         outcomes.push(outcome);
         summaries.push(summary);
     }
-    Ok((outcomes, summaries))
+    Ok(Some((outcomes, summaries)))
 }
 
 fn skipped_reason_name(reason: SkippedFileReason) -> &'static str {
