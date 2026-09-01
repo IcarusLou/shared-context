@@ -136,7 +136,11 @@ cargo test --locked -p sctx-cli --test hook_to_confirm_chain
 cargo test --locked -p sctx-cli --test repository_scope_foundation
 cargo test --locked -p sctx-cli --test repository_scoped_activation_acceptance
 cargo test --locked -p sctx-cli --test repository_scoped_context_acceptance
+cargo test --locked -p sctx-cli --test association_probe_workflow
+cargo test --locked -p sctx-cli --test association_probe_zh_workflow
 ```
+
+关联召回的具体数字以 `crates/cli/tests/association_probe_workflow.rs` 与 `crates/cli/tests/association_probe_zh_workflow.rs` 这两个 blocking 测试断言的为准，文档其余处的召回描述都只是转述。
 
 提交 `Cargo.lock`，确保 CLI workspace 的本地与 CI 构建使用相同依赖解析结果。
 
