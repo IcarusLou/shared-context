@@ -1107,12 +1107,16 @@ fn first_locator_decision_is_sticky_and_disabled_residue_is_exactly_zero() {
     assert_eq!(oracle.disabled_residue.knowledge_commits_delta, 0);
 }
 
-fn assert_denied(response: &McpResponse, fixture: &Fixture) {
+/// Every refusal stays in the one `session_not_authorized` family, and its `code` names
+/// the single cause the caller can act on: re-copy the marker id, register the directory,
+/// or retry a transient local failure. None of them may name a path or Repository.
+fn assert_denied(response: &McpResponse, fixture: &Fixture, code: &str) {
     assert!(response.is_error);
     assert_eq!(
-        response.structured["error"]["code"],
+        response.structured["error"]["kind"],
         "session_not_authorized"
     );
+    assert_eq!(response.structured["error"]["code"], code);
     let text = response.structured.to_string();
     assert!(!text.contains(fixture.ancestor.to_str().unwrap()));
     assert!(!text.contains(&fixture.repository_a_id.to_string()));
@@ -1139,7 +1143,7 @@ fn server_negative_matrix_is_uniform_and_writes_no_business_state() {
         "context_search",
         &json!({"query": "bounded"}),
     );
-    assert_denied(&response, &disabled);
+    assert_denied(&response, &disabled, "activation_disabled");
     assert_eq!(disabled.business_snapshot(), before);
 
     // A lease never expires and an unrelated registration no longer demotes a live
@@ -1198,7 +1202,7 @@ fn server_negative_matrix_is_uniform_and_writes_no_business_state() {
         "context_search",
         &json!({"query": "bounded"}),
     );
-    assert_denied(&response, &deregistered);
+    assert_denied(&response, &deregistered, "activation_disabled");
     assert_eq!(deregistered.business_snapshot(), before);
 
     let cross = Fixture::new();
@@ -1223,7 +1227,7 @@ fn server_negative_matrix_is_uniform_and_writes_no_business_state() {
             "context_search",
             &json!({"query": "bounded"}),
         );
-        assert_denied(&response, &cross);
+        assert_denied(&response, &cross, "lease_missing");
     }
     assert_eq!(cross.business_snapshot(), before);
 
@@ -1252,7 +1256,7 @@ fn server_negative_matrix_is_uniform_and_writes_no_business_state() {
         "context_search",
         &json!({"query": "bounded"}),
     );
-    assert_denied(&response, &corrupt);
+    assert_denied(&response, &corrupt, "lease_missing");
     assert_eq!(corrupt.business_snapshot(), before);
 
     let busy = Fixture::new();
@@ -1279,7 +1283,7 @@ fn server_negative_matrix_is_uniform_and_writes_no_business_state() {
         "context_search",
         &json!({"query": "bounded"}),
     );
-    assert_denied(&response, &busy);
+    assert_denied(&response, &busy, "authorization_internal");
     assert_eq!(busy.business_snapshot(), before);
     FileExt::unlock(&lock).unwrap();
 }

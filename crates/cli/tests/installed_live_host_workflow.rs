@@ -914,15 +914,26 @@ fn installed_codex_direct_evidence_replay_recovery_and_cursor_lifecycle_use_publ
             .as_str()
             .is_some_and(|message| message.contains("task_checkpoint"))
     );
-    assert!(!compact.to_string().contains("RAW_LIVE_HOST_CURSOR"));
-    assert_eq!(
-        run_configured_hook(
-            &home,
-            &cursor_hook,
-            &cursor_event("stop", cursor_session, &checkout_b, &cursor_version),
-        ),
-        json!({})
+    // Compaction is what drops the SessionStart marker, so the same line re-states it.
+    assert!(
+        compact["user_message"]
+            .as_str()
+            .is_some_and(|message| message.contains("<shared-context-active")
+                && message.contains(cursor_session))
     );
+    assert!(!compact.to_string().contains("RAW_LIVE_HOST_CURSOR"));
+    let stopped = run_configured_hook(
+        &home,
+        &cursor_hook,
+        &cursor_event("stop", cursor_session, &checkout_b, &cursor_version),
+    );
+    assert!(
+        stopped["user_message"]
+            .as_str()
+            .is_some_and(|message| message.contains("task_checkpoint")),
+        "{stopped:#}"
+    );
+    assert!(!stopped.to_string().contains("RAW_LIVE_HOST_CURSOR"));
     assert_eq!(
         run_configured_hook(
             &home,
@@ -935,8 +946,12 @@ fn installed_codex_direct_evidence_replay_recovery_and_cursor_lifecycle_use_publ
     eprintln!("live-host stage=cursor-ended");
     assert_eq!(after_end["result"]["isError"], true);
     assert_eq!(
-        after_end["result"]["structuredContent"]["error"]["code"],
+        after_end["result"]["structuredContent"]["error"]["kind"],
         "session_not_authorized"
+    );
+    assert_eq!(
+        after_end["result"]["structuredContent"]["error"]["code"],
+        "lease_missing"
     );
 
     for (session, checkout) in [(session_a, &checkout_a), (session_b, &checkout_b)] {

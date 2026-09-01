@@ -5655,7 +5655,7 @@ impl McpServer {
                 ClientKind::Codex => "codex",
             }
         {
-            return Err(ToolFailure::authorization_failed());
+            return Err(ToolFailure::locator_invalid());
         }
         let authorization = authorize_public_call(&self.root, &locator)?;
         if let Some(hook) = &self.authorization_linearization_hook {
@@ -6068,20 +6068,33 @@ type ToolResult = std::result::Result<Value, ToolFailure>;
 
 struct ToolFailure {
     code: &'static str,
+    /// Error family reported as `kind` when the domain `ErrorKind` is not the useful
+    /// grouping. Only authorization uses it today: its four distinct causes must stay
+    /// distinguishable by `code` while remaining one family a client can branch on.
+    family: Option<&'static str>,
     error: Error,
 }
 
 impl ToolFailure {
+    /// One failure whose `kind` is derived from its domain `ErrorKind`.
+    fn coded(code: &'static str, error: Error) -> Self {
+        Self {
+            code,
+            family: None,
+            error,
+        }
+    }
+
     fn maintenance_failed(error: Error) -> Self {
         let busy = error.kind() == ErrorKind::MaintenanceBusy;
         drop(error);
-        Self {
-            code: if busy {
+        Self::coded(
+            if busy {
                 "maintenance_busy"
             } else {
                 "maintenance_unavailable"
             },
-            error: Error::new(
+            Error::new(
                 if busy {
                     ErrorKind::MaintenanceBusy
                 } else {
@@ -6093,17 +6106,60 @@ impl ToolFailure {
                     "Shared Context maintenance coordination is unavailable"
                 },
             ),
+        )
+    }
+
+    /// The one error family every authorization refusal belongs to.
+    ///
+    /// It stays a single `kind` so a client can branch on "this call was not authorized"
+    /// exactly as before, while `code` names which of the four independent causes it was:
+    /// a locator the call itself got wrong, a Session no Hook ever leased, a directory
+    /// activation never covered, or a local failure that decided nothing at all. Merging
+    /// them made every one of them read as "you sent a bad id", which is the wrong repair
+    /// for three of the four.
+    const SESSION_NOT_AUTHORIZED: &'static str = "session_not_authorized";
+
+    fn authorization_failure(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            family: Some(Self::SESSION_NOT_AUTHORIZED),
+            error: Error::new(ErrorKind::External, message),
         }
     }
 
-    fn authorization_failed() -> Self {
-        Self {
-            code: "session_not_authorized",
-            error: Error::new(
-                ErrorKind::External,
-                "Shared Context MCP call is not authorized for this Agent Session: external_session_id must be the host session id shown in the <shared-context-active> marker (Codex: also $CODEX_SESSION_ID; Cursor: the conversation id); do not invent one",
+    /// The call did not carry a usable Agent Session locator at all.
+    fn locator_invalid() -> Self {
+        Self::authorization_failure(
+            "locator_invalid",
+            "Shared Context MCP call carries no usable Agent Session locator: agent_kind and external_session_id are both required, non-empty, and must match this MCP client; external_session_id is the host session id shown in the <shared-context-active> marker (Codex: also $CODEX_SESSION_ID; Cursor: the conversation id)",
+        )
+    }
+
+    /// No Hook ever authorized this Agent Session.
+    fn lease_missing() -> Self {
+        Self::authorization_failure(
+            "lease_missing",
+            "Shared Context has no authorization lease for this Agent Session: copy external_session_id verbatim from the <shared-context-active> marker (Codex: also $CODEX_SESSION_ID; Cursor: the conversation id) — never retype, derive, or invent one — and if no marker ever appeared run `sctx doctor --hooks`",
+        )
+    }
+
+    /// The Session is leased, but its directory is not under an activated Repository.
+    fn activation_disabled() -> Self {
+        Self::authorization_failure(
+            "activation_disabled",
+            "Shared Context is not activated for this Agent Session: the directory it started in is not covered by any registered Repository. Register it with `sctx repository add` and start a new Agent Session",
+        )
+    }
+
+    /// Authorization could not be decided locally, so nothing was decided.
+    fn authorization_internal(error: &Error) -> Self {
+        Self::authorization_failure(
+            "authorization_internal",
+            format!(
+                "Shared Context could not evaluate this Agent Session's authorization: {}",
+                error.message()
             ),
-        }
+        )
     }
 
     fn task_context_failed(error: Error) -> Self {
@@ -6118,7 +6174,7 @@ impl ToolFailure {
             ErrorKind::Unsupported => "task_context_unsupported",
             _ => "task_context_failed",
         };
-        Self { code, error }
+        Self::coded(code, error)
     }
 
     fn intent_update_failed(error: Error) -> Self {
@@ -6130,7 +6186,7 @@ impl ToolFailure {
             ErrorKind::Io => "intent_storage_failed",
             _ => "intent_update_failed",
         };
-        Self { code, error }
+        Self::coded(code, error)
     }
 
     fn engineering_graph_failed(error: Error) -> Self {
@@ -6143,7 +6199,7 @@ impl ToolFailure {
             ErrorKind::RepositoryNotConfigured => "repository_not_configured",
             _ => "engineering_graph_failed",
         };
-        Self { code, error }
+        Self::coded(code, error)
     }
 
     fn candidate_review_failed(error: Error) -> Self {
@@ -6156,15 +6212,15 @@ impl ToolFailure {
             ErrorKind::PrivacyRejected => "privacy_rejected",
             _ => "candidate_review_failed",
         };
-        Self { code, error }
+        Self::coded(code, error)
     }
 
     fn task_target_failed(error: Error) -> Self {
         if error.kind() == ErrorKind::InvalidInput {
-            Self {
-                code: "task_target_unavailable",
-                error: Error::new(ErrorKind::External, "Task target is unavailable"),
-            }
+            Self::coded(
+                "task_target_unavailable",
+                Error::new(ErrorKind::External, "Task target is unavailable"),
+            )
         } else {
             Self::task_context_failed(error)
         }
@@ -6172,13 +6228,13 @@ impl ToolFailure {
 
     fn candidate_target_failed(error: Error) -> Self {
         if error.kind() == ErrorKind::InvalidInput {
-            Self {
-                code: "candidate_review_unavailable",
-                error: Error::new(
+            Self::coded(
+                "candidate_review_unavailable",
+                Error::new(
                     ErrorKind::External,
                     "Candidate Review target is unavailable",
                 ),
-            }
+            )
         } else {
             Self::candidate_review_failed(error)
         }
@@ -6187,10 +6243,7 @@ impl ToolFailure {
 
 impl From<Error> for ToolFailure {
     fn from(error: Error) -> Self {
-        Self {
-            code: error_code(error.kind()),
-            error,
-        }
+        Self::coded(error_code(error.kind()), error)
     }
 }
 
@@ -6575,17 +6628,17 @@ fn locator_from_arguments(
 ) -> std::result::Result<ExternalSessionLocator, ToolFailure> {
     let object = arguments
         .as_object()
-        .ok_or_else(ToolFailure::authorization_failed)?;
+        .ok_or_else(ToolFailure::locator_invalid)?;
     let agent_kind = object
         .get("agent_kind")
         .and_then(Value::as_str)
-        .ok_or_else(ToolFailure::authorization_failed)?;
+        .ok_or_else(ToolFailure::locator_invalid)?;
     let external_session_id = object
         .get("external_session_id")
         .and_then(Value::as_str)
-        .ok_or_else(ToolFailure::authorization_failed)?;
+        .ok_or_else(ToolFailure::locator_invalid)?;
     ExternalSessionLocator::new(agent_kind, external_session_id)
-        .map_err(|_| ToolFailure::authorization_failed())
+        .map_err(|_| ToolFailure::locator_invalid())
 }
 
 fn authorize_public_call(
@@ -6595,24 +6648,28 @@ fn authorize_public_call(
     // The successful nonblocking lease classification against this exact Catalog is the call's
     // authorization linearization point. Later expiry, SessionEnd, or Catalog replacement affects
     // the next call; this call carries the frozen Catalog and allowed Repository identities.
-    let authorization = || -> Result<AuthorizedCallSnapshot> {
+    // The three outcomes stay apart: a decided refusal names its own cause, while a
+    // configuration, lock, or IO failure decided nothing and says so instead of blaming
+    // the id the Agent sent.
+    let authorization = || -> Result<std::result::Result<AuthorizedCallSnapshot, ToolFailure>> {
         let (catalog, context_ttl) =
             UserConfigStore::open_existing(root)?.repository_catalog_with_context_ttl()?;
         let context_ttl = context_ttl_settings(&context_ttl);
-        match read_reconciled_session_scope(root, locator, &catalog)? {
-            AuthorizedSessionScopeRead::Current(scope) if scope.decision.is_enabled() => {
-                Ok(AuthorizedCallSnapshot {
-                    catalog,
-                    scope,
-                    context_ttl,
-                })
-            }
-            AuthorizedSessionScopeRead::Missing | AuthorizedSessionScopeRead::Current(_) => {
-                Err(unavailable("unauthorized"))
-            }
-        }
+        Ok(
+            match read_reconciled_session_scope(root, locator, &catalog)? {
+                AuthorizedSessionScopeRead::Current(scope) if scope.decision.is_enabled() => {
+                    Ok(AuthorizedCallSnapshot {
+                        catalog,
+                        scope,
+                        context_ttl,
+                    })
+                }
+                AuthorizedSessionScopeRead::Current(_) => Err(ToolFailure::activation_disabled()),
+                AuthorizedSessionScopeRead::Missing => Err(ToolFailure::lease_missing()),
+            },
+        )
     };
-    authorization().map_err(|_| ToolFailure::authorization_failed())
+    authorization().map_err(|error| ToolFailure::authorization_internal(&error))?
 }
 
 /// The single lease read every MCP path uses.
@@ -7231,8 +7288,32 @@ fn task_checkpoint_schema() -> Value {
 }
 
 #[allow(clippy::needless_pass_by_value)]
+/// The one sentence appended to every public tool description.
+///
+/// `external_session_id` is the only argument no Model can derive: it is the host
+/// Session id the Hook stated in the activation marker. Real sessions showed models
+/// inventing it from a documentation example, and a tool description is the one text a
+/// host always renders next to the call it is about — so the rule is stated there as
+/// well as in the marker and the Skill gate.
+const EXTERNAL_SESSION_ID_DESCRIPTION: &str = "external_session_id: copy verbatim from the `<shared-context-active>` marker (Codex: also $CODEX_SESSION_ID; Cursor: the conversation id); never invent or derive one.";
+
+/// Declares one public tool, appending the `external_session_id` provenance sentence to
+/// every tool that takes one. Appending it here instead of in each literal is what keeps
+/// a newly added tool from silently shipping without it. The schema itself is untouched.
 fn tool_schema(name: &str, description: &str, input_schema: Value) -> Value {
-    json!({"name": name, "description": description, "inputSchema": input_schema})
+    let requires_external_session_id = input_schema["required"]
+        .as_array()
+        .is_some_and(|required| required.iter().any(|field| field == "external_session_id"));
+    let description = if requires_external_session_id {
+        format!("{description} {EXTERNAL_SESSION_ID_DESCRIPTION}")
+    } else {
+        description.to_owned()
+    };
+    let mut tool = Map::new();
+    tool.insert("name".to_owned(), Value::String(name.to_owned()));
+    tool.insert("description".to_owned(), Value::String(description));
+    tool.insert("inputSchema".to_owned(), input_schema);
+    Value::Object(tool)
 }
 
 fn search_schema() -> Value {
@@ -7666,7 +7747,9 @@ fn tool_failure(failure: ToolFailure) -> Result<Value> {
     let data = json!({
         "error": {
             "code": failure.code,
-            "kind": error_code(failure.error.kind()),
+            "kind": failure
+                .family
+                .unwrap_or_else(|| error_code(failure.error.kind())),
             "message": failure.error.message(),
         }
     });

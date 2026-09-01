@@ -537,12 +537,24 @@ fn authorization_error(fixture: &Fixture, agent: &str, session: &str, client: Cl
     responses[1]["result"]["structuredContent"]["error"].clone()
 }
 
-fn expected_authorization_error() -> Value {
-    json!({
-        "code": "session_not_authorized",
-        "kind": "external_error",
-        "message": "Shared Context MCP call is not authorized for this Agent Session: external_session_id must be the host session id shown in the <shared-context-active> marker (Codex: also $CODEX_SESSION_ID; Cursor: the conversation id); do not invent one"
-    })
+/// Asserts one refusal belongs to the single authorization family and names the exact
+/// cause a caller must repair.
+///
+/// The family is what a client branches on; the `code` is what tells an Agent whether to
+/// re-copy the marker id, register the directory, or retry a transient local failure.
+/// The message must stay free of any Repository identity, path, or other Session's id.
+fn assert_authorization_failure(error: &Value, code: &str, forbidden: &[&str]) {
+    assert_eq!(
+        error["kind"],
+        json!("session_not_authorized"),
+        "authorization refusals stay one family: {error:#}"
+    );
+    assert_eq!(error["code"], json!(code), "wrong cause: {error:#}");
+    let message = error["message"].as_str().unwrap();
+    assert!(message.starts_with("Shared Context"), "{message}");
+    for secret in forbidden {
+        assert!(!message.contains(secret), "{code} disclosed {secret}");
+    }
 }
 
 fn add_git_repository(fixture: &Fixture, name: &str) -> (std::path::PathBuf, RepositoryId) {
@@ -4546,12 +4558,12 @@ fn every_public_tool_requires_a_strict_locator_and_rejects_before_business_state
         FixtureFraming::Newline,
         &requests,
     );
-    let expected = expected_authorization_error();
     for (tool, response) in PUBLIC_TOOLS.iter().zip(&responses[1..]) {
         assert_eq!(response["result"]["isError"], true, "{tool}: {response:#}");
-        assert_eq!(
-            response["result"]["structuredContent"]["error"], expected,
-            "{tool} disclosed a distinct authorization state"
+        assert_authorization_failure(
+            &response["result"]["structuredContent"]["error"],
+            "lease_missing",
+            &[],
         );
     }
     assert_eq!(business_residue(&fixture.root), before);
@@ -4614,15 +4626,14 @@ fn every_public_tool_requires_a_strict_locator_and_rejects_before_business_state
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn authorization_states_cross_agent_and_busy_or_unsafe_storage_fail_identically() {
-    let expected = expected_authorization_error();
-
+fn authorization_states_name_one_repairable_cause_within_one_family() {
     let disabled = Fixture::new();
     authorize_disabled_session(&disabled, "disabled");
     let before = business_residue(&disabled.root);
-    assert_eq!(
-        authorization_error(&disabled, "codex", "disabled", ClientKind::Codex),
-        expected
+    assert_authorization_failure(
+        &authorization_error(&disabled, "codex", "disabled", ClientKind::Codex),
+        "activation_disabled",
+        &[disabled.root.to_str().unwrap()],
     );
     assert_eq!(business_residue(&disabled.root), before);
 
@@ -4660,7 +4671,7 @@ fn authorization_states_cross_agent_and_busy_or_unsafe_storage_fail_identically(
         json!({"agent_kind": "codex", "external_session_id": "aged"}),
     );
     assert_ne!(
-        aged_call["result"]["structuredContent"]["error"]["code"],
+        aged_call["result"]["structuredContent"]["error"]["kind"],
         json!("session_not_authorized"),
         "an aged lease under an unchanged registration still authorizes: {aged_call:#?}"
     );
@@ -4683,9 +4694,10 @@ fn authorization_states_cross_agent_and_busy_or_unsafe_storage_fail_identically(
         UserConfigStore::empty_document(&deregistered.root).unwrap(),
     )
     .unwrap();
-    assert_eq!(
-        authorization_error(&deregistered, "codex", "deregistered", ClientKind::Codex),
-        expected
+    assert_authorization_failure(
+        &authorization_error(&deregistered, "codex", "deregistered", ClientKind::Codex),
+        "activation_disabled",
+        &[deregistered.root.to_str().unwrap()],
     );
 
     let corrupt = Fixture::new();
@@ -4697,9 +4709,10 @@ fn authorization_states_cross_agent_and_busy_or_unsafe_storage_fail_identically(
         .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
         .unwrap();
     fs::write(&record, b"{}").unwrap();
-    assert_eq!(
-        authorization_error(&corrupt, "codex", "corrupt", ClientKind::Codex),
-        expected
+    assert_authorization_failure(
+        &authorization_error(&corrupt, "codex", "corrupt", ClientKind::Codex),
+        "lease_missing",
+        &[corrupt.root.to_str().unwrap()],
     );
 
     let unsafe_scope = Fixture::new();
@@ -4714,9 +4727,10 @@ fn authorization_states_cross_agent_and_busy_or_unsafe_storage_fail_identically(
     fs::write(&target, b"{}").unwrap();
     fs::remove_file(&record).unwrap();
     std::os::unix::fs::symlink(&target, &record).unwrap();
-    assert_eq!(
-        authorization_error(&unsafe_scope, "codex", "symlink", ClientKind::Codex),
-        expected
+    assert_authorization_failure(
+        &authorization_error(&unsafe_scope, "codex", "symlink", ClientKind::Codex),
+        "lease_missing",
+        &[unsafe_scope.root.to_str().unwrap()],
     );
 
     let scope_busy = Fixture::new();
@@ -4727,9 +4741,10 @@ fn authorization_states_cross_agent_and_busy_or_unsafe_storage_fail_identically(
         .open(scope_busy.root.join("state/authorized-session-scopes.lock"))
         .unwrap();
     lock.lock_exclusive().unwrap();
-    assert_eq!(
-        authorization_error(&scope_busy, "codex", "scope-busy", ClientKind::Codex),
-        expected
+    assert_authorization_failure(
+        &authorization_error(&scope_busy, "codex", "scope-busy", ClientKind::Codex),
+        "authorization_internal",
+        &[scope_busy.root.to_str().unwrap()],
     );
     FileExt::unlock(&lock).unwrap();
 
@@ -4741,25 +4756,33 @@ fn authorization_states_cross_agent_and_busy_or_unsafe_storage_fail_identically(
         .open(catalog_busy.root.join("state/config.lock"))
         .unwrap();
     lock.lock_exclusive().unwrap();
-    assert_eq!(
-        authorization_error(&catalog_busy, "codex", "catalog-busy", ClientKind::Codex),
-        expected
+    assert_authorization_failure(
+        &authorization_error(&catalog_busy, "codex", "catalog-busy", ClientKind::Codex),
+        "authorization_internal",
+        &[catalog_busy.root.to_str().unwrap()],
     );
     FileExt::unlock(&lock).unwrap();
 
+    // A locator that does not belong to this MCP client is the call's own mistake; a
+    // locator that belongs to no lease is a Session that was never authorized. Neither
+    // may say anything about the Session that does hold the lease.
     let cross_agent = Fixture::new();
     authorize_direct_session(&cross_agent, "codex", "borrowed");
-    assert_eq!(
-        authorization_error(&cross_agent, "codex", "borrowed", ClientKind::Cursor),
-        expected
+    let cross_forbidden = [cross_agent.root.to_str().unwrap(), "borrowed"];
+    assert_authorization_failure(
+        &authorization_error(&cross_agent, "codex", "borrowed", ClientKind::Cursor),
+        "locator_invalid",
+        &cross_forbidden,
     );
-    assert_eq!(
-        authorization_error(&cross_agent, "cursor", "borrowed", ClientKind::Cursor),
-        expected
+    assert_authorization_failure(
+        &authorization_error(&cross_agent, "cursor", "borrowed", ClientKind::Cursor),
+        "lease_missing",
+        &cross_forbidden,
     );
-    assert_eq!(
-        authorization_error(&cross_agent, "codex", "other", ClientKind::Cursor),
-        expected
+    assert_authorization_failure(
+        &authorization_error(&cross_agent, "codex", "other", ClientKind::Cursor),
+        "locator_invalid",
+        &cross_forbidden,
     );
 }
 
@@ -6682,6 +6705,10 @@ fn signal_supersede_is_cas_guarded_and_removed_from_paths_but_retained_in_histor
 }
 
 /// Marker shape the installed gate documents, with the host Session id left as a placeholder.
+/// The fallback marker the Hook emits when the host Session id cannot be quoted safely.
+/// The gate must trust this shape too, or a Session with an unquotable id can never activate.
+const SHARED_CONTEXT_ACTIVATION_MARKER_UNQUOTED_SHAPE: &str = "<shared-context-active>Shared Context is authorized for this session. Before substantive work, call task_intent_update with agent_kind \"codex\" and the host Session id (Codex: $CODEX_SESSION_ID; Cursor: the conversation id); never invent one.</shared-context-active>";
+
 const SHARED_CONTEXT_ACTIVATION_MARKER_SHAPE: &str = "<shared-context-active external_session_id=\"HOST_SESSION_ID\">Shared Context is authorized for this session. Before substantive work, call task_intent_update with agent_kind \"codex\" and external_session_id \"HOST_SESSION_ID\" (copy it verbatim; never invent one).</shared-context-active>";
 
 /// One concrete Hook-rendered marker: the documented shape with a real host Session id.
