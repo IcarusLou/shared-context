@@ -2786,6 +2786,7 @@ fn infer_task_space_associations(
     }
     hydrate_intent_conflict_state(connection, &mut evidence)?;
     assign_channel_features(&mut evidence, coverage_basis.tokens());
+    cap_hop_only_space_scores(&mut evidence, &contexts, &effective_spaces);
     let mut gate_omitted = Vec::new();
     let mut associations = Vec::new();
     for (space_id, space_evidence) in &evidence {
@@ -2928,6 +2929,123 @@ fn aggregate_context_across_effective_spaces(
             context_id,
             context,
         );
+    }
+}
+
+/// The Spaces one Context's evidence is aggregated into, mirroring
+/// [`aggregate_context_across_effective_spaces`].
+fn effective_context_space_ids(
+    effective_spaces: &BTreeMap<ContextId, EffectiveContextSpaces>,
+    fallback_space_id: SpaceId,
+    context_id: ContextId,
+) -> BTreeSet<SpaceId> {
+    effective_spaces.get(&context_id).map_or_else(
+        || BTreeSet::from([fallback_space_id]),
+        |effective| {
+            effective
+                .roles
+                .iter()
+                .map(|role| role.matched_space_id)
+                .collect()
+        },
+    )
+}
+
+/// True when a Context Relation hop out of some other Space is the whole reason this Space is
+/// here: the query never named its Intent, none of its Contexts matched any text, hint, scope or
+/// Artifact, and nothing but the hop connects it to the question.
+fn space_reached_only_by_relation_hops(evidence: &AssociationEvidence) -> bool {
+    !evidence.relation_contexts.is_empty()
+        && !evidence.intent_matched
+        && evidence.textual_contexts.is_empty()
+        && evidence.hint_text.is_empty()
+        && evidence.matched_scopes.is_empty()
+        && evidence.matched_artifacts.is_empty()
+        && evidence.graph_exact_contexts.is_empty()
+        && evidence.focus_text_fallback_contexts.is_empty()
+}
+
+/// Holds every Space a hop reached behind the Spaces the hop started in.
+///
+/// This is the Space-level form of the rule [`reached_only_by_a_hop`] already applies to items. A
+/// hop is a statement about a Context, not about the question: the Space it lands in answered
+/// nothing, and letting it lead the ranking means the Pack opens with background for an answer
+/// the reader has not been shown yet. The
+/// [`CONTEXT_RELATION_CHANNEL_WEIGHT`] channel is heavy enough for exactly that to happen when the
+/// answering Space matched on text alone.
+///
+/// The cap reads the scores as they stood before any capping, which is well defined because a hop
+/// always starts at a Context that matched the query directly: no Space that is the origin of a
+/// hop is itself hop-only, so no capped score is ever the limit for another.
+fn cap_hop_only_space_scores(
+    evidence: &mut BTreeMap<SpaceId, AssociationEvidence>,
+    contexts: &BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>,
+    effective_spaces: &BTreeMap<ContextId, EffectiveContextSpaces>,
+) {
+    let hop_only = evidence
+        .iter()
+        .filter(|(_, value)| space_reached_only_by_relation_hops(value))
+        .map(|(space_id, _)| *space_id)
+        .collect::<BTreeSet<_>>();
+    if hop_only.is_empty() {
+        return;
+    }
+    let owning_space = contexts
+        .keys()
+        .map(|(space_id, context_id)| (*context_id, *space_id))
+        .collect::<BTreeMap<_, _>>();
+    let mut origins = BTreeMap::<SpaceId, BTreeSet<SpaceId>>::new();
+    for ((space_id, context_id), context) in contexts {
+        let reached = effective_context_space_ids(effective_spaces, *space_id, *context_id)
+            .into_iter()
+            .filter(|reached| hop_only.contains(reached))
+            .collect::<BTreeSet<_>>();
+        if reached.is_empty() {
+            continue;
+        }
+        for path in &context.graph_paths {
+            let TaskRetrievalPath::ContextRelation { hops } = path else {
+                continue;
+            };
+            let Some(seed) = hops.first() else {
+                continue;
+            };
+            let Some(seed_space_id) = owning_space.get(&seed.source_context_id).copied() else {
+                continue;
+            };
+            let seed_spaces = effective_context_space_ids(
+                effective_spaces,
+                seed_space_id,
+                seed.source_context_id,
+            );
+            for target in &reached {
+                origins.entry(*target).or_default().extend(
+                    seed_spaces
+                        .iter()
+                        .copied()
+                        .filter(|origin| origin != target),
+                );
+            }
+        }
+    }
+    let before = evidence
+        .iter()
+        .map(|(space_id, value)| (*space_id, value.fused_score_basis_points))
+        .collect::<BTreeMap<_, _>>();
+    for (space_id, origin_spaces) in origins {
+        // Behind every Space it was reached from, not merely behind the best of them: the hop said
+        // nothing about which origin was the better answer.
+        let Some(limit) = origin_spaces
+            .iter()
+            .filter_map(|origin| before.get(origin).copied())
+            .min()
+        else {
+            continue;
+        };
+        if let Some(target) = evidence.get_mut(&space_id) {
+            target.fused_score_basis_points =
+                target.fused_score_basis_points.min(limit.saturating_sub(1));
+        }
     }
 }
 
@@ -8299,6 +8417,88 @@ mod tests {
                 "ctx_00000000-0000-4000-8000-000000000002"
             ]
         );
+    }
+
+    #[test]
+    fn a_space_only_a_hop_reached_never_outranks_the_space_the_hop_started_in() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        use sctx_domain::{ContextId, ContextRelationKind, RevisionId, SpaceId};
+
+        use super::{
+            AcceptedContextEvidence, AssociationEvidence, ContextRelationRetrievalPath,
+            TaskRetrievalPath, cap_hop_only_space_scores,
+        };
+
+        let answering_space = SpaceId::new();
+        let hopped_space = SpaceId::new();
+        let seed_context = ContextId::new();
+        let hopped_context = ContextId::new();
+        let mut evidence = BTreeMap::new();
+        evidence.insert(
+            answering_space,
+            AssociationEvidence {
+                textual_contexts: BTreeSet::from([seed_context]),
+                fused_score_basis_points: 3_000,
+                ..AssociationEvidence::default()
+            },
+        );
+        // The relation channel is heavy enough to fuse above a Space that only matched text.
+        evidence.insert(
+            hopped_space,
+            AssociationEvidence {
+                relation_contexts: BTreeSet::from([hopped_context]),
+                fused_score_basis_points: 7_000,
+                ..AssociationEvidence::default()
+            },
+        );
+        let mut contexts = BTreeMap::new();
+        contexts.insert(
+            (answering_space, seed_context),
+            AcceptedContextEvidence {
+                textual_match: true,
+                ..AcceptedContextEvidence::default()
+            },
+        );
+        contexts.insert(
+            (hopped_space, hopped_context),
+            AcceptedContextEvidence {
+                relation_depth: Some(1),
+                graph_paths: vec![TaskRetrievalPath::ContextRelation {
+                    hops: vec![ContextRelationRetrievalPath {
+                        source_context_id: seed_context,
+                        source_revision_id: RevisionId::new(),
+                        target_context_id: hopped_context,
+                        target_revision_id: RevisionId::new(),
+                        kind: ContextRelationKind::RelatedTo,
+                        rationale: "the hop".to_owned(),
+                        supports: Vec::new(),
+                        depth: 1,
+                    }],
+                }],
+                ..AcceptedContextEvidence::default()
+            },
+        );
+
+        cap_hop_only_space_scores(&mut evidence, &contexts, &BTreeMap::new());
+        assert_eq!(evidence[&answering_space].fused_score_basis_points, 3_000);
+        assert_eq!(
+            evidence[&hopped_space].fused_score_basis_points, 2_999,
+            "a Space nothing but a hop reached must sort behind the Space the hop started in"
+        );
+
+        // A Space that also answered on its own text is not a hop-only Space and keeps its score.
+        evidence
+            .get_mut(&hopped_space)
+            .unwrap()
+            .textual_contexts
+            .insert(hopped_context);
+        evidence
+            .get_mut(&hopped_space)
+            .unwrap()
+            .fused_score_basis_points = 7_000;
+        cap_hop_only_space_scores(&mut evidence, &contexts, &BTreeMap::new());
+        assert_eq!(evidence[&hopped_space].fused_score_basis_points, 7_000);
     }
 
     #[test]
