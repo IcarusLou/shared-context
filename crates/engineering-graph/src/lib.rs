@@ -6,6 +6,7 @@
 
 mod artifact_focus;
 mod projection;
+mod relocation;
 mod resolver;
 mod scanner;
 
@@ -14,6 +15,7 @@ pub use artifact_focus::{
     ArtifactFocusReader, MAX_ARTIFACT_FOCUS_HITS,
 };
 pub use projection::{EngineeringProjectionSnapshot, EngineeringProjectionStore};
+pub use relocation::{RelocationCandidate, find_relocation_candidate, relocatable_path};
 pub use resolver::{
     CandidateMatchEvidence, EngineeringProjection, EngineeringReferenceResolver,
     GraphContextRelation, GraphContextSafety, GraphContextSafetyBlocker, GraphContextSnapshot,

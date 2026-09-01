@@ -1678,6 +1678,20 @@ fn ambiguous_edges_are_explicit_diagnostics_only_and_never_raise_automatic_eligi
         automatic.graph_diagnostics[0].resolved_focus,
         *request.resolved_focus.as_ref().unwrap()
     );
+    // Automatic injection still crosses nothing, and now says which Reference stopped resolving
+    // rather than the bare "not reachable" that is equally true of an undocumented Artifact.
+    assert_eq!(
+        automatic.graph_diagnostics[0].kind,
+        TaskGraphDiagnosticKind::ArtifactReferenceAmbiguous
+    );
+    assert!(
+        automatic.graph_diagnostics[0]
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("several Artifacts")),
+        "{:?}",
+        automatic.graph_diagnostics[0].detail
+    );
     assert!(
         automatic
             .items
@@ -1793,4 +1807,191 @@ fn exact_file_signal_uses_repository_relative_path_locator() {
                 && path.resolved_focus.repository_id == fixture.repository.repository_id
                 && path.artifact_key.locator() == &path.resolved_focus.locator
     )));
+}
+
+#[test]
+fn a_missing_reference_is_named_in_automatic_mode_instead_of_a_bare_not_reachable() {
+    let fixture = graph_fixture();
+    // The Repository still has sources; it no longer has the Symbol the Reference names. That is
+    // the shape of a rename, and it is the one an operator can actually do something about.
+    let missing = EngineeringReferenceResolver
+        .resolve(
+            &[reference(
+                &fixture.repository,
+                fixture.source_context,
+                fixture.source_revision,
+                "SearchSymbol",
+            )],
+            &[snapshot(
+                &fixture.repository,
+                "repo-renamed",
+                vec![symbol_artifact(&fixture.repository, "RenamedSymbol")],
+            )],
+            &fixture.context_snapshots.clone(),
+        )
+        .unwrap();
+    let tree = fixture.index.metadata().unwrap().indexed_tree_oid;
+    fixture
+        .graph_store
+        .rebuild_for_context_tree(&missing, Some(&tree))
+        .unwrap();
+    let engine = SearchEngine::with_engineering_graph(fixture.index, fixture.graph_store);
+
+    let automatic = engine
+        .task_context_pack(&task_request(
+            fixture.repository.repository_id.clone(),
+            ContextPackMode::AutomaticInjection,
+            12_000,
+        ))
+        .unwrap();
+    assert_eq!(automatic.graph_diagnostics.len(), 1);
+    assert_eq!(
+        automatic.graph_diagnostics[0].kind,
+        TaskGraphDiagnosticKind::ArtifactReferenceMissing
+    );
+    assert!(
+        automatic.graph_diagnostics[0]
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("absent from the scanned Repository snapshot")),
+        "{:?}",
+        automatic.graph_diagnostics[0].detail
+    );
+    assert!(
+        automatic
+            .items
+            .iter()
+            .flat_map(|item| &item.retrieval_paths)
+            .all(|path| !matches!(path, TaskRetrievalPath::EngineeringGraph { .. })),
+        "naming the break never turns it into an association"
+    );
+}
+
+#[test]
+fn an_unreadable_engineering_projection_is_reported_instead_of_looking_absent() {
+    let fixture = graph_fixture();
+    let projection = EngineeringReferenceResolver
+        .resolve(
+            std::slice::from_ref(&fixture.reference),
+            &[snapshot(
+                &fixture.repository,
+                "repo-current",
+                vec![symbol_artifact(&fixture.repository, "SearchSymbol")],
+            )],
+            &fixture.context_snapshots.clone(),
+        )
+        .unwrap();
+    let tree = fixture.index.metadata().unwrap().indexed_tree_oid;
+    fixture
+        .graph_store
+        .rebuild_for_context_tree(&projection, Some(&tree))
+        .unwrap();
+    let database = fixture.graph_store.database_path().to_path_buf();
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{suffix}", database.display()));
+        let _ = fs::remove_file(sidecar);
+    }
+    fs::write(&database, b"this is not a database").unwrap();
+    let engine = SearchEngine::with_engineering_graph(fixture.index, fixture.graph_store);
+
+    let automatic = engine
+        .task_context_pack(&task_request(
+            fixture.repository.repository_id.clone(),
+            ContextPackMode::AutomaticInjection,
+            12_000,
+        ))
+        .unwrap();
+    let reported = automatic
+        .omitted
+        .iter()
+        .find(|omitted| omitted.reason == sctx_search::GRAPH_READ_FAILED_REASON)
+        .expect("an unreadable projection is not the same fact as an absent one");
+    assert!(
+        reported.detail.is_none(),
+        "automatic injection gets the reason it can act on, never the storage error text"
+    );
+
+    let mut explicit = task_request(
+        fixture.repository.repository_id.clone(),
+        ContextPackMode::Explicit,
+        12_000,
+    );
+    explicit.mode = ContextPackMode::Explicit;
+    let explained = engine.task_context_pack(&explicit).unwrap();
+    assert!(
+        explained
+            .omitted
+            .iter()
+            .find(|omitted| omitted.reason == sctx_search::GRAPH_READ_FAILED_REASON)
+            .expect("an explicit read reports the same degraded channel")
+            .detail
+            .is_some(),
+        "an explicit read asked for the explanation"
+    );
+    assert!(
+        explained.artifact_generation.is_none(),
+        "an unreadable projection supplies no generation to attribute the Pack to"
+    );
+}
+
+#[test]
+fn a_graph_rebuilt_under_every_read_degrades_to_text_instead_of_failing_the_read() {
+    let fixture = graph_fixture();
+    let repository = fixture.repository.clone();
+    let context_snapshots = fixture.context_snapshots.clone();
+    let reference = fixture.reference.clone();
+    let tree = fixture.index.metadata().unwrap().indexed_tree_oid;
+    let graph_store = fixture.graph_store.clone();
+    let generations = ["repo-a", "repo-b"].map(|generation| {
+        EngineeringReferenceResolver
+            .resolve(
+                std::slice::from_ref(&reference),
+                &[snapshot(
+                    &repository,
+                    generation,
+                    vec![symbol_artifact(&repository, "SearchSymbol")],
+                )],
+                &context_snapshots,
+            )
+            .unwrap()
+    });
+    graph_store
+        .rebuild_for_context_tree(&generations[0], Some(&tree))
+        .unwrap();
+    let engine = SearchEngine::with_engineering_graph(fixture.index, graph_store.clone());
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let rebuilder_stop = Arc::clone(&stop);
+    let rebuilder_tree = tree.clone();
+    let rebuilder = thread::spawn(move || {
+        let mut turn = 0_usize;
+        while !rebuilder_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            graph_store
+                .rebuild_for_context_tree(&generations[turn % 2], Some(&rebuilder_tree))
+                .unwrap();
+            turn += 1;
+        }
+    });
+
+    // The promise is not that the race never happens -- it is that losing it costs the caller the
+    // Graph channel and not the whole retrieval.
+    for _ in 0..40 {
+        let pack = engine
+            .task_context_pack(&task_request(
+                repository.repository_id.clone(),
+                ContextPackMode::AutomaticInjection,
+                12_000,
+            ))
+            .expect("a Graph moving underneath a reader never fails the read");
+        assert!(
+            pack.artifact_generation.is_some()
+                || pack
+                    .omitted
+                    .iter()
+                    .any(|omitted| omitted.reason == sctx_search::GRAPH_GENERATION_UNSTABLE_REASON),
+            "a Pack that gave the Graph up says so: {:#?}",
+            pack.omitted
+        );
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    rebuilder.join().unwrap();
 }

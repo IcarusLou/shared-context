@@ -396,6 +396,14 @@ pub struct ResolvedReferenceProjection {
     pub context_id: ContextId,
     pub revision_id: RevisionId,
     pub reference_id: ReferenceId,
+    /// The locator this Reference names, kept whether or not anything resolved.
+    ///
+    /// A `Missing` resolution otherwise projects to a Repository id and a sentence: the Graph
+    /// knows something stopped resolving and cannot say what it was pointing at, which is exactly
+    /// the fact a reader needs to decide whether the break is worth a human's attention. Absent on
+    /// rows written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<ArtifactLocator>,
     pub repository_generation: Option<String>,
     pub artifact_generation: String,
     pub resolution: ArtifactResolution,
@@ -845,6 +853,7 @@ fn projection_for_status(
         context_id: projected.context_id,
         revision_id: projected.revision_id,
         reference_id: projected.reference.reference_id,
+        locator: Some(projected.reference.locator.clone()),
         repository_generation,
         artifact_generation: String::new(),
         resolution: ArtifactResolution {

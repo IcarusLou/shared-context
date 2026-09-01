@@ -17,6 +17,7 @@ use sctx_domain::{
 use sctx_engineering_graph::{
     EngineeringProjection, EngineeringProjectionSnapshot, EngineeringProjectionStore,
     GraphContextSafety, GraphContextSnapshot, GraphContextStatus, MatchBasis,
+    ResolvedReferenceProjection,
 };
 use sctx_index::{IndexMetadata, ProjectionIndex, normalize_search_text, search_tokens};
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,17 @@ const DEFAULT_CANDIDATE_LIMIT: usize = 100;
 pub const DEFAULT_TASK_MAX_SPACES: usize = 8;
 pub const MAX_TASK_MAX_SPACES: usize = 32;
 pub const MIN_TASK_CONTEXT_TOKEN_BUDGET: usize = 256;
+/// How many times a Pack rereads a Graph that moved underneath it before giving the channel up.
+const GRAPH_GENERATION_ATTEMPTS: usize = 3;
+/// Omission reason for a projection that exists and could not be read.
+pub const GRAPH_READ_FAILED_REASON: &str = "graph_read_failed";
+/// Omission reason for a projection that was rebuilt underneath every retrieval attempt.
+pub const GRAPH_GENERATION_UNSTABLE_REASON: &str = "graph_generation_unstable";
+/// How many unresolved-Reference diagnostics one Pack reports before the rest are dropped.
+///
+/// Three is a report; a list as long as the Repository is a second retrieval result competing
+/// with the facts it was supposed to explain.
+pub const MAX_UNRESOLVED_FOCUS_DIAGNOSTICS: usize = 3;
 
 /// Structured applicability filter. Each populated dimension is required; values within one
 /// dimension are alternatives.
@@ -712,17 +724,29 @@ pub struct GraphResolutionDiagnosticPath {
 }
 
 /// Why this request's Resolved Focus produced no exact node in the selected Graph snapshot.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+///
+/// The last two name a Reference that does point at this Focus and did not resolve. They exist
+/// because "not reachable" is true of an Artifact nobody ever wrote about and equally true of one
+/// whose Reference is a rename away from resolving, and only the second is worth a human's time.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskGraphDiagnosticKind {
     ArtifactNotReachableInGraph,
+    /// A Reference names this Focus and its locator is absent from the Repository snapshot.
+    ArtifactReferenceMissing,
+    /// A Reference names this Focus and several Artifacts answer to its locator.
+    ArtifactReferenceAmbiguous,
 }
 
 /// Budgeted Task-level Graph diagnostic that makes zero-result semantics explicit.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct TaskGraphDiagnostic {
     pub kind: TaskGraphDiagnosticKind,
     pub resolved_focus: ResolvedFocus,
+    /// One compact sentence naming what did not resolve. Absent for a kind whose meaning is
+    /// exactly its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Working Intent field that supplied one non-factual text-retrieval Hint.
@@ -898,6 +922,11 @@ pub struct ContextPackOmitted {
     /// Independent text channels that matched this Space.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_channel_count: Option<usize>,
+    /// Free text naming what went wrong, for the omissions that report a degraded channel rather
+    /// than a dropped Context. Carried only under [`ContextPackMode::Explicit`]: an automatic
+    /// injection gets the reason, which is what it can act on, and not the storage error text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Payload shape requested for one Task Context Pack.
@@ -1258,10 +1287,12 @@ impl SearchEngine {
         let query_phrases = association_query_phrases(intent, signals);
         let hint_queries = working_intent_hint_queries(intent);
         let scope_targets = ScopeTargets::from_intent(intent);
-        for _attempt in 0..3 {
-            let graph_snapshot = self.read_graph_snapshot();
+        let mut graph_read = GraphSnapshotRead::Absent;
+        for _attempt in 0..GRAPH_GENERATION_ATTEMPTS {
+            graph_read = self.read_graph_snapshot();
+            let graph_snapshot = graph_read.snapshot();
             let snapshot = self.index.query_snapshot(|connection| {
-                let graph = graph_projection(graph_snapshot.as_ref());
+                let graph = graph_projection(graph_snapshot);
                 infer_task_space_associations(
                     connection,
                     task_id,
@@ -1271,15 +1302,12 @@ impl SearchEngine {
                     &scope_targets,
                     resolved_focus,
                     graph,
-                    graph_snapshot
-                        .as_ref()
-                        .and_then(|snapshot| snapshot.context_tree_oid.as_deref()),
+                    graph_snapshot.and_then(|snapshot| snapshot.context_tree_oid.as_deref()),
                     resolved_focus.is_some() && graph.is_none(),
                     ContextPackMode::AutomaticInjection,
                 )
             })?;
-            let used_graph = graph_projection(graph_snapshot.as_ref());
-            if used_graph.is_some() && !self.graph_snapshot_unchanged(graph_snapshot.as_ref()) {
+            if graph_snapshot.is_some() && !self.graph_snapshot_unchanged(graph_snapshot) {
                 continue;
             }
             return Ok(TaskSpaceAssociationsResponse {
@@ -1290,9 +1318,32 @@ impl SearchEngine {
                 query_token_explanation: Some(snapshot.data.query_token_explanation),
             });
         }
-        Err(invariant(
-            "Engineering Graph generation changed during Task association retrieval",
-        ))
+        // A Graph being rebuilt underneath a reader is a race this reader lost, not a broken
+        // installation, and this response has no field in which to say so. Text recall is what it
+        // would have fallen back to had the Graph simply been absent, so that is what it returns.
+        drop(graph_read);
+        let snapshot = self.index.query_snapshot(|connection| {
+            infer_task_space_associations(
+                connection,
+                task_id,
+                &query_tokens,
+                &query_phrases,
+                &hint_queries,
+                &scope_targets,
+                resolved_focus,
+                None,
+                None,
+                resolved_focus.is_some(),
+                ContextPackMode::AutomaticInjection,
+            )
+        })?;
+        Ok(TaskSpaceAssociationsResponse {
+            indexed_tree_oid: snapshot.metadata.indexed_tree_oid,
+            projection_generation: snapshot.metadata.projection_generation,
+            task_id,
+            associations: snapshot.data.associations,
+            query_token_explanation: Some(snapshot.data.query_token_explanation),
+        })
     }
 
     /// Reads the immutable statements of the named Context revisions.
@@ -1370,92 +1421,147 @@ impl SearchEngine {
             association_query_phrases(&request.working_intent, &request.task_signals);
         let hint_queries = working_intent_hint_queries(&request.working_intent);
         let scope_targets = ScopeTargets::from_intent(&request.working_intent);
-        for _attempt in 0..3 {
-            let graph_snapshot = self.read_graph_snapshot();
-            let snapshot = self.index.query_snapshot(|connection| {
-                let graph = graph_projection(graph_snapshot.as_ref());
-                let mut inference = infer_task_space_associations(
-                    connection,
-                    request.task_id,
-                    &query_tokens,
-                    &query_phrases,
-                    &hint_queries,
-                    &scope_targets,
-                    request.resolved_focus.as_ref(),
-                    graph,
-                    graph_snapshot
-                        .as_ref()
-                        .and_then(|snapshot| snapshot.context_tree_oid.as_deref()),
-                    request.resolved_focus.is_some() && graph.is_none(),
-                    request.mode,
-                )?;
-                let space_omissions = space_top_k_omissions(
-                    connection,
-                    &inference.associations[request.max_spaces.min(inference.associations.len())..],
-                )?;
-                inference.associations.truncate(request.max_spaces);
-                let candidates = load_task_context_candidates(
-                    connection,
-                    &inference,
-                    request.mode,
-                    request.candidate_limit,
-                    detail_level,
-                    &self.context_ttl,
-                    self.usage_prior.as_deref(),
-                )?;
-                let graph_diagnostics = artifact_focus_diagnostics(
-                    request.resolved_focus.as_ref(),
-                    inference.focus_reachable,
-                );
-                Ok(pack_task_context_candidates(
-                    candidates,
-                    request.token_budget,
-                    inference,
-                    graph_diagnostics,
-                    space_omissions,
-                    detail_level,
-                ))
-            })?;
-            let used_graph = graph_projection(graph_snapshot.as_ref());
-            if used_graph.is_some() && !self.graph_snapshot_unchanged(graph_snapshot.as_ref()) {
+        let plan = TaskContextPlan {
+            request,
+            detail_level,
+            fingerprint: &fingerprint,
+            query_tokens: &query_tokens,
+            query_phrases: &query_phrases,
+            hint_queries: &hint_queries,
+            scope_targets: &scope_targets,
+        };
+        for _attempt in 0..GRAPH_GENERATION_ATTEMPTS {
+            let graph_read = self.read_graph_snapshot();
+            let graph_snapshot = graph_read.snapshot();
+            // An unreadable projection is not the same fact as an absent one, and only one of the
+            // two is worth a line of an Agent's budget. `Absent` stays silent; a read failure is
+            // reported and the Pack is built the way it would have been built without a Graph.
+            let degraded = graph_read
+                .failure()
+                .map(|detail| {
+                    vec![degraded_graph_omission(
+                        GRAPH_READ_FAILED_REASON,
+                        detail,
+                        request.mode,
+                    )]
+                })
+                .unwrap_or_default();
+            let pack = self.pack_task_context_attempt(&plan, graph_snapshot, &degraded)?;
+            if graph_snapshot.is_some() && !self.graph_snapshot_unchanged(graph_snapshot) {
                 continue;
             }
-            return Ok(TaskContextPack {
-                indexed_tree_oid: snapshot.metadata.indexed_tree_oid,
-                projection_generation: snapshot.metadata.projection_generation,
-                artifact_generation: used_graph.map(|graph| graph.artifact_generation.clone()),
-                graph_context_tree_oid: graph_snapshot
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.context_tree_oid.clone()),
-                task_id: request.task_id,
-                task_fingerprint: fingerprint,
-                token_budget: request.token_budget,
-                estimated_tokens: snapshot.data.estimated_tokens,
-                mode: request.mode,
-                detail_level,
-                associations: snapshot.data.associations,
-                compact_associations: snapshot.data.compact_associations,
-                items: snapshot.data.items,
-                compact_items: snapshot.data.compact_items,
-                graph_diagnostics: snapshot.data.graph_diagnostics,
-                query_token_explanation: snapshot.data.query_token_explanation,
-                omitted: snapshot.data.omitted,
-            });
+            return Ok(pack);
         }
-        Err(invariant(
-            "Engineering Graph generation changed during Task Context retrieval",
-        ))
+        // The Graph kept moving underneath every attempt. That is a race this reader lost, not a
+        // reason to fail a retrieval the caller can still be served from text: the Pack degrades
+        // to the recall it would have had with no Graph at all, and says which channel it lost.
+        self.pack_task_context_attempt(
+            &plan,
+            None,
+            &[degraded_graph_omission(
+                GRAPH_GENERATION_UNSTABLE_REASON,
+                "the Engineering Graph generation changed under every retrieval attempt",
+                request.mode,
+            )],
+        )
     }
 
-    fn read_graph_snapshot(&self) -> Option<EngineeringProjectionSnapshot> {
-        self.engineering_graph
-            .as_ref()
-            .and_then(|store| store.read_snapshot().ok().flatten())
+    /// One complete Pack build against one fixed view of the Engineering Graph.
+    fn pack_task_context_attempt(
+        &self,
+        plan: &TaskContextPlan<'_>,
+        graph_snapshot: Option<&EngineeringProjectionSnapshot>,
+        degraded: &[ContextPackOmitted],
+    ) -> Result<TaskContextPack> {
+        let request = plan.request;
+        let detail_level = plan.detail_level;
+        let snapshot = self.index.query_snapshot(|connection| {
+            let graph = graph_projection(graph_snapshot);
+            let mut inference = infer_task_space_associations(
+                connection,
+                request.task_id,
+                plan.query_tokens,
+                plan.query_phrases,
+                plan.hint_queries,
+                plan.scope_targets,
+                request.resolved_focus.as_ref(),
+                graph,
+                graph_snapshot.and_then(|snapshot| snapshot.context_tree_oid.as_deref()),
+                request.resolved_focus.is_some() && graph.is_none(),
+                request.mode,
+            )?;
+            let mut space_omissions = space_top_k_omissions(
+                connection,
+                &inference.associations[request.max_spaces.min(inference.associations.len())..],
+            )?;
+            space_omissions.extend(degraded.iter().cloned());
+            inference.associations.truncate(request.max_spaces);
+            let candidates = load_task_context_candidates(
+                connection,
+                &inference,
+                request.mode,
+                request.candidate_limit,
+                detail_level,
+                &self.context_ttl,
+                self.usage_prior.as_deref(),
+            )?;
+            let graph_diagnostics = artifact_focus_diagnostics(
+                request.resolved_focus.as_ref(),
+                inference.focus_reachable,
+                &inference.unresolved_focus_diagnostics,
+            );
+            Ok(pack_task_context_candidates(
+                candidates,
+                request.token_budget,
+                inference,
+                graph_diagnostics,
+                space_omissions,
+                detail_level,
+            ))
+        })?;
+        Ok(TaskContextPack {
+            indexed_tree_oid: snapshot.metadata.indexed_tree_oid,
+            projection_generation: snapshot.metadata.projection_generation,
+            artifact_generation: graph_projection(graph_snapshot)
+                .map(|graph| graph.artifact_generation.clone()),
+            graph_context_tree_oid: graph_snapshot
+                .and_then(|snapshot| snapshot.context_tree_oid.clone()),
+            task_id: request.task_id,
+            task_fingerprint: plan.fingerprint.to_owned(),
+            token_budget: request.token_budget,
+            estimated_tokens: snapshot.data.estimated_tokens,
+            mode: request.mode,
+            detail_level,
+            associations: snapshot.data.associations,
+            compact_associations: snapshot.data.compact_associations,
+            items: snapshot.data.items,
+            compact_items: snapshot.data.compact_items,
+            graph_diagnostics: snapshot.data.graph_diagnostics,
+            query_token_explanation: snapshot.data.query_token_explanation,
+            omitted: snapshot.data.omitted,
+        })
+    }
+
+    /// Reads the historical Engineering projection, keeping "there is none" and "it could not be
+    /// read" apart.
+    ///
+    /// They used to be the same `None`, which made a corrupt or unreadable projection look exactly
+    /// like an installation that had never built one -- and the second is the ordinary case, so
+    /// the first went unreported forever.
+    fn read_graph_snapshot(&self) -> GraphSnapshotRead {
+        let Some(store) = self.engineering_graph.as_ref() else {
+            return GraphSnapshotRead::Absent;
+        };
+        match store.read_snapshot() {
+            Ok(Some(snapshot)) => GraphSnapshotRead::Available(snapshot),
+            Ok(None) => GraphSnapshotRead::Absent,
+            Err(error) => GraphSnapshotRead::Failed(error.to_string()),
+        }
     }
 
     fn graph_snapshot_unchanged(&self, before: Option<&EngineeringProjectionSnapshot>) -> bool {
         let after = self.read_graph_snapshot();
-        graph_snapshot_identity(before) == graph_snapshot_identity(after.as_ref())
+        graph_snapshot_identity(before) == graph_snapshot_identity(after.snapshot())
     }
 
     /// Searches and expands Evidence/conflicts within one read transaction.
@@ -1514,6 +1620,61 @@ impl SearchEngine {
             pages: snapshot.data.0,
             next_cursor: snapshot.data.1,
         })
+    }
+}
+
+/// Everything one Pack build needs that does not change between Graph read attempts.
+struct TaskContextPlan<'a> {
+    request: &'a TaskContextRequest,
+    detail_level: ContextPackDetailLevel,
+    fingerprint: &'a str,
+    query_tokens: &'a [String],
+    query_phrases: &'a [String],
+    hint_queries: &'a [WorkingIntentHintQuery],
+    scope_targets: &'a ScopeTargets,
+}
+
+/// One attempt to read the historical Engineering projection.
+enum GraphSnapshotRead {
+    /// No projection store is configured, or it holds no projection yet. The ordinary case for an
+    /// installation that has never scanned a Repository, and never reported.
+    Absent,
+    Available(EngineeringProjectionSnapshot),
+    /// A projection exists and could not be read. Reported, never fatal.
+    Failed(String),
+}
+
+impl GraphSnapshotRead {
+    const fn snapshot(&self) -> Option<&EngineeringProjectionSnapshot> {
+        match self {
+            Self::Available(snapshot) => Some(snapshot),
+            Self::Absent | Self::Failed(_) => None,
+        }
+    }
+
+    fn failure(&self) -> Option<&str> {
+        match self {
+            Self::Failed(detail) => Some(detail),
+            Self::Absent | Self::Available(_) => None,
+        }
+    }
+}
+
+/// Reports one Graph channel this Pack could not use.
+///
+/// The reason is machine-readable and reaches every caller; the free-text detail reaches only an
+/// explicit read, because an automatic injection can act on "the Graph was unreadable" and has no
+/// use for the storage error that said so.
+fn degraded_graph_omission(
+    reason: &str,
+    detail: &str,
+    mode: ContextPackMode,
+) -> ContextPackOmitted {
+    ContextPackOmitted {
+        reason: reason.to_owned(),
+        count: 1,
+        detail: (mode == ContextPackMode::Explicit).then(|| detail.to_owned()),
+        ..ContextPackOmitted::default()
     }
 }
 
@@ -2615,6 +2776,10 @@ struct TaskAssociationInference {
     graph_context_tree_oid: Option<String>,
     graph_artifact_generation: Option<String>,
     focus_reachable: bool,
+    /// Compact reports for the References that name this Focus and did not resolve. Automatic
+    /// injection has no other way to learn the difference between an Artifact nobody wrote about
+    /// and one whose Reference stopped resolving.
+    unresolved_focus_diagnostics: Vec<TaskGraphDiagnostic>,
     /// Denominator every automatic coverage decision downstream of the inference divides by.
     coverage_basis: AutomaticCoverageBasis,
     query_token_explanation: AutomaticQueryTokenExplanation,
@@ -2677,9 +2842,15 @@ fn infer_task_space_associations(
     }
     let mut graph_contexts = BTreeMap::new();
     let mut focus_reachable = false;
+    let mut unresolved_focus_diagnostics = Vec::new();
     if let Some(graph) = engineering_graph {
-        focus_reachable =
-            query_graph_context_evidence(graph, resolved_focus, mode, &mut graph_contexts);
+        focus_reachable = query_graph_context_evidence(
+            graph,
+            resolved_focus,
+            mode,
+            &mut graph_contexts,
+            &mut unresolved_focus_diagnostics,
+        );
         expand_graph_context_relation_evidence(graph, mode, &mut graph_contexts)?;
     }
     expand_current_context_relation_evidence(connection, mode, &coverage_basis, &mut contexts)?;
@@ -2734,6 +2905,7 @@ fn infer_task_space_associations(
         graph_context_tree_oid: graph_context_tree_oid.map(ToOwned::to_owned),
         graph_artifact_generation: engineering_graph.map(|graph| graph.artifact_generation.clone()),
         focus_reachable,
+        unresolved_focus_diagnostics,
         coverage_basis,
         query_token_explanation: token_explanation,
         omitted: collapse_gate_omissions(gate_omitted),
@@ -3139,6 +3311,7 @@ fn query_graph_context_evidence(
     resolved_focus: Option<&ResolvedFocus>,
     mode: ContextPackMode,
     contexts: &mut BTreeMap<GraphContextKey, GraphContextEvidence>,
+    unresolved: &mut Vec<TaskGraphDiagnostic>,
 ) -> bool {
     let Some(resolved_focus) = resolved_focus else {
         return false;
@@ -3156,6 +3329,18 @@ fn query_graph_context_evidence(
             .find(|artifact| focus_matches_artifact(resolved_focus, artifact))
             .copied()
         else {
+            // A Reference that resolved to nothing has no Artifact key to match the Focus
+            // against, so it is matched against the locator the Reference itself names. That is
+            // how a broken association stops being indistinguishable from an Artifact nobody ever
+            // documented -- and it stays a diagnostic: no Context, no evidence, no association, so
+            // an unreachable Artifact still retrieves exactly nothing through the Graph.
+            if mode == ContextPackMode::AutomaticInjection
+                && resolved.resolution.repository_id == resolved_focus.repository_id
+                && resolved.locator.as_ref() == Some(&resolved_focus.locator)
+                && let Some(diagnostic) = unresolved_focus_diagnostic(resolved_focus, resolved)
+            {
+                unresolved.push(diagnostic);
+            }
             continue;
         };
         let Some(snapshot) = graph.contexts.iter().find(|snapshot| {
@@ -3219,6 +3404,13 @@ fn query_graph_context_evidence(
                     path,
                     relation_hops: Vec::new(),
                 });
+        } else if mode == ContextPackMode::AutomaticInjection {
+            // Automatic injection never crosses an unresolved Reference, but it must not stay
+            // silent about one either: the Reference is the evidence that somebody documented
+            // this exact Artifact and the association has since come apart.
+            if let Some(diagnostic) = unresolved_focus_diagnostic(resolved_focus, resolved) {
+                unresolved.push(diagnostic);
+            }
         } else if mode == ContextPackMode::Explicit {
             reachable = true;
             let mut bases = resolved
@@ -3255,7 +3447,42 @@ fn query_graph_context_evidence(
     for context in contexts.values_mut() {
         sort_dedup_paths(&mut context.evidence.graph_paths);
     }
+    unresolved.sort();
+    unresolved.dedup();
+    unresolved.truncate(MAX_UNRESOLVED_FOCUS_DIAGNOSTICS);
     reachable
+}
+
+/// One compact sentence for a Reference that names this Focus and did not resolve.
+///
+/// `Unavailable` is deliberately absent: it says the checkout was not there to look in, which is
+/// a fact about this machine rather than about the association, and the generic "not reachable"
+/// diagnostic already covers it without implying the Reference itself is broken.
+fn unresolved_focus_diagnostic(
+    resolved_focus: &ResolvedFocus,
+    resolved: &ResolvedReferenceProjection,
+) -> Option<TaskGraphDiagnostic> {
+    let locator = resolved_focus.locator.canonical_key();
+    let (kind, detail) = match resolved.resolution.status {
+        ResolutionStatus::Missing => (
+            TaskGraphDiagnosticKind::ArtifactReferenceMissing,
+            format!(
+                "{locator} is referenced by accepted knowledge and is absent from the scanned Repository snapshot"
+            ),
+        ),
+        ResolutionStatus::Ambiguous => (
+            TaskGraphDiagnosticKind::ArtifactReferenceAmbiguous,
+            format!(
+                "{locator} is referenced by accepted knowledge and several Artifacts answer to it"
+            ),
+        ),
+        ResolutionStatus::Resolved | ResolutionStatus::Unavailable => return None,
+    };
+    Some(TaskGraphDiagnostic {
+        kind,
+        resolved_focus: resolved_focus.clone(),
+        detail: Some(detail),
+    })
 }
 
 fn current_context_space(
@@ -4782,18 +5009,27 @@ struct PackedTaskContexts {
     omitted: Vec<ContextPackOmitted>,
 }
 
+/// The Pack's zero-result explanation for its Resolved Focus.
+///
+/// A named unresolved Reference replaces the generic "not reachable in Graph" rather than joining
+/// it: both answer the same question, one of them says which Reference and why, and the generic
+/// line is exactly the part an Agent cannot act on.
 fn artifact_focus_diagnostics(
     resolved_focus: Option<&ResolvedFocus>,
     reachable: bool,
+    unresolved: &[TaskGraphDiagnostic],
 ) -> Vec<TaskGraphDiagnostic> {
-    resolved_focus
-        .filter(|_| !reachable)
-        .map(|focus| TaskGraphDiagnostic {
+    let Some(focus) = resolved_focus.filter(|_| !reachable) else {
+        return Vec::new();
+    };
+    if unresolved.is_empty() {
+        return vec![TaskGraphDiagnostic {
             kind: TaskGraphDiagnosticKind::ArtifactNotReachableInGraph,
             resolved_focus: focus.clone(),
-        })
-        .into_iter()
-        .collect()
+            detail: None,
+        }];
+    }
+    unresolved.to_vec()
 }
 
 fn validate_task_context_request(request: &TaskContextRequest) -> Result<()> {

@@ -35,6 +35,10 @@ struct ConfigDocument {
     /// Optional Context time-to-live policy. Absent means no Context ever expires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     context_ttl: Option<ContextTtlConfigDocument>,
+    /// Optional Engineering Graph maintenance switches. Absent means the defaults below, which
+    /// keep the Graph attached to the knowledge that names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    engineering: Option<EngineeringConfigDocument>,
 }
 
 /// Optional `[activation]` table: overrides for derived Session activation.
@@ -173,6 +177,54 @@ impl HookSettings {
             None => Self {
                 artifact_focus_reminder: false,
             },
+        }
+    }
+}
+
+/// Optional `[engineering]` table: Engineering Graph maintenance switches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EngineeringConfigDocument {
+    #[serde(default = "enabled")]
+    auto_scan: bool,
+}
+
+const fn enabled() -> bool {
+    true
+}
+
+impl Default for EngineeringConfigDocument {
+    fn default() -> Self {
+        Self { auto_scan: true }
+    }
+}
+
+/// Explicit local Engineering Graph maintenance switches.
+///
+/// Unlike `[hooks]`, these are on by default: an Engineering Reference that nothing ever scans is
+/// an association the installation silently does not have, so the bounded rescan that follows a
+/// Confirmation is the normal behaviour and `auto_scan = false` is the explicit opt-out for an
+/// installation whose checkouts are too expensive to touch on the interactive path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct EngineeringSettings {
+    /// Whether an interactive MCP write that records or names Engineering References may spend
+    /// its bounded time budget rescanning the Repositories those References point into.
+    pub auto_scan: bool,
+}
+
+impl Default for EngineeringSettings {
+    fn default() -> Self {
+        Self { auto_scan: true }
+    }
+}
+
+impl EngineeringSettings {
+    const fn from_document(document: Option<EngineeringConfigDocument>) -> Self {
+        match document {
+            Some(engineering) => Self {
+                auto_scan: engineering.auto_scan,
+            },
+            None => Self { auto_scan: true },
         }
     }
 }
@@ -369,6 +421,7 @@ impl UserConfigStore {
             activation: None,
             hooks: None,
             context_ttl: None,
+            engineering: None,
         };
         validate_document_structure(&document, &root.join("repository"))?;
         toml::to_string_pretty(&document).map_err(|error| {
@@ -409,6 +462,7 @@ impl UserConfigStore {
                     activation: None,
                     hooks: None,
                     context_ttl: None,
+                    engineering: None,
                 })?;
             }
             Ok(())
@@ -535,6 +589,24 @@ impl UserConfigStore {
         let outcome = self
             .read_document()
             .and_then(|document| ContextTtlPolicy::from_document(document.context_ttl.as_ref()));
+        finish_locked(&lock, outcome)
+    }
+
+    /// Reads the explicit `[engineering]` switches from `config.toml`.
+    ///
+    /// A missing table is the default: automatic bounded rescanning is on. Read the same way as
+    /// [`Self::context_ttl_policy`] -- waiting for a concurrent explicit writer rather than
+    /// failing the call -- because only request-serving code asks, never the Hook hot path.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or filesystem errors.
+    pub fn engineering_settings(&self) -> Result<EngineeringSettings> {
+        let lock = open_private_file(&self.lock_path)?;
+        FileExt::lock_shared(&lock).map_err(io_error("lock config.lock shared"))?;
+        let outcome = self
+            .read_document()
+            .map(|document| EngineeringSettings::from_document(document.engineering));
         finish_locked(&lock, outcome)
     }
 

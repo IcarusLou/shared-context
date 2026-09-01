@@ -3,6 +3,7 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
     process::Command,
+    time::Instant,
 };
 
 use sctx_domain::{
@@ -191,13 +192,40 @@ impl RepositoryScanner {
     /// # Errors
     ///
     /// Returns typed validation, local Git, filesystem, or parsing errors.
-    #[allow(clippy::too_many_lines)]
     pub fn scan(
         &self,
         repository: &RepositoryIdentity,
         checkout_path: &Path,
         plan: &RepositoryScanPlan,
     ) -> Result<RepositoryScanOutcome> {
+        self.scan_before(repository, checkout_path, plan, None)?
+            .ok_or_else(|| invariant("an unbudgeted Repository scan cannot be abandoned"))
+    }
+
+    /// Scans the same snapshot under a wall-clock budget.
+    ///
+    /// `Ok(None)` means the budget ran out mid-scan and nothing was produced. That is deliberately
+    /// neither a `RepositorySnapshot` with fewer files nor an `Unavailable` outcome: both would be
+    /// fed to the resolver, which would then record "missing from the Repository snapshot" for
+    /// Artifacts that are merely unscanned, and the resolver's answers are what callers act on. An
+    /// abandoned scan has nothing to say, and says exactly that.
+    ///
+    /// The budget is checked between planned paths and again before parsing, so it bounds the
+    /// per-file local Git calls that dominate a scan of a large plan. A single oversized file is
+    /// still bounded by [`RepositoryScannerLimits`] rather than by the clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::scan`].
+    #[allow(clippy::too_many_lines)]
+    pub fn scan_before(
+        &self,
+        repository: &RepositoryIdentity,
+        checkout_path: &Path,
+        plan: &RepositoryScanPlan,
+        deadline: Option<Instant>,
+    ) -> Result<Option<RepositoryScanOutcome>> {
+        let expired = || deadline.is_some_and(|deadline| Instant::now() >= deadline);
         repository.validate()?;
         if plan.repository_id != repository.repository_id {
             return Err(invalid(
@@ -205,10 +233,10 @@ impl RepositoryScanner {
             ));
         }
         if !checkout_path.exists() {
-            return Ok(RepositoryScanOutcome::Unavailable {
+            return Ok(Some(RepositoryScanOutcome::Unavailable {
                 repository_id: repository.repository_id.clone(),
                 reason: "Repository checkout is unavailable".to_owned(),
-            });
+            }));
         }
         let root = validate_checkout_root(checkout_path)?;
         let head_tree_oid = git_text(&root, &["rev-parse", "HEAD^{tree}"])?;
@@ -216,6 +244,9 @@ impl RepositoryScanner {
         let mut skipped_files = Vec::new();
         let mut scanned_bytes = 0_u64;
         for planned_path in &plan.paths {
+            if expired() {
+                return Ok(None);
+            }
             let relative = planned_path.as_str().to_owned();
             if sources.len() >= self.limits.max_files {
                 skipped_files.push(SkippedFile {
@@ -330,10 +361,13 @@ impl RepositoryScanner {
         );
         let mut builder = ArtifactBuilder::new(repository, &generation);
         for source in &sources {
+            if expired() {
+                return Ok(None);
+            }
             builder.scan_source(source)?;
         }
         let artifacts = builder.finish();
-        Ok(RepositoryScanOutcome::Available(RepositorySnapshot {
+        Ok(Some(RepositoryScanOutcome::Available(RepositorySnapshot {
             repository_id: repository.repository_id.clone(),
             source_policy: SnapshotSourcePolicy::PlannedPathsWithSafeTrackedModifications,
             policy_version: POLICY_VERSION,
@@ -344,7 +378,7 @@ impl RepositoryScanner {
             scanned_files: sources.len(),
             scanned_bytes,
             skipped_files,
-        }))
+        })))
     }
 
     /// Reuses an identical prior snapshot, otherwise returns the same result as a scratch scan.
@@ -1200,6 +1234,10 @@ fn hash_component(hasher: &mut Sha256, value: &str) {
 
 fn invalid(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::InvalidInput, message)
+}
+
+fn invariant(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvariantViolation, message)
 }
 
 fn io_error(context: &'static str) -> impl FnOnce(std::io::Error) -> Error {
