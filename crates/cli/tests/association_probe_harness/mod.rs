@@ -354,6 +354,53 @@ pub struct ProbeOutcome {
     pub intent_top1: Option<u64>,
     pub intent_items: usize,
     pub intent_hit: bool,
+    /// Automatic coverage inputs, read back from the explainable `task_context` payload of the
+    /// same Working Intent. They are diagnostics only; no assertion depends on them.
+    pub automatic: AutomaticProbeDiagnostics,
+}
+
+/// What the automatic channel measured for one probe: how many query tokens it selected, how many
+/// of those this corpus can answer at all, and how many the leading item actually matched.
+#[derive(Default)]
+pub struct AutomaticProbeDiagnostics {
+    pub selected_tokens: usize,
+    pub answerable_tokens: usize,
+    pub matched_tokens: usize,
+    pub coverage_basis_points: u64,
+    /// Omission reasons the Pack reported, deduplicated and counted.
+    pub omitted: BTreeMap<String, usize>,
+}
+
+fn count(value: &Value) -> usize {
+    usize::try_from(value.as_u64().unwrap_or(0)).unwrap_or(usize::MAX)
+}
+
+fn automatic_diagnostics(harness: &Harness) -> AutomaticProbeDiagnostics {
+    let pack = mcp_tool(
+        &harness.home,
+        &harness.session,
+        "task_context",
+        json!({"detail_level": "full", "token_budget": 32768}),
+    );
+    let explanation = &pack["query_token_explanation"];
+    let leading = pack["items"].as_array().and_then(|items| items.first());
+    let mut omitted = BTreeMap::new();
+    for entry in pack["omitted"].as_array().into_iter().flatten() {
+        let reason = entry["reason"].as_str().unwrap_or("unknown").to_owned();
+        *omitted.entry(reason).or_insert(0) +=
+            usize::try_from(entry["count"].as_u64().unwrap_or(0)).unwrap_or(usize::MAX);
+    }
+    AutomaticProbeDiagnostics {
+        selected_tokens: count(&explanation["selected_token_count"]),
+        answerable_tokens: count(&explanation["answerable_token_count"]),
+        matched_tokens: leading
+            .and_then(|item| item["context"]["match_reason"]["matched_tokens"].as_array())
+            .map_or(0, Vec::len),
+        coverage_basis_points: leading
+            .and_then(|item| item["context"]["match_reason"]["coverage_basis_points"].as_u64())
+            .unwrap_or(0),
+        omitted,
+    }
 }
 
 fn top_index(harness: &Harness, context_id: Option<&str>) -> Option<u64> {
@@ -422,7 +469,9 @@ pub fn run_probes(harness: &mut Harness, fixture: &Value) -> Vec<ProbeOutcome> {
                 top.is_some_and(|index| expected.contains(&index))
             }
         };
+        let automatic = automatic_diagnostics(harness);
         outcomes.push(ProbeOutcome {
+            automatic,
             id: probe["id"].as_str().unwrap().to_owned(),
             category: probe["category"].as_str().unwrap().to_owned(),
             query,
@@ -457,6 +506,7 @@ fn report_path(file_name: &str) -> PathBuf {
 
 /// Prints the per-probe table, writes the machine-readable report and returns
 /// the two hit counts (explicit search, automatic `task_intent_update`).
+#[allow(clippy::too_many_lines)]
 pub fn emit(
     report_file_name: &str,
     mode: &str,
@@ -501,6 +551,30 @@ pub fn emit(
         total = outcomes.len()
     );
 
+    println!("\n--- automatic coverage inputs ({mode}) ---");
+    println!(
+        "{:<10} {:>9} {:>11} {:>8} {:>9}  omitted",
+        "probe", "selected", "answerable", "matched", "coverage"
+    );
+    for outcome in outcomes {
+        let omitted = outcome
+            .automatic
+            .omitted
+            .iter()
+            .map(|(reason, count)| format!("{reason}={count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "{:<10} {:>9} {:>11} {:>8} {:>9}  {}",
+            outcome.id,
+            outcome.automatic.selected_tokens,
+            outcome.automatic.answerable_tokens,
+            outcome.automatic.matched_tokens,
+            outcome.automatic.coverage_basis_points,
+            omitted
+        );
+    }
+
     let rows = outcomes
         .iter()
         .map(|outcome| {
@@ -518,6 +592,13 @@ pub fn emit(
                     "top1_context_index": outcome.intent_top1,
                     "item_count": outcome.intent_items,
                     "hit": outcome.intent_hit
+                },
+                "automatic_coverage": {
+                    "selected_tokens": outcome.automatic.selected_tokens,
+                    "answerable_tokens": outcome.automatic.answerable_tokens,
+                    "matched_tokens": outcome.automatic.matched_tokens,
+                    "coverage_basis_points": outcome.automatic.coverage_basis_points,
+                    "omitted": outcome.automatic.omitted
                 }
             })
         })
