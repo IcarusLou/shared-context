@@ -16,7 +16,8 @@ pub use artifact_reminder::{
     ARTIFACT_REMINDER_MAX_ENTRIES, ArtifactReminderKey, ArtifactReminderMark, ArtifactReminderStore,
 };
 pub use config::{
-    ActivationScope, ActivationSettings, CatalogCheckoutStatus, ContextTtlPolicy, HookSettings,
+    ActivationScope, ActivationSettings, CatalogCheckoutStatus, ContextTtlPolicy,
+    EngineeringSettings, HookSettings,
     LEGACY_REPOSITORY_ID_PREFIX, RepositoryCatalogAddOutcome, RepositoryCatalogCheckoutCheck,
     RepositoryCatalogDiagnostic, RepositoryCatalogDoctorReport, RepositoryCatalogEntry,
     RepositoryCatalogRenameOutcome, RepositoryCatalogRevision, RepositoryCatalogSnapshot,

@@ -1038,3 +1038,45 @@ fn hook_switches_default_to_off_and_survive_an_explicit_catalog_write() {
         "an undocumented [hooks] key is refused instead of silently ignored"
     );
 }
+
+#[test]
+fn engineering_auto_scan_defaults_to_on_and_is_explicitly_switchable() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("共享 配置");
+    let repository = init_repo(&temporary.path().join("engineering repo"), "engineering");
+    let store = UserConfigStore::initialize(&root).unwrap();
+
+    assert!(
+        store.engineering_settings().unwrap().auto_scan,
+        "an absent [engineering] table keeps the Graph attached to new knowledge"
+    );
+
+    let config_path = root.join("config.toml");
+    let mut text = fs::read_to_string(&config_path).unwrap();
+    text.push_str("\n[engineering]\nauto_scan = false\n");
+    fs::write(&config_path, text).unwrap();
+    assert!(!store.engineering_settings().unwrap().auto_scan);
+
+    // A later explicit Catalog write must round-trip the switch, not drop it.
+    store
+        .add_repository(
+            "FE".parse::<RepositoryId>().unwrap(),
+            std::slice::from_ref(&repository),
+        )
+        .unwrap();
+    assert!(!store.engineering_settings().unwrap().auto_scan);
+    assert!(
+        fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("[engineering]")
+    );
+
+    let mut text = fs::read_to_string(&config_path).unwrap();
+    text.push_str("unknown_switch = true\n");
+    fs::write(&config_path, text).unwrap();
+    assert_eq!(
+        store.engineering_settings().unwrap_err().kind(),
+        ErrorKind::InvalidInput,
+        "an undocumented [engineering] key is refused instead of silently ignored"
+    );
+}
