@@ -1691,7 +1691,55 @@ struct AutomaticTokenSelection {
     tokens: Vec<String>,
     /// The subset of `tokens` whose document frequency is above zero.
     answerable: Vec<String>,
+    /// Observed rarity of the selected tokens, already paid for by the selection itself.
+    rarity: QueryTokenRarity,
     explanation: AutomaticQueryTokenExplanation,
+}
+
+/// How rare each selected query token is in this corpus.
+///
+/// Automatic token selection already reads every one of these frequencies to order the query
+/// rarest-first, so carrying them costs nothing and answers a question the ranking otherwise
+/// cannot: between two Contexts that covered exactly the same *share* of the query, which one
+/// matched the words that actually name something. Explicit retrieval never pays for the probes
+/// and therefore leaves this empty, which reads as "no opinion" and changes no order.
+#[derive(Clone, Debug, Default)]
+struct QueryTokenRarity {
+    document_count: usize,
+    document_frequencies: BTreeMap<String, usize>,
+}
+
+impl QueryTokenRarity {
+    /// Summed rarity of the tokens one Context matched, in micros.
+    ///
+    /// Rarity per token is `documents / documents holding it`, the quantity inverse document
+    /// frequency takes the logarithm of. The logarithm is dropped on purpose: this value is only
+    /// ever compared, never combined with a score, and integer arithmetic keeps a ranking key
+    /// exactly reproducible where a float would leave it depending on evaluation order.
+    ///
+    /// A token this Tree never measured contributes nothing rather than an invented rarity, so an
+    /// explicit query -- which measures none of them -- scores every candidate zero and keeps
+    /// exactly the order it had.
+    fn matched_micros(&self, matched: &[String]) -> u64 {
+        let Ok(documents) = u64::try_from(self.document_count) else {
+            return 0;
+        };
+        matched
+            .iter()
+            .filter_map(|token| self.document_frequencies.get(token).copied())
+            .filter_map(|frequency| u64::try_from(frequency).ok())
+            .map(|frequency| {
+                documents
+                    .saturating_mul(1_000_000)
+                    .saturating_div(frequency.saturating_add(1))
+            })
+            .fold(0, u64::saturating_add)
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.document_count = self.document_count.max(other.document_count);
+        self.document_frequencies.extend(other.document_frequencies);
+    }
 }
 
 /// Denominator of every automatic text-coverage decision.
@@ -1817,6 +1865,7 @@ fn explicit_token_selection(tokens: &[String]) -> AutomaticTokenSelection {
     AutomaticTokenSelection {
         tokens: tokens.to_vec(),
         answerable: tokens.to_vec(),
+        rarity: QueryTokenRarity::default(),
         explanation,
     }
 }
@@ -1895,6 +1944,10 @@ fn automatic_eligible_query_tokens(
         });
     }
     ranked.truncate(MAX_AUTOMATIC_QUERY_TOKENS);
+    let frequencies = ranked
+        .iter()
+        .map(|(frequency, token)| (token.clone(), *frequency))
+        .collect::<BTreeMap<_, _>>();
     // The frequencies were already paid for above, so naming the answerable tokens costs no query.
     //
     // A generic word is excluded whatever its frequency. The denominator asks which words of the
@@ -1929,6 +1982,10 @@ fn automatic_eligible_query_tokens(
     explanation.refresh_counts();
     Ok(AutomaticTokenSelection {
         explanation,
+        rarity: QueryTokenRarity {
+            document_count,
+            document_frequencies: frequencies,
+        },
         tokens: eligible,
         answerable,
     })
@@ -2639,6 +2696,8 @@ struct TaskAssociationInference {
     focus_reachable: bool,
     /// Denominator every automatic coverage decision downstream of the inference divides by.
     coverage_basis: AutomaticCoverageBasis,
+    /// Observed rarity of the selected query tokens, for the item tie-break that needs it.
+    token_rarity: QueryTokenRarity,
     query_token_explanation: AutomaticQueryTokenExplanation,
     /// Spaces the automatic text gate dropped, already collapsed to a reportable size.
     omitted: Vec<ContextPackOmitted>,
@@ -2667,6 +2726,7 @@ fn infer_task_space_associations(
 ) -> Result<TaskAssociationInference> {
     let selection = automatic_eligible_query_tokens(connection, query_tokens, mode)?;
     let coverage_basis = AutomaticCoverageBasis::from_selection(&selection);
+    let mut token_rarity = selection.rarity;
     let mut token_explanation = selection.explanation;
     let query_tokens = selection.tokens;
     let query_phrases = eligible_query_phrases(query_phrases, &query_tokens);
@@ -2674,6 +2734,7 @@ fn infer_task_space_associations(
         .iter()
         .map(|query| {
             let selection = automatic_eligible_query_tokens(connection, &query.tokens, mode)?;
+            token_rarity.merge(selection.rarity);
             merge_token_explanations(&mut token_explanation, selection.explanation);
             Ok(WorkingIntentHintQuery {
                 source_field: query.source_field,
@@ -2757,6 +2818,7 @@ fn infer_task_space_associations(
         graph_artifact_generation: engineering_graph.map(|graph| graph.artifact_generation.clone()),
         focus_reachable,
         coverage_basis,
+        token_rarity,
         query_token_explanation: token_explanation,
         omitted: collapse_gate_omissions(gate_omitted),
     })
@@ -5047,6 +5109,20 @@ fn load_task_context_candidates(
                     .match_reason
                     .coverage_basis_points
                     .cmp(&left.item.context.match_reason.coverage_basis_points)
+            })
+            // Equal shares of the query are not equal answers. Two Contexts can each match one of
+            // four answerable tokens and mean entirely different things by it, and the next key
+            // down is BM25, which separates them by document length -- the shorter near-duplicate
+            // wins on being short. Rarity says what coverage cannot: the Context that matched the
+            // word naming something in this corpus answered more of the question than the one that
+            // matched the word half the corpus uses.
+            .then_with(|| {
+                let rarity = |candidate: &TaskContextCandidate| {
+                    inference
+                        .token_rarity
+                        .matched_micros(&candidate.item.context.match_reason.matched_tokens)
+                };
+                rarity(right).cmp(&rarity(left))
             })
             .then_with(|| {
                 left.item
@@ -8222,6 +8298,35 @@ mod tests {
                 "ctx_00000000-0000-4000-8000-000000000001",
                 "ctx_00000000-0000-4000-8000-000000000002"
             ]
+        );
+    }
+
+    #[test]
+    fn matched_rarity_prefers_the_word_that_names_something() {
+        let rarity = super::QueryTokenRarity {
+            document_count: 8,
+            document_frequencies: [
+                ("兜底".to_owned(), 1),
+                ("槽位".to_owned(), 2),
+                ("模块".to_owned(), 6),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let one = |token: &str| rarity.matched_micros(&[token.to_owned()]);
+        assert!(one("兜底") > one("槽位"));
+        assert!(one("槽位") > one("模块"));
+        // Two Contexts covering one answerable token each are separated by which token it was.
+        assert!(
+            rarity.matched_micros(&["兜底".to_owned()])
+                > rarity.matched_micros(&["模块".to_owned()])
+        );
+        // A token this Tree never measured is not scored as if it were the rarest word there is.
+        assert_eq!(rarity.matched_micros(&["未测量".to_owned()]), 0);
+        // Explicit retrieval measures nothing, so every candidate scores zero and keeps its order.
+        assert_eq!(
+            super::QueryTokenRarity::default().matched_micros(&["兜底".to_owned()]),
+            0
         );
     }
 
