@@ -315,8 +315,8 @@ fn assert_output(output: &Output, expected: &Value) {
 /// The documented Codex lifecycle wire.
 ///
 /// The boundary line is user-visible on `systemMessage` and mirrored into model context,
-/// because a reminder the model cannot read cannot be acted on. `PreCompact` is the one
-/// exception: model context carries the re-stated activation marker there, since
+/// because a reminder the model cannot read cannot be acted on. At `PreCompact` model
+/// context carries that same line joined to the re-stated activation marker, since
 /// compaction is what drops the `SessionStart` marker out of the conversation.
 fn assert_codex_lifecycle_message(
     output: &Output,
@@ -574,7 +574,11 @@ fn documented_codex_direct_lifecycle_activates_before_prompt_and_keeps_git_clean
         &fixture.run("codex", &events[3]),
         "PreCompact",
         &oracle.enabled_without_active_task.pre_compact,
-        &oracle.activation_marker("codex", session),
+        &format!(
+            "{}\n{}",
+            oracle.enabled_without_active_task.pre_compact,
+            oracle.activation_marker("codex", session)
+        ),
     );
     assert_codex_lifecycle_message(
         &fixture.run("codex", &events[4]),

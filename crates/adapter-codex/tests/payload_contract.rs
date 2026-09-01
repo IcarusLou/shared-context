@@ -124,8 +124,9 @@ fn codex_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_cl
         }
 
         // Compaction re-states the activation marker as model-visible context, because
-        // compaction is what drops the SessionStart marker. A Stop has no marker of its
-        // own, so its user-visible line is mirrored into model context instead.
+        // compaction is what drops the SessionStart marker — joined to the boundary line
+        // so the checkpoint request the user sees is not the half the model loses. A Stop
+        // has no marker of its own, so its user-visible line is mirrored on its own.
         let output = encode_hook_output(
             event.kind(),
             &ResolvedAgentAction {
@@ -137,7 +138,10 @@ fn codex_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_cl
         let (hook_event_name, expected_context) = match expected_trigger {
             EpisodeFinalizationTrigger::PreCompact => (
                 "PreCompact",
-                shared_context_activation_marker(AgentKind::Codex, "thr_real_shape_01"),
+                format!(
+                    "{message}\n{}",
+                    shared_context_activation_marker(AgentKind::Codex, "thr_real_shape_01")
+                ),
             ),
             EpisodeFinalizationTrigger::TurnStop => ("Stop", message.to_owned()),
         };
@@ -342,6 +346,44 @@ fn codex_post_tool_reminder_is_off_by_default_and_keeps_the_current_bytes() {
         encode_hook_output(CanonicalAgentEventKind::PostToolUse, &resolved).unwrap(),
         b"{}".to_vec()
     );
+}
+
+/// The `PreCompact` join is scoped, and this is the event that proves it must be.
+///
+/// A `PostToolUse` under the enabled Artifact focus experiment is the one other event that
+/// carries both fields: the Intent bootstrap line and one bounded, untrusted-data-fenced
+/// reminder. The reminder reaches model context as exactly the block it was rendered and
+/// budgeted as — joining the message into it would both break its byte budget and put a
+/// trusted instruction inside a block fenced as untrusted data.
+#[test]
+fn codex_post_tool_keeps_a_bounded_reminder_separate_from_its_system_message() {
+    const INTENT_BOOTSTRAP: &str = "Shared Context: no ActiveTask exists. Call task_intent_update for this substantive task before continuing.";
+
+    let reminder = render_artifact_focus_reminder("src/lib.rs", &reminder_contexts()).unwrap();
+    let output = encode_hook_output(
+        CanonicalAgentEventKind::PostToolUse,
+        &ResolvedAgentAction {
+            additional_context: Some(reminder.clone()),
+            system_message: Some(INTENT_BOOTSTRAP.to_owned()),
+        },
+    )
+    .unwrap();
+    let output: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        output,
+        serde_json::json!({
+            "systemMessage": INTENT_BOOTSTRAP,
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": reminder
+            }
+        })
+    );
+    let model_context = output["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(!model_context.contains(INTENT_BOOTSTRAP));
+    assert!(model_context.len() <= ARTIFACT_FOCUS_REMINDER_MAX_BYTES);
 }
 
 #[test]

@@ -257,11 +257,28 @@ pub fn encode_hook_output(
     // message that carries no additional context of its own is therefore written to both
     // fields. TODO: narrow this back to `systemMessage` alone once a real Codex session
     // demonstrates that `systemMessage` is model-visible.
-    if let Some(context) = action
-        .additional_context
-        .as_ref()
-        .or(action.system_message.as_ref())
-    {
+    //
+    // `PreCompact` is the one event that carries both at once: the boundary line the user
+    // reads and the re-stated activation marker the model needs. They are joined into one
+    // model-visible block exactly as Cursor joins them into its single `user_message`
+    // field. The join is scoped to `PreCompact` on purpose. A `PostToolUse` under the
+    // enabled Artifact focus experiment also carries both — the Intent bootstrap message
+    // and one bounded, untrusted-data-fenced reminder — and that reminder must reach the
+    // model as exactly the block it was rendered and budgeted as, never with another
+    // sentence prepended inside its own field.
+    let additional_context = match (
+        event,
+        action.system_message.as_deref(),
+        action.additional_context.as_deref(),
+    ) {
+        (CanonicalAgentEventKind::PreCompact, Some(message), Some(marker)) => {
+            Some(format!("{message}\n{marker}"))
+        }
+        (_, _, Some(context)) => Some(context.to_owned()),
+        (_, Some(message), None) => Some(message.to_owned()),
+        (_, None, None) => None,
+    };
+    if let Some(context) = additional_context {
         object.insert(
             "hookSpecificOutput".to_owned(),
             json!({
