@@ -12,7 +12,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use sctx_domain::{
     AgentCheckpoint, AgentCheckpointId, Applicability, ArtifactRef, AutomaticContextCandidate,
     CandidateBuildId, CandidateConfirmationPlan, CandidateId, CandidateReviewStatus,
@@ -34,10 +36,23 @@ pub use reference_derivation::{
     ResolvedReference, derive_claim_references, unresolvable,
 };
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const HOOK_BUSY_TIMEOUT: Duration = Duration::from_millis(25);
 const MAX_EPISODE_LIST_LIMIT: usize = 256;
+/// Every this-many-th `hook_event` insert also prunes rows older than the retention window, so
+/// the Hook hot path never pays for cleanup on every call.
+const HOOK_EVENT_PRUNE_INTERVAL: i64 = 64;
+/// Row count kept behind the newest `hook_event` id when pruning runs.
+const HOOK_EVENT_RETENTION_ROWS: i64 = 5_000;
+/// Upper bound on one `hook_event.detail` value, enforced before it reaches storage.
+pub const MAX_HOOK_EVENT_DETAIL_CHARS: usize = 256;
+/// Busy window for the `hook_event` diagnostic write only, deliberately far shorter than
+/// [`HOOK_BUSY_TIMEOUT`]. Many concurrent Hook processes may all try to write a completion row
+/// at once; retrying each one against a single-writer `SQLite` file for tens of milliseconds
+/// would serialize them and could itself blow the Hook p99 budget. Losing an occasional
+/// diagnostic row under contention is an acceptable trade for keeping the Hook path fast.
+const HOOK_EVENT_BUSY_TIMEOUT: Duration = Duration::from_millis(3);
 /// Maximum Context identities bound into one usage-totals query.
 const USAGE_TOTALS_QUERY_CHUNK: usize = 256;
 pub const DEFAULT_CANDIDATE_REVIEW_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -620,6 +635,99 @@ impl ContextUsageTotals {
     pub const fn is_empty(&self) -> bool {
         self.reused == 0 && self.ignored == 0 && self.refuted == 0
     }
+}
+
+/// Disposition one `hook_event` row records for a single Hook-path decision point.
+///
+/// `Enabled`/`Disabled` mirror the resolved activation for that decision point; `Neutral`
+/// records a degraded-but-still-successful outcome (for example a dropped attribution); and
+/// `FailOpen` records a fault that forced the safe no-op path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HookEventDecision {
+    Enabled,
+    Disabled,
+    Neutral,
+    FailOpen,
+}
+
+impl HookEventDecision {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+            Self::Neutral => "neutral",
+            Self::FailOpen => "fail_open",
+        }
+    }
+}
+
+impl std::fmt::Display for HookEventDecision {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// One diagnostic row bound for the `hook_event` table.
+///
+/// `detail` is safe-by-construction free text — never prompt or tool-output content, though an
+/// absolute local path is acceptable — and is truncated to
+/// [`MAX_HOOK_EVENT_DETAIL_CHARS`] characters if longer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HookEventRecord {
+    pub recorded_at_unix_ms: u64,
+    pub agent_kind: String,
+    pub external_session_id: Option<String>,
+    pub event_kind: String,
+    pub decision: HookEventDecision,
+    pub reason: String,
+    pub duration_ms: u64,
+    pub detail: Option<String>,
+}
+
+impl HookEventRecord {
+    fn validate(&self) -> Result<()> {
+        if self.agent_kind.trim().is_empty() {
+            return Err(invalid("hook_event.agent_kind must not be empty"));
+        }
+        if self.event_kind.trim().is_empty() {
+            return Err(invalid("hook_event.event_kind must not be empty"));
+        }
+        if self.reason.trim().is_empty() {
+            return Err(invalid("hook_event.reason must not be empty"));
+        }
+        if self
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.chars().count() > MAX_HOOK_EVENT_DETAIL_CHARS)
+        {
+            return Err(invalid(format!(
+                "hook_event.detail must be at most {MAX_HOOK_EVENT_DETAIL_CHARS} characters"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// One `(decision, reason)` count over a recorded-since window.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HookEventCount {
+    pub decision: String,
+    pub reason: String,
+    pub count: i64,
+}
+
+/// One `hook_event` row as read back for `sctx doctor --hooks`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HookEventView {
+    pub recorded_at_unix_ms: u64,
+    pub agent_kind: String,
+    pub external_session_id: Option<String>,
+    pub event_kind: String,
+    pub decision: String,
+    pub reason: String,
+    pub duration_ms: u64,
+    pub detail: Option<String>,
 }
 
 /// Owner of the installation-local `state/runtime.sqlite` database.
@@ -3450,6 +3558,154 @@ impl TaskRuntime {
         Ok(totals)
     }
 
+    /// Records one Hook-path diagnostic row, best-effort from the caller's perspective.
+    ///
+    /// This is the only write on the Hook hot path: one `INSERT`, and — once per
+    /// [`HOOK_EVENT_PRUNE_INTERVAL`](crate) inserts, keyed off the assigned row id so no counter
+    /// needs to survive across Hook process invocations — one bounded `DELETE` that keeps the
+    /// table under [`HOOK_EVENT_RETENTION_ROWS`](crate) rows. No new lock is taken.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed validation or storage errors. Callers treat every error as advisory: a
+    /// failed diagnostic write must never change Hook behavior.
+    pub fn record_hook_event(&self, record: &HookEventRecord) -> Result<()> {
+        Self::record_hook_event_at(&self.database, record)
+    }
+
+    /// Writes one Hook diagnostic row directly against `database_path`, without constructing a
+    /// full [`TaskRuntime`] first (no directory creation, no schema check, no `PRAGMA
+    /// foreign_keys`). A Hook-path caller that already knows the installation root can use this
+    /// to record without paying for the extra validating connection open
+    /// [`TaskRuntime::initialize_for_hook`] performs, which matters when many Hook processes
+    /// write concurrently. The `hook_event` table must already exist — a schema that predates
+    /// it, or no installation database at all, both surface as a typed error the caller
+    /// degrades exactly like any other open/write failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed validation or storage errors. Callers treat every error as advisory: a
+    /// failed diagnostic write must never change Hook behavior.
+    pub fn record_hook_event_at(database_path: &Path, record: &HookEventRecord) -> Result<()> {
+        record.validate()?;
+        // `SQLITE_OPEN_READ_WRITE` only, deliberately without `SQLITE_OPEN_CREATE`: this write
+        // must never be the thing that first creates `runtime.sqlite`. `TaskRuntime::open_connection`
+        // only runs `ensure_schema` (which sets `journal_mode=WAL` and creates every table) when
+        // the database file did not already exist; a schema-less file this diagnostic write
+        // created would silently poison every later `initialize_for_hook` call into skipping
+        // schema setup, breaking the real Task Runtime tables. If the installation has not been
+        // set up yet, this simply fails to open and degrades to a stderr line, same as any other
+        // Runtime-unavailable case.
+        //
+        // A dedicated connection with its own short busy window: see [`HOOK_EVENT_BUSY_TIMEOUT`]
+        // for why this write must fail fast under contention instead of inheriting the
+        // interactive or Hook-authorization busy window.
+        let connection = Connection::open_with_flags(
+            database_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(sql_error("open task runtime database"))?;
+        connection
+            .busy_timeout(HOOK_EVENT_BUSY_TIMEOUT)
+            .map_err(sql_error("configure hook event busy timeout"))?;
+        connection
+            .execute(
+                "INSERT INTO hook_event (
+                    recorded_at_unix_ms, agent_kind, external_session_id, event_kind,
+                    decision, reason, duration_ms, detail
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    i64::try_from(record.recorded_at_unix_ms).unwrap_or(i64::MAX),
+                    record.agent_kind,
+                    record.external_session_id,
+                    record.event_kind,
+                    record.decision.as_str(),
+                    record.reason,
+                    i64::try_from(record.duration_ms).unwrap_or(i64::MAX),
+                    record.detail,
+                ],
+            )
+            .map_err(sql_error("insert hook event"))?;
+        let id = connection.last_insert_rowid();
+        if id > 0 && id % HOOK_EVENT_PRUNE_INTERVAL == 0 {
+            let _ = connection.execute(
+                "DELETE FROM hook_event WHERE id < ?1",
+                params![id - HOOK_EVENT_RETENTION_ROWS],
+            );
+        }
+        Ok(())
+    }
+
+    /// Counts `hook_event` rows recorded at or after `since_unix_ms`, grouped by decision and
+    /// reason. Used by `sctx doctor --hooks`; never on the Hook hot path.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage errors.
+    pub fn hook_event_counts_since(&self, since_unix_ms: u64) -> Result<Vec<HookEventCount>> {
+        let connection = self.open_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT decision, reason, COUNT(*) FROM hook_event
+                 WHERE recorded_at_unix_ms >= ?1
+                 GROUP BY decision, reason
+                 ORDER BY decision ASC, reason ASC",
+            )
+            .map_err(sql_error("prepare hook event counts"))?;
+        let rows = statement
+            .query_map(params![i64::try_from(since_unix_ms).unwrap_or(0)], |row| {
+                Ok(HookEventCount {
+                    decision: row.get(0)?,
+                    reason: row.get(1)?,
+                    count: row.get::<_, i64>(2)?,
+                })
+            })
+            .map_err(sql_error("query hook event counts"))?;
+        let mut counts = Vec::new();
+        for row in rows {
+            let mut row = row.map_err(sql_error("read hook event count row"))?;
+            row.count = row.count.max(0);
+            counts.push(row);
+        }
+        Ok(counts)
+    }
+
+    /// Reads the most recently recorded `hook_event` rows, newest first. Used by
+    /// `sctx doctor --hooks`; never on the Hook hot path.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage errors.
+    pub fn recent_hook_events(&self, limit: usize) -> Result<Vec<HookEventView>> {
+        let connection = self.open_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT recorded_at_unix_ms, agent_kind, external_session_id, event_kind,
+                        decision, reason, duration_ms, detail
+                 FROM hook_event ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(sql_error("prepare recent hook events"))?;
+        let rows = statement
+            .query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                Ok(HookEventView {
+                    recorded_at_unix_ms: u64::try_from(row.get::<_, i64>(0)?).unwrap_or(0),
+                    agent_kind: row.get(1)?,
+                    external_session_id: row.get(2)?,
+                    event_kind: row.get(3)?,
+                    decision: row.get(4)?,
+                    reason: row.get(5)?,
+                    duration_ms: u64::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
+                    detail: row.get(7)?,
+                })
+            })
+            .map_err(sql_error("query recent hook events"))?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row.map_err(sql_error("read recent hook event row"))?);
+        }
+        Ok(events)
+    }
+
     fn open_connection(&self) -> Result<Connection> {
         let connection =
             Connection::open(&self.database).map_err(sql_error("open task runtime database"))?;
@@ -3838,7 +4094,22 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 episode_id TEXT PRIMARY KEY,
                 FOREIGN KEY (episode_id) REFERENCES work_episode (episode_id)
             ) STRICT;
-            PRAGMA user_version = 13;",
+            CREATE TABLE IF NOT EXISTS hook_event (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at_unix_ms INTEGER NOT NULL CHECK (recorded_at_unix_ms >= 0),
+                agent_kind TEXT NOT NULL,
+                external_session_id TEXT,
+                event_kind TEXT NOT NULL,
+                decision TEXT NOT NULL CHECK (
+                    decision IN ('enabled', 'disabled', 'neutral', 'fail_open')
+                ),
+                reason TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL CHECK (duration_ms >= 0),
+                detail TEXT CHECK (detail IS NULL OR length(detail) <= 256)
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS hook_event_recorded_at
+                ON hook_event (recorded_at_unix_ms);
+            PRAGMA user_version = 14;",
         )
         .map_err(sql_error("initialize task runtime schema"))
 }
@@ -6640,4 +6911,64 @@ fn sql_error(context: &'static str) -> impl FnOnce(rusqlite::Error) -> Error {
 
 fn json_error(context: &'static str) -> impl FnOnce(serde_json::Error) -> Error {
     move |error| Error::new(ErrorKind::InvariantViolation, format!("{context}: {error}"))
+}
+
+#[cfg(test)]
+mod hook_event_retention_tests {
+    use tempfile::TempDir;
+
+    use super::{
+        Connection, HOOK_EVENT_PRUNE_INTERVAL, HOOK_EVENT_RETENTION_ROWS, HookEventDecision,
+        HookEventRecord, TaskRuntime, params,
+    };
+
+    fn sample() -> HookEventRecord {
+        HookEventRecord {
+            recorded_at_unix_ms: 1,
+            agent_kind: "codex".to_owned(),
+            external_session_id: None,
+            event_kind: "session_start".to_owned(),
+            decision: HookEventDecision::Enabled,
+            reason: "ok".to_owned(),
+            duration_ms: 0,
+            detail: None,
+        }
+    }
+
+    /// Whitebox: seeds `sqlite_sequence` so the very next insert lands on an id that both
+    /// crosses a [`HOOK_EVENT_PRUNE_INTERVAL`] boundary and clears the retention floor, so
+    /// pruning is observable without inserting [`HOOK_EVENT_RETENTION_ROWS`]-plus real rows.
+    #[test]
+    fn record_hook_event_prunes_rows_older_than_the_retention_window() {
+        let temporary = TempDir::new().unwrap();
+        let runtime = TaskRuntime::initialize(temporary.path().join(".shared-context")).unwrap();
+
+        // id = 1: old enough to be swept once the retention threshold clears zero.
+        runtime.record_hook_event(&sample()).unwrap();
+
+        let next_id =
+            HOOK_EVENT_PRUNE_INTERVAL * (HOOK_EVENT_RETENTION_ROWS / HOOK_EVENT_PRUNE_INTERVAL + 2);
+        assert_eq!(next_id % HOOK_EVENT_PRUNE_INTERVAL, 0);
+        assert!(next_id - HOOK_EVENT_RETENTION_ROWS > 1);
+        {
+            let connection = Connection::open(runtime.database_path()).unwrap();
+            connection
+                .execute(
+                    "UPDATE sqlite_sequence SET seq = ?1 WHERE name = 'hook_event'",
+                    params![next_id - 1],
+                )
+                .unwrap();
+        }
+
+        // This insert lands on `next_id`, a prune-interval multiple whose retention threshold
+        // is now positive, so the seeded id = 1 row falls below it and is swept.
+        runtime.record_hook_event(&sample()).unwrap();
+
+        let remaining = runtime.recent_hook_events(10_000).unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "the id = 1 row must be pruned; only the newest row remains"
+        );
+    }
 }
