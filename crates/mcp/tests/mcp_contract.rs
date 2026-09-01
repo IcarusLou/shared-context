@@ -4317,7 +4317,11 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
         assert_eq!(pack["detail_level"], "compact");
         assert!(pack.get("retrieval_paths").is_none());
         assert!(pack.get("compact_items").is_none());
-        assert!(pack.get("query_token_explanation").is_none());
+        // The one explanation compact keeps: its three totals, never the token lists.
+        let explanation = &pack["query_token_explanation"];
+        assert!(explanation["selected_token_count"].as_u64().is_some());
+        assert!(explanation["answerable_token_count"].as_u64().is_some());
+        assert_eq!(explanation["selected_tokens"], serde_json::json!([]));
         assert_eq!(pack["task_fingerprint"].as_str().unwrap().len(), 64);
         assert!(pack["tree"].as_str().is_some());
         assert!(pack["generation"].as_u64().is_some());
@@ -5683,10 +5687,20 @@ fn retrieval_tools_default_to_compact_and_expose_full_on_request() {
 
     let compact = &responses[1]["result"]["structuredContent"];
     assert_eq!(compact["detail_level"], "compact");
+    // The compact payload keeps the token-selection totals and drops the token lists with every
+    // other explanation channel.
+    assert_eq!(
+        compact["query_token_explanation"]["selected_tokens"],
+        serde_json::json!([])
+    );
+    assert!(
+        compact["query_token_explanation"]["selected_token_count"]
+            .as_u64()
+            .is_some()
+    );
     for absent in [
         "retrieval_paths",
         "compact_items",
-        "query_token_explanation",
         "artifact_generation",
         "graph_context_tree_oid",
     ] {
