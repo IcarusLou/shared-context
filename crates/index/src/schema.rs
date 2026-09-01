@@ -680,7 +680,13 @@ fn populate(
                     json(&content.assumptions)?,
                     json(&content.recheck_when)?,
                     json(&content.hints)?,
-                    hint_text(&[&content.hints], &candidate_prose.terms),
+                    hint_text(
+                        &[
+                            &content.hints,
+                            &topic_key_terms(content.topic_key.as_deref()),
+                        ],
+                        &candidate_prose.terms,
+                    ),
                     json(&content.evidence)?,
                     json(projection)?
                 ],
@@ -860,12 +866,17 @@ fn populate(
                 for term in &prose.alias_seeds {
                     collect_alias_rows(term, "identifier_split", &mut alias_rows);
                 }
+                for term in topic_key_alias_seeds(revision.topic_key.as_deref()) {
+                    collect_alias_rows(&term, "identifier_split", &mut alias_rows);
+                }
+                let topic_terms = topic_key_terms(revision.topic_key.as_deref());
                 let hint_text = hint_text(
                     &[
                         reference_hints
                             .get(revision_id)
                             .map_or(&[][..], Vec::as_slice),
                         &revision.hints,
+                        &topic_terms,
                     ],
                     &prose.terms,
                 );
@@ -1613,6 +1624,35 @@ fn hint_text(sources: &[&[String]], prose_terms: &[String]) -> String {
         text.push_str(&compound);
     }
     text
+}
+
+/// Retrieval terms one `topic_key` contributes to `hint_text`.
+///
+/// A server-derived key is `{kind}:{repository}:{path}` or `{kind}:text:{stem}`, so only the last
+/// segment names anything a question is asked about: the leading kind and the Repository identity
+/// are coordinates, and indexing them would make every `decision` share a token. An Agent-authored
+/// key carries no segments at all and is read whole. The spelling is then read exactly the way
+/// Claim prose is read, so `src/main/PoiEntranceAssem.kt` contributes its basename and stem.
+fn topic_key_terms(topic_key: Option<&str>) -> Vec<String> {
+    topic_key_spelling(topic_key)
+        .map(|spelling| hints::derived_hint_terms([spelling]))
+        .unwrap_or_default()
+}
+
+/// The `token_alias` seeds of one `topic_key`: its spelling, split like any other identifier.
+fn topic_key_alias_seeds(topic_key: Option<&str>) -> Vec<String> {
+    topic_key_spelling(topic_key)
+        .map(|spelling| vec![spelling.to_owned()])
+        .unwrap_or_default()
+}
+
+/// The one segment of a `topic_key` that names a repository coordinate.
+fn topic_key_spelling(topic_key: Option<&str>) -> Option<&str> {
+    topic_key
+        .map(str::trim)
+        .filter(|topic_key| !topic_key.is_empty())
+        .and_then(|topic_key| topic_key.rsplit(':').next())
+        .filter(|spelling| !spelling.is_empty())
 }
 
 /// The whole-identifier form of one prose term, or `None` when the term is a path spelling.

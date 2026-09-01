@@ -647,9 +647,14 @@ fn assess_target(
     let strong_identifier = shared_identifiers >= SHARED_IDENTIFIER_STRONG_OVERLAP && same_kind;
     let identifier_restates = similarity >= STATEMENT_SIMILARITY_REVIEW_BASIS_POINTS
         || shared_identifiers >= SHARED_IDENTIFIER_SUPPORT_OVERLAP;
+    // The same statement on the same topic is the same fact, whatever else the two drafts carry:
+    // two Tasks recording one finding differ in Evidence identity, `problem_view` and rationale
+    // wording, none of which makes the second a new fact. Whole-draft equality still wins first so
+    // the stronger path keeps its own trigger text.
+    let restates_topic = topic && !statement_differs;
     let relation = if negation_conflict {
         CandidateAssessmentRelation::PotentialContradiction
-    } else if canonical {
+    } else if canonical || restates_topic {
         CandidateAssessmentRelation::ExactDuplicate
     } else if statement {
         CandidateAssessmentRelation::Supports
@@ -672,6 +677,8 @@ fn assess_target(
         format!("Path: statement similarity {similarity} basis points but negation markers differ")
     } else if canonical {
         format!("Path: canonical draft equality at statement similarity {similarity} basis points")
+    } else if restates_topic {
+        "Path: normalized statement equality on one topic key".to_owned()
     } else if statement {
         if similarity >= 10_000 {
             "Path: normalized statement equality".to_owned()
@@ -718,9 +725,13 @@ fn assess_target(
         );
     }
     let (points, relation_reason) = match relation {
-        CandidateAssessmentRelation::ExactDuplicate => (
+        CandidateAssessmentRelation::ExactDuplicate if canonical => (
             10_000,
             "The complete canonical Candidate draft equals the immutable Context revision",
+        ),
+        CandidateAssessmentRelation::ExactDuplicate => (
+            10_000,
+            "The statement and the topic key both equal the immutable Context revision; this restates a fact the knowledge base already holds",
         ),
         CandidateAssessmentRelation::Supports => (
             9_000,

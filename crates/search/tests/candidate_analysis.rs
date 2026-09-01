@@ -647,6 +647,51 @@ fn relation_for(
         .relation
 }
 
+/// One statement under one topic key is one fact, however the two drafts otherwise differ.
+///
+/// Two Tasks recording the same finding never produce byte-identical drafts — the Evidence, the
+/// rationale wording and the problem each Task was working on all differ — so before Candidate
+/// Build derived a topic key this pair could only ever reach `supports`.
+#[test]
+fn a_restated_statement_on_one_topic_key_is_an_exact_duplicate() {
+    let fixture = fixture();
+    let restated = analyze(
+        &fixture,
+        draft(
+            Some("candidate/support"),
+            "Shared support statement",
+            "A second Task recorded the same finding in its own words",
+            "support-other-domain",
+        ),
+        Vec::new(),
+        8_000,
+        16,
+    );
+    assert_eq!(
+        relation_for(&restated, fixture.support),
+        CandidateAssessmentRelation::ExactDuplicate
+    );
+    let assessment = restated
+        .analysis
+        .assessments
+        .iter()
+        .find(|assessment| assessment.target == Some(fixture.support))
+        .unwrap();
+    assert!(
+        assessment
+            .paths
+            .contains(&CandidateAssessmentPath::StatementEquality)
+    );
+    assert!(assessment.paths.iter().any(|path| matches!(
+        path,
+        CandidateAssessmentPath::TopicEquality { topic_key } if topic_key == "candidate/support"
+    )));
+    assert_eq!(
+        restated.candidate_status,
+        sctx_domain::AutomaticCandidateStatus::ExactDuplicateReview
+    );
+}
+
 #[test]
 fn exact_support_revise_potential_fts_and_novel_remain_distinct_assessments() {
     let fixture = fixture();

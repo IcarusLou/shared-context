@@ -182,6 +182,67 @@ fn claim(
     }
 }
 
+/// Derivation fills a gap the Agent left; it never overrules a topic the Claim already named.
+#[test]
+fn an_agent_authored_topic_hint_survives_derivation() {
+    let checkout = probe_checkout(FIXTURE_FILES);
+    let root = TempDir::new().unwrap();
+    let (runtime, locator) = open_runtime(&root, "derive-authored-topic");
+    let task = runtime
+        .read_snapshot_by_locator(&locator)
+        .unwrap()
+        .expect("the fixture Session owns one ActiveTask");
+    let outcome = runtime
+        .write_agent_checkpoint(&sctx_task_runtime::AgentCheckpointWrite {
+            locator,
+            expected_task_id: task.task_id,
+            expected_intent_revision_id: task.current_intent_revision().unwrap().revision_id,
+            expected_episode_version: 0,
+            boundary: sctx_task_runtime::CheckpointBoundary::Close,
+            claims: vec![sctx_task_runtime::CheckpointClaimDraft {
+                context_kind_hint: Some(ContextKind::Issue),
+                topic_key_hint: Some("comment/fallback-bar".to_owned()),
+                statement: "PoiEntranceAssem.kt:118 registers before the null check".to_owned(),
+                rationale: "the fallback never runs".to_owned(),
+                applicability: sctx_domain::Applicability::default(),
+                assumptions: Vec::new(),
+                recheck_when: Vec::new(),
+                evidence_refs: Vec::new(),
+                inline_validations: vec![sctx_domain::EvidenceSnapshotDraft {
+                    kind: EvidenceType::SourceSnapshot,
+                    supports: "PoiEntranceAssem.kt:118 registers before the null check".to_owned(),
+                    content: serde_json::json!({"summary": "PoiEntranceAssem.kt:118 registers"}),
+                    interpretation: "the registration precedes the guard".to_owned(),
+                    limitations: vec!["synthetic association probe fixture".to_owned()],
+                }],
+                artifact_refs: Vec::new(),
+                relations: Vec::new(),
+                engineering_references: Vec::new(),
+                related_contexts: Vec::new(),
+            }],
+            unknowns: Vec::new(),
+        })
+        .unwrap();
+
+    let episode_id = outcome.episode.episode.episode_id;
+    let derivations = derive_with_checkout(&runtime, episode_id, checkout.path());
+    let episode = runtime.read_work_episode(episode_id).unwrap().unwrap();
+    let persisted = &episode.checkpoints[0].claims[0];
+    assert!(
+        !persisted.engineering_references.is_empty(),
+        "the spelling is still placed as a graph fact"
+    );
+    assert_eq!(
+        persisted.topic_key_hint.as_deref(),
+        Some("comment/fallback-bar")
+    );
+    assert_eq!(
+        derivations[0].topic_key_hint.as_deref(),
+        Some("comment/fallback-bar"),
+        "the reported derivation is the persisted answer, so a replay reports the same topic"
+    );
+}
+
 #[test]
 fn unique_basename_in_checkout_becomes_a_file_reference_and_topic_hint() {
     let checkout = probe_checkout(FIXTURE_FILES);

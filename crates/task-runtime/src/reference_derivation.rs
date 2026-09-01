@@ -273,6 +273,74 @@ pub fn derive_claim_references(
     }
 }
 
+/// Marks a `topic_key` derived from the Claim's own prose instead of a placed coordinate.
+///
+/// It occupies the segment a resolved topic key spends on the Repository, so the two shapes stay
+/// distinguishable at a glance and can never collide.
+pub const TEXT_TOPIC_SEGMENT: &str = "text";
+
+/// The `topic_key` one Candidate draft carries for a Claim.
+///
+/// Order of preference: the hint the persisted Claim already holds — either the Agent's own
+/// optional `topic_key_hint` or the resolved coordinate [`derive_claim_references`] wrote back
+/// onto it — and otherwise the dominant file spelling the Claim's own prose names. `None` only
+/// when the Claim names no coordinate at all, which is the one case that still leaves the topic
+/// unclassified.
+///
+/// Pure in its inputs and computed from persisted Claim text alone, so Candidate Build and every
+/// later reconstruction of the same Candidate agree on one answer.
+#[must_use]
+pub fn claim_topic_key(
+    kind: ContextKind,
+    hint: Option<&str>,
+    statement: &str,
+    rationale: &str,
+    evidence_summaries: &[&str],
+) -> Option<String> {
+    if let Some(hint) = hint.map(str::trim).filter(|hint| !hint.is_empty()) {
+        return Some(hint.to_owned());
+    }
+    text_topic_key(kind, statement, rationale, evidence_summaries)
+}
+
+/// The topic of a Claim no checkout could place, read from the file spellings it wrote down.
+///
+/// Only path-shaped spellings qualify. An identifier that merely appears in a sentence is not a
+/// coordinate — the same reason `token_alias` groups are seeded from path stems alone — and
+/// promoting one to a topic key would make every Claim that happens to mention `canShow` share a
+/// topic with every other. The spelling is lower-cased because this key is compared, not opened.
+fn text_topic_key(
+    kind: ContextKind,
+    statement: &str,
+    rationale: &str,
+    evidence_summaries: &[&str],
+) -> Option<String> {
+    let mut ranked = BTreeMap::<String, (usize, usize)>::new();
+    for (order, candidate) in claim_texts(statement, rationale, evidence_summaries)
+        .iter()
+        .flat_map(|text| scan_text(text).paths)
+        .enumerate()
+    {
+        let stem = candidate.stem().to_lowercase();
+        if stem.is_empty() {
+            continue;
+        }
+        let entry = ranked.entry(stem).or_insert((0, order));
+        entry.0 += 1;
+    }
+    // Most mentions wins; a tie goes to the spelling the Agent wrote first, exactly as the
+    // resolved topic key above is ranked.
+    ranked
+        .into_iter()
+        .max_by(|left, right| {
+            left.1
+                .0
+                .cmp(&right.1.0)
+                .then_with(|| right.1.1.cmp(&left.1.1))
+        })
+        .map(|(stem, _)| format!("{}:{TEXT_TOPIC_SEGMENT}:{stem}", kind_name(kind)))
+}
+
 fn scan_text(text: &str) -> TextScan {
     hints::scan_text(text)
 }
@@ -600,6 +668,65 @@ mod tests {
 
     fn scan(text: &str) -> TextScan {
         scan_text(text)
+    }
+
+    #[test]
+    fn an_agent_topic_hint_is_never_overruled_by_the_prose_fallback() {
+        assert_eq!(
+            claim_topic_key(
+                ContextKind::Decision,
+                Some("search/result-visibility"),
+                "ProductAnchorAssem.kt:202 returns early",
+                "",
+                &[],
+            )
+            .as_deref(),
+            Some("search/result-visibility")
+        );
+    }
+
+    #[test]
+    fn an_unplaced_claim_takes_its_topic_from_the_file_it_talks_about_most() {
+        assert_eq!(
+            claim_topic_key(
+                ContextKind::Issue,
+                None,
+                "PoiEntranceAssem.kt:118 registers before the null check",
+                "CommentBottomBarManager.kt:96 is skipped",
+                &["PoiEntranceAssem.kt:140 preempts the container"],
+            )
+            .as_deref(),
+            Some("issue:text:poientranceassem")
+        );
+    }
+
+    #[test]
+    fn a_tie_goes_to_the_spelling_the_agent_wrote_first() {
+        assert_eq!(
+            claim_topic_key(
+                ContextKind::Discovery,
+                None,
+                "CommentBottomBarManager.kt:96 falls back",
+                "PoiEntranceAssem.kt:118 registers early",
+                &[],
+            )
+            .as_deref(),
+            Some("discovery:text:commentbottombarmanager")
+        );
+    }
+
+    #[test]
+    fn a_claim_that_names_no_file_keeps_its_topic_unclassified() {
+        assert_eq!(
+            claim_topic_key(
+                ContextKind::Decision,
+                None,
+                "the ILiveEntryService has no implementation",
+                "nothing here is a file",
+                &["BUILD SUCCESSFUL"],
+            ),
+            None
+        );
     }
 
     #[test]

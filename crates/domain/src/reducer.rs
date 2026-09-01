@@ -2264,3 +2264,127 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
         diagnostics: diagnostics.into_iter().collect(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ContextGovernanceStatus, ContextProjection, ContextSpaceProjection, IntentProjection,
+        RevisionProjection, conflict_candidates,
+    };
+    use crate::{
+        Applicability, AutoInjectionEligibility, ContextId, ContextKind, ContextRevision,
+        ContextRevisionDraft, EvidenceSnapshotDraft, EvidenceType, PublicationId, ReviewSummary,
+        RevisionLifecycle, SpaceId,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn accepted_context(topic_key: Option<&str>, statement: &str) -> ContextProjection {
+        let revision = ContextRevision::from_draft(
+            Vec::new(),
+            ContextRevisionDraft {
+                kind: ContextKind::Decision,
+                topic_key: topic_key.map(ToOwned::to_owned),
+                problem_view: None,
+                statement: statement.to_owned(),
+                rationale: "the reducer only needs valid content".to_owned(),
+                applicability: Applicability {
+                    domains: vec!["mcp".to_owned()],
+                    platforms: Vec::new(),
+                    conditions: Vec::new(),
+                },
+                assumptions: Vec::new(),
+                recheck_when: Vec::new(),
+                hints: Vec::new(),
+                relations: Vec::new(),
+                evidence: vec![EvidenceSnapshotDraft {
+                    kind: EvidenceType::ExperimentRecord,
+                    supports: statement.to_owned(),
+                    content: serde_json::json!({"actual": "observed"}),
+                    interpretation: "the fixture holds".to_owned(),
+                    limitations: Vec::new(),
+                }],
+            },
+        )
+        .unwrap();
+        let revision_id = revision.revision_id;
+        let publication_id = PublicationId::new();
+        ContextProjection {
+            context_id: ContextId::new(),
+            revisions: BTreeMap::from([(
+                revision_id,
+                RevisionProjection {
+                    revision,
+                    is_head: true,
+                    review_summary: ReviewSummary::Approved,
+                    review_event_ids: BTreeSet::new(),
+                    lifecycle: RevisionLifecycle::Accepted,
+                },
+            )]),
+            revision_heads: BTreeSet::from([revision_id]),
+            reviews: BTreeMap::new(),
+            publications: BTreeMap::new(),
+            publication_heads: BTreeSet::new(),
+            governance: ContextGovernanceStatus::Accepted {
+                publication_id,
+                revision_id,
+            },
+            auto_injection: AutoInjectionEligibility {
+                eligible: true,
+                blockers: BTreeSet::new(),
+            },
+        }
+    }
+
+    fn one_space(contexts: Vec<ContextProjection>) -> BTreeMap<SpaceId, ContextSpaceProjection> {
+        let space_id = SpaceId::new();
+        BTreeMap::from([(
+            space_id,
+            ContextSpaceProjection {
+                space_id,
+                intent: IntentProjection {
+                    revisions: BTreeMap::new(),
+                    heads: BTreeSet::new(),
+                },
+                contexts: contexts
+                    .into_iter()
+                    .map(|context| (context.context_id, context))
+                    .collect(),
+            },
+        )])
+    }
+
+    /// The duplicate detector keys on `topic_key`, so it only sees a pair once Candidate Build
+    /// derives one. Two accepted Decisions restating one fact under the same server-derived topic
+    /// are exactly the pair a reviewer has to settle.
+    #[test]
+    fn same_topic_key_and_overlapping_scope_is_one_duplicate_pair() {
+        let spaces = one_space(vec![
+            accepted_context(
+                Some("decision:text:productanchorassem"),
+                "ProductAnchorAssem returns before the live entry resolves",
+            ),
+            accepted_context(
+                Some("decision:text:productanchorassem"),
+                "ProductAnchorAssem 在直播入口解析前提前返回",
+            ),
+        ]);
+        let candidates = conflict_candidates(&spaces);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].topic_key, "decision:text:productanchorassem");
+        assert_eq!(candidates[0].participants.len(), 2);
+    }
+
+    /// The pre-derivation behaviour: an absent topic key is not a topic two Contexts share, so an
+    /// unkeyed pair stays invisible to the detector however similar the two statements are.
+    #[test]
+    fn an_absent_topic_key_never_pairs() {
+        let spaces = one_space(vec![
+            accepted_context(
+                None,
+                "ProductAnchorAssem returns before the live entry resolves",
+            ),
+            accepted_context(None, "ProductAnchorAssem 在直播入口解析前提前返回"),
+        ]);
+        assert!(conflict_candidates(&spaces).is_empty());
+    }
+}

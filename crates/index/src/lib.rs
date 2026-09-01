@@ -43,7 +43,11 @@ pub const CONFLICT_DETECTOR_VERSION: &str = "1";
 /// NFKC, full Unicode case-folding, identifier splitting, and CJK bigram implementation.
 pub const NORMALIZER_TOKENIZER_VERSION: &str = "1";
 /// Context and Space-Intent weighted-BM25, explanation, and stable-ID ranking implementation.
-pub const SEARCH_RANKING_VERSION: &str = "4";
+///
+/// It also versions what the ranked columns contain: version 5 folds each revision's `topic_key`
+/// into `hint_text` and its alias groups, so an index written by version 4 must be rebuilt before
+/// a topic-keyed Context is reachable through the terms its topic names.
+pub const SEARCH_RANKING_VERSION: &str = "5";
 
 pub(crate) const IMPLEMENTATION_VERSIONS: [(&str, &str); 6] = [
     ("db_schema_version", DB_SCHEMA_VERSION),
