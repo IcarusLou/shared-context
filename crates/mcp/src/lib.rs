@@ -2315,6 +2315,10 @@ impl Runtime {
             episode
         };
         let _ = self.record_episode_context_usage(&episode);
+        // The question this Task was working on, read once and attached to every Candidate this
+        // Build produces: it is the retrieval column a later Task asks its question against, so it
+        // belongs on the draft a reviewer sees, not only on the confirmed revision.
+        let problem_view = self.episode_problem_view(&episode)?;
         let final_checkpoint = episode
             .checkpoints
             .iter()
@@ -2344,6 +2348,7 @@ impl Runtime {
                             claim,
                             &signals,
                             &snapshot,
+                            problem_view.as_deref(),
                         )
                     })
                 })
@@ -2654,6 +2659,7 @@ impl Runtime {
             claim,
             &signal_history,
             snapshot,
+            compose_problem_view(&source_intent).as_deref(),
         );
         let engine = self.engineering_graph.as_ref().map_or_else(
             || SearchEngine::new(self.index.clone()),
@@ -3217,9 +3223,10 @@ impl Runtime {
             .get(&candidate_id)
             .map(|projection| &projection.candidate)
             .ok_or_else(|| invalid("Candidate Confirmation payload is unavailable"))?;
-        // Derived, overridable `problem_view`: Candidate Build has no Task Intent to read, so the
-        // question the source Task was answering is attached here instead. An explicit
-        // `edits.problem_view` always wins, `clear` included.
+        // Derived, overridable `problem_view`: Candidate Build already attaches the question the
+        // source Task was answering, so this only fills the field for a Candidate built before it
+        // did, and never derives a second answer over the first. An explicit `edits.problem_view`
+        // always wins, `clear` included.
         let mut edits = edits.clone();
         if edits.problem_view.is_none()
             && persisted.content.problem_view.is_none()
@@ -3433,6 +3440,15 @@ impl Runtime {
         let Some(episode) = self.tasks.read_work_episode(source_episode.episode_id)? else {
             return Ok(None);
         };
+        self.episode_problem_view(&episode)
+    }
+
+    /// The same `problem_view` for an Episode the caller already holds.
+    ///
+    /// Candidate Build reads it once per Episode and writes it onto every draft that Build
+    /// produces; every later reconstruction of one of those Candidates reads it again from the
+    /// same immutable Intent revision, so the reconstruction reproduces the persisted draft.
+    fn episode_problem_view(&self, episode: &WorkEpisodeView) -> Result<Option<String>> {
         let intent_revision_id = episode.episode.intent_revisions.last();
         let Some(task) = self.tasks.read_snapshot(episode.episode.task_session_id)? else {
             return Ok(None);
@@ -3485,14 +3501,30 @@ impl Runtime {
         let signals = self
             .tasks
             .read_signal_history(record.source_episode.task_session_id)?;
-        let material = build_claim_material(
+        let problem_view = self.episode_problem_view(&episode)?;
+        let mut material = build_claim_material(
             &episode,
             final_checkpoint,
             checkpoint,
             claim,
             &signals,
             snapshot,
+            problem_view.as_deref(),
         );
+        // A Candidate built before Build derived `problem_view` and `topic_key` carries neither,
+        // and the derivation must not retroactively invalidate it: where the persisted draft left
+        // a derived field absent, the reconstruction leaves it absent too. Everything the Claim
+        // itself authored is still compared exactly.
+        if material.draft.as_ref() != Some(&persisted.content)
+            && let Some(draft) = material.draft.as_mut()
+        {
+            if persisted.content.problem_view.is_none() {
+                draft.problem_view = None;
+            }
+            if persisted.content.topic_key.is_none() {
+                draft.topic_key = None;
+            }
+        }
         if material.draft.as_ref() != Some(&persisted.content) {
             return Err(invariant(
                 "Candidate Review source Claim no longer reconstructs the persisted draft",
@@ -4462,6 +4494,49 @@ fn candidate_artifact_refs(claim: &CheckpointClaim) -> Vec<ArtifactRef> {
     refs
 }
 
+/// The searchable hints and the topic key one persisted Claim derives from its own text.
+///
+/// Both are pure functions of the Claim and the Evidence it already carries, never of the checkout
+/// or the clock, so Candidate Build and every later reconstruction of the same Candidate agree.
+fn claim_retrieval_fields(
+    claim: &CheckpointClaim,
+    kind: ContextKind,
+    evidence: &[EvidenceSnapshotDraft],
+) -> (Vec<String>, Option<String>) {
+    // Path and identifier spellings the Checkpoint's own Evidence text carried but the checkout
+    // could not place. They are retrieval text only, never graph facts, and are recomputed from
+    // the persisted Claim so a rebuild reproduces the same searchable Candidate.
+    let summaries = evidence
+        .iter()
+        .filter_map(|snapshot| {
+            snapshot
+                .content
+                .get("summary")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    let summaries = summaries.iter().map(String::as_str).collect::<Vec<_>>();
+    let hints = reference_derivation::claim_hints(
+        &claim.statement,
+        &claim.rationale,
+        &summaries,
+        &claim.engineering_references,
+    );
+    // The topic the Candidate is about, decided here rather than at confirmation: the Agent hint
+    // if the Claim carried one, else the coordinate the Checkpoint derivation placed, else the
+    // dominant file spelling of the Claim's own prose. Confirmation inherits this value unless a
+    // reviewer edits it, so both phases read one derivation.
+    let topic_key = reference_derivation::claim_topic_key(
+        kind,
+        claim.topic_key_hint.as_deref(),
+        &claim.statement,
+        &claim.rationale,
+        &summaries,
+    );
+    (hints, topic_key)
+}
+
 fn build_claim_material(
     episode: &WorkEpisodeView,
     final_checkpoint: &sctx_domain::AgentCheckpoint,
@@ -4469,6 +4544,7 @@ fn build_claim_material(
     claim: &CheckpointClaim,
     signals: &[TaskSignalRecord],
     snapshot: &DomainSnapshot,
+    problem_view: Option<&str>,
 ) -> ClaimBuildMaterial {
     let mut evidence = Vec::new();
     let mut observation_ids = Vec::new();
@@ -4491,6 +4567,7 @@ fn build_claim_material(
         unknowns.extend(final_checkpoint.unknowns.clone());
     }
     let kind = claim.context_kind_hint.unwrap_or(ContextKind::Discovery);
+    let (hints, topic_key) = claim_retrieval_fields(claim, kind, &evidence);
     let mut confidence = if claim.context_kind_hint.is_some() {
         8_000_u16
     } else {
@@ -4502,9 +4579,7 @@ fn build_claim_material(
         });
         4_500
     };
-    if matches!(kind, ContextKind::Decision | ContextKind::Contract)
-        && claim.topic_key_hint.is_none()
-    {
+    if matches!(kind, ContextKind::Decision | ContextKind::Contract) && topic_key.is_none() {
         unknowns.push(CheckpointUnknown {
             statement: "Decision or Contract topic key remains unclassified".to_owned(),
             blocking: false,
@@ -4521,33 +4596,11 @@ fn build_claim_material(
             None
         }
     });
-    // Path and identifier spellings the Checkpoint's own Evidence text carried but the checkout
-    // could not place. They are retrieval text only, never graph facts, and are recomputed from
-    // the persisted Claim so a rebuild reproduces the same searchable Candidate.
-    let evidence_summaries = evidence
-        .iter()
-        .filter_map(|snapshot| {
-            snapshot
-                .content
-                .get("summary")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .collect::<Vec<_>>();
-    let hints = reference_derivation::claim_hints(
-        &claim.statement,
-        &claim.rationale,
-        &evidence_summaries
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        &claim.engineering_references,
-    );
     let draft = error_code.is_none().then(|| ContextRevisionDraft {
-        problem_view: None,
+        problem_view: problem_view.map(ToOwned::to_owned),
         hints,
         kind,
-        topic_key: claim.topic_key_hint.clone(),
+        topic_key,
         statement: claim.statement.clone(),
         rationale: claim.rationale.clone(),
         applicability: claim.applicability.clone(),

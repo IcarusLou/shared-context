@@ -797,7 +797,9 @@ fn directly_close_builder_episode(
         })
         .unwrap();
     let content = ContextRevisionDraft {
-        problem_view: None,
+        problem_view: Some(fixture_problem_view(
+            "exercise Candidate Build crash recovery",
+        )),
         hints: Vec::new(),
         kind: ContextKind::Validation,
         topic_key: None,
@@ -846,6 +848,14 @@ fn update_input(
             open_questions: vec![],
         },
     }
+}
+
+/// The `problem_view` Candidate Build derives from an [`update_input`] Working Intent.
+///
+/// Build attaches the question the source Task was working on to every draft it produces, so a
+/// fixture that spells out the draft the server would have committed must spell this out too.
+fn fixture_problem_view(goal: &str) -> String {
+    format!("{goal} | In scope: MCP")
 }
 
 fn append(store: &GitStore, event: Event) {
@@ -1014,6 +1024,7 @@ fn typed_checkpoint_input(
 fn recovery_submission(
     locator: &ExternalSessionLocator,
     index: usize,
+    goal: &str,
 ) -> (AgentCheckpointSubmission, ContextRevisionDraft) {
     let statement = format!("Fair recovery statement {index}");
     let rationale = format!("Fair recovery rationale {index}");
@@ -1035,7 +1046,7 @@ fn recovery_submission(
             unknowns: Vec::new(),
         },
         ContextRevisionDraft {
-            problem_view: None,
+            problem_view: Some(fixture_problem_view(goal)),
             hints: Vec::new(),
             kind: ContextKind::Validation,
             topic_key: None,
@@ -1500,7 +1511,9 @@ fn candidate_list_recovers_git_committed_outbox_once_under_concurrency() {
         .unwrap();
     assert_eq!(queued.items[0].status, CandidateBuildItemStatus::Queued);
     let content = ContextRevisionDraft {
-        problem_view: None,
+        problem_view: Some(fixture_problem_view(
+            "recover one Git-committed Candidate outbox",
+        )),
         // The server derives searchable hints from the Claim text; `SubmissionId` in the rationale
         // is the only identifier-shaped spelling this Claim carries.
         hints: vec!["SubmissionId".to_owned()],
@@ -1696,7 +1709,8 @@ fn target_get_bypasses_poisoned_prefix_and_generic_recovery_rotates_fairly() {
     let locator = ExternalSessionLocator::new("codex", session).unwrap();
     let mut outboxes = Vec::new();
     for index in 0..34 {
-        let (submission, content) = recovery_submission(&locator, index);
+        let (submission, content) =
+            recovery_submission(&locator, index, "recover beyond a poisoned Build prefix");
         outboxes.push((
             runtime.submit_agent_checkpoint(&submission).unwrap(),
             content,
@@ -1751,7 +1765,8 @@ fn target_get_bypasses_poisoned_prefix_and_generic_recovery_rotates_fairly() {
     )
     .unwrap();
     let other_locator = ExternalSessionLocator::new("codex", other_session).unwrap();
-    let (other_submission, other_content) = recovery_submission(&other_locator, 99);
+    let (other_submission, other_content) =
+        recovery_submission(&other_locator, 99, "own a cross-task Candidate");
     let other_outbox = runtime.submit_agent_checkpoint(&other_submission).unwrap();
     let other_candidate = recovery_store
         .submit_candidate(CandidateSubmissionRequest {
@@ -7428,6 +7443,216 @@ fn candidate_batch_review_decisions_are_all_or_nothing_and_name_the_failing_cand
         ],
     );
     assert_eq!(edited_batch[1]["result"]["isError"], true);
+}
+
+/// The statement every derived-field fixture records; the `.kt` spelling is the only coordinate
+/// it names, so the derived topic key is decided by that one file.
+const DERIVED_FIELD_STATEMENT: &str =
+    "SampleAnchorAssem.kt:118 returns before the live entry service is resolved";
+
+/// The topic key Candidate Build derives for [`DERIVED_FIELD_STATEMENT`] with no checkout able to
+/// place the spelling: the Context kind, the marker for a prose-derived coordinate, and the stem.
+const DERIVED_FIELD_TOPIC_KEY: &str = "decision:text:sampleanchorassem";
+
+fn accepted_revision(
+    fixture: &Fixture,
+    context_id: ContextId,
+    revision_id: RevisionId,
+) -> sctx_domain::ContextRevision {
+    ProjectionIndex::for_store(&fixture.store)
+        .domain_snapshot()
+        .unwrap()
+        .projection
+        .spaces[&fixture.space_id]
+        .contexts[&context_id]
+        .revisions[&revision_id]
+        .revision
+        .clone()
+}
+
+fn confirm_candidate(
+    fixture: &Fixture,
+    session: &str,
+    task: &sctx_mcp::TaskIntentUpdateResponse,
+    candidate_id: CandidateId,
+    edits: OptionalCandidateEdits,
+) -> sctx_mcp::CandidateConfirmResponse {
+    candidate_confirm_at_root(
+        &fixture.root,
+        &CandidateConfirmInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: task.context.task_id.to_string(),
+            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+            candidate_id: candidate_id.to_string(),
+            expected_review_version: 1,
+            primary: CandidateConfirmPrimaryInput::Existing(ExistingCandidatePrimaryInput {
+                existing_space_id: fixture.space_id.to_string(),
+            }),
+            related_space_ids: Vec::new(),
+            edits,
+        },
+    )
+    .unwrap()
+}
+
+/// Candidate Build, not confirmation, decides `problem_view` and `topic_key`: a reviewer sees both
+/// on the Candidate they are asked to accept, and confirming without edits keeps exactly them.
+#[test]
+fn candidate_build_derives_the_problem_view_and_topic_key_a_review_can_see() {
+    let fixture = Fixture::new();
+    let session = "candidate-build-derived-fields";
+    let (task, candidate_id) = build_review_candidate(&fixture, session, DERIVED_FIELD_STATEMENT);
+    let expected_problem_view = fixture_problem_view(DERIVED_FIELD_STATEMENT);
+
+    let listed = candidate_list_at_root(
+        &fixture.root,
+        &CandidateListInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            status: CandidateReviewStatus::Pending,
+            limit: 10,
+            cursor: None,
+            token_budget: 32_768,
+        },
+    )
+    .unwrap();
+    assert_eq!(listed.reviews.len(), 1);
+    assert_eq!(
+        listed.reviews[0].0.content.problem_view.as_deref(),
+        Some(expected_problem_view.as_str())
+    );
+    assert_eq!(
+        listed.reviews[0].0.content.topic_key.as_deref(),
+        Some(DERIVED_FIELD_TOPIC_KEY)
+    );
+
+    // `candidate_get` reconstructs the same Candidate from the same persisted Claim.
+    let fetched = candidate_get_at_root(
+        &fixture.root,
+        &CandidateGetInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            candidate_id: candidate_id.to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(fetched.content, listed.reviews[0].0.content);
+    // A Decision that now carries a topic key no longer records the unclassified-topic unknown.
+    assert!(
+        !fetched
+            .unknowns
+            .iter()
+            .any(|unknown| unknown.statement.contains("topic key remains unclassified"))
+    );
+
+    // Confirming with no edits keeps the Build's answer instead of deriving a second one.
+    let confirmed = confirm_candidate(
+        &fixture,
+        session,
+        &task,
+        candidate_id,
+        OptionalCandidateEdits::default(),
+    );
+    let revision = accepted_revision(&fixture, confirmed.context_id, confirmed.revision_id);
+    assert_eq!(
+        revision.problem_view.as_deref(),
+        Some(expected_problem_view.as_str())
+    );
+    assert_eq!(revision.topic_key.as_deref(), Some(DERIVED_FIELD_TOPIC_KEY));
+
+    // A reviewer's own wording still wins over both derived fields.
+    let edited_session = "candidate-build-edited-fields";
+    let (edited_task, edited_candidate) =
+        build_review_candidate(&fixture, edited_session, DERIVED_FIELD_STATEMENT);
+    let edited = confirm_candidate(
+        &fixture,
+        edited_session,
+        &edited_task,
+        edited_candidate,
+        OptionalCandidateEdits {
+            problem_view: Some(ProblemViewEdit::Set {
+                value: "the reviewer restates the problem".to_owned(),
+            }),
+            topic_key: Some(sctx_domain::TopicKeyEdit::Set {
+                value: "decision:reviewer:live-entry".to_owned(),
+            }),
+            ..OptionalCandidateEdits::default()
+        },
+    );
+    let edited_revision = accepted_revision(&fixture, edited.context_id, edited.revision_id);
+    assert_eq!(
+        edited_revision.problem_view.as_deref(),
+        Some("the reviewer restates the problem")
+    );
+    assert_eq!(
+        edited_revision.topic_key.as_deref(),
+        Some("decision:reviewer:live-entry")
+    );
+}
+
+/// Two Tasks recording one finding differ in Evidence identity and in the problem each was
+/// working on, so whole-draft equality never fires. The derived topic key is what makes the second
+/// Candidate recognizable as a restatement of a fact the knowledge base already holds.
+#[test]
+fn a_restated_claim_on_one_derived_topic_is_an_exact_duplicate() {
+    let fixture = Fixture::new();
+    let first_session = "duplicate-topic-first";
+    let (task, candidate_id) =
+        build_review_candidate(&fixture, first_session, DERIVED_FIELD_STATEMENT);
+    let confirmed = confirm_candidate(
+        &fixture,
+        first_session,
+        &task,
+        candidate_id,
+        OptionalCandidateEdits::default(),
+    );
+
+    // A second Task, so the Build's own same-session restatement collapse cannot be what answers.
+    let second_session = "duplicate-topic-second";
+    let (_, duplicate_id) =
+        build_review_candidate(&fixture, second_session, DERIVED_FIELD_STATEMENT);
+    assert_ne!(duplicate_id, candidate_id);
+
+    let compact = candidate_list_with_detail_at_root(
+        &fixture.root,
+        &CandidateListInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: second_session.to_owned(),
+            status: CandidateReviewStatus::Pending,
+            limit: 10,
+            cursor: None,
+            token_budget: 32_768,
+        },
+        sctx_search::ContextPackDetailLevel::Compact,
+    )
+    .unwrap()
+    .compact();
+    let top = compact.reviews[0]
+        .top_assessment
+        .as_ref()
+        .expect("an analyzed Candidate names its strongest assessment");
+    assert_eq!(
+        top.relation,
+        sctx_domain::CandidateAssessmentRelation::ExactDuplicate
+    );
+    assert_eq!(top.target_context_id, Some(confirmed.context_id));
+
+    // The duplicate is still a Review a human settles, never an automatic rejection.
+    let fetched = candidate_get_at_root(
+        &fixture.root,
+        &CandidateGetInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: second_session.to_owned(),
+            candidate_id: duplicate_id.to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        fetched.candidate_status,
+        sctx_domain::AutomaticCandidateStatus::ExactDuplicateReview
+    );
+    assert_eq!(fetched.review_status, CandidateReviewStatus::Pending);
 }
 
 #[test]
