@@ -7559,15 +7559,29 @@ pub const MAX_ALIAS_EXPANSIONS_PER_QUERY: usize = 16;
 
 /// `token_alias.source` values, ranked: an identifier split is a spelling of the same artifact,
 /// a domain term is only a vocabulary neighbour, so the identifier split is kept first.
-const ALIAS_SOURCE_RANK: [&str; 2] = [IDENTIFIER_SPLIT_ALIAS_SOURCE, "domain_term"];
+const ALIAS_SOURCE_RANK: [&str; 2] = [IDENTIFIER_SPLIT_ALIAS_SOURCE, DOMAIN_TERM_ALIAS_SOURCE];
 
 /// `token_alias.source` of a group produced by splitting a code identifier into its words.
 const IDENTIFIER_SPLIT_ALIAS_SOURCE: &str = "identifier_split";
+
+/// `token_alias.source` of a group produced from a Space Intent domain term.
+const DOMAIN_TERM_ALIAS_SOURCE: &str = "domain_term";
 
 /// Least number of an alias group's members a query must already name before that group may
 /// expand one of them. A single shared word such as `page` names no identifier in particular, so
 /// expanding it would pull in every identifier that happens to contain it.
 const MIN_ALIAS_GROUP_MEMBERS_IN_QUERY: usize = 2;
+
+/// The same floor for a group seeded from a Space Intent domain term.
+///
+/// An identifier split is discovered incidentally — any sentence that spells `PageManager` seeds
+/// one — so it has to be corroborated by a second member before it may widen a query. A domain
+/// term was written down by a reviewer as the vocabulary of this Space, and one term is one
+/// phrase, not a hub every phrase containing that word joins. Naming any part of it is therefore
+/// already the query asking about that term. It is also the only way a group ever fires for
+/// non-ASCII text: a Han term indexes as overlapping bigrams, and a rewritten question rarely
+/// reproduces two adjacent bigrams of a phrase it is paraphrasing.
+const MIN_DOMAIN_TERM_ALIAS_GROUP_MEMBERS_IN_QUERY: usize = 1;
 
 /// Bounded, deterministic `token_alias` expansion of one query's tokens.
 ///
@@ -7635,13 +7649,18 @@ impl AliasExpansion {
                 .iter()
                 .filter(|(alias, _)| original.contains(alias))
                 .count();
-            if named < MIN_ALIAS_GROUP_MEMBERS_IN_QUERY {
+            let identifier_group = members
+                .iter()
+                .any(|(_, source)| source == IDENTIFIER_SPLIT_ALIAS_SOURCE);
+            let minimum = if identifier_group {
+                MIN_ALIAS_GROUP_MEMBERS_IN_QUERY
+            } else {
+                MIN_DOMAIN_TERM_ALIAS_GROUP_MEMBERS_IN_QUERY
+            };
+            if named < minimum {
                 continue;
             }
-            if members
-                .iter()
-                .any(|(_, source)| source == IDENTIFIER_SPLIT_ALIAS_SOURCE)
-            {
+            if identifier_group {
                 identifier_tokens.insert(token.clone());
             }
             for (alias, source) in members {
@@ -7952,11 +7971,71 @@ mod tests {
     use sctx_index::normalize_search_text;
 
     use super::{
-        ContextStatus, ContextTtlSettings, ContextUsageCounts, ScopeFilter, SearchFilters,
-        SearchRequest, USAGE_IGNORED_PENALTY_BASIS_POINTS, USAGE_REUSED_BONUS_BASIS_POINTS,
-        estimate_tokens, hex_decode, hex_encode, search_in_snapshot, usage_multiplier_basis_points,
-        usage_prior_reason, usage_prior_score,
+        AliasExpansion, ContextStatus, ContextTtlSettings, ContextUsageCounts, ScopeFilter,
+        SearchFilters, SearchRequest, USAGE_IGNORED_PENALTY_BASIS_POINTS,
+        USAGE_REUSED_BONUS_BASIS_POINTS, estimate_tokens, hex_decode, hex_encode,
+        search_in_snapshot, usage_multiplier_basis_points, usage_prior_reason, usage_prior_score,
     };
+
+    /// One `token_alias` table holding the ordered pairs of the given groups.
+    fn alias_table(groups: &[(&str, &str, &[&str])]) -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE token_alias(
+                   token TEXT NOT NULL, alias TEXT NOT NULL, source TEXT NOT NULL,
+                   group_key TEXT NOT NULL, PRIMARY KEY(token, alias, source, group_key)
+                 ) WITHOUT ROWID;",
+            )
+            .unwrap();
+        for (source, group_key, members) in groups {
+            for token in *members {
+                for alias in *members {
+                    if token == alias {
+                        continue;
+                    }
+                    connection
+                        .execute(
+                            "INSERT INTO token_alias VALUES (?, ?, ?, ?)",
+                            params![token, alias, source, group_key],
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        connection
+    }
+
+    #[test]
+    fn one_named_member_expands_a_domain_term_group_but_not_an_identifier_group() {
+        let connection = alias_table(&[
+            (
+                "domain_term",
+                "评论-论输-输入-入栏",
+                &["评论", "论输", "输入", "入栏"],
+            ),
+            (
+                "identifier_split",
+                "poi-entrance-assem",
+                &["poientranceassem", "poi", "entrance", "assem"],
+            ),
+        ]);
+        // A rewritten question reproduces one bigram of the written-down term, never two adjacent
+        // ones, so the domain-term group has to fire on a single named member.
+        let alias = AliasExpansion::load(&connection, &["评论".to_owned()]).unwrap();
+        assert_eq!(alias.token_group("评论"), ["评论", "入栏", "论输", "输入"]);
+        // One word of an identifier names no identifier in particular and stays unexpanded.
+        let alias = AliasExpansion::load(&connection, &["entrance".to_owned()]).unwrap();
+        assert_eq!(alias.token_group("entrance"), ["entrance"]);
+        assert!(alias.identifier_tokens().is_empty());
+        let alias = AliasExpansion::load(&connection, &["entrance".to_owned(), "assem".to_owned()])
+            .unwrap();
+        assert_eq!(
+            alias.token_group("entrance"),
+            ["entrance", "poi", "poientranceassem"]
+        );
+        assert!(alias.identifier_tokens().contains("entrance"));
+    }
 
     #[test]
     fn usage_prior_promotes_reuse_and_only_penalizes_repeated_ignores() {
