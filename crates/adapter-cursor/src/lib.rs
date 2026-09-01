@@ -308,13 +308,24 @@ pub fn encode_hook_output(
                 || json!({}),
                 |context| json!({"additional_context": context}),
             ),
-        CanonicalAgentEventKind::PreCompact => action
-            .system_message
-            .as_ref()
-            .map_or_else(|| json!({}), |message| json!({"user_message": message})),
-        CanonicalAgentEventKind::PromptSubmit
-        | CanonicalAgentEventKind::TurnStop
-        | CanonicalAgentEventKind::SessionEnd => json!({}),
+        // Cursor registers both `preCompact` and `stop`, and both accept `user_message`.
+        // A `stop` that dropped the runtime's checkpoint line silently discarded the only
+        // Episode boundary notice the host can render, so the two share one encoding. The
+        // re-stated activation marker a `preCompact` carries follows the message on its own
+        // line, because `user_message` is the single text field these events accept.
+        CanonicalAgentEventKind::PreCompact | CanonicalAgentEventKind::TurnStop => {
+            match (
+                action.system_message.as_deref(),
+                action.additional_context.as_deref(),
+            ) {
+                (Some(message), Some(marker)) => {
+                    json!({"user_message": format!("{message}\n{marker}")})
+                }
+                (Some(text), None) | (None, Some(text)) => json!({"user_message": text}),
+                (None, None) => json!({}),
+            }
+        }
+        CanonicalAgentEventKind::PromptSubmit | CanonicalAgentEventKind::SessionEnd => json!({}),
     };
     serde_json::to_vec(&value)
         .map_err(|error| Error::new(ErrorKind::Io, format!("encode Cursor hook output: {error}")))

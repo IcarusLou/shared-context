@@ -312,9 +312,28 @@ fn assert_output(output: &Output, expected: &Value) {
     assert_eq!(&output_json(output), expected);
 }
 
-fn assert_codex_lifecycle_message(output: &Output, expected: &str) {
-    let expected = json!({"systemMessage": expected});
-    assert_output(output, &expected);
+/// The documented Codex lifecycle wire.
+///
+/// The boundary line is user-visible on `systemMessage` and mirrored into model context,
+/// because a reminder the model cannot read cannot be acted on. `PreCompact` is the one
+/// exception: model context carries the re-stated activation marker there, since
+/// compaction is what drops the `SessionStart` marker out of the conversation.
+fn assert_codex_lifecycle_message(
+    output: &Output,
+    hook_event_name: &str,
+    message: &str,
+    model_context: &str,
+) {
+    assert_output(
+        output,
+        &json!({
+            "systemMessage": message,
+            "hookSpecificOutput": {
+                "hookEventName": hook_event_name,
+                "additionalContext": model_context
+            }
+        }),
+    );
 }
 
 fn git_output(repository: &Path, args: &[&str]) -> String {
@@ -542,6 +561,8 @@ fn documented_codex_direct_lifecycle_activates_before_prompt_and_keeps_git_clean
     assert_output(&fixture.run("codex", &events[1]), &oracle.wire.neutral);
     assert_codex_lifecycle_message(
         &fixture.run("codex", &events[2]),
+        "PostToolUse",
+        &oracle.enabled_without_active_task.post_tool,
         &oracle.enabled_without_active_task.post_tool,
     );
     assert!(
@@ -551,10 +572,14 @@ fn documented_codex_direct_lifecycle_activates_before_prompt_and_keeps_git_clean
     );
     assert_codex_lifecycle_message(
         &fixture.run("codex", &events[3]),
+        "PreCompact",
         &oracle.enabled_without_active_task.pre_compact,
+        &oracle.activation_marker("codex", session),
     );
     assert_codex_lifecycle_message(
         &fixture.run("codex", &events[4]),
+        "Stop",
+        &oracle.enabled_without_active_task.turn_stop,
         &oracle.enabled_without_active_task.turn_stop,
     );
     assert_output(&fixture.run("codex", &events[5]), &oracle.wire.neutral);
@@ -618,11 +643,21 @@ fn documented_cursor_parent_lifecycle_records_both_repositories_and_safe_non_loc
     });
     assert_output(&fixture.run("cursor", &mixed), &oracle.wire.neutral);
     assert_no_capture_state(&fixture.root());
+    // Cursor accepts one text field on these events, so a `preCompact` appends the
+    // re-stated activation marker to the boundary line, and a `stop` carries the same
+    // boundary line a Codex `Stop` does.
     assert_output(
         &fixture.run("cursor", &events[3]),
-        &json!({"user_message": oracle.enabled_without_active_task.pre_compact}),
+        &json!({"user_message": format!(
+            "{}\n{}",
+            oracle.enabled_without_active_task.pre_compact,
+            oracle.activation_marker("cursor", session)
+        )}),
     );
-    assert_output(&fixture.run("cursor", &events[4]), &oracle.wire.neutral);
+    assert_output(
+        &fixture.run("cursor", &events[4]),
+        &json!({"user_message": oracle.enabled_without_active_task.turn_stop}),
+    );
     assert_output(&fixture.run("cursor", &events[5]), &oracle.wire.neutral);
     assert!(matches!(
         fixture.read_scope("cursor", session),

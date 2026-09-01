@@ -126,6 +126,29 @@ fn cursor_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_c
                 "stale Hook guidance: {message}"
             );
         }
+
+        // Both events carry the one text field Cursor renders. Compaction additionally
+        // re-states the activation marker on its own line, because compaction is what
+        // drops the SessionStart marker out of the model's context.
+        let output = encode_hook_output(
+            event.kind(),
+            &ResolvedAgentAction {
+                additional_context: action.additional_context.clone(),
+                system_message: action.system_message.clone(),
+            },
+        )
+        .unwrap();
+        let expected = match expected_trigger {
+            EpisodeFinalizationTrigger::PreCompact => format!(
+                "{message}\n{}",
+                shared_context_activation_marker(AgentKind::Cursor, "conv-real-shape-01")
+            ),
+            EpisodeFinalizationTrigger::TurnStop => message.to_owned(),
+        };
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output).unwrap(),
+            serde_json::json!({"user_message": expected})
+        );
     }
 }
 

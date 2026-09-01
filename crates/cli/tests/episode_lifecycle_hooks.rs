@@ -387,7 +387,16 @@ fn real_hooks_close_checkpointed_episodes_build_once_and_keep_sessions_isolated(
                 |message| message.contains("durably closed") && message.contains("complete")
             )
     );
-    assert_eq!(cursor_output, json!({}));
+    // Cursor reports the same closed-Episode boundary Codex does, on the one text field
+    // a `stop` payload accepts.
+    assert!(
+        cursor_output["user_message"]
+            .as_str()
+            .is_some_and(
+                |message| message.contains("durably closed") && message.contains("complete")
+            ),
+        "{cursor_output:#}"
+    );
 
     for episode_id in [codex_episode, cursor_episode] {
         let episode = runtime.read_work_episode(episode_id).unwrap().unwrap();

@@ -122,6 +122,35 @@ fn codex_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_cl
                 "stale Hook guidance: {message}"
             );
         }
+
+        // Compaction re-states the activation marker as model-visible context, because
+        // compaction is what drops the SessionStart marker. A Stop has no marker of its
+        // own, so its user-visible line is mirrored into model context instead.
+        let output = encode_hook_output(
+            event.kind(),
+            &ResolvedAgentAction {
+                additional_context: action.additional_context.clone(),
+                system_message: action.system_message.clone(),
+            },
+        )
+        .unwrap();
+        let (hook_event_name, expected_context) = match expected_trigger {
+            EpisodeFinalizationTrigger::PreCompact => (
+                "PreCompact",
+                shared_context_activation_marker(AgentKind::Codex, "thr_real_shape_01"),
+            ),
+            EpisodeFinalizationTrigger::TurnStop => ("Stop", message.to_owned()),
+        };
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output).unwrap(),
+            serde_json::json!({
+                "systemMessage": message,
+                "hookSpecificOutput": {
+                    "hookEventName": hook_event_name,
+                    "additionalContext": expected_context
+                }
+            })
+        );
     }
 }
 
@@ -227,8 +256,11 @@ fn codex_output_uses_hook_specific_additional_context_without_control_fields() {
     assert!(output.get("continue").is_none());
 }
 
+/// A message with no additional context of its own reaches both the user-visible
+/// `systemMessage` line and the model-visible `additionalContext`, because a reminder
+/// the model cannot read is not a reminder.
 #[test]
-fn codex_fail_open_diagnostic_uses_only_system_message() {
+fn codex_fail_open_diagnostic_is_mirrored_into_model_context() {
     let output = encode_hook_output(
         CanonicalAgentEventKind::PromptSubmit,
         &ResolvedAgentAction {
@@ -240,9 +272,16 @@ fn codex_fail_open_diagnostic_uses_only_system_message() {
     let output: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(
         output,
-        serde_json::json!({"systemMessage": "task retrieval temporarily unavailable"})
+        serde_json::json!({
+            "systemMessage": "task retrieval temporarily unavailable",
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": "task retrieval temporarily unavailable"
+            }
+        })
     );
-    assert!(output.get("hookSpecificOutput").is_none());
+    assert!(output.get("decision").is_none());
+    assert!(output.get("continue").is_none());
 }
 
 #[test]

@@ -251,7 +251,17 @@ pub fn encode_hook_output(
     if let Some(message) = &action.system_message {
         object.insert("systemMessage".to_owned(), Value::String(message.clone()));
     }
-    if let Some(context) = &action.additional_context {
+    // `systemMessage` is a user-visible line by Hook-protocol convention, so a reminder
+    // delivered only there may never enter the model's context: the Intent bootstrap,
+    // PreCompact, and Stop reminders would be invisible to the Agent they address. A
+    // message that carries no additional context of its own is therefore written to both
+    // fields. TODO: narrow this back to `systemMessage` alone once a real Codex session
+    // demonstrates that `systemMessage` is model-visible.
+    if let Some(context) = action
+        .additional_context
+        .as_ref()
+        .or(action.system_message.as_ref())
+    {
         object.insert(
             "hookSpecificOutput".to_owned(),
             json!({

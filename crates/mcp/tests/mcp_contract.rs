@@ -6755,7 +6755,7 @@ fn read_source_skill_asset(relative: &str) -> String {
 }
 
 fn assert_skill_bundle_contract(gate: &str, workflow: &str, metadata: &str) {
-    assert!(gate.len() < 2_000, "activation gate must remain minimal");
+    assert!(gate.len() < 2_500, "activation gate must remain minimal");
     assert!(
         workflow.len() > gate.len() * 5,
         "workflow must stay progressive"
@@ -6773,10 +6773,11 @@ fn assert_skill_bundle_contract(gate: &str, workflow: &str, metadata: &str) {
     assert!(metadata.contains("default_prompt: \"Use $shared-context"));
     assert!(metadata.contains("allow_implicit_invocation: true"));
     assert!(!metadata.contains("task_intent_update"));
+    assert!(gate.contains(SHARED_CONTEXT_ACTIVATION_MARKER_UNQUOTED_SHAPE));
     assert_eq!(
         gate.matches("task_intent_update").count(),
-        1,
-        "minimal gate may name only the one approved Intent bootstrap tool"
+        2,
+        "minimal gate may name only the one approved Intent bootstrap tool, once per trusted marker shape"
     );
 
     let workflow_tool_names = [
@@ -7950,10 +7951,10 @@ fn exclusive_selections_and_locator_composition_are_typed_server_validation() {
                 tool_call(2, tool, arguments),
             ],
         );
-        assert_eq!(
-            responses[1]["result"]["structuredContent"]["error"],
-            expected_authorization_error(),
-            "{tool} rejected an accepted flat shape"
+        assert_authorization_failure(
+            &responses[1]["result"]["structuredContent"]["error"],
+            "lease_missing",
+            &[],
         );
     }
     assert_eq!(business_residue(&fixture.root), before);

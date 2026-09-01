@@ -231,7 +231,13 @@ fn public_m2_retrieval_quality_workflow() {
     );
     assert_eq!(
         run_hook(&home, &post_tool(session, &checkout, 1)),
-        json!({"systemMessage": BOOTSTRAP_REMINDER})
+        json!({
+            "systemMessage": BOOTSTRAP_REMINDER,
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": BOOTSTRAP_REMINDER
+            }
+        })
     );
     assert_eq!(
         run_hook(&home, &post_tool(session, &checkout, 2)),
