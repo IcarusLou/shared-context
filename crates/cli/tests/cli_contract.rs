@@ -823,7 +823,19 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         "tool_input": {"file_path": alpha_file},
         "tool_response": {"output": "passed"}
     }));
-    assert_eq!(before_prompt, serde_json::json!({}));
+    // No SessionStart ever reached the Hook for this Session, so this event both creates
+    // the lease and delivers the one Intent bootstrap reminder; it still creates no Task.
+    let bootstrap_reminder = "Shared Context: no ActiveTask exists. Call task_intent_update for this substantive task before continuing.";
+    assert_eq!(
+        before_prompt,
+        serde_json::json!({
+            "systemMessage": bootstrap_reminder,
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": bootstrap_reminder
+            }
+        })
+    );
     assert!(
         TaskRuntime::initialize(harness.root())
             .unwrap()

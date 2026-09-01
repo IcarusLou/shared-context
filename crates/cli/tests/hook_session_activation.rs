@@ -436,9 +436,17 @@ fn enabled_tool_work_gets_one_intent_bootstrap_reminder_without_prompt_or_task_c
         "codex",
         &codex_post_tool(codex_session, &fixture.direct_repository),
     );
+    // Codex receives the reminder on both the user-visible line and in model context:
+    // a reminder the model cannot read cannot be acted on.
     assert_eq!(
         serde_json::from_slice::<Value>(&first_codex.stdout).unwrap(),
-        json!({"systemMessage": REMINDER}),
+        json!({
+            "systemMessage": REMINDER,
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": REMINDER
+            }
+        }),
         "scope={:#?} stderr={}",
         fixture.read_scope("codex", codex_session),
         String::from_utf8_lossy(&first_codex.stderr)
@@ -496,11 +504,19 @@ fn enabled_tool_work_gets_one_intent_bootstrap_reminder_without_prompt_or_task_c
             .as_str()
             .is_some_and(|message| message.contains("no ActiveTask exists"))
     );
+    // A Cursor `stop` carries the same Episode boundary line a Codex `Stop` does; it is
+    // the host's one user-visible text field, not a neutral no-op.
     let stopped = fixture.hook(
         "cursor",
         &cursor_stop(cursor_session, &fixture.direct_repository),
     );
-    assert_neutral(&stopped);
+    assert!(
+        serde_json::from_slice::<Value>(&stopped.stdout).unwrap()["user_message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no ActiveTask exists")),
+        "{}",
+        String::from_utf8_lossy(&stopped.stdout)
+    );
 
     for removed in ["capture", "capture.lock", "capture-metadata.json"] {
         assert!(!fixture.root().join("state").join(removed).exists());
@@ -803,17 +819,19 @@ fn busy_corrupt_and_symlink_lease_state_never_emit_activation() {
     assert_activated(&output, AgentKind::Codex, "lease-corrupt");
     let record = scope_records(&corrupt.root()).pop().unwrap();
     fs::write(&record, "RAW_SCOPE_PARSE_ERROR").unwrap();
-    // A record that cannot be interpreted never authorizes; outside SessionStart the
-    // Session simply degrades to neutral.
+    // A record that cannot be interpreted never authorizes as it stands. The next event
+    // re-authorizes in place from its own cwd instead of leaving the Session silently
+    // dead for the rest of its life, and the event itself stays wire-neutral.
     assert_neutral(&corrupt.hook(
         "codex",
         &codex_prompt("lease-corrupt", &corrupt.direct_repository),
     ));
-    assert_eq!(
+    assert!(matches!(
         corrupt.read_scope("codex", "lease-corrupt"),
-        AuthorizedSessionScopeRead::Missing
-    );
-    // Only an explicit SessionStart boundary may overwrite it in place.
+        AuthorizedSessionScopeRead::Current(scope)
+            if scope.decision.is_enabled()
+    ));
+    // An explicit SessionStart boundary overwrites the same one record.
     assert_activated(
         &corrupt.hook(
             "codex",
@@ -993,4 +1011,116 @@ fn an_unusual_host_version_outside_a_registered_repository_stays_neutral() {
     let mut disabled = cursor_start("old-disabled", &fixture.outside);
     disabled["cursor_version"] = Value::String("2026.08.25-3e8eec8".to_owned());
     assert_neutral(&fixture.hook("cursor", &disabled));
+}
+
+/// One authorized MCP call over the real stdio server, used to prove a repaired lease is
+/// the same authorization a `SessionStart` would have produced.
+fn mcp_context_search(home: &Path, session: &str) -> Value {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sctx"))
+        .args(["mcp", "serve", "--client", "codex"])
+        .env("HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05"}
+        })
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "context_search",
+                "arguments": {
+                    "agent_kind": "codex",
+                    "external_session_id": session,
+                    "query": "bounded"
+                }
+            }
+        })
+    )
+    .unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "MCP server failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|response| response["id"] == json!(2))
+        .expect("one tools/call response")
+}
+
+/// A host that installs or starts the Hook after the Session began never delivers a
+/// `SessionStart`. Before this, that Session stayed unauthorized for its whole life: no
+/// marker, and every MCP call refused. Any event now creates the lease it is missing,
+/// with the same decision `SessionStart` would have recorded.
+#[test]
+fn a_session_that_never_sent_session_start_is_authorized_by_its_next_event() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.direct_repository.join("bootstrap.rs"),
+        "fn bootstrap_fixture() {}\n",
+    )
+    .unwrap();
+    let session = "missed-session-start";
+    assert!(matches!(
+        fixture.read_scope("codex", session),
+        AuthorizedSessionScopeRead::Missing
+    ));
+
+    let first = fixture.hook(
+        "codex",
+        &codex_post_tool(session, &fixture.direct_repository),
+    );
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(matches!(
+        fixture.read_scope("codex", session),
+        AuthorizedSessionScopeRead::Current(scope) if scope.decision.is_enabled()
+    ));
+
+    let response = mcp_context_search(&fixture.home, session);
+    assert_eq!(
+        response["result"]["isError"],
+        json!(false),
+        "a repaired lease must authorize MCP: {response:#}"
+    );
+
+    // Repair is not activation: a Session that started outside every registered
+    // Repository still records Disabled and stays wire-neutral.
+    let outside_session = "missed-session-start-outside";
+    assert_neutral(&fixture.hook("codex", &codex_post_tool(outside_session, &fixture.outside)));
+    assert!(matches!(
+        fixture.read_scope("codex", outside_session),
+        AuthorizedSessionScopeRead::Current(scope)
+            if scope.decision == AuthorizedSessionScopeDecision::Disabled
+    ));
+    let refused = mcp_context_search(&fixture.home, outside_session);
+    assert_eq!(refused["result"]["isError"], json!(true), "{refused:#}");
+    assert_eq!(
+        refused["result"]["structuredContent"]["error"]["code"],
+        json!("activation_disabled")
+    );
 }

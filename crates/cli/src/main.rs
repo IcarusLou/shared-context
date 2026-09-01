@@ -936,19 +936,13 @@ impl HookAuthorization {
 }
 
 fn resolve_hook_authorization(agent: &str, event: &CanonicalAgentEvent) -> HookAuthorization {
-    resolve_hook_authorization_inner(
-        agent,
-        event.kind(),
-        &event.context().session_id,
-        &event.context().cwd,
-    )
-    .ok()
-    .unwrap_or_else(HookAuthorization::disabled)
+    resolve_hook_authorization_inner(agent, &event.context().session_id, &event.context().cwd)
+        .ok()
+        .unwrap_or_else(HookAuthorization::disabled)
 }
 
 fn resolve_hook_authorization_inner(
     agent: &str,
-    event_kind: CanonicalAgentEventKind,
     session_id: &str,
     startup_cwd: &Path,
 ) -> Result<HookAuthorization> {
@@ -964,11 +958,18 @@ fn resolve_hook_authorization_inner(
     // event — including a Session started at a common parent, which simply gains or
     // loses one of the Repositories it records for. Re-resolution is pure — no stat, no Git, no scan — so this stays on
     // the Hook hot path.
+    // Every event, not only `SessionStart`, may create the lease it is missing. A host
+    // that installs the Hook mid-Session, starts it after the Session began, or stores a
+    // record this Store must classify as `Missing` would otherwise leave that Session
+    // permanently and silently unauthorized: the marker never appears, and every MCP call
+    // is refused for its whole life. Authorization is identical either way — the event's
+    // own cwd (the vendor adapters already fall back to the first workspace root) resolved
+    // against this Catalog — so a Session outside every registered Repository still
+    // records Disabled. The added hot-path cost is one `canonicalize`, and the write is
+    // non-blocking.
     let scope = match store.try_read_reconciled(&locator, &catalog)? {
         AuthorizedSessionScopeRead::Current(scope) => Some(scope),
-        AuthorizedSessionScopeRead::Missing
-            if event_kind == CanonicalAgentEventKind::SessionStart =>
-        {
+        AuthorizedSessionScopeRead::Missing => {
             let canonical_startup_cwd = fs::canonicalize(startup_cwd).map_err(|error| {
                 Error::new(ErrorKind::Io, format!("canonicalize startup cwd: {error}"))
             })?;
@@ -978,7 +979,6 @@ fn resolve_hook_authorization_inner(
                     .scope,
             )
         }
-        AuthorizedSessionScopeRead::Missing => None,
     };
     let activation = if scope
         .as_ref()
