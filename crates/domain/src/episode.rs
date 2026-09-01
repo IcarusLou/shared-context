@@ -953,9 +953,17 @@ impl CandidateRelationAssessment {
             && !self
                 .paths
                 .contains(&CandidateAssessmentPath::CanonicalDraftEquality)
+            && !(self
+                .paths
+                .contains(&CandidateAssessmentPath::StatementEquality)
+                && self
+                    .paths
+                    .iter()
+                    .any(|path| matches!(path, CandidateAssessmentPath::TopicEquality { .. })))
         {
             return Err(invalid(format!(
-                "{field}.exact_duplicate requires canonical draft equality"
+                "{field}.exact_duplicate requires canonical draft equality, or statement equality \
+                 on one topic key"
             )));
         }
         Ok(())
