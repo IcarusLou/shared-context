@@ -45,7 +45,7 @@ use sctx_engineering_graph::{
     EngineeringReferenceResolver, MAX_REPOSITORY_SCAN_PLAN_PATHS, ProjectedEngineeringReference,
     RegisteredRepository, RepositoryAvailability, RepositoryCatalogSyncReport, RepositoryRegistry,
     RepositoryScanOutcome, RepositoryScanPlan, RepositoryScanner, ResolvedReferenceProjection,
-    SkippedFileReason, build_graph_context_snapshots,
+    SkippedFileReason, build_graph_context_snapshots, find_relocation_candidate, relocatable_path,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{
@@ -1382,6 +1382,10 @@ pub struct AssociationExplainResponse {
     pub explanation: String,
     pub artifact_generation: String,
     pub context_tree_oid: Option<String>,
+    /// The rename local history states for a `Missing` File or Module Reference, when there is
+    /// exactly one. Absent otherwise, including when history is ambiguous.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relocation_candidate: Option<ReferenceRelocationCandidate>,
     pub tree: String,
     pub generation: u64,
 }
@@ -1412,6 +1416,26 @@ pub struct ResolutionStatusCounts {
     pub unavailable: usize,
 }
 
+/// One rename the Repository's own history states, reported beside a `Missing` Reference.
+///
+/// It is a diagnosis, never a repair. Resolution still never guesses after a move: nothing here
+/// rewrites a Reference, feeds an `ArtifactResolution`, or creates an association. A rename is
+/// reported because the Repository stated it -- this exact path became that exact path in this
+/// exact commit -- and the person who accepted the Context is the one who decides whether the
+/// claim still holds at the new path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceRelocationCandidate {
+    pub reference_id: ReferenceId,
+    pub repository_id: RepositoryId,
+    pub context_id: ContextId,
+    pub revision_id: RevisionId,
+    pub from: String,
+    pub to: String,
+    pub commit: String,
+    /// The explicit act that repairs it.
+    pub advice: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AssociationRebuildResponse {
     pub diagnose_only: bool,
@@ -1421,6 +1445,10 @@ pub struct AssociationRebuildResponse {
     pub reference_count: usize,
     pub repositories: Vec<RepositoryRebuildSummary>,
     pub status_counts: ResolutionStatusCounts,
+    /// Renames local history states for the `Missing` File and Module References. Empty on a
+    /// budgeted automatic rescan, which never reads history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relocation_candidates: Vec<ReferenceRelocationCandidate>,
     pub tree: String,
     pub generation: u64,
 }
@@ -1430,6 +1458,13 @@ pub struct AssociationRebuildResponse {
 /// Short enough that an Agent waiting on `candidate_confirm` never notices it, and the scan it
 /// bounds only ever visits the paths the Engineering References actually name.
 const AUTO_SCAN_BUDGET: Duration = Duration::from_secs(2);
+
+/// Wall-clock budget for one Reference's local history lookup.
+const RELOCATION_REFERENCE_BUDGET: Duration = Duration::from_secs(2);
+/// Wall-clock budget for every history lookup in one explicit rebuild.
+const RELOCATION_TOTAL_BUDGET: Duration = Duration::from_secs(10);
+/// The one repair for a Reference whose Artifact moved.
+const RELOCATION_ADVICE: &str = "confirm the Context still holds at the new path, then record a replacement with engineering_reference_record";
 
 /// Prefix of the only structured `recheck_when` entries the server evaluates.
 pub const RECHECK_BRANCH_ADVANCED_PREFIX: &str = "branch_advanced:";
@@ -3950,6 +3985,14 @@ impl Runtime {
                 .rebuild_for_context_tree(&projection, Some(&snapshot.metadata.indexed_tree_oid))?;
         }
         let status_counts = resolution_status_counts(&projection.references);
+        // Only an explicitly requested rebuild reads history. A budgeted automatic rescan carries
+        // a deadline, and spending it on `git log` would trade the scan that repairs the Graph for
+        // an explanation of why it is broken.
+        let relocation_candidates = if deadline.is_none() {
+            relocation_candidates(&projection.references, &repository_summaries)
+        } else {
+            Vec::new()
+        };
         Ok(Some(AssociationRebuildResponse {
             diagnose_only: input.diagnose_only,
             stored: !input.diagnose_only,
@@ -3958,6 +4001,7 @@ impl Runtime {
             reference_count: projection.references.len(),
             repositories: repository_summaries,
             status_counts,
+            relocation_candidates,
             tree: snapshot.metadata.indexed_tree_oid.clone(),
             generation: snapshot.metadata.projection_generation,
         }))
@@ -4023,9 +4067,21 @@ impl Runtime {
             .find(|reference| reference.reference_id == reference_id)
             .ok_or_else(|| invalid(format!("Reference is not projected: {reference_id}")))?;
         let metadata = self.index.synchronize()?.metadata;
+        let relocation_candidate = self
+            .repositories
+            .list()?
+            .iter()
+            .find(|repository| {
+                repository.identity.repository_id == projected.resolution.repository_id
+            })
+            .and_then(available_checkout)
+            .and_then(|checkout| {
+                relocation_candidate(projected, checkout, RELOCATION_REFERENCE_BUDGET)
+            });
         Ok(association_explain_response(
             projected,
             graph.context_tree_oid,
+            relocation_candidate,
             metadata.indexed_tree_oid,
             metadata.projection_generation,
         ))
@@ -4316,6 +4372,85 @@ fn scan_registered_repositories_before(
     Ok(Some((outcomes, summaries)))
 }
 
+/// The first registered checkout of one Repository that is actually on this machine.
+fn available_checkout(repository: &RegisteredRepository) -> Option<&Path> {
+    repository
+        .locators
+        .iter()
+        .find(|locator| {
+            locator.availability == RepositoryAvailability::Available
+                && locator.checkout_path.is_dir()
+        })
+        .map(|locator| locator.checkout_path.as_path())
+}
+
+/// Reads local history for every `Missing` File or Module Reference, under one shared budget.
+///
+/// The per-Reference budget bounds one unresponsive checkout; the total bounds a Repository whose
+/// Artifacts all moved at once. Running out is silent: an unfinished diagnosis is not a finding,
+/// and the `Missing` statuses it would have annotated are reported either way.
+fn relocation_candidates(
+    references: &[ResolvedReferenceProjection],
+    repositories: &[RepositoryRebuildSummary],
+) -> Vec<ReferenceRelocationCandidate> {
+    let checkouts = repositories
+        .iter()
+        .filter_map(|summary| {
+            summary
+                .checkout_path
+                .as_deref()
+                .map(|checkout| (summary.repository_id.clone(), checkout))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let Some(overall) = Instant::now().checked_add(RELOCATION_TOTAL_BUDGET) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for reference in references {
+        if reference.resolution.status != ResolutionStatus::Missing {
+            continue;
+        }
+        let remaining = overall.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let Some(checkout) = checkouts.get(&reference.resolution.repository_id).copied() else {
+            continue;
+        };
+        if let Some(candidate) = relocation_candidate(
+            reference,
+            checkout,
+            RELOCATION_REFERENCE_BUDGET.min(remaining),
+        ) {
+            found.push(candidate);
+        }
+    }
+    found
+}
+
+/// Reports the one rename history states for a `Missing` File or Module Reference.
+fn relocation_candidate(
+    reference: &ResolvedReferenceProjection,
+    checkout: &Path,
+    budget: Duration,
+) -> Option<ReferenceRelocationCandidate> {
+    if reference.resolution.status != ResolutionStatus::Missing {
+        return None;
+    }
+    let path = reference.locator.as_ref().and_then(relocatable_path)?;
+    let found = find_relocation_candidate(checkout, path, budget)?;
+    Some(ReferenceRelocationCandidate {
+        reference_id: reference.reference_id,
+        repository_id: reference.resolution.repository_id.clone(),
+        context_id: reference.context_id,
+        revision_id: reference.revision_id,
+        from: found.from,
+        to: found.to,
+        commit: found.commit,
+        advice: RELOCATION_ADVICE.to_owned(),
+    })
+}
+
 fn skipped_reason_name(reason: SkippedFileReason) -> &'static str {
     match reason {
         SkippedFileReason::Missing => "missing",
@@ -4353,6 +4488,7 @@ fn resolution_status_counts(references: &[ResolvedReferenceProjection]) -> Resol
 fn association_explain_response(
     projected: &ResolvedReferenceProjection,
     context_tree_oid: Option<String>,
+    relocation_candidate: Option<ReferenceRelocationCandidate>,
     tree: String,
     generation: u64,
 ) -> AssociationExplainResponse {
@@ -4400,6 +4536,7 @@ fn association_explain_response(
         explanation: projected.resolution.explanation.clone(),
         artifact_generation: projected.artifact_generation.clone(),
         context_tree_oid,
+        relocation_candidate,
         tree,
         generation,
     }

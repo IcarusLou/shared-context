@@ -190,3 +190,5 @@ Several Candidates discarded for the same reason:
 Call `repository_scan` only with an explicit bounded path plan. Call `engineering_reference_record` only after direct inspection or validation proves how an existing Context revision relates to a registered Repository Artifact. Supply the complete deterministic locator, support statement, and limitations; never guess a move, rename, Repository identity, or Artifact coordinate.
 
 Use `association_explain` for current resolution details and `association_rebuild` only for an explicit rebuild or diagnosis. Graph resolution and text fallback are retrieval evidence paths, not permission to rewrite Context facts.
+
+When a Reference is `missing`, both tools may report a `relocation_candidate` naming the one rename local history states (`from`, `to`, `commit`). That is a diagnosis, not a resolution: nothing is reattached. Confirm the Context still holds at the new path, then record a replacement with `engineering_reference_record`.

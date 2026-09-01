@@ -1923,3 +1923,111 @@ fn a_confirmation_that_names_engineering_references_rescans_within_its_budget() 
         snapshot.projection.references
     );
 }
+
+/// Resolution never guesses after a move, and that is exactly why the move has to be reported.
+/// A `Missing` Reference and a renamed file are the same status and completely different
+/// situations, and only the Repository's own history can tell them apart.
+#[test]
+fn a_renamed_artifact_is_reported_as_a_relocation_candidate_and_never_resolved() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("relocation root");
+    let checkout = temporary.path().join("relocation checkout");
+    init_repo(
+        &checkout,
+        &[(
+            "src/alpha.rs",
+            "pub fn relocation_anchor() -> bool { true }\n",
+        )],
+    );
+    let checkout = fs::canonicalize(&checkout).unwrap();
+    let (context_id, revision_id) = accepted_context(&root, "relocation decision");
+    let repository = UserConfigStore::initialize(&root)
+        .unwrap()
+        .add_repository(
+            "Relocation".parse().unwrap(),
+            std::slice::from_ref(&checkout),
+        )
+        .unwrap()
+        .repository;
+    let recorded = engineering_reference_record_at_root(
+        &root,
+        &reference_input(
+            context_id,
+            revision_id,
+            &repository.repository_id,
+            ArtifactKind::File,
+            ReferenceRelation::Implements,
+            ArtifactLocator::File {
+                path: RepoRelativePath::new("src/alpha.rs").unwrap(),
+            },
+        ),
+    )
+    .unwrap();
+
+    git(&checkout, &["mv", "src/alpha.rs", "src/beta.rs"]);
+    git(&checkout, &["commit", "-q", "-m", "move the anchor"]);
+
+    let rebuilt = association_rebuild_at_root(
+        &root,
+        &AssociationRebuildInput {
+            diagnose_only: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(rebuilt.status_counts.missing, 1);
+    assert_eq!(rebuilt.status_counts.resolved, 0);
+    assert_eq!(rebuilt.relocation_candidates.len(), 1);
+    let candidate = &rebuilt.relocation_candidates[0];
+    assert_eq!(candidate.reference_id, recorded.reference_id);
+    assert_eq!(candidate.from, "src/alpha.rs");
+    assert_eq!(candidate.to, "src/beta.rs");
+    assert_eq!(candidate.commit.len(), 40);
+    assert!(candidate.advice.contains("engineering_reference_record"));
+
+    let explained = association_explain_at_root(
+        &root,
+        &AssociationExplainInput {
+            reference_id: recorded.reference_id.to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(explained.status, sctx_domain::ResolutionStatus::Missing);
+    assert!(
+        explained.resolved_artifact.is_none() && explained.ambiguity_candidates.is_empty(),
+        "naming the rename never resolves the Reference to it"
+    );
+    assert_eq!(
+        explained
+            .relocation_candidate
+            .as_ref()
+            .map(|found| found.to.as_str()),
+        Some("src/beta.rs")
+    );
+
+    // A plain delete is not a rename, and the diagnosis says nothing rather than something close.
+    git(&checkout, &["rm", "-q", "src/beta.rs"]);
+    git(&checkout, &["commit", "-q", "-m", "drop the anchor"]);
+    let deleted = engineering_reference_record_at_root(
+        &root,
+        &reference_input(
+            context_id,
+            revision_id,
+            &repository.repository_id,
+            ArtifactKind::File,
+            ReferenceRelation::Implements,
+            ArtifactLocator::File {
+                path: RepoRelativePath::new("src/beta.rs").unwrap(),
+            },
+        ),
+    )
+    .unwrap();
+    let after_delete = association_explain_at_root(
+        &root,
+        &AssociationExplainInput {
+            reference_id: deleted.reference_id.to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(after_delete.status, sctx_domain::ResolutionStatus::Missing);
+    assert!(after_delete.relocation_candidate.is_none());
+}
