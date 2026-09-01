@@ -3307,6 +3307,32 @@ impl Runtime {
         let edits = &edits;
         let final_draft = edits.apply(&persisted.content)?;
         validate_context_relation_targets(snapshot, &final_draft.relations)?;
+        // A Candidate whose strongest assessment restates a Context the knowledge base already
+        // accepted stays confirmable — only a human confirmation ever produces an accepted fact,
+        // and that does not change here. What it may no longer do is land as a fresh, unrelated
+        // fact: confirming restatements that way is what left five of this repository's own nine
+        // accepted Contexts saying the same thing two or three times over. The confirmation now
+        // has to carry the decision the reviewer made — this revision replaces the Context it
+        // repeats, or it disagrees with it — and discarding the Candidate remains the third way
+        // out. An already Confirmed Review is exempt: that call is a replay finishing a
+        // confirmation Git already wrote, it admits no new fact, and refusing it would strand the
+        // Review as Pending forever behind a decision the reviewer already made.
+        if review_record.status == CandidateReviewStatus::Pending
+            && let Some(duplicate) = accepted_duplicate_target(snapshot, &review.analysis)
+            && !final_draft.relations.iter().any(|relation| {
+                relation.target_context_id == duplicate
+                    && matches!(
+                        relation.kind,
+                        ContextRelationKind::Supersedes | ContextRelationKind::Contradicts
+                    )
+            })
+        {
+            return Err(invalid(format!(
+                "{EXACT_DUPLICATE_REQUIRES_DECISION} {duplicate}. Confirm again with an \
+                 edits.relations entry of kind supersedes or contradicts whose target_context_id \
+                 is {duplicate}, or discard this Candidate through candidate_discard"
+            )));
+        }
         let final_json = serde_json::to_string(&final_draft).map_err(|error| {
             Error::new(ErrorKind::Io, format!("serialize final draft: {error}"))
         })?;
@@ -5260,6 +5286,50 @@ fn parse_batch_candidate_ids(values: &[String]) -> Result<Vec<sctx_domain::Candi
 }
 
 /// Reports the exact batch member that failed before anything was written.
+/// Opening of the one `candidate_confirm` refusal that asks for a decision rather than a repair.
+///
+/// It is matched as a prefix to give the refusal its own error code: `candidate_review_invalid`
+/// would tell a client to fix its arguments, when nothing about the arguments is malformed and
+/// what is missing is a human choice between superseding the Context this Candidate repeats and
+/// discarding the restatement.
+const EXACT_DUPLICATE_REQUIRES_DECISION: &str =
+    "This Candidate restates the accepted Context it was assessed against,";
+
+/// The Context an `exact_duplicate` top assessment points at, when it is still accepted.
+///
+/// Only the strongest assessment is read, selected exactly as `compact_candidate_review` selects
+/// the `top_assessment` a reviewer was shown, so the refusal is never about a relation the
+/// reviewer never saw. A duplicate found further down is a weaker relation among several, and a
+/// target whose revision is no longer accepted is no longer a fact this Candidate could repeat.
+fn accepted_duplicate_target(
+    snapshot: &DomainSnapshot,
+    analysis: &CandidateAnalysis,
+) -> Option<ContextId> {
+    let assessment = analysis
+        .assessments
+        .iter()
+        .max_by_key(|assessment| assessment.confidence.basis_points)?;
+    if assessment.relation != CandidateAssessmentRelation::ExactDuplicate {
+        return None;
+    }
+    let target = assessment.target?;
+    snapshot
+        .projection
+        .spaces
+        .values()
+        .flat_map(|space| space.contexts.values())
+        .find(|context| context.context_id == target.context_id)
+        .filter(|context| {
+            context
+                .revisions
+                .get(&target.revision_id)
+                .is_some_and(|revision| {
+                    revision.lifecycle == sctx_domain::RevisionLifecycle::Accepted
+                })
+        })
+        .map(|context| context.context_id)
+}
+
 fn batch_preparation_error(
     position: usize,
     candidate_id: sctx_domain::CandidateId,
@@ -6522,6 +6592,13 @@ impl ToolFailure {
 
     fn candidate_review_failed(error: Error) -> Self {
         let code = match error.kind() {
+            ErrorKind::InvalidInput
+                if error
+                    .message()
+                    .starts_with(EXACT_DUPLICATE_REQUIRES_DECISION) =>
+            {
+                "exact_duplicate_requires_decision"
+            }
             ErrorKind::InvalidInput => "candidate_review_invalid",
             ErrorKind::InvariantViolation => "candidate_review_invariant",
             ErrorKind::Io => "candidate_review_storage_failed",
