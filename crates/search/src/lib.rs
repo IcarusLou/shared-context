@@ -12,7 +12,7 @@ use sctx_domain::{
     Applicability, ArtifactAssociationKind, ArtifactKey, ArtifactKind, ContextId, ContextKind,
     ContextRelationKind, EvidenceId, EvidenceType, ReferenceId, RepositoryId, ResolutionStatus,
     ResolvedFocus, RevisionId, SpaceAssociationId, SpaceId, TaskId, TaskSignal, TaskSignalKind,
-    TaskSpaceAssociation, WorkingIntentSnapshot,
+    TaskSpaceAssociation, WorkingIntentSnapshot, hints,
 };
 use sctx_engineering_graph::{
     EngineeringProjection, EngineeringProjectionSnapshot, EngineeringProjectionStore,
@@ -1549,6 +1549,49 @@ struct StoredIntentFtsMatch {
     fields: [String; 7],
 }
 
+/// The text every Task Signal contributes to one retrieval query.
+///
+/// A `Prompt` is what the Agent was asked and a `Diff` names a file it rewrote; both are read
+/// whole. A `TestOutcome` is `test runner succeeded` or `test runner failed`, which describes no
+/// subject and would only add noise. A `Workspace` signal is read through
+/// [`workspace_signal_query_text`].
+fn signal_query_texts(signals: &[TaskSignal]) -> Vec<String> {
+    signals
+        .iter()
+        .filter_map(|signal| match signal.kind {
+            TaskSignalKind::Prompt | TaskSignalKind::Diff => Some(signal.content.clone()),
+            TaskSignalKind::Workspace => workspace_signal_query_text(&signal.content),
+            TaskSignalKind::TestOutcome => None,
+        })
+        .collect()
+}
+
+/// The words one `Workspace` signal contributes, or `None` when it names no file.
+///
+/// A `Workspace` signal has carried two shapes over this repository's life. An attributed one is
+/// `<RepositoryId>:<checkout-relative path>` -- a file the Agent opened but did not rewrite, which
+/// says what the Task is about exactly as a `Diff` does and belongs in the query at the same
+/// weight. The older shape is a bare checkout or Workspace root, which says only where the Agent
+/// is working; that has never been allowed to add a retrieval prior and still is not.
+///
+/// The two are told apart by the shape itself rather than by looking up the Repository: an
+/// attributed signal names a Repository before the colon and a *relative* path after it, and a
+/// root is an absolute path with no such prefix. Only the path is read, and only as the file stems
+/// the rest of retrieval already reads a path spelling as, because the Repository identity is a
+/// coordinate and no question is asked in it.
+fn workspace_signal_query_text(content: &str) -> Option<String> {
+    let (repository_id, path) = content.trim().split_once(':')?;
+    if repository_id.is_empty() || repository_id.contains('/') || repository_id.contains('\\') {
+        return None;
+    }
+    let path = path.trim();
+    if path.is_empty() || path.starts_with('/') {
+        return None;
+    }
+    let stems = hints::derived_path_stems([path]);
+    (!stems.is_empty()).then(|| stems.join(" "))
+}
+
 fn task_query_tokens(intent: &WorkingIntentSnapshot, signals: &[TaskSignal]) -> Vec<String> {
     let list_text = [
         &intent.in_scope,
@@ -1563,14 +1606,11 @@ fn task_query_tokens(intent: &WorkingIntentSnapshot, signals: &[TaskSignal]) -> 
     ]
     .into_iter()
     .flat_map(|values| values.iter().map(String::as_str));
-    let signal_text = signals
-        .iter()
-        .filter(|signal| matches!(signal.kind, TaskSignalKind::Prompt | TaskSignalKind::Diff))
-        .map(|signal| signal.content.as_str());
+    let signal_text = signal_query_texts(signals);
     std::iter::once(intent.goal.as_str())
         .chain(intent.current_direction.as_deref())
         .chain(list_text)
-        .chain(signal_text)
+        .chain(signal_text.iter().map(String::as_str))
         .flat_map(search_tokens)
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -1588,14 +1628,11 @@ fn association_query_tokens(intent: &WorkingIntentSnapshot, signals: &[TaskSigna
     ]
     .into_iter()
     .flat_map(|values| values.iter().map(String::as_str));
-    let signal_text = signals
-        .iter()
-        .filter(|signal| matches!(signal.kind, TaskSignalKind::Prompt | TaskSignalKind::Diff))
-        .map(|signal| signal.content.as_str());
+    let signal_text = signal_query_texts(signals);
     std::iter::once(intent.goal.as_str())
         .chain(intent.current_direction.as_deref())
         .chain(list_text)
-        .chain(signal_text)
+        .chain(signal_text.iter().map(String::as_str))
         .flat_map(search_tokens)
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -1618,12 +1655,8 @@ fn association_query_phrases(
     ] {
         texts.extend(values.iter().map(String::as_str));
     }
-    texts.extend(
-        signals
-            .iter()
-            .filter(|signal| matches!(signal.kind, TaskSignalKind::Prompt | TaskSignalKind::Diff))
-            .map(|signal| signal.content.as_str()),
-    );
+    let signal_text = signal_query_texts(signals);
+    texts.extend(signal_text.iter().map(String::as_str));
     normalized_phrases(texts)
 }
 
@@ -2240,12 +2273,8 @@ fn task_query_phrases(
     if include_out_of_scope {
         texts.extend(intent.out_of_scope.iter().map(String::as_str));
     }
-    texts.extend(
-        signals
-            .iter()
-            .filter(|signal| matches!(signal.kind, TaskSignalKind::Prompt | TaskSignalKind::Diff))
-            .map(|signal| signal.content.as_str()),
-    );
+    let signal_text = signal_query_texts(signals);
+    texts.extend(signal_text.iter().map(String::as_str));
     normalized_phrases(texts)
 }
 
@@ -5040,9 +5069,15 @@ fn task_fingerprint(intent: &WorkingIntentSnapshot, signals: &[TaskSignal]) -> R
     ] {
         values.sort();
     }
+    // A Workspace signal that names no file steers no query, so it must not change the
+    // fingerprint: two Packs that would be identical have to be recognized as identical. One that
+    // does name a file is part of the question now, exactly as a Diff is.
     let mut signals = signals
         .iter()
-        .filter(|signal| signal.kind != TaskSignalKind::Workspace)
+        .filter(|signal| {
+            signal.kind != TaskSignalKind::Workspace
+                || workspace_signal_query_text(&signal.content).is_some()
+        })
         .cloned()
         .collect::<Vec<_>>();
     signals.sort_by(|left, right| {
