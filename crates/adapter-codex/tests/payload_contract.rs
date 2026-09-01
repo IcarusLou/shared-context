@@ -66,7 +66,13 @@ fn verified_and_trusted_codex_prompt_never_repeats_activation_marker() {
     assert!(capability.prompt_aware_injection);
     let action =
         plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled);
-    assert!(action.task_operation.is_none());
+    // A Prompt plans one purely local Signal and nothing else: no marker, no reminder, and
+    // nothing the model or the user ever sees for this event.
+    assert!(matches!(
+        action.task_operation,
+        Some(TaskRuntimeOperation::RecordPromptSignal { .. })
+    ));
+    assert!(action.additional_context.is_none());
     assert!(action.system_message.is_none());
 
     let output = encode_hook_output(

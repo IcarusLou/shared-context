@@ -86,9 +86,28 @@ fn post_tool(session: &str, workspace: &Path, file: &Path, index: usize) -> Valu
     })
 }
 
+/// Both file spreads run in one test, sequentially and deliberately: each phase already
+/// saturates the machine with thirty-two concurrent Hook processes, and two such phases running
+/// as separate `#[test]`s would overlap into a sixty-four-way measurement of the harness rather
+/// than of the Hook.
 #[test]
-#[allow(clippy::too_many_lines)]
 fn thirty_two_post_tool_hooks_are_bounded_fail_open_and_write_zero_capture_state() {
+    // Every Hook after the first observes a file the Runtime already holds a Signal for, which
+    // is the common shape of a Session re-reading what it is working on.
+    thirty_two_concurrent_post_tool_hooks(FileSpread::OneSharedFile);
+    // The worst case for Signal writing: no observation can be skipped as unchanged, so all
+    // thirty-two take the Runtime write lock in turn under the same budget.
+    thirty_two_concurrent_post_tool_hooks(FileSpread::OneFilePerHook);
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FileSpread {
+    OneSharedFile,
+    OneFilePerHook,
+}
+
+#[allow(clippy::too_many_lines)]
+fn thirty_two_concurrent_post_tool_hooks(spread: FileSpread) {
     let temporary = tempfile::tempdir().unwrap();
     let home = temporary.path().join("Hook 热路径 home");
     let root = home.join(".shared-context");
@@ -116,6 +135,14 @@ fn thirty_two_post_tool_hooks_are_bounded_fail_open_and_write_zero_capture_state
         )
         .unwrap();
 
+    let sources = (0..WORKERS)
+        .map(|index| {
+            let path = workspace.join(format!("hot_path_{index:02}.rs"));
+            fs::write(&path, format!("fn hot_path_{index}() {{}}\n")).unwrap();
+            fs::canonicalize(path).unwrap()
+        })
+        .collect::<Vec<_>>();
+
     let session = "cursor-hot-path";
     let (start, _) = run_hook(&home, &session_start(session, &workspace));
     assert!(start.status.success());
@@ -135,11 +162,14 @@ fn thirty_two_post_tool_hooks_are_bounded_fail_open_and_write_zero_capture_state
 
     let barrier = Arc::new(Barrier::new(WORKERS));
     let mut workers = Vec::new();
-    for index in 0..WORKERS {
+    for (index, per_hook_source) in sources.iter().enumerate() {
         let barrier = Arc::clone(&barrier);
         let home = home.clone();
         let workspace = workspace.clone();
-        let source = source.clone();
+        let source = match spread {
+            FileSpread::OneSharedFile => source.clone(),
+            FileSpread::OneFilePerHook => per_hook_source.clone(),
+        };
         workers.push(thread::spawn(move || {
             let payload = post_tool(session, &workspace, &source, index);
             barrier.wait();
@@ -169,7 +199,11 @@ fn thirty_two_post_tool_hooks_are_bounded_fail_open_and_write_zero_capture_state
     }
     durations.sort_unstable();
     let p99 = durations[(WORKERS * 99).div_ceil(100) - 1];
-    eprintln!("32-way PostToolUse p99={p99:?}");
+    let shape = match spread {
+        FileSpread::OneSharedFile => "one shared file",
+        FileSpread::OneFilePerHook => "one file per hook",
+    };
+    eprintln!("32-way PostToolUse ({shape}) p99={p99:?}");
     assert!(p99 < Duration::from_millis(500), "Hook p99 was {p99:?}");
 
     for removed in ["capture", "capture.lock", "capture-metadata.json"] {

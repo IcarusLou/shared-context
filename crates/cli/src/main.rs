@@ -20,9 +20,10 @@ use std::{
 use args::Options;
 use sctx_agent_adapter::{
     AgentCapabilities, ArtifactFocusReminderContext, CanonicalAgentAction, CanonicalAgentEvent,
-    CanonicalAgentEventKind, EpisodeFinalizationTrigger, PathHint, ResolvedActivationDecision,
-    ResolvedAgentAction, TaskRuntimeOperation, ToolCategory, ToolOutcome, TrustState,
-    artifact_focus_reminder_file, plan_action_for_activation, render_artifact_focus_reminder,
+    CanonicalAgentEventKind, EpisodeFinalizationTrigger, FileAccess, PathHint,
+    ResolvedActivationDecision, ResolvedAgentAction, TaskRuntimeOperation, ToolCategory,
+    ToolOutcome, TrustState, artifact_focus_reminder_file, plan_action_for_activation,
+    render_artifact_focus_reminder,
 };
 use sctx_domain::{
     Applicability, CandidateReviewStatus, ConflictParticipant, ConflictResolutionDraft,
@@ -30,7 +31,8 @@ use sctx_domain::{
     ContextRevisionDraft, DomainProjection, Error, ErrorKind, EvidenceSnapshotDraft, EvidenceType,
     ExternalSessionLocator, IntentSnapshot, PublicationAction, PublicationDraft, RepositoryId,
     ResolutionOutcome, Result, ReviewDraft, ReviewSummary, ReviewVerdict, RevisionId,
-    SemanticConflictDraft, SpaceId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkEpisodeStatus,
+    SemanticConflictDraft, SpaceId, TaskSessionSnapshot, TaskSignal, TaskSignalKind, WorkEpisodeId,
+    WorkEpisodeStatus,
 };
 use sctx_engineering_graph::{
     ARTIFACT_FOCUS_QUERY_BUDGET, ArtifactFocusOutcome, ArtifactFocusReader, MAX_ARTIFACT_FOCUS_HITS,
@@ -43,7 +45,8 @@ use sctx_index::{
 use sctx_local_state::{
     ArtifactReminderKey, ArtifactReminderMark, ArtifactReminderStore, AuthorizedSessionScope,
     AuthorizedSessionScopeRead, AuthorizedSessionScopeStore, CatalogCheckoutStatus, HookSettings,
-    MaintenanceLock, RepositoryCatalogDiagnostic, RepositoryCatalogSnapshot, UserConfigStore,
+    MaintenanceLock, PrivacyScanner, RepositoryCatalogDiagnostic, RepositoryCatalogSnapshot,
+    UserConfigStore,
 };
 use sctx_mcp::{
     ArtifactFocusQuery, AssociationExplainInput, AssociationRebuildInput, CandidateAnalyzeInput,
@@ -57,7 +60,8 @@ use sctx_search::{
     SearchMatchMode, SearchRequest,
 };
 use sctx_task_runtime::{
-    AutomatedEpisodeBoundary, CandidateBuildStatus, HookEventDecision, HookEventRecord, TaskRuntime,
+    AutomatedEpisodeBoundary, CandidateBuildStatus, HookEventDecision, HookEventRecord,
+    SignalRetentionRule, TaskRuntime,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -862,6 +866,8 @@ struct HookEventRecorder {
     database_path: Option<PathBuf>,
     event_kind: RefCell<Option<&'static str>>,
     session_id: RefCell<Option<String>>,
+    /// Reason and detail the single Enabled completion row carries instead of a bare `ok`.
+    completion: RefCell<Option<(&'static str, Option<String>)>>,
     started: Instant,
 }
 
@@ -874,8 +880,23 @@ impl HookEventRecorder {
                 .map(|root| root.join("state").join("runtime.sqlite")),
             event_kind: RefCell::new(None),
             session_id: RefCell::new(None),
+            completion: RefCell::new(None),
             started: Instant::now(),
         }
+    }
+
+    /// Names what this Hook actually did, for the one Enabled completion row it will write.
+    ///
+    /// A normal Enabled Hook writes exactly one `hook_event` row, and that budget is the point:
+    /// several Hook processes flush concurrently, so an extra insert per event lands directly on
+    /// the contended part of the hot path. Ordinary outcomes therefore *replace* the `ok` reason
+    /// rather than adding a row; only genuine faults flush one of their own.
+    fn note_completion(&self, reason: &'static str, detail: Option<String>) {
+        *self.completion.borrow_mut() = Some((reason, detail));
+    }
+
+    fn take_completion(&self) -> (&'static str, Option<String>) {
+        self.completion.borrow_mut().take().unwrap_or(("ok", None))
     }
 
     /// Binds the decoded event kind and session id. Every `flush` after this call uses the
@@ -1058,7 +1079,8 @@ fn run_hook(args: &[String]) -> Result<()> {
     // `repository_scoped_activation_acceptance`). Only an Enabled completion is recorded here;
     // every genuine fault along a Disabled path already recorded its own row above.
     if activated {
-        recorder.flush(HookEventDecision::Enabled, "ok", None);
+        let (reason, detail) = recorder.take_completion();
+        recorder.flush(HookEventDecision::Enabled, reason, detail);
     }
     Ok(())
 }
@@ -1662,15 +1684,15 @@ fn resolve_task_operation(
     match operation {
         TaskRuntimeOperation::MergeSignals {
             locator,
-            cwd,
-            workspace_roots,
             file_hints,
             tool_category,
+            file_access,
             outcome,
+            ..
         } => {
             let root = installation_root()?;
             let runtime = TaskRuntime::initialize_for_hook(&root)?;
-            if runtime.read_snapshot_by_locator(&locator)?.is_none() {
+            let Some(active) = runtime.read_snapshot_by_locator(&locator)? else {
                 let mark_result = AuthorizedSessionScopeStore::initialize(&root)
                     .and_then(|store| store.try_mark_intent_bootstrap_notified(&locator));
                 let notify = mark_result.as_ref().copied().unwrap_or(false);
@@ -1685,19 +1707,38 @@ fn resolve_task_operation(
                     additional_context: None,
                     system_message: notify.then(|| INTENT_BOOTSTRAP_REMINDER.to_owned()),
                 });
-            }
+            };
             let catalog = UserConfigStore::open_existing(&root)?.repository_catalog()?;
             let signals = normalized_tool_signals(
                 &catalog,
-                &cwd,
-                &workspace_roots,
                 &file_hints,
                 tool_category,
+                file_access,
                 outcome,
-            );
-            if !signals.is_empty() {
-                let _outcome = runtime.merge_signals_by_locator(&locator, signals)?;
+            )?;
+            let signals = unrecorded_signals(&active, signals);
+            if signals.is_empty() {
+                recorder.note_completion("signal_write_skipped_nothing_new", None);
+                return Ok(ResolvedTaskOperation::default());
             }
+            let merged = runtime.merge_hook_signals_by_locator(
+                &locator,
+                signals,
+                &file_signal_retention(),
+            )?;
+            if let Some(merged) = merged {
+                recorder.note_completion(
+                    "file_signal_recorded",
+                    Some(truncate_hook_detail(&format!(
+                        "inserted={} retired={}",
+                        merged.inserted, merged.retired
+                    ))),
+                );
+            }
+            Ok(ResolvedTaskOperation::default())
+        }
+        TaskRuntimeOperation::RecordPromptSignal { locator, prompt } => {
+            record_prompt_signal(&locator, &prompt, recorder);
             Ok(ResolvedTaskOperation::default())
         }
         TaskRuntimeOperation::FinalizeCheckpointedEpisode { locator, trigger } => {
@@ -1819,14 +1860,141 @@ fn recover_one_pending_episode_build(
     Ok(())
 }
 
+/// Maximum Active Prompt Signals one Task retains.
+///
+/// A Prompt Signal is an unreviewed clue, and a long Session submits many. Eight keeps the
+/// recent shape of what the user asked for without letting one Task's association tokens
+/// drift into a transcript.
+const MAX_ACTIVE_PROMPT_SIGNALS: usize = 8;
+
+/// Maximum Active file Signals (`Diff` plus `Workspace`) one Task retains.
+const MAX_ACTIVE_FILE_SIGNALS: usize = 16;
+
+/// Character ceiling for one stored Prompt Signal, applied after redaction.
+const MAX_PROMPT_SIGNAL_CHARS: usize = 512;
+
+fn prompt_signal_retention() -> Vec<SignalRetentionRule> {
+    vec![SignalRetentionRule {
+        kinds: vec![TaskSignalKind::Prompt],
+        max_active: MAX_ACTIVE_PROMPT_SIGNALS,
+    }]
+}
+
+/// `Diff` and `Workspace` share one budget: both describe files this Task touched, and a Task
+/// that reads twenty files and edits twenty more should not keep forty locating clues alive.
+fn file_signal_retention() -> Vec<SignalRetentionRule> {
+    vec![SignalRetentionRule {
+        kinds: vec![TaskSignalKind::Diff, TaskSignalKind::Workspace],
+        max_active: MAX_ACTIVE_FILE_SIGNALS,
+    }]
+}
+
+/// Records one Prompt Signal against an already existing `ActiveTask`.
+///
+/// Three properties are load-bearing and are why this never returns an error to the caller:
+///
+/// * It never creates anything. No `ActiveTask` means no Signal, no Task, no Intent revision,
+///   and no change to the Intent bootstrap reminder — a Prompt is a clue about a Task the Agent
+///   already declared, never a reason to invent one.
+/// * It never stores text it did not scan. The Prompt is redacted first and truncated second, so
+///   a secret cannot survive by sitting past the character ceiling; a Prompt too large for the
+///   scanner is dropped rather than stored unscanned.
+/// * It is invisible to the model. Both vendors encode `PromptSubmit` as an empty object, and a
+///   failure here must not change that, so every fault is recorded to `hook_event` and swallowed
+///   instead of becoming a `systemMessage`.
+fn record_prompt_signal(
+    locator: &ExternalSessionLocator,
+    prompt: &str,
+    recorder: &HookEventRecorder,
+) {
+    let outcome = || -> Result<Option<usize>> {
+        let root = installation_root()?;
+        // No Task Runtime database means no `ActiveTask` can exist yet, so there is nothing to
+        // attach a clue to. Checking that before opening keeps a Prompt from being the event
+        // that first creates `runtime.sqlite`: activation alone must never fabricate Task state,
+        // and the common case — a Session whose user has not called `task_intent_update` yet —
+        // then costs one `stat` instead of a database open on the Hook hot path.
+        if !root.join("state").join("runtime.sqlite").is_file() {
+            return Ok(None);
+        }
+        let Some(content) = redacted_prompt_signal_content(prompt)? else {
+            return Ok(None);
+        };
+        let runtime = TaskRuntime::initialize_for_hook(&root)?;
+        let Some(active) = runtime.read_snapshot_by_locator(locator)? else {
+            return Ok(None);
+        };
+        let signals = unrecorded_signals(
+            &active,
+            vec![TaskSignal {
+                kind: TaskSignalKind::Prompt,
+                content,
+            }],
+        );
+        if signals.is_empty() {
+            return Ok(Some(0));
+        }
+        let merged =
+            runtime.merge_hook_signals_by_locator(locator, signals, &prompt_signal_retention())?;
+        Ok(merged.map(|merged| merged.retired))
+    }();
+    match outcome {
+        Ok(Some(retired)) => recorder.note_completion(
+            "prompt_signal_recorded",
+            Some(truncate_hook_detail(&format!("retired={retired}"))),
+        ),
+        Ok(None) => recorder.note_completion("prompt_signal_skipped_no_task", None),
+        Err(error) => recorder.flush(
+            HookEventDecision::FailOpen,
+            "signal_write_failed",
+            Some(truncate_hook_detail(error.message())),
+        ),
+    }
+}
+
+/// Drops Signals this Task already carries as Active, so an unchanged observation never opens a
+/// write transaction.
+///
+/// The merge itself is already idempotent, but idempotence inside a transaction still costs the
+/// write lock, and a Session that reads the same file in a loop would serialize every Hook
+/// process behind one. The snapshot this filters against was read on the way in, so the check is
+/// free; a concurrent insert that races it is still deduplicated inside the transaction.
+fn unrecorded_signals(active: &TaskSessionSnapshot, signals: Vec<TaskSignal>) -> Vec<TaskSignal> {
+    signals
+        .into_iter()
+        .filter(|signal| !active.task_signals.contains(signal))
+        .collect()
+}
+
+/// Redacts, then truncates, one Prompt into storable Signal content.
+///
+/// `None` means there is nothing safe and non-empty left to store. An oversized Prompt the
+/// scanner refuses is an error, not a `None`: the caller must not silently treat unscanned text
+/// as clean.
+fn redacted_prompt_signal_content(prompt: &str) -> Result<Option<String>> {
+    let redacted = PrivacyScanner::default().redact(prompt)?;
+    let content = redacted
+        .text
+        .chars()
+        .take(MAX_PROMPT_SIGNAL_CHARS)
+        .collect::<String>();
+    let content = content.trim().to_owned();
+    Ok((!content.is_empty()).then_some(content))
+}
+
+/// Derives this event's Signals from the structured, already attributed observation.
+///
+/// Every path here has already been resolved against the Catalog by
+/// [`attribute_post_tool_action`], so a file Signal names a registered Repository and a path
+/// relative to its checkout — never an absolute path from the user's machine. No raw command,
+/// tool input value, or tool output participates.
 fn normalized_tool_signals(
-    _catalog: &RepositoryCatalogSnapshot,
-    _cwd: &Path,
-    _workspace_roots: &[PathBuf],
-    _file_hints: &[PathBuf],
+    catalog: &RepositoryCatalogSnapshot,
+    file_hints: &[PathBuf],
     tool_category: ToolCategory,
+    file_access: Option<FileAccess>,
     outcome: ToolOutcome,
-) -> Vec<TaskSignal> {
+) -> Result<Vec<TaskSignal>> {
     let mut signals = Vec::new();
     if tool_category == ToolCategory::TestRunner {
         let test_outcome = format!(
@@ -1838,7 +2006,37 @@ fn normalized_tool_signals(
         );
         push_signal(&mut signals, TaskSignalKind::TestOutcome, &test_outcome);
     }
-    signals
+    // A file the Agent rewrote states far more about this Task than a file it read, so the two
+    // become different kinds. Retrieval consumes `Diff` today and `Workspace` is carried for the
+    // locating channel that will consume it; both stay clues, never Evidence.
+    let kind = match file_access {
+        Some(FileAccess::Modify) => TaskSignalKind::Diff,
+        Some(FileAccess::Read) => TaskSignalKind::Workspace,
+        None => return Ok(signals),
+    };
+    for file in file_hints {
+        if let Some(content) = repository_relative_signal_content(catalog, file)? {
+            push_signal(&mut signals, kind, &content);
+        }
+    }
+    Ok(signals)
+}
+
+/// Renders one attributed file as `<RepositoryId>:<checkout-relative path>`.
+fn repository_relative_signal_content(
+    catalog: &RepositoryCatalogSnapshot,
+    file: &Path,
+) -> Result<Option<String>> {
+    let Some((repository_id, checkout_path)) = catalog.deepest_checkout_for(file)? else {
+        return Ok(None);
+    };
+    let Ok(relative) = file.strip_prefix(&checkout_path) else {
+        return Ok(None);
+    };
+    Ok(relative
+        .to_str()
+        .filter(|relative| !relative.is_empty())
+        .map(|relative| format!("{repository_id}:{relative}")))
 }
 
 fn push_signal(signals: &mut Vec<TaskSignal>, kind: TaskSignalKind, content: &str) {

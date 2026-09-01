@@ -76,6 +76,33 @@ pub struct MergeSignalsOutcome {
     pub inserted_signal_ids: Vec<SignalId>,
 }
 
+/// Result of one automatic Hook-path Signal merge.
+///
+/// Counts only, deliberately: reading a full [`TaskSessionSnapshot`] means reading every Signal
+/// and the current Intent revision, and doing that inside the write transaction would hold the
+/// Runtime write lock for work no Hook caller uses.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HookSignalMergeOutcome {
+    pub inserted: usize,
+    /// How many Signals this merge superseded to stay inside a [`SignalRetentionRule`] bound.
+    pub retired: usize,
+}
+
+/// A bound on how many Active Signals of one group of kinds a Task may keep.
+///
+/// Retention is a caller-supplied policy, not a storage invariant: only the automatic
+/// Hook path, which appends Signals no human reviewed, asks for it. Explicit MCP merges
+/// keep every Signal they insert. Trimming supersedes the oldest Signals by
+/// `signal_ordinal` and never deletes a row, so Signal history stays complete and stable
+/// `SignalId`s remain resolvable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignalRetentionRule {
+    /// The kinds whose Active rows share one budget.
+    pub kinds: Vec<TaskSignalKind>,
+    /// Maximum Active Signals retained across `kinds`.
+    pub max_active: usize,
+}
+
 /// Result of explicitly creating and activating a new Task.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartNewTaskOutcome {
@@ -1175,20 +1202,58 @@ impl TaskRuntime {
         let signals = normalize_signals(signals)?;
         let mut connection = self.open_connection()?;
         let transaction = immediate(&mut connection, "begin locator Signal merge transaction")?;
-        let Some(task_session_id) = find_active_task_by_locator(&transaction, locator)? else {
+        let Some((task_session_id, task_id)) = locate_active_task(&transaction, locator)? else {
             transaction
                 .commit()
                 .map_err(sql_error("commit missing locator transaction"))?;
             return Ok(None);
         };
-        let (task_id, _) = read_active_task_head(&transaction, task_session_id)?
-            .ok_or_else(|| invariant("located ActiveTask is not active"))?;
         let outcome =
             merge_signals_in_transaction(&transaction, task_session_id, task_id, &signals)?;
         transaction
             .commit()
             .map_err(sql_error("commit locator Signal merge transaction"))?;
         Ok(Some(outcome))
+    }
+
+    /// Merges Signals into one `ExternalSession`'s `ActiveTask` and trims the result to
+    /// the supplied per-kind-group Active budgets, in one write transaction.
+    ///
+    /// This is the automatic Hook path's entry point: it appends Signals nobody reviewed,
+    /// so an unbounded Task would accumulate them for the whole life of a Session. Trimming
+    /// supersedes the oldest Active Signals of the affected kinds instead of deleting them,
+    /// which is exactly what an explicit `task_signal_supersede` does. A missing locator
+    /// returns `None` and never creates a Task.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed input or storage errors.
+    pub fn merge_hook_signals_by_locator(
+        &self,
+        locator: &ExternalSessionLocator,
+        signals: Vec<TaskSignal>,
+        retention: &[SignalRetentionRule],
+    ) -> Result<Option<HookSignalMergeOutcome>> {
+        locator.validate()?;
+        let signals = normalize_signals(signals)?;
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Hook Signal merge transaction")?;
+        let Some((task_session_id, task_id)) = locate_active_task(&transaction, locator)? else {
+            transaction
+                .commit()
+                .map_err(sql_error("commit missing locator transaction"))?;
+            return Ok(None);
+        };
+        let inserted =
+            insert_signals_in_transaction(&transaction, task_session_id, task_id, &signals)?;
+        let retired = enforce_signal_retention(&transaction, task_session_id, retention)?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit Hook Signal merge transaction"))?;
+        Ok(Some(HookSignalMergeOutcome {
+            inserted: inserted.len(),
+            retired: retired.len(),
+        }))
     }
 
     /// Supersedes stable Signal IDs without deleting history.
@@ -4234,12 +4299,40 @@ fn insert_intent_revision(
     Ok(())
 }
 
+fn locate_active_task(
+    transaction: &Transaction<'_>,
+    locator: &ExternalSessionLocator,
+) -> Result<Option<(TaskSessionId, TaskId)>> {
+    let Some(task_session_id) = find_active_task_by_locator(transaction, locator)? else {
+        return Ok(None);
+    };
+    let (task_id, _) = read_active_task_head(transaction, task_session_id)?
+        .ok_or_else(|| invariant("located ActiveTask is not active"))?;
+    Ok(Some((task_session_id, task_id)))
+}
+
 fn merge_signals_in_transaction(
     transaction: &Transaction<'_>,
     task_session_id: TaskSessionId,
     task_id: TaskId,
     signals: &[TaskSignal],
 ) -> Result<MergeSignalsOutcome> {
+    let inserted_signal_ids =
+        insert_signals_in_transaction(transaction, task_session_id, task_id, signals)?;
+    let snapshot = require_snapshot(transaction, task_session_id)?;
+    Ok(MergeSignalsOutcome {
+        snapshot,
+        inserted: inserted_signal_ids.len(),
+        inserted_signal_ids,
+    })
+}
+
+fn insert_signals_in_transaction(
+    transaction: &Transaction<'_>,
+    task_session_id: TaskSessionId,
+    task_id: TaskId,
+    signals: &[TaskSignal],
+) -> Result<Vec<SignalId>> {
     let mut inserted_signal_ids = Vec::new();
     let mut next_ordinal = next_signal_ordinal(transaction, task_session_id)?;
     for signal in signals {
@@ -4268,12 +4361,69 @@ fn merge_signals_in_transaction(
             .checked_add(1)
             .ok_or_else(|| invariant("Task Signal ordinal overflow"))?;
     }
-    let snapshot = require_snapshot(transaction, task_session_id)?;
-    Ok(MergeSignalsOutcome {
-        snapshot,
-        inserted: inserted_signal_ids.len(),
-        inserted_signal_ids,
-    })
+    Ok(inserted_signal_ids)
+}
+
+/// Supersedes the oldest Active Signals of each rule's kinds until the rule's budget holds.
+///
+/// Ordering is by `signal_ordinal`, the same monotonic append order the merge above assigns,
+/// so "oldest" means "inserted first" and never depends on wall-clock time.
+fn enforce_signal_retention(
+    transaction: &Transaction<'_>,
+    task_session_id: TaskSessionId,
+    retention: &[SignalRetentionRule],
+) -> Result<Vec<SignalId>> {
+    let mut retired = Vec::new();
+    for rule in retention {
+        if rule.kinds.is_empty() {
+            continue;
+        }
+        let placeholders = (2..2 + rule.kinds.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut statement = transaction
+            .prepare(&format!(
+                "SELECT signal_id FROM task_signal
+                 WHERE task_session_id = ?1 AND lifecycle = 'active' AND kind IN ({placeholders})
+                 ORDER BY signal_ordinal ASC"
+            ))
+            .map_err(sql_error("prepare Signal retention scan"))?;
+        let mut parameters = vec![task_session_id.to_string()];
+        parameters.extend(
+            rule.kinds
+                .iter()
+                .map(|kind| signal_kind_name(*kind).to_owned()),
+        );
+        let active = statement
+            .query_map(rusqlite::params_from_iter(parameters), |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(sql_error("scan Active Signals for retention"))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sql_error("read Active Signals for retention"))?;
+        drop(statement);
+        let Some(excess) = active.len().checked_sub(rule.max_active) else {
+            continue;
+        };
+        for value in active.into_iter().take(excess) {
+            let signal_id: SignalId = parse_id(&value, "task_signal.signal_id")?;
+            let changed = transaction
+                .execute(
+                    "UPDATE task_signal SET lifecycle = 'superseded'
+                     WHERE signal_id = ?1 AND lifecycle = 'active'",
+                    [signal_id.to_string()],
+                )
+                .map_err(sql_error("supersede retained Task Signal"))?;
+            if changed != 1 {
+                return Err(invariant(
+                    "Signal lifecycle changed inside write transaction",
+                ));
+            }
+            retired.push(signal_id);
+        }
+    }
+    Ok(retired)
 }
 
 fn find_open_episode(

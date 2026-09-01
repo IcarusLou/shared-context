@@ -56,6 +56,10 @@ pub enum CanonicalAgentEvent {
         tool_category: ToolCategory,
         tool_use_id: String,
         path_hints: Vec<PathHint>,
+        /// Whether a file-operation tool read or modified its paths. `None` for every tool
+        /// whose category is not [`ToolCategory::FileOperation`].
+        #[serde(default)]
+        file_access: Option<FileAccess>,
         /// Only a structured success/failure marker is retained. This is never raw tool output.
         outcome: ToolOutcome,
     },
@@ -106,6 +110,19 @@ pub enum ToolOutcome {
     Failed,
 }
 
+/// How one file-operation tool touched the paths it declared.
+///
+/// [`ToolCategory`] deliberately collapses every file tool into one category, because policy
+/// treats them identically. Association does not: a file the Agent rewrote is a much stronger
+/// statement about what this Task is doing than a file it merely read. This is derived from the
+/// structured tool name only — never from command text, tool input values, or tool output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileAccess {
+    Read,
+    Modify,
+}
+
 /// Vendor-neutral meaning of one completed tool call.
 ///
 /// The category is derived only from the structured tool name and, for a bounded set of shell
@@ -125,6 +142,8 @@ pub enum ToolCategory {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NormalizedToolUse {
     pub category: ToolCategory,
+    /// `Some` only for [`ToolCategory::FileOperation`].
+    pub file_access: Option<FileAccess>,
     pub path_hints: Vec<PathHint>,
 }
 
@@ -511,7 +530,19 @@ pub enum TaskRuntimeOperation {
         workspace_roots: Vec<PathBuf>,
         file_hints: Vec<PathBuf>,
         tool_category: ToolCategory,
+        #[serde(default)]
+        file_access: Option<FileAccess>,
         outcome: ToolOutcome,
+    },
+    /// Records one Prompt Signal against an already existing `ActiveTask`.
+    ///
+    /// The Prompt is a clue, never a fact: it can only join an `ActiveTask` the Agent already
+    /// established through `task_intent_update`, and it never creates a Task, an Intent
+    /// revision, or an Episode. The text is carried verbatim across this seam and is
+    /// redacted and truncated by the executing layer immediately before it is stored.
+    RecordPromptSignal {
+        locator: ExternalSessionLocator,
+        prompt: String,
     },
     FinalizeCheckpointedEpisode {
         locator: ExternalSessionLocator,
@@ -595,10 +626,22 @@ fn plan_enabled_action(
             )),
             system_message: None,
         },
-        CanonicalAgentEvent::PromptSubmit { .. } => CanonicalAgentAction::neutral(),
+        // A Prompt is the one lifecycle event that states, in the user's own words, what this
+        // Task is about. It stays entirely model-invisible: the plan records a local clue and
+        // adds no `additional_context` and no `system_message`, so both vendors keep emitting
+        // an empty object for this event.
+        CanonicalAgentEvent::PromptSubmit { context, prompt } => CanonicalAgentAction {
+            task_operation: Some(TaskRuntimeOperation::RecordPromptSignal {
+                locator: task_locator(capabilities.agent, context),
+                prompt: prompt.clone(),
+            }),
+            additional_context: None,
+            system_message: None,
+        },
         CanonicalAgentEvent::PostToolUse {
             context,
             tool_category,
+            file_access,
             outcome,
             path_hints,
             ..
@@ -620,6 +663,7 @@ fn plan_enabled_action(
                     workspace_roots: context.workspace_roots.clone(),
                     file_hints,
                     tool_category: *tool_category,
+                    file_access: *file_access,
                     outcome: *outcome,
                 }),
                 additional_context: None,
@@ -787,6 +831,7 @@ pub fn normalize_tool_use(tool_name: &str, input: &Value) -> NormalizedToolUse {
     if is_shared_context_tool(&normalized_name) {
         return NormalizedToolUse {
             category: ToolCategory::SharedContext,
+            file_access: None,
             path_hints: Vec::new(),
         };
     }
@@ -801,17 +846,20 @@ pub fn normalize_tool_use(tool_name: &str, input: &Value) -> NormalizedToolUse {
             } else {
                 ToolCategory::Shell
             },
+            file_access: None,
             path_hints: working_directory_hints_from_tool_input(input),
         };
     }
+    let file_access = file_access_for_tool(&normalized_name);
     NormalizedToolUse {
-        category: if is_file_operation_tool(&normalized_name) {
+        category: if file_access.is_some() {
             ToolCategory::FileOperation
         } else if is_dedicated_test_tool(&normalized_name) {
             ToolCategory::TestRunner
         } else {
             ToolCategory::Other
         },
+        file_access,
         path_hints: path_hints_from_tool_input(input),
     }
 }
@@ -828,22 +876,15 @@ fn is_shell_tool(name: &str) -> bool {
     )
 }
 
-fn is_file_operation_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "apply_patch"
-            | "delete"
-            | "delete_file"
-            | "edit"
-            | "edit_file"
-            | "multiedit"
-            | "read"
-            | "read_file"
-            | "str_replace"
-            | "view_image"
-            | "write"
-            | "write_file"
-    )
+/// Classifies the bounded file-tool whitelist, which also defines
+/// [`ToolCategory::FileOperation`]. Any name outside it is not a file operation.
+fn file_access_for_tool(name: &str) -> Option<FileAccess> {
+    match name {
+        "apply_patch" | "delete" | "delete_file" | "edit" | "edit_file" | "multiedit"
+        | "str_replace" | "write" | "write_file" => Some(FileAccess::Modify),
+        "read" | "read_file" | "view_image" => Some(FileAccess::Read),
+        _ => None,
+    }
 }
 
 fn is_dedicated_test_tool(name: &str) -> bool {
@@ -1144,6 +1185,7 @@ mod tests {
             tool_category: ToolCategory::SharedContext,
             tool_use_id: "tool-1".to_owned(),
             path_hints: Vec::new(),
+            file_access: None,
             outcome: ToolOutcome::Succeeded,
         };
         assert_eq!(
@@ -1319,7 +1361,13 @@ mod tests {
         assert!(start_action.system_message.is_none());
 
         let prompt_action = plan(1);
-        assert_eq!(prompt_action, CanonicalAgentAction::neutral());
+        assert!(matches!(
+            prompt_action.task_operation,
+            Some(TaskRuntimeOperation::RecordPromptSignal { ref prompt, .. })
+                if prompt == "implement private task"
+        ));
+        assert!(prompt_action.additional_context.is_none());
+        assert!(prompt_action.system_message.is_none());
         assert!(!format!("{prompt_action:?}").contains(&marker));
 
         let post_action = plan(2);
@@ -1415,6 +1463,7 @@ mod tests {
                 tool_category: ToolCategory::TestRunner,
                 tool_use_id: "tool-1".to_owned(),
                 path_hints: vec![PathHint::File(PathBuf::from("src/lib.rs"))],
+                file_access: None,
                 outcome: ToolOutcome::Succeeded,
             },
             CanonicalAgentEvent::PreCompact {

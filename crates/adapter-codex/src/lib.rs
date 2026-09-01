@@ -184,6 +184,7 @@ pub fn decode_hook_input(bytes: &[u8]) -> Result<CanonicalAgentEvent> {
                 tool_category: normalized.category,
                 tool_use_id: input.tool_use_id,
                 path_hints: normalized.path_hints,
+                file_access: normalized.file_access,
                 outcome,
             })
         }
