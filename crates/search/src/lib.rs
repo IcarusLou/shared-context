@@ -1657,13 +1657,16 @@ const AUTOMATIC_IDENTIFIER_TOKEN_COVERAGE_WEIGHT: usize = 3;
 /// `manager`) is vocabulary that happens to occur inside some identifier; two words of the same
 /// `identifier_split` group are the query naming that identifier.
 const AUTOMATIC_MIN_IDENTIFIER_QUERY_TOKENS: usize = 2;
-/// Smallest corpus that lets observed document frequency stand in for the built-in stop-word
-/// table. Below it the table is the only available fallback; at or above it the corpus decides,
-/// so real domain vocabulary such as `search` stays eligible.
+/// Smallest corpus that lets observed document frequency decide which query tokens are generic.
+///
+/// Below it the built-in stop-word table is the only available fallback and frequency merely
+/// orders the tokens; at or above it the corpus decides, so real domain vocabulary such as
+/// `search` stays eligible and a word this corpus really does put in half its documents may be
+/// dropped. One threshold governs both halves of that handover. Two of them left a band --
+/// five to nineteen documents -- in which neither the table nor the observed frequency applied,
+/// so a small repository ran with no generic-word filter at all, which is exactly the size at
+/// which every question shares its filler words with every Context.
 const AUTOMATIC_HIGH_DF_MIN_DOCUMENTS: usize = 5;
-/// Smallest corpus in which a high document frequency is evidence of a generic word rather than
-/// of a small fixture. Below it document frequency only orders tokens and never drops one.
-const AUTOMATIC_HIGH_DF_DROP_MIN_DOCUMENTS: usize = 20;
 const AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS: usize = 5_000;
 /// Number of rarest tokens that are never dropped for being merely frequent. It keeps a
 /// single-token or short intent intact, because dropping its only discriminating word retrieves
@@ -1791,7 +1794,7 @@ impl AutomaticTextGate {
 fn explicit_token_selection(tokens: &[String]) -> AutomaticTokenSelection {
     let mut explanation = AutomaticQueryTokenExplanation {
         document_count: 0,
-        high_document_frequency_min_documents: AUTOMATIC_HIGH_DF_DROP_MIN_DOCUMENTS,
+        high_document_frequency_min_documents: AUTOMATIC_HIGH_DF_MIN_DOCUMENTS,
         high_document_frequency_threshold_basis_points: AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS,
         stop_word_fallback_active: false,
         selected_tokens: tokens.to_vec(),
@@ -1871,7 +1874,7 @@ fn automatic_eligible_query_tokens(
             .then_with(|| left.1.cmp(&right.1))
     });
 
-    if document_count >= AUTOMATIC_HIGH_DF_DROP_MIN_DOCUMENTS {
+    if document_count >= AUTOMATIC_HIGH_DF_MIN_DOCUMENTS {
         ranked = drop_high_document_frequency_tokens(ranked, document_count, &mut dropped);
     }
 
@@ -1904,7 +1907,7 @@ fn automatic_eligible_query_tokens(
     dropped.sort_by(|left, right| left.token.cmp(&right.token));
     let mut explanation = AutomaticQueryTokenExplanation {
         document_count,
-        high_document_frequency_min_documents: AUTOMATIC_HIGH_DF_DROP_MIN_DOCUMENTS,
+        high_document_frequency_min_documents: AUTOMATIC_HIGH_DF_MIN_DOCUMENTS,
         high_document_frequency_threshold_basis_points: AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS,
         stop_word_fallback_active,
         selected_tokens: eligible.clone(),
