@@ -658,6 +658,60 @@ fn workspace_and_repository_locations_never_add_space_priors() {
     assert!(response.associations.is_empty());
 }
 
+/// The Hook renders a rewritten file and an opened file in one and the same shape, so the two
+/// have to be read in one and the same way. A `Diff` used to be tokenized whole, which put the
+/// Repository identifier — a coordinate, not a word anyone asked a question in — into the query
+/// beside the file stems, and let a Repository whose name happens to collide with a Space's
+/// vocabulary pull that Space in on its name alone.
+#[test]
+fn a_diff_signal_asks_about_its_path_and_never_about_its_repository_identifier() {
+    let fixture = fixture();
+    let engine = SearchEngine::new(fixture.index);
+    let unrelated = task("unrelatedtaskneedle");
+    let associations = |signal: TaskSignal| {
+        engine
+            .task_space_associations(TaskId::new(), &unrelated, &[signal])
+            .unwrap()
+            .associations
+            .iter()
+            .map(|association| association.space_id)
+            .collect::<Vec<_>>()
+    };
+
+    // The Repository is named `pageintentneedle`, which is the PageRequirement Space's own Intent
+    // vocabulary, and the path names nothing that Space holds. Reading the content whole retrieved
+    // that Space; reading the path alone retrieves nothing.
+    assert!(
+        associations(TaskSignal {
+            kind: TaskSignalKind::Diff,
+            content: "pageintentneedle:vendor/third_party/unrelatedvendorfile.txt".to_owned(),
+        })
+        .is_empty()
+    );
+
+    // The same content under either kind asks the same question.
+    let attributed = "product-catalog:src/pages/SearchResultsPage.tsx".to_owned();
+    assert_eq!(
+        associations(TaskSignal {
+            kind: TaskSignalKind::Diff,
+            content: attributed.clone(),
+        }),
+        associations(TaskSignal {
+            kind: TaskSignalKind::Workspace,
+            content: attributed,
+        })
+    );
+
+    // A `Diff` that is not in the Hook's shape came from an Agent naming what changed in its own
+    // words, and is still read whole: only `Workspace` treats an unattributed content as a bare
+    // location that asks nothing.
+    assert!(!associations(TaskSignal {
+        kind: TaskSignalKind::Diff,
+        content: "SearchV2Endpoint".to_owned(),
+    })
+    .is_empty());
+}
+
 #[test]
 fn a_workspace_signal_that_names_a_file_retrieves_like_the_diff_that_names_one() {
     let fixture = fixture();
