@@ -24,18 +24,19 @@ use sctx_domain::{
     CandidateAnalysisStatus, CandidateAssessmentRelation, CandidateBuilderProvenance,
     CandidateConfidence, CandidateConfirmationOperation, CandidateConfirmationPlan,
     CandidateConfirmationPrimaryReference, CandidateId, CandidatePrimarySelection,
-    CandidateRelationAssessment, CandidateReviewDiagnostic, CandidateReviewStatus,
-    CandidateReviewSummary, CandidateReviewView, CandidateSpaceRecommendation,
-    CandidateSpaceRecommendationPath, CheckpointClaim, CheckpointClaimId, CheckpointEvidenceRef,
-    CheckpointUnknown, ConflictParticipant, ContextGovernanceStatus, ContextId, ContextKind,
-    ContextRelation, ContextRelationKind, ContextRevisionDraft, EngineeringReferenceDraft, Error,
-    ErrorKind, EventId, EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator,
-    IntentSnapshot, NormalizedWorkObservation, OptionalCandidateEdits, ProblemViewEdit,
-    ProposedSpaceGroupKey, REPOSITORY_ID_MAX_BYTES, REPOSITORY_ID_PATTERN, RecommendedSpaceRole,
-    ReferenceId, ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionStatus,
-    ResolvedFocus, Result, RevisionId, SemanticConflictOpeningDraft, SemanticConflictStatus,
-    SignalId, SpaceId, SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId,
-    TaskSessionId, TaskSessionSnapshot, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord,
+    CandidateRelationAssessment, CandidateReviewDiagnostic, CandidateReviewScope,
+    CandidateReviewStatus, CandidateReviewSummary, CandidateReviewView,
+    CandidateSpaceRecommendation, CandidateSpaceRecommendationPath, CheckpointClaim,
+    CheckpointClaimId, CheckpointEvidenceRef, CheckpointUnknown, ConflictParticipant,
+    ContextGovernanceStatus, ContextId, ContextKind, ContextRelation, ContextRelationKind,
+    ContextRevisionDraft, EngineeringReferenceDraft, Error, ErrorKind, EventId,
+    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot,
+    NormalizedWorkObservation, OptionalCandidateEdits, ProblemViewEdit, ProposedSpaceGroupKey,
+    REPOSITORY_ID_MAX_BYTES, REPOSITORY_ID_PATTERN, RecommendedSpaceRole, ReferenceId,
+    ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionStatus, ResolvedFocus, Result,
+    RevisionId, SemanticConflictOpeningDraft, SemanticConflictStatus, SignalId, SpaceId,
+    SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId,
+    TaskSessionSnapshot, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord,
     TaskSpaceAssociation, WorkEpisodeId, WorkEpisodeRef, WorkEpisodeStatus, WorkObservation,
     WorkObservationId, WorkingIntentSnapshot, context_revision_as_draft,
     context_revision_content_hash,
@@ -342,6 +343,10 @@ pub struct CandidateListInput {
     pub external_session_id: String,
     #[serde(default = "default_candidate_review_status")]
     pub status: CandidateReviewStatus,
+    /// How wide the listing reaches. Defaults to the caller's own Task, which is the only scope
+    /// that ever existed; `session` widens it to a read-only view of every Task in the Session.
+    #[serde(default)]
+    pub scope: CandidateReviewScope,
     #[serde(default = "default_candidate_review_list_limit")]
     pub limit: usize,
     #[serde(default)]
@@ -605,6 +610,10 @@ pub enum CompactSpaceRecommendation {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CompactCandidateReview {
     pub candidate_id: sctx_domain::CandidateId,
+    /// The Task that produced this Candidate, present only when the listing reached past the
+    /// caller's own Task. Within one Task it would repeat the Task the caller already named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_task_id: Option<TaskId>,
     pub kind: ContextKind,
     pub statement: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -655,6 +664,7 @@ const fn is_cjk(character: char) -> bool {
 /// Projects one whole Review onto its compact triage row.
 fn compact_candidate_review(
     review: &CandidateReviewView,
+    source_task_id: Option<TaskId>,
     provisional_space_ids: &BTreeSet<SpaceId>,
 ) -> CompactCandidateReview {
     let top_assessment = review
@@ -712,6 +722,7 @@ fn compact_candidate_review(
     });
     CompactCandidateReview {
         candidate_id: review.candidate_id,
+        source_task_id,
         kind: review.content.kind,
         statement: review.content.statement.clone(),
         top_assessment,
@@ -1192,6 +1203,10 @@ pub struct TaskContextResponse {
     pub token_budget: usize,
     pub estimated_tokens: usize,
     pub omitted: Vec<ContextPackOmitted>,
+    /// Carried for the compact projection only; the explainable shape has never reported it and
+    /// gains no field here.
+    #[serde(skip)]
+    pub pending_candidates_in_other_tasks: Option<u32>,
 }
 
 impl TaskContextResponse {
@@ -1216,6 +1231,7 @@ impl TaskContextResponse {
             token_budget: self.token_budget,
             estimated_tokens: self.estimated_tokens,
             omitted: self.omitted.clone(),
+            pending_candidates_in_other_tasks: self.pending_candidates_in_other_tasks,
         }
     }
 }
@@ -1242,6 +1258,12 @@ pub struct CompactTaskContextResponse {
     pub token_budget: usize,
     pub estimated_tokens: usize,
     pub omitted: Vec<ContextPackOmitted>,
+    /// How many Pending Candidates the other Tasks of this Session are holding, when there are
+    /// any. It is a count and never the content: a sibling Task's Candidate is untrusted
+    /// Agent-authored text this Task never asked for, so nothing of it enters this Pack. Reading
+    /// them is `candidate_list` with `scope: "session"`, which stays an explicit, separate call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_candidates_in_other_tasks: Option<u32>,
 }
 
 /// Compact form of [`TaskIntentUpdateResponse`].
@@ -2804,8 +2826,9 @@ impl Runtime {
         }
         let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
         let recovery = self.recover_candidate_builds(&locator)?;
-        let page = self.tasks.list_candidate_reviews(
+        let page = self.tasks.list_candidate_reviews_in_scope(
             &locator,
+            input.scope,
             input.status,
             input.limit,
             input.cursor.as_deref(),
@@ -2832,7 +2855,12 @@ impl Runtime {
             }
             let summary =
                 CandidateReviewSummary::from(self.candidate_review_view(&record, &snapshot)?);
-            let compact = compact_candidate_review(&summary.0, &provisional_space_ids);
+            // Only a Session-scoped page names each row's Task: inside one Task the answer is the
+            // Task the caller itself passed, and repeating it would spend Pack budget on nothing.
+            let source_task_id = (input.scope == CandidateReviewScope::Session)
+                .then_some(record.source_episode.task_id);
+            let compact =
+                compact_candidate_review(&summary.0, source_task_id, &provisional_space_ids);
             let tokens = match detail_level {
                 ContextPackDetailLevel::Full => estimate_candidate_review_tokens(&summary)?,
                 ContextPackDetailLevel::Compact => estimate_candidate_review_tokens(&compact)?,
@@ -3279,6 +3307,32 @@ impl Runtime {
         let edits = &edits;
         let final_draft = edits.apply(&persisted.content)?;
         validate_context_relation_targets(snapshot, &final_draft.relations)?;
+        // A Candidate whose strongest assessment restates a Context the knowledge base already
+        // accepted stays confirmable — only a human confirmation ever produces an accepted fact,
+        // and that does not change here. What it may no longer do is land as a fresh, unrelated
+        // fact: confirming restatements that way is what left five of this repository's own nine
+        // accepted Contexts saying the same thing two or three times over. The confirmation now
+        // has to carry the decision the reviewer made — this revision replaces the Context it
+        // repeats, or it disagrees with it — and discarding the Candidate remains the third way
+        // out. An already Confirmed Review is exempt: that call is a replay finishing a
+        // confirmation Git already wrote, it admits no new fact, and refusing it would strand the
+        // Review as Pending forever behind a decision the reviewer already made.
+        if review_record.status == CandidateReviewStatus::Pending
+            && let Some(duplicate) = accepted_duplicate_target(snapshot, &review.analysis)
+            && !final_draft.relations.iter().any(|relation| {
+                relation.target_context_id == duplicate
+                    && matches!(
+                        relation.kind,
+                        ContextRelationKind::Supersedes | ContextRelationKind::Contradicts
+                    )
+            })
+        {
+            return Err(invalid(format!(
+                "{EXACT_DUPLICATE_REQUIRES_DECISION} {duplicate}. Confirm again with an \
+                 edits.relations entry of kind supersedes or contradicts whose target_context_id \
+                 is {duplicate}, or discard this Candidate through candidate_discard"
+            )));
+        }
         let final_json = serde_json::to_string(&final_draft).map_err(|error| {
             Error::new(ErrorKind::Io, format!("serialize final draft: {error}"))
         })?;
@@ -5232,6 +5286,50 @@ fn parse_batch_candidate_ids(values: &[String]) -> Result<Vec<sctx_domain::Candi
 }
 
 /// Reports the exact batch member that failed before anything was written.
+/// Opening of the one `candidate_confirm` refusal that asks for a decision rather than a repair.
+///
+/// It is matched as a prefix to give the refusal its own error code: `candidate_review_invalid`
+/// would tell a client to fix its arguments, when nothing about the arguments is malformed and
+/// what is missing is a human choice between superseding the Context this Candidate repeats and
+/// discarding the restatement.
+const EXACT_DUPLICATE_REQUIRES_DECISION: &str =
+    "This Candidate restates the accepted Context it was assessed against,";
+
+/// The Context an `exact_duplicate` top assessment points at, when it is still accepted.
+///
+/// Only the strongest assessment is read, selected exactly as `compact_candidate_review` selects
+/// the `top_assessment` a reviewer was shown, so the refusal is never about a relation the
+/// reviewer never saw. A duplicate found further down is a weaker relation among several, and a
+/// target whose revision is no longer accepted is no longer a fact this Candidate could repeat.
+fn accepted_duplicate_target(
+    snapshot: &DomainSnapshot,
+    analysis: &CandidateAnalysis,
+) -> Option<ContextId> {
+    let assessment = analysis
+        .assessments
+        .iter()
+        .max_by_key(|assessment| assessment.confidence.basis_points)?;
+    if assessment.relation != CandidateAssessmentRelation::ExactDuplicate {
+        return None;
+    }
+    let target = assessment.target?;
+    snapshot
+        .projection
+        .spaces
+        .values()
+        .flat_map(|space| space.contexts.values())
+        .find(|context| context.context_id == target.context_id)
+        .filter(|context| {
+            context
+                .revisions
+                .get(&target.revision_id)
+                .is_some_and(|revision| {
+                    revision.lifecycle == sctx_domain::RevisionLifecycle::Accepted
+                })
+        })
+        .map(|context| context.context_id)
+}
+
 fn batch_preparation_error(
     position: usize,
     candidate_id: sctx_domain::CandidateId,
@@ -5713,6 +5811,20 @@ fn build_task_context_response(
         token_budget: pack.token_budget,
         estimated_tokens: pack.estimated_tokens,
         omitted: pack.omitted,
+        // Only the compact shape reports it, so only the compact shape pays the count. A failure
+        // to count is not a failure to retrieve: the Pack is still the Pack, and the reminder is
+        // simply absent.
+        pending_candidates_in_other_tasks: (detail_level == ContextPackDetailLevel::Compact)
+            .then(|| {
+                tasks
+                    .count_pending_candidates_in_other_tasks(
+                        snapshot.task_session_id,
+                        snapshot.task_id,
+                    )
+                    .ok()
+                    .filter(|count| *count > 0)
+            })
+            .flatten(),
     };
     record_injected_contexts(tasks, &response, injection_source);
     Ok(response)
@@ -6480,6 +6592,13 @@ impl ToolFailure {
 
     fn candidate_review_failed(error: Error) -> Self {
         let code = match error.kind() {
+            ErrorKind::InvalidInput
+                if error
+                    .message()
+                    .starts_with(EXACT_DUPLICATE_REQUIRES_DECISION) =>
+            {
+                "exact_duplicate_requires_decision"
+            }
             ErrorKind::InvalidInput => "candidate_review_invalid",
             ErrorKind::InvariantViolation => "candidate_review_invariant",
             ErrorKind::Io => "candidate_review_storage_failed",
@@ -7631,6 +7750,12 @@ fn candidate_list_schema() -> Value {
                 "type": "string",
                 "enum": ["pending", "discarded", "expired", "confirmed"],
                 "default": "pending"
+            },
+            "scope": {
+                "type": "string",
+                "enum": ["task", "session"],
+                "default": "task",
+                "description": "task lists only this Task's Candidates; session additionally lists, read-only, the Candidates of every other Task in this Session and names each row's source_task_id."
             },
             "limit": {
                 "type": "integer", "minimum": 1,

@@ -1712,35 +1712,44 @@ struct StoredIntentFtsMatch {
 
 /// The text every Task Signal contributes to one retrieval query.
 ///
-/// A `Prompt` is what the Agent was asked and a `Diff` names a file it rewrote; both are read
-/// whole. A `TestOutcome` is `test runner succeeded` or `test runner failed`, which describes no
-/// subject and would only add noise. A `Workspace` signal is read through
-/// [`workspace_signal_query_text`].
+/// A `Prompt` is what the Agent was asked and is read whole. A `TestOutcome` is `test runner
+/// succeeded` or `test runner failed`, which describes no subject and would only add noise. A
+/// `Diff` and a `Workspace` signal are both read through [`signal_query_text`].
 fn signal_query_texts(signals: &[TaskSignal]) -> Vec<String> {
-    signals
-        .iter()
-        .filter_map(|signal| match signal.kind {
-            TaskSignalKind::Prompt | TaskSignalKind::Diff => Some(signal.content.clone()),
-            TaskSignalKind::Workspace => workspace_signal_query_text(&signal.content),
-            TaskSignalKind::TestOutcome => None,
-        })
-        .collect()
+    signals.iter().filter_map(signal_query_text).collect()
 }
 
-/// The words one `Workspace` signal contributes, or `None` when it names no file.
+/// The words one Task Signal contributes, or `None` when it asks nothing.
 ///
-/// A `Workspace` signal has carried two shapes over this repository's life. An attributed one is
-/// `<RepositoryId>:<checkout-relative path>` -- a file the Agent opened but did not rewrite, which
-/// says what the Task is about exactly as a `Diff` does and belongs in the query at the same
-/// weight. The older shape is a bare checkout or Workspace root, which says only where the Agent
-/// is working; that has never been allowed to add a retrieval prior and still is not.
+/// The Hook renders a `Diff` and a `Workspace` signal in one and the same shape --
+/// `<RepositoryId>:<checkout-relative path>`, a file the Agent rewrote and a file it merely opened
+/// -- so they are read in one and the same way: only the path stems reach the query, because the
+/// Repository identity is a coordinate and no question is asked in it. Feeding the whole rendered
+/// string to the tokenizer, as `Diff` used to, put the Repository identifier itself into the query
+/// as if it were a word the Task was about.
 ///
-/// The two are told apart by the shape itself rather than by looking up the Repository: an
-/// attributed signal names a Repository before the colon and a *relative* path after it, and a
-/// root is an absolute path with no such prefix. Only the path is read, and only as the file stems
-/// the rest of retrieval already reads a path spelling as, because the Repository identity is a
-/// coordinate and no question is asked in it.
-fn workspace_signal_query_text(content: &str) -> Option<String> {
+/// A `Workspace` signal that is not in that shape is a bare checkout or Workspace root, which says
+/// only where the Agent is working and has never been allowed to add a retrieval prior. A `Diff`
+/// that is not in that shape came from an Agent rather than the Hook and is free prose naming what
+/// changed, so it keeps being read whole: the two kinds differ only in what their unattributed
+/// form means.
+fn signal_query_text(signal: &TaskSignal) -> Option<String> {
+    match signal.kind {
+        TaskSignalKind::Prompt => Some(signal.content.clone()),
+        TaskSignalKind::Diff => Some(
+            attributed_path_query_text(&signal.content).unwrap_or_else(|| signal.content.clone()),
+        ),
+        TaskSignalKind::Workspace => attributed_path_query_text(&signal.content),
+        TaskSignalKind::TestOutcome => None,
+    }
+}
+
+/// The file stems of one `<RepositoryId>:<checkout-relative path>` signal content.
+///
+/// The shape is recognized by itself rather than by looking up the Repository: an attributed
+/// signal names a Repository before the colon and a *relative* path after it, while a root is an
+/// absolute path with no such prefix.
+fn attributed_path_query_text(content: &str) -> Option<String> {
     let (repository_id, path) = content.trim().split_once(':')?;
     if repository_id.is_empty() || repository_id.contains('/') || repository_id.contains('\\') {
         return None;
@@ -5318,12 +5327,12 @@ fn task_fingerprint(intent: &WorkingIntentSnapshot, signals: &[TaskSignal]) -> R
     }
     // A Workspace signal that names no file steers no query, so it must not change the
     // fingerprint: two Packs that would be identical have to be recognized as identical. One that
-    // does name a file is part of the question now, exactly as a Diff is.
+    // does name a file is part of the question now, exactly as a Diff is -- and it is asked the
+    // same question, through the same reader the query itself uses.
     let mut signals = signals
         .iter()
         .filter(|signal| {
-            signal.kind != TaskSignalKind::Workspace
-                || workspace_signal_query_text(&signal.content).is_some()
+            signal.kind != TaskSignalKind::Workspace || signal_query_text(signal).is_some()
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -8071,21 +8080,25 @@ fn serialized_tokens(value: &impl Serialize) -> usize {
     estimate_tokens(&serde_json::to_string(value).unwrap_or_default())
 }
 
+/// Approximates the token cost of one serialized Pack fragment.
+///
+/// Non-Han text is charged at four UTF-8 bytes per token, the usual byte-per-token ratio of a
+/// byte-pair vocabulary. A Han character is one morpheme worth three UTF-8 bytes, and a production
+/// vocabulary packs roughly one and a half of them into a single token, so Han is charged two
+/// tokens per three characters — about 0.67 token each. Charging one token per Han character, as
+/// this did before, spent a Chinese Pack budget three to four times faster than the identical
+/// English Pack and truncated Chinese Packs that were nowhere near the model limit.
 fn estimate_tokens(text: &str) -> usize {
-    let mut tokens: usize = 0;
-    let mut non_han_bytes: usize = 0;
+    let mut han_characters: usize = 0;
+    let mut other_bytes: usize = 0;
     for character in text.chars() {
         if is_han(character) {
-            tokens += 1;
-            if non_han_bytes > 0 {
-                tokens += non_han_bytes.div_ceil(4);
-                non_han_bytes = 0;
-            }
+            han_characters += 1;
         } else {
-            non_han_bytes += character.len_utf8();
+            other_bytes += character.len_utf8();
         }
     }
-    tokens + non_han_bytes.div_ceil(4)
+    han_characters.saturating_mul(2).div_ceil(3) + other_bytes.div_ceil(4)
 }
 
 fn is_han(character: char) -> bool {
@@ -9077,8 +9090,14 @@ mod tests {
     }
 
     #[test]
-    fn token_estimate_charges_han_individually() {
+    fn token_estimate_charges_han_by_morpheme_not_by_character() {
+        // Two Han characters cost two tokens per three characters, and "abcd" is one four-byte
+        // token: the mixed string stays at three tokens.
         assert_eq!(estimate_tokens("中文abcd"), 3);
+        // Thirty Han characters used to cost thirty tokens; they now cost twenty.
+        assert_eq!(estimate_tokens(&"重复".repeat(15)), 20);
+        // An ASCII sentence of the same byte length is charged the same way it always was.
+        assert_eq!(estimate_tokens("abcdefgh"), 2);
     }
 
     /// Manual fixed-corpus baseline; run with:

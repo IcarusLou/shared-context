@@ -23,6 +23,12 @@ cargo test --locked -p sctx-installer --test installer_matrix
 cargo test --locked -p sctx-cli --test cli_contract
 cargo test --locked -p sctx-cli --test milestone_one_contract
 
+# Association recall: two blocking probe sets over hand-written fixtures, with
+# asserted floors of 18/22 and 19/24. These tests are the authority for the
+# recall numbers; prose elsewhere only describes them.
+cargo test --locked -p sctx-cli --test association_probe_workflow
+cargo test --locked -p sctx-cli --test association_probe_zh_workflow
+
 # 18.1 and the end-to-end loop: the Python oracle reads Git/config directly and
 # speaks MCP itself; it never derives expected values from production output.
 cargo build --locked -p sctx-cli

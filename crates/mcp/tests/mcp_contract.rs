@@ -725,6 +725,7 @@ fn recover_candidate_ids(
     let list = candidate_list_at_root(
         &fixture.root,
         &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
             agent_kind: agent_kind.to_owned(),
             external_session_id: session.to_owned(),
             status: CandidateReviewStatus::Pending,
@@ -1558,6 +1559,7 @@ fn candidate_list_recovers_git_committed_outbox_once_under_concurrency() {
                 candidate_list_at_root(
                     root,
                     &CandidateListInput {
+                        scope: sctx_domain::CandidateReviewScope::Task,
                         agent_kind: "codex".to_owned(),
                         external_session_id: session.to_owned(),
                         status: CandidateReviewStatus::Pending,
@@ -1661,6 +1663,7 @@ fn build_failure_after_ack_stays_pending_and_candidate_list_retries() {
     let failed_page = candidate_list_at_root(
         &fixture.root,
         &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             status: CandidateReviewStatus::Pending,
@@ -1804,6 +1807,7 @@ fn target_get_bypasses_poisoned_prefix_and_generic_recovery_rotates_fairly() {
     );
 
     let list_input = CandidateListInput {
+        scope: sctx_domain::CandidateReviewScope::Task,
         agent_kind: "codex".to_owned(),
         external_session_id: session.to_owned(),
         status: CandidateReviewStatus::Pending,
@@ -1994,6 +1998,7 @@ fn candidate_builder_converts_six_flat_agent_attested_evidence_drafts() {
     let full_list = candidate_list_at_root(
         &fixture.root,
         &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             status: CandidateReviewStatus::Pending,
@@ -2014,6 +2019,7 @@ fn candidate_builder_converts_six_flat_agent_attested_evidence_drafts() {
     let first_page = candidate_list_at_root(
         &fixture.root,
         &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             status: CandidateReviewStatus::Pending,
@@ -2028,6 +2034,7 @@ fn candidate_builder_converts_six_flat_agent_attested_evidence_drafts() {
     let second_page = candidate_list_at_root(
         &fixture.root,
         &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             status: CandidateReviewStatus::Pending,
@@ -2046,6 +2053,7 @@ fn candidate_builder_converts_six_flat_agent_attested_evidence_drafts() {
     let budgeted = candidate_list_at_root(
         &fixture.root,
         &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             status: CandidateReviewStatus::Pending,
@@ -2088,6 +2096,7 @@ fn candidate_builder_converts_six_flat_agent_attested_evidence_drafts() {
         candidate_list_at_root(
             &fixture.root,
             &CandidateListInput {
+                scope: sctx_domain::CandidateReviewScope::Task,
                 agent_kind: "codex".to_owned(),
                 external_session_id: "candidate-review-other-session".to_owned(),
                 status: CandidateReviewStatus::Pending,
@@ -2132,6 +2141,7 @@ fn candidate_builder_converts_six_flat_agent_attested_evidence_drafts() {
         candidate_list_at_root(
             &fixture.root,
             &CandidateListInput {
+                scope: sctx_domain::CandidateReviewScope::Task,
                 agent_kind: "codex".to_owned(),
                 external_session_id: session.to_owned(),
                 status: CandidateReviewStatus::Pending,
@@ -2252,6 +2262,7 @@ fn candidate_builder_converts_six_flat_agent_attested_evidence_drafts() {
         candidate_list_at_root(
             &fixture.root,
             &CandidateListInput {
+                scope: sctx_domain::CandidateReviewScope::Task,
                 agent_kind: "codex".to_owned(),
                 external_session_id: session.to_owned(),
                 status: CandidateReviewStatus::Discarded,
@@ -2757,6 +2768,7 @@ fn candidate_confirm_existing_and_recommended_new_space_are_atomic_idempotent_an
         candidate_list_at_root(
             &fixture.root,
             &CandidateListInput {
+                scope: sctx_domain::CandidateReviewScope::Task,
                 agent_kind: "codex".to_owned(),
                 external_session_id: "confirm-existing".to_owned(),
                 status: CandidateReviewStatus::Pending,
@@ -2773,6 +2785,7 @@ fn candidate_confirm_existing_and_recommended_new_space_are_atomic_idempotent_an
         candidate_list_at_root(
             &fixture.root,
             &CandidateListInput {
+                scope: sctx_domain::CandidateReviewScope::Task,
                 agent_kind: "codex".to_owned(),
                 external_session_id: "confirm-existing".to_owned(),
                 status: CandidateReviewStatus::Confirmed,
@@ -3304,6 +3317,7 @@ fn candidates_of_one_task_share_and_reuse_one_proposed_space() {
     let compact = candidate_list_with_detail_at_root(
         &fixture.root,
         &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             status: CandidateReviewStatus::Pending,
@@ -3576,9 +3590,12 @@ fn candidate_confirm_recovers_reserved_before_git_and_git_before_runtime_finaliz
     assert_eq!(recovered.status, CandidateConfirmResponseStatus::Confirmed);
     assert_eq!(recovered.candidate_id, first_candidate);
 
+    // The two legs record unrelated findings on purpose: a statement that merely reshuffles the
+    // first leg's words is a near duplicate of the Context that leg just accepted, and the
+    // Confirmation would then be refused for wanting a decision this fixture is not about.
     let (second_task, second_candidate, second_plan, second_input) = prepare(
         "confirm-git-before-runtime",
-        "Git confirmation survives before Runtime finalize",
+        "Committed Confirmation payloads finalize on the next call",
     );
     tasks
         .reserve_candidate_confirmation(
@@ -7508,6 +7525,7 @@ fn candidate_build_derives_the_problem_view_and_topic_key_a_review_can_see() {
     let listed = candidate_list_at_root(
         &fixture.root,
         &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             status: CandidateReviewStatus::Pending,
@@ -7561,7 +7579,10 @@ fn candidate_build_derives_the_problem_view_and_topic_key_a_review_can_see() {
     );
     assert_eq!(revision.topic_key.as_deref(), Some(DERIVED_FIELD_TOPIC_KEY));
 
-    // A reviewer's own wording still wins over both derived fields.
+    // A reviewer's own wording still wins over both derived fields. Recording the same finding a
+    // second time now makes this Candidate an exact duplicate of the Context just accepted, so the
+    // confirmation also carries the decision that refusal asks for; retyping the topic key does
+    // not undo the assessment the analysis already made.
     let edited_session = "candidate-build-edited-fields";
     let (edited_task, edited_candidate) =
         build_review_candidate(&fixture, edited_session, DERIVED_FIELD_STATEMENT);
@@ -7577,6 +7598,14 @@ fn candidate_build_derives_the_problem_view_and_topic_key_a_review_can_see() {
             topic_key: Some(sctx_domain::TopicKeyEdit::Set {
                 value: "decision:reviewer:live-entry".to_owned(),
             }),
+            relations: Some(vec![ContextRelation {
+                target_context_id: confirmed.context_id,
+                kind: ContextRelationKind::Supersedes,
+                rationale: "The reviewer's wording replaces the Context it restates".to_owned(),
+                supports: vec![
+                    "the same finding is now filed under the reviewer's topic".to_owned(),
+                ],
+            }]),
             ..OptionalCandidateEdits::default()
         },
     );
@@ -7617,6 +7646,7 @@ fn a_restated_claim_on_one_derived_topic_is_an_exact_duplicate() {
     let compact = candidate_list_with_detail_at_root(
         &fixture.root,
         &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
             agent_kind: "codex".to_owned(),
             external_session_id: second_session.to_owned(),
             status: CandidateReviewStatus::Pending,
@@ -8224,4 +8254,502 @@ fn exclusive_selections_and_locator_composition_are_typed_server_validation() {
         );
     }
     assert_eq!(business_residue(&fixture.root), before);
+}
+
+/// A Candidate whose strongest assessment restates a still-accepted Context is the exact shape
+/// that let one finding land three times over as three unrelated accepted facts. `candidate_confirm`
+/// now refuses that confirmation until the reviewer says which of the two facts survives, and
+/// confirms it unchanged once they have. Without this test the guard could be dropped and every
+/// restatement would silently become a fresh Context again, or — the opposite failure — a reviewer
+/// who did decide would find the duplicate permanently unconfirmable.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn confirming_an_exact_duplicate_candidate_is_refused_until_the_reviewer_supersedes_the_original() {
+    let fixture = Fixture::new();
+    let accepted_session = "duplicate-decision-accepted";
+    let (accepted_task, accepted_candidate) =
+        build_review_candidate(&fixture, accepted_session, DERIVED_FIELD_STATEMENT);
+    let accepted = confirm_candidate(
+        &fixture,
+        accepted_session,
+        &accepted_task,
+        accepted_candidate,
+        OptionalCandidateEdits::default(),
+    );
+
+    // A second Session restates the same finding: the derived topic key makes the new Candidate an
+    // exact duplicate of the Context the knowledge base just accepted.
+    let session = "duplicate-decision-restated";
+    let (task, duplicate_id) = build_review_candidate(&fixture, session, DERIVED_FIELD_STATEMENT);
+    let confirm_arguments = |edits: Value| {
+        json!({
+            "agent_kind": "codex",
+            "external_session_id": session,
+            "expected_task_id": task.context.task_id,
+            "expected_intent_revision_id": task.context.intent_revision_id,
+            "candidate_id": duplicate_id,
+            "expected_review_version": 1,
+            "primary": {"existing_space_id": fixture.space_id},
+            "related_space_ids": [],
+            "edits": edits
+        })
+    };
+    let confirm = |edits: Value| {
+        run_authorized_session(
+            &fixture.root,
+            &mut fixture.server(ClientKind::Codex),
+            FixtureFraming::Newline,
+            &[
+                request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+                tool_call(2, "candidate_confirm", confirm_arguments(edits)),
+            ],
+        )[1]["result"]
+            .clone()
+    };
+
+    let before_events = event_count(fixture.store.repository());
+    let refused = confirm(json!({}));
+    assert_eq!(refused["isError"], true, "{refused:#}");
+    let error = &refused["structuredContent"]["error"];
+    assert_eq!(
+        error["code"], "exact_duplicate_requires_decision",
+        "an undecided duplicate is a missing human choice, not a malformed argument: {error:#}"
+    );
+    let message = error["message"].as_str().unwrap();
+    assert!(
+        message
+            .starts_with("This Candidate restates the accepted Context it was assessed against,"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&accepted.context_id.to_string()),
+        "the refusal must name the Context this Candidate repeats: {message}"
+    );
+    for way_out in ["supersedes", "contradicts", "candidate_discard"] {
+        assert!(
+            message.contains(way_out),
+            "the refusal must offer {way_out}: {message}"
+        );
+    }
+
+    // The refused attempt decided nothing: no Git write, and the Candidate is still awaiting review
+    // at the same Review version the caller was told to send.
+    assert_eq!(event_count(fixture.store.repository()), before_events);
+    let still_pending = candidate_get_at_root(
+        &fixture.root,
+        &CandidateGetInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            candidate_id: duplicate_id.to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(still_pending.review_status, CandidateReviewStatus::Pending);
+    assert_eq!(still_pending.review_version, 1);
+    assert_eq!(still_pending.confirmation_id, None);
+    assert_eq!(still_pending.result_context_id, None);
+
+    // The same confirmation carrying the reviewer's decision goes through: a human can always
+    // confirm, and only an undecided duplicate confirmation was ever blocked.
+    let decided = confirm(json!({
+        "relations": [{
+            "target_context_id": accepted.context_id,
+            "kind": "supersedes",
+            "rationale": "The restated finding replaces the Context it repeats",
+            "supports": ["the reviewer chose the restatement over the accepted Context"]
+        }]
+    }));
+    assert_eq!(decided["isError"], false, "{decided:#}");
+    let confirmed = &decided["structuredContent"];
+    assert_eq!(confirmed["status"], "confirmed");
+    assert_ne!(
+        confirmed["context_id"],
+        json!(accepted.context_id.to_string())
+    );
+    let revision = accepted_revision(
+        &fixture,
+        confirmed["context_id"].as_str().unwrap().parse().unwrap(),
+        confirmed["revision_id"].as_str().unwrap().parse().unwrap(),
+    );
+    assert_eq!(
+        revision.relations,
+        vec![ContextRelation {
+            target_context_id: accepted.context_id,
+            kind: ContextRelationKind::Supersedes,
+            rationale: "The restated finding replaces the Context it repeats".to_owned(),
+            supports: vec![
+                "the reviewer chose the restatement over the accepted Context".to_owned()
+            ],
+        }]
+    );
+}
+
+/// Batch `candidate_confirm` prepares every member with empty edits, so a duplicate member can
+/// never carry the decision a duplicate now needs. The batch must therefore fail in the pre-write
+/// validation pass and say which member needs the single-Candidate decision — otherwise a reviewer
+/// sweeping ten Candidates at once would either re-accept the restatement silently or be left with
+/// a half-written batch and no way to tell which Candidate stopped it.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_batch_candidate_confirm_holding_one_exact_duplicate_is_refused_whole_and_names_the_member() {
+    let fixture = Fixture::new();
+    let accepted_session = "batch-duplicate-accepted";
+    let (accepted_task, accepted_candidate) =
+        build_review_candidate(&fixture, accepted_session, DERIVED_FIELD_STATEMENT);
+    let accepted = confirm_candidate(
+        &fixture,
+        accepted_session,
+        &accepted_task,
+        accepted_candidate,
+        OptionalCandidateEdits::default(),
+    );
+
+    // One Task closing two Claims: one novel finding and one restatement of the accepted Context.
+    let session = "batch-duplicate-review";
+    let novel_statement = "Batch confirmation validates every member before the first Git write";
+    let task = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            session,
+            TaskBoundary::New,
+            None,
+            "confirm a batch that holds one restatement",
+        ),
+    )
+    .unwrap();
+    let claim = |statement: &str| TaskCheckpointClaimInput {
+        context_kind: ContextKind::Decision,
+        statement: statement.to_owned(),
+        rationale: "Batch duplicate refusal fixture".to_owned(),
+        conditions: Vec::new(),
+        evidence: vec![TaskCheckpointEvidenceInput {
+            evidence_type: EvidenceType::ExperimentRecord,
+            summary: format!("The batch duplicate fixture recorded {statement}"),
+            limitations: vec!["local fixture".to_owned()],
+        }],
+    };
+    task_checkpoint_at_root(
+        &fixture.root,
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            claims: vec![claim(novel_statement), claim(DERIVED_FIELD_STATEMENT)],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap()
+    .into_accepted()
+    .expect("nonempty Checkpoint must be accepted");
+    let compact = candidate_list_with_detail_at_root(
+        &fixture.root,
+        &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            status: CandidateReviewStatus::Pending,
+            limit: 10,
+            cursor: None,
+            token_budget: 32_768,
+        },
+        sctx_search::ContextPackDetailLevel::Compact,
+    )
+    .unwrap()
+    .compact();
+    assert_eq!(compact.reviews.len(), 2);
+    let duplicate_id = compact
+        .reviews
+        .iter()
+        .find(|review| {
+            review.top_assessment.as_ref().is_some_and(|assessment| {
+                assessment.relation == sctx_domain::CandidateAssessmentRelation::ExactDuplicate
+                    && assessment.target_context_id == Some(accepted.context_id)
+            })
+        })
+        .expect("exactly one member restates the accepted Context")
+        .candidate_id;
+    let novel_id = compact
+        .reviews
+        .iter()
+        .map(|review| review.candidate_id)
+        .find(|candidate_id| *candidate_id != duplicate_id)
+        .expect("the other member is novel");
+
+    // The duplicate is the second batch member, so the reported position must be the duplicate's
+    // and not simply the first item's.
+    let before_events = event_count(fixture.store.repository());
+    let refused = run_authorized_session(
+        &fixture.root,
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::Newline,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(
+                2,
+                "candidate_confirm",
+                json!({
+                    "agent_kind": "codex",
+                    "external_session_id": session,
+                    "expected_task_id": task.context.task_id,
+                    "expected_intent_revision_id": task.context.intent_revision_id,
+                    "candidate_ids": [novel_id, duplicate_id],
+                    "expected_review_version": 1,
+                    "primary": {"existing_space_id": fixture.space_id},
+                    "related_space_ids": []
+                }),
+            ),
+        ],
+    )[1]["result"]
+        .clone();
+    assert_eq!(refused["isError"], true, "{refused:#}");
+    let error = &refused["structuredContent"]["error"];
+    assert_eq!(
+        error["code"], "exact_duplicate_requires_decision",
+        "{error:#}"
+    );
+    let message = error["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!("(batch item 1, candidate {duplicate_id})")),
+        "the refusal must name the offending member and its batch position: {message}"
+    );
+    assert!(
+        message.contains("no Candidate in this batch was written"),
+        "{message}"
+    );
+    assert!(
+        !message.contains(&novel_id.to_string()),
+        "only the member that stopped the batch is named: {message}"
+    );
+
+    // Nothing was written, and both members stay reviewable exactly as they were.
+    assert_eq!(event_count(fixture.store.repository()), before_events);
+    for candidate_id in [novel_id, duplicate_id] {
+        let review = candidate_get_at_root(
+            &fixture.root,
+            &CandidateGetInput {
+                agent_kind: "codex".to_owned(),
+                external_session_id: session.to_owned(),
+                candidate_id: candidate_id.to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            review.review_status,
+            CandidateReviewStatus::Pending,
+            "{candidate_id} was written by a refused batch"
+        );
+        assert_eq!(review.confirmation_id, None);
+    }
+}
+
+/// One `ExternalSession` that forked a second Task still owes a review on the first Task's
+/// Candidates, and nothing in a Task-local listing could ever say so. `candidate_list` gains a
+/// Session scope that names each row's `source_task_id`, and the compact Pack gains the bare count
+/// that tells a reviewer the wider listing has something to show. This pins both halves: the
+/// default scope must stay Task-local and unchanged, and the reminder must vanish once the sibling
+/// Candidate is decided rather than linger as a permanent nag.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn candidate_list_session_scope_names_each_source_task_and_the_compact_pack_counts_the_siblings() {
+    let fixture = Fixture::new();
+    let session = "session-scoped-candidate-review";
+    let close_with_claim = |statement: &str| {
+        task_checkpoint_at_root(
+            &fixture.root,
+            &TaskCheckpointInput {
+                agent_kind: "codex".to_owned(),
+                external_session_id: session.to_owned(),
+                claims: vec![TaskCheckpointClaimInput {
+                    context_kind: ContextKind::Decision,
+                    statement: statement.to_owned(),
+                    rationale: "Session-scoped Candidate visibility fixture".to_owned(),
+                    conditions: Vec::new(),
+                    evidence: vec![TaskCheckpointEvidenceInput {
+                        evidence_type: EvidenceType::ExperimentRecord,
+                        summary: format!("The session scope fixture recorded {statement}"),
+                        limitations: vec!["local fixture".to_owned()],
+                    }],
+                }],
+                unknowns: Vec::new(),
+            },
+        )
+        .unwrap()
+        .into_accepted()
+        .expect("nonempty Checkpoint must be accepted");
+    };
+    let first_task = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            session,
+            TaskBoundary::New,
+            None,
+            "hold a reviewable Candidate in the first Task",
+        ),
+    )
+    .unwrap();
+    close_with_claim("The first Task of this Session recorded its own reviewable finding");
+    let first_candidate = recover_candidate_ids(&fixture, "codex", session, 1)[0];
+    let second_task = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(
+            session,
+            TaskBoundary::New,
+            Some(first_task.context.intent_revision_id.to_string()),
+            "fork a second Task inside the same ExternalSession",
+        ),
+    )
+    .unwrap();
+    close_with_claim("The second Task of this Session recorded a different reviewable finding");
+    let second_candidate = recover_candidate_ids(&fixture, "codex", session, 1)[0];
+    assert_ne!(first_task.context.task_id, second_task.context.task_id);
+
+    let list = |scope: sctx_domain::CandidateReviewScope| {
+        candidate_list_with_detail_at_root(
+            &fixture.root,
+            &CandidateListInput {
+                scope,
+                agent_kind: "codex".to_owned(),
+                external_session_id: session.to_owned(),
+                status: CandidateReviewStatus::Pending,
+                limit: 10,
+                cursor: None,
+                token_budget: 32_768,
+            },
+            sctx_search::ContextPackDetailLevel::Compact,
+        )
+        .unwrap()
+        .compact()
+    };
+
+    // The default scope is still the caller's own Task, and its rows spend no budget repeating the
+    // Task the caller itself named.
+    let task_scoped = list(sctx_domain::CandidateReviewScope::Task);
+    assert_eq!(task_scoped.reviews.len(), 1);
+    assert_eq!(task_scoped.reviews[0].candidate_id, second_candidate);
+    assert!(
+        serde_json::to_value(&task_scoped.reviews[0])
+            .unwrap()
+            .get("source_task_id")
+            .is_none(),
+        "a Task-scoped row must not carry the Task the caller already passed"
+    );
+
+    // The Session scope reaches the sibling Task and says which Task every row came from.
+    let session_scoped = list(sctx_domain::CandidateReviewScope::Session);
+    assert_eq!(session_scoped.reviews.len(), 2);
+    for review in &session_scoped.reviews {
+        assert!(
+            serde_json::to_value(review)
+                .unwrap()
+                .get("source_task_id")
+                .is_some(),
+            "every Session-scoped row names its source Task"
+        );
+    }
+    let sibling = session_scoped
+        .reviews
+        .iter()
+        .find(|review| review.candidate_id == first_candidate)
+        .expect("the Session scope reached the sibling Task");
+    assert_eq!(sibling.source_task_id, Some(first_task.context.task_id));
+    assert_eq!(
+        session_scoped
+            .reviews
+            .iter()
+            .find(|review| review.candidate_id == second_candidate)
+            .unwrap()
+            .source_task_id,
+        Some(second_task.context.task_id)
+    );
+
+    // The compact Pack carries the bare count and never the sibling's untrusted statement.
+    let compact_pack = |id: u64| {
+        run_authorized_session(
+            &fixture.root,
+            &mut fixture.server(ClientKind::Codex),
+            FixtureFraming::Newline,
+            &[
+                request(id, "initialize", json!({"protocolVersion": "2024-11-05"})),
+                tool_call(id + 1, "task_context", task_arguments("codex", session)),
+            ],
+        )[1]["result"]["structuredContent"]
+            .clone()
+    };
+    let with_sibling = compact_pack(1);
+    assert_eq!(with_sibling["detail_level"], "compact");
+    assert_eq!(with_sibling["pending_candidates_in_other_tasks"], 1);
+    assert!(
+        !with_sibling
+            .to_string()
+            .contains("recorded its own reviewable finding"),
+        "the Pack reports the count and never the sibling Candidate's content"
+    );
+
+    // Deciding the sibling Candidate removes the reminder entirely instead of leaving a zero.
+    let runtime = TaskRuntime::initialize(&fixture.root).unwrap();
+    let locator = ExternalSessionLocator::new("codex", session).unwrap();
+    runtime
+        .switch_active_task(
+            &locator,
+            second_task.context.task_id,
+            first_task.context.task_id,
+        )
+        .unwrap();
+    let discarded = candidate_discard_at_root(
+        &fixture.root,
+        &CandidateDiscardInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: first_task.context.task_id.to_string(),
+            expected_intent_revision_id: first_task.context.intent_revision_id.to_string(),
+            candidate_id: first_candidate.to_string(),
+            expected_review_version: 1,
+            reason: "the sibling Task settled its own Candidate".to_owned(),
+        },
+    )
+    .unwrap();
+    assert_eq!(discarded.status, CandidateDiscardResponseStatus::Discarded);
+    runtime
+        .switch_active_task(
+            &locator,
+            first_task.context.task_id,
+            second_task.context.task_id,
+        )
+        .unwrap();
+    let without_sibling = compact_pack(3);
+    assert!(
+        without_sibling
+            .get("pending_candidates_in_other_tasks")
+            .is_none(),
+        "a settled Session leaves no reminder at all: {without_sibling:#}"
+    );
+
+    // The host declaration offers the wider scope without ever requiring it.
+    let tools = run_session(
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::Newline,
+        &[
+            request(5, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            request(6, "tools/list", json!({})),
+        ],
+    )[1]["result"]["tools"]
+        .clone();
+    let list_schema = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "candidate_list")
+        .unwrap()["inputSchema"]
+        .clone();
+    assert_eq!(
+        list_schema["properties"]["scope"]["enum"],
+        json!(["task", "session"])
+    );
+    assert_eq!(list_schema["properties"]["scope"]["default"], "task");
+    assert!(
+        !list_schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("scope")),
+        "scope stays optional: an existing caller keeps the Task-local listing it always had"
+    );
 }

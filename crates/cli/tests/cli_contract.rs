@@ -1612,6 +1612,7 @@ fn twenty_cli_processes_confirm_one_review_in_one_atomic_commit() {
     let candidate_id = candidate_list_at_root(
         harness.root(),
         &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             status: CandidateReviewStatus::Pending,
@@ -3038,6 +3039,7 @@ fn candidate_confirm_and_discard_batches_are_atomic_and_single_id_keeps_prior_sh
     let candidate_ids = candidate_list_at_root(
         harness.root(),
         &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             status: CandidateReviewStatus::Pending,
@@ -3213,6 +3215,7 @@ fn candidate_confirm_and_discard_batches_are_atomic_and_single_id_keeps_prior_sh
     let discard_candidate_ids = candidate_list_at_root(
         harness.root(),
         &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
             agent_kind: "codex".to_owned(),
             external_session_id: discard_session.to_owned(),
             status: CandidateReviewStatus::Pending,

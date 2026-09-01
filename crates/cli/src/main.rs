@@ -820,19 +820,20 @@ fn verify_demo_mcp(
         .and_then(|response| response.pointer("/result/tools"))
         .and_then(Value::as_array)
         .ok_or_else(|| invariant("demo MCP tools/list response is missing"))?;
-    if tools.len() != 16
-        || [
-            "task_checkpoint",
-            "candidate_list",
-            "candidate_get",
-            "candidate_discard",
-            "candidate_confirm",
-        ]
+    // Compare the whole emitted surface against the one shared name list rather than spot-checking
+    // the Candidate Review tools: a hardcoded count plus five sampled names let `space_create` ship
+    // in `tools/list` without the demo noticing.
+    let emitted = tools
         .iter()
-        .any(|name| !tools.iter().any(|tool| tool["name"] == *name))
-    {
+        .map(|tool| tool["name"].as_str().unwrap_or_default())
+        .collect::<BTreeSet<_>>();
+    let expected = sctx_agent_adapter::shared_context_tool_names()
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if tools.len() != expected.len() || emitted != expected {
         return Err(invariant(
-            "demo MCP tools/list did not return the Candidate Review surface",
+            "demo MCP tools/list did not return the full tool surface, including Candidate Review",
         ));
     }
     let results = responses
@@ -2299,6 +2300,7 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
                     "--agent-kind",
                     "--external-session-id",
                     "--status",
+                    "--scope",
                     "--limit",
                     "--cursor",
                     "--token-budget",
@@ -2310,6 +2312,9 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
                 external_session_id: options.required("--external-session-id")?.to_owned(),
                 status: parse_candidate_review_status(
                     options.optional("--status")?.unwrap_or("pending"),
+                )?,
+                scope: parse_candidate_review_scope(
+                    options.optional("--scope")?.unwrap_or("task"),
                 )?,
                 limit: parse_usize(options.optional("--limit")?.unwrap_or("20"), "limit")?,
                 cursor: options.optional("--cursor")?.map(str::to_owned),
@@ -3812,6 +3817,18 @@ fn parse_status(value: &str) -> Result<ContextStatus> {
         "superseded" => Ok(ContextStatus::Superseded),
         "governance_conflict" => Ok(ContextStatus::GovernanceConflict),
         _ => Err(invalid(format!("invalid Context status: {value}"))),
+    }
+}
+
+/// Mirrors the MCP `scope` selector: `task` is the Task-local default, `session` widens the
+/// listing to every Task of the Session read-only.
+fn parse_candidate_review_scope(value: &str) -> Result<sctx_domain::CandidateReviewScope> {
+    match value {
+        "task" => Ok(sctx_domain::CandidateReviewScope::Task),
+        "session" => Ok(sctx_domain::CandidateReviewScope::Session),
+        other => Err(invalid(format!(
+            "unsupported Candidate Review scope: {other}"
+        ))),
     }
 }
 

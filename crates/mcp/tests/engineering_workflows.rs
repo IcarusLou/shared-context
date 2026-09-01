@@ -1866,6 +1866,7 @@ fn a_confirmation_that_names_engineering_references_rescans_within_its_budget() 
     let listed = sctx_mcp::candidate_list_at_root(
         &root,
         &sctx_mcp::CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             status: sctx_domain::CandidateReviewStatus::Pending,

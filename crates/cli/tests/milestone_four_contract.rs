@@ -100,6 +100,7 @@ fn build_review(
     let recovered = candidate_list_at_root(
         root,
         &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
             agent_kind: agent_kind.to_owned(),
             external_session_id: session.to_owned(),
             status: CandidateReviewStatus::Pending,
@@ -152,6 +153,7 @@ fn fixed_milestone_four_builder_review_confirm_oracle() {
     let list = candidate_list_at_root(
         &root,
         &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
             agent_kind: "codex".to_owned(),
             external_session_id: oracle.existing_session.clone(),
             status: CandidateReviewStatus::Pending,

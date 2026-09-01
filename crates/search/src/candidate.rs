@@ -32,6 +32,15 @@ const PROPOSED_SPACE_TITLE_MAX_CHARS: usize = 40;
 pub const STATEMENT_SIMILARITY_STRONG_BASIS_POINTS: u64 = 8_000;
 /// Lower bound of the band where two Claims are close enough to need human contradiction review.
 pub const STATEMENT_SIMILARITY_REVIEW_BASIS_POINTS: u64 = 5_000;
+/// Normalized statement overlap at or above which a Claim restates an accepted Context.
+///
+/// Measured against this repository's own accepted Contexts: pairs that restate one conclusion in
+/// different words score `5_400` to `10_000` basis points, while pairs about different conclusions
+/// stay at or below `1_100`. The band between this bound and
+/// [`STATEMENT_SIMILARITY_STRONG_BASIS_POINTS`] is where a rewrite of one conclusion used to fall
+/// through as merely related, because the strongest duplicate path needs a topic key and the topic
+/// key is optional.
+pub const STATEMENT_NEAR_DUPLICATE_BASIS_POINTS: u64 = 5_000;
 /// Shared repository identifiers at or above which two Claims are about the same code.
 ///
 /// One shared identifier is a coincidence of vocabulary; two independently written spellings of
@@ -68,10 +77,19 @@ pub struct CandidateAnalysisResult {
     pub candidate_status: AutomaticCandidateStatus,
 }
 
+// Four independent yes-or-no answers about one retrieval target, not a state machine: each is
+// read on its own by the relation rules and none constrains another, so folding them into an enum
+// would only hide which question was asked.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone)]
 struct TargetState {
     revision: ContextRevision,
     safe: bool,
+    /// True when the target revision is accepted, whatever its automatic-injection eligibility.
+    ///
+    /// `safe` narrows further as Graph and Space checks run; duplicate review asks only whether
+    /// the knowledge base already accepted this conclusion.
+    accepted: bool,
     space_conflicted: bool,
     channels: BTreeMap<&'static str, usize>,
     paths: Vec<CandidateAssessmentPath>,
@@ -290,6 +308,7 @@ fn collect_targets(snapshot: &DomainSnapshot) -> BTreeMap<ContextRevisionRef, Ta
                                 revision: revision.revision.clone(),
                                 safe: revision.lifecycle == RevisionLifecycle::Accepted
                                     && context.auto_injection.eligible,
+                                accepted: revision.lifecycle == RevisionLifecycle::Accepted,
                                 space_conflicted: space.intent.heads.len() > 1,
                                 channels: BTreeMap::new(),
                                 paths: Vec::new(),
@@ -652,9 +671,34 @@ fn assess_target(
     // wording, none of which makes the second a new fact. Whole-draft equality still wins first so
     // the stronger path keeps its own trigger text.
     let restates_topic = topic && !statement_differs;
+    // One conclusion written a second time against a Context the knowledge base already accepted.
+    // The topic key is optional, so without this path a Task that restated an accepted conclusion
+    // in its own words and typed no topic reached only `supports` or `unresolved_related`, and the
+    // reviewer confirmed the same fact again. It is deliberately confined to a rewritten
+    // statement: an identical statement filed under a different topic key stays `supports`, which
+    // is the "same statement, new Evidence" case, and a differing statement under a matching topic
+    // key stays a contradiction to review. A shared exact Artifact is also left alone: that is
+    // proof the two Claims are about the same code, and the existing path sends a differing
+    // statement over shared code to contradiction review, which is the stronger, evidence-backed
+    // reading. The restatements this catches carry no shared Artifact — they predate server-side
+    // Reference derivation, which is exactly why nothing but their wording connects them.
+    let near_duplicate = state.accepted
+        && !topic
+        && !shared_artifact
+        && statement_differs
+        && !negation_conflict
+        && similarity >= STATEMENT_NEAR_DUPLICATE_BASIS_POINTS;
+    if near_duplicate {
+        add_path(
+            &mut state,
+            CandidateAssessmentPath::NearDuplicateStatement {
+                similarity_basis_points: similarity,
+            },
+        );
+    }
     let relation = if negation_conflict {
         CandidateAssessmentRelation::PotentialContradiction
-    } else if canonical || restates_topic {
+    } else if canonical || restates_topic || near_duplicate {
         CandidateAssessmentRelation::ExactDuplicate
     } else if statement {
         CandidateAssessmentRelation::Supports
@@ -679,6 +723,10 @@ fn assess_target(
         format!("Path: canonical draft equality at statement similarity {similarity} basis points")
     } else if restates_topic {
         "Path: normalized statement equality on one topic key".to_owned()
+    } else if near_duplicate {
+        format!(
+            "Path: statement similarity {similarity} basis points against an accepted Context at or above the {STATEMENT_NEAR_DUPLICATE_BASIS_POINTS} near-duplicate threshold"
+        )
     } else if statement {
         if similarity >= 10_000 {
             "Path: normalized statement equality".to_owned()
@@ -728,6 +776,10 @@ fn assess_target(
         CandidateAssessmentRelation::ExactDuplicate if canonical => (
             10_000,
             "The complete canonical Candidate draft equals the immutable Context revision",
+        ),
+        CandidateAssessmentRelation::ExactDuplicate if near_duplicate => (
+            9_500,
+            "The statement restates a conclusion the knowledge base already accepted; confirming it again needs an explicit supersedes or contradicts decision",
         ),
         CandidateAssessmentRelation::ExactDuplicate => (
             10_000,
