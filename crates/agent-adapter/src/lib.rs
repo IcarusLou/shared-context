@@ -524,10 +524,15 @@ impl AgentCapabilities {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum TaskRuntimeOperation {
+    /// Records what one tool call revealed about the Task, as file clues alone.
+    ///
+    /// The Agent's working directory and Workspace roots are deliberately absent. They travelled
+    /// here for a locating channel that never consumed them: attribution resolves every path
+    /// against the Repository catalog before this operation runs, and the attributed `file_hints`
+    /// are the whole of what is recorded. Carrying the raw locations alongside them made them look
+    /// like inputs to the recording and put unattributed paths on a seam with no use for them.
     MergeSignals {
         locator: ExternalSessionLocator,
-        cwd: PathBuf,
-        workspace_roots: Vec<PathBuf>,
         file_hints: Vec<PathBuf>,
         tool_category: ToolCategory,
         #[serde(default)]
@@ -659,8 +664,6 @@ fn plan_enabled_action(
             CanonicalAgentAction {
                 task_operation: Some(TaskRuntimeOperation::MergeSignals {
                     locator: task_locator(capabilities.agent, context),
-                    cwd: context.cwd.clone(),
-                    workspace_roots: context.workspace_roots.clone(),
                     file_hints,
                     tool_category: *tool_category,
                     file_access: *file_access,
