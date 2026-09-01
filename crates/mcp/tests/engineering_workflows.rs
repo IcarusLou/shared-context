@@ -1686,7 +1686,11 @@ fn auto_scan_root(
     if let Some(auto_scan) = auto_scan {
         let config_path = root.join("config.toml");
         let mut text = fs::read_to_string(&config_path).unwrap();
-        text.push_str(&format!("\n[engineering]\nauto_scan = {auto_scan}\n"));
+        text.push_str(if auto_scan {
+            "\n[engineering]\nauto_scan = true\n"
+        } else {
+            "\n[engineering]\nauto_scan = false\n"
+        });
         fs::write(&config_path, text).unwrap();
     }
     let recorded = engineering_reference_record_at_root(
