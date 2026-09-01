@@ -407,6 +407,11 @@ pub struct TaskSpaceAssociationsResponse {
     pub projection_generation: u64,
     pub task_id: TaskId,
     pub associations: Vec<TaskSpaceAssociation>,
+    /// Automatic query-token selection, reported once here rather than repeated inside every
+    /// Association. Each Association still names the selection it was matched under, in its
+    /// projected form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_token_explanation: Option<AutomaticQueryTokenExplanation>,
 }
 
 /// Task-first Context retrieval request. No Space identifier is required or accepted.
@@ -609,7 +614,52 @@ pub struct AutomaticQueryTokenExplanation {
     pub high_document_frequency_threshold_basis_points: usize,
     pub stop_word_fallback_active: bool,
     pub selected_tokens: Vec<String>,
+    /// The selected tokens this corpus can actually answer: document frequency above zero, and
+    /// not a generic word that answers nothing wherever it appears.
+    ///
+    /// They are the denominator of the automatic coverage gate, so a question is not held against
+    /// the words this repository has simply never written down, only against the words it has.
+    #[serde(default)]
+    pub answerable_tokens: Vec<String>,
     pub dropped_tokens: Vec<AutomaticQueryTokenDrop>,
+    /// Totals that survive the compact projection, which drops the token lists themselves.
+    #[serde(default)]
+    pub selected_token_count: usize,
+    #[serde(default)]
+    pub answerable_token_count: usize,
+    #[serde(default)]
+    pub dropped_token_count: usize,
+}
+
+/// Most dropped tokens named in the compact projection of an
+/// [`AutomaticQueryTokenExplanation`]. Past a handful the list stops being readable and starts
+/// competing with the facts for the same budget.
+const COMPACT_QUERY_TOKEN_DROP_LIMIT: usize = 8;
+
+impl AutomaticQueryTokenExplanation {
+    /// Recomputes the three totals from the token lists. Every constructor and every merge ends
+    /// here, so the counts never disagree with the lists they summarize.
+    fn refresh_counts(&mut self) {
+        self.selected_token_count = self.selected_tokens.len();
+        self.answerable_token_count = self.answerable_tokens.len();
+        self.dropped_token_count = self.dropped_tokens.len();
+    }
+
+    /// Projects the explanation onto the compact payload: the three totals plus at most
+    /// [`COMPACT_QUERY_TOKEN_DROP_LIMIT`] named drops and their filters.
+    ///
+    /// A compact Pack that returned nothing is the one that most needs this, so the projection is
+    /// small enough to be affordable at any budget rather than being dropped when room runs out.
+    #[must_use]
+    fn compact_projection(&self) -> Self {
+        let mut compact = self.clone();
+        compact.selected_tokens = Vec::new();
+        compact.answerable_tokens = Vec::new();
+        compact
+            .dropped_tokens
+            .truncate(COMPACT_QUERY_TOKEN_DROP_LIMIT);
+        compact
+    }
 }
 
 /// One exact active Artifact Focus to a historical Engineering Artifact association.
@@ -817,18 +867,37 @@ pub enum ContextPackMode {
     AutomaticInjection,
 }
 
-/// One budget omission, including enough identity to fetch the Context explicitly.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// One omission, including enough identity to fetch the Context or the Space explicitly.
+///
+/// Budget omissions name a Context; retrieval-gate omissions name a Space and carry the numbers
+/// the gate decided on, so a Pack that returned nothing still says why.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ContextPackOmitted {
     pub context_id: Option<ContextId>,
     pub revision_id: Option<RevisionId>,
-    /// Context-owned display title of the omitted Context. Present whenever the omission names one
-    /// Context, so an Agent can decide whether the missing item is worth an explicit read.
+    /// Display title of the omitted Context or Space. Present whenever the omission names one of
+    /// them, so an Agent can decide whether what is missing is worth an explicit read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Space this omission is about. Present on every omission that drops a whole Space.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<SpaceId>,
     pub reason: String,
     pub estimated_tokens: usize,
     pub count: usize,
+    /// Coverage the automatic text gate measured, in basis points of the answerable query tokens.
+    /// Present only on the gate's own reasons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_basis_points: Option<u16>,
+    /// Query tokens this corpus can match at all, the coverage denominator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answerable_tokens: Option<usize>,
+    /// Query tokens automatic retrieval selected, answerable or not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_tokens: Option<usize>,
+    /// Independent text channels that matched this Space.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_channel_count: Option<usize>,
 }
 
 /// Payload shape requested for one Task Context Pack.
@@ -1218,6 +1287,7 @@ impl SearchEngine {
                 projection_generation: snapshot.metadata.projection_generation,
                 task_id,
                 associations: snapshot.data.associations,
+                query_token_explanation: Some(snapshot.data.query_token_explanation),
             });
         }
         Err(invariant(
@@ -1319,15 +1389,10 @@ impl SearchEngine {
                     request.resolved_focus.is_some() && graph.is_none(),
                     request.mode,
                 )?;
-                let omitted_spaces = inference
-                    .associations
-                    .len()
-                    .saturating_sub(request.max_spaces);
-                let omitted_space_tokens = inference.associations
-                    [request.max_spaces.min(inference.associations.len())..]
-                    .iter()
-                    .map(serialized_tokens)
-                    .sum();
+                let space_omissions = space_top_k_omissions(
+                    connection,
+                    &inference.associations[request.max_spaces.min(inference.associations.len())..],
+                )?;
                 inference.associations.truncate(request.max_spaces);
                 let candidates = load_task_context_candidates(
                     connection,
@@ -1347,8 +1412,7 @@ impl SearchEngine {
                     request.token_budget,
                     inference,
                     graph_diagnostics,
-                    omitted_spaces,
-                    omitted_space_tokens,
+                    space_omissions,
                     detail_level,
                 ))
             })?;
@@ -1565,6 +1629,20 @@ fn association_query_phrases(
 
 const MAX_AUTOMATIC_QUERY_TOKENS: usize = 64;
 const AUTOMATIC_TEXT_COVERAGE_THRESHOLD_BASIS_POINTS: u16 = 6_000;
+/// Smallest share of the selected query tokens the corpus has to be able to answer at all before
+/// the answerable coverage denominator is trusted on its own.
+///
+/// Dividing by the answerable tokens is what lets a real question through: the few words of it
+/// this repository has written down are the whole of what it can be asked. The same division
+/// hands a query the corpus barely recognizes a perfect score off one incidental word, which is
+/// exactly the noise an automatic channel must never inject. Below this ratio the gate stops
+/// believing coverage and falls back to the multi-channel evidence it shares with every other
+/// path.
+const AUTOMATIC_MIN_ANSWERABLE_RATIO_BASIS_POINTS: usize = 2_500;
+/// Fewest answerable tokens the coverage gate is willing to divide by, relaxed when the query
+/// selected fewer tokens than this in the first place (an identifier lookup is one token and is
+/// meant to pass).
+const AUTOMATIC_MIN_ANSWERABLE_QUERY_TOKENS: usize = 2;
 /// How many plain query tokens one identifier-channel token is worth in the automatic coverage
 /// gate.
 ///
@@ -1599,7 +1677,136 @@ const AUTOMATIC_UNIVERSAL_DF_THRESHOLD_BASIS_POINTS: usize = 9_000;
 /// Deterministic query-token selection for automatic injection plus its explanation.
 struct AutomaticTokenSelection {
     tokens: Vec<String>,
+    /// The subset of `tokens` whose document frequency is above zero.
+    answerable: Vec<String>,
     explanation: AutomaticQueryTokenExplanation,
+}
+
+/// Denominator of every automatic text-coverage decision.
+///
+/// `selected` is what automatic retrieval queried with; `answerable` is the part of it this
+/// corpus can match at all. Coverage divides by `answerable`, and
+/// [`Self::answerable_ratio_sufficient`] keeps that smaller denominator from turning a query the
+/// corpus barely recognizes into full coverage.
+#[derive(Clone, Debug, Default)]
+struct AutomaticCoverageBasis {
+    selected: Vec<String>,
+    answerable: Vec<String>,
+}
+
+impl AutomaticCoverageBasis {
+    fn from_selection(selection: &AutomaticTokenSelection) -> Self {
+        Self {
+            selected: selection.tokens.clone(),
+            answerable: selection.answerable.clone(),
+        }
+    }
+
+    /// The same basis with the answerable set widened back to every selected token.
+    ///
+    /// Relation expansion is the one consumer that keeps the stricter denominator. A seed does
+    /// not only rank itself: it pulls whole Spaces in over a
+    /// [`CONTEXT_RELATION_CHANNEL_WEIGHT`] channel, and that weight was calibrated against the
+    /// seed set the wider denominator produces. Widening the seeds is a separate decision from
+    /// fixing how coverage is measured, and taking both at once lets a Space reached only by a
+    /// hop out of the answering Space's Context outrank the Space that answered.
+    fn selected_only(&self) -> Self {
+        Self {
+            selected: self.selected.clone(),
+            answerable: self.selected.clone(),
+        }
+    }
+
+    /// The coverage denominator. A matched token is by construction answerable, so intersecting a
+    /// matched set with this list keeps the same numerator the selected list produced and only
+    /// divides it by what the corpus could actually answer.
+    fn tokens(&self) -> &[String] {
+        &self.answerable
+    }
+
+    fn selected_count(&self) -> usize {
+        self.selected.len()
+    }
+
+    fn answerable_count(&self) -> usize {
+        self.answerable.len()
+    }
+
+    /// True when the answerable denominator is broad enough for coverage to mean "this Space
+    /// answered the question" instead of "the corpus recognized one word of it".
+    fn answerable_ratio_sufficient(&self) -> bool {
+        if self.answerable.is_empty() {
+            return false;
+        }
+        if self.selected.len() < AUTOMATIC_MIN_ANSWERABLE_QUERY_TOKENS {
+            return true;
+        }
+        if self.answerable.len() < AUTOMATIC_MIN_ANSWERABLE_QUERY_TOKENS {
+            return false;
+        }
+        self.answerable
+            .len()
+            .saturating_mul(BASIS_POINTS_SCALE)
+            .checked_div(self.selected.len())
+            .unwrap_or(0)
+            >= AUTOMATIC_MIN_ANSWERABLE_RATIO_BASIS_POINTS
+    }
+}
+
+/// What the automatic text gate decided about one Space, and the numbers it decided on. The
+/// numbers are what a zero-result Pack reports as its omission.
+#[derive(Clone, Copy, Debug)]
+struct AutomaticTextGate {
+    eligible: bool,
+    coverage_basis_points: u16,
+    text_channel_count: usize,
+    /// True when coverage alone would have passed and only
+    /// [`AutomaticCoverageBasis::answerable_ratio_sufficient`] held it back.
+    blocked_by_answerable_ratio: bool,
+}
+
+impl AutomaticTextGate {
+    const ELIGIBLE: Self = Self {
+        eligible: true,
+        coverage_basis_points: 0,
+        text_channel_count: 0,
+        blocked_by_answerable_ratio: false,
+    };
+
+    /// Names the omission reason a rejected gate reports.
+    fn omission_reason(self) -> &'static str {
+        if self.blocked_by_answerable_ratio {
+            "low_answerable_ratio"
+        } else {
+            "automatic_text_ineligible"
+        }
+    }
+}
+
+/// Passes every query token straight through, unmeasured.
+///
+/// Explicit retrieval never pays for the per-token frequency probes, so it cannot know which
+/// tokens this corpus can answer. Every selected token therefore stays answerable and the
+/// coverage denominator is exactly the one explicit ranking already had.
+fn explicit_token_selection(tokens: &[String]) -> AutomaticTokenSelection {
+    let mut explanation = AutomaticQueryTokenExplanation {
+        document_count: 0,
+        high_document_frequency_min_documents: AUTOMATIC_HIGH_DF_DROP_MIN_DOCUMENTS,
+        high_document_frequency_threshold_basis_points: AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS,
+        stop_word_fallback_active: false,
+        selected_tokens: tokens.to_vec(),
+        answerable_tokens: tokens.to_vec(),
+        dropped_tokens: Vec::new(),
+        selected_token_count: 0,
+        answerable_token_count: 0,
+        dropped_token_count: 0,
+    };
+    explanation.refresh_counts();
+    AutomaticTokenSelection {
+        tokens: tokens.to_vec(),
+        answerable: tokens.to_vec(),
+        explanation,
+    }
 }
 
 /// Selects the query tokens used for automatic retrieval.
@@ -1614,18 +1821,7 @@ fn automatic_eligible_query_tokens(
     mode: ContextPackMode,
 ) -> Result<AutomaticTokenSelection> {
     if mode == ContextPackMode::Explicit {
-        return Ok(AutomaticTokenSelection {
-            tokens: tokens.to_vec(),
-            explanation: AutomaticQueryTokenExplanation {
-                document_count: 0,
-                high_document_frequency_min_documents: AUTOMATIC_HIGH_DF_DROP_MIN_DOCUMENTS,
-                high_document_frequency_threshold_basis_points:
-                    AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS,
-                stop_word_fallback_active: false,
-                selected_tokens: tokens.to_vec(),
-                dropped_tokens: Vec::new(),
-            },
-        });
+        return Ok(explicit_token_selection(tokens));
     }
     let document_count = automatic_text_document_count(connection)?;
     let stop_word_fallback_active = document_count < AUTOMATIC_HIGH_DF_MIN_DOCUMENTS;
@@ -1687,23 +1883,42 @@ fn automatic_eligible_query_tokens(
         });
     }
     ranked.truncate(MAX_AUTOMATIC_QUERY_TOKENS);
+    // The frequencies were already paid for above, so naming the answerable tokens costs no query.
+    //
+    // A generic word is excluded whatever its frequency. The denominator asks which words of the
+    // question this repository could have answered, and `the`, `task` or `code` answer nothing:
+    // leaving them in would let a query built entirely out of them read as fully covered the
+    // moment one of them appears somewhere, which is the noise an automatic channel exists to
+    // keep out. They stay in the query itself, where BM25 can still use them.
+    let mut answerable = ranked
+        .iter()
+        .filter(|(frequency, token)| *frequency > 0 && !automatic_stop_word(token))
+        .map(|(_, token)| token.clone())
+        .collect::<Vec<_>>();
+    answerable.sort();
     let mut eligible = ranked
         .into_iter()
         .map(|(_, token)| token)
         .collect::<Vec<_>>();
     eligible.sort();
     dropped.sort_by(|left, right| left.token.cmp(&right.token));
+    let mut explanation = AutomaticQueryTokenExplanation {
+        document_count,
+        high_document_frequency_min_documents: AUTOMATIC_HIGH_DF_DROP_MIN_DOCUMENTS,
+        high_document_frequency_threshold_basis_points: AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS,
+        stop_word_fallback_active,
+        selected_tokens: eligible.clone(),
+        answerable_tokens: answerable.clone(),
+        dropped_tokens: dropped,
+        selected_token_count: 0,
+        answerable_token_count: 0,
+        dropped_token_count: 0,
+    };
+    explanation.refresh_counts();
     Ok(AutomaticTokenSelection {
-        explanation: AutomaticQueryTokenExplanation {
-            document_count,
-            high_document_frequency_min_documents: AUTOMATIC_HIGH_DF_DROP_MIN_DOCUMENTS,
-            high_document_frequency_threshold_basis_points:
-                AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS,
-            stop_word_fallback_active,
-            selected_tokens: eligible.clone(),
-            dropped_tokens: dropped,
-        },
+        explanation,
         tokens: eligible,
+        answerable,
     })
 }
 
@@ -1878,6 +2093,9 @@ fn eligible_query_phrases(phrases: &[String], tokens: &[String]) -> Vec<String> 
 struct WorkingIntentHintQuery {
     source_field: WorkingIntentHintField,
     tokens: Vec<String>,
+    /// The subset of `tokens` this corpus can match at all, and so the coverage denominator of
+    /// this hint channel. Equal to `tokens` until automatic selection has measured them.
+    answerable_tokens: Vec<String>,
     phrases: Vec<String>,
 }
 
@@ -1902,6 +2120,7 @@ fn working_intent_hint_queries(intent: &WorkingIntentSnapshot) -> Vec<WorkingInt
             .collect::<Vec<_>>();
         (!tokens.is_empty()).then(|| WorkingIntentHintQuery {
             source_field,
+            answerable_tokens: tokens.clone(),
             tokens,
             phrases: normalized_phrases(values.iter().map(String::as_str)),
         })
@@ -2396,8 +2615,11 @@ struct TaskAssociationInference {
     graph_context_tree_oid: Option<String>,
     graph_artifact_generation: Option<String>,
     focus_reachable: bool,
-    query_tokens: Vec<String>,
+    /// Denominator every automatic coverage decision downstream of the inference divides by.
+    coverage_basis: AutomaticCoverageBasis,
     query_token_explanation: AutomaticQueryTokenExplanation,
+    /// Spaces the automatic text gate dropped, already collapsed to a reportable size.
+    omitted: Vec<ContextPackOmitted>,
 }
 
 fn normalized_values(values: &[String]) -> BTreeSet<String> {
@@ -2422,6 +2644,7 @@ fn infer_task_space_associations(
     mode: ContextPackMode,
 ) -> Result<TaskAssociationInference> {
     let selection = automatic_eligible_query_tokens(connection, query_tokens, mode)?;
+    let coverage_basis = AutomaticCoverageBasis::from_selection(&selection);
     let mut token_explanation = selection.explanation;
     let query_tokens = selection.tokens;
     let query_phrases = eligible_query_phrases(query_phrases, &query_tokens);
@@ -2433,6 +2656,7 @@ fn infer_task_space_associations(
             Ok(WorkingIntentHintQuery {
                 source_field: query.source_field,
                 phrases: eligible_query_phrases(&query.phrases, &selection.tokens),
+                answerable_tokens: selection.answerable,
                 tokens: selection.tokens,
             })
         })
@@ -2458,7 +2682,7 @@ fn infer_task_space_associations(
             query_graph_context_evidence(graph, resolved_focus, mode, &mut graph_contexts);
         expand_graph_context_relation_evidence(graph, mode, &mut graph_contexts)?;
     }
-    expand_current_context_relation_evidence(connection, mode, &query_tokens, &mut contexts)?;
+    expand_current_context_relation_evidence(connection, mode, &coverage_basis, &mut contexts)?;
     for ((space_id, context_id), context) in &contexts {
         aggregate_context_across_effective_spaces(
             &mut evidence,
@@ -2478,20 +2702,22 @@ fn infer_task_space_associations(
         );
     }
     hydrate_intent_conflict_state(connection, &mut evidence)?;
-    assign_channel_features(&mut evidence, &query_tokens);
-    let mut associations = evidence
-        .iter()
-        .filter_map(|(space_id, evidence)| {
-            association(
-                task_id,
-                *space_id,
-                evidence,
-                &query_tokens,
-                mode,
-                &token_explanation,
-            )
-        })
-        .collect::<Vec<_>>();
+    assign_channel_features(&mut evidence, coverage_basis.tokens());
+    let mut gate_omitted = Vec::new();
+    let mut associations = Vec::new();
+    for (space_id, space_evidence) in &evidence {
+        if let Some(built) = association(
+            task_id,
+            *space_id,
+            space_evidence,
+            &coverage_basis,
+            mode,
+            &token_explanation,
+            &mut gate_omitted,
+        ) {
+            associations.push(built);
+        }
+    }
     associations.sort_by(|left, right| {
         right
             .score
@@ -2508,9 +2734,35 @@ fn infer_task_space_associations(
         graph_context_tree_oid: graph_context_tree_oid.map(ToOwned::to_owned),
         graph_artifact_generation: engineering_graph.map(|graph| graph.artifact_generation.clone()),
         focus_reachable,
-        query_tokens,
+        coverage_basis,
         query_token_explanation: token_explanation,
+        omitted: collapse_gate_omissions(gate_omitted),
     })
+}
+
+/// Names the first [`AUTOMATIC_GATE_OMISSION_LIMIT`] Spaces the automatic text gate dropped and
+/// collapses the rest into one counted notice.
+///
+/// A Pack that returned nothing owes the Agent the reason; it does not owe it one entry per Space
+/// in the repository, which on a large Tree would cost more budget than the facts it replaced.
+fn collapse_gate_omissions(mut omitted: Vec<ContextPackOmitted>) -> Vec<ContextPackOmitted> {
+    if omitted.len() <= AUTOMATIC_GATE_OMISSION_LIMIT {
+        return omitted;
+    }
+    // Highest coverage first: the Spaces that came closest to passing are the ones worth naming.
+    omitted.sort_by(|left, right| {
+        right
+            .coverage_basis_points
+            .cmp(&left.coverage_basis_points)
+            .then_with(|| left.space_id.cmp(&right.space_id))
+    });
+    let collapsed = omitted.split_off(AUTOMATIC_GATE_OMISSION_LIMIT);
+    omitted.push(ContextPackOmitted {
+        reason: "automatic_text_ineligible".to_owned(),
+        count: collapsed.len(),
+        ..ContextPackOmitted::default()
+    });
+    omitted
 }
 
 fn query_effective_context_spaces(
@@ -2790,7 +3042,7 @@ fn apply_working_intent_hint_evidence(
                     .entry(space_channel)
                     .or_default()
                     .merge(&HintTextEvidence {
-                        query_tokens: query.tokens.iter().cloned().collect(),
+                        query_tokens: query.answerable_tokens.iter().cloned().collect(),
                         matched_tokens,
                         bm25: Some(candidate.bm25),
                         phrase_match: candidate.phrase_match,
@@ -2815,7 +3067,7 @@ fn apply_working_intent_hint_evidence(
         };
         for (key, matched) in context_matches {
             let hint = HintTextEvidence {
-                query_tokens: query.tokens.iter().cloned().collect(),
+                query_tokens: query.answerable_tokens.iter().cloned().collect(),
                 matched_tokens: matched.matched_tokens,
                 bm25: matched.bm25,
                 phrase_match: matched.phrase_match,
@@ -3192,7 +3444,7 @@ fn expand_graph_context_relation_evidence(
 fn expand_current_context_relation_evidence(
     connection: &Connection,
     mode: ContextPackMode,
-    query_tokens: &[String],
+    coverage_basis: &AutomaticCoverageBasis,
     contexts: &mut BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>,
 ) -> Result<()> {
     let edges = load_active_context_relations(connection, mode)?;
@@ -3206,9 +3458,10 @@ fn expand_current_context_relation_evidence(
             .or_default()
             .push(edge);
     }
+    let seed_basis = coverage_basis.selected_only();
     let seeds = contexts
         .iter()
-        .filter(|(_, evidence)| context_is_positive_seed(evidence, mode, query_tokens))
+        .filter(|(_, evidence)| context_is_positive_seed(evidence, mode, &seed_basis))
         .map(|((space_id, context_id), _evidence)| (*space_id, *context_id))
         .collect::<Vec<_>>();
     for (_space_id, seed_context_id) in seeds {
@@ -3264,7 +3517,7 @@ fn expand_current_context_relation_evidence(
 fn context_is_positive_seed(
     evidence: &AcceptedContextEvidence,
     mode: ContextPackMode,
-    query_tokens: &[String],
+    coverage_basis: &AutomaticCoverageBasis,
 ) -> bool {
     if evidence.graph_paths.iter().any(|path| {
         matches!(
@@ -3281,7 +3534,7 @@ fn context_is_positive_seed(
             || !evidence.hint_text.is_empty()
             || !evidence.matched_scopes.is_empty();
     }
-    automatic_direct_context_text_eligible(evidence, query_tokens)
+    automatic_direct_context_text_eligible(evidence, coverage_basis)
 }
 
 fn load_active_context_relations(
@@ -4113,6 +4366,13 @@ fn merge_token_explanations(
         .cloned()
         .chain(source.selected_tokens)
         .collect::<BTreeSet<_>>();
+    let answerable = target
+        .answerable_tokens
+        .iter()
+        .cloned()
+        .chain(source.answerable_tokens)
+        .collect::<BTreeSet<_>>();
+    target.answerable_tokens = answerable.into_iter().collect();
     target.dropped_tokens.extend(source.dropped_tokens);
     target.dropped_tokens.sort_by(|left, right| {
         left.token
@@ -4125,15 +4385,17 @@ fn merge_token_explanations(
         .dropped_tokens
         .retain(|drop| !selected.contains(&drop.token));
     target.selected_tokens = std::mem::take(&mut selected).into_iter().collect();
+    target.refresh_counts();
 }
 
 fn association(
     task_id: TaskId,
     space_id: SpaceId,
     evidence: &AssociationEvidence,
-    query_tokens: &[String],
+    coverage_basis: &AutomaticCoverageBasis,
     mode: ContextPackMode,
     token_explanation: &AutomaticQueryTokenExplanation,
+    omitted: &mut Vec<ContextPackOmitted>,
 ) -> Option<TaskSpaceAssociation> {
     if !evidence.intent_matched
         && evidence.hint_text.is_empty()
@@ -4146,16 +4408,32 @@ fn association(
     if evidence.fused_score_basis_points < MINIMUM_ASSOCIATION_SCORE_BASIS_POINTS {
         return None;
     }
-    if mode == ContextPackMode::AutomaticInjection
-        && !automatic_space_text_eligible(evidence, query_tokens)
-    {
-        return None;
+    if mode == ContextPackMode::AutomaticInjection {
+        let gate = automatic_space_text_gate(evidence, coverage_basis);
+        if !gate.eligible {
+            // The Space that failed the text gate is the whole reason a Pack can come back empty,
+            // so the decision is written down with the numbers it was made on.
+            omitted.push(ContextPackOmitted {
+                space_id: Some(space_id),
+                reason: gate.omission_reason().to_owned(),
+                count: 1,
+                coverage_basis_points: Some(gate.coverage_basis_points),
+                answerable_tokens: Some(coverage_basis.answerable_count()),
+                selected_tokens: Some(coverage_basis.selected_count()),
+                text_channel_count: Some(gate.text_channel_count),
+                ..ContextPackOmitted::default()
+            });
+            return None;
+        }
     }
     let score = association_score(evidence);
     let mut reasons = association_reasons(evidence);
     if !token_explanation.dropped_tokens.is_empty() {
+        // The projection, not the whole selection: the Pack carries one full copy at the top
+        // level, and repeating every token inside every Association spends the injection budget
+        // on saying the same thing once per Space.
         reasons.push(
-            serde_json::to_string(token_explanation)
+            serde_json::to_string(&token_explanation.compact_projection())
                 .expect("automatic query token explanation is always serializable"),
         );
     }
@@ -4171,17 +4449,23 @@ fn association(
     })
 }
 
-fn automatic_space_text_eligible(evidence: &AssociationEvidence, query_tokens: &[String]) -> bool {
+/// Decides whether one Space's text evidence is strong enough for automatic injection, and
+/// records the numbers behind the decision.
+fn automatic_space_text_gate(
+    evidence: &AssociationEvidence,
+    coverage_basis: &AutomaticCoverageBasis,
+) -> AutomaticTextGate {
     if !evidence.graph_exact_contexts.is_empty()
         || !evidence.relation_contexts.is_empty()
         || !evidence.focus_text_fallback_contexts.is_empty()
     {
-        return true;
+        return AutomaticTextGate::ELIGIBLE;
     }
     let hint_phrase = evidence.hint_text.values().any(|hint| hint.phrase_match);
     if evidence.intent_phrase_match || evidence.context_phrase_match || hint_phrase {
-        return true;
+        return AutomaticTextGate::ELIGIBLE;
     }
+    let query_tokens = coverage_basis.tokens();
     let coverage = token_coverage_basis_points(&evidence.intent_tokens, query_tokens)
         .max(identifier_weighted_coverage_basis_points(
             &evidence.context_tokens,
@@ -4196,17 +4480,31 @@ fn automatic_space_text_eligible(evidence: &AssociationEvidence, query_tokens: &
                 .max()
                 .unwrap_or(0),
         );
-    if coverage >= AUTOMATIC_TEXT_COVERAGE_THRESHOLD_BASIS_POINTS {
-        return true;
-    }
     let text_channel_count = usize::from(evidence.intent_matched)
         + usize::from(evidence.context_bm25.is_some())
         + evidence.hint_text.len();
-    if text_channel_count >= 2 {
-        return true;
+    let covered = coverage >= AUTOMATIC_TEXT_COVERAGE_THRESHOLD_BASIS_POINTS;
+    let ratio_sufficient = coverage_basis.answerable_ratio_sufficient();
+    let eligible = (covered && ratio_sufficient)
+        || text_channel_count >= 2
+        || (evidence.context_bm25.is_some() && !evidence.matched_scopes.is_empty());
+    AutomaticTextGate {
+        eligible,
+        coverage_basis_points: coverage,
+        text_channel_count,
+        blocked_by_answerable_ratio: !eligible && covered && !ratio_sufficient,
     }
-    evidence.context_bm25.is_some() && !evidence.matched_scopes.is_empty()
 }
+
+/// True when coverage measured against the answerable denominator may be believed on its own.
+fn automatic_coverage_passes(coverage: u16, coverage_basis: &AutomaticCoverageBasis) -> bool {
+    coverage >= AUTOMATIC_TEXT_COVERAGE_THRESHOLD_BASIS_POINTS
+        && coverage_basis.answerable_ratio_sufficient()
+}
+
+/// Most Spaces named one by one in a single omission reason before the rest are collapsed into
+/// one counted notice.
+const AUTOMATIC_GATE_OMISSION_LIMIT: usize = 8;
 
 const BASIS_POINTS_SCALE: usize = 10_000;
 const SCOPE_CONFLICT_SCORE_MULTIPLIER_BASIS_POINTS: u16 = 5_000;
@@ -4755,22 +5053,22 @@ fn load_task_context_candidates(
                 context_id: Some(candidate.item.context.context_id),
                 revision_id: Some(candidate.item.context.revision_id),
                 title: Some(candidate.item.context.title.clone()),
+                space_id: Some(candidate.item.association_space_id),
                 reason: "item_candidate_limit".to_owned(),
                 estimated_tokens: serialized_tokens(&candidate.item),
                 count: 1,
+                ..ContextPackOmitted::default()
             })
             .collect()
     } else {
         vec![ContextPackOmitted {
-            context_id: None,
-            revision_id: None,
-            title: None,
             reason: "item_candidate_limit".to_owned(),
             estimated_tokens: dropped
                 .iter()
                 .map(|candidate| serialized_tokens(&candidate.item))
                 .sum(),
             count: dropped.len(),
+            ..ContextPackOmitted::default()
         }]
     };
     if detail_level == ContextPackDetailLevel::Compact {
@@ -4794,6 +5092,49 @@ fn load_task_context_candidates(
         omitted,
         space_headers,
     })
+}
+
+/// Names the Spaces `max_spaces` truncated, so an Agent can ask for one of them explicitly
+/// instead of only learning that a number of them existed.
+///
+/// The first [`AUTOMATIC_GATE_OMISSION_LIMIT`] are named with their identity and title; the rest
+/// collapse into one counted notice, because a long list of names competes with the facts for the
+/// same budget.
+fn space_top_k_omissions(
+    connection: &Connection,
+    dropped: &[TaskSpaceAssociation],
+) -> Result<Vec<ContextPackOmitted>> {
+    if dropped.is_empty() {
+        return Ok(Vec::new());
+    }
+    let named = dropped.len().min(AUTOMATIC_GATE_OMISSION_LIMIT);
+    let space_ids = dropped[..named]
+        .iter()
+        .map(|association| association.space_id.to_string())
+        .collect::<Vec<_>>();
+    let headers = load_space_headers(connection, &space_ids)?;
+    let mut omitted = dropped[..named]
+        .iter()
+        .map(|association| ContextPackOmitted {
+            title: headers
+                .get(&association.space_id)
+                .and_then(|header| header.title.clone()),
+            space_id: Some(association.space_id),
+            reason: "space_top_k".to_owned(),
+            estimated_tokens: serialized_tokens(association),
+            count: 1,
+            ..ContextPackOmitted::default()
+        })
+        .collect::<Vec<_>>();
+    if named < dropped.len() {
+        omitted.push(ContextPackOmitted {
+            reason: "space_top_k".to_owned(),
+            estimated_tokens: dropped[named..].iter().map(serialized_tokens).sum(),
+            count: dropped.len() - named,
+            ..ContextPackOmitted::default()
+        });
+    }
+    Ok(omitted)
 }
 
 /// Reads the Intent-head title and provisional flag of every associated Space.
@@ -5291,7 +5632,7 @@ fn graph_context_candidate(
                 match_reason: context_match_reason(
                     Some(&graph.evidence),
                     i64::from(snapshot.evidence_completeness),
-                    &inference.query_tokens,
+                    inference.coverage_basis.tokens(),
                 ),
                 usage: ContextUsageCounts::default(),
                 detail: ContextPackDetail::Full,
@@ -5362,7 +5703,7 @@ fn task_context_candidate_from_row(
         && !automatic_context_text_eligible(
             space_evidence,
             context_evidence,
-            &inference.query_tokens,
+            &inference.coverage_basis,
         )
     {
         return Ok(None);
@@ -5437,7 +5778,7 @@ fn task_context_candidate_from_row(
     let match_reason = context_match_reason(
         context_evidence,
         evidence_completeness,
-        &inference.query_tokens,
+        inference.coverage_basis.tokens(),
     );
     let direct_path_count = paths
         .iter()
@@ -5484,10 +5825,10 @@ fn task_context_candidate_from_row(
 fn automatic_context_text_eligible(
     space: &AssociationEvidence,
     context: Option<&AcceptedContextEvidence>,
-    query_tokens: &[String],
+    coverage_basis: &AutomaticCoverageBasis,
 ) -> bool {
     let Some(context) = context else {
-        return automatic_inherited_space_text_eligible(space, query_tokens);
+        return automatic_inherited_space_text_eligible(space, coverage_basis);
     };
     if !context.matched_artifacts.is_empty()
         || context.graph_paths.iter().any(|path| {
@@ -5501,7 +5842,7 @@ fn automatic_context_text_eligible(
     {
         return true;
     }
-    if automatic_direct_context_text_eligible(context, query_tokens) {
+    if automatic_direct_context_text_eligible(context, coverage_basis) {
         return true;
     }
     let direct_text_channels = usize::from(context.textual_match) + context.hint_text.len();
@@ -5517,7 +5858,7 @@ fn automatic_context_text_eligible(
 
 fn automatic_inherited_space_text_eligible(
     space: &AssociationEvidence,
-    query_tokens: &[String],
+    coverage_basis: &AutomaticCoverageBasis,
 ) -> bool {
     let space_hints = space
         .hint_text
@@ -5528,14 +5869,14 @@ fn automatic_inherited_space_text_eligible(
     if space.intent_phrase_match || space_hints.iter().any(|hint| hint.phrase_match) {
         return true;
     }
-    let coverage = token_coverage_basis_points(&space.intent_tokens, query_tokens).max(
+    let coverage = token_coverage_basis_points(&space.intent_tokens, coverage_basis.tokens()).max(
         space_hints
             .iter()
             .map(|hint| hint.coverage_basis_points())
             .max()
             .unwrap_or(0),
     );
-    if coverage >= AUTOMATIC_TEXT_COVERAGE_THRESHOLD_BASIS_POINTS {
+    if automatic_coverage_passes(coverage, coverage_basis) {
         return true;
     }
     usize::from(space.intent_matched) + space_hints.len() >= 2
@@ -5543,7 +5884,7 @@ fn automatic_inherited_space_text_eligible(
 
 fn automatic_direct_context_text_eligible(
     context: &AcceptedContextEvidence,
-    query_tokens: &[String],
+    coverage_basis: &AutomaticCoverageBasis,
 ) -> bool {
     if context.phrase_match || context.hint_text.values().any(|hint| hint.phrase_match) {
         return true;
@@ -5551,7 +5892,7 @@ fn automatic_direct_context_text_eligible(
     let coverage = identifier_weighted_coverage_basis_points(
         &context.matched_tokens,
         &context.identifier_matched_tokens,
-        query_tokens,
+        coverage_basis.tokens(),
     )
     .max(
         context
@@ -5561,7 +5902,7 @@ fn automatic_direct_context_text_eligible(
             .max()
             .unwrap_or(0),
     );
-    if coverage >= AUTOMATIC_TEXT_COVERAGE_THRESHOLD_BASIS_POINTS {
+    if automatic_coverage_passes(coverage, coverage_basis) {
         return true;
     }
     let direct_text_channels = usize::from(context.textual_match) + context.hint_text.len();
@@ -5676,10 +6017,16 @@ fn context_match_reason(
 /// contradiction, or a sibling in the same Space. It is still returned and still explains its own
 /// route, but it never leads the Pack ahead of a Context that answered the query directly.
 /// Coverage at which a text-matched Context counts as having answered the query in full for
-/// ranking. Han bigrams and English stop words both make full coverage unreachable in practice, so
-/// saturating early keeps the multiplier a separator of *materially* different answers rather than
-/// a second BM25.
-const ITEM_TEXT_COVERAGE_SATURATION_BASIS_POINTS: u16 = 3_000;
+/// ranking.
+///
+/// It saturated at 3000 while coverage divided by every selected query token, because Han bigrams
+/// and English stop words the corpus never wrote down made full coverage unreachable and the
+/// multiplier had to separate answers somewhere inside the reachable range. Coverage now divides
+/// by the tokens this corpus can answer, where matching all of them is both reachable and exactly
+/// what "answered the query in full" means, so the saturation is that same full scale: a Context
+/// answering four of four answerable tokens has to outrank one answering one of them, and an
+/// early ceiling made those two nearly indistinguishable.
+const ITEM_TEXT_COVERAGE_SATURATION_BASIS_POINTS: u16 = 10_000;
 /// Multiplier a text-matched Context keeps when it covered none of the query beyond the token that
 /// found it. It is a demotion, never an exclusion: such a Context is still an answer, just not the
 /// one that answered most of the question.
@@ -5747,31 +6094,28 @@ fn pack_task_context_candidates(
     token_budget: usize,
     inference: TaskAssociationInference,
     graph_diagnostics: Vec<TaskGraphDiagnostic>,
-    omitted_space_count: usize,
-    omitted_space_tokens: usize,
+    space_omissions: Vec<ContextPackOmitted>,
     detail_level: ContextPackDetailLevel,
 ) -> PackedTaskContexts {
     let mut omitted = loaded.omitted;
-    if omitted_space_count > 0 {
-        omitted.push(ContextPackOmitted {
-            context_id: None,
-            revision_id: None,
-            title: None,
-            reason: "space_top_k".to_owned(),
-            estimated_tokens: omitted_space_tokens,
-            count: omitted_space_count,
-        });
-    }
-    let query_token_explanation = match detail_level {
-        ContextPackDetailLevel::Full => Some(inference.query_token_explanation.clone()),
-        ContextPackDetailLevel::Compact => None,
-    };
+    omitted.extend(space_omissions);
+    // The retrieval gate's own omissions are carried apart from the budget omissions: they are
+    // everything a Pack that returned nothing has to say, and nothing a Pack that returned a
+    // Context should give a Context up for.
+    let gate_omitted = inference.omitted.clone();
+    // Both detail levels report the token selection. A compact Pack gets the projection rather
+    // than nothing, because the reader most in need of it is the one whose Pack came back empty.
+    let query_token_explanation = Some(match detail_level {
+        ContextPackDetailLevel::Full => inference.query_token_explanation.clone(),
+        ContextPackDetailLevel::Compact => inference.query_token_explanation.compact_projection(),
+    });
     match detail_level {
         ContextPackDetailLevel::Full => pack_full_task_context(
             loaded.candidates,
             inference.associations,
             graph_diagnostics,
             &omitted,
+            &gate_omitted,
             token_budget,
             query_token_explanation,
         ),
@@ -5793,7 +6137,9 @@ fn pack_task_context_candidates(
                 associations,
                 graph_diagnostics,
                 &omitted,
+                &gate_omitted,
                 token_budget,
+                query_token_explanation,
             )
         }
     }
@@ -5827,12 +6173,15 @@ fn compact_association(
 /// has its Evidence summaries squeezed to [`COMPACT_SQUEEZED_EVIDENCE_SUMMARY_MAX_CHARS`] and is
 /// packed anyway, because an Agent that receives one truncated fact is better off than one that
 /// receives a longer list of what it did not get.
+#[allow(clippy::too_many_lines)]
 fn pack_compact_task_context(
     candidates: Vec<TaskContextCandidate>,
     mut associations: Vec<CompactSpaceAssociation>,
     mut graph_diagnostics: Vec<TaskGraphDiagnostic>,
     base_omitted: &[ContextPackOmitted],
+    gate_omitted: &[ContextPackOmitted],
     token_budget: usize,
+    query_token_explanation: Option<AutomaticQueryTokenExplanation>,
 ) -> PackedTaskContexts {
     let ranked = candidates
         .into_iter()
@@ -5868,20 +6217,32 @@ fn pack_compact_task_context(
     let mut diagnostic_omitted = OmissionAggregate::default();
     loop {
         let carried = ranked_values(&items);
-        let current_omitted = compact_budget_omissions(
-            base_omitted,
-            &ranked_values(&dropped),
-            space_omitted,
-            diagnostic_omitted,
+        let omissions = |carry_gate: bool| {
+            compact_budget_omissions(
+                &with_gate_omissions(base_omitted, gate_omitted, carry_gate),
+                &ranked_values(&dropped),
+                space_omitted,
+                diagnostic_omitted,
+            )
+        };
+        let charge = |carry_gate: bool, explanation: Option<&AutomaticQueryTokenExplanation>| {
+            charged_task_context_tokens(
+                &associations,
+                &carried,
+                &graph_diagnostics,
+                &omissions(carry_gate),
+                explanation,
+            )
+        };
+        let budgeted = budgeted_diagnostics(
+            &charge,
+            query_token_explanation.as_ref(),
+            carried.is_empty(),
+            token_budget,
         );
-        let estimated_tokens = charged_task_context_tokens(
-            &associations,
-            &carried,
-            &graph_diagnostics,
-            &current_omitted,
-            None,
-        );
-        if estimated_tokens <= token_budget {
+        if let Some(budgeted) = budgeted {
+            let effective_base =
+                with_gate_omissions(base_omitted, gate_omitted, budgeted.carry_gate_omissions);
             // The item share is a floor, not a ceiling: whatever the explanations left unspent
             // goes back to the highest ranked Context the first pass could not afford.
             if let Some((probe_items, probe_dropped)) = backfill(
@@ -5889,24 +6250,25 @@ fn pack_compact_task_context(
                 &dropped,
                 &associations,
                 &graph_diagnostics,
-                base_omitted,
+                &effective_base,
                 space_omitted,
                 diagnostic_omitted,
                 token_budget,
+                budgeted.explanation.as_ref(),
             ) {
                 items = probe_items;
                 dropped = probe_dropped;
                 continue;
             }
             return PackedTaskContexts {
-                estimated_tokens,
+                estimated_tokens: budgeted.estimated_tokens,
                 associations: Vec::new(),
                 compact_associations: associations,
                 items: Vec::new(),
                 compact_items: carried,
                 graph_diagnostics,
-                query_token_explanation: None,
-                omitted: current_omitted,
+                query_token_explanation: budgeted.explanation,
+                omitted: omissions(budgeted.carry_gate_omissions),
             };
         }
         // Explanations yield to facts: the Space list and the Graph diagnostics go first, and only
@@ -5925,12 +6287,12 @@ fn pack_compact_task_context(
             continue;
         }
         let current_omitted = compact_budget_omissions(
-            base_omitted,
+            &with_gate_omissions(base_omitted, gate_omitted, true),
             &ranked_values(&dropped),
             space_omitted,
             diagnostic_omitted,
         );
-        return exhausted_task_context(&current_omitted);
+        return exhausted_task_context(&current_omitted, query_token_explanation, token_budget);
     }
 }
 
@@ -5953,6 +6315,7 @@ fn backfill(
     space_omitted: OmissionAggregate,
     diagnostic_omitted: OmissionAggregate,
     token_budget: usize,
+    query_token_explanation: Option<&AutomaticQueryTokenExplanation>,
 ) -> Option<(Vec<RankedItem>, Vec<RankedItem>)> {
     let position = dropped
         .iter()
@@ -5975,7 +6338,7 @@ fn backfill(
         &ranked_values(&probe_items),
         graph_diagnostics,
         &probe_omitted,
-        None,
+        query_token_explanation,
     );
     (probe_tokens <= token_budget).then_some((probe_items, probe_dropped))
 }
@@ -6008,11 +6371,13 @@ fn elide(value: &str, max_chars: usize) -> String {
     elided
 }
 
+#[allow(clippy::too_many_lines)]
 fn pack_full_task_context(
     candidates: Vec<TaskContextCandidate>,
     mut associations: Vec<TaskSpaceAssociation>,
     mut graph_diagnostics: Vec<TaskGraphDiagnostic>,
     omitted: &[ContextPackOmitted],
+    gate_omitted: &[ContextPackOmitted],
     token_budget: usize,
     query_token_explanation: Option<AutomaticQueryTokenExplanation>,
 ) -> PackedTaskContexts {
@@ -6026,46 +6391,42 @@ fn pack_full_task_context(
     let mut diagnostic_omitted = OmissionAggregate::default();
 
     loop {
-        let current_omitted = task_budget_omissions(
-            omitted,
-            detail_omitted,
-            item_omitted,
-            space_omitted,
-            diagnostic_omitted,
-        );
-        let estimated_tokens = charged_task_context_tokens::<TaskSpaceAssociation, _>(
-            &associations,
-            &items,
-            &graph_diagnostics,
-            &current_omitted,
-            None,
-        );
-        if estimated_tokens <= token_budget {
-            // The token-selection explanation is a diagnostic, never a Context fact: it is added
-            // only when the budgeted payload leaves room, so it can never displace an item.
-            let with_explanation = charged_task_context_tokens(
+        let omissions = |carry_gate: bool| {
+            task_budget_omissions(
+                &with_gate_omissions(omitted, gate_omitted, carry_gate),
+                detail_omitted,
+                item_omitted,
+                space_omitted,
+                diagnostic_omitted,
+            )
+        };
+        let charge = |carry_gate: bool, explanation: Option<&AutomaticQueryTokenExplanation>| {
+            charged_task_context_tokens::<TaskSpaceAssociation, _>(
                 &associations,
                 &items,
                 &graph_diagnostics,
-                &current_omitted,
-                query_token_explanation.as_ref(),
-            );
-            let (estimated_tokens, query_token_explanation) = if with_explanation <= token_budget {
-                (with_explanation, query_token_explanation)
-            } else {
-                (estimated_tokens, None)
-            };
+                &omissions(carry_gate),
+                explanation,
+            )
+        };
+        if let Some(budgeted) = budgeted_diagnostics(
+            &charge,
+            query_token_explanation.as_ref(),
+            items.is_empty(),
+            token_budget,
+        ) {
             return PackedTaskContexts {
-                estimated_tokens,
+                estimated_tokens: budgeted.estimated_tokens,
                 associations,
                 compact_associations: Vec::new(),
                 items,
                 compact_items: Vec::new(),
                 graph_diagnostics,
-                query_token_explanation,
-                omitted: current_omitted,
+                query_token_explanation: budgeted.explanation,
+                omitted: omissions(budgeted.carry_gate_omissions),
             };
         }
+        let current_omitted = omissions(true);
 
         if let Some(space_id) = associations.last().map(|association| association.space_id) {
             if let Some(position) = items.iter().rposition(|item| {
@@ -6099,38 +6460,107 @@ fn pack_full_task_context(
             continue;
         }
 
-        return exhausted_task_context(&current_omitted);
+        return exhausted_task_context(&current_omitted, query_token_explanation, token_budget);
     }
+}
+
+/// Appends the retrieval-gate omissions to the budget omissions when the budget can afford them.
+fn with_gate_omissions(
+    omitted: &[ContextPackOmitted],
+    gate_omitted: &[ContextPackOmitted],
+    carry_gate: bool,
+) -> Vec<ContextPackOmitted> {
+    let mut all = omitted.to_vec();
+    if carry_gate {
+        all.extend_from_slice(gate_omitted);
+    }
+    all
+}
+
+/// One affordable way to explain the Pack: what it costs, and what survives at that cost.
+struct BudgetedDiagnostics {
+    estimated_tokens: usize,
+    explanation: Option<AutomaticQueryTokenExplanation>,
+    carry_gate_omissions: bool,
+}
+
+/// Fits the retrieval explanations into what is left of the budget, or reports that the payload
+/// has to give a fact up first.
+///
+/// They degrade in the order they stop being worth their tokens: the full token selection, then
+/// its projection, then the list of Spaces the text gate dropped, then nothing. The last two
+/// steps are taken only once the Pack carries an item that can speak for itself -- a Pack that
+/// came back empty keeps every explanation and gives up a Space or a diagnostic instead, because
+/// being told nothing without being told why is the failure this whole reason chain exists to
+/// prevent. And a Pack that did retrieve something has already answered the question the
+/// explanations exist to answer, so no Context is ever given up to make room for one.
+fn budgeted_diagnostics(
+    charge: &impl Fn(bool, Option<&AutomaticQueryTokenExplanation>) -> usize,
+    explanation: Option<&AutomaticQueryTokenExplanation>,
+    pack_is_empty: bool,
+    token_budget: usize,
+) -> Option<BudgetedDiagnostics> {
+    let projected = explanation.map(AutomaticQueryTokenExplanation::compact_projection);
+    let mut tiers = vec![(true, explanation.cloned()), (true, projected.clone())];
+    if !pack_is_empty {
+        tiers.push((false, projected));
+        tiers.push((false, None));
+    }
+    tiers.into_iter().find_map(|(carry_gate, explanation)| {
+        let estimated_tokens = charge(carry_gate, explanation.as_ref());
+        (estimated_tokens <= token_budget).then_some(BudgetedDiagnostics {
+            estimated_tokens,
+            explanation,
+            carry_gate_omissions: carry_gate,
+        })
+    })
 }
 
 /// Last resort when even one aggregated omission list exceeds the budget: keep nothing but one
 /// collapsed omission so the caller still learns that the Pack was dropped.
-fn exhausted_task_context(current_omitted: &[ContextPackOmitted]) -> PackedTaskContexts {
+///
+/// The token-selection explanation survives everything the ordinary packing loop gives up, but
+/// here there is nothing left to give up instead, and a Pack that overruns the budget it was
+/// handed is worse than one that cannot say why it is empty. So it degrades to its compact
+/// projection and, only if even that does not fit, to nothing.
+fn exhausted_task_context(
+    current_omitted: &[ContextPackOmitted],
+    query_token_explanation: Option<AutomaticQueryTokenExplanation>,
+    token_budget: usize,
+) -> PackedTaskContexts {
     let collapsed = vec![ContextPackOmitted {
-        context_id: None,
-        revision_id: None,
-        title: None,
         reason: "omitted".to_owned(),
         estimated_tokens: current_omitted
             .iter()
             .map(|omitted| omitted.estimated_tokens)
             .sum(),
         count: current_omitted.iter().map(|omitted| omitted.count).sum(),
+        ..ContextPackOmitted::default()
     }];
-    PackedTaskContexts {
-        estimated_tokens: charged_task_context_tokens::<TaskSpaceAssociation, TaskContextItem>(
+    let charge = |explanation: Option<&AutomaticQueryTokenExplanation>| {
+        charged_task_context_tokens::<TaskSpaceAssociation, TaskContextItem>(
             &[],
             &[],
             &[],
             &collapsed,
-            None,
-        ),
+            explanation,
+        )
+    };
+    let mut query_token_explanation =
+        query_token_explanation.map(|explanation| explanation.compact_projection());
+    let mut estimated_tokens = charge(query_token_explanation.as_ref());
+    if estimated_tokens > token_budget {
+        query_token_explanation = None;
+        estimated_tokens = charge(None);
+    }
+    PackedTaskContexts {
+        estimated_tokens,
         associations: Vec::new(),
         compact_associations: Vec::new(),
         items: Vec::new(),
         compact_items: Vec::new(),
         graph_diagnostics: Vec::new(),
-        query_token_explanation: None,
+        query_token_explanation,
         omitted: collapsed,
     }
 }
@@ -6164,12 +6594,10 @@ fn task_budget_omissions(
     ] {
         if aggregate.count > 0 {
             omitted.push(ContextPackOmitted {
-                context_id: None,
-                revision_id: None,
-                title: None,
                 reason: reason.to_owned(),
                 estimated_tokens: aggregate.estimated_tokens,
                 count: aggregate.count,
+                ..ContextPackOmitted::default()
             });
         }
     }
@@ -6192,11 +6620,12 @@ fn compact_budget_omissions(
     for item in dropped_items.iter().take(COMPACT_NAMED_OMISSION_LIMIT) {
         omitted.push(ContextPackOmitted {
             context_id: Some(item.context_id),
-            revision_id: None,
             title: Some(elide(&item.title, COMPACT_OMITTED_TITLE_MAX_CHARS)),
+            space_id: Some(item.space_id),
             reason: "item_token_budget".to_owned(),
             estimated_tokens: serialized_tokens(item),
             count: 1,
+            ..ContextPackOmitted::default()
         });
     }
     let collapsed = dropped_items
@@ -6205,12 +6634,10 @@ fn compact_budget_omissions(
         .collect::<Vec<_>>();
     if !collapsed.is_empty() {
         omitted.push(ContextPackOmitted {
-            context_id: None,
-            revision_id: None,
-            title: None,
             reason: "item_token_budget".to_owned(),
             estimated_tokens: collapsed.iter().copied().map(serialized_tokens).sum(),
             count: collapsed.len(),
+            ..ContextPackOmitted::default()
         });
     }
     for (reason, aggregate) in [
@@ -6219,12 +6646,10 @@ fn compact_budget_omissions(
     ] {
         if aggregate.count > 0 {
             omitted.push(ContextPackOmitted {
-                context_id: None,
-                revision_id: None,
-                title: None,
                 reason: reason.to_owned(),
                 estimated_tokens: aggregate.estimated_tokens,
                 count: aggregate.count,
+                ..ContextPackOmitted::default()
             });
         }
     }
@@ -6263,7 +6688,7 @@ pub fn estimate_task_context_payload_tokens(pack: &TaskContextPack) -> usize {
             &pack.compact_items,
             &pack.graph_diagnostics,
             &pack.omitted,
-            None,
+            pack.query_token_explanation.as_ref(),
         ),
     }
 }
@@ -7585,6 +8010,149 @@ mod tests {
             Some("Ignored in 3 prior task(s).")
         );
         assert_eq!(usage_prior_reason(ContextUsageCounts::default()), None);
+    }
+
+    fn tokens(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn basis(selected: &[&str], answerable: &[&str]) -> super::AutomaticCoverageBasis {
+        super::AutomaticCoverageBasis {
+            selected: tokens(selected),
+            answerable: tokens(answerable),
+        }
+    }
+
+    #[test]
+    fn coverage_divides_by_the_tokens_the_corpus_can_answer() {
+        let basis = basis(
+            &["bottom", "comment", "default", "input", "missing", "why"],
+            &["bottom", "comment", "input"],
+        );
+        let matched = ["bottom", "comment", "input"]
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect::<std::collections::BTreeSet<_>>();
+        // Three of three answerable tokens is full coverage; against all six selected tokens the
+        // same match read as 5000 and the automatic gate rejected it.
+        assert_eq!(
+            super::token_coverage_basis_points(&matched, basis.tokens()),
+            10_000
+        );
+        assert_eq!(
+            super::token_coverage_basis_points(&matched, &basis.selected),
+            5_000
+        );
+    }
+
+    #[test]
+    fn coverage_is_zero_when_the_corpus_answers_none_of_the_query() {
+        let basis = basis(&["kubernetes", "ingress", "timeout"], &[]);
+        let matched = std::collections::BTreeSet::new();
+        assert_eq!(
+            super::token_coverage_basis_points(&matched, basis.tokens()),
+            0
+        );
+        assert!(!basis.answerable_ratio_sufficient());
+    }
+
+    #[test]
+    fn the_answerable_guard_separates_a_thin_query_from_a_narrow_one() {
+        // A question the corpus recognizes a quarter of is asked in good faith.
+        assert!(
+            basis(&["a", "b", "c", "d", "e", "f", "g", "h"], &["a", "b"])
+                .answerable_ratio_sufficient()
+        );
+        // One word in nine is a query this Tree does not speak, whatever that word matches.
+        assert!(
+            !basis(&["a", "b", "c", "d", "e", "f", "g", "h", "i"], &["a"])
+                .answerable_ratio_sufficient()
+        );
+        // Two answerable tokens are the floor, and a query that never had two is exempt from it.
+        assert!(!basis(&["a", "b"], &["a"]).answerable_ratio_sufficient());
+        assert!(basis(&["a"], &["a"]).answerable_ratio_sufficient());
+        assert!(!basis(&["a"], &[]).answerable_ratio_sufficient());
+    }
+
+    #[test]
+    fn the_compact_projection_keeps_the_totals_and_drops_the_lists() {
+        let mut explanation = super::AutomaticQueryTokenExplanation {
+            document_count: 40,
+            high_document_frequency_min_documents: 20,
+            high_document_frequency_threshold_basis_points: 5_000,
+            stop_word_fallback_active: false,
+            selected_tokens: tokens(&["alpha", "bravo", "charlie"]),
+            answerable_tokens: tokens(&["alpha"]),
+            dropped_tokens: (0..12)
+                .map(|index| super::AutomaticQueryTokenDrop {
+                    token: format!("drop{index:02}"),
+                    filter: super::AutomaticQueryTokenFilter::HighDocumentFrequency,
+                    document_frequency: Some(index),
+                })
+                .collect(),
+            selected_token_count: 0,
+            answerable_token_count: 0,
+            dropped_token_count: 0,
+        };
+        explanation.refresh_counts();
+        let compact = explanation.compact_projection();
+        assert!(compact.selected_tokens.is_empty());
+        assert!(compact.answerable_tokens.is_empty());
+        assert_eq!(compact.selected_token_count, 3);
+        assert_eq!(compact.answerable_token_count, 1);
+        assert_eq!(compact.dropped_token_count, 12);
+        assert_eq!(
+            compact.dropped_tokens.len(),
+            super::COMPACT_QUERY_TOKEN_DROP_LIMIT
+        );
+        assert_eq!(compact.dropped_tokens[0].token, "drop00");
+    }
+
+    #[test]
+    fn gate_omissions_name_the_closest_spaces_and_collapse_the_rest() {
+        let omitted = (0..12)
+            .map(|index| super::ContextPackOmitted {
+                space_id: Some(sctx_domain::SpaceId::new()),
+                reason: "automatic_text_ineligible".to_owned(),
+                count: 1,
+                coverage_basis_points: Some(index * 100),
+                ..super::ContextPackOmitted::default()
+            })
+            .collect::<Vec<_>>();
+        let collapsed = super::collapse_gate_omissions(omitted);
+        assert_eq!(collapsed.len(), super::AUTOMATIC_GATE_OMISSION_LIMIT + 1);
+        // Highest coverage first: the Spaces that came closest to passing are the named ones.
+        assert_eq!(collapsed[0].coverage_basis_points, Some(1_100));
+        assert!(collapsed[0].space_id.is_some());
+        let last = collapsed.last().expect("the collapsed notice exists");
+        assert_eq!(last.count, 4);
+        assert!(last.space_id.is_none());
+        // A list short enough to name is left exactly as it is.
+        let short = vec![super::ContextPackOmitted {
+            reason: "low_answerable_ratio".to_owned(),
+            count: 1,
+            ..super::ContextPackOmitted::default()
+        }];
+        assert_eq!(super::collapse_gate_omissions(short.clone()), short);
+    }
+
+    #[test]
+    fn a_rejected_gate_names_which_rule_rejected_it() {
+        let ratio = super::AutomaticTextGate {
+            eligible: false,
+            coverage_basis_points: 10_000,
+            text_channel_count: 1,
+            blocked_by_answerable_ratio: true,
+        };
+        assert_eq!(ratio.omission_reason(), "low_answerable_ratio");
+        assert_eq!(
+            super::AutomaticTextGate {
+                blocked_by_answerable_ratio: false,
+                ..ratio
+            }
+            .omission_reason(),
+            "automatic_text_ineligible"
+        );
     }
 
     #[test]
