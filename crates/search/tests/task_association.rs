@@ -705,11 +705,13 @@ fn a_diff_signal_asks_about_its_path_and_never_about_its_repository_identifier()
     // A `Diff` that is not in the Hook's shape came from an Agent naming what changed in its own
     // words, and is still read whole: only `Workspace` treats an unattributed content as a bare
     // location that asks nothing.
-    assert!(!associations(TaskSignal {
-        kind: TaskSignalKind::Diff,
-        content: "SearchV2Endpoint".to_owned(),
-    })
-    .is_empty());
+    assert!(
+        !associations(TaskSignal {
+            kind: TaskSignalKind::Diff,
+            content: "SearchV2Endpoint".to_owned(),
+        })
+        .is_empty()
+    );
 }
 
 #[test]
