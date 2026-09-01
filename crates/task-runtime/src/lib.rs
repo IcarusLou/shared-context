@@ -3749,6 +3749,9 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
     let version = connection
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .map_err(sql_error("read task runtime schema version"))?;
+    if version == 13 {
+        return migrate_schema_13_to_14(connection);
+    }
     if version != 0 && version != SCHEMA_VERSION {
         return Err(invariant(format!(
             "unsupported task runtime schema version {version}; expected {SCHEMA_VERSION}"
@@ -4112,6 +4115,37 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
             PRAGMA user_version = 14;",
         )
         .map_err(sql_error("initialize task runtime schema"))
+}
+
+/// Adds the additive `hook_event` table (and its index) to an existing schema version 13
+/// installation and advances `user_version` to 14, in one transaction. Every prior table and
+/// its data is left untouched — this is the only supported upgrade path; every other version
+/// mismatch still hard-fails in [`ensure_schema`].
+fn migrate_schema_13_to_14(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS hook_event (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at_unix_ms INTEGER NOT NULL CHECK (recorded_at_unix_ms >= 0),
+                agent_kind TEXT NOT NULL,
+                external_session_id TEXT,
+                event_kind TEXT NOT NULL,
+                decision TEXT NOT NULL CHECK (
+                    decision IN ('enabled', 'disabled', 'neutral', 'fail_open')
+                ),
+                reason TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL CHECK (duration_ms >= 0),
+                detail TEXT CHECK (detail IS NULL OR length(detail) <= 256)
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS hook_event_recorded_at
+                ON hook_event (recorded_at_unix_ms);
+            PRAGMA user_version = 14;
+            COMMIT;",
+        )
+        .map_err(sql_error(
+            "migrate task runtime schema from version 13 to 14",
+        ))
 }
 
 fn insert_external_session(
