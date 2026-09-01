@@ -10,7 +10,8 @@ mod resolver;
 mod scanner;
 
 pub use artifact_focus::{
-    ARTIFACT_FOCUS_QUERY_BUDGET, ArtifactFocusHit, ArtifactFocusReader, MAX_ARTIFACT_FOCUS_HITS,
+    ARTIFACT_FOCUS_QUERY_BUDGET, ArtifactFocusHit, ArtifactFocusLookup, ArtifactFocusOutcome,
+    ArtifactFocusReader, MAX_ARTIFACT_FOCUS_HITS,
 };
 pub use projection::{EngineeringProjectionSnapshot, EngineeringProjectionStore};
 pub use resolver::{

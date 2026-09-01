@@ -33,6 +33,28 @@ pub struct ArtifactFocusHit {
     pub statement: String,
 }
 
+/// Why a lookup returned no hit without also returning an error.
+///
+/// Both variants render identically to a caller's reminder policy — no hit, no prompt — but
+/// they are distinguishable diagnostic outcomes so a Hook-path caller can record which one
+/// happened instead of treating every empty result the same way.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactFocusOutcome {
+    /// The lookup ran to completion; `hits` reflects every match found (possibly empty).
+    Completed,
+    /// The `state/engineering.sqlite` projection file does not exist or is not a plain file.
+    ProjectionAbsent,
+    /// The wall-clock budget elapsed before the lookup could finish.
+    BudgetExceeded,
+}
+
+/// Full result of one bounded, read-only lookup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactFocusLookup {
+    pub hits: Vec<ArtifactFocusHit>,
+    pub outcome: ArtifactFocusOutcome,
+}
+
 /// Bounded read-only reader for one installation's Engineering projection.
 #[derive(Clone, Debug)]
 pub struct ArtifactFocusReader {
@@ -55,29 +77,41 @@ impl ArtifactFocusReader {
 
     /// Returns accepted Graph Contexts associated with one exact File Artifact.
     ///
-    /// An absent projection returns no hit rather than an error. The lookup is
-    /// read-only, non-blocking (`busy_timeout` is zero), and abandoned once
-    /// `budget` elapses.
+    /// An absent projection or an exhausted query budget both report no hit through
+    /// [`ArtifactFocusLookup::outcome`] rather than as an error — callers that only render a
+    /// reminder can keep treating both as "no hit"; callers that want to diagnose the Hook path
+    /// can distinguish them. The lookup is read-only and abandoned once `budget` elapses.
     ///
     /// # Errors
     ///
-    /// Returns typed `SQLite` or Artifact identity errors. Every error is safe
-    /// for the caller to degrade into a neutral Hook result.
+    /// Returns [`ErrorKind::MaintenanceBusy`] when the read-only connection or a query hits
+    /// `SQLITE_BUSY`/`SQLITE_LOCKED` (the projection is non-blocking, so this is immediate), and
+    /// typed `SQLite` or Artifact identity errors otherwise. Every error is safe for the caller
+    /// to degrade into a neutral Hook result.
     pub fn accepted_contexts_for_file(
         &self,
         repository_id: &RepositoryId,
         relative_path: &RepoRelativePath,
         limit: usize,
         budget: Duration,
-    ) -> Result<Vec<ArtifactFocusHit>> {
+    ) -> Result<ArtifactFocusLookup> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(ArtifactFocusLookup {
+                hits: Vec::new(),
+                outcome: ArtifactFocusOutcome::Completed,
+            });
         }
         let Ok(metadata) = std::fs::symlink_metadata(&self.database) else {
-            return Ok(Vec::new());
+            return Ok(ArtifactFocusLookup {
+                hits: Vec::new(),
+                outcome: ArtifactFocusOutcome::ProjectionAbsent,
+            });
         };
         if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Ok(Vec::new());
+            return Ok(ArtifactFocusLookup {
+                hits: Vec::new(),
+                outcome: ArtifactFocusOutcome::ProjectionAbsent,
+            });
         }
         let deadline = Instant::now() + budget;
         let digest = ArtifactKey::derive(
@@ -109,7 +143,10 @@ impl ArtifactFocusReader {
         let mut pairs = Vec::new();
         for row in rows {
             if Instant::now() >= deadline {
-                return Ok(Vec::new());
+                return Ok(ArtifactFocusLookup {
+                    hits: Vec::new(),
+                    outcome: ArtifactFocusOutcome::BudgetExceeded,
+                });
             }
             pairs.push(row.map_err(sql_error("read Artifact focus Reference row"))?);
         }
@@ -118,7 +155,10 @@ impl ArtifactFocusReader {
         let mut hits = Vec::new();
         for (context_id, revision_id) in pairs {
             if Instant::now() >= deadline {
-                return Ok(Vec::new());
+                return Ok(ArtifactFocusLookup {
+                    hits: Vec::new(),
+                    outcome: ArtifactFocusOutcome::BudgetExceeded,
+                });
             }
             let statement = connection
                 .query_row(
@@ -150,7 +190,10 @@ impl ArtifactFocusReader {
             }
         }
         hits.truncate(limit);
-        Ok(hits)
+        Ok(ArtifactFocusLookup {
+            hits,
+            outcome: ArtifactFocusOutcome::Completed,
+        })
     }
 
     fn open_read_only(&self) -> Result<Connection> {
@@ -167,5 +210,49 @@ impl ArtifactFocusReader {
 }
 
 fn sql_error(context: &'static str) -> impl FnOnce(rusqlite::Error) -> Error {
-    move |error| Error::new(ErrorKind::Io, format!("{context}: {error}"))
+    move |error| {
+        if is_busy(&error) {
+            return Error::new(
+                ErrorKind::MaintenanceBusy,
+                format!("{context}: Engineering projection is locked by another process"),
+            );
+        }
+        Error::new(ErrorKind::Io, format!("{context}: {error}"))
+    }
+}
+
+/// Whether one `rusqlite` error is `SQLITE_BUSY` or `SQLITE_LOCKED`, the two codes a
+/// non-blocking (`busy_timeout(Duration::ZERO)`) read-only connection surfaces when another
+/// process currently holds the projection.
+fn is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(sqlite_error, _)
+            if matches!(
+                sqlite_error.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sql_error_classifies_busy_and_locked_as_maintenance_busy() {
+        const SQLITE_BUSY: std::ffi::c_int = 5;
+        const SQLITE_LOCKED: std::ffi::c_int = 6;
+        const SQLITE_IOERR: std::ffi::c_int = 10;
+
+        for code in [SQLITE_BUSY, SQLITE_LOCKED] {
+            let raw = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+            let mapped = sql_error("probe")(raw);
+            assert_eq!(mapped.kind(), ErrorKind::MaintenanceBusy);
+        }
+
+        let raw = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(SQLITE_IOERR), None);
+        let mapped = sql_error("probe")(raw);
+        assert_eq!(mapped.kind(), ErrorKind::Io);
+    }
 }
