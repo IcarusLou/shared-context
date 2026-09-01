@@ -1657,21 +1657,30 @@ const AUTOMATIC_IDENTIFIER_TOKEN_COVERAGE_WEIGHT: usize = 3;
 /// `manager`) is vocabulary that happens to occur inside some identifier; two words of the same
 /// `identifier_split` group are the query naming that identifier.
 const AUTOMATIC_MIN_IDENTIFIER_QUERY_TOKENS: usize = 2;
-/// Smallest corpus that lets observed document frequency decide which query tokens are generic.
+/// Smallest corpus that lets observed document frequency stand in for the built-in stop-word
+/// table, and the same size at which a frequent token may be dropped rather than merely ranked
+/// last.
 ///
-/// Below it the built-in stop-word table is the only available fallback and frequency merely
-/// orders the tokens; at or above it the corpus decides, so real domain vocabulary such as
-/// `search` stays eligible and a word this corpus really does put in half its documents may be
-/// dropped. One threshold governs both halves of that handover. Two of them left a band --
-/// five to nineteen documents -- in which neither the table nor the observed frequency applied,
-/// so a small repository ran with no generic-word filter at all, which is exactly the size at
-/// which every question shares its filler words with every Context.
+/// Below it the table is the only available fallback; at or above it the corpus decides, so real
+/// domain vocabulary such as `search` stays eligible. The two halves of that handover used to sit
+/// at different sizes, which left a band -- five to nineteen documents -- where neither the table
+/// nor the observed frequency applied and a small repository ran with no generic-word filter at
+/// all. Dropping here is still bounded by [`AUTOMATIC_MIN_RETAINED_QUERY_TOKENS`], so a question
+/// whose every word is frequent keeps its rarest ones and still retrieves.
 const AUTOMATIC_HIGH_DF_MIN_DOCUMENTS: usize = 5;
 const AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS: usize = 5_000;
 /// Number of rarest tokens that are never dropped for being merely frequent. It keeps a
 /// single-token or short intent intact, because dropping its only discriminating word retrieves
 /// nothing at all.
 const AUTOMATIC_MIN_RETAINED_QUERY_TOKENS: usize = 8;
+/// Smallest corpus in which a token present in nearly every document is evidence of a generic
+/// word rather than of a small repository with one subject.
+///
+/// The universal rule is the one drop that reaches inside the retained floor, so it is the one
+/// that can empty a query outright. In eight Contexts about one subject, the word all eight share
+/// is the subject; in forty it is filler. The frequency filter therefore starts at
+/// [`AUTOMATIC_HIGH_DF_MIN_DOCUMENTS`], and only its unbounded half waits for a corpus this size.
+const AUTOMATIC_UNIVERSAL_DF_MIN_DOCUMENTS: usize = 20;
 /// Document frequency at which a token selects essentially the whole corpus and therefore carries
 /// no retrieval signal at all. Such a token is dropped even inside the retained floor, because
 /// keeping it would turn a bare generic intent into an unbounded automatic injection.
@@ -1927,22 +1936,22 @@ fn automatic_eligible_query_tokens(
 
 /// Removes the tokens whose document frequency makes them useless discriminators. `ranked` is
 /// ordered rarest first, so the retained floor is simply its prefix: a frequent token survives
-/// while the query is short, unless it is present in nearly every document and would therefore
-/// select the whole corpus.
+/// while the query is short, unless the corpus is large enough for "present in nearly every
+/// document" to mean generic and the token would therefore select the whole corpus.
 fn drop_high_document_frequency_tokens(
     ranked: Vec<(usize, String)>,
     document_count: usize,
     dropped: &mut Vec<AutomaticQueryTokenDrop>,
 ) -> Vec<(usize, String)> {
     let minimum_frequency = document_count.saturating_mul(AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS);
-    let universal_frequency =
-        document_count.saturating_mul(AUTOMATIC_UNIVERSAL_DF_THRESHOLD_BASIS_POINTS);
+    let universal_frequency = (document_count >= AUTOMATIC_UNIVERSAL_DF_MIN_DOCUMENTS)
+        .then(|| document_count.saturating_mul(AUTOMATIC_UNIVERSAL_DF_THRESHOLD_BASIS_POINTS));
     let mut retained = Vec::with_capacity(ranked.len());
     for (position, (frequency, token)) in ranked.into_iter().enumerate() {
         let scaled = frequency.saturating_mul(BASIS_POINTS_SCALE);
         let frequent =
             position >= AUTOMATIC_MIN_RETAINED_QUERY_TOKENS && scaled >= minimum_frequency;
-        if frequent || scaled >= universal_frequency {
+        if frequent || universal_frequency.is_some_and(|limit| scaled >= limit) {
             dropped.push(AutomaticQueryTokenDrop {
                 token,
                 filter: AutomaticQueryTokenFilter::HighDocumentFrequency,
@@ -7585,16 +7594,16 @@ const DOMAIN_TERM_ALIAS_SOURCE: &str = "domain_term";
 /// expanding it would pull in every identifier that happens to contain it.
 const MIN_ALIAS_GROUP_MEMBERS_IN_QUERY: usize = 2;
 
-/// The same floor for a group seeded from a Space Intent domain term.
+/// The same floor for a non-ASCII member of a group seeded from a Space Intent domain term.
 ///
-/// An identifier split is discovered incidentally — any sentence that spells `PageManager` seeds
-/// one — so it has to be corroborated by a second member before it may widen a query. A domain
-/// term was written down by a reviewer as the vocabulary of this Space, and one term is one
-/// phrase, not a hub every phrase containing that word joins. Naming any part of it is therefore
-/// already the query asking about that term. It is also the only way a group ever fires for
-/// non-ASCII text: a Han term indexes as overlapping bigrams, and a rewritten question rarely
-/// reproduces two adjacent bigrams of a phrase it is paraphrasing.
-const MIN_DOMAIN_TERM_ALIAS_GROUP_MEMBERS_IN_QUERY: usize = 1;
+/// The two-member rule exists because an ASCII group member is a word in its own right: `page` is
+/// a member of `bottom-bar-page-manager` and also just a word, so expanding it alone turns the
+/// term into a hub every Space using that word joins. A non-ASCII member is not a word — a Han
+/// term indexes as *overlapping bigrams*, so `论输` is a fragment that exists only inside the one
+/// phrase it was cut from. Naming it is already the query asking about that term, and requiring
+/// two of them would mean requiring the paraphrase to reproduce two adjacent bigrams of the
+/// phrase it is paraphrasing, which is close to requiring the phrase itself.
+const MIN_HAN_DOMAIN_TERM_ALIAS_GROUP_MEMBERS_IN_QUERY: usize = 1;
 
 /// Bounded, deterministic `token_alias` expansion of one query's tokens.
 ///
@@ -7665,10 +7674,10 @@ impl AliasExpansion {
             let identifier_group = members
                 .iter()
                 .any(|(_, source)| source == IDENTIFIER_SPLIT_ALIAS_SOURCE);
-            let minimum = if identifier_group {
+            let minimum = if identifier_group || token.is_ascii() {
                 MIN_ALIAS_GROUP_MEMBERS_IN_QUERY
             } else {
-                MIN_DOMAIN_TERM_ALIAS_GROUP_MEMBERS_IN_QUERY
+                MIN_HAN_DOMAIN_TERM_ALIAS_GROUP_MEMBERS_IN_QUERY
             };
             if named < minimum {
                 continue;
@@ -8035,12 +8044,17 @@ mod tests {
     }
 
     #[test]
-    fn one_named_member_expands_a_domain_term_group_but_not_an_identifier_group() {
+    fn one_named_member_expands_a_han_domain_term_and_nothing_else() {
         let connection = alias_table(&[
             (
                 "domain_term",
                 "评论-论输-输入-入栏",
                 &["评论", "论输", "输入", "入栏"],
+            ),
+            (
+                "domain_term",
+                "bottom-bar-page-manager",
+                &["bottombarpagemanager", "bottom", "bar", "page", "manager"],
             ),
             (
                 "identifier_split",
@@ -8049,9 +8063,19 @@ mod tests {
             ),
         ]);
         // A rewritten question reproduces one bigram of the written-down term, never two adjacent
-        // ones, so the domain-term group has to fire on a single named member.
+        // ones, so a Han domain-term group has to fire on a single named member.
         let alias = AliasExpansion::load(&connection, &["评论".to_owned()]).unwrap();
         assert_eq!(alias.token_group("评论"), ["评论", "入栏", "论输", "输入"]);
+        // An ASCII member of the same kind of group is a word in its own right, so one of them
+        // still names no term in particular and would turn the term into a hub.
+        let alias = AliasExpansion::load(&connection, &["page".to_owned()]).unwrap();
+        assert_eq!(alias.token_group("page"), ["page"]);
+        let alias =
+            AliasExpansion::load(&connection, &["page".to_owned(), "manager".to_owned()]).unwrap();
+        assert_eq!(
+            alias.token_group("page"),
+            ["page", "bar", "bottom", "bottombarpagemanager"]
+        );
         // One word of an identifier names no identifier in particular and stays unexpanded.
         let alias = AliasExpansion::load(&connection, &["entrance".to_owned()]).unwrap();
         assert_eq!(alias.token_group("entrance"), ["entrance"]);
