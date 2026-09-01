@@ -1671,6 +1671,17 @@ const AUTOMATIC_TEXT_COVERAGE_THRESHOLD_BASIS_POINTS: u16 = 6_000;
 /// exactly the noise an automatic channel must never inject. Below this ratio the gate stops
 /// believing coverage and falls back to the multi-channel evidence it shares with every other
 /// path.
+///
+/// Swept across both probe sets, forty-six probes: every value from zero through 3333 produces
+/// the identical hit counts and no noise at all, and 3334 costs `probe-zh` two automatic hits
+/// (19/24 to 17/24) plus one on `probe-v1`. The ceiling is sharp because four probes -- zh-10,
+/// zh-11, en-01, en-02 -- ask a question of which this corpus can answer exactly one word in
+/// three. Nothing pins the floor: the noise probes are rejected for having *no* answerable token
+/// at all, which is a separate rule, so no probe requires this ratio to be positive. The value
+/// therefore stays where it was, 833 basis points clear of the only measured failure, and is not
+/// moved on evidence that does not exist. The zero margin this was expected to have at zh-13
+/// (two answerable tokens of eight, exactly on the line) is not real: raising the ratio to 2501
+/// changes nothing, because that Space passes on its second text channel rather than on coverage.
 const AUTOMATIC_MIN_ANSWERABLE_RATIO_BASIS_POINTS: usize = 2_500;
 /// Fewest answerable tokens the coverage gate is willing to divide by, relaxed when the query
 /// selected fewer tokens than this in the first place (an identifier lookup is one token and is
