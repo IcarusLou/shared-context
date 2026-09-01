@@ -3,6 +3,7 @@
 mod args;
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
@@ -13,7 +14,7 @@ use std::{
     str::FromStr,
     sync::Arc,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use args::Options;
@@ -32,7 +33,7 @@ use sctx_domain::{
     SemanticConflictDraft, SpaceId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkEpisodeStatus,
 };
 use sctx_engineering_graph::{
-    ARTIFACT_FOCUS_QUERY_BUDGET, ArtifactFocusReader, MAX_ARTIFACT_FOCUS_HITS,
+    ARTIFACT_FOCUS_QUERY_BUDGET, ArtifactFocusOutcome, ArtifactFocusReader, MAX_ARTIFACT_FOCUS_HITS,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendOutcome, AppendRequest, BatchId, GitStore};
@@ -55,7 +56,9 @@ use sctx_search::{
     ContextPackDetailLevel, ContextStatus, ScopeFilter, SearchEngine, SearchFilters,
     SearchMatchMode, SearchRequest,
 };
-use sctx_task_runtime::{AutomatedEpisodeBoundary, CandidateBuildStatus, TaskRuntime};
+use sctx_task_runtime::{
+    AutomatedEpisodeBoundary, CandidateBuildStatus, HookEventDecision, HookEventRecord, TaskRuntime,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -262,7 +265,7 @@ fn run_install_lifecycle(command: &str, args: &[String], json_output: bool) -> R
 }
 
 fn run_doctor(args: &[String], json_output: bool) -> Result<()> {
-    let options = Options::parse(args, &["--fix", "--recheck"])?;
+    let options = Options::parse(args, &["--fix", "--recheck", "--hooks"])?;
     options.allow_only(
         &[
             "--root",
@@ -270,8 +273,16 @@ fn run_doctor(args: &[String], json_output: bool) -> Result<()> {
             "--runtime-version",
             "--agents",
         ],
-        &["--fix", "--recheck"],
+        &["--fix", "--recheck", "--hooks"],
     )?;
+    if options.has("--hooks") {
+        if options.has("--fix") || options.has("--recheck") {
+            return Err(invalid(
+                "sctx doctor --hooks reports Hook diagnostics only; run --fix or --recheck separately",
+            ));
+        }
+        return run_doctor_hooks(&options, json_output);
+    }
     if options.has("--recheck") {
         if options.has("--fix") {
             return Err(invalid(
@@ -307,6 +318,64 @@ fn run_doctor_recheck(options: &Options, json_output: bool) -> Result<()> {
         &data,
         json_output,
     )
+}
+
+const HOOK_DIAGNOSTIC_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+const HOOK_DIAGNOSTIC_RECENT_LIMIT: usize = 50;
+
+/// Reports the Hook-path diagnostics `hook_event` recorded: a decision/reason count table over
+/// the last 24h, the most recent rows, and — best-effort — the current activation lease count.
+///
+/// This opens `TaskRuntime` with the normal (non-Hook) busy window and schema check; it is never
+/// on the Hook hot path.
+fn run_doctor_hooks(options: &Options, json_output: bool) -> Result<()> {
+    let root = options
+        .optional("--root")?
+        .map_or_else(installation_root, |value| Ok(PathBuf::from(value)))?;
+    let runtime = TaskRuntime::initialize(&root)?;
+    let since_unix_ms = unix_millis_now().saturating_sub(HOOK_DIAGNOSTIC_WINDOW_MS);
+    let counts = runtime.hook_event_counts_since(since_unix_ms)?;
+    let recent = runtime.recent_hook_events(HOOK_DIAGNOSTIC_RECENT_LIMIT)?;
+    let active_leases = AuthorizedSessionScopeStore::initialize(&root)
+        .and_then(|store| store.survey_stale_leases(Duration::ZERO))
+        .map(|survey| survey.total_entries)
+        .ok();
+    let data = json!({
+        "window_hours": HOOK_DIAGNOSTIC_WINDOW_MS / (60 * 60 * 1000),
+        "counts": counts
+            .iter()
+            .map(|count| json!({
+                "decision": count.decision,
+                "reason": count.reason,
+                "count": count.count,
+            }))
+            .collect::<Vec<_>>(),
+        "recent_events": recent
+            .iter()
+            .map(|event| json!({
+                "recorded_at_unix_ms": event.recorded_at_unix_ms,
+                "agent_kind": event.agent_kind,
+                "event_kind": event.event_kind,
+                "decision": event.decision,
+                "reason": event.reason,
+                "duration_ms": event.duration_ms,
+            }))
+            .collect::<Vec<_>>(),
+        "active_leases": active_leases,
+    });
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&data).map_err(json_error("serialize doctor hooks output"))?
+        );
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&data)
+                .map_err(json_error("serialize doctor hooks output"))?
+        );
+    }
+    Ok(())
 }
 
 fn run_uninstall(args: &[String], json_output: bool) -> Result<()> {
@@ -777,6 +846,109 @@ fn verify_demo_mcp(
     Ok(())
 }
 
+/// Best-effort diagnostic recorder for one `sctx hook` invocation.
+///
+/// It is created once at the top of [`run_hook`] and every fail-open, degraded, or normal
+/// completion point along the Hook path calls [`Self::flush`] exactly once. It opens at most one
+/// `TaskRuntime` per invocation, via the same short-timeout [`TaskRuntime::initialize_for_hook`]
+/// the rest of the Hook path already uses, and reuses it for every flush in this process. When
+/// the Runtime cannot be opened at all — `HOME` unset, a damaged installation, a schema that
+/// predates `hook_event` — every flush degrades to exactly one stderr line instead of failing
+/// the Hook or retrying.
+struct HookEventRecorder {
+    agent: String,
+    /// `<root>/state/runtime.sqlite`, computed once with no I/O. `None` only when `HOME` is
+    /// unset, matching every other Hook-path degrade-to-stderr case.
+    database_path: Option<PathBuf>,
+    event_kind: RefCell<Option<&'static str>>,
+    session_id: RefCell<Option<String>>,
+    started: Instant,
+}
+
+impl HookEventRecorder {
+    fn new(agent: &str) -> Self {
+        Self {
+            agent: agent.to_owned(),
+            database_path: installation_root()
+                .ok()
+                .map(|root| root.join("state").join("runtime.sqlite")),
+            event_kind: RefCell::new(None),
+            session_id: RefCell::new(None),
+            started: Instant::now(),
+        }
+    }
+
+    /// Binds the decoded event kind and session id. Every `flush` after this call uses the
+    /// bound values; a `flush` before it (only reachable from an undecodable payload) records
+    /// `event_kind = "undecodable"` and no session id.
+    fn bind(&self, event_kind: CanonicalAgentEventKind, session_id: &str) {
+        *self.event_kind.borrow_mut() = Some(hook_event_kind_str(event_kind));
+        *self.session_id.borrow_mut() = Some(session_id.to_owned());
+    }
+
+    /// Records one decision point. Never fails the Hook, and never adds stderr noise to a Hook
+    /// run that is otherwise clean: only a completely unresolvable `runtime.sqlite` path (`HOME`
+    /// unset) degrades to one stderr line. A write that fails once the path is resolved —
+    /// including the ordinary case of a schema that predates `hook_event`, or an installation
+    /// that has not run `sctx setup` yet — is silently dropped, exactly like every other
+    /// Hook-path diagnostic gap this change did not create.
+    ///
+    /// This writes through [`TaskRuntime::record_hook_event_at`] directly against the resolved
+    /// path rather than constructing a [`TaskRuntime`] first: many Hook processes may flush
+    /// concurrently, and skipping the extra validating connection open keeps this off the
+    /// contended part of the Hook hot path.
+    fn flush(&self, decision: HookEventDecision, reason: &str, detail: Option<String>) {
+        let event_kind = self.event_kind.borrow().unwrap_or("undecodable").to_owned();
+        let external_session_id = self.session_id.borrow().clone();
+        let duration_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match &self.database_path {
+            Some(database_path) => {
+                let record = HookEventRecord {
+                    recorded_at_unix_ms: unix_millis_now(),
+                    agent_kind: self.agent.clone(),
+                    external_session_id,
+                    event_kind,
+                    decision,
+                    reason: reason.to_owned(),
+                    duration_ms,
+                    detail,
+                };
+                let _ = TaskRuntime::record_hook_event_at(database_path, &record);
+            }
+            None => {
+                eprintln!("shared-context hook: {reason}");
+            }
+        }
+    }
+}
+
+const fn hook_event_kind_str(kind: CanonicalAgentEventKind) -> &'static str {
+    match kind {
+        CanonicalAgentEventKind::SessionStart => "session_start",
+        CanonicalAgentEventKind::PromptSubmit => "prompt_submit",
+        CanonicalAgentEventKind::PostToolUse => "post_tool_use",
+        CanonicalAgentEventKind::PreCompact => "pre_compact",
+        CanonicalAgentEventKind::TurnStop => "turn_stop",
+        CanonicalAgentEventKind::SessionEnd => "session_end",
+    }
+}
+
+fn unix_millis_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Truncates a safe (non-prompt, non-tool-output) diagnostic string to the
+/// `hook_event.detail` column's character ceiling.
+fn truncate_hook_detail(text: &str) -> String {
+    text.chars()
+        .take(sctx_task_runtime::MAX_HOOK_EVENT_DETAIL_CHARS)
+        .collect()
+}
+
 fn run_hook(args: &[String]) -> Result<()> {
     let options = Options::parse(args, &["--capabilities"])?;
     options.allow_only(
@@ -814,6 +986,7 @@ fn run_hook(args: &[String]) -> Result<()> {
             "--hook-available and --trust are probe-only options used with --capabilities",
         ));
     }
+    let recorder = HookEventRecorder::new(agent);
     let mut input = Vec::new();
     io::stdin()
         .read_to_end(&mut input)
@@ -836,28 +1009,33 @@ fn run_hook(args: &[String]) -> Result<()> {
         // which hosts render as a blocked action. Exit 2 stays reserved for CLI usage errors.
         Err(error) if error.kind() == ErrorKind::InvalidInput => {
             eprintln!("sctx hook: ignoring undecodable {agent} payload: {error}");
+            recorder.flush(HookEventDecision::FailOpen, "payload_decode_failed", None);
             println!("{{}}");
             return Ok(());
         }
         Err(error) => return Err(error),
     };
+    recorder.bind(event.kind(), &event.context().session_id);
     let trust = parse_trust(agent, None, true)?;
     let capabilities = agent_capabilities(agent, version.as_deref(), true, trust);
     let maintenance = installation_root()
         .and_then(MaintenanceLock::open_or_create)
         .and_then(|lock| lock.try_shared())
         .ok();
+    if maintenance.is_none() {
+        recorder.flush(HookEventDecision::FailOpen, "maintenance_lock_busy", None);
+    }
     let authorization = if maintenance.is_some() {
-        resolve_hook_authorization(agent, &event)
+        resolve_hook_authorization(agent, &event, &recorder)
     } else {
         HookAuthorization::disabled()
     };
     let activation = authorization.activation;
     let activated = activation == ResolvedActivationDecision::Enabled;
-    let action = plan_hook_action(agent, &event, &capabilities, &authorization);
-    let resolved = resolve_hook_action(action);
+    let action = plan_hook_action(agent, &event, &capabilities, &authorization, &recorder);
+    let resolved = resolve_hook_action(action, &recorder);
     if maintenance.is_some() && event.kind() == CanonicalAgentEventKind::SessionEnd {
-        remove_hook_session_scope(agent, &event.context().session_id);
+        remove_hook_session_scope(agent, &event.context().session_id, &recorder);
     }
     let output = if agent == "cursor" {
         sctx_adapter_cursor::encode_hook_output(event.kind(), &resolved)?
@@ -873,6 +1051,15 @@ fn run_hook(args: &[String]) -> Result<()> {
     if activated && !capabilities.hooks_verified() {
         eprintln!("{}", capabilities.diagnostic);
     }
+    // A Disabled outcome that reached here without any fail-open/degraded flush along the way is
+    // not a diagnostic event — it is the product's normal, by-design behavior for a Session
+    // Shared Context was never authorized for, and that Session must leave exactly zero local
+    // residue (verified by `repository_scoped_context_acceptance` and
+    // `repository_scoped_activation_acceptance`). Only an Enabled completion is recorded here;
+    // every genuine fault along a Disabled path already recorded its own row above.
+    if activated {
+        recorder.flush(HookEventDecision::Enabled, "ok", None);
+    }
     Ok(())
 }
 
@@ -883,6 +1070,7 @@ fn plan_hook_action(
     event: &CanonicalAgentEvent,
     capabilities: &AgentCapabilities,
     authorization: &HookAuthorization,
+    recorder: &HookEventRecorder,
 ) -> CanonicalAgentAction {
     let activation = authorization.activation;
     let action = plan_action_for_activation(event, capabilities, activation);
@@ -894,7 +1082,17 @@ fn plan_hook_action(
             .as_ref()
             .zip(authorization.catalog.as_ref())
             .and_then(|(scope, catalog)| {
-                attribute_post_tool_action(event, action, scope, catalog).ok()
+                match attribute_post_tool_action(event, action, scope, catalog) {
+                    Ok(action) => Some(action),
+                    Err(error) => {
+                        recorder.flush(
+                            HookEventDecision::Neutral,
+                            "attribution_failed",
+                            Some(truncate_hook_detail(error.message())),
+                        );
+                        None
+                    }
+                }
             })
             .unwrap_or_else(CanonicalAgentAction::neutral)
     } else {
@@ -908,6 +1106,7 @@ fn plan_hook_action(
             activation,
             capabilities,
             authorization,
+            recorder,
         )
     } else {
         action
@@ -935,15 +1134,27 @@ impl HookAuthorization {
     }
 }
 
-fn resolve_hook_authorization(agent: &str, event: &CanonicalAgentEvent) -> HookAuthorization {
-    resolve_hook_authorization_inner(
+fn resolve_hook_authorization(
+    agent: &str,
+    event: &CanonicalAgentEvent,
+    recorder: &HookEventRecorder,
+) -> HookAuthorization {
+    match resolve_hook_authorization_inner(
         agent,
         event.kind(),
         &event.context().session_id,
         &event.context().cwd,
-    )
-    .ok()
-    .unwrap_or_else(HookAuthorization::disabled)
+    ) {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            recorder.flush(
+                HookEventDecision::FailOpen,
+                "authorization_internal",
+                Some(truncate_hook_detail(error.message())),
+            );
+            HookAuthorization::disabled()
+        }
+    }
 }
 
 fn resolve_hook_authorization_inner(
@@ -996,7 +1207,7 @@ fn resolve_hook_authorization_inner(
     })
 }
 
-fn remove_hook_session_scope(agent: &str, session_id: &str) {
+fn remove_hook_session_scope(agent: &str, session_id: &str, recorder: &HookEventRecorder) {
     let Some((root, locator)) = installation_root()
         .ok()
         .zip(ExternalSessionLocator::new(agent, session_id).ok())
@@ -1008,8 +1219,15 @@ fn remove_hook_session_scope(agent: &str, session_id: &str) {
             store.forget(&locator);
         }
     }
-    let _removed =
+    let removed =
         AuthorizedSessionScopeStore::initialize(root).and_then(|store| store.try_remove(&locator));
+    if let Err(error) = removed {
+        recorder.flush(
+            HookEventDecision::Neutral,
+            "session_cleanup_failed",
+            Some(truncate_hook_detail(error.message())),
+        );
+    }
 }
 
 /// P4.1 experiment (`[hooks] artifact_focus_reminder`, default off).
@@ -1027,13 +1245,19 @@ fn add_artifact_focus_reminder(
     activation: ResolvedActivationDecision,
     capabilities: &AgentCapabilities,
     authorization: &HookAuthorization,
+    recorder: &HookEventRecorder,
 ) -> CanonicalAgentAction {
     if action.additional_context.is_some() {
         return action;
     }
-    if let Some(reminder) =
-        resolve_artifact_focus_reminder(agent, event, activation, capabilities, authorization)
-    {
+    if let Some(reminder) = resolve_artifact_focus_reminder(
+        agent,
+        event,
+        activation,
+        capabilities,
+        authorization,
+        recorder,
+    ) {
         action.additional_context = Some(reminder);
     }
     action
@@ -1045,6 +1269,7 @@ fn resolve_artifact_focus_reminder(
     activation: ResolvedActivationDecision,
     capabilities: &AgentCapabilities,
     authorization: &HookAuthorization,
+    recorder: &HookEventRecorder,
 ) -> Option<String> {
     let file = artifact_focus_reminder_file(
         event,
@@ -1068,18 +1293,51 @@ fn resolve_artifact_focus_reminder(
         return None;
     }
     let root = installation_root().ok()?;
-    let hits = ArtifactFocusReader::new(&root)
-        .accepted_contexts_for_file(
-            &resolved.repository_id,
-            &resolved.relative_path,
-            MAX_ARTIFACT_FOCUS_HITS,
-            ARTIFACT_FOCUS_QUERY_BUDGET,
-        )
-        .ok()?;
-    if hits.is_empty() {
+    let lookup = match ArtifactFocusReader::new(&root).accepted_contexts_for_file(
+        &resolved.repository_id,
+        &resolved.relative_path,
+        MAX_ARTIFACT_FOCUS_HITS,
+        ARTIFACT_FOCUS_QUERY_BUDGET,
+    ) {
+        Ok(lookup) => lookup,
+        Err(error) => {
+            let reason = if error.kind() == ErrorKind::MaintenanceBusy {
+                "artifact_focus_db_busy"
+            } else {
+                "artifact_focus_error"
+            };
+            recorder.flush(
+                HookEventDecision::FailOpen,
+                reason,
+                Some(truncate_hook_detail(error.message())),
+            );
+            return None;
+        }
+    };
+    match lookup.outcome {
+        ArtifactFocusOutcome::Completed => {}
+        ArtifactFocusOutcome::BudgetExceeded => {
+            recorder.flush(
+                HookEventDecision::FailOpen,
+                "artifact_focus_budget_exceeded",
+                None,
+            );
+            return None;
+        }
+        ArtifactFocusOutcome::ProjectionAbsent => {
+            recorder.flush(
+                HookEventDecision::Neutral,
+                "artifact_focus_projection_absent",
+                None,
+            );
+            return None;
+        }
+    }
+    if lookup.hits.is_empty() {
         return None;
     }
-    let contexts = hits
+    let contexts = lookup
+        .hits
         .into_iter()
         .map(|hit| ArtifactFocusReminderContext {
             context_id: hit.context_id,
@@ -1358,15 +1616,26 @@ fn agent_capabilities(
     }
 }
 
-fn resolve_hook_action(action: CanonicalAgentAction) -> ResolvedAgentAction {
+fn resolve_hook_action(
+    action: CanonicalAgentAction,
+    recorder: &HookEventRecorder,
+) -> ResolvedAgentAction {
     let CanonicalAgentAction {
         task_operation,
         additional_context,
         system_message,
     } = action;
-    let task_resolution = match task_operation.map(resolve_task_operation).transpose() {
+    let task_resolution = match task_operation
+        .map(|operation| resolve_task_operation(operation, recorder))
+        .transpose()
+    {
         Ok(resolution) => resolution.unwrap_or_default(),
-        Err(_) => {
+        Err(error) => {
+            recorder.flush(
+                HookEventDecision::FailOpen,
+                "task_operation_failed",
+                Some(truncate_hook_detail(error.message())),
+            );
             return ResolvedAgentAction {
                 additional_context: None,
                 system_message: Some(HOOK_TASK_UNAVAILABLE.to_owned()),
@@ -1385,7 +1654,10 @@ struct ResolvedTaskOperation {
     system_message: Option<String>,
 }
 
-fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<ResolvedTaskOperation> {
+fn resolve_task_operation(
+    operation: TaskRuntimeOperation,
+    recorder: &HookEventRecorder,
+) -> Result<ResolvedTaskOperation> {
     match operation {
         TaskRuntimeOperation::MergeSignals {
             locator,
@@ -1398,9 +1670,16 @@ fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<ResolvedTas
             let root = installation_root()?;
             let runtime = TaskRuntime::initialize_for_hook(&root)?;
             if runtime.read_snapshot_by_locator(&locator)?.is_none() {
-                let notify = AuthorizedSessionScopeStore::initialize(&root)
-                    .and_then(|store| store.try_mark_intent_bootstrap_notified(&locator))
-                    .unwrap_or(false);
+                let mark_result = AuthorizedSessionScopeStore::initialize(&root)
+                    .and_then(|store| store.try_mark_intent_bootstrap_notified(&locator));
+                let notify = mark_result.as_ref().copied().unwrap_or(false);
+                if let Err(error) = &mark_result {
+                    recorder.flush(
+                        HookEventDecision::Neutral,
+                        "bootstrap_mark_failed",
+                        Some(truncate_hook_detail(error.message())),
+                    );
+                }
                 return Ok(ResolvedTaskOperation {
                     additional_context: None,
                     system_message: notify.then(|| INTENT_BOOTSTRAP_REMINDER.to_owned()),

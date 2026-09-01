@@ -398,6 +398,11 @@ fn cursor_post_tool_hook_fails_open_when_runtime_is_unavailable() {
                 shared_context_activation_marker(AgentKind::Cursor, "cursor-fail-open")
         })
     );
+    // The prior SessionStart Hook already opened (and so created) `runtime.sqlite` itself —
+    // both to resolve the Task Runtime operation and to record its own `hook_event` diagnostic
+    // row — so the fault is injected by replacing that file with a directory, not by assuming
+    // the path is still untouched.
+    let _ = fs::remove_file(harness.root().join("state/runtime.sqlite"));
     fs::create_dir(harness.root().join("state/runtime.sqlite")).unwrap();
     let secret = "CURSOR_RAW_SECRET_MUST_NOT_LEAK";
 
@@ -548,6 +553,10 @@ fn hook_raw_stdin(harness: &Harness, agent: &str, payload: &[u8]) -> std::proces
 fn cursor_undecodable_payload_shapes_fail_open_with_a_neutral_output() {
     let harness = Harness::new();
     let secret = "CURSOR_UNDECODABLE_MUST_NOT_BLOCK";
+    // The Hook path's diagnostic write never creates `runtime.sqlite` itself (that would race a
+    // schema-less file ahead of the real Task Runtime tables), so this pre-creates it — exactly
+    // what a `sctx setup` on a real installation already does before any Hook ever fires.
+    TaskRuntime::initialize(harness.root()).unwrap();
 
     let mut empty_roots = cursor_session_start(&harness.home, "undecodable-roots");
     empty_roots["workspace_roots"] = json!([]);
@@ -564,6 +573,19 @@ fn cursor_undecodable_payload_shapes_fail_open_with_a_neutral_output() {
 
     let output = hook_raw_stdin(&harness, "cursor", b"RAW_NOT_JSON_PAYLOAD");
     assert_neutral(&output, &harness.root(), secret);
+
+    // The Runtime was already open-able (pre-created above), so every fail-open payload above
+    // must have left a `payload_decode_failed` hook_event row.
+    let runtime = TaskRuntime::initialize(harness.root()).unwrap();
+    let recent = runtime.recent_hook_events(50).unwrap();
+    let decode_failures = recent
+        .iter()
+        .filter(|event| event.reason == "payload_decode_failed")
+        .count();
+    assert_eq!(
+        decode_failures, 3,
+        "expected one payload_decode_failed hook_event row per undecodable payload: {recent:#?}"
+    );
 }
 
 /// The desktop IDE 3.17.21 shapes observed in production: an empty `generation_id` on
