@@ -182,3 +182,5 @@ macOS 测试会为 `aarch64-apple-darwin` 和 `x86_64-apple-darwin` 构建真实
 ## 设计不变量
 
 实现必须遵守 [`technical-design.md`](./technical-design.md) 的核心不变量。M1–M3 契约尤其禁止重新引入 Workspace 路由、Task 请求中的 Space 路由、Space 偏好排序、裸 query 自动注入、文本 TaskSignal 冒充 Graph edge，或让未确认 Candidate 进入自动注入。
+
+未授权（Disabled）的 Agent Session 必须零本地残留：`repository_scoped_activation_acceptance` 与 `repository_scoped_context_acceptance` 对 `state/` 做字节级快照比对。因此 Hook 路径上的任何持久化（含 `hook_event` 诊断行、TaskSignal）只能发生在 Enabled 决策之后；Disabled 且无 fail-open 事件的一次 Hook 调用不得写任何文件。
