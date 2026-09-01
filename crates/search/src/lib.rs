@@ -4778,6 +4778,9 @@ struct TaskContextCandidate {
     /// so this only reorders demoted items behind their undemoted siblings.
     injection_score_basis_points: u16,
     direct_path_count: usize,
+    /// Publication time in Unix seconds, or `-1` for a Context no publication has accepted yet.
+    /// It orders items nothing else separates, ahead of the meaningless Context identity.
+    accepted_at: i64,
     item: TaskContextItem,
     /// Compact projection of `item`, materialized only for
     /// [`ContextPackDetailLevel::Compact`] so the budgeter charges the emitted representation.
@@ -5052,6 +5055,11 @@ fn load_task_context_candidates(
                     .bm25
                     .total_cmp(&right.item.context.match_reason.bm25)
             })
+            // Newer first. BM25 separates equally covering Contexts by document length, which
+            // decides nothing a reader cares about once the text evidence has run out;
+            // publication time at least says which answer came later. It is never the last word:
+            // identity below it still totally orders the Pack.
+            .then_with(|| right.accepted_at.cmp(&left.accepted_at))
             .then_with(|| {
                 left.item
                     .context
@@ -5627,6 +5635,8 @@ fn graph_context_candidate(
             .get(&matched_space.association_space_id)
             .map_or(0, final_score_basis_points),
         direct_path_count,
+        // An Engineering Graph snapshot carries the Context, not the publication that accepted it.
+        accepted_at: -1,
         item: TaskContextItem {
             association_space_id: matched_space.association_space_id,
             context: ContextPackItem {
@@ -5816,6 +5826,7 @@ fn task_context_candidate_from_row(
             &derived_state,
         ),
         direct_path_count,
+        accepted_at: accepted_at.unwrap_or(-1),
         item: TaskContextItem {
             association_space_id: matched_space.association_space_id,
             context: ContextPackItem {
@@ -6722,6 +6733,10 @@ struct SearchPage {
     omitted: Vec<SearchOmitted>,
 }
 
+/// Cursor format version. Two adds `accepted_at`, which the ranking now orders by, so a version
+/// one cursor cannot address a page of this ordering and is rejected like any other stale cursor.
+const SEARCH_CURSOR_VERSION: u8 = 2;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CursorPayload {
     version: u8,
@@ -6729,6 +6744,8 @@ struct CursorPayload {
     query_fingerprint: String,
     relevance_bits: u64,
     evidence_completeness: i64,
+    /// Publication time in Unix seconds, or `-1` for a revision no publication has accepted yet.
+    accepted_at: i64,
     context_id: String,
     revision_id: String,
     seen: usize,
@@ -6739,6 +6756,7 @@ struct RankedRow {
     result: SearchResult,
     relevance: f64,
     evidence_completeness: i64,
+    accepted_at: i64,
 }
 
 /// `bm25()` column weights for `context_fts`, in its exact column order:
@@ -6911,7 +6929,7 @@ fn search_in_snapshot(
     let fingerprint = query_fingerprint(request, eligible_only)?;
     let cursor = request.cursor.as_deref().map(decode_cursor).transpose()?;
     if let Some(cursor) = &cursor {
-        if cursor.version != 1
+        if cursor.version != SEARCH_CURSOR_VERSION
             || cursor.tree_oid != tree_oid
             || cursor.query_fingerprint != fingerprint
         {
@@ -6999,14 +7017,20 @@ fn search_in_snapshot(
             parameters.extend([
                 SqlValue::Integer(cursor.evidence_completeness),
                 SqlValue::Integer(cursor.evidence_completeness),
+                SqlValue::Integer(cursor.accepted_at),
+                SqlValue::Integer(cursor.evidence_completeness),
+                SqlValue::Integer(cursor.accepted_at),
                 SqlValue::Text(cursor.context_id.clone()),
                 SqlValue::Integer(cursor.evidence_completeness),
+                SqlValue::Integer(cursor.accepted_at),
                 SqlValue::Text(cursor.context_id.clone()),
                 SqlValue::Text(cursor.revision_id.clone()),
             ]);
             "WHERE evidence_completeness < ?
-              OR (evidence_completeness = ? AND context_id > ?)
-              OR (evidence_completeness = ? AND context_id = ? AND revision_id > ?)"
+              OR (evidence_completeness = ? AND accepted_at < ?)
+              OR (evidence_completeness = ? AND accepted_at = ? AND context_id > ?)
+              OR (evidence_completeness = ? AND accepted_at = ? AND context_id = ?
+                  AND revision_id > ?)"
         } else {
             let relevance = f64::from_bits(cursor.relevance_bits);
             parameters.extend([
@@ -7015,16 +7039,23 @@ fn search_in_snapshot(
                 SqlValue::Integer(cursor.evidence_completeness),
                 SqlValue::Real(relevance),
                 SqlValue::Integer(cursor.evidence_completeness),
+                SqlValue::Integer(cursor.accepted_at),
+                SqlValue::Real(relevance),
+                SqlValue::Integer(cursor.evidence_completeness),
+                SqlValue::Integer(cursor.accepted_at),
                 SqlValue::Text(cursor.context_id.clone()),
                 SqlValue::Real(relevance),
                 SqlValue::Integer(cursor.evidence_completeness),
+                SqlValue::Integer(cursor.accepted_at),
                 SqlValue::Text(cursor.context_id.clone()),
                 SqlValue::Text(cursor.revision_id.clone()),
             ]);
             "WHERE relevance > ?
           OR (relevance = ? AND evidence_completeness < ?)
-          OR (relevance = ? AND evidence_completeness = ? AND context_id > ?)
-          OR (relevance = ? AND evidence_completeness = ? AND context_id = ? AND revision_id > ?)"
+          OR (relevance = ? AND evidence_completeness = ? AND accepted_at < ?)
+          OR (relevance = ? AND evidence_completeness = ? AND accepted_at = ? AND context_id > ?)
+          OR (relevance = ? AND evidence_completeness = ? AND accepted_at = ? AND context_id = ?
+              AND revision_id > ?)"
         }
     } else {
         ""
@@ -7032,10 +7063,16 @@ fn search_in_snapshot(
     parameters.push(SqlValue::Integer(
         i64::try_from(request.page_size + 1).map_err(|_| invalid("page size overflow"))?,
     ));
+    // Newer first between rows nothing else separates. A Context ID carries no meaning at all, so
+    // falling straight through to it made the page order an accident of identity; publication time
+    // is the one thing a reader can act on -- the later answer supersedes the earlier one in
+    // practice even when no `superseded_by` edge says so. It is never the last word: identity
+    // still breaks the remaining ties, so the page stays totally ordered and the cursor stable.
     let order_sql = if simple_rank {
-        "evidence_completeness DESC, context_id ASC, revision_id ASC"
+        "evidence_completeness DESC, accepted_at DESC, context_id ASC, revision_id ASC"
     } else {
-        "relevance ASC, evidence_completeness DESC, context_id ASC, revision_id ASC"
+        "relevance ASC, evidence_completeness DESC, accepted_at DESC,
+         context_id ASC, revision_id ASC"
     };
     let sql = format!(
         "{with_clause}{ranked_keyword} ranked AS (
@@ -7046,7 +7083,8 @@ fn search_in_snapshot(
                   item.auto_injection_eligible, {relevance} AS relevance,
                   {evidence} AS evidence_completeness, {coverage_sql} AS coverage_basis_points,
                   COALESCE(revision.problem_view, '') AS problem_view, revision.hint_text,
-                  item.superseded_by, item.stale_reason, item.accepted_at_unix_seconds
+                  item.superseded_by, item.stale_reason, item.accepted_at_unix_seconds,
+                  COALESCE(item.accepted_at_unix_seconds, -1) AS accepted_at
            FROM {from_sql}
            WHERE {where_sql}
          )
@@ -7117,6 +7155,9 @@ fn search_in_snapshot(
         let accepted_at = row
             .get::<_, Option<i64>>(19)
             .map_err(sql_error("read publication time"))?;
+        let accepted_at_rank = row
+            .get::<_, i64>(20)
+            .map_err(sql_error("read publication time rank"))?;
         let kind = parse_kind(&kind_text)?;
         let derived_state = ContextDerivedState {
             superseded_by,
@@ -7163,6 +7204,7 @@ fn search_in_snapshot(
             },
             relevance: row_relevance,
             evidence_completeness: row_evidence,
+            accepted_at: accepted_at_rank,
         });
     }
     let has_more = ranked.len() > request.page_size;
@@ -7172,11 +7214,12 @@ fn search_in_snapshot(
             .last()
             .map(|row| {
                 encode_cursor(&CursorPayload {
-                    version: 1,
+                    version: SEARCH_CURSOR_VERSION,
                     tree_oid: tree_oid.to_owned(),
                     query_fingerprint: fingerprint,
                     relevance_bits: row.relevance.to_bits(),
                     evidence_completeness: row.evidence_completeness,
+                    accepted_at: row.accepted_at,
                     context_id: row.result.context_id.to_string(),
                     revision_id: row.result.revision_id.to_string(),
                     seen: cursor.as_ref().map_or(0, |value| value.seen) + ranked.len(),
@@ -8031,6 +8074,155 @@ mod tests {
             }
         }
         connection
+    }
+
+    /// Two accepted Contexts holding the same text, published `first` and `second` seconds apart.
+    fn two_equally_ranked_contexts(first: i64, second: i64) -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+                 CREATE TABLE space_projection(space_id TEXT PRIMARY KEY, title TEXT) WITHOUT ROWID;
+                 CREATE TABLE context_item(
+                   context_id TEXT PRIMARY KEY, space_id TEXT NOT NULL,
+                   governance_status TEXT NOT NULL, auto_injection_eligible INTEGER NOT NULL,
+                   accepted_at_unix_seconds INTEGER, superseded_by TEXT, stale_reason TEXT
+                 ) WITHOUT ROWID;
+                 CREATE TABLE context_revision(
+                   revision_id TEXT PRIMARY KEY, context_id TEXT NOT NULL, space_id TEXT NOT NULL,
+                   kind TEXT NOT NULL, statement TEXT NOT NULL, rationale TEXT NOT NULL,
+                   applicability_json TEXT NOT NULL, assumptions_json TEXT NOT NULL,
+                   recheck_when_json TEXT NOT NULL, lifecycle TEXT NOT NULL,
+                   evidence_completeness INTEGER NOT NULL,
+                   problem_view TEXT, hint_text TEXT NOT NULL DEFAULT ''
+                 ) WITHOUT ROWID;
+                 CREATE TABLE evidence(
+                   evidence_id TEXT PRIMARY KEY, revision_id TEXT NOT NULL, kind TEXT NOT NULL,
+                   supports TEXT NOT NULL, content_json TEXT NOT NULL,
+                   interpretation TEXT NOT NULL, limitations_json TEXT NOT NULL
+                 ) WITHOUT ROWID;
+                 CREATE TABLE scope(
+                   revision_id TEXT NOT NULL, dimension TEXT NOT NULL, value TEXT NOT NULL,
+                   PRIMARY KEY(revision_id, dimension, value)
+                 ) WITHOUT ROWID;
+                 CREATE TABLE semantic_conflict(
+                   conflict_id TEXT PRIMARY KEY, status TEXT NOT NULL, projection_json TEXT NOT NULL
+                 ) WITHOUT ROWID;
+                 CREATE TABLE conflict(
+                   conflict_key TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL,
+                   context_id TEXT
+                 ) WITHOUT ROWID;
+                 CREATE TABLE publication_head(context_id TEXT, publication_id TEXT);
+                 CREATE TABLE publication(publication_id TEXT, revision_id TEXT);
+                 CREATE VIRTUAL TABLE context_fts USING fts5(
+                   context_id UNINDEXED, revision_id UNINDEXED,
+                   title, statement, rationale, evidence, problem_view, hint_text
+                 );
+                 CREATE TABLE token_alias(
+                   token TEXT NOT NULL, alias TEXT NOT NULL, source TEXT NOT NULL,
+                   group_key TEXT NOT NULL, PRIMARY KEY(token, alias, source, group_key)
+                 ) WITHOUT ROWID;",
+            )
+            .unwrap();
+        let space_id = "spc_00000000-0000-4000-8000-000000000001";
+        connection
+            .execute(
+                "INSERT INTO space_projection VALUES (?, ?)",
+                params![space_id, "Ordering Space"],
+            )
+            .unwrap();
+        let statement = "tiebreakneedle is stated identically by both Contexts";
+        // The earlier publication is given the lower Context ID, so identity alone would put it
+        // first and only the publication time can turn the order around.
+        for (index, accepted_at) in [(1_u8, first), (2, second)] {
+            let context_id = format!("ctx_00000000-0000-4000-8000-{index:012x}");
+            let revision_id = format!("rev_10000000-0000-4000-8000-{index:012x}");
+            connection
+                .execute(
+                    "INSERT INTO context_item VALUES (?, ?, 'accepted', 1, ?, NULL, NULL)",
+                    params![context_id, space_id, accepted_at],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO context_revision VALUES (
+                       ?, ?, ?, 'decision', ?, 'shared rationale',
+                       '{\"domains\":[],\"platforms\":[],\"conditions\":[]}', '[]', '[]',
+                       'accepted', 1000, NULL, ''
+                     )",
+                    params![revision_id, context_id, space_id, statement],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO context_fts VALUES (?, ?, ?, ?, ?, '', '', '')",
+                    params![
+                        context_id,
+                        revision_id,
+                        normalize_search_text(statement),
+                        normalize_search_text(statement),
+                        normalize_search_text("shared rationale")
+                    ],
+                )
+                .unwrap();
+        }
+        connection
+    }
+
+    fn ordered_context_ids(connection: &rusqlite::Connection) -> Vec<String> {
+        let request = SearchRequest {
+            query: "tiebreakneedle".to_owned(),
+            filters: SearchFilters {
+                statuses: vec![ContextStatus::Accepted],
+                ..SearchFilters::default()
+            },
+            page_size: 20,
+            ..SearchRequest::default()
+        };
+        search_in_snapshot(
+            connection,
+            &request,
+            "ordering-tree",
+            false,
+            &ContextTtlSettings::default(),
+        )
+        .unwrap()
+        .results
+        .into_iter()
+        .map(|result| result.context_id.to_string())
+        .collect()
+    }
+
+    #[test]
+    fn publication_time_orders_what_relevance_cannot_and_identity_still_closes_it() {
+        let newer_second = two_equally_ranked_contexts(1_000, 2_000);
+        assert_eq!(
+            ordered_context_ids(&newer_second),
+            [
+                "ctx_00000000-0000-4000-8000-000000000002",
+                "ctx_00000000-0000-4000-8000-000000000001"
+            ]
+        );
+        // Reversing only the publication times reverses only the order, so nothing else in the
+        // ranking is reading the identity these two rows differ in.
+        let newer_first = two_equally_ranked_contexts(2_000, 1_000);
+        assert_eq!(
+            ordered_context_ids(&newer_first),
+            [
+                "ctx_00000000-0000-4000-8000-000000000001",
+                "ctx_00000000-0000-4000-8000-000000000002"
+            ]
+        );
+        // With nothing left to separate them, identity closes the order rather than leaving it
+        // undefined.
+        let unpublished = two_equally_ranked_contexts(1_000, 1_000);
+        assert_eq!(
+            ordered_context_ids(&unpublished),
+            [
+                "ctx_00000000-0000-4000-8000-000000000001",
+                "ctx_00000000-0000-4000-8000-000000000002"
+            ]
+        );
     }
 
     #[test]
