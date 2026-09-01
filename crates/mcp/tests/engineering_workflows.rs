@@ -1346,7 +1346,8 @@ fn public_mcp_artifact_focus_is_query_scoped_across_six_kinds_and_hot_path() {
                 .unwrap()
                 .iter()
                 .any(|omitted| {
-                    omitted["reason"] == "graph_diagnostic_token_budget"
+                    omitted["reason"] == "diagnostic_token_budget"
+                        || omitted["reason"] == "graph_diagnostic_token_budget"
                         || omitted["reason"] == "omitted"
                 })
     );

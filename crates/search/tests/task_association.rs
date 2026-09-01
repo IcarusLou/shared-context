@@ -1670,11 +1670,23 @@ fn a_large_corpus_drops_generic_tokens_only_beyond_the_retained_rarest_floor() {
         .iter()
         .find(|association| association.space_id == fixture.precise_space_id)
         .expect("the rare tokens still associate the precise Space");
-    let explanation = association
+    // Every Association names the selection it was matched under; the token lists themselves live
+    // once at the top level rather than once per Space.
+    let projected = association
         .reasons
         .iter()
         .find_map(|reason| serde_json::from_str::<AutomaticQueryTokenExplanation>(reason).ok())
         .expect("automatic query token selection is explained");
+    assert!(projected.selected_tokens.is_empty());
+    assert!(projected.selected_token_count > 0);
+    let explanation = response
+        .query_token_explanation
+        .clone()
+        .expect("the explainable Pack names the automatic query token selection");
+    assert_eq!(
+        projected.selected_token_count,
+        explanation.selected_tokens.len()
+    );
 
     assert!(explanation.document_count >= 20);
     assert!(!explanation.stop_word_fallback_active);
@@ -1747,11 +1759,16 @@ fn the_retained_floor_keeps_frequent_tokens_but_never_a_corpus_wide_one() {
         )
         .unwrap();
     assert!(!response.associations.is_empty());
-    let explanation = response.associations[0]
-        .reasons
-        .iter()
-        .find_map(|reason| serde_json::from_str::<AutomaticQueryTokenExplanation>(reason).ok())
-        .expect("automatic query token selection is explained");
+    assert!(
+        response.associations[0]
+            .reasons
+            .iter()
+            .any(|reason| serde_json::from_str::<AutomaticQueryTokenExplanation>(reason).is_ok())
+    );
+    let explanation = response
+        .query_token_explanation
+        .clone()
+        .expect("the explainable Pack names the automatic query token selection");
 
     assert!(explanation.document_count >= 20);
     // 12 of 21 documents: frequent enough to trip the ordinary rule, but the query is short so the
@@ -1938,10 +1955,18 @@ fn high_coverage_hint_text_outranks_generic_text_and_remains_budgeted() {
         .task_context_pack(&generic_request)
         .unwrap();
     assert_eq!(explicit.associations.len(), generic_request.max_spaces);
-    assert!(explicit.omitted.iter().any(|item| {
-        item.reason == "space_top_k"
-            && item.count == fixture.total_spaces - generic_request.max_spaces
-    }));
+    // Every truncated Space is accounted for, and the named ones carry the identity an Agent
+    // needs to ask for one of them explicitly.
+    let space_top_k = explicit
+        .omitted
+        .iter()
+        .filter(|item| item.reason == "space_top_k")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        space_top_k.iter().map(|item| item.count).sum::<usize>(),
+        fixture.total_spaces - generic_request.max_spaces
+    );
+    assert!(space_top_k.iter().any(|item| item.space_id.is_some()));
 }
 
 /// One Space holding eight injection-safe Contexts that all answer the same rare query token.
@@ -2092,7 +2117,23 @@ fn compact_detail_level_drops_machine_channels_and_full_keeps_the_token_explanat
             .selected_tokens
             .contains(&"compactbudgetneedle".to_owned())
     );
-    assert!(compact.query_token_explanation.is_none());
+    // Compact keeps the projection, never the lists: the reader who most needs to know how much
+    // of the question this Tree could answer is the one whose Pack came back empty.
+    let compact_explanation = compact
+        .query_token_explanation
+        .as_ref()
+        .expect("compact packs keep the projected automatic query token selection");
+    assert!(compact_explanation.selected_tokens.is_empty());
+    assert!(compact_explanation.answerable_tokens.is_empty());
+    assert_eq!(
+        compact_explanation.selected_token_count,
+        explanation.selected_token_count
+    );
+    assert_eq!(
+        compact_explanation.answerable_token_count,
+        explanation.answerable_token_count
+    );
+    assert!(compact_explanation.dropped_tokens.len() <= 8);
 
     assert!(
         full.associations.iter().any(|association| association

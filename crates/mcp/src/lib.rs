@@ -1208,6 +1208,7 @@ impl TaskContextResponse {
             candidate_spaces: self.compact_candidate_spaces.clone(),
             items: self.compact_items.clone(),
             graph_diagnostics: self.graph_diagnostics.clone(),
+            query_token_explanation: self.query_token_explanation.clone(),
             task_fingerprint: self.task_fingerprint.clone(),
             tree: self.tree.clone(),
             generation: self.generation,
@@ -1229,6 +1230,11 @@ pub struct CompactTaskContextResponse {
     pub candidate_spaces: Vec<CompactSpaceAssociation>,
     pub items: Vec<CompactTaskContextItem>,
     pub graph_diagnostics: Vec<TaskGraphDiagnostic>,
+    /// Automatic query-token selection, projected onto its totals plus a few named drops. It is
+    /// the one explanation a compact Pack keeps: a Pack that came back with nothing still says
+    /// how much of the question this Tree could answer at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_token_explanation: Option<AutomaticQueryTokenExplanation>,
     pub task_fingerprint: String,
     pub tree: String,
     pub generation: u64,
