@@ -906,6 +906,95 @@ fn a_negated_near_duplicate_statement_is_a_contradiction_not_support() {
     );
 }
 
+/// The shape five of this repository's own nine accepted Contexts were recorded in: one
+/// conclusion, written again from scratch by a later Task in slightly different words, under no
+/// topic key at all. Statement equality on a topic key cannot see it — the topic key is optional
+/// and neither Task typed one — so every rewrite used to arrive as merely related and got
+/// confirmed as a brand new fact.
+#[test]
+fn one_conclusion_rewritten_without_a_topic_key_is_a_duplicate_of_the_accepted_context() {
+    const ACCEPTED: &str =
+        "Session activation binds the lease to the agent session rather than the parent directory";
+    const FIRST_REWRITE: &str =
+        "Session activation binds the lease to the agent session instead of the parent directory";
+    const SECOND_REWRITE: &str = "Session activation binds the session lease to the agent session \
+                                  in place of the parent directory";
+
+    let fixture = fixture();
+    let accepted = draft(
+        None,
+        ACCEPTED,
+        "The lease outlived the directory it was keyed on",
+        "activation-domain",
+    );
+    let target = add_context(&fixture.store, fixture.exact_space, accepted.clone());
+    fixture.index.synchronize().unwrap();
+
+    for restatement in [FIRST_REWRITE, SECOND_REWRITE] {
+        let mut rewrite = accepted.clone();
+        restatement.clone_into(&mut rewrite.statement);
+        "A later Task reached the same conclusion on its own Evidence"
+            .clone_into(&mut rewrite.rationale);
+        let result = analyze(&fixture, rewrite, Vec::new(), 8_000, 16);
+        let assessment = result
+            .analysis
+            .assessments
+            .iter()
+            .find(|assessment| assessment.target == Some(target))
+            .unwrap_or_else(|| panic!("no assessment against the accepted Context: {restatement}"));
+        assert_eq!(
+            assessment.relation,
+            CandidateAssessmentRelation::ExactDuplicate,
+            "{restatement}"
+        );
+        let similarity = assessment
+            .paths
+            .iter()
+            .find_map(|path| match path {
+                CandidateAssessmentPath::NearDuplicateStatement {
+                    similarity_basis_points,
+                } => Some(*similarity_basis_points),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no near-duplicate path: {:?}", assessment.paths));
+        assert!(
+            (5_000..8_000).contains(&similarity),
+            "the rewrite sits in the measured near-duplicate band, not on an equality path: \
+             {similarity}"
+        );
+        assert_eq!(
+            result.candidate_status,
+            sctx_domain::AutomaticCandidateStatus::ExactDuplicateReview,
+            "{restatement}"
+        );
+    }
+
+    // The other half of the measurement: pairs about different conclusions sat at or below 1_100
+    // basis points, so widening the duplicate band to 5_000 does not sweep them in.
+    let unrelated = analyze(
+        &fixture,
+        draft(
+            None,
+            "Repository scan skips vendored directories before it plans any file read",
+            "Scanning vendored trees cost more than it returned",
+            "activation-domain",
+        ),
+        Vec::new(),
+        8_000,
+        16,
+    );
+    assert!(
+        unrelated
+            .analysis
+            .assessments
+            .iter()
+            .filter(|assessment| assessment.target == Some(target))
+            .all(|assessment| assessment.relation != CandidateAssessmentRelation::ExactDuplicate),
+        "an unrelated conclusion never restates the accepted Context: {:?}",
+        unrelated.analysis.assessments
+    );
+}
+
 #[test]
 fn applicability_domain_overlap_alone_no_longer_contradicts() {
     let fixture = fixture();

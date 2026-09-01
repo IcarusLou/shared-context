@@ -861,6 +861,15 @@ pub enum CandidateAssessmentPath {
     SharedIdentifier {
         identifiers: Vec<String>,
     },
+    /// One conclusion restated against an accepted Context that carries no matching topic key.
+    ///
+    /// The topic key is optional, so the strongest duplicate path — statement equality on one
+    /// topic — cannot see a Task that recorded the same conclusion in its own words without ever
+    /// typing a topic. Normalized statement overlap can: rewrites of one conclusion sit far above
+    /// unrelated pairs, and this path records where in that band the two Claims met.
+    NearDuplicateStatement {
+        similarity_basis_points: u64,
+    },
     ScopeOverlap {
         domains: Vec<String>,
         platforms: Vec<String>,
@@ -894,6 +903,16 @@ impl CandidateAssessmentPath {
                     return Err(invalid(format!("{field}.matched_terms must not be empty")));
                 }
                 require_text_items(matched_terms, &format!("{field}.matched_terms"))
+            }
+            Self::NearDuplicateStatement {
+                similarity_basis_points,
+            } => {
+                if *similarity_basis_points == 0 || *similarity_basis_points > 10_000 {
+                    return Err(invalid(format!(
+                        "{field}.similarity_basis_points must be between 1 and 10000"
+                    )));
+                }
+                Ok(())
             }
             Self::SharedIdentifier { identifiers } => {
                 if identifiers.len() < 2 {
@@ -950,23 +969,41 @@ impl CandidateRelationAssessment {
         }
         require_text_items(&self.reasons, &format!("{field}.reasons"))?;
         if self.relation == CandidateAssessmentRelation::ExactDuplicate
-            && !self
-                .paths
-                .contains(&CandidateAssessmentPath::CanonicalDraftEquality)
-            && !(self
-                .paths
-                .contains(&CandidateAssessmentPath::StatementEquality)
-                && self
-                    .paths
-                    .iter()
-                    .any(|path| matches!(path, CandidateAssessmentPath::TopicEquality { .. })))
+            && !self.claims_a_duplicate_path()
         {
             return Err(invalid(format!(
-                "{field}.exact_duplicate requires canonical draft equality, or statement equality \
-                 on one topic key"
+                "{field}.exact_duplicate requires canonical draft equality, statement equality on \
+                 one topic key, or a near-duplicate statement against an accepted Context"
             )));
         }
         Ok(())
+    }
+
+    /// Whether the recorded paths support calling this assessment an exact duplicate.
+    ///
+    /// Three paths reach that conclusion, and no other combination does: the whole canonical draft
+    /// equals the revision, the statement equals it under one shared topic key, or the statement
+    /// restates an accepted Context closely enough to sit in the measured near-duplicate band.
+    fn claims_a_duplicate_path(&self) -> bool {
+        if self
+            .paths
+            .contains(&CandidateAssessmentPath::CanonicalDraftEquality)
+        {
+            return true;
+        }
+        if self
+            .paths
+            .contains(&CandidateAssessmentPath::StatementEquality)
+            && self
+                .paths
+                .iter()
+                .any(|path| matches!(path, CandidateAssessmentPath::TopicEquality { .. }))
+        {
+            return true;
+        }
+        self.paths
+            .iter()
+            .any(|path| matches!(path, CandidateAssessmentPath::NearDuplicateStatement { .. }))
     }
 }
 
