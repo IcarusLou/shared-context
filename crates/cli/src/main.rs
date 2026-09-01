@@ -820,19 +820,20 @@ fn verify_demo_mcp(
         .and_then(|response| response.pointer("/result/tools"))
         .and_then(Value::as_array)
         .ok_or_else(|| invariant("demo MCP tools/list response is missing"))?;
-    if tools.len() != 16
-        || [
-            "task_checkpoint",
-            "candidate_list",
-            "candidate_get",
-            "candidate_discard",
-            "candidate_confirm",
-        ]
+    // Compare the whole emitted surface against the one shared name list rather than spot-checking
+    // the Candidate Review tools: a hardcoded count plus five sampled names let `space_create` ship
+    // in `tools/list` without the demo noticing.
+    let emitted = tools
         .iter()
-        .any(|name| !tools.iter().any(|tool| tool["name"] == *name))
-    {
+        .map(|tool| tool["name"].as_str().unwrap_or_default())
+        .collect::<BTreeSet<_>>();
+    let expected = sctx_agent_adapter::shared_context_tool_names()
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if tools.len() != expected.len() || emitted != expected {
         return Err(invariant(
-            "demo MCP tools/list did not return the Candidate Review surface",
+            "demo MCP tools/list did not return the full tool surface, including Candidate Review",
         ));
     }
     let results = responses

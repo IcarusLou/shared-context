@@ -244,8 +244,8 @@ def read_checkpoint_schema(binary: pathlib.Path, probe_env: dict[str, str]) -> d
     if status != 0 or initialized.get("result", {}).get("protocolVersion") != "2024-11-05":
         raise RuntimeError("installed MCP failed initialization during schema probe")
     tools = listed["result"]["tools"]
-    if len(tools) != 16:
-        raise RuntimeError(f"installed MCP exposed {len(tools)} tools instead of 16")
+    if len(tools) != 17:
+        raise RuntimeError(f"installed MCP exposed {len(tools)} tools instead of 17")
     checkpoint = next(tool for tool in tools if tool["name"] == "task_checkpoint")
     schema = checkpoint["inputSchema"]
     assert_checkpoint_schema(schema)
@@ -595,7 +595,7 @@ def main() -> int:
         "threshold_percent": 99.0,
         "parallelism": arguments.parallelism,
         "schema_sha256": schema_hash,
-        "public_tool_count": 16,
+        "public_tool_count": 17,
         "distinct_operation_ids": len(operation_ids),
         "forbidden_error_codes": forbidden,
         "checkpoint_git_unchanged": git_before == git_after,

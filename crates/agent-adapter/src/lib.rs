@@ -894,25 +894,43 @@ fn is_dedicated_test_tool(name: &str) -> bool {
     matches!(name, "pytest" | "run_test" | "run_tests" | "test")
 }
 
+/// Every Shared Context MCP tool name, sorted alphabetically so a new tool has one obvious slot.
+///
+/// This is a whitelist, not a description: a name missing from it is silently reclassified as a
+/// foreign tool, so the Hook path stops treating that `PostToolUse` as neutral and starts
+/// attributing Shared Context's own writes to the Agent. Several surfaces have to recognize the
+/// same names — this classifier, `sctx setup --demo` verification, the demo oracle — and because
+/// each kept its own copy they drifted: `space_create` shipped in `tools/list` while three copies
+/// still knew only sixteen names. [`shared_context_tool_names`] exists so those surfaces read
+/// this array instead of restating it.
+const TOOL_NAMES: [&str; 17] = [
+    "association_explain",
+    "association_rebuild",
+    "candidate_confirm",
+    "candidate_discard",
+    "candidate_get",
+    "candidate_list",
+    "context_get",
+    "context_search",
+    "engineering_reference_record",
+    "repository_scan",
+    "space_create",
+    "space_list",
+    "task_artifact_focus",
+    "task_checkpoint",
+    "task_context",
+    "task_intent_update",
+    "task_signal_supersede",
+];
+
+/// The public Shared Context MCP tool names, as one list every surface that has to recognize
+/// them reads instead of copying.
+#[must_use]
+pub fn shared_context_tool_names() -> &'static [&'static str] {
+    &TOOL_NAMES
+}
+
 fn is_shared_context_tool(name: &str) -> bool {
-    const TOOL_NAMES: [&str; 16] = [
-        "association_explain",
-        "association_rebuild",
-        "candidate_confirm",
-        "candidate_discard",
-        "candidate_get",
-        "candidate_list",
-        "context_get",
-        "context_search",
-        "engineering_reference_record",
-        "repository_scan",
-        "space_list",
-        "task_artifact_focus",
-        "task_checkpoint",
-        "task_context",
-        "task_intent_update",
-        "task_signal_supersede",
-    ];
     let unqualified = name.strip_prefix("mcp:").unwrap_or(name);
     TOOL_NAMES.contains(&unqualified)
         || name.starts_with("mcp__shared-context__")
