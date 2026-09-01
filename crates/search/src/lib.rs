@@ -1955,10 +1955,20 @@ fn drop_high_document_frequency_tokens(
     retained
 }
 
+/// Two-letter ASCII tokens that name something a question is genuinely asked about.
+///
+/// The short-token rule exists to discard the fragments identifier splitting produces, but a
+/// handful of two-letter words are whole names in this domain: they are the entire discriminating
+/// content of "did CI pass", "which DB migration", "the RN bridge". Dropping them left such a
+/// question with nothing to retrieve on. The list is deliberately short -- a token earns a place
+/// only by being a name rather than a word -- and a corpus large enough for document frequency to
+/// speak still drops any of them that turns out to be generic there.
+const MEANINGFUL_SHORT_TOKENS: [&str; 9] = ["ci", "db", "fe", "id", "io", "js", "os", "rn", "ui"];
+
 /// Structural noise that never carries retrievable meaning, independent of corpus size.
 fn automatic_short_token(token: &str) -> bool {
     if token.is_ascii() {
-        token.len() < 3
+        token.len() < 3 && !MEANINGFUL_SHORT_TOKENS.contains(&token)
     } else {
         token.chars().count() < 2
     }
@@ -8007,6 +8017,21 @@ mod tests {
             }
         }
         connection
+    }
+
+    #[test]
+    fn two_letter_names_survive_the_short_token_filter() {
+        for name in super::MEANINGFUL_SHORT_TOKENS {
+            assert!(!super::automatic_short_token(name), "{name}");
+            assert!(!super::automatic_generic_token(name), "{name}");
+        }
+        // Everything else two bytes long is still a splitting fragment, not a name.
+        for fragment in ["ab", "xy", "l", "e2"] {
+            assert!(super::automatic_short_token(fragment), "{fragment}");
+        }
+        // A single Han character is one character of a bigram, never a token on its own.
+        assert!(super::automatic_short_token("论"));
+        assert!(!super::automatic_short_token("评论"));
     }
 
     #[test]
