@@ -33,7 +33,7 @@ pub mod reference_derivation;
 
 pub use reference_derivation::{
     CheckoutReferenceResolver, ClaimReferenceDerivation, DerivedClaimReferences, PathCandidate,
-    ResolvedReference, derive_claim_references, unresolvable,
+    ResolvedReference, claim_topic_key, derive_claim_references, unresolvable,
 };
 
 const SCHEMA_VERSION: i64 = 14;
@@ -1886,14 +1886,20 @@ impl TaskRuntime {
                     claim
                         .engineering_references
                         .clone_from(&derived.engineering_references);
-                    claim.topic_key_hint.clone_from(&derived.topic_key_hint);
+                    // A Claim that carried its own `topic_key_hint` keeps it: derivation fills a
+                    // gap the Agent left, it does not overrule a coordinate the Agent named.
+                    if claim.topic_key_hint.is_none() {
+                        claim.topic_key_hint.clone_from(&derived.topic_key_hint);
+                    }
                     derived
                 };
                 derivations.push(DerivedClaimReferences {
                     checkpoint_id: updated.checkpoint_id,
                     claim_id: claim.claim_id,
                     engineering_references: derivation.engineering_references,
-                    topic_key_hint: derivation.topic_key_hint,
+                    // Always the persisted answer, so the first derivation and every later replay
+                    // of it report the same topic hint.
+                    topic_key_hint: claim.topic_key_hint.clone(),
                     unresolved_hints: derivation.unresolved_hints,
                     applicability_inherited: true,
                 });
