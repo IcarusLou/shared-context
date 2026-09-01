@@ -659,6 +659,60 @@ fn workspace_and_repository_locations_never_add_space_priors() {
 }
 
 #[test]
+fn a_workspace_signal_that_names_a_file_retrieves_like_the_diff_that_names_one() {
+    let fixture = fixture();
+    let engine = SearchEngine::new(fixture.index);
+    let unrelated = task("unrelatedtaskneedle");
+    let file = |kind| {
+        vec![TaskSignal {
+            kind,
+            content: "product-catalog:src/pages/SearchResultsPage.tsx".to_owned(),
+        }]
+    };
+
+    // A file the Agent only opened says what the Task is about exactly as a file it rewrote does.
+    let opened = engine
+        .task_space_associations(TaskId::new(), &unrelated, &file(TaskSignalKind::Workspace))
+        .unwrap();
+    let rewritten = engine
+        .task_space_associations(TaskId::new(), &unrelated, &file(TaskSignalKind::Diff))
+        .unwrap();
+    assert_eq!(opened.associations.len(), 1);
+    assert_eq!(
+        opened
+            .associations
+            .iter()
+            .map(|association| association.space_id)
+            .collect::<Vec<_>>(),
+        rewritten
+            .associations
+            .iter()
+            .map(|association| association.space_id)
+            .collect::<Vec<_>>()
+    );
+
+    // The Repository identity in front of the path is a coordinate, not a word to retrieve on, and
+    // a bare checkout root is still only a location.
+    for content in [
+        "product-catalog:",
+        "/local/checkout/product-catalog",
+        "product-catalog:/absolute/SearchResultsPage.tsx",
+    ] {
+        let located = engine
+            .task_space_associations(
+                TaskId::new(),
+                &unrelated,
+                &[TaskSignal {
+                    kind: TaskSignalKind::Workspace,
+                    content: content.to_owned(),
+                }],
+            )
+            .unwrap();
+        assert!(located.associations.is_empty(), "{content}");
+    }
+}
+
+#[test]
 fn out_of_scope_only_text_or_code_signal_stays_diagnostic_and_never_associates() {
     let fixture = polarity_fixture();
     let engine = SearchEngine::new(fixture.index);

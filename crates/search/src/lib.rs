@@ -12,7 +12,7 @@ use sctx_domain::{
     Applicability, ArtifactAssociationKind, ArtifactKey, ArtifactKind, ContextId, ContextKind,
     ContextRelationKind, EvidenceId, EvidenceType, ReferenceId, RepositoryId, ResolutionStatus,
     ResolvedFocus, RevisionId, SpaceAssociationId, SpaceId, TaskId, TaskSignal, TaskSignalKind,
-    TaskSpaceAssociation, WorkingIntentSnapshot,
+    TaskSpaceAssociation, WorkingIntentSnapshot, hints,
 };
 use sctx_engineering_graph::{
     EngineeringProjection, EngineeringProjectionSnapshot, EngineeringProjectionStore,
@@ -1710,6 +1710,49 @@ struct StoredIntentFtsMatch {
     fields: [String; 7],
 }
 
+/// The text every Task Signal contributes to one retrieval query.
+///
+/// A `Prompt` is what the Agent was asked and a `Diff` names a file it rewrote; both are read
+/// whole. A `TestOutcome` is `test runner succeeded` or `test runner failed`, which describes no
+/// subject and would only add noise. A `Workspace` signal is read through
+/// [`workspace_signal_query_text`].
+fn signal_query_texts(signals: &[TaskSignal]) -> Vec<String> {
+    signals
+        .iter()
+        .filter_map(|signal| match signal.kind {
+            TaskSignalKind::Prompt | TaskSignalKind::Diff => Some(signal.content.clone()),
+            TaskSignalKind::Workspace => workspace_signal_query_text(&signal.content),
+            TaskSignalKind::TestOutcome => None,
+        })
+        .collect()
+}
+
+/// The words one `Workspace` signal contributes, or `None` when it names no file.
+///
+/// A `Workspace` signal has carried two shapes over this repository's life. An attributed one is
+/// `<RepositoryId>:<checkout-relative path>` -- a file the Agent opened but did not rewrite, which
+/// says what the Task is about exactly as a `Diff` does and belongs in the query at the same
+/// weight. The older shape is a bare checkout or Workspace root, which says only where the Agent
+/// is working; that has never been allowed to add a retrieval prior and still is not.
+///
+/// The two are told apart by the shape itself rather than by looking up the Repository: an
+/// attributed signal names a Repository before the colon and a *relative* path after it, and a
+/// root is an absolute path with no such prefix. Only the path is read, and only as the file stems
+/// the rest of retrieval already reads a path spelling as, because the Repository identity is a
+/// coordinate and no question is asked in it.
+fn workspace_signal_query_text(content: &str) -> Option<String> {
+    let (repository_id, path) = content.trim().split_once(':')?;
+    if repository_id.is_empty() || repository_id.contains('/') || repository_id.contains('\\') {
+        return None;
+    }
+    let path = path.trim();
+    if path.is_empty() || path.starts_with('/') {
+        return None;
+    }
+    let stems = hints::derived_path_stems([path]);
+    (!stems.is_empty()).then(|| stems.join(" "))
+}
+
 fn task_query_tokens(intent: &WorkingIntentSnapshot, signals: &[TaskSignal]) -> Vec<String> {
     let list_text = [
         &intent.in_scope,
@@ -1724,14 +1767,11 @@ fn task_query_tokens(intent: &WorkingIntentSnapshot, signals: &[TaskSignal]) -> 
     ]
     .into_iter()
     .flat_map(|values| values.iter().map(String::as_str));
-    let signal_text = signals
-        .iter()
-        .filter(|signal| matches!(signal.kind, TaskSignalKind::Prompt | TaskSignalKind::Diff))
-        .map(|signal| signal.content.as_str());
+    let signal_text = signal_query_texts(signals);
     std::iter::once(intent.goal.as_str())
         .chain(intent.current_direction.as_deref())
         .chain(list_text)
-        .chain(signal_text)
+        .chain(signal_text.iter().map(String::as_str))
         .flat_map(search_tokens)
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -1749,14 +1789,11 @@ fn association_query_tokens(intent: &WorkingIntentSnapshot, signals: &[TaskSigna
     ]
     .into_iter()
     .flat_map(|values| values.iter().map(String::as_str));
-    let signal_text = signals
-        .iter()
-        .filter(|signal| matches!(signal.kind, TaskSignalKind::Prompt | TaskSignalKind::Diff))
-        .map(|signal| signal.content.as_str());
+    let signal_text = signal_query_texts(signals);
     std::iter::once(intent.goal.as_str())
         .chain(intent.current_direction.as_deref())
         .chain(list_text)
-        .chain(signal_text)
+        .chain(signal_text.iter().map(String::as_str))
         .flat_map(search_tokens)
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -1779,12 +1816,8 @@ fn association_query_phrases(
     ] {
         texts.extend(values.iter().map(String::as_str));
     }
-    texts.extend(
-        signals
-            .iter()
-            .filter(|signal| matches!(signal.kind, TaskSignalKind::Prompt | TaskSignalKind::Diff))
-            .map(|signal| signal.content.as_str()),
-    );
+    let signal_text = signal_query_texts(signals);
+    texts.extend(signal_text.iter().map(String::as_str));
     normalized_phrases(texts)
 }
 
@@ -1799,6 +1832,17 @@ const AUTOMATIC_TEXT_COVERAGE_THRESHOLD_BASIS_POINTS: u16 = 6_000;
 /// exactly the noise an automatic channel must never inject. Below this ratio the gate stops
 /// believing coverage and falls back to the multi-channel evidence it shares with every other
 /// path.
+///
+/// Swept across both probe sets, forty-six probes: every value from zero through 3333 produces
+/// the identical hit counts and no noise at all, and 3334 costs `probe-zh` two automatic hits
+/// (19/24 to 17/24) plus one on `probe-v1`. The ceiling is sharp because four probes -- zh-10,
+/// zh-11, en-01, en-02 -- ask a question of which this corpus can answer exactly one word in
+/// three. Nothing pins the floor: the noise probes are rejected for having *no* answerable token
+/// at all, which is a separate rule, so no probe requires this ratio to be positive. The value
+/// therefore stays where it was, 833 basis points clear of the only measured failure, and is not
+/// moved on evidence that does not exist. The zero margin this was expected to have at zh-13
+/// (two answerable tokens of eight, exactly on the line) is not real: raising the ratio to 2501
+/// changes nothing, because that Space passes on its second text channel rather than on coverage.
 const AUTOMATIC_MIN_ANSWERABLE_RATIO_BASIS_POINTS: usize = 2_500;
 /// Fewest answerable tokens the coverage gate is willing to divide by, relaxed when the query
 /// selected fewer tokens than this in the first place (an identifier lookup is one token and is
@@ -1819,17 +1863,29 @@ const AUTOMATIC_IDENTIFIER_TOKEN_COVERAGE_WEIGHT: usize = 3;
 /// `identifier_split` group are the query naming that identifier.
 const AUTOMATIC_MIN_IDENTIFIER_QUERY_TOKENS: usize = 2;
 /// Smallest corpus that lets observed document frequency stand in for the built-in stop-word
-/// table. Below it the table is the only available fallback; at or above it the corpus decides,
-/// so real domain vocabulary such as `search` stays eligible.
+/// table, and the same size at which a frequent token may be dropped rather than merely ranked
+/// last.
+///
+/// Below it the table is the only available fallback; at or above it the corpus decides, so real
+/// domain vocabulary such as `search` stays eligible. The two halves of that handover used to sit
+/// at different sizes, which left a band -- five to nineteen documents -- where neither the table
+/// nor the observed frequency applied and a small repository ran with no generic-word filter at
+/// all. Dropping here is still bounded by [`AUTOMATIC_MIN_RETAINED_QUERY_TOKENS`], so a question
+/// whose every word is frequent keeps its rarest ones and still retrieves.
 const AUTOMATIC_HIGH_DF_MIN_DOCUMENTS: usize = 5;
-/// Smallest corpus in which a high document frequency is evidence of a generic word rather than
-/// of a small fixture. Below it document frequency only orders tokens and never drops one.
-const AUTOMATIC_HIGH_DF_DROP_MIN_DOCUMENTS: usize = 20;
 const AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS: usize = 5_000;
 /// Number of rarest tokens that are never dropped for being merely frequent. It keeps a
 /// single-token or short intent intact, because dropping its only discriminating word retrieves
 /// nothing at all.
 const AUTOMATIC_MIN_RETAINED_QUERY_TOKENS: usize = 8;
+/// Smallest corpus in which a token present in nearly every document is evidence of a generic
+/// word rather than of a small repository with one subject.
+///
+/// The universal rule is the one drop that reaches inside the retained floor, so it is the one
+/// that can empty a query outright. In eight Contexts about one subject, the word all eight share
+/// is the subject; in forty it is filler. The frequency filter therefore starts at
+/// [`AUTOMATIC_HIGH_DF_MIN_DOCUMENTS`], and only its unbounded half waits for a corpus this size.
+const AUTOMATIC_UNIVERSAL_DF_MIN_DOCUMENTS: usize = 20;
 /// Document frequency at which a token selects essentially the whole corpus and therefore carries
 /// no retrieval signal at all. Such a token is dropped even inside the retained floor, because
 /// keeping it would turn a bare generic intent into an unbounded automatic injection.
@@ -1840,7 +1896,55 @@ struct AutomaticTokenSelection {
     tokens: Vec<String>,
     /// The subset of `tokens` whose document frequency is above zero.
     answerable: Vec<String>,
+    /// Observed rarity of the selected tokens, already paid for by the selection itself.
+    rarity: QueryTokenRarity,
     explanation: AutomaticQueryTokenExplanation,
+}
+
+/// How rare each selected query token is in this corpus.
+///
+/// Automatic token selection already reads every one of these frequencies to order the query
+/// rarest-first, so carrying them costs nothing and answers a question the ranking otherwise
+/// cannot: between two Contexts that covered exactly the same *share* of the query, which one
+/// matched the words that actually name something. Explicit retrieval never pays for the probes
+/// and therefore leaves this empty, which reads as "no opinion" and changes no order.
+#[derive(Clone, Debug, Default)]
+struct QueryTokenRarity {
+    document_count: usize,
+    document_frequencies: BTreeMap<String, usize>,
+}
+
+impl QueryTokenRarity {
+    /// Summed rarity of the tokens one Context matched, in micros.
+    ///
+    /// Rarity per token is `documents / documents holding it`, the quantity inverse document
+    /// frequency takes the logarithm of. The logarithm is dropped on purpose: this value is only
+    /// ever compared, never combined with a score, and integer arithmetic keeps a ranking key
+    /// exactly reproducible where a float would leave it depending on evaluation order.
+    ///
+    /// A token this Tree never measured contributes nothing rather than an invented rarity, so an
+    /// explicit query -- which measures none of them -- scores every candidate zero and keeps
+    /// exactly the order it had.
+    fn matched_micros(&self, matched: &[String]) -> u64 {
+        let Ok(documents) = u64::try_from(self.document_count) else {
+            return 0;
+        };
+        matched
+            .iter()
+            .filter_map(|token| self.document_frequencies.get(token).copied())
+            .filter_map(|frequency| u64::try_from(frequency).ok())
+            .map(|frequency| {
+                documents
+                    .saturating_mul(1_000_000)
+                    .saturating_div(frequency.saturating_add(1))
+            })
+            .fold(0, u64::saturating_add)
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.document_count = self.document_count.max(other.document_count);
+        self.document_frequencies.extend(other.document_frequencies);
+    }
 }
 
 /// Denominator of every automatic text-coverage decision.
@@ -1952,7 +2056,7 @@ impl AutomaticTextGate {
 fn explicit_token_selection(tokens: &[String]) -> AutomaticTokenSelection {
     let mut explanation = AutomaticQueryTokenExplanation {
         document_count: 0,
-        high_document_frequency_min_documents: AUTOMATIC_HIGH_DF_DROP_MIN_DOCUMENTS,
+        high_document_frequency_min_documents: AUTOMATIC_HIGH_DF_MIN_DOCUMENTS,
         high_document_frequency_threshold_basis_points: AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS,
         stop_word_fallback_active: false,
         selected_tokens: tokens.to_vec(),
@@ -1966,6 +2070,7 @@ fn explicit_token_selection(tokens: &[String]) -> AutomaticTokenSelection {
     AutomaticTokenSelection {
         tokens: tokens.to_vec(),
         answerable: tokens.to_vec(),
+        rarity: QueryTokenRarity::default(),
         explanation,
     }
 }
@@ -2032,7 +2137,7 @@ fn automatic_eligible_query_tokens(
             .then_with(|| left.1.cmp(&right.1))
     });
 
-    if document_count >= AUTOMATIC_HIGH_DF_DROP_MIN_DOCUMENTS {
+    if document_count >= AUTOMATIC_HIGH_DF_MIN_DOCUMENTS {
         ranked = drop_high_document_frequency_tokens(ranked, document_count, &mut dropped);
     }
 
@@ -2044,6 +2149,10 @@ fn automatic_eligible_query_tokens(
         });
     }
     ranked.truncate(MAX_AUTOMATIC_QUERY_TOKENS);
+    let frequencies = ranked
+        .iter()
+        .map(|(frequency, token)| (token.clone(), *frequency))
+        .collect::<BTreeMap<_, _>>();
     // The frequencies were already paid for above, so naming the answerable tokens costs no query.
     //
     // A generic word is excluded whatever its frequency. The denominator asks which words of the
@@ -2065,7 +2174,7 @@ fn automatic_eligible_query_tokens(
     dropped.sort_by(|left, right| left.token.cmp(&right.token));
     let mut explanation = AutomaticQueryTokenExplanation {
         document_count,
-        high_document_frequency_min_documents: AUTOMATIC_HIGH_DF_DROP_MIN_DOCUMENTS,
+        high_document_frequency_min_documents: AUTOMATIC_HIGH_DF_MIN_DOCUMENTS,
         high_document_frequency_threshold_basis_points: AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS,
         stop_word_fallback_active,
         selected_tokens: eligible.clone(),
@@ -2078,6 +2187,10 @@ fn automatic_eligible_query_tokens(
     explanation.refresh_counts();
     Ok(AutomaticTokenSelection {
         explanation,
+        rarity: QueryTokenRarity {
+            document_count,
+            document_frequencies: frequencies,
+        },
         tokens: eligible,
         answerable,
     })
@@ -2085,22 +2198,22 @@ fn automatic_eligible_query_tokens(
 
 /// Removes the tokens whose document frequency makes them useless discriminators. `ranked` is
 /// ordered rarest first, so the retained floor is simply its prefix: a frequent token survives
-/// while the query is short, unless it is present in nearly every document and would therefore
-/// select the whole corpus.
+/// while the query is short, unless the corpus is large enough for "present in nearly every
+/// document" to mean generic and the token would therefore select the whole corpus.
 fn drop_high_document_frequency_tokens(
     ranked: Vec<(usize, String)>,
     document_count: usize,
     dropped: &mut Vec<AutomaticQueryTokenDrop>,
 ) -> Vec<(usize, String)> {
     let minimum_frequency = document_count.saturating_mul(AUTOMATIC_HIGH_DF_THRESHOLD_BASIS_POINTS);
-    let universal_frequency =
-        document_count.saturating_mul(AUTOMATIC_UNIVERSAL_DF_THRESHOLD_BASIS_POINTS);
+    let universal_frequency = (document_count >= AUTOMATIC_UNIVERSAL_DF_MIN_DOCUMENTS)
+        .then(|| document_count.saturating_mul(AUTOMATIC_UNIVERSAL_DF_THRESHOLD_BASIS_POINTS));
     let mut retained = Vec::with_capacity(ranked.len());
     for (position, (frequency, token)) in ranked.into_iter().enumerate() {
         let scaled = frequency.saturating_mul(BASIS_POINTS_SCALE);
         let frequent =
             position >= AUTOMATIC_MIN_RETAINED_QUERY_TOKENS && scaled >= minimum_frequency;
-        if frequent || scaled >= universal_frequency {
+        if frequent || universal_frequency.is_some_and(|limit| scaled >= limit) {
             dropped.push(AutomaticQueryTokenDrop {
                 token,
                 filter: AutomaticQueryTokenFilter::HighDocumentFrequency,
@@ -2113,10 +2226,20 @@ fn drop_high_document_frequency_tokens(
     retained
 }
 
+/// Two-letter ASCII tokens that name something a question is genuinely asked about.
+///
+/// The short-token rule exists to discard the fragments identifier splitting produces, but a
+/// handful of two-letter words are whole names in this domain: they are the entire discriminating
+/// content of "did CI pass", "which DB migration", "the RN bridge". Dropping them left such a
+/// question with nothing to retrieve on. The list is deliberately short -- a token earns a place
+/// only by being a name rather than a word -- and a corpus large enough for document frequency to
+/// speak still drops any of them that turns out to be generic there.
+const MEANINGFUL_SHORT_TOKENS: [&str; 9] = ["ci", "db", "fe", "id", "io", "js", "os", "rn", "ui"];
+
 /// Structural noise that never carries retrievable meaning, independent of corpus size.
 fn automatic_short_token(token: &str) -> bool {
     if token.is_ascii() {
-        token.len() < 3
+        token.len() < 3 && !MEANINGFUL_SHORT_TOKENS.contains(&token)
     } else {
         token.chars().count() < 2
     }
@@ -2322,12 +2445,8 @@ fn task_query_phrases(
     if include_out_of_scope {
         texts.extend(intent.out_of_scope.iter().map(String::as_str));
     }
-    texts.extend(
-        signals
-            .iter()
-            .filter(|signal| matches!(signal.kind, TaskSignalKind::Prompt | TaskSignalKind::Diff))
-            .map(|signal| signal.content.as_str()),
-    );
+    let signal_text = signal_query_texts(signals);
+    texts.extend(signal_text.iter().map(String::as_str));
     normalized_phrases(texts)
 }
 
@@ -2782,6 +2901,8 @@ struct TaskAssociationInference {
     unresolved_focus_diagnostics: Vec<TaskGraphDiagnostic>,
     /// Denominator every automatic coverage decision downstream of the inference divides by.
     coverage_basis: AutomaticCoverageBasis,
+    /// Observed rarity of the selected query tokens, for the item tie-break that needs it.
+    token_rarity: QueryTokenRarity,
     query_token_explanation: AutomaticQueryTokenExplanation,
     /// Spaces the automatic text gate dropped, already collapsed to a reportable size.
     omitted: Vec<ContextPackOmitted>,
@@ -2810,6 +2931,7 @@ fn infer_task_space_associations(
 ) -> Result<TaskAssociationInference> {
     let selection = automatic_eligible_query_tokens(connection, query_tokens, mode)?;
     let coverage_basis = AutomaticCoverageBasis::from_selection(&selection);
+    let mut token_rarity = selection.rarity;
     let mut token_explanation = selection.explanation;
     let query_tokens = selection.tokens;
     let query_phrases = eligible_query_phrases(query_phrases, &query_tokens);
@@ -2817,6 +2939,7 @@ fn infer_task_space_associations(
         .iter()
         .map(|query| {
             let selection = automatic_eligible_query_tokens(connection, &query.tokens, mode)?;
+            token_rarity.merge(selection.rarity);
             merge_token_explanations(&mut token_explanation, selection.explanation);
             Ok(WorkingIntentHintQuery {
                 source_field: query.source_field,
@@ -2874,6 +2997,7 @@ fn infer_task_space_associations(
     }
     hydrate_intent_conflict_state(connection, &mut evidence)?;
     assign_channel_features(&mut evidence, coverage_basis.tokens());
+    cap_hop_only_space_scores(&mut evidence, &contexts, &effective_spaces);
     let mut gate_omitted = Vec::new();
     let mut associations = Vec::new();
     for (space_id, space_evidence) in &evidence {
@@ -2907,6 +3031,7 @@ fn infer_task_space_associations(
         focus_reachable,
         unresolved_focus_diagnostics,
         coverage_basis,
+        token_rarity,
         query_token_explanation: token_explanation,
         omitted: collapse_gate_omissions(gate_omitted),
     })
@@ -3016,6 +3141,123 @@ fn aggregate_context_across_effective_spaces(
             context_id,
             context,
         );
+    }
+}
+
+/// The Spaces one Context's evidence is aggregated into, mirroring
+/// [`aggregate_context_across_effective_spaces`].
+fn effective_context_space_ids(
+    effective_spaces: &BTreeMap<ContextId, EffectiveContextSpaces>,
+    fallback_space_id: SpaceId,
+    context_id: ContextId,
+) -> BTreeSet<SpaceId> {
+    effective_spaces.get(&context_id).map_or_else(
+        || BTreeSet::from([fallback_space_id]),
+        |effective| {
+            effective
+                .roles
+                .iter()
+                .map(|role| role.matched_space_id)
+                .collect()
+        },
+    )
+}
+
+/// True when a Context Relation hop out of some other Space is the whole reason this Space is
+/// here: the query never named its Intent, none of its Contexts matched any text, hint, scope or
+/// Artifact, and nothing but the hop connects it to the question.
+fn space_reached_only_by_relation_hops(evidence: &AssociationEvidence) -> bool {
+    !evidence.relation_contexts.is_empty()
+        && !evidence.intent_matched
+        && evidence.textual_contexts.is_empty()
+        && evidence.hint_text.is_empty()
+        && evidence.matched_scopes.is_empty()
+        && evidence.matched_artifacts.is_empty()
+        && evidence.graph_exact_contexts.is_empty()
+        && evidence.focus_text_fallback_contexts.is_empty()
+}
+
+/// Holds every Space a hop reached behind the Spaces the hop started in.
+///
+/// This is the Space-level form of the rule [`reached_only_by_a_hop`] already applies to items. A
+/// hop is a statement about a Context, not about the question: the Space it lands in answered
+/// nothing, and letting it lead the ranking means the Pack opens with background for an answer
+/// the reader has not been shown yet. The
+/// [`CONTEXT_RELATION_CHANNEL_WEIGHT`] channel is heavy enough for exactly that to happen when the
+/// answering Space matched on text alone.
+///
+/// The cap reads the scores as they stood before any capping, which is well defined because a hop
+/// always starts at a Context that matched the query directly: no Space that is the origin of a
+/// hop is itself hop-only, so no capped score is ever the limit for another.
+fn cap_hop_only_space_scores(
+    evidence: &mut BTreeMap<SpaceId, AssociationEvidence>,
+    contexts: &BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>,
+    effective_spaces: &BTreeMap<ContextId, EffectiveContextSpaces>,
+) {
+    let hop_only = evidence
+        .iter()
+        .filter(|(_, value)| space_reached_only_by_relation_hops(value))
+        .map(|(space_id, _)| *space_id)
+        .collect::<BTreeSet<_>>();
+    if hop_only.is_empty() {
+        return;
+    }
+    let owning_space = contexts
+        .keys()
+        .map(|(space_id, context_id)| (*context_id, *space_id))
+        .collect::<BTreeMap<_, _>>();
+    let mut origins = BTreeMap::<SpaceId, BTreeSet<SpaceId>>::new();
+    for ((space_id, context_id), context) in contexts {
+        let reached = effective_context_space_ids(effective_spaces, *space_id, *context_id)
+            .into_iter()
+            .filter(|reached| hop_only.contains(reached))
+            .collect::<BTreeSet<_>>();
+        if reached.is_empty() {
+            continue;
+        }
+        for path in &context.graph_paths {
+            let TaskRetrievalPath::ContextRelation { hops } = path else {
+                continue;
+            };
+            let Some(seed) = hops.first() else {
+                continue;
+            };
+            let Some(seed_space_id) = owning_space.get(&seed.source_context_id).copied() else {
+                continue;
+            };
+            let seed_spaces = effective_context_space_ids(
+                effective_spaces,
+                seed_space_id,
+                seed.source_context_id,
+            );
+            for target in &reached {
+                origins.entry(*target).or_default().extend(
+                    seed_spaces
+                        .iter()
+                        .copied()
+                        .filter(|origin| origin != target),
+                );
+            }
+        }
+    }
+    let before = evidence
+        .iter()
+        .map(|(space_id, value)| (*space_id, value.fused_score_basis_points))
+        .collect::<BTreeMap<_, _>>();
+    for (space_id, origin_spaces) in origins {
+        // Behind every Space it was reached from, not merely behind the best of them: the hop said
+        // nothing about which origin was the better answer.
+        let Some(limit) = origin_spaces
+            .iter()
+            .filter_map(|origin| before.get(origin).copied())
+            .min()
+        else {
+            continue;
+        };
+        if let Some(target) = evidence.get_mut(&space_id) {
+            target.fused_score_basis_points =
+                target.fused_score_basis_points.min(limit.saturating_sub(1));
+        }
     }
 }
 
@@ -3287,9 +3529,9 @@ const fn intent_field_weight(field: SpaceIntentField) -> u16 {
 /// Mirrors [`CONTEXT_FTS_BM25_WEIGHTS`] for the fusion feature that ranks by which fields matched.
 const fn context_field_weight(field: MatchField) -> u16 {
     match field {
-        MatchField::Title | MatchField::Statement | MatchField::ProblemView => 8,
+        MatchField::Statement | MatchField::ProblemView => 8,
         MatchField::Rationale => 4,
-        MatchField::Evidence | MatchField::HintText => 2,
+        MatchField::Title | MatchField::Evidence | MatchField::HintText => 2,
     }
 }
 
@@ -4983,6 +5225,9 @@ struct TaskContextCandidate {
     /// so this only reorders demoted items behind their undemoted siblings.
     injection_score_basis_points: u16,
     direct_path_count: usize,
+    /// Publication time in Unix seconds, or `-1` for a Context no publication has accepted yet.
+    /// It orders items nothing else separates, ahead of the meaningless Context identity.
+    accepted_at: i64,
     item: TaskContextItem,
     /// Compact projection of `item`, materialized only for
     /// [`ContextPackDetailLevel::Compact`] so the budgeter charges the emitted representation.
@@ -5071,9 +5316,15 @@ fn task_fingerprint(intent: &WorkingIntentSnapshot, signals: &[TaskSignal]) -> R
     ] {
         values.sort();
     }
+    // A Workspace signal that names no file steers no query, so it must not change the
+    // fingerprint: two Packs that would be identical have to be recognized as identical. One that
+    // does name a file is part of the question now, exactly as a Diff is.
     let mut signals = signals
         .iter()
-        .filter(|signal| signal.kind != TaskSignalKind::Workspace)
+        .filter(|signal| {
+            signal.kind != TaskSignalKind::Workspace
+                || workspace_signal_query_text(&signal.content).is_some()
+        })
         .cloned()
         .collect::<Vec<_>>();
     signals.sort_by(|left, right| {
@@ -5259,6 +5510,20 @@ fn load_task_context_candidates(
                     .coverage_basis_points
                     .cmp(&left.item.context.match_reason.coverage_basis_points)
             })
+            // Equal shares of the query are not equal answers. Two Contexts can each match one of
+            // four answerable tokens and mean entirely different things by it, and the next key
+            // down is BM25, which separates them by document length -- the shorter near-duplicate
+            // wins on being short. Rarity says what coverage cannot: the Context that matched the
+            // word naming something in this corpus answered more of the question than the one that
+            // matched the word half the corpus uses.
+            .then_with(|| {
+                let rarity = |candidate: &TaskContextCandidate| {
+                    inference
+                        .token_rarity
+                        .matched_micros(&candidate.item.context.match_reason.matched_tokens)
+                };
+                rarity(right).cmp(&rarity(left))
+            })
             .then_with(|| {
                 left.item
                     .context
@@ -5266,6 +5531,11 @@ fn load_task_context_candidates(
                     .bm25
                     .total_cmp(&right.item.context.match_reason.bm25)
             })
+            // Newer first. BM25 separates equally covering Contexts by document length, which
+            // decides nothing a reader cares about once the text evidence has run out;
+            // publication time at least says which answer came later. It is never the last word:
+            // identity below it still totally orders the Pack.
+            .then_with(|| right.accepted_at.cmp(&left.accepted_at))
             .then_with(|| {
                 left.item
                     .context
@@ -5841,6 +6111,8 @@ fn graph_context_candidate(
             .get(&matched_space.association_space_id)
             .map_or(0, final_score_basis_points),
         direct_path_count,
+        // An Engineering Graph snapshot carries the Context, not the publication that accepted it.
+        accepted_at: -1,
         item: TaskContextItem {
             association_space_id: matched_space.association_space_id,
             context: ContextPackItem {
@@ -6030,6 +6302,7 @@ fn task_context_candidate_from_row(
             &derived_state,
         ),
         direct_path_count,
+        accepted_at: accepted_at.unwrap_or(-1),
         item: TaskContextItem {
             association_space_id: matched_space.association_space_id,
             context: ContextPackItem {
@@ -6936,6 +7209,10 @@ struct SearchPage {
     omitted: Vec<SearchOmitted>,
 }
 
+/// Cursor format version. Two adds `accepted_at`, which the ranking now orders by, so a version
+/// one cursor cannot address a page of this ordering and is rejected like any other stale cursor.
+const SEARCH_CURSOR_VERSION: u8 = 2;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CursorPayload {
     version: u8,
@@ -6943,6 +7220,8 @@ struct CursorPayload {
     query_fingerprint: String,
     relevance_bits: u64,
     evidence_completeness: i64,
+    /// Publication time in Unix seconds, or `-1` for a revision no publication has accepted yet.
+    accepted_at: i64,
     context_id: String,
     revision_id: String,
     seen: usize,
@@ -6953,6 +7232,7 @@ struct RankedRow {
     result: SearchResult,
     relevance: f64,
     evidence_completeness: i64,
+    accepted_at: i64,
 }
 
 /// `bm25()` column weights for `context_fts`, in its exact column order:
@@ -6960,9 +7240,14 @@ struct RankedRow {
 ///
 /// `problem_view` ranks with `statement` because it is the question the Context answers, and
 /// `hint_text` ranks with `evidence` because it is unresolved locating text rather than a fact.
-/// `title` sits at the same weight as `statement` rather than above it: the title is derived from
-/// the first characters of the statement, so a higher weight would score that prefix twice.
-const CONTEXT_FTS_BM25_WEIGHTS: &str = "0.0, 0.0, 8.0, 8.0, 4.0, 2.0, 8.0, 2.0";
+///
+/// `title` is not a field an author wrote: it is the first sixty characters of `statement`, cut at
+/// a character bound. Weighting it alongside `statement` therefore scored that prefix twice and
+/// made where in a sentence a term happens to fall decide the ranking -- two Contexts covering
+/// exactly the same query tokens were separated by which of them said the shared word early. It
+/// keeps the lowest weight instead of none at all so the prefix still counts as text the Context
+/// contains, without deciding anything on its own.
+const CONTEXT_FTS_BM25_WEIGHTS: &str = "0.0, 0.0, 2.0, 8.0, 4.0, 2.0, 8.0, 2.0";
 
 /// Minimum share of distinct query tokens a revision must match to stay in a ranked page.
 /// Below it the row is a single incidental term overlap rather than a plausible answer.
@@ -7120,7 +7405,7 @@ fn search_in_snapshot(
     let fingerprint = query_fingerprint(request, eligible_only)?;
     let cursor = request.cursor.as_deref().map(decode_cursor).transpose()?;
     if let Some(cursor) = &cursor {
-        if cursor.version != 1
+        if cursor.version != SEARCH_CURSOR_VERSION
             || cursor.tree_oid != tree_oid
             || cursor.query_fingerprint != fingerprint
         {
@@ -7208,14 +7493,20 @@ fn search_in_snapshot(
             parameters.extend([
                 SqlValue::Integer(cursor.evidence_completeness),
                 SqlValue::Integer(cursor.evidence_completeness),
+                SqlValue::Integer(cursor.accepted_at),
+                SqlValue::Integer(cursor.evidence_completeness),
+                SqlValue::Integer(cursor.accepted_at),
                 SqlValue::Text(cursor.context_id.clone()),
                 SqlValue::Integer(cursor.evidence_completeness),
+                SqlValue::Integer(cursor.accepted_at),
                 SqlValue::Text(cursor.context_id.clone()),
                 SqlValue::Text(cursor.revision_id.clone()),
             ]);
             "WHERE evidence_completeness < ?
-              OR (evidence_completeness = ? AND context_id > ?)
-              OR (evidence_completeness = ? AND context_id = ? AND revision_id > ?)"
+              OR (evidence_completeness = ? AND accepted_at < ?)
+              OR (evidence_completeness = ? AND accepted_at = ? AND context_id > ?)
+              OR (evidence_completeness = ? AND accepted_at = ? AND context_id = ?
+                  AND revision_id > ?)"
         } else {
             let relevance = f64::from_bits(cursor.relevance_bits);
             parameters.extend([
@@ -7224,16 +7515,23 @@ fn search_in_snapshot(
                 SqlValue::Integer(cursor.evidence_completeness),
                 SqlValue::Real(relevance),
                 SqlValue::Integer(cursor.evidence_completeness),
+                SqlValue::Integer(cursor.accepted_at),
+                SqlValue::Real(relevance),
+                SqlValue::Integer(cursor.evidence_completeness),
+                SqlValue::Integer(cursor.accepted_at),
                 SqlValue::Text(cursor.context_id.clone()),
                 SqlValue::Real(relevance),
                 SqlValue::Integer(cursor.evidence_completeness),
+                SqlValue::Integer(cursor.accepted_at),
                 SqlValue::Text(cursor.context_id.clone()),
                 SqlValue::Text(cursor.revision_id.clone()),
             ]);
             "WHERE relevance > ?
           OR (relevance = ? AND evidence_completeness < ?)
-          OR (relevance = ? AND evidence_completeness = ? AND context_id > ?)
-          OR (relevance = ? AND evidence_completeness = ? AND context_id = ? AND revision_id > ?)"
+          OR (relevance = ? AND evidence_completeness = ? AND accepted_at < ?)
+          OR (relevance = ? AND evidence_completeness = ? AND accepted_at = ? AND context_id > ?)
+          OR (relevance = ? AND evidence_completeness = ? AND accepted_at = ? AND context_id = ?
+              AND revision_id > ?)"
         }
     } else {
         ""
@@ -7241,10 +7539,16 @@ fn search_in_snapshot(
     parameters.push(SqlValue::Integer(
         i64::try_from(request.page_size + 1).map_err(|_| invalid("page size overflow"))?,
     ));
+    // Newer first between rows nothing else separates. A Context ID carries no meaning at all, so
+    // falling straight through to it made the page order an accident of identity; publication time
+    // is the one thing a reader can act on -- the later answer supersedes the earlier one in
+    // practice even when no `superseded_by` edge says so. It is never the last word: identity
+    // still breaks the remaining ties, so the page stays totally ordered and the cursor stable.
     let order_sql = if simple_rank {
-        "evidence_completeness DESC, context_id ASC, revision_id ASC"
+        "evidence_completeness DESC, accepted_at DESC, context_id ASC, revision_id ASC"
     } else {
-        "relevance ASC, evidence_completeness DESC, context_id ASC, revision_id ASC"
+        "relevance ASC, evidence_completeness DESC, accepted_at DESC,
+         context_id ASC, revision_id ASC"
     };
     let sql = format!(
         "{with_clause}{ranked_keyword} ranked AS (
@@ -7255,7 +7559,8 @@ fn search_in_snapshot(
                   item.auto_injection_eligible, {relevance} AS relevance,
                   {evidence} AS evidence_completeness, {coverage_sql} AS coverage_basis_points,
                   COALESCE(revision.problem_view, '') AS problem_view, revision.hint_text,
-                  item.superseded_by, item.stale_reason, item.accepted_at_unix_seconds
+                  item.superseded_by, item.stale_reason, item.accepted_at_unix_seconds,
+                  COALESCE(item.accepted_at_unix_seconds, -1) AS accepted_at
            FROM {from_sql}
            WHERE {where_sql}
          )
@@ -7326,6 +7631,9 @@ fn search_in_snapshot(
         let accepted_at = row
             .get::<_, Option<i64>>(19)
             .map_err(sql_error("read publication time"))?;
+        let accepted_at_rank = row
+            .get::<_, i64>(20)
+            .map_err(sql_error("read publication time rank"))?;
         let kind = parse_kind(&kind_text)?;
         let derived_state = ContextDerivedState {
             superseded_by,
@@ -7372,6 +7680,7 @@ fn search_in_snapshot(
             },
             relevance: row_relevance,
             evidence_completeness: row_evidence,
+            accepted_at: accepted_at_rank,
         });
     }
     let has_more = ranked.len() > request.page_size;
@@ -7381,11 +7690,12 @@ fn search_in_snapshot(
             .last()
             .map(|row| {
                 encode_cursor(&CursorPayload {
-                    version: 1,
+                    version: SEARCH_CURSOR_VERSION,
                     tree_oid: tree_oid.to_owned(),
                     query_fingerprint: fingerprint,
                     relevance_bits: row.relevance.to_bits(),
                     evidence_completeness: row.evidence_completeness,
+                    accepted_at: row.accepted_at,
                     context_id: row.result.context_id.to_string(),
                     revision_id: row.result.revision_id.to_string(),
                     seen: cursor.as_ref().map_or(0, |value| value.seen) + ranked.len(),
@@ -7795,15 +8105,29 @@ pub const MAX_ALIAS_EXPANSIONS_PER_QUERY: usize = 16;
 
 /// `token_alias.source` values, ranked: an identifier split is a spelling of the same artifact,
 /// a domain term is only a vocabulary neighbour, so the identifier split is kept first.
-const ALIAS_SOURCE_RANK: [&str; 2] = [IDENTIFIER_SPLIT_ALIAS_SOURCE, "domain_term"];
+const ALIAS_SOURCE_RANK: [&str; 2] = [IDENTIFIER_SPLIT_ALIAS_SOURCE, DOMAIN_TERM_ALIAS_SOURCE];
 
 /// `token_alias.source` of a group produced by splitting a code identifier into its words.
 const IDENTIFIER_SPLIT_ALIAS_SOURCE: &str = "identifier_split";
+
+/// `token_alias.source` of a group produced from a Space Intent domain term.
+const DOMAIN_TERM_ALIAS_SOURCE: &str = "domain_term";
 
 /// Least number of an alias group's members a query must already name before that group may
 /// expand one of them. A single shared word such as `page` names no identifier in particular, so
 /// expanding it would pull in every identifier that happens to contain it.
 const MIN_ALIAS_GROUP_MEMBERS_IN_QUERY: usize = 2;
+
+/// The same floor for a non-ASCII member of a group seeded from a Space Intent domain term.
+///
+/// The two-member rule exists because an ASCII group member is a word in its own right: `page` is
+/// a member of `bottom-bar-page-manager` and also just a word, so expanding it alone turns the
+/// term into a hub every Space using that word joins. A non-ASCII member is not a word — a Han
+/// term indexes as *overlapping bigrams*, so `论输` is a fragment that exists only inside the one
+/// phrase it was cut from. Naming it is already the query asking about that term, and requiring
+/// two of them would mean requiring the paraphrase to reproduce two adjacent bigrams of the
+/// phrase it is paraphrasing, which is close to requiring the phrase itself.
+const MIN_HAN_DOMAIN_TERM_ALIAS_GROUP_MEMBERS_IN_QUERY: usize = 1;
 
 /// Bounded, deterministic `token_alias` expansion of one query's tokens.
 ///
@@ -7871,13 +8195,18 @@ impl AliasExpansion {
                 .iter()
                 .filter(|(alias, _)| original.contains(alias))
                 .count();
-            if named < MIN_ALIAS_GROUP_MEMBERS_IN_QUERY {
+            let identifier_group = members
+                .iter()
+                .any(|(_, source)| source == IDENTIFIER_SPLIT_ALIAS_SOURCE);
+            let minimum = if identifier_group || token.is_ascii() {
+                MIN_ALIAS_GROUP_MEMBERS_IN_QUERY
+            } else {
+                MIN_HAN_DOMAIN_TERM_ALIAS_GROUP_MEMBERS_IN_QUERY
+            };
+            if named < minimum {
                 continue;
             }
-            if members
-                .iter()
-                .any(|(_, source)| source == IDENTIFIER_SPLIT_ALIAS_SOURCE)
-            {
+            if identifier_group {
                 identifier_tokens.insert(token.clone());
             }
             for (alias, source) in members {
@@ -8188,11 +8517,361 @@ mod tests {
     use sctx_index::normalize_search_text;
 
     use super::{
-        ContextStatus, ContextTtlSettings, ContextUsageCounts, ScopeFilter, SearchFilters,
-        SearchRequest, USAGE_IGNORED_PENALTY_BASIS_POINTS, USAGE_REUSED_BONUS_BASIS_POINTS,
-        estimate_tokens, hex_decode, hex_encode, search_in_snapshot, usage_multiplier_basis_points,
-        usage_prior_reason, usage_prior_score,
+        AliasExpansion, ContextStatus, ContextTtlSettings, ContextUsageCounts, ScopeFilter,
+        SearchFilters, SearchRequest, USAGE_IGNORED_PENALTY_BASIS_POINTS,
+        USAGE_REUSED_BONUS_BASIS_POINTS, estimate_tokens, hex_decode, hex_encode,
+        search_in_snapshot, usage_multiplier_basis_points, usage_prior_reason, usage_prior_score,
     };
+
+    /// One `token_alias` table holding the ordered pairs of the given groups.
+    fn alias_table(groups: &[(&str, &str, &[&str])]) -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE token_alias(
+                   token TEXT NOT NULL, alias TEXT NOT NULL, source TEXT NOT NULL,
+                   group_key TEXT NOT NULL, PRIMARY KEY(token, alias, source, group_key)
+                 ) WITHOUT ROWID;",
+            )
+            .unwrap();
+        for (source, group_key, members) in groups {
+            for token in *members {
+                for alias in *members {
+                    if token == alias {
+                        continue;
+                    }
+                    connection
+                        .execute(
+                            "INSERT INTO token_alias VALUES (?, ?, ?, ?)",
+                            params![token, alias, source, group_key],
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        connection
+    }
+
+    /// Two accepted Contexts holding the same text, published `first` and `second` seconds apart.
+    fn two_equally_ranked_contexts(first: i64, second: i64) -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+                 CREATE TABLE space_projection(space_id TEXT PRIMARY KEY, title TEXT) WITHOUT ROWID;
+                 CREATE TABLE context_item(
+                   context_id TEXT PRIMARY KEY, space_id TEXT NOT NULL,
+                   governance_status TEXT NOT NULL, auto_injection_eligible INTEGER NOT NULL,
+                   accepted_at_unix_seconds INTEGER, superseded_by TEXT, stale_reason TEXT
+                 ) WITHOUT ROWID;
+                 CREATE TABLE context_revision(
+                   revision_id TEXT PRIMARY KEY, context_id TEXT NOT NULL, space_id TEXT NOT NULL,
+                   kind TEXT NOT NULL, statement TEXT NOT NULL, rationale TEXT NOT NULL,
+                   applicability_json TEXT NOT NULL, assumptions_json TEXT NOT NULL,
+                   recheck_when_json TEXT NOT NULL, lifecycle TEXT NOT NULL,
+                   evidence_completeness INTEGER NOT NULL,
+                   problem_view TEXT, hint_text TEXT NOT NULL DEFAULT ''
+                 ) WITHOUT ROWID;
+                 CREATE TABLE evidence(
+                   evidence_id TEXT PRIMARY KEY, revision_id TEXT NOT NULL, kind TEXT NOT NULL,
+                   supports TEXT NOT NULL, content_json TEXT NOT NULL,
+                   interpretation TEXT NOT NULL, limitations_json TEXT NOT NULL
+                 ) WITHOUT ROWID;
+                 CREATE TABLE scope(
+                   revision_id TEXT NOT NULL, dimension TEXT NOT NULL, value TEXT NOT NULL,
+                   PRIMARY KEY(revision_id, dimension, value)
+                 ) WITHOUT ROWID;
+                 CREATE TABLE semantic_conflict(
+                   conflict_id TEXT PRIMARY KEY, status TEXT NOT NULL, projection_json TEXT NOT NULL
+                 ) WITHOUT ROWID;
+                 CREATE TABLE conflict(
+                   conflict_key TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL,
+                   context_id TEXT
+                 ) WITHOUT ROWID;
+                 CREATE TABLE publication_head(context_id TEXT, publication_id TEXT);
+                 CREATE TABLE publication(publication_id TEXT, revision_id TEXT);
+                 CREATE VIRTUAL TABLE context_fts USING fts5(
+                   context_id UNINDEXED, revision_id UNINDEXED,
+                   title, statement, rationale, evidence, problem_view, hint_text
+                 );
+                 CREATE TABLE token_alias(
+                   token TEXT NOT NULL, alias TEXT NOT NULL, source TEXT NOT NULL,
+                   group_key TEXT NOT NULL, PRIMARY KEY(token, alias, source, group_key)
+                 ) WITHOUT ROWID;",
+            )
+            .unwrap();
+        let space_id = "spc_00000000-0000-4000-8000-000000000001";
+        connection
+            .execute(
+                "INSERT INTO space_projection VALUES (?, ?)",
+                params![space_id, "Ordering Space"],
+            )
+            .unwrap();
+        let statement = "tiebreakneedle is stated identically by both Contexts";
+        // The earlier publication is given the lower Context ID, so identity alone would put it
+        // first and only the publication time can turn the order around.
+        for (index, accepted_at) in [(1_u8, first), (2, second)] {
+            let context_id = format!("ctx_00000000-0000-4000-8000-{index:012x}");
+            let revision_id = format!("rev_10000000-0000-4000-8000-{index:012x}");
+            connection
+                .execute(
+                    "INSERT INTO context_item VALUES (?, ?, 'accepted', 1, ?, NULL, NULL)",
+                    params![context_id, space_id, accepted_at],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO context_revision VALUES (
+                       ?, ?, ?, 'decision', ?, 'shared rationale',
+                       '{\"domains\":[],\"platforms\":[],\"conditions\":[]}', '[]', '[]',
+                       'accepted', 1000, NULL, ''
+                     )",
+                    params![revision_id, context_id, space_id, statement],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO context_fts VALUES (?, ?, ?, ?, ?, '', '', '')",
+                    params![
+                        context_id,
+                        revision_id,
+                        normalize_search_text(statement),
+                        normalize_search_text(statement),
+                        normalize_search_text("shared rationale")
+                    ],
+                )
+                .unwrap();
+        }
+        connection
+    }
+
+    fn ordered_context_ids(connection: &rusqlite::Connection) -> Vec<String> {
+        let request = SearchRequest {
+            query: "tiebreakneedle".to_owned(),
+            filters: SearchFilters {
+                statuses: vec![ContextStatus::Accepted],
+                ..SearchFilters::default()
+            },
+            page_size: 20,
+            ..SearchRequest::default()
+        };
+        search_in_snapshot(
+            connection,
+            &request,
+            "ordering-tree",
+            false,
+            &ContextTtlSettings::default(),
+        )
+        .unwrap()
+        .results
+        .into_iter()
+        .map(|result| result.context_id.to_string())
+        .collect()
+    }
+
+    #[test]
+    fn publication_time_orders_what_relevance_cannot_and_identity_still_closes_it() {
+        let newer_second = two_equally_ranked_contexts(1_000, 2_000);
+        assert_eq!(
+            ordered_context_ids(&newer_second),
+            [
+                "ctx_00000000-0000-4000-8000-000000000002",
+                "ctx_00000000-0000-4000-8000-000000000001"
+            ]
+        );
+        // Reversing only the publication times reverses only the order, so nothing else in the
+        // ranking is reading the identity these two rows differ in.
+        let newer_first = two_equally_ranked_contexts(2_000, 1_000);
+        assert_eq!(
+            ordered_context_ids(&newer_first),
+            [
+                "ctx_00000000-0000-4000-8000-000000000001",
+                "ctx_00000000-0000-4000-8000-000000000002"
+            ]
+        );
+        // With nothing left to separate them, identity closes the order rather than leaving it
+        // undefined.
+        let unpublished = two_equally_ranked_contexts(1_000, 1_000);
+        assert_eq!(
+            ordered_context_ids(&unpublished),
+            [
+                "ctx_00000000-0000-4000-8000-000000000001",
+                "ctx_00000000-0000-4000-8000-000000000002"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_space_only_a_hop_reached_never_outranks_the_space_the_hop_started_in() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        use sctx_domain::{ContextId, ContextRelationKind, RevisionId, SpaceId};
+
+        use super::{
+            AcceptedContextEvidence, AssociationEvidence, ContextRelationRetrievalPath,
+            TaskRetrievalPath, cap_hop_only_space_scores,
+        };
+
+        let answering_space = SpaceId::new();
+        let hopped_space = SpaceId::new();
+        let seed_context = ContextId::new();
+        let hopped_context = ContextId::new();
+        let mut evidence = BTreeMap::new();
+        evidence.insert(
+            answering_space,
+            AssociationEvidence {
+                textual_contexts: BTreeSet::from([seed_context]),
+                fused_score_basis_points: 3_000,
+                ..AssociationEvidence::default()
+            },
+        );
+        // The relation channel is heavy enough to fuse above a Space that only matched text.
+        evidence.insert(
+            hopped_space,
+            AssociationEvidence {
+                relation_contexts: BTreeSet::from([hopped_context]),
+                fused_score_basis_points: 7_000,
+                ..AssociationEvidence::default()
+            },
+        );
+        let mut contexts = BTreeMap::new();
+        contexts.insert(
+            (answering_space, seed_context),
+            AcceptedContextEvidence {
+                textual_match: true,
+                ..AcceptedContextEvidence::default()
+            },
+        );
+        contexts.insert(
+            (hopped_space, hopped_context),
+            AcceptedContextEvidence {
+                relation_depth: Some(1),
+                graph_paths: vec![TaskRetrievalPath::ContextRelation {
+                    hops: vec![ContextRelationRetrievalPath {
+                        source_context_id: seed_context,
+                        source_revision_id: RevisionId::new(),
+                        target_context_id: hopped_context,
+                        target_revision_id: RevisionId::new(),
+                        kind: ContextRelationKind::RelatedTo,
+                        rationale: "the hop".to_owned(),
+                        supports: Vec::new(),
+                        depth: 1,
+                    }],
+                }],
+                ..AcceptedContextEvidence::default()
+            },
+        );
+
+        cap_hop_only_space_scores(&mut evidence, &contexts, &BTreeMap::new());
+        assert_eq!(evidence[&answering_space].fused_score_basis_points, 3_000);
+        assert_eq!(
+            evidence[&hopped_space].fused_score_basis_points, 2_999,
+            "a Space nothing but a hop reached must sort behind the Space the hop started in"
+        );
+
+        // A Space that also answered on its own text is not a hop-only Space and keeps its score.
+        evidence
+            .get_mut(&hopped_space)
+            .unwrap()
+            .textual_contexts
+            .insert(hopped_context);
+        evidence
+            .get_mut(&hopped_space)
+            .unwrap()
+            .fused_score_basis_points = 7_000;
+        cap_hop_only_space_scores(&mut evidence, &contexts, &BTreeMap::new());
+        assert_eq!(evidence[&hopped_space].fused_score_basis_points, 7_000);
+    }
+
+    #[test]
+    fn matched_rarity_prefers_the_word_that_names_something() {
+        let rarity = super::QueryTokenRarity {
+            document_count: 8,
+            document_frequencies: [
+                ("兜底".to_owned(), 1),
+                ("槽位".to_owned(), 2),
+                ("模块".to_owned(), 6),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let one = |token: &str| rarity.matched_micros(&[token.to_owned()]);
+        assert!(one("兜底") > one("槽位"));
+        assert!(one("槽位") > one("模块"));
+        // Two Contexts covering one answerable token each are separated by which token it was.
+        assert!(
+            rarity.matched_micros(&["兜底".to_owned()])
+                > rarity.matched_micros(&["模块".to_owned()])
+        );
+        // A token this Tree never measured is not scored as if it were the rarest word there is.
+        assert_eq!(rarity.matched_micros(&["未测量".to_owned()]), 0);
+        // Explicit retrieval measures nothing, so every candidate scores zero and keeps its order.
+        assert_eq!(
+            super::QueryTokenRarity::default().matched_micros(&["兜底".to_owned()]),
+            0
+        );
+    }
+
+    #[test]
+    fn two_letter_names_survive_the_short_token_filter() {
+        for name in super::MEANINGFUL_SHORT_TOKENS {
+            assert!(!super::automatic_short_token(name), "{name}");
+            assert!(!super::automatic_generic_token(name), "{name}");
+        }
+        // Everything else two bytes long is still a splitting fragment, not a name.
+        for fragment in ["ab", "xy", "l", "e2"] {
+            assert!(super::automatic_short_token(fragment), "{fragment}");
+        }
+        // A single Han character is one character of a bigram, never a token on its own.
+        assert!(super::automatic_short_token("论"));
+        assert!(!super::automatic_short_token("评论"));
+    }
+
+    #[test]
+    fn one_named_member_expands_a_han_domain_term_and_nothing_else() {
+        let connection = alias_table(&[
+            (
+                "domain_term",
+                "评论-论输-输入-入栏",
+                &["评论", "论输", "输入", "入栏"],
+            ),
+            (
+                "domain_term",
+                "bottom-bar-page-manager",
+                &["bottombarpagemanager", "bottom", "bar", "page", "manager"],
+            ),
+            (
+                "identifier_split",
+                "poi-entrance-assem",
+                &["poientranceassem", "poi", "entrance", "assem"],
+            ),
+        ]);
+        // A rewritten question reproduces one bigram of the written-down term, never two adjacent
+        // ones, so a Han domain-term group has to fire on a single named member.
+        let alias = AliasExpansion::load(&connection, &["评论".to_owned()]).unwrap();
+        assert_eq!(alias.token_group("评论"), ["评论", "入栏", "论输", "输入"]);
+        // An ASCII member of the same kind of group is a word in its own right, so one of them
+        // still names no term in particular and would turn the term into a hub.
+        let alias = AliasExpansion::load(&connection, &["page".to_owned()]).unwrap();
+        assert_eq!(alias.token_group("page"), ["page"]);
+        let alias =
+            AliasExpansion::load(&connection, &["page".to_owned(), "manager".to_owned()]).unwrap();
+        assert_eq!(
+            alias.token_group("page"),
+            ["page", "bar", "bottom", "bottombarpagemanager"]
+        );
+        // One word of an identifier names no identifier in particular and stays unexpanded.
+        let alias = AliasExpansion::load(&connection, &["entrance".to_owned()]).unwrap();
+        assert_eq!(alias.token_group("entrance"), ["entrance"]);
+        assert!(alias.identifier_tokens().is_empty());
+        let alias = AliasExpansion::load(&connection, &["entrance".to_owned(), "assem".to_owned()])
+            .unwrap();
+        assert_eq!(
+            alias.token_group("entrance"),
+            ["entrance", "poi", "poientranceassem"]
+        );
+        assert!(alias.identifier_tokens().contains("entrance"));
+    }
 
     #[test]
     fn usage_prior_promotes_reuse_and_only_penalizes_repeated_ignores() {

@@ -1703,13 +1703,20 @@ fn prose_hints<'a>(
 }
 
 /// Emits every ordered alias pair of one identifier or domain term as a single alias group.
+///
+/// An ASCII run is a code identifier, so its members are the whole spelling plus every word it
+/// splits into. A run that carries non-ASCII text has no whole-word spelling to add: the
+/// tokenizer indexes contiguous Han as overlapping bigrams, and concatenating those back
+/// (`评论` + `论输` + …) would invent a string no document contains. Its members are therefore
+/// exactly the tokens the run indexes as, which makes one written-down term — a Space Intent
+/// domain term, a `topic_key` spelling — a group whose bigrams stand in for one another.
 fn collect_alias_rows(
     source: &str,
     origin: &str,
     rows: &mut BTreeSet<(String, String, String, String)>,
 ) {
     for run in source.split(|character: char| !character.is_alphanumeric()) {
-        if run.is_empty() || !run.is_ascii() {
+        if run.is_empty() {
             continue;
         }
         let parts = search_tokens(run);
@@ -1717,8 +1724,13 @@ fn collect_alias_rows(
             continue;
         }
         let group_key = parts.join("-");
-        let mut members = vec![parts.concat()];
-        members.extend(parts);
+        let mut members = if run.is_ascii() {
+            let mut members = vec![parts.concat()];
+            members.extend(parts);
+            members
+        } else {
+            parts
+        };
         members.sort();
         members.dedup();
         for token in &members {
@@ -1880,4 +1892,57 @@ fn json(value: &impl serde::Serialize) -> crate::Result<String> {
             format!("serialize projection JSON: {error}"),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::collect_alias_rows;
+
+    fn group(source: &str, origin: &str) -> Vec<(String, String, String, String)> {
+        let mut rows = BTreeSet::new();
+        collect_alias_rows(source, origin, &mut rows);
+        rows.into_iter().collect()
+    }
+
+    #[test]
+    fn an_ascii_identifier_group_keeps_its_whole_spelling() {
+        let rows = group("PoiEntranceAssem", "identifier_split");
+        let members = rows
+            .iter()
+            .map(|(token, _, _, _)| token.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            members,
+            BTreeSet::from(["assem", "entrance", "poi", "poientranceassem"])
+        );
+        assert!(
+            rows.iter()
+                .all(|(_, _, _, key)| key == "poi-entrance-assem")
+        );
+    }
+
+    #[test]
+    fn a_han_term_groups_the_bigrams_it_indexes_as() {
+        let rows = group("评论输入栏", "domain_term");
+        let members = rows
+            .iter()
+            .map(|(token, _, _, _)| token.as_str())
+            .collect::<BTreeSet<_>>();
+        // Contiguous Han indexes as overlapping bigrams, so those are exactly the members. No
+        // concatenated whole-term spelling is invented, because no document holds one.
+        assert_eq!(members, BTreeSet::from(["评论", "论输", "输入", "入栏"]));
+        assert!(
+            rows.iter()
+                .all(|(_, _, source, key)| source == "domain_term" && key == "评论-论输-输入-入栏")
+        );
+        assert_eq!(rows.len(), 12);
+    }
+
+    #[test]
+    fn a_han_run_shorter_than_one_bigram_pair_seeds_no_group() {
+        assert!(group("栏", "domain_term").is_empty());
+        assert!(group("输栏", "domain_term").is_empty());
+    }
 }

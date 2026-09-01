@@ -1385,8 +1385,10 @@ fn resolve_artifact_focus_reminder(
 
 #[derive(Debug)]
 enum HookEventAttribution {
+    /// Every path resolved to a Repository this Session is authorized for. The Workspace it
+    /// resolved through is a precondition, not a result: nothing downstream records a location,
+    /// so only the attributed files travel on.
     Registered {
-        workspace_hint: PathBuf,
         file_hints: Vec<PathBuf>,
     },
     NonLocating,
@@ -1418,29 +1420,16 @@ fn attribute_post_tool_action(
     };
     let attribution =
         resolve_post_tool_attribution(context.cwd.as_path(), path_hints, scope, catalog)?;
-    let Some(TaskRuntimeOperation::MergeSignals {
-        cwd,
-        workspace_roots,
-        file_hints,
-        ..
-    }) = action.task_operation.as_mut()
+    let Some(TaskRuntimeOperation::MergeSignals { file_hints, .. }) =
+        action.task_operation.as_mut()
     else {
         return Err(invariant("enabled PostToolUse has no merge operation"));
     };
     match attribution {
         HookEventAttribution::Registered {
-            workspace_hint,
             file_hints: attributed_files,
-        } => {
-            cwd.clone_from(&workspace_hint);
-            *workspace_roots = vec![workspace_hint.clone()];
-            file_hints.clone_from(&attributed_files);
-        }
-        HookEventAttribution::NonLocating => {
-            *cwd = PathBuf::new();
-            workspace_roots.clear();
-            file_hints.clear();
-        }
+        } => file_hints.clone_from(&attributed_files),
+        HookEventAttribution::NonLocating => file_hints.clear(),
     }
     Ok(action)
 }
@@ -1485,11 +1474,10 @@ fn resolve_post_tool_attribution(
     if repository_ids.is_empty() || checkout_paths.is_empty() {
         return Err(invariant("PostToolUse attribution resolved no safe path"));
     }
-    let Some(workspace_hint) = resolve_registered_workspace(&checkout_paths, scope) else {
+    if resolve_registered_workspace(&checkout_paths, scope).is_none() {
         return Ok(HookEventAttribution::NonLocating);
-    };
+    }
     Ok(HookEventAttribution::Registered {
-        workspace_hint,
         file_hints: file_hints.into_iter().collect(),
     })
 }
