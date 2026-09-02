@@ -23,7 +23,7 @@ use sctx_agent_adapter::{
     CanonicalAgentEvent, CanonicalAgentEventKind, EpisodeFinalizationTrigger, FileAccess,
     MAX_SHELL_COMMAND_PATH_CANDIDATES, PathHint, ResolvedActivationDecision, ResolvedAgentAction,
     TaskRuntimeOperation, ToolCategory, ToolOutcome, TrustState, artifact_focus_reminder_file,
-    plan_action_for_activation, render_artifact_focus_reminder,
+    plan_action_for_activation, render_artifact_focus_reminder, shared_context_activation_marker,
 };
 use sctx_domain::{
     Applicability, CandidateReviewStatus, ConflictParticipant, ConflictResolutionDraft,
@@ -1151,7 +1151,8 @@ fn run_hook(args: &[String]) -> Result<()> {
 }
 
 /// Resolves the complete Hook policy for one event: pure activation policy,
-/// then `PostToolUse` Catalog attribution, then the off-by-default P4.1 reminder.
+/// then `PostToolUse` Catalog attribution, then a self-healed activation marker,
+/// then the off-by-default P4.1 reminder.
 fn plan_hook_action(
     agent: &str,
     event: &CanonicalAgentEvent,
@@ -1190,6 +1191,7 @@ fn plan_hook_action(
     } else {
         action
     };
+    let action = add_self_healed_activation_marker(event, action, capabilities, authorization);
     if authorization.hooks.artifact_focus_reminder {
         add_artifact_focus_reminder(
             agent,
@@ -1211,6 +1213,9 @@ struct HookAuthorization {
     scope: Option<AuthorizedSessionScope>,
     catalog: Option<RepositoryCatalogSnapshot>,
     hooks: HookSettings,
+    /// True when *this* event created the Session's missing lease and owes it the activation
+    /// marker `SessionStart` never delivered.
+    deliver_activation_marker: bool,
 }
 
 impl HookAuthorization {
@@ -1222,8 +1227,49 @@ impl HookAuthorization {
             hooks: HookSettings {
                 artifact_focus_reminder: false,
             },
+            deliver_activation_marker: false,
         }
     }
+}
+
+/// Re-states the activation marker for a Session whose `SessionStart` never delivered one.
+///
+/// `SessionStart` is the only event that renders the marker, so a `SessionStart` that failed
+/// open — a busy maintenance lock is enough — left its Session permanently without the one datum
+/// the Agent cannot guess: the host Session id it must send back as `external_session_id`. The
+/// lease self-heal already rebuilds authorization from a later event; this rebuilds the marker
+/// with it, exactly once per lease.
+///
+/// The marker takes the `additional_context` field only when nothing else claimed it, which is
+/// the same first-come rule the Artifact focus reminder follows. Order settles the collision:
+/// this runs before the reminder, because a Session that cannot identify itself has nothing to
+/// focus on. Events whose vendor output cannot carry model-visible text — a Cursor
+/// `beforeSubmitPrompt` or `sessionEnd` encodes an empty object — are skipped rather than
+/// spending the one-shot delivery on a field that is dropped.
+fn add_self_healed_activation_marker(
+    event: &CanonicalAgentEvent,
+    mut action: CanonicalAgentAction,
+    capabilities: &AgentCapabilities,
+    authorization: &HookAuthorization,
+) -> CanonicalAgentAction {
+    if !authorization.deliver_activation_marker || action.additional_context.is_some() {
+        return action;
+    }
+    action.additional_context = Some(shared_context_activation_marker(
+        capabilities.agent,
+        &event.context().session_id,
+    ));
+    action
+}
+
+/// Whether one lifecycle event's vendor output can carry model-visible text on both adapters.
+const fn carries_model_visible_context(kind: CanonicalAgentEventKind) -> bool {
+    matches!(
+        kind,
+        CanonicalAgentEventKind::PostToolUse
+            | CanonicalAgentEventKind::PreCompact
+            | CanonicalAgentEventKind::TurnStop
+    )
 }
 
 fn resolve_hook_authorization(
@@ -1231,8 +1277,12 @@ fn resolve_hook_authorization(
     event: &CanonicalAgentEvent,
     recorder: &HookEventRecorder,
 ) -> HookAuthorization {
-    match resolve_hook_authorization_inner(agent, &event.context().session_id, &event.context().cwd)
-    {
+    match resolve_hook_authorization_inner(
+        agent,
+        event.kind(),
+        &event.context().session_id,
+        &event.context().cwd,
+    ) {
         Ok(authorization) => authorization,
         Err(error) => {
             recorder.flush(
@@ -1247,6 +1297,7 @@ fn resolve_hook_authorization(
 
 fn resolve_hook_authorization_inner(
     agent: &str,
+    event_kind: CanonicalAgentEventKind,
     session_id: &str,
     startup_cwd: &Path,
 ) -> Result<HookAuthorization> {
@@ -1271,17 +1322,31 @@ fn resolve_hook_authorization_inner(
     // against this Catalog — so a Session outside every registered Repository still
     // records Disabled. The added hot-path cost is one `canonicalize`, and the write is
     // non-blocking.
+    let mut deliver_activation_marker = false;
     let scope = match store.try_read_reconciled(&locator, &catalog)? {
         AuthorizedSessionScopeRead::Current(scope) => Some(scope),
         AuthorizedSessionScopeRead::Missing => {
             let canonical_startup_cwd = fs::canonicalize(startup_cwd).map_err(|error| {
                 Error::new(ErrorKind::Io, format!("canonicalize startup cwd: {error}"))
             })?;
-            Some(
-                store
-                    .try_authorize_missing(&locator, &catalog, &canonical_startup_cwd)?
-                    .scope,
-            )
+            let scope = store
+                .try_authorize_missing(&locator, &catalog, &canonical_startup_cwd)?
+                .scope;
+            // `SessionStart` renders the marker unconditionally, so only a later event that had
+            // to build the lease itself owes one. Recording the delivery in the lease is what
+            // keeps the next event from repeating it — the same one-shot bookkeeping the Intent
+            // bootstrap reminder uses — and a busy lock simply skips this event's delivery
+            // rather than risking a duplicate.
+            if event_kind != CanonicalAgentEventKind::SessionStart
+                && carries_model_visible_context(event_kind)
+                && scope.decision.is_enabled()
+                && !scope.activation_marker_delivered
+            {
+                deliver_activation_marker = store
+                    .try_mark_activation_marker_delivered(&locator)
+                    .unwrap_or(false);
+            }
+            Some(scope)
         }
     };
     let activation = if scope
@@ -1297,6 +1362,7 @@ fn resolve_hook_authorization_inner(
         scope,
         catalog: Some(catalog),
         hooks,
+        deliver_activation_marker,
     })
 }
 

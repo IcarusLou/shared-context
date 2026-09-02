@@ -820,3 +820,77 @@ fn an_undecodable_payload_records_its_shape_and_none_of_its_values() {
     assert!(detail.chars().count() <= 256, "{detail}");
     assert!(!fixture.persisted_state_text().contains(secret));
 }
+
+/// `SessionStart` is the only event that renders the activation marker, so a `SessionStart` that
+/// failed open — one busy maintenance lock is enough — left its Session permanently without the
+/// one datum the Agent cannot guess. The lease self-heal already rebuilds authorization from a
+/// later event; it now rebuilds the marker with it, exactly once.
+#[test]
+fn a_session_that_never_started_gets_its_marker_from_the_self_healing_event() {
+    let fixture = Fixture::new("self healed marker");
+    for (agent, session) in [("codex", "healed-codex"), ("cursor", "healed-cursor")] {
+        // The Task exists but the lease does not, so the marker is the only thing this event
+        // owes and the Intent bootstrap reminder cannot compete for the field.
+        fixture.open_task(
+            agent,
+            session,
+            "re-state the marker a SessionStart never sent",
+        );
+        let kind = if agent == "codex" {
+            AgentKind::Codex
+        } else {
+            AgentKind::Cursor
+        };
+        let marker = shared_context_activation_marker(kind, session);
+        let payload = |turn: &str| {
+            if agent == "codex" {
+                fixture.codex_exec(session, turn, &json!(["cargo", "check"]))
+            } else {
+                let mut payload = fixture.cursor_tool(
+                    session,
+                    turn,
+                    "read_file",
+                    &json!({"file_path": "src/lib.rs"}),
+                );
+                payload["cwd"] = json!(fixture.repository);
+                payload
+            }
+        };
+        let expected = if agent == "codex" {
+            json!({"hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": marker,
+            }})
+        } else {
+            json!({"additional_context": marker})
+        };
+
+        // No SessionStart ever reached the Hook: this event builds the lease and owes the marker.
+        assert_eq!(fixture.hook(agent, &payload("heal-1")), expected);
+        // The delivery is recorded in the lease, so the next event stays silent.
+        assert_eq!(fixture.hook(agent, &payload("heal-2")), json!({}));
+    }
+}
+
+/// An unauthorized Session must leave exactly zero local residue, and a self-heal that decides
+/// Disabled is no exception: it delivers no marker and writes no lease bookkeeping.
+#[test]
+fn a_disabled_self_heal_delivers_no_marker_and_writes_nothing() {
+    let fixture = Fixture::new("disabled self heal");
+    let event = |turn: &str| {
+        json!({
+            "session_id": "disabled-heal", "transcript_path": null, "cwd": fixture.outside,
+            "hook_event_name": "PostToolUse", "model": "gpt-5.6-sol",
+            "permission_mode": "default", "turn_id": turn,
+            "tool_name": "shell", "tool_use_id": format!("call-{turn}"),
+            "tool_input": {"command": ["cat", "src/lib.rs"], "workdir": fixture.outside},
+            "tool_response": {"output": "Done!"}
+        })
+    };
+    // The first event records the permanent Disabled lease, exactly as it did before.
+    assert_eq!(fixture.hook("codex", &event("turn-1")), json!({}));
+    let before = fixture.state_bytes();
+    assert_eq!(fixture.hook("codex", &event("turn-2")), json!({}));
+    assert_eq!(fixture.state_bytes(), before);
+    assert!(!fixture.root.join("state/runtime.sqlite").exists());
+}

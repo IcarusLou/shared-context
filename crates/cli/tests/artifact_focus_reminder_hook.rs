@@ -409,6 +409,41 @@ fn enabled_switch_reminds_once_per_artifact_and_stays_neutral_otherwise() {
     assert_eq!(harness.hook(&shell), json!({}));
 }
 
+/// Both the re-stated activation marker and the P4.1 reminder want the one model-visible field,
+/// and the marker wins: a Session that cannot name itself has nothing to focus on. Losing the
+/// field does not spend the reminder — it is still owed, and the next event delivers it.
+#[test]
+fn a_self_healed_marker_precedes_the_artifact_focus_reminder_without_consuming_it() {
+    let harness = seeded_harness();
+    harness.enable_artifact_focus_reminder();
+    // Exactly what a `SessionStart` that failed open leaves behind: no interpretable lease.
+    fs::remove_dir_all(harness.root().join("state/authorized-session-scopes")).unwrap();
+
+    let healed = harness.hook(&read_payload(
+        &harness.repository,
+        &harness.source_file(),
+        "tool-healed",
+    ));
+    assert_eq!(
+        reminder_of(&healed).as_deref(),
+        Some(shared_context_activation_marker(AgentKind::Codex, SESSION).as_str()),
+        "the identity the Agent cannot guess comes before an optional reminder"
+    );
+    assert!(
+        !harness.root().join("state/artifact-reminders").exists(),
+        "losing the field must not spend the one-shot reminder"
+    );
+
+    let next = harness.hook(&read_payload(
+        &harness.repository,
+        &harness.source_file(),
+        "tool-after-heal",
+    ));
+    let reminder = reminder_of(&next).expect("the reminder is still owed on the next event");
+    assert!(reminder.contains("call task_artifact_focus for src/contract.rs to load them"));
+    assert!(!reminder.contains("<shared-context-active"));
+}
+
 #[test]
 fn enabled_switch_is_neutral_without_an_engineering_projection() {
     let harness = seeded_harness();
