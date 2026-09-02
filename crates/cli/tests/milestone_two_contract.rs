@@ -721,9 +721,27 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
 
     let unsafe_input = fixture.input("unsafe-session", "hazardpackintent");
     let automatic_unsafe = establish_task(&fixture.root, &unsafe_input);
+    // All four hazard Spaces share one Intent token and are ranked against each other on that one
+    // channel, so the automatic relevance floor keeps the leaders and drops the tail. Which ones
+    // survive is the ranking's business; that they are hazard Spaces, that the drop is explained,
+    // and that none of them yields an item, are this contract's.
+    let associated = response_spaces(&automatic_unsafe);
+    let hazard = fixture.unsafe_spaces.into_iter().collect::<BTreeSet<_>>();
+    assert!(!associated.is_empty() && associated.is_subset(&hazard));
+    let dropped = hazard
+        .difference(&associated)
+        .copied()
+        .collect::<BTreeSet<_>>();
     assert_eq!(
-        response_spaces(&automatic_unsafe),
-        fixture.unsafe_spaces.into_iter().collect()
+        automatic_unsafe
+            .omitted
+            .iter()
+            .filter(|omitted| omitted.reason == "below_relevance_floor")
+            .filter_map(|omitted| omitted.space_id)
+            .collect::<BTreeSet<_>>(),
+        dropped,
+        "every Space the floor dropped says so: {:#?}",
+        automatic_unsafe.omitted
     );
     assert!(automatic_unsafe.items.is_empty());
     assert!(
