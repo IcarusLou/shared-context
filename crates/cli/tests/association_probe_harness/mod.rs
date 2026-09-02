@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Shared harness for the association probe acceptance tests (WP-T, WP-L7).
 //!
 //! Stores a fixed synthetic knowledge set through the public chain
@@ -166,7 +167,7 @@ fn initialize_repository(path: &Path, files: &Value) -> PathBuf {
 /// only the fixture's own storage order produced. Every probe therefore starts from no history at
 /// all: the usage prior is a real product signal, but it is not what these probes measure, and at
 /// basis-point margins it is loud enough to flip a top-1.
-fn reset_context_usage(home: &Path) {
+pub fn reset_context_usage(home: &Path) {
     let database = home
         .join(".shared-context")
         .join("state")
@@ -449,7 +450,7 @@ fn automatic_diagnostics(harness: &Harness) -> AutomaticProbeDiagnostics {
     }
 }
 
-fn top_index(harness: &Harness, context_id: Option<&str>) -> Option<u64> {
+pub fn top_index(harness: &Harness, context_id: Option<&str>) -> Option<u64> {
     context_id.and_then(|id| harness.index_by_context.get(id).copied())
 }
 
