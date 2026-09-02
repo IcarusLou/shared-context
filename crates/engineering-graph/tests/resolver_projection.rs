@@ -11,7 +11,7 @@ use sctx_engineering_graph::{
     ArtifactObservation, ArtifactSourceState, EngineeringProjectionStore,
     EngineeringReferenceResolver, GraphContextSafety, GraphContextSnapshot, GraphContextStatus,
     MatchBasis, ProjectedEngineeringReference, RepositoryScanOutcome, RepositorySnapshot,
-    SnapshotArtifact, SnapshotSourcePolicy, SourceLanguage,
+    ScanCoverage, SnapshotArtifact, SnapshotSourcePolicy, SourceLanguage,
 };
 use tempfile::TempDir;
 
@@ -119,6 +119,7 @@ fn snapshot(
         head_tree_oid: format!("tree-{generation}"),
         generation: generation.to_owned(),
         planned_paths,
+        coverage: ScanCoverage::Complete,
         artifacts,
         scanned_files: 1,
         scanned_bytes: 1,
@@ -413,4 +414,109 @@ fn empty_snapshot_is_missing_without_diagnostic_edge() {
         ResolutionStatus::Missing
     );
     assert!(projection.references[0].association.is_none());
+}
+
+/// Rewrites a snapshot so it only claims to have read `covered`.
+fn cut_short(
+    outcome: RepositoryScanOutcome,
+    covered: &[&str],
+    unfinished: &[&str],
+) -> RepositoryScanOutcome {
+    let RepositoryScanOutcome::Available(mut snapshot) = outcome else {
+        panic!("only an available snapshot can be cut short");
+    };
+    snapshot.coverage = ScanCoverage::Partial {
+        covered: covered.iter().map(|value| path(value)).collect(),
+        unfinished: unfinished.iter().map(|value| path(value)).collect(),
+    };
+    RepositoryScanOutcome::Available(snapshot)
+}
+
+#[test]
+fn a_path_a_budgeted_scan_never_reached_is_unavailable_rather_than_missing() {
+    // A scan that ran out of budget mid-plan holds no evidence about the range it never read.
+    // Calling that range "missing" would report the budget as a fact about the Repository.
+    let repository = repository("partial");
+    let unreached = reference(&repository, file("never/reached.rs"));
+    let reached = reference(&repository, file("was/read.rs"));
+    let projected = vec![unreached.clone(), reached.clone()];
+    let projection = EngineeringReferenceResolver
+        .resolve(
+            &projected,
+            &[cut_short(
+                snapshot(&repository, "snap-partial", Vec::new()),
+                &["was/read.rs"],
+                &["never/reached.rs"],
+            )],
+            &graph_contexts(&projected),
+        )
+        .unwrap();
+
+    let unreached = projection
+        .references
+        .iter()
+        .find(|entry| entry.reference_id == unreached.reference.reference_id)
+        .unwrap();
+    assert_eq!(
+        unreached.resolution.status,
+        ResolutionStatus::Unavailable,
+        "an unscanned path must not be reported as missing"
+    );
+    assert!(
+        unreached
+            .resolution
+            .explanation
+            .contains("stopped before this path"),
+        "{}",
+        unreached.resolution.explanation
+    );
+    assert_eq!(
+        unreached.evidence[0].basis,
+        MatchBasis::RepositoryUnavailable
+    );
+    assert!(unreached.association.is_none());
+
+    let reached = projection
+        .references
+        .iter()
+        .find(|entry| entry.reference_id == reached.reference.reference_id)
+        .unwrap();
+    assert_eq!(
+        reached.resolution.status,
+        ResolutionStatus::Missing,
+        "inside the scanned range the snapshot still answers"
+    );
+}
+
+#[test]
+fn an_incomplete_scan_records_its_unfinished_range_in_the_projection() {
+    let temp = TempDir::new().unwrap();
+    let store = EngineeringProjectionStore::initialize(temp.path()).unwrap();
+    let repository = repository("partial-record");
+    let projected = reference(&repository, file("was/read.rs"));
+    let projection = EngineeringReferenceResolver
+        .resolve(
+            std::slice::from_ref(&projected),
+            &[cut_short(
+                snapshot(&repository, "snap-partial", Vec::new()),
+                &["was/read.rs"],
+                &["never/reached.rs", "never/either.rs"],
+            )],
+            &graph_contexts(std::slice::from_ref(&projected)),
+        )
+        .unwrap();
+
+    assert_eq!(projection.incomplete_scans.len(), 1);
+    let record = &projection.incomplete_scans[0];
+    assert_eq!(record.repository_id, repository.repository_id);
+    assert_eq!(record.scanned_paths, 1);
+    assert_eq!(record.unfinished_paths, 2);
+    assert_eq!(record.unfinished_prefixes, vec!["never".to_owned()]);
+
+    store.rebuild(&projection).unwrap();
+    let stored = store.read_projection().unwrap().unwrap();
+    assert_eq!(
+        stored.incomplete_scans, projection.incomplete_scans,
+        "the unfinished range must survive a projection round trip"
+    );
 }

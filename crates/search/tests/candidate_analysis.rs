@@ -13,7 +13,7 @@ use sctx_domain::{
 use sctx_engineering_graph::{
     ArtifactObservation, ArtifactSourceState, EngineeringProjectionStore,
     EngineeringReferenceResolver, ProjectedEngineeringReference, RepositoryScanOutcome,
-    RepositorySnapshot, SnapshotArtifact, SnapshotSourcePolicy, SourceLanguage,
+    RepositorySnapshot, ScanCoverage, SnapshotArtifact, SnapshotSourcePolicy, SourceLanguage,
     build_graph_context_snapshots,
 };
 use sctx_event_schema::{Event, EventPayload};
@@ -1246,6 +1246,7 @@ fn exact_artifact_graph_reaches_cross_end_space_with_frozen_generation() {
                 head_tree_oid: "candidate-graph-tree".to_owned(),
                 generation: "candidate-graph-generation".to_owned(),
                 planned_paths: vec![RepoRelativePath::new("src/search.ts").unwrap()],
+                coverage: ScanCoverage::Complete,
                 artifacts: vec![artifact],
                 scanned_files: 1,
                 scanned_bytes: 100,

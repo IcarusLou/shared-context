@@ -10,7 +10,7 @@ use sctx_domain::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{RepositoryScanOutcome, RepositorySnapshot, SnapshotArtifact};
+use crate::{RepositoryScanOutcome, RepositorySnapshot, ScanCoverage, SnapshotArtifact};
 
 const RESOLVER_POLICY_VERSION: &str = "historical-context-snapshot-resolution-v2";
 
@@ -475,6 +475,21 @@ impl ResolvedReferenceProjection {
     }
 }
 
+/// One Repository scan in this generation that stopped before reading its whole plan.
+///
+/// The projection records the boundary rather than hiding it: References inside the unread range
+/// resolve to `Unavailable`, and this row says which range that was, so a reader can tell an
+/// Artifact that is genuinely gone from one the scan simply never reached.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IncompleteRepositoryScan {
+    pub repository_id: RepositoryId,
+    pub repository_generation: String,
+    pub scanned_paths: usize,
+    pub unfinished_paths: usize,
+    /// Directory prefixes that still hold at least one unread planned path.
+    pub unfinished_prefixes: Vec<String>,
+}
+
 /// Complete disposable Engineering projection for one resolver generation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EngineeringProjection {
@@ -482,6 +497,9 @@ pub struct EngineeringProjection {
     pub artifact_generation: String,
     pub contexts: Vec<GraphContextSnapshot>,
     pub references: Vec<ResolvedReferenceProjection>,
+    /// Scans that ran out of budget mid-plan. Absent on projections written before this existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete_scans: Vec<IncompleteRepositoryScan>,
 }
 
 impl EngineeringProjection {
@@ -604,6 +622,7 @@ impl EngineeringReferenceResolver {
             artifact_generation: generation,
             contexts,
             references: resolved,
+            incomplete_scans: incomplete_scans(&snapshots),
         };
         projection.validate()?;
         Ok(projection)
@@ -692,6 +711,23 @@ fn resolve_one(
         Some(SnapshotState::Available(snapshot)) => {
             let candidates = winning_candidates(reference, &snapshot.artifacts);
             match candidates.as_slice() {
+                // A budgeted scan can stop before it reaches every planned path. Outside the range
+                // it actually read, the snapshot holds no evidence either way, and "no Artifact
+                // found" would be a statement about the budget rather than about the Repository.
+                [] if !snapshot_covers(snapshot, &reference.locator) => projection_for_status(
+                    projected,
+                    Some(snapshot.generation.clone()),
+                    ResolutionStatus::Unavailable,
+                    None,
+                    vec![],
+                    vec![CandidateMatchEvidence {
+                        artifact_key: None,
+                        basis: MatchBasis::RepositoryUnavailable,
+                        confidence: 0.0,
+                        explanation: UNSCANNED_EXPLANATION.to_owned(),
+                    }],
+                    UNSCANNED_EXPLANATION.to_owned(),
+                ),
                 [] => projection_for_status(
                     projected,
                     Some(snapshot.generation.clone()),
@@ -708,6 +744,51 @@ fn resolve_one(
                 _ => projection_for_ambiguous(projected, snapshot, &candidates),
             }
         }
+    }
+}
+
+/// Collects the scans in this generation that stopped before reading their whole plan.
+fn incomplete_scans(
+    snapshots: &BTreeMap<RepositoryId, SnapshotState<'_>>,
+) -> Vec<IncompleteRepositoryScan> {
+    snapshots
+        .iter()
+        .filter_map(|(repository_id, state)| {
+            let SnapshotState::Available(snapshot) = state else {
+                return None;
+            };
+            let ScanCoverage::Partial {
+                covered,
+                unfinished,
+            } = &snapshot.coverage
+            else {
+                return None;
+            };
+            Some(IncompleteRepositoryScan {
+                repository_id: repository_id.clone(),
+                repository_generation: snapshot.generation.clone(),
+                scanned_paths: covered.len(),
+                unfinished_paths: unfinished.len(),
+                unfinished_prefixes: snapshot.coverage.unfinished_prefixes(),
+            })
+        })
+        .collect()
+}
+
+/// Sentence used whenever a Reference falls outside what a budgeted scan actually read.
+const UNSCANNED_EXPLANATION: &str =
+    "The Repository snapshot stopped before this path; the scan says nothing about it";
+
+/// Reports whether one snapshot carries evidence about the range a locator names.
+///
+/// A Module locator names a directory and is answered by anything read beneath it; every other
+/// locator names one file and is answered only by that file.
+fn snapshot_covers(snapshot: &RepositorySnapshot, locator: &ArtifactLocator) -> bool {
+    let path = locator.path().as_str();
+    if matches!(locator, ArtifactLocator::Module { .. }) {
+        snapshot.coverage.covers_directory(path)
+    } else {
+        snapshot.coverage.covers_path(path)
     }
 }
 

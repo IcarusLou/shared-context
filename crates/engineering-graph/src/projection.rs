@@ -9,7 +9,7 @@ use sctx_domain::{Error, ErrorKind, Result};
 
 use crate::EngineeringProjection;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Disposable local projection store for resolved Engineering Graph state.
@@ -104,12 +104,15 @@ impl EngineeringProjectionStore {
         transaction
             .execute(
                 "INSERT INTO projection_meta (
-                    singleton, policy_version, artifact_generation, context_tree_oid
-                 ) VALUES (1, ?1, ?2, ?3)",
+                    singleton, policy_version, artifact_generation, context_tree_oid,
+                    incomplete_scans_json
+                 ) VALUES (1, ?1, ?2, ?3, ?4)",
                 params![
                     projection.policy_version,
                     projection.artifact_generation,
-                    context_tree_oid
+                    context_tree_oid,
+                    serde_json::to_string(&projection.incomplete_scans)
+                        .map_err(json_error("serialize incomplete Repository scans"))?,
                 ],
             )
             .map_err(sql_error("write Engineering projection metadata"))?;
@@ -182,7 +185,8 @@ impl EngineeringProjectionStore {
             .map_err(sql_error("begin Engineering projection read"))?;
         let meta = transaction
             .query_row(
-                "SELECT policy_version, artifact_generation, context_tree_oid
+                "SELECT policy_version, artifact_generation, context_tree_oid,
+                        incomplete_scans_json
                  FROM projection_meta WHERE singleton = 1",
                 [],
                 |row| {
@@ -190,12 +194,15 @@ impl EngineeringProjectionStore {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
             .optional()
             .map_err(sql_error("read Engineering projection metadata"))?;
-        let Some((policy_version, artifact_generation, context_tree_oid)) = meta else {
+        let Some((policy_version, artifact_generation, context_tree_oid, incomplete_scans_json)) =
+            meta
+        else {
             transaction
                 .commit()
                 .map_err(sql_error("commit empty Engineering projection read"))?;
@@ -252,11 +259,17 @@ impl EngineeringProjectionStore {
             );
         }
         drop(statement);
+        let incomplete_scans = incomplete_scans_json
+            .map(|payload| serde_json::from_str(&payload))
+            .transpose()
+            .map_err(json_error("parse incomplete Repository scans"))?
+            .unwrap_or_default();
         let projection = EngineeringProjection {
             policy_version,
             artifact_generation,
             contexts,
             references,
+            incomplete_scans,
         };
         projection.validate()?;
         transaction
@@ -314,6 +327,16 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
         // behind a concurrent reader on a hot path that only ever reads.
         return Ok(());
     }
+    if version == 4 {
+        // Version 4 knew nothing about a scan that stopped mid-plan. The projection is a
+        // disposable derivative, so the column is simply added and the next rebuild fills it.
+        return connection
+            .execute_batch(
+                "ALTER TABLE projection_meta ADD COLUMN incomplete_scans_json TEXT;
+                 PRAGMA user_version = 5;",
+            )
+            .map_err(sql_error("migrate Engineering projection schema"));
+    }
     if version != 0 {
         return Err(invariant(format!(
             "unsupported Engineering projection schema version {version}"
@@ -325,7 +348,8 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 policy_version TEXT NOT NULL,
                 artifact_generation TEXT NOT NULL,
-                context_tree_oid TEXT
+                context_tree_oid TEXT,
+                incomplete_scans_json TEXT
             ) STRICT;
             CREATE TABLE IF NOT EXISTS graph_context_snapshot (
                 context_id TEXT NOT NULL,
@@ -339,7 +363,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 artifact_generation TEXT NOT NULL,
                 payload_json TEXT NOT NULL CHECK (json_valid(payload_json))
             ) STRICT;
-            PRAGMA user_version = 4;",
+            PRAGMA user_version = 5;",
         )
         .map_err(sql_error("initialize Engineering projection schema"))
 }

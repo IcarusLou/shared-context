@@ -19,14 +19,14 @@ pub use relocation::{RelocationCandidate, find_relocation_candidate, relocatable
 pub use resolver::{
     CandidateMatchEvidence, EngineeringProjection, EngineeringReferenceResolver,
     GraphContextRelation, GraphContextSafety, GraphContextSafetyBlocker, GraphContextSnapshot,
-    GraphContextStatus, MatchBasis, ProjectedEngineeringReference, ResolvedReferenceProjection,
-    build_graph_context_snapshots,
+    GraphContextStatus, IncompleteRepositoryScan, MatchBasis, ProjectedEngineeringReference,
+    ResolvedReferenceProjection, build_graph_context_snapshots,
 };
 pub use scanner::{
     ArtifactObservation, ArtifactSourceState, MAX_REPOSITORY_SCAN_PLAN_PATHS,
     RepositoryScanOutcome, RepositoryScanPlan, RepositoryScanner, RepositoryScannerLimits,
-    RepositorySnapshot, SkippedFile, SkippedFileReason, SnapshotArtifact, SnapshotSourcePolicy,
-    SourceLanguage,
+    RepositorySnapshot, ScanCoverage, SkippedFile, SkippedFileReason, SnapshotArtifact,
+    SnapshotSourcePolicy, SourceLanguage,
 };
 
 use std::{
