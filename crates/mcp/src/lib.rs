@@ -6023,12 +6023,14 @@ impl McpServer {
         if !is_public_tool(&call.name) {
             return Err(invalid(format!("unknown tool: {}", call.name)));
         }
+        let is_checkpoint = call.name == "task_checkpoint";
         self.runtime = None;
         let result = MaintenanceLock::open_or_create(&self.root)
             .and_then(|lock| lock.try_shared())
             .map_err(ToolFailure::maintenance_failed)
             .and_then(|_maintenance| self.authorize_and_call(&call));
         match result {
+            Ok(data) if is_checkpoint => tool_success_with_notice(data, task_checkpoint_ack_notice),
             Ok(data) => tool_success(data),
             Err(failure) => tool_failure(failure),
         }
@@ -8141,6 +8143,44 @@ fn tool_success(data: Value) -> Result<Value> {
         "structuredContent": data,
         "isError": false,
     }))
+}
+
+/// Same envelope as [`tool_success`], but appends a plain-text operator note after the
+/// pretty-printed JSON body. The note is presentation only: `structuredContent` (the public
+/// response schema) is unchanged, and no field here can be mistaken for an accepted Candidate —
+/// only `candidate_confirm` produces one.
+#[allow(clippy::needless_pass_by_value)]
+fn tool_success_with_notice(
+    data: Value,
+    notice: impl FnOnce(&Value) -> Option<String>,
+) -> Result<Value> {
+    let mut text = serde_json::to_string_pretty(&data)
+        .map_err(|error| Error::new(ErrorKind::Io, format!("serialize tool result: {error}")))?;
+    if let Some(notice) = notice(&data) {
+        text.push_str("\n\n");
+        text.push_str(&notice);
+    }
+    Ok(json!({
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": data,
+        "isError": false,
+    }))
+}
+
+/// Post-Checkpoint guidance appended to the ACK text whenever the Checkpoint was accepted (and
+/// therefore always queued a Candidate Build; ADR-0003).
+///
+/// Candidate drafts only ever come from `task_checkpoint`, and `candidate_list` itself drains
+/// any outstanding Build before it answers, so there is no reason for the agent to poll
+/// `candidate_list` before this ACK or to wait for the user to ask about it afterward.
+fn task_checkpoint_ack_notice(data: &Value) -> Option<String> {
+    data.get("candidate_build")?;
+    Some(
+        "This Checkpoint was accepted and queued a Candidate Build. Call candidate_list next, \
+         then present every Pending Review to the user as a table (topic, statement, relation) \
+         and ask them to confirm — do not wait for the user to bring it up."
+            .to_owned(),
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
