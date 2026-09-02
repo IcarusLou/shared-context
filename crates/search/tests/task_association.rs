@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
 use sctx_domain::{
-    Applicability, CandidateConfirmationOperation, CandidateConfirmationPlan,
-    CandidateConfirmationPrimaryReference, CandidatePrimarySelection, ConflictParticipant,
-    ContextId, ContextKind, ContextRevisionDraft, ContextSpaceAssociationDraft,
-    ContextSpaceAssociationOrigin, EvidenceSnapshotDraft, EvidenceType, OptionalCandidateEdits,
-    PublicationAction, PublicationDraft, RevisionId, SemanticConflictDraft, SpaceId, SubmissionId,
-    TaskId, TaskSessionId, TaskSignal, TaskSignalKind, TaskSpaceAssociation, WorkEpisodeId,
-    WorkEpisodeRef, WorkingIntentSnapshot,
+    Applicability, ArtifactKind, ArtifactLocator, CandidateConfirmationOperation,
+    CandidateConfirmationPlan, CandidateConfirmationPrimaryReference, CandidatePrimarySelection,
+    ConflictParticipant, ContextId, ContextKind, ContextRevisionDraft,
+    ContextSpaceAssociationDraft, ContextSpaceAssociationOrigin, EngineeringReferenceDraft,
+    EvidenceSnapshotDraft, EvidenceType, OptionalCandidateEdits, PublicationAction,
+    PublicationDraft, ReferenceRelation, RepoRelativePath, RevisionId, SemanticConflictDraft,
+    SpaceId, SubmissionId, TaskId, TaskSessionId, TaskSignal, TaskSignalKind, TaskSpaceAssociation,
+    WorkEpisodeId, WorkEpisodeRef, WorkingIntentSnapshot,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
@@ -2679,5 +2680,271 @@ fn coverage_weighted_rank_puts_the_covering_context_ahead_of_a_short_near_duplic
                 .context
                 .match_reason
                 .coverage_basis_points
+    );
+}
+
+/// The corpus of the FE session that was handed three Android SPI Contexts it had no use for:
+/// one subject, three Contexts, two of them near-duplicates.
+fn weak_token_corpus() -> (TempDir, GitStore, SpaceId) {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("relevance-floor")).unwrap();
+    let android = add_space(
+        &store,
+        "LiveAnchorProvider",
+        "android live anchor provider implementation registry",
+    );
+    for statement in [
+        "the live anchor entry provider returns early when its implementation is absent",
+        "removing the provider implementation module turns the missing dependency error into a \
+         silent fallback",
+        "the provider implementation module removal keeps the silent fallback behavior",
+    ] {
+        add_accepted_context(
+            &store,
+            android,
+            statement,
+            applicability("androidclient", "android", "liveroom"),
+        );
+    }
+    (temporary, store, android)
+}
+
+/// A Space that did not lead the one text channel that found it is not injected unasked.
+///
+/// `MINIMUM_ASSOCIATION_SCORE_BASIS_POINTS` only says an association exists, which is the right
+/// bar for a query an Agent typed. Automatic injection owes a higher one, and this is what
+/// `AUTOMATIC_RELEVANCE_FLOOR_BASIS_POINTS` buys: the runner-up on a single channel is dropped
+/// with its numbers, while the Space that led that same channel is still injected.
+#[test]
+fn a_single_channel_runner_up_is_dropped_below_the_relevance_floor_with_its_numbers() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("runner-up")).unwrap();
+    // Neither Space Intent carries the query token, so exactly one channel -- accepted Context
+    // BM25 -- ranks these two Spaces against each other.
+    let leader = add_space(&store, "LeaderSpace", "first subject area");
+    let runner_up = add_space(&store, "RunnerUpSpace", "second subject area");
+    add_accepted_context(
+        &store,
+        leader,
+        "anchorquorumtoken",
+        applicability("leaderdomain", "leaderplatform", "leadercondition"),
+    );
+    add_accepted_context(
+        &store,
+        runner_up,
+        "anchorquorumtoken appears once inside a much longer statement that also records a great \
+         deal of unrelated surrounding detail so that its term frequency per token is lower than \
+         the leading Space's",
+        applicability("runnerupdomain", "runnerupplatform", "runnerupcondition"),
+    );
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+
+    let pack = SearchEngine::new(index)
+        .task_context_pack(&TaskContextRequest::automatic(
+            TaskId::new(),
+            task("anchorquorumtoken"),
+            Vec::new(),
+            100_000,
+        ))
+        .unwrap();
+    assert_eq!(
+        pack.associations
+            .iter()
+            .map(|association| association.space_id)
+            .collect::<Vec<_>>(),
+        vec![leader],
+        "the Space that led the channel is still injected"
+    );
+    let floor = pack
+        .omitted
+        .iter()
+        .find(|omitted| omitted.reason == "below_relevance_floor")
+        .unwrap_or_else(|| panic!("the drop must say why: {:#?}", pack.omitted));
+    assert_eq!(floor.space_id, Some(runner_up));
+    assert_eq!(floor.count, 1);
+    let fused = floor
+        .fused_score_basis_points
+        .expect("the number it failed on");
+    let bar = floor
+        .relevance_floor_basis_points
+        .expect("the number it failed against");
+    assert!(fused < bar, "{fused} is not below {bar}");
+    assert!(
+        pack.items
+            .iter()
+            .all(|item| item.association_space_id == leader),
+        "a dropped Space contributes no items"
+    );
+}
+
+/// The weak-token injection the FE session actually saw is *not* separable by fused score, and
+/// this pins the measurement that says so.
+///
+/// The Task shares one generic token with a corpus about something else. That token matches both
+/// the Space Intent and an accepted Context, so two channels rank the Space first and it fuses to
+/// 454 basis points -- the same score a genuinely two-channel answer earns. The largest floor
+/// either probe fixture tolerates is 227 (one channel at rank 1; see the harness's relevance
+/// floor sweep), and a floor high enough to reject 454 costs the `probe-v1` set 6 of 20 correct
+/// top-1 answers and `probe-zh-v1` 4 of 19. Reciprocal rank fusion measures position within one
+/// query, not how much of the query a Space actually answers, so no threshold on it can tell
+/// "the only thing that matched" from "the right thing". Closing this needs an absolute measure;
+/// the floor is not it, and raising the floor is not the fix.
+#[test]
+fn the_fe_weak_token_case_scores_above_every_probe_tolerable_floor() {
+    let (_temporary, store, android) = weak_token_corpus();
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+
+    let mut unrelated = task("the comment input bar implementation is hidden by the soft keyboard");
+    unrelated.domains = vec!["webcomment".to_owned()];
+    unrelated.platforms = vec!["fe".to_owned()];
+    let pack = SearchEngine::new(index)
+        .task_context_pack(&TaskContextRequest::automatic(
+            TaskId::new(),
+            unrelated,
+            Vec::new(),
+            100_000,
+        ))
+        .unwrap();
+    let association = pack
+        .associations
+        .iter()
+        .find(|association| association.space_id == android)
+        .unwrap_or_else(|| {
+            panic!("the weak-token association is measured here, not asserted away: {pack:#?}")
+        });
+    let fusion = association
+        .reasons
+        .iter()
+        .find_map(|reason| serde_json::from_str::<TaskAssociationFusionExplanation>(reason).ok())
+        .expect("every association explains its fusion");
+    assert_eq!(
+        fusion.fused_score_basis_points, 454,
+        "two text channels at rank 1; the floor would have to exceed this to reject it"
+    );
+    assert!(
+        fusion.fused_score_basis_points > 227,
+        "227 is the largest floor both probe fixtures tolerate"
+    );
+}
+
+fn record_file_reference(
+    store: &GitStore,
+    context_id: ContextId,
+    revision_id: RevisionId,
+    repository_id: &str,
+    path: &str,
+) {
+    append(
+        store,
+        Event::engineering_reference_recorded(
+            context_id,
+            revision_id,
+            EngineeringReferenceDraft {
+                repository_id: repository_id.parse().unwrap(),
+                artifact_kind: ArtifactKind::File,
+                relation: ReferenceRelation::Implements,
+                locator: ArtifactLocator::File {
+                    path: RepoRelativePath::new(path).unwrap(),
+                },
+                supports: "the compact location fixture points at this file".to_owned(),
+                limitations: vec!["synthetic fixture".to_owned()],
+            },
+            None,
+        )
+        .unwrap(),
+    );
+}
+
+/// A compact item says which codebase its Engineering References all live in, and that sentence
+/// changes nothing about whether or where the item is returned.
+///
+/// The FE session that was handed three Android Contexts could not see that they were Android
+/// Contexts without opening each one. Naming the Repository is the whole repair: the Agent judges
+/// applicability, the ranking never does. Weighting by Repository would have suppressed exactly
+/// the cross-surface association this product exists to make, so the signal stays in the prose.
+#[test]
+fn a_compact_item_names_the_single_repository_its_references_live_in() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("repository-annotation")).unwrap();
+    let space = add_space(&store, "AnchorSpace", "anchor subject area");
+    let (single, single_revision, _) = add_accepted_context(
+        &store,
+        space,
+        "repositoryannotationneedle in the single repository Context",
+        applicability("anchordomain", "anchorplatform", "anchorcondition"),
+    );
+    let (spread, spread_revision, _) = add_accepted_context(
+        &store,
+        space,
+        "repositoryannotationneedle in the two repository Context",
+        applicability("anchordomain", "anchorplatform", "anchorcondition"),
+    );
+    record_file_reference(&store, single, single_revision, "Android", "app/src/One.kt");
+    record_file_reference(&store, single, single_revision, "Android", "app/src/Two.kt");
+    record_file_reference(&store, spread, spread_revision, "Android", "app/src/One.kt");
+    record_file_reference(&store, spread, spread_revision, "Web", "src/one.ts");
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    let engine = SearchEngine::new(index);
+
+    let request = TaskContextRequest::automatic(
+        TaskId::new(),
+        task("repositoryannotationneedle"),
+        Vec::new(),
+        100_000,
+    );
+    let full = engine.task_context_pack(&request).unwrap();
+    let compact = engine
+        .task_context_pack_with_detail(&request, ContextPackDetailLevel::Compact)
+        .unwrap();
+    assert_eq!(
+        compact
+            .compact_items
+            .iter()
+            .map(|item| item.context_id)
+            .collect::<Vec<_>>(),
+        full.items
+            .iter()
+            .map(|item| item.context.context_id)
+            .collect::<Vec<_>>(),
+        "the sentence is prose; the selection and its order are the ranking's alone"
+    );
+    let sentence = "References are all in repository Android.";
+    let single_item = compact
+        .compact_items
+        .iter()
+        .find(|item| item.context_id == single)
+        .expect("the single-repository Context is packed");
+    assert!(
+        single_item.why.iter().any(|reason| reason == sentence),
+        "{:#?}",
+        single_item.why
+    );
+    let spread_item = compact
+        .compact_items
+        .iter()
+        .find(|item| item.context_id == spread)
+        .expect("the two-repository Context is packed");
+    assert!(
+        spread_item
+            .why
+            .iter()
+            .all(|reason| !reason.starts_with("References are all in repository")),
+        "References in two Repositories are in neither: {:#?}",
+        spread_item.why
+    );
+    // The locations both items already carried keep their Repository prefix, unchanged.
+    assert!(
+        spread_item.evidence.iter().all(|evidence| {
+            evidence.locations
+                == vec![
+                    "Android:app/src/One.kt".to_owned(),
+                    "Web:src/one.ts".to_owned(),
+                ]
+        }),
+        "{:#?}",
+        spread_item.evidence
     );
 }

@@ -37,7 +37,7 @@ pub use reference_derivation::{
     ResolvedReference, claim_topic_key, derive_claim_references, unresolvable,
 };
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const HOOK_BUSY_TIMEOUT: Duration = Duration::from_millis(25);
 const MAX_EPISODE_LIST_LIMIT: usize = 256;
@@ -3888,8 +3888,15 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
     let version = connection
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .map_err(sql_error("read task runtime schema version"))?;
+    // The in-place upgrades chain, so an installation two versions behind reaches the current
+    // schema in one open instead of being told its database is unsupported.
+    let mut version = version;
     if version == 13 {
-        return migrate_schema_13_to_14(connection);
+        migrate_schema_13_to_14(connection)?;
+        version = 14;
+    }
+    if version == 14 {
+        return migrate_schema_14_to_15(connection);
     }
     if version != 0 && version != SCHEMA_VERSION {
         return Err(invariant(format!(
@@ -4251,15 +4258,15 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
             ) STRICT;
             CREATE INDEX IF NOT EXISTS hook_event_recorded_at
                 ON hook_event (recorded_at_unix_ms);
-            PRAGMA user_version = 14;",
+            PRAGMA user_version = 15;",
         )
         .map_err(sql_error("initialize task runtime schema"))
 }
 
 /// Adds the additive `hook_event` table (and its index) to an existing schema version 13
 /// installation and advances `user_version` to 14, in one transaction. Every prior table and
-/// its data is left untouched — this is the only supported upgrade path; every other version
-/// mismatch still hard-fails in [`ensure_schema`].
+/// its data is left untouched. [`ensure_schema`] chains this into the next upgrade rather than
+/// returning here; every version below 13 still hard-fails.
 fn migrate_schema_13_to_14(connection: &Connection) -> Result<()> {
     connection
         .execute_batch(
@@ -4284,6 +4291,28 @@ fn migrate_schema_13_to_14(connection: &Connection) -> Result<()> {
         )
         .map_err(sql_error(
             "migrate task runtime schema from version 13 to 14",
+        ))
+}
+
+/// Discards every recorded injection outcome on an existing schema version 14 installation and
+/// advances `user_version` to 15, in one transaction.
+///
+/// Every row in `context_usage` written before this version was decided by statement token
+/// similarity, which credited restatement and recorded real reuse as an omission. The counts are
+/// advisory local ranking state with no Event behind them and no way to re-derive them — the
+/// Claims that produced them are long since built — so the only honest repair is to stop counting
+/// the wrong answers. `task_injection` is untouched: what was injected into which Task is a fact,
+/// only the verdict on it was wrong.
+fn migrate_schema_14_to_15(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+            DELETE FROM context_usage;
+            PRAGMA user_version = 15;
+            COMMIT;",
+        )
+        .map_err(sql_error(
+            "migrate task runtime schema from version 14 to 15",
         ))
 }
 

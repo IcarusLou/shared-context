@@ -922,6 +922,14 @@ pub struct ContextPackOmitted {
     /// Independent text channels that matched this Space.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_channel_count: Option<usize>,
+    /// Fused association score this Space reached, in basis points. Present only on the
+    /// `below_relevance_floor` reason, beside the floor it failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fused_score_basis_points: Option<u16>,
+    /// Floor the fused score was measured against, so the number above it can be read without
+    /// knowing this build's constant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relevance_floor_basis_points: Option<u16>,
     /// Free text naming what went wrong, for the omissions that report a degraded channel rather
     /// than a dropped Context. Carried only under [`ContextPackMode::Explicit`]: an automatic
     /// injection gets the reason, which is what it can act on, and not the storage error text.
@@ -1346,44 +1354,60 @@ impl SearchEngine {
         })
     }
 
-    /// Reads the immutable statements of the named Context revisions.
+    /// Reads the Repository-qualified Engineering Reference locators of the named Context
+    /// revisions.
     ///
-    /// This is the cheap read behind the injection/Claim comparison: it answers "what text did we
-    /// actually hand this Task" from the projection index alone, without reducing the Event log
-    /// into a full domain snapshot. Revisions the index no longer carries are absent.
+    /// This is the cheap read behind the injection/Claim comparison: it answers "which engineering
+    /// coordinates did the Contexts we handed this Task point at" from the projection index alone,
+    /// without reducing the Event log into a full domain snapshot. Each locator is spelled
+    /// `repository_id:path`, the same spelling a compact Pack prints as a location, so a Claim's
+    /// own derived References can be intersected with it directly. Revisions the index no longer
+    /// carries, and revisions carrying no Reference, are absent.
     ///
     /// # Errors
     ///
     /// Returns storage errors propagated by index synchronization and snapshot reads.
-    pub fn context_statements(
+    pub fn context_reference_locators(
         &self,
         revisions: &[(ContextId, RevisionId)],
-    ) -> Result<BTreeMap<ContextId, String>> {
+    ) -> Result<BTreeMap<ContextId, BTreeSet<String>>> {
         let requested = revisions.iter().copied().collect::<BTreeSet<_>>();
         if requested.is_empty() {
             return Ok(BTreeMap::new());
         }
         let snapshot = self.index.query_snapshot(|connection| {
-            let mut statements = BTreeMap::new();
+            let mut locators = BTreeMap::<ContextId, BTreeSet<String>>::new();
             let mut statement = connection
                 .prepare(
-                    "SELECT statement FROM context_revision
+                    "SELECT repository_id, locator_json FROM engineering_reference
                      WHERE context_id = ?1 AND revision_id = ?2",
                 )
-                .map_err(sql_error("prepare Context statement read"))?;
+                .map_err(sql_error("prepare injected Reference locator read"))?;
             for (context_id, revision_id) in &requested {
-                let text = statement
-                    .query_row(
-                        rusqlite::params![context_id.to_string(), revision_id.to_string()],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()
-                    .map_err(sql_error("read Context statement"))?;
-                if let Some(text) = text {
-                    statements.insert(*context_id, text);
+                let mut rows = statement
+                    .query(rusqlite::params![
+                        context_id.to_string(),
+                        revision_id.to_string()
+                    ])
+                    .map_err(sql_error("execute injected Reference locator read"))?;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(sql_error("read injected Reference locator row"))?
+                {
+                    let repository_id: String = row
+                        .get(0)
+                        .map_err(sql_error("read injected Reference Repository"))?;
+                    let locator: LocatorPath = from_json(
+                        &row.get::<_, String>(1)
+                            .map_err(sql_error("read injected Reference locator"))?,
+                    )?;
+                    locators
+                        .entry(*context_id)
+                        .or_default()
+                        .insert(format!("{repository_id}:{}", locator.path));
                 }
             }
-            Ok(statements)
+            Ok(locators)
         })?;
         Ok(snapshot.data)
     }
@@ -3063,11 +3087,21 @@ fn collapse_gate_omissions(mut omitted: Vec<ContextPackOmitted>) -> Vec<ContextP
             .then_with(|| left.space_id.cmp(&right.space_id))
     });
     let collapsed = omitted.split_off(AUTOMATIC_GATE_OMISSION_LIMIT);
-    omitted.push(ContextPackOmitted {
-        reason: "automatic_text_ineligible".to_owned(),
-        count: collapsed.len(),
-        ..ContextPackOmitted::default()
-    });
+    // One counted notice per reason: a Pack that says "8 more" without saying what decided them
+    // sends an Agent looking for the wrong thing.
+    let mut counts = BTreeMap::<String, usize>::new();
+    for entry in collapsed {
+        *counts.entry(entry.reason).or_default() += 1;
+    }
+    omitted.extend(
+        counts
+            .into_iter()
+            .map(|(reason, count)| ContextPackOmitted {
+                reason,
+                count,
+                ..ContextPackOmitted::default()
+            }),
+    );
     omitted
 }
 
@@ -4389,6 +4423,21 @@ const FUSION_CHANNEL_WEIGHT: usize = GRAPH_ARTIFACT_CHANNEL_WEIGHT
     + (4 * HINT_TEXT_CHANNEL_WEIGHT)
     + 3;
 const MINIMUM_ASSOCIATION_SCORE_BASIS_POINTS: u16 = 100;
+/// Fused score an automatically injected Space must reach.
+///
+/// [`MINIMUM_ASSOCIATION_SCORE_BASIS_POINTS`] only says an association exists, which is the right
+/// bar for a query an Agent typed on purpose. Automatic injection is not asked for, so it owes a
+/// higher one: a Space that matched on one text channel and placed near the bottom of that
+/// channel's own ranking is a coincidence of vocabulary, and an unasked-for Context that is not
+/// about the Task is worse than no Context at all.
+///
+/// The value is measured, not chosen. Both probe fixtures were swept per distinct fused score
+/// behind a correct top-1 (`--- automatic relevance floor sweep ---`); the lowest such score in
+/// either set is 227 basis points, one text channel at rank 1, and this is the largest floor that
+/// costs neither set a hit. Nothing here reads the Repository a Context belongs to: cross-surface
+/// association is the point of the product, and a Space is dropped for being weakly matched, never
+/// for living somewhere else.
+const AUTOMATIC_RELEVANCE_FLOOR_BASIS_POINTS: u16 = 227;
 const TASK_CONTEXT_ENVELOPE_TOKEN_RESERVE: usize = 128;
 
 #[allow(clippy::too_many_lines)]
@@ -4906,6 +4955,17 @@ fn association(
                 answerable_tokens: Some(coverage_basis.answerable_count()),
                 selected_tokens: Some(coverage_basis.selected_count()),
                 text_channel_count: Some(gate.text_channel_count),
+                ..ContextPackOmitted::default()
+            });
+            return None;
+        }
+        if evidence.fused_score_basis_points < AUTOMATIC_RELEVANCE_FLOOR_BASIS_POINTS {
+            omitted.push(ContextPackOmitted {
+                space_id: Some(space_id),
+                reason: "below_relevance_floor".to_owned(),
+                count: 1,
+                fused_score_basis_points: Some(evidence.fused_score_basis_points),
+                relevance_floor_basis_points: Some(AUTOMATIC_RELEVANCE_FLOOR_BASIS_POINTS),
                 ..ContextPackOmitted::default()
             });
             return None;
@@ -5596,6 +5656,7 @@ fn load_task_context_candidates(
     if detail_level == ContextPackDetailLevel::Compact {
         let relations = load_compact_relations(connection, &candidates)?;
         let locations = load_compact_locations(connection, &candidates)?;
+        let empty_locations = CompactReferenceLocations::default();
         for candidate in &mut candidates {
             candidate.compact = Some(compact_task_context_item(
                 &candidate.item,
@@ -5605,7 +5666,7 @@ fn load_task_context_candidates(
                     .unwrap_or_default(),
                 locations
                     .get(&candidate.item.context.revision_id)
-                    .map_or(&[] as &[String], Vec::as_slice),
+                    .unwrap_or(&empty_locations),
             ));
         }
     }
@@ -5753,8 +5814,8 @@ fn load_compact_relations(
 fn load_compact_locations(
     connection: &Connection,
     candidates: &[TaskContextCandidate],
-) -> Result<BTreeMap<RevisionId, Vec<String>>> {
-    let mut locations = BTreeMap::<RevisionId, Vec<String>>::new();
+) -> Result<BTreeMap<RevisionId, CompactReferenceLocations>> {
+    let mut locations = BTreeMap::<RevisionId, CompactReferenceLocations>::new();
     if candidates.is_empty() {
         return Ok(locations);
     }
@@ -5773,6 +5834,7 @@ fn load_compact_locations(
             .query([revision_id.to_string()])
             .map_err(sql_error("execute compact Engineering Reference retrieval"))?;
         let mut paths = BTreeSet::new();
+        let mut repositories = BTreeSet::new();
         while let Some(row) = rows
             .next()
             .map_err(sql_error("read compact Engineering Reference row"))?
@@ -5785,18 +5847,38 @@ fn load_compact_locations(
                     .map_err(sql_error("read Engineering Reference locator"))?,
             )?;
             paths.insert(format!("{repository_id}:{}", locator.path));
+            repositories.insert(repository_id);
         }
         if !paths.is_empty() {
             locations.insert(
                 revision_id,
-                paths
-                    .into_iter()
-                    .take(COMPACT_EVIDENCE_LOCATION_LIMIT)
-                    .collect(),
+                CompactReferenceLocations {
+                    // Read before the truncation below, so a second Repository hidden by the
+                    // location limit still prevents the single-Repository sentence.
+                    sole_repository: (repositories.len() == 1)
+                        .then(|| repositories.into_iter().next().unwrap_or_default()),
+                    paths: paths
+                        .into_iter()
+                        .take(COMPACT_EVIDENCE_LOCATION_LIMIT)
+                        .collect(),
+                },
             );
         }
     }
     Ok(locations)
+}
+
+/// One revision's compact Reference locations, and the Repository they all live in when there is
+/// exactly one.
+///
+/// The Repository is carried as explanation only. It never enters ranking, a gate, or a filter:
+/// a Context whose References all sit in one codebase is very often exactly what a Task on
+/// another surface needs, and weighting by Repository would suppress the association this product
+/// exists to make. Saying where a fact came from lets the Agent judge that for itself.
+#[derive(Default)]
+struct CompactReferenceLocations {
+    paths: Vec<String>,
+    sole_repository: Option<String>,
 }
 
 /// Path shared by every `ArtifactLocator` variant. Kind-specific coordinates are irrelevant to a
@@ -5809,7 +5891,7 @@ struct LocatorPath {
 fn compact_task_context_item(
     item: &TaskContextItem,
     relations: Vec<CompactContextRelation>,
-    locations: &[String],
+    locations: &CompactReferenceLocations,
 ) -> CompactTaskContextItem {
     CompactTaskContextItem {
         context_id: item.context.context_id,
@@ -5830,14 +5912,14 @@ fn compact_task_context_item(
                     &evidence_summary(evidence),
                     COMPACT_EVIDENCE_SUMMARY_MAX_CHARS,
                 ),
-                locations: locations.to_vec(),
+                locations: locations.paths.clone(),
             })
             .collect(),
         relations,
         conflicts: item.context.conflicts.clone(),
         derived_state: item.context.derived_state.clone(),
         retrieval_channels: retrieval_channels(&item.retrieval_paths),
-        why: compact_item_reasons(item),
+        why: compact_item_reasons(item, locations.sole_repository.as_deref()),
     }
 }
 
@@ -5900,7 +5982,7 @@ fn truncate_chars(value: &str, maximum: usize) -> String {
 
 /// At most [`COMPACT_ITEM_REASON_LIMIT`] one-sentence reasons, ordered from the strongest
 /// retrieval path to the weakest, so a compact item stays explainable without its path payload.
-fn compact_item_reasons(item: &TaskContextItem) -> Vec<String> {
+fn compact_item_reasons(item: &TaskContextItem, sole_repository: Option<&str>) -> Vec<String> {
     let mut reasons = Vec::new();
     let mut relation_hops = 0;
     let mut graph = false;
@@ -5966,6 +6048,9 @@ fn compact_item_reasons(item: &TaskContextItem) -> Vec<String> {
     }
     if let Some(sentence) = usage_prior_reason(item.context.usage) {
         reasons.push(sentence);
+    }
+    if let Some(repository_id) = sole_repository {
+        reasons.push(format!("References are all in repository {repository_id}."));
     }
     reasons.truncate(COMPACT_ITEM_REASON_LIMIT);
     reasons

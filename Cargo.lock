@@ -509,6 +509,7 @@ name = "sctx-cli"
 version = "0.1.0"
 dependencies = [
  "fs2",
+ "rusqlite",
  "sctx-adapter-codex",
  "sctx-adapter-cursor",
  "sctx-agent-adapter",
