@@ -922,6 +922,14 @@ pub struct ContextPackOmitted {
     /// Independent text channels that matched this Space.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_channel_count: Option<usize>,
+    /// Fused association score this Space reached, in basis points. Present only on the
+    /// `below_relevance_floor` reason, beside the floor it failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fused_score_basis_points: Option<u16>,
+    /// Floor the fused score was measured against, so the number above it can be read without
+    /// knowing this build's constant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relevance_floor_basis_points: Option<u16>,
     /// Free text naming what went wrong, for the omissions that report a degraded channel rather
     /// than a dropped Context. Carried only under [`ContextPackMode::Explicit`]: an automatic
     /// injection gets the reason, which is what it can act on, and not the storage error text.
@@ -3079,11 +3087,21 @@ fn collapse_gate_omissions(mut omitted: Vec<ContextPackOmitted>) -> Vec<ContextP
             .then_with(|| left.space_id.cmp(&right.space_id))
     });
     let collapsed = omitted.split_off(AUTOMATIC_GATE_OMISSION_LIMIT);
-    omitted.push(ContextPackOmitted {
-        reason: "automatic_text_ineligible".to_owned(),
-        count: collapsed.len(),
-        ..ContextPackOmitted::default()
-    });
+    // One counted notice per reason: a Pack that says "8 more" without saying what decided them
+    // sends an Agent looking for the wrong thing.
+    let mut counts = BTreeMap::<String, usize>::new();
+    for entry in collapsed {
+        *counts.entry(entry.reason).or_default() += 1;
+    }
+    omitted.extend(
+        counts
+            .into_iter()
+            .map(|(reason, count)| ContextPackOmitted {
+                reason,
+                count,
+                ..ContextPackOmitted::default()
+            }),
+    );
     omitted
 }
 
@@ -4405,6 +4423,21 @@ const FUSION_CHANNEL_WEIGHT: usize = GRAPH_ARTIFACT_CHANNEL_WEIGHT
     + (4 * HINT_TEXT_CHANNEL_WEIGHT)
     + 3;
 const MINIMUM_ASSOCIATION_SCORE_BASIS_POINTS: u16 = 100;
+/// Fused score an automatically injected Space must reach.
+///
+/// [`MINIMUM_ASSOCIATION_SCORE_BASIS_POINTS`] only says an association exists, which is the right
+/// bar for a query an Agent typed on purpose. Automatic injection is not asked for, so it owes a
+/// higher one: a Space that matched on one text channel and placed near the bottom of that
+/// channel's own ranking is a coincidence of vocabulary, and an unasked-for Context that is not
+/// about the Task is worse than no Context at all.
+///
+/// The value is measured, not chosen. Both probe fixtures were swept per distinct fused score
+/// behind a correct top-1 (`--- automatic relevance floor sweep ---`); the lowest such score in
+/// either set is 227 basis points, one text channel at rank 1, and this is the largest floor that
+/// costs neither set a hit. Nothing here reads the Repository a Context belongs to: cross-surface
+/// association is the point of the product, and a Space is dropped for being weakly matched, never
+/// for living somewhere else.
+const AUTOMATIC_RELEVANCE_FLOOR_BASIS_POINTS: u16 = 227;
 const TASK_CONTEXT_ENVELOPE_TOKEN_RESERVE: usize = 128;
 
 #[allow(clippy::too_many_lines)]
@@ -4922,6 +4955,17 @@ fn association(
                 answerable_tokens: Some(coverage_basis.answerable_count()),
                 selected_tokens: Some(coverage_basis.selected_count()),
                 text_channel_count: Some(gate.text_channel_count),
+                ..ContextPackOmitted::default()
+            });
+            return None;
+        }
+        if evidence.fused_score_basis_points < AUTOMATIC_RELEVANCE_FLOOR_BASIS_POINTS {
+            omitted.push(ContextPackOmitted {
+                space_id: Some(space_id),
+                reason: "below_relevance_floor".to_owned(),
+                count: 1,
+                fused_score_basis_points: Some(evidence.fused_score_basis_points),
+                relevance_floor_basis_points: Some(AUTOMATIC_RELEVANCE_FLOOR_BASIS_POINTS),
                 ..ContextPackOmitted::default()
             });
             return None;

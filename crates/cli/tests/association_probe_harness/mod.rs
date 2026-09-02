@@ -390,8 +390,23 @@ pub struct AutomaticProbeDiagnostics {
     pub answerable_tokens: usize,
     pub matched_tokens: usize,
     pub coverage_basis_points: u64,
+    /// Fused association score, in basis points, of the Space that produced the leading item.
+    ///
+    /// This is what [`AUTOMATIC_RELEVANCE_FLOOR_BASIS_POINTS`] is compared against, so it is the
+    /// only number the floor sweep needs: a floor at or below the lowest score behind a hit
+    /// cannot take that hit away.
+    pub leading_fused_score_basis_points: Option<u64>,
     /// Omission reasons the Pack reported, deduplicated and counted.
     pub omitted: BTreeMap<String, usize>,
+}
+
+/// Reads `fused_score_basis_points` back out of an Association's serialized fusion explanation.
+fn fused_score_basis_points(association: &Value) -> Option<u64> {
+    association["reasons"]
+        .as_array()?
+        .iter()
+        .filter_map(|reason| serde_json::from_str::<Value>(reason.as_str()?).ok())
+        .find_map(|reason| reason["fused_score_basis_points"].as_u64())
 }
 
 fn count(value: &Value) -> usize {
@@ -413,7 +428,15 @@ fn automatic_diagnostics(harness: &Harness) -> AutomaticProbeDiagnostics {
         *omitted.entry(reason).or_insert(0) +=
             usize::try_from(entry["count"].as_u64().unwrap_or(0)).unwrap_or(usize::MAX);
     }
+    let leading_space = leading.and_then(|item| item["association_space_id"].as_str());
     AutomaticProbeDiagnostics {
+        leading_fused_score_basis_points: leading_space.and_then(|space_id| {
+            pack["candidate_spaces"]
+                .as_array()?
+                .iter()
+                .find(|association| association["space_id"].as_str() == Some(space_id))
+                .and_then(fused_score_basis_points)
+        }),
         selected_tokens: count(&explanation["selected_token_count"]),
         answerable_tokens: count(&explanation["answerable_token_count"]),
         matched_tokens: leading
@@ -599,6 +622,8 @@ pub fn emit(
         );
     }
 
+    emit_relevance_floor_sweep(mode, outcomes);
+
     let rows = outcomes
         .iter()
         .map(|outcome| {
@@ -622,6 +647,8 @@ pub fn emit(
                     "answerable_tokens": outcome.automatic.answerable_tokens,
                     "matched_tokens": outcome.automatic.matched_tokens,
                     "coverage_basis_points": outcome.automatic.coverage_basis_points,
+                    "leading_fused_score_basis_points":
+                        outcome.automatic.leading_fused_score_basis_points,
                     "omitted": outcome.automatic.omitted
                 }
             })
@@ -653,6 +680,61 @@ pub fn emit(
     fs::rename(&staging, &path).unwrap();
     println!("report written to {}", path.display());
     (search_hits, intent_hits)
+}
+
+/// Prints where an automatic relevance floor would start costing this probe set a hit.
+///
+/// The floor drops a whole Space before its items are packed, so a floor at or below the lowest
+/// fused score behind a currently-hit top-1 cannot take that hit away, and the first value above
+/// it is the first one that can. The table walks exactly those boundaries -- one row per distinct
+/// score behind a hit -- so the separation surface is read straight off one unfloored run and no
+/// candidate threshold needs a build of its own.
+fn emit_relevance_floor_sweep(mode: &str, outcomes: &[ProbeOutcome]) {
+    println!("\n--- automatic relevance floor sweep ({mode}) ---");
+    let mut scored = outcomes
+        .iter()
+        .filter(|outcome| outcome.intent_hit && !outcome.expected.is_empty())
+        .filter_map(|outcome| {
+            outcome
+                .automatic
+                .leading_fused_score_basis_points
+                .map(|score| (score, outcome.id.clone()))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_unstable();
+    let hits = outcomes.iter().filter(|outcome| outcome.intent_hit).count();
+    let total = outcomes.len();
+    println!("{:<12} {:>8}  first probes lost", "floor (bp)", "intent");
+    println!("{:<12} {:>8}  -", 0, format!("{hits}/{total}"));
+    let mut boundaries = scored.iter().map(|(score, _)| *score).collect::<Vec<_>>();
+    boundaries.dedup();
+    for boundary in boundaries {
+        let floor = boundary + 1;
+        let lost = scored
+            .iter()
+            .filter(|(score, _)| *score < floor)
+            .map(|(score, id)| format!("{id}({score})"))
+            .collect::<Vec<_>>();
+        println!(
+            "{:<12} {:>8}  {}",
+            floor,
+            format!("{}/{}", hits - lost.len(), total),
+            lost.join(" ")
+        );
+    }
+    println!("\n--- leading fused score per probe ({mode}) ---");
+    println!("{:<10} {:>8} {:>18}", "probe", "hit", "fused score (bp)");
+    for outcome in outcomes {
+        println!(
+            "{:<10} {:>8} {:>18}",
+            outcome.id,
+            mark(outcome.intent_hit),
+            outcome
+                .automatic
+                .leading_fused_score_basis_points
+                .map_or_else(|| "-".to_owned(), |score| score.to_string())
+        );
+    }
 }
 
 /// Every noise probe must return nothing on both entry points.
