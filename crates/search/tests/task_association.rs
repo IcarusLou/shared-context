@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
 use sctx_domain::{
-    Applicability, CandidateConfirmationOperation, CandidateConfirmationPlan,
-    CandidateConfirmationPrimaryReference, CandidatePrimarySelection, ConflictParticipant,
-    ContextId, ContextKind, ContextRevisionDraft, ContextSpaceAssociationDraft,
-    ContextSpaceAssociationOrigin, EvidenceSnapshotDraft, EvidenceType, OptionalCandidateEdits,
-    PublicationAction, PublicationDraft, RevisionId, SemanticConflictDraft, SpaceId, SubmissionId,
-    TaskId, TaskSessionId, TaskSignal, TaskSignalKind, TaskSpaceAssociation, WorkEpisodeId,
-    WorkEpisodeRef, WorkingIntentSnapshot,
+    Applicability, ArtifactKind, ArtifactLocator, CandidateConfirmationOperation,
+    CandidateConfirmationPlan, CandidateConfirmationPrimaryReference, CandidatePrimarySelection,
+    ConflictParticipant, ContextId, ContextKind, ContextRevisionDraft,
+    ContextSpaceAssociationDraft, ContextSpaceAssociationOrigin, EngineeringReferenceDraft,
+    EvidenceSnapshotDraft, EvidenceType, OptionalCandidateEdits, PublicationAction,
+    PublicationDraft, ReferenceRelation, RepoRelativePath, RevisionId, SemanticConflictDraft,
+    SpaceId, SubmissionId, TaskId, TaskSessionId, TaskSignal, TaskSignalKind, TaskSpaceAssociation,
+    WorkEpisodeId, WorkEpisodeRef, WorkingIntentSnapshot,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
@@ -2826,5 +2827,125 @@ fn the_fe_weak_token_case_scores_above_every_probe_tolerable_floor() {
     assert!(
         fusion.fused_score_basis_points > 227,
         "227 is the largest floor both probe fixtures tolerate"
+    );
+}
+
+fn record_file_reference(
+    store: &GitStore,
+    context_id: ContextId,
+    revision_id: RevisionId,
+    repository_id: &str,
+    path: &str,
+) {
+    append(
+        store,
+        Event::engineering_reference_recorded(
+            context_id,
+            revision_id,
+            EngineeringReferenceDraft {
+                repository_id: repository_id.parse().unwrap(),
+                artifact_kind: ArtifactKind::File,
+                relation: ReferenceRelation::Implements,
+                locator: ArtifactLocator::File {
+                    path: RepoRelativePath::new(path).unwrap(),
+                },
+                supports: "the compact location fixture points at this file".to_owned(),
+                limitations: vec!["synthetic fixture".to_owned()],
+            },
+            None,
+        )
+        .unwrap(),
+    );
+}
+
+/// A compact item says which codebase its Engineering References all live in, and that sentence
+/// changes nothing about whether or where the item is returned.
+///
+/// The FE session that was handed three Android Contexts could not see that they were Android
+/// Contexts without opening each one. Naming the Repository is the whole repair: the Agent judges
+/// applicability, the ranking never does. Weighting by Repository would have suppressed exactly
+/// the cross-surface association this product exists to make, so the signal stays in the prose.
+#[test]
+fn a_compact_item_names_the_single_repository_its_references_live_in() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("repository-annotation")).unwrap();
+    let space = add_space(&store, "AnchorSpace", "anchor subject area");
+    let (single, single_revision, _) = add_accepted_context(
+        &store,
+        space,
+        "repositoryannotationneedle in the single repository Context",
+        applicability("anchordomain", "anchorplatform", "anchorcondition"),
+    );
+    let (spread, spread_revision, _) = add_accepted_context(
+        &store,
+        space,
+        "repositoryannotationneedle in the two repository Context",
+        applicability("anchordomain", "anchorplatform", "anchorcondition"),
+    );
+    record_file_reference(&store, single, single_revision, "Android", "app/src/One.kt");
+    record_file_reference(&store, single, single_revision, "Android", "app/src/Two.kt");
+    record_file_reference(&store, spread, spread_revision, "Android", "app/src/One.kt");
+    record_file_reference(&store, spread, spread_revision, "Web", "src/one.ts");
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    let engine = SearchEngine::new(index);
+
+    let request = TaskContextRequest::automatic(
+        TaskId::new(),
+        task("repositoryannotationneedle"),
+        Vec::new(),
+        100_000,
+    );
+    let full = engine.task_context_pack(&request).unwrap();
+    let compact = engine
+        .task_context_pack_with_detail(&request, ContextPackDetailLevel::Compact)
+        .unwrap();
+    assert_eq!(
+        compact
+            .compact_items
+            .iter()
+            .map(|item| item.context_id)
+            .collect::<Vec<_>>(),
+        full.items
+            .iter()
+            .map(|item| item.context.context_id)
+            .collect::<Vec<_>>(),
+        "the sentence is prose; the selection and its order are the ranking's alone"
+    );
+    let sentence = "References are all in repository Android.";
+    let single_item = compact
+        .compact_items
+        .iter()
+        .find(|item| item.context_id == single)
+        .expect("the single-repository Context is packed");
+    assert!(
+        single_item.why.iter().any(|reason| reason == sentence),
+        "{:#?}",
+        single_item.why
+    );
+    let spread_item = compact
+        .compact_items
+        .iter()
+        .find(|item| item.context_id == spread)
+        .expect("the two-repository Context is packed");
+    assert!(
+        spread_item
+            .why
+            .iter()
+            .all(|reason| !reason.starts_with("References are all in repository")),
+        "References in two Repositories are in neither: {:#?}",
+        spread_item.why
+    );
+    // The locations both items already carried keep their Repository prefix, unchanged.
+    assert!(
+        spread_item.evidence.iter().all(|evidence| {
+            evidence.locations
+                == vec![
+                    "Android:app/src/One.kt".to_owned(),
+                    "Web:src/one.ts".to_owned(),
+                ]
+        }),
+        "{:#?}",
+        spread_item.evidence
     );
 }

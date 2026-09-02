@@ -5656,6 +5656,7 @@ fn load_task_context_candidates(
     if detail_level == ContextPackDetailLevel::Compact {
         let relations = load_compact_relations(connection, &candidates)?;
         let locations = load_compact_locations(connection, &candidates)?;
+        let empty_locations = CompactReferenceLocations::default();
         for candidate in &mut candidates {
             candidate.compact = Some(compact_task_context_item(
                 &candidate.item,
@@ -5665,7 +5666,7 @@ fn load_task_context_candidates(
                     .unwrap_or_default(),
                 locations
                     .get(&candidate.item.context.revision_id)
-                    .map_or(&[] as &[String], Vec::as_slice),
+                    .unwrap_or(&empty_locations),
             ));
         }
     }
@@ -5813,8 +5814,8 @@ fn load_compact_relations(
 fn load_compact_locations(
     connection: &Connection,
     candidates: &[TaskContextCandidate],
-) -> Result<BTreeMap<RevisionId, Vec<String>>> {
-    let mut locations = BTreeMap::<RevisionId, Vec<String>>::new();
+) -> Result<BTreeMap<RevisionId, CompactReferenceLocations>> {
+    let mut locations = BTreeMap::<RevisionId, CompactReferenceLocations>::new();
     if candidates.is_empty() {
         return Ok(locations);
     }
@@ -5833,6 +5834,7 @@ fn load_compact_locations(
             .query([revision_id.to_string()])
             .map_err(sql_error("execute compact Engineering Reference retrieval"))?;
         let mut paths = BTreeSet::new();
+        let mut repositories = BTreeSet::new();
         while let Some(row) = rows
             .next()
             .map_err(sql_error("read compact Engineering Reference row"))?
@@ -5845,18 +5847,38 @@ fn load_compact_locations(
                     .map_err(sql_error("read Engineering Reference locator"))?,
             )?;
             paths.insert(format!("{repository_id}:{}", locator.path));
+            repositories.insert(repository_id);
         }
         if !paths.is_empty() {
             locations.insert(
                 revision_id,
-                paths
-                    .into_iter()
-                    .take(COMPACT_EVIDENCE_LOCATION_LIMIT)
-                    .collect(),
+                CompactReferenceLocations {
+                    // Read before the truncation below, so a second Repository hidden by the
+                    // location limit still prevents the single-Repository sentence.
+                    sole_repository: (repositories.len() == 1)
+                        .then(|| repositories.into_iter().next().unwrap_or_default()),
+                    paths: paths
+                        .into_iter()
+                        .take(COMPACT_EVIDENCE_LOCATION_LIMIT)
+                        .collect(),
+                },
             );
         }
     }
     Ok(locations)
+}
+
+/// One revision's compact Reference locations, and the Repository they all live in when there is
+/// exactly one.
+///
+/// The Repository is carried as explanation only. It never enters ranking, a gate, or a filter:
+/// a Context whose References all sit in one codebase is very often exactly what a Task on
+/// another surface needs, and weighting by Repository would suppress the association this product
+/// exists to make. Saying where a fact came from lets the Agent judge that for itself.
+#[derive(Default)]
+struct CompactReferenceLocations {
+    paths: Vec<String>,
+    sole_repository: Option<String>,
 }
 
 /// Path shared by every `ArtifactLocator` variant. Kind-specific coordinates are irrelevant to a
@@ -5869,7 +5891,7 @@ struct LocatorPath {
 fn compact_task_context_item(
     item: &TaskContextItem,
     relations: Vec<CompactContextRelation>,
-    locations: &[String],
+    locations: &CompactReferenceLocations,
 ) -> CompactTaskContextItem {
     CompactTaskContextItem {
         context_id: item.context.context_id,
@@ -5890,14 +5912,14 @@ fn compact_task_context_item(
                     &evidence_summary(evidence),
                     COMPACT_EVIDENCE_SUMMARY_MAX_CHARS,
                 ),
-                locations: locations.to_vec(),
+                locations: locations.paths.clone(),
             })
             .collect(),
         relations,
         conflicts: item.context.conflicts.clone(),
         derived_state: item.context.derived_state.clone(),
         retrieval_channels: retrieval_channels(&item.retrieval_paths),
-        why: compact_item_reasons(item),
+        why: compact_item_reasons(item, locations.sole_repository.as_deref()),
     }
 }
 
@@ -5960,7 +5982,7 @@ fn truncate_chars(value: &str, maximum: usize) -> String {
 
 /// At most [`COMPACT_ITEM_REASON_LIMIT`] one-sentence reasons, ordered from the strongest
 /// retrieval path to the weakest, so a compact item stays explainable without its path payload.
-fn compact_item_reasons(item: &TaskContextItem) -> Vec<String> {
+fn compact_item_reasons(item: &TaskContextItem, sole_repository: Option<&str>) -> Vec<String> {
     let mut reasons = Vec::new();
     let mut relation_hops = 0;
     let mut graph = false;
@@ -6026,6 +6048,9 @@ fn compact_item_reasons(item: &TaskContextItem) -> Vec<String> {
     }
     if let Some(sentence) = usage_prior_reason(item.context.usage) {
         reasons.push(sentence);
+    }
+    if let Some(repository_id) = sole_repository {
+        reasons.push(format!("References are all in repository {repository_id}."));
     }
     reasons.truncate(COMPACT_ITEM_REASON_LIMIT);
     reasons
