@@ -786,9 +786,18 @@ artifact_focus_reminder = false
 [context_ttl]
 validation = "30d"
 progress = "14d"
+
+[retrieval]
+embedding_model_path = "/absolute/path/to/bge-m3-onnx"
+embedding_runtime_path = "/absolute/path/to/libonnxruntime.dylib"
 ```
 
 - `[hooks] artifact_focus_reminder`：默认 `false`（关闭）。关闭时 PostTool Hook 与该开关引入前逐字节一致。显式改成 `true` 后，仅对被识别为单个文件操作的工具事件，用本机 Catalog 把绝对路径解析到已登记 Repository（该 Repository 必须在本会话准入范围内，所以父目录会话会按文件选对仓库），再对 `engineering.sqlite` 做一次只读查询（不加锁、不跑 Git、不 scan、不 rebuild）；命中已接受且可自动注入的 Graph Context 时，追加一条不超过 800 字节的提示（最多 3 个 Context ID、每个标题截断到 60 字符，加一句固定的“可以调用 `task_artifact_focus` 查看”提示文案），不包含 statement/evidence 正文，也不写任何事实。同一 Session 对同一文件只提示一次。这个开关只影响以绝对文件路径命中的工具事件，不覆盖模块/符号/API/Schema/测试等其他定位方式。
+- `[retrieval]`：可选的 embedding 召回通道（ADR-0004）。**两个键都不写就是默认：通道完全不存在，检索与加入该通道之前逐字节一致，零磁盘、零内存、零延迟开销。** 两个键必须同时写、且都必须是绝对路径；只写一个视为配置错误（`sctx doctor` 会 Warning，通道保持关闭）。
+  - `embedding_model_path`：模型目录，需包含 `model.onnx`（若是拆分导出还需同目录的 `model.onnx_data`）与 `tokenizer.json`。推荐 bge-m3 的 ONNX 导出（约 2.1GB 磁盘、约 1.2GB 常驻内存）。模型不随包分发，需要自行下载。
+  - `embedding_runtime_path`：本机 ONNX Runtime 动态库（macOS `libonnxruntime.dylib`、Linux `libonnxruntime.so`）。构建期不下载任何二进制，运行时才按此路径加载。
+  - 开启后：`sctx mcp serve` 启动时由后台线程加载模型（一次性 9–12 秒）并把已接受 Context 的向量写入 `state/semantic.sqlite`（可随时删除的本地缓存，不进 Git、不进 `index.sqlite`，按模型指纹与 ranking 版本键控）。自动注入的查询会额外走一路余弦召回（阈值 0.50、最多 16 条），与词法通道一起做 RRF 融合；语义命中本身构成一条独立的注入资格路径。模型未就绪 / 加载失败 / 单次编码超过 200ms 预算时，该路静默降级为 `omitted.reason = "embedding_unavailable"`，词法结果不受影响。
+  - 显式 `context_search` 本轮不接入该通道，保持纯词法。
 - `[context_ttl]`：按 Context 类型（`decision`/`contract`/`issue`/`risk`/`validation`/`discovery`/`progress`）配置一个带单位的正时长（`s`/`m`/`h`/`d`/`w`），不配置的类型没有时效。到期起点是该 Context 被接受时所在 commit 的时间，不是本机当前时间。过期后状态变为 `historical`：排除自动注入，仍可以被 `search`/`context get` 查到。
 
 ## 7. 常见问题
