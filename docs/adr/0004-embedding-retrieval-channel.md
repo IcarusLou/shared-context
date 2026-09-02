@@ -18,7 +18,7 @@ R1–R5 之后，词法召回已到达天花板。R3 的实测结论：剩余探
 
 ## 决策
 
-1. **通道形态**：embedding 作为 RRF fusion 中新的一路 `SemanticSimilarity`，通道权重 3（与 hint 通道同级），**不参与任何门槛判定**（AutomaticTextEligibility、覆盖率、answerable 守卫均不变）、不产生事实、不进 Hook 热路径。相似度低于 0.50 的候选不进入该通道（阈值以 T5a 扩展探针集 ≥50 条重新标定后定稿）。
+1. **通道形态**：embedding 作为 RRF fusion 中新的一路 `SemanticSimilarity`，通道权重 3（与 hint 通道同级），**不参与任何门槛判定**（AutomaticTextEligibility、覆盖率、answerable 守卫均不变）、不产生事实、不进 Hook 热路径。相似度低于 0.52 的候选不进入该通道（T5a 扩展集重标定定稿：噪声上界 0.5095、跨语言正例下界 0.5640，0.52 高于噪声 105bp；0.50 会放进一条噪声查询并经资格路径注入无关 Context）。
 补充（实装批准时明确）：语义命中 ≥ 阈值构成一条独立的注入资格路径（与 exact EngineeringGraph / ContextRelation 同级的替代条件），但不放宽任何文本门槛本身；语料向量为可丢弃本地缓存（独立 sqlite 文件，键含模型指纹与 SEARCH_RANKING_VERSION），由后台线程回填。
 
 2. **模型**：bge-m3 级别的多语模型；分发形态为「不随包分发」——`[retrieval] embedding_model_path` 指向用户显式下载的本地模型，未配置时通道整体关闭且零成本；`sctx doctor` 提示获取方式。磁盘 ~2.1GB、RSS ~1.2GB、加载 9–12s（一次性，常驻 MCP 进程）、查询编码 p95 30–85ms。
