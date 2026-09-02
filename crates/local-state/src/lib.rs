@@ -20,7 +20,7 @@ pub use config::{
     EngineeringSettings, HookSettings, LEGACY_REPOSITORY_ID_PREFIX, RepositoryCatalogAddOutcome,
     RepositoryCatalogCheckoutCheck, RepositoryCatalogDiagnostic, RepositoryCatalogDoctorReport,
     RepositoryCatalogEntry, RepositoryCatalogRenameOutcome, RepositoryCatalogRevision,
-    RepositoryCatalogSnapshot, ResolvedRepositoryPath, UserConfigStore,
+    RepositoryCatalogSnapshot, ResolvedRepositoryPath, RetrievalSettings, UserConfigStore,
     migrate_legacy_repository_groups,
 };
 pub use maintenance::{MaintenanceGuard, MaintenanceLock};

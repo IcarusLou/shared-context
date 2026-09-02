@@ -39,6 +39,8 @@ struct ConfigDocument {
     /// keep the Graph attached to the knowledge that names it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     engineering: Option<EngineeringConfigDocument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retrieval: Option<RetrievalConfigDocument>,
 }
 
 /// Optional `[activation]` table: overrides for derived Session activation.
@@ -227,6 +229,88 @@ impl EngineeringSettings {
             None => Self { auto_scan: true },
         }
     }
+}
+
+/// Optional `[retrieval]` table: the local embedding recall channel.
+///
+/// Both keys name absolute paths the operator downloaded on purpose. Neither has a default and
+/// neither is ever guessed: a model this installation did not ask for is 2 GB of disk and a
+/// gigabyte of resident memory, so an absent table means the channel does not exist.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetrievalConfigDocument {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embedding_model_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embedding_runtime_path: Option<String>,
+}
+
+/// Explicit local embedding recall settings.
+///
+/// The channel is off unless *both* paths are configured. A model without an ONNX Runtime cannot
+/// be executed and a runtime without a model has nothing to execute, so half a configuration is
+/// the same fact as none -- reported by `sctx doctor`, never half-enabled.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct RetrievalSettings {
+    /// Directory holding `model.onnx` (plus `model.onnx_data` for an external-data model) and
+    /// `tokenizer.json`.
+    pub embedding_model_path: Option<PathBuf>,
+    /// The ONNX Runtime dynamic library this process loads at run time.
+    pub embedding_runtime_path: Option<PathBuf>,
+}
+
+impl RetrievalSettings {
+    /// True when both halves are present, which is the only state that enables the channel.
+    #[must_use]
+    pub const fn embedding_enabled(&self) -> bool {
+        self.embedding_model_path.is_some() && self.embedding_runtime_path.is_some()
+    }
+
+    /// True when exactly one half is configured, which is always an operator mistake.
+    #[must_use]
+    pub const fn embedding_half_configured(&self) -> bool {
+        self.embedding_model_path.is_some() != self.embedding_runtime_path.is_some()
+    }
+
+    fn from_document(document: Option<&RetrievalConfigDocument>) -> Result<Self> {
+        let Some(document) = document else {
+            return Ok(Self::default());
+        };
+        Ok(Self {
+            embedding_model_path: retrieval_path(
+                document.embedding_model_path.as_deref(),
+                "retrieval.embedding_model_path",
+            )?,
+            embedding_runtime_path: retrieval_path(
+                document.embedding_runtime_path.as_deref(),
+                "retrieval.embedding_runtime_path",
+            )?,
+        })
+    }
+}
+
+/// Validates one configured retrieval path. A relative path is rejected rather than resolved
+/// against an ambiguous working directory: the MCP server, the CLI, and the Hooks all run from
+/// different ones.
+fn retrieval_path(value: Option<&str>, field: &str) -> Result<Option<PathBuf>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("{field} must not be empty"),
+        ));
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("{field} must be an absolute path"),
+        ));
+    }
+    Ok(Some(path))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -422,6 +506,7 @@ impl UserConfigStore {
             hooks: None,
             context_ttl: None,
             engineering: None,
+            retrieval: None,
         };
         validate_document_structure(&document, &root.join("repository"))?;
         toml::to_string_pretty(&document).map_err(|error| {
@@ -463,6 +548,7 @@ impl UserConfigStore {
                     hooks: None,
                     context_ttl: None,
                     engineering: None,
+                    retrieval: None,
                 })?;
             }
             Ok(())
@@ -607,6 +693,24 @@ impl UserConfigStore {
         let outcome = self
             .read_document()
             .map(|document| EngineeringSettings::from_document(document.engineering));
+        finish_locked(&lock, outcome)
+    }
+
+    /// Reads the explicit `[retrieval]` table.
+    ///
+    /// A missing table is the default: the embedding channel does not exist. Read with the
+    /// blocking shared lock for the same reason as [`Self::engineering_settings`] -- only
+    /// request-serving code and `sctx doctor` ask, never the Hook hot path.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or filesystem errors.
+    pub fn retrieval_settings(&self) -> Result<RetrievalSettings> {
+        let lock = open_private_file(&self.lock_path)?;
+        FileExt::lock_shared(&lock).map_err(io_error("lock config.lock shared"))?;
+        let outcome = self
+            .read_document()
+            .and_then(|document| RetrievalSettings::from_document(document.retrieval.as_ref()));
         finish_locked(&lock, outcome)
     }
 

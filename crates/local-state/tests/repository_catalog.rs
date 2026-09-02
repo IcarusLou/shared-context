@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeSet,
+    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -1079,4 +1080,100 @@ fn engineering_auto_scan_defaults_to_on_and_is_explicitly_switchable() {
         ErrorKind::InvalidInput,
         "an undocumented [engineering] key is refused instead of silently ignored"
     );
+}
+
+#[test]
+fn retrieval_embedding_paths_default_to_absent_and_survive_a_catalog_write() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("共享 配置");
+    let repository = init_repo(&temporary.path().join("retrieval repo"), "retrieval");
+    let store = UserConfigStore::initialize(&root).unwrap();
+
+    let default = store.retrieval_settings().unwrap();
+    assert_eq!(default.embedding_model_path, None);
+    assert_eq!(default.embedding_runtime_path, None);
+    assert!(
+        !default.embedding_enabled(),
+        "an absent [retrieval] table means the embedding channel does not exist"
+    );
+    assert!(!default.embedding_half_configured());
+
+    let config_path = root.join("config.toml");
+    let model = temporary.path().join("模型 目录");
+    let runtime = temporary.path().join("libonnxruntime.dylib");
+
+    // Half a configuration cannot run a model, and is reported as the mistake it is.
+    let mut text = fs::read_to_string(&config_path).unwrap();
+    let _ = write!(
+        text,
+        "\n[retrieval]\nembedding_model_path = {}\n",
+        toml_string(&model)
+    );
+    fs::write(&config_path, text).unwrap();
+    let half = store.retrieval_settings().unwrap();
+    assert!(!half.embedding_enabled());
+    assert!(half.embedding_half_configured());
+
+    let mut text = fs::read_to_string(&config_path).unwrap();
+    let _ = writeln!(text, "embedding_runtime_path = {}", toml_string(&runtime));
+    fs::write(&config_path, text).unwrap();
+    let both = store.retrieval_settings().unwrap();
+    assert_eq!(both.embedding_model_path.as_deref(), Some(model.as_path()));
+    assert_eq!(
+        both.embedding_runtime_path.as_deref(),
+        Some(runtime.as_path())
+    );
+    assert!(both.embedding_enabled());
+
+    // A later explicit Catalog write must round-trip the table, not drop it.
+    store
+        .add_repository(
+            "RT".parse::<RepositoryId>().unwrap(),
+            std::slice::from_ref(&repository),
+        )
+        .unwrap();
+    assert!(store.retrieval_settings().unwrap().embedding_enabled());
+    assert!(
+        fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("[retrieval]")
+    );
+
+    let mut text = fs::read_to_string(&config_path).unwrap();
+    text.push_str("unknown_switch = true\n");
+    fs::write(&config_path, text).unwrap();
+    assert_eq!(
+        store.retrieval_settings().unwrap_err().kind(),
+        ErrorKind::InvalidInput,
+        "an undocumented [retrieval] key is refused instead of silently ignored"
+    );
+}
+
+#[test]
+fn a_relative_retrieval_path_is_refused_rather_than_resolved() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("共享 配置");
+    let store = UserConfigStore::initialize(&root).unwrap();
+    let config_path = root.join("config.toml");
+
+    // The MCP server, the CLI and the Hooks all run from different working directories, so there
+    // is no directory a relative path could honestly be resolved against.
+    let mut text = fs::read_to_string(&config_path).unwrap();
+    text.push_str("\n[retrieval]\nembedding_model_path = \"models/bge-m3\"\n");
+    fs::write(&config_path, text).unwrap();
+    assert_eq!(
+        store.retrieval_settings().unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
+}
+
+/// One TOML basic string, with the escaping a quoted or Windows-style path would need.
+fn toml_string(path: &std::path::Path) -> String {
+    format!(
+        "\"{}\"",
+        path.display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    )
 }
