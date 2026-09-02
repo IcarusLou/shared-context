@@ -899,6 +899,14 @@ pub struct CandidateConfirmResponse {
     pub projection_generation: u64,
     pub assessment_acknowledgments: Vec<CandidateRelationAssessment>,
     pub graph_rebuild_pending: bool,
+    /// What to do about `graph_rebuild_pending`, present only when it is true.
+    ///
+    /// The flag alone was reported honestly and then read by nobody: a caller that does not know
+    /// what a pending rebuild costs has no reason to mention it. The sentence travels with the
+    /// flag so the fix is in the same place as the fact. Absent on responses written before this
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advice: Option<String>,
 }
 
 /// Public Claim-scoped submission state.
@@ -1480,6 +1488,17 @@ pub struct AssociationRebuildResponse {
 /// Short enough that an Agent waiting on `candidate_confirm` never notices it, and the scan it
 /// bounds only ever visits the paths the Engineering References actually name.
 const AUTO_SCAN_BUDGET: Duration = Duration::from_secs(2);
+
+/// Wall-clock budget for the first Graph scan after an explicit Repository registration.
+///
+/// Registration is a deliberate operation a person is watching, not an Agent's hot path, so this
+/// scan is allowed the seconds a first read of an unseen checkout actually costs.
+const REPOSITORY_FIRST_SCAN_BUDGET: Duration = Duration::from_secs(30);
+
+/// What to tell a caller whose Confirmation left the Graph behind the Store.
+const GRAPH_REBUILD_ADVICE: &str = "This Confirmation named Engineering References the Graph has \
+     not resolved yet, so Artifact-anchored retrieval will not find them. Tell the user, and run \
+     `sctx association rebuild` (or wait for the next `sctx doctor --fix`).";
 
 /// Wall-clock budget for one Reference's local history lookup.
 const RELOCATION_REFERENCE_BUDGET: Duration = Duration::from_secs(2);
@@ -3482,6 +3501,7 @@ impl Runtime {
                     projection_generation: snapshot.metadata.projection_generation,
                     assessment_acknowledgments: reserved.assessments,
                     graph_rebuild_pending,
+                    advice: graph_rebuild_pending.then(|| GRAPH_REBUILD_ADVICE.to_owned()),
                 }
             })
             .collect())
@@ -4071,10 +4091,7 @@ impl Runtime {
     /// checkout, an exhausted budget -- leaves the Confirmation that triggered it untouched and
     /// is reported as `graph_rebuild_pending`, which names `sctx association rebuild` as the fix.
     fn auto_scan_engineering_graph(&self) -> bool {
-        let enabled = UserConfigStore::open_existing(&self.root)
-            .and_then(|config| config.engineering_settings())
-            .is_ok_and(|settings| settings.auto_scan);
-        if !enabled {
+        if !self.engineering_auto_scan() {
             return true;
         }
         let deadline = Instant::now().checked_add(AUTO_SCAN_BUDGET);
@@ -4099,6 +4116,41 @@ impl Runtime {
                 true
             }
         }
+    }
+
+    /// Reads the `[engineering] auto_scan` switch, defaulting to on for an unreadable config.
+    fn engineering_auto_scan(&self) -> bool {
+        UserConfigStore::open_existing(&self.root)
+            .and_then(|config| config.engineering_settings())
+            .is_ok_and(|settings| settings.auto_scan)
+    }
+
+    /// Scans the registered checkouts once after an explicit Repository registration.
+    ///
+    /// A newly registered Repository was never scanned by anything: every Reference naming it
+    /// resolved against "Repository is not registered" and stayed that way until somebody
+    /// happened to run a rebuild, so a freshly added checkout looked like a broken one. Adding a
+    /// Repository is an explicit operation, so it pays for the first read itself.
+    fn repository_first_scan(&self) -> Result<RepositoryFirstScanReport> {
+        if !self.engineering_auto_scan() {
+            return Ok(RepositoryFirstScanReport {
+                attempted: false,
+                completed: false,
+                rebuild: None,
+            });
+        }
+        let deadline = Instant::now().checked_add(REPOSITORY_FIRST_SCAN_BUDGET);
+        let rebuild = self.association_rebuild_before(
+            &AssociationRebuildInput {
+                diagnose_only: false,
+            },
+            deadline,
+        )?;
+        Ok(RepositoryFirstScanReport {
+            attempted: true,
+            completed: rebuild.is_some(),
+            rebuild,
+        })
     }
 
     fn association_explain(
@@ -5626,6 +5678,33 @@ pub fn space_create_at_root(
     input: &SpaceCreateInput,
 ) -> Result<SpaceCreateResponse> {
     Runtime::open(root.as_ref())?.space_create(input)
+}
+
+/// Outcome of the bounded first Graph scan that follows a Repository registration.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RepositoryFirstScanReport {
+    /// False only when `[engineering] auto_scan` is off; nothing was scanned.
+    pub attempted: bool,
+    /// False when the scan ran out of its budget; the previous projection is untouched.
+    pub completed: bool,
+    pub rebuild: Option<AssociationRebuildResponse>,
+}
+
+/// Scans the registered checkouts once, right after a Repository was registered.
+///
+/// Honors `[engineering] auto_scan`: with the switch off nothing is scanned and the report says so.
+///
+/// # Errors
+///
+/// Returns typed Registry, scanner, resolver, projection, or Context snapshot errors.
+pub fn repository_first_scan_at_root(root: impl AsRef<Path>) -> Result<RepositoryFirstScanReport> {
+    let runtime = Runtime::open(root.as_ref())?;
+    let report = runtime.repository_first_scan()?;
+    if report.completed {
+        // The checkouts were just read anyway, so the advisory `recheck_when` pass rides along.
+        let _ = runtime.context_recheck();
+    }
+    Ok(report)
 }
 
 /// Rebuilds or diagnoses the current Engineering projection from registered Repositories.

@@ -3134,11 +3134,16 @@ fn run_repository(args: &[String], json_output: bool) -> Result<()> {
             let outcome =
                 UserConfigStore::initialize(&root)?.add_repository(repository_id, &paths)?;
             let sync = sctx_mcp::sync_repository_catalog_at_root(&root)?;
+            // A Repository nothing ever scanned is indistinguishable from a broken one: every
+            // Reference naming it resolves against "not registered" until somebody happens to run
+            // a rebuild. Registration is explicit and a person is watching it, so it pays for the
+            // first read here rather than leaving the Graph dark and silent about why.
+            let first_scan = sctx_mcp::repository_first_scan_at_root(&root)?;
             let metadata = repository_command_metadata(&root)?;
             emit(
                 "repository.add",
                 &metadata,
-                json!({"catalog": outcome, "registry": sync}),
+                json!({"catalog": outcome, "registry": sync, "first_scan": first_scan}),
                 json_output,
             )
         }
