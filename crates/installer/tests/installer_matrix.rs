@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     fs,
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
@@ -3403,5 +3404,86 @@ fn doctor_names_the_repair_when_engineering_references_resolve_against_no_graph(
         repaired.message.contains("Graph Context snapshots"),
         "{}",
         repaired.message
+    );
+}
+
+#[test]
+fn doctor_reports_the_embedding_channel_as_off_configured_or_broken() {
+    let harness = Harness::new();
+    let installer = harness.installer("0.1.0");
+    installer.setup(&SetupOptions::default()).unwrap();
+
+    let retrieval_check = |report: &sctx_installer::DoctorReport| {
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "retrieval_embedding")
+            .expect("doctor always reports the embedding channel")
+            .clone()
+    };
+
+    // 1. Unconfigured is the default and is healthy: lexical retrieval is the product's baseline,
+    //    not a degraded state. Doctor still says how to turn the channel on.
+    let off = retrieval_check(&installer.doctor());
+    assert_eq!(off.status, CheckStatus::Ok);
+    assert!(off.message.contains("Off."), "{}", off.message);
+    assert!(
+        off.message.contains("embedding_model_path"),
+        "an operator who wants the channel must learn how from doctor: {}",
+        off.message
+    );
+
+    let config_path = harness.root.join("config.toml");
+    let model = harness.root.join("模型目录");
+    let runtime = harness.root.join("libonnxruntime.dylib");
+    std::fs::create_dir_all(&model).unwrap();
+
+    // 2. Half a configuration is an operator mistake, not a silent no-op.
+    let mut text = std::fs::read_to_string(&config_path).unwrap();
+    let _ = write!(
+        text,
+        "\n[retrieval]\nembedding_model_path = \"{}\"\n",
+        model.display()
+    );
+    std::fs::write(&config_path, &text).unwrap();
+    let half = retrieval_check(&installer.doctor());
+    assert_eq!(half.status, CheckStatus::Warning);
+    assert!(half.message.contains("only one of"), "{}", half.message);
+
+    // 3. Configured but with the files absent: the operator believes they are paying for semantic
+    //    recall and is not getting it, which is the one state worth a warning.
+    let _ = writeln!(text, "embedding_runtime_path = \"{}\"", runtime.display());
+    std::fs::write(&config_path, &text).unwrap();
+    let broken = retrieval_check(&installer.doctor());
+    assert_eq!(broken.status, CheckStatus::Warning);
+    assert!(broken.message.contains("model.onnx"), "{}", broken.message);
+    assert!(
+        broken.message.contains("tokenizer.json"),
+        "{}",
+        broken.message
+    );
+    assert!(
+        installer.doctor().healthy,
+        "an unconfigured or misconfigured optional channel never makes an installation unhealthy"
+    );
+
+    // 4. Every file present: reported as configured, without paying the 9-12 second model load
+    //    that only `serve` should ever pay.
+    std::fs::write(model.join("model.onnx"), b"not a real model").unwrap();
+    std::fs::write(model.join("tokenizer.json"), b"{}").unwrap();
+    std::fs::write(&runtime, b"not a real library").unwrap();
+    let configured = retrieval_check(&installer.doctor());
+    assert_eq!(configured.status, CheckStatus::Ok);
+    assert!(
+        configured.message.contains("Configured:"),
+        "{}",
+        configured.message
+    );
+    assert!(
+        configured
+            .message
+            .contains("0 Context revision(s) embedded"),
+        "a fresh installation has embedded nothing yet: {}",
+        configured.message
     );
 }

@@ -25,13 +25,16 @@ use sctx_adapter_codex::TrustState;
 pub use sctx_domain::{Error, ErrorKind, Result};
 use sctx_engineering_graph::{EngineeringProjectionStore, RepositoryRegistry};
 use sctx_git_store::GitStore;
-use sctx_index::ProjectionIndex;
+use sctx_index::{ProjectionIndex, SEARCH_RANKING_VERSION};
 use sctx_local_state::{
     AuthorizedSessionScopeStore, CatalogCheckoutStatus, MaintenanceLock, ORPHAN_LEASE_MAX_AGE,
     UserConfigStore, migrate_legacy_repository_groups,
 };
 use sctx_mcp::{AssociationRebuildInput, ClientKind, McpServer};
-use sctx_search::{SearchEngine, SearchFilters, SearchRequest};
+use sctx_search::{
+    SearchEngine, SearchFilters, SearchRequest, SemanticCacheKey, SemanticVectorCache,
+    model_fingerprint, semantic_cache_path,
+};
 use sctx_task_runtime::TaskRuntime;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -829,6 +832,7 @@ impl Installer {
         check_configs(root, &self.context.home, &mut checks);
         check_global_skill(root, &self.context.home, &mut checks);
         check_session_scope_leases(root, &mut checks);
+        check_retrieval(root, &mut checks);
         if root.join("repository/.git").is_dir() && root.join("bin/current/sctx").is_file() {
             match mcp_smoke(root) {
                 Ok(()) => checks.push(ok(
@@ -906,6 +910,13 @@ impl Installer {
                 diagnose_only: false,
             },
         );
+        // The vector cache is derived local state too, and its background filler only ever runs
+        // inside a long-lived `sctx mcp serve`. An installation whose MCP process answers one
+        // request and exits would otherwise never embed anything at all, so `--fix` is the
+        // supported way to pay the 9-12 second model load on purpose. Best effort for the same
+        // reason as the Graph above: an unloadable model is a diagnosis, not a failed repair, and
+        // an unconfigured `[retrieval]` returns immediately without touching anything.
+        let _ = sctx_mcp::warm_semantic_cache_at_root(&self.context.root);
         Ok(self.doctor())
     }
 
@@ -988,7 +999,7 @@ impl Installer {
         for path in [root.join("bin"), root.join("logs"), root.join("backups")] {
             remove_path_if_exists(&path, &mut report.removed)?;
         }
-        for database in ["index.sqlite", "runtime.sqlite"] {
+        for database in ["index.sqlite", "runtime.sqlite", "semantic.sqlite"] {
             for suffix in ["", "-wal", "-shm"] {
                 remove_path_if_exists(
                     &root.join(format!("state/{database}{suffix}")),
@@ -3394,6 +3405,9 @@ fn reset_relative_targets() -> Vec<PathBuf> {
         "runtime.sqlite",
         "engineering.sqlite",
         "repository-registry.sqlite",
+        // Derived vectors. A reset must clear them with everything else, or the next model load
+        // would repopulate a channel against a corpus that no longer exists.
+        "semantic.sqlite",
     ] {
         for suffix in ["", "-wal", "-shm"] {
             targets.push(PathBuf::from(format!("state/{database}{suffix}")));
@@ -4035,6 +4049,98 @@ fn check_index(root: &Path, checks: &mut Vec<DoctorCheck>) {
 /// Names the one repair every Engineering Graph warning below points at.
 const GRAPH_REPAIR: &str = "Run `sctx association rebuild` (or `sctx doctor --fix`), and check \
      that `[engineering] auto_scan` is not disabled.";
+
+/// What an operator has to do to turn the embedding channel on.
+const RETRIEVAL_SETUP: &str = "Download a bge-m3 ONNX export (`model.onnx`, its `model.onnx_data` \
+     if the export is split, and `tokenizer.json`) plus an ONNX Runtime shared library for this \
+     platform, then set `[retrieval] embedding_model_path` to the model directory and \
+     `[retrieval] embedding_runtime_path` to the library in `config.toml`.";
+
+/// Reports the optional embedding recall channel (ADR-0004).
+///
+/// It never reports [`CheckStatus::Error`]. The channel is opt-in and additive: an installation
+/// without it is a healthy installation with lexical retrieval, which is what every installation
+/// had before ADR-0004. What doctor owes the operator is the difference between "off" and "on but
+/// broken", because only the second one silently costs recall they think they are paying for.
+fn check_retrieval(root: &Path, checks: &mut Vec<DoctorCheck>) {
+    let settings = match UserConfigStore::open_existing(root)
+        .and_then(|config| config.retrieval_settings())
+    {
+        Ok(settings) => settings,
+        Err(error) => {
+            checks.push(warning(
+                "retrieval_embedding",
+                format!("`[retrieval]` is unreadable, so the embedding channel is off: {error}"),
+            ));
+            return;
+        }
+    };
+    if settings.embedding_half_configured() {
+        checks.push(warning(
+            "retrieval_embedding",
+            format!(
+                "`[retrieval]` sets only one of `embedding_model_path` and \
+                 `embedding_runtime_path`, so the embedding channel stays off. {RETRIEVAL_SETUP}"
+            ),
+        ));
+        return;
+    }
+    let (Some(model_path), Some(runtime_path)) = (
+        settings.embedding_model_path.as_deref(),
+        settings.embedding_runtime_path.as_deref(),
+    ) else {
+        checks.push(ok(
+            "retrieval_embedding",
+            format!(
+                "Off. Retrieval is lexical only, which is the default. To add semantic recall: \
+                 {RETRIEVAL_SETUP}"
+            ),
+        ));
+        return;
+    };
+    let mut missing = Vec::new();
+    if !model_path.join("model.onnx").is_file() {
+        missing.push(format!("{}/model.onnx", model_path.display()));
+    }
+    if !model_path.join("tokenizer.json").is_file() {
+        missing.push(format!("{}/tokenizer.json", model_path.display()));
+    }
+    if !runtime_path.is_file() {
+        missing.push(runtime_path.display().to_string());
+    }
+    if !missing.is_empty() {
+        checks.push(warning(
+            "retrieval_embedding",
+            format!(
+                "`[retrieval]` is configured but these files are missing, so the embedding \
+                 channel stays off and retrieval falls back to lexical recall: {}. \
+                 {RETRIEVAL_SETUP}",
+                missing.join(", ")
+            ),
+        ));
+        return;
+    }
+    // Loading the model here would cost doctor 9--12 seconds and a gigabyte of memory to learn
+    // something the server reports on stderr anyway. Doctor checks that the files a load needs are
+    // present; the load itself belongs to `serve`.
+    let cached = SemanticVectorCache::open(&semantic_cache_path(root))
+        .and_then(|cache| {
+            model_fingerprint(model_path).and_then(|fingerprint| {
+                cache
+                    .cached_revisions(&SemanticCacheKey::new(fingerprint, SEARCH_RANKING_VERSION))
+                    .map(|revisions| revisions.len())
+            })
+        })
+        .unwrap_or(0);
+    checks.push(ok(
+        "retrieval_embedding",
+        format!(
+            "Configured: model {}, runtime {}, {cached} Context revision(s) embedded so far.",
+            model_path.display(),
+            runtime_path.display()
+        ),
+    ));
+}
 
 fn check_engineering_graph(root: &Path, checks: &mut Vec<DoctorCheck>) {
     let index = ProjectionIndex::new(root.join("repository"), root.join("state"));
