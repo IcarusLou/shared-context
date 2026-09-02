@@ -1,0 +1,40 @@
+# 低优先级问题记录
+
+来源：2026-09-01 召回注入链路诊断与 2026-09-02 真实会话验证（Codex 01a060a1、Cursor 桌面 cba4000e、Cursor d0773d8f）。本文件只收录**不直接阻碍 shared-context 目标达成**（跨会话知识沉淀、当前任务无路由发现历史知识）的问题；直接影响目标的问题在第二轮 WP（T1–T5）中处理，不在此列。
+
+每条格式：现象 / 证据 / 为什么低优 / 升级条件或方案方向。
+
+## 观测与诊断噪声
+
+1. **PostToolUse 双行诊断**：每次 SharedContext MCP 调用产生 `attribution_failed(neutral)` + `ok(enabled)` 两行，detail「enabled PostToolUse has no merge operation」把预期路径写成失败语气。累计 30+ 次。纯观测噪声，不影响行为。方案：SharedContext 类工具事件跳过 attribution 记录或改中性 reason。
+2. **首条 prompt 不进 TaskSignal**：`prompt_signal_skipped_no_task` —— prompt_submit 必然早于 task_intent_update。mid-session 已实证生效（d0773d8f ×1、01a060a1 ×5）；首轮语义由 Intent 本身承载，损失有限。升级条件：单轮短会话占比显著。方案方向：无 Task 时暂存一条、Task 创建时补挂。
+3. **`doctor` 报 Codex trust unconfirmed 误报**：0.150.1 vs fixture 0.147.0，但同机 hook 全程工作（hook_event 为证）。诊断面与实际矛盾，属探测逻辑对新版本的误判。
+4. **startup cwd 被删时 `canonicalize` 失败记 `authorization_internal`**（一次，与清理 worktree 时间窗吻合）。环境特例。方案：canonicalize 失败时沿用租约既有决定而非 fail_open。
+
+## 提示与错误文案
+
+5. **`invalid_input` 泄漏 serde 内部措辞**（「expected struct WorkingIntentSnapshot」）且无恢复指引。模型自我纠错效率问题，非链路阻断（cba4000e 中模型第二次就改对了）。方案：按 `session_not_authorized` 家族的模式拆分常见形状错误并给指引。
+6. **stop 催促可能过频**：无 checkpoint 的每一轮 turn_stop 都推「call task_checkpoint…」。单轮会话未成骚扰，长会话形态可预见。方案：每 Session 限次，或仅在本轮有实质工具活动时催。
+7. **marker 512 字节上限仅 `debug_assert` 守护**（release 无检查）。当前两种形态都远小于上限。
+
+## 升级与运维
+
+8. **MCP serve 进程存活跨过升级**：`bin/current` 已切到新版，编辑器里已启动的 serve 进程仍持旧二进制（实测 4 个进程、最早早于安装时刻；cba4000e 因此在热修复已装后仍命中旧 bug）。方案：upgrade 输出加「重启编辑器/重连 MCP 生效」提示；serve 启动时记录自身版本并在响应元数据中携带。
+9. **`graph_rebuild_pending` 在 `auto_scan=false` 时语义漂移**：从「重建失败」漂移成「Graph 落后」，未拆分状态码（R4 遗留）。
+10. **`association_rebuild` 的 `RepositoryScannerLimits` 硬编码**，无配置入口；`--max-artifacts` 只影响 `repository scan` 的响应截断（R4 遗留）。
+
+## 设计空白（进设计讨论，非急修）
+
+11. **EngineeringReference 不携带分支上下文**：沉淀于分支 A 的引用在分支 B 的 checkout 下判 Missing（正确）但无「属于另一分支」提示；`recheck_when: branch_advanced` 机制存在未被用上。d0773d8f 前置分析中 4 条 `.kt` 即此类。
+12. **CONTEXT.md 术语表与实现不符**：「Supersession belongs to Revision and governance causality, not ContextRelation」，而 domain/index/confirm 均把 `Supersedes` 作为普通 ContextRelation（P0 热修复后 search 亦然）。文档需对齐实现。
+13. **跨版本 Candidate 恢复窗口**：旧版本已提交 Git、runtime 停在 Queued 的 Candidate，新版本重算 content hash 不同时可能触发 `deterministic Candidate content hash changed across retry`（R2-B 遗留，极窄窗口）。
+14. **artifact focus reminder 与其他 additional_context 的「先到先得」耦合**：`add_artifact_focus_reminder` 在字段已被占用时放弃提醒；当前无重叠场景但耦合脆弱（R1-H1 遗留）。
+
+## 文档与测试债
+
+15. **三处旧文档仍写 16 个 MCP 工具**：`technical-design.md:1076`、`docs/acceptance-report.md:13/102/126`、`docs/mew-iteration-timeline.md:150`（代码与 oracle 已是 17 并有一致性断言）。
+16. **零散过时注释/冗余字段**：`hook_session_activation.rs` 的 lease_record_path 注释仍称「SessionStart 是唯一写者」；`insert_review_aids` 的 `derived_problem_view` 响应字段对新 Candidate 与 `content.problem_view` 重复。
+17. **scenario-runner 设计上无法驱动真实 agent**（明令拒绝 codex/cursor/claude 可执行）：「模型看到 marker 后是否真调工具」只能靠 `tests/scripts/codex_checkpoint_model_probe.py` 类手动探针覆盖。长期验收缺口。
+18. **B3 英文 Intent vs 中文知识库**：workflow 语言指引已缓解（d0773d8f 实证中文 Intent），剩余跨语言召回由 embedding 通道（ADR-0004）覆盖；此处仅记录现象。
+19. **zh-09 类 Space Intent BM25 抬升无关 Space**：`space_intent_bm25` 通道命中「配置/置下」类弱词即可让无关 Space 反超，item 层 coverage 乘子下限 5000 拉不回（R3 分析）。单探针问题，待 embedding 通道落地后重估。
+20. **探针 harness 的 usage prior 自我干扰**：连跑探针累积 `ignored` 计数可影响 1bp 级排序差（R1-S1 发现）；T1 修 usage 判定时顺带在 harness 中隔离 usage 状态。
