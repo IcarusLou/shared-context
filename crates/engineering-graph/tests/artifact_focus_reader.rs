@@ -14,7 +14,7 @@ use sctx_engineering_graph::{
     ArtifactSourceState, EngineeringProjectionStore, EngineeringReferenceResolver,
     GraphContextSafety, GraphContextSafetyBlocker, GraphContextSnapshot, GraphContextStatus,
     MAX_ARTIFACT_FOCUS_HITS, ProjectedEngineeringReference, RepositoryScanOutcome,
-    RepositorySnapshot, SnapshotArtifact, SnapshotSourcePolicy, SourceLanguage,
+    RepositorySnapshot, ScanCoverage, SnapshotArtifact, SnapshotSourcePolicy, SourceLanguage,
 };
 use tempfile::TempDir;
 
@@ -74,6 +74,7 @@ fn snapshot(
         head_tree_oid: "tree-focus".to_owned(),
         generation: "snap_focus".to_owned(),
         planned_paths,
+        coverage: ScanCoverage::Complete,
         artifacts,
         scanned_files: 1,
         scanned_bytes: 1,

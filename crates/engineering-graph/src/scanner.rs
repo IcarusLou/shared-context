@@ -1,9 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Read,
     path::{Component, Path, PathBuf},
-    process::Command,
-    time::Instant,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 use sctx_domain::{
@@ -15,6 +16,18 @@ use sha2::{Digest, Sha256};
 const POLICY_VERSION: &str = "planned-paths-plus-safe-tracked-modifications-v2";
 /// Global hard bound for one explicit Repository scan plan.
 pub const MAX_REPOSITORY_SCAN_PLAN_PATHS: usize = 10_000;
+/// Hard ceiling on one batched Git pathspec argument list, in bytes.
+const MAX_GIT_PATHSPEC_ARGV_BYTES: usize = 96 * 1024;
+/// Hard ceiling on captured stdout for one batched local Git call.
+const MAX_GIT_STDOUT_BYTES: usize = 16 * 1024 * 1024;
+/// Hard ceiling on captured stderr for one local Git call.
+const MAX_GIT_STDERR_BYTES: usize = 8 * 1024;
+/// Wall-clock ceiling for one local Git call when the scan carries no budget.
+const GIT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Floor applied to a budget-derived Git timeout so a nearly spent budget still asks once.
+const GIT_CALL_MIN_TIMEOUT: Duration = Duration::from_millis(250);
+/// How often a running local Git child is checked against its wall-clock bound.
+const GIT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 /// Exact source policy used for a `RepositorySnapshot`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,9 +50,11 @@ pub enum SourceLanguage {
     TypeScriptJavaScript,
     Swift,
     Kotlin,
+    Java,
     Json,
     Yaml,
     Proto,
+    Xml,
 }
 
 /// One path-level observation of an Artifact. Source contents are never retained.
@@ -82,6 +97,84 @@ pub struct SkippedFile {
     pub reason: SkippedFileReason,
 }
 
+/// How much of a scan plan one snapshot actually inspected.
+///
+/// A budgeted scan may stop before the whole plan is read. The snapshot it still commits is then
+/// only authoritative for the paths it reached, and every consumer that would otherwise conclude
+/// "this Artifact is gone" has to know where the evidence stops. `Complete` says the plan was read
+/// end to end; `Partial` names both halves explicitly so no consumer has to infer the boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScanCoverage {
+    /// Every planned path was inspected.
+    Complete,
+    /// The budget expired mid-plan; only `covered` carries evidence.
+    Partial {
+        /// Planned paths the scan actually inspected, sorted and deduplicated.
+        covered: Vec<RepoRelativePath>,
+        /// Planned paths the scan never reached, sorted and deduplicated.
+        unfinished: Vec<RepoRelativePath>,
+    },
+}
+
+impl ScanCoverage {
+    /// Reports whether this snapshot read its whole plan.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
+
+    /// Reports whether the snapshot carries evidence about `path`.
+    ///
+    /// A complete scan covers everything it planned; a partial one covers exactly what it read.
+    #[must_use]
+    pub fn covers_path(&self, path: &str) -> bool {
+        match self {
+            Self::Complete => true,
+            Self::Partial { covered, .. } => covered.iter().any(|entry| entry.as_str() == path),
+        }
+    }
+
+    /// Reports whether the snapshot carries evidence about anything inside directory `path`.
+    ///
+    /// Module Artifacts name a directory rather than a file, so a directory is covered as soon as
+    /// one file beneath it was read.
+    #[must_use]
+    pub fn covers_directory(&self, path: &str) -> bool {
+        match self {
+            Self::Complete => true,
+            Self::Partial { covered, .. } => covered.iter().any(|entry| {
+                entry
+                    .as_str()
+                    .strip_prefix(path)
+                    .is_some_and(|tail| tail.starts_with('/'))
+            }),
+        }
+    }
+
+    /// Directory prefixes that still hold at least one unread planned path.
+    #[must_use]
+    pub fn unfinished_prefixes(&self) -> Vec<String> {
+        match self {
+            Self::Complete => Vec::new(),
+            Self::Partial { unfinished, .. } => unfinished
+                .iter()
+                .map(|path| module_name(path.as_str()))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn digest_tag(&self) -> String {
+        match self {
+            Self::Complete => "coverage:complete".to_owned(),
+            Self::Partial { covered, .. } => {
+                format!("coverage:partial:{}", covered.len())
+            }
+        }
+    }
+}
+
 /// Deterministic derived snapshot of one available Repository.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepositorySnapshot {
@@ -91,6 +184,8 @@ pub struct RepositorySnapshot {
     pub head_tree_oid: String,
     pub generation: String,
     pub planned_paths: Vec<RepoRelativePath>,
+    /// How much of `planned_paths` this snapshot is authoritative for.
+    pub coverage: ScanCoverage,
     pub artifacts: Vec<SnapshotArtifact>,
     pub scanned_files: usize,
     pub scanned_bytes: u64,
@@ -204,15 +299,19 @@ impl RepositoryScanner {
 
     /// Scans the same snapshot under a wall-clock budget.
     ///
-    /// `Ok(None)` means the budget ran out mid-scan and nothing was produced. That is deliberately
-    /// neither a `RepositorySnapshot` with fewer files nor an `Unavailable` outcome: both would be
-    /// fed to the resolver, which would then record "missing from the Repository snapshot" for
-    /// Artifacts that are merely unscanned, and the resolver's answers are what callers act on. An
-    /// abandoned scan has nothing to say, and says exactly that.
+    /// A budget that expires mid-plan no longer throws the whole scan away. The snapshot is
+    /// committed for the planned paths that were read and carries a [`ScanCoverage::Partial`]
+    /// record of where the evidence stops, so the resolver can answer for what was scanned and
+    /// stay silent about the rest. Discarding everything was the older way of keeping a budgeted
+    /// scan from reporting unscanned Artifacts as missing; the coverage record keeps that exact
+    /// guarantee while letting partial work count.
     ///
-    /// The budget is checked between planned paths and again before parsing, so it bounds the
-    /// per-file local Git calls that dominate a scan of a large plan. A single oversized file is
-    /// still bounded by [`RepositoryScannerLimits`] rather than by the clock.
+    /// `Ok(None)` survives for the degenerate case: the budget expired before a single planned
+    /// path was inspected, so there is no evidence to commit at all.
+    ///
+    /// Tracked-state facts for the whole plan are gathered in a few batched local Git calls before
+    /// any file is read, so the clock bounds file reading and parsing rather than a per-file
+    /// process spawn. A single oversized file is still bounded by [`RepositoryScannerLimits`].
     ///
     /// # Errors
     ///
@@ -239,14 +338,21 @@ impl RepositoryScanner {
             }));
         }
         let root = validate_checkout_root(checkout_path)?;
-        let head_tree_oid = git_text(&root, &["rev-parse", "HEAD^{tree}"])?;
+        let head_tree_oid = git_text(&root, &["rev-parse", "HEAD^{tree}"], deadline)?;
+        let tracked = TrackedPathFacts::collect(&root, plan.paths(), deadline)?;
         let mut sources = Vec::new();
         let mut skipped_files = Vec::new();
+        let mut covered = Vec::with_capacity(plan.paths.len());
+        let mut unfinished = Vec::new();
         let mut scanned_bytes = 0_u64;
+        let mut budget_expired = false;
         for planned_path in &plan.paths {
-            if expired() {
-                return Ok(None);
+            if budget_expired || expired() {
+                budget_expired = true;
+                unfinished.push(planned_path.clone());
+                continue;
             }
+            covered.push(planned_path.clone());
             let relative = planned_path.as_str().to_owned();
             if sources.len() >= self.limits.max_files {
                 skipped_files.push(SkippedFile {
@@ -302,7 +408,7 @@ impl RepositoryScanner {
                 });
                 continue;
             }
-            if !is_tracked_path(&root, &relative)? {
+            if !tracked.is_tracked(&relative) {
                 skipped_files.push(SkippedFile {
                     path: relative,
                     reason: SkippedFileReason::Untracked,
@@ -341,7 +447,7 @@ impl RepositoryScanner {
                 continue;
             }
             scanned_bytes = scanned_bytes.saturating_add(bytes.len() as u64);
-            let source_state = tracked_source_state(&root, &relative)?;
+            let source_state = tracked.source_state(&relative);
             sources.push(SourceFile {
                 path: relative,
                 language,
@@ -352,21 +458,49 @@ impl RepositoryScanner {
         }
         sources.sort_by(|left, right| left.path.cmp(&right.path));
         skipped_files.sort_by(|left, right| left.path.cmp(&right.path));
+        let mut builder = ArtifactBuilder::new(repository);
+        let mut parsed = 0_usize;
+        for source in &sources {
+            if expired() {
+                break;
+            }
+            builder.scan_source(source)?;
+            parsed += 1;
+        }
+        if parsed < sources.len() {
+            let mut unparsed = BTreeSet::new();
+            for source in sources.split_off(parsed) {
+                let path = repo_path(&source.path)?;
+                unparsed.insert(path.clone());
+                unfinished.push(path);
+            }
+            covered.retain(|entry| !unparsed.contains(entry));
+            unfinished.sort();
+            scanned_bytes = sources
+                .iter()
+                .map(|source| source.bytes.len() as u64)
+                .fold(0_u64, u64::saturating_add);
+        }
+        if covered.is_empty() {
+            return Ok(None);
+        }
+        let coverage = if unfinished.is_empty() {
+            ScanCoverage::Complete
+        } else {
+            ScanCoverage::Partial {
+                covered,
+                unfinished,
+            }
+        };
         let generation = snapshot_generation(
             repository,
             &head_tree_oid,
             &plan.paths,
+            &coverage,
             &sources,
             &skipped_files,
         );
-        let mut builder = ArtifactBuilder::new(repository, &generation);
-        for source in &sources {
-            if expired() {
-                return Ok(None);
-            }
-            builder.scan_source(source)?;
-        }
-        let artifacts = builder.finish();
+        let artifacts = builder.finish(&generation);
         Ok(Some(RepositoryScanOutcome::Available(RepositorySnapshot {
             repository_id: repository.repository_id.clone(),
             source_policy: SnapshotSourcePolicy::PlannedPathsWithSafeTrackedModifications,
@@ -374,6 +508,7 @@ impl RepositoryScanner {
             head_tree_oid,
             generation,
             planned_paths: plan.paths.clone(),
+            coverage,
             artifacts,
             scanned_files: sources.len(),
             scanned_bytes,
@@ -419,15 +554,18 @@ struct SourceFile {
 
 struct ArtifactBuilder<'a> {
     repository: &'a RepositoryIdentity,
-    generation: &'a str,
     artifacts: BTreeMap<String, SnapshotArtifact>,
 }
 
 impl<'a> ArtifactBuilder<'a> {
-    fn new(repository: &'a RepositoryIdentity, generation: &'a str) -> Self {
+    /// Builds Artifacts before the snapshot generation is known.
+    ///
+    /// A budgeted scan can only name its generation once it knows how much of the plan it read,
+    /// and it only knows that once parsing has stopped, so the generation is stamped in
+    /// [`Self::finish`] rather than carried through the build.
+    fn new(repository: &'a RepositoryIdentity) -> Self {
         Self {
             repository,
-            generation,
             artifacts: BTreeMap::new(),
         }
     }
@@ -507,15 +645,21 @@ impl<'a> ArtifactBuilder<'a> {
             key,
             SnapshotArtifact {
                 artifact,
-                snapshot_generation: self.generation.to_owned(),
+                snapshot_generation: String::new(),
                 source_policy: SnapshotSourcePolicy::PlannedPathsWithSafeTrackedModifications,
                 observations: vec![observation],
             },
         );
     }
 
-    fn finish(self) -> Vec<SnapshotArtifact> {
-        self.artifacts.into_values().collect()
+    fn finish(self, generation: &str) -> Vec<SnapshotArtifact> {
+        self.artifacts
+            .into_values()
+            .map(|mut artifact| {
+                generation.clone_into(&mut artifact.snapshot_generation);
+                artifact
+            })
+            .collect()
     }
 }
 
@@ -558,9 +702,13 @@ fn extract(language: SourceLanguage, path: &str, text: &str) -> Vec<Discovery> {
         }
         SourceLanguage::Swift => extract_code(text, path, language, &swift_declaration),
         SourceLanguage::Kotlin => extract_code(text, path, language, &kotlin_declaration),
+        SourceLanguage::Java => extract_code(text, path, language, &java_declaration),
         SourceLanguage::Json => extract_json(path, text),
         SourceLanguage::Yaml => extract_yaml(path, text),
         SourceLanguage::Proto => extract_proto(text),
+        // Android resource and manifest XML carries no symbol a deterministic locator could name,
+        // so it is an Artifact at File and Module level only. Nothing is guessed from its markup.
+        SourceLanguage::Xml => Vec::new(),
     }
 }
 
@@ -578,7 +726,8 @@ fn extract_code(
     for (index, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         if matches!(language, SourceLanguage::Rust) && trimmed.starts_with("#[test")
-            || matches!(language, SourceLanguage::Kotlin) && trimmed == "@Test"
+            || matches!(language, SourceLanguage::Kotlin | SourceLanguage::Java)
+                && trimmed == "@Test"
         {
             test_annotation = true;
             continue;
@@ -704,6 +853,79 @@ fn kotlin_declaration(line: &str, is_test: bool) -> Vec<(ArtifactKind, String)> 
             ("enum class ", ArtifactKind::Schema),
         ],
     )
+}
+
+/// Extracts top-level Java declarations with the same shape as the Kotlin parser.
+///
+/// Java has no keyword introducing a method, so a method is recognised structurally: once the
+/// modifiers are stripped, a declaration reads as a return type followed by the name and an
+/// argument list. Anything that does not read that way is left alone rather than guessed at.
+fn java_declaration(line: &str, is_test: bool) -> Vec<(ArtifactKind, String)> {
+    let line = strip_prefixes(
+        line,
+        &[
+            "public ",
+            "private ",
+            "protected ",
+            "abstract ",
+            "final ",
+            "static ",
+            "synchronized ",
+            "native ",
+            "strictfp ",
+            "default ",
+        ],
+    );
+    let declared = declaration_tokens(
+        line,
+        &[
+            ("class ", ArtifactKind::Symbol),
+            ("record ", ArtifactKind::Symbol),
+            ("interface ", ArtifactKind::Schema),
+            ("enum ", ArtifactKind::Schema),
+            ("@interface ", ArtifactKind::Schema),
+        ],
+    );
+    if !declared.is_empty() {
+        return declared;
+    }
+    java_method_name(line).map_or_else(Vec::new, |name| {
+        vec![(
+            if is_test {
+                ArtifactKind::Test
+            } else {
+                ArtifactKind::Symbol
+            },
+            name,
+        )]
+    })
+}
+
+/// Reads the name out of a Java method declaration, or nothing when the line is not one.
+fn java_method_name(line: &str) -> Option<String> {
+    let head = line.split_once('(')?.0;
+    if !(line.ends_with('{') || line.ends_with(';')) {
+        return None;
+    }
+    let mut tokens = head.split_whitespace().collect::<Vec<_>>();
+    let name = tokens.pop()?;
+    // A bare `name(...)` is a constructor or a call, and a control keyword is neither: both would
+    // be a guess about a symbol Java never declared here.
+    if tokens.is_empty()
+        || matches!(
+            name,
+            "if" | "for" | "while" | "switch" | "catch" | "return" | "new" | "synchronized"
+        )
+    {
+        return None;
+    }
+    let identifier = identifier(name)?;
+    (identifier == name
+        && name
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_alphabetic() || first == '_'))
+    .then(|| name.to_owned())
 }
 
 fn declaration_tokens(
@@ -963,7 +1185,7 @@ fn validate_checkout_root(path: &Path) -> Result<PathBuf> {
         return Err(invalid("Repository checkout path must not be a symlink"));
     }
     let root = fs::canonicalize(path).map_err(io_error("canonicalize Repository checkout"))?;
-    let top_level = git_text(&root, &["rev-parse", "--show-toplevel"])?;
+    let top_level = git_text(&root, &["rev-parse", "--show-toplevel"], None)?;
     let top_level =
         fs::canonicalize(top_level.trim()).map_err(io_error("canonicalize Git worktree root"))?;
     if root != top_level {
@@ -974,56 +1196,240 @@ fn validate_checkout_root(path: &Path) -> Result<PathBuf> {
     Ok(root)
 }
 
-fn is_tracked_path(root: &Path, relative: &str) -> Result<bool> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["ls-files", "--error-unmatch", "--", relative])
-        .output()
-        .map_err(io_error("check planned tracked path"))?;
-    match output.status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => Err(invalid("Git failed to inspect planned tracked path")),
+/// Tracked-state facts for one whole scan plan, gathered up front in batched local Git calls.
+///
+/// The two questions a scan asks of Git about a planned path -- is it tracked at all, and does the
+/// working tree differ from `HEAD` -- used to cost one `git` process per path. On a large
+/// Repository the dominant cost of either process is loading the index, which is the same work
+/// whether it answers about one path or ten thousand, so a per-path spawn multiplied a fixed cost
+/// by the size of the plan and made a budgeted scan of a real monorepo produce nothing at all.
+/// Asking both questions once for the whole plan pays that fixed cost twice instead of `2n` times.
+///
+/// Pathspec arguments are batched under [`MAX_GIT_PATHSPEC_ARGV_BYTES`] so the argument list stays
+/// inside every platform's limit; a plan large enough to need several batches still spawns a
+/// bounded handful of processes rather than one per path.
+#[derive(Debug, Default)]
+struct TrackedPathFacts {
+    tracked: BTreeSet<String>,
+    modified: BTreeSet<String>,
+}
+
+impl TrackedPathFacts {
+    fn collect(
+        root: &Path,
+        planned_paths: &[RepoRelativePath],
+        deadline: Option<Instant>,
+    ) -> Result<Self> {
+        let mut facts = Self::default();
+        let requested = planned_paths
+            .iter()
+            .map(|path| path.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        for batch in pathspec_batches(planned_paths) {
+            let mut tracked_args = vec!["ls-files", "-z", "--"];
+            tracked_args.extend(batch.iter().copied());
+            facts
+                .tracked
+                .extend(git_nul_paths(root, &tracked_args, &requested, deadline)?);
+            let mut modified_args = vec!["diff", "--name-only", "-z", "HEAD", "--"];
+            modified_args.extend(batch.iter().copied());
+            facts
+                .modified
+                .extend(git_nul_paths(root, &modified_args, &requested, deadline)?);
+        }
+        Ok(facts)
+    }
+
+    fn is_tracked(&self, relative: &str) -> bool {
+        self.tracked.contains(relative)
+    }
+
+    fn source_state(&self, relative: &str) -> ArtifactSourceState {
+        if self.modified.contains(relative) {
+            ArtifactSourceState::TrackedWorkingModification
+        } else {
+            ArtifactSourceState::TrackedHead
+        }
     }
 }
 
-fn tracked_source_state(root: &Path, relative: &str) -> Result<ArtifactSourceState> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["diff", "--quiet", "HEAD", "--", relative])
-        .status()
-        .map_err(io_error("check planned tracked modification"))?;
-    match status.code() {
-        Some(0) => Ok(ArtifactSourceState::TrackedHead),
-        Some(1) => Ok(ArtifactSourceState::TrackedWorkingModification),
-        _ => Err(invalid(
-            "Git failed to inspect planned tracked modification",
-        )),
+/// Splits a plan into pathspec argument batches that stay under the argument-list ceiling.
+fn pathspec_batches(planned_paths: &[RepoRelativePath]) -> Vec<Vec<&str>> {
+    let mut batches = Vec::new();
+    let mut batch: Vec<&str> = Vec::new();
+    let mut bytes = 0_usize;
+    for path in planned_paths {
+        let value = path.as_str();
+        if !batch.is_empty() && bytes.saturating_add(value.len() + 1) > MAX_GIT_PATHSPEC_ARGV_BYTES
+        {
+            batches.push(std::mem::take(&mut batch));
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(value.len() + 1);
+        batch.push(value);
     }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    batches
 }
 
-fn git_text(root: &Path, args: &[&str]) -> Result<String> {
-    String::from_utf8(git_bytes(root, args)?)
+/// Runs one batched Git query and keeps only the NUL-separated paths the plan actually asked for.
+///
+/// Git resolves each argument as a pathspec, so a batched query can report paths outside the plan
+/// (a planned directory expands to its contents). Intersecting with `requested` keeps the batched
+/// answer identical to what the per-path queries used to return.
+fn git_nul_paths(
+    root: &Path,
+    args: &[&str],
+    requested: &BTreeSet<String>,
+    deadline: Option<Instant>,
+) -> Result<Vec<String>> {
+    let run = bounded_git(root, args, deadline, MAX_GIT_STDOUT_BYTES)?;
+    if !matches!(run.code, Some(0)) {
+        return Err(invalid(format!(
+            "local Git snapshot command failed: {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        )));
+    }
+    let text = String::from_utf8(run.stdout)
+        .map_err(|error| invalid(format!("Git output is not UTF-8: {error}")))?;
+    Ok(text
+        .split('\0')
+        .filter(|value| !value.is_empty())
+        .filter(|value| requested.contains(*value))
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+fn git_text(root: &Path, args: &[&str], deadline: Option<Instant>) -> Result<String> {
+    let run = bounded_git(root, args, deadline, MAX_GIT_STDERR_BYTES)?;
+    if !matches!(run.code, Some(0)) {
+        return Err(invalid(format!(
+            "local Git snapshot command failed: {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        )));
+    }
+    String::from_utf8(run.stdout)
         .map(|value| value.trim().to_owned())
         .map_err(|error| invalid(format!("Git output is not UTF-8: {error}")))
 }
 
-fn git_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = Command::new("git")
+/// One completed local Git call, with both streams already capped.
+struct BoundedGitRun {
+    code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Runs one local Git command under a wall-clock timeout and a captured-output ceiling.
+///
+/// A scan is a hot path that a stuck or pathologically chatty `git` must never be able to hang, so
+/// both streams are drained by their own reader and truncated at a fixed ceiling, and a child that
+/// outlives its timeout is killed and reaped rather than waited on.
+fn bounded_git(
+    root: &Path,
+    args: &[&str],
+    deadline: Option<Instant>,
+    max_stdout_bytes: usize,
+) -> Result<BoundedGitRun> {
+    let timeout = git_call_timeout(deadline);
+    let mut child = Command::new("git")
         .arg("-C")
         .arg(root)
+        .arg("--literal-pathspecs")
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(io_error("run local Git snapshot command"))?;
-    if !output.status.success() {
-        return Err(invalid(format!(
-            "local Git snapshot command failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| invariant("local Git stdout was not captured"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| invariant("local Git stderr was not captured"))?;
+    let stdout_reader = std::thread::spawn(move || read_capped(stdout, max_stdout_bytes));
+    let stderr_reader = std::thread::spawn(move || read_capped(stderr, MAX_GIT_STDERR_BYTES));
+    let call_deadline = Instant::now().checked_add(timeout);
+    let code = loop {
+        if let Some(status) = child.try_wait().map_err(io_error("await local Git"))? {
+            break status.code();
+        }
+        if call_deadline.is_some_and(|limit| Instant::now() >= limit) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(invalid(
+                "local Git snapshot command exceeded its wall-clock bound",
+            ));
+        }
+        std::thread::sleep(GIT_POLL_INTERVAL);
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| invariant("local Git stdout reader panicked"))?
+        .map_err(io_error("read local Git output"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| invariant("local Git stderr reader panicked"))?
+        .map_or_else(|_| Vec::new(), |captured| captured.bytes);
+    if stdout.capped {
+        return Err(invalid(
+            "local Git snapshot command produced more output than the scanner accepts",
+        ));
     }
-    Ok(output.stdout)
+    Ok(BoundedGitRun {
+        code,
+        stdout: stdout.bytes,
+        stderr,
+    })
+}
+
+/// Derives one Git call's timeout from the scan budget it has to fit inside.
+fn git_call_timeout(deadline: Option<Instant>) -> Duration {
+    deadline.map_or(GIT_CALL_TIMEOUT, |deadline| {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .max(GIT_CALL_MIN_TIMEOUT)
+            .min(GIT_CALL_TIMEOUT)
+    })
+}
+
+/// One child stream drained to its end, plus whether the ceiling dropped anything.
+struct CapturedStream {
+    bytes: Vec<u8>,
+    capped: bool,
+}
+
+/// Drains one child stream to its end, keeping at most `limit` bytes.
+///
+/// A short read is never treated as the end of the stream: an interrupted read is retried and any
+/// other failure is reported. Half of `git ls-files` looks exactly like a complete answer in which
+/// the missing paths are untracked, and a scan that quietly believed that would report Artifacts
+/// as missing from a Repository that has them.
+fn read_capped(mut stream: impl Read, limit: usize) -> std::io::Result<CapturedStream> {
+    let mut kept = Vec::new();
+    let mut capped = false;
+    let mut chunk = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                let room = limit.saturating_sub(kept.len());
+                kept.extend_from_slice(&chunk[..read.min(room)]);
+                capped = capped || read > room;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(CapturedStream {
+        bytes: kept,
+        capped,
+    })
 }
 
 fn language_for_path(path: &str) -> Option<SourceLanguage> {
@@ -1039,10 +1445,12 @@ fn language_for_path(path: &str) -> Option<SourceLanguage> {
         (".swift", SourceLanguage::Swift),
         (".kt", SourceLanguage::Kotlin),
         (".kts", SourceLanguage::Kotlin),
+        (".java", SourceLanguage::Java),
         (".json", SourceLanguage::Json),
         (".yaml", SourceLanguage::Yaml),
         (".yml", SourceLanguage::Yaml),
         (".proto", SourceLanguage::Proto),
+        (".xml", SourceLanguage::Xml),
     ]
     .into_iter()
     .find_map(|(suffix, language)| lower.ends_with(suffix).then_some(language))
@@ -1054,9 +1462,11 @@ fn language_name(language: SourceLanguage) -> &'static str {
         SourceLanguage::TypeScriptJavaScript => "typescript-javascript",
         SourceLanguage::Swift => "swift",
         SourceLanguage::Kotlin => "kotlin",
+        SourceLanguage::Java => "java",
         SourceLanguage::Json => "json",
         SourceLanguage::Yaml => "yaml",
         SourceLanguage::Proto => "proto",
+        SourceLanguage::Xml => "xml",
     }
 }
 
@@ -1179,6 +1589,7 @@ fn snapshot_generation(
     repository: &RepositoryIdentity,
     head_tree_oid: &str,
     planned_paths: &[RepoRelativePath],
+    coverage: &ScanCoverage,
     sources: &[SourceFile],
     skipped_files: &[SkippedFile],
 ) -> String {
@@ -1187,11 +1598,17 @@ fn snapshot_generation(
         POLICY_VERSION.to_owned(),
         repository.repository_id.to_string(),
         head_tree_oid.to_owned(),
+        coverage.digest_tag(),
     ] {
         hash_component(&mut hasher, &component);
     }
     for path in planned_paths {
         hash_component(&mut hasher, path.as_str());
+    }
+    if let ScanCoverage::Partial { covered, .. } = coverage {
+        for path in covered {
+            hash_component(&mut hasher, path.as_str());
+        }
     }
     for source in sources {
         hash_component(&mut hasher, &source.path);

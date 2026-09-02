@@ -4032,20 +4032,26 @@ fn check_index(root: &Path, checks: &mut Vec<DoctorCheck>) {
 /// it, because every Task Context Pack degrades to text and the degradation is the normal path
 /// when no Graph exists at all. So the count comparison is the check: References without Contexts
 /// is the shape of that silence, and it has one command as its fix.
+/// Names the one repair every Engineering Graph warning below points at.
+const GRAPH_REPAIR: &str = "Run `sctx association rebuild` (or `sctx doctor --fix`), and check \
+     that `[engineering] auto_scan` is not disabled.";
+
 fn check_engineering_graph(root: &Path, checks: &mut Vec<DoctorCheck>) {
     let index = ProjectionIndex::new(root.join("repository"), root.join("state"));
-    let reference_count = match index.domain_snapshot() {
-        Ok(snapshot) => snapshot.projection.engineering_references.len(),
+    let (reference_count, indexed_tree_oid) = match index.domain_snapshot() {
+        Ok(snapshot) => (
+            snapshot.projection.engineering_references.len(),
+            snapshot.metadata.indexed_tree_oid,
+        ),
         Err(error) => {
             checks.push(failed("engineering_graph", error.to_string()));
             return;
         }
     };
-    let context_count = match EngineeringProjectionStore::initialize(root)
+    let graph = match EngineeringProjectionStore::initialize(root)
         .and_then(|store| store.read_snapshot())
     {
-        Ok(Some(snapshot)) => snapshot.projection.contexts.len(),
-        Ok(None) => 0,
+        Ok(graph) => graph,
         Err(error) => {
             checks.push(failed(
                 "engineering_graph",
@@ -4054,29 +4060,78 @@ fn check_engineering_graph(root: &Path, checks: &mut Vec<DoctorCheck>) {
             return;
         }
     };
+    let context_count = graph
+        .as_ref()
+        .map_or(0, |graph| graph.projection.contexts.len());
+    let resolved_count = graph
+        .as_ref()
+        .map_or(0, |graph| graph.projection.references.len());
+    let graph_tree_oid = graph
+        .as_ref()
+        .and_then(|graph| graph.context_tree_oid.clone());
+    let unfinished_scans = graph
+        .as_ref()
+        .map_or(0, |graph| graph.projection.incomplete_scans.len());
+
     if reference_count == 0 {
         checks.push(ok(
             "engineering_graph",
             "no Engineering Reference is recorded yet",
         ));
-    } else if context_count == 0 {
+        return;
+    }
+    if context_count == 0 {
         checks.push(warning(
             "engineering_graph",
             format!(
                 "{reference_count} Engineering References resolve against no Graph Context \
-                 snapshot; Artifact-anchored retrieval is silently unavailable. \
-                 Run `sctx association rebuild` (or `sctx doctor --fix`) to scan the registered \
-                 checkouts, and check that `[engineering] auto_scan` is not disabled."
+                 snapshot; Artifact-anchored retrieval is silently unavailable. {GRAPH_REPAIR}"
             ),
         ));
-    } else {
-        checks.push(ok(
+        return;
+    }
+    // A Graph with snapshots in it can still be behind the Store. Both symptoms below were
+    // reported as healthy by the check above while Artifact-anchored retrieval quietly missed the
+    // newest Contexts, which is the one failure mode a doctor exists to catch.
+    if graph_tree_oid.as_deref() != Some(indexed_tree_oid.as_str()) {
+        checks.push(warning(
             "engineering_graph",
             format!(
-                "{reference_count} Engineering References over {context_count} Graph Context snapshots"
+                "the Engineering projection was built from Context Tree {} while the index is at \
+                 {indexed_tree_oid}; Confirmations since then are absent from Artifact-anchored \
+                 retrieval. {GRAPH_REPAIR}",
+                graph_tree_oid.as_deref().unwrap_or("an unrecorded Tree")
             ),
         ));
+        return;
     }
+    if resolved_count < reference_count {
+        checks.push(warning(
+            "engineering_graph",
+            format!(
+                "{reference_count} Engineering References are recorded but only {resolved_count} \
+                 carry a resolution; the rest are invisible to Artifact-anchored retrieval. \
+                 {GRAPH_REPAIR}"
+            ),
+        ));
+        return;
+    }
+    if unfinished_scans > 0 {
+        checks.push(warning(
+            "engineering_graph",
+            format!(
+                "{unfinished_scans} Repository scans stopped before reading their whole plan, so \
+                 the Graph is authoritative only for what they reached. {GRAPH_REPAIR}"
+            ),
+        ));
+        return;
+    }
+    checks.push(ok(
+        "engineering_graph",
+        format!(
+            "{reference_count} Engineering References over {context_count} Graph Context snapshots"
+        ),
+    ));
 }
 
 fn check_repository_catalog(root: &Path, checks: &mut Vec<DoctorCheck>) {

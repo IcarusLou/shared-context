@@ -1098,9 +1098,11 @@ const fn language_name(language: SourceLanguage) -> &'static str {
         SourceLanguage::TypeScriptJavaScript => "typescript-javascript",
         SourceLanguage::Swift => "swift",
         SourceLanguage::Kotlin => "kotlin",
+        SourceLanguage::Java => "java",
         SourceLanguage::Json => "json",
         SourceLanguage::Yaml => "yaml",
         SourceLanguage::Proto => "proto",
+        SourceLanguage::Xml => "xml",
     }
 }
 

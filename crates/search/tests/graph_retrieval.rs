@@ -11,8 +11,8 @@ use sctx_domain::{
 use sctx_engineering_graph::{
     ArtifactObservation, ArtifactSourceState, EngineeringProjectionStore,
     EngineeringReferenceResolver, GraphContextSnapshot, ProjectedEngineeringReference,
-    RepositoryScanOutcome, RepositorySnapshot, SnapshotArtifact, SnapshotSourcePolicy,
-    SourceLanguage, build_graph_context_snapshots,
+    RepositoryScanOutcome, RepositorySnapshot, ScanCoverage, SnapshotArtifact,
+    SnapshotSourcePolicy, SourceLanguage, build_graph_context_snapshots,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
@@ -312,6 +312,7 @@ fn snapshot(
         head_tree_oid: "repo-tree".to_owned(),
         generation: generation.to_owned(),
         planned_paths,
+        coverage: ScanCoverage::Complete,
         artifacts,
         scanned_files: 1,
         scanned_bytes: 100,
