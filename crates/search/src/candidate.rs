@@ -41,6 +41,22 @@ pub const STATEMENT_SIMILARITY_REVIEW_BASIS_POINTS: u64 = 5_000;
 /// through as merely related, because the strongest duplicate path needs a topic key and the topic
 /// key is optional.
 pub const STATEMENT_NEAR_DUPLICATE_BASIS_POINTS: u64 = 5_000;
+/// Adjacent-token (bigram) Jaccard at or above which two same-topic, differently worded
+/// statements read as one conclusion paraphrased rather than two independent, potentially
+/// opposed ones.
+///
+/// This only gates the topic-key path to `potential_contradiction` ([`assess_target`]): a shared
+/// topic key with a differing statement used to send every such pair to human contradiction
+/// review, including a Claim that only reworded a Context the knowledge base already held from a
+/// different angle. Word order recovers what unigram overlap cannot see — a paraphrase still
+/// reproduces most of its neighbor-token pairs after synonym substitution and light
+/// restructuring, while two independently written statements about the same topic rarely share
+/// more than a scattered few. Below this bound the pair still reaches
+/// `unresolved_related`, not `supports`: nothing here promotes it as confirmed agreement, it only
+/// stops treating a rewrite as evidence of disagreement. A negation or polarity marker mismatch
+/// overrides this bound in either direction, because "reached" and "not reached" can otherwise
+/// look like the same phrase reused.
+pub const STATEMENT_BIGRAM_PARAPHRASE_BASIS_POINTS: u64 = 3_000;
 /// Shared repository identifiers at or above which two Claims are about the same code.
 ///
 /// One shared identifier is a coincidence of vocabulary; two independently written spellings of
@@ -659,6 +675,24 @@ fn assess_target(
     let statement_differs = normalize_search_text(&state.revision.statement)
         != normalize_search_text(&candidate.statement);
     let negation_conflict = state.negation_conflict;
+    // `state.negation_conflict` only fires above `STATEMENT_SIMILARITY_STRONG_BASIS_POINTS`
+    // ([`add_exact_channels`]), which the topic-key path below is never reached above (that
+    // similarity band already resolves as `supports` at the `statement` channel check). A
+    // differing negation or polarity marker is still decisive at any similarity, so it is
+    // recomputed here without that gate.
+    let topic_negation_conflict =
+        negation_markers(&candidate.statement) != negation_markers(&state.revision.statement);
+    // See [`STATEMENT_BIGRAM_PARAPHRASE_BASIS_POINTS`]: word-order overlap tells a paraphrase of
+    // one topic-matched fact from an independently written, potentially opposed one.
+    let topic_bigram_paraphrase =
+        statement_bigram_jaccard_basis_points(&candidate.statement, &state.revision.statement)
+            >= STATEMENT_BIGRAM_PARAPHRASE_BASIS_POINTS;
+    // A topic-key match with a differing statement is worth a human contradiction review only
+    // when the wording is not itself explainable as a paraphrase: a clear negation/polarity
+    // mismatch, or bigram overlap low enough that the two statements are not simply the same
+    // conclusion reworded (see [`STATEMENT_BIGRAM_PARAPHRASE_BASIS_POINTS`]).
+    let topic_statement_conflict =
+        topic && statement_differs && (topic_negation_conflict || !topic_bigram_paraphrase);
     // A shared identifier set is only strong within one Context kind: an `issue` and the
     // `validation` that exercises the same class are related, not the same fact.
     let shared_identifiers = state.shared_identifiers.len();
@@ -710,8 +744,10 @@ fn assess_target(
         } else {
             CandidateAssessmentRelation::PotentialContradiction
         }
-    } else if statement_differs
-        && (topic || (shared_artifact && similarity >= STATEMENT_SIMILARITY_REVIEW_BASIS_POINTS))
+    } else if topic_statement_conflict
+        || (statement_differs
+            && shared_artifact
+            && similarity >= STATEMENT_SIMILARITY_REVIEW_BASIS_POINTS)
     {
         CandidateAssessmentRelation::PotentialContradiction
     } else {
@@ -748,7 +784,17 @@ fn assess_target(
             )
         }
     } else if topic && statement_differs {
-        "Path: topic equality with a differing statement".to_owned()
+        if topic_negation_conflict {
+            "Path: topic equality with a differing statement and a negation/polarity marker mismatch".to_owned()
+        } else if topic_statement_conflict {
+            format!(
+                "Path: topic equality with a differing statement, bigram overlap below the {STATEMENT_BIGRAM_PARAPHRASE_BASIS_POINTS} paraphrase threshold"
+            )
+        } else {
+            format!(
+                "Path: topic equality with a differing statement read as a paraphrase at or above the {STATEMENT_BIGRAM_PARAPHRASE_BASIS_POINTS} bigram threshold"
+            )
+        }
     } else if matches!(
         relation,
         CandidateAssessmentRelation::PotentialContradiction
@@ -883,6 +929,33 @@ fn jaccard_basis_points(left: &BTreeSet<&str>, right: &BTreeSet<&str>) -> u64 {
         return 0;
     }
     intersection.saturating_mul(10_000) / union
+}
+
+/// Adjacent-token bigrams of one already-normalized, whitespace-joined statement.
+///
+/// A bag of tokens cannot see order: a Claim that reuses another one's vocabulary in a different
+/// arrangement scores identically to a verbatim rewrite. Pairing each token with its neighbor
+/// recovers enough sequence to tell a paraphrase of one fact — which still reproduces most of its
+/// neighbor pairs after synonym substitution and light restructuring — from an independently
+/// written Claim that merely shares a topic, whose neighbor pairs rarely coincide. A statement of
+/// fewer than two tokens carries no bigram, so it never counts as a paraphrase of anything.
+fn token_bigrams(normalized: &str) -> BTreeSet<String> {
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    tokens
+        .windows(2)
+        .map(|pair| format!("{} {}", pair[0], pair[1]))
+        .collect()
+}
+
+/// Bigram Jaccard of two raw statements, normalized and tokenized the same way as
+/// [`token_set`]. Reuses [`jaccard_basis_points`] over the bigram vocabulary instead of the
+/// unigram one.
+fn statement_bigram_jaccard_basis_points(left: &str, right: &str) -> u64 {
+    let left_bigrams = token_bigrams(&normalize_search_text(left));
+    let right_bigrams = token_bigrams(&normalize_search_text(right));
+    let left_refs = left_bigrams.iter().map(String::as_str).collect();
+    let right_refs = right_bigrams.iter().map(String::as_str).collect();
+    jaccard_basis_points(&left_refs, &right_refs)
 }
 
 fn novel_assessment() -> CandidateRelationAssessment {
