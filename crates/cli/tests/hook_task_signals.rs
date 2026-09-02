@@ -150,13 +150,27 @@ impl Fixture {
     }
 
     fn hook_event_reasons(&self) -> Vec<String> {
+        self.hook_events()
+            .into_iter()
+            .map(|(reason, _)| reason)
+            .collect()
+    }
+
+    fn hook_events(&self) -> Vec<(String, Option<String>)> {
         TaskRuntime::initialize(&self.root)
             .unwrap()
             .recent_hook_events(64)
             .unwrap()
             .into_iter()
-            .map(|event| event.reason)
+            .map(|event| (event.reason, event.detail))
             .collect()
+    }
+
+    fn hook_event_detail(&self, reason: &str) -> Option<String> {
+        self.hook_events()
+            .into_iter()
+            .find(|(event_reason, _)| event_reason == reason)
+            .map(|(_, detail)| detail)?
     }
 
     /// Every regular file under `state/`, by path, with its exact bytes.
@@ -192,6 +206,48 @@ impl Fixture {
             "tool_input": {"absolute_file_path": file},
             "tool_response": {"output": "Done!"}
         })
+    }
+
+    /// One Codex `exec` call: the shape every tool call of a real Codex Session arrives in.
+    fn codex_exec(&self, session: &str, turn: &str, command: &Value) -> Value {
+        json!({
+            "session_id": session, "transcript_path": null, "cwd": self.repository,
+            "hook_event_name": "PostToolUse", "model": "gpt-5.6-sol",
+            "permission_mode": "default", "turn_id": turn,
+            "tool_name": "shell", "tool_use_id": format!("call-{turn}"),
+            "tool_input": {"command": command, "workdir": self.repository},
+            "tool_response": {"output": "Done!"}
+        })
+    }
+
+    fn cursor_tool(&self, session: &str, turn: &str, tool: &str, input: &Value) -> Value {
+        json!({
+            "conversation_id": session, "generation_id": format!("gen-{turn}"),
+            "model": "claude-opus-4-7", "hook_event_name": "postToolUse",
+            "cursor_version": "3.13.10", "workspace_roots": [self.repository],
+            "user_email": null, "transcript_path": null,
+            "tool_name": tool, "tool_input": input,
+            "tool_output": json!({"contents": "ok"}).to_string(),
+            "tool_use_id": format!("tool-{turn}"), "duration": 10
+        })
+    }
+
+    fn start_cursor_session(&self, session: &str) {
+        assert_eq!(
+            self.hook(
+                "cursor",
+                &json!({
+                    "conversation_id": session, "generation_id": "gen-0",
+                    "model": "claude-opus-4-7", "hook_event_name": "sessionStart",
+                    "cursor_version": "3.13.10", "workspace_roots": [self.repository],
+                    "user_email": null, "transcript_path": null, "session_id": session,
+                    "is_background_agent": false, "composer_mode": "agent"
+                }),
+            ),
+            json!({
+                "additional_context": shared_context_activation_marker(AgentKind::Cursor, session)
+            })
+        );
     }
 }
 
@@ -515,4 +571,326 @@ fn cursor_tool_output_exit_code_decides_the_test_outcome_signal() {
             "{turn} run must record {expected}"
         );
     }
+}
+
+/// A Codex Session spends essentially every tool call in `exec`, so before command candidates
+/// existed such a Session contributed no file clue at all: the category was always `Shell`, the
+/// hints were always empty, and the Task Signal table stayed empty for its whole life. The
+/// command is still never stored — only the files it named, resolved against the Catalog, land
+/// as `<RepositoryId>:<checkout-relative path>`.
+#[test]
+fn codex_exec_commands_contribute_repository_relative_workspace_signals() {
+    let fixture = Fixture::new("exec signal");
+    let session = "exec-signal";
+    fixture.start_codex_session(session);
+    fixture.open_task("codex", session, "record file clues from exec commands");
+    let expected = format!("{}:src/lib.rs", fixture.repository_id);
+
+    // The shape a model normally phrases an `exec` call in: an argument vector wrapping one
+    // simple command. A relative path is resolved against the event's own working directory.
+    assert_eq!(
+        fixture.hook(
+            "codex",
+            &fixture.codex_exec(session, "cat-1", &json!(["bash", "-lc", "cat src/lib.rs"])),
+        ),
+        json!({})
+    );
+    assert_eq!(
+        fixture.active_signals("codex", session, TaskSignalKind::Workspace),
+        vec![expected.clone()],
+        "an exec that read a registered file is a Workspace clue"
+    );
+    // An `exec` cannot say whether it read or rewrote what it named, so it never claims the
+    // stronger of the two kinds.
+    assert!(
+        fixture
+            .active_signals("codex", session, TaskSignalKind::Diff)
+            .is_empty()
+    );
+
+    // A guess never fails an event and never widens it: a file in another checkout, a path that
+    // does not exist, and a directory are all dropped while the event stays attributed.
+    let outside = fixture.outside.join("src/lib.rs");
+    assert_eq!(
+        fixture.hook(
+            "codex",
+            &fixture.codex_exec(
+                session,
+                "mixed-1",
+                &json!([
+                    "cat",
+                    outside.to_str().unwrap(),
+                    "src/absent.rs",
+                    "src",
+                    "src/lib.rs"
+                ]),
+            ),
+        ),
+        json!({})
+    );
+    assert_eq!(
+        fixture.active_signals("codex", session, TaskSignalKind::Workspace),
+        vec![expected],
+        "only the registered file survives the guess"
+    );
+    let reasons = fixture.hook_event_reasons();
+    assert!(
+        !reasons.contains(&"attribution_failed".to_owned()),
+        "a rejected guess is not an attribution failure: {reasons:?}"
+    );
+    assert!(reasons.contains(&"file_signal_recorded".to_owned()));
+
+    // The command text itself never crosses into storage — only attributed, relative paths.
+    let state = fixture.persisted_state_text();
+    for command_text in ["bash", "-lc", "src/absent.rs"] {
+        assert!(
+            !state.contains(command_text),
+            "{command_text:?} must not reach local state"
+        );
+    }
+    assert!(!state.contains(fixture.outside.to_str().unwrap()));
+}
+
+/// Two very different outcomes used to share one reason, and the louder one hid the quieter: an
+/// event that could place no file at all was reported as an event whose Signals were already
+/// known. That is what made a Codex Session's empty Signal table look like healthy deduplication.
+#[test]
+fn an_event_with_no_attributable_file_is_not_reported_as_deduplicated() {
+    let fixture = Fixture::new("empty signal reason");
+    let session = "empty-signal-reason";
+    fixture.start_codex_session(session);
+    fixture.open_task("codex", session, "separate the two empty-Signal outcomes");
+
+    // Nothing in this command names a file, so this event places nothing.
+    assert_eq!(
+        fixture.hook(
+            "codex",
+            &fixture.codex_exec(session, "check-1", &json!(["cargo", "check"])),
+        ),
+        json!({})
+    );
+    assert!(fixture.signal_history("codex", session).is_empty());
+    assert!(
+        fixture
+            .hook_event_reasons()
+            .contains(&"no_attributable_files".to_owned())
+    );
+    assert!(
+        !fixture
+            .hook_event_reasons()
+            .contains(&"signal_write_skipped_nothing_new".to_owned())
+    );
+
+    // The same file read twice does place a file — the second read is genuinely deduplicated.
+    let file = fixture.repository.join("src/lib.rs");
+    for turn in ["read-1", "read-2"] {
+        assert_eq!(
+            fixture.hook(
+                "codex",
+                &fixture.codex_tool(session, turn, "read_file", &file)
+            ),
+            json!({})
+        );
+    }
+    assert!(
+        fixture
+            .hook_event_reasons()
+            .contains(&"signal_write_skipped_nothing_new".to_owned())
+    );
+}
+
+/// Shared Context's own MCP tool calls plan no Signal merge on purpose. Running attribution over
+/// them reported that by-design path as `attribution_failed` on every single call, which is how
+/// a healthy Session accumulated dozens of failure rows describing nothing.
+#[test]
+fn a_shared_context_tool_call_records_no_attribution_failure() {
+    let fixture = Fixture::new("shared context tool");
+    let session = "shared-context-tool";
+    fixture.start_codex_session(session);
+    fixture.open_task(
+        "codex",
+        session,
+        "keep our own tool calls out of observation",
+    );
+
+    let file = fixture.repository.join("src/lib.rs");
+    assert_eq!(
+        fixture.hook(
+            "codex",
+            &fixture.codex_tool(session, "checkpoint-1", "task_checkpoint", &file)
+        ),
+        json!({})
+    );
+    let reasons = fixture.hook_event_reasons();
+    assert!(
+        !reasons.contains(&"attribution_failed".to_owned()),
+        "our own tool call is not an attribution failure: {reasons:?}"
+    );
+    assert!(fixture.signal_history("codex", session).is_empty());
+}
+
+/// Cursor's desktop build sends some tool events with a relative path. The absolute-path rule
+/// rejected those outright, so every such event lost its file clue and left one
+/// `attribution_failed` row behind. The event already says where it ran.
+#[test]
+fn cursor_relative_tool_paths_resolve_against_the_event_workspace() {
+    let fixture = Fixture::new("cursor relative");
+    let session = "cursor-relative";
+    fixture.start_cursor_session(session);
+    fixture.open_task("cursor", session, "place relative Cursor tool paths");
+    let expected = format!("{}:src/lib.rs", fixture.repository_id);
+
+    // With an explicit working directory, and — as the desktop build sends it — without one,
+    // in which case the first declared Workspace root is the base.
+    for (turn, cwd) in [
+        ("with-cwd", Some(fixture.repository.clone())),
+        ("without-cwd", None),
+    ] {
+        let mut payload = fixture.cursor_tool(
+            session,
+            turn,
+            "read_file",
+            &json!({"file_path": "src/lib.rs"}),
+        );
+        if let Some(cwd) = cwd {
+            payload["cwd"] = json!(cwd);
+        }
+        assert_eq!(fixture.hook("cursor", &payload), json!({}));
+        assert_eq!(
+            fixture.active_signals("cursor", session, TaskSignalKind::Workspace),
+            vec![expected.clone()],
+            "{turn} must place the relative path"
+        );
+    }
+    let reasons = fixture.hook_event_reasons();
+    assert!(
+        !reasons.contains(&"attribution_failed".to_owned()),
+        "a relative path the event can place is not a failure: {reasons:?}"
+    );
+
+    // A relative path that escapes the Workspace still cannot be placed, and still records no
+    // absolute path from this machine.
+    let escape = fixture.cursor_tool(
+        session,
+        "escape",
+        "read_file",
+        &json!({"file_path": "../outside/src/lib.rs"}),
+    );
+    assert_eq!(fixture.hook("cursor", &escape), json!({}));
+    assert_eq!(
+        fixture.active_signals("cursor", session, TaskSignalKind::Workspace),
+        vec![expected]
+    );
+    assert!(
+        !fixture
+            .persisted_state_text()
+            .contains(fixture.outside.to_str().unwrap())
+    );
+}
+
+/// Ten undecodable payloads arrived from one real Codex build with an empty `detail`, which said
+/// only that something failed and never which shape failed. The shape is diagnosable without
+/// reading one value: the payload's length and the top-level keys the decoder branches on.
+#[test]
+fn an_undecodable_payload_records_its_shape_and_none_of_its_values() {
+    let fixture = Fixture::new("undecodable payload");
+    TaskRuntime::initialize(&fixture.root).unwrap();
+    let secret = "ghp_undecodable_payload_value_must_not_be_recorded";
+    assert_eq!(
+        fixture.hook(
+            "codex",
+            &json!({
+                "hook_event_name": "SomeUndocumentedEvent",
+                "session_id": "undecodable",
+                "novel field!": secret
+            }),
+        ),
+        json!({})
+    );
+
+    let detail = fixture
+        .hook_event_detail("payload_decode_failed")
+        .expect("an undecodable payload records its shape");
+    assert!(detail.starts_with("bytes="), "{detail}");
+    assert!(detail.contains("hook_event_name"), "{detail}");
+    assert!(detail.contains("session_id"), "{detail}");
+    // The key name is quoted, held to an ASCII identifier alphabet; the value never is.
+    assert!(detail.contains("novel?field?"), "{detail}");
+    assert!(!detail.contains(secret), "{detail}");
+    assert!(detail.chars().count() <= 256, "{detail}");
+    assert!(!fixture.persisted_state_text().contains(secret));
+}
+
+/// `SessionStart` is the only event that renders the activation marker, so a `SessionStart` that
+/// failed open — one busy maintenance lock is enough — left its Session permanently without the
+/// one datum the Agent cannot guess. The lease self-heal already rebuilds authorization from a
+/// later event; it now rebuilds the marker with it, exactly once.
+#[test]
+fn a_session_that_never_started_gets_its_marker_from_the_self_healing_event() {
+    let fixture = Fixture::new("self healed marker");
+    for (agent, session) in [("codex", "healed-codex"), ("cursor", "healed-cursor")] {
+        // The Task exists but the lease does not, so the marker is the only thing this event
+        // owes and the Intent bootstrap reminder cannot compete for the field.
+        fixture.open_task(
+            agent,
+            session,
+            "re-state the marker a SessionStart never sent",
+        );
+        let kind = if agent == "codex" {
+            AgentKind::Codex
+        } else {
+            AgentKind::Cursor
+        };
+        let marker = shared_context_activation_marker(kind, session);
+        let payload = |turn: &str| {
+            if agent == "codex" {
+                fixture.codex_exec(session, turn, &json!(["cargo", "check"]))
+            } else {
+                let mut payload = fixture.cursor_tool(
+                    session,
+                    turn,
+                    "read_file",
+                    &json!({"file_path": "src/lib.rs"}),
+                );
+                payload["cwd"] = json!(fixture.repository);
+                payload
+            }
+        };
+        let expected = if agent == "codex" {
+            json!({"hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": marker,
+            }})
+        } else {
+            json!({"additional_context": marker})
+        };
+
+        // No SessionStart ever reached the Hook: this event builds the lease and owes the marker.
+        assert_eq!(fixture.hook(agent, &payload("heal-1")), expected);
+        // The delivery is recorded in the lease, so the next event stays silent.
+        assert_eq!(fixture.hook(agent, &payload("heal-2")), json!({}));
+    }
+}
+
+/// An unauthorized Session must leave exactly zero local residue, and a self-heal that decides
+/// Disabled is no exception: it delivers no marker and writes no lease bookkeeping.
+#[test]
+fn a_disabled_self_heal_delivers_no_marker_and_writes_nothing() {
+    let fixture = Fixture::new("disabled self heal");
+    let event = |turn: &str| {
+        json!({
+            "session_id": "disabled-heal", "transcript_path": null, "cwd": fixture.outside,
+            "hook_event_name": "PostToolUse", "model": "gpt-5.6-sol",
+            "permission_mode": "default", "turn_id": turn,
+            "tool_name": "shell", "tool_use_id": format!("call-{turn}"),
+            "tool_input": {"command": ["cat", "src/lib.rs"], "workdir": fixture.outside},
+            "tool_response": {"output": "Done!"}
+        })
+    };
+    // The first event records the permanent Disabled lease, exactly as it did before.
+    assert_eq!(fixture.hook("codex", &event("turn-1")), json!({}));
+    let before = fixture.state_bytes();
+    assert_eq!(fixture.hook("codex", &event("turn-2")), json!({}));
+    assert_eq!(fixture.state_bytes(), before);
+    assert!(!fixture.root.join("state/runtime.sqlite").exists());
 }

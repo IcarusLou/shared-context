@@ -174,6 +174,23 @@ struct Published {
     publication_id: String,
 }
 
+/// The exact Codex `PostToolUse` output of an event that had to build its own activation lease.
+///
+/// `SessionStart` is the only event that renders the marker, so a Session whose `SessionStart`
+/// never reached the Hook — or failed open — gets it re-stated on the event that self-heals the
+/// lease instead, once.
+fn self_healed_marker(agent: &str, session_id: &str) -> Value {
+    let kind = if agent == "codex" {
+        AgentKind::Codex
+    } else {
+        AgentKind::Cursor
+    };
+    serde_json::json!({"hookSpecificOutput": {
+        "hookEventName": "PostToolUse",
+        "additionalContext": shared_context_activation_marker(kind, session_id),
+    }})
+}
+
 fn create_space(harness: &Harness, title: &str) -> (String, String) {
     let value = harness.success(&[
         "space",
@@ -825,6 +842,9 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
     }));
     // No SessionStart ever reached the Hook for this Session, so this event both creates
     // the lease and delivers the one Intent bootstrap reminder; it still creates no Task.
+    // The model-visible field carries the re-stated activation marker rather than a second copy
+    // of the reminder, because the marker says everything the reminder says *and* names the
+    // host Session id the Agent has to send back.
     let bootstrap_reminder = "Shared Context: no ActiveTask exists. Call task_intent_update for this substantive task before continuing.";
     assert_eq!(
         before_prompt,
@@ -832,7 +852,10 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
             "systemMessage": bootstrap_reminder,
             "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",
-                "additionalContext": bootstrap_reminder
+                "additionalContext": shared_context_activation_marker(
+                    AgentKind::Codex,
+                    "session-without-prompt",
+                )
             }
         })
     );
@@ -1134,9 +1157,11 @@ fn hook_catalog_mapping_never_discovers_sibling_repositories() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        // No SessionStart reached the Hook, so this event self-heals the lease and re-states
+        // the activation marker `SessionStart` never delivered. It still records no clue.
         assert_eq!(
             serde_json::from_slice::<Value>(&output.stdout).unwrap(),
-            serde_json::json!({})
+            self_healed_marker("codex", session_id)
         );
     };
 
@@ -1281,9 +1306,10 @@ fn cross_parent_workspace_maps_three_catalog_repositories_without_cross_contamin
             }),
         );
         assert!(output.status.success());
+        // The lease is created by this very event, so it also re-states the activation marker.
         assert_eq!(
             serde_json::from_slice::<Value>(&output.stdout).unwrap(),
-            serde_json::json!({})
+            self_healed_marker("codex", &session_id)
         );
         let snapshot = TaskRuntime::initialize(harness.root())
             .unwrap()

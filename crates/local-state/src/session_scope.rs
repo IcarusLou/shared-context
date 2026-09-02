@@ -89,6 +89,12 @@ pub struct AuthorizedSessionScope {
     /// in authorization, Catalog matching, re-resolution, or reclamation semantics.
     #[serde(default, skip_serializing_if = "is_false")]
     pub intent_bootstrap_notified: bool,
+    /// Delivery-only marker for an activation marker this lease re-stated after a `SessionStart`
+    /// failed open without one. Like `intent_bootstrap_notified` it is bookkeeping, not
+    /// authorization: it never participates in the decision, Catalog matching, re-resolution, or
+    /// reclamation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub activation_marker_delivered: bool,
 }
 
 impl AuthorizedSessionScope {
@@ -405,6 +411,37 @@ impl AuthorizedSessionScopeStore {
         &self,
         external_session_locator: &ExternalSessionLocator,
     ) -> Result<bool> {
+        self.try_mark_delivery(external_session_locator, |record| {
+            &mut record.intent_bootstrap_notified
+        })
+    }
+
+    /// Non-blockingly records delivery of the one-shot re-stated activation marker.
+    ///
+    /// This is the marker a lease self-heal owes a Session whose `SessionStart` failed open
+    /// without one. Semantics match [`Self::try_mark_intent_bootstrap_notified`] exactly:
+    /// `true` means this caller recorded the first delivery; `false` means it was already
+    /// recorded or the current decision is Disabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns immediately for lock contention and rejects missing, unsafe, or invalid scope
+    /// state without changing it.
+    pub fn try_mark_activation_marker_delivered(
+        &self,
+        external_session_locator: &ExternalSessionLocator,
+    ) -> Result<bool> {
+        self.try_mark_delivery(external_session_locator, |record| {
+            &mut record.activation_marker_delivered
+        })
+    }
+
+    /// Flips one delivery-only flag of an existing Enabled lease, preserving everything else.
+    fn try_mark_delivery(
+        &self,
+        external_session_locator: &ExternalSessionLocator,
+        select: fn(&mut AuthorizedSessionScope) -> &mut bool,
+    ) -> Result<bool> {
         validate_locator(external_session_locator)?;
         self.with_try_lock(|| {
             let path = self.record_path(external_session_locator);
@@ -412,10 +449,10 @@ impl AuthorizedSessionScopeStore {
                 .read_optional_record(&path)?
                 .ok_or_else(|| invalid("AuthorizedSessionScope is missing"))?;
             verify_record_locator(&record, external_session_locator)?;
-            if !record.decision.is_enabled() || record.intent_bootstrap_notified {
+            if !record.decision.is_enabled() || *select(&mut record) {
                 return Ok(false);
             }
-            record.intent_bootstrap_notified = true;
+            *select(&mut record) = true;
             record.validate()?;
             let bytes = self.serialize_scope(&record)?;
             let usage = self.usage(Some(path.as_path()))?;
@@ -536,6 +573,7 @@ impl AuthorizedSessionScopeStore {
             startup_cwd: canonical_startup_cwd.to_path_buf(),
             issued_at_unix_seconds: unix_seconds(now)?,
             intent_bootstrap_notified: false,
+            activation_marker_delivered: false,
         };
         scope.validate()?;
         Ok(scope)
@@ -1481,6 +1519,53 @@ mod tests {
                 if !scope.intent_bootstrap_notified
                     && scope.decision == AuthorizedSessionScopeDecision::Disabled
         ));
+    }
+
+    /// The re-stated activation marker a lease self-heal owes is delivery bookkeeping, exactly
+    /// like the Intent bootstrap notice: one shot, never on a Disabled lease, and independent of
+    /// the other flag so neither can consume the other.
+    #[test]
+    fn activation_marker_delivery_is_one_shot_and_independent_of_the_bootstrap_notice() {
+        let temporary = tempdir().unwrap();
+        let store = AuthorizedSessionScopeStore::initialize(temporary.path()).unwrap();
+        let (catalog, _, _) = fixture_catalog();
+        let external = locator("marker-delivery");
+        let authorized = authorize(&store, &external, &catalog, MEMBER_CHECKOUT);
+        assert!(!authorized.activation_marker_delivered);
+
+        assert!(
+            store
+                .try_mark_activation_marker_delivered(&external)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .try_mark_activation_marker_delivered(&external)
+                .unwrap()
+        );
+        // Delivering the marker leaves the bootstrap notice still owed, and vice versa.
+        assert!(store.try_mark_intent_bootstrap_notified(&external).unwrap());
+        let scope = match store.try_read(&external).unwrap() {
+            AuthorizedSessionScopeRead::Current(scope) => scope,
+            other @ AuthorizedSessionScopeRead::Missing => {
+                panic!("expected current scope, got {other:?}")
+            }
+        };
+        assert!(scope.activation_marker_delivered && scope.intent_bootstrap_notified);
+        assert_eq!(scope.decision, authorized.decision);
+        assert_eq!(scope.startup_cwd, authorized.startup_cwd);
+        assert_eq!(
+            scope.issued_at_unix_seconds,
+            authorized.issued_at_unix_seconds
+        );
+
+        let disabled = locator("marker-delivery-disabled");
+        authorize(&store, &disabled, &catalog, OUTSIDE);
+        assert!(
+            !store
+                .try_mark_activation_marker_delivered(&disabled)
+                .unwrap()
+        );
     }
 
     #[test]
