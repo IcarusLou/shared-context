@@ -906,6 +906,100 @@ fn a_negated_near_duplicate_statement_is_a_contradiction_not_support() {
     );
 }
 
+/// A same-topic pair whose statement differs only by scattered synonym substitution — a
+/// paraphrase, not a disagreement. Word overlap alone (unigram Jaccard) sits below the
+/// `statement` channel's strong threshold, so before this bound existed every such pair fell
+/// through to `topic && statement_differs` and was sent to `potential_contradiction`: a real
+/// false positive a reviewer had to dismiss (the R2-B pattern — two Claims about the same topic
+/// that complement rather than oppose each other). Bigram overlap tells them apart because a
+/// paraphrase still reproduces most of its neighbor-token pairs.
+#[test]
+fn a_same_topic_paraphrase_is_unresolved_related_not_a_contradiction() {
+    let fixture = fixture();
+    let target_statement = "The bottom bar fallback registers the default comment input box \
+        whenever the candidate list returned by the priority resolver is empty at render time";
+    let target = add_context(
+        &fixture.store,
+        fixture.exact_space,
+        draft(
+            Some("candidate/paraphrase"),
+            target_statement,
+            "Existing rationale for the fallback registration",
+            "paraphrase-domain",
+        ),
+    );
+    fixture.index.synchronize().unwrap();
+
+    let paraphrase = draft(
+        Some("candidate/paraphrase"),
+        "The bottom bar fallback installs the default comment input box whenever the candidate \
+            list produced by the priority resolver is empty during render",
+        "A second Task described the same fallback from its own angle",
+        "paraphrase-domain",
+    );
+    let result = analyze(&fixture, paraphrase, Vec::new(), 8_000, 16);
+    assert_eq!(
+        relation_for(&result, target),
+        CandidateAssessmentRelation::UnresolvedRelated,
+        "a reworded restatement of the same fallback must not read as a contradiction hypothesis"
+    );
+    let assessment = result
+        .analysis
+        .assessments
+        .iter()
+        .find(|assessment| assessment.target == Some(target))
+        .unwrap();
+    assert!(
+        assessment
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("paraphrase")),
+        "reasons should name the paraphrase read: {:?}",
+        assessment.reasons
+    );
+}
+
+/// A same-topic pair that gives an opposite judgment about the same retry policy: one says the
+/// backoff delay doubles after each failure, the other says it stays fixed regardless of
+/// failures. The wording is independently written (low bigram overlap, no shared negation
+/// marker), which is exactly the shape the bigram guard must still forward to a human — tightening
+/// the paraphrase path must never silence a real conflict.
+#[test]
+fn a_same_topic_opposite_judgment_still_reaches_contradiction_review() {
+    let fixture = fixture();
+    let target_statement = "The retry policy on the payment gateway doubles the backoff delay after each failed attempt";
+    let target = add_context(
+        &fixture.store,
+        fixture.exact_space,
+        draft(
+            Some("candidate/retry-policy"),
+            target_statement,
+            "Existing rationale for the exponential backoff",
+            "retry-policy-domain",
+        ),
+    );
+    fixture.index.synchronize().unwrap();
+
+    let opposite = draft(
+        Some("candidate/retry-policy"),
+        "The retry policy on the payment gateway always waits a fixed two second gap between \
+            every attempt regardless of the failure count",
+        "A second Task inspected the same retry policy and reached a different reading",
+        "retry-policy-domain",
+    );
+    let result = analyze(&fixture, opposite, Vec::new(), 8_000, 16);
+    assert_eq!(
+        relation_for(&result, target),
+        CandidateAssessmentRelation::PotentialContradiction,
+        "an independently worded, opposing account of the same retry policy must still reach \
+            human review"
+    );
+    assert_eq!(
+        result.candidate_status,
+        sctx_domain::AutomaticCandidateStatus::PotentialContradictionReview
+    );
+}
+
 /// The shape five of this repository's own nine accepted Contexts were recorded in: one
 /// conclusion, written again from scratch by a later Task in slightly different words, under no
 /// topic key at all. Statement equality on a topic key cannot see it — the topic key is optional
