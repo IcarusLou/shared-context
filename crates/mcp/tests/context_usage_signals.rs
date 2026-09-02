@@ -160,7 +160,8 @@ fn submit_checkpoint(
 ) -> sctx_mcp::TaskCheckpointAcceptedResponse {
     let mut rationale = "The Task confirmed the inherited behavior while extending it".to_owned();
     for context_id in cites {
-        rationale.push_str(&format!(" (building on {context_id})"));
+        use std::fmt::Write as _;
+        write!(rationale, " (building on {context_id})").unwrap();
     }
     task_checkpoint_at_root(
         root,

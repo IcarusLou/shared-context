@@ -2817,8 +2817,7 @@ fn the_fe_weak_token_case_scores_above_every_probe_tolerable_floor() {
     let fusion = association
         .reasons
         .iter()
-        .filter_map(|reason| serde_json::from_str::<TaskAssociationFusionExplanation>(reason).ok())
-        .next()
+        .find_map(|reason| serde_json::from_str::<TaskAssociationFusionExplanation>(reason).ok())
         .expect("every association explains its fusion");
     assert_eq!(
         fusion.fused_score_basis_points, 454,
