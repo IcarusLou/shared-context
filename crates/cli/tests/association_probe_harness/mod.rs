@@ -158,6 +158,28 @@ fn initialize_repository(path: &Path, files: &Value) -> PathBuf {
     fs::canonicalize(path).unwrap()
 }
 
+/// Discards every recorded injection outcome in this installation.
+///
+/// Storing the corpus injects each Context into the Tasks that store the ones after it, and none
+/// of those Tasks builds on what it was handed, so a finished corpus already carries enough
+/// `ignored` rows to move the usage prior. The probes then measure ranking under a history that
+/// only the fixture's own storage order produced. Every probe therefore starts from no history at
+/// all: the usage prior is a real product signal, but it is not what these probes measure, and at
+/// basis-point margins it is loud enough to flip a top-1.
+fn reset_context_usage(home: &Path) {
+    let database = home
+        .join(".shared-context")
+        .join("state")
+        .join("runtime.sqlite");
+    if !database.is_file() {
+        return;
+    }
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute("DELETE FROM context_usage", [])
+        .unwrap();
+}
+
 fn session_start(session: &str, checkout: &Path) -> Value {
     let mut payload = serde_json::from_str::<Vec<Value>>(CODEX_FIXTURE)
         .unwrap()
@@ -330,6 +352,7 @@ pub fn build_harness(fixture: &Value) -> Harness {
         fixture["contexts"].as_array().unwrap().len()
     );
 
+    reset_context_usage(&home);
     Harness {
         _temporary: temporary,
         home,
@@ -410,6 +433,7 @@ fn top_index(harness: &Harness, context_id: Option<&str>) -> Option<u64> {
 pub fn run_probes(harness: &mut Harness, fixture: &Value) -> Vec<ProbeOutcome> {
     let mut outcomes = Vec::new();
     for probe in fixture["probes"].as_array().unwrap() {
+        reset_context_usage(&harness.home);
         let query = probe["query"].as_str().unwrap().to_owned();
         let expected = probe["expected"]
             .as_array()
