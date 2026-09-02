@@ -90,9 +90,6 @@ const DEFAULT_CANDIDATE_REVIEW_TOKEN_BUDGET: usize = 4_096;
 const MIN_CANDIDATE_REVIEW_TOKEN_BUDGET: usize = 512;
 const MAX_CANDIDATE_REVIEW_TOKEN_BUDGET: usize = 32_768;
 const MAX_TASK_CHECKPOINT_BYTES: usize = 64 * 1024;
-/// Normalized statement token Jaccard above which a Checkpoint Claim counts as restating one
-/// injected Context.
-const USAGE_REUSED_SIMILARITY_BASIS_POINTS: u16 = 6_000;
 const MAX_TASK_CHECKPOINT_CLAIMS: usize = 64;
 const MAX_TASK_CHECKPOINT_UNKNOWNS: usize = 64;
 const MAX_TASK_CHECKPOINT_EVIDENCE_PER_CLAIM: usize = 32;
@@ -2213,14 +2210,21 @@ impl Runtime {
         self.record_checkpoint_context_usage(episode.episode.task_id, &claims)
     }
 
-    /// Compares what this Task was given with what it just claimed.
+    /// Compares what this Task was given with what it actually built on.
     ///
-    /// Every Context injected into the Task is matched against the Checkpoint Claims by
-    /// normalized statement token Jaccard. A Claim that restates an injected Context marks it
-    /// `reused`; an injected Context no Claim restates is `ignored`. The model fills in nothing:
-    /// both outcomes are derived from text it wrote for its own purpose. This runs during
-    /// Candidate Build rather than in the ACK because it reads the retrieval index; writing the
-    /// same rows again is a no-op, so a Build rerun and a Checkpoint replay both stay idempotent.
+    /// A Context this Task received counts as `reused` when the Task's own Claims point back at
+    /// it: either a Claim names the `ContextId` in its statement or rationale, or a Claim's
+    /// server-derived Engineering References land on a coordinate that Context already referenced.
+    /// Everything else the Task was handed is `ignored`. Text similarity is deliberately not part
+    /// of the decision: a Claim that merely restates an injected Context is the *worst* kind of
+    /// reuse and is already collapsed as a duplicate, while the reuse worth rewarding produces a
+    /// new conclusion whose wording shares nothing with its input. The model fills in nothing:
+    /// both signals are derived from text and coordinates it wrote for its own purpose.
+    ///
+    /// This runs during Candidate Build, after `derive_episode_claim_references` has placed the
+    /// Claims' path spellings, because the Reference intersection needs those coordinates and the
+    /// ACK deliberately reads no index. Writing the same rows again is a no-op, so a Build rerun
+    /// and a Checkpoint replay both stay idempotent.
     fn record_checkpoint_context_usage(
         &self,
         task_id: TaskId,
@@ -2230,35 +2234,43 @@ impl Runtime {
         if injections.is_empty() {
             return Ok(());
         }
-        let claim_tokens = claims
+        let claim_locators = claims
             .iter()
-            .map(|claim| statement_tokens(&claim.statement))
-            .collect::<Vec<_>>();
+            .flat_map(|claim| claim.engineering_references.iter())
+            .map(reference_draft_locator)
+            .collect::<BTreeSet<_>>();
         let injected = injections
             .iter()
             .map(|injection| (injection.context_id, injection.revision_id))
             .collect::<Vec<_>>();
-        let statements = SearchEngine::new(self.index.clone()).context_statements(&injected)?;
-        let mut records = Vec::new();
-        for injection in &injections {
-            let Some(statement) = statements.get(&injection.context_id) else {
-                continue;
-            };
-            let injected_tokens = statement_tokens(statement);
-            let reused = claim_tokens.iter().any(|claim| {
-                jaccard_basis_points(&injected_tokens, claim)
-                    >= USAGE_REUSED_SIMILARITY_BASIS_POINTS
-            });
-            records.push(ContextUsageRecord {
-                context_id: injection.context_id,
-                task_id,
-                outcome: if reused {
-                    ContextUsageOutcome::Reused
-                } else {
-                    ContextUsageOutcome::Ignored
-                },
-            });
-        }
+        let injected_locators =
+            SearchEngine::new(self.index.clone()).context_reference_locators(&injected)?;
+        let records = injections
+            .iter()
+            .map(|injection| {
+                let named = injection.context_id.to_string();
+                let cited = claims.iter().any(|claim| {
+                    claim.statement.contains(&named) || claim.rationale.contains(&named)
+                });
+                let shares_reference =
+                    injected_locators
+                        .get(&injection.context_id)
+                        .is_some_and(|locators| {
+                            locators
+                                .iter()
+                                .any(|locator| claim_locators.contains(locator))
+                        });
+                ContextUsageRecord {
+                    context_id: injection.context_id,
+                    task_id,
+                    outcome: if cited || shares_reference {
+                        ContextUsageOutcome::Reused
+                    } else {
+                        ContextUsageOutcome::Ignored
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
         self.tasks.record_context_usage(&records)?;
         Ok(())
     }
@@ -5342,6 +5354,14 @@ fn batch_preparation_error(
             error.message()
         ),
     )
+}
+
+/// The Repository-qualified locator spelling one Claim Reference draft resolves to.
+///
+/// It matches [`sctx_search::SearchEngine::context_reference_locators`] exactly, so a Claim's
+/// derived coordinates and an injected Context's recorded coordinates compare as plain strings.
+fn reference_draft_locator(draft: &EngineeringReferenceDraft) -> String {
+    format!("{}:{}", draft.repository_id, draft.locator.path().as_str())
 }
 
 /// Normalized statement tokens used only for Builder deduplication.

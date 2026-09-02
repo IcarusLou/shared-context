@@ -1346,44 +1346,60 @@ impl SearchEngine {
         })
     }
 
-    /// Reads the immutable statements of the named Context revisions.
+    /// Reads the Repository-qualified Engineering Reference locators of the named Context
+    /// revisions.
     ///
-    /// This is the cheap read behind the injection/Claim comparison: it answers "what text did we
-    /// actually hand this Task" from the projection index alone, without reducing the Event log
-    /// into a full domain snapshot. Revisions the index no longer carries are absent.
+    /// This is the cheap read behind the injection/Claim comparison: it answers "which engineering
+    /// coordinates did the Contexts we handed this Task point at" from the projection index alone,
+    /// without reducing the Event log into a full domain snapshot. Each locator is spelled
+    /// `repository_id:path`, the same spelling a compact Pack prints as a location, so a Claim's
+    /// own derived References can be intersected with it directly. Revisions the index no longer
+    /// carries, and revisions carrying no Reference, are absent.
     ///
     /// # Errors
     ///
     /// Returns storage errors propagated by index synchronization and snapshot reads.
-    pub fn context_statements(
+    pub fn context_reference_locators(
         &self,
         revisions: &[(ContextId, RevisionId)],
-    ) -> Result<BTreeMap<ContextId, String>> {
+    ) -> Result<BTreeMap<ContextId, BTreeSet<String>>> {
         let requested = revisions.iter().copied().collect::<BTreeSet<_>>();
         if requested.is_empty() {
             return Ok(BTreeMap::new());
         }
         let snapshot = self.index.query_snapshot(|connection| {
-            let mut statements = BTreeMap::new();
+            let mut locators = BTreeMap::<ContextId, BTreeSet<String>>::new();
             let mut statement = connection
                 .prepare(
-                    "SELECT statement FROM context_revision
+                    "SELECT repository_id, locator_json FROM engineering_reference
                      WHERE context_id = ?1 AND revision_id = ?2",
                 )
-                .map_err(sql_error("prepare Context statement read"))?;
+                .map_err(sql_error("prepare injected Reference locator read"))?;
             for (context_id, revision_id) in &requested {
-                let text = statement
-                    .query_row(
-                        rusqlite::params![context_id.to_string(), revision_id.to_string()],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()
-                    .map_err(sql_error("read Context statement"))?;
-                if let Some(text) = text {
-                    statements.insert(*context_id, text);
+                let mut rows = statement
+                    .query(rusqlite::params![
+                        context_id.to_string(),
+                        revision_id.to_string()
+                    ])
+                    .map_err(sql_error("execute injected Reference locator read"))?;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(sql_error("read injected Reference locator row"))?
+                {
+                    let repository_id: String = row
+                        .get(0)
+                        .map_err(sql_error("read injected Reference Repository"))?;
+                    let locator: LocatorPath = from_json(
+                        &row.get::<_, String>(1)
+                            .map_err(sql_error("read injected Reference locator"))?,
+                    )?;
+                    locators
+                        .entry(*context_id)
+                        .or_default()
+                        .insert(format!("{repository_id}:{}", locator.path));
                 }
             }
-            Ok(statements)
+            Ok(locators)
         })?;
         Ok(snapshot.data)
     }

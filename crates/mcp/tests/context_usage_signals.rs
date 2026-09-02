@@ -3,21 +3,24 @@
 //! Nothing here is Agent-authored: the Checkpoint contract stays the four public fields, and every
 //! usage outcome is derived from text the Agent wrote for its own purpose.
 
-use std::path::Path;
+use std::{fs, path::Path, process::Command};
 
 use sctx_domain::{
-    Applicability, CandidateId, ContextId, ContextKind, ContextRelation, ContextRelationKind,
-    ContextRevisionDraft, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot,
-    OptionalCandidateEdits, PublicationAction, PublicationDraft, ReviewDraft, ReviewVerdict,
-    SpaceId, WorkingIntentSnapshot,
+    Applicability, ArtifactKind, ArtifactLocator, CandidateId, ContextId, ContextKind,
+    ContextRelation, ContextRelationKind, ContextRevisionDraft, EvidenceSnapshotDraft,
+    EvidenceType, ExternalSessionLocator, IntentSnapshot, OptionalCandidateEdits,
+    PublicationAction, PublicationDraft, ReferenceRelation, RepoRelativePath, ReviewDraft,
+    ReviewVerdict, RevisionId, SpaceId, WorkingIntentSnapshot,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
+use sctx_local_state::{AuthorizedSessionScopeStore, UserConfigStore};
 use sctx_mcp::{
     CandidateConfirmInput, CandidateConfirmPrimaryInput, CandidateListInput,
-    ExistingCandidatePrimaryInput, ExpectedRevisionId, TaskBoundary, TaskCheckpointClaimInput,
-    TaskCheckpointEvidenceInput, TaskCheckpointInput, TaskContextReadInput, TaskIntentUpdateInput,
-    build_closed_episode_at_root, candidate_confirm_at_root, candidate_list_at_root,
+    EngineeringReferenceRecordInput, ExistingCandidatePrimaryInput, ExpectedRevisionId,
+    TaskBoundary, TaskCheckpointClaimInput, TaskCheckpointEvidenceInput, TaskCheckpointInput,
+    TaskContextReadInput, TaskIntentUpdateInput, build_closed_episode_at_root,
+    candidate_confirm_at_root, candidate_list_at_root, engineering_reference_record_at_root,
     task_checkpoint_at_root, task_context_readonly_with_detail_at_root, task_intent_update_at_root,
 };
 use sctx_search::ContextPackDetailLevel;
@@ -28,7 +31,7 @@ const REUSED_STATEMENT: &str =
 const IGNORED_STATEMENT: &str = "quorum ledger replay tolerates truncated segments during recovery";
 const GOAL: &str = "quorum ledger replay";
 
-fn accepted_context(root: &Path, statement: &str) -> (SpaceId, ContextId) {
+fn accepted_context(root: &Path, statement: &str) -> (SpaceId, ContextId, RevisionId) {
     let store = GitStore::bootstrap_local(root).unwrap();
     let space = Event::space_created(
         IntentSnapshot {
@@ -106,7 +109,7 @@ fn accepted_context(root: &Path, statement: &str) -> (SpaceId, ContextId) {
             .unwrap(),
         ))
         .unwrap();
-    (space_id, context_id)
+    (space_id, context_id, revision_id)
 }
 
 fn intent_update(root: &Path, session: &str) -> sctx_mcp::TaskIntentUpdateResponse {
@@ -140,8 +143,11 @@ fn intent_update(root: &Path, session: &str) -> sctx_mcp::TaskIntentUpdateRespon
 /// The durable ACK is receipt plus outbox (ADR-0003): it never reads the retrieval index, so the
 /// injection comparison happens where the Build already reconstructs the Claims. Every caller here
 /// wants the state an Agent reaches after `candidate_list`, so the drain belongs in the helper.
-fn checkpoint(root: &Path, session: &str, statement: &str) -> bool {
-    let accepted = submit_checkpoint(root, session, statement);
+///
+/// `cites` are Contexts the Claim names by identity in its own rationale, which is how an Agent
+/// says "I built this on what you gave me" without the server asking it a question.
+fn checkpoint(root: &Path, session: &str, statement: &str, cites: &[ContextId]) -> bool {
+    let accepted = submit_checkpoint(root, session, statement, cites);
     build_closed_episode_at_root(root, accepted.episode_id).unwrap();
     accepted.replayed
 }
@@ -150,7 +156,12 @@ fn submit_checkpoint(
     root: &Path,
     session: &str,
     statement: &str,
+    cites: &[ContextId],
 ) -> sctx_mcp::TaskCheckpointAcceptedResponse {
+    let mut rationale = "The Task confirmed the inherited behavior while extending it".to_owned();
+    for context_id in cites {
+        rationale.push_str(&format!(" (building on {context_id})"));
+    }
     task_checkpoint_at_root(
         root,
         &TaskCheckpointInput {
@@ -159,8 +170,7 @@ fn submit_checkpoint(
             claims: vec![TaskCheckpointClaimInput {
                 context_kind: ContextKind::Validation,
                 statement: statement.to_owned(),
-                rationale: "The Task confirmed the inherited behavior while extending it"
-                    .to_owned(),
+                rationale,
                 conditions: Vec::new(),
                 evidence: vec![TaskCheckpointEvidenceInput {
                     evidence_type: EvidenceType::ExperimentRecord,
@@ -180,8 +190,8 @@ fn submit_checkpoint(
 fn injections_are_recorded_and_one_checkpoint_separates_reuse_from_omission() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("context usage root");
-    let (_, reused) = accepted_context(&root, REUSED_STATEMENT);
-    let (_, ignored) = accepted_context(&root, IGNORED_STATEMENT);
+    let (_, reused, _) = accepted_context(&root, REUSED_STATEMENT);
+    let (_, ignored, _) = accepted_context(&root, IGNORED_STATEMENT);
     let session = "usage-first-task";
 
     let task = intent_update(&root, session);
@@ -215,7 +225,7 @@ fn injections_are_recorded_and_one_checkpoint_separates_reuse_from_omission() {
         "no Checkpoint has compared anything yet"
     );
 
-    assert!(!checkpoint(&root, session, REUSED_STATEMENT));
+    assert!(!checkpoint(&root, session, REUSED_STATEMENT, &[reused]));
     let totals = runtime.context_usage_totals(&[reused, ignored]).unwrap();
     assert_eq!(
         totals[&reused],
@@ -235,7 +245,7 @@ fn injections_are_recorded_and_one_checkpoint_separates_reuse_from_omission() {
     );
 
     // A same-content replay is idempotent: it neither doubles a count nor changes a verdict.
-    assert!(checkpoint(&root, session, REUSED_STATEMENT));
+    assert!(checkpoint(&root, session, REUSED_STATEMENT, &[reused]));
     assert_eq!(
         runtime.context_usage_totals(&[reused, ignored]).unwrap(),
         totals
@@ -264,8 +274,8 @@ fn injections_are_recorded_and_one_checkpoint_separates_reuse_from_omission() {
 fn a_reused_context_outranks_its_sibling_and_says_so_in_the_compact_pack() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("usage prior root");
-    let (_, reused) = accepted_context(&root, REUSED_STATEMENT);
-    let (_, ignored) = accepted_context(&root, IGNORED_STATEMENT);
+    let (_, reused, _) = accepted_context(&root, REUSED_STATEMENT);
+    let (_, ignored, _) = accepted_context(&root, IGNORED_STATEMENT);
 
     let first = intent_update(&root, "usage-prior-first");
     assert!(
@@ -276,7 +286,12 @@ fn a_reused_context_outranks_its_sibling_and_says_so_in_the_compact_pack() {
             .all(|item| item.context.usage.is_empty()),
         "a Context nobody has used yet reports no usage"
     );
-    assert!(!checkpoint(&root, "usage-prior-first", REUSED_STATEMENT));
+    assert!(!checkpoint(
+        &root,
+        "usage-prior-first",
+        REUSED_STATEMENT,
+        &[reused]
+    ));
 
     let second = intent_update(&root, "usage-prior-second");
     let full = second
@@ -334,8 +349,8 @@ fn a_reused_context_outranks_its_sibling_and_says_so_in_the_compact_pack() {
 fn confirming_a_contradiction_refutes_the_injected_context() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("refutation root");
-    let (space_id, reused) = accepted_context(&root, REUSED_STATEMENT);
-    let (_, ignored) = accepted_context(&root, IGNORED_STATEMENT);
+    let (space_id, reused, _) = accepted_context(&root, REUSED_STATEMENT);
+    let (_, ignored, _) = accepted_context(&root, IGNORED_STATEMENT);
     let session = "usage-refutation";
 
     let task = intent_update(&root, session);
@@ -346,7 +361,7 @@ fn confirming_a_contradiction_refutes_the_injected_context() {
             .any(|item| item.context.context_id == reused)
     );
     // The Claim restates the injected Context first, so the refutation has to override a reuse.
-    assert!(!checkpoint(&root, session, REUSED_STATEMENT));
+    assert!(!checkpoint(&root, session, REUSED_STATEMENT, &[reused]));
     let runtime = TaskRuntime::initialize(&root).unwrap();
     assert_eq!(
         runtime.context_usage_totals(&[reused]).unwrap()[&reused],
@@ -419,5 +434,170 @@ fn confirming_a_contradiction_refutes_the_injected_context() {
             refuted: 0,
         },
         "a Context nobody contradicted keeps the Checkpoint verdict"
+    );
+}
+
+/// Restating an injected Context is not reuse (P3).
+///
+/// The comparison this replaces scored normalized statement token Jaccard, so a Claim that
+/// repeated its input scored highest while the Claim that carried a genuinely *new* conclusion
+/// built on that input scored nothing. Both real reuses observed in session `01a060a1` were
+/// recorded `ignored` that way, and the usage prior optimized backwards for as long as it ran. A
+/// restatement now records exactly what it is.
+#[test]
+fn restating_an_injected_context_is_not_reuse() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("restatement root");
+    let (_, reused, _) = accepted_context(&root, REUSED_STATEMENT);
+    let (_, ignored, _) = accepted_context(&root, IGNORED_STATEMENT);
+    let session = "usage-restatement";
+
+    intent_update(&root, session);
+    // The Claim repeats the injected statement word for word and names nothing.
+    assert!(!checkpoint(&root, session, REUSED_STATEMENT, &[]));
+
+    let runtime = TaskRuntime::initialize(&root).unwrap();
+    let totals = runtime.context_usage_totals(&[reused, ignored]).unwrap();
+    assert_eq!(
+        totals[&reused],
+        ContextUsageTotals {
+            reused: 0,
+            ignored: 1,
+            refuted: 0,
+        },
+        "a word-for-word restatement is the weakest possible reuse signal, not the strongest"
+    );
+    assert_eq!(
+        totals[&ignored],
+        ContextUsageTotals {
+            reused: 0,
+            ignored: 1,
+            refuted: 0,
+        }
+    );
+}
+
+fn init_repo(path: &Path, relative: &str, content: &str) {
+    fs::create_dir_all(path).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let target = path.join(relative);
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(target, content).unwrap();
+    for args in [
+        vec!["config", "user.name", "Usage Signals"],
+        vec!["config", "user.email", "usage@example.invalid"],
+        vec!["add", "--", "."],
+        vec!["commit", "-q", "-m", "fixture"],
+    ] {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+}
+
+/// A Claim that lands on a coordinate its injected Context already referenced is reuse, even
+/// though the two statements share no wording at all.
+///
+/// This is the signal that survives the restatement gate: a Task inherits an Engineering fact,
+/// works on the same artifact, and concludes something new about it. The intersection is taken
+/// after Candidate Build has derived the Claim's own path spellings, so both sides are
+/// server-derived coordinates and the model is asked nothing.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_claim_landing_on_the_injected_coordinate_is_reuse_without_shared_wording() {
+    const ARTIFACT: &str = "app/src/ledger/ReplaySegment.kt";
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("reference reuse root");
+    let checkout = temporary.path().join("reference reuse checkout");
+    init_repo(&checkout, ARTIFACT, "// replay segment fixture\n");
+    let checkout = fs::canonicalize(&checkout).unwrap();
+    let (_, reused, reused_revision) = accepted_context(&root, REUSED_STATEMENT);
+    let (_, ignored, _) = accepted_context(&root, IGNORED_STATEMENT);
+    let repository_id = UserConfigStore::initialize(&root)
+        .unwrap()
+        .add_repository("Ledger".parse().unwrap(), std::slice::from_ref(&checkout))
+        .unwrap()
+        .repository
+        .repository_id;
+    engineering_reference_record_at_root(
+        &root,
+        &EngineeringReferenceRecordInput {
+            context_id: reused.to_string(),
+            revision_id: reused_revision.to_string(),
+            repository_id: repository_id.to_string(),
+            artifact_kind: ArtifactKind::File,
+            relation: ReferenceRelation::Implements,
+            locator: ArtifactLocator::File {
+                path: RepoRelativePath::new(ARTIFACT).unwrap(),
+            },
+            supports: "The replay ordering is implemented in this file".to_owned(),
+            limitations: vec!["Synthetic fixture".to_owned()],
+        },
+    )
+    .unwrap();
+
+    let session = "usage-reference-reuse";
+    let locator = ExternalSessionLocator::new("codex", session).unwrap();
+    let catalog = UserConfigStore::open_existing(&root)
+        .unwrap()
+        .repository_catalog_wait()
+        .unwrap();
+    AuthorizedSessionScopeStore::initialize(&root)
+        .unwrap()
+        .try_authorize_missing(&locator, &catalog, &checkout)
+        .unwrap();
+
+    let task = intent_update(&root, session);
+    let injected = task
+        .context
+        .items
+        .iter()
+        .map(|item| item.context.context_id)
+        .collect::<Vec<_>>();
+    assert!(
+        injected.contains(&reused) && injected.contains(&ignored),
+        "{injected:?}"
+    );
+
+    // Nothing in this statement restates either injected Context; it only names the artifact.
+    assert!(!checkpoint(
+        &root,
+        session,
+        "ReplaySegment.kt drops the trailing partial frame before it hands the batch on",
+        &[],
+    ));
+
+    let runtime = TaskRuntime::initialize(&root).unwrap();
+    let totals = runtime.context_usage_totals(&[reused, ignored]).unwrap();
+    assert_eq!(
+        totals[&reused],
+        ContextUsageTotals {
+            reused: 1,
+            ignored: 0,
+            refuted: 0,
+        },
+        "the Claim landed on the coordinate this Context referenced"
+    );
+    assert_eq!(
+        totals[&ignored],
+        ContextUsageTotals {
+            reused: 0,
+            ignored: 1,
+            refuted: 0,
+        },
+        "the sibling shares no coordinate and was never named"
     );
 }
