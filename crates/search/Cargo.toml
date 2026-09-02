@@ -14,6 +14,15 @@ sha2.workspace = true
 sctx-domain.workspace = true
 sctx-engineering-graph.workspace = true
 sctx-index.workspace = true
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray"], optional = true }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"], optional = true }
+ndarray = { version = "0.16", optional = true }
+
+[features]
+default = ["embedding-onnx"]
+# ONNX Runtime is loaded dynamically at run time from the path `[retrieval]` names.
+# Nothing is downloaded at build time and no runtime library is linked.
+embedding-onnx = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
 
 [lints]
 workspace = true

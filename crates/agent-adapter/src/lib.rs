@@ -1871,6 +1871,7 @@ mod tests {
                         evidence_completeness: 1,
                         structured_filter_match: true,
                         matched_via_alias: Vec::new(),
+                        similarity_basis_points: None,
                     },
                     detail: ContextPackDetail::Summary,
                 },

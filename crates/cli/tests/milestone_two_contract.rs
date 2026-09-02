@@ -22,7 +22,8 @@ use sctx_mcp::{
     TaskIntentUpdateInput, task_context_readonly_at_root, task_intent_update_at_root,
 };
 use sctx_search::{
-    ContextPackMode, ContextStatus, SearchEngine, TaskContextRequest, TaskRetrievalPath,
+    ContextPackMode, ContextStatus, SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SearchEngine,
+    TaskContextRequest, TaskRetrievalPath,
 };
 use sctx_task_runtime::TaskRuntime;
 use serde_json::Value;
@@ -548,6 +549,14 @@ fn assert_typed_m2_path(path: &TaskRetrievalPath) {
         TaskRetrievalPath::ExactScope { dimension, value } => {
             assert!(!dimension.is_empty());
             assert!(!value.is_empty());
+        }
+        // Unreachable in this fixture: the semantic channel only exists once `[retrieval]` names
+        // a model, and no M2 contract fixture configures one. It is matched rather than wildcarded
+        // so a future path added to the enum still fails this assertion loudly.
+        TaskRetrievalPath::SemanticSimilarity {
+            similarity_basis_points,
+        } => {
+            assert!(*similarity_basis_points >= SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS);
         }
         TaskRetrievalPath::EngineeringGraph {
             path,
