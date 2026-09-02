@@ -36,12 +36,20 @@ pub mod onnx;
 
 /// Cosine similarity, in basis points, a corpus revision must reach to enter the channel.
 ///
-/// The value is the one ADR-0004 measured rather than a round number chosen for looking like one:
-/// at 0.50 the bge-m3 prototype separated every probe positive from every noise probe on both
-/// fixtures, rejecting 7 of 9 noise queries at zero cost in recall. A lower floor admitted the
-/// noise; a higher one started dropping cross-lingual positives, which are the entire reason the
-/// channel exists.
-pub const SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS: u16 = 5_000;
+/// ADR-0004 set a provisional 0.50 from a two-fixture prototype and explicitly deferred the final
+/// value to the T5a extended set. This is that recalibration, and the extended set moved it:
+/// measured against `fixtures/association/probe-ext-v1.json` with a real bge-m3 export, the
+/// highest-scoring noise query reaches 5095 and the lowest-scoring cross-lingual positive reaches
+/// 5640. A floor of 0.50 therefore admits one noise query outright -- and because a semantic hit
+/// is its own injection eligibility path, admitting it is enough to put a Context in front of an
+/// Agent who asked about something else entirely.
+///
+/// 5200 sits 105 basis points above the noise ceiling and 440 below the lowest positive the
+/// channel exists to rescue. One `multi_hop` probe scores 5160 and is given up deliberately: the
+/// alternative is defending a five-basis-point gap, which is not a threshold but an overfit to one
+/// fixture. Noise rejection is the constraint that does not bend, because a wrong Context nobody
+/// asked for is worse than no Context at all.
+pub const SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS: u16 = 5_200;
 
 /// Most revisions one query may contribute through the semantic channel.
 ///
