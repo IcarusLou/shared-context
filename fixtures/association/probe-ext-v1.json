@@ -1,0 +1,276 @@
+{
+  "fixture_version": "probe-ext-v1",
+  "repository_id": "Platform",
+  "repository_files": {
+    "app/src/main/kotlin/push/PushDedupeWorker.kt": "package push\n\nclass PushDedupeWorker(private val window: DedupeWindow) {\n    fun shouldSuppress(eventId: String, receivedAtMillis: Long): Boolean {\n        return window.hasSeen(eventId, receivedAtMillis)\n    }\n}\n",
+    "app/src/main/kotlin/push/DeviceTokenRegistry.kt": "package push\n\nclass DeviceTokenRegistry(private val store: TokenStore) {\n    fun registerToken(userId: String, token: String) {\n        store.upsert(userId, token)\n    }\n\n    fun activeTokens(userId: String): List<String> = store.tokensFor(userId)\n}\n",
+    "app/src/main/kotlin/push/RetryCounterMetrics.kt": "package push\n\nclass RetryCounterMetrics(private val emitter: MetricEmitter) {\n    fun recordRetry(eventId: String) {\n        emitter.increment(\"push.retry.count\")\n    }\n}\n",
+    "app/src/main/kotlin/upload/ImageUploadCache.kt": "package upload\n\nclass ImageUploadCache(private val maxEntries: Int) {\n    private val entries = LinkedHashMap<String, ByteArray>()\n\n    fun put(key: String, chunk: ByteArray) {\n        if (entries.size >= maxEntries) {\n            entries.remove(entries.keys.first())\n        }\n        entries[key] = chunk\n    }\n}\n",
+    "app/src/main/kotlin/upload/UploadRetryScheduler.kt": "package upload\n\nclass UploadRetryScheduler {\n    fun scheduleRetry(uploadId: String, attempt: Int) {\n        // no backoff applied between attempts\n    }\n}\n",
+    "app/src/main/kotlin/scheduler/CronDispatcher.kt": "package scheduler\n\nclass CronDispatcher(private val zone: String, private val misfirePolicy: MisfirePolicy) {\n    fun nextFireTime(cronExpression: String): Long = 0L\n\n    fun onMisfire(jobId: String) {\n        if (misfirePolicy == MisfirePolicy.IGNORE_MISFIRES) {\n            return\n        }\n    }\n}\n",
+    "app/src/main/kotlin/scheduler/TaskQueueExecutorPool.kt": "package scheduler\n\nclass TaskQueueExecutorPool(private val coreSize: Int) {\n    fun submit(job: Runnable) {\n        // no rejection handler configured\n    }\n}\n",
+    "app/src/main/kotlin/storage/QuotaWatcher.kt": "package storage\n\nclass QuotaWatcher(private val softLimitRatio: Double) {\n    fun checkUsage(usedBytes: Long, totalBytes: Long): Boolean {\n        return usedBytes.toDouble() / totalBytes.toDouble() >= softLimitRatio\n    }\n}\n",
+    "services/ledger/SettlementReconciler.kt": "package ledger\n\nclass SettlementReconciler(private val roundingMode: String) {\n    fun reconcile(lineItems: List<Double>): Double {\n        return lineItems.sumOf { round(it) }\n    }\n\n    private fun round(value: Double): Double = value\n}\n",
+    "services/config/FeatureFlagCache.kt": "package config\n\nclass FeatureFlagCache(private val refreshIntervalSeconds: Int) {\n    fun get(flag: String): Boolean = false\n\n    fun onInvalidationEvent(flag: String) {\n        // ignored until the next timer tick\n    }\n}\n"
+  },
+  "contexts": [
+    {
+      "index": 1,
+      "label": "push-dedupe-window-too-short",
+      "goal": "复查推送重复下发问题",
+      "acceptance_conditions": ["去重窗口配置与重复推送现象被对应上"],
+      "context_kind": "issue",
+      "statement": "推送去重窗口 push.dedupe.window_ms 被设置为 500，短于下游网络重试的典型间隔（1200ms 起），导致同一条通知在重试后被判定为新事件而重复下发；PushDedupeWorker.shouldSuppress 只按 window 内的时间戳去重，超出窗口的重试会被当作全新事件放行。",
+      "rationale": "去重窗口小于重试间隔时，重试请求天然落在窗口之外，去重逻辑对其失效。",
+      "conditions": ["下游重试间隔 >= 1200ms"],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "PushDedupeWorker.kt:44 的 shouldSuppress 只比较 window 内的时间戳；push.dedupe.window_ms 配置为 500。",
+          "limitations": ["synthetic association probe fixture"]
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "label": "push-token-refresh-duplicate",
+      "goal": "复查设备换机后收到两份推送",
+      "acceptance_conditions": ["旧 token 失效时机与重复推送现象被对应上"],
+      "context_kind": "issue",
+      "statement": "用户更换设备登录后，DeviceTokenRegistry 没有让旧设备的 token 立即失效，新旧 token 在过渡期内都保持 active，导致同一条通知同时投递到两台设备，表现为重复推送，但成因是旧 token 未及时下线，与去重窗口长度无关。",
+      "rationale": "activeTokens 换机后仍然包含旧 token，说明失效走的是被动过期而不是登录时的主动撤销。",
+      "conditions": ["用户在 24 小时内更换过登录设备"],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "DeviceTokenRegistry.kt:81 的 activeTokens 在换机后仍然包含旧 token；registerToken 没有撤销旧记录。",
+          "limitations": ["synthetic association probe fixture"]
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "label": "image-cache-eviction-stale",
+      "goal": "复查图片分片上传校验失败",
+      "acceptance_conditions": ["缓存逐出策略与校验失败现象被对应上"],
+      "context_kind": "issue",
+      "statement": "ImageUploadCache 使用固定容量的 LRU 策略（upload.cache.max_entries=200），当并发上传的分片数超过该值时，尚未完成校验的分片会被提前逐出，导致断点续传时找不到已上传分片，校验失败。",
+      "rationale": "put() 在超出 maxEntries 时按插入顺序逐出最早的 entry，不区分该 entry 是否仍处于校验中。",
+      "conditions": ["并发上传分片数超过 200"],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "ImageUploadCache.kt:76 的 put 按插入顺序逐出，不检查分片是否已完成校验。",
+          "limitations": ["synthetic association probe fixture"]
+        }
+      ]
+    },
+    {
+      "index": 4,
+      "label": "image-upload-retry-storm",
+      "goal": "复查图片上传失败后的重试行为",
+      "acceptance_conditions": ["重试退避策略缺失与上传失败率升高被对应上"],
+      "context_kind": "issue",
+      "statement": "UploadRetryScheduler 在上传失败后没有应用退避策略，同一分片失败会立即重试，短时间内产生大量重复请求，压垮上传网关；表现同样是上传失败率升高，但根因是缺少退避而不是缓存逐出。",
+      "rationale": "scheduleRetry 里没有依据 attempt 计算延迟，重试请求几乎是同时发出的。",
+      "conditions": ["单个分片连续失败 3 次以上"],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "UploadRetryScheduler.kt:53 的 scheduleRetry 忽略 attempt 参数，没有指数退避。",
+          "limitations": ["synthetic association probe fixture"]
+        }
+      ]
+    },
+    {
+      "index": 5,
+      "label": "cron-timezone-drift",
+      "goal": "复查跨时区部署下定时任务触发时间偏移",
+      "acceptance_conditions": ["时区取值来源与触发时间偏移被对应上"],
+      "context_kind": "issue",
+      "statement": "CronDispatcher 计算下一次触发时间时使用了服务器本地时区，而不是配置项 scheduler.timezone 指定的时区，跨时区部署时任务会提前或延后触发，偏移量等于服务器时区与配置时区之间的差值。",
+      "rationale": "nextFireTime 没有读取传入的 zone 字段，直接使用运行时默认时区计算。",
+      "conditions": ["服务器本地时区与 scheduler.timezone 配置不一致"],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "CronDispatcher.kt:112 的 nextFireTime 没有使用构造函数传入的 zone。",
+          "limitations": ["synthetic association probe fixture"]
+        }
+      ]
+    },
+    {
+      "index": 6,
+      "label": "cron-catchup-disabled",
+      "goal": "复查服务重启后错过的定时任务是否补跑",
+      "acceptance_conditions": ["misfire 策略与补跑行为被写下来"],
+      "context_kind": "discovery",
+      "statement": "scheduler.misfire_policy 被设置为 IGNORE_MISFIRES，服务重启期间错过的任务不会被补跑；onMisfire 在该策略下直接返回，错过的任务槽位由 TaskQueueExecutorPool 交给下一次正常触发处理，而不是立即补跑。",
+      "rationale": "onMisfire 命中 IGNORE_MISFIRES 分支后立即 return，没有把错过的任务重新提交给线程池。",
+      "conditions": ["misfire_policy=IGNORE_MISFIRES"],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "CronDispatcher.kt:158 的 onMisfire 在 IGNORE_MISFIRES 时直接返回；错过的任务槽位交还 TaskQueueExecutorPool。",
+          "limitations": ["synthetic association probe fixture"]
+        }
+      ]
+    },
+    {
+      "index": 7,
+      "label": "settlement-reconciliation-rounding",
+      "goal": "Review settlement batch rounding drift",
+      "acceptance_conditions": ["the rounding step is traced against the drift it produces"],
+      "context_kind": "issue",
+      "statement": "SettlementReconciler rounds each line item to two decimal places before summing (reconcile() at ledger/SettlementReconciler.kt:203), which produces a systematic one-cent drift on batches larger than 10,000 rows compared to summing the unrounded values first and rounding once at the end.",
+      "rationale": "Rounding every addend independently accumulates truncation error proportional to batch size; a single final rounding does not.",
+      "conditions": ["batch size > 10,000 rows"],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "ledger/SettlementReconciler.kt:203 rounds inside the sumOf loop instead of after it.",
+          "limitations": ["synthetic association probe fixture"]
+        }
+      ]
+    },
+    {
+      "index": 8,
+      "label": "feature-flag-cache-stale-read",
+      "goal": "Review feature flag propagation delay",
+      "acceptance_conditions": ["the refresh path is traced against the invalidation event"],
+      "context_kind": "issue",
+      "statement": "FeatureFlagCache refreshes on a fixed 60-second timer (config/FeatureFlagCache.kt:58) even when the underlying flag store pushes an invalidation event through onInvalidationEvent, so a flag flip can take up to 60 seconds to take effect instead of applying immediately.",
+      "rationale": "onInvalidationEvent is a no-op; the only refresh path is the fixed timer.",
+      "conditions": ["flag store emits an invalidation event"],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "config/FeatureFlagCache.kt:58 onInvalidationEvent ignores the event; refresh only happens on the 60s timer.",
+          "limitations": ["synthetic association probe fixture"]
+        }
+      ]
+    },
+    {
+      "index": 9,
+      "label": "push-dedupe-metric-spike",
+      "goal": "解释 push.retry.count 指标异常尖峰",
+      "acceptance_conditions": ["指标尖峰与去重窗口根因被关联起来"],
+      "context_kind": "discovery",
+      "statement": "在去重异常发生的同一时间窗口，RetryCounterMetrics 记录的 push.retry.count 出现了明显尖峰；该指标本身只统计重试次数，尖峰的根因要追到去重窗口配置过短这一结论。",
+      "rationale": "指标尖峰和去重窗口过短在时间上完全重合，且尖峰规模与超出去重窗口的重试请求数量吻合。",
+      "conditions": ["去重窗口过短的配置仍然生效"],
+      "evidence": [
+        {
+          "evidence_type": "experiment_record",
+          "summary": "RetryCounterMetrics.kt:29 的 recordRetry 在去重异常窗口内被调用次数显著高于日常基线。",
+          "limitations": ["synthetic association probe fixture"]
+        }
+      ]
+    },
+    {
+      "index": 10,
+      "label": "task-queue-executor-starvation",
+      "goal": "复查线程池耗尽对定时任务的影响",
+      "acceptance_conditions": ["线程池饱和行为与静默丢失被写下来"],
+      "context_kind": "issue",
+      "statement": "TaskQueueExecutorPool 的核心线程数固定且没有配置拒绝策略，当补跑任务与正常触发的任务同时提交时，线程池会被占满，后提交的任务既不会执行也不会报错，只是静默丢失。",
+      "rationale": "submit() 没有处理线程池饱和的情况，也没有拒绝策略兜底。",
+      "conditions": ["线程池同时收到补跑任务与正常触发任务"],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "TaskQueueExecutorPool.kt:37 的 submit 没有配置 RejectedExecutionHandler。",
+          "limitations": ["synthetic association probe fixture"]
+        }
+      ]
+    },
+    {
+      "index": 11,
+      "label": "settlement-reconciliation-rounding-fixed",
+      "goal": "Validate the rounding fix for settlement reconciliation",
+      "acceptance_conditions": ["the fixed rounding mode is verified against the original drift fixture"],
+      "context_kind": "validation",
+      "statement": "After ledger.rounding_mode was switched to sum_then_round (ledger/SettlementReconciler.kt:238), the one-cent batch drift no longer reproduces on the same 10,000-row fixture; SettlementReconciler now rounds once after summing instead of per line item.",
+      "rationale": "Re-running the same batch fixture with the new rounding_mode produced totals that matched the unrounded reference sum exactly.",
+      "conditions": ["ledger.rounding_mode=sum_then_round"],
+      "evidence": [
+        {
+          "evidence_type": "experiment_record",
+          "summary": "ledger/SettlementReconciler.kt:238 now rounds after sumOf; regression fixture batch-10000.json matched the reference total.",
+          "limitations": ["synthetic association probe fixture"]
+        }
+      ]
+    },
+    {
+      "index": 12,
+      "label": "storage-quota-watcher",
+      "goal": "复查存储配额告警阈值",
+      "acceptance_conditions": ["多副本场景下的配额计算被写下来"],
+      "context_kind": "discovery",
+      "statement": "QuotaWatcher 的软限值 storage.quota.soft_limit_ratio 被设置为 0.85，checkUsage 用 usedBytes/totalBytes 与该比例比较；由于 totalBytes 在多副本场景下按单副本容量计算，实际触发告警的物理使用率明显低于 85%。",
+      "rationale": "totalBytes 没有乘上副本数，分母偏小，比例被系统性放大。",
+      "conditions": ["存储开启多副本"],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "QuotaWatcher.kt:29 的 checkUsage 使用未乘副本数的 totalBytes 计算比例。",
+          "limitations": ["synthetic association probe fixture"]
+        }
+      ]
+    }
+  ],
+  "relations": [
+    {
+      "from": 9,
+      "to": 1,
+      "kind": "depends_on",
+      "rationale": "push.retry.count 的尖峰是去重窗口过短这一根因的下游可观测现象。",
+      "supports": ["重试计数暴涨可以归因到去重窗口过短"]
+    },
+    {
+      "from": 11,
+      "to": 7,
+      "kind": "supersedes",
+      "rationale": "The sum_then_round fix replaces the earlier per-line rounding behaviour described in the drift context.",
+      "supports": ["the one-cent batch drift is resolved by ledger.rounding_mode=sum_then_round"]
+    }
+  ],
+  "probes": [
+    {"id": "para-01", "category": "paraphrase", "query": "重试请求如果落在去重窗口之外会不会被当成新消息重复下发", "expected": [1]},
+    {"id": "para-02", "category": "paraphrase", "query": "定时任务算出来的下一次触发时间为什么没跟着配置的时区走", "expected": [5]},
+    {"id": "para-03", "category": "paraphrase", "query": "服务重启期间错过的任务会自动补跑吗", "expected": [6]},
+    {"id": "para-04", "category": "paraphrase", "query": "并发上传太多分片会不会把还没校验完的分片挤掉", "expected": [3]},
+    {"id": "para-05", "category": "paraphrase", "query": "上传失败之后是不是立刻又发起了一次请求", "expected": [4]},
+    {"id": "para-06", "category": "paraphrase", "query": "线程池满了之后后来的任务是直接报错还是悄悄没了", "expected": [10]},
+    {"id": "para-07", "category": "paraphrase", "query": "多副本情况下配额告警阈值是不是算得偏松", "expected": [12]},
+    {"id": "para-08", "category": "paraphrase", "query": "旧设备的登录状态什么时候才会被收回", "expected": [2]},
+    {"id": "para-09", "category": "paraphrase", "query": "does the flag cache pick up an invalidation push before its timer fires", "expected": [8]},
+    {"id": "xl-01", "category": "cross_lingual", "query": "why does the same notification get delivered twice after a network retry", "expected": [1]},
+    {"id": "xl-02", "category": "cross_lingual", "query": "cron job fires at the wrong time across timezones", "expected": [5]},
+    {"id": "xl-03", "category": "cross_lingual", "query": "结算批量汇总之后总金额少了一分钱", "expected": [7]},
+    {"id": "xl-04", "category": "cross_lingual", "query": "功能开关的失效推送没有让缓存立刻生效", "expected": [8]},
+    {"id": "xl-05", "category": "cross_lingual", "query": "uploaded chunks get evicted from cache before validation finishes", "expected": [3]},
+    {"id": "dup-01", "category": "near_duplicate", "query": "同一条推送莫名其妙来了两次，是去重时间设太短吗", "expected": [1]},
+    {"id": "dup-02", "category": "near_duplicate", "query": "换了新手机登录之后老收到两份一样的推送", "expected": [2]},
+    {"id": "dup-03", "category": "near_duplicate", "query": "断点续传老是提示分片找不到了", "expected": [3]},
+    {"id": "dup-04", "category": "near_duplicate", "query": "上传接口突然来了一堆重复请求，网关都顶不住了", "expected": [4]},
+    {"id": "dup-05", "category": "near_duplicate", "query": "图片上传最近失败率变高了", "expected": [3, 4]},
+    {"id": "neg-01", "category": "negation", "query": "如果不把去重窗口调大，重复推送问题是不是好不了", "expected": [1]},
+    {"id": "neg-02", "category": "negation", "query": "机型没换、账号也没退登，还会不会同时收到两份推送", "expected": [1]},
+    {"id": "neg-03", "category": "negation", "query": "不是重启导致的任务丢失，会不会是线程池被占满了", "expected": [10]},
+    {"id": "neg-04", "category": "negation", "query": "就算 flag store 没有主动推送失效事件，缓存本来是不是也要等 60 秒", "expected": [8]},
+    {"id": "id-01", "category": "identifier", "query": "PushDedupeWorker", "expected": [1]},
+    {"id": "id-02", "category": "identifier", "query": "DeviceTokenRegistry", "expected": [2]},
+    {"id": "id-03", "category": "identifier", "query": "scheduler.misfire_policy", "expected": [6]},
+    {"id": "id-04", "category": "identifier", "query": "TaskQueueExecutorPool", "expected": [10, 6]},
+    {"id": "id-05", "category": "identifier", "query": "ledger.rounding_mode", "expected": [11]},
+    {"id": "hop-01", "category": "multi_hop", "query": "push.retry.count 指标为什么会突然升高", "expected": [9, 1]},
+    {"id": "hop-02", "category": "multi_hop", "query": "错过的定时任务补跑的时候线程资源够不够用", "expected": [6, 10]},
+    {"id": "hop-03", "category": "multi_hop", "query": "结算金额的舍入问题现在解决了吗", "expected": [11, 7]},
+    {"id": "noise-01", "category": "noise", "query": "手冲咖啡的萃取压力控制", "expected": []},
+    {"id": "noise-02", "category": "noise", "query": "长跑训练计划怎么安排", "expected": []},
+    {"id": "noise-03", "category": "noise", "query": "红酒配餐推荐", "expected": []},
+    {"id": "noise-04", "category": "noise", "query": "自动驾驶感知融合算法", "expected": []},
+    {"id": "noise-05", "category": "noise", "query": "national park camping permit renewal", "expected": []}
+  ]
+}
