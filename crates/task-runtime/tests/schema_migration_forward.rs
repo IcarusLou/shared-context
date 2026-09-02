@@ -1,11 +1,11 @@
-//! `TaskRuntime` schema version 13 -> 14 is an in-place, additive migration: it must add
-//! `hook_event` and advance `PRAGMA user_version` without touching any pre-existing row.
+//! `TaskRuntime` in-place schema upgrades. Version 13 -> 14 is additive (`hook_event`) and must
+//! touch no pre-existing row; version 14 -> 15 discards `context_usage` and must touch nothing
+//! else. The two chain, so a version 13 database reopened today lands on the current version.
 //!
-//! There is no standalone "build a v13 database" helper, so this constructs one honestly: it
-//! opens a fresh (current-schema) `TaskRuntime`, writes representative business rows through
-//! the public API and a hand-crafted `candidate_review` row, then downgrades the file to look
-//! exactly like a real version 13 database by dropping `hook_event` (the only thing v14 added)
-//! and rewinding `PRAGMA user_version`. Reopening it must then migrate forward in place.
+//! There is no standalone "build an old database" helper, so these construct one honestly: they
+//! open a fresh (current-schema) `TaskRuntime`, write representative business rows through the
+//! public API and a hand-crafted `candidate_review` row, then downgrade the file to look exactly
+//! like a real older database and rewind `PRAGMA user_version`. Reopening must migrate forward.
 
 use rusqlite::{Connection, params};
 use sctx_domain::{ExternalSessionLocator, TaskId, WorkingIntentSnapshot};
@@ -30,11 +30,11 @@ fn intent(goal: &str) -> WorkingIntentSnapshot {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn schema_version_13_migrates_in_place_to_14_and_keeps_existing_rows() {
+fn schema_version_13_chains_forward_in_place_and_keeps_existing_rows() {
     let temporary = TempDir::new().unwrap();
     let root = temporary.path().join(".shared-context");
 
-    // 1. A real Task Session, written through the public API against the current (v14) schema.
+    // 1. A real Task Session, written through the public API against the current schema.
     let locator = ExternalSessionLocator::new("codex", "schema-migration-session").unwrap();
     let task_id = TaskId::new();
     let (task_session_id, revision_id) = {
@@ -114,16 +114,19 @@ fn schema_version_13_migrates_in_place_to_14_and_keeps_existing_rows() {
         assert!(!hook_event_exists, "fixture must not have hook_event yet");
     }
 
-    // 4. Reopening must migrate in place: version advances to 14, hook_event now exists, and
-    //    every pre-existing row -- Task Runtime tables written through the public API, and the
-    //    hand-crafted candidate_review row -- is untouched.
+    // 4. Reopening must migrate in place: the version chains all the way to the current one,
+    //    hook_event now exists, and every pre-existing row -- Task Runtime tables written through
+    //    the public API, and the hand-crafted candidate_review row -- is untouched.
     let runtime = TaskRuntime::initialize(&root).unwrap();
 
     let connection = Connection::open(runtime.database_path()).unwrap();
     let version: i64 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 14, "migration must advance user_version to 14");
+    assert_eq!(
+        version, 15,
+        "migration must chain through to the current version"
+    );
     let hook_event_exists: bool = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hook_event')",
@@ -180,4 +183,102 @@ fn schema_version_13_migrates_in_place_to_14_and_keeps_existing_rows() {
     };
     runtime.record_hook_event(&record).unwrap();
     assert_eq!(runtime.recent_hook_events(10).unwrap().len(), 1);
+}
+
+/// Version 14 -> 15 clears every recorded injection outcome and nothing else.
+///
+/// The rows a version 14 installation holds were all decided by statement token similarity, which
+/// credited restatement and recorded real reuse as an omission. They are advisory local ranking
+/// state with no Event behind them and no way to re-derive them, so the migration deletes them.
+/// What was injected into which Task is a fact and survives.
+#[test]
+fn schema_version_14_discards_the_recorded_injection_outcomes_only() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join(".shared-context");
+    let locator = ExternalSessionLocator::new("codex", "usage-migration-session").unwrap();
+    let task_id = TaskId::new();
+    let context_id = sctx_domain::ContextId::new();
+    let revision_id = sctx_domain::RevisionId::new();
+    let intent_revision_id = {
+        let runtime = TaskRuntime::initialize(&root).unwrap();
+        let outcome = runtime
+            .open_or_create(
+                locator.clone(),
+                task_id,
+                intent("survive a usage reset"),
+                Vec::new(),
+            )
+            .unwrap();
+        let intent_revision_id = outcome
+            .snapshot
+            .current_intent_revision()
+            .unwrap()
+            .revision_id;
+        runtime
+            .record_task_injections(
+                task_id,
+                intent_revision_id,
+                sctx_task_runtime::ContextInjectionSource::IntentUpdate,
+                &[sctx_task_runtime::InjectedContext {
+                    context_id,
+                    revision_id,
+                }],
+            )
+            .unwrap();
+        runtime
+            .record_context_usage(&[sctx_task_runtime::ContextUsageRecord {
+                context_id,
+                task_id,
+                outcome: sctx_task_runtime::ContextUsageOutcome::Ignored,
+            }])
+            .unwrap();
+        assert_eq!(
+            runtime.context_usage_totals(&[context_id]).unwrap()[&context_id],
+            sctx_task_runtime::ContextUsageTotals {
+                reused: 0,
+                ignored: 1,
+                refuted: 0,
+            }
+        );
+        intent_revision_id
+    };
+
+    // Version 15 changed no table shape, so rewinding the stamp alone is a faithful version 14.
+    let database_path = root.join("state").join("runtime.sqlite");
+    Connection::open(&database_path)
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 14;")
+        .unwrap();
+
+    let runtime = TaskRuntime::initialize(&root).unwrap();
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap(),
+        15
+    );
+    assert!(
+        runtime
+            .context_usage_totals(&[context_id])
+            .unwrap()
+            .is_empty(),
+        "the migration must discard every outcome the old comparison decided"
+    );
+    let injections = runtime.read_task_injections(task_id).unwrap();
+    assert_eq!(
+        injections.len(),
+        1,
+        "what was injected is a fact and survives"
+    );
+    assert_eq!(injections[0].context_id, context_id);
+    assert_eq!(injections[0].intent_revision_id, intent_revision_id);
+    assert_eq!(
+        runtime
+            .read_snapshot_by_locator(&locator)
+            .unwrap()
+            .unwrap()
+            .task_id,
+        task_id
+    );
 }
