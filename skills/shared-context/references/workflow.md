@@ -192,3 +192,5 @@ Call `repository_scan` only with an explicit bounded path plan. Call `engineerin
 Use `association_explain` for current resolution details and `association_rebuild` only for an explicit rebuild or diagnosis. Graph resolution and text fallback are retrieval evidence paths, not permission to rewrite Context facts.
 
 When a Reference is `missing`, both tools may report a `relocation_candidate` naming the one rename local history states (`from`, `to`, `commit`). That is a diagnosis, not a resolution: nothing is reattached. Confirm the Context still holds at the new path, then record a replacement with `engineering_reference_record`.
+
+When a `candidate_confirm` response carries `graph_rebuild_pending: true`, the Confirmation is stored but the Engineering Graph has not resolved the References it named, so Artifact-anchored retrieval will not find them yet. Tell the user this happened and recommend `sctx association rebuild`, or that they wait for the next `sctx doctor --fix`. The response's `advice` field carries the same sentence. Never treat the pending flag as a failure of the Confirmation and never re-record the References.

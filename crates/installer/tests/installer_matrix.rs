@@ -3229,6 +3229,105 @@ fn next_setup_recovers_an_incomplete_durable_journal_before_reapplying() {
 /// that degradation is the normal path for an installation with no Graph at all. So `doctor` is
 /// where it has to become visible, and the warning has to name the command that repairs it.
 #[test]
+fn doctor_warns_when_the_graph_lags_the_store_rather_than_calling_it_healthy() {
+    // A Confirmation whose rescan did not finish leaves the Graph one Context Tree behind the
+    // Store. It still has snapshots in it, so the old check called that healthy while
+    // Artifact-anchored retrieval quietly missed everything confirmed since.
+    let harness = Harness::new();
+    let installer = harness.installer("1.0.0");
+    installer.setup(&SetupOptions::default()).unwrap();
+
+    let graph_check = |report: &sctx_installer::DoctorReport| {
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "engineering_graph")
+            .expect("doctor always reports the Graph channel")
+            .clone()
+    };
+
+    let oracle = team_sharing_oracle();
+    let checkout = init_team_checkout(&harness.home.join("doctor stale checkout"), &oracle);
+    let repository_id: sctx_domain::RepositoryId = oracle.repository_id.parse().unwrap();
+    UserConfigStore::open_existing(&harness.root)
+        .unwrap()
+        .add_repository(repository_id.clone(), std::slice::from_ref(&checkout))
+        .unwrap();
+    let config_path = harness.root.join("config.toml");
+    let mut text = fs::read_to_string(&config_path).unwrap();
+    text.push_str("\n[engineering]\nauto_scan = false\n");
+    fs::write(&config_path, text).unwrap();
+
+    let (context_id, revision_id) = append_accepted_team_context(&harness.root, &oracle);
+    engineering_reference_record_at_root(
+        &harness.root,
+        &EngineeringReferenceRecordInput {
+            context_id: context_id.to_string(),
+            revision_id: revision_id.to_string(),
+            repository_id: repository_id.to_string(),
+            artifact_kind: ArtifactKind::File,
+            relation: ReferenceRelation::Implements,
+            locator: ArtifactLocator::File {
+                path: RepoRelativePath::new(&oracle.relative_path).unwrap(),
+            },
+            supports: "The doctor fixture inspected the fixed tracked artifact".to_owned(),
+            limitations: vec!["Synthetic doctor fixture".to_owned()],
+        },
+    )
+    .unwrap();
+    association_rebuild_at_root(
+        &harness.root,
+        &AssociationRebuildInput {
+            diagnose_only: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(graph_check(&installer.doctor()).status, CheckStatus::Ok);
+
+    // One more accepted Context, and no rebuild after it.
+    let (later_context, later_revision) = append_accepted_team_context(&harness.root, &oracle);
+    engineering_reference_record_at_root(
+        &harness.root,
+        &EngineeringReferenceRecordInput {
+            context_id: later_context.to_string(),
+            revision_id: later_revision.to_string(),
+            repository_id: repository_id.to_string(),
+            artifact_kind: ArtifactKind::File,
+            relation: ReferenceRelation::Implements,
+            locator: ArtifactLocator::File {
+                path: RepoRelativePath::new(&oracle.relative_path).unwrap(),
+            },
+            supports: "A later Confirmation the Graph has not caught up with".to_owned(),
+            limitations: vec!["Synthetic doctor fixture".to_owned()],
+        },
+    )
+    .unwrap();
+
+    let stale = graph_check(&installer.doctor());
+    assert_eq!(
+        stale.status,
+        CheckStatus::Warning,
+        "a Graph behind the Store is not healthy: {}",
+        stale.message
+    );
+    assert!(stale.message.contains("Context Tree"), "{}", stale.message);
+    assert!(
+        stale.message.contains("sctx association rebuild"),
+        "{}",
+        stale.message
+    );
+
+    association_rebuild_at_root(
+        &harness.root,
+        &AssociationRebuildInput {
+            diagnose_only: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(graph_check(&installer.doctor()).status, CheckStatus::Ok);
+}
+
+#[test]
 fn doctor_names_the_repair_when_engineering_references_resolve_against_no_graph() {
     let harness = Harness::new();
     let installer = harness.installer("1.0.0");
