@@ -4072,13 +4072,16 @@ fn load_active_context_relations(
         {
             continue;
         }
+        let Some(kind) = parse_context_relation_kind(&kind) else {
+            continue;
+        };
         edges.push(IndexedContextRelation {
             source_context_id,
             source_revision_id,
             target_context_id,
             target_revision_id,
             target_space_id: parse_id(&target_space)?,
-            kind: parse_context_relation_kind(&kind)?,
+            kind,
             rationale,
             supports: from_json(&supports)?,
         });
@@ -4086,17 +4089,21 @@ fn load_active_context_relations(
     Ok(edges)
 }
 
-fn parse_context_relation_kind(value: &str) -> Result<ContextRelationKind> {
+/// Parses one indexed Context Relation kind, returning `None` for a kind this reader does not
+/// know. An unknown kind is a row a newer (or drifted) projection wrote, not corrupt data, and
+/// this loader sits on the retrieval main path: erroring here once let a single `supersedes` row
+/// fail every `task_intent_update`/`task_context` of an installation (2026-09-02). The caller
+/// skips the edge instead, so an unreadable Relation costs one hop, never the whole Pack.
+fn parse_context_relation_kind(value: &str) -> Option<ContextRelationKind> {
     match value {
-        "depends_on" => Ok(ContextRelationKind::DependsOn),
-        "constrains" => Ok(ContextRelationKind::Constrains),
-        "implements" => Ok(ContextRelationKind::Implements),
-        "validated_by" => Ok(ContextRelationKind::ValidatedBy),
-        "contradicts" => Ok(ContextRelationKind::Contradicts),
-        "related_to" => Ok(ContextRelationKind::RelatedTo),
-        _ => Err(invariant(format!(
-            "unknown indexed Context Relation kind {value}"
-        ))),
+        "depends_on" => Some(ContextRelationKind::DependsOn),
+        "constrains" => Some(ContextRelationKind::Constrains),
+        "implements" => Some(ContextRelationKind::Implements),
+        "validated_by" => Some(ContextRelationKind::ValidatedBy),
+        "contradicts" => Some(ContextRelationKind::Contradicts),
+        "supersedes" => Some(ContextRelationKind::Supersedes),
+        "related_to" => Some(ContextRelationKind::RelatedTo),
+        _ => None,
     }
 }
 
@@ -5722,10 +5729,12 @@ fn load_compact_relations(
                 &row.get::<_, String>(0)
                     .map_err(sql_error("read Context Relation target"))?,
             )?;
-            let kind = parse_context_relation_kind(
+            let Some(kind) = parse_context_relation_kind(
                 &row.get::<_, String>(1)
                     .map_err(sql_error("read Context Relation kind"))?,
-            )?;
+            ) else {
+                continue;
+            };
             edges.push(CompactContextRelation {
                 kind,
                 target_context_id,
@@ -9291,5 +9300,28 @@ mod tests {
     fn percentile(samples: &[Duration], percentile: usize) -> Duration {
         let index = (samples.len() * percentile).div_ceil(100).saturating_sub(1);
         samples[index]
+    }
+}
+
+#[cfg(test)]
+mod relation_kind_regression {
+    use super::{ContextRelationKind, parse_context_relation_kind};
+
+    #[test]
+    fn every_domain_relation_kind_parses_and_unknown_kinds_are_skipped_not_fatal() {
+        for (spelling, kind) in [
+            ("depends_on", ContextRelationKind::DependsOn),
+            ("constrains", ContextRelationKind::Constrains),
+            ("implements", ContextRelationKind::Implements),
+            ("validated_by", ContextRelationKind::ValidatedBy),
+            ("contradicts", ContextRelationKind::Contradicts),
+            ("supersedes", ContextRelationKind::Supersedes),
+            ("related_to", ContextRelationKind::RelatedTo),
+        ] {
+            assert_eq!(parse_context_relation_kind(spelling), Some(kind));
+            let wire = serde_json::to_string(&kind).unwrap();
+            assert_eq!(wire, format!("\"{spelling}\""), "serde spelling drifted");
+        }
+        assert_eq!(parse_context_relation_kind("erases"), None);
     }
 }
