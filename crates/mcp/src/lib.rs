@@ -65,8 +65,8 @@ use sctx_search::{
     ContextStatus, ContextTtlSettings, ContextUsageCounts, DEFAULT_TASK_MAX_SPACES,
     MAX_CANDIDATE_ANALYSIS_TOKEN_BUDGET, MAX_CANDIDATE_ANALYSIS_TOP_K, MAX_TASK_MAX_SPACES,
     MIN_CANDIDATE_ANALYSIS_TOKEN_BUDGET, MIN_TASK_CONTEXT_TOKEN_BUDGET, ScopeFilter, SearchEngine,
-    SearchFilters, SearchMatchMode, SearchRequest, TaskContextItem, TaskContextRequest,
-    TaskGraphDiagnostic, TaskRetrievalPath, UsagePriorSource,
+    SearchFilters, SearchMatchMode, SearchRequest, SemanticChannelHandle, TaskContextItem,
+    TaskContextRequest, TaskGraphDiagnostic, TaskRetrievalPath, UsagePriorSource,
 };
 use sctx_task_runtime::{
     AgentCheckpointSubmission, CandidateBuildDuplicatePreparation, CandidateBuildItemPreparation,
@@ -1697,6 +1697,9 @@ struct Runtime {
     /// Explicit `[context_ttl]` policy. Contexts past their configured lifetime are `historical`:
     /// still searchable and explainable, never automatically injected.
     context_ttl: ContextTtlSettings,
+    /// The process-lifetime embedding channel, handed down from [`McpServer`] so a Pack built on
+    /// this call can consult it. `None` on every installation without `[retrieval]`.
+    semantic: Option<SemanticChannelHandle>,
     /// Activation scope that authorized this exact call, when the caller is public MCP dispatch.
     /// Internal entry points carry `None` and fall back to the scope recorded for the Episode's
     /// own `ExternalSession`.
@@ -1750,6 +1753,8 @@ struct RuntimeOpenParts {
     context_ttl: Option<ContextTtlSettings>,
     /// Task Runtime already opened by the identity preflight of this call.
     tasks: Option<TaskRuntime>,
+    /// The process-lifetime embedding channel, when one is loading or loaded.
+    semantic: Option<SemanticChannelHandle>,
 }
 
 impl Runtime {
@@ -1791,6 +1796,7 @@ impl Runtime {
             catalog,
             context_ttl,
             session_scope: parts.session_scope,
+            semantic: parts.semantic,
         })
     }
 
@@ -1846,6 +1852,7 @@ impl Runtime {
             input.max_spaces,
             detail_level,
             self.context_ttl,
+            self.semantic.as_ref(),
         )
     }
 
@@ -1891,6 +1898,7 @@ impl Runtime {
             input.max_spaces,
             detail_level,
             self.context_ttl,
+            self.semantic.as_ref(),
         )?;
         Ok(ArtifactFocusQueryResponse {
             resolved_focus,
@@ -1979,6 +1987,7 @@ impl Runtime {
             default_max_spaces(),
             detail_level,
             self.context_ttl,
+            self.semantic.as_ref(),
         )?;
         Ok(TaskIntentUpdateResponse {
             active_signals: active_signal_records(&self.tasks, snapshot.task_session_id)?,
@@ -5858,6 +5867,7 @@ fn build_task_context_response(
     max_spaces: usize,
     detail_level: ContextPackDetailLevel,
     context_ttl: ContextTtlSettings,
+    semantic: Option<&SemanticChannelHandle>,
 ) -> Result<TaskContextResponse> {
     let current = snapshot
         .current_intent_revision()
@@ -5870,11 +5880,14 @@ fn build_task_context_response(
     );
     request.resolved_focus = resolved_focus;
     request.max_spaces = max_spaces;
-    let engine = if let Some(engineering_graph) = engineering_graph {
+    let mut engine = if let Some(engineering_graph) = engineering_graph {
         SearchEngine::with_engineering_graph(index.clone(), engineering_graph.clone())
     } else {
         SearchEngine::new(index.clone())
     };
+    if let Some(semantic) = semantic {
+        engine = engine.with_semantic_channel(Arc::new(semantic.clone()));
+    }
     let pack = engine
         .with_context_ttl(context_ttl)
         .with_usage_prior(Arc::new(RuntimeUsagePrior {
@@ -5929,6 +5942,10 @@ fn build_task_context_response(
     Ok(response)
 }
 
+mod semantic;
+
+pub use semantic::{SemanticWarmReport, warm_semantic_cache_at_root};
+
 /// Stateful MCP request dispatcher for one stdio session.
 pub struct McpServer {
     root: PathBuf,
@@ -5936,6 +5953,12 @@ pub struct McpServer {
     client: ClientKind,
     initialized: bool,
     authorization_linearization_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// The optional embedding channel, loaded once per `serve` process rather than once per call.
+    ///
+    /// It lives here, not on [`Runtime`], because `Runtime` is rebuilt for every tool call and a
+    /// 9--12 second model load per call would be absurd. `None` is the ordinary state: no
+    /// `[retrieval]` table, no channel, no cost.
+    semantic: Option<SemanticChannelHandle>,
 }
 
 #[derive(Clone, Debug)]
@@ -5962,7 +5985,24 @@ impl McpServer {
             client,
             initialized: false,
             authorization_linearization_hook: None,
+            semantic: None,
         })
+    }
+
+    /// Starts the background embedding loader for this process, if `[retrieval]` configures one.
+    ///
+    /// Separate from [`Self::new`] on purpose: `new` is the constructor every test and in-process
+    /// caller uses, and none of them should start a thread that opens a two gigabyte model. Only
+    /// [`serve_stdio`], the long-lived process the ADR budgets the load against, calls this.
+    pub fn start_semantic_channel(&mut self) {
+        self.semantic = semantic::spawn_semantic_loader(&self.root);
+    }
+
+    /// Attaches an already-built embedding channel, for tests that must exercise the fused
+    /// channel without an ONNX model on disk.
+    #[doc(hidden)]
+    pub fn set_semantic_channel(&mut self, semantic: SemanticChannelHandle) {
+        self.semantic = Some(semantic);
     }
 
     /// Installs a controlled test seam immediately after authorization has
@@ -6182,6 +6222,7 @@ impl McpServer {
                 session_scope: Some(authorization.scope.clone()),
                 context_ttl: Some(authorization.context_ttl),
                 tasks: preflight_tasks,
+                semantic: self.semantic.clone(),
             },
         )
         .map_err(|error| runtime_open_failure(&call.name, error))?;
@@ -6541,6 +6582,7 @@ impl McpServer {
 /// external-error category for the CLI boundary.
 pub fn serve_stdio(root: impl AsRef<Path>, client: ClientKind) -> Result<ServeOutcome> {
     let mut server = McpServer::new(root, client)?;
+    server.start_semantic_channel();
     let stdin = io::stdin();
     let stdout = io::stdout();
     server

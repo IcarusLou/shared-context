@@ -479,7 +479,11 @@ fn collect_business_residue(
             .unwrap_or("");
         let is_database = matches!(
             name,
-            "runtime.sqlite" | "index.sqlite" | "engineering.sqlite" | "repository-registry.sqlite"
+            "runtime.sqlite"
+                | "index.sqlite"
+                | "engineering.sqlite"
+                | "repository-registry.sqlite"
+                | "semantic.sqlite"
         );
         let is_payload = matches!(name, "capture" | "report" | "reports");
         if path.is_dir() {
