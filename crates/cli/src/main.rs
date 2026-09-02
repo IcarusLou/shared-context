@@ -19,11 +19,11 @@ use std::{
 
 use args::Options;
 use sctx_agent_adapter::{
-    AgentCapabilities, ArtifactFocusReminderContext, CanonicalAgentAction, CanonicalAgentEvent,
-    CanonicalAgentEventKind, EpisodeFinalizationTrigger, FileAccess, PathHint,
-    ResolvedActivationDecision, ResolvedAgentAction, TaskRuntimeOperation, ToolCategory,
-    ToolOutcome, TrustState, artifact_focus_reminder_file, plan_action_for_activation,
-    render_artifact_focus_reminder,
+    AgentCapabilities, AgentEventContext, ArtifactFocusReminderContext, CanonicalAgentAction,
+    CanonicalAgentEvent, CanonicalAgentEventKind, EpisodeFinalizationTrigger, FileAccess,
+    MAX_SHELL_COMMAND_PATH_CANDIDATES, PathHint, ResolvedActivationDecision, ResolvedAgentAction,
+    TaskRuntimeOperation, ToolCategory, ToolOutcome, TrustState, artifact_focus_reminder_file,
+    plan_action_for_activation, render_artifact_focus_reminder,
 };
 use sctx_domain::{
     Applicability, CandidateReviewStatus, ConflictParticipant, ConflictResolutionDraft,
@@ -971,6 +971,83 @@ fn truncate_hook_detail(text: &str) -> String {
         .collect()
 }
 
+/// Longest single key name one payload fingerprint quotes.
+const MAX_FINGERPRINT_KEY_CHARS: usize = 32;
+
+/// Describes an undecodable Hook payload by its *shape* alone, so the next one is diagnosable.
+///
+/// Ten of these arrived from one real Codex build with an empty `detail`, which said only that
+/// something failed and never which event. The shape is enough to identify it: the payload's
+/// byte length and its top-level key names, which is what the decoder branches on. No value is
+/// read — not a Prompt, not a tool input, not a path, not an identity — because the payload is
+/// untrusted host text and this row is a diagnostic, not a capture. Key names are held to an
+/// ASCII identifier alphabet and truncated, so a hostile payload cannot write arbitrary text
+/// into the diagnostic column.
+fn undecodable_payload_fingerprint(payload: &[u8]) -> String {
+    let bytes = payload.len();
+    let keys = match serde_json::from_slice::<Value>(payload) {
+        Ok(Value::Object(object)) => object
+            .keys()
+            .map(|key| sanitize_fingerprint_key(key))
+            .collect::<Vec<_>>()
+            .join(","),
+        Ok(_) => "<not-an-object>".to_owned(),
+        Err(_) => "<invalid-json>".to_owned(),
+    };
+    truncate_hook_detail(&format!("bytes={bytes} keys=[{keys}]"))
+}
+
+fn sanitize_fingerprint_key(key: &str) -> String {
+    let sanitized = key
+        .chars()
+        .take(MAX_FINGERPRINT_KEY_CHARS)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
+                character
+            } else {
+                '?'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "?".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+/// Decodes one vendor payload, or fails open with a shape fingerprint.
+///
+/// `Ok(None)` means the payload is undecodable. It comes from the Agent host, not the user, so
+/// an unrecognized shape (a new desktop build, say) is a neutral no-op rather than exit 2, which
+/// hosts render as a blocked action. Exit 2 stays reserved for CLI usage errors.
+fn decode_hook_payload(
+    agent: &str,
+    input: &[u8],
+    installed_agent_version: Option<String>,
+    recorder: &HookEventRecorder,
+) -> Result<Option<(CanonicalAgentEvent, Option<String>)>> {
+    let decoded = if agent == "cursor" {
+        sctx_adapter_cursor::decode_hook_input(input)
+            .map(|(event, payload_version)| (event, Some(payload_version)))
+    } else {
+        sctx_adapter_codex::decode_hook_input(input).map(|event| (event, installed_agent_version))
+    };
+    match decoded {
+        Ok(decoded) => Ok(Some(decoded)),
+        Err(error) if error.kind() == ErrorKind::InvalidInput => {
+            eprintln!("sctx hook: ignoring undecodable {agent} payload: {error}");
+            recorder.flush(
+                HookEventDecision::FailOpen,
+                "payload_decode_failed",
+                Some(undecodable_payload_fingerprint(input)),
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn run_hook(args: &[String]) -> Result<()> {
     let options = Options::parse(args, &["--capabilities"])?;
     options.allow_only(
@@ -1018,24 +1095,11 @@ fn run_hook(args: &[String]) -> Result<()> {
     }
 
     let installed_agent_version = options.optional("--agent-version")?.map(str::to_owned);
-    let decoded = if agent == "cursor" {
-        sctx_adapter_cursor::decode_hook_input(&input)
-            .map(|(event, payload_version)| (event, Some(payload_version)))
-    } else {
-        sctx_adapter_codex::decode_hook_input(&input).map(|event| (event, installed_agent_version))
-    };
-    let (event, version) = match decoded {
-        Ok(decoded) => decoded,
-        // The payload comes from the Agent host, not the user. An undecodable shape (for
-        // example a new desktop build) fails open as a neutral no-op instead of exit 2,
-        // which hosts render as a blocked action. Exit 2 stays reserved for CLI usage errors.
-        Err(error) if error.kind() == ErrorKind::InvalidInput => {
-            eprintln!("sctx hook: ignoring undecodable {agent} payload: {error}");
-            recorder.flush(HookEventDecision::FailOpen, "payload_decode_failed", None);
-            println!("{{}}");
-            return Ok(());
-        }
-        Err(error) => return Err(error),
+    let Some((event, version)) =
+        decode_hook_payload(agent, &input, installed_agent_version, &recorder)?
+    else {
+        println!("{{}}");
+        return Ok(());
     };
     recorder.bind(event.kind(), &event.context().session_id);
     let trust = parse_trust(agent, None, true)?;
@@ -1097,8 +1161,13 @@ fn plan_hook_action(
 ) -> CanonicalAgentAction {
     let activation = authorization.activation;
     let action = plan_action_for_activation(event, capabilities, activation);
-    let action = if event.kind() == CanonicalAgentEventKind::PostToolUse
-        && activation == ResolvedActivationDecision::Enabled
+    // Only an event that actually planned a Signal merge has anything to attribute. Shared
+    // Context's own MCP tool calls plan nothing on purpose, and running attribution over them
+    // reported the by-design path as `attribution_failed` on every single call.
+    let action = if matches!(
+        action.task_operation,
+        Some(TaskRuntimeOperation::MergeSignals { .. })
+    ) && activation == ResolvedActivationDecision::Enabled
     {
         authorization
             .scope
@@ -1419,8 +1488,7 @@ fn attribute_post_tool_action(
     else {
         return Err(invariant("PostToolUse attribution received another event"));
     };
-    let attribution =
-        resolve_post_tool_attribution(context.cwd.as_path(), path_hints, scope, catalog)?;
+    let attribution = resolve_post_tool_attribution(context, path_hints, scope, catalog)?;
     let Some(TaskRuntimeOperation::MergeSignals { file_hints, .. }) =
         action.task_operation.as_mut()
     else {
@@ -1436,7 +1504,7 @@ fn attribute_post_tool_action(
 }
 
 fn resolve_post_tool_attribution(
-    event_cwd: &Path,
+    context: &AgentEventContext,
     path_hints: &[PathHint],
     scope: &AuthorizedSessionScope,
     catalog: &RepositoryCatalogSnapshot,
@@ -1444,23 +1512,27 @@ fn resolve_post_tool_attribution(
     if !scope.decision.is_enabled() {
         return Err(invalid("PostToolUse requires an enabled Session scope"));
     }
+    let base = event_base_directory(context);
+    let (candidates, structured): (Vec<&PathHint>, Vec<&PathHint>) = path_hints
+        .iter()
+        .partition(|hint| matches!(hint, PathHint::CommandCandidate(_)));
 
     let mut repository_ids = BTreeSet::new();
     let mut checkout_paths = BTreeSet::new();
     let mut file_hints = BTreeSet::new();
     let mut has_unregistered_path = false;
-    if path_hints.is_empty() {
+    if structured.is_empty() {
         collect_safe_path_attribution(
-            resolve_safe_directory(event_cwd, catalog)?,
+            resolve_safe_directory(&absolute_against(base, &context.cwd), catalog)?,
             &mut repository_ids,
             &mut checkout_paths,
             &mut file_hints,
             &mut has_unregistered_path,
         );
     } else {
-        for hint in path_hints {
+        for hint in structured {
             collect_safe_path_attribution(
-                resolve_structured_path_hint(hint, catalog)?,
+                resolve_structured_path_hint(hint, base, catalog)?,
                 &mut repository_ids,
                 &mut checkout_paths,
                 &mut file_hints,
@@ -1478,25 +1550,98 @@ fn resolve_post_tool_attribution(
     if resolve_registered_workspace(&checkout_paths, scope).is_none() {
         return Ok(HookEventAttribution::NonLocating);
     }
+    extend_command_candidate_files(&candidates, base, catalog, &checkout_paths, &mut file_hints);
     Ok(HookEventAttribution::Registered {
         file_hints: file_hints.into_iter().collect(),
     })
 }
 
+/// The directory a relative path hint is resolved against.
+///
+/// Cursor's desktop build sends some tool events with relative paths, which the absolute-path
+/// rule rejected outright and which therefore contributed no clue at all. The event states where
+/// it ran: its own working directory, or — when the host omitted one — the first Workspace root
+/// it declared. Neither is trusted as a location on its own; the joined path still has to pass
+/// every existing safety check, including the canonical-form check that rejects a join through
+/// a symlinked or non-normalized base.
+fn event_base_directory(context: &AgentEventContext) -> Option<&Path> {
+    if context.cwd.is_absolute() {
+        return Some(context.cwd.as_path());
+    }
+    context
+        .workspace_roots
+        .iter()
+        .find(|root| root.is_absolute())
+        .map(PathBuf::as_path)
+}
+
+/// Joins a relative path onto the event's base directory, leaving an absolute path alone.
+///
+/// A relative path with no usable base stays relative, so [`validate_safe_existing_path`]
+/// rejects it exactly as it did before.
+fn absolute_against(base: Option<&Path>, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    base.map_or_else(|| path.to_path_buf(), |base| base.join(path))
+}
+
+/// Resolves the bounded command-derived candidates of one already attributed event.
+///
+/// Every rule here is a rejection rule, because a candidate is a guess: it must resolve to an
+/// existing, non-symlink, canonical regular file inside a checkout this event *already*
+/// attributed to. Landing in a different registered Repository is not enough — accepting one
+/// could widen the event's Workspace and flip it non-locating, so a guess is never allowed to
+/// change an outcome the structured hints decided. Nothing here fails the event, and at most
+/// [`MAX_SHELL_COMMAND_PATH_CANDIDATES`] candidates are inspected.
+fn extend_command_candidate_files(
+    candidates: &[&PathHint],
+    base: Option<&Path>,
+    catalog: &RepositoryCatalogSnapshot,
+    checkout_paths: &BTreeSet<PathBuf>,
+    file_hints: &mut BTreeSet<PathBuf>,
+) {
+    for hint in candidates.iter().take(MAX_SHELL_COMMAND_PATH_CANDIDATES) {
+        let PathHint::CommandCandidate(path) = hint else {
+            continue;
+        };
+        let path = absolute_against(base, path);
+        let Ok(metadata) = validate_safe_existing_path(&path) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let Ok(Some((_, checkout_path))) = catalog.deepest_checkout_for(&path) else {
+            continue;
+        };
+        if checkout_paths.contains(&checkout_path) {
+            file_hints.insert(path);
+        }
+    }
+}
+
 fn resolve_structured_path_hint(
     hint: &PathHint,
+    base: Option<&Path>,
     catalog: &RepositoryCatalogSnapshot,
 ) -> Result<SafePathAttribution> {
     match hint {
-        PathHint::File(path) => resolve_safe_file(path, catalog),
+        PathHint::File(path) => resolve_safe_file(&absolute_against(base, path), catalog),
         PathHint::Path(path) => {
-            let metadata = validate_safe_existing_path(path)?;
+            let path = absolute_against(base, path);
+            let metadata = validate_safe_existing_path(&path)?;
             if metadata.is_file() {
-                return resolve_safe_file(path, catalog);
+                return resolve_safe_file(&path, catalog);
             }
-            resolve_safe_directory(path, catalog)
+            resolve_safe_directory(&path, catalog)
         }
-        PathHint::WorkingDirectory(path) => resolve_safe_directory(path, catalog),
+        PathHint::WorkingDirectory(path) => {
+            resolve_safe_directory(&absolute_against(base, path), catalog)
+        }
+        PathHint::CommandCandidate(_) => Err(invariant(
+            "a command candidate is never resolved as a structured path hint",
+        )),
         PathHint::Ambiguous => Err(invalid("PostToolUse contains an ambiguous path hint")),
     }
 }
@@ -1698,14 +1843,23 @@ fn resolve_task_operation(
                 });
             };
             let catalog = UserConfigStore::open_existing(&root)?.repository_catalog()?;
-            let signals = normalized_tool_signals(
+            let derived = normalized_tool_signals(
                 &catalog,
                 &file_hints,
                 tool_category,
                 file_access,
                 outcome,
             )?;
-            let signals = unrecorded_signals(&active, signals);
+            // Two different outcomes used to share one reason, and the louder one hid the
+            // quieter: an event that produced no Signal at all was reported as an event whose
+            // Signals were already known. `no_attributable_files` is the honest name for a tool
+            // call that named nothing this Session could place, which is exactly what a Codex
+            // Session full of `exec` calls looked like before command candidates existed.
+            if derived.is_empty() {
+                recorder.note_completion("no_attributable_files", None);
+                return Ok(ResolvedTaskOperation::default());
+            }
+            let signals = unrecorded_signals(&active, derived);
             if signals.is_empty() {
                 recorder.note_completion("signal_write_skipped_nothing_new", None);
                 return Ok(ResolvedTaskOperation::default());
@@ -1998,10 +2152,12 @@ fn normalized_tool_signals(
     // A file the Agent rewrote states far more about this Task than a file it read, so the two
     // become different kinds. Retrieval consumes `Diff` today and `Workspace` is carried for the
     // locating channel that will consume it; both stay clues, never Evidence.
-    let kind = match file_access {
-        Some(FileAccess::Modify) => TaskSignalKind::Diff,
-        Some(FileAccess::Read) => TaskSignalKind::Workspace,
-        None => return Ok(signals),
+    // A shell command names the files it mentioned without ever saying whether it read or
+    // rewrote them, so it settles for the same weaker kind a read gets — never `Diff`.
+    let kind = match (file_access, tool_category) {
+        (Some(FileAccess::Modify), _) => TaskSignalKind::Diff,
+        (Some(FileAccess::Read), _) | (None, ToolCategory::Shell) => TaskSignalKind::Workspace,
+        (None, _) => return Ok(signals),
     };
     for file in file_hints {
         if let Some(content) = repository_relative_signal_content(catalog, file)? {

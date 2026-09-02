@@ -152,12 +152,18 @@ pub struct NormalizedToolUse {
 /// `Ambiguous` records the presence of a recognized path key whose value could not be represented
 /// as one scalar path. Keeping that fact, without retaining the raw value, lets attribution fail
 /// closed instead of silently falling back to the event working directory.
+///
+/// `CommandCandidate` is the one hint that is a *guess*: a bounded token lifted from a shell
+/// command's argument vector that merely looks like a path. It states nothing on its own, so
+/// attribution must resolve it and drop it silently when it does not name a registered file —
+/// never fail the event and never make it non-locating.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "path", rename_all = "snake_case")]
 pub enum PathHint {
     File(PathBuf),
     Path(PathBuf),
     WorkingDirectory(PathBuf),
+    CommandCandidate(PathBuf),
     Ambiguous,
 }
 
@@ -320,7 +326,10 @@ pub fn artifact_focus_reminder_file<'event>(
     }
     let mut files = path_hints.iter().filter_map(|hint| match hint {
         PathHint::File(path) => Some(path.as_path()),
-        PathHint::Path(_) | PathHint::WorkingDirectory(_) | PathHint::Ambiguous => None,
+        PathHint::Path(_)
+        | PathHint::WorkingDirectory(_)
+        | PathHint::CommandCandidate(_)
+        | PathHint::Ambiguous => None,
     });
     let file = files.next()?;
     files.next().is_none().then_some(file)
@@ -658,7 +667,10 @@ fn plan_enabled_action(
                 .iter()
                 .filter_map(|hint| match hint {
                     PathHint::File(path) => Some(path.clone()),
-                    PathHint::Path(_) | PathHint::WorkingDirectory(_) | PathHint::Ambiguous => None,
+                    PathHint::Path(_)
+                    | PathHint::WorkingDirectory(_)
+                    | PathHint::CommandCandidate(_)
+                    | PathHint::Ambiguous => None,
                 })
                 .collect::<Vec<_>>();
             CanonicalAgentAction {
@@ -839,18 +851,24 @@ pub fn normalize_tool_use(tool_name: &str, input: &Value) -> NormalizedToolUse {
         };
     }
     if is_shell_tool(&normalized_name) {
+        let is_test_runner = input
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(is_strict_test_runner_command);
+        let mut path_hints = working_directory_hints_from_tool_input(input);
+        // A test runner already states its own outcome and names no file it worked on, and an
+        // ambiguous working directory means attribution must fail closed rather than widen.
+        if !is_test_runner && !path_hints.contains(&PathHint::Ambiguous) {
+            path_hints.extend(shell_command_path_candidates(input));
+        }
         return NormalizedToolUse {
-            category: if input
-                .get("command")
-                .and_then(Value::as_str)
-                .is_some_and(is_strict_test_runner_command)
-            {
+            category: if is_test_runner {
                 ToolCategory::TestRunner
             } else {
                 ToolCategory::Shell
             },
             file_access: None,
-            path_hints: working_directory_hints_from_tool_input(input),
+            path_hints,
         };
     }
     let file_access = file_access_for_tool(&normalized_name);
@@ -937,30 +955,186 @@ fn is_shared_context_tool(name: &str) -> bool {
         || name.starts_with("mcp__shared_context__")
 }
 
+/// Every byte that makes a command string something a shell would interpret rather than one
+/// simple invocation. A command containing any of them is never split into tokens here.
+fn contains_shell_metacharacter(command: &str) -> bool {
+    command.bytes().any(|byte| {
+        matches!(
+            byte,
+            b'\n'
+                | b'\r'
+                | b'\0'
+                | b'|'
+                | b'&'
+                | b';'
+                | b'<'
+                | b'>'
+                | b'`'
+                | b'$'
+                | b'('
+                | b')'
+                | b'{'
+                | b'}'
+                | b'\''
+                | b'"'
+        )
+    })
+}
+
+/// Longest command string this crate will even look at.
+const MAX_SHELL_COMMAND_BYTES: usize = 1_024;
+
+/// Longest argument vector one shell command may offer for path extraction. A longer one is
+/// abandoned whole rather than scanned, so the hot-path cost stays flat.
+const MAX_SHELL_ARGV_TOKENS: usize = 32;
+
+/// Most file candidates one shell command may contribute.
+///
+/// Every candidate costs the attribution path one `symlink_metadata` plus one `canonicalize`,
+/// so this is the Hook hot path's per-event budget for command-derived paths.
+pub const MAX_SHELL_COMMAND_PATH_CANDIDATES: usize = 4;
+
+/// Lifts the tokens of one shell command that could name a file, without retaining the command.
+///
+/// Codex spends essentially every tool call in `exec`, so a Session that classifies as
+/// [`ToolCategory::Shell`] contributed no file clue at all before this. The extraction is
+/// deliberately a guess and deliberately timid: it reads only the structured `command` field,
+/// abandons anything a shell would interpret, and emits at most
+/// [`MAX_SHELL_COMMAND_PATH_CANDIDATES`] [`PathHint::CommandCandidate`] tokens. Nothing here
+/// decides anything — attribution still has to find each token on disk, inside a registered
+/// checkout this event already resolved to, before it becomes a clue.
+///
+/// Both documented shapes are accepted: an argument vector (Codex sends `command` as a string
+/// array) and one plain command string. A `sh -c`/`bash -lc` wrapper is unwrapped exactly once,
+/// because that is how a model normally phrases an `exec` call; the wrapped script is then held
+/// to the same "no shell metacharacters" rule as any other command string.
+fn shell_command_path_candidates(input: &Value) -> Vec<PathHint> {
+    let Some(argv) = shell_command_argv(input.get("command")) else {
+        return Vec::new();
+    };
+    let argv = unwrap_shell_dash_c(&argv).unwrap_or(argv);
+    // Whatever is left must be one plain invocation. An argument vector that still names a shell
+    // is a script — an unrecognized wrapper shape, or a wrapper inside a wrapper — and its
+    // tokens are shell syntax, not this Task's files.
+    if argv
+        .first()
+        .is_some_and(|program| is_shell_program(program))
+    {
+        return Vec::new();
+    }
+    let mut candidates = Vec::new();
+    // `argv[0]` is the executable, never a file this Task is working on.
+    for token in argv.into_iter().skip(1) {
+        if candidates.len() == MAX_SHELL_COMMAND_PATH_CANDIDATES {
+            break;
+        }
+        if !is_path_candidate_token(&token) {
+            continue;
+        }
+        let hint = PathHint::CommandCandidate(PathBuf::from(token));
+        if !candidates.contains(&hint) {
+            candidates.push(hint);
+        }
+    }
+    candidates
+}
+
+/// Normalizes the structured `command` field into one bounded argument vector.
+///
+/// `None` means "abandon this command": a non-string array element, an over-long vector, a
+/// command string a shell would interpret, or any other JSON shape.
+fn shell_command_argv(command: Option<&Value>) -> Option<Vec<String>> {
+    match command? {
+        Value::Array(items) => {
+            if items.len() > MAX_SHELL_ARGV_TOKENS {
+                return None;
+            }
+            items
+                .iter()
+                .map(|item| item.as_str().map(str::to_owned))
+                .collect()
+        }
+        Value::String(text) => split_simple_command(text),
+        _ => None,
+    }
+}
+
+/// Splits one command string into tokens, or abandons it whole when a shell would interpret it.
+fn split_simple_command(text: &str) -> Option<Vec<String>> {
+    if text.is_empty() || text.len() > MAX_SHELL_COMMAND_BYTES || contains_shell_metacharacter(text)
+    {
+        return None;
+    }
+    let tokens = text
+        .split_ascii_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    (tokens.len() <= MAX_SHELL_ARGV_TOKENS).then_some(tokens)
+}
+
+fn is_shell_program(program: &str) -> bool {
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "sh" | "bash" | "zsh" | "dash"))
+}
+
+/// Unwraps one `sh -c "<script>"` style invocation into the script's own tokens.
+///
+/// Only the exact three-token shape is unwrapped, only for a known shell, only for a flag made
+/// of login/interactive/command letters, and only once — a wrapper inside a wrapper is a script,
+/// not an invocation.
+fn unwrap_shell_dash_c(argv: &[String]) -> Option<Vec<String>> {
+    let [program, flag, script] = argv else {
+        return None;
+    };
+    if !is_shell_program(program) {
+        return None;
+    }
+    let letters = flag.strip_prefix('-')?;
+    if letters.is_empty()
+        || !letters.contains('c')
+        || !letters
+            .bytes()
+            .all(|byte| matches!(byte, b'l' | b'i' | b'c'))
+    {
+        return None;
+    }
+    split_simple_command(script)
+}
+
+/// Whether one argument token is worth asking the filesystem about.
+///
+/// This is a shape test, never a decision: it only has to be cheap and to keep obvious
+/// non-paths (flags, globs, assignments, subcommand words) from spending the event's stat
+/// budget. A token must carry a directory separator or an interior dot, because `cargo`,
+/// `test`, and `run` are subcommands that could otherwise collide with same-named files.
+fn is_path_candidate_token(token: &str) -> bool {
+    if token.is_empty()
+        || token.len() > MAX_SHELL_COMMAND_BYTES
+        || token.starts_with('-')
+        || token.starts_with('~')
+    {
+        return false;
+    }
+    if token.bytes().any(|byte| {
+        byte.is_ascii_whitespace()
+            || byte.is_ascii_control()
+            || matches!(byte, b'*' | b'?' | b'[' | b']' | b'=' | b'!' | b'#' | b'\\')
+    }) || contains_shell_metacharacter(token)
+    {
+        return false;
+    }
+    token.contains('/')
+        || token
+            .rfind('.')
+            .is_some_and(|dot| dot > 0 && dot + 1 < token.len())
+}
+
 fn is_strict_test_runner_command(command: &str) -> bool {
     if command.is_empty()
-        || command.len() > 1_024
-        || command.bytes().any(|byte| {
-            matches!(
-                byte,
-                b'\n'
-                    | b'\r'
-                    | b'\0'
-                    | b'|'
-                    | b'&'
-                    | b';'
-                    | b'<'
-                    | b'>'
-                    | b'`'
-                    | b'$'
-                    | b'('
-                    | b')'
-                    | b'{'
-                    | b'}'
-                    | b'\''
-                    | b'"'
-            )
-        })
+        || command.len() > MAX_SHELL_COMMAND_BYTES
+        || contains_shell_metacharacter(command)
     {
         return false;
     }
@@ -1192,6 +1366,140 @@ mod tests {
         assert_eq!(
             normalize_tool_use("ContractCheck", &Value::Null).category,
             ToolCategory::Other
+        );
+    }
+
+    /// Codex spends essentially every tool call in `exec`, so the only file clue such a Session
+    /// can offer is the one its command names. The extraction is a guess and stays one: it reads
+    /// the structured `command` field, abandons anything a shell would interpret, and emits a
+    /// bounded number of candidate tokens that attribution still has to find on disk.
+    #[test]
+    fn shell_commands_offer_bounded_path_candidates_and_never_carry_command_text() {
+        let candidates = |command: Value| {
+            normalize_tool_use("shell", &serde_json::json!({"command": command}))
+                .path_hints
+                .into_iter()
+                .map(|hint| match hint {
+                    PathHint::CommandCandidate(path) => path.display().to_string(),
+                    other => panic!("unexpected hint {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // One plain invocation, both documented shapes: an argument vector and a command string.
+        assert_eq!(
+            candidates(serde_json::json!(["cat", "crates/cli/src/main.rs"])),
+            vec!["crates/cli/src/main.rs".to_owned()]
+        );
+        assert_eq!(
+            candidates(serde_json::json!(
+                "rg --files-with-matches crates/cli/src/main.rs"
+            )),
+            vec!["crates/cli/src/main.rs".to_owned()]
+        );
+        // The `sh -c` wrapper a model normally phrases an `exec` call with is unwrapped once.
+        assert_eq!(
+            candidates(serde_json::json!([
+                "bash",
+                "-lc",
+                "git diff /repo/src/lib.rs docs/plan.md"
+            ])),
+            vec!["/repo/src/lib.rs".to_owned(), "docs/plan.md".to_owned()]
+        );
+
+        for abandoned in [
+            // Anything a shell would interpret is abandoned whole, wrapped or not.
+            serde_json::json!("cat src/lib.rs | tail -5"),
+            serde_json::json!(["bash", "-lc", "cat src/lib.rs && echo done"]),
+            serde_json::json!(["bash", "-lc", "cat \"src/a b.rs\""]),
+            // A wrapper inside a wrapper is a script, not an invocation.
+            serde_json::json!(["bash", "-lc", "sh -c cat/x.rs"]),
+            // Subcommand words, flags, globs, and assignments are not files.
+            serde_json::json!(["cargo", "test", "-p", "sctx-cli"]),
+            serde_json::json!(["ls", "-la"]),
+            serde_json::json!(["rm", "src/*.rs"]),
+            serde_json::json!(["env", "CONFIG=/repo/a.rs", "run"]),
+            serde_json::json!(["cat", "~/secrets.txt"]),
+            // `argv[0]` is the executable, never a file this Task is working on.
+            serde_json::json!(["./scripts/build.sh"]),
+            // Shapes with no bounded argument vector at all.
+            serde_json::json!({"argv": ["cat", "src/lib.rs"]}),
+            serde_json::json!(["cat", 7]),
+            Value::Array(
+                (0..33)
+                    .map(|index| serde_json::json!(format!("src/unit{index}.rs")))
+                    .collect(),
+            ),
+        ] {
+            assert!(
+                candidates(abandoned.clone()).is_empty(),
+                "{abandoned} must contribute no candidate"
+            );
+        }
+
+        // At most four candidates leave the adapter, because each one costs the attribution
+        // path a `symlink_metadata` and a `canonicalize`.
+        let many = (0..12)
+            .map(|index| serde_json::json!(format!("src/unit{index}.rs")))
+            .collect::<Vec<_>>();
+        let mut argv = vec![serde_json::json!("cat")];
+        argv.extend(many);
+        assert_eq!(
+            candidates(Value::Array(argv)).len(),
+            MAX_SHELL_COMMAND_PATH_CANDIDATES
+        );
+    }
+
+    /// A candidate is a guess, so it may never appear where a decision is made: a test runner
+    /// states its own outcome and names no file, and an ambiguous working directory has to fail
+    /// closed rather than be widened by a guessed path.
+    #[test]
+    fn guessed_paths_never_join_a_test_runner_or_an_ambiguous_working_directory() {
+        let test_runner = normalize_tool_use(
+            "bash",
+            &serde_json::json!({"command": "cargo test src/lib.rs"}),
+        );
+        assert_eq!(test_runner.category, ToolCategory::TestRunner);
+        assert!(test_runner.path_hints.is_empty());
+
+        let ambiguous = normalize_tool_use(
+            "shell",
+            &serde_json::json!({"command": ["cat", "src/lib.rs"], "cwd": ["/a", "/b"]}),
+        );
+        assert_eq!(ambiguous.category, ToolCategory::Shell);
+        assert_eq!(ambiguous.path_hints, vec![PathHint::Ambiguous]);
+
+        // A guessed path never becomes a located file hint by itself; only attribution, which
+        // owns the Catalog and the filesystem, may promote it.
+        let event = CanonicalAgentEvent::PostToolUse {
+            context: AgentEventContext {
+                session_id: "session".to_owned(),
+                cwd: PathBuf::from("/repo"),
+                workspace_roots: vec![PathBuf::from("/repo")],
+            },
+            tool_category: ToolCategory::Shell,
+            tool_use_id: "tool-1".to_owned(),
+            path_hints: vec![PathHint::CommandCandidate(PathBuf::from("src/lib.rs"))],
+            file_access: None,
+            outcome: ToolOutcome::Succeeded,
+        };
+        let action = plan_action_for_activation(
+            &event,
+            &verified_codex_capabilities(),
+            ResolvedActivationDecision::Enabled,
+        );
+        assert!(matches!(
+            action.task_operation,
+            Some(TaskRuntimeOperation::MergeSignals { ref file_hints, .. }) if file_hints.is_empty()
+        ));
+        assert!(
+            artifact_focus_reminder_file(
+                &event,
+                ResolvedActivationDecision::Enabled,
+                &verified_codex_capabilities(),
+                true,
+            )
+            .is_none()
         );
     }
 
