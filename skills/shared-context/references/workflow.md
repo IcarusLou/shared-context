@@ -101,6 +101,8 @@ The caller no longer supplies lifecycle CAS, so `checkpoint_stale` or `checkpoin
 
 Checkpoint creation and same-content replay write no Git facts. They only reserve local durable recovery state.
 
+Candidate drafts come only from `task_checkpoint`; calling `candidate_list` before this Checkpoint's ACK has returned finds nothing to recover yet and is necessarily empty, not a sign the Checkpoint failed. Once the ACK returns, call `candidate_list` yourself and, whenever it comes back non-empty, present the compact rows to the user as a table on your own initiative — do not wait for the user to ask about it.
+
 ## Recover and Review Candidates
 
 Call `candidate_list` for the same external Session after an accepted Checkpoint. The read performs bounded, fair recovery of queued or incomplete Build outboxes before returning Pending Reviews; this recovery may append only the untrusted Candidate submission facts needed for review. Use `candidate_get` for one complete Review and target-aware recovery. An operator can use `candidate build-closed-episode --episode-id <ID>` when an identified closed Episode still needs explicit recovery.
