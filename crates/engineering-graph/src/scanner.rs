@@ -1370,13 +1370,20 @@ fn bounded_git(
     };
     let stdout = stdout_reader
         .join()
-        .map_err(|_| invariant("local Git stdout reader panicked"))?;
+        .map_err(|_| invariant("local Git stdout reader panicked"))?
+        .map_err(io_error("read local Git output"))?;
     let stderr = stderr_reader
         .join()
-        .map_err(|_| invariant("local Git stderr reader panicked"))?;
+        .map_err(|_| invariant("local Git stderr reader panicked"))?
+        .map_or_else(|_| Vec::new(), |captured| captured.bytes);
+    if stdout.capped {
+        return Err(invalid(
+            "local Git snapshot command produced more output than the scanner accepts",
+        ));
+    }
     Ok(BoundedGitRun {
         code,
-        stdout,
+        stdout: stdout.bytes,
         stderr,
     })
 }
@@ -1391,22 +1398,38 @@ fn git_call_timeout(deadline: Option<Instant>) -> Duration {
     })
 }
 
+/// One child stream drained to its end, plus whether the ceiling dropped anything.
+struct CapturedStream {
+    bytes: Vec<u8>,
+    capped: bool,
+}
+
 /// Drains one child stream to its end, keeping at most `limit` bytes.
-fn read_capped(mut stream: impl Read, limit: usize) -> Vec<u8> {
+///
+/// A short read is never treated as the end of the stream: an interrupted read is retried and any
+/// other failure is reported. Half of `git ls-files` looks exactly like a complete answer in which
+/// the missing paths are untracked, and a scan that quietly believed that would report Artifacts
+/// as missing from a Repository that has them.
+fn read_capped(mut stream: impl Read, limit: usize) -> std::io::Result<CapturedStream> {
     let mut kept = Vec::new();
+    let mut capped = false;
     let mut chunk = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
         match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(read) => {
                 let room = limit.saturating_sub(kept.len());
-                if room > 0 {
-                    kept.extend_from_slice(&chunk[..read.min(room)]);
-                }
+                kept.extend_from_slice(&chunk[..read.min(room)]);
+                capped = capped || read > room;
             }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
+            Err(error) => return Err(error),
         }
     }
-    kept
+    Ok(CapturedStream {
+        bytes: kept,
+        capped,
+    })
 }
 
 fn language_for_path(path: &str) -> Option<SourceLanguage> {

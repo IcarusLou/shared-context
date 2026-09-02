@@ -1759,6 +1759,42 @@ fn auto_scan_false_leaves_the_graph_exactly_where_it_was() {
             .is_none(),
         "the opt-out writes no projection at all"
     );
+    // The same opt-out reaches the shape a newly registered Repository was left in before
+    // registration scanned anything: References in the Store, and nothing that ever read the
+    // checkout. The scan `sctx repository add` now runs obeys the switch like everything else.
+    let opted_out = sctx_mcp::repository_first_scan_at_root(&root).unwrap();
+    assert!(
+        !opted_out.attempted,
+        "`auto_scan = false` turns off the registration scan too"
+    );
+    assert!(
+        EngineeringProjectionStore::initialize(&root)
+            .unwrap()
+            .read_snapshot()
+            .unwrap()
+            .is_none()
+    );
+
+    let config_path = root.join("config.toml");
+    let text = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("auto_scan = false", "auto_scan = true");
+    fs::write(&config_path, text).unwrap();
+    let scanned = sctx_mcp::repository_first_scan_at_root(&root).unwrap();
+    assert!(scanned.attempted);
+    assert!(
+        scanned.completed,
+        "a registration scan gets a budget wide enough to finish a first read"
+    );
+    assert_eq!(
+        scanned
+            .rebuild
+            .expect("a completed scan reports what it built")
+            .status_counts
+            .resolved,
+        1,
+        "registration resolves the References that were waiting on the checkout"
+    );
 
     // The explicit command still works, and is what the doctor warning points at.
     let rebuilt = association_rebuild_at_root(
@@ -1771,89 +1807,15 @@ fn auto_scan_false_leaves_the_graph_exactly_where_it_was() {
     assert_eq!(rebuilt.status_counts.resolved, 1);
 }
 
-/// A Repository nothing ever scanned is indistinguishable from a broken one. Registration used to
-/// write a Catalog entry and stop there, so every Reference naming the new checkout resolved
-/// against "Repository is not registered" until somebody happened to run a rebuild by hand.
+/// The same rescan on the path that actually produces most References: a Confirmation whose
+/// Claim named a file. `candidate_confirm` is an interactive MCP call, so it pays the bounded
+/// budget once and reports `graph_rebuild_pending` when it could not.
 #[test]
-fn registering_a_repository_scans_it_once_unless_auto_scan_is_off() {
-    let temporary = TempDir::new().unwrap();
-    let (root, _) = auto_scan_root(&temporary, Some(false));
-
-    // The opt-out reaches the exact shape a newly registered Repository was left in.
-    let opted_out = sctx_mcp::repository_first_scan_at_root(&root).unwrap();
-    assert!(
-        !opted_out.attempted,
-        "`auto_scan = false` turns off the registration scan too"
-    );
-    assert!(
-        EngineeringProjectionStore::initialize(&root)
-            .unwrap()
-            .read_snapshot()
-            .unwrap()
-            .is_none(),
-        "the opt-out writes no projection at all"
-    );
-
-    let config_path = root.join("config.toml");
-    let text = fs::read_to_string(&config_path)
-        .unwrap()
-        .replace("auto_scan = false", "auto_scan = true");
-    fs::write(&config_path, text).unwrap();
-
-    let scanned = sctx_mcp::repository_first_scan_at_root(&root).unwrap();
-    assert!(scanned.attempted);
-    assert!(
-        scanned.completed,
-        "a registration scan gets a budget wide enough to finish a first read"
-    );
-    let rebuild = scanned
-        .rebuild
-        .expect("a completed scan reports what it built");
-    assert_eq!(
-        rebuild.status_counts.resolved, 1,
-        "registration resolves the References that were waiting on the checkout"
-    );
-    assert!(
-        EngineeringProjectionStore::initialize(&root)
-            .unwrap()
-            .read_snapshot()
-            .unwrap()
-            .is_some_and(|snapshot| !snapshot.projection.contexts.is_empty()),
-        "the registration scan is what makes the Graph exist"
-    );
-}
-
-/// The pending flag was reported honestly and then read by nobody: a caller that does not know
-/// what a pending rebuild costs has no reason to mention it. The sentence travels with the flag,
-/// so the fix sits in the same place as the fact.
-#[test]
-fn a_pending_graph_rebuild_carries_the_advice_that_says_what_to_do_about_it() {
-    let temporary = TempDir::new().unwrap();
-    // The explicit opt-out is the deterministic way to reach a pending Graph without racing a clock.
-    let (_, confirmed) =
-        confirm_a_named_engineering_reference(&temporary, "pending advice", Some(false));
-
-    assert!(
-        confirmed.graph_rebuild_pending,
-        "the opt-out leaves the Graph behind the Store"
-    );
-    let advice = confirmed
-        .advice
-        .expect("a pending rebuild must say what to do about it");
-    assert!(advice.contains("sctx association rebuild"), "{advice}");
-    assert!(advice.contains("Tell the user"), "{advice}");
-}
-
-/// Drives one Confirmation whose Claim names a source file, with `[engineering] auto_scan` left at
-/// its default or pinned, and hands back the installation and the Confirmation response.
 #[allow(clippy::too_many_lines)]
-fn confirm_a_named_engineering_reference(
-    temporary: &TempDir,
-    name: &str,
-    auto_scan: Option<bool>,
-) -> (std::path::PathBuf, sctx_mcp::CandidateConfirmResponse) {
-    let root = temporary.path().join(format!("{name} root"));
-    let checkout = temporary.path().join(format!("{name} checkout"));
+fn a_confirmation_that_names_engineering_references_rescans_within_its_budget() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("confirm scan root");
+    let checkout = temporary.path().join("confirm scan checkout");
     init_repo(
         &checkout,
         &[("app/src/anchor/ProductAnchorAssem.kt", "// fixture\n")],
@@ -1867,16 +1829,6 @@ fn confirm_a_named_engineering_reference(
             std::slice::from_ref(&checkout),
         )
         .unwrap();
-    if let Some(auto_scan) = auto_scan {
-        let config_path = root.join("config.toml");
-        let mut text = fs::read_to_string(&config_path).unwrap();
-        text.push_str(if auto_scan {
-            "\n[engineering]\nauto_scan = true\n"
-        } else {
-            "\n[engineering]\nauto_scan = false\n"
-        });
-        fs::write(&config_path, text).unwrap();
-    }
     let session = "confirm-scan";
     let locator = ExternalSessionLocator::new("codex", session).unwrap();
     let catalog = UserConfigStore::open_existing(&root)
@@ -1982,16 +1934,6 @@ fn confirm_a_named_engineering_reference(
         },
     )
     .unwrap();
-    (root, confirmed)
-}
-
-/// The rescan on the path that actually produces most References: a Confirmation whose Claim
-/// named a file. `candidate_confirm` is an interactive MCP call, so it pays the bounded budget
-/// once and reports `graph_rebuild_pending` when it could not.
-#[test]
-fn a_confirmation_that_names_engineering_references_rescans_within_its_budget() {
-    let temporary = TempDir::new().unwrap();
-    let (root, confirmed) = confirm_a_named_engineering_reference(&temporary, "confirm scan", None);
     assert!(
         !confirmed.graph_rebuild_pending,
         "the bounded rescan finished inside the Confirmation"
@@ -2022,6 +1964,93 @@ fn a_confirmation_that_names_engineering_references_rescans_within_its_budget() 
         "{:#?}",
         snapshot.projection.references
     );
+
+    // The pending flag was reported honestly and then read by nobody: a caller that does not know
+    // what a pending rebuild costs has no reason to mention it. The sentence travels with the
+    // flag, so the fix sits in the same place as the fact. The explicit opt-out is the
+    // deterministic way to reach the pending branch without racing a clock.
+    let config_path = root.join("config.toml");
+    let mut text = fs::read_to_string(&config_path).unwrap();
+    text.push_str("\n[engineering]\nauto_scan = false\n");
+    fs::write(&config_path, text).unwrap();
+    let pending = confirm_next_candidate(&root, session, &task, space.space_id);
+    assert!(
+        pending.graph_rebuild_pending,
+        "the opt-out leaves the Graph behind the Store"
+    );
+    let advice = pending
+        .advice
+        .expect("a pending rebuild must say what to do about it");
+    assert!(advice.contains("sctx association rebuild"), "{advice}");
+    assert!(advice.contains("Tell the user"), "{advice}");
+}
+
+/// Checkpoints one more Claim naming the same file and confirms the Candidate it produces.
+fn confirm_next_candidate(
+    root: &std::path::Path,
+    session: &str,
+    task: &sctx_mcp::TaskIntentUpdateResponse,
+    space_id: sctx_domain::SpaceId,
+) -> sctx_mcp::CandidateConfirmResponse {
+    let accepted = sctx_mcp::task_checkpoint_at_root(
+        root,
+        &sctx_mcp::TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            claims: vec![sctx_mcp::TaskCheckpointClaimInput {
+                context_kind: ContextKind::Issue,
+                statement: "ProductAnchorAssem.kt:311 drops the navigation callback".to_owned(),
+                rationale: "The dropped callback observably diverges from the baseline".to_owned(),
+                conditions: vec!["live entry service is absent".to_owned()],
+                evidence: vec![sctx_mcp::TaskCheckpointEvidenceInput {
+                    evidence_type: EvidenceType::SourceSnapshot,
+                    summary: "ProductAnchorAssem.kt:311 never dispatches".to_owned(),
+                    limitations: Vec::new(),
+                }],
+            }],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap()
+    .into_accepted()
+    .expect("a nonempty Checkpoint is accepted");
+    sctx_mcp::build_closed_episode_at_root(root, accepted.episode_id).unwrap();
+    let listed = sctx_mcp::candidate_list_at_root(
+        root,
+        &sctx_mcp::CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            status: sctx_domain::CandidateReviewStatus::Pending,
+            limit: 100,
+            cursor: None,
+            token_budget: 32_768,
+        },
+    )
+    .unwrap();
+    let review = listed
+        .reviews
+        .first()
+        .expect("the second Checkpoint produced a Candidate");
+    sctx_mcp::candidate_confirm_at_root(
+        root,
+        &sctx_mcp::CandidateConfirmInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: task.context.task_id.to_string(),
+            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+            candidate_id: review.0.candidate_id.to_string(),
+            expected_review_version: review.0.review_version,
+            primary: sctx_mcp::CandidateConfirmPrimaryInput::Existing(
+                sctx_mcp::ExistingCandidatePrimaryInput {
+                    existing_space_id: space_id.to_string(),
+                },
+            ),
+            related_space_ids: Vec::new(),
+            edits: sctx_domain::OptionalCandidateEdits::default(),
+        },
+    )
+    .unwrap()
 }
 
 /// Resolution never guesses after a move, and that is exactly why the move has to be reported.
