@@ -7385,7 +7385,7 @@ fn tools_list() -> Value {
     json!({"tools": [
         tool_schema(
             "task_intent_update",
-            "CAS-record a lightweight Working Intent snapshot, optionally start a new explicit Task, and return its TaskContextPack. detail_level defaults to compact, which returns only the inheritable Context fields; pass full for retrieval paths, match reasons, and the automatic query token explanation.",
+            "CAS-record a lightweight Working Intent snapshot, optionally start a new explicit Task, and return its TaskContextPack. detail_level defaults to compact, which returns only the inheritable Context fields; pass full for retrieval paths, match reasons, and the automatic query token explanation. Write goal, current_direction and in_scope in Chinese, the knowledge base language, keeping identifiers, paths, commands and error codes in their original spelling. current_direction and in_scope also feed the retrieval query, so fill them whenever you already know them; never invent either one.",
             task_intent_update_schema()
         ),
         tool_schema(
@@ -7400,7 +7400,7 @@ fn tools_list() -> Value {
         ),
         tool_schema(
             "task_checkpoint",
-            "Finalize one content-addressed Agent Checkpoint for the current ActiveTask and Intent. Submit focused Claims with self-contained Evidence summaries; the server durably queues untrusted Candidate drafts for bounded recovery by Candidate review reads. Empty Claims and Unknowns are a successful no-op.",
+            "Finalize one content-addressed Agent Checkpoint for the current ActiveTask and Intent. Submit focused Claims with self-contained Evidence summaries; the server durably queues untrusted Candidate drafts for bounded recovery by Candidate review reads. Empty Claims and Unknowns are a successful no-op. Once the ACK reports a queued Candidate Build, call candidate_list next and present the Pending Reviews to the user.",
             task_checkpoint_schema()
         ),
         tool_schema(
@@ -7480,7 +7480,7 @@ fn tools_list() -> Value {
         ),
         tool_schema(
             "candidate_list",
-            "List untrusted automatic Candidate Reviews for the exact ActiveTask; Pending is the default lifecycle filter. detail_level defaults to compact, which returns one triage row per Candidate; pass full for the whole untrusted drafts, or read one with candidate_get.",
+            "List untrusted automatic Candidate Reviews for the exact ActiveTask; Pending is the default lifecycle filter. detail_level defaults to compact, which returns one triage row per Candidate; pass full for the whole untrusted drafts, or read one with candidate_get. Candidates come only from task_checkpoint, so calling this before a Checkpoint ACK has nothing to recover and is necessarily empty, not a failure.",
             candidate_list_schema()
         ),
         tool_schema(
@@ -7835,17 +7835,43 @@ fn task_checkpoint_schema() -> Value {
 /// well as in the marker and the Skill gate.
 const EXTERNAL_SESSION_ID_DESCRIPTION: &str = "external_session_id: copy verbatim from the `<shared-context-active>` marker (Codex: also $CODEX_SESSION_ID; Cursor: the conversation id); never invent or derive one.";
 
+/// The one sentence appended to every tool that decides a Candidate Review's fate.
+///
+/// A Candidate is an untrusted draft, so the decision is the user's. That rule already
+/// ships in the post-Checkpoint ACK notice, and a real Cursor session showed the ACK
+/// working while the Skill carrying the same rule was never delivered at all — so the
+/// rule is restated on the three tools that act on a Review, in the ACK's own wording so
+/// a model never sees two versions of it.
+const CANDIDATE_REVIEW_DECISION_DESCRIPTION: &str = "Present the Review to the user as a table and ask for their decision; never confirm or discard on your own inference.";
+
+/// The tools whose call *is* the decision on one Candidate Review.
+///
+/// `candidate_list` is deliberately absent: listing is triage, not a decision, and it
+/// already carries its own ordering rule.
+fn decides_candidate_review(name: &str) -> bool {
+    matches!(
+        name,
+        "candidate_get" | "candidate_discard" | "candidate_confirm"
+    )
+}
+
 /// Declares one public tool, appending the `external_session_id` provenance sentence to
-/// every tool that takes one. Appending it here instead of in each literal is what keeps
-/// a newly added tool from silently shipping without it. The schema itself is untouched.
+/// every tool that takes one, and the Candidate Review decision rule to every tool that
+/// acts on a Review. Appending them here instead of in each literal is what keeps a newly
+/// added tool from silently shipping without them. The schema itself is untouched.
 fn tool_schema(name: &str, description: &str, input_schema: Value) -> Value {
     let requires_external_session_id = input_schema["required"]
         .as_array()
         .is_some_and(|required| required.iter().any(|field| field == "external_session_id"));
+    let mut description = description.to_owned();
+    if decides_candidate_review(name) {
+        description.push(' ');
+        description.push_str(CANDIDATE_REVIEW_DECISION_DESCRIPTION);
+    }
     let description = if requires_external_session_id {
         format!("{description} {EXTERNAL_SESSION_ID_DESCRIPTION}")
     } else {
-        description.to_owned()
+        description
     };
     let mut tool = Map::new();
     tool.insert("name".to_owned(), Value::String(name.to_owned()));
