@@ -351,7 +351,14 @@ fn the_embedding_channel_lifts_paraphrase_and_cross_lingual_without_costing_iden
     );
 
     // 4. Latency, with the model already loaded.
-    assert_latency_budgets(&harness, &semantic_engine, &fixture, &lexical, &fused, total);
+    assert_latency_budgets(
+        &harness,
+        &semantic_engine,
+        &fixture,
+        &lexical,
+        &fused,
+        total,
+    );
 }
 
 /// Grades the two latency clauses ADR-0004 was split into on 2026-09-03.
