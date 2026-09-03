@@ -3,7 +3,7 @@
 //! `probe-ext-v1` adds 12 corpus Contexts across six unrelated domains (push
 //! notification dedupe/token refresh, image upload cache/retry, cron
 //! scheduler timezone/misfire, English-language settlement reconciliation,
-//! English-language feature-flag cache, storage quota) and 36 probes, each
+//! English-language feature-flag cache, storage quota) and 39 probes, each
 //! tagged with a `category`:
 //!
 //! * `paraphrase` (9) -- same-language synonym rewrites that avoid the
@@ -24,6 +24,13 @@
 //!   edge (`TaskQueueExecutorPool` in both the misfire discovery and the
 //!   starvation issue). Each lists both plausible Contexts as an allowed
 //!   set, since only the current lexical channel is under test.
+//! * `long_intent` (3) -- queries 254--356 characters long, built in the
+//!   shape `semantic_query_text` produces from a Working Intent (goal, then
+//!   current direction, then in-scope and out-of-scope lists). Added by T5d:
+//!   every other category is 15--40 characters, which is nothing like what
+//!   an automatic retrieval submits, and calibrating the embedding channel's
+//!   encode budget against those short probes is what made the channel
+//!   report `embedding_unavailable` on every query in every real session.
 //! * `noise` (5) -- topics with zero lexical overlap with any of the three
 //!   probe fixtures; `assert_no_noise` requires these to return nothing on
 //!   both entry points.
@@ -42,21 +49,24 @@
 //! this fixture, so future channel changes can be graded against the
 //! per-category table this test prints on every run.
 //!
-//! Measured on 2026-09-02, three consecutive runs against
-//! `feat/association-repair @ 5b422c1` (lexical channel only, no embedding
-//! work landed). The three runs were bit-for-bit identical -- this retrieval
-//! path is deterministic, no flakiness was observed:
+//! Re-measured on 2026-09-03 after T5d added the `long_intent` category,
+//! which takes the fixture from 36 probes to 39. Three consecutive runs,
+//! lexical channel only (the embedding channel is off in this suite), all
+//! three bit-for-bit identical -- this retrieval path is deterministic and
+//! no flakiness was observed:
 //!
-//! | run | search hits / 36 | `task_intent_update` hits / 36 |
+//! | run | search hits / 39 | `task_intent_update` hits / 39 |
 //! |-----|-------------------|---------------------------------|
-//! |  1  | 27                | 26                              |
-//! |  2  | 27                | 26                              |
-//! |  3  | 27                | 26                              |
+//! |  1  | 30                | 27                              |
+//! |  2  | 30                | 27                              |
+//! |  3  | 30                | 27                              |
 //!
-//! Worst (= only) observed: search 27/36, `task_intent_update` 26/36. The
+//! Worst (= only) observed: search 30/39, `task_intent_update` 27/39. The
 //! blocking thresholds below are pinned to those values -- they only catch a
 //! regression, they do not encode a progress target. Do not raise them
-//! without re-measuring; do not lower them without recording why.
+//! without re-measuring; do not lower them without recording why. (The
+//! 2026-09-02 baseline on the 36-probe fixture was 27 and 26; the three new
+//! probes contribute +3 and +1.)
 //!
 //! Per-category hit counts (both entry points; identical across all three
 //! runs):
@@ -69,7 +79,19 @@
 //! | `negation`         | 4     | 1            | 1            |
 //! | `identifier`       | 5     | 5            | 4            |
 //! | `multi_hop`        | 3     | 2            | 2            |
+//! | `long_intent`      | 3     | 3            | 1            |
 //! | `noise`            | 5     | 5 (0 leaks)  | 5 (0 leaks)  |
+//!
+//! `long_intent` is the category T5d added, and its lexical scores are the
+//! reason it exists. Its queries are 254--356 characters -- the shape a real
+//! `semantic_query_text` builds out of a Working Intent's goal, current
+//! direction and in-scope list -- and the gap between 3/3 explicit search
+//! and 1/3 automatic injection is exactly the room the embedding channel is
+//! supposed to occupy. It is also the length at which the encode budget was
+//! never calibrated: every probe in the other seven categories is short
+//! enough to encode well inside the old 200 ms budget, which is how that
+//! budget passed T5b while making the channel unusable in every real
+//! session.
 //!
 //! This matches the qualitative failure modes WP-T already knew about:
 //! `negation` and `cross_lingual` are almost entirely unresolved by a
@@ -97,8 +119,8 @@ const REPORT_FILE_NAME: &str = "association-probe-ext-report.json";
 /// Ratcheted floor: the worst (here, only, since all three runs matched) of
 /// three measured runs. Regression-only, not a progress target -- see the
 /// module doc comment for the measured numbers.
-const TARGET_SEARCH_HITS: usize = 27;
-const TARGET_INTENT_HITS: usize = 26;
+const TARGET_SEARCH_HITS: usize = 30;
+const TARGET_INTENT_HITS: usize = 27;
 
 fn fixture() -> Value {
     serde_json::from_str::<Value>(PROBE_FIXTURE).unwrap()

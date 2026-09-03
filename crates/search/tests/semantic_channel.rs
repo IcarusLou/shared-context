@@ -29,9 +29,10 @@ use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::ProjectionIndex;
 use sctx_search::{
-    ContextPackMode, EmbeddingProvider, EmbeddingSemanticChannel, Error, ErrorKind,
-    SEMANTIC_CHANNEL_LIMIT, SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SearchEngine, SemanticCacheKey,
-    SemanticChannel, SemanticChannelHandle, SemanticHit, SemanticOutcome, SemanticVectorCache,
+    ContextPackMode, EmbeddingProvider, EmbeddingSemanticChannel, EncodeLatencySummary,
+    EncodeSample, EncodeSampleRecorder, Error, ErrorKind, QueryVectorCache, SEMANTIC_CHANNEL_LIMIT,
+    SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SearchEngine, SemanticCacheKey, SemanticChannel,
+    SemanticChannelHandle, SemanticHit, SemanticOutcome, SemanticVectorCache,
     TaskAssociationChannel, TaskContextPack, TaskContextRequest, TaskRetrievalPath,
 };
 use serde_json::Value;
@@ -527,6 +528,201 @@ fn an_encode_that_overruns_its_budget_reports_the_channel_unavailable() {
         SemanticOutcome::Unavailable,
         "overrunning the encode budget degrades the channel; it never stalls the Pack"
     );
+}
+
+#[test]
+fn a_repeated_query_is_served_from_the_cache_without_encoding_again() {
+    let provider = Arc::new(HashProvider::new());
+    let vector = provider.encode("corpus entry").unwrap();
+    let channel = EmbeddingSemanticChannel::new(
+        Arc::clone(&provider) as Arc<dyn EmbeddingProvider>,
+        vec![(RevisionId::new(), vector)],
+    );
+
+    let first = channel.similar_revisions("the same working intent, read twice");
+    let encodes_after_first = provider.encode_count();
+    let second = channel.similar_revisions("the same working intent, read twice");
+
+    assert_eq!(
+        first, second,
+        "a cached query vector must rank exactly as the freshly encoded one did"
+    );
+    assert_eq!(
+        provider.encode_count(),
+        encodes_after_first,
+        "the second read of one Working Intent must not reach the encoder at all"
+    );
+    let _third = channel.similar_revisions("a different working intent entirely");
+    assert!(
+        provider.encode_count() > encodes_after_first,
+        "a query the cache has never seen must still be encoded"
+    );
+}
+
+#[test]
+fn an_encode_that_overran_its_budget_still_lands_in_the_cache_for_the_next_call() {
+    // The defect this covers is the one that made the channel useless in a real session: a budget
+    // the machine cannot meet used to fail every call identically and forever, because the encode
+    // that overran was simply thrown away. Now the worker finishes into the cache, so the cost is
+    // paid once.
+    let provider = Arc::new(HashProvider::slow(Duration::from_millis(200)));
+    let vector = provider.encode("corpus entry").unwrap();
+    let channel = EmbeddingSemanticChannel::new(
+        Arc::clone(&provider) as Arc<dyn EmbeddingProvider>,
+        vec![(RevisionId::new(), vector)],
+    )
+    .with_budget(Duration::from_millis(20));
+
+    assert_eq!(
+        channel.similar_revisions("a long working intent this budget cannot encode"),
+        SemanticOutcome::Unavailable,
+        "the first call still degrades rather than stalling the Pack"
+    );
+
+    // Wait for the detached worker, which is still encoding, to finish and fill the cache.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while channel.query_cache().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        matches!(
+            channel.similar_revisions("a long working intent this budget cannot encode"),
+            SemanticOutcome::Hits(_)
+        ),
+        "the next read of the same Intent must be a cache hit, not a second timeout"
+    );
+}
+
+#[test]
+fn the_query_cache_evicts_the_least_recently_read_entry() {
+    let cache = QueryVectorCache::with_capacity(2);
+    let key = SemanticCacheKey::new("fingerprint", "ranking");
+    cache.store(&key, "first", Arc::new(vec![1.0_f32]));
+    cache.store(&key, "second", Arc::new(vec![2.0_f32]));
+    // Reading "first" makes "second" the coldest entry.
+    assert!(cache.get(&key, "first").is_some());
+    cache.store(&key, "third", Arc::new(vec![3.0_f32]));
+
+    assert_eq!(cache.len(), 2, "capacity is a bound, not a suggestion");
+    assert!(
+        cache.get(&key, "first").is_some(),
+        "the recently read entry survives"
+    );
+    assert!(
+        cache.get(&key, "third").is_some(),
+        "the newest entry survives"
+    );
+    assert!(
+        cache.get(&key, "second").is_none(),
+        "the least recently read entry is the one evicted"
+    );
+}
+
+#[test]
+fn a_query_vector_is_never_served_across_model_generations() {
+    let cache = QueryVectorCache::with_capacity(8);
+    let original = SemanticCacheKey::new("fingerprint-a", "ranking-1");
+    cache.store(&original, "one intent", Arc::new(vec![1.0_f32]));
+
+    assert!(cache.get(&original, "one intent").is_some());
+    assert!(
+        cache
+            .get(
+                &SemanticCacheKey::new("fingerprint-b", "ranking-1"),
+                "one intent"
+            )
+            .is_none(),
+        "a swapped model must not read the previous model's query vectors"
+    );
+    assert!(
+        cache
+            .get(
+                &SemanticCacheKey::new("fingerprint-a", "ranking-2"),
+                "one intent"
+            )
+            .is_none(),
+        "a ranking version bump changes the embedded text, so its vectors are a new generation"
+    );
+}
+
+#[test]
+fn encode_timings_are_recorded_where_status_and_doctor_can_read_them() {
+    let directory = TempDir::new().unwrap();
+    let cache =
+        Arc::new(SemanticVectorCache::open(&directory.path().join("semantic.sqlite")).unwrap());
+
+    assert_eq!(
+        cache.encode_latency_summary().unwrap(),
+        EncodeLatencySummary::default(),
+        "a channel nobody has queried reports nothing rather than a fabricated zero-latency run"
+    );
+
+    let provider = Arc::new(HashProvider::slow(Duration::from_millis(120)));
+    let vector = provider.encode("corpus entry").unwrap();
+    let channel = EmbeddingSemanticChannel::new(provider, vec![(RevisionId::new(), vector)])
+        .with_budget(Duration::from_millis(15))
+        .with_encode_recorder(Arc::clone(&cache) as Arc<dyn EncodeSampleRecorder>);
+
+    assert_eq!(
+        channel.similar_revisions("a query this budget cannot afford"),
+        SemanticOutcome::Unavailable
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while cache.recent_encode_samples(8).unwrap().is_empty() && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let samples = cache.recent_encode_samples(8).unwrap();
+    assert_eq!(samples.len(), 1, "one query, one observation");
+    assert!(
+        samples[0].timed_out,
+        "an encode that overran its budget has to be recorded as one: the Pack cannot tell a \
+         timeout from a missing model, so this is the only place the difference survives"
+    );
+    assert_eq!(samples[0].budget_ms, 15);
+    assert!(
+        samples[0].elapsed_ms >= 100,
+        "the real cost is recorded, not the budget"
+    );
+    assert!(samples[0].query_chars > 0);
+}
+
+#[test]
+fn a_history_of_timeouts_is_what_marks_a_budget_unfit_and_a_short_one_is_not() {
+    let timeout = EncodeSample {
+        query_chars: 283,
+        elapsed_ms: 240,
+        budget_ms: 200,
+        timed_out: true,
+    };
+    let inside = EncodeSample {
+        timed_out: false,
+        elapsed_ms: 30,
+        ..timeout
+    };
+
+    assert!(
+        !EncodeLatencySummary::from_samples(&[timeout; 4]).budget_is_unfit(),
+        "four observations is a busy machine, not a verdict about the budget"
+    );
+    assert!(
+        EncodeLatencySummary::from_samples(&[timeout; 10]).budget_is_unfit(),
+        "a full history of timeouts is a budget this machine cannot meet"
+    );
+
+    let mut mixed = vec![inside; 9];
+    mixed.push(timeout);
+    assert!(
+        !EncodeLatencySummary::from_samples(&mixed).budget_is_unfit(),
+        "one timeout among nine healthy encodes is not a misconfiguration"
+    );
+    let summary = EncodeLatencySummary::from_samples(&mixed);
+    assert_eq!(summary.samples, 10);
+    assert_eq!(summary.timed_out, 1);
+    assert_eq!(summary.max_ms, 240);
 }
 
 #[test]

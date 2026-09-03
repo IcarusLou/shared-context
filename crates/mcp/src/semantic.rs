@@ -6,13 +6,13 @@
 //! that publish lands, every automatic Pack reports `embedding_unavailable` and answers from the
 //! lexical channels exactly as it would on an installation that never configured a model.
 
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use sctx_index::{ProjectionIndex, SEARCH_RANKING_VERSION};
 use sctx_local_state::{RetrievalSettings, UserConfigStore};
 use sctx_search::{
-    EmbeddingSemanticChannel, SearchEngine, SemanticCacheKey, SemanticChannelHandle,
-    SemanticVectorCache, load_onnx_provider, model_fingerprint,
+    EmbeddingSemanticChannel, EncodeSampleRecorder, SearchEngine, SemanticCacheKey,
+    SemanticChannelHandle, SemanticVectorCache, load_onnx_provider, model_fingerprint,
 };
 
 /// Reads `[retrieval]` without letting a broken config file break `serve`.
@@ -34,13 +34,16 @@ pub(crate) fn spawn_semantic_loader(root: &Path) -> Option<SemanticChannelHandle
     let settings = retrieval_settings(root);
     let model_path = settings.embedding_model_path.clone()?;
     let runtime_path = settings.embedding_runtime_path.clone()?;
+    let budget = settings.encode_budget();
     let handle = SemanticChannelHandle::new();
     let background = handle.clone();
     let root = root.to_path_buf();
     if std::thread::Builder::new()
         .name("sctx-embedding-loader".to_owned())
         .spawn(move || {
-            if let Err(error) = load_and_backfill(&root, &model_path, &runtime_path, &background) {
+            if let Err(error) =
+                load_and_backfill(&root, &model_path, &runtime_path, budget, &background)
+            {
                 // stderr is the MCP server's advisory channel; stdout carries the protocol. A
                 // failed model load degrades retrieval, it never fails a request.
                 eprintln!("sctx: embedding channel unavailable: {error}");
@@ -63,20 +66,29 @@ fn load_and_backfill(
     root: &Path,
     model_path: &Path,
     runtime_path: &Path,
+    budget: Option<Duration>,
     handle: &SemanticChannelHandle,
 ) -> sctx_search::Result<()> {
     let provider = load_onnx_provider(model_path, runtime_path)?;
     let key = SemanticCacheKey::new(model_fingerprint(model_path)?, SEARCH_RANKING_VERSION);
-    let cache = SemanticVectorCache::open_at_root(root)?;
+    let cache = Arc::new(SemanticVectorCache::open_at_root(root)?);
     // Vectors from a superseded model or ranking version can never be compared against the current
     // ones, so they are disk cost with no possible reader.
     let _pruned = cache.prune_superseded(&key)?;
 
-    handle.publish(Arc::new(EmbeddingSemanticChannel::from_cache(
-        Arc::clone(&provider),
-        &cache,
-        &key,
-    )?));
+    // Both publishes carry the same budget and the same recorder, and share one query vector cache
+    // through `from_cache`, so the second one inherits the first one's warmth instead of resetting
+    // a session back to a cold encode.
+    let build = |provider: Arc<dyn sctx_search::EmbeddingProvider>| {
+        let channel = EmbeddingSemanticChannel::from_cache(provider, &cache, &key)?
+            .with_encode_recorder(Arc::clone(&cache) as Arc<dyn EncodeSampleRecorder>);
+        Ok::<_, sctx_search::Error>(match budget {
+            Some(budget) => channel.with_budget(budget),
+            None => channel,
+        })
+    };
+
+    handle.publish(Arc::new(build(Arc::clone(&provider))?));
 
     let engine = SearchEngine::new(open_index(root));
     let embeddable = engine.embeddable_revisions()?;
@@ -96,9 +108,7 @@ fn load_and_backfill(
         }
     }
     if wrote {
-        handle.publish(Arc::new(EmbeddingSemanticChannel::from_cache(
-            provider, &cache, &key,
-        )?));
+        handle.publish(Arc::new(build(provider)?));
     }
     Ok(())
 }

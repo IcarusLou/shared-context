@@ -271,6 +271,9 @@
     {"id": "noise-02", "category": "noise", "query": "长跑训练计划怎么安排", "expected": []},
     {"id": "noise-03", "category": "noise", "query": "红酒配餐推荐", "expected": []},
     {"id": "noise-04", "category": "noise", "query": "自动驾驶感知融合算法", "expected": []},
-    {"id": "noise-05", "category": "noise", "query": "national park camping permit renewal", "expected": []}
+    {"id": "noise-05", "category": "noise", "query": "national park camping permit renewal", "expected": []},
+    {"id": "long-01", "category": "long_intent", "query": "排查线上推送系统同一条通知被重复下发给同一个用户的问题，需要定位根因到底是去重逻辑本身的配置问题，还是设备 token 生命周期管理在换机场景下的问题 当前方向：先看重试链路上的时间窗口设置，确认下游网关做网络重试时的典型间隔是否已经大于我们在配置里写死的那个去重窗口值，如果是，那么重试上来的同一条消息就会被判定成一条全新的事件 涉及范围：推送投递服务里的去重组件与其窗口配置项、重试次数相关的监控指标、设备 token 的注册与失效流程 排除范围：客户端的通知展示逻辑，以及推送内容模板本身的渲染问题，这次只关心投递次数", "expected": [1]},
+    {"id": "long-02", "category": "long_intent", "query": "解决跨时区部署环境下定时任务的实际触发时间与预期不符的问题，业务方反馈欧洲机房上的日终结算任务比配置里写的时间提前了好几个小时就被执行了，而国内机房上的同一个任务时间是对的 当前方向：核对调度器在计算下一次触发时刻的时候读取的时区来源，确认它用的究竟是运行服务的那台机器的本地时区，还是配置文件里显式指定的那个时区参数，两者不一致就会产生固定的偏移量 涉及范围：定时任务的调度分发组件、时区相关的配置项、下一次触发时间的计算逻辑 排除范围：任务本身的业务代码，以及任务执行失败后的告警通道，这次只关心触发时刻", "expected": [5]},
+    {"id": "long-03", "category": "long_intent", "query": "Investigate the one-cent drift finance reports in the daily settlement batch totals, and whether the ledger rounding change resolved it. Current direction: compare rounding each line item before summing against rounding the sum itself, and confirm the ledger's rounding mode today. In scope: the settlement reconciler and the ledger rounding configuration.", "expected": [11, 7]}
   ]
 }

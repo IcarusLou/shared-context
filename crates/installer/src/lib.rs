@@ -4069,6 +4069,18 @@ const RETRIEVAL_ENABLE: &str = "run `sctx embedding install`, which downloads th
      It needs about 2.3 GB of disk. `sctx embedding install --model-url <BASE>` fetches the model \
      from an internal mirror instead.";
 
+/// What an operator has to do when the encode budget does not fit their hardware.
+///
+/// The default is calibrated against a real Working Intent on current Apple Silicon; slower
+/// machines exist, and on one of them the channel loads, embeds the corpus, reports no error, and
+/// contributes to nothing. This is the only place that fact becomes visible, so it has to carry
+/// the whole remedy rather than a pointer to it.
+const RETRIEVAL_BUDGET: &str = "The encode budget is calibrated for this machine's hardware, not \
+     configured per installation. Raise it by setting `[retrieval] embedding_encode_budget_ms` in \
+     `config.toml` to something above the p95 above (a value of 50--30000 is accepted), then \
+     restart `sctx mcp serve`. Shortening the Working Intent's goal and current direction also \
+     helps: the encode cost scales with the length of the query they build.";
+
 /// Reports the optional embedding recall channel (ADR-0004).
 ///
 /// It never reports [`CheckStatus::Error`]. The channel is opt-in and additive: an installation
@@ -4136,23 +4148,64 @@ fn check_retrieval(root: &Path, checks: &mut Vec<DoctorCheck>) {
     // Loading the model here would cost doctor 9--12 seconds and a gigabyte of memory to learn
     // something the server reports on stderr anyway. Doctor checks that the files a load needs are
     // present; the load itself belongs to `serve`.
-    let cached = SemanticVectorCache::open(&semantic_cache_path(root))
+    checks.push(configured_retrieval_check(root, model_path, runtime_path));
+}
+
+/// Grades a `[retrieval]` whose files are all present, on what its encodes have actually cost.
+///
+/// A channel whose encodes mostly time out is configured, loaded, and useless: every automatic
+/// retrieval reports `embedding_unavailable` and answers lexically, which is indistinguishable
+/// from a healthy installation unless someone says so here. That indistinguishability is what let
+/// a budget calibrated on the wrong query length ship as working.
+fn configured_retrieval_check(root: &Path, model_path: &Path, runtime_path: &Path) -> DoctorCheck {
+    let cache = SemanticVectorCache::open(&semantic_cache_path(root));
+    let cached = cache
+        .as_ref()
+        .ok()
         .and_then(|cache| {
-            model_fingerprint(model_path).and_then(|fingerprint| {
-                cache
-                    .cached_revisions(&SemanticCacheKey::new(fingerprint, SEARCH_RANKING_VERSION))
-                    .map(|revisions| revisions.len())
-            })
+            model_fingerprint(model_path)
+                .and_then(|fingerprint| {
+                    cache.cached_revisions(&SemanticCacheKey::new(
+                        fingerprint,
+                        SEARCH_RANKING_VERSION,
+                    ))
+                })
+                .ok()
         })
-        .unwrap_or(0);
-    checks.push(ok(
+        .map_or(0, |revisions| revisions.len());
+    let encodes = cache
+        .as_ref()
+        .ok()
+        .and_then(|cache| cache.encode_latency_summary().ok())
+        .unwrap_or_default();
+    if encodes.budget_is_unfit() {
+        return warning(
+            "retrieval_embedding",
+            format!(
+                "Configured, but {} of the last {} query encodes overran the {} ms budget \
+                 (p50 {} ms, p95 {} ms), so those retrievals degraded to lexical recall. \
+                 {RETRIEVAL_BUDGET}",
+                encodes.timed_out,
+                encodes.samples,
+                encodes.budget_ms,
+                encodes.p50_ms,
+                encodes.p95_ms
+            ),
+        );
+    }
+    ok(
         "retrieval_embedding",
         format!(
-            "Configured: model {}, runtime {}, {cached} Context revision(s) embedded so far.",
+            "Configured: model {}, runtime {}, {cached} Context revision(s) embedded so far. \
+             Query encodes: {} sampled, {} over budget, p95 {} ms against a {} ms budget.",
             model_path.display(),
-            runtime_path.display()
+            runtime_path.display(),
+            encodes.samples,
+            encodes.timed_out,
+            encodes.p95_ms,
+            encodes.budget_ms
         ),
-    ));
+    )
 }
 
 fn check_engineering_graph(root: &Path, checks: &mut Vec<DoctorCheck>) {

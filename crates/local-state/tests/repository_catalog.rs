@@ -1083,6 +1083,75 @@ fn engineering_auto_scan_defaults_to_on_and_is_explicitly_switchable() {
 }
 
 #[test]
+fn the_encode_budget_is_optional_bounded_and_survives_a_model_reinstall() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("预算 配置");
+    let store = UserConfigStore::initialize(&root).unwrap();
+    let config_path = root.join("config.toml");
+    let model = temporary.path().join("模型 目录");
+    let runtime = temporary.path().join("libonnxruntime.dylib");
+
+    store.set_retrieval_embedding(&model, &runtime).unwrap();
+    let default = store.retrieval_settings().unwrap();
+    assert_eq!(
+        default.embedding_encode_budget_ms, None,
+        "an installation that never needed a budget must not grow a key it did not write"
+    );
+    assert_eq!(
+        default.encode_budget(),
+        None,
+        "absent means the compiled-in default, not zero"
+    );
+    assert!(
+        !fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("embedding_encode_budget_ms"),
+        "the default must stay out of the document so it can change without a migration"
+    );
+
+    let mut text = fs::read_to_string(&config_path).unwrap();
+    let _ = writeln!(text, "embedding_encode_budget_ms = 2500");
+    fs::write(&config_path, text).unwrap();
+    let tuned = store.retrieval_settings().unwrap();
+    assert_eq!(tuned.embedding_encode_budget_ms, Some(2_500));
+    assert_eq!(
+        tuned.encode_budget(),
+        Some(std::time::Duration::from_millis(2_500))
+    );
+
+    // Reinstalling the model rewrites both paths. A budget the operator measured for this machine
+    // is not part of that, and losing it would silently restore the failure they tuned it away.
+    store.set_retrieval_embedding(&model, &runtime).unwrap();
+    assert_eq!(
+        store
+            .retrieval_settings()
+            .unwrap()
+            .embedding_encode_budget_ms,
+        Some(2_500),
+        "`sctx embedding install` must not discard a tuned encode budget"
+    );
+
+    for refused in ["0", "10", "60000"] {
+        let mut text = fs::read_to_string(&config_path).unwrap();
+        text = text.replace(
+            "embedding_encode_budget_ms = 2500",
+            &format!("embedding_encode_budget_ms = {refused}"),
+        );
+        fs::write(&config_path, text).unwrap();
+        assert_eq!(
+            store.retrieval_settings().unwrap_err().kind(),
+            ErrorKind::InvalidInput,
+            "a budget of {refused} ms is refused rather than clamped, so a typo is a message"
+        );
+        let text = fs::read_to_string(&config_path).unwrap().replace(
+            &format!("embedding_encode_budget_ms = {refused}"),
+            "embedding_encode_budget_ms = 2500",
+        );
+        fs::write(&config_path, text).unwrap();
+    }
+}
+
+#[test]
 fn retrieval_embedding_paths_default_to_absent_and_survive_a_catalog_write() {
     let temporary = TempDir::new().unwrap();
     let root = temporary.path().join("共享 配置");

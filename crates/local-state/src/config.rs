@@ -238,11 +238,19 @@ impl EngineeringSettings {
 /// gigabyte of resident memory, so an absent table means the channel does not exist.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+// The field names are the TOML keys operators type, so the shared `embedding_` prefix is the
+// public schema rather than a naming habit; dropping it would rename `[retrieval]` keys that are
+// already documented and written to real `config.toml` files.
+#[allow(clippy::struct_field_names)]
 struct RetrievalConfigDocument {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     embedding_model_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     embedding_runtime_path: Option<String>,
+    /// Optional override for the query encode budget. Absent on every installation that has not
+    /// needed one, which keeps the document byte-identical to the one this table shipped with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embedding_encode_budget_ms: Option<u64>,
 }
 
 /// Explicit local embedding recall settings.
@@ -251,12 +259,22 @@ struct RetrievalConfigDocument {
 /// be executed and a runtime without a model has nothing to execute, so half a configuration is
 /// the same fact as none -- reported by `sctx doctor`, never half-enabled.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+// Mirrors the TOML key names one-for-one on purpose; see `RetrievalConfigDocument`.
+#[allow(clippy::struct_field_names)]
 pub struct RetrievalSettings {
     /// Directory holding `model.onnx` (plus `model.onnx_data` for an external-data model) and
     /// `tokenizer.json`.
     pub embedding_model_path: Option<PathBuf>,
     /// The ONNX Runtime dynamic library this process loads at run time.
     pub embedding_runtime_path: Option<PathBuf>,
+    /// Wall clock one query encode may spend before the channel degrades, in milliseconds.
+    ///
+    /// Absent means the compiled-in default, which is calibrated against a real Working Intent on
+    /// current Apple Silicon. The knob exists because that calibration is a property of the
+    /// operator's hardware, not of this code: a slower machine needs a larger number, and the
+    /// alternative to letting them set one is the silent, total channel failure this field was
+    /// added to end. `sctx doctor` reports when the recorded encodes say the budget does not fit.
+    pub embedding_encode_budget_ms: Option<u64>,
 }
 
 impl RetrievalSettings {
@@ -285,8 +303,42 @@ impl RetrievalSettings {
                 document.embedding_runtime_path.as_deref(),
                 "retrieval.embedding_runtime_path",
             )?,
+            embedding_encode_budget_ms: retrieval_budget_ms(
+                document.embedding_encode_budget_ms,
+                "retrieval.embedding_encode_budget_ms",
+            )?,
         })
     }
+
+    /// The configured encode budget, or `None` to use the compiled-in default.
+    #[must_use]
+    pub const fn encode_budget(&self) -> Option<std::time::Duration> {
+        match self.embedding_encode_budget_ms {
+            Some(milliseconds) => Some(std::time::Duration::from_millis(milliseconds)),
+            None => None,
+        }
+    }
+}
+
+/// Bounds a configured encode budget.
+///
+/// Zero disables the channel by making every encode time out, which is never what an operator
+/// reaching for this key wants; the ceiling is there because a budget measured in minutes is a
+/// hung retrieval, not a slow one. Both ends are refused rather than clamped, so a typo is a
+/// message instead of a mystery.
+fn retrieval_budget_ms(value: Option<u64>, field: &str) -> Result<Option<u64>> {
+    const MIN_BUDGET_MS: u64 = 50;
+    const MAX_BUDGET_MS: u64 = 30_000;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if !(MIN_BUDGET_MS..=MAX_BUDGET_MS).contains(&value) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("{field} must be between {MIN_BUDGET_MS} and {MAX_BUDGET_MS} milliseconds"),
+        ));
+    }
+    Ok(Some(value))
 }
 
 /// Validates one configured retrieval path. A relative path is rejected rather than resolved
@@ -1056,9 +1108,16 @@ impl UserConfigStore {
         let lock = self.lock()?;
         let outcome = (|| {
             let mut document = self.read_document()?;
+            // Reinstalling the model is not a reason to discard a budget the operator tuned for
+            // this machine: the two halves this call owns are the paths, and nothing else.
+            let encode_budget_ms = document
+                .retrieval
+                .as_ref()
+                .and_then(|retrieval| retrieval.embedding_encode_budget_ms);
             document.retrieval = Some(RetrievalConfigDocument {
                 embedding_model_path: Some(model),
                 embedding_runtime_path: Some(runtime),
+                embedding_encode_budget_ms: encode_budget_ms,
             });
             self.validate_document(&document)?;
             self.write_document(&document)?;

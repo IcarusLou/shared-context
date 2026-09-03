@@ -16,7 +16,7 @@
 //! embedding channel loads its model on a background thread precisely so a session never waits
 //! 9--12 seconds for it, and a process that answers one request and exits is killed long before
 //! that thread publishes anything. Measured through the probe binary the channel would report
-//! `embedding_unavailable` on all 36 probes and prove nothing.
+//! `embedding_unavailable` on all 39 probes and prove nothing.
 //!
 //! So the corpus is still built by the real harness -- the same Git store, the same public MCP
 //! confirmation chain, the same projection -- and only the *query* half runs in-process against
@@ -24,7 +24,7 @@
 //! per-category deltas below are measured against their own control and never against a number
 //! produced by a different runner.
 //!
-//! The in-process control lands one probe below the 26/36 the blocking suite measures through the
+//! The in-process control lands one probe below the 27/39 the blocking suite measures through the
 //! binary, and the difference is known rather than mysterious: `Runtime` attaches a
 //! `RuntimeUsagePrior` read from `runtime.sqlite`, which this runner has no public way to build.
 //! The harness clears `context_usage` before every probe, so the prior is near-neutral, but
@@ -47,9 +47,9 @@ use sctx_domain::{TaskId, WorkingIntentSnapshot};
 use sctx_engineering_graph::EngineeringProjectionStore;
 use sctx_index::{ProjectionIndex, SEARCH_RANKING_VERSION};
 use sctx_search::{
-    ContextPackMode, EmbeddingSemanticChannel, SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS,
-    SearchEngine, SemanticCacheKey, SemanticChannel, SemanticOutcome, SemanticVectorCache,
-    TaskContextRequest, model_fingerprint,
+    ContextPackMode, EmbeddingSemanticChannel, QueryVectorCache, SEMANTIC_QUERY_CACHE_CAPACITY,
+    SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SearchEngine, SemanticCacheKey, SemanticChannel,
+    SemanticOutcome, SemanticVectorCache, TaskContextRequest, model_fingerprint,
 };
 use serde_json::Value;
 
@@ -60,13 +60,33 @@ const AUTOMATIC_TOKEN_BUDGET: usize = 2_000;
 const AUTOMATIC_MAX_SPACES: usize = 8;
 
 /// What the blocking ext suite measures for `task_intent_update` through the real binary.
-const LEXICAL_INTENT_HITS: usize = 26;
+/// Re-measured 2026-09-03 over the 39-probe fixture (`long_intent` added by T5d).
+const LEXICAL_INTENT_HITS: usize = 27;
 /// How far the in-process control may sit below it before the substitution stops being honest.
 /// One probe, for the usage prior this runner cannot build; see the module docs.
 const LEXICAL_CONTROL_TOLERANCE: usize = 1;
 
-/// ADR-0004's latency budget for the loaded-model case.
-const P95_INCREMENT_BUDGET: Duration = Duration::from_millis(100);
+/// ADR-0004's latency budget, which now applies to the case it can actually hold for: a query
+/// whose vector the process has already encoded once.
+///
+/// The original clause budgeted a 100 ms p95 increment with no qualifier, and it was measured
+/// against probe queries 15--40 characters long. That is not what an automatic retrieval submits.
+/// A real Working Intent flattens to a few hundred characters and its *first* encode costs
+/// hundreds of milliseconds on current hardware, which is the whole reason the 200 ms encode
+/// budget silently disabled the channel in every real session. See the 2026-09-03 revision in
+/// `docs/adr/0004-embedding-retrieval-channel.md`.
+const REPEATED_P95_INCREMENT_BUDGET: Duration = Duration::from_millis(100);
+
+/// What one *first* encode of a real-length Working Intent may add to `task_context` p95.
+///
+/// Measured at 235 ms p95 for a 283-character query (`crates/search/tests/embedding_encode_latency.rs`);
+/// 400 ms is that plus fusion and headroom. This number is the honest cost of the channel's first
+/// look at a new Intent, and stating it is the point: the previous budget hid it by never paying
+/// it at all.
+const FIRST_P95_INCREMENT_BUDGET: Duration = Duration::from_millis(400);
+
+/// The probe category whose queries are the length a real automatic retrieval submits.
+const LONG_INTENT_CATEGORY: &str = "long_intent";
 
 fn model_paths() -> Option<(PathBuf, PathBuf)> {
     let model = std::env::var_os("SCTX_PROBE_EMBEDDING_MODEL")?;
@@ -125,6 +145,10 @@ struct Run {
     hits: usize,
     by_category: BTreeMap<String, (usize, usize)>,
     latencies: Vec<Duration>,
+    /// Latencies of the `long_intent` probes alone. The suite average is dominated by 15--40
+    /// character probes that no automatic retrieval ever submits, and a p95 taken over it is the
+    /// measurement that let a 200 ms encode budget look adequate.
+    long_latencies: Vec<Duration>,
     noise_leaks: usize,
 }
 
@@ -133,6 +157,7 @@ fn run_suite(harness: &Harness, engine: &SearchEngine, fixture: &Value) -> Run {
         hits: 0,
         by_category: BTreeMap::new(),
         latencies: Vec::new(),
+        long_latencies: Vec::new(),
         noise_leaks: 0,
     };
     for probe in fixture["probes"].as_array().unwrap() {
@@ -148,6 +173,9 @@ fn run_suite(harness: &Harness, engine: &SearchEngine, fixture: &Value) -> Run {
 
         let (top1, count, elapsed) = automatic_top1(engine, query);
         run.latencies.push(elapsed);
+        if category == LONG_INTENT_CATEGORY {
+            run.long_latencies.push(elapsed);
+        }
         let index = top_index(harness, top1.as_deref());
         let hit = if expected.is_empty() {
             if count > 0 {
@@ -269,11 +297,23 @@ fn the_embedding_channel_lifts_paraphrase_and_cross_lingual_without_costing_iden
 
     print_similarity_separation(&fixture, channel.as_ref());
 
+    // `print_similarity_separation` has now encoded every probe query once, so the shared query
+    // cache holds them all. Handing the fused channel an empty cache of its own is what makes the
+    // "first encode" measurement below actually a first encode -- otherwise the run would report
+    // the cached cost for every probe and quietly lose the number this test exists to pin.
+    let channel = Arc::new(
+        EmbeddingSemanticChannel::from_cache(Arc::clone(&provider), &cache, &key)
+            .unwrap()
+            .with_query_cache(Arc::new(QueryVectorCache::with_capacity(
+                SEMANTIC_QUERY_CACHE_CAPACITY,
+            ))),
+    );
+
     let semantic_engine = engine
         .clone()
         .with_semantic_channel(Arc::clone(&channel) as Arc<dyn SemanticChannel>);
 
-    // 3. The same 36 probes, now with the channel fused in.
+    // 3. The same 39 probes, now with the channel fused in.
     let fused = run_suite(&harness, &semantic_engine, &fixture);
     println!("--- with embedding channel --- {}/{total}", fused.hits);
 
@@ -311,15 +351,61 @@ fn the_embedding_channel_lifts_paraphrase_and_cross_lingual_without_costing_iden
     );
 
     // 4. Latency, with the model already loaded.
+    assert_latency_budgets(&harness, &semantic_engine, &fixture, &lexical, &fused, total);
+}
+
+/// Grades the two latency clauses ADR-0004 was split into on 2026-09-03.
+///
+/// Both are measured on the `long_intent` probes alone. The whole-suite p95 is printed for
+/// continuity with the T5b baseline and asserted on nothing: it is dominated by 15--40 character
+/// probes, and taking an acceptance number from it is precisely the mistake that let a 200 ms
+/// encode budget ship while making the channel unusable in every real session.
+fn assert_latency_budgets(
+    harness: &Harness,
+    semantic_engine: &SearchEngine,
+    fixture: &Value,
+    lexical: &Run,
+    fused: &Run,
+    total: usize,
+) {
     let lexical_p95 = percentile(lexical.latencies.clone(), 95);
     let fused_p95 = percentile(fused.latencies.clone(), 95);
-    let increment = fused_p95.saturating_sub(lexical_p95);
     println!(
-        "\ntask_context p95: lexical {lexical_p95:?}, fused {fused_p95:?}, increment {increment:?}"
+        "\ntask_context p95 over all {total} probes: lexical {lexical_p95:?}, fused {fused_p95:?} \
+         (short-probe dominated, not an acceptance number)"
+    );
+
+    let lexical_long_p95 = percentile(lexical.long_latencies.clone(), 95);
+    let first_long_p95 = percentile(fused.long_latencies.clone(), 95);
+    let first_increment = first_long_p95.saturating_sub(lexical_long_p95);
+    println!(
+        "long_intent p95 (first encode): lexical {lexical_long_p95:?}, fused {first_long_p95:?}, \
+         increment {first_increment:?}"
     );
     assert!(
-        increment <= P95_INCREMENT_BUDGET,
-        "ADR-0004 budgets a p95 increment of {P95_INCREMENT_BUDGET:?}, measured {increment:?}"
+        first_increment <= FIRST_P95_INCREMENT_BUDGET,
+        "a first encode of a real-length Working Intent may add {FIRST_P95_INCREMENT_BUDGET:?} to \
+         task_context p95, measured {first_increment:?}"
+    );
+
+    // The same long queries again. Their vectors are in the query cache now, so this is what every
+    // repeat read of one Intent costs -- and it is the case ADR-0004's original 100 ms clause
+    // survives on.
+    let repeated = run_suite(harness, semantic_engine, fixture);
+    let repeated_long_p95 = percentile(repeated.long_latencies.clone(), 95);
+    let repeated_increment = repeated_long_p95.saturating_sub(lexical_long_p95);
+    println!(
+        "long_intent p95 (cached encode): fused {repeated_long_p95:?}, increment \
+         {repeated_increment:?}"
+    );
+    assert!(
+        repeated_increment <= REPEATED_P95_INCREMENT_BUDGET,
+        "a repeated retrieval over one Working Intent must stay inside ADR-0004's \
+         {REPEATED_P95_INCREMENT_BUDGET:?} p95 increment, measured {repeated_increment:?}"
+    );
+    assert_eq!(
+        repeated.hits, fused.hits,
+        "the query vector cache must not change what the channel retrieves"
     );
 }
 
@@ -327,6 +413,6 @@ fn the_embedding_channel_lifts_paraphrase_and_cross_lingual_without_costing_iden
 #[test]
 fn the_extended_probe_fixture_is_readable() {
     let fixture = serde_json::from_str::<Value>(PROBE_FIXTURE).unwrap();
-    assert_eq!(fixture["probes"].as_array().unwrap().len(), 36);
+    assert_eq!(fixture["probes"].as_array().unwrap().len(), 39);
     let _ = fs::metadata("../../fixtures/association/probe-ext-v1.json");
 }

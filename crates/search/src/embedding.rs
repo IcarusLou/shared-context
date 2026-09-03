@@ -9,10 +9,19 @@
 //!   before this module existed -- not approximately, and not "with an empty channel": the
 //!   [`crate::SearchEngine`] holds `None` and never reports an omission it had no channel to fail.
 //! * **It never blocks.** Corpus vectors are a discardable local cache filled by a background
-//!   thread. The query path reads that cache and encodes one short query under a hard wall-clock
-//!   budget; every failure mode -- absent model, unfinished load, slow encode -- degrades to
+//!   thread. The query path reads that cache and encodes one query under a hard wall-clock budget;
+//!   every failure mode -- absent model, unfinished load, slow encode -- degrades to
 //!   [`SemanticOutcome::Unavailable`], which the Pack reports as `embedding_unavailable` while the
 //!   lexical channels answer unchanged.
+//!
+//!   That budget is the one number in this file that has already been wrong once, and the way it
+//!   was wrong is worth keeping in view. It was set for a *short* query, because the probe suite
+//!   that validated it asked short questions. A real query is a Working Intent flattened to a few
+//!   hundred characters, the encode cost scales with that length, and the result was a channel
+//!   that loaded a two-gigabyte model, embedded the whole corpus, reported no error, and
+//!   contributed to nothing in any real session. Degrading silently is right; degrading silently
+//!   *and leaving no trace* is what turned one mis-calibrated constant into an invisible total
+//!   failure. Hence [`EncodeSample`]: every encode says what it cost and whether it fit.
 //! * **It is one channel, never the answer.** The prototype that motivated ADR-0004 lost
 //!   identifier queries outright and could not tell a near-duplicate from its neighbour. Its
 //!   output is fused, never substituted.
@@ -21,7 +30,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex, OnceLock, RwLock,
         mpsc::{RecvTimeoutError, sync_channel},
     },
     time::{Duration, Instant, UNIX_EPOCH},
@@ -58,11 +67,58 @@ pub const SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS: u16 = 5_200;
 /// sheer count.
 pub const SEMANTIC_CHANNEL_LIMIT: usize = 16;
 
-/// Wall clock a single query encode may spend before the channel reports itself unavailable.
+/// Default wall clock a single query encode may spend before the channel reports itself
+/// unavailable.
 ///
-/// ADR-0004 measured 30--85 ms p95 for a loaded bge-m3. The budget is the point past which a
-/// retrieval that was never asked for stops being worth the Agent's latency.
-pub const SEMANTIC_ENCODE_BUDGET: Duration = Duration::from_millis(200);
+/// The first value here was 200 ms, taken from ADR-0004's "30--85 ms p95". That number came from a
+/// torch prototype, not the `ort` stack this workspace ships, and it was validated against probe
+/// queries 15--40 characters long. A real query is a Working Intent flattened -- goal, current
+/// direction and in-scope list concatenated -- and the encode cost is roughly linear in its
+/// length. Codex session 01a06646 built a 283-character query and every one of its automatic
+/// retrievals reported `embedding_unavailable`: the channel was not slow on that machine, it was
+/// calibrated against a query length no real session produces.
+///
+/// Measured 2026-09-03, Apple Silicon / macOS 24.6.0, ONNX Runtime 1.28.1, bge-m3 ONNX export,
+/// release profile, warm (`crates/search/tests/embedding_encode_latency.rs`, 24 samples each):
+///
+/// | chars | p50 | p95 | max |
+/// |------:|----:|----:|----:|
+/// |    20 |  28 |  33 |  37 |
+/// |    40 |  33 |  37 |  43 |
+/// |   100 |  74 |  78 |  81 |
+/// |   200 | 139 | 153 | 164 |
+/// |   283 | 197 | 235 | 243 |
+/// |   400 | 274 | 298 | 301 |
+/// |   700 | 458 | 539 | 633 |
+/// |  1400 | 757 | 816 | 828 |
+///
+/// The debug profile runs about 20% slower and tops out at 995 ms p95 for the longest query.
+/// [`SEMANTIC_MAX_TOKENS`] caps the sequence, so 1400 characters is already at the truncation
+/// ceiling and 816 ms is the worst warm encode this machine can be asked for.
+///
+/// 1200 ms is that ceiling plus headroom. It is a *ceiling*, not a typical cost: the 283-character
+/// query that exposed the defect returns in about 200 ms and the budget is never spent, and a
+/// repeat of any query is served from the query vector cache for nothing at all. What the number
+/// buys is that a machine roughly five times slower than this one still answers a real Intent
+/// instead of degrading silently, which is the failure this constant caused.
+///
+/// Operators on slower hardware raise it with `[retrieval] embedding_encode_budget_ms`; `sctx
+/// doctor` says so when it sees encodes timing out.
+pub const SEMANTIC_ENCODE_BUDGET: Duration = Duration::from_millis(1_200);
+
+/// Query vectors kept in the process-lifetime LRU that fronts the encoder.
+///
+/// A Working Intent changes far more slowly than it is read: `task_context` re-reads the same
+/// Intent, `task_artifact_focus` fires repeatedly against one Task, and every one of those builds
+/// the identical query string. Sixty-four entries is a few hundred kilobytes and covers every
+/// Intent a session realistically holds open at once.
+pub const SEMANTIC_QUERY_CACHE_CAPACITY: usize = 64;
+
+/// Encode observations kept in the discardable cache for `sctx embedding status` and `sctx doctor`.
+///
+/// Enough to show a distribution and a timeout rate; small enough that the trim is one statement
+/// and the rows never become a storage decision.
+pub const SEMANTIC_ENCODE_SAMPLE_HISTORY: usize = 64;
 
 /// Longest query, in model tokens, handed to the encoder. bge-m3 accepts far more; retrieval
 /// queries built from a Working Intent do not need them, and truncation keeps the encode inside
@@ -138,6 +194,205 @@ impl SemanticCacheKey {
             model_fingerprint: model_fingerprint.into(),
             ranking_version: ranking_version.into(),
         }
+    }
+}
+
+/// Process-lifetime LRU of query vectors, shared by every channel built over the same generation.
+///
+/// The corpus cache on disk answers "what does this Context embed to". This one answers "what does
+/// *this query* embed to", and it exists because the query side turned out to be the expensive
+/// half: one encode of a real Working Intent costs about as much as the entire lexical retrieval
+/// it is supposed to augment, and a session asks the same question repeatedly.
+///
+/// Two properties make it worth more than the memory it costs. A hit is not merely fast, it is
+/// *free*: it skips the worker thread and the budget entirely. And an encode that overran the
+/// budget still lands here when it finishes, so the caller that gave up is the only one that pays
+/// -- the next read of the same Intent is a hit. That turns a systematic timeout from permanent
+/// silence into one slow first call.
+#[derive(Debug, Default)]
+pub struct QueryVectorCache {
+    entries: Mutex<QueryVectorEntries>,
+    capacity: usize,
+}
+
+#[derive(Debug, Default)]
+struct QueryVectorEntries {
+    /// Digest of the generation and the query text, to the vector and the tick it was last read.
+    vectors: BTreeMap<[u8; 32], (Arc<Vec<f32>>, u64)>,
+    /// Monotonic read counter. Recency, not wall clock: a clock that can move backwards would let
+    /// eviction pick the entry it just stored.
+    tick: u64,
+}
+
+impl QueryVectorCache {
+    /// Builds an empty cache holding at most `capacity` vectors.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Mutex::new(QueryVectorEntries::default()),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// The shared cache for one cache generation, created on first use.
+    ///
+    /// Sharing it across channel instances is the point. [`crate::EmbeddingSemanticChannel`] is
+    /// rebuilt and republished when the corpus backfill finishes, and a per-instance cache would
+    /// be thrown away at exactly the moment a session has warmed it up.
+    #[must_use]
+    pub fn shared(key: &SemanticCacheKey) -> Arc<Self> {
+        static SHARED: OnceLock<Mutex<BTreeMap<String, Arc<QueryVectorCache>>>> = OnceLock::new();
+        let namespace = format!("{}\u{0}{}", key.model_fingerprint, key.ranking_version);
+        let caches = SHARED.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let Ok(mut caches) = caches.lock() else {
+            // A poisoned registry costs cache sharing, never an answer.
+            return Arc::new(Self::with_capacity(SEMANTIC_QUERY_CACHE_CAPACITY));
+        };
+        Arc::clone(
+            caches
+                .entry(namespace)
+                .or_insert_with(|| Arc::new(Self::with_capacity(SEMANTIC_QUERY_CACHE_CAPACITY))),
+        )
+    }
+
+    /// Returns the cached vector for `query_text` under `key`, if one is held.
+    #[must_use]
+    pub fn get(&self, key: &SemanticCacheKey, query_text: &str) -> Option<Arc<Vec<f32>>> {
+        let digest = Self::digest(key, query_text);
+        let mut entries = self.entries.lock().ok()?;
+        entries.tick = entries.tick.wrapping_add(1);
+        let tick = entries.tick;
+        let (vector, last_read) = entries.vectors.get_mut(&digest)?;
+        *last_read = tick;
+        Some(Arc::clone(vector))
+    }
+
+    /// Stores one query vector, evicting the least recently read entry when full.
+    pub fn store(&self, key: &SemanticCacheKey, query_text: &str, vector: Arc<Vec<f32>>) {
+        let digest = Self::digest(key, query_text);
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        entries.tick = entries.tick.wrapping_add(1);
+        let tick = entries.tick;
+        entries.vectors.insert(digest, (vector, tick));
+        while entries.vectors.len() > self.capacity {
+            let Some(coldest) = entries
+                .vectors
+                .iter()
+                .min_by_key(|(_, (_, last_read))| *last_read)
+                .map(|(digest, _)| *digest)
+            else {
+                break;
+            };
+            entries.vectors.remove(&coldest);
+        }
+    }
+
+    /// How many vectors the cache currently holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .map_or(0, |entries| entries.vectors.len())
+    }
+
+    /// True when the cache holds nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Hashes the generation and the query together, so a model swap cannot serve a stale vector.
+    fn digest(key: &SemanticCacheKey, query_text: &str) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(key.model_fingerprint.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(key.ranking_version.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(query_text.as_bytes());
+        hasher.finalize().into()
+    }
+}
+
+/// One observed query encode.
+///
+/// The channel's whole failure surface is `Unavailable`, which is honest but says nothing about
+/// *why*. A timeout and an absent model read identically in the Pack, and the defect this type
+/// exists to prevent -- a budget that no real query can meet -- was invisible for exactly that
+/// reason: fail-open with no trace. These rows are what makes the difference legible after the
+/// fact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct EncodeSample {
+    /// Characters in the query that was encoded, which is what the cost scales with.
+    pub query_chars: u32,
+    /// Wall clock the encode itself took, whether or not the caller was still waiting.
+    pub elapsed_ms: u32,
+    /// The budget in force when it ran.
+    pub budget_ms: u32,
+    /// Whether the encode overran that budget, which is what the caller saw as `Unavailable`.
+    pub timed_out: bool,
+}
+
+/// Where a channel reports what its encodes cost. Implemented by [`SemanticVectorCache`]; absent
+/// on every channel that has no discardable cache to write to, such as the in-memory test ones.
+pub trait EncodeSampleRecorder: Send + Sync {
+    /// Records one observation. Failure is not reportable: a diagnostic that can fail a retrieval
+    /// is worse than no diagnostic.
+    fn record(&self, sample: EncodeSample);
+}
+
+/// What the recorded encodes add up to, for `sctx embedding status` and `sctx doctor`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct EncodeLatencySummary {
+    /// Observations the summary is built from.
+    pub samples: usize,
+    /// How many of them overran the budget.
+    pub timed_out: usize,
+    /// Median observed encode, in milliseconds.
+    pub p50_ms: u32,
+    /// 95th percentile observed encode, in milliseconds.
+    pub p95_ms: u32,
+    /// Slowest observed encode, in milliseconds.
+    pub max_ms: u32,
+    /// The budget in force at the most recent observation.
+    pub budget_ms: u32,
+}
+
+impl EncodeLatencySummary {
+    /// Summarises a batch of observations, newest first.
+    #[must_use]
+    pub fn from_samples(samples: &[EncodeSample]) -> Self {
+        if samples.is_empty() {
+            return Self::default();
+        }
+        let mut elapsed = samples
+            .iter()
+            .map(|sample| sample.elapsed_ms)
+            .collect::<Vec<_>>();
+        elapsed.sort_unstable();
+        let percentile = |fraction: usize| {
+            let rank = (elapsed.len() * fraction).div_ceil(100).saturating_sub(1);
+            elapsed[rank.min(elapsed.len() - 1)]
+        };
+        Self {
+            samples: samples.len(),
+            timed_out: samples.iter().filter(|sample| sample.timed_out).count(),
+            p50_ms: percentile(50),
+            p95_ms: percentile(95),
+            max_ms: elapsed.last().copied().unwrap_or_default(),
+            budget_ms: samples.first().map_or(0, |sample| sample.budget_ms),
+        }
+    }
+
+    /// True when the recorded history is long enough to trust and mostly timeouts.
+    ///
+    /// One timeout is a busy machine. A majority of them over a full history is the shape of the
+    /// defect this whole module was repaired for: a budget the local hardware cannot meet, which
+    /// silently costs every automatic retrieval its semantic channel.
+    #[must_use]
+    pub const fn budget_is_unfit(&self) -> bool {
+        self.samples >= 8 && self.timed_out * 2 > self.samples
     }
 }
 
@@ -241,7 +496,14 @@ impl SemanticVectorCache {
                      dimensions INTEGER NOT NULL,
                      vector BLOB NOT NULL,
                      PRIMARY KEY (revision_id, model_fingerprint, ranking_version)
-                 ) WITHOUT ROWID;",
+                 ) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS encode_sample (
+                     observed_at INTEGER PRIMARY KEY AUTOINCREMENT,
+                     query_chars INTEGER NOT NULL,
+                     elapsed_ms INTEGER NOT NULL,
+                     budget_ms INTEGER NOT NULL,
+                     timed_out INTEGER NOT NULL
+                 );",
             )
             .map_err(|error| {
                 Error::new(
@@ -406,6 +668,44 @@ impl SemanticVectorCache {
         Ok(removed)
     }
 
+    /// Returns the most recent encode observations, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::Io`] when the cache cannot be read.
+    pub fn recent_encode_samples(&self, limit: usize) -> Result<Vec<EncodeSample>> {
+        let connection = self.locked()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT query_chars, elapsed_ms, budget_ms, timed_out
+                 FROM encode_sample ORDER BY observed_at DESC LIMIT ?1",
+            )
+            .map_err(|error| Error::new(ErrorKind::Io, format!("read encode samples: {error}")))?;
+        let rows = statement
+            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                Ok(EncodeSample {
+                    query_chars: row.get::<_, i64>(0)?.try_into().unwrap_or(u32::MAX),
+                    elapsed_ms: row.get::<_, i64>(1)?.try_into().unwrap_or(u32::MAX),
+                    budget_ms: row.get::<_, i64>(2)?.try_into().unwrap_or(u32::MAX),
+                    timed_out: row.get::<_, i64>(3)? != 0,
+                })
+            })
+            .map_err(|error| Error::new(ErrorKind::Io, format!("read encode samples: {error}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| Error::new(ErrorKind::Io, format!("read encode samples: {error}")))
+    }
+
+    /// Summarises the recorded encode history.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::Io`] when the cache cannot be read.
+    pub fn encode_latency_summary(&self) -> Result<EncodeLatencySummary> {
+        Ok(EncodeLatencySummary::from_samples(
+            &self.recent_encode_samples(SEMANTIC_ENCODE_SAMPLE_HISTORY)?,
+        ))
+    }
+
     fn locked(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
         self.connection.lock().map_err(|_| {
             Error::new(
@@ -413,6 +713,42 @@ impl SemanticVectorCache {
                 "semantic cache connection lock was poisoned",
             )
         })
+    }
+}
+
+/// Encode observations go to the same discardable file the vectors do.
+///
+/// They belong there and nowhere durable: they describe how this machine performed, they are worth
+/// nothing after the operator changes hardware or model, and deleting `semantic.sqlite` to reclaim
+/// disk must never be a decision about diagnostics. Every write is best-effort for the same
+/// reason -- a full disk degrades observability, never retrieval.
+impl EncodeSampleRecorder for SemanticVectorCache {
+    fn record(&self, sample: EncodeSample) {
+        let Ok(connection) = self.locked() else {
+            return;
+        };
+        if connection
+            .execute(
+                "INSERT INTO encode_sample (query_chars, elapsed_ms, budget_ms, timed_out)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    i64::from(sample.query_chars),
+                    i64::from(sample.elapsed_ms),
+                    i64::from(sample.budget_ms),
+                    i64::from(sample.timed_out),
+                ],
+            )
+            .is_err()
+        {
+            return;
+        }
+        let _trimmed = connection.execute(
+            "DELETE FROM encode_sample WHERE observed_at <= (
+                 SELECT observed_at FROM encode_sample
+                 ORDER BY observed_at DESC LIMIT 1 OFFSET ?1
+             )",
+            [i64::try_from(SEMANTIC_ENCODE_SAMPLE_HISTORY).unwrap_or(i64::MAX)],
+        );
     }
 }
 
@@ -494,22 +830,41 @@ pub struct EmbeddingSemanticChannel {
     floor_basis_points: u16,
     limit: usize,
     budget: Duration,
+    /// Generation this channel's query vectors belong to. A channel built over a bare vector
+    /// snapshot has no fingerprint to name, so it gets a private one and shares nothing.
+    key: SemanticCacheKey,
+    query_cache: Arc<QueryVectorCache>,
+    recorder: Option<Arc<dyn EncodeSampleRecorder>>,
 }
 
 impl EmbeddingSemanticChannel {
     /// Builds a channel over an in-memory vector snapshot.
+    ///
+    /// Its query cache is private to this channel: with no model fingerprint there is no way to
+    /// tell whether another channel's vectors came from the same encoder, and a shared cache that
+    /// might be wrong is worse than one that is merely small.
     #[must_use]
     pub fn new(provider: Arc<dyn EmbeddingProvider>, vectors: Vec<(RevisionId, Vec<f32>)>) -> Self {
+        let key = SemanticCacheKey::new("in-memory", "in-memory");
+        let query_cache = Arc::new(QueryVectorCache::with_capacity(
+            SEMANTIC_QUERY_CACHE_CAPACITY,
+        ));
         Self {
             provider,
             vectors: Arc::new(vectors),
             floor_basis_points: SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS,
             limit: SEMANTIC_CHANNEL_LIMIT,
             budget: SEMANTIC_ENCODE_BUDGET,
+            key,
+            query_cache,
+            recorder: None,
         }
     }
 
     /// Builds a channel over everything the cache currently holds under `key`.
+    ///
+    /// The query vector cache is the shared one for `key`, so the second publish that follows a
+    /// finished backfill inherits whatever the first one warmed up.
     ///
     /// # Errors
     ///
@@ -519,15 +874,41 @@ impl EmbeddingSemanticChannel {
         cache: &SemanticVectorCache,
         key: &SemanticCacheKey,
     ) -> Result<Self> {
-        Ok(Self::new(provider, cache.load(key)?))
+        let vectors = cache.load(key)?;
+        Ok(Self {
+            key: key.clone(),
+            query_cache: QueryVectorCache::shared(key),
+            ..Self::new(provider, vectors)
+        })
     }
 
-    /// Overrides the encode budget. Tests that must observe the timeout degradation set it
-    /// deliberately low; nothing else changes it.
+    /// Overrides the encode budget. `sctx mcp serve` sets it from `[retrieval]
+    /// embedding_encode_budget_ms`, and tests that must observe the timeout degradation set it
+    /// deliberately low.
     #[must_use]
     pub const fn with_budget(mut self, budget: Duration) -> Self {
         self.budget = budget;
         self
+    }
+
+    /// Attaches the sink that records what encodes cost.
+    #[must_use]
+    pub fn with_encode_recorder(mut self, recorder: Arc<dyn EncodeSampleRecorder>) -> Self {
+        self.recorder = Some(recorder);
+        self
+    }
+
+    /// Replaces the query vector cache, for tests that need an isolated one.
+    #[must_use]
+    pub fn with_query_cache(mut self, query_cache: Arc<QueryVectorCache>) -> Self {
+        self.query_cache = query_cache;
+        self
+    }
+
+    /// The query vector cache this channel reads and fills.
+    #[must_use]
+    pub fn query_cache(&self) -> &Arc<QueryVectorCache> {
+        &self.query_cache
     }
 
     /// How many corpus vectors this channel can rank against.
@@ -536,20 +917,48 @@ impl EmbeddingSemanticChannel {
         self.vectors.len()
     }
 
-    /// Encodes on a detached worker so a slow model costs the caller the budget, not the encode.
+    /// Returns the query vector, from cache if possible and from the encoder otherwise.
     ///
-    /// Returning `None` on timeout leaves the worker running; it writes into a buffered channel
-    /// nobody reads and exits. That wastes one encode. Holding the retrieval path open until an
-    /// unbounded model call returns would waste the Agent's turn.
-    fn encode_within_budget(&self, text: &str) -> Option<Vec<f32>> {
+    /// The cache lookup comes first and costs no thread, no budget and no model call. Only a miss
+    /// reaches the encoder.
+    ///
+    /// The encode runs on a detached worker so a slow model costs the caller the budget rather
+    /// than the encode. Returning `None` on timeout leaves that worker running, and it now does
+    /// two useful things before it exits: it stores its vector in the query cache, so the next
+    /// read of the same Intent is an immediate hit rather than a second timeout, and it records
+    /// what it cost. A budget this machine cannot meet used to be indistinguishable from a missing
+    /// model; it is now one slow call followed by hits, and a row in the encode history either
+    /// way.
+    fn encode_within_budget(&self, text: &str) -> Option<Arc<Vec<f32>>> {
+        if let Some(cached) = self.query_cache.get(&self.key, text) {
+            return Some(cached);
+        }
         let provider = Arc::clone(&self.provider);
+        let query_cache = Arc::clone(&self.query_cache);
+        let recorder = self.recorder.clone();
+        let key = self.key.clone();
+        let budget = self.budget;
         let owned = text.to_owned();
         let (sender, receiver) = sync_channel(1);
         let started = Instant::now();
         if std::thread::Builder::new()
             .name("sctx-embedding-query".to_owned())
             .spawn(move || {
-                let _ignored = sender.send(provider.encode(&owned));
+                let outcome = provider.encode(&owned);
+                let elapsed = started.elapsed();
+                let vector = outcome.map(Arc::new);
+                if let Ok(vector) = &vector {
+                    query_cache.store(&key, &owned, Arc::clone(vector));
+                }
+                let _ignored = sender.send(vector);
+                if let Some(recorder) = recorder {
+                    recorder.record(EncodeSample {
+                        query_chars: u32::try_from(owned.chars().count()).unwrap_or(u32::MAX),
+                        elapsed_ms: u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX),
+                        budget_ms: u32::try_from(budget.as_millis()).unwrap_or(u32::MAX),
+                        timed_out: elapsed > budget,
+                    });
+                }
             })
             .is_err()
         {
