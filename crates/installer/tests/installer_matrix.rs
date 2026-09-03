@@ -3428,8 +3428,9 @@ fn doctor_reports_the_embedding_channel_as_off_configured_or_broken() {
     assert_eq!(off.status, CheckStatus::Ok);
     assert!(off.message.contains("Off."), "{}", off.message);
     assert!(
-        off.message.contains("embedding_model_path"),
-        "an operator who wants the channel must learn how from doctor: {}",
+        off.message.contains("sctx embedding install"),
+        "an operator who wants the channel must learn how from doctor, and since T5c that is one \
+         command rather than a manual errand: {}",
         off.message
     );
 

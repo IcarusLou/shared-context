@@ -75,7 +75,7 @@ const HELP: &str = r"Shared Context command-line interface
 Usage: sctx [--json] <COMMAND>
 
 Commands:
-  setup [--demo] [--agents cursor,codex] [--knowledge-store-url GIT_URL]
+  setup [--demo] [--embedding] [--agents cursor,codex] [--knowledge-store-url GIT_URL]
       [--root PATH] [--runtime-source PATH]
   demo
   doctor [--fix] [--recheck] [--root PATH]
@@ -83,6 +83,7 @@ Commands:
   uninstall [--root PATH]
   data reset [--dry-run] [--yes]
   knowledge sync|delete
+  embedding install|status|remove
   space create|intent revise|list|get
   candidate list|get|discard|confirm|build-closed-episode|analyze
   context revise|review|publish|withdraw|get
@@ -205,6 +206,7 @@ fn run_without_maintenance(args: &[String], json_output: bool) -> Result<()> {
         [command, rest @ ..] if command == "uninstall" => run_uninstall(rest, json_output),
         [group, rest @ ..] if group == "data" => run_data(rest, json_output),
         [group, rest @ ..] if group == "knowledge" => run_knowledge(rest, json_output),
+        [group, rest @ ..] if group == "embedding" => run_embedding(rest, json_output),
         [group, rest @ ..] if group == "space" => run_space(rest, json_output),
         [group, rest @ ..] if group == "candidate" => run_candidate(rest, json_output),
         [group, rest @ ..] if group == "context" => run_context(rest, json_output),
@@ -226,7 +228,7 @@ fn run_without_maintenance(args: &[String], json_output: bool) -> Result<()> {
 }
 
 fn run_install_lifecycle(command: &str, args: &[String], json_output: bool) -> Result<()> {
-    let options = Options::parse(args, &["--yes", "--demo"])?;
+    let options = Options::parse(args, &["--yes", "--demo", "--embedding"])?;
     options.allow_only(
         &[
             "--agents",
@@ -235,21 +237,32 @@ fn run_install_lifecycle(command: &str, args: &[String], json_output: bool) -> R
             "--runtime-version",
             "--knowledge-store-url",
         ],
-        &["--yes", "--demo"],
+        &["--yes", "--demo", "--embedding"],
     )?;
     if command != "setup" && options.has("--demo") {
         return Err(invalid("--demo applies only to setup"));
+    }
+    // `upgrade` deliberately never provisions the channel. An upgrade is expected to be quick and
+    // unattended; a 2.3 GB download is neither, and an installation that wanted the channel
+    // already has it.
+    if command != "setup" && options.has("--embedding") {
+        return Err(invalid(
+            "--embedding applies only to setup; run `sctx embedding install` to add the channel to an existing installation",
+        ));
     }
     if command != "setup" && options.provided("--knowledge-store-url") {
         return Err(invalid("--knowledge-store-url applies only to setup"));
     }
     let installer = installer_from_options(&options)?;
     let setup = setup_options(&options)?;
-    let report = if command == "setup" {
+    let mut report = if command == "setup" {
         installer.setup(&setup)?
     } else {
         installer.upgrade(&setup)?
     };
+    if options.has("--embedding") {
+        append_setup_embedding(&mut report, json_output);
+    }
     if options.has("--demo") {
         let _maintenance = MaintenanceLock::open_or_create(&report.root)?.try_shared()?;
         let (demo, metadata) = complete_demo(&report.root)?;
@@ -443,6 +456,148 @@ fn run_knowledge(args: &[String], json_output: bool) -> Result<()> {
         &json!({"repository": deleted, "deleted": true}),
         json_output,
     )
+}
+
+const EMBEDDING_HELP: &str = r"Usage:
+  sctx embedding install [--model-url <BASE_URL>] [--runtime-url <URL>]
+      [--expected-sha256 <SHA256>] [--root PATH]
+  sctx embedding status [--verify] [--root PATH]
+  sctx embedding remove --yes [--root PATH]
+
+`install` downloads a bge-m3 ONNX export and an ONNX Runtime library into
+`~/.shared-context/embedding/`, proves the model loads, writes `[retrieval]`,
+and fills the vector cache. It needs about 2.3 GB of disk and is safe to rerun:
+verified files are not downloaded twice.
+
+`--model-url` names a directory serving `model.onnx`, `model.onnx_data` and
+`tokenizer.json` under those names -- an internal mirror, for example. The
+built-in SHA-256 digests still apply, so a mirror serving different bytes is
+rejected.
+";
+
+/// Provisions, inspects, or removes the optional embedding recall channel (ADR-0004).
+///
+/// Progress goes to stderr, and only when `--json` was not asked for. A half-hour download that
+/// printed nothing until it finished would look indistinguishable from a hang, so a human gets a
+/// running account; but stderr is also where this CLI puts its error envelope, so narrating over
+/// it would leave a scripted caller parsing prose. `--json` means a machine is reading, and a
+/// machine gets the two streams it was promised and nothing else.
+fn run_embedding(args: &[String], json_output: bool) -> Result<()> {
+    let [command, rest @ ..] = args else {
+        return Err(invalid(EMBEDDING_HELP));
+    };
+    if is_help(args) || is_help(rest) {
+        print!("{EMBEDDING_HELP}");
+        return Ok(());
+    }
+    let mut progress = embedding_progress(json_output);
+    match command.as_str() {
+        "install" => {
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(
+                &[
+                    "--root",
+                    "--runtime-source",
+                    "--runtime-version",
+                    "--model-url",
+                    "--runtime-url",
+                    "--expected-sha256",
+                ],
+                &[],
+            )?;
+            let root = embedding_root(&options)?;
+            let report = sctx_installer::embedding::install(
+                &root,
+                &embedding_install_options(&options)?,
+                &mut progress,
+            )?;
+            emit_lifecycle(&report, json_output)
+        }
+        "status" => {
+            let options = Options::parse(rest, &["--verify"])?;
+            options.allow_only(
+                &["--root", "--runtime-source", "--runtime-version"],
+                &["--verify"],
+            )?;
+            let report = sctx_installer::embedding::status(
+                &embedding_root(&options)?,
+                options.has("--verify"),
+            )?;
+            emit_lifecycle(&report, json_output)
+        }
+        "remove" => {
+            let options = Options::parse(rest, &["--yes"])?;
+            options.allow_only(
+                &["--root", "--runtime-source", "--runtime-version"],
+                &["--yes"],
+            )?;
+            let report = sctx_installer::embedding::remove(
+                &embedding_root(&options)?,
+                options.has("--yes"),
+                &mut progress,
+            )?;
+            emit_lifecycle(&report, json_output)
+        }
+        _ => Err(invalid(format!(
+            "embedding command must be install, status, or remove\n\n{EMBEDDING_HELP}"
+        ))),
+    }
+}
+
+/// Narrates a long provisioning run to stderr, unless a machine asked for JSON.
+fn embedding_progress(json_output: bool) -> impl FnMut(&str) {
+    move |line: &str| {
+        if !json_output {
+            eprintln!("sctx embedding: {line}");
+        }
+    }
+}
+
+fn embedding_root(options: &Options) -> Result<PathBuf> {
+    options
+        .optional("--root")?
+        .map_or_else(installation_root, |value| Ok(PathBuf::from(value)))
+}
+
+fn embedding_install_options(
+    options: &Options,
+) -> Result<sctx_installer::embedding::InstallOptions> {
+    Ok(sctx_installer::embedding::InstallOptions {
+        model_url: options.optional("--model-url")?.map(str::to_owned),
+        runtime_url: options.optional("--runtime-url")?.map(str::to_owned),
+        expected_runtime_sha256: options.optional("--expected-sha256")?.map(str::to_owned),
+    })
+}
+
+/// Runs the embedding provisioning that `setup --embedding` asked for, without letting it fail
+/// setup.
+///
+/// The channel is an optional enhancement to retrieval, and the installation it enhances is
+/// already complete and working by the time this runs. Failing the whole `setup` over a download
+/// that timed out would trade a working installation for no installation, so a failure becomes a
+/// notice on the report and an operator who can rerun `sctx embedding install` whenever they like.
+///
+/// It runs *after* `installer.setup()` returns rather than inside it, because setup holds the
+/// exclusive maintenance lock for its whole duration and a 2.3 GB download does not belong inside
+/// a lock that blocks every other `sctx` process on the machine.
+fn append_setup_embedding(report: &mut sctx_installer::SetupReport, json_output: bool) {
+    let mut progress = embedding_progress(json_output);
+    match sctx_installer::embedding::install(
+        &report.root,
+        &sctx_installer::embedding::InstallOptions::default(),
+        &mut progress,
+    ) {
+        Ok(embedding) => report.notices.push(format!(
+            "Embedding recall channel enabled: model {}, runtime {}, {} Context revision(s) embedded.",
+            embedding.model_path.display(),
+            embedding.runtime_path.display(),
+            embedding.embedded
+        )),
+        Err(error) => report.notices.push(format!(
+            "Setup finished, but --embedding did not: {error} Retrieval stays lexical, which is \
+             the default; rerun `sctx embedding install` to try again."
+        )),
+    }
 }
 
 fn installer_from_options(options: &Options) -> Result<sctx_installer::Installer> {

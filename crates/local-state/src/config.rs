@@ -313,6 +313,30 @@ fn retrieval_path(value: Option<&str>, field: &str) -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
+/// Renders one path for storage, applying the same rules a read would enforce.
+///
+/// A writer that accepted a relative path would produce a document its own reader rejects, so the
+/// check happens on the way in rather than being discovered on the next `serve`. The path is not
+/// required to exist: `sctx embedding install` writes it immediately after proving it loads, and a
+/// stale entry is [`super::UserConfigStore`]'s to report, not to prevent.
+fn absolute_retrieval_text(path: &Path, field: &str) -> Result<String> {
+    if !path.is_absolute() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("{field} must be an absolute path, got {}", path.display()),
+        ));
+    }
+    path.to_str()
+        .map(str::to_owned)
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("{field} must be non-empty UTF-8"),
+            )
+        })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RepositoryConfigDocument {
@@ -1006,6 +1030,63 @@ impl UserConfigStore {
                 previous_repository_id: from.clone(),
                 repository,
             })
+        })();
+        finish_locked(&lock, outcome)
+    }
+
+    /// Points `[retrieval]` at a model directory and an ONNX Runtime library.
+    ///
+    /// Both halves are written together because half a configuration is the same fact as none
+    /// (see [`RetrievalSettings`]); there is deliberately no way to set one from here. The write
+    /// goes through the same read-modify-validate-replace path as the Catalog writers, so every
+    /// other table in `config.toml` round-trips untouched and a concurrent reader either sees the
+    /// old document or the new one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input error when either path is relative or empty, and typed locking or
+    /// filesystem errors when the document cannot be read or replaced.
+    pub fn set_retrieval_embedding(
+        &self,
+        model_path: &Path,
+        runtime_path: &Path,
+    ) -> Result<RetrievalSettings> {
+        let model = absolute_retrieval_text(model_path, "retrieval.embedding_model_path")?;
+        let runtime = absolute_retrieval_text(runtime_path, "retrieval.embedding_runtime_path")?;
+        let lock = self.lock()?;
+        let outcome = (|| {
+            let mut document = self.read_document()?;
+            document.retrieval = Some(RetrievalConfigDocument {
+                embedding_model_path: Some(model),
+                embedding_runtime_path: Some(runtime),
+            });
+            self.validate_document(&document)?;
+            self.write_document(&document)?;
+            RetrievalSettings::from_document(document.retrieval.as_ref())
+        })();
+        finish_locked(&lock, outcome)
+    }
+
+    /// Removes both `[retrieval]` embedding keys, reporting whether anything was configured.
+    ///
+    /// The whole table is dropped rather than emptied: an empty `[retrieval]` and an absent one
+    /// mean the same thing to every reader, and the absent one is what a never-configured
+    /// installation has, so removal restores the exact document shape it started from.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or filesystem errors.
+    pub fn clear_retrieval_embedding(&self) -> Result<bool> {
+        let lock = self.lock()?;
+        let outcome = (|| {
+            let mut document = self.read_document()?;
+            if document.retrieval.is_none() {
+                return Ok(false);
+            }
+            document.retrieval = None;
+            self.validate_document(&document)?;
+            self.write_document(&document)?;
+            Ok(true)
         })();
         finish_locked(&lock, outcome)
     }

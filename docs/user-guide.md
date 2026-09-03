@@ -256,6 +256,69 @@ sctx knowledge delete --confirm-path <知识仓库的绝对路径> \
 
 先运行 `sctx uninstall` 并确认输出中的 `repository` 路径，再决定是否执行知识删除。不要猜路径，也不要把父目录或通配符作为目标。
 
+### 3.7 启用语义召回（可选）
+
+默认检索是纯词法的。词法通道找不到「砍掉 / 排除」「参数拼装 / addParamsForLiveAnchor」这类**只有同义关系、没有共同词**的联系，也搜不动跨语言（英文 Intent 对中文知识库）。语义召回（ADR-0004）补的就是这一路。它是**可选增强**：不装就完全不存在，检索行为与加这个通道之前逐字节一致，零磁盘、零内存、零延迟开销。
+
+一条命令启用：
+
+```bash
+sctx embedding install
+```
+
+它会依次做完过去要手工做的六步：下载 bge-m3 的 ONNX 导出（`model.onnx`、`model.onnx_data`、`tokenizer.json`）和 ONNX Runtime 1.28.1 的动态库，逐个文件按内置 SHA-256 校验，解包取出 `libonnxruntime.dylib`，**真的加载模型编码一句话**证明它能跑，然后才写 `config.toml` 的 `[retrieval]`，最后把已接受 Context 的向量回填进 `state/semantic.sqlite` 并打印条数。
+
+安装过程逐步打印在 stderr，stdout 仍然只有一个 JSON 信封，所以 `sctx --json embedding install` 可以直接被脚本消费。
+
+**开销预期**（bge-m3，实测量级）：
+
+| 项目 | 预期 |
+|---|---|
+| 下载体积 | 约 2.3 GB（其中 `model.onnx_data` 2.1 GB） |
+| 安装后磁盘 | `~/.shared-context/embedding/` 约 2.3 GB，另加 `state/semantic.sqlite`（每条 revision 约 4 KB） |
+| 常驻内存 | 模型加载后 RSS 约 1.2 GB，只在 `sctx mcp serve` 进程里 |
+| 模型加载耗时 | 9–12 秒，每个 serve 进程一次，后台线程完成，加载期间检索照常走词法通道 |
+| 查询编码 | p95 30–85 ms，超过 200ms 预算的单次编码静默降级 |
+| `install` 总耗时 | 下载时间 + 约 15 秒（校验 + 自检 + 回填） |
+
+命令是**幂等**的：已经存在且校验通过的文件不会重新下载，中断的下载会从断点续传，所以一次失败的 2.1 GB 传输重跑就好，不用从头再来。
+
+**团队内网源**。`--model-url` 指向一个按原名提供那三个文件的目录，公司内网镜像最常见：
+
+```bash
+sctx embedding install --model-url https://mirror.example.internal/models/bge-m3-onnx
+```
+
+内置的 SHA-256 是**文件的属性、不是站点的属性**：镜像同样要过一模一样的校验，字节不对就直接失败，什么都不装、也不写配置。这正是 `--model-url` 敢存在的原因。指定 `--model-url` 后不再回退到公网（否则「指定内网源」这件事就白做了）。
+
+`--runtime-url` 同理指向一个 ONNX Runtime release tarball。
+
+**平台支持**。macOS arm64 开箱即用。macOS x86_64 上游 ONNX Runtime 1.28.1 **没有发布**对应产物，所以必须自己提供并为其背书：
+
+```bash
+sctx embedding install --runtime-url <URL> --expected-sha256 <shasum -a 256 的输出>
+```
+
+其他平台会直接报 unsupported，并给出手工配置 `[retrieval]` 的指引——通道本身不限平台，只有这条便捷命令限。
+
+**查看与关闭**：
+
+```bash
+sctx embedding status            # 配置、文件、向量条数、模型指纹（不加载模型）
+sctx embedding status --verify   # 额外真加载一次，确认能跑（9–12 秒）
+sctx embedding remove --yes      # 删配置节 + embedding/ 目录 + semantic.sqlite
+```
+
+`status` 默认只查文件字节数不重算 SHA-256——对 2.1 GB 重算一次要十几秒，而它要抓的问题（文件被删或写了一半）字节数就能看出来；想确认「字节是对的」而不只是「文件在」，用 `--verify`。
+
+也可以在首次安装时顺带启用：
+
+```bash
+sctx setup --embedding
+```
+
+这一步失败**不会**让 `setup` 失败——语义召回是可选增强，用一个能工作的安装去换一个装不上的安装并不划算；失败只在报告的 `notices` 里留一条，之后随时可以重跑 `sctx embedding install`。`sctx upgrade` 不会自动安装。
+
 ## 4. 基础原理
 
 ### 4.1 一条知识是怎样产生的
@@ -507,7 +570,7 @@ sctx candidate discard \
 
 | 命令 | 功能 |
 |---|---|
-| `sctx setup [--demo] [--agents cursor,codex] [--knowledge-store-url GIT_URL]` | 首次安装运行时、知识库、索引、MCP、Hook 和 Skill；可从已有非空远端 Store 克隆并幂等执行。`--demo` 是 #195 已接受的非核心已知限制，不作为安装验收。 |
+| `sctx setup [--demo] [--embedding] [--agents cursor,codex] [--knowledge-store-url GIT_URL]` | 首次安装运行时、知识库、索引、MCP、Hook 和 Skill；可从已有非空远端 Store 克隆并幂等执行。`--demo` 是 #195 已接受的非核心已知限制，不作为安装验收。`--embedding` 在安装完成后顺带启用语义召回（见 3.7）；失败只记一条 notice，不会让 setup 失败。 |
 | `sctx demo` | 建立并验证固定演示闭环；重复执行可复用已有演示数据。 |
 | `sctx doctor` | 只读检查安装、索引、配置、MCP 和 Agent 能力。 |
 | `sctx doctor --fix` | 重做安全、可逆的注册和索引设置后再次检查。 |
@@ -517,6 +580,9 @@ sctx candidate discard \
 | `sctx uninstall` | 精确移除安装器拥有的运行时和接入配置，保留知识库。 |
 | `sctx knowledge sync` | 显式收取远端默认/工作分支，验证并合并到本机 InstallationWorkBranch，只发布该工作分支。 |
 | `sctx knowledge delete ...` | 双重确认后永久删除知识 Git 仓库。 |
+| `sctx embedding install [--model-url BASE] [--runtime-url URL] [--expected-sha256 SHA]` | 一条命令启用语义召回：下载模型与 ONNX Runtime、校验、自检、写 `[retrieval]`、回填向量缓存（见 3.7）。 |
+| `sctx embedding status [--verify]` | 报告配置、文件、向量条数与模型指纹；`--verify` 才真正加载模型（9–12 秒）。 |
+| `sctx embedding remove --yes` | 删除 `[retrieval]`、`~/.shared-context/embedding/` 与 `state/semantic.sqlite`。 |
 
 `--root`、`--runtime-source`、`--runtime-version` 主要用于安装包、测试和受控部署。普通命令固定读取 `~/.shared-context`，日常用户应使用默认根目录，避免“setup 到自定义目录、运行时却读取默认目录”的混淆。
 
@@ -793,9 +859,9 @@ embedding_runtime_path = "/absolute/path/to/libonnxruntime.dylib"
 ```
 
 - `[hooks] artifact_focus_reminder`：默认 `false`（关闭）。关闭时 PostTool Hook 与该开关引入前逐字节一致。显式改成 `true` 后，仅对被识别为单个文件操作的工具事件，用本机 Catalog 把绝对路径解析到已登记 Repository（该 Repository 必须在本会话准入范围内，所以父目录会话会按文件选对仓库），再对 `engineering.sqlite` 做一次只读查询（不加锁、不跑 Git、不 scan、不 rebuild）；命中已接受且可自动注入的 Graph Context 时，追加一条不超过 800 字节的提示（最多 3 个 Context ID、每个标题截断到 60 字符，加一句固定的“可以调用 `task_artifact_focus` 查看”提示文案），不包含 statement/evidence 正文，也不写任何事实。同一 Session 对同一文件只提示一次。这个开关只影响以绝对文件路径命中的工具事件，不覆盖模块/符号/API/Schema/测试等其他定位方式。
-- `[retrieval]`：可选的 embedding 召回通道（ADR-0004）。**两个键都不写就是默认：通道完全不存在，检索与加入该通道之前逐字节一致，零磁盘、零内存、零延迟开销。** 两个键必须同时写、且都必须是绝对路径；只写一个视为配置错误（`sctx doctor` 会 Warning，通道保持关闭）。
-  - `embedding_model_path`：模型目录，需包含 `model.onnx`（若是拆分导出还需同目录的 `model.onnx_data`）与 `tokenizer.json`。推荐 bge-m3 的 ONNX 导出（约 2.1GB 磁盘、约 1.2GB 常驻内存）。模型不随包分发，需要自行下载。
-  - `embedding_runtime_path`：本机 ONNX Runtime 动态库（macOS `libonnxruntime.dylib`、Linux `libonnxruntime.so`）。构建期不下载任何二进制，运行时才按此路径加载。
+- `[retrieval]`：可选的 embedding 召回通道（ADR-0004）。**两个键都不写就是默认：通道完全不存在，检索与加入该通道之前逐字节一致，零磁盘、零内存、零延迟开销。** 两个键必须同时写、且都必须是绝对路径；只写一个视为配置错误（`sctx doctor` 会 Warning，通道保持关闭）。**不需要手工写这一节**：`sctx embedding install`（见 3.7）会下载、校验、自检后替你写好；下面的说明是给自备模型或非 macOS 平台的用户看的。
+  - `embedding_model_path`：模型目录，需包含 `model.onnx`（若是拆分导出还需同目录的 `model.onnx_data`）与 `tokenizer.json`。推荐 bge-m3 的 ONNX 导出（约 2.1GB 磁盘、约 1.2GB 常驻内存）。模型不随包分发；`sctx embedding install` 会下载到 `~/.shared-context/embedding/model/`，也可以自行下载后手工指向别处。
+  - `embedding_runtime_path`：本机 ONNX Runtime 动态库（macOS `libonnxruntime.dylib`、Linux `libonnxruntime.so`）。构建期不下载任何二进制，运行时才按此路径加载。`sctx embedding install` 会解包到 `~/.shared-context/embedding/runtime/`。
   - 开启后：`sctx mcp serve` 启动时由后台线程加载模型（一次性 9–12 秒）并把已接受 Context 的向量写入 `state/semantic.sqlite`（可随时删除的本地缓存，不进 Git、不进 `index.sqlite`，按模型指纹与 ranking 版本键控）。自动注入的查询会额外走一路余弦召回（阈值 0.52、最多 16 条），与词法通道一起做 RRF 融合；语义命中本身构成一条独立的注入资格路径。模型未就绪 / 加载失败 / 单次编码超过 200ms 预算时，该路静默降级为 `omitted.reason = "embedding_unavailable"`，词法结果不受影响。
   - 显式 `context_search` 本轮不接入该通道，保持纯词法。
 - `[context_ttl]`：按 Context 类型（`decision`/`contract`/`issue`/`risk`/`validation`/`discovery`/`progress`）配置一个带单位的正时长（`s`/`m`/`h`/`d`/`w`），不配置的类型没有时效。到期起点是该 Context 被接受时所在 commit 的时间，不是本机当前时间。过期后状态变为 `historical`：排除自动注入，仍可以被 `search`/`context get` 查到。

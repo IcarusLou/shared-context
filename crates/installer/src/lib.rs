@@ -42,6 +42,8 @@ use sha2::{Digest, Sha256};
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 use uuid::Uuid;
 
+pub mod embedding;
+
 const JOURNAL_VERSION: u32 = 1;
 const RESET_JOURNAL_VERSION: u32 = 1;
 const MANIFEST_VERSION: u32 = 1;
@@ -4050,11 +4052,22 @@ fn check_index(root: &Path, checks: &mut Vec<DoctorCheck>) {
 const GRAPH_REPAIR: &str = "Run `sctx association rebuild` (or `sctx doctor --fix`), and check \
      that `[engineering] auto_scan` is not disabled.";
 
-/// What an operator has to do to turn the embedding channel on.
-const RETRIEVAL_SETUP: &str = "Download a bge-m3 ONNX export (`model.onnx`, its `model.onnx_data` \
-     if the export is split, and `tokenizer.json`) plus an ONNX Runtime shared library for this \
-     platform, then set `[retrieval] embedding_model_path` to the model directory and \
-     `[retrieval] embedding_runtime_path` to the library in `config.toml`.";
+/// What an operator has to do to repair a `[retrieval]` that is present but wrong.
+///
+/// Separate from [`RETRIEVAL_ENABLE`] because the two situations want different advice: an
+/// installation with no `[retrieval]` at all can be handed one command, while one whose configured
+/// files have gone missing has a decision to make about the paths it already chose.
+const RETRIEVAL_SETUP: &str = "Run `sctx embedding install` to download and configure both halves, \
+     or download a bge-m3 ONNX export (`model.onnx`, its `model.onnx_data` if the export is split, \
+     and `tokenizer.json`) plus an ONNX Runtime shared library for this platform and set \
+     `[retrieval] embedding_model_path` to the model directory and `[retrieval] \
+     embedding_runtime_path` to the library in `config.toml`.";
+
+/// What an operator has to do to turn the embedding channel on from nothing.
+const RETRIEVAL_ENABLE: &str = "run `sctx embedding install`, which downloads the bge-m3 ONNX \
+     export and an ONNX Runtime library, proves the model loads, and writes `[retrieval]` for you. \
+     It needs about 2.3 GB of disk. `sctx embedding install --model-url <BASE>` fetches the model \
+     from an internal mirror instead.";
 
 /// Reports the optional embedding recall channel (ADR-0004).
 ///
@@ -4093,7 +4106,7 @@ fn check_retrieval(root: &Path, checks: &mut Vec<DoctorCheck>) {
             "retrieval_embedding",
             format!(
                 "Off. Retrieval is lexical only, which is the default. To add semantic recall: \
-                 {RETRIEVAL_SETUP}"
+                 {RETRIEVAL_ENABLE}"
             ),
         ));
         return;

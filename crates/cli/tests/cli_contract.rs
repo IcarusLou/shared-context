@@ -132,6 +132,18 @@ impl Harness {
         value
     }
 
+    /// Runs a lifecycle command, which reports its own shape rather than the `tree`/`generation`
+    /// envelope the knowledge commands share.
+    fn success_lifecycle(&self, args: &[&str]) -> Value {
+        let output = self.run(args);
+        assert!(
+            output.status.success(),
+            "command {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
     fn failure(&self, args: &[&str]) -> Value {
         let output = self.run(args);
         assert_eq!(
@@ -464,13 +476,14 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
     assert!(help.status.success());
     assert!(stdout.contains("--knowledge-store-url GIT_URL"));
     for command in [
-        "setup [--demo] [--agents cursor,codex]",
+        "setup [--demo] [--embedding] [--agents cursor,codex]",
         "demo",
         "doctor [--fix]",
         "upgrade [--agents cursor,codex]",
         "uninstall [--root PATH]",
         "data reset [--dry-run] [--yes]",
         "knowledge sync|delete",
+        "embedding install|status|remove",
         "space create|intent revise|list|get",
         "candidate list|get|discard|confirm|build-closed-episode|analyze",
         "context revise|review|publish|withdraw|get",
@@ -542,6 +555,126 @@ fn data_reset_requires_explicit_confirmation_before_initializing_state() {
             .contains("--yes")
     );
     assert!(!harness.root().exists());
+}
+
+#[test]
+fn embedding_remove_requires_explicit_confirmation() {
+    let harness = Harness::new();
+    harness.success_lifecycle(&["setup"]);
+
+    let rejected = harness.failure(&["embedding", "remove"]);
+
+    assert_eq!(rejected["error"]["code"], "invalid_input");
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--yes")
+    );
+}
+
+#[test]
+fn embedding_status_reports_an_unconfigured_channel_without_calling_it_broken() {
+    let harness = Harness::new();
+    harness.success_lifecycle(&["setup"]);
+
+    let status = harness.success_lifecycle(&["embedding", "status"]);
+
+    assert_eq!(status["configured"], serde_json::Value::Bool(false));
+    assert_eq!(status["ready"], serde_json::Value::Bool(false));
+    assert_eq!(status["embedded_revisions"], 0);
+    // `--verify` was not asked for, so no 9--12 second load was attempted.
+    assert_eq!(status["loads"], serde_json::Value::Null);
+}
+
+#[test]
+fn embedding_remove_is_idempotent_on_an_installation_that_never_enabled_it() {
+    let harness = Harness::new();
+    harness.success_lifecycle(&["setup"]);
+    let before = fs::read_to_string(harness.root().join("config.toml")).unwrap();
+
+    let removed = harness.success_lifecycle(&["embedding", "remove", "--yes"]);
+
+    assert_eq!(removed["config_cleared"], serde_json::Value::Bool(false));
+    assert_eq!(removed["removed"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        fs::read_to_string(harness.root().join("config.toml")).unwrap(),
+        before,
+        "removing a channel that was never enabled must not rewrite config.toml"
+    );
+}
+
+#[test]
+fn embedding_rejects_an_unknown_subcommand_and_a_malformed_digest() {
+    let harness = Harness::new();
+    harness.success_lifecycle(&["setup"]);
+
+    let unknown = harness.failure(&["embedding", "reinstall"]);
+    assert_eq!(unknown["error"]["code"], "invalid_input");
+    assert!(
+        unknown["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("install, status, or remove")
+    );
+
+    // The digest is validated while the plan is built, so a typo costs nothing but the message.
+    let malformed = harness.failure(&[
+        "embedding",
+        "install",
+        "--runtime-url",
+        "file:///nonexistent.tgz",
+        "--expected-sha256",
+        "not-a-digest",
+    ]);
+    assert_eq!(malformed["error"]["code"], "invalid_input");
+    assert!(
+        malformed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("64 hexadecimal")
+    );
+    assert!(!harness.root().join("embedding").exists());
+}
+
+#[test]
+fn upgrade_refuses_the_setup_only_embedding_flag() {
+    let harness = Harness::new();
+    harness.success_lifecycle(&["setup"]);
+
+    let rejected = harness.failure(&["upgrade", "--embedding"]);
+
+    assert_eq!(rejected["error"]["code"], "invalid_input");
+    let message = rejected["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("--embedding applies only to setup"),
+        "{message}"
+    );
+    assert!(message.contains("sctx embedding install"), "{message}");
+}
+
+#[test]
+fn doctor_points_an_unconfigured_installation_at_the_install_command() {
+    let harness = Harness::new();
+    harness.success_lifecycle(&["setup"]);
+
+    let doctor = harness.success_lifecycle(&["doctor"]);
+
+    let check = doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "retrieval_embedding")
+        .unwrap();
+    // Off is a healthy state, not a failure: lexical retrieval is the default.
+    assert_eq!(check["status"], "ok");
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap()
+            .contains("sctx embedding install"),
+        "{check:#}"
+    );
 }
 
 #[test]

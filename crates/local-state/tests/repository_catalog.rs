@@ -12,7 +12,7 @@ use std::{
 use sctx_domain::{ArtifactLocator, ErrorKind, RepositoryId};
 use sctx_local_state::{
     ActivationScope, ActivationSettings, CatalogCheckoutStatus, RepositoryCatalogDiagnostic,
-    RepositoryCatalogEntry, RepositoryCatalogSnapshot, UserConfigStore,
+    RepositoryCatalogEntry, RepositoryCatalogSnapshot, RetrievalSettings, UserConfigStore,
     migrate_legacy_repository_groups,
 };
 use tempfile::TempDir;
@@ -1164,6 +1164,117 @@ fn a_relative_retrieval_path_is_refused_rather_than_resolved() {
     assert_eq!(
         store.retrieval_settings().unwrap_err().kind(),
         ErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn setting_retrieval_embedding_leaves_every_other_table_exactly_as_it_was() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("共享 配置");
+    let repository = init_repo(&temporary.path().join("retrieval repo"), "retrieval");
+    let store = UserConfigStore::initialize(&root).unwrap();
+    let config_path = root.join("config.toml");
+
+    // Everything an installation can legitimately carry, so the write has something to lose.
+    store
+        .add_repository(
+            "RT".parse::<RepositoryId>().unwrap(),
+            std::slice::from_ref(&repository),
+        )
+        .unwrap();
+    let mut text = fs::read_to_string(&config_path).unwrap();
+    text.push_str(
+        "\n[hooks]\nartifact_focus_reminder = true\n\n[context_ttl]\nvalidation = \"30d\"\n\
+         progress = \"14d\"\n\n[activation]\nallow_home = true\n\n[engineering]\n\
+         auto_scan = false\n",
+    );
+    fs::write(&config_path, text).unwrap();
+    let before = store.repository_catalog_with_context_ttl().unwrap();
+    let hooks_before = store.repository_catalog_with_hooks().unwrap().1;
+    let engineering_before = store.engineering_settings().unwrap();
+
+    let model = temporary.path().join("模型 目录");
+    let runtime = temporary.path().join("libonnxruntime.dylib");
+    let written = store.set_retrieval_embedding(&model, &runtime).unwrap();
+
+    assert_eq!(
+        written.embedding_model_path.as_deref(),
+        Some(model.as_path())
+    );
+    assert_eq!(
+        written.embedding_runtime_path.as_deref(),
+        Some(runtime.as_path())
+    );
+    assert!(written.embedding_enabled());
+    assert_eq!(store.retrieval_settings().unwrap(), written);
+    // The point of the test: a write aimed at one table is not a rewrite of the document.
+    assert_eq!(store.repository_catalog_with_context_ttl().unwrap(), before);
+    assert_eq!(
+        store.repository_catalog_with_hooks().unwrap().1,
+        hooks_before
+    );
+    assert_eq!(store.engineering_settings().unwrap(), engineering_before);
+
+    let text = fs::read_to_string(&config_path).unwrap();
+    for table in ["[hooks]", "[context_ttl]", "[activation]", "[engineering]"] {
+        assert!(text.contains(table), "{table} disappeared from\n{text}");
+    }
+}
+
+#[test]
+fn clearing_retrieval_embedding_restores_the_document_of_an_installation_that_never_had_it() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("共享 配置");
+    let store = UserConfigStore::initialize(&root).unwrap();
+    let config_path = root.join("config.toml");
+    let pristine = fs::read_to_string(&config_path).unwrap();
+
+    assert!(
+        !store.clear_retrieval_embedding().unwrap(),
+        "clearing an absent [retrieval] reports that there was nothing to clear"
+    );
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), pristine);
+
+    store
+        .set_retrieval_embedding(
+            &temporary.path().join("模型 目录"),
+            &temporary.path().join("libonnxruntime.dylib"),
+        )
+        .unwrap();
+    assert!(store.clear_retrieval_embedding().unwrap());
+    assert_eq!(
+        store.retrieval_settings().unwrap(),
+        RetrievalSettings::default()
+    );
+    assert_eq!(
+        fs::read_to_string(&config_path).unwrap(),
+        pristine,
+        "removal restores the exact document shape, not an empty [retrieval] table"
+    );
+}
+
+#[test]
+fn a_relative_retrieval_path_is_refused_by_the_writer_too() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("共享 配置");
+    let store = UserConfigStore::initialize(&root).unwrap();
+    let config_path = root.join("config.toml");
+    let pristine = fs::read_to_string(&config_path).unwrap();
+    let absolute = temporary.path().join("libonnxruntime.dylib");
+
+    // A writer that accepted these would produce a document its own reader rejects.
+    for (model, runtime) in [
+        (Path::new("models/bge-m3"), absolute.as_path()),
+        (temporary.path(), Path::new("lib/libonnxruntime.dylib")),
+    ] {
+        let error = store.set_retrieval_embedding(model, runtime).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("absolute"), "{error}");
+    }
+    assert_eq!(
+        fs::read_to_string(&config_path).unwrap(),
+        pristine,
+        "a refused write must not have touched the document"
     );
 }
 
