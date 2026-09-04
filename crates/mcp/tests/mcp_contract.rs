@@ -13,12 +13,12 @@ use sctx_domain::{
     Applicability, CandidateAnalysisStatus, CandidateConfirmationOperation,
     CandidateConfirmationPlan, CandidateConfirmationPrimaryReference, CandidateId,
     CandidatePrimarySelection, CandidateReviewStatus, CheckpointEvidenceRef, ContextId,
-    ContextKind, ContextRelation, ContextRelationKind, ContextRevisionDraft, EvidenceSnapshotDraft,
-    EvidenceType, ExternalSessionLocator, IntentSnapshot, NormalizedWorkObservation,
-    OptionalCandidateEdits, ProblemViewEdit, PublicationAction, PublicationDraft, RepositoryId,
-    ReviewDraft, ReviewVerdict, RevisionId, SemanticConflictStatus, SpaceId, SubmissionId, TaskId,
-    TaskSignal, TaskSignalKind, WorkEpisodeId, WorkSourceRef, WorkingIntentSnapshot,
-    candidate_submission_content_hash,
+    ContextKind, ContextRelation, ContextRelationKind, ContextRevisionDraft, DecisionSource,
+    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot,
+    NormalizedWorkObservation, OptionalCandidateEdits, ProblemViewEdit, PublicationAction,
+    PublicationDraft, RepositoryId, ReviewDraft, ReviewVerdict, RevisionId, SemanticConflictStatus,
+    SpaceId, SubmissionId, TaskId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkSourceRef,
+    WorkingIntentSnapshot, candidate_submission_content_hash,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
@@ -2221,6 +2221,7 @@ fn candidate_builder_converts_six_flat_agent_attested_evidence_drafts() {
     let discarded = candidate_discard_at_root(
         &fixture.root,
         &CandidateDiscardInput {
+            decision_source: DecisionSource::Human,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             expected_task_id: active.task_id.to_string(),
@@ -2244,6 +2245,7 @@ fn candidate_builder_converts_six_flat_agent_attested_evidence_drafts() {
     let retry = candidate_discard_at_root(
         &fixture.root,
         &CandidateDiscardInput {
+            decision_source: DecisionSource::Human,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             expected_task_id: active.task_id.to_string(),
@@ -2284,6 +2286,7 @@ fn candidate_builder_converts_six_flat_agent_attested_evidence_drafts() {
     let private_reason = candidate_discard_at_root(
         &fixture.root,
         &CandidateDiscardInput {
+            decision_source: DecisionSource::Human,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             expected_task_id: active.task_id.to_string(),
@@ -2305,6 +2308,7 @@ fn candidate_builder_converts_six_flat_agent_attested_evidence_drafts() {
 
     let before_negative_confirms = event_count(fixture.store.repository());
     let confirm_for = |candidate_id: CandidateId| CandidateConfirmInput {
+        decision_source: DecisionSource::Human,
         agent_kind: "codex".to_owned(),
         external_session_id: session.to_owned(),
         expected_task_id: active.task_id.to_string(),
@@ -2716,6 +2720,7 @@ fn candidate_confirm_existing_and_recommended_new_space_are_atomic_idempotent_an
         "Original Candidate statement for existing Space",
     );
     let existing_input = CandidateConfirmInput {
+        decision_source: DecisionSource::Human,
         agent_kind: "codex".to_owned(),
         external_session_id: "confirm-existing".to_owned(),
         expected_task_id: existing_task.context.task_id.to_string(),
@@ -2856,6 +2861,7 @@ fn candidate_confirm_existing_and_recommended_new_space_are_atomic_idempotent_an
     let new_confirmed = candidate_confirm_at_root(
         &fixture.root,
         &CandidateConfirmInput {
+            decision_source: DecisionSource::Human,
             agent_kind: "codex".to_owned(),
             external_session_id: "confirm-new".to_owned(),
             expected_task_id: new_task.context.task_id.to_string(),
@@ -3108,6 +3114,7 @@ fn proposed_space_recommendation_survives_governance_intent_revisions() {
     let confirmed = candidate_confirm_at_root(
         &fixture.root,
         &CandidateConfirmInput {
+            decision_source: DecisionSource::Human,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             expected_task_id: third.context.task_id.to_string(),
@@ -3139,6 +3146,7 @@ fn proposed_space_recommendation_survives_governance_intent_revisions() {
     let sibling = candidate_confirm_at_root(
         &fixture.root,
         &CandidateConfirmInput {
+            decision_source: DecisionSource::Human,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             expected_task_id: third.context.task_id.to_string(),
@@ -3246,6 +3254,7 @@ fn candidates_of_one_task_share_and_reuse_one_proposed_space() {
     assert!(!first_proposed.2.title.contains("System suggestion"));
 
     let first_input = CandidateConfirmInput {
+        decision_source: DecisionSource::Human,
         agent_kind: "codex".to_owned(),
         external_session_id: session.to_owned(),
         expected_task_id: task.context.task_id.to_string(),
@@ -3350,6 +3359,7 @@ fn candidates_of_one_task_share_and_reuse_one_proposed_space() {
     let second_confirmed = candidate_confirm_at_root(
         &fixture.root,
         &CandidateConfirmInput {
+            decision_source: DecisionSource::Human,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             expected_task_id: task.context.task_id.to_string(),
@@ -3376,6 +3386,7 @@ fn candidates_of_one_task_share_and_reuse_one_proposed_space() {
     let replayed = candidate_confirm_at_root(
         &fixture.root,
         &CandidateConfirmInput {
+            decision_source: DecisionSource::Human,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             expected_task_id: task.context.task_id.to_string(),
@@ -3561,6 +3572,7 @@ fn candidate_confirm_recovers_reserved_before_git_and_git_before_runtime_finaliz
         )
         .unwrap();
         let input = CandidateConfirmInput {
+            decision_source: DecisionSource::Human,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             expected_task_id: task.context.task_id.to_string(),
@@ -7265,6 +7277,7 @@ fn candidate_batch_review_decisions_are_all_or_nothing_and_name_the_failing_cand
     assert_eq!(candidates.len(), 3);
 
     let batch_input = |ids: Vec<String>| sctx_mcp::CandidateConfirmBatchInput {
+        decision_source: DecisionSource::Human,
         agent_kind: "codex".to_owned(),
         external_session_id: session.to_owned(),
         expected_task_id: task.context.task_id.to_string(),
@@ -7405,6 +7418,7 @@ fn candidate_batch_review_decisions_are_all_or_nothing_and_name_the_failing_cand
     .expect("nonempty Checkpoint must be accepted");
     let discardable = recover_candidate_ids(&fixture, "codex", discard_session, 2);
     let discard_input = |ids: Vec<String>, version: u64| sctx_mcp::CandidateDiscardBatchInput {
+        decision_source: DecisionSource::Human,
         agent_kind: "codex".to_owned(),
         external_session_id: discard_session.to_owned(),
         expected_task_id: discard_task.context.task_id.to_string(),
@@ -7501,6 +7515,7 @@ fn confirm_candidate(
     candidate_confirm_at_root(
         &fixture.root,
         &CandidateConfirmInput {
+            decision_source: DecisionSource::Human,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             expected_task_id: task.context.task_id.to_string(),
@@ -7698,6 +7713,7 @@ fn confirmation_derives_the_problem_the_source_task_was_working_on() {
         candidate_confirm_at_root(
             &fixture.root,
             &CandidateConfirmInput {
+                decision_source: DecisionSource::Human,
                 agent_kind: "codex".to_owned(),
                 external_session_id: session.to_owned(),
                 expected_task_id: task.context.task_id.to_string(),
@@ -7759,6 +7775,7 @@ fn contradicting_relation_opens_one_semantic_conflict_in_the_confirmation_batch(
     let contradiction =
         |candidate_id: CandidateId, session: &str, task: &sctx_mcp::TaskIntentUpdateResponse| {
             CandidateConfirmInput {
+                decision_source: DecisionSource::Human,
                 agent_kind: "codex".to_owned(),
                 external_session_id: session.to_owned(),
                 expected_task_id: task.context.task_id.to_string(),
@@ -8701,6 +8718,7 @@ fn candidate_list_session_scope_names_each_source_task_and_the_compact_pack_coun
     let discarded = candidate_discard_at_root(
         &fixture.root,
         &CandidateDiscardInput {
+            decision_source: DecisionSource::Human,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             expected_task_id: first_task.context.task_id.to_string(),
@@ -8755,5 +8773,604 @@ fn candidate_list_session_scope_names_each_source_task_and_the_compact_pack_coun
             .unwrap()
             .contains(&json!("scope")),
         "scope stays optional: an existing caller keeps the Task-local listing it always had"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0005: policy-gated automatic Candidate disposition.
+//
+// `decision_source: agent_policy` is a claim the Agent makes about its own decision, so nothing in
+// it is trusted. Every condition the server checks is a value the server itself derived for that
+// exact Review, and a Candidate outside the surface is refused rather than quietly downgraded to a
+// human confirmation. These tests pin one refusal per condition, the accepting case, and that the
+// human path is untouched by any of it.
+// ---------------------------------------------------------------------------
+
+/// Rewrites one Candidate's server-derived review surface to the exact shape under test.
+///
+/// The gate reads `candidate_status` and the strongest assessment relation, both of which the
+/// analyzer decides from retrieval. Driving them through retrieval would make each test a test of
+/// the analyzer; writing the analysis the analyzer would have produced keeps each test about the
+/// permission surface, and it goes in through the same public Runtime call the analyzer uses.
+fn set_review_surface(
+    fixture: &Fixture,
+    candidate_id: CandidateId,
+    status: sctx_domain::AutomaticCandidateStatus,
+    relation: sctx_domain::CandidateAssessmentRelation,
+) {
+    let tasks = TaskRuntime::initialize(&fixture.root).unwrap();
+    let mut view = tasks
+        .read_candidate_analysis(candidate_id)
+        .unwrap()
+        .unwrap();
+    let novel = relation == sctx_domain::CandidateAssessmentRelation::Novel;
+    view.candidate.analysis.assessments = vec![sctx_domain::CandidateRelationAssessment {
+        relation,
+        target: (!novel).then_some(sctx_domain::ContextRevisionRef {
+            context_id: fixture.context_id,
+            revision_id: fixture.revision_id,
+        }),
+        confidence: sctx_domain::CandidateConfidence {
+            basis_points: 9_000,
+            rationale: "fixed review surface for the permission-surface tests".to_owned(),
+        },
+        paths: vec![if novel {
+            sctx_domain::CandidateAssessmentPath::NoSufficientCandidate
+        } else {
+            sctx_domain::CandidateAssessmentPath::ExplicitRelatedContext
+        }],
+        reasons: vec!["fixed review surface".to_owned()],
+    }];
+    view.candidate.status = status;
+    tasks.replace_candidate_analysis(&view.candidate).unwrap();
+}
+
+/// Builds one Candidate already sitting inside the automatic permission surface.
+fn permitted_candidate(
+    fixture: &Fixture,
+    session: &str,
+    statement: &str,
+) -> (sctx_mcp::TaskIntentUpdateResponse, CandidateId) {
+    let (task, candidate_id) = build_review_candidate(fixture, session, statement);
+    set_review_surface(
+        fixture,
+        candidate_id,
+        sctx_domain::AutomaticCandidateStatus::ReadyForReview,
+        sctx_domain::CandidateAssessmentRelation::Novel,
+    );
+    (task, candidate_id)
+}
+
+fn confirm_input(
+    task: &sctx_mcp::TaskIntentUpdateResponse,
+    session: &str,
+    candidate_id: CandidateId,
+    space_id: SpaceId,
+    decision_source: DecisionSource,
+) -> CandidateConfirmInput {
+    CandidateConfirmInput {
+        decision_source,
+        agent_kind: "codex".to_owned(),
+        external_session_id: session.to_owned(),
+        expected_task_id: task.context.task_id.to_string(),
+        expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+        candidate_id: candidate_id.to_string(),
+        expected_review_version: 1,
+        primary: CandidateConfirmPrimaryInput::Existing(ExistingCandidatePrimaryInput {
+            existing_space_id: space_id.to_string(),
+        }),
+        related_space_ids: Vec::new(),
+        edits: OptionalCandidateEdits::default(),
+    }
+}
+
+/// Reads the annotations of the single `candidate.confirmed` Event naming one Confirmation.
+fn confirmation_annotations(fixture: &Fixture, context_id: ContextId) -> Value {
+    fn walk(directory: &Path, found: &mut Vec<Value>) {
+        for entry in fs::read_dir(directory).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.extension().is_some_and(|value| value == "json")
+                && let Ok(bytes) = fs::read(&path)
+                && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+                && value["event_type"] == "candidate.confirmed"
+            {
+                found.push(value);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(&fixture.store.repository().join("events"), &mut found);
+    found
+        .into_iter()
+        .find(|event| event["confirmation"]["result_context_id"] == json!(context_id.to_string()))
+        .expect("the Confirmation Event of this Candidate is committed")["annotations"]
+        .clone()
+}
+
+/// A Candidate inside the whole surface is accepted, and the acceptance records who made it.
+#[test]
+fn agent_policy_confirmation_inside_the_permission_surface_records_its_provenance() {
+    let fixture = Fixture::new();
+    let session = "agent-policy-permitted";
+    let (task, candidate_id) = permitted_candidate(&fixture, session, "Automatic acceptance path");
+
+    let confirmed = candidate_confirm_at_root(
+        &fixture.root,
+        &confirm_input(
+            &task,
+            session,
+            candidate_id,
+            fixture.space_id,
+            DecisionSource::AgentPolicy,
+        ),
+    )
+    .unwrap();
+    assert_eq!(confirmed.status, CandidateConfirmResponseStatus::Confirmed);
+    assert!(confirmed.created);
+
+    // The provenance is in the Event's annotations, which is the one open extension boundary of
+    // the byte-frozen V1 schema, and nowhere near the payload.
+    let annotations = confirmation_annotations(&fixture, confirmed.context_id);
+    assert_eq!(annotations["decision_source"], "agent_policy");
+    assert!(
+        annotations["external_session_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("xss_")),
+        "the recorded session is this system's own opaque identifier, not the Agent's key: {annotations}"
+    );
+
+    // And in the local Runtime, where batch revocation and the reversal rate read it.
+    let tasks = TaskRuntime::initialize(&fixture.root).unwrap();
+    let stats = tasks.candidate_disposition_stats().unwrap();
+    assert_eq!(stats.agent_policy.confirmed, 1);
+    assert_eq!(stats.human.confirmed, 0);
+    assert_eq!(stats.auto_confirm_not_permitted, 0);
+
+    let selected = tasks
+        .list_confirmed_dispositions(Some(DecisionSource::AgentPolicy), None)
+        .unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].candidate_id, candidate_id);
+    assert_eq!(selected[0].result_context_id, confirmed.context_id);
+    assert!(
+        tasks
+            .list_confirmed_dispositions(Some(DecisionSource::Human), None)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Every condition of the surface refuses on its own, and says which one it was.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn agent_policy_confirmation_is_refused_once_for_each_condition_of_the_surface() {
+    let fixture = Fixture::new();
+
+    // 1. `candidate_status` is not `ready_for_review`: this Candidate needs a human judgement
+    //    about a contradiction, which is exactly what the surface excludes.
+    let contradiction_session = "agent-policy-contradiction";
+    let (contradiction_task, contradiction) = build_review_candidate(
+        &fixture,
+        contradiction_session,
+        "Refused because a contradiction needs a person",
+    );
+    set_review_surface(
+        &fixture,
+        contradiction,
+        sctx_domain::AutomaticCandidateStatus::PotentialContradictionReview,
+        sctx_domain::CandidateAssessmentRelation::PotentialContradiction,
+    );
+
+    // 2. The top assessment relation is neither `novel` nor `supports`.
+    let revises_session = "agent-policy-revises";
+    let (revises_task, revises) = build_review_candidate(
+        &fixture,
+        revises_session,
+        "Refused because revising an accepted Context is a person's call",
+    );
+    set_review_surface(
+        &fixture,
+        revises,
+        sctx_domain::AutomaticCandidateStatus::ReadyForReview,
+        sctx_domain::CandidateAssessmentRelation::Revises,
+    );
+
+    // 3. The request carries edits.
+    let edited_session = "agent-policy-edits";
+    let (edited_task, edited) = permitted_candidate(
+        &fixture,
+        edited_session,
+        "Refused because rewriting the content is a person's call",
+    );
+
+    let cases: Vec<(&str, CandidateConfirmInput, &str)> = vec![
+        (
+            "candidate_status",
+            confirm_input(
+                &contradiction_task,
+                contradiction_session,
+                contradiction,
+                fixture.space_id,
+                DecisionSource::AgentPolicy,
+            ),
+            "candidate_status is potential_contradiction_review",
+        ),
+        (
+            "top assessment relation",
+            confirm_input(
+                &revises_task,
+                revises_session,
+                revises,
+                fixture.space_id,
+                DecisionSource::AgentPolicy,
+            ),
+            "top assessment relation is revises",
+        ),
+        (
+            "edits",
+            CandidateConfirmInput {
+                edits: OptionalCandidateEdits {
+                    statement: Some("An Agent must not rewrite what it accepts".to_owned()),
+                    ..OptionalCandidateEdits::default()
+                },
+                ..confirm_input(
+                    &edited_task,
+                    edited_session,
+                    edited,
+                    fixture.space_id,
+                    DecisionSource::AgentPolicy,
+                )
+            },
+            "the request carries edits",
+        ),
+    ];
+
+    for (label, input, expected) in cases {
+        let error = candidate_confirm_at_root(&fixture.root, &input)
+            .expect_err(&format!("{label} must refuse an automatic confirmation"));
+        assert_eq!(error.kind(), sctx_domain::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .message()
+                .starts_with("Automatic confirmation is not permitted for this Candidate:"),
+            "{label}: {}",
+            error.message()
+        );
+        assert!(
+            error.message().contains(expected),
+            "{label} must name the condition it failed: {}",
+            error.message()
+        );
+        assert!(
+            error
+                .message()
+                .contains("Present this Candidate to the user for review instead"),
+            "{label} must point at the one way forward: {}",
+            error.message()
+        );
+    }
+
+    // 4. The Review is not `ready_for_review` at all. A Review already confirmed is the honest
+    //    case: it is still confirmable as a replay, and it is not a fresh automatic decision.
+    let replay_session = "agent-policy-replay";
+    let (replay_task, replay) = permitted_candidate(
+        &fixture,
+        replay_session,
+        "Refused on replay under agent_policy",
+    );
+    let human = confirm_input(
+        &replay_task,
+        replay_session,
+        replay,
+        fixture.space_id,
+        DecisionSource::Human,
+    );
+    candidate_confirm_at_root(&fixture.root, &human).unwrap();
+    let error = candidate_confirm_at_root(
+        &fixture.root,
+        &CandidateConfirmInput {
+            decision_source: DecisionSource::AgentPolicy,
+            ..human
+        },
+    )
+    .expect_err("an already decided Review is not a surface for a fresh automatic decision");
+    assert!(
+        error
+            .message()
+            .contains("its Review is not ready_for_review"),
+        "{}",
+        error.message()
+    );
+
+    // Three refusals were automatic confirmations; the counter holds exactly those.
+    let stats = TaskRuntime::initialize(&fixture.root)
+        .unwrap()
+        .candidate_disposition_stats()
+        .unwrap();
+    assert_eq!(stats.auto_confirm_not_permitted, 4);
+    assert_eq!(stats.human.confirmed, 1);
+    assert_eq!(stats.agent_policy.confirmed, 0);
+}
+
+/// The gate is invisible to a human confirmation: none of its conditions apply.
+#[test]
+fn a_human_confirmation_is_unchanged_by_the_automatic_permission_surface() {
+    let fixture = Fixture::new();
+    let session = "human-unchanged";
+    let (task, candidate_id) = build_review_candidate(
+        &fixture,
+        session,
+        "A person may confirm what an Agent may not",
+    );
+    // Deliberately outside every automatic condition: a revision of an accepted Context, plus
+    // edits. A human decides both.
+    set_review_surface(
+        &fixture,
+        candidate_id,
+        sctx_domain::AutomaticCandidateStatus::ReadyForReview,
+        sctx_domain::CandidateAssessmentRelation::Revises,
+    );
+    let confirmed = candidate_confirm_at_root(
+        &fixture.root,
+        &CandidateConfirmInput {
+            edits: OptionalCandidateEdits {
+                statement: Some("A person rewrote this before accepting it".to_owned()),
+                ..OptionalCandidateEdits::default()
+            },
+            ..confirm_input(
+                &task,
+                session,
+                candidate_id,
+                fixture.space_id,
+                DecisionSource::Human,
+            )
+        },
+    )
+    .unwrap();
+    assert_eq!(confirmed.status, CandidateConfirmResponseStatus::Confirmed);
+
+    let annotations = confirmation_annotations(&fixture, confirmed.context_id);
+    assert_eq!(annotations["decision_source"], "human");
+    let stats = TaskRuntime::initialize(&fixture.root)
+        .unwrap()
+        .candidate_disposition_stats()
+        .unwrap();
+    assert_eq!(stats.human.confirmed, 1);
+    assert_eq!(stats.auto_confirm_not_permitted, 0);
+}
+
+/// An omitted `decision_source` is a human decision, byte for byte.
+#[test]
+fn an_omitted_decision_source_is_a_human_confirmation() {
+    let fixture = Fixture::new();
+    let session = "omitted-decision-source";
+    let (task, candidate_id) =
+        permitted_candidate(&fixture, session, "An old client sends no decision_source");
+
+    let arguments = json!({
+        "agent_kind": "codex",
+        "external_session_id": session,
+        "expected_task_id": task.context.task_id.to_string(),
+        "expected_intent_revision_id": task.context.intent_revision_id.to_string(),
+        "candidate_id": candidate_id.to_string(),
+        "expected_review_version": 1,
+        "primary": {"existing_space_id": fixture.space_id.to_string()},
+        "related_space_ids": [],
+    });
+    let decoded: CandidateConfirmInput = serde_json::from_value(arguments).unwrap();
+    assert_eq!(
+        decoded.decision_source,
+        DecisionSource::Human,
+        "a client that predates the field keeps the only behavior it ever had"
+    );
+    let confirmed = candidate_confirm_at_root(&fixture.root, &decoded).unwrap();
+    assert_eq!(
+        confirmation_annotations(&fixture, confirmed.context_id)["decision_source"],
+        "human"
+    );
+}
+
+/// One member outside the surface rejects the whole automatic batch and names it.
+#[test]
+fn an_agent_policy_batch_is_rejected_whole_and_names_the_member_that_failed() {
+    let fixture = Fixture::new();
+    let session = "agent-policy-batch";
+    let task = task_intent_update_at_root(
+        &fixture.root,
+        &update_input(session, TaskBoundary::New, None, "Batch permission surface"),
+    )
+    .unwrap();
+    task_checkpoint_at_root(
+        &fixture.root,
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            claims: ["batch member one", "batch member two"]
+                .into_iter()
+                .map(|statement| TaskCheckpointClaimInput {
+                    context_kind: ContextKind::Decision,
+                    statement: statement.to_owned(),
+                    rationale: "Batch permission-surface fixture".to_owned(),
+                    conditions: Vec::new(),
+                    evidence: vec![TaskCheckpointEvidenceInput {
+                        evidence_type: EvidenceType::ExperimentRecord,
+                        summary: format!("The batch fixture produced {statement}"),
+                        limitations: vec!["local fixture".to_owned()],
+                    }],
+                })
+                .collect(),
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap()
+    .into_accepted()
+    .unwrap();
+    let candidates = recover_candidate_ids(&fixture, "codex", session, 2);
+    set_review_surface(
+        &fixture,
+        candidates[0],
+        sctx_domain::AutomaticCandidateStatus::ReadyForReview,
+        sctx_domain::CandidateAssessmentRelation::Supports,
+    );
+    set_review_surface(
+        &fixture,
+        candidates[1],
+        sctx_domain::AutomaticCandidateStatus::NeedsSpaceReview,
+        sctx_domain::CandidateAssessmentRelation::Novel,
+    );
+
+    let input = sctx_mcp::CandidateConfirmBatchInput {
+        decision_source: DecisionSource::AgentPolicy,
+        agent_kind: "codex".to_owned(),
+        external_session_id: session.to_owned(),
+        expected_task_id: task.context.task_id.to_string(),
+        expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+        candidate_ids: candidates.iter().map(ToString::to_string).collect(),
+        expected_review_version: 1,
+        primary: CandidateConfirmPrimaryInput::Existing(ExistingCandidatePrimaryInput {
+            existing_space_id: fixture.space_id.to_string(),
+        }),
+        related_space_ids: Vec::new(),
+    };
+    let error = sctx_mcp::candidate_confirm_batch_at_root(&fixture.root, &input)
+        .expect_err("one member outside the surface rejects the whole batch");
+    assert!(
+        error
+            .message()
+            .starts_with("Automatic confirmation is not permitted for this Candidate:")
+    );
+    assert!(
+        error
+            .message()
+            .contains(&format!("candidate {}", candidates[1])),
+        "the refusal names the member that failed: {}",
+        error.message()
+    );
+    assert!(
+        error
+            .message()
+            .contains("no Candidate in this batch was written")
+    );
+
+    // Nothing was written, so the compliant member is still Pending and confirmable.
+    let review = candidate_get_at_root(
+        &fixture.root,
+        &CandidateGetInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            candidate_id: candidates[0].to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(review.review_status, CandidateReviewStatus::Pending);
+}
+
+/// A discard records its source and stays a local decision with no permission surface.
+#[test]
+fn an_agent_policy_discard_is_recorded_and_never_gated() {
+    let fixture = Fixture::new();
+    let session = "agent-policy-discard";
+    let (task, candidate_id) = build_review_candidate(
+        &fixture,
+        session,
+        "A process-level conclusion the Agent discards itself",
+    );
+    // Deliberately outside the confirmation surface: discard writes no Git fact, so it is not
+    // gated at all.
+    set_review_surface(
+        &fixture,
+        candidate_id,
+        sctx_domain::AutomaticCandidateStatus::PotentialContradictionReview,
+        sctx_domain::CandidateAssessmentRelation::PotentialContradiction,
+    );
+    let discarded = candidate_discard_at_root(
+        &fixture.root,
+        &CandidateDiscardInput {
+            decision_source: DecisionSource::AgentPolicy,
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: task.context.task_id.to_string(),
+            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+            candidate_id: candidate_id.to_string(),
+            expected_review_version: 1,
+            reason: "process-level conclusion, not durable knowledge".to_owned(),
+        },
+    )
+    .unwrap();
+    assert_eq!(discarded.status, CandidateDiscardResponseStatus::Discarded);
+
+    let stats = TaskRuntime::initialize(&fixture.root)
+        .unwrap()
+        .candidate_disposition_stats()
+        .unwrap();
+    assert_eq!(stats.agent_policy.discarded, 1);
+    assert_eq!(stats.human.discarded, 0);
+    assert_eq!(stats.auto_confirm_not_permitted, 0);
+}
+
+/// The public tool surface declares the field and gives the refusal its own error code.
+#[test]
+fn the_public_tools_declare_decision_source_and_code_the_refusal() {
+    let fixture = Fixture::new();
+    let mut server = fixture.server(ClientKind::Codex);
+    let responses = run_session(
+        &mut server,
+        FixtureFraming::Newline,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            request(2, "tools/list", json!({})),
+        ],
+    );
+    let tools = responses[1]["result"]["tools"].as_array().unwrap().clone();
+    for name in ["candidate_confirm", "candidate_discard"] {
+        let schema = tools.iter().find(|tool| tool["name"] == name).unwrap()["inputSchema"].clone();
+        assert_eq!(
+            schema["properties"]["decision_source"]["enum"],
+            json!(["human", "agent_policy"]),
+            "{name} declares the provenance field as a plain string enum"
+        );
+        assert!(
+            !schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("decision_source")),
+            "{name} keeps it optional: an existing caller sends nothing and stays human"
+        );
+    }
+
+    let session = "tool-surface-refusal";
+    authorize_session(&fixture.root, "codex", session);
+    let (task, candidate_id) = build_review_candidate(
+        &fixture,
+        session,
+        "A refusal reaching the public tool surface",
+    );
+    set_review_surface(
+        &fixture,
+        candidate_id,
+        sctx_domain::AutomaticCandidateStatus::ExactDuplicateReview,
+        sctx_domain::CandidateAssessmentRelation::Novel,
+    );
+    let error = call_public_tool(
+        &fixture,
+        "candidate_confirm",
+        json!({
+            "agent_kind": "codex",
+            "external_session_id": session,
+            "expected_task_id": task.context.task_id.to_string(),
+            "expected_intent_revision_id": task.context.intent_revision_id.to_string(),
+            "candidate_id": candidate_id.to_string(),
+            "expected_review_version": 1,
+            "primary": {"existing_space_id": fixture.space_id.to_string()},
+            "related_space_ids": [],
+            "decision_source": "agent_policy",
+        }),
+    );
+    assert!(error["result"]["isError"].as_bool().unwrap());
+    assert_eq!(
+        error["result"]["structuredContent"]["error"]["code"], "auto_confirm_not_permitted",
+        "the refusal has its own code, not a generic argument error: {error}"
     );
 }

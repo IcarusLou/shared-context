@@ -7,10 +7,10 @@ use std::{fs, path::Path, process::Command};
 
 use sctx_domain::{
     Applicability, ArtifactKind, ArtifactLocator, CandidateId, ContextId, ContextKind,
-    ContextRelation, ContextRelationKind, ContextRevisionDraft, EvidenceSnapshotDraft,
-    EvidenceType, ExternalSessionLocator, IntentSnapshot, OptionalCandidateEdits,
-    PublicationAction, PublicationDraft, ReferenceRelation, RepoRelativePath, ReviewDraft,
-    ReviewVerdict, RevisionId, SpaceId, WorkingIntentSnapshot,
+    ContextRelation, ContextRelationKind, ContextRevisionDraft, DecisionSource,
+    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot,
+    OptionalCandidateEdits, PublicationAction, PublicationDraft, ReferenceRelation,
+    RepoRelativePath, ReviewDraft, ReviewVerdict, RevisionId, SpaceId, WorkingIntentSnapshot,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
@@ -395,6 +395,7 @@ fn confirming_a_contradiction_refutes_the_injected_context() {
     candidate_confirm_at_root(
         &root,
         &CandidateConfirmInput {
+            decision_source: DecisionSource::Human,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             expected_task_id: task.context.task_id.to_string(),
