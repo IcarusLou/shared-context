@@ -32,6 +32,7 @@ fn run_json_cli(binary: &Path, home: &Path, args: &[&str]) -> Value {
     let mut child = Command::new(binary)
         .arg("--json")
         .args(args)
+        .env("SCTX_SKIP_LAUNCHCTL", "1")
         .env("HOME", home)
         .stdout(Stdio::from(stdout.reopen().unwrap()))
         .stderr(Stdio::from(stderr.reopen().unwrap()))
@@ -55,6 +56,7 @@ fn run_configured_hook(home: &Path, command: &str, payload: &Value) -> Value {
     let stderr = tempfile::NamedTempFile::new().unwrap();
     let mut child = Command::new("/bin/sh")
         .args(["-c", command])
+        .env("SCTX_SKIP_LAUNCHCTL", "1")
         .env("HOME", home)
         .stdin(Stdio::piped())
         .stdout(Stdio::from(stdout.reopen().unwrap()))
@@ -85,6 +87,7 @@ impl InstalledMcp {
     fn start(binary: &Path, home: &Path, client: &str) -> Self {
         let mut child = Command::new(binary)
             .args(["mcp", "serve", "--client", client])
+            .env("SCTX_SKIP_LAUNCHCTL", "1")
             .env("HOME", home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -502,6 +505,7 @@ fn installed_codex_direct_evidence_replay_recovery_and_cursor_lifecycle_use_publ
     let setup_stderr = tempfile::NamedTempFile::new().unwrap();
     let mut setup = Command::new(&source_binary)
         .args(["--json", "setup", "--agents", "cursor,codex"])
+        .env("SCTX_SKIP_LAUNCHCTL", "1")
         .env("HOME", &home)
         .env("PATH", probe_path)
         .stdout(Stdio::from(setup_stdout.reopen().unwrap()))

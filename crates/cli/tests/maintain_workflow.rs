@@ -12,6 +12,7 @@ use serde_json::Value;
 fn sctx(binary: &PathBuf, home: &PathBuf, args: &[&str]) -> std::process::Output {
     Command::new(binary)
         .args(args)
+        .env("SCTX_SKIP_LAUNCHCTL", "1")
         .env("HOME", home)
         .output()
         .unwrap()

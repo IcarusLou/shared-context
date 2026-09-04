@@ -9,6 +9,7 @@ use std::{
     ffi::OsString,
     fs,
     io::{self, Read},
+    os::unix::process::CommandExt as _,
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
     str::FromStr,
@@ -23,7 +24,8 @@ use sctx_agent_adapter::{
     CanonicalAgentEvent, CanonicalAgentEventKind, EpisodeFinalizationTrigger, FileAccess,
     MAX_SHELL_COMMAND_PATH_CANDIDATES, PathHint, ResolvedActivationDecision, ResolvedAgentAction,
     TaskRuntimeOperation, ToolCategory, ToolOutcome, TrustState, artifact_focus_reminder_file,
-    plan_action_for_activation, render_artifact_focus_reminder, shared_context_activation_marker,
+    plan_action_for_activation, render_artifact_focus_reminder, render_maintenance_hint,
+    shared_context_activation_marker,
 };
 use sctx_domain::{
     Applicability, CandidateReviewStatus, ConflictParticipant, ConflictResolutionDraft,
@@ -46,8 +48,8 @@ use sctx_installer::maintain::MaintainOptions;
 use sctx_local_state::{
     ArtifactReminderKey, ArtifactReminderMark, ArtifactReminderStore, AuthorizedSessionScope,
     AuthorizedSessionScopeRead, AuthorizedSessionScopeStore, CatalogCheckoutStatus, HookSettings,
-    MaintenanceLock, PrivacyScanner, RepositoryCatalogDiagnostic, RepositoryCatalogSnapshot,
-    UserConfigStore,
+    MaintenanceLock, MaintenanceSettings, PrivacyScanner, RepositoryCatalogDiagnostic,
+    RepositoryCatalogSnapshot, UserConfigStore,
 };
 use sctx_mcp::{
     ArtifactFocusQuery, AssociationExplainInput, AssociationRebuildInput, CandidateAnalyzeInput,
@@ -1431,7 +1433,74 @@ fn run_hook(args: &[String]) -> Result<()> {
         let (reason, detail) = recorder.take_completion();
         recorder.flush(HookEventDecision::Enabled, reason, detail);
     }
+    // Dead last, after the response is already on stdout and every lease decision is recorded: the
+    // opportunistic maintenance track must never be something a Session waits for.
+    if activated && maintenance.is_some() && event.kind() == CanonicalAgentEventKind::SessionStart {
+        spawn_opportunistic_maintenance(&authorization.maintenance, &recorder);
+    }
     Ok(())
+}
+
+/// Starts one detached `sctx maintain run --opportunistic` when maintenance has gone stale.
+///
+/// This is the half of the two-track schedule that reaches a laptop asleep at the `LaunchAgent`'s
+/// hour -- and, on a machine where launchd refused the job, the only half there is.
+///
+/// The cost on the Hook hot path is fixed and tiny by construction: one read of a single-line file
+/// and one `spawn`. No database is opened, no lock is taken, and nothing is waited for. Every
+/// failure is silence except one `hook_event` row, because a Session's start is not the place to
+/// report that a background chore could not begin.
+///
+/// The child is put in its own process group so that closing the editor -- which signals the
+/// Hook's group -- does not kill a maintenance run mid-Git-operation. Its three streams go to
+/// `/dev/null`: the run's durable record is `state/maintain-digest.json`, and inheriting the
+/// Hook's stdout would put a JSON digest into the Agent's response.
+fn spawn_opportunistic_maintenance(
+    maintenance: &MaintenanceSettings,
+    recorder: &HookEventRecorder,
+) {
+    let Some(stale_after) = maintenance.opportunistic_after_seconds() else {
+        return;
+    };
+    let Ok(root) = installation_root() else {
+        return;
+    };
+    // A missing marker means maintenance has never run here, which is exactly the installation
+    // this track exists for. An unreadable or malformed one is left to `sctx doctor`.
+    let Ok(last_run) = sctx_installer::maintain::read_last_run(&root) else {
+        return;
+    };
+    if let Some(last_run) = last_run {
+        let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+            return;
+        };
+        // Saturating, so a marker written by a clock ahead of this one reads as "just ran" rather
+        // than as an enormous age that starts a run on every single Session.
+        if now.as_secs().saturating_sub(last_run) <= stale_after {
+            return;
+        }
+    }
+    let outcome = Command::new(root.join("bin/current/sctx"))
+        .args(["maintain", "run", "--opportunistic"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn();
+    match outcome {
+        // The handle is dropped without `wait`, which on Unix neither kills nor reaps the child:
+        // it outlives this Hook and is reparented when the Hook exits a moment from now.
+        Ok(_child) => recorder.flush(
+            HookEventDecision::Neutral,
+            "opportunistic_maintenance_started",
+            None,
+        ),
+        Err(error) => recorder.flush(
+            HookEventDecision::Neutral,
+            "opportunistic_maintenance_unavailable",
+            Some(truncate_hook_detail(&error.to_string())),
+        ),
+    }
 }
 
 /// Resolves the complete Hook policy for one event: pure activation policy,
@@ -1476,6 +1545,7 @@ fn plan_hook_action(
         action
     };
     let action = add_self_healed_activation_marker(event, action, capabilities, authorization);
+    let action = add_maintenance_digest_hint(event, action, capabilities, activation);
     if authorization.hooks.artifact_focus_reminder {
         add_artifact_focus_reminder(
             agent,
@@ -1497,13 +1567,16 @@ struct HookAuthorization {
     scope: Option<AuthorizedSessionScope>,
     catalog: Option<RepositoryCatalogSnapshot>,
     hooks: HookSettings,
+    /// The maintenance schedule, read from the same `config.toml` open the Catalog cost. Only the
+    /// `SessionStart` opportunistic gate reads it; every other event carries it unused.
+    maintenance: MaintenanceSettings,
     /// True when *this* event created the Session's missing lease and owes it the activation
     /// marker `SessionStart` never delivered.
     deliver_activation_marker: bool,
 }
 
 impl HookAuthorization {
-    const fn disabled() -> Self {
+    fn disabled() -> Self {
         Self {
             activation: ResolvedActivationDecision::Disabled,
             scope: None,
@@ -1511,6 +1584,9 @@ impl HookAuthorization {
             hooks: HookSettings {
                 artifact_focus_reminder: false,
             },
+            // A Session this installation never authorized starts nothing, so the value is only
+            // ever read through the `Enabled` gate below and the default is never acted on.
+            maintenance: MaintenanceSettings::default(),
             deliver_activation_marker: false,
         }
     }
@@ -1544,6 +1620,63 @@ fn add_self_healed_activation_marker(
         &event.context().session_id,
     ));
     action
+}
+
+/// Appends the maintenance hint to the `SessionStart` activation marker when Reviews are waiting.
+///
+/// The hint rides *behind* the marker rather than replacing it, and only when
+/// `additional_context` holds exactly the marker this event just rendered. That is the same
+/// first-come rule [`add_self_healed_activation_marker`] and [`add_artifact_focus_reminder`]
+/// follow, stated positively: the field is not free, so the only thing this may do is add a line
+/// after content it recognizes as its own. Anything else in the field -- today nothing, tomorrow
+/// whatever claims it first -- means the hint is dropped, and the marker's two existing forms keep
+/// their exact bytes either way.
+///
+/// `SessionStart` only: it is the one event a person reads before deciding what the session is
+/// for, and repeating a pending count on every turn would be nagging rather than steering.
+///
+/// Every failure is silence. An absent digest is the normal state of an installation that has
+/// never run maintenance, an unreadable or unrecognized one is a local-state fault the Hook has no
+/// business reporting to the model, and neither is worth a byte of the Agent's context.
+fn add_maintenance_digest_hint(
+    event: &CanonicalAgentEvent,
+    mut action: CanonicalAgentAction,
+    capabilities: &AgentCapabilities,
+    activation: ResolvedActivationDecision,
+) -> CanonicalAgentAction {
+    if event.kind() != CanonicalAgentEventKind::SessionStart
+        || activation != ResolvedActivationDecision::Enabled
+    {
+        return action;
+    }
+    let marker = shared_context_activation_marker(capabilities.agent, &event.context().session_id);
+    let pending = installation_root()
+        .ok()
+        .and_then(|root| sctx_installer::maintain::read_digest(&root).ok().flatten())
+        .map_or(0, |digest| digest.counts.pending_candidate_reviews);
+    if let Some(context) =
+        maintenance_hint_appended_to_marker(action.additional_context.as_deref(), &marker, pending)
+    {
+        action.additional_context = Some(context);
+    }
+    action
+}
+
+/// The whole first-come decision, with no clock, filesystem, or configuration in it.
+///
+/// Returns the complete replacement value for `additional_context`, or `None` to leave the field
+/// exactly as it is -- which covers all three of "nobody rendered a marker", "somebody else owns
+/// the field", and "nothing is pending".
+fn maintenance_hint_appended_to_marker(
+    additional_context: Option<&str>,
+    marker: &str,
+    pending_candidate_reviews: u64,
+) -> Option<String> {
+    if additional_context != Some(marker) {
+        return None;
+    }
+    let hint = render_maintenance_hint(pending_candidate_reviews)?;
+    Some(format!("{marker}\n{hint}"))
 }
 
 /// Whether one lifecycle event's vendor output can carry model-visible text on both adapters.
@@ -1588,7 +1721,7 @@ fn resolve_hook_authorization_inner(
     let root = installation_root()?;
     let locator = ExternalSessionLocator::new(agent, session_id)?;
     let config = UserConfigStore::open_existing(&root)?;
-    let (catalog, hooks) = config.repository_catalog_with_hooks()?;
+    let (catalog, hooks, maintenance) = config.repository_catalog_with_hooks()?;
     let store = AuthorizedSessionScopeStore::initialize(&root)?;
 
     // A lease is permanent, but its decision is not: the recorded canonical
@@ -1646,6 +1779,7 @@ fn resolve_hook_authorization_inner(
         scope,
         catalog: Some(catalog),
         hooks,
+        maintenance,
         deliver_activation_marker,
     })
 }
@@ -4783,4 +4917,54 @@ fn invariant(message: impl Into<String>) -> Error {
 
 fn json_error(operation: &'static str) -> impl FnOnce(serde_json::Error) -> Error {
     move |error| Error::new(ErrorKind::Io, format!("failed to {operation}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Artifact focus reminder gives up when `additional_context` is taken; this hint is the
+    /// same rule seen from the other side -- it may only *extend* content it recognizes as the
+    /// marker it was rendered beside. Anything else in the field, including nothing at all, leaves
+    /// the field untouched, which is what keeps deferred-issues #14 from becoming a real
+    /// collision the first time a second producer claims `SessionStart`.
+    #[test]
+    fn the_maintenance_hint_only_extends_a_marker_it_recognizes() {
+        let marker = shared_context_activation_marker(
+            sctx_agent_adapter::AgentKind::Cursor,
+            "session-hint-unit",
+        );
+
+        let appended = maintenance_hint_appended_to_marker(Some(&marker), &marker, 3).unwrap();
+        let (kept, hint) = appended.split_at(marker.len());
+        assert_eq!(kept, marker, "the marker's bytes must survive verbatim");
+        assert!(hint.starts_with('\n'));
+        assert!(
+            hint.contains("3 pending Candidate Reviews await a decision"),
+            "{hint}"
+        );
+
+        // Nothing pending: the marker is returned to the caller untouched, not rewritten.
+        assert_eq!(
+            maintenance_hint_appended_to_marker(Some(&marker), &marker, 0),
+            None
+        );
+        // The field is free -- a degraded or Disabled plan -- so there is no marker to extend.
+        assert_eq!(maintenance_hint_appended_to_marker(None, &marker, 3), None);
+        // The field belongs to another producer: give it up rather than appending to their text.
+        assert_eq!(
+            maintenance_hint_appended_to_marker(Some("some other producer's context"), &marker, 3),
+            None
+        );
+        // Even a marker for a *different* Session is somebody else's: byte equality is the whole
+        // ownership test, because it is the only one that cannot be fooled.
+        let other = shared_context_activation_marker(
+            sctx_agent_adapter::AgentKind::Cursor,
+            "another-session",
+        );
+        assert_eq!(
+            maintenance_hint_appended_to_marker(Some(&other), &marker, 3),
+            None
+        );
+    }
 }
