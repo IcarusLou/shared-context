@@ -53,6 +53,7 @@ struct HashProvider {
     encodes: AtomicUsize,
     delay: Option<Duration>,
     fail: bool,
+    backfilling: bool,
 }
 
 impl HashProvider {
@@ -62,6 +63,7 @@ impl HashProvider {
             encodes: AtomicUsize::new(0),
             delay: None,
             fail: false,
+            backfilling: false,
         }
     }
 
@@ -70,6 +72,15 @@ impl HashProvider {
         Self {
             delay: Some(delay),
             ..Self::new()
+        }
+    }
+
+    /// A slow provider that says a corpus backfill is competing with every encode, for the
+    /// difference between "the budget is unfit" and "the backfill window is open".
+    fn slow_while_backfilling(delay: Duration) -> Self {
+        Self {
+            backfilling: true,
+            ..Self::slow(delay)
         }
     }
 
@@ -99,6 +110,10 @@ fn ngram_seed(ngram: &[char]) -> u64 {
 impl EmbeddingProvider for HashProvider {
     fn dimensions(&self) -> usize {
         self.dimensions
+    }
+
+    fn is_backfilling(&self) -> bool {
+        self.backfilling
     }
 
     fn encode(&self, text: &str) -> Result<Vec<f32>, Error> {
@@ -688,6 +703,49 @@ fn encode_timings_are_recorded_where_status_and_doctor_can_read_them() {
         "the real cost is recorded, not the budget"
     );
     assert!(samples[0].query_chars > 0);
+    assert!(
+        !samples[0].backfill_active,
+        "nothing was backfilling, so this timeout is the encoder's own and has to read as one"
+    );
+}
+
+#[test]
+fn a_timeout_taken_while_the_corpus_backfills_is_recorded_as_a_contended_one() {
+    let directory = TempDir::new().unwrap();
+    let cache =
+        Arc::new(SemanticVectorCache::open(&directory.path().join("semantic.sqlite")).unwrap());
+
+    let provider = Arc::new(HashProvider::slow_while_backfilling(Duration::from_millis(
+        120,
+    )));
+    let vector = provider.encode("corpus entry").unwrap();
+    let channel = EmbeddingSemanticChannel::new(provider, vec![(RevisionId::new(), vector)])
+        .with_budget(Duration::from_millis(15))
+        .with_encode_recorder(Arc::clone(&cache) as Arc<dyn EncodeSampleRecorder>);
+
+    assert_eq!(
+        channel.similar_revisions("a query the backfill is standing on"),
+        SemanticOutcome::Unavailable
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while cache.recent_encode_samples(8).unwrap().is_empty() && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let samples = cache.recent_encode_samples(8).unwrap();
+    assert_eq!(samples.len(), 1, "one query, one observation");
+    assert!(samples[0].timed_out);
+    assert!(
+        samples[0].backfill_active,
+        "a timeout the backfill caused has to survive as a different fact from one the budget \
+         caused, or `sctx doctor` sends the operator to raise a budget that was never the problem"
+    );
+
+    let summary = cache.encode_latency_summary().unwrap();
+    assert_eq!(summary.timed_out, 1);
+    assert_eq!(summary.timed_out_during_backfill, 1);
 }
 
 #[test]
@@ -697,6 +755,7 @@ fn a_history_of_timeouts_is_what_marks_a_budget_unfit_and_a_short_one_is_not() {
         elapsed_ms: 240,
         budget_ms: 200,
         timed_out: true,
+        backfill_active: false,
     };
     let inside = EncodeSample {
         timed_out: false,
@@ -723,6 +782,21 @@ fn a_history_of_timeouts_is_what_marks_a_budget_unfit_and_a_short_one_is_not() {
     assert_eq!(summary.samples, 10);
     assert_eq!(summary.timed_out, 1);
     assert_eq!(summary.max_ms, 240);
+
+    // The reason the column exists. The same ten timeouts that condemn the budget above say
+    // nothing about it once they are attributed to the backfill window they were taken in.
+    let contended = EncodeSample {
+        backfill_active: true,
+        ..timeout
+    };
+    let summary = EncodeLatencySummary::from_samples(&[contended; 10]);
+    assert_eq!(summary.timed_out, 10, "the degradations are still recorded");
+    assert_eq!(summary.timed_out_during_backfill, 10);
+    assert!(
+        !summary.budget_is_unfit(),
+        "a history of timeouts taken while the corpus backfilled is a window that closes, not a \
+         budget the machine cannot meet"
+    );
 }
 
 #[test]

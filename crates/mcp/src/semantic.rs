@@ -100,7 +100,13 @@ fn load_and_backfill(
         }
         // One failed encode is one missing candidate, not a failed backfill: the remaining corpus
         // is still worth having.
-        let Ok(vector) = provider.encode(&text) else {
+        //
+        // `encode_bulk`, not `encode`, and that is the whole point of the publish-then-backfill
+        // order being safe. The channel above is already answering, so from here to the end of the
+        // loop every query shares one ONNX session with the most expensive encodes in the system.
+        // Asking for the corpus at background priority means a query waits for the corpus text
+        // already in flight and never for the next one.
+        let Ok(vector) = provider.encode_bulk(&text) else {
             continue;
         };
         if cache.store(&key, revision_id, &vector).is_ok() {
@@ -156,7 +162,11 @@ pub fn warm_semantic_cache_at_root(root: &Path) -> sctx_search::Result<SemanticW
         if cached.contains(&revision_id) {
             continue;
         }
-        let Ok(vector) = provider.encode(&text) else {
+        // Corpus priority here too, for the same reason it is corpus priority in the background
+        // loader: nothing is waiting on these vectors. This process serves no queries, so the
+        // priority never costs anything -- it only keeps the two backfill paths saying the same
+        // thing about what corpus work is.
+        let Ok(vector) = provider.encode_bulk(&text) else {
             continue;
         };
         if cache.store(&key, revision_id, &vector).is_ok() {
