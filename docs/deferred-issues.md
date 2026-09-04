@@ -38,3 +38,12 @@
 18. **B3 英文 Intent vs 中文知识库**：workflow 语言指引已缓解（d0773d8f 实证中文 Intent），剩余跨语言召回由 embedding 通道（ADR-0004）覆盖；此处仅记录现象。
 19. **zh-09 类 Space Intent BM25 抬升无关 Space**：`space_intent_bm25` 通道命中「配置/置下」类弱词即可让无关 Space 反超，item 层 coverage 乘子下限 5000 拉不回（R3 分析）。单探针问题，待 embedding 通道落地后重估。
 20. **探针 harness 的 usage prior 自我干扰**：连跑探针累积 `ignored` 计数可影响 1bp 级排序差（R1-S1 发现）；T1 修 usage 判定时顺带在 harness 中隔离 usage 状态。
+
+## 2026-09-04 新增（第三轮 U1–U4 期间发现，均只报告未修）
+
+21. **`AssignedCredential` 规则可能误伤域 id**：`token:`/`secret:`/`credential:` 等 key 名 + 分隔符 + ≥8 字节值即命中；若文本写成 `auth_token: ctx_<uuid>`，即便 id 已被 U4 的掩码替换，该规则仍按「关键字+分隔符+非空值」结构触发。与 U4 的修复正交，需单独跟踪。
+22. **`scan_phone_numbers` 的反向缺陷（漏检）**：真实号码后紧跟 `(` + 单词（如 `+1 415-555-0132 (building on ...`）时，`(` 被当作格式字符继续吞入，随后遇字母使 `boundary_after` 失败，整段贪婪匹配被丢弃且不回退到更短的合法前缀 → 假阴性。同一规则表内的不对称问题。
+23. **长十六进制串（commit sha 等）的同类小概率误判**：纯数字子串恰好落入电话号码窗口时，与 U4 修掉的 UUID 场景同源，概率远低，未处理。
+24. **installer 展示层未呈现 `timed_out_during_backfill`**：U3 已把该字段写入 `encode_sample` 与 `EncodeLatencySummary`，但 `sctx embedding status` / `doctor` 的文案没有把「回填窗口内超时」与「预算不匹配硬件」的区分展示给操作员（数据已在，仅缺展示）。
+25. **1200ms 编码预算对满长语料几乎无余量**：U3 在高负载下实测 1400 字符 encode 达 1062ms（T5d 定预算时机器较闲，测得 816ms）。查询侧因抢占已不受影响，但该预算本身的余量值得后续复核。
+
