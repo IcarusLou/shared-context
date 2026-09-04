@@ -4029,6 +4029,32 @@ fn check_index(root: &Path, checks: &mut Vec<DoctorCheck>) {
         )),
         Err(error) => checks.push(failed("indexed_tree", error.to_string())),
     }
+    // WP-V6 fix 4: `APPEND_PROTOCOL_BYPASSED` used to reach only whichever `sctx index sync` (or
+    // automatic retrieval call) happened to trigger the rebuild that found it, as one line in that
+    // one call's own JSON -- gone the moment that process exited. It is now persisted in `meta`
+    // (`ProjectionIndex::last_rebuild_operational_warnings`), so a later `sctx doctor` sees it too.
+    match index.last_rebuild_operational_warnings() {
+        Ok(warnings) if warnings.is_empty() => checks.push(ok(
+            "append_protocol",
+            "the most recent rebuild that compared history found no bypass",
+        )),
+        Ok(warnings) => {
+            let paths = warnings
+                .iter()
+                .flat_map(|warning| warning.paths.iter())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            checks.push(warning(
+                "append_protocol",
+                format!(
+                    "知识仓库历史出现非追加变更 (committed history was found modified outside the \
+                     append protocol): {paths}"
+                ),
+            ));
+        }
+        Err(error) => checks.push(failed("append_protocol", error.to_string())),
+    }
     match index.domain_snapshot() {
         Ok(snapshot) if snapshot.diagnostics.is_empty() => {
             checks.push(ok(

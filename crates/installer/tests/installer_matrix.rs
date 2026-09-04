@@ -17,7 +17,7 @@ use sctx_domain::{
 use sctx_engineering_graph::{EngineeringProjectionStore, RepositoryRegistry};
 use sctx_event_schema::{Event, IntentSnapshot, V1_JSON_SCHEMA};
 use sctx_git_store::{AppendRequest, GitStore, TextObject};
-use sctx_index::ProjectionIndex;
+use sctx_index::{IncrementalFallback, ProjectionIndex};
 use sctx_installer::{
     Agent, Architecture, CheckStatus, DataResetOptions, Host, InstallContext, Installer,
     KnowledgeRemoteType, KnowledgeStoreUrl, ResetStage, SetupOptions, SetupStage, SkillStatus,
@@ -341,10 +341,11 @@ fn assert_runtime_schema_current(root: &Path) {
     let version = connection
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .unwrap();
-    // 16 is the current schema version: 13, 14 and 15 all gained in-place migrations (additive
-    // `hook_event`, then the `context_usage` reset, then the omission-only reset) rather than
-    // becoming discardable/unsupported versions, so a fresh or rebuilt Runtime always lands on 16.
-    assert_eq!(version, 16);
+    // 17 is the current schema version: 13, 14, 15 and 16 all gained in-place migrations
+    // (additive `hook_event`, then the `context_usage` reset, then the omission-only reset, then
+    // the additive checkpoint-reminder counters) rather than becoming discardable/unsupported
+    // versions, so a fresh or rebuilt Runtime always lands on 17.
+    assert_eq!(version, 17);
     assert!(sqlite_table_exists(&connection, "task_signal"));
     assert!(sqlite_table_exists(&connection, "hook_event"));
     assert!(!sqlite_table_exists(&connection, "capture_ingestion"));
@@ -992,7 +993,7 @@ fn setup_rebuilds_schema_11_runtime_and_discards_cached_task_and_capture_state()
 
 #[test]
 fn setup_rejects_unknown_or_future_runtime_schemas_without_mutating_state() {
-    for version in [10_u32, 17, 999] {
+    for version in [10_u32, 18, 999] {
         let harness = Harness::new();
         let installer = harness.installer("1.2.3");
         installer.setup(&SetupOptions::default()).unwrap();
@@ -1031,7 +1032,7 @@ fn setup_rejects_unknown_or_future_runtime_schemas_without_mutating_state() {
 
         assert_eq!(
             error.message(),
-            format!("unsupported task runtime schema version {version}; expected 16")
+            format!("unsupported task runtime schema version {version}; expected 17")
         );
         for (path, bytes, mode) in prior {
             assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
@@ -3318,6 +3319,100 @@ fn next_setup_recovers_an_incomplete_durable_journal_before_reapplying() {
         serde_json::from_slice(&fs::read(&report.journal).unwrap()).unwrap();
     assert_eq!(recovered_journal["phase"], "recovered_rollback");
     assert_eq!(recovered_journal["complete"], true);
+}
+
+/// `APPEND_PROTOCOL_BYPASSED` (WP-V6 fix 4) used to reach only whichever process's own
+/// `sctx index sync` call happened to trigger the fallback rebuild that found it, gone the moment
+/// that process exited. It is now persisted in the index's own `meta` table, so a `sctx doctor`
+/// run long after the triggering synchronization still sees it.
+#[test]
+fn doctor_surfaces_a_persisted_append_protocol_bypass_after_the_synchronization_that_found_it() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.0.0");
+    installer.setup(&SetupOptions::default()).unwrap();
+
+    let append_protocol_check = |report: &sctx_installer::DoctorReport| {
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "append_protocol")
+            .expect("doctor always reports append-protocol integrity")
+            .clone()
+    };
+    assert_eq!(
+        append_protocol_check(&installer.doctor()).status,
+        CheckStatus::Ok,
+        "a freshly set up installation has no history to warn about"
+    );
+
+    let store = GitStore::open_existing(&harness.root).unwrap();
+    let event = Event::space_created(
+        IntentSnapshot {
+            title: "doctor append-protocol fixture".to_owned(),
+            problem: "a persisted bypass warning must survive past the call that found it"
+                .to_owned(),
+            desired_outcome: "sctx doctor reports it".to_owned(),
+            in_scope: vec!["append-protocol integrity".to_owned()],
+            out_of_scope: Vec::new(),
+            acceptance_conditions: vec!["doctor names the modified path".to_owned()],
+            domain_terms: Vec::new(),
+        },
+        None,
+    )
+    .unwrap();
+    let outcome = store.append_event(AppendRequest::event(event)).unwrap();
+    let event_path = harness.root.join("repository").join(&outcome.event_path);
+    let index = ProjectionIndex::new(harness.root.join("repository"), harness.root.join("state"));
+    index.synchronize().unwrap();
+
+    // Committed history modified outside the append protocol: the same shape
+    // `crates/index/tests/sqlite_rebuild.rs`'s "modify" case constructs.
+    let replacement = Event::space_created(
+        IntentSnapshot {
+            title: "manual replacement".to_owned(),
+            problem: "committed history must not be a second source of truth".to_owned(),
+            desired_outcome: "doctor names the modified path".to_owned(),
+            in_scope: vec!["append-protocol integrity".to_owned()],
+            out_of_scope: Vec::new(),
+            acceptance_conditions: vec!["doctor reports the bypass".to_owned()],
+            domain_terms: Vec::new(),
+        },
+        None,
+    )
+    .unwrap();
+    fs::write(&event_path, serde_json::to_vec(&replacement).unwrap()).unwrap();
+    git(
+        &harness.root.join("repository"),
+        &["add", "--", &outcome.event_path],
+    );
+    git(
+        &harness.root.join("repository"),
+        &["commit", "-m", "Bypass append protocol for doctor test"],
+    );
+
+    let synchronized = index.synchronize().unwrap();
+    assert_eq!(
+        synchronized.incremental_fallback,
+        Some(IncrementalFallback::AppendProtocolBypassed)
+    );
+
+    let bypassed = append_protocol_check(&installer.doctor());
+    assert_eq!(
+        bypassed.status,
+        CheckStatus::Warning,
+        "a persisted bypass must not read as healthy: {}",
+        bypassed.message
+    );
+    assert!(
+        bypassed.message.contains("知识仓库历史出现非追加变更"),
+        "{}",
+        bypassed.message
+    );
+    assert!(
+        bypassed.message.contains(&outcome.event_path),
+        "the message must name the modified path: {}",
+        bypassed.message
+    );
 }
 
 /// A dark Graph channel is silent by construction: every Task Context Pack degrades to text, and

@@ -1029,17 +1029,104 @@ fn manual_modify_delete_and_rename_force_full_equivalent_rebuilds() {
             "APPEND_PROTOCOL_BYPASSED"
         );
 
+        // WP-V6 fix 4: the bypass this synchronize() call just found is persisted, not only
+        // returned -- `sctx doctor` reads exactly this back later, long after the call that
+        // detected it has returned and exited.
+        let persisted = fixture.index.last_rebuild_operational_warnings().unwrap();
+        assert_eq!(persisted.len(), 1, "{operation} must persist the warning");
+        assert_eq!(persisted[0].code, "APPEND_PROTOCOL_BYPASSED");
+        assert_eq!(
+            persisted[0].paths, synchronized.operational_warnings[0].paths,
+            "{operation} persisted paths must match the returned warning"
+        );
+
         let scratch_state = fixture
             .temporary
             .path()
             .join(format!("scratch-{operation}"));
         let scratch = ProjectionIndex::new(fixture.store.repository(), scratch_state);
         scratch.rebuild().unwrap();
+        // The scratch database never went through an incremental attempt that found a bypass --
+        // it has nothing to persist a warning about, which is exactly the asymmetry
+        // `projection_dump` excludes `last_rebuild_operational_warnings` to tolerate.
+        assert!(
+            scratch
+                .last_rebuild_operational_warnings()
+                .unwrap()
+                .is_empty(),
+            "{operation}: a scratch rebuild has no history to warn about"
+        );
         assert_eq!(
             projection_dump(fixture.index.database_path()),
             projection_dump(scratch.database_path()),
             "{operation} projection diverged from scratch"
         );
+    }
+}
+
+/// The persisted warning (WP-V6 fix 4) survives every ordinary incremental sync that follows the
+/// rebuild that found it: an incremental update is not itself a rebuild, and a Session that keeps
+/// working normally after one historical bypass must not make `sctx doctor` forget it happened by
+/// the next time an Agent's automatic retrieval happens to call `synchronize()`.
+#[test]
+fn operational_warning_survives_every_incremental_sync_that_follows_it() {
+    let fixture = fixture();
+    fixture.index.synchronize().unwrap();
+    assert!(
+        fixture
+            .index
+            .last_rebuild_operational_warnings()
+            .unwrap()
+            .is_empty(),
+        "nothing has bypassed the append protocol yet"
+    );
+
+    let relative = fixture
+        .committed_event_path
+        .strip_prefix(fixture.store.repository())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let replacement = Event::space_created(intent("manual replacement"), None).unwrap();
+    fs::write(
+        &fixture.committed_event_path,
+        serde_json::to_vec(&replacement).unwrap(),
+    )
+    .unwrap();
+    git(fixture.store.repository(), ["add", "--", &relative]);
+    git(
+        fixture.store.repository(),
+        ["commit", "-m", "Bypass append protocol for index test"],
+    );
+    let bypassed = fixture.index.synchronize().unwrap();
+    assert_eq!(bypassed.update_kind, IndexUpdateKind::FullRebuild);
+    let persisted = fixture.index.last_rebuild_operational_warnings().unwrap();
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].code, "APPEND_PROTOCOL_BYPASSED");
+
+    // Three ordinary, purely-additive commits and synchronizations follow -- exactly the shape a
+    // Session working normally after the one bypass produces. `append` writes directly through
+    // `GitStore` without going through the index-aware candidate-submission path, so the
+    // `synchronize()` below always has real, genuinely incremental work to do.
+    for index in 0..3 {
+        append(
+            &fixture.store,
+            Event::space_created(intent(&format!("addition {index} after the bypass")), None)
+                .unwrap(),
+        );
+        let synchronized = fixture.index.synchronize().unwrap();
+        assert_eq!(
+            synchronized.update_kind,
+            IndexUpdateKind::Incremental,
+            "addition {index} must be a clean incremental update, not another rebuild"
+        );
+        let persisted = fixture.index.last_rebuild_operational_warnings().unwrap();
+        assert_eq!(
+            persisted.len(),
+            1,
+            "addition {index}: the warning from the earlier rebuild must still be visible"
+        );
+        assert_eq!(persisted[0].code, "APPEND_PROTOCOL_BYPASSED");
     }
 }
 
@@ -1681,7 +1768,15 @@ fn event_commit_memo(database: &Path) -> BTreeMap<String, String> {
 fn projection_dump(database: &Path) -> Vec<String> {
     let connection = Connection::open(database).unwrap();
     [
-        "SELECT key, value FROM meta WHERE key <> 'projection_generation' ORDER BY key",
+        // `projection_generation` counts how many times this database was synchronized, and
+        // `last_rebuild_operational_warnings` remembers whether a *past* rebuild found committed
+        // history modified outside the append protocol (WP-V6 fix 4): both are properties of this
+        // database's own history, not of the Tree it currently indexes, so two databases that
+        // reach the identical Tree by different paths are allowed to disagree about them without
+        // the projection itself having diverged.
+        "SELECT key, value FROM meta \
+         WHERE key NOT IN ('projection_generation', 'last_rebuild_operational_warnings') \
+         ORDER BY key",
         "SELECT * FROM source_file ORDER BY path",
         "SELECT * FROM context_candidate ORDER BY candidate_id",
         "SELECT * FROM space_projection ORDER BY space_id",

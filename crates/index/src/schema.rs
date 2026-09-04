@@ -66,10 +66,18 @@ pub(crate) fn replace_projection(
     input: &BuildInput,
     tree_oid: &str,
     generation: u64,
+    operational_warnings_json: &str,
 ) -> crate::Result<()> {
     drop_tables(transaction, NEXT_PREFIX)?;
     create_tables(transaction, NEXT_PREFIX)?;
-    populate(transaction, NEXT_PREFIX, input, tree_oid, generation)?;
+    populate(
+        transaction,
+        NEXT_PREFIX,
+        input,
+        tree_oid,
+        generation,
+        operational_warnings_json,
+    )?;
     drop_tables(transaction, "")?;
     for table in TABLES {
         transaction
@@ -565,6 +573,7 @@ fn populate(
     input: &BuildInput,
     tree_oid: &str,
     generation: u64,
+    operational_warnings_json: &str,
 ) -> crate::Result<()> {
     let insert_meta = format!("INSERT INTO {prefix}meta(key, value) VALUES (?1, ?2)");
     transaction
@@ -576,6 +585,20 @@ fn populate(
             params!["projection_generation", generation.to_string()],
         )
         .map_err(sql_error("write projection generation"))?;
+    // Additive to `meta`'s existing generic `(key, value)` shape: see
+    // `crate::OPERATIONAL_WARNINGS_META_KEY` for why this needs no schema version bump. The caller
+    // resolved this string before the shadow rebuild began -- either freshly from this
+    // generation's own comparison, or carried forward from what `meta` already held -- so it is
+    // written verbatim here without this function needing to know which.
+    transaction
+        .execute(
+            &insert_meta,
+            params![
+                crate::OPERATIONAL_WARNINGS_META_KEY,
+                operational_warnings_json
+            ],
+        )
+        .map_err(sql_error("write operational warning metadata"))?;
     for (key, value) in IMPLEMENTATION_VERSIONS {
         transaction
             .execute(&insert_meta, params![key, value])
@@ -1353,10 +1376,18 @@ pub(crate) fn replace_projection_incremental(
     tree_oid: &str,
     generation: u64,
     affected_spaces: &std::collections::BTreeSet<String>,
+    operational_warnings_json: &str,
 ) -> crate::Result<()> {
     drop_tables(transaction, NEXT_PREFIX)?;
     create_tables(transaction, NEXT_PREFIX)?;
-    populate(transaction, NEXT_PREFIX, input, tree_oid, generation)?;
+    populate(
+        transaction,
+        NEXT_PREFIX,
+        input,
+        tree_oid,
+        generation,
+        operational_warnings_json,
+    )?;
     transaction
         .execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS _affected_space(space_id TEXT PRIMARY KEY) WITHOUT ROWID;
