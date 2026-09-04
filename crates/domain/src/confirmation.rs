@@ -26,6 +26,54 @@ where
     Ok(())
 }
 
+/// Who decided one Candidate disposition.
+///
+/// It is provenance, never domain semantics: it is recorded in event `annotations` and in the
+/// local Runtime, and it never reaches an event payload, the Confirmation operation hash, or any
+/// replay identity. `Human` is the default and the only value a client that never states one
+/// produces, so every disposition written before this existed reads back as a human decision.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionSource {
+    /// An explicit human choice; the default for every request that omits the field.
+    #[default]
+    Human,
+    /// The session Agent acting inside the server-verified automatic permission surface.
+    AgentPolicy,
+}
+
+impl DecisionSource {
+    /// Stable wire and storage name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::AgentPolicy => "agent_policy",
+        }
+    }
+
+    /// Parses the stable wire name.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any spelling other than `human` or `agent_policy`.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "human" => Ok(Self::Human),
+            "agent_policy" => Ok(Self::AgentPolicy),
+            other => Err(invalid(format!(
+                "decision_source must be human or agent_policy, not {other}"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for DecisionSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Exactly one Primary Space choice supplied when confirming a Candidate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -102,6 +150,15 @@ pub struct OptionalCandidateEdits {
 }
 
 impl OptionalCandidateEdits {
+    /// True when no field replacement was supplied at all.
+    ///
+    /// Every field is optional and absence preserves the Candidate, so "no edits" and "the default
+    /// value" are the same fact.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
     /// Applies only supplied replacements and validates the resulting complete draft.
     ///
     /// # Errors

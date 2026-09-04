@@ -19,9 +19,9 @@ pub use confirmation::{
     CandidateConfirmationNewSpace, CandidateConfirmationOperation, CandidateConfirmationPlan,
     CandidateConfirmationPlanEventIds, CandidateConfirmationPrimaryReference,
     CandidateConfirmationRequest, CandidatePrimarySelection, ContextSpaceAssociation,
-    ContextSpaceAssociationDraft, ContextSpaceAssociationOrigin, OptionalCandidateEdits,
-    ProblemViewEdit, SemanticConflictOpening, SemanticConflictOpeningDraft, TopicKeyEdit,
-    context_revision_as_draft, context_revision_content_hash,
+    ContextSpaceAssociationDraft, ContextSpaceAssociationOrigin, DecisionSource,
+    OptionalCandidateEdits, ProblemViewEdit, SemanticConflictOpening, SemanticConflictOpeningDraft,
+    TopicKeyEdit, context_revision_as_draft, context_revision_content_hash,
 };
 pub use engineering::{
     ArtifactAssociationKind, ArtifactKey, ArtifactKind, ArtifactLocator, ArtifactRelationKind,

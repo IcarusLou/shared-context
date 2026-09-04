@@ -19,17 +19,18 @@ pub use sctx_domain::{
     ContextCandidate, ContextGovernanceStatus, ContextId, ContextKind, ContextProjection,
     ContextRelation, ContextRelationKind, ContextRevision, ContextRevisionDraft,
     ContextSpaceAssociation, ContextSpaceAssociationDraft, ContextSpaceAssociationOrigin,
-    ContextSpaceProjection, DomainProjection, EngineeringReference, EngineeringReferenceDraft,
-    Error, ErrorKind, EventId, EvidenceId, EvidenceSnapshot, EvidenceSnapshotDraft, EvidenceType,
-    IdParseError, IntentProjection, IntentRevision, IntentSnapshot, OptionalCandidateEdits,
-    ProblemViewEdit, Publication, PublicationAction, PublicationDraft, PublicationId,
-    ReducerDiagnostic, ReducerDiagnosticCode, ReducerEvent, ReducerPayload, ReferenceId,
-    ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionId, ResolutionOutcome, Result,
-    Review, ReviewDraft, ReviewId, ReviewSummary, ReviewVerdict, RevisionId, RevisionLifecycle,
-    RevisionProjection, SemanticConflict, SemanticConflictCandidate, SemanticConflictDraft,
-    SemanticConflictOpenReason, SemanticConflictProjection, SemanticConflictStatus,
-    SpaceAssociationId, SpaceId, SubmissionId, TaskId, TaskSessionId, TopicKeyEdit, WorkEpisodeId,
-    WorkEpisodeRef, context_revision_as_draft, context_revision_content_hash, reduce,
+    ContextSpaceProjection, DecisionSource, DomainProjection, EngineeringReference,
+    EngineeringReferenceDraft, Error, ErrorKind, EventId, EvidenceId, EvidenceSnapshot,
+    EvidenceSnapshotDraft, EvidenceType, IdParseError, IntentProjection, IntentRevision,
+    IntentSnapshot, OptionalCandidateEdits, ProblemViewEdit, Publication, PublicationAction,
+    PublicationDraft, PublicationId, ReducerDiagnostic, ReducerDiagnosticCode, ReducerEvent,
+    ReducerPayload, ReferenceId, ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionId,
+    ResolutionOutcome, Result, Review, ReviewDraft, ReviewId, ReviewSummary, ReviewVerdict,
+    RevisionId, RevisionLifecycle, RevisionProjection, SemanticConflict, SemanticConflictCandidate,
+    SemanticConflictDraft, SemanticConflictOpenReason, SemanticConflictProjection,
+    SemanticConflictStatus, SpaceAssociationId, SpaceId, SubmissionId, TaskId, TaskSessionId,
+    TopicKeyEdit, WorkEpisodeId, WorkEpisodeRef, context_revision_as_draft,
+    context_revision_content_hash, reduce,
 };
 
 /// Immutable identifier for the bundled V1 JSON Schema.
@@ -165,6 +166,62 @@ pub struct Annotations {
     pub origin_hint: Option<OriginHint>,
     #[serde(flatten)]
     pub additional: BTreeMap<String, Value>,
+}
+
+/// Who decided one Candidate Confirmation, and from which session.
+///
+/// This is provenance only. It is written into the `candidate.confirmed` event's `annotations` —
+/// the single open extension boundary of the byte-frozen V1 schema — and never into an event
+/// payload, the Confirmation operation hash, or the plan hash: `annotations` are excluded from
+/// [`Event::semantic_hash`], and a replay of the same confirmation must stay byte-identical in
+/// every identity a retry compares.
+///
+/// `author` is a bare username (the part of a global Git `user.email` before the `@`), never a
+/// full address, and `external_session_id` is this system's own opaque `xss_` identifier. Both are
+/// optional: a confirmation whose author cannot be resolved simply omits the key.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ConfirmationProvenance {
+    /// `human` (the default) or `agent_policy`.
+    pub decision_source: DecisionSource,
+    /// Username portion of the global Git identity, when one was resolvable.
+    pub author: Option<String>,
+    /// This system's opaque `ExternalSession` identifier, for batch revocation by session.
+    pub external_session_id: Option<String>,
+}
+
+impl ConfirmationProvenance {
+    /// Provenance for a confirmation whose only known fact is that a human made it.
+    #[must_use]
+    pub fn human() -> Self {
+        Self::default()
+    }
+
+    /// Builds the annotations the one `candidate.confirmed` event carries.
+    ///
+    /// The two server envelope hashes and every resolvable provenance key, over the base
+    /// annotations every event in the same closure already shares. Nothing here is read back as
+    /// domain state, and nothing here changes a hash a retry compares.
+    fn confirmation_annotations(
+        &self,
+        mut annotations: Annotations,
+        plan: &CandidateConfirmationPlan,
+    ) -> Annotations {
+        let mut put = |key: &str, value: String| {
+            annotations
+                .additional
+                .insert(key.to_owned(), Value::String(value));
+        };
+        put("confirmation_operation_hash", plan.operation_hash.clone());
+        put("confirmation_plan_hash", plan.plan_hash());
+        put("decision_source", self.decision_source.as_str().to_owned());
+        if let Some(author) = &self.author {
+            put("author", author.clone());
+        }
+        if let Some(external_session_id) = &self.external_session_id {
+            put("external_session_id", external_session_id.clone());
+        }
+        annotations
+    }
 }
 
 /// Authoritative V1 event payload. The enclosing [`Event`] owns envelope data.
@@ -459,7 +516,10 @@ impl Event {
 
     /// Materializes one reserved Confirmation plan into its exact atomic immutable Events.
     ///
-    /// All IDs come from the server-owned plan; the caller supplies only the Writer batch.
+    /// All IDs come from the server-owned plan; the caller supplies the Writer batch and the
+    /// disposition provenance. Provenance reaches only the `candidate.confirmed` event's
+    /// `annotations`: it is deliberately not part of the plan, because the plan is hashed into
+    /// `plan_hash` and that hash is a replay identity.
     ///
     /// # Errors
     ///
@@ -467,6 +527,7 @@ impl Event {
     pub fn from_candidate_confirmation_plan(
         plan: &CandidateConfirmationPlan,
         writer_batch_id: &str,
+        provenance: &ConfirmationProvenance,
     ) -> Result<Vec<Self>> {
         plan.validate()?;
         let base_annotations = annotations_with_writer_batch(writer_batch_id, None)?;
@@ -551,15 +612,7 @@ impl Event {
                 base_annotations.clone(),
             )?);
         }
-        let mut confirmation_annotations = base_annotations;
-        confirmation_annotations.additional.insert(
-            "confirmation_operation_hash".to_owned(),
-            Value::String(plan.operation_hash.clone()),
-        );
-        confirmation_annotations.additional.insert(
-            "confirmation_plan_hash".to_owned(),
-            Value::String(plan.plan_hash()),
-        );
+        let confirmation_annotations = provenance.confirmation_annotations(base_annotations, plan);
         events.push(exact(
             plan.event_ids.confirmation_event_id,
             EventPayload::CandidateConfirmed {
