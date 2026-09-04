@@ -149,8 +149,8 @@ An immutable fact that one unconflicted Candidate produced one exact published C
 _Avoid_: CandidateReview decision, Candidate activation, Candidate mutation
 
 **CandidateConfirmationOperation**:
-One recoverable human confirmation decision bound to an exact Pending CandidateReview version, analysis generation, Space selection, Related Spaces, and optional field edits.
-_Avoid_: content deduplication, automatic confirmation, Candidate mutation
+One recoverable confirmation decision — human, or agent_policy inside the server-verified surface (ADR-0005) — bound to an exact Pending CandidateReview version, analysis generation, Space selection, Related Spaces, and optional field edits.
+_Avoid_: content deduplication, unverified automatic confirmation, Candidate mutation
 
 **CandidateConfirmationPlan**:
 The complete server-owned fact closure reserved for one CandidateConfirmationOperation, including stable identities and causal references for every knowledge fact it will create.

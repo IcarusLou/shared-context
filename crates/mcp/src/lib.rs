@@ -784,7 +784,8 @@ pub enum CandidateConfirmPrimaryInput {
     Proposed(NewCandidatePrimaryInput),
 }
 
-/// Strict explicit human Candidate confirmation request.
+/// Strict explicit Candidate confirmation request — human by default, or `agent_policy`
+/// inside the server-verified surface (ADR-0005).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateConfirmInput {
@@ -3486,8 +3487,9 @@ impl Runtime {
         let final_draft = edits.apply(&persisted.content)?;
         validate_context_relation_targets(snapshot, &final_draft.relations)?;
         // A Candidate whose strongest assessment restates a Context the knowledge base already
-        // accepted stays confirmable — only a human confirmation ever produces an accepted fact,
-        // and that does not change here. What it may no longer do is land as a fresh, unrelated
+        // accepted stays confirmable — only an explicit disposition (human, or agent_policy inside
+        // the server-verified surface; ADR-0005) ever produces an accepted fact, and that does not
+        // change here. What it may no longer do is land as a fresh, unrelated
         // fact: confirming restatements that way is what left five of this repository's own nine
         // accepted Contexts saying the same thing two or three times over. The confirmation now
         // has to carry the decision the reviewer made — this revision replaces the Context it

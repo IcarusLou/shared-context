@@ -47,3 +47,14 @@
 24. **installer 展示层未呈现 `timed_out_during_backfill`**：U3 已把该字段写入 `encode_sample` 与 `EncodeLatencySummary`，但 `sctx embedding status` / `doctor` 的文案没有把「回填窗口内超时」与「预算不匹配硬件」的区分展示给操作员（数据已在，仅缺展示）。
 25. **1200ms 编码预算对满长语料几乎无余量**：U3 在高负载下实测 1400 字符 encode 达 1062ms（T5d 定预算时机器较闲，测得 816ms）。查询侧因抢占已不受影响，但该预算本身的余量值得后续复核。
 
+## 2026-09-04 新增（治理自动化 V1–V6 实施期间发现，均只报告未修）
+
+26. **compact triage 行缺目标 Context 的 status**：自动丢弃第一档要求「exact_duplicate 且目标仍 accepted」，但 `candidate_list` 紧凑行只给 `target_context_id` 不给其 status，模型须额外 `context_get` 才能判定。若实测出现误 discard 指向已 deprecated Context 的重复条目，正解是服务端在紧凑行带上目标 status。
+27. **git 网络子进程超时用 SIGKILL、不杀进程组**：`Child::kill()` 不会终止 git spawn 的传输助手/`receive-pack`，超时后可能短暂残留孤儿进程（workspace `unsafe_code = "forbid"` 无法用 `pre_exec` 建进程组）。独占锁必然释放，影响仅进程残留。
+28. **doctor 无 LaunchAgent 检查**：plist 被手工删除或 job 未注册，目前只有下次 setup 的 notice 会提示。方案：doctor 加 `launch_agent` 检查（文件存在 + `launchctl print` 探测）。
+29. **launchd job 依赖 gui domain 注入的 `HOME`**：plist 未写 `EnvironmentVariables`，`maintain run` 靠 HOME 解析安装根。可改为把 `--root` 写进 ProgramArguments。
+30. **墙钟断言型测试在高负载下假失败率偏高**：`engineering_workflows::public_mcp_artifact_focus_...`（本日并行负载下挂 3 次，安静时段一次跑过全量）、`scenario-runner::concurrent_fault_...`、`hook_hot_path` p99、`cli_contract::embedding_remove_...`。隔离重跑均过。方向：latency 断言改条件化（如负载探测）或串行执行；CI 必须 `--no-fail-fast` 否则 flake 会截断后半程。
+31. **`skills/*/agents/openai.yaml` 的宿主实际效果未验证**：仓库只有字节级断言，无任何测试证明宿主读取该文件；`sctx-review` 的 `allow_implicit_invocation: false` 是按形态推断写的。
+32. **机会轨 spawn 使 Enabled SessionStart 多写一行 hook_event**（`opportunistic_maintenance_started`/`_unavailable`，Neutral）。目前无精确条数断言，未来加断言时注意。
+33. **`~/Library/LaunchAgents` 若由本产品创建为 0o700**（沿用 `ensure_directory_preserving_mode`），比系统惯例 0o755 严；功能正常，仅与惯例不一致。
+
