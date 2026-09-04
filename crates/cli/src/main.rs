@@ -42,6 +42,7 @@ use sctx_git_store::{AppendOutcome, AppendRequest, BatchId, GitStore};
 use sctx_index::{
     DomainSnapshot, IndexMetadata, ProjectionDiagnosticView, ProjectionIndex, RebuildOutcome,
 };
+use sctx_installer::maintain::MaintainOptions;
 use sctx_local_state::{
     ArtifactReminderKey, ArtifactReminderMark, ArtifactReminderStore, AuthorizedSessionScope,
     AuthorizedSessionScopeRead, AuthorizedSessionScopeStore, CatalogCheckoutStatus, HookSettings,
@@ -82,6 +83,7 @@ Commands:
   upgrade [--agents cursor,codex] [--root PATH] [--runtime-source PATH]
   uninstall [--root PATH]
   data reset [--dry-run] [--yes]
+  maintain run [--opportunistic] | maintain status
   knowledge sync|delete
   embedding install|status|remove
   space create|intent revise|list|get
@@ -205,6 +207,7 @@ fn run_without_maintenance(args: &[String], json_output: bool) -> Result<()> {
         }
         [command, rest @ ..] if command == "uninstall" => run_uninstall(rest, json_output),
         [group, rest @ ..] if group == "data" => run_data(rest, json_output),
+        [group, rest @ ..] if group == "maintain" => run_maintain(rest, json_output),
         [group, rest @ ..] if group == "knowledge" => run_knowledge(rest, json_output),
         [group, rest @ ..] if group == "embedding" => run_embedding(rest, json_output),
         [group, rest @ ..] if group == "space" => run_space(rest, json_output),
@@ -420,6 +423,131 @@ fn run_data(args: &[String], json_output: bool) -> Result<()> {
             dry_run: options.has("--dry-run"),
         })?;
     emit_lifecycle(&report, json_output)
+}
+
+const MAINTAIN_HELP: &str = r"Usage:
+  sctx maintain run [--opportunistic] [--root PATH]
+  sctx maintain status [--root PATH]
+
+`run` performs one periodic maintenance cycle: it rebuilds the Engineering Graph,
+counts the Candidate Reviews and provisional Spaces awaiting a human decision, and
+synchronizes the Knowledge Store. Every step is independent -- one failure never
+stops the rest -- and the result is recorded in state/maintain-digest.json, which
+`sctx doctor` reads. Nothing here disposes of a Candidate or edits knowledge.
+
+`--opportunistic` makes the run yield instead of wait: the Knowledge Store sync is
+attempted once and skipped if the installation is busy, which suits a run triggered
+by something a person is waiting on. Without it the sync retries with backoff.
+";
+
+/// `maintain` is deliberately absent from [`requires_shared_maintenance_guard`]: the run holds a
+/// shared lease for its read-only steps and must have released it before `knowledge sync` takes
+/// the exclusive one, so it manages its own leases rather than inheriting one for its whole life.
+fn run_maintain(args: &[String], json_output: bool) -> Result<()> {
+    if is_help(args) {
+        print!("{MAINTAIN_HELP}");
+        return Ok(());
+    }
+    let [command, rest @ ..] = args else {
+        return Err(invalid(MAINTAIN_HELP));
+    };
+    match command.as_str() {
+        "run" => {
+            let options = Options::parse(rest, &["--opportunistic"])?;
+            options.allow_only(
+                &["--root", "--runtime-source", "--runtime-version"],
+                &["--opportunistic"],
+            )?;
+            let digest = installer_from_options(&options)?.maintain(&MaintainOptions {
+                opportunistic: options.has("--opportunistic"),
+            })?;
+            if json_output {
+                return emit_lifecycle(&digest, true);
+            }
+            print_maintain_digest(&digest);
+            Ok(())
+        }
+        "status" => {
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(&["--root", "--runtime-source", "--runtime-version"], &[])?;
+            let status = installer_from_options(&options)?.maintain_status()?;
+            if json_output {
+                return emit_lifecycle(&status, true);
+            }
+            print_maintain_status(&status);
+            Ok(())
+        }
+        _ => Err(invalid(MAINTAIN_HELP)),
+    }
+}
+
+fn print_maintain_status(status: &sctx_installer::maintain::MaintainStatus) {
+    println!("root: {}", status.root.display());
+    println!("digest: {}", status.digest_path.display());
+    let (Some(last_run), Some(digest)) = (status.last_run_at_unix_seconds, status.digest.as_ref())
+    else {
+        println!("last run: never");
+        println!("Run `sctx maintain run` to record one.");
+        return;
+    };
+    println!("last run: Unix second {last_run}");
+    print_maintain_digest(digest);
+}
+
+fn print_maintain_digest(digest: &sctx_installer::maintain::MaintainDigest) {
+    use sctx_installer::maintain::MaintainOutcome;
+    println!(
+        "mode: {}",
+        match digest.mode {
+            sctx_installer::maintain::MaintainMode::Scheduled => "scheduled",
+            sctx_installer::maintain::MaintainMode::Opportunistic => "opportunistic",
+        }
+    );
+    println!(
+        "duration: {}s",
+        digest
+            .finished_at_unix_seconds
+            .saturating_sub(digest.started_at_unix_seconds)
+    );
+    println!("steps:");
+    for step in &digest.steps {
+        let outcome = match step.outcome {
+            MaintainOutcome::Ok => "ok",
+            MaintainOutcome::Skipped => "skipped",
+            MaintainOutcome::Failed => "failed",
+        };
+        print!("  {:<26} {outcome}", step.name);
+        if step.attempts > 1 {
+            print!(" (after {} attempts)", step.attempts);
+        }
+        if let Some(reason) = &step.reason {
+            print!(": {reason}");
+        }
+        if step.needs_human {
+            print!(" [needs a human decision]");
+        }
+        println!();
+    }
+    println!("awaiting a decision:");
+    println!(
+        "  {} Candidate Reviews pending, {} of them expiring within {} days",
+        digest.counts.pending_candidate_reviews,
+        digest.counts.expiring_candidate_reviews,
+        digest.counts.candidate_expiry_horizon_seconds / (24 * 60 * 60),
+    );
+    println!(
+        "  {} provisional Spaces still carrying a server-proposed Intent",
+        digest.counts.provisional_spaces
+    );
+    println!(
+        "  {} of {} Engineering References unresolved, {} relocation candidates",
+        digest.counts.unresolved_references,
+        digest.counts.engineering_references,
+        digest.counts.relocation_candidates,
+    );
+    if let Some(generation) = &digest.graph_generation {
+        println!("graph generation: {generation}");
+    }
 }
 
 fn run_knowledge(args: &[String], json_output: bool) -> Result<()> {

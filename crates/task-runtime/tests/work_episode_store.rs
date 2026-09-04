@@ -18,9 +18,10 @@ use sctx_domain::{
 use sctx_task_runtime::{
     AgentCheckpointSubmission, AgentCheckpointWrite, AutomatedEpisodeBoundary,
     CandidateBuildItemPreparation, CandidateBuildItemStatus, CandidateBuildStatus,
-    CandidateReviewDiscard, CandidateReviewDiscardStatus, CheckpointBoundary, CheckpointClaimDraft,
-    DEFAULT_CANDIDATE_REVIEW_TTL, DirectCheckpointClaimDraft, DirectEvidenceDraft,
-    IntentRevisionWriteStatus, MAX_CANDIDATE_REVIEW_TTL, TaskRuntime,
+    CandidateReviewDiscard, CandidateReviewDiscardStatus, CandidateReviewSurvey,
+    CheckpointBoundary, CheckpointClaimDraft, DEFAULT_CANDIDATE_REVIEW_TTL,
+    DirectCheckpointClaimDraft, DirectEvidenceDraft, IntentRevisionWriteStatus,
+    MAX_CANDIDATE_REVIEW_TTL, TaskRuntime,
 };
 use tempfile::TempDir;
 
@@ -1146,6 +1147,36 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
         DEFAULT_CANDIDATE_REVIEW_TTL.as_secs()
     );
     assert!(DEFAULT_CANDIDATE_REVIEW_TTL <= MAX_CANDIDATE_REVIEW_TTL);
+
+    // The maintenance survey sees both Pending Reviews without a locator, filters by the expiry
+    // horizon it was asked about, and -- unlike every scoped list reader above -- retires nothing:
+    // surveying at a moment well past expiry leaves the Review exactly as Pending as it was.
+    assert_eq!(
+        runtime
+            .survey_candidate_reviews_at(review.created_at_unix_seconds, 0)
+            .unwrap(),
+        CandidateReviewSurvey {
+            pending_count: 2,
+            expiring_soon_count: 0,
+        }
+    );
+    assert_eq!(
+        runtime
+            .survey_candidate_reviews_at(review.expires_at_unix_seconds + 60, 0)
+            .unwrap(),
+        CandidateReviewSurvey {
+            pending_count: 2,
+            expiring_soon_count: 2,
+        }
+    );
+    assert_eq!(
+        runtime
+            .read_candidate_review(&locator, candidate_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        CandidateReviewStatus::Pending
+    );
 
     let persisted = ContextCandidate {
         candidate_id,

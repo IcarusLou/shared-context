@@ -21,6 +21,7 @@ use sctx_index::ProjectionIndex;
 use sctx_installer::{
     Agent, Architecture, CheckStatus, DataResetOptions, Host, InstallContext, Installer,
     KnowledgeRemoteType, KnowledgeStoreUrl, ResetStage, SetupOptions, SetupStage, SkillStatus,
+    maintain::{MaintainDigest, MaintainMode, MaintainOptions, MaintainOutcome, MaintainStep},
 };
 use sctx_local_state::{MaintenanceLock, PrivacyScanner, UserConfigStore};
 use sctx_mcp::{
@@ -3486,5 +3487,375 @@ fn doctor_reports_the_embedding_channel_as_off_configured_or_broken() {
             .contains("0 Context revision(s) embedded"),
         "a fresh installation has embedded nothing yet: {}",
         configured.message
+    );
+}
+
+fn maintain_step<'a>(digest: &'a MaintainDigest, name: &str) -> &'a MaintainStep {
+    digest
+        .steps
+        .iter()
+        .find(|step| step.name == name)
+        .unwrap_or_else(|| panic!("digest has no {name} step: {digest:?}"))
+}
+
+fn maintain_check(report: &sctx_installer::DoctorReport) -> &sctx_installer::DoctorCheck {
+    report
+        .checks
+        .iter()
+        .find(|check| check.name == "maintain")
+        .expect("doctor reports a maintain check")
+}
+
+/// The digest is the whole point of `maintain run`: it is what `doctor` reads, what an operator
+/// reads, and what a later automatic triage pass will extend. So its shape is asserted on disk,
+/// field by field, rather than only through the returned value.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn maintain_run_records_a_digest_and_skips_the_sync_a_local_installation_cannot_do() {
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+
+    let digest = harness
+        .installer("1.0.0")
+        .maintain(&MaintainOptions::default())
+        .unwrap();
+
+    assert_eq!(digest.schema_version, 1);
+    assert_eq!(digest.mode, MaintainMode::Scheduled);
+    assert_eq!(
+        digest
+            .steps
+            .iter()
+            .map(|step| step.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "association_rebuild",
+            "candidate_survey",
+            "provisional_space_survey",
+            "knowledge_sync",
+        ]
+    );
+    for name in [
+        "association_rebuild",
+        "candidate_survey",
+        "provisional_space_survey",
+    ] {
+        let step = maintain_step(&digest, name);
+        assert_eq!(step.outcome, MaintainOutcome::Ok, "{step:?}");
+        assert_eq!(step.attempts, 1);
+        assert!(step.reason.is_none());
+        assert!(!step.needs_human);
+    }
+    // A locally bootstrapped Knowledge Store has no remote. That is a property of the installation,
+    // not a fault, so it is skipped without spending an attempt -- and `doctor` stays quiet.
+    let sync = maintain_step(&digest, "knowledge_sync");
+    assert_eq!(sync.outcome, MaintainOutcome::Skipped);
+    assert_eq!(sync.attempts, 0);
+    assert!(
+        sync.reason.as_deref().unwrap().contains("local"),
+        "{sync:?}"
+    );
+    assert!(!sync.needs_human);
+    assert!(digest.failed_steps().is_empty());
+
+    assert_eq!(
+        digest.counts.candidate_expiry_horizon_seconds,
+        7 * 24 * 60 * 60
+    );
+    assert_eq!(digest.counts.pending_candidate_reviews, 0);
+    assert_eq!(digest.counts.expiring_candidate_reviews, 0);
+    assert_eq!(digest.counts.provisional_spaces, 0);
+    assert_eq!(digest.counts.engineering_references, 0);
+    assert_eq!(digest.counts.unresolved_references, 0);
+    assert_eq!(digest.counts.relocation_candidates, 0);
+    assert!(digest.graph_generation.is_some());
+    assert!(digest.finished_at_unix_seconds >= digest.started_at_unix_seconds);
+
+    let digest_path = harness.root.join("state/maintain-digest.json");
+    assert_eq!(
+        fs::metadata(&digest_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let written: serde_json::Value =
+        serde_json::from_slice(&fs::read(&digest_path).unwrap()).unwrap();
+    assert_eq!(
+        written
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            "counts",
+            "finished_at_unix_seconds",
+            "graph_generation",
+            "mode",
+            "projection_generation",
+            "schema_version",
+            "started_at_unix_seconds",
+            "steps",
+        ],
+        "the digest is a stable, readable shape, not an accident of serialization"
+    );
+    assert_eq!(
+        written["counts"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            "candidate_expiry_horizon_seconds",
+            "engineering_references",
+            "expiring_candidate_reviews",
+            "pending_candidate_reviews",
+            "provisional_spaces",
+            "relocation_candidates",
+            "unresolved_references",
+        ]
+    );
+    assert_eq!(written["steps"][3]["outcome"], "skipped");
+    assert_eq!(written["mode"], "scheduled");
+    // Every field is optional on read, so a digest a newer version wrote still loads here.
+    let reloaded: MaintainDigest = serde_json::from_str("{}").unwrap();
+    assert_eq!(reloaded.schema_version, 0);
+
+    let marker = harness.root.join("state/maintain-last-run");
+    assert_eq!(
+        fs::read_to_string(&marker)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap(),
+        digest.finished_at_unix_seconds
+    );
+
+    let log = fs::read_dir(harness.root.join("logs"))
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension().is_some_and(|extension| extension == "log")
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("maintain-"))
+        })
+        .expect("the run appends one summary line to a dated maintenance log");
+    let line = fs::read_to_string(&log).unwrap();
+    assert!(line.contains("mode=scheduled"), "{line}");
+    assert!(line.contains("knowledge_sync=skipped"), "{line}");
+    assert!(line.contains("pending_reviews=0"), "{line}");
+
+    let status = harness.installer("1.0.0").maintain_status().unwrap();
+    assert_eq!(status.digest.as_ref(), Some(&digest));
+    assert_eq!(
+        status.last_run_at_unix_seconds,
+        Some(digest.finished_at_unix_seconds)
+    );
+    assert_eq!(status.digest_path, digest_path);
+    assert_eq!(status.last_run_path, marker);
+}
+
+/// The two ways a run meets a busy installation, and the one thing that must be true of both: the
+/// read-only steps still run. They take the *shared* lease, so a concurrent shared holder -- an
+/// editor's in-flight MCP call, another `association rebuild` -- is not competition.
+#[test]
+fn maintain_backs_off_while_busy_and_an_opportunistic_run_yields_at_once() {
+    let harness = Harness::new();
+    let fixture = remote_fixture(&harness, "maintain-busy");
+    harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&fixture.remote))
+        .unwrap();
+
+    let maintenance = MaintenanceLock::open_or_create(&harness.root).unwrap();
+    let shared = maintenance.try_shared().unwrap();
+
+    let scheduled = harness
+        .installer("1.0.0")
+        .with_maintain_sync_backoff(vec![std::time::Duration::from_millis(5); 3])
+        .maintain(&MaintainOptions::default())
+        .unwrap();
+    for name in [
+        "association_rebuild",
+        "candidate_survey",
+        "provisional_space_survey",
+    ] {
+        assert_eq!(
+            maintain_step(&scheduled, name).outcome,
+            MaintainOutcome::Ok,
+            "the read-only steps coexist with a concurrent shared lease holder"
+        );
+    }
+    let sync = maintain_step(&scheduled, "knowledge_sync");
+    assert_eq!(sync.outcome, MaintainOutcome::Failed);
+    assert_eq!(
+        sync.attempts, 4,
+        "one attempt plus one per backoff entry, and no more"
+    );
+    assert!(!sync.needs_human, "a busy installation is not a decision");
+    assert_eq!(scheduled.failed_steps().len(), 1);
+
+    // The opportunistic run must not even look at the backoff schedule, so it is handed one it
+    // could never afford to wait on.
+    let opportunistic = harness
+        .installer("1.0.0")
+        .with_maintain_sync_backoff(vec![std::time::Duration::from_secs(600)])
+        .maintain(&MaintainOptions {
+            opportunistic: true,
+        })
+        .unwrap();
+    assert_eq!(opportunistic.mode, MaintainMode::Opportunistic);
+    let sync = maintain_step(&opportunistic, "knowledge_sync");
+    assert_eq!(sync.outcome, MaintainOutcome::Skipped);
+    assert_eq!(sync.attempts, 1);
+    assert!(
+        opportunistic.failed_steps().is_empty(),
+        "stepping aside is the mode's purpose, not a failure to report"
+    );
+
+    drop(shared);
+    let completed = harness
+        .installer("1.0.0")
+        .maintain(&MaintainOptions::default())
+        .unwrap();
+    let sync = maintain_step(&completed, "knowledge_sync");
+    assert_eq!(sync.outcome, MaintainOutcome::Ok, "{sync:?}");
+    assert_eq!(sync.attempts, 1);
+}
+
+/// A remote that accepts the connection and then stops answering is the failure the exclusive
+/// maintenance lease cannot survive without a budget: nothing else in the installation can run
+/// until the transfer returns.
+#[test]
+fn a_stalled_network_git_operation_is_terminated_and_frees_the_exclusive_lease() {
+    let harness = Harness::new();
+    let fixture = remote_fixture(&harness, "maintain-stall");
+    harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&fixture.remote))
+        .unwrap();
+    // The closest local stand-in for that remote: a receive hook that never replies.
+    install_remote_hook(&fixture.remote, "#!/bin/sh\nsleep 45\nexit 0\n");
+    let local = GitStore::open_existing(&harness.root).unwrap();
+    append_space(&local, "work that must be pushed");
+
+    let started = std::time::Instant::now();
+    let error = harness
+        .installer("1.0.0")
+        .with_git_network_timeout(std::time::Duration::from_millis(500))
+        .sync_knowledge()
+        .unwrap_err();
+    assert_eq!(error.kind(), sctx_installer::ErrorKind::External);
+    assert!(error.message().contains("terminated"), "{error}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "the stalled child was waited on rather than killed"
+    );
+    // The whole reason for the budget: the lease the failed sync held is available immediately.
+    assert!(
+        MaintenanceLock::open_or_create(&harness.root)
+            .unwrap()
+            .try_exclusive()
+            .is_ok()
+    );
+    assert!(
+        fs::read_to_string(harness.root.join("repository/.git/HEAD")).is_ok(),
+        "the Knowledge Store checkout survives a killed transfer"
+    );
+
+    // And a maintenance run records the same ending instead of raising it, leaving the read-only
+    // steps it already completed intact.
+    let digest = harness
+        .installer("1.0.0")
+        .with_git_network_timeout(std::time::Duration::from_millis(500))
+        .with_maintain_sync_backoff(Vec::new())
+        .maintain(&MaintainOptions::default())
+        .unwrap();
+    let sync = maintain_step(&digest, "knowledge_sync");
+    assert_eq!(sync.outcome, MaintainOutcome::Failed);
+    assert_eq!(
+        sync.attempts, 1,
+        "a stall is not a busy lease; it is not retried"
+    );
+    assert!(!sync.needs_human);
+    assert!(
+        sync.reason.as_deref().unwrap().contains("terminated"),
+        "{sync:?}"
+    );
+    assert_eq!(
+        maintain_step(&digest, "association_rebuild").outcome,
+        MaintainOutcome::Ok
+    );
+}
+
+/// Three states, and the reason the first is not a warning: a machine installed five minutes ago
+/// has nothing to maintain, and a doctor that complains about that teaches operators to skim.
+#[test]
+fn doctor_reports_never_run_clean_and_failed_maintenance_without_ever_erroring() {
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+
+    let never = harness.installer("1.0.0").doctor();
+    let check = maintain_check(&never);
+    assert_eq!(check.status, CheckStatus::Ok);
+    assert!(check.message.contains("No maintenance run"), "{check:?}");
+
+    harness
+        .installer("1.0.0")
+        .maintain(&MaintainOptions::default())
+        .unwrap();
+    let clean = harness.installer("1.0.0").doctor();
+    let check = maintain_check(&clean);
+    assert_eq!(check.status, CheckStatus::Ok);
+    assert!(check.message.contains("completed every step"), "{check:?}");
+    assert!(
+        check.message.contains("0 Candidate Reviews pending"),
+        "{check:?}"
+    );
+
+    let mut digest = sctx_installer::maintain::read_digest(&harness.root)
+        .unwrap()
+        .unwrap();
+    digest.steps.push(MaintainStep {
+        name: "knowledge_sync".to_owned(),
+        outcome: MaintainOutcome::Failed,
+        reason: Some("Knowledge Store branch merge conflicted".to_owned()),
+        attempts: 1,
+        needs_human: true,
+    });
+    fs::write(
+        harness.root.join("state/maintain-digest.json"),
+        serde_json::to_vec(&digest).unwrap(),
+    )
+    .unwrap();
+    let degraded = harness.installer("1.0.0").doctor();
+    let check = maintain_check(&degraded);
+    assert_eq!(check.status, CheckStatus::Warning);
+    assert!(
+        check
+            .message
+            .contains("knowledge_sync: Knowledge Store branch merge conflicted"),
+        "{check:?}"
+    );
+    assert!(
+        check.message.contains("needs a human decision"),
+        "{check:?}"
+    );
+    assert_eq!(
+        degraded
+            .checks
+            .iter()
+            .filter(|other| other.name == "maintain" && other.status == CheckStatus::Error)
+            .count(),
+        0,
+        "an unsynchronized Knowledge Store never makes the installation itself unhealthy"
     );
 }

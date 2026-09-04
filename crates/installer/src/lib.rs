@@ -43,6 +43,9 @@ use toml_edit::{Array, DocumentMut, Item, Table, value};
 use uuid::Uuid;
 
 pub mod embedding;
+pub mod maintain;
+
+use maintain::MAINTAIN_SYNC_BACKOFF;
 
 const JOURNAL_VERSION: u32 = 1;
 const RESET_JOURNAL_VERSION: u32 = 1;
@@ -50,6 +53,12 @@ const MANIFEST_VERSION: u32 = 1;
 const MINIMUM_FREE_SPACE_BYTES: u64 = 64 * 1024 * 1024;
 const AGENT_VERSION_TIMEOUT: Duration = Duration::from_secs(2);
 const KNOWLEDGE_SYNC_PUSH_ATTEMPTS: usize = 3;
+/// Wall-clock budget for one Knowledge Store Git operation that reaches the remote.
+///
+/// Generous enough that a slow but live clone still completes, short enough that a scheduled
+/// `sctx maintain run` on a dead network releases the exclusive lease the same day it took it.
+const GIT_NETWORK_TIMEOUT: Duration = Duration::from_secs(120);
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PRODUCT_KEY: &str = "shared-context";
 const GLOBAL_SKILL_DIRECTORY: &str = ".agents/skills/shared-context";
 const SKILL_ASSETS: [(&str, &[u8]); 3] = [
@@ -526,6 +535,8 @@ pub struct Installer {
     fail_after: Option<SetupStage>,
     reset_crash_after: Option<ResetStage>,
     codex_trust: TrustState,
+    git_network_timeout: Duration,
+    maintain_sync_backoff: Vec<Duration>,
 }
 
 impl Installer {
@@ -550,7 +561,29 @@ impl Installer {
             fail_after: None,
             reset_crash_after: None,
             codex_trust: TrustState::Unconfirmed,
+            git_network_timeout: GIT_NETWORK_TIMEOUT,
+            maintain_sync_backoff: MAINTAIN_SYNC_BACKOFF.to_vec(),
         }
+    }
+
+    /// Overrides the wall-clock budget for Knowledge Store Git operations that reach the remote.
+    ///
+    /// Exposed for tests and managed callers with their own network expectations; production keeps
+    /// [`GIT_NETWORK_TIMEOUT`].
+    #[must_use]
+    pub const fn with_git_network_timeout(mut self, timeout: Duration) -> Self {
+        self.git_network_timeout = timeout;
+        self
+    }
+
+    /// Overrides the `maintain run` retry schedule for a busy installation.
+    ///
+    /// One entry per retry, in order; an empty schedule means a single attempt. Exposed so tests
+    /// exercise the backoff without paying its production minutes.
+    #[must_use]
+    pub fn with_maintain_sync_backoff(mut self, backoff: Vec<Duration>) -> Self {
+        self.maintain_sync_backoff = backoff;
+        self
     }
 
     /// Injects one deterministic failure after a completed write stage.
@@ -835,6 +868,7 @@ impl Installer {
         check_global_skill(root, &self.context.home, &mut checks);
         check_session_scope_leases(root, &mut checks);
         check_retrieval(root, &mut checks);
+        check_maintain(root, &mut checks);
         if root.join("repository/.git").is_dir() && root.join("bin/current/sctx").is_file() {
             match mcp_smoke(root) {
                 Ok(()) => checks.push(ok(
@@ -900,6 +934,8 @@ impl Installer {
             fail_after: None,
             reset_crash_after: None,
             codex_trust: self.codex_trust,
+            git_network_timeout: self.git_network_timeout,
+            maintain_sync_backoff: self.maintain_sync_backoff.clone(),
         };
         fixer.setup(options)?;
         // The Graph is derived local state, so repairing it is exactly what `--fix` is for, and it
@@ -1043,7 +1079,7 @@ impl Installer {
         recover_incomplete_data_reset(&self.context.root)?;
         recover_incomplete_journals(&self.context.root)?;
         require_existing_installation(&self.context.root)?;
-        let result = sync_knowledge_locked(&self.context.root);
+        let result = sync_knowledge_locked(&self.context.root, self.git_network_timeout);
         FileExt::unlock(&setup_lock).map_err(io_error("unlock knowledge synchronization"))?;
         result
     }
@@ -1661,7 +1697,7 @@ struct KnowledgeStoreInstall {
     changed: bool,
 }
 
-fn sync_knowledge_locked(root: &Path) -> Result<KnowledgeSyncReport> {
+fn sync_knowledge_locked(root: &Path, network_timeout: Duration) -> Result<KnowledgeSyncReport> {
     let manifest = read_manifest(root)?
         .ok_or_else(|| invalid("knowledge sync requires an install manifest"))?;
     let installation_id = installation_id(Some(&manifest))?;
@@ -1701,8 +1737,9 @@ fn sync_knowledge_locked(root: &Path) -> Result<KnowledgeSyncReport> {
     let base_ref = format!("refs/remotes/origin/{default_branch}");
     let work_ref = format!("refs/remotes/origin/{work_branch}");
 
-    fetch_required_branch(repository, default_branch, &base_ref)?;
-    let remote_work_oid = fetch_optional_work_branch(repository, work_branch, &work_ref)?;
+    fetch_required_branch(repository, default_branch, &base_ref, network_timeout)?;
+    let remote_work_oid =
+        fetch_optional_work_branch(repository, work_branch, &work_ref, network_timeout)?;
     let merge_result = (|| {
         if remote_work_oid.is_some() {
             merge_sync_ref(repository, &work_ref)?;
@@ -1721,6 +1758,7 @@ fn sync_knowledge_locked(root: &Path) -> Result<KnowledgeSyncReport> {
         work_branch,
         &work_ref,
         remote_work_oid,
+        network_timeout,
     )?;
 
     let (behind, ahead) = divergence(repository, &base_ref)?;
@@ -1745,6 +1783,7 @@ fn push_synchronized_work_branch(
     work_branch: &str,
     work_ref: &str,
     mut remote_work_oid: Option<String>,
+    network_timeout: Duration,
 ) -> Result<bool> {
     let repository = store.repository();
     for attempt in 0..KNOWLEDGE_SYNC_PUSH_ATTEMPTS {
@@ -1757,10 +1796,11 @@ fn push_synchronized_work_branch(
             return Ok(false);
         }
         let destination = format!("HEAD:refs/heads/{work_branch}");
-        let output = git_command(
+        let output = git_network_command(
             repository,
             &["push", "--porcelain", "origin", &destination],
             "push Knowledge Store work branch",
+            network_timeout,
         )?;
         if output.status.success() {
             return Ok(true);
@@ -1771,7 +1811,8 @@ fn push_synchronized_work_branch(
                 "push Knowledge Store work branch failed after 3 attempts; verify write access and retry",
             ));
         }
-        remote_work_oid = fetch_optional_work_branch(repository, work_branch, work_ref)?;
+        remote_work_oid =
+            fetch_optional_work_branch(repository, work_branch, work_ref, network_timeout)?;
         let race_merge = (|| {
             if remote_work_oid.is_some() {
                 merge_sync_ref(repository, work_ref)?;
@@ -1813,12 +1854,18 @@ fn validate_sync_head(store: &GitStore, base_revision: Option<&str>) -> Result<(
     Ok(())
 }
 
-fn fetch_required_branch(repository: &Path, branch: &str, tracking_ref: &str) -> Result<()> {
+fn fetch_required_branch(
+    repository: &Path,
+    branch: &str,
+    tracking_ref: &str,
+    network_timeout: Duration,
+) -> Result<()> {
     let refspec = format!("refs/heads/{branch}:{tracking_ref}");
-    let output = git_command(
+    let output = git_network_command(
         repository,
         &["fetch", "--no-tags", "origin", &refspec],
         "fetch Knowledge Store default branch",
+        network_timeout,
     )?;
     if output.status.success() {
         Ok(())
@@ -1834,20 +1881,23 @@ fn fetch_optional_work_branch(
     repository: &Path,
     branch: &str,
     tracking_ref: &str,
+    network_timeout: Duration,
 ) -> Result<Option<String>> {
     let remote_ref = format!("refs/heads/{branch}");
-    let probe = git_command(
+    let probe = git_network_command(
         repository,
         &["ls-remote", "--exit-code", "--heads", "origin", &remote_ref],
         "inspect remote Knowledge Store work branch",
+        network_timeout,
     )?;
     match probe.status.code() {
         Some(0) => {
             let refspec = format!("{remote_ref}:{tracking_ref}");
-            let fetch = git_command(
+            let fetch = git_network_command(
                 repository,
                 &["fetch", "--no-tags", "origin", &refspec],
                 "fetch Knowledge Store work branch",
+                network_timeout,
             )?;
             if !fetch.status.success() {
                 return Err(Error::new(
@@ -1958,13 +2008,121 @@ fn divergence(repository: &Path, base_ref: &str) -> Result<(u64, u64)> {
 }
 
 fn git_command(repository: &Path, args: &[&str], context: &str) -> Result<Output> {
-    Command::new("git")
+    run_git(repository, args, context, None)
+}
+
+/// Runs one Git operation that reaches the remote, under a wall-clock budget.
+///
+/// Two hardenings apply here and nowhere else. The budget kills a transfer that stopped making
+/// progress, so the exclusive maintenance lease `knowledge sync` holds can never be pinned by an
+/// unresponsive network for longer than the budget; the kill surfaces as an ordinary typed
+/// `External` error, so the caller's existing abort/rollback path runs exactly as it does for any
+/// other failed fetch or push. `BatchMode=yes` stops OpenSSH from blocking on a passphrase or
+/// host-key prompt, the same way `GIT_TERMINAL_PROMPT=0` already stops Git's own prompts -- and
+/// only when the operator has not set `GIT_SSH_COMMAND` themselves, because their command is the
+/// one that knows how their keys are held.
+///
+/// Local Git stays unbounded on purpose: it cannot hang on a network, and interrupting a merge or
+/// a reset halfway is strictly worse than waiting for it.
+fn git_network_command(
+    repository: &Path,
+    args: &[&str],
+    context: &str,
+    timeout: Duration,
+) -> Result<Output> {
+    run_git(repository, args, context, Some(timeout))
+}
+
+fn run_git(
+    repository: &Path,
+    args: &[&str],
+    context: &str,
+    timeout: Option<Duration>,
+) -> Result<Output> {
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repository)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .map_err(|error| Error::new(ErrorKind::External, format!("{context}: {error}")))
+        .stdin(Stdio::null());
+    if timeout.is_some() && env::var_os("GIT_SSH_COMMAND").is_none() {
+        command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
+    let Some(timeout) = timeout else {
+        return command
+            .output()
+            .map_err(|error| Error::new(ErrorKind::External, format!("{context}: {error}")));
+    };
+    command_output_with_timeout(&mut command, context, timeout)
+}
+
+/// Spawns `command`, drains both pipes, and terminates it once `timeout` elapses.
+///
+/// The pipes are drained on their own threads because a full pipe blocks the child itself, and a
+/// blocked child is exactly the state the budget exists to bound.
+///
+/// The readers are joined only when the child exited on its own. On the timeout path they are
+/// abandoned deliberately: Git hands its pipe write ends to whatever it spawned -- a transport
+/// helper, and for a local remote a whole `receive-pack` with the remote's hooks under it -- so a
+/// read to end-of-file finishes only when the *last* of those exits. Waiting for that is precisely
+/// the wait the budget exists to refuse, and a terminated command's output is not wanted anyway.
+/// Each abandoned thread holds one pipe and ends when the writers do.
+fn command_output_with_timeout(
+    command: &mut Command,
+    context: &str,
+    timeout: Duration,
+) -> Result<Output> {
+    let external =
+        |error: std::io::Error| Error::new(ErrorKind::External, format!("{context}: {error}"));
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(external)?;
+    let stdout = child.stdout.take().map(drain_pipe);
+    let stderr = child.stderr.take().map(drain_pipe);
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::new(
+                    ErrorKind::External,
+                    format!(
+                        "{context} made no progress for {} seconds and was terminated; \
+                         verify network access to the Knowledge Store remote and retry",
+                        timeout.as_secs()
+                    ),
+                ));
+            }
+            Ok(None) => thread::sleep(COMMAND_POLL_INTERVAL),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(external(error));
+            }
+        }
+    };
+    Ok(Output {
+        status,
+        stdout: stdout.map(join_pipe).unwrap_or_default(),
+        stderr: stderr.map(join_pipe).unwrap_or_default(),
+    })
+}
+
+fn drain_pipe<R: std::io::Read + Send + 'static>(mut pipe: R) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = pipe.read_to_end(&mut buffer);
+        buffer
+    })
+}
+
+fn join_pipe(handle: thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    handle.join().unwrap_or_default()
 }
 
 fn installation_id(prior: Option<&InstallManifest>) -> Result<String> {
@@ -2160,12 +2318,10 @@ fn verify_remote_store(
 }
 
 fn git_output(repository: &Path, args: &[&str], context: &str) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repository)
-        .args(args)
-        .output()
-        .map_err(|error| Error::new(ErrorKind::External, format!("{context}: {error}")))?;
+    // Every current caller is a local read, but the prompt suppression `git_command` has always
+    // carried belongs on this path too: an unattended maintenance run must never be the thing that
+    // parks a Git process on a terminal prompt nobody is watching.
+    let output = run_git(repository, args, context, None)?;
     if !output.status.success() {
         return Err(Error::new(
             ErrorKind::External,
@@ -4087,6 +4243,75 @@ const RETRIEVAL_BUDGET: &str = "The encode budget is calibrated for this machine
 /// without it is a healthy installation with lexical retrieval, which is what every installation
 /// had before ADR-0004. What doctor owes the operator is the difference between "off" and "on but
 /// broken", because only the second one silently costs recall they think they are paying for.
+/// Reports what the last `sctx maintain run` found, in three states.
+///
+/// Never having run maintenance is informational, not a warning: a freshly installed machine has
+/// nothing to maintain yet, and a doctor that greets every new installation with a complaint about
+/// a command it has not heard of teaches operators to ignore the warnings that matter. The warning
+/// is reserved for a run that had work to do and did not finish it -- and it stays a warning, never
+/// an error, because `healthy` is about whether this installation works, and a Knowledge Store that
+/// could not be reached last night does not stop it from working.
+fn check_maintain(root: &Path, checks: &mut Vec<DoctorCheck>) {
+    const NAME: &str = "maintain";
+    let digest = match maintain::read_digest(root) {
+        Ok(digest) => digest,
+        Err(error) => {
+            checks.push(warning(
+                NAME,
+                format!(
+                    "the last maintenance digest is unreadable, so recent maintenance cannot be \
+                     confirmed: {error}. Run `sctx maintain run` to write a fresh one."
+                ),
+            ));
+            return;
+        }
+    };
+    let last_run = maintain::read_last_run(root).ok().flatten();
+    let (Some(digest), Some(last_run)) = (digest, last_run) else {
+        checks.push(ok(
+            NAME,
+            "No maintenance run has been recorded yet. Run `sctx maintain run` on a cycle to \
+             rebuild the Engineering Graph, count Candidate Reviews awaiting a decision, and \
+             synchronize the Knowledge Store.",
+        ));
+        return;
+    };
+    let failures = digest.failed_steps();
+    if failures.is_empty() {
+        checks.push(ok(
+            NAME,
+            format!(
+                "Last run at Unix second {last_run} completed every step. {} Candidate Reviews \
+                 pending ({} expiring within a week), {} provisional Spaces.",
+                digest.counts.pending_candidate_reviews,
+                digest.counts.expiring_candidate_reviews,
+                digest.counts.provisional_spaces,
+            ),
+        ));
+        return;
+    }
+    let detail = failures
+        .iter()
+        .map(|step| {
+            format!(
+                "{}: {}{}",
+                step.name,
+                step.reason.as_deref().unwrap_or("no reason recorded"),
+                if step.needs_human {
+                    " (needs a human decision)"
+                } else {
+                    ""
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    checks.push(warning(
+        NAME,
+        format!("The maintenance run at Unix second {last_run} left {detail}"),
+    ));
+}
+
 fn check_retrieval(root: &Path, checks: &mut Vec<DoctorCheck>) {
     let settings = match UserConfigStore::open_existing(root)
         .and_then(|config| config.retrieval_settings())
