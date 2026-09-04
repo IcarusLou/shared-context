@@ -43,8 +43,13 @@ use toml_edit::{Array, DocumentMut, Item, Table, value};
 use uuid::Uuid;
 
 pub mod embedding;
+pub mod launchd;
 pub mod maintain;
 
+use launchd::{
+    LaunchAgentActivation, MAINTAIN_LAUNCH_AGENT_LABEL, OwnedLaunchAgent, install_launch_agent,
+    launch_agent_path, plan_launch_agent,
+};
 use maintain::MAINTAIN_SYNC_BACKOFF;
 
 const JOURNAL_VERSION: u32 = 1;
@@ -125,6 +130,7 @@ pub enum SetupStage {
     GlobalSkillWorkflowWritten,
     GlobalSkillMetadataWritten,
     GlobalSkillWritten,
+    LaunchAgentWritten,
     ManifestWritten,
     SmokeTested,
 }
@@ -152,6 +158,57 @@ pub trait Host: Send + Sync {
     /// Returns an external or parse error when free space cannot be determined.
     fn available_space(&self, path: &Path) -> Result<u64>;
     fn agent_version(&self, agent: Agent) -> Option<String>;
+
+    /// Registers the user `LaunchAgent` at `plist` in the calling user's GUI domain, replacing any
+    /// job already loaded under `label`.
+    ///
+    /// Defaults to doing nothing, which is what every host but the production one wants:
+    /// bootstrapping a job is the one setup side effect that outlives the process and reaches
+    /// state no test owns. Only [`SystemHost`] talks to `launchctl`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an external error when `launchctl` cannot be run or refuses the job.
+    fn load_launch_agent(&self, _plist: &Path, _label: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Removes `label` from the calling user's GUI domain if it is loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an external error when `launchctl` cannot be run. A job that is not loaded is not
+    /// an error: the operation is defined as "this label is not registered afterwards".
+    fn unload_launch_agent(&self, _label: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Environment escape hatch that keeps `launchctl` out of a process that must not touch the
+/// machine's launchd state -- the test harness above all, but also a CI image or a container where
+/// a per-user GUI domain does not exist. Any non-empty value disables registration; the plist is
+/// still written and still owned, so a later `sctx setup` without it registers what is already
+/// there.
+pub const SKIP_LAUNCHCTL_ENV: &str = "SCTX_SKIP_LAUNCHCTL";
+
+fn launchctl_is_disabled() -> bool {
+    env::var_os(SKIP_LAUNCHCTL_ENV).is_some_and(|value| !value.is_empty())
+}
+
+/// The GUI domain target of the calling user, which is where a `LaunchAgent` belongs.
+///
+/// `id -u` rather than `getuid`, because the installer takes no `libc` dependency and this runs
+/// exactly twice per setup, on a path that is already spawning `launchctl`.
+fn launchctl_gui_domain() -> Result<String> {
+    let uid = command_stdout(Command::new("id").arg("-u"), "id -u")?;
+    let uid = uid.trim();
+    if uid.is_empty() || !uid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(Error::new(
+            ErrorKind::External,
+            format!("`id -u` did not report a numeric user id, got {uid:?}"),
+        ));
+    }
+    Ok(format!("gui/{uid}"))
 }
 
 /// Production host implementation using argv-based macOS commands.
@@ -244,6 +301,81 @@ impl Host for SystemHost {
             )
         })
     }
+
+    /// Replaces the job under `label`, because `bootstrap` refuses a label that is already loaded
+    /// and an upgrade that changed the schedule must reach launchd rather than only the file.
+    fn load_launch_agent(&self, plist: &Path, label: &str) -> Result<()> {
+        if launchctl_is_disabled() {
+            return Ok(());
+        }
+        let domain = launchctl_gui_domain()?;
+        // An unloaded label is the normal case on a first install, so this ending is discarded
+        // rather than reported: only the bootstrap below decides whether the job is registered.
+        let _ = launchctl(&["bootout", &format!("{domain}/{label}")]);
+        launchctl(&["bootstrap", &domain, &path_text(plist)?]).map_err(LaunchctlFailure::into_error)
+    }
+
+    fn unload_launch_agent(&self, label: &str) -> Result<()> {
+        if launchctl_is_disabled() {
+            return Ok(());
+        }
+        let domain = launchctl_gui_domain()?;
+        match launchctl(&["bootout", &format!("{domain}/{label}")]) {
+            // 3 is `ESRCH` in launchd's exit vocabulary: no such process, which is exactly the
+            // state this operation is asking for.
+            Err(LaunchctlFailure::Refused { code: 3, .. }) | Ok(()) => Ok(()),
+            Err(failure) => Err(failure.into_error()),
+        }
+    }
+}
+
+/// One unsuccessful `launchctl` invocation, keeping the exit code callers actually branch on.
+enum LaunchctlFailure {
+    Unavailable(Error),
+    Refused {
+        command: String,
+        code: i32,
+        detail: String,
+    },
+}
+
+impl LaunchctlFailure {
+    fn into_error(self) -> Error {
+        match self {
+            Self::Unavailable(error) => error,
+            Self::Refused {
+                command,
+                code,
+                detail,
+            } => Error::new(
+                ErrorKind::External,
+                format!(
+                    "launchctl {command} failed ({code}){}{detail}",
+                    if detail.is_empty() { "" } else { ": " }
+                ),
+            ),
+        }
+    }
+}
+
+/// Runs one `launchctl` subcommand, reporting a failure with the exit status launchd chose.
+fn launchctl(arguments: &[&str]) -> std::result::Result<(), LaunchctlFailure> {
+    let output = Command::new("launchctl")
+        .args(arguments)
+        .output()
+        .map_err(|error| {
+            LaunchctlFailure::Unavailable(external_error("execute launchctl")(error))
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(LaunchctlFailure::Refused {
+        command: arguments.join(" "),
+        // A signalled `launchctl` is not a code launchd chose, so it becomes a code no branch
+        // matches rather than being mistaken for one that means something.
+        code: output.status.code().unwrap_or(-1),
+        detail: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    })
 }
 
 fn command_stdout_with_timeout(command: &mut Command, timeout: Duration) -> Option<String> {
@@ -643,10 +775,21 @@ impl Installer {
         }
 
         let mut transaction = Transaction::begin(&self.context.root, operation)?;
-        let result = self.install_locked(operation, options, preflight, &mut transaction);
+        let mut activation = None;
+        let result = self.install_locked(
+            operation,
+            options,
+            preflight,
+            &mut transaction,
+            &mut activation,
+        );
         let result = match result {
-            Ok(report) => {
+            Ok(mut report) => {
                 transaction.complete()?;
+                // Only now, with the plist committed and no rollback left that could contradict
+                // it, does anything reach launchd. See `launchd`'s module documentation for why
+                // this is the one setup side effect that lives outside the transaction.
+                self.activate_launch_agent(activation.as_ref(), &mut report.notices);
                 Ok(report)
             }
             Err(error) => match transaction.rollback() {
@@ -661,6 +804,35 @@ impl Installer {
         result
     }
 
+    /// Registers or deregisters the maintenance job, best effort, after the transaction commits.
+    ///
+    /// A failure here is always a notice and never an error: the plist is on disk and correct, and
+    /// launchd picks it up at the next login even when this process could not reach the domain --
+    /// which is the normal outcome over SSH, in a container, and on a machine whose user has not
+    /// logged in graphically since boot.
+    fn activate_launch_agent(
+        &self,
+        activation: Option<&LaunchAgentActivation>,
+        notices: &mut Vec<String>,
+    ) {
+        let outcome = match activation {
+            None => return,
+            Some(LaunchAgentActivation::Load { plist }) => self
+                .host
+                .load_launch_agent(plist, MAINTAIN_LAUNCH_AGENT_LABEL),
+            Some(LaunchAgentActivation::Unload) => {
+                self.host.unload_launch_agent(MAINTAIN_LAUNCH_AGENT_LABEL)
+            }
+        };
+        if let Err(error) = outcome {
+            notices.push(format!(
+                "scheduled maintenance was written to disk but could not be registered with \
+                 launchd right now ({error}); it takes effect the next time you log in, or \
+                 immediately after `sctx setup` from a graphical session."
+            ));
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn install_locked(
         &self,
@@ -668,6 +840,7 @@ impl Installer {
         options: &SetupOptions,
         preflight: PreflightReport,
         transaction: &mut Transaction,
+        activation: &mut Option<LaunchAgentActivation>,
     ) -> Result<SetupReport> {
         let architecture = preflight.architecture;
         let runtime_dir = self
@@ -788,6 +961,24 @@ impl Installer {
 
         reclaim_orphan_leases(&self.context.root, &mut notices);
 
+        // The schedule is read from the same `config.toml` the Catalog lives in, which the
+        // Knowledge Store install above has already created, so a first setup sees the defaults
+        // and every later one sees whatever the operator wrote.
+        let maintenance = UserConfigStore::open_existing(&self.context.root)
+            .and_then(|config| config.maintenance_settings())?;
+        let launch_agent = install_launch_agent(
+            transaction,
+            &self.context.home,
+            &self.context.root,
+            &plan_launch_agent(self.host.platform(), &maintenance),
+            prior_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.launch_agent.as_ref()),
+            &mut notices,
+        )?;
+        *activation = launch_agent.activation;
+        self.fail(SetupStage::LaunchAgentWritten)?;
+
         let manifest = InstallManifest {
             version: MANIFEST_VERSION,
             installed_version: self.context.version.clone(),
@@ -804,6 +995,7 @@ impl Installer {
                     .as_ref()
                     .and_then(|prior| prior.author.clone())
             }),
+            launch_agent: launch_agent.ownership,
         };
         let manifest_changed = write_manifest(transaction, &self.context.root, &manifest)?;
         self.fail(SetupStage::ManifestWritten)?;
@@ -848,6 +1040,7 @@ impl Installer {
                 || knowledge_store_changed
                 || config_changed
                 || skill_install.changed
+                || launch_agent.changed
                 || manifest_changed,
             knowledge_store: knowledge_store_source.report(&installation_id),
             preflight,
@@ -1033,6 +1226,7 @@ impl Installer {
                     report.preserved.push(skill.path.clone());
                 }
             }
+            self.uninstall_launch_agent(manifest.launch_agent.as_ref(), &mut report);
             if had_expected_skill_ownership {
                 for directory in [
                     global_skill_root(&self.context.home).join("references"),
@@ -1083,6 +1277,65 @@ impl Installer {
         }
         FileExt::unlock(&lock).map_err(io_error("unlock uninstall"))?;
         Ok(report)
+    }
+
+    /// Deregisters and removes the maintenance `LaunchAgent` this installation owns.
+    ///
+    /// Deregistration comes first and unconditionally: a job whose plist is deleted while it is
+    /// still loaded stays loaded until the next login, and would then fail every day against a
+    /// binary uninstall just removed. Everything here is best effort and reported, never fatal --
+    /// uninstall's contract is to remove exactly what this installation owns and to say what it
+    /// could not, not to fail because launchd was unreachable.
+    fn uninstall_launch_agent(
+        &self,
+        owned: Option<&OwnedLaunchAgent>,
+        report: &mut UninstallReport,
+    ) {
+        let Some(owned) = owned else { return };
+        if let Err(error) = self.host.unload_launch_agent(&owned.label) {
+            report.warnings.push(format!(
+                "could not deregister the scheduled maintenance job {} from launchd ({error}); it \
+                 stops at the next login.",
+                owned.label
+            ));
+        }
+        if owned.path != launch_agent_path(&self.context.home) {
+            report.warnings.push(format!(
+                "preserved unexpected manifest LaunchAgent path: {}",
+                owned.path.display()
+            ));
+            report.preserved.push(owned.path.clone());
+            return;
+        }
+        match fs::read(&owned.path) {
+            Ok(bytes) if sha256(&bytes) == owned.sha256 => match fs::remove_file(&owned.path) {
+                Ok(()) => report.removed.push(owned.path.clone()),
+                Err(error) => {
+                    report.preserved.push(owned.path.clone());
+                    report.warnings.push(format!(
+                        "preserved the scheduled maintenance LaunchAgent because it could not be \
+                         removed: {} ({error})",
+                        owned.path.display()
+                    ));
+                }
+            },
+            Ok(_) => {
+                report.preserved.push(owned.path.clone());
+                report.warnings.push(format!(
+                    "preserved user-modified scheduled maintenance LaunchAgent: {}",
+                    owned.path.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                report.preserved.push(owned.path.clone());
+                report.warnings.push(format!(
+                    "preserved the scheduled maintenance LaunchAgent because it could not be read: \
+                     {} ({error})",
+                    owned.path.display()
+                ));
+            }
+        }
     }
 
     /// Fetches shared knowledge into this installation's work branch and publishes only that
@@ -1680,6 +1933,14 @@ struct InstallManifest {
     /// still reads back at `MANIFEST_VERSION` 1 — nothing about the manifest contract changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     author: Option<String>,
+    /// The maintenance `LaunchAgent` this installation wrote, if it wrote one.
+    ///
+    /// Ownership works exactly like `configs` and `skills`: the digest recorded here is the only
+    /// thing that authorizes a later run to rewrite or remove the file. Optional with
+    /// `#[serde(default)]`, so a manifest written before the scheduled track existed still reads
+    /// back at `MANIFEST_VERSION` 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch_agent: Option<OwnedLaunchAgent>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

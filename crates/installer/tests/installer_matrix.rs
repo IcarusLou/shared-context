@@ -21,6 +21,7 @@ use sctx_index::{IncrementalFallback, ProjectionIndex};
 use sctx_installer::{
     Agent, Architecture, CheckStatus, DataResetOptions, Host, InstallContext, Installer,
     KnowledgeRemoteType, KnowledgeStoreUrl, ResetStage, SetupOptions, SetupStage, SkillStatus,
+    launchd::launch_agent_path,
     maintain::{MaintainDigest, MaintainMode, MaintainOptions, MaintainOutcome, MaintainStep},
 };
 use sctx_local_state::{MaintenanceLock, PrivacyScanner, UserConfigStore};
@@ -1604,6 +1605,7 @@ fn every_setup_write_seam_restores_exact_agent_bytes_and_permissions() {
         SetupStage::GlobalSkillWorkflowWritten,
         SetupStage::GlobalSkillMetadataWritten,
         SetupStage::GlobalSkillWritten,
+        SetupStage::LaunchAgentWritten,
         SetupStage::ManifestWritten,
         SetupStage::SmokeTested,
     ];
@@ -1646,6 +1648,14 @@ fn every_setup_write_seam_restores_exact_agent_bytes_and_permissions() {
         assert!(
             !harness.home.join(".agents").exists(),
             "new global Skill parents at {stage:?}"
+        );
+        assert!(
+            !launch_agent_path(&harness.home).exists(),
+            "maintenance LaunchAgent at {stage:?}"
+        );
+        assert!(
+            !harness.home.join("Library").exists(),
+            "new LaunchAgents parents at {stage:?}"
         );
         if stage >= SetupStage::RepositoryInitialized {
             assert!(harness.root.join("repository/.git").is_dir());
@@ -2183,6 +2193,7 @@ fn failed_upgrade_restores_managed_skill_bytes_and_permissions() {
         SetupStage::GlobalSkillWorkflowWritten,
         SetupStage::GlobalSkillMetadataWritten,
         SetupStage::GlobalSkillWritten,
+        SetupStage::LaunchAgentWritten,
         SetupStage::ManifestWritten,
         SetupStage::SmokeTested,
     ] {
@@ -4048,4 +4059,274 @@ fn doctor_reports_never_run_clean_and_failed_maintenance_without_ever_erroring()
         0,
         "an unsynchronized Knowledge Store never makes the installation itself unhealthy"
     );
+}
+
+/// Reads the exact bytes `setup` installed for the daily maintenance job.
+fn installed_plist(home: &Path) -> String {
+    fs::read_to_string(launch_agent_path(home)).unwrap()
+}
+
+/// Appends one `[maintenance]` table to an installation's `config.toml`.
+fn write_maintenance_table(root: &Path, table: &str) {
+    let path = root.join("config.toml");
+    let mut document = fs::read_to_string(&path).unwrap();
+    document.push_str(table);
+    fs::write(&path, document).unwrap();
+}
+
+#[test]
+fn setup_installs_one_daily_maintenance_launch_agent_and_follows_the_configured_time() {
+    let harness = Harness::new();
+    let report = harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert!(report.changed);
+
+    let plist = launch_agent_path(&harness.home);
+    assert!(plist.is_file());
+    assert_eq!(
+        fs::metadata(&plist).unwrap().permissions().mode() & 0o7777,
+        0o644
+    );
+    // The complete installed document, so a change to the schedule launchd reads is a change to
+    // this test rather than a silent one.
+    let program = harness.root.join("bin/current/sctx");
+    let log = harness.root.join("logs/maintain-launchd.log");
+    let expected = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.shared-context.maintain</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{}</string>
+		<string>maintain</string>
+		<string>run</string>
+		<string>--json</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>6</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>{}</string>
+	<key>StandardErrorPath</key>
+	<string>{}</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+</dict>
+</plist>
+"#,
+        program.display(),
+        log.display(),
+        log.display(),
+    );
+    assert_eq!(installed_plist(&harness.home), expected);
+    // The program is the version-stable symlink, so an upgrade never has to rewrite the plist.
+    assert!(!expected.contains("1.0.0"));
+
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(harness.root.join("state/install-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["launch_agent"]["label"],
+        "com.shared-context.maintain"
+    );
+    assert_eq!(manifest["launch_agent"]["path"], plist.to_str().unwrap());
+    assert_eq!(
+        manifest["launch_agent"]["sha256"].as_str().unwrap(),
+        format!("{:x}", Sha256::digest(expected.as_bytes()))
+    );
+
+    // Re-running with the same schedule is a no-op down to the bytes.
+    let repeat = harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert!(!repeat.changed);
+    assert_eq!(installed_plist(&harness.home), expected);
+
+    // An explicit time reaches launchd, and only the two integers move.
+    write_maintenance_table(
+        &harness.root,
+        "\n[maintenance]\nschedule_hour = 21\nschedule_minute = 30\n",
+    );
+    let rescheduled = harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert!(rescheduled.changed);
+    let plist_text = installed_plist(&harness.home);
+    assert_eq!(
+        plist_text,
+        expected
+            .replace("<integer>6</integer>", "<integer>21</integer>")
+            .replace("<integer>0</integer>", "<integer>30</integer>")
+    );
+
+    // An impossible time is a typed refusal, not a job that never fires.
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    write_maintenance_table(&harness.root, "\n[maintenance]\nschedule_hour = 24\n");
+    let error = harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap_err();
+    assert!(error.to_string().contains("schedule_hour"), "{error}");
+}
+
+#[test]
+fn setup_never_claims_or_overwrites_a_launch_agent_it_did_not_write() {
+    let harness = Harness::new();
+    let plist = launch_agent_path(&harness.home);
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(&plist, b"<!-- someone else's job -->\n").unwrap();
+
+    let report = harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert_eq!(fs::read(&plist).unwrap(), b"<!-- someone else's job -->\n");
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|notice| notice.contains("preserved user-owned launchd job")),
+        "{:?}",
+        report.notices
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(harness.root.join("state/install-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(manifest.get("launch_agent").is_none());
+
+    // Uninstall owns nothing here, so it removes nothing.
+    let uninstall = harness.installer("1.0.0").uninstall().unwrap();
+    assert!(plist.is_file());
+    assert!(!uninstall.removed.contains(&plist));
+
+    // A job this installation *did* write, then the operator edited, is equally untouchable.
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let plist = launch_agent_path(&harness.home);
+    fs::write(&plist, b"<!-- hand-tuned -->\n").unwrap();
+    let report = harness
+        .installer("1.1.0")
+        .upgrade(&SetupOptions::default())
+        .unwrap();
+    assert_eq!(fs::read(&plist).unwrap(), b"<!-- hand-tuned -->\n");
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|notice| notice.contains("preserved user-modified scheduled maintenance")),
+        "{:?}",
+        report.notices
+    );
+    let uninstall = harness.installer("1.1.0").uninstall().unwrap();
+    assert!(plist.is_file());
+    assert!(uninstall.preserved.contains(&plist));
+    assert!(
+        uninstall
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("preserved user-modified scheduled maintenance")),
+        "{:?}",
+        uninstall.warnings
+    );
+}
+
+#[test]
+fn a_disabled_schedule_removes_the_owned_launch_agent_and_uninstall_removes_it_otherwise() {
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let plist = launch_agent_path(&harness.home);
+    assert!(plist.is_file());
+
+    write_maintenance_table(&harness.root, "\n[maintenance]\nscheduled = false\n");
+    let report = harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert!(report.changed);
+    assert!(!plist.exists());
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|notice| notice.contains("removed the scheduled maintenance")),
+        "{:?}",
+        report.notices
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(harness.root.join("state/install-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(manifest.get("launch_agent").is_none());
+
+    // Staying disabled is quiet: nothing to remove, nothing to say.
+    let repeat = harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert!(!repeat.changed);
+    assert!(
+        !repeat
+            .notices
+            .iter()
+            .any(|notice| notice.contains("scheduled maintenance")),
+        "{:?}",
+        repeat.notices
+    );
+
+    // And a normal installation gives its own plist back at uninstall.
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let plist = launch_agent_path(&harness.home);
+    let uninstall = harness.installer("1.0.0").uninstall().unwrap();
+    assert!(!plist.exists());
+    assert!(uninstall.removed.contains(&plist));
+    assert!(uninstall.warnings.is_empty(), "{:?}", uninstall.warnings);
+}
+
+/// launchd user agents are a macOS facility, and `preflight` already refuses every other platform
+/// before any write happens -- so "skipped on a foreign host" is the whole installation being
+/// refused, and the plist is one of the things that is never written. The planning function's own
+/// non-macOS branch is covered by the unit test beside it.
+#[test]
+fn a_non_macos_host_writes_no_launch_agent_because_setup_itself_is_refused() {
+    let harness = Harness::new();
+    let installer = Installer::new(
+        harness.context("1.0.0"),
+        Arc::new(FakeHost {
+            platform: "linux",
+            ..FakeHost::default()
+        }),
+    );
+    let error = installer.setup(&SetupOptions::default()).unwrap_err();
+    assert!(error.to_string().contains("supports macOS only"), "{error}");
+    assert!(!launch_agent_path(&harness.home).exists());
+    assert!(!harness.home.join("Library").exists());
 }
