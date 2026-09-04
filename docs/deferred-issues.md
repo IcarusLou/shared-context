@@ -28,7 +28,7 @@
 11. **EngineeringReference 不携带分支上下文**：沉淀于分支 A 的引用在分支 B 的 checkout 下判 Missing（正确）但无「属于另一分支」提示；`recheck_when: branch_advanced` 机制存在未被用上。d0773d8f 前置分析中 4 条 `.kt` 即此类。
 12. **CONTEXT.md 术语表与实现不符**：「Supersession belongs to Revision and governance causality, not ContextRelation」，而 domain/index/confirm 均把 `Supersedes` 作为普通 ContextRelation（P0 热修复后 search 亦然）。文档需对齐实现。
 13. **跨版本 Candidate 恢复窗口**：旧版本已提交 Git、runtime 停在 Queued 的 Candidate，新版本重算 content hash 不同时可能触发 `deterministic Candidate content hash changed across retry`（R2-B 遗留，极窄窗口）。
-14. **artifact focus reminder 与其他 additional_context 的「先到先得」耦合**：`add_artifact_focus_reminder` 在字段已被占用时放弃提醒；当前无重叠场景但耦合脆弱（R1-H1 遗留）。
+14. **artifact focus reminder 与其他 additional_context 的「先到先得」耦合**：`add_artifact_focus_reminder` 在字段已被占用时放弃提醒；当前无重叠场景但耦合脆弱（R1-H1 遗留）。WP-V5 的 maintenance hint 是第二个消费者，它把同一条规则反过来说——只在 `additional_context` 逐字节等于自己刚渲染的 activation marker 时才追加，其余一律放弃（`maintenance_hint_appended_to_marker` 有三态单测）。规则仍然是「谁先占谁赢」这个约定，没有共享的 slot 所有权结构；第三个消费者出现时应当先做这个结构。
 
 ## 文档与测试债
 

@@ -578,7 +578,7 @@ sctx candidate discard \
 | `sctx upgrade [--agents cursor,codex]` | 安装新版本并原子切换 `bin/current`。 |
 | `sctx data reset --dry-run` / `--yes` | 预览或确认事务式清空活动数据；保留安装结构、Agent 接入和默认恢复备份，不修改远端 Git。 |
 | `sctx uninstall` | 精确移除安装器拥有的运行时和接入配置，保留知识库。 |
-| `sctx maintain run [--opportunistic]` | 一次周期维护：重建工程图、清点待人工处置的 Candidate Review 与 provisional Space、同步知识库。每步独立容错，一步失败不阻断后续步；结果写入 `state/maintain-digest.json`，由 `sctx doctor` 读回。它只统计、不处置任何 Candidate（见 ADR-0005），也不做 `doctor --fix` 的重装和语义模型预热。`--opportunistic` 让同步遇锁即让路（只尝试一次），适合挂在有人等待的操作后面；不加则按 30/60/120 秒退避重试。 |
+| `sctx maintain run [--opportunistic]` | 一次周期维护：重建工程图、清点待人工处置的 Candidate Review 与 provisional Space、同步知识库。每步独立容错，一步失败不阻断后续步；结果写入 `state/maintain-digest.json`，由 `sctx doctor` 读回。它只统计、不处置任何 Candidate（见 ADR-0005），也不做 `doctor --fix` 的重装和语义模型预热。`--opportunistic` 让同步遇锁即让路（只尝试一次），适合挂在有人等待的操作后面；不加则按 30/60/120 秒退避重试。**通常不需要手工跑**：`setup` 会装一个每天 06:00 的 launchd job，`SessionStart` 也会在维护超过 24 小时没跑时自己拉起一次，两者都可以在 `[maintenance]` 里关（见 6.11）。 |
 | `sctx maintain status` | 读回上一次维护运行的时间、每步结果和各项待处置计数。 |
 | `sctx knowledge sync` | 显式收取远端默认/工作分支，验证并合并到本机 InstallationWorkBranch，只发布该工作分支。触及远端的 fetch/ls-remote/push 有 120 秒预算，超时即终止子进程并释放独占租约。 |
 | `sctx knowledge delete ...` | 双重确认后永久删除知识 Git 仓库。 |
@@ -858,6 +858,12 @@ progress = "14d"
 [retrieval]
 embedding_model_path = "/absolute/path/to/bge-m3-onnx"
 embedding_runtime_path = "/absolute/path/to/libonnxruntime.dylib"
+
+[maintenance]
+scheduled = true
+schedule_hour = 6
+schedule_minute = 0
+opportunistic_after_hours = 24
 ```
 
 - `[hooks] artifact_focus_reminder`：默认 `false`（关闭）。关闭时 PostTool Hook 与该开关引入前逐字节一致。显式改成 `true` 后，仅对被识别为单个文件操作的工具事件，用本机 Catalog 把绝对路径解析到已登记 Repository（该 Repository 必须在本会话准入范围内，所以父目录会话会按文件选对仓库），再对 `engineering.sqlite` 做一次只读查询（不加锁、不跑 Git、不 scan、不 rebuild）；命中已接受且可自动注入的 Graph Context 时，追加一条不超过 800 字节的提示（最多 3 个 Context ID、每个标题截断到 60 字符，加一句固定的“可以调用 `task_artifact_focus` 查看”提示文案），不包含 statement/evidence 正文，也不写任何事实。同一 Session 对同一文件只提示一次。这个开关只影响以绝对文件路径命中的工具事件，不覆盖模块/符号/API/Schema/测试等其他定位方式。
@@ -868,6 +874,10 @@ embedding_runtime_path = "/absolute/path/to/libonnxruntime.dylib"
   - 开启后：`sctx mcp serve` 启动时由后台线程加载模型（一次性 9–12 秒）并把已接受 Context 的向量写入 `state/semantic.sqlite`（可随时删除的本地缓存，不进 Git、不进 `index.sqlite`，按模型指纹与 ranking 版本键控）。自动注入的查询会额外走一路余弦召回（阈值 0.52、最多 16 条），与词法通道一起做 RRF 融合；语义命中本身构成一条独立的注入资格路径。查询向量另有一个进程内 LRU（64 条），所以同一个 Working Intent 被反复检索时只编码一次。模型未就绪 / 加载失败 / 单次编码超过预算时，该路静默降级为 `omitted.reason = "embedding_unavailable"`，词法结果不受影响；超时的那次编码在后台跑完后仍会写进查询缓存，所以同一个 Intent 的下一次调用会直接命中。
   - 怎么知道预算够不够：最近 64 次编码的耗时分布与超时次数记在 `semantic.sqlite` 里，`sctx embedding status` 的 `encode_latency` 字段会输出（`samples`/`timed_out`/`p50_ms`/`p95_ms`/`max_ms`）。超时占多数时 `sctx doctor` 的 `retrieval_embedding` 检查会从 Ok 变成 Warning，并直接给出调大 `embedding_encode_budget_ms` 的建议——通道「装好了但每次都超时」在 Pack 里和「没装模型」长得一模一样，这是唯一能把两者区分开的地方。
   - 显式 `context_search` 本轮不接入该通道，保持纯词法。
+- `[maintenance]`：`sctx maintain run`（见 6.x 命令表）什么时候自己跑起来。两条轨互相独立，都默认开着，因为单独任何一条都会漏掉真实的机器：
+  - **定时轨**（`scheduled`，默认 `true`）：`sctx setup` / `sctx upgrade` 会在 `~/Library/LaunchAgents/com.shared-context.maintain.plist` 装一个用户级 launchd job，每天在 `schedule_hour`:`schedule_minute`（本机时区，默认 06:00）执行 `<安装根>/bin/current/sctx maintain run --json`，两路输出都追加到 `<安装根>/logs/maintain-launchd.log`。plist 的所有权按 manifest 里记录的 SHA-256 判定：不是本产品写的同名文件、或者被你手工改过的文件，一律保留不覆盖并在 setup 的 notices 里说明；`sctx uninstall` 也只删自己写的那一份。改成 `scheduled = false` 再跑一次 `sctx setup`，会把本产品装的那个 job 卸载并删除。写 plist 在 setup 事务内（失败会连同其他改动一起回滚），`launchctl bootstrap` 在事务提交之后尽力执行——注册失败（SSH 会话、容器、还没图形登录过）只记一条 notice，下次登录时 launchd 自己会读到，安装不会因此失败。
+  - **机会轨**（`opportunistic_after_hours`，默认 `24`，`0` = 关闭）：如果 `state/maintain-last-run` 不存在、或者距今超过这个小时数，`SessionStart` Hook 在激活与租约工作全部完成之后，会 detach 拉起一个 `sctx maintain run --opportunistic`（独立进程组、三路输出都指向 `/dev/null`、不等待）。这条轨覆盖的是"到点时笔记本正在睡觉"，代价固定为一次单行文件读加一次 spawn：不开数据库、不拿锁、不等待，任何失败都静默（最多在 `sctx doctor --hooks` 里留一行 `opportunistic_maintenance_*`）。设成 `0` 时 `SessionStart` 与引入这条轨之前逐字节一致。
+  - 另外，只要 `state/maintain-digest.json` 记着 `pending_candidate_reviews > 0`，`SessionStart` 的 activation marker 后面会多一行 `<shared-context-maintenance>…</shared-context-maintenance>`，只带一个计数和 `candidate_list` 这个工具名。它是检索提示不是事实，不产生任何 Claim/Evidence（ADR-0003），marker 本身的两种形态逐字节不变；`additional_context` 已被别的东西占用时直接放弃这行提示。
 - `[context_ttl]`：按 Context 类型（`decision`/`contract`/`issue`/`risk`/`validation`/`discovery`/`progress`）配置一个带单位的正时长（`s`/`m`/`h`/`d`/`w`），不配置的类型没有时效。到期起点是该 Context 被接受时所在 commit 的时间，不是本机当前时间。过期后状态变为 `historical`：排除自动注入，仍可以被 `search`/`context get` 查到。
 
 ## 7. 常见问题
