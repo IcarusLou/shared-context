@@ -222,6 +222,12 @@ fn session_start_starts_opportunistic_maintenance_only_once_it_has_gone_stale() 
         wait_for(&digest, Duration::from_secs(30)),
         "an installation that never ran maintenance must start one"
     );
+    // The run writes the digest first and the last-run marker second, so observing the digest
+    // does not yet prove the marker landed; wait for the final write before reading it.
+    assert!(
+        wait_for(&last_run, Duration::from_secs(30)),
+        "a completed run leaves the last-run marker behind"
+    );
     let first = fs::read_to_string(&last_run).unwrap();
     // The scheduled track is not what ran: the Hook asks for the opportunistic budget by name.
     let recorded: Value = serde_json::from_slice(&fs::read(&digest).unwrap()).unwrap();
