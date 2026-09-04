@@ -140,6 +140,33 @@ pub trait EmbeddingProvider: Send + Sync {
     ///
     /// Returns a typed error when the text cannot be tokenized or the model cannot be run.
     fn encode(&self, text: &str) -> Result<Vec<f32>>;
+
+    /// Encodes corpus text nobody is waiting for, yielding the encoder to queries.
+    ///
+    /// The vector must be identical to [`EmbeddingProvider::encode`]'s -- corpus and query vectors
+    /// are compared against each other, so a different answer here would silently break ranking.
+    /// The only difference is scheduling: a provider that serialises encodes should let every
+    /// waiting query go first, because the backfill runs behind a channel that is already
+    /// published and answering.
+    ///
+    /// The default is `encode`, which is right for any provider whose encodes do not contend.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`EmbeddingProvider::encode`].
+    fn encode_bulk(&self, text: &str) -> Result<Vec<f32>> {
+        self.encode(text)
+    }
+
+    /// Whether corpus encodes are competing for this provider right now.
+    ///
+    /// It is what separates "this encode overran because the machine cannot meet the budget" from
+    /// "this encode overran because it queued behind the corpus backfill". The first is a reason
+    /// to raise `[retrieval] embedding_encode_budget_ms`; the second is a window that closes by
+    /// itself, and telling an operator to raise a budget over it would be wrong.
+    fn is_backfilling(&self) -> bool {
+        false
+    }
 }
 
 /// One corpus revision the semantic channel matched, with the similarity that admitted it.
@@ -332,6 +359,12 @@ pub struct EncodeSample {
     pub budget_ms: u32,
     /// Whether the encode overran that budget, which is what the caller saw as `Unavailable`.
     pub timed_out: bool,
+    /// Whether the corpus backfill was competing for the encoder while this encode ran.
+    ///
+    /// A timeout with this set is a transient contention timeout inside a window that closes when
+    /// the backfill finishes. A timeout without it is the encoder failing to meet the budget on
+    /// its own, which is the only one an operator should act on.
+    pub backfill_active: bool,
 }
 
 /// Where a channel reports what its encodes cost. Implemented by [`SemanticVectorCache`]; absent
@@ -349,6 +382,10 @@ pub struct EncodeLatencySummary {
     pub samples: usize,
     /// How many of them overran the budget.
     pub timed_out: usize,
+    /// How many of those timeouts happened while the corpus backfill held the encoder.
+    ///
+    /// Subtracting this from `timed_out` leaves the timeouts that say something about the budget.
+    pub timed_out_during_backfill: usize,
     /// Median observed encode, in milliseconds.
     pub p50_ms: u32,
     /// 95th percentile observed encode, in milliseconds.
@@ -378,6 +415,10 @@ impl EncodeLatencySummary {
         Self {
             samples: samples.len(),
             timed_out: samples.iter().filter(|sample| sample.timed_out).count(),
+            timed_out_during_backfill: samples
+                .iter()
+                .filter(|sample| sample.timed_out && sample.backfill_active)
+                .count(),
             p50_ms: percentile(50),
             p95_ms: percentile(95),
             max_ms: elapsed.last().copied().unwrap_or_default(),
@@ -390,9 +431,17 @@ impl EncodeLatencySummary {
     /// One timeout is a busy machine. A majority of them over a full history is the shape of the
     /// defect this whole module was repaired for: a budget the local hardware cannot meet, which
     /// silently costs every automatic retrieval its semantic channel.
+    ///
+    /// Timeouts taken while the corpus backfill held the encoder do not count. They are real
+    /// degradations and they are recorded as such, but they say nothing about the budget: they end
+    /// when the backfill does, and telling an operator to raise a budget over them would send them
+    /// to change a number that was never the cause.
     #[must_use]
     pub const fn budget_is_unfit(&self) -> bool {
-        self.samples >= 8 && self.timed_out * 2 > self.samples
+        let attributable = self
+            .timed_out
+            .saturating_sub(self.timed_out_during_backfill);
+        self.samples >= 8 && attributable * 2 > self.samples
     }
 }
 
@@ -502,7 +551,8 @@ impl SemanticVectorCache {
                      query_chars INTEGER NOT NULL,
                      elapsed_ms INTEGER NOT NULL,
                      budget_ms INTEGER NOT NULL,
-                     timed_out INTEGER NOT NULL
+                     timed_out INTEGER NOT NULL,
+                     backfill_active INTEGER NOT NULL DEFAULT 0
                  );",
             )
             .map_err(|error| {
@@ -511,6 +561,7 @@ impl SemanticVectorCache {
                     format!("initialize semantic cache schema: {error}"),
                 )
             })?;
+        migrate_encode_sample(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -677,7 +728,7 @@ impl SemanticVectorCache {
         let connection = self.locked()?;
         let mut statement = connection
             .prepare(
-                "SELECT query_chars, elapsed_ms, budget_ms, timed_out
+                "SELECT query_chars, elapsed_ms, budget_ms, timed_out, backfill_active
                  FROM encode_sample ORDER BY observed_at DESC LIMIT ?1",
             )
             .map_err(|error| Error::new(ErrorKind::Io, format!("read encode samples: {error}")))?;
@@ -688,6 +739,7 @@ impl SemanticVectorCache {
                     elapsed_ms: row.get::<_, i64>(1)?.try_into().unwrap_or(u32::MAX),
                     budget_ms: row.get::<_, i64>(2)?.try_into().unwrap_or(u32::MAX),
                     timed_out: row.get::<_, i64>(3)? != 0,
+                    backfill_active: row.get::<_, i64>(4)? != 0,
                 })
             })
             .map_err(|error| Error::new(ErrorKind::Io, format!("read encode samples: {error}")))?;
@@ -729,13 +781,15 @@ impl EncodeSampleRecorder for SemanticVectorCache {
         };
         if connection
             .execute(
-                "INSERT INTO encode_sample (query_chars, elapsed_ms, budget_ms, timed_out)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO encode_sample
+                     (query_chars, elapsed_ms, budget_ms, timed_out, backfill_active)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 rusqlite::params![
                     i64::from(sample.query_chars),
                     i64::from(sample.elapsed_ms),
                     i64::from(sample.budget_ms),
                     i64::from(sample.timed_out),
+                    i64::from(sample.backfill_active),
                 ],
             )
             .is_err()
@@ -750,6 +804,52 @@ impl EncodeSampleRecorder for SemanticVectorCache {
             [i64::try_from(SEMANTIC_ENCODE_SAMPLE_HISTORY).unwrap_or(i64::MAX)],
         );
     }
+}
+
+/// Brings a cache written before `backfill_active` existed up to the current sample schema.
+///
+/// The observations are dropped rather than migrated, and only the observations. They are a rolling
+/// window of at most [`SEMANTIC_ENCODE_SAMPLE_HISTORY`] rows describing how this machine performed
+/// in the last few minutes, worth nothing after a restart, and refilled by the next few queries --
+/// whereas the corpus vectors in the same file cost hours of encoding, so recreating the *file*
+/// to add one diagnostic column would be a real loss for no reason. Backfilling the missing column
+/// with `false` would be worse than dropping: it would assert about old rows exactly the thing the
+/// column exists to establish.
+///
+/// # Errors
+///
+/// Returns [`ErrorKind::Io`] when the table cannot be inspected or replaced.
+fn migrate_encode_sample(connection: &Connection) -> Result<()> {
+    let has_column = connection
+        .prepare("SELECT 1 FROM pragma_table_info('encode_sample') WHERE name = 'backfill_active'")
+        .and_then(|mut statement| statement.exists([]))
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("inspect encode sample schema: {error}"),
+            )
+        })?;
+    if has_column {
+        return Ok(());
+    }
+    connection
+        .execute_batch(
+            "DROP TABLE encode_sample;
+             CREATE TABLE encode_sample (
+                 observed_at INTEGER PRIMARY KEY AUTOINCREMENT,
+                 query_chars INTEGER NOT NULL,
+                 elapsed_ms INTEGER NOT NULL,
+                 budget_ms INTEGER NOT NULL,
+                 timed_out INTEGER NOT NULL,
+                 backfill_active INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .map_err(|error| {
+            Error::new(
+                ErrorKind::Io,
+                format!("rebuild encode sample table: {error}"),
+            )
+        })
 }
 
 /// Path of the discardable vector cache inside an installation root.
@@ -944,8 +1044,13 @@ impl EmbeddingSemanticChannel {
         if std::thread::Builder::new()
             .name("sctx-embedding-query".to_owned())
             .spawn(move || {
+                // Asked on both sides of the encode. A backfill that started while this query was
+                // queued and one that finished while it ran are both contention this encode paid
+                // for, and either reading alone would miss one of them.
+                let contended_before = provider.is_backfilling();
                 let outcome = provider.encode(&owned);
                 let elapsed = started.elapsed();
+                let contended = contended_before || provider.is_backfilling();
                 let vector = outcome.map(Arc::new);
                 if let Ok(vector) = &vector {
                     query_cache.store(&key, &owned, Arc::clone(vector));
@@ -957,6 +1062,7 @@ impl EmbeddingSemanticChannel {
                         elapsed_ms: u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX),
                         budget_ms: u32::try_from(budget.as_millis()).unwrap_or(u32::MAX),
                         timed_out: elapsed > budget,
+                        backfill_active: contended,
                     });
                 }
             })
