@@ -1760,6 +1760,100 @@ fn upgrade_switches_atomically_and_failed_upgrade_restores_previous_runtime() {
     assert!(!harness.root.join("bin/3.0.0/arm64/sctx").exists());
 }
 
+/// An editor's `sctx mcp serve` process (or a Hook process) resolved `bin/current` once, at its
+/// own startup, and keeps that binary mapped for its whole lifetime; switching the symlink an
+/// upgrade later does not reach it. Nothing this process runs can restart another process's MCP
+/// server, so the report has to say so explicitly -- in the structured `notices` field that both
+/// `--json` and the pretty-printed default carry, not a side channel a scripted caller would miss.
+#[test]
+fn upgrade_notices_that_a_running_editor_must_restart_to_see_the_new_binary() {
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+
+    fs::write(&harness.runtime, b"signed-runtime-v2").unwrap();
+    let upgraded = harness
+        .installer("2.0.0")
+        .upgrade(&SetupOptions::default())
+        .unwrap();
+    assert!(
+        upgraded.notices.iter().any(|notice| {
+            notice.contains("restart") && notice.contains("1.0.0") && notice.contains("2.0.0")
+        }),
+        "an upgrade that switched bin/current must notice that a running editor or MCP server \
+         needs a restart: {:#?}",
+        upgraded.notices
+    );
+
+    // Re-running the upgrade at the same version is a no-op for `bin/current`: nothing switched,
+    // so nothing already running fell behind, and repeating the notice would just be noise.
+    let repeated = harness
+        .installer("2.0.0")
+        .upgrade(&SetupOptions::default())
+        .unwrap();
+    assert!(
+        !repeated.changed,
+        "an upgrade to the version already current changes nothing"
+    );
+    assert!(
+        !repeated
+            .notices
+            .iter()
+            .any(|notice| notice.contains("restart")),
+        "an upgrade that switched nothing must not claim a restart is needed: {:#?}",
+        repeated.notices
+    );
+}
+
+/// `sctx setup` re-run over an installation that already exists takes the same `bin/current`
+/// switch an `upgrade` does, and a running editor is exactly as stale either way -- the notice
+/// has to follow "did `bin/current` just move for a pre-existing installation", not the verb the
+/// operator typed.
+#[test]
+fn setup_rerun_over_an_existing_installation_notices_the_restart_the_same_way_upgrade_does() {
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+
+    fs::write(&harness.runtime, b"signed-runtime-v2").unwrap();
+    let resetup = harness
+        .installer("2.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert!(
+        resetup
+            .notices
+            .iter()
+            .any(|notice| notice.contains("restart") && notice.contains("2.0.0")),
+        "a `setup` rerun that moves bin/current for an existing installation must notice the \
+         restart exactly as an `upgrade` would: {:#?}",
+        resetup.notices
+    );
+}
+
+/// The very first `setup` on a machine has no prior installation and nothing else could already
+/// be running the old binary, so there is nothing to restart and the notice must stay silent.
+#[test]
+fn a_first_setup_never_claims_a_restart_is_needed() {
+    let harness = Harness::new();
+    let report = harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert!(
+        !report
+            .notices
+            .iter()
+            .any(|notice| notice.contains("restart")),
+        "a first-ever setup has no prior process to restart: {:#?}",
+        report.notices
+    );
+}
+
 /// An installation that configured explicit `RepositoryGroups` keeps working after the
 /// upgrade that removed them: the section is dropped in the same transaction that would
 /// roll it back, and one notice explains what replaced it (WP-N2).
