@@ -260,6 +260,40 @@ pub fn shared_context_activation_marker(agent: AgentKind, external_session_id: &
     marker
 }
 
+/// Exact upper bound in bytes for one Agent-visible maintenance hint.
+pub const MAINTENANCE_HINT_MAX_BYTES: usize = 256;
+
+const MAINTENANCE_HINT_OPEN: &str = "<shared-context-maintenance>";
+const MAINTENANCE_HINT_CLOSE: &str = "</shared-context-maintenance>";
+
+/// Renders the one-line hint that Candidate Reviews are waiting for a human decision.
+///
+/// This is retrieval steering, not a fact: it carries one count the last maintenance run recorded
+/// and the name of the tool that lists what the count refers to. No Candidate identity, statement,
+/// Space, Repository, or age enters it -- everything a decision actually needs comes from
+/// `candidate_list`, which is the point of pointing at it. ADR-0003's rule that a Hook produces no
+/// Claim and no Evidence is why this stops at a count.
+///
+/// `None` when nothing is pending, which is the common case and must cost the marker zero bytes.
+#[must_use]
+pub fn render_maintenance_hint(pending_candidate_reviews: u64) -> Option<String> {
+    if pending_candidate_reviews == 0 {
+        return None;
+    }
+    let review = if pending_candidate_reviews == 1 {
+        "Candidate Review awaits"
+    } else {
+        "Candidate Reviews await"
+    };
+    let hint = format!(
+        "{MAINTENANCE_HINT_OPEN}Shared Context maintenance: {pending_candidate_reviews} pending \
+         {review} a decision; call candidate_list after your first checkpoint.\
+         {MAINTENANCE_HINT_CLOSE}"
+    );
+    // A count large enough to overflow the bound is a broken digest, not a hint worth sending.
+    (hint.len() <= MAINTENANCE_HINT_MAX_BYTES).then_some(hint)
+}
+
 /// Exact upper bound in bytes for one Agent-visible Artifact focus reminder.
 ///
 /// The reminder replaces roughly 200 model tokens at worst; the byte bound is
@@ -1665,6 +1699,30 @@ mod tests {
         ] {
             assert!(!marker.contains(private_data));
         }
+    }
+
+    #[test]
+    fn the_maintenance_hint_is_bounded_absent_at_zero_and_carries_only_a_count() {
+        assert_eq!(render_maintenance_hint(0), None);
+        let one = render_maintenance_hint(1).unwrap();
+        assert!(
+            one.contains("1 pending Candidate Review awaits a decision"),
+            "{one}"
+        );
+        let many = render_maintenance_hint(7).unwrap();
+        assert!(
+            many.contains("7 pending Candidate Reviews await a decision"),
+            "{many}"
+        );
+        assert!(many.contains("candidate_list"));
+        assert!(many.starts_with(MAINTENANCE_HINT_OPEN) && many.ends_with(MAINTENANCE_HINT_CLOSE));
+        assert!(many.len() <= MAINTENANCE_HINT_MAX_BYTES);
+        // The hint is a count and a tool name; nothing that identifies a Candidate may reach it.
+        for private_data in ["rpo_", "cnd_", "ctx_", "/private/repository", "statement"] {
+            assert!(!many.contains(private_data), "{many}");
+        }
+        // The bound holds for every count that can exist, so it is a guard rather than a cliff.
+        assert!(render_maintenance_hint(u64::MAX).unwrap().len() <= MAINTENANCE_HINT_MAX_BYTES);
     }
 
     #[test]

@@ -17,11 +17,11 @@ pub use artifact_reminder::{
 };
 pub use config::{
     ActivationScope, ActivationSettings, CatalogCheckoutStatus, ContextTtlPolicy,
-    EngineeringSettings, HookSettings, LEGACY_REPOSITORY_ID_PREFIX, RepositoryCatalogAddOutcome,
-    RepositoryCatalogCheckoutCheck, RepositoryCatalogDiagnostic, RepositoryCatalogDoctorReport,
-    RepositoryCatalogEntry, RepositoryCatalogRenameOutcome, RepositoryCatalogRevision,
-    RepositoryCatalogSnapshot, ResolvedRepositoryPath, RetrievalSettings, UserConfigStore,
-    migrate_legacy_repository_groups,
+    EngineeringSettings, HookSettings, LEGACY_REPOSITORY_ID_PREFIX, MaintenanceSettings,
+    RepositoryCatalogAddOutcome, RepositoryCatalogCheckoutCheck, RepositoryCatalogDiagnostic,
+    RepositoryCatalogDoctorReport, RepositoryCatalogEntry, RepositoryCatalogRenameOutcome,
+    RepositoryCatalogRevision, RepositoryCatalogSnapshot, ResolvedRepositoryPath,
+    RetrievalSettings, UserConfigStore, migrate_legacy_repository_groups,
 };
 pub use maintenance::{MaintenanceGuard, MaintenanceLock};
 pub use privacy::{PrivacyFinding, PrivacyFindingKind, PrivacyScan, PrivacyScanner, RedactedText};

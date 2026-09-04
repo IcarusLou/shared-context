@@ -995,7 +995,7 @@ fn hook_switches_default_to_off_and_survive_an_explicit_catalog_write() {
     let repository = init_repo(&temporary.path().join("switch repo"), "switch");
     let store = UserConfigStore::initialize(&root).unwrap();
 
-    let (catalog, hooks) = store.repository_catalog_with_hooks().unwrap();
+    let (catalog, hooks, _) = store.repository_catalog_with_hooks().unwrap();
     assert!(catalog.repositories.is_empty());
     assert!(
         !hooks.artifact_focus_reminder,
@@ -1021,7 +1021,7 @@ fn hook_switches_default_to_off_and_survive_an_explicit_catalog_write() {
             std::slice::from_ref(&repository),
         )
         .unwrap();
-    let (catalog, hooks) = store.repository_catalog_with_hooks().unwrap();
+    let (catalog, hooks, _) = store.repository_catalog_with_hooks().unwrap();
     assert_eq!(catalog.repositories.len(), 1);
     assert!(hooks.artifact_focus_reminder);
     assert!(

@@ -41,6 +41,10 @@ struct ConfigDocument {
     engineering: Option<EngineeringConfigDocument>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     retrieval: Option<RetrievalConfigDocument>,
+    /// Optional periodic maintenance schedule. Absent means the defaults below, which install the
+    /// daily `LaunchAgent` and let a Session that has not seen maintenance for a day start one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    maintenance: Option<MaintenanceConfigDocument>,
 }
 
 /// Optional `[activation]` table: overrides for derived Session activation.
@@ -230,6 +234,117 @@ impl EngineeringSettings {
         }
     }
 }
+
+/// Optional `[maintenance]` table: when the periodic maintenance cycle runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceConfigDocument {
+    #[serde(default = "enabled")]
+    scheduled: bool,
+    #[serde(default = "default_schedule_hour")]
+    schedule_hour: u32,
+    #[serde(default)]
+    schedule_minute: u32,
+    #[serde(default = "default_opportunistic_after_hours")]
+    opportunistic_after_hours: u64,
+}
+
+const fn default_schedule_hour() -> u32 {
+    6
+}
+
+const fn default_opportunistic_after_hours() -> u64 {
+    24
+}
+
+impl Default for MaintenanceConfigDocument {
+    fn default() -> Self {
+        Self {
+            scheduled: true,
+            schedule_hour: default_schedule_hour(),
+            schedule_minute: 0,
+            opportunistic_after_hours: default_opportunistic_after_hours(),
+        }
+    }
+}
+
+/// When the periodic maintenance cycle (`sctx maintain run`) is allowed to start itself.
+///
+/// Two independent tracks read this table. The *scheduled* track is a user `LaunchAgent` installed by
+/// setup, which is the only one that can reach an installation nobody opened that day. The
+/// *opportunistic* track is one detached process a `SessionStart` Hook may spawn when the recorded
+/// last run is older than [`opportunistic_after_hours`](Self::opportunistic_after_hours), which is
+/// what covers a laptop that is asleep at the scheduled hour. Either can be turned off alone: a
+/// machine that is always awake wants only the timer, and one that refuses launchd jobs wants only
+/// the Hook.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct MaintenanceSettings {
+    /// Whether setup installs (and upgrade keeps) the daily `LaunchAgent`. `false` also *removes* an
+    /// agent this installation previously installed, so the switch is reversible in both
+    /// directions rather than only stopping future installs.
+    pub scheduled: bool,
+    /// Local hour of the scheduled run, 0-23.
+    pub schedule_hour: u32,
+    /// Local minute of the scheduled run, 0-59.
+    pub schedule_minute: u32,
+    /// How stale the recorded last run must be before a `SessionStart` may spawn one. `0` disables
+    /// the opportunistic track entirely, which is the one setting that makes a Session's Hook
+    /// byte-identical to the one that shipped before this track existed.
+    pub opportunistic_after_hours: u64,
+}
+
+impl Default for MaintenanceSettings {
+    fn default() -> Self {
+        Self {
+            scheduled: true,
+            schedule_hour: default_schedule_hour(),
+            schedule_minute: 0,
+            opportunistic_after_hours: default_opportunistic_after_hours(),
+        }
+    }
+}
+
+impl MaintenanceSettings {
+    /// The staleness threshold in seconds, or `None` when the opportunistic track is off.
+    #[must_use]
+    pub const fn opportunistic_after_seconds(&self) -> Option<u64> {
+        match self.opportunistic_after_hours {
+            0 => None,
+            hours => Some(hours * 3_600),
+        }
+    }
+
+    fn from_document(document: Option<MaintenanceConfigDocument>) -> Result<Self> {
+        let Some(document) = document else {
+            return Ok(Self::default());
+        };
+        if document.schedule_hour > 23 {
+            return Err(invalid(
+                "[maintenance] schedule_hour must be between 0 and 23",
+            ));
+        }
+        if document.schedule_minute > 59 {
+            return Err(invalid(
+                "[maintenance] schedule_minute must be between 0 and 59",
+            ));
+        }
+        // A year is the largest interval that still means "run this eventually"; past it the
+        // multiplication into seconds stops being the operator's intent and starts being a typo.
+        if document.opportunistic_after_hours > MAX_OPPORTUNISTIC_AFTER_HOURS {
+            return Err(invalid(format!(
+                "[maintenance] opportunistic_after_hours must be between 0 and {MAX_OPPORTUNISTIC_AFTER_HOURS}"
+            )));
+        }
+        Ok(Self {
+            scheduled: document.scheduled,
+            schedule_hour: document.schedule_hour,
+            schedule_minute: document.schedule_minute,
+            opportunistic_after_hours: document.opportunistic_after_hours,
+        })
+    }
+}
+
+const MAX_OPPORTUNISTIC_AFTER_HOURS: u64 = 24 * 365;
 
 /// Optional `[retrieval]` table: the local embedding recall channel.
 ///
@@ -583,6 +698,7 @@ impl UserConfigStore {
             context_ttl: None,
             engineering: None,
             retrieval: None,
+            maintenance: None,
         };
         validate_document_structure(&document, &root.join("repository"))?;
         toml::to_string_pretty(&document).map_err(|error| {
@@ -625,6 +741,7 @@ impl UserConfigStore {
                     context_ttl: None,
                     engineering: None,
                     retrieval: None,
+                    maintenance: None,
                 })?;
             }
             Ok(())
@@ -692,23 +809,50 @@ impl UserConfigStore {
         finish_locked(&lock, outcome)
     }
 
-    /// Reads the Catalog and the explicit Hook switches from the same bounded,
-    /// non-blocking `config.toml` read.
+    /// Reads the Catalog, the explicit Hook switches, and the maintenance schedule from the same
+    /// bounded, non-blocking `config.toml` read.
     ///
     /// The Hook hot path uses this instead of a second file open: the disabled
-    /// decision costs exactly the read it already performed.
+    /// decision costs exactly the read it already performed. The maintenance schedule rides along
+    /// for the same reason — the `SessionStart` opportunistic gate needs it, and a second open
+    /// would add a lock acquisition to every event that does not.
+    ///
+    /// An unusable `[maintenance]` table degrades to the defaults here rather than failing the
+    /// read: a mistyped schedule must not cost a Session its activation, and `sctx doctor` and
+    /// `sctx setup` both report it through [`Self::maintenance_settings`], which does fail loudly.
     ///
     /// # Errors
     ///
     /// Returns typed configuration, locking, or filesystem errors.
     pub fn repository_catalog_with_hooks(
         &self,
-    ) -> Result<(RepositoryCatalogSnapshot, HookSettings)> {
+    ) -> Result<(RepositoryCatalogSnapshot, HookSettings, MaintenanceSettings)> {
         let lock = self.lock_shared()?;
         let outcome = self.read_document().map(|document| {
             let hooks = HookSettings::from_document(document.hooks);
-            (catalog_snapshot(&document), hooks)
+            let maintenance =
+                MaintenanceSettings::from_document(document.maintenance).unwrap_or_default();
+            (catalog_snapshot(&document), hooks, maintenance)
         });
+        finish_locked(&lock, outcome)
+    }
+
+    /// Reads the explicit `[maintenance]` table.
+    ///
+    /// A missing table is the default: the daily `LaunchAgent` is installed and a Session that finds
+    /// maintenance a day stale may start one. Read with the blocking shared lock for the same
+    /// reason as [`Self::engineering_settings`] -- only setup, uninstall, and `sctx doctor` ask,
+    /// never the Hook hot path, which takes the degrading reader above.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or filesystem errors.
+    pub fn maintenance_settings(&self) -> Result<MaintenanceSettings> {
+        let lock = open_private_file(&self.lock_path)?;
+        FileExt::lock_shared(&lock).map_err(io_error("lock config.lock shared"))?;
+        let outcome = self
+            .read_document()
+            .and_then(|document| MaintenanceSettings::from_document(document.maintenance));
         finish_locked(&lock, outcome)
     }
 

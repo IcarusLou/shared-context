@@ -80,6 +80,7 @@ impl Harness {
         Command::new(env!("CARGO_BIN_EXE_sctx"))
             .arg("--json")
             .args(args)
+            .env("SCTX_SKIP_LAUNCHCTL", "1")
             .env("HOME", &self.home)
             .output()
             .expect("sctx should start")
@@ -96,7 +97,10 @@ impl Harness {
         environment: &[(&str, &Path)],
     ) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_sctx"));
-        command.args(args).env("HOME", &self.home);
+        command
+            .args(args)
+            .env("SCTX_SKIP_LAUNCHCTL", "1")
+            .env("HOME", &self.home);
         for (name, value) in environment {
             command.env(name, value);
         }
@@ -1819,6 +1823,7 @@ fn twenty_cli_processes_confirm_one_review_in_one_atomic_commit() {
                         "--input",
                         input_path.to_str().unwrap(),
                     ])
+                    .env("SCTX_SKIP_LAUNCHCTL", "1")
                     .env("HOME", home)
                     .output()
                     .unwrap()
@@ -2615,6 +2620,7 @@ fn mcp_stdio_entry_serves_cursor_and_codex_without_extra_stdout() {
         let harness = Harness::new();
         let mut child = Command::new(env!("CARGO_BIN_EXE_sctx"))
             .args(["mcp", "serve", "--client", client])
+            .env("SCTX_SKIP_LAUNCHCTL", "1")
             .env("HOME", &harness.home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2811,6 +2817,7 @@ fn lifecycle_commands_share_stable_json_tree_and_generation_envelopes() {
     harness.success(&["validate", "--staged"]);
     let human = Command::new(env!("CARGO_BIN_EXE_sctx"))
         .args(["space", "list"])
+        .env("SCTX_SKIP_LAUNCHCTL", "1")
         .env("HOME", &harness.home)
         .output()
         .unwrap();
