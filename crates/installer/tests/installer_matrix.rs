@@ -17,7 +17,7 @@ use sctx_domain::{
 use sctx_engineering_graph::{EngineeringProjectionStore, RepositoryRegistry};
 use sctx_event_schema::{Event, IntentSnapshot, V1_JSON_SCHEMA};
 use sctx_git_store::{AppendRequest, GitStore, TextObject};
-use sctx_index::ProjectionIndex;
+use sctx_index::{IncrementalFallback, ProjectionIndex};
 use sctx_installer::{
     Agent, Architecture, CheckStatus, DataResetOptions, Host, InstallContext, Installer,
     KnowledgeRemoteType, KnowledgeStoreUrl, ResetStage, SetupOptions, SetupStage, SkillStatus,
@@ -342,11 +342,11 @@ fn assert_runtime_schema_current(root: &Path) {
     let version = connection
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .unwrap();
-    // 17 is the current schema version: 13, 14, 15 and 16 all gained in-place migrations
-    // (additive `hook_event`, the `context_usage` reset, the omission-only reset, then additive
-    // disposition provenance) rather than becoming discardable/unsupported versions, so a fresh or
-    // rebuilt Runtime always lands on 17.
-    assert_eq!(version, 17);
+    // 18 is the current schema version: 13 through 17 all gained in-place migrations
+    // (additive `hook_event`, the `context_usage` reset, the omission-only reset, additive
+    // disposition provenance, then the additive checkpoint-reminder counters) rather than
+    // becoming discardable/unsupported versions, so a fresh or rebuilt Runtime always lands on 18.
+    assert_eq!(version, 18);
     assert!(sqlite_table_exists(&connection, "auto_confirm_rejection"));
     assert!(sqlite_table_exists(&connection, "task_signal"));
     assert!(sqlite_table_exists(&connection, "hook_event"));
@@ -995,7 +995,7 @@ fn setup_rebuilds_schema_11_runtime_and_discards_cached_task_and_capture_state()
 
 #[test]
 fn setup_rejects_unknown_or_future_runtime_schemas_without_mutating_state() {
-    for version in [10_u32, 18, 999] {
+    for version in [10_u32, 19, 999] {
         let harness = Harness::new();
         let installer = harness.installer("1.2.3");
         installer.setup(&SetupOptions::default()).unwrap();
@@ -1034,7 +1034,7 @@ fn setup_rejects_unknown_or_future_runtime_schemas_without_mutating_state() {
 
         assert_eq!(
             error.message(),
-            format!("unsupported task runtime schema version {version}; expected 17")
+            format!("unsupported task runtime schema version {version}; expected 18")
         );
         for (path, bytes, mode) in prior {
             assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
@@ -1761,6 +1761,100 @@ fn upgrade_switches_atomically_and_failed_upgrade_restores_previous_runtime() {
         PathBuf::from("2.0.0/arm64")
     );
     assert!(!harness.root.join("bin/3.0.0/arm64/sctx").exists());
+}
+
+/// An editor's `sctx mcp serve` process (or a Hook process) resolved `bin/current` once, at its
+/// own startup, and keeps that binary mapped for its whole lifetime; switching the symlink an
+/// upgrade later does not reach it. Nothing this process runs can restart another process's MCP
+/// server, so the report has to say so explicitly -- in the structured `notices` field that both
+/// `--json` and the pretty-printed default carry, not a side channel a scripted caller would miss.
+#[test]
+fn upgrade_notices_that_a_running_editor_must_restart_to_see_the_new_binary() {
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+
+    fs::write(&harness.runtime, b"signed-runtime-v2").unwrap();
+    let upgraded = harness
+        .installer("2.0.0")
+        .upgrade(&SetupOptions::default())
+        .unwrap();
+    assert!(
+        upgraded.notices.iter().any(|notice| {
+            notice.contains("restart") && notice.contains("1.0.0") && notice.contains("2.0.0")
+        }),
+        "an upgrade that switched bin/current must notice that a running editor or MCP server \
+         needs a restart: {:#?}",
+        upgraded.notices
+    );
+
+    // Re-running the upgrade at the same version is a no-op for `bin/current`: nothing switched,
+    // so nothing already running fell behind, and repeating the notice would just be noise.
+    let repeated = harness
+        .installer("2.0.0")
+        .upgrade(&SetupOptions::default())
+        .unwrap();
+    assert!(
+        !repeated.changed,
+        "an upgrade to the version already current changes nothing"
+    );
+    assert!(
+        !repeated
+            .notices
+            .iter()
+            .any(|notice| notice.contains("restart")),
+        "an upgrade that switched nothing must not claim a restart is needed: {:#?}",
+        repeated.notices
+    );
+}
+
+/// `sctx setup` re-run over an installation that already exists takes the same `bin/current`
+/// switch an `upgrade` does, and a running editor is exactly as stale either way -- the notice
+/// has to follow "did `bin/current` just move for a pre-existing installation", not the verb the
+/// operator typed.
+#[test]
+fn setup_rerun_over_an_existing_installation_notices_the_restart_the_same_way_upgrade_does() {
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+
+    fs::write(&harness.runtime, b"signed-runtime-v2").unwrap();
+    let resetup = harness
+        .installer("2.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert!(
+        resetup
+            .notices
+            .iter()
+            .any(|notice| notice.contains("restart") && notice.contains("2.0.0")),
+        "a `setup` rerun that moves bin/current for an existing installation must notice the \
+         restart exactly as an `upgrade` would: {:#?}",
+        resetup.notices
+    );
+}
+
+/// The very first `setup` on a machine has no prior installation and nothing else could already
+/// be running the old binary, so there is nothing to restart and the notice must stay silent.
+#[test]
+fn a_first_setup_never_claims_a_restart_is_needed() {
+    let harness = Harness::new();
+    let report = harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert!(
+        !report
+            .notices
+            .iter()
+            .any(|notice| notice.contains("restart")),
+        "a first-ever setup has no prior process to restart: {:#?}",
+        report.notices
+    );
 }
 
 /// An installation that configured explicit `RepositoryGroups` keeps working after the
@@ -3227,6 +3321,100 @@ fn next_setup_recovers_an_incomplete_durable_journal_before_reapplying() {
         serde_json::from_slice(&fs::read(&report.journal).unwrap()).unwrap();
     assert_eq!(recovered_journal["phase"], "recovered_rollback");
     assert_eq!(recovered_journal["complete"], true);
+}
+
+/// `APPEND_PROTOCOL_BYPASSED` (WP-V6 fix 4) used to reach only whichever process's own
+/// `sctx index sync` call happened to trigger the fallback rebuild that found it, gone the moment
+/// that process exited. It is now persisted in the index's own `meta` table, so a `sctx doctor`
+/// run long after the triggering synchronization still sees it.
+#[test]
+fn doctor_surfaces_a_persisted_append_protocol_bypass_after_the_synchronization_that_found_it() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.0.0");
+    installer.setup(&SetupOptions::default()).unwrap();
+
+    let append_protocol_check = |report: &sctx_installer::DoctorReport| {
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "append_protocol")
+            .expect("doctor always reports append-protocol integrity")
+            .clone()
+    };
+    assert_eq!(
+        append_protocol_check(&installer.doctor()).status,
+        CheckStatus::Ok,
+        "a freshly set up installation has no history to warn about"
+    );
+
+    let store = GitStore::open_existing(&harness.root).unwrap();
+    let event = Event::space_created(
+        IntentSnapshot {
+            title: "doctor append-protocol fixture".to_owned(),
+            problem: "a persisted bypass warning must survive past the call that found it"
+                .to_owned(),
+            desired_outcome: "sctx doctor reports it".to_owned(),
+            in_scope: vec!["append-protocol integrity".to_owned()],
+            out_of_scope: Vec::new(),
+            acceptance_conditions: vec!["doctor names the modified path".to_owned()],
+            domain_terms: Vec::new(),
+        },
+        None,
+    )
+    .unwrap();
+    let outcome = store.append_event(AppendRequest::event(event)).unwrap();
+    let event_path = harness.root.join("repository").join(&outcome.event_path);
+    let index = ProjectionIndex::new(harness.root.join("repository"), harness.root.join("state"));
+    index.synchronize().unwrap();
+
+    // Committed history modified outside the append protocol: the same shape
+    // `crates/index/tests/sqlite_rebuild.rs`'s "modify" case constructs.
+    let replacement = Event::space_created(
+        IntentSnapshot {
+            title: "manual replacement".to_owned(),
+            problem: "committed history must not be a second source of truth".to_owned(),
+            desired_outcome: "doctor names the modified path".to_owned(),
+            in_scope: vec!["append-protocol integrity".to_owned()],
+            out_of_scope: Vec::new(),
+            acceptance_conditions: vec!["doctor reports the bypass".to_owned()],
+            domain_terms: Vec::new(),
+        },
+        None,
+    )
+    .unwrap();
+    fs::write(&event_path, serde_json::to_vec(&replacement).unwrap()).unwrap();
+    git(
+        &harness.root.join("repository"),
+        &["add", "--", &outcome.event_path],
+    );
+    git(
+        &harness.root.join("repository"),
+        &["commit", "-m", "Bypass append protocol for doctor test"],
+    );
+
+    let synchronized = index.synchronize().unwrap();
+    assert_eq!(
+        synchronized.incremental_fallback,
+        Some(IncrementalFallback::AppendProtocolBypassed)
+    );
+
+    let bypassed = append_protocol_check(&installer.doctor());
+    assert_eq!(
+        bypassed.status,
+        CheckStatus::Warning,
+        "a persisted bypass must not read as healthy: {}",
+        bypassed.message
+    );
+    assert!(
+        bypassed.message.contains("知识仓库历史出现非追加变更"),
+        "{}",
+        bypassed.message
+    );
+    assert!(
+        bypassed.message.contains(&outcome.event_path),
+        "the message must name the modified path: {}",
+        bypassed.message
+    );
 }
 
 /// A dark Graph channel is silent by construction: every Task Context Pack degrades to text, and

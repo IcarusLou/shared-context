@@ -817,6 +817,23 @@ impl Installer {
                 .filter(|capability| capability.diagnostic.starts_with("ACTION REQUIRED:"))
                 .map(|capability| capability.diagnostic.clone()),
         );
+        // `bin/current` just moved to point at a different version than the one this run started
+        // with -- and it only moves for an installation that already existed (`prior_manifest`).
+        // An editor's `sctx mcp serve` process, or a Hook process spawned before this run, resolved
+        // `bin/current` once already and keeps its own already-open binary mapped in memory: the
+        // symlink change is invisible to it. Nothing this process does can restart another
+        // process's MCP server, so the only correct fix is telling the operator to.
+        if changed_current {
+            if let Some(prior) = &prior_manifest {
+                notices.push(format!(
+                    "ACTION REQUIRED: sctx was updated from {} to {}. Any editor or MCP server \
+                     process started before this run is still running the previous binary; \
+                     restart your editor (or the `sctx mcp serve` process it manages) to use the \
+                     new version.",
+                    prior.installed_version, self.context.version
+                ));
+            }
+        }
         Ok(SetupReport {
             operation: operation.as_str().to_owned(),
             root: self.context.root.clone(),
@@ -4221,6 +4238,32 @@ fn check_index(root: &Path, checks: &mut Vec<DoctorCheck>) {
             ),
         )),
         Err(error) => checks.push(failed("indexed_tree", error.to_string())),
+    }
+    // WP-V6 fix 4: `APPEND_PROTOCOL_BYPASSED` used to reach only whichever `sctx index sync` (or
+    // automatic retrieval call) happened to trigger the rebuild that found it, as one line in that
+    // one call's own JSON -- gone the moment that process exited. It is now persisted in `meta`
+    // (`ProjectionIndex::last_rebuild_operational_warnings`), so a later `sctx doctor` sees it too.
+    match index.last_rebuild_operational_warnings() {
+        Ok(warnings) if warnings.is_empty() => checks.push(ok(
+            "append_protocol",
+            "the most recent rebuild that compared history found no bypass",
+        )),
+        Ok(warnings) => {
+            let paths = warnings
+                .iter()
+                .flat_map(|warning| warning.paths.iter())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            checks.push(warning(
+                "append_protocol",
+                format!(
+                    "知识仓库历史出现非追加变更 (committed history was found modified outside the \
+                     append protocol): {paths}"
+                ),
+            ));
+        }
+        Err(error) => checks.push(failed("append_protocol", error.to_string())),
     }
     match index.domain_snapshot() {
         Ok(snapshot) if snapshot.diagnostics.is_empty() => {

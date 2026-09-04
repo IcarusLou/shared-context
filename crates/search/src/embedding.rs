@@ -506,6 +506,17 @@ pub fn model_fingerprint(model_directory: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// How long a write against `semantic.sqlite` waits on another connection's lock before giving up.
+///
+/// The two real writers -- an editor's long-lived `serve` process backfilling on a background
+/// thread, and a `sctx doctor --fix` synchronous warm running at the same time -- are two separate
+/// connections to the same file, exactly the shape that produces `SQLITE_BUSY`. Both `serve` and
+/// `doctor --fix` already treat a failed [`SemanticVectorCache::store`] as best-effort and swallow
+/// the error (`crates/mcp/src/semantic.rs`), so a timeout that is too short does not fail loudly,
+/// it silently drops the vector -- which is exactly the bug this constant closes. See
+/// [`SemanticVectorCache::open`] for why this one number also covers the cache's reads.
+const SEMANTIC_CACHE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Discardable local cache of corpus vectors, in its own `SQLite` file.
 ///
 /// It is deliberately not a table in `index.sqlite`. Vectors are derived data an operator may
@@ -534,6 +545,46 @@ impl SemanticVectorCache {
         }
         let connection = Connection::open(path)
             .map_err(|error| Error::new(ErrorKind::Io, format!("open semantic cache: {error}")))?;
+        // Explicit, not `Duration::ZERO` the way `artifact_focus`'s read-only connection sets it.
+        // That contrast is a decision, not an oversight: `artifact_focus` opens a *second*,
+        // read-only connection specifically so a query in progress is never made to wait on it,
+        // and it accepts an immediate `SQLITE_BUSY` because the caller has a same-process
+        // fallback for that case. This cache has one connection for both halves, and the two
+        // halves have opposite tolerance for a wait -- so the choice has to be justified by what
+        // actually reaches this connection, not split down the middle.
+        //
+        // Nothing on the synchronous query path -- `EmbeddingSemanticChannel::similar_revisions`,
+        // reached from `task_context` -- ever touches this connection. The corpus vectors it
+        // scores against are loaded into memory once, at channel construction
+        // (`SemanticVectorCache::load`, called from `from_cache`), and that construction happens
+        // only on the background loader thread in `spawn_semantic_loader` or inside `sctx doctor
+        // --fix`'s synchronous warm-up -- never inline in a request. The one write this connection
+        // takes that a query ever provokes is the `EncodeSampleRecorder::record` call in
+        // `encode_within_budget`, and that runs on a spawned per-query thread *after* it has
+        // already sent the vector back over the channel the caller is blocked on: the caller has
+        // its answer, and its p95, before this connection is touched at all. So a wait here is
+        // invisible to `task_context` latency by construction, not by measurement, and the same
+        // budget that is safe for the write paths below (cache fill, `prune_superseded`,
+        // `encode_sample`) is safe for the whole connection.
+        //
+        // Five seconds, matching `rusqlite::Connection::open`'s own default
+        // (`sqlite3_busy_timeout(db, 5000)`, set unconditionally inside
+        // `InnerConnection::open_with_flags`): this call changes no observed behaviour today, it
+        // only makes the wait every write here already gets an explicit, reviewable fact instead
+        // of an rusqlite implementation detail this crate happened to inherit. Every other
+        // connection this codebase opens for a real write path sets its own busy_timeout by name
+        // (`engineering-graph`'s and `task-runtime`'s `BUSY_TIMEOUT` at 10s, `index`'s at 3s); this
+        // was the one write path relying on the library default instead of stating its own budget,
+        // and "hundreds of ms to low seconds" for a corpus backfill or a `doctor --fix` warm sync
+        // that nothing waits on puts five seconds squarely inside range.
+        connection
+            .busy_timeout(SEMANTIC_CACHE_BUSY_TIMEOUT)
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Io,
+                    format!("set semantic cache busy timeout: {error}"),
+                )
+            })?;
         connection
             .execute_batch(
                 "PRAGMA journal_mode = WAL;

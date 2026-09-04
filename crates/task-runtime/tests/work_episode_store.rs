@@ -1828,3 +1828,92 @@ fn deleting_runtime_loses_episode_only_and_preserves_other_state() {
         b"unrelated"
     );
 }
+
+/// The `TurnStop` checkpoint reminder gate (WP-V6 fix 3, `docs/deferred-issues.md` #6): capped at
+/// three reminders per external Session, and an idle turn -- no
+/// [`TaskRuntime::record_checkpoint_reminder_activity`] since the last reminder -- neither shows
+/// the reminder again nor spends part of the budget.
+#[test]
+fn turn_stop_checkpoint_reminder_gate_caps_at_three_and_skips_idle_turns() {
+    let temporary = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(temporary.path()).unwrap();
+    let (locator, _task) = open_task(&runtime, "reminder-gate", "throttle the TurnStop nag");
+
+    // 1st reminder: always fires, there is nothing yet to compare it against.
+    assert!(
+        runtime.gate_turn_stop_checkpoint_reminder(&locator),
+        "the first reminder fires unconditionally"
+    );
+
+    // Immediately again, with no recorded activity in between: an idle turn is suppressed and
+    // must not consume part of the three-reminder budget.
+    assert!(
+        !runtime.gate_turn_stop_checkpoint_reminder(&locator),
+        "a turn with no activity since the last reminder must not repeat it"
+    );
+    assert!(
+        !runtime.gate_turn_stop_checkpoint_reminder(&locator),
+        "repeating the idle check must still not consume budget"
+    );
+
+    // Real activity unlocks the 2nd reminder.
+    runtime
+        .record_checkpoint_reminder_activity(&locator)
+        .unwrap();
+    assert!(
+        runtime.gate_turn_stop_checkpoint_reminder(&locator),
+        "activity since the last reminder unlocks the next one"
+    );
+    assert!(
+        !runtime.gate_turn_stop_checkpoint_reminder(&locator),
+        "the activity was spent by the reminder that just fired"
+    );
+
+    // Activity unlocks the 3rd and final reminder.
+    runtime
+        .record_checkpoint_reminder_activity(&locator)
+        .unwrap();
+    assert!(
+        runtime.gate_turn_stop_checkpoint_reminder(&locator),
+        "the third reminder still fires"
+    );
+
+    // The budget is now spent: even with fresh activity, a 4th reminder never fires again this
+    // Session.
+    runtime
+        .record_checkpoint_reminder_activity(&locator)
+        .unwrap();
+    assert!(
+        !runtime.gate_turn_stop_checkpoint_reminder(&locator),
+        "a 4th reminder must not fire even with new activity: the Session budget is spent"
+    );
+    runtime
+        .record_checkpoint_reminder_activity(&locator)
+        .unwrap();
+    assert!(
+        !runtime.gate_turn_stop_checkpoint_reminder(&locator),
+        "the budget stays spent for the rest of the Session"
+    );
+}
+
+/// A Session with no `ExternalSession` row yet (no `ActiveTask`) has nothing to throttle: the gate
+/// fails open, and recording activity against it is a harmless no-op rather than an error.
+#[test]
+fn turn_stop_checkpoint_reminder_gate_fails_open_with_no_active_task() {
+    let temporary = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(temporary.path()).unwrap();
+    let missing = ExternalSessionLocator::new("codex", "reminder-gate-missing").unwrap();
+
+    assert!(
+        runtime.gate_turn_stop_checkpoint_reminder(&missing),
+        "no ExternalSession row means nothing to throttle: the gate fails open"
+    );
+    assert!(
+        runtime.gate_turn_stop_checkpoint_reminder(&missing),
+        "failing open is not itself state: it does not start consuming a budget that has no row \
+         to live on"
+    );
+    runtime
+        .record_checkpoint_reminder_activity(&missing)
+        .expect("recording activity with no row is a harmless no-op, not an error");
+}

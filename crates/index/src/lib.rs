@@ -107,6 +107,61 @@ pub struct OperationalWarning {
     pub paths: Vec<String>,
 }
 
+/// Owned twin of [`OperationalWarning`], read back from `meta` (WP-V6 fix 4).
+///
+/// [`OperationalWarning::code`] is `&'static str` because every live warning is produced from a
+/// literal at its one call site; a warning read back from `SQLite` has no `'static` string to
+/// borrow, so this carries an owned `code` instead of reusing that type.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct PersistedOperationalWarning {
+    pub code: String,
+    pub paths: Vec<String>,
+}
+
+/// `meta` key the most recent rebuild's [`OperationalWarning`]s are persisted under (WP-V6 fix 4).
+///
+/// Additive to the existing generic `(key, value)` `meta` table, so no `DB_SCHEMA_VERSION` bump or
+/// migration is needed: an index built before this key existed simply has no row for it, which
+/// [`ProjectionIndex::last_rebuild_operational_warnings`] already treats as "nothing to report."
+pub(crate) const OPERATIONAL_WARNINGS_META_KEY: &str = "last_rebuild_operational_warnings";
+
+/// What one candidate [`UpdatePlan`] establishes about append-protocol integrity, and therefore
+/// what `meta`'s persisted [`OperationalWarning`]s should become (WP-V6 fix 4).
+///
+/// The two are different questions answered by the same comparison: [`RebuildOutcome`] reports
+/// what *this* `synchronize()` call found, which was already correct before this type existed and
+/// stays that way (only [`Self::Fresh`] ever contributes to it, same as before). This type is
+/// additionally about what `sctx doctor` should still be able to see afterward -- which requires
+/// knowing not just *whether* a violation was found, but whether the check that could have found
+/// one actually ran this time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OperationalWarningsUpdate {
+    /// A Tree diff against the previously indexed generation completed, so these warnings (empty
+    /// for a clean diff) are this generation's authoritative verdict and replace whatever was
+    /// persisted before.
+    Fresh(Vec<OperationalWarning>),
+    /// No comparable diff ran this synchronization -- a missing database, a forced rebuild, an
+    /// implementation-version change, or an old Tree unavailable for comparison all reach the
+    /// projection by some path other than comparing it against the last one. Whatever `meta`
+    /// already holds stands, unexamined and unchanged, exactly as an operator would expect
+    /// "unrelated to Git history integrity" to behave.
+    CarryForward,
+}
+
+/// Serializes warnings for [`OPERATIONAL_WARNINGS_META_KEY`], the one direction
+/// [`OperationalWarning::code`]'s `&'static str` never needs to round-trip back out of.
+fn encode_operational_warnings(warnings: &[OperationalWarning]) -> Result<String> {
+    let persisted = warnings
+        .iter()
+        .map(|warning| PersistedOperationalWarning {
+            code: warning.code.to_owned(),
+            paths: warning.paths.clone(),
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&persisted)
+        .map_err(|error| invariant(format!("encode operational warnings for meta: {error}")))
+}
+
 /// Metadata that identifies one atomic projection generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexMetadata {
@@ -186,7 +241,7 @@ enum UpdatePlan {
     Full {
         input: project::BuildInput,
         fallback: Option<IncrementalFallback>,
-        warnings: Vec<OperationalWarning>,
+        operational_warnings: OperationalWarningsUpdate,
     },
 }
 
@@ -302,6 +357,32 @@ impl ProjectionIndex {
         require_quick_check(&connection)?;
         read_metadata(&connection)?.ok_or_else(|| {
             invariant("projection database does not contain complete version metadata")
+        })
+    }
+
+    /// Operational warnings the most recent rebuild that actually compared this generation
+    /// against the last one found, persisted in `meta` (WP-V6 fix 4) so `sctx doctor` can see
+    /// them without waiting for a live `sctx index sync`.
+    ///
+    /// Empty is the normal case, and is ambiguous by design between "the last rebuild found
+    /// nothing to warn about" and "this database predates the key": both mean there is nothing
+    /// for an operator to act on. Persists across every incremental sync after the rebuild that
+    /// wrote it -- see [`OperationalWarningsUpdate`] -- until the next rebuild that runs a real
+    /// Tree diff updates or clears it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is absent, corrupt, or the persisted value is not valid JSON.
+    pub fn last_rebuild_operational_warnings(&self) -> Result<Vec<PersistedOperationalWarning>> {
+        let connection = self.open_read_only()?;
+        require_quick_check(&connection)?;
+        let Some(raw) = schema::read_meta_value(&connection, OPERATIONAL_WARNINGS_META_KEY)? else {
+            return Ok(Vec::new());
+        };
+        serde_json::from_str(&raw).map_err(|error| {
+            invariant(format!(
+                "parse persisted operational warnings from meta: {error}"
+            ))
         })
     }
 
@@ -510,8 +591,45 @@ impl ProjectionIndex {
                     input: self
                         .build_input(&git_tree::read_tree(&self.repository, &head_oid)?.blobs)?,
                     fallback: None,
-                    warnings: Vec::new(),
+                    // No diff ran (a missing database, a forced rebuild, or an implementation
+                    // version change all skip `plan_tree_change` entirely), so this has nothing
+                    // fresh to say about append-protocol integrity either.
+                    operational_warnings: OperationalWarningsUpdate::CarryForward,
                 }
+            };
+            // Resolved from `&plan` before the shadow-rebuild transaction begins: `CarryForward`
+            // reads whatever `meta` currently holds so a synchronization that is not itself a
+            // rebuild re-examining Git history integrity does not silently erase a warning a past
+            // rebuild found. `replace_projection` and `replace_projection_incremental` only ever
+            // *write* this string; they never decide what it should be.
+            //
+            // `UpdatePlan::Incremental` always carries forward, never writes a fresh verdict, even
+            // though the diff that produced it did run and came back clean: an incremental update
+            // is not a rebuild (`IndexUpdateKind::Incremental`, not `FullRebuild`), and "the most
+            // recent rebuild's warning" -- what `sctx doctor` reports -- has to mean what it says.
+            // A past bypass stays visible through however many ordinary incremental syncs follow
+            // it, until the next real rebuild re-examines history and updates or clears it.
+            let operational_warnings_json = match &plan {
+                UpdatePlan::Incremental { .. }
+                | UpdatePlan::Full {
+                    operational_warnings: OperationalWarningsUpdate::CarryForward,
+                    ..
+                } => {
+                    // Also reached by the very first synchronization a database ever does
+                    // (`MissingDatabase`, before `meta` exists at all), so the read is guarded by
+                    // `schema::is_complete` -- already evaluated once above as part of
+                    // `versions_match` -- rather than assuming the table it names is there to read.
+                    if schema::is_complete(&connection)? {
+                        schema::read_meta_value(&connection, OPERATIONAL_WARNINGS_META_KEY)?
+                            .unwrap_or_else(|| "[]".to_owned())
+                    } else {
+                        "[]".to_owned()
+                    }
+                }
+                UpdatePlan::Full {
+                    operational_warnings: OperationalWarningsUpdate::Fresh(warnings),
+                    ..
+                } => encode_operational_warnings(warnings)?,
             };
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -527,6 +645,7 @@ impl ProjectionIndex {
                         &head_oid,
                         generation,
                         &affected_spaces,
+                        &operational_warnings_json,
                     )?;
                     if update_kind == IndexUpdateKind::Current {
                         update_kind = IndexUpdateKind::Incremental;
@@ -536,14 +655,22 @@ impl ProjectionIndex {
                 UpdatePlan::Full {
                     input,
                     fallback,
-                    warnings,
+                    operational_warnings: warnings_update,
                 } => {
-                    schema::replace_projection(&transaction, &input, &head_oid, generation)?;
+                    schema::replace_projection(
+                        &transaction,
+                        &input,
+                        &head_oid,
+                        generation,
+                        &operational_warnings_json,
+                    )?;
                     update_kind = IndexUpdateKind::FullRebuild;
                     if fallback.is_some() {
                         incremental_fallback = fallback;
                     }
-                    operational_warnings.extend(warnings);
+                    if let OperationalWarningsUpdate::Fresh(warnings) = warnings_update {
+                        operational_warnings.extend(warnings);
+                    }
                     input
                 }
             };
@@ -638,21 +765,32 @@ impl ProjectionIndex {
         new_tree_oid: &str,
         new_entries: &[git_tree::TreeEntry],
     ) -> Result<UpdatePlan> {
-        let full = |fallback, warnings| -> Result<UpdatePlan> {
+        let full = |fallback, operational_warnings| -> Result<UpdatePlan> {
             Ok(UpdatePlan::Full {
                 input: self
                     .build_input(&git_tree::read_tree(&self.repository, new_tree_oid)?.blobs)?,
                 fallback: Some(fallback),
-                warnings,
+                operational_warnings,
             })
         };
+        // Neither branch below ran a diff against the previously indexed generation, so neither
+        // has a fresh answer about append-protocol integrity -- whatever `meta` already says
+        // stands. Contrast the `AppendProtocolBypassed`, `CachedSourceMismatch`, and
+        // `ImpactClosureUnproven` branches further down, all reached only after `changes` was
+        // computed successfully.
         if !git_tree::tree_exists(&self.repository, &metadata.indexed_tree_oid) {
-            return full(IncrementalFallback::IndexedTreeUnavailable, Vec::new());
+            return full(
+                IncrementalFallback::IndexedTreeUnavailable,
+                OperationalWarningsUpdate::CarryForward,
+            );
         }
         let Ok(changes) =
             git_tree::diff_trees(&self.repository, &metadata.indexed_tree_oid, new_tree_oid)
         else {
-            return full(IncrementalFallback::IndexedTreeUnavailable, Vec::new());
+            return full(
+                IncrementalFallback::IndexedTreeUnavailable,
+                OperationalWarningsUpdate::CarryForward,
+            );
         };
         if changes.iter().any(|change| !change.is_addition()) {
             let paths = changes
@@ -667,10 +805,10 @@ impl ProjectionIndex {
                 .collect();
             return full(
                 IncrementalFallback::AppendProtocolBypassed,
-                vec![OperationalWarning {
+                OperationalWarningsUpdate::Fresh(vec![OperationalWarning {
                     code: "APPEND_PROTOCOL_BYPASSED",
                     paths,
-                }],
+                }]),
             );
         }
 
@@ -694,8 +832,14 @@ impl ProjectionIndex {
             .iter()
             .map(|blob| (blob.path.as_str(), blob.oid.as_str()))
             .collect();
+        // Reached only once `changes` was computed and confirmed to contain no non-addition
+        // change, so append-protocol integrity has a fresh, clean answer here even though the
+        // plan still degrades to a full rebuild for an unrelated reason.
         if expected != cached || expected.len() != new_blobs.len() {
-            return full(IncrementalFallback::CachedSourceMismatch, Vec::new());
+            return full(
+                IncrementalFallback::CachedSourceMismatch,
+                OperationalWarningsUpdate::Fresh(Vec::new()),
+            );
         }
 
         let old_input = self.build_input(&old_blobs)?;
@@ -707,7 +851,10 @@ impl ProjectionIndex {
         let affected_spaces = project::impact_closure(&old_input, &new_input, &changed_paths);
         let observed_changes = project::changed_projection_spaces(&old_input, &new_input);
         if !observed_changes.is_subset(&affected_spaces) {
-            return full(IncrementalFallback::ImpactClosureUnproven, Vec::new());
+            return full(
+                IncrementalFallback::ImpactClosureUnproven,
+                OperationalWarningsUpdate::Fresh(Vec::new()),
+            );
         }
         Ok(UpdatePlan::Incremental {
             input: new_input,

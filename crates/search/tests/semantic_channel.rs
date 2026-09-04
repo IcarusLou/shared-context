@@ -17,7 +17,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use sctx_domain::{
@@ -455,6 +455,126 @@ fn the_cache_round_trips_vectors_bit_for_bit() {
         "a re-read vector must be identical, not merely close: cosine against a query is only \
          reproducible if the stored bits are"
     );
+}
+
+#[test]
+fn a_writer_holding_the_lock_does_not_make_a_concurrent_store_drop_its_write() {
+    // Reproduces the two real writers that share `semantic.sqlite`: the editor's long-lived
+    // `serve` process backfilling on a background thread, and a `doctor --fix` synchronous warm
+    // running at the same time. Both call `SemanticVectorCache::store`, and both are separate
+    // connections to the same file -- exactly the shape that produces `SQLITE_BUSY` for as long as
+    // the other side holds the write lock, which `crates/mcp/src/semantic.rs` then silently treats
+    // as "nothing to store" (`if cache.store(..).is_ok() { .. }`) and the vector is gone for good.
+    // A too-short or absent `busy_timeout` turns an ordinary lock hold into a dropped write; this
+    // pins `SEMANTIC_CACHE_BUSY_TIMEOUT` as long enough to ride one out. (`Connection::open`
+    // already carries rusqlite's own 5 s default, so this also guards against a future change
+    // silently narrowing that default underneath an unrelated rusqlite upgrade.)
+    //
+    // This holds a real write lock open on a *third* connection to force the contention
+    // deterministically, then proves the cache's own connection waits it out instead of failing.
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("state/semantic.sqlite");
+    let cache = Arc::new(SemanticVectorCache::open(&path).unwrap());
+    // Opening the cache once already creates the schema and the parent directory; a second raw
+    // connection to the same file can now take the write lock.
+    let mut locker = rusqlite::Connection::open(&path).unwrap();
+    locker.busy_timeout(Duration::from_millis(0)).unwrap();
+    let key = SemanticCacheKey::new("fingerprint", "6");
+    let provider = HashProvider::new();
+
+    let hold = Duration::from_millis(400);
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let locker_barrier = Arc::clone(&barrier);
+    let locking_thread = std::thread::spawn(move || {
+        let transaction = locker
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        locker_barrier.wait();
+        std::thread::sleep(hold);
+        transaction.commit().unwrap();
+    });
+
+    // Give the locking thread a head start so its `BEGIN IMMEDIATE` is in place before the cache
+    // tries to write, then race the cache's own store against the held lock.
+    barrier.wait();
+    std::thread::sleep(Duration::from_millis(20));
+    let started = Instant::now();
+    let revision = RevisionId::new();
+    let vector = provider
+        .encode("written while another connection holds the lock")
+        .unwrap();
+    let result = cache.store(&key, revision, &vector);
+    let waited = started.elapsed();
+
+    locking_thread.join().unwrap();
+
+    assert!(
+        result.is_ok(),
+        "store must wait out the busy_timeout and succeed, not drop the write: {result:?}"
+    );
+    assert!(
+        waited >= Duration::from_millis(200),
+        "the store returned in {waited:?} without ever actually waiting on the held lock, so \
+         this run did not exercise the busy_timeout at all"
+    );
+    assert!(
+        cache.cached_revisions(&key).unwrap().contains(&revision),
+        "the vector written while the lock was held must be durably in the cache"
+    );
+}
+
+#[test]
+fn many_concurrent_writers_lose_no_stores_under_busy_timeout() {
+    // The realistic shape: no one is pinning the lock open, several writers are just issuing
+    // stores back to back from separate connections (separate `SemanticVectorCache::open` calls,
+    // the way two processes each would). This is real writer-writer contention, not staged: with
+    // `SEMANTIC_CACHE_BUSY_TIMEOUT` set to `Duration::ZERO` this flakes under exactly this load
+    // with `SQLITE_BUSY` on whichever writer loses the race, so it is not a vacuous assertion --
+    // every store below must land.
+    const WRITERS: usize = 6;
+    const STORES_PER_WRITER: usize = 20;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("state/semantic.sqlite");
+    // Establish the schema up front so every writer thread races on writes only, not on
+    // `CREATE TABLE IF NOT EXISTS`.
+    drop(SemanticVectorCache::open(&path).unwrap());
+
+    let key = SemanticCacheKey::new("fingerprint", "6");
+    let mut revisions = Vec::with_capacity(WRITERS * STORES_PER_WRITER);
+    let mut handles = Vec::with_capacity(WRITERS);
+    for _ in 0..WRITERS {
+        let path = path.clone();
+        let key = key.clone();
+        let writer_revisions: Vec<RevisionId> =
+            (0..STORES_PER_WRITER).map(|_| RevisionId::new()).collect();
+        revisions.extend_from_slice(&writer_revisions);
+        handles.push(std::thread::spawn(move || {
+            let cache = SemanticVectorCache::open(&path).unwrap();
+            let provider = HashProvider::new();
+            for (index, revision) in writer_revisions.into_iter().enumerate() {
+                let vector = provider
+                    .encode(&format!("concurrent writer text {index}"))
+                    .unwrap();
+                cache.store(&key, revision, &vector).expect(
+                    "busy_timeout must absorb writer-writer contention, not drop the write",
+                );
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let verifier = SemanticVectorCache::open(&path).unwrap();
+    let stored = verifier.cached_revisions(&key).unwrap();
+    for revision in &revisions {
+        assert!(
+            stored.contains(revision),
+            "revision {revision} written by a concurrent writer is missing from the cache"
+        );
+    }
+    assert_eq!(stored.len(), revisions.len());
 }
 
 // ---------------------------------------------------------------------------------------------

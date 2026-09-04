@@ -300,6 +300,22 @@ fn codex_event(session: &str, cwd: &Path, event: &str, raw_marker: &str) -> Valu
             "model": "gpt-5.6-sol",
             "reason": "other"
         }),
+        // A generic Codex `shell` tool call: real "substantial tool activity" for the TurnStop
+        // checkpoint reminder gate (WP-V6 fix 3), independent of whether it names a file this
+        // installation's Repository catalog can attribute.
+        "PostToolUse" => json!({
+            "session_id": session,
+            "transcript_path": format!("/tmp/{raw_marker}.jsonl"),
+            "cwd": cwd,
+            "hook_event_name": "PostToolUse",
+            "model": "gpt-5.6-sol",
+            "permission_mode": "default",
+            "turn_id": format!("turn-{raw_marker}"),
+            "tool_name": "shell",
+            "tool_use_id": format!("call-{raw_marker}"),
+            "tool_input": {"command": ["echo", raw_marker], "workdir": cwd},
+            "tool_response": {"output": "done"}
+        }),
         _ => unreachable!(),
     }
 }
@@ -578,6 +594,21 @@ fn out_of_order_stop_requires_checkpoint_and_session_end_never_closes_or_builds(
             snapshot.current_intent_revision().unwrap().revision_id,
         )
         .unwrap();
+    // The TurnStop checkpoint reminder gate (WP-V6 fix 3) only repeats the reminder for a Stop
+    // that saw real activity since the last one; this test's whole point is two reminders in
+    // sequence, so it needs a tool call between them the way a real out-of-order Session would
+    // have one. The tool call's `cwd` has to be the registered checkout (`harness.workspace`),
+    // not `harness.home` the way the Session-lifecycle events on this page use: PostToolUse
+    // activation is repository-scoped, and only Session-lifecycle events are not.
+    harness.hook(
+        "codex",
+        &codex_event(
+            session,
+            &harness.workspace,
+            "PostToolUse",
+            "RAW_BETWEEN_STOPS",
+        ),
+    );
     let checkpoint_required = harness.hook(
         "codex",
         &codex_event(session, &harness.home, "Stop", "RAW_CHECKPOINT_REQUIRED"),
@@ -603,6 +634,80 @@ fn out_of_order_stop_requires_checkpoint_and_session_end_never_closes_or_builds(
     let episode = runtime.read_work_episode(episode_id).unwrap().unwrap();
     assert_eq!(episode.episode.status, WorkEpisodeStatus::Open);
     assert!(runtime.read_candidate_build(episode_id).unwrap().is_none());
+}
+
+/// End to end through the real `sctx hook` binary (WP-V6 fix 3, `docs/deferred-issues.md` #6): a
+/// Session that never checkpoints gets at most three `call task_checkpoint` reminders across
+/// however many `Stop` (Codex's `TurnStop`) events it produces, an idle `Stop` -- no tool call
+/// since the last reminder -- is suppressed and spends none of the budget, and the fourth
+/// reminder never fires even once real activity resumes.
+#[test]
+fn turn_stop_checkpoint_reminder_throttles_after_three_and_skips_idle_turns() {
+    let harness = Harness::new();
+    let runtime = TaskRuntime::initialize(&harness.root).unwrap();
+    let session = "reminder-throttle";
+    harness.activate("codex", session);
+    runtime
+        .open_or_create(
+            ExternalSessionLocator::new("codex", session).unwrap(),
+            TaskId::new(),
+            intent(session),
+            Vec::new(),
+        )
+        .unwrap();
+
+    let stop = |marker: &str| {
+        harness.hook(
+            "codex",
+            &codex_event(session, &harness.workspace, "Stop", marker),
+        )
+    };
+    let tool_use = |marker: &str| {
+        harness.hook(
+            "codex",
+            &codex_event(session, &harness.workspace, "PostToolUse", marker),
+        )
+    };
+    let is_the_nag = |response: &Value| {
+        response["systemMessage"]
+            .as_str()
+            .is_some_and(|message| message.contains("call task_checkpoint"))
+    };
+
+    // 1st reminder always fires: no checkpoint exists yet and nothing has been said before.
+    let first = stop("REMINDER_1");
+    assert_flat_checkpoint_guidance(&first);
+
+    // Immediately again with no tool call in between: an idle turn is suppressed, and it must not
+    // spend part of the three-reminder budget either.
+    assert!(
+        !is_the_nag(&stop("REMINDER_IDLE_A")),
+        "an idle Stop must not repeat the reminder"
+    );
+    assert!(
+        !is_the_nag(&stop("REMINDER_IDLE_B")),
+        "repeating the idle Stop must still not spend the budget"
+    );
+
+    // Real tool activity unlocks the 2nd reminder.
+    tool_use("ACTIVITY_1");
+    assert_flat_checkpoint_guidance(&stop("REMINDER_2"));
+
+    tool_use("ACTIVITY_2");
+    assert_flat_checkpoint_guidance(&stop("REMINDER_3"));
+
+    // The budget is now spent: a 4th reminder never fires this Session, even with fresh activity
+    // right before it.
+    tool_use("ACTIVITY_3");
+    assert!(
+        !is_the_nag(&stop("REMINDER_4")),
+        "a 4th reminder must not fire even with new activity: the Session budget is spent"
+    );
+    tool_use("ACTIVITY_4");
+    assert!(
+        !is_the_nag(&stop("REMINDER_5")),
+        "the budget stays spent for the rest of the Session"
+    );
 }
 
 #[test]
