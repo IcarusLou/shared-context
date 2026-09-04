@@ -16,12 +16,13 @@ use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_local_state::{AuthorizedSessionScopeStore, UserConfigStore};
 use sctx_mcp::{
-    CandidateConfirmInput, CandidateConfirmPrimaryInput, CandidateListInput,
+    CandidateAnalyzeInput, CandidateConfirmInput, CandidateConfirmPrimaryInput, CandidateListInput,
     EngineeringReferenceRecordInput, ExistingCandidatePrimaryInput, ExpectedRevisionId,
     TaskBoundary, TaskCheckpointClaimInput, TaskCheckpointEvidenceInput, TaskCheckpointInput,
     TaskContextReadInput, TaskIntentUpdateInput, build_closed_episode_at_root,
-    candidate_confirm_at_root, candidate_list_at_root, engineering_reference_record_at_root,
-    task_checkpoint_at_root, task_context_readonly_with_detail_at_root, task_intent_update_at_root,
+    candidate_analyze_at_root, candidate_confirm_at_root, candidate_list_at_root,
+    engineering_reference_record_at_root, task_checkpoint_at_root,
+    task_context_readonly_with_detail_at_root, task_intent_update_at_root,
 };
 use sctx_search::ContextPackDetailLevel;
 use sctx_task_runtime::{ContextInjectionSource, ContextUsageTotals, TaskRuntime};
@@ -438,15 +439,25 @@ fn confirming_a_contradiction_refutes_the_injected_context() {
     );
 }
 
-/// Restating an injected Context is not reuse (P3).
+/// Reuse follows the server's own published relation verdict, not a similarity score.
 ///
-/// The comparison this replaces scored normalized statement token Jaccard, so a Claim that
-/// repeated its input scored highest while the Claim that carried a genuinely *new* conclusion
-/// built on that input scored nothing. Both real reuses observed in session `01a060a1` were
-/// recorded `ignored` that way, and the usage prior optimized backwards for as long as it ran. A
-/// restatement now records exactly what it is.
+/// The comparison the two Claim signals replaced scored normalized statement token Jaccard inside
+/// the usage path itself, so a Claim that repeated its input scored highest while the Claim that
+/// carried a genuinely *new* conclusion built on that input scored nothing. That rule is gone and
+/// stays gone: nothing here measures wording.
+///
+/// What decides a restatement now is the Candidate analysis, which the review pipeline publishes
+/// for its own reasons -- it gates Confirmation, routes duplicate review, and is the same verdict
+/// a human reviewer reads. When that verdict relates the Candidate to a Context this very Task was
+/// handed, the server has already told itself the injection landed on target, and recording the
+/// injection as an omission contradicts its own analysis. Session `3f862e48` is the proof: the
+/// stored assessment read `supports ctx_d9689ac4` and all three injections were filed `ignored`.
+///
+/// The sibling keeps the ordering honest. It was injected into the same Task, it is a sentence
+/// about the same subsystem, and no assessment related the Candidate to it, so it stays `ignored`:
+/// the decision is the relation, not the topic and not the wording.
 #[test]
-fn restating_an_injected_context_is_not_reuse() {
+fn a_restatement_is_reuse_only_because_the_analysis_relates_it_to_the_injection() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("restatement root");
     let (_, reused, _) = accepted_context(&root, REUSED_STATEMENT);
@@ -454,7 +465,8 @@ fn restating_an_injected_context_is_not_reuse() {
     let session = "usage-restatement";
 
     intent_update(&root, session);
-    // The Claim repeats the injected statement word for word and names nothing.
+    // The Claim repeats the injected statement word for word and names nothing: neither Claim
+    // signal fires, and the Working Intent quotes no identifier either.
     assert!(!checkpoint(&root, session, REUSED_STATEMENT, &[]));
 
     let runtime = TaskRuntime::initialize(&root).unwrap();
@@ -462,11 +474,11 @@ fn restating_an_injected_context_is_not_reuse() {
     assert_eq!(
         totals[&reused],
         ContextUsageTotals {
-            reused: 0,
-            ignored: 1,
+            reused: 1,
+            ignored: 0,
             refuted: 0,
         },
-        "a word-for-word restatement is the weakest possible reuse signal, not the strongest"
+        "the analysis related this Candidate to the injected Context"
     );
     assert_eq!(
         totals[&ignored],
@@ -474,7 +486,108 @@ fn restating_an_injected_context_is_not_reuse() {
             reused: 0,
             ignored: 1,
             refuted: 0,
-        }
+        },
+        "no assessment related the Candidate to the sibling, so it stays an omission"
+    );
+
+    // Replaying the Checkpoint re-derives the two Claim signals, which both say `ignored` here.
+    // A rerun must not walk the analysis verdict back.
+    assert!(checkpoint(&root, session, REUSED_STATEMENT, &[]));
+    assert_eq!(
+        runtime.context_usage_totals(&[reused, ignored]).unwrap(),
+        totals,
+        "a Candidate Build rerun re-derives the early signals and must not erase the late one"
+    );
+}
+
+/// A Context the Working Intent quotes by identity is reuse, whatever the Claims end up saying.
+///
+/// Session `01a06646` is the shape: `ctx_be6db0a4` was pasted whole into the Task's
+/// `current_direction`, the model said it was correcting its implementation accordingly, and the
+/// Claims it finally filed were about newly created files that shared no coordinate with the
+/// Context's own references. Every Claim signal missed, and the Context that visibly steered the
+/// Task was recorded as an omission.
+///
+/// The Intent is Agent-authored prose written for the Agent's own purpose, exactly like a Claim
+/// statement, and the server asks for no new field to read it.
+#[test]
+fn a_context_quoted_into_the_working_intent_is_reuse() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("intent quote root");
+    let (_, quoted, _) = accepted_context(&root, REUSED_STATEMENT);
+    let (_, ignored, _) = accepted_context(&root, IGNORED_STATEMENT);
+    let session = "usage-intent-quote";
+
+    let task = intent_update(&root, session);
+    let injected = task
+        .context
+        .items
+        .iter()
+        .map(|item| item.context.context_id)
+        .collect::<Vec<_>>();
+    assert!(
+        injected.contains(&quoted) && injected.contains(&ignored),
+        "{injected:?}"
+    );
+
+    // The Agent revises its direction around one of the two Contexts it was handed.
+    let revised = task_intent_update_at_root(
+        &root,
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            task_boundary: TaskBoundary::Continue,
+            expected_revision_id: ExpectedRevisionId::Revision(
+                task.context.intent_revision_id.to_string(),
+            ),
+            intent: WorkingIntentSnapshot {
+                goal: GOAL.to_owned(),
+                current_direction: Some(format!(
+                    "Correcting the implementation against {quoted}, which pins the ordering"
+                )),
+                in_scope: vec![GOAL.to_owned()],
+                out_of_scope: Vec::new(),
+                domains: vec!["ledger".to_owned()],
+                platforms: Vec::new(),
+                constraints: Vec::new(),
+                acceptance_conditions: vec!["The Pack is returned".to_owned()],
+                artifact_hints: Vec::new(),
+                interface_hints: Vec::new(),
+                open_questions: Vec::new(),
+            },
+        },
+    )
+    .unwrap();
+    assert_eq!(revised.context.task_id, task.context.task_id);
+
+    // The Claim is about something else entirely: it names no Context, restates nothing, and
+    // lands on no shared coordinate.
+    assert!(!checkpoint(
+        &root,
+        session,
+        "the release pipeline pins its toolchain to one minor version per branch",
+        &[],
+    ));
+
+    let runtime = TaskRuntime::initialize(&root).unwrap();
+    let totals = runtime.context_usage_totals(&[quoted, ignored]).unwrap();
+    assert_eq!(
+        totals[&quoted],
+        ContextUsageTotals {
+            reused: 1,
+            ignored: 0,
+            refuted: 0,
+        },
+        "the Task wrote this Context's identity into its own direction"
+    );
+    assert_eq!(
+        totals[&ignored],
+        ContextUsageTotals {
+            reused: 0,
+            ignored: 1,
+            refuted: 0,
+        },
+        "the sibling appears in no Intent revision and in no Claim"
     );
 }
 
@@ -600,5 +713,216 @@ fn a_claim_landing_on_the_injected_coordinate_is_reuse_without_shared_wording() 
             refuted: 0,
         },
         "the sibling shares no coordinate and was never named"
+    );
+}
+
+/// Reads the one pending Candidate this Task produced.
+fn only_candidate(root: &Path, session: &str) -> CandidateId {
+    candidate_list_at_root(
+        root,
+        &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            status: sctx_domain::CandidateReviewStatus::Pending,
+            limit: 10,
+            cursor: None,
+            token_budget: 8_192,
+        },
+    )
+    .unwrap()
+    .reviews
+    .first()
+    .expect("the Checkpoint produced one Candidate")
+    .0
+    .candidate_id
+}
+
+/// Re-analyzing a Candidate rewrites the same reuse verdict instead of a second one.
+///
+/// Analysis is produced from three entry points -- Candidate Build's deferred pass,
+/// `candidate_analyze`, and the recovery drain behind `candidate_get` -- and every one of them
+/// records the assessment signal. A Context is credited once per Task however many of them run.
+#[test]
+fn re_analyzing_a_candidate_does_not_double_count_the_reuse() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("re-analysis root");
+    let (_, reused, _) = accepted_context(&root, REUSED_STATEMENT);
+    let (_, ignored, _) = accepted_context(&root, IGNORED_STATEMENT);
+    let session = "usage-re-analysis";
+
+    intent_update(&root, session);
+    assert!(!checkpoint(&root, session, REUSED_STATEMENT, &[]));
+
+    let runtime = TaskRuntime::initialize(&root).unwrap();
+    let before = runtime.context_usage_totals(&[reused, ignored]).unwrap();
+    assert_eq!(
+        before[&reused],
+        ContextUsageTotals {
+            reused: 1,
+            ignored: 0,
+            refuted: 0,
+        }
+    );
+
+    let analyzed = candidate_analyze_at_root(
+        &root,
+        &CandidateAnalyzeInput {
+            candidate_id: only_candidate(&root, session).to_string(),
+            token_budget: 8_192,
+            top_k: 8,
+        },
+    )
+    .unwrap();
+    assert!(
+        analyzed
+            .candidate
+            .analysis
+            .assessments
+            .iter()
+            .any(|assessment| assessment
+                .target
+                .is_some_and(|target| target.context_id == reused)),
+        "the analysis this test reasons about must actually target the injected Context"
+    );
+    assert_eq!(
+        runtime.context_usage_totals(&[reused, ignored]).unwrap(),
+        before,
+        "one (context, task) pair contributes one row however often the analysis is rebuilt"
+    );
+}
+
+/// Publishes one more accepted Context into an existing Space.
+fn sibling_context(root: &Path, space_id: SpaceId, statement: &str) -> ContextId {
+    let store = GitStore::bootstrap_local(root).unwrap();
+    let draft = ContextRevisionDraft {
+        problem_view: None,
+        hints: Vec::new(),
+        kind: ContextKind::Discovery,
+        topic_key: Some(format!("usage/{statement}")),
+        statement: statement.to_owned(),
+        rationale: "The fixture verified the behavior directly".to_owned(),
+        applicability: Applicability::default(),
+        assumptions: Vec::new(),
+        recheck_when: Vec::new(),
+        relations: Vec::new(),
+        evidence: vec![EvidenceSnapshotDraft {
+            kind: EvidenceType::ExperimentRecord,
+            supports: "The usage fixture verified the Context".to_owned(),
+            content: serde_json::json!({"test": "context_usage_signals", "result": "passed"}),
+            interpretation: "The Context is safe for automatic retrieval".to_owned(),
+            limitations: vec!["Synthetic fixture".to_owned()],
+        }],
+    };
+    let revision = Event::context_revision_added(space_id, draft, None).unwrap();
+    let (context_id, revision_id) = match revision.payload() {
+        EventPayload::ContextRevisionAdded {
+            context_id,
+            revision,
+            ..
+        } => (*context_id, revision.revision_id),
+        _ => unreachable!(),
+    };
+    store.append_event(AppendRequest::event(revision)).unwrap();
+    let review = Event::context_reviewed(
+        space_id,
+        context_id,
+        ReviewDraft {
+            revision_id,
+            verdict: ReviewVerdict::Approve,
+            reason: "Verified fixture evidence".to_owned(),
+        },
+        None,
+    )
+    .unwrap();
+    let review_event_id = review.event_id();
+    store.append_event(AppendRequest::event(review)).unwrap();
+    store
+        .append_event(AppendRequest::event(
+            Event::publication_changed(
+                space_id,
+                context_id,
+                PublicationDraft {
+                    previous_publication_ids: Vec::new(),
+                    action: PublicationAction::Publish,
+                    revision_id,
+                    review_event_ids: vec![review_event_id],
+                },
+                None,
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    context_id
+}
+
+/// The analysis signal is the *relation*, not the neighbourhood the Context was retrieved from.
+///
+/// Both Contexts here live in one Space, both were injected into this Task, and the Candidate is
+/// recommended into that same Space. Only one of them stands in an assessed relation to the
+/// Candidate, and only that one is credited. This is why `unresolved_related` is excluded from the
+/// signal by construction: "retrieval found this nearby" is what injection already means, and
+/// crediting it would mark every analyzed injection reused and leave the prior saying nothing.
+#[test]
+fn an_injected_neighbour_the_analysis_never_relates_to_stays_an_omission() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("neighbour root");
+    let (space, related, _) = accepted_context(&root, REUSED_STATEMENT);
+    let neighbour = sibling_context(
+        &root,
+        space,
+        "the retention sweeper prunes archived snapshots older than ninety days",
+    );
+    let session = "usage-neighbour";
+
+    let injected = intent_update(&root, session)
+        .context
+        .items
+        .iter()
+        .map(|item| item.context.context_id)
+        .collect::<Vec<_>>();
+    assert!(
+        injected.contains(&related) && injected.contains(&neighbour),
+        "both Space members must reach this Task: {injected:?}"
+    );
+    assert!(!checkpoint(&root, session, REUSED_STATEMENT, &[]));
+
+    let analyzed = candidate_analyze_at_root(
+        &root,
+        &CandidateAnalyzeInput {
+            candidate_id: only_candidate(&root, session).to_string(),
+            token_budget: 8_192,
+            top_k: 8,
+        },
+    )
+    .unwrap();
+    let assessed = analyzed
+        .candidate
+        .analysis
+        .assessments
+        .iter()
+        .filter_map(|assessment| assessment.target.map(|target| target.context_id))
+        .collect::<Vec<_>>();
+    assert!(assessed.contains(&related), "{assessed:?}");
+    assert!(!assessed.contains(&neighbour), "{assessed:?}");
+
+    let runtime = TaskRuntime::initialize(&root).unwrap();
+    let totals = runtime.context_usage_totals(&[related, neighbour]).unwrap();
+    assert_eq!(
+        totals[&related],
+        ContextUsageTotals {
+            reused: 1,
+            ignored: 0,
+            refuted: 0,
+        }
+    );
+    assert_eq!(
+        totals[&neighbour],
+        ContextUsageTotals {
+            reused: 0,
+            ignored: 1,
+            refuted: 0,
+        },
+        "sharing a Space with a credited Context proves nothing about this one"
     );
 }

@@ -2226,37 +2226,66 @@ impl Runtime {
     }
 
     /// Records the injection outcome for every Claim this Episode carries.
+    ///
+    /// The Working Intent revisions of the authoring Task come along: an Agent that quotes an
+    /// injected Context into its own direction has demonstrably read and adopted it, whether or
+    /// not any single Claim repeats the identifier.
     fn record_episode_context_usage(&self, episode: &WorkEpisodeView) -> Result<()> {
         let claims = episode
             .checkpoints
             .iter()
             .flat_map(|checkpoint| checkpoint.claims.iter().cloned())
             .collect::<Vec<_>>();
-        if claims.is_empty() {
+        let intent_text = self
+            .tasks
+            .read_snapshot(episode.episode.task_session_id)?
+            .map(|task| {
+                task.intent_revisions
+                    .iter()
+                    .map(|revision| working_intent_text(&revision.working_intent))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        if claims.is_empty() && intent_text.is_empty() {
             return Ok(());
         }
-        self.record_checkpoint_context_usage(episode.episode.task_id, &claims)
+        self.record_checkpoint_context_usage(episode.episode.task_id, &claims, &intent_text)
     }
 
     /// Compares what this Task was given with what it actually built on.
     ///
-    /// A Context this Task received counts as `reused` when the Task's own Claims point back at
-    /// it: either a Claim names the `ContextId` in its statement or rationale, or a Claim's
-    /// server-derived Engineering References land on a coordinate that Context already referenced.
-    /// Everything else the Task was handed is `ignored`. Text similarity is deliberately not part
-    /// of the decision: a Claim that merely restates an injected Context is the *worst* kind of
-    /// reuse and is already collapsed as a duplicate, while the reuse worth rewarding produces a
-    /// new conclusion whose wording shares nothing with its input. The model fills in nothing:
-    /// both signals are derived from text and coordinates it wrote for its own purpose.
+    /// A Context this Task received counts as `reused` when the Task's own work points back at it.
+    /// Three of the four signals are decided here, all of them server-derived from text and
+    /// coordinates the Agent wrote for its own purpose:
+    ///
+    /// 1. a Claim names the `ContextId` in its statement or rationale;
+    /// 2. a Claim's server-derived Engineering References land on a coordinate that Context
+    ///    already referenced;
+    /// 3. any Working Intent revision of this Task names the `ContextId` in its own prose - an
+    ///    Agent that pastes an injected Context into its `current_direction` and then works from
+    ///    it has adopted that Context, even when no Claim repeats the identifier (session
+    ///    `01a06646` did exactly this and every injection was recorded as an omission).
+    ///
+    /// The fourth signal is the Candidate analysis assessment and arrives later; see
+    /// [`Runtime::record_analysis_context_usage`]. Everything the Task was handed and none of the
+    /// four signals touched is `ignored`.
+    ///
+    /// Text similarity is deliberately not part of the decision: a Claim that merely restates an
+    /// injected Context is the *worst* kind of reuse and is already collapsed as a duplicate,
+    /// while the reuse worth rewarding produces a new conclusion whose wording shares nothing with
+    /// its input.
     ///
     /// This runs during Candidate Build, after `derive_episode_claim_references` has placed the
     /// Claims' path spellings, because the Reference intersection needs those coordinates and the
-    /// ACK deliberately reads no index. Writing the same rows again is a no-op, so a Build rerun
-    /// and a Checkpoint replay both stay idempotent.
+    /// ACK deliberately reads no index. Writing the same rows again is a no-op and `ignored` never
+    /// overwrites a stored `reused`, so a Build rerun and a Checkpoint replay both stay idempotent
+    /// and neither can erase a later signal's verdict.
     fn record_checkpoint_context_usage(
         &self,
         task_id: TaskId,
         claims: &[CheckpointClaim],
+        intent_text: &str,
     ) -> Result<()> {
         let injections = self.tasks.read_task_injections(task_id)?;
         if injections.is_empty() {
@@ -2280,6 +2309,7 @@ impl Runtime {
                 let cited = claims.iter().any(|claim| {
                     claim.statement.contains(&named) || claim.rationale.contains(&named)
                 });
+                let carried_by_intent = intent_text.contains(&named);
                 let shares_reference =
                     injected_locators
                         .get(&injection.context_id)
@@ -2291,12 +2321,71 @@ impl Runtime {
                 ContextUsageRecord {
                     context_id: injection.context_id,
                     task_id,
-                    outcome: if cited || shares_reference {
+                    outcome: if cited || carried_by_intent || shares_reference {
                         ContextUsageOutcome::Reused
                     } else {
                         ContextUsageOutcome::Ignored
                     },
                 }
+            })
+            .collect::<Vec<_>>();
+        self.tasks.record_context_usage(&records)?;
+        Ok(())
+    }
+
+    /// Records the fourth reuse signal: the server's own Candidate analysis relating this Task's
+    /// Candidate to a Context the same Task was injected with.
+    ///
+    /// The analyzer compares the Candidate against the Knowledge Store and writes down what it
+    /// found - `supports`, `revises`, `exact_duplicate`, `potential_contradiction`. When the
+    /// Context on the other side of that relation is one this Task was handed, the server has
+    /// already proved to itself that the injection landed: the Task's conclusion stands in a
+    /// stated relationship to it. Session `3f862e48` is the case in point - the stored analysis
+    /// read `supports ctx_d9689ac4`, and the injection was nonetheless filed as an omission.
+    ///
+    /// `unresolved_related` is excluded on purpose: it asserts no relationship, only that the
+    /// target surfaced during retrieval, which is what injection already means. `novel` carries no
+    /// target at all.
+    ///
+    /// Timing: analysis runs *after* [`Runtime::record_checkpoint_context_usage`] - inside the
+    /// same Candidate Build, in the late `candidate_get` recovery path, and in an explicit
+    /// `candidate_analyze` - so this is a strict upgrade of rows that already exist. The store
+    /// only ever raises a `(context, task)` pair, so re-running analysis rewrites the same
+    /// `reused` row and a later Build rerun's `ignored` cannot pull it back down.
+    fn record_analysis_context_usage(
+        &self,
+        task_id: TaskId,
+        analysis: &CandidateAnalysis,
+    ) -> Result<()> {
+        let assessed = analysis
+            .assessments
+            .iter()
+            .filter(|assessment| {
+                matches!(
+                    assessment.relation,
+                    CandidateAssessmentRelation::Supports
+                        | CandidateAssessmentRelation::Revises
+                        | CandidateAssessmentRelation::ExactDuplicate
+                        | CandidateAssessmentRelation::PotentialContradiction
+                )
+            })
+            .filter_map(|assessment| assessment.target.map(|target| target.context_id))
+            .collect::<BTreeSet<_>>();
+        if assessed.is_empty() {
+            return Ok(());
+        }
+        let injected = self
+            .tasks
+            .read_task_injections(task_id)?
+            .into_iter()
+            .map(|injection| injection.context_id)
+            .collect::<BTreeSet<_>>();
+        let records = assessed
+            .intersection(&injected)
+            .map(|context_id| ContextUsageRecord {
+                context_id: *context_id,
+                task_id,
+                outcome: ContextUsageOutcome::Reused,
             })
             .collect::<Vec<_>>();
         self.tasks.record_context_usage(&records)?;
@@ -2842,6 +2931,11 @@ impl Runtime {
             status,
         )?;
         let view = self.tasks.replace_candidate_analysis(&candidate)?;
+        // Late reuse signal, recorded wherever an analysis is produced: Candidate Build's deferred
+        // pass, `candidate_analyze`, and the `candidate_get` recovery path all land here. Best
+        // effort, like every other usage record: a Candidate the analyzer could relate to a
+        // Context this Task was given must never be reported as an omission of that Context.
+        let _ = self.record_analysis_context_usage(task.task_id, &view.candidate.analysis);
         Ok(CandidateAnalyzeResponse {
             analysis_generation: view.analysis_generation,
             candidate: view.candidate,
@@ -5182,6 +5276,30 @@ fn candidate_builder_error_code(error: &Error) -> &'static str {
         ErrorKind::RepositoryNotConfigured => "repository_not_configured",
         _ => "candidate_write_failed",
     }
+}
+
+/// Every line of prose one Working Intent revision carries, joined for identifier scanning.
+///
+/// It exists to answer one question - did this Task write a `ContextId` down anywhere in its own
+/// direction - so it takes the whole snapshot rather than the fields `problem_view` selects. No
+/// meaning is read out of the result and the joiner is never parsed back.
+fn working_intent_text(intent: &WorkingIntentSnapshot) -> String {
+    let mut lines = vec![intent.goal.clone()];
+    lines.extend(intent.current_direction.clone());
+    for group in [
+        &intent.in_scope,
+        &intent.out_of_scope,
+        &intent.domains,
+        &intent.platforms,
+        &intent.constraints,
+        &intent.acceptance_conditions,
+        &intent.artifact_hints,
+        &intent.interface_hints,
+        &intent.open_questions,
+    ] {
+        lines.extend(group.iter().cloned());
+    }
+    lines.join("\n")
 }
 
 fn candidate_analysis_error_code(error: &Error) -> &'static str {
