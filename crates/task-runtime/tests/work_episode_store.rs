@@ -10,10 +10,10 @@ use sctx_domain::{
     CandidateAnalysisStatus, CandidateAssessmentPath, CandidateAssessmentRelation,
     CandidateBuilderProvenance, CandidateConfidence, CandidateId, CandidateRelationAssessment,
     CandidateReviewStatus, CheckpointEvidenceRef, CheckpointUnknown, ConfirmationId,
-    ContextCandidate, ContextId, ContextKind, ContextRevisionDraft, ErrorKind, EventId,
-    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, NormalizedWorkObservation, TaskId,
-    TaskSignal, TaskSignalKind, TestOutcomeStatus, WorkEpisodeStatus, WorkSourceRef,
-    WorkingIntentSnapshot,
+    ContextCandidate, ContextId, ContextKind, ContextRevisionDraft, DecisionSource, ErrorKind,
+    EventId, EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator,
+    NormalizedWorkObservation, TaskId, TaskSignal, TaskSignalKind, TestOutcomeStatus,
+    WorkEpisodeStatus, WorkSourceRef, WorkingIntentSnapshot,
 };
 use sctx_task_runtime::{
     AgentCheckpointSubmission, AgentCheckpointWrite, AutomatedEpisodeBoundary,
@@ -1283,6 +1283,7 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
 
     let discarded = runtime
         .discard_candidate_review(&CandidateReviewDiscard {
+            decision_source: DecisionSource::Human,
             locator: locator.clone(),
             expected_task_id: task.task_id,
             expected_intent_revision_id: task.current_intent_revision().unwrap().revision_id,
@@ -1295,6 +1296,7 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
     assert_eq!(discarded.record.review_version, 2);
     let idempotent = runtime
         .discard_candidate_review(&CandidateReviewDiscard {
+            decision_source: DecisionSource::Human,
             locator: locator.clone(),
             expected_task_id: task.task_id,
             expected_intent_revision_id: task.current_intent_revision().unwrap().revision_id,
@@ -1310,6 +1312,7 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
     assert_eq!(
         runtime
             .discard_candidate_review(&CandidateReviewDiscard {
+                decision_source: DecisionSource::Human,
                 locator: locator.clone(),
                 expected_task_id: task.task_id,
                 expected_intent_revision_id: task.current_intent_revision().unwrap().revision_id,
@@ -1496,6 +1499,7 @@ fn candidate_reviews_isolate_sessions_episodes_stale_and_reserved_confirmed_stat
     assert_eq!(
         runtime
             .discard_candidate_review(&CandidateReviewDiscard {
+                decision_source: DecisionSource::Human,
                 locator: first_locator.clone(),
                 expected_task_id: first.task_id,
                 expected_intent_revision_id: first.current_intent_revision().unwrap().revision_id,
@@ -1510,6 +1514,7 @@ fn candidate_reviews_isolate_sessions_episodes_stale_and_reserved_confirmed_stat
     assert_eq!(
         runtime
             .discard_candidate_review(&CandidateReviewDiscard {
+                decision_source: DecisionSource::Human,
                 locator: second_locator.clone(),
                 expected_task_id: second.task_id,
                 expected_intent_revision_id: second.current_intent_revision().unwrap().revision_id,
@@ -1538,6 +1543,7 @@ fn candidate_reviews_isolate_sessions_episodes_stale_and_reserved_confirmed_stat
     assert_eq!(
         runtime
             .discard_candidate_review(&CandidateReviewDiscard {
+                decision_source: DecisionSource::Human,
                 locator: first_locator.clone(),
                 expected_task_id: first.task_id,
                 expected_intent_revision_id: first.current_intent_revision().unwrap().revision_id,

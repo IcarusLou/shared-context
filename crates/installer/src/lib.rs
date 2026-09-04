@@ -797,6 +797,13 @@ impl Installer {
             knowledge_store: knowledge_store_source.clone(),
             configs: ownership,
             skills: skill_install.ownership,
+            // Re-resolved on every setup and upgrade so a changed Git identity is picked up, and
+            // never allowed to erase what a previous run already cached.
+            author: resolve_manifest_author().or_else(|| {
+                prior_manifest
+                    .as_ref()
+                    .and_then(|prior| prior.author.clone())
+            }),
         };
         let manifest_changed = write_manifest(transaction, &self.context.root, &manifest)?;
         self.fail(SetupStage::ManifestWritten)?;
@@ -1648,6 +1655,14 @@ struct InstallManifest {
     configs: Vec<OwnedConfig>,
     #[serde(default)]
     skills: Vec<OwnedSkill>,
+    /// Username portion of the global Git identity, cached at setup and upgrade.
+    ///
+    /// It is provenance for Candidate confirmations, not installation identity: `sctx` works
+    /// exactly the same without it, and a machine with no global Git identity simply leaves it
+    /// unset. Optional with `#[serde(default)]`, so a manifest written before this field existed
+    /// still reads back at `MANIFEST_VERSION` 1 — nothing about the manifest contract changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    author: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -3338,6 +3353,45 @@ fn read_manifest(root: &Path) -> Result<Option<InstallManifest>> {
 
 fn manifest_path(root: &Path) -> PathBuf {
     root.join("state/install-manifest.json")
+}
+
+/// How long the global Git identity lookup may take before setup stops waiting for it.
+const AUTHOR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Longest author this system will cache. An author is a username, not prose.
+const MAX_AUTHOR_CHARS: usize = 64;
+
+/// Resolves the username to record with this installation's Candidate confirmations.
+///
+/// Deliberately infallible: an installation with no global Git identity, or a `git` that does not
+/// answer promptly, is a perfectly good installation. It caches nothing and refuses nothing — it
+/// returns `None` and setup carries on.
+///
+/// Only the *global* identity is read. The knowledge repository's local config holds a fixed
+/// writer identity (`Shared Context Writer <shared-context@localhost>`) that identifies this
+/// software, not the person using it.
+fn resolve_manifest_author() -> Option<String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let output = Command::new("git")
+            .args(["config", "--global", "--get", "user.email"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .output();
+        let _ = sender.send(output);
+    });
+    let output = receiver.recv_timeout(AUTHOR_LOOKUP_TIMEOUT).ok()?.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let email = String::from_utf8(output.stdout).ok()?;
+    let email = email.trim();
+    let username = email.split_once('@').map_or(email, |(name, _)| name).trim();
+    (!username.is_empty()
+        && username.chars().count() <= MAX_AUTHOR_CHARS
+        && !username.chars().any(char::is_whitespace)
+        && !username.contains('@'))
+    .then(|| username.to_owned())
 }
 
 fn upsert_owned_config(

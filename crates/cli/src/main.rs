@@ -28,11 +28,11 @@ use sctx_agent_adapter::{
 use sctx_domain::{
     Applicability, CandidateReviewStatus, ConflictParticipant, ConflictResolutionDraft,
     ConflictResolutionResult, ContextGovernanceStatus, ContextId, ContextKind,
-    ContextRevisionDraft, DomainProjection, Error, ErrorKind, EvidenceSnapshotDraft, EvidenceType,
-    ExternalSessionLocator, IntentSnapshot, PublicationAction, PublicationDraft, RepositoryId,
-    ResolutionOutcome, Result, ReviewDraft, ReviewSummary, ReviewVerdict, RevisionId,
-    SemanticConflictDraft, SpaceId, TaskSessionSnapshot, TaskSignal, TaskSignalKind, WorkEpisodeId,
-    WorkEpisodeStatus,
+    ContextRevisionDraft, DecisionSource, DomainProjection, Error, ErrorKind,
+    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot, PublicationAction,
+    PublicationDraft, PublicationId, RepositoryId, ResolutionOutcome, Result, ReviewDraft,
+    ReviewSummary, ReviewVerdict, RevisionId, SemanticConflictDraft, SpaceId, TaskSessionSnapshot,
+    TaskSignal, TaskSignalKind, WorkEpisodeId, WorkEpisodeStatus,
 };
 use sctx_engineering_graph::{
     ARTIFACT_FOCUS_QUERY_BUDGET, ArtifactFocusOutcome, ArtifactFocusReader, MAX_ARTIFACT_FOCUS_HITS,
@@ -87,8 +87,9 @@ Commands:
   knowledge sync|delete
   embedding install|status|remove
   space create|intent revise|list|get
-  candidate list|get|discard|confirm|build-closed-episode|analyze
+  candidate list|get|discard|confirm|stats|build-closed-episode|analyze
   context revise|review|publish|withdraw|get
+  context withdraw --decision-source human|agent_policy [--external-session <ID>] [--dry-run]
   semantic conflict open|resolve
   task context|artifact-focus|checkpoint|intent update|signal supersede
   repository add|list|doctor|rename|scan
@@ -2919,6 +2920,7 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
                     candidate_id: candidate_id.clone(),
                     expected_review_version,
                     reason,
+                    decision_source: DecisionSource::Human,
                 };
                 let response = sctx_mcp::candidate_discard_at_root(installation_root()?, &input)?;
                 let metadata = Runtime::open()?.index.synchronize()?.metadata;
@@ -2938,6 +2940,7 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
                     candidate_ids,
                     expected_review_version,
                     reason,
+                    decision_source: DecisionSource::Human,
                 };
                 let response =
                     sctx_mcp::candidate_discard_batch_at_root(installation_root()?, &input)?;
@@ -3052,8 +3055,9 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
                 json_output,
             )
         }
+        [command, rest @ ..] if command == "stats" => run_candidate_stats(rest, json_output),
         _ => Err(invalid(format!(
-            "invalid candidate command; expected list|get|discard|confirm|build-closed-episode|analyze\n\n{CONTEXT_WRITE_HELP}"
+            "invalid candidate command; expected list|get|discard|confirm|stats|build-closed-episode|analyze\n\n{CONTEXT_WRITE_HELP}"
         ))),
     }
 }
@@ -3102,7 +3106,14 @@ fn run_context(args: &[String], json_output: bool) -> Result<()> {
             run_publication(rest, PublicationAction::Publish, json_output)
         }
         [command, rest @ ..] if command == "withdraw" => {
-            run_publication(rest, PublicationAction::Withdraw, json_output)
+            // One `withdraw` with two selectors. The single-Context form is unchanged; naming
+            // `--decision-source` switches to the batch form, which reverses a whole class of
+            // automatic acceptances at once — the reversal path ADR-0005 requires.
+            if rest.iter().any(|argument| argument == "--decision-source") {
+                run_withdraw_by_disposition(rest, json_output)
+            } else {
+                run_publication(rest, PublicationAction::Withdraw, json_output)
+            }
         }
         [command, rest @ ..] if command == "get" => {
             let options = Options::parse(rest, &[])?;
@@ -3289,6 +3300,179 @@ fn run_publication(args: &[String], action: PublicationAction, json_output: bool
                "batch_id": append.batch_id, "commit_oid": append.commit_oid}),
         json_output,
     )
+}
+
+const WITHDRAW_BY_DISPOSITION_HELP: &str = r"Usage:
+  sctx context withdraw --decision-source human|agent_policy
+      [--external-session <XSS_ID>] [--dry-run]
+
+Withdraws every accepted Context this installation confirmed under the given disposition.
+Each Context is withdrawn through the ordinary Publication event path, one append at a time:
+nothing already written is modified, and a Context whose current Publication Head no longer
+selects an accepted revision is reported as skipped rather than forced.
+
+The selector is answered from this machine's local runtime, which knows what this installation
+decided. A Context confirmed on another machine is not in it and is never touched.
+";
+
+/// Reverses a whole class of Candidate dispositions, one ordinary withdrawal at a time.
+///
+/// The Contexts are selected from the local Runtime, because `decision_source` is provenance this
+/// installation recorded about its own decisions. Each withdrawal is then an ordinary
+/// `context.publication_changed` append: the batch is a selector over an existing operation, not a
+/// new kind of write, so a partial failure leaves every already-withdrawn Context withdrawn and
+/// names the one that stopped it.
+fn run_withdraw_by_disposition(args: &[String], json_output: bool) -> Result<()> {
+    if is_help(args) {
+        print!("{WITHDRAW_BY_DISPOSITION_HELP}");
+        return Ok(());
+    }
+    let options = Options::parse(args, &["--dry-run"])?;
+    options.allow_only(&["--decision-source", "--external-session"], &["--dry-run"])?;
+    let decision_source = DecisionSource::parse(options.required("--decision-source")?)?;
+    let external_session_id = options
+        .optional("--external-session")?
+        .map(|value| parse_id(value, "ExternalSession ID"))
+        .transpose()?;
+    let dry_run = options.has("--dry-run");
+
+    let root = installation_root()?;
+    let tasks = TaskRuntime::initialize(&root)?;
+    let selected = tasks.list_confirmed_dispositions(Some(decision_source), external_session_id)?;
+    let runtime = Runtime::open_at(&root)?;
+    let snapshot = runtime.domain_snapshot()?;
+
+    let mut planned = Vec::new();
+    let mut skipped = Vec::new();
+    for disposition in &selected {
+        match locate_withdrawable(&snapshot.projection, disposition.result_context_id) {
+            Some(target) => planned.push(target),
+            None => skipped.push(json!({
+                "context_id": disposition.result_context_id,
+                "candidate_id": disposition.candidate_id,
+                "reason": "no accepted Publication Head selects a revision to withdraw; it is already withdrawn, unpublished, or in governance conflict",
+            })),
+        }
+    }
+
+    if dry_run {
+        return emit(
+            "context.withdraw.batch",
+            &snapshot.metadata,
+            json!({
+                "decision_source": decision_source.as_str(),
+                "dry_run": true,
+                "selected": selected.len(),
+                "planned": planned.iter().map(withdrawal_json).collect::<Vec<_>>(),
+                "skipped": skipped,
+            }),
+            json_output,
+        );
+    }
+
+    let mut withdrawn = Vec::new();
+    let mut metadata = snapshot.metadata;
+    for target in &planned {
+        let event = Event::publication_changed(
+            target.space_id,
+            target.context_id,
+            PublicationDraft {
+                previous_publication_ids: target.previous_publication_ids.clone(),
+                action: PublicationAction::Withdraw,
+                revision_id: target.revision_id,
+                review_event_ids: Vec::new(),
+            },
+            None,
+        )?;
+        let event_id = event.event_id();
+        let (append, appended) = runtime.append(event)?;
+        metadata = appended;
+        let mut entry = withdrawal_json(target);
+        entry["event_id"] = json!(event_id);
+        entry["batch_id"] = json!(append.batch_id);
+        entry["commit_oid"] = json!(append.commit_oid);
+        withdrawn.push(entry);
+    }
+    emit(
+        "context.withdraw.batch",
+        &metadata,
+        json!({
+            "decision_source": decision_source.as_str(),
+            "dry_run": false,
+            "selected": selected.len(),
+            "withdrawn": withdrawn,
+            "skipped": skipped,
+        }),
+        json_output,
+    )
+}
+
+/// One accepted Context resolved to everything an ordinary withdrawal needs.
+struct WithdrawalTarget {
+    space_id: SpaceId,
+    context_id: ContextId,
+    revision_id: RevisionId,
+    previous_publication_ids: Vec<PublicationId>,
+}
+
+fn withdrawal_json(target: &WithdrawalTarget) -> Value {
+    json!({
+        "space_id": target.space_id,
+        "context_id": target.context_id,
+        "revision_id": target.revision_id,
+    })
+}
+
+/// Finds the Space and revision one accepted Context would be withdrawn from.
+///
+/// Only an `Accepted` Context is a target. `Deprecated` is what a withdrawal already produced, so
+/// selecting it would append a second withdrawal of something already withdrawn and make re-running
+/// the selector grow history for no change; `Unpublished` and a governance conflict are exactly the
+/// cases the single-Context `withdraw` refuses, and a batch must not do quietly what the explicit
+/// command refuses to do at all. Anything skipped is reported, never silently dropped.
+fn locate_withdrawable(
+    projection: &DomainProjection,
+    context_id: ContextId,
+) -> Option<WithdrawalTarget> {
+    projection.spaces.iter().find_map(|(space_id, space)| {
+        let context = space.contexts.get(&context_id)?;
+        let ContextGovernanceStatus::Accepted { revision_id, .. } = context.governance else {
+            return None;
+        };
+        Some(WithdrawalTarget {
+            space_id: *space_id,
+            context_id,
+            revision_id,
+            previous_publication_ids: context.publication_heads.iter().copied().collect(),
+        })
+    })
+}
+
+/// Reports this installation's own disposition totals, grouped by who decided them.
+fn run_candidate_stats(args: &[String], json_output: bool) -> Result<()> {
+    if is_help(args) {
+        println!("Usage: sctx candidate stats");
+        return Ok(());
+    }
+    let options = Options::parse(args, &[])?;
+    options.allow_only(&[], &[])?;
+    let root = installation_root()?;
+    let stats = TaskRuntime::initialize(&root)?.candidate_disposition_stats()?;
+    let data = json!({
+        "human": {
+            "confirmed": stats.human.confirmed,
+            "discarded": stats.human.discarded,
+        },
+        "agent_policy": {
+            "confirmed": stats.agent_policy.confirmed,
+            "discarded": stats.agent_policy.discarded,
+        },
+        "auto_confirm_not_permitted": stats.auto_confirm_not_permitted,
+    });
+    // The counts are Runtime-only, but the envelope stays the one every `candidate` command
+    // shares, so a caller reads one shape across the group.
+    let metadata = Runtime::open_at(&root)?.index.synchronize()?.metadata;
+    emit("candidate.stats", &metadata, data, json_output)
 }
 
 fn run_semantic(args: &[String], json_output: bool) -> Result<()> {

@@ -19,8 +19,8 @@ use sctx_domain::{
     AgentCheckpoint, AgentCheckpointId, Applicability, ArtifactRef, AutomaticContextCandidate,
     CandidateBuildId, CandidateConfirmationPlan, CandidateId, CandidateReviewScope,
     CandidateReviewStatus, CheckpointClaim, CheckpointClaimId, CheckpointEvidenceRef,
-    CheckpointUnknown, ConfirmationId, ContextId, ContextKind, ContextRevisionRef, Error,
-    ErrorKind, EventId, EvidenceSnapshotDraft, EvidenceType, ExternalSessionId,
+    CheckpointUnknown, ConfirmationId, ContextId, ContextKind, ContextRevisionRef, DecisionSource,
+    Error, ErrorKind, EventId, EvidenceSnapshotDraft, EvidenceType, ExternalSessionId,
     ExternalSessionLocator, ExternalSessionSnapshot, IntentRevisionRange, NonLocatingSignalRef,
     NormalizedWorkObservation, ProposedSpaceGroupKey, Result, RevisionId, SignalId, SpaceId,
     SubmissionId, TaskId, TaskIntentRevision, TaskIntentRevisionId, TaskSessionId,
@@ -37,7 +37,7 @@ pub use reference_derivation::{
     ResolvedReference, claim_topic_key, derive_claim_references, unresolvable,
 };
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const HOOK_BUSY_TIMEOUT: Duration = Duration::from_millis(25);
 const MAX_EPISODE_LIST_LIMIT: usize = 256;
@@ -340,6 +340,9 @@ pub struct CandidateReviewDiscard {
     pub candidate_id: CandidateId,
     pub expected_review_version: u64,
     pub reason: String,
+    /// Who decided this discard. A discard writes no Git fact, so this is the only place it is
+    /// recorded at all.
+    pub decision_source: DecisionSource,
 }
 
 /// Exact idempotent result of one discard command.
@@ -354,6 +357,34 @@ pub enum CandidateReviewDiscardStatus {
 pub struct CandidateReviewDiscardOutcome {
     pub record: CandidateReviewRecord,
     pub status: CandidateReviewDiscardStatus,
+}
+
+/// Local disposition totals for one decision source.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DispositionCounts {
+    pub confirmed: usize,
+    pub discarded: usize,
+}
+
+/// Local disposition totals, grouped by who decided them.
+///
+/// These are Runtime counts of this installation's own decisions, not knowledge facts: a fresh
+/// checkout of the same repository reports zero.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CandidateDispositionStats {
+    pub human: DispositionCounts,
+    pub agent_policy: DispositionCounts,
+    /// Automatic confirmations the server refused with `auto_confirm_not_permitted`.
+    pub auto_confirm_not_permitted: usize,
+}
+
+/// One confirmed Candidate, with the provenance a batch revocation selects on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfirmedDisposition {
+    pub candidate_id: CandidateId,
+    pub result_context_id: ContextId,
+    pub decision_source: DecisionSource,
+    pub external_session_id: ExternalSessionId,
 }
 
 /// Runtime-only expiration report; Git knowledge is never changed.
@@ -394,6 +425,9 @@ pub struct CandidateConfirmationFinalize {
     pub operation_hash: String,
     pub confirmation_id: ConfirmationId,
     pub result_context_id: ContextId,
+    /// Who decided this confirmation. Recorded beside the Review so a batch revocation can find
+    /// every automatically accepted Context later; it changes no Confirmation identity.
+    pub decision_source: DecisionSource,
 }
 
 /// Result of finalizing Runtime after the Git fact closure is committed.
@@ -3342,12 +3376,14 @@ impl TaskRuntime {
         operation_hash: &str,
         confirmation_id: ConfirmationId,
         result_context_id: ContextId,
+        decision_source: DecisionSource,
     ) -> Result<CandidateConfirmationFinalizeOutcome> {
         self.finalize_candidate_confirmations(&[CandidateConfirmationFinalize {
             candidate_id,
             operation_hash: operation_hash.to_owned(),
             confirmation_id,
             result_context_id,
+            decision_source,
         }])?
         .pop()
         .ok_or_else(|| invariant("Candidate Confirmation finalize produced no outcome"))
@@ -3393,6 +3429,183 @@ impl TaskRuntime {
             .commit()
             .map_err(sql_error("commit Candidate Confirmation finalize"))?;
         Ok(outcomes)
+    }
+
+    /// Resolves this system's opaque `ExternalSession` identifier for one Agent locator.
+    ///
+    /// The `xss_` identifier is what disposition provenance records, not the Agent's own session
+    /// key: it is this system's own opaque id, it is stable across the Session, and it is the
+    /// selector `sctx context withdraw --external-session` accepts.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed validation, parse, or storage failures.
+    pub fn resolve_external_session_id(
+        &self,
+        locator: &ExternalSessionLocator,
+    ) -> Result<Option<ExternalSessionId>> {
+        locator.validate()?;
+        let connection = self.open_connection()?;
+        Ok(read_external_identity(&connection, locator)?
+            .map(|identity| identity.external_session_id))
+    }
+
+    /// Counts one automatic confirmation the server refused.
+    ///
+    /// The human reversal rate of automatic confirmations, and the rate at which the permission
+    /// surface refuses them, are the only inputs for widening or narrowing that surface, so the
+    /// refusal is counted rather than only returned. Best effort by construction: a failure to
+    /// record a refusal must never turn into a second failure on top of the refusal itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed clock or storage failures.
+    pub fn record_auto_confirm_rejection(
+        &self,
+        candidate_id: CandidateId,
+        external_session_id: Option<ExternalSessionId>,
+        error_code: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let now = i64::try_from(unix_seconds(SystemTime::now())?)
+            .map_err(|_| invalid("rejection timestamp exceeds SQLite range"))?;
+        let connection = self.open_connection()?;
+        connection
+            .execute(
+                "INSERT INTO auto_confirm_rejection (
+                    recorded_at_unix_seconds, candidate_id, external_session_id,
+                    error_code, reason
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    now,
+                    candidate_id.to_string(),
+                    external_session_id.map(|value| value.to_string()),
+                    error_code,
+                    bounded_rejection_reason(reason),
+                ],
+            )
+            .map_err(sql_error("record automatic confirmation rejection"))?;
+        Ok(())
+    }
+
+    /// Reports local disposition totals grouped by who decided them.
+    ///
+    /// Every Review decided before `decision_source` existed reads back as `human`: that is what
+    /// it was, since no other disposition could produce it.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed parse or storage failures.
+    pub fn candidate_disposition_stats(&self) -> Result<CandidateDispositionStats> {
+        let connection = self.open_connection()?;
+        let mut stats = CandidateDispositionStats::default();
+        let mut statement = connection
+            .prepare(
+                "SELECT status, COALESCE(decision_source, 'human'), COUNT(*)
+                 FROM candidate_review
+                 WHERE status IN ('confirmed', 'discarded')
+                 GROUP BY status, COALESCE(decision_source, 'human')",
+            )
+            .map_err(sql_error("prepare disposition totals"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(sql_error("query disposition totals"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error("read disposition totals"))?;
+        for (status, decision_source, count) in rows {
+            let count = usize::try_from(count).unwrap_or(0);
+            let bucket = match DecisionSource::parse(&decision_source)? {
+                DecisionSource::Human => &mut stats.human,
+                DecisionSource::AgentPolicy => &mut stats.agent_policy,
+            };
+            match status.as_str() {
+                "confirmed" => bucket.confirmed = bucket.confirmed.saturating_add(count),
+                "discarded" => bucket.discarded = bucket.discarded.saturating_add(count),
+                _ => {}
+            }
+        }
+        stats.auto_confirm_not_permitted = connection
+            .query_row(
+                "SELECT COUNT(*) FROM auto_confirm_rejection
+                 WHERE error_code = 'auto_confirm_not_permitted'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sql_error("read automatic confirmation rejections"))
+            .map(|count| usize::try_from(count).unwrap_or(0))?;
+        Ok(stats)
+    }
+
+    /// Lists every confirmed Candidate this installation decided under the given selector.
+    ///
+    /// It answers exactly the question batch revocation asks — "which accepted Contexts came out
+    /// of automatic confirmations, optionally from this one session" — and returns nothing else.
+    /// A `None` selector field is not a filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed parse or storage failures.
+    pub fn list_confirmed_dispositions(
+        &self,
+        decision_source: Option<DecisionSource>,
+        external_session_id: Option<ExternalSessionId>,
+    ) -> Result<Vec<ConfirmedDisposition>> {
+        let connection = self.open_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT review.candidate_id, review.result_context_id,
+                        COALESCE(review.decision_source, 'human'), task.external_session_id
+                 FROM candidate_review AS review
+                 JOIN task_session AS task ON task.task_id = review.task_id
+                 WHERE review.status = 'confirmed'
+                   AND review.result_context_id IS NOT NULL
+                   AND (?1 IS NULL OR COALESCE(review.decision_source, 'human') = ?1)
+                   AND (?2 IS NULL OR task.external_session_id = ?2)
+                 ORDER BY review.created_at_unix_seconds ASC, review.candidate_id ASC",
+            )
+            .map_err(sql_error("prepare confirmed disposition selector"))?;
+        let rows = statement
+            .query_map(
+                params![
+                    decision_source.map(DecisionSource::as_str),
+                    external_session_id.map(|value| value.to_string()),
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .map_err(sql_error("query confirmed dispositions"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error("read confirmed dispositions"))?;
+        rows.into_iter()
+            .map(
+                |(candidate_id, context_id, decision_source, external_session_id)| {
+                    Ok(ConfirmedDisposition {
+                        candidate_id: parse_id(&candidate_id, "candidate_review.candidate_id")?,
+                        result_context_id: parse_id(
+                            &context_id,
+                            "candidate_review.result_context_id",
+                        )?,
+                        decision_source: DecisionSource::parse(&decision_source)?,
+                        external_session_id: parse_id(
+                            &external_session_id,
+                            "task_session.external_session_id",
+                        )?,
+                    })
+                },
+            )
+            .collect()
     }
 
     /// Expires retained Pending/Discarded Reviews and removes only heavy Runtime analysis.
@@ -3978,7 +4191,11 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
         version = 15;
     }
     if version == 15 {
-        return migrate_schema_15_to_16(connection);
+        migrate_schema_15_to_16(connection)?;
+        version = 16;
+    }
+    if version == 16 {
+        return migrate_schema_16_to_17(connection);
     }
     if version != 0 && version != SCHEMA_VERSION {
         return Err(invariant(format!(
@@ -4243,6 +4460,9 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 expired_at_unix_seconds INTEGER,
                 confirmation_id TEXT,
                 result_context_id TEXT,
+                decision_source TEXT CHECK (
+                    decision_source IS NULL OR decision_source IN ('human', 'agent_policy')
+                ),
                 UNIQUE (build_id, claim_id),
                 CHECK (
                     (status = 'pending' AND discard_reason IS NULL
@@ -4340,7 +4560,19 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
             ) STRICT;
             CREATE INDEX IF NOT EXISTS hook_event_recorded_at
                 ON hook_event (recorded_at_unix_ms);
-            PRAGMA user_version = 16;",
+            CREATE TABLE IF NOT EXISTS auto_confirm_rejection (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at_unix_seconds INTEGER NOT NULL CHECK (
+                    recorded_at_unix_seconds >= 0
+                ),
+                candidate_id TEXT NOT NULL,
+                external_session_id TEXT,
+                error_code TEXT NOT NULL,
+                reason TEXT NOT NULL
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS auto_confirm_rejection_recorded_at
+                ON auto_confirm_rejection (recorded_at_unix_seconds);
+            PRAGMA user_version = 17;",
         )
         .map_err(sql_error("initialize task runtime schema"))
 }
@@ -4423,6 +4655,48 @@ fn migrate_schema_15_to_16(connection: &Connection) -> Result<()> {
         )
         .map_err(sql_error(
             "migrate task runtime schema from version 15 to 16",
+        ))
+}
+
+/// Adds disposition provenance to an existing schema version 16 installation and advances
+/// `user_version` to 17, in one transaction.
+///
+/// Two additive changes, no data rewritten: `candidate_review.decision_source` records who decided
+/// each confirmation or discard, and `auto_confirm_rejection` counts the automatic confirmations
+/// the server refused. Every row written before this version keeps `decision_source IS NULL`,
+/// which reads back as `human` — the only disposition that existed then.
+fn migrate_schema_16_to_17(connection: &Connection) -> Result<()> {
+    // `ADD COLUMN` has no `IF NOT EXISTS`, and every other statement in this chain is re-runnable.
+    // A database that already carries the column — a stamp rewound by hand, or a run interrupted
+    // between the two statements — must migrate, not hard-fail on a column it already has.
+    let add_column = if candidate_review_has_decision_source(connection)? {
+        ""
+    } else {
+        "ALTER TABLE candidate_review ADD COLUMN decision_source TEXT CHECK (
+            decision_source IS NULL OR decision_source IN ('human', 'agent_policy')
+        );"
+    };
+    connection
+        .execute_batch(&format!(
+            "BEGIN IMMEDIATE;
+            {add_column}
+            CREATE TABLE IF NOT EXISTS auto_confirm_rejection (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at_unix_seconds INTEGER NOT NULL CHECK (
+                    recorded_at_unix_seconds >= 0
+                ),
+                candidate_id TEXT NOT NULL,
+                external_session_id TEXT,
+                error_code TEXT NOT NULL,
+                reason TEXT NOT NULL
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS auto_confirm_rejection_recorded_at
+                ON auto_confirm_rejection (recorded_at_unix_seconds);
+            PRAGMA user_version = 17;
+            COMMIT;"
+        ))
+        .map_err(sql_error(
+            "migrate task runtime schema from version 16 to 17",
         ))
 }
 
@@ -6445,6 +6719,32 @@ fn find_active_signal(
         .transpose()
 }
 
+/// True when `candidate_review` already carries the version 17 provenance column.
+fn candidate_review_has_decision_source(connection: &Connection) -> Result<bool> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(candidate_review)")
+        .map_err(sql_error("inspect candidate_review columns"))?;
+    let present = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sql_error("query candidate_review columns"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error("read candidate_review columns"))?
+        .iter()
+        .any(|name| name == "decision_source");
+    Ok(present)
+}
+
+/// Upper bound on one stored refusal reason. The reason is a diagnostic, not the refusal itself.
+const MAX_REJECTION_REASON_CHARS: usize = 512;
+
+/// Truncates one refusal reason on a character boundary so the counter row stays bounded.
+fn bounded_rejection_reason(reason: &str) -> String {
+    match reason.char_indices().nth(MAX_REJECTION_REASON_CHARS) {
+        Some((index, _)) => reason[..index].to_owned(),
+        None => reason.to_owned(),
+    }
+}
+
 fn read_external_identity(
     connection: &Connection,
     locator: &ExternalSessionLocator,
@@ -6586,6 +6886,7 @@ fn finalize_one_candidate_confirmation(
         operation_hash,
         confirmation_id,
         result_context_id,
+        decision_source,
     } = request;
     let candidate_id = *candidate_id;
     let confirmation_id = *confirmation_id;
@@ -6630,7 +6931,7 @@ fn finalize_one_candidate_confirmation(
         .execute(
             "UPDATE candidate_review
                  SET status = 'confirmed', review_version = review_version + 1,
-                     confirmation_id = ?1, result_context_id = ?2
+                     confirmation_id = ?1, result_context_id = ?2, decision_source = ?5
                  WHERE candidate_id = ?3 AND status = 'pending' AND review_version = ?4",
             params![
                 confirmation_id.to_string(),
@@ -6638,6 +6939,7 @@ fn finalize_one_candidate_confirmation(
                 candidate_id.to_string(),
                 i64::try_from(operation.review_parent_version)
                     .map_err(|_| invalid("Candidate Review parent version exceeds SQLite range"))?,
+                decision_source.as_str(),
             ],
         )
         .map_err(sql_error("confirm Candidate Review"))?;
@@ -6725,7 +7027,8 @@ fn discard_one_candidate_review(
         .execute(
             "UPDATE candidate_review
              SET status = 'discarded', review_version = review_version + 1,
-                 discard_reason = ?1, discarded_at_unix_seconds = ?2
+                 discard_reason = ?1, discarded_at_unix_seconds = ?2,
+                 decision_source = ?5
              WHERE candidate_id = ?3 AND review_version = ?4 AND status = 'pending'",
             params![
                 reason,
@@ -6734,6 +7037,7 @@ fn discard_one_candidate_review(
                 request.candidate_id.to_string(),
                 i64::try_from(request.expected_review_version)
                     .map_err(|_| invalid("Candidate Review version exceeds SQLite range"))?,
+                request.decision_source.as_str(),
             ],
         )
         .map_err(sql_error("discard Candidate Review"))?;

@@ -10,9 +10,10 @@ use std::{
 
 use sctx_domain::{
     Applicability, ArtifactKind, ArtifactLocator, ContextId, ContextKind, ContextRevisionDraft,
-    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot, PublicationAction,
-    PublicationDraft, ReferenceRelation, RepoRelativePath, RepositoryId, ReviewDraft,
-    ReviewVerdict, RevisionId, TaskId, TaskSignal, TaskSignalKind, WorkingIntentSnapshot,
+    DecisionSource, EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot,
+    PublicationAction, PublicationDraft, ReferenceRelation, RepoRelativePath, RepositoryId,
+    ReviewDraft, ReviewVerdict, RevisionId, TaskId, TaskSignal, TaskSignalKind,
+    WorkingIntentSnapshot,
 };
 use sctx_engineering_graph::EngineeringProjectionStore;
 use sctx_event_schema::{Event, EventPayload};
@@ -1918,6 +1919,7 @@ fn a_confirmation_that_names_engineering_references_rescans_within_its_budget() 
     let confirmed = sctx_mcp::candidate_confirm_at_root(
         &root,
         &sctx_mcp::CandidateConfirmInput {
+            decision_source: DecisionSource::Human,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             expected_task_id: task.context.task_id.to_string(),
@@ -2035,6 +2037,7 @@ fn confirm_next_candidate(
     sctx_mcp::candidate_confirm_at_root(
         root,
         &sctx_mcp::CandidateConfirmInput {
+            decision_source: DecisionSource::Human,
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
             expected_task_id: task.context.task_id.to_string(),

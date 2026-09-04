@@ -14,8 +14,8 @@ use sctx_domain::{
     candidate_submission_content_hash, reduce,
 };
 use sctx_event_schema::{
-    ContextSpaceAssociationOrigin, Event, EventPayload, EventType, ParsedEvent, V1_JSON_SCHEMA,
-    candidate_submission_hint, parse_event,
+    ConfirmationProvenance, ContextSpaceAssociationOrigin, Event, EventPayload, EventType,
+    ParsedEvent, V1_JSON_SCHEMA, candidate_submission_hint, parse_event,
 };
 use sctx_local_state::{PrivacyScan, PrivacyScanner, UserConfigStore};
 use serde::Serialize;
@@ -1103,8 +1103,24 @@ impl GitStore {
         &self,
         plan: &CandidateConfirmationPlan,
     ) -> Result<CandidateConfirmationOutcome> {
+        self.confirm_candidate_with_provenance(plan, &ConfirmationProvenance::human())
+    }
+
+    /// Appends one reserved Candidate Confirmation, recording who decided it.
+    ///
+    /// Identical to [`Self::confirm_candidate`] in every written fact; the provenance reaches only
+    /// the `candidate.confirmed` event's `annotations` and no hash a replay compares.
+    ///
+    /// # Errors
+    ///
+    /// Same failures as [`Self::confirm_candidate`].
+    pub fn confirm_candidate_with_provenance(
+        &self,
+        plan: &CandidateConfirmationPlan,
+        provenance: &ConfirmationProvenance,
+    ) -> Result<CandidateConfirmationOutcome> {
         let write = self
-            .confirm_candidate_plans(std::slice::from_ref(plan))
+            .confirm_candidate_plans(std::slice::from_ref(plan), provenance)
             .map_err(ConfirmationBatchFailure::into_error)?;
         let entry = write
             .entries
@@ -1137,7 +1153,22 @@ impl GitStore {
         &self,
         plans: &[CandidateConfirmationPlan],
     ) -> Result<CandidateConfirmationBatchWrite> {
-        self.confirm_candidate_plans(plans)
+        self.confirm_candidates_with_provenance(plans, &ConfirmationProvenance::human())
+    }
+
+    /// Appends several reserved Candidate Confirmations, recording who decided them.
+    ///
+    /// One batch is one disposition decision, so one provenance covers every plan in it.
+    ///
+    /// # Errors
+    ///
+    /// Same failures as [`Self::confirm_candidates`].
+    pub fn confirm_candidates_with_provenance(
+        &self,
+        plans: &[CandidateConfirmationPlan],
+        provenance: &ConfirmationProvenance,
+    ) -> Result<CandidateConfirmationBatchWrite> {
+        self.confirm_candidate_plans(plans, provenance)
             .map_err(ConfirmationBatchFailure::into_labeled_error)
     }
 
@@ -1145,6 +1176,7 @@ impl GitStore {
     fn confirm_candidate_plans(
         &self,
         plans: &[CandidateConfirmationPlan],
+        provenance: &ConfirmationProvenance,
     ) -> std::result::Result<CandidateConfirmationBatchWrite, ConfirmationBatchFailure> {
         use ConfirmationBatchFailure as Failure;
 
@@ -1187,7 +1219,7 @@ impl GitStore {
         lock.lock_exclusive()
             .map_err(io_error("lock candidate-confirmation.lock"))
             .map_err(Failure::Batch)?;
-        let write = self.confirm_candidate_plans_locked(plans, &identities)?;
+        let write = self.confirm_candidate_plans_locked(plans, &identities, provenance)?;
         FileExt::unlock(&lock)
             .map_err(io_error("unlock candidate-confirmation.lock"))
             .map_err(Failure::Batch)?;
@@ -1199,6 +1231,7 @@ impl GitStore {
         &self,
         plans: &[CandidateConfirmationPlan],
         identities: &[(CandidateId, String, String)],
+        provenance: &ConfirmationProvenance,
     ) -> std::result::Result<CandidateConfirmationBatchWrite, ConfirmationBatchFailure> {
         use ConfirmationBatchFailure as Failure;
 
@@ -1212,7 +1245,7 @@ impl GitStore {
             return replayed_confirmation_batch(identities, existing);
         }
 
-        let (events, payloads) = confirmation_batch_events(plans, &unwritten)?;
+        let (events, payloads) = confirmation_batch_events(plans, &unwritten, provenance)?;
         let journal = self
             .prepare_internal_event_batch(&events, &payloads, BatchId::new())
             .map_err(Failure::Batch)?;
@@ -2576,6 +2609,7 @@ fn serialize_internal_events(events: &[Event]) -> Result<Vec<Vec<u8>>> {
 fn confirmation_batch_events(
     plans: &[CandidateConfirmationPlan],
     selected: &[usize],
+    provenance: &ConfirmationProvenance,
 ) -> std::result::Result<(Vec<Event>, Vec<Vec<u8>>), ConfirmationBatchFailure> {
     use ConfirmationBatchFailure as Failure;
 
@@ -2590,8 +2624,9 @@ fn confirmation_batch_events(
         let candidate_id = plan.operation.candidate_id;
         // Each plan keeps its own Writer batch so the Confirmation index still maps a Candidate to
         // exactly its own fact closure, even though one Git commit carries the whole slice.
-        let plan_events = Event::from_candidate_confirmation_plan(plan, BatchId::new().as_str())
-            .map_err(|error| Failure::plan(*position, candidate_id, error))?;
+        let plan_events =
+            Event::from_candidate_confirmation_plan(plan, BatchId::new().as_str(), provenance)
+                .map_err(|error| Failure::plan(*position, candidate_id, error))?;
         if plan_events.len() != plan.expected_event_count() {
             return Err(Failure::plan(
                 *position,

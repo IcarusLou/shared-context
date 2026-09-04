@@ -13,8 +13,10 @@ use std::{
     fmt, fs,
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
+    process::Command,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock, mpsc},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -29,7 +31,7 @@ use sctx_domain::{
     CandidateSpaceRecommendation, CandidateSpaceRecommendationPath, CheckpointClaim,
     CheckpointClaimId, CheckpointEvidenceRef, CheckpointUnknown, ConflictParticipant,
     ContextGovernanceStatus, ContextId, ContextKind, ContextRelation, ContextRelationKind,
-    ContextRevisionDraft, EngineeringReferenceDraft, Error, ErrorKind, EventId,
+    ContextRevisionDraft, DecisionSource, EngineeringReferenceDraft, Error, ErrorKind, EventId,
     EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot,
     NormalizedWorkObservation, OptionalCandidateEdits, ProblemViewEdit, ProposedSpaceGroupKey,
     REPOSITORY_ID_MAX_BYTES, REPOSITORY_ID_PATTERN, RecommendedSpaceRole, ReferenceId,
@@ -48,7 +50,7 @@ use sctx_engineering_graph::{
     RepositoryScanOutcome, RepositoryScanPlan, RepositoryScanner, ResolvedReferenceProjection,
     SkippedFileReason, build_graph_context_snapshots, find_relocation_candidate, relocatable_path,
 };
-use sctx_event_schema::{Event, EventPayload};
+use sctx_event_schema::{ConfirmationProvenance, Event, EventPayload};
 use sctx_git_store::{
     AppendBatchOutcome, AppendRequest, CandidateConfirmationWriteStatus,
     CandidateSubmissionRequest, CandidateSubmissionStatus, GitStore,
@@ -372,6 +374,10 @@ pub struct CandidateDiscardInput {
     pub candidate_id: String,
     pub expected_review_version: u64,
     pub reason: String,
+    /// Who decided this discard. Omitting it means `human`, which is what every client that
+    /// predates the field sends and what every discard written before it recorded.
+    #[serde(default)]
+    pub decision_source: DecisionSource,
 }
 
 /// Why a whole Review Summary was omitted from one bounded page.
@@ -792,6 +798,10 @@ pub struct CandidateConfirmInput {
     pub related_space_ids: Vec<String>,
     #[serde(default)]
     pub edits: OptionalCandidateEdits,
+    /// Who decided this confirmation. `agent_policy` is accepted only inside the permission
+    /// surface the server itself verifies; omitting the field means `human` and changes nothing.
+    #[serde(default)]
+    pub decision_source: DecisionSource,
 }
 
 /// Strict explicit human confirmation of several owned Pending Candidates.
@@ -809,6 +819,10 @@ pub struct CandidateConfirmBatchInput {
     pub expected_review_version: u64,
     pub primary: CandidateConfirmPrimaryInput,
     pub related_space_ids: Vec<String>,
+    /// Who decided this batch. One batch is one decision, so it carries one source; under
+    /// `agent_policy` a single member outside the permission surface rejects the whole batch.
+    #[serde(default)]
+    pub decision_source: DecisionSource,
 }
 
 /// Batch discard request; the Review version and reason apply to every listed Candidate.
@@ -822,6 +836,9 @@ pub struct CandidateDiscardBatchInput {
     pub candidate_ids: Vec<String>,
     pub expected_review_version: u64,
     pub reason: String,
+    /// Who decided this batch discard; omitting it means `human`.
+    #[serde(default)]
+    pub decision_source: DecisionSource,
 }
 
 /// Either public shape accepted by `candidate_confirm`.
@@ -3093,6 +3110,7 @@ impl Runtime {
                 candidate_id: parse_id_value(&input.candidate_id, "candidate_id")?,
                 expected_review_version: input.expected_review_version,
                 reason: input.reason.clone(),
+                decision_source: input.decision_source,
             })?;
         let snapshot = self.snapshot()?;
         let review = self.candidate_review_view(&outcome.record, &snapshot)?;
@@ -3136,6 +3154,7 @@ impl Runtime {
                 candidate_id,
                 expected_review_version: input.expected_review_version,
                 reason: input.reason.clone(),
+                decision_source: input.decision_source,
             })
             .collect::<Vec<_>>();
         let outcomes = self.tasks.discard_candidate_reviews(&requests)?;
@@ -3166,20 +3185,27 @@ impl Runtime {
         )?;
         let candidate_id = parse_id_value(&input.candidate_id, "candidate_id")?;
         let snapshot = self.snapshot()?;
-        let prepared = self.prepare_candidate_confirmation(
-            &snapshot,
-            &locator,
-            candidate_id,
-            input.expected_review_version,
-            &input.primary,
-            &input.related_space_ids,
-            &input.edits,
-        )?;
+        let provenance = self.confirmation_provenance(&locator, input.decision_source);
+        let prepared = self
+            .prepare_candidate_confirmation(
+                &snapshot,
+                &locator,
+                candidate_id,
+                input.expected_review_version,
+                &input.primary,
+                &input.related_space_ids,
+                &input.edits,
+                input.decision_source,
+            )
+            .inspect_err(|error| {
+                self.record_auto_confirm_rejection(&provenance, candidate_id, error);
+            })?;
         self.commit_candidate_confirmation(
             &locator,
             expected_task_id,
             expected_intent_revision_id,
             prepared,
+            &provenance,
         )
     }
 
@@ -3205,7 +3231,10 @@ impl Runtime {
             ));
         }
         let snapshot = self.snapshot()?;
+        let provenance = self.confirmation_provenance(&locator, input.decision_source);
         let mut prepared = Vec::with_capacity(candidate_ids.len());
+        // Every member is validated against the permission surface before the first reservation,
+        // so an automatic batch with one member outside it writes nothing and names that member.
         for (position, candidate_id) in candidate_ids.iter().enumerate() {
             prepared.push(
                 self.prepare_candidate_confirmation(
@@ -3216,7 +3245,11 @@ impl Runtime {
                     &input.primary,
                     &input.related_space_ids,
                     &OptionalCandidateEdits::default(),
+                    input.decision_source,
                 )
+                .inspect_err(|error| {
+                    self.record_auto_confirm_rejection(&provenance, *candidate_id, error);
+                })
                 .map_err(|error| batch_preparation_error(position, *candidate_id, &error))?,
             );
         }
@@ -3239,7 +3272,9 @@ impl Runtime {
             .iter()
             .map(|reserved| reserved.plan.clone())
             .collect::<Vec<_>>();
-        let write = self.store()?.confirm_candidates(&plans)?;
+        let write = self
+            .store()?
+            .confirm_candidates_with_provenance(&plans, &provenance)?;
         let finalized = self.tasks.finalize_candidate_confirmations(
             &write
                 .entries
@@ -3249,6 +3284,7 @@ impl Runtime {
                     operation_hash: entry.record.operation_hash.clone(),
                     confirmation_id: entry.record.confirmation_id,
                     result_context_id: entry.record.result_context_id,
+                    decision_source: input.decision_source,
                 })
                 .collect::<Vec<_>>(),
         )?;
@@ -3287,6 +3323,7 @@ impl Runtime {
         primary: &CandidateConfirmPrimaryInput,
         related_space_ids: &[String],
         edits: &OptionalCandidateEdits,
+        decision_source: DecisionSource,
     ) -> Result<PreparedCandidateConfirmation> {
         let review_record = self
             .tasks
@@ -3312,6 +3349,12 @@ impl Runtime {
             return Err(invalid(
                 "Candidate Confirmation requires complete current analysis and reviewable Evidence",
             ));
+        }
+        // The server-enforced surface for an Agent-decided confirmation, checked before any
+        // reservation and against derived values only. A human confirmation reaches none of this,
+        // so its behavior is unchanged in every byte.
+        if decision_source == DecisionSource::AgentPolicy {
+            require_auto_confirm_permitted(&review, edits)?;
         }
         let (primary_reference, resolved_primary, primary_space_id, proposed_space_group_key) =
             match primary {
@@ -3507,6 +3550,57 @@ impl Runtime {
         })
     }
 
+    /// Assembles the provenance one Candidate Confirmation is written with.
+    ///
+    /// Nothing here can fail the confirmation: an author this installation cannot resolve and an
+    /// `ExternalSession` identifier this Runtime cannot look up are both simply omitted. Recording
+    /// who confirmed is worth having, and it is never worth refusing a decision over.
+    fn confirmation_provenance(
+        &self,
+        locator: &ExternalSessionLocator,
+        decision_source: DecisionSource,
+    ) -> ConfirmationProvenance {
+        ConfirmationProvenance {
+            decision_source,
+            author: resolve_author(&self.root),
+            external_session_id: self
+                .tasks
+                .resolve_external_session_id(locator)
+                .ok()
+                .flatten()
+                .map(|value| value.to_string()),
+        }
+    }
+
+    /// Counts one refused automatic confirmation, and only that.
+    ///
+    /// A human confirmation that fails validation is an ordinary rejected request and is not
+    /// counted here; neither is an automatic confirmation refused for some other reason. Failing
+    /// to write the counter is deliberately silent: the caller is already returning a refusal, and
+    /// replacing it with a storage error would hide the reason it was refused.
+    fn record_auto_confirm_rejection(
+        &self,
+        provenance: &ConfirmationProvenance,
+        candidate_id: sctx_domain::CandidateId,
+        error: &Error,
+    ) {
+        if provenance.decision_source != DecisionSource::AgentPolicy
+            || !error.message().starts_with(AUTO_CONFIRM_NOT_PERMITTED)
+        {
+            return;
+        }
+        let external_session_id = provenance
+            .external_session_id
+            .as_deref()
+            .and_then(|value| value.parse().ok());
+        let _ = self.tasks.record_auto_confirm_rejection(
+            candidate_id,
+            external_session_id,
+            "auto_confirm_not_permitted",
+            error.message(),
+        );
+    }
+
     /// Reserves, writes and finalizes one already validated Candidate Confirmation.
     fn commit_candidate_confirmation(
         &self,
@@ -3514,6 +3608,7 @@ impl Runtime {
         expected_task_id: TaskId,
         expected_intent_revision_id: TaskIntentRevisionId,
         prepared: PreparedCandidateConfirmation,
+        provenance: &ConfirmationProvenance,
     ) -> Result<CandidateConfirmResponse> {
         let reserved = self.reserve_candidate_confirmation(
             locator,
@@ -3521,12 +3616,15 @@ impl Runtime {
             expected_intent_revision_id,
             prepared,
         )?;
-        let write = self.store()?.confirm_candidate(&reserved.plan)?;
+        let write = self
+            .store()?
+            .confirm_candidate_with_provenance(&reserved.plan, provenance)?;
         let finalized = self.tasks.finalize_candidate_confirmation(
             reserved.candidate_id,
             &reserved.plan.operation_hash,
             write.record.confirmation_id,
             write.record.result_context_id,
+            provenance.decision_source,
         )?;
         let written = vec![WrittenCandidateConfirmation {
             append: write.append,
@@ -5486,6 +5584,173 @@ fn parse_batch_candidate_ids(values: &[String]) -> Result<Vec<sctx_domain::Candi
 const EXACT_DUPLICATE_REQUIRES_DECISION: &str =
     "This Candidate restates the accepted Context it was assessed against,";
 
+/// Opening of every refusal of an automatic Candidate confirmation.
+///
+/// Matched as a prefix to give the refusal its own error code, the same way
+/// [`EXACT_DUPLICATE_REQUIRES_DECISION`] is: nothing about the arguments is malformed, so
+/// `candidate_review_invalid` would send a client to repair a request that has no defect. What
+/// the request lacks is permission, and the repair is a human.
+const AUTO_CONFIRM_NOT_PERMITTED: &str =
+    "Automatic confirmation is not permitted for this Candidate:";
+
+/// Closing of every automatic-confirmation refusal. It names the one way forward.
+const AUTO_CONFIRM_ESCALATION: &str = "Present this Candidate to the user for review instead, and \
+     confirm it without decision_source (or with decision_source human) once they have decided.";
+
+/// The whole permission surface an automatic Candidate confirmation is allowed inside.
+///
+/// Every condition is read from a value the server itself derived for this exact Review — the
+/// same `ready_for_review` and `candidate_status` a reviewer would have been shown, and the same
+/// `top_assessment` selection `compact_candidate_review` makes — so an Agent can never widen the
+/// surface by asserting something about its own request. A Candidate outside it is not downgraded
+/// to a human confirmation silently: it is refused, and the refusal names the condition it failed.
+///
+/// Both Primary shapes are permitted. An existing Space and a Space recommendation the server
+/// produced are both server-owned choices; what stays a human decision is Space governance beyond
+/// them, and no `candidate_confirm` argument can express that.
+fn require_auto_confirm_permitted(
+    review: &CandidateReviewView,
+    edits: &OptionalCandidateEdits,
+) -> Result<()> {
+    let top_relation = review
+        .analysis
+        .assessments
+        .iter()
+        .max_by_key(|assessment| assessment.confidence.basis_points)
+        .map(|assessment| assessment.relation);
+    let violation = if !review.ready_for_review {
+        Some("its Review is not ready_for_review".to_owned())
+    } else if review.candidate_status != AutomaticCandidateStatus::ReadyForReview {
+        Some(format!(
+            "its candidate_status is {} rather than ready_for_review, so it needs a human \
+             judgement about Space organization, duplication, or contradiction",
+            snake_case_name(&review.candidate_status)
+        ))
+    } else if !edits.is_empty() {
+        Some(
+            "the request carries edits, and rewriting a Candidate's content is a human decision"
+                .to_owned(),
+        )
+    } else {
+        match top_relation {
+            Some(CandidateAssessmentRelation::Novel | CandidateAssessmentRelation::Supports) => {
+                None
+            }
+            Some(relation) => Some(format!(
+                "its top assessment relation is {}, and only novel or supports may be confirmed \
+                 automatically",
+                snake_case_name(&relation)
+            )),
+            None => Some(
+                "its analysis produced no assessment, so no relation could be verified".to_owned(),
+            ),
+        }
+    };
+    match violation {
+        None => Ok(()),
+        Some(violation) => Err(invalid(format!(
+            "{AUTO_CONFIRM_NOT_PERMITTED} {violation}. {AUTO_CONFIRM_ESCALATION}"
+        ))),
+    }
+}
+
+/// Longest author this system will record. An author is a username, not prose.
+const MAX_AUTHOR_CHARS: usize = 64;
+
+/// How long the global Git identity lookup is allowed to take before it is abandoned.
+///
+/// `git config --global --get user.email` reads one file and returns, but a confirmation must
+/// never be held up by a Git invocation that misbehaves on somebody's machine, so the lookup is
+/// bounded and a timeout simply means no author.
+const GIT_AUTHOR_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Process-lifetime author cache, keyed by installation root.
+///
+/// Resolving the author costs a file read and possibly a child process. A confirmation is a hot
+/// enough path — and a batch confirmation runs it once for many Candidates — that paying either
+/// cost per call is not worth it, and the answer cannot change inside one process in any way that
+/// matters. It is keyed by root so two installations in one process do not borrow each other's.
+static AUTHOR_CACHE: OnceLock<Mutex<BTreeMap<PathBuf, Option<String>>>> = OnceLock::new();
+
+/// Resolves the author to record with this installation's confirmations, once per process.
+///
+/// The install manifest wins: `sctx setup` and `sctx upgrade` already resolved the identity and
+/// wrote it down, so the steady state costs one small file read. Falling back to the live global
+/// Git identity covers an installation that predates the manifest field.
+///
+/// The knowledge repository's own local Git config is deliberately never consulted. It is written
+/// as a fixed writer identity (`Shared Context Writer <shared-context@localhost>`), so reading it
+/// would record that literal string as every user's author.
+fn resolve_author(root: &Path) -> Option<String> {
+    let cache = AUTHOR_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(entries) = cache.lock()
+        && let Some(cached) = entries.get(root)
+    {
+        return cached.clone();
+    }
+    let resolved = manifest_author(root).or_else(global_git_author);
+    if let Ok(mut entries) = cache.lock() {
+        entries.insert(root.to_path_buf(), resolved.clone());
+    }
+    resolved
+}
+
+/// Reads the author the installer cached, without depending on the installer's manifest type.
+///
+/// The manifest is read as plain JSON on purpose: `sctx-installer` depends on this crate, so the
+/// dependency cannot point the other way, and one optional string needs no shared type.
+fn manifest_author(root: &Path) -> Option<String> {
+    let bytes = fs::read(root.join("state/install-manifest.json")).ok()?;
+    let manifest: Value = serde_json::from_slice(&bytes).ok()?;
+    sanitized_author(manifest.get("author")?.as_str()?)
+}
+
+/// Reads the username portion of the global Git identity, under a bounded wait.
+fn global_git_author() -> Option<String> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let output = Command::new("git")
+            .args(["config", "--global", "--get", "user.email"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output();
+        let _ = sender.send(output);
+    });
+    let output = receiver.recv_timeout(GIT_AUTHOR_TIMEOUT).ok()?.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let email = String::from_utf8(output.stdout).ok()?;
+    author_from_email(&email)
+}
+
+/// Takes the username portion of one email address.
+///
+/// The address itself is never recorded: a bare username is not personal contact information, and
+/// it is all the reversal-rate question needs to attribute a confirmation.
+fn author_from_email(email: &str) -> Option<String> {
+    let email = email.trim();
+    let username = email.split_once('@').map_or(email, |(name, _)| name);
+    sanitized_author(username)
+}
+
+/// Accepts one author value only if it is a plausible bounded username.
+fn sanitized_author(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.chars().count() <= MAX_AUTHOR_CHARS
+        && !value.chars().any(char::is_whitespace)
+        && !value.contains('@'))
+    .then(|| value.to_owned())
+}
+
+/// Renders one `snake_case`-serialized domain enum by its exact wire name.
+fn snake_case_name<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
 /// The Context an `exact_duplicate` top assessment points at, when it is still accepted.
 ///
 /// Only the strongest assessment is read, selected exactly as `compact_candidate_review` selects
@@ -6860,6 +7125,9 @@ impl ToolFailure {
             {
                 "exact_duplicate_requires_decision"
             }
+            ErrorKind::InvalidInput if error.message().starts_with(AUTO_CONFIRM_NOT_PERMITTED) => {
+                "auto_confirm_not_permitted"
+            }
             ErrorKind::InvalidInput => "candidate_review_invalid",
             ErrorKind::InvariantViolation => "candidate_review_invariant",
             ErrorKind::Io => "candidate_review_storage_failed",
@@ -8098,8 +8366,24 @@ fn candidate_discard_schema() -> Value {
                 "description": "Send exactly one of candidate_id or candidate_ids; the batch form discards every listed Candidate atomically under the same Review version and reason."
             },
             "expected_review_version": {"type": "integer", "minimum": 1},
-            "reason": {"type": "string", "minLength": 1, "maxLength": 512}
+            "reason": {"type": "string", "minLength": 1, "maxLength": 512},
+            "decision_source": decision_source_schema(
+                "Who decided this discard. Defaults to human when omitted. Use agent_policy only \
+                 for a discard you made yourself without asking the user."
+            )
         }
+    })
+}
+
+/// Declares the optional provenance field shared by both Candidate disposition tools.
+///
+/// A plain string `enum` rather than a union: the public schema avoids `oneOf`/`anyOf` because at
+/// least one host renders those as an untyped map.
+fn decision_source_schema(description: &str) -> Value {
+    json!({
+        "type": "string",
+        "enum": ["human", "agent_policy"],
+        "description": description
     })
 }
 
@@ -8142,7 +8426,15 @@ fn candidate_confirm_schema() -> Value {
                 "type": "array", "uniqueItems": true,
                 "items": id_schema("spc_")
             },
-            "edits": candidate_edits_schema()
+            "edits": candidate_edits_schema(),
+            "decision_source": decision_source_schema(
+                "Who decided this confirmation. Defaults to human when omitted. agent_policy \
+                 declares that you confirmed it yourself without asking the user, and the server \
+                 accepts it only when the Review is ready_for_review with candidate_status \
+                 ready_for_review, the top assessment relation is novel or supports, and the \
+                 request carries no edits; anything else is refused as auto_confirm_not_permitted \
+                 and belongs in front of the user."
+            )
         }
     })
 }

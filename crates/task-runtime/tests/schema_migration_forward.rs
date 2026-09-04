@@ -1,7 +1,9 @@
 //! `TaskRuntime` in-place schema upgrades. Version 13 -> 14 is additive (`hook_event`) and must
 //! touch no pre-existing row; version 14 -> 15 discards `context_usage` and must touch nothing
-//! else; version 15 -> 16 discards the recorded omissions only and keeps every proof. The three
-//! chain, so a version 13 database reopened today lands on the current version.
+//! else; version 15 -> 16 discards the recorded omissions only and keeps every proof; version
+//! 16 -> 17 is additive again (disposition provenance) and must leave every decided Review
+//! readable as the human decision it was. The four chain, so a version 13 database reopened today
+//! lands on the current version.
 //!
 //! There is no standalone "build an old database" helper, so these construct one honestly: they
 //! open a fresh (current-schema) `TaskRuntime`, write representative business rows through the
@@ -95,6 +97,9 @@ fn schema_version_13_chains_forward_in_place_and_keeps_existing_rows() {
             .execute_batch(
                 "DROP INDEX IF EXISTS hook_event_recorded_at;
                  DROP TABLE IF EXISTS hook_event;
+                 DROP INDEX IF EXISTS auto_confirm_rejection_recorded_at;
+                 DROP TABLE IF EXISTS auto_confirm_rejection;
+                 ALTER TABLE candidate_review DROP COLUMN decision_source;
                  PRAGMA user_version = 13;",
             )
             .unwrap();
@@ -125,7 +130,7 @@ fn schema_version_13_chains_forward_in_place_and_keeps_existing_rows() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(
-        version, 16,
+        version, 17,
         "migration must chain through to the current version"
     );
     let hook_event_exists: bool = connection
@@ -258,7 +263,7 @@ fn schema_version_14_discards_the_recorded_injection_outcomes_only() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        16
+        17
     );
     assert!(
         runtime
@@ -341,7 +346,7 @@ fn schema_version_15_discards_the_recorded_omissions_and_keeps_the_proofs() {
             .unwrap()
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        16
+        17
     );
     let totals = runtime
         .context_usage_totals(&[ignored, reused, refuted])
@@ -367,5 +372,155 @@ fn schema_version_15_discards_the_recorded_omissions_and_keeps_the_proofs() {
             refuted: 1,
         },
         "a refutation is an Agent-stated contradiction and survives"
+    );
+}
+
+/// Version 16 -> 17 adds disposition provenance without touching one decided Review.
+///
+/// Both changes are additive: `candidate_review.decision_source` starts `NULL` on every row that
+/// already existed, and `auto_confirm_rejection` starts empty. A `NULL` reads back as `human`,
+/// which is exactly what those dispositions were — `agent_policy` did not exist when they were
+/// written, so there is nothing to guess and nothing to rewrite.
+#[test]
+fn schema_version_16_adds_disposition_provenance_without_rewriting_a_decision() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join(".shared-context");
+    let locator = ExternalSessionLocator::new("codex", "provenance-migration-session").unwrap();
+    let task_id = TaskId::new();
+    let task_session_id = {
+        let runtime = TaskRuntime::initialize(&root).unwrap();
+        runtime
+            .open_or_create(
+                locator.clone(),
+                task_id,
+                intent("survive a provenance upgrade"),
+                Vec::new(),
+            )
+            .unwrap()
+            .snapshot
+            .task_session_id
+    };
+    let database_path = root.join("state").join("runtime.sqlite");
+
+    // A version 16 installation exactly: one already-decided Review, and neither version 17
+    // addition present.
+    {
+        let connection = Connection::open(&database_path).unwrap();
+        connection.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        connection
+            .execute(
+                "INSERT INTO candidate_review (
+                    candidate_id, submission_id, episode_id, task_session_id, task_id,
+                    build_id, final_checkpoint_id, checkpoint_id, claim_id, review_version,
+                    status, discard_reason, created_at_unix_seconds, expires_at_unix_seconds,
+                    discarded_at_unix_seconds
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 2, 'discarded', 'process detail',
+                           1000, 2000, 1500)",
+                params![
+                    "candidate-provenance-fixture",
+                    "submission-provenance-fixture",
+                    "episode-provenance-fixture",
+                    task_session_id.to_string(),
+                    task_id.to_string(),
+                    "build-provenance-fixture",
+                    "checkpoint-provenance-fixture",
+                    "checkpoint-provenance-fixture",
+                    "claim-provenance-fixture",
+                ],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX IF EXISTS auto_confirm_rejection_recorded_at;
+                 DROP TABLE IF EXISTS auto_confirm_rejection;
+                 ALTER TABLE candidate_review DROP COLUMN decision_source;
+                 PRAGMA user_version = 16;",
+            )
+            .unwrap();
+    }
+
+    let runtime = TaskRuntime::initialize(&root).unwrap();
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap(),
+        17
+    );
+    let rejections_exist: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'auto_confirm_rejection')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        rejections_exist,
+        "migration must create the refusal counter table"
+    );
+
+    let (status, reason, decision_source): (String, String, Option<String>) = connection
+        .query_row(
+            "SELECT status, discard_reason, decision_source FROM candidate_review
+             WHERE candidate_id = ?1",
+            params!["candidate-provenance-fixture"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "discarded", "the decision itself is untouched");
+    assert_eq!(reason, "process detail");
+    assert_eq!(
+        decision_source, None,
+        "a Review decided before the column existed carries no invented provenance"
+    );
+
+    let totals = runtime.candidate_disposition_stats().unwrap();
+    assert_eq!(
+        totals.human.discarded, 1,
+        "a NULL provenance reads back as the human decision it was"
+    );
+    assert_eq!(totals.agent_policy.discarded, 0);
+    assert_eq!(totals.auto_confirm_not_permitted, 0);
+}
+
+/// Re-running the version 17 migration over a database that already has the column must not fail.
+///
+/// `ADD COLUMN` has no `IF NOT EXISTS`, so the migration guards on the column itself. A stamp
+/// rewound by hand — the same shape an interrupted upgrade leaves behind — must still migrate.
+#[test]
+fn schema_version_17_migration_is_reentrant_over_an_existing_column() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join(".shared-context");
+    let locator = ExternalSessionLocator::new("codex", "reentrant-migration-session").unwrap();
+    {
+        let runtime = TaskRuntime::initialize(&root).unwrap();
+        runtime
+            .open_or_create(
+                locator.clone(),
+                TaskId::new(),
+                intent("survive a repeated upgrade"),
+                Vec::new(),
+            )
+            .unwrap();
+    }
+    Connection::open(root.join("state").join("runtime.sqlite"))
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 16;")
+        .unwrap();
+
+    let runtime = TaskRuntime::initialize(&root).unwrap();
+    assert_eq!(
+        Connection::open(runtime.database_path())
+            .unwrap()
+            .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap(),
+        17
+    );
+    assert!(
+        runtime
+            .read_snapshot_by_locator(&locator)
+            .unwrap()
+            .is_some()
     );
 }
