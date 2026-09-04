@@ -578,7 +578,9 @@ sctx candidate discard \
 | `sctx upgrade [--agents cursor,codex]` | 安装新版本并原子切换 `bin/current`。 |
 | `sctx data reset --dry-run` / `--yes` | 预览或确认事务式清空活动数据；保留安装结构、Agent 接入和默认恢复备份，不修改远端 Git。 |
 | `sctx uninstall` | 精确移除安装器拥有的运行时和接入配置，保留知识库。 |
-| `sctx knowledge sync` | 显式收取远端默认/工作分支，验证并合并到本机 InstallationWorkBranch，只发布该工作分支。 |
+| `sctx maintain run [--opportunistic]` | 一次周期维护：重建工程图、清点待人工处置的 Candidate Review 与 provisional Space、同步知识库。每步独立容错，一步失败不阻断后续步；结果写入 `state/maintain-digest.json`，由 `sctx doctor` 读回。它只统计、不处置任何 Candidate（见 ADR-0005），也不做 `doctor --fix` 的重装和语义模型预热。`--opportunistic` 让同步遇锁即让路（只尝试一次），适合挂在有人等待的操作后面；不加则按 30/60/120 秒退避重试。 |
+| `sctx maintain status` | 读回上一次维护运行的时间、每步结果和各项待处置计数。 |
+| `sctx knowledge sync` | 显式收取远端默认/工作分支，验证并合并到本机 InstallationWorkBranch，只发布该工作分支。触及远端的 fetch/ls-remote/push 有 120 秒预算，超时即终止子进程并释放独占租约。 |
 | `sctx knowledge delete ...` | 双重确认后永久删除知识 Git 仓库。 |
 | `sctx embedding install [--model-url BASE] [--runtime-url URL] [--expected-sha256 SHA]` | 一条命令启用语义召回：下载模型与 ONNX Runtime、校验、自检、写 `[retrieval]`、回填向量缓存（见 3.7）。 |
 | `sctx embedding status [--verify]` | 报告配置、文件、向量条数与模型指纹；`--verify` 才真正加载模型（9–12 秒）。 |
