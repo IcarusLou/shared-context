@@ -1,6 +1,6 @@
 use sctx_domain::{
     CandidateAnalysisStatus, CandidateReviewStatus, CandidateSpaceRecommendation, ContextKind,
-    EvidenceType, IntentSnapshot, OptionalCandidateEdits, WorkingIntentSnapshot,
+    DecisionSource, EvidenceType, IntentSnapshot, OptionalCandidateEdits, WorkingIntentSnapshot,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
@@ -207,6 +207,7 @@ fn fixed_milestone_four_builder_review_confirm_oracle() {
     );
 
     let existing_input = CandidateConfirmInput {
+        decision_source: DecisionSource::Human,
         agent_kind: "codex".to_owned(),
         external_session_id: oracle.existing_session.clone(),
         expected_task_id: existing_task.context.task_id.to_string(),
@@ -283,6 +284,7 @@ fn fixed_milestone_four_builder_review_confirm_oracle() {
     let new_confirmed = candidate_confirm_at_root(
         &root,
         &CandidateConfirmInput {
+            decision_source: DecisionSource::Human,
             agent_kind: "cursor".to_owned(),
             external_session_id: oracle.new_session,
             expected_task_id: new_task.context.task_id.to_string(),
