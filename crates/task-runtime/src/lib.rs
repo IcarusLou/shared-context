@@ -314,6 +314,16 @@ pub struct CandidateReviewRecord {
     pub result_context_id: Option<sctx_domain::ContextId>,
 }
 
+/// Installation-wide read-only Pending Review counts observed by periodic maintenance.
+///
+/// `expiring_soon_count` is a subset of `pending_count`, and includes rows already past their
+/// expiry that the lazy sweep has not retired yet.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CandidateReviewSurvey {
+    pub pending_count: u64,
+    pub expiring_soon_count: u64,
+}
+
 /// Bounded stable page of Review records owned by one exact `ActiveTask`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateReviewPage {
@@ -2950,6 +2960,57 @@ impl TaskRuntime {
             )
             .map_err(sql_error("count sibling Candidate Reviews"))?;
         Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    /// Counts installation-wide Pending Candidate Reviews for periodic maintenance.
+    ///
+    /// This is the one Review reader that is not scoped to an `ExternalSession` or an `ActiveTask`,
+    /// because periodic maintenance has neither: it observes the whole installation. It is also
+    /// strictly read-only — deliberately *not* running the lazy expiry sweep
+    /// [`cleanup_expired_candidate_reviews`](Self::cleanup_expired_candidate_reviews) that the
+    /// scoped list readers run first. Maintenance observes and reports; disposition is a separate
+    /// decision that ADR-0005 keeps behind an explicit act, so a survey must never change state.
+    ///
+    /// Because expiry is swept lazily, `pending_count` includes rows whose `expires_at` has already
+    /// passed but that no scoped read has retired yet; those rows are also counted in
+    /// `expiring_soon_count`, which is exactly the "needs a human soon" number a digest wants.
+    ///
+    /// # Errors
+    ///
+    /// Returns clock or storage failures.
+    pub fn survey_candidate_reviews(
+        &self,
+        expiring_within_seconds: u64,
+    ) -> Result<CandidateReviewSurvey> {
+        self.survey_candidate_reviews_at(unix_seconds(SystemTime::now())?, expiring_within_seconds)
+    }
+
+    /// Deterministic survey boundary used by tests and maintenance orchestration.
+    ///
+    /// # Errors
+    ///
+    /// Returns bound or storage failures.
+    pub fn survey_candidate_reviews_at(
+        &self,
+        now_unix_seconds: u64,
+        expiring_within_seconds: u64,
+    ) -> Result<CandidateReviewSurvey> {
+        let horizon = i64::try_from(now_unix_seconds.saturating_add(expiring_within_seconds))
+            .map_err(|_| invalid("Candidate Review survey horizon exceeds SQLite range"))?;
+        let connection = self.open_connection()?;
+        let (pending, expiring): (i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*),
+                        COUNT(*) FILTER (WHERE expires_at_unix_seconds <= ?1)
+                 FROM candidate_review WHERE status = 'pending'",
+                [horizon],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(sql_error("survey Candidate Reviews"))?;
+        Ok(CandidateReviewSurvey {
+            pending_count: u64::try_from(pending).unwrap_or(0),
+            expiring_soon_count: u64::try_from(expiring).unwrap_or(0),
+        })
     }
 
     /// Lists Pending and Confirmed Candidate Reviews owned by every Task of one `ExternalSession`.
