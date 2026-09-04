@@ -213,7 +213,7 @@ sctx doctor --fix
 - 初始化本地索引和运行时状态。
 - 按选择写入 `~/.cursor/mcp.json`、`~/.cursor/hooks.json`。
 - 按选择写入 `~/.codex/config.toml`、`~/.codex/hooks.json`。
-- 安装用户级最小 activation Skill 与 installer-owned 完整 workflow reference 到 `~/.agents/skills/shared-context`。该 workflow 规定知识库正文默认用中文书写（intent 的 goal/current_direction/in_scope，claim 的 statement/rationale/conditions，evidence.summary），代码标识符、路径与命令保持原文；这只约束沉淀内容，不改变 Agent 与用户交流使用的语言。
+- 安装两个用户级 installer-owned Agent Skill（见 5.4）：`~/.agents/skills/shared-context`（最小 activation gate + 完整 workflow reference）与 `~/.agents/skills/sctx-review`（显式调用的完整 review / 治理流程）。两个目录整体安装、整体保留：只要其中任何一个是你自己的同名 Skill 或被你改过，本产品一个字节都不覆盖、也不在 manifest 里认领，并在 notices 里说明；`uninstall` 同样只删自己写的那些文件。该 workflow 规定知识库正文默认用中文书写（intent 的 goal/current_direction/in_scope，claim 的 statement/rationale/conditions，evidence.summary），代码标识符、路径与命令保持原文；这只约束沉淀内容，不改变 Agent 与用户交流使用的语言。
 - 写安装清单，用于后续升级、诊断和精确卸载。
 
 安装器会记录每次写入并支持失败回滚。已有配置会合并，不会把整个配置文件直接覆盖成模板。
@@ -335,7 +335,7 @@ Working Intent（Agent 当前理解自己在做什么）
 Work Episode（一次连续工作片段）
     ↓ 关闭后自动整理
 Candidate（待审核草稿，不可信、不会自动发布）
-    ↓ 用户明确确认
+    ↓ 明确处置（三档：Agent 自动丢弃 / Agent 自动确认 / 升级给你决定）
 Context（长期工程知识）
     ↓
 写入本机 Git 事实库，并建立可重建索引
@@ -343,7 +343,23 @@ Context（长期工程知识）
 未来相关任务按意图、范围和工程对象检索
 ```
 
-这里最重要的安全门槛是：**自动生成的 Candidate 不会自动变成可信知识**。用户需要先查看完整内容、证据、冲突分析和推荐 Space，然后明确选择确认或丢弃。
+这里最重要的安全门槛是：**自动生成的 Candidate 不会悄悄变成可信知识，只能通过一次明确处置**。处置分三档（ADR-0005），前两档 Agent 可以自己做，第三档永远归你：
+
+| 档位 | 谁来做 | 适用范围 |
+|---|---|---|
+| 自动丢弃 | Agent | 只是复述某条仍然 `accepted` 的旧 Context、且没带来新适用条件和新证据；或者这条 Claim 只是"我读了一遍这段代码"的过程性理解。丢弃只是本机运行时决定，不写任何 Git 事实，丢错了顶多下次重新 Checkpoint。 |
+| 自动确认 | Agent | Review 已 `ready_for_review`、最强关系是 `novel` 或 `supports`、没有任何 `edits`、Primary Space 是已有 Space 或服务端自己给的推荐——**并且这四条由服务端亲自校验**，越界一律以 `auto_confirm_not_permitted` 拒绝，不会被悄悄降级放行。 |
+| 升级给你 | 你 | 其余全部：`potential_contradiction` 与 `revises`、需要 supersede 决策的重复项、超出已有 Space 与服务端推荐的 Space 治理、分析不完整的 Review，以及 Agent 自己拿不准的任何一条。Agent 应当只把这些行以一张紧凑表格（主题 / 结论 / 关系 / 它的建议）交给你。 |
+
+每次确认和丢弃都会记下 `decision_source`（`human` 或 `agent_policy`），确认还会记下作者（全局 `git config user.email` 的用户名部分）。两者只存放在事件的 `annotations` 里，不进入事件正文，也不参与任何重放身份。所以自动入库是**可整批撤销**的：
+
+```bash
+sctx context withdraw --decision-source agent_policy --external-session <会话 ID> --dry-run
+```
+
+去掉 `--dry-run` 才真正执行；`--external-session` 可省略，省略时选中本机所有 `agent_policy` 确认过的 Context。每条都走普通 Publication 事件路径逐条追加，不改写任何已写入的事实；当前 Publication Head 已不再指向 accepted 版本的会被报成 skipped 而不是强行处理，因此中途失败可以直接重跑。
+
+如果你想亲自做一轮批量 review，或者需要给 Space 命名、撤销自动入库，可以在会话里直接调用 `$sctx-review`（见 5.4）。
 
 ### 4.2 常见名词
 
@@ -356,11 +372,11 @@ Context（长期工程知识）
 | Work Episode | 当前 Task 中一段连续的探索、实现和验证过程。 |
 | Checkpoint | Agent 明确写下的结论（Claims）和未知项（Unknowns）。 |
 | Candidate | 从已关闭 Episode 生成的待审核知识草稿。默认是不可信数据。 |
-| Context | 用户确认后进入长期事实层的工程知识。 |
+| Context | 经过一次明确处置（人工确认，或服务端校验通过的 Agent 自动确认）后进入长期事实层的工程知识。 |
 | Revision | Intent 或 Context 的不可变版本。修改不会覆盖旧版本，而是新增 Revision。 |
 | Evidence | 能独立阅读的证据快照，例如源码快照、实验记录或工程对象快照。 |
 | Engineering Reference | 一条 Context 与文件、模块、符号、API、Schema 或测试之间的已验证关系。 |
-| Context Relation | 两条 Context 之间由用户确认的稳定知识关系，例如 implements 或 validated_by；它不同于文本相关性。 |
+| Context Relation | 两条 Context 之间在确认时写下的稳定知识关系，例如 implements 或 validated_by；它不同于文本相关性。 |
 | Related Space | Context 的辅助组织和召回角色；Context 仍由一个 Primary Space 拥有，不会复制到 Related Space。 |
 | Projection / Index | 从 Git 事实重建出的 SQLite 查询视图。损坏时可以重建。 |
 
@@ -423,10 +439,10 @@ Agent 在合适时机会：
 2. 用 `task_context` 获取与整个任务相关的历史 Context。
 3. 需要某个具体文件、符号或接口历史时，用 `task_artifact_focus` 做一次即时查询。
 4. 形成重要结论、压缩上下文或结束一轮工作前，用 `task_checkpoint` 直接提交聚焦的 Claims、Unknowns 和自包含 Evidence 摘要。
-5. Episode 关闭后，用 `candidate_list` 和 `candidate_get` 展示待审核 Candidate。
-6. 只有在你明确同意后，才调用 `candidate_confirm`；你拒绝保留时调用 `candidate_discard`。
+5. Episode 关闭后，用 `candidate_list` 拿到精简列表，按 4.1 的三档处置自己消化前两档；只对需要展开的行调用 `candidate_get`。
+6. 把第三档（升级给你的那些行）以一张紧凑表格交给你，按你的决定调用 `candidate_confirm` 或 `candidate_discard`。它自己做的那两档同样会调这两个工具，但会带上 `decision_source: "agent_policy"`。
 
-如果 Agent 展示 Candidate，请重点检查：结论是否准确、适用范围是否过大、证据是否足够、是否与旧 Context 冲突、应该归入哪个 Space。
+Agent 不应该把整张 Candidate 列表原样丢给你，也不应该等你主动问起才处理。如果它交上来一张表，请重点检查：结论是否准确、适用范围是否过大、证据是否足够、是否与旧 Context 冲突、应该归入哪个 Space。
 
 ### 5.2 手工 CLI 示例：建立一个 Task
 
@@ -562,6 +578,48 @@ sctx candidate discard \
   --reason "证据不足，暂不沉淀"
 ```
 
+### 5.4 `$sctx-review`：在会话里做一轮完整 review
+
+安装会往 `~/.agents/skills/` 放两个 Agent Skill，各管一件事：
+
+| Skill | 什么时候被读 | 内容 |
+|---|---|---|
+| `shared-context` | 每个被 SessionStart marker 激活的会话自动读一次 | 会话主流程：激活门控、建立 Intent、检索历史 Context、Checkpoint、三档处置政策、工程引用维护。 |
+| `sctx-review` | 你显式输入 `$sctx-review` 时；Agent 需要第三档的细节时也会读 | 完整 review 流程：展开哪些行、`candidate_confirm`/`candidate_discard` 的全部请求形态（含 `edits` 与批量）、重复项的 supersede/contradicts 决策、机器可评估的 `recheck_when`、Space 治理与 provisional Space、撤销自动入库、同一会话其他 Task 里遗留的待审核项。 |
+
+拆成两个的原因很实际：主流程那份每个会话都要整读一遍，越短越好；review 那份只有真的要做治理决策时才需要，放在同一个文件里等于每个会话都为它付一次上下文。另外有些宿主（例如 Cursor）不会自动加载 Skill，但**你显式调用的 Skill 一定会被加载**——所以第二个 Skill 面向显式调用设计。
+
+两个 Skill 的门控规则一样：没有可信 SessionStart / PreCompact marker 时，显式调用只回一句 `Shared Context is unavailable for this session.`，不读任何 reference，也不调用任何 Shared Context 工具。
+
+什么时候值得手动敲 `$sctx-review`：
+
+- 攒了一批待审核 Candidate，想一次性过完；
+- 要给某个 `provisional` Space 正式命名或合并；
+- 想撤销一批自动入库的 Context（见 4.1 的 `sctx context withdraw`）；
+- 想知道同一会话别的 Task 下还压着哪些没处理的 Candidate。
+
+### 5.5 后台维护与 digest
+
+`sctx maintain run` 做一次周期维护：重建工程图、清点待人工处置的 Candidate Review 与 provisional Space、同步知识库。它**只统计、不处置任何 Candidate**——处置永远走 4.1 的三档，不会在你睡觉时被后台悄悄做掉。
+
+它默认由两条互相独立、都开着的轨拉起（配置见 6.11 的 `[maintenance]`）：
+
+- **定时轨**：`setup` / `upgrade` 装的 launchd job，每天 06:00 跑一次。
+- **机会轨**：`SessionStart` Hook 发现维护超过 24 小时没跑时，在激活工作全部完成之后 detach 拉起一次，不等待、不影响你的会话。
+
+结果写进 `state/maintain-digest.json`，`sctx maintain status` 读回。digest 记的是：`schema_version`、`mode`（定时还是机会）、起止时间、每一步的 `steps`（名称、`ok`/`skipped`/`failed`、原因、尝试次数、是否 `needs_human`）、本次重建到的 `graph_generation` 与 `projection_generation`，以及一组只统计不处置的 `counts`：
+
+| 计数 | 含义 |
+|---|---|
+| `pending_candidate_reviews` | 整个安装里待处置的 Candidate Review 总数。 |
+| `expiring_candidate_reviews` | 上面这些里，保留期在 `candidate_expiry_horizon_seconds` 之内就要到期的。 |
+| `provisional_spaces` | 还带着服务端临时 Intent、等人命名的 Space 数。 |
+| `engineering_references` | 已登记的工程引用总数。 |
+| `unresolved_references` | 其中重建后仍是 Ambiguous / Missing / Unavailable 的。 |
+| `relocation_candidates` | Missing 引用旁边、本地历史能说出一次重命名的条数；每条都是一次需要人来定的修复。 |
+
+只要 digest 里 `pending_candidate_reviews > 0`，下一次 `SessionStart` 会在 activation marker 后面多带一行 `<shared-context-maintenance>`，里面只有一个计数和 `candidate_list` 一个工具名（≤ 256 字节）。它是检索提示不是事实，不产生任何 Claim 或 Evidence。
+
 ## 6. 所有功能与命令
 
 本节覆盖当前 `sctx --help` 中暴露的全部功能。命令默认输出便于人阅读的 JSON；在任意命令中加入全局参数 `--json` 可获得稳定的单行 JSON 信封，适合脚本处理。`sctx --help` 或 `sctx -h` 查看总帮助，`sctx --version` 或 `sctx -V` 查看版本。
@@ -643,7 +701,7 @@ Checkpoint Claim 必须严格包含 `context_kind`、`statement`、`rationale`�
 | `sctx candidate list --agent-kind ... --external-session-id ... [--compact]` | 分页列出当前 Task 的 Candidate Review；默认只列 `pending`。可用 `--status`、`--limit`、`--cursor`、`--token-budget`。 |
 | `sctx candidate get ... --candidate-id <ID>` | 获取完整草稿、证据、来源、冲突分析、置信度、未知项和 Space 推荐。 |
 | `sctx candidate analyze --candidate-id <ID> [--token-budget 4096] [--top-k 16]` | 重新计算与已有 Context 的重复、支持、修订、潜在冲突和相关性分析；不写入 Git。 |
-| `sctx candidate confirm --input <JSON>` | 用户明确确认后，把 Candidate、Primary/Related Space、最终 Context Revision、Association、Publication、Confirmation 和可选编辑作为一个原子事实批次写入。JSON 用 `candidate_id` 确认一个，或用 `candidate_ids` 数组原子确认多个（写入前对每个 Candidate 做完整校验，任何一个失败整批都不写；批量模式不支持 `edits` 和新建 Space 推荐，只能用于已有 Space）。 |
+| `sctx candidate confirm --input <JSON>` | 一次明确确认（`--decision-source human` 默认，或 `agent_policy`）把 Candidate、Primary/Related Space、最终 Context Revision、Association、Publication、Confirmation 和可选编辑作为一个原子事实批次写入。JSON 用 `candidate_id` 确认一个，或用 `candidate_ids` 数组原子确认多个（写入前对每个 Candidate 做完整校验，任何一个失败整批都不写；批量模式不支持 `edits` 和新建 Space 推荐，只能用于已有 Space）。 |
 | `sctx candidate discard --candidate-id <ID> [--candidate-id <ID> ...] --reason <TEXT>` | 用户明确拒绝保留时丢弃 Candidate Review；不会发布任何 Context。重复 `--candidate-id` 原子丢弃多个自己名下的 Pending Candidate。 |
 | `sctx candidate build-closed-episode --episode-id <ID>` | 在 Episode 已关闭但 Builder 响应丢失或待恢复时重建；属于恢复命令。 |
 
@@ -651,7 +709,7 @@ Candidate 状态支持 `pending`、`discarded`、`expired`、`confirmed`。只�
 
 `candidate list` 默认（MCP 侧）和 `--compact`（CLI 侧）返回精简三角视图：每条只有 `candidate_id`、`kind`、`statement`、置信度最高的 `top_assessment`（`relation` + `confidence_basis_points`）、`primary_space_recommendation` 和 `ready_for_review`；不含完整证据、来源和分析明细。推荐的审核顺序是：先看这份精简列表，只对 `top_assessment.relation` 为 `potential_contradiction` 或 `revises` 的 Candidate 用 `candidate get` 展开完整 Review，再决定是否用 `candidate_ids` 批量确认或丢弃其余同批次的 `supports`/`exact_duplicate`/`novel` 项，避免逐条重复展开明显不需要人工细看的 Candidate。
 
-同一 Task Intent Revision 产生多个 Claims 时，每个 Claim 仍是独立 Candidate，但它们共享一个 `ProposedSpaceGroup`：建议的新 Space 标题只来自 Working Intent 的 `goal`，会移除内部 `System suggestion:` 前缀、规范空白后按字符截断到 40 个字符并加省略号（不是按词边界截断，goal 为空时用固定标题 "Task intent"）。第一个 Candidate 确认创建新 Space 后，其他待审核 Candidate 会推荐该 Existing Space；新的 Intent Revision 使用新分组。这个机制不会按文本合并 Candidate，也不是全局 Active Space。这类系统生成的 Space 会带 `provisional` 标记，出现在 `space list`/`space get` 与候选的 Space 推荐里；当它积累的已接受 Context 达到一定数量，或出现跨 Space 的相关引用时，`candidate list` 顶层会给出合并/命名到人工 Space 的提示，人工执行一次 `space intent revise` 才会让它不再是 `provisional`。
+同一 Task 产生多个 Claims 时，每个 Claim 仍是独立 Candidate，但它们共享一个 `ProposedSpaceGroup`（键是 `ProposedSpaceGroupKey::from_task(task_id)`，只绑 Task，不绑 Intent Revision）：建议的新 Space 标题只来自 Working Intent 的 `goal`，会移除内部 `System suggestion:` 前缀、规范空白后按字符截断到 40 个字符并加省略号（不是按词边界截断，goal 为空时用固定标题 "Task intent"）。第一个 Candidate 确认创建新 Space 后，其他待审核 Candidate 会推荐该 Existing Space；同一 Task 内推进 Intent Revision 不会换分组，只有新 Task 才会。这个机制不会按文本合并 Candidate，也不是全局 Active Space。这类系统生成的 Space 会带 `provisional` 标记，出现在 `space list`/`space get` 与候选的 Space 推荐里；当它积累的已接受 Context 达到一定数量，或出现跨 Space 的相关引用时，`candidate list` 顶层会给出合并/命名到人工 Space 的提示，人工执行一次 `space intent revise` 才会让它不再是 `provisional`。
 
 确认时的 `edits` 可以只替换用户明确要求修改的字段：`kind`、`topic_key`、`problem_view`、`hints`、`statement`、`rationale`、`applicability`、`assumptions`、`recheck_when`、`relations`、`evidence`。省略字段表示保留原草稿；`topic_key`/`problem_view` 都要用 `{"action":"clear"}` 才表示显式清空，`hints` 直接给字符串数组整体替换。`problem_view` 省略且草稿本身没有值时，服务端会用来源 Task 的 Working Intent（goal/in-scope/未决问题）自动补一份摘要，不需要手工填写。
 
@@ -680,6 +738,7 @@ Context 类型共有七种：
 | `sctx context review --space-id ... --context-id ... --revision-id ... --verdict <approve 或 reject> --reason ...` | 对一个 Revision 做明确审核。 |
 | `sctx context publish ...` | 发布一个被确定性批准的 Revision。必须引用当前全部 Publication Head 和该 Revision 的全部 Review Event。 |
 | `sctx context withdraw ...` | 撤回当前治理 Head 选中的 Revision，不接受 Review Event。 |
+| `sctx context withdraw --decision-source human\|agent_policy [--external-session <ID>] [--dry-run]` | 按处置来源整批撤回本机确认过的 Context（见 4.1）。选择器只看本机 Runtime 记录的自己的决定，别的机器确认的永远不碰；每条走普通 Publication 追加，Head 已不指向 accepted 版本的报 skipped 而不强行处理。 |
 
 Context 内容可通过 `--input` JSON 提供：
 
