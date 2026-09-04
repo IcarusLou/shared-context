@@ -2063,6 +2063,12 @@ fn resolve_task_operation(
                     system_message: notify.then(|| INTENT_BOOTSTRAP_REMINDER.to_owned()),
                 });
             };
+            // A real PostToolUse against an ActiveTask, independent of whether it goes on to
+            // produce a new Signal below: this is exactly the "substantial tool activity" the
+            // TurnStop checkpoint reminder gate (WP-V6 fix 3) needs to tell an idle turn from one
+            // where the Agent kept working. Best-effort like every other Hook-path write beside the
+            // diagnostic log; losing this counter only makes the gate more conservative, never less.
+            let _ = runtime.record_checkpoint_reminder_activity(&locator);
             let catalog = UserConfigStore::open_existing(&root)?.repository_catalog()?;
             let derived = normalized_tool_signals(
                 &catalog,
@@ -2133,11 +2139,21 @@ fn finalize_checkpointed_episode(
         AutomatedEpisodeBoundary::NoActiveTask => format!(
             "Shared Context {trigger_name}: no ActiveTask exists. Continue coding normally; use $shared-context and task_intent_update before checkpointing."
         ),
-        AutomatedEpisodeBoundary::NoEpisode { task_id, .. } => format!(
-            "Shared Context {trigger_name}: no Work Episode is open for Task {task_id}. Use $shared-context and call task_checkpoint with complete direct Claims/Unknowns; the server resolves the current Task, Intent, and lifecycle. Hook text is not Claim evidence."
+        AutomatedEpisodeBoundary::NoEpisode { task_id, .. } => checkpoint_reminder_text(
+            &runtime,
+            locator,
+            trigger,
+            format!(
+                "Shared Context {trigger_name}: no Work Episode is open for Task {task_id}. Use $shared-context and call task_checkpoint with complete direct Claims/Unknowns; the server resolves the current Task, Intent, and lifecycle. Hook text is not Claim evidence."
+            ),
         ),
-        AutomatedEpisodeBoundary::CheckpointRequired { .. } => format!(
-            "Shared Context {trigger_name}: current work has no Checkpoint. Before compaction or completion, call task_checkpoint with complete direct Claims/Unknowns; the server resolves the current Task, Intent, and lifecycle. Hook text is not Claim evidence."
+        AutomatedEpisodeBoundary::CheckpointRequired { .. } => checkpoint_reminder_text(
+            &runtime,
+            locator,
+            trigger,
+            format!(
+                "Shared Context {trigger_name}: current work has no Checkpoint. Before compaction or completion, call task_checkpoint with complete direct Claims/Unknowns; the server resolves the current Task, Intent, and lifecycle. Hook text is not Claim evidence."
+            ),
         ),
         AutomatedEpisodeBoundary::Closed {
             episode,
@@ -2197,6 +2213,34 @@ fn finalize_checkpointed_episode(
         additional_context: None,
         system_message: Some(system_message),
     })
+}
+
+/// Applies the `TurnStop` checkpoint-reminder throttle (WP-V6 fix 3, `docs/deferred-issues.md`
+/// #6) to one "checkpoint is missing" message.
+///
+/// `PreCompact` fires once per compaction, which is already rare and is the one boundary that
+/// re-attaches the `$shared-context` activation marker the model needs after its transcript is
+/// dropped -- so only `TurnStop`, the every-turn trigger the docs issue is about, consults the
+/// budget; `PreCompact` always shows `nag` unmodified.
+fn checkpoint_reminder_text(
+    runtime: &TaskRuntime,
+    locator: &ExternalSessionLocator,
+    trigger: EpisodeFinalizationTrigger,
+    nag: String,
+) -> String {
+    if trigger != EpisodeFinalizationTrigger::TurnStop {
+        return nag;
+    }
+    if runtime.gate_turn_stop_checkpoint_reminder(locator) {
+        nag
+    } else {
+        // Deliberately without the `call task_checkpoint` directive the budgeted reminders above
+        // carry: repeating even a softened version of the same instruction would still read as
+        // urging, which is exactly what the throttle exists to stop doing.
+        "Shared Context TurnStop: checkpoint still pending; this Session already received its \
+         automated reminders for it."
+            .to_owned()
+    }
 }
 
 fn recover_one_pending_episode_build(

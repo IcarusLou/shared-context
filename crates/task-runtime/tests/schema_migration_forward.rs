@@ -1,7 +1,9 @@
 //! `TaskRuntime` in-place schema upgrades. Version 13 -> 14 is additive (`hook_event`) and must
 //! touch no pre-existing row; version 14 -> 15 discards `context_usage` and must touch nothing
-//! else; version 15 -> 16 discards the recorded omissions only and keeps every proof. The three
-//! chain, so a version 13 database reopened today lands on the current version.
+//! else; version 15 -> 16 discards the recorded omissions only and keeps every proof; version
+//! 16 -> 17 is additive (two `external_session` counters for the `TurnStop` checkpoint reminder
+//! gate, WP-V6 fix 3). They chain, so a version 13 database reopened today lands on the current
+//! version.
 //!
 //! There is no standalone "build an old database" helper, so these construct one honestly: they
 //! open a fresh (current-schema) `TaskRuntime`, write representative business rows through the
@@ -125,7 +127,7 @@ fn schema_version_13_chains_forward_in_place_and_keeps_existing_rows() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(
-        version, 16,
+        version, 17,
         "migration must chain through to the current version"
     );
     let hook_event_exists: bool = connection
@@ -258,7 +260,7 @@ fn schema_version_14_discards_the_recorded_injection_outcomes_only() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        16
+        17
     );
     assert!(
         runtime
@@ -341,7 +343,7 @@ fn schema_version_15_discards_the_recorded_omissions_and_keeps_the_proofs() {
             .unwrap()
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        16
+        17
     );
     let totals = runtime
         .context_usage_totals(&[ignored, reused, refuted])
@@ -367,5 +369,118 @@ fn schema_version_15_discards_the_recorded_omissions_and_keeps_the_proofs() {
             refuted: 1,
         },
         "a refutation is an Agent-stated contradiction and survives"
+    );
+}
+
+/// Version 16 -> 17 adds the two `external_session` counters the `TurnStop` checkpoint reminder
+/// gate uses (WP-V6 fix 3) and touches nothing else.
+///
+/// Unlike the other fixtures in this file, `external_session`'s *shape* changed, so writing rows
+/// through the current schema and only rewinding `user_version` would not reproduce a genuine
+/// version 16 database -- the columns would already be there before the migration ever ran. This
+/// rebuilds `external_session` in its true pre-migration shape (no reminder columns) to prove the
+/// `ADD COLUMN` path itself, not the migration's defensive skip of a column that already exists.
+#[test]
+fn schema_version_16_adds_the_checkpoint_reminder_counters_at_zero() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join(".shared-context");
+    let locator = ExternalSessionLocator::new("codex", "reminder-migration-session").unwrap();
+    let task_id = TaskId::new();
+    let task_session_id = {
+        let runtime = TaskRuntime::initialize(&root).unwrap();
+        runtime
+            .open_or_create(
+                locator.clone(),
+                task_id,
+                intent("survive a reminder-counter upgrade"),
+                Vec::new(),
+            )
+            .unwrap()
+            .snapshot
+            .task_session_id
+    };
+
+    let database_path = root.join("state").join("runtime.sqlite");
+    {
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 CREATE TABLE external_session_v16 (
+                     external_session_id TEXT PRIMARY KEY,
+                     agent_kind TEXT NOT NULL,
+                     external_session_key TEXT NOT NULL,
+                     active_task_session_id TEXT NOT NULL,
+                     active_task_id TEXT NOT NULL,
+                     UNIQUE (agent_kind, external_session_key),
+                     FOREIGN KEY (external_session_id, active_task_session_id, active_task_id)
+                         REFERENCES task_session (external_session_id, task_session_id, task_id)
+                         DEFERRABLE INITIALLY DEFERRED
+                 ) STRICT;
+                 INSERT INTO external_session_v16
+                     SELECT external_session_id, agent_kind, external_session_key,
+                            active_task_session_id, active_task_id
+                     FROM external_session;
+                 DROP TABLE external_session;
+                 ALTER TABLE external_session_v16 RENAME TO external_session;
+                 PRAGMA user_version = 16;",
+            )
+            .unwrap();
+        let has_reminder_columns: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM pragma_table_info('external_session')
+                     WHERE name = 'checkpoint_reminder_count'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !has_reminder_columns,
+            "fixture must reproduce a genuine version 16 external_session, without the reminder \
+             columns"
+        );
+    }
+
+    let runtime = TaskRuntime::initialize(&root).unwrap();
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap(),
+        17,
+        "migration must chain through to the current version"
+    );
+    let (reminder_count, activity): (i64, i64) = connection
+        .query_row(
+            "SELECT checkpoint_reminder_count, activity_since_checkpoint_reminder
+             FROM external_session WHERE active_task_session_id = ?1",
+            params![task_session_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (reminder_count, activity),
+        (0, 0),
+        "a migrated pre-existing Session starts with a fresh reminder budget"
+    );
+
+    // The migrated row works through the public gate/activity API exactly like a fresh row would.
+    assert!(
+        runtime.gate_turn_stop_checkpoint_reminder(&locator),
+        "the first reminder on a migrated row still fires unconditionally"
+    );
+    runtime
+        .record_checkpoint_reminder_activity(&locator)
+        .unwrap();
+    assert_eq!(
+        runtime
+            .read_snapshot_by_locator(&locator)
+            .unwrap()
+            .unwrap()
+            .task_id,
+        task_id,
+        "the migrated row's Task identity is untouched"
     );
 }

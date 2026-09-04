@@ -37,7 +37,7 @@ pub use reference_derivation::{
     ResolvedReference, claim_topic_key, derive_claim_references, unresolvable,
 };
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const HOOK_BUSY_TIMEOUT: Duration = Duration::from_millis(25);
 const MAX_EPISODE_LIST_LIMIT: usize = 256;
@@ -56,6 +56,9 @@ pub const MAX_HOOK_EVENT_DETAIL_CHARS: usize = 256;
 const HOOK_EVENT_BUSY_TIMEOUT: Duration = Duration::from_millis(3);
 /// Maximum Context identities bound into one usage-totals query.
 const USAGE_TOTALS_QUERY_CHUNK: usize = 256;
+/// Automated `TurnStop` checkpoint reminders one external Session may receive before the gate
+/// stops showing them (WP-V6 fix 3). See [`TaskRuntime::gate_turn_stop_checkpoint_reminder`].
+const CHECKPOINT_REMINDER_LIMIT: i64 = 3;
 pub const DEFAULT_CANDIDATE_REVIEW_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 pub const MAX_CANDIDATE_REVIEW_TTL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 pub const MAX_CANDIDATE_REVIEW_LIST_LIMIT: usize = 100;
@@ -2131,6 +2134,129 @@ impl TaskRuntime {
         )
     }
 
+    /// Decides whether one more automated `TurnStop` checkpoint reminder should reach the model,
+    /// and records that decision (WP-V6 fix 3).
+    ///
+    /// Every `TurnStop` with a checkpoint still missing used to repeat the identical
+    /// `call task_checkpoint` reminder, which is noise across a long Session that keeps working
+    /// through several turns before checkpointing. This caps it at
+    /// [`CHECKPOINT_REMINDER_LIMIT`] reminders per external Session, and only spends one of them
+    /// on a turn that saw real tool activity since the last reminder
+    /// ([`record_checkpoint_reminder_activity`](Self::record_checkpoint_reminder_activity)): an
+    /// idle turn cannot yet have acted on advice it was just given, so repeating the reminder would
+    /// only restate the same nag with nothing new to react to, and it does not spend part of the
+    /// budget either.
+    ///
+    /// The counters live on the `external_session` row rather than in process memory because a
+    /// Hook is a short-lived process that exits before the next `TurnStop` fires -- state that does
+    /// not survive the process is not state at all here.
+    ///
+    /// Fails open: a missing `ExternalSession` row or any read/write error returns `true` (show the
+    /// reminder), exactly the behaviour before this method existed. An extra reminder is a mild
+    /// annoyance; a silently suppressed one hides a real missing Checkpoint.
+    #[must_use]
+    pub fn gate_turn_stop_checkpoint_reminder(&self, locator: &ExternalSessionLocator) -> bool {
+        self.gate_turn_stop_checkpoint_reminder_inner(locator)
+            .unwrap_or(true)
+    }
+
+    fn gate_turn_stop_checkpoint_reminder_inner(
+        &self,
+        locator: &ExternalSessionLocator,
+    ) -> Result<bool> {
+        locator.validate()?;
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "gate TurnStop checkpoint reminder")?;
+        let Some(external) = read_external_identity(&transaction, locator)? else {
+            transaction.commit().map_err(sql_error(
+                "commit missing ExternalSession for checkpoint reminder gate",
+            ))?;
+            return Ok(true);
+        };
+        let (reminder_count, activity): (i64, i64) = transaction
+            .query_row(
+                "SELECT checkpoint_reminder_count, activity_since_checkpoint_reminder
+                 FROM external_session WHERE external_session_id = ?1",
+                params![external.external_session_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(sql_error("read checkpoint reminder counters"))?;
+        // The first reminder always fires: there is no prior reminder for an idle turn to be
+        // compared against yet, and a checkpoint that is genuinely missing deserves to be said
+        // once unconditionally. From the second reminder on, silence since the last one means nothing
+        // has changed since the Agent was already told, so showing it again would add nothing.
+        let allow =
+            reminder_count < CHECKPOINT_REMINDER_LIMIT && (reminder_count == 0 || activity > 0);
+        if allow {
+            transaction
+                .execute(
+                    "UPDATE external_session
+                     SET checkpoint_reminder_count = checkpoint_reminder_count + 1,
+                         activity_since_checkpoint_reminder = 0
+                     WHERE external_session_id = ?1",
+                    params![external.external_session_id.to_string()],
+                )
+                .map_err(sql_error("record checkpoint reminder"))?;
+        }
+        transaction
+            .commit()
+            .map_err(sql_error("commit checkpoint reminder gate"))?;
+        Ok(allow)
+    }
+
+    /// Records one real PostToolUse-driven Signal event toward the reminder-activity counter
+    /// (WP-V6 fix 3), so the next call to
+    /// [`gate_turn_stop_checkpoint_reminder`](Self::gate_turn_stop_checkpoint_reminder) can tell an
+    /// idle turn from one where the Agent did something after being reminded.
+    ///
+    /// A dedicated connection with its own short busy window, for the same reason
+    /// [`record_hook_event_at`](Self::record_hook_event_at) uses [`HOOK_EVENT_BUSY_TIMEOUT`]:
+    /// every `PostToolUse` in a Session reaches this, so as many concurrent Hook processes as a
+    /// Session has active tool calls can all touch this one row at once, and retrying each one
+    /// against the interactive [`HOOK_BUSY_TIMEOUT`] would serialize them and could itself blow
+    /// the Hook p99 budget on its own (`crates/cli/tests/hook_hot_path.rs` measures exactly that
+    /// budget under 32-way concurrency). One `UPDATE`, no read first and no explicit transaction:
+    /// losing an occasional increment under contention only makes the gate slightly more
+    /// conservative, never less correct, which is the same trade `record_hook_event_at` already
+    /// makes for the diagnostic log.
+    ///
+    /// Best-effort like that write, too: a missing `ExternalSession` row (no `ActiveTask` yet, so
+    /// no reminder can fire either) matches zero rows rather than erroring, and a write failure
+    /// just leaves the counter where it was.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed locator or storage error. Callers on the Hook path are expected to treat
+    /// this the way they treat every other best-effort write there and not fail the Hook over it.
+    pub fn record_checkpoint_reminder_activity(
+        &self,
+        locator: &ExternalSessionLocator,
+    ) -> Result<()> {
+        locator.validate()?;
+        // `SQLITE_OPEN_READ_WRITE` only, deliberately without `SQLITE_OPEN_CREATE`: see
+        // `record_hook_event_at` for why this write must never be the thing that first creates
+        // `runtime.sqlite`.
+        let connection = Connection::open_with_flags(
+            &self.database,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(sql_error("open task runtime database"))?;
+        connection
+            .busy_timeout(HOOK_EVENT_BUSY_TIMEOUT)
+            .map_err(sql_error(
+                "configure checkpoint reminder activity busy timeout",
+            ))?;
+        connection
+            .execute(
+                "UPDATE external_session
+                 SET activity_since_checkpoint_reminder = activity_since_checkpoint_reminder + 1
+                 WHERE agent_kind = ?1 AND external_session_key = ?2",
+                params![locator.agent_kind, locator.external_session_id],
+            )
+            .map_err(sql_error("record checkpoint reminder activity"))?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     fn close_checkpointed_work_episode_guarded(
         &self,
@@ -3917,7 +4043,11 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
         version = 15;
     }
     if version == 15 {
-        return migrate_schema_15_to_16(connection);
+        migrate_schema_15_to_16(connection)?;
+        version = 16;
+    }
+    if version == 16 {
+        return migrate_schema_16_to_17(connection);
     }
     if version != 0 && version != SCHEMA_VERSION {
         return Err(invariant(format!(
@@ -3932,6 +4062,10 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 external_session_key TEXT NOT NULL,
                 active_task_session_id TEXT NOT NULL,
                 active_task_id TEXT NOT NULL,
+                checkpoint_reminder_count INTEGER NOT NULL DEFAULT 0
+                    CHECK (checkpoint_reminder_count >= 0),
+                activity_since_checkpoint_reminder INTEGER NOT NULL DEFAULT 0
+                    CHECK (activity_since_checkpoint_reminder >= 0),
                 UNIQUE (agent_kind, external_session_key),
                 FOREIGN KEY (external_session_id, active_task_session_id, active_task_id)
                     REFERENCES task_session (external_session_id, task_session_id, task_id)
@@ -4279,7 +4413,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
             ) STRICT;
             CREATE INDEX IF NOT EXISTS hook_event_recorded_at
                 ON hook_event (recorded_at_unix_ms);
-            PRAGMA user_version = 16;",
+            PRAGMA user_version = 17;",
         )
         .map_err(sql_error("initialize task runtime schema"))
 }
@@ -4362,6 +4496,58 @@ fn migrate_schema_15_to_16(connection: &Connection) -> Result<()> {
         )
         .map_err(sql_error(
             "migrate task runtime schema from version 15 to 16",
+        ))
+}
+
+/// Adds the two additive counters `TaskRuntime::gate_turn_stop_checkpoint_reminder` and
+/// `TaskRuntime::record_checkpoint_reminder_activity` use (WP-V6 fix 3) to `external_session` on
+/// an existing schema version 16 installation, and advances `user_version` to 17.
+///
+/// Both counters start at zero on every existing row, the same value a brand-new row gets. That
+/// resets the reminder budget for every Session already in flight at the moment of the upgrade,
+/// which is the conservative direction: at most three reminders more than a Session that had run
+/// under this schema the whole time, never fewer, so no operator loses the escape hatch the
+/// throttle exists to provide.
+///
+/// Checks for the column before adding it, the way [`sctx_search`'s cache schema does][1] for the
+/// same reason: an installation exercised through this crate's own test harness reaches a "version
+/// 16" fixture by writing rows through the *current* schema (which already carries these columns)
+/// and only rewinding `user_version`, so the column can already be present even though the stamp
+/// says 16. A real pre-upgrade installation never has it, and `ADD COLUMN` still runs there exactly
+/// once, same as always.
+///
+/// [1]: ../../search/src/embedding.rs
+fn migrate_schema_16_to_17(connection: &Connection) -> Result<()> {
+    let has_reminder_columns = connection
+        .prepare(
+            "SELECT 1 FROM pragma_table_info('external_session')
+             WHERE name = 'checkpoint_reminder_count'",
+        )
+        .and_then(|mut statement| statement.exists([]))
+        .map_err(sql_error("inspect external_session columns"))?;
+    connection
+        .execute_batch("BEGIN IMMEDIATE;")
+        .map_err(sql_error(
+            "begin task runtime schema migration from version 16 to 17",
+        ))?;
+    if !has_reminder_columns {
+        connection
+            .execute_batch(
+                "ALTER TABLE external_session
+                    ADD COLUMN checkpoint_reminder_count INTEGER NOT NULL DEFAULT 0
+                        CHECK (checkpoint_reminder_count >= 0);
+                 ALTER TABLE external_session
+                    ADD COLUMN activity_since_checkpoint_reminder INTEGER NOT NULL DEFAULT 0
+                        CHECK (activity_since_checkpoint_reminder >= 0);",
+            )
+            .map_err(sql_error(
+                "add checkpoint reminder columns to external_session",
+            ))?;
+    }
+    connection
+        .execute_batch("PRAGMA user_version = 17; COMMIT;")
+        .map_err(sql_error(
+            "migrate task runtime schema from version 16 to 17",
         ))
 }
 
