@@ -1,7 +1,7 @@
 {
   "name": "@bytedance-dev/shared-context-npm-packaging",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0-dev.5",
   "scripts": {
     "install:local": "node scripts/install-local.js",
     "install:release": "node scripts/install-release.js",

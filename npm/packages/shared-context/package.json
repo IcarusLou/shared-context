@@ -1,6 +1,6 @@
 {
   "name": "@bytedance-dev/shared-context",
-  "version": "0.1.0",
+  "version": "0.2.0-dev.5",
   "description": "Shared Context native CLI launcher",
   "license": "UNLICENSED",
   "bin": {
@@ -18,7 +18,7 @@
     "registry": "https://bnpm.byted.org"
   },
   "optionalDependencies": {
-    "@bytedance-dev/shared-context-darwin-arm64": "0.1.0",
-    "@bytedance-dev/shared-context-darwin-x64": "0.1.0"
+    "@bytedance-dev/shared-context-darwin-arm64": "0.2.0-dev.5",
+    "@bytedance-dev/shared-context-darwin-x64": "0.2.0-dev.5"
   }
 }
