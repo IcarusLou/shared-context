@@ -804,7 +804,8 @@ pub struct CandidateConfirmInput {
     pub decision_source: DecisionSource,
 }
 
-/// Strict explicit human confirmation of several owned Pending Candidates.
+/// Strict explicit confirmation of several owned Pending Candidates, by a human or, inside the
+/// server-verified permission surface, by the session Agent.
 ///
 /// It shares one Space organization and one Review version across the batch; per-Candidate field
 /// `edits` and proposed new Space recommendations stay single-Candidate operations.
@@ -7786,7 +7787,7 @@ fn tools_list() -> Value {
         ),
         tool_schema(
             "task_checkpoint",
-            "Finalize one content-addressed Agent Checkpoint for the current ActiveTask and Intent. Submit focused Claims with self-contained Evidence summaries; the server durably queues untrusted Candidate drafts for bounded recovery by Candidate review reads. Empty Claims and Unknowns are a successful no-op. Once the ACK reports a queued Candidate Build, call candidate_list next and present the Pending Reviews to the user.",
+            "Finalize one content-addressed Agent Checkpoint for the current ActiveTask and Intent. Submit focused Claims with self-contained Evidence summaries; the server durably queues untrusted Candidate drafts for bounded recovery by Candidate review reads. Empty Claims and Unknowns are a successful no-op. Checkpoint only what is worth keeping: decisions and their reasons, contracts, verified conclusions, counter-intuitive findings, and summaries of a newly understood mechanism. Process-level understanding of code you just read is not a Claim. Once the ACK reports a queued Candidate Build, call candidate_list next and dispose every Pending Review under its triage policy.",
             task_checkpoint_schema()
         ),
         tool_schema(
@@ -7866,7 +7867,7 @@ fn tools_list() -> Value {
         ),
         tool_schema(
             "candidate_list",
-            "List untrusted automatic Candidate Reviews for the exact ActiveTask; Pending is the default lifecycle filter. detail_level defaults to compact, which returns one triage row per Candidate; pass full for the whole untrusted drafts, or read one with candidate_get. Candidates come only from task_checkpoint, so calling this before a Checkpoint ACK has nothing to recover and is necessarily empty, not a failure.",
+            "List untrusted automatic Candidate Reviews for the exact ActiveTask; Pending is the default lifecycle filter. detail_level defaults to compact, which returns one triage row per Candidate; pass full for the whole untrusted drafts, or read one with candidate_get. Candidates come only from task_checkpoint, so calling this before a Checkpoint ACK has nothing to recover and is necessarily empty, not a failure. Triage every row by top_assessment.relation: discard, with decision_source agent_policy, an exact_duplicate of a still-accepted Context and any row that only restates process-level reading of code; confirm the same way a novel or supports row that is a genuine decision, contract, verified conclusion, or newly understood mechanism; escalate everything else, including potential_contradiction, revises, a duplicate needing a supersede decision, Space governance, and anything you are unsure of, to the user as a table carrying your recommendation.",
             candidate_list_schema()
         ),
         tool_schema(
@@ -7876,12 +7877,12 @@ fn tools_list() -> Value {
         ),
         tool_schema(
             "candidate_discard",
-            "Explicitly discard one Pending automatic Candidate Review under Task, Intent, and Review-version CAS. This never confirms or publishes Context.",
+            "Explicitly discard one Pending automatic Candidate Review under Task, Intent, and Review-version CAS. This never confirms or publishes Context. Send decision_source agent_policy for a discard you made yourself under that triage, naming the ground in reason.",
             candidate_discard_schema()
         ),
         tool_schema(
             "candidate_confirm",
-            "Explicitly confirm one owned Pending Candidate Review into one atomic Context/Space fact closure. All generated identities and any proposed new Space Intent are server-owned.",
+            "Explicitly confirm one owned Pending Candidate Review into one atomic Context/Space fact closure. All generated identities and any proposed new Space Intent are server-owned. Send decision_source agent_policy for a confirmation you made yourself under that triage; the server accepts it only for a ready_for_review novel-or-supports Candidate confirmed without edits, and a refusal (auto_confirm_not_permitted) means present it to the user, not retry with different fields.",
             candidate_confirm_schema()
         ),
         tool_schema(
@@ -8223,12 +8224,13 @@ const EXTERNAL_SESSION_ID_DESCRIPTION: &str = "external_session_id: copy verbati
 
 /// The one sentence appended to every tool that decides a Candidate Review's fate.
 ///
-/// A Candidate is an untrusted draft, so the decision is the user's. That rule already
-/// ships in the post-Checkpoint ACK notice, and a real Cursor session showed the ACK
-/// working while the Skill carrying the same rule was never delivered at all — so the
-/// rule is restated on the three tools that act on a Review, in the ACK's own wording so
-/// a model never sees two versions of it.
-const CANDIDATE_REVIEW_DECISION_DESCRIPTION: &str = "Present the Review to the user as a table and ask for their decision; never confirm or discard on your own inference.";
+/// A Candidate is an untrusted draft, and ADR-0005 splits its disposition into three tiers:
+/// two the Agent may take itself and one that is always the user's. That rule already ships
+/// in the post-Checkpoint ACK notice, and a real Cursor session showed the ACK working while
+/// the Skill carrying the same rule was never delivered at all — so it is restated on the
+/// three tools that act on a Review, pointing at the one place the tiers are spelled out in
+/// full so a model never sees two versions of them.
+const CANDIDATE_REVIEW_DECISION_DESCRIPTION: &str = "Dispose each Review under candidate_list's three-tier triage; anything outside the two automatic tiers goes to the user as a table with your recommendation.";
 
 /// The tools whose call *is* the decision on one Candidate Review.
 ///
@@ -8750,13 +8752,29 @@ fn tool_success_with_notice(
 /// Candidate drafts only ever come from `task_checkpoint`, and `candidate_list` itself drains
 /// any outstanding Build before it answers, so there is no reason for the agent to poll
 /// `candidate_list` before this ACK or to wait for the user to ask about it afterward.
+///
+/// The notice carries ADR-0005's three tiers in full because it is the one instruction channel
+/// a Skill-less host reliably delivers: a real Cursor session rendered this ACK while never
+/// reading `workflow.md` at all. The two automatic tiers are stated as the server enforces
+/// them, so a model following the notice literally is inside the permission surface
+/// [`require_auto_confirm_permitted`] checks rather than discovering it through a refusal.
 fn task_checkpoint_ack_notice(data: &Value) -> Option<String> {
     data.get("candidate_build")?;
     Some(
-        "This Checkpoint was accepted and queued a Candidate Build. Call candidate_list next, \
-         then present every Pending Review to the user as a table (topic, statement, relation) \
-         and ask them to confirm — do not wait for the user to bring it up."
-            .to_owned(),
+        "This Checkpoint was accepted and queued a Candidate Build. Call candidate_list next \
+         and dispose every Pending Review yourself under the triage policy, rather than handing \
+         the whole list to the user. Discard the rows that only restate an accepted Context or \
+         your own process-level reading of code, with candidate_discard, decision_source \
+         \"agent_policy\", and a reason naming the ground. Confirm the ready_for_review rows \
+         whose top relation is novel or supports and that carry a genuine decision, contract, \
+         verified conclusion, or newly understood mechanism, with candidate_confirm, \
+         decision_source \"agent_policy\", and no edits; if the server refuses one as \
+         auto_confirm_not_permitted, move it to the user instead of retrying. Present only what \
+         is left — contradictions, revisions, duplicates needing a supersede decision, and \
+         anything you are unsure of — to the user as a compact table (topic, statement, \
+         relation) carrying your own recommendation, and do not wait for the user to bring it \
+         up."
+        .to_owned(),
     )
 }
 
