@@ -1,6 +1,7 @@
 //! `TaskRuntime` in-place schema upgrades. Version 13 -> 14 is additive (`hook_event`) and must
 //! touch no pre-existing row; version 14 -> 15 discards `context_usage` and must touch nothing
-//! else. The two chain, so a version 13 database reopened today lands on the current version.
+//! else; version 15 -> 16 discards the recorded omissions only and keeps every proof. The three
+//! chain, so a version 13 database reopened today lands on the current version.
 //!
 //! There is no standalone "build an old database" helper, so these construct one honestly: they
 //! open a fresh (current-schema) `TaskRuntime`, write representative business rows through the
@@ -124,7 +125,7 @@ fn schema_version_13_chains_forward_in_place_and_keeps_existing_rows() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(
-        version, 15,
+        version, 16,
         "migration must chain through to the current version"
     );
     let hook_event_exists: bool = connection
@@ -243,7 +244,8 @@ fn schema_version_14_discards_the_recorded_injection_outcomes_only() {
         intent_revision_id
     };
 
-    // Version 15 changed no table shape, so rewinding the stamp alone is a faithful version 14.
+    // Neither version 15 nor 16 changed a table shape, so rewinding the stamp alone is a
+    // faithful version 14, and reopening chains 14 -> 15 -> 16 in one call.
     let database_path = root.join("state").join("runtime.sqlite");
     Connection::open(&database_path)
         .unwrap()
@@ -256,7 +258,7 @@ fn schema_version_14_discards_the_recorded_injection_outcomes_only() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        15
+        16
     );
     assert!(
         runtime
@@ -280,5 +282,90 @@ fn schema_version_14_discards_the_recorded_injection_outcomes_only() {
             .unwrap()
             .task_id,
         task_id
+    );
+}
+
+/// Version 15 -> 16 discards the recorded omissions and keeps every proof.
+///
+/// Version 15 decided reuse from two signals; two more decide it now, so a stored `ignored` is a
+/// verdict this version would not necessarily reach on the same input and cannot be re-derived.
+/// `reused` and `refuted` are proofs and no signal was removed, so both still hold.
+#[test]
+fn schema_version_15_discards_the_recorded_omissions_and_keeps_the_proofs() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join(".shared-context");
+    let locator = ExternalSessionLocator::new("codex", "omission-migration-session").unwrap();
+    let task_id = TaskId::new();
+    let ignored = sctx_domain::ContextId::new();
+    let reused = sctx_domain::ContextId::new();
+    let refuted = sctx_domain::ContextId::new();
+    {
+        let runtime = TaskRuntime::initialize(&root).unwrap();
+        runtime
+            .open_or_create(
+                locator.clone(),
+                task_id,
+                intent("survive an omission reset"),
+                Vec::new(),
+            )
+            .unwrap();
+        runtime
+            .record_context_usage(&[
+                sctx_task_runtime::ContextUsageRecord {
+                    context_id: ignored,
+                    task_id,
+                    outcome: sctx_task_runtime::ContextUsageOutcome::Ignored,
+                },
+                sctx_task_runtime::ContextUsageRecord {
+                    context_id: reused,
+                    task_id,
+                    outcome: sctx_task_runtime::ContextUsageOutcome::Reused,
+                },
+                sctx_task_runtime::ContextUsageRecord {
+                    context_id: refuted,
+                    task_id,
+                    outcome: sctx_task_runtime::ContextUsageOutcome::Refuted,
+                },
+            ])
+            .unwrap();
+    }
+
+    Connection::open(root.join("state").join("runtime.sqlite"))
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 15;")
+        .unwrap();
+
+    let runtime = TaskRuntime::initialize(&root).unwrap();
+    assert_eq!(
+        Connection::open(runtime.database_path())
+            .unwrap()
+            .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap(),
+        16
+    );
+    let totals = runtime
+        .context_usage_totals(&[ignored, reused, refuted])
+        .unwrap();
+    assert!(
+        !totals.contains_key(&ignored),
+        "an omission the old rule decided is not a verdict this version stands behind"
+    );
+    assert_eq!(
+        totals[&reused],
+        sctx_task_runtime::ContextUsageTotals {
+            reused: 1,
+            ignored: 0,
+            refuted: 0,
+        },
+        "proven reuse survives: no signal was removed"
+    );
+    assert_eq!(
+        totals[&refuted],
+        sctx_task_runtime::ContextUsageTotals {
+            reused: 0,
+            ignored: 0,
+            refuted: 1,
+        },
+        "a refutation is an Agent-stated contradiction and survives"
     );
 }
