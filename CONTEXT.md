@@ -185,7 +185,7 @@ One immutable Context revision, its fixed relation targets, and its automatic-sa
 _Avoid_: current Context head, live governance lookup
 
 **Evidence**:
-A self-contained or typed, resolvable provenance record supporting an engineering assertion. A DirectEvidenceDraft supports an untrusted Candidate only; it becomes durable trusted Context Evidence only through explicit human confirmation.
+A self-contained or typed, resolvable provenance record supporting an engineering assertion. A DirectEvidenceDraft supports an untrusted Candidate only; it becomes durable trusted Context Evidence only through explicit disposition — by a human, or by the session Agent inside the permission surface the server itself verifies (ADR-0005).
 _Avoid_: Task clue, retrieval match, Artifact association alone
 
 **EvidenceSource**:

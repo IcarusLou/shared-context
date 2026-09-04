@@ -166,6 +166,10 @@ impl Harness {
         self.home.join(".agents/skills/shared-context")
     }
 
+    fn review_skill_root(&self) -> PathBuf {
+        self.home.join(".agents/skills/sctx-review")
+    }
+
     fn seed_configs(&self) -> Vec<(PathBuf, Vec<u8>, u32)> {
         let fixtures = [
             (
@@ -791,6 +795,9 @@ fn seed_reset_state(harness: &Harness) -> SeededResetState {
         harness.skill_root().join("SKILL.md"),
         harness.skill_root().join("references/workflow.md"),
         harness.skill_root().join("agents/openai.yaml"),
+        harness.review_skill_root().join("SKILL.md"),
+        harness.review_skill_root().join("references/review.md"),
+        harness.review_skill_root().join("agents/openai.yaml"),
     ];
     let preserved = preserved_paths
         .into_iter()
@@ -834,19 +841,38 @@ fn setup_three_times_is_idempotent_and_preserves_existing_configuration() {
         fs::read(harness.skill_root().join("references/workflow.md")).unwrap(),
         include_bytes!("../../../skills/shared-context/references/workflow.md")
     );
+    assert_eq!(
+        fs::read(harness.review_skill_root().join("SKILL.md")).unwrap(),
+        include_bytes!("../../../skills/sctx-review/SKILL.md")
+    );
+    assert_eq!(
+        fs::read(harness.review_skill_root().join("agents/openai.yaml")).unwrap(),
+        include_bytes!("../../../skills/sctx-review/agents/openai.yaml")
+    );
+    assert_eq!(
+        fs::read(harness.review_skill_root().join("references/review.md")).unwrap(),
+        include_bytes!("../../../skills/sctx-review/references/review.md")
+    );
     for asset in [
         harness.skill_root().join("SKILL.md"),
         harness.skill_root().join("references/workflow.md"),
         harness.skill_root().join("agents/openai.yaml"),
+        harness.review_skill_root().join("SKILL.md"),
+        harness.review_skill_root().join("references/review.md"),
+        harness.review_skill_root().join("agents/openai.yaml"),
     ] {
         assert_eq!(
             fs::metadata(asset).unwrap().permissions().mode() & 0o7777,
             0o644
         );
     }
+    // Ownership covers both bundles, sorted by path exactly as the manifest stores them.
     assert_eq!(
         manifest_skill_paths(&harness.root.join("state/install-manifest.json")),
         vec![
+            harness.review_skill_root().join("SKILL.md"),
+            harness.review_skill_root().join("agents/openai.yaml"),
+            harness.review_skill_root().join("references/review.md"),
             harness.skill_root().join("SKILL.md"),
             harness.skill_root().join("agents/openai.yaml"),
             harness.skill_root().join("references/workflow.md"),
@@ -1556,6 +1582,19 @@ fn cursor_and_codex_share_one_global_skill_installation() {
             .join("references/workflow.md")
             .is_file()
     );
+    assert!(harness.review_skill_root().join("SKILL.md").is_file());
+    assert!(
+        harness
+            .review_skill_root()
+            .join("agents/openai.yaml")
+            .is_file()
+    );
+    assert!(
+        harness
+            .review_skill_root()
+            .join("references/review.md")
+            .is_file()
+    );
 }
 
 #[test]
@@ -1583,11 +1622,48 @@ fn setup_preserves_and_does_not_claim_an_external_same_name_skill() {
     .unwrap();
     assert_eq!(manifest["skills"].as_array().unwrap().len(), 0);
 
+    // The conflicting bundle stops the whole set: the second managed Skill is not installed
+    // either, so an installation never carries half of them.
+    assert!(!harness.review_skill_root().exists());
+
     let uninstall = installer.uninstall().unwrap();
     assert!(skill.join("SKILL.md").is_file());
     assert!(skill.join("agents/openai.yaml").is_file());
     assert!(!skill.join("references/workflow.md").exists());
     assert!(!uninstall.removed.contains(&skill));
+}
+
+#[test]
+fn setup_preserves_and_does_not_claim_an_external_review_skill_of_the_same_name() {
+    let harness = Harness::new();
+    let review = harness.review_skill_root();
+    fs::create_dir_all(review.join("references")).unwrap();
+    fs::write(review.join("SKILL.md"), b"user review skill\n").unwrap();
+
+    let installer = harness.installer("1.0.0");
+    let report = installer.setup(&SetupOptions::default()).unwrap();
+    assert_eq!(report.skill.status, SkillStatus::Conflict);
+    assert!(
+        report.notices.iter().any(|notice| {
+            notice.contains("sctx-review") && notice.contains("did not overwrite")
+        })
+    );
+    assert_eq!(
+        fs::read(review.join("SKILL.md")).unwrap(),
+        b"user review skill\n"
+    );
+    assert!(!review.join("references/review.md").exists());
+    // The other bundle is preserved too, and nothing is claimed in the manifest.
+    assert!(!harness.skill_root().exists());
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(harness.root.join("state/install-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["skills"].as_array().unwrap().len(), 0);
+
+    let uninstall = installer.uninstall().unwrap();
+    assert!(review.join("SKILL.md").is_file());
+    assert!(!uninstall.removed.contains(&review));
 }
 
 #[test]
@@ -1604,6 +1680,9 @@ fn every_setup_write_seam_restores_exact_agent_bytes_and_permissions() {
         SetupStage::GlobalSkillGateWritten,
         SetupStage::GlobalSkillWorkflowWritten,
         SetupStage::GlobalSkillMetadataWritten,
+        SetupStage::GlobalSkillReviewGateWritten,
+        SetupStage::GlobalSkillReviewReferenceWritten,
+        SetupStage::GlobalSkillReviewMetadataWritten,
         SetupStage::GlobalSkillWritten,
         SetupStage::LaunchAgentWritten,
         SetupStage::ManifestWritten,
@@ -2104,7 +2183,52 @@ fn upgrade_replaces_an_unchanged_managed_skill_from_an_older_build() {
         fs::metadata(&openai_yaml).unwrap().permissions().mode() & 0o7777,
         0o604
     );
+    assert_eq!(manifest_skill_paths(&manifest).len(), 6);
+}
+
+#[test]
+fn upgrade_from_a_single_skill_installation_adds_the_review_bundle() {
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    // Rewind to what a pre-split installation looked like: one bundle on disk, one in the manifest.
+    let manifest = harness.root.join("state/install-manifest.json");
+    let review = harness.review_skill_root();
+    for relative in ["SKILL.md", "references/review.md", "agents/openai.yaml"] {
+        remove_owned_skill(&review.join(relative), &manifest);
+    }
+    fs::remove_dir_all(&review).unwrap();
     assert_eq!(manifest_skill_paths(&manifest).len(), 3);
+    fs::write(&harness.runtime, b"signed-runtime-v2").unwrap();
+
+    let report = harness
+        .installer("2.0.0")
+        .upgrade(&SetupOptions::default())
+        .unwrap();
+
+    assert_eq!(report.skill.status, SkillStatus::Installed);
+    assert_eq!(
+        fs::read(review.join("SKILL.md")).unwrap(),
+        include_bytes!("../../../skills/sctx-review/SKILL.md")
+    );
+    assert_eq!(
+        fs::read(review.join("references/review.md")).unwrap(),
+        include_bytes!("../../../skills/sctx-review/references/review.md")
+    );
+    assert_eq!(
+        fs::read(review.join("agents/openai.yaml")).unwrap(),
+        include_bytes!("../../../skills/sctx-review/agents/openai.yaml")
+    );
+    assert_eq!(manifest_skill_paths(&manifest).len(), 6);
+
+    // And uninstall now reclaims both bundles down to the empty directories they created.
+    let uninstall = harness.installer("2.0.0").uninstall().unwrap();
+    assert!(!review.exists());
+    assert!(!harness.skill_root().exists());
+    assert!(uninstall.removed.contains(&review));
+    assert!(uninstall.removed.contains(&harness.skill_root()));
 }
 
 #[test]
@@ -2192,6 +2316,9 @@ fn failed_upgrade_restores_managed_skill_bytes_and_permissions() {
         SetupStage::GlobalSkillGateWritten,
         SetupStage::GlobalSkillWorkflowWritten,
         SetupStage::GlobalSkillMetadataWritten,
+        SetupStage::GlobalSkillReviewGateWritten,
+        SetupStage::GlobalSkillReviewReferenceWritten,
+        SetupStage::GlobalSkillReviewMetadataWritten,
         SetupStage::GlobalSkillWritten,
         SetupStage::LaunchAgentWritten,
         SetupStage::ManifestWritten,
@@ -2302,6 +2429,19 @@ fn doctor_reports_codex_trust_as_action_required() {
     assert!(report.checks.iter().any(|check| {
         check.name == "global_skill.workflow_reference" && check.status == CheckStatus::Ok
     }));
+    for name in [
+        "global_skill.review_skill_md",
+        "global_skill.review_reference",
+        "global_skill.review_openai_yaml",
+    ] {
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == name && check.status == CheckStatus::Ok),
+            "{name} is missing from a healthy doctor report"
+        );
+    }
 }
 
 #[test]
@@ -2316,9 +2456,21 @@ fn doctor_distinguishes_modified_and_missing_managed_skill_files() {
     )
     .unwrap();
     fs::remove_file(harness.skill_root().join("agents/openai.yaml")).unwrap();
+    fs::write(
+        harness.review_skill_root().join("references/review.md"),
+        b"modified review\n",
+    )
+    .unwrap();
+    fs::remove_file(harness.review_skill_root().join("SKILL.md")).unwrap();
 
     let report = installer.doctor();
     assert!(!report.healthy);
+    assert!(report.checks.iter().any(|check| {
+        check.name == "global_skill.review_reference" && check.status == CheckStatus::ActionRequired
+    }));
+    assert!(report.checks.iter().any(|check| {
+        check.name == "global_skill.review_skill_md" && check.status == CheckStatus::Error
+    }));
     assert!(report.checks.iter().any(|check| {
         check.name == "global_skill.skill_md" && check.status == CheckStatus::ActionRequired
     }));

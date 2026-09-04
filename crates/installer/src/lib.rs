@@ -65,19 +65,37 @@ const KNOWLEDGE_SYNC_PUSH_ATTEMPTS: usize = 3;
 const GIT_NETWORK_TIMEOUT: Duration = Duration::from_secs(120);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PRODUCT_KEY: &str = "shared-context";
-const GLOBAL_SKILL_DIRECTORY: &str = ".agents/skills/shared-context";
-const SKILL_ASSETS: [(&str, &[u8]); 3] = [
+/// The one directory every managed global Agent Skill bundle lives under.
+const GLOBAL_SKILLS_DIRECTORY: &str = ".agents/skills";
+/// Bundle directory names under [`GLOBAL_SKILLS_DIRECTORY`], in install order. `shared-context`
+/// is the session gate; `sctx-review` carries the long-form governance procedures a user reaches
+/// explicitly. The first entry names the bundle a [`SkillReport`] points at.
+const GLOBAL_SKILL_DIRECTORIES: [&str; 2] = ["shared-context", "sctx-review"];
+/// Every managed Skill file, keyed by its path relative to [`GLOBAL_SKILLS_DIRECTORY`].
+const SKILL_ASSETS: [(&str, &[u8]); 6] = [
     (
-        "SKILL.md",
+        "shared-context/SKILL.md",
         include_bytes!("../../../skills/shared-context/SKILL.md"),
     ),
     (
-        "references/workflow.md",
+        "shared-context/references/workflow.md",
         include_bytes!("../../../skills/shared-context/references/workflow.md"),
     ),
     (
-        "agents/openai.yaml",
+        "shared-context/agents/openai.yaml",
         include_bytes!("../../../skills/shared-context/agents/openai.yaml"),
+    ),
+    (
+        "sctx-review/SKILL.md",
+        include_bytes!("../../../skills/sctx-review/SKILL.md"),
+    ),
+    (
+        "sctx-review/references/review.md",
+        include_bytes!("../../../skills/sctx-review/references/review.md"),
+    ),
+    (
+        "sctx-review/agents/openai.yaml",
+        include_bytes!("../../../skills/sctx-review/agents/openai.yaml"),
     ),
 ];
 const HOOK_EVENTS_CURSOR: [&str; 6] = [
@@ -129,6 +147,9 @@ pub enum SetupStage {
     GlobalSkillGateWritten,
     GlobalSkillWorkflowWritten,
     GlobalSkillMetadataWritten,
+    GlobalSkillReviewGateWritten,
+    GlobalSkillReviewReferenceWritten,
+    GlobalSkillReviewMetadataWritten,
     GlobalSkillWritten,
     LaunchAgentWritten,
     ManifestWritten,
@@ -1228,11 +1249,13 @@ impl Installer {
             }
             self.uninstall_launch_agent(manifest.launch_agent.as_ref(), &mut report);
             if had_expected_skill_ownership {
-                for directory in [
-                    global_skill_root(&self.context.home).join("references"),
-                    global_skill_root(&self.context.home).join("agents"),
-                    global_skill_root(&self.context.home),
-                ] {
+                let prunable = global_skill_roots(&self.context.home)
+                    .into_iter()
+                    .flat_map(|root| {
+                        [root.join("references"), root.join("agents"), root].into_iter()
+                    })
+                    .collect::<Vec<_>>();
+                for directory in prunable {
                     if !global_skill_directory_is_safe(&self.context.home, &directory)? {
                         if fs::symlink_metadata(&directory).is_ok() {
                             report.preserved.push(directory.clone());
@@ -2741,12 +2764,26 @@ struct SkillAssetInstall {
     changed: bool,
 }
 
+fn global_skills_root(home: &Path) -> PathBuf {
+    home.join(GLOBAL_SKILLS_DIRECTORY)
+}
+
+/// The bundle a [`SkillReport`] names. Every bundle installs and uninstalls together, so one path
+/// still describes the outcome; [`global_skill_roots`] is what the per-bundle work iterates.
 fn global_skill_root(home: &Path) -> PathBuf {
-    home.join(GLOBAL_SKILL_DIRECTORY)
+    global_skills_root(home).join(GLOBAL_SKILL_DIRECTORIES[0])
+}
+
+fn global_skill_roots(home: &Path) -> Vec<PathBuf> {
+    let root = global_skills_root(home);
+    GLOBAL_SKILL_DIRECTORIES
+        .iter()
+        .map(|directory| root.join(directory))
+        .collect()
 }
 
 fn global_skill_assets(home: &Path) -> Vec<(PathBuf, &'static [u8])> {
-    let root = global_skill_root(home);
+    let root = global_skills_root(home);
     SKILL_ASSETS
         .iter()
         .map(|(relative, bytes)| (root.join(relative), *bytes))
@@ -2783,7 +2820,6 @@ fn install_global_skill(
     notices: &mut Vec<String>,
     fail_after: Option<SetupStage>,
 ) -> Result<SkillInstall> {
-    let root = global_skill_root(home);
     let assets = global_skill_assets(home);
     let expected_paths = assets.iter().map(|(path, _)| path).collect::<BTreeSet<_>>();
     let mut ownership = prior_ownership.to_vec();
@@ -2797,11 +2833,9 @@ fn install_global_skill(
         }
     }
 
-    let owns_expected_file = prior_ownership
-        .iter()
-        .any(|owned| expected_paths.contains(&owned.path));
-    if let Some(status) = global_skill_location_conflict(home, &root, owns_expected_file, notices)?
-    {
+    // Every bundle is installed or preserved as one unit: a conflict in any single bundle stops
+    // the whole set, so an installation never ends up carrying half the managed Skills.
+    if let Some(status) = global_skill_location_conflict(home, prior_ownership, notices)? {
         return Ok(SkillInstall {
             changed: false,
             status,
@@ -2844,18 +2878,29 @@ fn install_global_skill(
 }
 
 fn global_skill_asset_stage(path: &Path) -> Result<SetupStage> {
-    if path.ends_with("SKILL.md") {
-        Ok(SetupStage::GlobalSkillGateWritten)
-    } else if path.ends_with("references/workflow.md") {
-        Ok(SetupStage::GlobalSkillWorkflowWritten)
-    } else if path.ends_with("agents/openai.yaml") {
-        Ok(SetupStage::GlobalSkillMetadataWritten)
-    } else {
-        Err(Error::new(
+    match global_skill_asset_relative(path) {
+        Some("shared-context/SKILL.md") => Ok(SetupStage::GlobalSkillGateWritten),
+        Some("shared-context/references/workflow.md") => Ok(SetupStage::GlobalSkillWorkflowWritten),
+        Some("shared-context/agents/openai.yaml") => Ok(SetupStage::GlobalSkillMetadataWritten),
+        Some("sctx-review/SKILL.md") => Ok(SetupStage::GlobalSkillReviewGateWritten),
+        Some("sctx-review/references/review.md") => {
+            Ok(SetupStage::GlobalSkillReviewReferenceWritten)
+        }
+        Some("sctx-review/agents/openai.yaml") => Ok(SetupStage::GlobalSkillReviewMetadataWritten),
+        _ => Err(Error::new(
             ErrorKind::InvariantViolation,
             format!("unexpected global Agent Skill asset: {}", path.display()),
-        ))
+        )),
     }
+}
+
+/// The [`SKILL_ASSETS`] key an installed path carries, matched by suffix so it stays independent
+/// of the home directory the caller resolved against.
+fn global_skill_asset_relative(path: &Path) -> Option<&'static str> {
+    SKILL_ASSETS
+        .iter()
+        .map(|(relative, _)| *relative)
+        .find(|relative| path.ends_with(relative))
 }
 
 fn global_skill_bundle_conflict(
@@ -2930,32 +2975,36 @@ fn global_skill_bundle_conflict(
 
 fn global_skill_location_conflict(
     home: &Path,
-    root: &Path,
-    owns_expected_file: bool,
+    prior_ownership: &[OwnedSkill],
     notices: &mut Vec<String>,
 ) -> Result<Option<SkillStatus>> {
-    match fs::symlink_metadata(root) {
-        Ok(_) if !owns_expected_file => {
-            notices.push(format!(
-                "preserved user-owned global Agent Skill at {}; Shared Context did not overwrite or claim it",
-                root.display()
-            ));
-            return Ok(Some(SkillStatus::Conflict));
+    for root in global_skill_roots(home) {
+        // Ownership is judged per bundle: a `sctx-review` directory an older build never wrote is
+        // a user's Skill of the same name, not a managed one this run may claim.
+        let owns_expected_file = prior_ownership
+            .iter()
+            .any(|owned| owned.path.starts_with(&root));
+        match fs::symlink_metadata(&root) {
+            Ok(_) if !owns_expected_file => {
+                notices.push(format!(
+                    "preserved user-owned global Agent Skill at {}; Shared Context did not overwrite or claim it",
+                    root.display()
+                ));
+                return Ok(Some(SkillStatus::Conflict));
+            }
+            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                notices.push(format!(
+                    "preserved managed global Agent Skill because its directory is no longer a non-symlink directory: {}",
+                    root.display()
+                ));
+                return Ok(Some(SkillStatus::Modified));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("inspect global Agent Skill")(error)),
+            Ok(_) => {}
         }
-        Ok(metadata)
-            if owns_expected_file && (!metadata.is_dir() || metadata.file_type().is_symlink()) =>
-        {
-            notices.push(format!(
-                "preserved managed global Agent Skill because its directory is no longer a non-symlink directory: {}",
-                root.display()
-            ));
-            return Ok(Some(SkillStatus::Modified));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(io_error("inspect global Agent Skill")(error)),
-        _ => {}
     }
-    for ancestor in [home.join(".agents"), home.join(".agents/skills")] {
+    for ancestor in [home.join(".agents"), global_skills_root(home)] {
         match fs::symlink_metadata(&ancestor) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             Ok(_) => {
@@ -5018,12 +5067,13 @@ fn check_global_skill(root: &Path, home: &Path, checks: &mut Vec<DoctorCheck>) {
     }
 
     for (path, desired) in assets {
-        let name = if path.ends_with("SKILL.md") {
-            "global_skill.skill_md"
-        } else if path.ends_with("references/workflow.md") {
-            "global_skill.workflow_reference"
-        } else {
-            "global_skill.openai_yaml"
+        let name = match global_skill_asset_relative(&path) {
+            Some("shared-context/SKILL.md") => "global_skill.skill_md",
+            Some("shared-context/references/workflow.md") => "global_skill.workflow_reference",
+            Some("shared-context/agents/openai.yaml") => "global_skill.openai_yaml",
+            Some("sctx-review/SKILL.md") => "global_skill.review_skill_md",
+            Some("sctx-review/references/review.md") => "global_skill.review_reference",
+            _ => "global_skill.review_openai_yaml",
         };
         let Some(owned) = manifest.skills.iter().find(|owned| owned.path == path) else {
             checks.push(action_required(

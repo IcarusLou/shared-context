@@ -30,6 +30,11 @@ const WORKFLOW_BYTES: &[u8] =
     include_bytes!("../../../skills/shared-context/references/workflow.md");
 const SKILL_METADATA_BYTES: &[u8] =
     include_bytes!("../../../skills/shared-context/agents/openai.yaml");
+const REVIEW_GATE_BYTES: &[u8] = include_bytes!("../../../skills/sctx-review/SKILL.md");
+const REVIEW_REFERENCE_BYTES: &[u8] =
+    include_bytes!("../../../skills/sctx-review/references/review.md");
+const REVIEW_METADATA_BYTES: &[u8] =
+    include_bytes!("../../../skills/sctx-review/agents/openai.yaml");
 
 #[derive(Debug, Deserialize)]
 struct Oracle {
@@ -49,6 +54,12 @@ struct SourceAssets {
     workflow: usize,
     #[serde(rename = "metadata_bytes")]
     metadata: usize,
+    #[serde(rename = "review_gate_bytes")]
+    review_gate: usize,
+    #[serde(rename = "review_reference_bytes")]
+    review_reference: usize,
+    #[serde(rename = "review_metadata_bytes")]
+    review_metadata: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1507,6 +1518,10 @@ impl InstallerFixture {
     fn skill_root(&self) -> PathBuf {
         self.home.join(".agents/skills/shared-context")
     }
+
+    fn review_skill_root(&self) -> PathBuf {
+        self.home.join(".agents/skills/sctx-review")
+    }
 }
 
 fn directory_bytes(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
@@ -1534,9 +1549,37 @@ fn installer_assets_are_exact_atomic_recoverable_and_never_touch_business_reposi
         fs::read(skill.join("agents/openai.yaml")).unwrap(),
         SKILL_METADATA_BYTES
     );
+    let review = fixture.review_skill_root();
+    assert_eq!(
+        fs::read(review.join("SKILL.md")).unwrap(),
+        REVIEW_GATE_BYTES
+    );
+    assert_eq!(
+        fs::read(review.join("references/review.md")).unwrap(),
+        REVIEW_REFERENCE_BYTES
+    );
+    assert_eq!(
+        fs::read(review.join("agents/openai.yaml")).unwrap(),
+        REVIEW_METADATA_BYTES
+    );
     assert_eq!(SKILL_GATE_BYTES.len(), oracle.source_assets.gate);
     assert_eq!(WORKFLOW_BYTES.len(), oracle.source_assets.workflow);
     assert_eq!(SKILL_METADATA_BYTES.len(), oracle.source_assets.metadata);
+    assert_eq!(REVIEW_GATE_BYTES.len(), oracle.source_assets.review_gate);
+    assert_eq!(
+        REVIEW_REFERENCE_BYTES.len(),
+        oracle.source_assets.review_reference
+    );
+    assert_eq!(
+        REVIEW_METADATA_BYTES.len(),
+        oracle.source_assets.review_metadata
+    );
+    // The split only pays for itself if the session-hot reference actually shrank: the review
+    // procedures moved into a second bundle instead of being duplicated into both.
+    assert!(
+        WORKFLOW_BYTES.len() < 21_000,
+        "the core workflow reference must stay slimmer than the pre-split bundle"
+    );
 
     fs::write(&fixture.runtime, b"signed-runtime-v2").unwrap();
     let failed = fixture
@@ -1554,6 +1597,10 @@ fn installer_assets_are_exact_atomic_recoverable_and_never_touch_business_reposi
         SKILL_METADATA_BYTES
     );
     assert_eq!(
+        fs::read(review.join("references/review.md")).unwrap(),
+        REVIEW_REFERENCE_BYTES
+    );
+    assert_eq!(
         fs::read_link(fixture.root.join("bin/current")).unwrap(),
         PathBuf::from("1.0.0/arm64")
     );
@@ -1562,6 +1609,7 @@ fn installer_assets_are_exact_atomic_recoverable_and_never_touch_business_reposi
     assert!(!skill.join("SKILL.md").exists());
     assert!(!skill.join("references/workflow.md").exists());
     assert!(!skill.join("agents/openai.yaml").exists());
+    assert!(!review.exists());
     assert_eq!(
         directory_bytes(&fixture.business_repository),
         business_before
@@ -1581,6 +1629,9 @@ fn installer_assets_are_exact_atomic_recoverable_and_never_touch_business_reposi
         b"user-owned skill\n"
     );
     assert!(!conflict_skill.join("references/workflow.md").exists());
+    // One conflicting bundle preserves the whole set: an installation never carries half the
+    // managed Skills.
+    assert!(!conflict.review_skill_root().exists());
     conflict.installer("1.0.0").uninstall().unwrap();
     assert!(conflict_skill.join("SKILL.md").exists());
 }

@@ -123,7 +123,7 @@ Engineering Context Sharing
 
 的转变。
 
-原始 Agent Conversation / Trace 不作为产品输入。工作 Agent 直接把已经形成的结论、理由、适用条件、证据摘要与局限写成 Checkpoint；这些内容在人工确认前仍是不可信 Candidate。
+原始 Agent Conversation / Trace 不作为产品输入。工作 Agent 直接把已经形成的结论、理由、适用条件、证据摘要与局限写成 Checkpoint；这些内容在一次明确处置（人工确认，或服务端校验通过的 Agent 自动确认，ADR-0005）之前仍是不可信 Candidate。
 
 ---
 
