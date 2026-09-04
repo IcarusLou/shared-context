@@ -186,3 +186,71 @@ fn usage_outcomes_are_per_task_and_never_downgrade_a_refutation() {
     );
     assert!(runtime.context_usage_totals(&[]).unwrap().is_empty());
 }
+
+/// Reuse is monotonic within one `(context, task)` pair.
+///
+/// Four independent signals decide reuse at different moments of one Task, and the ones that
+/// arrive last -- the Candidate analysis assessment above all -- run after the Candidate Build
+/// pass that writes the omissions. A Build rerun re-derives the early signals only, so if a
+/// re-recorded `ignored` could overwrite a stored `reused`, every recovery drain would erase the
+/// proof the analysis had just established.
+#[test]
+fn a_recorded_reuse_is_never_downgraded_by_a_later_omission() {
+    let root = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(root.path()).unwrap();
+    let (task_id, _) = open_task(&runtime, "session-usage-monotonic");
+    let context_id = ContextId::new();
+
+    let reused = ContextUsageTotals {
+        reused: 1,
+        ignored: 0,
+        refuted: 0,
+    };
+    let record = |outcome, at| {
+        runtime
+            .record_context_usage_at(
+                &[ContextUsageRecord {
+                    context_id,
+                    task_id,
+                    outcome,
+                }],
+                at,
+            )
+            .unwrap()
+    };
+
+    record(ContextUsageOutcome::Ignored, 1_000);
+    record(ContextUsageOutcome::Reused, 2_000);
+    assert_eq!(
+        runtime.context_usage_totals(&[context_id]).unwrap()[&context_id],
+        reused
+    );
+
+    // The Candidate Build reruns and re-derives only the early signals.
+    record(ContextUsageOutcome::Ignored, 3_000);
+    assert_eq!(
+        runtime.context_usage_totals(&[context_id]).unwrap()[&context_id],
+        reused,
+        "an omission is the absence of evidence and cannot retract a proof"
+    );
+
+    // Re-running the analysis writes the same verdict without doubling the count.
+    record(ContextUsageOutcome::Reused, 4_000);
+    assert_eq!(
+        runtime.context_usage_totals(&[context_id]).unwrap()[&context_id],
+        reused,
+        "one pair contributes one row however often it is re-derived"
+    );
+
+    // A refutation still outranks reuse, and reuse cannot walk it back.
+    record(ContextUsageOutcome::Refuted, 5_000);
+    record(ContextUsageOutcome::Reused, 6_000);
+    assert_eq!(
+        runtime.context_usage_totals(&[context_id]).unwrap()[&context_id],
+        ContextUsageTotals {
+            reused: 0,
+            ignored: 0,
+            refuted: 1,
+        }
+    );
+}

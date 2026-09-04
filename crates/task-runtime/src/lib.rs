@@ -37,7 +37,7 @@ pub use reference_derivation::{
     ResolvedReference, claim_topic_key, derive_claim_references, unresolvable,
 };
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const HOOK_BUSY_TIMEOUT: Duration = Duration::from_millis(25);
 const MAX_EPISODE_LIST_LIMIT: usize = 256;
@@ -614,8 +614,13 @@ pub struct TaskInjectionRecord {
 
 /// What one Task did with a Context that was injected into it.
 ///
-/// `Refuted` is the highest priority: a Context an Agent contradicted must never be downgraded
-/// back to `Reused` or `Ignored` by a later write for the same Task.
+/// The outcomes are monotonic within one `(context, task)` pair: `Ignored` is the absence of
+/// evidence, `Reused` is proof the Task built on the Context, and `Refuted` is proof it
+/// contradicted it. Evidence never expires, so a later write may only move a pair upwards. Reuse
+/// is proven by several independent signals derived at different moments of one Task — a Claim
+/// naming the Context, a Claim landing on its coordinate, the Candidate analysis assessing a
+/// relation to it, an Intent revision quoting it — and the ones that arrive last must not be
+/// erased by a re-derivation of the ones that arrive first.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ContextUsageOutcome {
     Ignored,
@@ -636,10 +641,17 @@ impl ContextUsageOutcome {
     /// Higher wins when two writes disagree about the same `(context, task)` pair.
     const fn priority(self) -> u8 {
         match self {
-            Self::Ignored | Self::Reused => 0,
-            Self::Refuted => 1,
+            Self::Ignored => 0,
+            Self::Reused => 1,
+            Self::Refuted => 2,
         }
     }
+
+    /// The SQL expression that reads one stored outcome's priority, for the upsert guard.
+    ///
+    /// It mirrors [`Self::priority`] and must stay in step with it.
+    const PRIORITY_SQL: &'static str =
+        "CASE context_usage.outcome WHEN 'refuted' THEN 2 WHEN 'reused' THEN 1 ELSE 0 END";
 }
 
 /// One `(context, task)` usage decision derived by the server from a Checkpoint or Confirmation.
@@ -3584,9 +3596,10 @@ impl TaskRuntime {
 
     /// Records what one Task did with the Contexts injected into it.
     ///
-    /// The last write for a `(context, task)` pair wins, except that `refuted` is never
-    /// downgraded. Re-deriving the same outcomes writes the same rows, so a same-content
-    /// Checkpoint replay leaves the table unchanged.
+    /// A write only ever raises a `(context, task)` pair: `ignored` never overwrites `reused` or
+    /// `refuted`, and `reused` never overwrites `refuted`. Re-deriving the same outcomes writes
+    /// the same rows, so a same-content Checkpoint replay leaves the table unchanged, and a
+    /// Candidate Build rerun cannot erase reuse a later signal already proved.
     ///
     /// # Errors
     ///
@@ -3612,17 +3625,21 @@ impl TaskRuntime {
             .map_err(|_| invalid("Context usage timestamp exceeds the supported range"))?;
         let mut connection = self.open_connection()?;
         let transaction = immediate(&mut connection, "begin Context usage record")?;
+        let statement = format!(
+            "INSERT INTO context_usage (
+                context_id, task_id, outcome, recorded_at_unix_seconds
+             ) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (context_id, task_id) DO UPDATE SET
+                outcome = excluded.outcome,
+                recorded_at_unix_seconds = excluded.recorded_at_unix_seconds
+             WHERE ?5 >= ({})",
+            ContextUsageOutcome::PRIORITY_SQL
+        );
         let mut written = 0;
         for record in records {
             written += transaction
                 .execute(
-                    "INSERT INTO context_usage (
-                        context_id, task_id, outcome, recorded_at_unix_seconds
-                     ) VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT (context_id, task_id) DO UPDATE SET
-                        outcome = excluded.outcome,
-                        recorded_at_unix_seconds = excluded.recorded_at_unix_seconds
-                     WHERE ?5 >= (CASE context_usage.outcome WHEN 'refuted' THEN 1 ELSE 0 END)",
+                    &statement,
                     params![
                         record.context_id.to_string(),
                         record.task_id.to_string(),
@@ -3896,7 +3913,11 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
         version = 14;
     }
     if version == 14 {
-        return migrate_schema_14_to_15(connection);
+        migrate_schema_14_to_15(connection)?;
+        version = 15;
+    }
+    if version == 15 {
+        return migrate_schema_15_to_16(connection);
     }
     if version != 0 && version != SCHEMA_VERSION {
         return Err(invariant(format!(
@@ -4258,7 +4279,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
             ) STRICT;
             CREATE INDEX IF NOT EXISTS hook_event_recorded_at
                 ON hook_event (recorded_at_unix_ms);
-            PRAGMA user_version = 15;",
+            PRAGMA user_version = 16;",
         )
         .map_err(sql_error("initialize task runtime schema"))
 }
@@ -4313,6 +4334,34 @@ fn migrate_schema_14_to_15(connection: &Connection) -> Result<()> {
         )
         .map_err(sql_error(
             "migrate task runtime schema from version 14 to 15",
+        ))
+}
+
+/// Discards every recorded *omission* on an existing schema version 15 installation and advances
+/// `user_version` to 16, in one transaction.
+///
+/// Version 15 decided reuse from two signals only: a Claim naming the `ContextId`, or a Claim's
+/// server-derived Engineering References intersecting the Context's own. Three real sessions
+/// showed both missing a reuse that had plainly happened — a Context quoted into the Working
+/// Intent and acted on, a Context the Candidate analysis itself assessed as `supports` — and every
+/// one of those was written down as `ignored`, so the usage prior penalized exactly the Contexts
+/// that worked. Two further signals now decide reuse, which makes every stored `ignored` row a
+/// verdict this version would no longer reach on the same input, and none of them can be
+/// re-derived: the Claims and analyses behind them are already built.
+///
+/// Only `ignored` is discarded. `reused` and `refuted` are proofs, not absences: no signal was
+/// removed in this version, so both still hold under the wider rule. `task_injection` is untouched
+/// here as it was in 14 -> 15: what was injected into which Task is a fact.
+fn migrate_schema_15_to_16(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+            DELETE FROM context_usage WHERE outcome = 'ignored';
+            PRAGMA user_version = 16;
+            COMMIT;",
+        )
+        .map_err(sql_error(
+            "migrate task runtime schema from version 15 to 16",
         ))
 }
 
