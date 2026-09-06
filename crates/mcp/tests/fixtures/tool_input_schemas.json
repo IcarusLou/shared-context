@@ -994,7 +994,7 @@
         "type": "integer"
       },
       "token_budget": {
-        "default": 2000,
+        "default": 8000,
         "minimum": 256,
         "type": "integer"
       }
@@ -1165,7 +1165,7 @@
         "type": "integer"
       },
       "token_budget": {
-        "default": 2000,
+        "default": 8000,
         "minimum": 256,
         "type": "integer"
       }

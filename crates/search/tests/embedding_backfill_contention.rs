@@ -4,9 +4,10 @@
 //! `sctx mcp serve` publishes the semantic channel *before* it finishes embedding the corpus, so
 //! for the length of the backfill every user query shares one ONNX session with a loop of the most
 //! expensive encodes in the system. On this machine a full-length corpus encode is about 1060 ms
-//! at p95 against a 1200 ms budget, so this is not a fairness problem that yielding between corpus
-//! texts can solve: one corpus text already costs most of the budget. The repair aborts the corpus
-//! run in flight when a query arrives.
+//! at p95 against a 2000 ms budget, so this is not a fairness problem that yielding between corpus
+//! texts can solve: one corpus text already costs half the budget, and on the loaded machine the
+//! budget was raised for it costs all of it. The repair aborts the corpus run in flight when a
+//! query arrives.
 //!
 //! Two phases, because a fix for either half alone is easy and wrong:
 //!

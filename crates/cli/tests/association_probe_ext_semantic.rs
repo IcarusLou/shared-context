@@ -56,7 +56,7 @@ use serde_json::Value;
 const PROBE_FIXTURE: &str = include_str!("../../../fixtures/association/probe-ext-v1.json");
 
 /// The `task_intent_update` defaults the real automatic path uses (`crates/mcp/src/lib.rs`).
-const AUTOMATIC_TOKEN_BUDGET: usize = 2_000;
+const AUTOMATIC_TOKEN_BUDGET: usize = 8_000;
 const AUTOMATIC_MAX_SPACES: usize = 8;
 
 /// What the blocking ext suite measures for `task_intent_update` through the real binary.

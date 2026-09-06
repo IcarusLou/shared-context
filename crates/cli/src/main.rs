@@ -4149,8 +4149,10 @@ fn run_task_context(args: &[String], json_output: bool) -> Result<()> {
     let input = TaskContextReadInput {
         agent_kind: options.required("--agent-kind")?.to_owned(),
         external_session_id: options.required("--external-session-id")?.to_owned(),
+        // Mirrors `default_token_budget()` in `crates/mcp/src/lib.rs`; the two entry points read
+        // the same Pack and must not disagree about how much of it the caller gets.
         token_budget: parse_usize(
-            options.optional("--token-budget")?.unwrap_or("2000"),
+            options.optional("--token-budget")?.unwrap_or("8000"),
             "token budget",
         )?,
         max_spaces: parse_usize(

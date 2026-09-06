@@ -8059,7 +8059,7 @@ fn tools_list() -> Value {
                 "properties": {
                     "agent_kind": {"type": "string", "minLength": 1},
                     "external_session_id": {"type": "string", "minLength": 1},
-                    "token_budget": {"type": "integer", "minimum": MIN_TASK_CONTEXT_TOKEN_BUDGET, "default": 2000},
+                    "token_budget": {"type": "integer", "minimum": MIN_TASK_CONTEXT_TOKEN_BUDGET, "default": 8000},
                     "max_spaces": {"type": "integer", "minimum": 1, "maximum": MAX_TASK_MAX_SPACES, "default": DEFAULT_TASK_MAX_SPACES},
                     "detail_level": detail_level_schema()
                 }
@@ -8236,7 +8236,7 @@ fn task_artifact_focus_schema() -> Value {
             "expected_revision_id": id_schema("tir_"),
             "absolute_file_path": {"type": "string", "minLength": 1},
             "locator": task_artifact_focus_coordinates_schema(),
-            "token_budget": {"type": "integer", "minimum": MIN_TASK_CONTEXT_TOKEN_BUDGET, "default": 2000},
+            "token_budget": {"type": "integer", "minimum": MIN_TASK_CONTEXT_TOKEN_BUDGET, "default": 8000},
             "max_spaces": {"type": "integer", "minimum": 1, "maximum": MAX_TASK_MAX_SPACES, "default": DEFAULT_TASK_MAX_SPACES},
             "detail_level": detail_level_schema()
         }
@@ -9179,8 +9179,46 @@ const fn default_page_size() -> usize {
     20
 }
 
+/// Token ceiling one automatic Task Context Pack may charge when the caller names none.
+///
+/// This is the budget every `task_intent_update` spends, so it decides how much of what
+/// retrieval found actually reaches the Agent. It was 2000, and 2000 was measured against
+/// probe fixtures whose queries are one short sentence: across all 84 probes in
+/// `probe-v1`/`probe-zh-v1`/`probe-ext-v1` the largest complete compact Pack is 1832 tokens, so
+/// no probe was ever truncated and the suites could not see the ceiling at all.
+///
+/// A real Working Intent is not one sentence. Replaying the 22 Intent revisions of Codex session
+/// 01a06b3e against that installation's own 21 accepted Contexts (compact detail, the automatic
+/// path's own shape), 19 retrieved something and **18 of those 19 were truncated**: the Pack kept
+/// 3 Contexts at the median and reported 17 more as `item_token_budget` omissions. The session's
+/// own `task_injection` rows agree -- never more than three Contexts injected per Intent update.
+///
+/// Measured cost of the whole compact Pack, same replay, by budget (19 retrieving Intents):
+///
+/// | budget | tokens p50 | tokens p95 | items p50 | items max | still truncated |
+/// |-------:|-----------:|-----------:|----------:|----------:|----------------:|
+/// |   2000 |       1959 |       1995 |         3 |         3 |           18/19 |
+/// |   4000 |       3798 |       3983 |         6 |         8 |           17/19 |
+/// |   6000 |       5770 |       5979 |        11 |        13 |           17/19 |
+/// |   8000 |       7522 |       7933 |        15 |        18 |           12/19 |
+/// |  12000 |       8769 |       9333 |        19 |        20 |            0/19 |
+///
+/// 8000 is not the value that ends truncation -- that is about 9400, and it is not a budget worth
+/// having. On this corpus the retrieval gate admits 20 of 21 accepted Contexts for a broad
+/// Working Intent, so "never truncate" means "return the whole installation on every Intent
+/// update", and the retrieval candidate limit lets that grow to a hundred items on a larger
+/// corpus. A budget that tracks corpus size is not a bound.
+///
+/// 8000 is the value that fixes what the 2000 ceiling actually broke. It carries 15 of the 19--20
+/// Contexts the gate admitted at the median, against 3 before, while staying a fixed cost the
+/// caller can reason about: under 8000 tokens per automatic Pack no matter how large the corpus
+/// gets. What it drops is still named -- the compact packer lists the first
+/// `COMPACT_NAMED_OMISSION_LIMIT` omissions by Context ID and collapses the rest -- so a truncated
+/// Pack remains one `context_get` away from anything it left out. Callers that want a different
+/// trade set `token_budget` explicitly; the floor stays
+/// [`MIN_TASK_CONTEXT_TOKEN_BUDGET`].
 const fn default_token_budget() -> usize {
-    2_000
+    8_000
 }
 
 const fn default_max_spaces() -> usize {

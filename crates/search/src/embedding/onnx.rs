@@ -116,7 +116,7 @@ enum Priority {
 ///
 /// * **A corpus encode never starts while a query is waiting or running.** That alone bounds a
 ///   query's wait at the corpus text already in flight -- but on this machine a full-length corpus
-///   encode is 1062 ms at p95 against a 1200 ms budget, so "one corpus text" is already most of
+///   encode is 1062 ms at p95 against a 2000 ms budget, so "one corpus text" is already half of
 ///   the budget and a real query still misses it. Yielding between texts cannot fix a single text
 ///   that costs what the whole budget costs.
 /// * **A corpus encode in flight is aborted when a query arrives.** ONNX Runtime can be told to

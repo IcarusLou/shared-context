@@ -96,15 +96,24 @@ pub const SEMANTIC_CHANNEL_LIMIT: usize = 16;
 /// [`SEMANTIC_MAX_TOKENS`] caps the sequence, so 1400 characters is already at the truncation
 /// ceiling and 816 ms is the worst warm encode this machine can be asked for.
 ///
-/// 1200 ms is that ceiling plus headroom. It is a *ceiling*, not a typical cost: the 283-character
-/// query that exposed the defect returns in about 200 ms and the budget is never spent, and a
-/// repeat of any query is served from the query vector cache for nothing at all. What the number
-/// buys is that a machine roughly five times slower than this one still answers a real Intent
-/// instead of degrading silently, which is the failure this constant caused.
+/// Every row above is a quiet machine, and that is the table's limit. Codex session 01a06b3e --
+/// 6.7 hours of real work, the machine also running builds and the Agent itself -- encoded at
+/// three to five times these numbers: a 76-character query took 379 ms against a 78 ms quiet p95,
+/// and a 394-character query took **1505 ms and timed out**, which is a length the quiet table
+/// answers in under 300 ms. The 1200 ms budget did not fail because the machine is slow; it failed
+/// because a busy machine is the normal case and the calibration only ever saw an idle one.
+///
+/// 2000 ms is the quiet 512-token ceiling (816 ms) carried through that measured 3--5x load
+/// factor: even the longest query this constant can be asked for stays inside the budget while
+/// the machine is under the load a real session puts it under. It remains a *ceiling*, not a
+/// typical cost -- the 283-character query that exposed the original defect returns in about
+/// 200 ms quiet, and a repeat of any query is served from the query vector cache for nothing at
+/// all. What the number buys is that the channel keeps answering during exactly the long sessions
+/// that accumulate the most Context, instead of degrading silently once the machine gets busy.
 ///
 /// Operators on slower hardware raise it with `[retrieval] embedding_encode_budget_ms`; `sctx
 /// doctor` says so when it sees encodes timing out.
-pub const SEMANTIC_ENCODE_BUDGET: Duration = Duration::from_millis(1_200);
+pub const SEMANTIC_ENCODE_BUDGET: Duration = Duration::from_secs(2);
 
 /// Query vectors kept in the process-lifetime LRU that fronts the encoder.
 ///
