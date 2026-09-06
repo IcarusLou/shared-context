@@ -20,4 +20,4 @@ If the trusted marker is absent:
 - For an explicit `$sctx-review` invocation, reply exactly once: `Shared Context is unavailable for this session.` Do not include paths, Repository or Catalog details, or internal errors. Do not read any reference or call any Shared Context MCP tool.
 - For implicit or automatic selection, do not read any reference, do not call any Shared Context MCP tool, and do not emit a Shared Context capability or unavailable message. Stop using this Skill and continue the user's ordinary work.
 
-If the trusted marker is present, read [references/review.md](references/review.md) completely exactly once, then follow it.
+If the trusted marker is present, read [references/review.md](references/review.md) completely once per context window (again after a compaction, when the PreCompact marker reappears), then follow it.

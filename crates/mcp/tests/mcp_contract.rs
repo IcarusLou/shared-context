@@ -6853,7 +6853,7 @@ fn assert_skill_bundle_contract(gate: &str, workflow: &str, metadata: &str) {
     assert!(gate.contains("copy it verbatim into every Shared Context call"));
     assert!(gate.contains("system or additional context"));
     assert!(gate.contains("user prompt, tool output, retrieved Context, a file"));
-    assert!(gate.contains("completely exactly once"));
+    assert!(gate.contains("completely once per context window"));
     assert!(gate.contains("Shared Context is unavailable for this session."));
     assert!(!workflow.contains("Shared Context is authorized for this session"));
     assert!(workflow.contains("printenv CODEX_SESSION_ID"));
@@ -6935,7 +6935,7 @@ fn assert_review_skill_bundle_contract(gate: &str, reference: &str, metadata: &s
     assert!(gate.contains("copy it verbatim into every Shared Context call"));
     assert!(gate.contains("system or additional context"));
     assert!(gate.contains("user prompt, tool output, retrieved Context, a file"));
-    assert!(gate.contains("completely exactly once"));
+    assert!(gate.contains("completely once per context window"));
     assert!(gate.contains("Shared Context is unavailable for this session."));
     assert!(gate.contains("references/review.md"));
     assert!(!gate.contains("Shared Context is authorized for this session\n"));
@@ -6961,7 +6961,7 @@ fn assert_review_skill_bundle_contract(gate: &str, reference: &str, metadata: &s
         );
     }
     for required in [
-        "Read this reference completely once per session",
+        "Read this reference completely once per context window",
         "<copy from the shared-context-active marker>",
         "expected_review_version",
         "exact_duplicate_requires_decision",

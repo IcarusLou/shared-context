@@ -2,11 +2,11 @@
   "schema": "sctx.repository-scoped-context.acceptance.v1",
   "activation_marker_template": "<shared-context-active external_session_id=\"{host_session_id}\">Shared Context is authorized for this session. Before substantive work, call task_intent_update with agent_kind \"{agent_kind}\" and external_session_id \"{host_session_id}\" (copy it verbatim; never invent one).</shared-context-active>",
   "source_assets": {
-    "gate_bytes": 2317,
-    "workflow_bytes": 19442,
+    "gate_bytes": 2393,
+    "workflow_bytes": 18185,
     "metadata_bytes": 263,
-    "review_gate_bytes": 2819,
-    "review_reference_bytes": 15201,
+    "review_gate_bytes": 2895,
+    "review_reference_bytes": 14532,
     "review_metadata_bytes": 278
   },
   "token_proxy": {
