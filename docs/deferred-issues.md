@@ -58,3 +58,7 @@
 32. **机会轨 spawn 使 Enabled SessionStart 多写一行 hook_event**（`opportunistic_maintenance_started`/`_unavailable`，Neutral）。目前无精确条数断言，未来加断言时注意。
 33. **`~/Library/LaunchAgents` 若由本产品创建为 0o700**（沿用 `ensure_directory_preserving_mode`），比系统惯例 0o755 严；功能正常，仅与惯例不一致。
 
+## 2026-09-04 新增（真实会话 01a06b3e 分析，用户裁定暂缓）
+
+34. **Codex `SessionEnd` 从未解码成功**：`adapter-codex/src/lib.rs:223` 的 `require_one_of(reason, ["other"])` 只接受字面量 `"other"`，Codex 0.153.2 发送其他 reason 值 → 累计 53 次 `payload_decode_failed`（N2 指纹确认 keys=[cwd,hook_event_name,reason,session_id,transcript_path]）。WP-O 当初只放宽了 Cursor 的 lifecycle 枚举透传，漏了 Codex 此处。后果：SessionEnd 的租约/提醒清理从不执行，孤儿租约靠 30 天回收兜底。修法：与 `adapter-cursor/src/lib.rs:198,274` 对齐（透传 + 非空校验），一行级。用户 2026-09-04 裁定：不紧急，后续再修。
+
