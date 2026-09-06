@@ -16,6 +16,9 @@ members = [
     "crates/cli",
     "crates/scenario-contract",
     "crates/scenario-runner",
+    "crates/telemetry",
+    "crates/log-service",
+    "crates/log-sync",
 ]
 resolver = "3"
 
@@ -47,6 +50,9 @@ sctx-search = { path = "crates/search" }
 sctx-scenario-contract = { path = "crates/scenario-contract" }
 sctx-scenario-runner = { path = "crates/scenario-runner" }
 sctx-task-runtime = { path = "crates/task-runtime" }
+sctx-telemetry = { path = "crates/telemetry" }
+sctx-log-service = { path = "crates/log-service" }
+sctx-log-sync = { path = "crates/log-sync" }
 uuid = { version = "1.18", features = ["v4"] }
 toml = "0.9"
 

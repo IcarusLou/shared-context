@@ -1,0 +1,23 @@
+[package]
+name = "sctx-log-sync"
+description = "Independent bounded Git uploader for Shared Context logs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+fs2.workspace = true
+nix = { version = "0.29", features = ["process", "signal"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sctx-log-service.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+sctx-telemetry.workspace = true
+tempfile = "3.20"
+
+[lints]
+workspace = true

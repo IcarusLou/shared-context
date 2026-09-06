@@ -1,9 +1,10 @@
 //! `sctx` command-line entry point.
 
 mod args;
+mod logs;
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
@@ -63,8 +64,8 @@ use sctx_search::{
     SearchMatchMode, SearchRequest,
 };
 use sctx_task_runtime::{
-    AutomatedEpisodeBoundary, CandidateBuildStatus, HookEventDecision, HookEventRecord,
-    SignalRetentionRule, TaskRuntime,
+    AutomatedEpisodeBoundary, CandidateBuildStatus, HookEventDecision, SignalRetentionRule,
+    TaskRuntime,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -87,6 +88,7 @@ Commands:
   data reset [--dry-run] [--yes]
   maintain run [--opportunistic] | maintain status
   knowledge sync|delete
+  logs init|collect|sync|status|prune|doctor|enable|disable|report|trace
   embedding install|status|remove
   space create|intent revise|list|get
   candidate list|get|discard|confirm|stats|build-closed-episode|analyze
@@ -137,12 +139,137 @@ Evidence JSON shape:
 fn main() -> ExitCode {
     let raw = env::args_os().skip(1).collect::<Vec<_>>();
     let json_output = raw.iter().any(|arg| arg == "--json");
-    match utf8_args(raw).and_then(|args| run(&args, json_output)) {
-        Ok(()) => ExitCode::SUCCESS,
+    match utf8_args(raw) {
+        Ok(args) => {
+            let telemetry = CliTelemetry::new(&args);
+            let result = run(&args, json_output);
+            if let Some(telemetry) = telemetry {
+                telemetry.finish(result.as_ref().err());
+            }
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    emit_error(&error, json_output);
+                    ExitCode::from(2)
+                }
+            }
+        }
         Err(error) => {
             emit_error(&error, json_output);
             ExitCode::from(2)
         }
+    }
+}
+
+struct CliTelemetry {
+    logs_root: PathBuf,
+    invocation_id: String,
+    operation: &'static str,
+    started: Instant,
+}
+
+impl CliTelemetry {
+    fn new(args: &[String]) -> Option<Self> {
+        let operation = cli_operation(args)?;
+        let logs_root = sctx_telemetry::default_logs_root()?;
+        let invocation_id = sctx_telemetry::new_invocation_id();
+        let event = sctx_telemetry::Event::started(
+            sctx_telemetry::EntryPoint::Cli,
+            sctx_telemetry::EventKind::OperationStarted,
+            invocation_id.clone(),
+            operation,
+        );
+        let _ = sctx_telemetry::emit_to(&logs_root, &event);
+        Some(Self {
+            logs_root,
+            invocation_id,
+            operation,
+            started: Instant::now(),
+        })
+    }
+
+    fn finish(self, error: Option<&Error>) {
+        let mut event = sctx_telemetry::Event::finished(
+            sctx_telemetry::EntryPoint::Cli,
+            sctx_telemetry::EventKind::OperationFinished,
+            self.invocation_id,
+            self.operation,
+            if error.is_some() {
+                sctx_telemetry::Outcome::Failure
+            } else {
+                sctx_telemetry::Outcome::Success
+            },
+        );
+        event.sequence = 1;
+        event.duration_ms =
+            Some(u32::try_from(self.started.elapsed().as_millis()).unwrap_or(u32::MAX));
+        if let Some(error) = error {
+            event.error_code = Some(telemetry_error_code(error.kind()).to_owned());
+            event.error_family = Some(error_family(error.kind()).to_owned());
+        }
+        let _ = sctx_telemetry::emit_to(&self.logs_root, &event);
+    }
+}
+
+fn cli_operation(args: &[String]) -> Option<&'static str> {
+    let first = args.first()?.as_str();
+    let second = args.get(1).map(String::as_str);
+    match (first, second) {
+        ("setup", _) => Some("setup"),
+        ("demo", _) => Some("demo"),
+        ("doctor", _) if args.iter().any(|arg| arg == "--hooks") => Some("doctor.hooks"),
+        ("doctor", _) if args.iter().any(|arg| arg == "--recheck") => Some("doctor.recheck"),
+        ("doctor", _) => Some("doctor"),
+        ("upgrade", _) => Some("upgrade"),
+        ("uninstall", _) => Some("uninstall"),
+        ("search", _) => Some("search"),
+        ("validate", _) => Some("validate"),
+        ("data", Some("reset")) => Some("data.reset"),
+        ("maintain", Some("run")) => Some("maintain.run"),
+        ("maintain", Some("status")) => Some("maintain.status"),
+        ("knowledge", Some("sync")) => Some("knowledge.sync"),
+        ("knowledge", Some("delete")) => Some("knowledge.delete"),
+        ("embedding", Some("install")) => Some("embedding.install"),
+        ("embedding", Some("status")) => Some("embedding.status"),
+        ("embedding", Some("remove")) => Some("embedding.remove"),
+        ("space", Some("create")) => Some("space.create"),
+        ("space", Some("list")) => Some("space.list"),
+        ("space", Some("get")) => Some("space.get"),
+        ("space", Some("intent")) => Some("space.intent"),
+        ("candidate", Some("list")) => Some("candidate.list"),
+        ("candidate", Some("get")) => Some("candidate.get"),
+        ("candidate", Some("discard")) => Some("candidate.discard"),
+        ("candidate", Some("confirm")) => Some("candidate.confirm"),
+        ("candidate", Some("stats")) => Some("candidate.stats"),
+        ("candidate", Some("build-closed-episode")) => Some("candidate.build_closed_episode"),
+        ("candidate", Some("analyze")) => Some("candidate.analyze"),
+        ("context", Some("revise")) => Some("context.revise"),
+        ("context", Some("review")) => Some("context.review"),
+        ("context", Some("publish")) => Some("context.publish"),
+        ("context", Some("withdraw")) => Some("context.withdraw"),
+        ("context", Some("get")) => Some("context.get"),
+        ("semantic", Some("conflict")) => Some("semantic.conflict"),
+        ("task", Some("context")) => Some("task.context"),
+        ("task", Some("artifact-focus")) => Some("task.artifact_focus"),
+        ("task", Some("checkpoint")) => Some("task.checkpoint"),
+        ("task", Some("intent")) => Some("task.intent"),
+        ("task", Some("signal")) => Some("task.signal"),
+        ("repository", Some("add")) => Some("repository.add"),
+        ("repository", Some("list")) => Some("repository.list"),
+        ("repository", Some("doctor")) => Some("repository.doctor"),
+        ("repository", Some("rename")) => Some("repository.rename"),
+        ("repository", Some("scan")) => Some("repository.scan"),
+        ("engineering-reference", Some("record")) => Some("engineering_reference.record"),
+        ("association", Some("explain")) => Some("association.explain"),
+        ("association", Some("rebuild")) => Some("association.rebuild"),
+        ("index", Some("rebuild")) => Some("index.rebuild"),
+        ("index", Some("status")) => Some("index.status"),
+        ("pending", Some("list")) => Some("pending.list"),
+        ("pending", Some("commit")) => Some("pending.commit"),
+        ("pending", Some("move-aside")) => Some("pending.move_aside"),
+        // Hooks have their own decision event. Logging commands never recursively log. MCP is a
+        // long-lived protocol boundary and records typed tool/protocol events instead.
+        _ => None,
     }
 }
 
@@ -213,6 +340,7 @@ fn run_without_maintenance(args: &[String], json_output: bool) -> Result<()> {
         [group, rest @ ..] if group == "maintain" => run_maintain(rest, json_output),
         [group, rest @ ..] if group == "knowledge" => run_knowledge(rest, json_output),
         [group, rest @ ..] if group == "embedding" => run_embedding(rest, json_output),
+        [group, rest @ ..] if group == "logs" => logs::run(rest, json_output),
         [group, rest @ ..] if group == "space" => run_space(rest, json_output),
         [group, rest @ ..] if group == "candidate" => run_candidate(rest, json_output),
         [group, rest @ ..] if group == "context" => run_context(rest, json_output),
@@ -266,6 +394,23 @@ fn run_install_lifecycle(command: &str, args: &[String], json_output: bool) -> R
     } else {
         installer.upgrade(&setup)?
     };
+    // Logging owns a separate service transaction. Reconcile it only after the installer returns,
+    // which guarantees the business maintenance lease and setup lock have both been released.
+    if let Some(logs_root) = sctx_telemetry::default_logs_root() {
+        if !logs_root.is_absolute() {
+            report.notices.push(
+                "logging service was not changed because SCTX_LOGS_ROOT is not absolute".to_owned(),
+            );
+        } else if let Some(home) = home_directory() {
+            let lifecycle = sctx_installer::logs_launchd::reconcile_log_service(
+                &home,
+                &logs_root,
+                &report.runtime,
+            );
+            report.changed |= lifecycle.changed;
+            report.notices.extend(lifecycle.notices);
+        }
+    }
     if options.has("--embedding") {
         append_setup_embedding(&mut report, json_output);
     }
@@ -344,31 +489,45 @@ fn run_doctor_recheck(options: &Options, json_output: bool) -> Result<()> {
 }
 
 const HOOK_DIAGNOSTIC_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
-const HOOK_DIAGNOSTIC_RECENT_LIMIT: usize = 50;
 
-/// Reports the Hook-path diagnostics `hook_event` recorded: a decision/reason count table over
-/// the last 24h, the most recent rows, and — best-effort — the current activation lease count.
-///
-/// This opens `TaskRuntime` with the normal (non-Hook) busy window and schema check; it is never
-/// on the Hook hot path.
+/// Reports the collector's independent Hook diagnostic view. A missing or stopped collector is an
+/// explicit unavailable source, not a reason to reopen the legacy Runtime diagnostic table.
 fn run_doctor_hooks(options: &Options, json_output: bool) -> Result<()> {
-    let root = options
+    let business_root = options
         .optional("--root")?
         .map_or_else(installation_root, |value| Ok(PathBuf::from(value)))?;
-    let runtime = TaskRuntime::initialize(&root)?;
-    let since_unix_ms = unix_millis_now().saturating_sub(HOOK_DIAGNOSTIC_WINDOW_MS);
-    let counts = runtime.hook_event_counts_since(since_unix_ms)?;
-    let recent = runtime.recent_hook_events(HOOK_DIAGNOSTIC_RECENT_LIMIT)?;
-    let active_leases = AuthorizedSessionScopeStore::initialize(&root)
+    let logs_root = sctx_telemetry::default_logs_root();
+    let diagnostics = logs_root
+        .as_deref()
+        .map(sctx_log_service::load_hook_diagnostics)
+        .transpose();
+    let (source, diagnostic_error, counts, recent) = match diagnostics {
+        Ok(Some(view)) => ("telemetry", None, view.counts, view.recent_events),
+        Ok(None) => (
+            "unavailable",
+            Some("logs_root_unavailable".to_owned()),
+            Vec::new(),
+            Vec::new(),
+        ),
+        Err(error) => (
+            "unavailable",
+            Some(format!("{:?}", error.code()).to_lowercase()),
+            Vec::new(),
+            Vec::new(),
+        ),
+    };
+    let active_leases = AuthorizedSessionScopeStore::initialize(&business_root)
         .and_then(|store| store.survey_stale_leases(Duration::ZERO))
         .map(|survey| survey.total_entries)
         .ok();
     let data = json!({
+        "source": source,
+        "diagnostic_error": diagnostic_error,
         "window_hours": HOOK_DIAGNOSTIC_WINDOW_MS / (60 * 60 * 1000),
         "counts": counts
             .iter()
             .map(|count| json!({
-                "decision": count.decision,
+                "decision": hook_diagnostic_outcome(count.decision),
                 "reason": count.reason,
                 "count": count.count,
             }))
@@ -376,12 +535,12 @@ fn run_doctor_hooks(options: &Options, json_output: bool) -> Result<()> {
         "recent_events": recent
             .iter()
             .map(|event| json!({
-                "recorded_at_unix_ms": event.recorded_at_unix_ms,
-                "agent_kind": event.agent_kind,
-                "event_kind": event.event_kind,
-                "decision": event.decision,
-                "reason": event.reason,
-                "duration_ms": event.duration_ms,
+                "recorded_at_unix_ms": event.occurred_at_unix_ms,
+                "agent_kind": hook_diagnostic_operation(event.operation.as_deref()).0,
+                "event_kind": hook_diagnostic_operation(event.operation.as_deref()).1,
+                "decision": hook_diagnostic_outcome(event.outcome),
+                "reason": event.reason.as_deref().unwrap_or("unspecified"),
+                "duration_ms": event.duration_ms.unwrap_or(0),
             }))
             .collect::<Vec<_>>(),
         "active_leases": active_leases,
@@ -401,10 +560,45 @@ fn run_doctor_hooks(options: &Options, json_output: bool) -> Result<()> {
     Ok(())
 }
 
+const fn hook_diagnostic_outcome(outcome: sctx_telemetry::Outcome) -> &'static str {
+    match outcome {
+        sctx_telemetry::Outcome::Success => "enabled",
+        sctx_telemetry::Outcome::FailOpen => "fail_open",
+        sctx_telemetry::Outcome::Degraded => "neutral",
+        sctx_telemetry::Outcome::Disabled => "disabled",
+        sctx_telemetry::Outcome::Started => "started",
+        sctx_telemetry::Outcome::Failure => "failure",
+        sctx_telemetry::Outcome::Dropped => "dropped",
+        sctx_telemetry::Outcome::Unknown => "unknown",
+    }
+}
+
+fn hook_diagnostic_operation(operation: Option<&str>) -> (&str, &str) {
+    let Some(operation) = operation.and_then(|value| value.strip_prefix("hook.")) else {
+        return ("unknown", "unknown");
+    };
+    operation.split_once('.').unwrap_or(("unknown", "unknown"))
+}
+
 fn run_uninstall(args: &[String], json_output: bool) -> Result<()> {
     let options = Options::parse(args, &[])?;
     options.allow_only(&["--root", "--runtime-source", "--runtime-version"], &[])?;
-    let report = installer_from_options(&options)?.uninstall()?;
+    let mut report = installer_from_options(&options)?.uninstall()?;
+    // The business uninstall has completed and released its locks. The collector service is
+    // independently owned; removing it is best effort and always retains the logging root.
+    if let Some(logs_root) = sctx_telemetry::default_logs_root() {
+        if !logs_root.is_absolute() {
+            report.warnings.push(
+                "logging service was preserved because SCTX_LOGS_ROOT is not absolute".to_owned(),
+            );
+        } else if let Some(home) = home_directory() {
+            let lifecycle = sctx_installer::logs_launchd::uninstall_log_service(&home, &logs_root);
+            report.warnings.extend(lifecycle.notices);
+            if lifecycle.configured || logs_root.exists() {
+                report.preserved.push(logs_root);
+            }
+        }
+    }
     emit_lifecycle(&report, json_output)
 }
 
@@ -1137,22 +1331,17 @@ fn verify_demo_mcp(
     Ok(())
 }
 
-/// Best-effort diagnostic recorder for one `sctx hook` invocation.
+/// Best-effort, non-blocking diagnostic recorder for one `sctx hook` invocation.
 ///
-/// It is created once at the top of [`run_hook`] and every fail-open, degraded, or normal
-/// completion point along the Hook path calls [`Self::flush`] exactly once. It opens at most one
-/// `TaskRuntime` per invocation, via the same short-timeout [`TaskRuntime::initialize_for_hook`]
-/// the rest of the Hook path already uses, and reuses it for every flush in this process. When
-/// the Runtime cannot be opened at all — `HOME` unset, a damaged installation, a schema that
-/// predates `hook_event` — every flush degrades to exactly one stderr line instead of failing
-/// the Hook or retrying.
+/// The producer only emits a bounded frame to the collector FIFO. It never opens Runtime, writes
+/// a diagnostic file, creates the logging root, retries, or changes Hook stdout/stderr.
 struct HookEventRecorder {
     agent: String,
-    /// `<root>/state/runtime.sqlite`, computed once with no I/O. `None` only when `HOME` is
-    /// unset, matching every other Hook-path degrade-to-stderr case.
-    database_path: Option<PathBuf>,
+    logs_root: Option<PathBuf>,
+    invocation_id: String,
+    sequence: Cell<u32>,
     event_kind: RefCell<Option<&'static str>>,
-    session_id: RefCell<Option<String>>,
+    session_digest: RefCell<Option<String>>,
     /// Reason and detail the single Enabled completion row carries instead of a bare `ok`.
     completion: RefCell<Option<(&'static str, Option<String>)>>,
     started: Instant,
@@ -1162,11 +1351,11 @@ impl HookEventRecorder {
     fn new(agent: &str) -> Self {
         Self {
             agent: agent.to_owned(),
-            database_path: installation_root()
-                .ok()
-                .map(|root| root.join("state").join("runtime.sqlite")),
+            logs_root: sctx_telemetry::default_logs_root(),
+            invocation_id: sctx_telemetry::new_invocation_id(),
+            sequence: Cell::new(0),
             event_kind: RefCell::new(None),
-            session_id: RefCell::new(None),
+            session_digest: RefCell::new(None),
             completion: RefCell::new(None),
             started: Instant::now(),
         }
@@ -1191,43 +1380,68 @@ impl HookEventRecorder {
     /// `event_kind = "undecodable"` and no session id.
     fn bind(&self, event_kind: CanonicalAgentEventKind, session_id: &str) {
         *self.event_kind.borrow_mut() = Some(hook_event_kind_str(event_kind));
-        *self.session_id.borrow_mut() = Some(session_id.to_owned());
+        *self.session_digest.borrow_mut() = telemetry_session_digest(&self.agent, session_id);
     }
 
-    /// Records one decision point. Never fails the Hook, and never adds stderr noise to a Hook
-    /// run that is otherwise clean: only a completely unresolvable `runtime.sqlite` path (`HOME`
-    /// unset) degrades to one stderr line. A write that fails once the path is resolved —
-    /// including the ordinary case of a schema that predates `hook_event`, or an installation
-    /// that has not run `sctx setup` yet — is silently dropped, exactly like every other
-    /// Hook-path diagnostic gap this change did not create.
-    ///
-    /// This writes through [`TaskRuntime::record_hook_event_at`] directly against the resolved
-    /// path rather than constructing a [`TaskRuntime`] first: many Hook processes may flush
-    /// concurrently, and skipping the extra validating connection open keeps this off the
-    /// contended part of the Hook hot path.
-    fn flush(&self, decision: HookEventDecision, reason: &str, detail: Option<String>) {
-        let event_kind = self.event_kind.borrow().unwrap_or("undecodable").to_owned();
-        let external_session_id = self.session_id.borrow().clone();
-        let duration_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        match &self.database_path {
-            Some(database_path) => {
-                let record = HookEventRecord {
-                    recorded_at_unix_ms: unix_millis_now(),
-                    agent_kind: self.agent.clone(),
-                    external_session_id,
-                    event_kind,
-                    decision,
-                    reason: reason.to_owned(),
-                    duration_ms,
-                    detail,
-                };
-                let _ = TaskRuntime::record_hook_event_at(database_path, &record);
-            }
-            None => {
-                eprintln!("shared-context hook: {reason}");
-            }
-        }
+    fn flush(&self, decision: HookEventDecision, reason: &str, _detail: Option<String>) {
+        let Some(logs_root) = &self.logs_root else {
+            return;
+        };
+        let event_kind = self.event_kind.borrow().unwrap_or("undecodable");
+        let (outcome, authorization) = match decision {
+            HookEventDecision::Enabled => (
+                sctx_telemetry::Outcome::Success,
+                sctx_telemetry::Authorization::Authorized,
+            ),
+            HookEventDecision::FailOpen => (
+                sctx_telemetry::Outcome::FailOpen,
+                sctx_telemetry::Authorization::Unverified,
+            ),
+            HookEventDecision::Disabled => (
+                sctx_telemetry::Outcome::Disabled,
+                sctx_telemetry::Authorization::Unauthorized,
+            ),
+            HookEventDecision::Neutral => (
+                sctx_telemetry::Outcome::Degraded,
+                sctx_telemetry::Authorization::NotApplicable,
+            ),
+        };
+        let sequence = self.sequence.get();
+        self.sequence.set(sequence.saturating_add(1));
+        let mut event = sctx_telemetry::Event::finished(
+            sctx_telemetry::EntryPoint::Hook,
+            sctx_telemetry::EventKind::HookDecision,
+            self.invocation_id.clone(),
+            format!("hook.{}.{event_kind}", self.agent),
+            outcome,
+        );
+        event.sequence = sequence;
+        event.authorization = authorization;
+        event.duration_ms =
+            Some(u32::try_from(self.started.elapsed().as_millis()).unwrap_or(u32::MAX));
+        // `reason` comes exclusively from closed Hook branches in this module. Detail is omitted:
+        // existing diagnostics can contain paths and error text which do not belong on the wire.
+        event.reason = Some(reason.to_owned());
+        event
+            .session_digest
+            .clone_from(&self.session_digest.borrow());
+        let _ = sctx_telemetry::emit_to(logs_root, &event);
     }
+}
+
+fn telemetry_session_digest(agent: &str, external_session_id: &str) -> Option<String> {
+    use sha2::{Digest as _, Sha256};
+    if !matches!(agent, "cursor" | "codex")
+        || external_session_id.is_empty()
+        || external_session_id.len() > 256
+    {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(agent.as_bytes());
+    digest.update([0]);
+    digest.update(external_session_id.as_bytes());
+    Some(format!("{:x}", digest.finalize()))
 }
 
 const fn hook_event_kind_str(kind: CanonicalAgentEventKind) -> &'static str {
@@ -1239,14 +1453,6 @@ const fn hook_event_kind_str(kind: CanonicalAgentEventKind) -> &'static str {
         CanonicalAgentEventKind::TurnStop => "turn_stop",
         CanonicalAgentEventKind::SessionEnd => "session_end",
     }
-}
-
-fn unix_millis_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-        })
 }
 
 /// Truncates a safe (non-prompt, non-tool-output) diagnostic string to the
@@ -4896,11 +5102,39 @@ const fn error_code(kind: ErrorKind) -> &'static str {
     }
 }
 
+const fn telemetry_error_code(kind: ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::StaleState => "stale_state",
+        ErrorKind::PrivacyRejected => "privacy_rejected",
+        _ => error_code(kind),
+    }
+}
+
+const fn error_family(kind: ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::InvalidInput | ErrorKind::Unsupported => "request",
+        ErrorKind::InvariantViolation => "invariant",
+        ErrorKind::Io => "io",
+        ErrorKind::External => "external",
+        ErrorKind::Conflict | ErrorKind::StaleState | ErrorKind::IdempotencyKeyConflict => "state",
+        ErrorKind::PrivacyRejected => "privacy",
+        ErrorKind::RepositoryNotConfigured => "repository",
+        ErrorKind::MaintenanceBusy => "maintenance",
+        _ => "unknown",
+    }
+}
+
 fn installation_root() -> Result<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join(".shared-context"))
         .ok_or_else(|| invalid("HOME is not set"))
+}
+
+fn home_directory() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn is_help(args: &[String]) -> bool {

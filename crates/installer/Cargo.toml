@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 fs2.workspace = true
+libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -19,9 +20,12 @@ sctx-engineering-graph.workspace = true
 sctx-git-store.workspace = true
 sctx-index.workspace = true
 sctx-local-state.workspace = true
+sctx-log-service.workspace = true
+sctx-log-sync.workspace = true
 sctx-mcp.workspace = true
 sctx-search.workspace = true
 sctx-task-runtime.workspace = true
+sctx-telemetry.workspace = true
 toml_edit.workspace = true
 uuid.workspace = true
 

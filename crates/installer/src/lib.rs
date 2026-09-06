@@ -44,6 +44,7 @@ use uuid::Uuid;
 
 pub mod embedding;
 pub mod launchd;
+pub mod logs_launchd;
 pub mod maintain;
 
 use launchd::{
@@ -1107,6 +1108,7 @@ impl Installer {
         check_session_scope_leases(root, &mut checks);
         check_retrieval(root, &mut checks);
         check_maintain(root, &mut checks);
+        check_logging(&self.context.home, &mut checks);
         if root.join("repository/.git").is_dir() && root.join("bin/current/sctx").is_file() {
             match mcp_smoke(root) {
                 Ok(()) => checks.push(ok(
@@ -4658,6 +4660,76 @@ const RETRIEVAL_BUDGET: &str = "The encode budget is calibrated for this machine
 /// is reserved for a run that had work to do and did not finish it -- and it stays a warning, never
 /// an error, because `healthy` is about whether this installation works, and a Knowledge Store that
 /// could not be reached last night does not stop it from working.
+fn check_logging(home: &Path, checks: &mut Vec<DoctorCheck>) {
+    const NAME: &str = "logging";
+    let process_home = env::var_os("HOME").map(PathBuf::from);
+    let logs_root = if process_home.as_deref() == Some(home) {
+        sctx_telemetry::default_logs_root().unwrap_or_else(|| home.join(".shared-context-logs"))
+    } else {
+        home.join(".shared-context-logs")
+    };
+    let status = match sctx_log_service::status(&logs_root) {
+        Ok(status) => status,
+        Err(error) => {
+            checks.push(warning(
+                NAME,
+                format!(
+                    "independent logging status is unavailable ({error}); run `sctx logs doctor --probe`"
+                ),
+            ));
+            return;
+        }
+    };
+    if !status.configured {
+        if status.config_error == Some(sctx_log_service::ErrorCode::NotConfigured) {
+            checks.push(ok(
+                NAME,
+                "Independent structured logging is not configured. Run `sctx logs init` to enable local collection.",
+            ));
+        } else {
+            checks.push(warning(
+                NAME,
+                format!(
+                    "independent logging configuration is unreadable ({:?}); run `sctx logs doctor --probe`",
+                    status.config_error
+                ),
+            ));
+        }
+        return;
+    }
+    if status.enabled == Some(false) {
+        checks.push(ok(
+            NAME,
+            format!(
+                "Independent structured logging is disabled; {} sealed batch(es) remain preserved.",
+                status.ready_batches
+            ),
+        ));
+        return;
+    }
+    let endpoint_ready = status.endpoint == sctx_log_service::ProbeStatus::Ok;
+    if !endpoint_ready || status.storage_pressure || status.last_error.is_some() {
+        checks.push(warning(
+            NAME,
+            format!(
+                "independent logging needs attention: endpoint={:?}, storage_pressure={}, ready_batches={}, last_error={}. Run `sctx logs doctor --probe`.",
+                status.endpoint,
+                status.storage_pressure,
+                status.ready_batches,
+                status.last_error.as_deref().unwrap_or("none")
+            ),
+        ));
+    } else {
+        checks.push(ok(
+            NAME,
+            format!(
+                "Independent structured logging is enabled; {} sealed batch(es) await synchronization.",
+                status.ready_batches
+            ),
+        ));
+    }
+}
+
 fn check_maintain(root: &Path, checks: &mut Vec<DoctorCheck>) {
     const NAME: &str = "maintain";
     let digest = match maintain::read_digest(root) {

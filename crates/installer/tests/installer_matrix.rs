@@ -3889,6 +3889,7 @@ fn maintain_run_records_a_digest_and_skips_the_sync_a_local_installation_cannot_
             "candidate_survey",
             "provisional_space_survey",
             "knowledge_sync",
+            "logs_sync",
         ]
     );
     for name in [
@@ -3912,6 +3913,17 @@ fn maintain_run_records_a_digest_and_skips_the_sync_a_local_installation_cannot_
         "{sync:?}"
     );
     assert!(!sync.needs_human);
+    let logs_sync = maintain_step(&digest, "logs_sync");
+    assert_eq!(logs_sync.outcome, MaintainOutcome::Skipped);
+    assert_eq!(logs_sync.attempts, 0);
+    assert!(
+        logs_sync
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("not configured"),
+        "{logs_sync:?}"
+    );
     assert!(digest.failed_steps().is_empty());
 
     assert_eq!(
@@ -4183,6 +4195,7 @@ fn doctor_reports_never_run_clean_and_failed_maintenance_without_ever_erroring()
         reason: Some("Knowledge Store branch merge conflicted".to_owned()),
         attempts: 1,
         needs_human: true,
+        duration_ms: 0,
     });
     fs::write(
         harness.root.join("state/maintain-digest.json"),

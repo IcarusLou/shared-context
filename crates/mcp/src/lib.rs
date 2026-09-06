@@ -1686,6 +1686,37 @@ impl fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
+const fn transport_error_code(kind: TransportErrorKind) -> &'static str {
+    match kind {
+        TransportErrorKind::Io => "transport_io",
+        TransportErrorKind::InvalidFrame => "invalid_frame",
+        TransportErrorKind::UnexpectedEof => "unexpected_eof",
+        TransportErrorKind::FrameTooLarge => "frame_too_large",
+    }
+}
+
+fn emit_mcp_protocol_failure(
+    root: Option<&Path>,
+    operation: &'static str,
+    code: &'static str,
+    family: &'static str,
+) {
+    let Some(root) = root else {
+        return;
+    };
+    let mut event = sctx_telemetry::Event::finished(
+        sctx_telemetry::EntryPoint::Mcp,
+        sctx_telemetry::EventKind::ProtocolFailure,
+        sctx_telemetry::new_invocation_id(),
+        operation,
+        sctx_telemetry::Outcome::Failure,
+    );
+    event.authorization = sctx_telemetry::Authorization::NotApplicable;
+    event.error_code = Some(code.to_owned());
+    event.error_family = Some(family.to_owned());
+    let _ = sctx_telemetry::emit_to(root, &event);
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FrameStyle {
     Newline,
@@ -6335,6 +6366,7 @@ pub use semantic::{SemanticWarmReport, warm_semantic_cache_at_root};
 /// Stateful MCP request dispatcher for one stdio session.
 pub struct McpServer {
     root: PathBuf,
+    telemetry_root: Option<PathBuf>,
     runtime: Option<Runtime>,
     client: ClientKind,
     initialized: bool,
@@ -6367,6 +6399,9 @@ impl McpServer {
         })?;
         Ok(Self {
             root,
+            // Programmatic/in-process servers are common in tests and demos. Only the real stdio
+            // boundary opts into ambient per-user telemetry; injected callers may set a root.
+            telemetry_root: None,
             runtime: None,
             client,
             initialized: false,
@@ -6398,6 +6433,12 @@ impl McpServer {
         self.authorization_linearization_hook = Some(hook);
     }
 
+    /// Overrides the independent telemetry root without changing process environment.
+    #[doc(hidden)]
+    pub fn set_telemetry_root_for_test(&mut self, root: Option<PathBuf>) {
+        self.telemetry_root = root;
+    }
+
     fn runtime(&self) -> &Runtime {
         self.runtime
             .as_ref()
@@ -6418,7 +6459,19 @@ impl McpServer {
     ) -> std::result::Result<ServeOutcome, TransportError> {
         let mut requests_handled = 0_u64;
         loop {
-            let Some(frame) = read_frame(reader)? else {
+            let frame = match read_frame(reader) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    emit_mcp_protocol_failure(
+                        self.telemetry_root.as_deref(),
+                        "transport_read",
+                        transport_error_code(error.kind()),
+                        "transport",
+                    );
+                    return Err(error);
+                }
+            };
+            let Some(frame) = frame else {
                 return Ok(ServeOutcome {
                     disconnect: DisconnectReason::CleanEof,
                     requests_handled,
@@ -6427,23 +6480,45 @@ impl McpServer {
             requests_handled = requests_handled.saturating_add(1);
             let response = match serde_json::from_slice::<Value>(&frame.body) {
                 Ok(request) => self.dispatch(request),
-                Err(error) => Some(rpc_error(
-                    Value::Null,
-                    -32_700,
-                    "Parse error",
-                    "parse_error",
-                    Some(error.to_string()),
-                )),
+                Err(error) => {
+                    emit_mcp_protocol_failure(
+                        self.telemetry_root.as_deref(),
+                        "request_parse",
+                        "parse_error",
+                        "protocol",
+                    );
+                    Some(rpc_error(
+                        Value::Null,
+                        -32_700,
+                        "Parse error",
+                        "parse_error",
+                        Some(error.to_string()),
+                    ))
+                }
             };
             if let Some(response) = response {
-                write_frame(writer, &response, frame.style)?;
+                if let Err(error) = write_frame(writer, &response, frame.style) {
+                    emit_mcp_protocol_failure(
+                        self.telemetry_root.as_deref(),
+                        "transport_write",
+                        transport_error_code(error.kind()),
+                        "transport",
+                    );
+                    return Err(error);
+                }
             }
         }
     }
 
-    #[allow(clippy::needless_pass_by_value)]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     fn dispatch(&mut self, request: Value) -> Option<Value> {
         let Some(object) = request.as_object() else {
+            emit_mcp_protocol_failure(
+                self.telemetry_root.as_deref(),
+                "request_validation",
+                "invalid_request",
+                "protocol",
+            );
             return Some(rpc_error(
                 Value::Null,
                 -32_600,
@@ -6454,6 +6529,12 @@ impl McpServer {
         };
         let id = object.get("id").cloned();
         if object.get("jsonrpc") != Some(&Value::String("2.0".to_owned())) {
+            emit_mcp_protocol_failure(
+                self.telemetry_root.as_deref(),
+                "request_validation",
+                "invalid_request",
+                "protocol",
+            );
             return Some(rpc_error(
                 id.unwrap_or(Value::Null),
                 -32_600,
@@ -6463,6 +6544,12 @@ impl McpServer {
             ));
         }
         let Some(method) = object.get("method").and_then(Value::as_str) else {
+            emit_mcp_protocol_failure(
+                self.telemetry_root.as_deref(),
+                "request_validation",
+                "invalid_request",
+                "protocol",
+            );
             return Some(rpc_error(
                 id.unwrap_or(Value::Null),
                 -32_600,
@@ -6484,6 +6571,12 @@ impl McpServer {
         }
         let id = id.unwrap_or(Value::Null);
         if matches!(method, "tools/list" | "tools/call") && !self.initialized {
+            emit_mcp_protocol_failure(
+                self.telemetry_root.as_deref(),
+                "request_validation",
+                "server_not_initialized",
+                "protocol",
+            );
             return Some(rpc_error(
                 id,
                 -32_002,
@@ -6498,6 +6591,12 @@ impl McpServer {
             "tools/list" => Ok(tools_list()),
             "tools/call" => self.tools_call(params),
             _ => {
+                emit_mcp_protocol_failure(
+                    self.telemetry_root.as_deref(),
+                    "request_dispatch",
+                    "method_not_found",
+                    "protocol",
+                );
                 return Some(rpc_error(
                     id,
                     -32_601,
@@ -6509,13 +6608,21 @@ impl McpServer {
         };
         match result {
             Ok(result) => Some(json!({"jsonrpc": "2.0", "id": id, "result": result})),
-            Err(error) => Some(rpc_error(
-                id,
-                -32_602,
-                "Invalid params",
-                error_code(error.kind()),
-                Some(error.message().to_owned()),
-            )),
+            Err(error) => {
+                emit_mcp_protocol_failure(
+                    self.telemetry_root.as_deref(),
+                    "request_parameters",
+                    error_code(error.kind()),
+                    "protocol",
+                );
+                Some(rpc_error(
+                    id,
+                    -32_602,
+                    "Invalid params",
+                    error_code(error.kind()),
+                    Some(error.message().to_owned()),
+                ))
+            }
         }
     }
 
@@ -6548,12 +6655,16 @@ impl McpServer {
         if !is_public_tool(&call.name) {
             return Err(invalid(format!("unknown tool: {}", call.name)));
         }
+        let telemetry = McpToolTelemetry::start(&call, self.client, self.telemetry_root.clone());
         let is_checkpoint = call.name == "task_checkpoint";
         self.runtime = None;
         let result = MaintenanceLock::open_or_create(&self.root)
             .and_then(|lock| lock.try_shared())
             .map_err(ToolFailure::maintenance_failed)
             .and_then(|_maintenance| self.authorize_and_call(&call));
+        // Observe the typed business result before it is converted into an always-Ok MCP
+        // envelope. `isError: true` failures must count as failures, not successful Rust Results.
+        telemetry.finish(&result);
         match result {
             Ok(data) if is_checkpoint => tool_success_with_notice(data, task_checkpoint_ack_notice),
             Ok(data) => tool_success(data),
@@ -6968,6 +7079,7 @@ impl McpServer {
 /// external-error category for the CLI boundary.
 pub fn serve_stdio(root: impl AsRef<Path>, client: ClientKind) -> Result<ServeOutcome> {
     let mut server = McpServer::new(root, client)?;
+    server.telemetry_root = sctx_telemetry::default_logs_root();
     server.start_semantic_channel();
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -6982,6 +7094,151 @@ pub fn serve_stdio(root: impl AsRef<Path>, client: ClientKind) -> Result<ServeOu
 }
 
 type ToolResult = std::result::Result<Value, ToolFailure>;
+
+struct McpToolTelemetry {
+    logs_root: Option<PathBuf>,
+    invocation_id: String,
+    operation: String,
+    session_digest: Option<String>,
+    started: Instant,
+}
+
+impl McpToolTelemetry {
+    fn start(call: &ToolCall, client: ClientKind, logs_root: Option<PathBuf>) -> Self {
+        // The caller has already checked `is_public_tool`, so this is a closed product enum and
+        // cannot carry an arbitrary tool name supplied by the peer.
+        let invocation_id = sctx_telemetry::new_invocation_id();
+        let operation = call.name.as_str();
+        let session_digest = mcp_session_digest(&call.arguments, client);
+        if let Some(root) = &logs_root {
+            let mut event = sctx_telemetry::Event::started(
+                sctx_telemetry::EntryPoint::Mcp,
+                sctx_telemetry::EventKind::ToolStarted,
+                invocation_id.clone(),
+                operation,
+            );
+            event.authorization = sctx_telemetry::Authorization::Unverified;
+            event.session_digest.clone_from(&session_digest);
+            let _ = sctx_telemetry::emit_to(root, &event);
+        }
+        Self {
+            logs_root,
+            invocation_id,
+            operation: operation.to_owned(),
+            session_digest,
+            started: Instant::now(),
+        }
+    }
+
+    fn finish(self, result: &ToolResult) {
+        let Some(root) = &self.logs_root else { return };
+        let mut event = sctx_telemetry::Event::finished(
+            sctx_telemetry::EntryPoint::Mcp,
+            sctx_telemetry::EventKind::ToolFinished,
+            self.invocation_id,
+            self.operation,
+            if result.is_ok() {
+                sctx_telemetry::Outcome::Success
+            } else {
+                sctx_telemetry::Outcome::Failure
+            },
+        );
+        event.sequence = 1;
+        event.duration_ms =
+            Some(u32::try_from(self.started.elapsed().as_millis()).unwrap_or(u32::MAX));
+        event.session_digest = self.session_digest;
+        match result {
+            Ok(data) => {
+                event.authorization = sctx_telemetry::Authorization::Authorized;
+                event.result_count = result_count(data);
+                populate_result_identifiers(&mut event, data);
+            }
+            Err(failure) => {
+                event.authorization = if failure.family == Some(ToolFailure::SESSION_NOT_AUTHORIZED)
+                {
+                    sctx_telemetry::Authorization::Unauthorized
+                } else {
+                    sctx_telemetry::Authorization::Unverified
+                };
+                event.error_code = Some(failure.code.to_owned());
+                event.error_family = Some(
+                    failure
+                        .family
+                        .unwrap_or_else(|| error_code(failure.error.kind()))
+                        .to_owned(),
+                );
+            }
+        }
+        let _ = sctx_telemetry::emit_to(root, &event);
+    }
+}
+
+fn result_count(data: &Value) -> Option<u32> {
+    [
+        "results",
+        "reviews",
+        "items",
+        "candidates",
+        "contexts",
+        "spaces",
+        "repositories",
+    ]
+    .into_iter()
+    .find_map(|field| data.get(field).and_then(Value::as_array))
+    .map(|items| u32::try_from(items.len()).unwrap_or(u32::MAX))
+}
+
+fn mcp_session_digest(arguments: &Value, client: ClientKind) -> Option<String> {
+    use sha2::{Digest as _, Sha256};
+    let agent = arguments.get("agent_kind")?.as_str()?;
+    let expected = match client {
+        ClientKind::Cursor => "cursor",
+        ClientKind::Codex => "codex",
+    };
+    if agent != expected {
+        return None;
+    }
+    let session = arguments.get("external_session_id")?.as_str()?;
+    if session.is_empty() || session.len() > 256 {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(agent.as_bytes());
+    digest.update([0]);
+    digest.update(session.as_bytes());
+    Some(format!("{:x}", digest.finalize()))
+}
+
+fn populate_result_identifiers(event: &mut sctx_telemetry::Event, data: &Value) {
+    event.task_id = telemetry_id(data, "task_id");
+    event.task_session_id = telemetry_id(data, "task_session_id");
+    event.episode_id = telemetry_id(data, "episode_id");
+    event.checkpoint_id = telemetry_id(data, "checkpoint_id");
+    event.operation_id = telemetry_id(data, "operation_id");
+    if let Some(context) = data.get("context") {
+        event.task_id = event
+            .task_id
+            .take()
+            .or_else(|| telemetry_id(context, "task_id"));
+        event.task_session_id = event
+            .task_session_id
+            .take()
+            .or_else(|| telemetry_id(context, "task_session_id"));
+    }
+}
+
+fn telemetry_id(data: &Value, field: &str) -> Option<String> {
+    let value = data.get(field)?.as_str()?;
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return None;
+    }
+    Some(value.to_owned())
+}
 
 struct ToolFailure {
     code: &'static str,

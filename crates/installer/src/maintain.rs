@@ -39,8 +39,8 @@ use std::{
     io::Write,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use sctx_local_state::{MaintenanceLock, UserConfigStore};
@@ -79,6 +79,7 @@ pub const STEP_ASSOCIATION_REBUILD: &str = "association_rebuild";
 pub const STEP_CANDIDATE_SURVEY: &str = "candidate_survey";
 pub const STEP_PROVISIONAL_SPACE_SURVEY: &str = "provisional_space_survey";
 pub const STEP_KNOWLEDGE_SYNC: &str = "knowledge_sync";
+pub const STEP_LOGS_SYNC: &str = "logs_sync";
 
 /// What a maintenance run was allowed to cost.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -123,6 +124,9 @@ pub struct MaintainStep {
     /// Set when the step stopped on something no retry can clear -- today, a merge conflict.
     #[serde(default)]
     pub needs_human: bool,
+    /// Wall-clock time spent in this step. Older digests deserialize this as zero.
+    #[serde(default)]
+    pub duration_ms: u64,
 }
 
 /// Everything one run observed but did not act on.
@@ -225,6 +229,7 @@ impl Installer {
         // different installations.
         match MaintenanceLock::open_or_create(root).and_then(|lock| lock.try_shared()) {
             Ok(guard) => {
+                let step_started = Instant::now();
                 match sctx_mcp::association_rebuild_at_root(
                     root,
                     &AssociationRebuildInput {
@@ -245,6 +250,8 @@ impl Installer {
                     }
                     Err(error) => steps.push(failed(STEP_ASSOCIATION_REBUILD, &error)),
                 }
+                finish_step_duration(&mut steps, step_started);
+                let step_started = Instant::now();
                 match TaskRuntime::initialize(root).and_then(|runtime| {
                     runtime.survey_candidate_reviews(CANDIDATE_EXPIRY_HORIZON_SECONDS)
                 }) {
@@ -255,6 +262,8 @@ impl Installer {
                     }
                     Err(error) => steps.push(failed(STEP_CANDIDATE_SURVEY, &error)),
                 }
+                finish_step_duration(&mut steps, step_started);
+                let step_started = Instant::now();
                 match provisional_space_count(root) {
                     Ok(count) => {
                         counts.provisional_spaces = count;
@@ -262,6 +271,7 @@ impl Installer {
                     }
                     Err(error) => steps.push(failed(STEP_PROVISIONAL_SPACE_SURVEY, &error)),
                 }
+                finish_step_duration(&mut steps, step_started);
                 drop(guard);
             }
             Err(error) => {
@@ -276,12 +286,18 @@ impl Installer {
                         reason: Some(error.message().to_owned()),
                         attempts: 1,
                         needs_human: false,
+                        duration_ms: 0,
                     });
                 }
             }
         }
 
+        // Start the independent logging subprocess after the shared business lease is gone. It
+        // has its own process-group deadline and logging lock, so it can run concurrently with
+        // knowledge sync without holding or waiting for any business lock.
+        let logs_sync = self.spawn_maintain_logs_sync();
         steps.push(self.maintain_knowledge_sync(*options));
+        steps.push(join_logs_sync(logs_sync));
 
         let digest = MaintainDigest {
             schema_version: MAINTAIN_DIGEST_SCHEMA_VERSION,
@@ -297,6 +313,7 @@ impl Installer {
             graph_generation,
             projection_generation,
         };
+        emit_maintenance_steps(&digest.steps, &self.logs_root());
         write_digest(root, &digest)?;
         // The log is a convenience, never the record: the digest above is already durable, and a
         // logs directory an operator removed must not turn a completed run into a failed one.
@@ -324,6 +341,13 @@ impl Installer {
 
     /// Runs `knowledge sync` under the run's retry budget, translating every ending into a step.
     fn maintain_knowledge_sync(&self, options: MaintainOptions) -> MaintainStep {
+        let started = Instant::now();
+        let mut step = self.maintain_knowledge_sync_inner(options);
+        step.duration_ms = elapsed_millis(started);
+        step
+    }
+
+    fn maintain_knowledge_sync_inner(&self, options: MaintainOptions) -> MaintainStep {
         match read_manifest(&self.context.root) {
             Ok(Some(manifest))
                 if matches!(
@@ -342,6 +366,7 @@ impl Installer {
                     ),
                     attempts: 0,
                     needs_human: false,
+                    duration_ms: 0,
                 };
             }
             Err(error) => return failed(STEP_KNOWLEDGE_SYNC, &error),
@@ -382,6 +407,7 @@ impl Installer {
                         reason: Some(error.message().to_owned()),
                         attempts,
                         needs_human: false,
+                        duration_ms: 0,
                     }
                 } else {
                     failed(STEP_KNOWLEDGE_SYNC, &error)
@@ -391,6 +417,172 @@ impl Installer {
             };
             thread::sleep(*wait);
         }
+    }
+
+    fn spawn_maintain_logs_sync(&self) -> LogsSyncTask {
+        let logs_root = self.logs_root();
+        let config = match sctx_log_service::load_config(&logs_root) {
+            Ok(config) => config,
+            Err(error) if error.code() == sctx_log_service::ErrorCode::NotConfigured => {
+                return LogsSyncTask::Ready(skipped_logs("logging is not configured"));
+            }
+            Err(_) => {
+                return LogsSyncTask::Ready(failed_logs("logging configuration is invalid"));
+            }
+        };
+        if !config.enabled {
+            return LogsSyncTask::Ready(skipped_logs("logging is disabled"));
+        }
+        if !config.sync.on_maintain {
+            return LogsSyncTask::Ready(skipped_logs(
+                "logging synchronization on maintenance is disabled",
+            ));
+        }
+        if !config.is_assigned() {
+            return LogsSyncTask::Ready(skipped_logs(
+                "logging has no upload remote and email assignment",
+            ));
+        }
+        let executable = self.context.root.join("bin/current/sctx");
+        let timeout = sctx_log_sync::SyncOptions::from_config(&config)
+            .deadline
+            .saturating_add(Duration::from_secs(5));
+        match thread::Builder::new()
+            .name("sctx-logs-sync".to_owned())
+            .spawn(move || {
+                let started = Instant::now();
+                let spec = sctx_log_sync::runner::CommandSpec::new(executable, timeout)
+                    .args([
+                        "logs".into(),
+                        "sync".into(),
+                        "--logs-root".into(),
+                        logs_root.into_os_string(),
+                        "--json".into(),
+                    ])
+                    .output_limit(4096);
+                let mut step = match sctx_log_sync::runner::run(&spec) {
+                    Ok(output) if output.status.success() => parse_logs_sync_report(&output.stdout),
+                    Ok(_) => failed_logs("logging synchronization exited unsuccessfully"),
+                    Err(sctx_log_sync::runner::RunnerError::TimedOut { .. }) => {
+                        failed_logs("logging synchronization exceeded its total deadline")
+                    }
+                    Err(_) => failed_logs("logging synchronization process was unavailable"),
+                };
+                step.duration_ms = elapsed_millis(started);
+                step
+            }) {
+            Ok(handle) => LogsSyncTask::Running(handle),
+            Err(_) => LogsSyncTask::Ready(failed_logs(
+                "logging synchronization supervisor could not start",
+            )),
+        }
+    }
+
+    fn logs_root(&self) -> PathBuf {
+        let process_home = std::env::var_os("HOME").map(PathBuf::from);
+        if process_home.as_deref() == Some(self.context.home.as_path()) {
+            sctx_telemetry::default_logs_root()
+                .unwrap_or_else(|| self.context.home.join(".shared-context-logs"))
+        } else {
+            // Injected installers must never escape their injected home and observe or mutate the
+            // real user's logging service during an in-process test or managed invocation.
+            self.context.home.join(".shared-context-logs")
+        }
+    }
+}
+
+enum LogsSyncTask {
+    Ready(MaintainStep),
+    Running(JoinHandle<MaintainStep>),
+}
+
+fn join_logs_sync(task: LogsSyncTask) -> MaintainStep {
+    match task {
+        LogsSyncTask::Ready(step) => step,
+        LogsSyncTask::Running(handle) => handle
+            .join()
+            .unwrap_or_else(|_| failed_logs("logging synchronization supervisor failed")),
+    }
+}
+
+fn skipped_logs(reason: &str) -> MaintainStep {
+    MaintainStep {
+        name: STEP_LOGS_SYNC.to_owned(),
+        outcome: MaintainOutcome::Skipped,
+        reason: Some(reason.to_owned()),
+        attempts: 0,
+        needs_human: false,
+        duration_ms: 0,
+    }
+}
+
+fn failed_logs(reason: &str) -> MaintainStep {
+    MaintainStep {
+        name: STEP_LOGS_SYNC.to_owned(),
+        outcome: MaintainOutcome::Failed,
+        reason: Some(reason.to_owned()),
+        attempts: 1,
+        needs_human: false,
+        duration_ms: 0,
+    }
+}
+
+fn parse_logs_sync_report(bytes: &[u8]) -> MaintainStep {
+    let Ok(report) = serde_json::from_slice::<sctx_log_sync::SyncReport>(bytes) else {
+        return failed_logs("logging synchronization returned an invalid bounded report");
+    };
+    match report.outcome {
+        sctx_log_sync::SyncOutcome::Uploaded => {
+            let mut step = succeeded(STEP_LOGS_SYNC);
+            if !report.active_included {
+                step.reason = Some(format!(
+                    "uploaded {} sealed batch(es); the active batch was not included ({:?})",
+                    report.uploaded_batches, report.seal_status
+                ));
+            }
+            step
+        }
+        sctx_log_sync::SyncOutcome::Partial => MaintainStep {
+            name: STEP_LOGS_SYNC.to_owned(),
+            outcome: MaintainOutcome::Ok,
+            reason: Some(format!(
+                "uploaded {} batch(es); {} remain for a later maintenance run",
+                report.uploaded_batches, report.remaining_batches
+            )),
+            attempts: 1,
+            needs_human: false,
+            duration_ms: 0,
+        },
+        sctx_log_sync::SyncOutcome::NoReady => skipped_logs(&format!(
+            "no sealed logging batches were ready; active batch included: {} ({:?})",
+            report.active_included, report.seal_status
+        )),
+        sctx_log_sync::SyncOutcome::SkippedBusy => {
+            skipped_logs("another logging synchronization owns the independent log lock")
+        }
+    }
+}
+
+fn emit_maintenance_steps(steps: &[MaintainStep], logs_root: &Path) {
+    let invocation_id = sctx_telemetry::new_invocation_id();
+    for (sequence, step) in steps.iter().enumerate() {
+        let mut event = sctx_telemetry::Event::finished(
+            sctx_telemetry::EntryPoint::Maintenance,
+            sctx_telemetry::EventKind::MaintenanceStepFinished,
+            invocation_id.clone(),
+            step.name.clone(),
+            match step.outcome {
+                MaintainOutcome::Ok => sctx_telemetry::Outcome::Success,
+                MaintainOutcome::Skipped => sctx_telemetry::Outcome::Disabled,
+                MaintainOutcome::Failed => sctx_telemetry::Outcome::Failure,
+            },
+        );
+        event.sequence = u32::try_from(sequence).unwrap_or(u32::MAX);
+        event.duration_ms = Some(u32::try_from(step.duration_ms).unwrap_or(u32::MAX));
+        if step.outcome == MaintainOutcome::Failed {
+            event.error_code = Some("maintenance_step_failed".to_owned());
+        }
+        let _ = sctx_telemetry::emit_to(logs_root, &event);
     }
 }
 
@@ -413,6 +605,16 @@ fn provisional_space_count(root: &Path) -> Result<u64> {
     Ok(u64::try_from(snapshot.data).unwrap_or(0))
 }
 
+fn finish_step_duration(steps: &mut [MaintainStep], started: Instant) {
+    if let Some(step) = steps.last_mut() {
+        step.duration_ms = elapsed_millis(started);
+    }
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 fn succeeded(name: &str) -> MaintainStep {
     MaintainStep {
         name: name.to_owned(),
@@ -420,6 +622,7 @@ fn succeeded(name: &str) -> MaintainStep {
         reason: None,
         attempts: 1,
         needs_human: false,
+        duration_ms: 0,
     }
 }
 
@@ -430,6 +633,7 @@ fn failed(name: &str, error: &Error) -> MaintainStep {
         reason: Some(error.message().to_owned()),
         attempts: 1,
         needs_human: false,
+        duration_ms: 0,
     }
 }
 

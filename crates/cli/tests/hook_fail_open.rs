@@ -1,3 +1,5 @@
+mod logging_harness;
+
 use std::{
     fs::{self, OpenOptions},
     io::{BufRead as _, BufReader, Write as _},
@@ -16,6 +18,8 @@ use sctx_local_state::UserConfigStore;
 use sctx_task_runtime::TaskRuntime;
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
+
+use logging_harness::LoggingHarness;
 
 const DIAGNOSTIC: &str = "Shared Context task retrieval is temporarily unavailable. Coding can continue; retry through MCP or CLI later.";
 
@@ -60,6 +64,7 @@ impl Drop for SqliteLock {
 }
 
 struct Harness {
+    logging: LoggingHarness,
     _temporary: TempDir,
     home: std::path::PathBuf,
 }
@@ -69,7 +74,9 @@ impl Harness {
         let temporary = tempdir().unwrap();
         let home = temporary.path().join("hook failure home");
         fs::create_dir_all(&home).unwrap();
+        let logging = LoggingHarness::start(&home);
         Self {
+            logging,
             _temporary: temporary,
             home,
         }
@@ -81,6 +88,7 @@ impl Harness {
 
     fn hook(&self, agent: &str, payload: &Value) -> std::process::Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_sctx"));
+        self.logging.apply(&mut command);
         command
             .args(["hook", "--agent", agent])
             .env("HOME", &self.home);
@@ -99,7 +107,9 @@ impl Harness {
     }
 
     fn explicit_task_context(&self) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_sctx"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sctx"));
+        self.logging.apply(&mut command);
+        command
             .args([
                 "--json",
                 "task",
@@ -308,7 +318,9 @@ fn codex_hook_without_embedded_version_never_spawns_a_per_event_probe() {
     permissions.set_mode(0o700);
     fs::set_permissions(&codex, permissions).unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sctx"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sctx"));
+    harness.logging.apply(&mut command);
+    let mut child = command
         .args(["hook", "--agent", "codex"])
         .env("HOME", &harness.home)
         .env("PATH", &binaries)
@@ -534,7 +546,9 @@ fn cursor_post_tool_hook_is_neutral_immediately_when_catalog_lock_is_busy() {
 }
 
 fn hook_raw_stdin(harness: &Harness, agent: &str, payload: &[u8]) -> std::process::Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sctx"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sctx"));
+    harness.logging.apply(&mut command);
+    let mut child = command
         .args(["hook", "--agent", agent])
         .env("HOME", &harness.home)
         .stdin(Stdio::piped())
@@ -553,11 +567,6 @@ fn hook_raw_stdin(harness: &Harness, agent: &str, payload: &[u8]) -> std::proces
 fn cursor_undecodable_payload_shapes_fail_open_with_a_neutral_output() {
     let harness = Harness::new();
     let secret = "CURSOR_UNDECODABLE_MUST_NOT_BLOCK";
-    // The Hook path's diagnostic write never creates `runtime.sqlite` itself (that would race a
-    // schema-less file ahead of the real Task Runtime tables), so this pre-creates it — exactly
-    // what a `sctx setup` on a real installation already does before any Hook ever fires.
-    TaskRuntime::initialize(harness.root()).unwrap();
-
     let mut empty_roots = cursor_session_start(&harness.home, "undecodable-roots");
     empty_roots["workspace_roots"] = json!([]);
     let mut unknown_event = cursor_session_start(&harness.home, "undecodable-event");
@@ -574,13 +583,12 @@ fn cursor_undecodable_payload_shapes_fail_open_with_a_neutral_output() {
     let output = hook_raw_stdin(&harness, "cursor", b"RAW_NOT_JSON_PAYLOAD");
     assert_neutral(&output, &harness.root(), secret);
 
-    // The Runtime was already open-able (pre-created above), so every fail-open payload above
-    // must have left a `payload_decode_failed` hook_event row.
-    let runtime = TaskRuntime::initialize(harness.root()).unwrap();
-    let recent = runtime.recent_hook_events(50).unwrap();
+    // Each failure is emitted to the collector's independent bounded diagnostics view; Runtime
+    // remains untouched by telemetry.
+    let recent = harness.logging.diagnostics().recent_events;
     let decode_failures = recent
         .iter()
-        .filter(|event| event.reason == "payload_decode_failed")
+        .filter(|event| event.reason.as_deref() == Some("payload_decode_failed"))
         .count();
     assert_eq!(
         decode_failures, 3,

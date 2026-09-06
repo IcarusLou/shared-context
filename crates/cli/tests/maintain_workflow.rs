@@ -54,10 +54,12 @@ fn maintain_run_and_status_are_reachable_and_feed_doctor() {
             "candidate_survey",
             "provisional_space_survey",
             "knowledge_sync",
+            "logs_sync",
         ]
     );
     // A default `sctx setup` bootstraps the Knowledge Store locally, so there is no remote to sync.
     assert_eq!(digest["steps"][3]["outcome"], "skipped");
+    assert_eq!(digest["steps"][4]["outcome"], "skipped");
     assert!(root.join("state/maintain-digest.json").is_file());
     assert!(root.join("state/maintain-last-run").is_file());
 

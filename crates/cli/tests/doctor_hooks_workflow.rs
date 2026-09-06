@@ -1,5 +1,6 @@
-//! `sctx doctor --hooks` reports the diagnostic rows the Hook path records into
-//! `hook_event`: a 24h decision/reason count table and the most recent rows.
+//! `sctx doctor --hooks` reports the collector's independent 24h decision/reason view.
+
+mod logging_harness;
 
 use std::{
     fs,
@@ -9,11 +10,14 @@ use std::{
 };
 
 use sctx_git_store::GitStore;
-use sctx_task_runtime::TaskRuntime;
 use serde_json::{Value, json};
 
-fn run_hook_raw(home: &Path, stdin: &[u8]) -> std::process::Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sctx"))
+use logging_harness::LoggingHarness;
+
+fn run_hook_raw(home: &Path, logging: &LoggingHarness, stdin: &[u8]) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sctx"));
+    logging.apply(&mut command);
+    let mut child = command
         .args(["hook", "--agent", "cursor"])
         .env("HOME", home)
         .stdin(Stdio::piped())
@@ -26,8 +30,8 @@ fn run_hook_raw(home: &Path, stdin: &[u8]) -> std::process::Output {
     child.wait_with_output().unwrap()
 }
 
-fn run_hook(home: &Path, payload: &Value) -> std::process::Output {
-    run_hook_raw(home, &serde_json::to_vec(payload).unwrap())
+fn run_hook(home: &Path, logging: &LoggingHarness, payload: &Value) -> std::process::Output {
+    run_hook_raw(home, logging, &serde_json::to_vec(payload).unwrap())
 }
 
 fn cursor_session_start(cwd: &Path, session_id: &str) -> Value {
@@ -46,8 +50,10 @@ fn cursor_session_start(cwd: &Path, session_id: &str) -> Value {
     })
 }
 
-fn run_json_cli(home: &Path, args: &[&str]) -> Value {
-    let output = Command::new(env!("CARGO_BIN_EXE_sctx"))
+fn run_json_cli(home: &Path, logging: &LoggingHarness, args: &[&str]) -> Value {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sctx"));
+    logging.apply(&mut command);
+    let output = command
         .arg("--json")
         .args(args)
         .env("HOME", home)
@@ -68,10 +74,7 @@ fn doctor_hooks_reports_counts_and_recent_rows_for_this_installations_hook_activ
     fs::create_dir_all(&home).unwrap();
     let root = home.join(".shared-context");
     GitStore::bootstrap_local(&root).unwrap();
-    // The Hook path's diagnostic write never creates `runtime.sqlite` itself — that would race
-    // a schema-less file ahead of the real Task Runtime tables — so this pre-creates it exactly
-    // as a real `sctx setup` already would before any Hook ever fires.
-    TaskRuntime::initialize(&root).unwrap();
+    let logging = LoggingHarness::start(&home);
 
     // A Disabled SessionStart is the product's normal, by-design silent path — it must leave
     // zero local residue, so the Hook path never records it. To see an `ok` row this uses an
@@ -88,6 +91,7 @@ fn doctor_hooks_reports_counts_and_recent_rows_for_this_installations_hook_activ
     );
     run_json_cli(
         &home,
+        &logging,
         &[
             "repository",
             "add",
@@ -99,16 +103,18 @@ fn doctor_hooks_reports_counts_and_recent_rows_for_this_installations_hook_activ
     );
     let enabled = run_hook(
         &home,
+        &logging,
         &cursor_session_start(&workspace, "doctor-hooks-enabled"),
     );
     assert!(enabled.status.success());
 
     // An undecodable payload: the Hook fails open before an Agent Session even exists and
     // records one `payload_decode_failed` / `fail_open` row.
-    let undecodable = run_hook_raw(&home, b"NOT_JSON_AT_ALL");
+    let undecodable = run_hook_raw(&home, &logging, b"NOT_JSON_AT_ALL");
     assert!(undecodable.status.success());
 
-    let report = run_json_cli(&home, &["doctor", "--hooks"]);
+    let _ = logging.diagnostics();
+    let report = run_json_cli(&home, &logging, &["doctor", "--hooks"]);
     assert_eq!(report["window_hours"], json!(24));
 
     let counts = report["counts"].as_array().unwrap();
@@ -155,8 +161,11 @@ fn doctor_hooks_rejects_combination_with_fix_or_recheck() {
     let home = temporary.path().join("doctor hooks conflict home");
     fs::create_dir_all(&home).unwrap();
     GitStore::bootstrap_local(home.join(".shared-context")).unwrap();
+    let logging = LoggingHarness::start(&home);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_sctx"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sctx"));
+    logging.apply(&mut command);
+    let output = command
         .args(["doctor", "--hooks", "--fix"])
         .env("HOME", &home)
         .output()

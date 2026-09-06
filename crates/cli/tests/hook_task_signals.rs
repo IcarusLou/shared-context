@@ -5,6 +5,8 @@
 //! things together at each step — what was stored, what was *not* stored, and that the Hook's
 //! stdout stayed an empty object.
 
+mod logging_harness;
+
 use std::{
     collections::BTreeMap,
     fs,
@@ -24,11 +26,14 @@ use sctx_local_state::UserConfigStore;
 use sctx_task_runtime::TaskRuntime;
 use serde_json::{Value, json};
 
+use logging_harness::LoggingHarness;
+
 /// A GitHub token shaped exactly like the privacy scanner's `ghp_` pattern (24..96 trailing
 /// characters), so a Prompt carrying it must never reach storage verbatim.
 const PROMPT_SECRET: &str = "ghp_0123456789abcdefghijklmnopqrstuvwx";
 
 struct Fixture {
+    logging: LoggingHarness,
     _temporary: tempfile::TempDir,
     home: PathBuf,
     root: PathBuf,
@@ -51,7 +56,9 @@ impl Fixture {
             .unwrap()
             .add_repository(repository_id.clone(), std::slice::from_ref(&repository))
             .unwrap();
+        let logging = LoggingHarness::start(&home);
         Self {
+            logging,
             _temporary: temporary,
             home,
             root,
@@ -67,7 +74,9 @@ impl Fixture {
         } else {
             "0.147.0"
         };
-        let mut child = Command::new(env!("CARGO_BIN_EXE_sctx"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sctx"));
+        self.logging.apply(&mut command);
+        let mut child = command
             .args(["hook", "--agent", agent, "--agent-version", version])
             .env("HOME", &self.home)
             .stdin(Stdio::piped())
@@ -157,16 +166,15 @@ impl Fixture {
     }
 
     fn hook_events(&self) -> Vec<(String, Option<String>)> {
-        TaskRuntime::initialize(&self.root)
-            .unwrap()
-            .recent_hook_events(64)
-            .unwrap()
+        self.logging
+            .diagnostics()
+            .recent_events
             .into_iter()
-            .map(|event| (event.reason, event.detail))
+            .map(|event| (event.reason.unwrap_or_default(), event.summary))
             .collect()
     }
 
-    fn hook_event_detail(&self, reason: &str) -> Option<String> {
+    fn hook_event_summary(&self, reason: &str) -> Option<String> {
         self.hook_events()
             .into_iter()
             .find(|(event_reason, _)| event_reason == reason)
@@ -519,6 +527,13 @@ fn a_disabled_session_prompt_writes_nothing_at_all() {
 
     assert_eq!(fixture.state_bytes(), before);
     assert!(!fixture.root.join("state/runtime.sqlite").exists());
+    assert!(
+        fixture
+            .logging
+            .diagnostics_or_empty()
+            .recent_events
+            .is_empty()
+    );
 }
 
 /// Cursor sends its tool result as a JSON string, and its `exitCode` is a decidable failure
@@ -788,9 +803,9 @@ fn cursor_relative_tool_paths_resolve_against_the_event_workspace() {
     );
 }
 
-/// Ten undecodable payloads arrived from one real Codex build with an empty `detail`, which said
-/// only that something failed and never which shape failed. The shape is diagnosable without
-/// reading one value: the payload's length and the top-level keys the decoder branches on.
+/// Undecodable payloads produce only a typed collector event. The bounded event deliberately
+/// omits the old free-text shape fingerprint so no input value, key, or local path can cross the
+/// telemetry boundary.
 #[test]
 fn an_undecodable_payload_records_its_shape_and_none_of_its_values() {
     let fixture = Fixture::new("undecodable payload");
@@ -808,16 +823,29 @@ fn an_undecodable_payload_records_its_shape_and_none_of_its_values() {
         json!({})
     );
 
-    let detail = fixture
-        .hook_event_detail("payload_decode_failed")
-        .expect("an undecodable payload records its shape");
-    assert!(detail.starts_with("bytes="), "{detail}");
-    assert!(detail.contains("hook_event_name"), "{detail}");
-    assert!(detail.contains("session_id"), "{detail}");
-    // The key name is quoted, held to an ASCII identifier alphabet; the value never is.
-    assert!(detail.contains("novel?field?"), "{detail}");
-    assert!(!detail.contains(secret), "{detail}");
-    assert!(detail.chars().count() <= 256, "{detail}");
+    let events = fixture.logging.diagnostics().recent_events;
+    let event = events
+        .iter()
+        .find(|event| event.reason.as_deref() == Some("payload_decode_failed"))
+        .expect("an undecodable payload records a typed collector diagnostic");
+    assert_eq!(event.operation.as_deref(), Some("hook.codex.undecodable"));
+    assert_eq!(
+        event.summary, None,
+        "free text is never persisted for decode failures"
+    );
+    assert_eq!(fixture.hook_event_summary("payload_decode_failed"), None);
+    let telemetry = fixture.logging.persisted_text();
+    for forbidden in [
+        secret,
+        "SomeUndocumentedEvent",
+        "novel field!",
+        fixture.root.to_str().unwrap(),
+    ] {
+        assert!(
+            !telemetry.contains(forbidden),
+            "telemetry leaked {forbidden:?}"
+        );
+    }
     assert!(!fixture.persisted_state_text().contains(secret));
 }
 
@@ -893,4 +921,11 @@ fn a_disabled_self_heal_delivers_no_marker_and_writes_nothing() {
     assert_eq!(fixture.hook("codex", &event("turn-2")), json!({}));
     assert_eq!(fixture.state_bytes(), before);
     assert!(!fixture.root.join("state/runtime.sqlite").exists());
+    assert!(
+        fixture
+            .logging
+            .diagnostics_or_empty()
+            .recent_events
+            .is_empty()
+    );
 }
