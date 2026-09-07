@@ -11,6 +11,14 @@
 //!   differently and some emit only `last_hidden_state`. Guessing wrong yields plausible-looking
 //!   vectors that quietly rank nothing correctly, so the session's declared inputs and outputs are
 //!   read once at load and the pooling strategy is chosen from what is actually there.
+//! * **The family is declared, not sniffed.** Two encoder families are supported and they disagree
+//!   about every step between text and vector: which token carries the sentence, whether a query is
+//!   prefixed with an instruction, whether the graph wants `position_ids`, and what cosine floor
+//!   means anything. None of those disagreements is detectable from the vector -- each combination
+//!   produces a unit-length vector of the right width -- so the family is read from the model
+//!   directory's `config.json` and a directory that has one this provider cannot recognise fails to
+//!   load. The failure is the feature: a bad install has to surface where `sctx doctor` looks, not
+//!   as a channel that answers every query with a confidently wrong ranking.
 //! * **The one session is rationed, not merely locked.** `Session::run` needs `&mut`, so every
 //!   encode in the process is serialised through one mutex, and the corpus backfill is a loop of
 //!   the most expensive encodes there are. A plain mutex lets that loop barge: it re-acquires the
@@ -20,6 +28,7 @@
 //!   run in flight when a query arrives, which is what makes one session enough for both.
 
 use std::{
+    borrow::Cow,
     path::Path,
     sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError},
     time::{Duration, Instant},
@@ -32,7 +41,10 @@ use ort::{
 use sctx_domain::{Error, ErrorKind, Result};
 use tokenizers::Tokenizer;
 
-use super::{EmbeddingProvider, SEMANTIC_MAX_TOKENS, normalize};
+use super::{
+    EmbeddingProvider, QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SEMANTIC_MAX_TOKENS,
+    SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, normalize,
+};
 
 /// The ONNX Runtime library is process-global: `ort::init_from` may only take effect once, before
 /// any session exists. A second `[retrieval]` path in the same process would be ignored rather
@@ -108,6 +120,22 @@ enum Priority {
     /// Corpus work with no reader waiting. It may always be made to wait, and may be abandoned
     /// part-way and redone later.
     Bulk,
+}
+
+impl Priority {
+    /// What text encoded at this priority is.
+    ///
+    /// The two facts coincide by construction rather than by coincidence: the only thing a user
+    /// ever blocks on is a query, and the only thing the backfill ever encodes is corpus text. Both
+    /// entry points on the trait already carry the distinction, so an asymmetric model needs no new
+    /// plumbing to be told which side of itself to be -- and cannot be told wrongly without also
+    /// scheduling the encode wrongly, which is loud.
+    const fn role(self) -> TextRole {
+        match self {
+            Self::Interactive => TextRole::Query,
+            Self::Bulk => TextRole::Document,
+        }
+    }
 }
 
 /// Admission control in front of the one ONNX session, and the reason one session is enough.
@@ -340,9 +368,102 @@ enum Pooling {
     /// head on. Mean pooling over the sequence is a different embedding space and scores
     /// differently against a corpus built with CLS pooling.
     ClassToken,
+    /// Take the final position's hidden state, which is where a causal decoder accumulates the
+    /// whole sequence. Only the last position has attended to everything before it, so for this
+    /// family it is the only position that carries a sentence at all.
+    LastToken,
 }
 
-/// A loaded bge-m3-shaped ONNX encoder.
+/// Which encoder family the loaded model belongs to.
+///
+/// This is the one fact the rest of the file branches on, and it exists because the two families
+/// share nothing but the file names. It is deliberately not inferred from the graph: an encoder and
+/// a decoder can declare identical inputs and an identically shaped output and still need opposite
+/// treatment at every step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelFamily {
+    /// bge-m3: XLM-R tokenizer, `[CLS]` pooling, queries and documents encoded identically.
+    ///
+    /// This is what a model directory with no `config.json` is taken to be, because that is what
+    /// every directory the installer has written so far contains.
+    BgeM3,
+    /// F2LLM over a Qwen3-0.6B decoder: last-token pooling, an explicit `position_ids` input, and
+    /// an instruction prefix that goes in front of queries and never in front of corpus text.
+    Qwen3,
+}
+
+/// What a text is being encoded *as*.
+///
+/// For bge-m3 the distinction is invisible -- the same text produces the same vector either way. For
+/// an asymmetric model it changes the text before it is ever tokenized, which is why it has to be
+/// carried this far down rather than decided by the caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextRole {
+    /// A retrieval query, which is what a user is waiting on.
+    Query,
+    /// Corpus text being embedded for later comparison.
+    Document,
+}
+
+/// The instruction F2LLM was trained to see in front of a query and never in front of a document.
+///
+/// The asymmetry is the model's, not a choice made here: dropping it costs recall on every query,
+/// and adding it to corpus text moves the whole corpus into the query region of the space, which
+/// costs more. Both mistakes are silent -- the vectors stay unit-length and the right width -- so
+/// the two sides are separated by [`TextRole`] at the one place that can still tell them apart.
+const QWEN3_QUERY_INSTRUCTION: &str =
+    "Instruct: Given a question, retrieve passages that can help answer the question.\nQuery: ";
+
+/// `<|im_end|>`, the token this tokenizer's post-processor appends to every sequence.
+///
+/// Last-token pooling reads whatever token ends up last, so this one is not decoration: truncation
+/// cutting it off leaves the vector meaning "the 511th token of the text" instead of "the text",
+/// with nothing in the output to say so. [`OnnxEmbeddingProvider::input_ids`] puts it back.
+const QWEN3_EOS_TOKEN: i64 = 151_645;
+
+/// Reads the model family out of the directory `[retrieval]` names.
+///
+/// Three outcomes, and the third is the point. No `config.json` is bge-m3, because that is exactly
+/// what the installations that predate this function look like and a working install must not start
+/// failing on an upgrade. A `config.json` naming a family this provider implements is that family.
+/// Anything else -- unreadable, unparseable, or naming a `model_type` nobody here has calibrated --
+/// is a load failure, because the alternative is picking a tokenization and a pooling by coin flip
+/// and reporting the result as retrieval.
+fn detect_family(model_directory: &Path) -> Result<ModelFamily> {
+    let config_path = model_directory.join("config.json");
+    let raw = match std::fs::read(&config_path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ModelFamily::BgeM3);
+        }
+        Err(error) => {
+            return Err(Error::new(
+                ErrorKind::Io,
+                format!("read model config {}: {error}", config_path.display()),
+            ));
+        }
+    };
+    let config: serde_json::Value = serde_json::from_slice(&raw).map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("parse model config {}: {error}", config_path.display()),
+        )
+    })?;
+    match config.get("model_type").and_then(serde_json::Value::as_str) {
+        Some("qwen3") => Ok(ModelFamily::Qwen3),
+        other => Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "model config {} declares model_type {:?}, which this build has no encoder \
+                 contract for",
+                config_path.display(),
+                other.unwrap_or("<missing>")
+            ),
+        )),
+    }
+}
+
+/// A loaded ONNX encoder, of one of the families [`ModelFamily`] names.
 pub struct OnnxEmbeddingProvider {
     // `Session::run` needs `&mut`, and the provider is shared across the backfill thread and the
     // query path. One session is the memory-honest choice -- a second would double the ~1.2 GB
@@ -353,6 +474,7 @@ pub struct OnnxEmbeddingProvider {
     tokenizer: Tokenizer,
     input_names: Vec<String>,
     output_name: String,
+    family: ModelFamily,
     pooling: Pooling,
     dimensions: usize,
 }
@@ -365,9 +487,10 @@ impl OnnxEmbeddingProvider {
     /// # Errors
     ///
     /// Returns [`ErrorKind::Io`] when the directory is missing either file and
-    /// [`ErrorKind::InvalidInput`] when the model cannot be loaded or has no output this provider
-    /// knows how to pool.
+    /// [`ErrorKind::InvalidInput`] when the model cannot be loaded, declares a family this build
+    /// has no contract for, or has no output this provider knows how to pool.
     pub fn load(model_directory: &Path) -> Result<Self> {
+        let family = detect_family(model_directory)?;
         let model_path = model_directory.join("model.onnx");
         if !model_path.is_file() {
             return Err(Error::new(
@@ -407,7 +530,7 @@ impl OnnxEmbeddingProvider {
             .iter()
             .map(|outlet| outlet.name().to_owned())
             .collect::<Vec<_>>();
-        let (output_name, pooling) = select_output(&output_names)?;
+        let (output_name, pooling) = select_output(family, &output_names)?;
 
         Ok(Self {
             gate: SessionGate::new()?,
@@ -415,8 +538,9 @@ impl OnnxEmbeddingProvider {
             tokenizer,
             input_names,
             output_name,
+            family,
             pooling,
-            // bge-m3 dense is 1024-wide, but the width is confirmed from the first encode rather
+            // Both families are 1024-wide, but the width is confirmed from the first encode rather
             // than asserted here: a dimension mismatch has to be a load-time or first-encode
             // failure, never a silently wrong vector.
             dimensions: 0,
@@ -441,28 +565,85 @@ impl OnnxEmbeddingProvider {
         Ok(provider)
     }
 
-    /// Encodes one text, waiting for the session on `priority`'s terms.
+    /// Which family this provider loaded, for callers that report what is installed.
+    #[must_use]
+    pub const fn family(&self) -> ModelFamily {
+        self.family
+    }
+
+    /// The exact token sequence `text` is encoded as in `role`.
     ///
-    /// Tokenisation happens before admission on purpose: it needs no session, and doing it inside
-    /// the gate would lengthen the window a waiting query has to sit through for no gain.
-    fn encode_inner(&self, text: &str, priority: Priority) -> Result<Vec<f32>> {
-        let mut encoding = self.tokenizer.encode(text, true).map_err(|error| {
-            Error::new(ErrorKind::InvalidInput, format!("tokenize query: {error}"))
-        })?;
+    /// Public because nothing downstream can check it. Every mistake this function can make -- a
+    /// missing query instruction, a truncation that drops the token last-token pooling reads, an
+    /// off-by-one anywhere in the sequence -- produces a unit-length vector of the correct width
+    /// that simply means something other than the text. There is no assertion available at the
+    /// vector, so the assertion has to be available at the tokens, against a reference
+    /// implementation's. Nothing on the retrieval path calls this; [`Self::encode_inner`] shares it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] when the tokenizer rejects the text.
+    pub fn input_ids(&self, text: &str, role: TextRole) -> Result<Vec<i64>> {
+        let text = match (self.family, role) {
+            (ModelFamily::Qwen3, TextRole::Query) => {
+                Cow::Owned(format!("{QWEN3_QUERY_INSTRUCTION}{text}"))
+            }
+            // bge-m3 is symmetric, and a document is a document in every family. The prefix is
+            // joined here rather than by the caller so the query vector cache stays keyed on the
+            // text a session actually asked about.
+            _ => Cow::Borrowed(text),
+        };
+        let mut encoding = self
+            .tokenizer
+            .encode(text.as_ref(), true)
+            .map_err(|error| {
+                Error::new(ErrorKind::InvalidInput, format!("tokenize query: {error}"))
+            })?;
         encoding.truncate(
             SEMANTIC_MAX_TOKENS,
             0,
             tokenizers::TruncationDirection::Right,
         );
-        let length = encoding.get_ids().len().max(1);
-        let ids = encoding
+        let mut ids = encoding
             .get_ids()
             .iter()
             .map(|id| i64::from(*id))
             .collect::<Vec<_>>();
-        let ids = if ids.is_empty() { vec![0_i64] } else { ids };
+        // Truncation cuts from the right, which is precisely where the post-processor put the token
+        // this family pools on. Restoring it costs the last token of the text and keeps the vector
+        // meaning the text; not restoring it costs the vector its meaning and says nothing.
+        if self.family == ModelFamily::Qwen3 && ids.last() != Some(&QWEN3_EOS_TOKEN) {
+            if ids.len() >= SEMANTIC_MAX_TOKENS {
+                ids.truncate(SEMANTIC_MAX_TOKENS.saturating_sub(1));
+            }
+            ids.push(QWEN3_EOS_TOKEN);
+        }
+        if ids.is_empty() {
+            ids.push(0);
+        }
+        Ok(ids)
+    }
+
+    /// Encodes one text, waiting for the session on `priority`'s terms.
+    ///
+    /// Tokenisation happens before admission on purpose: it needs no session, and doing it inside
+    /// the gate would lengthen the window a waiting query has to sit through for no gain.
+    fn encode_inner(&self, text: &str, priority: Priority) -> Result<Vec<f32>> {
+        let ids = self.input_ids(text, priority.role())?;
+        let length = ids.len();
         let mask = vec![1_i64; length];
         let type_ids = vec![0_i64; length];
+        // Built only when the graph asks for it. bge-m3 derives its positions internally and
+        // declares no such input, so handing one over unasked would be an input the session has no
+        // slot for; the decoder export declares it and gets a plain `arange`, which is what a
+        // batch of one with no padding means.
+        let positions = if self.input_names.iter().any(|name| name == "position_ids") {
+            (0..length)
+                .map(|index| i64::try_from(index).unwrap_or(i64::MAX))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let shape = [1_usize, length];
         let mut inputs = Vec::new();
@@ -471,6 +652,7 @@ impl OnnxEmbeddingProvider {
                 "input_ids" => &ids,
                 "attention_mask" => &mask,
                 "token_type_ids" => &type_ids,
+                "position_ids" => &positions,
                 // An input this provider cannot supply means the graph is not the encoder shape
                 // ADR-0004 specified; refusing is the only honest answer.
                 other => {
@@ -537,6 +719,13 @@ impl EmbeddingProvider for OnnxEmbeddingProvider {
         self.encode_checked(text, Priority::Interactive)
     }
 
+    fn similarity_floor_basis_points(&self) -> u16 {
+        match self.family {
+            ModelFamily::BgeM3 => SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS,
+            ModelFamily::Qwen3 => QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS,
+        }
+    }
+
     fn encode_bulk(&self, text: &str) -> Result<Vec<f32>> {
         // The scope is taken before admission so a corpus text that is still queuing already
         // counts as backfill pressure: a query encoded while it waits is a contended encode, and
@@ -587,15 +776,24 @@ impl OnnxEmbeddingProvider {
 }
 
 /// Picks the output to pool, preferring one the graph already reduced.
-fn select_output(output_names: &[String]) -> Result<(String, Pooling)> {
+///
+/// The family decides only the second half. Whether the graph pooled for us is a fact about the
+/// graph and reads the same either way; *which* position carries the sentence when it did not is a
+/// fact about the model, and reading a decoder's first position is how one gets a plausible vector
+/// of the start-of-sequence token instead of the text.
+fn select_output(family: ModelFamily, output_names: &[String]) -> Result<(String, Pooling)> {
     for candidate in ["dense_vecs", "sentence_embedding", "text_embeds"] {
         if let Some(name) = output_names.iter().find(|name| name.as_str() == candidate) {
             return Ok((name.clone(), Pooling::Pooled));
         }
     }
+    let sequence_pooling = match family {
+        ModelFamily::BgeM3 => Pooling::ClassToken,
+        ModelFamily::Qwen3 => Pooling::LastToken,
+    };
     for candidate in ["last_hidden_state", "token_embeddings", "output"] {
         if let Some(name) = output_names.iter().find(|name| name.as_str() == candidate) {
-            return Ok((name.clone(), Pooling::ClassToken));
+            return Ok((name.clone(), sequence_pooling));
         }
     }
     // Falling back to output 0 with CLS pooling would be a guess, and a wrong guess here is
@@ -625,9 +823,52 @@ fn pool(pooling: Pooling, shape: &[i64], values: &[f32]) -> Result<Vec<f32>> {
             "embedding output is shorter than one vector",
         ));
     }
-    // Batch is always one and the class token is index zero, so both strategies read the same
-    // leading slice; they differ in what the rest of the buffer means, not in where the answer is.
+    // Batch is always one and the class token is index zero, so the first two strategies read the
+    // same leading slice; they differ in what the rest of the buffer means, not in where the answer
+    // is. The third is the one that has to look.
     match pooling {
         Pooling::Pooled | Pooling::ClassToken => Ok(values[..width].to_vec()),
+        Pooling::LastToken => {
+            // Unlike the other two, this answer is not at the front of the buffer, so the sequence
+            // length is load-bearing and the shape is checked rather than trusted. A rank-2 output
+            // would be a graph that already pooled, and its "last row" is the tail of one vector,
+            // not the vector -- a mistake that still returns 1024 finite floats.
+            let [batch, sequence, _] = shape else {
+                return Err(Error::new(
+                    ErrorKind::External,
+                    format!(
+                        "last-token pooling needs a [batch, sequence, hidden] output, got {shape:?}"
+                    ),
+                ));
+            };
+            if *batch != 1 {
+                return Err(Error::new(
+                    ErrorKind::External,
+                    format!("embedding output has batch {batch}, expected one sequence"),
+                ));
+            }
+            let sequence = usize::try_from(*sequence)
+                .ok()
+                .filter(|sequence| *sequence > 0)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::External,
+                        format!("embedding output has unusable shape {shape:?}"),
+                    )
+                })?;
+            let end = sequence.checked_mul(width).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::External,
+                    format!("embedding output has unusable shape {shape:?}"),
+                )
+            })?;
+            if values.len() < end {
+                return Err(Error::new(
+                    ErrorKind::External,
+                    "embedding output is shorter than the shape it declares",
+                ));
+            }
+            Ok(values[end - width..end].to_vec())
+        }
     }
 }

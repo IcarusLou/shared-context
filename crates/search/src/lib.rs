@@ -29,11 +29,11 @@ pub mod embedding;
 
 pub use embedding::{
     EmbeddingProvider, EmbeddingSemanticChannel, EncodeLatencySummary, EncodeSample,
-    EncodeSampleRecorder, QueryVectorCache, SEMANTIC_CHANNEL_LIMIT, SEMANTIC_ENCODE_BUDGET,
-    SEMANTIC_ENCODE_SAMPLE_HISTORY, SEMANTIC_QUERY_CACHE_CAPACITY,
-    SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SemanticCacheKey, SemanticChannel,
-    SemanticChannelHandle, SemanticHit, SemanticOutcome, SemanticVectorCache, load_onnx_provider,
-    model_fingerprint, semantic_cache_path,
+    EncodeSampleRecorder, QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, QueryVectorCache,
+    SEMANTIC_CHANNEL_LIMIT, SEMANTIC_ENCODE_BUDGET, SEMANTIC_ENCODE_SAMPLE_HISTORY,
+    SEMANTIC_QUERY_CACHE_CAPACITY, SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SemanticCacheKey,
+    SemanticChannel, SemanticChannelHandle, SemanticHit, SemanticOutcome, SemanticVectorCache,
+    load_onnx_provider, model_fingerprint, semantic_cache_path,
 };
 
 pub use candidate::{

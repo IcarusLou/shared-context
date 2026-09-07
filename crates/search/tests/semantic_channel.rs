@@ -157,6 +157,30 @@ impl EmbeddingProvider for HashProvider {
     }
 }
 
+/// A [`HashProvider`] that reports a similarity floor of its own.
+///
+/// It stands in for a second model family without needing a second model: what matters to the
+/// channel is not which encoder produced the floor but that the floor travelled with the provider
+/// instead of being read from a constant at the call site.
+struct FlooredProvider {
+    inner: HashProvider,
+    floor: u16,
+}
+
+impl EmbeddingProvider for FlooredProvider {
+    fn dimensions(&self) -> usize {
+        self.inner.dimensions()
+    }
+
+    fn encode(&self, text: &str) -> Result<Vec<f32>, Error> {
+        self.inner.encode(text)
+    }
+
+    fn similarity_floor_basis_points(&self) -> u16 {
+        self.floor
+    }
+}
+
 /// A channel that answers whatever the test told it to answer.
 struct ScriptedChannel {
     outcome: SemanticOutcome,
@@ -594,16 +618,53 @@ fn hash_channel(texts: &[&str]) -> (EmbeddingSemanticChannel, Vec<RevisionId>) {
     (EmbeddingSemanticChannel::new(provider, vectors), revisions)
 }
 
+/// The two corpus texts every floor assertion here uses: one the query repeats verbatim, one about
+/// something else entirely.
+const FLOOR_CORPUS: [&str; 2] = [
+    "retry outside the deduplication window is delivered twice",
+    "espresso extraction pressure curves for a hand pour",
+];
+
+#[test]
+fn a_provider_that_names_no_floor_gets_the_bge_m3_calibration() {
+    assert_eq!(
+        HashProvider::new().similarity_floor_basis_points(),
+        SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS,
+        "the trait default is the number T5a measured against bge-m3, so every provider written \
+         before a second family existed keeps scoring exactly as it did"
+    );
+}
+
+#[test]
+fn the_channel_takes_its_floor_from_the_provider() {
+    // Same corpus and same query as the floor test below, so the only difference between the two
+    // outcomes is which floor the channel was handed.
+    let provider = Arc::new(FlooredProvider {
+        inner: HashProvider::new(),
+        floor: 0,
+    });
+    let vectors = FLOOR_CORPUS
+        .iter()
+        .map(|text| (RevisionId::new(), provider.encode(text).unwrap()))
+        .collect::<Vec<_>>();
+    let channel = EmbeddingSemanticChannel::new(provider, vectors);
+
+    let SemanticOutcome::Hits(hits) = channel.similar_revisions(FLOOR_CORPUS[0]) else {
+        panic!("a loaded channel over a non-empty corpus must run");
+    };
+    assert_eq!(
+        hits.len(),
+        FLOOR_CORPUS.len(),
+        "the unrelated text clears a floor of zero, so the channel read the provider's floor and \
+         not the bge-m3 constant; got {hits:?}"
+    );
+}
+
 #[test]
 fn the_similarity_floor_admits_the_near_match_and_rejects_the_unrelated_one() {
-    let (channel, revisions) = hash_channel(&[
-        "retry outside the deduplication window is delivered twice",
-        "espresso extraction pressure curves for a hand pour",
-    ]);
+    let (channel, revisions) = hash_channel(&FLOOR_CORPUS);
 
-    let SemanticOutcome::Hits(hits) =
-        channel.similar_revisions("retry outside the deduplication window is delivered twice")
-    else {
+    let SemanticOutcome::Hits(hits) = channel.similar_revisions(FLOOR_CORPUS[0]) else {
         panic!("a loaded channel over a non-empty corpus must run");
     };
     assert_eq!(

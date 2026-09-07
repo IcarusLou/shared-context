@@ -60,6 +60,24 @@ pub mod onnx;
 /// asked for is worse than no Context at all.
 pub const SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS: u16 = 5_200;
 
+/// The same floor for the F2LLM encoder over a Qwen3-0.6B decoder.
+///
+/// **Provisional.** It comes from the torch/Python benchmark that validated the F2LLM contract
+/// before any of it existed in this workspace: over that run, keeping 95% of the true positives
+/// needs a floor no higher than 3540, and the highest-scoring noise query reaches 2066. 3000 sits
+/// between the two with roughly a third of the gap on either side. It is not the T5a procedure that
+/// produced [`SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`] -- different fixtures, a different stack, and
+/// no cross-lingual positive read off the same run -- so it stands only until that procedure is
+/// repeated on this family against the `ort` stack this workspace actually ships.
+///
+/// A second constant rather than a second opinion about the first: cosine floors are not portable
+/// between embedding spaces. bge-m3's CLS vectors and a decoder's last-token vectors spread their
+/// similarities over different ranges, and carrying 5200 across would reject nearly everything this
+/// family retrieves, exactly as carrying 3000 back would admit noise bge-m3 was calibrated to
+/// refuse. Which one applies is a property of the loaded model, so the loaded provider is what
+/// reports it -- see [`EmbeddingProvider::similarity_floor_basis_points`].
+pub const QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS: u16 = 3_000;
+
 /// Most revisions one query may contribute through the semantic channel.
 ///
 /// Fusion ranks within a channel, so an unbounded channel would hand a rank to every vector above
@@ -149,6 +167,20 @@ pub trait EmbeddingProvider: Send + Sync {
     ///
     /// Returns a typed error when the text cannot be tokenized or the model cannot be run.
     fn encode(&self, text: &str) -> Result<Vec<f32>>;
+
+    /// Cosine similarity, in basis points, below which this provider's vectors say nothing useful.
+    ///
+    /// The floor belongs to the provider because it is a property of the embedding space, not of
+    /// retrieval: it is read off a calibration run against one model, and the number that keeps
+    /// noise out of one space is the number that empties another. A caller that reached for a
+    /// constant instead would be asserting that every encoder scores alike, which is the assumption
+    /// that breaks the moment a second family is installed.
+    ///
+    /// The default is [`SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`], which is bge-m3's -- the space
+    /// every provider that predates a second family produces vectors in.
+    fn similarity_floor_basis_points(&self) -> u16 {
+        SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS
+    }
 
     /// Encodes corpus text nobody is waiting for, yielding the encoder to queries.
     ///
@@ -987,6 +1019,8 @@ fn similarity_basis_points(similarity: f32) -> u16 {
 pub struct EmbeddingSemanticChannel {
     provider: Arc<dyn EmbeddingProvider>,
     vectors: Arc<Vec<(RevisionId, Vec<f32>)>>,
+    /// Read from the provider at construction, not from a constant: the floor that admits a hit is
+    /// a fact about the encoder that produced both sides of the comparison.
     floor_basis_points: u16,
     limit: usize,
     budget: Duration,
@@ -1009,10 +1043,11 @@ impl EmbeddingSemanticChannel {
         let query_cache = Arc::new(QueryVectorCache::with_capacity(
             SEMANTIC_QUERY_CACHE_CAPACITY,
         ));
+        let floor_basis_points = provider.similarity_floor_basis_points();
         Self {
             provider,
             vectors: Arc::new(vectors),
-            floor_basis_points: SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS,
+            floor_basis_points,
             limit: SEMANTIC_CHANNEL_LIMIT,
             budget: SEMANTIC_ENCODE_BUDGET,
             key,
