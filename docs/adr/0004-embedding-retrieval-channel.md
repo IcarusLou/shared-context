@@ -22,6 +22,8 @@ R1–R5 之后，词法召回已到达天花板。R3 的实测结论：剩余探
 补充（实装批准时明确）：语义命中 ≥ 阈值构成一条独立的注入资格路径（与 exact EngineeringGraph / ContextRelation 同级的替代条件），但不放宽任何文本门槛本身；语料向量为可丢弃本地缓存（独立 sqlite 文件，键含模型指纹与 SEARCH_RANKING_VERSION），由后台线程回填。
 
 2. **模型**：bge-m3 级别的多语模型；分发形态为「不随包分发」——`[retrieval] embedding_model_path` 指向用户显式下载的本地模型，未配置时通道整体关闭且零成本；`sctx doctor` 提示获取方式。获取方式已收敛为一条命令 `sctx embedding install`（T5c）：下载模型与 ONNX Runtime、按内置 SHA-256 逐文件校验、加载模型编码一句话自检通过后才写 `[retrieval]`、再回填向量缓存；`--model-url` 指向团队内网镜像时仍按同一组内置摘要校验（摘要是文件的属性，不是站点的属性）。这不改变「不随包分发」的决策——二进制里只有摘要，没有权重。磁盘 ~2.1GB、RSS ~1.2GB、加载 9–12s（一次性，常驻 MCP 进程）、查询编码 p95 30–85ms。
+
+补充（2026-09-06）：`sctx embedding install` 的默认导出改为 `codefuse-ai/F2LLM-v2-0.6B`，`--model bge-m3` 仍可装。这不推翻本条的任何一项决策——「不随包分发」「内置摘要按文件校验」「未配置即零成本」都不变，改的只是默认那一组摘要指向哪个仓库。上面那组实测数字仍然是 bge-m3 的（本文余下的阈值标定与对比同理），新默认导出的 RSS / 加载 / 编码延迟尚未在本仓库实测；其下载与磁盘由摘要钉死为 ~2.4GB。两个导出不共享向量空间，由 `semantic.sqlite` 键里的模型指纹保证换模型即换代而不是混用。
 3. **推理**：MCP 进程内 ort（ONNX Runtime，`load-dynamic`：运行时加载 `[retrieval]` 配置指向的 onnxruntime 动态库，构建期零网络依赖）；模型在 serve 启动时后台线程加载（避免首查付 9–12s），就绪前查询按第 4 条降级；索引侧在投影更新时为 accepted revision 计算并缓存向量（`SEARCH_RANKING_VERSION` bump 触发重建）；向量存 index.sqlite 新表，按 revision_id 键控。
 4. **降级语义**：模型缺失 / 加载失败 / 单次编码超时（预算 200ms）→ 该路静默为空 + `omitted.reason = "embedding_unavailable"`（沿用 R1 的可解释 omission 机制），词法结果不受影响。
 5. **不做**：不用 embedding 做去重（statement bigram Jaccard 分离度更好，R5 已用）；不做「embedding 单通道模式」；不引入远程 embedding 服务（隐私边界：知识正文不出本机）。

@@ -4623,16 +4623,17 @@ const GRAPH_REPAIR: &str = "Run `sctx association rebuild` (or `sctx doctor --fi
 /// installation with no `[retrieval]` at all can be handed one command, while one whose configured
 /// files have gone missing has a decision to make about the paths it already chose.
 const RETRIEVAL_SETUP: &str = "Run `sctx embedding install` to download and configure both halves, \
-     or download a bge-m3 ONNX export (`model.onnx`, its `model.onnx_data` if the export is split, \
-     and `tokenizer.json`) plus an ONNX Runtime shared library for this platform and set \
-     `[retrieval] embedding_model_path` to the model directory and `[retrieval] \
-     embedding_runtime_path` to the library in `config.toml`.";
+     or download an ONNX export (`model.onnx`, its `model.onnx_data` if the export is split, \
+     `tokenizer.json`, and `config.json` so the encoder can tell which family it loaded) plus an \
+     ONNX Runtime shared library for this platform and set `[retrieval] embedding_model_path` to \
+     the model directory and `[retrieval] embedding_runtime_path` to the library in `config.toml`.";
 
 /// What an operator has to do to turn the embedding channel on from nothing.
-const RETRIEVAL_ENABLE: &str = "run `sctx embedding install`, which downloads the bge-m3 ONNX \
-     export and an ONNX Runtime library, proves the model loads, and writes `[retrieval]` for you. \
-     It needs about 2.3 GB of disk. `sctx embedding install --model-url <BASE>` fetches the model \
-     from an internal mirror instead.";
+const RETRIEVAL_ENABLE: &str = "run `sctx embedding install`, which downloads the \
+     codefuse-ai/F2LLM-v2-0.6B ONNX export and an ONNX Runtime library, proves the model loads, \
+     and writes `[retrieval]` for you. It needs about 2.4 GB of disk. `sctx embedding install \
+     --model bge-m3` installs the older BAAI/bge-m3 export instead, and `--model-url <BASE>` \
+     fetches whichever one from an internal mirror.";
 
 /// What an operator has to do when the encode budget does not fit their hardware.
 ///
@@ -4827,13 +4828,20 @@ fn check_retrieval(root: &Path, checks: &mut Vec<DoctorCheck>) {
         ));
         return;
     };
-    let mut missing = Vec::new();
-    if !model_path.join("model.onnx").is_file() {
-        missing.push(format!("{}/model.onnx", model_path.display()));
-    }
-    if !model_path.join("tokenizer.json").is_file() {
-        missing.push(format!("{}/tokenizer.json", model_path.display()));
-    }
+    // Which files are required depends on the export: only the identified families pin a full
+    // list, and an unidentified directory is held to the two every export must have. Identification
+    // survives a `config.json` that itself went missing -- the graph size still names the family --
+    // which is the whole reason that file can be reported as missing rather than silently
+    // downgrading the directory to "unknown, and therefore fine".
+    let required: Vec<&str> = embedding::installed_model(model_path).map_or_else(
+        || vec!["model.onnx", "tokenizer.json"],
+        |model| model.files().iter().map(|file| file.name).collect(),
+    );
+    let mut missing = required
+        .into_iter()
+        .filter(|name| !model_path.join(name).is_file())
+        .map(|name| format!("{}/{name}", model_path.display()))
+        .collect::<Vec<_>>();
     if !runtime_path.is_file() {
         missing.push(runtime_path.display().to_string());
     }
@@ -4897,11 +4905,17 @@ fn configured_retrieval_check(root: &Path, model_path: &Path, runtime_path: &Pat
             ),
         );
     }
+    // Named rather than inferred: two exports are installable and they do not share a vector
+    // space, so "which model is this" is the first thing anyone comparing two machines needs.
+    let model = embedding::installed_model(model_path).map_or_else(
+        || "unrecognized export".to_owned(),
+        |model| model.slug().to_owned(),
+    );
     ok(
         "retrieval_embedding",
         format!(
-            "Configured: model {}, runtime {}, {cached} Context revision(s) embedded so far. \
-             Query encodes: {} sampled, {} over budget, p95 {} ms against a {} ms budget.",
+            "Configured: model {model} at {}, runtime {}, {cached} Context revision(s) embedded \
+             so far. Query encodes: {} sampled, {} over budget, p95 {} ms against a {} ms budget.",
             model_path.display(),
             runtime_path.display(),
             encodes.samples,

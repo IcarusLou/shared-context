@@ -643,6 +643,50 @@ fn embedding_rejects_an_unknown_subcommand_and_a_malformed_digest() {
 }
 
 #[test]
+fn an_unknown_model_is_rejected_before_anything_is_downloaded() {
+    let harness = Harness::new();
+    harness.success_lifecycle(&["setup"]);
+
+    let rejected = harness.failure(&["embedding", "install", "--model", "f2llm"]);
+
+    assert_eq!(rejected["error"]["code"], "invalid_input");
+    let message = rejected["error"]["message"].as_str().unwrap();
+    // Both accepted values are named: the alternative is an operator learning the right spelling
+    // by downloading the wrong two gigabytes.
+    assert!(message.contains("f2llm-v2-0.6b"), "{message}");
+    assert!(message.contains("bge-m3"), "{message}");
+    assert!(
+        !harness.root().join("embedding").exists(),
+        "a rejected --model must not have created the install directory"
+    );
+}
+
+#[test]
+fn embedding_status_names_no_model_when_no_model_is_installed() {
+    let harness = Harness::new();
+    harness.success_lifecycle(&["setup"]);
+
+    let status = harness.success_lifecycle(&["embedding", "status"]);
+
+    // Two exports are installable and they do not share a vector space, so `status` reports which
+    // one is on disk -- and reports nothing rather than the default when nothing is on disk.
+    assert_eq!(status["model"], serde_json::Value::Null);
+}
+
+#[test]
+fn embedding_help_documents_both_installable_models() {
+    let harness = Harness::new();
+    harness.success_lifecycle(&["setup"]);
+
+    let rejected = harness.failure(&["embedding"]);
+
+    let message = rejected["error"]["message"].as_str().unwrap();
+    assert!(message.contains("--model"), "{message}");
+    assert!(message.contains("f2llm-v2-0.6b"), "{message}");
+    assert!(message.contains("bge-m3"), "{message}");
+}
+
+#[test]
 fn upgrade_refuses_the_setup_only_embedding_flag() {
     let harness = Harness::new();
     harness.success_lifecycle(&["setup"]);
