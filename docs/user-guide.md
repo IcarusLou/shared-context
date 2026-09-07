@@ -279,15 +279,15 @@ sctx embedding install --model bge-m3   # 装回旧的那个
 
 两个模型**不共享同一个向量空间**，所以换模型等于换一套向量。这件事不用你操心：`state/semantic.sqlite` 的键里带模型指纹，换了导出旧向量既读不到也会被回收，不会出现「拿 A 的向量按 B 的空间打分」。已经装着 bge-m3 的机器不需要为了继续工作重下一个模型；`sctx embedding status` 会报当前目录里究竟是哪一个。
 
-**开销预期**。下载与磁盘是内置摘要钉死的，可以精确到字节；内存、加载耗时、编码延迟这三行是 **bge-m3 在 Apple Silicon 上的实测值**，默认模型的对应数字本仓库尚未实测，权重大约多 5%，请按同量级估算而不是当作已验证结论。
+**开销预期**。下载与磁盘是内置摘要钉死的，可以精确到字节；后三行是实测值，两列的测量条件不同，看表前先看清楚这一点：默认模型那列测于 **2026-09-07，Apple Silicon / macOS 24.6.0 / ONNX Runtime 1.28.1 / release / 页缓存已热，每档 24 次**（`crates/search/tests/embedding_encode_latency.rs`）；bge-m3 那列的加载与编码数字来自 ADR-0004 当初的 torch 原型，同一台机器上按 ort 实测的编码 p95 见括注。**两列的编码数字不能直接相减当作模型差异**——在同一套 ort 实测下，283 字符真实 Intent 上两个模型是 236ms 对 235ms，差别只出现在长查询的尾部。
 
 | 项目 | `f2llm-v2-0.6b`（默认） | `bge-m3` |
 |---|---|---|
 | 下载体积 | 约 2.4 GB（其中 `model.onnx_data` 2.38 GB） | 约 2.3 GB（其中 `model.onnx_data` 2.27 GB） |
 | 安装后磁盘 | `~/.shared-context/embedding/` 约 2.4 GB | 约 2.3 GB |
-| 常驻内存 | 尚未实测 | 模型加载后 RSS 约 1.2 GB，只在 `sctx mcp serve` 进程里 |
-| 模型加载耗时 | 尚未实测 | 9–12 秒，每个 serve 进程一次，后台线程完成，加载期间检索照常走词法通道 |
-| 查询编码 | 尚未实测 | p95 30–85 ms |
+| 常驻内存 | 加载后进程 RSS 约 1.83 GB（编码一阵后约 1.95 GB），只在 `sctx mcp serve` 进程里 | 模型加载后 RSS 约 1.2 GB，只在 `sctx mcp serve` 进程里 |
+| 模型加载耗时 | 页缓存已热时 2.1–2.5 秒；冷启动首次还要加上从磁盘读 2.4 GB 权重的时间。每个 serve 进程一次，后台线程完成，加载期间检索照常走词法通道 | 9–12 秒，每个 serve 进程一次，后台线程完成，加载期间检索照常走词法通道 |
+| 查询编码 | p95 236 ms（283 字符的真实 Working Intent 长度）；短探针 20 字符 63 ms，512-token 截断上限 986 ms | p95 30–85 ms（torch 原型；同机 ort 实测 283 字符为 235 ms） |
 
 两者共同的部分：另加 `state/semantic.sqlite`（每条 revision 约 4 KB）；单次编码超过 `embedding_encode_budget_ms` 预算即静默降级（见 6.11）；`install` 总耗时 = 下载时间 + 约 15 秒（校验 + 自检 + 回填）。
 
@@ -940,7 +940,7 @@ opportunistic_after_hours = 24
   - `embedding_model_path`：模型目录，需包含 `model.onnx`（若是拆分导出还需同目录的 `model.onnx_data`）与 `tokenizer.json`，另建议放上该导出的 `config.json`——编码器按它的 `model_type` 判断加载的是哪一族，`sctx embedding status` / `sctx doctor` 也按它报出模型名。推荐 `codefuse-ai/F2LLM-v2-0.6B`（默认，约 2.4GB 磁盘）或 `BAAI/bge-m3`（约 2.3GB 磁盘、约 1.2GB 常驻内存）的 ONNX 导出。模型不随包分发；`sctx embedding install` 会下载到 `~/.shared-context/embedding/model/`，也可以自行下载后手工指向别处；手工组装的、本产品没有量过的导出同样是受支持的配置，只是 `status` 会把模型名报成未知而不是猜一个。
   - `embedding_runtime_path`：本机 ONNX Runtime 动态库（macOS `libonnxruntime.dylib`、Linux `libonnxruntime.so`）。构建期不下载任何二进制，运行时才按此路径加载。`sctx embedding install` 会解包到 `~/.shared-context/embedding/runtime/`。
   - `embedding_encode_budget_ms`（可选）：单次查询编码的时间预算，毫秒，接受 50–30000。不写就用内置默认值 2000ms。这个默认值是在 Apple Silicon 上按真实 Working Intent 长度实测标定的（安静态：283 字符查询 p95 235ms，512-token 截断上限处 p95 816ms），再乘上真实高负载会话实测的 3–5 倍系数——同一台机器在 6.7 小时的连续会话里，一个 394 字符的查询实测 1505ms，安静态的同档只要约 300ms。明显更慢的机器仍需要调大，判断依据见下一条的 `sctx doctor` 提示。它是上限不是常态开销：一次典型查询远在预算内返回，重复查询直接命中进程内缓存。
-  - 开启后：`sctx mcp serve` 启动时由后台线程加载模型（一次性 9–12 秒）并把已接受 Context 的向量写入 `state/semantic.sqlite`（可随时删除的本地缓存，不进 Git、不进 `index.sqlite`，按模型指纹与 ranking 版本键控）。自动注入的查询会额外走一路余弦召回（阈值 0.52、最多 16 条），与词法通道一起做 RRF 融合；语义命中本身构成一条独立的注入资格路径。查询向量另有一个进程内 LRU（64 条），所以同一个 Working Intent 被反复检索时只编码一次。模型未就绪 / 加载失败 / 单次编码超过预算时，该路静默降级为 `omitted.reason = "embedding_unavailable"`，词法结果不受影响；超时的那次编码在后台跑完后仍会写进查询缓存，所以同一个 Intent 的下一次调用会直接命中。
+  - 开启后：`sctx mcp serve` 启动时由后台线程加载模型（一次性 9–12 秒）并把已接受 Context 的向量写入 `state/semantic.sqlite`（可随时删除的本地缓存，不进 Git、不进 `index.sqlite`，按模型指纹与 ranking 版本键控）。自动注入的查询会额外走一路余弦召回（最多 16 条；相似度阈值由装的是哪一族决定——bge-m3 是 0.52，默认的 F2LLM 是 0.28，两个空间的余弦分布本来就不在一个量程上，标定过程见 ADR-0004），与词法通道一起做 RRF 融合；语义命中本身构成一条独立的注入资格路径。查询向量另有一个进程内 LRU（64 条），所以同一个 Working Intent 被反复检索时只编码一次。模型未就绪 / 加载失败 / 单次编码超过预算时，该路静默降级为 `omitted.reason = "embedding_unavailable"`，词法结果不受影响；超时的那次编码在后台跑完后仍会写进查询缓存，所以同一个 Intent 的下一次调用会直接命中。
   - 怎么知道预算够不够：最近 64 次编码的耗时分布与超时次数记在 `semantic.sqlite` 里，`sctx embedding status` 的 `encode_latency` 字段会输出（`samples`/`timed_out`/`p50_ms`/`p95_ms`/`max_ms`）。超时占多数时 `sctx doctor` 的 `retrieval_embedding` 检查会从 Ok 变成 Warning，并直接给出调大 `embedding_encode_budget_ms` 的建议——通道「装好了但每次都超时」在 Pack 里和「没装模型」长得一模一样，这是唯一能把两者区分开的地方。
   - 显式 `context_search` 本轮不接入该通道，保持纯词法。
 - `[maintenance]`：`sctx maintain run`（见 6.x 命令表）什么时候自己跑起来。两条轨互相独立，都默认开着，因为单独任何一条都会漏掉真实的机器：

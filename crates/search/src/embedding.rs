@@ -62,21 +62,50 @@ pub const SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS: u16 = 5_200;
 
 /// The same floor for the F2LLM encoder over a Qwen3-0.6B decoder.
 ///
-/// **Provisional.** It comes from the torch/Python benchmark that validated the F2LLM contract
-/// before any of it existed in this workspace: over that run, keeping 95% of the true positives
-/// needs a floor no higher than 3540, and the highest-scoring noise query reaches 2066. 3000 sits
-/// between the two with roughly a third of the gap on either side. It is not the T5a procedure that
-/// produced [`SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`] -- different fixtures, a different stack, and
-/// no cross-lingual positive read off the same run -- so it stands only until that procedure is
-/// repeated on this family against the `ort` stack this workspace actually ships.
+/// The value this constant held first came from a torch/Python benchmark run before any of this
+/// existed in the workspace, and it said so, because ADR-0004 has twice recorded what happens when
+/// a retrieval constant is calibrated somewhere other than where it runs. This is the T5a procedure
+/// repeated on the stack that ships: measured 2026-09-07 on Apple Silicon / macOS 24.6.0, ONNX
+/// Runtime 1.28.1, the `codefuse-ai/F2LLM-v2-0.6B` Hub export, release profile, over all three
+/// association fixtures at once -- 27 Contexts encoded as corpus, 85 probe queries encoded through
+/// the query path with the model's instruction prefix, by
+/// `crates/search/tests/embedding_qwen3_floor_calibration.rs`.
+///
+/// That run separates into three regions, and the middle one is why this number is not 2400:
+///
+/// | region | range |
+/// |---|---|
+/// | 8 noise queries | 303 -- **2070** |
+/// | 2 outlying positives (`probe-v1` zh-07, en-04) | 2403, 2447 |
+/// | the other 75 positives | **3217** -- 8588 |
+///
+/// 2800 sits in the widest empty band the distribution has: 730 basis points above every noise
+/// query and 417 below the lowest positive of the main mass. Noise rejection is the constraint that
+/// does not bend -- a semantic hit is its own injection eligibility path, so one noise query above
+/// the floor is enough to put a Context in front of an Agent who asked about something else -- and
+/// the remaining room is spent on the positives that are still to come rather than on the two this
+/// fixture happens to hold.
+///
+/// Those two are given up deliberately. Reaching them costs a floor of 2400, three basis points
+/// under zh-07, which is an overfit to one fixture row rather than a threshold; and zh-07 would not
+/// even be answered by admitting it, because a distractor outscores its expected Context (2445
+/// against 2403). Their category survives regardless: `chinese_natural_language` keeps 24 of 25 and
+/// `english_natural_language` 6 of 7. Both are also two-word keyword queries -- `功能等价` and
+/// `functional equivalence` -- which is the shape with the least for an encoder to work with and the
+/// most for a lexical index, and `association_probe_workflow` measures both as lexical hits through
+/// both entry points today. Giving them up costs this suite nothing.
+/// Fusion over the extended fixture measures the same 32/39 at 2800 as at any floor down to 2200,
+/// so the band is a choice about safety margin and nothing else
+/// (`crates/cli/tests/association_probe_ext_semantic_f2llm.rs`).
 ///
 /// A second constant rather than a second opinion about the first: cosine floors are not portable
 /// between embedding spaces. bge-m3's CLS vectors and a decoder's last-token vectors spread their
-/// similarities over different ranges, and carrying 5200 across would reject nearly everything this
-/// family retrieves, exactly as carrying 3000 back would admit noise bge-m3 was calibrated to
-/// refuse. Which one applies is a property of the loaded model, so the loaded provider is what
-/// reports it -- see [`EmbeddingProvider::similarity_floor_basis_points`].
-pub const QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS: u16 = 3_000;
+/// similarities over different ranges -- this family's noise ceiling, 2070, is below bge-m3's floor
+/// by more than three thousand basis points -- and carrying 5200 across would reject nearly
+/// everything this family retrieves, exactly as carrying 2800 back would admit noise bge-m3 was
+/// calibrated to refuse. Which one applies is a property of the loaded model, so the loaded provider
+/// is what reports it -- see [`EmbeddingProvider::similarity_floor_basis_points`].
+pub const QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS: u16 = 2_800;
 
 /// Most revisions one query may contribute through the semantic channel.
 ///
@@ -96,8 +125,9 @@ pub const SEMANTIC_CHANNEL_LIMIT: usize = 16;
 /// retrievals reported `embedding_unavailable`: the channel was not slow on that machine, it was
 /// calibrated against a query length no real session produces.
 ///
-/// Measured 2026-09-03, Apple Silicon / macOS 24.6.0, ONNX Runtime 1.28.1, bge-m3 ONNX export,
-/// release profile, warm (`crates/search/tests/embedding_encode_latency.rs`, 24 samples each):
+/// **bge-m3.** Measured 2026-09-03, Apple Silicon / macOS 24.6.0, ONNX Runtime 1.28.1, bge-m3 ONNX
+/// export, release profile, warm (`crates/search/tests/embedding_encode_latency.rs`, 24 samples
+/// each):
 ///
 /// | chars | p50 | p95 | max |
 /// |------:|----:|----:|----:|
@@ -113,6 +143,39 @@ pub const SEMANTIC_CHANNEL_LIMIT: usize = 16;
 /// The debug profile runs about 20% slower and tops out at 995 ms p95 for the longest query.
 /// [`SEMANTIC_MAX_TOKENS`] caps the sequence, so 1400 characters is already at the truncation
 /// ceiling and 816 ms is the worst warm encode this machine can be asked for.
+///
+/// **F2LLM-v2-0.6B**, the export `sctx embedding install` now defaults to. Measured 2026-09-07 on
+/// the same machine, runtime and profile, same 24 samples per length, by the same file. The middle
+/// column is what the ladder's characters cost in *tokens* for this tokenizer, because that is what
+/// the cap counts:
+///
+/// | chars | tokens | p50 | p95 | max |
+/// |------:|-------:|----:|----:|----:|
+/// |    20 |     30 |  58 |  63 |  63 |
+/// |    40 |     40 |  71 |  76 |  77 |
+/// |   100 |     65 | 111 | 113 | 113 |
+/// |   200 |    104 | 169 | 169 | 171 |
+/// |   283 |    132 | 215 | 236 | 246 |
+/// |   400 |    178 | 295 | 344 | 350 |
+/// |   700 |    290 | 493 | 536 | 546 |
+/// |  1400 |    512 | 941 | 986 |1000 |
+///
+/// 1400 characters of this text is exactly [`SEMANTIC_MAX_TOKENS`], so that row is the ceiling for
+/// this family too; a separately measured 6000-character query, truncated to the same 512 tokens,
+/// returns in 959 ms p95, which is the same number reached from the other side.
+///
+/// The two families cost the same at the length that matters and diverge at the tail: 236 ms
+/// against 235 ms for a real 283-character Intent, 986 ms against 816 ms at the cap. Model load is
+/// 2.1--2.5 s (runtime initialisation and session, warm page cache) and the process holds about
+/// 1.83 GB resident with the weights in.
+///
+/// One thing the 2026-09-04 derivation of this constant does not survive on the new table, and it
+/// is recorded here rather than quietly fixed: 2000 ms is 2.0x the F2LLM ceiling, where the load
+/// factor that session 01a06b3e measured was 3--5x. It was already only 2.45x the bge-m3 ceiling,
+/// so the shortfall is not a property of the new default -- what the new default does is make it
+/// slightly worse at the longest query the constant can be asked for, while leaving the real-Intent
+/// case (283 characters, 8x headroom) exactly where it was. Raising the budget is an ADR-0004
+/// decision, not a doc-comment one.
 ///
 /// Every row above is a quiet machine, and that is the table's limit. Codex session 01a06b3e --
 /// 6.7 hours of real work, the machine also running builds and the Agent itself -- encoded at

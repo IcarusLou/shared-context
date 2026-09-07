@@ -19,6 +19,8 @@ use std::{
     process::{Command, Stdio},
 };
 
+pub mod semantic;
+
 use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
 use sctx_git_store::GitStore;
 use serde_json::{Value, json};

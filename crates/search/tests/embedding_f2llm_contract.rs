@@ -24,32 +24,26 @@
 //!   cargo test -p sctx-search --test embedding_f2llm_contract -- --ignored --nocapture
 //! ```
 //!
-//! The snapshot is used as it comes off the Hub, `onnx/` subdirectory and all, and this suite builds
-//! the flat directory the provider expects out of symlinks. That is not a convenience: copying the
-//! external-weights blob to reshape a directory would cost 2.4 GB of disk to say nothing extra, and
-//! a symlinked `model.onnx_data` beside a symlinked `model.onnx` is resolved by ONNX Runtime exactly
-//! as the real installation layout is. The session is loaded once for the whole file and shared,
-//! because three tests holding three sessions would mean three copies of the weights resident at
-//! once for no additional coverage.
+//! `f2llm_snapshot` reshapes that snapshot into the flat directory the provider loads from and holds
+//! the one session this binary uses.
 
 #![cfg(all(feature = "embedding-onnx", unix))]
 
-use std::{
-    path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
-};
+mod f2llm_snapshot;
 
+use std::sync::Arc;
+
+use f2llm_snapshot::provider;
 use sctx_domain::RevisionId;
 use sctx_search::{
     EmbeddingProvider, EmbeddingSemanticChannel, QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS,
     QueryVectorCache, SEMANTIC_QUERY_CACHE_CAPACITY, SemanticCacheKey, SemanticChannel,
     embedding::{
         SEMANTIC_MAX_TOKENS,
-        onnx::{ModelFamily, OnnxEmbeddingProvider, TextRole, initialize_runtime},
+        onnx::{ModelFamily, OnnxEmbeddingProvider, TextRole},
     },
 };
 use serde_json::Value;
-use tempfile::TempDir;
 
 const GOLDEN: &str = include_str!("fixtures/f2llm_golden.json");
 
@@ -69,80 +63,6 @@ const HIDDEN_SIZE: usize = 1024;
 
 /// `<|im_end|>`, which last-token pooling reads and truncation must therefore preserve.
 const EOS_TOKEN: i64 = 151_645;
-
-/// The loaded session and the directory whose symlinks it holds open.
-struct Loaded {
-    provider: Arc<OnnxEmbeddingProvider>,
-    /// Dropped when the process exits, never before: ONNX Runtime keeps `model.onnx_data` open for
-    /// the life of the session, and that path runs through these symlinks.
-    _flat: TempDir,
-}
-
-static LOADED: OnceLock<Loaded> = OnceLock::new();
-
-fn probe_paths() -> Option<(PathBuf, PathBuf)> {
-    let model = std::env::var_os("SCTX_PROBE_F2LLM_MODEL")?;
-    let runtime = std::env::var_os("SCTX_PROBE_EMBEDDING_RUNTIME")?;
-    Some((PathBuf::from(model), PathBuf::from(runtime)))
-}
-
-/// Builds the flat model directory the provider loads from, out of a Hugging Face snapshot.
-///
-/// `model.onnx_data` is optional because an export small enough to fit one file has none. The other
-/// three are the provider's entire contract with a model directory, and their absence means the
-/// environment variable names something that is not an F2LLM snapshot.
-fn flatten_snapshot(snapshot: &Path, into: &Path) {
-    std::fs::create_dir_all(into).expect("create the flattened model directory");
-    for (name, required) in [
-        ("model.onnx", true),
-        ("model.onnx_data", false),
-        ("tokenizer.json", true),
-        ("config.json", true),
-    ] {
-        let source = [snapshot.join("onnx").join(name), snapshot.join(name)]
-            .into_iter()
-            .find(|candidate| candidate.exists());
-        match source {
-            Some(source) => {
-                // Resolved through the Hub's own blob symlinks first, so the link this test writes
-                // points at a file rather than at another link into a cache that may be pruned.
-                let source = std::fs::canonicalize(&source).expect("resolve the snapshot file");
-                std::os::unix::fs::symlink(source, into.join(name))
-                    .expect("link the snapshot file into the flat directory");
-            }
-            None => assert!(
-                !required,
-                "{} holds no {name}; SCTX_PROBE_F2LLM_MODEL must name an F2LLM snapshot",
-                snapshot.display()
-            ),
-        }
-    }
-}
-
-fn provider() -> &'static Arc<OnnxEmbeddingProvider> {
-    &LOADED
-        .get_or_init(|| {
-            let Some((model, runtime)) = probe_paths() else {
-                panic!(
-                    "set SCTX_PROBE_F2LLM_MODEL and SCTX_PROBE_EMBEDDING_RUNTIME; see the module \
-                     docs"
-                );
-            };
-            initialize_runtime(&runtime)
-                .expect("load ONNX Runtime from SCTX_PROBE_EMBEDDING_RUNTIME");
-            let flat = tempfile::tempdir().expect("a temporary directory for the flattened model");
-            let directory = flat.path().join("model");
-            flatten_snapshot(&model, &directory);
-            Loaded {
-                provider: Arc::new(
-                    OnnxEmbeddingProvider::load_and_probe(&directory)
-                        .expect("load the F2LLM export"),
-                ),
-                _flat: flat,
-            }
-        })
-        .provider
-}
 
 fn golden_cases() -> Vec<Value> {
     let golden: Value = serde_json::from_str(GOLDEN).expect("the golden fixture is valid JSON");
