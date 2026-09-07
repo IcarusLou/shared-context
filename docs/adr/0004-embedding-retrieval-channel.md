@@ -107,3 +107,46 @@ R1–R5 之后，词法召回已到达天花板。R3 的实测结论：剩余探
 ### 教训
 
 两次修订同一个参数，原因是同一类：**验收环境不是运行环境**。第一次是查询长度（探针 15–40 字符 vs 真实 283 字符），第二次是机器负载（安静 vs 6.7 小时高负载会话）。标定一个时间预算时，「在什么条件下测的」和「测出多少」同等重要——只记后者的表，下一次还会被同样绕过。
+
+## 2026-09-07 修订：默认模型换代 F2LLM-v2-0.6B
+
+原决策文字不变，本节补录默认模型的换代决定、其证据与两条新教训。决策 2 下的 2026-09-06 过渡补充所称「尚未实测」的数字已由本节补齐。
+
+### 事实
+
+原决策 2 的「bge-m3 级别的多语模型」写于 2024 代 encoder 是唯一选择时。2026-09-06 应用户要求做了同生态位七模型基准（本地 CPU、中英多语、可 ONNX、许可可商用；数据 = 三套探针 77 正例 + 8 噪声、21 条本机真实 accepted 混入作干扰语料、22 条真实 Intent 测延迟；语料/查询文本构造与线上口径逐字段一致）。关键结果（top-1 正例数，fixture 内 / 混入真实干扰后）：
+
+| 模型 | top-1/77 | 混入干扰 | cross_lingual | 拒全噪声弃正例 |
+|---|---:|---:|---:|---:|
+| bge-m3（时任默认） | 65 | 62 | 3/5 | 2 |
+| snowflake-arctic-embed-l-v2.0 | 73 | 69 | 4/5 | 4 |
+| **F2LLM-v2-0.6B** | 72 | **71** | **5/5** | **0** |
+| Qwen3-Embedding-0.6B / jina-v5-text-small | 70 / 70 | 67 / 70 | 5/5 / 5/5 | 0 / 0 |
+
+F2LLM（codefuse-ai，Qwen3-0.6B 底座，Apache 2.0，官方 fp32 ONNX 随仓发布）在最接近线上形态的口径（真实语料干扰）下全场第一，cross_lingual 5/5 正中本 ADR 立项动机。用户 2026-09-06 裁定其为默认模型。
+
+基准过程中两个被推翻再校正的数字，入档为教训：
+
+1. torch 栈测得 F2LLM p50 1459ms，一度得出「decoder 必然击穿预算」的错误结论。根因是 dtype 混杂变量：sentence-transformers 6.x 默认沿用 checkpoint 自带精度，三个 Qwen3 底座模型的 checkpoint 是 BF16，而 Apple Silicon 的 torch CPU 没有 bf16 快速 kernel（强制 fp32 后 580→177ms）；ort fp32 真栈实测 245/342ms。这是本 ADR「验收环境不是运行环境」教训的第三种形态——前两次是查询长度与机器负载，这次是**跨推理栈外推**。
+2. GPU（CoreML EP）路线实测否决：MLProgram 格式对动态 shape 子图编译失败（MIL -7），NeuralNetwork 格式算子回退反比纯 CPU 慢 3×；torch MPS 61ms 证明收益空间在软件路径而非硬件，但 CPU EP 已在预算内，GPU 不必要。WebGPU EP 已编入现分发 dylib，未验证，留作未来选项。
+
+### 决策
+
+1. **默认模型：F2LLM-v2-0.6B 官方 fp32 ONNX**（4 文件含 config.json，摘要钉死，~2.4GB）。「不随包分发」「摘要是文件的属性」「未配置零成本」全部不变；`sctx embedding install --model bge-m3` 保留，既有安装不受影响。
+2. **编码器双家族，家族声明而非嗅探**：模型目录 config.json 的 model_type 判定——`qwen3` → last-token pooling + `position_ids` + 查询侧 instruct 前缀；文件缺失 → bge-m3 行为（向后兼容）；不认识 → 拒载（坏安装必须在 doctor 能看到的地方失败，不能作为「自信地错排每条查询」的通道活着）。前缀封装在 provider 内，查询向量缓存 key 仍是原文本。正确性由与 sentence-transformers 交叉验证（cosine 0.998）的逐 token 黄金固件锁定（`crates/search/tests/fixtures/f2llm_golden.json`；EOS 151645 必须在截断后仍居末位，last-token pooling 读的就是它）。
+3. **相似度下限按家族**（cosine floor 不跨嵌入空间迁移）：bge-m3 保持 5200；Qwen3 家族定为 **2800**（2026-09-07，ort 1.28.1、三套探针 85 查询、T5a 规则：噪声上界 2070、正例主体下界 3217，2800 落在最宽空带——高于噪声 730bp、低于正例主体 417bp；弃 probe-v1 zh-07/en-04 两条离群正例，理由与当年弃 multi_hop 5160 同构：救它们要贴边 3bp 取 2400，且 zh-07 即使放进来也被干扰项反超，两条均为词法双入口已命中的双词关键词查询）。标定工具进版本库：`crates/search/tests/embedding_qwen3_floor_calibration.rs`。
+4. **编码预算 2000ms 维持不变，并补录一笔诚实算术**：F2LLM 512-token 截断上限 p95 为 986ms，×3–5 高负载系数 = 3.0–4.9s，超出 2000ms——但这不是新缺口：bge-m3 上限 816ms ×3 = 2448ms 时该推导已不成立，2026-09-04 的「上限×负载系数落在预算内」从未在算术上闭合。真实 Intent 长度（实测最长 422 字符）下两家族同价（283 字符 p95 236 vs 235ms，约 8× 余量）；上限长度查询在极端负载下的超时走既有优雅降级（该查询词法不受影响 + 迟到向量写缓存、下次命中）。维持 2000ms 是对 09-04 用户裁定的延续；若要求上限长度在最坏负载下也不降级，算术值为 5000ms，作为已知选项记录于此而非采纳。
+5. 向量缓存按模型指纹自动换代（semantic.sqlite 键），SEARCH_RANKING_VERSION 不 bump（词法排序未变）。
+
+### 验收（全部实测通过）
+
+- F2LLM 融合棘轮（ext）：**32/39**（词法 27、bge-m3 融合 31），cross_lingual 2≥2、paraphrase 8≥8、identifier 5≥词法 4、multi_hop 3>2、噪声零泄漏——原验收条款「paraphrase 与 cross_lingual 净提升、identifier 与 noise 不回退」对新默认成立。
+- bge-m3 gated 语义验收零漂移（31/39，floor 5200 经 trait 默认路径），三套词法探针零回退，关闭态与基线逐字节一致。
+- E2E 安装工作流真模型 2/2（322s：file:// 下载、逐文件摘要校验、平铺、qwen3 家族加载自检、写 [retrieval]、remove 清理）。
+- 成本口径（实测）：磁盘 ~2.4GB、RSS ~1.83GB（编码后 1.95GB）、加载 2.1–2.5s（快于 bge-m3 的 9–12s）、真实 Intent 编码 p95 236ms。
+
+### 备选与否决（增补）
+
+- **arctic-embed-l-v2.0**：73/77 与近零集成成本（同 XLM-R+CLS）曾是延迟约束下的推荐；torch 延迟误判被 ort 实测纠正后约束消失，按混入干扰口径（69<71）与 cross_lingual（4/5<5/5）让位。
+- **Qwen3-Embedding-0.6B**：略逊于同底座的 F2LLM 且无官方 ONNX（仅社区导出，与摘要钉死分发的一方工件要求不符）。
+- **jina-embeddings-v5-text-small**：混入干扰后零掉位（鲁棒性全场唯一），但 CC-BY-NC 许可 + 任务 LoRA 需自行合并导出，双重否决。
