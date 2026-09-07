@@ -266,30 +266,40 @@ sctx knowledge delete --confirm-path <知识仓库的绝对路径> \
 sctx embedding install
 ```
 
-它会依次做完过去要手工做的六步：下载 bge-m3 的 ONNX 导出（`model.onnx`、`model.onnx_data`、`tokenizer.json`）和 ONNX Runtime 1.28.1 的动态库，逐个文件按内置 SHA-256 校验，解包取出 `libonnxruntime.dylib`，**真的加载模型编码一句话**证明它能跑，然后才写 `config.toml` 的 `[retrieval]`，最后把已接受 Context 的向量回填进 `state/semantic.sqlite` 并打印条数。
+它会依次做完过去要手工做的六步：下载模型的 ONNX 导出和 ONNX Runtime 1.28.1 的动态库，逐个文件按内置 SHA-256 校验，解包取出 `libonnxruntime.dylib`，**真的加载模型编码一句话**证明它能跑，然后才写 `config.toml` 的 `[retrieval]`，最后把已接受 Context 的向量回填进 `state/semantic.sqlite` 并打印条数。
 
 安装过程逐步打印在 stderr，stdout 仍然只有一个 JSON 信封，所以 `sctx --json embedding install` 可以直接被脚本消费。
 
-**开销预期**（bge-m3，实测量级）：
-
-| 项目 | 预期 |
-|---|---|
-| 下载体积 | 约 2.3 GB（其中 `model.onnx_data` 2.1 GB） |
-| 安装后磁盘 | `~/.shared-context/embedding/` 约 2.3 GB，另加 `state/semantic.sqlite`（每条 revision 约 4 KB） |
-| 常驻内存 | 模型加载后 RSS 约 1.2 GB，只在 `sctx mcp serve` 进程里 |
-| 模型加载耗时 | 9–12 秒，每个 serve 进程一次，后台线程完成，加载期间检索照常走词法通道 |
-| 查询编码 | p95 30–85 ms，超过 200ms 预算的单次编码静默降级 |
-| `install` 总耗时 | 下载时间 + 约 15 秒（校验 + 自检 + 回填） |
-
-命令是**幂等**的：已经存在且校验通过的文件不会重新下载，中断的下载会从断点续传，所以一次失败的 2.1 GB 传输重跑就好，不用从头再来。
-
-**团队内网源**。`--model-url` 指向一个按原名提供那三个文件的目录，公司内网镜像最常见：
+**装哪个模型**。默认是 `codefuse-ai/F2LLM-v2-0.6B`（slug `f2llm-v2-0.6b`），`BAAI/bge-m3`（ADR-0004 当初随附的那个导出）仍然可装：
 
 ```bash
-sctx embedding install --model-url https://mirror.example.internal/models/bge-m3-onnx
+sctx embedding install                  # 默认 f2llm-v2-0.6b
+sctx embedding install --model bge-m3   # 装回旧的那个
 ```
 
-内置的 SHA-256 是**文件的属性、不是站点的属性**：镜像同样要过一模一样的校验，字节不对就直接失败，什么都不装、也不写配置。这正是 `--model-url` 敢存在的原因。指定 `--model-url` 后不再回退到公网（否则「指定内网源」这件事就白做了）。
+两个模型**不共享同一个向量空间**，所以换模型等于换一套向量。这件事不用你操心：`state/semantic.sqlite` 的键里带模型指纹，换了导出旧向量既读不到也会被回收，不会出现「拿 A 的向量按 B 的空间打分」。已经装着 bge-m3 的机器不需要为了继续工作重下一个模型；`sctx embedding status` 会报当前目录里究竟是哪一个。
+
+**开销预期**。下载与磁盘是内置摘要钉死的，可以精确到字节；内存、加载耗时、编码延迟这三行是 **bge-m3 在 Apple Silicon 上的实测值**，默认模型的对应数字本仓库尚未实测，权重大约多 5%，请按同量级估算而不是当作已验证结论。
+
+| 项目 | `f2llm-v2-0.6b`（默认） | `bge-m3` |
+|---|---|---|
+| 下载体积 | 约 2.4 GB（其中 `model.onnx_data` 2.38 GB） | 约 2.3 GB（其中 `model.onnx_data` 2.27 GB） |
+| 安装后磁盘 | `~/.shared-context/embedding/` 约 2.4 GB | 约 2.3 GB |
+| 常驻内存 | 尚未实测 | 模型加载后 RSS 约 1.2 GB，只在 `sctx mcp serve` 进程里 |
+| 模型加载耗时 | 尚未实测 | 9–12 秒，每个 serve 进程一次，后台线程完成，加载期间检索照常走词法通道 |
+| 查询编码 | 尚未实测 | p95 30–85 ms |
+
+两者共同的部分：另加 `state/semantic.sqlite`（每条 revision 约 4 KB）；单次编码超过 `embedding_encode_budget_ms` 预算即静默降级（见 6.11）；`install` 总耗时 = 下载时间 + 约 15 秒（校验 + 自检 + 回填）。
+
+命令是**幂等**的：已经存在且校验通过的文件不会重新下载，中断的下载会从断点续传，所以一次失败的 2.4 GB 传输重跑就好，不用从头再来。
+
+**团队内网源**。`--model-url` 指向一个**基准目录**，它下面各文件的相对路径要和上游仓库一致——默认模型的镜像因此要提供 `onnx/model.onnx`、`onnx/model.onnx_data`、`tokenizer.json` 和 `config.json`，而 bge-m3 的那三个文件是平铺的。公司内网镜像最常见：
+
+```bash
+sctx embedding install --model-url https://mirror.example.internal/models/F2LLM-v2-0.6B
+```
+
+内置的 SHA-256 是**文件的属性、不是站点的属性**：镜像同样要过一模一样的校验，字节不对就直接失败，什么都不装、也不写配置。这正是 `--model-url` 敢存在的原因。指定 `--model-url` 后不再回退到公网（否则「指定内网源」这件事就白做了）。`--model` 和 `--model-url` 可以一起给：前者决定要哪些文件、按哪组摘要校验，后者决定去哪里取。
 
 `--runtime-url` 同理指向一个 ONNX Runtime release tarball。
 
@@ -309,7 +319,7 @@ sctx embedding status --verify   # 额外真加载一次，确认能跑（9–12
 sctx embedding remove --yes      # 删配置节 + embedding/ 目录 + semantic.sqlite
 ```
 
-`status` 默认只查文件字节数不重算 SHA-256——对 2.1 GB 重算一次要十几秒，而它要抓的问题（文件被删或写了一半）字节数就能看出来；想确认「字节是对的」而不只是「文件在」，用 `--verify`。
+`status` 默认只查文件字节数不重算 SHA-256——对 2.4 GB 重算一次要十几秒，而它要抓的问题（文件被删或写了一半）字节数就能看出来；想确认「字节是对的」而不只是「文件在」，用 `--verify`。`status` 报的模型名来自模型目录里 `config.json` 的 `model_type`（没有这个文件时退回按 `model.onnx` 的字节数认），两条都对不上就报未知——手工组装的导出是受支持的，猜错模型名比不报更糟。
 
 也可以在首次安装时顺带启用：
 
@@ -915,7 +925,7 @@ validation = "30d"
 progress = "14d"
 
 [retrieval]
-embedding_model_path = "/absolute/path/to/bge-m3-onnx"
+embedding_model_path = "/absolute/path/to/onnx-export-directory"
 embedding_runtime_path = "/absolute/path/to/libonnxruntime.dylib"
 
 [maintenance]
@@ -927,7 +937,7 @@ opportunistic_after_hours = 24
 
 - `[hooks] artifact_focus_reminder`：默认 `false`（关闭）。关闭时 PostTool Hook 与该开关引入前逐字节一致。显式改成 `true` 后，仅对被识别为单个文件操作的工具事件，用本机 Catalog 把绝对路径解析到已登记 Repository（该 Repository 必须在本会话准入范围内，所以父目录会话会按文件选对仓库），再对 `engineering.sqlite` 做一次只读查询（不加锁、不跑 Git、不 scan、不 rebuild）；命中已接受且可自动注入的 Graph Context 时，追加一条不超过 800 字节的提示（最多 3 个 Context ID、每个标题截断到 60 字符，加一句固定的“可以调用 `task_artifact_focus` 查看”提示文案），不包含 statement/evidence 正文，也不写任何事实。同一 Session 对同一文件只提示一次。这个开关只影响以绝对文件路径命中的工具事件，不覆盖模块/符号/API/Schema/测试等其他定位方式。
 - `[retrieval]`：可选的 embedding 召回通道（ADR-0004）。**两个键都不写就是默认：通道完全不存在，检索与加入该通道之前逐字节一致，零磁盘、零内存、零延迟开销。** 两个键必须同时写、且都必须是绝对路径；只写一个视为配置错误（`sctx doctor` 会 Warning，通道保持关闭）。**不需要手工写这一节**：`sctx embedding install`（见 3.7）会下载、校验、自检后替你写好；下面的说明是给自备模型或非 macOS 平台的用户看的。
-  - `embedding_model_path`：模型目录，需包含 `model.onnx`（若是拆分导出还需同目录的 `model.onnx_data`）与 `tokenizer.json`。推荐 bge-m3 的 ONNX 导出（约 2.1GB 磁盘、约 1.2GB 常驻内存）。模型不随包分发；`sctx embedding install` 会下载到 `~/.shared-context/embedding/model/`，也可以自行下载后手工指向别处。
+  - `embedding_model_path`：模型目录，需包含 `model.onnx`（若是拆分导出还需同目录的 `model.onnx_data`）与 `tokenizer.json`，另建议放上该导出的 `config.json`——编码器按它的 `model_type` 判断加载的是哪一族，`sctx embedding status` / `sctx doctor` 也按它报出模型名。推荐 `codefuse-ai/F2LLM-v2-0.6B`（默认，约 2.4GB 磁盘）或 `BAAI/bge-m3`（约 2.3GB 磁盘、约 1.2GB 常驻内存）的 ONNX 导出。模型不随包分发；`sctx embedding install` 会下载到 `~/.shared-context/embedding/model/`，也可以自行下载后手工指向别处；手工组装的、本产品没有量过的导出同样是受支持的配置，只是 `status` 会把模型名报成未知而不是猜一个。
   - `embedding_runtime_path`：本机 ONNX Runtime 动态库（macOS `libonnxruntime.dylib`、Linux `libonnxruntime.so`）。构建期不下载任何二进制，运行时才按此路径加载。`sctx embedding install` 会解包到 `~/.shared-context/embedding/runtime/`。
   - `embedding_encode_budget_ms`（可选）：单次查询编码的时间预算，毫秒，接受 50–30000。不写就用内置默认值 2000ms。这个默认值是在 Apple Silicon 上按真实 Working Intent 长度实测标定的（安静态：283 字符查询 p95 235ms，512-token 截断上限处 p95 816ms），再乘上真实高负载会话实测的 3–5 倍系数——同一台机器在 6.7 小时的连续会话里，一个 394 字符的查询实测 1505ms，安静态的同档只要约 300ms。明显更慢的机器仍需要调大，判断依据见下一条的 `sctx doctor` 提示。它是上限不是常态开销：一次典型查询远在预算内返回，重复查询直接命中进程内缓存。
   - 开启后：`sctx mcp serve` 启动时由后台线程加载模型（一次性 9–12 秒）并把已接受 Context 的向量写入 `state/semantic.sqlite`（可随时删除的本地缓存，不进 Git、不进 `index.sqlite`，按模型指纹与 ranking 版本键控）。自动注入的查询会额外走一路余弦召回（阈值 0.52、最多 16 条），与词法通道一起做 RRF 融合；语义命中本身构成一条独立的注入资格路径。查询向量另有一个进程内 LRU（64 条），所以同一个 Working Intent 被反复检索时只编码一次。模型未就绪 / 加载失败 / 单次编码超过预算时，该路静默降级为 `omitted.reason = "embedding_unavailable"`，词法结果不受影响；超时的那次编码在后台跑完后仍会写进查询缓存，所以同一个 Intent 的下一次调用会直接命中。

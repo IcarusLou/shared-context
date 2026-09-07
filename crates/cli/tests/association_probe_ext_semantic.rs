@@ -9,6 +9,13 @@
 //!   cargo test --locked -p sctx-cli --test association_probe_ext_semantic -- --ignored --nocapture
 //! ```
 //!
+//! The model must be bge-m3 specifically, even though `sctx embedding install` now defaults to a
+//! different export. `SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS` was calibrated against bge-m3's
+//! score distribution on this very fixture, and the noise-ceiling assertion below is a statement
+//! about *that* distribution: pointed at another export this test would be comparing a floor to
+//! scores it was never derived from, and would prove nothing either way. Recalibrating the floor
+//! for the new default is its own errand, and it starts by rerunning this file's measurements.
+//!
 //! ## Why this runs in-process instead of through the probe binary
 //!
 //! [`association_probe_harness::run_probes`] spawns a fresh `sctx mcp serve` for every single

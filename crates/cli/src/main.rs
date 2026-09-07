@@ -377,7 +377,7 @@ fn run_install_lifecycle(command: &str, args: &[String], json_output: bool) -> R
         return Err(invalid("--demo applies only to setup"));
     }
     // `upgrade` deliberately never provisions the channel. An upgrade is expected to be quick and
-    // unattended; a 2.3 GB download is neither, and an installation that wanted the channel
+    // unattended; a 2.4 GB download is neither, and an installation that wanted the channel
     // already has it.
     if command != "setup" && options.has("--embedding") {
         return Err(invalid(
@@ -784,20 +784,25 @@ fn run_knowledge(args: &[String], json_output: bool) -> Result<()> {
 }
 
 const EMBEDDING_HELP: &str = r"Usage:
-  sctx embedding install [--model-url <BASE_URL>] [--runtime-url <URL>]
-      [--expected-sha256 <SHA256>] [--root PATH]
+  sctx embedding install [--model <NAME>] [--model-url <BASE_URL>]
+      [--runtime-url <URL>] [--expected-sha256 <SHA256>] [--root PATH]
   sctx embedding status [--verify] [--root PATH]
   sctx embedding remove --yes [--root PATH]
 
-`install` downloads a bge-m3 ONNX export and an ONNX Runtime library into
+`install` downloads an ONNX export and an ONNX Runtime library into
 `~/.shared-context/embedding/`, proves the model loads, writes `[retrieval]`,
-and fills the vector cache. It needs about 2.3 GB of disk and is safe to rerun:
+and fills the vector cache. It needs about 2.4 GB of disk and is safe to rerun:
 verified files are not downloaded twice.
 
-`--model-url` names a directory serving `model.onnx`, `model.onnx_data` and
-`tokenizer.json` under those names -- an internal mirror, for example. The
-built-in SHA-256 digests still apply, so a mirror serving different bytes is
-rejected.
+`--model` selects the export: `f2llm-v2-0.6b` (codefuse-ai/F2LLM-v2-0.6B, the
+default) or `bge-m3` (BAAI/bge-m3). An installation already holding one keeps
+working; `sctx embedding status` reports which one is there.
+
+`--model-url` names a base directory serving the model's files at the same
+relative paths the upstream repository uses -- so a mirror of the default model
+serves `onnx/model.onnx`, `onnx/model.onnx_data`, `tokenizer.json` and
+`config.json`. The built-in SHA-256 digests still apply, so a mirror serving
+different bytes is rejected.
 ";
 
 /// Provisions, inspects, or removes the optional embedding recall channel (ADR-0004).
@@ -824,6 +829,7 @@ fn run_embedding(args: &[String], json_output: bool) -> Result<()> {
                     "--root",
                     "--runtime-source",
                     "--runtime-version",
+                    "--model",
                     "--model-url",
                     "--runtime-url",
                     "--expected-sha256",
@@ -888,6 +894,11 @@ fn embedding_install_options(
     options: &Options,
 ) -> Result<sctx_installer::embedding::InstallOptions> {
     Ok(sctx_installer::embedding::InstallOptions {
+        model: options
+            .optional("--model")?
+            .map(sctx_installer::embedding::EmbeddingModel::parse)
+            .transpose()?
+            .unwrap_or_default(),
         model_url: options.optional("--model-url")?.map(str::to_owned),
         runtime_url: options.optional("--runtime-url")?.map(str::to_owned),
         expected_runtime_sha256: options.optional("--expected-sha256")?.map(str::to_owned),
@@ -903,7 +914,7 @@ fn embedding_install_options(
 /// notice on the report and an operator who can rerun `sctx embedding install` whenever they like.
 ///
 /// It runs *after* `installer.setup()` returns rather than inside it, because setup holds the
-/// exclusive maintenance lock for its whole duration and a 2.3 GB download does not belong inside
+/// exclusive maintenance lock for its whole duration and a 2.4 GB download does not belong inside
 /// a lock that blocks every other `sctx` process on the machine.
 fn append_setup_embedding(report: &mut sctx_installer::SetupReport, json_output: bool) {
     let mut progress = embedding_progress(json_output);
@@ -913,7 +924,8 @@ fn append_setup_embedding(report: &mut sctx_installer::SetupReport, json_output:
         &mut progress,
     ) {
         Ok(embedding) => report.notices.push(format!(
-            "Embedding recall channel enabled: model {}, runtime {}, {} Context revision(s) embedded.",
+            "Embedding recall channel enabled: {} at {}, runtime {}, {} Context revision(s) embedded.",
+            embedding.model,
             embedding.model_path.display(),
             embedding.runtime_path.display(),
             embedding.embedded

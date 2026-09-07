@@ -4,13 +4,24 @@
 //! files the operator fetched themselves. That decision stands -- nothing here is bundled, nothing
 //! is downloaded at build time, and an installation that never runs `sctx embedding install` is
 //! byte-identical to one that never heard of this module. What it removes is the six-step manual
-//! errand the decision implied: fetch 2.1 GB of weights from one host, an ONNX Runtime tarball from
+//! errand the decision implied: fetch 2.4 GB of weights from one host, an ONNX Runtime tarball from
 //! another, unpack the right dynamic library out of it, hand-edit `config.toml`, and then discover
 //! at `serve` time whether any of it actually loads.
 //!
+//! ## Why two models, and why the newer one leads
+//!
+//! [`EmbeddingModel::F2llmV2`] is the default and [`EmbeddingModel::BgeM3`] stays installable. The
+//! two are not interchangeable at runtime -- they produce different vector spaces, so a cache
+//! keyed on one is meaningless to the other -- but that is already handled: the semantic cache is
+//! keyed by a fingerprint of the model directory, so swapping exports invalidates it rather than
+//! corrupting it. Keeping bge-m3 reachable therefore costs one enum variant and buys two things:
+//! an installation that already holds 2.3 GB of bge-m3 is not asked to re-download a different
+//! model to keep working, and an operator who measures the new default as worse for their corpus
+//! has a way back that is not "edit `config.toml` by hand".
+//!
 //! ## Why `curl` instead of an HTTP client
 //!
-//! A 2.2 GB transfer wants conditional resume, redirect following, and retry -- which is either a
+//! A 2.4 GB transfer wants conditional resume, redirect following, and retry -- which is either a
 //! new HTTP stack (and, in practice, a TLS stack and an async runtime) in the dependency graph of
 //! a tool whose entire value proposition is that it stays out of the way, or a `curl` that every
 //! supported platform already ships. The download is a rare, operator-initiated, foreground errand,
@@ -24,8 +35,9 @@
 //! exactly the situation where "the bytes came from somewhere else" must not mean "the bytes are
 //! different". So the digests below are properties of the *files*, not of the host: a mirror is
 //! checked against the same constants as the default source, and a mismatch is a hard failure that
-//! leaves nothing behind. They were measured on the artifacts this repository's own T5b acceptance
-//! run used; see [`MODEL_FILES`] and [`RUNTIME_ARM64`].
+//! leaves nothing behind. The bge-m3 and runtime digests were measured on the artifacts this
+//! repository's own T5b acceptance run used; the F2LLM ones against the published upstream
+//! repository. See [`F2LLM_V2_MODEL_FILES`], [`BGE_M3_MODEL_FILES`] and [`RUNTIME_ARM64`].
 //!
 //! ## Why the config write comes last
 //!
@@ -56,15 +68,23 @@ use sha2::{Digest, Sha256};
 
 use super::{ensure_private_directory, io_error};
 
-/// Default mirror for the bge-m3 ONNX export.
+/// Default mirror for the F2LLM-v2-0.6B ONNX export.
 ///
 /// The mirror leads because the operators this command exists for are the ones for whom the
-/// canonical host is slow or unreachable; [`HUGGINGFACE_MODEL_BASE`] is tried next, and both are
+/// canonical host is slow or unreachable; [`F2LLM_V2_HUGGINGFACE_BASE`] is tried next, and both are
 /// checked against the same digests.
-pub const MIRROR_MODEL_BASE: &str = "https://hf-mirror.com/BAAI/bge-m3/resolve/main/onnx";
+pub const F2LLM_V2_MIRROR_BASE: &str =
+    "https://hf-mirror.com/codefuse-ai/F2LLM-v2-0.6B/resolve/main";
+
+/// Canonical upstream for the F2LLM-v2-0.6B ONNX export, used when the mirror does not answer.
+pub const F2LLM_V2_HUGGINGFACE_BASE: &str =
+    "https://huggingface.co/codefuse-ai/F2LLM-v2-0.6B/resolve/main";
+
+/// Default mirror for the bge-m3 ONNX export.
+pub const BGE_M3_MIRROR_BASE: &str = "https://hf-mirror.com/BAAI/bge-m3/resolve/main/onnx";
 
 /// Canonical upstream for the bge-m3 ONNX export, used when the mirror does not answer.
-pub const HUGGINGFACE_MODEL_BASE: &str = "https://huggingface.co/BAAI/bge-m3/resolve/main/onnx";
+pub const BGE_M3_HUGGINGFACE_BASE: &str = "https://huggingface.co/BAAI/bge-m3/resolve/main/onnx";
 
 /// The ONNX Runtime release this command provisions.
 pub const RUNTIME_VERSION: &str = "1.28.1";
@@ -78,7 +98,7 @@ const SELF_CHECK_TEXT: &str = "shared context embedding channel self check";
 
 /// Wall-clock budget for one `model.onnx_data` transfer.
 ///
-/// 2.2 GB at a pessimistic 1.2 MB/s is roughly half an hour, which is the point of the generous
+/// 2.4 GB at a pessimistic 1.2 MB/s is roughly half an hour, which is the point of the generous
 /// budget: this bound exists to stop a wedged connection from hanging forever, not to enforce a
 /// throughput expectation. Resume makes a timeout cheap -- the next run continues where this one
 /// stopped.
@@ -103,17 +123,67 @@ const MAX_CHILD_STDERR_LINES: usize = 12;
 /// How much is read at a time when digesting a multi-gigabyte file.
 const HASH_CHUNK_BYTES: usize = 1024 * 1024;
 
+/// What `status` checks for in a model directory whose family it could not identify.
+///
+/// `model.onnx_data` is deliberately absent: it exists only in a split export, and a directory
+/// this binary has not measured may legitimately be a single-file one. Reporting a file missing
+/// that was never supposed to be there would make a working hand-assembled installation read as
+/// broken.
+const CORE_MODEL_FILES: [&str; 2] = ["model.onnx", "tokenizer.json"];
+
 /// One file this command fetches, with the integrity it must have afterwards.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct RemoteFile {
-    /// Name at the source and on disk. The two are always equal, which is what makes
-    /// `--model-url` a base directory rather than a per-file mapping.
+    /// Name under the installed model directory.
     pub name: &'static str,
+    /// Path relative to the base URL, which is not always [`RemoteFile::name`]: the F2LLM
+    /// repository keeps its ONNX export in an `onnx/` subdirectory while the tokenizer and the
+    /// config sit at the root, and both end up flat in one model directory on disk. Keeping the
+    /// remote layout separate from the installed layout is what lets `--model-url` stay a *base
+    /// directory* -- a mirror serves the same relative paths under a different host -- instead of
+    /// degenerating into a per-file URL mapping.
+    pub remote_path: &'static str,
     /// Lowercase hex SHA-256 of the complete file.
     pub sha256: &'static str,
     /// Exact byte length, checked before the digest so a truncated transfer fails in constant time.
     pub bytes: u64,
 }
+
+/// The F2LLM-v2-0.6B ONNX export, measured against the published `codefuse-ai/F2LLM-v2-0.6B`
+/// repository.
+///
+/// Four files rather than bge-m3's three, and the fourth is not optional: `config.json` is how the
+/// encoder tells which family it loaded, so a directory without one is a directory the encoder has
+/// to guess about. The rest are the usual split-export trio -- `model.onnx` is the graph,
+/// `model.onnx_data` its external weights, `tokenizer.json` the vocabulary. The remaining upstream
+/// files (`model.safetensors`, `tokenizer_config.json`, `special_tokens_map.json`, `vocab.json`,
+/// `merges.txt`) are not read by the provider and are deliberately not fetched.
+pub const F2LLM_V2_MODEL_FILES: [RemoteFile; 4] = [
+    RemoteFile {
+        name: "model.onnx",
+        remote_path: "onnx/model.onnx",
+        sha256: "740b4598462f55af2e526047bb9328b8aae81d4a0350b4821f54179a2f22b512",
+        bytes: 1_265_183,
+    },
+    RemoteFile {
+        name: "model.onnx_data",
+        remote_path: "onnx/model.onnx_data",
+        sha256: "be7f3e3f635f1ae76d4c8e5370f4b7824589f121e76847c25294045b7683a2d1",
+        bytes: 2_384_199_936,
+    },
+    RemoteFile {
+        name: "tokenizer.json",
+        remote_path: "tokenizer.json",
+        sha256: "7e295e5bb91a3d35335f92fa4294a6e4e0ab4aa586db853e14312a62135bfddc",
+        bytes: 8_399_930,
+    },
+    RemoteFile {
+        name: "config.json",
+        remote_path: "config.json",
+        sha256: "0deb25e01f7c173de401cdd6f16d281b05b964afef8aae21a242a3f6d64f3109",
+        bytes: 1_384,
+    },
+];
 
 /// The bge-m3 ONNX export, as measured on the artifacts used for the ADR-0004 acceptance run.
 ///
@@ -121,30 +191,167 @@ pub struct RemoteFile {
 /// `model.onnx_data` its external weights (the export is split, so the graph alone cannot load),
 /// and `tokenizer.json` the vocabulary. The remaining files in the upstream directory --
 /// `config.json`, `tokenizer_config.json`, `special_tokens_map.json` -- are not read by the
-/// provider and are deliberately not fetched.
-pub const MODEL_FILES: [RemoteFile; 3] = [
+/// provider and are deliberately not fetched. That last part is why this set is still three files
+/// after [`F2LLM_V2_MODEL_FILES`] grew a fourth: the digests are a record of what was installed,
+/// and adding a file to this list would strand every existing bge-m3 installation as incomplete.
+pub const BGE_M3_MODEL_FILES: [RemoteFile; 3] = [
     RemoteFile {
         name: "model.onnx",
+        remote_path: "model.onnx",
         sha256: "f84251230831afb359ab26d9fd37d5936d4d9bb5d1d5410e66442f630f24435b",
         bytes: 724_923,
     },
     RemoteFile {
         name: "model.onnx_data",
+        remote_path: "model.onnx_data",
         sha256: "1eebfb28493f67bba03ce0ef64bfdc7fc5a3bd9d7493f818bb1d78cd798416b4",
         bytes: 2_266_820_608,
     },
     RemoteFile {
         name: "tokenizer.json",
+        remote_path: "tokenizer.json",
         sha256: "6710678b12670bc442b99edc952c4d996ae309a7020c1fa0096dd245c2faf790",
         bytes: 17_082_821,
     },
 ];
+
+/// An export `sctx embedding install` knows how to fetch and verify.
+///
+/// The default is deliberately the *newest measured* export rather than the one longest in use:
+/// this enum exists so that decision is a one-word flag and a compile-time constant, not a fork in
+/// the download code.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EmbeddingModel {
+    /// `codefuse-ai/F2LLM-v2-0.6B`, the default.
+    #[default]
+    F2llmV2,
+    /// `BAAI/bge-m3`, the export ADR-0004 shipped with.
+    BgeM3,
+}
+
+impl EmbeddingModel {
+    /// Every model `--model` accepts, in the order help text lists them.
+    pub const ALL: [Self; 2] = [Self::F2llmV2, Self::BgeM3];
+
+    /// The `--model` value, and the name reports and doctor use.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::F2llmV2 => "f2llm-v2-0.6b",
+            Self::BgeM3 => "bge-m3",
+        }
+    }
+
+    /// The upstream repository, for error messages that have to tell an operator where to look.
+    #[must_use]
+    pub const fn repository(self) -> &'static str {
+        match self {
+            Self::F2llmV2 => "codefuse-ai/F2LLM-v2-0.6B",
+            Self::BgeM3 => "BAAI/bge-m3",
+        }
+    }
+
+    /// The files this export installs, with their pinned digests.
+    #[must_use]
+    pub const fn files(self) -> &'static [RemoteFile] {
+        match self {
+            Self::F2llmV2 => &F2LLM_V2_MODEL_FILES,
+            Self::BgeM3 => &BGE_M3_MODEL_FILES,
+        }
+    }
+
+    /// The default sources, mirror first.
+    #[must_use]
+    pub const fn default_bases(self) -> [&'static str; 2] {
+        match self {
+            Self::F2llmV2 => [F2LLM_V2_MIRROR_BASE, F2LLM_V2_HUGGINGFACE_BASE],
+            Self::BgeM3 => [BGE_M3_MIRROR_BASE, BGE_M3_HUGGINGFACE_BASE],
+        }
+    }
+
+    /// The `model_type` this family writes into `config.json`, used to recognize an installed
+    /// directory. See [`installed_model`].
+    #[must_use]
+    pub const fn config_model_type(self) -> &'static str {
+        match self {
+            Self::F2llmV2 => "qwen3",
+            Self::BgeM3 => "xlm-roberta",
+        }
+    }
+
+    /// Parses a `--model` value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::InvalidInput`] for anything else, naming every accepted value: the
+    /// alternative is an operator who typed `f2llm` discovering the correct spelling by
+    /// downloading the wrong two gigabytes.
+    pub fn parse(value: &str) -> Result<Self> {
+        let normalized = value.trim().to_ascii_lowercase();
+        Self::ALL
+            .into_iter()
+            .find(|model| model.slug() == normalized)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "--model must be one of {}, got {value:?}",
+                        Self::ALL.map(EmbeddingModel::slug).join(" or ")
+                    ),
+                )
+            })
+    }
+}
+
+/// Identifies which export an installed model directory holds.
+///
+/// Two signals, in the order of how much they prove. `config.json` is the one the encoder itself
+/// uses to pick a family, so it decides when it is there. When it is not -- which is every bge-m3
+/// installation, because that file set never fetched one -- the graph's byte size stands in: the
+/// two pinned exports differ by half a megabyte, so an unambiguous match identifies the directory
+/// without hashing 2.4 GB to answer a question `status` asks on every invocation.
+///
+/// `None` means "assembled by hand from something this binary has not measured", which is a
+/// supported configuration and not a fault. Callers report it as unknown rather than guessing,
+/// because naming the wrong model in `status` is worse than naming none.
+#[must_use]
+pub fn installed_model(model_directory: &Path) -> Option<EmbeddingModel> {
+    if let Ok(text) = fs::read_to_string(model_directory.join("config.json")) {
+        let declared = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|config| {
+                config
+                    .get("model_type")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_ascii_lowercase)
+            });
+        return declared.and_then(|declared| {
+            EmbeddingModel::ALL
+                .into_iter()
+                .find(|model| model.config_model_type() == declared)
+        });
+    }
+    let graph = file_size(&model_directory.join("model.onnx"))?;
+    let mut matches = EmbeddingModel::ALL.into_iter().filter(|model| {
+        model
+            .files()
+            .iter()
+            .any(|file| file.name == "model.onnx" && file.bytes == graph)
+    });
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
 
 /// The macOS/arm64 ONNX Runtime release tarball.
 ///
 /// Measured from the published asset, which is the same build the acceptance run loaded.
 pub const RUNTIME_ARM64: RemoteFile = RemoteFile {
     name: "onnxruntime-osx-arm64-1.28.1.tgz",
+    // The runtime is named by a full release URL rather than a base directory, so its relative
+    // path is never joined with anything; it is the file name for the same reason the two are
+    // equal in a flat export.
+    remote_path: "onnxruntime-osx-arm64-1.28.1.tgz",
     sha256: "18c853e5c5deba90e244e1b953a65121f23747ba2c04e6743885caa6ce1ea12f",
     bytes: 31_484_009,
 };
@@ -186,7 +393,8 @@ impl Platform {
                 format!(
                     "`sctx embedding install` supports macOS on arm64 and x86_64; this host is \
                      {os}/{arch}. The embedding channel itself is not limited to those: download \
-                     a bge-m3 ONNX export (`model.onnx`, `model.onnx_data`, `tokenizer.json`) and \
+                     an ONNX export (`model.onnx`, `model.onnx_data`, `tokenizer.json`, and \
+                     `config.json` for an export whose family the encoder has to recognize) and \
                      an ONNX Runtime {RUNTIME_VERSION} shared library for this platform, then set \
                      `[retrieval] embedding_model_path` to the model directory and `[retrieval] \
                      embedding_runtime_path` to the library in `config.toml`. `sctx doctor` \
@@ -233,8 +441,11 @@ impl Platform {
 /// What the operator asked `sctx embedding install` to do.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct InstallOptions {
-    /// Base URL holding the three model files under their upstream names. A team mirror goes
-    /// here; the pinned digests still apply.
+    /// Which export to install. Defaults to [`EmbeddingModel::F2llmV2`].
+    pub model: EmbeddingModel,
+    /// Base URL the model files hang under, at the same *relative paths* the upstream repository
+    /// uses -- so a mirror of the default model serves `onnx/model.onnx` and `config.json`, not a
+    /// flat directory. A team mirror goes here; the pinned digests still apply.
     pub model_url: Option<String>,
     /// Full URL of an ONNX Runtime release tarball.
     pub runtime_url: Option<String>,
@@ -260,6 +471,8 @@ pub struct FileOutcome {
 pub struct InstallReport {
     pub root: PathBuf,
     pub platform: &'static str,
+    /// The export that was installed, as a `--model` value.
+    pub model: &'static str,
     pub model_path: PathBuf,
     pub runtime_path: PathBuf,
     pub files: Vec<FileOutcome>,
@@ -285,7 +498,7 @@ pub struct FileStatus {
     pub actual_bytes: Option<u64>,
     /// True when the file is present and, where a size is pinned, exactly that size.
     ///
-    /// Sizes are checked and digests are not: re-hashing 2.2 GB on every `status` would turn a
+    /// Sizes are checked and digests are not: re-hashing 2.4 GB on every `status` would turn a
     /// glance into a ten-second errand, and the failure mode status exists to catch -- a
     /// half-written or deleted file -- changes the size. `--verify` is the answer when the
     /// question is whether the bytes are *right* rather than whether they are *there*.
@@ -297,6 +510,9 @@ pub struct FileStatus {
 pub struct StatusReport {
     pub root: PathBuf,
     pub configured: bool,
+    /// Which export the configured directory holds, as a `--model` value, or `None` when it is
+    /// not one this binary has measured. See [`installed_model`].
+    pub model: Option<&'static str>,
     pub model_path: Option<PathBuf>,
     pub runtime_path: Option<PathBuf>,
     pub files: Vec<FileStatus>,
@@ -380,6 +596,7 @@ pub struct PlannedDownload {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DownloadPlan {
     pub platform: Platform,
+    pub model: EmbeddingModel,
     pub model_directory: PathBuf,
     pub runtime_directory: PathBuf,
     pub model_files: Vec<PlannedDownload>,
@@ -417,21 +634,27 @@ pub fn plan_downloads(
         // An explicit source replaces both defaults rather than joining them. Falling back from a
         // team mirror to the public internet would silently undo the reason the mirror was named.
         Some(base) => vec![base.trim_end_matches('/').to_owned()],
-        None => vec![
-            MIRROR_MODEL_BASE.to_owned(),
-            HUGGINGFACE_MODEL_BASE.to_owned(),
-        ],
+        None => options
+            .model
+            .default_bases()
+            .map(str::to_owned)
+            .into_iter()
+            .collect(),
     };
-    let model_files = MODEL_FILES
+    let model_files = options
+        .model
+        .files()
         .iter()
         .map(|file| PlannedDownload {
             name: file.name.to_owned(),
             sha256: file.sha256.to_owned(),
             bytes: file.bytes,
             destination: model_directory.join(file.name),
+            // The base is joined with the *remote* path, so a mirror is a base directory that
+            // reproduces the upstream layout rather than a flat dump of renamed files.
             sources: model_bases
                 .iter()
-                .map(|base| format!("{base}/{}", file.name))
+                .map(|base| format!("{base}/{}", file.remote_path))
                 .collect(),
             timeout: if file.bytes > 512 * 1024 * 1024 {
                 LARGE_DOWNLOAD_TIMEOUT
@@ -443,6 +666,7 @@ pub fn plan_downloads(
     let runtime_archive = plan_runtime(root, platform, options)?;
     Ok(DownloadPlan {
         platform,
+        model: options.model,
         model_directory,
         runtime_directory,
         model_files,
@@ -523,7 +747,7 @@ fn validated_sha256(value: &str) -> Result<String> {
 /// The order is the contract: nothing lands under its real name until it matches its digest, and
 /// `config.toml` is not touched until a loaded model has encoded a sentence. Re-running is
 /// idempotent -- an already verified file is not transferred again -- which is what makes an
-/// interrupted 2.2 GB download a resumable errand rather than a lost afternoon.
+/// interrupted 2.4 GB download a resumable errand rather than a lost afternoon.
 ///
 /// # Errors
 ///
@@ -537,7 +761,7 @@ pub fn install(
 ) -> Result<InstallReport> {
     let platform = Platform::detect()?;
     let plan = plan_downloads(root, platform, options)?;
-    require_curl()?;
+    require_curl(plan.model)?;
     // Everything that can be known before the first byte moves is checked before the first byte
     // moves. Discovering after a half-hour download that there is no `config.toml` to write into
     // would be a half hour spent to learn something available immediately.
@@ -549,8 +773,10 @@ pub fn install(
     ensure_private_directory(&download_directory(root))?;
 
     progress(&format!(
-        "platform {}, installing into {}",
+        "platform {}, model {} ({}), installing into {}",
         platform.as_str(),
+        plan.model.slug(),
+        plan.model.repository(),
         root.join(EMBEDDING_DIRECTORY).display()
     ));
 
@@ -624,6 +850,7 @@ pub fn install(
     Ok(InstallReport {
         root: root.to_path_buf(),
         platform: platform.as_str(),
+        model: plan.model.slug(),
         model_path: plan.model_directory,
         runtime_path: runtime_library,
         files,
@@ -635,6 +862,44 @@ pub fn install(
     })
 }
 
+/// Grades the model directory's files against whatever export was identified in it.
+///
+/// Which files are expected depends on which export is there: asking a bge-m3 installation for the
+/// default model's `config.json` would report a missing file that model never had. An unidentified
+/// directory is checked only for what any export must hold -- notably not `model.onnx_data`, which
+/// only a split export has.
+fn model_file_status(model_path: &Path, installed: Option<EmbeddingModel>) -> Vec<FileStatus> {
+    let expected: Vec<(&str, Option<u64>)> = installed.map_or_else(
+        || CORE_MODEL_FILES.iter().map(|name| (*name, None)).collect(),
+        |model| {
+            model
+                .files()
+                .iter()
+                .map(|file| (file.name, Some(file.bytes)))
+                .collect()
+        },
+    );
+    expected
+        .into_iter()
+        .map(|(name, expected_bytes)| {
+            let path = model_path.join(name);
+            let actual = file_size(&path);
+            FileStatus {
+                name: name.to_owned(),
+                path,
+                present: actual.is_some(),
+                // A model directory the operator assembled by hand is a supported configuration,
+                // and its `model.onnx_data` legitimately differs from the export this command
+                // installs. The pinned size is only an expectation for the files this command put
+                // there, so it is reported and compared, never required.
+                expected_bytes,
+                actual_bytes: actual,
+                ok: actual.is_some(),
+            }
+        })
+        .collect()
+}
+
 /// Reports what is configured, what is on disk, and how much of the corpus is embedded.
 ///
 /// # Errors
@@ -644,25 +909,11 @@ pub fn status(root: &Path, verify: bool) -> Result<StatusReport> {
     let settings = UserConfigStore::open_existing(root)?.retrieval_settings()?;
     let model_path = settings.embedding_model_path.clone();
     let runtime_path = settings.embedding_runtime_path.clone();
-    let mut files = Vec::new();
-    if let Some(model_path) = model_path.as_deref() {
-        for file in &MODEL_FILES {
-            let path = model_path.join(file.name);
-            let actual = file_size(&path);
-            files.push(FileStatus {
-                name: file.name.to_owned(),
-                path,
-                present: actual.is_some(),
-                // A model directory the operator assembled by hand is a supported configuration,
-                // and its `model.onnx_data` legitimately differs from the export this command
-                // installs. The pinned size is only an expectation for the files this command put
-                // there, so it is reported and compared, never required.
-                expected_bytes: Some(file.bytes),
-                actual_bytes: actual,
-                ok: actual.is_some(),
-            });
-        }
-    }
+    let installed = model_path.as_deref().and_then(installed_model);
+    let mut files = model_path
+        .as_deref()
+        .map(|path| model_file_status(path, installed))
+        .unwrap_or_default();
     if let Some(runtime_path) = runtime_path.as_deref() {
         let actual = file_size(runtime_path);
         files.push(FileStatus {
@@ -728,6 +979,7 @@ pub fn status(root: &Path, verify: bool) -> Result<StatusReport> {
     Ok(StatusReport {
         root: root.to_path_buf(),
         configured,
+        model: installed.map(EmbeddingModel::slug),
         model_path,
         runtime_path,
         files,
@@ -938,19 +1190,28 @@ fn require_writable_configuration(root: &Path) -> Result<()> {
         })
 }
 
-fn require_curl() -> Result<()> {
+fn require_curl(model: EmbeddingModel) -> Result<()> {
     let mut command = Command::new("curl");
     command.arg("--version");
     if run_bounded(&mut command, TOOL_TIMEOUT).is_ok() {
         return Ok(());
     }
+    let files = model
+        .files()
+        .iter()
+        .map(|file| format!("`{}`", file.remote_path))
+        .collect::<Vec<_>>()
+        .join(", ");
     Err(Error::new(
         ErrorKind::External,
-        "`sctx embedding install` downloads through `curl`, which this host does not have. \
-         Install curl, or fetch the files by hand -- `model.onnx`, `model.onnx_data` and \
-         `tokenizer.json` from https://huggingface.co/BAAI/bge-m3/resolve/main/onnx/ into one \
-         directory, and an ONNX Runtime shared library -- then point `[retrieval] \
-         embedding_model_path` and `embedding_runtime_path` at them in `config.toml`.",
+        format!(
+            "`sctx embedding install` downloads through `curl`, which this host does not have. \
+             Install curl, or fetch the files by hand -- {files} from \
+             https://huggingface.co/{}/resolve/main/, flattened into one directory -- plus an \
+             ONNX Runtime shared library, then point `[retrieval] embedding_model_path` and \
+             `embedding_runtime_path` at them in `config.toml`.",
+            model.repository()
+        ),
     ))
 }
 
@@ -1148,16 +1409,20 @@ mod tests {
     }
 
     #[test]
-    fn default_model_sources_lead_with_the_mirror_and_fall_back_to_upstream() {
+    fn the_default_model_is_f2llm_and_its_sources_lead_with_the_mirror() {
         let plan = plan(&InstallOptions::default()).unwrap();
-        assert_eq!(plan.model_files.len(), 3);
+        assert_eq!(plan.model, EmbeddingModel::F2llmV2);
+        assert_eq!(plan.model_files.len(), 4);
         let onnx = &plan.model_files[0];
         assert_eq!(onnx.name, "model.onnx");
+        // The graph lives under `onnx/` upstream and flat on disk; both halves of that are here.
         assert_eq!(
             onnx.sources,
             vec![
-                "https://hf-mirror.com/BAAI/bge-m3/resolve/main/onnx/model.onnx".to_owned(),
-                "https://huggingface.co/BAAI/bge-m3/resolve/main/onnx/model.onnx".to_owned(),
+                "https://hf-mirror.com/codefuse-ai/F2LLM-v2-0.6B/resolve/main/onnx/model.onnx"
+                    .to_owned(),
+                "https://huggingface.co/codefuse-ai/F2LLM-v2-0.6B/resolve/main/onnx/model.onnx"
+                    .to_owned(),
             ]
         );
         assert_eq!(
@@ -1167,20 +1432,100 @@ mod tests {
     }
 
     #[test]
-    fn a_custom_model_base_replaces_both_defaults_and_keeps_the_pinned_digests() {
+    fn the_family_marker_is_installed_alongside_the_weights() {
+        let plan = plan(&InstallOptions::default()).unwrap();
+        let config = plan
+            .model_files
+            .iter()
+            .find(|planned| planned.name == "config.json")
+            .expect("the encoder detects the family from config.json, so it must be installed");
+        // Root-relative upstream, unlike the two ONNX files.
+        assert_eq!(
+            config.sources,
+            vec![
+                "https://hf-mirror.com/codefuse-ai/F2LLM-v2-0.6B/resolve/main/config.json"
+                    .to_owned(),
+                "https://huggingface.co/codefuse-ai/F2LLM-v2-0.6B/resolve/main/config.json"
+                    .to_owned(),
+            ]
+        );
+        assert_eq!(
+            config.destination,
+            Path::new("/root/embedding/model/config.json")
+        );
+    }
+
+    #[test]
+    fn bge_m3_stays_installable_on_its_original_three_files_and_urls() {
         let plan = plan(&InstallOptions {
-            model_url: Some("https://mirror.internal/bge-m3/".to_owned()),
+            model: EmbeddingModel::BgeM3,
             ..InstallOptions::default()
         })
         .unwrap();
-        for (planned, pinned) in plan.model_files.iter().zip(MODEL_FILES.iter()) {
-            assert_eq!(
-                planned.sources,
-                vec![format!("https://mirror.internal/bge-m3/{}", pinned.name)],
-                "a named mirror must not silently fall back to the public internet"
-            );
+        assert_eq!(plan.model, EmbeddingModel::BgeM3);
+        assert_eq!(plan.model_files.len(), 3);
+        for (planned, pinned) in plan.model_files.iter().zip(BGE_M3_MODEL_FILES.iter()) {
+            assert_eq!(planned.name, pinned.name);
             assert_eq!(planned.sha256, pinned.sha256);
             assert_eq!(planned.bytes, pinned.bytes);
+            assert_eq!(
+                planned.sources,
+                vec![
+                    format!(
+                        "https://hf-mirror.com/BAAI/bge-m3/resolve/main/onnx/{}",
+                        pinned.name
+                    ),
+                    format!(
+                        "https://huggingface.co/BAAI/bge-m3/resolve/main/onnx/{}",
+                        pinned.name
+                    ),
+                ],
+                "an existing bge-m3 installation must keep resolving to the same bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn model_slugs_round_trip_and_anything_else_names_the_alternatives() {
+        for model in EmbeddingModel::ALL {
+            assert_eq!(EmbeddingModel::parse(model.slug()).unwrap(), model);
+        }
+        assert_eq!(
+            EmbeddingModel::parse("  F2LLM-V2-0.6B ").unwrap(),
+            EmbeddingModel::F2llmV2
+        );
+        assert_eq!(EmbeddingModel::default(), EmbeddingModel::F2llmV2);
+        let error = EmbeddingModel::parse("f2llm").unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        let message = error.to_string();
+        assert!(message.contains("f2llm-v2-0.6b"), "{message}");
+        assert!(message.contains("bge-m3"), "{message}");
+    }
+
+    #[test]
+    fn a_custom_model_base_replaces_both_defaults_and_keeps_the_pinned_digests() {
+        for model in EmbeddingModel::ALL {
+            let plan = plan(&InstallOptions {
+                model,
+                model_url: Some("https://mirror.internal/export/".to_owned()),
+                ..InstallOptions::default()
+            })
+            .unwrap();
+            for (planned, pinned) in plan.model_files.iter().zip(model.files().iter()) {
+                assert_eq!(
+                    planned.sources,
+                    // The mirror is a base directory that reproduces the upstream *relative*
+                    // layout, so the subdirectory travels with the file rather than being flattened
+                    // at the source.
+                    vec![format!(
+                        "https://mirror.internal/export/{}",
+                        pinned.remote_path
+                    )],
+                    "a named mirror must not silently fall back to the public internet"
+                );
+                assert_eq!(planned.sha256, pinned.sha256);
+                assert_eq!(planned.bytes, pinned.bytes);
+            }
         }
     }
 
@@ -1272,8 +1617,8 @@ mod tests {
         .unwrap();
         assert_eq!(plan.runtime_archive.sha256, expected);
         // The model half is identical on both architectures: only the runtime is per-platform.
-        assert_eq!(plan.model_files.len(), 3);
-        assert_eq!(plan.model_files[0].sha256, MODEL_FILES[0].sha256);
+        assert_eq!(plan.model_files.len(), 4);
+        assert_eq!(plan.model_files[0].sha256, F2LLM_V2_MODEL_FILES[0].sha256);
     }
 
     #[test]
@@ -1627,24 +1972,42 @@ mod tests {
         assert_eq!(report.loads, None, "--verify was not asked for");
     }
 
+    /// Writes a model directory holding exactly the files named, each a five-byte stub.
+    fn model_directory_holding(root: &Path, present: &[&str]) -> PathBuf {
+        let directory = model_directory(root);
+        fs::create_dir_all(&directory).unwrap();
+        for name in present {
+            fs::write(directory.join(name), b"stub!").unwrap();
+        }
+        directory
+    }
+
+    fn configure(root: &Path, model: &Path) -> PathBuf {
+        let runtime = runtime_directory(root).join("libonnxruntime.dylib");
+        fs::create_dir_all(runtime.parent().unwrap()).unwrap();
+        fs::write(&runtime, b"runtime").unwrap();
+        UserConfigStore::open_existing(root)
+            .unwrap()
+            .set_retrieval_embedding(model, &runtime)
+            .unwrap();
+        runtime
+    }
+
     #[test]
     fn status_reports_a_configured_channel_whose_files_went_missing() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("root");
-        let config = UserConfigStore::initialize(&root).unwrap();
-        let model = model_directory(&root);
-        let runtime = runtime_directory(&root).join("libonnxruntime.dylib");
-        fs::create_dir_all(&model).unwrap();
-        fs::create_dir_all(runtime.parent().unwrap()).unwrap();
-        fs::write(model.join("model.onnx"), b"graph").unwrap();
-        fs::write(&runtime, b"runtime").unwrap();
-        config.set_retrieval_embedding(&model, &runtime).unwrap();
+        UserConfigStore::initialize(&root).unwrap();
+        let model = model_directory_holding(&root, &["model.onnx"]);
+        fs::write(model.join("config.json"), br#"{"model_type":"qwen3"}"#).unwrap();
+        configure(&root, &model);
 
         // `tokenizer.json` and `model.onnx_data` were never written.
         let report = status(&root, false).unwrap();
 
         assert!(report.configured);
         assert!(!report.ready);
+        assert_eq!(report.model, Some("f2llm-v2-0.6b"));
         let missing = report
             .files
             .iter()
@@ -1658,6 +2021,116 @@ mod tests {
             .find(|file| file.name == "model.onnx")
             .unwrap();
         assert_eq!(graph.actual_bytes, Some(5));
-        assert_eq!(graph.expected_bytes, Some(MODEL_FILES[0].bytes));
+        assert_eq!(graph.expected_bytes, Some(F2LLM_V2_MODEL_FILES[0].bytes));
+    }
+
+    #[test]
+    fn status_names_the_model_it_found_rather_than_the_one_it_would_install() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        UserConfigStore::initialize(&root).unwrap();
+        // A bge-m3 installation predating the default change: three files, no `config.json`, so
+        // the pinned graph size is the only thing that identifies it.
+        let model = model_directory_holding(&root, &["model.onnx_data", "tokenizer.json"]);
+        fs::write(
+            model.join("model.onnx"),
+            vec![0_u8; usize::try_from(BGE_M3_MODEL_FILES[0].bytes).unwrap()],
+        )
+        .unwrap();
+        configure(&root, &model);
+
+        let report = status(&root, false).unwrap();
+
+        assert_eq!(report.model, Some("bge-m3"));
+        assert!(
+            report.ready,
+            "an existing bge-m3 installation must not be reported as incomplete because the \
+             default model grew a fourth file: {report:#?}"
+        );
+        assert_eq!(report.files.len(), 4, "three model files plus the runtime");
+        assert!(
+            !report.files.iter().any(|file| file.name == "config.json"),
+            "bge-m3 never installed a config.json, so status must not ask for one"
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_export_is_reported_as_unknown_rather_than_guessed_at() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        UserConfigStore::initialize(&root).unwrap();
+        let model = model_directory(&root);
+        fs::create_dir_all(&model).unwrap();
+        fs::write(model.join("model.onnx"), b"graph").unwrap();
+        fs::write(model.join("tokenizer.json"), b"vocabulary").unwrap();
+        fs::write(model.join("config.json"), br#"{"model_type":"bert"}"#).unwrap();
+        configure(&root, &model);
+
+        let report = status(&root, false).unwrap();
+
+        assert_eq!(report.model, None);
+        assert!(report.ready, "{report:#?}");
+        let names = report
+            .files
+            .iter()
+            .map(|file| file.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["model.onnx", "tokenizer.json", "libonnxruntime.dylib"],
+            "an unmeasured export is checked for what any export must hold, and nothing more"
+        );
+        assert!(
+            report
+                .files
+                .iter()
+                .take(2)
+                .all(|file| file.expected_bytes.is_none()),
+            "there is no measured size to compare an unmeasured export against"
+        );
+    }
+
+    #[test]
+    fn the_graph_size_identifies_a_directory_whose_config_went_missing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path();
+        // No `config.json`, so only the pinned graph size can tell the two exports apart.
+        fs::write(
+            directory.join("model.onnx"),
+            vec![0_u8; usize::try_from(F2LLM_V2_MODEL_FILES[0].bytes).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(installed_model(directory), Some(EmbeddingModel::F2llmV2));
+
+        fs::write(
+            directory.join("model.onnx"),
+            vec![0_u8; usize::try_from(BGE_M3_MODEL_FILES[0].bytes).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(installed_model(directory), Some(EmbeddingModel::BgeM3));
+
+        fs::write(directory.join("model.onnx"), b"neither").unwrap();
+        assert_eq!(installed_model(directory), None);
+    }
+
+    #[test]
+    fn a_declared_family_outranks_the_graph_size() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path();
+        fs::write(
+            directory.join("model.onnx"),
+            vec![0_u8; usize::try_from(BGE_M3_MODEL_FILES[0].bytes).unwrap()],
+        )
+        .unwrap();
+        fs::write(directory.join("config.json"), br#"{"model_type":"qwen3"}"#).unwrap();
+
+        assert_eq!(installed_model(directory), Some(EmbeddingModel::F2llmV2));
+    }
+
+    #[test]
+    fn an_empty_model_directory_identifies_nothing() {
+        let temporary = tempfile::tempdir().unwrap();
+        assert_eq!(installed_model(temporary.path()), None);
+        assert_eq!(installed_model(&temporary.path().join("absent")), None);
     }
 }
