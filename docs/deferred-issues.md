@@ -13,7 +13,7 @@
 
 ## 提示与错误文案
 
-5. **`invalid_input` 泄漏 serde 内部措辞**（「expected struct WorkingIntentSnapshot」）且无恢复指引。模型自我纠错效率问题，非链路阻断（cba4000e 中模型第二次就改对了）。方案：按 `session_not_authorized` 家族的模式拆分常见形状错误并给指引。
+5. **`invalid_input` 泄漏 serde 内部措辞**（「expected struct WorkingIntentSnapshot」）且无恢复指引。模型自我纠错效率问题，非链路阻断（cba4000e 中模型第二次就改对了）。方案：按 `session_not_authorized` 家族的模式拆分常见形状错误并给指引。**2026-09-08 部分修复**：`intent` 非对象这一条已在 serde 之前拦下（`validate_intent_composition`，`crates/mcp/src/lib.rs`），`task_intent_update` 与 `space_create` 各报自己的必填字段。选它先修是因为 cursor 会话 4b2e9fb5 实证了最坏形态——cursor 动态工具下 `inputSchema` 首调前不可见，错误消息是模型唯一的自纠依据，那次为此花掉一次失败调用加一次 schema 拉取。**其余形状错误仍是 serde 原文**（`claims[].evidence`、`locator`、各 id 字段等），要不要继续逐条拦取决于是否还有同样的实证。
 6. **stop 催促可能过频**：无 checkpoint 的每一轮 turn_stop 都推「call task_checkpoint…」。单轮会话未成骚扰，长会话形态可预见。方案：每 Session 限次，或仅在本轮有实质工具活动时催。
 7. **marker 512 字节上限仅 `debug_assert` 守护**（release 无检查）。当前两种形态都远小于上限。
 

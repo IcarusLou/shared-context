@@ -8343,6 +8343,37 @@ fn exclusive_selections_and_locator_composition_are_typed_server_validation() {
             }),
             "locator_kind symbol requires locator.enclosing_type",
         ),
+        // A Cursor client cannot see an inputSchema before its first call, so the message is the
+        // only place the expected shape can be stated. A bare goal string is the shape a model
+        // reaches for when it has to guess, and serde's own rejection named a Rust type instead
+        // of the fix.
+        (
+            "task_intent_update",
+            json!({
+                "agent_kind": "codex", "external_session_id": session,
+                "task_boundary": "new", "expected_revision_id": null,
+                "intent": "ship the search fix"
+            }),
+            "intent must be a JSON object, not a string; only goal is required, for example {\"goal\": \"...\"}",
+        ),
+        (
+            "task_intent_update",
+            json!({
+                "agent_kind": "codex", "external_session_id": session,
+                "task_boundary": "new", "expected_revision_id": null,
+                "intent": ["ship the search fix"]
+            }),
+            "intent must be a JSON object, not an array",
+        ),
+        // The second tool that takes an `intent` states its own required fields.
+        (
+            "space_create",
+            json!({
+                "agent_kind": "codex", "external_session_id": session,
+                "intent": "search relevance"
+            }),
+            "intent must be a JSON object, not a string; title, problem, desired_outcome, in_scope, and acceptance_conditions are required",
+        ),
     ];
     for (index, (tool, arguments, expected)) in cases.iter().enumerate() {
         let responses = run_session(

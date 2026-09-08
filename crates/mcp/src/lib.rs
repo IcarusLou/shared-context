@@ -7716,7 +7716,13 @@ fn validate_public_arguments(
         }};
     }
     match name {
-        "task_intent_update" => decode_detail_leveled!(TaskIntentUpdateInput),
+        "task_intent_update" => {
+            validate_intent_composition(
+                arguments.get("intent"),
+                "only goal is required, for example {\"goal\": \"...\"}",
+            )?;
+            decode_detail_leveled!(TaskIntentUpdateInput);
+        }
         "task_artifact_focus" => {
             validate_locator_composition(arguments.get("locator"), false)?;
             decode_detail_leveled!(ArtifactFocusQuery);
@@ -7742,7 +7748,13 @@ fn validate_public_arguments(
             let _ = decode_candidate_confirm_request(arguments.clone())?;
         }
         "space_list" => decode!(SessionInput),
-        "space_create" => decode!(McpSpaceCreateInput),
+        "space_create" => {
+            validate_intent_composition(
+                arguments.get("intent"),
+                "title, problem, desired_outcome, in_scope, and acceptance_conditions are required",
+            )?;
+            decode!(McpSpaceCreateInput);
+        }
         _ => unreachable!("public tool name was checked"),
     }
     Ok(())
@@ -7772,6 +7784,44 @@ const LOCATOR_KIND_COORDINATES: [(&str, &[&str]); 6] = [
 /// The declared view lists every coordinate field as optional, because a host union declaration
 /// degrades into an untyped map; the exact per-kind field set therefore stays authoritative server
 /// validation and names the exact missing or foreign field.
+/// Rejects an `intent` that is not a JSON object, naming the shape the caller should send.
+///
+/// Serde's own rejection is `invalid type: string "...", expected struct WorkingIntentSnapshot`:
+/// it names a Rust type the caller cannot see and never says what to send instead. That matters
+/// more here than the message text usually does, because a Cursor client is offered no
+/// `inputSchema` until after a tool's first call, so this message is the whole of what a model
+/// has to correct itself from — a real Session spent a failed call and a schema fetch on it.
+/// `required` names this tool's own required intent fields; the two tools that take an `intent`
+/// do not agree on them.
+///
+/// Only the outermost shape is checked. Everything inside it — an unknown key, an empty string,
+/// a list over its bound — already fails with a message that names the offending field.
+fn validate_intent_composition(
+    intent: Option<&Value>,
+    required: &str,
+) -> std::result::Result<(), ToolFailure> {
+    match intent {
+        None | Some(Value::Object(_)) => Ok(()),
+        Some(other) => Err(invalid(format!(
+            "intent must be a JSON object, not {}; {required}",
+            json_shape(other)
+        ))
+        .into()),
+    }
+}
+
+/// The JSON shape name a caller would recognize, for a message that has to be self-explaining.
+fn json_shape(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
 fn validate_locator_composition(
     locator: Option<&Value>,
     with_path: bool,
