@@ -129,10 +129,11 @@ fn codex_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_cl
             );
         }
 
-        // Compaction re-states the activation marker as model-visible context, because
-        // compaction is what drops the SessionStart marker — joined to the boundary line
-        // so the checkpoint request the user sees is not the half the model loses. A Stop
-        // has no marker of its own, so its user-visible line is mirrored on its own.
+        // Neither event's Codex output object has a `hookSpecificOutput` variant, so the
+        // checkpoint request travels as the one field both of them accept. A `PreCompact`
+        // plan still renders the activation marker, and it is dropped here rather than
+        // taking the whole output down with it; the marker reaches a compacted session
+        // through the `SessionStart` Codex re-sends with `source: "compact"`.
         let output = encode_hook_output(
             event.kind(),
             &ResolvedAgentAction {
@@ -141,27 +142,163 @@ fn codex_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_cl
             },
         )
         .unwrap();
-        let (hook_event_name, expected_context) = match expected_trigger {
-            EpisodeFinalizationTrigger::PreCompact => (
-                "PreCompact",
-                format!(
-                    "{message}\n{}",
+        if expected_trigger == EpisodeFinalizationTrigger::PreCompact {
+            assert_eq!(
+                action.additional_context.as_deref(),
+                Some(
                     shared_context_activation_marker(AgentKind::Codex, "thr_real_shape_01")
-                ),
-            ),
-            EpisodeFinalizationTrigger::TurnStop => ("Stop", message.to_owned()),
-        };
+                        .as_str()
+                )
+            );
+        }
+        let output: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            output,
+            serde_json::json!({"systemMessage": message}),
+            "{expected_trigger:?} must encode as systemMessage alone"
+        );
+        assert!(output.get("hookSpecificOutput").is_none());
+    }
+}
+
+/// `SessionEnd` is the third event Codex rejects a `hookSpecificOutput` on, and the one whose
+/// plan carries nothing to say in the first place: the neutral object is the whole output.
+#[test]
+fn codex_session_end_encodes_a_neutral_object_and_never_model_context() {
+    let event = decode_hook_input(&serde_json::to_vec(&fixtures().remove(5)).unwrap()).unwrap();
+    let capability = capabilities(Some("codex-cli 0.153.4"), true, TrustState::Confirmed);
+    let action =
+        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled);
+    let output = encode_hook_output(
+        event.kind(),
+        &ResolvedAgentAction {
+            additional_context: action.additional_context,
+            system_message: action.system_message,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output).unwrap(),
+        serde_json::json!({})
+    );
+
+    // And a `SessionEnd` that did have something to say keeps it in `systemMessage` alone.
+    let output = encode_hook_output(
+        CanonicalAgentEventKind::SessionEnd,
+        &ResolvedAgentAction {
+            additional_context: Some("model context that cannot be delivered".to_owned()),
+            system_message: Some("a closing line".to_owned()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output).unwrap(),
+        serde_json::json!({"systemMessage": "a closing line"})
+    );
+}
+
+/// The wire fact behind the whitelist, stated as a test: Codex 0.153.4 deserializes
+/// `hookSpecificOutput` as an internally tagged enum with six variants, and `Stop`,
+/// `PreCompact`, and `SessionEnd` are not among them. Emitting the block on one of those
+/// takes the entire output down — `hook returned invalid stop hook JSON output` — so the
+/// `systemMessage` a user was meant to read is lost with it.
+#[test]
+fn codex_events_without_a_hook_specific_output_variant_encode_system_message_alone() {
+    for event in [
+        CanonicalAgentEventKind::TurnStop,
+        CanonicalAgentEventKind::PreCompact,
+        CanonicalAgentEventKind::SessionEnd,
+    ] {
+        let output = encode_hook_output(
+            event,
+            &ResolvedAgentAction {
+                additional_context: Some("marker the model will never see here".to_owned()),
+                system_message: Some("call task_checkpoint".to_owned()),
+            },
+        )
+        .unwrap();
+        let output: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            output,
+            serde_json::json!({"systemMessage": "call task_checkpoint"}),
+            "{event:?}"
+        );
+
+        // Nothing to say at all stays the neutral object, not an empty block.
+        let neutral = encode_hook_output(
+            event,
+            &ResolvedAgentAction {
+                additional_context: Some("marker the model will never see here".to_owned()),
+                system_message: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(neutral, b"{}".to_vec(), "{event:?}");
+    }
+}
+
+/// The three events that do have a variant keep mirroring a lone `systemMessage` into model
+/// context, which is how the Intent bootstrap reaches the Agent it addresses.
+#[test]
+fn codex_events_with_a_hook_specific_output_variant_still_mirror_a_lone_system_message() {
+    for (event, hook_event_name) in [
+        (CanonicalAgentEventKind::SessionStart, "SessionStart"),
+        (CanonicalAgentEventKind::PromptSubmit, "UserPromptSubmit"),
+        (CanonicalAgentEventKind::PostToolUse, "PostToolUse"),
+    ] {
+        let output = encode_hook_output(
+            event,
+            &ResolvedAgentAction {
+                additional_context: None,
+                system_message: Some("Shared Context: no ActiveTask exists.".to_owned()),
+            },
+        )
+        .unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&output).unwrap(),
             serde_json::json!({
-                "systemMessage": message,
+                "systemMessage": "Shared Context: no ActiveTask exists.",
                 "hookSpecificOutput": {
                     "hookEventName": hook_event_name,
-                    "additionalContext": expected_context
+                    "additionalContext": "Shared Context: no ActiveTask exists."
                 }
             })
         );
     }
+}
+
+/// Codex re-sends `SessionStart` after it compacts, and that payload is the only path the
+/// activation marker has back into a compacted session's context.
+#[test]
+fn codex_session_start_accepts_the_post_compaction_source() {
+    let mut payload = fixtures().remove(0);
+    payload["source"] = Value::String("compact".to_owned());
+    let event = decode_hook_input(&serde_json::to_vec(&payload).unwrap()).unwrap();
+    assert_eq!(event.kind(), CanonicalAgentEventKind::SessionStart);
+    let capability = capabilities(Some("codex-cli 0.153.4"), true, TrustState::Confirmed);
+    let action =
+        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled);
+    let output = encode_hook_output(
+        event.kind(),
+        &ResolvedAgentAction {
+            additional_context: action.additional_context,
+            system_message: action.system_message,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output).unwrap(),
+        serde_json::json!({"hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": shared_context_activation_marker(
+                AgentKind::Codex,
+                "thr_real_shape_01"
+            )
+        }})
+    );
+
+    payload["source"] = Value::String("teleport".to_owned());
+    assert!(decode_hook_input(&serde_json::to_vec(&payload).unwrap()).is_err());
 }
 
 #[test]
@@ -517,4 +654,34 @@ fn codex_reminder_drops_extra_contexts_and_truncates_long_titles() {
     );
     assert!(reminder.contains('\u{2026}'));
     assert!(render_artifact_focus_reminder("src/lib.rs", &[]).is_none());
+}
+
+/// The visibility predicate and the encoder must agree on every event, because a caller deciding
+/// whether to spend a one-shot delivery reads the predicate and the host reads the encoder.
+#[test]
+fn model_visibility_predicate_agrees_with_the_encoder_on_every_event() {
+    for kind in [
+        CanonicalAgentEventKind::SessionStart,
+        CanonicalAgentEventKind::PromptSubmit,
+        CanonicalAgentEventKind::PostToolUse,
+        CanonicalAgentEventKind::PreCompact,
+        CanonicalAgentEventKind::TurnStop,
+        CanonicalAgentEventKind::SessionEnd,
+    ] {
+        const CONTEXT: &str = "one line of model context";
+        let encoded = encode_hook_output(
+            kind,
+            &ResolvedAgentAction {
+                additional_context: Some(CONTEXT.to_owned()),
+                system_message: None,
+            },
+        )
+        .unwrap();
+        let delivered = String::from_utf8(encoded).unwrap().contains(CONTEXT);
+        assert_eq!(
+            delivered,
+            sctx_adapter_codex::delivers_model_visible_context(kind),
+            "{kind:?}"
+        );
+    }
 }

@@ -22,7 +22,7 @@ use sctx_domain::{
     WorkingIntentSnapshot,
 };
 use sctx_git_store::GitStore;
-use sctx_local_state::UserConfigStore;
+use sctx_local_state::{AuthorizedSessionScopeRead, AuthorizedSessionScopeStore, UserConfigStore};
 use sctx_task_runtime::TaskRuntime;
 use serde_json::{Value, json};
 
@@ -127,6 +127,46 @@ impl Fixture {
                 Vec::new(),
             )
             .unwrap();
+    }
+
+    /// Whether the lease has already spent this Session's one-shot marker delivery.
+    fn activation_marker_delivered(&self, agent: &str, session: &str) -> bool {
+        let read = AuthorizedSessionScopeStore::initialize(&self.root)
+            .unwrap()
+            .read(&ExternalSessionLocator::new(agent, session).unwrap())
+            .unwrap();
+        let AuthorizedSessionScopeRead::Current(scope) = read else {
+            panic!("the event under test must have built a lease");
+        };
+        scope.activation_marker_delivered
+    }
+
+    /// One Codex `PreCompact`, the shape a real compaction boundary arrives in.
+    fn codex_pre_compact(&self, session: &str, turn: &str) -> Value {
+        json!({
+            "session_id": session, "transcript_path": null, "cwd": self.repository,
+            "hook_event_name": "PreCompact", "model": "gpt-5.6-sol",
+            "permission_mode": "default", "turn_id": turn, "trigger": "auto"
+        })
+    }
+
+    /// One Codex `Stop`, the shape a completed turn arrives in.
+    fn codex_stop(&self, session: &str, turn: &str) -> Value {
+        json!({
+            "session_id": session, "transcript_path": null, "cwd": self.repository,
+            "hook_event_name": "Stop", "model": "gpt-5.6-sol",
+            "permission_mode": "default", "turn_id": turn,
+            "stop_hook_active": false, "last_assistant_message": "Done."
+        })
+    }
+
+    fn cursor_pre_compact(&self, session: &str, turn: &str) -> Value {
+        json!({
+            "conversation_id": session, "generation_id": format!("gen-{turn}"),
+            "model": "claude-opus-4-7", "hook_event_name": "preCompact",
+            "cursor_version": "3.13.10", "workspace_roots": [self.repository],
+            "user_email": null, "transcript_path": null, "trigger": "auto"
+        })
     }
 
     /// Active Signal contents of one kind, in Signal order.
@@ -898,6 +938,86 @@ fn a_session_that_never_started_gets_its_marker_from_the_self_healing_event() {
         // The delivery is recorded in the lease, so the next event stays silent.
         assert_eq!(fixture.hook(agent, &payload("heal-2")), json!({}));
     }
+}
+
+/// The one-shot delivery is spent only where this host would actually carry it.
+///
+/// A Codex `PreCompact` and `Stop` cannot: neither has a `hookSpecificOutput` variant, so anything
+/// written to model context is dropped with the rest of the object. Repairing a lease on one of
+/// them must therefore leave the delivery unspent — recording a delivery the host discarded is a
+/// lie about what the Session was told, and it is the lie that permanently costs that Session the
+/// `external_session_id` it has to send back. The same two events on Cursor do carry
+/// `user_message`, so there the marker is delivered exactly as before.
+#[test]
+fn a_codex_lease_repaired_at_a_compaction_or_stop_boundary_keeps_its_marker_delivery() {
+    let fixture = Fixture::new("boundary self heal");
+
+    for (turn, boundary) in [
+        ("boundary-precompact", "PreCompact"),
+        ("boundary-stop", "Stop"),
+    ] {
+        // Each boundary gets its own Session, because the question is what the *first* event
+        // after a missing SessionStart does with the delivery.
+        let session = format!("healed-codex-{turn}");
+        fixture.open_task("codex", &session, "repair a lease at a boundary event");
+        let payload = if boundary == "PreCompact" {
+            fixture.codex_pre_compact(&session, turn)
+        } else {
+            fixture.codex_stop(&session, turn)
+        };
+
+        // The boundary line reaches the user; nothing reaches the model, and the lease still
+        // owes a marker.
+        let output = fixture.hook("codex", &payload);
+        assert!(
+            output.get("hookSpecificOutput").is_none(),
+            "{boundary}: {output}"
+        );
+        assert!(
+            !output.to_string().contains("<shared-context-active"),
+            "{boundary}: {output}"
+        );
+        assert!(
+            !fixture.activation_marker_delivered("codex", &session),
+            "{boundary} must not spend a delivery Codex would drop"
+        );
+
+        // The delivery is still unspent on the following `PostToolUse`, and today nothing
+        // hands it over there: the offer is made only by the event that *creates* the lease,
+        // and this lease already exists. That gap is deferred-issues #37, and it is a
+        // separate defect from the one under test here — what this asserts is that the flag
+        // stays honest, so the repair that closes #37 has something true to act on.
+        assert_eq!(
+            fixture.hook(
+                "codex",
+                &fixture.codex_exec(&session, "after", &json!(["cargo", "check"]))
+            ),
+            json!({}),
+            "{boundary}"
+        );
+        assert!(!fixture.activation_marker_delivered("codex", &session));
+    }
+
+    // Cursor is unchanged: its `preCompact` carries `user_message`, so the repair delivers there.
+    let cursor_session = "healed-cursor-boundary";
+    fixture.open_task(
+        "cursor",
+        cursor_session,
+        "repair a lease at a boundary event",
+    );
+    let output = fixture.hook(
+        "cursor",
+        &fixture.cursor_pre_compact(cursor_session, "boundary-precompact"),
+    );
+    let user_message = output["user_message"].as_str().unwrap_or_default();
+    assert!(
+        user_message.contains(&shared_context_activation_marker(
+            AgentKind::Cursor,
+            cursor_session
+        )),
+        "{output}"
+    );
+    assert!(fixture.activation_marker_delivered("cursor", cursor_session));
 }
 
 /// An unauthorized Session must leave exactly zero local residue, and a self-heal that decides

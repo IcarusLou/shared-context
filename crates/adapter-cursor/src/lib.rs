@@ -332,6 +332,26 @@ pub fn encode_hook_output(
         .map_err(|error| Error::new(ErrorKind::Io, format!("encode Cursor hook output: {error}")))
 }
 
+/// Whether text this adapter encodes for `event` can reach the model reading the Session.
+///
+/// The mirror of [`encode_hook_output`]'s match, stated as one predicate so a Runtime decision
+/// that depends on model visibility — whether a one-shot delivery like the self-healed activation
+/// marker is worth spending on this event — asks the adapter that owns the wire instead of
+/// restating its rules. Cursor's `sessionStart` and `postToolUse` carry `additional_context`, and
+/// its `preCompact` and `stop` carry `user_message`; a `beforeSubmitPrompt` and a `sessionEnd`
+/// encode an empty object, so anything written for them is dropped. `payload_contract` holds the
+/// test that keeps this in step with the encoder.
+#[must_use]
+pub const fn delivers_model_visible_context(event: CanonicalAgentEventKind) -> bool {
+    matches!(
+        event,
+        CanonicalAgentEventKind::SessionStart
+            | CanonicalAgentEventKind::PostToolUse
+            | CanonicalAgentEventKind::PreCompact
+            | CanonicalAgentEventKind::TurnStop
+    )
+}
+
 /// Derives the one structured success/failure marker a Cursor `postToolUse` carries.
 ///
 /// Cursor sends `tool_output` as a JSON *string* whose content is the tool's own JSON result

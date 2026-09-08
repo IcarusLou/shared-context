@@ -240,56 +240,76 @@ pub fn encode_hook_output(
     event: CanonicalAgentEventKind,
     action: &ResolvedAgentAction,
 ) -> Result<Vec<u8>> {
-    let hook_event_name = match event {
-        CanonicalAgentEventKind::SessionStart => "SessionStart",
-        CanonicalAgentEventKind::PromptSubmit => "UserPromptSubmit",
-        CanonicalAgentEventKind::PostToolUse => "PostToolUse",
-        CanonicalAgentEventKind::PreCompact => "PreCompact",
-        CanonicalAgentEventKind::TurnStop => "Stop",
-        CanonicalAgentEventKind::SessionEnd => "SessionEnd",
-    };
     let mut object = serde_json::Map::new();
     if let Some(message) = &action.system_message {
         object.insert("systemMessage".to_owned(), Value::String(message.clone()));
     }
     // `systemMessage` is a user-visible line by Hook-protocol convention, so a reminder
-    // delivered only there may never enter the model's context: the Intent bootstrap,
-    // PreCompact, and Stop reminders would be invisible to the Agent they address. A
-    // message that carries no additional context of its own is therefore written to both
-    // fields. TODO: narrow this back to `systemMessage` alone once a real Codex session
-    // demonstrates that `systemMessage` is model-visible.
-    //
-    // `PreCompact` is the one event that carries both at once: the boundary line the user
-    // reads and the re-stated activation marker the model needs. They are joined into one
-    // model-visible block exactly as Cursor joins them into its single `user_message`
-    // field. The join is scoped to `PreCompact` on purpose. A `PostToolUse` under the
-    // enabled Artifact focus experiment also carries both — the Intent bootstrap message
-    // and one bounded, untrusted-data-fenced reminder — and that reminder must reach the
-    // model as exactly the block it was rendered and budgeted as, never with another
-    // sentence prepended inside its own field.
-    let additional_context = match (
-        event,
-        action.system_message.as_deref(),
-        action.additional_context.as_deref(),
-    ) {
-        (CanonicalAgentEventKind::PreCompact, Some(message), Some(marker)) => {
-            Some(format!("{message}\n{marker}"))
+    // delivered only there may never enter the model's context. A message that carries no
+    // additional context of its own is therefore written to both fields — but only on the
+    // events whose output object can hold the second one at all.
+    if let Some(hook_event_name) = hook_specific_output_event_name(event) {
+        if let Some(context) = action
+            .additional_context
+            .as_deref()
+            .or(action.system_message.as_deref())
+        {
+            object.insert(
+                "hookSpecificOutput".to_owned(),
+                json!({
+                    "hookEventName": hook_event_name,
+                    "additionalContext": context,
+                }),
+            );
         }
-        (_, _, Some(context)) => Some(context.to_owned()),
-        (_, Some(message), None) => Some(message.to_owned()),
-        (_, None, None) => None,
-    };
-    if let Some(context) = additional_context {
-        object.insert(
-            "hookSpecificOutput".to_owned(),
-            json!({
-                "hookEventName": hook_event_name,
-                "additionalContext": context,
-            }),
-        );
     }
     serde_json::to_vec(&Value::Object(object))
         .map_err(|error| Error::new(ErrorKind::Io, format!("encode Codex hook output: {error}")))
+}
+
+/// The Codex Hook name to tag a `hookSpecificOutput` block with, or `None` when this event's
+/// output object cannot carry one.
+///
+/// Codex 0.153.4 deserializes `hookSpecificOutput` as an internally tagged enum with exactly six
+/// variants — `PreToolUse`, `PostToolUse`, `PermissionRequest`, `SessionStart`, `SubagentStart`,
+/// `UserPromptSubmit`. There is no `Stop`, `PreCompact`, or `SessionEnd` variant, so putting the
+/// block on one of those events does not merely drop the extra context: the whole output object
+/// fails to deserialize and every field goes with it, including the `systemMessage` the user was
+/// meant to read. A real Codex session showed exactly that — `hook returned invalid stop hook JSON
+/// output` on every turn, and the checkpoint reminder never arrived. The base output shape for
+/// those three events does accept `systemMessage`, so `{"systemMessage": …}` alone is the whole
+/// contract they can honor here.
+///
+/// Compaction therefore has no `PreCompact` channel into model context, and does not need one:
+/// Codex re-sends `SessionStart` with `source: "compact"` after it compacts, and `SessionStart`
+/// renders the activation marker unconditionally. That is the marker's post-compaction path.
+///
+/// A `Stop` has no such fallback. The only field Codex reads there that the model would see is
+/// `decision: "block"` with a `reason`, and blocking a turn to make the Agent read a reminder is a
+/// control decision this adapter does not make: it returns no decision, continuation, or updated
+/// input on any event. The checkpoint request stays a user-visible `systemMessage`.
+const fn hook_specific_output_event_name(event: CanonicalAgentEventKind) -> Option<&'static str> {
+    match event {
+        CanonicalAgentEventKind::SessionStart => Some("SessionStart"),
+        CanonicalAgentEventKind::PromptSubmit => Some("UserPromptSubmit"),
+        CanonicalAgentEventKind::PostToolUse => Some("PostToolUse"),
+        CanonicalAgentEventKind::PreCompact
+        | CanonicalAgentEventKind::TurnStop
+        | CanonicalAgentEventKind::SessionEnd => None,
+    }
+}
+
+/// Whether text this adapter encodes for `event` can reach the model reading the Session.
+///
+/// This is [`hook_specific_output_event_name`] read from the caller's side, and it exists so a
+/// Runtime decision that depends on model visibility — whether a one-shot delivery like the
+/// self-healed activation marker is worth spending on this event — asks the adapter that owns
+/// the wire instead of restating its rules. It is derived rather than written out, so the two
+/// cannot drift: an event Codex has no `hookSpecificOutput` variant for delivers nothing to the
+/// model no matter what the caller puts in `additional_context`.
+#[must_use]
+pub const fn delivers_model_visible_context(event: CanonicalAgentEventKind) -> bool {
+    hook_specific_output_event_name(event).is_some()
 }
 
 fn tool_outcome(response: &Value) -> ToolOutcome {

@@ -1838,14 +1838,29 @@ fn add_self_healed_activation_marker(
     action
 }
 
-/// Whether one lifecycle event's vendor output can carry model-visible text on both adapters.
-const fn carries_model_visible_context(kind: CanonicalAgentEventKind) -> bool {
-    matches!(
-        kind,
-        CanonicalAgentEventKind::PostToolUse
-            | CanonicalAgentEventKind::PreCompact
-            | CanonicalAgentEventKind::TurnStop
-    )
+/// Whether this event is worth spending an Agent's one-shot activation-marker delivery on.
+///
+/// Two questions, asked in order. The wire question belongs to the adapter that encodes the
+/// output, so it is asked there and never restated here: the two hosts disagree — a Codex `Stop`
+/// or `PreCompact` has no `hookSpecificOutput` variant and drops everything written to model
+/// context, while the same Cursor events carry it in `user_message` — and a single shared answer
+/// would spend the delivery on a field one host silently discards, leaving that Session
+/// permanently without the id it must send back. The dispatch is the same `agent` string the Hook
+/// command already uses to pick an adapter for [`agent_capabilities`] and for the encode itself.
+///
+/// The policy question is the caller's: a Prompt is excluded even where the host would deliver it,
+/// because the Prompt Hook never states the marker, and a Session repairing its own lease is not
+/// the reason to make that the exception. `SessionStart` is excluded by its caller, which renders
+/// the marker unconditionally and owes no self-heal.
+fn carries_model_visible_context(agent: &str, kind: CanonicalAgentEventKind) -> bool {
+    if kind == CanonicalAgentEventKind::PromptSubmit {
+        return false;
+    }
+    if agent == "cursor" {
+        sctx_adapter_cursor::delivers_model_visible_context(kind)
+    } else {
+        sctx_adapter_codex::delivers_model_visible_context(kind)
+    }
 }
 
 fn resolve_hook_authorization(
@@ -1914,8 +1929,15 @@ fn resolve_hook_authorization_inner(
             // bootstrap reminder uses — and a busy lock simply skips this event's delivery
             // rather than risking a duplicate.
             //
+            // The delivery is offered here and nowhere else, because a lease this event did not
+            // create cannot be told apart from one a `SessionStart` created — both carry
+            // `activation_marker_delivered: false`, since a `SessionStart` marker is rendered
+            // without recording anything. A lease built by an event whose host drops model
+            // context therefore keeps its delivery unspent but never gets a second chance at it
+            // (deferred-issues #37). Unspent is still the right state: recording a delivery the
+            // host discarded is a lie about what the Session was told.
             if event_kind != CanonicalAgentEventKind::SessionStart
-                && carries_model_visible_context(event_kind)
+                && carries_model_visible_context(agent, event_kind)
                 && scope.decision.is_enabled()
                 && !scope.activation_marker_delivered
             {

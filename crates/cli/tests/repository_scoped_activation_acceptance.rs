@@ -312,12 +312,10 @@ fn assert_output(output: &Output, expected: &Value) {
     assert_eq!(&output_json(output), expected);
 }
 
-/// The documented Codex lifecycle wire.
+/// The documented Codex lifecycle wire for an event Codex can carry model context on.
 ///
-/// The boundary line is user-visible on `systemMessage` and mirrored into model context,
-/// because a reminder the model cannot read cannot be acted on. At `PreCompact` model
-/// context carries that same line joined to the re-stated activation marker, since
-/// compaction is what drops the `SessionStart` marker out of the conversation.
+/// The line is user-visible on `systemMessage` and mirrored into model context, because a
+/// reminder the model cannot read cannot be acted on.
 fn assert_codex_lifecycle_message(
     output: &Output,
     hook_event_name: &str,
@@ -334,6 +332,16 @@ fn assert_codex_lifecycle_message(
             }
         }),
     );
+}
+
+/// The documented Codex lifecycle wire for `Stop`, `PreCompact`, and `SessionEnd`.
+///
+/// Codex has no `hookSpecificOutput` variant for any of the three, and emitting one there
+/// makes the whole output fail to deserialize — taking the user-visible line down with it.
+/// The line therefore travels alone, and a compacted session gets its activation marker
+/// back from the `SessionStart` Codex re-sends with `source: "compact"`.
+fn assert_codex_user_visible_line_only(output: &Output, message: &str) {
+    assert_output(output, &json!({"systemMessage": message}));
 }
 
 fn git_output(repository: &Path, args: &[&str]) -> String {
@@ -570,20 +578,12 @@ fn documented_codex_direct_lifecycle_activates_before_prompt_and_keeps_git_clean
             .current_scope("codex", session)
             .intent_bootstrap_notified
     );
-    assert_codex_lifecycle_message(
+    assert_codex_user_visible_line_only(
         &fixture.run("codex", &events[3]),
-        "PreCompact",
         &oracle.enabled_without_active_task.pre_compact,
-        &format!(
-            "{}\n{}",
-            oracle.enabled_without_active_task.pre_compact,
-            oracle.activation_marker("codex", session)
-        ),
     );
-    assert_codex_lifecycle_message(
+    assert_codex_user_visible_line_only(
         &fixture.run("codex", &events[4]),
-        "Stop",
-        &oracle.enabled_without_active_task.turn_stop,
         &oracle.enabled_without_active_task.turn_stop,
     );
     assert_output(&fixture.run("codex", &events[5]), &oracle.wire.neutral);

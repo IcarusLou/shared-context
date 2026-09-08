@@ -66,3 +66,9 @@
 ## 2026-09-07 新增（F2LLM 换代收尾，W-C 发现）
 
 35. **`model_fingerprint` 不跟随符号链接**：`crates/search/src/embedding.rs` 用 `DirEntry::metadata()`（Unix 上不解引用 symlink），模型目录若由符号链接拼成（如指向 HF 缓存）会以「holds no files」响亮失败。installer 写真实文件不受影响，仅手工用 `embedding_model_path` 指向 symlink 布局的操作者会踩到；失败是响亮的不是静默的。修法一词级：`fs::metadata(entry.path())`。
+
+## 2026-09-08 新增（ADR-0006 白名单修复期间发现）
+
+36. ~~**`carries_model_visible_context` 对 Codex 已经不准**~~ —— **2026-09-08 随 ADR-0006 同轮修复**。原问题：`crates/cli/src/main.rs` 的这个判定（`PostToolUse | PreCompact | TurnStop`）是 adapter 无关的，用来决定「自愈 activation marker」值不值得花掉那次一次性投递；白名单修复之后 Codex 的 `PreCompact`/`TurnStop` 已不再携带 `additionalContext`，于是投递被花在会被丢弃的字段上、`try_mark_activation_marker_delivered` 还把它记成已投递。修法：真值来源下沉到 adapter 本地——`sctx_adapter_codex::delivers_model_visible_context` 由 `hook_specific_output_event_name` 直接派生（两者不可能漂移），`sctx_adapter_cursor::delivers_model_visible_context` 与其 `encode_hook_output` 的 match 同形并有逐事件一致性测试；cli 只按已有的 `agent` 字符串分派（与 `agent_capabilities`、编码出口同一套），另加一条策略排除：Prompt 事件即便宿主能送也不投递。触发条件不是理论——遥测里确有 `maintenance_lock_busy` 导致的 SessionStart fail-open。集成覆盖见 `hook_task_signals::a_codex_lease_repaired_at_a_compaction_or_stop_boundary_keeps_its_marker_delivery`。
+
+37. **一次性 marker 投递只在「创建租约的那个事件」上提供**：`resolve_hook_authorization_inner` 只在 `AuthorizedSessionScopeRead::Missing` 分支里判断要不要投递 marker，`Current` 分支不判断。原因是租约本身分不清两种来源——`SessionStart` 渲染 marker 时**不**写 `activation_marker_delivered`，所以「SessionStart 建的租约」和「自愈建的租约」都是 `activation_marker_delivered: false`，在 `Current` 分支上放开投递会让每个正常会话的第一个 PostToolUse 重复一次 marker。后果：#36 修好之后，一个在 Codex `PreCompact`/`Stop` 上自愈的租约虽然不再谎报投递，但也拿不到第二次机会，该会话仍然全程没有 marker（与修复前的最终结果相同，区别只在租约不再撒谎）。正解方向：让 `SessionStart` 在建租约时就把 `activation_marker_delivered` 记成 true（最好作为 `try_authorize_missing` 的入参，避免热路径上多一次写），此后 `!activation_marker_delivered` 才是可信的「这个会话还没被告知过自己的 id」，`Current` 分支即可安全地补投一次。触发面与 #36 相同（宿主漏发 SessionStart 或租约损坏，且下一个事件恰好是 Codex 的 PreCompact/Stop）；Cursor 不受影响。`hook_task_signals` 里已有一条断言钉住当前行为，修这条时要一并翻转。

@@ -463,3 +463,33 @@ fn empty_workspace_roots_still_fail_the_adapter_guard() {
     payload["workspace_roots"] = serde_json::json!([]);
     assert!(decode_hook_input(&serde_json::to_vec(&payload).unwrap()).is_err());
 }
+
+/// The visibility predicate and the encoder must agree on every event, because a caller deciding
+/// whether to spend a one-shot delivery reads the predicate and the host reads the encoder.
+#[test]
+fn model_visibility_predicate_agrees_with_the_encoder_on_every_event() {
+    for kind in [
+        CanonicalAgentEventKind::SessionStart,
+        CanonicalAgentEventKind::PromptSubmit,
+        CanonicalAgentEventKind::PostToolUse,
+        CanonicalAgentEventKind::PreCompact,
+        CanonicalAgentEventKind::TurnStop,
+        CanonicalAgentEventKind::SessionEnd,
+    ] {
+        const CONTEXT: &str = "one line of model context";
+        let encoded = encode_hook_output(
+            kind,
+            &ResolvedAgentAction {
+                additional_context: Some(CONTEXT.to_owned()),
+                system_message: None,
+            },
+        )
+        .unwrap();
+        let delivered = String::from_utf8(encoded).unwrap().contains(CONTEXT);
+        assert_eq!(
+            delivered,
+            sctx_adapter_cursor::delivers_model_visible_context(kind),
+            "{kind:?}"
+        );
+    }
+}
