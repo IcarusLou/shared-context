@@ -25,8 +25,7 @@ use sctx_agent_adapter::{
     CanonicalAgentEvent, CanonicalAgentEventKind, EpisodeFinalizationTrigger, FileAccess,
     MAX_SHELL_COMMAND_PATH_CANDIDATES, PathHint, ResolvedActivationDecision, ResolvedAgentAction,
     TaskRuntimeOperation, ToolCategory, ToolOutcome, TrustState, artifact_focus_reminder_file,
-    plan_action_for_activation, render_artifact_focus_reminder, render_maintenance_hint,
-    shared_context_activation_marker,
+    plan_action_for_activation, render_artifact_focus_reminder, shared_context_activation_marker,
 };
 use sctx_domain::{
     Applicability, CandidateReviewStatus, ConflictParticipant, ConflictResolutionDraft,
@@ -1763,7 +1762,6 @@ fn plan_hook_action(
         action
     };
     let action = add_self_healed_activation_marker(event, action, capabilities, authorization);
-    let action = add_maintenance_digest_hint(event, action, capabilities, activation);
     if authorization.hooks.artifact_focus_reminder {
         add_artifact_focus_reminder(
             agent,
@@ -1838,63 +1836,6 @@ fn add_self_healed_activation_marker(
         &event.context().session_id,
     ));
     action
-}
-
-/// Appends the maintenance hint to the `SessionStart` activation marker when Reviews are waiting.
-///
-/// The hint rides *behind* the marker rather than replacing it, and only when
-/// `additional_context` holds exactly the marker this event just rendered. That is the same
-/// first-come rule [`add_self_healed_activation_marker`] and [`add_artifact_focus_reminder`]
-/// follow, stated positively: the field is not free, so the only thing this may do is add a line
-/// after content it recognizes as its own. Anything else in the field -- today nothing, tomorrow
-/// whatever claims it first -- means the hint is dropped, and the marker's two existing forms keep
-/// their exact bytes either way.
-///
-/// `SessionStart` only: it is the one event a person reads before deciding what the session is
-/// for, and repeating a pending count on every turn would be nagging rather than steering.
-///
-/// Every failure is silence. An absent digest is the normal state of an installation that has
-/// never run maintenance, an unreadable or unrecognized one is a local-state fault the Hook has no
-/// business reporting to the model, and neither is worth a byte of the Agent's context.
-fn add_maintenance_digest_hint(
-    event: &CanonicalAgentEvent,
-    mut action: CanonicalAgentAction,
-    capabilities: &AgentCapabilities,
-    activation: ResolvedActivationDecision,
-) -> CanonicalAgentAction {
-    if event.kind() != CanonicalAgentEventKind::SessionStart
-        || activation != ResolvedActivationDecision::Enabled
-    {
-        return action;
-    }
-    let marker = shared_context_activation_marker(capabilities.agent, &event.context().session_id);
-    let pending = installation_root()
-        .ok()
-        .and_then(|root| sctx_installer::maintain::read_digest(&root).ok().flatten())
-        .map_or(0, |digest| digest.counts.pending_candidate_reviews);
-    if let Some(context) =
-        maintenance_hint_appended_to_marker(action.additional_context.as_deref(), &marker, pending)
-    {
-        action.additional_context = Some(context);
-    }
-    action
-}
-
-/// The whole first-come decision, with no clock, filesystem, or configuration in it.
-///
-/// Returns the complete replacement value for `additional_context`, or `None` to leave the field
-/// exactly as it is -- which covers all three of "nobody rendered a marker", "somebody else owns
-/// the field", and "nothing is pending".
-fn maintenance_hint_appended_to_marker(
-    additional_context: Option<&str>,
-    marker: &str,
-    pending_candidate_reviews: u64,
-) -> Option<String> {
-    if additional_context != Some(marker) {
-        return None;
-    }
-    let hint = render_maintenance_hint(pending_candidate_reviews)?;
-    Some(format!("{marker}\n{hint}"))
 }
 
 /// Whether one lifecycle event's vendor output can carry model-visible text on both adapters.
@@ -1972,6 +1913,7 @@ fn resolve_hook_authorization_inner(
             // keeps the next event from repeating it — the same one-shot bookkeeping the Intent
             // bootstrap reminder uses — and a busy lock simply skips this event's delivery
             // rather than risking a duplicate.
+            //
             if event_kind != CanonicalAgentEventKind::SessionStart
                 && carries_model_visible_context(event_kind)
                 && scope.decision.is_enabled()
@@ -5165,54 +5107,4 @@ fn invariant(message: impl Into<String>) -> Error {
 
 fn json_error(operation: &'static str) -> impl FnOnce(serde_json::Error) -> Error {
     move |error| Error::new(ErrorKind::Io, format!("failed to {operation}: {error}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The Artifact focus reminder gives up when `additional_context` is taken; this hint is the
-    /// same rule seen from the other side -- it may only *extend* content it recognizes as the
-    /// marker it was rendered beside. Anything else in the field, including nothing at all, leaves
-    /// the field untouched, which is what keeps deferred-issues #14 from becoming a real
-    /// collision the first time a second producer claims `SessionStart`.
-    #[test]
-    fn the_maintenance_hint_only_extends_a_marker_it_recognizes() {
-        let marker = shared_context_activation_marker(
-            sctx_agent_adapter::AgentKind::Cursor,
-            "session-hint-unit",
-        );
-
-        let appended = maintenance_hint_appended_to_marker(Some(&marker), &marker, 3).unwrap();
-        let (kept, hint) = appended.split_at(marker.len());
-        assert_eq!(kept, marker, "the marker's bytes must survive verbatim");
-        assert!(hint.starts_with('\n'));
-        assert!(
-            hint.contains("3 pending Candidate Reviews await a decision"),
-            "{hint}"
-        );
-
-        // Nothing pending: the marker is returned to the caller untouched, not rewritten.
-        assert_eq!(
-            maintenance_hint_appended_to_marker(Some(&marker), &marker, 0),
-            None
-        );
-        // The field is free -- a degraded or Disabled plan -- so there is no marker to extend.
-        assert_eq!(maintenance_hint_appended_to_marker(None, &marker, 3), None);
-        // The field belongs to another producer: give it up rather than appending to their text.
-        assert_eq!(
-            maintenance_hint_appended_to_marker(Some("some other producer's context"), &marker, 3),
-            None
-        );
-        // Even a marker for a *different* Session is somebody else's: byte equality is the whole
-        // ownership test, because it is the only one that cannot be fooled.
-        let other = shared_context_activation_marker(
-            sctx_agent_adapter::AgentKind::Cursor,
-            "another-session",
-        );
-        assert_eq!(
-            maintenance_hint_appended_to_marker(Some(&other), &marker, 3),
-            None
-        );
-    }
 }

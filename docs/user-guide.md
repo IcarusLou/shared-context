@@ -628,7 +628,7 @@ sctx candidate discard \
 | `unresolved_references` | 其中重建后仍是 Ambiguous / Missing / Unavailable 的。 |
 | `relocation_candidates` | Missing 引用旁边、本地历史能说出一次重命名的条数；每条都是一次需要人来定的修复。 |
 
-只要 digest 里 `pending_candidate_reviews > 0`，下一次 `SessionStart` 会在 activation marker 后面多带一行 `<shared-context-maintenance>`，里面只有一个计数和 `candidate_list` 一个工具名（≤ 256 字节）。它是检索提示不是事实，不产生任何 Claim 或 Evidence。
+这些计数只报给你看（`sctx maintain status` 与 `sctx doctor`），**不会注入给模型**：待处置的 Review 往往属于别的会话，而 `candidate_list` 的范围是调用它的那个会话，模型拿到一个它够不着的计数只会被带偏（见 ADR-0006）。
 
 ## 6. 所有功能与命令
 
@@ -946,7 +946,7 @@ opportunistic_after_hours = 24
 - `[maintenance]`：`sctx maintain run`（见 6.x 命令表）什么时候自己跑起来。两条轨互相独立，都默认开着，因为单独任何一条都会漏掉真实的机器：
   - **定时轨**（`scheduled`，默认 `true`）：`sctx setup` / `sctx upgrade` 会在 `~/Library/LaunchAgents/com.shared-context.maintain.plist` 装一个用户级 launchd job，每天在 `schedule_hour`:`schedule_minute`（本机时区，默认 06:00）执行 `<安装根>/bin/current/sctx maintain run --json`，两路输出都追加到 `<安装根>/logs/maintain-launchd.log`。plist 的所有权按 manifest 里记录的 SHA-256 判定：不是本产品写的同名文件、或者被你手工改过的文件，一律保留不覆盖并在 setup 的 notices 里说明；`sctx uninstall` 也只删自己写的那一份。改成 `scheduled = false` 再跑一次 `sctx setup`，会把本产品装的那个 job 卸载并删除。写 plist 在 setup 事务内（失败会连同其他改动一起回滚），`launchctl bootstrap` 在事务提交之后尽力执行——注册失败（SSH 会话、容器、还没图形登录过）只记一条 notice，下次登录时 launchd 自己会读到，安装不会因此失败。
   - **机会轨**（`opportunistic_after_hours`，默认 `24`，`0` = 关闭）：如果 `state/maintain-last-run` 不存在、或者距今超过这个小时数，`SessionStart` Hook 在激活与租约工作全部完成之后，会 detach 拉起一个 `sctx maintain run --opportunistic`（独立进程组、三路输出都指向 `/dev/null`、不等待）。这条轨覆盖的是"到点时笔记本正在睡觉"，代价固定为一次单行文件读加一次 spawn：不开数据库、不拿锁、不等待，任何失败都静默（最多在 `sctx doctor --hooks` 里留一行 `opportunistic_maintenance_*`）。设成 `0` 时 `SessionStart` 与引入这条轨之前逐字节一致。
-  - 另外，只要 `state/maintain-digest.json` 记着 `pending_candidate_reviews > 0`，`SessionStart` 的 activation marker 后面会多一行 `<shared-context-maintenance>…</shared-context-maintenance>`，只带一个计数和 `candidate_list` 这个工具名。它是检索提示不是事实，不产生任何 Claim/Evidence（ADR-0003），marker 本身的两种形态逐字节不变；`additional_context` 已被别的东西占用时直接放弃这行提示。
+  - 两条轨都只写 `state/maintain-digest.json`，digest 里的计数只经 `sctx maintain status` 和 `sctx doctor` 报给你，**不进 `SessionStart` 注入**：`pending_candidate_reviews` 数的常常是别的会话留下的 Review，而 `candidate_list` 只看得到调用它的那个会话，把这个计数塞给模型反而会诱导它做一次空 checkpoint（ADR-0006）。activation marker 因此在任何 digest 状态下都逐字节不变。
 - `[context_ttl]`：按 Context 类型（`decision`/`contract`/`issue`/`risk`/`validation`/`discovery`/`progress`）配置一个带单位的正时长（`s`/`m`/`h`/`d`/`w`），不配置的类型没有时效。到期起点是该 Context 被接受时所在 commit 的时间，不是本机当前时间。过期后状态变为 `historical`：排除自动注入，仍可以被 `search`/`context get` 查到。
 
 ## 7. 常见问题

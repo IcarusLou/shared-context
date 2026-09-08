@@ -1,10 +1,15 @@
-//! The two things a `SessionStart` owes periodic maintenance: one line about what is waiting for a
-//! human, and -- when nobody has run maintenance for a day -- one detached process that runs it.
+//! What a `SessionStart` owes periodic maintenance: when nobody has run maintenance for a day, one
+//! detached process that runs it.
 //!
-//! Both are covered from the outside, through the real binary, because both are defined by what
-//! the Agent and the filesystem observe rather than by any value a function returns. The
-//! first-come rule the hint follows is a unit test in `main.rs`; what is here is the three states
-//! that rule resolves to on a real installation, and the three ages the opportunistic gate reads.
+//! It is covered from the outside, through the real binary, because it is defined by what the
+//! filesystem observes rather than by any value a function returns -- the three ages the
+//! opportunistic gate reads, and the setting that closes the gate for good.
+//!
+//! What a `SessionStart` does *not* owe it is a line to the model. The digest's pending count was
+//! injected behind the activation marker until a real session showed the steering was a dead end:
+//! the Reviews the count names belong to other sessions, `candidate_list` is scoped to the calling
+//! Session, and the only thing the line reliably produced was an empty checkpoint. `sctx maintain
+//! status` and `sctx doctor` still report the count to the person who can act on it.
 
 use std::{
     fs,
@@ -106,40 +111,35 @@ fn bootstrapped_installation() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf)
     (temporary, home, root, workspace)
 }
 
+/// A pending count is a person's decision, so no digest state may change what a Session is told.
+///
+/// The marker is byte-identical whether maintenance has never run, ran and found nothing, ran and
+/// found four Reviews waiting, or left a digest this version cannot parse.
 #[test]
-fn session_start_appends_the_maintenance_hint_only_while_reviews_are_pending() {
+fn no_digest_state_changes_what_a_session_start_injects() {
     let (_temporary, home, root, workspace) = bootstrapped_installation();
     let marker = shared_context_activation_marker(AgentKind::Cursor, SESSION);
     let payload = session_start(SESSION, &workspace);
 
-    // No digest at all: the installation has never run maintenance, and the marker is untouched.
+    // No digest at all: the installation has never run maintenance.
     assert_eq!(additional_context(&run_hook(&home, &payload)), marker);
 
-    // A digest that counted nothing pending is the same silence, not a "0 pending" line.
+    // A digest that counted nothing pending.
     write_digest(&root, 0);
     assert_eq!(additional_context(&run_hook(&home, &payload)), marker);
 
-    // Reviews waiting: one line behind the marker, and the marker's bytes are still exactly the
-    // marker's bytes.
+    // Reviews waiting: still exactly the marker's bytes, and nothing about maintenance.
     write_digest(&root, 4);
     let context = additional_context(&run_hook(&home, &payload));
-    let (kept, hint) = context.split_at(marker.len());
-    assert_eq!(kept, marker);
-    assert_eq!(
-        hint,
-        "\n<shared-context-maintenance>Shared Context maintenance: 4 pending Candidate Reviews \
-         await a decision; call candidate_list after your first checkpoint.\
-         </shared-context-maintenance>"
-    );
-
-    // The hint is retrieval steering, not a fact: nothing about any Candidate travels in it.
-    assert!(!hint.contains("cnd_") && !hint.contains("ctx_"));
+    assert_eq!(context, marker);
+    assert!(!context.contains("shared-context-maintenance"));
+    assert!(!context.contains("candidate_list"));
 
     // A digest this version cannot parse is local-state noise, never a degraded Session.
     fs::write(root.join("state/maintain-digest.json"), b"{not json").unwrap();
     assert_eq!(additional_context(&run_hook(&home, &payload)), marker);
 
-    // And no other event grows a hint: the count is a starting decision, not a per-turn nag.
+    // And no other event grows one either.
     write_digest(&root, 4);
     let post_tool = run_hook(
         &home,
