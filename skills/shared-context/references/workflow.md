@@ -6,7 +6,7 @@ Follow this workflow only after the trusted SessionStart marker has activated Sh
 
 ## 1. What Is Worth Keeping
 
-Checkpoint after forming a conclusion worth keeping, and always immediately before compaction and before ending the turn. Worth keeping means one of these:
+Checkpoint after forming a conclusion worth keeping, and, when one exists, immediately before compaction and before ending the turn. Worth keeping means one of these:
 
 - a decision together with the reasoning behind it;
 - a contract: an interface, schema, or cross-platform constraint;
@@ -22,7 +22,7 @@ Not worth keeping:
 
 When the user asks you to record something, apply the same filter. If the point is derivable from the code or history, ask which part is non-obvious and record that instead.
 
-Leaving a row out costs the knowledge base nothing. A row that only says you read a file costs every later reader.
+Leaving a row out costs the knowledge base nothing. A row that only says you read a file costs every later reader. Having nothing to keep is a complete answer at either boundary: empty `claims` and `unknowns` are the `no_op` of section 6, recording nothing and leaving the checkpoint as pending as it already was, so never send one to look compliant. The opposite lapse costs more: announcing a checkpoint is not making one, so when you tell the user you are recording something, call `task_checkpoint` in the same turn.
 
 ## 2. Kinds
 
