@@ -66,6 +66,11 @@ const PROBE_FIXTURE: &str = include_str!("../../../fixtures/association/probe-ex
 const LEXICAL_INTENT_HITS: usize = 27;
 const LEXICAL_CONTROL_TOLERANCE: usize = 1;
 
+/// R1-3 keeps answerable words ahead of absent terms at the automatic token budget boundary.
+/// Three release runs on 2026-09-09 improved this control from 1 to 3/3 long intents (27 to 29/39
+/// overall), while fused recall remained 32/39. Pin the lexical gain where it was measured.
+const LEXICAL_LONG_INTENT_HITS: usize = 3;
+
 /// Fused hits this fixture reaches with F2LLM at the calibrated floor.
 ///
 /// Measured 2026-09-07 on the run recorded in
@@ -103,6 +108,11 @@ fn the_f2llm_channel_holds_cross_lingual_and_paraphrase_at_the_calibrated_floor(
          probe(s) below the {LEXICAL_INTENT_HITS}/{total} the blocking suite measures; its \
          embedding numbers would not be comparable",
         lexical.hits
+    );
+    assert_eq!(
+        category_hits(&lexical, "long_intent"),
+        LEXICAL_LONG_INTENT_HITS,
+        "answerable words must survive absent-token pressure in every long intent"
     );
     assert_eq!(
         lexical.noise_leaks, 0,

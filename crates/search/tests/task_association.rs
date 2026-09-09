@@ -2948,3 +2948,127 @@ fn a_compact_item_names_the_single_repository_its_references_live_in() {
         spread_item.evidence
     );
 }
+
+fn absent_query_tokens(count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| {
+            format!(
+                "unseen{}{}",
+                char::from(b'a' + u8::try_from(index / 26).unwrap()),
+                char::from(b'a' + u8::try_from(index % 26).unwrap())
+            )
+        })
+        .collect()
+}
+
+fn token_selection_fixture(documents: &[String]) -> (TempDir, SearchEngine) {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("token-selection")).unwrap();
+    for (index, text) in documents.iter().enumerate() {
+        add_space(&store, &format!("Corpus{index}"), text);
+    }
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    (temporary, SearchEngine::new(index))
+}
+
+fn selected_query_tokens(
+    engine: &SearchEngine,
+    tokens: &[String],
+) -> AutomaticQueryTokenExplanation {
+    engine
+        .task_context_pack(&TaskContextRequest::automatic(
+            TaskId::new(),
+            task(&tokens.join(" ")),
+            Vec::new(),
+            100_000,
+        ))
+        .unwrap()
+        .query_token_explanation
+        .unwrap()
+}
+
+#[test]
+fn absent_tokens_cannot_displace_answerable_words_from_the_automatic_budget() {
+    let (_temporary, engine) =
+        token_selection_fixture(&["rarestword sharedword".to_owned(), "sharedword".to_owned()]);
+    let absent = absent_query_tokens(80);
+    let mut query = absent.clone();
+    query.extend(["rarestword".to_owned(), "sharedword".to_owned()]);
+    let explanation = selected_query_tokens(&engine, &query);
+    assert_eq!(explanation.selected_token_count, 64);
+    assert_eq!(explanation.answerable_tokens, ["rarestword", "sharedword"]);
+    assert_eq!(explanation.dropped_tokens.len(), 18);
+    assert!(
+        explanation
+            .dropped_tokens
+            .iter()
+            .all(|drop| drop.filter == AutomaticQueryTokenFilter::TokenBudget
+                && drop.document_frequency == Some(0))
+    );
+    // All absent terms have identical length: the unchanged lexical tie-breaker keeps the first
+    // 62, and the remaining slots belong to the real words, regardless of their higher DF.
+    for token in &absent[..62] {
+        assert!(explanation.selected_tokens.contains(token));
+    }
+    for token in &absent[62..] {
+        assert!(!explanation.selected_tokens.contains(token));
+    }
+}
+
+#[test]
+fn absent_tokens_remain_selected_when_the_automatic_budget_has_room() {
+    let (_temporary, engine) = token_selection_fixture(&["rarestword".to_owned()]);
+    let explanation =
+        selected_query_tokens(&engine, &["rarestword".to_owned(), "unseenword".to_owned()]);
+    assert_eq!(explanation.selected_tokens, ["rarestword", "unseenword"]);
+    assert_eq!(explanation.answerable_tokens, ["rarestword"]);
+    assert!(explanation.dropped_tokens.is_empty());
+}
+
+#[test]
+fn positive_df_order_preserves_the_existing_high_df_retained_prefix_rules() {
+    let rare: Vec<_> = (0..8)
+        .map(|index| format!("rare{}", char::from(b'a' + index)))
+        .collect();
+    let documents: Vec<_> = (0..10)
+        .map(|index| {
+            format!(
+                "frequentword {}",
+                rare.get(index).map_or("", String::as_str)
+            )
+        })
+        .collect();
+    let (_temporary, engine) = token_selection_fixture(&documents);
+    let mut query = absent_query_tokens(10);
+    query.push("frequentword".to_owned());
+    let retained = selected_query_tokens(&engine, &query);
+    assert_eq!(retained.document_count, 10);
+    assert!(
+        retained
+            .selected_tokens
+            .contains(&"frequentword".to_owned())
+    );
+    assert!(retained.dropped_tokens.is_empty());
+
+    // Eight genuinely rarer terms exhaust the protected prefix; the unchanged high-DF filter
+    // then drops the frequent term. Absent terms still fill the remaining selection.
+    query.extend(rare);
+    let filtered = selected_query_tokens(&engine, &query);
+    let drop = filtered
+        .dropped_tokens
+        .iter()
+        .find(|drop| drop.token == "frequentword")
+        .unwrap();
+    assert_eq!(
+        drop.filter,
+        AutomaticQueryTokenFilter::HighDocumentFrequency
+    );
+    assert_eq!(drop.document_frequency, Some(10));
+    assert!(
+        !filtered
+            .selected_tokens
+            .contains(&"frequentword".to_owned())
+    );
+    assert_eq!(filtered.answerable_token_count, 8);
+}

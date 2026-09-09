@@ -2357,8 +2357,8 @@ fn explicit_token_selection(tokens: &[String]) -> AutomaticTokenSelection {
 
 /// Selects the query tokens used for automatic retrieval.
 ///
-/// Document frequency always orders the tokens (rarest first, so the most discriminating survive
-/// truncation), but it only *drops* a token in a corpus large enough for frequency to mean
+/// Tokens with positive document frequency come first, rarest first; absent tokens fill any
+/// remaining budget. Frequency only *drops* a token in a corpus large enough for it to mean
 /// "generic" instead of "this fixture is small", and never below
 /// [`AUTOMATIC_MIN_RETAINED_QUERY_TOKENS`] surviving tokens.
 fn automatic_eligible_query_tokens(
@@ -2403,16 +2403,17 @@ fn automatic_eligible_query_tokens(
         }
     }
 
-    // Rarest first: low document frequency is high IDF. Length and lexicographic order only break
-    // exact frequency ties so the selection stays deterministic.
+    // Positive DF first: absent tokens cannot match BM25 and must not displace real words.
+    // Among matching tokens, low DF is high IDF. Keep length and lexical tie-breakers unchanged.
     let mut ranked = Vec::with_capacity(candidates.len());
     for token in candidates {
         let frequency = automatic_token_document_frequency(connection, &token)?;
         ranked.push((frequency, token));
     }
     ranked.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
+        (left.0 == 0)
+            .cmp(&(right.0 == 0))
+            .then_with(|| left.0.cmp(&right.0))
             .then_with(|| right.1.chars().count().cmp(&left.1.chars().count()))
             .then_with(|| left.1.cmp(&right.1))
     });
@@ -2477,8 +2478,9 @@ fn automatic_eligible_query_tokens(
 }
 
 /// Removes the tokens whose document frequency makes them useless discriminators. `ranked` is
-/// ordered rarest first, so the retained floor is simply its prefix: a frequent token survives
-/// while the query is short, unless the corpus is large enough for "present in nearly every
+/// ordered positive-DF rarest first, then absent tokens, so the retained floor is its prefix:
+/// a frequent token survives while the query is short, unless the corpus is large enough for
+/// "present in nearly every
 /// document" to mean generic and the token would therefore select the whole corpus.
 fn drop_high_document_frequency_tokens(
     ranked: Vec<(usize, String)>,
