@@ -187,7 +187,13 @@ def initialize_probe(
             env=probe_env,
             stdin=json.dumps(hook),
         )
-        if "<shared-context-active>" not in activated.stdout:
+        activation = json.loads(activated.stdout)
+        model_context = activation.get("hookSpecificOutput", {}).get("additionalContext")
+        marker = (
+            rf'<shared-context-active external_session_id="{re.escape(session_id)}">'
+            r".+?</shared-context-active>"
+        )
+        if not isinstance(model_context, str) or re.search(marker, model_context, re.DOTALL) is None:
             raise RuntimeError(
                 f"trial {trial} SessionStart did not authorize Shared Context: "
                 f"{activated.stdout.strip()}"
