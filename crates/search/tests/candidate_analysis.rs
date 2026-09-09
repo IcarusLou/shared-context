@@ -106,6 +106,22 @@ fn add_context(
     draft: ContextRevisionDraft,
 ) -> ContextRevisionRef {
     let event = Event::context_revision_added(space_id, draft, None).unwrap();
+    append_context(store, space_id, event)
+}
+
+fn add_context_with_id(
+    store: &GitStore,
+    space_id: SpaceId,
+    content: ContextRevisionDraft,
+    id: &str,
+) -> ContextRevisionRef {
+    let event = Event::context_revision_added(space_id, content, None).unwrap();
+    let mut value = serde_json::to_value(event).unwrap();
+    value["context_id"] = serde_json::json!(id);
+    append_context(store, space_id, serde_json::from_value(value).unwrap())
+}
+
+fn append_context(store: &GitStore, space_id: SpaceId, event: Event) -> ContextRevisionRef {
     let EventPayload::ContextRevisionAdded {
         context_id,
         revision,
@@ -208,6 +224,87 @@ fn fixture() -> Fixture {
         fts,
         exact_draft,
     }
+}
+
+#[test]
+fn bm25_relevance_order_survives_candidate_analysis() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("bm25 candidate order")).unwrap();
+    let (space, _) = add_space(&store, "Ranking", "ranking");
+    let low = add_context_with_id(
+        &store,
+        space,
+        draft(
+            None,
+            "Ordinary cache behavior",
+            "quizzical appears in rationale",
+            "low-domain",
+        ),
+        "ctx_00000000-0000-4000-8000-000000000001",
+    );
+    let high = add_context_with_id(
+        &store,
+        space,
+        draft(
+            None,
+            "quizzical quizzical quizzical cache",
+            "Stronger statement match",
+            "high-domain",
+        ),
+        "ctx_ffffffff-ffff-4fff-bfff-ffffffffffff",
+    );
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    let engine = SearchEngine::new(index);
+    let search = engine
+        .search(&sctx_search::SearchRequest {
+            query: "quizzical".to_owned(),
+            filters: sctx_search::SearchFilters::default(),
+            page_size: 8,
+            cursor: None,
+            match_mode: sctx_search::SearchMatchMode::Ranked,
+        })
+        .unwrap();
+    assert_eq!(search.results.len(), 2);
+    assert_eq!(search.results[0].context_id, high.context_id);
+    assert_eq!(search.results[1].context_id, low.context_id);
+    assert!(
+        search.results[0].match_reason.bm25 < search.results[1].match_reason.bm25,
+        "SQLite BM25 is lower for the more relevant hit"
+    );
+    let candidate = candidate(draft(
+        None,
+        "quizzical novel claim",
+        "Independent claim",
+        "candidate-domain",
+    ));
+    let result = engine
+        .analyze_candidate(&CandidateAnalysisRequest {
+            source_task_id: candidate.source_episode.task_id,
+            source_intent_revision_id: TaskIntentRevisionId::new(),
+            source_working_intent: source_intent(candidate.source_episode.task_id),
+            source_task_signals: Vec::new(),
+            candidate,
+            explicit_related_contexts: Vec::new(),
+            artifact_refs: Vec::new(),
+            proposed_space_group_space_id: None,
+            token_budget: 8_000,
+            top_k: 8,
+        })
+        .unwrap();
+    assert_eq!(result.analysis.assessments.len(), 2);
+    for assessment in &result.analysis.assessments {
+        assert!(
+            assessment
+                .paths
+                .iter()
+                .all(|path| matches!(path, CandidateAssessmentPath::ContextFullText { .. })),
+            "only BM25 may affect this fixture's rank: {:?}",
+            assessment.paths
+        );
+    }
+    assert_eq!(result.analysis.assessments[0].target, Some(high));
+    assert_eq!(result.analysis.assessments[1].target, Some(low));
 }
 
 #[test]
@@ -1266,7 +1363,7 @@ fn exact_artifact_graph_reaches_cross_end_space_with_frozen_generation() {
     let store = GitStore::bootstrap_local(&root).unwrap();
     let (source_space, _) = add_space(&store, "Frontend Source", "frontend-graph");
     let (contract_space, _) = add_space(&store, "Server Contract", "server-graph");
-    let contract = add_context(
+    let contract = add_context_with_id(
         &store,
         contract_space,
         draft(
@@ -1275,6 +1372,7 @@ fn exact_artifact_graph_reaches_cross_end_space_with_frozen_generation() {
             "Cross-end contract rationale",
             "server-graph-domain",
         ),
+        "ctx_00000000-0000-4000-8000-000000000001",
     );
     let mut source_draft = draft(
         Some("candidate/graph-source"),
@@ -1288,7 +1386,12 @@ fn exact_artifact_graph_reaches_cross_end_space_with_frozen_generation() {
         rationale: "The frontend implements the server contract".to_owned(),
         supports: vec!["Cross-end integration is verified".to_owned()],
     }];
-    let source = add_context(&store, source_space, source_draft);
+    let source = add_context_with_id(
+        &store,
+        source_space,
+        source_draft,
+        "ctx_ffffffff-ffff-4fff-bfff-ffffffffffff",
+    );
     let index = ProjectionIndex::for_store(&store);
     let metadata = index.synchronize().unwrap().metadata;
     let repository = RepositoryIdentity {
@@ -1380,6 +1483,23 @@ fn exact_artifact_graph_reaches_cross_end_space_with_frozen_generation() {
             })
             .unwrap()
     };
+    // Only graph retrieval applies here. The root must precede its hop even though
+    // the hop's ID sorts first.
+    let graph_only = analyze_with_graph(draft(
+        None,
+        "Quizzical zephyrs dance",
+        "Independent vocabulary",
+        "unrelated-domain",
+    ));
+    assert_eq!(
+        graph_only
+            .analysis
+            .assessments
+            .iter()
+            .map(|assessment| assessment.target)
+            .collect::<Vec<_>>(),
+        vec![Some(source), Some(contract)],
+    );
     let result = analyze_with_graph(content);
     assert_eq!(
         relation_for(&result, source),

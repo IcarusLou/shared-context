@@ -580,8 +580,6 @@ fn add_graph_channel(
             }
         }
     }
-    ranked.sort();
-    ranked.dedup();
     add_ranked_channel(targets, "graph", ranked);
     Ok(())
 }
@@ -615,11 +613,15 @@ fn add_bm25_channel(
 fn add_ranked_channel(
     targets: &mut BTreeMap<ContextRevisionRef, TargetState>,
     channel: &'static str,
-    mut values: Vec<ContextRevisionRef>,
+    values: Vec<ContextRevisionRef>,
 ) {
-    values.sort();
-    values.dedup();
-    for (rank, target) in values.into_iter().enumerate() {
+    // The caller owns relevance order; repeated hits keep their first position.
+    let mut seen = BTreeSet::new();
+    for (rank, target) in values
+        .into_iter()
+        .filter(|target| seen.insert(*target))
+        .enumerate()
+    {
         if let Some(state) = targets.get_mut(&target) {
             state.channels.entry(channel).or_insert(rank + 1);
         }
@@ -1413,7 +1415,64 @@ fn push_space_path(state: &mut SpaceState, path: CandidateSpaceRecommendationPat
 
 #[cfg(test)]
 mod tests {
-    use super::{PROPOSED_SPACE_TITLE_MAX_CHARS, proposed_space_title};
+    use super::*;
+
+    fn ranked_target() -> (ContextRevisionRef, TargetState) {
+        let revision = ContextRevision {
+            revision_id: sctx_domain::RevisionId::new(),
+            parent_revision_ids: Vec::new(),
+            kind: sctx_domain::ContextKind::Discovery,
+            topic_key: None,
+            problem_view: None,
+            statement: "A ranking target".to_owned(),
+            rationale: "Only channel rank is under test".to_owned(),
+            applicability: Applicability::default(),
+            assumptions: Vec::new(),
+            recheck_when: Vec::new(),
+            hints: Vec::new(),
+            relations: Vec::new(),
+            evidence: Vec::new(),
+        };
+        let target = ContextRevisionRef {
+            context_id: sctx_domain::ContextId::new(),
+            revision_id: revision.revision_id,
+        };
+        (
+            target,
+            TargetState {
+                revision,
+                safe: true,
+                accepted: true,
+                space_conflicted: false,
+                channels: BTreeMap::new(),
+                paths: Vec::new(),
+                score: 0,
+                statement_similarity: 0,
+                negation_conflict: false,
+                shared_identifiers: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn ranked_channel_keeps_input_order_and_first_duplicate_position() {
+        let mut targets = BTreeMap::from([ranked_target(), ranked_target(), ranked_target()]);
+        let ids = targets.keys().copied().collect::<Vec<_>>();
+        add_ranked_channel(
+            &mut targets,
+            "bm25",
+            vec![ids[2], ids[0], ids[2], ids[1], ids[0]],
+        );
+        assert_eq!(targets[&ids[2]].channels["bm25"], 1);
+        assert_eq!(targets[&ids[0]].channels["bm25"], 2);
+        assert_eq!(targets[&ids[1]].channels["bm25"], 3);
+
+        // Explicit references are an unordered set and retain their canonical ID order.
+        add_explicit_channel(&[ids[2], ids[0], ids[2], ids[1]], &mut targets);
+        for (rank, id) in ids.iter().enumerate() {
+            assert_eq!(targets[id].channels["explicit"], rank + 1);
+        }
+    }
 
     #[test]
     fn a_short_goal_is_its_own_title_after_normalization() {
