@@ -64,7 +64,7 @@ pub use reducer::{
     DomainProjection, EngineeringReferenceProjection, IntentProjection, ReducerDiagnostic,
     ReducerDiagnosticCode, ReducerEvent, ReducerPayload, ReviewSummary, RevisionLifecycle,
     RevisionProjection, SemanticConflictCandidate, SemanticConflictOpenReason,
-    SemanticConflictProjection, SemanticConflictStatus, reduce,
+    SemanticConflictProjection, SemanticConflictStatus, reduce, space_is_provisional,
 };
 pub use task::{
     ExternalSessionLocator, ExternalSessionSnapshot, TaskIntentRevision, TaskSessionSnapshot,

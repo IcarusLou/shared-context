@@ -3527,3 +3527,171 @@ fn candidate_confirm_and_discard_batches_are_atomic_and_single_id_keeps_prior_sh
     ]);
     assert_eq!(missing_candidate["error"]["code"], "invalid_input");
 }
+
+fn with_provisional_intent(event: Event) -> Event {
+    let mut value = serde_json::to_value(event).unwrap();
+    value["intent_revision"]["provisional"] = Value::Bool(true);
+    sctx_event_schema::parse_event(&serde_json::to_vec(&value).unwrap())
+        .unwrap()
+        .known()
+        .expect("provisional fixture is a valid event")
+        .clone()
+}
+
+fn listed_provisional_flags(spaces: &Value) -> std::collections::BTreeMap<String, bool> {
+    spaces
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|space| {
+            (
+                space["space_id"].as_str().unwrap().to_owned(),
+                space["provisional"].as_bool().unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn provisional_space_state_agrees_across_domain_index_mcp_and_cli() {
+    let harness = Harness::new();
+    let store = GitStore::bootstrap_local(harness.root()).unwrap();
+    let mut expected = std::collections::BTreeMap::new();
+    for (title, proposed, conflicted) in [
+        ("Proposed boundary", true, false),
+        ("Named boundary", false, false),
+        ("Conflicting proposals", true, true),
+    ] {
+        let event = Event::space_created(intent(title), None).unwrap();
+        let event = if proposed {
+            with_provisional_intent(event)
+        } else {
+            event
+        };
+        let (space_id, parent) = match event.payload() {
+            EventPayload::SpaceCreated {
+                space_id,
+                intent_revision,
+            } => (*space_id, intent_revision.revision_id),
+            _ => unreachable!("space.created fixture"),
+        };
+        store.append_event(AppendRequest::event(event)).unwrap();
+        if conflicted {
+            for branch in ["First proposal", "Second proposal"] {
+                let revision =
+                    Event::intent_revision_added(space_id, vec![parent], intent(branch), None)
+                        .unwrap();
+                store
+                    .append_event(AppendRequest::event(with_provisional_intent(revision)))
+                    .unwrap();
+            }
+        }
+        expected.insert(space_id.to_string(), proposed && !conflicted);
+    }
+    let index = ProjectionIndex::for_store(&store);
+    let snapshot = index.domain_snapshot().unwrap();
+    let domain_flags = snapshot
+        .projection
+        .spaces
+        .values()
+        .map(|space| {
+            (
+                space.space_id.to_string(),
+                sctx_domain::space_is_provisional(space),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(domain_flags, expected);
+    let connection = rusqlite::Connection::open_with_flags(
+        index.database_path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let indexed_flags = connection
+        .prepare("SELECT space_id, provisional FROM space_projection")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()
+        .unwrap();
+    assert_eq!(indexed_flags, expected);
+    let cli = harness.success(&["space", "list"]);
+    assert_eq!(listed_provisional_flags(&cli["data"]["spaces"]), expected);
+    assert_eq!(cli["tree"], snapshot.metadata.indexed_tree_oid);
+
+    let config = UserConfigStore::open_existing(harness.root()).unwrap();
+    let checkout = fs::canonicalize(store.repository()).unwrap();
+    config
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(&checkout),
+        )
+        .unwrap();
+    let session = "provisional-consistency";
+    sctx_local_state::AuthorizedSessionScopeStore::initialize(harness.root())
+        .unwrap()
+        .try_authorize_missing(
+            &ExternalSessionLocator::new("codex", session).unwrap(),
+            &config.repository_catalog().unwrap(),
+            &checkout,
+        )
+        .unwrap();
+    establish_cli_task(
+        &harness,
+        session,
+        "Read provisional boundaries",
+        "Compare current flags",
+    );
+    let candidates = candidate_list_at_root(
+        harness.root(),
+        &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            status: CandidateReviewStatus::Pending,
+            limit: 10,
+            cursor: None,
+            token_budget: 4096,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        candidates
+            .provisional_space_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>(),
+        expected
+            .iter()
+            .filter(|(_, value)| **value)
+            .map(|(id, _)| id.clone())
+            .collect()
+    );
+
+    let input = format!(
+        "{}\n{}\n",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2024-11-05"}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"space_list","arguments":{
+                "agent_kind":"codex","external_session_id":session}}}),
+    );
+    let mut output = Vec::new();
+    sctx_mcp::McpServer::new(harness.root(), sctx_mcp::ClientKind::Codex)
+        .unwrap()
+        .serve(&mut std::io::Cursor::new(input.into_bytes()), &mut output)
+        .unwrap();
+    let responses = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(responses[1]["result"]["isError"], false);
+    let mcp = &responses[1]["result"]["structuredContent"];
+    assert_eq!(listed_provisional_flags(&mcp["spaces"]), expected);
+    assert_eq!(mcp["conflicts"], 1);
+    assert_eq!(mcp["indexed_tree_oid"], snapshot.metadata.indexed_tree_oid);
+}

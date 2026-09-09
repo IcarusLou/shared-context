@@ -405,15 +405,7 @@ fn provisional_space_ids(snapshot: &DomainSnapshot) -> BTreeSet<SpaceId> {
         .projection
         .spaces
         .iter()
-        .filter(|(_, space)| {
-            space.intent.heads.len() == 1
-                && space
-                    .intent
-                    .heads
-                    .first()
-                    .and_then(|revision_id| space.intent.revisions.get(revision_id))
-                    .is_some_and(|revision| revision.provisional)
-        })
+        .filter(|(_, space)| sctx_domain::space_is_provisional(space))
         .map(|(space_id, _)| *space_id)
         .collect()
 }
@@ -6844,13 +6836,7 @@ impl McpServer {
                     "titles": titles,
                     "context_count": space.contexts.len(),
                     // A conflicted Space has no winning head, so it never reports provisional.
-                    "provisional": space.intent.heads.len() == 1
-                        && space
-                            .intent
-                            .heads
-                            .first()
-                            .and_then(|revision_id| space.intent.revisions.get(revision_id))
-                            .is_some_and(|revision| revision.provisional),
+                    "provisional": sctx_domain::space_is_provisional(space),
                     "conflicts": if space.intent.heads.len() > 1 {
                         vec![json!({"kind": "intent", "status": "open", "heads": space.intent.heads})]
                     } else { Vec::new() },

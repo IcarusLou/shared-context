@@ -778,7 +778,7 @@ fn populate(
                     i64::from(space.intent.heads.len() > 1),
                     // Only a single resolved Intent head can say whether the Space is still the
                     // server's provisional proposal; a conflicted Space reports 0.
-                    i64::from(intent.is_some_and(|revision| revision.provisional)),
+                    i64::from(sctx_domain::space_is_provisional(space)),
                     json(space)?
                 ],
             )

@@ -248,6 +248,20 @@ pub struct ContextSpaceProjection {
     pub contexts: BTreeMap<ContextId, ContextProjection>,
 }
 
+/// Whether the Space's unique current Intent head is a server-proposed boundary.
+///
+/// Conflicting, absent or unresolved heads cannot speak for a Space and return false.
+#[must_use]
+pub fn space_is_provisional(space: &ContextSpaceProjection) -> bool {
+    space.intent.heads.len() == 1
+        && space
+            .intent
+            .heads
+            .first()
+            .and_then(|revision_id| space.intent.revisions.get(revision_id))
+            .is_some_and(|revision| revision.provisional)
+}
+
 /// Projection of one unassigned Candidate creation event.
 ///
 /// Candidate projections deliberately have no Space, publication, conflict, or
@@ -2386,5 +2400,64 @@ mod tests {
             accepted_context(None, "ProductAnchorAssem 在直播入口解析前提前返回"),
         ]);
         assert!(conflict_candidates(&spaces).is_empty());
+    }
+    #[test]
+    fn provisional_space_requires_one_resolved_current_head() {
+        let mut space = one_space(Vec::new()).into_values().next().unwrap();
+        assert!(!super::space_is_provisional(&space), "no head");
+        let revision_id = crate::RevisionId::new();
+        space.intent.heads.insert(revision_id);
+        assert!(!super::space_is_provisional(&space), "dangling head");
+        let revision = crate::IntentRevision {
+            revision_id,
+            parent_revision_ids: Vec::new(),
+            intent: crate::IntentSnapshot {
+                title: "Proposed boundary".to_owned(),
+                problem: "a boundary needs review".to_owned(),
+                desired_outcome: "one current boundary".to_owned(),
+                in_scope: vec!["Space state".to_owned()],
+                out_of_scope: Vec::new(),
+                acceptance_conditions: vec!["a current head decides".to_owned()],
+                domain_terms: Vec::new(),
+            },
+            provisional: true,
+        };
+        space.intent.revisions.insert(revision_id, revision.clone());
+        assert!(super::space_is_provisional(&space), "unique proposed head");
+        space
+            .intent
+            .revisions
+            .get_mut(&revision_id)
+            .unwrap()
+            .provisional = false;
+        assert!(!super::space_is_provisional(&space), "unique named head");
+        let other_id = crate::RevisionId::new();
+        space.intent.revisions.insert(
+            other_id,
+            crate::IntentRevision {
+                revision_id: other_id,
+                ..revision
+            },
+        );
+        assert!(
+            !super::space_is_provisional(&space),
+            "old proposal is not current"
+        );
+        space
+            .intent
+            .revisions
+            .get_mut(&revision_id)
+            .unwrap()
+            .provisional = true;
+        space.intent.heads.insert(other_id);
+        assert!(
+            !super::space_is_provisional(&space),
+            "two proposed heads conflict"
+        );
+        space.intent.heads.clear();
+        assert!(
+            !super::space_is_provisional(&space),
+            "history alone has no current head"
+        );
     }
 }

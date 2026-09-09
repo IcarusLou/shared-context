@@ -2972,13 +2972,7 @@ fn run_space(args: &[String], json_output: bool) -> Result<()> {
                         .map(|revision| revision.intent.title.clone())
                         .collect::<Vec<_>>();
                     // A conflicted Space has no winning head, so it never reports provisional.
-                    let provisional = space.intent.heads.len() == 1
-                        && space
-                            .intent
-                            .heads
-                            .first()
-                            .and_then(|revision_id| space.intent.revisions.get(revision_id))
-                            .is_some_and(|revision| revision.provisional);
+                    let provisional = sctx_domain::space_is_provisional(space);
                     json!({"space_id": space.space_id, "intent_heads": space.intent.heads,
                            "titles": titles, "context_count": space.contexts.len(),
                            "provisional": provisional})
