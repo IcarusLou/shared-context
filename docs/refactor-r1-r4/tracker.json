@@ -432,5 +432,19 @@
     "AutomationGenerated": false,
     "RoomEnabled": true,
     "WebURL": "https://mew.bytedance.net/3c7b5483-4704-4084-a5c7-c75193912e47/issues/c562f9b3-1005-437e-b699-06af4c69a900"
+  },
+  "M4-F2": {
+    "ID": "d36bfbda-6f88-4fea-bbf0-91f29f2593a8",
+    "CreatedAt": "2026-09-09T15:36:18.636284Z",
+    "UpdatedAt": "2026-09-09T15:57:37.233126Z",
+    "WorkspaceID": "3c7b5483-4704-4084-a5c7-c75193912e47",
+    "Number": 261,
+    "Title": "Shared Context / M4-F2 Paired real-host smoke",
+    "Description": "User amendment U-002: whenever real Codex smoke is required/performed, require a paired real Cursor smoke. Add project acceptance rules and run actual Cursor Agent/model/MCP against an isolated installation. Preserve production HOME/config/database and pending H-002 activation decision. Capture genuine host trace and distinguish native hooks from any explicitly driven lifecycle checks; never count fixture playback as real host or smoke as normal-use observation. One bounded commit with script/rules/evidence/decision log; main verifies before done. Commit: test(hosts): require paired Cursor and Codex smoke (M4-F2).",
+    "Status": "done",
+    "Priority": "high",
+    "AutomationGenerated": false,
+    "RoomEnabled": true,
+    "WebURL": "https://mew.bytedance.net/3c7b5483-4704-4084-a5c7-c75193912e47/issues/d36bfbda-6f88-4fea-bbf0-91f29f2593a8"
   }
 }

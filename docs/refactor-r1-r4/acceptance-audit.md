@@ -20,6 +20,7 @@ Authority: [approved plan](approved-plan.md), amended only by [H-001 disposition
 | R4-2a prior off and strong calibration only | c1f77c8; Full items equal apart from counters at reused3/ignored3, Compact order/reasons neutral; deferred#39 | Accepted code |
 | R4-2b readonly recall stats | 6e3204a; live-WAL/current/old/missing source contracts, no source byte/sidecar/index writes, strong/weak and Task/Session aggregation | Accepted code |
 | M1 / M2 / M3 full gates | Recorded accepted gate runs, actual targeted repairs/rechecks and explicit ignored/manual-model coverage in execution.md | Accepted |
+| U-002 paired real-host smoke | cafe920; same-build real Cursor Agent CLI + Codex, actual MCP/identity/Builder/lease evidence and fail-closed pair verifier; [report](paired-real-host-smoke.md) | Accepted |
 | M4 final code gates |1052passed/1fixturefail/14ignored;1396a5d repairs exact maintenance-lock race; whole scenario-runner41passed and independentobserver5passed. Finalfmt/clippy, NPM21passed/1skip | Accepted code gates |
 | Installed M4 activation and baseline | Signed local build and actual-database copy upgrade preserve all23old table projections;9live old MCP clients require coordinated reconnection | [H-002 pending](r4-activation-gate.md) |
 | Normal-use≥2weeks OR≥20sessions | Must start after activation; exclude historical IDs and isolated smokes; keep ranking and permissions stable | Pending |

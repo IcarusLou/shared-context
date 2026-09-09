@@ -130,5 +130,11 @@
     "title": "M4-F1 Stable Git observer fixture",
     "description": "Parent milestone: M4 (#234). Required gate repair. The unchanged observer fixture fingerprints its repository immediately after git commit; detached Git maintenance removes objects/maintenance.lock during traversal. Private exact Rust reproduction: 6 failures in 80 runs. Configure only fixture Git calls with maintenance.autoDetach=false, preserving strict observer source and every no-write assertion. Non-goals: production observer changes, ignored files/retries/sleeps, global Git configuration, deferred latency changes. Run full scenario-runner tests and repeated direct fingerprint fixture. One commit: test(scenarios): await fixture Git maintenance (M4-F1). Move to review and stop for main verification.",
     "commit": "test(scenarios): await fixture Git maintenance (M4-F1)"
+  },
+  {
+    "key": "M4-F2",
+    "title": "Paired real-host smoke",
+    "description": "User amendment U-002: whenever real Codex smoke is required/performed, require a paired real Cursor smoke. Add project acceptance rules and run actual Cursor Agent/model/MCP against an isolated installation. Preserve production HOME/config/database and pending H-002 activation decision. Capture genuine host trace and distinguish native hooks from any explicitly driven lifecycle checks; never count fixture playback as real host or smoke as normal-use observation. One bounded commit with script/rules/evidence/decision log; main verifies before done. Commit: test(hosts): require paired Cursor and Codex smoke (M4-F2).",
+    "commit": "test(hosts): require paired Cursor and Codex smoke (M4-F2)"
   }
 ]
