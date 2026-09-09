@@ -1035,3 +1035,126 @@ fn lifecycle_boundary_creates_no_capture_storage() {
         assert!(!harness.root.join("state").join(removed).exists());
     }
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn session_end_records_weak_usage_and_preserves_checkpoint_verdicts_on_both_hosts() {
+    use sctx_task_runtime::{ContextInjectionSource, InjectedContext};
+    for agent in ["codex", "cursor"] {
+        let harness = Harness::new();
+        let runtime = TaskRuntime::initialize(&harness.root).unwrap();
+        let session = "session-close-usage";
+        harness.activate(agent, session);
+        let (locator, _) = open_checkpoint(&runtime, agent, session);
+        let first = runtime.read_snapshot_by_locator(&locator).unwrap().unwrap();
+        let context = InjectedContext {
+            context_id: sctx_domain::ContextId::new(),
+            revision_id: sctx_domain::RevisionId::new(),
+        };
+        runtime
+            .record_task_injections_at(
+                first.task_id,
+                first.current_intent_revision().unwrap().revision_id,
+                ContextInjectionSource::TaskContext,
+                &[context],
+                10,
+            )
+            .unwrap();
+        let stop = if agent == "codex" {
+            codex_event(session, &harness.workspace, "Stop", "usage-checkpoint")
+        } else {
+            cursor_stop(session, &harness.workspace, "usage-checkpoint")
+        };
+        harness.hook(agent, &stop);
+        let connection = rusqlite::Connection::open(runtime.database_path()).unwrap();
+        let read = |task: TaskId| {
+            connection.query_row(
+            "SELECT outcome, basis, recorded_at_unix_seconds FROM context_usage WHERE task_id = ?1",
+            [task.to_string()], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))).unwrap()
+        };
+        let strong_before = read(first.task_id);
+        assert_eq!(strong_before.0, "ignored");
+        assert_eq!(strong_before.1, "checkpoint_derived");
+        let second = runtime
+            .start_new_task(
+                &locator,
+                first.task_id,
+                &intent("no-checkpoint"),
+                Vec::new(),
+            )
+            .unwrap()
+            .snapshot;
+        runtime
+            .record_task_injections_at(
+                second.task_id,
+                second.current_intent_revision().unwrap().revision_id,
+                ContextInjectionSource::TaskContext,
+                &[context],
+                20,
+            )
+            .unwrap();
+        let third = runtime
+            .start_new_task(
+                &locator,
+                second.task_id,
+                &intent("also-no-checkpoint"),
+                Vec::new(),
+            )
+            .unwrap()
+            .snapshot;
+        runtime
+            .record_task_injections_at(
+                third.task_id,
+                third.current_intent_revision().unwrap().revision_id,
+                ContextInjectionSource::TaskContext,
+                &[context],
+                30,
+            )
+            .unwrap();
+        let end = if agent == "codex" {
+            let mut event = codex_event(session, &harness.workspace, "SessionEnd", "usage-end");
+            event.as_object_mut().unwrap().remove("model");
+            event
+        } else {
+            json!({
+                "conversation_id": session, "generation_id": "close-generation", "model": "claude-opus-4-7-thinking-max",
+                "hook_event_name": "sessionEnd", "cursor_version": "3.13.10", "workspace_roots": [harness.workspace],
+                "user_email": null, "transcript_path": null, "session_id": session, "reason": "completed",
+                "duration_ms": 45000, "is_background_agent": false, "final_status": "completed"
+            })
+        };
+        assert_eq!(harness.hook(agent, &end), json!({}));
+        assert_eq!(read(first.task_id), strong_before);
+        for task in [second.task_id, third.task_id] {
+            let row = read(task);
+            assert_eq!(
+                (row.0.as_str(), row.1.as_str()),
+                ("ignored", "session_close")
+            );
+        }
+    }
+}
+
+#[test]
+fn session_end_usage_lock_contention_is_quiet_and_bounded() {
+    let harness = Harness::new();
+    harness.activate("codex", "locked-close");
+    let runtime = TaskRuntime::initialize(&harness.root).unwrap();
+    let connection = rusqlite::Connection::open(runtime.database_path()).unwrap();
+    connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let start = Instant::now();
+    assert_eq!(
+        harness.hook(
+            "codex",
+            &codex_event(
+                "locked-close",
+                &harness.workspace,
+                "SessionEnd",
+                "locked-close"
+            )
+        ),
+        json!({})
+    );
+    assert!(start.elapsed() < Duration::from_secs(2));
+    connection.execute_batch("ROLLBACK").unwrap();
+}

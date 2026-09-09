@@ -175,3 +175,14 @@ Affected issue/code: R3-3, task-runtime schema/analysis/disposition/usage, CLI s
 Validation evidence: fullRuntime71passed, CLI disposition2passed; installer matrix63passed with one obsolete future-version19 fixture, corrected to20 and exact target1passed. Actual old18 shape migrates/reopens without losing all3outcomes or decision rows; invalid basis rejected. Completed relation persists through failed retry, terminal reanalysis, blob deletion and expiration. Workspaceclippy/fmt passed. Logs /private/tmp/sctx-r3-3-*.log.
 Status: agent-selected
 Supersedes / superseded by: none.
+
+## D-016 — Fill only missing session verdicts atomically
+Unspecified question / design reference: R4-1 must cover all Tasks and coexist with checkpoint writes, failures and repeat SessionEnd calls.
+Chosen approach: one INSERT SELECT joins task_injection through task_session to the exact agent-kind/session-key identity, inserts only missing pairs and uses ON CONFLICT DO NOTHING. Every inserted row is ignored/session_close, even if a checkpoint exists but has not yet produced a verdict; no strong evidence is inferred. Existing strong writer upgrades a later equal-or-higher-priority verdict and basis. Hook reuses its existing25ms Runtime handle and ignores this advisory failure before continuing cleanup.
+Alternatives considered: only active Task (misses older Tasks); overwriting ignored rows (erases basis/time); deriving reused/refuted at session end (invented evidence).
+Rationale and assumptions: the primary key and atomic statement serialize races without read/write gaps; injection pairs are already installation-local state.
+Tradeoffs / consequences: lock contention can leave gaps, consistent with fail-open hooks; repeat SessionEnd can safely retry. No schema, lifecycle closure, permission or lease policy change. The existing expired-review cleanup remains attempted, but its advisory error is also ignored during SessionEnd: the lock test showed its pre-existing propagated error otherwise produces a visible retrieval-unavailable message, defeating the required quiet close. Other lifecycle errors retain their current behavior.
+Affected issue/code: R4-1, Runtime session-close method, CLI CleanupSessionState and host/runtime tests.
+Validation evidence: fullRuntime72passed; full CLI lifecycle10passed including both real hosts, real checkpoint→Builder strong verdict preservation, inactive Tasks, model-less Codex end and bounded quiet lock contention. Runtime concurrency8callers converges, excludes same-key other-host and same-host other-session, preserves refuted/time, permits later strong upgrades. Workspaceclippy/fmt passed after test-only fixture length annotation. Logs /private/tmp/sctx-r4-1-*.log.
+Status: agent-selected
+Supersedes / superseded by: none.

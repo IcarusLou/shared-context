@@ -3955,6 +3955,43 @@ impl TaskRuntime {
         Ok(records)
     }
 
+    /// Conservatively fills missing verdicts for every Task owned by this exact Session.
+    ///
+    /// Existing verdicts, including their evidence basis and timestamps, are never changed.
+    /// Hook callers use their short busy timeout and treat failures as advisory.
+    ///
+    /// # Errors
+    /// Returns typed identity, clock, or storage errors.
+    pub fn record_session_close_usage(&self, locator: &ExternalSessionLocator) -> Result<usize> {
+        self.record_session_close_usage_at(locator, unix_seconds(SystemTime::now())?)
+    }
+
+    /// Records conservative Session-close verdicts against an explicit clock reading.
+    ///
+    /// # Errors
+    /// Returns typed identity, timestamp, or storage errors.
+    pub fn record_session_close_usage_at(
+        &self,
+        locator: &ExternalSessionLocator,
+        now_unix_seconds: u64,
+    ) -> Result<usize> {
+        locator.validate()?;
+        let recorded_at = i64::try_from(now_unix_seconds)
+            .map_err(|_| invalid("Session close usage timestamp exceeds the supported range"))?;
+        self.open_connection()?.execute(
+            "INSERT INTO context_usage (context_id, task_id, outcome, recorded_at_unix_seconds, basis)
+             SELECT injection.context_id, injection.task_id, 'ignored', ?3, 'session_close'
+             FROM task_injection AS injection
+             JOIN task_session AS task ON task.task_id = injection.task_id
+             JOIN external_session AS session ON session.external_session_id = task.external_session_id
+             WHERE session.agent_kind = ?1 AND session.external_session_key = ?2
+               AND NOT EXISTS (SELECT 1 FROM context_usage AS usage
+                 WHERE usage.context_id = injection.context_id AND usage.task_id = injection.task_id)
+             ON CONFLICT(context_id, task_id) DO NOTHING",
+            params![locator.agent_kind, locator.external_session_id, recorded_at],
+        ).map_err(sql_error("record conservative Session close usage"))
+    }
+
     /// Records what one Task did with the Contexts injected into it.
     ///
     /// A write only ever raises a `(context, task)` pair: `ignored` never overwrites `reused` or

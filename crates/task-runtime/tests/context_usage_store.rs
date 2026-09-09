@@ -254,3 +254,130 @@ fn a_recorded_reuse_is_never_downgraded_by_a_later_omission() {
         }
     );
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn session_close_covers_all_owned_tasks_without_overwriting_strong_verdicts() {
+    let root = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(root.path()).unwrap();
+    let (first, revision) = open_task(&runtime, "close-coverage");
+    let locator = ExternalSessionLocator::new("codex", "close-coverage").unwrap();
+    let (one, two) = injected();
+    runtime
+        .record_task_injections_at(
+            first,
+            revision,
+            ContextInjectionSource::TaskContext,
+            &[one, two],
+            10,
+        )
+        .unwrap();
+    runtime
+        .record_context_usage_at(
+            &[ContextUsageRecord {
+                context_id: one.context_id,
+                task_id: first,
+                outcome: ContextUsageOutcome::Refuted,
+            }],
+            20,
+        )
+        .unwrap();
+    let second = runtime
+        .start_new_task(&locator, first, &intent("second task"), Vec::new())
+        .unwrap()
+        .snapshot;
+    runtime
+        .record_task_injections_at(
+            second.task_id,
+            second.current_intent_revision().unwrap().revision_id,
+            ContextInjectionSource::TaskContext,
+            &[one],
+            30,
+        )
+        .unwrap();
+    // Identical external key in another host and another key in this host are both excluded.
+    for other in [
+        ExternalSessionLocator::new("cursor", "close-coverage").unwrap(),
+        ExternalSessionLocator::new("codex", "other-coverage").unwrap(),
+    ] {
+        let task = runtime
+            .open_or_create(other, TaskId::new(), intent("unrelated"), Vec::new())
+            .unwrap()
+            .snapshot;
+        runtime
+            .record_task_injections_at(
+                task.task_id,
+                task.current_intent_revision().unwrap().revision_id,
+                ContextInjectionSource::TaskContext,
+                &[one],
+                30,
+            )
+            .unwrap();
+    }
+    let written: usize = std::thread::scope(|scope| {
+        let handles = (0..8)
+            .map(|_| scope.spawn(|| runtime.record_session_close_usage_at(&locator, 40).unwrap()))
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .sum()
+    });
+    assert_eq!(written, 2);
+    assert_eq!(
+        runtime.record_session_close_usage_at(&locator, 50).unwrap(),
+        0
+    );
+    let connection = rusqlite::Connection::open(runtime.database_path()).unwrap();
+    let read = |task: TaskId, context: ContextId| {
+        connection.query_row("SELECT outcome, basis, recorded_at_unix_seconds FROM context_usage WHERE task_id = ?1 AND context_id = ?2",
+            [task.to_string(), context.to_string()], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))).unwrap()
+    };
+    assert_eq!(
+        read(first, one.context_id),
+        ("refuted".into(), "checkpoint_derived".into(), 20)
+    );
+    assert_eq!(
+        read(first, two.context_id),
+        ("ignored".into(), "session_close".into(), 40)
+    );
+    assert_eq!(
+        read(second.task_id, one.context_id),
+        ("ignored".into(), "session_close".into(), 40)
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM context_usage", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    runtime
+        .record_context_usage_at(
+            &[ContextUsageRecord {
+                context_id: two.context_id,
+                task_id: first,
+                outcome: ContextUsageOutcome::Ignored,
+            }],
+            60,
+        )
+        .unwrap();
+    assert_eq!(
+        read(first, two.context_id),
+        ("ignored".into(), "checkpoint_derived".into(), 60)
+    );
+    runtime
+        .record_context_usage_at(
+            &[ContextUsageRecord {
+                context_id: one.context_id,
+                task_id: second.task_id,
+                outcome: ContextUsageOutcome::Reused,
+            }],
+            60,
+        )
+        .unwrap();
+    assert_eq!(
+        read(second.task_id, one.context_id),
+        ("reused".into(), "checkpoint_derived".into(), 60)
+    );
+}

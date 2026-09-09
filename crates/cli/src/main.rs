@@ -2391,8 +2391,9 @@ fn resolve_task_operation(
         TaskRuntimeOperation::CleanupSessionState { locator } => {
             let root = installation_root()?;
             let runtime = TaskRuntime::initialize_for_hook(&root)?;
+            let _usage = runtime.record_session_close_usage(&locator);
             let _active = runtime.read_snapshot_by_locator(&locator)?;
-            let _reviews = runtime.cleanup_expired_candidate_reviews()?;
+            let _reviews = runtime.cleanup_expired_candidate_reviews();
             Ok(ResolvedTaskOperation::default())
         }
     }
