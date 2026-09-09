@@ -625,12 +625,7 @@ fn one_real_hook_to_confirm_identity_chain() {
         .unwrap()
         .to_owned();
     let repeated_stop = run_hook(&home, &turn_stop_payload);
-    assert!(
-        !repeated_stop["systemMessage"]
-            .as_str()
-            .unwrap()
-            .contains(&oracle.raw_stop_marker)
-    );
+    assert_eq!(repeated_stop, json!({}));
     let repeated_list = mcp_tool(&home, &oracle.session, "candidate_list", &owner);
     assert_eq!(repeated_list["reviews"].as_array().unwrap().len(), 1);
     assert_eq!(repeated_list["reviews"][0]["candidate_id"], candidate_id);
