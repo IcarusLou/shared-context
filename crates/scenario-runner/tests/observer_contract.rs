@@ -279,6 +279,8 @@ fn git_observer_reads_only_committed_head_tree_and_path_counts() {
 
 fn git(repository: &Path, arguments: &[&str]) {
     let status = Command::new("/usr/bin/git")
+        // Finish fixture maintenance before a strict no-write fingerprint starts.
+        .args(["-c", "maintenance.autoDetach=false"])
         .arg("-C")
         .arg(repository)
         .args(arguments)

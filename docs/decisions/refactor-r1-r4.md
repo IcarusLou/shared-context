@@ -209,3 +209,14 @@ Affected issue/code: R4-2b, new Runtime recall_stats module, CLI command/help/co
 Validation evidence: fullRuntime75passed; snapshot3passed again after the bounded hash-buffer lint correction, including a committed verdict present in live WAL, exact source DB/WAL/SHM byte preservation, closed-WAL no-sidecar creation, missing Runtime and unchanged old schema/journal rejection. ActualCLI readonly contracts2passed and help1passed; workspaceclippy/fmt passed. Fixture corrections ensured the new verdict actually lived in WAL and bypassed only the unrelated old harness assertion requiring an index envelope. Logs /private/tmp/sctx-r4-2b-*.log.
 Status: agent-selected
 Supersedes / superseded by: none.
+
+## D-019 — Wait for fixture Git maintenance before fingerprinting
+Unspecified question / design reference: M3/M4 whole-workspace gates each exposed a generic read failure before the unchanged observer runs; earlier isolated passes did not establish a cause.
+Chosen approach: only the observer test fixture's Git helper sets maintenance.autoDetach=false. Git finishes its maintenance before returning to the strict filesystem fingerprint. No observer filtering, retry, latency threshold or production Git config change.
+Alternatives considered: ignore maintenance.lock (weakens no-write proof); sleep/retry fingerprint (masks asynchronous fixture mutation); disable global maintenance (outside test ownership).
+Rationale and assumptions: private exact Rust reproduction recorded6/80failures at stat of .git/objects/maintenance.lock; Git trace confirms commit launches detached maintenance and returns before child completion. Local git help --config confirms the option. This is fixture quiescence, not a deferred product latency repair.
+Tradeoffs / consequences: fixture commits synchronously finish negligible automatic-maintenance work. M3's earlier transient diagnosis is now superseded by this concrete cause.
+Affected issue/code: M4-F1 (#260), scenario-runner/tests/observer_contract.rs helper only.
+Validation evidence: the same private Rust diagnostic changes6/80failures to0/80 with this option; full scenario-runner all-features tests passed, workspacefmt/clippy passed. Production observer byte-identical. Diagnostics /private/tmp/sctx-m4-fingerprint-{diagnostic,fixed}.log, sctx-m4-git-trace.json, sctx-m4-f1-tests.log.
+Status: agent-selected
+Supersedes / superseded by: M3 fingerprint failure explanation refined; no production decision superseded.
