@@ -177,19 +177,55 @@ fn schema_version_13_chains_forward_in_place_and_keeps_existing_rows() {
     assert_eq!(review_version, 1);
     assert_eq!(submission_id, "submission-schema-migration-fixture");
 
-    // Recording a Hook diagnostic now works against the migrated schema.
-    let record = sctx_task_runtime::HookEventRecord {
-        recorded_at_unix_ms: 1,
-        agent_kind: "codex".to_owned(),
-        external_session_id: Some("schema-migration-session".to_owned()),
-        event_kind: "session_start".to_owned(),
-        decision: sctx_task_runtime::HookEventDecision::Enabled,
-        reason: "ok".to_owned(),
-        duration_ms: 0,
-        detail: None,
-    };
-    runtime.record_hook_event(&record).unwrap();
-    assert_eq!(runtime.recent_hook_events(10).unwrap().len(), 1);
+    // Legacy schema compatibility remains after the new Runtime retires its diagnostic APIs.
+    // Prove the table still accepts all original columns and reopening preserves the exact row.
+    connection
+        .execute(
+            "INSERT INTO hook_event (
+                recorded_at_unix_ms, agent_kind, external_session_id, event_kind,
+                decision, reason, duration_ms, detail
+             ) VALUES (1, 'codex', 'schema-migration-session', 'session_start',
+                       'enabled', 'ok', 3, 'legacy diagnostic')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let reopened = TaskRuntime::initialize(&root).unwrap();
+    let connection = Connection::open(reopened.database_path()).unwrap();
+    let rows: Vec<serde_json::Value> = connection
+        .prepare(
+            "SELECT recorded_at_unix_ms, agent_kind, external_session_id, event_kind,
+                    decision, reason, duration_ms, detail FROM hook_event ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok(serde_json::json!({
+                "recorded_at_unix_ms": row.get::<_, i64>(0)?,
+                "agent_kind": row.get::<_, String>(1)?,
+                "external_session_id": row.get::<_, String>(2)?,
+                "event_kind": row.get::<_, String>(3)?,
+                "decision": row.get::<_, String>(4)?,
+                "reason": row.get::<_, String>(5)?,
+                "duration_ms": row.get::<_, i64>(6)?,
+                "detail": row.get::<_, String>(7)?,
+            }))
+        })
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        [serde_json::json!({
+            "recorded_at_unix_ms": 1,
+            "agent_kind": "codex",
+            "external_session_id": "schema-migration-session",
+            "event_kind": "session_start",
+            "decision": "enabled",
+            "reason": "ok",
+            "duration_ms": 3,
+            "detail": "legacy diagnostic",
+        })]
+    );
 }
 
 /// Version 14 -> 15 clears every recorded injection outcome and nothing else.

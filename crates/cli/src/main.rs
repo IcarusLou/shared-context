@@ -1387,10 +1387,8 @@ impl HookEventRecorder {
 
     /// Names what this Hook actually did, for the one Enabled completion row it will write.
     ///
-    /// A normal Enabled Hook writes exactly one `hook_event` row, and that budget is the point:
-    /// several Hook processes flush concurrently, so an extra insert per event lands directly on
-    /// the contended part of the hot path. Ordinary outcomes therefore *replace* the `ok` reason
-    /// rather than adding a row; only genuine faults flush one of their own.
+    /// A normal Enabled Hook emits one completion telemetry event. Ordinary outcomes replace
+    /// its `ok` reason rather than emitting an extra event; faults can flush their own event.
     fn note_completion(&self, reason: &'static str, detail: Option<String>) {
         *self.completion.borrow_mut() = Some((reason, detail));
     }
@@ -1496,12 +1494,13 @@ const fn hook_event_kind_str(kind: CanonicalAgentEventKind) -> &'static str {
     }
 }
 
-/// Truncates a safe (non-prompt, non-tool-output) diagnostic string to the
-/// `hook_event.detail` column's character ceiling.
+/// Character bound for the existing local Hook diagnostic detail plumbing. The telemetry
+/// recorder omits detail from its wire payload.
+const MAX_HOOK_DETAIL_CHARS: usize = 256;
+
+/// Truncates a safe (non-prompt, non-tool-output) local diagnostic string by Unicode characters.
 fn truncate_hook_detail(text: &str) -> String {
-    text.chars()
-        .take(sctx_task_runtime::MAX_HOOK_EVENT_DETAIL_CHARS)
-        .collect()
+    text.chars().take(MAX_HOOK_DETAIL_CHARS).collect()
 }
 
 /// Decodes one vendor payload, or fails open with closed adapter diagnostics.
@@ -1652,7 +1651,7 @@ fn run_hook(args: &[String]) -> Result<()> {
 ///
 /// The cost on the Hook hot path is fixed and tiny by construction: one read of a single-line file
 /// and one `spawn`. No database is opened, no lock is taken, and nothing is waited for. Every
-/// failure is silence except one `hook_event` row, because a Session's start is not the place to
+/// failure is silence except one Hook telemetry event, because a Session's start is not the place to
 /// report that a background chore could not begin.
 ///
 /// The child is put in its own process group so that closing the editor -- which signals the
@@ -2737,7 +2736,7 @@ fn file_signal_retention() -> Vec<SignalRetentionRule> {
 ///   a secret cannot survive by sitting past the character ceiling; a Prompt too large for the
 ///   scanner is dropped rather than stored unscanned.
 /// * It is invisible to the model. Both vendors encode `PromptSubmit` as an empty object, and a
-///   failure here must not change that, so every fault is recorded to `hook_event` and swallowed
+///   failure here must not change that, so every fault is sent to Hook telemetry and swallowed
 ///   instead of becoming a `systemMessage`.
 fn record_prompt_signal(
     locator: &ExternalSessionLocator,
