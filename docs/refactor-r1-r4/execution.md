@@ -4,8 +4,8 @@ Authority: [approved plan](approved-plan.md). Decisions: [decision log](../decis
 
 | Milestone | Outcome / invariant | Dependencies / forbidden early work | Issues in order | Status |
 |---|---|---|---|---|
-| M1 | SessionEnd cleanup works; relevance rank survives; DF>0 tokens survive budget | None; no M2–M4 implementation | R1-1, R1-2, R1-3 | backlog |
-| M2 | Remove only approved dead surfaces, quiet duplicate closure, preserve recovery and compatibility | M1 accepted + real-session smoke; no M3–M4 | R2-1, R2-2 (split by independent outcome), R2-3, R2-4, R2-5, R2-6 | backlog |
+| M1 | SessionEnd cleanup works; relevance rank survives; DF>0 tokens survive budget | None; no M2–M4 implementation | R1-1, R1-2, R1-3 | doing |
+| M2 | Remove only approved dead surfaces, quiet duplicate closure, preserve recovery and compatibility | M1 accepted + real-session smoke; no M3–M4 | R2-1, R2-2a → R2-2b → R2-2c → R2-2d (parent R2-2), R2-3, R2-4, R2-5, R2-6 | backlog |
 | M3 | Triage single source, evidence semantics, additive audit migration | M2 accepted; no M4 writers before migration acceptance | R3-1, R3-2, R3-3 | backlog |
 | M4 | All injections judged with evidence basis; prior off; truthful stats | M3 accepted + real-session smoke; no B-layer changes | R4-1, R4-2, observation report | backlog |
 
@@ -15,4 +15,15 @@ M4 observation is required unfinished work until normal use reaches ≥2 weeks o
 
 ## Reviews and evidence
 
-Pending.
+Baseline: `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` passed on 2026-09-09. Clippy log: `/private/tmp/sctx-refactor-baseline-clippy.log`. R2-2 is tracked as four independent atomic outcomes (Mew #249–252); this is issue decomposition, not expanded scope. Implementation reviews pending.
+
+
+### R1-1 — accepted atomic issue
+Commit reviewed: `f539f9c20d78b5ee5c23d43e14854de0658286b4` (Mew #235).
+Scope verified: six files, optional model decoding plus append-only fixture/tests and #34 documentation; no profile bump, unrelated diagnostics unchanged. Checked both shape validator and typed event match, supplied-empty/wrong-type boundaries and all five strict events; existing fixture indices unchanged.
+Direct tests independently re-run: adapter payload_contract 25 passed; CLI hook_fail_open::codex_model_less_session_end_reaches_cleanup_and_success_telemetry 1 passed (11 filtered). Executor additionally ran full hook_fail_open 12 + hook_session_activation 14.
+Decision log: D-002 consistent with code and approved KD3; null handling explicitly recorded.
+ROI-1: none. ROI-2: none. ROI-3: none.
+Unproven requirements: full M1 workspace/affected-crate gates and cross-milestone real-host smoke remain pending; not claimed by atomic acceptance.
+Worktree/tracker: staged index empty after executor commit; only main-owned execution/issue decomposition documents pending. Mew #235 done after main verification, #236 doing.
+Human gate required: no. Next action: automatically advance to R1-2.
