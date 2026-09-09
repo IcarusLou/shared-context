@@ -490,6 +490,7 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
         "embedding install|status|remove",
         "space create|intent revise|list|get",
         "candidate list|get|discard|confirm|stats|build-closed-episode|analyze",
+        "recall stats",
         "context withdraw --decision-source human|agent_policy",
         "context revise|review|publish|withdraw|get",
         "semantic conflict open|resolve",
@@ -3694,4 +3695,79 @@ fn provisional_space_state_agrees_across_domain_index_mcp_and_cli() {
     assert_eq!(listed_provisional_flags(&mcp["spaces"]), expected);
     assert_eq!(mcp["conflicts"], 1);
     assert_eq!(mcp["indexed_tree_oid"], snapshot.metadata.indexed_tree_oid);
+}
+
+#[test]
+fn recall_stats_has_a_runtime_only_envelope_and_never_initializes_missing_state() {
+    let harness = Harness::new();
+    let root = harness.home.join(".shared-context");
+    let output = harness.run(&["recall", "stats"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response.as_object().unwrap().len(), 2);
+    assert_eq!(response["command"], "recall.stats");
+    assert_eq!(response["data"]["runtime_available"], false);
+    assert_eq!(response["data"]["totals"]["injections"], 0);
+    assert!(response["data"]["totals"]["coverage_percent"].is_null());
+    assert!(!root.exists());
+    assert!(
+        !harness
+            .run(&["recall", "stats", "--write"])
+            .status
+            .success()
+    );
+    assert!(!root.exists());
+}
+
+#[test]
+fn recall_stats_reads_existing_runtime_without_index_or_sidecar_writes() {
+    let harness = Harness::new();
+    let root = harness.home.join(".shared-context");
+    let runtime = TaskRuntime::initialize(&root).unwrap();
+    let locator = ExternalSessionLocator::new("codex", "readonly-recall").unwrap();
+    let task = runtime
+        .open_or_create(
+            locator.clone(),
+            sctx_domain::TaskId::new(),
+            serde_json::from_value(serde_json::json!({"goal": "recall metric fixture"})).unwrap(),
+            Vec::new(),
+        )
+        .unwrap()
+        .snapshot;
+    runtime
+        .record_task_injections_at(
+            task.task_id,
+            task.current_intent_revision().unwrap().revision_id,
+            sctx_task_runtime::ContextInjectionSource::TaskContext,
+            &[sctx_task_runtime::InjectedContext {
+                context_id: sctx_domain::ContextId::new(),
+                revision_id: sctx_domain::RevisionId::new(),
+            }],
+            10,
+        )
+        .unwrap();
+    runtime.record_session_close_usage_at(&locator, 20).unwrap();
+    let before = fs::read(runtime.database_path()).unwrap();
+    let output = harness.run(&["recall", "stats"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["data"]["totals"]["injections"], 1);
+    assert_eq!(response["data"]["totals"]["coverage_percent"], 100.0);
+    assert_eq!(
+        response["data"]["totals"]["outcomes"]["session_close"]["ignored"],
+        1
+    );
+    assert_eq!(response["data"]["totals"]["strong_samples"], 0);
+    assert!(response["data"]["totals"]["strong_reuse_rate_percent"].is_null());
+    assert_eq!(fs::read(runtime.database_path()).unwrap(), before);
+    assert_eq!(fs::read_dir(root.join("state")).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
 }

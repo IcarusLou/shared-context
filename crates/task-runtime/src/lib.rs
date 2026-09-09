@@ -29,6 +29,7 @@ use sctx_domain::{
 };
 use sha2::{Digest, Sha256};
 
+pub mod recall_stats;
 pub mod reference_derivation;
 
 pub use reference_derivation::{

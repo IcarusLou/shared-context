@@ -1073,3 +1073,12 @@ cargo test -p sctx-installer --test installer_matrix \
 - 开发约定：[`../DEVELOPMENT.md`](../DEVELOPMENT.md)
 - npm 打包和离线安装：[`../npm/README.md`](../npm/README.md)
 - 事件 Schema：[`../schemas/README.md`](../schemas/README.md)
+
+
+### 本机召回与处置统计
+
+运行 `sctx --json recall stats` 查看本机注入总数、判决覆盖率、按 Task/Session 汇总及 `outcomes` 中按 `checkpoint_derived` / `session_close` 分开的 reused、ignored、refuted 数。注入数按唯一 `(Task, Context)` 计数，重复投递不累加；未注入 Context 的判决不进入覆盖率分母或强证据 reuse 率。
+
+`session_close.ignored` 表示会话结束时缺少 checkpoint 判决的“弱证据未采用”，只供覆盖率与趋势观察；`strong_samples` 和 `strong_reuse_rate_percent` 只使用 `checkpoint_derived`。没有注入或没有强证据时，相应百分比为 `null`。命令从临时一致性副本读取，不初始化、迁移 Runtime，也不重建 Index；未安装时 `runtime_available=false`，旧 schema 会明确要求升级。
+
+`usage prior` 当前关闭：计数可见但不影响排序，重新讨论需覆盖率 ≥60% 且强证据样本 ≥100，并另行 review。`sctx --json candidate stats` 的 `relation_decisions` 按 relation 和 decision_source 汇总确认/弃置，保留已过期的弃置审计；历史未知 relation 为 `null`。原有 human/agent_policy 总数仍是当前处置状态计数，因此过期后可能小于新审计分组总数。

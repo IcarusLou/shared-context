@@ -86,6 +86,7 @@ Commands:
   logs init|collect|sync|status|prune|doctor|enable|disable|report|trace
   embedding install|status|remove
   space create|intent revise|list|get
+  recall stats
   candidate list|get|discard|confirm|stats|build-closed-episode|analyze
   context revise|review|publish|withdraw|get
   context withdraw --decision-source human|agent_policy [--external-session <ID>] [--dry-run]
@@ -236,6 +237,7 @@ fn cli_operation(args: &[String]) -> Option<&'static str> {
         ("candidate", Some("discard")) => Some("candidate.discard"),
         ("candidate", Some("confirm")) => Some("candidate.confirm"),
         ("candidate", Some("stats")) => Some("candidate.stats"),
+        ("recall", Some("stats")) => Some("recall.stats"),
         ("candidate", Some("build-closed-episode")) => Some("candidate.build_closed_episode"),
         ("candidate", Some("analyze")) => Some("candidate.analyze"),
         ("context", Some("revise")) => Some("context.revise"),
@@ -338,6 +340,7 @@ fn run_without_maintenance(args: &[String], json_output: bool) -> Result<()> {
         [group, rest @ ..] if group == "logs" => logs::run(rest, json_output),
         [group, rest @ ..] if group == "space" => run_space(rest, json_output),
         [group, rest @ ..] if group == "candidate" => run_candidate(rest, json_output),
+        [group, rest @ ..] if group == "recall" => run_recall(rest, json_output),
         [group, rest @ ..] if group == "context" => run_context(rest, json_output),
         [group, rest @ ..] if group == "semantic" => run_semantic(rest, json_output),
         [group, rest @ ..] if group == "task" => run_task(rest, json_output),
@@ -3666,6 +3669,30 @@ fn locate_withdrawable(
             previous_publication_ids: context.publication_heads.iter().copied().collect(),
         })
     })
+}
+
+fn run_recall(args: &[String], json_output: bool) -> Result<()> {
+    if is_help(args) {
+        println!("Usage: sctx recall stats");
+        return Ok(());
+    }
+    let [command, rest @ ..] = args else {
+        return Err(invalid("Usage: sctx recall stats"));
+    };
+    if command != "stats" {
+        return Err(invalid("Usage: sctx recall stats"));
+    }
+    if is_help(rest) {
+        println!("Usage: sctx recall stats");
+        return Ok(());
+    }
+    let options = Options::parse(rest, &[])?;
+    options.allow_only(&[], &[])?;
+    let stats = sctx_task_runtime::recall_stats::read_recall_stats(installation_root()?)?;
+    emit_lifecycle(
+        &json!({"command": "recall.stats", "data": stats}),
+        json_output,
+    )
 }
 
 /// Reports this installation's own disposition totals, grouped by who decided them.

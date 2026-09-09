@@ -1201,6 +1201,7 @@ version = "0.2.0-dev.8"
 dependencies = [
  "rusqlite",
  "sctx-domain",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
