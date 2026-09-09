@@ -67,3 +67,33 @@ On 2026-09-09 the main agent independently ran both existing positive tests:
 - `cargo test --locked -p sctx-task-runtime --test work_episode_store checkpoint_is_atomic_semantically_idempotent_and_closes_without_hook_observations -- --exact`: 1 passed, 13 filtered.
 
 These prove the nonempty Claim fixtures are currently accepted and persisted/retried, rather than merely hypothetical malformed fixtures. No R2-1 production changes have been made. H-001 remains pending user disposition.
+
+## Disposition (2026-09-09, reviewed and ruled — H-001 closed)
+
+**Ruling: the recommended bounded rescope (`LegacyClaimFields` compatibility carrier) is REJECTED. The smaller "empty-only tombstone adapter" — which this document said "is unacceptable without fresh authorization" — is APPROVED, and that authorization is granted here.**
+
+### The decisive fact the recommendation weighed wrong
+
+The assessment above is factually correct that the *contract* admits nonempty values. But the gate question is whether valid nonempty **history** exists, and it does not: measured across all 16 checkpoints in the real installation (`~/.shared-context/state/runtime.sqlite`), the combined element count of `assumptions` + `recheck_when` + `artifact_refs` + `related_contexts` + `relations` over every persisted Claim is **zero**. Nonempty values exist only in test fixtures. The public MCP `inputSchema` has never accepted these five fields (ADR-0003), `write_agent_checkpoint` has no production caller, and this document's own evidence (line on `materialize_direct_checkpoint_claim`) concedes production has only ever written five empty vectors. A compatibility carrier, legacy-only accessors, and preserved Builder/analyzer behavior for nonempty historical Claims would protect data that provably does not exist in any real installation — which is exactly the chain audit's bloat pattern ① ("build runtime machinery for a hypothetical need") reconstructed inside the very work item whose purpose is to delete an instance of it.
+
+### Approved — do exactly this
+
+1. **Empty-required wire DTO.** A private wire DTO reads the five legacy keys and **requires them empty; a nonempty value is a loud typed error**, never a silent discard. This honors the red line above ("do not silently reject or discard"); on real data the error path is unreachable.
+2. **Tombstone writes.** New writes keep serializing the five empty-key literals in `checkpoint_json` and the fat `checkpoint_semantic_json`. This is what the "Low-level retry proof" section actually requires: old-binary rollback still parses, `derive_episode_claim_references`'s full-JSON rewrite stays byte-stable, and low-level retry string equality holds in both directions.
+3. **Field deletion in the active types.** `CheckpointClaim` / `CheckpointClaimDraft` lose the five fields; `build_claim_material` supplies empty `Vec`s (byte-identical to what the direct path produces today); the explicit Search channel stays wired and structurally empty (keep-list honored — the channel is not removed, it simply has no producers, matching its 0-hit reality).
+4. **Fixture rewrite is authorized.** The nonempty fixtures (`episode.rs:2128`, `work_episode_store.rs:78`, `episode_lifecycle_hooks.rs:200`) are rewritten to the empty form as part of this change. This is the inherent consequence of deleting an authoring surface, explicitly authorized here — not a silent redefinition of valid data as invalid.
+5. **Untouched:** `direct_checkpoint_semantic_json`, operation hashing, `ContextRevision`/`ContextRevisionDraft`, `schemas/event-v1.schema.json`. All 16 real semantic rows are direct-shaped and unaffected.
+
+### Rejected — do not do, and why
+
+- **`LegacyClaimFields` carrier + legacy-only accessors + nonempty-history Builder/analyzer behavior**: protects nonexistent data at the cost of retaining most of what R2-1 exists to remove (the tradeoff the recommendation itself named). Rejected on the project rule that generation-side cost must buy real value.
+- **Deferring R2-1** (the listed alternative): unnecessary once the empty-only variant is authorized.
+- **Unchanged prohibitions from the R2-1 charter**: no event-schema or `ContextRevision` changes, no schema/data migration, no unknown-key acceptance or `Value` catch-all, no removal of the explicit Search channel wiring.
+
+### Acceptance (replaces the earlier list's nonempty-survival item)
+
+- Literal old empty-key checkpoint fixture: runtime history read, same direct retry receipt, derivation rewrite, and Candidate Build all pass.
+- A nonempty legacy input fails with the loud typed error (test pinned).
+- New Claim serialization decodes under a frozen old wire type that requires the five vectors (as empty).
+- Old-style retry semantic bytes remain equal after a new low-level write; unknown keys remain rejected.
+- Direct operation semantic JSON/hash byte-identical; no schema/event/ContextRevision diffs in the change.
