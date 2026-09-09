@@ -140,3 +140,15 @@ Affected issue and code: R2-5; domain helper/export, four predicate sites, domai
 Validation evidence: full domain/index/MCP suites193passed/0failed/0ignored; main completed full cli_contract+lifecycle43passed/0failed after executor quota interruption. Shared domain/index/MCP/CLI fixture and domain edge-case tests each passed; workspace all-target/all-feature clippy and formatting passed. Logs /private/tmp/sctx-r2-5-{full-tests,cli-final,clippy-final,cross-surface,domain-targeted}.log. Index resolver changes only its boolean predicate call; Space Intent model/event schema/index version/maintenance untouched (sctx-r2-5-invariance.json).
 Status: agent-selected
 Supersedes / superseded by: none.
+
+
+## D-013 — Share complete triage prose inside the existing description budget
+Unspecified question / design reference: R3-1/KD4 requires both consumers to share complete policy, preserving workflow authority and all other tool descriptions, under8180bytes total.
+Chosen approach: one private triage constant includes all3 existing tiers plus counter-intuitive findings and user corrections that later proved right. Candidate-list operational prefix is shortened while retaining status/detail parameter names, source/ACK semantics and draft-read options; ACK has a short prefix and the identical policy body.
+Alternatives considered: edit other tool descriptions or frozen decision_source text (forbidden); replace policy with a pointer (forbidden).
+Rationale and assumptions: only candidate_list has the approved room for wording compression. Shared body prevents future criteria drift without taking definition authority from workflow§7.
+Tradeoffs / consequences: candidate_list wording becomes more compact; no tool input schema or permission change. Workflow authority sentence is explicitly tested.
+Affected issue/code: R3-1, MCP descriptions/ACK and contract tests.
+Validation evidence: shared-policy equality/criteria unit1passed; workflow authority contract1passed; budget/frozen input schema2passed; fullMCP93passed/0failed/0ignored. Requested golden regeneration produced no diff. Actual public tools/list measures7977→8172 totalbytes, candidate_list1318bytes, other16descriptions identical (/private/tmp/sctx-r3-1-byte-evidence.json). Scopedclippy andfmt passed after an in-scope format-argument lint correction and the equality unit was rerun.
+Status: agent-selected
+Supersedes / superseded by: none.

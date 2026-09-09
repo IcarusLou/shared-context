@@ -8044,7 +8044,7 @@ fn tools_list() -> Value {
         ),
         tool_schema(
             "candidate_list",
-            "List untrusted automatic Candidate Reviews for the exact ActiveTask; Pending is the default lifecycle filter. detail_level defaults to compact, which returns one triage row per Candidate; pass full for the whole untrusted drafts, or read one with candidate_get. Candidates come only from task_checkpoint, so calling this before a Checkpoint ACK has nothing to recover and is necessarily empty, not a failure. Triage every row by top_assessment.relation: discard, with decision_source agent_policy, an exact_duplicate of a still-accepted Context and any row that only restates process-level reading of code; confirm the same way a novel or supports row that is a genuine decision, contract, verified conclusion, or newly understood mechanism; escalate everything else, including potential_contradiction, revises, a duplicate needing a supersede decision, Space governance, and anything you are unsure of, to the user as a table carrying your recommendation.",
+            &format!("List untrusted Reviews for the exact ActiveTask; status=pending and detail_level=compact are defaults. Use full or candidate_get for drafts. Candidates come only from task_checkpoint; before its ACK an empty list is normal. {CANDIDATE_TRIAGE_POLICY}"),
             candidate_list_schema()
         ),
         tool_schema(
@@ -8923,6 +8923,8 @@ fn tool_success_with_notice(
     }))
 }
 
+const CANDIDATE_TRIAGE_POLICY: &str = "Triage each Pending Review by top_assessment.relation. Discard with candidate_discard, decision_source agent_policy, and a reason naming the ground: an exact_duplicate of a still-accepted Context adding no applicability condition or Evidence, or process-level code reading. Confirm with candidate_confirm, decision_source agent_policy, and no edits: ready_for_review novel or supports rows carrying a genuine decision, contract, verified conclusion, counter-intuitive finding, newly understood mechanism, or a user correction to your proposal that later proved right. On auto_confirm_not_permitted, escalate; do not change fields and retry. Escalate everything else: potential_contradiction, revises, duplicates needing a supersede decision, Space governance, incomplete analysis, and uncertainty. Present only these to the user in a compact table (topic, statement, relation) with your recommendation; do not wait to be asked.";
+
 /// Post-Checkpoint guidance appended to the ACK text whenever the Checkpoint was accepted (and
 /// therefore always queued a Candidate Build; ADR-0003).
 ///
@@ -8937,22 +8939,9 @@ fn tool_success_with_notice(
 /// [`require_auto_confirm_permitted`] checks rather than discovering it through a refusal.
 fn task_checkpoint_ack_notice(data: &Value) -> Option<String> {
     data.get("candidate_build")?;
-    Some(
-        "This Checkpoint was accepted and queued a Candidate Build. Call candidate_list next \
-         and dispose every Pending Review yourself under the triage policy, rather than handing \
-         the whole list to the user. Discard the rows that only restate an accepted Context or \
-         your own process-level reading of code, with candidate_discard, decision_source \
-         \"agent_policy\", and a reason naming the ground. Confirm the ready_for_review rows \
-         whose top relation is novel or supports and that carry a genuine decision, contract, \
-         verified conclusion, or newly understood mechanism, with candidate_confirm, \
-         decision_source \"agent_policy\", and no edits; if the server refuses one as \
-         auto_confirm_not_permitted, move it to the user instead of retrying. Present only what \
-         is left — contradictions, revisions, duplicates needing a supersede decision, and \
-         anything you are unsure of — to the user as a compact table (topic, statement, \
-         relation) carrying your own recommendation, and do not wait for the user to bring it \
-         up."
-        .to_owned(),
-    )
+    Some(format!(
+        "This Checkpoint was accepted and queued a Candidate Build. Call candidate_list next. {CANDIDATE_TRIAGE_POLICY}"
+    ))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -9455,6 +9444,47 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_description_and_ack_share_all_three_triage_tiers() {
+        let surface = tools_list();
+        let description = surface["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "candidate_list")
+            .unwrap()["description"]
+            .as_str()
+            .unwrap();
+        let notice = task_checkpoint_ack_notice(&json!({"candidate_build": {}})).unwrap();
+        let description_policy = description
+            .split_once("Triage each Pending Review")
+            .unwrap()
+            .1
+            .split_once(" external_session_id:")
+            .unwrap()
+            .0;
+        let notice_policy = notice.split_once("Triage each Pending Review").unwrap().1;
+        assert_eq!(description_policy, notice_policy);
+        assert_eq!(
+            format!("Triage each Pending Review{notice_policy}"),
+            CANDIDATE_TRIAGE_POLICY
+        );
+        for criterion in [
+            "counter-intuitive finding",
+            "user correction to your proposal that later proved right",
+            "novel or supports",
+            "potential_contradiction",
+            "decision_source agent_policy",
+            "Space governance",
+        ] {
+            assert!(
+                description_policy.contains(criterion),
+                "missing {criterion}"
+            );
+        }
+        assert!(task_checkpoint_ack_notice(&json!({"status": "no_op"})).is_none());
+    }
 
     #[test]
     fn language_hint_only_flags_statements_without_any_chinese() {

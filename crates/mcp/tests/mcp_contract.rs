@@ -6981,6 +6981,9 @@ fn assert_skill_bundle_contract(gate: &str, workflow: &str, metadata: &str) {
     assert!(workflow.contains("printenv CODEX_SESSION_ID"));
     assert!(workflow.contains("<copy from the shared-context-active marker>"));
     assert!(workflow.contains("This knowledge base is written in Chinese"));
+    assert!(
+        workflow.contains("This section is the one place the three disposition tiers are defined")
+    );
     assert!(metadata.contains("default_prompt: \"Use $shared-context"));
     assert!(metadata.contains("allow_implicit_invocation: true"));
     assert!(!metadata.contains("task_intent_update"));
