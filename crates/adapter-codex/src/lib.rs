@@ -5,9 +5,9 @@
 //! unconfirmed state is reported as `ACTION REQUIRED` and disables all Hook capabilities while
 //! MCP + CLI remain usable.
 //!
-//! SessionEnd follows the live #34 fingerprint: `model` may be absent and `reason` is any
+//! `SessionEnd` follows the live #34 fingerprint: `model` may be absent and `reason` is any
 //! nonempty string. The other five supported events still require a nonempty `model`; policy
-//! enums such as SessionStart source and PreCompact trigger remain closed.
+//! enums such as `SessionStart` source and `PreCompact` trigger remain closed.
 //!
 //! The documented payload carries exactly one identity field, `session_id`, and Codex reports the
 //! same `session_id` to a thread spawned from a parent conversation. The spawned thread's own
@@ -273,7 +273,7 @@ struct SessionEndInput {
 /// # Errors
 ///
 /// Rejects malformed JSON, unsupported Hook names, wrong field types, empty required identity
-/// fields, and undocumented enum values used by policy. SessionEnd accepts a missing/null model
+/// fields, and undocumented enum values used by policy. `SessionEnd` accepts a missing/null model
 /// and any nonempty reason, matching the live #34 fingerprint; a supplied model must be nonempty.
 pub fn decode_hook_input(bytes: &[u8]) -> Result<CanonicalAgentEvent> {
     decode_hook_input_with_diagnostic(bytes).map_err(HookDecodeFailure::into_error)

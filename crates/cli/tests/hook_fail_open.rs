@@ -642,7 +642,7 @@ fn cursor_desktop_3_17_payload_shapes_decode_and_stay_neutral_when_disabled() {
     assert_neutral(&harness.hook("cursor", &end), &harness.root(), secret);
 }
 
-/// #34's real five-key SessionEnd shape must reach cleanup, not merely emit the same neutral
+/// #34's real five-key `SessionEnd` shape must reach cleanup, not merely emit the same neutral
 /// stdout as a decode failure. Prove the runtime effect and the collector event together.
 #[test]
 fn codex_model_less_session_end_reaches_cleanup_and_success_telemetry() {
