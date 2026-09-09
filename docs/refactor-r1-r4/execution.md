@@ -38,3 +38,17 @@ ROI-1: none. ROI-2: none. ROI-3: none.
 Unproven requirements: R1-3 and full M1 gates/smoke remain pending.
 Worktree/tracker: only main-owned issue decomposition and replay evidence pending before this review record; #236 done after independent verification; #237 doing.
 Human gate required: no. Next action: automatically advance to R1-3.
+
+
+### Human gate H-001 — R2-1 persisted compatibility (pending)
+
+Status: all implementation/delegation paused; existing read-only R1-3 probe process may finish. R1-1 and R1-2 remain accepted commits. R1-3 has an uncommitted three-file implementation (search/lib.rs, task_association.rs, D-004), full search133 passed/8 ignored and three ordinary probe repetitions20/22 each; semantic repetitions/replay/final audit pending. No M2 implementation began.
+
+ROI-1: literal five-field deletion rejects existing checkpoint_json under deny_unknown_fields; empty-only compatibility would discard/reject valid nonempty positive fixtures that production Builder/analyzer consume. Removing low-level semantic JSON keys also changes exact retry equality and old-binary rollback behavior. Evidence and concrete alternatives: [H-001 review and proposed rescope](r2-1-compatibility-gate.md).
+
+Recommended decision: approve R2-1 as new-authoring field retirement plus a strict private legacy compatibility carrier, preserving historical values/Builder behavior, serialized empty keys for new Claims, and low-level semantic byte compatibility. This retains compatibility code/consumers the pure-deletion plan intended to remove. Alternative: defer R2-1, retain its current implementation, proceed with remaining approved work after gate resolution. Neither option authorizes ContextRevision/event schema changes, data deletion, explicit-channel deletion or any other deferred issue.
+
+Authority required: review-gated-development requires fresh approval for a materially revised plan and instructs stopping all implementation/delegation at the human gate. No choice has yet been approved. Tracker R/M1/R1-3/R2-1 set to review while the gate is pending; future items remain backlog.
+
+
+H-001 evidence update: the main agent independently passed the existing positive domain serialization and runtime checkpoint retry tests (one test each); details in the gate record. Already-running R1-3 tests finished without further implementation: all three release ordinary runs search20/22 + intent20/22, all three F2LLM runs lexical29/39 + fused32/39, zero noise, explicit ignored-test selection. All agents and test runners are now stopped. After-intent replay, R1-3 clippy/ratchet disposition/commit and main review remain pending user decision. Goal remains active and incomplete.

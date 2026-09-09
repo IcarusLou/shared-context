@@ -32,4 +32,4 @@ At `369772b`, debug-profile ordinary probe: 2 tests passed, 20/22 explicit searc
 
 Logs: `/private/tmp/sctx-r1-3-baseline-workflow.log`, `/private/tmp/sctx-r1-3-baseline-semantic.log`; metadata `/private/tmp/sctx-r1-3-baseline-metadata.json`.
 
-Three post-change runs: pending.
+Three post-change release repetitions completed before H-001 stopped implementation: ordinary search20/22 and intent20/22 each time; F2LLM lexical29/39 and fused32/39 each time, zero noise. Lexical long_intent improves1→3/3; fused total is unchanged. Runner summary `/private/tmp/sctx-r1-3-probe-runs.json`; per-run logs `/private/tmp/sctx-r1-3-association_probe_{workflow,ext_semantic_f2llm}-{1,2,3}.log`. These are executor observations; R1-3 remains uncommitted and unaccepted pending replay, ratchet disposition, clippy and main review after H-001 is resolved.
