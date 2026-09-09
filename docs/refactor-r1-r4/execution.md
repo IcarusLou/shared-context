@@ -7,7 +7,7 @@ Authority: [approved plan](approved-plan.md). Decisions: [decision log](../decis
 | M1 | SessionEnd cleanup works; relevance rank survives; DF>0 tokens survive budget | None; no M2–M4 implementation | R1-1, R1-2, R1-3 | doing |
 | M2 | Remove only approved dead surfaces, quiet duplicate closure, preserve recovery and compatibility | M1 accepted + real-session smoke; no M3–M4 | R2-1, R2-2a → R2-2b → R2-2c → R2-2d (parent R2-2), R2-3, R2-4, R2-5, R2-6 | backlog |
 | M3 | Triage single source, evidence semantics, additive audit migration | M2 accepted; no M4 writers before migration acceptance | R3-1, R3-2, R3-3 | backlog |
-| M4 | All injections judged with evidence basis; prior off; truthful stats | M3 accepted + real-session smoke; no B-layer changes | R4-1, R4-2, observation report | backlog |
+| M4 | All injections judged with evidence basis; prior off; truthful stats | M3 accepted + real-session smoke; no B-layer changes | R4-1, R4-2a, R4-2b (parent R4-2), R4-observation | backlog |
 
 Each milestone requires exact diff review, targeted tests re-run by main agent, affected crate full tests, formatting and warning-free workspace clippy. Final gates additionally include workspace tests, packaging and relevant privacy/performance tests. Acceptance details and non-goals are the corresponding authoritative plan items and issues.json. No routine human gate between milestones. Human gates only for materially revised scope, conflicting acceptance, newly deferred work, destructive action, or tradeoffs requiring judgment. Main agent reviews every implementation decision before acceptance; clean worktree and verified commits required.
 
@@ -27,3 +27,14 @@ ROI-1: none. ROI-2: none. ROI-3: none.
 Unproven requirements: full M1 workspace/affected-crate gates and cross-milestone real-host smoke remain pending; not claimed by atomic acceptance.
 Worktree/tracker: staged index empty after executor commit; only main-owned execution/issue decomposition documents pending. Mew #235 done after main verification, #236 doing.
 Human gate required: no. Next action: automatically advance to R1-2.
+
+
+### R1-2 — accepted atomic issue
+Commit reviewed: `7f2646162492b80e572b3cf3b42f8238e4fab4c5` (Mew #236).
+Scope verified: three files; membership-only stable dedup, removal of graph caller sort, adversarial-ID tests, D-003. Traced every add_ranked_channel caller: explicit retains sort/dedup, unordered channels already iterate ordered maps; graph traversal, safety, weights, seven-rule relation ladder and all thresholds unchanged. No global depth policy introduced.
+Direct tests independently re-run: ranked_channel_keeps_input_order_and_first_duplicate_position 1 passed (22 filtered); full candidate_analysis 19 passed, including real BM25 and graph adverse-ID order. Executor full search: 130 passed / 8 ignored / 0 failed, search clippy clean. Main inspected exact commit and empty staging and verified snapshot hashes. Numeric replay and limitations: [evidence](replay-evidence.md).
+Decision-log coverage: D-003 matches code; first occurrences consume compacted unique ranks and graph remains per-root BFS.
+ROI-1: none. ROI-2: none. ROI-3: none.
+Unproven requirements: R1-3 and full M1 gates/smoke remain pending.
+Worktree/tracker: only main-owned issue decomposition and replay evidence pending before this review record; #236 done after independent verification; #237 doing.
+Human gate required: no. Next action: automatically advance to R1-3.
