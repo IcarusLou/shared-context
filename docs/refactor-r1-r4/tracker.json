@@ -170,12 +170,12 @@
   "R2-5": {
     "ID": "839ce37f-270e-48f1-8c8c-1dcdbe13e1c7",
     "CreatedAt": "2026-09-09T09:10:53.524172Z",
-    "UpdatedAt": "2026-09-09T13:16:55.683971Z",
+    "UpdatedAt": "2026-09-09T13:45:50.77017Z",
     "WorkspaceID": "3c7b5483-4704-4084-a5c7-c75193912e47",
     "Number": 242,
     "Title": "Shared Context / R2-5 · provisional 谓词收敛(A6)",
     "Description": "Parent milestone: M2\nPurpose: R2-5 · provisional 谓词收敛(A6)\nDependencies: previous issue in this milestone, and all preceding milestone gates.\n\nAuthoritative scope, invariants, non-goals and acceptance:\n改动domain 新增 space_is_provisional()(口径:唯一 current head 且 provisional),替换 mcp:421 / mcp:6965 / cli:3096 三处;index/schema.rs:780 改调同一函数。零行为变更,加一条四处一致性单测。\n\nDesign: docs/refactor-r1-r4/approved-plan.md\nDecision log: docs/decisions/refactor-r1-r4.md (executor records choices; main agent verifies).\nRepository gates: cargo fmt --all -- --check; cargo clippy --workspace --all-targets --all-features --locked -- -D warnings; affected crate full tests.\nExpected commit: refactor(m2): provisional 谓词收敛(A6) (R2-5)\nStop condition: commit only this issue, move to review, do not begin next issue. Main agent alone marks done after independent review.\n",
-    "Status": "doing",
+    "Status": "done",
     "Priority": "high",
     "AutomationGenerated": false,
     "RoomEnabled": true,
@@ -404,5 +404,19 @@
     "AutomationGenerated": false,
     "RoomEnabled": true,
     "WebURL": "https://mew.bytedance.net/3c7b5483-4704-4084-a5c7-c75193912e47/issues/fa36fb9a-2bec-435a-a812-f82ae7a3bbab"
+  },
+  "M2-F1": {
+    "ID": "2337f14d-aa16-45cb-b9ec-395d3d30b776",
+    "CreatedAt": "2026-09-09T13:40:25.044219Z",
+    "UpdatedAt": "2026-09-09T13:45:50.956456Z",
+    "WorkspaceID": "3c7b5483-4704-4084-a5c7-c75193912e47",
+    "Number": 259,
+    "Title": "Shared Context / M2-F1 Repeated Stop test assertion",
+    "Description": "Parent M2 (#232), review repair for accepted R2-3 (#240). Align the repeated Stop test with the already-approved silent output; preserve Candidate identity assertions. Scope: crates/cli/tests/hook_to_confirm_chain.rs only. Run that complete test target and formatting. Commit: test(cli): expect silence for repeated completed Stop (M2-F1). Main completes execution and review because sub-agents are unavailable.",
+    "Status": "done",
+    "Priority": "high",
+    "AutomationGenerated": false,
+    "RoomEnabled": true,
+    "WebURL": "https://mew.bytedance.net/3c7b5483-4704-4084-a5c7-c75193912e47/issues/2337f14d-aa16-45cb-b9ec-395d3d30b776"
   }
 }
