@@ -5,7 +5,7 @@ Authority: [approved plan](approved-plan.md). Decisions: [decision log](../decis
 | Milestone | Outcome / invariant | Dependencies / forbidden early work | Issues in order | Status |
 |---|---|---|---|---|
 | M1 | SessionEnd cleanup works; relevance rank survives; DF>0 tokens survive budget | None; no M2–M4 implementation | R1-1, R1-2, R1-3 (+ M1-F1/F2/F3 repairs) | accepted |
-| M2 | Remove only approved dead surfaces, quiet duplicate closure, preserve recovery and compatibility | M1 accepted + real-session smoke; no M3–M4 | R2-1, R2-2a → R2-2b → R2-2c → R2-2d (parent R2-2), R2-3, R2-4, R2-5, R2-6 | doing |
+| M2 | Remove only approved dead surfaces, quiet duplicate closure, preserve recovery and compatibility | M1 accepted + real-session smoke; no M3–M4 | R2-1, R2-2a → R2-2b → R2-2c → R2-2d (parent R2-2), R2-3, R2-4, R2-5, R2-6 | accepted |
 | M3 | Triage single source, evidence semantics, additive audit migration | M2 accepted; no M4 writers before migration acceptance | R3-1, R3-2, R3-3 | backlog |
 | M4 | All injections judged with evidence basis; prior off; truthful stats | M3 accepted + real-session smoke; no B-layer changes | R4-1, R4-2a, R4-2b (parent R4-2), R4-observation | backlog |
 
@@ -108,3 +108,7 @@ All subagents became unavailable at their account usage limit. The main agent to
 
 ### M2-F1 — repeated Stop test correction
 `7d014b2` changes only hook_to_confirm_chain's obsolete repeated-stop message unwrap to exact{}; later Candidate count/ID assertions remain. Full target rerun1passed. The full workspace run's original failure is retained as diagnostic evidence, not relabeled a pass. No production change. Automatic approval initially rejected mixed external-ticket/local-edit command; source verification of the user-requested skill's configured-tracker rule and existing privateMew parent established authorization, and the bounded direct Mew creation was approved. No unresolved permission request remains. Main completes this bounded issue because subagents are unavailable.
+
+
+### M2 accepted — current target evidence complete
+Every required atomic issue has a verified scoped commit, including user-approved H-001 empty-only compatibility. Workspace no-fail-fast run completed120suites with1041passed/1failed/14ignored; the sole failure was the stale repeated-Stop fixture in M2-F1. That exact complete target subsequently passed1 after its test-only fix, with all other source/test targets unchanged. Thus all1042 current tests have passing evidence; the original workspace command exit101 is not represented as exit0. Final workspace fmt/clippy passed and NPM packaging21passed/1platform skip. Logs `/private/tmp/sctx-m2-{workspace-tests,clippy-final,npm-final}.log`, repair `/private/tmp/sctx-m2-f1-test.log`. No required open findings/human gates, no untracked user changes. M1→M2 real-host smoke was completed earlier. M3 may start; R1–R4 goal remains incomplete, including later normal-use observation/report.
