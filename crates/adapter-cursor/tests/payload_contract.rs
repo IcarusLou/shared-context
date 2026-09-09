@@ -3,10 +3,9 @@ use sctx_adapter_cursor::{
     encode_hook_output,
 };
 use sctx_agent_adapter::{
-    ARTIFACT_FOCUS_REMINDER_MAX_BYTES, AgentKind, ArtifactFocusReminderContext, CapabilityMode,
-    EpisodeFinalizationTrigger, PathHint, ResolvedActivationDecision, TaskRuntimeOperation,
-    ToolCategory, artifact_focus_reminder_file, plan_action_for_activation,
-    render_artifact_focus_reminder, shared_context_activation_marker,
+    AgentKind, CapabilityMode, EpisodeFinalizationTrigger, PathHint, ResolvedActivationDecision,
+    TaskRuntimeOperation, ToolCategory, plan_action_for_activation,
+    shared_context_activation_marker,
 };
 use serde_json::Value;
 use std::path::PathBuf;
@@ -280,44 +279,17 @@ fn malformed_or_unknown_cursor_payload_fails_strictly() {
     assert!(decode_hook_input(&serde_json::to_vec(&payload).unwrap()).is_err());
 }
 
-/// P4.1 experiment. Cursor's documented `PostToolUse` fixture is a shell test
-/// runner, so the located file case uses the same envelope with a documented
-/// file-operation tool. The switch is off by default and the disabled bytes stay
-/// the contract.
-fn cursor_file_operation_payload() -> Value {
+#[test]
+fn cursor_post_tool_policy_keeps_the_current_neutral_bytes() {
     let mut payload = fixtures().remove(2);
     payload["tool_name"] = serde_json::json!("Read");
     payload["tool_input"] =
         serde_json::json!({"file_path": "/workspace/shared context/src/lib.rs"});
-    payload
-}
-
-fn cursor_reminder_contexts() -> Vec<ArtifactFocusReminderContext> {
-    vec![ArtifactFocusReminderContext {
-        context_id: "ctx_2f0d2a2f4c7a4f0f8f8f0a1b2c3d4e5f".to_owned(),
-        title:
-            "The default comment bottom bar must survive an absent vertical-domain service module"
-                .to_owned(),
-    }]
-}
-
-#[test]
-fn cursor_post_tool_reminder_is_off_by_default_and_keeps_the_current_bytes() {
-    let (event, _) =
-        decode_hook_input(&serde_json::to_vec(&cursor_file_operation_payload()).unwrap()).unwrap();
+    let (event, _) = decode_hook_input(&serde_json::to_vec(&payload).unwrap()).unwrap();
     let capabilities = capabilities(Some("3.13.10"), true);
     let action =
         plan_action_for_activation(&event, &capabilities, ResolvedActivationDecision::Enabled);
     assert!(action.additional_context.is_none());
-    assert!(
-        artifact_focus_reminder_file(
-            &event,
-            ResolvedActivationDecision::Enabled,
-            &capabilities,
-            false,
-        )
-        .is_none()
-    );
     let resolved = ResolvedAgentAction {
         additional_context: action.additional_context,
         system_message: action.system_message,
@@ -325,67 +297,6 @@ fn cursor_post_tool_reminder_is_off_by_default_and_keeps_the_current_bytes() {
     assert_eq!(
         encode_hook_output(CanonicalAgentEventKind::PostToolUse, &resolved).unwrap(),
         b"{}".to_vec()
-    );
-}
-
-#[test]
-fn cursor_enabled_reminder_is_bounded_and_encoded_as_read_only_additional_context() {
-    let (event, _) =
-        decode_hook_input(&serde_json::to_vec(&cursor_file_operation_payload()).unwrap()).unwrap();
-    let capabilities = capabilities(Some("3.13.10"), true);
-    let file = artifact_focus_reminder_file(
-        &event,
-        ResolvedActivationDecision::Enabled,
-        &capabilities,
-        true,
-    )
-    .expect("a located Cursor file operation is eligible");
-    assert_eq!(
-        file,
-        std::path::Path::new("/workspace/shared context/src/lib.rs")
-    );
-
-    let contexts = cursor_reminder_contexts();
-    let reminder = render_artifact_focus_reminder("src/lib.rs", &contexts).unwrap();
-    assert!(reminder.len() <= ARTIFACT_FOCUS_REMINDER_MAX_BYTES);
-    assert!(reminder.contains(&contexts[0].context_id));
-    assert!(reminder.contains("call task_artifact_focus for src/lib.rs to load them"));
-    assert!(!reminder.contains("/workspace/shared context"));
-
-    let resolved = ResolvedAgentAction {
-        additional_context: Some(reminder.clone()),
-        system_message: None,
-    };
-    let encoded = encode_hook_output(CanonicalAgentEventKind::PostToolUse, &resolved).unwrap();
-    let decoded: Value = serde_json::from_slice(&encoded).unwrap();
-    assert_eq!(decoded["additional_context"], Value::String(reminder));
-}
-
-#[test]
-fn cursor_shell_and_group_activation_never_reach_the_reminder_lookup() {
-    let (shell, _) =
-        decode_hook_input(&serde_json::to_vec(&fixtures().remove(2)).unwrap()).unwrap();
-    let capabilities = capabilities(Some("3.13.10"), true);
-    assert!(
-        artifact_focus_reminder_file(
-            &shell,
-            ResolvedActivationDecision::Enabled,
-            &capabilities,
-            true,
-        )
-        .is_none()
-    );
-
-    let (file_event, _) =
-        decode_hook_input(&serde_json::to_vec(&cursor_file_operation_payload()).unwrap()).unwrap();
-    assert!(
-        artifact_focus_reminder_file(
-            &file_event,
-            ResolvedActivationDecision::Disabled,
-            &capabilities,
-            true,
-        )
-        .is_none()
     );
 }
 

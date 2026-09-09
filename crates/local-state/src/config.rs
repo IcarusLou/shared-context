@@ -163,14 +163,12 @@ struct HookConfigDocument {
     artifact_focus_reminder: bool,
 }
 
-/// Explicit local Hook switches read on the bounded Hook hot path.
+/// Retired Hook switches retained for existing configuration compatibility.
 ///
-/// Every switch is an off-by-default experiment: a missing `[hooks]` table, a
-/// missing key, and an explicit `false` are the same decision.
+/// Values remain readable, but no longer change Hook execution.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct HookSettings {
-    /// P4.1 experiment: the `PostTool` Hook may run one read-only Engineering Graph lookup
-    /// for a located file and emit one bounded Artifact focus reminder.
+    /// Retired P4.1 switch. Both `true` and `false` are accepted and have no effect.
     pub artifact_focus_reminder: bool,
 }
 

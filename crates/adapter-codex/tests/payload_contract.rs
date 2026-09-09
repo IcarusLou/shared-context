@@ -4,10 +4,9 @@ use sctx_adapter_codex::{
     decode_hook_input_with_diagnostic, encode_hook_output,
 };
 use sctx_agent_adapter::{
-    ARTIFACT_FOCUS_REMINDER_MAX_BYTES, ARTIFACT_FOCUS_REMINDER_MAX_CONTEXTS, AgentKind,
-    ArtifactFocusReminderContext, CapabilityMode, EpisodeFinalizationTrigger, PathHint,
-    ResolvedActivationDecision, TaskRuntimeOperation, ToolCategory, artifact_focus_reminder_file,
-    plan_action_for_activation, render_artifact_focus_reminder, shared_context_activation_marker,
+    AgentKind, CapabilityMode, EpisodeFinalizationTrigger, PathHint, ResolvedActivationDecision,
+    TaskRuntimeOperation, ToolCategory, plan_action_for_activation,
+    shared_context_activation_marker,
 };
 use serde_json::Value;
 use std::path::PathBuf;
@@ -615,46 +614,13 @@ fn codex_session_end_accepts_nonempty_live_host_reasons() {
     );
 }
 
-/// P4.1 experiment. The switch is off by default: the disabled Codex `PostToolUse`
-/// bytes are the contract, and the enabled path may only add one bounded
-/// reminder that names Context identities and no Context body.
-fn codex_post_tool_event() -> sctx_adapter_codex::CanonicalAgentEvent {
-    decode_hook_input(&serde_json::to_vec(&fixtures().remove(2)).unwrap()).unwrap()
-}
-
-fn codex_capabilities() -> sctx_adapter_codex::AgentCapabilities {
-    capabilities(Some("0.147.0"), true, TrustState::Confirmed)
-}
-
-fn reminder_contexts() -> Vec<ArtifactFocusReminderContext> {
-    vec![
-        ArtifactFocusReminderContext {
-            context_id: "ctx_2f0d2a2f4c7a4f0f8f8f0a1b2c3d4e5f".to_owned(),
-            title: "The default comment bottom bar must survive an absent vertical-domain service module".to_owned(),
-        },
-        ArtifactFocusReminderContext {
-            context_id: "ctx_9a1b2c3d4e5f60718293a4b5c6d7e8f9".to_owned(),
-            title: "Product anchor navigation returns early without a live entry implementation".to_owned(),
-        },
-    ]
-}
-
 #[test]
-fn codex_post_tool_reminder_is_off_by_default_and_keeps_the_current_bytes() {
-    let event = codex_post_tool_event();
-    let capabilities = codex_capabilities();
+fn codex_post_tool_policy_keeps_the_current_neutral_bytes() {
+    let event = decode_hook_input(&serde_json::to_vec(&fixtures().remove(2)).unwrap()).unwrap();
+    let capabilities = capabilities(Some("0.147.0"), true, TrustState::Confirmed);
     let action =
         plan_action_for_activation(&event, &capabilities, ResolvedActivationDecision::Enabled);
     assert!(action.additional_context.is_none());
-    assert!(
-        artifact_focus_reminder_file(
-            &event,
-            ResolvedActivationDecision::Enabled,
-            &capabilities,
-            false,
-        )
-        .is_none()
-    );
     let resolved = ResolvedAgentAction {
         additional_context: action.additional_context,
         system_message: action.system_message,
@@ -665,22 +631,15 @@ fn codex_post_tool_reminder_is_off_by_default_and_keeps_the_current_bytes() {
     );
 }
 
-/// The `PreCompact` join is scoped, and this is the event that proves it must be.
-///
-/// A `PostToolUse` under the enabled Artifact focus experiment is the one other event that
-/// carries both fields: the Intent bootstrap line and one bounded, untrusted-data-fenced
-/// reminder. The reminder reaches model context as exactly the block it was rendered and
-/// budgeted as — joining the message into it would both break its byte budget and put a
-/// trusted instruction inside a block fenced as untrusted data.
+/// Trusted system instructions stay separate from model-visible reference data.
 #[test]
-fn codex_post_tool_keeps_a_bounded_reminder_separate_from_its_system_message() {
+fn codex_post_tool_keeps_model_context_separate_from_its_system_message() {
     const INTENT_BOOTSTRAP: &str = "Shared Context: no ActiveTask exists. Call task_intent_update for this substantive task before continuing.";
-
-    let reminder = render_artifact_focus_reminder("src/lib.rs", &reminder_contexts()).unwrap();
+    const MODEL_CONTEXT: &str = "Reference data only: a stored Context title.";
     let output = encode_hook_output(
         CanonicalAgentEventKind::PostToolUse,
         &ResolvedAgentAction {
-            additional_context: Some(reminder.clone()),
+            additional_context: Some(MODEL_CONTEXT.to_owned()),
             system_message: Some(INTENT_BOOTSTRAP.to_owned()),
         },
     )
@@ -692,142 +651,16 @@ fn codex_post_tool_keeps_a_bounded_reminder_separate_from_its_system_message() {
             "systemMessage": INTENT_BOOTSTRAP,
             "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",
-                "additionalContext": reminder
+                "additionalContext": MODEL_CONTEXT
             }
         })
     );
-    let model_context = output["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap();
-    assert!(!model_context.contains(INTENT_BOOTSTRAP));
-    assert!(model_context.len() <= ARTIFACT_FOCUS_REMINDER_MAX_BYTES);
-}
-
-#[test]
-fn codex_enabled_reminder_is_bounded_names_context_ids_and_carries_no_context_body() {
-    let event = codex_post_tool_event();
-    let capabilities = codex_capabilities();
-    let file = artifact_focus_reminder_file(
-        &event,
-        ResolvedActivationDecision::Enabled,
-        &capabilities,
-        true,
-    )
-    .expect("a located Codex file operation is eligible");
-    assert_eq!(
-        file,
-        std::path::Path::new("/workspace/shared context/src/lib.rs")
-    );
-
-    let contexts = reminder_contexts();
-    let reminder = render_artifact_focus_reminder("src/lib.rs", &contexts).unwrap();
-    assert!(reminder.len() <= ARTIFACT_FOCUS_REMINDER_MAX_BYTES);
-    for context in &contexts {
-        assert!(reminder.contains(&context.context_id));
-    }
-    assert!(reminder.contains("call task_artifact_focus for src/lib.rs to load them"));
-    for forbidden in [
-        "rationale",
-        "evidence",
-        "statement",
-        "/workspace/shared context",
-    ] {
-        assert!(!reminder.contains(forbidden), "reminder leaked {forbidden}");
-    }
-
-    let resolved = ResolvedAgentAction {
-        additional_context: Some(reminder.clone()),
-        system_message: None,
-    };
-    let encoded = encode_hook_output(CanonicalAgentEventKind::PostToolUse, &resolved).unwrap();
-    let decoded: Value = serde_json::from_slice(&encoded).unwrap();
-    assert_eq!(
-        decoded["hookSpecificOutput"]["additionalContext"],
-        Value::String(reminder)
-    );
-}
-
-#[test]
-fn codex_reminder_target_requires_enabled_activation_a_file_tool_and_one_path() {
-    let event = codex_post_tool_event();
-    let capabilities = codex_capabilities();
     assert!(
-        artifact_focus_reminder_file(
-            &event,
-            ResolvedActivationDecision::Disabled,
-            &capabilities,
-            true,
-        )
-        .is_none()
+        !output["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains(INTENT_BOOTSTRAP)
     );
-
-    let unverified =
-        sctx_adapter_codex::capabilities(Some("0.146.0"), false, TrustState::Confirmed);
-    assert!(
-        artifact_focus_reminder_file(
-            &event,
-            ResolvedActivationDecision::Enabled,
-            &unverified,
-            true,
-        )
-        .is_none()
-    );
-
-    let mut ambiguous = fixtures().remove(2);
-    ambiguous["tool_input"] = serde_json::json!({"file_path": ["/a.rs", "/b.rs"]});
-    let ambiguous = decode_hook_input(&serde_json::to_vec(&ambiguous).unwrap()).unwrap();
-    assert!(
-        artifact_focus_reminder_file(
-            &ambiguous,
-            ResolvedActivationDecision::Enabled,
-            &capabilities,
-            true,
-        )
-        .is_none()
-    );
-
-    let shell = decode_hook_input(
-        &serde_json::to_vec(&{
-            let mut payload = fixtures().remove(2);
-            payload["tool_name"] = serde_json::json!("Shell");
-            payload["tool_input"] =
-                serde_json::json!({"command": "cargo test", "working_directory": "/workspace"});
-            payload
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    assert!(
-        artifact_focus_reminder_file(
-            &shell,
-            ResolvedActivationDecision::Enabled,
-            &capabilities,
-            true,
-        )
-        .is_none()
-    );
-}
-
-#[test]
-fn codex_reminder_drops_extra_contexts_and_truncates_long_titles() {
-    let long = "\u{4e00}".repeat(400);
-    let contexts = (0..6)
-        .map(|index| ArtifactFocusReminderContext {
-            context_id: format!("ctx_{index:032x}"),
-            title: long.clone(),
-        })
-        .collect::<Vec<_>>();
-    let reminder = render_artifact_focus_reminder("src/lib.rs", &contexts).unwrap();
-    assert!(reminder.len() <= ARTIFACT_FOCUS_REMINDER_MAX_BYTES);
-    assert!(
-        reminder
-            .lines()
-            .filter(|line| line.starts_with("ctx_"))
-            .count()
-            <= ARTIFACT_FOCUS_REMINDER_MAX_CONTEXTS
-    );
-    assert!(reminder.contains('\u{2026}'));
-    assert!(render_artifact_focus_reminder("src/lib.rs", &[]).is_none());
 }
 
 /// The visibility predicate and the encoder must agree on every event, because a caller deciding

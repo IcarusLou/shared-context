@@ -21,11 +21,11 @@ use std::{
 
 use args::Options;
 use sctx_agent_adapter::{
-    AgentCapabilities, AgentEventContext, ArtifactFocusReminderContext, CanonicalAgentAction,
-    CanonicalAgentEvent, CanonicalAgentEventKind, EpisodeFinalizationTrigger, FileAccess,
+    AgentCapabilities, AgentEventContext, CanonicalAgentAction, CanonicalAgentEvent,
+    CanonicalAgentEventKind, EpisodeFinalizationTrigger, FileAccess,
     MAX_SHELL_COMMAND_PATH_CANDIDATES, PathHint, ResolvedActivationDecision, ResolvedAgentAction,
-    TaskRuntimeOperation, ToolCategory, ToolOutcome, TrustState, artifact_focus_reminder_file,
-    plan_action_for_activation, render_artifact_focus_reminder, shared_context_activation_marker,
+    TaskRuntimeOperation, ToolCategory, ToolOutcome, TrustState, plan_action_for_activation,
+    shared_context_activation_marker,
 };
 use sctx_domain::{
     Applicability, CandidateReviewStatus, ConflictParticipant, ConflictResolutionDraft,
@@ -36,9 +36,6 @@ use sctx_domain::{
     ReviewSummary, ReviewVerdict, RevisionId, SemanticConflictDraft, SpaceId, TaskSessionSnapshot,
     TaskSignal, TaskSignalKind, WorkEpisodeId, WorkEpisodeStatus,
 };
-use sctx_engineering_graph::{
-    ARTIFACT_FOCUS_QUERY_BUDGET, ArtifactFocusOutcome, ArtifactFocusReader, MAX_ARTIFACT_FOCUS_HITS,
-};
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendOutcome, AppendRequest, BatchId, GitStore};
 use sctx_index::{
@@ -46,10 +43,9 @@ use sctx_index::{
 };
 use sctx_installer::maintain::MaintainOptions;
 use sctx_local_state::{
-    ArtifactReminderKey, ArtifactReminderMark, ArtifactReminderStore, AuthorizedSessionScope,
-    AuthorizedSessionScopeRead, AuthorizedSessionScopeStore, CatalogCheckoutStatus, HookSettings,
-    MaintenanceLock, MaintenanceSettings, PrivacyScanner, RepositoryCatalogDiagnostic,
-    RepositoryCatalogSnapshot, UserConfigStore,
+    AuthorizedSessionScope, AuthorizedSessionScopeRead, AuthorizedSessionScopeStore,
+    CatalogCheckoutStatus, MaintenanceLock, MaintenanceSettings, PrivacyScanner,
+    RepositoryCatalogDiagnostic, RepositoryCatalogSnapshot, UserConfigStore,
 };
 use sctx_mcp::{
     ArtifactFocusQuery, AssociationExplainInput, AssociationRebuildInput, CandidateAnalyzeInput,
@@ -1607,7 +1603,7 @@ fn run_hook(args: &[String]) -> Result<()> {
     };
     let activation = authorization.activation;
     let activated = activation == ResolvedActivationDecision::Enabled;
-    let action = plan_hook_action(agent, &event, &capabilities, &authorization, &recorder);
+    let action = plan_hook_action(&event, &capabilities, &authorization, &recorder);
     let resolved = resolve_hook_action(action, &recorder);
     if maintenance.is_some() && event.kind() == CanonicalAgentEventKind::SessionEnd {
         remove_hook_session_scope(agent, &event.context().session_id, &recorder);
@@ -1707,10 +1703,8 @@ fn spawn_opportunistic_maintenance(
 }
 
 /// Resolves the complete Hook policy for one event: pure activation policy,
-/// then `PostToolUse` Catalog attribution, then a self-healed activation marker,
-/// then the off-by-default P4.1 reminder.
+/// then `PostToolUse` Catalog attribution, then a self-healed activation marker.
 fn plan_hook_action(
-    agent: &str,
     event: &CanonicalAgentEvent,
     capabilities: &AgentCapabilities,
     authorization: &HookAuthorization,
@@ -1747,20 +1741,7 @@ fn plan_hook_action(
     } else {
         action
     };
-    let action = add_self_healed_activation_marker(event, action, capabilities, authorization);
-    if authorization.hooks.artifact_focus_reminder {
-        add_artifact_focus_reminder(
-            agent,
-            event,
-            action,
-            activation,
-            capabilities,
-            authorization,
-            recorder,
-        )
-    } else {
-        action
-    }
+    add_self_healed_activation_marker(event, action, capabilities, authorization)
 }
 
 #[derive(Debug)]
@@ -1768,7 +1749,6 @@ struct HookAuthorization {
     activation: ResolvedActivationDecision,
     scope: Option<AuthorizedSessionScope>,
     catalog: Option<RepositoryCatalogSnapshot>,
-    hooks: HookSettings,
     /// The maintenance schedule, read from the same `config.toml` open the Catalog cost. Only the
     /// `SessionStart` opportunistic gate reads it; every other event carries it unused.
     maintenance: MaintenanceSettings,
@@ -1783,9 +1763,6 @@ impl HookAuthorization {
             activation: ResolvedActivationDecision::Disabled,
             scope: None,
             catalog: None,
-            hooks: HookSettings {
-                artifact_focus_reminder: false,
-            },
             // A Session this installation never authorized starts nothing, so the value is only
             // ever read through the `Enabled` gate below and the default is never acted on.
             maintenance: MaintenanceSettings::default(),
@@ -1802,10 +1779,9 @@ impl HookAuthorization {
 /// lease self-heal already rebuilds authorization from a later event; this rebuilds the marker
 /// with it, exactly once per lease.
 ///
-/// The marker takes the `additional_context` field only when nothing else claimed it, which is
-/// the same first-come rule the Artifact focus reminder follows. Order settles the collision:
-/// this runs before the reminder, because a Session that cannot identify itself has nothing to
-/// focus on. Events whose vendor output cannot carry model-visible text — a Cursor
+/// The marker takes the `additional_context` field only when nothing else claimed it, preserving
+/// model context already selected by activation policy. Events whose vendor output cannot
+/// carry model-visible text — a Cursor
 /// `beforeSubmitPrompt` or `sessionEnd` encodes an empty object — are skipped rather than
 /// spending the one-shot delivery on a field that is dropped.
 fn add_self_healed_activation_marker(
@@ -1881,7 +1857,7 @@ fn resolve_hook_authorization_inner(
     let root = installation_root()?;
     let locator = ExternalSessionLocator::new(agent, session_id)?;
     let config = UserConfigStore::open_existing(&root)?;
-    let (catalog, hooks, maintenance) = config.repository_catalog_with_hooks()?;
+    let (catalog, _, maintenance) = config.repository_catalog_with_hooks()?;
     let store = AuthorizedSessionScopeStore::initialize(&root)?;
 
     // A lease is permanent, but its decision is not: the recorded canonical
@@ -1946,7 +1922,6 @@ fn resolve_hook_authorization_inner(
         activation,
         scope,
         catalog: Some(catalog),
-        hooks,
         maintenance,
         deliver_activation_marker,
     })
@@ -1959,11 +1934,6 @@ fn remove_hook_session_scope(agent: &str, session_id: &str, recorder: &HookEvent
     else {
         return;
     };
-    if root.join("state").join("artifact-reminders").is_dir() {
-        if let Ok(store) = ArtifactReminderStore::open(&root) {
-            store.forget(&locator);
-        }
-    }
     let removed =
         AuthorizedSessionScopeStore::initialize(root).and_then(|store| store.try_remove(&locator));
     if let Err(error) = removed {
@@ -1972,136 +1942,6 @@ fn remove_hook_session_scope(agent: &str, session_id: &str, recorder: &HookEvent
             "session_cleanup_failed",
             Some(truncate_hook_detail(error.message())),
         );
-    }
-}
-
-/// P4.1 experiment (`[hooks] artifact_focus_reminder`, default off).
-///
-/// When explicitly enabled, one located `PostToolUse` file operation may add one
-/// bounded Artifact focus reminder. The path stays read-only: it runs no Git, no
-/// Repository scan, and no Graph rebuild, opens `state/engineering.sqlite`
-/// read-only without waiting for a lock, and writes no fact. Every failure —
-/// unresolved path, absent projection, query budget, unusable reminder state —
-/// degrades to the disabled output.
-fn add_artifact_focus_reminder(
-    agent: &str,
-    event: &CanonicalAgentEvent,
-    mut action: CanonicalAgentAction,
-    activation: ResolvedActivationDecision,
-    capabilities: &AgentCapabilities,
-    authorization: &HookAuthorization,
-    recorder: &HookEventRecorder,
-) -> CanonicalAgentAction {
-    if action.additional_context.is_some() {
-        return action;
-    }
-    if let Some(reminder) = resolve_artifact_focus_reminder(
-        agent,
-        event,
-        activation,
-        capabilities,
-        authorization,
-        recorder,
-    ) {
-        action.additional_context = Some(reminder);
-    }
-    action
-}
-
-fn resolve_artifact_focus_reminder(
-    agent: &str,
-    event: &CanonicalAgentEvent,
-    activation: ResolvedActivationDecision,
-    capabilities: &AgentCapabilities,
-    authorization: &HookAuthorization,
-    recorder: &HookEventRecorder,
-) -> Option<String> {
-    let file = artifact_focus_reminder_file(
-        event,
-        activation,
-        capabilities,
-        authorization.hooks.artifact_focus_reminder,
-    )?;
-    let catalog = authorization.catalog.as_ref()?;
-    let authorized_repository_ids = authorization.scope.as_ref()?.decision.repository_ids();
-    if authorized_repository_ids.is_empty() {
-        return None;
-    }
-    // A Session started at a common parent records for several Repositories, so the file
-    // itself decides which one this reminder is about: the Catalog places it, and the
-    // placement must land inside this Session's own activation.
-    let declared = catalog.resolve_declared_path(file).ok()?;
-    let resolved = catalog
-        .resolve_file_path(file, std::slice::from_ref(&declared.checkout_path))
-        .ok()?;
-    if !authorized_repository_ids.contains(&resolved.repository_id) {
-        return None;
-    }
-    let root = installation_root().ok()?;
-    let lookup = match ArtifactFocusReader::new(&root).accepted_contexts_for_file(
-        &resolved.repository_id,
-        &resolved.relative_path,
-        MAX_ARTIFACT_FOCUS_HITS,
-        ARTIFACT_FOCUS_QUERY_BUDGET,
-    ) {
-        Ok(lookup) => lookup,
-        Err(error) => {
-            let reason = if error.kind() == ErrorKind::MaintenanceBusy {
-                "artifact_focus_db_busy"
-            } else {
-                "artifact_focus_error"
-            };
-            recorder.flush(
-                HookEventDecision::FailOpen,
-                reason,
-                Some(truncate_hook_detail(error.message())),
-            );
-            return None;
-        }
-    };
-    match lookup.outcome {
-        ArtifactFocusOutcome::Completed => {}
-        ArtifactFocusOutcome::BudgetExceeded => {
-            recorder.flush(
-                HookEventDecision::FailOpen,
-                "artifact_focus_budget_exceeded",
-                None,
-            );
-            return None;
-        }
-        ArtifactFocusOutcome::ProjectionAbsent => {
-            recorder.flush(
-                HookEventDecision::Neutral,
-                "artifact_focus_projection_absent",
-                None,
-            );
-            return None;
-        }
-    }
-    if lookup.hits.is_empty() {
-        return None;
-    }
-    let contexts = lookup
-        .hits
-        .into_iter()
-        .map(|hit| ArtifactFocusReminderContext {
-            context_id: hit.context_id,
-            title: hit.statement,
-        })
-        .collect::<Vec<_>>();
-    let reminder = render_artifact_focus_reminder(resolved.relative_path.as_str(), &contexts)?;
-    let locator = ExternalSessionLocator::new(agent, &event.context().session_id).ok()?;
-    let key = ArtifactReminderKey::new(
-        &resolved.repository_id.to_string(),
-        resolved.relative_path.as_str(),
-    )
-    .ok()?;
-    match ArtifactReminderStore::open(&root)
-        .ok()?
-        .mark_reminded(&locator, &key)
-    {
-        ArtifactReminderMark::FirstReminder => Some(reminder),
-        ArtifactReminderMark::AlreadyReminded => None,
     }
 }
 

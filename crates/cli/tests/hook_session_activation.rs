@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     fs::{self, OpenOptions},
     io::Write as _,
     os::unix::fs::symlink,
@@ -1158,4 +1159,79 @@ fn a_session_that_never_sent_session_start_is_authorized_by_its_next_event() {
         refused["result"]["structuredContent"]["error"]["code"],
         json!("activation_disabled")
     );
+}
+
+#[test]
+fn retired_artifact_reminder_switch_is_inert_and_preserves_legacy_files() {
+    let mut post_tool_outputs = Vec::new();
+    for enabled in [false, true] {
+        let fixture = Fixture::new();
+        let config_path = fixture.root().join("config.toml");
+        let mut config = fs::read_to_string(&config_path).unwrap();
+        write!(config,
+            "\n[hooks]\nartifact_focus_reminder = {enabled}\n\n[context_ttl]\nvalidation = \"30d\"\n"
+        )
+        .unwrap();
+        fs::write(config_path, config).unwrap();
+        fs::write(
+            fixture.direct_repository.join("bootstrap.rs"),
+            "fn fixture() {}\n",
+        )
+        .unwrap();
+        let session = "retired-reminder";
+        assert_activated(
+            &fixture.hook(
+                "codex",
+                &codex_start(session, &fixture.direct_repository, "startup"),
+            ),
+            AgentKind::Codex,
+            session,
+        );
+        let post_tool = fixture.hook(
+            "codex",
+            &codex_post_tool(session, &fixture.direct_repository),
+        );
+        assert!(post_tool.status.success());
+        assert!(
+            !String::from_utf8_lossy(&post_tool.stdout).contains("shared-context-artifact-focus")
+        );
+        post_tool_outputs.push(post_tool.stdout);
+        let reminder_directory = fixture.root().join("state/artifact-reminders");
+        assert!(!reminder_directory.exists());
+
+        // Legacy reminder records shared the lease's locator digest. Seed the exact filename
+        // the retired SessionEnd cleanup used, so preserving an unrelated sentinel cannot pass.
+        let lease = lease_record_path(&fixture.root(), "codex", session);
+        let suffix = lease
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .strip_prefix("scope-")
+            .unwrap();
+        fs::create_dir(&reminder_directory).unwrap();
+        let reminder = reminder_directory.join(format!("reminders-{suffix}"));
+        let legacy_bytes = br#"{"version":1,"artifacts":["Probe\u001fsrc/legacy.rs"]}"#;
+        fs::write(&reminder, legacy_bytes).unwrap();
+
+        // Retiring the reminder must not retire recovery of the trusted session identity.
+        fs::remove_file(lease).unwrap();
+        let healed = fixture.hook(
+            "codex",
+            &codex_post_tool(session, &fixture.direct_repository),
+        );
+        assert_activated(&healed, AgentKind::Codex, session);
+        let ended = fixture.hook(
+            "codex",
+            &codex_session_end(session, &fixture.direct_repository, "completed"),
+        );
+        assert!(ended.status.success());
+        assert!(matches!(
+            fixture.read_scope("codex", session),
+            AuthorizedSessionScopeRead::Missing
+        ));
+        assert_eq!(fs::read(&reminder).unwrap(), legacy_bytes);
+        assert_eq!(fs::read_dir(reminder_directory).unwrap().count(), 1);
+    }
+    assert_eq!(post_tool_outputs[0], post_tool_outputs[1]);
 }

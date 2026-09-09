@@ -935,7 +935,7 @@ schedule_minute = 0
 opportunistic_after_hours = 24
 ```
 
-- `[hooks] artifact_focus_reminder`：默认 `false`（关闭）。关闭时 PostTool Hook 与该开关引入前逐字节一致。显式改成 `true` 后，仅对被识别为单个文件操作的工具事件，用本机 Catalog 把绝对路径解析到已登记 Repository（该 Repository 必须在本会话准入范围内，所以父目录会话会按文件选对仓库），再对 `engineering.sqlite` 做一次只读查询（不加锁、不跑 Git、不 scan、不 rebuild）；命中已接受且可自动注入的 Graph Context 时，追加一条不超过 800 字节的提示（最多 3 个 Context ID、每个标题截断到 60 字符，加一句固定的“可以调用 `task_artifact_focus` 查看”提示文案），不包含 statement/evidence 正文，也不写任何事实。同一 Session 对同一文件只提示一次。这个开关只影响以绝对文件路径命中的工具事件，不覆盖模块/符号/API/Schema/测试等其他定位方式。
+- `[hooks] artifact_focus_reminder`：已退役，仅保留旧配置兼容性。`true` / `false` 均可解析，但不再触发 Graph 查询或提示。旧 `state/artifact-reminders/` 文件保持原样，SessionEnd 也不清理；显式 `task_artifact_focus` 不受影响。
 - `[retrieval]`：可选的 embedding 召回通道（ADR-0004）。**两个键都不写就是默认：通道完全不存在，检索与加入该通道之前逐字节一致，零磁盘、零内存、零延迟开销。** 两个键必须同时写、且都必须是绝对路径；只写一个视为配置错误（`sctx doctor` 会 Warning，通道保持关闭）。**不需要手工写这一节**：`sctx embedding install`（见 3.7）会下载、校验、自检后替你写好；下面的说明是给自备模型或非 macOS 平台的用户看的。
   - `embedding_model_path`：模型目录，需包含 `model.onnx`（若是拆分导出还需同目录的 `model.onnx_data`）与 `tokenizer.json`，另建议放上该导出的 `config.json`——编码器按它的 `model_type` 判断加载的是哪一族，`sctx embedding status` / `sctx doctor` 也按它报出模型名。推荐 `codefuse-ai/F2LLM-v2-0.6B`（默认，约 2.4GB 磁盘）或 `BAAI/bge-m3`（约 2.3GB 磁盘、约 1.2GB 常驻内存）的 ONNX 导出。模型不随包分发；`sctx embedding install` 会下载到 `~/.shared-context/embedding/model/`，也可以自行下载后手工指向别处；手工组装的、本产品没有量过的导出同样是受支持的配置，只是 `status` 会把模型名报成未知而不是猜一个。
   - `embedding_runtime_path`：本机 ONNX Runtime 动态库（macOS `libonnxruntime.dylib`、Linux `libonnxruntime.so`）。构建期不下载任何二进制，运行时才按此路径加载。`sctx embedding install` 会解包到 `~/.shared-context/embedding/runtime/`。
