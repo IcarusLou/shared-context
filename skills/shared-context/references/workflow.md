@@ -19,10 +19,16 @@ Not worth keeping:
 - process-level understanding of code you just read: what a function does, the call chain you followed to orient yourself;
 - anything the code, `git log`, or a PR already states plainly;
 - anything an accepted Context in the Context Pack already says. Submit only the delta: a new applicability condition, new Evidence, or a contradiction.
+- a routine build, compile, or test success; a validation is worth keeping only when its result is counter-intuitive or constrains someone else;
+- restating what a single function or component visibly does, however precisely — that is the code's own job.
 
 When the user asks you to record something, apply the same filter. If the point is derivable from the code or history, ask which part is non-obvious and record that instead.
 
 Leaving a row out costs the knowledge base nothing. A row that only says you read a file costs every later reader. Having nothing to keep is a complete answer at either boundary: empty `claims` and `unknowns` are the `no_op` of section 6, recording nothing and leaving the checkpoint as pending as it already was, so never send one to look compliant. The opposite lapse costs more: announcing a checkpoint is not making one, so when you tell the user you are recording something, call `task_checkpoint` in the same turn.
+
+Leaving a row out costs the knowledge base nothing: a lost conclusion is re-checkpointed the next time it matters. A low-value row costs retrieval itself — it ranks beside the real facts and dilutes every later query, and it keeps costing until someone withdraws it. When unsure, leave it out.
+
+Before submitting a Claim, ask three questions. Would this change what the next person does? Would it still hold, with its conditions stated, after this diff is merged and forgotten? Could a later reader re-derive it from the code, the diff, or the PR in under a minute — and if they could, what is the one non-obvious part worth keeping instead? A Checkpoint that survives all three is usually one to three Claims; needing more than five in one call is a sign the filter did not run.
 
 ## 2. Kinds
 
