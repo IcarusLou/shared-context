@@ -97,3 +97,7 @@ The assessment above is factually correct that the *contract* admits nonempty va
 - New Claim serialization decodes under a frozen old wire type that requires the five vectors (as empty).
 - Old-style retry semantic bytes remain equal after a new low-level write; unknown keys remain rejected.
 - Direct operation semantic JSON/hash byte-identical; no schema/event/ContextRevision diffs in the change.
+
+## Implementation acceptance (2026-09-09)
+
+The final approved Disposition is implemented and independently accepted at `274170cc8bee77ae2da6ca3c6f513540f20a4fba`. Five active fields are removed; the private decoder accepts only empty legacy arrays with explicit typed nonempty rejection. Old empty wire order/keys and fat retry bytes survive; direct semantics/hash and Context/event schema remain unchanged. Authorized fixture rewrites are complete. No LegacyClaimFields carrier was introduced. Main re-ran five direct compatibility tests; full affected gates passed300tests plus13CLI tests. Current status: H-001 resolved, R2-1 accepted. See execution.md and decision log D-006/D-007 for evidence and the reviewed decoder correction.
