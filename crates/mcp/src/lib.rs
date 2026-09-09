@@ -396,24 +396,6 @@ pub struct CandidateReviewOmitted {
     pub estimated_tokens: usize,
 }
 
-/// Number of accepted Contexts at which a provisional Space has stopped being a scratch bucket
-/// and is worth naming or folding into a human-defined Space.
-pub const PROVISIONAL_SPACE_MERGE_THRESHOLD: usize = 5;
-
-/// Upper bound on advisories one Candidate list carries. The advisory is a nudge, not a report.
-const MAX_SPACE_ADVISORIES: usize = 5;
-
-/// Non-binding hint that one server-proposed Space now deserves a human decision.
-///
-/// Nothing is merged or renamed automatically: the advisory only names the Space and says why it
-/// showed up, and the reviewer decides whether to name it or move its Contexts.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SpaceAdvisory {
-    pub space_id: SpaceId,
-    pub title: String,
-    pub reason: String,
-}
-
 /// Collects the Spaces whose single current Intent head is still the server's proposal.
 ///
 /// A Space with conflicting Intent heads is never reported as provisional: no head won, so no
@@ -436,95 +418,6 @@ fn provisional_space_ids(snapshot: &DomainSnapshot) -> BTreeSet<SpaceId> {
         .collect()
 }
 
-/// Builds the merge advisories for every provisional Space that has grown past a review nudge.
-///
-/// Two independent signals qualify a Space, and both are read from the same immutable projection
-/// the rest of the response is read from:
-///
-/// * it has accumulated at least [`PROVISIONAL_SPACE_MERGE_THRESHOLD`] accepted Contexts, or
-/// * an accepted Context in a different Space points at one of its Contexts with a `related_to`
-///   relation, which means the knowledge is already being read as part of a named boundary.
-fn provisional_space_advisories(snapshot: &DomainSnapshot) -> Vec<SpaceAdvisory> {
-    let provisional = provisional_space_ids(snapshot);
-    if provisional.is_empty() {
-        return Vec::new();
-    }
-    let owners = snapshot
-        .projection
-        .spaces
-        .iter()
-        .flat_map(|(space_id, space)| {
-            space
-                .contexts
-                .keys()
-                .map(move |context_id| (*context_id, *space_id))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut incoming_related = BTreeMap::<SpaceId, usize>::new();
-    for (space_id, space) in &snapshot.projection.spaces {
-        for context in space.contexts.values() {
-            let ContextGovernanceStatus::Accepted { revision_id, .. } = &context.governance else {
-                continue;
-            };
-            let Some(revision) = context.revisions.get(revision_id) else {
-                continue;
-            };
-            for relation in &revision.revision.relations {
-                if relation.kind != ContextRelationKind::RelatedTo {
-                    continue;
-                }
-                let Some(target_space_id) = owners.get(&relation.target_context_id).copied() else {
-                    continue;
-                };
-                if target_space_id == *space_id || !provisional.contains(&target_space_id) {
-                    continue;
-                }
-                *incoming_related.entry(target_space_id).or_default() += 1;
-            }
-        }
-    }
-    let mut advisories = Vec::new();
-    for space_id in provisional {
-        let Some(space) = snapshot.projection.spaces.get(&space_id) else {
-            continue;
-        };
-        let accepted = space
-            .contexts
-            .values()
-            .filter(|context| {
-                matches!(context.governance, ContextGovernanceStatus::Accepted { .. })
-            })
-            .count();
-        let referenced = incoming_related.get(&space_id).copied().unwrap_or(0);
-        if accepted < PROVISIONAL_SPACE_MERGE_THRESHOLD && referenced == 0 {
-            continue;
-        }
-        let title = space
-            .intent
-            .heads
-            .first()
-            .and_then(|revision_id| space.intent.revisions.get(revision_id))
-            .map(|revision| revision.intent.title.clone())
-            .unwrap_or_default();
-        let referenced_clause = if referenced == 0 {
-            String::new()
-        } else {
-            format!(" and {referenced} related Context relations from other Spaces")
-        };
-        advisories.push(SpaceAdvisory {
-            space_id,
-            title,
-            reason: format!(
-                "Provisional Space has {accepted} accepted Contexts{referenced_clause}; consider `sctx space intent revise` to name it or merge into a human-defined Space"
-            ),
-        });
-        if advisories.len() == MAX_SPACE_ADVISORIES {
-            break;
-        }
-    }
-    advisories
-}
-
 /// Stable page of whole untrusted Summaries; no Review content is truncated.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CandidateListResponse {
@@ -533,10 +426,6 @@ pub struct CandidateListResponse {
     /// Compact projection of the same budgeted page; empty under `full`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compact_reviews: Vec<CompactCandidateReview>,
-    /// Merge nudges for provisional Spaces, outside the per-Review token budget. Never present
-    /// when no provisional Space has grown past the threshold.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub space_advisories: Vec<SpaceAdvisory>,
     /// Spaces whose current Intent head is still the server's proposal. This is an in-process
     /// aid for marking the Full Review rows; it never reaches the wire.
     #[serde(skip)]
@@ -555,7 +444,6 @@ impl CandidateListResponse {
         CompactCandidateListResponse {
             reviews: self.compact_reviews.clone(),
             detail_level: ContextPackDetailLevel::Compact,
-            space_advisories: self.space_advisories.clone(),
             omitted: self.omitted.clone(),
             next_cursor: self.next_cursor.clone(),
             estimated_tokens: self.estimated_tokens,
@@ -571,9 +459,6 @@ impl CandidateListResponse {
 pub struct CompactCandidateListResponse {
     pub reviews: Vec<CompactCandidateReview>,
     pub detail_level: ContextPackDetailLevel,
-    /// Merge nudges for provisional Spaces, outside the per-Review token budget.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub space_advisories: Vec<SpaceAdvisory>,
     pub omitted: Vec<CandidateReviewOmitted>,
     pub next_cursor: Option<String>,
     pub estimated_tokens: usize,
@@ -3018,7 +2903,6 @@ impl Runtime {
         )?;
         let snapshot = self.snapshot()?;
         let provisional_space_ids = provisional_space_ids(&snapshot);
-        let space_advisories = provisional_space_advisories(&snapshot);
         let mut reviews = Vec::new();
         let mut compact_reviews = Vec::new();
         let mut omitted = Vec::new();
@@ -3067,7 +2951,6 @@ impl Runtime {
             reviews,
             detail_level,
             compact_reviews,
-            space_advisories,
             provisional_space_ids,
             omitted,
             next_cursor: page.next_cursor,
@@ -9638,7 +9521,8 @@ mod tests {
     /// Builds one provisional Space by patching the serialized `space.created` event: only
     /// Candidate Confirmation writes the flag, and this test is about how the flag is read.
     fn provisional_space_event(title: &str) -> Event {
-        let human = Event::space_created(advisory_intent(title), None).expect("valid Intent");
+        let human =
+            Event::space_created(provisional_test_intent(title), None).expect("valid Intent");
         let mut json = serde_json::to_value(&human).expect("event serializes");
         json["intent_revision"]["provisional"] = Value::Bool(true);
         let bytes = serde_json::to_vec(&json).expect("event serializes");
@@ -9649,77 +9533,16 @@ mod tests {
             .clone()
     }
 
-    fn advisory_intent(title: &str) -> sctx_domain::IntentSnapshot {
+    fn provisional_test_intent(title: &str) -> sctx_domain::IntentSnapshot {
         sctx_domain::IntentSnapshot {
             title: title.to_owned(),
-            problem: "provisional Spaces accumulate without a human boundary".to_owned(),
-            desired_outcome: "a reviewer names or merges the Space".to_owned(),
-            in_scope: vec!["provisional Space advisories".to_owned()],
+            problem: "distinguish proposed and human-defined Space boundaries".to_owned(),
+            desired_outcome: "retain provisional markers for proposals".to_owned(),
+            in_scope: vec!["provisional Space markers".to_owned()],
             out_of_scope: vec!["automatic merging".to_owned()],
-            acceptance_conditions: vec!["the advisory only nudges".to_owned()],
+            acceptance_conditions: vec!["only proposals carry provisional markers".to_owned()],
             domain_terms: vec!["space".to_owned()],
         }
-    }
-
-    fn advisory_context(statement: &str, relations: Vec<ContextRelation>) -> ContextRevisionDraft {
-        ContextRevisionDraft {
-            kind: ContextKind::Discovery,
-            topic_key: None,
-            problem_view: None,
-            statement: statement.to_owned(),
-            rationale: "recorded by the advisory fixture".to_owned(),
-            applicability: Applicability::default(),
-            assumptions: Vec::new(),
-            recheck_when: Vec::new(),
-            hints: Vec::new(),
-            relations,
-            evidence: vec![EvidenceSnapshotDraft {
-                kind: EvidenceType::ExperimentRecord,
-                supports: statement.to_owned(),
-                content: json!({"command": "fixture", "actual": "recorded"}),
-                interpretation: "fixture observation".to_owned(),
-                limitations: vec!["fixture".to_owned()],
-            }],
-        }
-    }
-
-    /// Appends one accepted Context and returns its `ContextId`.
-    fn accept_context(
-        store: &GitStore,
-        space_id: SpaceId,
-        statement: &str,
-        relations: Vec<ContextRelation>,
-    ) -> ContextId {
-        let event =
-            Event::context_revision_added(space_id, advisory_context(statement, relations), None)
-                .expect("valid Context revision");
-        let (context_id, revision_id) = match event.payload() {
-            EventPayload::ContextRevisionAdded {
-                context_id,
-                revision,
-                ..
-            } => (*context_id, revision.revision_id),
-            _ => unreachable!("context.revision_added"),
-        };
-        store
-            .append_event(AppendRequest::event(event))
-            .expect("append Context revision");
-        let publication = Event::publication_changed(
-            space_id,
-            context_id,
-            sctx_domain::PublicationDraft {
-                previous_publication_ids: Vec::new(),
-                action: sctx_domain::PublicationAction::Publish,
-                revision_id,
-                review_event_ids: Vec::new(),
-            },
-            None,
-        )
-        .expect("valid publication");
-        store
-            .append_event(AppendRequest::event(publication))
-            .expect("append publication");
-        context_id
     }
 
     fn space_id_of(event: &Event) -> SpaceId {
@@ -9730,7 +9553,7 @@ mod tests {
     }
 
     #[test]
-    fn only_provisional_spaces_past_the_threshold_or_referenced_get_an_advisory() {
+    fn provisional_space_ids_include_proposals_but_not_human_named_spaces() {
         let temporary = tempfile::tempdir().expect("temporary root");
         let store =
             GitStore::bootstrap_local(temporary.path().join("installation")).expect("bootstrap");
@@ -9746,71 +9569,19 @@ mod tests {
         store
             .append_event(AppendRequest::event(small))
             .expect("append provisional Space");
-        let human =
-            Event::space_created(advisory_intent("Human named Space"), None).expect("valid Intent");
-        let human_id = space_id_of(&human);
+        let human = Event::space_created(provisional_test_intent("Human named Space"), None)
+            .expect("valid Intent");
         store
             .append_event(AppendRequest::event(human))
             .expect("append human Space");
 
-        for index_of in 0..PROVISIONAL_SPACE_MERGE_THRESHOLD {
-            accept_context(
-                &store,
-                grown_id,
-                &format!("Grown provisional fact {index_of}"),
-                Vec::new(),
-            );
-        }
-        let small_context = accept_context(
-            &store,
-            small_id,
-            "The only fact in the small provisional Space",
-            Vec::new(),
-        );
-
         index.synchronize().expect("synchronize");
         let snapshot = index.domain_snapshot().expect("snapshot");
-        // The small Space is provisional but has one accepted Context and no inbound relation.
-        let advisories = provisional_space_advisories(&snapshot);
-        assert_eq!(advisories.len(), 1);
-        assert_eq!(advisories[0].space_id, grown_id);
-        assert_eq!(advisories[0].title, "Grown provisional Space");
-        assert_eq!(
-            advisories[0].reason,
-            format!(
-                "Provisional Space has {PROVISIONAL_SPACE_MERGE_THRESHOLD} accepted Contexts; consider `sctx space intent revise` to name it or merge into a human-defined Space"
-            )
-        );
         assert_eq!(
             provisional_space_ids(&snapshot),
             BTreeSet::from([grown_id, small_id])
         );
 
-        // A `related_to` edge from a human-defined Space is the second, independent trigger.
-        accept_context(
-            &store,
-            human_id,
-            "The human Space already reads the provisional knowledge",
-            vec![ContextRelation {
-                target_context_id: small_context,
-                kind: ContextRelationKind::RelatedTo,
-                rationale: "the named boundary already depends on this fact".to_owned(),
-                supports: vec!["fixture relation".to_owned()],
-            }],
-        );
-        index.synchronize().expect("synchronize");
-        let snapshot = index.domain_snapshot().expect("snapshot");
-        let advisories = provisional_space_advisories(&snapshot);
-        assert_eq!(advisories.len(), 2);
-        let small_advisory = advisories
-            .iter()
-            .find(|advisory| advisory.space_id == small_id)
-            .expect("the referenced provisional Space is advised");
-        assert_eq!(
-            small_advisory.reason,
-            "Provisional Space has 1 accepted Contexts and 1 related Context relations from other Spaces; consider `sctx space intent revise` to name it or merge into a human-defined Space"
-        );
-        // Nothing was merged or renamed: both Spaces still exist with their proposed titles.
         assert_eq!(snapshot.projection.spaces.len(), 3);
     }
 }

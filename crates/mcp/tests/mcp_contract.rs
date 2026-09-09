@@ -3472,8 +3472,13 @@ fn candidates_of_one_task_share_and_reuse_one_proposed_space() {
             ..
         }) if space_id == first_confirmed.primary_space_id
     )));
-    // One accepted Context is below the merge threshold and nothing references it yet.
-    assert!(compact.space_advisories.is_empty());
+    assert!(
+        serde_json::to_value(&compact)
+            .unwrap()
+            .get("space_advisories")
+            .is_none(),
+        "retired merge advisories must not appear on the wire"
+    );
 
     // The recommendation this Candidate was handed before its sibling confirmed no longer appears
     // in the refreshed view, but it still names this Task's proposed group: confirming it lands in
