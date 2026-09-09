@@ -930,7 +930,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "sctx-adapter-codex"
-version = "0.2.0-dev.5"
+version = "0.2.0-dev.8"
 dependencies = [
  "sctx-agent-adapter",
  "sctx-domain",
@@ -940,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "sctx-adapter-cursor"
-version = "0.2.0-dev.5"
+version = "0.2.0-dev.8"
 dependencies = [
  "sctx-agent-adapter",
  "sctx-domain",
@@ -950,7 +950,7 @@ dependencies = [
 
 [[package]]
 name = "sctx-agent-adapter"
-version = "0.2.0-dev.5"
+version = "0.2.0-dev.8"
 dependencies = [
  "sctx-domain",
  "sctx-search",
@@ -960,7 +960,7 @@ dependencies = [
 
 [[package]]
 name = "sctx-cli"
-version = "0.2.0-dev.5"
+version = "0.2.0-dev.8"
 dependencies = [
  "fs2",
  "rusqlite",
@@ -990,7 +990,7 @@ dependencies = [
 
 [[package]]
 name = "sctx-domain"
-version = "0.2.0-dev.5"
+version = "0.2.0-dev.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -1000,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "sctx-engineering-graph"
-version = "0.2.0-dev.5"
+version = "0.2.0-dev.8"
 dependencies = [
  "rusqlite",
  "sctx-domain",
@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "sctx-event-schema"
-version = "0.2.0-dev.5"
+version = "0.2.0-dev.8"
 dependencies = [
  "proptest",
  "sctx-domain",
@@ -1023,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "sctx-git-store"
-version = "0.2.0-dev.5"
+version = "0.2.0-dev.8"
 dependencies = [
  "fs2",
  "sctx-domain",
@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "sctx-index"
-version = "0.2.0-dev.5"
+version = "0.2.0-dev.8"
 dependencies = [
  "fs2",
  "rusqlite",
@@ -1056,7 +1056,7 @@ dependencies = [
 
 [[package]]
 name = "sctx-installer"
-version = "0.2.0-dev.5"
+version = "0.2.0-dev.8"
 dependencies = [
  "fs2",
  "libc",
@@ -1086,7 +1086,7 @@ dependencies = [
 
 [[package]]
 name = "sctx-local-state"
-version = "0.2.0-dev.5"
+version = "0.2.0-dev.8"
 dependencies = [
  "fs2",
  "sctx-domain",
@@ -1100,7 +1100,7 @@ dependencies = [
 
 [[package]]
 name = "sctx-log-service"
-version = "0.2.0-dev.5"
+version = "0.2.0-dev.8"
 dependencies = [
  "fs2",
  "libc",
@@ -1116,7 +1116,7 @@ dependencies = [
 
 [[package]]
 name = "sctx-log-sync"
-version = "0.2.0-dev.5"
+version = "0.2.0-dev.8"
 dependencies = [
  "fs2",
  "nix",
@@ -1131,7 +1131,7 @@ dependencies = [
 
 [[package]]
 name = "sctx-mcp"
-version = "0.2.0-dev.5"
+version = "0.2.0-dev.8"
 dependencies = [
  "fs2",
  "rusqlite",
@@ -1153,7 +1153,7 @@ dependencies = [
 
 [[package]]
 name = "sctx-scenario-contract"
-version = "0.2.0-dev.5"
+version = "0.2.0-dev.8"
 dependencies = [
  "semver",
  "serde",
@@ -1163,7 +1163,7 @@ dependencies = [
 
 [[package]]
 name = "sctx-scenario-runner"
-version = "0.2.0-dev.5"
+version = "0.2.0-dev.8"
 dependencies = [
  "rusqlite",
  "sctx-domain",
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "sctx-search"
-version = "0.2.0-dev.5"
+version = "0.2.0-dev.8"
 dependencies = [
  "ndarray 0.16.1",
  "ort",
@@ -1197,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "sctx-task-runtime"
-version = "0.2.0-dev.5"
+version = "0.2.0-dev.8"
 dependencies = [
  "rusqlite",
  "sctx-domain",
@@ -1208,7 +1208,7 @@ dependencies = [
 
 [[package]]
 name = "sctx-telemetry"
-version = "0.2.0-dev.5"
+version = "0.2.0-dev.8"
 dependencies = [
  "libc",
  "nix",

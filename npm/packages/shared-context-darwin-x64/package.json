@@ -1,6 +1,6 @@
 {
   "name": "@bytedance-dev/shared-context-darwin-x64",
-  "version": "0.2.0-dev.5",
+  "version": "0.2.0-dev.8",
   "description": "Shared Context native CLI for macOS x64",
   "license": "UNLICENSED",
   "os": [
