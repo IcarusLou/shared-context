@@ -2453,14 +2453,13 @@ fn resolve_hook_action(
         }
     };
     ResolvedAgentAction {
-        additional_context: task_resolution.additional_context.or(additional_context),
+        additional_context,
         system_message: task_resolution.system_message.or(system_message),
     }
 }
 
 #[derive(Default)]
 struct ResolvedTaskOperation {
-    additional_context: Option<String>,
     system_message: Option<String>,
 }
 
@@ -2491,7 +2490,6 @@ fn resolve_task_operation(
                     );
                 }
                 return Ok(ResolvedTaskOperation {
-                    additional_context: None,
                     system_message: notify.then(|| INTENT_BOOTSTRAP_REMINDER.to_owned()),
                 });
             };
@@ -2642,7 +2640,6 @@ fn finalize_checkpointed_episode(
     };
     recover_one_pending_episode_build(&root, &runtime, locator)?;
     Ok(ResolvedTaskOperation {
-        additional_context: None,
         system_message: Some(system_message),
     })
 }
