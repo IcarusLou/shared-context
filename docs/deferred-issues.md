@@ -77,3 +77,7 @@
 ## 2026-09-09 新增（R1-1 边界记录）
 
 38. **Codex fixture profile 与线上宿主版本脱节**：`FIXTURE_PROFILE_VERSION` 与 `fixtures/agents/codex-0.147.json` 仍标记 0.147.0，#34 指纹来自 0.153.2。R1-1 仅在数组末尾追加脱敏后的五键 SessionEnd 指纹，未改变已有下标，也未 bump profile。版本标签仅供参考、不门控能力；完整 profile 更新与版本命名另议，本轮不执行。
+
+## 2026-09-09 新增（R4-2 / KD7 预注册）
+
+39. **usage prior 重新进入排序须另行裁定**：`USAGE_PRIOR_ENABLED = false`。只有判决覆盖率 ≥60% 且 `checkpoint_derived` 强证据样本 ≥100 条，才具备重新讨论的条件；达到门槛不会自动打开。`ignored + session_close` 为弱证据未采用，只参与覆盖率与趋势，不计入强证据标定。观察期间不调整排序或权限面。

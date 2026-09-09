@@ -1182,6 +1182,11 @@ pub trait UsagePriorSource: fmt::Debug + Send + Sync {
     fn usage_counts(&self, context_ids: &[ContextId]) -> BTreeMap<ContextId, ContextUsageCounts>;
 }
 
+/// Disabled during collection. Reconsider only after verdict coverage >= 60% AND at least
+/// 100 checkpoint-derived samples, with fresh review; reaching those thresholds never enables it.
+/// See R4-2/KD7 and deferred-issues #39. Weak session-close verdicts do not calibrate this prior.
+pub const USAGE_PRIOR_ENABLED: bool = false;
+
 /// Score multiplier for a Context at least one earlier Task's Checkpoint restated.
 pub const USAGE_REUSED_BONUS_BASIS_POINTS: u16 = 11_500;
 
@@ -5414,9 +5419,9 @@ fn final_score_basis_points(evidence: &AssociationEvidence) -> u16 {
     u16::try_from(points).expect("association score basis points fit u16")
 }
 
-/// Reweights fused item scores by how earlier Tasks used each Context.
+/// Attaches strong usage counts and, only when explicitly enabled, reweights fused scores.
 ///
-/// The prior runs after every demotion, so it reorders equally ranked Contexts without ever
+/// When enabled, the prior runs after every demotion and reorders equally ranked Contexts without
 /// undoing a conflict, stale, or historical demotion decision. Without a source, nothing is read
 /// and no score changes.
 fn apply_usage_prior(
@@ -5444,10 +5449,12 @@ fn apply_usage_prior(
             continue;
         }
         candidate.item.context.usage = usage;
-        candidate.injection_score_basis_points = usage_prior_score(
-            candidate.injection_score_basis_points,
-            usage_multiplier_basis_points(usage),
-        );
+        if USAGE_PRIOR_ENABLED {
+            candidate.injection_score_basis_points = usage_prior_score(
+                candidate.injection_score_basis_points,
+                usage_multiplier_basis_points(usage),
+            );
+        }
     }
 }
 
@@ -6464,6 +6471,9 @@ fn compact_item_reasons(item: &TaskContextItem, sole_repository: Option<&str>) -
 ///
 /// Reporting an ignore that changed nothing would read as a warning the ranking never applied.
 fn usage_prior_reason(usage: ContextUsageCounts) -> Option<String> {
+    if !USAGE_PRIOR_ENABLED {
+        return None;
+    }
     if usage.reused >= 1 {
         return Some(format!("Reused in {} prior task(s).", usage.reused));
     }
@@ -9515,7 +9525,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_prior_promotes_reuse_and_only_penalizes_repeated_ignores() {
+    fn disabled_usage_prior_keeps_its_calibration_formula_but_emits_no_rank_reason() {
         let reused = ContextUsageCounts {
             reused: 2,
             ignored: 9,
@@ -9556,15 +9566,9 @@ mod tests {
             usage_prior_score(4_000, USAGE_IGNORED_PENALTY_BASIS_POINTS),
             3_600
         );
-        assert_eq!(
-            usage_prior_reason(reused).as_deref(),
-            Some("Reused in 2 prior task(s).")
-        );
+        assert_eq!(usage_prior_reason(reused), None);
         assert_eq!(usage_prior_reason(ignored_once), None);
-        assert_eq!(
-            usage_prior_reason(ignored_often).as_deref(),
-            Some("Ignored in 3 prior task(s).")
-        );
+        assert_eq!(usage_prior_reason(ignored_often), None);
         assert_eq!(usage_prior_reason(ContextUsageCounts::default()), None);
     }
 

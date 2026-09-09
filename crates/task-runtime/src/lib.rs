@@ -4055,7 +4055,8 @@ impl TaskRuntime {
         Ok(written)
     }
 
-    /// Aggregates the recorded usage outcomes of the requested Contexts.
+    /// Aggregates checkpoint-derived usage outcomes of the requested Contexts.
+    /// Weak Session-close omissions are excluded from strong evidence calibration.
     ///
     /// # Errors
     ///
@@ -4081,7 +4082,7 @@ impl TaskRuntime {
             let mut statement = connection
                 .prepare(&format!(
                     "SELECT context_id, outcome, COUNT(*) FROM context_usage
-                     WHERE context_id IN ({placeholders})
+                     WHERE context_id IN ({placeholders}) AND basis = 'checkpoint_derived'
                      GROUP BY context_id, outcome"
                 ))
                 .map_err(sql_error("prepare Context usage totals"))?;

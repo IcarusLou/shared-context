@@ -186,3 +186,14 @@ Affected issue/code: R4-1, Runtime session-close method, CLI CleanupSessionState
 Validation evidence: fullRuntime72passed; full CLI lifecycle10passed including both real hosts, real checkpoint→Builder strong verdict preservation, inactive Tasks, model-less Codex end and bounded quiet lock contention. Runtime concurrency8callers converges, excludes same-key other-host and same-host other-session, preserves refuted/time, permits later strong upgrades. Workspaceclippy/fmt passed after test-only fixture length annotation. Logs /private/tmp/sctx-r4-1-*.log.
 Status: agent-selected
 Supersedes / superseded by: none.
+
+## D-017 — Separate strong observation counts from disabled ranking
+Unspecified question / design reference: KD6/KD7 require weak observations separated while keeping truthful read surfaces and prior off.
+Chosen approach: a false constant gates score multiplication and its reason text; continue populating Context.usage from actual checkpoint_derived rows only. Keep the existing formula/constants for a future explicitly reviewed activation, but never enable by evaluating live coverage. The recall stats reader will expose weak counts separately. Existing ranking contract becomes a same-fixture before/after neutrality check at the ignored threshold, retaining raw usage assertions.
+Alternatives considered: zero all counts (misleading); count weak ignored in Context.usage (mislabels evidence); auto-enable at a sample threshold (authority explicitly withheld by KD7).
+Rationale and assumptions: data collection and display can continue independently of ranking influence; old strong-only rows preserve existing count meaning.
+Tradeoffs / consequences: usage no longer adds ranking reasons or bonus/penalty. Prior reactivation needs coverage>=60% AND>=100strong samples followed by fresh review, recorded in deferred issues. No other ranking, threshold, schema or permission change.
+Affected issue/code: R4-2a, Search prior/reasons, Runtime strong totals, MCP contract and current development documentation.
+Validation evidence: fullSearch137passed/8ignored; fullRuntime72passed; MCP usage8passed including same-fixture Full item equality after only neutralizing actual counters, unchanged Compact order and no usage reason with reused3/ignored3. Weak-only rows absent from strong totals while refuted remains. Workspaceclippy/fmt passed after a test-only explicit Default type correction. Logs /private/tmp/sctx-r4-2a-*.log.
+Status: agent-selected
+Supersedes / superseded by: none.

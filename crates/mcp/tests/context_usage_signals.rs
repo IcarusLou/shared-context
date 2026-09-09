@@ -273,7 +273,7 @@ fn injections_are_recorded_and_one_checkpoint_separates_reuse_from_omission() {
 }
 
 #[test]
-fn a_reused_context_outranks_its_sibling_and_says_so_in_the_compact_pack() {
+fn strong_usage_stays_visible_without_reweighting_or_rank_reasons() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("usage prior root");
     let (_, reused, _) = accepted_context(&root, REUSED_STATEMENT);
@@ -295,6 +295,11 @@ fn a_reused_context_outranks_its_sibling_and_says_so_in_the_compact_pack() {
         &[reused]
     ));
 
+    for index in 0..2 {
+        let session = format!("usage-prior-more-{index}");
+        intent_update(&root, &session);
+        assert!(!checkpoint(&root, &session, REUSED_STATEMENT, &[reused]));
+    }
     let second = intent_update(&root, "usage-prior-second");
     let full = second
         .context
@@ -302,7 +307,7 @@ fn a_reused_context_outranks_its_sibling_and_says_so_in_the_compact_pack() {
         .iter()
         .find(|item| item.context.context_id == reused)
         .expect("the reused Context is still retrievable");
-    assert_eq!(full.context.usage.reused, 1);
+    assert_eq!(full.context.usage.reused, 3);
     assert_eq!(full.context.usage.ignored, 0);
 
     let compact = task_context_readonly_with_detail_at_root(
@@ -321,28 +326,35 @@ fn a_reused_context_outranks_its_sibling_and_says_so_in_the_compact_pack() {
         .iter()
         .map(|item| item.context_id)
         .collect::<Vec<_>>();
-    let reused_rank = order.iter().position(|id| *id == reused).unwrap();
-    let ignored_rank = order.iter().position(|id| *id == ignored).unwrap();
-    assert!(
-        reused_rank < ignored_rank,
-        "the reused Context must sort ahead of its equally scored sibling: {order:?}"
-    );
-    assert!(
-        compact.compact_items[reused_rank]
-            .why
+    assert_eq!(
+        order,
+        first
+            .context
+            .items
             .iter()
-            .any(|reason| reason == "Reused in 1 prior task(s)."),
-        "compact why explains the prior: {:?}",
-        compact.compact_items[reused_rank].why
+            .map(|item| item.context.context_id)
+            .collect::<Vec<_>>()
     );
-    assert!(
-        compact.compact_items[ignored_rank]
-            .why
+    let mut normalized = second.context.items.clone();
+    for item in &mut normalized {
+        item.context.usage = sctx_search::ContextUsageCounts::default();
+    }
+    assert_eq!(
+        normalized, first.context.items,
+        "only truthful usage counters may change"
+    );
+    let ignored_item = second
+        .context
+        .items
+        .iter()
+        .find(|item| item.context.context_id == ignored)
+        .unwrap();
+    assert_eq!(ignored_item.context.usage.ignored, 3);
+    assert!(compact.compact_items.iter().all(|item| {
+        item.why
             .iter()
-            .all(|reason| !reason.contains("Reused in") && !reason.contains("Ignored in")),
-        "one omission is not enough to report an ignore: {:?}",
-        compact.compact_items[ignored_rank].why
-    );
+            .all(|reason| !reason.contains("Reused in") && !reason.contains("Ignored in"))
+    }));
 }
 
 /// A Task that explicitly contradicts a Context it was given records the refutation, and no later

@@ -352,6 +352,18 @@ fn session_close_covers_all_owned_tasks_without_overwriting_strong_verdicts() {
             .unwrap(),
         3
     );
+    let strong = runtime
+        .context_usage_totals(&[one.context_id, two.context_id])
+        .unwrap();
+    assert_eq!(
+        strong[&one.context_id],
+        ContextUsageTotals {
+            reused: 0,
+            ignored: 0,
+            refuted: 1
+        }
+    );
+    assert!(!strong.contains_key(&two.context_id));
     runtime
         .record_context_usage_at(
             &[ContextUsageRecord {
