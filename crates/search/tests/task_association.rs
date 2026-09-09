@@ -2201,6 +2201,77 @@ fn compact_detail_level_fits_more_evidenced_items_in_the_default_budget() {
 }
 
 #[test]
+fn compact_top_k_omissions_keep_full_association_byte_charges() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("compact omissions")).unwrap();
+    for index in 0..12 {
+        let space = add_space(
+            &store,
+            &format!("Omission{index}"),
+            "omissionneedle boundary",
+        );
+        add_accepted_context(
+            &store,
+            space,
+            &format!("omissionneedle boundary case {index}"),
+            applicability("omissions", "server", "active"),
+        );
+    }
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    let engine = SearchEngine::new(index);
+    let mut request = TaskContextRequest::automatic(
+        TaskId::new(),
+        task("omissionneedle boundary"),
+        Vec::new(),
+        100_000,
+    );
+    request.mode = ContextPackMode::Explicit;
+    request.max_spaces = 1;
+    let full = engine.task_context_pack(&request).unwrap();
+    let compact = engine
+        .task_context_pack_with_detail(&request, ContextPackDetailLevel::Compact)
+        .unwrap();
+    let omissions = |pack: &sctx_search::TaskContextPack| {
+        pack.omitted
+            .iter()
+            .filter(|omitted| omitted.reason == "space_top_k")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let full_omissions = omissions(&full);
+    assert_eq!(
+        full_omissions.len(),
+        9,
+        "eight named Spaces and one aggregated remainder"
+    );
+    assert_eq!(full_omissions.last().unwrap().count, 3);
+    assert!(
+        full_omissions
+            .iter()
+            .all(|omitted| omitted.estimated_tokens > 0)
+    );
+    assert_eq!(
+        omissions(&compact),
+        full_omissions,
+        "Compact retains the old Full-byte charges, including the unnamed aggregate"
+    );
+    assert_eq!(full.items.len(), 1);
+    assert_eq!(compact.compact_items.len(), 1);
+    assert_eq!(
+        compact.compact_items[0].context_id,
+        full.items[0].context.context_id
+    );
+    for pack in [&full, &compact] {
+        assert_eq!(
+            pack.estimated_tokens,
+            estimate_task_context_payload_tokens(pack)
+        );
+        assert!(pack.estimated_tokens <= request.token_budget);
+    }
+}
+
+#[test]
 fn compact_detail_level_drops_machine_channels_and_full_keeps_the_token_explanation() {
     let (_temporary, index, _contexts) = compact_budget_fixture();
     let engine = SearchEngine::new(index);

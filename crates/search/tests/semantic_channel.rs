@@ -1213,6 +1213,61 @@ fn a_semantic_hit_alone_makes_a_space_injectable_and_explains_itself() {
 }
 
 #[test]
+fn compact_semantic_only_association_keeps_its_empty_reasons_and_injected_context() {
+    let fixture = Fixture::new();
+    let (context_id, revision_id) = fixture.accept(
+        fixture.silent_space,
+        &format!("{SILENT_TOPIC} shapes the outbox drain"),
+    );
+    let (channel, _) = ScriptedChannel::hits(vec![SemanticHit {
+        revision_id,
+        similarity_basis_points: 6_400,
+    }]);
+    let engine = fixture.engine().with_semantic_channel(channel);
+    let request = TaskContextRequest::automatic(TaskId::new(), working_intent(), Vec::new(), 8_000);
+    let full = engine.task_context_pack(&request).unwrap();
+    let compact = engine
+        .task_context_pack_with_detail(&request, sctx_search::ContextPackDetailLevel::Compact)
+        .unwrap();
+    assert_eq!(full.associations.len(), 1);
+    assert!(
+        full.associations[0]
+            .reasons
+            .iter()
+            .all(|reason| reason.starts_with('{')),
+        "only machine reasons exist before the Compact projection"
+    );
+    assert_eq!(compact.compact_associations.len(), 1);
+    assert_eq!(
+        compact.compact_associations[0].space_id,
+        full.associations[0].space_id
+    );
+    assert_eq!(
+        compact.compact_associations[0].score.to_bits(),
+        full.associations[0].score.to_bits()
+    );
+    assert!(compact.compact_associations[0].reasons.is_empty());
+    assert_eq!(compact.compact_items.len(), 1);
+    assert_eq!(compact.compact_items[0].context_id, context_id);
+    assert_eq!(
+        compact.estimated_tokens,
+        sctx_search::estimate_task_context_payload_tokens(&compact)
+    );
+    assert_eq!(
+        serde_json::to_string(&compact).unwrap(),
+        serde_json::to_string(
+            &engine
+                .task_context_pack_with_detail(
+                    &request,
+                    sctx_search::ContextPackDetailLevel::Compact
+                )
+                .unwrap()
+        )
+        .unwrap()
+    );
+}
+
+#[test]
 fn the_semantic_channel_fuses_at_the_hint_channel_weight_without_deflating_lexical_scores() {
     let fixture = Fixture::new();
     fixture.accept(

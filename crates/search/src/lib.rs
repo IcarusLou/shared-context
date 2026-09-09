@@ -1448,6 +1448,7 @@ impl SearchEngine {
                     resolved_focus.is_some() && graph.is_none(),
                     ContextPackMode::AutomaticInjection,
                     &[],
+                    AssociationReasonPolicy::Full,
                 )
             })?;
             if graph_snapshot.is_some() && !self.graph_snapshot_unchanged(graph_snapshot) {
@@ -1479,6 +1480,7 @@ impl SearchEngine {
                 resolved_focus.is_some(),
                 ContextPackMode::AutomaticInjection,
                 &[],
+                AssociationReasonPolicy::Full,
             )
         })?;
         Ok(TaskSpaceAssociationsResponse {
@@ -1653,6 +1655,12 @@ impl SearchEngine {
                 match &plan.semantic {
                     Some(SemanticOutcome::Hits(hits)) => hits.as_slice(),
                     Some(SemanticOutcome::Unavailable) | None => &[],
+                },
+                match detail_level {
+                    ContextPackDetailLevel::Full => AssociationReasonPolicy::Full,
+                    ContextPackDetailLevel::Compact => AssociationReasonPolicy::Compact {
+                        max_spaces: request.max_spaces,
+                    },
                 },
             )?;
             let mut space_omissions = space_top_k_omissions(
@@ -3202,6 +3210,22 @@ fn normalized_values(values: &[String]) -> BTreeSet<String> {
         .collect()
 }
 
+// Dropped Spaces still need their Full bytes for the existing top-k omission charge.
+#[derive(Clone, Copy)]
+enum AssociationReasonPolicy {
+    Full,
+    Compact { max_spaces: usize },
+}
+
+impl AssociationReasonPolicy {
+    const fn detail_for_rank(self, rank: usize) -> ContextPackDetailLevel {
+        match self {
+            Self::Compact { max_spaces } if rank < max_spaces => ContextPackDetailLevel::Compact,
+            Self::Full | Self::Compact { .. } => ContextPackDetailLevel::Full,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn infer_task_space_associations(
     connection: &Connection,
@@ -3216,6 +3240,7 @@ fn infer_task_space_associations(
     focus_text_fallback_enabled: bool,
     mode: ContextPackMode,
     semantic_hits: &[SemanticHit],
+    reason_policy: AssociationReasonPolicy,
 ) -> Result<TaskAssociationInference> {
     let selection = automatic_eligible_query_tokens(connection, query_tokens, mode)?;
     let coverage_basis = AutomaticCoverageBasis::from_selection(&selection);
@@ -3296,7 +3321,6 @@ fn infer_task_space_associations(
             space_evidence,
             &coverage_basis,
             mode,
-            &token_explanation,
             &mut gate_omitted,
         ) {
             associations.push(built);
@@ -3308,7 +3332,13 @@ fn infer_task_space_associations(
             .total_cmp(&left.score)
             .then_with(|| left.space_id.cmp(&right.space_id))
     });
-    TaskSpaceAssociation::validate_collection(task_id, &associations)?;
+    populate_association_reasons(
+        task_id,
+        &mut associations,
+        &evidence,
+        &token_explanation,
+        reason_policy,
+    )?;
     Ok(TaskAssociationInference {
         associations,
         evidence,
@@ -5247,7 +5277,6 @@ fn association(
     evidence: &AssociationEvidence,
     coverage_basis: &AutomaticCoverageBasis,
     mode: ContextPackMode,
-    token_explanation: &AutomaticQueryTokenExplanation,
     omitted: &mut Vec<ContextPackOmitted>,
 ) -> Option<TaskSpaceAssociation> {
     if !evidence.intent_matched
@@ -5291,16 +5320,6 @@ fn association(
         }
     }
     let score = association_score(evidence);
-    let mut reasons = association_reasons(evidence);
-    if !token_explanation.dropped_tokens.is_empty() {
-        // The projection, not the whole selection: the Pack carries one full copy at the top
-        // level, and repeating every token inside every Association spends the injection budget
-        // on saying the same thing once per Space.
-        reasons.push(
-            serde_json::to_string(&token_explanation.compact_projection())
-                .expect("automatic query token explanation is always serializable"),
-        );
-    }
     Some(TaskSpaceAssociation {
         task_id,
         space_id,
@@ -5309,7 +5328,7 @@ fn association(
         matched_artifacts: evidence.matched_artifacts.iter().cloned().collect(),
         matched_contexts: evidence.matched_contexts.iter().copied().collect(),
         relation_paths: evidence.relation_paths.iter().cloned().collect(),
-        reasons,
+        reasons: Vec::new(),
     })
 }
 
@@ -5534,18 +5553,54 @@ fn intent_conflict_handoff(
         })
 }
 
-fn association_reasons(evidence: &AssociationEvidence) -> Vec<String> {
-    let mut reasons = vec![
-        serde_json::to_string(&TaskAssociationFusionExplanation {
-            algorithm: TaskAssociationFusionAlgorithm::ReciprocalRankFusion,
-            rrf_k: u16::try_from(RRF_K).expect("RRF K fits u16"),
-            channels: evidence.channel_features.clone(),
-            fused_score_basis_points: evidence.fused_score_basis_points,
-            minimum_score_basis_points: MINIMUM_ASSOCIATION_SCORE_BASIS_POINTS,
-            final_score_basis_points: final_score_basis_points(evidence),
-        })
-        .expect("Task Association fusion explanation is always serializable"),
-    ];
+fn association_fusion_reason(evidence: &AssociationEvidence) -> String {
+    serde_json::to_string(&TaskAssociationFusionExplanation {
+        algorithm: TaskAssociationFusionAlgorithm::ReciprocalRankFusion,
+        rrf_k: u16::try_from(RRF_K).expect("RRF K fits u16"),
+        channels: evidence.channel_features.clone(),
+        fused_score_basis_points: evidence.fused_score_basis_points,
+        minimum_score_basis_points: MINIMUM_ASSOCIATION_SCORE_BASIS_POINTS,
+        final_score_basis_points: final_score_basis_points(evidence),
+    })
+    .expect("Task Association fusion explanation is always serializable")
+}
+
+fn populate_association_reasons(
+    task_id: TaskId,
+    associations: &mut [TaskSpaceAssociation],
+    evidence: &BTreeMap<SpaceId, AssociationEvidence>,
+    token_explanation: &AutomaticQueryTokenExplanation,
+    policy: AssociationReasonPolicy,
+) -> Result<()> {
+    let mut validation_only = Vec::new();
+    for (rank, association) in associations.iter_mut().enumerate() {
+        let source = &evidence[&association.space_id];
+        let detail = policy.detail_for_rank(rank);
+        association.reasons = association_reasons(source, token_explanation, detail);
+        if detail == ContextPackDetailLevel::Compact && association.reasons.is_empty() {
+            // Semantic-only evidence can have no prose. Keep its real confidence basis for
+            // unchanged domain validation, then remove only this explicitly tracked payload.
+            association.reasons.push(association_fusion_reason(source));
+            validation_only.push(rank);
+        }
+    }
+    TaskSpaceAssociation::validate_collection(task_id, associations)?;
+    for rank in validation_only {
+        associations[rank].reasons.clear();
+    }
+    Ok(())
+}
+
+fn association_reasons(
+    evidence: &AssociationEvidence,
+    token_explanation: &AutomaticQueryTokenExplanation,
+    detail: ContextPackDetailLevel,
+) -> Vec<String> {
+    let full = detail == ContextPackDetailLevel::Full;
+    let mut reasons = Vec::new();
+    if full {
+        reasons.push(association_fusion_reason(evidence));
+    }
     if evidence.intent_matched {
         reasons.push(format!(
             "Task text matched Space Intent fields: {}",
@@ -5557,17 +5612,19 @@ fn association_reasons(evidence: &AssociationEvidence) -> Vec<String> {
                 .join(", ")
         ));
     }
-    if let Some(conflict) = intent_conflict_handoff(evidence) {
-        reasons.push(
-            serde_json::to_string(&conflict)
-                .expect("Intent Conflict handoff explanation is always serializable"),
-        );
-    }
-    if let Some(conflict) = intent_scope_conflict(evidence) {
-        reasons.push(
-            serde_json::to_string(&conflict)
-                .expect("Intent Scope Conflict explanation is always serializable"),
-        );
+    if full {
+        if let Some(conflict) = intent_conflict_handoff(evidence) {
+            reasons.push(
+                serde_json::to_string(&conflict)
+                    .expect("Intent Conflict handoff explanation is always serializable"),
+            );
+        }
+        if let Some(conflict) = intent_scope_conflict(evidence) {
+            reasons.push(
+                serde_json::to_string(&conflict)
+                    .expect("Intent Scope Conflict explanation is always serializable"),
+            );
+        }
     }
     if !evidence.textual_contexts.is_empty() {
         reasons.push(format!(
@@ -5617,6 +5674,14 @@ fn association_reasons(evidence: &AssociationEvidence) -> Vec<String> {
             evidence.relation_contexts.len(),
             DEFAULT_CONTEXT_RELATION_DEPTH
         ));
+    }
+    if full && !token_explanation.dropped_tokens.is_empty() {
+        // Full retains the existing per-association projection; Compact already carries its
+        // own top-level explanation and never returned this machine string.
+        reasons.push(
+            serde_json::to_string(&token_explanation.compact_projection())
+                .expect("automatic query token explanation is always serializable"),
+        );
     }
     reasons
 }
@@ -7116,6 +7181,13 @@ fn compact_association(
     association: TaskSpaceAssociation,
     header: &SpaceHeader,
 ) -> CompactSpaceAssociation {
+    assert!(
+        association
+            .reasons
+            .iter()
+            .all(|reason| !reason.starts_with('{')),
+        "Compact association reasons must be prepared without machine payloads",
+    );
     CompactSpaceAssociation {
         space_id: association.space_id,
         title: header.title.clone(),
@@ -7124,7 +7196,6 @@ fn compact_association(
         reasons: association
             .reasons
             .into_iter()
-            .filter(|reason| !reason.starts_with('{'))
             .take(COMPACT_ASSOCIATION_REASON_LIMIT)
             .collect(),
     }
@@ -8947,6 +9018,113 @@ fn invariant(message: impl Into<String>) -> Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compact_reason_policy_keeps_full_bytes_only_for_existing_consumers() {
+        use super::*;
+        let evidence = AssociationEvidence {
+            intent_matched: true,
+            intent_fields: BTreeSet::from(["goal".to_owned()]),
+            intent_conflicted: true,
+            intent_head_revision_ids: BTreeSet::from([RevisionId::new(), RevisionId::new()]),
+            excluded_intent_tokens: BTreeSet::from(["outside".to_owned()]),
+            fused_score_basis_points: 8_000,
+            ..AssociationEvidence::default()
+        };
+        let explanation = AutomaticQueryTokenExplanation {
+            document_count: 32,
+            high_document_frequency_min_documents: 16,
+            high_document_frequency_threshold_basis_points: 6_000,
+            stop_word_fallback_active: false,
+            selected_tokens: vec!["needle".to_owned()],
+            answerable_tokens: vec!["needle".to_owned()],
+            dropped_tokens: vec![AutomaticQueryTokenDrop {
+                token: "a".to_owned(),
+                filter: AutomaticQueryTokenFilter::ShortToken,
+                document_frequency: None,
+            }],
+            selected_token_count: 1,
+            answerable_token_count: 1,
+            dropped_token_count: 1,
+        };
+        let full = association_reasons(&evidence, &explanation, ContextPackDetailLevel::Full);
+        assert_eq!(
+            full.iter().filter(|reason| reason.starts_with('{')).count(),
+            4
+        );
+        let human = vec!["Task text matched Space Intent fields: goal".to_owned()];
+        assert_eq!(
+            association_reasons(&evidence, &explanation, ContextPackDetailLevel::Compact),
+            human
+        );
+        let task_id = TaskId::new();
+        let mut associations = (0..3)
+            .map(|_| TaskSpaceAssociation {
+                task_id,
+                space_id: SpaceId::new(),
+                score: 0.8,
+                matched_intent_fields: vec!["goal".to_owned()],
+                matched_artifacts: Vec::new(),
+                matched_contexts: Vec::new(),
+                relation_paths: Vec::new(),
+                reasons: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut sources = associations
+            .iter()
+            .map(|a| (a.space_id, evidence.clone()))
+            .collect::<BTreeMap<_, _>>();
+        populate_association_reasons(
+            task_id,
+            &mut associations,
+            &sources,
+            &explanation,
+            AssociationReasonPolicy::Compact { max_spaces: 1 },
+        )
+        .unwrap();
+        assert_eq!(associations[0].reasons, human);
+        assert_eq!(associations[1].reasons, full);
+        // Full APIs retain all payloads even when the same rows were previously used by Compact.
+        populate_association_reasons(
+            task_id,
+            &mut associations,
+            &sources,
+            &explanation,
+            AssociationReasonPolicy::Full,
+        )
+        .unwrap();
+        assert!(associations.iter().all(|a| a.reasons == full));
+
+        // A semantic-only row has no prose to emit, but must still undergo domain validation.
+        sources.insert(
+            associations[0].space_id,
+            AssociationEvidence {
+                semantic_similarity_basis_points: Some(6_400),
+                fused_score_basis_points: 8_000,
+                ..AssociationEvidence::default()
+            },
+        );
+        populate_association_reasons(
+            task_id,
+            &mut associations,
+            &sources,
+            &explanation,
+            AssociationReasonPolicy::Compact { max_spaces: 1 },
+        )
+        .unwrap();
+        assert!(associations[0].reasons.is_empty());
+        associations[0].score = f64::NAN;
+        assert!(
+            populate_association_reasons(
+                task_id,
+                &mut associations,
+                &sources,
+                &explanation,
+                AssociationReasonPolicy::Compact { max_spaces: 1 }
+            )
+            .is_err()
+        );
+    }
+
     /// The compact channel names are hand-written; this pins them to what `serde` actually emits.
     #[test]
     fn compact_retrieval_channel_names_match_the_serialized_source_tag() {
