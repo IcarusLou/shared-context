@@ -253,6 +253,13 @@ fn withdraw_by_decision_source_reverses_only_the_automatic_acceptances() {
     assert_eq!(stats["data"]["agent_policy"]["confirmed"], 2);
     assert_eq!(stats["data"]["human"]["confirmed"], 1);
     assert_eq!(stats["data"]["auto_confirm_not_permitted"], 0);
+    assert_eq!(
+        stats["data"]["relation_decisions"],
+        serde_json::json!([
+            {"top_relation": "novel", "decision_source": "agent_policy", "confirmed": 2, "discarded": 0},
+            {"top_relation": "novel", "decision_source": "human", "confirmed": 1, "discarded": 0},
+        ])
+    );
 
     // A dry run names the whole selection and writes nothing.
     let planned = harness.run(&[

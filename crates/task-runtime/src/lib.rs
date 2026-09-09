@@ -36,7 +36,7 @@ pub use reference_derivation::{
     ResolvedReference, claim_topic_key, derive_claim_references, unresolvable,
 };
 
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const HOOK_BUSY_TIMEOUT: Duration = Duration::from_millis(25);
 const MAX_EPISODE_LIST_LIMIT: usize = 256;
@@ -358,12 +358,22 @@ pub struct DispositionCounts {
 ///
 /// These are Runtime counts of this installation's own decisions, not knowledge facts: a fresh
 /// checkout of the same repository reports zero.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CandidateDispositionStats {
+    /// Includes expired discarded tombstones; legacy live-status totals below stay unchanged.
+    pub relation_decisions: Vec<RelationDispositionCounts>,
     pub human: DispositionCounts,
     pub agent_policy: DispositionCounts,
     /// Automatic confirmations the server refused with `auto_confirm_not_permitted`.
     pub auto_confirm_not_permitted: usize,
+}
+
+/// Durable relation at disposition time; `None` means collection had not begun.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationDispositionCounts {
+    pub top_relation: Option<String>,
+    pub decision_source: DecisionSource,
+    pub counts: DispositionCounts,
 }
 
 /// One confirmed Candidate, with the provenance a batch revocation selects on.
@@ -2828,6 +2838,26 @@ impl TaskRuntime {
                 ],
             )
             .map_err(sql_error("replace Candidate analysis"))?;
+        if candidate.analysis.status == sctx_domain::CandidateAnalysisStatus::Complete {
+            let top_relation = candidate
+                .analysis
+                .assessments
+                .iter()
+                .max_by_key(|assessment| assessment.confidence.basis_points)
+                .map(|assessment| serde_json::to_value(assessment.relation))
+                .transpose()
+                .map_err(json_error("serialize audit relation"))?;
+            transaction
+                .execute(
+                    "UPDATE candidate_review SET top_relation = ?2
+                 WHERE candidate_id = ?1 AND status = 'pending'",
+                    params![
+                        candidate.candidate_id.to_string(),
+                        top_relation.as_ref().and_then(serde_json::Value::as_str)
+                    ],
+                )
+                .map_err(sql_error("record completed analysis relation"))?;
+        }
         transaction
             .commit()
             .map_err(sql_error("commit Candidate analysis replacement"))?;
@@ -3538,10 +3568,12 @@ impl TaskRuntime {
         let mut stats = CandidateDispositionStats::default();
         let mut statement = connection
             .prepare(
-                "SELECT status, COALESCE(decision_source, 'human'), COUNT(*)
+                "SELECT status, COALESCE(decision_source, 'human'), COUNT(*), top_relation
                  FROM candidate_review
                  WHERE status IN ('confirmed', 'discarded')
-                 GROUP BY status, COALESCE(decision_source, 'human')",
+                    OR (status = 'expired' AND discarded_at_unix_seconds IS NOT NULL)
+                 GROUP BY status, COALESCE(decision_source, 'human'), top_relation
+                 ORDER BY top_relation, COALESCE(decision_source, 'human'), status",
             )
             .map_err(sql_error("prepare disposition totals"))?;
         let rows = statement
@@ -3550,23 +3582,41 @@ impl TaskRuntime {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             })
             .map_err(sql_error("query disposition totals"))?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sql_error("read disposition totals"))?;
-        for (status, decision_source, count) in rows {
+        let mut groups = BTreeMap::<(Option<String>, String), DispositionCounts>::new();
+        for (status, decision_source, count, relation) in rows {
             let count = usize::try_from(count).unwrap_or(0);
             let bucket = match DecisionSource::parse(&decision_source)? {
                 DecisionSource::Human => &mut stats.human,
                 DecisionSource::AgentPolicy => &mut stats.agent_policy,
             };
+            let group = groups.entry((relation, decision_source)).or_default();
+            match status.as_str() {
+                "confirmed" => group.confirmed = group.confirmed.saturating_add(count),
+                "discarded" | "expired" => group.discarded = group.discarded.saturating_add(count),
+                _ => {}
+            }
             match status.as_str() {
                 "confirmed" => bucket.confirmed = bucket.confirmed.saturating_add(count),
                 "discarded" => bucket.discarded = bucket.discarded.saturating_add(count),
                 _ => {}
             }
         }
+        stats.relation_decisions = groups
+            .into_iter()
+            .map(|((top_relation, source), counts)| {
+                Ok(RelationDispositionCounts {
+                    top_relation,
+                    decision_source: DecisionSource::parse(&source)?,
+                    counts,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         stats.auto_confirm_not_permitted = connection
             .query_row(
                 "SELECT COUNT(*) FROM auto_confirm_rejection
@@ -3938,10 +3988,11 @@ impl TaskRuntime {
         let transaction = immediate(&mut connection, "begin Context usage record")?;
         let statement = format!(
             "INSERT INTO context_usage (
-                context_id, task_id, outcome, recorded_at_unix_seconds
-             ) VALUES (?1, ?2, ?3, ?4)
+                context_id, task_id, outcome, recorded_at_unix_seconds, basis
+             ) VALUES (?1, ?2, ?3, ?4, 'checkpoint_derived')
              ON CONFLICT (context_id, task_id) DO UPDATE SET
                 outcome = excluded.outcome,
+                basis = excluded.basis,
                 recorded_at_unix_seconds = excluded.recorded_at_unix_seconds
              WHERE ?5 >= ({})",
             ContextUsageOutcome::PRIORITY_SQL
@@ -4088,7 +4139,11 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
         version = 17;
     }
     if version == 17 {
-        return migrate_schema_17_to_18(connection);
+        migrate_schema_17_to_18(connection)?;
+        version = 18;
+    }
+    if version == 18 {
+        return migrate_schema_18_to_19(connection);
     }
     if version != 0 && version != SCHEMA_VERSION {
         return Err(invariant(format!(
@@ -4360,6 +4415,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 decision_source TEXT CHECK (
                     decision_source IS NULL OR decision_source IN ('human', 'agent_policy')
                 ),
+                top_relation TEXT,
                 UNIQUE (build_id, claim_id),
                 CHECK (
                     (status = 'pending' AND discard_reason IS NULL
@@ -4432,6 +4488,8 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 outcome TEXT NOT NULL CHECK (
                     outcome IN ('reused', 'ignored', 'refuted')
                 ),
+                basis TEXT NOT NULL DEFAULT 'checkpoint_derived'
+                    CHECK (basis IN ('checkpoint_derived', 'session_close')),
                 recorded_at_unix_seconds INTEGER NOT NULL CHECK (
                     recorded_at_unix_seconds >= 0
                 ),
@@ -4469,7 +4527,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
             ) STRICT;
             CREATE INDEX IF NOT EXISTS auto_confirm_rejection_recorded_at
                 ON auto_confirm_rejection (recorded_at_unix_seconds);
-            PRAGMA user_version = 18;",
+            PRAGMA user_version = 19;",
         )
         .map_err(sql_error("initialize task runtime schema"))
 }
@@ -4647,6 +4705,44 @@ fn migrate_schema_17_to_18(connection: &Connection) -> Result<()> {
         .map_err(sql_error(
             "migrate task runtime schema from version 17 to 18",
         ))
+}
+
+/// Adds audit columns without rewriting or discarding any prior business record.
+fn migrate_schema_18_to_19(connection: &Connection) -> Result<()> {
+    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
+        .map_err(sql_error("begin task runtime audit migration"))?;
+    for (table, column, alteration) in [
+        (
+            "candidate_review",
+            "top_relation",
+            "ALTER TABLE candidate_review ADD COLUMN top_relation TEXT",
+        ),
+        (
+            "context_usage",
+            "basis",
+            "ALTER TABLE context_usage ADD COLUMN basis TEXT NOT NULL DEFAULT 'checkpoint_derived'
+          CHECK (basis IN ('checkpoint_derived', 'session_close'))",
+        ),
+    ] {
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                params![table, column],
+                |row| row.get(0),
+            )
+            .map_err(sql_error("inspect audit migration columns"))?;
+        if !exists {
+            transaction
+                .execute_batch(alteration)
+                .map_err(sql_error("add runtime audit column"))?;
+        }
+    }
+    transaction
+        .execute_batch("PRAGMA user_version = 19")
+        .map_err(sql_error("advance runtime audit schema"))?;
+    transaction
+        .commit()
+        .map_err(sql_error("commit runtime audit migration"))
 }
 
 fn insert_external_session(

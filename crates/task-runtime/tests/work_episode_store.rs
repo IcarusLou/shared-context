@@ -1309,14 +1309,26 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
         rationale: "Analysis failed and remains retryable".to_owned(),
     };
     failed.status = AutomaticCandidateStatus::Draft;
+    let audit_relation = || {
+        Connection::open(runtime.database_path())
+            .unwrap()
+            .query_row(
+                "SELECT top_relation FROM candidate_review WHERE candidate_id = ?1",
+                [candidate_id.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+    };
     let first_analysis = runtime.replace_candidate_analysis(&failed).unwrap();
     assert_eq!(first_analysis.analysis_generation, 1);
+    assert_eq!(audit_relation(), None);
     assert_eq!(
         first_analysis.candidate.analysis.status,
         CandidateAnalysisStatus::Failed
     );
     let completed = runtime.replace_candidate_analysis(&automatic).unwrap();
     assert_eq!(completed.analysis_generation, 2);
+    assert_eq!(audit_relation().as_deref(), Some("novel"));
     let replaced = runtime.replace_candidate_analysis(&automatic).unwrap();
     assert_eq!(replaced.analysis_generation, 3);
     assert_eq!(
@@ -1343,6 +1355,7 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
             .unwrap()
             .is_none()
     );
+    assert_eq!(audit_relation().as_deref(), Some("novel"));
     let recomputed = runtime.replace_candidate_analysis(&automatic).unwrap();
     assert_eq!(recomputed.analysis_generation, 1);
 
@@ -1359,6 +1372,26 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
         .unwrap();
     assert_eq!(discarded.status, CandidateReviewDiscardStatus::Discarded);
     assert_eq!(discarded.record.review_version, 2);
+    let mut later_analysis = automatic.clone();
+    later_analysis.analysis.assessments[0].relation = CandidateAssessmentRelation::Supports;
+    later_analysis.analysis.assessments[0].target = Some(sctx_domain::ContextRevisionRef {
+        context_id: ContextId::new(),
+        revision_id: sctx_domain::RevisionId::new(),
+    });
+    later_analysis.analysis.assessments[0].paths = vec![CandidateAssessmentPath::ContextFullText {
+        matched_terms: vec!["audit".to_owned()],
+    }];
+    runtime.replace_candidate_analysis(&later_analysis).unwrap();
+    assert_eq!(audit_relation().as_deref(), Some("novel"));
+    runtime.replace_candidate_analysis(&failed).unwrap();
+    assert_eq!(audit_relation().as_deref(), Some("novel"));
+    let stats = runtime.candidate_disposition_stats().unwrap();
+    assert_eq!(
+        stats.relation_decisions[0].top_relation.as_deref(),
+        Some("novel")
+    );
+    assert_eq!(stats.relation_decisions[0].counts.discarded, 1);
+
     let idempotent = runtime
         .discard_candidate_review(&CandidateReviewDiscard {
             decision_source: DecisionSource::Human,
@@ -1409,6 +1442,14 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
         .cleanup_expired_candidate_reviews_at(review.expires_at_unix_seconds + 1)
         .unwrap();
     assert!(cleanup.expired_candidate_ids.contains(&candidate_id));
+    assert_eq!(audit_relation().as_deref(), Some("novel"));
+    let stats = runtime.candidate_disposition_stats().unwrap();
+    assert_eq!(stats.relation_decisions[0].counts.discarded, 1);
+    assert_eq!(
+        stats.human.discarded, 0,
+        "legacy live-status total is unchanged"
+    );
+
     assert!(
         runtime
             .read_candidate_analysis(candidate_id)

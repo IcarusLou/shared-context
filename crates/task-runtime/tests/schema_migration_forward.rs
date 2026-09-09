@@ -3,7 +3,7 @@
 //! else; version 15 -> 16 discards the recorded omissions only and keeps every proof; version
 //! 16 -> 17 is additive again (disposition provenance) and must leave every decided Review
 //! readable as the human decision it was; version 17 -> 18 is additive (two `external_session`
-//! counters for the `TurnStop` checkpoint reminder gate, WP-V6 fix 3). The five chain, so a
+//! counters for the `TurnStop` checkpoint reminder gate, WP-V6 fix 3). Version 18 -> 19 adds relation and usage-basis audit columns. The six chain, so a
 //! version 13 database reopened today lands on the current version.
 //!
 //! There is no standalone "build an old database" helper, so these construct one honestly: they
@@ -131,7 +131,7 @@ fn schema_version_13_chains_forward_in_place_and_keeps_existing_rows() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(
-        version, 18,
+        version, 19,
         "migration must chain through to the current version"
     );
     let hook_event_exists: bool = connection
@@ -300,7 +300,7 @@ fn schema_version_14_discards_the_recorded_injection_outcomes_only() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        18
+        19
     );
     assert!(
         runtime
@@ -383,7 +383,7 @@ fn schema_version_15_discards_the_recorded_omissions_and_keeps_the_proofs() {
             .unwrap()
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        18
+        19
     );
     let totals = runtime
         .context_usage_totals(&[ignored, reused, refuted])
@@ -482,7 +482,7 @@ fn schema_version_16_adds_disposition_provenance_without_rewriting_a_decision() 
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        18
+        19
     );
     let rejections_exist: bool = connection
         .query_row(
@@ -599,7 +599,7 @@ fn schema_version_17_adds_the_checkpoint_reminder_counters_at_zero() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        18,
+        19,
         "migration must chain through to the current version"
     );
     let (reminder_count, activity): (i64, i64) = connection
@@ -667,7 +667,7 @@ fn schema_migrations_are_reentrant_over_existing_columns() {
             .unwrap()
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        18
+        19
     );
     assert!(
         runtime
@@ -675,4 +675,94 @@ fn schema_migrations_are_reentrant_over_existing_columns() {
             .unwrap()
             .is_some()
     );
+}
+
+#[test]
+fn schema_version_18_adds_audit_columns_without_losing_decisions_or_usage() {
+    let root = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(root.path()).unwrap();
+    let task_id = TaskId::new();
+    runtime
+        .open_or_create(
+            ExternalSessionLocator::new("codex", "audit-migration").unwrap(),
+            task_id,
+            intent("preserve audit rows"),
+            Vec::new(),
+        )
+        .unwrap();
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+        ALTER TABLE candidate_review DROP COLUMN top_relation;
+        ALTER TABLE context_usage DROP COLUMN basis;
+        PRAGMA user_version = 18;",
+        )
+        .unwrap();
+    for (index, outcome) in ["ignored", "reused", "refuted"].iter().enumerate() {
+        connection
+            .execute(
+                "INSERT INTO context_usage VALUES (?1, ?2, ?3, 123)",
+                params![format!("context-{index}"), task_id.to_string(), outcome],
+            )
+            .unwrap();
+    }
+    connection
+        .execute_batch(
+            "INSERT INTO candidate_review (
+        candidate_id, submission_id, episode_id, task_session_id, task_id,
+        build_id, final_checkpoint_id, checkpoint_id, claim_id, review_version,
+        status, discard_reason, created_at_unix_seconds, expires_at_unix_seconds,
+        discarded_at_unix_seconds, decision_source
+    ) VALUES ('candidate', 'submission', 'episode', 'task-session', 'task',
+        'build', 'final', 'checkpoint', 'claim', 2, 'discarded', 'process', 10, 100, 20,
+        'agent_policy');",
+        )
+        .unwrap();
+    drop(connection);
+    for _ in 0..2 {
+        let runtime = TaskRuntime::initialize(root.path()).unwrap();
+        let connection = Connection::open(runtime.database_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            19
+        );
+        let rows = connection.prepare("SELECT outcome, recorded_at_unix_seconds, basis FROM context_usage ORDER BY context_id")
+            .unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(
+            rows,
+            ["ignored", "reused", "refuted"].map(|outcome| (
+                outcome.to_owned(),
+                123,
+                "checkpoint_derived".to_owned()
+            ))
+        );
+        let stats = runtime.candidate_disposition_stats().unwrap();
+        assert_eq!(stats.agent_policy.discarded, 1);
+        assert_eq!(stats.relation_decisions.len(), 1);
+        assert_eq!(stats.relation_decisions[0].top_relation, None);
+        assert_eq!(stats.relation_decisions[0].counts.discarded, 1);
+        assert!(
+            connection
+                .execute("UPDATE context_usage SET basis = 'invented'", [])
+                .is_err()
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT discard_reason FROM candidate_review", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "process"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM task_session", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
 }

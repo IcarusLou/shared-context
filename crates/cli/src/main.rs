@@ -3686,6 +3686,12 @@ fn run_candidate_stats(args: &[String], json_output: bool) -> Result<()> {
             "confirmed": stats.agent_policy.confirmed,
             "discarded": stats.agent_policy.discarded,
         },
+        "relation_decisions": stats.relation_decisions.iter().map(|group| json!({
+            "top_relation": group.top_relation,
+            "decision_source": group.decision_source,
+            "confirmed": group.counts.confirmed,
+            "discarded": group.counts.discarded,
+        })).collect::<Vec<_>>(),
         "auto_confirm_not_permitted": stats.auto_confirm_not_permitted,
     });
     // The counts are Runtime-only, but the envelope stays the one every `candidate` command

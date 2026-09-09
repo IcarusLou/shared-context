@@ -164,3 +164,14 @@ Affected issue/code: R3-2, search CandidateAnalysisRequest/review_status, MCP ca
 Validation evidence: direct evidence/low-confidence unit1passed; full Search and MCP suites passed (logs /private/tmp/sctx-r3-2-{search,mcp}.log), including public frozen schemas and automatic-confirm eligibility/replay tests. Workspace clippy and fmt passed.
 Status: agent-selected
 Supersedes / superseded by: none.
+
+## D-015 — Preserve audit provenance across analysis cleanup
+Unspecified question / design reference: R3-3 specifies additive columns but not historical relation backfill, analysis retries, or grouped output shape.
+Chosen approach: old top_relation remains NULL (unknown); pending reviews take the highest-confidence relation from each completed analysis, using the existing last-max tie rule. Failed retries retain the last completed value and decided reviews freeze it. Write it in the same transaction as analysis. Stats add relation_decisions rows with nullable top_relation, decision_source, confirmed and discarded counts, preserving old totals. usage basis defaults to checkpoint_derived for old/current strong writes; a strong equal-priority write upgrades basis too.
+Alternatives considered: infer old relation from disposable blobs (incomplete audit history); overwrite decided relation on later analysis (misattributes decisions); flatten unknown to novel (false data).
+Rationale and assumptions: durable decision provenance must survive analysis cleanup; unknown is honest for records predating collection. Groups retain expired discarded tombstones using their persisted discarded_at timestamp; never-decided expired rows are excluded. Legacy live-status totals remain unchanged.
+Tradeoffs / consequences: pre-migration relation is unavailable; an additive JSON array gives deterministic relation/source groups without changing existing keys. New relation_decisions can exceed legacy live-status totals after expiration; this is documented explicitly. Both new columns arrive in one transactional schema19 migration; no deletions.
+Affected issue/code: R3-3, task-runtime schema/analysis/disposition/usage, CLI stats, migration and contract tests.
+Validation evidence: fullRuntime71passed, CLI disposition2passed; installer matrix63passed with one obsolete future-version19 fixture, corrected to20 and exact target1passed. Actual old18 shape migrates/reopens without losing all3outcomes or decision rows; invalid basis rejected. Completed relation persists through failed retry, terminal reanalysis, blob deletion and expiration. Workspaceclippy/fmt passed. Logs /private/tmp/sctx-r3-3-*.log.
+Status: agent-selected
+Supersedes / superseded by: none.
