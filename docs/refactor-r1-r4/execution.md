@@ -4,8 +4,8 @@ Authority: [approved plan](approved-plan.md). Decisions: [decision log](../decis
 
 | Milestone | Outcome / invariant | Dependencies / forbidden early work | Issues in order | Status |
 |---|---|---|---|---|
-| M1 | SessionEnd cleanup works; relevance rank survives; DF>0 tokens survive budget | None; no M2–M4 implementation | R1-1, R1-2, R1-3 | doing |
-| M2 | Remove only approved dead surfaces, quiet duplicate closure, preserve recovery and compatibility | M1 accepted + real-session smoke; no M3–M4 | R2-1, R2-2a → R2-2b → R2-2c → R2-2d (parent R2-2), R2-3, R2-4, R2-5, R2-6 | backlog |
+| M1 | SessionEnd cleanup works; relevance rank survives; DF>0 tokens survive budget | None; no M2–M4 implementation | R1-1, R1-2, R1-3 (+ M1-F1/F2/F3 repairs) | accepted |
+| M2 | Remove only approved dead surfaces, quiet duplicate closure, preserve recovery and compatibility | M1 accepted + real-session smoke; no M3–M4 | R2-1, R2-2a → R2-2b → R2-2c → R2-2d (parent R2-2), R2-3, R2-4, R2-5, R2-6 | doing |
 | M3 | Triage single source, evidence semantics, additive audit migration | M2 accepted; no M4 writers before migration acceptance | R3-1, R3-2, R3-3 | backlog |
 | M4 | All injections judged with evidence basis; prior off; truthful stats | M3 accepted + real-session smoke; no B-layer changes | R4-1, R4-2a, R4-2b (parent R4-2), R4-observation | backlog |
 
@@ -66,3 +66,10 @@ Commit reviewed: `2b664c2d44201a9721054499122c1238a8a23106` (supersedes55b19a1 b
 
 ### M1-F2 — accepted review repair and real-host smoke
 Commit reviewed: `c04bd68431679238b0ca1ae8983943a0d540b2f0`. Scope only probe JSON/current-marker validation (7insertions/1deletion); D-005 records decision. Main inspected exact diff and real completed MCP trace: one accepted direct Checkpoint, replayed=false, zero extra tools/errors; summary confirms unchanged Knowledge Git/no capture residue. Main further invoked Stop and model-less SessionEnd on same isolated product session: Buildercomplete, one candidate, lease directoryempty. No statistical quality claim from a single smoke; no M4 normal-use sample claim. Initial marker-check and sandbox attempts are not passes. Evidence `/private/tmp/sctx-refactor-m1-host-smoke-verified/{summary,lifecycle-smoke}.json` and raw/. ROI-1/2/3 none. M1 full CLI gate remains pending.
+
+
+### M1-F3 — accepted fixture repair
+Commit reviewed: `4254d0e1d08bcec21c971b928be98827d9078921` (Mew #258). Full CLI initial run152passed/4failed/6ignored exposed one stale helper cardinality assertion; all4 failures were in that same acceptance target. Exact diff changes only expected Codex cardinality7 vs Cursor6 and a comment, preserving original indexes and disabled traversal of the extra fixture. Executor targeted6passed; main independently reran the entire CLI suite, including these6 tests, successfully. ROI-1/2/3 none; no runtime/fixture content change and no new implementation choice.
+
+### M1 accepted — automatic advance to M2
+Required atomic commits R1-1/R1-2/R1-3 and repairs M1-F1/F2/F3 verified. Final gates: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` exit0; full CLI `cargo test --locked -p sctx-cli --no-fail-fast -- --test-threads=1` exit0,156passed/0failed/6ignored across41 suites. Logs `/private/tmp/sctx-m1-clippy-accepted.log`, `/private/tmp/sctx-m1-cli-accepted.log`. Prior failed runs are diagnostic evidence only, not passes. Final search133passed/8ignored and adapter25passed cover their unchanged behavioral source; ignored real F2LLM suite separately passed three times plus ratchet verification. Hook hot-path/fail-open/privacy tests are included in full CLI. NPM packaging `npm test`:21passed/0failed/1platform skip (`/private/tmp/sctx-m1-npm-test.log`). Real model/MCP→Checkpoint→Builder→SessionEnd isolated smoke passed as recorded above. RRF34-candidate and DF36-intent immutable replays documented in replay-evidence.md. Decision log D-002–D-005 + user U-001 current. No open ROI-1/required ROI-2 or human gate. Governance commit leaves clean worktree before dispatch. Mew M1 done, M2/R2-1 doing; future milestones remain backlog. H-001 empty-only ruling applies exactly, not the rejected carrier proposal.
