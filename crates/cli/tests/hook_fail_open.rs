@@ -14,7 +14,7 @@ use sctx_domain::{ExternalSessionLocator, IntentSnapshot, TaskId, WorkingIntentS
 use sctx_event_schema::Event;
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::ProjectionIndex;
-use sctx_local_state::UserConfigStore;
+use sctx_local_state::{AuthorizedSessionScopeRead, AuthorizedSessionScopeStore, UserConfigStore};
 use sctx_task_runtime::TaskRuntime;
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
@@ -640,4 +640,83 @@ fn cursor_desktop_3_17_payload_shapes_decode_and_stay_neutral_when_disabled() {
         "final_status": "unknown"
     });
     assert_neutral(&harness.hook("cursor", &end), &harness.root(), secret);
+}
+
+/// #34's real five-key SessionEnd shape must reach cleanup, not merely emit the same neutral
+/// stdout as a decode failure. Prove the runtime effect and the collector event together.
+#[test]
+fn codex_model_less_session_end_reaches_cleanup_and_success_telemetry() {
+    let harness = Harness::new();
+    initialize_store(&harness);
+    let workspace = harness.home.join("registered workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&workspace)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let workspace = fs::canonicalize(workspace).unwrap();
+    UserConfigStore::open_existing(harness.root())
+        .unwrap()
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(&workspace),
+        )
+        .unwrap();
+    let fixtures: Vec<Value> =
+        serde_json::from_str(include_str!("../../../fixtures/agents/codex-0.147.json")).unwrap();
+    let session = "model-less-session-end";
+    let locator = ExternalSessionLocator::new("codex", session).unwrap();
+    let scopes = AuthorizedSessionScopeStore::initialize(harness.root()).unwrap();
+    let mut start = fixtures[0].clone();
+    start["session_id"] = json!(session);
+    start["cwd"] = json!(workspace);
+    let started = harness.hook("codex", &start);
+    assert!(started.status.success());
+    assert!(matches!(
+        scopes.read(&locator).unwrap(),
+        AuthorizedSessionScopeRead::Current(_)
+    ));
+
+    let mut end = fixtures[6].clone();
+    end["session_id"] = json!(session);
+    end["cwd"] = json!(workspace);
+    assert_eq!(end.as_object().unwrap().len(), 5);
+    assert!(end.get("model").is_none());
+    let ended = harness.hook("codex", &end);
+    assert!(ended.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&ended.stdout).unwrap(),
+        json!({})
+    );
+    assert_eq!(
+        scopes.read(&locator).unwrap(),
+        AuthorizedSessionScopeRead::Missing
+    );
+
+    let events = harness.logging.diagnostics().recent_events;
+    let end_events = events
+        .iter()
+        .filter(|event| event.operation.as_deref() == Some("hook.codex.session_end"))
+        .collect::<Vec<_>>();
+    assert!(
+        !end_events.is_empty(),
+        "missing SessionEnd telemetry: {events:#?}"
+    );
+    assert!(
+        end_events
+            .iter()
+            .any(|event| event.outcome == sctx_telemetry::Outcome::Success),
+        "{end_events:#?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.outcome != sctx_telemetry::Outcome::FailOpen
+                && event.reason.as_deref() != Some("payload_decode_failed")),
+        "{events:#?}"
+    );
 }

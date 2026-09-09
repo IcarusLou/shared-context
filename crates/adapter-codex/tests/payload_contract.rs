@@ -17,7 +17,7 @@ fn fixtures() -> Vec<Value> {
 }
 
 #[test]
-fn documented_codex_0_147_shapes_map_to_all_canonical_events() {
+fn codex_fixture_and_live_session_end_shapes_map_to_all_canonical_events() {
     let actual = fixtures()
         .into_iter()
         .map(|payload| {
@@ -35,8 +35,94 @@ fn documented_codex_0_147_shapes_map_to_all_canonical_events() {
             CanonicalAgentEventKind::PreCompact,
             CanonicalAgentEventKind::TurnStop,
             CanonicalAgentEventKind::SessionEnd,
+            CanonicalAgentEventKind::SessionEnd,
         ]
     );
+}
+
+#[test]
+fn codex_model_less_session_end_matches_the_live_five_key_fingerprint() {
+    let payload = fixtures().remove(6);
+    let keys = payload
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keys,
+        [
+            "cwd",
+            "hook_event_name",
+            "reason",
+            "session_id",
+            "transcript_path"
+        ]
+    );
+    let event = decode_hook_input(&serde_json::to_vec(&payload).unwrap()).unwrap();
+    let sctx_adapter_codex::CanonicalAgentEvent::SessionEnd { context, reason } = event else {
+        panic!("live fingerprint must decode as SessionEnd");
+    };
+    assert_eq!(context.session_id, "thr_live_session_end_shape_01");
+    assert_eq!(reason, "completed");
+}
+
+#[test]
+fn codex_five_model_bearing_events_keep_strict_model_validation() {
+    for fixture in fixtures().into_iter().take(5) {
+        for (model, class) in [
+            (None, HookDecodeErrorClass::MissingField),
+            (Some(Value::Null), HookDecodeErrorClass::Type),
+            (Some(serde_json::json!(42)), HookDecodeErrorClass::Type),
+            (
+                Some(serde_json::json!("")),
+                HookDecodeErrorClass::MissingField,
+            ),
+            (
+                Some(serde_json::json!("  ")),
+                HookDecodeErrorClass::MissingField,
+            ),
+        ] {
+            let mut payload = fixture.clone();
+            payload.as_object_mut().unwrap().remove("model");
+            if let Some(model) = model {
+                payload["model"] = model;
+            }
+            let failure = decode_hook_input_with_diagnostic(&serde_json::to_vec(&payload).unwrap())
+                .unwrap_err();
+            assert_eq!(failure.diagnostic().error_class, class, "{payload}");
+            assert_eq!(
+                failure.diagnostic().field,
+                Some(HookDecodeField::Model),
+                "{payload}"
+            );
+        }
+    }
+}
+
+#[test]
+fn codex_session_end_optional_model_retains_supplied_value_boundaries() {
+    for model in [Value::Null, serde_json::json!("gpt-5.6-sol")] {
+        let mut payload = fixtures().remove(6);
+        payload["model"] = model;
+        assert_eq!(
+            decode_hook_input(&serde_json::to_vec(&payload).unwrap())
+                .unwrap()
+                .kind(),
+            CanonicalAgentEventKind::SessionEnd
+        );
+    }
+    for (model, class) in [
+        (serde_json::json!(42), HookDecodeErrorClass::Type),
+        (serde_json::json!("  "), HookDecodeErrorClass::MissingField),
+    ] {
+        let mut payload = fixtures().remove(6);
+        payload["model"] = model;
+        let failure =
+            decode_hook_input_with_diagnostic(&serde_json::to_vec(&payload).unwrap()).unwrap_err();
+        assert_eq!(failure.diagnostic().error_class, class);
+        assert_eq!(failure.diagnostic().field, Some(HookDecodeField::Model));
+    }
 }
 
 #[test]

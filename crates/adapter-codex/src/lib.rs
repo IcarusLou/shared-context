@@ -5,6 +5,10 @@
 //! unconfirmed state is reported as `ACTION REQUIRED` and disables all Hook capabilities while
 //! MCP + CLI remain usable.
 //!
+//! SessionEnd follows the live #34 fingerprint: `model` may be absent and `reason` is any
+//! nonempty string. The other five supported events still require a nonempty `model`; policy
+//! enums such as SessionStart source and PreCompact trigger remain closed.
+//!
 //! The documented payload carries exactly one identity field, `session_id`, and Codex reports the
 //! same `session_id` to a thread spawned from a parent conversation. The spawned thread's own
 //! identity and its parent link exist only in the local rollout record, never in a Hook payload or
@@ -179,7 +183,7 @@ struct Common {
     transcript_path: Option<PathBuf>,
     cwd: PathBuf,
     hook_event_name: String,
-    model: String,
+    model: Option<String>,
     #[serde(default)]
     permission_mode: Option<String>,
 }
@@ -187,7 +191,6 @@ struct Common {
 impl Common {
     fn validate(&self, expected_event: &str) -> Result<()> {
         require_nonempty("session_id", &self.session_id)?;
-        require_nonempty("model", &self.model)?;
         if self.cwd.as_os_str().is_empty() {
             return Err(invalid("Codex cwd must not be empty"));
         }
@@ -199,6 +202,11 @@ impl Common {
         }
         let _ = (&self.transcript_path, &self.permission_mode);
         Ok(())
+    }
+
+    fn validate_with_model(&self, expected_event: &str) -> Result<()> {
+        self.validate(expected_event)?;
+        require_nonempty("model", self.model.as_deref().unwrap_or_default())
     }
 
     fn context(&self) -> AgentEventContext {
@@ -265,7 +273,8 @@ struct SessionEndInput {
 /// # Errors
 ///
 /// Rejects malformed JSON, unsupported Hook names, wrong field types, empty required identity
-/// fields, and undocumented enum values used by policy.
+/// fields, and undocumented enum values used by policy. SessionEnd accepts a missing/null model
+/// and any nonempty reason, matching the live #34 fingerprint; a supplied model must be nonempty.
 pub fn decode_hook_input(bytes: &[u8]) -> Result<CanonicalAgentEvent> {
     decode_hook_input_with_diagnostic(bytes).map_err(HookDecodeFailure::into_error)
 }
@@ -347,9 +356,12 @@ pub fn decode_hook_input_with_diagnostic(
     match event_name {
         "SessionStart" => {
             let input: SessionStartInput = decode(value, "SessionStart", &diagnostic)?;
-            input.common.validate("SessionStart").map_err(|error| {
-                classified_failure(&diagnostic, HookDecodeErrorClass::MissingField, error)
-            })?;
+            input
+                .common
+                .validate_with_model("SessionStart")
+                .map_err(|error| {
+                    classified_failure(&diagnostic, HookDecodeErrorClass::MissingField, error)
+                })?;
             require_one_of(
                 "Codex SessionStart source",
                 &input.source,
@@ -369,7 +381,10 @@ pub fn decode_hook_input_with_diagnostic(
         }
         "UserPromptSubmit" => {
             let input: PromptInput = decode(value, "UserPromptSubmit", &diagnostic)?;
-            validate_common_and_required(&diagnostic, input.common.validate("UserPromptSubmit"))?;
+            validate_common_and_required(
+                &diagnostic,
+                input.common.validate_with_model("UserPromptSubmit"),
+            )?;
             validate_required(&diagnostic, require_nonempty("turn_id", &input.turn_id))?;
             validate_required(&diagnostic, require_nonempty("prompt", &input.prompt))?;
             Ok(CanonicalAgentEvent::PromptSubmit {
@@ -379,7 +394,10 @@ pub fn decode_hook_input_with_diagnostic(
         }
         "PostToolUse" => {
             let input: PostToolInput = decode(value, "PostToolUse", &diagnostic)?;
-            validate_common_and_required(&diagnostic, input.common.validate("PostToolUse"))?;
+            validate_common_and_required(
+                &diagnostic,
+                input.common.validate_with_model("PostToolUse"),
+            )?;
             validate_required(&diagnostic, require_nonempty("turn_id", &input.turn_id))?;
             validate_required(&diagnostic, require_nonempty("tool_name", &input.tool_name))?;
             validate_required(
@@ -399,7 +417,10 @@ pub fn decode_hook_input_with_diagnostic(
         }
         "PreCompact" => {
             let input: PreCompactInput = decode(value, "PreCompact", &diagnostic)?;
-            validate_common_and_required(&diagnostic, input.common.validate("PreCompact"))?;
+            validate_common_and_required(
+                &diagnostic,
+                input.common.validate_with_model("PreCompact"),
+            )?;
             validate_required(&diagnostic, require_nonempty("turn_id", &input.turn_id))?;
             require_one_of(
                 "Codex PreCompact trigger",
@@ -421,7 +442,7 @@ pub fn decode_hook_input_with_diagnostic(
         }
         "Stop" => {
             let input: StopInput = decode(value, "Stop", &diagnostic)?;
-            validate_common_and_required(&diagnostic, input.common.validate("Stop"))?;
+            validate_common_and_required(&diagnostic, input.common.validate_with_model("Stop"))?;
             validate_required(&diagnostic, require_nonempty("turn_id", &input.turn_id))?;
             let _ = input.last_assistant_message;
             Ok(CanonicalAgentEvent::TurnStop {
@@ -507,9 +528,11 @@ fn validate_supported_shape(
         ("session_id", HookDecodeField::SessionId),
         ("cwd", HookDecodeField::Cwd),
         ("hook_event_name", HookDecodeField::HookEventName),
-        ("model", HookDecodeField::Model),
     ] {
         require_shape_string(object, name, field, diagnostic)?;
+    }
+    if event_name != "SessionEnd" || object.get("model").is_some_and(|value| !value.is_null()) {
+        require_shape_string(object, "model", HookDecodeField::Model, diagnostic)?;
     }
     for (name, field) in [
         ("transcript_path", HookDecodeField::TranscriptPath),
