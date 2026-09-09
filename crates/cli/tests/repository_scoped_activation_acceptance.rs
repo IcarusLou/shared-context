@@ -233,7 +233,9 @@ fn documented_events(agent: &str, session: &str, cwd: &Path) -> Vec<Value> {
         CURSOR_FIXTURE
     };
     let mut events = serde_json::from_str::<Vec<Value>>(fixture).unwrap();
-    assert_eq!(events.len(), 6);
+    // R1-1 appended the live model-less Codex SessionEnd at index 6; the original six
+    // lifecycle indexes remain stable, and disabled-path iteration also covers the new shape.
+    assert_eq!(events.len(), if agent == "codex" { 7 } else { 6 });
     for event in &mut events {
         event["transcript_path"] = Value::Null;
         if agent == "codex" {
