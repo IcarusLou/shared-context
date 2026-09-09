@@ -220,3 +220,11 @@ Affected issue/code: M4-F1 (#260), scenario-runner/tests/observer_contract.rs he
 Validation evidence: the same private Rust diagnostic changes6/80failures to0/80 with this option; full scenario-runner all-features tests passed, workspacefmt/clippy passed. Production observer byte-identical. Diagnostics /private/tmp/sctx-m4-fingerprint-{diagnostic,fixed}.log, sctx-m4-git-trace.json, sctx-m4-f1-tests.log.
 Status: agent-selected
 Supersedes / superseded by: M3 fingerprint failure explanation refined; no production decision superseded.
+
+## U-002 / D-020 — Paired real-host smoke is mandatory
+Authority: user's follow-up explicitly requires a real Cursor smoke now and a continuing rule that any real Codex smoke must have Cursor coverage. This supersedes the former either-host gate; H-002 activation timing is not approved by this follow-up.
+Implementation choice: run the installed Cursor Agent CLI against a fresh private HOME and installation, recording its real model/MCP traffic and native hook payloads. Cursor itself accesses the existing macOS keychain via a private HOME symlink; no credential values are extracted/copied/logged. Only non-secret auth identity metadata is retained. Harness bootstrap of Task is labeled separately from model-authored Checkpoint. Native lifecycle observations must be distinguished from manually driven checks, and smoke never counts as normal-use evidence. Production configs/Runtime remain untouched.
+Alternatives: replaying Cursor fixtures (not real-host proof); using production HOME (can run production hooks); claiming CLI proof also covers desktop UI (overclaim).
+Affected issue: M4-F2 (#261), host smoke scripts, AGENTS.md, DEVELOPMENT and plan acceptance rules; generated Python bytecode is ignored.
+Validation evidence: real Cursor-03 and same-build Codex pass the paired verifier; both1accepted checkpoint/1novel candidate/empty leases. Cursor native start/end and actual session ID are preserved; Builder follows model-driven candidate_list. Codex Stop/end are explicitly driver-delivered. Missing/failed Cursor and mismatched builds reject, including under Python -O. Initial fixture diagnostics are retained separately in paired-real-host-smoke.md. Main review pending.
+Status: rule user-approved; isolation details agent-selected.

@@ -10,3 +10,5 @@
 
 # Keep schemas/, fixtures/, and npm/ source trees tracked. Add narrow build-output
 # rules here when those trees gain generated artifacts; do not ignore them wholesale.
+
+/tests/scripts/__pycache__/

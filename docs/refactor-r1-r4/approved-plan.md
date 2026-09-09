@@ -347,7 +347,7 @@ N1/A9 措辞改变 agent 行为方向(欠沉淀回潮)M4 的 recall/candidate st
 提交:沿用本分支惯例(type(scope) + 讲清 why 的正文 + 实证引用);外来未提交改动(log-sync 等)全程不碰、不 fmt、提交前 diff 清点。
 
 
-M1 与 M2 之间、M3 与 M4 之间各跑一次真实会话冒烟(cursor 或 codex 任一),对照本方案验收点。
+M1 与 M2 之间、M3 与 M4 之间均须成对执行 Codex 与 Cursor 真实会话冒烟，对照相同方案验收点。后续任何 Codex 真实冒烟都必须配有 Cursor 真实冒烟；缺失、失败或阻塞不得仅凭 Codex 结果放行。此规则由用户 U-002 明确修订，取代原“任一宿主即可”。
 
 
 M4 收数期结束的产出物:一份 B 层入场数据报告(relation 分布、agent_policy 尝试/拒绝、判决覆盖与强证据 reuse 率),作为 ADR-0005 修订与 B1–B5 各自设计文档的输入。

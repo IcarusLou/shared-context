@@ -140,6 +140,8 @@ cargo test --workspace --locked
 (cd npm && npm test)
 ```
 
+真实宿主冒烟规则（U-002，强制）：只要验收包含 Codex 的真实冒烟，就必须同时包含 Cursor 的真实冒烟，并在同一验收记录中列出两者版本、被测构建、真实模型/MCP 证据及生命周期结果。缺失、失败或阻塞任一宿主时，该项门禁未通过；fixture 回放、手写 payload、模拟模型不得代替真实宿主。Cursor Agent CLI 与 Cursor 桌面 UI 的覆盖范围须分别标明。隔离烟测不计入正常使用观察样本。统一入口为 `tests/scripts/real_host_smoke_pair.py`，操作与证据要求见 `tests/scripts/README.md`。
+
 定向执行里程碑验收：
 
 ```bash
