@@ -100,12 +100,12 @@
   "R1-3": {
     "ID": "2c19308e-7784-4a8d-8197-647db8c26778",
     "CreatedAt": "2026-09-09T09:10:52.537102Z",
-    "UpdatedAt": "2026-09-09T11:01:18.025913Z",
+    "UpdatedAt": "2026-09-09T11:12:31.668017Z",
     "WorkspaceID": "3c7b5483-4704-4084-a5c7-c75193912e47",
     "Number": 237,
     "Title": "Shared Context / R1-3 · DF=0 伪 token 不再挤占查询预算(A2)",
-    "Description": "Parent milestone: M1\nPurpose: R1-3 · DF=0 伪 token 不再挤占查询预算(A2)\nDependencies: previous issue in this milestone, and all preceding milestone gates.\n\nAuthoritative scope, invariants, non-goals and acceptance:\n根因crates/search/src/lib.rs:2416-2422 rarest-first 排序让 DF=0 的 token(Han 跨词边界伪 bigram 是最大来源,实测 78 中 60 个)排最前,优先占满 MAX_AUTOMATIC_QUERY_TOKENS=64,把 DF>0 真词挤出截断。DF=0 对 BM25 匹配是纯 no-op。\n\n\n改动按 KD2(推荐保守变体):排序键改为\"DF=0 者排最后,其余仍 rarest-first\",截断照旧——真词优先存活。不动 tokenizer、不动索引、不 bump 任何 version。\n\n\n验收两套探针棘轮(association_probe_workflow / association_probe_ext_semantic_f2llm)按仓库惯例三次一致实测:不回退;若提升,按先例更新棘轮数字并在提交信息记录三次读数。同时复核 answerable/selected 比值门(AUTOMATIC_MIN_ANSWERABLE_RATIO_BASIS_POINTS=2500)在真机回放语料上的触发次数变化,写进提交信息。\n\n\n明确不做不从 selected 集合中剔除 DF=0(那是激进变体,留待 M4 数据后与 B5 一起议);不改 automatic_short_token 的非 ASCII 规则。\n\nDesign: docs/refactor-r1-r4/approved-plan.md\nDecision log: docs/decisions/refactor-r1-r4.md (executor records choices; main agent verifies).\nRepository gates: cargo fmt --all -- --check; cargo clippy --workspace --all-targets --all-features --locked -- -D warnings; affected crate full tests.\nExpected commit: fix(search): prioritize answerable automatic query tokens (R1-3)\nStop condition: commit only this issue, move to review, do not begin next issue. Main agent alone marks done after independent review.\n\n\nPaused at H-001 (R2-1 compatibility rescope), no implementation commit yet. Three-file diff retained. Full search133 passed/8 ignored; three ordinary release probes each20/22 search+intent; three F2LLM release probes each29/39 lexical+32/39 fused, no noise. After36-intent replay, ratchet disposition, clippy and main commit review pending. No further implementation before user gate resolution.",
-    "Status": "doing",
+    "Description": "Parent milestone: M1\nPurpose: R1-3 · DF=0 伪 token 不再挤占查询预算(A2)\nDependencies: previous issue in this milestone, and all preceding milestone gates.\n\nAuthoritative scope, invariants, non-goals and acceptance:\n根因crates/search/src/lib.rs:2416-2422 rarest-first 排序让 DF=0 的 token(Han 跨词边界伪 bigram 是最大来源,实测 78 中 60 个)排最前,优先占满 MAX_AUTOMATIC_QUERY_TOKENS=64,把 DF>0 真词挤出截断。DF=0 对 BM25 匹配是纯 no-op。\n\n\n改动按 KD2(推荐保守变体):排序键改为\"DF=0 者排最后,其余仍 rarest-first\",截断照旧——真词优先存活。不动 tokenizer、不动索引、不 bump 任何 version。\n\n\n验收两套探针棘轮(association_probe_workflow / association_probe_ext_semantic_f2llm)按仓库惯例三次一致实测:不回退;若提升,按先例更新棘轮数字并在提交信息记录三次读数。同时复核 answerable/selected 比值门(AUTOMATIC_MIN_ANSWERABLE_RATIO_BASIS_POINTS=2500)在真机回放语料上的触发次数变化,写进提交信息。\n\n\n明确不做不从 selected 集合中剔除 DF=0(那是激进变体,留待 M4 数据后与 B5 一起议);不改 automatic_short_token 的非 ASCII 规则。\n\nDesign: docs/refactor-r1-r4/approved-plan.md\nDecision log: docs/decisions/refactor-r1-r4.md (executor records choices; main agent verifies).\nRepository gates: cargo fmt --all -- --check; cargo clippy --workspace --all-targets --all-features --locked -- -D warnings; affected crate full tests.\nExpected commit: fix(search): prioritize answerable automatic query tokens (R1-3)\nStop condition: commit only this issue, move to review, do not begin next issue. Main agent alone marks done after independent review.\n\n\nExecution evidence (2026-09-09): H-001 resolved in governance commit 501305a; R1-3 commit 70a816b is ready for main-agent review. Full search133 passed/8 explicitly ignored model/manual tests; search all-target/all-feature clippy and scoped formatting passed. Three release ordinary probes each search20/22 and intent20/22; three F2LLM probes each lexical29/39 and fused32/39, zero noise. Added lexical long_intent3/3 ratchet; one further F2LLM validation passed. Immutable36-intent direct-engine replay: mathematical ratio-insufficient8->1, actual low_answerable_ratio omissions1->0. Replay holds empty signals/no resolved focus and omits semantic/usage-prior providers; not exact original live requests. Decision D-004 records choices and full evidence. Separate M1-F1 resolves earlier adapter documentation lint; final milestone workspace gates remain main-agent work.",
+    "Status": "done",
     "Priority": "high",
     "AutomationGenerated": false,
     "RoomEnabled": true,
@@ -362,5 +362,33 @@
     "AutomationGenerated": false,
     "RoomEnabled": true,
     "WebURL": "https://mew.bytedance.net/3c7b5483-4704-4084-a5c7-c75193912e47/issues/5c7a79db-4282-4b7a-8e77-18242341ad77"
+  },
+  "M1-F1": {
+    "ID": "83bade33-ba49-4794-a1fa-b934341896c1",
+    "CreatedAt": "2026-09-09T11:04:02.235046Z",
+    "UpdatedAt": "2026-09-09T11:12:31.794645Z",
+    "WorkspaceID": "3c7b5483-4704-4084-a5c7-c75193912e47",
+    "Number": 256,
+    "Title": "Shared Context / M1-F1 Hook documentation lint repair",
+    "Description": "Parent M1. ROI-2 required documentation lint repair discovered by full workspace clippy: adapter-codex/src/lib.rs doc_markdown errors at lines 8, 10, 276 for bare SessionEnd/SessionStart/PreCompact, plus crates/cli/tests/hook_fail_open.rs line 645 bare SessionEnd found during main review. Scope only Markdown backticks in those documentation comments. No behavior change or diagnostic restructuring. Dependencies R1-1 accepted. Acceptance: scoped rustfmt checks and cargo clippy --workspace --all-targets --all-features --locked -- -D warnings passed; log /private/tmp/sctx-m1-f1-workspace-clippy.log. Earlier scoped adapter-codex clippy passed. Commit fix(adapter-codex): format hook event documentation (M1-F1), amended before any later dependent commit. Stage only owned files, one commit, move review and stop. No unspecified implementation choices; main records review in execution.md.",
+    "Status": "done",
+    "Priority": "high",
+    "AutomationGenerated": false,
+    "RoomEnabled": true,
+    "WebURL": "https://mew.bytedance.net/3c7b5483-4704-4084-a5c7-c75193912e47/issues/83bade33-ba49-4794-a1fa-b934341896c1"
+  },
+  "M1-F2": {
+    "ID": "7f298ef0-563f-4762-bf66-be9bab638bdc",
+    "CreatedAt": "2026-09-09T11:05:21.731771Z",
+    "UpdatedAt": "2026-09-09T11:12:31.930357Z",
+    "WorkspaceID": "3c7b5483-4704-4084-a5c7-c75193912e47",
+    "Number": 257,
+    "Title": "Shared Context / M1-F2 Update real-host probe marker validation",
+    "Description": "Parent M1. ROI-2 acceptance-harness defect: tests/scripts/codex_checkpoint_model_probe.py checks literal <shared-context-active> in raw JSON, but current valid marker has external_session_id attribute (first smoke exited before any model call). Scope only probe marker validation; parse actual JSON and validate correct session activation, no product/marker/schema change. Rerun one real isolated Codex trial using release binary, SCTX_SKIP_LAUNCHCTL=1. No fabricated smoke success or normal-use observation counting. Commit test(probe): accept attributed activation markers (M1-F2). One owned commit, Mew review, stop. Coordinate staging with main.",
+    "Status": "done",
+    "Priority": "high",
+    "AutomationGenerated": false,
+    "RoomEnabled": true,
+    "WebURL": "https://mew.bytedance.net/3c7b5483-4704-4084-a5c7-c75193912e47/issues/7f298ef0-563f-4762-bf66-be9bab638bdc"
   }
 }

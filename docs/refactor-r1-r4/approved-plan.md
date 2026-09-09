@@ -1,5 +1,7 @@
 # Authoritative refactor plan (2026-09-09)
 
+Current amendment: R2-1 follows the user-approved [H-001 Disposition](r2-1-compatibility-gate.md#disposition-2026-09-09-reviewed-and-ruled--h-001-closed). Empty-required wire DTO and tombstone writes are approved; a LegacyClaimFields carrier is rejected. The original transcription below remains historical authority for all other scope.
+
 Source: /private/tmp/claude-501/-Users-bytedance-workspace-shared-context/25a5e2fe-a1ea-4361-a744-a650de089725/scratchpad/refactor-execution-plan.html
 
 SHA256: 2ec8c20d0826ac7c32eaeeeb77c8d569dbba2eac0fc8f1b1f58ef93b610c8e1a

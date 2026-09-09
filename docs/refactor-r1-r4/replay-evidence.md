@@ -24,7 +24,7 @@ All 36 recorded Intent revisions are replayed via production `task_space_associa
 
 Limit: immutable as-of signal histories are unavailable, so signals are held empty and resolved_focus absent. Intent artifact/interface hints remain present. This is a fixed intent-only lexical/graph replay; semantic and usage-prior providers are absent. Candidate analyzer likewise does not use these providers; writes to copied usage rows do not feed the comparison. Separate semantic probe suite covers embedding fusion.
 
-After R1-3: pending.
+After R1-3 (70a816b): ratio-insufficient requests8→1, actual low_answerable_ratio omissions1→0;23 of36 intent summaries changed. Same immutable snapshots/harness assumptions. Frozen after evidence: `/private/tmp/sctx-refactor-replay/after-r1-3-evidence.json`; after outputs `after-intents.jsonl` and `after-intents-summary.json`.
 
 ## Pre-R1-3 probe baseline
 
@@ -33,3 +33,6 @@ At `369772b`, debug-profile ordinary probe: 2 tests passed, 20/22 explicit searc
 Logs: `/private/tmp/sctx-r1-3-baseline-workflow.log`, `/private/tmp/sctx-r1-3-baseline-semantic.log`; metadata `/private/tmp/sctx-r1-3-baseline-metadata.json`.
 
 Three post-change release repetitions completed before H-001 stopped implementation: ordinary search20/22 and intent20/22 each time; F2LLM lexical29/39 and fused32/39 each time, zero noise. Lexical long_intent improves1→3/3; fused total is unchanged. Runner summary `/private/tmp/sctx-r1-3-probe-runs.json`; per-run logs `/private/tmp/sctx-r1-3-association_probe_{workflow,ext_semantic_f2llm}-{1,2,3}.log`. These are executor observations; R1-3 remains uncommitted and unaccepted pending replay, ratchet disposition, clippy and main review after H-001 is resolved.
+
+
+R1-3 post-resumption completion: the measured lexical long_intent gain is pinned at3/3, with one further real F2LLM release run passing the new assertion. Existing fused32/39 bound and independent binary-reference27 remain unchanged. Main independently reran all three direct token-selection regressions (2 +1 passed), reviewed exact commit70a816b, source invariants and D-004.
