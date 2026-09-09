@@ -9346,9 +9346,7 @@ fn agent_policy_confirmation_is_refused_once_for_each_condition_of_the_surface()
     )
     .expect_err("an already decided Review is not a surface for a fresh automatic decision");
     assert!(
-        error
-            .message()
-            .contains("its Review is not ready_for_review"),
+        error.message().contains("its Review is no longer pending"),
         "{}",
         error.message()
     );

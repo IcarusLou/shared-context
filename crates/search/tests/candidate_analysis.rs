@@ -280,6 +280,7 @@ fn bm25_relevance_order_survives_candidate_analysis() {
     ));
     let result = engine
         .analyze_candidate(&CandidateAnalysisRequest {
+            has_blocking_unknowns: false,
             source_task_id: candidate.source_episode.task_id,
             source_intent_revision_id: TaskIntentRevisionId::new(),
             source_working_intent: source_intent(candidate.source_episode.task_id),
@@ -392,6 +393,7 @@ fn empty_context_store_yields_zero_existing_spaces_and_does_not_write_git() {
     ));
     let result = SearchEngine::new(index)
         .analyze_candidate(&CandidateAnalysisRequest {
+            has_blocking_unknowns: false,
             source_task_id: candidate.source_episode.task_id,
             source_intent_revision_id: TaskIntentRevisionId::new(),
             source_working_intent: source_intent(candidate.source_episode.task_id),
@@ -452,6 +454,7 @@ fn canonically_duplicate_evidence_supports_do_not_invalidate_candidate_intent() 
 
     let result = SearchEngine::new(index)
         .analyze_candidate(&CandidateAnalysisRequest {
+            has_blocking_unknowns: false,
             source_task_id: candidate.source_episode.task_id,
             source_intent_revision_id: TaskIntentRevisionId::new(),
             source_working_intent: source_intent(candidate.source_episode.task_id),
@@ -489,6 +492,7 @@ fn one_safe_exact_owner_yields_one_existing_primary_space() {
     let candidate = candidate(content);
     let result = SearchEngine::new(index)
         .analyze_candidate(&CandidateAnalysisRequest {
+            has_blocking_unknowns: false,
             source_task_id: candidate.source_episode.task_id,
             source_intent_revision_id: TaskIntentRevisionId::new(),
             source_working_intent: source_intent(candidate.source_episode.task_id),
@@ -592,6 +596,7 @@ fn proposed_space_group_is_stable_per_task_and_resolves_to_its_first_space() {
                    mapped_space_id: Option<SpaceId>| {
         SearchEngine::new(index.clone())
             .analyze_candidate(&CandidateAnalysisRequest {
+                has_blocking_unknowns: false,
                 source_task_id: task_id,
                 source_intent_revision_id: revision_id,
                 source_working_intent: working_intent.clone(),
@@ -717,6 +722,7 @@ fn analyze(
     let candidate = candidate(content);
     SearchEngine::new(fixture.index.clone())
         .analyze_candidate(&CandidateAnalysisRequest {
+            has_blocking_unknowns: false,
             source_task_id: candidate.source_episode.task_id,
             source_intent_revision_id: TaskIntentRevisionId::new(),
             source_working_intent: source_intent(candidate.source_episode.task_id),
@@ -1467,6 +1473,7 @@ fn exact_artifact_graph_reaches_cross_end_space_with_frozen_generation() {
         let candidate = candidate(content);
         engine
             .analyze_candidate(&CandidateAnalysisRequest {
+                has_blocking_unknowns: false,
                 source_task_id: candidate.source_episode.task_id,
                 source_intent_revision_id: TaskIntentRevisionId::new(),
                 source_working_intent: source_intent(candidate.source_episode.task_id),
@@ -1646,6 +1653,7 @@ fn analyze_identifier_claim(
     let candidate = candidate(content);
     SearchEngine::new(fixture.index.clone())
         .analyze_candidate(&CandidateAnalysisRequest {
+            has_blocking_unknowns: false,
             source_task_id: candidate.source_episode.task_id,
             source_intent_revision_id: TaskIntentRevisionId::new(),
             source_working_intent: source_intent(candidate.source_episode.task_id),

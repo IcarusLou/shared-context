@@ -152,3 +152,15 @@ Affected issue/code: R3-1, MCP descriptions/ACK and contract tests.
 Validation evidence: shared-policy equality/criteria unit1passed; workflow authority contract1passed; budget/frozen input schema2passed; fullMCP93passed/0failed/0ignored. Requested golden regeneration produced no diff. Actual public tools/list measures7977→8172 totalbytes, candidate_list1318bytes, other16descriptions identical (/private/tmp/sctx-r3-1-byte-evidence.json). Scopedclippy andfmt passed after an in-scope format-argument lint correction and the equality unit was rerun.
 Status: agent-selected
 Supersedes / superseded by: none.
+
+
+## D-014 — Carry the server's blocking-unknown fact into analysis
+Unspecified question / design reference: R3-2 needs real evidence gaps, but Search's base ContextCandidate omits the server-derived unknowns carried by the MCP wrapper.
+Chosen approach: add a has_blocking_unknowns boolean to the Rust analysis request, derived only from existing material unknowns in the MCP caller. Replace the confidence threshold at its existing precedence position with blocking-unknown/Failed checks. Preserve duplicate/contradiction/Space precedence, MCP's existing overlay and Failed→Draft recovery path; both Draft and NeedsEvidence remain hard rejected. Narrow automatic-confirm guard1 to pending/replay; other eligibility guards remain.
+Alternatives considered: expose a new model argument (unneeded and forbidden schema drift); infer evidence from relation confidence (the reported defect); reorder other review classifications (outside this narrow change).
+Rationale and assumptions: this is internal server provenance, not additional Agent authority. It makes the requested predicate explicit without expanding the permission surface.
+Tradeoffs / consequences: internal Rust callers initialize one boolean; public JSON input schemas, thresholds and status precedence remain unchanged.
+Affected issue/code: R3-2, search CandidateAnalysisRequest/review_status, MCP caller/permission error and direct tests.
+Validation evidence: direct evidence/low-confidence unit1passed; full Search and MCP suites passed (logs /private/tmp/sctx-r3-2-{search,mcp}.log), including public frozen schemas and automatic-confirm eligibility/replay tests. Workspace clippy and fmt passed.
+Status: agent-selected
+Supersedes / superseded by: none.

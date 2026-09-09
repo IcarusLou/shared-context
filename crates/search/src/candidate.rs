@@ -77,6 +77,8 @@ pub struct CandidateAnalysisRequest {
     pub source_intent_revision_id: TaskIntentRevisionId,
     pub source_working_intent: WorkingIntentSnapshot,
     pub source_task_signals: Vec<TaskSignal>,
+    /// Evidence gaps derived from the source Checkpoint, never from relationship confidence.
+    pub has_blocking_unknowns: bool,
     pub explicit_related_contexts: Vec<ContextRevisionRef>,
     pub artifact_refs: Vec<ArtifactRef>,
     pub proposed_space_group_space_id: Option<SpaceId>,
@@ -271,7 +273,8 @@ impl SearchEngine {
             error_code: None,
         };
         enforce_budget(&mut analysis, &mut recommendations)?;
-        let candidate_status = review_status(&analysis, &recommendations, &confidence);
+        let candidate_status =
+            review_status(&analysis, &recommendations, request.has_blocking_unknowns);
         analysis.validate()?;
         Ok(CandidateAnalysisResult {
             analysis,
@@ -1274,7 +1277,7 @@ fn estimate_tokens(value: &impl serde::Serialize) -> Result<usize> {
 fn review_status(
     analysis: &CandidateAnalysis,
     recommendations: &[CandidateSpaceRecommendation],
-    confidence: &CandidateConfidence,
+    has_blocking_unknowns: bool,
 ) -> AutomaticCandidateStatus {
     if analysis
         .assessments
@@ -1296,7 +1299,7 @@ fn review_status(
         )
     }) {
         AutomaticCandidateStatus::NeedsSpaceReview
-    } else if confidence.basis_points < 5_000 {
+    } else if has_blocking_unknowns || analysis.status == CandidateAnalysisStatus::Failed {
         AutomaticCandidateStatus::NeedsEvidence
     } else {
         AutomaticCandidateStatus::ReadyForReview
@@ -1416,6 +1419,65 @@ fn push_space_path(state: &mut SpaceState, path: CandidateSpaceRecommendationPat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_status_uses_evidence_gaps_not_relation_confidence() {
+        let analysis = CandidateAnalysis {
+            status: CandidateAnalysisStatus::Complete,
+            assessments: vec![CandidateRelationAssessment {
+                relation: CandidateAssessmentRelation::UnresolvedRelated,
+                target: Some(ContextRevisionRef {
+                    context_id: sctx_domain::ContextId::new(),
+                    revision_id: sctx_domain::RevisionId::new(),
+                }),
+                confidence: CandidateConfidence {
+                    basis_points: 4_000,
+                    rationale: "Relation remains unresolved".to_owned(),
+                },
+                paths: vec![CandidateAssessmentPath::ContextFullText {
+                    matched_terms: vec!["budget".to_owned()],
+                }],
+                reasons: vec!["Retrieval is not a lack of evidence".to_owned()],
+            }],
+            context_tree_oid: Some("a".repeat(40)),
+            context_generation: Some(1),
+            token_budget: 4096,
+            estimated_tokens: 128,
+            ..CandidateAnalysis::default()
+        };
+        analysis.validate().unwrap();
+        let recommendations = vec![CandidateSpaceRecommendation::existing(
+            SpaceId::new(),
+            RecommendedSpaceRole::Primary,
+            "Current owner",
+            CandidateConfidence {
+                basis_points: 9_000,
+                rationale: "Verified owner".to_owned(),
+            },
+        )];
+        assert_eq!(
+            review_status(&analysis, &recommendations, false),
+            AutomaticCandidateStatus::ReadyForReview
+        );
+        assert_eq!(
+            review_status(&analysis, &recommendations, true),
+            AutomaticCandidateStatus::NeedsEvidence
+        );
+        let failed = CandidateAnalysis {
+            status: CandidateAnalysisStatus::Failed,
+            error_code: Some("analysis_invalid_input".to_owned()),
+            ..CandidateAnalysis::default()
+        };
+        failed.validate().unwrap();
+        assert_eq!(
+            review_status(&failed, &recommendations, false),
+            AutomaticCandidateStatus::NeedsEvidence
+        );
+        assert_eq!(
+            review_status(&analysis, &[], false),
+            AutomaticCandidateStatus::NeedsSpaceReview
+        );
+    }
 
     fn ranked_target() -> (ContextRevisionRef, TargetState) {
         let revision = ContextRevision {

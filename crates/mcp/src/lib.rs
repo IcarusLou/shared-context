@@ -2786,6 +2786,7 @@ impl Runtime {
             |graph| SearchEngine::with_engineering_graph(self.index.clone(), graph.clone()),
         );
         let derived = engine.analyze_candidate(&CandidateAnalysisRequest {
+            has_blocking_unknowns: material.unknowns.iter().any(|unknown| unknown.blocking),
             candidate: persisted.clone(),
             source_task_id: task.task_id,
             source_intent_revision_id: source_intent_id,
@@ -5526,8 +5527,11 @@ fn require_auto_confirm_permitted(
         .iter()
         .max_by_key(|assessment| assessment.confidence.basis_points)
         .map(|assessment| assessment.relation);
-    let violation = if !review.ready_for_review {
-        Some("its Review is not ready_for_review".to_owned())
+    let violation = if review.review_status != CandidateReviewStatus::Pending {
+        Some(
+            "its Review is no longer pending; automatic confirmation cannot replay a decision"
+                .to_owned(),
+        )
     } else if review.candidate_status != AutomaticCandidateStatus::ReadyForReview {
         Some(format!(
             "its candidate_status is {} rather than ready_for_review, so it needs a human \
