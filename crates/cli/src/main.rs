@@ -2293,7 +2293,12 @@ fn resolve_hook_action(
     };
     ResolvedAgentAction {
         additional_context,
-        system_message: task_resolution.system_message.or(system_message),
+        // Some("") is an explicit runtime silence override. Filter only after choosing it,
+        // so an adapter fallback cannot turn a quiet replay back into a notification.
+        system_message: task_resolution
+            .system_message
+            .or(system_message)
+            .filter(|message| !message.is_empty()),
     }
 }
 
@@ -2393,6 +2398,7 @@ fn resolve_task_operation(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn finalize_checkpointed_episode(
     locator: &ExternalSessionLocator,
     trigger: EpisodeFinalizationTrigger,
@@ -2404,7 +2410,13 @@ fn finalize_checkpointed_episode(
         EpisodeFinalizationTrigger::PreCompact => "PreCompact",
         EpisodeFinalizationTrigger::TurnStop => "TurnStop",
     };
-    let system_message = match boundary {
+    let closure_message = |episode_id, final_checkpoint_id, build_status, item_count| {
+        format!(
+            "Shared Context {trigger_name}: Work Episode {episode_id} is durably closed at Checkpoint {final_checkpoint_id}; Candidate Builder is {build_status} with {item_count} item(s). Candidate review remains explicit and untrusted.",
+        )
+    };
+    let mut replayed_build = None;
+    let mut system_message = match boundary {
         AutomatedEpisodeBoundary::NoActiveTask => format!(
             "Shared Context {trigger_name}: no ActiveTask exists. Continue coding normally; use $shared-context and task_intent_update before checkpointing."
         ),
@@ -2436,6 +2448,15 @@ fn finalize_checkpointed_episode(
                 return Err(invariant("automated closed Episode lacks final Checkpoint"));
             };
             let existing = runtime.read_candidate_build(episode_id)?;
+            if !newly_closed {
+                replayed_build = Some((
+                    episode_id,
+                    final_checkpoint_id,
+                    existing
+                        .as_ref()
+                        .is_none_or(|build| build.status == CandidateBuildStatus::Pending),
+                ));
+            }
             let should_build = newly_closed
                 || existing
                     .as_ref()
@@ -2472,12 +2493,33 @@ fn finalize_checkpointed_episode(
                     )
                 },
             );
-            format!(
-                "Shared Context {trigger_name}: Work Episode {episode_id} is durably closed at Checkpoint {final_checkpoint_id}; Candidate Builder is {build_status} with {item_count} item(s). Candidate review remains explicit and untrusted.",
-            )
+            closure_message(episode_id, final_checkpoint_id, build_status, item_count)
         }
     };
     recover_one_pending_episode_build(&root, &runtime, locator)?;
+    if let Some((episode_id, final_checkpoint_id, could_recover)) = replayed_build {
+        // Quieting a replay never bypasses either build attempt above. Only a newly terminal
+        // current build earns another receipt; completion of an older Episode does not.
+        system_message = if could_recover {
+            runtime
+                .read_candidate_build(episode_id)?
+                .filter(|build| build.status != CandidateBuildStatus::Pending)
+                .map_or_else(String::new, |build| {
+                    closure_message(
+                        episode_id,
+                        final_checkpoint_id,
+                        if build.status == CandidateBuildStatus::Complete {
+                            "complete"
+                        } else {
+                            "incomplete"
+                        },
+                        build.items.len(),
+                    )
+                })
+        } else {
+            String::new()
+        };
+    }
     Ok(ResolvedTaskOperation {
         system_message: Some(system_message),
     })

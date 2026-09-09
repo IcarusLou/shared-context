@@ -569,10 +569,8 @@ fn checkpoint(
             trigger,
         }),
         additional_context,
-        system_message: Some(
-            "Before compaction or turn completion, use $shared-context and call task_checkpoint with complete direct Claims/Unknowns; the server resolves the current Task, Intent, and lifecycle. Hook lifecycle data is not Claim evidence."
-                .to_owned(),
-        ),
+        // Runtime finalization decides between checkpoint guidance, a closure receipt and silence.
+        system_message: None,
     }
 }
 
@@ -1552,12 +1550,7 @@ mod tests {
                 Some(TaskRuntimeOperation::FinalizeCheckpointedEpisode { trigger, .. })
                     if trigger == expected_trigger
             ));
-            assert!(
-                action
-                    .system_message
-                    .as_deref()
-                    .is_some_and(|message| message.contains("task_checkpoint"))
-            );
+            assert!(action.system_message.is_none());
         }
 
         let end_action = plan(5);

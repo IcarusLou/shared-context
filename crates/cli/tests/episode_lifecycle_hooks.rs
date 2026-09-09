@@ -429,12 +429,23 @@ fn real_hooks_close_checkpointed_episodes_build_once_and_keep_sessions_isolated(
             "codex",
             &codex_event("codex-lifecycle", &harness.home, "Stop", raw_marker),
         );
-        assert!(
-            retry["systemMessage"]
-                .as_str()
-                .is_some_and(|message| message.contains("durably closed"))
+        assert_eq!(retry, json!({}));
+        let cursor_retry = harness.hook(
+            "cursor",
+            &cursor_stop("cursor-lifecycle", &harness.home, raw_marker),
         );
+        assert_eq!(cursor_retry, json!({}));
     }
+    // Silence removes only the closure notice: Cursor still receives its compaction marker.
+    let mut compact = cursor_stop("cursor-lifecycle", &harness.home, raw_marker);
+    compact["hook_event_name"] = json!("preCompact");
+    compact["trigger"] = json!("auto");
+    assert_eq!(
+        harness.hook("cursor", &compact),
+        json!({
+            "user_message": shared_context_activation_marker(AgentKind::Cursor, "cursor-lifecycle")
+        })
+    );
     assert!(started.elapsed() < Duration::from_secs(10));
     assert_eq!(
         index.domain_snapshot().unwrap().projection.candidates.len(),
@@ -759,6 +770,7 @@ fn concurrent_turn_stop_processes_converge_on_one_build_and_candidate() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn turn_stop_fails_open_after_close_and_later_retry_recovers_builder() {
     let harness = Harness::new();
     let runtime = TaskRuntime::initialize(&harness.root).unwrap();
@@ -852,6 +864,132 @@ fn turn_stop_fails_open_after_close_and_later_retry_recovers_builder() {
         .unwrap();
     assert_eq!(newer.status, CandidateBuildStatus::Complete);
     assert_eq!(newer.items.len(), 1);
+
+    // A quiet replay of the already-complete current Episode must still run the older-Episode
+    // recovery sweep. Its completion is not a second receipt for the current Episode.
+    rusqlite::Connection::open(runtime.database_path())
+        .unwrap()
+        .execute(
+            "UPDATE candidate_build SET status = 'pending' WHERE episode_id = ?1",
+            [episode_id.to_string()],
+        )
+        .unwrap();
+    let quiet = harness.hook(
+        "codex",
+        &codex_event(
+            "builder-recovery",
+            &harness.home,
+            "Stop",
+            "OLDER_BUILD_RECOVERY",
+        ),
+    );
+    assert_eq!(quiet, json!({}));
+    assert_eq!(
+        runtime
+            .read_candidate_build(episode_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        CandidateBuildStatus::Complete
+    );
+}
+
+#[test]
+fn repeated_closed_episode_reports_only_new_terminal_build_recovery() {
+    for pending in [false, true] {
+        for evidenced in [false, true] {
+            let harness = Harness::new();
+            let runtime = TaskRuntime::initialize(&harness.root).unwrap();
+            let session = "current-build-recovery";
+            harness.activate("codex", session);
+            let locator = ExternalSessionLocator::new("codex", session).unwrap();
+            let active = runtime
+                .open_or_create(
+                    locator.clone(),
+                    TaskId::new(),
+                    intent(session),
+                    vec![sctx_domain::TaskSignal {
+                        kind: sctx_domain::TaskSignalKind::Prompt,
+                        content: "A locating prompt is not engineering evidence".to_owned(),
+                    }],
+                )
+                .unwrap()
+                .snapshot;
+            let mut claim = checkpoint_claim(session);
+            if !evidenced {
+                claim.inline_validations.clear();
+                // A legitimate local reference can still be insufficient for Builder: Prompt
+                // Signals locate work but cannot substantiate an engineering Claim.
+                claim
+                    .evidence_refs
+                    .push(sctx_domain::CheckpointEvidenceRef::TaskSignal {
+                        signal_id: runtime.read_signal_history(active.task_session_id).unwrap()[0]
+                            .signal_id,
+                    });
+            }
+            let episode_id = runtime
+                .write_agent_checkpoint(&AgentCheckpointWrite {
+                    locator: locator.clone(),
+                    expected_task_id: active.task_id,
+                    expected_intent_revision_id: active
+                        .current_intent_revision()
+                        .unwrap()
+                        .revision_id,
+                    expected_episode_version: 0,
+                    boundary: CheckpointBoundary::Continue,
+                    claims: vec![claim],
+                    unknowns: Vec::new(),
+                })
+                .unwrap()
+                .episode
+                .episode
+                .episode_id;
+            runtime.close_checkpointed_work_episode(&locator).unwrap();
+            assert!(runtime.read_candidate_build(episode_id).unwrap().is_none());
+            if pending {
+                sctx_mcp::build_closed_episode_at_root(&harness.root, episode_id).unwrap();
+                // Reproduce a pending build-status projection over retained item outcomes. The
+                // real Builder must converge it before this replay can earn a recovery receipt.
+                rusqlite::Connection::open(runtime.database_path())
+                    .unwrap()
+                    .execute(
+                        "UPDATE candidate_build SET status = 'pending' WHERE episode_id = ?1",
+                        [episode_id.to_string()],
+                    )
+                    .unwrap();
+                assert_eq!(
+                    runtime
+                        .read_candidate_build(episode_id)
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    CandidateBuildStatus::Pending
+                );
+            }
+            let payload = codex_event(session, &harness.home, "Stop", "RECOVERY_FIXTURE");
+            let receipt = harness.hook("codex", &payload);
+            let status = if evidenced { "complete" } else { "incomplete" };
+            let message = receipt["systemMessage"].as_str().unwrap();
+            assert!(
+                message.contains(&format!("Candidate Builder is {status} with")),
+                "{receipt:#}"
+            );
+            assert!(message.contains(&episode_id.to_string()));
+            assert_eq!(
+                runtime
+                    .read_candidate_build(episode_id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                if evidenced {
+                    CandidateBuildStatus::Complete
+                } else {
+                    CandidateBuildStatus::Incomplete
+                }
+            );
+            assert_eq!(harness.hook("codex", &payload), json!({}));
+        }
+    }
 }
 
 #[test]

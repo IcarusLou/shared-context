@@ -98,7 +98,7 @@ fn cursor_prompt_hook_never_repeats_activation_marker() {
 }
 
 #[test]
-fn cursor_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_claims() {
+fn cursor_boundaries_plan_runtime_finalization_and_encode_its_resolved_notice() {
     let capability = capabilities(Some("3.13.10"), true);
     for (index, expected_trigger) in [
         (3, EpisodeFinalizationTrigger::PreCompact),
@@ -113,24 +113,11 @@ fn cursor_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_c
             Some(TaskRuntimeOperation::FinalizeCheckpointedEpisode { trigger, .. })
                 if trigger == expected_trigger
         ));
-        let message = action.system_message.as_deref().unwrap();
-        assert!(message.contains("task_checkpoint"));
-        assert!(message.contains("complete direct Claims/Unknowns"));
-        assert!(message.contains("server resolves the current Task, Intent, and lifecycle"));
-        assert!(message.contains("Hook lifecycle data is not Claim evidence"));
-        for forbidden in [
-            "expected_task_id",
-            "expected_intent_revision_id",
-            "expected_episode_version",
-            "boundary",
-            "inline_validation",
-            "capture",
-        ] {
-            assert!(
-                !message.contains(forbidden),
-                "stale Hook guidance: {message}"
-            );
-        }
+        assert!(
+            action.system_message.is_none(),
+            "the planner must not invent runtime guidance"
+        );
+        let message = "Runtime-resolved checkpoint guidance";
 
         // Both events carry the one text field Cursor renders. Compaction additionally
         // re-states the activation marker on its own line, because compaction is what
@@ -139,7 +126,7 @@ fn cursor_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_c
             event.kind(),
             &ResolvedAgentAction {
                 additional_context: action.additional_context.clone(),
-                system_message: action.system_message.clone(),
+                system_message: Some(message.to_owned()),
             },
         )
         .unwrap();
