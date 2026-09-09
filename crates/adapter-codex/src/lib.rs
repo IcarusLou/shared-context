@@ -45,9 +45,132 @@ pub fn capabilities(
     )
 }
 
-#[derive(Deserialize)]
-struct Envelope {
-    hook_event_name: String,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HookDecodeErrorClass {
+    InvalidJson,
+    MissingField,
+    Type,
+    Enum,
+    UnknownEvent,
+}
+
+impl HookDecodeErrorClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidJson => "invalid_json",
+            Self::MissingField => "missing_field",
+            Self::Type => "type",
+            Self::Enum => "enum",
+            Self::UnknownEvent => "unknown_event",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HookHostSchema {
+    InvalidJson,
+    NonObject,
+    MissingEventName,
+    EventNameType,
+    SupportedEvent,
+    UnknownEvent,
+}
+
+impl HookHostSchema {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidJson => "invalid_json",
+            Self::NonObject => "non_object",
+            Self::MissingEventName => "missing_event_name",
+            Self::EventNameType => "event_name_type",
+            Self::SupportedEvent => "supported_event",
+            Self::UnknownEvent => "unknown_event",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HookDecodeField {
+    SessionId,
+    TranscriptPath,
+    Cwd,
+    HookEventName,
+    Model,
+    PermissionMode,
+    Source,
+    TurnId,
+    Prompt,
+    ToolName,
+    ToolUseId,
+    ToolInput,
+    ToolResponse,
+    Trigger,
+    StopHookActive,
+    LastAssistantMessage,
+    Reason,
+}
+
+impl HookDecodeField {
+    #[must_use]
+    pub const fn telemetry_family(self) -> &'static str {
+        match self {
+            Self::SessionId => "field.session_id",
+            Self::TranscriptPath => "field.transcript_path",
+            Self::Cwd => "field.cwd",
+            Self::HookEventName => "field.hook_event_name",
+            Self::Model => "field.model",
+            Self::PermissionMode => "field.permission_mode",
+            Self::Source => "field.source",
+            Self::TurnId => "field.turn_id",
+            Self::Prompt => "field.prompt",
+            Self::ToolName => "field.tool_name",
+            Self::ToolUseId => "field.tool_use_id",
+            Self::ToolInput => "field.tool_input",
+            Self::ToolResponse => "field.tool_response",
+            Self::Trigger => "field.trigger",
+            Self::StopHookActive => "field.stop_hook_active",
+            Self::LastAssistantMessage => "field.last_assistant_message",
+            Self::Reason => "field.reason",
+        }
+    }
+}
+
+/// Closed, privacy-safe metadata for one rejected host payload.
+///
+/// The optional Session id is read only from the documented top-level field and is bounded before
+/// it leaves the adapter. Callers may hash it, but must never persist it directly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HookDecodeDiagnostic {
+    pub error_class: HookDecodeErrorClass,
+    pub event_kind: Option<CanonicalAgentEventKind>,
+    pub host_schema: HookHostSchema,
+    pub field: Option<HookDecodeField>,
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct HookDecodeFailure {
+    error: Error,
+    diagnostic: HookDecodeDiagnostic,
+}
+
+impl HookDecodeFailure {
+    #[must_use]
+    pub const fn diagnostic(&self) -> &HookDecodeDiagnostic {
+        &self.diagnostic
+    }
+
+    #[must_use]
+    pub fn error(&self) -> &Error {
+        &self.error
+    }
+
+    #[must_use]
+    pub fn into_error(self) -> Error {
+        self.error
+    }
 }
 
 #[derive(Deserialize)]
@@ -144,39 +267,125 @@ struct SessionEndInput {
 /// Rejects malformed JSON, unsupported Hook names, wrong field types, empty required identity
 /// fields, and undocumented enum values used by policy.
 pub fn decode_hook_input(bytes: &[u8]) -> Result<CanonicalAgentEvent> {
-    let value: Value = serde_json::from_slice(bytes)
-        .map_err(|error| invalid(format!("invalid Codex hook JSON: {error}")))?;
-    let envelope: Envelope = serde_json::from_value(value.clone())
-        .map_err(|error| invalid(format!("invalid Codex hook envelope: {error}")))?;
-    match envelope.hook_event_name.as_str() {
+    decode_hook_input_with_diagnostic(bytes).map_err(HookDecodeFailure::into_error)
+}
+
+/// Decode a Codex payload while retaining only closed, bounded failure metadata.
+///
+/// # Errors
+///
+/// Returns the same strict adapter error as [`decode_hook_input`] plus a diagnostic which never
+/// contains Prompt text, tool values, paths, arbitrary keys, arbitrary enum values, or raw errors.
+#[allow(clippy::too_many_lines)]
+pub fn decode_hook_input_with_diagnostic(
+    bytes: &[u8],
+) -> std::result::Result<CanonicalAgentEvent, HookDecodeFailure> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|error| HookDecodeFailure {
+        error: invalid(format!("invalid Codex hook JSON: {error}")),
+        diagnostic: HookDecodeDiagnostic {
+            error_class: HookDecodeErrorClass::InvalidJson,
+            event_kind: None,
+            host_schema: HookHostSchema::InvalidJson,
+            field: None,
+            session_id: None,
+        },
+    })?;
+    let Some(object) = value.as_object() else {
+        return Err(decode_failure(
+            HookDecodeDiagnostic {
+                error_class: HookDecodeErrorClass::Type,
+                event_kind: None,
+                host_schema: HookHostSchema::NonObject,
+                field: None,
+                session_id: None,
+            },
+            invalid("Codex hook payload must be an object"),
+        ));
+    };
+    let session_id = object
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|session| !session.is_empty() && session.len() <= 256)
+        .map(str::to_owned);
+    let Some(event_name) = object.get("hook_event_name") else {
+        return Err(decode_failure(
+            HookDecodeDiagnostic {
+                error_class: HookDecodeErrorClass::MissingField,
+                event_kind: None,
+                host_schema: HookHostSchema::MissingEventName,
+                field: Some(HookDecodeField::HookEventName),
+                session_id,
+            },
+            invalid("invalid Codex hook envelope: missing hook_event_name"),
+        ));
+    };
+    let Some(event_name) = event_name.as_str() else {
+        return Err(decode_failure(
+            HookDecodeDiagnostic {
+                error_class: HookDecodeErrorClass::Type,
+                event_kind: None,
+                host_schema: HookHostSchema::EventNameType,
+                field: Some(HookDecodeField::HookEventName),
+                session_id,
+            },
+            invalid("invalid Codex hook envelope: hook_event_name must be a string"),
+        ));
+    };
+    let event_kind = codex_event_kind(event_name);
+    let diagnostic = HookDecodeDiagnostic {
+        error_class: HookDecodeErrorClass::Type,
+        event_kind,
+        host_schema: if event_kind.is_some() {
+            HookHostSchema::SupportedEvent
+        } else {
+            HookHostSchema::UnknownEvent
+        },
+        field: None,
+        session_id,
+    };
+    validate_supported_shape(object, event_name, &diagnostic)?;
+    match event_name {
         "SessionStart" => {
-            let input: SessionStartInput = decode(value, "SessionStart")?;
-            input.common.validate("SessionStart")?;
+            let input: SessionStartInput = decode(value, "SessionStart", &diagnostic)?;
+            input.common.validate("SessionStart").map_err(|error| {
+                classified_failure(&diagnostic, HookDecodeErrorClass::MissingField, error)
+            })?;
             require_one_of(
                 "Codex SessionStart source",
                 &input.source,
                 &["startup", "resume", "clear", "compact"],
-            )?;
+            )
+            .map_err(|error| {
+                classified_field_failure(
+                    &diagnostic,
+                    HookDecodeErrorClass::Enum,
+                    HookDecodeField::Source,
+                    error,
+                )
+            })?;
             Ok(CanonicalAgentEvent::SessionStart {
                 context: input.common.context(),
             })
         }
         "UserPromptSubmit" => {
-            let input: PromptInput = decode(value, "UserPromptSubmit")?;
-            input.common.validate("UserPromptSubmit")?;
-            require_nonempty("turn_id", &input.turn_id)?;
-            require_nonempty("prompt", &input.prompt)?;
+            let input: PromptInput = decode(value, "UserPromptSubmit", &diagnostic)?;
+            validate_common_and_required(&diagnostic, input.common.validate("UserPromptSubmit"))?;
+            validate_required(&diagnostic, require_nonempty("turn_id", &input.turn_id))?;
+            validate_required(&diagnostic, require_nonempty("prompt", &input.prompt))?;
             Ok(CanonicalAgentEvent::PromptSubmit {
                 context: input.common.context(),
                 prompt: input.prompt,
             })
         }
         "PostToolUse" => {
-            let input: PostToolInput = decode(value, "PostToolUse")?;
-            input.common.validate("PostToolUse")?;
-            require_nonempty("turn_id", &input.turn_id)?;
-            require_nonempty("tool_name", &input.tool_name)?;
-            require_nonempty("tool_use_id", &input.tool_use_id)?;
+            let input: PostToolInput = decode(value, "PostToolUse", &diagnostic)?;
+            validate_common_and_required(&diagnostic, input.common.validate("PostToolUse"))?;
+            validate_required(&diagnostic, require_nonempty("turn_id", &input.turn_id))?;
+            validate_required(&diagnostic, require_nonempty("tool_name", &input.tool_name))?;
+            validate_required(
+                &diagnostic,
+                require_nonempty("tool_use_id", &input.tool_use_id),
+            )?;
             let outcome = tool_outcome(&input.tool_response);
             let normalized = normalize_tool_use(&input.tool_name, &input.tool_input);
             Ok(CanonicalAgentEvent::PostToolUse {
@@ -189,23 +398,31 @@ pub fn decode_hook_input(bytes: &[u8]) -> Result<CanonicalAgentEvent> {
             })
         }
         "PreCompact" => {
-            let input: PreCompactInput = decode(value, "PreCompact")?;
-            input.common.validate("PreCompact")?;
-            require_nonempty("turn_id", &input.turn_id)?;
+            let input: PreCompactInput = decode(value, "PreCompact", &diagnostic)?;
+            validate_common_and_required(&diagnostic, input.common.validate("PreCompact"))?;
+            validate_required(&diagnostic, require_nonempty("turn_id", &input.turn_id))?;
             require_one_of(
                 "Codex PreCompact trigger",
                 &input.trigger,
                 &["manual", "auto"],
-            )?;
+            )
+            .map_err(|error| {
+                classified_field_failure(
+                    &diagnostic,
+                    HookDecodeErrorClass::Enum,
+                    HookDecodeField::Trigger,
+                    error,
+                )
+            })?;
             Ok(CanonicalAgentEvent::PreCompact {
                 context: input.common.context(),
                 trigger: input.trigger,
             })
         }
         "Stop" => {
-            let input: StopInput = decode(value, "Stop")?;
-            input.common.validate("Stop")?;
-            require_nonempty("turn_id", &input.turn_id)?;
+            let input: StopInput = decode(value, "Stop", &diagnostic)?;
+            validate_common_and_required(&diagnostic, input.common.validate("Stop"))?;
+            validate_required(&diagnostic, require_nonempty("turn_id", &input.turn_id))?;
             let _ = input.last_assistant_message;
             Ok(CanonicalAgentEvent::TurnStop {
                 context: input.common.context(),
@@ -218,16 +435,249 @@ pub fn decode_hook_input(bytes: &[u8]) -> Result<CanonicalAgentEvent> {
             })
         }
         "SessionEnd" => {
-            let input: SessionEndInput = decode(value, "SessionEnd")?;
-            input.common.validate("SessionEnd")?;
-            require_one_of("Codex SessionEnd reason", &input.reason, &["other"])?;
+            let input: SessionEndInput = decode(value, "SessionEnd", &diagnostic)?;
+            validate_common_and_required(&diagnostic, input.common.validate("SessionEnd"))?;
+            // The canonical event only carries this descriptive host value through, and Session
+            // cleanup never branches on it. Retain the non-empty boundary instead of maintaining
+            // a guessed enum whitelist which can suppress cleanup for new host reasons.
+            validate_required(
+                &diagnostic,
+                require_nonempty("SessionEnd reason", &input.reason),
+            )?;
             Ok(CanonicalAgentEvent::SessionEnd {
                 context: input.common.context(),
                 reason: input.reason,
             })
         }
-        other => Err(invalid(format!("unsupported Codex Hook event {other:?}"))),
+        other => Err(classified_failure(
+            &diagnostic,
+            HookDecodeErrorClass::UnknownEvent,
+            invalid(format!("unsupported Codex Hook event {other:?}")),
+        )),
     }
+}
+
+const fn codex_event_kind(event_name: &str) -> Option<CanonicalAgentEventKind> {
+    match event_name.as_bytes() {
+        b"SessionStart" => Some(CanonicalAgentEventKind::SessionStart),
+        b"UserPromptSubmit" => Some(CanonicalAgentEventKind::PromptSubmit),
+        b"PostToolUse" => Some(CanonicalAgentEventKind::PostToolUse),
+        b"PreCompact" => Some(CanonicalAgentEventKind::PreCompact),
+        b"Stop" => Some(CanonicalAgentEventKind::TurnStop),
+        b"SessionEnd" => Some(CanonicalAgentEventKind::SessionEnd),
+        _ => None,
+    }
+}
+
+fn decode_failure(diagnostic: HookDecodeDiagnostic, error: Error) -> HookDecodeFailure {
+    HookDecodeFailure { error, diagnostic }
+}
+
+fn classified_failure(
+    diagnostic: &HookDecodeDiagnostic,
+    error_class: HookDecodeErrorClass,
+    error: Error,
+) -> HookDecodeFailure {
+    let mut diagnostic = diagnostic.clone();
+    diagnostic.error_class = error_class;
+    decode_failure(diagnostic, error)
+}
+
+fn classified_field_failure(
+    diagnostic: &HookDecodeDiagnostic,
+    error_class: HookDecodeErrorClass,
+    field: HookDecodeField,
+    error: Error,
+) -> HookDecodeFailure {
+    let mut diagnostic = diagnostic.clone();
+    diagnostic.error_class = error_class;
+    diagnostic.field = Some(field);
+    decode_failure(diagnostic, error)
+}
+
+fn validate_supported_shape(
+    object: &serde_json::Map<String, Value>,
+    event_name: &str,
+    diagnostic: &HookDecodeDiagnostic,
+) -> std::result::Result<(), HookDecodeFailure> {
+    if diagnostic.event_kind.is_none() {
+        return Ok(());
+    }
+    for (name, field) in [
+        ("session_id", HookDecodeField::SessionId),
+        ("cwd", HookDecodeField::Cwd),
+        ("hook_event_name", HookDecodeField::HookEventName),
+        ("model", HookDecodeField::Model),
+    ] {
+        require_shape_string(object, name, field, diagnostic)?;
+    }
+    for (name, field) in [
+        ("transcript_path", HookDecodeField::TranscriptPath),
+        ("permission_mode", HookDecodeField::PermissionMode),
+    ] {
+        require_optional_shape_string(object, name, field, diagnostic)?;
+    }
+    match event_name {
+        "SessionStart" => {
+            require_shape_string(object, "source", HookDecodeField::Source, diagnostic)?;
+        }
+        "UserPromptSubmit" => {
+            require_shape_string(object, "turn_id", HookDecodeField::TurnId, diagnostic)?;
+            require_shape_string(object, "prompt", HookDecodeField::Prompt, diagnostic)?;
+        }
+        "PostToolUse" => {
+            require_shape_string(object, "turn_id", HookDecodeField::TurnId, diagnostic)?;
+            require_shape_string(object, "tool_name", HookDecodeField::ToolName, diagnostic)?;
+            require_shape_string(
+                object,
+                "tool_use_id",
+                HookDecodeField::ToolUseId,
+                diagnostic,
+            )?;
+            require_shape_value(object, "tool_input", HookDecodeField::ToolInput, diagnostic)?;
+            require_shape_value(
+                object,
+                "tool_response",
+                HookDecodeField::ToolResponse,
+                diagnostic,
+            )?;
+        }
+        "PreCompact" => {
+            require_shape_string(object, "turn_id", HookDecodeField::TurnId, diagnostic)?;
+            require_shape_string(object, "trigger", HookDecodeField::Trigger, diagnostic)?;
+        }
+        "Stop" => {
+            require_shape_string(object, "turn_id", HookDecodeField::TurnId, diagnostic)?;
+            require_shape_bool(
+                object,
+                "stop_hook_active",
+                HookDecodeField::StopHookActive,
+                diagnostic,
+            )?;
+            require_optional_shape_string(
+                object,
+                "last_assistant_message",
+                HookDecodeField::LastAssistantMessage,
+                diagnostic,
+            )?;
+        }
+        "SessionEnd" => {
+            require_shape_string(object, "reason", HookDecodeField::Reason, diagnostic)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn require_shape_string(
+    object: &serde_json::Map<String, Value>,
+    name: &'static str,
+    field: HookDecodeField,
+    diagnostic: &HookDecodeDiagnostic,
+) -> std::result::Result<(), HookDecodeFailure> {
+    let Some(value) = object.get(name) else {
+        return Err(classified_field_failure(
+            diagnostic,
+            HookDecodeErrorClass::MissingField,
+            field,
+            invalid(format!("invalid Codex payload: missing {name}")),
+        ));
+    };
+    let Some(value) = value.as_str() else {
+        return Err(classified_field_failure(
+            diagnostic,
+            HookDecodeErrorClass::Type,
+            field,
+            invalid(format!("invalid Codex payload: {name} must be a string")),
+        ));
+    };
+    if value.trim().is_empty() {
+        return Err(classified_field_failure(
+            diagnostic,
+            HookDecodeErrorClass::MissingField,
+            field,
+            invalid(format!("invalid Codex payload: {name} must not be empty")),
+        ));
+    }
+    Ok(())
+}
+
+fn require_optional_shape_string(
+    object: &serde_json::Map<String, Value>,
+    name: &'static str,
+    field: HookDecodeField,
+    diagnostic: &HookDecodeDiagnostic,
+) -> std::result::Result<(), HookDecodeFailure> {
+    if object
+        .get(name)
+        .is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        return Err(classified_field_failure(
+            diagnostic,
+            HookDecodeErrorClass::Type,
+            field,
+            invalid(format!(
+                "invalid Codex payload: {name} must be a string or null"
+            )),
+        ));
+    }
+    Ok(())
+}
+
+fn require_shape_bool(
+    object: &serde_json::Map<String, Value>,
+    name: &'static str,
+    field: HookDecodeField,
+    diagnostic: &HookDecodeDiagnostic,
+) -> std::result::Result<(), HookDecodeFailure> {
+    match object.get(name) {
+        None => Err(classified_field_failure(
+            diagnostic,
+            HookDecodeErrorClass::MissingField,
+            field,
+            invalid(format!("invalid Codex payload: missing {name}")),
+        )),
+        Some(value) if !value.is_boolean() => Err(classified_field_failure(
+            diagnostic,
+            HookDecodeErrorClass::Type,
+            field,
+            invalid(format!("invalid Codex payload: {name} must be a boolean")),
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+fn require_shape_value(
+    object: &serde_json::Map<String, Value>,
+    name: &'static str,
+    field: HookDecodeField,
+    diagnostic: &HookDecodeDiagnostic,
+) -> std::result::Result<(), HookDecodeFailure> {
+    if object.contains_key(name) {
+        Ok(())
+    } else {
+        Err(classified_field_failure(
+            diagnostic,
+            HookDecodeErrorClass::MissingField,
+            field,
+            invalid(format!("invalid Codex payload: missing {name}")),
+        ))
+    }
+}
+
+fn validate_common_and_required(
+    diagnostic: &HookDecodeDiagnostic,
+    result: Result<()>,
+) -> std::result::Result<(), HookDecodeFailure> {
+    validate_required(diagnostic, result)
+}
+
+fn validate_required(
+    diagnostic: &HookDecodeDiagnostic,
+    result: Result<()>,
+) -> std::result::Result<(), HookDecodeFailure> {
+    result
+        .map_err(|error| classified_failure(diagnostic, HookDecodeErrorClass::MissingField, error))
 }
 
 /// Encode only documented Codex output fields. The adapter never returns a decision, continuation,
@@ -325,9 +775,23 @@ fn tool_outcome(response: &Value) -> ToolOutcome {
     }
 }
 
-fn decode<T: for<'de> Deserialize<'de>>(value: Value, event: &str) -> Result<T> {
-    serde_json::from_value(value)
-        .map_err(|error| invalid(format!("invalid Codex {event} payload: {error}")))
+fn decode<T: for<'de> Deserialize<'de>>(
+    value: Value,
+    event: &str,
+    diagnostic: &HookDecodeDiagnostic,
+) -> std::result::Result<T, HookDecodeFailure> {
+    serde_json::from_value(value).map_err(|error| {
+        let error_class = if error.to_string().starts_with("missing field") {
+            HookDecodeErrorClass::MissingField
+        } else {
+            HookDecodeErrorClass::Type
+        };
+        classified_failure(
+            diagnostic,
+            error_class,
+            invalid(format!("invalid Codex {event} payload: {error}")),
+        )
+    })
 }
 
 fn require_nonempty(name: &str, value: &str) -> Result<()> {

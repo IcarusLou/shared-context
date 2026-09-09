@@ -220,6 +220,41 @@ fn codex_precompact(session: &str, cwd: &Path) -> Value {
     payload
 }
 
+fn codex_session_end(session: &str, cwd: &Path, reason: &str) -> Value {
+    let mut payload = codex_payload(5, session, cwd);
+    payload["reason"] = Value::String(reason.to_owned());
+    payload
+}
+
+#[test]
+fn codex_session_end_cleanup_does_not_branch_on_a_nonempty_reason() {
+    let fixture = Fixture::new();
+    let session = "completed-session-end";
+    assert_activated(
+        &fixture.hook(
+            "codex",
+            &codex_start(session, &fixture.direct_repository, "startup"),
+        ),
+        AgentKind::Codex,
+        session,
+    );
+    assert!(matches!(
+        fixture.read_scope("codex", session),
+        AuthorizedSessionScopeRead::Current(_)
+    ));
+
+    let ended = fixture.hook(
+        "codex",
+        &codex_session_end(session, &fixture.direct_repository, "completed"),
+    );
+    assert!(ended.status.success());
+    assert_eq!(String::from_utf8_lossy(&ended.stdout).trim(), "{}");
+    assert_eq!(
+        fixture.read_scope("codex", session),
+        AuthorizedSessionScopeRead::Missing
+    );
+}
+
 fn cursor_payload(index: usize, session: &str, cwd: &Path) -> Value {
     let mut payload = serde_json::from_str::<Vec<Value>>(include_str!(
         "../../../fixtures/agents/cursor-3.13.json"

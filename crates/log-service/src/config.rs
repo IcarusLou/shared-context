@@ -48,6 +48,12 @@ pub struct StreamTarget {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SyncConfig {
+    /// Runs the independent log synchronization scheduler when logging has an assigned target.
+    ///
+    /// The field is omitted while enabled so routine rewrites keep the schema readable by older
+    /// binaries that reject unknown fields.
+    #[serde(default = "enabled_by_default", skip_serializing_if = "is_true")]
+    pub scheduled: bool,
     pub on_maintain: bool,
     pub timeout_seconds: u64,
     pub max_new_payload_mib: u64,
@@ -57,12 +63,22 @@ pub struct SyncConfig {
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
+            scheduled: true,
             on_maintain: true,
             timeout_seconds: 60,
             max_new_payload_mib: 20,
             max_retry_count: 1,
         }
     }
+}
+
+const fn enabled_by_default() -> bool {
+    true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_true(value: &bool) -> bool {
+    *value
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -609,4 +625,48 @@ fn now_unix_ms() -> i64 {
         .as_millis()
         .try_into()
         .unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod scheduled_tests {
+    use super::*;
+
+    #[test]
+    fn old_configs_default_to_scheduled_without_persisting_the_default_field() {
+        let root = tempfile::tempdir().unwrap();
+        let initialized = init(
+            root.path(),
+            InitOptions {
+                email: None,
+                remote: None,
+                installation_id: None,
+                enabled: true,
+            },
+        )
+        .unwrap();
+        assert!(initialized.config.sync.scheduled);
+        assert!(
+            !fs::read_to_string(root.path().join("config.toml"))
+                .unwrap()
+                .contains("scheduled")
+        );
+
+        disable(root.path()).unwrap();
+        assert!(load_config(root.path()).unwrap().sync.scheduled);
+        assert!(
+            !fs::read_to_string(root.path().join("config.toml"))
+                .unwrap()
+                .contains("scheduled")
+        );
+
+        let mut explicit = load_config(root.path()).unwrap();
+        explicit.sync.scheduled = false;
+        write_config(&layout(root.path()).config, &explicit).unwrap();
+        assert!(!load_config(root.path()).unwrap().sync.scheduled);
+        assert!(
+            fs::read_to_string(root.path().join("config.toml"))
+                .unwrap()
+                .contains("scheduled = false")
+        );
+    }
 }

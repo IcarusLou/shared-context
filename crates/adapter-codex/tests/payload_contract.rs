@@ -1,6 +1,7 @@
 use sctx_adapter_codex::{
-    CanonicalAgentEventKind, ResolvedAgentAction, TrustState, capabilities, decode_hook_input,
-    encode_hook_output,
+    CanonicalAgentEventKind, HookDecodeErrorClass, HookDecodeField, HookHostSchema,
+    ResolvedAgentAction, TrustState, capabilities, decode_hook_input,
+    decode_hook_input_with_diagnostic, encode_hook_output,
 };
 use sctx_agent_adapter::{
     ARTIFACT_FOCUS_REMINDER_MAX_BYTES, ARTIFACT_FOCUS_REMINDER_MAX_CONTEXTS, AgentKind,
@@ -439,6 +440,93 @@ fn malformed_or_unknown_codex_payload_fails_strictly() {
     payload["hook_event_name"] = Value::String("SessionStart".to_owned());
     payload["cwd"] = Value::Bool(false);
     assert!(decode_hook_input(&serde_json::to_vec(&payload).unwrap()).is_err());
+}
+
+#[test]
+fn decode_failures_expose_only_closed_shape_metadata_and_a_bounded_session_id() {
+    let secret = "ghp_adapter_diagnostic_must_never_retain_this_value";
+    let unknown = serde_json::json!({
+        "hook_event_name": "SecretFutureHook",
+        "session_id": "known-session",
+        "prompt": secret,
+        "secret key!": secret
+    });
+    let failure = decode_hook_input_with_diagnostic(&serde_json::to_vec(&unknown).unwrap())
+        .expect_err("unknown event");
+    assert_eq!(
+        failure.diagnostic().error_class,
+        HookDecodeErrorClass::UnknownEvent
+    );
+    assert_eq!(failure.diagnostic().event_kind, None);
+    assert_eq!(failure.diagnostic().field, None);
+    assert_eq!(
+        failure.diagnostic().host_schema,
+        HookHostSchema::UnknownEvent
+    );
+    assert_eq!(
+        failure.diagnostic().session_id.as_deref(),
+        Some("known-session")
+    );
+    let diagnostic = format!("{:?}", failure.diagnostic());
+    assert!(!diagnostic.contains(secret));
+    assert!(!diagnostic.contains("SecretFutureHook"));
+    assert!(!diagnostic.contains("secret key"));
+
+    let mut supported = fixtures().remove(1);
+    supported.as_object_mut().unwrap().remove("turn_id");
+    supported["prompt"] = Value::String(secret.to_owned());
+    let failure =
+        decode_hook_input_with_diagnostic(&serde_json::to_vec(&supported).unwrap()).unwrap_err();
+    assert_eq!(
+        failure.diagnostic().error_class,
+        HookDecodeErrorClass::MissingField
+    );
+    assert_eq!(
+        failure.diagnostic().event_kind,
+        Some(CanonicalAgentEventKind::PromptSubmit)
+    );
+    assert_eq!(
+        failure.diagnostic().host_schema,
+        HookHostSchema::SupportedEvent
+    );
+    assert_eq!(failure.diagnostic().field, Some(HookDecodeField::TurnId));
+
+    let failure = decode_hook_input_with_diagnostic(b"not json").unwrap_err();
+    assert_eq!(
+        failure.diagnostic().error_class,
+        HookDecodeErrorClass::InvalidJson
+    );
+    assert_eq!(
+        failure.diagnostic().host_schema,
+        HookHostSchema::InvalidJson
+    );
+    assert_eq!(failure.diagnostic().field, None);
+    assert_eq!(failure.diagnostic().session_id, None);
+}
+
+#[test]
+fn codex_session_end_accepts_nonempty_live_host_reasons() {
+    for reason in ["other", "completed", "window_close"] {
+        let mut payload = fixtures().remove(5);
+        payload["reason"] = Value::String(reason.to_owned());
+        let event = decode_hook_input(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        let sctx_adapter_codex::CanonicalAgentEvent::SessionEnd {
+            reason: decoded, ..
+        } = event
+        else {
+            panic!("SessionEnd payload must remain a SessionEnd");
+        };
+        assert_eq!(decoded, reason);
+    }
+
+    let mut payload = fixtures().remove(5);
+    payload["reason"] = Value::String("  ".to_owned());
+    let failure =
+        decode_hook_input_with_diagnostic(&serde_json::to_vec(&payload).unwrap()).unwrap_err();
+    assert_eq!(
+        failure.diagnostic().error_class,
+        HookDecodeErrorClass::MissingField
+    );
 }
 
 /// P4.1 experiment. The switch is off by default: the disabled Codex `PostToolUse`

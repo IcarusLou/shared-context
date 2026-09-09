@@ -63,7 +63,7 @@ fn start_collector(home: &Path, logs_root: &Path) -> CollectorProcess {
 
 fn hook_raw(home: &Path, logs_root: &Path, input: &[u8]) -> std::process::Output {
     let mut child = command(home, logs_root)
-        .args(["hook", "--agent", "cursor"])
+        .args(["hook", "--agent", "codex"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -114,6 +114,39 @@ fn independent_logs_commands_work_when_business_state_is_corrupt() {
         ],
     );
     assert_eq!(probe["logs_root"], json!("ok"));
+}
+
+#[test]
+fn logs_sync_scheduled_uses_the_independent_due_checked_entry_point() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path().join("home");
+    let logs_root = temporary.path().join("scheduled logs");
+    fs::create_dir_all(&home).unwrap();
+    run_json(
+        &home,
+        &logs_root,
+        &["logs", "init", "--logs-root", logs_root.to_str().unwrap()],
+    );
+
+    let scheduled = run_json(
+        &home,
+        &logs_root,
+        &[
+            "logs",
+            "sync",
+            "--scheduled",
+            "--logs-root",
+            logs_root.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(scheduled["outcome"], json!("skipped_not_due"));
+
+    let manual = run_json(
+        &home,
+        &logs_root,
+        &["logs", "sync", "--logs-root", logs_root.to_str().unwrap()],
+    );
+    assert_eq!(manual["outcome"], json!("no_ready"));
 }
 
 #[test]
@@ -281,6 +314,15 @@ fn hook_diagnostics_use_the_collector_and_never_create_runtime_sqlite() {
         thread::sleep(Duration::from_millis(25));
     };
     assert_eq!(report["source"], json!("telemetry"));
+    let decode_failure = report["recent_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["reason"] == json!("payload_decode_failed"))
+        .expect("decode failure details");
+    assert_eq!(decode_failure["decode_error_class"], json!("invalid_json"));
+    assert_eq!(decode_failure["host_schema"], json!("invalid_json"));
+    assert_eq!(decode_failure["decode_field"], Value::Null);
     assert!(!home.join(".shared-context/state/runtime.sqlite").exists());
     let encoded = serde_json::to_string(&report).unwrap();
     assert!(!encoded.contains(temporary.path().to_str().unwrap()));

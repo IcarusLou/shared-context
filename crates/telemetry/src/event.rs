@@ -179,7 +179,10 @@ impl Event {
             task_session_id: bounded_option(source.task_session_id.as_deref(), 64),
             episode_id: bounded_option(source.episode_id.as_deref(), 64),
             checkpoint_id: bounded_option(source.checkpoint_id.as_deref(), 64),
-            operation_id: bounded_option(source.operation_id.as_deref(), 64),
+            // Durable operation identities include the `sha256:` prefix plus 64 hex digits.
+            // Validate the whole token instead of truncating it: a prefix of a content hash is
+            // not the same business identity and must never be reported as though it were.
+            operation_id: validated_identifier_option(source.operation_id.as_deref(), 96),
             result_count: source.result_count,
         };
         // V1 deliberately discards free text. Typed codes and closed operation/reason
@@ -200,6 +203,19 @@ pub(crate) fn now_unix_ms() -> i64 {
 fn bounded_option(value: Option<&str>, max: usize) -> Option<String> {
     let bounded = bounded_token(value?, max);
     (!bounded.is_empty()).then_some(bounded)
+}
+
+fn validated_identifier_option(value: Option<&str>, max: usize) -> Option<String> {
+    let value = value?;
+    if value.is_empty()
+        || value.len() > max
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return None;
+    }
+    Some(value.to_owned())
 }
 
 fn bounded_identifier(value: &str, max: usize) -> String {

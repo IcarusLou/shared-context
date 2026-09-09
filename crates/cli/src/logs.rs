@@ -13,7 +13,7 @@ use crate::args::Options;
 const HELP: &str = r"Usage:
   sctx logs init [--remote <GIT_URL>] [--email <EMAIL>] [--logs-root <PATH>]
   sctx logs collect [--logs-root <PATH>]
-  sctx logs sync [--logs-root <PATH>]
+  sctx logs sync [--scheduled] [--logs-root <PATH>]
   sctx logs status [--logs-root <PATH>]
   sctx logs prune --cache [--logs-root <PATH>]
   sctx logs doctor --probe [--logs-root <PATH>]
@@ -111,12 +111,17 @@ fn run_collect(args: &[String]) -> Result<()> {
 }
 
 fn run_sync(args: &[String], json_output: bool) -> Result<()> {
-    let options = Options::parse(args, &[])?;
-    options.allow_only(&["--logs-root"], &[])?;
+    let options = Options::parse(args, &["--scheduled"])?;
+    options.allow_only(&["--logs-root"], &["--scheduled"])?;
     let root = logs_root(&options)?;
     let config = sctx_log_service::load_config(&root).map_err(service_error)?;
-    let report = sctx_log_sync::sync(&root, &sctx_log_sync::SyncOptions::from_config(&config))
-        .map_err(sync_error)?;
+    let sync_options = sctx_log_sync::SyncOptions::from_config(&config);
+    let report = if options.has("--scheduled") {
+        sctx_log_sync::sync_scheduled(&root, &sync_options)
+    } else {
+        sctx_log_sync::sync(&root, &sync_options)
+    }
+    .map_err(sync_error)?;
     emit_json(&report, json_output)
 }
 
@@ -292,7 +297,14 @@ fn service_error(error: sctx_log_service::Error) -> Error {
 
 fn sync_error(error: sctx_log_sync::SyncError) -> Error {
     let code = error.code();
-    let message = error.to_string();
+    let message = format!(
+        "stage={} code={code:?} retryable={} uploaded_batches={} uploaded_bytes={} detail={}",
+        sync_error_stage_name(error.stage()),
+        error.retryable(),
+        error.uploaded_batches(),
+        error.uploaded_bytes(),
+        error.safe_detail(),
+    );
     drop(error);
     Error::new(
         match code {
@@ -309,6 +321,23 @@ fn sync_error(error: sctx_log_sync::SyncError) -> Error {
         },
         format!("logs sync {code:?}: {message}"),
     )
+}
+
+const fn sync_error_stage_name(stage: sctx_log_sync::SyncErrorStage) -> &'static str {
+    match stage {
+        sctx_log_sync::SyncErrorStage::Validate => "validate",
+        sctx_log_sync::SyncErrorStage::Discover => "discover",
+        sctx_log_sync::SyncErrorStage::Recover => "recover",
+        sctx_log_sync::SyncErrorStage::Prepare => "prepare",
+        sctx_log_sync::SyncErrorStage::Fetch => "fetch",
+        sctx_log_sync::SyncErrorStage::Apply => "apply",
+        sctx_log_sync::SyncErrorStage::Commit => "commit",
+        sctx_log_sync::SyncErrorStage::Push => "push",
+        sctx_log_sync::SyncErrorStage::Verify => "verify",
+        sctx_log_sync::SyncErrorStage::Receipt => "receipt",
+        sctx_log_sync::SyncErrorStage::Cleanup => "cleanup",
+        sctx_log_sync::SyncErrorStage::Storage => "storage",
+    }
 }
 
 fn invalid(message: impl Into<String>) -> Error {

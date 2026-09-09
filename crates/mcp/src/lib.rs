@@ -7210,27 +7210,27 @@ fn mcp_session_digest(arguments: &Value, client: ClientKind) -> Option<String> {
 }
 
 fn populate_result_identifiers(event: &mut sctx_telemetry::Event, data: &Value) {
-    event.task_id = telemetry_id(data, "task_id");
-    event.task_session_id = telemetry_id(data, "task_session_id");
-    event.episode_id = telemetry_id(data, "episode_id");
-    event.checkpoint_id = telemetry_id(data, "checkpoint_id");
-    event.operation_id = telemetry_id(data, "operation_id");
+    event.task_id = telemetry_id(data, "task_id", 64);
+    event.task_session_id = telemetry_id(data, "task_session_id", 64);
+    event.episode_id = telemetry_id(data, "episode_id", 64);
+    event.checkpoint_id = telemetry_id(data, "checkpoint_id", 64);
+    event.operation_id = telemetry_id(data, "operation_id", 96);
     if let Some(context) = data.get("context") {
         event.task_id = event
             .task_id
             .take()
-            .or_else(|| telemetry_id(context, "task_id"));
+            .or_else(|| telemetry_id(context, "task_id", 64));
         event.task_session_id = event
             .task_session_id
             .take()
-            .or_else(|| telemetry_id(context, "task_session_id"));
+            .or_else(|| telemetry_id(context, "task_session_id", 64));
     }
 }
 
-fn telemetry_id(data: &Value, field: &str) -> Option<String> {
+fn telemetry_id(data: &Value, field: &str, max_len: usize) -> Option<String> {
     let value = data.get(field)?.as_str()?;
     if value.is_empty()
-        || value.len() > 64
+        || value.len() > max_len
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))

@@ -9,6 +9,6 @@ pub mod runner;
 mod sync;
 
 pub use sync::{
-    PruneReport, SealStatus, SyncError, SyncErrorCode, SyncOptions, SyncOutcome, SyncReport,
-    prune_cache, sync,
+    PruneReport, SealStatus, SyncError, SyncErrorCode, SyncErrorStage, SyncOptions, SyncOutcome,
+    SyncReport, prune_cache, sync, sync_scheduled,
 };

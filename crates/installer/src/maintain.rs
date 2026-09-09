@@ -560,6 +560,9 @@ fn parse_logs_sync_report(bytes: &[u8]) -> MaintainStep {
         sctx_log_sync::SyncOutcome::SkippedBusy => {
             skipped_logs("another logging synchronization owns the independent log lock")
         }
+        sctx_log_sync::SyncOutcome::SkippedNotDue => {
+            skipped_logs("automatic logging synchronization retry is not due yet")
+        }
     }
 }
 

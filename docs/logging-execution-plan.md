@@ -208,6 +208,7 @@ stream_id = "<generated-stream-id>"
 
 [sync]
 on_maintain = true
+scheduled = true
 timeout_seconds = 60
 max_new_payload_mib = 20
 max_retry_count = 1
@@ -229,7 +230,7 @@ cache_max_age_days = 7
 
 maintain 增加 logs_sync 子进程：前三步释放业务 lease 后，由独立的有界 supervisor 启动日志子进程，随后主维护流程照常执行 knowledge sync，最后收取日志结果。日志子进程及其 Git 有自己的总 deadline，不能让日志的超时控制依赖 knowledge sync 返回；启动失败直接形成日志步骤失败。业务安装完全不可用导致 maintain 提前返回时，由独立 logs sync 支持排障，不承诺 maintain 必然执行。日志步骤失败进入摘要，不跳过/回滚其他步骤，也不修改现有 maintain 对步骤失败仍返回成功的语义。
 
-已有定时任务是每日 06:00，SessionStart 机会补跑默认 24 小时陈旧阈值。第一版复用这一频率，不声称日志自动每分钟上报。希望更及时的团队可把 `sctx logs sync --json` 加入现有外部调度；单实例锁兼容用户手动触发。
+已有业务维护仍是每日 06:00，SessionStart 机会补跑默认 24 小时陈旧阈值。实机验证发现日志失败会因此长时间等待，后续实现增加独立 `logs-sync` LaunchAgent：启动时和每 60 秒执行 `logs sync --scheduled`，在日志锁内按日志自己的 next-retry 状态门控；成功后 5 分钟、可恢复失败按 1/5/15/60 分钟退避。`scheduled` 默认 true 且默认值不强制写入旧配置；禁用日志不影响业务维护任务。手动同步可绕过时间退避，但仍保留数据安全校验和单实例锁。
 
 uninstall 有界停日志服务、移除受管 plist，但保留日志根和未上传数据；日志清理命令不删除业务根。logs disable 关闭采集与自动同步，保留现存批次，显式 logs sync 仍可上传这些历史批次。日志 warning 不把 doctor 的业务状态改成不可用。
 

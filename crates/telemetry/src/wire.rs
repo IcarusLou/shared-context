@@ -74,19 +74,18 @@ impl FrameDecoder {
 
 pub(crate) fn encode_frame(event: &Event) -> Option<Vec<u8>> {
     let mut candidate = Event::bounded_from(event);
-    for optional in 0..8 {
+    for optional in 0..7 {
         if let Some(frame) = encode_candidate(&candidate) {
             return Some(frame);
         }
         match optional {
             0 => candidate.summary = None,
-            1 => candidate.session_digest = None,
+            1 => candidate.reason = None,
             2 => candidate.task_session_id = None,
-            3 => candidate.episode_id = None,
-            4 => candidate.checkpoint_id = None,
-            5 => candidate.operation_id = None,
-            6 => candidate.task_id = None,
-            _ => candidate.reason = None,
+            3 => candidate.session_digest = None,
+            4 => candidate.task_id = None,
+            5 => candidate.episode_id = None,
+            _ => candidate.checkpoint_id = None,
         }
     }
     encode_candidate(&candidate)
@@ -373,6 +372,30 @@ mod tests {
                 .as_ref()
                 .is_some_and(|value| value.len() <= 48)
         );
+    }
+
+    #[test]
+    fn complete_sha256_operation_identity_survives_the_bounded_wire() {
+        let operation_id = format!("sha256:{}", "a".repeat(64));
+        let mut event = Event::finished(
+            EntryPoint::Mcp,
+            EventKind::ToolFinished,
+            "inv-checkpoint",
+            "task_checkpoint",
+            Outcome::Success,
+        );
+        event.operation_id = Some(operation_id.clone());
+        let frame = encode_frame(&event).expect("bounded frame");
+        assert!(frame.len() <= FRAME_MAX_BYTES);
+        let decoded = FrameDecoder::new()
+            .push(&frame)
+            .pop()
+            .expect("one frame")
+            .expect("valid frame");
+        assert_eq!(decoded.operation_id.as_deref(), Some(operation_id.as_str()));
+
+        event.operation_id = Some(format!("sha256:{}", "b".repeat(90)));
+        assert_eq!(event.normalized().operation_id, None);
     }
 
     #[test]

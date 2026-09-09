@@ -539,6 +539,15 @@ fn run_doctor_hooks(options: &Options, json_output: bool) -> Result<()> {
                 "event_kind": hook_diagnostic_operation(event.operation.as_deref()).1,
                 "decision": hook_diagnostic_outcome(event.outcome),
                 "reason": event.reason.as_deref().unwrap_or("unspecified"),
+                "decode_error_class": event.error_code,
+                "decode_field": event
+                    .error_family
+                    .as_deref()
+                    .and_then(|value| value.strip_prefix("field.")),
+                "host_schema": event
+                    .error_family
+                    .as_deref()
+                    .filter(|value| !value.starts_with("field.")),
                 "duration_ms": event.duration_ms.unwrap_or(0),
             }))
             .collect::<Vec<_>>(),
@@ -1353,6 +1362,8 @@ struct HookEventRecorder {
     sequence: Cell<u32>,
     event_kind: RefCell<Option<&'static str>>,
     session_digest: RefCell<Option<String>>,
+    decode_error_class: RefCell<Option<&'static str>>,
+    host_schema: RefCell<Option<&'static str>>,
     /// Reason and detail the single Enabled completion row carries instead of a bare `ok`.
     completion: RefCell<Option<(&'static str, Option<String>)>>,
     started: Instant,
@@ -1367,6 +1378,8 @@ impl HookEventRecorder {
             sequence: Cell::new(0),
             event_kind: RefCell::new(None),
             session_digest: RefCell::new(None),
+            decode_error_class: RefCell::new(None),
+            host_schema: RefCell::new(None),
             completion: RefCell::new(None),
             started: Instant::now(),
         }
@@ -1392,6 +1405,21 @@ impl HookEventRecorder {
     fn bind(&self, event_kind: CanonicalAgentEventKind, session_id: &str) {
         *self.event_kind.borrow_mut() = Some(hook_event_kind_str(event_kind));
         *self.session_digest.borrow_mut() = telemetry_session_digest(&self.agent, session_id);
+    }
+
+    /// Binds only the adapter's closed diagnostic metadata after strict decoding failed.
+    fn bind_decode_diagnostic(&self, diagnostic: &sctx_adapter_codex::HookDecodeDiagnostic) {
+        if let Some(event_kind) = diagnostic.event_kind {
+            *self.event_kind.borrow_mut() = Some(hook_event_kind_str(event_kind));
+        }
+        if let Some(session_id) = diagnostic.session_id.as_deref() {
+            *self.session_digest.borrow_mut() = telemetry_session_digest(&self.agent, session_id);
+        }
+        *self.decode_error_class.borrow_mut() = Some(diagnostic.error_class.as_str());
+        *self.host_schema.borrow_mut() = Some(diagnostic.field.map_or_else(
+            || diagnostic.host_schema.as_str(),
+            sctx_adapter_codex::HookDecodeField::telemetry_family,
+        ));
     }
 
     fn flush(&self, decision: HookEventDecision, reason: &str, _detail: Option<String>) {
@@ -1433,6 +1461,8 @@ impl HookEventRecorder {
         // `reason` comes exclusively from closed Hook branches in this module. Detail is omitted:
         // existing diagnostics can contain paths and error text which do not belong on the wire.
         event.reason = Some(reason.to_owned());
+        event.error_code = self.decode_error_class.borrow().map(str::to_owned);
+        event.error_family = self.host_schema.borrow().map(str::to_owned);
         event
             .session_digest
             .clone_from(&self.session_digest.borrow());
@@ -1474,52 +1504,7 @@ fn truncate_hook_detail(text: &str) -> String {
         .collect()
 }
 
-/// Longest single key name one payload fingerprint quotes.
-const MAX_FINGERPRINT_KEY_CHARS: usize = 32;
-
-/// Describes an undecodable Hook payload by its *shape* alone, so the next one is diagnosable.
-///
-/// Ten of these arrived from one real Codex build with an empty `detail`, which said only that
-/// something failed and never which event. The shape is enough to identify it: the payload's
-/// byte length and its top-level key names, which is what the decoder branches on. No value is
-/// read — not a Prompt, not a tool input, not a path, not an identity — because the payload is
-/// untrusted host text and this row is a diagnostic, not a capture. Key names are held to an
-/// ASCII identifier alphabet and truncated, so a hostile payload cannot write arbitrary text
-/// into the diagnostic column.
-fn undecodable_payload_fingerprint(payload: &[u8]) -> String {
-    let bytes = payload.len();
-    let keys = match serde_json::from_slice::<Value>(payload) {
-        Ok(Value::Object(object)) => object
-            .keys()
-            .map(|key| sanitize_fingerprint_key(key))
-            .collect::<Vec<_>>()
-            .join(","),
-        Ok(_) => "<not-an-object>".to_owned(),
-        Err(_) => "<invalid-json>".to_owned(),
-    };
-    truncate_hook_detail(&format!("bytes={bytes} keys=[{keys}]"))
-}
-
-fn sanitize_fingerprint_key(key: &str) -> String {
-    let sanitized = key
-        .chars()
-        .take(MAX_FINGERPRINT_KEY_CHARS)
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
-                character
-            } else {
-                '?'
-            }
-        })
-        .collect::<String>();
-    if sanitized.is_empty() {
-        "?".to_owned()
-    } else {
-        sanitized
-    }
-}
-
-/// Decodes one vendor payload, or fails open with a shape fingerprint.
+/// Decodes one vendor payload, or fails open with closed adapter diagnostics.
 ///
 /// `Ok(None)` means the payload is undecodable. It comes from the Agent host, not the user, so
 /// an unrecognized shape (a new desktop build, say) is a neutral no-op rather than exit 2, which
@@ -1534,17 +1519,19 @@ fn decode_hook_payload(
         sctx_adapter_cursor::decode_hook_input(input)
             .map(|(event, payload_version)| (event, Some(payload_version)))
     } else {
-        sctx_adapter_codex::decode_hook_input(input).map(|event| (event, installed_agent_version))
+        match sctx_adapter_codex::decode_hook_input_with_diagnostic(input) {
+            Ok(event) => Ok((event, installed_agent_version)),
+            Err(failure) => {
+                recorder.bind_decode_diagnostic(failure.diagnostic());
+                Err(failure.into_error())
+            }
+        }
     };
     match decoded {
         Ok(decoded) => Ok(Some(decoded)),
         Err(error) if error.kind() == ErrorKind::InvalidInput => {
             eprintln!("sctx hook: ignoring undecodable {agent} payload: {error}");
-            recorder.flush(
-                HookEventDecision::FailOpen,
-                "payload_decode_failed",
-                Some(undecodable_payload_fingerprint(input)),
-            );
+            recorder.flush(HookEventDecision::FailOpen, "payload_decode_failed", None);
             Ok(None)
         }
         Err(error) => Err(error),

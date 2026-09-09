@@ -312,13 +312,22 @@ fn directory_size(root: &std::path::Path, deadline: Instant) -> io::Result<Optio
         if Instant::now() >= deadline {
             return Ok(None);
         }
-        for entry in fs::read_dir(directory)? {
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
             if Instant::now() >= deadline || entries_seen >= MAX_GUARD_ENTRIES {
                 return Ok(None);
             }
             let entry = entry?;
             entries_seen += 1;
-            let metadata = entry.path().symlink_metadata()?;
+            let metadata = match entry.path().symlink_metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
             if metadata.file_type().is_symlink() {
                 continue;
             }

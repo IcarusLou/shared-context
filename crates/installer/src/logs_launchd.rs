@@ -1,4 +1,4 @@
-//! Independent lifecycle for the telemetry collector `LaunchAgent`.
+//! Independent lifecycle for the telemetry collector and log synchronization `LaunchAgent`s.
 //!
 //! This deliberately lives outside the main install manifest and transaction. Callers invoke it
 //! only after setup/upgrade has returned (and therefore after the business lease and setup lock
@@ -19,6 +19,8 @@ use sha2::{Digest as _, Sha256};
 use crate::SKIP_LAUNCHCTL_ENV;
 
 pub const LOGS_LAUNCH_AGENT_LABEL: &str = "com.shared-context.logs";
+pub const LOGS_SYNC_LAUNCH_AGENT_LABEL: &str = "com.shared-context.logs-sync";
+const LOGS_SYNC_INTERVAL_SECONDS: u32 = 60;
 const LAUNCHCTL_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PLIST_BYTES: u64 = 64 * 1024;
 const MAX_OWNERSHIP_BYTES: u64 = 64 * 1024;
@@ -29,6 +31,7 @@ pub struct LogServiceLifecycleReport {
     pub configured: bool,
     pub changed: bool,
     pub plist: Option<PathBuf>,
+    pub sync_plist: Option<PathBuf>,
     pub notices: Vec<String>,
 }
 
@@ -63,16 +66,23 @@ enum LifecycleLock {
     Invalid(String),
 }
 
-/// Installs or refreshes the independent collector service when logging was explicitly initialized.
+/// Installs or refreshes the independent collector and synchronization services.
 ///
-/// The function is intentionally infallible. A malformed logging configuration still counts as
-/// configured here: `sctx logs doctor` owns its diagnosis, while setup remains successful.
+/// Collector and scheduler failures remain independent notices so logging can never fail setup.
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn reconcile_log_service(
     home: &Path,
     logs_root: &Path,
     executable: &Path,
+) -> LogServiceLifecycleReport {
+    reconcile_log_service_inner(home, logs_root, executable, || {})
+}
+
+fn reconcile_log_service_inner(
+    home: &Path,
+    logs_root: &Path,
+    executable: &Path,
+    between_services: impl FnOnce(),
 ) -> LogServiceLifecycleReport {
     let mut report = LogServiceLifecycleReport::default();
     let config = match sctx_log_service::load_config(logs_root) {
@@ -93,21 +103,64 @@ pub fn reconcile_log_service(
         LifecycleLock::Acquired(file) => file,
         LifecycleLock::Busy => {
             report.notices.push(
-                "logging service lifecycle is already active for this user; preserved the current service state"
+                "logging service lifecycle is already active for this user; preserved both logging services"
                     .to_owned(),
             );
             return report;
         }
         LifecycleLock::Invalid(error) => {
             report.notices.push(format!(
-                "logging service lifecycle lock is unavailable; preserved the current service state ({error})"
+                "logging service lifecycle lock is unavailable; preserved both logging services ({error})"
             ));
             return report;
         }
     };
-    if !recover_service_transaction(home, logs_root, &mut report.notices) {
+    let mut recovery_changed = false;
+    let collector_recovered =
+        recover_service_transaction(home, logs_root, &mut report.notices, &mut recovery_changed);
+    let sync_recovered = recover_sync_service_transaction(
+        home,
+        logs_root,
+        &mut report.notices,
+        &mut recovery_changed,
+    );
+    report.changed |= recovery_changed;
+    if !collector_recovered || !sync_recovered {
+        report.notices.push(
+            "stopped the paired logging lifecycle because recovery did not complete; any completed recovery is reported as a change"
+                .to_owned(),
+        );
         return report;
     }
+
+    let recovery_changed = report.changed;
+    report = reconcile_collector_service_locked(home, logs_root, executable, &config);
+    report.changed |= recovery_changed;
+    between_services();
+    let sync = reconcile_log_sync_service_locked(home, logs_root, executable, &config);
+    report.configured |= sync.configured;
+    report.changed |= sync.changed;
+    report.sync_plist = sync.sync_plist;
+    report.notices.extend(sync.notices);
+    report
+}
+
+/// Installs or refreshes the independent collector service when logging was explicitly initialized.
+///
+/// The function is intentionally infallible. A malformed logging configuration still counts as
+/// configured here: `sctx logs doctor` owns its diagnosis, while setup remains successful.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+fn reconcile_collector_service_locked(
+    home: &Path,
+    logs_root: &Path,
+    executable: &Path,
+    config: &sctx_log_service::Config,
+) -> LogServiceLifecycleReport {
+    let mut report = LogServiceLifecycleReport {
+        configured: true,
+        ..LogServiceLifecycleReport::default()
+    };
     if !config.enabled {
         return uninstall_log_service_locked(home, logs_root, report);
     }
@@ -254,33 +307,76 @@ pub fn reconcile_log_service(
     report
 }
 
-/// Stops and removes the exactly-owned collector `LaunchAgent` while retaining all logging data.
+/// Stops and removes the exactly-owned collector and synchronization `LaunchAgent`s while retaining
+/// all logging data.
 #[must_use]
 pub fn uninstall_log_service(home: &Path, logs_root: &Path) -> LogServiceLifecycleReport {
     let mut report = LogServiceLifecycleReport {
         configured: logs_root.join("config.toml").symlink_metadata().is_ok(),
         ..LogServiceLifecycleReport::default()
     };
+    if !report.configured && !has_log_service_lifecycle_state(logs_root) {
+        return report;
+    }
     let _lock = match acquire_lifecycle_lock(home) {
         LifecycleLock::Acquired(file) => file,
         LifecycleLock::Busy => {
             report.notices.push(
-                "logging service lifecycle is already active for this user; preserved the current service state"
+                "logging service lifecycle is already active for this user; preserved both logging services"
                     .to_owned(),
             );
             return report;
         }
         LifecycleLock::Invalid(error) => {
             report.notices.push(format!(
-                "logging service lifecycle lock is unavailable; preserved the current service state ({error})"
+                "logging service lifecycle lock is unavailable; preserved both logging services ({error})"
             ));
             return report;
         }
     };
-    if !recover_service_transaction(home, logs_root, &mut report.notices) {
+    let mut recovery_changed = false;
+    let collector_recovered =
+        recover_service_transaction(home, logs_root, &mut report.notices, &mut recovery_changed);
+    let sync_recovered = recover_sync_service_transaction(
+        home,
+        logs_root,
+        &mut report.notices,
+        &mut recovery_changed,
+    );
+    report.changed |= recovery_changed;
+    if !collector_recovered || !sync_recovered {
+        report.notices.push(
+            "stopped the paired logging lifecycle because recovery did not complete; any completed recovery is reported as a change"
+                .to_owned(),
+        );
         return report;
     }
-    uninstall_log_service_locked(home, logs_root, report)
+
+    report = uninstall_log_service_locked(home, logs_root, report);
+    let sync = uninstall_log_sync_service_locked(
+        home,
+        logs_root,
+        LogServiceLifecycleReport {
+            configured: report.configured,
+            ..LogServiceLifecycleReport::default()
+        },
+    );
+    report.configured |= sync.configured;
+    report.changed |= sync.changed;
+    report.sync_plist = sync.sync_plist;
+    report.notices.extend(sync.notices);
+    report
+}
+
+fn has_log_service_lifecycle_state(logs_root: &Path) -> bool {
+    [
+        ownership_path(logs_root),
+        transaction_path(logs_root),
+        sync_ownership_path(logs_root),
+        sync_transaction_path(logs_root),
+    ]
+    .iter()
+    .any(|path| path.symlink_metadata().is_ok())
 }
 
 fn uninstall_log_service_locked(
@@ -375,6 +471,245 @@ fn uninstall_log_service_locked(
     report
 }
 
+#[allow(clippy::too_many_lines)]
+fn reconcile_log_sync_service_locked(
+    home: &Path,
+    logs_root: &Path,
+    executable: &Path,
+    config: &sctx_log_service::Config,
+) -> LogServiceLifecycleReport {
+    let mut report = LogServiceLifecycleReport {
+        configured: true,
+        ..LogServiceLifecycleReport::default()
+    };
+    if !config.enabled || !config.sync.scheduled || !config.is_assigned() {
+        return uninstall_log_sync_service_locked(home, logs_root, report);
+    }
+    if std::env::consts::OS != "macos" {
+        report.notices.push(
+            "automatic logging synchronization is only available through a LaunchAgent on macOS; run `sctx logs sync` from your own scheduler"
+                .to_owned(),
+        );
+        return report;
+    }
+    // A single user's two logging jobs must always name the same logs root. The collector's
+    // ownership is the root-selection authority, so concurrent roots cannot split the pair.
+    let collector_ownership = match read_ownership(&ownership_path(logs_root), home) {
+        ManagedRead::Valid(owned) => owned,
+        ManagedRead::Missing | ManagedRead::Invalid(_) => {
+            report.notices.push(
+                "preserved the logging synchronization service because this logs root does not safely own the collector LaunchAgent"
+                    .to_owned(),
+            );
+            return report;
+        }
+    };
+    match read_managed_bytes(&collector_ownership.plist, MAX_PLIST_BYTES) {
+        ManagedRead::Valid(bytes) if sha256(&bytes) == collector_ownership.sha256 => {}
+        ManagedRead::Valid(_) | ManagedRead::Missing | ManagedRead::Invalid(_) => {
+            report.notices.push(
+                "preserved the logging synchronization service because the collector LaunchAgent no longer matches this logs root's ownership"
+                    .to_owned(),
+            );
+            return report;
+        }
+    }
+
+    let plist = sync_launch_agent_path(home);
+    report.sync_plist = Some(plist.clone());
+    let desired = match render_logs_sync_plist(executable, logs_root) {
+        Ok(value) => value,
+        Err(reason) => {
+            report.notices.push(reason);
+            return report;
+        }
+    };
+    let desired_hash = sha256(desired.as_bytes());
+    let ownership_file = sync_ownership_path(logs_root);
+    let mut prior = match read_sync_ownership(&ownership_file, home) {
+        ManagedRead::Valid(owned) => Some(owned),
+        ManagedRead::Missing => None,
+        ManagedRead::Invalid(error) => {
+            report.notices.push(format!(
+                "preserved logging synchronization service files because ownership is invalid at {}: {error}",
+                ownership_file.display()
+            ));
+            return report;
+        }
+    };
+    let ownership = ServiceOwnership {
+        schema_version: 1,
+        label: LOGS_SYNC_LAUNCH_AGENT_LABEL.to_owned(),
+        plist: plist.clone(),
+        sha256: desired_hash.clone(),
+    };
+
+    match fs::symlink_metadata(&plist) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            let current = match read_managed_bytes(&plist, MAX_PLIST_BYTES) {
+                ManagedRead::Valid(bytes) => bytes,
+                ManagedRead::Missing => {
+                    report.notices.push(format!(
+                        "logging synchronization LaunchAgent disappeared during lifecycle inspection: {}",
+                        plist.display()
+                    ));
+                    return report;
+                }
+                ManagedRead::Invalid(error) => {
+                    report.notices.push(format!(
+                        "could not read the logging synchronization LaunchAgent at {}: {error}",
+                        plist.display()
+                    ));
+                    return report;
+                }
+            };
+            let current_hash = sha256(&current);
+            if prior.as_ref().is_none_or(|owned| {
+                owned.label != LOGS_SYNC_LAUNCH_AGENT_LABEL
+                    || owned.plist != plist
+                    || owned.sha256 != current_hash
+            }) {
+                report.notices.push(format!(
+                    "preserved an unowned or user-modified logging synchronization LaunchAgent at {}",
+                    plist.display()
+                ));
+                return report;
+            }
+            if current_hash != desired_hash {
+                if let Err(error) = commit_sync_service_transaction(
+                    logs_root,
+                    &plist,
+                    desired.as_bytes(),
+                    &ownership,
+                    Some(current),
+                    prior.clone(),
+                ) {
+                    report.notices.push(format!(
+                        "could not update the logging synchronization LaunchAgent transaction at {}: {error}",
+                        plist.display()
+                    ));
+                    return report;
+                }
+                report.changed = true;
+            }
+        }
+        Ok(_) => {
+            report.notices.push(format!(
+                "preserved the logging synchronization LaunchAgent path because it is not a regular file: {}",
+                plist.display()
+            ));
+            return report;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if prior.is_some() {
+                if let Err(error) = remove_file_and_sync_parent(&ownership_file) {
+                    report.notices.push(format!(
+                        "could not retire stale logging synchronization service ownership before reinstall: {error}"
+                    ));
+                    return report;
+                }
+                prior = None;
+            }
+            if let Err(error) = commit_sync_service_transaction(
+                logs_root,
+                &plist,
+                desired.as_bytes(),
+                &ownership,
+                None,
+                prior,
+            ) {
+                report.notices.push(format!(
+                    "could not install the logging synchronization LaunchAgent transaction at {}: {error}",
+                    plist.display()
+                ));
+                return report;
+            }
+            report.changed = true;
+        }
+        Err(error) => {
+            report.notices.push(format!(
+                "could not inspect the logging synchronization LaunchAgent at {}: {error}",
+                plist.display()
+            ));
+            return report;
+        }
+    }
+
+    if launchctl_enabled()
+        && let Err(error) = replace_launch_agent_label(home, &plist, LOGS_SYNC_LAUNCH_AGENT_LABEL)
+    {
+        report.notices.push(format!(
+            "the logging synchronization LaunchAgent was written, but launchd could not activate it within the bounded service timeout ({error}); it can be retried with `sctx logs enable`"
+        ));
+    }
+    report
+}
+
+fn uninstall_log_sync_service_locked(
+    home: &Path,
+    logs_root: &Path,
+    mut report: LogServiceLifecycleReport,
+) -> LogServiceLifecycleReport {
+    let ownership_file = sync_ownership_path(logs_root);
+    let owned = match read_sync_ownership(&ownership_file, home) {
+        ManagedRead::Valid(owned) => owned,
+        ManagedRead::Missing => return report,
+        ManagedRead::Invalid(error) => {
+            report.notices.push(format!(
+                "preserved logging synchronization service files because ownership is invalid at {}: {error}",
+                ownership_file.display()
+            ));
+            return report;
+        }
+    };
+    report.sync_plist = Some(owned.plist.clone());
+    match read_managed_bytes(&owned.plist, MAX_PLIST_BYTES) {
+        ManagedRead::Valid(bytes) if sha256(&bytes) == owned.sha256 => {}
+        ManagedRead::Valid(_) => {
+            report.notices.push(format!(
+                "preserved user-modified logging synchronization LaunchAgent: {}",
+                owned.plist.display()
+            ));
+            return report;
+        }
+        ManagedRead::Missing => {}
+        ManagedRead::Invalid(error) => {
+            report.notices.push(format!(
+                "could not inspect the owned logging synchronization LaunchAgent at {}: {error}",
+                owned.plist.display()
+            ));
+            return report;
+        }
+    }
+    if launchctl_enabled()
+        && let Err(error) = unload_launch_agent_label(home, LOGS_SYNC_LAUNCH_AGENT_LABEL)
+    {
+        report.notices.push(format!(
+            "could not stop automatic logging synchronization within the bounded service timeout ({error}); it will stop at the next login"
+        ));
+    }
+    match fs::remove_file(&owned.plist) {
+        Ok(()) => report.changed = true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            report.notices.push(format!(
+                "could not remove the owned logging synchronization LaunchAgent at {}: {error}",
+                owned.plist.display()
+            ));
+            return report;
+        }
+    }
+    if let Err(error) = fs::remove_file(&ownership_file)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        report.notices.push(format!(
+            "could not remove logging synchronization service ownership at {}: {error}",
+            ownership_file.display()
+        ));
+    }
+    report
+}
+
 #[must_use]
 pub fn launch_agent_path(home: &Path) -> PathBuf {
     home.join("Library/LaunchAgents")
@@ -384,6 +719,17 @@ pub fn launch_agent_path(home: &Path) -> PathBuf {
 #[must_use]
 pub fn ownership_path(logs_root: &Path) -> PathBuf {
     logs_root.join("state/service-ownership.json")
+}
+
+#[must_use]
+pub fn sync_launch_agent_path(home: &Path) -> PathBuf {
+    home.join("Library/LaunchAgents")
+        .join(format!("{LOGS_SYNC_LAUNCH_AGENT_LABEL}.plist"))
+}
+
+#[must_use]
+pub fn sync_ownership_path(logs_root: &Path) -> PathBuf {
+    logs_root.join("state/sync-service-ownership.json")
 }
 
 fn render_logs_plist(executable: &Path, logs_root: &Path) -> Result<String, String> {
@@ -416,9 +762,43 @@ fn render_logs_plist(executable: &Path, logs_root: &Path) -> Result<String, Stri
     ))
 }
 
+fn render_logs_sync_plist(executable: &Path, logs_root: &Path) -> Result<String, String> {
+    let executable = executable
+        .to_str()
+        .ok_or_else(|| "logging synchronization executable path is not UTF-8".to_owned())?;
+    let logs_root = logs_root
+        .to_str()
+        .ok_or_else(|| "logging root path is not UTF-8".to_owned())?;
+    Ok(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key><string>{}</string>
+	<key>ProgramArguments</key>
+	<array><string>{}</string><string>logs</string><string>sync</string><string>--scheduled</string><string>--logs-root</string><string>{}</string></array>
+	<key>RunAtLoad</key><true/>
+	<key>StartInterval</key><integer>{}</integer>
+	<key>ProcessType</key><string>Background</string>
+	<key>StandardOutPath</key><string>/dev/null</string>
+	<key>StandardErrorPath</key><string>/dev/null</string>
+</dict>
+</plist>
+"#,
+        LOGS_SYNC_LAUNCH_AGENT_LABEL,
+        escape_xml(executable),
+        escape_xml(logs_root),
+        LOGS_SYNC_INTERVAL_SECONDS
+    ))
+}
+
 fn replace_launch_agent(home: &Path, plist: &Path) -> Result<(), String> {
+    replace_launch_agent_label(home, plist, LOGS_LAUNCH_AGENT_LABEL)
+}
+
+fn replace_launch_agent_label(home: &Path, plist: &Path, label: &str) -> Result<(), String> {
     let domain = launchctl_domain(home)?;
-    let _ = run_launchctl(&["bootout", &format!("{domain}/{LOGS_LAUNCH_AGENT_LABEL}")]);
+    let _ = run_launchctl(&["bootout", &format!("{domain}/{label}")]);
     run_launchctl(&[
         "bootstrap",
         &domain,
@@ -429,8 +809,12 @@ fn replace_launch_agent(home: &Path, plist: &Path) -> Result<(), String> {
 }
 
 fn unload_launch_agent(home: &Path) -> Result<(), String> {
+    unload_launch_agent_label(home, LOGS_LAUNCH_AGENT_LABEL)
+}
+
+fn unload_launch_agent_label(home: &Path, label: &str) -> Result<(), String> {
     let domain = launchctl_domain(home)?;
-    match run_launchctl(&["bootout", &format!("{domain}/{LOGS_LAUNCH_AGENT_LABEL}")]) {
+    match run_launchctl(&["bootout", &format!("{domain}/{label}")]) {
         Ok(()) => Ok(()),
         Err(error) if error.starts_with("exit 3") => Ok(()),
         Err(error) => Err(error),
@@ -518,6 +902,10 @@ fn transaction_path(logs_root: &Path) -> PathBuf {
     logs_root.join("state/service-transaction.json")
 }
 
+fn sync_transaction_path(logs_root: &Path) -> PathBuf {
+    logs_root.join("state/sync-service-transaction.json")
+}
+
 fn commit_service_transaction(
     logs_root: &Path,
     plist: &Path,
@@ -558,6 +946,7 @@ fn commit_service_transaction(
                 .unwrap_or(logs_root),
             logs_root,
             &mut notices,
+            &mut false,
         );
         return Err(error);
     }
@@ -565,7 +954,71 @@ fn commit_service_transaction(
     sync_directory(&state)
 }
 
-fn recover_service_transaction(home: &Path, logs_root: &Path, notices: &mut Vec<String>) -> bool {
+fn commit_sync_service_transaction(
+    logs_root: &Path,
+    plist: &Path,
+    desired: &[u8],
+    ownership: &ServiceOwnership,
+    previous_plist: Option<Vec<u8>>,
+    previous_ownership: Option<ServiceOwnership>,
+) -> std::io::Result<()> {
+    let state = logs_root.join("state");
+    ensure_directory(&state, 0o700)?;
+    ensure_directory(plist.parent().unwrap_or(logs_root), 0o755)?;
+    let journal = ServiceTransaction {
+        schema_version: 1,
+        plist: plist.to_path_buf(),
+        desired_sha256: ownership.sha256.clone(),
+        previous_plist,
+        previous_ownership,
+    };
+    validate_sync_ownership(ownership, plist).map_err(std::io::Error::other)?;
+    validate_sync_transaction(&journal, plist).map_err(std::io::Error::other)?;
+    if u64::try_from(desired.len()).unwrap_or(u64::MAX) > MAX_PLIST_BYTES
+        || ownership.sha256 != sha256(desired)
+    {
+        return Err(std::io::Error::other(
+            "desired logging synchronization LaunchAgent does not match its bounded ownership",
+        ));
+    }
+    atomic_write(
+        &sync_transaction_path(logs_root),
+        &json_bytes(&journal)?,
+        0o600,
+    )?;
+    let result = atomic_write(plist, desired, 0o644).and_then(|()| {
+        atomic_write(
+            &sync_ownership_path(logs_root),
+            &json_bytes(ownership)?,
+            0o600,
+        )
+    });
+    if let Err(error) = result {
+        let mut notices = Vec::new();
+        let _ = recover_sync_service_transaction(
+            plist
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .unwrap_or(logs_root),
+            logs_root,
+            &mut notices,
+            &mut false,
+        );
+        return Err(error);
+    }
+    fs::remove_file(sync_transaction_path(logs_root))?;
+    sync_directory(&state)
+}
+
+// Keep validation, rollback, and mutation reporting together as one recovery state machine.
+#[allow(clippy::too_many_lines)]
+fn recover_service_transaction(
+    home: &Path,
+    logs_root: &Path,
+    notices: &mut Vec<String>,
+    changed: &mut bool,
+) -> bool {
     let path = transaction_path(logs_root);
     let transaction = match read_transaction(&path, home) {
         ManagedRead::Missing => return true,
@@ -613,18 +1066,43 @@ fn recover_service_transaction(home: &Path, logs_root: &Path, notices: &mut Vec<
             || current_hash.is_none())
     {
         let plist_result = match transaction.previous_plist {
-            Some(previous) => atomic_write(&transaction.plist, &previous, 0o644),
+            Some(previous) => {
+                let result = atomic_write(&transaction.plist, &previous, 0o644);
+                // An atomic write can fail while syncing the parent after rename, so once it was
+                // attempted the target may have changed even when the result is an error.
+                *changed = true;
+                result
+            }
             None => match fs::remove_file(&transaction.plist) {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    *changed = true;
+                    Ok(())
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(error) => Err(error),
             },
         };
         let ownership_result = match transaction.previous_ownership {
-            Some(previous) => json_bytes(&previous)
-                .and_then(|bytes| atomic_write(&ownership_path(logs_root), &bytes, 0o600)),
+            Some(previous) => {
+                let bytes = match json_bytes(&previous) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        notices.push(format!(
+                            "could not serialize prior logging service ownership during recovery: {error}"
+                        ));
+                        return false;
+                    }
+                };
+                let result = atomic_write(&ownership_path(logs_root), &bytes, 0o600);
+                // See the paired plist write above: rename can precede a reported sync failure.
+                *changed = true;
+                result
+            }
             None => match fs::remove_file(ownership_path(logs_root)) {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    *changed = true;
+                    Ok(())
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(error) => Err(error),
             },
@@ -649,6 +1127,127 @@ fn recover_service_transaction(home: &Path, logs_root: &Path, notices: &mut Vec<
         ));
         return false;
     }
+    *changed = true;
+    true
+}
+
+// Keep validation, rollback, and mutation reporting together as one recovery state machine.
+#[allow(clippy::too_many_lines)]
+fn recover_sync_service_transaction(
+    home: &Path,
+    logs_root: &Path,
+    notices: &mut Vec<String>,
+    changed: &mut bool,
+) -> bool {
+    let path = sync_transaction_path(logs_root);
+    let transaction = match read_sync_transaction(&path, home) {
+        ManagedRead::Missing => return true,
+        ManagedRead::Valid(transaction) => transaction,
+        ManagedRead::Invalid(error) => {
+            notices.push(format!(
+                "preserved logging synchronization service recovery journal because it is invalid at {}: {error}",
+                path.display()
+            ));
+            return false;
+        }
+    };
+    let current_hash = match read_managed_bytes(&transaction.plist, MAX_PLIST_BYTES) {
+        ManagedRead::Missing => None,
+        ManagedRead::Valid(bytes) => Some(sha256(&bytes)),
+        ManagedRead::Invalid(error) => {
+            notices.push(format!(
+                "preserved logging synchronization service recovery state because the LaunchAgent cannot be safely read: {error}"
+            ));
+            return false;
+        }
+    };
+    let installed_ownership = match read_sync_ownership(&sync_ownership_path(logs_root), home) {
+        ManagedRead::Missing => None,
+        ManagedRead::Valid(ownership) => Some(ownership),
+        ManagedRead::Invalid(error) => {
+            notices.push(format!(
+                "preserved logging synchronization service recovery state because installed ownership is invalid: {error}"
+            ));
+            return false;
+        }
+    };
+    let committed = current_hash.as_deref() == Some(transaction.desired_sha256.as_str())
+        && installed_ownership
+            .as_ref()
+            .is_some_and(|owned| owned.sha256 == transaction.desired_sha256);
+    let previous_hash = transaction
+        .previous_plist
+        .as_ref()
+        .map(|bytes| sha256(bytes));
+    let still_previous = current_hash == previous_hash && current_hash.is_some();
+    if !committed
+        && (current_hash.as_deref() == Some(transaction.desired_sha256.as_str())
+            || still_previous
+            || current_hash.is_none())
+    {
+        let plist_result = match transaction.previous_plist {
+            Some(previous) => {
+                let result = atomic_write(&transaction.plist, &previous, 0o644);
+                // An atomic write can fail while syncing the parent after rename, so once it was
+                // attempted the target may have changed even when the result is an error.
+                *changed = true;
+                result
+            }
+            None => match fs::remove_file(&transaction.plist) {
+                Ok(()) => {
+                    *changed = true;
+                    Ok(())
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            },
+        };
+        let ownership_result = match transaction.previous_ownership {
+            Some(previous) => {
+                let bytes = match json_bytes(&previous) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        notices.push(format!(
+                            "could not serialize prior logging synchronization ownership during recovery: {error}"
+                        ));
+                        return false;
+                    }
+                };
+                let result = atomic_write(&sync_ownership_path(logs_root), &bytes, 0o600);
+                // See the paired plist write above: rename can precede a reported sync failure.
+                *changed = true;
+                result
+            }
+            None => match fs::remove_file(sync_ownership_path(logs_root)) {
+                Ok(()) => {
+                    *changed = true;
+                    Ok(())
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            },
+        };
+        if let Err(error) = plist_result.and(ownership_result) {
+            notices.push(format!(
+                "could not roll back interrupted logging synchronization service transaction: {error}"
+            ));
+            return false;
+        }
+    } else if !committed && current_hash.is_some() {
+        notices.push(
+            "preserved logging synchronization service recovery journal because the plist changed after the interrupted transaction"
+                .to_owned(),
+        );
+        return false;
+    }
+    if let Err(error) = fs::remove_file(&path) {
+        notices.push(format!(
+            "could not clear recovered logging synchronization service transaction at {}: {error}",
+            path.display()
+        ));
+        return false;
+    }
+    *changed = true;
     true
 }
 
@@ -674,6 +1273,22 @@ fn read_ownership(path: &Path, home: &Path) -> ManagedRead<ServiceOwnership> {
     }
 }
 
+fn read_sync_ownership(path: &Path, home: &Path) -> ManagedRead<ServiceOwnership> {
+    let bytes = match read_managed_bytes(path, MAX_OWNERSHIP_BYTES) {
+        ManagedRead::Missing => return ManagedRead::Missing,
+        ManagedRead::Valid(bytes) => bytes,
+        ManagedRead::Invalid(error) => return ManagedRead::Invalid(error),
+    };
+    let ownership = match serde_json::from_slice::<ServiceOwnership>(&bytes) {
+        Ok(ownership) => ownership,
+        Err(error) => return ManagedRead::Invalid(format!("invalid ownership JSON: {error}")),
+    };
+    match validate_sync_ownership(&ownership, &sync_launch_agent_path(home)) {
+        Ok(()) => ManagedRead::Valid(ownership),
+        Err(error) => ManagedRead::Invalid(error),
+    }
+}
+
 fn read_transaction(path: &Path, home: &Path) -> ManagedRead<ServiceTransaction> {
     let bytes = match read_managed_bytes(path, MAX_TRANSACTION_BYTES) {
         ManagedRead::Missing => return ManagedRead::Missing,
@@ -685,6 +1300,22 @@ fn read_transaction(path: &Path, home: &Path) -> ManagedRead<ServiceTransaction>
         Err(error) => return ManagedRead::Invalid(format!("invalid transaction JSON: {error}")),
     };
     match validate_transaction(&transaction, &launch_agent_path(home)) {
+        Ok(()) => ManagedRead::Valid(transaction),
+        Err(error) => ManagedRead::Invalid(error),
+    }
+}
+
+fn read_sync_transaction(path: &Path, home: &Path) -> ManagedRead<ServiceTransaction> {
+    let bytes = match read_managed_bytes(path, MAX_TRANSACTION_BYTES) {
+        ManagedRead::Missing => return ManagedRead::Missing,
+        ManagedRead::Valid(bytes) => bytes,
+        ManagedRead::Invalid(error) => return ManagedRead::Invalid(error),
+    };
+    let transaction = match serde_json::from_slice::<ServiceTransaction>(&bytes) {
+        Ok(transaction) => transaction,
+        Err(error) => return ManagedRead::Invalid(format!("invalid transaction JSON: {error}")),
+    };
+    match validate_sync_transaction(&transaction, &sync_launch_agent_path(home)) {
         Ok(()) => ManagedRead::Valid(transaction),
         Err(error) => ManagedRead::Invalid(error),
     }
@@ -717,6 +1348,22 @@ fn validate_ownership(ownership: &ServiceOwnership, expected_plist: &Path) -> Re
     Ok(())
 }
 
+fn validate_sync_ownership(
+    ownership: &ServiceOwnership,
+    expected_plist: &Path,
+) -> Result<(), String> {
+    if ownership.schema_version != 1 {
+        return Err("unsupported ownership schema_version".to_owned());
+    }
+    if ownership.label != LOGS_SYNC_LAUNCH_AGENT_LABEL || ownership.plist != expected_plist {
+        return Err("ownership names an unexpected label or plist target".to_owned());
+    }
+    if !is_sha256(&ownership.sha256) {
+        return Err("ownership SHA-256 is invalid".to_owned());
+    }
+    Ok(())
+}
+
 fn validate_transaction(
     transaction: &ServiceTransaction,
     expected_plist: &Path,
@@ -738,6 +1385,34 @@ fn validate_transaction(
             return Err("transaction previous plist exceeds its bounded size".to_owned());
         }
         validate_ownership(previous_ownership, expected_plist)?;
+        if previous_ownership.sha256 != sha256(previous_plist) {
+            return Err("transaction previous ownership hash does not match its plist".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn validate_sync_transaction(
+    transaction: &ServiceTransaction,
+    expected_plist: &Path,
+) -> Result<(), String> {
+    if transaction.schema_version != 1 {
+        return Err("unsupported transaction schema_version".to_owned());
+    }
+    if transaction.plist != expected_plist || !is_sha256(&transaction.desired_sha256) {
+        return Err("transaction names an unexpected target or invalid desired SHA-256".to_owned());
+    }
+    if transaction.previous_plist.is_some() != transaction.previous_ownership.is_some() {
+        return Err("transaction previous plist and ownership must be present together".to_owned());
+    }
+    if let (Some(previous_plist), Some(previous_ownership)) = (
+        transaction.previous_plist.as_ref(),
+        transaction.previous_ownership.as_ref(),
+    ) {
+        if u64::try_from(previous_plist.len()).unwrap_or(u64::MAX) > MAX_PLIST_BYTES {
+            return Err("transaction previous plist exceeds its bounded size".to_owned());
+        }
+        validate_sync_ownership(previous_ownership, expected_plist)?;
         if previous_ownership.sha256 != sha256(previous_plist) {
             return Err("transaction previous ownership hash does not match its plist".to_owned());
         }
@@ -868,6 +1543,19 @@ mod tests {
         (home, logs_root, executable)
     }
 
+    fn assign_upload_target(logs_root: &Path) {
+        sctx_log_service::init(
+            logs_root,
+            sctx_log_service::InitOptions {
+                email: Some("owner@example.com".to_owned()),
+                remote: Some(logs_root.join("remote.git").display().to_string()),
+                installation_id: None,
+                enabled: true,
+            },
+        )
+        .unwrap();
+    }
+
     fn write_ownership(logs_root: &Path, ownership: &ServiceOwnership) {
         atomic_write(
             &ownership_path(logs_root),
@@ -916,7 +1604,12 @@ mod tests {
         fs::write(&plist, desired).unwrap();
 
         let mut notices = Vec::new();
-        assert!(recover_service_transaction(&home, &logs_root, &mut notices));
+        assert!(recover_service_transaction(
+            &home,
+            &logs_root,
+            &mut notices,
+            &mut false
+        ));
         assert!(notices.is_empty(), "{notices:?}");
         assert_eq!(fs::read(&plist).unwrap(), old);
         assert_eq!(
@@ -1150,7 +1843,12 @@ mod tests {
         )
         .unwrap();
         let mut notices = Vec::new();
-        assert!(recover_service_transaction(&home, &logs_root, &mut notices));
+        assert!(recover_service_transaction(
+            &home,
+            &logs_root,
+            &mut notices,
+            &mut false
+        ));
         assert!(!plist.exists());
         assert!(!transaction_path(&logs_root).exists());
     }
@@ -1160,6 +1858,8 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let (home, first_root, executable) = initialized_fixture(&temporary, "logs one");
         let (_, second_root, _) = initialized_fixture(&temporary, "logs two");
+        assign_upload_target(&first_root);
+        assign_upload_target(&second_root);
         let barrier = Arc::new(Barrier::new(3));
         let handles = [first_root.clone(), second_root.clone()].map(|logs_root| {
             let home = home.clone();
@@ -1183,6 +1883,17 @@ mod tests {
         );
         assert_ne!(first_owned, second_owned);
         assert!(launch_agent_path(&home).is_file());
+        let first_sync_owned = matches!(
+            read_sync_ownership(&sync_ownership_path(&first_root), &home),
+            ManagedRead::Valid(_)
+        );
+        let second_sync_owned = matches!(
+            read_sync_ownership(&sync_ownership_path(&second_root), &home),
+            ManagedRead::Valid(_)
+        );
+        assert_eq!(first_sync_owned, first_owned);
+        assert_eq!(second_sync_owned, second_owned);
+        assert!(sync_launch_agent_path(&home).is_file());
         assert_eq!(reports.iter().filter(|report| report.changed).count(), 1);
     }
 
@@ -1201,6 +1912,304 @@ mod tests {
                 .notices
                 .iter()
                 .any(|notice| notice.contains("already active"))
+        );
+    }
+
+    #[test]
+    fn unconfigured_logging_does_not_create_a_launch_agents_directory_or_lock() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("home");
+        let logs_root = temporary.path().join("never configured");
+        let executable = temporary.path().join("sctx");
+        ensure_directory(&home, 0o700).unwrap();
+
+        let reconcile = reconcile_log_service(&home, &logs_root, &executable);
+        assert!(!reconcile.configured);
+        assert!(!home.join("Library").exists());
+        let uninstall = uninstall_log_service(&home, &logs_root);
+        assert!(!uninstall.configured);
+        assert!(!home.join("Library").exists());
+    }
+
+    #[test]
+    fn paired_lock_prevents_disable_and_another_root_enable_from_interleaving() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (home, first_root, executable) = initialized_fixture(&temporary, "owner a");
+        let (_, second_root, _) = initialized_fixture(&temporary, "owner b");
+        assign_upload_target(&first_root);
+        assign_upload_target(&second_root);
+        let _ = reconcile_log_service(&home, &first_root, &executable);
+        sctx_log_service::disable(&first_root).unwrap();
+
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let first_home = home.clone();
+        let first_executable = executable.clone();
+        let first = first_root.clone();
+        let disabling = thread::spawn(move || {
+            reconcile_log_service_inner(&first_home, &first, &first_executable, || {
+                paused_tx.send(()).unwrap();
+                continue_rx.recv().unwrap();
+            })
+        });
+        paused_rx.recv().unwrap();
+
+        let competing = reconcile_log_service(&home, &second_root, &executable);
+        assert!(!competing.changed);
+        assert!(
+            competing
+                .notices
+                .iter()
+                .any(|notice| notice.contains("preserved both logging services"))
+        );
+        continue_tx.send(()).unwrap();
+        let disabled = disabling.join().unwrap();
+        assert!(disabled.changed, "{:?}", disabled.notices);
+        assert!(!launch_agent_path(&home).exists());
+        assert!(!sync_launch_agent_path(&home).exists());
+
+        let retried = reconcile_log_service(&home, &second_root, &executable);
+        assert!(retried.changed, "{:?}", retried.notices);
+        assert!(matches!(
+            read_ownership(&ownership_path(&second_root), &home),
+            ManagedRead::Valid(_)
+        ));
+        assert!(matches!(
+            read_sync_ownership(&sync_ownership_path(&second_root), &home),
+            ManagedRead::Valid(_)
+        ));
+    }
+
+    #[test]
+    fn completed_collector_recovery_is_reported_when_sync_recovery_is_invalid() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (home, logs_root, executable) = initialized_fixture(&temporary, "mixed collector");
+        assign_upload_target(&logs_root);
+        let _ = reconcile_log_service(&home, &logs_root, &executable);
+        let plist = launch_agent_path(&home);
+        let previous = fs::read(&plist).unwrap();
+        let ManagedRead::Valid(previous_ownership) =
+            read_ownership(&ownership_path(&logs_root), &home)
+        else {
+            panic!("collector ownership");
+        };
+        let desired = b"interrupted collector replacement".to_vec();
+        atomic_write(
+            &transaction_path(&logs_root),
+            &json_bytes(&ServiceTransaction {
+                schema_version: 1,
+                plist: plist.clone(),
+                desired_sha256: sha256(&desired),
+                previous_plist: Some(previous.clone()),
+                previous_ownership: Some(previous_ownership),
+            })
+            .unwrap(),
+            0o600,
+        )
+        .unwrap();
+        fs::write(&plist, desired).unwrap();
+        fs::write(sync_transaction_path(&logs_root), b"{}\n").unwrap();
+
+        let report = reconcile_log_service(&home, &logs_root, &executable);
+        assert!(report.changed);
+        assert_eq!(fs::read(&plist).unwrap(), previous);
+        assert!(!transaction_path(&logs_root).exists());
+        assert!(sync_transaction_path(&logs_root).exists());
+        assert!(
+            report
+                .notices
+                .iter()
+                .any(|notice| { notice.contains("stopped the paired logging lifecycle") })
+        );
+    }
+
+    #[test]
+    fn completed_sync_recovery_is_reported_when_collector_recovery_is_invalid() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (home, logs_root, executable) = initialized_fixture(&temporary, "mixed sync");
+        assign_upload_target(&logs_root);
+        let _ = reconcile_log_service(&home, &logs_root, &executable);
+        let plist = sync_launch_agent_path(&home);
+        let previous = fs::read(&plist).unwrap();
+        let ManagedRead::Valid(previous_ownership) =
+            read_sync_ownership(&sync_ownership_path(&logs_root), &home)
+        else {
+            panic!("sync ownership");
+        };
+        let desired = b"interrupted sync replacement".to_vec();
+        atomic_write(
+            &sync_transaction_path(&logs_root),
+            &json_bytes(&ServiceTransaction {
+                schema_version: 1,
+                plist: plist.clone(),
+                desired_sha256: sha256(&desired),
+                previous_plist: Some(previous.clone()),
+                previous_ownership: Some(previous_ownership),
+            })
+            .unwrap(),
+            0o600,
+        )
+        .unwrap();
+        fs::write(&plist, desired).unwrap();
+        fs::write(transaction_path(&logs_root), b"{}\n").unwrap();
+
+        let report = reconcile_log_service(&home, &logs_root, &executable);
+        assert!(report.changed);
+        assert_eq!(fs::read(&plist).unwrap(), previous);
+        assert!(!sync_transaction_path(&logs_root).exists());
+        assert!(transaction_path(&logs_root).exists());
+        assert!(
+            report
+                .notices
+                .iter()
+                .any(|notice| { notice.contains("stopped the paired logging lifecycle") })
+        );
+    }
+
+    #[test]
+    fn uninstall_reports_recovery_without_config_or_ownership() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("home");
+        let logs_root = temporary.path().join("orphaned lifecycle");
+        let plist = launch_agent_path(&home);
+        ensure_directory(plist.parent().unwrap(), 0o755).unwrap();
+        ensure_directory(&logs_root.join("state"), 0o700).unwrap();
+        let desired = b"half-installed collector".to_vec();
+        fs::write(&plist, &desired).unwrap();
+        atomic_write(
+            &transaction_path(&logs_root),
+            &json_bytes(&ServiceTransaction {
+                schema_version: 1,
+                plist: plist.clone(),
+                desired_sha256: sha256(&desired),
+                previous_plist: None,
+                previous_ownership: None,
+            })
+            .unwrap(),
+            0o600,
+        )
+        .unwrap();
+
+        let report = uninstall_log_service(&home, &logs_root);
+        assert!(report.changed);
+        assert!(!report.configured);
+        assert!(!plist.exists());
+        assert!(!transaction_path(&logs_root).exists());
+    }
+
+    #[test]
+    fn assigned_logging_installs_a_fast_due_check_and_disable_removes_both_jobs_only() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (home, logs_root, executable) = initialized_fixture(&temporary, "scheduled");
+        assign_upload_target(&logs_root);
+        let maintain = home.join("Library/LaunchAgents/com.shared-context.maintain.plist");
+        ensure_directory(maintain.parent().unwrap(), 0o755).unwrap();
+        fs::write(&maintain, b"business scheduler").unwrap();
+
+        let installed = reconcile_log_service(&home, &logs_root, &executable);
+        assert!(installed.changed, "{:?}", installed.notices);
+        assert!(launch_agent_path(&home).is_file());
+        let sync_plist = sync_launch_agent_path(&home);
+        let contents = fs::read_to_string(&sync_plist).unwrap();
+        assert!(contents.contains("<string>--scheduled</string>"));
+        assert!(contents.contains("<key>StartInterval</key><integer>60</integer>"));
+        assert!(!contents.contains("<key>KeepAlive</key>"));
+        assert!(sync_ownership_path(&logs_root).is_file());
+
+        sctx_log_service::disable(&logs_root).unwrap();
+        let disabled = reconcile_log_service(&home, &logs_root, &executable);
+        assert!(disabled.changed, "{:?}", disabled.notices);
+        assert!(!launch_agent_path(&home).exists());
+        assert!(!sync_plist.exists());
+        assert!(logs_root.join("config.toml").is_file());
+        assert_eq!(fs::read(&maintain).unwrap(), b"business scheduler");
+    }
+
+    #[test]
+    fn scheduled_switch_is_independent_from_collection_and_maintenance_sync() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (home, logs_root, executable) = initialized_fixture(&temporary, "scheduled off");
+        assign_upload_target(&logs_root);
+        let _ = reconcile_log_service(&home, &logs_root, &executable);
+        assert!(sync_launch_agent_path(&home).is_file());
+        let config_path = logs_root.join("config.toml");
+        let before = fs::read_to_string(&config_path).unwrap();
+        assert!(before.contains("[sync]\n"), "{before}");
+        let config = before.replacen("[sync]\n", "[sync]\nscheduled = false\n", 1);
+        fs::write(&config_path, config).unwrap();
+
+        let report = reconcile_log_service(&home, &logs_root, &executable);
+        assert!(report.changed, "{:?}", report.notices);
+        assert!(launch_agent_path(&home).is_file());
+        assert!(!sync_launch_agent_path(&home).exists());
+        let config = sctx_log_service::load_config(&logs_root).unwrap();
+        assert!(!config.sync.scheduled);
+        assert!(config.sync.on_maintain);
+    }
+
+    #[test]
+    fn user_modified_sync_job_is_preserved_when_logging_is_disabled() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (home, logs_root, executable) = initialized_fixture(&temporary, "modified sync");
+        assign_upload_target(&logs_root);
+        let _ = reconcile_log_service(&home, &logs_root, &executable);
+        let sync_plist = sync_launch_agent_path(&home);
+        fs::write(&sync_plist, b"user scheduled job").unwrap();
+        sctx_log_service::disable(&logs_root).unwrap();
+
+        let report = reconcile_log_service(&home, &logs_root, &executable);
+        assert_eq!(fs::read(&sync_plist).unwrap(), b"user scheduled job");
+        assert!(sync_ownership_path(&logs_root).is_file());
+        assert!(report.notices.iter().any(|notice| {
+            notice.contains("user-modified logging synchronization LaunchAgent")
+        }));
+    }
+
+    #[test]
+    fn unsafe_sync_lifecycle_state_is_bounded_and_explicitly_preserved() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (home, logs_root, executable) = initialized_fixture(&temporary, "unsafe sync state");
+        assign_upload_target(&logs_root);
+        let ownership = sync_ownership_path(&logs_root);
+        let status = Command::new("mkfifo")
+            .args(["-m", "600"])
+            .arg(&ownership)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let started = Instant::now();
+        let report = reconcile_log_service(&home, &logs_root, &executable);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(launch_agent_path(&home).is_file());
+        assert!(!sync_launch_agent_path(&home).exists());
+        assert!(
+            report
+                .notices
+                .iter()
+                .any(|notice| notice.contains("invalid"))
+        );
+    }
+
+    #[test]
+    fn modified_collector_cannot_seed_a_scheduler_for_a_different_logs_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (home, logs_root, executable) = initialized_fixture(&temporary, "modified collector");
+        let _ = reconcile_log_service(&home, &logs_root, &executable);
+        fs::write(
+            launch_agent_path(&home),
+            b"user collector with a different logs root",
+        )
+        .unwrap();
+        assign_upload_target(&logs_root);
+
+        let report = reconcile_log_service(&home, &logs_root, &executable);
+        assert!(!sync_launch_agent_path(&home).exists());
+        assert!(
+            report
+                .notices
+                .iter()
+                .any(|notice| notice.contains("collector LaunchAgent no longer matches"))
         );
     }
 }

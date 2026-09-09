@@ -843,11 +843,10 @@ fn cursor_relative_tool_paths_resolve_against_the_event_workspace() {
     );
 }
 
-/// Undecodable payloads produce only a typed collector event. The bounded event deliberately
-/// omits the old free-text shape fingerprint so no input value, key, or local path can cross the
-/// telemetry boundary.
+/// Undecodable payloads produce only closed adapter metadata. The event type is never copied from
+/// an unknown host string, while the documented Session id is hashed before it crosses the wire.
 #[test]
-fn an_undecodable_payload_records_its_shape_and_none_of_its_values() {
+fn an_undecodable_payload_records_only_closed_diagnostics() {
     let fixture = Fixture::new("undecodable payload");
     TaskRuntime::initialize(&fixture.root).unwrap();
     let secret = "ghp_undecodable_payload_value_must_not_be_recorded";
@@ -862,6 +861,35 @@ fn an_undecodable_payload_records_its_shape_and_none_of_its_values() {
         ),
         json!({})
     );
+    assert_eq!(
+        fixture.hook(
+            "codex",
+            &json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "supported-but-invalid",
+                "transcript_path": null,
+                "cwd": fixture.root,
+                "model": "gpt-5.6-sol",
+                "prompt": secret
+            }),
+        ),
+        json!({})
+    );
+    assert_eq!(
+        fixture.hook(
+            "codex",
+            &json!({
+                "hook_event_name": "PreCompact",
+                "session_id": "invalid-enum",
+                "transcript_path": null,
+                "cwd": fixture.root,
+                "model": "gpt-5.6-sol",
+                "turn_id": "turn-invalid-enum",
+                "trigger": secret
+            }),
+        ),
+        json!({})
+    );
 
     let events = fixture.logging.diagnostics().recent_events;
     let event = events
@@ -869,11 +897,37 @@ fn an_undecodable_payload_records_its_shape_and_none_of_its_values() {
         .find(|event| event.reason.as_deref() == Some("payload_decode_failed"))
         .expect("an undecodable payload records a typed collector diagnostic");
     assert_eq!(event.operation.as_deref(), Some("hook.codex.undecodable"));
+    assert_eq!(event.error_code.as_deref(), Some("unknown_event"));
+    assert_eq!(event.error_family.as_deref(), Some("unknown_event"));
+    assert!(
+        event
+            .session_digest
+            .as_ref()
+            .is_some_and(|value| value.len() == 64)
+    );
     assert_eq!(
         event.summary, None,
         "free text is never persisted for decode failures"
     );
     assert_eq!(fixture.hook_event_summary("payload_decode_failed"), None);
+    let supported = events
+        .iter()
+        .find(|event| event.operation.as_deref() == Some("hook.codex.prompt_submit"))
+        .expect("supported event type remains visible without retaining host text");
+    assert_eq!(supported.error_code.as_deref(), Some("missing_field"));
+    assert_eq!(supported.error_family.as_deref(), Some("field.turn_id"));
+    assert!(
+        supported
+            .session_digest
+            .as_ref()
+            .is_some_and(|value| value.len() == 64)
+    );
+    let invalid_enum = events
+        .iter()
+        .find(|event| event.operation.as_deref() == Some("hook.codex.pre_compact"))
+        .expect("supported enum failure remains classifiable without its value");
+    assert_eq!(invalid_enum.error_code.as_deref(), Some("enum"));
+    assert_eq!(invalid_enum.error_family.as_deref(), Some("field.trigger"));
     let telemetry = fixture.logging.persisted_text();
     for forbidden in [
         secret,
