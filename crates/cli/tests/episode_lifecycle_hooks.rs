@@ -208,8 +208,6 @@ fn checkpoint_claim(session: &str) -> CheckpointClaimDraft {
             platforms: Vec::new(),
             conditions: vec![session.to_owned()],
         },
-        assumptions: Vec::new(),
-        recheck_when: vec!["the Agent lifecycle contract changes".to_owned()],
         evidence_refs: Vec::new(),
         inline_validations: vec![EvidenceSnapshotDraft {
             kind: EvidenceType::ExperimentRecord,
@@ -219,10 +217,7 @@ fn checkpoint_claim(session: &str) -> CheckpointClaimDraft {
                 .to_owned(),
             limitations: Vec::new(),
         }],
-        artifact_refs: Vec::new(),
-        relations: Vec::new(),
         engineering_references: Vec::new(),
-        related_contexts: Vec::new(),
     }
 }
 

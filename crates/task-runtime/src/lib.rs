@@ -16,17 +16,16 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 use sctx_domain::{
-    AgentCheckpoint, AgentCheckpointId, Applicability, ArtifactRef, AutomaticContextCandidate,
-    CandidateBuildId, CandidateConfirmationPlan, CandidateId, CandidateReviewScope,
-    CandidateReviewStatus, CheckpointClaim, CheckpointClaimId, CheckpointEvidenceRef,
-    CheckpointUnknown, ConfirmationId, ContextId, ContextKind, ContextRevisionRef, DecisionSource,
-    Error, ErrorKind, EventId, EvidenceSnapshotDraft, EvidenceType, ExternalSessionId,
-    ExternalSessionLocator, ExternalSessionSnapshot, IntentRevisionRange, NonLocatingSignalRef,
-    NormalizedWorkObservation, ProposedSpaceGroupKey, Result, RevisionId, SignalId, SpaceId,
-    SubmissionId, TaskId, TaskIntentRevision, TaskIntentRevisionId, TaskSessionId,
-    TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord,
-    WorkEpisode, WorkEpisodeId, WorkEpisodeRef, WorkEpisodeStatus, WorkObservation,
-    WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
+    AgentCheckpoint, AgentCheckpointId, Applicability, AutomaticContextCandidate, CandidateBuildId,
+    CandidateConfirmationPlan, CandidateId, CandidateReviewScope, CandidateReviewStatus,
+    CheckpointClaim, CheckpointClaimId, CheckpointEvidenceRef, CheckpointUnknown, ConfirmationId,
+    ContextId, ContextKind, DecisionSource, Error, ErrorKind, EventId, EvidenceSnapshotDraft,
+    EvidenceType, ExternalSessionId, ExternalSessionLocator, ExternalSessionSnapshot,
+    IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation, ProposedSpaceGroupKey,
+    Result, RevisionId, SignalId, SpaceId, SubmissionId, TaskId, TaskIntentRevision,
+    TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalKind,
+    TaskSignalLifecycle, TaskSignalRecord, WorkEpisode, WorkEpisodeId, WorkEpisodeRef,
+    WorkEpisodeStatus, WorkObservation, WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
 };
 use sha2::{Digest, Sha256};
 
@@ -191,14 +190,9 @@ pub struct CheckpointClaimDraft {
     pub statement: String,
     pub rationale: String,
     pub applicability: Applicability,
-    pub assumptions: Vec<String>,
-    pub recheck_when: Vec<String>,
     pub evidence_refs: Vec<CheckpointEvidenceRef>,
     pub inline_validations: Vec<EvidenceSnapshotDraft>,
-    pub artifact_refs: Vec<ArtifactRef>,
-    pub relations: Vec<sctx_domain::ContextRelation>,
     pub engineering_references: Vec<sctx_domain::EngineeringReferenceDraft>,
-    pub related_contexts: Vec<ContextRevisionRef>,
 }
 
 /// One strict Checkpoint write under `ActiveTask`, Intent and Episode-version CAS.
@@ -1622,13 +1616,8 @@ impl TaskRuntime {
                 claim.statement.clone(),
                 claim.rationale.clone(),
                 claim.applicability.clone(),
-                claim.assumptions.clone(),
-                claim.recheck_when.clone(),
                 evidence_refs,
-                claim.artifact_refs.clone(),
-                claim.relations.clone(),
                 claim.engineering_references.clone(),
-                claim.related_contexts.clone(),
             )?);
         }
         let episode_with_inline = require_episode_view(&transaction, episode_id)?.episode;
@@ -1810,13 +1799,8 @@ impl TaskRuntime {
                 claim.statement.clone(),
                 claim.rationale.clone(),
                 claim.applicability.clone(),
-                claim.assumptions.clone(),
-                claim.recheck_when.clone(),
                 evidence_refs,
-                claim.artifact_refs.clone(),
-                claim.relations.clone(),
                 claim.engineering_references.clone(),
-                claim.related_contexts.clone(),
             )?);
         }
         let episode_with_inline = require_episode_view(&transaction, episode_id)?.episode;
@@ -5185,6 +5169,7 @@ fn find_latest_checkpoint_episode(
 }
 
 fn checkpoint_semantic_json(input: &AgentCheckpointWrite) -> Result<String> {
+    // Retired empty keys preserve exact retry equality with checkpoints written by older binaries.
     let claims = input
         .claims
         .iter()
@@ -5195,14 +5180,14 @@ fn checkpoint_semantic_json(input: &AgentCheckpointWrite) -> Result<String> {
                 "statement": claim.statement,
                 "rationale": claim.rationale,
                 "applicability": claim.applicability,
-                "assumptions": claim.assumptions,
-                "recheck_when": claim.recheck_when,
+                "assumptions": [],
+                "recheck_when": [],
                 "evidence_refs": claim.evidence_refs,
                 "inline_validations": claim.inline_validations,
-                "artifact_refs": claim.artifact_refs,
-                "relations": claim.relations,
+                "artifact_refs": [],
+                "relations": [],
                 "engineering_references": claim.engineering_references,
-                "related_contexts": claim.related_contexts,
+                "related_contexts": [],
             })
         })
         .collect::<Vec<_>>();
@@ -5302,14 +5287,9 @@ fn materialize_direct_checkpoint_claim(
         statement: claim.statement.clone(),
         rationale: claim.rationale.clone(),
         applicability,
-        assumptions: Vec::new(),
-        recheck_when: Vec::new(),
         evidence_refs: Vec::new(),
         inline_validations,
-        artifact_refs: Vec::new(),
-        relations: Vec::new(),
         engineering_references: Vec::new(),
-        related_contexts: Vec::new(),
     })
 }
 
@@ -7865,5 +7845,46 @@ mod hook_event_retention_tests {
             1,
             "the id = 1 row must be pruned; only the newest row remains"
         );
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_wire_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn direct_checkpoint_semantics_and_operation_hash_match_the_old_contract() {
+        let input = AgentCheckpointSubmission {
+            locator: ExternalSessionLocator::new("codex", "wire-contract").unwrap(),
+            claims: vec![DirectCheckpointClaimDraft {
+                context_kind: ContextKind::Validation,
+                statement: "Operation A".to_owned(),
+                rationale: "The direct Checkpoint operation is durable".to_owned(),
+                conditions: vec!["content addressed".to_owned()],
+                evidence: vec![DirectEvidenceDraft {
+                    evidence_type: EvidenceType::ExperimentRecord,
+                    summary: "Operation A passed".to_owned(),
+                    limitations: Vec::new(),
+                }],
+            }],
+            unknowns: Vec::new(),
+        };
+        let semantic = direct_checkpoint_semantic_json(&input).unwrap();
+        assert_eq!(
+            semantic,
+            r#"{"claims":[{"conditions":["content addressed"],"context_kind":"validation","evidence":[{"evidence_type":"experiment_record","limitations":[],"summary":"Operation A passed"}],"rationale":"The direct Checkpoint operation is durable","statement":"Operation A"}],"unknowns":[]}"#
+        );
+        let (operation_id, hash) = checkpoint_operation_identity(
+            "tss_00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            "tsk_00000000-0000-4000-8000-000000000002".parse().unwrap(),
+            "tir_00000000-0000-4000-8000-000000000003".parse().unwrap(),
+            &semantic,
+        );
+        // Independently computed from the frozen v1 length-prefixed SHA-256 input.
+        assert_eq!(
+            hash,
+            "sha256:bcd7f8195ddbfb68d024fd27d6ee7658c7dae6a954344e1b18fe9a7a4e0af7fd"
+        );
+        assert_eq!(operation_id, hash);
     }
 }

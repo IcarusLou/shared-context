@@ -86,8 +86,6 @@ fn checkpoint_claim(statement: &str) -> CheckpointClaimDraft {
             platforms: Vec::new(),
             conditions: vec!["Agent Checkpoint".to_owned()],
         },
-        assumptions: Vec::new(),
-        recheck_when: vec!["the validated behavior changes".to_owned()],
         evidence_refs: Vec::new(),
         inline_validations: vec![EvidenceSnapshotDraft {
             kind: EvidenceType::ExperimentRecord,
@@ -96,10 +94,7 @@ fn checkpoint_claim(statement: &str) -> CheckpointClaimDraft {
             interpretation: "The focused runtime behavior was directly validated".to_owned(),
             limitations: Vec::new(),
         }],
-        artifact_refs: Vec::new(),
-        relations: Vec::new(),
         engineering_references: Vec::new(),
-        related_contexts: Vec::new(),
     }
 }
 
@@ -216,6 +211,71 @@ fn finalize_review(
         .read_candidate_review(locator, candidate_id)
         .unwrap()
         .unwrap()
+}
+
+#[test]
+fn old_empty_fat_semantic_bytes_preserve_open_and_closed_retries() {
+    for boundary in [CheckpointBoundary::Continue, CheckpointBoundary::Close] {
+        let temporary = TempDir::new().unwrap();
+        let runtime = TaskRuntime::initialize(temporary.path()).unwrap();
+        let (locator, task) = open_task(&runtime, "old-fat-retry", "preserve old retry bytes");
+        let input = checkpoint_write(
+            &locator,
+            &task,
+            0,
+            boundary,
+            vec![checkpoint_claim("Old low-level Claim")],
+            Vec::new(),
+        );
+        let first = runtime.write_agent_checkpoint(&input).unwrap();
+        // Frozen old helper output; only the server-owned IDs and boundary vary.
+        let old = r#"{"boundary":"BOUNDARY","claims":[{"applicability":{"conditions":["Agent Checkpoint"],"domains":["runtime"],"platforms":[]},"artifact_refs":[],"assumptions":[],"context_kind_hint":null,"engineering_references":[],"evidence_refs":[],"inline_validations":[{"content":{"actual":"passed","test":"checkpoint"},"interpretation":"The focused runtime behavior was directly validated","kind":"experiment_record","limitations":[],"supports":"Old low-level Claim"}],"rationale":"Direct validation supports this engineering conclusion","recheck_when":[],"related_contexts":[],"relations":[],"statement":"Old low-level Claim","topic_key_hint":null}],"expected_intent_revision_id":"INTENT_ID","expected_task_id":"TASK_ID","unknowns":[]}"#
+            .replace("TASK_ID", &task.task_id.to_string())
+            .replace("INTENT_ID", &input.expected_intent_revision_id.to_string())
+            .replace("BOUNDARY", if boundary == CheckpointBoundary::Close { "close" } else { "continue" });
+        let connection = Connection::open(runtime.database_path()).unwrap();
+        let stored: String = connection
+            .query_row(
+                "SELECT semantic_json FROM agent_checkpoint WHERE checkpoint_id = ?1",
+                [first.checkpoint.checkpoint_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored, old,
+            "new writes must match the old binary comparator"
+        );
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE agent_checkpoint SET semantic_json = ?1 WHERE checkpoint_id = ?2",
+                    rusqlite::params![old, first.checkpoint.checkpoint_id.to_string()]
+                )
+                .unwrap(),
+            1
+        );
+        let retry = runtime.write_agent_checkpoint(&input).unwrap();
+        assert!(!retry.created);
+        assert_eq!(retry.checkpoint, first.checkpoint);
+        assert_eq!(
+            retry.episode.episode.episode_id,
+            first.episode.episode.episode_id
+        );
+        assert_eq!(
+            runtime
+                .list_work_episodes(task.task_session_id, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM agent_checkpoint", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
 }
 
 #[test]
@@ -341,6 +401,11 @@ fn content_addressed_checkpoint_operations_converge_across_concurrency_and_delay
             |row| row.get::<_, String>(0),
         )
         .unwrap();
+    // This literal is the pre-R2-1 direct operation shape, independent of Claim serde.
+    assert_eq!(
+        persisted_semantics,
+        r#"{"claims":[{"conditions":["content addressed"],"context_kind":"validation","evidence":[{"evidence_type":"experiment_record","limitations":[],"summary":"Operation A passed"}],"rationale":"The direct Checkpoint operation is durable","statement":"Operation A"}],"unknowns":[]}"#
+    );
     assert!(persisted_semantics.contains("Operation A"));
     assert!(!persisted_semantics.contains("content-operation"));
     assert!(!persisted_semantics.contains(&task.task_id.to_string()));

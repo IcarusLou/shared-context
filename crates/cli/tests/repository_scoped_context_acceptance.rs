@@ -845,7 +845,10 @@ fn run_enabled_chain(
         .into_iter()
         .next()
         .unwrap();
-    assert!(episode.checkpoints[0].claims[0].artifact_refs.is_empty());
+    assert_eq!(
+        serde_json::to_value(&episode.checkpoints[0].claims[0]).unwrap()["artifact_refs"],
+        json!([]),
+    );
     let boundary = fixture.hook(profile, &lifecycle_boundary(profile, session, startup));
     assert!(
         boundary.get("systemMessage").is_some()

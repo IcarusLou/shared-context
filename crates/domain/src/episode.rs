@@ -558,8 +558,8 @@ impl CheckpointUnknown {
 }
 
 /// One server-identified structured engineering claim.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(from = "CheckpointClaimWire")]
 pub struct CheckpointClaim {
     pub claim_id: CheckpointClaimId,
     pub context_kind_hint: Option<crate::ContextKind>,
@@ -567,15 +567,108 @@ pub struct CheckpointClaim {
     pub statement: String,
     pub rationale: String,
     pub applicability: Applicability,
-    pub assumptions: Vec<String>,
-    pub recheck_when: Vec<String>,
     pub evidence_refs: Vec<CheckpointEvidenceRef>,
-    pub artifact_refs: Vec<ArtifactRef>,
-    #[serde(default)]
-    pub relations: Vec<crate::ContextRelation>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub engineering_references: Vec<EngineeringReferenceDraft>,
-    pub related_contexts: Vec<ContextRevisionRef>,
+}
+
+// Retired Claim fields remain empty wire keys for stored checkpoints and old-reader rollback.
+// A sequence visitor rejects nonempty input as a data error, without retaining legacy values.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointClaimWire {
+    claim_id: CheckpointClaimId,
+    context_kind_hint: Option<crate::ContextKind>,
+    topic_key_hint: Option<String>,
+    statement: String,
+    rationale: String,
+    applicability: Applicability,
+    #[serde(rename = "assumptions", deserialize_with = "empty_claim_field")]
+    _assumptions: [(); 0],
+    #[serde(rename = "recheck_when", deserialize_with = "empty_claim_field")]
+    _recheck_when: [(); 0],
+    evidence_refs: Vec<CheckpointEvidenceRef>,
+    #[serde(rename = "artifact_refs", deserialize_with = "empty_claim_field")]
+    _artifact_refs: [(); 0],
+    #[serde(default, rename = "relations", deserialize_with = "empty_claim_field")]
+    _relations: [(); 0],
+    #[serde(default)]
+    engineering_references: Vec<EngineeringReferenceDraft>,
+    #[serde(rename = "related_contexts", deserialize_with = "empty_claim_field")]
+    _related_contexts: [(); 0],
+}
+
+fn empty_claim_field<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<[(); 0], D::Error> {
+    struct EmptyClaimField;
+
+    impl<'de> serde::de::Visitor<'de> for EmptyClaimField {
+        type Value = [(); 0];
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an empty retired checkpoint Claim field")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::custom(
+                    "retired checkpoint Claim fields must be empty",
+                ));
+            }
+            Ok([])
+        }
+    }
+
+    deserializer.deserialize_seq(EmptyClaimField)
+}
+
+impl From<CheckpointClaimWire> for CheckpointClaim {
+    fn from(wire: CheckpointClaimWire) -> Self {
+        Self {
+            claim_id: wire.claim_id,
+            context_kind_hint: wire.context_kind_hint,
+            topic_key_hint: wire.topic_key_hint,
+            statement: wire.statement,
+            rationale: wire.rationale,
+            applicability: wire.applicability,
+            evidence_refs: wire.evidence_refs,
+            engineering_references: wire.engineering_references,
+        }
+    }
+}
+
+impl Serialize for CheckpointClaim {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        let has_references = !self.engineering_references.is_empty();
+        let mut wire =
+            serializer.serialize_struct("CheckpointClaim", 12 + usize::from(has_references))?;
+        // Keep the old order as well as the empty keys: derivation rewrites checkpoint_json.
+        let empty: [(); 0] = [];
+        wire.serialize_field("claim_id", &self.claim_id)?;
+        wire.serialize_field("context_kind_hint", &self.context_kind_hint)?;
+        wire.serialize_field("topic_key_hint", &self.topic_key_hint)?;
+        wire.serialize_field("statement", &self.statement)?;
+        wire.serialize_field("rationale", &self.rationale)?;
+        wire.serialize_field("applicability", &self.applicability)?;
+        wire.serialize_field("assumptions", &empty)?;
+        wire.serialize_field("recheck_when", &empty)?;
+        wire.serialize_field("evidence_refs", &self.evidence_refs)?;
+        wire.serialize_field("artifact_refs", &empty)?;
+        wire.serialize_field("relations", &empty)?;
+        if has_references {
+            wire.serialize_field("engineering_references", &self.engineering_references)?;
+        }
+        wire.serialize_field("related_contexts", &empty)?;
+        wire.end()
+    }
 }
 
 impl CheckpointClaim {
@@ -584,20 +677,14 @@ impl CheckpointClaim {
     /// # Errors
     ///
     /// Returns an input error for missing statement/rationale/Evidence or invalid references.
-    #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         context_kind_hint: Option<crate::ContextKind>,
         topic_key_hint: Option<String>,
         statement: impl Into<String>,
         rationale: impl Into<String>,
         applicability: Applicability,
-        assumptions: Vec<String>,
-        recheck_when: Vec<String>,
         evidence_refs: Vec<CheckpointEvidenceRef>,
-        artifact_refs: Vec<ArtifactRef>,
-        relations: Vec<crate::ContextRelation>,
         engineering_references: Vec<EngineeringReferenceDraft>,
-        related_contexts: Vec<ContextRevisionRef>,
     ) -> Result<Self> {
         let claim = Self {
             claim_id: CheckpointClaimId::new(),
@@ -606,13 +693,8 @@ impl CheckpointClaim {
             statement: statement.into(),
             rationale: rationale.into(),
             applicability,
-            assumptions,
-            recheck_when,
             evidence_refs,
-            artifact_refs,
-            relations,
             engineering_references,
-            related_contexts,
         };
         claim.validate("checkpoint_claim")?;
         Ok(claim)
@@ -626,32 +708,14 @@ impl CheckpointClaim {
         require_text(&self.rationale, &format!("{field}.rationale"))?;
         self.applicability
             .validate(&format!("{field}.applicability"))?;
-        require_text_items(&self.assumptions, &format!("{field}.assumptions"))?;
-        require_text_items(&self.recheck_when, &format!("{field}.recheck_when"))?;
         if self.evidence_refs.is_empty() {
             return Err(invalid(format!("{field}.evidence_refs must not be empty")));
         }
         require_unique(&self.evidence_refs, &format!("{field}.evidence_refs"))?;
-        require_unique(&self.artifact_refs, &format!("{field}.artifact_refs"))?;
-        for artifact in &self.artifact_refs {
-            artifact.validate()?;
-        }
-        for relation in &self.relations {
-            relation.validate()?;
-        }
-        require_unique(
-            &self
-                .relations
-                .iter()
-                .map(|relation| (relation.target_context_id, relation.kind))
-                .collect::<Vec<_>>(),
-            &format!("{field}.relations target/kind"),
-        )?;
         validate_engineering_reference_drafts(
             &self.engineering_references,
             &format!("{field}.engineering_references"),
-        )?;
-        require_unique(&self.related_contexts, &format!("{field}.related_contexts"))
+        )
     }
 }
 
@@ -2094,6 +2158,144 @@ mod tests {
         }
     }
 
+    // Frozen before R2-1: original field order and mandatory empty-vector keys.
+    const OLD_EMPTY_CLAIM: &str = r#"{"claim_id":"clm_00000000-0000-4000-8000-000000000001","context_kind_hint":"validation","topic_key_hint":null,"statement":"Old empty Claim","rationale":"Evidence is retained","applicability":{"domains":[],"platforms":[],"conditions":[]},"assumptions":[],"recheck_when":[],"evidence_refs":[{"kind":"observation","observation_id":"wob_00000000-0000-4000-8000-000000000002"}],"artifact_refs":[],"relations":[],"related_contexts":[]}"#;
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct OldClaimWire {
+        claim_id: CheckpointClaimId,
+        context_kind_hint: Option<crate::ContextKind>,
+        topic_key_hint: Option<String>,
+        statement: String,
+        rationale: String,
+        applicability: Applicability,
+        assumptions: Vec<String>,
+        recheck_when: Vec<String>,
+        evidence_refs: Vec<CheckpointEvidenceRef>,
+        artifact_refs: Vec<ArtifactRef>,
+        #[serde(default)]
+        relations: Vec<crate::ContextRelation>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        engineering_references: Vec<EngineeringReferenceDraft>,
+        related_contexts: Vec<ContextRevisionRef>,
+    }
+
+    #[test]
+    fn empty_claim_wire_bytes_match_the_frozen_old_contract() {
+        let claim: CheckpointClaim = serde_json::from_str(OLD_EMPTY_CLAIM).unwrap();
+        claim.validate("claim").unwrap();
+        let encoded = serde_json::to_string(&claim).unwrap();
+        assert_eq!(encoded, OLD_EMPTY_CLAIM);
+        let old: OldClaimWire = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(serde_json::to_string(&old).unwrap(), OLD_EMPTY_CLAIM);
+        assert!(old.assumptions.is_empty() && old.recheck_when.is_empty());
+        assert!(old.artifact_refs.is_empty() && old.relations.is_empty());
+        assert!(old.related_contexts.is_empty());
+        let mut without_relations: Value = serde_json::from_str(OLD_EMPTY_CLAIM).unwrap();
+        without_relations
+            .as_object_mut()
+            .unwrap()
+            .remove("relations");
+        let old_without_relations: OldClaimWire =
+            serde_json::from_value(without_relations).unwrap();
+        assert!(old_without_relations.relations.is_empty());
+        assert_eq!(
+            serde_json::to_string(&old_without_relations).unwrap(),
+            OLD_EMPTY_CLAIM
+        );
+
+        // Optional references retain their old omit-empty/include-nonempty behavior.
+        let mut with_references: Value = serde_json::from_str(OLD_EMPTY_CLAIM).unwrap();
+        with_references["engineering_references"] = json!([]);
+        let empty: CheckpointClaim = serde_json::from_value(with_references.clone()).unwrap();
+        assert_eq!(serde_json::to_string(&empty).unwrap(), OLD_EMPTY_CLAIM);
+        with_references["engineering_references"] = json!([{
+            "repository_id": "wire-fixture",
+            "artifact_kind": "file",
+            "relation": "implements",
+            "locator": {"locator_kind": "file", "path": "src/search.ts"},
+            "supports": "The file implements this Claim",
+            "limitations": []
+        }]);
+        let current: CheckpointClaim = serde_json::from_value(with_references).unwrap();
+        current.validate("claim").unwrap();
+        let encoded = serde_json::to_string(&current).unwrap();
+        let old: OldClaimWire = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(old.engineering_references.len(), 1);
+        assert_eq!(serde_json::to_string(&old).unwrap(), encoded);
+    }
+
+    #[test]
+    fn retired_claim_wire_fields_reject_nonempty_and_unknown_inputs() {
+        let nonempty = [
+            ("assumptions", json!(["A legacy assumption"])),
+            ("recheck_when", json!(["The old contract changes"])),
+            ("artifact_refs", json!([artifact("src/search.ts")])),
+            (
+                "relations",
+                json!([crate::ContextRelation {
+                    target_context_id: ContextId::new(),
+                    kind: ContextRelationKind::RelatedTo,
+                    rationale: "Previously accepted relation".to_owned(),
+                    supports: vec!["The reference supports the claim".to_owned()],
+                }]),
+            ),
+            (
+                "related_contexts",
+                json!([ContextRevisionRef {
+                    context_id: ContextId::new(),
+                    revision_id: RevisionId::new(),
+                }]),
+            ),
+        ];
+        for (field, value) in nonempty {
+            let mut wire: Value = serde_json::from_str(OLD_EMPTY_CLAIM).unwrap();
+            wire[field] = value;
+            let error = serde_json::from_value::<CheckpointClaim>(wire.clone()).unwrap_err();
+            assert!(error.is_data(), "{field}: {error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("retired checkpoint Claim fields must be empty"),
+                "{field}: {error}"
+            );
+            let encoded = serde_json::to_string(&wire).unwrap();
+            let string_error = serde_json::from_str::<CheckpointClaim>(&encoded).unwrap_err();
+            assert!(string_error.is_data(), "{field}: {string_error}");
+            assert!(
+                string_error
+                    .to_string()
+                    .contains("retired checkpoint Claim fields must be empty")
+            );
+            for malformed in [Value::Null, json!({}), json!("empty")] {
+                wire[field] = malformed;
+                assert!(
+                    serde_json::from_value::<CheckpointClaim>(wire.clone()).is_err(),
+                    "{field}"
+                );
+            }
+            wire.as_object_mut().unwrap().remove(field);
+            let absent = serde_json::from_value::<CheckpointClaim>(wire);
+            if field == "relations" {
+                assert!(absent.is_ok(), "relations retains its old default");
+            } else {
+                assert!(
+                    absent.unwrap_err().to_string().contains("missing field"),
+                    "{field}"
+                );
+            }
+        }
+        let mut unknown: Value = serde_json::from_str(OLD_EMPTY_CLAIM).unwrap();
+        unknown["private_payload"] = json!([]);
+        assert!(
+            serde_json::from_value::<CheckpointClaim>(unknown)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field")
+        );
+    }
+
     struct CheckpointFixture {
         episode: WorkEpisode,
         checkpoint: AgentCheckpoint,
@@ -2131,12 +2333,7 @@ mod tests {
             "Keep fallback ownership server-side",
             "Every client consumes one contract",
             Applicability::default(),
-            Vec::new(),
-            vec!["The v3 contract ships".to_owned()],
             vec![CheckpointEvidenceRef::Observation { observation_id }],
-            vec![artifact("src/search.ts")],
-            Vec::new(),
-            Vec::new(),
             Vec::new(),
         )
         .unwrap();
@@ -2405,11 +2602,6 @@ mod tests {
                 "Claim without Evidence",
                 "Cannot be grounded",
                 Applicability::default(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
                 Vec::new(),
                 Vec::new(),
             )

@@ -2914,9 +2914,8 @@ impl Runtime {
             source_intent_revision_id: source_intent_id,
             source_working_intent: source_intent,
             source_task_signals: task.task_signals.clone(),
-            explicit_related_contexts: claim.related_contexts.clone(),
-            // Server-derived References are the only Artifact coordinates most Claims carry, so
-            // the analyzer's shared-Artifact path sees them alongside any Agent-authored ref.
+            explicit_related_contexts: Vec::new(),
+            // Server-derived References supply the Claim's Artifact coordinates to analysis.
             artifact_refs: candidate_artifact_refs(claim),
             proposed_space_group_space_id,
             token_budget,
@@ -5051,7 +5050,7 @@ fn compose_problem_view(intent: &WorkingIntentSnapshot) -> Option<String> {
 }
 
 fn candidate_artifact_refs(claim: &CheckpointClaim) -> Vec<ArtifactRef> {
-    let mut refs = claim.artifact_refs.clone();
+    let mut refs = Vec::new();
     for reference in &claim.engineering_references {
         let derived = ArtifactRef {
             repository_id: reference.repository_id.clone(),
@@ -5174,9 +5173,9 @@ fn build_claim_material(
         statement: claim.statement.clone(),
         rationale: claim.rationale.clone(),
         applicability: claim.applicability.clone(),
-        assumptions: claim.assumptions.clone(),
-        recheck_when: claim.recheck_when.clone(),
-        relations: claim.relations.clone(),
+        assumptions: Vec::new(),
+        recheck_when: Vec::new(),
+        relations: Vec::new(),
         evidence,
     });
     ClaimBuildMaterial {

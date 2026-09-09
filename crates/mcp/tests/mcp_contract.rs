@@ -789,14 +789,9 @@ fn directly_close_builder_episode(
                 statement: statement.to_owned(),
                 rationale: rationale.clone(),
                 applicability: Applicability::default(),
-                assumptions: Vec::new(),
-                recheck_when: Vec::new(),
                 evidence_refs: Vec::new(),
                 inline_validations: vec![evidence.clone()],
-                artifact_refs: Vec::new(),
-                relations: Vec::new(),
                 engineering_references: Vec::new(),
-                related_contexts: Vec::new(),
             }],
             unknowns: Vec::new(),
         })
@@ -1074,6 +1069,138 @@ fn recovery_submission(
             }],
         },
     )
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn old_empty_checkpoint_wire_survives_retry_derivation_and_candidate_build() {
+    let fixture = Fixture::new();
+    let runtime = TaskRuntime::initialize(&fixture.root).unwrap();
+    let locator = ExternalSessionLocator::new("codex", "old-wire").unwrap();
+    let goal = "old wire compatibility";
+    runtime
+        .open_or_create(
+            locator.clone(),
+            TaskId::new(),
+            update_input("old-wire", TaskBoundary::New, None, goal).intent,
+            Vec::new(),
+        )
+        .unwrap();
+    let (input, expected_content) = recovery_submission(&locator, 1, goal);
+    let original = runtime.submit_agent_checkpoint(&input).unwrap();
+    let checkpoint = &original.checkpoint;
+    let episode_id = original.episode.episode.episode_id;
+    // Frozen old checkpoint shape. Only generated identities are substituted, never fields or
+    // a serde-produced Claim object, so a new keyless serializer cannot validate itself here.
+    let old = r#"{"checkpoint_id":"CHECKPOINT","episode_id":"EPISODE","task_session_id":"SESSION","task_id":"TASK","intent_revision_id":"INTENT","claims":[{"claim_id":"CLAIM","context_kind_hint":"validation","topic_key_hint":null,"statement":"Fair recovery statement 1","rationale":"Fair recovery rationale 1","applicability":{"domains":["mcp"],"platforms":[],"conditions":["fair recovery"]},"assumptions":[],"recheck_when":[],"evidence_refs":[{"kind":"observation","observation_id":"OBSERVATION"}],"artifact_refs":[],"relations":[],"related_contexts":[]}],"unknowns":[]}"#
+        .replace("CHECKPOINT", &checkpoint.checkpoint_id.to_string())
+        .replace("EPISODE", &episode_id.to_string())
+        .replace("SESSION", &checkpoint.task_session_id.to_string())
+        .replace("TASK", &checkpoint.task_id.to_string())
+        .replace("INTENT", &checkpoint.intent_revision_id.to_string())
+        .replace("CLAIM", &checkpoint.claims[0].claim_id.to_string())
+        .replace("OBSERVATION", &original.inline_observation_ids[0].to_string());
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    let read_wire = || {
+        connection
+            .query_row(
+                "SELECT checkpoint_json FROM agent_checkpoint WHERE checkpoint_id = ?1",
+                [checkpoint.checkpoint_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        read_wire(),
+        old,
+        "new writes retain the exact old wire bytes"
+    );
+    let replace_wire = |wire: &str| {
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE agent_checkpoint SET checkpoint_json = ?1 WHERE checkpoint_id = ?2",
+                    rusqlite::params![wire, checkpoint.checkpoint_id.to_string()]
+                )
+                .unwrap(),
+            1
+        );
+    };
+    replace_wire(&old);
+    let history = runtime.read_work_episode(episode_id).unwrap().unwrap();
+    assert_eq!(history.checkpoints, vec![checkpoint.clone()]);
+    let retry = runtime.submit_agent_checkpoint(&input).unwrap();
+    assert!(retry.replayed);
+    assert_eq!(retry.operation_id, original.operation_id);
+    assert_eq!(retry.checkpoint.checkpoint_id, checkpoint.checkpoint_id);
+    assert_eq!(retry.episode.episode.episode_id, episode_id);
+
+    // The runtime must surface unsupported legacy data as a typed invariant error.
+    let mut nonempty: Value = serde_json::from_str(&old).unwrap();
+    nonempty["claims"][0]["assumptions"] = json!(["Unsupported legacy value"]);
+    replace_wire(&serde_json::to_string(&nonempty).unwrap());
+    let error = runtime.read_work_episode(episode_id).unwrap_err();
+    assert_eq!(error.kind(), sctx_domain::ErrorKind::InvariantViolation);
+    assert!(
+        error
+            .to_string()
+            .contains("retired checkpoint Claim fields must be empty"),
+        "{error}"
+    );
+    replace_wire(&old);
+
+    let derived = runtime
+        .derive_episode_claim_references(episode_id, &|_| None)
+        .unwrap();
+    assert_eq!(derived.len(), 1);
+    assert!(derived[0].engineering_references.is_empty());
+    assert_eq!(
+        read_wire(),
+        old,
+        "no-op derivation preserves all old empty keys and order"
+    );
+    assert_eq!(
+        runtime
+            .read_work_episode(episode_id)
+            .unwrap()
+            .unwrap()
+            .checkpoints,
+        vec![checkpoint.clone()]
+    );
+    let after_derivation = runtime.submit_agent_checkpoint(&input).unwrap();
+    assert!(after_derivation.replayed);
+    assert_eq!(after_derivation.operation_id, original.operation_id);
+    assert_eq!(
+        after_derivation.checkpoint.checkpoint_id,
+        checkpoint.checkpoint_id
+    );
+
+    let built = build_closed_episode_at_root(&fixture.root, episode_id).unwrap();
+    assert_eq!(built.status, CandidateBuildResponseStatus::Complete);
+    assert_eq!(built.items.len(), 1);
+    let candidate_id = built.items[0].candidate_id.unwrap();
+    let analyzed = sctx_mcp::candidate_analyze_at_root(
+        &fixture.root,
+        &sctx_mcp::CandidateAnalyzeInput {
+            candidate_id: candidate_id.to_string(),
+            token_budget: 8_000,
+            top_k: 8,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        analyzed.candidate.analysis.status,
+        CandidateAnalysisStatus::Complete
+    );
+    assert_eq!(analyzed.candidate.content, expected_content);
+    assert_eq!(read_wire(), old);
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM agent_checkpoint", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
 }
 
 #[test]
@@ -2436,14 +2563,9 @@ fn internal_builder_preserves_observation_signal_and_context_evidence_sources() 
         statement: statement.to_owned(),
         rationale: "The internal Builder resolves this typed source".to_owned(),
         applicability: Applicability::default(),
-        assumptions: Vec::new(),
-        recheck_when: Vec::new(),
         evidence_refs: vec![evidence_ref],
         inline_validations: Vec::new(),
-        artifact_refs: Vec::new(),
-        relations: Vec::new(),
         engineering_references: Vec::new(),
-        related_contexts: Vec::new(),
     };
     let closed = tasks
         .write_agent_checkpoint(&AgentCheckpointWrite {
@@ -3841,14 +3963,9 @@ fn distinct_claims_with_identical_drafts_keep_distinct_stable_submissions() {
         statement: "Two creation operations may have identical text".to_owned(),
         rationale: "Submission identity is operational, not semantic".to_owned(),
         applicability: Applicability::default(),
-        assumptions: Vec::new(),
-        recheck_when: Vec::new(),
         evidence_refs: Vec::new(),
         inline_validations: vec![evidence],
-        artifact_refs: Vec::new(),
-        relations: Vec::new(),
         engineering_references: Vec::new(),
-        related_contexts: Vec::new(),
     };
     let revision_id = task.current_intent_revision().unwrap().revision_id;
     tasks

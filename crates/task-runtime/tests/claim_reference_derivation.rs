@@ -205,8 +205,6 @@ fn an_agent_authored_topic_hint_survives_derivation() {
                 statement: "PoiEntranceAssem.kt:118 registers before the null check".to_owned(),
                 rationale: "the fallback never runs".to_owned(),
                 applicability: sctx_domain::Applicability::default(),
-                assumptions: Vec::new(),
-                recheck_when: Vec::new(),
                 evidence_refs: Vec::new(),
                 inline_validations: vec![sctx_domain::EvidenceSnapshotDraft {
                     kind: EvidenceType::SourceSnapshot,
@@ -215,10 +213,7 @@ fn an_agent_authored_topic_hint_survives_derivation() {
                     interpretation: "the registration precedes the guard".to_owned(),
                     limitations: vec!["synthetic association probe fixture".to_owned()],
                 }],
-                artifact_refs: Vec::new(),
-                relations: Vec::new(),
                 engineering_references: Vec::new(),
-                related_contexts: Vec::new(),
             }],
             unknowns: Vec::new(),
         })

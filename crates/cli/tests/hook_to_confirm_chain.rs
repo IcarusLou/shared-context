@@ -578,10 +578,9 @@ fn one_real_hook_to_confirm_identity_chain() {
         episode_before.episode.status,
         WorkEpisodeStatus::Closed { .. }
     ));
-    assert!(
-        episode_before.checkpoints[0].claims[0]
-            .artifact_refs
-            .is_empty()
+    assert_eq!(
+        serde_json::to_value(&episode_before.checkpoints[0].claims[0]).unwrap()["artifact_refs"],
+        json!([]),
     );
 
     let turn_stop_payload = json!({
