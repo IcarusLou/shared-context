@@ -115,3 +115,6 @@ Every required atomic issue has a verified scoped commit, including user-approve
 
 ### R3-1 — accepted shared triage text
 Commit cf4d9c2 reviewed: one complete policy constant feeds list description and queued ACK; exact consumer-body equality/criteria test rerun after commit1passed. Workflow§7 authority assertion added. FullMCP93passed, budget+schema2passed and workflow1passed; requested golden regeneration left inputSchemas byte-identical. Actual public tools/list7977→8172bytes, other16descriptions unchanged; no decision_source/marker/schema edits. D-013 current. No open findings; nextR3-2. Main executes sequentially while subagents unavailable.
+
+### R3-2 — accepted evidence semantics repair
+Commit 7e5bf7b reviewed: five scoped files, internal blocking-unknown flag replaces relation-confidence heuristic at unchanged status precedence; automatic permission guard1 now checks pending/replay, other guards and Draft/NeedsEvidence hard rejection unchanged. Main inspected exact diff and independently reran evidence-status unit1 and actual MCP permission/replay contract1. FullSearch137passed/8ignored and MCP93passed; workspaceclippy/fmt passed. D-014 current, public input schemas frozen. No open findings or human gate. NextR3-3.
