@@ -23,3 +23,10 @@ Authoritative private traces:
 Cursor diagnostics remain separate: real-01 verified only checkpoint/native end and left Builder pending because its prompt stopped there; it is not full-gate evidence. Real-02 completed the product chain but exposed an overly restrictive harness read filter: the real host reads its installed Skill. The final fixture explicitly permits only that private SKILL.md/workflow.md, and real-03 passes with those reads recorded. Metadata discovery is distinguished from business calls. No product Rust behavior was changed to make these tests pass.
 
 Negative verifier checks passed: missing Cursor rejected; failed Cursor rejected even under Python optimization; mismatched build rejected; a failed rerun clears a previous green receipt. Python syntax checks and positive pair verification passed. H-002 production activation remains unapproved and unchanged.
+
+
+## 2026-09-10 — default live entry point also executed
+
+In response to the user's question about actual script execution, the default `real_host_smoke_pair.py` path was run end to end (not `--verify-only`). It sequentially launched real Cursor and Codex, drove the explicitly labeled Codex lifecycle, and completed pair verification with process exit0. [Result](paired-real-host-smoke-full-entry.json); raw output `/private/tmp/sctx-pair-full-entry-20260910-01/`, command log `/private/tmp/sctx-pair-full-entry-20260910-01.log`.
+
+Cursor again made the two expected real MCP calls, completed1novel candidate and natively cleared its lease on SessionEnd. Codex again submitted1accepted checkpoint; Builder and driven close/repeat/end checks passed. Both used the same signed binary and checkpoint schema as the earlier pair. This closes the earlier evidence gap: the default orchestration entry had previously been composed from separately run hosts and tested only with `--verify-only`. Desktop UI and native Cursor stop remain outside the observed coverage. No script or product-code change was needed for this full-entry run.
