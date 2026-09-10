@@ -7,9 +7,10 @@ use std::{
     thread,
 };
 
-use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker_with_policy};
 use sctx_domain::{ExternalSessionLocator, RepositoryId};
 use sctx_git_store::GitStore;
+use sctx_local_state::Policy;
 use sctx_local_state::{
     AuthorizedSessionScope, AuthorizedSessionScopeRead, AuthorizedSessionScopeStore,
     UserConfigStore,
@@ -27,6 +28,9 @@ const CURSOR_FIXTURE: &str = include_str!("../../../fixtures/agents/cursor-3.13.
 struct Oracle {
     schema: String,
     activation_marker_template: String,
+    /// The team `## session` policy half of the template, stated separately so the fixture says
+    /// which bytes are protocol and which are one installation's policy.
+    session_policy: String,
     activation_marker_max_bytes: usize,
     wire: WireOracle,
     enabled_without_active_task: LifecycleOracle,
@@ -504,7 +508,18 @@ fn fixed_oracle_is_hand_written_bounded_and_privacy_safe() {
         oracle.schema,
         "sctx.repository-scoped-activation.acceptance.v1"
     );
-    assert_eq!(oracle.activation_marker_max_bytes, 512);
+    assert_eq!(oracle.activation_marker_max_bytes, 1026);
+    assert_eq!(
+        oracle.session_policy,
+        Policy::compiled_default().session(),
+        "the oracle's policy half must be the shipped default policy's session section"
+    );
+    assert!(
+        oracle
+            .activation_marker_template
+            .contains(&format!("\n\n{}", oracle.session_policy)),
+        "the policy half must sit inside the marker block"
+    );
     let raw = String::from_utf8(ORACLE_BYTES.to_vec()).unwrap();
     for forbidden in [
         "/Users/",
@@ -783,4 +798,16 @@ fn resume_compact_and_concurrent_repeated_starts_keep_the_first_successful_scope
         fixture.read_scope("codex", session),
         AuthorizedSessionScopeRead::Missing
     ));
+}
+
+/// The activation marker exactly as this installation renders it.
+///
+/// Protocol text plus the built-in team `## session` policy, which is what an installation with
+/// no `policy.md` -- every temporary root in this file -- actually delivers.
+fn shared_context_activation_marker(agent: AgentKind, external_session_id: &str) -> String {
+    shared_context_activation_marker_with_policy(
+        agent,
+        external_session_id,
+        Policy::compiled_default().session(),
+    )
 }

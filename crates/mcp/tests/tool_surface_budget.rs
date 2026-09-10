@@ -14,6 +14,7 @@
 
 use std::io::{BufReader, Cursor};
 
+use sctx_local_state::{CHECKPOINT_SECTION_MAX_BYTES, TRIAGE_SECTION_MAX_BYTES};
 use sctx_mcp::{ClientKind, McpServer};
 use serde_json::{Value, json};
 
@@ -35,9 +36,61 @@ const DESCRIPTION_BASELINE_BYTES: usize = 6644;
 /// can be said; the raise is the deliberate decision the discipline exists to force.
 const DESCRIPTION_BUDGET_BYTES: usize = 1664;
 
+/// What this installation's `policy.md` is allowed to add on top of the protocol ceiling.
+///
+/// A separate number because it buys something different. The budget above disciplines *protocol*
+/// wording, which only a release can change; this one bounds *team policy*, which any operator can
+/// edit, and which must therefore be bounded by the code rather than by review.
+///
+/// It is *derived*, not chosen: the two sections that reach a tool description are `checkpoint`
+/// and `triage`, and `sctx_local_state` already refuses either one over its ceiling. Restating
+/// those ceilings here keeps the two ends honest -- any `policy.md` the loader accepts fits this
+/// budget by construction, so a team editing their policy can never fail this test.
+///
+/// The strictest *host* limit we could establish is: none. Investigated 2026-09-10.
+/// `docs/deferred-issues.md` and every adapter crate record nothing about description truncation.
+/// Codex passes MCP descriptions straight through -- `mcp_tool_to_openai_tool` in
+/// `codex-rs/core/src/tools/spec.rs` destructures `description` and forwards it, and every
+/// truncation constant in that workspace (`MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES`, the
+/// 256-line/10 KiB clamp, `output_token_limit`) applies to tool *output*. Cursor documents a
+/// name-length limit (60 characters, server plus tool) and an active-tool cap, but no description
+/// limit; its reported description truncation is forum anecdote, and the ~6,500-character figure
+/// that circulates with it is blog hearsay rather than documentation. Anthropic documents
+/// output-side limits only. So the binding constraint is per description, not in total, and it is
+/// asserted separately by `no_single_description_approaches_the_reported_cursor_ceiling`.
+const POLICY_DESCRIPTION_BUDGET_BYTES: usize =
+    CHECKPOINT_SECTION_MAX_BYTES + TRIAGE_SECTION_MAX_BYTES + 2;
+
+/// Exactly what the *shipped default* policy adds to the surface today.
+///
+/// The budget above is what any team may spend; this is what we spend, and it is frozen so that
+/// editing `crates/local-state/src/default_policy.md` is a decision someone made on purpose rather
+/// than a number that drifted. Update it together with that file.
+const DEFAULT_POLICY_DESCRIPTION_BYTES: usize = 1058;
+
+/// A single description must stay well under the largest figure anyone reports a host truncating
+/// at (~6,500 characters, Cursor, unverified). Half of it is the standing headroom.
+const SINGLE_DESCRIPTION_MAX_BYTES: usize = 4096;
+
 fn tools() -> Vec<Value> {
     let temporary = tempfile::tempdir().unwrap();
-    let mut server = McpServer::new(temporary.path(), ClientKind::Codex).unwrap();
+    tools_at(temporary.path())
+}
+
+/// The surface an installation gets from a `policy.md` that states no section at all, which is the
+/// protocol-only baseline every budget above is measured against.
+fn tools_without_policy() -> Vec<Value> {
+    let temporary = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temporary.path().join("policy.md"),
+        "# team policy\n\nnothing stated here.\n",
+    )
+    .unwrap();
+    tools_at(temporary.path())
+}
+
+fn tools_at(root: &std::path::Path) -> Vec<Value> {
+    let mut server = McpServer::new(root, ClientKind::Codex).unwrap();
     let mut input = Vec::new();
     for value in [
         json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}}),
@@ -97,11 +150,13 @@ fn tool_descriptions_stay_inside_their_budget() {
         .iter()
         .map(|tool| tool["description"].as_str().unwrap().len())
         .sum();
-    let ceiling = DESCRIPTION_BASELINE_BYTES + DESCRIPTION_BUDGET_BYTES;
+    let ceiling =
+        DESCRIPTION_BASELINE_BYTES + DESCRIPTION_BUDGET_BYTES + POLICY_DESCRIPTION_BUDGET_BYTES;
     assert!(
         total <= ceiling,
         "the seventeen tool descriptions total {total} bytes, over the {ceiling}-byte ceiling \
-         ({DESCRIPTION_BASELINE_BYTES} baseline + {DESCRIPTION_BUDGET_BYTES} budget)"
+         ({DESCRIPTION_BASELINE_BYTES} baseline + {DESCRIPTION_BUDGET_BYTES} protocol budget + \
+         {POLICY_DESCRIPTION_BUDGET_BYTES} policy budget)"
     );
     for tool in &tools {
         let description = tool["description"].as_str().unwrap();
@@ -109,6 +164,79 @@ fn tool_descriptions_stay_inside_their_budget() {
             !description.is_empty(),
             "tool {} has no description",
             tool["name"]
+        );
+    }
+}
+
+/// The team policy half of the surface is bounded on its own, so an edit to `policy.md` cannot
+/// quietly spend the protocol budget -- and so that raising one number is never mistaken for
+/// raising the other.
+#[test]
+fn team_policy_text_stays_inside_its_own_budget() {
+    let with_policy: usize = tools()
+        .iter()
+        .map(|tool| tool["description"].as_str().unwrap().len())
+        .sum();
+    let without_policy: usize = tools_without_policy()
+        .iter()
+        .map(|tool| tool["description"].as_str().unwrap().len())
+        .sum();
+    assert!(
+        with_policy >= without_policy,
+        "policy text can only add bytes"
+    );
+    let policy_bytes = with_policy - without_policy;
+    assert!(
+        policy_bytes <= POLICY_DESCRIPTION_BUDGET_BYTES,
+        "policy.md adds {policy_bytes} bytes to the tool surface, over the \
+         {POLICY_DESCRIPTION_BUDGET_BYTES}-byte policy budget"
+    );
+    assert_eq!(
+        policy_bytes, DEFAULT_POLICY_DESCRIPTION_BYTES,
+        "the shipped default policy changed size; update DEFAULT_POLICY_DESCRIPTION_BYTES with it"
+    );
+    assert!(
+        without_policy <= DESCRIPTION_BASELINE_BYTES + DESCRIPTION_BUDGET_BYTES,
+        "the protocol-only surface is {without_policy} bytes, over its own ceiling"
+    );
+}
+
+/// The point of the whole mechanism: one team's `policy.md` reaches the model through the tool
+/// surface, without a release and without touching a business Repository.
+#[test]
+fn an_installations_own_policy_reaches_the_task_checkpoint_and_triage_descriptions() {
+    let temporary = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temporary.path().join("policy.md"),
+        "# team\n\n## checkpoint\nKeep only what a code reviewer could not reconstruct.\n\n         ## triage\nConfirm nothing that names a person.\n",
+    )
+    .unwrap();
+    let tools = tools_at(temporary.path());
+    let description = |name: &str| {
+        tools.iter().find(|tool| tool["name"] == name).unwrap()["description"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let checkpoint = description("task_checkpoint");
+    assert!(checkpoint.contains("Keep only what a code reviewer could not reconstruct."));
+    assert!(
+        !checkpoint.contains("Also worth keeping"),
+        "a stated section replaces the default outright"
+    );
+    assert!(description("candidate_list").contains("Confirm nothing that names a person."));
+}
+
+#[test]
+fn no_single_description_approaches_the_reported_cursor_ceiling() {
+    for tool in &tools() {
+        let description = tool["description"].as_str().unwrap();
+        assert!(
+            description.len() <= SINGLE_DESCRIPTION_MAX_BYTES,
+            "{} is {} bytes, over the {SINGLE_DESCRIPTION_MAX_BYTES}-byte single-description \
+             ceiling",
+            tool["name"],
+            description.len()
         );
     }
 }

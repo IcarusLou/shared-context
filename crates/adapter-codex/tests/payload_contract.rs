@@ -151,7 +151,7 @@ fn verified_and_trusted_codex_prompt_never_repeats_activation_marker() {
     assert_eq!(capability.mode, CapabilityMode::VerifiedHooks);
     assert!(capability.prompt_aware_injection);
     let action =
-        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled);
+        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled, "");
     // A Prompt plans one purely local Signal and nothing else: no marker, no reminder, and
     // nothing the model or the user ever sees for this event.
     assert!(matches!(
@@ -189,8 +189,12 @@ fn codex_boundaries_plan_runtime_finalization_and_encode_its_resolved_notice() {
     ] {
         let event =
             decode_hook_input(&serde_json::to_vec(&fixtures().remove(index)).unwrap()).unwrap();
-        let action =
-            plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled);
+        let action = plan_action_for_activation(
+            &event,
+            &capability,
+            ResolvedActivationDecision::Enabled,
+            "",
+        );
         assert!(matches!(
             action.task_operation,
             Some(TaskRuntimeOperation::FinalizeCheckpointedEpisode { trigger, .. })
@@ -241,7 +245,7 @@ fn codex_session_end_encodes_a_neutral_object_and_never_model_context() {
     let event = decode_hook_input(&serde_json::to_vec(&fixtures().remove(5)).unwrap()).unwrap();
     let capability = capabilities(Some("codex-cli 0.153.4"), true, TrustState::Confirmed);
     let action =
-        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled);
+        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled, "");
     let output = encode_hook_output(
         event.kind(),
         &ResolvedAgentAction {
@@ -350,7 +354,7 @@ fn codex_session_start_accepts_the_post_compaction_source() {
     assert_eq!(event.kind(), CanonicalAgentEventKind::SessionStart);
     let capability = capabilities(Some("codex-cli 0.153.4"), true, TrustState::Confirmed);
     let action =
-        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled);
+        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled, "");
     let output = encode_hook_output(
         event.kind(),
         &ResolvedAgentAction {
@@ -379,8 +383,12 @@ fn codex_session_start_encodes_enabled_marker_as_model_context_and_disabled_as_n
     let event = decode_hook_input(&serde_json::to_vec(&fixtures().remove(0)).unwrap()).unwrap();
     let capability = capabilities(Some("codex-cli 0.147.0"), true, TrustState::Confirmed);
 
-    let disabled =
-        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Disabled);
+    let disabled = plan_action_for_activation(
+        &event,
+        &capability,
+        ResolvedActivationDecision::Disabled,
+        "",
+    );
     assert!(disabled.task_operation.is_none());
     let disabled_output = encode_hook_output(
         event.kind(),
@@ -396,7 +404,7 @@ fn codex_session_start_encodes_enabled_marker_as_model_context_and_disabled_as_n
     );
 
     let action =
-        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled);
+        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled, "");
     assert!(action.task_operation.is_none());
     let enabled_output = encode_hook_output(
         event.kind(),
@@ -605,8 +613,12 @@ fn codex_session_end_accepts_nonempty_live_host_reasons() {
 fn codex_post_tool_policy_keeps_the_current_neutral_bytes() {
     let event = decode_hook_input(&serde_json::to_vec(&fixtures().remove(2)).unwrap()).unwrap();
     let capabilities = capabilities(Some("0.147.0"), true, TrustState::Confirmed);
-    let action =
-        plan_action_for_activation(&event, &capabilities, ResolvedActivationDecision::Enabled);
+    let action = plan_action_for_activation(
+        &event,
+        &capabilities,
+        ResolvedActivationDecision::Enabled,
+        "",
+    );
     assert!(action.additional_context.is_none());
     let resolved = ResolvedAgentAction {
         additional_context: action.additional_context,

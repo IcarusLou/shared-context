@@ -8,12 +8,13 @@ use std::{
 };
 
 use fs2::FileExt;
-use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker_with_policy};
 use sctx_domain::ExternalSessionLocator;
 use sctx_git_store::GitStore;
 use sctx_installer::{
     Agent, Architecture, Host, InstallContext, Installer, SetupOptions, SetupStage, SkillStatus,
 };
+use sctx_local_state::Policy;
 use sctx_local_state::{
     AuthorizedSessionScope, AuthorizedSessionScopeRead, AuthorizedSessionScopeStore,
     UserConfigStore,
@@ -40,6 +41,9 @@ const REVIEW_METADATA_BYTES: &[u8] =
 struct Oracle {
     schema: String,
     activation_marker_template: String,
+    /// The team `## session` policy half of the template, stated separately so the fixture says
+    /// which bytes are protocol and which are one installation's policy.
+    session_policy: String,
     source_assets: SourceAssets,
     token_proxy: TokenProxy,
     enabled_chain: EnabledChain,
@@ -899,6 +903,11 @@ fn fixed_oracle_closes_single_and_multi_repository_disabled_and_token_proxy_cont
     assert_eq!(WORKFLOW_BYTES.len(), oracle.source_assets.workflow);
     assert_eq!(SKILL_METADATA_BYTES.len(), oracle.source_assets.metadata);
     assert_eq!(
+        oracle.session_policy,
+        Policy::compiled_default().session(),
+        "the oracle's policy half must be the shipped default policy's session section"
+    );
+    assert_eq!(
         oracle
             .activation_marker_template
             .replace("{host_session_id}", "")
@@ -1568,6 +1577,11 @@ fn installer_assets_are_exact_atomic_recoverable_and_never_touch_business_reposi
     assert_eq!(SKILL_GATE_BYTES.len(), oracle.source_assets.gate);
     assert_eq!(WORKFLOW_BYTES.len(), oracle.source_assets.workflow);
     assert_eq!(SKILL_METADATA_BYTES.len(), oracle.source_assets.metadata);
+    assert_eq!(
+        oracle.session_policy,
+        Policy::compiled_default().session(),
+        "the oracle's policy half must be the shipped default policy's session section"
+    );
     assert_eq!(REVIEW_GATE_BYTES.len(), oracle.source_assets.review_gate);
     assert_eq!(
         REVIEW_REFERENCE_BYTES.len(),
@@ -1637,4 +1651,16 @@ fn installer_assets_are_exact_atomic_recoverable_and_never_touch_business_reposi
     assert!(!conflict.review_skill_root().exists());
     conflict.installer("1.0.0").uninstall().unwrap();
     assert!(conflict_skill.join("SKILL.md").exists());
+}
+
+/// The activation marker exactly as this installation renders it.
+///
+/// Protocol text plus the built-in team `## session` policy, which is what an installation with
+/// no `policy.md` -- every temporary root in this file -- actually delivers.
+fn shared_context_activation_marker(agent: AgentKind, external_session_id: &str) -> String {
+    shared_context_activation_marker_with_policy(
+        agent,
+        external_session_id,
+        Policy::compiled_default().session(),
+    )
 }

@@ -11,9 +11,10 @@ use std::{
 };
 
 use fs2::FileExt;
-use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker_with_policy};
 use sctx_domain::{ExternalSessionLocator, RepositoryId};
 use sctx_git_store::GitStore;
+use sctx_local_state::Policy;
 use sctx_local_state::{
     AuthorizedSessionScopeDecision, AuthorizedSessionScopeRead, AuthorizedSessionScopeStore,
     MaintenanceLock, UserConfigStore,
@@ -1234,4 +1235,16 @@ fn retired_artifact_reminder_switch_is_inert_and_preserves_legacy_files() {
         assert_eq!(fs::read_dir(reminder_directory).unwrap().count(), 1);
     }
     assert_eq!(post_tool_outputs[0], post_tool_outputs[1]);
+}
+
+/// The activation marker exactly as this installation renders it.
+///
+/// Protocol text plus the built-in team `## session` policy, which is what an installation with
+/// no `policy.md` -- every temporary root in this file -- actually delivers.
+fn shared_context_activation_marker(agent: AgentKind, external_session_id: &str) -> String {
+    shared_context_activation_marker_with_policy(
+        agent,
+        external_session_id,
+        Policy::compiled_default().session(),
+    )
 }

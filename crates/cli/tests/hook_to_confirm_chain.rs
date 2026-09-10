@@ -5,7 +5,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker_with_policy};
 use sctx_domain::{
     Applicability, ContextKind, ContextRevisionDraft, EvidenceSnapshotDraft, EvidenceType,
     ExternalSessionLocator, IntentSnapshot, PublicationAction, PublicationDraft, ReviewDraft,
@@ -13,6 +13,7 @@ use sctx_domain::{
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
+use sctx_local_state::Policy;
 use sctx_task_runtime::TaskRuntime;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -746,4 +747,16 @@ fn one_real_hook_to_confirm_identity_chain() {
             .unwrap()
             .is_some()
     );
+}
+
+/// The activation marker exactly as this installation renders it.
+///
+/// Protocol text plus the built-in team `## session` policy, which is what an installation with
+/// no `policy.md` -- every temporary root in this file -- actually delivers.
+fn shared_context_activation_marker(agent: AgentKind, external_session_id: &str) -> String {
+    shared_context_activation_marker_with_policy(
+        agent,
+        external_session_id,
+        Policy::compiled_default().session(),
+    )
 }

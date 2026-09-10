@@ -5,8 +5,9 @@ use std::{
     process::{Command, Stdio},
 };
 
-use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker_with_policy};
 use sctx_git_store::GitStore;
+use sctx_local_state::Policy;
 use sctx_local_state::UserConfigStore;
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
@@ -245,4 +246,16 @@ fn hook_writes_zero_mechanical_state_and_direct_evidence_builds_candidate() {
     let tools = listed[1]["result"]["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 17);
     assert!(tools.iter().all(|tool| tool["name"] != "task_capture_list"));
+}
+
+/// The activation marker exactly as this installation renders it.
+///
+/// Protocol text plus the built-in team `## session` policy, which is what an installation with
+/// no `policy.md` -- every temporary root in this file -- actually delivers.
+fn shared_context_activation_marker(agent: AgentKind, external_session_id: &str) -> String {
+    shared_context_activation_marker_with_policy(
+        agent,
+        external_session_id,
+        Policy::compiled_default().session(),
+    )
 }

@@ -25,7 +25,7 @@ use sctx_agent_adapter::{
     CanonicalAgentEventKind, EpisodeFinalizationTrigger, FileAccess,
     MAX_SHELL_COMMAND_PATH_CANDIDATES, PathHint, ResolvedActivationDecision, ResolvedAgentAction,
     TaskRuntimeOperation, ToolCategory, ToolOutcome, TrustState, plan_action_for_activation,
-    shared_context_activation_marker,
+    shared_context_activation_marker_with_policy,
 };
 use sctx_domain::{
     Applicability, CandidateReviewStatus, ConflictParticipant, ConflictResolutionDraft,
@@ -44,8 +44,9 @@ use sctx_index::{
 use sctx_installer::maintain::MaintainOptions;
 use sctx_local_state::{
     AuthorizedSessionScope, AuthorizedSessionScopeRead, AuthorizedSessionScopeStore,
-    CatalogCheckoutStatus, MaintenanceLock, MaintenanceSettings, PrivacyScanner,
-    RepositoryCatalogDiagnostic, RepositoryCatalogSnapshot, UserConfigStore,
+    CatalogCheckoutStatus, MaintenanceLock, MaintenanceSettings, Policy, PrivacyScanner,
+    RepositoryCatalogDiagnostic, RepositoryCatalogSnapshot, ResolvedPolicy, UserConfigStore,
+    installation_policy,
 };
 use sctx_mcp::{
     ArtifactFocusQuery, AssociationExplainInput, AssociationRebuildInput, CandidateAnalyzeInput,
@@ -82,6 +83,7 @@ Commands:
   uninstall [--root PATH]
   data reset [--dry-run] [--yes]
   maintain run [--opportunistic] | maintain status
+  policy show|reset
   knowledge sync|delete
   logs init|collect|sync|status|prune|doctor|enable|disable|report|trace
   embedding install|status|remove
@@ -223,6 +225,8 @@ fn cli_operation(args: &[String]) -> Option<&'static str> {
         ("data", Some("reset")) => Some("data.reset"),
         ("maintain", Some("run")) => Some("maintain.run"),
         ("maintain", Some("status")) => Some("maintain.status"),
+        ("policy", Some("show")) => Some("policy.show"),
+        ("policy", Some("reset")) => Some("policy.reset"),
         ("knowledge", Some("sync")) => Some("knowledge.sync"),
         ("knowledge", Some("delete")) => Some("knowledge.delete"),
         ("embedding", Some("install")) => Some("embedding.install"),
@@ -335,6 +339,7 @@ fn run_without_maintenance(args: &[String], json_output: bool) -> Result<()> {
         [command, rest @ ..] if command == "uninstall" => run_uninstall(rest, json_output),
         [group, rest @ ..] if group == "data" => run_data(rest, json_output),
         [group, rest @ ..] if group == "maintain" => run_maintain(rest, json_output),
+        [group, rest @ ..] if group == "policy" => run_policy(rest, json_output),
         [group, rest @ ..] if group == "knowledge" => run_knowledge(rest, json_output),
         [group, rest @ ..] if group == "embedding" => run_embedding(rest, json_output),
         [group, rest @ ..] if group == "logs" => logs::run(rest, json_output),
@@ -683,6 +688,124 @@ fn run_maintain(args: &[String], json_output: bool) -> Result<()> {
         }
         _ => Err(invalid(MAINTAIN_HELP)),
     }
+}
+
+const POLICY_HELP: &str = r"Usage:
+  sctx policy show [--root PATH]
+  sctx policy reset [--root PATH]
+
+Team policy is Markdown in <root>/policy.md, delivered to the model at run time:
+`## session` inside the SessionStart activation marker, `## checkpoint` in the
+task_checkpoint tool description, `## stop` on a boundary checkpoint reminder, and
+`## triage` in the Candidate disposition text. Every section is optional and any
+other heading or prose is ignored. `[policy] path` in config.toml points somewhere
+else. An absent, unreadable, or oversize file never breaks a Session: the built-in
+default is delivered instead, and `sctx doctor` reports which.
+
+`show` prints the effective policy and the file it came from. `reset` rewrites the
+built-in default, first moving any existing file aside with a timestamp suffix.
+";
+
+fn run_policy(args: &[String], json_output: bool) -> Result<()> {
+    if is_help(args) {
+        print!("{POLICY_HELP}");
+        return Ok(());
+    }
+    let [command, rest @ ..] = args else {
+        return Err(invalid(POLICY_HELP));
+    };
+    let options = Options::parse(rest, &[])?;
+    options.allow_only(&["--root"], &[])?;
+    let root = options
+        .optional("--root")?
+        .map_or_else(installation_root, |value| Ok(PathBuf::from(value)))?;
+    match command.as_str() {
+        "show" => {
+            let resolved = installation_policy(&root);
+            if json_output {
+                return emit_lifecycle(&policy_json(&resolved), true);
+            }
+            print_policy(&resolved);
+            Ok(())
+        }
+        "reset" => {
+            let outcome = reset_policy_file(&root)?;
+            if json_output {
+                return emit_lifecycle(&outcome, true);
+            }
+            if let Some(backup) = &outcome.backup_path {
+                println!("moved aside: {}", backup.display());
+            }
+            println!("wrote default policy: {}", outcome.path.display());
+            Ok(())
+        }
+        _ => Err(invalid(POLICY_HELP)),
+    }
+}
+
+fn policy_json(resolved: &ResolvedPolicy) -> Value {
+    json!({
+        "path": resolved.path,
+        "status": resolved.status.reason(),
+        "summary": resolved.summary(),
+        "oversize_sections": resolved.oversize_sections,
+        "sections": {
+            "session": resolved.policy.session(),
+            "checkpoint": resolved.policy.checkpoint(),
+            "stop": resolved.policy.stop(),
+            "triage": resolved.policy.triage(),
+        }
+    })
+}
+
+fn print_policy(resolved: &ResolvedPolicy) {
+    println!("path: {}", resolved.path.display());
+    println!("status: {}", resolved.summary());
+    for (name, text) in [
+        ("session", resolved.policy.session()),
+        ("checkpoint", resolved.policy.checkpoint()),
+        ("stop", resolved.policy.stop()),
+        ("triage", resolved.policy.triage()),
+    ] {
+        println!();
+        println!("## {name}");
+        if text.is_empty() {
+            println!("(not stated)");
+        } else {
+            println!("{text}");
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PolicyResetOutcome {
+    path: PathBuf,
+    backup_path: Option<PathBuf>,
+}
+
+/// Rewrites `policy.md` with the built-in default, keeping whatever was there.
+///
+/// The existing file is moved aside under a timestamp suffix rather than overwritten, because it
+/// is a document a person wrote and this command's whole purpose is to be reachable when that
+/// document is broken. `create_new` on the backup name means a second reset in the same second
+/// fails loudly instead of destroying the first backup.
+fn reset_policy_file(root: &Path) -> Result<PolicyResetOutcome> {
+    let path = root.join(sctx_local_state::POLICY_FILE_NAME);
+    let backup_path = if path.exists() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| invalid(format!("read system clock: {error}")))?
+            .as_secs();
+        let backup = root.join(format!("policy.md.{stamp}.bak"));
+        fs::rename(&path, &backup)
+            .map_err(|error| Error::new(ErrorKind::Io, format!("move policy.md aside: {error}")))?;
+        Some(backup)
+    } else {
+        None
+    };
+    fs::write(&path, sctx_local_state::DEFAULT_POLICY_MARKDOWN)
+        .map_err(|error| Error::new(ErrorKind::Io, format!("write policy.md: {error}")))?;
+    Ok(PolicyResetOutcome { path, backup_path })
 }
 
 fn print_maintain_status(status: &sctx_installer::maintain::MaintainStatus) {
@@ -1606,8 +1729,12 @@ fn run_hook(args: &[String]) -> Result<()> {
     };
     let activation = authorization.activation;
     let activated = activation == ResolvedActivationDecision::Enabled;
-    let action = plan_hook_action(&event, &capabilities, &authorization, &recorder);
-    let resolved = resolve_hook_action(action, &recorder);
+    // Resolved once per Hook, before planning, because two different channels want it: the
+    // activation marker carries `## session` and the boundary reminder carries `## stop`.
+    // Resolution never fails; a degraded one is a telemetry row, never a refused activation.
+    let policy = hook_policy(activated, &recorder);
+    let action = plan_hook_action(&event, &capabilities, &authorization, &policy, &recorder);
+    let resolved = resolve_hook_action(action, &policy, &recorder);
     if maintenance.is_some() && event.kind() == CanonicalAgentEventKind::SessionEnd {
         remove_hook_session_scope(agent, &event.context().session_id, &recorder);
     }
@@ -1711,10 +1838,11 @@ fn plan_hook_action(
     event: &CanonicalAgentEvent,
     capabilities: &AgentCapabilities,
     authorization: &HookAuthorization,
+    policy: &Policy,
     recorder: &HookEventRecorder,
 ) -> CanonicalAgentAction {
     let activation = authorization.activation;
-    let action = plan_action_for_activation(event, capabilities, activation);
+    let action = plan_action_for_activation(event, capabilities, activation, policy.session());
     // Only an event that actually planned a Signal merge has anything to attribute. Shared
     // Context's own MCP tool calls plan nothing on purpose, and running attribution over them
     // reported the by-design path as `attribution_failed` on every single call.
@@ -1744,7 +1872,32 @@ fn plan_hook_action(
     } else {
         action
     };
-    add_self_healed_activation_marker(event, action, capabilities, authorization)
+    add_self_healed_activation_marker(event, action, capabilities, authorization, policy)
+}
+
+/// Resolves this installation's runtime team policy for one Hook, reporting a degraded file.
+///
+/// Fail-open is the whole contract: an absent, unreadable, or oversize `policy.md` yields the
+/// compiled-in default, so a typo in a Markdown file can never cost a Session its activation. It
+/// is not silent, though. The degraded status rides in the existing closed `hook_decision` reason
+/// field -- the telemetry schema is `deny_unknown_fields` with no attribute map, so no field was
+/// added for this -- and `sctx doctor` says the same thing where an operator will actually read it.
+fn hook_policy(activated: bool, recorder: &HookEventRecorder) -> Policy {
+    if !activated {
+        return Policy::compiled_default();
+    }
+    let Ok(root) = installation_root() else {
+        return Policy::compiled_default();
+    };
+    let resolved = installation_policy(&root);
+    if resolved.status.is_degraded() {
+        recorder.flush(
+            HookEventDecision::FailOpen,
+            resolved.status.reason(),
+            Some(truncate_hook_detail(&resolved.oversize_sections.join(","))),
+        );
+    }
+    resolved.policy
 }
 
 #[derive(Debug)]
@@ -1792,13 +1945,15 @@ fn add_self_healed_activation_marker(
     mut action: CanonicalAgentAction,
     capabilities: &AgentCapabilities,
     authorization: &HookAuthorization,
+    policy: &Policy,
 ) -> CanonicalAgentAction {
     if !authorization.deliver_activation_marker || action.additional_context.is_some() {
         return action;
     }
-    action.additional_context = Some(shared_context_activation_marker(
+    action.additional_context = Some(shared_context_activation_marker_with_policy(
         capabilities.agent,
         &event.context().session_id,
+        policy.session(),
     ));
     action
 }
@@ -2270,6 +2425,7 @@ fn agent_capabilities(
 
 fn resolve_hook_action(
     action: CanonicalAgentAction,
+    policy: &Policy,
     recorder: &HookEventRecorder,
 ) -> ResolvedAgentAction {
     let CanonicalAgentAction {
@@ -2278,7 +2434,7 @@ fn resolve_hook_action(
         system_message,
     } = action;
     let task_resolution = match task_operation
-        .map(|operation| resolve_task_operation(operation, recorder))
+        .map(|operation| resolve_task_operation(operation, policy, recorder))
         .transpose()
     {
         Ok(resolution) => resolution.unwrap_or_default(),
@@ -2312,6 +2468,7 @@ struct ResolvedTaskOperation {
 
 fn resolve_task_operation(
     operation: TaskRuntimeOperation,
+    policy: &Policy,
     recorder: &HookEventRecorder,
 ) -> Result<ResolvedTaskOperation> {
     match operation {
@@ -2389,7 +2546,7 @@ fn resolve_task_operation(
             Ok(ResolvedTaskOperation::default())
         }
         TaskRuntimeOperation::FinalizeCheckpointedEpisode { locator, trigger } => {
-            finalize_checkpointed_episode(&locator, trigger)
+            finalize_checkpointed_episode(&locator, trigger, policy)
         }
         TaskRuntimeOperation::CleanupSessionState { locator } => {
             let root = installation_root()?;
@@ -2406,6 +2563,7 @@ fn resolve_task_operation(
 fn finalize_checkpointed_episode(
     locator: &ExternalSessionLocator,
     trigger: EpisodeFinalizationTrigger,
+    policy: &Policy,
 ) -> Result<ResolvedTaskOperation> {
     let root = installation_root()?;
     let runtime = TaskRuntime::initialize_for_hook(&root)?;
@@ -2428,6 +2586,7 @@ fn finalize_checkpointed_episode(
             &runtime,
             locator,
             trigger,
+            policy,
             format!(
                 "Shared Context {trigger_name}: no Work Episode is open for Task {task_id}. Use $shared-context and call task_checkpoint with complete direct Claims/Unknowns; the server resolves the current Task, Intent, and lifecycle. Hook text is not Claim evidence."
             ),
@@ -2436,6 +2595,7 @@ fn finalize_checkpointed_episode(
             &runtime,
             locator,
             trigger,
+            policy,
             format!(
                 "Shared Context {trigger_name}: current work has no Checkpoint. Before compaction or completion, call task_checkpoint with complete direct Claims/Unknowns; the server resolves the current Task, Intent, and lifecycle. Hook text is not Claim evidence."
             ),
@@ -2540,8 +2700,18 @@ fn checkpoint_reminder_text(
     runtime: &TaskRuntime,
     locator: &ExternalSessionLocator,
     trigger: EpisodeFinalizationTrigger,
+    policy: &Policy,
     nag: String,
 ) -> String {
+    // The team's `## stop` line rides only on a reminder that is actually asking for a Checkpoint.
+    // The throttled variant below deliberately drops it along with the directive it qualifies:
+    // restating the standard a Checkpoint has to meet, on a turn where we have already stopped
+    // asking for one, is the same urging the throttle exists to stop.
+    let nag = if policy.stop().trim().is_empty() {
+        nag
+    } else {
+        format!("{nag} {}", Policy::inline(policy.stop()).trim())
+    };
     if trigger != EpisodeFinalizationTrigger::TurnStop {
         return nag;
     }

@@ -68,7 +68,7 @@ fn cursor_prompt_hook_never_repeats_activation_marker() {
     assert!(capability.prompt_submit);
     assert!(!capability.prompt_aware_injection);
     let action =
-        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled);
+        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled, "");
     // A Prompt plans one purely local Signal and nothing else: no marker, no reminder, and
     // nothing the model or the user ever sees for this event.
     assert!(matches!(
@@ -106,8 +106,12 @@ fn cursor_boundaries_plan_runtime_finalization_and_encode_its_resolved_notice() 
     ] {
         let (event, _) =
             decode_hook_input(&serde_json::to_vec(&fixtures().remove(index)).unwrap()).unwrap();
-        let action =
-            plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled);
+        let action = plan_action_for_activation(
+            &event,
+            &capability,
+            ResolvedActivationDecision::Enabled,
+            "",
+        );
         assert!(matches!(
             action.task_operation,
             Some(TaskRuntimeOperation::FinalizeCheckpointedEpisode { trigger, .. })
@@ -150,8 +154,12 @@ fn cursor_session_start_encodes_disabled_as_neutral_and_both_enabled_scopes_iden
         decode_hook_input(&serde_json::to_vec(&fixtures().remove(0)).unwrap()).unwrap();
     let capability = capabilities(Some("3.13.10"), true);
 
-    let disabled =
-        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Disabled);
+    let disabled = plan_action_for_activation(
+        &event,
+        &capability,
+        ResolvedActivationDecision::Disabled,
+        "",
+    );
     assert!(disabled.task_operation.is_none());
     let disabled_output = encode_hook_output(
         event.kind(),
@@ -167,7 +175,7 @@ fn cursor_session_start_encodes_disabled_as_neutral_and_both_enabled_scopes_iden
     );
 
     let action =
-        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled);
+        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled, "");
     assert!(action.task_operation.is_none());
     let enabled_output = encode_hook_output(
         event.kind(),
@@ -274,8 +282,12 @@ fn cursor_post_tool_policy_keeps_the_current_neutral_bytes() {
         serde_json::json!({"file_path": "/workspace/shared context/src/lib.rs"});
     let (event, _) = decode_hook_input(&serde_json::to_vec(&payload).unwrap()).unwrap();
     let capabilities = capabilities(Some("3.13.10"), true);
-    let action =
-        plan_action_for_activation(&event, &capabilities, ResolvedActivationDecision::Enabled);
+    let action = plan_action_for_activation(
+        &event,
+        &capabilities,
+        ResolvedActivationDecision::Enabled,
+        "",
+    );
     assert!(action.additional_context.is_none());
     let resolved = ResolvedAgentAction {
         additional_context: action.additional_context,

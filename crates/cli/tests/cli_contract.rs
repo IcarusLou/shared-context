@@ -9,7 +9,7 @@ use std::{
     thread,
 };
 
-use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker_with_policy};
 use sctx_domain::{
     Applicability, CandidateReviewStatus, ContextKind, ContextRevisionDraft, Error, ErrorKind,
     EventId, EvidenceSnapshotDraft, ExternalSessionLocator, IntentSnapshot, PublicationAction,
@@ -22,6 +22,7 @@ use sctx_git_store::{
     AppendRequest, CandidateSubmissionRequest, CrashInjector, CrashSeam, GitStore,
 };
 use sctx_index::ProjectionIndex;
+use sctx_local_state::Policy;
 use sctx_local_state::{MaintenanceLock, UserConfigStore};
 use sctx_mcp::{
     CandidateListInput, ExpectedRevisionId, TaskBoundary, TaskCheckpointClaimInput,
@@ -3770,4 +3771,16 @@ fn recall_stats_reads_existing_runtime_without_index_or_sidecar_writes() {
     assert_eq!(fs::read(runtime.database_path()).unwrap(), before);
     assert_eq!(fs::read_dir(root.join("state")).unwrap().count(), 1);
     assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+}
+
+/// The activation marker exactly as this installation renders it.
+///
+/// Protocol text plus the built-in team `## session` policy, which is what an installation with
+/// no `policy.md` -- every temporary root in this file -- actually delivers.
+fn shared_context_activation_marker(agent: AgentKind, external_session_id: &str) -> String {
+    shared_context_activation_marker_with_policy(
+        agent,
+        external_session_id,
+        Policy::compiled_default().session(),
+    )
 }

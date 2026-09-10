@@ -5,8 +5,9 @@ use std::{
     process::{Command, Stdio},
 };
 
-use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker_with_policy};
 use sctx_git_store::GitStore;
+use sctx_local_state::Policy;
 use serde_json::{Value, json};
 
 const CODEX_FIXTURE: &str = include_str!("../../../fixtures/agents/codex-0.147.json");
@@ -481,4 +482,16 @@ fn public_m2_retrieval_quality_workflow() {
             .all(|item| item["context"]["context_id"] != second_confirmed["context_id"]),
         "the unreferenced sibling Context must stay out of the Focus payload: {focused:#}"
     );
+}
+
+/// The activation marker exactly as this installation renders it.
+///
+/// Protocol text plus the built-in team `## session` policy, which is what an installation with
+/// no `policy.md` -- every temporary root in this file -- actually delivers.
+fn shared_context_activation_marker(agent: AgentKind, external_session_id: &str) -> String {
+    shared_context_activation_marker_with_policy(
+        agent,
+        external_session_id,
+        Policy::compiled_default().session(),
+    )
 }

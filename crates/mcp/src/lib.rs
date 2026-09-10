@@ -59,7 +59,8 @@ use sctx_git_store::{
 use sctx_index::{DomainSnapshot, ProjectionIndex};
 use sctx_local_state::{
     AuthorizedSessionScope, AuthorizedSessionScopeRead, AuthorizedSessionScopeStore,
-    MaintenanceLock, PrivacyScanner, RepositoryCatalogSnapshot, UserConfigStore,
+    MaintenanceLock, Policy, PrivacyScanner, RepositoryCatalogSnapshot, UserConfigStore,
+    installation_policy,
 };
 use sctx_search::{
     AutomaticQueryTokenExplanation, CandidateAnalysisRequest, CompactSpaceAssociation,
@@ -6255,6 +6256,13 @@ pub struct McpServer {
     /// 9--12 second model load per call would be absurd. `None` is the ordinary state: no
     /// `[retrieval]` table, no channel, no cost.
     semantic: Option<SemanticChannelHandle>,
+    /// This installation's runtime team policy, resolved once per process.
+    ///
+    /// The tool surface is rendered on every `tools/list` and the ACK notice on every accepted
+    /// Checkpoint, so re-reading `policy.md` per call would put a file read on both. Resolution
+    /// never fails: an absent, unreadable, or oversize file yields the compiled-in default, and
+    /// `sctx doctor` is where the operator learns which of those happened.
+    policy: Policy,
 }
 
 #[derive(Clone, Debug)]
@@ -6275,6 +6283,7 @@ impl McpServer {
         let root = std::path::absolute(root.as_ref()).map_err(|error| {
             Error::new(ErrorKind::Io, format!("make MCP root absolute: {error}"))
         })?;
+        let policy = installation_policy(&root).policy;
         Ok(Self {
             root,
             // Programmatic/in-process servers are common in tests and demos. Only the real stdio
@@ -6285,6 +6294,7 @@ impl McpServer {
             initialized: false,
             authorization_linearization_hook: None,
             semantic: None,
+            policy,
         })
     }
 
@@ -6466,7 +6476,7 @@ impl McpServer {
         let result = match method {
             "initialize" => self.initialize(&params),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(tools_list()),
+            "tools/list" => Ok(tools_list(&self.policy)),
             "tools/call" => self.tools_call(params),
             _ => {
                 emit_mcp_protocol_failure(
@@ -6544,7 +6554,9 @@ impl McpServer {
         // envelope. `isError: true` failures must count as failures, not successful Rust Results.
         telemetry.finish(&result);
         match result {
-            Ok(data) if is_checkpoint => tool_success_with_notice(data, task_checkpoint_ack_notice),
+            Ok(data) if is_checkpoint => tool_success_with_notice(data, |data| {
+                task_checkpoint_ack_notice(&self.policy, data)
+            }),
             Ok(data) => tool_success(data),
             Err(failure) => tool_failure(failure),
         }
@@ -7948,8 +7960,15 @@ fn identity_target_unavailable(name: &str) -> ToolFailure {
     }
 }
 
+/// The protocol half of the `task_checkpoint` description: what the tool does, what the server
+/// guarantees, and what happens next. Byte-for-byte what shipped before team policy existed, so
+/// an installation whose `policy.md` has no `## checkpoint` section receives exactly today's text.
+const TASK_CHECKPOINT_PROTOCOL: &str = "Finalize one content-addressed Agent Checkpoint for the current ActiveTask and Intent. Submit focused Claims with self-contained Evidence summaries; the server durably queues untrusted Candidate drafts for bounded recovery by Candidate review reads. Empty Claims and Unknowns are a successful no-op. Checkpoint only what is worth keeping: decisions and their reasons, contracts, verified conclusions, counter-intuitive findings, and summaries of a newly understood mechanism. Process-level understanding of code you just read is not a Claim. Once the ACK reports a queued Candidate Build, call candidate_list next and dispose every Pending Review under its triage policy.";
+
 #[allow(clippy::too_many_lines)]
-fn tools_list() -> Value {
+fn tools_list(policy: &Policy) -> Value {
+    let checkpoint_description = join_policy(TASK_CHECKPOINT_PROTOCOL, policy.checkpoint());
+    let triage = candidate_triage_text(policy);
     json!({"tools": [
         tool_schema(
             "task_intent_update",
@@ -7968,7 +7987,7 @@ fn tools_list() -> Value {
         ),
         tool_schema(
             "task_checkpoint",
-            "Finalize one content-addressed Agent Checkpoint for the current ActiveTask and Intent. Submit focused Claims with self-contained Evidence summaries; the server durably queues untrusted Candidate drafts for bounded recovery by Candidate review reads. Empty Claims and Unknowns are a successful no-op. Checkpoint only what is worth keeping: decisions and their reasons, contracts, verified conclusions, counter-intuitive findings, and summaries of a newly understood mechanism. Process-level understanding of code you just read is not a Claim. Once the ACK reports a queued Candidate Build, call candidate_list next and dispose every Pending Review under its triage policy.",
+            &checkpoint_description,
             task_checkpoint_schema()
         ),
         tool_schema(
@@ -8048,7 +8067,7 @@ fn tools_list() -> Value {
         ),
         tool_schema(
             "candidate_list",
-            &format!("List untrusted Reviews for the exact ActiveTask; status=pending and detail_level=compact are defaults. Use full or candidate_get for drafts. Candidates come only from task_checkpoint; before its ACK an empty list is normal. {CANDIDATE_TRIAGE_POLICY}"),
+            &format!("List untrusted Reviews for the exact ActiveTask; status=pending and detail_level=compact are defaults. Use full or candidate_get for drafts. Candidates come only from task_checkpoint; before its ACK an empty list is normal. {triage}"),
             candidate_list_schema()
         ),
         tool_schema(
@@ -8932,7 +8951,37 @@ fn tool_success_with_notice(
     }))
 }
 
-const CANDIDATE_TRIAGE_POLICY: &str = "Triage each Pending Review by top_assessment.relation. Discard with candidate_discard, decision_source agent_policy, and a reason naming the ground: an exact_duplicate of a still-accepted Context adding no applicability condition or Evidence, or process-level code reading that is not a progress summary. Confirm with candidate_confirm, decision_source agent_policy, and no edits: ready_for_review novel or supports rows carrying a genuine decision, contract, verified conclusion, counter-intuitive finding, newly understood mechanism, a user correction to your proposal that later proved right, or a progress summary of paths changed, verified state and remaining work. On auto_confirm_not_permitted, escalate; do not change fields and retry. Escalate everything else: potential_contradiction, revises, duplicates needing a supersede decision, Space governance, incomplete analysis, and uncertainty. Present only these to the user in a compact table (topic, statement, relation) with your recommendation; do not wait to be asked.";
+/// The Candidate disposition *mechanics*: which tool decides each tier, which `decision_source`
+/// it carries, and what must be escalated instead. This is protocol -- the server enforces every
+/// sentence of it (see [`require_auto_confirm_permitted`]) -- so it ships in the binary and is
+/// identical for every installation.
+///
+/// What it deliberately no longer states is *which drafts deserve which tier*. That is one team's
+/// judgement about its own knowledge base, it changes without a release, and it now arrives from
+/// `policy.md`'s `## triage` section through [`candidate_triage_text`].
+const CANDIDATE_TRIAGE_PROTOCOL: &str = "Triage each Pending Review by top_assessment.relation. Discard with candidate_discard, decision_source agent_policy, and a reason naming the ground. Confirm with candidate_confirm, decision_source agent_policy, and no edits, and only a ready_for_review novel or supports row. On auto_confirm_not_permitted, escalate; do not change fields and retry. Escalate everything else: potential_contradiction, revises, duplicates needing a supersede decision, Space governance, incomplete analysis, and uncertainty. Present only these to the user in a compact table (topic, statement, relation) with your recommendation; do not wait to be asked.";
+
+/// The complete triage text one installation delivers: protocol, then its team's grounds.
+///
+/// Both channels that state the triage -- the `candidate_list` description and the
+/// `task_checkpoint` ACK notice -- render this one function, which is what
+/// `candidate_description_and_ack_share_all_three_triage_tiers` holds them to. A model that reads
+/// only the ACK (a real Cursor session never opened `workflow.md` at all) and a model that reads
+/// only the tool surface must be told the same thing.
+fn candidate_triage_text(policy: &Policy) -> String {
+    join_policy(CANDIDATE_TRIAGE_PROTOCOL, policy.triage())
+}
+
+/// Appends one policy section to a protocol sentence, on one line, with no trailing separator
+/// when the section is absent.
+fn join_policy(protocol: &str, section: &str) -> String {
+    let section = Policy::inline(section);
+    let section = section.trim();
+    if section.is_empty() {
+        return protocol.to_owned();
+    }
+    format!("{protocol} {section}")
+}
 
 /// Post-Checkpoint guidance appended to the ACK text whenever the Checkpoint was accepted (and
 /// therefore always queued a Candidate Build; ADR-0003).
@@ -8946,10 +8995,11 @@ const CANDIDATE_TRIAGE_POLICY: &str = "Triage each Pending Review by top_assessm
 /// reading `workflow.md` at all. The two automatic tiers are stated as the server enforces
 /// them, so a model following the notice literally is inside the permission surface
 /// [`require_auto_confirm_permitted`] checks rather than discovering it through a refusal.
-fn task_checkpoint_ack_notice(data: &Value) -> Option<String> {
+fn task_checkpoint_ack_notice(policy: &Policy, data: &Value) -> Option<String> {
     data.get("candidate_build")?;
+    let triage = candidate_triage_text(policy);
     Some(format!(
-        "This Checkpoint was accepted and queued a Candidate Build. Call candidate_list next. {CANDIDATE_TRIAGE_POLICY}"
+        "This Checkpoint was accepted and queued a Candidate Build. Call candidate_list next. {triage}"
     ))
 }
 
@@ -9454,18 +9504,23 @@ where
 mod tests {
     use super::*;
 
-    #[test]
-    fn candidate_description_and_ack_share_all_three_triage_tiers() {
-        let surface = tools_list();
-        let description = surface["tools"]
+    fn description_of(policy: &Policy, name: &str) -> String {
+        tools_list(policy)["tools"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|tool| tool["name"] == "candidate_list")
+            .find(|tool| tool["name"] == name)
             .unwrap()["description"]
             .as_str()
-            .unwrap();
-        let notice = task_checkpoint_ack_notice(&json!({"candidate_build": {}})).unwrap();
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn candidate_description_and_ack_share_all_three_triage_tiers() {
+        let policy = Policy::compiled_default();
+        let description = description_of(&policy, "candidate_list");
+        let notice = task_checkpoint_ack_notice(&policy, &json!({"candidate_build": {}})).unwrap();
         let description_policy = description
             .split_once("Triage each Pending Review")
             .unwrap()
@@ -9477,7 +9532,7 @@ mod tests {
         assert_eq!(description_policy, notice_policy);
         assert_eq!(
             format!("Triage each Pending Review{notice_policy}"),
-            CANDIDATE_TRIAGE_POLICY
+            candidate_triage_text(&policy)
         );
         for criterion in [
             "counter-intuitive finding",
@@ -9492,7 +9547,42 @@ mod tests {
                 "missing {criterion}"
             );
         }
-        assert!(task_checkpoint_ack_notice(&json!({"status": "no_op"})).is_none());
+        assert!(task_checkpoint_ack_notice(&policy, &json!({"status": "no_op"})).is_none());
+    }
+
+    /// The tier *mechanics* are protocol and must survive a `policy.md` that deletes `## triage`
+    /// entirely; only the team's grounds go away with it.
+    #[test]
+    fn an_empty_triage_section_still_delivers_every_protocol_tier() {
+        let empty = Policy::default();
+        let text = candidate_triage_text(&empty);
+        assert_eq!(text, CANDIDATE_TRIAGE_PROTOCOL);
+        for tier in [
+            "candidate_discard",
+            "candidate_confirm",
+            "decision_source agent_policy",
+            "auto_confirm_not_permitted",
+            "potential_contradiction",
+        ] {
+            assert!(text.contains(tier), "missing {tier}");
+        }
+        assert!(description_of(&empty, "candidate_list").contains(CANDIDATE_TRIAGE_PROTOCOL));
+    }
+
+    /// The regression guard for the split: with no `## checkpoint` section the tool description is
+    /// exactly the text that shipped before runtime policy existed, byte for byte.
+    #[test]
+    fn an_empty_checkpoint_section_reproduces_the_shipped_description() {
+        let empty = description_of(&Policy::default(), "task_checkpoint");
+        assert!(empty.starts_with(TASK_CHECKPOINT_PROTOCOL));
+        let default = description_of(&Policy::compiled_default(), "task_checkpoint");
+        assert_eq!(
+            default.len(),
+            empty.len() + 1 + Policy::compiled_default().checkpoint().len(),
+            "the default description is the protocol plus one space plus the policy section"
+        );
+        assert!(default.starts_with(TASK_CHECKPOINT_PROTOCOL));
+        assert!(default.contains(&Policy::inline(Policy::compiled_default().checkpoint())));
     }
 
     #[test]

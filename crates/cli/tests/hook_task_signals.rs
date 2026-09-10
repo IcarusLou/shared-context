@@ -16,12 +16,13 @@ use std::{
     str::FromStr,
 };
 
-use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker_with_policy};
 use sctx_domain::{
     ExternalSessionLocator, RepositoryId, TaskId, TaskSignalKind, TaskSignalLifecycle,
     WorkingIntentSnapshot,
 };
 use sctx_git_store::GitStore;
+use sctx_local_state::Policy;
 use sctx_local_state::{AuthorizedSessionScopeRead, AuthorizedSessionScopeStore, UserConfigStore};
 use sctx_task_runtime::TaskRuntime;
 use serde_json::{Value, json};
@@ -1102,4 +1103,16 @@ fn a_disabled_self_heal_delivers_no_marker_and_writes_nothing() {
             .recent_events
             .is_empty()
     );
+}
+
+/// The activation marker exactly as this installation renders it.
+///
+/// Protocol text plus the built-in team `## session` policy, which is what an installation with
+/// no `policy.md` -- every temporary root in this file -- actually delivers.
+fn shared_context_activation_marker(agent: AgentKind, external_session_id: &str) -> String {
+    shared_context_activation_marker_with_policy(
+        agent,
+        external_session_id,
+        Policy::compiled_default().session(),
+    )
 }

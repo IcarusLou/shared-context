@@ -41,6 +41,10 @@ struct ConfigDocument {
     engineering: Option<EngineeringConfigDocument>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     retrieval: Option<RetrievalConfigDocument>,
+    /// Optional `[policy]` table pointing at the team policy document. Absent means
+    /// `<root>/policy.md`, which is what `sctx setup` writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    policy: Option<PolicyConfigDocument>,
     /// Optional periodic maintenance schedule. Absent means the defaults below, which install the
     /// daily `LaunchAgent` and let a Session that has not seen maintenance for a day start one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -408,11 +412,11 @@ impl RetrievalSettings {
             return Ok(Self::default());
         };
         Ok(Self {
-            embedding_model_path: retrieval_path(
+            embedding_model_path: configured_absolute_path(
                 document.embedding_model_path.as_deref(),
                 "retrieval.embedding_model_path",
             )?,
-            embedding_runtime_path: retrieval_path(
+            embedding_runtime_path: configured_absolute_path(
                 document.embedding_runtime_path.as_deref(),
                 "retrieval.embedding_runtime_path",
             )?,
@@ -430,6 +434,35 @@ impl RetrievalSettings {
             Some(milliseconds) => Some(std::time::Duration::from_millis(milliseconds)),
             None => None,
         }
+    }
+}
+
+/// Optional `[policy]` table: where this installation keeps its runtime team policy.
+///
+/// One key on purpose. The policy's *content* belongs in Markdown a person edits, not in TOML a
+/// person escapes; the only thing `config.toml` decides is which file that is, so that a team can
+/// point every workstation at one checked-out document instead of copying it around.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyConfigDocument {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+}
+
+/// Where the runtime team policy is read from. `None` means `<root>/policy.md`.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct PolicySettings {
+    pub path: Option<PathBuf>,
+}
+
+impl PolicySettings {
+    fn from_document(document: Option<&PolicyConfigDocument>) -> Result<Self> {
+        let Some(document) = document else {
+            return Ok(Self::default());
+        };
+        Ok(Self {
+            path: configured_absolute_path(document.path.as_deref(), "policy.path")?,
+        })
     }
 }
 
@@ -454,10 +487,10 @@ fn retrieval_budget_ms(value: Option<u64>, field: &str) -> Result<Option<u64>> {
     Ok(Some(value))
 }
 
-/// Validates one configured retrieval path. A relative path is rejected rather than resolved
-/// against an ambiguous working directory: the MCP server, the CLI, and the Hooks all run from
-/// different ones.
-fn retrieval_path(value: Option<&str>, field: &str) -> Result<Option<PathBuf>> {
+/// Validates one configured absolute path (`[retrieval]` model/runtime, `[policy] path`). A
+/// relative path is rejected rather than resolved against an ambiguous working directory: the MCP
+/// server, the CLI, and the Hooks all run from different ones.
+fn configured_absolute_path(value: Option<&str>, field: &str) -> Result<Option<PathBuf>> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -696,6 +729,7 @@ impl UserConfigStore {
             context_ttl: None,
             engineering: None,
             retrieval: None,
+            policy: None,
             maintenance: None,
         };
         validate_document_structure(&document, &root.join("repository"))?;
@@ -739,6 +773,7 @@ impl UserConfigStore {
                     context_ttl: None,
                     engineering: None,
                     retrieval: None,
+                    policy: None,
                     maintenance: None,
                 })?;
             }
@@ -804,6 +839,23 @@ impl UserConfigStore {
         let outcome = self
             .read_document()
             .map(|document| catalog_snapshot(&document));
+        finish_locked(&lock, outcome)
+    }
+
+    /// Reads where this installation keeps its runtime team policy.
+    ///
+    /// Non-blocking like [`Self::repository_catalog`]: the Hook hot path asks for this on every
+    /// event that delivers policy text to the model, and a Session must never wait on a
+    /// concurrent `sctx repository add` to find out which Markdown file to read.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or filesystem errors.
+    pub fn policy_settings(&self) -> Result<PolicySettings> {
+        let lock = self.lock_shared()?;
+        let outcome = self
+            .read_document()
+            .and_then(|document| PolicySettings::from_document(document.policy.as_ref()));
         finish_locked(&lock, outcome)
     }
 

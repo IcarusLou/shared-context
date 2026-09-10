@@ -21,8 +21,9 @@ use std::{
 
 pub mod semantic;
 
-use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker_with_policy};
 use sctx_git_store::GitStore;
+use sctx_local_state::Policy;
 use serde_json::{Value, json};
 
 const CODEX_FIXTURE: &str = include_str!("../../../../fixtures/agents/codex-0.147.json");
@@ -275,7 +276,11 @@ pub fn build_harness(fixture: &Value) -> Harness {
         run_hook(&home, &session_start(&session, &checkout)),
         json!({"hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": shared_context_activation_marker(AgentKind::Codex, &session)
+            "additionalContext": shared_context_activation_marker_with_policy(
+                AgentKind::Codex,
+                &session,
+                Policy::compiled_default().session(),
+            )
         }})
     );
 

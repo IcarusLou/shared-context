@@ -19,8 +19,9 @@ use std::{
     process::{Command, Stdio},
 };
 
-use sctx_agent_adapter::{AgentKind, shared_context_activation_marker};
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker_with_policy};
 use sctx_git_store::GitStore;
+use sctx_local_state::Policy;
 use serde_json::{Value, json};
 
 fn run_json_cli(home: &Path, args: &[&str]) -> Value {
@@ -369,4 +370,16 @@ fn structured_recheck_when_marks_a_confirmed_context_stale_without_writing_a_git
         knowledge_head_before_recheck, knowledge_head_after,
         "doctor --recheck / search must not write to the knowledge Git repository"
     );
+}
+
+/// The activation marker exactly as this installation renders it.
+///
+/// Protocol text plus the built-in team `## session` policy, which is what an installation with
+/// no `policy.md` -- every temporary root in this file -- actually delivers.
+fn shared_context_activation_marker(agent: AgentKind, external_session_id: &str) -> String {
+    shared_context_activation_marker_with_policy(
+        agent,
+        external_session_id,
+        Policy::compiled_default().session(),
+    )
 }

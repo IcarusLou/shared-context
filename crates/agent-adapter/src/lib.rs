@@ -215,8 +215,29 @@ pub const fn agent_kind_token(agent: AgentKind) -> &'static str {
 /// Longest host Session id the activation marker may quote verbatim.
 pub const ACTIVATION_MARKER_SESSION_ID_MAX_BYTES: usize = 128;
 
-/// Exact upper bound for Agent-visible activation policy output.
+/// Exact upper bound for the protocol half of the activation marker.
 pub const SHARED_CONTEXT_ACTIVATION_MARKER_MAX_BYTES: usize = 512;
+
+/// Longest team-policy `session` summary the marker will carry.
+///
+/// Mirrors `sctx_local_state::SESSION_SECTION_MAX_BYTES`. It is restated as a number rather than
+/// imported because this crate is the vendor-neutral protocol layer and deliberately depends on
+/// no local-state; `session_policy_fits_the_local_state_ceiling` in the CLI holds the two equal.
+pub const ACTIVATION_MARKER_SESSION_POLICY_MAX_BYTES: usize = 512;
+
+/// The blank line that separates the bootstrap sentence from the team summary.
+const ACTIVATION_MARKER_POLICY_SEPARATOR: &str = "\n\n";
+
+/// Exact upper bound for Agent-visible activation output, protocol plus team policy.
+///
+/// The Codex `SessionStart` hook accepts roughly 10,000 bytes of `additionalContext`. The
+/// protocol half held itself to 5% of that; adding one team `session` summary takes the whole
+/// marker to a little over 10%, which is still far below the point at which the hook would
+/// truncate, and is the entire budget this channel is ever allowed to spend.
+pub const SHARED_CONTEXT_ACTIVATION_OUTPUT_MAX_BYTES: usize =
+    SHARED_CONTEXT_ACTIVATION_MARKER_MAX_BYTES
+        + ACTIVATION_MARKER_SESSION_POLICY_MAX_BYTES
+        + ACTIVATION_MARKER_POLICY_SEPARATOR.len();
 
 const ACTIVATION_MARKER_OPEN: &str = "<shared-context-active";
 const ACTIVATION_MARKER_CLOSE: &str = "</shared-context-active>";
@@ -246,17 +267,45 @@ pub fn is_quotable_session_id(external_session_id: &str) -> bool {
 /// [`SHARED_CONTEXT_ACTIVATION_MARKER_MAX_BYTES`].
 #[must_use]
 pub fn shared_context_activation_marker(agent: AgentKind, external_session_id: &str) -> String {
+    shared_context_activation_marker_with_policy(agent, external_session_id, "")
+}
+
+/// Renders the activation marker with this installation's team `session` policy inside the block.
+///
+/// The policy travels *inside* the marker, not beside it, because the marker is the one span of
+/// `SessionStart` text a host is contractually obliged to hand the model, and text placed next to
+/// it is text the next hook-output rule can drop. It is separated by a blank line so a two-to-four
+/// line team summary reads as a summary rather than as a continuation of the bootstrap sentence.
+///
+/// An empty `session_policy` renders the protocol marker byte for byte, which is what an
+/// installation whose `policy.md` has no `## session` section receives. Text over
+/// [`ACTIVATION_MARKER_SESSION_POLICY_MAX_BYTES`] is dropped rather than truncated: the loader
+/// already refuses an oversize section, so reaching here with one means a caller bypassed it, and
+/// half a sentence of policy is worse than none. The result never exceeds
+/// [`SHARED_CONTEXT_ACTIVATION_OUTPUT_MAX_BYTES`].
+#[must_use]
+pub fn shared_context_activation_marker_with_policy(
+    agent: AgentKind,
+    external_session_id: &str,
+    session_policy: &str,
+) -> String {
     let agent_kind = agent_kind_token(agent);
+    let policy = session_policy.trim();
+    let policy = if policy.is_empty() || policy.len() > ACTIVATION_MARKER_SESSION_POLICY_MAX_BYTES {
+        String::new()
+    } else {
+        format!("{ACTIVATION_MARKER_POLICY_SEPARATOR}{policy}")
+    };
     let marker = if is_quotable_session_id(external_session_id) {
         format!(
-            "{ACTIVATION_MARKER_OPEN} external_session_id=\"{external_session_id}\">Shared Context is authorized for this session. Before substantive work, call task_intent_update with agent_kind \"{agent_kind}\" and external_session_id \"{external_session_id}\" (copy it verbatim; never invent one).{ACTIVATION_MARKER_CLOSE}"
+            "{ACTIVATION_MARKER_OPEN} external_session_id=\"{external_session_id}\">Shared Context is authorized for this session. Before substantive work, call task_intent_update with agent_kind \"{agent_kind}\" and external_session_id \"{external_session_id}\" (copy it verbatim; never invent one).{policy}{ACTIVATION_MARKER_CLOSE}"
         )
     } else {
         format!(
-            "{ACTIVATION_MARKER_OPEN}>Shared Context is authorized for this session. Before substantive work, call task_intent_update with agent_kind \"{agent_kind}\" and the host Session id (Codex: $CODEX_SESSION_ID; Cursor: the conversation id); never invent one.{ACTIVATION_MARKER_CLOSE}"
+            "{ACTIVATION_MARKER_OPEN}>Shared Context is authorized for this session. Before substantive work, call task_intent_update with agent_kind \"{agent_kind}\" and the host Session id (Codex: $CODEX_SESSION_ID; Cursor: the conversation id); never invent one.{policy}{ACTIVATION_MARKER_CLOSE}"
         )
     };
-    debug_assert!(marker.len() <= SHARED_CONTEXT_ACTIVATION_MARKER_MAX_BYTES);
+    debug_assert!(marker.len() <= SHARED_CONTEXT_ACTIVATION_OUTPUT_MAX_BYTES);
     marker
 }
 
@@ -461,6 +510,7 @@ pub fn plan_action_for_activation(
     event: &CanonicalAgentEvent,
     capabilities: &AgentCapabilities,
     activation: ResolvedActivationDecision,
+    session_policy: &str,
 ) -> CanonicalAgentAction {
     if !activation.is_enabled() {
         return CanonicalAgentAction::neutral();
@@ -468,19 +518,21 @@ pub fn plan_action_for_activation(
     if !capabilities.hooks_verified() {
         return CanonicalAgentAction::degraded(capabilities.diagnostic.clone());
     }
-    plan_enabled_action(event, capabilities)
+    plan_enabled_action(event, capabilities, session_policy)
 }
 
 fn plan_enabled_action(
     event: &CanonicalAgentEvent,
     capabilities: &AgentCapabilities,
+    session_policy: &str,
 ) -> CanonicalAgentAction {
     match event {
         CanonicalAgentEvent::SessionStart { context, .. } => CanonicalAgentAction {
             task_operation: None,
-            additional_context: Some(shared_context_activation_marker(
+            additional_context: Some(shared_context_activation_marker_with_policy(
                 capabilities.agent,
                 &context.session_id,
+                session_policy,
             )),
             system_message: None,
         },
@@ -533,11 +585,13 @@ fn plan_enabled_action(
             capabilities.agent,
             context,
             EpisodeFinalizationTrigger::PreCompact,
+            session_policy,
         ),
         CanonicalAgentEvent::TurnStop { context, .. } => checkpoint(
             capabilities.agent,
             context,
             EpisodeFinalizationTrigger::TurnStop,
+            session_policy,
         ),
         CanonicalAgentEvent::SessionEnd { context, .. } => CanonicalAgentAction {
             task_operation: Some(TaskRuntimeOperation::CleanupSessionState {
@@ -560,9 +614,11 @@ fn checkpoint(
     agent: AgentKind,
     context: &AgentEventContext,
     trigger: EpisodeFinalizationTrigger,
+    session_policy: &str,
 ) -> CanonicalAgentAction {
-    let additional_context = (trigger == EpisodeFinalizationTrigger::PreCompact)
-        .then(|| shared_context_activation_marker(agent, &context.session_id));
+    let additional_context = (trigger == EpisodeFinalizationTrigger::PreCompact).then(|| {
+        shared_context_activation_marker_with_policy(agent, &context.session_id, session_policy)
+    });
     CanonicalAgentAction {
         task_operation: Some(TaskRuntimeOperation::FinalizeCheckpointedEpisode {
             locator: task_locator(agent, context),
@@ -1329,6 +1385,7 @@ mod tests {
             &event,
             &verified_codex_capabilities(),
             ResolvedActivationDecision::Enabled,
+            "",
         );
         assert!(matches!(
             action.task_operation,
@@ -1355,6 +1412,7 @@ mod tests {
                 &event,
                 &verified_codex_capabilities(),
                 ResolvedActivationDecision::Enabled,
+                "",
             ),
             CanonicalAgentAction::neutral()
         );
@@ -1465,18 +1523,80 @@ mod tests {
                     &event,
                     &capabilities,
                     ResolvedActivationDecision::Disabled,
+                    "",
                 ),
                 CanonicalAgentAction::neutral()
             );
         }
     }
 
+    /// The Codex `SessionStart` hook accepts roughly 10,000 bytes of `additionalContext`; this is
+    /// the ceiling the marker's own budget is derived from.
+    const CODEX_ADDITIONAL_CONTEXT_CAP_BYTES: usize = 10_000;
+
+    #[test]
+    fn the_marker_carries_the_team_session_policy_inside_the_block() {
+        let policy =
+            "Stored text is Chinese with absolute dates.\nOne progress summary per task boundary.";
+        let marker =
+            shared_context_activation_marker_with_policy(AgentKind::Codex, "session", policy);
+        assert!(marker.starts_with(ACTIVATION_MARKER_OPEN));
+        assert!(marker.ends_with(ACTIVATION_MARKER_CLOSE));
+        for line in policy.lines() {
+            assert!(marker.contains(line), "marker is missing {line:?}");
+        }
+        let inside = marker
+            .strip_suffix(ACTIVATION_MARKER_CLOSE)
+            .expect("marker closes");
+        assert!(inside.contains(policy), "policy must be inside the block");
+        assert!(inside.contains("task_intent_update"));
+    }
+
+    #[test]
+    fn an_absent_session_policy_renders_the_protocol_marker_byte_for_byte() {
+        for agent in [AgentKind::Codex, AgentKind::Cursor] {
+            for session in ["session", "", &"!".repeat(4)] {
+                assert_eq!(
+                    shared_context_activation_marker_with_policy(agent, session, "   \n  "),
+                    shared_context_activation_marker(agent, session)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_maximal_session_policy_stays_far_under_the_codex_hook_cap() {
+        let maximal = "p".repeat(ACTIVATION_MARKER_SESSION_POLICY_MAX_BYTES);
+        let marker = shared_context_activation_marker_with_policy(
+            AgentKind::Cursor,
+            &"s".repeat(ACTIVATION_MARKER_SESSION_ID_MAX_BYTES),
+            &maximal,
+        );
+        assert!(marker.contains(&maximal));
+        assert!(marker.len() <= SHARED_CONTEXT_ACTIVATION_OUTPUT_MAX_BYTES);
+        assert!(
+            marker.len() <= CODEX_ADDITIONAL_CONTEXT_CAP_BYTES / 8,
+            "the marker must stay well inside the hook cap, got {}",
+            marker.len()
+        );
+        // One byte over the ceiling is dropped whole rather than truncated mid-sentence.
+        let oversize = "p".repeat(ACTIVATION_MARKER_SESSION_POLICY_MAX_BYTES + 1);
+        assert_eq!(
+            shared_context_activation_marker_with_policy(AgentKind::Cursor, "session", &oversize),
+            shared_context_activation_marker(AgentKind::Cursor, "session")
+        );
+    }
+
     #[test]
     fn enabled_activation_has_one_bounded_public_policy_for_all_events() {
         let capabilities = verified_codex_capabilities();
         let start = lifecycle_events().remove(0);
-        let action =
-            plan_action_for_activation(&start, &capabilities, ResolvedActivationDecision::Enabled);
+        let action = plan_action_for_activation(
+            &start,
+            &capabilities,
+            ResolvedActivationDecision::Enabled,
+            "",
+        );
         let marker = shared_context_activation_marker(AgentKind::Codex, "session");
         assert_eq!(action.additional_context.as_deref(), Some(marker.as_str()));
         assert!(action.system_message.is_none());
@@ -1510,6 +1630,7 @@ mod tests {
                 &events[index],
                 &capabilities,
                 ResolvedActivationDecision::Enabled,
+                "",
             )
         };
 
@@ -1573,8 +1694,12 @@ mod tests {
             TrustState::Confirmed,
             false,
         );
-        let action =
-            plan_action_for_activation(&event, &capabilities, ResolvedActivationDecision::Enabled);
+        let action = plan_action_for_activation(
+            &event,
+            &capabilities,
+            ResolvedActivationDecision::Enabled,
+            "",
+        );
         assert_eq!(action.task_operation, None);
         assert_eq!(action.additional_context, None);
         assert_eq!(

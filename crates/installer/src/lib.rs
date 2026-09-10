@@ -27,8 +27,9 @@ use sctx_engineering_graph::{EngineeringProjectionStore, RepositoryRegistry};
 use sctx_git_store::GitStore;
 use sctx_index::{ProjectionIndex, SEARCH_RANKING_VERSION};
 use sctx_local_state::{
-    AuthorizedSessionScopeStore, CatalogCheckoutStatus, MaintenanceLock, ORPHAN_LEASE_MAX_AGE,
-    UserConfigStore, migrate_legacy_repository_groups,
+    AuthorizedSessionScopeStore, CatalogCheckoutStatus, DEFAULT_POLICY_MARKDOWN, MaintenanceLock,
+    ORPHAN_LEASE_MAX_AGE, POLICY_FILE_NAME, UserConfigStore, installation_policy,
+    migrate_legacy_repository_groups,
 };
 use sctx_mcp::{AssociationRebuildInput, ClientKind, McpServer};
 use sctx_search::{
@@ -983,6 +984,8 @@ impl Installer {
 
         reclaim_orphan_leases(&self.context.root, &mut notices);
 
+        install_default_policy(&self.context.root, &mut notices);
+
         // The schedule is read from the same `config.toml` the Catalog lives in, which the
         // Knowledge Store install above has already created, so a first setup sees the defaults
         // and every later one sees whatever the operator wrote.
@@ -1104,6 +1107,7 @@ impl Installer {
         check_engineering_graph(root, &mut checks);
         check_repository_catalog(root, &mut checks);
         check_configs(root, &self.context.home, &mut checks);
+        check_policy(root, &mut checks);
         check_global_skill(root, &self.context.home, &mut checks);
         check_session_scope_leases(root, &mut checks);
         check_retrieval(root, &mut checks);
@@ -2813,6 +2817,30 @@ fn absent_parent_directories(path: &Path, stop_at: &Path) -> Result<Vec<PathBuf>
         }
     }
     Ok(directories)
+}
+
+/// Seeds `<root>/policy.md` with the built-in default the first time, and never again.
+///
+/// Deliberately outside the setup transaction and outside skill ownership tracking. This file is
+/// the operator's document from the moment it exists: an upgrade must not roll it back, reconcile
+/// it, or notice that it differs from what we shipped. `create_new` is the whole idempotence
+/// story -- a file that is already there is left exactly as it is, whatever it says.
+///
+/// Failing to write it is a notice, not a failed installation: the compiled-in default is what
+/// gets delivered either way, and `sctx policy reset` writes the file on demand.
+fn install_default_policy(root: &Path, notices: &mut Vec<String>) {
+    let path = root.join(POLICY_FILE_NAME);
+    let outcome = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .and_then(|mut file| file.write_all(DEFAULT_POLICY_MARKDOWN.as_bytes()));
+    match outcome {
+        Ok(()) => notices.push(format!("wrote default team policy: {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => notices.push(format!("could not write {}: {error}", path.display())),
+    }
 }
 
 fn install_global_skill(
@@ -5229,6 +5257,22 @@ fn check_global_skill_asset(
             checks.push(failed(name, format!("{} is missing", path.display())));
         }
         Err(error) => checks.push(failed(name, error.to_string())),
+    }
+}
+
+/// Reports the one thing an operator cannot see from the policy file itself: whether what they
+/// wrote is what the model is actually being told.
+///
+/// Delivery is fail-open, so a broken `policy.md` costs a Session nothing and says nothing --
+/// which is exactly why it has to be said here. A degraded status is a warning, not an error: the
+/// installation is healthy, the team's wording is not being delivered.
+fn check_policy(root: &Path, checks: &mut Vec<DoctorCheck>) {
+    let resolved = installation_policy(root);
+    let message = resolved.summary();
+    if resolved.status.is_degraded() {
+        checks.push(warning("policy", message));
+    } else {
+        checks.push(ok("policy", message));
     }
 }
 
