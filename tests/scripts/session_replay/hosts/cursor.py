@@ -87,26 +87,31 @@ Because the transcript holds no results, every `SctxCall` from this host has
 `status="unknown"` and `result_text=None`. `error_code` is always None: a
 failed sctx call is indistinguishable from a successful one here.
 
-## Injections: reconstructed from sctx, never from the transcript
+## Pack deliveries: reconstructed from sctx, never from the transcript
 
-`reconstruct_from_sctx()` rebuilds the injection timeline out of sctx's own
-state, and flags every `Injection` it produces with
-`reconstructed_from="sctx:task_injection"`:
+`reconstruct_from_sctx()` rebuilds the Context Pack delivery timeline out of
+sctx's own state, and flags every `PackDelivery` it produces with
+`reconstructed_from="sctx:task_injection"` and `channel="unknown"` (Cursor's
+transcript has no wire evidence at all for how the pack traveled, unlike
+Codex's `code_mode_script`/`native_mcp` distinction — see `hosts/codex.py`):
 
   - `runtime.sqlite` `task_injection` rows for this session's task ids, each
     carrying `context_id`, `source` and `injected_at_unix_seconds`. Rows
-    sharing a `(source, injected_at_unix_seconds)` pair are one injection
-    event, so they are grouped into a single `Injection` whose `ctx_ids` is
-    the group. `text` is a synthetic one-line summary and `wire_bytes` /
-    `est_tokens` stay 0 — the injected TEXT is nowhere on disk, only the
-    identity of what was injected.
+    sharing a `(source, injected_at_unix_seconds)` pair are one delivery
+    event, so they are grouped into a single `PackDelivery` whose `ctx_ids`
+    is the group. `text` is a synthetic one-line summary and
+    `bytes`/`delivered_bytes` stay 0/None — the delivered TEXT is nowhere on
+    disk, only the identity of what was injected.
   - `~/.shared-context-logs/state/hook-diagnostics.json` `recent_events`
     filtered by `sctx_logs.telemetry_session_digest("cursor", <id>)`. The
     digest formula is host-agnostic and gated on `{"cursor","codex"}` in the
     Rust source, and it matches for real Cursor sessions (verified: 328
     events for the fixture, `hook.cursor.session_start` through
     `hook.cursor.turn_stop`). These become per-turn `HookEvent` aggregates,
-    not `Injection`s — they say a hook ran, not that context arrived.
+    not `PackDelivery`s — they say a hook ran, not that context arrived.
+    Cursor's `hook_injections` (the small marker/reminder channel) is always
+    empty: the transcript shows no hook output at all, so there is nothing
+    to even reconstruct it from.
 
 Both are bucketed into turns by the `<timestamp>` clock: turn *n* owns
 `[start_n, start_{n+1})`, with turn 1's lower bound open (so the
@@ -132,8 +137,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import sctx_logs  # noqa: E402
 from session_model import (  # noqa: E402
     HookEvent,
-    Injection,
     OtherInjection,
+    PackDelivery,
     SctxCall,
     Session,
     SessionMeta,
@@ -178,20 +183,24 @@ FIDELITY_NOTES = (
     "returned candidates, returned context packs) are unavailable — "
     "sctx_calls carry status=unknown and no result text",
     "hook injections are NOT recorded by Cursor: the transcript never shows "
-    "what sctx pushed, so every injection below is RECONSTRUCTED from sctx's "
-    "own runtime.sqlite/task_injection rows — the context ids and the time "
-    "are real, the injected text is unrecoverable and wire_bytes/est_tokens "
-    "are therefore 0, not measured",
+    "what sctx's hook pushed, so hook_injections is always empty here — that "
+    "channel carries only small markers/reminders anyway (see hosts/codex.py), "
+    "never the Context Pack",
+    "Context Pack deliveries are NOT recorded by Cursor either (no MCP tool "
+    "results at all): every pack_delivery below is RECONSTRUCTED from sctx's "
+    "own runtime.sqlite/task_injection rows, channel=\"unknown\" — the context "
+    "ids and the time are real, the delivered bytes/channel/truncation are "
+    "unrecoverable and stay None/0/\"unknown\", not a guess",
     "no token usage, git commit, model or compaction markers are recorded by "
     "Cursor; those fields are empty rather than zero-valued findings",
 )
 
-# task_injection.source -> Injection.kind. Observed values across the real
-# database: intent_update (170), task_context (7), artifact_focus (2). The
-# host-agnostic kinds in session_model are Codex-hook-shaped, and none of
-# these map onto them cleanly, so the sctx source name is kept verbatim and
-# prefixed to stay obviously distinct from a transcript-read Codex kind.
-def _injection_kind(source: Optional[str]) -> str:
+# task_injection.source -> PackDelivery.tool. Observed values across the real
+# database: intent_update (170), task_context (7), artifact_focus (2). There
+# is no MCP tool-call record on this host to read a real tool name from, so
+# the sctx source name is kept verbatim and prefixed to stay obviously
+# distinct from a transcript-read Codex tool name.
+def _pack_tool_label(source: Optional[str]) -> str:
     return f"sctx:{source}" if source else "sctx:unknown"
 
 
@@ -572,12 +581,12 @@ def _task_injection_rows(db_path: Path, external_session_id: str) -> tuple[list,
 
 
 def _group_injections(rows: list) -> list:
-    """Group `task_injection` rows into injection EVENTS.
+    """Group `task_injection` rows into pack-delivery EVENTS.
 
     One `sctx` push writes one row per injected context id, all sharing a
     `(source, injected_at_unix_seconds)` pair — the fixture's 20 rows are 3
-    events (3 + 4 + 13). Reporting 20 injections would triple-count the pushes
-    and make `injections.count` incomparable with the Codex side.
+    events (3 + 4 + 13). Reporting 20 pack deliveries would triple-count the
+    pushes and make `pack_deliveries.count` incomparable with the Codex side.
     """
     grouped: dict = {}
     for row in rows:
@@ -599,7 +608,7 @@ def _group_injections(rows: list) -> list:
     return events
 
 
-def _event_to_injection(event: dict) -> Injection:
+def _event_to_pack_delivery(event: dict) -> PackDelivery:
     when = dt.datetime.fromtimestamp(
         event["injected_at_unix_seconds"], dt.timezone.utc
     ).isoformat()
@@ -609,22 +618,24 @@ def _event_to_injection(event: dict) -> Injection:
         f"context_ids={len(event['ctx_ids'])} "
         f"intent_revision_ids={','.join(event['intent_revision_ids']) or '-'}\n"
         f"{chr(10).join(event['ctx_ids'])}\n"
-        "(the injected TEXT is not recorded anywhere on this host: Cursor does "
-        "not write hook additionalContext into its transcript, and sctx stores "
-        "only the identity of what it injected)"
+        "(the delivered TEXT is not recorded anywhere on this host: Cursor "
+        "records no MCP tool results at all, and sctx's task_injection table "
+        "stores only the identity of what it injected, not the pack bytes)"
     )
-    return Injection(
-        kind=_injection_kind(event["source"]),
-        text=summary,
-        has_marker=False,
-        marker_session_id=None,
+    return PackDelivery(
+        tool=_pack_tool_label(event["source"]),
+        items_count=len(event["ctx_ids"]),
         ctx_ids=event["ctx_ids"],
-        # Deliberately 0, not a guess: the delivered bytes are unmeasurable
-        # here, and a fabricated number would be compared against Codex's real
-        # one in facts.json.
-        wire_bytes=0,
-        est_tokens=0,
+        # Deliberately 0/None, not a guess: the pack size, delivered bytes and
+        # channel are unmeasurable here, and a fabricated number would be
+        # compared against Codex's real ones in facts.json.
+        bytes=0,
+        channel="unknown",
+        channel_cap_bytes=None,
+        delivered_bytes=None,
         truncated=False,
+        original_token_count=None,
+        text=summary,
         reconstructed_from="sctx:task_injection",
     )
 
@@ -656,7 +667,7 @@ def reconstruct_from_sctx(
     home: Path,
     external_session_id: Optional[str] = None,
 ) -> dict:
-    """Fill in `Turn.injections` and `Turn.hook_events` from sctx's own state.
+    """Fill in `Turn.pack_deliveries` and `Turn.hook_events` from sctx's own state.
 
     Mutates `session` and returns (and stores on `session.reconstruction`) the
     provenance record: which files were read, what the per-turn windows were,
@@ -705,7 +716,7 @@ def reconstruct_from_sctx(
         if turn is None:
             unwindowed_injections.append(event)
         else:
-            turn.injections.append(_event_to_injection(event))
+            turn.pack_deliveries.append(_event_to_pack_delivery(event))
 
     per_turn_hooks: dict = {}
     for event in hook_events:
@@ -721,8 +732,8 @@ def reconstruct_from_sctx(
     record = {
         "source": "sctx",
         "reason": (
-            "Cursor transcripts record neither hook injections nor tool "
-            "results; injections and hook events below are rebuilt from "
+            "Cursor transcripts record neither MCP tool results nor hook output at "
+            "all; pack deliveries and hook events below are rebuilt from "
             "sctx's own state and are flagged reconstructed_from"
         ),
         "runtime_sqlite": str(db_path),

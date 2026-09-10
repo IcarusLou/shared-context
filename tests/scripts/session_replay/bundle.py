@@ -150,38 +150,55 @@ def render_digest(session: Session, side_label: str) -> str:
         lines.append(f"> {turn.user_text}")
         lines.append("")
 
-        if turn.injections:
-            total_ctx = len(set(ctx for inj in turn.injections for ctx in inj.ctx_ids))
-            total_wire = sum(inj.wire_bytes for inj in turn.injections)
-            any_marker = any(inj.has_marker for inj in turn.injections)
-            any_truncated = any(inj.truncated for inj in turn.injections)
-            reconstructed = sum(1 for inj in turn.injections if inj.reconstructed_from)
+        if turn.hook_injections:
+            total_wire = sum(inj.wire_bytes for inj in turn.hook_injections)
+            any_marker = any(inj.has_marker for inj in turn.hook_injections)
+            lines.append(
+                f"### hook injections ({len(turn.hook_injections)})  "
+                f"marker={'yes' if any_marker else 'no'}  "
+                f"wire={_fmt_int(total_wire)} B"
+                "  (small marker/reminder channel — never carries the Context Pack)"
+            )
+            for inj in turn.hook_injections:
+                lines.append(
+                    f"- kind={inj.kind} marker={'yes' if inj.has_marker else 'no'}"
+                    f"{' session_id=' + inj.marker_session_id if inj.marker_session_id else ''} "
+                    f"wire={_fmt_int(inj.wire_bytes)} B est_tokens={inj.est_tokens}"
+                )
+                lines.append(_fence(inj.text, "json" if inj.text.strip().startswith("{") else ""))
+            lines.append("")
+
+        if turn.pack_deliveries:
+            total_ctx = len(set(ctx for p in turn.pack_deliveries for ctx in p.ctx_ids))
+            total_bytes = sum(p.bytes for p in turn.pack_deliveries)
+            any_truncated = any(p.truncated for p in turn.pack_deliveries)
+            reconstructed = sum(1 for p in turn.pack_deliveries if p.reconstructed_from)
             recon_note = (
-                f"  reconstructed={reconstructed}/{len(turn.injections)} (wire/est_tokens "
+                f"  reconstructed={reconstructed}/{len(turn.pack_deliveries)} (bytes/channel "
                 "unmeasurable, not zero)"
                 if reconstructed
                 else ""
             )
             lines.append(
-                f"### injections ({len(turn.injections)})  "
-                f"marker={'yes' if any_marker else 'no'}  ctx={total_ctx}  "
-                f"wire={_fmt_int(total_wire)} B  "
+                f"### pack deliveries ({len(turn.pack_deliveries)})  "
+                f"ctx={total_ctx}  bytes={_fmt_int(total_bytes)}  "
                 f"truncated={'YES' if any_truncated else 'no'}{recon_note}"
             )
-            for inj in turn.injections:
-                origin = (
-                    f" reconstructed_from={inj.reconstructed_from}"
-                    if inj.reconstructed_from
-                    else ""
+            for p in turn.pack_deliveries:
+                origin = f" reconstructed_from={p.reconstructed_from}" if p.reconstructed_from else ""
+                cap_str = f" cap={_fmt_int(p.channel_cap_bytes)}B" if p.channel_cap_bytes else ""
+                delivered_str = (
+                    f" delivered={_fmt_int(p.delivered_bytes)}B" if p.delivered_bytes is not None else ""
+                )
+                orig_tok_str = (
+                    f" original_tokens={p.original_token_count}" if p.original_token_count is not None else ""
                 )
                 lines.append(
-                    f"- kind={inj.kind} marker={'yes' if inj.has_marker else 'no'}"
-                    f"{' session_id=' + inj.marker_session_id if inj.marker_session_id else ''} "
-                    f"ctx={len(inj.ctx_ids)} wire={_fmt_int(inj.wire_bytes)} B "
-                    f"est_tokens={inj.est_tokens} truncated={'YES' if inj.truncated else 'no'}"
-                    f"{origin}"
+                    f"- tool={p.tool} channel={p.channel}{cap_str} items={p.items_count} "
+                    f"ctx={len(p.ctx_ids)} bytes={_fmt_int(p.bytes)}{delivered_str} "
+                    f"truncated={'YES' if p.truncated else 'no'}{orig_tok_str}{origin}"
                 )
-                lines.append(_fence(inj.text, "json" if inj.text.strip().startswith("{") else ""))
+                lines.append(_fence(p.text, "json" if p.text.strip().startswith("{") else ""))
             lines.append("")
 
         if turn.reasoning_summaries:
@@ -271,7 +288,8 @@ def compute_facts(
     versions_summary=None,
 ) -> dict:
     m = session.meta
-    all_injections = [inj for t in session.turns for inj in t.injections]
+    all_hook_injections = [inj for t in session.turns for inj in t.hook_injections]
+    all_pack_deliveries = [p for t in session.turns for p in t.pack_deliveries]
     all_sctx_calls = [sc for t in session.turns for sc in t.sctx_calls]
     all_tool_calls = [tc for t in session.turns for tc in t.tool_calls]
     all_discard_hits = [
@@ -281,10 +299,10 @@ def compute_facts(
     ]
 
     ctx_ids_injected = set()
-    for inj in all_injections:
-        ctx_ids_injected.update(inj.ctx_ids)
+    for p in all_pack_deliveries:
+        ctx_ids_injected.update(p.ctx_ids)
 
-    marker_ids = [inj.marker_session_id for inj in all_injections if inj.marker_session_id]
+    marker_ids = [inj.marker_session_id for inj in all_hook_injections if inj.marker_session_id]
     if marker_ids:
         marker_session_id_matches_thread = all(mid == m.thread_id for mid in marker_ids)
     else:
@@ -298,10 +316,41 @@ def compute_facts(
         first_compacted_idx = next((t.index for t in session.turns if t.compaction), None)
         if first_compacted_idx is not None:
             reinjected_after_compaction = any(
-                inj for t in session.turns if t.index > first_compacted_idx for inj in t.injections
+                p for t in session.turns if t.index > first_compacted_idx for p in t.pack_deliveries
             )
         else:
             reinjected_after_compaction = False
+
+    pack_delivery_rows = [
+        {
+            "turn": t.index,
+            "tool": p.tool,
+            "items_count": p.items_count,
+            "ctx_ids_count": len(p.ctx_ids),
+            "bytes": p.bytes,
+            "channel": p.channel,
+            "channel_cap_bytes": p.channel_cap_bytes,
+            "delivered_bytes": p.delivered_bytes,
+            "truncated": p.truncated,
+            "original_token_count": p.original_token_count,
+            "reconstructed_from": p.reconstructed_from,
+        }
+        for t in session.turns
+        for p in t.pack_deliveries
+    ]
+    packs_by_tool: dict = {}
+    channels_seen: dict = {}
+    over_channel_cap_count = 0
+    for p in all_pack_deliveries:
+        packs_by_tool[p.tool] = packs_by_tool.get(p.tool, 0) + 1
+        channels_seen[p.channel] = channels_seen.get(p.channel, 0) + 1
+        exceeds_cap = (
+            p.channel_cap_bytes is not None
+            and p.delivered_bytes is not None
+            and p.delivered_bytes >= p.channel_cap_bytes
+        )
+        if p.truncated or exceeds_cap:
+            over_channel_cap_count += 1
 
     by_tool: dict = {}
     errors_by_code: dict = {}
@@ -407,15 +456,35 @@ def compute_facts(
         "turns": len(session.turns),
         "human_prompts": len(session.turns),
         "compactions": m.compaction_count,
+        # Hook `additionalContext` injections ONLY — the marker/maintenance
+        # channel. It never carries the Context Pack (see `pack_deliveries`
+        # below); every value here is small on purpose (<=506 bytes observed
+        # across every September rollout).
         "injections": {
-            "count": len(all_injections),
-            "with_marker": sum(1 for i in all_injections if i.has_marker),
+            "count": len(all_hook_injections),
+            "with_marker": sum(1 for i in all_hook_injections if i.has_marker),
             "marker_session_id_matches_thread": marker_session_id_matches_thread,
+            "wire_bytes_total": sum(i.wire_bytes for i in all_hook_injections),
+        },
+        # The Context Pack itself, delivered as an sctx MCP tool result (see
+        # hosts/codex.py's module docstring for the native_mcp vs
+        # code_mode_script channel distinction). `truncated`/
+        # `over_channel_cap_count` reflect that channel's own cap — NOT a
+        # hook truncating, which cannot happen (hooks never carry the pack).
+        "pack_deliveries": {
+            "count": len(all_pack_deliveries),
+            "by_tool": packs_by_tool,
+            "channels_seen": channels_seen,
             "ctx_ids_total": len(ctx_ids_injected),
-            "wire_bytes_total": sum(i.wire_bytes for i in all_injections),
-            "truncated_count": sum(1 for i in all_injections if i.truncated),
-            "reconstructed_count": sum(1 for i in all_injections if i.reconstructed_from),
+            "bytes_total": sum(p.bytes for p in all_pack_deliveries),
+            "delivered_bytes_total": sum(
+                p.delivered_bytes for p in all_pack_deliveries if p.delivered_bytes is not None
+            ),
+            "truncated_count": sum(1 for p in all_pack_deliveries if p.truncated),
+            "over_channel_cap_count": over_channel_cap_count,
+            "reconstructed_count": sum(1 for p in all_pack_deliveries if p.reconstructed_from),
             "reinjected_after_compaction": reinjected_after_compaction,
+            "per_turn": pack_delivery_rows,
         },
         "sctx_calls": {
             "count": len(all_sctx_calls),

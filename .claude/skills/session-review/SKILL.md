@@ -22,12 +22,12 @@ description: 分析 tests/scripts/session_replay 生成的会话回放审计 bun
 
 ## 1. 读取顺序
 
-1. `~/.shared-context-audit/$ARGUMENTS/facts.json`——先读这个，建立数字基线（injections/sctx_calls/pack_usage/sctx_db 等字段）。
+1. `~/.shared-context-audit/$ARGUMENTS/facts.json`——先读这个，建立数字基线（injections/pack_deliveries/sctx_calls/pack_usage/sctx_db/sctx_logs/lease 等字段）。
 2. `original.md`——**逐轮读全**，不要跳轮。如果文件很大（14 轮的样本约 783 KB），用 `Read` 的 `offset`/`limit`
    分段读，每一段都要覆盖到下一轮的 `## Turn N` 标题，不要因为文件大就只抽样。可以先用 grep 定位
-   `^## Turn|^### injections|^### sctx calls|^### tools|^## other injections` 这些锚点再分段读，但每一段实际内容都要读完，不能只看锚点。
+   `^## Turn|^### hook injections|^### pack deliveries|^### sctx calls|^### tools|^## other injections` 这些锚点再分段读，但每一段实际内容都要读完，不能只看锚点。
 3. `replay.md`（如果存在）。
-4. `sctx/original/hook_event.json`、`sctx/original/candidate_review.json`（以及 `sctx/replay/...` 对应文件，如果存在）。
+4. `sctx/original/candidate_review.json`、`sctx/original/task_injection.json`（以及 `sctx/replay/...` 对应文件，如果存在）；`hook_event.json` 是死表，跳过。
    其余 `sctx/*/*.json` 按需抽查（本技能验证时发现 `checkpoint_operation.json` / `work_episode.json` /
    `agent_checkpoint.json` / `context_usage.json` 在 claims=0 的 no_op 场景下应为空数组——空是预期行为，不是异常）。
 
@@ -49,13 +49,15 @@ description: 分析 tests/scripts/session_replay 生成的会话回放审计 bun
 
 对每个方向产出零到多条发现，每条都要能回指第 4 节表格里的一行引用。
 
-**送达**：marker/pack 是否真的到达模型？compaction 后是否重新注入
-（`facts.json` 的 `injections.reinjected_after_compaction`）？是被宿主截断
-（`injections.truncated_count`，`original.md` 里对应轮次 `### injections` 行的 `truncated=YES`）还是被模型自己丢弃
-（`wire_bytes` 很小但 `truncated=no`——这是和截断不同的失败模式，两者都要在 `### injections` 摘要行里找到字面依据）？
-`tools` 列表里 exec 脚本的 `args_head` 只有前 160 字符，`.then(r=>({isError:...}))` 这类丢弃包装脚本的完整文本
-**通常不在 digest 里**（被截断的 head 里可能看不到），这种情况下只能用 `wire_bytes`/`truncated` 的数字组合做间接证据，
-在结论里如实说明「基于 wire_bytes 与 truncated 标志推断，未见丢弃脚本原文」，不要假装看到了原文。
+**送达**：bundle 把两条通道分开记，不要混：`### hook injections`（hook 的 additionalContext 通道，只承载
+marker / 提醒 / systemMessage，从不承载 pack；facts 里是 `injections`）和 `### pack deliveries`（Context Pack 以 sctx MCP
+工具结果送达；facts 里是 `pack_deliveries`）。先看 marker 是否到达、compaction 后是否重新注入
+（`injections.reinjected_after_compaction`）。再看每条 pack delivery 的 `channel`：`native_mcp` 是原生 MCP 调用；
+`code_mode_script` 是模型把 MCP 调用包进 exec 脚本再回显，这条通道有宿主上限（`channel_cap_bytes`，Codex 约 40,000 字节 /
+10,000 近似 token），`delivered_bytes` 超过它就是被宿主截断（`truncated=true`，`original_token_count` 是原文大小）；
+`delivered_bytes` 极小而 `truncated=false` 则是模型自己用 `.then(r=>({isError:...}))` 之类的包装把结果丢掉了，这是另一种失效模式，
+digest 的 `### tools` 下会引用 `discard_wrapper` 命中的脚本片段，引用它而不是推断。`pack_deliveries.over_channel_cap_count`
+是全会话越界次数。写结论时明确说是「pack 在脚本通道被截断」还是「hook 注入被截断」，后者在现有数据里从未发生过。
 同一轮是否还有其他注入在抢占同一个 slot（`## other injections`）？
 
 **激活与依从**：边界处（轮次开始/结束、compaction 前）是否有值得留的 checkpoint？是否出现空 claims 或单次调用
@@ -78,17 +80,14 @@ workflow.md 第 7 节三档；`sctx/original/candidate_review.json` 每行的 `t
 如果 `candidate_list` 全程返回空 `reviews` 且 `candidate_review.json` 是空数组，说明本 session 范围内没有可处置的候选，
 如实报告「无候选可处置」而不是缺失项。
 
-**留痕**：`sctx/original/hook_event.json` 每行的 `decision`（是否 `fail_open`）、`event_kind`
-（是否有无法解码的）、`reason`（是否 ≠ `ok`）；`hook_event.json` 为空数组而
-`sctx_db.checkpoint_reminder_count` / `facts.json` 里的 reminder 计数 >0，是一个已知的怪现象——`sctx_facts.py`
-模块 docstring 的原话是「the reminder counter and the hook_event audit log are populated by different code paths
-for this host session」；`tests/scripts/session_replay/README.md` 的「Known deviations」一节进一步说明
-`runtime.sqlite` 的 `hook_event` 表「on current installations no hook writes any more (hook decisions go to the
-log service's `hook-diagnostics.json` aggregate instead)」——也就是说在较新的安装上 `hook_event` 为空可能根本不是
-这一次会话的异常，而是这张表已经停止被写入，真正的留痕现在在 bundle 未导出的 `hook-diagnostics.json` 里。
-两条说明都要据实引用，不要只挑一条、也不要替它们调和出一个更圆的解释；如果两者时间线冲突（比如 bundle 的会话
-明显早于「停止写入」生效的时间），在「未能判断」里说明无法确定适用哪一条。同一秒内重复的 `session_start`、
-`authorization_internal` 突发也在这里看，但如果 `hook_event.json` 本身是空数组，这些子项直接归为「未能判断」而不是「未发现」。
+**留痕**：真正的留痕在 facts 的 `sctx_logs` 块（来自 `~/.shared-context-logs/state/hook-diagnostics.json`，已按
+session_digest 过滤到本会话）：看事件序列是否完整（session_start → prompt_submit → post_tool_use… → turn_stop，
+会话结束应有 session_end），有没有 fail_open / undecodable / reason ≠ ok 的事件，`logs_sync_failure` 与
+`spool_ready_batch_count` 是否指示遥测积压。`lease` 块给出租约文件（`state/authorized-session-scopes/scope-<digest>.json`）
+是否仍存在：会话早已结束而 `lease_file_exists=true` 且 sctx_logs 里没有 session_end，就是 SessionEnd 未清理的直接证据。
+`sctx/original/hook_event.json` 是一张只建不写的死表（全树没有写入），为空不是异常，不要据此下结论，也不要拿它
+和 `checkpoint_reminder_count` 对照。`diagnostics_file_found=false` 表示该侧根本没有诊断文件（回放侧早期就是如此），
+按「未能判断」处理而不是「零事件」。同一秒内重复的 session_start、`authorization_internal` 突发在 sctx_logs 的事件序列里看。
 如果一条留痕/依从发现的根因能在 `docs/adr/000X-*.md` 里找到且该 ADR 的 frontmatter `status` 是 `accepted`，说明这是
 已被修复的历史行为：把「已知项」写成该 ADR 编号，并在小节正文里明说「这是对已修复问题的历史证据复现，不代表当前代码仍有此缺陷」，
 严重度按它在录制当时造成的影响标注，不要因为已修复就直接标「观察」抹平它，也不要因为影响大就让人误以为现在仍会发生。
@@ -116,9 +115,8 @@ log service's `hook-diagnostics.json` aggregate instead)」——也就是说在
 3. 每条发现一个短小节（2–4 句）：发生了什么、依据 workflow.md 哪条规则/哪个 ADR 判断它重要、建议下一步核实什么。
    这一节里每句话都要能追到第 2 步的表格行,不要引入表格之外的新事实。
 4. 「未能判断」一节：列出这个 bundle 结构性做不到的判断，例如 Codex 的 reasoning 是加密的、
-   `hook_event.json` 为空导致留痕方向大部分子项无法核实、SessionEnd/lease 清理状态不在
-   `sctx_facts.py` 导出的表里、exec 包装脚本的完整文本被 160 字符 `args_head` 截断导致丢弃模式只能靠数字推断
-   而非原文验证、Cursor bundle 缺少 tool 输出等（按实际遇到的情况写，不要照抄这个例子列表）。
+   某一侧 `diagnostics_file_found=false` 导致留痕方向无法核实、Cursor bundle 缺少 tool 输出且 pack 送达是从 sctx 侧
+   反推的（`channel=unknown`）、原会话的 sctx 版本只能取 bundle 时的安装版本等（按实际遇到的情况写，不要照抄这个例子列表）。
 5. 每句结论前或段落开头用「建议：」标出，提醒这是建议不是定论；不给任何修复方案或代码改动建议，只给「建议人工核实
    XX」这类下一步。
 

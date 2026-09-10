@@ -52,19 +52,34 @@ python3 tests/scripts/session_replay/bundle.py \
 ```
 
 Modules:
-- `session_model.py` — host-agnostic `Session`/`Turn`/`Injection`/`SctxCall`
-  dataclasses shared by every host parser and by `bundle.py`.
+- `session_model.py` — host-agnostic `Session`/`Turn`/`SctxCall` dataclasses
+  shared by every host parser and by `bundle.py`, split (2026-09-10) into two
+  distinct channels: `HookInjection` (the hook `additionalContext`
+  marker/reminder channel — small, <=506 bytes observed on every September
+  rollout, and it never carries the Context Pack) and `PackDelivery` (the
+  Context Pack itself, delivered as the RESULT of an sctx MCP tool call —
+  see `hosts/codex.py`). An earlier version of this model folded both into
+  one `Injection` type, which mislabeled the pack's own channel-cap
+  truncation as "hook truncation" — see `hosts/codex.py`'s module docstring
+  for the correction.
 - `hosts/cursor.py` — parses a Cursor Agent transcript `.jsonl` into a
-  `Session`, and rebuilds the injection/hook timeline from sctx's own state
-  because the transcript carries neither. See its module docstring for the
-  verified line shapes, the human-prompt rule, the dynamic-tool wrapper sctx
-  MCP calls arrive in, and the turn-windowing used for reconstruction. See
-  "### cursor" under bundle below for the fidelity caveats.
+  `Session`, and rebuilds the pack-delivery/hook timeline from sctx's own
+  state because the transcript carries neither. See its module docstring for
+  the verified line shapes, the human-prompt rule, the dynamic-tool wrapper
+  sctx MCP calls arrive in, and the turn-windowing used for reconstruction.
+  See "### cursor" under bundle below for the fidelity caveats.
 - `hosts/codex.py` — parses a Codex rollout `.jsonl` into a `Session`. See
   its module docstring for the verified rollout line shapes, the human-
-  prompt / hook-injection detection rules, and how the sctx context "pack"
-  is recovered from the exec-wrapped MCP call record even when the model's
-  own copy was truncated or discarded.
+  prompt / hook-injection detection rules, and — the important part — where
+  the Context Pack actually travels: as the MCP tool RESULT of
+  `task_intent_update`/`task_context`, never over the hook channel. It is
+  wrapped in an `exec` code-mode script in every session observed so far
+  (`channel="code_mode_script"`), which is what can truncate it (Codex's own
+  ~10,000-token/~40,000-byte script-output cap — see
+  `CODE_MODE_SCRIPT_CAP_BYTES`), independent of the model discarding the
+  pack itself via a `.then(...)` wrapper before ever rendering it (see
+  `discard_wrapper` below) — two different failure modes, kept separate in
+  `facts.json`.
 - `sctx_facts.py` — queries `<HOME>/.shared-context/state/runtime.sqlite`
   read-only for one external session's rows across every sctx table it can
   link (task_session, task_injection, context_usage, candidate_review,
@@ -110,16 +125,24 @@ version, the sctx hook's `--agent-version` string from `hooks.json`, the
 reflecting the install at *bundle* time, not necessarily at *session* time).
 
 Validated against a real 2-turn session
-(`01a08017-95a0-7841-8ab9-09b582c62cb1`): turn 1's context pack had 16
-items and was truncated by the host's exec output-token cap; turn 2's pack
-had 15 items and was discarded by the model's own
-`.then(r=>({isError:r.isError}))` wrapper before it ever reached the
-model's context (so it shows `truncated=no` but tiny `wire_bytes` — a
-different failure mode, both visible in the digest, and separately caught
-by `discard_wrapper`); `checkpoint_reminder_count` was 2; the assistant
-text cited zero `ctx_` ids. `sctx_logs` shows this session's 27
-session-digest-matched hook events ending in `turn_stop` with no
-`session_end` among them, and `lease.lease_file_exists=true` two days
+(`01a08017-95a0-7841-8ab9-09b582c62cb1`): turn 1's `pack_deliveries[0]` had
+16 items (`bytes=31,727`, the compact pack sctx computed) delivered over
+`channel="code_mode_script"` with `channel_cap_bytes=40,000`, and it WAS
+truncated by that channel's own cap — `delivered_bytes=40,154`,
+`truncated=true`, `original_token_count=22949` parsed straight off the
+"Warning: truncated output (original token count: 22949)" marker on the
+paired `custom_tool_call_output`. This is Codex's script-output cap, not a
+hook cap — `hook_injections` in the same turn total 959 bytes across 3
+entries, nowhere near a cap of any kind. Turn 2's pack had 15 items
+(`bytes=32,094`) but the model's own `.then(r=>({isError:r.isError}))`
+wrapper discarded it before ever calling `text()` on it, so
+`delivered_bytes=438` while `truncated=false` — a different failure mode
+from turn 1's, kept distinguishable in `facts.json.pack_deliveries.per_turn`
+and separately caught by `discard_wrapper`; do not read turn 2's
+`truncated=false` as "the pack arrived intact". `checkpoint_reminder_count`
+was 2; the assistant text cited zero `ctx_` ids. `sctx_logs` shows this
+session's 27 session-digest-matched hook events ending in `turn_stop` with
+no `session_end` among them, and `lease.lease_file_exists=true` two days
 later — together making the human review's "SessionEnd payload
 undecodable, lease not cleaned" finding decidable from the bundle rather
 than only observable by reading the raw session. All of the above are
@@ -154,33 +177,45 @@ block and repeated in `facts.json` as `original.fidelity_notes`.
   to `projects/<slug>/agent-tools/<uuid>.txt`, but `tool_use` blocks carry no
   id and those files are shared across every conversation in the project, so
   they cannot be attributed back to a call and are deliberately not read.)
-- **Injections are reconstructed, not observed.** Cursor never writes a hook's
-  `additionalContext` into the transcript. Every `Injection` on the Cursor side
-  is rebuilt from `runtime.sqlite`'s `task_injection` rows and carries
-  `reconstructed_from=sctx:task_injection` on its digest line, with the
-  provenance in the digest's `## reconstruction` block, in
+- **Pack deliveries are reconstructed, not observed** (`hook_injections` is
+  simply always empty — see below). Cursor never writes a hook's
+  `additionalContext` into the transcript, and it never records an MCP tool
+  result either, so there is no wire evidence for the Context Pack at all.
+  Every `PackDelivery` on the Cursor side is rebuilt from `runtime.sqlite`'s
+  `task_injection` rows and carries `reconstructed_from=sctx:task_injection`
+  and `channel="unknown"` on its digest line, with the provenance in the
+  digest's `## reconstruction` block, in
   `facts.json.original.reconstruction`, and raw in
   `sctx/original/reconstruction.json`. Consequences:
-  - `ctx_ids` and the injection *time* are real; the injected **text** is
-    recoverable from nowhere, so `wire_bytes` and `est_tokens` are **0 as a
-    sentinel, not as a measurement**. Never compare a Cursor `wire_bytes`
-    against a Codex one.
-  - Rows sharing a `(source, injected_at_unix_seconds)` pair are one injection
-    event, so `injections.count` counts pushes (comparable across hosts), not
-    context ids (`injections.ctx_ids_total` is that).
-  - `kind` is the sctx `source` name prefixed with `sctx:`
-    (`sctx:intent_update`, `sctx:task_context`, `sctx:artifact_focus`), not a
-    Codex hook kind, because the two do not map onto each other.
+  - `ctx_ids` and the delivery *time* are real; the delivered **text** is
+    recoverable from nowhere, so `bytes` is **0 and `delivered_bytes`/
+    `channel_cap_bytes` are `None`/`"unknown"` as sentinels, not as a
+    measurement**. Never compare a Cursor `bytes`/`delivered_bytes` against
+    a Codex one.
+  - Rows sharing a `(source, injected_at_unix_seconds)` pair are one
+    delivery event, so `pack_deliveries.count` counts pushes (comparable
+    across hosts), not context ids (`pack_deliveries.ctx_ids_total` is
+    that).
+  - `tool` is the sctx `source` name prefixed with `sctx:`
+    (`sctx:intent_update`, `sctx:task_context`, `sctx:artifact_focus`), not
+    a real MCP tool-call name, because there is no call-level record to read
+    one from.
   - Attribution to a turn uses the `<timestamp>` tag Cursor prepends to each
     user message. It is **minute-granular**, so a row within ~60s of a turn
     boundary can land on either side. Turn 1's lower bound is left open so the
     session-start hook lands in turn 1. A transcript with no timestamp tags
     degrades to session-level: nothing is guessed into a turn, and the rows
     appear under `reconstruction.unwindowed` instead.
+- **`hook_injections` is always empty and `### hook injections` never
+  appears** — Cursor's transcript shows no hook output at all (not even the
+  small marker/reminder text Codex's hook writes), so there is nothing to
+  read or reconstruct it from. This is a structural absence, not evidence
+  the hook never ran; see the next bullet for what Cursor *can* show about
+  hook activity.
 - **Hook activity is a separate, reconstructed block.** Per-turn
   `### hook events` come from `~/.shared-context-logs/state/hook-diagnostics.json`
   filtered by this session's digest. They say a hook *ran*; they do not say
-  context arrived, which is why they are not folded into `injections`.
+  context arrived, which is why they are not folded into `pack_deliveries`.
 - **No token usage, model, git commit, cwd or compaction markers.** `### usage`
   is all zeros on the Cursor side and means "not recorded". The `cwd` in the
   header is *recovered* — from sctx's activation lease `startup_cwd`, else by
@@ -207,7 +242,7 @@ Validated against `7d8cbab1-0d90-4155-962b-7654f6f5bfcd` (2026-09-08, Cursor
 `task_checkpoint`×4, `candidate_list`×4, `candidate_discard`×1 — carrying 7
 claims across the 3 checkpoint calls whose arguments survived intact, and 1
 whose arguments the host truncated. 20 `task_injection` rows group into 3
-injection events (20 distinct context ids), all landing in turn 3, and 328
+pack-delivery events (20 distinct context ids), all landing in turn 3, and 328
 hook-diagnostics events match the session digest. `pack_usage` shows 0 of
 those 20 ids cited back in assistant text or in later sctx call arguments,
 while `sctx_db.context_usage` records all 20 as `ignored`. Note the

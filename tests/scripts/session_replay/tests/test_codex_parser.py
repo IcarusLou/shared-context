@@ -281,7 +281,7 @@ class TestCodexParser(unittest.TestCase):
 
     def test_session_start_injection_attached_to_turn_one(self):
         turn1 = self.session.turns[0]
-        session_start = [i for i in turn1.injections if i.kind == "session_start"]
+        session_start = [i for i in turn1.hook_injections if i.kind == "session_start"]
         self.assertEqual(len(session_start), 1)
         self.assertTrue(session_start[0].has_marker)
         self.assertEqual(session_start[0].marker_session_id, "syn-thread-0001")
@@ -290,13 +290,23 @@ class TestCodexParser(unittest.TestCase):
         self.assertEqual(len(self.session.other_injections), 1)
         self.assertIn("synthetic skills list", self.session.other_injections[0].text_head)
 
-    def test_pack_injection_ctx_ids_and_truncation(self):
+    def test_pack_delivery_ctx_ids_and_truncation(self):
         turn1 = self.session.turns[0]
-        pack = [i for i in turn1.injections if i.ctx_ids]
-        self.assertEqual(len(pack), 1)
-        self.assertEqual(sorted(pack[0].ctx_ids), ["ctx_0000000a-1111-2222-3333-444444444444", "ctx_0000000b-1111-2222-3333-444444444444"])
-        self.assertTrue(pack[0].truncated)  # paired output carried the truncation banner
-        self.assertEqual(pack[0].kind, "prompt_submit")
+        self.assertEqual(len(turn1.pack_deliveries), 1)
+        pack = turn1.pack_deliveries[0]
+        self.assertEqual(
+            sorted(pack.ctx_ids),
+            [
+                "ctx_0000000a-1111-2222-3333-444444444444",
+                "ctx_0000000b-1111-2222-3333-444444444444",
+            ],
+        )
+        self.assertEqual(pack.items_count, 2)
+        self.assertEqual(pack.tool, "task_intent_update")
+        self.assertTrue(pack.truncated)  # paired output carried the truncation banner
+        self.assertEqual(pack.original_token_count, 999)
+        self.assertEqual(pack.channel, "code_mode_script")
+        self.assertEqual(pack.channel_cap_bytes, 40_000)
 
     def test_sctx_calls_full_arguments_and_error_code(self):
         turn1 = self.session.turns[0]
@@ -338,6 +348,83 @@ class TestCodexParser(unittest.TestCase):
         # compaction flag; it does not propagate forward to turn 2.
         self.assertTrue(self.session.turns[0].compaction)
         self.assertFalse(self.session.turns[1].compaction)
+
+
+class TestPackDeliveryChannels(unittest.TestCase):
+    """Covers the 2026-09-10 correction: the Context Pack travels as an sctx
+    MCP tool RESULT, never over the hook additionalContext channel, and the
+    channel it takes (code_mode_script vs native_mcp) determines whether a
+    cap/truncation marker can even apply."""
+
+    def _parse(self, lines: list):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "r.jsonl"
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return parse_rollout(path)
+
+    def test_hook_injection_never_carries_ctx_ids_or_truncated_fields(self):
+        # HookInjection has no ctx_ids/truncated attributes at all any more —
+        # this is a structural guarantee, not just "happens to be empty".
+        from session_model import HookInjection
+
+        fields = {f for f in HookInjection.__dataclass_fields__}
+        self.assertNotIn("ctx_ids", fields)
+        self.assertNotIn("truncated", fields)
+
+    def test_native_mcp_channel_when_no_wrapping_exec_script_exists(self):
+        lines = [
+            _line(
+                0,
+                "session_meta",
+                {"id": "syn-native-0001", "cwd": "/tmp/x", "cli_version": "0.0.0", "originator": "codex-tui"},
+            ),
+            _line(
+                1,
+                "response_item",
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "native mcp prompt"}]},
+            ),
+            # No custom_tool_call wrapping this at all — a direct structured
+            # MCP call record with no exec pairing anywhere in the file.
+            _line(
+                2,
+                "event_msg",
+                {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "McpToolCall",
+                        "server": "shared-context",
+                        "tool": "task_context",
+                        "status": "ok",
+                        "arguments": {"agent_kind": "codex"},
+                        "result": {
+                            "content": [
+                                {
+                                    # Compact separators so this matches
+                                    # `bytes` (the compact re-serialization
+                                    # PackDelivery always computes) exactly,
+                                    # letting the test assert the native_mcp
+                                    # channel delivers the pack undiminished.
+                                    "text": json.dumps(
+                                        {"items": [{"context_id": "ctx_deadbeef00-1111-2222-3333-444444444444"}]},
+                                        separators=(",", ":"),
+                                    )
+                                }
+                            ]
+                        },
+                    },
+                },
+            ),
+        ]
+        session = self._parse(lines)
+        turn1 = session.turns[0]
+        self.assertEqual(len(turn1.pack_deliveries), 1)
+        pack = turn1.pack_deliveries[0]
+        self.assertEqual(pack.channel, "native_mcp")
+        self.assertIsNone(pack.channel_cap_bytes)
+        self.assertFalse(pack.truncated)
+        self.assertIsNone(pack.original_token_count)
+        self.assertIsNotNone(pack.delivered_bytes)
+        self.assertEqual(pack.delivered_bytes, pack.bytes)
 
 
 class TestDiscardWrapperDetection(unittest.TestCase):

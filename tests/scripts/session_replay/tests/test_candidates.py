@@ -15,7 +15,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from session_model import (  # noqa: E402
-    Injection,
+    HookInjection,
+    PackDelivery,
     SctxCall,
     Session,
     SessionMeta,
@@ -46,8 +47,9 @@ def build_synthetic_good_session() -> Session:
         ),
         assistant_texts=["done."],
         tool_calls=[_tool("exec", "cargo build"), _tool("exec", "cargo test")],
-        injections=[Injection(kind="prompt_submit", text="pack", has_marker=True,
-                               ctx_ids=["ctx_1", "ctx_2"])],
+        hook_injections=[HookInjection(kind="prompt_submit", text="marker", has_marker=True)],
+        pack_deliveries=[PackDelivery(tool="task_intent_update", items_count=2,
+                                       ctx_ids=["ctx_1", "ctx_2"])],
         sctx_calls=[SctxCall(tool="task_intent_update", arguments={"goal": "x"})],
     )
     session.turns.append(turn1)

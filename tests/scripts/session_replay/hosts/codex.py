@@ -24,55 +24,78 @@ values so it degrades gracefully on sessions this was not tested against.
 A human prompt is a `response_item` message with `role == "user"` whose
 joined text does not start with `# AGENTS.md instructions` or `<`.
 
-A hook injection is a `response_item` message with `role == "developer"`
-whose `payload.internal_chat_message_metadata_passthrough.content_item_kinds`
+A hook injection (`HookInjection`) is a `response_item` message with
+`role == "developer"` whose
+`payload.internal_chat_message_metadata_passthrough.content_item_kinds`
 contains `"hooks.additional_context"` — confirmed on the real file at the
 `<shared-context-active ...>` session-start banner. NOTE (schema surprise):
 by this literal rule, an unrelated third-party "this session is collected by
 an AI hook" notice in the same file carries the *same* content_item_kinds
-marker, so it is also classified as an injection rather than folded into
+marker, so it is also classified as a hook injection rather than folded into
 other_injections, even though the plan's prose lists "third-party hook
 notices" as an other_injections example. We follow the literal
 content_item_kinds rule since it is the only reliable signal in the data.
 
-## The sctx "pack" (verified on 01a08017)
+**Correction (2026-09-10, verified across every September rollout on this
+machine): the hook `additionalContext` channel does NOT carry the Context
+Pack.** Every sctx hook output observed all month is <=506 bytes —
+`PromptSubmit` itself emits `{}` plus, at most, an optional
+`systemMessage`. `HookInjection` therefore carries no `ctx_ids` and no
+`truncated` flag; it is a small marker/reminder channel, full stop. An
+earlier version of this parser folded the Context Pack into this same
+`Injection` type and consequently mislabeled the pack's OWN truncation as
+"hook truncation" — see the next section for where the pack actually
+travels and why that was wrong.
 
-sctx MCP calls are invoked by the model from inside an `exec` tool call as
+## The sctx Context Pack (`PackDelivery`, verified on 01a08017)
+
+The Context Pack reaches the model as the MCP **tool result** of
+`task_intent_update` / `task_context` (and any other sctx tool whose result
+contains a list-valued `items` key), never as a hook push. sctx MCP calls
+are invoked by the model from inside an `exec` tool call as
 `tools.mcp__shared_context__<tool>({...})` — there is no native structured
-tool-call item for them. The authoritative, complete record is the
-`event_msg` line with `payload.type == "item_completed"`,
-`payload.item.type == "McpToolCall"`, `item.server == "shared-context"`.
-`item.result.content[0].text` is the FULL JSON response text sctx computed,
-independent of whatever the model's exec sandbox actually surfaced back into
-its own context.
+tool-call item for them in either sample rollout, so we call this the
+`code_mode_script` channel; a future/other Codex build that instead issues
+the MCP call as a first-class structured tool call (no wrapping exec
+script) would be the `native_mcp` channel, and any session where neither
+form of wire evidence exists gets `channel="unknown"`.
 
-We treat any such call whose parsed JSON result contains a list-valued
-`items` key as a context "pack" delivered to the model, and additionally
-emit a synthetic `Injection` for it (kind `prompt_submit` if it is the
-turn's first sctx call, else `post_tool_use`). This reproduces the ground
-truth that turn 1 and turn 2 of 01a08017 "carried 16 and 15 context items"
-(`len(result['items'])`), which is otherwise invisible if you only look at
-hook-pushed developer messages (there are none carrying ctx_ ids in that
-file).
+The authoritative, complete pack record is the `event_msg` line with
+`payload.type == "item_completed"`, `payload.item.type == "McpToolCall"`,
+`item.server == "shared-context"`. `item.result.content[0].text` is the
+FULL JSON response text sctx computed, independent of whatever the model's
+exec sandbox actually surfaced back into its own context. `items_count` and
+`ctx_ids` are read from `items[i].context_id` directly (see the code
+comment at the call site for why a blanket `ctx_` regex over the whole pack
+overcounts), and `PackDelivery.bytes` is the compact-JSON size of that FULL
+record — the pack size sctx intended to send, regardless of channel outcome.
 
-Because the MCP call is wrapped in `exec`, what the model *actually saw* can
-differ sharply from what sctx computed: on 01a08017 turn 1 the paired
-`custom_tool_call_output` contains a host "Warning: truncated output"
-banner (the pack was cut by exec's max_output_tokens), while on turn 2 the
+Because the `code_mode_script` channel wraps the MCP call in `exec`, what
+the model *actually saw* can differ sharply from what sctx computed: on
+01a08017 turn 1 the paired `custom_tool_call_output` contains a host
+`"Warning: truncated output (original token count: 22949)"` banner — this
+is Codex's OWN code-mode script-output cap (~10,000 tokens, ~40,000 bytes;
+see `CODE_MODE_SCRIPT_CAP_BYTES`), not a hook cap — while on turn 2 the
 model's own wrapper script was `.then(r=>({isError:r.isError}))`, so it
-discarded the pack itself and the paired output is just `{"isError":false}`.
+discarded the pack itself before ever calling `text()` on it, and the
+paired output is just `{"isError":false}` (438 bytes). Both are visible as
+`delivered_bytes` far below `bytes`, but only turn 1 sets `truncated=True`
+(parsed from the script-output marker itself, via `_parse_truncation_marker`
+— accepts both an `"original token count: N"` and an `"N tokens
+truncated"` phrasing) with `original_token_count=22949`; turn 2's wrapper
+discard is a distinct failure mode the digest keeps separately visible
+under `discard_wrapper_hits` (see `find_discard_wrapper_hits`), not
+`truncated`.
+
 We pair each pack-bearing MCP call to its wrapping `custom_tool_call` /
 `custom_tool_call_output` by matching, within the same turn and in order of
 appearance, an exec `input` script that contains
-`mcp__shared_context__<tool>(` for the Nth call to that tool. `wire_bytes`
-and `truncated` are computed from that *paired, actually-delivered* text
-(falling back to the full sctx-side text if no pairing is found); `ctx_ids`
-and the injection `text` field use the FULL sctx-side record, since that is
-the only way to recover the true pack size (16 / 15) when the model
-discarded or never rendered its copy. This means `truncated=True` reflects
-a genuine host-side truncation (turn 1), while a model-side self-discard
-(turn 2) shows up as small `wire_bytes` with `truncated=False` — these are
-different failure modes and the digest keeps them distinguishable.
+`mcp__shared_context__<tool>(` for the Nth call to that tool
+(`_find_paired_exec_output`). A pairing found means `channel="code_mode_script"`;
+no pairing anywhere in the file for that call means `channel="native_mcp"`
+(the call must have reached the MCP server some other way) and
+`delivered_bytes` falls back to the full pack size (no channel cap is known
+to apply, so `truncated` stays False and `channel_cap_bytes` stays None).
 
 `item.started` variants of the McpToolCall event were not observed in
 either sample file; only `item_completed` is handled.
@@ -90,8 +113,9 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from session_model import (  # noqa: E402
     DiscardWrapperHit,
-    Injection,
+    HookInjection,
     OtherInjection,
+    PackDelivery,
     SctxCall,
     Session,
     SessionMeta,
@@ -102,7 +126,37 @@ from session_model import (  # noqa: E402
 
 CTX_ID_RE = re.compile(r"ctx_[0-9a-fA-F-]+")
 MARKER_SESSION_ID_RE = re.compile(r'external_session_id="([^"]+)"')
-TRUNCATION_MARKERS = ("Warning: truncated output",)
+
+# Codex's code-mode script-output cap: approximately 10,000 tokens, which we
+# report as ~40,000 bytes (4 bytes/token, a round number consistent with
+# `estimate_tokens`'s own ASCII-heavy divisor). This is a Codex sandbox limit
+# on the TOTAL text() output of one exec script, unrelated to anything sctx
+# or its hooks do — see the module docstring's "Correction" section.
+CODE_MODE_SCRIPT_CAP_BYTES = 40_000
+
+# Two phrasings observed/expected for the script-output truncation marker:
+# "Warning: truncated output (original token count: 22949)" (verified on
+# 01a08017) and a more compact "N tokens truncated" form the coordinator's
+# investigation found elsewhere. Both are matched; `original_token_count` is
+# taken from whichever one hits.
+TRUNCATION_MARKER_PATTERNS = (
+    re.compile(r"original token count:\s*(\d+)"),
+    re.compile(r"(\d+)\s*tokens truncated"),
+)
+TRUNCATION_MARKER_TEXT = "Warning: truncated output"
+
+
+def _parse_truncation_marker(text: str) -> tuple:
+    """Returns (truncated: bool, original_token_count: Optional[int]) parsed
+    from a channel-level script-output truncation marker in `text` — NOT a
+    heuristic over pack JSON shape. See TRUNCATION_MARKER_PATTERNS."""
+    if TRUNCATION_MARKER_TEXT not in text and not any(p.search(text) for p in TRUNCATION_MARKER_PATTERNS):
+        return False, None
+    for pattern in TRUNCATION_MARKER_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            return True, int(m.group(1))
+    return True, None
 
 # Discard-wrapper detection (verified against 01a08017 turn 2, where the
 # model wrapped its own task_intent_update MCP call as
@@ -179,18 +233,6 @@ def _is_cjk(ch: str) -> bool:
     )
 
 
-def _looks_truncated(text: str) -> bool:
-    if any(m in text for m in TRUNCATION_MARKERS):
-        return True
-    if "<shared-context-active" in text and "</shared-context-active>" not in text:
-        return True
-    if text.count("{") != text.count("}"):
-        return True
-    if text.count("[") != text.count("]"):
-        return True
-    return False
-
-
 def resolve_rollout_path(thread_id: str, codex_home: Optional[Path] = None) -> Optional[Path]:
     """Resolve a Codex thread id to its rollout .jsonl path.
 
@@ -241,7 +283,6 @@ class _TurnBuilder:
 
     def __init__(self, index: int, user_text: str):
         self.turn = Turn(index=index, user_text=user_text)
-        self._sctx_calls_seen = 0
         self._saw_tool_since_prompt = False
 
 
@@ -254,8 +295,7 @@ def parse_rollout(path: Path) -> Session:
     # SESSION-WIDE (not per-turn) occurrence counter per sctx tool name, used
     # only to pick out the Nth `mcp__shared_context__<tool>(` exec wrapper
     # for output pairing in _find_paired_exec_output, which scans the whole
-    # file. Deliberately separate from _TurnBuilder._sctx_calls_seen, which
-    # resets every turn and drives prompt_submit/post_tool_use classification.
+    # file.
     mcp_tool_global_seen: dict = {}
     # Set True the moment a compaction line is seen; used only to classify
     # the *next* hook injection's kind as "compact". It does NOT propagate
@@ -263,11 +303,11 @@ def parse_rollout(path: Path) -> Session:
     # which the compaction line itself appeared.
     just_compacted = False
 
-    def flush_injection(inj: Injection):
+    def flush_injection(inj: HookInjection):
         if builder is None:
             pending_injections.append(inj)
         else:
-            builder.turn.injections.append(inj)
+            builder.turn.hook_injections.append(inj)
 
     def flush_other(head: str):
         session.other_injections.append(OtherInjection(text_head=head[:80]))
@@ -350,12 +390,6 @@ def parse_rollout(path: Path) -> Session:
                         occ = mcp_tool_global_seen.get(tool, 0)
                         mcp_tool_global_seen[tool] = occ + 1
                         if isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
-                            kind = (
-                                "prompt_submit"
-                                if builder._sctx_calls_seen == 0
-                                else "post_tool_use"
-                            )
-                            builder._sctx_calls_seen += 1
                             # Use items[i].context_id directly rather than a
                             # blanket ctx_ regex over the whole result text:
                             # the pack JSON also carries "omitted" entries
@@ -373,22 +407,47 @@ def parse_rollout(path: Path) -> Session:
                                     if isinstance(it, dict) and it.get("context_id")
                                 }
                             )
-                            marker_match = MARKER_SESSION_ID_RE.search(result_text)
-                            delivered = _find_paired_exec_output(
-                                lines, tool, occ, line
+                            compact_bytes = len(
+                                json.dumps(parsed, ensure_ascii=False, separators=(",", ":")).encode(
+                                    "utf-8"
+                                )
                             )
-                            wire_text = delivered if delivered is not None else result_text
-                            inj = Injection(
-                                kind=kind,
-                                text=result_text,
-                                has_marker="<shared-context-active" in result_text,
-                                marker_session_id=marker_match.group(1) if marker_match else None,
+                            delivered = _find_paired_exec_output(lines, tool, occ, line)
+                            if delivered is not None:
+                                # This call was wrapped in an exec code-mode
+                                # script (verified: EVERY sctx MCP call in
+                                # 01a08017 takes this path) — the script's
+                                # own output-token cap, not any hook, is what
+                                # can truncate what the model actually saw.
+                                channel = "code_mode_script"
+                                channel_cap_bytes = CODE_MODE_SCRIPT_CAP_BYTES
+                                delivered_bytes = len(delivered.encode("utf-8"))
+                                truncated, original_token_count = _parse_truncation_marker(
+                                    delivered
+                                )
+                            else:
+                                # No wrapping exec script found anywhere in the
+                                # file for this occurrence — either a native,
+                                # unwrapped MCP call (no code-mode cap applies)
+                                # or evidence we simply don't have. Either way
+                                # we do not invent a cap or a truncation.
+                                channel = "native_mcp"
+                                channel_cap_bytes = None
+                                delivered_bytes = len(result_text.encode("utf-8"))
+                                truncated, original_token_count = False, None
+                            pack = PackDelivery(
+                                tool=tool,
+                                items_count=len(parsed["items"]),
                                 ctx_ids=ctx_ids,
-                                wire_bytes=len(wire_text.encode("utf-8")),
-                                est_tokens=estimate_tokens(result_text),
-                                truncated=_looks_truncated(wire_text),
+                                bytes=compact_bytes,
+                                channel=channel,
+                                channel_cap_bytes=channel_cap_bytes,
+                                delivered_bytes=delivered_bytes,
+                                truncated=truncated,
+                                original_token_count=original_token_count,
+                                text=result_text,
                             )
-                            builder.turn.injections.append(inj)
+                            builder.turn.pack_deliveries.append(pack)
             continue
 
         if ltype != "response_item":
@@ -413,7 +472,7 @@ def parse_rollout(path: Path) -> Session:
                     session.turns.append(builder.turn)
                     just_compacted = False
                     for inj in pending_injections:
-                        builder.turn.injections.append(inj)
+                        builder.turn.hook_injections.append(inj)
                     pending_injections.clear()
                     continue
                 else:
@@ -434,15 +493,13 @@ def parse_rollout(path: Path) -> Session:
                     kind = _infer_injection_kind(text, builder, just_compacted)
                     just_compacted = False
                     marker_match = MARKER_SESSION_ID_RE.search(text)
-                    inj = Injection(
+                    inj = HookInjection(
                         kind=kind,
                         text=text,
                         has_marker="<shared-context-active" in text,
                         marker_session_id=marker_match.group(1) if marker_match else None,
-                        ctx_ids=sorted(set(CTX_ID_RE.findall(text))),
                         wire_bytes=len(text.encode("utf-8")),
                         est_tokens=estimate_tokens(text),
-                        truncated=_looks_truncated(text),
                     )
                     flush_injection(inj)
                 else:

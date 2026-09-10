@@ -339,7 +339,8 @@ class CursorParserTests(unittest.TestCase):
         self.assertIn("hook injections are NOT recorded", joined)
 
     def test_no_injections_come_from_the_transcript_itself(self):
-        self.assertEqual(sum(len(turn.injections) for turn in self.session.turns), 0)
+        self.assertEqual(sum(len(turn.hook_injections) for turn in self.session.turns), 0)
+        self.assertEqual(sum(len(turn.pack_deliveries) for turn in self.session.turns), 0)
 
 
 class CursorReconstructionTests(unittest.TestCase):
@@ -369,20 +370,22 @@ class CursorReconstructionTests(unittest.TestCase):
 
     def test_events_land_in_the_turn_whose_window_contains_them(self):
         first, second = self.session.turns
-        self.assertEqual(len(first.injections), 1)
-        self.assertEqual(first.injections[0].ctx_ids, ["ctx_syn_a", "ctx_syn_b"])
-        self.assertEqual(first.injections[0].kind, "sctx:task_context")
-        self.assertEqual(len(second.injections), 1)
-        self.assertEqual(second.injections[0].ctx_ids, ["ctx_syn_c"])
+        self.assertEqual(len(first.pack_deliveries), 1)
+        self.assertEqual(first.pack_deliveries[0].ctx_ids, ["ctx_syn_a", "ctx_syn_b"])
+        self.assertEqual(first.pack_deliveries[0].tool, "sctx:task_context")
+        self.assertEqual(len(second.pack_deliveries), 1)
+        self.assertEqual(second.pack_deliveries[0].ctx_ids, ["ctx_syn_c"])
 
-    def test_every_reconstructed_injection_is_flagged_and_claims_no_wire_bytes(self):
+    def test_every_reconstructed_pack_delivery_is_flagged_and_claims_no_bytes(self):
         for turn in self.session.turns:
-            for injection in turn.injections:
-                self.assertEqual(injection.reconstructed_from, "sctx:task_injection")
-                self.assertEqual(injection.wire_bytes, 0)
-                self.assertEqual(injection.est_tokens, 0)
-                self.assertFalse(injection.has_marker)
-                self.assertIn("reconstructed from sctx", injection.text)
+            for pack in turn.pack_deliveries:
+                self.assertEqual(pack.reconstructed_from, "sctx:task_injection")
+                self.assertEqual(pack.bytes, 0)
+                self.assertIsNone(pack.delivered_bytes)
+                self.assertEqual(pack.channel, "unknown")
+                self.assertIsNone(pack.channel_cap_bytes)
+                self.assertFalse(pack.truncated)
+                self.assertIn("reconstructed from sctx", pack.text)
 
     def test_hook_events_are_bucketed_by_digest_and_by_window(self):
         first, second = self.session.turns
@@ -404,7 +407,7 @@ class CursorReconstructionTests(unittest.TestCase):
         record = reconstruct_from_sctx(session, self.home, external_session_id=CONVERSATION)
         self.assertIn("session-level only", record["windowing"])
         self.assertEqual(len(record["unwindowed"]["injection_events"]), 2)
-        self.assertEqual(sum(len(turn.injections) for turn in session.turns), 0)
+        self.assertEqual(sum(len(turn.pack_deliveries) for turn in session.turns), 0)
 
     def test_load_session_reports_an_unknown_cwd_instead_of_inventing_one(self):
         session, path = load_session(

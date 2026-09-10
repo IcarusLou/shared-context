@@ -35,21 +35,68 @@ class SctxCall:
 
 
 @dataclass
-class Injection:
+class HookInjection:
+    """A hook-pushed `hooks.additional_context` developer message: the
+    marker banner, maintenance reminders, and similar small text sctx's hook
+    writes back into the model's own turn.
+
+    This channel does NOT carry the Context Pack. Investigation across every
+    September 2026 rollout established every sctx hook output is <=506
+    bytes (`PromptSubmit` itself emits `{}` plus, at most, an optional
+    `systemMessage`) — see `hosts/codex.py`'s module docstring and
+    `PackDelivery` below for where the pack actually travels.
+    """
+
     kind: str  # session_start | prompt_submit | post_tool_use | compact | unknown
     text: str  # FULL, never truncated
     has_marker: bool = False
     marker_session_id: Optional[str] = None
-    ctx_ids: list = field(default_factory=list)  # unique ctx_ ids, sorted
     wire_bytes: int = 0
     est_tokens: int = 0
+
+
+@dataclass
+class PackDelivery:
+    """One Context Pack delivered as the RESULT of an sctx MCP tool call
+    (`task_intent_update` / `task_context` / ...) — not over the hook
+    `additionalContext` channel (see `HookInjection`). See
+    `hosts/codex.py`'s module docstring for the wire-path evidence and the
+    `native_mcp` vs `code_mode_script` channel distinction, and its meaning
+    for `truncated`/`channel_cap_bytes`/`delivered_bytes`.
+    """
+
+    tool: str
+    items_count: int = 0
+    ctx_ids: list = field(default_factory=list)  # unique ctx_ ids, sorted
+    # Compact-JSON byte size of the FULL/authoritative pack sctx computed
+    # (json.dumps with no whitespace) — the pack size sctx intended to send,
+    # independent of how much of it actually crossed the channel.
+    bytes: int = 0
+    channel: str = "unknown"  # native_mcp | code_mode_script | unknown
+    # code_mode_script's ~10,000-token (~40,000-byte) script-output cap, when
+    # the channel is known to have one; None when no cap is known to apply.
+    channel_cap_bytes: Optional[int] = None
+    # Bytes actually observed crossing the channel (e.g. the paired
+    # `custom_tool_call_output` text), when that evidence exists; None when
+    # unmeasurable (no pairing found, or the channel is `unknown`/Cursor).
+    delivered_bytes: Optional[int] = None
+    # Parsed specifically from a channel-level truncation marker (e.g.
+    # Codex's "Warning: truncated output (original token count: N)" on
+    # `custom_tool_call_output`) — NOT a heuristic over the pack JSON itself,
+    # and NOT the same thing as a hook truncating (hooks never carry the pack
+    # at all, see HookInjection).
     truncated: bool = False
-    # None: read straight out of the host transcript (Codex). Otherwise a short
-    # tag naming the out-of-band source this Injection was rebuilt from because
-    # the host transcript does not record injections at all (Cursor), e.g.
-    # "sctx:task_injection". A reconstructed Injection knows WHICH context ids
-    # were injected and WHEN, but not the injected text, so `text` carries a
-    # synthetic one-line summary and `wire_bytes`/`est_tokens` stay 0.
+    # The "original token count: N" (or equivalent) the truncation marker
+    # itself reports, when `truncated` is True and the marker states it.
+    original_token_count: Optional[int] = None
+    text: str = ""  # FULL text for the digest: the pack JSON (Codex) or a synthetic summary (Cursor)
+    # None: read straight out of the host transcript/MCP record (Codex).
+    # Otherwise a short tag naming the out-of-band source this PackDelivery
+    # was rebuilt from because the host transcript does not record MCP
+    # results at all (Cursor), e.g. "sctx:task_injection". A reconstructed
+    # PackDelivery knows WHICH context ids were injected and WHEN, but not
+    # the delivered bytes/channel, so those stay 0/None/"unknown", not a
+    # guess.
     reconstructed_from: Optional[str] = None
 
 
@@ -104,7 +151,8 @@ class Turn:
     tool_calls: list = field(default_factory=list)  # list[ToolCall]
     tool_outputs_head_count: int = 0
     sctx_calls: list = field(default_factory=list)  # list[SctxCall]
-    injections: list = field(default_factory=list)  # list[Injection]
+    hook_injections: list = field(default_factory=list)  # list[HookInjection]
+    pack_deliveries: list = field(default_factory=list)  # list[PackDelivery]
     discard_wrapper_hits: list = field(default_factory=list)  # list[DiscardWrapperHit]
     compaction: bool = False
     usage: Usage = field(default_factory=Usage)

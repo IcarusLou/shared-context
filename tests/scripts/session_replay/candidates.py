@@ -300,14 +300,15 @@ def compute_metrics(agent: str, thread_id: str, session: Session, rollout_bytes:
         ext_dep_hits.extend(_external_dep_hits(tc.args_head))
     external_deps = len(ext_dep_hits)
 
-    all_injections = [inj for t in turns for inj in t.injections]
+    all_hook_injections = [inj for t in turns for inj in t.hook_injections]
+    all_pack_deliveries = [pack for t in turns for pack in t.pack_deliveries]
     all_sctx_calls = [sc for t in turns for sc in t.sctx_calls]
-    with_marker = sum(1 for i in all_injections if i.has_marker)
+    with_marker = sum(1 for i in all_hook_injections if i.has_marker)
     sctx_calls_count = len(all_sctx_calls)
     sctx_active = with_marker > 0 and sctx_calls_count > 0
     ctx_ids = set()
-    for inj in all_injections:
-        ctx_ids.update(inj.ctx_ids)
+    for pack in all_pack_deliveries:
+        ctx_ids.update(pack.ctx_ids)
 
     m = session.meta
     repo_id = _match_repository(m.cwd, repo_entries)
