@@ -7265,6 +7265,90 @@ fn shared_context_skill_contract_drives_mcp_runtime_and_search_response() {
     assert!(data["tree"].as_str().is_some());
 }
 
+/// MCP requires every tool result to carry a text copy equivalent to `structuredContent`, so a
+/// Context Pack is delivered twice inside one envelope. The text copy is therefore compact JSON:
+/// indentation carries nothing a parser needs, and a host that wraps the MCP call in a script
+/// (Codex code-mode) truncates that script's output at a fixed approximate token count, so the
+/// indentation was spending the budget that the tail of a large Pack needed.
+#[test]
+fn tool_result_text_is_compact_json_equivalent_to_structured_content() {
+    let fixture = Fixture::new();
+    for index in 0..16 {
+        let statement = format!(
+            "stdio MCP transport rule {index}: the Codex and Cursor clients share one framing boundary, and the server never renegotiates it mid-session"
+        );
+        let revision_added =
+            Event::context_revision_added(fixture.space_id, draft(&statement), None).unwrap();
+        let (context_id, revision_id) = context_identity(&revision_added);
+        append(&fixture.store, revision_added);
+        append(
+            &fixture.store,
+            Event::publication_changed(
+                fixture.space_id,
+                context_id,
+                PublicationDraft {
+                    previous_publication_ids: Vec::new(),
+                    action: PublicationAction::Publish,
+                    revision_id,
+                    review_event_ids: Vec::new(),
+                },
+                None,
+            )
+            .unwrap(),
+        );
+    }
+
+    let arguments = serde_json::to_value(update_input(
+        "compact-envelope",
+        TaskBoundary::New,
+        None,
+        "MCP Contract",
+    ))
+    .unwrap();
+    let responses = run_authorized_session(
+        &fixture.root,
+        &mut fixture.server(ClientKind::Codex),
+        FixtureFraming::Newline,
+        &[
+            request(1, "initialize", json!({"protocolVersion": "2024-11-05"})),
+            tool_call(2, "task_intent_update", arguments),
+        ],
+    );
+    let result = &responses[1]["result"];
+    assert_eq!(result["isError"], false);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !text.contains('\n'),
+        "the text copy must stay on one line: indentation is pure envelope cost"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(text).unwrap(),
+        result["structuredContent"],
+        "the text copy must parse back to exactly the structured result"
+    );
+
+    let structured = &result["structuredContent"];
+    assert!(
+        structured["items"].as_array().unwrap().len() >= 8,
+        "the measurement needs a Pack of real size, got {}",
+        structured["items"]
+    );
+    let pretty = serde_json::to_string_pretty(structured).unwrap();
+    assert!(
+        text.len() * 10 < pretty.len() * 9,
+        "compact {} bytes must undercut pretty {} bytes by more than a tenth",
+        text.len(),
+        pretty.len()
+    );
+    println!(
+        "pack items={} compact_text={} pretty_text={} envelope={} (text + structuredContent)",
+        structured["items"].as_array().unwrap().len(),
+        text.len(),
+        pretty.len(),
+        serde_json::to_vec(result).unwrap().len()
+    );
+}
+
 #[test]
 fn malformed_json_is_typed_and_does_not_stop_the_session() {
     let fixture = Fixture::new();

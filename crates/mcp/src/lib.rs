@@ -8894,9 +8894,14 @@ fn rpc_error(
     })
 }
 
+/// The `text` copy is compact JSON on purpose. MCP requires a text representation equivalent to
+/// `structuredContent`, so both travel on every result and the envelope already costs about twice
+/// the pack it carries; pretty-printing added a further ~18% in indentation alone. Hosts that wrap
+/// an MCP call in a script (Codex code-mode) cap that script's output at a fixed approximate token
+/// count, so the indentation was truncating the tail of a large Context Pack.
 #[allow(clippy::needless_pass_by_value)]
 fn tool_success(data: Value) -> Result<Value> {
-    let text = serde_json::to_string_pretty(&data)
+    let text = serde_json::to_string(&data)
         .map_err(|error| Error::new(ErrorKind::Io, format!("serialize tool result: {error}")))?;
     Ok(json!({
         "content": [{"type": "text", "text": text}],
@@ -8906,7 +8911,7 @@ fn tool_success(data: Value) -> Result<Value> {
 }
 
 /// Same envelope as [`tool_success`], but appends a plain-text operator note after the
-/// pretty-printed JSON body. The note is presentation only: `structuredContent` (the public
+/// compact JSON body. The note is presentation only: `structuredContent` (the public
 /// response schema) is unchanged, and no field here can be mistaken for an accepted Candidate —
 /// only `candidate_confirm` produces one.
 #[allow(clippy::needless_pass_by_value)]
@@ -8914,7 +8919,7 @@ fn tool_success_with_notice(
     data: Value,
     notice: impl FnOnce(&Value) -> Option<String>,
 ) -> Result<Value> {
-    let mut text = serde_json::to_string_pretty(&data)
+    let mut text = serde_json::to_string(&data)
         .map_err(|error| Error::new(ErrorKind::Io, format!("serialize tool result: {error}")))?;
     if let Some(notice) = notice(&data) {
         text.push_str("\n\n");
@@ -8927,7 +8932,7 @@ fn tool_success_with_notice(
     }))
 }
 
-const CANDIDATE_TRIAGE_POLICY: &str = "Triage each Pending Review by top_assessment.relation. Discard with candidate_discard, decision_source agent_policy, and a reason naming the ground: an exact_duplicate of a still-accepted Context adding no applicability condition or Evidence, or process-level code reading. Confirm with candidate_confirm, decision_source agent_policy, and no edits: ready_for_review novel or supports rows carrying a genuine decision, contract, verified conclusion, counter-intuitive finding, newly understood mechanism, or a user correction to your proposal that later proved right. On auto_confirm_not_permitted, escalate; do not change fields and retry. Escalate everything else: potential_contradiction, revises, duplicates needing a supersede decision, Space governance, incomplete analysis, and uncertainty. Present only these to the user in a compact table (topic, statement, relation) with your recommendation; do not wait to be asked.";
+const CANDIDATE_TRIAGE_POLICY: &str = "Triage each Pending Review by top_assessment.relation. Discard with candidate_discard, decision_source agent_policy, and a reason naming the ground: an exact_duplicate of a still-accepted Context adding no applicability condition or Evidence, or process-level code reading that is not a progress summary. Confirm with candidate_confirm, decision_source agent_policy, and no edits: ready_for_review novel or supports rows carrying a genuine decision, contract, verified conclusion, counter-intuitive finding, newly understood mechanism, a user correction to your proposal that later proved right, or a progress summary of paths changed, verified state and remaining work. On auto_confirm_not_permitted, escalate; do not change fields and retry. Escalate everything else: potential_contradiction, revises, duplicates needing a supersede decision, Space governance, incomplete analysis, and uncertainty. Present only these to the user in a compact table (topic, statement, relation) with your recommendation; do not wait to be asked.";
 
 /// Post-Checkpoint guidance appended to the ACK text whenever the Checkpoint was accepted (and
 /// therefore always queued a Candidate Build; ADR-0003).
@@ -8959,7 +8964,7 @@ fn tool_failure(failure: ToolFailure) -> Result<Value> {
             "message": failure.error.message(),
         }
     });
-    let text = serde_json::to_string_pretty(&data)
+    let text = serde_json::to_string(&data)
         .map_err(|error| Error::new(ErrorKind::Io, format!("serialize tool error: {error}")))?;
     Ok(json!({
         "content": [{"type": "text", "text": text}],

@@ -12,7 +12,8 @@ Checkpoint after forming a conclusion worth keeping, and, when one exists, immed
 - a contract: an interface, schema, or cross-platform constraint;
 - a verified result, with what was run and what it does not establish;
 - a counter-intuitive finding, or a newly understood mechanism;
-- a correction the user made to your own proposal that later proved right.
+- a correction the user made to your own proposal that later proved right;
+- a stage summary of what is now in place after a long stretch of autonomous work, recorded as `context_kind: progress`.
 
 Not worth keeping:
 
@@ -22,13 +23,13 @@ Not worth keeping:
 - a routine build, compile, or test success; a validation is worth keeping only when its result is counter-intuitive or constrains someone else;
 - restating what a single function or component visibly does, however precisely — that is the code's own job.
 
+A `progress` row is bounded by cadence, not topic. Record one only at a task boundary — the end of a long autonomous stretch, before a `task_boundary: "new"`, before compaction, before ending the session — at most one per boundary, never per turn or per file. Write it as a map, not an explanation: which paths changed for what purpose, what state things are in now, what was verified and what was not, what remains; how the code works is process-level and stays excluded. The test: could the next person resume from this branch in five minutes with only this row? One per Task: when the Context Pack already shows a `progress` Context for this Task, submit the new one as a revision of it, not a sibling — its Review returns `revises`, which section 7 escalates for the user's `supersedes` decision. `progress` rows expire by TTL (`[context_ttl] progress` in `config.toml`), so they do not accumulate.
+
 When the user asks you to record something, apply the same filter. If the point is derivable from the code or history, ask which part is non-obvious and record that instead.
 
-Leaving a row out costs the knowledge base nothing. A row that only says you read a file costs every later reader. Having nothing to keep is a complete answer at either boundary: empty `claims` and `unknowns` are the `no_op` of section 6, recording nothing and leaving the checkpoint as pending as it already was, so never send one to look compliant. The opposite lapse costs more: announcing a checkpoint is not making one, so when you tell the user you are recording something, call `task_checkpoint` in the same turn.
+Leaving a row out costs the knowledge base nothing: a lost conclusion is re-checkpointed the next time it matters. A row that only says you read a file costs every later reader, and a low-value row costs retrieval itself — it ranks beside the real facts and dilutes every later query, and it keeps costing until someone withdraws it. Having nothing to keep is a complete answer at either boundary: empty `claims` and `unknowns` are the `no_op` of section 6, recording nothing and leaving the checkpoint as pending as it already was, so never send one to look compliant. The opposite lapse costs more: announcing a checkpoint is not making one, so when you tell the user you are recording something, call `task_checkpoint` in the same turn. When unsure, leave it out.
 
-Leaving a row out costs the knowledge base nothing: a lost conclusion is re-checkpointed the next time it matters. A low-value row costs retrieval itself — it ranks beside the real facts and dilutes every later query, and it keeps costing until someone withdraws it. When unsure, leave it out.
-
-Before submitting a Claim, ask three questions. Would this change what the next person does? Would it still hold, with its conditions stated, after this diff is merged and forgotten? Could a later reader re-derive it from the code, the diff, or the PR in under a minute — and if they could, what is the one non-obvious part worth keeping instead? A Checkpoint that survives all three is usually one to three Claims; needing more than five in one call is a sign the filter did not run.
+Before submitting a Claim of the first five kinds, ask three questions. Would this change what the next person does? Would it still hold, with its conditions stated, after this diff is merged and forgotten? Could a later reader re-derive it from the code, the diff, or the PR in under a minute — and if they could, what is the one non-obvious part worth keeping instead? A Checkpoint that survives all three is usually one to three Claims; needing more than five in one call is a sign the filter did not run. A `progress` Claim answers the five-minute-resume test instead.
 
 ## 2. Kinds
 
@@ -121,9 +122,9 @@ This section is the one place the three disposition tiers are defined; the `sctx
 
 Every Pending Review goes into exactly one of three tiers. Two are yours; the third is always the user's.
 
-**Discard it yourself** with `candidate_discard`, `decision_source: "agent_policy"`, and a `reason` naming the ground, when either holds. First, `top_assessment.relation` is `exact_duplicate`, the Context named by `target_context_id` is still `accepted` (read it with `context_get` if the Context Pack has not already shown it), and this Candidate adds no new applicability condition and no new Evidence. Second, the Claim is only process-level understanding under section 1. A discard is a local runtime decision that writes no Git fact, so a wrong one costs a later re-Checkpoint, not a correction.
+**Discard it yourself** with `candidate_discard`, `decision_source: "agent_policy"`, and a `reason` naming the ground, when either holds. First, `top_assessment.relation` is `exact_duplicate`, the Context named by `target_context_id` is still `accepted` (read it with `context_get` if the Context Pack has not already shown it), and this Candidate adds no new applicability condition and no new Evidence. Second, the Claim is only process-level code reading under section 1 — a `progress` stage summary naming paths, verified state and remaining work is not that. A discard is a local runtime decision that writes no Git fact, so a wrong one costs a later re-Checkpoint, not a correction.
 
-**Confirm it yourself** with `candidate_confirm`, `decision_source: "agent_policy"`, and no `edits`, when the row is `ready_for_review`, its `top_assessment.relation` is `novel` or `supports`, and the conclusion is worth keeping under section 1. The server checks the same permission surface and refuses anything outside it as `auto_confirm_not_permitted`. That refusal reports a missing permission, not a malformed request: do not change fields and retry; move the Candidate to the third tier.
+**Confirm it yourself** with `candidate_confirm`, `decision_source: "agent_policy"`, and no `edits`, when the row is `ready_for_review`, its `top_assessment.relation` is `novel` or `supports`, and the conclusion is worth keeping under section 1, including a `progress` row that names the paths changed, what was verified and what remains. The server checks the same permission surface and refuses anything outside it as `auto_confirm_not_permitted`. That refusal reports a missing permission, not a malformed request: do not change fields and retry; move the Candidate to the third tier.
 
 **Escalate to the user** for everything else: `potential_contradiction` and `revises` rows; an `exact_duplicate` that deserves a supersede decision rather than a discard; Space governance beyond an existing Space or a server recommendation; a Review whose analysis is incomplete; and anything you are not sure about. Present those rows, and only those, as one compact table with topic, statement, relation, and your recommended disposition, then carry out the decision the user makes. Omitting `decision_source`, or sending `human`, records that they decided.
 

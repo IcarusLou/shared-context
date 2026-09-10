@@ -28,7 +28,12 @@ const DESCRIPTION_BASELINE_BYTES: usize = 6644;
 ///
 /// The same budget U1 held itself to. It is a discipline, not a capacity: the descriptions are
 /// read on every single tools/list, by every host, for the whole session.
-const DESCRIPTION_BUDGET_BYTES: usize = 1536;
+///
+/// Raised once, by 128 bytes, for the sixth "worth keeping" type accepted on 2026-09-10: the
+/// triage policy has to say that a `progress` stage summary is auto-confirmable and that the
+/// process-level discard ground does not swallow it. Both clauses were written as short as they
+/// can be said; the raise is the deliberate decision the discipline exists to force.
+const DESCRIPTION_BUDGET_BYTES: usize = 1664;
 
 fn tools() -> Vec<Value> {
     let temporary = tempfile::tempdir().unwrap();

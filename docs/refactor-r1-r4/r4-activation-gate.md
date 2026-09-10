@@ -31,3 +31,11 @@ The invoked [review-gated-development skill](/Users/bytedance/.codex/skills/revi
 ## U-002 supplement
 
 The user additionally required real Cursor coverage whenever Codex real smoke is used. This independently authorized test/rule work is complete in cafe920; [paired evidence](paired-real-host-smoke.md) covers both real CLI hosts on the same signed product build. Future gates use AGENTS.md/DEVELOPMENT and the paired verifier. The follow-up did not approve production activation; H-002 remains pending. Existing production Runtime/table data was verified unchanged after both smokes.
+
+## 送达预算按信封计费（wire option 3）待裁定
+
+- 现状：`token_budget` 标称 8000 计的是紧凑 Pack JSON 本身，但 MCP 结果必须同时携带等价的 `text` 副本与 `structuredContent`，实际送达约为标称的 2.1–2.24 倍。
+- 实测（`tool_result_text_is_compact_json_equivalent_to_structured_content`，17 items）：紧凑 text 14283 B，pretty text 18307 B，整条结果信封 29686 B ≈ 紧凑 Pack 的 2.08 倍。
+- Wire option 1（text 改紧凑 JSON）已落地，省下缩进的约 22%；信封的双份成本是 MCP 协议要求，不能靠删 `text` 消除。
+- Codex code-mode 把 MCP 调用包在脚本里，脚本输出上限 10000 approx tokens（`ceil(utf8_bytes/4)`），9-8 会话 71759 B 的结果即在此被截断。
+- 待裁定：是否让 `token_budget` 按信封倍率计费（wire option 3）。这会改变 Pack 组成与截断位置，属于排序冻结口径，因此归入激活前的 ranking-freeze 决策，不在 R4 代码范围内单独改。
