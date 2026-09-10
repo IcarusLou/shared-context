@@ -598,6 +598,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--commit", default=None, help="override the guessed commit")
     parser.add_argument("--model", default=None, help="override the model")
     parser.add_argument("--agent-bin", default=CURSOR_AGENT_DEFAULT)
+    parser.add_argument(
+        "--sctx-bin",
+        default=None,
+        help="replay a DEV BUILD instead of the installed sctx: the binary is copied into "
+        "the isolated HOME's .shared-context/bin/current/sctx, which is already what the "
+        "generated hooks.json and mcp.json name, and the managed skill bundles are taken "
+        "from the checkout it was built from. Cursor has no hook trust hashes to repair.",
+    )
     parser.add_argument("--turn-timeout", type=int, default=1800, help="seconds per turn")
     parser.add_argument("--dry-run", action="store_true", help="print the plan and exit")
     return parser
@@ -619,6 +627,7 @@ def print_plan(original: CursorOriginal, turns: int | None, replay_id: str, args
     print(f"  session window      {original.started_at} .. {original.ended_at}")
     print(f"  checkout mode       {args.checkout} -> {checkout}")
     print(f"  cursor home mode    {args.cursor_home}")
+    print(f"  sctx binary         {args.sctx_bin or 'installed (~/.shared-context/bin/current)'}")
     print(f"  sctx calls in orig  {len(original.sctx_tool_calls)} {sorted(set(original.sctx_tool_calls))}")
     print(f"  host prompts skipped {original.host_prompts_skipped}")
     print(f"  human prompts       {len(original.prompts)} total, replaying {len(selected)}")
@@ -640,6 +649,11 @@ def main(argv: list[str] | None = None) -> int:
     agent = shutil.which(args.agent_bin) or shutil.which("agent")
     if agent is None:
         raise ReplayError(f"{args.agent_bin} is not on PATH")
+    sctx_bin: pathlib.Path | None = None
+    if args.sctx_bin:
+        sctx_bin = pathlib.Path(os.path.expanduser(args.sctx_bin)).resolve()
+        if not sctx_bin.is_file() or not os.access(sctx_bin, os.X_OK):
+            raise ReplayError(f"--sctx-bin {sctx_bin} is not an executable file")
 
     real_home = pathlib.Path(os.path.expanduser("~"))
     real_cursor_home = pathlib.Path(
@@ -702,7 +716,7 @@ def main(argv: list[str] | None = None) -> int:
 
     home = replay_dir / "home"
     home_record = build_replay_home(
-        home, real_home, warnings, skip_paths=(audit_root,)
+        home, real_home, warnings, skip_paths=(audit_root,), sctx_bin=sctx_bin
     )
     binary = home / ".shared-context" / "bin" / "current" / "sctx"
     if not binary.exists():
@@ -879,6 +893,11 @@ def main(argv: list[str] | None = None) -> int:
             "resolved_binary": str(binary.resolve()) if binary.exists() else None,
             "version": version.stdout.strip() or version.stderr.strip(),
         },
+        # Present only under --sctx-bin. Both a dev build and the installed one
+        # print the same workspace version, so the sha256 is what identifies the
+        # bytes that ran; `skill_bundle` says which skill text was in effect.
+        "sctx_bin": home_record.get("sctx_bin"),
+        "skill_bundle": home_record.get("skill_bundle"),
         "cursor": {
             "executable": agent,
             "version": agent_version.stdout.strip() or agent_version.stderr.strip(),
@@ -913,7 +932,19 @@ def main(argv: list[str] | None = None) -> int:
             "host/hook-input.jsonl before invoking the real binary with the same stdin",
             "Cursor's own auto follow-up prompts (see hosts/cursor.py "
             "HOST_QUERY_PREFIXES) are not replayed; only human prompts are",
-        ],
+        ]
+        + (
+            [
+                f"--sctx-bin: the replay ran the dev build at {sctx_bin} copied into the "
+                "isolated HOME, not the operator's installed sctx; the generated hooks.json "
+                "and mcp.json name it, and ~/.agents/skills/{shared-context,sctx-review} "
+                "came from that binary's own source tree rather than from the installed "
+                "bundles. Cursor registers hooks by plain command, so there is no trust "
+                "hash to recompute the way the Codex path has to"
+            ]
+            if sctx_bin is not None
+            else []
+        ),
         "warnings": warnings,
     }
     manifest_path = replay_dir / "manifest.json"

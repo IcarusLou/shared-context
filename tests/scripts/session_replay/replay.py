@@ -27,6 +27,7 @@ import argparse
 import contextlib
 import datetime as dt
 import glob
+import hashlib
 import json
 import os
 import pathlib
@@ -40,6 +41,10 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Iterator
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+import codex_trust  # noqa: E402
 
 # Codex writes one JSON object per rollout line: {timestamp, ordinal, type, payload}.
 ROLLOUT_GLOB = "sessions/*/*/*/rollout-*-{thread_id}.jsonl"
@@ -104,6 +109,28 @@ HOME_OVERLAY_EXCLUSIONS = (
     ".codex",
     ".cursor",
 )
+
+# `~/.agents/skills/` holds the managed Agent Skill bundles, and `sctx setup`
+# writes them there from bytes the binary carries (`SKILL_ASSETS` in
+# crates/installer, `include_bytes!` off `skills/` at build time). Symlinking the
+# real `~/.agents` into the replay HOME therefore runs a dev binary against the
+# *installed* skill text, which is a silent mismatch on the one input that steers
+# the agent hardest. With `--sctx-bin` the directory is excluded from the overlay
+# and rebuilt: the two managed bundles are copied from the source tree the binary
+# was built from, and every other skill the operator has is symlinked through, so
+# the agent still sees the same machine.
+MANAGED_SKILL_BUNDLES = ("shared-context", "sctx-review")
+GLOBAL_SKILLS_DIRECTORY = pathlib.PurePath(".agents", "skills")
+
+# Where a Shared Context installation root keeps the binary the hooks and the MCP
+# server are invoked through. `sctx` resolves this from `$HOME` with no override,
+# so a replay of a dev build has to put the dev build *here*.
+SCTX_BIN_RELATIVE = pathlib.PurePath("bin", "current", "sctx")
+
+# Any `<something>/.shared-context/bin/<version>/sctx` inside a hook command line.
+# The real `hooks.json` hard-codes the installed path; rewriting it is what lets a
+# replay drive a dev build without touching the operator's installation.
+SCTX_COMMAND_PATH = re.compile(r"""[^\s'"]*/\.shared-context/bin/[^\s'"]*/sctx""")
 
 # A tool call whose name contains this is the agent asking the operator something
 # and blocking on the answer. Headless, nobody answers, and the turn ends with the
@@ -561,13 +588,146 @@ def start_log_collector(
         return None
 
 
+def file_digest(path: pathlib.Path) -> str:
+    """sha256 of one file, so the manifest can name exact bytes rather than a path."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def place_sctx_binary(sctx_root: pathlib.Path, sctx_bin: pathlib.Path) -> pathlib.Path:
+    """Copies a dev build into the snapshot's own `bin/current/sctx`.
+
+    A copy, not a symlink: `sctx` resolves its installation root from `$HOME`, and
+    a symlink back into `~/.shared-context/bin` would make the replay's binary the
+    operator's again the moment the real install is upgraded mid-run. `embedding/`
+    stays a symlink (2.3G of model weights nothing writes to).
+    """
+    target = sctx_root / SCTX_BIN_RELATIVE
+    private_mkdir(target.parent.parent)
+    private_mkdir(target.parent)
+    shutil.copy2(sctx_bin, target)
+    target.chmod(0o700)
+    return target
+
+
+def sctx_bin_facts(
+    binary: pathlib.Path, source: pathlib.Path, home: pathlib.Path
+) -> dict[str, Any]:
+    """What the manifest records about the binary this replay actually ran."""
+    version = subprocess.run(
+        [str(binary), "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=dict(os.environ, HOME=str(home)),
+    )
+    return {
+        "source_path": str(source),
+        "resolved_source_path": str(source.resolve()),
+        "installed_path": str(binary),
+        "sha256": file_digest(binary),
+        "bytes": binary.stat().st_size,
+        "version": version.stdout.strip() or version.stderr.strip(),
+    }
+
+
+def resolve_skill_source(sctx_bin: pathlib.Path, warnings: list[str]) -> pathlib.Path | None:
+    """Finds the `skills/` tree of the checkout a dev binary was built from.
+
+    The installer embeds the bundle with `include_bytes!("../../../skills/...")`,
+    so "the skills that match this binary" is literally `<repo>/skills` of the
+    tree it was compiled in -- and `target/{debug,release}/sctx` puts that two
+    directories up. The walk is by marker file rather than by fixed depth so a
+    `--target-dir` build still resolves.
+    """
+    for parent in sctx_bin.resolve().parents:
+        candidate = parent / "skills"
+        if all(
+            (candidate / bundle / "SKILL.md").is_file() for bundle in MANAGED_SKILL_BUNDLES
+        ):
+            return candidate
+    warn(
+        warnings,
+        f"no skills/ tree with {', '.join(MANAGED_SKILL_BUNDLES)} above {sctx_bin}; "
+        "the replay HOME keeps the operator's INSTALLED skill bundles, which may not "
+        "match this binary",
+    )
+    return None
+
+
+def install_skill_bundle(
+    home: pathlib.Path, real_home: pathlib.Path, source: pathlib.Path, warnings: list[str]
+) -> dict[str, Any]:
+    """Rebuilds `<home>/.agents` so the managed bundles match the binary under replay.
+
+    Everything the operator has under `~/.agents` is symlinked through -- the
+    replay is supposed to be the same machine -- except the two Shared Context
+    bundles, which are copied from `source` (the checkout the binary was built
+    from). Per-file digests go into the manifest, because "which skill bytes were
+    in effect" is not answerable from a version string.
+    """
+    real_agents = real_home / ".agents"
+    agents = private_mkdir(home / ".agents")
+    if real_agents.is_dir():
+        for entry in sorted(real_agents.iterdir()):
+            if entry.name == "skills":
+                continue
+            with contextlib.suppress(OSError):
+                os.symlink(entry, agents / entry.name)
+    skills = private_mkdir(home / GLOBAL_SKILLS_DIRECTORY)
+    linked: list[str] = []
+    real_skills = real_agents / "skills"
+    if real_skills.is_dir():
+        for entry in sorted(real_skills.iterdir()):
+            if entry.name in MANAGED_SKILL_BUNDLES:
+                continue
+            with contextlib.suppress(OSError):
+                os.symlink(entry, skills / entry.name)
+                linked.append(entry.name)
+    files: dict[str, dict[str, Any]] = {}
+    for bundle in MANAGED_SKILL_BUNDLES:
+        origin = source / bundle
+        if not origin.is_dir():
+            warn(warnings, f"{origin} is missing; that skill bundle is absent from the replay")
+            continue
+        shutil.copytree(origin, skills / bundle, dirs_exist_ok=True)
+        for path in sorted(p for p in (skills / bundle).rglob("*") if p.is_file()):
+            relative = str(path.relative_to(skills))
+            files[relative] = {"bytes": path.stat().st_size, "sha256": file_digest(path)}
+    bundle_digest = hashlib.sha256(
+        json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    log(f"skill bundles: copied {len(files)} files from {source}, symlinked {len(linked)} others")
+    return {
+        "source": str(source),
+        "installed_at": str(skills),
+        "bundles": list(MANAGED_SKILL_BUNDLES),
+        "files": files,
+        "bundle_sha256": bundle_digest,
+        "symlinked_other_skills": linked,
+    }
+
+
 def build_replay_home(
     home: pathlib.Path,
     real_home: pathlib.Path,
     warnings: list[str],
     overlay_exclusions: tuple[str, ...] = HOME_OVERLAY_EXCLUSIONS,
     skip_paths: tuple[pathlib.Path, ...] = (),
+    sctx_bin: pathlib.Path | None = None,
 ) -> dict[str, Any]:
+    """Builds the replay HOME. With ``sctx_bin`` it is a *dev build's* HOME.
+
+    Without it nothing changes: `bin/` is a symlink back to the operator's
+    installation and `.agents` comes through the overlay, so the replay exercises
+    the installed `sctx` and the installed skill text. With it, `bin/current/sctx`
+    is a copy of the given binary and `.agents/skills/{shared-context,sctx-review}`
+    are copied from the checkout that binary was built from -- the two halves of
+    "this installation", kept in step with each other.
+    """
     private_mkdir(home)
     real_sctx = real_home / ".shared-context"
     if not real_sctx.is_dir():
@@ -582,8 +742,14 @@ def build_replay_home(
             continue
         log(f"snapshotting {source} -> {sctx / name}")
         snapshot_state_tree(source, sctx / name)
+    binary_record: dict[str, Any] | None = None
     for name in ("embedding", "bin"):
         source = real_sctx / name
+        if name == "bin" and sctx_bin is not None:
+            placed = place_sctx_binary(sctx, sctx_bin)
+            binary_record = sctx_bin_facts(placed, sctx_bin, home)
+            log(f"sctx binary: copied {sctx_bin} -> {placed} ({binary_record['version']})")
+            continue
         if source.exists():
             os.symlink(source, sctx / name)
         else:
@@ -600,14 +766,42 @@ def build_replay_home(
     (sctx / "config.toml").write_text(body, encoding="utf-8")
     (sctx / "config.toml").chmod(0o600)
 
+    # `policy.md` is the installation's own text for the `## session` / `## checkpoint`
+    # / `## triage` sections the tool surface carries. It is optional: an install
+    # without one gets the binary's built-in default, which is what the replay then
+    # gets too. Copying it when present keeps the replay on the operator's wording.
+    policy = real_sctx / "policy.md"
+    copied = ["state", "repository", "config.toml"]
+    if policy.is_file():
+        shutil.copy2(policy, sctx / "policy.md")
+        (sctx / "policy.md").chmod(0o600)
+        copied.append("policy.md")
+
     # Telemetry resolves its root from HOME. The directory is the replay's own, so
     # nothing it records reaches the operator's spool -- but it is configured
     # rather than left empty, because an empty one records nothing at all.
+    # The log service is part of what a replay of a dev build has to exercise: hook
+    # decisions reach `hook-diagnostics.json` through it, and that file is the
+    # replay side's only record that a hook ran at all.
     logs = setup_replay_logs(
-        home / ".shared-context-logs", (real_sctx / "bin" / "current" / "sctx"), warnings
+        home / ".shared-context-logs",
+        (sctx / SCTX_BIN_RELATIVE) if sctx_bin is not None else (real_sctx / SCTX_BIN_RELATIVE),
+        warnings,
     )
 
+    if sctx_bin is not None:
+        overlay_exclusions = tuple(dict.fromkeys(overlay_exclusions + (".agents",)))
     overlay = overlay_real_home(home, real_home, overlay_exclusions, warnings, skip_paths)
+    skills: dict[str, Any] | None = None
+    if sctx_bin is not None:
+        source = resolve_skill_source(sctx_bin, warnings)
+        if source is None:
+            # Better the operator's installed bundles than none at all; the warning
+            # above already says the skill text may not match the binary.
+            with contextlib.suppress(OSError):
+                os.symlink(real_home / ".agents", home / ".agents")
+        else:
+            skills = install_skill_bundle(home, real_home, source, warnings)
     if not (home / ".agents").exists():
         warn(warnings, f"{real_home / '.agents'} is missing; skill bundles will not load")
     if not (home / ".gitconfig").exists():
@@ -616,10 +810,12 @@ def build_replay_home(
     return {
         "path": str(home),
         "snapshot_taken_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "copied": ["state", "repository", "config.toml"],
-        "symlinked": ["embedding", "bin"],
+        "copied": copied + (["bin/current/sctx"] if sctx_bin is not None else []),
+        "symlinked": ["embedding"] if sctx_bin is not None else ["embedding", "bin"],
         "overlay": overlay,
         "logs": logs,
+        "sctx_bin": binary_record,
+        "skill_bundle": skills,
     }
 
 
@@ -708,36 +904,181 @@ def register_checkout(
 # --------------------------------------------------------------------------
 
 
+def drop_hook_state_tables(body: str, key_prefix: str) -> tuple[str, int]:
+    """Removes every ``[hooks.state."<key_prefix>..."]`` table from a config.toml body.
+
+    Used when the replay writes its own ``hooks.json``: the operator's stored
+    hashes describe the operator's hook entries, and leaving them behind under a
+    rewritten path would make Codex read them as ``Modified`` and refuse to run
+    the hook -- the failure this whole mechanism exists to avoid.
+    """
+    lines = body.splitlines(keepends=True)
+    kept: list[str] = []
+    dropped = 0
+    skipping = False
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith("["):
+            skipping = stripped.startswith(f'[hooks.state."{key_prefix}')
+            if skipping:
+                dropped += 1
+                continue
+        if skipping:
+            continue
+        kept.append(line)
+    return "".join(kept), dropped
+
+
+def retarget_sctx_hooks(
+    hooks_file: dict[str, Any], binary: pathlib.Path
+) -> tuple[dict[str, Any], int]:
+    """Points every Shared Context hook command in a hooks.json at ``binary``.
+
+    Everything else about the entry -- the event it is registered for, the
+    ``--agent codex --agent-version '<x>'`` arguments, the quoting, the status
+    message -- is left exactly as the operator's installer wrote it, because the
+    argument string is part of what is being replayed.
+    """
+    replaced = 0
+    for ref in codex_trust.iter_hook_handlers(hooks_file):
+        command = ref.handler.get("command")
+        if not isinstance(command, str) or not SCTX_COMMAND_PATH.search(command):
+            continue
+        ref.handler["command"] = SCTX_COMMAND_PATH.sub(str(binary), command)
+        replaced += 1
+    return hooks_file, replaced
+
+
+def retarget_mcp_command(body: str, server: str, binary: pathlib.Path) -> tuple[str, bool]:
+    """Rewrites ``[mcp_servers.<server>] command = ...`` in a config.toml body.
+
+    The app-server driver passes no ``-c`` overrides, so for that driver the
+    copied ``config.toml`` is the only place the MCP server's command is stated.
+    """
+    lines = body.splitlines(keepends=True)
+    inside = False
+    changed = False
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            inside = stripped == f"[mcp_servers.{server}]"
+            continue
+        if inside and stripped.startswith("command"):
+            lines[index] = f"command = {toml_string(str(binary))}\n"
+            changed = True
+            inside = False
+    return "".join(lines), changed
+
+
 def build_codex_home(
     target: pathlib.Path,
     real_codex_home: pathlib.Path,
     checkout: pathlib.Path,
     warnings: list[str],
-) -> None:
+    sctx_bin: pathlib.Path | None = None,
+) -> dict[str, Any]:
     """Mirrors the real Codex home closely enough that hooks and plugins still load.
 
     Codex 0.153.4 refuses to run a hook unless config.toml holds a
-    ``[hooks.state."<hooks.json path>:<event>:0:0"]`` entry whose ``trusted_hash``
-    matches. The key is *keyed by the absolute path of the hooks file*, so a
-    verbatim copy of both files into a new CODEX_HOME trusts nothing. Rewriting
-    only the path prefix inside those keys -- the hashes cover the hook entries,
-    which are copied byte for byte -- restores trust without the
-    ``--dangerously-bypass-hook-trust`` escape hatch.
+    ``[hooks.state."<hooks.json path>:<event>:<group>:<handler>"]`` entry whose
+    ``trusted_hash`` matches the hash it recomputes from the hook entry. The key
+    is *keyed by the absolute path of the hooks file*, so a verbatim copy of both
+    files into a new CODEX_HOME trusts nothing.
+
+    Two routes out of that, and which one is taken depends on whether the replay
+    is allowed to change the hook entries:
+
+    - **No ``sctx_bin``** (unchanged behaviour): the hook entries are copied byte
+      for byte, so their hashes are unchanged and only the *path prefix* inside
+      the state keys has to be rewritten.
+    - **With ``sctx_bin``**: the hook commands have to name the dev binary, which
+      changes their hashes, so the operator's state entries are dropped and fresh
+      ones are computed with `codex_trust`. Before trusting that computation the
+      operator's own entries are recomputed and compared against what Codex
+      stored -- if that disagrees, this build of Codex hashes differently and the
+      replay says so instead of silently running with hooks disabled.
+
+    Neither route needs ``--dangerously-bypass-hook-trust``.
     """
     private_mkdir(target)
     config = real_codex_home / "config.toml"
     if not config.is_file():
         raise ReplayError(f"{config} does not exist")
+    real_hooks = real_codex_home / "hooks.json"
+    target_hooks = target / "hooks.json"
     body = config.read_text(encoding="utf-8")
-    hooks_key_prefix = f'[hooks.state."{real_codex_home / "hooks.json"}:'
-    rewritten_keys = body.count(hooks_key_prefix)
-    body = body.replace(hooks_key_prefix, f'[hooks.state."{target / "hooks.json"}:')
-    if rewritten_keys == 0:
+    record: dict[str, Any] = {"hooks_json": str(target_hooks), "sctx_bin_retargeted": False}
+
+    if sctx_bin is None:
+        hooks_key_prefix = f'[hooks.state."{real_hooks}:'
+        rewritten_keys = body.count(hooks_key_prefix)
+        body = body.replace(hooks_key_prefix, f'[hooks.state."{target_hooks}:')
+        if rewritten_keys == 0:
+            warn(
+                warnings,
+                f"no [hooks.state] entries in {config} name {real_hooks}; "
+                "Codex may refuse to run the Shared Context hooks in the isolated CODEX_HOME",
+            )
+        record["trust"] = {"mode": "path-prefix-rewrite", "state_keys_rewritten": rewritten_keys}
+    else:
+        if not real_hooks.is_file():
+            raise ReplayError(f"{real_hooks} does not exist; nothing to retarget")
+        hooks_file = codex_trust.load_hooks_file(real_hooks)
+
+        # Self-check first: recompute the operator's *unmodified* entries and
+        # compare them with what Codex itself stored. Agreement is the evidence
+        # that the hashes written below will be accepted.
+        stored = codex_trust.read_config_hook_states(config)
+        reference = codex_trust.hook_state_entries(hooks_file, str(real_hooks))
+        agreed = sum(1 for key, value in reference.items() if stored.get(key) == value)
+        if agreed != len(reference):
+            warn(
+                warnings,
+                f"the replay's hook-hash implementation reproduces only {agreed} of "
+                f"{len(reference)} trusted_hash values Codex stored for {real_hooks}; "
+                "the hooks in the isolated CODEX_HOME may be refused as untrusted "
+                f"(codex_trust follows openai/codex {codex_trust.CODEX_SOURCE_COMMIT})",
+            )
+
+        hooks_file, retargeted = retarget_sctx_hooks(hooks_file, sctx_bin)
+        if retargeted == 0:
+            warn(
+                warnings,
+                f"no hook command in {real_hooks} names a Shared Context binary; "
+                "the replay's hooks still point wherever the operator's did",
+            )
+        target_hooks.write_text(
+            json.dumps(hooks_file, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        target_hooks.chmod(0o600)
+
+        body, dropped = drop_hook_state_tables(body, f"{real_hooks}:")
+        entries = codex_trust.hook_state_entries(hooks_file, str(target_hooks))
+        body = body.rstrip("\n") + "\n\n" + codex_trust.render_hook_state(entries)
+        record["sctx_bin_retargeted"] = True
+        record["trust"] = {
+            "mode": "recomputed",
+            "codex_source_commit": codex_trust.CODEX_SOURCE_COMMIT,
+            "operator_entries_reproduced": f"{agreed}/{len(reference)}",
+            "state_keys_dropped": dropped,
+            "state_keys_written": len(entries),
+            "trusted_hashes": entries,
+            "hook_commands_retargeted": retargeted,
+        }
+
+    body, mcp_changed = retarget_mcp_command(body, "shared-context", sctx_bin) if sctx_bin else (
+        body,
+        False,
+    )
+    record["mcp_command_retargeted"] = mcp_changed
+    if sctx_bin is not None and not mcp_changed:
         warn(
             warnings,
-            f"no [hooks.state] entries in {config} name {real_codex_home / 'hooks.json'}; "
-            "Codex may refuse to run the Shared Context hooks in the isolated CODEX_HOME",
+            f"no [mcp_servers.shared-context] command in {config} to retarget; the "
+            "app-server driver passes no -c overrides, so the MCP server may start the "
+            "operator's installed binary",
         )
+
     # A checkout Codex has never seen is untrusted, which in a headless run means
     # the sandbox tightens without saying so. The original cwd carries this mark
     # already; the replay checkout inherits it.
@@ -746,6 +1087,8 @@ def build_codex_home(
     (target / "config.toml").chmod(0o600)
 
     for name in CODEX_HOME_COPIES:
+        if name == "hooks.json" and sctx_bin is not None:
+            continue  # written above, retargeted
         source = real_codex_home / name
         if source.is_file():
             shutil.copy2(source, target / name)
@@ -755,6 +1098,7 @@ def build_codex_home(
         source = real_codex_home / name
         if source.exists() and not (target / name).exists():
             os.symlink(source, target / name)
+    return record
 
 
 # --------------------------------------------------------------------------
@@ -1388,6 +1732,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="stop: end the replay after a turn in which the agent asked the operator "
         "something (default); next-prompt: answer with the next original prompt",
     )
+    parser.add_argument(
+        "--sctx-bin",
+        default=None,
+        help="replay a DEV BUILD instead of the installed sctx: the binary is copied into "
+        "the isolated HOME's .shared-context/bin/current/sctx, the isolated hooks.json "
+        "and mcp_servers command are pointed at it, matching Codex hook trust hashes are "
+        "computed (see codex_trust.py), and the managed skill bundles are taken from the "
+        "checkout it was built from. Omitted, nothing changes.",
+    )
     parser.add_argument("--turn-timeout", type=int, default=1800, help="seconds per turn")
     parser.add_argument(
         "--turn-stop-timeout",
@@ -1420,6 +1773,7 @@ def print_plan(original: Original, turns: int | None, replay_id: str, audit_root
     print(f"  workspace roots     {original.workspace_roots}")
     print(f"  checkout mode       {args.checkout} -> {checkout}")
     print(f"  codex home mode     {args.codex_home}")
+    print(f"  sctx binary         {args.sctx_bin or 'installed (~/.shared-context/bin/current)'}")
     print(f"  driver              {args.driver}")
     print(f"  on question         {args.on_question}")
     print(f"  audit root          {audit_root}")
@@ -1477,6 +1831,11 @@ def main(argv: list[str] | None = None) -> int:
     codex = shutil.which("codex")
     if codex is None:
         raise ReplayError("codex is not on PATH")
+    sctx_bin: pathlib.Path | None = None
+    if args.sctx_bin:
+        sctx_bin = pathlib.Path(os.path.expanduser(args.sctx_bin)).resolve()
+        if not sctx_bin.is_file() or not os.access(sctx_bin, os.X_OK):
+            raise ReplayError(f"--sctx-bin {sctx_bin} is not an executable file")
 
     rollout, index_row = locate_rollout(args.session)
     original = parse_original(args.session, rollout, index_row)
@@ -1529,6 +1888,7 @@ def main(argv: list[str] | None = None) -> int:
             name for name in HOME_OVERLAY_EXCLUSIONS if name != ".cursor"
         ),
         skip_paths=(audit_root,),
+        sctx_bin=sctx_bin,
     )
     binary = home / ".shared-context" / "bin" / "current" / "sctx"
     if not binary.exists():
@@ -1539,14 +1899,24 @@ def main(argv: list[str] | None = None) -> int:
     real_codex_home = codex_home()
     if args.codex_home == "isolated":
         effective_codex_home = replay_dir / "codex-home"
-        build_codex_home(effective_codex_home, real_codex_home, checkout, warnings)
+        codex_home_record = build_codex_home(
+            effective_codex_home, real_codex_home, checkout, warnings, sctx_bin=sctx_bin
+        )
     else:
         effective_codex_home = real_codex_home
+        codex_home_record = {}
         warn(
             warnings,
             f"running against the real CODEX_HOME ({real_codex_home}); the replayed rollout "
             "lands beside the operator's own sessions",
         )
+        if sctx_bin is not None:
+            warn(
+                warnings,
+                "--sctx-bin with --codex-home real cannot retarget the hooks: the operator's "
+                "~/.codex/hooks.json still names the INSTALLED binary, so the hooks run that "
+                "one while the MCP server runs the dev build",
+            )
 
     environment = dict(os.environ)
     environment["HOME"] = str(home)
@@ -1555,7 +1925,7 @@ def main(argv: list[str] | None = None) -> int:
     environment.pop("SCTX_LOGS_ROOT", None)
 
     collector = start_log_collector(
-        real_home / ".shared-context" / "bin" / "current" / "sctx",
+        binary if sctx_bin is not None else real_home / ".shared-context" / SCTX_BIN_RELATIVE,
         home / ".shared-context-logs",
         replay_dir / "log-collector.log",
     )
@@ -1710,6 +2080,14 @@ def main(argv: list[str] | None = None) -> int:
         "CODEX_HOME is a copy when --codex-home isolated, so history and thread index start empty",
         "the worktree is the original commit, not the original working tree",
     ]
+    if sctx_bin is not None:
+        deviations.append(
+            f"--sctx-bin: the replay ran the dev build at {sctx_bin} copied into the isolated "
+            "HOME, not the operator's installed sctx; hooks.json and mcp_servers.shared-context "
+            "were rewritten to name it and fresh Codex hook trust hashes were computed, and "
+            "~/.agents/skills/{shared-context,sctx-review} came from that binary's own source "
+            "tree rather than from the installed bundles"
+        )
     if args.driver != "app-server":
         deviations.append(
             "session_start_per_turn: true -- `codex exec resume` starts a new process per turn, "
@@ -1759,6 +2137,7 @@ def main(argv: list[str] | None = None) -> int:
             "mode": args.codex_home,
             "path": str(effective_codex_home),
             "real_path": str(real_codex_home),
+            **codex_home_record,
         },
         "home": home_record,
         "flags": {
@@ -1783,6 +2162,11 @@ def main(argv: list[str] | None = None) -> int:
             "resolved_binary": str(binary.resolve()) if binary.exists() else None,
             "version": version.stdout.strip() or version.stderr.strip(),
         },
+        # Present only under --sctx-bin. `sctx.version` alone cannot tell a dev
+        # build from the installed one (both print the workspace version), so the
+        # sha256 is what actually identifies the bytes that ran.
+        "sctx_bin": home_record.get("sctx_bin"),
+        "skill_bundle": home_record.get("skill_bundle"),
         "codex": {
             "executable": codex,
             "version": codex_version.stdout.strip() or codex_version.stderr.strip(),

@@ -41,6 +41,7 @@ the Markdown digest / facts.json.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -571,6 +572,7 @@ def get_versions_facts(
     # (e.g. "0.2.0-dev.9/arm64"), not the executable itself; the binary is
     # `current/sctx` inside it.
     sctx_version_output = None
+    sctx_bin_sha256 = None
     sctx_bin = bin_current / "sctx"
     if sctx_bin.exists():
         try:
@@ -579,6 +581,20 @@ def get_versions_facts(
             )
             sctx_version_output = (proc.stdout or proc.stderr or "").strip() or None
         except (OSError, subprocess.SubprocessError):
+            pass
+        # The version string cannot tell a `replay.py --sctx-bin` dev build from
+        # the installed release -- both print the workspace version -- and
+        # `sctx_bin_current_target` is null for a replay HOME, where
+        # `bin/current` is a real directory holding a copy rather than the
+        # installation's symlink. The digest is what identifies the bytes that
+        # ran; compare it against `manifest.sctx_bin.sha256`.
+        try:
+            digest = hashlib.sha256()
+            with sctx_bin.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            sctx_bin_sha256 = digest.hexdigest()
+        except OSError:
             pass
 
     return {
@@ -590,6 +606,7 @@ def get_versions_facts(
         "codex_cli_version": cli_version if agent_kind == "codex" else None,
         "hooks_json_agent_version": hooks_agent_version,
         "sctx_bin_current_target": bin_current_target,
+        "sctx_bin_sha256": sctx_bin_sha256,
         "sctx_version_output": sctx_version_output,
         "note": (
             "reflects the install at bundle time, not necessarily at session "

@@ -102,6 +102,17 @@ Modules:
   `collector-status.json`, `upload-status.json` (surfaces a `logs_sync`
   failure), and the `spool/ready/` batch count. Feeds `facts.json`'s
   `sctx_logs` block.
+- `codex_trust.py` — reimplements Codex's hook **trust hash** so `replay.py
+  --sctx-bin` can write a `hooks.json` of its own and still have Codex run it.
+  See "Replaying a dev build" under replay for the algorithm, the pinned
+  openai/codex commit it was read at, and the verifier
+  (`python3 codex_trust.py --config ~/.codex/config.toml`) that recomputes every
+  real `[hooks.state]` entry as proof.
+- `tests/test_codex_trust.py` — the hash's normalization rules (absent matcher,
+  matcher-dropping events, timeout defaults and the SessionEnd clamp,
+  `additionalContextLimit`, positional handler indices, skipped handler kinds)
+  and `replay.py`'s retargeting glue, all against synthetic hooks.json /
+  config.toml files built inline — no real hook command, path or hash.
 - `tests/test_codex_parser.py` — unittest against a synthetic minimal
   rollout built inline in the test file (no real transcript text), plus the
   discard-wrapper regex tests.
@@ -112,7 +123,7 @@ Modules:
   the turn-windowed reconstruction (including the degrade-to-session-level
   path for an undated transcript).
 
-Run both with
+Run them all with
 `python3 -m unittest discover -s tests/scripts/session_replay/tests`.
 
 `facts.json` per side also carries: `discard_wrapper` (turns where an exec
@@ -263,7 +274,7 @@ mirror is written into the manifest under `deviations` and `warnings`.
 ```sh
 python3 tests/scripts/session_replay/replay.py --session <thread_id> \
   [--turns N|all] [--audit-root ~/.shared-context-audit] \
-  [--checkout worktree|inplace] [--codex-home isolated|real] \
+  [--checkout worktree|inplace] [--codex-home isolated|real] [--sctx-bin PATH] \
   [--driver app-server|exec-resume] [--on-question stop|next-prompt] [--dry-run]
 ```
 
@@ -381,12 +392,15 @@ replay that writes into it would corrupt the very state the audit measures.
   - Codex 0.153.4 will not run a hook unless `config.toml` carries a matching
     `[hooks.state."<absolute hooks.json path>:<event>:0:0"] trusted_hash`, and
     that key is *keyed by the path*. A verbatim copy into a new `CODEX_HOME`
-    therefore trusts nothing and the hooks never fire. `replay.py` rewrites only
-    the path prefix inside those keys — the hashes cover the hook entries, which
-    are copied byte for byte — which restores trust without needing
-    `--dangerously-bypass-hook-trust`. This is verified working: the replayed
-    rollout contains the `hooks.additional_context` developer message carrying
-    `<shared-context-active external_session_id="<new thread id>">`.
+    therefore trusts nothing and the hooks never fire. Without `--sctx-bin`,
+    `replay.py` rewrites only the path prefix inside those keys — the hashes
+    cover the hook entries, which are copied byte for byte — which restores trust
+    without needing `--dangerously-bypass-hook-trust`. This is verified working:
+    the replayed rollout contains the `hooks.additional_context` developer
+    message carrying
+    `<shared-context-active external_session_id="<new thread id>">`. With
+    `--sctx-bin` the hook entries *have* to change, so the hash is recomputed
+    instead — see "Replaying a dev build" below.
   - `--codex-home real` is the fallback if a future Codex changes that scheme.
     `HOME` still points at the replay snapshot; only the rollout moves back to
     `~/.codex/sessions`.
@@ -415,6 +429,164 @@ fingerprints of the real `~/.shared-context` taken before and after the run,
 `real_shared_context_unchanged`, and the replayed thread's
 `external_session`/`task_injection`/`context_usage` rows looked up in *both*
 the replay state and the real state.
+
+### Replaying a dev build (`--sctx-bin`)
+
+By default a replay can only exercise the `sctx` that is *installed*, because the
+isolated `CODEX_HOME` copies the real `hooks.json` whose commands hard-code
+`/Users/<you>/.shared-context/bin/current/sctx`. `--sctx-bin
+target/release/sctx` replays a dev build instead, without touching the real
+installation:
+
+```sh
+cargo build --release -p sctx-cli
+python3 tests/scripts/session_replay/replay.py --session <thread_id> --turns 1 \
+  --sctx-bin target/release/sctx --turn-timeout 2400
+```
+
+Five things change, and only when the flag is given:
+
+- **The binary is copied**, not symlinked, to
+  `<replay home>/.shared-context/bin/current/sctx`. `sctx` resolves its
+  installation root from `$HOME` with no override, so this is the only place it
+  can go; a symlink back into `~/.shared-context/bin` would silently become the
+  operator's binary again the moment the real install is upgraded mid-run.
+  `embedding/` stays a symlink as before (2.3G nothing writes to).
+- **`hooks.json` is written, not copied.** Every hook command whose path matches
+  `…/.shared-context/bin/…/sctx` is retargeted at the dev binary; the event, the
+  `--agent codex --agent-version '<x>'` arguments, the quoting and the status
+  message are left byte-identical, because the argument string is part of what is
+  being replayed. Hooks belonging to anything else (a corporate telemetry plugin,
+  a project `.codex/hooks.json`) are untouched.
+- **The hook trust hashes are recomputed** — see below.
+- **`mcp_servers.shared-context.command`** in the isolated `config.toml` is
+  pointed at the same binary. This matters specifically for the default
+  `app-server` driver, which passes no `-c` overrides, so the copied
+  `config.toml` is the only place the MCP command is stated.
+- **The managed skill bundles come from the binary's own source tree.**
+  `~/.agents/skills/{shared-context,sctx-review}` is what `sctx setup` writes out
+  of bytes the binary carries (`SKILL_ASSETS` in `crates/installer`, which are
+  `include_bytes!` off `skills/` at build time). Symlinking the real `~/.agents`
+  through the HOME overlay would therefore run a dev binary against the
+  *installed* skill text — a silent mismatch on the input that steers the agent
+  hardest. So `.agents` is excluded from the overlay and rebuilt: the two managed
+  bundles are copied from the `skills/` tree found above the binary, every other
+  skill the operator has is symlinked through, and the manifest's `skill_bundle`
+  records the source path plus a sha256 and byte count for every file, so "which
+  skill bytes were in effect" is answerable from the bundle rather than guessed.
+
+`manifest.sctx_bin` records the source path, the installed path, the sha256 and
+the `--version` output. Read the **sha256**, not the version: a dev build and the
+installed release print the same workspace version string, so only the digest
+tells them apart.
+
+Everything else is unchanged. Without `--sctx-bin` not one of the five happens,
+and the manifest carries `sctx_bin: null` / `skill_bundle: null`.
+
+`replay_cursor.py` takes the same flag and does the first, second, fourth and
+fifth of those. Cursor needs no third: it registers hooks by plain command with
+no hashes anywhere, and `build_cursor_home` already *generates* its `hooks.json`
+and `mcp.json` against `<replay home>/.shared-context/bin/current/sctx`, so
+placing the dev binary there is the whole job.
+
+#### The trust hash, reproduced
+
+Retargeting a hook command changes the hook entry, which changes the hash Codex
+recomputes at discovery time, which makes the operator's stored `trusted_hash`
+read as `Modified` — and a `Modified` hook does not run. So `codex_trust.py`
+reimplements Codex's own hash, `replay.py` drops the operator's `[hooks.state]`
+tables for `~/.codex/hooks.json` and appends freshly computed ones for the
+isolated file. No `--dangerously-bypass-hook-trust`.
+
+The algorithm, read from openai/codex at commit
+`c7c824dce4da186e5142af5d9a1587ae553efe46` (the exact files are cited in
+`codex_trust.py`'s module docstring): build
+`{event_name: "<snake_case label>", matcher?: <event-adjusted matcher>, hooks: [<normalized handler>]}`,
+serialize it to TOML, convert to JSON, sort every object's keys recursively,
+serialize compactly, sha256 it, and prefix `sha256:`. The parts that are easy to
+get wrong and are each covered by a unit test:
+
+- a `None` matcher (or `commandWindows`, or `statusMessage`) contributes **no
+  key at all**, because `toml::Value::try_from` drops None-valued entries —
+  a JSON `null` would give a different digest;
+- `UserPromptSubmit`, `Stop` and `Interrupt` drop their matcher even when the
+  group states one;
+- the timeout is normalized *before* hashing, so an entry that states none
+  hashes as `600` — except `SessionEnd`/`Interrupt`, which default to `1` and
+  clamp to `3`;
+- an `additionalContextLimit` equal to the 2,500-token default, or on an event
+  that cannot emit `additionalContext`, is dropped;
+- handler indices are positional, so a `prompt`/`agent`/empty-command handler
+  Codex skips still consumes its index.
+
+**The proof is a check against the real installation, not a fixture.** Run
+
+```sh
+python3 tests/scripts/session_replay/codex_trust.py --config ~/.codex/config.toml
+```
+
+and it recomputes, from the hooks files themselves, every `[hooks.state]` entry
+whose key source is a path that exists on disk. On the validation machine that is
+**24 of 24 matched, 0 mismatched**, across three different `hooks.json` files —
+6 entries for `~/.codex/hooks.json` (the Shared Context hooks), 8 for a project
+file that uses matchers and explicit timeouts including a clamped `SessionEnd`,
+and 10 for another — covering 10 of the 12 event kinds. Three further entries are
+reported as `missing_from_hooks_file`: stale state for events the current
+`hooks.json` no longer declares, which is a leftover rather than a disagreement.
+Eleven plugin-provided sources (`<plugin>@<pack>:hooks/hooks.json:…`) name no
+readable path and are reported as unresolved rather than counted either way.
+
+`replay.py` runs that same comparison for `~/.codex/hooks.json` at the start of
+every `--sctx-bin` run and writes the result into
+`manifest.codex_home.trust.operator_entries_reproduced` (e.g. `"6/6"`). If a
+future Codex changes the algorithm the count drops and the manifest says so,
+instead of the replay quietly running with its hooks disabled.
+
+**Validated end to end** on 2026-09-10, replaying turn 1 of `01a06646-…` (an
+Android monorepo session originally run on 2026-09-03) against
+`target/release/sctx` built from this checkout:
+
+- `manifest.codex_home.trust` — `mode: "recomputed"`,
+  `operator_entries_reproduced: "6/6"`, 9 stale state keys dropped, 6 written,
+  6 hook commands retargeted; `sctx_bin_retargeted` and
+  `mcp_command_retargeted` both true.
+- **The hooks fired against the dev binary.** The replayed rollout carries the
+  `hooks.additional_context` developer message naming the *new* thread id, and
+  the replay side's `hook-diagnostics.json` (`facts.replay.sctx_logs`) holds 106
+  events for the session — `session_start` 1, `prompt_submit` 21,
+  `post_tool_use` 83, `session_end` 1, every one `success` or `degraded`, none
+  refused.
+- **The marker proves *which* binary.** The original's marker is one sentence;
+  the replay's carries the dev build's `## session` policy lines on top of it —
+  "Stored text is Chinese, with identifiers, paths, commands, and error codes in
+  their original spelling…" and "Record one `progress` summary per task
+  boundary, never per turn." Neither line exists in the original.
+- `manifest.sctx_bin` — sha256 `01c0b933…`, 24,174,304 bytes, `sctx
+  0.2.0-dev.9`, copied from `target/release/sctx`. `facts.json`'s `versions`
+  block now carries `sctx_bin_sha256` for exactly this reason: both sides print
+  `sctx 0.2.0-dev.9`, and only the digest separates the replay's `01c0b933…`
+  from the original's installed `f7ba9342…`. `sctx_bin_current_target` being
+  `null` on the replay side (a real directory holding a copy, not the
+  installation's symlink) is the second tell.
+- `manifest.skill_bundle` — six files from
+  `/Users/bytedance/workspace/shared-context/skills`, including
+  `shared-context/references/workflow.md` at **15,159 bytes**
+  (`f792fb0e…`), which is the shrink-to-protocol revision; the installed bundle
+  at the time was a different 19,644-byte file. 34 other skills symlinked
+  through.
+- **The real installation is untouched.** `~/.codex/hooks.json`,
+  `~/.shared-context/config.toml`, `~/.shared-context/bin/current` and every
+  file under `~/.agents/skills/shared-context` are byte-identical before and
+  after, `~/.codex/config.toml` still holds its own 38 `[hooks.state]` entries
+  with no `shared-context-audit` path anywhere in it, and
+  `manifest.isolation.replayed_thread_in_real_state` shows
+  `external_session_id: null` for the replayed thread. Note that
+  `real_shared_context_unchanged` came back **false** on this run and that is
+  *not* contamination: other real Codex sessions were running on the machine
+  during the 40 minutes and wrote their own rows (the newest real
+  `external_session` belongs to an unrelated thread). The per-thread lookup, not
+  the whole-database fingerprint, is the load-bearing check when the machine is
+  busy.
 
 ### Known deviations from an interactive session
 
@@ -463,7 +635,7 @@ the replay state and the real state.
 ```sh
 python3 tests/scripts/session_replay/replay.py --agent cursor \
   --session <conversation_id> [--turns N|all] \
-  [--checkout worktree|inplace] [--cursor-home isolated|real] \
+  [--checkout worktree|inplace] [--cursor-home isolated|real] [--sctx-bin PATH] \
   [--cwd PATH] [--commit SHA] [--model MODEL] [--dry-run]
 ```
 
@@ -483,7 +655,7 @@ layout's `host/turn-<n>.jsonl` / `.stderr`.
 
 **Hook trust: there is none to repair.** Codex refuses to run a hook unless
 `config.toml` carries a path-keyed `trusted_hash`, which is why `replay.py`
-rewrites those keys. Cursor has no equivalent: `~/.cursor/hooks.json` is
+rewrites those keys (and, under `--sctx-bin`, recomputes them). Cursor has no equivalent: `~/.cursor/hooks.json` is
 `{"hooks": {<event>: [{"command": ...}]}, "version": 1}` with no hashes, and
 nothing else under `~/.cursor` gates hook execution. A freshly written
 `hooks.json` in a fresh `CURSOR_CONFIG_DIR` is simply run. `build_cursor_home`
@@ -503,7 +675,12 @@ which would be the first sign a trust mechanism had appeared.
   keychain. No token is read, printed or passed as an argument.
 - `mcp.json` registers `shared-context` against the snapshot's
   `bin/current/sctx` with `HOME` pinned to the snapshot, so the MCP side and
-  the hook side agree on which installation they are in.
+  the hook side agree on which installation they are in. That indirection is
+  also why `--sctx-bin` needs no Cursor-specific work beyond placing the binary:
+  both the generated `hooks.json` wrapper and `mcp.json` already name that path.
+  See "Replaying a dev build" above for the flag; on the Cursor side it also
+  rebuilds `~/.agents/skills/` from the binary's source tree and records
+  `sctx_bin` / `skill_bundle` in the manifest.
 - Each hook is registered as a two-line `sh` recorder that appends the payload
   to `host/hook-input.jsonl`, runs the real snapshot binary with the same
   arguments and the same stdin, appends the reply to `host/hook-output.jsonl`,
