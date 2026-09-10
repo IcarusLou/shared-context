@@ -35,9 +35,13 @@ description: 分析 tests/scripts/session_replay 生成的会话回放审计 bun
 
 在下结论之前，必须先读一遍这些文件，让判断对齐项目自己的定义，而不是你自己的常识：
 
-- `skills/shared-context/references/workflow.md` 第 1 节（值得记什么，含排除项、「空调用不算合规」「宣布不等于做了」）、
-  第 3 节（落库文本规则：中文、绝对日期、`path:line`、Hook 文本/工具输出永远不能变成 Evidence）、
-  第 5 节（如何使用 Context）、第 6 节（Checkpoint 契约）、第 7 节（候选处置三档）。
+- **策略层**（什么值得记、正文风格、哪类候选该确认或丢弃）：`crates/local-state/src/default_policy.md` 的四个小节
+  （`## session` 中文与绝对日期、`## checkpoint` 值得记/不值得记与 `progress` 节奏、`## stop` 完成标准、`## triage` 处置依据）；
+  如果被审计的机器装了自己的策略，以 `~/.shared-context/policy.md` 为准。2026-09-10 起这些规则由运行时下发（marker /
+  `task_checkpoint` 描述 / 边界提醒 / 候选处置文本），不再写在 Skill 里，所以评判「该不该记这条」只看策略文件。
+- **协议层**：`skills/shared-context/references/workflow.md` 第 1 节（空 claims 是 `no_op`、「宣布不等于做了」）、
+  第 3 节（字段集与落库字段规则：`path:line`、标识符原文、Hook 文本/工具输出永远不能变成 Evidence）、
+  第 4 节（Session/Intent 设置）、第 5 节（如何使用 Context）、第 6 节（Checkpoint 契约）、第 7 节（候选处置三档的机制）。
 - `skills/shared-context/SKILL.md` 的激活规则（哪种 marker 才可信）。
 - `docs/adr/0005-policy-gated-agent-disposition.md`、`docs/adr/0006-hook-reminders-need-a-channel-and-an-actionable-recipient.md`
   ——各读一句话结论即可，但要记住 ADR-0006 明确点名了 01a08017 这个会话作为证据来源之一；如果本次审计的 bundle
@@ -65,8 +69,9 @@ claims>5？assistant 文本里是否有「已记录/已保存」这类措辞但�
 `sctx_db.checkpoint_reminder_count` 是否 >0 而同一轮/同一 session 之后没有对应的 `task_checkpoint` 调用？
 
 **结论合规**：对每个已提交的 claim（`task_checkpoint` 调用的 `arguments.claims`，digest 里是 FULL 的，不是摘要），
-按 workflow.md 第 1 节判断它属于「值得记」的类型还是排除项（过程性理解、代码/git 已有、重复）；再按第 3 节检查
-`statement`/`rationale`/`conditions`/`evidence` 是否遵守中文、绝对日期、`path:line` 等字段规则。如果本次会话所有
+按 `default_policy.md` 的 `## checkpoint` 判断它属于「值得记」的类型还是排除项（过程性理解、代码/git 已有、重复）；
+再按 `## session` 的正文风格（中文、绝对日期）与 workflow.md 第 3 节的字段规则（`path:line`、标识符原文、Evidence 来源）
+检查 `statement`/`rationale`/`conditions`/`evidence`。如果本次会话所有
 `task_checkpoint` 调用的 `claims` 都是空数组，直接说「本次会话没有产出可评判结论合规性的 claim」，不要编造。
 
 **召回相关性**：对每个被注入的 pack（`text` 字段是 FULL 的），判断其中哪些 item 和该轮用户 prompt 相关
@@ -76,7 +81,8 @@ claims>5？assistant 文本里是否有「已记录/已保存」这类措辞但�
 句首标注「基于项目知识」，和纯粹从 bundle 摘取的证据区分开。
 
 **候选处置**：`candidate_list`/`candidate_discard`/`candidate_confirm` 调用（在 `### sctx calls` 里）对照
-workflow.md 第 7 节三档；`sctx/original/candidate_review.json` 每行的 `top_relation` 分布、`decision_source`。
+workflow.md 第 7 节的三档机制与 `default_policy.md` 的 `## triage` 处置依据；`sctx/original/candidate_review.json` 每行的
+`top_relation` 分布、`decision_source`。
 如果 `candidate_list` 全程返回空 `reviews` 且 `candidate_review.json` 是空数组，说明本 session 范围内没有可处置的候选，
 如实报告「无候选可处置」而不是缺失项。
 
@@ -112,7 +118,8 @@ session_digest 过滤到本会话）：看事件序列是否完整（session_sta
      （例如 `Turn 1`、`facts.json.original.injections`）。
    - `严重度` ∈ `阻断` / `重要` / `次要` / `观察`。
    - `已知项`：命中 `docs/deferred-issues.md` 的编号，或命中 ADR-0005/0006 的一句话引用，都填不上就写「新」。
-3. 每条发现一个短小节（2–4 句）：发生了什么、依据 workflow.md 哪条规则/哪个 ADR 判断它重要、建议下一步核实什么。
+3. 每条发现一个短小节（2–4 句）：发生了什么、依据 workflow.md（协议）或 `default_policy.md`（策略）哪条规则、哪个 ADR
+   判断它重要、建议下一步核实什么。
    这一节里每句话都要能追到第 2 步的表格行,不要引入表格之外的新事实。
 4. 「未能判断」一节：列出这个 bundle 结构性做不到的判断，例如 Codex 的 reasoning 是加密的、
    某一侧 `diagnostics_file_found=false` 导致留痕方向无法核实、Cursor bundle 缺少 tool 输出且 pack 送达是从 sctx 侧

@@ -12,6 +12,8 @@ Record one `progress` summary per task boundary, never per turn.
 ## checkpoint
 
 Also worth keeping: a correction the user made to your own proposal that later proved right, and, as `context_kind: progress`, a stage summary after a long autonomous stretch. Not worth keeping: anything the code, `git log`, or a PR already states plainly; anything an accepted Context in the Pack already says, unless you submit only the delta; a routine build, compile, or test success. Record a `progress` row only at a task boundary, at most one per boundary and never per turn or per file: which paths changed for what purpose, what state things are in now, what was verified and what was not, and what remains.
+When the user asks you to record something, apply the same filter: if the point is derivable from the code or history, record instead the one part that is not.
+A Checkpoint is usually one to three Claims; needing more than five in one call means the filter did not run. When unsure, leave it out.
 
 ## stop
 

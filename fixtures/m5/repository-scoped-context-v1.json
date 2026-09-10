@@ -3,8 +3,8 @@
   "activation_marker_template": "<shared-context-active external_session_id=\"{host_session_id}\">Shared Context is authorized for this session. Before substantive work, call task_intent_update with agent_kind \"{agent_kind}\" and external_session_id \"{host_session_id}\" (copy it verbatim; never invent one).\n\nStored text is Chinese, with identifiers, paths, commands, and error codes in their original spelling, and every version, commit, and date written absolutely.\nRecord one `progress` summary per task boundary, never per turn.</shared-context-active>",
   "session_policy": "Stored text is Chinese, with identifiers, paths, commands, and error codes in their original spelling, and every version, commit, and date written absolutely.\nRecord one `progress` summary per task boundary, never per turn.",
   "source_assets": {
-    "gate_bytes": 2393,
-    "workflow_bytes": 20897,
+    "gate_bytes": 2396,
+    "workflow_bytes": 14346,
     "metadata_bytes": 263,
     "review_gate_bytes": 2895,
     "review_reference_bytes": 14532,

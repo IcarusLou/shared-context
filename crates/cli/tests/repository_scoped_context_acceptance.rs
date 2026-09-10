@@ -1592,10 +1592,11 @@ fn installer_assets_are_exact_atomic_recoverable_and_never_touch_business_reposi
         oracle.source_assets.review_metadata
     );
     // The split only pays for itself if the session-hot reference actually shrank: the review
-    // procedures moved into a second bundle instead of being duplicated into both.
+    // procedures moved into a second bundle, and team policy moved into `policy.md`, instead of
+    // being duplicated into a file every Session on every host reads.
     assert!(
-        WORKFLOW_BYTES.len() < 21_000,
-        "the core workflow reference must stay slimmer than the pre-split bundle"
+        WORKFLOW_BYTES.len() < 15_000,
+        "the core workflow reference must stay protocol-only and slimmer than the split bundle"
     );
 
     fs::write(&fixture.runtime, b"signed-runtime-v2").unwrap();

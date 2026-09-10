@@ -6980,7 +6980,12 @@ fn assert_skill_bundle_contract(gate: &str, workflow: &str, metadata: &str) {
     assert!(!workflow.contains("Shared Context is authorized for this session"));
     assert!(workflow.contains("printenv CODEX_SESSION_ID"));
     assert!(workflow.contains("<copy from the shared-context-active marker>"));
-    assert!(workflow.contains("This knowledge base is written in Chinese"));
+    // Protocol only: the identifier-spelling rule the server's extraction depends on stays in the
+    // reference, while the team's "what is worth keeping" wording now arrives from `policy.md` at
+    // run time and must not be duplicated here.
+    assert!(workflow.contains("in their original spelling"));
+    assert!(workflow.contains("What is worth keeping is team policy"));
+    assert!(!workflow.contains("Not worth keeping"));
     assert!(
         workflow.contains("This section is the one place the three disposition tiers are defined")
     );
@@ -7116,8 +7121,8 @@ fn assert_review_skill_bundle_contract(gate: &str, reference: &str, metadata: &s
 /// of the two references, and the session-hot one is the one that shrank.
 fn assert_skill_split_contract(workflow: &str, review: &str) {
     assert!(
-        workflow.len() < 21_000,
-        "the core workflow reference must stay slimmer than the pre-split bundle"
+        workflow.len() < 15_000,
+        "the core workflow reference must stay protocol-only and slimmer than the split bundle"
     );
     // Named by the rule's own wire spelling, not by its topic: the core reference still names
     // the topics it delegated so a reader knows where they went.

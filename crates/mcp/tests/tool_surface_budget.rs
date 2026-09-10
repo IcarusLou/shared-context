@@ -66,7 +66,10 @@ const POLICY_DESCRIPTION_BUDGET_BYTES: usize =
 /// The budget above is what any team may spend; this is what we spend, and it is frozen so that
 /// editing `crates/local-state/src/default_policy.md` is a decision someone made on purpose rather
 /// than a number that drifted. Update it together with that file.
-const DEFAULT_POLICY_DESCRIPTION_BYTES: usize = 1058;
+///
+/// Raised on 2026-09-10 when the Skill shrank to protocol: three "what is worth keeping" sentences
+/// with no other runtime channel moved out of `references/workflow.md` into `## checkpoint`.
+const DEFAULT_POLICY_DESCRIPTION_BYTES: usize = 1355;
 
 /// A single description must stay well under the largest figure anyone reports a host truncating
 /// at (~6,500 characters, Cursor, unverified). Half of it is the standing headroom.

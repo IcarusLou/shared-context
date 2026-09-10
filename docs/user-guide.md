@@ -213,7 +213,8 @@ sctx doctor --fix
 - 初始化本地索引和运行时状态。
 - 按选择写入 `~/.cursor/mcp.json`、`~/.cursor/hooks.json`。
 - 按选择写入 `~/.codex/config.toml`、`~/.codex/hooks.json`。
-- 安装两个用户级 installer-owned Agent Skill（见 5.4）：`~/.agents/skills/shared-context`（最小 activation gate + 完整 workflow reference）与 `~/.agents/skills/sctx-review`（显式调用的完整 review / 治理流程）。两个目录整体安装、整体保留：只要其中任何一个是你自己的同名 Skill 或被你改过，本产品一个字节都不覆盖、也不在 manifest 里认领，并在 notices 里说明；`uninstall` 同样只删自己写的那些文件。该 workflow 规定知识库正文默认用中文书写（intent 的 goal/current_direction/in_scope，claim 的 statement/rationale/conditions，evidence.summary），代码标识符、路径与命令保持原文；这只约束沉淀内容，不改变 Agent 与用户交流使用的语言。
+- 安装两个用户级 installer-owned Agent Skill（见 5.4）：`~/.agents/skills/shared-context`（最小 activation gate + 完整 workflow reference）与 `~/.agents/skills/sctx-review`（显式调用的完整 review / 治理流程）。两个目录整体安装、整体保留：只要其中任何一个是你自己的同名 Skill 或被你改过，本产品一个字节都不覆盖、也不在 manifest 里认领，并在 notices 里说明；`uninstall` 同样只删自己写的那些文件。
+- **协议与策略是分开的两层。** Skill（`SKILL.md` + `references/workflow.md`）只写**协议**：激活门控、请求字段集、Session/Intent/Checkpoint/候选处置的机制——对每个团队都成立，只随工具 schema 变化，因此随版本发布。**策略**是"什么值得记、正文怎么写、哪类候选该确认或丢弃"，属于团队自己的判断，放在本机 `~/.shared-context/policy.md`（见 6.11 `[policy]`），由 sctx 在运行时通过四条通道下发给模型：SessionStart marker（`## session`）、`task_checkpoint` 工具描述（`## checkpoint`）、边界 Checkpoint 提醒（`## stop`）、候选处置文本（`## triage`）。内置默认策略仍规定知识库正文用中文书写（intent 的 goal/current_direction/in_scope，claim 的 statement/rationale/conditions，evidence.summary）、标识符与路径保持原文、版本与日期写绝对值；改团队规则只需改 `policy.md`，不需要发版，也不需要在业务仓库放 `AGENTS.md`。这只约束沉淀内容，不改变 Agent 与用户交流使用的语言。
 - 写安装清单，用于后续升级、诊断和精确卸载。
 
 安装器会记录每次写入并支持失败回滚。已有配置会合并，不会把整个配置文件直接覆盖成模板。
@@ -910,7 +911,7 @@ CLI 还提供 Space/Context 写入治理、语义冲突、索引和 Pending Batc
 
 当前 Repository 准入控制 Hook 的 Agent-visible activation 与机械 TaskSignal 路径；MCP Server 也用 current Enabled Session lease 实现授权校验，Disabled/缺失/锁忙/损坏 Session 的调用会被拒绝。已安装的全局 Skill 主入口只包含最小 activation gate：没有可信 SessionStart marker 时不读取完整 workflow reference、不产生 Shared Context MCP 调用提示；有 marker 时才完整读取一次 installer-owned reference。这个 Skill gate 是 Agent 推理前的指令准入机制，Server guard 则负责安全和不落越权数据。MCP 进程和工具 Schema 仍由用户级 Agent 配置提供，可能物理启动或可见；不要把 Disabled 理解为进程必然未启动，也不要把合约中的 reference-read/MCP-call 字节代理外推为真实计费 token 已被测量。当前还已证明 Disabled Hook 不向模型注入 Shared Context 文本，也不产生业务 Runtime/Report/知识 Git 记录。
 
-#214 更新后的固定 bytes proxy 进一步量化该边界：Disabled 的 Agent-visible activation、完整 workflow read、Shared Context MCP call/result 与业务 residue 都是 0；Enabled 每个 SessionStart marker 的固定部分为 474 bytes（249 bytes 协议文本 + 空行 + 内置默认策略的 `## session` 段 223 bytes），加上 `agent_kind` 与两处 host session id（36 字符的 UUID 会话约 551 bytes，硬上限 1026 bytes），完整 workflow 读取一次，并在固定的单仓库/共同父目录验收链中产生 5 次真实 public MCP 调用。当前最小 gate、workflow、metadata 源文件分别为 2393、19644、263 bytes。若 Enabled Session 在没有 ActiveTask 时先发生安全 PostToolUse，Hook 只提醒一次调用 `task_intent_update`，不读取 Prompt、不自动创建 Task；PreCompact/TurnStop 只给出 bounded Checkpoint guidance并尝试恢复已有 outbox，不创作 Claim。这些值用于回归比较，不是 tokenizer 结果或供应商计费 token。
+#214 更新后的固定 bytes proxy 进一步量化该边界：Disabled 的 Agent-visible activation、完整 workflow read、Shared Context MCP call/result 与业务 residue 都是 0；Enabled 每个 SessionStart marker 的固定部分为 474 bytes（249 bytes 协议文本 + 空行 + 内置默认策略的 `## session` 段 223 bytes），加上 `agent_kind` 与两处 host session id（36 字符的 UUID 会话约 551 bytes，硬上限 1026 bytes），完整 workflow 读取一次，并在固定的单仓库/共同父目录验收链中产生 5 次真实 public MCP 调用。当前最小 gate、workflow、metadata 源文件分别为 2396、14346、263 bytes（workflow 在 2026-09-10 由 20897 bytes 瘦身为纯协议文本，团队策略移交 `policy.md` 运行时下发）。若 Enabled Session 在没有 ActiveTask 时先发生安全 PostToolUse，Hook 只提醒一次调用 `task_intent_update`，不读取 Prompt、不自动创建 Task；PreCompact/TurnStop 只给出 bounded Checkpoint guidance并尝试恢复已有 outbox，不创作 Claim。这些值用于回归比较，不是 tokenizer 结果或供应商计费 token。
 
 ### 6.11 可选 `config.toml` 设置
 
