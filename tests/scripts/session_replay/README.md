@@ -1,0 +1,624 @@
+# Session replay audit tools
+
+Scripts for turning a coding-agent session (an original real one, and
+optionally a replayed one produced by `replay.py`) plus sctx's own database
+rows into a compact, human- and agent-readable audit bundle.
+
+Two hosts are supported — **Codex** (`codex`, rollout `.jsonl` under
+`~/.codex/sessions`) and **Cursor Agent** (`cursor-agent`, transcript `.jsonl`
+under `~/.cursor/projects/*/agent-transcripts`). Everything downstream of the
+host parser is shared: one `Session` model, one Markdown digest, one
+`facts.json` schema, one bundle layout, one manifest schema. `/session-review`
+does not branch on host. What it *does* have to read is the digest's
+`## fidelity` block, because a Cursor transcript is structurally much thinner
+than a Codex rollout (no tool results, no injections, no token usage) and an
+absence there is a missing record, not a finding.
+
+## bundle
+
+`bundle.py` builds the bundle:
+
+```
+<audit-root>/<replay-id-or-orig-id>/
+  original.md    digest of the original session
+  replay.md       digest of the replayed session (only if a manifest with replayed_thread_id exists)
+  facts.json      hard facts computed per side ("original", "replay")
+  sctx/           raw JSON exports of the sctx rows used, per side
+```
+
+Default audit root: `~/.shared-context-audit`.
+
+Bundle a real session that was never replayed (writes only `original.md`,
+`facts.json`, `sctx/` under `<audit-root>/orig-<short id>/`):
+
+```sh
+python3 tests/scripts/session_replay/bundle.py --session <thread_id>
+```
+
+`--agent auto|codex|cursor` (default `auto`) picks the host. `auto` resolves
+the id against `~/.codex` first and `~/.cursor` second and names both misses if
+neither owns it; with `--replay-id` the manifest's own `agent` field wins.
+`facts.json` records the resolved host as a top-level `agent` key and per side
+as `original.host` / `replay.host`.
+
+Bundle a session alongside its replay (reads
+`<audit-root>/<replay-id>/manifest.json` written by `replay.py`, and writes
+into that same directory):
+
+```sh
+python3 tests/scripts/session_replay/bundle.py \
+  --session <original_thread_id> --replay-id <replay-id> \
+  [--audit-root ~/.shared-context-audit] [--home <HOME whose .shared-context to read, default real>]
+```
+
+Modules:
+- `session_model.py` — host-agnostic `Session`/`Turn`/`Injection`/`SctxCall`
+  dataclasses shared by every host parser and by `bundle.py`.
+- `hosts/cursor.py` — parses a Cursor Agent transcript `.jsonl` into a
+  `Session`, and rebuilds the injection/hook timeline from sctx's own state
+  because the transcript carries neither. See its module docstring for the
+  verified line shapes, the human-prompt rule, the dynamic-tool wrapper sctx
+  MCP calls arrive in, and the turn-windowing used for reconstruction. See
+  "### cursor" under bundle below for the fidelity caveats.
+- `hosts/codex.py` — parses a Codex rollout `.jsonl` into a `Session`. See
+  its module docstring for the verified rollout line shapes, the human-
+  prompt / hook-injection detection rules, and how the sctx context "pack"
+  is recovered from the exec-wrapped MCP call record even when the model's
+  own copy was truncated or discarded.
+- `sctx_facts.py` — queries `<HOME>/.shared-context/state/runtime.sqlite`
+  read-only for one external session's rows across every sctx table it can
+  link (task_session, task_injection, context_usage, candidate_review,
+  hook_event, ...), exports them to `sctx/<table>.json`, and returns a
+  summary dict for `facts.json`'s `sctx_db` field. Also has
+  `get_lease_facts()`: whether the session's `AuthorizedSessionScope`
+  activation-lease file still exists under
+  `<HOME>/.shared-context/state/authorized-session-scopes/` — if it does,
+  `SessionEnd` never cleaned it up. See its module docstring for the
+  verified join keys, the lease file's digest formula, and a couple of
+  schema surprises (multiple `task_session` rows per external session;
+  `hook_event`/`auto_confirm_rejection.external_session_id` is the raw host
+  thread id, not the `xss_...` id; `hook_event` itself is effectively dead
+  on current installs — see `sctx_logs.py`).
+- `sctx_logs.py` — reads `<HOME>/.shared-context-logs/state/` (where hook
+  decisions actually land on current installs):
+  `hook-diagnostics.json`'s `recent_events` filtered down to this session by
+  a sha256 digest of `(agent_kind, external_session_id)` (a different digest
+  formula than the lease file's — see the module docstring),
+  `collector-status.json`, `upload-status.json` (surfaces a `logs_sync`
+  failure), and the `spool/ready/` batch count. Feeds `facts.json`'s
+  `sctx_logs` block.
+- `tests/test_codex_parser.py` — unittest against a synthetic minimal
+  rollout built inline in the test file (no real transcript text), plus the
+  discard-wrapper regex tests.
+- `tests/test_cursor_parser.py` — same discipline for the Cursor parser: a
+  synthetic transcript, a synthetic three-table `runtime.sqlite` and a
+  synthetic `hook-diagnostics.json` built inline, covering human-prompt
+  detection, the dynamic-tool unwrapping, the truncated-arguments case, and
+  the turn-windowed reconstruction (including the degrade-to-session-level
+  path for an undated transcript).
+
+Run both with
+`python3 -m unittest discover -s tests/scripts/session_replay/tests`.
+
+`facts.json` per side also carries: `discard_wrapper` (turns where an exec
+call's FULL, untruncated args text matches a `.then(r=>({key:r.key}))` /
+`.then(r=>{...return {isError:...}})` shape, meaning sctx's response likely
+never reached the model's own context — shown in the digest under that
+turn's `### tools` section too) and `versions` (the session's own Codex CLI
+version, the sctx hook's `--agent-version` string from `hooks.json`, the
+`bin/current` symlink target, and `sctx --version` output — noted as
+reflecting the install at *bundle* time, not necessarily at *session* time).
+
+Validated against a real 2-turn session
+(`01a08017-95a0-7841-8ab9-09b582c62cb1`): turn 1's context pack had 16
+items and was truncated by the host's exec output-token cap; turn 2's pack
+had 15 items and was discarded by the model's own
+`.then(r=>({isError:r.isError}))` wrapper before it ever reached the
+model's context (so it shows `truncated=no` but tiny `wire_bytes` — a
+different failure mode, both visible in the digest, and separately caught
+by `discard_wrapper`); `checkpoint_reminder_count` was 2; the assistant
+text cited zero `ctx_` ids. `sctx_logs` shows this session's 27
+session-digest-matched hook events ending in `turn_stop` with no
+`session_end` among them, and `lease.lease_file_exists=true` two days
+later — together making the human review's "SessionEnd payload
+undecodable, lease not cleaned" finding decidable from the bundle rather
+than only observable by reading the raw session. All of the above are
+reproduced by `facts.json`.
+
+### cursor
+
+```sh
+python3 tests/scripts/session_replay/bundle.py \
+  --session <conversation_id> --agent cursor
+```
+
+The conversation id is the directory name under
+`~/.cursor/projects/<cwd-slug>/agent-transcripts/`, and is simultaneously the
+hook payload's `conversation_id`/`session_id` and sctx's
+`external_session_key` with `agent_kind='cursor'` — one id, no mapping table.
+`sctx_facts.py` and `sctx_logs.py` needed no change to serve it: both already
+take `agent_kind` as a parameter, and `telemetry_session_digest` is gated on
+`{"cursor","codex"}` in the Rust source it mirrors.
+
+**Fidelity caveats — read these before treating a Cursor absence as a
+finding.** They are printed at the top of `original.md` as a `## fidelity`
+block and repeated in `facts.json` as `original.fidelity_notes`.
+
+- **Tool outputs do not exist in a Cursor transcript.** There are no
+  `tool_result` blocks at all — not for shell, not for reads, not for MCP. So
+  every `### sctx calls` entry shows `status=unknown` and
+  `result: (not recorded by this host)`, and `facts.json` reports
+  `sctx_calls.results_unavailable`. Whether a `task_checkpoint` was accepted
+  or rejected is only decidable from `sctx/original/agent_checkpoint.json`
+  and friends, never from the digest's call list. (Large outputs are spilled
+  to `projects/<slug>/agent-tools/<uuid>.txt`, but `tool_use` blocks carry no
+  id and those files are shared across every conversation in the project, so
+  they cannot be attributed back to a call and are deliberately not read.)
+- **Injections are reconstructed, not observed.** Cursor never writes a hook's
+  `additionalContext` into the transcript. Every `Injection` on the Cursor side
+  is rebuilt from `runtime.sqlite`'s `task_injection` rows and carries
+  `reconstructed_from=sctx:task_injection` on its digest line, with the
+  provenance in the digest's `## reconstruction` block, in
+  `facts.json.original.reconstruction`, and raw in
+  `sctx/original/reconstruction.json`. Consequences:
+  - `ctx_ids` and the injection *time* are real; the injected **text** is
+    recoverable from nowhere, so `wire_bytes` and `est_tokens` are **0 as a
+    sentinel, not as a measurement**. Never compare a Cursor `wire_bytes`
+    against a Codex one.
+  - Rows sharing a `(source, injected_at_unix_seconds)` pair are one injection
+    event, so `injections.count` counts pushes (comparable across hosts), not
+    context ids (`injections.ctx_ids_total` is that).
+  - `kind` is the sctx `source` name prefixed with `sctx:`
+    (`sctx:intent_update`, `sctx:task_context`, `sctx:artifact_focus`), not a
+    Codex hook kind, because the two do not map onto each other.
+  - Attribution to a turn uses the `<timestamp>` tag Cursor prepends to each
+    user message. It is **minute-granular**, so a row within ~60s of a turn
+    boundary can land on either side. Turn 1's lower bound is left open so the
+    session-start hook lands in turn 1. A transcript with no timestamp tags
+    degrades to session-level: nothing is guessed into a turn, and the rows
+    appear under `reconstruction.unwindowed` instead.
+- **Hook activity is a separate, reconstructed block.** Per-turn
+  `### hook events` come from `~/.shared-context-logs/state/hook-diagnostics.json`
+  filtered by this session's digest. They say a hook *ran*; they do not say
+  context arrived, which is why they are not folded into `injections`.
+- **No token usage, model, git commit, cwd or compaction markers.** `### usage`
+  is all zeros on the Cursor side and means "not recorded". The `cwd` in the
+  header is *recovered* — from sctx's activation lease `startup_cwd`, else by
+  slugifying each registered checkout path and matching the project directory
+  name — and the header's fidelity notes say which. Cursor's project slug is
+  lossy (`/` and `_` both become `-`) and cannot be inverted.
+- **Arguments can be truncated by the host.** `CallDynamicTool.input.arguments`
+  is normally an object but is sometimes a JSON *string*, and in the validation
+  fixture one such string was cut off mid-object. That call is preserved
+  verbatim under `__arguments_unparsed__`, counted as
+  `sctx_calls.arguments_unparsed`, and excluded from both the claims tally and
+  the `external_session_id_verbatim` check, which it would otherwise fail for
+  the wrong reason.
+- **Cursor's own follow-up prompts are not turns.** A `role: "user"` message
+  whose `<user_query>` opens with "Briefly inform the user about the task
+  result…" or "The beginning of the above subagent result is already visible…",
+  or which carries no `<user_query>` at all, is the client talking. It folds
+  into the preceding human turn and is listed under `## other injections`, so
+  `turns == human_prompts` still holds.
+
+Validated against `7d8cbab1-0d90-4155-962b-7654f6f5bfcd` (2026-09-08, Cursor
+2026.08.31, the FE monorepo): 4 human turns (1 host follow-up prompt skipped),
+138 tool calls of which 12 are sctx MCP calls — `task_intent_update`×3,
+`task_checkpoint`×4, `candidate_list`×4, `candidate_discard`×1 — carrying 7
+claims across the 3 checkpoint calls whose arguments survived intact, and 1
+whose arguments the host truncated. 20 `task_injection` rows group into 3
+injection events (20 distinct context ids), all landing in turn 3, and 328
+hook-diagnostics events match the session digest. `pack_usage` shows 0 of
+those 20 ids cited back in assistant text or in later sctx call arguments,
+while `sctx_db.context_usage` records all 20 as `ignored`. Note the
+cross-check the two sides make possible: the transcript contains **no**
+`candidate_confirm` call, yet `candidate_review.json` holds 7 rows, 4
+`confirmed` and 3 `discarded`, all `decision_source: human` — a gap that is
+only visible because the bundle carries both halves.
+
+## replay
+
+`replay.py` re-runs the *human* half of a real Codex session — its prompts, in
+order, verbatim — against a fresh headless Codex session, so that `bundle.py`
+has a second transcript to compare the original against. Fidelity is the bar:
+the replay reuses the original's commit, sandbox policy, model, Codex config,
+hooks and Shared Context Repository identity, and everything it could not
+mirror is written into the manifest under `deviations` and `warnings`.
+
+```sh
+python3 tests/scripts/session_replay/replay.py --session <thread_id> \
+  [--turns N|all] [--audit-root ~/.shared-context-audit] \
+  [--checkout worktree|inplace] [--codex-home isolated|real] \
+  [--driver app-server|exec-resume] [--on-question stop|next-prompt] [--dry-run]
+```
+
+`--dry-run` resolves the original and prints the plan (commit, branch, model,
+sandbox, approval policy, prompt count and per-prompt length) without running
+anything or creating any directory. Use it before committing minutes of agent
+time to a large repository.
+
+Output, under `<audit-root>/<replay-id>/` where `<replay-id>` is
+`<UTC timestamp>-<first block of the original thread id>`:
+
+```
+manifest.json          everything bundle.py needs, plus the isolation evidence
+home/                  the replay's HOME (its own .shared-context snapshot)
+codex-home/            the replay's CODEX_HOME, including sessions/<the new rollout>
+host/turn-<n>.jsonl    the raw `codex exec --json` stream for each turn
+host/turn-<n>.stderr
+```
+
+and one detached worktree at `<audit-root>/worktrees/<replay-id>`.
+
+### Driver: one app-server process, not one `codex exec` per turn
+
+`--driver app-server` (the default) drives the whole replay through a single
+`codex app-server` process over JSON-RPC on stdio: `initialize`, then
+`thread/start` once, then `turn/start` per prompt, watching the `turn/completed`,
+`item/completed`, `hook/started` and `hook/completed` notifications.
+
+The reason is not tidiness. `codex exec resume` starts a *new process* for every
+turn, and every start replays the SessionStart hook — so a two-turn replay
+carried the Shared Context activation marker twice where the interactive
+original carried it once (`injections.with_marker: 2` against the original's
+`1`). Injected context is precisely what this audit measures, so an artifact of
+the driver landing in that number makes the comparison worthless. Verified with
+app-server on a real replay: exactly **one** activation-marker developer message
+in the rollout, and hook operations `session_start x1, prompt_submit,
+post_tool_use x N, turn_stop, session_end` — the interactive shape.
+
+`--driver exec-resume` keeps the per-turn-process behaviour as a fallback if the
+app-server protocol changes. It writes `session_start_per_turn: true` into the
+manifest's `deviations`, so nobody compares marker counts across drivers by
+accident.
+
+Token usage comes from `thread/tokenUsage/updated`, not from `turn/completed`
+(which carries no usage in this protocol version).
+
+### When the agent asks a question
+
+A replayed agent that calls `request_user_input` — or simply ends its turn with a
+question — is waiting for a human who is not there, and everything after that
+point diverges from the original by construction. `--on-question` decides what
+happens:
+
+- `stop` (default): the turn is finished and recorded, the question is written to
+  `manifest.stopped_on_question` and to that turn's `question` field, and the
+  replay ends there rather than pretending the remaining prompts still line up.
+- `next-prompt`: the next original prompt is fed back as the answer (usually what
+  the human typed next anyway), and the turn is marked
+  `answered_with_next_prompt`.
+
+Blocking `item/tool/requestUserInput` server requests are always answered so the
+turn can complete — with the next prompt under `next-prompt`, with an empty
+string otherwise. A turn is never left deadlocked against an unanswerable
+question.
+
+### Isolation model
+
+Four things are separated from the operator's real installation, because a
+replay that writes into it would corrupt the very state the audit measures.
+
+- **`HOME`** points at `<replay-id>/home`, built as an **overlay**: every
+  top-level entry of the real `~` is symlinked into it except the four in
+  `HOME_OVERLAY_EXCLUSIONS`, which get isolated copies. `sctx` resolves its
+  installation root as `$HOME/.shared-context` with no environment override, so
+  redirecting `HOME` is the only way to move it — but a *bare* redirected HOME is
+  a different machine, and the agent notices. The first end-to-end replay
+  diverged on turn 1 for exactly that reason: the original had read a document
+  through the corporate `lark-cli`, and the replay, whose HOME held only
+  `.shared-context`, answered that this machine has no `lark-cli` configured. The
+  overlay gives the agent the same machine.
+  - A tool that writes *through* one of those symlinks writes into the real HOME.
+    That is accepted: `.codex`, `.cursor` and the two `.shared-context*`
+    directories are the only state whose contamination would corrupt the audit,
+    and those are the ones excluded. `.cursor` is symlinked for Codex replays and
+    isolated for Cursor ones.
+  - The audit root itself is never symlinked in, even when it lives under `~`:
+    the replay HOME is inside it, and the link would make every tree walk from
+    the replay HOME infinite.
+  - Inside the isolated `.shared-context`, `state/` and `repository/` are
+    snapshotted (databases through SQLite's backup API, so a live writer cannot
+    hand over a torn copy), `config.toml` is copied with its absolute paths
+    rewritten, and the 2.3G `embedding/` plus `bin/` are symlinked back to the
+    originals.
+  - `<home>/.shared-context-logs/` is **configured**, not left empty. Hook
+    decisions are not written to `runtime.sqlite`'s `hook_event` table any more;
+    the log collector aggregates them into `state/hook-diagnostics.json`, and with
+    no config there is no collector and no file — which is why the first replay
+    reported `sctx_logs.diagnostics_file_found: false` for its own side.
+    `replay.py` runs `sctx logs init --logs-root <home>/.shared-context-logs`
+    **with `HOME` unset**, which yields a config with no `remote` (nothing to
+    upload to) and skips the launchd reconciliation, so the operator's real
+    `com.shared-context.logs` / `logs-sync` services are untouched; `on_maintain`
+    is then flipped to `false`. A `sctx logs collect` child process runs for the
+    lifetime of the replay and is stopped afterwards.
+  - The snapshot directories are created `0700` on purpose. `sctx` refuses to
+    open an installation root or state directory that is not private, and it
+    fails *closed*: hooks return `{}` and Shared Context silently never
+    activates. A world-readable snapshot produces a replay that looks like it
+    ran with the feature switched off.
+- **`CODEX_HOME`** points at `<replay-id>/codex-home` (`--codex-home isolated`,
+  the default), so the new rollout, history and thread index land inside the
+  audit directory instead of beside the operator's own sessions. `config.toml`,
+  `hooks.json` and `auth.json` are copied; `plugins/`, `skills/`, `rules/` and
+  the other read-only caches are symlinked.
+  - Codex 0.153.4 will not run a hook unless `config.toml` carries a matching
+    `[hooks.state."<absolute hooks.json path>:<event>:0:0"] trusted_hash`, and
+    that key is *keyed by the path*. A verbatim copy into a new `CODEX_HOME`
+    therefore trusts nothing and the hooks never fire. `replay.py` rewrites only
+    the path prefix inside those keys — the hashes cover the hook entries, which
+    are copied byte for byte — which restores trust without needing
+    `--dangerously-bypass-hook-trust`. This is verified working: the replayed
+    rollout contains the `hooks.additional_context` developer message carrying
+    `<shared-context-active external_session_id="<new thread id>">`.
+  - `--codex-home real` is the fallback if a future Codex changes that scheme.
+    `HOME` still points at the replay snapshot; only the rollout moves back to
+    `~/.codex/sessions`.
+- **The checkout** is a `git worktree` at the original commit on a local branch
+  named `replay/<original branch>` (`--checkout worktree`, the default). A
+  *detached* worktree reports `git_branch` as `-`, which propagates into the
+  replayed session's metadata and into every hook that reads it, so the replay
+  stops being comparable on a field the audit reads; if the branch name is taken
+  the replay id is appended, and if the branch cannot be created at all the
+  worktree falls back to detached with a warning. The repository under replay is
+  never written to — only `git worktree add`/`remove` touch it. If the commit is not
+  present locally the run fails and names the commit and branch to fetch.
+  `--checkout inplace` runs in the original directory instead and prints a loud
+  warning; it does not stash, reset or restore anything.
+- **The Repository registration.** Shared Context authorizes a session by
+  longest-prefix match of its startup directory against the registered checkout
+  paths, so a worktree at a brand-new path would activate nothing. `replay.py`
+  finds the Repository identity that owns the original `cwd` and registers the
+  worktree as a second checkout of that same identity *inside the snapshot*, which
+  keeps the knowledge base identical. If the original `cwd` belongs to no
+  registered Repository, the replay runs with Shared Context disabled — which is
+  what the original session did too — and says so in `warnings`.
+
+`manifest.json.isolation` carries the proof, not just the intent: row-count
+fingerprints of the real `~/.shared-context` taken before and after the run,
+`real_shared_context_unchanged`, and the replayed thread's
+`external_session`/`task_injection`/`context_usage` rows looked up in *both*
+the replay state and the real state.
+
+### Known deviations from an interactive session
+
+- **Approvals.** The original ran `approval_policy = "on-request"` with a human
+  (or the auto reviewer) answering. `codex exec` cannot prompt, so turn 1 uses
+  `--approve-for-me` and every turn sets `approvals_reviewer = "auto_review"`.
+  Note `--approve-for-me` hard-codes the workspace-write sandbox and refuses to
+  sit beside `--sandbox`; when the original used a different sandbox the flag is
+  dropped and `approvals_reviewer` alone carries approvals, because mirroring the
+  sandbox matters more.
+- **No human latency.** Turns follow each other as fast as the model finishes.
+  Anything that depends on wall-clock gaps — maintenance windows, staleness
+  timers, a human reading the answer before the next prompt — will not reproduce.
+- **Sandbox roots.** The sandbox `type` and `network_access` are mirrored, but
+  the original's per-session writable roots (Codex adds a `visualizations/<id>`
+  directory of its own) are not.
+- **The working tree.** A worktree is the original *commit*, not the original
+  *working tree*: uncommitted edits the human had in flight are absent.
+- **Turn-stop barrier.** The `turn_stop` row `replay.py` waits for between turns
+  lives in `runtime.sqlite`'s `hook_event` table, which on current installations
+  no hook writes any more (hook decisions go to the log service's
+  `hook-diagnostics.json` aggregate instead — see the `.shared-context-logs` note
+  above). Both drivers observe the turn's end directly, so the barrier is
+  attempted once, recorded as `waited_for_turn_stop: false`, and skipped
+  thereafter with a warning.
+- **Depth of work.** Even with everything above mirrored, the replayed agent does
+  not necessarily do the *same amount* of work: on the validated Android replay
+  the original made 105 tool calls and the replay 31 for the same single prompt,
+  reaching a comparable end state by a shorter route. Compare kinds and outcomes,
+  not counts.
+- **Host stderr.** Whatever Codex wrote to stderr — unloadable skills, MCP servers
+  that refused to start, config keys this build does not know — is folded into
+  `manifest.warnings`, de-duplicated with an `(xN)` count, because those are
+  exactly the differences that quietly make a replay incomparable.
+- **Plugin hooks.** The copied `config.toml` keeps the operator's other trusted
+  hooks — including any corporate telemetry plugin — so a replay reports itself
+  the same way the original did. Drop those `[hooks.state]` entries from the
+  copied `codex-home/config.toml` before running if that is not wanted.
+- **Prompt selection.** A user message that starts with `# AGENTS.md instructions`
+  or with `<` is the host talking (AGENTS.md injection, `<recommended_plugins>`,
+  environment blocks) and is skipped. Everything else is replayed byte for byte,
+  URLs, pasted JSON and all.
+
+### cursor
+
+```sh
+python3 tests/scripts/session_replay/replay.py --agent cursor \
+  --session <conversation_id> [--turns N|all] \
+  [--checkout worktree|inplace] [--cursor-home isolated|real] \
+  [--cwd PATH] [--commit SHA] [--model MODEL] [--dry-run]
+```
+
+`--agent cursor` forwards every remaining argument to `replay_cursor.py`,
+which is also runnable directly. It reuses `replay.py`'s snapshot machinery
+verbatim — the same 0700 `HOME` snapshot (`state/` and `repository/` through
+SQLite's backup API, `config.toml` path-rewritten, `embedding/` and `bin/`
+symlinked), the same worktree, the same Repository re-registration inside the
+snapshot, the same before/after fingerprints — and writes the same
+`manifest.json` schema with `agent: "cursor"`, a `cursor_home` block where the
+Codex path writes `codex_home`, and `replayed_transcript_path` alongside
+`replayed_rollout_path` (same value) so `bundle.py --replay-id <id>` reads it
+unchanged.
+
+Output adds `host/hook-input.jsonl` and `host/hook-output.jsonl` to the Codex
+layout's `host/turn-<n>.jsonl` / `.stderr`.
+
+**Hook trust: there is none to repair.** Codex refuses to run a hook unless
+`config.toml` carries a path-keyed `trusted_hash`, which is why `replay.py`
+rewrites those keys. Cursor has no equivalent: `~/.cursor/hooks.json` is
+`{"hooks": {<event>: [{"command": ...}]}, "version": 1}` with no hashes, and
+nothing else under `~/.cursor` gates hook execution. A freshly written
+`hooks.json` in a fresh `CURSOR_CONFIG_DIR` is simply run. `build_cursor_home`
+therefore *generates* the file rather than copying it, taking only the event
+list from the operator's own (so a future Cursor that adds an event is picked
+up), and warns if `hooks.json` ever grows a key beyond `hooks`/`version` —
+which would be the first sign a trust mechanism had appeared.
+
+**How the isolation is arranged.**
+
+- `HOME` is the snapshot, exactly as on the Codex path. `CURSOR_CONFIG_DIR`
+  and `CURSOR_DATA_DIR` both point at `<home>/.cursor` inside it, so chats,
+  transcripts and per-project state land in the audit directory.
+- `cli-config.json` is written fresh with only `version`, `authInfo`, `model`
+  and `permissions` copied across; `$HOME/Library/Keychains` is **symlinked**,
+  never copied, because Cursor resolves its stored credential through the macOS
+  keychain. No token is read, printed or passed as an argument.
+- `mcp.json` registers `shared-context` against the snapshot's
+  `bin/current/sctx` with `HOME` pinned to the snapshot, so the MCP side and
+  the hook side agree on which installation they are in.
+- Each hook is registered as a two-line `sh` recorder that appends the payload
+  to `host/hook-input.jsonl`, runs the real snapshot binary with the same
+  arguments and the same stdin, appends the reply to `host/hook-output.jsonl`,
+  and prints that reply unchanged. This is the only way to see hook traffic:
+  Cursor writes it into neither the transcript nor its own logs. The two files
+  pair by line index; concurrent `postToolUse` hooks append small single
+  writes, which is atomic enough in practice but is not a guarantee.
+
+`manifest.json.isolation.hooks` is the proof the hooks fired *in the isolated
+HOME*: the per-event payload counts, the conversation ids seen in those
+payloads, how many replies carried a `<shared-context-active>` marker, and
+`marker_names_replayed_conversation` — whether such a marker named the new
+conversation id. Alongside it, `real_cursor_unchanged` /
+`real_cursor_new_transcripts` compare the real `~/.cursor` transcript
+inventory before and after the run, and
+`replayed_thread_in_replay_state` / `replayed_thread_in_real_state` show the
+new conversation's `external_session` / `task_injection` / `context_usage` rows
+existing in the snapshot and absent from the operator's real installation.
+
+**Known deviations beyond the Codex list.** All of these are written into
+`manifest.deviations` at run time, with the specific reason string used.
+
+- **The commit is a guess.** A Cursor transcript records no git metadata at
+  all. The commit is `git -C <cwd> log -1 --before=<turn 1's `<timestamp>`
+  tag>` on whatever branch the checkout is on *now* (falling back to the
+  transcript's file mtime when the transcript predates the timestamp tag), and
+  `manifest.original.commit_source` says so in words, prefixed `GUESS:`. Use
+  `--commit` when you know better.
+- **The cwd is recovered, not read** — from sctx's activation lease
+  `startup_cwd`, else by slug-matching the registered checkouts;
+  `manifest.original.cwd_source` records which. `--cwd` overrides. If neither
+  works the run refuses rather than guessing.
+- **The model is not recorded either.** The replay uses the operator's current
+  `cli-config.json` default and marks `model_source` as a `GUESS:`. `--model`
+  overrides.
+- **Approvals.** `--auto-review --approve-mcps --trust`. `--force`/`--yolo` is
+  deliberately *not* used: it would let the replay run commands the original's
+  reviewer would have stopped.
+- **Only human prompts are replayed.** Cursor's own follow-up prompts (see
+  `hosts/cursor.py` `HOST_QUERY_PREFIXES`) are skipped, and
+  `manifest.original.host_prompts_skipped` counts them.
+- **Turn 2 onwards uses `--resume <conversation id>`**, the id taken from turn
+  1's `{"type":"system","subtype":"init"}` stream event. If a later turn reports
+  a *different* id the manifest warns that `--resume` did not continue the same
+  session.
+- **`--model` is deliberately not passed** unless the operator supplies one.
+  Cursor records no model in the transcript, so there is nothing faithful to
+  pass, and the account default (which the copied `cli-config.json` carries) is
+  what an interactive session would have used anyway. Passing the config's own
+  `model.modelId` is actively worse: it is a display alias like `grok-4.6`,
+  which a `--resume` turn rejects with `Cannot use this model` — a first attempt
+  at this replay died exactly that way on turn 2 after turn 1 had accepted it.
+- **`hook-diagnostics.json` is absent on the replay side.** That file is written
+  by the sctx log *collector* service, and a replay HOME has an empty
+  `.shared-context-logs/` with no collector in it. The reconstruction block says
+  `hook-diagnostics: unavailable: ... — the hook-event counts below are ABSENT,
+  not zero`, and the replay's real hook traffic lives in
+  `host/hook-input.jsonl` / `host/hook-output.jsonl` and
+  `manifest.isolation.hooks` instead.
+
+**Validated end to end** on 2026-09-10, replaying the first 2 human prompts of
+`7d8cbab1-…` into the FE monorepo at guessed commit `a3351d8d`:
+
+- `manifest.isolation.hooks` — 69 hook payloads captured in the isolated HOME:
+  `sessionStart` 1, `postToolUse` 66, `sessionEnd` 2; one conversation id
+  observed (`230023e6-…`, the replay's own); 2 replies carried a
+  `<shared-context-active>` marker and `marker_names_replayed_conversation` is
+  `true`. So the hooks ran, sctx activated, and it activated *for this
+  conversation* — with no trust handshake of any kind.
+- `real_shared_context_unchanged: true` (identical row-count fingerprint before
+  and after across all 9 tracked tables), `real_cursor_unchanged: true`
+  (627 → 627 transcripts, `real_cursor_new_transcripts: []`).
+- `replayed_thread_in_replay_state` shows the new conversation with
+  `task_injection_rows: 17`, `context_usage_rows: 17`,
+  `agent_checkpoint_rows: 2`; `replayed_thread_in_real_state` shows
+  `external_session_id: null` — the rows exist in the snapshot and do not exist
+  in the operator's installation.
+- Both turns exited 0 with `turn_ended` `success`, and turn 2 reported the same
+  conversation id, so `--resume` did continue the session.
+- `bundle.py --replay-id <id>` then produced `original.md` (65 KB),
+  `replay.md` (26 KB) and a two-sided `facts.json`: original 4 turns / 12 sctx
+  calls / 7 claims / 3 injection events over 20 context ids, replay 2 turns /
+  18 sctx calls / 5 claims / 2 injection events over 17 context ids.
+
+One finding fell out of that run and is now handled in the parser: the sctx MCP
+`namespace` on a dynamic-tool call is the server name **with whatever scope
+prefix Cursor gives it**. The real session shows `user-shared-context`; the
+replay's isolated `CURSOR_CONFIG_DIR` produced bare `shared-context`. Matching
+the literal string would have reported zero sctx calls for a replay that made
+eighteen.
+
+### Cleaning up
+
+Worktrees hold a real checkout and a `.git/worktrees` entry in the source
+repository, so remove them through git rather than with `rm -rf`:
+
+```sh
+git -C <original cwd> worktree remove --force <audit-root>/worktrees/<replay-id>
+git -C <original cwd> branch -D replay/<original branch>   # the branch it was on
+git -C <original cwd> worktree prune          # if a directory was already deleted
+rm -rf <audit-root>/<replay-id>               # home, host home, host streams, manifest
+```
+
+A Cursor replay directory additionally holds `home/.cursor/` — the isolated
+`CURSOR_CONFIG_DIR`, including the replayed transcript — so deleting it deletes
+that transcript too. Bundle first if it matters.
+
+A replay directory is a few tens of megabytes (`home/.shared-context/state` is
+the bulk of it; `embedding/` and `bin/` are symlinks, not copies). Deleting it
+deletes the replayed rollout with it, so bundle first if the transcript matters.
+
+## candidates
+
+Replays are headless: the agent's questions get no answer. `candidates.py`
+scans local real sessions (Codex `~/.codex/state_5.sqlite` `threads`,
+`thread_source='user'`, via `hosts/codex.py`; Cursor
+`~/.cursor/projects/*/agent-transcripts/*/*.jsonl`, via `hosts/cursor.py`)
+and ranks them as replay candidates, so a session gets picked for `replay.py`
+*before* it turns out to depend on an external doc or user corrections. (Note:
+named `candidates.py`, not `select.py` — that name shadows the stdlib
+`select` module that `subprocess`/`selectors` import, which breaks any script
+run from this directory.)
+
+Every metric is computed from the parsed `session_model.Session` alone: how
+long and specific the first human prompt is (a path, a `.kt`/`.swift`/`.ts`/`.rs`
+name, or a backticked identifier counts as specific; a bare URL or Lark link
+does not), how much of the tool-call volume happened in turn 1 versus later,
+how many short "continue"/"确认" follow-ups and agent-asked questions there
+were, and how many tool calls touched something needing credentials or the
+network (`lark`, `curl`, `gh `, `adb`, `xcodebuild`, a bare host). A session's
+repo must also be registered in `~/.shared-context/config.toml`'s
+`[[repositories]]` table (parsed directly with `tomllib`, matched by path
+prefix) — an unregistered repo never receives a marker injection and is
+useless as a replay candidate, so this is a **hard filter by default**
+(`--include-unregistered` opts back in). The score formula (long specific
+first prompt + high turn-1 tool share + few prompts + an active sctx marker,
+minus questions/short-followups/external-deps/URL-first-prompt) is documented
+in the file's module docstring alongside every constant.
+
+```sh
+python3 tests/scripts/session_replay/candidates.py \
+  [--agent codex|cursor|all] [--since YYYY-MM-DD] [--min-t1-tools N] \
+  [--top N] [--json] [--include-unregistered] [--explain THREAD_ID]
+```
+
+`--json` prints the same records the table shows, for a replay driver to
+consume machine-readably; `--explain THREAD_ID` resolves and parses one
+session (ignoring every other filter/the hard registration filter) and
+prints its full raw metrics, including which `external_dep_keywords`
+matched. `tests/test_candidates.py` covers the detection helpers, the score
+formula, `config.toml` parsing/prefix matching, and the `--since` /
+`thread_source` filtering, all against synthetic data built inline — no real
+transcript text or thread ids.

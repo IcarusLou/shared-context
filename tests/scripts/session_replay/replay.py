@@ -1,0 +1,1817 @@
+#!/usr/bin/env python3
+"""Replay a real Codex session's human prompts into a fresh headless Codex session.
+
+The point of this script is fidelity, not convenience: a replay is only worth
+auditing when the run it produces could plausibly have been the original. So the
+replay reuses the original's commit, sandbox policy, approval policy, model and
+Shared Context repository identity, and it changes exactly three things it cannot
+avoid changing -- an isolated ``HOME`` so no Shared Context state is written into
+the operator's real installation, an isolated ``CODEX_HOME`` so the new rollout
+lands inside the audit directory, and headless approvals so nobody has to sit at
+the keyboard. Every one of those three is recorded in the manifest.
+
+Usage::
+
+    python3 tests/scripts/session_replay/replay.py --session <thread_id> \
+        [--turns N|all] [--audit-root ~/.shared-context-audit] \
+        [--checkout worktree|inplace] [--codex-home isolated|real] [--dry-run]
+
+Nothing here writes into the repository under replay, into ``~/.shared-context``
+or into ``~/.codex``: the replay's whole footprint is the audit root plus one
+detached ``git worktree``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import glob
+import json
+import os
+import pathlib
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Iterator
+
+# Codex writes one JSON object per rollout line: {timestamp, ordinal, type, payload}.
+ROLLOUT_GLOB = "sessions/*/*/*/rollout-*-{thread_id}.jsonl"
+
+# A user message that opens with either of these is the host talking, not a human:
+# AGENTS.md injection, or one of the `<recommended_plugins>` / `<environment_context>`
+# style blocks Codex splices into the transcript.
+HOST_PROMPT_PREFIXES = ("# AGENTS.md instructions", "<")
+
+# Every Shared Context state directory is created 0700 by the installer, and
+# `sctx` refuses to open an installation root or state directory that is not
+# private -- it fails closed and the hook silently reports "disabled". A snapshot
+# that forgets this produces a replay in which Shared Context never activates and
+# nothing says why, so the mode is asserted rather than inherited from umask.
+PRIVATE_DIR_MODE = 0o700
+
+# Files under ~/.shared-context/state that must be snapshotted through SQLite's
+# own backup API rather than copied, because a live writer may be mid-transaction.
+SQLITE_SUFFIXES = (".sqlite",)
+SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", ".sqlite-wal", ".sqlite-shm")
+
+# Codex home entries that are pure inputs (read-only caches, bundles, credentials)
+# and can be shared with the real installation. Everything else -- sessions,
+# history, the thread index -- must be fresh so the replay's rollout is isolated.
+CODEX_HOME_SYMLINKS = (
+    "plugins",
+    "skills",
+    "rules",
+    "computer-use",
+    "vendor_imports",
+    "ambient-suggestions",
+    "attachments",
+    "browser",
+    "node_repl",
+    "memories",
+)
+CODEX_HOME_COPIES = (
+    "auth.json",
+    "hooks.json",
+    "installation_id",
+    "models_cache.json",
+    "version.json",
+    "AGENTS.md",
+    "chrome-native-hosts.json",
+    "chrome-native-hosts-v2.json",
+    ".personality_migration",
+    ".sandbox_migration",
+)
+
+# Top-level entries of the real HOME that must NOT be symlinked into the replay
+# HOME, because the replay needs its own copy of them. Everything else is
+# symlinked through: the first replay diverged from turn 1 because the isolated
+# HOME was bare, so the agent lost the corporate CLI configs the original had
+# read a document with and answered "this machine has no lark-cli configured"
+# where the original had answered from the document. A tool that writes through
+# one of these symlinks writes into the real HOME; that is accepted, because the
+# three directories below are the only state whose contamination would corrupt
+# the audit.
+HOME_OVERLAY_EXCLUSIONS = (
+    ".shared-context",
+    ".shared-context-logs",
+    ".codex",
+    ".cursor",
+)
+
+# A tool call whose name contains this is the agent asking the operator something
+# and blocking on the answer. Headless, nobody answers, and the turn ends with the
+# question unanswered -- which is a divergence, not a result.
+QUESTION_TOOL_MARKER = "request_user_input"
+
+# Stream item types that count as one tool call. The two hosts spell them
+# differently -- `codex exec --json` snake_case, the app-server lowerCamelCase --
+# and the rollout on disk uses PascalCase again, so nothing here is shared.
+TOOL_ITEM_TYPES_APP_SERVER = frozenset(
+    {"commandExecution", "fileChange", "mcpToolCall", "webSearch", "dynamicTool", "toolCall"}
+)
+TOOL_ITEM_TYPES_EXEC = frozenset(
+    {"command_execution", "file_change", "mcp_tool_call", "web_search", "dynamic_tool",
+     "tool_call"}
+)
+QUESTION_SUFFIXES = ("?", "？")
+
+# Tables in the isolated runtime database whose row counts make a compact
+# before/after fingerprint of "did this replay write Shared Context state".
+RUNTIME_FINGERPRINT_TABLES = (
+    "external_session",
+    "task_session",
+    "task_injection",
+    "work_episode",
+    "work_observation",
+    "context_usage",
+    "agent_checkpoint",
+    "candidate_build",
+    "hook_event",
+)
+
+
+class ReplayError(RuntimeError):
+    """A condition the operator has to resolve before a replay can be faithful."""
+
+
+def log(message: str) -> None:
+    print(f"[replay] {message}", flush=True)
+
+
+def warn(warnings: list[str], message: str) -> None:
+    warnings.append(message)
+    print(f"[replay:warn] {message}", flush=True)
+
+
+# --------------------------------------------------------------------------
+# Resolving the original session
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Original:
+    thread_id: str
+    rollout_path: pathlib.Path
+    cwd: pathlib.Path
+    commit: str | None
+    branch: str | None
+    repository_url: str | None
+    cli_version: str | None
+    originator: str | None
+    thread_source: str | None
+    model: str | None
+    approval_policy: str | None
+    approvals_reviewer: str | None
+    sandbox_type: str | None
+    sandbox_network_access: bool | None
+    workspace_roots: list[str]
+    prompts: list[str]
+
+
+def codex_home() -> pathlib.Path:
+    return pathlib.Path(os.environ.get("CODEX_HOME") or pathlib.Path.home() / ".codex")
+
+
+def _open_thread_index(scratch: pathlib.Path) -> sqlite3.Connection | None:
+    """Copies the Codex thread index aside and opens it.
+
+    The live index is a WAL database another process is writing; opening it in
+    place would either take a lock or read a stale snapshot. The copy includes
+    the ``-wal``/``-shm`` sidecars so the copy sees committed-but-uncheckpointed
+    rows -- which is where a session started minutes ago still lives.
+    """
+    source = codex_home() / "state_5.sqlite"
+    if not source.exists():
+        return None
+    scratch.mkdir(parents=True, exist_ok=True)
+    target = scratch / "state_5.sqlite"
+    for suffix in ("", "-wal", "-shm"):
+        candidate = source.with_name(source.name + suffix)
+        if candidate.exists():
+            shutil.copy2(candidate, scratch / candidate.name)
+    return sqlite3.connect(target)
+
+
+def locate_rollout(thread_id: str) -> tuple[pathlib.Path, dict[str, Any]]:
+    """Returns the rollout path plus whatever the thread index knows about it."""
+    index_row: dict[str, Any] = {}
+    with tempfile.TemporaryDirectory(prefix="sctx-replay-index-") as scratch:
+        connection = _open_thread_index(pathlib.Path(scratch))
+        if connection is not None:
+            with contextlib.closing(connection):
+                connection.row_factory = sqlite3.Row
+                try:
+                    row = connection.execute(
+                        "SELECT id, rollout_path, cwd, cli_version, thread_source, git_branch, "
+                        "git_sha, model, first_user_message FROM threads WHERE id = ?",
+                        (thread_id,),
+                    ).fetchone()
+                except sqlite3.DatabaseError as error:  # pragma: no cover - defensive
+                    raise ReplayError(f"cannot read the Codex thread index: {error}") from error
+                if row is not None:
+                    index_row = dict(row)
+                    candidate = pathlib.Path(index_row["rollout_path"])
+                    if candidate.exists():
+                        return candidate, index_row
+    matches = sorted(
+        pathlib.Path(path)
+        for path in glob.glob(str(codex_home() / ROLLOUT_GLOB.format(thread_id=thread_id)))
+    )
+    if not matches:
+        raise ReplayError(
+            f"no rollout found for session {thread_id}: it is neither in "
+            f"{codex_home() / 'state_5.sqlite'} nor on disk under {codex_home() / 'sessions'}"
+        )
+    return matches[-1], index_row
+
+
+def iter_rollout(path: pathlib.Path) -> Iterator[dict[str, Any]]:
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+
+def message_text(payload: dict[str, Any]) -> str:
+    content = payload.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        part.get("text", "") for part in content if isinstance(part, dict) and part.get("text")
+    )
+
+
+def is_human_prompt(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return not stripped.startswith(HOST_PROMPT_PREFIXES)
+
+
+def parse_original(thread_id: str, rollout: pathlib.Path, index_row: dict[str, Any]) -> Original:
+    meta: dict[str, Any] = {}
+    turn_context: dict[str, Any] = {}
+    model: str | None = None
+    prompts: list[str] = []
+    for record in iter_rollout(rollout):
+        kind = record.get("type")
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if kind == "session_meta" and not meta:
+            meta = payload
+        elif kind == "turn_context" and not turn_context:
+            turn_context = payload
+        elif kind == "response_item" and payload.get("type") == "message":
+            if payload.get("role") != "user":
+                continue
+            text = message_text(payload)
+            if is_human_prompt(text):
+                prompts.append(text)
+        if model is None:
+            # The model is recorded on `turn_context` in 0.153.x; older rollouts put
+            # it on `token_usage_record` or an `event_msg`, so all three are tried
+            # before falling back to the thread index.
+            if kind == "turn_context":
+                model = payload.get("model")
+            elif kind in {"token_usage_record", "event_msg"}:
+                candidate = payload.get("model") or payload.get("model_slug")
+                if isinstance(candidate, str) and candidate:
+                    model = candidate
+    if not meta:
+        raise ReplayError(f"{rollout} carries no session_meta record")
+    if not prompts:
+        raise ReplayError(f"{rollout} carries no human prompts to replay")
+
+    git = meta.get("git") if isinstance(meta.get("git"), dict) else {}
+    sandbox = turn_context.get("sandbox_policy")
+    sandbox = sandbox if isinstance(sandbox, dict) else {}
+    workspace_roots = turn_context.get("workspace_roots")
+    cwd = meta.get("cwd") or index_row.get("cwd")
+    if not cwd:
+        raise ReplayError(f"{rollout} does not record a working directory")
+    return Original(
+        thread_id=thread_id,
+        rollout_path=rollout,
+        cwd=pathlib.Path(cwd),
+        commit=git.get("commit_hash") or index_row.get("git_sha"),
+        branch=git.get("branch") or index_row.get("git_branch"),
+        repository_url=git.get("repository_url"),
+        cli_version=meta.get("cli_version") or index_row.get("cli_version"),
+        originator=meta.get("originator"),
+        thread_source=meta.get("thread_source") or index_row.get("thread_source"),
+        model=model or index_row.get("model"),
+        approval_policy=turn_context.get("approval_policy"),
+        approvals_reviewer=turn_context.get("approvals_reviewer"),
+        sandbox_type=sandbox.get("type"),
+        sandbox_network_access=sandbox.get("network_access"),
+        workspace_roots=[str(root) for root in workspace_roots]
+        if isinstance(workspace_roots, list)
+        else [],
+        prompts=prompts,
+    )
+
+
+# --------------------------------------------------------------------------
+# Repository state
+# --------------------------------------------------------------------------
+
+
+def git_output(args: list[str]) -> str:
+    completed = subprocess.run(
+        ["git", *args], capture_output=True, text=True, check=False
+    )
+    if completed.returncode != 0:
+        raise ReplayError(
+            f"git {' '.join(args)} failed: {completed.stderr.strip() or completed.stdout.strip()}"
+        )
+    return completed.stdout.strip()
+
+
+def replay_branch_name(original: Original, replay_id: str) -> str:
+    """`replay/<original branch>`, unique per replay when that name is taken.
+
+    A detached worktree reports `git_branch` as `-`, which propagates into the
+    replayed session's own metadata and into every hook that reads it -- so the
+    replay stops being comparable to the original on a field the audit reads.
+    A real local branch at the same commit fixes that at no cost.
+    """
+    base = (original.branch or (original.commit or "unknown")[:12]).strip()
+    base = base.removeprefix("refs/heads/").strip("/") or "unknown"
+    base = re.sub(r"[^A-Za-z0-9._/-]", "-", base)
+    return f"replay/{base}"
+
+
+def prepare_worktree(
+    original: Original, worktree: pathlib.Path, replay_id: str = ""
+) -> tuple[str, str | None]:
+    """Adds a worktree at the original commit on a `replay/...` branch."""
+    if not original.commit:
+        raise ReplayError(
+            f"session {original.thread_id} does not record a git commit; rerun with "
+            "--checkout inplace if you accept replaying against the current tree"
+        )
+    if not (original.cwd / ".git").exists():
+        raise ReplayError(f"{original.cwd} is not a git checkout")
+    probe = subprocess.run(
+        ["git", "-C", str(original.cwd), "cat-file", "-e", f"{original.commit}^{{commit}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode != 0:
+        raise ReplayError(
+            f"commit {original.commit} (branch {original.branch or 'unknown'}) is not present "
+            f"in {original.cwd}; fetch it first, e.g. `git -C {original.cwd} fetch origin "
+            f"{original.branch or original.commit}`"
+        )
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    branch = replay_branch_name(original, replay_id)
+    existing = subprocess.run(
+        ["git", "-C", str(original.cwd), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if existing.returncode == 0 and replay_id:
+        branch = f"{branch}-{replay_id}"
+    log(f"creating worktree at {worktree} (branch {branch} at {original.commit[:12]}) -- this can "
+        "take minutes on a large repository")
+    started = time.monotonic()
+    completed = subprocess.run(
+        ["git", "-C", str(original.cwd), "worktree", "add", "-b", branch, str(worktree),
+         original.commit],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        # A branch is a nicety; a checkout at the right commit is the requirement.
+        detached = subprocess.run(
+            ["git", "-C", str(original.cwd), "worktree", "add", "--detach", str(worktree),
+             original.commit],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if detached.returncode != 0:
+            raise ReplayError(
+                f"git worktree add failed: {completed.stderr.strip() or completed.stdout.strip()}"
+            )
+        branch = None
+    log(f"worktree ready in {time.monotonic() - started:.1f}s")
+    return git_output(["-C", str(worktree), "rev-parse", "HEAD"]), branch
+
+
+# --------------------------------------------------------------------------
+# Isolated HOME with a Shared Context snapshot
+# --------------------------------------------------------------------------
+
+
+def private_mkdir(path: pathlib.Path) -> pathlib.Path:
+    path.mkdir(parents=True, exist_ok=True)
+    path.chmod(PRIVATE_DIR_MODE)
+    return path
+
+
+def snapshot_sqlite(source: pathlib.Path, target: pathlib.Path) -> None:
+    with contextlib.closing(sqlite3.connect(f"file:{source}?mode=ro", uri=True)) as origin:
+        with contextlib.closing(sqlite3.connect(target)) as copy:
+            origin.backup(copy)
+    target.chmod(0o600)
+
+
+def snapshot_state_tree(source: pathlib.Path, target: pathlib.Path) -> None:
+    """Copies a Shared Context state directory, snapshotting databases safely.
+
+    A plain ``cp -R`` of a live SQLite database plus its ``-wal``/``-shm`` sidecars
+    produces a copy whose sidecars describe a different file; every later opener
+    then either rebuilds or errors. The backup API hands over a consistent single
+    file instead, so the sidecars are deliberately not copied.
+    """
+    private_mkdir(target)
+    for entry in sorted(source.iterdir()):
+        destination = target / entry.name
+        if entry.is_dir() and not entry.is_symlink():
+            snapshot_state_tree(entry, destination)
+        elif entry.name.endswith(SQLITE_SIDECAR_SUFFIXES):
+            continue
+        elif entry.name.endswith(SQLITE_SUFFIXES):
+            snapshot_sqlite(entry, destination)
+        elif entry.is_symlink():
+            os.symlink(os.readlink(entry), destination)
+        else:
+            shutil.copy2(entry, destination)
+
+
+def overlay_real_home(
+    home: pathlib.Path,
+    real_home: pathlib.Path,
+    exclusions: tuple[str, ...],
+    warnings: list[str],
+    skip_paths: tuple[pathlib.Path, ...] = (),
+) -> dict[str, Any]:
+    """Symlinks every top-level entry of the real HOME into the replay HOME.
+
+    A replay in a bare HOME is not a replay of the same machine: shells, tool
+    credentials, corporate CLI configs and caches all live under `~` and the
+    agent notices their absence within one turn. Symlinks give the agent the same
+    machine while keeping the four directories in `exclusions` -- the ones whose
+    contamination would corrupt the audit -- private to the replay.
+    """
+    linked: list[str] = []
+    skipped: list[str] = []
+    for entry in sorted(real_home.iterdir()):
+        if entry.name in exclusions:
+            skipped.append(entry.name)
+            continue
+        # The audit root usually lives under HOME, and the replay HOME lives
+        # inside the audit root: symlinking it back would make every tree walk
+        # from the replay HOME infinite.
+        if any(entry == skip for skip in skip_paths):
+            skipped.append(entry.name)
+            continue
+        target = home / entry.name
+        if target.exists() or target.is_symlink():
+            continue
+        try:
+            os.symlink(entry, target)
+        except OSError as error:  # pragma: no cover - defensive
+            warn(warnings, f"could not overlay {entry.name} into the replay HOME: {error}")
+            continue
+        linked.append(entry.name)
+    log(f"HOME overlay: symlinked {len(linked)} entries, kept {len(skipped)} private/skipped")
+    return {"symlinked": linked, "excluded": list(exclusions), "skipped": skipped}
+
+
+def setup_replay_logs(
+    logs_root: pathlib.Path, binary: pathlib.Path, warnings: list[str]
+) -> dict[str, Any]:
+    """Configures the replay's own log-service root so hook diagnostics get written.
+
+    An empty `.shared-context-logs/` silences the replay side of the audit: hook
+    decisions are not in `runtime.sqlite` any more, they are aggregated by the
+    log collector into `state/hook-diagnostics.json`, and with no config there is
+    no collector and no file. `sctx logs init` without `--remote` produces a
+    configuration that collects locally and has nowhere to upload to; running it
+    with HOME unset skips the launchd reconciliation, so the operator's real
+    collector and sync services are left exactly as they were.
+    """
+    private_mkdir(logs_root)
+    environment = {key: value for key, value in os.environ.items() if key != "HOME"}
+    completed = subprocess.run(
+        [str(binary), "logs", "init", "--logs-root", str(logs_root)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+    )
+    if completed.returncode != 0:
+        warn(
+            warnings,
+            "`sctx logs init` failed for the replay logs root "
+            f"({completed.stderr.strip() or completed.stdout.strip()}); replay-side hook "
+            "diagnostics will be missing",
+        )
+        return {"configured": False, "path": str(logs_root)}
+    config = logs_root / "config.toml"
+    body = config.read_text(encoding="utf-8")
+    if "remote" in body:
+        warn(warnings, "the replay logs config names a remote; uploads are NOT disabled")
+    # `on_maintain` is the one path that would push replay telemetry outward on
+    # its own; there is no remote to push to, but belt and braces.
+    body = body.replace("on_maintain = true", "on_maintain = false")
+    config.write_text(body, encoding="utf-8")
+    config.chmod(0o600)
+    return {
+        "configured": True,
+        "path": str(logs_root),
+        "remote_configured": "remote" in body,
+        "sync_on_maintain": False,
+    }
+
+
+def start_log_collector(
+    binary: pathlib.Path, logs_root: pathlib.Path, log_path: pathlib.Path
+) -> subprocess.Popen[bytes] | None:
+    """Runs the log collector for the lifetime of the replay, in-process, no launchd."""
+    try:
+        return subprocess.Popen(
+            [str(binary), "logs", "collect", "--logs-root", str(logs_root)],
+            stdin=subprocess.DEVNULL,
+            stdout=log_path.open("wb"),
+            stderr=subprocess.STDOUT,
+            env={key: value for key, value in os.environ.items() if key != "HOME"},
+        )
+    except OSError:  # pragma: no cover - defensive
+        return None
+
+
+def build_replay_home(
+    home: pathlib.Path,
+    real_home: pathlib.Path,
+    warnings: list[str],
+    overlay_exclusions: tuple[str, ...] = HOME_OVERLAY_EXCLUSIONS,
+    skip_paths: tuple[pathlib.Path, ...] = (),
+) -> dict[str, Any]:
+    private_mkdir(home)
+    real_sctx = real_home / ".shared-context"
+    if not real_sctx.is_dir():
+        raise ReplayError(f"{real_sctx} does not exist; nothing to snapshot")
+    sctx = private_mkdir(home / ".shared-context")
+
+    started = time.monotonic()
+    for name in ("state", "repository"):
+        source = real_sctx / name
+        if not source.is_dir():
+            warn(warnings, f"{source} is missing; the replay runs without it")
+            continue
+        log(f"snapshotting {source} -> {sctx / name}")
+        snapshot_state_tree(source, sctx / name)
+    for name in ("embedding", "bin"):
+        source = real_sctx / name
+        if source.exists():
+            os.symlink(source, sctx / name)
+        else:
+            warn(warnings, f"{source} is missing; the replay runs without it")
+
+    config = real_sctx / "config.toml"
+    if not config.is_file():
+        raise ReplayError(f"{config} does not exist; run `sctx setup` first")
+    # Every absolute path inside config.toml points at the real installation root.
+    # Rewriting the prefix keeps the repository store and the embedding model
+    # pointing at this HOME -- the store is a snapshot, the embedding directory a
+    # symlink back to the 2.3G original.
+    body = config.read_text(encoding="utf-8").replace(str(real_sctx), str(sctx))
+    (sctx / "config.toml").write_text(body, encoding="utf-8")
+    (sctx / "config.toml").chmod(0o600)
+
+    # Telemetry resolves its root from HOME. The directory is the replay's own, so
+    # nothing it records reaches the operator's spool -- but it is configured
+    # rather than left empty, because an empty one records nothing at all.
+    logs = setup_replay_logs(
+        home / ".shared-context-logs", (real_sctx / "bin" / "current" / "sctx"), warnings
+    )
+
+    overlay = overlay_real_home(home, real_home, overlay_exclusions, warnings, skip_paths)
+    if not (home / ".agents").exists():
+        warn(warnings, f"{real_home / '.agents'} is missing; skill bundles will not load")
+    if not (home / ".gitconfig").exists():
+        warn(warnings, f"{real_home / '.gitconfig'} is missing; git uses its defaults")
+    log(f"HOME snapshot ready in {time.monotonic() - started:.1f}s")
+    return {
+        "path": str(home),
+        "snapshot_taken_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "copied": ["state", "repository", "config.toml"],
+        "symlinked": ["embedding", "bin"],
+        "overlay": overlay,
+        "logs": logs,
+    }
+
+
+def read_repository_catalog(config: pathlib.Path) -> list[tuple[str, list[str]]]:
+    """Parses `[[repositories]]` out of a Shared Context config.toml.
+
+    ``tomllib`` is used where available; the regex fallback keeps the script
+    runnable on Python 3.10, which the repo's other helper scripts still target.
+    """
+    body = config.read_text(encoding="utf-8")
+    try:
+        import tomllib
+
+        document = tomllib.loads(body)
+        return [
+            (str(entry.get("id")), [str(path) for path in entry.get("paths", [])])
+            for entry in document.get("repositories", [])
+            if entry.get("id")
+        ]
+    except Exception:  # pragma: no cover - fallback for older interpreters
+        catalog: list[tuple[str, list[str]]] = []
+        for block in body.split("[[repositories]]")[1:]:
+            block = block.split("\n[", 1)[0]
+            identity = re.search(r'id\s*=\s*"([^"]+)"', block)
+            paths = re.findall(r'"([^"]+)"', block.split("paths", 1)[-1])
+            if identity:
+                catalog.append((identity.group(1), paths))
+        return catalog
+
+
+def register_checkout(
+    home: pathlib.Path,
+    binary: pathlib.Path,
+    original_cwd: pathlib.Path,
+    checkout: pathlib.Path,
+    warnings: list[str],
+) -> dict[str, Any]:
+    """Teaches the snapshotted catalog that the replay checkout is the same Repository.
+
+    Shared Context authorizes a session by longest-prefix match of its startup
+    directory against the registered checkout paths. A worktree lives somewhere
+    else entirely, so without this the replay of a session that *did* activate
+    would silently run with Shared Context disabled -- the exact signal the audit
+    is trying to measure. Registering the worktree under the original's Repository
+    identity keeps the knowledge base the same and only adds a second checkout.
+    """
+    config = home / ".shared-context" / "config.toml"
+    catalog = read_repository_catalog(config)
+    matched: str | None = None
+    matched_path = ""
+    for identity, paths in catalog:
+        for path in paths:
+            if str(original_cwd) == path or str(original_cwd).startswith(path.rstrip("/") + "/"):
+                if len(path) > len(matched_path):
+                    matched, matched_path = identity, path
+    if matched is None:
+        warn(
+            warnings,
+            f"{original_cwd} is outside every registered Shared Context Repository, so the "
+            "replay runs with Shared Context disabled -- exactly as the original session did",
+        )
+        return {"repository_id": None, "registered_path": None}
+    if checkout == original_cwd:
+        return {"repository_id": matched, "registered_path": str(original_cwd)}
+    log(f"registering {checkout} as Repository {matched} in the snapshot (first scan may be slow)")
+    environment = dict(os.environ, HOME=str(home))
+    completed = subprocess.run(
+        [str(binary), "repository", "add", "--repository-id", matched, "--path", str(checkout)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+    )
+    if completed.returncode != 0:
+        warn(
+            warnings,
+            f"`sctx repository add` failed for the replay checkout ({completed.stderr.strip()}); "
+            "Shared Context will stay disabled for the replay",
+        )
+        return {"repository_id": None, "registered_path": None}
+    return {"repository_id": matched, "registered_path": str(checkout)}
+
+
+# --------------------------------------------------------------------------
+# Isolated CODEX_HOME
+# --------------------------------------------------------------------------
+
+
+def build_codex_home(
+    target: pathlib.Path,
+    real_codex_home: pathlib.Path,
+    checkout: pathlib.Path,
+    warnings: list[str],
+) -> None:
+    """Mirrors the real Codex home closely enough that hooks and plugins still load.
+
+    Codex 0.153.4 refuses to run a hook unless config.toml holds a
+    ``[hooks.state."<hooks.json path>:<event>:0:0"]`` entry whose ``trusted_hash``
+    matches. The key is *keyed by the absolute path of the hooks file*, so a
+    verbatim copy of both files into a new CODEX_HOME trusts nothing. Rewriting
+    only the path prefix inside those keys -- the hashes cover the hook entries,
+    which are copied byte for byte -- restores trust without the
+    ``--dangerously-bypass-hook-trust`` escape hatch.
+    """
+    private_mkdir(target)
+    config = real_codex_home / "config.toml"
+    if not config.is_file():
+        raise ReplayError(f"{config} does not exist")
+    body = config.read_text(encoding="utf-8")
+    hooks_key_prefix = f'[hooks.state."{real_codex_home / "hooks.json"}:'
+    rewritten_keys = body.count(hooks_key_prefix)
+    body = body.replace(hooks_key_prefix, f'[hooks.state."{target / "hooks.json"}:')
+    if rewritten_keys == 0:
+        warn(
+            warnings,
+            f"no [hooks.state] entries in {config} name {real_codex_home / 'hooks.json'}; "
+            "Codex may refuse to run the Shared Context hooks in the isolated CODEX_HOME",
+        )
+    # A checkout Codex has never seen is untrusted, which in a headless run means
+    # the sandbox tightens without saying so. The original cwd carries this mark
+    # already; the replay checkout inherits it.
+    body += f'\n[projects."{checkout}"]\ntrust_level = "trusted"\n'
+    (target / "config.toml").write_text(body, encoding="utf-8")
+    (target / "config.toml").chmod(0o600)
+
+    for name in CODEX_HOME_COPIES:
+        source = real_codex_home / name
+        if source.is_file():
+            shutil.copy2(source, target / name)
+    if not (target / "auth.json").exists():
+        warn(warnings, f"{real_codex_home / 'auth.json'} is missing; Codex may not be logged in")
+    for name in CODEX_HOME_SYMLINKS:
+        source = real_codex_home / name
+        if source.exists() and not (target / name).exists():
+            os.symlink(source, target / name)
+
+
+# --------------------------------------------------------------------------
+# Driving the turns
+# --------------------------------------------------------------------------
+
+
+def looks_like_question(text: str) -> bool:
+    """Whether a final assistant message is a question waiting for an answer."""
+    stripped = (text or "").strip().rstrip("*_`)]\"'\u201d\u300d\u300f")
+    return bool(stripped) and stripped.endswith(QUESTION_SUFFIXES)
+
+
+def question_from_item(item: dict[str, Any]) -> str | None:
+    """Extracts the operator-facing question out of one completed stream item.
+
+    Two shapes carry one: a `request_user_input`-family tool call (the agent
+    blocking on an answer), and a final assistant message that simply ends in a
+    question mark. Both leave the replay stalled against an original in which a
+    human answered, so both have to be visible.
+    """
+    kind = str(item.get("type") or "")
+    name = str(item.get("name") or item.get("tool_name") or item.get("toolName") or "")
+    if QUESTION_TOOL_MARKER in name.lower().replace("-", "_") or QUESTION_TOOL_MARKER in kind.lower(
+    ).replace("-", "_"):
+        payload = item.get("arguments") or item.get("input") or item.get("questions") or item
+        return json.dumps(payload, ensure_ascii=False)[:2000]
+    if kind in {"agent_message", "agentMessage"}:
+        questions = item.get("questions")
+        if questions:
+            return json.dumps(questions, ensure_ascii=False)[:2000]
+        text = item.get("text") or ""
+        if item.get("phase") in (None, "final_answer") and looks_like_question(text):
+            return text.strip()[:2000]
+    return None
+
+
+@dataclass
+class TurnResult:
+    prompt_index: int
+    prompt_chars: int
+    started: str
+    finished: str
+    exit_code: int
+    thread_id: str | None
+    usage: dict[str, Any] | None
+    waited_for_turn_stop: bool
+    stream_path: str
+    stderr_path: str
+    errors: list[str] = field(default_factory=list)
+    question: str | None = None
+    answered_with_next_prompt: bool = False
+    tool_calls: int = 0
+
+
+def toml_string(value: str) -> str:
+    return json.dumps(value)
+
+
+def sandbox_flag(original: Original) -> str:
+    mapping = {
+        "workspace-write": "workspace-write",
+        "read-only": "read-only",
+        "danger-full-access": "danger-full-access",
+    }
+    return mapping.get(original.sandbox_type or "", "workspace-write")
+
+
+def shared_config_overrides(
+    original: Original, home: pathlib.Path, binary: pathlib.Path
+) -> list[str]:
+    overrides = [
+        f"mcp_servers.shared-context.command={toml_string(str(binary))}",
+        'mcp_servers.shared-context.args=["mcp","serve","--client","codex"]',
+        f"mcp_servers.shared-context.env={{HOME={toml_string(str(home))}}}",
+        # `--approve-for-me` is the headless equivalent of the reviewer the original
+        # interactive session used; stating it explicitly makes `resume`, which has
+        # no such flag, behave like turn 1.
+        'approvals_reviewer="auto_review"',
+    ]
+    if original.approval_policy:
+        overrides.append(f"approval_policy={toml_string(original.approval_policy)}")
+    if original.sandbox_network_access is not None:
+        overrides.append(
+            "sandbox_workspace_write.network_access="
+            f"{'true' if original.sandbox_network_access else 'false'}"
+        )
+    return overrides
+
+
+def build_turn_command(
+    codex: str,
+    original: Original,
+    prompt: str,
+    checkout: pathlib.Path,
+    home: pathlib.Path,
+    binary: pathlib.Path,
+    resume_thread: str | None,
+) -> list[str]:
+    command = [codex, "exec"]
+    if resume_thread:
+        command += ["resume", resume_thread]
+    command += ["--json"]
+    if not resume_thread:
+        # `codex exec resume` accepts neither --color nor -C; NO_COLOR in the
+        # environment covers the first, and the process working directory the second.
+        command += ["--color", "never", "-C", str(checkout)]
+        # `--approve-for-me` is the only headless approval route `codex exec` offers,
+        # and it hard-codes the workspace-write sandbox: passing `--sandbox` beside it
+        # is a usage error. When the original ran under a different sandbox the flag
+        # is dropped and `approvals_reviewer=auto_review` (below) carries approvals,
+        # because mirroring the sandbox matters more than the flag's convenience.
+        if sandbox_flag(original) == "workspace-write":
+            command += ["--approve-for-me"]
+        else:
+            command += ["-s", sandbox_flag(original)]
+    if original.model:
+        command += ["-m", original.model]
+    if original.thread_source and not resume_thread:
+        command += ["--thread-source", original.thread_source]
+    for override in shared_config_overrides(original, home, binary):
+        command += ["-c", override]
+    if resume_thread:
+        command += ["-c", f"sandbox_mode={toml_string(sandbox_flag(original))}"]
+    command.append(prompt)
+    return command
+
+
+def run_turn(
+    command: list[str],
+    environment: dict[str, str],
+    checkout: pathlib.Path,
+    stream_path: pathlib.Path,
+    stderr_path: pathlib.Path,
+    timeout: int,
+) -> tuple[int, str | None, dict[str, Any] | None, list[str], str | None, int]:
+    """Runs one `codex exec` turn, teeing the JSONL stream to disk as it arrives."""
+    thread_id: str | None = None
+    usage: dict[str, Any] | None = None
+    errors: list[str] = []
+    question: str | None = None
+    tool_calls = 0
+    deadline = time.monotonic() + timeout
+    with stderr_path.open("w", encoding="utf-8") as stderr_handle:
+        process = subprocess.Popen(
+            command,
+            cwd=str(checkout),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=stderr_handle,
+            text=True,
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        with stream_path.open("w", encoding="utf-8") as stream_handle:
+            for line in process.stdout:
+                stream_handle.write(line)
+                stream_handle.flush()
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                kind = event.get("type")
+                if kind == "thread.started" and event.get("thread_id"):
+                    thread_id = event["thread_id"]
+                    log(f"thread {thread_id}")
+                elif kind == "item.completed":
+                    item = event.get("item") or {}
+                    if item.get("type") in TOOL_ITEM_TYPES_EXEC:
+                        tool_calls += 1
+                    question = question or question_from_item(item)
+                elif kind == "turn.completed":
+                    usage = event.get("usage")
+                elif kind == "turn.failed":
+                    errors.append(json.dumps(event.get("error", event))[:400])
+                elif kind == "error":
+                    errors.append(json.dumps(event)[:400])
+                if time.monotonic() > deadline:
+                    process.kill()
+                    errors.append(f"turn exceeded {timeout}s and was killed")
+                    break
+        try:
+            status = process.wait(timeout=max(1.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            process.kill()
+            status = 124
+            errors.append(f"turn exceeded {timeout}s and was killed")
+    return status, thread_id, usage, errors, question, tool_calls
+
+
+class AppServerDriver:
+    """Drives a whole replay through one `codex app-server` process.
+
+    `codex exec resume` starts a *new* process per turn, and every start replays
+    the SessionStart hook: a two-turn replay carried the Shared Context activation
+    marker twice where the interactive original carried it once, which is exactly
+    the kind of injected-context difference this audit exists to measure. The
+    app-server protocol keeps one process and one thread across turns
+    (`thread/start` once, `turn/start` per prompt), so the hook sequence matches an
+    interactive session: session_start once, then prompt_submit / post_tool_use /
+    stop per turn.
+    """
+
+    def __init__(
+        self,
+        codex: str,
+        environment: dict[str, str],
+        cwd: pathlib.Path,
+        transcript: pathlib.Path,
+        warnings: list[str],
+    ) -> None:
+        self.codex = codex
+        self.environment = environment
+        self.cwd = cwd
+        self.warnings = warnings
+        self.transcript = transcript.open("w", encoding="utf-8")
+        self.process: subprocess.Popen[str] | None = None
+        self.messages: list[dict[str, Any]] = []
+        self.responses: dict[Any, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+        self._next_id = 0
+        self._sink: list[dict[str, Any]] | None = None
+        self.pending_answer: str | None = None
+        self.questions: list[str] = []
+        self.stderr_path = transcript.with_suffix(".stderr")
+
+    # -- plumbing ---------------------------------------------------------
+    def _send(self, payload: dict[str, Any]) -> None:
+        assert self.process is not None and self.process.stdin is not None
+        line = json.dumps(payload, ensure_ascii=False)
+        self.process.stdin.write(line + "\n")
+        self.process.stdin.flush()
+
+    def _request(self, method: str, params: dict[str, Any]) -> int:
+        with self._lock:
+            self._next_id += 1
+            request_id = self._next_id
+        self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        return request_id
+
+    def _await(self, request_id: int, timeout: float) -> dict[str, Any] | None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if request_id in self.responses:
+                    return self.responses.pop(request_id)
+            if self.process is not None and self.process.poll() is not None:
+                return None
+            time.sleep(0.05)
+        return None
+
+    def _record(self, message: dict[str, Any]) -> None:
+        self.transcript.write(json.dumps(message, ensure_ascii=False) + "\n")
+        self.transcript.flush()
+        with self._lock:
+            self.messages.append(message)
+            if self._sink is not None:
+                self._sink.append(message)
+
+    def _answer_user_input(self, message: dict[str, Any]) -> None:
+        """Replies to a blocking `item/tool/requestUserInput` server request.
+
+        With `--on-question next-prompt` the answer is the next original prompt,
+        which is what the human typed next anyway. Otherwise every question is
+        answered with an empty string so the turn can finish and be recorded,
+        rather than deadlocking the replay against a question nobody will answer.
+        """
+        params = message.get("params") or {}
+        questions = params.get("questions") or []
+        for question in questions:
+            self.questions.append(json.dumps(question, ensure_ascii=False)[:2000])
+        answer = self.pending_answer or ""
+        self._send(
+            {
+                "jsonrpc": "2.0",
+                "id": message["id"],
+                "result": {
+                    "answers": {
+                        question.get("id", str(index)): {"answers": [answer]}
+                        for index, question in enumerate(questions)
+                    }
+                },
+            }
+        )
+
+    def _reader(self) -> None:
+        assert self.process is not None and self.process.stdout is not None
+        for line in self.process.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            self._record(message)
+            if "id" in message and "method" in message:
+                if str(message.get("method", "")).endswith("requestUserInput"):
+                    self._answer_user_input(message)
+                else:
+                    # Approvals are routed to `auto_review`, so anything that still
+                    # reaches the client is something a headless run cannot judge;
+                    # an empty result is the least-surprising refusal.
+                    self._send({"jsonrpc": "2.0", "id": message["id"], "result": {}})
+            elif "id" in message:
+                with self._lock:
+                    self.responses[message["id"]] = message
+
+    # -- lifecycle --------------------------------------------------------
+    def start(self) -> None:
+        self.process = subprocess.Popen(
+            [self.codex, "app-server"],
+            cwd=str(self.cwd),
+            env=self.environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self.stderr_path.open("w", encoding="utf-8"),
+            text=True,
+            bufsize=1,
+        )
+        threading.Thread(target=self._reader, daemon=True).start()
+        request_id = self._request(
+            "initialize",
+            {"clientInfo": {"name": "sctx-session-replay", "version": "0.1.0",
+                            "title": "Shared Context session replay"}},
+        )
+        if self._await(request_id, 60) is None:
+            raise ReplayError("codex app-server did not answer `initialize`")
+        self._send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+
+    def start_thread(self, original: Original, timeout: float = 180) -> str:
+        params: dict[str, Any] = {
+            "cwd": str(self.cwd),
+            "sandbox": sandbox_flag(original),
+            "approvalsReviewer": "auto_review",
+            "ephemeral": False,
+        }
+        if original.approval_policy:
+            params["approvalPolicy"] = original.approval_policy
+        if original.model:
+            params["model"] = original.model
+        if original.thread_source:
+            params["threadSource"] = original.thread_source
+        response = self._await(self._request("thread/start", params), timeout)
+        if response is None or "result" not in response:
+            raise ReplayError(f"codex app-server refused `thread/start`: {response}")
+        thread = response["result"].get("thread") or {}
+        thread_id = thread.get("id") or response["result"].get("threadId")
+        if not thread_id:
+            raise ReplayError(f"codex app-server returned no thread id: {response}")
+        return str(thread_id)
+
+    def run_turn(
+        self, thread_id: str, prompt: str, stream_path: pathlib.Path, timeout: int
+    ) -> tuple[dict[str, Any] | None, str | None, int, list[str]]:
+        with self._lock:
+            self._sink = []
+        errors: list[str] = []
+        request_id = self._request(
+            "turn/start",
+            {"threadId": thread_id, "input": [{"type": "text", "text": prompt}]},
+        )
+        if self._await(request_id, min(timeout, 120)) is None:
+            errors.append("codex app-server did not acknowledge `turn/start`")
+        usage: dict[str, Any] | None = None
+        question: str | None = None
+        tool_calls = 0
+        deadline = time.monotonic() + timeout
+        seen = 0
+        while time.monotonic() < deadline:
+            with self._lock:
+                batch = list(self._sink or [])[seen:]
+                seen += len(batch)
+            finished = False
+            for message in batch:
+                method = message.get("method")
+                params = message.get("params") or {}
+                if method == "item/completed":
+                    item = params.get("item") or {}
+                    if item.get("type") in TOOL_ITEM_TYPES_APP_SERVER:
+                        tool_calls += 1
+                    question = question or question_from_item(item)
+                elif method == "thread/tokenUsage/updated":
+                    # `turn/completed` does not carry usage in this protocol version;
+                    # the running total does, and the last one before completion is
+                    # the turn's.
+                    usage = (params.get("tokenUsage") or {}).get("total") or usage
+                elif method == "turn/completed":
+                    usage = (params.get("turn") or {}).get("usage") or usage
+                    finished = True
+                elif method in {"turn/failed", "error"}:
+                    errors.append(json.dumps(params, ensure_ascii=False)[:400])
+                    finished = True
+            if finished:
+                break
+            if self.process is not None and self.process.poll() is not None:
+                errors.append("codex app-server exited mid-turn")
+                break
+            time.sleep(0.1)
+        else:
+            errors.append(f"turn exceeded {timeout}s")
+        with self._lock:
+            batch = list(self._sink or [])
+            self._sink = None
+        with stream_path.open("w", encoding="utf-8") as handle:
+            for message in batch:
+                handle.write(json.dumps(message, ensure_ascii=False) + "\n")
+        if self.questions and question is None:
+            question = self.questions[-1]
+        return usage, question, tool_calls, errors
+
+    def close(self) -> None:
+        if self.process is None:
+            return
+        with contextlib.suppress(Exception):
+            if self.process.stdin is not None:
+                self.process.stdin.close()
+        with contextlib.suppress(Exception):
+            self.process.wait(timeout=10)
+        if self.process.poll() is None:  # pragma: no cover - defensive
+            self.process.terminate()
+        with contextlib.suppress(Exception):
+            self.transcript.close()
+
+
+def wait_for_turn_stop(
+    runtime_db: pathlib.Path, thread_id: str, timeout: int, probe_interval: float = 2.0
+) -> bool:
+    """Blocks until the Stop hook's `turn_stop` row lands for this thread.
+
+    ``codex exec`` is synchronous, so by the time it returns the Stop hook has
+    already been invoked; this barrier exists for the case where a future Codex
+    detaches it. On installations where ``hook_event`` is not written live the
+    caller detects the inert table once and stops paying for the wait.
+    """
+    if not runtime_db.exists():
+        return False
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            with contextlib.closing(sqlite3.connect(f"file:{runtime_db}?mode=ro", uri=True)) as db:
+                found = db.execute(
+                    "SELECT 1 FROM hook_event WHERE external_session_id = ? "
+                    "AND event_kind = 'turn_stop' LIMIT 1",
+                    (thread_id,),
+                ).fetchone()
+        except sqlite3.DatabaseError:
+            return False
+        if found:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(probe_interval)
+
+
+# --------------------------------------------------------------------------
+# Evidence
+# --------------------------------------------------------------------------
+
+
+def runtime_fingerprint(runtime_db: pathlib.Path) -> dict[str, int | None]:
+    counts: dict[str, int | None] = {}
+    if not runtime_db.exists():
+        return counts
+    try:
+        with contextlib.closing(sqlite3.connect(f"file:{runtime_db}?mode=ro", uri=True)) as db:
+            for table in RUNTIME_FINGERPRINT_TABLES:
+                try:
+                    counts[table] = db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                except sqlite3.DatabaseError:
+                    counts[table] = None
+    except sqlite3.DatabaseError:
+        return counts
+    return counts
+
+
+def state_fingerprint(root: pathlib.Path) -> dict[str, Any]:
+    """A cheap, comparable summary of a Shared Context installation's durable state."""
+    scopes = root / "state" / "authorized-session-scopes"
+    return {
+        "root": str(root),
+        "authorized_session_scopes": len(list(scopes.glob("*.json"))) if scopes.is_dir() else None,
+        "runtime_rows": runtime_fingerprint(root / "state" / "runtime.sqlite"),
+    }
+
+
+def replayed_thread_evidence(runtime_db: pathlib.Path, thread_id: str) -> dict[str, Any]:
+    """Counts the durable Shared Context rows this thread produced in one installation.
+
+    Run against both the isolated and the real state directory, this is the whole
+    isolation argument in two numbers: the replay's rows exist over here and do
+    not exist over there.
+    """
+    evidence: dict[str, Any] = {"external_session_key": thread_id, "external_session_id": None}
+    if not runtime_db.exists():
+        return evidence
+    try:
+        with contextlib.closing(sqlite3.connect(f"file:{runtime_db}?mode=ro", uri=True)) as db:
+            row = db.execute(
+                "SELECT external_session_id, active_task_session_id, active_task_id, "
+                "checkpoint_reminder_count FROM external_session WHERE external_session_key = ?",
+                (thread_id,),
+            ).fetchone()
+            if row is None:
+                return evidence
+            evidence["external_session_id"] = row[0]
+            evidence["task_session_id"] = row[1]
+            evidence["task_id"] = row[2]
+            evidence["checkpoint_reminder_count"] = row[3]
+            # Both tables hang off `task_id`, not the Task Session id: the Task
+            # outlives any one Session, which is the point of the identity.
+            for table in ("task_injection", "context_usage", "agent_checkpoint"):
+                try:
+                    evidence[f"{table}_rows"] = db.execute(
+                        f"SELECT count(*) FROM {table} WHERE task_id = ?", (row[2],)
+                    ).fetchone()[0]
+                except sqlite3.DatabaseError:
+                    evidence[f"{table}_rows"] = None
+    except sqlite3.DatabaseError:
+        return evidence
+    return evidence
+
+
+def collect_host_stderr(host_dir: pathlib.Path, max_lines: int = 6) -> list[str]:
+    """Folds the host's stderr files into a handful of manifest warnings.
+
+    Codex writes real problems to stderr and nothing else does -- unloadable
+    skills, MCP servers that refused to start, config keys this build does not
+    know. Left in a file nobody opens, those are exactly the differences that
+    make a replay quietly incomparable to its original.
+    """
+    notes: list[str] = []
+    for path in sorted(host_dir.glob("*.stderr")):
+        try:
+            lines = [line.strip() for line in path.read_text(
+                encoding="utf-8", errors="replace").splitlines() if line.strip()]
+        except OSError:  # pragma: no cover - defensive
+            continue
+        interesting = [
+            line for line in lines
+            if "ERROR" in line or "error" in line.lower() or "warn" in line.lower()
+        ]
+        if not interesting:
+            continue
+        # Repeated stack-ish noise collapses to its distinct lines; the count keeps
+        # "this happened 40 times" visible without pasting it 40 times.
+        seen: dict[str, int] = {}
+        for line in interesting:
+            seen[line[:300]] = seen.get(line[:300], 0) + 1
+        for line, count in list(seen.items())[:max_lines]:
+            suffix = f" (x{count})" if count > 1 else ""
+            notes.append(f"{path.name}: {line}{suffix}")
+        if len(seen) > max_lines:
+            notes.append(f"{path.name}: ... and {len(seen) - max_lines} more distinct stderr lines")
+    return notes
+
+
+def find_replayed_rollout(home: pathlib.Path, thread_id: str) -> pathlib.Path | None:
+    matches = sorted(
+        pathlib.Path(path)
+        for path in glob.glob(str(home / ROLLOUT_GLOB.format(thread_id=thread_id)))
+    )
+    return matches[-1] if matches else None
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+
+def parse_turns(value: str) -> int | None:
+    if value.strip().lower() == "all":
+        return None
+    try:
+        count = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("--turns takes a positive integer or 'all'") from error
+    if count < 1:
+        raise argparse.ArgumentTypeError("--turns takes a positive integer or 'all'")
+    return count
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Replay a real Codex session's human prompts into a fresh headless session."
+    )
+    parser.add_argument(
+        "--agent",
+        choices=("codex", "cursor"),
+        default="codex",
+        help="host that produced the session; `cursor` forwards every remaining "
+        "argument to replay_cursor.py, which shares this script's snapshot, "
+        "worktree and manifest machinery",
+    )
+    parser.add_argument("--session", required=True, help="original Codex thread id")
+    parser.add_argument(
+        "--turns", type=parse_turns, default=3, help="number of prompts to replay, or 'all'"
+    )
+    parser.add_argument(
+        "--audit-root",
+        default="~/.shared-context-audit",
+        help="directory that holds replay homes and worktrees",
+    )
+    parser.add_argument(
+        "--checkout",
+        choices=("worktree", "inplace"),
+        default="worktree",
+        help="worktree: detached checkout at the original commit (default); "
+        "inplace: run in the original working directory",
+    )
+    parser.add_argument(
+        "--codex-home",
+        choices=("isolated", "real"),
+        default="isolated",
+        help="isolated: a copied CODEX_HOME inside the audit directory (default); "
+        "real: the operator's ~/.codex, with HOME still redirected",
+    )
+    parser.add_argument(
+        "--driver",
+        choices=("app-server", "exec-resume"),
+        default="app-server",
+        help="app-server: one `codex app-server` process for the whole replay, so the "
+        "SessionStart hook fires once as it does interactively (default); "
+        "exec-resume: one `codex exec [resume]` process per turn",
+    )
+    parser.add_argument(
+        "--on-question",
+        choices=("stop", "next-prompt"),
+        default="stop",
+        help="stop: end the replay after a turn in which the agent asked the operator "
+        "something (default); next-prompt: answer with the next original prompt",
+    )
+    parser.add_argument("--turn-timeout", type=int, default=1800, help="seconds per turn")
+    parser.add_argument(
+        "--turn-stop-timeout",
+        type=int,
+        default=120,
+        help="seconds to wait for the Stop hook's turn_stop row between turns",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="print the plan and exit")
+    return parser
+
+
+def print_plan(original: Original, turns: int | None, replay_id: str, audit_root: pathlib.Path,
+               args: argparse.Namespace, checkout: pathlib.Path) -> None:
+    selected = original.prompts if turns is None else original.prompts[:turns]
+    print("replay plan")
+    print(f"  replay id           {replay_id}")
+    print(f"  original thread     {original.thread_id}")
+    print(f"  original rollout    {original.rollout_path}")
+    print(f"  original cwd        {original.cwd}")
+    print(f"  commit              {original.commit} ({original.branch})")
+    print(f"  repository url      {original.repository_url}")
+    print(f"  cli version         {original.cli_version}")
+    print(f"  originator          {original.originator}")
+    print(f"  thread source       {original.thread_source}")
+    print(f"  model               {original.model}")
+    print(f"  approval policy     {original.approval_policy} "
+          f"(reviewer {original.approvals_reviewer})")
+    print(f"  sandbox             {original.sandbox_type} "
+          f"(network_access={original.sandbox_network_access})")
+    print(f"  workspace roots     {original.workspace_roots}")
+    print(f"  checkout mode       {args.checkout} -> {checkout}")
+    print(f"  codex home mode     {args.codex_home}")
+    print(f"  driver              {args.driver}")
+    print(f"  on question         {args.on_question}")
+    print(f"  audit root          {audit_root}")
+    print(f"  human prompts       {len(original.prompts)} total, replaying {len(selected)}")
+    for index, prompt in enumerate(selected, start=1):
+        head = prompt.strip().splitlines()[0] if prompt.strip() else ""
+        print(f"    turn {index}: {len(prompt)} chars, first line {len(head)} chars")
+    print("  flags")
+    print(f"    turn timeout      {args.turn_timeout}s")
+    print(f"    turn stop timeout {args.turn_stop_timeout}s")
+
+
+def _split_agent(argv: list[str]) -> tuple[str, list[str]]:
+    """Pull `--agent <kind>` out of the argument list before parsing.
+
+    Cursor replays are a different enough animal (no commit, no cwd, no model
+    in the transcript; different flags on the host CLI) that they live in
+    `replay_cursor.py`. Routing here rather than there keeps one entry point in
+    muscle memory and one manifest schema on disk.
+    """
+    agent = "codex"
+    remaining: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--agent" and index + 1 < len(argv):
+            agent = argv[index + 1]
+            index += 2
+            continue
+        if token.startswith("--agent="):
+            agent = token.split("=", 1)[1]
+            index += 1
+            continue
+        remaining.append(token)
+        index += 1
+    return agent, remaining
+
+
+def main(argv: list[str] | None = None) -> int:
+    agent, argv = _split_agent(list(sys.argv[1:] if argv is None else argv))
+    if agent == "cursor":
+        import replay_cursor  # local import: replay_cursor imports this module
+
+        return replay_cursor.main(argv)
+    if agent != "codex":
+        raise ReplayError(f"unknown --agent {agent!r}; expected codex or cursor")
+    args = build_parser().parse_args(argv)
+    warnings: list[str] = []
+    audit_root = pathlib.Path(os.path.expanduser(args.audit_root)).resolve()
+    replay_id = (
+        dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        + "-"
+        + args.session.split("-")[0]
+    )
+    codex = shutil.which("codex")
+    if codex is None:
+        raise ReplayError("codex is not on PATH")
+
+    rollout, index_row = locate_rollout(args.session)
+    original = parse_original(args.session, rollout, index_row)
+    checkout = (
+        original.cwd
+        if args.checkout == "inplace"
+        else audit_root / "worktrees" / replay_id
+    )
+
+    if args.dry_run:
+        print_plan(original, args.turns, replay_id, audit_root, args, checkout)
+        return 0
+
+    print_plan(original, args.turns, replay_id, audit_root, args, checkout)
+    replay_dir = audit_root / replay_id
+    private_mkdir(replay_dir)
+    host_dir = replay_dir / "host"
+    host_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.checkout == "inplace":
+        print(
+            "\n"
+            "!! --checkout inplace: this replay runs inside the live working tree at\n"
+            f"!! {original.cwd}\n"
+            "!! The agent may create, modify or delete files there. Nothing in this script\n"
+            "!! stashes, resets or restores that tree -- that is on you.\n",
+            flush=True,
+        )
+        warn(warnings, f"replayed in place at {original.cwd}; the live working tree was writable")
+        head = git_output(["-C", str(original.cwd), "rev-parse", "HEAD"])
+        if original.commit and head != original.commit:
+            warn(
+                warnings,
+                f"in-place tree is at {head}, not the original commit {original.commit}",
+            )
+        checkout_commit = head
+        checkout_branch = git_output(["-C", str(original.cwd), "branch", "--show-current"]) or None
+    else:
+        checkout_commit, checkout_branch = prepare_worktree(original, checkout, replay_id)
+        if checkout_branch is None:
+            warn(warnings, "the worktree is detached; the replay records git_branch as '-'")
+
+    real_home = pathlib.Path(os.path.expanduser("~"))
+    home = replay_dir / "home"
+    home_record = build_replay_home(
+        home,
+        real_home,
+        warnings,
+        overlay_exclusions=tuple(
+            name for name in HOME_OVERLAY_EXCLUSIONS if name != ".cursor"
+        ),
+        skip_paths=(audit_root,),
+    )
+    binary = home / ".shared-context" / "bin" / "current" / "sctx"
+    if not binary.exists():
+        raise ReplayError(f"{binary} does not resolve; is Shared Context installed?")
+
+    registration = register_checkout(home, binary, original.cwd, checkout, warnings)
+
+    real_codex_home = codex_home()
+    if args.codex_home == "isolated":
+        effective_codex_home = replay_dir / "codex-home"
+        build_codex_home(effective_codex_home, real_codex_home, checkout, warnings)
+    else:
+        effective_codex_home = real_codex_home
+        warn(
+            warnings,
+            f"running against the real CODEX_HOME ({real_codex_home}); the replayed rollout "
+            "lands beside the operator's own sessions",
+        )
+
+    environment = dict(os.environ)
+    environment["HOME"] = str(home)
+    environment["CODEX_HOME"] = str(effective_codex_home)
+    environment["NO_COLOR"] = "1"
+    environment.pop("SCTX_LOGS_ROOT", None)
+
+    collector = start_log_collector(
+        real_home / ".shared-context" / "bin" / "current" / "sctx",
+        home / ".shared-context-logs",
+        replay_dir / "log-collector.log",
+    )
+    if collector is None:
+        warn(warnings, "the replay log collector did not start; hook diagnostics will be missing")
+
+    real_before = state_fingerprint(real_home / ".shared-context")
+    isolated_runtime = home / ".shared-context" / "state" / "runtime.sqlite"
+
+    prompts = original.prompts if args.turns is None else original.prompts[: args.turns]
+    results: list[TurnResult] = []
+    replayed_thread: str | None = None
+    hook_event_table_live = True
+    stopped_on_question: str | None = None
+    driver: AppServerDriver | None = None
+
+    try:
+        if args.driver == "app-server":
+            driver = AppServerDriver(
+                codex, environment, checkout, host_dir / "app-server.jsonl", warnings
+            )
+            driver.start()
+            replayed_thread = driver.start_thread(original)
+            log(f"thread {replayed_thread}")
+
+        for index, prompt in enumerate(prompts, start=1):
+            log(f"turn {index}/{len(prompts)} ({len(prompt)} chars)")
+            stream_path = host_dir / f"turn-{index}.jsonl"
+            stderr_path = host_dir / f"turn-{index}.stderr"
+            started = dt.datetime.now(dt.timezone.utc).isoformat()
+            answered = False
+            if driver is not None:
+                assert replayed_thread is not None
+                if args.on_question == "next-prompt" and index < len(prompts):
+                    driver.pending_answer = prompts[index]
+                usage, question, tool_calls, errors = driver.run_turn(
+                    replayed_thread, prompt, stream_path, args.turn_timeout
+                )
+                answered = bool(question) and driver.pending_answer is not None
+                driver.pending_answer = None
+                status = 0 if not errors else 1
+                thread_id = replayed_thread
+                stderr_path = driver.stderr_path
+            else:
+                command = build_turn_command(
+                    codex, original, prompt, checkout, home, binary, replayed_thread
+                )
+                status, thread_id, usage, errors, question, tool_calls = run_turn(
+                    command, environment, checkout, stream_path, stderr_path, args.turn_timeout
+                )
+            finished = dt.datetime.now(dt.timezone.utc).isoformat()
+            if thread_id and replayed_thread is None:
+                replayed_thread = thread_id
+            if status != 0:
+                warn(warnings, f"turn {index} exited {status}; see {stderr_path}")
+            for error in errors:
+                warn(warnings, f"turn {index}: {error}")
+
+            waited = False
+            if replayed_thread and hook_event_table_live and index < len(prompts):
+                waited = wait_for_turn_stop(
+                    isolated_runtime, replayed_thread, args.turn_stop_timeout
+                )
+                if not waited:
+                    hook_event_table_live = False
+                    warn(
+                        warnings,
+                        "no turn_stop row appeared in the isolated runtime.sqlite within "
+                        f"{args.turn_stop_timeout}s; the Stop hook has already run by the time a "
+                        "turn returns, and later turns skip this barrier",
+                    )
+            results.append(
+                TurnResult(
+                    prompt_index=index,
+                    prompt_chars=len(prompt),
+                    started=started,
+                    finished=finished,
+                    exit_code=status,
+                    thread_id=thread_id,
+                    usage=usage,
+                    waited_for_turn_stop=waited,
+                    stream_path=str(stream_path),
+                    stderr_path=str(stderr_path),
+                    errors=errors,
+                    question=question,
+                    answered_with_next_prompt=answered,
+                    tool_calls=tool_calls,
+                )
+            )
+            if replayed_thread is None:
+                warn(warnings, "no thread id was reported; stopping before the resume turns")
+                break
+            if question and args.on_question == "stop":
+                stopped_on_question = question
+                warn(
+                    warnings,
+                    f"turn {index} ended with the agent asking the operator a question; "
+                    "stopping (see manifest.stopped_on_question)",
+                )
+                break
+    finally:
+        if driver is not None:
+            driver.close()
+
+    if collector is not None:
+        # The collector aggregates on a timer; give it a moment to drain the socket
+        # before it is stopped, or the last turn's hook decisions never land.
+        time.sleep(3)
+        collector.terminate()
+        with contextlib.suppress(Exception):
+            collector.wait(timeout=10)
+
+    for note in collect_host_stderr(host_dir):
+        warn(warnings, note)
+
+    diagnostics = home / ".shared-context-logs" / "state" / "hook-diagnostics.json"
+    if not diagnostics.is_file():
+        warn(warnings, f"no replay-side hook diagnostics at {diagnostics}")
+
+    real_after = state_fingerprint(real_home / ".shared-context")
+    isolated_after = state_fingerprint(home / ".shared-context")
+    replay_evidence = (
+        replayed_thread_evidence(isolated_runtime, replayed_thread) if replayed_thread else {}
+    )
+    real_evidence = (
+        replayed_thread_evidence(
+            real_home / ".shared-context" / "state" / "runtime.sqlite", replayed_thread
+        )
+        if replayed_thread
+        else {}
+    )
+    replayed_rollout = (
+        find_replayed_rollout(effective_codex_home, replayed_thread) if replayed_thread else None
+    )
+    if replayed_thread and replayed_rollout is None:
+        warn(warnings, f"no rollout found for replayed thread {replayed_thread}")
+
+    version = subprocess.run(
+        [str(binary), "--version"], capture_output=True, text=True, check=False,
+        env=dict(os.environ, HOME=str(home)),
+    )
+    codex_version = subprocess.run(
+        [codex, "--version"], capture_output=True, text=True, check=False
+    )
+
+    deviations = [
+        "approvals run headless (approvals_reviewer=auto_review) instead of the original "
+        f"{original.approvals_reviewer or original.approval_policy!r} routing to a human",
+        "no human thinking time between turns",
+        "HOME is an overlay: everything but .shared-context/.shared-context-logs/.codex is a "
+        "symlink to the real HOME, so a tool that writes through one writes to the real HOME",
+        "CODEX_HOME is a copy when --codex-home isolated, so history and thread index start empty",
+        "the worktree is the original commit, not the original working tree",
+    ]
+    if args.driver != "app-server":
+        deviations.append(
+            "session_start_per_turn: true -- `codex exec resume` starts a new process per turn, "
+            "so the SessionStart hook (and the Shared Context activation marker) repeats on every "
+            "turn, where an interactive original carries it once"
+        )
+    if stopped_on_question:
+        deviations.append(
+            "the replay stopped early because the agent asked the operator a question that "
+            "nobody was there to answer"
+        )
+
+    manifest = {
+        "agent": "codex",
+        "replay_id": replay_id,
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "original": {
+            "thread_id": original.thread_id,
+            "rollout_path": str(original.rollout_path),
+            "cwd": str(original.cwd),
+            "commit": original.commit,
+            "branch": original.branch,
+            "repository_url": original.repository_url,
+            "cli_version": original.cli_version,
+            "originator": original.originator,
+            "thread_source": original.thread_source,
+            "model": original.model,
+            "approval_policy": original.approval_policy,
+            "approvals_reviewer": original.approvals_reviewer,
+            "sandbox_type": original.sandbox_type,
+            "sandbox_network_access": original.sandbox_network_access,
+            "workspace_roots": original.workspace_roots,
+            "human_prompt_count": len(original.prompts),
+        },
+        "replayed_thread_id": replayed_thread,
+        "replayed_rollout_path": str(replayed_rollout) if replayed_rollout else None,
+        "stopped_on_question": stopped_on_question,
+        "checkout": {
+            "mode": args.checkout,
+            "path": str(checkout),
+            "commit": checkout_commit,
+            "branch": checkout_branch,
+            "shared_context_repository_id": registration["repository_id"],
+            "registered_path": registration["registered_path"],
+        },
+        "codex_home": {
+            "mode": args.codex_home,
+            "path": str(effective_codex_home),
+            "real_path": str(real_codex_home),
+        },
+        "home": home_record,
+        "flags": {
+            "driver": args.driver,
+            "on_question": args.on_question,
+            "turns_requested": "all" if args.turns is None else args.turns,
+            "turns_replayed": len(results),
+            "turn_timeout_seconds": args.turn_timeout,
+            "turn_stop_timeout_seconds": args.turn_stop_timeout,
+            "sandbox": sandbox_flag(original),
+            "approvals": (
+                "--approve-for-me on turn 1"
+                if sandbox_flag(original) == "workspace-write"
+                else f"-s {sandbox_flag(original)} on turn 1"
+            )
+            + ", approvals_reviewer=auto_review on every turn",
+            "config_overrides": shared_config_overrides(original, home, binary),
+        },
+        "turns": [result.__dict__ for result in results],
+        "sctx": {
+            "binary": str(binary),
+            "resolved_binary": str(binary.resolve()) if binary.exists() else None,
+            "version": version.stdout.strip() or version.stderr.strip(),
+        },
+        "codex": {
+            "executable": codex,
+            "version": codex_version.stdout.strip() or codex_version.stderr.strip(),
+        },
+        "isolation": {
+            "real_shared_context_before": real_before,
+            "real_shared_context_after": real_after,
+            "real_shared_context_unchanged": real_before == real_after,
+            "replay_shared_context_after": isolated_after,
+            "replayed_thread_in_replay_state": replay_evidence,
+            "replayed_thread_in_real_state": real_evidence,
+        },
+        "deviations": deviations,
+        "warnings": warnings,
+    }
+    manifest_path = replay_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    log(f"manifest {manifest_path}")
+    if replayed_rollout:
+        log(f"rollout  {replayed_rollout}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except ReplayError as error:
+        print(f"[replay:error] {error}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:  # pragma: no cover
+        print("[replay:error] interrupted", file=sys.stderr)
+        sys.exit(130)
