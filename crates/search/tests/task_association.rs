@@ -1492,7 +1492,12 @@ fn compact_detail_level_fits_more_evidenced_items_in_the_default_budget() {
         "compactbudgetneedle",
         &files.iter().map(String::as_str).collect::<Vec<_>>(),
     );
-    request.token_budget = 2_000;
+    // 4300 is what this assertion's 2000 became when `estimated_tokens` started charging the wire
+    // rather than half of it (caliber v2: the payload travels twice, as `structuredContent` and as
+    // the escaped `content[0].text` MCP requires beside it). The budget buys the same Contexts it
+    // always did -- 6 explainable and 7 compact here, against 5 and 6 at the old 2000 -- and the
+    // difference is that all of them now arrive instead of being cut in half by the host.
+    request.token_budget = 4_300;
 
     let full = engine
         .task_context_pack_with_detail(&request, ContextPackDetailLevel::Full)
@@ -1510,7 +1515,7 @@ fn compact_detail_level_fits_more_evidenced_items_in_the_default_budget() {
 
     assert!(
         compact.compact_items.len() >= 6,
-        "compact packing must carry at least six Contexts in the default budget, got {}",
+        "compact packing must carry at least six Contexts in this budget, got {}",
         compact.compact_items.len()
     );
     assert!(
@@ -1738,7 +1743,10 @@ fn compact_packing_keeps_the_top_ranked_chinese_contexts_in_the_default_budget()
         "realshapeneedle",
         &files.iter().map(String::as_str).collect::<Vec<_>>(),
     );
-    request.token_budget = 2_000;
+    // The same caliber-v2 conversion the compact budget fixture records: 2000 v1 tokens of payload
+    // is 4300 v2 tokens of wire, and it carries the same four real-shape Contexts (2839 charged
+    // here against 1446 under v1) -- measured, not assumed.
+    request.token_budget = 4_300;
 
     let reference = engine
         .task_context_pack_with_detail(
@@ -1759,7 +1767,7 @@ fn compact_packing_keeps_the_top_ranked_chinese_contexts_in_the_default_budget()
         .map(|item| serde_json::to_string(item).unwrap().chars().count())
         .collect::<Vec<_>>();
     println!(
-        "real-shape compact: {} items at 2000 tokens ({} estimated), unbudgeted item chars {:?}",
+        "real-shape compact: {} items at 4300 wire tokens ({} estimated), unbudgeted item chars {:?}",
         compact.compact_items.len(),
         compact.estimated_tokens,
         item_tokens
@@ -1768,7 +1776,7 @@ fn compact_packing_keeps_the_top_ranked_chinese_contexts_in_the_default_budget()
     assert!(compact.estimated_tokens <= request.token_budget);
     assert!(
         compact.compact_items.len() >= 4,
-        "a 2000 token budget must carry at least four real-shape Contexts, got {}",
+        "a 4300 wire-token budget must carry at least four real-shape Contexts, got {}",
         compact.compact_items.len()
     );
     let carried = compact
@@ -2251,5 +2259,322 @@ fn an_anchored_seed_admits_the_context_no_file_records_and_the_refusals_are_reco
             .iter()
             .all(|sample| sample.candidate_revision_id != recorded[0].seed_revision_id),
         "a seed is never its own candidate: {recorded:#?}"
+    );
+}
+
+/// `count` accepted Contexts with the payload shape a real review writes -- a long Chinese
+/// statement, a long Chinese Evidence summary, structured conditions -- each recorded against its
+/// own file so one Session's footprint reaches every one of them.
+///
+/// Twenty-six is this installation's own accepted corpus, and "every Context anchored by one
+/// Session" is the largest Pack the two lanes can produce at that size. It is the scale the wire
+/// ceiling has to be measured at: a ceiling that only binds on synthetic input is not a ceiling,
+/// and one that binds on Tuesday is a retrieval defect wearing a safety belt.
+fn wire_scale_fixture(count: usize) -> (TempDir, ProjectionIndex, Vec<String>) {
+    let temporary = tempfile::tempdir().unwrap();
+    let store =
+        GitStore::bootstrap_local(temporary.path().join("wire-scale-installation")).unwrap();
+    let space_id = add_space(&store, "线上问题结论", "wirescaleneedle 结论 降级 注入");
+    let mut files = Vec::new();
+    for index in 0..count {
+        let mut draft = context(
+            &format!(
+                "wirescaleneedle 第 {index} 条结论：当垂类实现模块缺席时，分支把未解析服务的失败行为\
+                 有意改成安全降级，因此严格意义上的全配置功能等价并不成立，评审需要按配置分别给出结\
+                 论，而不是笼统地宣称行为不变；两套配置的差异点集中在服务解析失败之后的兜底分支上。"
+            ),
+            applicability("wirescale", "android", &format!("case-{index}")),
+        );
+        "评审需要逐条区分配置差异，避免把安全降级误读成功能回归，因此每条结论都单独沉淀。"
+            .clone_into(&mut draft.rationale);
+        draft.evidence[0].content = serde_json::json!({
+            "summary": format!(
+                "第 {index} 条结论的证据：对照基线逐行比较调用链，记录了进入直播间导航与底栏兜底两条\
+                 路径的实际行为差异，并附带缺少垂类模块与包含垂类模块两种配置下的构建与运行日志摘要；\
+                 复现步骤是在缺少垂类模块的调试包里点击商品锚点，观察不到任何页面跳转，再在包含垂类\
+                 模块的完整包里重复同一步骤，导航与底栏兜底都恢复正常，两次运行的日志差异已逐行标注。"
+            ),
+        });
+        let (context_id, revision_id) = add_context_draft(&store, space_id, draft);
+        publish(
+            &store,
+            space_id,
+            context_id,
+            revision_id,
+            Vec::new(),
+            PublicationAction::Publish,
+        );
+        let path = format!("app/src/main/java/scale/Conclusion{index}.kt");
+        record_file_reference(&store, context_id, revision_id, FIXTURE_REPOSITORY, &path);
+        files.push(path);
+    }
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    (temporary, index, files)
+}
+
+/// One automatic request whose footprint is every file of a [`wire_scale_fixture`].
+fn wire_scale_request(files: &[String], token_budget: usize) -> TaskContextRequest {
+    let mut request = automatic_touching(
+        "wirescaleneedle",
+        &files.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    request.token_budget = token_budget;
+    request
+}
+
+/// What one Pack actually costs on the wire, measured rather than charged.
+///
+/// This is the number the ceiling exists to bound, computed the way the host computes it: the
+/// serialized payload, plus the escaped copy of it that MCP requires `content[0].text` to carry.
+/// The Pack's own `estimated_tokens` is a proxy for exactly this, so the two are compared in
+/// [`the_charge_is_a_proxy_for_the_measured_wire_size`] rather than assumed equal.
+fn measured_wire_tokens(pack: &sctx_search::TaskContextPack) -> usize {
+    let body = serde_json::to_string(pack).unwrap();
+    let escaped = serde_json::to_string(&body).unwrap();
+    body.len().div_ceil(4) + escaped.len().div_ceil(4)
+}
+
+#[test]
+fn the_charge_is_a_proxy_for_the_measured_wire_size() {
+    let (_temporary, index, files) = wire_scale_fixture(26);
+    let pack = SearchEngine::new(index)
+        .task_context_pack_with_detail(
+            &wire_scale_request(&files, 100_000),
+            ContextPackDetailLevel::Compact,
+        )
+        .unwrap();
+    let measured = measured_wire_tokens(&pack);
+    println!(
+        "wire scale: {} items, charged {} tokens, measured {} wire tokens",
+        pack.compact_items.len(),
+        pack.estimated_tokens,
+        measured
+    );
+    // Han is charged at two thirds of a token per character and four bytes per token everywhere
+    // else, so a Chinese Pack is charged well below its byte count -- that is the whole point of
+    // the proxy, and it is why these two numbers are compared as a band rather than as an equality.
+    // What must never happen again is the charge landing *under* the wire by a multiple: caliber v1
+    // reported a little under half of this, and half of ten thousand is what a host cell truncated.
+    assert!(
+        pack.estimated_tokens * 2 >= measured,
+        "the charge may not be less than half the measured wire size: charged {}, measured {}",
+        pack.estimated_tokens,
+        measured
+    );
+}
+
+/// The Pack this installation's own corpus produces when every Context in it is anchored.
+#[test]
+fn the_real_corpus_scale_stays_under_the_wire_ceiling() {
+    let (_temporary, index, files) = wire_scale_fixture(26);
+    let engine = SearchEngine::new(index);
+    for detail_level in [
+        ContextPackDetailLevel::Compact,
+        ContextPackDetailLevel::Full,
+    ] {
+        let pack = engine
+            .task_context_pack_with_detail(&wire_scale_request(&files, 100_000), detail_level)
+            .unwrap();
+        println!(
+            "wire ceiling at real scale ({detail_level:?} requested): emitted {:?}, {} items, {} charged, {} measured",
+            pack.detail_level,
+            pack.compact_items.len() + pack.items.len(),
+            pack.estimated_tokens,
+            measured_wire_tokens(&pack)
+        );
+        assert!(
+            pack.estimated_tokens <= sctx_search::PACK_WIRE_TOKEN_CEILING,
+            "an unbounded budget may not produce a Pack no host can render: {} tokens",
+            pack.estimated_tokens
+        );
+        assert!(
+            measured_wire_tokens(&pack) <= 10_000,
+            "the measured wire size must stay inside the host cell the ceiling is derived from"
+        );
+    }
+}
+
+/// The shape of one Pack, reduced to what the degradation chain is allowed to change.
+#[derive(Debug, Eq, PartialEq)]
+struct WireShape {
+    detail_level: ContextPackDetailLevel,
+    items: usize,
+    evidence: usize,
+    longest_summary: usize,
+}
+
+fn wire_shape(pack: &sctx_search::TaskContextPack) -> WireShape {
+    WireShape {
+        detail_level: pack.detail_level,
+        items: pack.compact_items.len() + pack.items.len(),
+        evidence: pack
+            .compact_items
+            .iter()
+            .map(|item| item.evidence.len())
+            .chain(pack.items.iter().map(|item| item.context.evidence.len()))
+            .sum(),
+        longest_summary: pack
+            .compact_items
+            .iter()
+            .flat_map(|item| item.evidence.iter())
+            .map(|evidence| evidence.summary.chars().count())
+            .max()
+            .unwrap_or(0),
+    }
+}
+
+#[test]
+fn the_wire_ceiling_degrades_one_rung_at_a_time_and_every_rung_is_whole_json() {
+    let (_temporary, index, files) = wire_scale_fixture(12);
+    let request = wire_scale_request(&files, 100_000);
+    let mut observed: Vec<(usize, WireShape)> = Vec::new();
+    for ceiling in [100_000, 9_000, 8_400, 8_000, 5_000, 3_000, 1_000, 200] {
+        let pack = SearchEngine::new(index.clone())
+            .with_pack_wire_token_ceiling(Some(ceiling))
+            .task_context_pack_with_detail(&request, ContextPackDetailLevel::Full)
+            .unwrap();
+        // Every rung produces a Pack that serializes and parses back to itself. This is the
+        // property the whole chain exists for: the failure it prevents is not an oversized Pack,
+        // it is a host truncating one from the middle into JSON that does not close.
+        let serialized = serde_json::to_string(&pack).unwrap();
+        let round_tripped: sctx_search::TaskContextPack =
+            serde_json::from_str(&serialized).unwrap();
+        assert_eq!(round_tripped, pack, "every rung is complete, legal JSON");
+        assert_eq!(
+            pack.estimated_tokens,
+            estimate_task_context_payload_tokens(&pack),
+            "every rung recharges the shape it actually emitted"
+        );
+        // The two smallest ceilings cannot be honoured by any Pack -- one that says nothing still
+        // costs the line saying so -- and the chain's answer there is to have given up everything
+        // it had, which is asserted below rather than pretended away here.
+        if ceiling >= 3_000 {
+            assert!(
+                pack.estimated_tokens <= ceiling,
+                "ceiling {ceiling} produced {} tokens",
+                pack.estimated_tokens
+            );
+        }
+        observed.push((ceiling, wire_shape(&pack)));
+    }
+    println!("wire degradation sweep: {observed:#?}");
+
+    let shapes = observed.iter().map(|(_, shape)| shape).collect::<Vec<_>>();
+    // Rung 1: the explainable shape is the first thing given up, and only it -- the compact Pack
+    // at the ceiling below still carries every item and every Evidence.
+    assert_eq!(shapes[0].detail_level, ContextPackDetailLevel::Full);
+    assert_eq!(shapes[1].detail_level, ContextPackDetailLevel::Compact);
+    assert_eq!(shapes[1].items, shapes[0].items);
+    assert!(shapes[1].evidence > 0);
+    // Rung 2: Evidence summaries are squeezed before any of them is dropped. The fixture's
+    // summaries are 166 characters, so a squeeze to COMPACT_SQUEEZED_EVIDENCE_SUMMARY_MAX_CHARS is
+    // visible as a shorter longest summary rather than inferred from the token count.
+    assert_eq!(shapes[1].longest_summary, 166);
+    let squeezed = shapes
+        .iter()
+        .skip(1)
+        .find(|shape| shape.evidence > 0 && shape.longest_summary < shapes[1].longest_summary)
+        .expect("one rung squeezes Evidence summaries without dropping them");
+    assert_eq!(
+        squeezed.longest_summary, 121,
+        "120 characters and the elision mark"
+    );
+    assert_eq!(squeezed.items, shapes[0].items);
+    assert_eq!(squeezed.evidence, shapes[0].evidence);
+    // Rung 3: Evidence goes entirely before any item does.
+    let stripped = shapes
+        .iter()
+        .skip(1)
+        .find(|shape| shape.evidence == 0 && shape.items == shapes[0].items)
+        .expect("one rung drops Evidence entirely and still carries every item");
+    assert_eq!(stripped.evidence, 0);
+    // Rung 4: whole items, from the tail.
+    assert!(
+        shapes.iter().any(|shape| shape.items < shapes[0].items),
+        "one rung gives up whole items"
+    );
+    // Rung 5: nothing left but the line that says so.
+    assert_eq!(shapes.last().unwrap().items, 0);
+    // Nothing is ever taken back: each rung carries at most what the rung above it carried.
+    for pair in shapes.windows(2) {
+        assert!(
+            pair[1].items <= pair[0].items && pair[1].evidence <= pair[0].evidence,
+            "the chain only ever gives up: {pair:#?}"
+        );
+    }
+}
+
+#[test]
+fn the_wire_ceiling_reports_everything_it_took() {
+    let (_temporary, index, files) = wire_scale_fixture(12);
+    let request = wire_scale_request(&files, 100_000);
+    let whole = SearchEngine::new(index.clone())
+        .task_context_pack_with_detail(&request, ContextPackDetailLevel::Compact)
+        .unwrap();
+    let bounded = SearchEngine::new(index)
+        .with_pack_wire_token_ceiling(Some(2_600))
+        .task_context_pack_with_detail(&request, ContextPackDetailLevel::Compact)
+        .unwrap();
+
+    let taken = bounded
+        .omitted
+        .iter()
+        .filter(|omitted| omitted.reason == sctx_search::WIRE_CEILING_REASON)
+        .collect::<Vec<_>>();
+    assert!(
+        !taken.is_empty(),
+        "a Pack the ceiling shortened says so: {:#?}",
+        bounded.omitted
+    );
+    assert!(
+        taken.iter().all(|omitted| omitted.estimated_tokens > 0),
+        "an omission that charges nothing explains nothing: {taken:#?}"
+    );
+    let dropped = whole.compact_items.len() - bounded.compact_items.len();
+    assert_eq!(
+        taken
+            .iter()
+            .filter(|omitted| omitted.context_id.is_some())
+            .count(),
+        dropped.min(5),
+        "the first five dropped Contexts are named so each is one context_get away: {taken:#?}"
+    );
+    // What the ceiling dropped is the tail of the lane order, which is Lane A first and Lane B by
+    // descending admission score -- so the Contexts that survive are the ones the lanes were most
+    // sure of, and the named omissions are exactly the tail.
+    let named = taken
+        .iter()
+        .filter_map(|omitted| omitted.context_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let carried = bounded
+        .compact_items
+        .iter()
+        .map(|item| item.context_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(named.is_disjoint(&carried));
+    assert_eq!(
+        whole
+            .compact_items
+            .iter()
+            .take(bounded.compact_items.len())
+            .map(|item| item.context_id)
+            .collect::<Vec<_>>(),
+        bounded
+            .compact_items
+            .iter()
+            .map(|item| item.context_id)
+            .collect::<Vec<_>>(),
+        "the survivors are the head of the lane order, in the lane order"
+    );
+    assert!(
+        bounded
+            .omitted
+            .iter()
+            .any(|omitted| omitted.reason == sctx_search::WIRE_CEILING_REASON
+                && omitted.context_id.is_none()
+                && omitted.count > 0),
+        "the detail the ceiling took off every surviving item is reported too: {:#?}",
+        bounded.omitted
     );
 }

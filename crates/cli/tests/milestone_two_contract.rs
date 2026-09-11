@@ -670,7 +670,12 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
     let read_input = TaskContextReadInput {
         agent_kind: many_input.agent_kind.clone(),
         external_session_id: many_input.external_session_id.clone(),
-        token_budget: 2_000,
+        // The same budget the establishing call takes, because this input is compared Pack-for-Pack
+        // against it below. It used to be 2000 and the comparison still held, which said more about
+        // how little `estimated_tokens` was charging than about the two routes agreeing: once the
+        // charge became the wire size (caliber v2), 2000 stopped carrying the third Space and the
+        // read route looked like it disagreed with the write route about retrieval. It never did.
+        token_budget: 8_000,
         max_spaces: many_input.max_spaces,
     };
     let serialized_input = serde_json::to_value(&read_input).unwrap();
