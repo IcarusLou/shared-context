@@ -123,6 +123,83 @@ pub const SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS: u16 = 5_200;
 /// that made re-deriving meaningful.
 pub const QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS: u16 = 2_800;
 
+/// Cosine a candidate Context must reach against a *seed Context* to be admitted by the second hop.
+///
+/// Every other floor in this file cuts a ranked list produced by a query. This one does not cut a
+/// list at all: the second hop starts from a Context the Session already touched, compares it
+/// document-against-document with each candidate, and either admits the candidate into the Pack or
+/// drops it. Nothing downstream re-tests the admitted Context for relevance, so the number has to
+/// carry the whole decision -- which is why it is derived from the *highest scoring negative* and
+/// not, as a ranking floor would be, from the lowest positive worth keeping.
+///
+/// ## Derivation
+///
+/// Measured 2026-09-11 on Apple Silicon / macOS 24.6.0, ONNX Runtime 1.28.1, the
+/// `codefuse-ai/F2LLM-v2-0.6B` Hub export, release profile, by
+/// `crates/search/tests/embedding_hop2_admission_calibration.rs` over
+/// `fixtures/association/hard-negative-v1.json`: 24 Contexts, three topic families across two
+/// repository labels, all 276 unordered pairs encoded through the document path and grouped by
+/// whether the two share a repository and whether they share a topic.
+///
+/// | group | n | p50 | max |
+/// |---|---|---|---|
+/// | same-repo/same-topic | 38 | 5061 | 7598 |
+/// | cross-repo/same-topic | 47 | 4631 | 7447 |
+/// | same-repo/cross-topic | 98 | 2563 | **5045** |
+/// | cross-repo/cross-topic | 93 | 2549 | 4498 |
+///
+/// AUC 0.9097 over same-topic against cross-topic. The binding number is the bolded one: 5045, the
+/// highest any pair of Contexts about *different* topics reaches, and it comes from the hardest
+/// group by construction -- two Contexts in the same repository, sharing the product's whole
+/// vocabulary while describing unrelated work. 5200 clears it by 155 basis points and admits 0 of
+/// 191 cross-topic pairs; it retains 13 of 47 cross-repository joins and 18 of 38 same-repository
+/// ones.
+///
+/// ## Why 5200 and not the 5140 the device run suggested
+///
+/// The same four-group comparison was run on a real installation's Contexts during the Step 0a
+/// experiment behind ADR-0007 -- 83/66/122/54 pairs over one Android and one web checkout -- and it
+/// put the cross-topic ceiling at 5130, the best threshold at 5140 (100% precision, 95.5%
+/// cross-repository recall) and the whole 5000--5500 range on a plateau. Two corpora, one synthetic
+/// and adversarial, one real, therefore place the boundary within a hundred basis points of each
+/// other, which is the only reason to trust either.
+///
+/// The value is the *union* of the two rather than the better of them. 5140 clears this fixture's
+/// ceiling comfortably but sits only 10 basis points above the device's, which is a reading of one
+/// pair and not a threshold; 5100 clears this fixture but would admit the device's hardest
+/// cross-topic pair outright. 5200 is above both ceilings, costs one cross-repository join against
+/// 5140 on the device (62/66 rather than 63/66), and costs nothing here -- 5100 and 5200 retain the
+/// same 13 of 47. Erring high is the standing rule: a Context nobody asked for is worse than no
+/// Context.
+///
+/// Its numerical equality with [`SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`] is a coincidence of two
+/// unrelated measurements in two unrelated embedding spaces. Neither is evidence about the other
+/// and they must not be merged.
+///
+/// ## Recall differs between the two corpora, and that is a property of the corpora
+///
+/// 95.5% on the device against 28% here. The device's same-topic family was one feature's work in
+/// one week, so its Contexts repeat each other's field names; this fixture's families span a
+/// topic's whole history and include two deliberate hard cases per the fixture's
+/// `known_hard_cases` -- cross-cutting knowledge (a contrast-ratio finding that shares almost no
+/// vocabulary with its own family) and entity-free validations (procedural prose with no
+/// identifier to anchor on). Those are the shapes the device run also lost. A real second hop seeds
+/// from a Context the Session just touched and reaches the Contexts written around it, which is the
+/// device's shape; this fixture's number is the pessimistic end of the range, kept pessimistic on
+/// purpose so the floor is not tuned against an easy positive set.
+///
+/// ## Pre-registered recalibration
+///
+/// This is a synthetic corpus cross-checked against one installation, which is one installation
+/// more than any floor in this file previously had and still not a distribution. Before this
+/// governs injections in the field it becomes a configuration key with its admitted/refused score
+/// distribution recorded per decision, and the value is re-derived from that record once real
+/// traffic has accumulated -- the same discipline ADR-0004 wrote for the encode budget after
+/// setting it twice from the wrong machine. The device run's own limits are the ones to close
+/// first: its positives were single-topic (one feature family), and its iOS checkout held no
+/// Contexts at all, so the cross-repository claim rests on two repositories rather than three.
+pub const SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS: u16 = 5_200;
+
 /// Most revisions one query may contribute through the semantic channel.
 ///
 /// Fusion ranks within a channel, so an unbounded channel would hand a rank to every vector above

@@ -1,0 +1,713 @@
+{
+  "fixture_version": "hard-negative-v1",
+  "purpose": "Calibrates the second-hop Context-to-Context admission floor. Every other association fixture is built around queries that should find an answer; this one is built around Context pairs that should not be joined. Its contexts are laid out as three topic families across two repository labels so that four pair groups fall out of the cross product: same-repo/same-topic and cross-repo/same-topic are the pairs a second hop must reach, same-repo/cross-topic and cross-repo/cross-topic are the pairs it must refuse. The hard group is same-repo/cross-topic, because every context in one repository shares the product's high-frequency vocabulary -- here the word 搜索 and the card/module/default-value language around it -- while describing unrelated work. A fixture whose cross-topic pairs are about visibly different subject matter would measure nothing: separating those is free, and the floor derived from it would be too low for the only negatives that actually occur.",
+  "repositories": {
+    "android": "The native client checkout. Kotlin, one application module with feature modules under it.",
+    "fe": "The web checkout. A TypeScript monorepo holding the search result page and its vertical packages."
+  },
+  "topics": {
+    "result-badge": "The live badge drawn on search result cards: its data sources, its gradient, its default-value handling.",
+    "map-panel": "The map panel on the search result page: camera ownership, coordinate conventions, marker deduplication.",
+    "build-downgrade": "Making the search verticals pluggable, and what the product does when an implementation is absent or the module fails to load."
+  },
+  "known_hard_cases": [
+    {
+      "index": 4,
+      "kind": "cross_cutting_knowledge",
+      "note": "A contrast-ratio finding. It belongs to the badge family by subject but shares almost none of that family's vocabulary, so it is the weakest edge of every cross-repo/same-topic pair it appears in -- the synthetic stand-in for the accessibility-contrast context that produced the three real false negatives at 5140 in the Step 0a device run."
+    },
+    {
+      "index": 5,
+      "kind": "entity_free_validation",
+      "note": "A validation written entirely in procedural prose: no identifier, no path, no field name. Nothing lexical anchors it and the encoder has only the process language to work with, which is the shape that scores low against its own family."
+    },
+    {
+      "index": 16,
+      "kind": "entity_free_validation",
+      "note": "The same shape on the other repository label and another topic, so the effect is not read off one row."
+    },
+    {
+      "index": 20,
+      "kind": "cross_cutting_knowledge",
+      "note": "A build-duration measurement. Its subject is the downgrade work but its vocabulary is build tooling, which is shared with nothing else in the corpus."
+    }
+  ],
+  "contexts": [
+    {
+      "index": 1,
+      "repo": "android",
+      "topic": "result-badge",
+      "label": "badge-android-dual-source",
+      "goal": "统一搜索结果卡片上直播徽标的数据来源",
+      "acceptance_conditions": [
+        "两类卡片的徽标状态来自同一个状态对象"
+      ],
+      "context_kind": "discovery",
+      "statement": "Android 搜索结果卡片的直播徽标走两条数据源：视频卡从 feed item 的 liveRoomExt 里读 live_show_tag 与 live_room_tag_info，用户卡要先把 UserStruct.roomData 的 JSON 串解开再读同一组字段；两条路径在 BadgeBinder 里汇合成同一个 BadgeState，因此服务端只要有一侧不下发 live_room_tag_info，同一个主播在两类卡片上的徽标文案就会不一致。",
+      "rationale": "两条路径读的是同一组服务端字段，承载结构却不同，字段缺失在汇合点被抹平成默认文案，差异因此只在界面上暴露。",
+      "conditions": [
+        "服务端按卡片类型分别下发直播字段"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "BadgeBinder.kt 的 bind 同时接受 liveRoomExt 与 roomData 两个入参，缺失一侧时落到同一个默认分支。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "repo": "android",
+      "topic": "result-badge",
+      "label": "badge-android-rebind-default",
+      "goal": "消除列表复用带来的徽标串场",
+      "acceptance_conditions": [
+        "每次绑定都先恢复默认样式再套用数据"
+      ],
+      "context_kind": "contract",
+      "statement": "所有接入搜索结果直播徽标的绑定分支，都必须在每次 bind 开头显式恢复默认文案与默认背景，再按 live_show_tag 与 live_room_tag_info 覆盖；列表复用会把上一条数据的徽标状态带到下一个 ViewHolder 上，只在字段存在时赋值，会让上一条的 SHOW 文案留在下一条卡片的徽标上。",
+      "rationale": "ViewHolder 是复用的，徽标的文案与背景是控件的当前状态而不是数据的一部分，不主动复位就会被下一条数据继承。",
+      "conditions": [
+        "卡片在可复用的列表容器内渲染"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "三处绑定分支中有两处只在字段非空时设置背景，没有对应的复位路径。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "repo": "android",
+      "topic": "result-badge",
+      "label": "badge-android-gradient-resource",
+      "goal": "统一徽标渐变的颜色来源",
+      "acceptance_conditions": [
+        "四个 shape 复用同一组起止色资源"
+      ],
+      "context_kind": "decision",
+      "statement": "直播徽标的 FF2D55 到 FF8A3D 渐变必须统一到一组搜索徽标专用的起止色资源上，四个现有 shape XML 复用同一组颜色；不允许各自写死色值，也不允许改动全局主题色 live_entry_accent，那个色值还被搜索之外的直播入口用着。",
+      "rationale": "改全局主题色能一次覆盖所有渲染点，但会把非搜索的直播入口一并改掉；专用资源把影响面限定在搜索直播徽标内。",
+      "conditions": [
+        "live_entry_accent 仍被其他入口引用"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "四个 shape XML 各自写死了起止色；live_entry_accent 在搜索之外还有两处引用。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 4,
+      "repo": "android",
+      "topic": "result-badge",
+      "label": "badge-android-contrast-risk",
+      "goal": "评估新渐变下标签文字的可读性",
+      "acceptance_conditions": [
+        "对比度结论与具体色值对应上"
+      ],
+      "context_kind": "risk",
+      "statement": "新渐变继续使用当前的白色小字号标签文字存在无障碍对比度风险：白色对 FF2D55 约为 3.90:1，对 FF8A3D 约为 2.19:1，都低于 AA 级对小字号要求的 4.5:1；在户外强光和低亮度屏幕上首先劣化的是文字而不是背景。",
+      "rationale": "对比度只取决于前景色与背景色本身，与它画在哪个控件上无关，因此这个结论对所有复用该渐变的搜索直播徽标同时成立。",
+      "conditions": [
+        "标签文字保持当前字号与白色"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "analysis",
+          "summary": "按相对亮度公式对两端色值分别计算，结果为 3.90:1 与 2.19:1。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 5,
+      "repo": "android",
+      "topic": "result-badge",
+      "label": "badge-android-rebind-validation",
+      "goal": "回归复用场景下的样式残留",
+      "acceptance_conditions": [
+        "连续滑动后没有观察到上一条数据的样式"
+      ],
+      "context_kind": "validation",
+      "statement": "回归覆盖了三类卡片在快速滑动与前后台切换下的重复绑定：每次进入可见区，直播徽标都先回到默认文案与默认背景再套用当前数据，连续二十次滑动与两轮切后台都没有观察到上一条数据的徽标残留。",
+      "rationale": "残留只在复用发生时出现，所以验证的重点是制造足够多次复用，而不是检查单次渲染的结果。",
+      "conditions": [
+        "在可复用列表容器中连续滑动"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "observation",
+          "summary": "两台设备各走一轮，滑动与切后台交替进行，逐屏比对。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture",
+            "手工回归，无自动化留痕"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 6,
+      "repo": "fe",
+      "topic": "result-badge",
+      "label": "badge-fe-single-card-scope",
+      "goal": "限定本次前端徽标改动的范围",
+      "acceptance_conditions": [
+        "垂类页的旧实现保持不动"
+      ],
+      "context_kind": "decision",
+      "statement": "本次前端只改综合搜索的直播单卡 live-single-card（封面胶囊与头像直播徽标），本地生活垂类页和直播垂类页保持旧实现不动；两处的胶囊组件虽然同名，读的却不是同一组服务端字段，一起改会把垂类页在 live_show_tag 缺失时的兜底逻辑一并改掉。",
+      "rationale": "同名组件不等于同一份数据契约，按名字统一改动会把两套兜底合成一套，而垂类页徽标的兜底目前没有回归覆盖。",
+      "conditions": [
+        "垂类页仍使用旧接口字段"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "live-single-card 与垂类页的胶囊组件读取的是两个不同的字段路径。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 7,
+      "repo": "fe",
+      "topic": "result-badge",
+      "label": "badge-fe-field-shape",
+      "goal": "处理徽标文案字段的两种形态",
+      "acceptance_conditions": [
+        "字符串与对象两种返回都能取到文案"
+      ],
+      "context_kind": "contract",
+      "statement": "解析直播徽标的 live_room_tag_info 时：字段是字符串就直接当文案用，是对象就取它的 content 字段；同一个接口在不同实验分组下两种形态都会返回，解析处必须同时处理，取不到时落回内置默认文案而不是把徽标渲染成空串。",
+      "rationale": "形态由实验分组决定而不是由版本决定，所以不能按发布时间收敛成一种，只能在解析处同时容纳。",
+      "conditions": [
+        "实验分组同时存在新旧两种下发形态"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "接口在两个分组下分别返回字符串与对象，前端解析处目前只处理字符串。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 8,
+      "repo": "fe",
+      "topic": "result-badge",
+      "label": "badge-fe-gradient-two-mechanisms",
+      "goal": "查清前端渐变背景的产生机制",
+      "acceptance_conditions": [
+        "五个渲染点各自归到一种机制"
+      ],
+      "context_kind": "discovery",
+      "statement": "前端仓里直播徽标胶囊的 FF2D55 到 FF8A3D 渐变背景由两套机制产生，共 5 个渲染点：机制 A 是组件内联 style 写死的 linear-gradient，机制 B 是主题包里的 badge-live-bg token；只改 token 只能覆盖 3 个渲染点，另外 2 个必须改组件本身。",
+      "rationale": "内联样式的优先级高于主题包，所以机制 A 的渲染点对 token 的改动完全免疫，改 token 时不会报错也不会生效。",
+      "conditions": [
+        "组件内联样式仍然保留"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "五个渲染点中三处引用 badge-live-bg，两处写死 linear-gradient。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 9,
+      "repo": "fe",
+      "topic": "result-badge",
+      "label": "badge-fe-show-flag",
+      "goal": "区分 SHOW 与 LIVE 两种徽标",
+      "acceptance_conditions": [
+        "字段缺失时保持 LIVE"
+      ],
+      "context_kind": "contract",
+      "statement": "live_show_tag 等于 1 时，直播单卡的头像必须展示 SHOW 徽标而不是 LIVE 徽标，徽标的文案与背景取 live_room_tag_info 下发的值；等于 0 或字段缺失时保持 LIVE 徽标，不允许把缺失当成 SHOW 处理。",
+      "rationale": "缺失与 0 在语义上都是未开启，把缺失当成开启会让没有灰度到的用户看到一个服务端从未声明过的徽标状态。",
+      "conditions": [
+        "灰度期间部分请求不返回该字段"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "当前实现用真值判断而不是等值判断，字段缺失时走的是 SHOW 分支。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 10,
+      "repo": "android",
+      "topic": "map-panel",
+      "label": "map-android-runtime-lifecycle",
+      "goal": "修复搜索结果页地图旋转后相机复位",
+      "acceptance_conditions": [
+        "旋转与分屏后相机保持原位姿"
+      ],
+      "context_kind": "decision",
+      "statement": "搜索结果页的地图面板把相机控制从 Fragment 抽到 MapSceneRuntime：相机位姿、按 poi_id 建立的标注层与手势状态都由 Runtime 持有，Fragment 只转发生命周期；这样分屏和旋转重建之后相机不再回到默认位姿。",
+      "rationale": "位姿此前存在 Fragment 的成员里，配置变更重建 Fragment 就等于丢掉相机位姿；把它移到不随重建销毁的持有者上才是根治。",
+      "conditions": [
+        "地图面板随结果页一起承受配置变更"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "相机位姿原先是 Fragment 的成员字段，onCreateView 每次都用默认值初始化。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 11,
+      "repo": "android",
+      "topic": "map-panel",
+      "label": "map-android-camera-contract",
+      "goal": "固定相机接口的坐标系口径",
+      "acceptance_conditions": [
+        "接口只接受经纬度与缩放级别"
+      ],
+      "context_kind": "contract",
+      "statement": "搜索结果页地图面板的 CameraController.moveTo 只接受 WGS84 经纬度与缩放级别，投影转换一律在调用方完成；把屏幕像素坐标直接传进来会在高纬度地区产生累积偏移，接口不做任何坐标系推断，也不提供按像素移动的重载。",
+      "rationale": "像素与 WGS84 经纬度的换算依赖当前投影与缩放，接口内部无法在不知道调用意图的情况下选对换算，推断出来的相机位姿在高纬度会稳定地偏。",
+      "conditions": [
+        "地图使用墨卡托投影"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "analysis",
+          "summary": "按墨卡托投影估算，纬度 60 度附近同样像素位移对应的实际距离约为赤道的一半。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 12,
+      "repo": "android",
+      "topic": "map-panel",
+      "label": "map-android-poi-test-gap",
+      "goal": "盘点地图模块的自动化覆盖",
+      "acceptance_conditions": [
+        "未覆盖的行为被逐项列出"
+      ],
+      "context_kind": "validation",
+      "statement": "搜索结果页地图面板的单测任务当前只覆盖 WGS84 坐标换算与按 poi_id 的标注去重两类纯函数，相机位姿动画与手势冲突没有任何自动化覆盖，这部分回归依赖手工在两台设备上各走一遍，因此每次改动的验证成本是固定的人力而不是机器时间。",
+      "rationale": "相机位姿动画的断言需要一个能推进时间的渲染环境，当前单测任务跑在没有渲染的 JVM 上，补不进去。",
+      "conditions": [
+        "单测运行在无渲染环境"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "observation",
+          "summary": "单测任务的用例清单里只有换算与去重两类，没有任何涉及动画时间轴的用例。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 13,
+      "repo": "android",
+      "topic": "map-panel",
+      "label": "map-android-marker-dedupe",
+      "goal": "解释地图落点随刷新抖动",
+      "acceptance_conditions": [
+        "抖动与去重保留策略被对应上"
+      ],
+      "context_kind": "discovery",
+      "statement": "同一个地点在搜索结果里可能出现在多个卡片上，地图面板的标注层按 poi_id 去重；但服务端对同一个 poi_id 会下发精度不同的 WGS84 坐标，去重后保留的是先到的那一条，因此地图上的落点会随请求返回顺序在几十米范围内抖动。",
+      "rationale": "去重策略只看 poi_id 不看坐标精度，先到先得在并发返回下等价于随机选取，抖动幅度就是两个精度之间的差。",
+      "conditions": [
+        "同一地点由多个卡片并发返回"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "observation",
+          "summary": "连续刷新同一查询，同一地点的落点在两个固定位置之间交替。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 14,
+      "repo": "fe",
+      "topic": "map-panel",
+      "label": "map-fe-lazy-bundle",
+      "goal": "控制地图代码对首屏的影响",
+      "acceptance_conditions": [
+        "首屏产物不包含地图 SDK"
+      ],
+      "context_kind": "decision",
+      "statement": "地图面板在前端按需加载：只有用户点开搜索结果页的地点标签时才拉取地图 SDK bundle 并初始化相机位姿与标注层，首屏产物不打包地图代码；代价是第一次点开有大约 400ms 的空白，用骨架图遮掉而不是加转圈。",
+      "rationale": "地图 SDK 是搜索结果页最大的单个依赖，而点开地点标签的用户是少数，把它算进首屏等于让多数人为少数人的路径付费。",
+      "conditions": [
+        "地点标签为非默认标签"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "observation",
+          "summary": "首屏产物在拆出地图 SDK 后明显变小，地点标签首次点开的等待稳定在 400ms 上下。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 15,
+      "repo": "fe",
+      "topic": "map-panel",
+      "label": "map-fe-coordinate-contract",
+      "goal": "统一前端的地点坐标口径",
+      "acceptance_conditions": [
+        "组件不再保留坐标系开关"
+      ],
+      "context_kind": "contract",
+      "statement": "前端拿到的地点坐标一律按 WGS84 处理，任何偏移坐标系的转换都在服务端完成；地图面板的组件不再保留历史上的 gcj02 开关，那个开关在两个页面上取值相反，正是同一个 poi_id 在两处落点不同的来源。",
+      "rationale": "坐标系是数据的属性而不是渲染的选项，把选择权留在组件里，就等于允许同一个 poi_id 的 WGS84 坐标在两个页面上被解释成两个位置。",
+      "conditions": [
+        "服务端已统一按 WGS84 下发"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "两个页面对同一个开关分别传入 true 与 false，落点差异与开关取值一致。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 16,
+      "repo": "fe",
+      "topic": "map-panel",
+      "label": "map-fe-panel-height-validation",
+      "goal": "回归面板展开收起的布局",
+      "acceptance_conditions": [
+        "收起态不再占用高度"
+      ],
+      "context_kind": "validation",
+      "statement": "在三种常见视口高度下逐一检查了地图面板的展开与收起：收起之后容器不再保留高度，下方列表的首条不会被挡住；横屏下面板的最大高度取视口的六成，超出的部分在内部滚动而不是把整页撑高。",
+      "rationale": "被遮挡只在收起态与列表首条同时出现时才可见，所以检查必须按状态组合走，而不是只看展开后的样子。",
+      "conditions": [
+        "在三种视口高度下分别检查"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "observation",
+          "summary": "三种高度各走一轮展开与收起，逐一确认首条位置与内部滚动。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture",
+            "手工回归，无自动化留痕"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 17,
+      "repo": "android",
+      "topic": "build-downgrade",
+      "label": "dwn-android-spi-downgrade-semantics",
+      "goal": "澄清可插拔改造后的行为等价口径",
+      "acceptance_conditions": [
+        "降级路径与等价结论被分开陈述"
+      ],
+      "context_kind": "decision",
+      "statement": "该分支不应被描述为所有形态下严格行为不变：当搜索垂类的 @ServiceImpl 实现缺失或被强制 downgrade 时，搜索能力会有意降级为隐藏入口 UI、跳过动作或返回中性默认值，这是设计内的降级而不是缺陷，等价结论只覆盖实现齐备的那一种形态。",
+      "rationale": "把有意降级和行为不变写成同一句话，会让后续读者按不变去验收，而降级路径本来就不满足不变。",
+      "conditions": [
+        "存在实现缺失或强制降级的构建形态"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "降级实现分别返回空列表、空 Optional 与 no-op，对应隐藏 UI 与跳过动作两类表现。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 18,
+      "repo": "android",
+      "topic": "build-downgrade",
+      "label": "dwn-android-impl-presence",
+      "goal": "验证实现齐备形态下的行为等价",
+      "acceptance_conditions": [
+        "改造前后逐项比对一致"
+      ],
+      "context_kind": "validation",
+      "statement": "在包含真实垂类 @ServiceImpl 且未强制 downgrade 的整包构建上，可插拔改造前后的行为逐项比对一致；功能等价的结论只在这一个配置下成立，其他配置没有比对过也不应被推断。",
+      "rationale": "比对是在一个具体构建上做的，结论的适用范围就是那个构建的配置，扩大到其他配置需要另一次比对。",
+      "conditions": [
+        "构建包含真实实现且未强制降级"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "observation",
+          "summary": "按功能清单逐项走查，改造前后表现一致。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 19,
+      "repo": "android",
+      "topic": "build-downgrade",
+      "label": "dwn-android-null-guard-late",
+      "goal": "查清降级路径上的空指针",
+      "acceptance_conditions": [
+        "抛出点与判空位置被对应上"
+      ],
+      "context_kind": "issue",
+      "statement": "搜索垂类降级路径上的判空加得太晚：调用方先读了一次垂类服务实例的配置字段才判空，@ServiceImpl 缺失时这一次读取本身就会抛，保护写在了它要保护的那行代码后面，因此实际从未生效。",
+      "rationale": "判空只有在解引用之前才有意义，写在之后就只是一段永远走不到的降级代码。",
+      "conditions": [
+        "构建中缺少该垂类的实现"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "调用点先访问配置字段，下一行才做判空返回。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 20,
+      "repo": "android",
+      "topic": "build-downgrade",
+      "label": "dwn-android-build-cost",
+      "goal": "量化可插拔改造的构建代价",
+      "acceptance_conditions": [
+        "耗时变化与来源被对应上"
+      ],
+      "context_kind": "discovery",
+      "statement": "Debug 整包构建在接入可插拔搜索垂类之后从约 18 分钟涨到约 26 分钟，增量主要来自新增的三个垂类模块各自独立跑一遍注解处理；打开注解处理的增量缓存后回到约 20 分钟，剩下的 2 分钟是模块本身的编译。",
+      "rationale": "注解处理默认按模块重跑，垂类模块数量增加时耗时是线性叠加的，缓存能消掉重复部分但消不掉新增的编译量。",
+      "conditions": [
+        "Debug 整包构建，冷缓存"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "observation",
+          "summary": "三次构建分别测得 18、26、20 分钟，对应改造前、改造后与开启缓存后。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 21,
+      "repo": "android",
+      "topic": "build-downgrade",
+      "label": "dwn-android-downgrade-contract",
+      "goal": "固定降级实现的返回约定",
+      "acceptance_conditions": [
+        "降级实现不返回 null"
+      ],
+      "context_kind": "contract",
+      "statement": "每一个标了 @ServiceImpl 的搜索垂类服务都必须同时提供 @DowngradeImpl 的中性实现，返回空列表、空 Optional 或 no-op；不允许返回 null，调用方因此也不做判空，降级与否对调用方是不可见的。",
+      "rationale": "让降级实现返回 null，等于把降级形态的处理成本摊给每一个调用点；约定成中性值之后，调用方的代码对两种形态是同一份。",
+      "conditions": [
+        "服务通过 SPI 注解注册"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "现有三个降级实现中有一个返回 null，对应调用点也确实写了判空。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 22,
+      "repo": "fe",
+      "topic": "build-downgrade",
+      "label": "dwn-fe-remote-module-fallback",
+      "goal": "定义远程模块加载失败时的表现",
+      "acceptance_conditions": [
+        "失败时渲染兜底卡片而不是空白"
+      ],
+      "context_kind": "contract",
+      "statement": "搜索垂类的远程模块加载失败时，结果页必须渲染本地兜底卡片而不是留下空白区块——这是前端侧的降级实现，返回的是中性内容；兜底卡片不展示任何依赖远程模块的字段，也不上报点击事件，避免把一次加载失败记成一次真实曝光。",
+      "rationale": "空白区块在用户看来与内容缺失无法区分，而带上报的兜底会把降级混进正常指标，两者都让垂类的加载失败更难发现。",
+      "conditions": [
+        "远程模块从 CDN 异步加载"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "当前失败分支直接返回 null，区块高度塌陷为零。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 23,
+      "repo": "fe",
+      "topic": "build-downgrade",
+      "label": "dwn-fe-bundle-split-regression",
+      "goal": "解释拆包后首屏请求数上涨",
+      "acceptance_conditions": [
+        "请求数变化与拆分粒度被对应上"
+      ],
+      "context_kind": "issue",
+      "statement": "把搜索垂类拆成独立 chunk 之后，首屏请求数从 4 个涨到 9 个，弱网下结果页的可交互时间明显劣化；拆分粒度按垂类逐个走得太细，应该按访问频次合并成两到三个 chunk 而不是每个垂类一个。",
+      "rationale": "弱网下的瓶颈是往返次数而不是字节数，按垂类拆分优化的是后者，代价正好落在前者上。",
+      "conditions": [
+        "弱网，首屏冷缓存"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "observation",
+          "summary": "拆分前后首屏请求数分别为 4 与 9，弱网下可交互时间同向劣化。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    },
+    {
+      "index": 24,
+      "repo": "fe",
+      "topic": "build-downgrade",
+      "label": "dwn-fe-flag-default-off",
+      "goal": "确定可插拔垂类的前端开关默认值",
+      "acceptance_conditions": [
+        "开关读取失败时按关闭处理"
+      ],
+      "context_kind": "decision",
+      "statement": "可插拔搜索垂类的前端开关默认关闭，按仓库灰度到一成再放量；开关读取失败时同样按关闭处理并走兜底，因为打开一个加载不出来的垂类比暂时不展示它更糟，用户看到的会是一个点不动的入口而不是一个不存在的入口。",
+      "rationale": "失败时的默认值决定了故障的形态：默认开会把配置故障放大成垂类的功能故障，默认关只损失一次曝光。",
+      "conditions": [
+        "开关配置从远端读取"
+      ],
+      "evidence": [
+        {
+          "evidence_type": "source_snapshot",
+          "summary": "读取失败分支目前落到 true，与灰度意图相反。",
+          "limitations": [
+            "synthetic hard-negative calibration fixture"
+          ]
+        }
+      ]
+    }
+  ],
+  "intents": [
+    {
+      "id": "intent-badge-android",
+      "repo": "android",
+      "topic": "result-badge",
+      "goal": "接入服务端可编程的搜索结果直播徽标",
+      "current_direction": "先把视频卡与用户卡两条数据读取路径统一到同一个 BadgeState，再处理列表复用时的默认值恢复",
+      "in_scope": [
+        "BadgeBinder 的三处绑定分支",
+        "徽标背景与文案的默认值恢复",
+        "视频卡与用户卡的字段读取路径"
+      ]
+    },
+    {
+      "id": "intent-badge-fe",
+      "repo": "fe",
+      "topic": "result-badge",
+      "goal": "前端直播单卡徽标对齐服务端字段",
+      "current_direction": "解析 live_room_tag_info 的字符串与对象两种形态，并把渐变背景收敛到主题 token",
+      "in_scope": [
+        "live-single-card 组件",
+        "主题包的 badge-live-bg token",
+        "接口字段缺失时的兜底文案"
+      ]
+    },
+    {
+      "id": "intent-map-android",
+      "repo": "android",
+      "topic": "map-panel",
+      "goal": "修复搜索结果页地图面板旋转后相机复位的问题",
+      "current_direction": "把相机位姿移到 MapSceneRuntime 持有，Fragment 只转发生命周期",
+      "in_scope": [
+        "CameraController 的调用点",
+        "标注层的去重策略",
+        "分屏与旋转下的回归"
+      ]
+    },
+    {
+      "id": "intent-map-fe",
+      "repo": "fe",
+      "topic": "map-panel",
+      "goal": "地图面板按需加载并统一坐标口径",
+      "current_direction": "把地图 SDK 拆成懒加载 bundle，并移除组件里遗留的坐标系开关",
+      "in_scope": [
+        "地点标签页的首次点开路径",
+        "坐标转换的责任边界",
+        "面板展开与收起时的视口高度"
+      ]
+    },
+    {
+      "id": "intent-downgrade-android",
+      "repo": "android",
+      "topic": "build-downgrade",
+      "goal": "让搜索垂类走可插拔 SPI 并保证降级行为可预期",
+      "current_direction": "给每个 @ServiceImpl 补齐中性的 @DowngradeImpl，并把判空提前到读取配置字段之前",
+      "in_scope": [
+        "SPI 模块的注解处理耗时",
+        "降级路径上的空值约定",
+        "整包构建的耗时回归"
+      ]
+    },
+    {
+      "id": "intent-downgrade-fe",
+      "repo": "fe",
+      "topic": "build-downgrade",
+      "goal": "远程模块加载失败时搜索结果页的兜底表现",
+      "current_direction": "把垂类 chunk 合并成两到三个，并确认兜底卡片不上报点击事件",
+      "in_scope": [
+        "远程模块加载失败的分支",
+        "首屏请求数与弱网可交互时间",
+        "灰度开关读取失败时的默认值"
+      ]
+    }
+  ]
+}
