@@ -31,9 +31,10 @@ use sctx_index::ProjectionIndex;
 use sctx_search::{
     ContextPackMode, EmbeddingProvider, EmbeddingSemanticChannel, EncodeLatencySummary,
     EncodeSample, EncodeSampleRecorder, Error, ErrorKind, QueryVectorCache, SEMANTIC_CHANNEL_LIMIT,
-    SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SearchEngine, SemanticCacheKey, SemanticChannel,
-    SemanticChannelHandle, SemanticHit, SemanticOutcome, SemanticVectorCache,
-    TaskAssociationChannel, TaskContextPack, TaskContextRequest, TaskRetrievalPath,
+    SEMANTIC_CORPUS_VERSION, SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SearchEngine,
+    SemanticCacheKey, SemanticChannel, SemanticChannelHandle, SemanticHit, SemanticOutcome,
+    SemanticVectorCache, TaskAssociationChannel, TaskContextPack, TaskContextRequest,
+    TaskRetrievalPath,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -301,7 +302,15 @@ impl Fixture {
     }
 
     fn accept(&self, space_id: SpaceId, statement: &str) -> (ContextId, RevisionId) {
-        let added = Event::context_revision_added(space_id, draft(statement), None).unwrap();
+        self.accept_draft(space_id, draft(statement))
+    }
+
+    fn accept_draft(
+        &self,
+        space_id: SpaceId,
+        revision_draft: ContextRevisionDraft,
+    ) -> (ContextId, RevisionId) {
+        let added = Event::context_revision_added(space_id, revision_draft, None).unwrap();
         let EventPayload::ContextRevisionAdded {
             context_id,
             revision,
@@ -453,12 +462,104 @@ fn cached_vectors_are_invisible_under_a_different_model_or_ranking_version() {
     );
     assert!(cache.cached_revisions(&other_model).unwrap().is_empty());
 
+    // A SEMANTIC_CORPUS_VERSION bump is the signal that the *corpus text rule* changed shape, and
+    // it has to invalidate on its own: the 2026-09-11 join fix changed what every cached vector
+    // means while leaving SEARCH_RANKING_VERSION -- and therefore BM25 -- byte-identical.
+    assert_eq!(
+        original.ranking_version,
+        format!("6+corpus{SEMANTIC_CORPUS_VERSION}"),
+        "the key must fold the corpus version in, or a corpus change cannot invalidate anything"
+    );
+    assert_ne!(
+        original.ranking_version, "6",
+        "the ranking version alone must not be the cache generation"
+    );
+
     // Pruning against the new key must reclaim the superseded generation, not the current one.
     cache.store(&other_model, revision, &vector).unwrap();
     let pruned = cache.prune_superseded(&other_model).unwrap();
     assert_eq!(pruned, 1, "exactly the superseded generation is dropped");
     assert!(cache.load(&original).unwrap().is_empty());
     assert_eq!(cache.load(&other_model).unwrap().len(), 1);
+}
+
+#[test]
+fn a_vector_whose_revision_left_the_accepted_set_is_reclaimed() {
+    // `prune_superseded` only ever looks at the model and corpus generation, so a revision that is
+    // superseded or un-accepted keeps its vector under an unchanged key forever. Measured at 5 of
+    // 28 rows on one real installation. The cost is recall, not correctness: the hit is discarded
+    // by the safety predicate afterwards, but only after it has taken a channel slot.
+    let temporary = tempfile::tempdir().unwrap();
+    let cache = SemanticVectorCache::open(&temporary.path().join("state/semantic.sqlite")).unwrap();
+    let provider = HashProvider::new();
+    let key = SemanticCacheKey::new("fingerprint", "6");
+    let live = RevisionId::new();
+    let retired = RevisionId::new();
+    let vector = provider.encode("a decision worth caching").unwrap();
+    cache.store(&key, live, &vector).unwrap();
+    cache.store(&key, retired, &vector).unwrap();
+
+    let other_generation = SemanticCacheKey::new("fingerprint", "5");
+    cache.store(&other_generation, live, &vector).unwrap();
+
+    let keep = std::collections::BTreeSet::from([live]);
+    assert_eq!(cache.retain_revisions(&key, &keep).unwrap(), 1);
+    assert_eq!(
+        cache.cached_revisions(&key).unwrap(),
+        keep,
+        "exactly the revisions still embeddable survive"
+    );
+    assert_eq!(
+        cache.retain_revisions(&key, &keep).unwrap(),
+        0,
+        "a second pass over an already-clean generation removes nothing"
+    );
+    assert_eq!(
+        cache.load(&other_generation).unwrap().len(),
+        1,
+        "reclaiming dead revisions is scoped to one generation; prune_superseded owns the rest"
+    );
+}
+
+#[test]
+fn the_embedding_corpus_is_the_revision_text_and_never_the_normalized_index_text() {
+    // The defect this pins: `embeddable_revisions` read `statement`/`rationale`/`problem_view` out
+    // of `context_fts`, where every column has been through `normalize_search_text`. For CJK that
+    // is overlapping bigrams -- "在包 包含 含真 真实" -- so the entire semantic corpus was tokenizer
+    // shrapnel while `semantic_query_text` encoded ordinary prose on the query side. Cosine between
+    // two different text spaces is not a weak signal, it is a different question.
+    let fixture = Fixture::new();
+    let statement = "检索准入必须先判定语料是否与查询处于同一文本空间";
+    let rationale = "否则余弦相似度比较的是两套不同的文本,排序结果无从解释".to_owned();
+    let problem_view = "召回通道对中文语料给出的分数长期低于英文语料".to_owned();
+    let mut revision_draft = draft(statement);
+    revision_draft.rationale = rationale.clone();
+    revision_draft.problem_view = Some(problem_view.clone());
+    let (_, revision_id) = fixture.accept_draft(fixture.lexical_space, revision_draft);
+
+    let embeddable = fixture.engine().embeddable_revisions().unwrap();
+    let text = embeddable
+        .iter()
+        .find(|(candidate, _)| *candidate == revision_id)
+        .map(|(_, text)| text.clone())
+        .expect("the accepted revision is offered to the backfill");
+
+    assert_eq!(
+        text,
+        format!("{statement}\n{rationale}\n{problem_view}"),
+        "the corpus text is the three revision fields as written, joined with a newline"
+    );
+    // The other direction, so the test fails if the fields are ever routed back through the
+    // tokenizer rather than merely joined differently.
+    assert_ne!(
+        text,
+        sctx_index::normalize_search_text(&text),
+        "this fixture must be text the normalizer actually rewrites, or it proves nothing"
+    );
+    assert!(
+        text.contains(statement),
+        "the statement survives as one contiguous string, not as bigram fragments"
+    );
 }
 
 #[test]

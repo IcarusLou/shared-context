@@ -105,6 +105,22 @@ pub const SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS: u16 = 5_200;
 /// everything this family retrieves, exactly as carrying 2800 back would admit noise bge-m3 was
 /// calibrated to refuse. Which one applies is a property of the loaded model, so the loaded provider
 /// is what reports it -- see [`EmbeddingProvider::similarity_floor_basis_points`].
+///
+/// ## What this number did and did not govern before 2026-09-10
+///
+/// The calibration above has always encoded revision fields as written. Production did not: until
+/// the corpus join was fixed (`SEMANTIC_CORPUS_VERSION` `"1"` -> `"2"`, see
+/// `SearchEngine::embeddable_revisions`) every installed vector was built from `context_fts`, i.e.
+/// from `normalize_search_text` output, which for CJK is overlapping bigram shrapnel. So this floor
+/// was cutting one distribution in the calibration suite and a different one in the field, and no
+/// test could see the gap: the fixtures and the probes both went through the intended path, and the
+/// only code that took the wrong one was the backfill.
+///
+/// The value is therefore left alone here. 2800 is what the calibration measured, the calibration
+/// measured the space production now actually uses, and this is the first time those two statements
+/// are both true -- which makes this a restoration of the floor's meaning, not evidence for a new
+/// value. Re-deriving one belongs to the rebuild work, against a re-encoded corpus, not to the fix
+/// that made re-deriving meaningful.
 pub const QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS: u16 = 2_800;
 
 /// Most revisions one query may contribute through the semantic channel.
@@ -302,28 +318,55 @@ pub trait SemanticChannel: Send + Sync {
     fn similar_revisions(&self, query_text: &str) -> SemanticOutcome;
 }
 
+/// The generation of the rule `SearchEngine::embeddable_revisions` applies to build one corpus
+/// text.
+///
+/// `SEARCH_RANKING_VERSION` cannot carry this on its own, and the attempt to make it is what let
+/// the 2026-09-10 corpus defect survive. That constant versions what the *lexical* index holds;
+/// the semantic corpus is a second reading of the same three revision fields, and the two move
+/// independently. A change to the join, the field set, the separator or the source table changes
+/// what every cached vector means while leaving BM25 byte-identical, and nothing in the ranking
+/// version would notice.
+///
+/// - `"1"`: `statement`/`rationale`/`problem_view` read from `context_fts`, i.e. after
+///   `normalize_search_text`. Never intended; see `SearchEngine::embeddable_revisions`.
+/// - `"2"`: the same three fields read from `context_revision` as written, joined with a newline.
+///
+/// Bumping it invalidates every cached vector at once: [`SemanticCacheKey::new`] folds it into the
+/// key, so `prune_superseded` reclaims the old generation and `cached_revisions` reports the whole
+/// corpus as missing, which is exactly what makes the next backfill a full re-encode.
+pub const SEMANTIC_CORPUS_VERSION: &str = "2";
+
 /// Identifies one generation of cached vectors.
 ///
 /// Both halves matter. `model_fingerprint` changes when the operator swaps model files, and
-/// comparing vectors from two different models is meaningless rather than merely inaccurate.
-/// `ranking_version` follows `SEARCH_RANKING_VERSION`, because the text that gets embedded is the
-/// same text the lexical channels index and a ranking-version bump is exactly the signal that it
-/// changed shape.
+/// comparing vectors from two different models is meaningless rather than merely inaccurate. The
+/// other half answers "what text was fed to that model", and it has two independent inputs:
+/// `SEARCH_RANKING_VERSION`, which moves when the indexed revision content changes shape, and
+/// [`SEMANTIC_CORPUS_VERSION`], which moves when the rule that turns a revision into one corpus
+/// text changes. [`SemanticCacheKey::new`] takes the first and folds in the second.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SemanticCacheKey {
     /// Content fingerprint of the model files the vectors were produced by.
     pub model_fingerprint: String,
-    /// The `SEARCH_RANKING_VERSION` in force when the vectors were produced.
+    /// The corpus generation the vectors were produced under: the `SEARCH_RANKING_VERSION` in
+    /// force, with [`SEMANTIC_CORPUS_VERSION`] folded in by [`SemanticCacheKey::new`]. It is the
+    /// composed string, not the ranking version alone -- read it as an opaque generation tag.
     pub ranking_version: String,
 }
 
 impl SemanticCacheKey {
     /// Builds a key from a model fingerprint and the ranking version in force.
+    ///
+    /// The stored `ranking_version` is `"<ranking_version>+corpus<SEMANTIC_CORPUS_VERSION>"`, so a
+    /// caller passing `SEARCH_RANKING_VERSION` gets invalidation on either input without having to
+    /// know that the second one exists.
     #[must_use]
     pub fn new(model_fingerprint: impl Into<String>, ranking_version: impl Into<String>) -> Self {
+        let ranking_version = ranking_version.into();
         Self {
             model_fingerprint: model_fingerprint.into(),
-            ranking_version: ranking_version.into(),
+            ranking_version: format!("{ranking_version}+corpus{SEMANTIC_CORPUS_VERSION}"),
         }
     }
 }
@@ -871,6 +914,68 @@ impl SemanticVectorCache {
             .map_err(|error| {
                 Error::new(ErrorKind::Io, format!("prune semantic vectors: {error}"))
             })?;
+        Ok(removed)
+    }
+
+    /// Drops every row under the current key whose revision is no longer embeddable.
+    ///
+    /// Returns how many rows were removed. [`prune_superseded`](Self::prune_superseded) reclaims
+    /// vectors the *model or corpus generation* left behind; this one reclaims vectors the
+    /// *projection* left behind -- a revision that has since been superseded, un-accepted, or made
+    /// ineligible for automatic injection keeps its vector forever otherwise, because the key it
+    /// is filed under never changes. Measured at 5 of 28 rows (18%) on one real installation.
+    ///
+    /// A dead vector cannot resurrect its Context: `apply_semantic_context_evidence` re-checks the
+    /// safety predicate on every hit. What it can do is take one of the channel's
+    /// [`SEMANTIC_CHANNEL_LIMIT`] slots and be discarded after the fact, so the cost is recall, not
+    /// correctness. `keep` is the accepted set the backfill just read, which makes this the same
+    /// snapshot the next encode pass works from.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the cache cannot be read or the delete fails.
+    pub fn retain_revisions(
+        &self,
+        key: &SemanticCacheKey,
+        keep: &BTreeSet<RevisionId>,
+    ) -> Result<usize> {
+        let dead: Vec<RevisionId> = self
+            .cached_revisions(key)?
+            .into_iter()
+            .filter(|revision_id| !keep.contains(revision_id))
+            .collect();
+        if dead.is_empty() {
+            return Ok(0);
+        }
+        let mut connection = self.locked()?;
+        let transaction = connection.transaction().map_err(|error| {
+            Error::new(ErrorKind::Io, format!("open dead vector prune: {error}"))
+        })?;
+        let mut removed = 0;
+        {
+            let mut statement = transaction
+                .prepare(
+                    "DELETE FROM revision_vector
+                     WHERE revision_id = ?1 AND model_fingerprint = ?2 AND ranking_version = ?3",
+                )
+                .map_err(|error| {
+                    Error::new(ErrorKind::Io, format!("prepare dead vector prune: {error}"))
+                })?;
+            for revision_id in dead {
+                removed += statement
+                    .execute(rusqlite::params![
+                        revision_id.to_string(),
+                        key.model_fingerprint,
+                        key.ranking_version
+                    ])
+                    .map_err(|error| {
+                        Error::new(ErrorKind::Io, format!("prune dead vector: {error}"))
+                    })?;
+            }
+        }
+        transaction.commit().map_err(|error| {
+            Error::new(ErrorKind::Io, format!("commit dead vector prune: {error}"))
+        })?;
         Ok(removed)
     }
 

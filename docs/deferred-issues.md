@@ -81,3 +81,7 @@
 ## 2026-09-09 新增（R4-2 / KD7 预注册）
 
 39. **usage prior 重新进入排序须另行裁定**：`USAGE_PRIOR_ENABLED = false`。只有判决覆盖率 ≥60% 且 `checkpoint_derived` 强证据样本 ≥100 条，才具备重新讨论的条件；达到门槛不会自动打开。`ignored + session_close` 为弱证据未采用，只参与覆盖率与趋势，不计入强证据标定。观察期间不调整排序或权限面。
+
+## 2026-09-11 新增（R0 语料 join 修复期间发现）
+
+40. **bge-m3 探针未在修复后复测**：R0 把语义语料从 `context_fts`（`normalize_search_text` 输出）切回 `context_revision` 原文，`association_probe_ext_semantic_f2llm` 已三次复跑确认（29/39 lexical、32/39 fused 不变，最差正样本 4127→4553bp），但同一改动同样改变 `association_probe_ext_semantic`（bge-m3 臂）编码的每一条语料，而本机没有 bge-m3 权重、该测试 `#[ignore]` 且无法运行。该文件的断言以自身 lexical control 为基准、外加一条对 `SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`(5200) 的噪声天花板断言——后者是唯一可能因语料换空间而翻的。`association_probe_ext_semantic_f2llm` 里的 `BGE_CROSS_LINGUAL_HITS`/`BGE_PARAPHRASE_HITS`（2/8）是从那次 2026-09-07 的 bge-m3 运行抄来的常量，也一并未复核。升级条件：任何人手上有 bge-m3 export 时跑一次该 suite；若噪声天花板失守，属于 bge-m3 臂的重标定，不影响默认 F2LLM 路径。

@@ -30,10 +30,11 @@ pub mod embedding;
 pub use embedding::{
     EmbeddingProvider, EmbeddingSemanticChannel, EncodeLatencySummary, EncodeSample,
     EncodeSampleRecorder, QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, QueryVectorCache,
-    SEMANTIC_CHANNEL_LIMIT, SEMANTIC_ENCODE_BUDGET, SEMANTIC_ENCODE_SAMPLE_HISTORY,
-    SEMANTIC_QUERY_CACHE_CAPACITY, SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SemanticCacheKey,
-    SemanticChannel, SemanticChannelHandle, SemanticHit, SemanticOutcome, SemanticVectorCache,
-    load_onnx_provider, model_fingerprint, semantic_cache_path,
+    SEMANTIC_CHANNEL_LIMIT, SEMANTIC_CORPUS_VERSION, SEMANTIC_ENCODE_BUDGET,
+    SEMANTIC_ENCODE_SAMPLE_HISTORY, SEMANTIC_QUERY_CACHE_CAPACITY,
+    SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SemanticCacheKey, SemanticChannel,
+    SemanticChannelHandle, SemanticHit, SemanticOutcome, SemanticVectorCache, load_onnx_provider,
+    model_fingerprint, semantic_cache_path,
 };
 
 pub use candidate::{
@@ -1242,10 +1243,23 @@ impl SearchEngine {
 
     /// The text every accepted, injectable revision contributes to the embedding index.
     ///
-    /// It is `statement`, `rationale` and `problem_view` joined -- the same fields the lexical FTS
-    /// weights highest. Using a different set here would build a vector space that answers a
-    /// different question than the one the rest of retrieval is answering, and fusing the two
-    /// would be comparing rankings over two different corpora.
+    /// It is `statement`, `rationale` and `problem_view` joined with a newline -- the same fields
+    /// the lexical FTS weights highest. Using a different set here would build a vector space that
+    /// answers a different question than the one the rest of retrieval is answering, and fusing
+    /// the two would be comparing rankings over two different corpora. It is the corpus-side
+    /// counterpart of [`semantic_query_text`], which flattens the Working Intent under the same
+    /// rule: whole fields, as written, joined.
+    ///
+    /// The fields are read from `context_revision`, which stores them **as they were written**.
+    /// They must never be read from `context_fts`, which holds the same three fields after
+    /// [`normalize_search_text`](sctx_index::normalize_search_text) -- case-folded, identifier-split
+    /// and, for CJK, exploded into overlapping bigrams ("在包 包含 含真 真实"). That output exists
+    /// so BM25 can match substrings; it is not language, and an encoder handed it embeds the
+    /// artefacts of a tokenizer rather than the Context. Until 2026-09-10 this function read
+    /// `context_fts`, so every production vector was built from bigram shrapnel while the query
+    /// side encoded ordinary prose -- two different text spaces compared by cosine, and the reason
+    /// [`SemanticCacheKey`](crate::SemanticCacheKey) now carries
+    /// [`SEMANTIC_CORPUS_VERSION`](crate::SEMANTIC_CORPUS_VERSION).
     ///
     /// Only revisions that pass [`SAFE_ACCEPTED_CONTEXT_PREDICATE`] are offered, so the backfill
     /// never spends a model call on a Context automatic injection would refuse anyway.
@@ -1257,10 +1271,9 @@ impl SearchEngine {
         let snapshot = self.index.query_snapshot(|connection| {
             let mut statement = connection
                 .prepare(&format!(
-                    "SELECT revision.revision_id, context_fts.statement,
-                            context_fts.rationale, context_fts.problem_view
-                     FROM context_fts
-                     JOIN context_revision AS revision USING(revision_id)
+                    "SELECT revision.revision_id, revision.statement, revision.rationale,
+                            COALESCE(revision.problem_view, '')
+                     FROM context_revision AS revision
                      JOIN context_item AS item USING(context_id)
                      WHERE {SAFE_ACCEPTED_CONTEXT_PREDICATE}
                      ORDER BY revision.revision_id"

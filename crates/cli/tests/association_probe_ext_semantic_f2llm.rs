@@ -75,6 +75,15 @@ const LEXICAL_LONG_INTENT_HITS: usize = 3;
 ///
 /// Measured 2026-09-07 on the run recorded in
 /// [`QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`]'s doc comment.
+///
+/// Re-measured 2026-09-11, when the corpus join fix (`SEMANTIC_CORPUS_VERSION` `"1"` -> `"2"`)
+/// changed every vector this suite encodes: the corpus text stopped being `normalize_search_text`
+/// output and became the revision fields as written, which for this Chinese fixture is a different
+/// text space, not a lightly different string. Three release runs, all 29/39 lexical control and
+/// 32/39 fused, per-category identical to the line above. What did move is the margin the floor
+/// cuts: the worst-scoring positive went from 4127 to 4553 basis points against an unchanged noise
+/// ceiling of 0. So the ratchet stays where it is on purpose -- the fix bought separation on this
+/// fixture rather than hits, and pinning 32 keeps the next regression noisy.
 const FUSED_HITS: usize = 32;
 
 /// What the bge-m3 arm of this acceptance reaches, per category, on the same fixture through the

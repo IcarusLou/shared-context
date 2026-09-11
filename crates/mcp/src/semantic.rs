@@ -72,9 +72,24 @@ fn load_and_backfill(
     let provider = load_onnx_provider(model_path, runtime_path)?;
     let key = SemanticCacheKey::new(model_fingerprint(model_path)?, SEARCH_RANKING_VERSION);
     let cache = Arc::new(SemanticVectorCache::open_at_root(root)?);
-    // Vectors from a superseded model or ranking version can never be compared against the current
-    // ones, so they are disk cost with no possible reader.
+    // Vectors from a superseded model or corpus generation can never be compared against the
+    // current ones, so they are disk cost with no possible reader.
     let _pruned = cache.prune_superseded(&key)?;
+
+    // Read the corpus before the first publish, not after, so both prunes land before any snapshot
+    // is loaded. This is one local SQLite query against a projection that is already synchronized,
+    // against a model load that has just cost 9--12 seconds: it does not measurably delay the
+    // publish, and doing it here means the first snapshot a restarted server answers from is
+    // already free of vectors for revisions the projection has since retired.
+    let engine = SearchEngine::new(open_index(root));
+    let embeddable = engine.embeddable_revisions()?;
+    let _retired = cache.retain_revisions(
+        &key,
+        &embeddable
+            .iter()
+            .map(|(revision_id, _)| *revision_id)
+            .collect(),
+    )?;
 
     // Both publishes carry the same budget and the same recorder, and share one query vector cache
     // through `from_cache`, so the second one inherits the first one's warmth instead of resetting
@@ -90,8 +105,6 @@ fn load_and_backfill(
 
     handle.publish(Arc::new(build(Arc::clone(&provider))?));
 
-    let engine = SearchEngine::new(open_index(root));
-    let embeddable = engine.embeddable_revisions()?;
     let cached = cache.cached_revisions(&key)?;
     let mut wrote = false;
     for (revision_id, text) in embeddable {
@@ -156,9 +169,19 @@ pub fn warm_semantic_cache_at_root(root: &Path) -> sctx_search::Result<SemanticW
     let key = SemanticCacheKey::new(model_fingerprint(&model_path)?, SEARCH_RANKING_VERSION);
     let cache = SemanticVectorCache::open_at_root(root)?;
     let _pruned = cache.prune_superseded(&key)?;
+    let embeddable = SearchEngine::new(open_index(root)).embeddable_revisions()?;
+    // Same reclaim as the background loader, for the same reason: a vector whose revision left the
+    // accepted set is filed under an unchanged key and nothing else will ever drop it.
+    let _retired = cache.retain_revisions(
+        &key,
+        &embeddable
+            .iter()
+            .map(|(revision_id, _)| *revision_id)
+            .collect(),
+    )?;
     let cached = cache.cached_revisions(&key)?;
     let mut embedded = 0;
-    for (revision_id, text) in SearchEngine::new(open_index(root)).embeddable_revisions()? {
+    for (revision_id, text) in embeddable {
         if cached.contains(&revision_id) {
             continue;
         }
