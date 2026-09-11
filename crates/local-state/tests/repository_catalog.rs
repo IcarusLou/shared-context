@@ -1224,6 +1224,67 @@ fn the_second_hop_floor_is_optional_bounded_and_survives_a_model_reinstall() {
 }
 
 #[test]
+fn the_wire_ceiling_is_optional_bounded_and_survives_a_model_reinstall() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("信封 配置");
+    let store = UserConfigStore::initialize(&root).unwrap();
+    let config_path = root.join("config.toml");
+    let model = temporary.path().join("模型 目录");
+    let runtime = temporary.path().join("libonnxruntime.dylib");
+
+    store.set_retrieval_embedding(&model, &runtime).unwrap();
+    assert_eq!(
+        store.retrieval_settings().unwrap().pack_wire_token_ceiling,
+        None,
+        "absent means the compiled-in ceiling, derived from the one desktop host that was measured"
+    );
+    assert!(
+        !fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("pack_wire_token_ceiling"),
+        "the default stays out of the document, like every other tuned retrieval number"
+    );
+
+    // A host with a larger cell than the measured one is the whole reason this key exists: the
+    // ceiling is a fact about where the result is rendered, not about this corpus.
+    let mut text = fs::read_to_string(&config_path).unwrap();
+    let _ = writeln!(text, "pack_wire_token_ceiling = 16000");
+    fs::write(&config_path, text).unwrap();
+    assert_eq!(
+        store.retrieval_settings().unwrap().pack_wire_token_ceiling,
+        Some(16_000)
+    );
+
+    store.set_retrieval_embedding(&model, &runtime).unwrap();
+    assert_eq!(
+        store.retrieval_settings().unwrap().pack_wire_token_ceiling,
+        Some(16_000),
+        "`sctx embedding install` must not discard a ceiling the operator measured for this host"
+    );
+
+    // 1999 degrades every Pack to nothing without saying it turned injection off; 100001 has
+    // stopped describing any host this protocol reaches, and the truncation the ceiling exists to
+    // prevent comes back silently. Both are refused rather than clamped.
+    for refused in ["0", "1999", "100001"] {
+        let text = fs::read_to_string(&config_path).unwrap().replace(
+            "pack_wire_token_ceiling = 16000",
+            &format!("pack_wire_token_ceiling = {refused}"),
+        );
+        fs::write(&config_path, text).unwrap();
+        assert_eq!(
+            store.retrieval_settings().unwrap_err().kind(),
+            ErrorKind::InvalidInput,
+            "a ceiling of {refused} tokens is refused rather than clamped"
+        );
+        let text = fs::read_to_string(&config_path).unwrap().replace(
+            &format!("pack_wire_token_ceiling = {refused}"),
+            "pack_wire_token_ceiling = 16000",
+        );
+        fs::write(&config_path, text).unwrap();
+    }
+}
+
+#[test]
 fn retrieval_embedding_paths_default_to_absent_and_survive_a_catalog_write() {
     let temporary = TempDir::new().unwrap();
     let root = temporary.path().join("共享 配置");

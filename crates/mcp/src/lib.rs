@@ -1103,6 +1103,9 @@ pub struct TaskContextResponse {
     pub artifact_generation: Option<String>,
     pub graph_context_tree_oid: Option<String>,
     pub token_budget: usize,
+    /// What this Pack costs its reader, in caliber-v2 tokens: the payload charged at the shape it
+    /// reaches the host in, both wire copies -- see `TaskContextPack::estimated_tokens`. It is not
+    /// comparable with the number this field carried before that change.
     pub estimated_tokens: usize,
     pub omitted: Vec<ContextPackOmitted>,
     /// Carried for the compact projection only; the explainable shape has never reported it and
@@ -1158,6 +1161,9 @@ pub struct CompactTaskContextResponse {
     pub tree: String,
     pub generation: u64,
     pub token_budget: usize,
+    /// What this Pack costs its reader, in caliber-v2 tokens: the payload charged at the shape it
+    /// reaches the host in, both wire copies -- see `TaskContextPack::estimated_tokens`. It is not
+    /// comparable with the number this field carried before that change.
     pub estimated_tokens: usize,
     pub omitted: Vec<ContextPackOmitted>,
     /// How many Pending Candidates the other Tasks of this Session are holding, when there are
@@ -1633,6 +1639,11 @@ struct Runtime {
     /// `None` is the ordinary state and means the compiled-in ADR-0007 default. The key is read
     /// here, beside `[context_ttl]`, so a Pack never opens `config.toml` a second time.
     hop2_admission_floor_basis_points: Option<u16>,
+    /// `[retrieval] pack_wire_token_ceiling`, when this installation's host holds a different
+    /// amount than the one `PACK_WIRE_TOKEN_CEILING` was measured against.
+    ///
+    /// Read here for the same reason the floor is: a Pack never opens `config.toml` twice.
+    pack_wire_token_ceiling: Option<usize>,
     /// Activation scope that authorized this exact call, when the caller is public MCP dispatch.
     /// Internal entry points carry `None` and fall back to the scope recorded for the Episode's
     /// own `ExternalSession`.
@@ -1719,6 +1730,9 @@ impl Runtime {
             Some(context_ttl) => context_ttl,
             None => context_ttl_settings(&config.context_ttl_policy()?),
         };
+        // One read for both retrieval knobs: they live in the same table, and an unreadable
+        // `[retrieval]` is the same fact for each of them -- the compiled-in default.
+        let retrieval = config.retrieval_settings().ok();
         Ok(Self {
             root: root.to_path_buf(),
             store: OnceCell::new(),
@@ -1728,10 +1742,12 @@ impl Runtime {
             tasks,
             catalog,
             context_ttl,
-            hop2_admission_floor_basis_points: config
-                .retrieval_settings()
-                .ok()
+            hop2_admission_floor_basis_points: retrieval
+                .as_ref()
                 .and_then(|retrieval| retrieval.hop2_admission_floor_basis_points),
+            pack_wire_token_ceiling: retrieval
+                .as_ref()
+                .and_then(|retrieval| retrieval.pack_wire_token_ceiling),
             session_scope: parts.session_scope,
             semantic: parts.semantic,
         })
@@ -1791,6 +1807,7 @@ impl Runtime {
             self.context_ttl,
             self.semantic.as_ref(),
             self.hop2_admission_floor_basis_points,
+            self.pack_wire_token_ceiling,
         )
     }
 
@@ -1838,6 +1855,7 @@ impl Runtime {
             self.context_ttl,
             self.semantic.as_ref(),
             self.hop2_admission_floor_basis_points,
+            self.pack_wire_token_ceiling,
         )?;
         Ok(ArtifactFocusQueryResponse {
             resolved_focus,
@@ -1928,6 +1946,7 @@ impl Runtime {
             self.context_ttl,
             self.semantic.as_ref(),
             self.hop2_admission_floor_basis_points,
+            self.pack_wire_token_ceiling,
         )?;
         Ok(TaskIntentUpdateResponse {
             active_signals: active_signal_records(&self.tasks, snapshot.task_session_id)?,
@@ -6177,6 +6196,7 @@ fn build_task_context_response(
     context_ttl: ContextTtlSettings,
     semantic: Option<&SemanticChannelHandle>,
     hop2_admission_floor_basis_points: Option<u16>,
+    pack_wire_token_ceiling: Option<usize>,
 ) -> Result<TaskContextResponse> {
     let current = snapshot
         .current_intent_revision()
@@ -6210,6 +6230,7 @@ fn build_task_context_response(
     let pack = engine
         .with_context_ttl(context_ttl)
         .with_hop2_admission_floor(hop2_admission_floor_basis_points)
+        .with_pack_wire_token_ceiling(pack_wire_token_ceiling)
         .with_usage_prior(Arc::new(RuntimeUsagePrior {
             tasks: tasks.clone(),
         }))
@@ -6246,7 +6267,9 @@ fn build_task_context_response(
         // Only the compact shape reports it, so only the compact shape pays the count. A failure
         // to count is not a failure to retrieve: the Pack is still the Pack, and the reminder is
         // simply absent.
-        pending_candidates_in_other_tasks: (detail_level == ContextPackDetailLevel::Compact)
+        // The Pack's own shape, not the requested one: a Pack the wire ceiling handed back compact
+        // is a compact Pack, and this field is the compact shape's.
+        pending_candidates_in_other_tasks: (pack.detail_level == ContextPackDetailLevel::Compact)
             .then(|| {
                 tasks
                     .count_pending_candidates_in_other_tasks(

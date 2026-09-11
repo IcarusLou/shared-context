@@ -372,6 +372,9 @@ struct RetrievalConfigDocument {
     /// reason the budget is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hop2_admission_floor_basis_points: Option<u16>,
+    /// Optional override for the hard wire ceiling on one automatic Pack. Absent by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pack_wire_token_ceiling: Option<usize>,
 }
 
 /// Explicit local embedding recall settings.
@@ -407,6 +410,15 @@ pub struct RetrievalSettings {
     /// move it that is not a release -- and the record of what each decision scored is what makes
     /// moving it an informed act rather than a guess.
     pub hop2_admission_floor_basis_points: Option<u16>,
+    /// Hard ceiling on what one automatic Context Pack may cost on the wire, in tokens.
+    ///
+    /// Absent means the compiled-in default. Unlike every other retrieval key, this one is not a
+    /// statement about this corpus at all: it is the size of the cell the *host* will render the
+    /// tool result into, and a host that truncates at ten thousand tokens truncates from the
+    /// middle, leaving the model a JSON object that does not close. The compiled-in value is
+    /// derived from one measured desktop host, so an operator whose host holds more -- or whose
+    /// host holds conspicuously less -- has to be able to say so without waiting for a release.
+    pub pack_wire_token_ceiling: Option<usize>,
 }
 
 impl RetrievalSettings {
@@ -442,6 +454,10 @@ impl RetrievalSettings {
             hop2_admission_floor_basis_points: hop2_admission_floor(
                 document.hop2_admission_floor_basis_points,
                 "retrieval.hop2_admission_floor_basis_points",
+            )?,
+            pack_wire_token_ceiling: pack_wire_token_ceiling(
+                document.pack_wire_token_ceiling,
+                "retrieval.pack_wire_token_ceiling",
             )?,
         })
     }
@@ -506,6 +522,33 @@ fn hop2_admission_floor(value: Option<u16>, field: &str) -> Result<Option<u16>> 
             format!(
                 "{field} must be between {MIN_FLOOR_BASIS_POINTS} and {MAX_FLOOR_BASIS_POINTS} \
                  basis points"
+            ),
+        ));
+    }
+    Ok(Some(value))
+}
+
+/// Bounds a configured wire ceiling.
+///
+/// Below 2000 the ceiling stops being a host fact and becomes a way to turn automatic injection
+/// off by degrading every Pack to nothing; an operator who wants it off has `token_budget`, and a
+/// host cell that small would not hold the response frame either. Above 100000 no host this
+/// protocol reaches renders the result in one piece, so the number has stopped describing anything
+/// and the truncation it was written to prevent comes back silently. Both ends are refused rather
+/// than clamped, on the same grounds as the admission floor's: a typo should be a message, not a
+/// Pack that quietly stopped being delivered whole.
+fn pack_wire_token_ceiling(value: Option<usize>, field: &str) -> Result<Option<usize>> {
+    const MIN_WIRE_CEILING_TOKENS: usize = 2_000;
+    const MAX_WIRE_CEILING_TOKENS: usize = 100_000;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if !(MIN_WIRE_CEILING_TOKENS..=MAX_WIRE_CEILING_TOKENS).contains(&value) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "{field} must be between {MIN_WIRE_CEILING_TOKENS} and {MAX_WIRE_CEILING_TOKENS} \
+                 tokens"
             ),
         ));
     }
@@ -1354,11 +1397,13 @@ impl UserConfigStore {
             let encode_budget_ms = tuned.and_then(|retrieval| retrieval.embedding_encode_budget_ms);
             let hop2_floor =
                 tuned.and_then(|retrieval| retrieval.hop2_admission_floor_basis_points);
+            let wire_ceiling = tuned.and_then(|retrieval| retrieval.pack_wire_token_ceiling);
             document.retrieval = Some(RetrievalConfigDocument {
                 embedding_model_path: Some(model),
                 embedding_runtime_path: Some(runtime),
                 embedding_encode_budget_ms: encode_budget_ms,
                 hop2_admission_floor_basis_points: hop2_floor,
+                pack_wire_token_ceiling: wire_ceiling,
             });
             self.validate_document(&document)?;
             self.write_document(&document)?;
