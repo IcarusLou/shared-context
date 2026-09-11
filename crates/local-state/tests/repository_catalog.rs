@@ -1152,6 +1152,78 @@ fn the_encode_budget_is_optional_bounded_and_survives_a_model_reinstall() {
 }
 
 #[test]
+fn the_second_hop_floor_is_optional_bounded_and_survives_a_model_reinstall() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("准入 配置");
+    let store = UserConfigStore::initialize(&root).unwrap();
+    let config_path = root.join("config.toml");
+    let model = temporary.path().join("模型 目录");
+    let runtime = temporary.path().join("libonnxruntime.dylib");
+
+    store.set_retrieval_embedding(&model, &runtime).unwrap();
+    assert_eq!(
+        store
+            .retrieval_settings()
+            .unwrap()
+            .hop2_admission_floor_basis_points,
+        None,
+        "absent means the compiled-in default, which is the value ADR-0007 derived and the one \
+         this key exists to let real traffic replace"
+    );
+    assert!(
+        !fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("hop2_admission_floor_basis_points"),
+        "the default stays out of the document so re-deriving it needs no migration"
+    );
+
+    // The device run behind ADR-0007 put the best threshold at 5140 and the shipped value is the
+    // union of that reading and the fixture's, so 5140 is exactly the kind of installation-local
+    // number this key exists to carry.
+    let mut text = fs::read_to_string(&config_path).unwrap();
+    let _ = writeln!(text, "hop2_admission_floor_basis_points = 5140");
+    fs::write(&config_path, text).unwrap();
+    assert_eq!(
+        store
+            .retrieval_settings()
+            .unwrap()
+            .hop2_admission_floor_basis_points,
+        Some(5_140)
+    );
+
+    store.set_retrieval_embedding(&model, &runtime).unwrap();
+    assert_eq!(
+        store
+            .retrieval_settings()
+            .unwrap()
+            .hop2_admission_floor_basis_points,
+        Some(5_140),
+        "`sctx embedding install` must not discard a floor the operator derived for this corpus"
+    );
+
+    // 2999 admits about a third of an unrelated corpus, which is the defect the second hop exists
+    // to end; 9001 admits nothing short of a near-duplicate, which turns the lane off without
+    // saying so. Both are refused rather than clamped.
+    for refused in ["0", "2999", "9001"] {
+        let text = fs::read_to_string(&config_path).unwrap().replace(
+            "hop2_admission_floor_basis_points = 5140",
+            &format!("hop2_admission_floor_basis_points = {refused}"),
+        );
+        fs::write(&config_path, text).unwrap();
+        assert_eq!(
+            store.retrieval_settings().unwrap_err().kind(),
+            ErrorKind::InvalidInput,
+            "a floor of {refused} basis points is refused rather than clamped"
+        );
+        let text = fs::read_to_string(&config_path).unwrap().replace(
+            &format!("hop2_admission_floor_basis_points = {refused}"),
+            "hop2_admission_floor_basis_points = 5140",
+        );
+        fs::write(&config_path, text).unwrap();
+    }
+}
+
+#[test]
 fn retrieval_embedding_paths_default_to_absent_and_survive_a_catalog_write() {
     let temporary = TempDir::new().unwrap();
     let root = temporary.path().join("共享 配置");

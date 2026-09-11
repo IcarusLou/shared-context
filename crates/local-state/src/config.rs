@@ -368,6 +368,10 @@ struct RetrievalConfigDocument {
     /// needed one, which keeps the document byte-identical to the one this table shipped with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     embedding_encode_budget_ms: Option<u64>,
+    /// Optional override for the second hop's admission floor. Absent by default, for the same
+    /// reason the budget is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hop2_admission_floor_basis_points: Option<u16>,
 }
 
 /// Explicit local embedding recall settings.
@@ -392,6 +396,17 @@ pub struct RetrievalSettings {
     /// alternative to letting them set one is the silent, total channel failure this field was
     /// added to end. `sctx doctor` reports when the recorded encodes say the budget does not fit.
     pub embedding_encode_budget_ms: Option<u64>,
+    /// Cosine, in basis points, a candidate Context must reach against a seed Context to be
+    /// admitted by the second hop.
+    ///
+    /// Absent means the compiled-in default. The key exists because ADR-0007 pre-registered it:
+    /// that default was derived from one adversarial fixture cross-checked against one
+    /// installation, which is one installation more than any retrieval constant in this repository
+    /// previously had and still not a distribution. Until the recorded admission scores of real
+    /// traffic settle the value, an installation whose corpus separates differently needs a way to
+    /// move it that is not a release -- and the record of what each decision scored is what makes
+    /// moving it an informed act rather than a guess.
+    pub hop2_admission_floor_basis_points: Option<u16>,
 }
 
 impl RetrievalSettings {
@@ -423,6 +438,10 @@ impl RetrievalSettings {
             embedding_encode_budget_ms: retrieval_budget_ms(
                 document.embedding_encode_budget_ms,
                 "retrieval.embedding_encode_budget_ms",
+            )?,
+            hop2_admission_floor_basis_points: hop2_admission_floor(
+                document.hop2_admission_floor_basis_points,
+                "retrieval.hop2_admission_floor_basis_points",
             )?,
         })
     }
@@ -464,6 +483,33 @@ impl PolicySettings {
             path: configured_absolute_path(document.path.as_deref(), "policy.path")?,
         })
     }
+}
+
+/// Bounds a configured second-hop admission floor.
+///
+/// The band is deliberately narrower than "any cosine". Below 3000 the floor stops being an
+/// admission decision at all -- the query-side calibration measured a third of an unrelated corpus
+/// above 2800, and this key exists precisely because a second hop that admits a third of the corpus
+/// is the defect ADR-0007 was written about. Above 9000 nothing but a near-duplicate is admitted,
+/// which silently turns the lane off; an operator who wants it off removes the model. Both ends are
+/// refused rather than clamped, for the same reason the encode budget's are: a typo should be a
+/// message, not a retrieval that quietly stopped working.
+fn hop2_admission_floor(value: Option<u16>, field: &str) -> Result<Option<u16>> {
+    const MIN_FLOOR_BASIS_POINTS: u16 = 3_000;
+    const MAX_FLOOR_BASIS_POINTS: u16 = 9_000;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if !(MIN_FLOOR_BASIS_POINTS..=MAX_FLOOR_BASIS_POINTS).contains(&value) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "{field} must be between {MIN_FLOOR_BASIS_POINTS} and {MAX_FLOOR_BASIS_POINTS} \
+                 basis points"
+            ),
+        ));
+    }
+    Ok(Some(value))
 }
 
 /// Bounds a configured encode budget.
@@ -1302,16 +1348,17 @@ impl UserConfigStore {
         let lock = self.lock()?;
         let outcome = (|| {
             let mut document = self.read_document()?;
-            // Reinstalling the model is not a reason to discard a budget the operator tuned for
-            // this machine: the two halves this call owns are the paths, and nothing else.
-            let encode_budget_ms = document
-                .retrieval
-                .as_ref()
-                .and_then(|retrieval| retrieval.embedding_encode_budget_ms);
+            // Reinstalling the model is not a reason to discard a number the operator tuned for
+            // this installation: the two halves this call owns are the paths, and nothing else.
+            let tuned = document.retrieval.as_ref();
+            let encode_budget_ms = tuned.and_then(|retrieval| retrieval.embedding_encode_budget_ms);
+            let hop2_floor =
+                tuned.and_then(|retrieval| retrieval.hop2_admission_floor_basis_points);
             document.retrieval = Some(RetrievalConfigDocument {
                 embedding_model_path: Some(model),
                 embedding_runtime_path: Some(runtime),
                 embedding_encode_budget_ms: encode_budget_ms,
+                hop2_admission_floor_basis_points: hop2_floor,
             });
             self.validate_document(&document)?;
             self.write_document(&document)?;
