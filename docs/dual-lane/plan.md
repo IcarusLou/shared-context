@@ -83,3 +83,12 @@ S2-1 → S2-2 → S2-3 可流水(2 依赖 1 的种子形态,3 依赖 1+2);S2-4 �
 4. **改名容差与 graph 诊断退役是有意的**:图谱已裁定降级为 relocation 记账;pack 自解释实测负价值。deferred 跟进:"径 A 反查 miss 时咨询 relocation 记录"。graph_retrieval 失败据此分流:引用解析类保留修复、pack 图通道类退役。
 5. **融合常量族的 pack 侧退役完成**;其余存活仅因 candidate 分析栈(B1 冻结)与不可达的 Explicit 模式——全量删除随 B1,Explicit 模式死代码一并在 B1 清点。
 6. **60 个失败的分流规则**(逐文件执行):(i) 测试意图是"文本匹配让自动包含 X"→ 退役删除(旧语义);(ii) 意图是 wire 形状/Space 分组/budget/compact 字节稳定/usage 记录 → 给 fixture 补文件足迹使包非空后修复断言(mcp compact 稳定性需 ≥8 items 的 lane-fed fixture);(iii) graph_retrieval 按第 4 条分流;(iv) 严禁为了让测试通过而弱化空包语义或降低 hop2 floor。
+
+## S2-4b 收尾注记(review 定案)
+
+- workspace 1076/0(主会话独立复跑一致);红线零 diff(candidate.rs/search_contract.rs/candidate_analysis.rs 全分支未动)。
+- topic_key 边已物理删除;problem_view 单边下"一跳"由守卫变为算术性质,测试注明"若第二个边字段回归,此断言应最先失败"。
+- lane 探针集:probe-ext-v1 的 lane_probes 扩展块(10 条),棘轮 anchored 9 / expanded 0 / associated 0 / noise 0(三次一致);associated=0 是套件未配 [retrieval] 所致,径 B 由 hop2_ratchet 独立守护;noise=0 永不放宽。
+- 新 deferred:#41 relocation-aware 反查、#42 Explicit 模式死代码随 B1、#43 同 checkpoint claims 经 task 级 problem_view 互注入(修复方向在 problem_view 派生粒度,回流 B 层生成设计——与"文件改动总结一等形态"同点解)。
+- 行为变化记录:ambiguous Engineering Reference 经径 A 精确 join 变为可达(Graph resolver 曾拒绝);ContextSafetySource::EngineeringGraphSnapshot 失去生产者(lane 项恒 CurrentProjection),清点随 B1。
+- 既有 flake(artifact_focus 六 kind 扫描竞态)与本包无关,未处理。
