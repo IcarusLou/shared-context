@@ -26,6 +26,7 @@ use sha2::{Digest as _, Sha256};
 
 mod candidate;
 pub mod embedding;
+mod lanes;
 
 pub use embedding::{
     EmbeddingProvider, EmbeddingSemanticChannel, EncodeLatencySummary, EncodeSample,
