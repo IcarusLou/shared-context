@@ -1716,6 +1716,7 @@ fn automatic_task_pack_excludes_every_unsafe_state_while_explicit_expands_confli
             task_id,
             working_intent: task,
             task_signals: Vec::new(),
+            signal_history: Vec::new(),
             resolved_focus: None,
             token_budget: 100_000,
             max_spaces: sctx_search::DEFAULT_TASK_MAX_SPACES,

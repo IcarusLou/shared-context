@@ -1628,6 +1628,11 @@ struct Runtime {
     /// The process-lifetime embedding channel, handed down from [`McpServer`] so a Pack built on
     /// this call can consult it. `None` on every installation without `[retrieval]`.
     semantic: Option<SemanticChannelHandle>,
+    /// `[retrieval] hop2_admission_floor_basis_points`, when this installation tuned one.
+    ///
+    /// `None` is the ordinary state and means the compiled-in ADR-0007 default. The key is read
+    /// here, beside `[context_ttl]`, so a Pack never opens `config.toml` a second time.
+    hop2_admission_floor_basis_points: Option<u16>,
     /// Activation scope that authorized this exact call, when the caller is public MCP dispatch.
     /// Internal entry points carry `None` and fall back to the scope recorded for the Episode's
     /// own `ExternalSession`.
@@ -1723,6 +1728,10 @@ impl Runtime {
             tasks,
             catalog,
             context_ttl,
+            hop2_admission_floor_basis_points: config
+                .retrieval_settings()
+                .ok()
+                .and_then(|retrieval| retrieval.hop2_admission_floor_basis_points),
             session_scope: parts.session_scope,
             semantic: parts.semantic,
         })
@@ -1781,6 +1790,7 @@ impl Runtime {
             detail_level,
             self.context_ttl,
             self.semantic.as_ref(),
+            self.hop2_admission_floor_basis_points,
         )
     }
 
@@ -1827,6 +1837,7 @@ impl Runtime {
             detail_level,
             self.context_ttl,
             self.semantic.as_ref(),
+            self.hop2_admission_floor_basis_points,
         )?;
         Ok(ArtifactFocusQueryResponse {
             resolved_focus,
@@ -1916,6 +1927,7 @@ impl Runtime {
             detail_level,
             self.context_ttl,
             self.semantic.as_ref(),
+            self.hop2_admission_floor_basis_points,
         )?;
         Ok(TaskIntentUpdateResponse {
             active_signals: active_signal_records(&self.tasks, snapshot.task_session_id)?,
@@ -6164,6 +6176,7 @@ fn build_task_context_response(
     detail_level: ContextPackDetailLevel,
     context_ttl: ContextTtlSettings,
     semantic: Option<&SemanticChannelHandle>,
+    hop2_admission_floor_basis_points: Option<u16>,
 ) -> Result<TaskContextResponse> {
     let current = snapshot
         .current_intent_revision()
@@ -6174,6 +6187,16 @@ fn build_task_context_response(
         snapshot.task_signals.clone(),
         token_budget,
     );
+    // ADR-0007's first lane reads where the Session has been, not what it is looking at now, so it
+    // is handed the whole Signal history -- superseded rows included. A history this read cannot
+    // get is a smaller footprint, never a failed retrieval: the Pack degrades to the active window
+    // the snapshot already carries.
+    request.signal_history = tasks
+        .read_signal_history(snapshot.task_session_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|record| record.signal)
+        .collect();
     request.resolved_focus = resolved_focus;
     request.max_spaces = max_spaces;
     let mut engine = if let Some(engineering_graph) = engineering_graph {
@@ -6186,6 +6209,7 @@ fn build_task_context_response(
     }
     let pack = engine
         .with_context_ttl(context_ttl)
+        .with_hop2_admission_floor(hop2_admission_floor_basis_points)
         .with_usage_prior(Arc::new(RuntimeUsagePrior {
             tasks: tasks.clone(),
         }))

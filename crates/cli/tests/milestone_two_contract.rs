@@ -22,7 +22,7 @@ use sctx_mcp::{
     TaskIntentUpdateInput, task_context_readonly_at_root, task_intent_update_at_root,
 };
 use sctx_search::{
-    ContextPackMode, ContextStatus, SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SearchEngine,
+    ContextPackMode, ContextStatus, SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS, SearchEngine,
     TaskContextRequest, TaskRetrievalPath,
 };
 use sctx_task_runtime::TaskRuntime;
@@ -514,74 +514,42 @@ fn establish_task(root: &Path, input: &TaskScenario) -> TaskContextResponse {
     task_intent_update_at_root(root, &update).unwrap().context
 }
 
+/// Every Retrieval Path an automatic Pack can carry, and the fact each one has to be able to name.
+///
+/// ADR-0007 is what makes this list two entries long. Automatic injection used to reach a Context
+/// through any of nine routes -- Intent text, Context text, hint text, exact scope, a focus text
+/// fallback, a Graph Artifact, a Relation hop, a Space association, a query-side cosine -- and the
+/// Pack's job was to fuse nine opinions into one ranking. It now reaches a Context two ways: the
+/// Session opened a file this Context is recorded against, or a Context the Session already reached
+/// admitted this one on the two documents' cosine. The remaining variants are still part of the
+/// enum because an explicit Pack read still produces them; an automatic Pack that produced one
+/// would mean the lanes had been bypassed, so they fail here rather than being wildcarded away.
 fn assert_typed_m2_path(path: &TaskRetrievalPath) {
     match path {
-        TaskRetrievalPath::IntentFts {
-            matched_fields,
-            matched_tokens,
-        } => {
-            assert!(!matched_fields.is_empty());
-            assert!(!matched_tokens.is_empty());
-        }
-        TaskRetrievalPath::ContextFts {
-            matched_fields,
-            matched_tokens,
-        } => {
-            assert!(!matched_fields.is_empty());
-            assert!(!matched_tokens.is_empty());
-        }
-        TaskRetrievalPath::WorkingIntentHintText { explanation } => {
-            assert!(!explanation.matched_tokens.is_empty());
-            assert!(explanation.query_token_coverage_basis_points > 0);
-            assert!(explanation.fusion_contribution_micros > 0);
-        }
-        TaskRetrievalPath::ResolvedFocusTextFallback { explanation } => {
-            assert!(
-                !explanation
-                    .resolved_focus
-                    .locator
-                    .canonical_key()
-                    .is_empty()
-            );
-            assert!(!explanation.matched_components.is_empty());
-            assert!(!explanation.matched_fields.is_empty());
-        }
-        TaskRetrievalPath::ExactScope { dimension, value } => {
-            assert!(!dimension.is_empty());
-            assert!(!value.is_empty());
-        }
-        // Unreachable in this fixture: the semantic channel only exists once `[retrieval]` names
-        // a model, and no M2 contract fixture configures one. It is matched rather than wildcarded
-        // so a future path added to the enum still fails this assertion loudly.
-        TaskRetrievalPath::SemanticSimilarity {
-            similarity_basis_points,
-        } => {
-            assert!(*similarity_basis_points >= SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS);
-        }
-        TaskRetrievalPath::EngineeringGraph {
-            path,
-            relation_hops,
-        } => {
-            assert!(!path.resolved_focus.locator.canonical_key().is_empty());
-            assert!(!path.artifact_generation.is_empty());
-            assert!(relation_hops.len() <= 2);
-        }
-        TaskRetrievalPath::ContextRelation { hops } => {
-            assert!(!hops.is_empty());
-            assert!(hops.len() <= 2);
-        }
-        TaskRetrievalPath::SpaceAssociation {
-            association_id,
-            matched_space_id,
+        TaskRetrievalPath::FileAnchor {
+            location,
+            anchor_count,
             ..
         } => {
-            assert!(association_id.to_string().starts_with("asc_"));
-            assert!(matched_space_id.to_string().starts_with("spc_"));
+            assert!(
+                location.contains(':'),
+                "a Lane A path names the Repository-qualified coordinate that justifies it: \
+                 {location}"
+            );
+            assert!(*anchor_count >= 1);
         }
-        TaskRetrievalPath::GraphDiagnostic { diagnostic } => {
-            assert!(!diagnostic.resolved_focus.locator.canonical_key().is_empty());
-            assert!(!diagnostic.artifact_generation.is_empty());
+        TaskRetrievalPath::SeedAssociation {
+            seed_context_id,
+            score_basis_points,
+            ..
+        } => {
+            assert!(seed_context_id.to_string().starts_with("ctx_"));
+            assert!(
+                *score_basis_points >= SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
+                "a Lane B path carries the score that admitted it, never one below the floor"
+            );
         }
+        other => panic!("automatic injection produced a path outside the two lanes: {other:?}"),
     }
 }
 
@@ -764,6 +732,7 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
             task_id: TaskId::new(),
             working_intent: task_intent("hazardpackintent"),
             task_signals: Vec::new(),
+            signal_history: Vec::new(),
             resolved_focus: None,
             token_budget: 100_000,
             max_spaces: sctx_search::DEFAULT_TASK_MAX_SPACES,

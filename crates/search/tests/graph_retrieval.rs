@@ -467,6 +467,7 @@ fn task_request(
             open_questions: Vec::new(),
         },
         task_signals: Vec::new(),
+        signal_history: Vec::new(),
         resolved_focus: Some(resolved_focus(
             repository_id,
             symbol_locator("SearchSymbol"),

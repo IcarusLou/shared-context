@@ -33,9 +33,6 @@
 //! hop off the Contexts it just admitted. The two lanes live in one file because Lane B's input is
 //! Lane A's output and neither is meaningful without the other.
 
-// S2-4 wires all three into `task_context_pack`; until it does, nothing in the crate calls them.
-#![allow(dead_code)]
-
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet},
@@ -44,7 +41,7 @@ use std::{
 use rusqlite::{Connection, params_from_iter};
 use sctx_domain::{
     ContextId, RepoRelativePath, RepositoryId, ResolvedFocus, RevisionId, SpaceId, TaskSignal,
-    TaskSignalKind, TaskSignalRecord, WorkingIntentSnapshot, hints,
+    TaskSignalKind, WorkingIntentSnapshot, hints,
 };
 use serde::{Deserialize, Serialize};
 
@@ -57,7 +54,7 @@ use crate::{
 /// Where one file anchor came from.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AnchorSource {
+pub enum AnchorSource {
     /// A `workspace` or `diff` Task Signal of this Session -- active or superseded.
     Signal,
     /// A `working_intent.artifact_hints` spelling that reads as a path.
@@ -85,7 +82,7 @@ pub(crate) struct FileAnchor {
 /// the assembler should prefer when one Context is reached several ways.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum AnchorMatchBasis {
+pub enum AnchorMatchBasis {
     /// Same Repository, same repository-relative path. The only basis a Signal or a resolved
     /// focus can ever produce.
     RepositoryPath,
@@ -98,7 +95,7 @@ pub(crate) enum AnchorMatchBasis {
 
 /// One reason a Context is in Lane A's answer, spelled the way a Pack prints a location.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub(crate) struct AnchorEvidence {
+pub struct AnchorEvidence {
     /// `repository:path` of the Engineering Reference that matched -- the same spelling
     /// `load_compact_locations` prints, so a `why` line can render it directly.
     pub location: String,
@@ -146,17 +143,20 @@ fn basename_of(path: &str) -> &str {
 
 /// The complete anchor set of one Task, from all three sources, deduplicated and ordered.
 ///
-/// `signals` is the Session's whole Signal history, not its active window: [`TaskSignalRecord`]'s
-/// `lifecycle` is deliberately never read here. A caller holding only active Signals may pass
-/// them, and will get the smaller footprint that implies.
-pub(crate) fn collect_file_anchors(
-    signals: &[TaskSignalRecord],
+/// `signals` is the Session's whole Signal history, not its active window. It is taken as a stream
+/// of [`TaskSignal`] rather than of
+/// [`TaskSignalRecord`](sctx_domain::TaskSignalRecord) precisely because the record's `lifecycle`
+/// has no business here: Lane A reads a footprint, and a superseded Signal is still a place the
+/// Session went. A caller holding only active Signals may pass them, and will get the smaller
+/// footprint that implies.
+pub(crate) fn collect_file_anchors<'a>(
+    signals: impl IntoIterator<Item = &'a TaskSignal>,
     intent: &WorkingIntentSnapshot,
     resolved_focus: &[ResolvedFocus],
 ) -> Vec<FileAnchor> {
     let mut anchors = BTreeSet::new();
-    for record in signals {
-        if let Some(anchor) = signal_anchor(&record.signal) {
+    for signal in signals {
+        if let Some(anchor) = signal_anchor(signal) {
             anchors.insert(anchor);
         }
     }
@@ -569,6 +569,7 @@ impl LaneBHit {
     }
 
     /// Every seed that admitted this Context, strongest first.
+    #[cfg(test)]
     pub fn admitting_seeds(&self) -> impl Iterator<Item = &SeedMatch> {
         std::iter::once(&self.seed).chain(&self.also_admitted_by)
     }
@@ -631,6 +632,8 @@ struct Hop2Context {
 /// `vectors` is keyed by revision because that is how [`SemanticVectorCache`](crate::SemanticVectorCache)
 /// keys them -- one generation of one model's output, loaded once when the channel is published.
 /// A candidate missing from it is skipped and counted, never encoded on demand and never waited on.
+/// The values are borrowed rather than owned so an assembler can index the channel's published
+/// snapshot without copying a whole corpus of vectors on every automatic retrieval.
 ///
 /// # Errors
 ///
@@ -638,7 +641,7 @@ struct Hop2Context {
 pub(crate) fn lane_b_hits(
     connection: &Connection,
     seeds: &[(ContextId, RevisionId)],
-    vectors: &BTreeMap<RevisionId, Vec<f32>>,
+    vectors: &BTreeMap<RevisionId, &[f32]>,
     floor_basis_points: u16,
 ) -> Result<Hop2Admission> {
     if seeds.is_empty() {
@@ -961,8 +964,14 @@ mod test_support {
             vectors: &std::collections::BTreeMap<RevisionId, Vec<f32>>,
             floor_basis_points: u16,
         ) -> super::Hop2Admission {
+            // The lane borrows the channel's published snapshot rather than owning a copy; a test
+            // that owns its vectors hands over the same borrow.
+            let borrowed = vectors
+                .iter()
+                .map(|(revision_id, vector)| (*revision_id, vector.as_slice()))
+                .collect::<std::collections::BTreeMap<_, _>>();
             self.read(|connection| {
-                super::lane_b_hits(connection, seeds, vectors, floor_basis_points)
+                super::lane_b_hits(connection, seeds, &borrowed, floor_basis_points)
             })
         }
 
@@ -1127,12 +1136,15 @@ mod tests {
 
     #[test]
     fn a_superseded_workspace_signal_anchors_exactly_like_an_active_one() {
+        let records = [
+            signal(TaskSignalKind::Workspace, "Android:app/src/Active.kt", true),
+            signal(TaskSignalKind::Workspace, "Android:app/src/Old.kt", false),
+            signal(TaskSignalKind::Diff, "Android:app/src/Changed.kt", false),
+        ];
+        // Records, deliberately: the caller holds a Signal history with lifecycles on it, and what
+        // this asserts is that the lane never looks at one.
         let anchors = collect_file_anchors(
-            &[
-                signal(TaskSignalKind::Workspace, "Android:app/src/Active.kt", true),
-                signal(TaskSignalKind::Workspace, "Android:app/src/Old.kt", false),
-                signal(TaskSignalKind::Diff, "Android:app/src/Changed.kt", false),
-            ],
+            records.iter().map(|record| &record.signal),
             &intent(&[]),
             &[],
         );
@@ -1154,21 +1166,22 @@ mod tests {
 
     #[test]
     fn a_signal_that_names_no_repository_qualified_file_anchors_nothing() {
+        let records = [
+            // Prompt and TestOutcome never carry a coordinate.
+            signal(TaskSignalKind::Prompt, "Android:app/src/Prompt.kt", true),
+            signal(TaskSignalKind::TestOutcome, "test runner failed", true),
+            // A bare checkout root says only where the Agent is, never what it opened.
+            signal(TaskSignalKind::Workspace, "/Users/dev/checkout", true),
+            // An absolute path behind a Repository prefix is not repository relative.
+            signal(TaskSignalKind::Workspace, "Android:/etc/passwd", true),
+            // Escapes and Windows separators are refused by RepoRelativePath.
+            signal(TaskSignalKind::Workspace, "Android:../../secrets", true),
+            signal(TaskSignalKind::Workspace, "C:\\Users\\dev\\a.kt", true),
+            // A Repository identity may not contain a path separator.
+            signal(TaskSignalKind::Workspace, "a/b:app/src/A.kt", true),
+        ];
         let anchors = collect_file_anchors(
-            &[
-                // Prompt and TestOutcome never carry a coordinate.
-                signal(TaskSignalKind::Prompt, "Android:app/src/Prompt.kt", true),
-                signal(TaskSignalKind::TestOutcome, "test runner failed", true),
-                // A bare checkout root says only where the Agent is, never what it opened.
-                signal(TaskSignalKind::Workspace, "/Users/dev/checkout", true),
-                // An absolute path behind a Repository prefix is not repository relative.
-                signal(TaskSignalKind::Workspace, "Android:/etc/passwd", true),
-                // Escapes and Windows separators are refused by RepoRelativePath.
-                signal(TaskSignalKind::Workspace, "Android:../../secrets", true),
-                signal(TaskSignalKind::Workspace, "C:\\Users\\dev\\a.kt", true),
-                // A Repository identity may not contain a path separator.
-                signal(TaskSignalKind::Workspace, "a/b:app/src/A.kt", true),
-            ],
+            records.iter().map(|record| &record.signal),
             &intent(&[]),
             &[],
         );
@@ -1179,7 +1192,7 @@ mod tests {
     #[test]
     fn an_artifact_hint_anchors_only_the_spellings_that_read_as_a_path() {
         let anchors = collect_file_anchors(
-            &[],
+            [],
             &intent(&[
                 "file:search.ts",
                 "symbol:SearchResult",
@@ -1215,7 +1228,7 @@ mod tests {
             },
         };
 
-        let anchors = collect_file_anchors(&[], &intent(&[]), &[focus]);
+        let anchors = collect_file_anchors([], &intent(&[]), &[focus]);
 
         assert_eq!(anchors.len(), 1);
         assert_eq!(anchors[0].path, "app/src/MapScene.kt");
@@ -1316,11 +1329,7 @@ mod tests {
         let accepted = corpus.accept("the search result card renders its default value");
         corpus.reference(accepted, "Web", "src/search/result.ts");
 
-        let hits = corpus.hits(&collect_file_anchors(
-            &[],
-            &intent(&["file:result.ts"]),
-            &[],
-        ));
+        let hits = corpus.hits(&collect_file_anchors([], &intent(&["file:result.ts"]), &[]));
 
         assert_eq!(
             hits.iter()
@@ -1542,7 +1551,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let anchors = collect_file_anchors(
-            &signals,
+            signals.iter().map(|record| &record.signal),
             &intent(&["/private/tmp/x-ttk-map-view-refactor-plan.md"]),
             &[],
         );

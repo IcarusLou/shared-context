@@ -436,10 +436,34 @@ pub enum SemanticOutcome {
     Hits(Vec<SemanticHit>),
 }
 
+/// One published generation of corpus vectors, shared by every reader of the same channel.
+pub type DocumentVectorSnapshot = Arc<Vec<(RevisionId, Vec<f32>)>>;
+
 /// The query-time face of the channel, so retrieval never depends on how vectors are produced.
 pub trait SemanticChannel: Send + Sync {
     /// Ranks cached corpus revisions against one query text.
     fn similar_revisions(&self, query_text: &str) -> SemanticOutcome;
+
+    /// The cached document vectors this channel was published over.
+    ///
+    /// ADR-0007's second hop compares a seed Context against a candidate Context, so both sides are
+    /// corpus vectors the backfill already wrote and neither side is a query. That is why this
+    /// returns the snapshot rather than answering a question: the lane does the comparing, the
+    /// channel only owns the vectors, and nothing on this path can acquire a model call.
+    ///
+    /// `None` means the channel cannot serve the hop at all -- the model has not loaded yet, or the
+    /// implementation has no corpus snapshot. It is a different fact from `Some` of an empty
+    /// snapshot, which is a channel that is running over a corpus the backfill has not reached, and
+    /// only the first one is worth an omission line.
+    fn document_vectors(&self) -> Option<DocumentVectorSnapshot> {
+        None
+    }
+
+    /// Records what the second hop decided about each pair it judged.
+    ///
+    /// Best effort by contract: ADR-0007 pre-registered the record so the floor can be re-derived
+    /// from real traffic, and a diagnostic that can fail a retrieval is worse than no diagnostic.
+    fn record_hop2_admissions(&self, _samples: &[Hop2AdmissionSample]) {}
 }
 
 /// The generation of the rule `SearchEngine::embeddable_revisions` applies to build one corpus
@@ -680,6 +704,13 @@ pub trait EncodeSampleRecorder: Send + Sync {
     /// Records one observation. Failure is not reportable: a diagnostic that can fail a retrieval
     /// is worse than no diagnostic.
     fn record(&self, sample: EncodeSample);
+
+    /// Records one pass of the second hop's admission decisions, on the same terms.
+    ///
+    /// Defaulted to a no-op so a recorder that only watches encodes stays a recorder: the sink that
+    /// has somewhere to put these rows is [`SemanticVectorCache`], and every other implementation
+    /// would otherwise have to write the same empty body.
+    fn record_hop2_admissions(&self, _samples: &[Hop2AdmissionSample]) {}
 }
 
 /// What the recorded encodes add up to, for `sctx embedding status` and `sctx doctor`.
@@ -1344,6 +1375,10 @@ impl EncodeSampleRecorder for SemanticVectorCache {
             [i64::try_from(SEMANTIC_ENCODE_SAMPLE_HISTORY).unwrap_or(i64::MAX)],
         );
     }
+
+    fn record_hop2_admissions(&self, samples: &[Hop2AdmissionSample]) {
+        Self::record_hop2_admissions(self, samples);
+    }
 }
 
 /// Brings a cache written before `backfill_active` existed up to the current sample schema.
@@ -1663,6 +1698,16 @@ impl SemanticChannel for EmbeddingSemanticChannel {
         scored.truncate(self.limit);
         SemanticOutcome::Hits(scored)
     }
+
+    fn document_vectors(&self) -> Option<DocumentVectorSnapshot> {
+        Some(Arc::clone(&self.vectors))
+    }
+
+    fn record_hop2_admissions(&self, samples: &[Hop2AdmissionSample]) {
+        if let Some(recorder) = &self.recorder {
+            recorder.record_hop2_admissions(samples);
+        }
+    }
 }
 
 /// Loads the configured ONNX encoder, or explains why this build cannot.
@@ -1751,6 +1796,16 @@ impl SemanticChannel for SemanticChannelHandle {
         match self.channel() {
             Some(channel) => channel.similar_revisions(query_text),
             None => SemanticOutcome::Unavailable,
+        }
+    }
+
+    fn document_vectors(&self) -> Option<DocumentVectorSnapshot> {
+        self.channel()?.document_vectors()
+    }
+
+    fn record_hop2_admissions(&self, samples: &[Hop2AdmissionSample]) {
+        if let Some(channel) = self.channel() {
+            channel.record_hop2_admissions(samples);
         }
     }
 }

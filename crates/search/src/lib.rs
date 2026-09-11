@@ -1,6 +1,7 @@
 //! Structured FTS5 search, Task-to-Space association, and deterministic Context Packs.
 
 use std::{
+    cmp::Reverse,
     collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
     str::FromStr,
@@ -43,15 +44,19 @@ mod candidate;
 pub mod embedding;
 mod lanes;
 
+/// The two anchor facts a Lane A [`TaskRetrievalPath`] has to be able to name.
+pub use lanes::{AnchorMatchBasis, AnchorSource};
+
 pub use embedding::{
-    EmbeddingProvider, EmbeddingSemanticChannel, EncodeLatencySummary, EncodeSample,
-    EncodeSampleRecorder, Hop2AdmissionSample, QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS,
-    QueryVectorCache, RecordedHop2Admission, SEMANTIC_CHANNEL_LIMIT, SEMANTIC_CORPUS_VERSION,
-    SEMANTIC_ENCODE_BUDGET, SEMANTIC_ENCODE_SAMPLE_HISTORY,
-    SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS, SEMANTIC_HOP2_SAMPLE_HISTORY,
-    SEMANTIC_QUERY_CACHE_CAPACITY, SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SemanticCacheKey,
-    SemanticChannel, SemanticChannelHandle, SemanticHit, SemanticOutcome, SemanticVectorCache,
-    load_onnx_provider, model_fingerprint, semantic_cache_path,
+    DocumentVectorSnapshot, EmbeddingProvider, EmbeddingSemanticChannel, EncodeLatencySummary,
+    EncodeSample, EncodeSampleRecorder, Hop2AdmissionSample,
+    QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, QueryVectorCache, RecordedHop2Admission,
+    SEMANTIC_CHANNEL_LIMIT, SEMANTIC_CORPUS_VERSION, SEMANTIC_ENCODE_BUDGET,
+    SEMANTIC_ENCODE_SAMPLE_HISTORY, SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
+    SEMANTIC_HOP2_SAMPLE_HISTORY, SEMANTIC_QUERY_CACHE_CAPACITY,
+    SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SemanticCacheKey, SemanticChannel,
+    SemanticChannelHandle, SemanticHit, SemanticOutcome, SemanticVectorCache, load_onnx_provider,
+    model_fingerprint, semantic_cache_path,
 };
 
 pub use candidate::{
@@ -473,6 +478,19 @@ pub struct TaskContextRequest {
     pub task_id: TaskId,
     pub working_intent: WorkingIntentSnapshot,
     pub task_signals: Vec<TaskSignal>,
+    /// Every `workspace` and `diff` Signal this Session ever recorded, superseded ones included.
+    ///
+    /// It exists because ADR-0007's first lane reads a *footprint* rather than a retrieval state.
+    /// `task_signals` is the active window -- a bound on what the Agent is looking at now, capped
+    /// at sixteen slots -- and on the 17-hour Session of Step 0b that window held 16 files while
+    /// the history held 145. Reading only the window would shrink Lane A's input by a factor of
+    /// nine and call the result a measurement.
+    ///
+    /// Empty is a valid and ordinary value: a caller that has no history to offer gets Lane A over
+    /// the active window alone. The two are unioned by coordinate, never concatenated, so passing
+    /// both costs nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signal_history: Vec<TaskSignal>,
     pub resolved_focus: Option<ResolvedFocus>,
     pub token_budget: usize,
     pub max_spaces: usize,
@@ -492,6 +510,7 @@ impl TaskContextRequest {
             task_id,
             working_intent,
             task_signals,
+            signal_history: Vec::new(),
             resolved_focus: None,
             token_budget,
             max_spaces: DEFAULT_TASK_MAX_SPACES,
@@ -869,11 +888,49 @@ pub enum TaskRetrievalPath {
     },
     /// Reached because its accepted text embeds near the Working Intent, with no token in common
     /// required. This is the only path that can explain a cross-lingual or pure-synonym hit.
+    ///
+    /// Produced only by an explicit Pack read. ADR-0007 retired intent-text semantic matching from
+    /// automatic injection: the channel ranked well and admitted badly, and the two lanes below are
+    /// what replaced it there.
     SemanticSimilarity {
         /// Cosine similarity in basis points; always at or above
         /// [`SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`].
         similarity_basis_points: u16,
     },
+    /// Lane A (ADR-0007). The Session opened or rewrote a file, and this Context records an
+    /// Engineering Reference to that exact file. There is no fuzziness in it: the route is a join
+    /// of two facts, and `location` is the coordinate that justifies it.
+    FileAnchor {
+        /// `repository_id:path` of the Engineering Reference that matched.
+        location: String,
+        /// Which of the three anchor sources named the file. Spelled `anchor_source` because
+        /// `source` is this enum's own serde tag.
+        anchor_source: AnchorSource,
+        basis: AnchorMatchBasis,
+        /// How many distinct anchors reached this Context. `location` names the strongest.
+        anchor_count: usize,
+    },
+    /// Lane B (ADR-0007). A Context the Session already reached admitted this one on the cosine of
+    /// their two document vectors, both encoded through the corpus path. No query was encoded and
+    /// the hop is never taken twice.
+    SeedAssociation {
+        /// The seed Context whose document vector admitted this one.
+        seed_context_id: ContextId,
+        /// Cosine in basis points; always at or above the second-hop admission floor in force.
+        score_basis_points: u16,
+        /// Identifiers both Contexts spell out. Corroboration in the `why` line, never a ticket.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        shared_identifiers: Vec<String>,
+        /// Further seeds that also admitted it, beyond the one named here.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        also_admitted_by: usize,
+    },
+}
+
+/// `skip_serializing_if` for a count whose zero is the ordinary case.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// One budgeted Context explicitly linked to its Task-to-Space association and retrieval paths.
@@ -1227,6 +1284,12 @@ pub struct SearchEngine {
     /// every installation without a `[retrieval]` table, and in it nothing here is queried, no
     /// channel feature is produced, and no omission is reported.
     semantic: Option<Arc<dyn SemanticChannel>>,
+    /// The cosine Lane B's second hop admits a Context at, in basis points.
+    ///
+    /// ADR-0007 pre-registered this as a configuration key rather than a constant, because
+    /// [`SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS`] was derived from one adversarial fixture
+    /// cross-checked against one installation. An engine nobody configured uses that default.
+    hop2_admission_floor_basis_points: u16,
 }
 
 impl std::fmt::Debug for SearchEngine {
@@ -1238,6 +1301,10 @@ impl std::fmt::Debug for SearchEngine {
             .field("context_ttl", &self.context_ttl)
             .field("usage_prior", &self.usage_prior.is_some())
             .field("semantic", &self.semantic.is_some())
+            .field(
+                "hop2_admission_floor_basis_points",
+                &self.hop2_admission_floor_basis_points,
+            )
             .finish()
     }
 }
@@ -1255,6 +1322,7 @@ impl SearchEngine {
             },
             usage_prior: None,
             semantic: None,
+            hop2_admission_floor_basis_points: SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
         }
     }
 
@@ -1328,12 +1396,18 @@ impl SearchEngine {
 
     /// Asks the embedding channel about one request, or reports that there is no channel.
     ///
-    /// Explicit `context_search` is deliberately excluded. ADR-0004 scopes this work to automatic
-    /// injection, and an explicit search is paged and cursored: a channel that ranks by cosine
-    /// against a cache which the background backfill is still filling would make page 2 of a query
-    /// disagree with page 1 of the same query.
+    /// Paged `context_search` is deliberately excluded, and so, since ADR-0007, is automatic
+    /// injection.
+    ///
+    /// The paging reason has not changed: a channel that ranks by cosine against a cache the
+    /// background backfill is still filling would make page 2 of a query disagree with page 1. The
+    /// second exclusion is the new one and it is a measurement, not a preference -- ADR-0007 found
+    /// this path taking its top hit from an unrelated topic on every real Working Intent it was
+    /// given, because a query-side cosine is a ranking signal and automatic injection needs an
+    /// admission decision. What is left is the caller who asked: an explicit Pack read, where a
+    /// broad ranked list is the thing being requested.
     fn semantic_outcome(&self, request: &TaskContextRequest) -> Option<SemanticOutcome> {
-        if request.mode != ContextPackMode::AutomaticInjection {
+        if request.mode != ContextPackMode::Explicit {
             return None;
         }
         let channel = self.semantic.as_ref()?;
@@ -1348,6 +1422,19 @@ impl SearchEngine {
     #[must_use]
     pub fn with_semantic_channel(mut self, semantic: Arc<dyn SemanticChannel>) -> Self {
         self.semantic = Some(semantic);
+        self
+    }
+
+    /// Applies the operator's `[retrieval] hop2_admission_floor_basis_points`.
+    ///
+    /// `None` keeps [`SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS`], which is what every
+    /// installation that has not tuned one runs. The range is validated where the key is read, not
+    /// here: a value that reached this far has already been refused or accepted once.
+    #[must_use]
+    pub const fn with_hop2_admission_floor(mut self, floor_basis_points: Option<u16>) -> Self {
+        if let Some(floor_basis_points) = floor_basis_points {
+            self.hop2_admission_floor_basis_points = floor_basis_points;
+        }
         self
     }
 
@@ -1390,6 +1477,7 @@ impl SearchEngine {
             },
             usage_prior: None,
             semantic: None,
+            hop2_admission_floor_basis_points: SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
         }
     }
 
@@ -1613,6 +1701,12 @@ impl SearchEngine {
     ) -> Result<TaskContextPack> {
         validate_task_context_request(request)?;
         let fingerprint = task_fingerprint(&request.working_intent, &request.task_signals)?;
+        // ADR-0007: automatic injection is the two lanes and nothing else. It reads no Engineering
+        // Graph snapshot, selects no query tokens and encodes no query, so none of the work below
+        // -- the token selection, the Graph retry loop, the fusion inference -- is on its path.
+        if request.mode == ContextPackMode::AutomaticInjection {
+            return self.dual_lane_pack(request, detail_level, &fingerprint);
+        }
         let query_tokens = association_query_tokens(&request.working_intent, &request.task_signals);
         let query_phrases =
             association_query_phrases(&request.working_intent, &request.task_signals);
@@ -1662,6 +1756,101 @@ impl SearchEngine {
                 request.mode,
             )],
         )
+    }
+
+    /// The automatic injection Pack, assembled from Lane A and Lane B (ADR-0007).
+    ///
+    /// Four properties are worth stating because the Pack this replaced had none of them:
+    ///
+    /// * **No query is encoded.** Both lanes read facts -- a file the Session opened, a vector the
+    ///   backfill already wrote -- so an automatic injection costs no model call at all.
+    /// * **No Engineering Graph is read**, and therefore no generation race has to be retried. The
+    ///   Graph's contribution to automatic retrieval was the Artifact channel; Lane A reaches the
+    ///   same knowledge from the index side, through the Reference rows themselves.
+    /// * **The budget is a cap, never a target.** Items are placed in lane order until the budget
+    ///   is spent and the rest are reported. Nothing is re-admitted to fill a remainder, because an
+    ///   unspent budget is not a shortfall -- it is the honest size of the answer.
+    /// * **An empty Pack is a first-class answer**, reported as one line rather than as a failure.
+    fn dual_lane_pack(
+        &self,
+        request: &TaskContextRequest,
+        detail_level: ContextPackDetailLevel,
+        fingerprint: &str,
+    ) -> Result<TaskContextPack> {
+        // Read once, outside the projection transaction: the snapshot belongs to the channel, and
+        // borrowing it means an automatic retrieval never copies a corpus of vectors.
+        let published = self
+            .semantic
+            .as_ref()
+            .and_then(|channel| channel.document_vectors());
+        let vectors = published.as_ref().map(|snapshot| {
+            snapshot
+                .iter()
+                .map(|(revision_id, vector)| (*revision_id, vector.as_slice()))
+                .collect::<BTreeMap<_, _>>()
+        });
+        let unavailable = self.semantic.is_some() && vectors.is_none();
+        let snapshot = self.index.query_snapshot(|connection| {
+            let mut retrieval = retrieve_lanes(
+                connection,
+                request,
+                vectors.as_ref(),
+                self.hop2_admission_floor_basis_points,
+            )?;
+            if unavailable {
+                retrieval.omitted.push(embedding_unavailable_omission());
+            }
+            let loaded = load_lane_context_candidates(
+                connection,
+                &retrieval.hits,
+                detail_level,
+                &self.context_ttl,
+                self.usage_prior.as_deref(),
+            )?;
+            let mut associations =
+                lane_space_associations(request.task_id, &loaded.candidates, &retrieval.hits)?;
+            let mut omitted = std::mem::take(&mut retrieval.omitted);
+            let (loaded, dropped) = cap_lane_spaces(loaded, &mut associations, request.max_spaces);
+            omitted.extend(space_top_k_omissions(connection, &dropped)?);
+            Ok((
+                pack_lane_candidates(
+                    loaded,
+                    associations,
+                    &omitted,
+                    request.token_budget,
+                    detail_level,
+                ),
+                std::mem::take(&mut retrieval.samples),
+            ))
+        })?;
+        let (packed, samples) = snapshot.data;
+        // Outside the read, and unconditionally best effort: ADR-0007 pre-registered this record so
+        // the floor can be re-derived from real traffic, and a diagnostic that could fail a
+        // retrieval would be worse than no diagnostic.
+        if !samples.is_empty() {
+            if let Some(channel) = &self.semantic {
+                channel.record_hop2_admissions(&samples);
+            }
+        }
+        Ok(TaskContextPack {
+            indexed_tree_oid: snapshot.metadata.indexed_tree_oid,
+            projection_generation: snapshot.metadata.projection_generation,
+            artifact_generation: None,
+            graph_context_tree_oid: None,
+            task_id: request.task_id,
+            task_fingerprint: fingerprint.to_owned(),
+            token_budget: request.token_budget,
+            estimated_tokens: packed.estimated_tokens,
+            mode: request.mode,
+            detail_level,
+            associations: packed.associations,
+            compact_associations: packed.compact_associations,
+            items: packed.items,
+            compact_items: packed.compact_items,
+            graph_diagnostics: Vec::new(),
+            query_token_explanation: None,
+            omitted: packed.omitted,
+        })
     }
 
     /// One complete Pack build against one fixed view of the Engineering Graph.
@@ -6107,6 +6296,557 @@ fn load_task_context_candidates(
     })
 }
 
+// ---------------------------------------------------------------------------------------------
+// ADR-0007: the automatic Pack, assembled from the two lanes
+// ---------------------------------------------------------------------------------------------
+
+/// Association score a Lane A hit gives its Space, in basis points.
+///
+/// Full marks, and deliberately not a measurement. Lane A is a join of two facts -- the Session
+/// opened this file, this Context is about this file -- and a join is either true or absent. Giving
+/// it a graded score would invite the reader to compare two anchored Contexts on a number that
+/// means nothing, which is the habit ADR-0007 exists to end.
+const LANE_A_ASSOCIATION_SCORE_BASIS_POINTS: u16 = 10_000;
+
+/// Omission reason for a candidate the second hop could not judge.
+///
+/// It is not a Context that lost: it is a Context the corpus backfill has not reached, which is a
+/// property of this installation's cache rather than of the Context's relevance, and the Pack says
+/// so rather than silently shrinking.
+pub const VECTOR_NOT_BACKFILLED_REASON: &str = "vector_not_backfilled";
+
+/// Omission reason for an automatic Pack whose lanes found no route at all.
+///
+/// ADR-0007 makes the empty Pack a first-class outcome: a Session whose work is disjoint from every
+/// recorded Context gets nothing, and that is the correct answer rather than a degradation. The
+/// line exists so "nothing" and "something went wrong" never look the same.
+pub const NO_LANE_EVIDENCE_REASON: &str = "no_lane_evidence";
+
+/// Where one Context sits in the Pack, and what admitted it.
+///
+/// The order is the whole ranking: Lane A before Lane B, anchors by how many files reached them,
+/// admissions by the cosine that let them in. There is no fused score, no channel weight and no
+/// coverage multiplier, because the two lanes answer two different questions and neither answer is
+/// a position on the other's scale.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum LaneRank {
+    /// Lane A, most anchored first.
+    Anchored(Reverse<usize>),
+    /// Lane B, highest admitting score first.
+    Associated(Reverse<u16>),
+}
+
+/// One Context the lanes put in the Pack, before its payload is loaded.
+#[derive(Clone, Debug)]
+struct LaneHit {
+    context_id: ContextId,
+    revision_id: RevisionId,
+    space_id: SpaceId,
+    rank: LaneRank,
+    /// The association score this hit gives its Space, in basis points.
+    score_basis_points: u16,
+    path: TaskRetrievalPath,
+}
+
+/// Everything one pass of the two lanes produced.
+#[derive(Debug, Default)]
+struct LaneRetrieval {
+    /// Admitted Contexts in Pack order. At most one entry per Context.
+    hits: Vec<LaneHit>,
+    omitted: Vec<ContextPackOmitted>,
+    /// The second hop's decisions, for the caller to hand to the recorder outside this read.
+    samples: Vec<Hop2AdmissionSample>,
+}
+
+/// Runs both lanes against one projection snapshot.
+///
+/// The sequence is ADR-0007's, and each step feeds only the next one: anchors from the Session's
+/// whole footprint, the Contexts those anchors reach, one non-semantic hop off those Contexts to
+/// pick up the knowledge no file records, and then the second hop's admission over every seed the
+/// first three produced.
+///
+/// `vectors` is `None` when no embedding channel could answer -- an installation without
+/// `[retrieval]`, or one whose model has not finished loading. Lane A is unaffected by that: it
+/// compares no vectors and needs none, which is exactly why it is the lane that runs first.
+///
+/// Two Contexts that both lanes reach are kept once, with Lane A's evidence. That is not a
+/// tie-break, it is a statement about which fact is worth printing: a coordinate the Session
+/// actually opened beats a cosine every time.
+fn retrieve_lanes(
+    connection: &Connection,
+    request: &TaskContextRequest,
+    vectors: Option<&BTreeMap<RevisionId, &[f32]>>,
+    floor_basis_points: u16,
+) -> Result<LaneRetrieval> {
+    let focus = request.resolved_focus.as_slice();
+    // The full Signal history and the active window are one footprint, deduplicated by coordinate.
+    // A caller that passes only the window gets the window; the MCP server passes both because the
+    // 16-slot window is a bound on what the Agent is looking at now, never on where it has been.
+    let anchors = lanes::collect_file_anchors(
+        request
+            .signal_history
+            .iter()
+            .chain(request.task_signals.iter()),
+        &request.working_intent,
+        focus,
+    );
+    let anchored = lanes::lane_a_hits(connection, &anchors)?;
+    let mut seeds = anchored
+        .iter()
+        .map(lanes::LaneAHit::seed)
+        .collect::<Vec<_>>();
+    seeds.extend(
+        lanes::expand_seeds_once(connection, &seeds)?
+            .iter()
+            .map(lanes::ExpandedSeed::seed),
+    );
+
+    let mut retrieval = LaneRetrieval::default();
+    let mut placed = BTreeSet::new();
+    for hit in &anchored {
+        let strongest = hit
+            .anchors
+            .first()
+            .expect("a Lane A hit carries the anchor that produced it");
+        placed.insert(hit.context_id);
+        retrieval.hits.push(LaneHit {
+            context_id: hit.context_id,
+            revision_id: hit.revision_id,
+            space_id: hit.space_id,
+            rank: LaneRank::Anchored(Reverse(hit.anchors.len())),
+            score_basis_points: LANE_A_ASSOCIATION_SCORE_BASIS_POINTS,
+            // The location is the Engineering Reference's own coordinate, read from the index. A
+            // resolved Artifact Focus is read from a different projection and the two can disagree;
+            // when they do, this is the side that decided, so this is the side the Pack prints.
+            path: TaskRetrievalPath::FileAnchor {
+                location: strongest.location.clone(),
+                anchor_source: strongest.source,
+                basis: strongest.basis,
+                anchor_count: hit.anchors.len(),
+            },
+        });
+    }
+
+    let Some(vectors) = vectors else {
+        return Ok(finish_lane_retrieval(retrieval));
+    };
+    let admission = lanes::lane_b_hits(connection, &seeds, vectors, floor_basis_points)?;
+    retrieval.samples = admission.samples;
+    if admission.skipped_missing_vector > 0 {
+        retrieval.omitted.push(ContextPackOmitted {
+            reason: VECTOR_NOT_BACKFILLED_REASON.to_owned(),
+            count: admission.skipped_missing_vector,
+            ..ContextPackOmitted::default()
+        });
+    }
+    for hit in admission.hits {
+        if !placed.insert(hit.context_id) {
+            continue;
+        }
+        retrieval.hits.push(LaneHit {
+            context_id: hit.context_id,
+            revision_id: hit.revision_id,
+            space_id: hit.space_id,
+            rank: LaneRank::Associated(Reverse(hit.score_basis_points())),
+            score_basis_points: hit.score_basis_points(),
+            path: TaskRetrievalPath::SeedAssociation {
+                seed_context_id: hit.seed.seed_context_id,
+                score_basis_points: hit.seed.score_basis_points,
+                shared_identifiers: hit.seed.shared_identifiers,
+                also_admitted_by: hit.also_admitted_by.len(),
+            },
+        });
+    }
+    Ok(finish_lane_retrieval(retrieval))
+}
+
+/// Orders the two lanes' answers and says so when there is none.
+fn finish_lane_retrieval(mut retrieval: LaneRetrieval) -> LaneRetrieval {
+    retrieval
+        .hits
+        .sort_by_key(|hit| (hit.rank, hit.context_id, hit.revision_id));
+    if retrieval.hits.is_empty() {
+        retrieval.omitted.push(ContextPackOmitted {
+            reason: NO_LANE_EVIDENCE_REASON.to_owned(),
+            ..ContextPackOmitted::default()
+        });
+    }
+    retrieval
+}
+
+/// Loads the Pack payload of exactly the Contexts the lanes admitted.
+///
+/// Nothing here re-decides retrieval. The lanes said which Contexts are in the Pack; this reads
+/// what each one says, applies the safety rules automatic injection has always applied, and drops a
+/// Context that fails them -- an unresolved conflict, an expired Context, a revision that stopped
+/// being the accepted one between the lane read and this one.
+fn load_lane_context_candidates(
+    connection: &Connection,
+    hits: &[LaneHit],
+    detail_level: ContextPackDetailLevel,
+    context_ttl: &ContextTtlSettings,
+    usage_prior: Option<&dyn UsagePriorSource>,
+) -> Result<LoadedTaskContexts> {
+    if hits.is_empty() {
+        return Ok(LoadedTaskContexts {
+            candidates: Vec::new(),
+            omitted: Vec::new(),
+            space_headers: BTreeMap::new(),
+        });
+    }
+    let by_revision = hits
+        .iter()
+        .enumerate()
+        .map(|(rank, hit)| (hit.revision_id, (rank, hit)))
+        .collect::<BTreeMap<_, _>>();
+    let revisions = by_revision
+        .keys()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let space_ids = hits
+        .iter()
+        .map(|hit| hit.space_id.to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let space_headers = load_space_headers(connection, &space_ids)?;
+    let sql = format!(
+        "SELECT item.space_id, item.context_id, revision.revision_id,
+                COALESCE(space.title, ''), revision.kind, {status} AS result_status,
+                revision.statement, revision.rationale, revision.applicability_json,
+                revision.evidence_completeness, item.stale_reason,
+                item.accepted_at_unix_seconds
+         FROM context_revision AS revision
+         JOIN context_item AS item USING(context_id)
+         JOIN space_projection AS space ON space.space_id = item.space_id
+         WHERE revision.revision_id IN ({placeholders})
+           AND {SAFE_ACCEPTED_CONTEXT_PREDICATE}
+         ORDER BY item.context_id",
+        status = status_expression(),
+        placeholders = std::iter::repeat_n("?", revisions.len())
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(sql_error("prepare lane Context payload read"))?;
+    let mut rows = statement
+        .query(params_from_iter(revisions.iter()))
+        .map_err(sql_error("execute lane Context payload read"))?;
+    let mut candidates = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(sql_error("read lane Context payload row"))?
+    {
+        let revision_id: RevisionId = parse_id(
+            &row.get::<_, String>(2)
+                .map_err(sql_error("read lane Revision ID"))?,
+        )?;
+        let Some((rank, hit)) = by_revision.get(&revision_id) else {
+            continue;
+        };
+        if let Some(candidate) = lane_context_candidate(connection, row, *rank, hit, context_ttl)? {
+            candidates.push(candidate);
+        }
+    }
+    candidates.sort_by_key(|candidate| candidate.association_rank);
+    apply_usage_prior(&mut candidates, usage_prior);
+    if detail_level == ContextPackDetailLevel::Compact {
+        let relations = load_compact_relations(connection, &candidates)?;
+        let locations = load_compact_locations(connection, &candidates)?;
+        let empty_locations = CompactReferenceLocations::default();
+        for candidate in &mut candidates {
+            candidate.compact = Some(compact_task_context_item(
+                &candidate.item,
+                relations
+                    .get(&candidate.item.context.revision_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                locations
+                    .get(&candidate.item.context.revision_id)
+                    .unwrap_or(&empty_locations),
+            ));
+        }
+    }
+    Ok(LoadedTaskContexts {
+        candidates,
+        omitted: Vec::new(),
+        space_headers,
+    })
+}
+
+/// One lane hit's Pack item, or `None` when the safety rules refuse it.
+fn lane_context_candidate(
+    connection: &Connection,
+    row: &rusqlite::Row<'_>,
+    rank: usize,
+    hit: &LaneHit,
+    context_ttl: &ContextTtlSettings,
+) -> Result<Option<TaskContextCandidate>> {
+    let space_id: SpaceId = parse_id(
+        &row.get::<_, String>(0)
+            .map_err(sql_error("read lane Space ID"))?,
+    )?;
+    let context_id: ContextId = parse_id(
+        &row.get::<_, String>(1)
+            .map_err(sql_error("read lane Context ID"))?,
+    )?;
+    let kind = parse_kind(
+        &row.get::<_, String>(4)
+            .map_err(sql_error("read lane Context kind"))?,
+    )?;
+    let status = parse_status(
+        &row.get::<_, String>(5)
+            .map_err(sql_error("read lane Context status"))?,
+    )?;
+    let statement: String = row
+        .get(6)
+        .map_err(sql_error("read lane Context statement"))?;
+    let rationale = row
+        .get(7)
+        .map_err(sql_error("read lane Context rationale"))?;
+    let applicability = from_json(
+        &row.get::<_, String>(8)
+            .map_err(sql_error("read lane Context applicability"))?,
+    )?;
+    let evidence_completeness = row
+        .get::<_, i64>(9)
+        .map_err(sql_error("read lane Context Evidence completeness"))?;
+    let stale_reason = row
+        .get::<_, Option<String>>(10)
+        .map_err(sql_error("read lane Context stale reason"))?;
+    let accepted_at = row
+        .get::<_, Option<i64>>(11)
+        .map_err(sql_error("read lane Context publication time"))?;
+    let mut derived_state = ContextDerivedState {
+        // The predicate this row was read under already excludes a superseded Context, so the only
+        // way to carry a superseding identity here would be to assert one that is not there.
+        superseded_by: None,
+        stale_reason,
+        historical_reason: context_ttl.historical_reason(kind, accepted_at),
+        demotion_basis_points: None,
+    };
+    let evidence = load_evidence(connection, hit.revision_id)?;
+    let conflicts = load_conflicts(connection, context_id, hit.revision_id)?;
+    let demotion = item_demotion_basis_points(&conflicts, &derived_state);
+    derived_state.demotion_basis_points =
+        (usize::from(demotion) < BASIS_POINTS_SCALE).then_some(demotion);
+    // The same bar every automatic injection has had to clear. The lanes decide relevance; these
+    // rules decide safety, and no amount of relevance buys a way past them.
+    if status != ContextStatus::Accepted
+        || derived_state.blocks_automatic_injection()
+        || evidence.is_empty()
+        || !conflicts.is_empty()
+    {
+        return Ok(None);
+    }
+    Ok(Some(TaskContextCandidate {
+        association_rank: rank,
+        injection_score_basis_points: demoted_item_score(
+            hit.score_basis_points,
+            &conflicts,
+            &derived_state,
+        ),
+        direct_path_count: 1,
+        accepted_at: accepted_at.unwrap_or(-1),
+        item: TaskContextItem {
+            association_space_id: space_id,
+            context: ContextPackItem {
+                space_id,
+                context_id,
+                revision_id: hit.revision_id,
+                title: context_display_title(&statement),
+                space_title: row
+                    .get(3)
+                    .map_err(sql_error("read lane Context Space title"))?,
+                kind,
+                status,
+                statement,
+                rationale: Some(rationale),
+                applicability,
+                evidence,
+                conflicts,
+                derived_state,
+                auto_injection_eligible: true,
+                safety_source: ContextSafetySource::CurrentProjection,
+                match_reason: lane_match_reason(hit, evidence_completeness),
+                usage: ContextUsageCounts::default(),
+                detail: ContextPackDetail::Full,
+            },
+            retrieval_paths: vec![hit.path.clone()],
+        },
+        compact: None,
+    }))
+}
+
+/// What a lane hit can honestly say in a [`MatchReason`].
+///
+/// Almost nothing, and that is the point: neither lane matched a token, so there are no matched
+/// tokens, no matched fields, no BM25 and no coverage to report. Reporting a zero coverage as if it
+/// were a measured one is what the old pack did; here the emptiness *is* the statement, and the one
+/// number that means anything -- Lane B's cosine -- goes in the field that has always carried a
+/// similarity.
+fn lane_match_reason(hit: &LaneHit, evidence_completeness: i64) -> MatchReason {
+    MatchReason {
+        matched_fields: Vec::new(),
+        coverage_basis_points: 0,
+        matched_tokens: Vec::new(),
+        bm25: 0.0,
+        evidence_completeness: u16::try_from(evidence_completeness).unwrap_or(u16::MAX),
+        structured_filter_match: true,
+        matched_via_alias: Vec::new(),
+        similarity_basis_points: match &hit.path {
+            TaskRetrievalPath::SeedAssociation {
+                score_basis_points, ..
+            } => Some(*score_basis_points),
+            _ => None,
+        },
+    }
+}
+
+/// The Space list an automatic Pack reports, derived from the lanes rather than from a fusion.
+///
+/// A Space is in the list because a Context it owns is in the Pack, and its score is the best score
+/// any of those Contexts carried. There is no independent Space ranking any more: ranking Spaces
+/// and then taking their Contexts is exactly how a Space that won on vocabulary got to put forward
+/// whichever of its Contexts happened to share a phrase.
+fn lane_space_associations(
+    task_id: TaskId,
+    candidates: &[TaskContextCandidate],
+    hits: &[LaneHit],
+) -> Result<Vec<TaskSpaceAssociation>> {
+    let scores = hits
+        .iter()
+        .map(|hit| (hit.context_id, hit))
+        .collect::<BTreeMap<_, _>>();
+    let mut by_space = BTreeMap::<SpaceId, (u16, BTreeSet<ContextId>, usize, usize)>::new();
+    for candidate in candidates {
+        let context_id = candidate.item.context.context_id;
+        let Some(hit) = scores.get(&context_id) else {
+            continue;
+        };
+        let entry = by_space
+            .entry(candidate.item.association_space_id)
+            .or_insert((0, BTreeSet::new(), 0, 0));
+        entry.0 = entry.0.max(hit.score_basis_points);
+        entry.1.insert(context_id);
+        match hit.rank {
+            LaneRank::Anchored(_) => entry.2 += 1,
+            LaneRank::Associated(_) => entry.3 += 1,
+        }
+    }
+    let mut associations = by_space
+        .into_iter()
+        .map(
+            |(space_id, (score, contexts, anchored, associated))| TaskSpaceAssociation {
+                task_id,
+                space_id,
+                score: f64::from(score) / f64::from(BASIS_POINTS),
+                matched_intent_fields: Vec::new(),
+                matched_artifacts: Vec::new(),
+                matched_contexts: contexts.into_iter().collect(),
+                relation_paths: Vec::new(),
+                reasons: lane_association_reasons(anchored, associated),
+            },
+        )
+        .collect::<Vec<_>>();
+    associations.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.space_id.cmp(&right.space_id))
+    });
+    TaskSpaceAssociation::validate_collection(task_id, &associations)?;
+    Ok(associations)
+}
+
+/// Applies `max_spaces` to a Pack whose Spaces came from its items.
+///
+/// The items go with their Space. That is the one part of the old top-k that survives unchanged:
+/// a Pack that reported a Context under a Space it had already dropped would be claiming a
+/// provenance it is not prepared to explain.
+fn cap_lane_spaces(
+    mut loaded: LoadedTaskContexts,
+    associations: &mut Vec<TaskSpaceAssociation>,
+    max_spaces: usize,
+) -> (LoadedTaskContexts, Vec<TaskSpaceAssociation>) {
+    if associations.len() <= max_spaces {
+        return (loaded, Vec::new());
+    }
+    let dropped = associations.split_off(max_spaces);
+    let kept = associations
+        .iter()
+        .map(|association| association.space_id)
+        .collect::<BTreeSet<_>>();
+    loaded
+        .candidates
+        .retain(|candidate| kept.contains(&candidate.item.association_space_id));
+    (loaded, dropped)
+}
+
+/// Budgets a lane-assembled Pack into the shape the caller asked for.
+///
+/// It is the existing budgeter with two things removed and nothing added: there is no query-token
+/// explanation to fit in and there are no retrieval-gate omissions to carry, because neither
+/// mechanism exists on this path any more.
+fn pack_lane_candidates(
+    loaded: LoadedTaskContexts,
+    associations: Vec<TaskSpaceAssociation>,
+    omitted: &[ContextPackOmitted],
+    token_budget: usize,
+    detail_level: ContextPackDetailLevel,
+) -> PackedTaskContexts {
+    match detail_level {
+        ContextPackDetailLevel::Full => pack_full_task_context(
+            loaded.candidates,
+            associations,
+            Vec::new(),
+            omitted,
+            &[],
+            token_budget,
+            None,
+        ),
+        ContextPackDetailLevel::Compact => {
+            let compact = associations
+                .into_iter()
+                .map(|association| {
+                    let header = loaded
+                        .space_headers
+                        .get(&association.space_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    compact_association(association, &header)
+                })
+                .collect();
+            pack_compact_task_context(
+                loaded.candidates,
+                compact,
+                Vec::new(),
+                omitted,
+                &[],
+                token_budget,
+                None,
+            )
+        }
+    }
+}
+
+/// One sentence per lane that reached the Space, and nothing machine-readable.
+fn lane_association_reasons(anchored: usize, associated: usize) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if anchored > 0 {
+        reasons.push(format!(
+            "{anchored} Context(s) here are recorded against files this Session touched"
+        ));
+    }
+    if associated > 0 {
+        reasons.push(format!(
+            "{associated} Context(s) here were admitted by a Context this Session already reached"
+        ));
+    }
+    reasons
+}
+
 /// Names the Spaces `max_spaces` truncated, so an Agent can ask for one of them explicitly
 /// instead of only learning that a number of them existed.
 ///
@@ -6381,6 +7121,8 @@ const fn retrieval_channel_name(path: &TaskRetrievalPath) -> &'static str {
         TaskRetrievalPath::ResolvedFocusTextFallback { .. } => "resolved_focus_text_fallback",
         TaskRetrievalPath::ExactScope { .. } => "exact_scope",
         TaskRetrievalPath::SemanticSimilarity { .. } => "semantic_similarity",
+        TaskRetrievalPath::FileAnchor { .. } => "file_anchor",
+        TaskRetrievalPath::SeedAssociation { .. } => "seed_association",
     }
 }
 
@@ -6413,6 +7155,7 @@ fn truncate_chars(value: &str, maximum: usize) -> String {
 
 /// At most [`COMPACT_ITEM_REASON_LIMIT`] one-sentence reasons, ordered from the strongest
 /// retrieval path to the weakest, so a compact item stays explainable without its path payload.
+#[allow(clippy::too_many_lines)]
 fn compact_item_reasons(item: &TaskContextItem, sole_repository: Option<&str>) -> Vec<String> {
     let mut reasons = Vec::new();
     let mut relation_hops = 0;
@@ -6423,6 +7166,41 @@ fn compact_item_reasons(item: &TaskContextItem, sole_repository: Option<&str>) -
     let mut scopes = Vec::new();
     for path in &item.retrieval_paths {
         match path {
+            // The two lanes speak first and they speak plainly: a Pack built by ADR-0007's
+            // retrieval owes the Agent the coordinate or the seed that admitted each Context, and
+            // nothing else it says about itself is worth reading before that.
+            TaskRetrievalPath::FileAnchor {
+                location,
+                anchor_count,
+                ..
+            } => reasons.push(if *anchor_count > 1 {
+                format!("anchored: {location} (+{} more)", anchor_count - 1)
+            } else {
+                format!("anchored: {location}")
+            }),
+            TaskRetrievalPath::SeedAssociation {
+                seed_context_id,
+                score_basis_points,
+                shared_identifiers,
+                ..
+            } => {
+                let mut sentence = format!(
+                    "associated via {} at {score_basis_points}bp",
+                    short_identity(*seed_context_id)
+                );
+                if !shared_identifiers.is_empty() {
+                    sentence.push_str(", both naming ");
+                    sentence.push_str(
+                        &shared_identifiers
+                            .iter()
+                            .take(SHARED_IDENTIFIER_REASON_LIMIT)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                }
+                reasons.push(sentence);
+            }
             TaskRetrievalPath::EngineeringGraph { .. } => graph = true,
             TaskRetrievalPath::ContextRelation { hops } => {
                 relation_hops = relation_hops.max(hops.len());
@@ -6496,6 +7274,26 @@ fn compact_item_reasons(item: &TaskContextItem, sole_repository: Option<&str>) -
     reasons.truncate(COMPACT_ITEM_REASON_LIMIT);
     reasons
 }
+
+/// Shared identifiers named in one Lane B `why` sentence before the rest are dropped.
+///
+/// They corroborate an admission the cosine already made. Past a couple of them the sentence stops
+/// reading as corroboration and starts reading as a second, much weaker lexical channel.
+const SHARED_IDENTIFIER_REASON_LIMIT: usize = 3;
+
+/// The leading characters of an identity, for a sentence a person reads.
+///
+/// A `why` line that spelled a whole Context identity would spend more of a compact budget naming
+/// the seed than stating the fact, and the prefix is what an Agent pastes into `context_get`.
+fn short_identity(context_id: ContextId) -> String {
+    context_id
+        .to_string()
+        .chars()
+        .take(SHORT_IDENTITY_CHARS)
+        .collect()
+}
+
+const SHORT_IDENTITY_CHARS: usize = 8;
 
 /// One sentence for the usage prior, and only when the prior actually moved the score.
 ///
@@ -7317,25 +8115,10 @@ fn pack_compact_task_context(
             token_budget,
         );
         if let Some(budgeted) = budgeted {
-            let effective_base =
-                with_gate_omissions(base_omitted, gate_omitted, budgeted.carry_gate_omissions);
-            // The item share is a floor, not a ceiling: whatever the explanations left unspent
-            // goes back to the highest ranked Context the first pass could not afford.
-            if let Some((probe_items, probe_dropped)) = backfill(
-                &items,
-                &dropped,
-                &associations,
-                &graph_diagnostics,
-                &effective_base,
-                space_omitted,
-                diagnostic_omitted,
-                token_budget,
-                budgeted.explanation.as_ref(),
-            ) {
-                items = probe_items;
-                dropped = probe_dropped;
-                continue;
-            }
+            // The item share is a cap, never a target. ADR-0007 retired the pass that used to
+            // re-admit a dropped Context into whatever the explanations left unspent: a Pack that
+            // fills its budget because it has room is answering a question about the budget, not
+            // about the Task, and an unspent remainder is the honest size of the answer.
             return PackedTaskContexts {
                 estimated_tokens: budgeted.estimated_tokens,
                 associations: Vec::new(),
@@ -7377,47 +8160,8 @@ fn ranked_values(items: &[RankedItem]) -> Vec<CompactTaskContextItem> {
     items.iter().map(|(_, item)| item.clone()).collect()
 }
 
-/// Tries to re-admit the highest ranked dropped item into the unspent remainder of the budget.
 /// One item paired with the packing rank that keeps the emitted order stable.
 type RankedItem = (usize, CompactTaskContextItem);
-
-#[allow(clippy::too_many_arguments)]
-fn backfill(
-    items: &[RankedItem],
-    dropped: &[RankedItem],
-    associations: &[CompactSpaceAssociation],
-    graph_diagnostics: &[TaskGraphDiagnostic],
-    base_omitted: &[ContextPackOmitted],
-    space_omitted: OmissionAggregate,
-    diagnostic_omitted: OmissionAggregate,
-    token_budget: usize,
-    query_token_explanation: Option<&AutomaticQueryTokenExplanation>,
-) -> Option<(Vec<RankedItem>, Vec<RankedItem>)> {
-    let position = dropped
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, (rank, _))| *rank)
-        .map(|(position, _)| position)?;
-    let mut probe_items = items.to_vec();
-    probe_items.push(dropped[position].clone());
-    probe_items.sort_by_key(|(rank, _)| *rank);
-    let mut probe_dropped = dropped.to_vec();
-    probe_dropped.remove(position);
-    let probe_omitted = compact_budget_omissions(
-        base_omitted,
-        &ranked_values(&probe_dropped),
-        space_omitted,
-        diagnostic_omitted,
-    );
-    let probe_tokens = charged_task_context_tokens(
-        associations,
-        &ranked_values(&probe_items),
-        graph_diagnostics,
-        &probe_omitted,
-        query_token_explanation,
-    );
-    (probe_tokens <= token_budget).then_some((probe_items, probe_dropped))
-}
 
 /// True when `item` still fits beside the already packed items inside `budget`.
 fn fits(items: &[RankedItem], item: &CompactTaskContextItem, budget: usize) -> bool {
