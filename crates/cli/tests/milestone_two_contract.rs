@@ -38,7 +38,6 @@ struct MilestoneTwoFixture {
     index: ProjectionIndex,
     feature_spaces: [SpaceId; 4],
     feature_contexts: [ContextId; 4],
-    unsafe_spaces: [SpaceId; 4],
     unassigned_candidate_id: String,
 }
 
@@ -268,12 +267,6 @@ impl MilestoneTwoFixture {
                 compatibility_context,
                 analytics_context,
             ],
-            unsafe_spaces: [
-                candidate_space,
-                deprecated_space,
-                conflict_space,
-                incomplete_space,
-            ],
             unassigned_candidate_id,
         }
     }
@@ -481,7 +474,7 @@ fn add_accepted_context(
                     artifact_kind: sctx_domain::ArtifactKind::File,
                     relation: sctx_domain::ReferenceRelation::Implements,
                     locator: sctx_domain::ArtifactLocator::File {
-                        path: sctx_domain::RepoRelativePath::new(&m2_anchor(statement)).unwrap(),
+                        path: sctx_domain::RepoRelativePath::new(m2_anchor(statement)).unwrap(),
                     },
                     supports: "the M2 fixture anchors this Context to the file it names".to_owned(),
                     limitations: vec!["synthetic fixture".to_owned()],

@@ -321,8 +321,7 @@ fn seed_context(harness: &Harness, space_id: &str, statement: &str) -> (String, 
                     artifact_kind: sctx_domain::ArtifactKind::File,
                     relation: sctx_domain::ReferenceRelation::Implements,
                     locator: sctx_domain::ArtifactLocator::File {
-                        path: sctx_domain::RepoRelativePath::new(&anchored_path(statement))
-                            .unwrap(),
+                        path: sctx_domain::RepoRelativePath::new(anchored_path(statement)).unwrap(),
                     },
                     supports: "the CLI fixture anchors this Context to the output module"
                         .to_owned(),

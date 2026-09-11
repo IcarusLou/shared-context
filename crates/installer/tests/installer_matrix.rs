@@ -3380,13 +3380,21 @@ fn fixed_two_installation_team_sharing_and_local_reset_oracle() {
     )
     .unwrap();
     assert_eq!(focused.resolved_focus.repository_id, repository_id);
-    assert!(focused.context.items.iter().any(|item| {
-        item.context.context_id == context_id
-            && item
-                .retrieval_paths
-                .iter()
-                .any(|path| matches!(path, TaskRetrievalPath::EngineeringGraph { .. }))
-    }));
+    // Machine B reaches the Context Machine A wrote, by the file both installations record it
+    // against. It is a `file_anchor` rather than an `engineering_graph` path because ADR-0007's
+    // first lane joins the Focus coordinate against the Engineering Reference rows in the index --
+    // which is also why this works before Machine B has built a Graph of its own.
+    assert!(
+        focused.context.items.iter().any(|item| {
+            item.context.context_id == context_id
+                && item
+                    .retrieval_paths
+                    .iter()
+                    .all(|path| matches!(path, TaskRetrievalPath::FileAnchor { .. }))
+        }),
+        "{:#?}",
+        focused.context.items
+    );
 
     let preserved_paths = [
         machine_b.root.join("bin/current/sctx"),

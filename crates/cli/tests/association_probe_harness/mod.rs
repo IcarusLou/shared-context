@@ -12,7 +12,7 @@
 //! fixture file and its own thresholds.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -788,4 +788,142 @@ pub fn assert_every_automatic_pack_is_empty(outcomes: &[ProbeOutcome]) {
             outcome.id, outcome.query, outcome.intent_items
         );
     }
+}
+
+/// One lane probe: what the Session opened, and what the two lanes returned for it.
+///
+/// Deliberately not a [`ProbeOutcome`]. A probe outcome answers "did the top hit match", which is a
+/// ranking question; a lane outcome answers three admission questions instead -- how many Contexts
+/// each lane admitted, and whether any of them was one nobody asked for. ADR-0007 made those
+/// different measurements, and folding them back into one number is how the old ratchet came to
+/// report a channel that no longer exists.
+pub struct LaneOutcome {
+    pub id: String,
+    pub category: String,
+    pub touched: Vec<String>,
+    /// Contexts admitted by Lane A, by fixture index.
+    pub anchored: BTreeSet<u64>,
+    /// Contexts the seed expansion admitted off an anchored one.
+    pub expanded: BTreeSet<u64>,
+    /// Contexts Lane B's second hop admitted. Zero on an installation with no embedding channel,
+    /// which is what these suites run as.
+    pub associated: BTreeSet<u64>,
+    /// Admitted Contexts the probe did not ask for. The one count that must stay at zero.
+    pub noise: BTreeSet<u64>,
+}
+
+impl LaneOutcome {
+    /// Every Context the Pack returned, whichever lane put it there.
+    pub fn admitted(&self) -> BTreeSet<u64> {
+        self.anchored
+            .union(&self.expanded)
+            .chain(self.associated.iter())
+            .copied()
+            .collect()
+    }
+}
+
+/// Runs the fixture's `lane_probes` block: one `task_intent_update` per probe, with the probe's
+/// file footprint in `artifact_hints`.
+///
+/// `artifact_hints` is the anchor an MCP caller can write. A real Session anchors from its Workspace
+/// and Diff Signals too, and those reach Lane A by the same
+/// [`collect_file_anchors`](sctx_search) union; a Hook is simply more machinery than this
+/// measurement needs.
+pub fn run_lane_probes(harness: &mut Harness, fixture: &Value) -> Vec<LaneOutcome> {
+    let mut outcomes = Vec::new();
+    for probe in fixture["lane_probes"].as_array().unwrap() {
+        reset_context_usage(&harness.home);
+        let touched = probe["touched"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|path| path.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let expected = probe["expected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_u64().unwrap())
+            .collect::<BTreeSet<_>>();
+        let intent = mcp_tool(
+            &harness.home,
+            &harness.session,
+            "task_intent_update",
+            json!({
+                "task_boundary": "new",
+                "expected_revision_id": harness.intent_revision_id,
+                "intent": {
+                    "goal": probe["query"],
+                    "artifact_hints": touched,
+                },
+                "detail_level": "full"
+            }),
+        );
+        intent["intent_revision_id"]
+            .as_str()
+            .unwrap()
+            .clone_into(&mut harness.intent_revision_id);
+        let mut lane = LaneOutcome {
+            id: probe["id"].as_str().unwrap().to_owned(),
+            category: probe["category"].as_str().unwrap().to_owned(),
+            touched,
+            anchored: BTreeSet::new(),
+            expanded: BTreeSet::new(),
+            associated: BTreeSet::new(),
+            noise: BTreeSet::new(),
+        };
+        for item in intent["items"].as_array().unwrap() {
+            let Some(index) = top_index(harness, item["context"]["context_id"].as_str()) else {
+                continue;
+            };
+            for path in item["retrieval_paths"].as_array().unwrap() {
+                match path["source"].as_str() {
+                    Some("file_anchor") => lane.anchored.insert(index),
+                    Some("seed_expansion") => lane.expanded.insert(index),
+                    Some("seed_association") => lane.associated.insert(index),
+                    other => panic!(
+                        "probe {} reached a Context by a route outside the two lanes: {other:?}",
+                        lane.id
+                    ),
+                };
+            }
+            if !expected.contains(&index) {
+                lane.noise.insert(index);
+            }
+        }
+        outcomes.push(lane);
+    }
+    outcomes
+}
+
+/// Prints the per-probe lane table and returns `(anchored, expanded, associated, noise)` totals.
+pub fn emit_lane_table(outcomes: &[LaneOutcome]) -> (usize, usize, usize, usize) {
+    println!("\n--- lane probes: admissions by lane ---");
+    println!(
+        "{:<16} {:<16} {:>8} {:>9} {:>11} {:>6}  touched",
+        "probe", "category", "anchored", "expanded", "associated", "noise"
+    );
+    let mut totals = (0, 0, 0, 0);
+    for outcome in outcomes {
+        println!(
+            "{:<16} {:<16} {:>8} {:>9} {:>11} {:>6}  {}",
+            outcome.id,
+            outcome.category,
+            outcome.anchored.len(),
+            outcome.expanded.len(),
+            outcome.associated.len(),
+            outcome.noise.len(),
+            outcome.touched.join(", ")
+        );
+        totals.0 += outcome.anchored.len();
+        totals.1 += outcome.expanded.len();
+        totals.2 += outcome.associated.len();
+        totals.3 += outcome.noise.len();
+    }
+    println!(
+        "totals: anchored={} expanded={} associated={} noise={}",
+        totals.0, totals.1, totals.2, totals.3
+    );
+    totals
 }
