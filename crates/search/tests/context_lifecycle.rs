@@ -25,6 +25,17 @@ const FAR_FUTURE_UNIX_SECONDS: i64 = 4_000_000_000;
 
 const NEEDLE: &str = "lifecycleguardneedle";
 
+/// The one file every Context in this fixture is recorded against, and the Session opens it.
+///
+/// None of these tests is about retrieval: they are about what the derived lifecycle does to a
+/// Context that has already been retrieved -- superseded, in an unresolved conflict, stale, or past
+/// its configured lifetime. Under ADR-0007 a Context has to be anchored to be retrieved at all, so
+/// one shared file is the cheapest way to keep every test pointed at its own subject. It is
+/// deliberately one file and not one each: which Context is refused is decided by lifecycle, never
+/// by which file the Session happened to open.
+const LIFECYCLE_REPOSITORY: &str = "Server";
+const LIFECYCLE_FILE: &str = "src/lifecycle/Guard.rs";
+
 struct Fixture {
     _temporary: TempDir,
     store: GitStore,
@@ -131,6 +142,25 @@ impl Fixture {
         };
         let publication_id = publication.publication_id;
         append(&self.store, published);
+        append(
+            &self.store,
+            Event::engineering_reference_recorded(
+                context_id,
+                revision_id,
+                sctx_domain::EngineeringReferenceDraft {
+                    repository_id: LIFECYCLE_REPOSITORY.parse().unwrap(),
+                    artifact_kind: sctx_domain::ArtifactKind::File,
+                    relation: sctx_domain::ReferenceRelation::Implements,
+                    locator: sctx_domain::ArtifactLocator::File {
+                        path: sctx_domain::RepoRelativePath::new(LIFECYCLE_FILE).unwrap(),
+                    },
+                    supports: "the lifecycle fixture anchors every Context to one file".to_owned(),
+                    limitations: vec!["synthetic fixture".to_owned()],
+                },
+                None,
+            )
+            .unwrap(),
+        );
         (context_id, revision_id, publication_id)
     }
 
@@ -143,6 +173,10 @@ impl Fixture {
 fn pack(engine: &SearchEngine, mode: ContextPackMode) -> Vec<sctx_search::TaskContextItem> {
     let mut request = TaskContextRequest::automatic(TaskId::new(), task(), Vec::new(), 8_000);
     request.mode = mode;
+    request.signal_history = vec![sctx_domain::TaskSignal {
+        kind: sctx_domain::TaskSignalKind::Workspace,
+        content: format!("{LIFECYCLE_REPOSITORY}:{LIFECYCLE_FILE}"),
+    }];
     engine.task_context_pack(&request).unwrap().items
 }
 
@@ -372,6 +406,10 @@ fn recorded_stale_reason_demotes_an_item_and_explains_itself() {
 
     let mut request = TaskContextRequest::automatic(TaskId::new(), task(), Vec::new(), 8_000);
     request.mode = ContextPackMode::AutomaticInjection;
+    request.signal_history = vec![sctx_domain::TaskSignal {
+        kind: sctx_domain::TaskSignalKind::Workspace,
+        content: format!("{LIFECYCLE_REPOSITORY}:{LIFECYCLE_FILE}"),
+    }];
     let compact = engine
         .task_context_pack_with_detail(&request, ContextPackDetailLevel::Compact)
         .unwrap();
