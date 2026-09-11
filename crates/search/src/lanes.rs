@@ -1964,3 +1964,166 @@ mod tests {
         );
     }
 }
+
+/// The second hop, end to end, against the corpus its floor was calibrated on.
+///
+/// [`embedding_hop2_admission_calibration`](../../tests/embedding_hop2_admission_calibration.rs)
+/// measures the *distribution*: it encodes `fixtures/association/hard-negative-v1.json` and scores
+/// all 276 unordered pairs to say where a threshold could go. This module asserts that the code
+/// which actually decides admissions reproduces that reading through the real path -- Contexts
+/// accepted into a real projection, the corpus text read by `embeddable_revisions`, every Context
+/// taken as a seed in turn, and [`lane_b_hits`] doing the judging. The two together are the claim
+/// the floor rests on: the number is defensible *and* the implementation is the number.
+///
+/// It is a ratchet, not a target. The two constants below are what the calibration measured; a
+/// deliberate recalibration moves them in the same commit as the floor and says why.
+///
+/// `#[ignore]`d because it needs roughly 2.4 GB of weights this repository deliberately does not
+/// ship, and it takes the same two environment variables the calibration does:
+///
+/// ```text
+/// SCTX_PROBE_F2LLM_MODEL=~/.cache/huggingface/hub/models--codefuse-ai--F2LLM-v2-0.6B/snapshots/<sha> \
+/// SCTX_PROBE_EMBEDDING_RUNTIME=~/.shared-context/embedding/runtime/libonnxruntime.dylib \
+///   cargo test --release -p sctx-search --lib -- --ignored hop2_ratchet --nocapture
+/// ```
+#[cfg(all(test, feature = "embedding-onnx", unix))]
+mod hop2_ratchet {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use sctx_domain::RevisionId;
+    use serde_json::Value;
+
+    use super::test_support::Corpus;
+    use crate::{EmbeddingProvider, SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS, f2llm_snapshot};
+
+    const FIXTURE: &str = include_str!("../../../fixtures/association/hard-negative-v1.json");
+
+    /// Contexts the fixture holds. The two ratchets below are not comparable across a change to it.
+    const TOTAL_CONTEXTS: usize = 24;
+
+    /// Cross-repository, same-topic pairs the floor admits, as the calibration measured them.
+    ///
+    /// The same 13 that file asserts, reached from the other end: it counts unordered pairs above
+    /// the floor, this counts the pairs the lane actually produces when each Context is used as a
+    /// seed. They agree because a cosine is symmetric and one floor governs both directions, and
+    /// the day they stop agreeing is the day the lane stopped implementing the calibration.
+    const RETAINED_CROSS_REPO_SAME_TOPIC: usize = 13;
+
+    /// Where one fixture Context ended up in the projection, and what it is about.
+    struct Placed {
+        label: String,
+        repo: String,
+        topic: String,
+    }
+
+    #[test]
+    #[ignore = "needs a real F2LLM-v2-0.6B snapshot; see the module docs"]
+    fn no_seed_admits_a_context_from_another_topic() {
+        let fixture: Value = serde_json::from_str(FIXTURE).expect("the fixture is valid JSON");
+        let corpus = Corpus::new();
+        let mut placed = BTreeMap::<RevisionId, Placed>::new();
+        let mut seeds = Vec::new();
+        for context in fixture["contexts"]
+            .as_array()
+            .expect("the fixture holds a context array")
+        {
+            let field = |name: &str| {
+                context[name]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("a context carries {name}"))
+                    .to_owned()
+            };
+            let accepted = corpus.accept_document(&field("statement"), &field("rationale"));
+            placed.insert(
+                accepted.revision,
+                Placed {
+                    label: field("label"),
+                    repo: field("repo"),
+                    topic: field("topic"),
+                },
+            );
+            seeds.push((accepted.context, accepted.revision));
+        }
+        assert_eq!(placed.len(), TOTAL_CONTEXTS);
+
+        let provider = f2llm_snapshot::provider().as_ref();
+        let vectors = corpus
+            .embeddable()
+            .into_iter()
+            .map(|(revision_id, text)| {
+                (
+                    revision_id,
+                    provider
+                        .encode_bulk(&text)
+                        .expect("every corpus text encodes"),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            vectors.len(),
+            TOTAL_CONTEXTS,
+            "every accepted Context has to be embeddable, or the hop is measuring a smaller corpus"
+        );
+
+        let mut cross_topic = Vec::new();
+        let mut cross_repo_joins = BTreeSet::new();
+        let mut same_repo_joins = BTreeSet::new();
+        for seed in &seeds {
+            let admission = corpus.hop2(
+                std::slice::from_ref(seed),
+                &vectors,
+                SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
+            );
+            assert_eq!(
+                admission.skipped_missing_vector, 0,
+                "every candidate has a vector in this corpus"
+            );
+            assert_eq!(
+                admission.samples.len(),
+                TOTAL_CONTEXTS - 1,
+                "one seed judges every other Context exactly once"
+            );
+            let from = &placed[&seed.1];
+            for hit in &admission.hits {
+                let to = &placed[&hit.revision_id];
+                let pair = BTreeSet::from([from.label.clone(), to.label.clone()]);
+                if to.topic == from.topic {
+                    if to.repo == from.repo {
+                        same_repo_joins.insert(pair);
+                    } else {
+                        cross_repo_joins.insert(pair);
+                    }
+                } else {
+                    cross_topic.push((
+                        hit.score_basis_points(),
+                        from.label.clone(),
+                        to.label.clone(),
+                    ));
+                }
+            }
+        }
+
+        println!(
+            "\nfloor {SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS}: {} cross-repository joins, {} \
+             same-repository joins, {} cross-topic admissions",
+            cross_repo_joins.len(),
+            same_repo_joins.len(),
+            cross_topic.len()
+        );
+
+        // The constraint that does not bend. A Context admitted here is injected with no further
+        // test of relevance, so one cross-topic admission is one off-topic Context in front of an
+        // Agent working on something else.
+        assert!(
+            cross_topic.is_empty(),
+            "the second hop admitted {} cross-topic Contexts: {cross_topic:#?}",
+            cross_topic.len()
+        );
+        assert!(
+            cross_repo_joins.len() >= RETAINED_CROSS_REPO_SAME_TOPIC,
+            "the lane delivers {} cross-repository joins, below the \
+             {RETAINED_CROSS_REPO_SAME_TOPIC} the calibration measured over the same corpus",
+            cross_repo_joins.len()
+        );
+    }
+}

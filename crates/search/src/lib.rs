@@ -24,6 +24,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
+// So the in-crate second-hop ratchet can reach `tests/f2llm_snapshot`, the one place that knows how
+// to turn a Hugging Face snapshot into a loadable model directory. That helper is shared with the
+// integration tests and therefore spells its paths `sctx_search::`; a second copy of it living in
+// `src/` for the sake of one `crate::` would be exactly the divergence it exists to prevent.
+#[cfg(test)]
+extern crate self as sctx_search;
+
+/// The shared F2LLM snapshot loader, for [`lanes`]'s second-hop ratchet.
+///
+/// Declared at the crate root rather than beside its one user because `#[path]` on a module nested
+/// in `src/lanes.rs` resolves from `src/lanes/`, a directory this crate does not have.
+#[cfg(all(test, feature = "embedding-onnx", unix))]
+#[path = "../tests/f2llm_snapshot/mod.rs"]
+mod f2llm_snapshot;
+
 mod candidate;
 pub mod embedding;
 mod lanes;
