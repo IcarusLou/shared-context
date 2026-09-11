@@ -91,6 +91,41 @@ pub const GRAPH_GENERATION_UNSTABLE_REASON: &str = "graph_generation_unstable";
 /// with the facts it was supposed to explain.
 pub const MAX_UNRESOLVED_FOCUS_DIAGNOSTICS: usize = 3;
 
+/// Hard ceiling on what one automatic Pack may cost on the wire, in caliber-v2 tokens.
+///
+/// This is not a second budget. `token_budget` is a request -- the caller's statement of how much
+/// it wants to read -- and a caller may raise it to any number above
+/// [`MIN_TASK_CONTEXT_TOKEN_BUDGET`]. This is a property of the *host*: a Codex desktop exec cell
+/// truncates at a hard 10000 tokens, and it truncates from the middle, so the Pack that comes out
+/// the far side is not a shortened Pack but invalid JSON. Three of five Intent updates in one
+/// 17-hour Session arrived that way.
+///
+/// The value is 10000 less a 2000-token margin, and the margin is spent on three things this charge
+/// does not and cannot see:
+///
+/// * **The response around the Pack.** `task_intent_update` returns up to sixteen active Signals
+///   beside it, `task_artifact_focus` returns the resolved coordinate, and every response carries
+///   the retrieval paths and the Task identity.
+/// * **The frames around the response.** The JSON-RPC result object, the `content`/
+///   `structuredContent`/`isError` keys, and whatever the host prints around a tool call it wrapped
+///   in a script.
+/// * **The proxy's own error.** [`estimate_tokens`] charges four UTF-8 bytes per token. Identifier-
+///   dense JSON -- UUIDs, hex OIDs, file paths -- tokenizes below that, so on exactly the payload
+///   this Pack is made of the proxy reports fewer tokens than the host will count.
+///
+/// It coincides with the MCP server's default `token_budget`, which is not an accident and not a
+/// coupling: a caller that takes the default is bounded by its budget and never reaches this at
+/// all, and the ceiling exists for the caller that asked for more than a host cell can hold.
+pub const PACK_WIRE_TOKEN_CEILING: usize = 8_000;
+
+/// Omission reason for anything [`PACK_WIRE_TOKEN_CEILING`] took out of a Pack.
+///
+/// It is deliberately distinct from `item_token_budget`: that reason means the caller's budget was
+/// spent, and this one means the caller's budget could not have been honoured by any host. An
+/// operator reading a Pack full of these is being told to lower `token_budget`, not that their
+/// corpus grew.
+pub const WIRE_CEILING_REASON: &str = "wire_ceiling";
+
 /// Structured applicability filter. Each populated dimension is required; values within one
 /// dimension are alternatives.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -952,10 +987,28 @@ pub struct TaskContextPack {
     pub task_id: TaskId,
     pub task_fingerprint: String,
     pub token_budget: usize,
+    /// What this Pack costs its reader, in **caliber-v2** tokens: the payload as it is serialized,
+    /// charged twice, plus [`TASK_CONTEXT_ENVELOPE_TOKEN_RESERVE`].
+    ///
+    /// Twice, because that is how many copies of it travel. MCP requires the tool result to carry a
+    /// text representation equivalent to `structuredContent`, so both are emitted, and the text
+    /// copy is a JSON string in which every quote and backslash of the body costs a second byte.
+    /// Caliber v1 charged the body once and so reported a little under half of what the host was
+    /// asked to read; a Pack that said 8000 was handing a 10000-token host cell something over
+    /// 17000, and the cell truncated it from the middle into JSON that does not parse.
+    ///
+    /// The number therefore moved without the Pack moving. A v1 reading and a v2 reading of the
+    /// same payload are not comparable, and `token_budget` -- which this is measured against -- now
+    /// means wire tokens too, so the same budget carries roughly half the Contexts it used to and
+    /// all of them arrive.
     pub estimated_tokens: usize,
     pub mode: ContextPackMode,
     /// Payload shape this Pack was budgeted for. `items` and `compact_items` are never both
     /// populated; the budgeter charges exactly the representation named here.
+    ///
+    /// It is the shape that was **emitted**, which is not always the shape that was requested: the
+    /// first thing [`PACK_WIRE_TOKEN_CEILING`] takes from an oversized Pack is the explainable
+    /// shape, and the exchange is reported as a [`WIRE_CEILING_REASON`] omission.
     pub detail_level: ContextPackDetailLevel,
     pub associations: Vec<TaskSpaceAssociation>,
     /// Compact projection of the surviving associations. Empty under
@@ -1290,6 +1343,13 @@ pub struct SearchEngine {
     /// [`SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS`] was derived from one adversarial fixture
     /// cross-checked against one installation. An engine nobody configured uses that default.
     hop2_admission_floor_basis_points: u16,
+    /// The wire size one automatic Pack may not exceed, in caliber-v2 tokens.
+    ///
+    /// A property of the host this installation talks to, not of this corpus, which is why it is a
+    /// configuration key rather than only a constant: [`PACK_WIRE_TOKEN_CEILING`] is derived from
+    /// one measured host, and an operator whose host holds more (or less) needs a way to say so
+    /// that is not a release.
+    pack_wire_token_ceiling: usize,
 }
 
 impl std::fmt::Debug for SearchEngine {
@@ -1305,6 +1365,7 @@ impl std::fmt::Debug for SearchEngine {
                 "hop2_admission_floor_basis_points",
                 &self.hop2_admission_floor_basis_points,
             )
+            .field("pack_wire_token_ceiling", &self.pack_wire_token_ceiling)
             .finish()
     }
 }
@@ -1323,6 +1384,7 @@ impl SearchEngine {
             usage_prior: None,
             semantic: None,
             hop2_admission_floor_basis_points: SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
+            pack_wire_token_ceiling: PACK_WIRE_TOKEN_CEILING,
         }
     }
 
@@ -1418,6 +1480,18 @@ impl SearchEngine {
         self
     }
 
+    /// Applies the operator's `[retrieval] pack_wire_token_ceiling`.
+    ///
+    /// `None` keeps [`PACK_WIRE_TOKEN_CEILING`]. As with the admission floor, the range is
+    /// validated where the key is read; a value that reached this far was accepted once already.
+    #[must_use]
+    pub const fn with_pack_wire_token_ceiling(mut self, ceiling: Option<usize>) -> Self {
+        if let Some(ceiling) = ceiling {
+            self.pack_wire_token_ceiling = ceiling;
+        }
+        self
+    }
+
     /// Attaches the installation-local usage prior read from Task Runtime state.
     ///
     /// It only reweights an already fused Context Pack item; it never admits a Context the
@@ -1458,6 +1532,7 @@ impl SearchEngine {
             usage_prior: None,
             semantic: None,
             hop2_admission_floor_basis_points: SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
+            pack_wire_token_ceiling: PACK_WIRE_TOKEN_CEILING,
         }
     }
 
@@ -1748,6 +1823,11 @@ impl SearchEngine {
     ///   is spent and the rest are reported. Nothing is re-admitted to fill a remainder, because an
     ///   unspent budget is not a shortfall -- it is the honest size of the answer.
     /// * **An empty Pack is a first-class answer**, reported as one line rather than as a failure.
+    ///
+    /// A fifth property is the host's rather than the design's: whatever the caller's budget says,
+    /// the assembled Pack is held under [`PACK_WIRE_TOKEN_CEILING`] by
+    /// [`assemble_under_wire_ceiling`], which is why the emitted `detail_level` is the one that
+    /// survived rather than the one that was asked for.
     fn dual_lane_pack(
         &self,
         request: &TaskContextRequest,
@@ -1777,30 +1857,26 @@ impl SearchEngine {
             if unavailable {
                 retrieval.omitted.push(embedding_unavailable_omission());
             }
-            let loaded = load_lane_context_candidates(
-                connection,
-                &retrieval.hits,
-                detail_level,
-                &self.context_ttl,
-                self.usage_prior.as_deref(),
-            )?;
-            let mut associations =
-                lane_space_associations(request.task_id, &loaded.candidates, &retrieval.hits)?;
-            let mut omitted = std::mem::take(&mut retrieval.omitted);
-            let (loaded, dropped) = cap_lane_spaces(loaded, &mut associations, request.max_spaces);
-            omitted.extend(space_top_k_omissions(connection, &dropped)?);
+            let omitted = std::mem::take(&mut retrieval.omitted);
             Ok((
-                pack_lane_candidates(
-                    loaded,
-                    associations,
-                    &omitted,
-                    request.token_budget,
+                assemble_under_wire_ceiling(
+                    connection,
+                    request,
+                    &retrieval.hits,
                     detail_level,
-                ),
+                    &omitted,
+                    &self.context_ttl,
+                    self.usage_prior.as_deref(),
+                    self.pack_wire_token_ceiling,
+                )?,
                 std::mem::take(&mut retrieval.samples),
             ))
         })?;
-        let (packed, samples) = snapshot.data;
+        let (assembled, samples) = snapshot.data;
+        let WirePack {
+            packed,
+            detail_level,
+        } = assembled;
         // Outside the read, and unconditionally best effort: ADR-0007 pre-registered this record so
         // the floor can be re-derived from real traffic, and a diagnostic that could fail a
         // retrieval would be worse than no diagnostic.
@@ -4825,6 +4901,17 @@ const MINIMUM_ASSOCIATION_SCORE_BASIS_POINTS: u16 = 100;
 /// association is the point of the product, and a Space is dropped for being weakly matched, never
 /// for living somewhere else.
 const AUTOMATIC_RELEVANCE_FLOOR_BASIS_POINTS: u16 = 227;
+
+/// Fixed allowance for the Pack's own scalar header -- the two tree OIDs, the Task identity, the
+/// 64-character fingerprint, the budgets, the mode and the detail level -- which the charged tuple
+/// does not contain.
+///
+/// It stays charged once even though the wire carries the header twice like everything else. The
+/// header is about a hundred tokens; doubling it would buy a hundredth of a host cell and would
+/// take [`MIN_TASK_CONTEXT_TOKEN_BUDGET`] below the cost of the one line an empty Pack owes its
+/// reader. The second copy of a constant is absorbed by [`PACK_WIRE_TOKEN_CEILING`]'s margin, which
+/// is where a fixed overhead belongs; what had to become honest is the part that scales with the
+/// Pack, and that is [`serialized_tokens`].
 const TASK_CONTEXT_ENVELOPE_TOKEN_RESERVE: usize = 128;
 
 #[allow(clippy::too_many_lines)]
@@ -5717,7 +5804,7 @@ fn association_reasons(
     reasons
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct TaskContextCandidate {
     association_rank: usize,
     /// The matched Space's fused RRF score after every per-item demotion (unresolved semantic
@@ -5734,7 +5821,7 @@ struct TaskContextCandidate {
     compact: Option<CompactTaskContextItem>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct LoadedTaskContexts {
     candidates: Vec<TaskContextCandidate>,
     omitted: Vec<ContextPackOmitted>,
@@ -6669,6 +6756,298 @@ fn pack_lane_candidates(
                 None,
             )
         }
+    }
+}
+
+/// One assembled Pack and the detail level it is actually in.
+///
+/// The two can differ: a Pack asked for in the explainable shape and handed back compact is the
+/// first thing the wire ceiling takes, and `detail_level` has to be the emitted shape or every
+/// reader of it -- the budgeter's own recomputation included -- would be charging the wrong half of
+/// the payload.
+#[derive(Debug)]
+struct WirePack {
+    packed: PackedTaskContexts,
+    detail_level: ContextPackDetailLevel,
+}
+
+/// One rung of the wire degradation chain.
+///
+/// Each rung retrieves nothing and decides nothing. The lanes already said which Contexts are in
+/// the Pack and in what order; a rung only says how much of each one is printed, and the last rung
+/// says how many of them are printed at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WireTier {
+    /// Everything the lanes produced, in the shape that was asked for.
+    Whole,
+    /// Evidence summaries squeezed to [`COMPACT_SQUEEZED_EVIDENCE_SUMMARY_MAX_CHARS`].
+    SqueezedEvidence,
+    /// Evidence and Relations dropped: the item is its statement, its conditions and its identity.
+    StatementOnly,
+    /// [`WireTier::StatementOnly`], keeping only the first `usize` items of the lane order.
+    Truncated(usize),
+}
+
+/// Assembles one lane retrieval into a Pack no larger than `ceiling` caliber-v2 wire tokens.
+///
+/// The chain gives up, in order, the things whose loss costs the reader least:
+///
+/// 1. the explainable shape, for the compact one (only when the caller asked for the explainable
+///    one -- a compact Pack starts here);
+/// 2. the length of every Evidence summary;
+/// 3. Evidence and Relations entirely, leaving each item its statement;
+/// 4. whole items, from the tail of the lane order -- which is Lane A first, then the seed
+///    expansion, then Lane B by descending admission score, so the item given up is always the
+///    weakest evidence the Pack holds;
+/// 5. the list of what was given up, collapsed into one line.
+///
+/// Every rung produces a complete Pack that is serialized in full, so there is no state in which a
+/// caller receives a half-written object. That is the whole point: the failure this exists to
+/// prevent is not an oversized Pack, it is a host truncating one from the middle and handing the
+/// model JSON that does not parse.
+#[allow(clippy::too_many_arguments)]
+fn assemble_under_wire_ceiling(
+    connection: &Connection,
+    request: &TaskContextRequest,
+    hits: &[LaneHit],
+    requested: ContextPackDetailLevel,
+    base_omitted: &[ContextPackOmitted],
+    context_ttl: &ContextTtlSettings,
+    usage_prior: Option<&dyn UsagePriorSource>,
+    ceiling: usize,
+) -> Result<WirePack> {
+    let mut level = requested;
+    let mut loaded =
+        load_lane_context_candidates(connection, hits, level, context_ttl, usage_prior)?;
+    let mut omitted = base_omitted.to_vec();
+    let mut packed = pack_lane_tier(
+        connection,
+        request,
+        hits,
+        &loaded,
+        level,
+        &omitted,
+        WireTier::Whole,
+    )?;
+    if packed.estimated_tokens <= ceiling {
+        return Ok(WirePack {
+            packed,
+            detail_level: level,
+        });
+    }
+
+    if level == ContextPackDetailLevel::Full {
+        let explainable = loaded
+            .candidates
+            .iter()
+            .map(|candidate| serialized_tokens(&candidate.item))
+            .sum::<usize>();
+        level = ContextPackDetailLevel::Compact;
+        loaded = load_lane_context_candidates(connection, hits, level, context_ttl, usage_prior)?;
+        let compacted = loaded
+            .candidates
+            .iter()
+            .filter_map(|candidate| candidate.compact.as_ref())
+            .map(serialized_tokens)
+            .sum::<usize>();
+        omitted.push(ContextPackOmitted {
+            reason: WIRE_CEILING_REASON.to_owned(),
+            estimated_tokens: explainable.saturating_sub(compacted),
+            count: loaded.candidates.len(),
+            ..ContextPackOmitted::default()
+        });
+        packed = pack_lane_tier(
+            connection,
+            request,
+            hits,
+            &loaded,
+            level,
+            &omitted,
+            WireTier::Whole,
+        )?;
+        if packed.estimated_tokens <= ceiling {
+            return Ok(WirePack {
+                packed,
+                detail_level: level,
+            });
+        }
+    }
+
+    for tier in [WireTier::SqueezedEvidence, WireTier::StatementOnly] {
+        packed = pack_lane_tier(connection, request, hits, &loaded, level, &omitted, tier)?;
+        if packed.estimated_tokens <= ceiling {
+            return Ok(WirePack {
+                packed,
+                detail_level: level,
+            });
+        }
+    }
+
+    // Walking down one item at a time from the whole list would re-pack the Pack once per item, so
+    // the walk starts at the longest prefix whose stripped items could possibly fit and descends
+    // from there. The prefix is an upper bound, never an answer: the loop below is what decides.
+    let mut keep = affordable_prefix(&loaded, ceiling);
+    loop {
+        packed = pack_lane_tier(
+            connection,
+            request,
+            hits,
+            &loaded,
+            level,
+            &omitted,
+            WireTier::Truncated(keep),
+        )?;
+        if packed.estimated_tokens <= ceiling {
+            return Ok(WirePack {
+                packed,
+                detail_level: level,
+            });
+        }
+        if keep == 0 {
+            break;
+        }
+        keep -= 1;
+    }
+
+    // The Pack is empty and the notices alone are over the ceiling. There is nothing left to give
+    // up but the notices, so they collapse into the single line that says how much was dropped --
+    // the same last resort the token budget takes, for the same reason.
+    Ok(WirePack {
+        packed: exhausted_task_context(&packed.omitted, None, ceiling),
+        detail_level: level,
+    })
+}
+
+/// The longest prefix of the lane order whose stripped items could fit under `ceiling`.
+fn affordable_prefix(loaded: &LoadedTaskContexts, ceiling: usize) -> usize {
+    let mut spent = TASK_CONTEXT_ENVELOPE_TOKEN_RESERVE;
+    let mut keep = 0;
+    for candidate in &loaded.candidates {
+        let mut stripped = candidate.clone();
+        strip_candidate(&mut stripped);
+        let cost = match stripped.compact.as_ref() {
+            Some(compact) => serialized_tokens(compact),
+            None => serialized_tokens(&stripped.item),
+        };
+        spent = spent.saturating_add(cost);
+        if spent > ceiling {
+            break;
+        }
+        keep += 1;
+    }
+    keep
+}
+
+/// Re-packs one already loaded lane retrieval at one rung of the chain.
+#[allow(clippy::too_many_arguments)]
+fn pack_lane_tier(
+    connection: &Connection,
+    request: &TaskContextRequest,
+    hits: &[LaneHit],
+    loaded: &LoadedTaskContexts,
+    detail_level: ContextPackDetailLevel,
+    base_omitted: &[ContextPackOmitted],
+    tier: WireTier,
+) -> Result<PackedTaskContexts> {
+    let mut working = loaded.clone();
+    let mut omitted = base_omitted.to_vec();
+    // Items go first, because the Space list is derived from the items that survive: a Space whose
+    // every Context was dropped is not a Space this Pack is in a position to claim it reached.
+    if let WireTier::Truncated(keep) = tier
+        && keep < working.candidates.len()
+    {
+        let dropped = working.candidates.split_off(keep);
+        omitted.extend(wire_ceiling_item_omissions(&dropped));
+    }
+    let mut degraded = OmissionAggregate::default();
+    for candidate in &mut working.candidates {
+        let before = candidate.compact.as_ref().map(serialized_tokens);
+        match tier {
+            WireTier::Whole => {}
+            WireTier::SqueezedEvidence => squeeze_candidate(candidate),
+            WireTier::StatementOnly | WireTier::Truncated(_) => strip_candidate(candidate),
+        }
+        if let (Some(before), Some(after)) =
+            (before, candidate.compact.as_ref().map(serialized_tokens))
+            && before > after
+        {
+            degraded.add(before - after);
+        }
+    }
+    if degraded.count > 0 {
+        omitted.push(ContextPackOmitted {
+            reason: WIRE_CEILING_REASON.to_owned(),
+            estimated_tokens: degraded.estimated_tokens,
+            count: degraded.count,
+            ..ContextPackOmitted::default()
+        });
+    }
+    let mut associations = lane_space_associations(request.task_id, &working.candidates, hits)?;
+    let (working, dropped) = cap_lane_spaces(working, &mut associations, request.max_spaces);
+    omitted.extend(space_top_k_omissions(connection, &dropped)?);
+    Ok(pack_lane_candidates(
+        working,
+        associations,
+        &omitted,
+        request.token_budget,
+        detail_level,
+    ))
+}
+
+/// Names the first [`COMPACT_NAMED_OMISSION_LIMIT`] items the ceiling dropped and collapses the
+/// rest, on the same terms the token budget names its own -- a dropped Context is one `context_get`
+/// away whichever limit dropped it.
+fn wire_ceiling_item_omissions(dropped: &[TaskContextCandidate]) -> Vec<ContextPackOmitted> {
+    let charge = |candidate: &TaskContextCandidate| match candidate.compact.as_ref() {
+        Some(compact) => serialized_tokens(compact),
+        None => serialized_tokens(&candidate.item),
+    };
+    let mut omitted = dropped
+        .iter()
+        .take(COMPACT_NAMED_OMISSION_LIMIT)
+        .map(|candidate| ContextPackOmitted {
+            context_id: Some(candidate.item.context.context_id),
+            title: Some(elide(
+                &candidate.item.context.title,
+                COMPACT_OMITTED_TITLE_MAX_CHARS,
+            )),
+            space_id: Some(candidate.item.association_space_id),
+            reason: WIRE_CEILING_REASON.to_owned(),
+            estimated_tokens: charge(candidate),
+            count: 1,
+            ..ContextPackOmitted::default()
+        })
+        .collect::<Vec<_>>();
+    let collapsed = &dropped[dropped.len().min(COMPACT_NAMED_OMISSION_LIMIT)..];
+    if !collapsed.is_empty() {
+        omitted.push(ContextPackOmitted {
+            reason: WIRE_CEILING_REASON.to_owned(),
+            estimated_tokens: collapsed.iter().map(charge).sum(),
+            count: collapsed.len(),
+            ..ContextPackOmitted::default()
+        });
+    }
+    omitted
+}
+
+/// Squeezes one candidate's Evidence summaries, the cheapest thing a compact item can give up.
+fn squeeze_candidate(candidate: &mut TaskContextCandidate) {
+    if let Some(compact) = candidate.compact.as_mut() {
+        squeeze_compact_item_in_place(compact);
+    }
+}
+
+/// Strips one candidate to the statement it exists to carry.
+///
+/// Evidence and Relations go, because on a real-shape corpus they are most of a compact item's
+/// bytes. Conditions, conflicts and derived state stay: a statement printed without the conditions
+/// that bound it is a different statement, and a compact payload that hid an unresolved conflict
+/// would be less safe than the full one. The ceiling is a budget problem; it is never a licence to
+/// make the Pack less honest than the corpus it reports.
+fn strip_candidate(candidate: &mut TaskContextCandidate) {
+    if let Some(compact) = candidate.compact.as_mut() {
+        compact.evidence.clear();
+        compact.relations.clear();
     }
 }
 
@@ -8005,13 +8384,18 @@ fn fits(items: &[RankedItem], item: &CompactTaskContextItem, budget: usize) -> b
 
 /// Squeezes one oversized item to its shortest still-useful form.
 fn squeeze_compact_item(mut item: CompactTaskContextItem) -> CompactTaskContextItem {
+    squeeze_compact_item_in_place(&mut item);
+    item
+}
+
+/// The same squeeze, for the wire chain, which degrades a whole loaded list in place.
+fn squeeze_compact_item_in_place(item: &mut CompactTaskContextItem) {
     for evidence in &mut item.evidence {
         evidence.summary = elide(
             &evidence.summary,
             COMPACT_SQUEEZED_EVIDENCE_SUMMARY_MAX_CHARS,
         );
     }
-    item
 }
 
 /// Truncates one text to `max_chars` characters, marking the elision.
@@ -8325,7 +8709,8 @@ fn charged_task_context_tokens<A: Serialize, T: Serialize>(
     )))
 }
 
-/// Recomputes the charged Association, item/path, omission, and deterministic envelope reserve.
+/// Recomputes the charged Association, item/path, omission, and deterministic envelope reserve at
+/// the caliber [`TaskContextPack::estimated_tokens`] is reported in -- v2, both wire copies.
 #[must_use]
 pub fn estimate_task_context_payload_tokens(pack: &TaskContextPack) -> usize {
     match pack.detail_level {
@@ -9214,8 +9599,44 @@ fn explain_match(input: &ExplainMatchInput<'_>) -> MatchReason {
     }
 }
 
+/// Charges one Pack fragment at the shape it actually reaches the host in -- **caliber v2**.
+///
+/// The old caliber charged the compact JSON body once. The wire carries it twice: MCP requires a
+/// `content[0].text` representation equivalent to `structuredContent`, so `tool_success` emits
+/// both, and the text copy is a JSON *string*, in which every quote and backslash of the body
+/// costs a second byte. A Pack that reported 8000 tokens was therefore asking its reader for
+/// something over 17000, which is how a 10000-token host cell came to truncate an automatic
+/// injection in the middle of a JSON object.
 fn serialized_tokens(value: &impl Serialize) -> usize {
-    estimate_tokens(&serde_json::to_string(value).unwrap_or_default())
+    wire_tokens(&serde_json::to_string(value).unwrap_or_default())
+}
+
+/// The two copies of one serialized body, charged with the same proxy.
+fn wire_tokens(body: &str) -> usize {
+    estimate_tokens(body).saturating_add(estimate_escaped_tokens(body))
+}
+
+/// The proxy over the same text after it is escaped into a JSON string literal.
+///
+/// Only the escaping differs from [`estimate_tokens`]: a quote or a backslash becomes two bytes, a
+/// newline, tab or carriage return becomes its two-byte escape, any other control character becomes
+/// a six-byte `\u00xx`, and a non-ASCII character is emitted verbatim -- `serde_json` does not
+/// escape it -- so Han is charged exactly as it is in the unescaped copy.
+fn estimate_escaped_tokens(text: &str) -> usize {
+    let mut han_characters: usize = 0;
+    let mut other_bytes: usize = 0;
+    for character in text.chars() {
+        if is_han(character) {
+            han_characters += 1;
+            continue;
+        }
+        other_bytes += match character {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            control if (control as u32) < 0x20 => 6,
+            other => other.len_utf8(),
+        };
+    }
+    han_characters.saturating_mul(2).div_ceil(3) + other_bytes.div_ceil(4)
 }
 
 /// Approximates the token cost of one serialized Pack fragment.
