@@ -56,3 +56,11 @@
 ## 顺序与依赖
 
 S2-1 → S2-2 → S2-3 可流水(2 依赖 1 的种子形态,3 依赖 1+2);S2-4 依赖 1–3;S2-5 可与 S2-4 并行开发、合并时串接。每包独立提交,S2-4 的拆除与装配在同一包内完成(避免双栈中间态过夜)。
+
+## S2-1/S2-2 实施注记(review 定案,S2-3/S2-4 必读)
+
+- 落点 `crates/search/src/lanes.rs`(私有模块,S2-4 接线前 allow(dead_code));过滤统一走 `SAFE_ACCEPTED_CONTEXT_PREDICATE`(它同时覆盖 stale revision 与 superseded Context 两种旧引用形态,实测装置的 6 行旧引用全部属于后者)。
+- **17h 会话(01a08baf)在径 A+B 下确定为空包,这是设计事实而非缺陷**:145 个全历史触碰文件与 56 个锚定坐标零交集(连 basename 都不重叠),artifact_hints 是 /private/tmp 的 .md(非代码路径),无 focus 调用——种子为零,S2-2/S2-3 无从展开。按噪声公理,空包正确;S2-4 的空包渲染按此语义书写。
+- superseded signal 纳入是"足迹修真"(输入面积 16→145),在三个探针会话上不改变召回条数——不得把它表述为召回提升。
+- 仓限定锚点只做精确路径匹配(不做 basename 放宽);basename 仅用于无仓 artifact_hints 且带 `AnchorMatchBasis::Basename` 标记,S2-4 装配端可按噪声表现降级。
+- `task_artifact_focus` 读的是 engineering.sqlite(resolved_reference/graph_context_snapshot),与径 A 反查(index)是两个投影:S2-1 取 focus 的 resolved (repo,path) 回到 index 侧反查,两侧可能不一致——S2-4 遇到不一致时以 index 侧为准并在 why 里如实呈现。
