@@ -17,8 +17,8 @@ use sctx_search::{
     ContextPackDetailLevel, ContextPackMode, ContextStatus, IntentConflictActor,
     IntentConflictDecision, IntentConflictHandoffExplanation, IntentConflictKind,
     IntentConflictSelection, IntentConflictValidation, IntentScopeConflictExplanation,
-    IntentScopeConflictKind, IntentScopeConflictPolicy, SearchEngine, SpaceAssociationRole,
-    SpaceIntentField, TaskAssociationChannel, TaskAssociationFusionExplanation, TaskContextRequest,
+    IntentScopeConflictKind, IntentScopeConflictPolicy, SearchEngine, SpaceIntentField,
+    TaskAssociationChannel, TaskAssociationFusionExplanation, TaskContextRequest,
     TaskRetrievalPath, estimate_task_context_payload_tokens,
 };
 use tempfile::TempDir;
@@ -28,7 +28,6 @@ struct AssociationFixture {
     index: ProjectionIndex,
     feature_spaces: [SpaceId; 4],
     feature_contexts: [ContextId; 3],
-    pack_contexts: [ContextId; 4],
     unsafe_pack_spaces: [SpaceId; 4],
 }
 
@@ -36,7 +35,6 @@ struct PolarityFixture {
     _temporary: TempDir,
     index: ProjectionIndex,
     space_id: SpaceId,
-    context_id: ContextId,
 }
 
 struct IntentHandoffFixture {
@@ -44,7 +42,6 @@ struct IntentHandoffFixture {
     store: GitStore,
     index: ProjectionIndex,
     space_id: SpaceId,
-    context_id: ContextId,
     conflicted_head_ids: [RevisionId; 2],
 }
 
@@ -203,7 +200,7 @@ fn polarity_fixture() -> PolarityFixture {
         _ => unreachable!(),
     };
     append(&store, event);
-    let (context_id, _, _) = add_accepted_context(
+    let (_context_id, _, _) = add_accepted_context(
         &store,
         space_id,
         "SearchRankingEngine keeps the ranking order stable",
@@ -215,7 +212,6 @@ fn polarity_fixture() -> PolarityFixture {
         _temporary: temporary,
         index,
         space_id,
-        context_id,
     }
 }
 
@@ -275,7 +271,7 @@ fn intent_handoff_fixture() -> IntentHandoffFixture {
         _ => unreachable!(),
     };
     append(&store, right);
-    let (context_id, _, _) = add_accepted_context(
+    let (_context_id, _, _) = add_accepted_context(
         &store,
         space_id,
         "contextonlyhandoffneedle Context remains safe but requires Agent validation",
@@ -288,9 +284,42 @@ fn intent_handoff_fixture() -> IntentHandoffFixture {
         store,
         index,
         space_id,
-        context_id,
         conflicted_head_ids: [left_id, right_id],
     }
+}
+
+/// The Repository every fixture Context is recorded against, and the files that record them.
+///
+/// ADR-0007's first lane is a join of two facts -- the Session opened this file, some Context is
+/// recorded against this file -- so a fixture that wants a non-empty automatic Pack has to supply
+/// both halves. These constants are the half the corpus owns; [`touching`] is the half the Session
+/// owns. Before the two-lane rebuild these Contexts needed neither, because sharing a word with the
+/// Working Intent was enough to be injected, which is the property ADR-0007 exists to remove.
+const FIXTURE_REPOSITORY: &str = "Fe";
+const PAGE_FILE: &str = "src/search/SearchResultsPage.tsx";
+const PROTOCOL_FILE: &str = "src/api/SearchV2Endpoint.ts";
+const COMPATIBILITY_FILE: &str = "src/legacy/LegacyCompatibilityTest.ts";
+const ANALYTICS_FILE: &str = "src/analytics/ImpressionContract.ts";
+/// Every unsafe Context shares one file: the Session touches one place and the safety rules, not
+/// the retrieval, decide which of them may be injected.
+const UNSAFE_FILE: &str = "src/unsafe/Shared.ts";
+
+/// The Workspace Signals of a Session that opened exactly these files.
+fn touching(paths: &[&str]) -> Vec<TaskSignal> {
+    paths
+        .iter()
+        .map(|path| TaskSignal {
+            kind: TaskSignalKind::Workspace,
+            content: format!("{FIXTURE_REPOSITORY}:{path}"),
+        })
+        .collect()
+}
+
+/// One automatic request whose Session footprint is exactly `paths`.
+fn automatic_touching(goal: &str, paths: &[&str]) -> TaskContextRequest {
+    let mut request = TaskContextRequest::automatic(TaskId::new(), task(goal), Vec::new(), 8_000);
+    request.signal_history = touching(paths);
+    request
 }
 
 #[allow(clippy::too_many_lines)]
@@ -304,32 +333,60 @@ fn fixture() -> AssociationFixture {
         "PageRequirement",
         "pageintentneedle SearchResultsPage.tsx",
     );
-    let (page_context, _, _) = add_accepted_context(
+    let (page_context, page_revision, _) = add_accepted_context(
         &store,
         page_space,
         "the result page keeps its persistent navigation controls",
         applicability("page-requirement", "browser", "active"),
     );
+    record_file_reference(
+        &store,
+        page_context,
+        page_revision,
+        FIXTURE_REPOSITORY,
+        PAGE_FILE,
+    );
     let protocol_space = add_space(&store, "ServerProtocol", "protocolintentonly");
-    let (protocol_context, _, _) = add_accepted_context(
+    let (protocol_context, protocol_revision, _) = add_accepted_context(
         &store,
         protocol_space,
         "SearchV2Endpoint returns SearchResponseV2",
         applicability("server-protocol", "server", "active"),
     );
+    record_file_reference(
+        &store,
+        protocol_context,
+        protocol_revision,
+        FIXTURE_REPOSITORY,
+        PROTOCOL_FILE,
+    );
     let compatibility_space = add_space(&store, "Compatibility", "compatibilityintentonly");
-    let (compatibility_context, _, _) = add_accepted_context(
+    let (compatibility_context, compatibility_revision, _) = add_accepted_context(
         &store,
         compatibility_space,
         "LegacyCompatibilityTest verifies old client behavior",
         applicability("compatibility", "fe", "legacyclient"),
     );
+    record_file_reference(
+        &store,
+        compatibility_context,
+        compatibility_revision,
+        FIXTURE_REPOSITORY,
+        COMPATIBILITY_FILE,
+    );
     let analytics_space = add_space(&store, "Analytics", "analyticsintentonly");
-    let (analytics_context, _, _) = add_accepted_context(
+    let (analytics_context, analytics_revision, _) = add_accepted_context(
         &store,
         analytics_space,
         "impression semantics are governed by the analytics contract",
         applicability("analyticsdomain", "server", "production"),
+    );
+    record_file_reference(
+        &store,
+        analytics_context,
+        analytics_revision,
+        FIXTURE_REPOSITORY,
+        ANALYTICS_FILE,
     );
 
     let tie_alpha = add_space(&store, "TieAlpha", "tiealphaintent");
@@ -352,11 +409,18 @@ fn fixture() -> AssociationFixture {
         "UnsafeCandidate",
         "candidateintentonly unsafepackintentneedle",
     );
-    add_context(
+    let (candidate_context, candidate_revision) = add_context(
         &store,
         candidate_space,
         "unsafeassociationneedle candidate",
         applicability("unsafe", "fe", "active"),
+    );
+    record_file_reference(
+        &store,
+        candidate_context,
+        candidate_revision,
+        FIXTURE_REPOSITORY,
+        UNSAFE_FILE,
     );
     let deprecated_space = add_space(
         &store,
@@ -368,6 +432,13 @@ fn fixture() -> AssociationFixture {
         deprecated_space,
         "unsafeassociationneedle deprecated",
         applicability("unsafe", "fe", "active"),
+    );
+    record_file_reference(
+        &store,
+        deprecated_context,
+        deprecated_revision,
+        FIXTURE_REPOSITORY,
+        UNSAFE_FILE,
     );
     publish(
         &store,
@@ -388,11 +459,25 @@ fn fixture() -> AssociationFixture {
         "unsafeassociationneedle enabled",
         applicability("unsafe", "fe", "active"),
     );
+    record_file_reference(
+        &store,
+        conflict_a,
+        revision_a,
+        FIXTURE_REPOSITORY,
+        UNSAFE_FILE,
+    );
     let (conflict_b, revision_b, publication_b) = add_accepted_context(
         &store,
         conflict_space,
         "unsafeassociationneedle disabled",
         applicability("unsafe", "fe", "active"),
+    );
+    record_file_reference(
+        &store,
+        conflict_b,
+        revision_b,
+        FIXTURE_REPOSITORY,
+        UNSAFE_FILE,
     );
     append(
         &store,
@@ -430,6 +515,13 @@ fn fixture() -> AssociationFixture {
     incomplete.evidence[0].limitations.clear();
     let (incomplete_context, incomplete_revision) =
         add_context_draft(&store, incomplete_space, incomplete);
+    record_file_reference(
+        &store,
+        incomplete_context,
+        incomplete_revision,
+        FIXTURE_REPOSITORY,
+        UNSAFE_FILE,
+    );
     publish(
         &store,
         incomplete_space,
@@ -451,12 +543,6 @@ fn fixture() -> AssociationFixture {
             analytics_space,
         ],
         feature_contexts: [protocol_context, compatibility_context, analytics_context],
-        pack_contexts: [
-            page_context,
-            protocol_context,
-            compatibility_context,
-            analytics_context,
-        ],
         unsafe_pack_spaces: [
             candidate_space,
             deprecated_space,
@@ -896,26 +982,13 @@ fn positive_and_out_of_scope_matches_keep_one_penalized_explained_association() 
     assert_eq!(explanation.score_multiplier_basis_points, 5_000);
     assert!(!explanation.matched_tokens.is_empty());
 
-    let pack = engine
-        .task_context_pack(&TaskContextRequest::automatic(
-            conflict_task_id,
-            conflict_task,
-            conflict_signals,
-            100_000,
-        ))
-        .unwrap();
-    assert_eq!(pack.associations, conflicted.associations);
-    assert_eq!(pack.items.len(), 1);
-    assert_eq!(pack.items[0].context.context_id, fixture.context_id);
-    assert!(pack.items[0].retrieval_paths.iter().any(|path| {
-        matches!(
-            path,
-            TaskRetrievalPath::IntentFts {
-                matched_fields,
-                matched_tokens,
-            } if matched_fields == &["out_of_scope".to_owned()] && !matched_tokens.is_empty()
-        )
-    }));
+    // The Pack half of this test is retired with the mechanism it measured. It asserted that the
+    // conflicted Space's Contexts were injected because the Task text matched them, under an
+    // `IntentFts` path naming the tokens -- and ADR-0007 removed text matching from automatic
+    // injection entirely. The handoff itself is unaffected and is what the assertions above check:
+    // it is a property of the Space association, which `task_space_associations` still computes
+    // exactly as before for the Candidate analyzer.
+    let _ = (conflict_task_id, conflict_task, conflict_signals);
 }
 
 #[test]
@@ -968,36 +1041,14 @@ fn intent_conflict_handoff_is_visible_without_blocking_and_disappears_after_merg
         IntentConflictDecision::DecideWhichContextIsMoreSuitable
     );
 
-    let before = engine
-        .task_context_pack(&TaskContextRequest::automatic(
-            context_only_task_id,
-            context_only_query.clone(),
-            Vec::new(),
-            100_000,
-        ))
-        .unwrap();
-    assert_eq!(before.associations, associations.associations);
-    assert_eq!(
-        before.items.len(),
-        1,
-        "human decision keeps automatic behavior"
-    );
-    assert_eq!(before.items[0].context.context_id, fixture.context_id);
-    let hook_visible_json = serde_json::to_string(&before).unwrap();
-    for marker in [
-        "context_and_intent_alternatives_conflict",
-        "system_has_not_selected_winner",
-        "session_agent",
-        "current_code",
-        "evidence",
-        "task_applicability",
-        "decide_which_context_is_more_suitable",
-    ] {
-        assert!(
-            hook_visible_json.contains(marker),
-            "Hook-serialized Task Pack must expose {marker}"
-        );
-    }
+    // The Pack halves of this test are retired with the route they depended on. Both reached the
+    // conflicted Space's Context by matching the Task text against it, which ADR-0007 removed from
+    // automatic injection; and the handoff payload itself rode on the fused Space association,
+    // which a lane-assembled Pack does not build. The handoff is still computed and still
+    // explained -- every assertion above reads it from `task_space_associations`, the API the
+    // Candidate analyzer uses and this rebuild did not touch. That it no longer reaches the
+    // *Pack* is a real narrowing rather than a test artefact, and is filed as such.
+    let _ = (context_only_task_id, context_only_query);
 
     append(
         &fixture.store,
@@ -1019,22 +1070,16 @@ fn intent_conflict_handoff_is_visible_without_blocking_and_disappears_after_merg
     assert!(!resolved_candidates.candidates[0].intent_conflicted);
     assert_eq!(resolved_candidates.candidates[0].head_revision_ids.len(), 1);
     let resolved = engine
-        .task_context_pack(&TaskContextRequest::automatic(
-            TaskId::new(),
-            context_only_query,
-            Vec::new(),
-            100_000,
-        ))
+        .task_space_associations(TaskId::new(), &query, &[])
         .unwrap();
-    assert_eq!(resolved.items.len(), 1);
-    assert_eq!(resolved.items[0].context.context_id, fixture.context_id);
     assert!(resolved.associations[0].reasons.iter().all(|reason| {
         serde_json::from_str::<IntentConflictHandoffExplanation>(reason).is_err()
     }));
     assert!(
         !serde_json::to_string(&resolved)
             .unwrap()
-            .contains("system_has_not_selected_winner")
+            .contains("system_has_not_selected_winner"),
+        "a merged Intent stops producing the handoff at the one layer that still produces it"
     );
 }
 
@@ -1054,48 +1099,42 @@ fn unsafe_context_states_cannot_supply_association_or_injection_evidence() {
 fn task_context_pack_supports_zero_one_and_many_spaces_with_explicit_m2_paths() {
     let fixture = fixture();
     let engine = SearchEngine::new(fixture.index.clone());
+    // Zero: a Session that opened a file nobody has written a Context about.
     let zero = engine
-        .task_context_pack(&TaskContextRequest::automatic(
-            TaskId::new(),
-            task("unrelatedpackneedle"),
-            Vec::new(),
-            100_000,
+        .task_context_pack(&automatic_touching(
+            "unrelatedpackneedle",
+            &["src/unwritten/Nothing.ts"],
         ))
         .unwrap();
     assert!(zero.associations.is_empty());
     assert!(zero.items.is_empty());
 
+    // One: one file, one Context recorded against it, one Space.
     let one = engine
-        .task_context_pack(&TaskContextRequest::automatic(
-            TaskId::new(),
-            task("pageintentneedle"),
-            Vec::new(),
-            100_000,
-        ))
+        .task_context_pack(&automatic_touching("pageintentneedle", &[PAGE_FILE]))
         .unwrap();
     assert_eq!(one.associations.len(), 1);
     assert_eq!(one.items.len(), 1);
     assert!(matches!(
         one.items[0].retrieval_paths.as_slice(),
-        [TaskRetrievalPath::IntentFts { .. }]
+        [TaskRetrievalPath::FileAnchor { .. }]
     ));
 
+    // Many: three files across three Spaces, which is the grouping this test exists to pin.
     let many = engine
-        .task_context_pack(&TaskContextRequest::automatic(
-            TaskId::new(),
-            feature_task(),
-            feature_signals(),
-            100_000,
+        .task_context_pack(&automatic_touching(
+            "featureassociationgoal",
+            &[PROTOCOL_FILE, COMPATIBILITY_FILE, ANALYTICS_FILE],
         ))
         .unwrap();
-    assert_eq!(many.associations.len(), 1);
-    assert_eq!(many.items.len(), 1);
+    assert_eq!(many.associations.len(), 3);
+    assert_eq!(many.items.len(), 3);
     assert_eq!(
         many.items
             .iter()
             .map(|item| item.context.context_id)
             .collect::<std::collections::BTreeSet<_>>(),
-        [fixture.pack_contexts[3]].into_iter().collect()
+        fixture.feature_contexts.into_iter().collect()
     );
     let association_spaces = many
         .associations
@@ -1119,66 +1158,13 @@ fn task_context_pack_supports_zero_one_and_many_spaces_with_explicit_m2_paths() 
     assert!(
         paths
             .iter()
-            .any(|path| matches!(path, TaskRetrievalPath::ContextFts { .. }))
+            .all(|path| matches!(path, TaskRetrievalPath::FileAnchor { .. })),
+        "every route into this Pack is a file the Session opened: {paths:#?}"
     );
-    assert!(
-        paths
-            .iter()
-            .any(|path| matches!(path, TaskRetrievalPath::ExactScope { .. }))
-    );
-    assert!(paths.iter().all(|path| matches!(
-        path,
-        TaskRetrievalPath::ContextFts { .. } | TaskRetrievalPath::ExactScope { .. }
-    )));
     let metadata = fixture.index.metadata().unwrap();
     assert_eq!(many.indexed_tree_oid, metadata.indexed_tree_oid);
     assert_eq!(many.projection_generation, metadata.projection_generation);
 }
-
-#[test]
-fn strong_context_phrase_does_not_promote_an_unrelated_same_space_sibling() {
-    let temporary = tempfile::tempdir().unwrap();
-    let store = GitStore::bootstrap_local(temporary.path().join("text inheritance gate")).unwrap();
-    let space_id = add_space(&store, "WeakSpace", "weakspaceanchor");
-    let (strong_context_id, _, _) = add_accepted_context(
-        &store,
-        space_id,
-        "strong context phrase is directly relevant",
-        applicability("quality", "server", "active"),
-    );
-    let (unrelated_context_id, _, _) = add_accepted_context(
-        &store,
-        space_id,
-        "unrelated sibling material must stay private",
-        applicability("other", "client", "inactive"),
-    );
-    let index = ProjectionIndex::for_store(&store);
-    index.synchronize().unwrap();
-    let mut intent = task("weakspaceanchor absentalpha absentbravo absentcharlie absentdelta");
-    intent.current_direction = Some("strong context phrase".to_owned());
-    let pack = SearchEngine::new(index)
-        .task_context_pack(&TaskContextRequest::automatic(
-            TaskId::new(),
-            intent,
-            Vec::new(),
-            100_000,
-        ))
-        .unwrap();
-    assert_eq!(pack.associations.len(), 1);
-    assert!(pack.items.iter().any(|item| {
-        item.context.context_id == strong_context_id
-            && item
-                .retrieval_paths
-                .iter()
-                .any(|path| matches!(path, TaskRetrievalPath::ContextFts { .. }))
-    }));
-    assert!(
-        pack.items
-            .iter()
-            .all(|item| item.context.context_id != unrelated_context_id)
-    );
-}
-
 #[test]
 #[allow(clippy::too_many_lines)]
 fn related_space_retrieval_preserves_primary_owner_and_exposes_typed_association_path() {
@@ -1230,13 +1216,16 @@ fn related_space_retrieval_preserves_primary_owner_and_exposes_typed_association
     )
     .unwrap();
     store.confirm_candidate(&plan).unwrap();
-    let engine = SearchEngine::new(index.clone());
-    let request = TaskContextRequest::automatic(
-        TaskId::new(),
-        task("relatedonlyneedle"),
-        Vec::new(),
-        100_000,
+    record_file_reference(
+        &store,
+        plan.result_context_id,
+        plan.confirmation.result_revision_id,
+        FIXTURE_REPOSITORY,
+        PAGE_FILE,
     );
+    let engine = SearchEngine::new(index.clone());
+    let mut request = automatic_touching("relatedonlyneedle", &[PAGE_FILE]);
+    request.token_budget = 100_000;
     let first = engine.task_context_pack(&request).unwrap();
     let second = engine.task_context_pack(&request).unwrap();
     assert_eq!(first, second);
@@ -1245,48 +1234,29 @@ fn related_space_retrieval_preserves_primary_owner_and_exposes_typed_association
         first.estimated_tokens,
         estimate_task_context_payload_tokens(&first)
     );
+    // The primary owner is the whole of the grouping now, and a Context appears exactly once.
+    //
+    // A Pack used to rank Spaces and then take their Contexts, so a Context could be carried into
+    // the Pack by a Space that merely listed it as related, under a `SpaceAssociation` path naming
+    // the role. The lanes invert that: Contexts are retrieved and the Space list is derived from
+    // the ones that made it, so a Context is grouped under the Space that owns it and the related
+    // Space is a curation fact the Agent reads on the Context rather than a second route into it.
     assert_eq!(first.associations.len(), 1);
-    assert_eq!(first.associations[0].space_id, related_space);
+    assert_eq!(first.associations[0].space_id, primary_space);
     assert_eq!(first.items.len(), 1);
     let item = &first.items[0];
-    assert_eq!(item.association_space_id, related_space);
+    assert_eq!(item.association_space_id, primary_space);
     assert_eq!(item.context.space_id, primary_space);
     assert_eq!(item.context.context_id, plan.result_context_id);
-    assert!(item.retrieval_paths.iter().any(|path| {
-        matches!(
-            path,
-            TaskRetrievalPath::SpaceAssociation {
-                association_id,
-                role: SpaceAssociationRole::Related,
-                matched_space_id,
-            } if *association_id == plan.space_association.association_id
-                && *matched_space_id == related_space
-        )
-    }));
     assert!(
+        matches!(
+            item.retrieval_paths.as_slice(),
+            [TaskRetrievalPath::FileAnchor { .. }]
+        ),
+        "{:#?}",
         item.retrieval_paths
-            .iter()
-            .all(|path| { !matches!(path, TaskRetrievalPath::ContextRelation { .. }) })
     );
-
-    let direct = engine
-        .task_context_pack(&TaskContextRequest::automatic(
-            TaskId::new(),
-            task("directcontextneedle"),
-            Vec::new(),
-            100_000,
-        ))
-        .unwrap();
-    assert_eq!(direct.items.len(), 1);
-    assert_eq!(direct.items[0].context.context_id, plan.result_context_id);
-    assert_eq!(
-        direct
-            .associations
-            .iter()
-            .map(|association| association.space_id)
-            .collect::<std::collections::BTreeSet<_>>(),
-        [primary_space, related_space].into_iter().collect()
-    );
+    let _ = related_space;
 
     for related_space_ids in [vec![related_space], vec![alternate_space]] {
         append(
@@ -1308,11 +1278,21 @@ fn related_space_retrieval_preserves_primary_owner_and_exposes_typed_association
     let conflicted = SearchEngine::new(index)
         .task_context_pack(&request)
         .unwrap();
-    assert!(
+    // Two competing association heads used to make the Context unreachable, and that was an
+    // accident of how it was reached rather than a decision: a Context with no settled association
+    // fell back to its own Space, which the *text query* had not ranked, so it vanished. Retrieval
+    // no longer routes through Spaces, so the ambiguity costs nothing it should not cost -- the
+    // file still anchors the Context, and the Context is still grouped under the Space that owns
+    // it. What the ambiguity may never do is put it under a Space that merely lists it.
+    assert_eq!(
         conflicted
             .items
             .iter()
-            .all(|item| item.context.context_id != plan.result_context_id)
+            .map(|item| (item.context.context_id, item.association_space_id))
+            .collect::<Vec<_>>(),
+        [(plan.result_context_id, primary_space)],
+        "{:#?}",
+        conflicted.items
     );
 }
 
@@ -1393,30 +1373,28 @@ fn automatic_task_pack_excludes_every_unsafe_state_while_explicit_expands_confli
     let fixture = fixture();
     let task_id = TaskId::new();
     let task = task("unsafepackintentneedle");
+    // Every unsafe Context is recorded against one file, and the Session opened it. Lane A reaches
+    // all four states -- a Candidate, a withdrawn Context, both sides of an open conflict, and one
+    // with incomplete Evidence -- so this is now a stronger statement than it was: they are not
+    // missing from the Pack because retrieval failed to find them, they are missing because the
+    // safety rules refused them after retrieval found them.
+    let automatic_request = automatic_touching("unsafepackintentneedle", &[UNSAFE_FILE]);
     let automatic = SearchEngine::new(fixture.index.clone())
-        .task_context_pack(&TaskContextRequest::automatic(
-            task_id,
-            task.clone(),
-            Vec::new(),
-            100_000,
-        ))
+        .task_context_pack(&automatic_request)
         .unwrap();
-    assert_eq!(
-        automatic
-            .associations
-            .iter()
-            .map(|association| association.space_id)
-            .collect::<std::collections::BTreeSet<_>>(),
-        fixture.unsafe_pack_spaces.into_iter().collect()
+    assert!(
+        automatic.items.is_empty() && automatic.associations.is_empty(),
+        "{:#?}",
+        automatic.items
     );
-    assert!(automatic.items.is_empty());
+    let _ = fixture.unsafe_pack_spaces;
 
     let explicit = SearchEngine::new(fixture.index)
         .task_context_pack(&TaskContextRequest {
             task_id,
             working_intent: task,
             task_signals: Vec::new(),
-            signal_history: Vec::new(),
+            signal_history: touching(&[UNSAFE_FILE]),
             resolved_focus: None,
             token_budget: 100_000,
             max_spaces: sctx_search::DEFAULT_TASK_MAX_SPACES,
@@ -1424,7 +1402,11 @@ fn automatic_task_pack_excludes_every_unsafe_state_while_explicit_expands_confli
             mode: ContextPackMode::Explicit,
         })
         .unwrap();
-    assert_eq!(explicit.task_fingerprint, automatic.task_fingerprint);
+    assert_eq!(
+        explicit.task_fingerprint, automatic.task_fingerprint,
+        "the fingerprint is a property of the Working Intent and its active Signals, so the two \
+         modes and the Session footprint never move it"
+    );
     assert!(
         explicit
             .items
@@ -1464,7 +1446,14 @@ fn automatic_task_pack_excludes_every_unsafe_state_while_explicit_expands_confli
 /// One Space holding eight injection-safe Contexts that all answer the same rare query token.
 /// A 2000-token budget cannot carry eight explainable items, so it is the exact shape that made
 /// automatic injection return a single Context before compact packing existed.
-fn compact_budget_fixture() -> (TempDir, ProjectionIndex, Vec<ContextId>) {
+/// Eight evidenced Contexts, each recorded against its own file, and the footprint that reaches
+/// them.
+///
+/// Eight is the number the budget assertions need: the point of the compact payload is that a
+/// budget which carries one explainable Context carries several inheritable facts, and that is not
+/// observable with two. Each Context gets a file of its own so the footprint can be varied -- a
+/// Session that opened three of them must get three items, not eight.
+fn compact_budget_fixture() -> (TempDir, ProjectionIndex, Vec<ContextId>, Vec<String>) {
     let temporary = tempfile::tempdir().unwrap();
     let store = GitStore::bootstrap_local(temporary.path().join("compact-installation")).unwrap();
     let space_id = add_space(
@@ -1473,8 +1462,9 @@ fn compact_budget_fixture() -> (TempDir, ProjectionIndex, Vec<ContextId>) {
         "compactbudgetneedle retrieval payload",
     );
     let mut contexts = Vec::new();
+    let mut files = Vec::new();
     for index in 0..8_u8 {
-        let (context_id, _, _) = add_accepted_context(
+        let (context_id, revision_id, _) = add_accepted_context(
             &store,
             space_id,
             &format!(
@@ -1484,23 +1474,25 @@ fn compact_budget_fixture() -> (TempDir, ProjectionIndex, Vec<ContextId>) {
             ),
             applicability("compactbudget", "server", &format!("case-{index}")),
         );
+        let path = format!("src/compact/Case{index}.ts");
+        record_file_reference(&store, context_id, revision_id, FIXTURE_REPOSITORY, &path);
         contexts.push(context_id);
+        files.push(path);
     }
     let index = ProjectionIndex::for_store(&store);
     index.synchronize().unwrap();
-    (temporary, index, contexts)
+    (temporary, index, contexts, files)
 }
 
 #[test]
 fn compact_detail_level_fits_more_evidenced_items_in_the_default_budget() {
-    let (_temporary, index, contexts) = compact_budget_fixture();
+    let (_temporary, index, contexts, files) = compact_budget_fixture();
     let engine = SearchEngine::new(index);
-    let request = TaskContextRequest::automatic(
-        TaskId::new(),
-        task("compactbudgetneedle"),
-        Vec::new(),
-        2_000,
+    let mut request = automatic_touching(
+        "compactbudgetneedle",
+        &files.iter().map(String::as_str).collect::<Vec<_>>(),
     );
+    request.token_budget = 2_000;
 
     let full = engine
         .task_context_pack_with_detail(&request, ContextPackDetailLevel::Full)
@@ -1651,63 +1643,6 @@ fn compact_top_k_omissions_keep_full_association_byte_charges() {
         assert!(pack.estimated_tokens <= request.token_budget);
     }
 }
-
-#[test]
-fn a_condition_matches_the_stated_task_scope_rather_than_its_constraint_list() {
-    let fixture = fixture();
-    let engine = SearchEngine::new(fixture.index);
-
-    // The Task never lists a constraint: it states the situation in its goal and in-scope items,
-    // which is how an Agent actually writes a Working Intent.
-    let mut stated = task("legacyclient compatibility fallback");
-    stated.in_scope = vec!["legacyclient".to_owned()];
-    let matched = engine
-        .task_context_pack(&TaskContextRequest::automatic(
-            TaskId::new(),
-            stated,
-            Vec::new(),
-            100_000,
-        ))
-        .unwrap();
-    let conditions = matched
-        .items
-        .iter()
-        .flat_map(|item| item.retrieval_paths.iter())
-        .filter_map(|path| match path {
-            TaskRetrievalPath::ExactScope { dimension, value } if dimension == "condition" => {
-                Some(value.clone())
-            }
-            _ => None,
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    assert!(
-        conditions.contains("legacyclient"),
-        "an in-scope item must be able to match a Context condition: {conditions:?}"
-    );
-
-    // A Task that never states the situation still must not match the condition.
-    let silent = engine
-        .task_context_pack(&TaskContextRequest::automatic(
-            TaskId::new(),
-            task("compatibility fallback"),
-            Vec::new(),
-            100_000,
-        ))
-        .unwrap();
-    assert!(
-        !silent
-            .items
-            .iter()
-            .flat_map(|item| item.retrieval_paths.iter())
-            .any(|path| matches!(
-                path,
-                TaskRetrievalPath::ExactScope { dimension, value }
-                    if dimension == "condition" && value == "legacyclient"
-            )),
-        "an unstated condition must stay unmatched"
-    );
-}
-
 /// Six accepted Contexts written the way a real review writes them: a long Chinese statement, a
 /// Chinese Evidence summary, and one cross-Space Relation whose rationale is a whole Chinese
 /// paragraph. This is the payload shape that made a real 2000-token injection return two
@@ -1776,18 +1711,34 @@ fn real_shape_compact_fixture() -> (TempDir, ProjectionIndex, SpaceId) {
             Vec::new(),
             PublicationAction::Publish,
         );
+        record_file_reference(
+            &store,
+            context_id,
+            revision_id,
+            FIXTURE_REPOSITORY,
+            &real_shape_file(index),
+        );
     }
     let index = ProjectionIndex::for_store(&store);
     index.synchronize().unwrap();
     (temporary, index, space_id)
 }
 
+/// The file the `index`-th real-shape Context is recorded against.
+fn real_shape_file(index: usize) -> String {
+    format!("app/src/main/java/review/Conclusion{index}.kt")
+}
+
 #[test]
 fn compact_packing_keeps_the_top_ranked_chinese_contexts_in_the_default_budget() {
     let (_temporary, index, _space_id) = real_shape_compact_fixture();
     let engine = SearchEngine::new(index);
-    let request =
-        TaskContextRequest::automatic(TaskId::new(), task("realshapeneedle"), Vec::new(), 2_000);
+    let files = (0..6).map(real_shape_file).collect::<Vec<_>>();
+    let mut request = automatic_touching(
+        "realshapeneedle",
+        &files.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    request.token_budget = 2_000;
 
     let reference = engine
         .task_context_pack_with_detail(
@@ -1923,12 +1874,17 @@ fn a_compact_item_names_the_single_repository_its_references_live_in() {
     index.synchronize().unwrap();
     let engine = SearchEngine::new(index);
 
-    let request = TaskContextRequest::automatic(
+    // One file, two Contexts recorded against it: the Session opens it and both are anchored.
+    let mut request = TaskContextRequest::automatic(
         TaskId::new(),
         task("repositoryannotationneedle"),
         Vec::new(),
         100_000,
     );
+    request.signal_history = vec![TaskSignal {
+        kind: TaskSignalKind::Workspace,
+        content: "Android:app/src/One.kt".to_owned(),
+    }];
     let full = engine.task_context_pack(&request).unwrap();
     let compact = engine
         .task_context_pack_with_detail(&request, ContextPackDetailLevel::Compact)
