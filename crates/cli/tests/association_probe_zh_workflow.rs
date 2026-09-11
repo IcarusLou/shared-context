@@ -9,10 +9,22 @@
 //!
 //! `association_probe_zh_baseline` locks in what must never regress (identifier
 //! probes hit, noise probes return nothing). `association_probe_zh_target`
-//! holds the association goal, >= 19/24 on both entry points with zero noise
-//! hits, and is blocking since WP-L8.
+//! holds the association goal on the entry point this fixture can still
+//! measure.
 //!
-//! WP-L8 moved the two retrieval-side causes and left the third:
+//! Re-baselined for ADR-0007 (three release runs, bit-identical): explicit
+//! search 20/24, unchanged from the fused stack. Automatic retrieval reads 0
+//! lane A hits, 0 lane B hits, 0 noise across all 24 probes -- the fixture asks
+//! `task_intent_update` for knowledge with a goal string and no file footprint,
+//! which under ADR-0007 is a question automatic injection deliberately does not
+//! answer. The `intent_hits >= 19` floor is therefore retired rather than
+//! lowered: the two mechanisms that earned five of those hits are the two the
+//! paragraphs below describe, and both are gone.
+//!
+//! WP-L8 moved the two retrieval-side causes and left the third. The first two
+//! bullets are history now -- the answerable coverage denominator still governs
+//! explicit search and is why the 20/24 above holds, while the automatic
+//! coverage gate and the coverage-weighted injection rank no longer exist:
 //!
 //! * The ranked coverage denominator now counts only the query tokens the Tree
 //!   can answer at all, so a Han bigram that names nothing in the corpus no
@@ -34,7 +46,10 @@
 
 mod association_probe_harness;
 
-use association_probe_harness::{ProbeOutcome, assert_no_noise, build_harness, emit, run_probes};
+use association_probe_harness::{
+    ProbeOutcome, assert_every_automatic_pack_is_empty, assert_no_noise, build_harness, emit,
+    run_probes,
+};
 use serde_json::Value;
 
 const PROBE_FIXTURE: &str = include_str!("../../../fixtures/association/probe-zh-v1.json");
@@ -72,16 +87,13 @@ fn association_probe_zh_baseline() {
 
 #[test]
 fn association_probe_zh_target() {
-    let (_fixture, outcomes, search_hits, intent_hits) = probe("target");
+    let (_fixture, outcomes, search_hits, _intent_hits) = probe("target");
 
     let total = outcomes.len();
     assert!(
         search_hits >= TARGET_HITS,
         "explicit search associated only {search_hits}/{total} probes"
     );
-    assert!(
-        intent_hits >= TARGET_HITS,
-        "task_intent_update associated only {intent_hits}/{total} probes"
-    );
+    assert_every_automatic_pack_is_empty(&outcomes);
     assert_no_noise(&outcomes);
 }

@@ -110,7 +110,10 @@ mod association_probe_harness;
 
 use std::collections::BTreeMap;
 
-use association_probe_harness::{ProbeOutcome, assert_no_noise, build_harness, emit, run_probes};
+use association_probe_harness::{
+    ProbeOutcome, assert_every_automatic_pack_is_empty, assert_no_noise, build_harness, emit,
+    run_probes,
+};
 use serde_json::Value;
 
 const PROBE_FIXTURE: &str = include_str!("../../../fixtures/association/probe-ext-v1.json");
@@ -119,8 +122,14 @@ const REPORT_FILE_NAME: &str = "association-probe-ext-report.json";
 /// Ratcheted floor: the worst (here, only, since all three runs matched) of
 /// three measured runs. Regression-only, not a progress target -- see the
 /// module doc comment for the measured numbers.
+///
+/// Only the explicit-search half survives ADR-0007 as a number. It is unchanged
+/// at 30/39 across three release runs, which is the assertion that proves
+/// `context_search` was not touched by the two-lane rebuild. The automatic half
+/// had no fixture input to measure once intent-text matching was retired, so
+/// `TARGET_INTENT_HITS` is replaced by two statements the corpus can still
+/// support: every automatic Pack is empty, and empty is not noisy.
 const TARGET_SEARCH_HITS: usize = 30;
-const TARGET_INTENT_HITS: usize = 27;
 
 fn fixture() -> Value {
     serde_json::from_str::<Value>(PROBE_FIXTURE).unwrap()
@@ -177,7 +186,7 @@ fn association_probe_ext_baseline() {
 
 #[test]
 fn association_probe_ext_ratchet() {
-    let (_fixture, outcomes, search_hits, intent_hits) = probe("target");
+    let (_fixture, outcomes, search_hits, _intent_hits) = probe("target");
 
     let total = outcomes.len();
     print_category_table(&outcomes);
@@ -187,10 +196,6 @@ fn association_probe_ext_ratchet() {
         "explicit search associated only {search_hits}/{total} probes, \
          below the ratcheted floor of {TARGET_SEARCH_HITS}"
     );
-    assert!(
-        intent_hits >= TARGET_INTENT_HITS,
-        "task_intent_update associated only {intent_hits}/{total} probes, \
-         below the ratcheted floor of {TARGET_INTENT_HITS}"
-    );
+    assert_every_automatic_pack_is_empty(&outcomes);
     assert_no_noise(&outcomes);
 }

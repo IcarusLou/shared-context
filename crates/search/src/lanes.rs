@@ -358,7 +358,14 @@ impl ExpandedSeed {
 ///
 /// **The expansion is one hop and stops.** The edges of the Contexts it returns are not followed,
 /// because a repeated hop over a field this coarse walks the whole corpus in two or three steps.
-/// Callers use the result as a seed for Lane B's admission, not as a second round of input here.
+///
+/// Both edge kinds are returned and the caller decides what each one is worth. That decision is not
+/// symmetric and the assembler makes it explicitly: a shared `problem_view` places a Context in the
+/// Pack, a shared `topic_key` does not, because a `topic_key` is a classification and a coarse one
+/// reaches across an installation. A Context this function returns is a seed only if the caller
+/// also places it -- placing and seeding are the same decision, since Lane B never judges a Context
+/// that is already in the Pack, and a Context seeded without being placed would be reachable by
+/// neither.
 ///
 /// An empty seed set expands to nothing: these edges carry a seed, they do not create one. A
 /// Session Lane A could not anchor at all therefore stays empty, which is what the 17-hour Session

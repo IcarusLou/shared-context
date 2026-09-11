@@ -762,3 +762,30 @@ pub fn assert_no_noise(outcomes: &[ProbeOutcome]) {
         }
     }
 }
+
+/// Not one automatic item across the whole fixture, and the reason stated rather than assumed.
+///
+/// ADR-0007 retired intent-text matching from automatic injection, and these three fixtures drive
+/// `task_intent_update` with a Working Intent goal and nothing else: no Workspace or Diff Signal,
+/// no `artifact_hints` that read as a path, no `task_artifact_focus`. Lane A therefore has no
+/// anchor to start from, and with no seed there is no second hop either, so every automatic Pack in
+/// these suites is empty *by construction*.
+///
+/// That makes the old `intent_hits >= N` floor unmeasurable rather than merely lower: it counted
+/// hits on a channel that no longer exists. What is still worth asserting is the half these
+/// fixtures can still speak to -- that an empty Pack is an empty Pack and not a Pack of noise, and
+/// that it says so in one line instead of falling silent. Whoever extends a fixture with the file
+/// footprint of a real Session should replace this with a lane hit-rate floor, and until then the
+/// honest reading is zero of both lanes with zero noise.
+pub fn assert_every_automatic_pack_is_empty(outcomes: &[ProbeOutcome]) {
+    for outcome in outcomes {
+        assert_eq!(
+            outcome.intent_items, 0,
+            "probe {} ({}) returned {} automatic item(s) from a fixture that supplies no lane \
+             input at all -- no touched file, no resolved Focus, no path-shaped hint. Either the \
+             fixture grew a footprint, in which case this assertion should become a lane hit-rate \
+             floor, or a route into automatic injection exists that ADR-0007 does not describe.",
+            outcome.id, outcome.query, outcome.intent_items
+        );
+    }
+}
