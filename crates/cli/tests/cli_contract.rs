@@ -229,6 +229,56 @@ fn create_space(harness: &Harness, title: &str) -> (String, String) {
     )
 }
 
+/// The file every CLI fixture Context is recorded against, and the hint that reaches it.
+///
+/// ADR-0007 injects a Context because the Session touched a file it is recorded against. None of
+/// the CLI contract tests is about retrieval quality -- they are about JSON envelopes, session
+/// isolation and command wiring -- so they need the cheapest honest anchor, and the `artifact_hints`
+/// spelling is it.
+const CLI_REPOSITORY: &str = "Cli";
+const CLI_FILE: &str = "src/cli/output.rs";
+
+/// The file a fixture Context is recorded against: the one its own statement names, when it names
+/// one, and the shared default otherwise.
+///
+/// Several of these fixtures already write the path into the statement -- `"alphaquartz
+/// src/alpha_feature.rs test runner succeeded"` -- because the old retrieval matched it as text.
+/// Reading the same spelling as a coordinate keeps those tests saying what they were written to
+/// say, including the session-isolation ones, where two Contexts naming two different files must
+/// not reach each other.
+/// Records one Engineering Reference against an already-appended revision.
+fn anchor_context(harness: &Harness, context_id: &str, revision_id: &str, path: &str) {
+    GitStore::bootstrap_local(harness.root())
+        .unwrap()
+        .append_event(AppendRequest::event(
+            Event::engineering_reference_recorded(
+                sctx_domain::ContextId::from_str(context_id).unwrap(),
+                sctx_domain::RevisionId::from_str(revision_id).unwrap(),
+                sctx_domain::EngineeringReferenceDraft {
+                    repository_id: CLI_REPOSITORY.parse().unwrap(),
+                    artifact_kind: sctx_domain::ArtifactKind::File,
+                    relation: sctx_domain::ReferenceRelation::Implements,
+                    locator: sctx_domain::ArtifactLocator::File {
+                        path: sctx_domain::RepoRelativePath::new(path).unwrap(),
+                    },
+                    supports: "the CLI fixture anchors this Context to the output module"
+                        .to_owned(),
+                    limitations: vec!["synthetic fixture".to_owned()],
+                },
+                None,
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+}
+
+fn anchored_path(statement: &str) -> String {
+    statement
+        .split_whitespace()
+        .find(|token| token.contains('/') && token.contains('.'))
+        .map_or_else(|| CLI_FILE.to_owned(), ToOwned::to_owned)
+}
+
 fn seed_context(harness: &Harness, space_id: &str, statement: &str) -> (String, String) {
     let event = Event::context_revision_added(
         SpaceId::from_str(space_id).unwrap(),
@@ -259,9 +309,29 @@ fn seed_context(harness: &Harness, space_id: &str, statement: &str) -> (String, 
         } => (*context_id, revision.revision_id),
         _ => unreachable!(),
     };
-    GitStore::bootstrap_local(harness.root())
-        .unwrap()
-        .append_event(AppendRequest::event(event))
+    let store = GitStore::bootstrap_local(harness.root()).unwrap();
+    store.append_event(AppendRequest::event(event)).unwrap();
+    store
+        .append_event(AppendRequest::event(
+            Event::engineering_reference_recorded(
+                context_id,
+                revision_id,
+                sctx_domain::EngineeringReferenceDraft {
+                    repository_id: CLI_REPOSITORY.parse().unwrap(),
+                    artifact_kind: sctx_domain::ArtifactKind::File,
+                    relation: sctx_domain::ReferenceRelation::Implements,
+                    locator: sctx_domain::ArtifactLocator::File {
+                        path: sctx_domain::RepoRelativePath::new(&anchored_path(statement))
+                            .unwrap(),
+                    },
+                    supports: "the CLI fixture anchors this Context to the output module"
+                        .to_owned(),
+                    limitations: vec!["synthetic fixture".to_owned()],
+                },
+                None,
+            )
+            .unwrap(),
+        ))
         .unwrap();
     (context_id.to_string(), revision_id.to_string())
 }
@@ -392,7 +462,7 @@ fn establish_cli_task(harness: &Harness, session: &str, goal: &str, current_dire
                 platforms: vec![],
                 constraints: vec![],
                 acceptance_conditions: vec![],
-                artifact_hints: vec![],
+                artifact_hints: vec![CLI_FILE.to_owned()],
                 interface_hints: vec![],
                 open_questions: vec![],
             },
@@ -1005,7 +1075,14 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
                 platforms: vec![],
                 constraints: vec![],
                 acceptance_conditions: vec![],
-                artifact_hints: vec![],
+                // Each Session names the file it is working on. That is what keeps the isolation
+                // assertion below meaningful under ADR-0007: alpha and beta reach their own
+                // Contexts because they anchor on their own files, not because their goal strings
+                // happen to differ.
+                artifact_hints: vec![format!(
+                    "src/{}_feature.rs",
+                    session_id.rsplit('-').next().unwrap_or_default()
+                )],
                 interface_hints: vec![],
                 open_questions: vec![],
             },
@@ -2418,9 +2495,15 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
         focused["data"]["resolved_focus"]["locator"],
         serde_json::json!({"locator_kind": "file", "path": "src/future.rs"})
     );
+    // A Focus on a file nobody has written about returns an empty Pack that says so. It no longer
+    // says it as a Graph diagnostic, because the Pack does not read the Graph.
     assert_eq!(
-        focused["data"]["context"]["graph_diagnostics"][0]["kind"],
-        "artifact_not_reachable_in_graph"
+        focused["data"]["context"]["graph_diagnostics"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        focused["data"]["context"]["omitted"][0]["reason"],
+        "no_lane_evidence"
     );
 
     let task_session_id = updated["data"]["task_session_id"]
@@ -2776,6 +2859,11 @@ fn lifecycle_commands_share_stable_json_tree_and_generation_envelopes() {
         EVIDENCE,
     ]);
     let revision_id = text(&revised, "revision_id").to_owned();
+    // A Reference belongs to the revision it was recorded on, and only the *accepted* revision
+    // anchors -- which is the rule that keeps a file from pulling a retired reading back out of the
+    // corpus. The seeded Reference is on the parent, so the revision that will be published needs
+    // its own.
+    anchor_context(&harness, &context_id, &revision_id, CLI_FILE);
     let review = harness.success(&[
         "context",
         "review",

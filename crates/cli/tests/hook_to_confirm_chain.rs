@@ -477,7 +477,11 @@ fn one_real_hook_to_confirm_identity_chain() {
     assert_eq!(focus["resolved_focus"]["repository_id"], repository_id);
     assert_eq!(focus["resolved_focus"]["locator"], file_locator);
     let focus_json = serde_json::to_string(&focus).unwrap();
-    assert!(focus_json.contains("engineering_graph"));
+    // The Focus reaches the Context it seeded, by the file both of them name. It is a `file_anchor`
+    // and not an `engineering_graph` path: ADR-0007's first lane joins the Session's footprint
+    // against the Engineering Reference rows in the index, and never consults the Graph projection.
+    assert!(focus_json.contains("file_anchor"), "{focus_json}");
+    assert!(!focus_json.contains("engineering_graph"));
     assert!(focus_json.contains(&seeded.context));
     let ordinary = mcp_tool(
         &home,

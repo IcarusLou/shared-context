@@ -278,6 +278,18 @@ impl MilestoneTwoFixture {
         }
     }
 
+    /// One scenario whose Session footprint is exactly `files`.
+    fn input_touching(
+        &self,
+        external_session_id: &str,
+        goal: &str,
+        files: &[&str],
+    ) -> TaskScenario {
+        let mut scenario = self.input(external_session_id, goal);
+        scenario.intent.artifact_hints = files.iter().map(|file| (*file).to_owned()).collect();
+        scenario
+    }
+
     fn input(&self, external_session_id: &str, goal: &str) -> TaskScenario {
         TaskScenario {
             agent_kind: "codex".to_owned(),
@@ -423,6 +435,34 @@ fn add_context(
     ids
 }
 
+/// The Repository every M2 fixture Context is anchored in.
+const M2_REPOSITORY: &str = "Quartz";
+
+/// The file a fixture Context is recorded against: the one its own statement names, when it names
+/// one, and a name derived from the statement otherwise.
+///
+/// These fixtures already wrote the path into the statement -- the retrieval that preceded ADR-0007
+/// matched it as text -- so reading the same spelling as a coordinate is the smallest change that
+/// keeps each test saying what it was written to say.
+fn m2_anchor(statement: &str) -> String {
+    statement
+        .split_whitespace()
+        .find(|token| token.contains('/') && token.contains('.'))
+        .map_or_else(
+            || {
+                format!(
+                    "src/{}.ts",
+                    statement
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("context")
+                        .to_lowercase()
+                )
+            },
+            ToOwned::to_owned,
+        )
+}
+
 fn add_accepted_context(
     store: &GitStore,
     space_id: SpaceId,
@@ -431,6 +471,26 @@ fn add_accepted_context(
 ) -> ContextId {
     let (context_id, revision_id) =
         add_context(store, space_id, complete_context(statement, applicability));
+    store
+        .append_event(AppendRequest::event(
+            Event::engineering_reference_recorded(
+                context_id,
+                revision_id,
+                sctx_domain::EngineeringReferenceDraft {
+                    repository_id: M2_REPOSITORY.parse().unwrap(),
+                    artifact_kind: sctx_domain::ArtifactKind::File,
+                    relation: sctx_domain::ReferenceRelation::Implements,
+                    locator: sctx_domain::ArtifactLocator::File {
+                        path: sctx_domain::RepoRelativePath::new(&m2_anchor(statement)).unwrap(),
+                    },
+                    supports: "the M2 fixture anchors this Context to the file it names".to_owned(),
+                    limitations: vec!["synthetic fixture".to_owned()],
+                },
+                None,
+            )
+            .unwrap(),
+        ))
+        .unwrap();
     publish(
         store,
         space_id,
@@ -588,10 +648,32 @@ fn git_tree(repository: &Path) -> String {
 fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
     let fixture = MilestoneTwoFixture::new();
 
-    let zero_input = fixture.input("zero-session", "lonelyunrelatedtoken");
-    let one_input = fixture.input("page-session", "quartzpageintent");
-    let server_input = fixture.input("server-session", "cobaltserverintent");
-    let many_input = fixture.feature_input("feature-session");
+    // Each scenario says which files its Session is working on. That is the whole of what decides
+    // its Pack now: `zero` names a file no Context is recorded against, `page` and `server` name
+    // one each, and `feature` names three across three Spaces.
+    let zero_input = fixture.input_touching(
+        "zero-session",
+        "lonelyunrelatedtoken",
+        &["src/nobody_wrote_about_this.ts"],
+    );
+    let one_input = fixture.input_touching(
+        "page-session",
+        "quartzpageintent",
+        &["src/search_results_page.tsx"],
+    );
+    let server_input = fixture.input_touching(
+        "server-session",
+        "cobaltserverintent",
+        &["src/searchv2endpoint.ts"],
+    );
+    let mut many_input = fixture.feature_input("feature-session");
+    many_input.intent.artifact_hints = [
+        "src/search_results_page.tsx",
+        "src/searchv2endpoint.ts",
+        "src/legacycompatibilitytest.ts",
+    ]
+    .map(ToOwned::to_owned)
+    .to_vec();
     let read_input = TaskContextReadInput {
         agent_kind: many_input.agent_kind.clone(),
         external_session_id: many_input.external_session_id.clone(),
@@ -696,29 +778,24 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
     assert_eq!(repeated.items, many.items);
     assert_eq!(repeated.retrieval_paths, many.retrieval_paths);
 
-    let unsafe_input = fixture.input("unsafe-session", "hazardpackintent");
+    // Every hazard Context is recorded against a file, and the Session opens all of them. This is
+    // a stronger statement than the relevance-floor ranking it replaces: the four hazard Spaces are
+    // not absent because a floor dropped the tail of a one-channel ranking, they are absent because
+    // the lane retrieved every one of their Contexts and the safety rules refused all four states --
+    // a Candidate, a withdrawn Context, both sides of an open conflict, and incomplete Evidence.
+    let unsafe_input = fixture.input_touching(
+        "unsafe-session",
+        "hazardpackintent",
+        &[
+            "src/hazardpackcontext.ts",
+            "src/hazardpackcontext_deprecated.ts",
+        ],
+    );
     let automatic_unsafe = establish_task(&fixture.root, &unsafe_input);
-    // All four hazard Spaces share one Intent token and are ranked against each other on that one
-    // channel, so the automatic relevance floor keeps the leaders and drops the tail. Which ones
-    // survive is the ranking's business; that they are hazard Spaces, that the drop is explained,
-    // and that none of them yields an item, are this contract's.
-    let associated = response_spaces(&automatic_unsafe);
-    let hazard = fixture.unsafe_spaces.into_iter().collect::<BTreeSet<_>>();
-    assert!(!associated.is_empty() && associated.is_subset(&hazard));
-    let dropped = hazard
-        .difference(&associated)
-        .copied()
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        automatic_unsafe
-            .omitted
-            .iter()
-            .filter(|omitted| omitted.reason == "below_relevance_floor")
-            .filter_map(|omitted| omitted.space_id)
-            .collect::<BTreeSet<_>>(),
-        dropped,
-        "every Space the floor dropped says so: {:#?}",
-        automatic_unsafe.omitted
+    assert!(
+        response_spaces(&automatic_unsafe).is_empty(),
+        "a Space exists in a Pack because one of its Contexts is in the Pack: {:#?}",
+        automatic_unsafe.candidate_spaces
     );
     assert!(automatic_unsafe.items.is_empty());
     assert!(
@@ -804,7 +881,7 @@ fn post_tool_file_is_non_factual_signal_only_and_test_outcome_refreshes_active_t
             platforms: vec![],
             constraints: vec![],
             acceptance_conditions: vec![],
-            artifact_hints: vec![],
+            artifact_hints: vec!["src/search_results_page.tsx".to_owned()],
             interface_hints: vec![],
             open_questions: vec![],
         },

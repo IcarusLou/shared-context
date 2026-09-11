@@ -1,3 +1,23 @@
+//! What the M3 Engineering Graph still guarantees, now that the Pack no longer consults it.
+//!
+//! Three of this file's four tests were about the Graph as a retrieval channel into an automatic
+//! Context Pack -- the exact Artifact reached from a Focus, the relation hops off it, the
+//! `artifact_generation` the Pack reported, the ambiguous edge that had to stay a diagnostic, and
+//! the frozen safety a Graph snapshot lent a revision whose current head had been withdrawn.
+//! ADR-0007 removed that channel, and the ruling that followed made it deliberate: the Graph's job
+//! is relocation bookkeeping.
+//!
+//! Two of those claims are worth naming because they did not merely move, they stopped being
+//! expressible. An *ambiguous* Engineering Reference -- one whose locator several Artifacts answer
+//! -- was refused by the Graph resolver and therefore never injected; Lane A joins on the
+//! `(repository, path)` the Reference itself records, where there is nothing to be ambiguous about,
+//! so the Context it names is reachable again. And `ContextSafetySource::EngineeringGraphSnapshot`,
+//! the frozen revision a Pack could still inject after the current one was withdrawn, has no
+//! producer left: every lane item is `CurrentProjection`, and a withdrawn Context is simply absent.
+//!
+//! What survives is the multilanguage scan oracle: moves and renames are marked missing, and a
+//! rebuild reports them. That is resolution, and ADR-0007 does not touch it.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -7,23 +27,18 @@ use std::{
 };
 
 use sctx_domain::{
-    Applicability, ArtifactKind, ContextGovernanceStatus, ContextId, ContextKind,
-    ContextRelationKind, ContextRevisionDraft, EvidenceSnapshotDraft, EvidenceType,
-    PublicationAction, PublicationDraft, ReferenceId, RepositoryId, RepositoryIdentity,
-    ResolutionStatus, ResolvedFocus, SpaceId, TaskId, WorkingIntentSnapshot,
+    ArtifactKind, ReferenceId, RepositoryId, RepositoryIdentity, ResolutionStatus, ResolvedFocus,
+    TaskId, WorkingIntentSnapshot,
 };
 use sctx_engineering_graph::{
     EngineeringProjection, EngineeringProjectionStore, EngineeringReferenceResolver,
     ProjectedEngineeringReference, RepositoryScanOutcome, RepositoryScanPlan, RepositoryScanner,
     RepositoryScannerLimits, RepositorySnapshot, SourceLanguage, build_graph_context_snapshots,
 };
-use sctx_event_schema::{Event, EventPayload, ParsedEvent, parse_event};
-use sctx_git_store::{AppendRequest, GitStore};
+use sctx_event_schema::{ParsedEvent, parse_event};
+use sctx_git_store::GitStore;
 use sctx_index::{IndexMetadata, ProjectionIndex};
-use sctx_search::{
-    ContextPackMode, ContextSafetySource, SearchEngine, TaskContextPack, TaskContextRequest,
-    TaskRetrievalPath, estimate_task_context_payload_tokens,
-};
+use sctx_search::{ContextPackMode, SearchEngine, TaskContextRequest, TaskRetrievalPath};
 use serde::Deserialize;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -41,6 +56,9 @@ struct Oracle {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+// The oracle file is the schema; this mirrors it whole so a field that stops being read here is
+// still a field the fixture is required to carry.
+#[allow(dead_code)]
 struct Expected {
     repository_id: String,
     spaces: BTreeMap<String, String>,
@@ -73,6 +91,7 @@ struct ExpectedArtifact {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[allow(dead_code)]
 struct ExpectedRelation {
     source: String,
     target: String,
@@ -82,7 +101,6 @@ struct ExpectedRelation {
 
 struct MilestoneThreeFixture {
     _temporary: TempDir,
-    store: GitStore,
     root: PathBuf,
     repository_path: PathBuf,
     oracle: Oracle,
@@ -193,7 +211,6 @@ impl MilestoneThreeFixture {
             .unwrap();
         Self {
             _temporary: temporary,
-            store,
             root,
             repository_path,
             oracle,
@@ -434,418 +451,6 @@ fn fixed_multilanguage_oracle_marks_moves_and_renames_missing_and_rebuilds() {
             .all(|path| { !matches!(path, TaskRetrievalPath::EngineeringGraph { .. }) })
     );
 }
-
-#[test]
-#[allow(clippy::too_many_lines)]
-fn fixed_graph_oracle_opens_requirement_decision_contract_and_cross_platform_validation() {
-    let fixture = MilestoneThreeFixture::new();
-    let symbol_signal = fixture
-        .reference("symbol")
-        .resolution
-        .resolved_artifact
-        .as_ref()
-        .unwrap()
-        .locator()
-        .clone();
-    let pack = fixture
-        .engine()
-        .task_context_pack(&task_request(
-            ResolvedFocus {
-                repository_id: fixture.repository.repository_id.clone(),
-                locator: symbol_signal.clone(),
-            },
-            ContextPackMode::AutomaticInjection,
-            fixture.oracle.expected.token_budget,
-            "zxq inspect current implementation",
-        ))
-        .unwrap();
-
-    assert_pack_generations_and_budget(&fixture, &pack);
-    let expected_contexts = [
-        "decision",
-        "contract",
-        "ios_validation",
-        "android_validation",
-    ]
-    .into_iter()
-    .map(|name| fixture.oracle.expected.contexts[name].clone())
-    .collect::<BTreeSet<_>>();
-    assert_eq!(context_ids(&pack), expected_contexts);
-    assert!(pack.associations.iter().any(|association| {
-        association.space_id == parse_id::<SpaceId>(&fixture.oracle.expected.spaces["requirement"])
-    }));
-    let domain = fixture.index.domain_snapshot().unwrap();
-    assert_eq!(
-        {
-            let intent = &domain.projection.spaces
-                [&parse_id::<SpaceId>(&fixture.oracle.expected.spaces["requirement"])]
-                .intent;
-            let head = intent.heads.iter().next().unwrap();
-            &intent.revisions[head].intent.title
-        },
-        "Search Results Requirement",
-        "the direct Symbol association lands in the hand-authored Requirement Intent"
-    );
-    assert_direct_graph_reference(
-        &pack,
-        &fixture.oracle.expected.contexts["decision"],
-        &fixture.oracle.expected.references["symbol"],
-    );
-    for relation in &fixture.oracle.expected.relations_from_symbol {
-        assert_relation_path(&pack, relation);
-    }
-    assert_cycle_safe_and_bounded(&pack);
-
-    for reference_name in ["api", "schema"] {
-        let exact_signal = fixture
-            .reference(reference_name)
-            .resolution
-            .resolved_artifact
-            .as_ref()
-            .unwrap()
-            .locator()
-            .clone();
-        let cross_end = fixture
-            .engine()
-            .task_context_pack(&task_request(
-                ResolvedFocus {
-                    repository_id: fixture.repository.repository_id.clone(),
-                    locator: exact_signal,
-                },
-                ContextPackMode::AutomaticInjection,
-                fixture.oracle.expected.token_budget,
-                "zxs opaque route",
-            ))
-            .unwrap();
-        assert_pack_generations_and_budget(&fixture, &cross_end);
-        assert_eq!(context_ids(&cross_end), expected_contexts);
-        assert_direct_graph_reference(
-            &cross_end,
-            &fixture.oracle.expected.contexts["contract"],
-            &fixture.oracle.expected.references[reference_name],
-        );
-        for target in ["decision", "ios_validation", "android_validation"] {
-            let item = context_item(&cross_end, &fixture.oracle.expected.contexts[target]);
-            assert!(item.retrieval_paths.iter().any(|path| matches!(
-                path,
-                TaskRetrievalPath::EngineeringGraph { relation_hops, .. }
-                    if relation_hops.len() == 1
-            )));
-        }
-        assert_cycle_safe_and_bounded(&cross_end);
-    }
-
-    let mut bounded_request = task_request(
-        ResolvedFocus {
-            repository_id: fixture.repository.repository_id.clone(),
-            locator: symbol_signal,
-        },
-        ContextPackMode::AutomaticInjection,
-        fixture.oracle.expected.bounded_token_budget,
-        "zxt budget graph output",
-    );
-    bounded_request.max_spaces = 2;
-    let bounded = fixture
-        .engine()
-        .task_context_pack(&bounded_request)
-        .unwrap();
-    assert_eq!(
-        bounded.estimated_tokens,
-        estimate_task_context_payload_tokens(&bounded)
-    );
-    assert!(bounded.estimated_tokens <= bounded.token_budget);
-    assert!(bounded.associations.len() <= 2);
-    assert!(!bounded.omitted.is_empty());
-}
-
-#[test]
-#[allow(clippy::too_many_lines)]
-fn ambiguous_and_unavailable_edges_diagnose_or_fall_back_without_automatic_graph_injection() {
-    let fixture = MilestoneThreeFixture::new();
-    let ambiguous = fixture.reference("ambiguous");
-    assert_eq!(ambiguous.resolution.status, ResolutionStatus::Ambiguous);
-    assert_eq!(ambiguous.resolution.candidates.len(), 1);
-    assert!(ambiguous.association.is_none());
-    let ambiguous_locator = ambiguous.resolution.candidates[0].locator().clone();
-
-    let explicit = fixture
-        .engine()
-        .task_context_pack(&task_request(
-            ResolvedFocus {
-                repository_id: fixture.repository.repository_id.clone(),
-                locator: ambiguous_locator.clone(),
-            },
-            ContextPackMode::Explicit,
-            fixture.oracle.expected.token_budget,
-            "ambiguous Symbol association",
-        ))
-        .unwrap();
-    let ambiguous_item = context_item(&explicit, &fixture.oracle.expected.contexts["ambiguous"]);
-    assert!(ambiguous_item.retrieval_paths.iter().any(|path| matches!(
-        path,
-        TaskRetrievalPath::GraphDiagnostic { diagnostic }
-            if diagnostic.reference_id
-                == parse_id::<ReferenceId>(&fixture.oracle.expected.references["ambiguous"])
-                && diagnostic.resolution_status == ResolutionStatus::Ambiguous
-                && diagnostic.candidate_artifact_keys.len() == 1
-    )));
-
-    let automatic = fixture
-        .engine()
-        .task_context_pack(&task_request(
-            ResolvedFocus {
-                repository_id: fixture.repository.repository_id.clone(),
-                locator: ambiguous_locator,
-            },
-            ContextPackMode::AutomaticInjection,
-            fixture.oracle.expected.token_budget,
-            "zxu no textual fallback",
-        ))
-        .unwrap();
-    assert!(!context_ids(&automatic).contains(&fixture.oracle.expected.contexts["ambiguous"]));
-    assert!(
-        automatic
-            .items
-            .iter()
-            .flat_map(|item| &item.retrieval_paths)
-            .all(|path| {
-                !matches!(
-                    path,
-                    TaskRetrievalPath::EngineeringGraph { .. }
-                        | TaskRetrievalPath::GraphDiagnostic { .. }
-                )
-            })
-    );
-
-    let domain = fixture.index.domain_snapshot().unwrap();
-    let references = domain
-        .projection
-        .engineering_references
-        .values()
-        .map(|reference| ProjectedEngineeringReference {
-            context_id: reference.context_id,
-            revision_id: reference.revision_id,
-            reference: reference.reference.clone(),
-        })
-        .collect::<Vec<_>>();
-    let unavailable = EngineeringReferenceResolver
-        .resolve(
-            &references,
-            &[RepositoryScanOutcome::Unavailable {
-                repository_id: fixture.repository.repository_id.clone(),
-                reason: "fixed oracle checkout unavailable".to_owned(),
-            }],
-            &fixture.projection.contexts,
-        )
-        .unwrap();
-    assert!(unavailable.references.iter().all(|reference| {
-        reference.resolution.status == ResolutionStatus::Unavailable
-            && reference.association.is_none()
-    }));
-    fixture
-        .graph_store
-        .rebuild_for_context_tree(&unavailable, Some(&fixture.metadata.indexed_tree_oid))
-        .unwrap();
-    let fallback = fixture
-        .engine()
-        .task_context_pack(&task_request(
-            ResolvedFocus {
-                repository_id: fixture.repository.repository_id.clone(),
-                locator: fixture
-                    .projection
-                    .references
-                    .iter()
-                    .find(|reference| {
-                        reference.reference_id
-                            == parse_id::<ReferenceId>(
-                                &fixture.oracle.expected.references["symbol"],
-                            )
-                    })
-                    .unwrap()
-                    .resolution
-                    .resolved_artifact
-                    .as_ref()
-                    .unwrap()
-                    .locator()
-                    .clone(),
-            },
-            ContextPackMode::AutomaticInjection,
-            fixture.oracle.expected.token_budget,
-            "frontend renders SearchEnvelopeClient",
-        ))
-        .unwrap();
-    assert_eq!(
-        fallback.artifact_generation.as_deref(),
-        Some(unavailable.artifact_generation.as_str())
-    );
-    assert!(
-        context_ids(&fallback).contains(&fixture.oracle.expected.contexts["decision"]),
-        "Intent/Context BM25 fallback remains usable when the Repository is unavailable"
-    );
-    assert!(
-        fallback
-            .items
-            .iter()
-            .flat_map(|item| &item.retrieval_paths)
-            .all(|path| {
-                !matches!(
-                    path,
-                    TaskRetrievalPath::EngineeringGraph { .. }
-                        | TaskRetrievalPath::GraphDiagnostic { .. }
-                )
-            })
-    );
-    assert_eq!(
-        fallback.estimated_tokens,
-        estimate_task_context_payload_tokens(&fallback)
-    );
-    assert!(fallback.estimated_tokens <= fallback.token_budget);
-}
-
-#[test]
-#[allow(clippy::too_many_lines)]
-fn adapter_injects_frozen_safe_revision_after_current_revision_is_withdrawn() {
-    let fixture = MilestoneThreeFixture::new();
-    let decision_space = parse_id::<SpaceId>(&fixture.oracle.expected.spaces["requirement"]);
-    let decision_context = parse_id::<ContextId>(&fixture.oracle.expected.contexts["decision"]);
-    let decision_revision = parse_id(&fixture.oracle.expected.revisions["decision"]);
-    let before = fixture.index.domain_snapshot().unwrap();
-    let context = &before.projection.spaces[&decision_space].contexts[&decision_context];
-    let ContextGovernanceStatus::Accepted {
-        publication_id: previous_publication,
-        ..
-    } = context.governance
-    else {
-        panic!("fixed decision must be accepted before Graph build")
-    };
-    let revision_event = Event::context_revised(
-        decision_space,
-        decision_context,
-        vec![decision_revision],
-        ContextRevisionDraft {
-            problem_view: None,
-            hints: Vec::new(),
-            kind: ContextKind::Decision,
-            topic_key: Some("search/frontend-rendering".to_owned()),
-            statement: "withdrawncurrentneedle replaces the historical Graph decision".to_owned(),
-            rationale: "The current Store moves independently from an explicit Graph build"
-                .to_owned(),
-            applicability: Applicability {
-                domains: vec!["search".to_owned()],
-                platforms: vec!["fe".to_owned()],
-                conditions: vec!["v2 response".to_owned()],
-            },
-            assumptions: vec!["the Graph is not rebuilt".to_owned()],
-            recheck_when: vec!["an explicit association rebuild occurs".to_owned()],
-            relations: Vec::new(),
-            evidence: vec![EvidenceSnapshotDraft {
-                kind: EvidenceType::ExperimentRecord,
-                supports: "The replacement Revision was appended".to_owned(),
-                content: serde_json::json!({"result": "appended"}),
-                interpretation: "Current governance can advance independently".to_owned(),
-                limitations: vec!["synthetic #147 fixture".to_owned()],
-            }],
-        },
-        None,
-    )
-    .unwrap();
-    let EventPayload::ContextRevisionAdded { revision, .. } = revision_event.payload() else {
-        unreachable!()
-    };
-    let current_revision = revision.revision_id;
-    fixture
-        .store
-        .append_event(AppendRequest::event(revision_event))
-        .unwrap();
-    let publish_event = Event::publication_changed(
-        decision_space,
-        decision_context,
-        PublicationDraft {
-            previous_publication_ids: vec![previous_publication],
-            action: PublicationAction::Publish,
-            revision_id: current_revision,
-            review_event_ids: Vec::new(),
-        },
-        None,
-    )
-    .unwrap();
-    let EventPayload::ContextPublicationChanged { publication, .. } = publish_event.payload()
-    else {
-        unreachable!()
-    };
-    let current_publication = publication.publication_id;
-    fixture
-        .store
-        .append_event(AppendRequest::event(publish_event))
-        .unwrap();
-    fixture
-        .store
-        .append_event(AppendRequest::event(
-            Event::publication_changed(
-                decision_space,
-                decision_context,
-                PublicationDraft {
-                    previous_publication_ids: vec![current_publication],
-                    action: PublicationAction::Withdraw,
-                    revision_id: current_revision,
-                    review_event_ids: Vec::new(),
-                },
-                None,
-            )
-            .unwrap(),
-        ))
-        .unwrap();
-    fixture.index.synchronize().unwrap();
-    let after = fixture.index.domain_snapshot().unwrap();
-    assert!(matches!(
-        after.projection.spaces[&decision_space].contexts[&decision_context].governance,
-        ContextGovernanceStatus::Deprecated { revision_id, .. }
-            if revision_id == current_revision
-    ));
-
-    let locator = fixture
-        .reference("symbol")
-        .resolution
-        .resolved_artifact
-        .as_ref()
-        .unwrap()
-        .locator()
-        .clone();
-    let pack = fixture
-        .engine()
-        .task_context_pack(&task_request(
-            ResolvedFocus {
-                repository_id: fixture.repository.repository_id.clone(),
-                locator,
-            },
-            ContextPackMode::AutomaticInjection,
-            fixture.oracle.expected.token_budget,
-            "opaque historical graph injection",
-        ))
-        .unwrap();
-    let item = pack
-        .items
-        .iter()
-        .find(|item| item.context.context_id == decision_context)
-        .unwrap();
-    assert_eq!(item.context.revision_id, decision_revision);
-    assert_eq!(item.context.status, sctx_search::ContextStatus::Accepted);
-    assert!(item.context.auto_injection_eligible);
-    assert!(matches!(
-        item.context.safety_source,
-        ContextSafetySource::EngineeringGraphSnapshot { revision_id, .. }
-            if revision_id == decision_revision
-    ));
-    let rendered = sctx_agent_adapter::render_untrusted_task_context_pack(&pack).unwrap();
-    assert!(rendered.contains("frontend renders SearchEnvelopeClient"));
-    assert!(!rendered.contains("withdrawncurrentneedle"));
-    let mut mismatched_provenance = pack.clone();
-    mismatched_provenance.graph_context_tree_oid = Some("wrong-build-tree".to_owned());
-    assert!(
-        sctx_agent_adapter::render_untrusted_task_context_pack(&mismatched_provenance).is_err()
-    );
-}
-
 fn assert_multilanguage_snapshot(fixture: &MilestoneThreeFixture) {
     let actual_languages = fixture
         .snapshot
@@ -888,119 +493,6 @@ fn assert_multilanguage_snapshot(fixture: &MilestoneThreeFixture) {
             .all(|observation| planned_paths.contains(observation.path.as_str()))
     }));
 }
-
-fn assert_pack_generations_and_budget(fixture: &MilestoneThreeFixture, pack: &TaskContextPack) {
-    assert_eq!(pack.indexed_tree_oid, fixture.metadata.indexed_tree_oid);
-    assert_eq!(
-        pack.projection_generation,
-        fixture.metadata.projection_generation
-    );
-    assert_eq!(
-        pack.artifact_generation.as_deref(),
-        Some(fixture.projection.artifact_generation.as_str())
-    );
-    let snapshot = fixture.graph_store.read_snapshot().unwrap().unwrap();
-    assert_eq!(
-        snapshot.context_tree_oid.as_deref(),
-        Some(pack.indexed_tree_oid.as_str())
-    );
-    assert_eq!(pack.graph_context_tree_oid, snapshot.context_tree_oid);
-    assert_eq!(
-        snapshot.projection.artifact_generation,
-        pack.artifact_generation.as_deref().unwrap()
-    );
-    for path in pack.items.iter().flat_map(|item| &item.retrieval_paths) {
-        if let TaskRetrievalPath::EngineeringGraph { path, .. } = path {
-            assert_eq!(
-                Some(path.artifact_generation.as_str()),
-                pack.artifact_generation.as_deref()
-            );
-        }
-    }
-    assert_eq!(
-        pack.estimated_tokens,
-        estimate_task_context_payload_tokens(pack)
-    );
-    assert!(pack.estimated_tokens <= pack.token_budget);
-}
-
-fn assert_direct_graph_reference(pack: &TaskContextPack, context: &str, reference: &str) {
-    let item = context_item(pack, context);
-    assert!(
-        item.retrieval_paths.iter().any(|path| matches!(
-            path,
-            TaskRetrievalPath::EngineeringGraph { path, relation_hops }
-                if path.reference_id == parse_id::<ReferenceId>(reference)
-                    && path.resolution_status == ResolutionStatus::Resolved
-                    && relation_hops.is_empty()
-        )),
-        "missing direct Graph path for Context {context} and Reference {reference}"
-    );
-}
-
-fn assert_relation_path(pack: &TaskContextPack, expected: &ExpectedRelation) {
-    let target = context_item(pack, &expected.target);
-    assert!(
-        target.retrieval_paths.iter().any(|path| match path {
-            TaskRetrievalPath::EngineeringGraph { relation_hops, .. }
-            | TaskRetrievalPath::ContextRelation {
-                hops: relation_hops,
-            } => relation_hops.iter().any(|hop| {
-                hop.source_context_id == parse_id::<ContextId>(&expected.source)
-                    && hop.target_context_id == parse_id::<ContextId>(&expected.target)
-                    && relation_kind_name(hop.kind) == expected.kind
-                    && hop.depth == expected.depth
-            }),
-            _ => false,
-        }),
-        "missing fixed relation {} -> {} ({}, depth {})",
-        expected.source,
-        expected.target,
-        expected.kind,
-        expected.depth
-    );
-}
-
-fn assert_cycle_safe_and_bounded(pack: &TaskContextPack) {
-    let ids = context_ids(pack);
-    assert_eq!(
-        ids.len(),
-        pack.items.len(),
-        "cycles must not duplicate Context items"
-    );
-    for path in pack.items.iter().flat_map(|item| &item.retrieval_paths) {
-        let hops = match path {
-            TaskRetrievalPath::EngineeringGraph { relation_hops, .. } => relation_hops,
-            TaskRetrievalPath::ContextRelation { hops } => hops,
-            _ => continue,
-        };
-        assert!(hops.len() <= 2);
-        assert!(hops.iter().all(|hop| hop.depth <= 2));
-        let mut visited = BTreeSet::new();
-        for hop in hops {
-            assert!(visited.insert(hop.source_context_id));
-        }
-        if let Some(last) = hops.last() {
-            assert!(!visited.contains(&last.target_context_id));
-        }
-    }
-}
-
-fn context_ids(pack: &TaskContextPack) -> BTreeSet<String> {
-    pack.items
-        .iter()
-        .map(|item| item.context.context_id.to_string())
-        .collect()
-}
-
-fn context_item<'a>(pack: &'a TaskContextPack, context: &str) -> &'a sctx_search::TaskContextItem {
-    let context = parse_id::<ContextId>(context);
-    pack.items
-        .iter()
-        .find(|item| item.context.context_id == context)
-        .unwrap_or_else(|| panic!("missing fixed Context {context}"))
-}
-
 fn resolved<'a>(
     projection: &'a EngineeringProjection,
     reference: &str,
@@ -1114,17 +606,5 @@ fn artifact_kind(kind: &str) -> ArtifactKind {
         "schema" => ArtifactKind::Schema,
         "file" => ArtifactKind::File,
         other => panic!("unsupported fixed Artifact kind {other}"),
-    }
-}
-
-const fn relation_kind_name(kind: ContextRelationKind) -> &'static str {
-    match kind {
-        ContextRelationKind::DependsOn => "depends_on",
-        ContextRelationKind::Constrains => "constrains",
-        ContextRelationKind::Implements => "implements",
-        ContextRelationKind::ValidatedBy => "validated_by",
-        ContextRelationKind::Contradicts => "contradicts",
-        ContextRelationKind::Supersedes => "supersedes",
-        ContextRelationKind::RelatedTo => "related_to",
     }
 }

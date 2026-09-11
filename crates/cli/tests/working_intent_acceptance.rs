@@ -24,6 +24,9 @@ fn append(store: &GitStore, event: Event) {
     store.append_event(AppendRequest::event(event)).unwrap();
 }
 
+/// The file the oracle Context is recorded against, and the hint the Working Intent names it with.
+const RENDERER_FILE: &str = "src/search/searchresultrenderer.ts";
+
 fn seed_text_context(store: &GitStore) -> usize {
     let space = Event::space_created(
         IntentSnapshot {
@@ -92,6 +95,25 @@ fn seed_text_context(store: &GitStore) -> usize {
     append(store, review);
     append(
         store,
+        Event::engineering_reference_recorded(
+            context_id,
+            revision_id,
+            sctx_domain::EngineeringReferenceDraft {
+                repository_id: "Web".parse().unwrap(),
+                artifact_kind: sctx_domain::ArtifactKind::File,
+                relation: sctx_domain::ReferenceRelation::Implements,
+                locator: sctx_domain::ArtifactLocator::File {
+                    path: sctx_domain::RepoRelativePath::new(RENDERER_FILE).unwrap(),
+                },
+                supports: "the oracle Context is about the renderer file".to_owned(),
+                limitations: vec!["fixed local oracle".to_owned()],
+            },
+            None,
+        )
+        .unwrap(),
+    );
+    append(
+        store,
         Event::publication_changed(
             space_id,
             context_id,
@@ -105,7 +127,8 @@ fn seed_text_context(store: &GitStore) -> usize {
         )
         .unwrap(),
     );
-    4
+    // Space, revision, review, Reference, publication.
+    5
 }
 
 fn input(
@@ -145,9 +168,13 @@ fn fixed_working_intent_cross_layer_oracle() {
     .unwrap();
     assert_eq!(initial.revision_status, IntentRevisionStatus::Created);
 
+    // The hint names a file rather than a symbol, because a hint is an anchor now: ADR-0007 reads
+    // the spellings that read as a path and joins them against the Engineering Reference rows. A
+    // bare `SearchResultRenderer` is still a legal hint and still recorded on the Intent; it simply
+    // names no file, so it anchors nothing.
     let hinted = WorkingIntentSnapshot {
         goal: "Implement search".to_owned(),
-        artifact_hints: vec!["SearchResultRenderer".to_owned()],
+        artifact_hints: vec![RENDERER_FILE.to_owned()],
         interface_hints: vec!["search-v2-endpoint".to_owned()],
         ..WorkingIntentSnapshot::new("Implement search").unwrap()
     };
@@ -169,26 +196,14 @@ fn fixed_working_intent_cross_layer_oracle() {
             .retrieval_paths
             .iter()
             .flat_map(|item| &item.paths)
-            .any(|path| matches!(
-                path,
-                sctx_search::TaskRetrievalPath::WorkingIntentHintText { .. }
-            ))
-    );
-    assert!(
-        changed
-            .context
-            .retrieval_paths
-            .iter()
-            .flat_map(|item| &item.paths)
-            .all(|path| !matches!(
-                path,
-                sctx_search::TaskRetrievalPath::EngineeringGraph { .. }
-            ))
+            .all(|path| matches!(path, sctx_search::TaskRetrievalPath::FileAnchor { .. })),
+        "a hint reaches knowledge by naming a file, and by nothing else: {:#?}",
+        changed.context.retrieval_paths
     );
 
     let mut equivalent = hinted.clone();
     equivalent.goal = "  IMPLEMENT   search ".to_owned();
-    equivalent.artifact_hints[0] = "searchresultrenderer".to_owned();
+    equivalent.artifact_hints[0] = RENDERER_FILE.to_uppercase();
     let retry = task_intent_update_at_root(
         &root,
         &input(
@@ -288,7 +303,11 @@ fn fixed_working_intent_cross_layer_oracle() {
         .unwrap()
         .projection;
     assert!(projection.candidates.is_empty());
-    assert!(projection.engineering_references.is_empty());
+    // The corpus seeded exactly one Reference, on the Context. Working Intent activity adds none:
+    // a hint that names a file is read as a coordinate at retrieval time and never written down as
+    // one, which is what keeps the Intent a disposable local note rather than a source of
+    // engineering facts.
+    assert_eq!(projection.engineering_references.len(), 1);
     assert_eq!(
         outcomes
             .iter()
