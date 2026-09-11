@@ -39,7 +39,7 @@
         "expected_revision_id": {"type": "null"},
         "intent": {"type": "object", "fields": {
           "goal": {"type": "string", "value": "establish a synthetic dynamic workflow"},
-          "artifact_hints": {"type": "array", "items": [{"type": "string", "value": "synthetic focus resource"}]}
+          "artifact_hints": {"type": "array", "items": [{"type": "string", "value": "src/focus.rs"}]}
         }}
       }}}
     },
@@ -52,7 +52,7 @@
         "expected_revision_id": {"type": "variable", "name": "revision-one"},
         "intent": {"type": "object", "fields": {
           "goal": {"type": "string", "value": " establish   a SYNTHETIC dynamic workflow "},
-          "artifact_hints": {"type": "array", "items": [{"type": "string", "value": "synthetic focus resource"}]}
+          "artifact_hints": {"type": "array", "items": [{"type": "string", "value": "src/focus.rs"}]}
         }}
       }}}
     },
@@ -65,7 +65,7 @@
         "expected_revision_id": {"type": "variable", "name": "revision-retry"},
         "intent": {"type": "object", "fields": {
           "goal": {"type": "string", "value": "validate the accepted synthetic focus resource"},
-          "artifact_hints": {"type": "array", "items": [{"type": "string", "value": "synthetic focus resource"}]}
+          "artifact_hints": {"type": "array", "items": [{"type": "string", "value": "src/focus.rs"}]}
         }}
       }}}
     },

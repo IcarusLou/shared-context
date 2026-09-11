@@ -251,17 +251,22 @@ fn serve_mcp(_client: &str) {
                     }
                 }
                 if name == "task_artifact_focus" {
+                    // A Focus anchors the file its coordinate lives in; it does not consult the
+                    // Engineering Graph (ADR-0007).
                     data.insert(
                         "retrieval_paths".to_owned(),
-                        json!([{"source": "engineering_graph"}]),
+                        json!([{"source": "file_anchor"}]),
                     );
                 }
                 if name == "task_context"
                     && arguments.get("emit_hint").and_then(Value::as_bool) == Some(true)
                 {
+                    // A Working Intent Hint that names a file is a Lane A anchor now, so the route
+                    // it produces is `file_anchor` (ADR-0007). The scenario invariant still asks
+                    // the same question: the Hint reached knowledge, and no Graph path came with it.
                     data.insert(
                         "retrieval_paths".to_owned(),
-                        json!([{"source": "working_intent_hint_text"}]),
+                        json!([{"source": "file_anchor"}]),
                     );
                 }
                 json!({

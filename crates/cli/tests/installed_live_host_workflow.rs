@@ -838,12 +838,16 @@ fn installed_codex_direct_evidence_replay_recovery_and_cursor_lifecycle_use_publ
         .iter()
         .find(|item| item["context"]["context_id"] == confirmed["context_id"])
         .unwrap_or_else(|| panic!("Session B missed Session A Context: {focus:#}"));
+    // Session B reaches Session A's Context by the file both Sessions name, not through the
+    // Engineering Graph: ADR-0007's first lane joins the Focus coordinate against the Engineering
+    // Reference rows in the index.
     assert!(
         focused["retrieval_paths"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|path| path["source"] == "engineering_graph")
+            .all(|path| path["source"] == "file_anchor"),
+        "{focused:#}"
     );
     let search = run_json_cli(
         &installed,

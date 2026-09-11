@@ -678,7 +678,13 @@ struct SafeStepFacts {
     domain_ids: BTreeSet<String>,
     string_hashes: BTreeSet<[u8; 32]>,
     has_engineering_graph: bool,
-    has_working_intent_hint: bool,
+    /// Whether the response carries a Lane A Retrieval Path.
+    ///
+    /// This used to be `has_working_intent_hint`, reading the `working_intent_hint_text` tag an
+    /// automatic Pack emitted when a Hint matched Context prose as text. ADR-0007 keeps the Hint
+    /// and drops the matching: a Hint that reads as a path is an anchor, and the route it produces
+    /// is `file_anchor`. The invariants below ask the same questions of the new tag.
+    has_file_anchor: bool,
     confirmation: Option<SafeConfirmationFacts>,
     expected_failure: Option<(String, String)>,
     observation: Option<ProvenObservation>,
@@ -1039,9 +1045,10 @@ fn evaluate_assertions(
                 )
             }
             InvariantKind::WorkingIntentHintHasNoGraphPath { response } => (
-                state.facts.get(response.as_str()).is_some_and(|facts| {
-                    facts.has_working_intent_hint && !facts.has_engineering_graph
-                }),
+                state
+                    .facts
+                    .get(response.as_str())
+                    .is_some_and(|facts| facts.has_file_anchor && !facts.has_engineering_graph),
                 "working_intent_hint_graph_path_mismatch",
             ),
             InvariantKind::ArtifactFocusIsRequestScoped {
@@ -1056,7 +1063,7 @@ fn evaluate_assertions(
                         .facts
                         .get(focused_response.as_str())
                         .is_some_and(|facts| {
-                            facts.has_engineering_graph && facts.string_hashes.contains(&path_hash)
+                            facts.has_file_anchor && facts.string_hashes.contains(&path_hash)
                         })
                         && state
                             .facts
@@ -1231,7 +1238,7 @@ fn safe_step_facts(value: &Value, observation: Option<ProvenObservation>) -> Saf
     collect_domain_ids(value, &mut facts.domain_ids);
     collect_string_hashes(value, &mut facts.string_hashes);
     facts.has_engineering_graph = contains_engineering_graph(value);
-    facts.has_working_intent_hint = contains_exact_string(value, "working_intent_hint_text");
+    facts.has_file_anchor = contains_exact_string(value, "file_anchor");
     facts.confirmation = confirmation_facts(value);
     facts
 }

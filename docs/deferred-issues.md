@@ -85,3 +85,11 @@
 ## 2026-09-11 新增（R0 语料 join 修复期间发现）
 
 40. **bge-m3 探针未在修复后复测**：R0 把语义语料从 `context_fts`（`normalize_search_text` 输出）切回 `context_revision` 原文，`association_probe_ext_semantic_f2llm` 已三次复跑确认（29/39 lexical、32/39 fused 不变，最差正样本 4127→4553bp），但同一改动同样改变 `association_probe_ext_semantic`（bge-m3 臂）编码的每一条语料，而本机没有 bge-m3 权重、该测试 `#[ignore]` 且无法运行。该文件的断言以自身 lexical control 为基准、外加一条对 `SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`(5200) 的噪声天花板断言——后者是唯一可能因语料换空间而翻的。`association_probe_ext_semantic_f2llm` 里的 `BGE_CROSS_LINGUAL_HITS`/`BGE_PARAPHRASE_HITS`（2/8）是从那次 2026-09-07 的 bge-m3 运行抄来的常量，也一并未复核。升级条件：任何人手上有 bge-m3 export 时跑一次该 suite；若噪声天花板失守，属于 bge-m3 臂的重标定，不影响默认 F2LLM 路径。
+
+## 2026-09-11 新增（S2-4/S2-4b 双径重建的边界记录）
+
+41. **径 A 反查 miss 时未咨询 relocation 记录**（裁定 4 的跟进项）。ADR-0007 的第一径把 Focus 或 Signal 解析出的 `(repository, path)` 与 index 里的 `engineering_reference` 行做**精确**匹配。此前图谱通道用 `MatchBasis` 解析，因此一个已经改名/移动的文件仍能反查到它的 Context；现在改名即失联——文件叫新名字，Reference 记的是旧名字，两边对不上，包里就什么都没有。这是有意的取舍而不是疏漏：图谱已裁定降级为 relocation 记账，pack 侧自解释实测负价值。跟进方向也因此是现成的——`a_renamed_artifact_is_reported_as_a_relocation_candidate_and_never_resolved` 证明 relocation 候选已经被记下来了，径 A 在精确匹配落空时可以再查一次这份记录，把「旧路径 → 新路径」的映射补上。升级条件：真实会话里观察到因改名而空包的案例，或 relocation 记录的准确率有了实测基线。在此之前，空包是诚实的答案。
+
+42. **`ContextPackMode::Explicit` 是不可达的死代码，随 B1 一并清点**（裁定 5）。全仓唯一的生产 `TaskContextRequest` 构造点是 `crates/mcp/src/lib.rs` 的 `build_task_context_response`，它永远用 `TaskContextRequest::automatic`，因此没有任何 MCP 工具或 CLI 命令能构造出 Explicit 模式的包。ADR-0007 之后这条模式是融合栈（八通道加权 RRF、`AUTOMATIC_RELEVANCE_FLOOR_BASIS_POINTS`、词法覆盖门、`AutomaticQueryTokenExplanation`）在 pack 侧仅剩的入口；那套机器另一个存活理由是 `task_space_associations`，而它的唯一生产消费者是 candidate 分析栈（B1 冻结）。两者要一起看：B1 解冻时，先确认 candidate 侧还需要哪些通道，再把 Explicit 模式与它拖着的常量族一并删掉，而不是分两次拆。本轮只做了 pack 侧退役，没有删这些符号。
+
+43. **同一次 Checkpoint 落下的多条 Claim 互为种子扩展**。Candidate Build 会把来源 Task 的问题附到它产出的每一份 draft 上，所以一次 Checkpoint 里的几条 Claim 拿到的是**同一个** `problem_view`；ADR-0007 的种子扩展正是按 `problem_view` 相等来连边的，于是它们在包里互相带出来——哪怕内容彼此无关。`retrieval_quality_workflow` 的「unrelated sibling」就是这个形状，该测试现在钉的是**路径**而不是缺席：兄弟条目只能以 `seed_expansion` 出现在一条已锚定 Context 旁边，永远不能自己锚一个它并不引用的文件。这是否算噪声取决于一个尚未实测的判断——「同一次 Checkpoint 提交的东西是不是同一件工作」。S2-2 的前提说是（真实装置上 map 会话的三条 Context 共享一个 `problem_view`，正是要一起读的），这个 fixture 说不一定。升级条件：真实流量里统计同 `problem_view` 兄弟条目的被采纳率；若明显偏低，候选修法是让 Build 按 Claim 而不是按 Task 派生 `problem_view`，而不是去动种子扩展。

@@ -384,23 +384,45 @@ fn public_m2_retrieval_quality_workflow() {
         json!({
             "task_boundary": "new",
             "expected_revision_id": grouped_task["intent_revision_id"],
-            "intent": {"goal": "qualitystrong exact phrase"},
+            // The Claim named `src/quality/fallback.rs`, so confirmation recorded a
+            // server-derived Engineering Reference for it. A Session working on that file is what
+            // reaches the Context now -- the exact phrase in the goal reaches nothing on its own,
+            // which is the whole of ADR-0007's change to this workflow.
+            "intent": {
+                "goal": "qualitystrong exact phrase",
+                "artifact_hints": ["src/quality/fallback.rs"]
+            },
             "detail_level": "full"
         }),
     );
     let strong_items = strong_task["items"].as_array().unwrap();
-    assert!(strong_items.iter().any(|item| {
-        item["context"]["context_id"] == first_confirmed["context_id"]
-            && item["retrieval_paths"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|path| path["source"] == "context_fts")
-    }));
     assert!(
-        strong_items
+        strong_items.iter().any(|item| {
+            item["context"]["context_id"] == first_confirmed["context_id"]
+                && item["retrieval_paths"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|path| path["source"] == "file_anchor")
+        }),
+        "{strong_task:#}"
+    );
+    // The sibling Claim comes with it, and by a route the old Pack did not have: both Claims were
+    // checkpointed from one Task, so Candidate Build derived the same `problem_view` for both, and
+    // ADR-0007's seed expansion is exactly that edge. It used to be excluded because it shared no
+    // phrase with the query. What is asserted now is the route, because the route is the claim:
+    // a sibling arrives as a `seed_expansion` off an anchored Context, never as a match of its own.
+    let sibling = strong_items
+        .iter()
+        .find(|item| item["context"]["context_id"] == second_confirmed["context_id"])
+        .unwrap_or_else(|| panic!("the co-checkpointed sibling: {strong_task:#}"));
+    assert!(
+        sibling["retrieval_paths"]
+            .as_array()
+            .unwrap()
             .iter()
-            .all(|item| item["context"]["context_id"] != second_confirmed["context_id"])
+            .all(|path| path["source"] == "seed_expansion"),
+        "{sibling:#}"
     );
 
     let generic_task = mcp_tool(
@@ -457,10 +479,9 @@ fn public_m2_retrieval_quality_workflow() {
         }),
     );
     // The Claim statement names `src/quality/fallback.rs`, so confirmation records a
-    // server-derived Engineering Reference for it and the Focus now resolves through the
-    // Engineering Graph instead of the text fallback. The text-fallback path itself stays
-    // covered by `sctx-search`'s graph_retrieval suite and the MCP engineering workflow.
-    assert!(focused["context"]["artifact_generation"].is_string());
+    // server-derived Engineering Reference for it, and the Focus reaches the Context by anchoring
+    // that exact file. No Graph generation comes with it: the Pack does not read the Graph.
+    assert!(focused["context"]["artifact_generation"].is_null());
     let focused_item = focused["context"]["items"]
         .as_array()
         .unwrap()
@@ -472,15 +493,20 @@ fn public_m2_retrieval_quality_workflow() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|path| path["source"] == "engineering_graph")
+            .all(|path| path["source"] == "file_anchor"),
+        "{focused_item:#}"
     );
     assert!(
-        focused["context"]["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|item| item["context"]["context_id"] != second_confirmed["context_id"]),
-        "the unreferenced sibling Context must stay out of the Focus payload: {focused:#}"
+        focused["context"]["items"].as_array().unwrap().iter().all(
+            |item| item["context"]["context_id"] != second_confirmed["context_id"]
+                || item["retrieval_paths"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|path| path["source"] == "seed_expansion")
+        ),
+        "the sibling may only ever arrive off an anchored Context, never by anchoring a file it \
+         does not reference: {focused:#}"
     );
 }
 
