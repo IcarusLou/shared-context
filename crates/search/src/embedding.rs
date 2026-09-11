@@ -121,6 +121,40 @@ pub const SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS: u16 = 5_200;
 /// are both true -- which makes this a restoration of the floor's meaning, not evidence for a new
 /// value. Re-deriving one belongs to the rebuild work, against a re-encoded corpus, not to the fix
 /// that made re-deriving meaningful.
+///
+/// ## Re-read in the clean space, 2026-09-11, and deliberately left at 2800
+///
+/// That re-derivation was done, and it changed the floor's *job* rather than its value.
+/// `embedding_hop2_admission_calibration.rs` scores the six Working Intents of
+/// `fixtures/association/hard-negative-v1.json` -- goal, current direction and in-scope list joined
+/// exactly as `semantic_query_text` joins them -- against the Contexts of the two topics each
+/// Intent is *not* about. This floor admits **31 of those 96 off-topic Contexts, 32.3%**. Per
+/// Intent the pass rate runs from 0/16 to 13/16, and the single highest off-topic score is 5125.
+///
+/// The value is nonetheless unchanged, because that number is not evidence against it.
+///
+/// * **The failure it describes is structural, not numerical.** Ranking is intact on the same run:
+///   every Intent's best on-topic Context beats its best off-topic one by 2902 to 5584 basis
+///   points, without exception. So the encoder knows which Contexts belong to the task, and the
+///   floor is simply not the thing that acts on that knowledge -- it admits a third of the corpus
+///   and leaves the ordering to decide the rest. Raising a number cannot convert a ranking signal
+///   into an admission decision; that is what the second hop's
+///   [`SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS`] is for, and on the same six Intents it admits
+///   0 of 96.
+/// * **Raising it would break the job this floor still has.** Under the two-lane design the
+///   intent-text path is retired from automatic injection and what remains behind this floor is
+///   explicit `context_search`, where a caller asked for a broad list and a short human phrase is
+///   the query. The calibration above measured that population directly: positives run 2403--8588
+///   with the main mass starting at 3217, so a floor anywhere near the document-side 5200 would
+///   refuse most of what an explicit search exists to return. The two floors are not two opinions
+///   about one boundary; they cut two different distributions for two different callers.
+/// * **This corpus cannot settle the question it would have to settle.** `hard-negative-v1` holds
+///   no noise queries, which is the constraint that set 2800 in the first place, and its Intents
+///   were written alongside its Contexts -- so they share vocabulary a real Working Intent, written
+///   before the work is understood, does not. The device run behind ADR-0007 is the honest evidence
+///   on that path and it is worse than this one: five real Intents scored against a real corpus
+///   took their top hit from an unrelated topic every time, with the highest at 5501. That is the
+///   defect the architecture change addresses, and no value of this constant addresses it.
 pub const QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS: u16 = 2_800;
 
 /// Cosine a candidate Context must reach against a *seed Context* to be admitted by the second hop.
