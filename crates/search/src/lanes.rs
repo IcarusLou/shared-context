@@ -298,32 +298,19 @@ pub(crate) fn lane_a_hits(
     Ok(hits)
 }
 
-/// Which retrieval field carried a seed to a Context no file anchors.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NonSemanticEdgeKind {
-    /// Both Contexts restate the same problem. On the measured installation the map Session's
-    /// three Contexts share one `problem_view` and only one of them is file anchored.
-    ProblemView,
-    /// Both Contexts carry the same non-empty `topic_key`.
-    TopicKey,
-}
-
-impl NonSemanticEdgeKind {
-    /// The `context_revision` column this edge compares.
-    const fn column(self) -> &'static str {
-        match self {
-            Self::ProblemView => "problem_view",
-            Self::TopicKey => "topic_key",
-        }
-    }
-}
-
-/// One zero-cost edge that carried a seed one hop.
+/// One zero-cost edge that carried a seed one hop: a `problem_view` two Contexts both restate.
+///
+/// S2-2 proposed two such fields and only this one survived review. `topic_key` was removed rather
+/// than left switched off, on two independent counts: the association fixture in this repository
+/// files every Context under one `topic_key`, so admitting on it injected an unrelated Context into
+/// a Session working on something else; and on a real installation the generated key's `kind`
+/// prefix does not follow a Context through a kind rewrite, which is a known defect filed
+/// separately. A classification that is coarse in the fixture and stale in the field is unreliable
+/// at both ends, and a retrieval edge has to be reliable at one of them. Restoring it is a decision
+/// to take after that defect is fixed, not a constant to flip.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct NonSemanticEdge {
-    pub kind: NonSemanticEdgeKind,
-    /// The shared field value, as written. A `why` line renders it truncated.
+    /// The shared `problem_view`, as written. A `why` line renders it truncated.
     pub value: String,
     /// The seed this edge started from.
     pub from_context_id: ContextId,
@@ -346,28 +333,23 @@ impl ExpandedSeed {
     }
 }
 
-/// Adds every accepted Context that shares a `problem_view` or a non-empty `topic_key` with one of
-/// `seeds`.
+/// Adds every accepted Context that restates the same non-empty `problem_view` as one of `seeds`.
 ///
 /// Step 0b measured 10 of 26 injectable Contexts on a real installation with no Engineering
 /// Reference at all -- 38%, and they are exactly the cross-cutting kinds: a contrast-ratio finding,
 /// a module-level test-availability discovery, a downgrade risk. No file can reach them, and
-/// ADR-0007 names that a signal problem rather than a threshold problem. These two fields are the
-/// signal the corpus already carries: two Contexts written against the same restated problem, or
-/// filed under the same topic, are related by authorship rather than by a cosine.
+/// ADR-0007 names that a signal problem rather than a threshold problem. A restated problem is the
+/// signal the corpus already carries: two Contexts written against the same one were written about
+/// the same work, which is a fact about authorship rather than about a cosine.
 ///
 /// **The expansion is one hop and stops.** The edges of the Contexts it returns are not followed,
 /// because a repeated hop over a field this coarse walks the whole corpus in two or three steps.
 ///
-/// Both edge kinds are returned and the caller decides what each one is worth. That decision is not
-/// symmetric and the assembler makes it explicitly: a shared `problem_view` places a Context in the
-/// Pack, a shared `topic_key` does not, because a `topic_key` is a classification and a coarse one
-/// reaches across an installation. A Context this function returns is a seed only if the caller
-/// also places it -- placing and seeding are the same decision, since Lane B never judges a Context
-/// that is already in the Pack, and a Context seeded without being placed would be reachable by
-/// neither.
+/// A Context this function returns is a seed only if the caller also places it in the Pack. Placing
+/// and seeding are the same decision: Lane B never judges a Context that is already in the Pack, so
+/// a Context seeded without being placed would be reachable by neither.
 ///
-/// An empty seed set expands to nothing: these edges carry a seed, they do not create one. A
+/// An empty seed set expands to nothing: this edge carries a seed, it does not create one. A
 /// Session Lane A could not anchor at all therefore stays empty, which is what the 17-hour Session
 /// of Step 0b actually does.
 ///
@@ -385,41 +367,28 @@ pub(crate) fn expand_seeds_once(
         .iter()
         .map(|(context_id, _)| *context_id)
         .collect::<BTreeSet<_>>();
-    let fields = read_seed_edge_fields(connection, seeds)?;
+    let wanted = read_seed_problem_views(connection, seeds)?;
     let mut reached =
         BTreeMap::<(ContextId, RevisionId, SpaceId), BTreeSet<NonSemanticEdge>>::new();
-    for kind in [
-        NonSemanticEdgeKind::ProblemView,
-        NonSemanticEdgeKind::TopicKey,
-    ] {
-        let wanted = fields
-            .iter()
-            .filter(|(edge, _)| edge.0 == kind)
-            .map(|(edge, sources)| (edge.1.clone(), sources.clone()))
-            .collect::<BTreeMap<_, _>>();
-        if wanted.is_empty() {
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    for (context_id, revision_id, space_id, value) in
+        contexts_sharing(connection, &wanted.keys().cloned().collect::<Vec<_>>())?
+    {
+        if seeded.contains(&context_id) {
             continue;
         }
-        for (context_id, revision_id, space_id, value) in contexts_sharing(
-            connection,
-            kind,
-            &wanted.keys().cloned().collect::<Vec<_>>(),
-        )? {
-            if seeded.contains(&context_id) {
-                continue;
-            }
-            let Some(sources) = wanted.get(&value) else {
-                continue;
-            };
-            reached
-                .entry((context_id, revision_id, space_id))
-                .or_default()
-                .extend(sources.iter().map(|from_context_id| NonSemanticEdge {
-                    kind,
-                    value: value.clone(),
-                    from_context_id: *from_context_id,
-                }));
-        }
+        let Some(sources) = wanted.get(&value) else {
+            continue;
+        };
+        reached
+            .entry((context_id, revision_id, space_id))
+            .or_default()
+            .extend(sources.iter().map(|from_context_id| NonSemanticEdge {
+                value: value.clone(),
+                from_context_id: *from_context_id,
+            }));
     }
     Ok(reached
         .into_iter()
@@ -434,69 +403,59 @@ pub(crate) fn expand_seeds_once(
         .collect())
 }
 
-/// The non-empty `problem_view` and `topic_key` values the seeds carry, each mapped to the seeds
-/// that carry it.
+/// The non-empty `problem_view` values the seeds carry, each mapped to the seeds that carry it.
 ///
-/// A `NULL` or blank field is not an edge: it is the absence of a classification, and treating
-/// every unclassified Context as related to every other unclassified Context would make the
-/// expansion a corpus dump.
-fn read_seed_edge_fields(
+/// A `NULL` or blank field is not an edge: it is the absence of a restated problem, and treating
+/// every Context without one as related to every other Context without one would make the expansion
+/// a corpus dump.
+fn read_seed_problem_views(
     connection: &Connection,
     seeds: &[(ContextId, RevisionId)],
-) -> Result<BTreeMap<(NonSemanticEdgeKind, String), BTreeSet<ContextId>>> {
+) -> Result<BTreeMap<String, BTreeSet<ContextId>>> {
     let revisions = seeds
         .iter()
         .map(|(_, revision_id)| revision_id.to_string())
         .collect::<Vec<_>>();
     let mut statement = connection
         .prepare(&format!(
-            "SELECT context_id, COALESCE(problem_view, ''), COALESCE(topic_key, '')
+            "SELECT context_id, COALESCE(problem_view, '')
              FROM context_revision
              WHERE revision_id IN ({})",
             placeholders(revisions.len())
         ))
-        .map_err(sql_error("prepare seed edge field read"))?;
+        .map_err(sql_error("prepare seed problem view read"))?;
     let mut rows = statement
         .query(params_from_iter(revisions))
-        .map_err(sql_error("execute seed edge field read"))?;
-    let mut fields = BTreeMap::<(NonSemanticEdgeKind, String), BTreeSet<ContextId>>::new();
-    while let Some(row) = rows.next().map_err(sql_error("read seed edge field row"))? {
+        .map_err(sql_error("execute seed problem view read"))?;
+    let mut fields = BTreeMap::<String, BTreeSet<ContextId>>::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(sql_error("read seed problem view row"))?
+    {
         let context_id: ContextId = parse_id(
             &row.get::<_, String>(0)
                 .map_err(sql_error("read seed Context"))?,
         )?;
-        for (index, kind) in [
-            NonSemanticEdgeKind::ProblemView,
-            NonSemanticEdgeKind::TopicKey,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let value: String = row
-                .get(index + 1)
-                .map_err(sql_error("read seed edge field"))?;
-            if !value.trim().is_empty() {
-                fields.entry((kind, value)).or_default().insert(context_id);
-            }
+        let value: String = row.get(1).map_err(sql_error("read seed problem view"))?;
+        if !value.trim().is_empty() {
+            fields.entry(value).or_default().insert(context_id);
         }
     }
     Ok(fields)
 }
 
-/// Every accepted, injectable Context whose edge field equals one of `values`.
+/// Every accepted, injectable Context whose `problem_view` equals one of `values`.
 fn contexts_sharing(
     connection: &Connection,
-    kind: NonSemanticEdgeKind,
     values: &[String],
 ) -> Result<Vec<(ContextId, RevisionId, SpaceId, String)>> {
-    let column = kind.column();
     let mut statement = connection
         .prepare(&format!(
-            "SELECT item.context_id, revision.revision_id, item.space_id, revision.{column}
+            "SELECT item.context_id, revision.revision_id, item.space_id, revision.problem_view
              FROM context_revision AS revision
              JOIN context_item AS item USING(context_id)
              WHERE {SAFE_ACCEPTED_CONTEXT_PREDICATE}
-               AND revision.{column} IN ({})
+               AND revision.problem_view IN ({})
              ORDER BY item.context_id",
             placeholders(values.len())
         ))
@@ -1424,7 +1383,6 @@ mod tests {
         assert!(
             expanded.iter().all(|seed| seed.edges
                 == [NonSemanticEdge {
-                    kind: NonSemanticEdgeKind::ProblemView,
                     value: PROBLEM.to_owned(),
                     from_context_id: anchored.context,
                 }]),
@@ -1432,8 +1390,16 @@ mod tests {
         );
     }
 
+    /// A shared `topic_key` is not an edge, and neither is a shared absence of one.
+    ///
+    /// The first half is the S2-4b ruling: `topic_key` was proposed as a second zero-cost edge and
+    /// removed instead of switched off. It is coarse where it is present -- this repository's own
+    /// association fixture files every Context under one key -- and stale where it matters, because
+    /// the generated key's `kind` prefix does not follow a Context through a kind rewrite. The two
+    /// Contexts here share a topic *and* a surface and are still unreachable from each other,
+    /// because neither restates a problem.
     #[test]
-    fn a_shared_non_empty_topic_key_is_an_edge_and_an_absent_one_is_not() {
+    fn a_shared_topic_key_is_not_an_edge_and_neither_is_a_shared_absence() {
         const TOPIC: &str = "risk:Android:search_live_badge.xml";
         let corpus = Corpus::new();
         let anchored = corpus.accept_grouped(
@@ -1442,7 +1408,7 @@ mod tests {
             Some(TOPIC),
         );
         corpus.reference(anchored, "Android", "res/layout/search_live_badge.xml");
-        let sibling = corpus.accept_grouped(
+        let topic_sibling = corpus.accept_grouped(
             "the white label text against the new gradient is a contrast-ratio risk",
             None,
             Some(TOPIC),
@@ -1457,38 +1423,41 @@ mod tests {
         ]);
         let expanded = corpus.expand(&seeds.iter().map(LaneAHit::seed).collect::<Vec<_>>());
 
-        assert_eq!(
-            expanded
-                .iter()
-                .map(|seed| (seed.context_id, seed.edges.clone()))
-                .collect::<Vec<_>>(),
-            [(
-                sibling.context,
-                vec![NonSemanticEdge {
-                    kind: NonSemanticEdgeKind::TopicKey,
-                    value: TOPIC.to_owned(),
-                    from_context_id: anchored.context,
-                }]
-            )],
-            "two Contexts with no classification at all are not related by having none: \
-             {unclassified_other:?} must stay out"
+        assert!(
+            expanded.is_empty(),
+            "a shared topic is not a shared problem ({topic_sibling:?}), and two Contexts with no \
+             classification at all are not related by having none ({unclassified_other:?}): \
+             {expanded:#?}"
         );
     }
 
-    /// One hop, and then it stops. `problem_view` and `topic_key` are coarse enough that a second
-    /// hop would walk a whole installation in a step or two.
+    /// The expansion is one hop, and with one equality field that is now structural rather than
+    /// guarded.
+    ///
+    /// A Context carries exactly one `problem_view`, so every Context an expansion can reach shares
+    /// the seed's problem, and expanding again from the result asks the same question and gets the
+    /// same answer. While `topic_key` was also an edge this mattered: a Context could arrive by
+    /// problem and leave by topic, and a repeated hop would walk an installation in two or three
+    /// steps. It is asserted rather than assumed because the day a second edge field returns, this
+    /// is the property that stops holding, and the failure should be a red test rather than a
+    /// corpus dump in somebody's Pack.
     #[test]
     fn the_expansion_never_follows_the_edges_of_what_it_just_reached() {
+        const PROBLEM: &str = "shared problem";
         let corpus = Corpus::new();
-        let seed = corpus.accept_grouped("the anchored reading", Some("shared problem"), None);
+        let seed = corpus.accept_grouped("the anchored reading", Some(PROBLEM), None);
         corpus.reference(seed, "Android", "app/src/Seed.kt");
         let one_hop = corpus.accept_grouped(
-            "one hop away, by problem view",
-            Some("shared problem"),
+            "one hop away, restating the seed's problem",
+            Some(PROBLEM),
+            None,
+        );
+        // Same surface, same topic, a different problem. Nothing reaches it, at any number of hops.
+        let other_problem = corpus.accept_grouped(
+            "a reading of the same file under a different problem",
+            Some("a different problem entirely"),
             Some("shared topic"),
         );
-        let two_hops =
-            corpus.accept_grouped("two hops away, by topic key", None, Some("shared topic"));
 
         let seeds = corpus.hits(&[anchor("Android", "app/src/Seed.kt")]);
         let expanded = corpus.expand(&seeds.iter().map(LaneAHit::seed).collect::<Vec<_>>());
@@ -1499,21 +1468,18 @@ mod tests {
                 .map(|seed| seed.context_id)
                 .collect::<Vec<_>>(),
             [one_hop.context],
-            "the second hop is reachable and deliberately not taken: {two_hops:?}"
+            "{other_problem:?} restates a different problem and is reached by nothing"
         );
         let twice = seeds
             .iter()
             .map(LaneAHit::seed)
             .chain(expanded.iter().map(ExpandedSeed::seed))
             .collect::<Vec<_>>();
-        assert_eq!(
-            corpus
-                .expand(&twice)
-                .iter()
-                .map(|seed| seed.context_id)
-                .collect::<Vec<_>>(),
-            [two_hops.context],
-            "a caller that chose to hop again would reach it; this function never does"
+        assert!(
+            corpus.expand(&twice).is_empty(),
+            "expanding from the result asks the same question of the same field, so a caller that \
+             chose to hop again would learn nothing -- which is what makes the single hop a \
+             property of the edge rather than a bound this function has to enforce"
         );
     }
 

@@ -44,8 +44,8 @@ mod candidate;
 pub mod embedding;
 mod lanes;
 
-/// The facts a lane [`TaskRetrievalPath`] has to be able to name.
-pub use lanes::{AnchorMatchBasis, AnchorSource, NonSemanticEdgeKind};
+/// The two anchor facts a Lane A [`TaskRetrievalPath`] has to be able to name.
+pub use lanes::{AnchorMatchBasis, AnchorSource};
 
 pub use embedding::{
     DocumentVectorSnapshot, EmbeddingProvider, EmbeddingSemanticChannel, EncodeLatencySummary,
@@ -896,20 +896,18 @@ pub enum TaskRetrievalPath {
         anchor_count: usize,
     },
     /// The seed expansion between the two lanes (ADR-0007's S2-2 edge). This Context restates the
-    /// same problem, or is filed under the same topic, as a Context the Session anchored.
+    /// same problem as a Context the Session anchored.
     ///
     /// It is the one route to the knowledge no file can reach. On the installation Step 0b
     /// measured, 10 of 26 injectable Contexts carried no Engineering Reference at all -- a
     /// contrast-ratio finding, a module-level test-availability discovery, a downgrade risk -- and
     /// they are cross-cutting by nature rather than by omission. The edge is authorship, not
     /// vocabulary: two Contexts written against the same restated problem were written about the
-    /// same work, and an absent classification is never an edge to another absent one.
+    /// same work, and an absent problem is never an edge to another absent one.
     SeedExpansion {
         /// The anchored Context this one was reached from.
         from_context_id: ContextId,
-        /// Which field carried it.
-        edge: NonSemanticEdgeKind,
-        /// The shared value, as written.
+        /// The shared `problem_view`, as written.
         value: String,
     },
     /// Lane B (ADR-0007). A Context the Session already reached admitted this one on the cosine of
@@ -6247,21 +6245,10 @@ fn retrieve_lanes(
     // ADR-0007 names, restated rather than repaired. They are also excluded from Lane B's
     // candidate set by construction, being seeds, so this is their only route.
     for seed in &expanded {
-        // Only a shared `problem_view` puts an expanded seed in the Pack. Both edges widen Lane B's
-        // question, where a cosine still has to be cleared before anything is injected, but only
-        // one of them is evidence on its own. A `problem_view` is a problem an Agent restated for
-        // one piece of work, so two Contexts carrying the same one were written about the same
-        // work. A `topic_key` is a classification, and a coarse one reaches across a whole
-        // installation: the association fixture in this repository files every Context under
-        // `task/association-fixture`, and admitting on that would have injected the live-tag
-        // Context into a Session working on the POI map. Erring high is the standing rule.
-        let Some(strongest) = seed
+        let strongest = seed
             .edges
-            .iter()
-            .find(|edge| edge.kind == NonSemanticEdgeKind::ProblemView)
-        else {
-            continue;
-        };
+            .first()
+            .expect("an expanded seed carries the edge that reached it");
         // It is a seed because it is in the Pack, and for no other reason. The two are the same
         // fact: Lane B never judges a Context that is already there, so a Context promoted to seed
         // without being placed would be excluded from both and reachable by nothing. That is how a
@@ -6276,7 +6263,6 @@ fn retrieve_lanes(
             score_basis_points: LANE_EXPANSION_ASSOCIATION_SCORE_BASIS_POINTS,
             path: TaskRetrievalPath::SeedExpansion {
                 from_context_id: strongest.from_context_id,
-                edge: strongest.kind,
                 value: strongest.value.clone(),
             },
         });
@@ -7034,14 +7020,9 @@ fn compact_item_reasons(item: &TaskContextItem, sole_repository: Option<&str>) -
             }),
             TaskRetrievalPath::SeedExpansion {
                 from_context_id,
-                edge,
                 value,
             } => reasons.push(format!(
-                "restates the {} of {}: {}",
-                match edge {
-                    NonSemanticEdgeKind::ProblemView => "problem",
-                    NonSemanticEdgeKind::TopicKey => "topic",
-                },
+                "restates the problem of {}: {}",
                 short_identity(*from_context_id),
                 truncate_chars(value, EXPANSION_EDGE_REASON_MAX_CHARS)
             )),
@@ -7133,7 +7114,7 @@ fn compact_item_reasons(item: &TaskContextItem, sole_repository: Option<&str>) -
     reasons
 }
 
-/// Characters of a shared `problem_view` or `topic_key` one `why` sentence prints.
+/// Characters of a shared `problem_view` one `why` sentence prints.
 ///
 /// The value is a restated problem an Agent wrote, so it can be a paragraph. The sentence needs
 /// enough of it to be recognized, never all of it.
