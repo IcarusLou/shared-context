@@ -32,6 +32,16 @@ const REUSED_STATEMENT: &str =
 const IGNORED_STATEMENT: &str = "quorum ledger replay tolerates truncated segments during recovery";
 const GOAL: &str = "quorum ledger replay";
 
+/// The file every fixture Context here is recorded against, and the Working Intent hint that
+/// reaches it.
+///
+/// ADR-0007 retrieves by anchor: a Context is injected because the Session touched a file it is
+/// recorded against. None of these tests is about retrieval -- they are about what the server
+/// records *after* an injection, and how that record feeds back -- so they need the cheapest honest
+/// anchor there is. An `artifact_hints` spelling is exactly that, and it is the one anchor source
+/// an MCP caller can supply without a Hook: a field of the Working Intent the Agent already writes.
+const LEDGER_FILE: &str = "src/ledger/replay.ts";
+
 fn accepted_context(root: &Path, statement: &str) -> (SpaceId, ContextId, RevisionId) {
     let store = GitStore::bootstrap_local(root).unwrap();
     let space = Event::space_created(
@@ -110,7 +120,33 @@ fn accepted_context(root: &Path, statement: &str) -> (SpaceId, ContextId, Revisi
             .unwrap(),
         ))
         .unwrap();
+    anchor_to_ledger_file(&store, context_id, revision_id);
     (space_id, context_id, revision_id)
+}
+
+/// Records the Engineering Reference that makes one Context reachable by Lane A.
+fn anchor_to_ledger_file(store: &GitStore, context_id: ContextId, revision_id: RevisionId) {
+    store
+        .append_event(AppendRequest::event(
+            Event::engineering_reference_recorded(
+                context_id,
+                revision_id,
+                sctx_domain::EngineeringReferenceDraft {
+                    repository_id: "Ledger".parse().unwrap(),
+                    artifact_kind: ArtifactKind::File,
+                    relation: ReferenceRelation::Implements,
+                    locator: ArtifactLocator::File {
+                        path: RepoRelativePath::new(LEDGER_FILE).unwrap(),
+                    },
+                    supports: "the usage fixture anchors this Context to the replay file"
+                        .to_owned(),
+                    limitations: vec!["Synthetic fixture".to_owned()],
+                },
+                None,
+            )
+            .unwrap(),
+        ))
+        .unwrap();
 }
 
 fn intent_update(root: &Path, session: &str) -> sctx_mcp::TaskIntentUpdateResponse {
@@ -130,7 +166,7 @@ fn intent_update(root: &Path, session: &str) -> sctx_mcp::TaskIntentUpdateRespon
                 platforms: Vec::new(),
                 constraints: Vec::new(),
                 acceptance_conditions: vec!["The Pack is returned".to_owned()],
-                artifact_hints: Vec::new(),
+                artifact_hints: vec![LEDGER_FILE.to_owned()],
                 interface_hints: Vec::new(),
                 open_questions: Vec::new(),
             },
@@ -564,7 +600,7 @@ fn a_context_quoted_into_the_working_intent_is_reuse() {
                 platforms: Vec::new(),
                 constraints: Vec::new(),
                 acceptance_conditions: vec!["The Pack is returned".to_owned()],
-                artifact_hints: Vec::new(),
+                artifact_hints: vec![LEDGER_FILE.to_owned()],
                 interface_hints: Vec::new(),
                 open_questions: Vec::new(),
             },
@@ -866,6 +902,7 @@ fn sibling_context(root: &Path, space_id: SpaceId, statement: &str) -> ContextId
             .unwrap(),
         ))
         .unwrap();
+    anchor_to_ledger_file(&store, context_id, revision_id);
     context_id
 }
 

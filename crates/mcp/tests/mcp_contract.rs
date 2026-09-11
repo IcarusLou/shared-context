@@ -16,9 +16,9 @@ use sctx_domain::{
     ContextKind, ContextRelation, ContextRelationKind, ContextRevisionDraft, DecisionSource,
     EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot,
     NormalizedWorkObservation, OptionalCandidateEdits, ProblemViewEdit, PublicationAction,
-    PublicationDraft, RepositoryId, ReviewDraft, ReviewVerdict, RevisionId, SemanticConflictStatus,
-    SpaceId, SubmissionId, TaskId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkSourceRef,
-    WorkingIntentSnapshot, candidate_submission_content_hash,
+    PublicationDraft, RepositoryId, RevisionId, SemanticConflictStatus, SpaceId, SubmissionId,
+    TaskId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkSourceRef, WorkingIntentSnapshot,
+    candidate_submission_content_hash,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
@@ -38,7 +38,6 @@ use sctx_mcp::{
     task_checkpoint_at_root, task_context_readonly_at_root, task_intent_update_at_root,
     task_signal_supersede_at_root,
 };
-use sctx_search::{TaskRetrievalPath, WorkingIntentHintField, WorkingIntentHintTarget};
 use sctx_task_runtime::{
     AgentCheckpointSubmission, AgentCheckpointWrite, CandidateBuildItemPreparation,
     CandidateBuildItemStatus, CandidateBuildStatus, CheckpointBoundary, CheckpointClaimDraft,
@@ -4499,11 +4498,10 @@ fn cursor_and_codex_fixtures_initialize_read_and_list_spaces() {
         assert_eq!(pack["detail_level"], "compact");
         assert!(pack.get("retrieval_paths").is_none());
         assert!(pack.get("compact_items").is_none());
-        // The one explanation compact keeps: its three totals, never the token lists.
-        let explanation = &pack["query_token_explanation"];
-        assert!(explanation["selected_token_count"].as_u64().is_some());
-        assert!(explanation["answerable_token_count"].as_u64().is_some());
-        assert_eq!(explanation["selected_tokens"], serde_json::json!([]));
+        // Automatic injection selects no query token, because it asks no query: ADR-0007 reaches
+        // knowledge through the files the Session opened, so there is no token selection left to
+        // explain and the field is absent rather than empty.
+        assert!(pack.get("query_token_explanation").is_none());
         assert_eq!(pack["task_fingerprint"].as_str().unwrap().len(), 64);
         assert!(pack["tree"].as_str().is_some());
         assert!(pack["generation"].as_u64().is_some());
@@ -5880,22 +5878,14 @@ fn retrieval_tools_default_to_compact_and_expose_full_on_request() {
 
     let compact = &responses[1]["result"]["structuredContent"];
     assert_eq!(compact["detail_level"], "compact");
-    // The compact payload keeps the token-selection totals and drops the token lists with every
-    // other explanation channel.
-    assert_eq!(
-        compact["query_token_explanation"]["selected_tokens"],
-        serde_json::json!([])
-    );
-    assert!(
-        compact["query_token_explanation"]["selected_token_count"]
-            .as_u64()
-            .is_some()
-    );
     for absent in [
         "retrieval_paths",
         "compact_items",
         "artifact_generation",
         "graph_context_tree_oid",
+        // No query is asked on the automatic path, so there is no token selection to explain in
+        // either shape. It used to be the one explanation the compact payload kept.
+        "query_token_explanation",
     ] {
         assert!(
             compact.get(absent).is_none(),
@@ -5919,10 +5909,8 @@ fn retrieval_tools_default_to_compact_and_expose_full_on_request() {
     assert_eq!(full["detail_level"], "full");
     assert!(full["retrieval_paths"].as_array().is_some());
     assert!(
-        full["query_token_explanation"]["selected_tokens"]
-            .as_array()
-            .is_some(),
-        "the explainable payload names the automatic query tokens even with zero associations"
+        full.get("query_token_explanation").is_none(),
+        "neither shape explains a token selection any more, because neither makes one"
     );
     assert!(full.get("compact_items").is_none());
     assert_eq!(full["task_fingerprint"], compact["task_fingerprint"]);
@@ -6354,201 +6342,13 @@ fn task_intent_update_supports_created_already_current_continue_and_explicit_new
     );
     assert_eq!(external.active_task_id, next.context.task_id);
 }
-
-#[test]
-#[allow(clippy::too_many_lines)]
-fn working_intent_hint_text_is_returned_without_an_engineering_graph() {
-    let fixture = Fixture::new();
-    let space = Event::space_created(
-        IntentSnapshot {
-            title: "Search renderer".to_owned(),
-            problem: "SearchResultRenderer needs search-v2-endpoint history".to_owned(),
-            desired_outcome: "Reuse the historical interface decision".to_owned(),
-            in_scope: vec!["SearchResultRenderer".to_owned()],
-            out_of_scope: Vec::new(),
-            acceptance_conditions: vec!["search-v2-endpoint remains compatible".to_owned()],
-            domain_terms: Vec::new(),
-        },
-        None,
-    )
-    .unwrap();
-    let EventPayload::SpaceCreated {
-        space_id: hint_space_id,
-        ..
-    } = space.payload()
-    else {
-        unreachable!()
-    };
-    let hint_space_id = *hint_space_id;
-    append(&fixture.store, space);
-    let context = Event::context_revision_added(
-        hint_space_id,
-        ContextRevisionDraft {
-            problem_view: None,
-            hints: Vec::new(),
-            kind: ContextKind::Contract,
-            topic_key: Some("search/v2".to_owned()),
-            statement: "SearchResultRenderer consumes search-v2-endpoint".to_owned(),
-            rationale: "The interface hint should retrieve this text only".to_owned(),
-            applicability: Applicability::default(),
-            assumptions: Vec::new(),
-            recheck_when: Vec::new(),
-            relations: Vec::new(),
-            evidence: vec![EvidenceSnapshotDraft {
-                kind: EvidenceType::ExperimentRecord,
-                supports: "The fixed oracle context is searchable".to_owned(),
-                content: json!({"actual": "searchable"}),
-                interpretation: "This Evidence belongs to Context, never Working Intent".to_owned(),
-                limitations: vec!["Fixed local fixture".to_owned()],
-            }],
-        },
-        None,
-    )
-    .unwrap();
-    let (hint_context_id, hint_revision_id) = context_identity(&context);
-    append(&fixture.store, context);
-    let review = Event::context_reviewed(
-        hint_space_id,
-        hint_context_id,
-        ReviewDraft {
-            revision_id: hint_revision_id,
-            verdict: ReviewVerdict::Approve,
-            reason: "Hint Context is safe for automatic retrieval".to_owned(),
-        },
-        None,
-    )
-    .unwrap();
-    let review_event_id = review.event_id();
-    append(&fixture.store, review);
-    append(
-        &fixture.store,
-        Event::publication_changed(
-            hint_space_id,
-            hint_context_id,
-            PublicationDraft {
-                previous_publication_ids: Vec::new(),
-                action: PublicationAction::Publish,
-                revision_id: hint_revision_id,
-                review_event_ids: vec![review_event_id],
-            },
-            None,
-        )
-        .unwrap(),
-    );
-    let knowledge_before = serde_json::to_vec(
-        &ProjectionIndex::for_store(&fixture.store)
-            .domain_snapshot()
-            .unwrap()
-            .projection,
-    )
-    .unwrap();
-    let initial = task_intent_update_at_root(
-        &fixture.root,
-        &TaskIntentUpdateInput {
-            agent_kind: "codex".to_owned(),
-            external_session_id: "hint-text".to_owned(),
-            task_boundary: TaskBoundary::New,
-            expected_revision_id: ExpectedRevisionId::Null(()),
-            intent: WorkingIntentSnapshot::new("Implement search").unwrap(),
-        },
-    )
-    .unwrap();
-    let mut intent = WorkingIntentSnapshot::new("Implement search").unwrap();
-    intent.artifact_hints = vec!["SearchResultRenderer".to_owned()];
-    intent.interface_hints = vec!["search-v2-endpoint".to_owned()];
-    let response = task_intent_update_at_root(
-        &fixture.root,
-        &TaskIntentUpdateInput {
-            agent_kind: "codex".to_owned(),
-            external_session_id: "hint-text".to_owned(),
-            task_boundary: TaskBoundary::Continue,
-            expected_revision_id: ExpectedRevisionId::Revision(
-                initial.context.intent_revision_id.to_string(),
-            ),
-            intent,
-        },
-    )
-    .unwrap();
-    let item = response
-        .context
-        .items
-        .iter()
-        .find(|item| item.context.context_id == hint_context_id)
-        .unwrap();
-    let hint_paths = item
-        .retrieval_paths
-        .iter()
-        .filter_map(|path| {
-            let TaskRetrievalPath::WorkingIntentHintText { explanation } = path else {
-                return None;
-            };
-            Some(explanation)
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(hint_paths.len(), 4);
-    assert_eq!(
-        hint_paths
-            .iter()
-            .map(|path| (path.source_field, path.target))
-            .collect::<std::collections::BTreeSet<_>>(),
-        [
-            (
-                WorkingIntentHintField::ArtifactHints,
-                WorkingIntentHintTarget::SpaceIntentFts,
-            ),
-            (
-                WorkingIntentHintField::ArtifactHints,
-                WorkingIntentHintTarget::AcceptedContextFts,
-            ),
-            (
-                WorkingIntentHintField::InterfaceHints,
-                WorkingIntentHintTarget::SpaceIntentFts,
-            ),
-            (
-                WorkingIntentHintField::InterfaceHints,
-                WorkingIntentHintTarget::AcceptedContextFts,
-            ),
-        ]
-        .into_iter()
-        .collect()
-    );
-    assert!(hint_paths.iter().all(|path| {
-        path.phrase_match
-            && path.query_token_coverage_basis_points == 10_000
-            && path.fusion_contribution_micros > 0
-            && !path.matched_tokens.is_empty()
-    }));
-    assert!(
-        item.retrieval_paths
-            .iter()
-            .all(|path| { !matches!(path, TaskRetrievalPath::EngineeringGraph { .. }) })
-    );
-    let encoded_paths = serde_json::to_string(&item.retrieval_paths).unwrap();
-    assert!(encoded_paths.contains("\"source\":\"working_intent_hint_text\""));
-    assert!(encoded_paths.contains("\"source_field\":\"artifact_hints\""));
-    assert!(encoded_paths.contains("\"source_field\":\"interface_hints\""));
-    assert!(encoded_paths.contains("\"target\":\"space_intent_fts\""));
-    assert!(encoded_paths.contains("\"target\":\"accepted_context_fts\""));
-    for forbidden in [
-        "resolved_focus",
-        "repository_id",
-        "artifact_key",
-        "reference_id",
-        "engineering_graph",
-    ] {
-        assert!(!encoded_paths.contains(forbidden));
-    }
-    assert!(response.context.artifact_generation.is_none());
-    assert!(response.context.graph_context_tree_oid.is_none());
-    let knowledge_after = serde_json::to_vec(
-        &ProjectionIndex::for_store(&fixture.store)
-            .domain_snapshot()
-            .unwrap()
-            .projection,
-    )
-    .unwrap();
-    assert_eq!(knowledge_after, knowledge_before);
-}
+// `working_intent_hint_text_is_returned_without_an_engineering_graph` was here, and is retired
+// with the four FTS channels it named. A Working Intent Hint used to be matched as *text* against
+// Space Intents and accepted Contexts, and the test pinned all four combinations plus their
+// coverage and fusion contribution. ADR-0007 keeps hints and drops the matching: a hint that reads
+// as a path is now a Lane A anchor -- the Session says which file it is working on, and the join
+// against the Engineering Reference rows is exact. `context_usage_signals` is where that anchor is
+// exercised end to end through the MCP surface.
 
 #[test]
 fn concurrent_mcp_intent_retries_converge_on_one_successor() {
@@ -7278,6 +7078,11 @@ fn shared_context_skill_contract_drives_mcp_runtime_and_search_response() {
 #[test]
 fn tool_result_text_is_compact_json_equivalent_to_structured_content() {
     let fixture = Fixture::new();
+    // Sixteen Contexts, each recorded against its own file, and a Session that opened all sixteen.
+    // The measurement needs a Pack of real size and ADR-0007 only builds one from a real footprint,
+    // so the corpus supplies the Engineering References and the Working Intent supplies the hints
+    // that reach them -- the one anchor source an MCP caller can write without a Hook.
+    let mut transport_files = Vec::new();
     for index in 0..16 {
         let statement = format!(
             "stdio MCP transport rule {index}: the Codex and Cursor clients share one framing boundary, and the server never renegotiates it mid-session"
@@ -7301,15 +7106,32 @@ fn tool_result_text_is_compact_json_equivalent_to_structured_content() {
             )
             .unwrap(),
         );
+        let path = format!("src/transport/Rule{index}.ts");
+        append(
+            &fixture.store,
+            Event::engineering_reference_recorded(
+                context_id,
+                revision_id,
+                sctx_domain::EngineeringReferenceDraft {
+                    repository_id: "Mcp".parse().unwrap(),
+                    artifact_kind: sctx_domain::ArtifactKind::File,
+                    relation: sctx_domain::ReferenceRelation::Implements,
+                    locator: sctx_domain::ArtifactLocator::File {
+                        path: sctx_domain::RepoRelativePath::new(&path).unwrap(),
+                    },
+                    supports: "the envelope fixture anchors this rule to its file".to_owned(),
+                    limitations: vec!["synthetic fixture".to_owned()],
+                },
+                None,
+            )
+            .unwrap(),
+        );
+        transport_files.push(path);
     }
 
-    let arguments = serde_json::to_value(update_input(
-        "compact-envelope",
-        TaskBoundary::New,
-        None,
-        "MCP Contract",
-    ))
-    .unwrap();
+    let mut input = update_input("compact-envelope", TaskBoundary::New, None, "MCP Contract");
+    input.intent.artifact_hints.clone_from(&transport_files);
+    let arguments = serde_json::to_value(input).unwrap();
     let responses = run_authorized_session(
         &fixture.root,
         &mut fixture.server(ClientKind::Codex),

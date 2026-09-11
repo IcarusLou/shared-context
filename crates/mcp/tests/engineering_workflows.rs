@@ -579,11 +579,30 @@ fn public_artifact_focus_uses_strict_text_only_while_graph_is_unavailable() {
         .unwrap()
         .repository
         .repository_id;
-    let expected_context = accepted_context(
+    let (expected_context, expected_revision) = accepted_context(
         &root,
         &format!("{repository_id} src/contracts/fallback.rs owns the strict fallback contract"),
+    );
+    // The Reference is what makes the Focus reach anything at all now. Before ADR-0007 this test
+    // needed none: with no Graph, a Focus fell back to matching its *path spelling* as text against
+    // the Context corpus, which is how a Context came back for containing the string
+    // `src/contracts/fallback.rs` in its statement. That fallback is gone with every other text
+    // route into automatic injection, and what replaces it is the honest version of the same idea
+    // -- the Context says which file it is about, in a Reference, and the Focus names that file.
+    engineering_reference_record_at_root(
+        &root,
+        &reference_input(
+            expected_context,
+            expected_revision,
+            &repository_id,
+            ArtifactKind::File,
+            ReferenceRelation::Implements,
+            ArtifactLocator::File {
+                path: RepoRelativePath::new("src/contracts/fallback.rs").unwrap(),
+            },
+        ),
     )
-    .0;
+    .unwrap();
     let session = "public-focus-text-fallback";
     let catalog = config.repository_catalog().unwrap();
     AuthorizedSessionScopeStore::initialize(&root)
@@ -623,20 +642,22 @@ fn public_artifact_focus_uses_strict_text_only_while_graph_is_unavailable() {
     .unwrap();
     assert_eq!(focused.resolved_focus.repository_id, repository_id);
     assert!(focused.context.artifact_generation.is_none());
-    assert!(focused.context.items.iter().any(|item| {
-        item.context.context_id == expected_context
-            && item.retrieval_paths.iter().any(|path| {
-                matches!(
-                    path,
-                    TaskRetrievalPath::ResolvedFocusTextFallback { explanation }
-                        if explanation.resolved_focus == focused.resolved_focus
+    // A Focus works with no Engineering Graph at all, and this is a stronger statement than the
+    // text fallback it replaces: the route does not degrade when the Graph is missing, because the
+    // route never used the Graph. The Working Intent here is deliberate nonsense
+    // (`zzzzabsentpublicfallbackgoal`), so nothing but the anchor can be responsible.
+    assert!(
+        focused.context.items.iter().any(|item| {
+            item.context.context_id == expected_context
+                && matches!(
+                    item.retrieval_paths.as_slice(),
+                    [TaskRetrievalPath::FileAnchor { location, .. }]
+                        if location == &format!("{repository_id}:src/contracts/fallback.rs")
                 )
-            })
-            && item
-                .retrieval_paths
-                .iter()
-                .all(|path| !matches!(path, TaskRetrievalPath::EngineeringGraph { .. }))
-    }));
+        }),
+        "{:#?}",
+        focused.context.items
+    );
     assert!(focused.context.candidate_spaces.iter().all(|association| {
         association.matched_artifacts.is_empty() && association.relation_paths.is_empty()
     }));
@@ -854,10 +875,11 @@ fn scan_record_rebuild_explain_and_task_pack_cross_two_repositories_and_a_worktr
         },
     )
     .unwrap();
-    assert_eq!(
-        authoritative.context.artifact_generation,
-        Some(rebuilt.artifact_generation.clone())
-    );
+    // An automatic Pack no longer carries the Graph's generation, because it no longer reads the
+    // Graph. What this test is really about -- scan, record, rebuild, explain, and a Focus that
+    // works across two Repositories and a worktree -- is unchanged, and every one of those steps is
+    // still asserted below.
+    assert!(authoritative.context.artifact_generation.is_none());
     let focused = task_artifact_focus_at_root(
         &root,
         &ArtifactFocusQuery {
@@ -876,14 +898,18 @@ fn scan_record_rebuild_explain_and_task_pack_cross_two_repositories_and_a_worktr
         first_scan.repository_id
     );
     let pack = focused.context;
-    assert_eq!(pack.artifact_generation, Some(rebuilt.artifact_generation));
-    assert!(pack.items.iter().any(|item| {
-        item.context.context_id == context_id
-            && item
-                .retrieval_paths
-                .iter()
-                .any(|path| matches!(path, TaskRetrievalPath::EngineeringGraph { .. }))
-    }));
+    assert!(pack.artifact_generation.is_none());
+    assert!(
+        pack.items.iter().any(|item| {
+            item.context.context_id == context_id
+                && item
+                    .retrieval_paths
+                    .iter()
+                    .any(|path| matches!(path, TaskRetrievalPath::FileAnchor { .. }))
+        }),
+        "the Focus reaches its Context across the worktree, by the file it names: {:#?}",
+        pack.items
+    );
     assert!(
         rebuilt
             .repositories
@@ -1122,15 +1148,24 @@ fn public_mcp_artifact_focus_is_query_scoped_across_six_kinds_and_hot_path() {
         );
         assert!(data.get("created").is_none());
         assert!(data.get("focus").is_none());
-        assert_eq!(
-            data["context"]["items"].as_array().unwrap().len(),
-            1,
-            "unexpected Focus items: {}",
-            data["context"]["items"]
+        // A Focus anchors the *file* its coordinate lives in, so every Context recorded against
+        // that file comes back and not only the one whose Artifact kind the query named. The Graph
+        // channel resolved a Focus to one exact Artifact and returned the Context attached to it;
+        // ADR-0007's first lane joins on `(repository, path)` instead, and a Session that opened a
+        // file to read one Symbol has opened the file the Api and the File Contexts describe too.
+        // What the Focus still guarantees is that its own Context is among them.
+        let items = data["context"]["items"].as_array().unwrap();
+        assert!(
+            items
+                .iter()
+                .any(|item| item["context_id"] == case.context_id.to_string()),
+            "the focused Context is missing from its own file's anchors: {items:#?}"
         );
-        assert_eq!(
-            data["context"]["items"][0]["context_id"],
-            case.context_id.to_string()
+        assert!(
+            items
+                .iter()
+                .all(|item| item["retrieval_channels"] == json!(["file_anchor"])),
+            "a Focus reaches knowledge by anchoring, and by nothing else: {items:#?}"
         );
         assert_eq!(data["context"]["graph_diagnostics"], json!([]));
 
@@ -1240,13 +1275,14 @@ fn public_mcp_artifact_focus_is_query_scoped_across_six_kinds_and_hot_path() {
         after_restart[0]
     );
     let after_restart = &after_restart[0]["result"]["structuredContent"];
-    assert_eq!(
-        after_restart["context"]["items"].as_array().unwrap().len(),
-        1
-    );
-    assert_eq!(
-        after_restart["context"]["items"][0]["context_id"],
-        first_case.context_id.to_string()
+    assert!(
+        after_restart["context"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["context_id"] == first_case.context_id.to_string()),
+        "a restart changes nothing about what a file anchors: {}",
+        after_restart["context"]["items"]
     );
     assert_eq!(
         after_restart["context"]["task_fingerprint"],
@@ -1325,9 +1361,15 @@ fn public_mcp_artifact_focus_is_query_scoped_across_six_kinds_and_hot_path() {
     );
     let missing = &missing[0]["result"]["structuredContent"];
     assert_eq!(missing["context"]["items"], json!([]));
+    // A Focus on a file nobody has written a Context about returns nothing, and says so in the one
+    // line an empty Pack owes its reader. It no longer says it as a Graph diagnostic: the Pack does
+    // not consult the Graph, so "not reachable in the Graph" is not a fact it is in a position to
+    // report. The Focus still resolves -- the coordinate below is the proof -- it simply anchors no
+    // knowledge.
+    assert_eq!(missing["context"]["graph_diagnostics"], json!([]));
     assert_eq!(
-        missing["context"]["graph_diagnostics"][0]["kind"],
-        "artifact_not_reachable_in_graph"
+        missing["context"]["omitted"][0]["reason"],
+        "no_lane_evidence"
     );
     assert_eq!(
         missing["resolved_focus"]["locator"]["path"],
@@ -1341,17 +1383,20 @@ fn public_mcp_artifact_focus_is_query_scoped_across_six_kinds_and_hot_path() {
     );
     let bounded = &bounded[0]["result"]["structuredContent"]["context"];
     assert!(bounded["estimated_tokens"].as_u64().unwrap() <= 256);
+    // The smallest budget the server accepts still buys the sentence that says why the Pack is
+    // empty. It used to be a Graph diagnostic or, when even that did not fit, a notice that the
+    // diagnostic had been dropped; it is now the one-line reason itself, which costs so little that
+    // there is nothing left to drop it for.
     assert!(
-        !bounded["graph_diagnostics"].as_array().unwrap().is_empty()
-            || bounded["omitted"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|omitted| {
-                    omitted["reason"] == "diagnostic_token_budget"
-                        || omitted["reason"] == "graph_diagnostic_token_budget"
-                        || omitted["reason"] == "omitted"
-                })
+        bounded["omitted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |omitted| omitted["reason"] == "no_lane_evidence" || omitted["reason"] == "omitted"
+            ),
+        "{}",
+        bounded["omitted"]
     );
 
     let mut stale_arguments = missing_arguments.clone();
