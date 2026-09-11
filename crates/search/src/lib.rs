@@ -44,8 +44,8 @@ mod candidate;
 pub mod embedding;
 mod lanes;
 
-/// The two anchor facts a Lane A [`TaskRetrievalPath`] has to be able to name.
-pub use lanes::{AnchorMatchBasis, AnchorSource};
+/// The facts a lane [`TaskRetrievalPath`] has to be able to name.
+pub use lanes::{AnchorMatchBasis, AnchorSource, NonSemanticEdgeKind};
 
 pub use embedding::{
     DocumentVectorSnapshot, EmbeddingProvider, EmbeddingSemanticChannel, EncodeLatencySummary,
@@ -909,6 +909,23 @@ pub enum TaskRetrievalPath {
         basis: AnchorMatchBasis,
         /// How many distinct anchors reached this Context. `location` names the strongest.
         anchor_count: usize,
+    },
+    /// The seed expansion between the two lanes (ADR-0007's S2-2 edge). This Context restates the
+    /// same problem, or is filed under the same topic, as a Context the Session anchored.
+    ///
+    /// It is the one route to the knowledge no file can reach. On the installation Step 0b
+    /// measured, 10 of 26 injectable Contexts carried no Engineering Reference at all -- a
+    /// contrast-ratio finding, a module-level test-availability discovery, a downgrade risk -- and
+    /// they are cross-cutting by nature rather than by omission. The edge is authorship, not
+    /// vocabulary: two Contexts written against the same restated problem were written about the
+    /// same work, and an absent classification is never an edge to another absent one.
+    SeedExpansion {
+        /// The anchored Context this one was reached from.
+        from_context_id: ContextId,
+        /// Which field carried it.
+        edge: NonSemanticEdgeKind,
+        /// The shared value, as written.
+        value: String,
     },
     /// Lane B (ADR-0007). A Context the Session already reached admitted this one on the cosine of
     /// their two document vectors, both encoded through the corpus path. No query was encoded and
@@ -6308,6 +6325,14 @@ fn load_task_context_candidates(
 /// means nothing, which is the habit ADR-0007 exists to end.
 const LANE_A_ASSOCIATION_SCORE_BASIS_POINTS: u16 = 10_000;
 
+/// Association score a seed-expansion hit gives its Space, in basis points.
+///
+/// Below an anchor and above every admission, and for the same reason the anchor is at full marks:
+/// a shared `problem_view` is a fact about who wrote these two Contexts and why, not a degree of
+/// similarity. It sits under the anchor because the anchor is a fact about *this Session*, while
+/// this one is a fact about a Context the Session reached.
+const LANE_EXPANSION_ASSOCIATION_SCORE_BASIS_POINTS: u16 = 9_000;
+
 /// Omission reason for a candidate the second hop could not judge.
 ///
 /// It is not a Context that lost: it is a Context the corpus backfill has not reached, which is a
@@ -6332,6 +6357,9 @@ pub const NO_LANE_EVIDENCE_REASON: &str = "no_lane_evidence";
 enum LaneRank {
     /// Lane A, most anchored first.
     Anchored(Reverse<usize>),
+    /// The seed expansion, most edges first. It sits between the lanes because that is what it is:
+    /// reached from an anchor rather than by one, and by an authorship fact rather than a cosine.
+    Expanded(Reverse<usize>),
     /// Lane B, highest admitting score first.
     Associated(Reverse<u16>),
 }
@@ -6395,11 +6423,7 @@ fn retrieve_lanes(
         .iter()
         .map(lanes::LaneAHit::seed)
         .collect::<Vec<_>>();
-    seeds.extend(
-        lanes::expand_seeds_once(connection, &seeds)?
-            .iter()
-            .map(lanes::ExpandedSeed::seed),
-    );
+    let expanded = lanes::expand_seeds_once(connection, &seeds)?;
 
     let mut retrieval = LaneRetrieval::default();
     let mut placed = BTreeSet::new();
@@ -6423,6 +6447,47 @@ fn retrieve_lanes(
                 anchor_source: strongest.source,
                 basis: strongest.basis,
                 anchor_count: hit.anchors.len(),
+            },
+        });
+    }
+
+    // The expansion's own Contexts are in the Pack, not merely in the query. Leaving them out
+    // would make S2-2 a widening of Lane B's question and nothing else -- the zero-anchor Context
+    // it exists to reach would seed one hop and never be seen, which is the reachability failure
+    // ADR-0007 names, restated rather than repaired. They are also excluded from Lane B's
+    // candidate set by construction, being seeds, so this is their only route.
+    for seed in &expanded {
+        // Only a shared `problem_view` puts an expanded seed in the Pack. Both edges widen Lane B's
+        // question, where a cosine still has to be cleared before anything is injected, but only
+        // one of them is evidence on its own. A `problem_view` is a problem an Agent restated for
+        // one piece of work, so two Contexts carrying the same one were written about the same
+        // work. A `topic_key` is a classification, and a coarse one reaches across a whole
+        // installation: the association fixture in this repository files every Context under
+        // `task/association-fixture`, and admitting on that would have injected the live-tag
+        // Context into a Session working on the POI map. Erring high is the standing rule.
+        let Some(strongest) = seed
+            .edges
+            .iter()
+            .find(|edge| edge.kind == NonSemanticEdgeKind::ProblemView)
+        else {
+            continue;
+        };
+        // It is a seed because it is in the Pack, and for no other reason. The two are the same
+        // fact: Lane B never judges a Context that is already there, so a Context promoted to seed
+        // without being placed would be excluded from both and reachable by nothing. That is how a
+        // coarse `topic_key` edge would have quietly *removed* a Context from retrieval.
+        seeds.push(seed.seed());
+        placed.insert(seed.context_id);
+        retrieval.hits.push(LaneHit {
+            context_id: seed.context_id,
+            revision_id: seed.revision_id,
+            space_id: seed.space_id,
+            rank: LaneRank::Expanded(Reverse(seed.edges.len())),
+            score_basis_points: LANE_EXPANSION_ASSOCIATION_SCORE_BASIS_POINTS,
+            path: TaskRetrievalPath::SeedExpansion {
+                from_context_id: strongest.from_context_id,
+                edge: strongest.kind,
+                value: strongest.value.clone(),
             },
         });
     }
@@ -6731,7 +6796,7 @@ fn lane_space_associations(
         entry.0 = entry.0.max(hit.score_basis_points);
         entry.1.insert(context_id);
         match hit.rank {
-            LaneRank::Anchored(_) => entry.2 += 1,
+            LaneRank::Anchored(_) | LaneRank::Expanded(_) => entry.2 += 1,
             LaneRank::Associated(_) => entry.3 += 1,
         }
     }
@@ -7122,6 +7187,7 @@ const fn retrieval_channel_name(path: &TaskRetrievalPath) -> &'static str {
         TaskRetrievalPath::ExactScope { .. } => "exact_scope",
         TaskRetrievalPath::SemanticSimilarity { .. } => "semantic_similarity",
         TaskRetrievalPath::FileAnchor { .. } => "file_anchor",
+        TaskRetrievalPath::SeedExpansion { .. } => "seed_expansion",
         TaskRetrievalPath::SeedAssociation { .. } => "seed_association",
     }
 }
@@ -7178,6 +7244,19 @@ fn compact_item_reasons(item: &TaskContextItem, sole_repository: Option<&str>) -
             } else {
                 format!("anchored: {location}")
             }),
+            TaskRetrievalPath::SeedExpansion {
+                from_context_id,
+                edge,
+                value,
+            } => reasons.push(format!(
+                "restates the {} of {}: {}",
+                match edge {
+                    NonSemanticEdgeKind::ProblemView => "problem",
+                    NonSemanticEdgeKind::TopicKey => "topic",
+                },
+                short_identity(*from_context_id),
+                truncate_chars(value, EXPANSION_EDGE_REASON_MAX_CHARS)
+            )),
             TaskRetrievalPath::SeedAssociation {
                 seed_context_id,
                 score_basis_points,
@@ -7274,6 +7353,12 @@ fn compact_item_reasons(item: &TaskContextItem, sole_repository: Option<&str>) -
     reasons.truncate(COMPACT_ITEM_REASON_LIMIT);
     reasons
 }
+
+/// Characters of a shared `problem_view` or `topic_key` one `why` sentence prints.
+///
+/// The value is a restated problem an Agent wrote, so it can be a paragraph. The sentence needs
+/// enough of it to be recognized, never all of it.
+const EXPANSION_EDGE_REASON_MAX_CHARS: usize = 60;
 
 /// Shared identifiers named in one Lane B `why` sentence before the rest are dropped.
 ///

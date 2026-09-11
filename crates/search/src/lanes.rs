@@ -301,7 +301,7 @@ pub(crate) fn lane_a_hits(
 /// Which retrieval field carried a seed to a Context no file anchors.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum NonSemanticEdgeKind {
+pub enum NonSemanticEdgeKind {
     /// Both Contexts restate the same problem. On the measured installation the map Session's
     /// three Contexts share one `problem_view` and only one of them is file anchored.
     ProblemView,
@@ -321,7 +321,7 @@ impl NonSemanticEdgeKind {
 
 /// One zero-cost edge that carried a seed one hop.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub(crate) struct NonSemanticEdge {
+pub struct NonSemanticEdge {
     pub kind: NonSemanticEdgeKind,
     /// The shared field value, as written. A `why` line renders it truncated.
     pub value: String,

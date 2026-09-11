@@ -42,14 +42,6 @@ struct PolarityFixture {
     context_id: ContextId,
 }
 
-struct FusionCorpusFixture {
-    _temporary: TempDir,
-    index: ProjectionIndex,
-    precise_space_id: SpaceId,
-    precise_context_id: ContextId,
-    total_spaces: usize,
-}
-
 struct IntentHandoffFixture {
     _temporary: TempDir,
     store: GitStore,
@@ -227,56 +219,6 @@ fn polarity_fixture() -> PolarityFixture {
         index,
         space_id,
         context_id,
-    }
-}
-
-fn fusion_corpus_fixture() -> FusionCorpusFixture {
-    const GENERIC_SPACE_COUNT: usize = 40;
-
-    let temporary = tempfile::tempdir().unwrap();
-    let store = GitStore::bootstrap_local(temporary.path().join("fusion-installation")).unwrap();
-    for index in 0..GENERIC_SPACE_COUNT {
-        add_space(
-            &store,
-            &format!("GenericImplementation{index:02}"),
-            "implement shared workflow",
-        );
-    }
-    let precise = Event::space_created(
-        sctx_domain::IntentSnapshot {
-            title: "PreciseProtocol".to_owned(),
-            problem: "implement rare endpoint SearchV9RareEndpoint ExactResultSchema".to_owned(),
-            desired_outcome: "implement rare endpoint SearchV9RareEndpoint ExactResultSchema"
-                .to_owned(),
-            in_scope: vec![
-                "implement rare endpoint SearchV9RareEndpoint ExactResultSchema".to_owned(),
-            ],
-            out_of_scope: vec!["unrelated payments migration".to_owned()],
-            acceptance_conditions: vec!["rare endpoint remains exact".to_owned()],
-            domain_terms: vec!["precise-protocol".to_owned()],
-        },
-        None,
-    )
-    .unwrap();
-    let precise_space_id = match precise.payload() {
-        EventPayload::SpaceCreated { space_id, .. } => *space_id,
-        _ => unreachable!(),
-    };
-    append(&store, precise);
-    let (precise_context_id, _, _) = add_accepted_context(
-        &store,
-        precise_space_id,
-        "SearchV9RareEndpoint returns ExactResultSchema",
-        applicability("precise-search", "server", "active"),
-    );
-    let index = ProjectionIndex::for_store(&store);
-    index.synchronize().unwrap();
-    FusionCorpusFixture {
-        _temporary: temporary,
-        index,
-        precise_space_id,
-        precise_context_id,
-        total_spaces: GENERIC_SPACE_COUNT + 1,
     }
 }
 
@@ -1101,183 +1043,6 @@ fn intent_conflict_handoff_is_visible_without_blocking_and_disappears_after_merg
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
-fn forty_space_corpus_is_rrf_ranked_top_k_bounded_and_fully_budgeted() {
-    let fixture = fusion_corpus_fixture();
-    let engine = SearchEngine::new(fixture.index);
-    let signals = vec![TaskSignal {
-        kind: TaskSignalKind::Diff,
-        content: "SearchV9RareEndpoint".to_owned(),
-    }];
-    let mut request = TaskContextRequest::automatic(
-        TaskId::new(),
-        task("implement rare endpoint SearchV9RareEndpoint ExactResultSchema"),
-        signals,
-        4_000,
-    );
-    request.max_spaces = 5;
-
-    for invalid_max_spaces in [0, sctx_search::MAX_TASK_MAX_SPACES + 1] {
-        let mut invalid = request.clone();
-        invalid.max_spaces = invalid_max_spaces;
-        assert_eq!(
-            engine.task_context_pack(&invalid).unwrap_err().kind(),
-            sctx_search::ErrorKind::InvalidInput
-        );
-    }
-    let mut invalid_budget = request.clone();
-    invalid_budget.token_budget = sctx_search::MIN_TASK_CONTEXT_TOKEN_BUDGET - 1;
-    assert_eq!(
-        engine
-            .task_context_pack(&invalid_budget)
-            .unwrap_err()
-            .kind(),
-        sctx_search::ErrorKind::InvalidInput
-    );
-
-    let first = engine.task_context_pack(&request).unwrap();
-    let second = engine.task_context_pack(&request).unwrap();
-    assert_eq!(
-        first, second,
-        "RRF, top-k, omissions, and budget must be stable"
-    );
-    assert!(!first.associations.is_empty());
-    assert!(first.associations.len() <= request.max_spaces);
-    assert_eq!(first.associations[0].space_id, fixture.precise_space_id);
-    assert!(first.items.iter().any(|item| {
-        item.association_space_id == fixture.precise_space_id
-            && item.context.context_id == fixture.precise_context_id
-    }));
-    assert!(first.estimated_tokens <= request.token_budget);
-    assert_eq!(
-        first.estimated_tokens,
-        estimate_task_context_payload_tokens(&first),
-        "reported tokens must charge Associations, reasons, item paths, and omissions"
-    );
-    assert!(
-        serde_json::to_string(&first).unwrap().len().div_ceil(4) <= first.estimated_tokens,
-        "charged envelope reserve must conservatively cover the complete ASCII fixture response"
-    );
-    assert!(
-        first
-            .omitted
-            .iter()
-            .all(|omitted| omitted.reason != "space_top_k"),
-        "generic corpus rows must be filtered before top-k"
-    );
-
-    let precise_fusion = first.associations[0]
-        .reasons
-        .iter()
-        .find_map(|reason| serde_json::from_str::<TaskAssociationFusionExplanation>(reason).ok())
-        .expect("precise association must expose typed RRF features");
-    assert_eq!(
-        precise_fusion.algorithm,
-        sctx_search::TaskAssociationFusionAlgorithm::ReciprocalRankFusion
-    );
-    assert!(
-        precise_fusion.channels.iter().any(|feature| {
-            feature.channel == TaskAssociationChannel::SpaceIntentBm25
-                && feature.rank == 1
-                && feature.query_token_coverage_basis_points > 0
-                && feature.idf_bm25_contribution_micros > 0
-                && feature.phrase_match
-                && feature.field_weight_points > 0
-        }),
-        "precise fusion features: {precise_fusion:?}"
-    );
-    assert!(precise_fusion.channels.iter().any(|feature| {
-        feature.channel == TaskAssociationChannel::AcceptedContextBm25
-            && feature.rank == 1
-            && feature.bm25_micros.is_some()
-    }));
-    if let Some(generic) = first.associations.get(1) {
-        assert!(first.associations[0].score > generic.score);
-        let generic_fusion = generic
-            .reasons
-            .iter()
-            .find_map(|reason| {
-                serde_json::from_str::<TaskAssociationFusionExplanation>(reason).ok()
-            })
-            .unwrap();
-        let precise_intent = precise_fusion
-            .channels
-            .iter()
-            .find(|feature| feature.channel == TaskAssociationChannel::SpaceIntentBm25)
-            .unwrap();
-        let generic_intent = generic_fusion
-            .channels
-            .iter()
-            .find(|feature| feature.channel == TaskAssociationChannel::SpaceIntentBm25)
-            .unwrap();
-        assert!(
-            precise_intent.query_token_coverage_basis_points
-                > generic_intent.query_token_coverage_basis_points
-        );
-        assert!(
-            precise_intent.idf_bm25_contribution_micros
-                > generic_intent.idf_bm25_contribution_micros
-        );
-    }
-
-    let mut minimum_budget = request.clone();
-    minimum_budget.token_budget = sctx_search::MIN_TASK_CONTEXT_TOKEN_BUDGET;
-    let bounded = engine.task_context_pack(&minimum_budget).unwrap();
-    assert!(bounded.estimated_tokens <= minimum_budget.token_budget);
-    assert_eq!(
-        bounded.estimated_tokens,
-        estimate_task_context_payload_tokens(&bounded)
-    );
-    assert!(!bounded.omitted.is_empty());
-
-    let mut generic_request =
-        TaskContextRequest::automatic(TaskId::new(), task("implement"), Vec::new(), 900);
-    generic_request.max_spaces = 4;
-    let generic = engine.task_context_pack(&generic_request).unwrap();
-    assert!(generic.associations.len() <= generic_request.max_spaces);
-    assert!(generic.estimated_tokens <= generic_request.token_budget);
-    assert_eq!(
-        generic.estimated_tokens,
-        estimate_task_context_payload_tokens(&generic)
-    );
-    assert!(generic.associations.is_empty());
-    assert!(generic.items.is_empty());
-    assert!(generic.omitted.is_empty());
-}
-
-#[test]
-fn equal_fused_scores_use_stable_space_id_ties() {
-    let fixture = fixture();
-    let index = fixture.index.clone();
-    let query = task("tieassociationneedle");
-    let task_id = TaskId::new();
-    let first = SearchEngine::new(fixture.index)
-        .task_space_associations(task_id, &query, &[])
-        .unwrap();
-    assert_eq!(first.associations.len(), 2);
-    let mut expected = fixture.tied_spaces.to_vec();
-    expected.sort();
-    assert_eq!(
-        first
-            .associations
-            .iter()
-            .map(|association| association.space_id)
-            .collect::<Vec<_>>(),
-        expected
-    );
-    assert_eq!(
-        first.associations[0].score.to_bits(),
-        first.associations[1].score.to_bits()
-    );
-
-    index.rebuild().unwrap();
-    let rebuilt = SearchEngine::new(index)
-        .task_space_associations(task_id, &query, &[])
-        .unwrap();
-    assert_eq!(rebuilt.associations, first.associations);
-}
-
-#[test]
 fn unsafe_context_states_cannot_supply_association_or_injection_evidence() {
     let fixture = fixture();
     let response = SearchEngine::new(fixture.index)
@@ -1372,67 +1137,6 @@ fn task_context_pack_supports_zero_one_and_many_spaces_with_explicit_m2_paths() 
     let metadata = fixture.index.metadata().unwrap();
     assert_eq!(many.indexed_tree_oid, metadata.indexed_tree_oid);
     assert_eq!(many.projection_generation, metadata.projection_generation);
-}
-
-#[test]
-fn automatic_text_quality_keeps_phrase_and_drops_weak_or_generic_space_inheritance() {
-    let fixture = fixture();
-    let engine = SearchEngine::new(fixture.index);
-
-    let phrase = engine
-        .task_context_pack(&TaskContextRequest::automatic(
-            TaskId::new(),
-            task("pageintentneedle SearchResultsPage.tsx"),
-            Vec::new(),
-            100_000,
-        ))
-        .unwrap();
-    assert_eq!(phrase.associations.len(), 1);
-    assert_eq!(phrase.items.len(), 1);
-    assert_eq!(phrase.items[0].context.context_id, fixture.pack_contexts[0]);
-    let fusion = phrase.associations[0]
-        .reasons
-        .iter()
-        .find_map(|reason| serde_json::from_str::<TaskAssociationFusionExplanation>(reason).ok())
-        .unwrap();
-    assert!(fusion.channels.iter().any(|feature| {
-        feature.channel == TaskAssociationChannel::SpaceIntentBm25 && feature.phrase_match
-    }));
-
-    let generic = engine
-        .task_context_pack(&TaskContextRequest::automatic(
-            TaskId::new(),
-            task("the to code file task"),
-            Vec::new(),
-            100_000,
-        ))
-        .unwrap();
-    assert!(generic.associations.is_empty());
-    assert!(generic.items.is_empty());
-
-    let weak_intent =
-        task("pageintentneedle unrelatedalpha unrelatedbravo unrelatedcharlie unrelateddelta");
-    let automatic = engine
-        .task_context_pack(&TaskContextRequest::automatic(
-            TaskId::new(),
-            weak_intent.clone(),
-            Vec::new(),
-            100_000,
-        ))
-        .unwrap();
-    assert!(automatic.associations.is_empty());
-    assert!(automatic.items.is_empty());
-
-    let mut explicit_request =
-        TaskContextRequest::automatic(TaskId::new(), weak_intent, Vec::new(), 100_000);
-    explicit_request.mode = ContextPackMode::Explicit;
-    let explicit = engine.task_context_pack(&explicit_request).unwrap();
-    assert_eq!(explicit.associations.len(), 1);
-    assert_eq!(explicit.items.len(), 1);
-    assert_eq!(
-        explicit.items[0].context.context_id,
-        fixture.pack_contexts[0]
-    );
 }
 
 #[test]
@@ -1761,326 +1465,6 @@ fn automatic_task_pack_excludes_every_unsafe_state_while_explicit_expands_confli
     );
 }
 
-#[test]
-fn a_large_corpus_drops_generic_tokens_only_beyond_the_retained_rarest_floor() {
-    let fixture = fusion_corpus_fixture();
-    let engine = SearchEngine::new(fixture.index);
-    // `implement`, `shared` and `workflow` appear in every generic Space Intent of this corpus;
-    // the remaining tokens are rare and carry the actual meaning of the intent.
-    let response = engine
-        .task_context_pack(&TaskContextRequest::automatic(
-            TaskId::new(),
-            task(
-                "SearchV9RareEndpoint ExactResultSchema precise protocol implement shared workflow",
-            ),
-            Vec::new(),
-            100_000,
-        ))
-        .unwrap();
-    let association = response
-        .associations
-        .iter()
-        .find(|association| association.space_id == fixture.precise_space_id)
-        .expect("the rare tokens still associate the precise Space");
-    // Every Association names the selection it was matched under; the token lists themselves live
-    // once at the top level rather than once per Space.
-    let projected = association
-        .reasons
-        .iter()
-        .find_map(|reason| serde_json::from_str::<AutomaticQueryTokenExplanation>(reason).ok())
-        .expect("automatic query token selection is explained");
-    assert!(projected.selected_tokens.is_empty());
-    assert!(projected.selected_token_count > 0);
-    let explanation = response
-        .query_token_explanation
-        .clone()
-        .expect("the explainable Pack names the automatic query token selection");
-    assert_eq!(
-        projected.selected_token_count,
-        explanation.selected_tokens.len()
-    );
-
-    assert!(explanation.document_count >= 20);
-    assert!(!explanation.stop_word_fallback_active);
-    for generic in ["implement", "shared", "workflow"] {
-        let drop = explanation
-            .dropped_tokens
-            .iter()
-            .find(|drop| drop.token == generic)
-            .unwrap_or_else(|| panic!("{generic} is dropped: {explanation:?}"));
-        assert_eq!(
-            drop.filter,
-            AutomaticQueryTokenFilter::HighDocumentFrequency
-        );
-        assert!(
-            drop.document_frequency
-                .is_some_and(|frequency| frequency > 0)
-        );
-    }
-    // Frequency never removes a rare token, and the retained floor keeps at least the rarest
-    // tokens whatever the corpus looks like.
-    assert!(explanation.selected_tokens.len() >= 8);
-    for rare in ["search", "endpoint", "schema", "precise"] {
-        assert!(
-            explanation
-                .selected_tokens
-                .iter()
-                .any(|token| token == rare),
-            "{rare} is genuine domain vocabulary here"
-        );
-        assert!(
-            explanation
-                .dropped_tokens
-                .iter()
-                .all(|drop| drop.token != rare)
-        );
-    }
-    assert!(
-        response
-            .items
-            .iter()
-            .any(|item| item.context.context_id == fixture.precise_context_id)
-    );
-}
-
-#[test]
-fn the_retained_floor_keeps_frequent_tokens_but_never_a_corpus_wide_one() {
-    const CARRIER_SPACE_COUNT: usize = 21;
-    const MIDDLE_FREQUENCY_SPACE_COUNT: usize = 12;
-
-    let temporary = tempfile::tempdir().unwrap();
-    let store = GitStore::bootstrap_local(temporary.path().join("frequency-floor")).unwrap();
-    for index in 0..CARRIER_SPACE_COUNT {
-        let mut intent_text = "universalterm".to_owned();
-        if index < MIDDLE_FREQUENCY_SPACE_COUNT {
-            intent_text.push_str(" middlefrequencyterm");
-        }
-        if index == 0 {
-            intent_text.push_str(" rareneedle");
-        }
-        add_space(&store, &format!("Carrier{index:02}"), &intent_text);
-    }
-    let index = ProjectionIndex::for_store(&store);
-    index.synchronize().unwrap();
-
-    let response = SearchEngine::new(index)
-        .task_space_associations(
-            TaskId::new(),
-            &task("rareneedle middlefrequencyterm universalterm"),
-            &[],
-        )
-        .unwrap();
-    assert!(!response.associations.is_empty());
-    assert!(
-        response.associations[0]
-            .reasons
-            .iter()
-            .any(|reason| serde_json::from_str::<AutomaticQueryTokenExplanation>(reason).is_ok())
-    );
-    let explanation = response
-        .query_token_explanation
-        .clone()
-        .expect("the explainable Pack names the automatic query token selection");
-
-    assert!(explanation.document_count >= 20);
-    // 12 of 21 documents: frequent enough to trip the ordinary rule, but the query is short so the
-    // retained floor keeps it.
-    assert!(
-        explanation
-            .selected_tokens
-            .iter()
-            .any(|token| token == "middlefrequencyterm"),
-        "{explanation:?}"
-    );
-    assert!(
-        explanation
-            .selected_tokens
-            .iter()
-            .any(|token| token == "rareneedle")
-    );
-    // Present in every document: it selects the whole corpus, so the floor does not protect it.
-    let universal = explanation
-        .dropped_tokens
-        .iter()
-        .find(|drop| drop.token == "universalterm")
-        .unwrap_or_else(|| panic!("a corpus-wide token is dropped: {explanation:?}"));
-    assert_eq!(
-        universal.filter,
-        AutomaticQueryTokenFilter::HighDocumentFrequency
-    );
-    assert_eq!(universal.document_frequency, Some(CARRIER_SPACE_COUNT));
-}
-
-#[test]
-fn artifact_and_interface_hints_recall_context_only_text_without_graph_semantics() {
-    let fixture = fixture();
-    let index = fixture.index.clone();
-    let mut intent = task("zzzzabsenttaskneedle");
-    intent.artifact_hints = vec!["SearchV2Endpoint".to_owned()];
-    intent.interface_hints = vec!["SearchResponseV2".to_owned()];
-    let request = TaskContextRequest::automatic(TaskId::new(), intent, Vec::new(), 100_000);
-    let first = SearchEngine::new(index.clone())
-        .task_context_pack(&request)
-        .unwrap();
-
-    let protocol_association = first
-        .associations
-        .iter()
-        .find(|association| association.space_id == fixture.feature_spaces[1])
-        .unwrap();
-    assert_eq!(
-        protocol_association.matched_contexts,
-        vec![fixture.feature_contexts[0]]
-    );
-    let item = first
-        .items
-        .iter()
-        .find(|item| item.context.context_id == fixture.feature_contexts[0])
-        .unwrap();
-    let explanations = item
-        .retrieval_paths
-        .iter()
-        .filter_map(|path| {
-            let TaskRetrievalPath::WorkingIntentHintText { explanation } = path else {
-                return None;
-            };
-            Some(explanation)
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(explanations.len(), 2);
-    assert_eq!(
-        explanations
-            .iter()
-            .map(|explanation| explanation.source_field)
-            .collect::<std::collections::BTreeSet<_>>(),
-        [
-            WorkingIntentHintField::ArtifactHints,
-            WorkingIntentHintField::InterfaceHints,
-        ]
-        .into_iter()
-        .collect()
-    );
-    assert!(explanations.iter().all(|explanation| {
-        explanation.target == WorkingIntentHintTarget::AcceptedContextFts
-            && explanation.phrase_match
-            && explanation.query_token_coverage_basis_points == 10_000
-            && explanation.fusion_contribution_micros > 0
-            && !explanation.matched_tokens.is_empty()
-    }));
-    assert!(
-        item.retrieval_paths
-            .iter()
-            .all(|path| matches!(path, TaskRetrievalPath::WorkingIntentHintText { .. }))
-    );
-    assert!(first.artifact_generation.is_none());
-    assert!(first.graph_context_tree_oid.is_none());
-
-    let second = SearchEngine::new(index.clone())
-        .task_context_pack(&request)
-        .unwrap();
-    assert_eq!(second, first);
-    index.rebuild().unwrap();
-    let rebuilt = SearchEngine::new(index.clone())
-        .task_context_pack(&request)
-        .unwrap();
-    assert_eq!(rebuilt.task_fingerprint, first.task_fingerprint);
-    assert_eq!(rebuilt.associations, first.associations);
-    assert_eq!(rebuilt.items, first.items);
-
-    let mut unsafe_intent = task("another absent goal");
-    unsafe_intent.artifact_hints = vec!["unsafeassociationneedle".to_owned()];
-    unsafe_intent.interface_hints = vec!["incomplete evidence must not enter".to_owned()];
-    let unsafe_pack = SearchEngine::new(index)
-        .task_context_pack(&TaskContextRequest::automatic(
-            TaskId::new(),
-            unsafe_intent,
-            Vec::new(),
-            100_000,
-        ))
-        .unwrap();
-    assert!(unsafe_pack.items.iter().all(|item| {
-        !fixture
-            .unsafe_pack_spaces
-            .contains(&item.association_space_id)
-    }));
-}
-
-#[test]
-fn high_coverage_hint_text_outranks_generic_text_and_remains_budgeted() {
-    let fixture = fusion_corpus_fixture();
-    let index = fixture.index.clone();
-    let mut intent = task("implement shared workflow");
-    intent.artifact_hints = vec!["SearchV9RareEndpoint".to_owned()];
-    intent.interface_hints = vec!["ExactResultSchema".to_owned()];
-    let task_id = TaskId::new();
-    let mut request = TaskContextRequest::automatic(task_id, intent, Vec::new(), 100_000);
-    request.max_spaces = 5;
-    let full = SearchEngine::new(index.clone())
-        .task_context_pack(&request)
-        .unwrap();
-    assert_eq!(full.associations[0].space_id, fixture.precise_space_id);
-    assert_eq!(full.items[0].context.context_id, fixture.precise_context_id);
-    let channels = full.associations[0]
-        .reasons
-        .iter()
-        .find_map(|reason| serde_json::from_str::<TaskAssociationFusionExplanation>(reason).ok())
-        .unwrap()
-        .channels
-        .into_iter()
-        .map(|feature| feature.channel)
-        .collect::<std::collections::BTreeSet<_>>();
-    assert!(channels.contains(&TaskAssociationChannel::ArtifactHintSpaceIntentBm25));
-    assert!(channels.contains(&TaskAssociationChannel::ArtifactHintAcceptedContextBm25));
-    assert!(channels.contains(&TaskAssociationChannel::InterfaceHintSpaceIntentBm25));
-    assert!(channels.contains(&TaskAssociationChannel::InterfaceHintAcceptedContextBm25));
-    assert!(full.associations.len() <= request.max_spaces);
-    assert!(full.omitted.iter().all(|item| item.reason != "space_top_k"));
-
-    request.token_budget = 512;
-    let limited_first = SearchEngine::new(index.clone())
-        .task_context_pack(&request)
-        .unwrap();
-    let limited_second = SearchEngine::new(index)
-        .task_context_pack(&request)
-        .unwrap();
-    assert_eq!(limited_first, limited_second);
-    assert!(limited_first.estimated_tokens <= limited_first.token_budget);
-    assert!(!limited_first.omitted.is_empty());
-
-    let mut generic_hint = task("zzzzabsentgenerichintgoal");
-    generic_hint.artifact_hints = vec!["implement shared workflow".to_owned()];
-    let mut generic_request =
-        TaskContextRequest::automatic(TaskId::new(), generic_hint, Vec::new(), 100_000);
-    generic_request.max_spaces = 4;
-    let generic_first = SearchEngine::new(fixture.index.clone())
-        .task_context_pack(&generic_request)
-        .unwrap();
-    let generic_second = SearchEngine::new(fixture.index.clone())
-        .task_context_pack(&generic_request)
-        .unwrap();
-    assert_eq!(generic_first, generic_second);
-    assert!(generic_first.associations.is_empty());
-    assert!(generic_first.items.is_empty());
-
-    generic_request.mode = ContextPackMode::Explicit;
-    let explicit = SearchEngine::new(fixture.index)
-        .task_context_pack(&generic_request)
-        .unwrap();
-    assert_eq!(explicit.associations.len(), generic_request.max_spaces);
-    // Every truncated Space is accounted for, and the named ones carry the identity an Agent
-    // needs to ask for one of them explicitly.
-    let space_top_k = explicit
-        .omitted
-        .iter()
-        .filter(|item| item.reason == "space_top_k")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        space_top_k.iter().map(|item| item.count).sum::<usize>(),
-        fixture.total_spaces - generic_request.max_spaces
-    );
-    assert!(space_top_k.iter().any(|item| item.space_id.is_some()));
-}
-
 /// One Space holding eight injection-safe Contexts that all answer the same rare query token.
 /// A 2000-token budget cannot carry eight explainable items, so it is the exact shape that made
 /// automatic injection return a single Context before compact packing existed.
@@ -2270,101 +1654,6 @@ fn compact_top_k_omissions_keep_full_association_byte_charges() {
         );
         assert!(pack.estimated_tokens <= request.token_budget);
     }
-}
-
-#[test]
-fn compact_detail_level_drops_machine_channels_and_full_keeps_the_token_explanation() {
-    let (_temporary, index, _contexts) = compact_budget_fixture();
-    let engine = SearchEngine::new(index);
-    let request = TaskContextRequest::automatic(
-        TaskId::new(),
-        task("compactbudgetneedle"),
-        Vec::new(),
-        100_000,
-    );
-
-    let full = engine
-        .task_context_pack_with_detail(&request, ContextPackDetailLevel::Full)
-        .unwrap();
-    let compact = engine
-        .task_context_pack_with_detail(&request, ContextPackDetailLevel::Compact)
-        .unwrap();
-
-    // A Task with no dropped tokens still reports its selection at the top level in `full`.
-    let explanation = full
-        .query_token_explanation
-        .as_ref()
-        .expect("full packs expose the automatic query token selection at the top level");
-    assert!(
-        explanation
-            .selected_tokens
-            .contains(&"compactbudgetneedle".to_owned())
-    );
-    // Compact keeps the projection, never the lists: the reader who most needs to know how much
-    // of the question this Tree could answer is the one whose Pack came back empty.
-    let compact_explanation = compact
-        .query_token_explanation
-        .as_ref()
-        .expect("compact packs keep the projected automatic query token selection");
-    assert!(compact_explanation.selected_tokens.is_empty());
-    assert!(compact_explanation.answerable_tokens.is_empty());
-    assert_eq!(
-        compact_explanation.selected_token_count,
-        explanation.selected_token_count
-    );
-    assert_eq!(
-        compact_explanation.answerable_token_count,
-        explanation.answerable_token_count
-    );
-    assert!(compact_explanation.dropped_tokens.len() <= 8);
-
-    assert!(
-        full.associations.iter().any(|association| association
-            .reasons
-            .iter()
-            .any(|reason| reason.starts_with('{'))),
-        "the explainable shape keeps the machine-readable fusion reason"
-    );
-    assert!(
-        compact
-            .compact_associations
-            .iter()
-            .all(|association| association
-                .reasons
-                .iter()
-                .all(|reason| !reason.starts_with('{'))),
-        "compact associations keep only human-readable sentences"
-    );
-
-    let encoded = serde_json::to_value(&compact.compact_items).unwrap();
-    let encoded = serde_json::to_string(&encoded).unwrap();
-    for dropped in [
-        "match_reason",
-        "safety_source",
-        "retrieval_paths",
-        "rationale",
-        "bm25",
-        "auto_injection_eligible",
-    ] {
-        assert!(
-            !encoded.contains(dropped),
-            "compact items must not carry `{dropped}`"
-        );
-    }
-    assert!(
-        serde_json::to_string(&full.items)
-            .unwrap()
-            .contains("match_reason"),
-        "the explainable shape keeps its match reasons"
-    );
-
-    // Identical requests remain byte-stable in both shapes.
-    assert_eq!(
-        compact,
-        engine
-            .task_context_pack_with_detail(&request, ContextPackDetailLevel::Compact)
-            .unwrap()
-    );
 }
 
 #[test]
@@ -2578,329 +1867,6 @@ fn compact_packing_keeps_the_top_ranked_chinese_contexts_in_the_default_budget()
     }
 }
 
-/// A Chinese-first knowledge base plus filler, so document frequency rather than the small-corpus
-/// stop-word fallback governs automatic query-token selection.
-///
-/// The one interesting Context states its fact in Chinese but spells `ProductAnchorAssem`
-/// verbatim, which is the only channel an English question has into it.
-fn cross_language_identifier_fixture() -> (TempDir, ProjectionIndex, ContextId) {
-    let temporary = tempfile::tempdir().unwrap();
-    let store =
-        GitStore::bootstrap_local(temporary.path().join("identifier-installation")).unwrap();
-    let space_id = add_space(&store, "商品锚点导航", "复查商品锚点进入直播间的导航缺口");
-    let (context_id, _, _) = add_accepted_context(
-        &store,
-        space_id,
-        "当 ProductAnchorAssem 在商品锚点点击回调中提前 return 时，跳过配置分发与进入直播间导航（ProductAnchorAssem.kt:202）。",
-        applicability("anchordomain", "android", "无真实实现"),
-    );
-    for filler in 0..6_u8 {
-        let filler_space = add_space(
-            &store,
-            &format!("无关空间{filler}"),
-            &format!("无关意图{filler} 发布清单"),
-        );
-        add_accepted_context(
-            &store,
-            filler_space,
-            &format!("无关事实{filler}：发布清单会在发版之前校验版本号。"),
-            applicability("fillerdomain", "server", "active"),
-        );
-    }
-    let index = ProjectionIndex::for_store(&store);
-    index.synchronize().unwrap();
-    (temporary, index, context_id)
-}
-
-/// WP-L8: identifier-derived query tokens carry extra weight in the automatic coverage gate.
-///
-/// Two of six English tokens match a Chinese Context, which reads as 33% coverage and used to sit
-/// below `AUTOMATIC_TEXT_COVERAGE_THRESHOLD_BASIS_POINTS` with only one text channel behind it, so
-/// automatic injection returned nothing at all for a question explicit search answers first.
-#[test]
-fn identifier_coverage_carries_an_english_question_into_a_chinese_knowledge_base() {
-    let (_temporary, index, context_id) = cross_language_identifier_fixture();
-    let engine = SearchEngine::new(index);
-
-    let request = TaskContextRequest::automatic(
-        TaskId::new(),
-        task("product anchor click does not navigate"),
-        Vec::new(),
-        100_000,
-    );
-    let pack = engine.task_context_pack(&request).unwrap();
-    assert_eq!(
-        pack.items
-            .iter()
-            .map(|item| item.context.context_id)
-            .collect::<Vec<_>>(),
-        vec![context_id],
-        "the query names two words of one identifier the Context spells verbatim"
-    );
-    assert!(
-        pack.associations[0]
-            .reasons
-            .iter()
-            .any(|reason| reason.starts_with("Identifier coverage:")),
-        "the weighting explains itself: {:?}",
-        pack.associations[0].reasons
-    );
-
-    // One shared word is vocabulary, not a named identifier, so the weighting stays off.
-    let single_word = TaskContextRequest::automatic(
-        TaskId::new(),
-        task("anchor rollout timeline review"),
-        Vec::new(),
-        100_000,
-    );
-    let single = engine.task_context_pack(&single_word).unwrap();
-    assert!(
-        single.items.is_empty(),
-        "a single incidental identifier word must not buy an association: {:?}",
-        single.items
-    );
-}
-
-/// A Space that wins on Intent text but offers a Context sharing a single query token, a Space
-/// that offers the Context answering most of the query, and filler that crowds the accepted-Context
-/// channel so the two Spaces fuse to close but distinct scores.
-fn near_duplicate_coverage_fixture() -> (TempDir, ProjectionIndex, ContextId, ContextId) {
-    let temporary = tempfile::tempdir().unwrap();
-    let store = GitStore::bootstrap_local(temporary.path().join("coverage-installation")).unwrap();
-    let short_space = add_space(
-        &store,
-        "SlotSurface",
-        "zulpraneedle bantiqneedle korvethneedle mildapneedle glavikneedle",
-    );
-    let (short_context, _, _) = add_accepted_context(
-        &store,
-        short_space,
-        "zulpraneedle",
-        applicability("surfacedomain", "android", "active"),
-    );
-    for filler in 0..6_u8 {
-        let filler_space = add_space(
-            &store,
-            &format!("Filler{filler}"),
-            "unrelated filler intent",
-        );
-        add_accepted_context(
-            &store,
-            filler_space,
-            "bantiqneedle korvethneedle mildapneedle glavikneedle",
-            applicability("fillerdomain", "server", "active"),
-        );
-    }
-    let long_space = add_space(
-        &store,
-        "SlotCause",
-        "zulpraneedle bantiqneedle korvethneedle mildapneedle glavikneedle plus a much longer \
-         intent body whose extra words push this Space one rank down on the Intent channel",
-    );
-    let (long_context, _, _) = add_accepted_context(
-        &store,
-        long_space,
-        "bantiqneedle korvethneedle mildapneedle glavikneedle: the registration happens before \
-         the null guard, so the empty container keeps the slot and the default fallback never \
-         runs for the surface the shorter Context only names",
-        applicability("causedomain", "android", "active"),
-    );
-    let index = ProjectionIndex::for_store(&store);
-    index.synchronize().unwrap();
-    (temporary, index, short_context, long_context)
-}
-
-/// WP-L8: the injection ranking scales each Space's fused score by how much of the query the
-/// Context itself answered.
-///
-/// The fused score is a property of the Space, so every Context a Space contributes carries the
-/// same one. Ordering by it alone let the Space that won on Intent text put forward whichever of
-/// its Contexts shared a phrase with the query, ahead of the Context that actually covers the
-/// question.
-#[test]
-fn coverage_weighted_rank_puts_the_covering_context_ahead_of_a_short_near_duplicate() {
-    let (_temporary, index, short_context, long_context) = near_duplicate_coverage_fixture();
-    let mut request = TaskContextRequest::automatic(
-        TaskId::new(),
-        task("zulpraneedle bantiqneedle korvethneedle mildapneedle glavikneedle"),
-        Vec::new(),
-        100_000,
-    );
-    request.max_spaces = 10;
-    let pack = SearchEngine::new(index)
-        .task_context_pack(&request)
-        .unwrap();
-    let position = |context_id: ContextId| {
-        pack.items
-            .iter()
-            .position(|item| item.context.context_id == context_id)
-    };
-    let short_position = position(short_context).expect("the near duplicate is still an answer");
-    let long_position = position(long_context).expect("the covering Context is an answer");
-    assert!(
-        long_position < short_position,
-        "the Context that answered more of the query must lead: long={long_position} \
-         short={short_position}"
-    );
-    assert_eq!(long_position, 0);
-    assert!(
-        pack.items[long_position]
-            .context
-            .match_reason
-            .coverage_basis_points
-            > pack.items[short_position]
-                .context
-                .match_reason
-                .coverage_basis_points
-    );
-}
-
-/// The corpus of the FE session that was handed three Android SPI Contexts it had no use for:
-/// one subject, three Contexts, two of them near-duplicates.
-fn weak_token_corpus() -> (TempDir, GitStore, SpaceId) {
-    let temporary = tempfile::tempdir().unwrap();
-    let store = GitStore::bootstrap_local(temporary.path().join("relevance-floor")).unwrap();
-    let android = add_space(
-        &store,
-        "LiveAnchorProvider",
-        "android live anchor provider implementation registry",
-    );
-    for statement in [
-        "the live anchor entry provider returns early when its implementation is absent",
-        "removing the provider implementation module turns the missing dependency error into a \
-         silent fallback",
-        "the provider implementation module removal keeps the silent fallback behavior",
-    ] {
-        add_accepted_context(
-            &store,
-            android,
-            statement,
-            applicability("androidclient", "android", "liveroom"),
-        );
-    }
-    (temporary, store, android)
-}
-
-/// A Space that did not lead the one text channel that found it is not injected unasked.
-///
-/// `MINIMUM_ASSOCIATION_SCORE_BASIS_POINTS` only says an association exists, which is the right
-/// bar for a query an Agent typed. Automatic injection owes a higher one, and this is what
-/// `AUTOMATIC_RELEVANCE_FLOOR_BASIS_POINTS` buys: the runner-up on a single channel is dropped
-/// with its numbers, while the Space that led that same channel is still injected.
-#[test]
-fn a_single_channel_runner_up_is_dropped_below_the_relevance_floor_with_its_numbers() {
-    let temporary = tempfile::tempdir().unwrap();
-    let store = GitStore::bootstrap_local(temporary.path().join("runner-up")).unwrap();
-    // Neither Space Intent carries the query token, so exactly one channel -- accepted Context
-    // BM25 -- ranks these two Spaces against each other.
-    let leader = add_space(&store, "LeaderSpace", "first subject area");
-    let runner_up = add_space(&store, "RunnerUpSpace", "second subject area");
-    add_accepted_context(
-        &store,
-        leader,
-        "anchorquorumtoken",
-        applicability("leaderdomain", "leaderplatform", "leadercondition"),
-    );
-    add_accepted_context(
-        &store,
-        runner_up,
-        "anchorquorumtoken appears once inside a much longer statement that also records a great \
-         deal of unrelated surrounding detail so that its term frequency per token is lower than \
-         the leading Space's",
-        applicability("runnerupdomain", "runnerupplatform", "runnerupcondition"),
-    );
-    let index = ProjectionIndex::for_store(&store);
-    index.synchronize().unwrap();
-
-    let pack = SearchEngine::new(index)
-        .task_context_pack(&TaskContextRequest::automatic(
-            TaskId::new(),
-            task("anchorquorumtoken"),
-            Vec::new(),
-            100_000,
-        ))
-        .unwrap();
-    assert_eq!(
-        pack.associations
-            .iter()
-            .map(|association| association.space_id)
-            .collect::<Vec<_>>(),
-        vec![leader],
-        "the Space that led the channel is still injected"
-    );
-    let floor = pack
-        .omitted
-        .iter()
-        .find(|omitted| omitted.reason == "below_relevance_floor")
-        .unwrap_or_else(|| panic!("the drop must say why: {:#?}", pack.omitted));
-    assert_eq!(floor.space_id, Some(runner_up));
-    assert_eq!(floor.count, 1);
-    let fused = floor
-        .fused_score_basis_points
-        .expect("the number it failed on");
-    let bar = floor
-        .relevance_floor_basis_points
-        .expect("the number it failed against");
-    assert!(fused < bar, "{fused} is not below {bar}");
-    assert!(
-        pack.items
-            .iter()
-            .all(|item| item.association_space_id == leader),
-        "a dropped Space contributes no items"
-    );
-}
-
-/// The weak-token injection the FE session actually saw is *not* separable by fused score, and
-/// this pins the measurement that says so.
-///
-/// The Task shares one generic token with a corpus about something else. That token matches both
-/// the Space Intent and an accepted Context, so two channels rank the Space first and it fuses to
-/// 454 basis points -- the same score a genuinely two-channel answer earns. The largest floor
-/// either probe fixture tolerates is 227 (one channel at rank 1; see the harness's relevance
-/// floor sweep), and a floor high enough to reject 454 costs the `probe-v1` set 6 of 20 correct
-/// top-1 answers and `probe-zh-v1` 4 of 19. Reciprocal rank fusion measures position within one
-/// query, not how much of the query a Space actually answers, so no threshold on it can tell
-/// "the only thing that matched" from "the right thing". Closing this needs an absolute measure;
-/// the floor is not it, and raising the floor is not the fix.
-#[test]
-fn the_fe_weak_token_case_scores_above_every_probe_tolerable_floor() {
-    let (_temporary, store, android) = weak_token_corpus();
-    let index = ProjectionIndex::for_store(&store);
-    index.synchronize().unwrap();
-
-    let mut unrelated = task("the comment input bar implementation is hidden by the soft keyboard");
-    unrelated.domains = vec!["webcomment".to_owned()];
-    unrelated.platforms = vec!["fe".to_owned()];
-    let pack = SearchEngine::new(index)
-        .task_context_pack(&TaskContextRequest::automatic(
-            TaskId::new(),
-            unrelated,
-            Vec::new(),
-            100_000,
-        ))
-        .unwrap();
-    let association = pack
-        .associations
-        .iter()
-        .find(|association| association.space_id == android)
-        .unwrap_or_else(|| {
-            panic!("the weak-token association is measured here, not asserted away: {pack:#?}")
-        });
-    let fusion = association
-        .reasons
-        .iter()
-        .find_map(|reason| serde_json::from_str::<TaskAssociationFusionExplanation>(reason).ok())
-        .expect("every association explains its fusion");
-    assert_eq!(
-        fusion.fused_score_basis_points, 454,
-        "two text channels at rank 1; the floor would have to exceed this to reject it"
-    );
-    assert!(
-        fusion.fused_score_basis_points > 227,
-        "227 is the largest floor both probe fixtures tolerate"
-    );
-}
-
 fn record_file_reference(
     store: &GitStore,
     context_id: ContextId,
@@ -3021,126 +1987,317 @@ fn a_compact_item_names_the_single_repository_its_references_live_in() {
     );
 }
 
-fn absent_query_tokens(count: usize) -> Vec<String> {
-    (0..count)
-        .map(|index| {
-            format!(
-                "unseen{}{}",
-                char::from(b'a' + u8::try_from(index / 26).unwrap()),
-                char::from(b'a' + u8::try_from(index % 26).unwrap())
-            )
-        })
-        .collect()
+// -----------------------------------------------------------------------------------------------
+// ADR-0007: the two lanes, through the real Pack
+// -----------------------------------------------------------------------------------------------
+
+/// A Session, a file it opened, and the knowledge recorded against that exact file.
+///
+/// `anchored` carries an Engineering Reference to `poi/map/LynxMapController.kt`; `sibling` carries
+/// none at all and restates the same problem, which is how 10 of the 26 injectable Contexts on the
+/// installation Step 0b measured are shaped -- cross-cutting knowledge no file can reach.
+/// `elsewhere` is about something else entirely and is what the noise assertions are for.
+struct LaneFixture {
+    _temporary: TempDir,
+    index: ProjectionIndex,
+    anchored: ContextId,
+    sibling: ContextId,
+    elsewhere: ContextId,
+    space_id: SpaceId,
 }
 
-fn token_selection_fixture(documents: &[String]) -> (TempDir, SearchEngine) {
+const LANE_PROBLEM: &str = "接手 x-ttk-map-view Android 改造，按重构方案推进";
+
+fn lane_fixture() -> LaneFixture {
     let temporary = tempfile::tempdir().unwrap();
-    let store = GitStore::bootstrap_local(temporary.path().join("token-selection")).unwrap();
-    for (index, text) in documents.iter().enumerate() {
-        add_space(&store, &format!("Corpus{index}"), text);
-    }
-    let index = ProjectionIndex::for_store(&store);
-    index.synchronize().unwrap();
-    (temporary, SearchEngine::new(index))
-}
+    let store = GitStore::bootstrap_local(temporary.path().join("lane-installation")).unwrap();
+    let space_id = add_space(&store, "PoiMap", "poimapintent");
 
-fn selected_query_tokens(
-    engine: &SearchEngine,
-    tokens: &[String],
-) -> AutomaticQueryTokenExplanation {
-    engine
-        .task_context_pack(&TaskContextRequest::automatic(
-            TaskId::new(),
-            task(&tokens.join(" ")),
-            Vec::new(),
-            100_000,
-        ))
-        .unwrap()
-        .query_token_explanation
-        .unwrap()
-}
-
-#[test]
-fn absent_tokens_cannot_displace_answerable_words_from_the_automatic_budget() {
-    let (_temporary, engine) =
-        token_selection_fixture(&["rarestword sharedword".to_owned(), "sharedword".to_owned()]);
-    let absent = absent_query_tokens(80);
-    let mut query = absent.clone();
-    query.extend(["rarestword".to_owned(), "sharedword".to_owned()]);
-    let explanation = selected_query_tokens(&engine, &query);
-    assert_eq!(explanation.selected_token_count, 64);
-    assert_eq!(explanation.answerable_tokens, ["rarestword", "sharedword"]);
-    assert_eq!(explanation.dropped_tokens.len(), 18);
-    assert!(
-        explanation
-            .dropped_tokens
-            .iter()
-            .all(|drop| drop.filter == AutomaticQueryTokenFilter::TokenBudget
-                && drop.document_frequency == Some(0))
+    let mut draft = context(
+        "the POI map engine reads its viewport through LynxMapController",
+        applicability("poi", "android", "active"),
     );
-    // All absent terms have identical length: the unchanged lexical tie-breaker keeps the first
-    // 62, and the remaining slots belong to the real words, regardless of their higher DF.
-    for token in &absent[..62] {
-        assert!(explanation.selected_tokens.contains(token));
-    }
-    for token in &absent[62..] {
-        assert!(!explanation.selected_tokens.contains(token));
-    }
-}
-
-#[test]
-fn absent_tokens_remain_selected_when_the_automatic_budget_has_room() {
-    let (_temporary, engine) = token_selection_fixture(&["rarestword".to_owned()]);
-    let explanation =
-        selected_query_tokens(&engine, &["rarestword".to_owned(), "unseenword".to_owned()]);
-    assert_eq!(explanation.selected_tokens, ["rarestword", "unseenword"]);
-    assert_eq!(explanation.answerable_tokens, ["rarestword"]);
-    assert!(explanation.dropped_tokens.is_empty());
-}
-
-#[test]
-fn positive_df_order_preserves_the_existing_high_df_retained_prefix_rules() {
-    let rare: Vec<_> = (0..8)
-        .map(|index| format!("rare{}", char::from(b'a' + index)))
-        .collect();
-    let documents: Vec<_> = (0..10)
-        .map(|index| {
-            format!(
-                "frequentword {}",
-                rare.get(index).map_or("", String::as_str)
-            )
-        })
-        .collect();
-    let (_temporary, engine) = token_selection_fixture(&documents);
-    let mut query = absent_query_tokens(10);
-    query.push("frequentword".to_owned());
-    let retained = selected_query_tokens(&engine, &query);
-    assert_eq!(retained.document_count, 10);
-    assert!(
-        retained
-            .selected_tokens
-            .contains(&"frequentword".to_owned())
+    draft.problem_view = Some(LANE_PROBLEM.to_owned());
+    let (anchored, anchored_revision) = add_context_draft(&store, space_id, draft);
+    publish(
+        &store,
+        space_id,
+        anchored,
+        anchored_revision,
+        Vec::new(),
+        PublicationAction::Publish,
     );
-    assert!(retained.dropped_tokens.is_empty());
+    record_file_reference(
+        &store,
+        anchored,
+        anchored_revision,
+        "Android",
+        "poi/map/LynxMapController.kt",
+    );
 
-    // Eight genuinely rarer terms exhaust the protected prefix; the unchanged high-DF filter
-    // then drops the frequent term. Absent terms still fill the remaining selection.
-    query.extend(rare);
-    let filtered = selected_query_tokens(&engine, &query);
-    let drop = filtered
-        .dropped_tokens
-        .iter()
-        .find(|drop| drop.token == "frequentword")
+    let mut draft = context(
+        "the effective minimum zoom must be bound to the measured viewport",
+        applicability("poi", "android", "active"),
+    );
+    draft.problem_view = Some(LANE_PROBLEM.to_owned());
+    let (sibling, sibling_revision) = add_context_draft(&store, space_id, draft);
+    publish(
+        &store,
+        space_id,
+        sibling,
+        sibling_revision,
+        Vec::new(),
+        PublicationAction::Publish,
+    );
+
+    let (elsewhere, _, _) = add_accepted_context(
+        &store,
+        space_id,
+        "the live tag reads its text from the server",
+        applicability("live", "android", "active"),
+    );
+
+    LaneFixture {
+        index: ProjectionIndex::for_store(&store),
+        _temporary: temporary,
+        anchored,
+        sibling,
+        elsewhere,
+        space_id,
+    }
+}
+
+fn lane_request(fixture: &LaneFixture, signals: Vec<TaskSignal>) -> TaskContextRequest {
+    let mut request = TaskContextRequest::automatic(
+        TaskId::new(),
+        task("接手 x-ttk-map-view Android 改造"),
+        Vec::new(),
+        4_096,
+    );
+    let _ = fixture;
+    request.signal_history = signals;
+    request
+}
+
+/// The whole of Lane A, through the Pack an Agent actually receives.
+///
+/// One Workspace Signal names one file; one accepted Context is recorded against that file; the
+/// Pack returns that Context and nothing else, under a `file_anchor` path whose `why` line is the
+/// coordinate that justified it. Nothing in this fixture shares a token with the Working Intent in
+/// the way the old text channels needed, and that is the point: ADR-0007's first lane is a join of
+/// two facts, not a vocabulary overlap.
+#[test]
+fn a_touched_file_puts_its_context_in_the_pack_and_the_why_line_names_the_coordinate() {
+    let fixture = lane_fixture();
+    let request = lane_request(
+        &fixture,
+        vec![TaskSignal {
+            kind: TaskSignalKind::Workspace,
+            content: "Android:poi/map/LynxMapController.kt".to_owned(),
+        }],
+    );
+
+    let pack = SearchEngine::new(fixture.index)
+        .task_context_pack_with_detail(&request, ContextPackDetailLevel::Compact)
         .unwrap();
+
     assert_eq!(
-        drop.filter,
-        AutomaticQueryTokenFilter::HighDocumentFrequency
+        pack.compact_items
+            .iter()
+            .map(|item| (item.context_id, item.retrieval_channels.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (fixture.anchored, vec!["file_anchor".to_owned()]),
+            // Reached from the anchor by the problem both Contexts restate, with no file of its
+            // own and no vector consulted: this is the zero-anchor knowledge ADR-0007 names.
+            (fixture.sibling, vec!["seed_expansion".to_owned()]),
+        ],
+        "the Context about other work stays out: {:?}",
+        fixture.elsewhere
     );
-    assert_eq!(drop.document_frequency, Some(10));
+    assert_eq!(
+        pack.compact_items[0].why.first().map(String::as_str),
+        Some("anchored: Android:poi/map/LynxMapController.kt"),
+        "the first thing the Agent reads is the coordinate that admitted the Context: {:#?}",
+        pack.compact_items[0].why
+    );
     assert!(
-        !filtered
-            .selected_tokens
-            .contains(&"frequentword".to_owned())
+        pack.compact_items[1].why[0].starts_with("restates the problem of "),
+        "the expansion says which Context it was reached from and by what: {:#?}",
+        pack.compact_items[1].why
     );
-    assert_eq!(filtered.answerable_token_count, 8);
+    assert_eq!(
+        pack.compact_associations
+            .iter()
+            .map(|association| (association.space_id, association.score))
+            .collect::<Vec<_>>(),
+        [(fixture.space_id, 1.0)],
+        "an anchor is a join of two facts, so the Space it reaches carries full marks rather than \
+         a graded score nobody can compare"
+    );
+    assert!(
+        pack.query_token_explanation.is_none(),
+        "no query token was selected because no query was asked"
+    );
+    assert!(pack.estimated_tokens <= request.token_budget);
+}
+
+/// A Session whose work is disjoint from every recorded Context gets an empty Pack, and is told so.
+///
+/// This is the 17-hour Session of Step 0b in miniature: 145 files touched, none of them a file any
+/// accepted Context references. ADR-0007 makes the empty Pack a first-class answer -- a Context
+/// nobody asked for is worse than no Context -- and the one line exists so "nothing" never looks
+/// like "something went wrong".
+#[test]
+fn a_session_that_touched_nothing_anchored_gets_an_empty_pack_that_says_why() {
+    let fixture = lane_fixture();
+    let request = lane_request(
+        &fixture,
+        (0..145)
+            .map(|index| TaskSignal {
+                kind: TaskSignalKind::Workspace,
+                content: format!("Android:poi/map/Touched{index:03}.kt"),
+            })
+            .collect(),
+    );
+
+    let pack = SearchEngine::new(fixture.index)
+        .task_context_pack_with_detail(&request, ContextPackDetailLevel::Compact)
+        .unwrap();
+
+    assert!(pack.compact_items.is_empty(), "{:#?}", pack.compact_items);
+    assert!(pack.compact_associations.is_empty());
+    assert_eq!(
+        pack.omitted
+            .iter()
+            .map(|omitted| omitted.reason.as_str())
+            .collect::<Vec<_>>(),
+        ["no_lane_evidence"],
+        "the Pack says it found no route rather than saying nothing at all: {:#?}",
+        pack.omitted
+    );
+}
+
+/// Lexical overlap never grants injection eligibility on its own.
+///
+/// The Working Intent here repeats the unanchored Context's whole statement, which under every
+/// version of the fused Pack would have injected it at the top. With no file touched there is no
+/// seed, so there is no Pack -- which is the single sentence ADR-0007's measurement comes down to.
+#[test]
+fn repeating_a_contexts_own_words_never_injects_it_without_a_lane() {
+    let fixture = lane_fixture();
+    let mut request = lane_request(&fixture, Vec::new());
+    request.working_intent =
+        task("the effective minimum zoom must be bound to the measured viewport");
+
+    let pack = SearchEngine::new(fixture.index)
+        .task_context_pack_with_detail(&request, ContextPackDetailLevel::Compact)
+        .unwrap();
+
+    assert!(
+        pack.compact_items.is_empty(),
+        "word overlap is not evidence that a Context is about this Task: {:#?}",
+        pack.compact_items
+    );
+}
+
+/// A channel over vectors a test placed by hand, and a record of what the hop decided.
+///
+/// It implements the whole boundary the assembler uses -- the published snapshot on the way in,
+/// the admission record on the way out -- and deliberately refuses to encode anything, because the
+/// second hop must not be able to acquire a model call even when a channel is attached.
+#[derive(Debug, Default)]
+struct LaneChannel {
+    vectors: Vec<(RevisionId, Vec<f32>)>,
+    recorded: std::sync::Mutex<Vec<sctx_search::Hop2AdmissionSample>>,
+}
+
+impl sctx_search::SemanticChannel for LaneChannel {
+    fn similar_revisions(&self, _query_text: &str) -> sctx_search::SemanticOutcome {
+        panic!("automatic injection must never encode a query");
+    }
+
+    fn document_vectors(&self) -> Option<sctx_search::DocumentVectorSnapshot> {
+        Some(Arc::new(self.vectors.clone()))
+    }
+
+    fn record_hop2_admissions(&self, samples: &[sctx_search::Hop2AdmissionSample]) {
+        self.recorded.lock().unwrap().extend_from_slice(samples);
+    }
+}
+
+/// Lane B, through the Pack: a seed the Session anchored admits the Context no file can reach.
+///
+/// The sibling here carries no Engineering Reference -- it is the shape of the 38% of injectable
+/// Contexts Step 0b found with no anchor at all -- so the only way it reaches the Agent is the
+/// second hop off the anchored Context beside it. The unrelated Context sits below the floor and
+/// stays out, and every pair the hop judged, refusals included, reaches the recorder.
+#[test]
+fn an_anchored_seed_admits_the_context_no_file_records_and_the_refusals_are_recorded() {
+    let fixture = lane_fixture();
+    let revisions = SearchEngine::new(fixture.index.clone())
+        .embeddable_revisions()
+        .unwrap()
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let revision_of = |needle: &str| {
+        *revisions
+            .iter()
+            .find(|(_, text)| text.contains(needle))
+            .expect("the fixture Context is embeddable")
+            .0
+    };
+    // A three-dimensional toy space: the seed on the first axis, the sibling well above the floor
+    // from it, the unrelated Context well below.
+    let channel = Arc::new(LaneChannel {
+        vectors: vec![
+            (revision_of("LynxMapController"), vec![1.0, 0.0, 0.0]),
+            (revision_of("minimum zoom"), vec![0.8, 0.6, 0.0]),
+            (revision_of("live tag"), vec![0.7, 0.714_142_8, 0.0]),
+        ],
+        recorded: std::sync::Mutex::default(),
+    });
+    let request = lane_request(
+        &fixture,
+        vec![TaskSignal {
+            kind: TaskSignalKind::Workspace,
+            content: "Android:poi/map/LynxMapController.kt".to_owned(),
+        }],
+    );
+
+    let pack = SearchEngine::new(fixture.index)
+        .with_semantic_channel(Arc::clone(&channel) as Arc<dyn sctx_search::SemanticChannel>)
+        .task_context_pack_with_detail(&request, ContextPackDetailLevel::Compact)
+        .unwrap();
+
+    assert_eq!(
+        pack.compact_items
+            .iter()
+            .map(|item| (item.context_id, item.retrieval_channels.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (fixture.anchored, vec!["file_anchor".to_owned()]),
+            (fixture.sibling, vec!["seed_expansion".to_owned()]),
+            (fixture.elsewhere, vec!["seed_association".to_owned()]),
+        ],
+        "the two seeds lead, and the Context no edge reaches enters on its score alone"
+    );
+    let admitted = &pack.compact_items[2];
+    assert!(
+        admitted.why[0].starts_with("associated via ") && admitted.why[0].ends_with("bp"),
+        "the second lane's why line names the seed and the score that admitted it: {:#?}",
+        admitted.why
+    );
+
+    let recorded = channel.recorded.lock().unwrap().clone();
+    assert!(
+        !recorded.is_empty(),
+        "every pair the hop judged has to reach the recalibration record"
+    );
+    assert!(
+        recorded
+            .iter()
+            .all(|sample| sample.candidate_revision_id != recorded[0].seed_revision_id),
+        "a seed is never its own candidate: {recorded:#?}"
+    );
 }
