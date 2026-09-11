@@ -74,3 +74,12 @@ S2-1 → S2-2 → S2-3 可流水(2 依赖 1 的种子形态,3 依赖 1+2);S2-4 �
 - 公开面小幅移动:样本表三类型两方法经公共 `SemanticVectorCache` 导出(lane 类型仍 pub(crate))——review 裁定接受。
 - 棘轮是 in-crate 单测(模块私有所致),调用形态 `cargo test --release -p sctx-search --lib -- --ignored hop2_ratchet`;三次读数 13/18/0 与校准文档一致;装置矩阵 5140 行与 seed_sweep 逐字节一致,5200 行与 ADR 的 62/66 声明一致(注意 ordered/unordered 两种计数口径,均已记录)。
 - 数据佐证:5200 下 2ea272dd 仅可经 problem_view 边到达——S2-2 的必要性由 S2-3 实测反向确认。
+
+## S2-4 中场裁定(review 定案,S2-4b 续包依据)
+
+1. **不变量:一个 Context 是种子,当且仅当它在包里**(扩展种子经 SeedExpansion 入包,已实现)。
+2. **topic_key 边删除**(不留惰性代码):fixture 实测噪声 + 真机 topic_key 前缀不跟随 kind 改写的既有缺陷,两头不可靠;problem_view 独自承担非语义边。恢复条件:topic_key 获得可靠性修复后另案评估。
+3. **探针棘轮现状接受**("每个自动包为空 + 零噪声"断言 + 文档化恢复路径);**合并门新增前置**:最小 lane 探针集——从既有探针挑 ~10 条补文件足迹(engineering reference + workspace signal),恢复 lane A/B 命中率棘轮(三次一致),否则自动注入侧只有负向棘轮。
+4. **改名容差与 graph 诊断退役是有意的**:图谱已裁定降级为 relocation 记账;pack 自解释实测负价值。deferred 跟进:"径 A 反查 miss 时咨询 relocation 记录"。graph_retrieval 失败据此分流:引用解析类保留修复、pack 图通道类退役。
+5. **融合常量族的 pack 侧退役完成**;其余存活仅因 candidate 分析栈(B1 冻结)与不可达的 Explicit 模式——全量删除随 B1,Explicit 模式死代码一并在 B1 清点。
+6. **60 个失败的分流规则**(逐文件执行):(i) 测试意图是"文本匹配让自动包含 X"→ 退役删除(旧语义);(ii) 意图是 wire 形状/Space 分组/budget/compact 字节稳定/usage 记录 → 给 fixture 补文件足迹使包非空后修复断言(mcp compact 稳定性需 ≥8 items 的 lane-fed fixture);(iii) graph_retrieval 按第 4 条分流;(iv) 严禁为了让测试通过而弱化空包语义或降低 hop2 floor。
