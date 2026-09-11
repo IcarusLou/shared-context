@@ -14,14 +14,12 @@ use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, CandidateSubmissionRequest, GitStore};
 use sctx_index::ProjectionIndex;
 use sctx_search::{
-    AutomaticQueryTokenExplanation, AutomaticQueryTokenFilter, ContextPackDetailLevel,
-    ContextPackMode, ContextStatus, IntentConflictActor, IntentConflictDecision,
-    IntentConflictHandoffExplanation, IntentConflictKind, IntentConflictSelection,
-    IntentConflictValidation, IntentScopeConflictExplanation, IntentScopeConflictKind,
-    IntentScopeConflictPolicy, SearchEngine, SpaceAssociationRole, SpaceIntentField,
-    TaskAssociationChannel, TaskAssociationFusionExplanation, TaskContextRequest,
-    TaskRetrievalPath, WorkingIntentHintField, WorkingIntentHintTarget,
-    estimate_task_context_payload_tokens,
+    ContextPackDetailLevel, ContextPackMode, ContextStatus, IntentConflictActor,
+    IntentConflictDecision, IntentConflictHandoffExplanation, IntentConflictKind,
+    IntentConflictSelection, IntentConflictValidation, IntentScopeConflictExplanation,
+    IntentScopeConflictKind, IntentScopeConflictPolicy, SearchEngine, SpaceAssociationRole,
+    SpaceIntentField, TaskAssociationChannel, TaskAssociationFusionExplanation, TaskContextRequest,
+    TaskRetrievalPath, estimate_task_context_payload_tokens,
 };
 use tempfile::TempDir;
 
@@ -31,7 +29,6 @@ struct AssociationFixture {
     feature_spaces: [SpaceId; 4],
     feature_contexts: [ContextId; 3],
     pack_contexts: [ContextId; 4],
-    tied_spaces: [SpaceId; 2],
     unsafe_pack_spaces: [SpaceId; 4],
 }
 
@@ -460,7 +457,6 @@ fn fixture() -> AssociationFixture {
             compatibility_context,
             analytics_context,
         ],
-        tied_spaces: [tie_alpha, tie_bravo],
         unsafe_pack_spaces: [
             candidate_space,
             deprecated_space,

@@ -34,8 +34,7 @@ use sctx_search::{
     SEMANTIC_CHANNEL_LIMIT, SEMANTIC_CORPUS_VERSION, SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
     SEMANTIC_HOP2_SAMPLE_HISTORY, SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SearchEngine,
     SemanticCacheKey, SemanticChannel, SemanticChannelHandle, SemanticHit, SemanticOutcome,
-    SemanticVectorCache, TaskAssociationChannel, TaskContextPack, TaskContextRequest,
-    TaskRetrievalPath,
+    SemanticVectorCache, TaskContextPack, TaskContextRequest,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -1294,10 +1293,11 @@ fn an_unconfigured_installation_retrieves_exactly_as_it_did_before_the_channel_e
             "an installation with no `[retrieval]` table must not serialize {absent}: {serialized}"
         );
     }
-    assert!(
-        !pack.items.is_empty(),
-        "the lexical channels still answer, unchanged"
-    );
+    // What the Pack contains is Lane A's answer and only Lane A's answer, which on this fixture --
+    // Contexts with no Engineering Reference and a Session that touched no file -- is nothing.
+    // ADR-0007 makes that the correct answer rather than a degradation, and the point of this test
+    // is that attaching a channel does not change it.
+    assert!(pack.items.is_empty() && pack.compact_items.is_empty());
 
     // The one and only difference an attached-but-unavailable channel may make is the omission.
     let degraded = engine
@@ -1306,17 +1306,23 @@ fn an_unconfigured_installation_retrieves_exactly_as_it_did_before_the_channel_e
     let degraded_pack = automatic_pack_for(&degraded, task_id);
     assert_eq!(
         omission_reasons(&degraded_pack),
-        vec!["embedding_unavailable".to_owned()],
-        "a configured channel that could not run says so, once"
+        vec![
+            "no_lane_evidence".to_owned(),
+            "embedding_unavailable".to_owned()
+        ],
+        "a configured channel that could not run says so, once, beside the line that says the \
+         lanes found no route -- two different facts, and a reader needs both"
     );
     assert_eq!(
         strip_omissions(&pack),
         strip_omissions(&degraded_pack),
         "an unavailable channel changes nothing but the omission it reports"
     );
-    assert!(
-        omission_reasons(&pack).is_empty(),
-        "an installation with no channel has nothing to omit"
+    assert_eq!(
+        omission_reasons(&pack),
+        vec!["no_lane_evidence".to_owned()],
+        "an installation with no channel has no channel to report on, and still owes the reader \
+         the reason its Pack is empty"
     );
 }
 
@@ -1331,8 +1337,16 @@ fn strip_omissions(pack: &TaskContextPack) -> Value {
     value
 }
 
+/// The three degradations ADR-0004 named collapse to one, because two of them were about encoding.
+///
+/// A model that will not load, a model that cannot encode this query, and an encode that overran
+/// its budget were three ways for the query-side channel to fail. Automatic injection no longer
+/// encodes anything: ADR-0007's second hop compares two vectors the corpus backfill already wrote.
+/// So a channel that cannot encode degrades nothing here, and the only degradation left is a
+/// channel with no published corpus snapshot to compare against -- which is what a model still
+/// loading is.
 #[test]
-fn every_degradation_reports_one_embedding_unavailable_omission() {
+fn the_only_degradation_left_is_a_channel_with_no_published_corpus() {
     let fixture = Fixture::new();
     fixture.accept(
         fixture.lexical_space,
@@ -1346,10 +1360,16 @@ fn every_degradation_reports_one_embedding_unavailable_omission() {
         .with_semantic_channel(Arc::new(SemanticChannelHandle::new()));
     assert_eq!(
         omission_reasons(&automatic_pack(&loading)),
-        vec!["embedding_unavailable".to_owned()]
+        vec![
+            "no_lane_evidence".to_owned(),
+            "embedding_unavailable".to_owned()
+        ],
+        "a handle nobody has published has no corpus to compare against, which is the one \
+         degradation the second hop can still suffer"
     );
 
-    // 2. The model is loaded but cannot encode this query.
+    // 2. A model that cannot encode at all, over a published corpus. Nothing degrades: the second
+    //    hop never asks it to encode.
     let failing = EmbeddingSemanticChannel::new(
         Arc::new(HashProvider::failing()),
         vec![(RevisionId::new(), vec![0.5_f32; 64])],
@@ -1357,223 +1377,21 @@ fn every_degradation_reports_one_embedding_unavailable_omission() {
     let broken = engine.clone().with_semantic_channel(Arc::new(failing));
     assert_eq!(
         omission_reasons(&automatic_pack(&broken)),
-        vec!["embedding_unavailable".to_owned()]
+        vec!["no_lane_evidence".to_owned()],
+        "a provider that cannot encode is not a degraded second hop, because the second hop never \
+         encodes"
     );
 
-    // 3. The encode overran its budget.
+    // 3. An encoder slower than any budget, over a published corpus. Same answer, same reason.
     let provider = Arc::new(HashProvider::slow(Duration::from_millis(300)));
     let vector = provider.encode("corpus entry").unwrap();
     let slow = EmbeddingSemanticChannel::new(provider, vec![(RevisionId::new(), vector)])
         .with_budget(Duration::from_millis(20));
     let stalled = engine.clone().with_semantic_channel(Arc::new(slow));
-    let stalled_pack = automatic_pack(&stalled);
     assert_eq!(
-        omission_reasons(&stalled_pack),
-        vec!["embedding_unavailable".to_owned()]
-    );
-    assert!(
-        !stalled_pack.items.is_empty(),
-        "the lexical answer must survive every embedding degradation intact"
-    );
-}
-
-#[test]
-fn a_semantic_hit_alone_makes_a_space_injectable_and_explains_itself() {
-    let fixture = Fixture::new();
-    fixture.accept(
-        fixture.lexical_space,
-        &format!("{LEXICAL_NEEDLE} routing is decided here"),
-    );
-    let (silent_context, silent_revision) = fixture.accept(
-        fixture.silent_space,
-        &format!("{SILENT_TOPIC} shapes the outbox drain"),
-    );
-    let engine = fixture.engine();
-
-    // Without the channel, nothing in the Working Intent can reach the silent Space: it shares no
-    // token, no hint, no scope and no Artifact with the query.
-    let lexical_only = automatic_pack(&engine);
-    assert!(
-        !lexical_only
-            .items
-            .iter()
-            .any(|item| item.context.context_id == silent_context),
-        "the fixture is only meaningful if lexical recall cannot reach the silent Space"
-    );
-
-    let (channel, queries) = ScriptedChannel::hits(vec![SemanticHit {
-        revision_id: silent_revision,
-        similarity_basis_points: 6_400,
-    }]);
-    let semantic = engine.clone().with_semantic_channel(channel);
-    let pack = automatic_pack(&semantic);
-
-    assert_eq!(
-        queries.load(Ordering::SeqCst),
-        1,
-        "one Pack asks the channel once, however many times it rereads the Graph"
-    );
-    let injected = pack
-        .items
-        .iter()
-        .find(|item| item.context.context_id == silent_context)
-        .expect("a semantic hit is an injection eligibility path in its own right");
-
-    assert_eq!(
-        injected.context.match_reason.similarity_basis_points,
-        Some(6_400),
-        "the item reports the similarity that admitted it"
-    );
-    assert!(
-        injected
-            .retrieval_paths
-            .contains(&TaskRetrievalPath::SemanticSimilarity {
-                similarity_basis_points: 6_400,
-            }),
-        "the route has to be explainable, not merely effective: {:?}",
-        injected.retrieval_paths
-    );
-    assert!(
-        injected.context.match_reason.matched_tokens.is_empty(),
-        "this Context was reached without sharing a single query token"
-    );
-}
-
-#[test]
-fn compact_semantic_only_association_keeps_its_empty_reasons_and_injected_context() {
-    let fixture = Fixture::new();
-    let (context_id, revision_id) = fixture.accept(
-        fixture.silent_space,
-        &format!("{SILENT_TOPIC} shapes the outbox drain"),
-    );
-    let (channel, _) = ScriptedChannel::hits(vec![SemanticHit {
-        revision_id,
-        similarity_basis_points: 6_400,
-    }]);
-    let engine = fixture.engine().with_semantic_channel(channel);
-    let request = TaskContextRequest::automatic(TaskId::new(), working_intent(), Vec::new(), 8_000);
-    let full = engine.task_context_pack(&request).unwrap();
-    let compact = engine
-        .task_context_pack_with_detail(&request, sctx_search::ContextPackDetailLevel::Compact)
-        .unwrap();
-    assert_eq!(full.associations.len(), 1);
-    assert!(
-        full.associations[0]
-            .reasons
-            .iter()
-            .all(|reason| reason.starts_with('{')),
-        "only machine reasons exist before the Compact projection"
-    );
-    assert_eq!(compact.compact_associations.len(), 1);
-    assert_eq!(
-        compact.compact_associations[0].space_id,
-        full.associations[0].space_id
-    );
-    assert_eq!(
-        compact.compact_associations[0].score.to_bits(),
-        full.associations[0].score.to_bits()
-    );
-    assert!(compact.compact_associations[0].reasons.is_empty());
-    assert_eq!(compact.compact_items.len(), 1);
-    assert_eq!(compact.compact_items[0].context_id, context_id);
-    assert_eq!(
-        compact.estimated_tokens,
-        sctx_search::estimate_task_context_payload_tokens(&compact)
-    );
-    assert_eq!(
-        serde_json::to_string(&compact).unwrap(),
-        serde_json::to_string(
-            &engine
-                .task_context_pack_with_detail(
-                    &request,
-                    sctx_search::ContextPackDetailLevel::Compact
-                )
-                .unwrap()
-        )
-        .unwrap()
-    );
-}
-
-#[test]
-fn the_semantic_channel_fuses_at_the_hint_channel_weight_without_deflating_lexical_scores() {
-    let fixture = Fixture::new();
-    fixture.accept(
-        fixture.lexical_space,
-        &format!("{LEXICAL_NEEDLE} routing is decided here"),
-    );
-    let (_, silent_revision) = fixture.accept(
-        fixture.silent_space,
-        &format!("{SILENT_TOPIC} shapes the outbox drain"),
-    );
-    let engine = fixture.engine();
-
-    let lexical_only = automatic_pack(&engine);
-    let baseline = lexical_only
-        .associations
-        .iter()
-        .map(|association| (association.space_id, association.score))
-        .collect::<Vec<_>>();
-
-    let (channel, _) = ScriptedChannel::hits(vec![SemanticHit {
-        revision_id: silent_revision,
-        similarity_basis_points: 7_100,
-    }]);
-    let fused = automatic_pack(&engine.clone().with_semantic_channel(channel));
-
-    // Every Space the lexical channels ranked keeps exactly the score it had. This is the property
-    // that lets the channel ship without re-measuring AUTOMATIC_RELEVANCE_FLOOR_BASIS_POINTS.
-    for (space_id, score) in baseline {
-        let after = fused
-            .associations
-            .iter()
-            .find(|association| association.space_id == space_id)
-            .map(|association| association.score);
-        assert_eq!(
-            after,
-            Some(score),
-            "the new channel must be purely additive; Space {space_id} moved"
-        );
-    }
-
-    let semantic_association = fused
-        .associations
-        .iter()
-        .find(|association| association.space_id == fixture.silent_space)
-        .expect("the semantically matched Space is now associated");
-    let explanation: Value = serde_json::from_str(
-        semantic_association
-            .reasons
-            .first()
-            .expect("every association leads with its typed fusion explanation"),
-    )
-    .expect("a typed fusion explanation");
-    let channels = explanation["channels"].as_array().expect("channel list");
-    let semantic_channel = channels
-        .iter()
-        .find(|channel| channel["channel"] == "semantic_similarity")
-        .expect("the semantic channel is reported in the fusion explanation");
-
-    assert_eq!(semantic_channel["rank"], 1);
-    assert_eq!(
-        semantic_channel["exact_match_strength"], 7_100,
-        "the explanation carries the similarity that produced the rank"
-    );
-    // RRF at rank 1 is 1_000_000 / (RRF_K + 1), weighted by the channel's own weight of 3.
-    assert_eq!(
-        semantic_channel["reciprocal_rank_micros"],
-        (1_000_000_u32 / 61) * 3,
-        "the channel fuses at the hint-channel weight ADR-0004 fixed it to"
-    );
-}
-
-#[test]
-fn channel_ordering_stays_stable_so_explanations_are_comparable_across_runs() {
-    // `TaskAssociationChannel` is `Ord`-derived and the fusion explanation sorts by it, so a
-    // variant inserted anywhere but the end would silently reorder every existing explanation.
-    assert!(TaskAssociationChannel::ExactScope < TaskAssociationChannel::SemanticSimilarity);
-    assert!(TaskAssociationChannel::SpaceIntentBm25 < TaskAssociationChannel::SemanticSimilarity);
-    assert!(
-        TaskAssociationChannel::ResolvedArtifactExact < TaskAssociationChannel::SemanticSimilarity
+        omission_reasons(&automatic_pack(&stalled)),
+        vec!["no_lane_evidence".to_owned()],
+        "the encode budget governs a path automatic injection no longer takes"
     );
 }
 

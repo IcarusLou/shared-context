@@ -619,10 +619,6 @@ pub enum TaskAssociationChannel {
     SpaceIntentBm25,
     AcceptedContextBm25,
     ExactScope,
-    /// Cosine similarity against the optional local embedding index (ADR-0004). Present only on
-    /// an installation that configured `[retrieval]`; every other installation fuses exactly the
-    /// channels it fused before this variant existed.
-    SemanticSimilarity,
 }
 
 /// Explainable features and rank contribution from one RRF channel.
@@ -885,17 +881,6 @@ pub enum TaskRetrievalPath {
     ExactScope {
         dimension: String,
         value: String,
-    },
-    /// Reached because its accepted text embeds near the Working Intent, with no token in common
-    /// required. This is the only path that can explain a cross-lingual or pure-synonym hit.
-    ///
-    /// Produced only by an explicit Pack read. ADR-0007 retired intent-text semantic matching from
-    /// automatic injection: the channel ranked well and admitted badly, and the two lanes below are
-    /// what replaced it there.
-    SemanticSimilarity {
-        /// Cosine similarity in basis points; always at or above
-        /// [`SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`].
-        similarity_basis_points: u16,
     },
     /// Lane A (ADR-0007). The Session opened or rewrote a file, and this Context records an
     /// Engineering Reference to that exact file. There is no fuzziness in it: the route is a join
@@ -1411,26 +1396,6 @@ impl SearchEngine {
         Ok(snapshot.data)
     }
 
-    /// Asks the embedding channel about one request, or reports that there is no channel.
-    ///
-    /// Paged `context_search` is deliberately excluded, and so, since ADR-0007, is automatic
-    /// injection.
-    ///
-    /// The paging reason has not changed: a channel that ranks by cosine against a cache the
-    /// background backfill is still filling would make page 2 of a query disagree with page 1. The
-    /// second exclusion is the new one and it is a measurement, not a preference -- ADR-0007 found
-    /// this path taking its top hit from an unrelated topic on every real Working Intent it was
-    /// given, because a query-side cosine is a ranking signal and automatic injection needs an
-    /// admission decision. What is left is the caller who asked: an explicit Pack read, where a
-    /// broad ranked list is the thing being requested.
-    fn semantic_outcome(&self, request: &TaskContextRequest) -> Option<SemanticOutcome> {
-        if request.mode != ContextPackMode::Explicit {
-            return None;
-        }
-        let channel = self.semantic.as_ref()?;
-        Some(channel.similar_revisions(&semantic_query_text(&request.working_intent)))
-    }
-
     /// Attaches the optional local embedding recall channel (ADR-0004).
     ///
     /// Callers attach it only when `[retrieval]` names both a model and a runtime. The handle may
@@ -1587,7 +1552,6 @@ impl SearchEngine {
                     graph_snapshot.and_then(|snapshot| snapshot.context_tree_oid.as_deref()),
                     resolved_focus.is_some() && graph.is_none(),
                     ContextPackMode::AutomaticInjection,
-                    &[],
                     AssociationReasonPolicy::Full,
                 )
             })?;
@@ -1619,7 +1583,6 @@ impl SearchEngine {
                 None,
                 resolved_focus.is_some(),
                 ContextPackMode::AutomaticInjection,
-                &[],
                 AssociationReasonPolicy::Full,
             )
         })?;
@@ -1737,7 +1700,6 @@ impl SearchEngine {
             query_phrases: &query_phrases,
             hint_queries: &hint_queries,
             scope_targets: &scope_targets,
-            semantic: self.semantic_outcome(request),
         };
         for _attempt in 0..GRAPH_GENERATION_ATTEMPTS {
             let graph_read = self.read_graph_snapshot();
@@ -1893,10 +1855,6 @@ impl SearchEngine {
                 graph_snapshot.and_then(|snapshot| snapshot.context_tree_oid.as_deref()),
                 request.resolved_focus.is_some() && graph.is_none(),
                 request.mode,
-                match &plan.semantic {
-                    Some(SemanticOutcome::Hits(hits)) => hits.as_slice(),
-                    Some(SemanticOutcome::Unavailable) | None => &[],
-                },
                 match detail_level {
                     ContextPackDetailLevel::Full => AssociationReasonPolicy::Full,
                     ContextPackDetailLevel::Compact => AssociationReasonPolicy::Compact {
@@ -1909,9 +1867,6 @@ impl SearchEngine {
                 &inference.associations[request.max_spaces.min(inference.associations.len())..],
             )?;
             space_omissions.extend(degraded.iter().cloned());
-            if matches!(plan.semantic, Some(SemanticOutcome::Unavailable)) {
-                space_omissions.push(embedding_unavailable_omission());
-            }
             inference.associations.truncate(request.max_spaces);
             let candidates = load_task_context_candidates(
                 connection,
@@ -2049,12 +2004,6 @@ struct TaskContextPlan<'a> {
     query_phrases: &'a [String],
     hint_queries: &'a [WorkingIntentHintQuery],
     scope_targets: &'a ScopeTargets,
-    /// What the embedding channel said about this query, computed once for the whole Pack.
-    ///
-    /// `None` means no channel is attached. It is resolved before the Graph retry loop because the
-    /// encode is the expensive part and the Graph moving underneath a read is no reason to pay for
-    /// it again -- and because it must not run inside the projection read.
-    semantic: Option<SemanticOutcome>,
 }
 
 /// One attempt to read the historical Engineering projection.
@@ -2088,44 +2037,6 @@ impl GraphSnapshotRead {
 /// The reason is machine-readable and reaches every caller; the free-text detail reaches only an
 /// explicit read, because an automatic injection can act on "the Graph was unreadable" and has no
 /// use for the storage error that said so.
-/// The one text the embedding channel encodes for a Working Intent.
-///
-/// It mirrors the fields the lexical channels weight highest -- the goal, the direction currently
-/// being taken, and what the Task declared in scope -- and deliberately omits `out_of_scope`.
-/// Embeddings have no notion of negation: appending what the Task explicitly ruled out would pull
-/// the query vector *towards* the Contexts that are about it, which is the exact opposite of what
-/// the field means.
-fn semantic_query_text(intent: &WorkingIntentSnapshot) -> String {
-    let mut parts = Vec::new();
-    if !intent.goal.trim().is_empty() {
-        parts.push(intent.goal.trim());
-    }
-    if let Some(direction) = intent.current_direction.as_deref() {
-        if !direction.trim().is_empty() {
-            parts.push(direction.trim());
-        }
-    }
-    for scope in &intent.in_scope {
-        if !scope.trim().is_empty() {
-            parts.push(scope.trim());
-        }
-    }
-    let joined = parts.join(" ");
-    // A hard character cap in front of the tokenizer's own 512-token truncation. Both are needed:
-    // this one bounds what is handed across the thread boundary, the tokenizer's bounds the model.
-    if joined.chars().count() <= SEMANTIC_QUERY_TEXT_CHARACTER_LIMIT {
-        return joined;
-    }
-    joined
-        .chars()
-        .take(SEMANTIC_QUERY_TEXT_CHARACTER_LIMIT)
-        .collect()
-}
-
-/// Character ceiling on the encoded query text, generous enough that 512 model tokens truncate
-/// first for every language the corpus is written in.
-const SEMANTIC_QUERY_TEXT_CHARACTER_LIMIT: usize = 4_000;
-
 /// Reports that a configured embedding channel could not answer this query.
 fn embedding_unavailable_omission() -> ContextPackOmitted {
     ContextPackOmitted {
@@ -2133,56 +2044,6 @@ fn embedding_unavailable_omission() -> ContextPackOmitted {
         count: 1,
         ..ContextPackOmitted::default()
     }
-}
-
-/// Attaches embedding hits to the Contexts they name.
-///
-/// The channel ranks revisions, because that is what the vector cache is keyed by, and retrieval
-/// reasons about Contexts. The join is what turns one into the other, and it runs through
-/// [`SAFE_ACCEPTED_CONTEXT_PREDICATE`] like every other channel: a cached vector for a revision
-/// that has since been superseded, un-accepted, or made ineligible for injection must not be able
-/// to reintroduce it. The cache is allowed to lag the projection; it is not allowed to override it.
-fn apply_semantic_context_evidence(
-    connection: &Connection,
-    hits: &[SemanticHit],
-    evidence: &mut BTreeMap<(SpaceId, ContextId), AcceptedContextEvidence>,
-) -> Result<()> {
-    if hits.is_empty() {
-        return Ok(());
-    }
-    let mut statement = connection
-        .prepare(&format!(
-            "SELECT revision.space_id, revision.context_id
-             FROM context_revision AS revision
-             JOIN context_item AS item USING(context_id)
-             WHERE revision.revision_id = ?1
-               AND {SAFE_ACCEPTED_CONTEXT_PREDICATE}"
-        ))
-        .map_err(sql_error("prepare semantic Context lookup"))?;
-    for hit in hits {
-        let mut rows = statement
-            .query_map([hit.revision_id.to_string()], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(sql_error("query semantic Context lookup"))?;
-        let Some(row) = rows.next() else {
-            continue;
-        };
-        let (space_id, context_id) = row.map_err(sql_error("collect semantic Context lookup"))?;
-        let entry = evidence
-            .entry((parse_id(&space_id)?, parse_id(&context_id)?))
-            .or_default();
-        // A Context reachable by two vectors keeps the stronger similarity, matching how every
-        // other channel aggregates: the Space is as relevant as its best evidence.
-        entry.semantic_similarity_basis_points = Some(
-            entry
-                .semantic_similarity_basis_points
-                .map_or(hit.similarity_basis_points, |current| {
-                    current.max(hit.similarity_basis_points)
-                }),
-        );
-    }
-    Ok(())
 }
 
 fn degraded_graph_omission(
@@ -3296,8 +3157,6 @@ struct AcceptedContextEvidence {
     hint_text: BTreeMap<WorkingIntentHintTextChannel, HintTextEvidence>,
     graph_paths: Vec<TaskRetrievalPath>,
     relation_depth: Option<u8>,
-    /// Cosine similarity that admitted this Context through the embedding channel, if any.
-    semantic_similarity_basis_points: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -3416,9 +3275,6 @@ struct AssociationEvidence {
     relation_paths: BTreeSet<Vec<String>>,
     channel_features: Vec<TaskAssociationChannelFeature>,
     fused_score_basis_points: u16,
-    /// Best embedding similarity across every Context this Space contributes, which is what the
-    /// Space-level [`TaskAssociationChannel::SemanticSimilarity`] rank is built from.
-    semantic_similarity_basis_points: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -3480,7 +3336,6 @@ fn infer_task_space_associations(
     graph_context_tree_oid: Option<&str>,
     focus_text_fallback_enabled: bool,
     mode: ContextPackMode,
-    semantic_hits: &[SemanticHit],
     reason_policy: AssociationReasonPolicy,
 ) -> Result<TaskAssociationInference> {
     let selection = automatic_eligible_query_tokens(connection, query_tokens, mode)?;
@@ -3508,7 +3363,6 @@ fn infer_task_space_associations(
     let effective_spaces = query_effective_context_spaces(connection)?;
     let mut contexts =
         query_accepted_context_evidence(connection, &query_tokens, &query_phrases, scope_targets)?;
-    apply_semantic_context_evidence(connection, semantic_hits, &mut contexts)?;
     let mut evidence = BTreeMap::<SpaceId, AssociationEvidence>::new();
     apply_intent_evidence(&mut evidence, intent_candidates);
     apply_working_intent_hint_evidence(connection, &hint_queries, &mut evidence, &mut contexts)?;
@@ -3839,13 +3693,6 @@ fn aggregate_context_evidence(
     aggregate.matched_contexts.insert(context_id);
     // The Space ranks on its best Context, the same way every other channel treats a Space as the
     // strongest evidence it carries.
-    if let Some(similarity) = context.semantic_similarity_basis_points {
-        aggregate.semantic_similarity_basis_points = Some(
-            aggregate
-                .semantic_similarity_basis_points
-                .map_or(similarity, |current| current.max(similarity)),
-        );
-    }
     if context.textual_match {
         aggregate.textual_contexts.insert(context_id);
         aggregate
@@ -4953,23 +4800,12 @@ const GRAPH_ARTIFACT_CHANNEL_WEIGHT: usize = 13;
 const CONTEXT_RELATION_CHANNEL_WEIGHT: usize = 10;
 const FOCUS_TEXT_FALLBACK_CHANNEL_WEIGHT: usize = 6;
 const HINT_TEXT_CHANNEL_WEIGHT: usize = 3;
-/// Weight of the optional embedding channel, equal to one hint text channel.
-///
-/// ADR-0004 fixed it there because the prototype showed embedding is a peer of the hint channels,
-/// not of the exact ones: it finds Contexts no token could reach, and it also cannot tell a
-/// near-duplicate from its neighbour or rank an identifier query at all.
-const SEMANTIC_TEXT_CHANNEL_WEIGHT: usize = 3;
 /// The normalization denominator every fused score divides by.
 ///
-/// [`SEMANTIC_TEXT_CHANNEL_WEIGHT`] is deliberately **not** part of this sum. The denominator is
-/// what turns summed reciprocal ranks into the basis points that
-/// [`AUTOMATIC_RELEVANCE_FLOOR_BASIS_POINTS`] was measured against, so widening it would silently
-/// deflate every existing score: a Space that matched one text channel at rank 1 would fall from
-/// 227 to 213 basis points and drop below a floor it used to clear, costing hits on a corpus the
-/// embedding channel never even looked at. Leaving the denominator fixed makes the new channel
-/// purely additive -- it can lift a Space above the floor, never push one below it -- which is
-/// also what makes the disabled configuration byte-identical rather than merely close. Scores
-/// still clamp at [`BASIS_POINTS_SCALE`], so the ceiling remains meaningful.
+/// It turns summed reciprocal ranks into the basis points
+/// [`AUTOMATIC_RELEVANCE_FLOOR_BASIS_POINTS`] was measured against, so it is fixed rather than
+/// derived from whichever channels happened to fire: widening it would silently deflate every
+/// existing score. Scores still clamp at [`BASIS_POINTS_SCALE`], so the ceiling remains meaningful.
 const FUSION_CHANNEL_WEIGHT: usize = GRAPH_ARTIFACT_CHANNEL_WEIGHT
     + CONTEXT_RELATION_CHANNEL_WEIGHT
     + FOCUS_TEXT_FALLBACK_CHANNEL_WEIGHT
@@ -5115,8 +4951,6 @@ fn assign_channel_features(
             ));
     }
 
-    assign_semantic_channel_features(evidence);
-
     let maximum_rrf = FUSION_CHANNEL_WEIGHT * reciprocal_rank_micros(1) as usize;
     for value in evidence.values_mut() {
         value
@@ -5134,41 +4968,6 @@ fn assign_channel_features(
                 .min(BASIS_POINTS_SCALE),
         )
         .expect("basis points fit u16");
-    }
-}
-
-/// Ranks the Spaces the embedding channel reached and gives each one its weighted RRF share.
-///
-/// Ties are broken by Space ID rather than left to map order so a fused score is reproducible: two
-/// Spaces at the same similarity must always rank in the same order, on every process and every
-/// run, or the same query stops answering the same way.
-fn assign_semantic_channel_features(evidence: &mut BTreeMap<SpaceId, AssociationEvidence>) {
-    let mut ranked = evidence
-        .iter()
-        .filter_map(|(space_id, value)| {
-            value
-                .semantic_similarity_basis_points
-                .map(|similarity| (*space_id, similarity))
-        })
-        .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    let mut previous = None;
-    let mut rank = 0;
-    for (offset, (space_id, similarity)) in ranked.into_iter().enumerate() {
-        if previous != Some(similarity) {
-            rank = offset + 1;
-            previous = Some(similarity);
-        }
-        evidence
-            .get_mut(&space_id)
-            .expect("ranked semantic Space exists")
-            .channel_features
-            .push(weighted_exact_channel_feature(
-                TaskAssociationChannel::SemanticSimilarity,
-                rank,
-                usize::from(similarity),
-                SEMANTIC_TEXT_CHANNEL_WEIGHT,
-            ));
     }
 }
 
@@ -5582,15 +5381,6 @@ fn automatic_space_text_gate(
     if !evidence.graph_exact_contexts.is_empty()
         || !evidence.relation_contexts.is_empty()
         || !evidence.focus_text_fallback_contexts.is_empty()
-        // ADR-0004: a semantic hit is a fourth alternative condition, ranked with the exact
-        // routes above rather than folded into the text arithmetic below. It has to be here and
-        // not in the coverage sum, because the whole reason the channel exists is queries whose
-        // token coverage of the answer is exactly zero -- `砍掉` against `排除`, an English Intent
-        // against a Chinese corpus. Weighing such a hit by the tokens it did not share would
-        // reject every case it was built for. Note what this does *not* touch: no threshold
-        // constant moves, and a Space with no semantic hit is judged by exactly the arithmetic it
-        // was judged by before.
-        || evidence.semantic_similarity_basis_points.is_some()
     {
         return AutomaticTextGate::ELIGIBLE;
     }
@@ -7185,7 +6975,6 @@ const fn retrieval_channel_name(path: &TaskRetrievalPath) -> &'static str {
         TaskRetrievalPath::WorkingIntentHintText { .. } => "working_intent_hint_text",
         TaskRetrievalPath::ResolvedFocusTextFallback { .. } => "resolved_focus_text_fallback",
         TaskRetrievalPath::ExactScope { .. } => "exact_scope",
-        TaskRetrievalPath::SemanticSimilarity { .. } => "semantic_similarity",
         TaskRetrievalPath::FileAnchor { .. } => "file_anchor",
         TaskRetrievalPath::SeedExpansion { .. } => "seed_expansion",
         TaskRetrievalPath::SeedAssociation { .. } => "seed_association",
@@ -7228,7 +7017,6 @@ fn compact_item_reasons(item: &TaskContextItem, sole_repository: Option<&str>) -
     let mut graph = false;
     let mut focus_fallback = false;
     let mut text = false;
-    let mut semantic = None;
     let mut scopes = Vec::new();
     for path in &item.retrieval_paths {
         match path {
@@ -7291,18 +7079,9 @@ fn compact_item_reasons(item: &TaskContextItem, sole_repository: Option<&str>) -
             TaskRetrievalPath::ExactScope { dimension, value } => {
                 scopes.push(format!("{dimension}={value}"));
             }
-            TaskRetrievalPath::SemanticSimilarity {
-                similarity_basis_points,
-            } => semantic = Some(*similarity_basis_points),
             TaskRetrievalPath::SpaceAssociation { .. }
             | TaskRetrievalPath::GraphDiagnostic { .. } => {}
         }
-    }
-    if let Some(similarity) = semantic {
-        reasons.push(format!(
-            "Matched the Task meaning without sharing its wording (semantic similarity {}%).",
-            similarity / 100
-        ));
     }
     if graph {
         reasons.push(
@@ -7769,14 +7548,6 @@ fn automatic_context_text_eligible(
     let Some(context) = context else {
         return automatic_inherited_space_text_eligible(space, coverage_basis);
     };
-    // A semantic hit is its own admission ticket, at the same rank as an exact Graph or Relation
-    // path. ADR-0004 is explicit that this widens the *set of routes* into automatic injection
-    // without touching any text threshold: the similarity floor already did the judging, and a
-    // Context whose text embeds this close to the Working Intent is on topic in exactly the way
-    // the coverage rules were written to approximate and cannot measure across a language gap.
-    if context.semantic_similarity_basis_points.is_some() {
-        return true;
-    }
     if !context.matched_artifacts.is_empty()
         || context.graph_paths.iter().any(|path| {
             matches!(
@@ -7861,11 +7632,6 @@ fn task_retrieval_paths(
     context: Option<&AcceptedContextEvidence>,
 ) -> Vec<TaskRetrievalPath> {
     let mut paths = Vec::new();
-    if let Some(similarity) = context.and_then(|value| value.semantic_similarity_basis_points) {
-        paths.push(TaskRetrievalPath::SemanticSimilarity {
-            similarity_basis_points: similarity,
-        });
-    }
     if space.intent_matched {
         paths.push(TaskRetrievalPath::IntentFts {
             matched_fields: space.intent_fields.iter().cloned().collect(),
@@ -7959,7 +7725,8 @@ fn context_match_reason(
             .into_iter()
             .flat_map(|value| value.alias_matches.iter().cloned())
             .collect(),
-        similarity_basis_points: context.and_then(|value| value.semantic_similarity_basis_points),
+        // Only the second hop produces one now; an explicit Pack read compares no vectors.
+        similarity_basis_points: None,
     }
 }
 
@@ -9963,11 +9730,10 @@ mod tests {
         .unwrap();
         assert!(associations.iter().all(|a| a.reasons == full));
 
-        // A semantic-only row has no prose to emit, but must still undergo domain validation.
+        // A row with no prose to emit must still undergo domain validation.
         sources.insert(
             associations[0].space_id,
             AssociationEvidence {
-                semantic_similarity_basis_points: Some(6_400),
                 fused_score_basis_points: 8_000,
                 ..AssociationEvidence::default()
             },
