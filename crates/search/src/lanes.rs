@@ -25,8 +25,15 @@
 //!
 //! This module also carries the S2-2 non-semantic seed expansion, because it produces the same
 //! kind of value -- a seed -- from the same starting point.
+//!
+//! And it carries Lane B's second hop ([`lane_b_hits`]), which is where the fuzziness lives and
+//! where it is bounded. Lane A produces seeds; the second hop takes each seed's cached document
+//! vector, compares it against every other accepted Context's, and *admits* the ones above
+//! [`crate::SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS`] -- no query text, no encode, no second
+//! hop off the Contexts it just admitted. The two lanes live in one file because Lane B's input is
+//! Lane A's output and neither is meaningful without the other.
 
-// S2-4 wires both halves into `task_context_pack`; until it does, nothing in the crate calls them.
+// S2-4 wires all three into `task_context_pack`; until it does, nothing in the crate calls them.
 #![allow(dead_code)]
 
 use std::{
@@ -41,7 +48,11 @@ use sctx_domain::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{LocatorPath, Result, SAFE_ACCEPTED_CONTEXT_PREDICATE, from_json, parse_id, sql_error};
+use crate::{
+    LocatorPath, Result, SAFE_ACCEPTED_CONTEXT_PREDICATE,
+    embedding::{Hop2AdmissionSample, cosine_similarity, similarity_basis_points},
+    from_json, parse_id, sql_error,
+};
 
 /// Where one file anchor came from.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -515,6 +526,281 @@ fn placeholders(count: usize) -> String {
     vec!["?"; count].join(",")
 }
 
+/// What one seed decided about one candidate, and why.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SeedMatch {
+    pub seed_context_id: ContextId,
+    pub seed_revision_id: RevisionId,
+    /// Cosine of the two document vectors, in basis points.
+    pub score_basis_points: u16,
+    /// Identifiers both Contexts spell out, lower-cased and deduplicated.
+    ///
+    /// Corroboration, never a ticket: a candidate with identifiers in common is admitted by its
+    /// score or not at all, and this only decides which of two equally scored candidates prints
+    /// first and what the `why` line has to show for itself.
+    pub shared_identifiers: Vec<String>,
+}
+
+/// One accepted Context the second hop admitted, and the seed that admitted it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LaneBHit {
+    pub context_id: ContextId,
+    pub revision_id: RevisionId,
+    pub space_id: SpaceId,
+    /// The strongest seed -- the one a `why` line names, with the score that admitted the Context.
+    pub seed: SeedMatch,
+    /// Every other seed that also admitted it, strongest first. Usually empty.
+    ///
+    /// The strongest seed is the one to render, but it is not the only true thing about the hit:
+    /// a Context three seeds all reach is better evidence than one a single seed reaches, and the
+    /// assembler is the layer that gets to decide whether to say so.
+    pub also_admitted_by: Vec<SeedMatch>,
+}
+
+impl LaneBHit {
+    /// The score that admitted this Context: its strongest seed's.
+    pub const fn score_basis_points(&self) -> u16 {
+        self.seed.score_basis_points
+    }
+
+    /// The identifiers the strongest seed shares with it.
+    pub fn shared_identifiers(&self) -> &[String] {
+        &self.seed.shared_identifiers
+    }
+
+    /// Every seed that admitted this Context, strongest first.
+    pub fn admitting_seeds(&self) -> impl Iterator<Item = &SeedMatch> {
+        std::iter::once(&self.seed).chain(&self.also_admitted_by)
+    }
+}
+
+/// Everything one pass of the second hop produced.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Hop2Admission {
+    /// Admitted Contexts, by descending score. Never contains a seed.
+    pub hits: Vec<LaneBHit>,
+    /// Candidates no seed could be compared against, because the corpus backfill has not reached
+    /// them or their cached vector belongs to a generation this one cannot be compared with.
+    ///
+    /// Counted rather than reported as an omission and never waited for: encoding one on demand
+    /// would put a model call on the retrieval path, which is the thing ADR-0004's whole design
+    /// refuses. A non-zero count with a large corpus means the backfill is still running.
+    pub skipped_missing_vector: usize,
+    /// Seeds that carried no usable vector, which is the same fact seen from the other side.
+    pub seeds_missing_vector: usize,
+    /// One row per pair judged, refusals included, in the order they were judged.
+    ///
+    /// ADR-0007 pre-registered this: the floor was set from one synthetic corpus cross-checked
+    /// against one installation, and it is re-derived from these rows once real traffic has
+    /// accumulated. The caller hands them to
+    /// [`SemanticVectorCache::record_hop2_admissions`](crate::SemanticVectorCache::record_hop2_admissions);
+    /// this function does not write, because it holds a projection connection and the samples
+    /// belong in the discardable cache.
+    pub samples: Vec<Hop2AdmissionSample>,
+}
+
+/// One accepted Context as the second hop sees it: an identity, a vector key, and its prose.
+struct Hop2Context {
+    context_id: ContextId,
+    revision_id: RevisionId,
+    space_id: SpaceId,
+    /// Identifiers this Context spells out, for the shared-identifier intersection.
+    identifiers: BTreeSet<String>,
+}
+
+/// Admits the accepted Contexts whose document vector is close enough to a seed's.
+///
+/// This is Lane B, and it is an admission rather than a ranking. ADR-0007's measurement is the
+/// whole reason for the distinction: on a real installation the intent-text path took its top hit
+/// from an unrelated topic every single time while *ordering* the corpus essentially perfectly, so
+/// a cosine that decides who gets in has to be read against a threshold derived from the highest
+/// scoring negative -- which is what [`crate::SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS`] is, and what
+/// `floor_basis_points` carries here so an operator can move it and a test can pin it.
+///
+/// Three properties are structural rather than enforced:
+///
+/// * **No query is encoded.** Both sides of every comparison are document vectors the backfill
+///   already wrote, handed in through `vectors`. There is no provider parameter and no text-to-
+///   vector call in this function, so the retrieval path cannot acquire a model call by accident --
+///   the defect that made the encode budget's mis-calibration invisible for as long as it was.
+/// * **It is one hop.** The Contexts admitted here are not re-seeded. `seeds` is what the caller
+///   assembled from Lane A and the non-semantic expansion, and the answer is not fed back into it.
+/// * **A seed is never its own candidate**, and never another seed's: a seed is already in the
+///   Pack by the time this runs, and admitting it a second time would double-count it.
+///
+/// `vectors` is keyed by revision because that is how [`SemanticVectorCache`](crate::SemanticVectorCache)
+/// keys them -- one generation of one model's output, loaded once when the channel is published.
+/// A candidate missing from it is skipped and counted, never encoded on demand and never waited on.
+///
+/// # Errors
+///
+/// Returns typed storage errors when the projection cannot be read.
+pub(crate) fn lane_b_hits(
+    connection: &Connection,
+    seeds: &[(ContextId, RevisionId)],
+    vectors: &BTreeMap<RevisionId, Vec<f32>>,
+    floor_basis_points: u16,
+) -> Result<Hop2Admission> {
+    if seeds.is_empty() {
+        return Ok(Hop2Admission::default());
+    }
+    let seeded = seeds.iter().copied().collect::<BTreeSet<_>>();
+    let corpus = read_hop2_corpus(connection)?;
+    let (seed_contexts, candidates): (Vec<_>, Vec<_>) = corpus
+        .iter()
+        .partition(|context| seeded.contains(&(context.context_id, context.revision_id)));
+
+    let mut seeds_missing_vector = 0;
+    let scored_seeds = seed_contexts
+        .iter()
+        .filter(|seed| match vectors.get(&seed.revision_id) {
+            Some(vector) if !vector.is_empty() => true,
+            _ => {
+                seeds_missing_vector += 1;
+                false
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut admission = Hop2Admission {
+        seeds_missing_vector,
+        ..Hop2Admission::default()
+    };
+    for candidate in candidates {
+        let Some(candidate_vector) = vectors.get(&candidate.revision_id) else {
+            admission.skipped_missing_vector += 1;
+            continue;
+        };
+        let mut matched = Vec::new();
+        let mut compared = false;
+        for seed in &scored_seeds {
+            let seed_vector = &vectors[&seed.revision_id];
+            // Two vectors of different length are two generations, not two meanings. The channel
+            // drops that pair for the same reason.
+            if seed_vector.len() != candidate_vector.len() {
+                continue;
+            }
+            compared = true;
+            let score_basis_points =
+                similarity_basis_points(cosine_similarity(seed_vector, candidate_vector));
+            let admitted = score_basis_points >= floor_basis_points;
+            admission.samples.push(Hop2AdmissionSample {
+                seed_revision_id: seed.revision_id,
+                candidate_revision_id: candidate.revision_id,
+                score_basis_points,
+                admitted,
+            });
+            if admitted {
+                matched.push(SeedMatch {
+                    seed_context_id: seed.context_id,
+                    seed_revision_id: seed.revision_id,
+                    score_basis_points,
+                    shared_identifiers: seed
+                        .identifiers
+                        .intersection(&candidate.identifiers)
+                        .cloned()
+                        .collect(),
+                });
+            }
+        }
+        if !compared {
+            admission.skipped_missing_vector += 1;
+            continue;
+        }
+        // Strongest first, and by seed identity when two seeds reach it equally, so the seed a
+        // `why` line names does not depend on the order the projection returned rows in.
+        matched.sort_by(|left, right| {
+            right
+                .score_basis_points
+                .cmp(&left.score_basis_points)
+                .then_with(|| left.seed_context_id.cmp(&right.seed_context_id))
+        });
+        let mut matched = matched.into_iter();
+        let Some(seed) = matched.next() else {
+            continue;
+        };
+        admission.hits.push(LaneBHit {
+            context_id: candidate.context_id,
+            revision_id: candidate.revision_id,
+            space_id: candidate.space_id,
+            seed,
+            also_admitted_by: matched.collect(),
+        });
+    }
+    // Score decides the order. Shared identifiers break a tie and nothing more: two Contexts at the
+    // same cosine are separated by whether they name the same code, which is the one piece of
+    // evidence a cosine does not carry. Context identity closes it so the order is total.
+    admission.hits.sort_by(|left, right| {
+        right
+            .score_basis_points()
+            .cmp(&left.score_basis_points())
+            .then_with(|| {
+                right
+                    .shared_identifiers()
+                    .len()
+                    .cmp(&left.shared_identifiers().len())
+            })
+            .then_with(|| left.context_id.cmp(&right.context_id))
+    });
+    Ok(admission)
+}
+
+/// Every accepted, injectable Context with the identifiers its prose spells out.
+///
+/// The three fields read here are the three [`SearchEngine::embeddable_revisions`](crate::SearchEngine::embeddable_revisions)
+/// encodes, which is what makes the identifier intersection a statement about the same text the
+/// vectors were built from.
+fn read_hop2_corpus(connection: &Connection) -> Result<Vec<Hop2Context>> {
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT item.context_id, revision.revision_id, item.space_id,
+                    revision.statement, revision.rationale,
+                    COALESCE(revision.problem_view, '')
+             FROM context_revision AS revision
+             JOIN context_item AS item USING(context_id)
+             WHERE {SAFE_ACCEPTED_CONTEXT_PREDICATE}
+             ORDER BY item.context_id"
+        ))
+        .map_err(sql_error("prepare second-hop corpus read"))?;
+    let mut rows = statement
+        .query([])
+        .map_err(sql_error("execute second-hop corpus read"))?;
+    let mut corpus = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(sql_error("read second-hop corpus row"))?
+    {
+        let statement_text: String = row.get(3).map_err(sql_error("read second-hop statement"))?;
+        let rationale: String = row.get(4).map_err(sql_error("read second-hop rationale"))?;
+        let problem_view: String = row
+            .get(5)
+            .map_err(sql_error("read second-hop problem view"))?;
+        corpus.push(Hop2Context {
+            context_id: parse_id(
+                &row.get::<_, String>(0)
+                    .map_err(sql_error("read second-hop Context"))?,
+            )?,
+            revision_id: parse_id(
+                &row.get::<_, String>(1)
+                    .map_err(sql_error("read second-hop revision"))?,
+            )?,
+            space_id: parse_id(
+                &row.get::<_, String>(2)
+                    .map_err(sql_error("read second-hop Space"))?,
+            )?,
+            // The same reading the Candidate analyzer intersects, and the same one the projection
+            // derives hint terms with -- identifier syntax, not word overlap. `hints` refuses a
+            // run that is merely short and lower case, so a repository nickname like the `ttk` in
+            // `x-ttk-map-view` contributes nothing while `LynxMapController` does. That refusal is
+            // what keeps this a corroboration and not a second lexical channel.
+            identifiers: hints::normalized_identifiers(
+                [&statement_text, &rationale, &problem_view].map(String::as_str),
+            ),
+        });
+    }
+    Ok(corpus)
+}
+
 #[cfg(test)]
 mod test_support {
     use sctx_domain::{
@@ -662,11 +948,40 @@ mod test_support {
             self.read(|connection| super::expand_seeds_once(connection, seeds))
         }
 
+        /// An accepted Context whose two embedded fields are both under the test's control.
+        pub fn accept_document(&self, statement: &str, rationale: &str) -> Accepted {
+            let mut draft = draft(statement, None, None, Vec::new());
+            draft.rationale = rationale.to_owned();
+            self.accept_draft(draft)
+        }
+
+        pub fn hop2(
+            &self,
+            seeds: &[(ContextId, RevisionId)],
+            vectors: &std::collections::BTreeMap<RevisionId, Vec<f32>>,
+            floor_basis_points: u16,
+        ) -> super::Hop2Admission {
+            self.read(|connection| {
+                super::lane_b_hits(connection, seeds, vectors, floor_basis_points)
+            })
+        }
+
         pub fn read<T>(&self, query: impl FnOnce(&rusqlite::Connection) -> crate::Result<T>) -> T {
             ProjectionIndex::for_store(&self.store)
                 .query_snapshot(query)
                 .unwrap()
                 .data
+        }
+
+        /// What the corpus backfill would encode, read through the production rule.
+        ///
+        /// Not the fixture's text read a second time: the second hop compares vectors the backfill
+        /// wrote, and the only way a test can claim its vectors are those is to build them from
+        /// the same projection query production builds them from.
+        pub fn embeddable(&self) -> Vec<(RevisionId, String)> {
+            crate::SearchEngine::new(ProjectionIndex::for_store(&self.store))
+                .embeddable_revisions()
+                .expect("read the embeddable corpus")
         }
 
         fn accept_draft(&self, draft: ContextRevisionDraft) -> Accepted {
@@ -1242,5 +1557,410 @@ mod tests {
         let seeds = corpus.hits(&anchors);
         assert!(seeds.is_empty(), "{seeds:#?}");
         assert!(corpus.expand(&[]).is_empty());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Lane B: the second hop's admission
+    // ---------------------------------------------------------------------------------------
+
+    use std::collections::BTreeMap;
+
+    use crate::SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS;
+
+    /// A unit vector in a three-dimensional toy space, placed at a stated cosine from two axes.
+    ///
+    /// `against` is the cosine, in basis points, this vector has with the first and the second axis
+    /// vector; the third dimension carries whatever is left of the unit length. Two seeds parked on
+    /// the two axes therefore score any candidate at exactly the numbers the test names, which is
+    /// what lets a test assert that 5199 is refused and 5200 admitted without a language model in
+    /// the room. Nothing about the embedding space is being claimed here -- only that the
+    /// comparison, the rounding and the threshold behave as written.
+    fn at(against: [u16; 2]) -> Vec<f32> {
+        let first = f32::from(against[0]) / 10_000.0;
+        let second = f32::from(against[1]) / 10_000.0;
+        let remainder = (1.0 - first * first - second * second).max(0.0).sqrt();
+        vec![first, second, remainder]
+    }
+
+    /// The vector a seed sits on: `axis(0)` and `axis(1)` are the two [`at`] refers to.
+    fn axis(index: usize) -> Vec<f32> {
+        let mut vector = vec![0.0; 3];
+        vector[index] = 1.0;
+        vector
+    }
+
+    #[test]
+    fn a_candidate_enters_on_its_score_and_a_basis_point_below_the_floor_does_not() {
+        let corpus = Corpus::new();
+        let seed = corpus.accept("the seed the Session already touched");
+        let admitted = corpus.accept("a Context exactly at the floor");
+        let refused = corpus.accept("a Context one basis point under it");
+
+        let vectors = BTreeMap::from([
+            (seed.revision, axis(0)),
+            (admitted.revision, at([5_200, 0])),
+            (refused.revision, at([5_199, 0])),
+        ]);
+        let admission = corpus.hop2(
+            &[(seed.context, seed.revision)],
+            &vectors,
+            SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
+        );
+
+        assert_eq!(
+            admission
+                .hits
+                .iter()
+                .map(|hit| (hit.context_id, hit.score_basis_points()))
+                .collect::<Vec<_>>(),
+            [(admitted.context, 5_200)],
+            "the floor is a boundary the score has to reach, not one it has to approach"
+        );
+        assert_eq!(admission.hits[0].revision_id, admitted.revision);
+        assert_eq!(admission.hits[0].space_id, corpus.space_id);
+        assert_eq!(admission.hits[0].seed.seed_context_id, seed.context);
+        assert_eq!(admission.hits[0].seed.seed_revision_id, seed.revision);
+        assert_eq!(admission.skipped_missing_vector, 0);
+        assert_eq!(admission.seeds_missing_vector, 0);
+        assert!(
+            admission.hits[0].also_admitted_by.is_empty(),
+            "one seed admitted it, so there is no second seed to carry"
+        );
+    }
+
+    #[test]
+    fn a_candidate_the_backfill_has_not_reached_is_skipped_and_counted() {
+        let corpus = Corpus::new();
+        let seed = corpus.accept("the seed the Session already touched");
+        let cached = corpus.accept("a Context the backfill has encoded");
+        let uncached = corpus.accept("a Context the backfill has not reached yet");
+        let stale_generation = corpus.accept("a Context whose cached vector is another model's");
+
+        let vectors = BTreeMap::from([
+            (seed.revision, axis(0)),
+            (cached.revision, at([9_000, 0])),
+            // A vector of a different width is a different generation, not a different meaning.
+            (stale_generation.revision, vec![1.0, 0.0]),
+        ]);
+        let admission = corpus.hop2(
+            &[(seed.context, seed.revision)],
+            &vectors,
+            SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
+        );
+
+        assert_eq!(
+            admission
+                .hits
+                .iter()
+                .map(|hit| hit.context_id)
+                .collect::<Vec<_>>(),
+            [cached.context],
+            "a missing vector costs one candidate and blocks nothing: {uncached:?}"
+        );
+        assert_eq!(
+            admission.skipped_missing_vector, 2,
+            "both the uncached Context and the one no seed could be compared with are counted"
+        );
+        assert_eq!(
+            admission.samples.len(),
+            1,
+            "a pair that was never scored is not a decision and must not become a sample"
+        );
+    }
+
+    #[test]
+    fn a_seed_with_no_vector_is_counted_and_the_hop_runs_on_the_seeds_that_have_one() {
+        let corpus = Corpus::new();
+        let scored = corpus.accept("a seed the backfill reached");
+        let unscored = corpus.accept("a seed the backfill has not reached");
+        let candidate = corpus.accept("the Context under judgement");
+
+        let vectors = BTreeMap::from([
+            (scored.revision, axis(0)),
+            (candidate.revision, at([7_000, 9_900])),
+        ]);
+        let admission = corpus.hop2(
+            &[
+                (scored.context, scored.revision),
+                (unscored.context, unscored.revision),
+            ],
+            &vectors,
+            SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
+        );
+
+        assert_eq!(admission.seeds_missing_vector, 1);
+        assert_eq!(
+            admission
+                .hits
+                .iter()
+                .map(|hit| (hit.context_id, hit.seed.seed_context_id))
+                .collect::<Vec<_>>(),
+            [(candidate.context, scored.context)]
+        );
+    }
+
+    #[test]
+    fn every_pair_the_hop_judged_leaves_a_row_and_the_refusals_are_the_point() {
+        let corpus = Corpus::new();
+        let seed = corpus.accept("the seed the Session already touched");
+        let admitted = corpus.accept("a Context above the floor");
+        let refused = corpus.accept("a Context well below it");
+
+        let vectors = BTreeMap::from([
+            (seed.revision, axis(0)),
+            (admitted.revision, at([7_400, 0])),
+            (refused.revision, at([2_500, 0])),
+        ]);
+        let admission = corpus.hop2(
+            &[(seed.context, seed.revision)],
+            &vectors,
+            SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
+        );
+
+        let mut recorded = admission
+            .samples
+            .iter()
+            .map(|sample| {
+                (
+                    sample.candidate_revision_id,
+                    sample.score_basis_points,
+                    sample.admitted,
+                )
+            })
+            .collect::<Vec<_>>();
+        recorded.sort_by_key(|(_, score, _)| Reverse(*score));
+        assert_eq!(
+            recorded,
+            [
+                (admitted.revision, 7_400, true),
+                (refused.revision, 2_500, false)
+            ],
+            "the floor is derived from the highest scoring negative, so a record that dropped the \
+             refusals could never re-derive it"
+        );
+        assert!(
+            admission
+                .samples
+                .iter()
+                .all(|sample| sample.seed_revision_id == seed.revision)
+        );
+    }
+
+    #[test]
+    fn the_strongest_seed_names_the_hit_and_the_weaker_ones_survive_beside_it() {
+        let corpus = Corpus::new();
+        let near = corpus.accept("the seed this Context sits closest to");
+        let far = corpus.accept("a second seed that also reaches it");
+        let candidate = corpus.accept("the Context two seeds both admit");
+
+        let vectors = BTreeMap::from([
+            (near.revision, axis(0)),
+            (far.revision, axis(1)),
+            (candidate.revision, at([8_000, 5_400])),
+        ]);
+        let admission = corpus.hop2(
+            &[(near.context, near.revision), (far.context, far.revision)],
+            &vectors,
+            SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
+        );
+
+        assert_eq!(admission.hits.len(), 1, "one Context, reached twice");
+        let hit = &admission.hits[0];
+        assert_eq!(hit.context_id, candidate.context);
+        assert_eq!(
+            (hit.seed.seed_context_id, hit.score_basis_points()),
+            (near.context, 8_000),
+            "the highest score is the Context's score and its seed is the one a why line names"
+        );
+        assert_eq!(
+            hit.also_admitted_by
+                .iter()
+                .map(|seed| (seed.seed_context_id, seed.score_basis_points))
+                .collect::<Vec<_>>(),
+            [(far.context, 5_400)],
+            "the weaker seed is still true and the assembler is the layer that decides to say so"
+        );
+        assert_eq!(
+            hit.admitting_seeds()
+                .map(|seed| seed.seed_context_id)
+                .collect::<Vec<_>>(),
+            [near.context, far.context]
+        );
+        assert_eq!(
+            admission.samples.len(),
+            2,
+            "two seeds judged it, so two decisions were taken"
+        );
+    }
+
+    /// Identifiers order a tie and nothing more, and only spellings that pass identifier syntax
+    /// count as one. The negative here is the real one: `x-ttk-map-view` is a repository nickname
+    /// two Contexts in the same product share by the accident of being about the same product, and
+    /// letting a slice of it read as a shared identifier would turn corroboration into a second,
+    /// much weaker lexical channel.
+    #[test]
+    fn shared_identifiers_break_a_tie_and_a_repository_nickname_is_not_one() {
+        let corpus = Corpus::new();
+        let seed = corpus.accept_document(
+            "LynxMapController 在 x-ttk-map-view 中持有相机",
+            "种子记录的是相机归属",
+        );
+        let names_the_symbol = corpus.accept_document(
+            "LynxMapController 的可见性切换会重置相机",
+            "候选与种子谈的是同一个类",
+        );
+        let names_the_repository = corpus.accept_document(
+            "x-ttk-map-view 的构建任务在本仓不可用",
+            "候选与种子只共享一个仓库昵称",
+        );
+
+        let vectors = BTreeMap::from([
+            (seed.revision, axis(0)),
+            // Deliberately the same score: the tie is the whole subject of this test.
+            (names_the_symbol.revision, at([6_000, 0])),
+            (names_the_repository.revision, at([6_000, 0])),
+        ]);
+        let admission = corpus.hop2(
+            &[(seed.context, seed.revision)],
+            &vectors,
+            SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
+        );
+
+        assert_eq!(
+            admission
+                .hits
+                .iter()
+                .map(|hit| (hit.context_id, hit.shared_identifiers().to_vec()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    names_the_symbol.context,
+                    vec!["lynxmapcontroller".to_owned()]
+                ),
+                (names_the_repository.context, Vec::new()),
+            ],
+            "`ttk`, `map` and `view` are short lower-case runs, not identifiers, so the Context \
+             that names the class sorts above the one that merely names the product"
+        );
+    }
+
+    #[test]
+    fn a_seed_is_never_its_own_candidate_and_never_another_seeds() {
+        let corpus = Corpus::new();
+        let first = corpus.accept("the first seed");
+        let second = corpus.accept("the second seed");
+
+        // Both seeds are as close to each other as two Contexts can be.
+        let vectors = BTreeMap::from([(first.revision, axis(0)), (second.revision, axis(0))]);
+        let admission = corpus.hop2(
+            &[
+                (first.context, first.revision),
+                (second.context, second.revision),
+            ],
+            &vectors,
+            SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
+        );
+
+        assert!(
+            admission.hits.is_empty(),
+            "a seed is already in the Pack; admitting it again would double-count it: {:#?}",
+            admission.hits
+        );
+        assert!(
+            admission.samples.is_empty(),
+            "no pair was judged, so no decision was taken"
+        );
+    }
+
+    /// The same predicate Lane A's reverse lookup carries, for the same reason. A cached vector
+    /// outlives the revision that produced it -- measured at 5 of 28 rows on one real installation
+    /// -- so without this the second hop could reach a Context nothing else in the system will
+    /// serve any more.
+    #[test]
+    fn a_vector_whose_context_left_the_accepted_set_admits_nothing() {
+        let corpus = Corpus::new();
+        let seed = corpus.accept("the seed the Session already touched");
+        let retired = corpus.accept("the reading a later Context replaces");
+        let current = corpus.supersede(retired.context, "the reading that replaces it");
+        let revised_from = corpus.accept("the first reading of a Context that was then revised");
+        let revised_to = corpus.revise(revised_from, "the corrected reading");
+
+        let vectors = BTreeMap::from([
+            (seed.revision, axis(0)),
+            (retired.revision, axis(0)),
+            (revised_from.revision, axis(0)),
+            (current.revision, at([9_000, 0])),
+            (revised_to.revision, at([9_000, 0])),
+        ]);
+        let admission = corpus.hop2(
+            &[(seed.context, seed.revision)],
+            &vectors,
+            SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
+        );
+
+        assert_eq!(
+            admission
+                .hits
+                .iter()
+                .map(|hit| hit.context_id)
+                .collect::<BTreeSet<_>>(),
+            [current.context, revised_to.context].into_iter().collect(),
+            "a superseded Context and a retired revision keep their vectors and must still be \
+             invisible here"
+        );
+    }
+
+    /// The floor is a parameter because ADR-0007 pre-registered it as a configuration key: 5200 is
+    /// one synthetic corpus cross-checked against one installation, and the value is due to be
+    /// re-derived from the samples above. A lane that read the constant directly could not be moved
+    /// without a release.
+    #[test]
+    fn the_floor_is_the_caller_s_and_moving_it_moves_the_admitted_set() {
+        let corpus = Corpus::new();
+        let seed = corpus.accept("the seed the Session already touched");
+        let borderline = corpus.accept("a Context between the two floors");
+
+        let vectors = BTreeMap::from([
+            (seed.revision, axis(0)),
+            (borderline.revision, at([4_800, 0])),
+        ]);
+        let seeds = [(seed.context, seed.revision)];
+
+        assert!(
+            corpus
+                .hop2(&seeds, &vectors, SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS)
+                .hits
+                .is_empty()
+        );
+        assert_eq!(
+            corpus
+                .hop2(&seeds, &vectors, 4_500)
+                .hits
+                .iter()
+                .map(|hit| hit.context_id)
+                .collect::<Vec<_>>(),
+            [borderline.context]
+        );
+        assert!(
+            corpus
+                .hop2(&seeds, &vectors, SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS)
+                .samples
+                .iter()
+                .all(|sample| !sample.admitted),
+            "the refusal is recorded as the decision that was taken under the floor in force"
+        );
+    }
+
+    #[test]
+    fn an_empty_seed_set_admits_nothing_and_reads_neither_corpus_nor_vectors() {
+        let corpus = Corpus::new();
+        let orphan = corpus.accept("a Context no seed reaches");
+        let vectors = BTreeMap::from([(orphan.revision, axis(0))]);
+
+        assert_eq!(
+            corpus.hop2(&[], &vectors, SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS),
+            Hop2Admission::default(),
+            "the second hop queries from a seed; with none it has nothing to ask"
+        );
     }
 }

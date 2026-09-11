@@ -30,9 +30,10 @@ mod lanes;
 
 pub use embedding::{
     EmbeddingProvider, EmbeddingSemanticChannel, EncodeLatencySummary, EncodeSample,
-    EncodeSampleRecorder, QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, QueryVectorCache,
-    SEMANTIC_CHANNEL_LIMIT, SEMANTIC_CORPUS_VERSION, SEMANTIC_ENCODE_BUDGET,
-    SEMANTIC_ENCODE_SAMPLE_HISTORY, SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
+    EncodeSampleRecorder, Hop2AdmissionSample, QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS,
+    QueryVectorCache, RecordedHop2Admission, SEMANTIC_CHANNEL_LIMIT, SEMANTIC_CORPUS_VERSION,
+    SEMANTIC_ENCODE_BUDGET, SEMANTIC_ENCODE_SAMPLE_HISTORY,
+    SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS, SEMANTIC_HOP2_SAMPLE_HISTORY,
     SEMANTIC_QUERY_CACHE_CAPACITY, SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SemanticCacheKey,
     SemanticChannel, SemanticChannelHandle, SemanticHit, SemanticOutcome, SemanticVectorCache,
     load_onnx_provider, model_fingerprint, semantic_cache_path,

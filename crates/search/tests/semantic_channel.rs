@@ -30,8 +30,9 @@ use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::ProjectionIndex;
 use sctx_search::{
     ContextPackMode, EmbeddingProvider, EmbeddingSemanticChannel, EncodeLatencySummary,
-    EncodeSample, EncodeSampleRecorder, Error, ErrorKind, QueryVectorCache, SEMANTIC_CHANNEL_LIMIT,
-    SEMANTIC_CORPUS_VERSION, SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SearchEngine,
+    EncodeSample, EncodeSampleRecorder, Error, ErrorKind, Hop2AdmissionSample, QueryVectorCache,
+    SEMANTIC_CHANNEL_LIMIT, SEMANTIC_CORPUS_VERSION, SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
+    SEMANTIC_HOP2_SAMPLE_HISTORY, SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SearchEngine,
     SemanticCacheKey, SemanticChannel, SemanticChannelHandle, SemanticHit, SemanticOutcome,
     SemanticVectorCache, TaskAssociationChannel, TaskContextPack, TaskContextRequest,
     TaskRetrievalPath,
@@ -1078,6 +1079,131 @@ fn a_history_of_timeouts_is_what_marks_a_budget_unfit_and_a_short_one_is_not() {
         !summary.budget_is_unfit(),
         "a history of timeouts taken while the corpus backfilled is a window that closes, not a \
          budget the machine cannot meet"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The second hop's admission record (ADR-0007's pre-registered recalibration)
+// ---------------------------------------------------------------------------------------------
+
+/// One decision, spelled the way the second hop produces it.
+fn hop2_sample(seed: RevisionId, candidate: RevisionId, score: u16) -> Hop2AdmissionSample {
+    Hop2AdmissionSample {
+        seed_revision_id: seed,
+        candidate_revision_id: candidate,
+        score_basis_points: score,
+        admitted: score >= SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
+    }
+}
+
+#[test]
+fn second_hop_decisions_land_where_the_recalibration_can_read_them() {
+    let directory = TempDir::new().unwrap();
+    let cache = SemanticVectorCache::open(&directory.path().join("semantic.sqlite")).unwrap();
+
+    assert!(
+        cache.recent_hop2_admissions(8).unwrap().is_empty(),
+        "an installation whose second hop has never run reports nothing rather than a zero"
+    );
+
+    let seed = RevisionId::new();
+    let admitted = RevisionId::new();
+    let refused = RevisionId::new();
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    cache.record_hop2_admissions(&[
+        hop2_sample(seed, admitted, 7_412),
+        hop2_sample(seed, refused, 2_563),
+    ]);
+
+    let recorded = cache.recent_hop2_admissions(8).unwrap();
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|row| (
+                row.sample.seed_revision_id,
+                row.sample.candidate_revision_id,
+                row.sample.score_basis_points,
+                row.sample.admitted
+            ))
+            .collect::<Vec<_>>(),
+        [(seed, refused, 2_563, false), (seed, admitted, 7_412, true),],
+        "newest first, and the refusal is kept: the floor is derived from the highest scoring \
+         negative, so a record of admissions alone could never re-derive it"
+    );
+    assert!(
+        recorded
+            .iter()
+            .all(|row| row.recorded_at_unix_seconds >= i64::try_from(before).unwrap()),
+        "the writer stamps the clock, so one history cannot be ordered two ways"
+    );
+}
+
+#[test]
+fn the_admission_record_is_a_window_and_never_a_storage_decision() {
+    let directory = TempDir::new().unwrap();
+    let cache = SemanticVectorCache::open(&directory.path().join("semantic.sqlite")).unwrap();
+    let seed = RevisionId::new();
+
+    let overflowing = (0..SEMANTIC_HOP2_SAMPLE_HISTORY + 64)
+        .map(|index| {
+            hop2_sample(
+                seed,
+                RevisionId::new(),
+                u16::try_from(index % 10_000).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    cache.record_hop2_admissions(&overflowing);
+
+    assert_eq!(
+        cache
+            .recent_hop2_admissions(SEMANTIC_HOP2_SAMPLE_HISTORY * 2)
+            .unwrap()
+            .len(),
+        SEMANTIC_HOP2_SAMPLE_HISTORY,
+        "the record trims to its window, the way the encode history does"
+    );
+    let newest = cache.recent_hop2_admissions(1).unwrap();
+    assert_eq!(
+        newest[0].sample.candidate_revision_id,
+        overflowing.last().unwrap().candidate_revision_id,
+        "the trim drops the oldest decisions, not the newest"
+    );
+}
+
+#[test]
+fn a_record_that_cannot_be_written_costs_the_recalibration_and_never_the_retrieval() {
+    // The cache is discardable by design and an operator may delete or truncate it at any moment,
+    // and an older build's file has no such table at all. Every one of those has to read as a
+    // dropped batch: a Pack that failed to assemble because a diagnostic could not be written
+    // would be a far worse trade than a hole in a distribution.
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("semantic.sqlite");
+    let cache = SemanticVectorCache::open(&path).unwrap();
+    let key = SemanticCacheKey::new("fingerprint", "6");
+    let revision = RevisionId::new();
+    cache
+        .store(&key, revision, &[0.5_f32, 0.5, 0.5, 0.5])
+        .unwrap();
+
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE hop2_admission_sample")
+        .unwrap();
+
+    cache.record_hop2_admissions(&[hop2_sample(revision, RevisionId::new(), 5_400)]);
+
+    assert_eq!(
+        cache.load(&key).unwrap().len(),
+        1,
+        "the vectors retrieval actually depends on are untouched by a failed diagnostic write"
+    );
+    assert!(
+        cache.recent_hop2_admissions(8).is_err(),
+        "reading a table that is gone is an error the caller may handle; writing to it is not"
     );
 }
 

@@ -337,6 +337,19 @@ pub const SEMANTIC_QUERY_CACHE_CAPACITY: usize = 64;
 /// and the rows never become a storage decision.
 pub const SEMANTIC_ENCODE_SAMPLE_HISTORY: usize = 64;
 
+/// Second-hop admission decisions kept in the discardable cache.
+///
+/// Two orders of magnitude above [`SEMANTIC_ENCODE_SAMPLE_HISTORY`], and the difference is what the
+/// two histories are read for. An encode history answers "is this budget fit for this machine",
+/// which the last few dozen calls settle. This one is the data source ADR-0007 pre-registered for
+/// re-deriving [`SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS`] from real traffic, and a threshold is
+/// re-derived from a *distribution* -- one pass of the second hop over a 26-Context installation
+/// with four seeds already writes about a hundred rows, so 64 would hold a single retrieval's worth
+/// of them and answer nothing. At roughly 100 bytes a row this is a few hundred kilobytes in a file
+/// that already holds megabytes of floats, which keeps it what the rest of `semantic.sqlite` is:
+/// derived data an operator may delete at any moment.
+pub const SEMANTIC_HOP2_SAMPLE_HISTORY: usize = 4_096;
+
 /// Longest query, in model tokens, handed to the encoder. bge-m3 accepts far more; retrieval
 /// queries built from a Working Intent do not need them, and truncation keeps the encode inside
 /// [`SEMANTIC_ENCODE_BUDGET`].
@@ -625,6 +638,42 @@ pub struct EncodeSample {
     pub backfill_active: bool,
 }
 
+/// One second-hop admission decision, as it was taken.
+///
+/// Every pair the hop judged produces one of these, refused pairs included. The refused ones are
+/// the more valuable half: [`SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS`] is derived from the
+/// highest-scoring negative, so a record that held only what was admitted could never say whether
+/// the floor sits too high or too low -- it would be the fixture's positive set again, measured in
+/// the field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct Hop2AdmissionSample {
+    /// The seed Context's accepted revision -- the side the Session had already touched.
+    pub seed_revision_id: RevisionId,
+    /// The candidate revision the seed was compared against.
+    pub candidate_revision_id: RevisionId,
+    /// Cosine of the two document vectors, in basis points, by the same rounding the floor is
+    /// compared with.
+    pub score_basis_points: u16,
+    /// Whether that score reached the floor in force when the decision was taken.
+    ///
+    /// Stored rather than recomputed from the score, because the floor is a configuration key: a
+    /// row written under an operator's tuned floor has to stay readable as the decision that was
+    /// actually made, not as the decision today's constant would have made.
+    pub admitted: bool,
+}
+
+/// One recorded decision, with the wall clock it was taken at.
+///
+/// The clock is the writer's, not the caller's: a sample is a fact about when the installation
+/// retrieved, and letting a caller stamp it would let two callers disagree about the ordering of
+/// one history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct RecordedHop2Admission {
+    /// Seconds since the Unix epoch, as the writing process read them.
+    pub recorded_at_unix_seconds: i64,
+    pub sample: Hop2AdmissionSample,
+}
+
 /// Where a channel reports what its encodes cost. Implemented by [`SemanticVectorCache`]; absent
 /// on every channel that has no discardable cache to write to, such as the in-memory test ones.
 pub trait EncodeSampleRecorder: Send + Sync {
@@ -862,6 +911,14 @@ impl SemanticVectorCache {
                      budget_ms INTEGER NOT NULL,
                      timed_out INTEGER NOT NULL,
                      backfill_active INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE IF NOT EXISTS hop2_admission_sample (
+                     observed_at INTEGER PRIMARY KEY AUTOINCREMENT,
+                     recorded_at_unix_seconds INTEGER NOT NULL,
+                     seed_revision_id TEXT NOT NULL,
+                     candidate_revision_id TEXT NOT NULL,
+                     score_basis_points INTEGER NOT NULL,
+                     admitted INTEGER NOT NULL
                  );",
             )
             .map_err(|error| {
@@ -1118,6 +1175,118 @@ impl SemanticVectorCache {
             .map_err(|error| Error::new(ErrorKind::Io, format!("read encode samples: {error}")))
     }
 
+    /// Records what the second hop decided about each pair it judged.
+    ///
+    /// Best-effort and silent, exactly like [`EncodeSampleRecorder::record`] and for the same
+    /// reason: this is the pre-registered recalibration record, and a diagnostic that can fail a
+    /// retrieval is worse than a diagnostic with a hole in it. A cache file an operator deleted
+    /// mid-session, a full disk, or a table an older build never created all end here as a dropped
+    /// batch rather than as a Pack that failed to assemble.
+    ///
+    /// The whole batch is one transaction, so a reader never sees half of one hop's decisions --
+    /// a partial batch would read as a hop that refused the pairs it never got to write.
+    pub fn record_hop2_admissions(&self, samples: &[Hop2AdmissionSample]) {
+        if samples.is_empty() {
+            return;
+        }
+        let Ok(mut connection) = self.locked() else {
+            return;
+        };
+        let recorded_at = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs()),
+        )
+        .unwrap_or(i64::MAX);
+        let Ok(transaction) = connection.transaction() else {
+            return;
+        };
+        {
+            let Ok(mut statement) = transaction.prepare(
+                "INSERT INTO hop2_admission_sample
+                     (recorded_at_unix_seconds, seed_revision_id, candidate_revision_id,
+                      score_basis_points, admitted)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            ) else {
+                return;
+            };
+            for sample in samples {
+                if statement
+                    .execute(rusqlite::params![
+                        recorded_at,
+                        sample.seed_revision_id.to_string(),
+                        sample.candidate_revision_id.to_string(),
+                        i64::from(sample.score_basis_points),
+                        i64::from(sample.admitted),
+                    ])
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+        if transaction.commit().is_err() {
+            return;
+        }
+        let _trimmed = connection.execute(
+            "DELETE FROM hop2_admission_sample WHERE observed_at <= (
+                 SELECT observed_at FROM hop2_admission_sample
+                 ORDER BY observed_at DESC LIMIT 1 OFFSET ?1
+             )",
+            [i64::try_from(SEMANTIC_HOP2_SAMPLE_HISTORY).unwrap_or(i64::MAX)],
+        );
+    }
+
+    /// Returns the most recent second-hop decisions, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::Io`] when the cache cannot be read.
+    pub fn recent_hop2_admissions(&self, limit: usize) -> Result<Vec<RecordedHop2Admission>> {
+        let connection = self.locked()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT recorded_at_unix_seconds, seed_revision_id, candidate_revision_id,
+                        score_basis_points, admitted
+                 FROM hop2_admission_sample ORDER BY observed_at DESC LIMIT ?1",
+            )
+            .map_err(|error| Error::new(ErrorKind::Io, format!("read hop2 admissions: {error}")))?;
+        let rows = statement
+            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)? != 0,
+                ))
+            })
+            .map_err(|error| Error::new(ErrorKind::Io, format!("read hop2 admissions: {error}")))?;
+        let mut recorded = Vec::new();
+        for row in rows {
+            let (recorded_at_unix_seconds, seed, candidate, score, admitted) =
+                row.map_err(|error| {
+                    Error::new(ErrorKind::Io, format!("collect hop2 admissions: {error}"))
+                })?;
+            // An unparsable identity is a row of a discardable cache, not a read failure.
+            let (Ok(seed_revision_id), Ok(candidate_revision_id)) =
+                (seed.parse::<RevisionId>(), candidate.parse::<RevisionId>())
+            else {
+                continue;
+            };
+            recorded.push(RecordedHop2Admission {
+                recorded_at_unix_seconds,
+                sample: Hop2AdmissionSample {
+                    seed_revision_id,
+                    candidate_revision_id,
+                    score_basis_points: score.try_into().unwrap_or(u16::MAX),
+                    admitted,
+                },
+            });
+        }
+        Ok(recorded)
+    }
+
     /// Summarises the recorded encode history.
     ///
     /// # Errors
@@ -1274,7 +1443,13 @@ pub fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
         .sum()
 }
 
-fn similarity_basis_points(similarity: f32) -> u16 {
+/// Scales one cosine to the basis points every floor in this file is expressed in.
+///
+/// `pub(crate)` rather than private because the second hop compares against
+/// [`SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS`] and has to round identically: a lane that rounded
+/// its own way would sit a basis point off the distribution the floor was calibrated against, which
+/// is precisely the gap this repository has twice paid for.
+pub(crate) fn similarity_basis_points(similarity: f32) -> u16 {
     if !similarity.is_finite() || similarity <= 0.0 {
         return 0;
     }
