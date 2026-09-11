@@ -92,3 +92,11 @@ S2-1 → S2-2 → S2-3 可流水(2 依赖 1 的种子形态,3 依赖 1+2);S2-4 �
 - 新 deferred:#41 relocation-aware 反查、#42 Explicit 模式死代码随 B1、#43 同 checkpoint claims 经 task 级 problem_view 互注入(修复方向在 problem_view 派生粒度,回流 B 层生成设计——与"文件改动总结一等形态"同点解)。
 - 行为变化记录:ambiguous Engineering Reference 经径 A 精确 join 变为可达(Graph resolver 曾拒绝);ContextSafetySource::EngineeringGraphSnapshot 失去生产者(lane 项恒 CurrentProjection),清点随 B1。
 - 既有 flake(artifact_focus 六 kind 扫描竞态)与本包无关,未处理。
+
+## S2-5 收尾注记(review 定案)
+
+- 口径 v2 的根源修正:MCP 同发 structuredContent 与 content[0].text 两份,旧口径只计一份——serialized_tokens 现按 raw+escaped 双份计,单函数改动全链同口径;数字与 v1 不可比,已在四处字段 doc 声明。
+- PACK_WIRE_TOKEN_CEILING=8000(10000 cell − 2000 余量,余量推导入 doc;与 default budget 重合是刻意的:默认调用者被 budget 约束永远够不到 ceiling)。配置键 pack_wire_token_ceiling(2000–100000)。
+- 降级链五档,每档完整合法 JSON、serde 往返测试;conditions/conflicts/derived_state 任何档不丢(安全);截断先于 Space 派生(S2-4 不变量保持);detail_level 报告实际发出的形态。
+- 实测修正 plan 假设:26 条全库全锚定+无界 budget 下 ceiling 触发(15 items,实测 wire 8151<10000)——上限按设计工作即验收,已如实入测试与提交记录。
+- inputSchema 零字节变化(为一个默认调用者摸不到的旋钮不值得一次兼容性事件——曾加 description 后主动回退)。
