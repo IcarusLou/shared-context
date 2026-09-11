@@ -34,7 +34,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params_from_iter};
 use sctx_domain::{
     ContextId, RepoRelativePath, RepositoryId, ResolvedFocus, RevisionId, SpaceId, TaskSignal,
     TaskSignalKind, TaskSignalRecord, WorkingIntentSnapshot, hints,
@@ -287,6 +287,234 @@ pub(crate) fn lane_a_hits(
     Ok(hits)
 }
 
+/// Which retrieval field carried a seed to a Context no file anchors.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NonSemanticEdgeKind {
+    /// Both Contexts restate the same problem. On the measured installation the map Session's
+    /// three Contexts share one `problem_view` and only one of them is file anchored.
+    ProblemView,
+    /// Both Contexts carry the same non-empty `topic_key`.
+    TopicKey,
+}
+
+impl NonSemanticEdgeKind {
+    /// The `context_revision` column this edge compares.
+    const fn column(self) -> &'static str {
+        match self {
+            Self::ProblemView => "problem_view",
+            Self::TopicKey => "topic_key",
+        }
+    }
+}
+
+/// One zero-cost edge that carried a seed one hop.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub(crate) struct NonSemanticEdge {
+    pub kind: NonSemanticEdgeKind,
+    /// The shared field value, as written. A `why` line renders it truncated.
+    pub value: String,
+    /// The seed this edge started from.
+    pub from_context_id: ContextId,
+}
+
+/// One Context the expansion added to the seed set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExpandedSeed {
+    pub context_id: ContextId,
+    pub revision_id: RevisionId,
+    pub space_id: SpaceId,
+    /// Every edge that reached it, ordered. Never empty.
+    pub edges: Vec<NonSemanticEdge>,
+}
+
+impl ExpandedSeed {
+    /// The `(Context, revision)` pair this seed contributes to the seed set.
+    pub fn seed(&self) -> (ContextId, RevisionId) {
+        (self.context_id, self.revision_id)
+    }
+}
+
+/// Adds every accepted Context that shares a `problem_view` or a non-empty `topic_key` with one of
+/// `seeds`.
+///
+/// Step 0b measured 10 of 26 injectable Contexts on a real installation with no Engineering
+/// Reference at all -- 38%, and they are exactly the cross-cutting kinds: a contrast-ratio finding,
+/// a module-level test-availability discovery, a downgrade risk. No file can reach them, and
+/// ADR-0007 names that a signal problem rather than a threshold problem. These two fields are the
+/// signal the corpus already carries: two Contexts written against the same restated problem, or
+/// filed under the same topic, are related by authorship rather than by a cosine.
+///
+/// **The expansion is one hop and stops.** The edges of the Contexts it returns are not followed,
+/// because a repeated hop over a field this coarse walks the whole corpus in two or three steps.
+/// Callers use the result as a seed for Lane B's admission, not as a second round of input here.
+///
+/// An empty seed set expands to nothing: these edges carry a seed, they do not create one. A
+/// Session Lane A could not anchor at all therefore stays empty, which is what the 17-hour Session
+/// of Step 0b actually does.
+///
+/// # Errors
+///
+/// Returns typed storage errors when the projection cannot be read.
+pub(crate) fn expand_seeds_once(
+    connection: &Connection,
+    seeds: &[(ContextId, RevisionId)],
+) -> Result<Vec<ExpandedSeed>> {
+    if seeds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let seeded = seeds
+        .iter()
+        .map(|(context_id, _)| *context_id)
+        .collect::<BTreeSet<_>>();
+    let fields = read_seed_edge_fields(connection, seeds)?;
+    let mut reached =
+        BTreeMap::<(ContextId, RevisionId, SpaceId), BTreeSet<NonSemanticEdge>>::new();
+    for kind in [
+        NonSemanticEdgeKind::ProblemView,
+        NonSemanticEdgeKind::TopicKey,
+    ] {
+        let wanted = fields
+            .iter()
+            .filter(|(edge, _)| edge.0 == kind)
+            .map(|(edge, sources)| (edge.1.clone(), sources.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if wanted.is_empty() {
+            continue;
+        }
+        for (context_id, revision_id, space_id, value) in contexts_sharing(
+            connection,
+            kind,
+            &wanted.keys().cloned().collect::<Vec<_>>(),
+        )? {
+            if seeded.contains(&context_id) {
+                continue;
+            }
+            let Some(sources) = wanted.get(&value) else {
+                continue;
+            };
+            reached
+                .entry((context_id, revision_id, space_id))
+                .or_default()
+                .extend(sources.iter().map(|from_context_id| NonSemanticEdge {
+                    kind,
+                    value: value.clone(),
+                    from_context_id: *from_context_id,
+                }));
+        }
+    }
+    Ok(reached
+        .into_iter()
+        .map(
+            |((context_id, revision_id, space_id), edges)| ExpandedSeed {
+                context_id,
+                revision_id,
+                space_id,
+                edges: edges.into_iter().collect(),
+            },
+        )
+        .collect())
+}
+
+/// The non-empty `problem_view` and `topic_key` values the seeds carry, each mapped to the seeds
+/// that carry it.
+///
+/// A `NULL` or blank field is not an edge: it is the absence of a classification, and treating
+/// every unclassified Context as related to every other unclassified Context would make the
+/// expansion a corpus dump.
+fn read_seed_edge_fields(
+    connection: &Connection,
+    seeds: &[(ContextId, RevisionId)],
+) -> Result<BTreeMap<(NonSemanticEdgeKind, String), BTreeSet<ContextId>>> {
+    let revisions = seeds
+        .iter()
+        .map(|(_, revision_id)| revision_id.to_string())
+        .collect::<Vec<_>>();
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT context_id, COALESCE(problem_view, ''), COALESCE(topic_key, '')
+             FROM context_revision
+             WHERE revision_id IN ({})",
+            placeholders(revisions.len())
+        ))
+        .map_err(sql_error("prepare seed edge field read"))?;
+    let mut rows = statement
+        .query(params_from_iter(revisions))
+        .map_err(sql_error("execute seed edge field read"))?;
+    let mut fields = BTreeMap::<(NonSemanticEdgeKind, String), BTreeSet<ContextId>>::new();
+    while let Some(row) = rows.next().map_err(sql_error("read seed edge field row"))? {
+        let context_id: ContextId = parse_id(
+            &row.get::<_, String>(0)
+                .map_err(sql_error("read seed Context"))?,
+        )?;
+        for (index, kind) in [
+            NonSemanticEdgeKind::ProblemView,
+            NonSemanticEdgeKind::TopicKey,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let value: String = row
+                .get(index + 1)
+                .map_err(sql_error("read seed edge field"))?;
+            if !value.trim().is_empty() {
+                fields.entry((kind, value)).or_default().insert(context_id);
+            }
+        }
+    }
+    Ok(fields)
+}
+
+/// Every accepted, injectable Context whose edge field equals one of `values`.
+fn contexts_sharing(
+    connection: &Connection,
+    kind: NonSemanticEdgeKind,
+    values: &[String],
+) -> Result<Vec<(ContextId, RevisionId, SpaceId, String)>> {
+    let column = kind.column();
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT item.context_id, revision.revision_id, item.space_id, revision.{column}
+             FROM context_revision AS revision
+             JOIN context_item AS item USING(context_id)
+             WHERE {SAFE_ACCEPTED_CONTEXT_PREDICATE}
+               AND revision.{column} IN ({})
+             ORDER BY item.context_id",
+            placeholders(values.len())
+        ))
+        .map_err(sql_error("prepare non-semantic edge lookup"))?;
+    let mut rows = statement
+        .query(params_from_iter(values.iter()))
+        .map_err(sql_error("execute non-semantic edge lookup"))?;
+    let mut shared = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(sql_error("read non-semantic edge row"))?
+    {
+        shared.push((
+            parse_id(
+                &row.get::<_, String>(0)
+                    .map_err(sql_error("read edge Context"))?,
+            )?,
+            parse_id(
+                &row.get::<_, String>(1)
+                    .map_err(sql_error("read edge revision"))?,
+            )?,
+            parse_id(
+                &row.get::<_, String>(2)
+                    .map_err(sql_error("read edge Space"))?,
+            )?,
+            row.get::<_, String>(3)
+                .map_err(sql_error("read edge field value"))?,
+        ));
+    }
+    Ok(shared)
+}
+
+fn placeholders(count: usize) -> String {
+    vec!["?"; count].join(",")
+}
+
 #[cfg(test)]
 mod test_support {
     use sctx_domain::{
@@ -428,6 +656,10 @@ mod test_support {
 
         pub fn hits(&self, anchors: &[FileAnchor]) -> Vec<LaneAHit> {
             self.read(|connection| lane_a_hits(connection, anchors))
+        }
+
+        pub fn expand(&self, seeds: &[(ContextId, RevisionId)]) -> Vec<super::ExpandedSeed> {
+            self.read(|connection| super::expand_seeds_once(connection, seeds))
         }
 
         pub fn read<T>(&self, query: impl FnOnce(&rusqlite::Connection) -> crate::Result<T>) -> T {
@@ -809,5 +1041,206 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(two.context, 2), (one.context, 1)]
         );
+    }
+
+    /// The map Session's shape, as Step 0b recorded it: three Contexts share one `problem_view`,
+    /// one of them (`fb1f06df`) is anchored to `LynxMapController.kt`, and the other two
+    /// (`c1ad461d`, `2ea272dd`) carry no Engineering Reference at all. They are 2 of the 10
+    /// zero-anchor Contexts in a 26-Context injectable corpus, and no file reaches either of them.
+    #[test]
+    fn zero_anchor_knowledge_becomes_reachable_through_a_shared_problem_view() {
+        const PROBLEM: &str = "接手 x-ttk-map-view Android 改造，按重构方案推进";
+        let corpus = Corpus::new();
+        let anchored = corpus.accept_grouped(
+            "the POI map engine reads its viewport through LynxMapController",
+            Some(PROBLEM),
+            Some("issue:Android:LynxMapController.kt"),
+        );
+        corpus.reference(anchored, "Android", "poi/map/LynxMapController.kt");
+        let zoom = corpus.accept_grouped(
+            "the effective minimum zoom must be bound to the measured viewport",
+            Some(PROBLEM),
+            None,
+        );
+        let tests = corpus.accept_grouped(
+            "the POI module's standard unit test task is unavailable in this repository",
+            Some(PROBLEM),
+            None,
+        );
+        let elsewhere = corpus.accept_grouped(
+            "the live tag reads its text from the server",
+            Some("a different problem entirely"),
+            None,
+        );
+
+        let seeds = corpus.hits(&[anchor("Android", "poi/map/LynxMapController.kt")]);
+        assert_eq!(
+            seeds.iter().map(LaneAHit::seed).collect::<Vec<_>>(),
+            [(anchored.context, anchored.revision)],
+            "only one of the three is file anchored"
+        );
+
+        let expanded = corpus.expand(&seeds.iter().map(LaneAHit::seed).collect::<Vec<_>>());
+
+        assert_eq!(
+            expanded
+                .iter()
+                .map(|seed| seed.context_id)
+                .collect::<BTreeSet<_>>(),
+            [zoom.context, tests.context].into_iter().collect(),
+            "the zero-anchor siblings go from 0 seeds to 2; {elsewhere:?} stays out"
+        );
+        assert!(
+            expanded.iter().all(|seed| seed.edges
+                == [NonSemanticEdge {
+                    kind: NonSemanticEdgeKind::ProblemView,
+                    value: PROBLEM.to_owned(),
+                    from_context_id: anchored.context,
+                }]),
+            "{expanded:#?}"
+        );
+    }
+
+    #[test]
+    fn a_shared_non_empty_topic_key_is_an_edge_and_an_absent_one_is_not() {
+        const TOPIC: &str = "risk:Android:search_live_badge.xml";
+        let corpus = Corpus::new();
+        let anchored = corpus.accept_grouped(
+            "the badge gradient needs its own start and end colour resources",
+            None,
+            Some(TOPIC),
+        );
+        corpus.reference(anchored, "Android", "res/layout/search_live_badge.xml");
+        let sibling = corpus.accept_grouped(
+            "the white label text against the new gradient is a contrast-ratio risk",
+            None,
+            Some(TOPIC),
+        );
+        let unclassified_seed = corpus.accept("an unrelated reading with no topic and no problem");
+        corpus.reference(unclassified_seed, "Android", "res/layout/other.xml");
+        let unclassified_other = corpus.accept("another reading with no topic and no problem");
+
+        let seeds = corpus.hits(&[
+            anchor("Android", "res/layout/search_live_badge.xml"),
+            anchor("Android", "res/layout/other.xml"),
+        ]);
+        let expanded = corpus.expand(&seeds.iter().map(LaneAHit::seed).collect::<Vec<_>>());
+
+        assert_eq!(
+            expanded
+                .iter()
+                .map(|seed| (seed.context_id, seed.edges.clone()))
+                .collect::<Vec<_>>(),
+            [(
+                sibling.context,
+                vec![NonSemanticEdge {
+                    kind: NonSemanticEdgeKind::TopicKey,
+                    value: TOPIC.to_owned(),
+                    from_context_id: anchored.context,
+                }]
+            )],
+            "two Contexts with no classification at all are not related by having none: \
+             {unclassified_other:?} must stay out"
+        );
+    }
+
+    /// One hop, and then it stops. `problem_view` and `topic_key` are coarse enough that a second
+    /// hop would walk a whole installation in a step or two.
+    #[test]
+    fn the_expansion_never_follows_the_edges_of_what_it_just_reached() {
+        let corpus = Corpus::new();
+        let seed = corpus.accept_grouped("the anchored reading", Some("shared problem"), None);
+        corpus.reference(seed, "Android", "app/src/Seed.kt");
+        let one_hop = corpus.accept_grouped(
+            "one hop away, by problem view",
+            Some("shared problem"),
+            Some("shared topic"),
+        );
+        let two_hops =
+            corpus.accept_grouped("two hops away, by topic key", None, Some("shared topic"));
+
+        let seeds = corpus.hits(&[anchor("Android", "app/src/Seed.kt")]);
+        let expanded = corpus.expand(&seeds.iter().map(LaneAHit::seed).collect::<Vec<_>>());
+
+        assert_eq!(
+            expanded
+                .iter()
+                .map(|seed| seed.context_id)
+                .collect::<Vec<_>>(),
+            [one_hop.context],
+            "the second hop is reachable and deliberately not taken: {two_hops:?}"
+        );
+        let twice = seeds
+            .iter()
+            .map(LaneAHit::seed)
+            .chain(expanded.iter().map(ExpandedSeed::seed))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            corpus
+                .expand(&twice)
+                .iter()
+                .map(|seed| seed.context_id)
+                .collect::<Vec<_>>(),
+            [two_hops.context],
+            "a caller that chose to hop again would reach it; this function never does"
+        );
+    }
+
+    /// The 17-hour Session of Step 0b, in shape: 145 distinct files touched across one Repository,
+    /// 129 of them recorded by Signals that have since been superseded, and not one of them is a
+    /// file any accepted Context references. The full-history anchor set is nine times the active
+    /// window and still reaches nothing, and because these edges carry a seed rather than create
+    /// one, the non-semantic expansion of an empty seed set is empty too.
+    ///
+    /// This is the measurement, not a target: Step 0b's `01a08baf` row reads `145 touched, 0 hit,
+    /// 0 path-A Contexts`, and its touched paths share no basename at all with the 56 anchored
+    /// coordinates the corpus offers. S2-3's second hop cannot help either, for the same reason --
+    /// it queries *from* a seed. A Session whose work is disjoint from every recorded Context gets
+    /// an empty Pack, and ADR-0007 makes an empty Pack a first-class outcome.
+    #[test]
+    fn the_seventeen_hour_session_shape_anchors_nothing_and_the_edges_carry_nothing() {
+        let corpus = Corpus::new();
+        let accepted = corpus.accept_grouped(
+            "the POI map engine reads its viewport through LynxMapController",
+            Some("接手 x-ttk-map-view Android 改造"),
+            None,
+        );
+        // The one file the corpus anchors is a sibling of the ones the Session opened, and the
+        // Session never opened it.
+        corpus.reference(
+            accepted,
+            "Android",
+            "components/business/poi/poi/src/main/java/com/ss/android/ugc/aweme/poi/map/lynxmap/\
+             engine/LynxMapController.kt",
+        );
+
+        let signals = (0..145)
+            .map(|index| {
+                signal(
+                    TaskSignalKind::Workspace,
+                    &format!(
+                        "Android:components/business/poi/poi/src/main/java/com/ss/android/ugc/\
+                         aweme/poi/map/lynxmap/engine/Touched{index:03}.kt"
+                    ),
+                    index >= 129,
+                )
+            })
+            .collect::<Vec<_>>();
+        let anchors = collect_file_anchors(
+            &signals,
+            &intent(&["/private/tmp/x-ttk-map-view-refactor-plan.md"]),
+            &[],
+        );
+        assert_eq!(
+            anchors.len(),
+            145,
+            "every touched file anchors, superseded Signals included -- and the Session's one \
+             `artifact_hints` entry contributes nothing, because `.md` is not in the extension \
+             list that makes a dotted run read as a repository path"
+        );
+
+        let seeds = corpus.hits(&anchors);
+        assert!(seeds.is_empty(), "{seeds:#?}");
+        assert!(corpus.expand(&[]).is_empty());
     }
 }
