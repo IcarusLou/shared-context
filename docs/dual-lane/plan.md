@@ -64,3 +64,13 @@ S2-1 → S2-2 → S2-3 可流水(2 依赖 1 的种子形态,3 依赖 1+2);S2-4 �
 - superseded signal 纳入是"足迹修真"(输入面积 16→145),在三个探针会话上不改变召回条数——不得把它表述为召回提升。
 - 仓限定锚点只做精确路径匹配(不做 basename 放宽);basename 仅用于无仓 artifact_hints 且带 `AnchorMatchBasis::Basename` 标记,S2-4 装配端可按噪声表现降级。
 - `task_artifact_focus` 读的是 engineering.sqlite(resolved_reference/graph_context_snapshot),与径 A 反查(index)是两个投影:S2-1 取 focus 的 resolved (repo,path) 回到 index 侧反查,两侧可能不一致——S2-4 遇到不一致时以 index 侧为准并在 why 里如实呈现。
+
+## S2-3 实施注记(review 定案,S2-4 必读)
+
+- `lane_b_hits` 不持 provider、不做任何查询编码;样本由函数**返回**而非写入(index 与 semantic 两库分离),S2-4 装配端负责把 `admission.samples` 交给 `record_hop2_admissions`。
+- 最强种子内联为 `SeedMatch`、其余在 `also_admitted_by`——无重复状态、无可 panic 的 seeds[0]。
+- 标识符校验复用 `hints::normalized_identifiers`(已含语法门:CamelCase≥2 段、snake≥6 字符等,`x-ttk-map-view` 切片贡献为零)——plan 的"最小校验"应急条款未启用。
+- 配置键 `[retrieval] hop2_admission_floor_basis_points` 已落 local-state(3000–9000 拒绝式校验),**engine 接线与 user-guide 条目刻意留给 S2-4**(不文档化惰性旋钮)。
+- 公开面小幅移动:样本表三类型两方法经公共 `SemanticVectorCache` 导出(lane 类型仍 pub(crate))——review 裁定接受。
+- 棘轮是 in-crate 单测(模块私有所致),调用形态 `cargo test --release -p sctx-search --lib -- --ignored hop2_ratchet`;三次读数 13/18/0 与校准文档一致;装置矩阵 5140 行与 seed_sweep 逐字节一致,5200 行与 ADR 的 62/66 声明一致(注意 ordered/unordered 两种计数口径,均已记录)。
+- 数据佐证:5200 下 2ea272dd 仅可经 problem_view 边到达——S2-2 的必要性由 S2-3 实测反向确认。
