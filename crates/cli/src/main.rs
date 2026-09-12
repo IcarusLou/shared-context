@@ -60,8 +60,8 @@ use sctx_search::{
     SearchMatchMode, SearchRequest,
 };
 use sctx_task_runtime::{
-    AutomatedEpisodeBoundary, CandidateBuildStatus, HookEventDecision, SignalRetentionRule,
-    TaskRuntime,
+    AutomatedEpisodeBoundary, CandidateBuildStatus, HookEventDecision, PendingPromptOutcome,
+    SignalRetentionRule, TaskRuntime,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -2942,16 +2942,31 @@ fn file_signal_retention() -> Vec<SignalRetentionRule> {
     }]
 }
 
-/// Records one Prompt Signal against an already existing `ActiveTask`.
+/// What one `PromptSubmit` did with the Prompt it carried.
+enum PromptSignalOutcome {
+    /// Attached to the `ActiveTask`; `retired` Prompts were superseded to make room.
+    Recorded { retired: usize },
+    /// Held until this Session declares a Task; `pending` is how many are now held.
+    Stashed { pending: usize },
+    /// Nothing to hold: no Runtime database, no Task, an empty Prompt after redaction, a slash
+    /// command, or a stash already at its ceiling. The reason is the telemetry reason string.
+    Skipped(&'static str),
+}
+
+/// Records one Prompt Signal, or holds it until this Session has a Task to attach it to.
 ///
 /// Three properties are load-bearing and are why this never returns an error to the caller:
 ///
-/// * It never creates anything. No `ActiveTask` means no Signal, no Task, no Intent revision,
-///   and no change to the Intent bootstrap reminder — a Prompt is a clue about a Task the Agent
-///   already declared, never a reason to invent one.
+/// * It never creates Task state. No `ActiveTask` still means no Task, no Intent revision, and no
+///   change to the Intent bootstrap reminder — a Prompt is a clue about work, never a reason to
+///   invent a Task. What it may now do is hold the Prompt in a table with no foreign key, so the
+///   one sentence that states what a Session is for survives until `task_intent_update` arrives.
+///   That sentence was previously lost by construction: the Prompt that defines the work is
+///   always submitted before the Task that would hold it exists.
 /// * It never stores text it did not scan. The Prompt is redacted first and truncated second, so
 ///   a secret cannot survive by sitting past the character ceiling; a Prompt too large for the
-///   scanner is dropped rather than stored unscanned.
+///   scanner is dropped rather than stored unscanned. The stash stores exactly the same scanned,
+///   truncated text a Signal would have stored.
 /// * It is invisible to the model. Both vendors encode `PromptSubmit` as an empty object, and a
 ///   failure here must not change that, so every fault is sent to Hook telemetry and swallowed
 ///   instead of becoming a `systemMessage`.
@@ -2960,22 +2975,43 @@ fn record_prompt_signal(
     prompt: &str,
     recorder: &HookEventRecorder,
 ) {
-    let outcome = || -> Result<Option<usize>> {
+    let outcome = || -> Result<PromptSignalOutcome> {
         let root = installation_root()?;
-        // No Task Runtime database means no `ActiveTask` can exist yet, so there is nothing to
-        // attach a clue to. Checking that before opening keeps a Prompt from being the event
-        // that first creates `runtime.sqlite`: activation alone must never fabricate Task state,
-        // and the common case — a Session whose user has not called `task_intent_update` yet —
-        // then costs one `stat` instead of a database open on the Hook hot path.
+        // No Task Runtime database means no `ActiveTask` can exist yet, and creating one here is
+        // exactly what this must not do: activation alone must never fabricate Task state, and a
+        // Prompt must never be the event that first writes `runtime.sqlite`. The common case — a
+        // Session whose user has not called `task_intent_update` yet, on an installation that has
+        // run before — still reaches the stash, because that database already exists.
         if !root.join("state").join("runtime.sqlite").is_file() {
-            return Ok(None);
+            return Ok(PromptSignalOutcome::Skipped(
+                "prompt_signal_skipped_no_task",
+            ));
         }
         let Some(content) = redacted_prompt_signal_content(prompt)? else {
-            return Ok(None);
+            return Ok(PromptSignalOutcome::Skipped("prompt_signal_skipped_empty"));
         };
         let runtime = TaskRuntime::initialize_for_hook(&root)?;
         let Some(active) = runtime.read_snapshot_by_locator(locator)? else {
-            return Ok(None);
+            // A slash command names a tool, not a task. `/sctx-review` says nothing about what
+            // this Session is for, and the stash holds two Prompts: one of them must not be spent
+            // on a command word. A Prompt that merely *starts* with a path is not a command --
+            // the token after the slash has to read like a command name.
+            if is_slash_command(prompt) {
+                return Ok(PromptSignalOutcome::Skipped(
+                    "prompt_signal_skipped_slash_command",
+                ));
+            }
+            return Ok(match runtime.stash_pending_prompt(locator, &content)? {
+                PendingPromptOutcome::Stashed { pending } => {
+                    PromptSignalOutcome::Stashed { pending }
+                }
+                PendingPromptOutcome::AlreadyPending => {
+                    PromptSignalOutcome::Skipped("prompt_signal_already_pending")
+                }
+                PendingPromptOutcome::Full => {
+                    PromptSignalOutcome::Skipped("prompt_signal_pending_full")
+                }
+            });
         };
         let signals = unrecorded_signals(
             &active,
@@ -2985,24 +3021,54 @@ fn record_prompt_signal(
             }],
         );
         if signals.is_empty() {
-            return Ok(Some(0));
+            return Ok(PromptSignalOutcome::Recorded { retired: 0 });
         }
         let merged =
             runtime.merge_hook_signals_by_locator(locator, signals, &prompt_signal_retention())?;
-        Ok(merged.map(|merged| merged.retired))
+        Ok(merged.map_or(
+            PromptSignalOutcome::Skipped("prompt_signal_skipped_no_task"),
+            |merged| PromptSignalOutcome::Recorded {
+                retired: merged.retired,
+            },
+        ))
     }();
     match outcome {
-        Ok(Some(retired)) => recorder.note_completion(
+        Ok(PromptSignalOutcome::Recorded { retired }) => recorder.note_completion(
             "prompt_signal_recorded",
             Some(truncate_hook_detail(&format!("retired={retired}"))),
         ),
-        Ok(None) => recorder.note_completion("prompt_signal_skipped_no_task", None),
+        Ok(PromptSignalOutcome::Stashed { pending }) => recorder.note_completion(
+            "prompt_signal_stashed",
+            Some(truncate_hook_detail(&format!("pending={pending}"))),
+        ),
+        Ok(PromptSignalOutcome::Skipped(reason)) => recorder.note_completion(reason, None),
         Err(error) => recorder.flush(
             HookEventDecision::FailOpen,
             "signal_write_failed",
             Some(truncate_hook_detail(error.message())),
         ),
     }
+}
+
+/// Whether one Prompt is a host slash command rather than a statement of work.
+///
+/// The shape test is deliberate about what it excludes. The first token after the slash must be a
+/// command name — letters, digits, `-` and `_` and nothing else — so `/sctx-review` and
+/// `/compact now` are commands while `/Users/me/project/notes.md is the plan` is not: a path
+/// carries further separators inside that token and fails the test.
+fn is_slash_command(prompt: &str) -> bool {
+    let Some(rest) = prompt.trim_start().strip_prefix('/') else {
+        return false;
+    };
+    let name = rest
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches([',', '.', ':', ';', '!', '?']);
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
 /// Drops Signals this Task already carries as Active, so an unchanged observation never opens a

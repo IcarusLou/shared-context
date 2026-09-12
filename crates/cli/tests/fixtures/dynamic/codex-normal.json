@@ -273,7 +273,6 @@
     {"id": "hint-no-graph", "invariant": {"type": "working_intent_hint_has_no_graph_path", "response": "ordinary-context"}},
     {"id": "focus-scoped", "invariant": {"type": "artifact_focus_is_request_scoped", "focused_response": "artifact-focus", "ordinary_response": "ordinary-context", "resource": "focus-repo", "path": "src/focus.rs"}},
     {"id": "raw-absent", "invariant": {"type": "raw_content_is_absent", "probes": [
-      {"kind": "prompt", "hook": "prompt"},
       {"kind": "transcript", "hook": "prompt"},
       {"kind": "tool_output", "hook": "post-tool"}
     ]}}

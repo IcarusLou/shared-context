@@ -40,7 +40,7 @@ pub use reference_derivation::{
     derive_claim_references,
 };
 
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const HOOK_BUSY_TIMEOUT: Duration = Duration::from_millis(25);
 const MAX_EPISODE_LIST_LIMIT: usize = 256;
@@ -99,6 +99,36 @@ pub struct SignalRetentionRule {
     pub kinds: Vec<TaskSignalKind>,
     /// Maximum Active Signals retained across `kinds`.
     pub max_active: usize,
+}
+
+/// Pending Prompts one Session may hold while it still has no `ActiveTask`.
+///
+/// Two: the Prompt that states the work, and one correction of it. A third is elaboration, and
+/// the Task's own Intent will carry that better than a raw Prompt would.
+pub const MAX_PENDING_PROMPT_SIGNALS: usize = 2;
+
+/// How long a Prompt no Task ever claimed stays on disk.
+///
+/// Longer than the longest Session in the replay corpus (21.8 hours), so a slow Session never
+/// loses the sentence that started it; short enough that text from a Session which never declared
+/// a Task does not live on indefinitely.
+pub const PENDING_PROMPT_MAX_AGE_SECONDS: i64 = 48 * 60 * 60;
+
+/// Pending Prompts the whole installation may hold at once.
+///
+/// Every Session that is activated and then never declares a Task leaves its rows behind, and
+/// nothing else ever collects them, so the table carries its own ceiling.
+pub const MAX_PENDING_PROMPT_ROWS: usize = 256;
+
+/// What became of one Prompt offered to the pending stash.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingPromptOutcome {
+    /// Held; `pending` is how many this Session now holds.
+    Stashed { pending: usize },
+    /// This Session already holds this exact Prompt.
+    AlreadyPending,
+    /// This Session already holds [`MAX_PENDING_PROMPT_SIGNALS`].
+    Full,
 }
 
 /// Result of explicitly creating and activating a new Task.
@@ -872,6 +902,7 @@ impl TaskRuntime {
         }
 
         let external_session_id = ExternalSessionId::new();
+        let signals = with_backfilled_prompts(&transaction, &locator, signals)?;
         let snapshot =
             TaskSessionSnapshot::from_initial(locator, task_id, initial_intent, signals)?;
         insert_external_session(
@@ -914,6 +945,7 @@ impl TaskRuntime {
         require_expected_active(external.active_task_id, expected_active_task_id)?;
 
         let task_id = TaskId::new();
+        let signals = with_backfilled_prompts(&transaction, locator, signals)?;
         let snapshot = TaskSessionSnapshot::from_initial(
             locator.clone(),
             task_id,
@@ -1894,6 +1926,95 @@ impl TaskRuntime {
             return Ok(None);
         };
         Ok(Some(episode_claim_mentions(&episode)))
+    }
+
+    /// Holds one Prompt that arrived before its Session had an `ActiveTask` to attach it to.
+    ///
+    /// The Prompt that states what a Session is for is, by construction, the one that cannot be
+    /// recorded: `task_intent_update` is what creates the Task, and it happens after the user has
+    /// already said what they want. Measured on the replay corpus this is not an edge case — it is
+    /// every Session's most informative sentence, plus five more in `01a060a1` alone.
+    ///
+    /// The stash is deliberately small. [`MAX_PENDING_PROMPT_SIGNALS`] per Session is enough for
+    /// the prompt that defines the work and one correction of it, and keeping the *first* ones
+    /// rather than the most recent is the point: a Session that keeps talking before declaring a
+    /// Task is elaborating, not restating. [`MAX_PENDING_PROMPT_ROWS`] bounds the whole table, so
+    /// Sessions that never declare a Task cannot accumulate without limit.
+    ///
+    /// This never creates Task state. It writes one row in a table with no foreign key, which is
+    /// what makes it safe to call for a Session that may never have a Task at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage errors.
+    pub fn stash_pending_prompt(
+        &self,
+        locator: &ExternalSessionLocator,
+        content: &str,
+    ) -> Result<PendingPromptOutcome> {
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin pending Prompt stash")?;
+        let now = i64::try_from(unix_seconds(SystemTime::now())?).unwrap_or(i64::MAX);
+        // Held text is text on disk that no Task ever claimed, so it expires. Two days is longer
+        // than the longest Session in the replay corpus (21.8 hours) and far shorter than "until
+        // someone notices": a Session that has not declared a Task by then never will.
+        transaction
+            .execute(
+                "DELETE FROM pending_prompt_signal WHERE recorded_at_unix_seconds < ?1",
+                params![now.saturating_sub(PENDING_PROMPT_MAX_AGE_SECONDS)],
+            )
+            .map_err(sql_error("expire stale pending Prompts"))?;
+        let pending = read_pending_prompts(&transaction, locator)?;
+        if pending.iter().any(|prompt| prompt == content) {
+            return Ok(PendingPromptOutcome::AlreadyPending);
+        }
+        if pending.len() >= MAX_PENDING_PROMPT_SIGNALS {
+            return Ok(PendingPromptOutcome::Full);
+        }
+        let ordinal: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(prompt_ordinal), -1) + 1 FROM pending_prompt_signal
+                 WHERE agent_kind = ?1 AND external_session_key = ?2",
+                params![locator.agent_kind, locator.external_session_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_error("read the next pending Prompt ordinal"))?;
+        transaction
+            .execute(
+                "INSERT INTO pending_prompt_signal (
+                    agent_kind, external_session_key, prompt_ordinal, content,
+                    recorded_at_unix_seconds
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    locator.agent_kind,
+                    locator.external_session_id,
+                    ordinal,
+                    content,
+                    now,
+                ],
+            )
+            .map_err(sql_error("stash pending Prompt"))?;
+        // Oldest first, so a table at its ceiling drops the Session that has waited longest for a
+        // Task it will probably never declare, never the Prompt that just arrived.
+        transaction
+            .execute(
+                "DELETE FROM pending_prompt_signal WHERE rowid IN (
+                    SELECT rowid FROM pending_prompt_signal
+                    ORDER BY recorded_at_unix_seconds ASC, rowid ASC
+                    LIMIT MAX(
+                        (SELECT COUNT(*) FROM pending_prompt_signal) - ?1,
+                        0
+                    )
+                 )",
+                params![i64::try_from(MAX_PENDING_PROMPT_ROWS).unwrap_or(i64::MAX)],
+            )
+            .map_err(sql_error("bound the pending Prompt table"))?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit pending Prompt stash"))?;
+        Ok(PendingPromptOutcome::Stashed {
+            pending: pending.len() + 1,
+        })
     }
 
     /// Reads what one Episode's recorded derivation attempt found, if it has run.
@@ -4294,7 +4415,11 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
         version = 19;
     }
     if version == 19 {
-        return migrate_schema_19_to_20(connection);
+        migrate_schema_19_to_20(connection)?;
+        version = 20;
+    }
+    if version == 20 {
+        return migrate_schema_20_to_21(connection);
     }
     if version != 0 && version != SCHEMA_VERSION {
         return Err(invariant(format!(
@@ -4663,6 +4788,16 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 reopened INTEGER NOT NULL DEFAULT 0 CHECK (reopened IN (0, 1)),
                 FOREIGN KEY (episode_id) REFERENCES work_episode (episode_id)
             ) STRICT;
+            CREATE TABLE IF NOT EXISTS pending_prompt_signal (
+                agent_kind TEXT NOT NULL,
+                external_session_key TEXT NOT NULL,
+                prompt_ordinal INTEGER NOT NULL CHECK (prompt_ordinal >= 0),
+                content TEXT NOT NULL,
+                recorded_at_unix_seconds INTEGER NOT NULL CHECK (
+                    recorded_at_unix_seconds >= 0
+                ),
+                PRIMARY KEY (agent_kind, external_session_key, prompt_ordinal)
+            ) STRICT;
             CREATE TABLE IF NOT EXISTS hook_event (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 recorded_at_unix_ms INTEGER NOT NULL CHECK (recorded_at_unix_ms >= 0),
@@ -4690,7 +4825,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
             ) STRICT;
             CREATE INDEX IF NOT EXISTS auto_confirm_rejection_recorded_at
                 ON auto_confirm_rejection (recorded_at_unix_seconds);
-            PRAGMA user_version = 20;",
+            PRAGMA user_version = 21;",
         )
         .map_err(sql_error("initialize task runtime schema"))
 }
@@ -4987,6 +5122,32 @@ fn migrate_schema_19_to_20(connection: &Connection) -> Result<()> {
     transaction
         .commit()
         .map_err(sql_error("commit reference derivation record migration"))
+}
+
+/// Adds the one table that lets a Prompt outlive the moment it arrived too early.
+///
+/// Purely additive and carries no foreign key, which is the whole point: a pending Prompt exists
+/// precisely when no `external_session` row does yet.
+fn migrate_schema_20_to_21(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS pending_prompt_signal (
+                agent_kind TEXT NOT NULL,
+                external_session_key TEXT NOT NULL,
+                prompt_ordinal INTEGER NOT NULL CHECK (prompt_ordinal >= 0),
+                content TEXT NOT NULL,
+                recorded_at_unix_seconds INTEGER NOT NULL CHECK (
+                    recorded_at_unix_seconds >= 0
+                ),
+                PRIMARY KEY (agent_kind, external_session_key, prompt_ordinal)
+            ) STRICT;
+            PRAGMA user_version = 21;
+            COMMIT;",
+        )
+        .map_err(sql_error(
+            "migrate task runtime schema from version 20 to 21",
+        ))
 }
 
 fn insert_external_session(
@@ -6801,6 +6962,74 @@ fn read_episode_view(
         episode,
         checkpoints,
     }))
+}
+
+/// Puts the Prompts that arrived before this Task in front of the Signals it was created with.
+///
+/// Order is the only fidelity this can offer and it is faithful: `task_signal` records no time by
+/// design, and position in `signal_ordinal` is what "earlier" means there. A backfilled Prompt was
+/// written before anything the Task itself carries, so it takes the lower ordinals.
+fn with_backfilled_prompts(
+    transaction: &Transaction<'_>,
+    locator: &ExternalSessionLocator,
+    signals: Vec<TaskSignal>,
+) -> Result<Vec<TaskSignal>> {
+    let mut backfilled = drain_pending_prompt_signals(transaction, locator)?;
+    if backfilled.is_empty() {
+        return Ok(signals);
+    }
+    backfilled.extend(signals);
+    normalize_signals(backfilled)
+}
+
+/// Reads one Session's pending Prompts in the order they were written.
+fn read_pending_prompts(
+    connection: &Connection,
+    locator: &ExternalSessionLocator,
+) -> Result<Vec<String>> {
+    connection
+        .prepare(
+            "SELECT content FROM pending_prompt_signal
+             WHERE agent_kind = ?1 AND external_session_key = ?2
+             ORDER BY prompt_ordinal",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(
+                    params![locator.agent_kind, locator.external_session_id],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(sql_error("read pending Prompts"))
+}
+
+/// Takes one Session's pending Prompts as Signals, leaving the stash empty.
+///
+/// Called from inside the transaction that creates the Task, so a Prompt either becomes a Signal
+/// of that Task or stays pending; it can never be lost between the two.
+fn drain_pending_prompt_signals(
+    transaction: &Transaction<'_>,
+    locator: &ExternalSessionLocator,
+) -> Result<Vec<TaskSignal>> {
+    let pending = read_pending_prompts(transaction, locator)?;
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    transaction
+        .execute(
+            "DELETE FROM pending_prompt_signal
+             WHERE agent_kind = ?1 AND external_session_key = ?2",
+            params![locator.agent_kind, locator.external_session_id],
+        )
+        .map_err(sql_error("drain pending Prompts"))?;
+    Ok(pending
+        .into_iter()
+        .map(|content| TaskSignal {
+            kind: TaskSignalKind::Prompt,
+            content,
+        })
+        .collect())
 }
 
 /// What Candidate Build recorded when it placed this Episode's Claim spellings, if it has.

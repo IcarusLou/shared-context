@@ -328,28 +328,34 @@ fn collect_files(directory: &Path, root: &Path, files: &mut BTreeMap<PathBuf, Ve
     }
 }
 
-/// A Prompt joins an `ActiveTask` the Agent already declared, redacted and bounded — and never
-/// creates one. Before `task_intent_update` there is nothing to attach a clue to, and the Hook
-/// must not invent a Task, an Intent, or even a Runtime database to hold one.
+/// A Prompt joins an `ActiveTask` the Agent already declared, redacted and bounded. Before
+/// `task_intent_update` there is nothing to attach it to, so it is held — without inventing a
+/// Task, an Intent, or even a Runtime database to hold one — and attached when the Task arrives.
 #[test]
-fn prompt_submit_records_a_redacted_bounded_signal_only_for_an_existing_active_task() {
+fn prompt_submit_records_a_redacted_bounded_signal_and_backfills_the_one_that_came_first() {
     let fixture = Fixture::new("prompt signal");
     let session = "prompt-signal";
     fixture.start_codex_session(session);
 
-    // No Task Runtime at all: an activated Session that never declared a Task stays inert.
+    // No Task Runtime at all: a Prompt must never be the event that first writes it.
     assert_eq!(
         fixture.hook("codex", &fixture.codex_prompt(session, "turn-0", "explore")),
         json!({})
     );
     assert!(!fixture.root.join("state/runtime.sqlite").exists());
+    assert!(
+        fixture
+            .hook_event_reasons()
+            .contains(&"prompt_signal_skipped_no_task".to_owned())
+    );
 
-    // A Runtime that exists but holds no ActiveTask is still not something to attach to.
+    // A Runtime that exists but holds no ActiveTask: the Prompt is held, not dropped, and holding
+    // it still creates no Task state of any kind.
     TaskRuntime::initialize(&fixture.root).unwrap();
     assert_eq!(
         fixture.hook(
             "codex",
-            &fixture.codex_prompt(session, "turn-1", "still exploring")
+            &fixture.codex_prompt(session, "turn-1", "修复登录流程在搜索结果页的回退路径")
         ),
         json!({})
     );
@@ -357,7 +363,7 @@ fn prompt_submit_records_a_redacted_bounded_signal_only_for_an_existing_active_t
     assert!(
         fixture
             .hook_event_reasons()
-            .contains(&"prompt_signal_skipped_no_task".to_owned())
+            .contains(&"prompt_signal_stashed".to_owned())
     );
 
     fixture.open_task("codex", session, "record Prompt clues for an existing Task");
@@ -371,8 +377,16 @@ fn prompt_submit_records_a_redacted_bounded_signal_only_for_an_existing_active_t
     );
 
     let prompts = fixture.active_signals("codex", session, TaskSignalKind::Prompt);
-    assert_eq!(prompts.len(), 1);
-    let stored = &prompts[0];
+    assert_eq!(
+        prompts.len(),
+        2,
+        "the Prompt that stated the work is backfilled beside the one submitted after: {prompts:?}"
+    );
+    assert_eq!(
+        prompts[0], "修复登录流程在搜索结果页的回退路径",
+        "what came first takes the lower ordinal, which is what earlier means here"
+    );
+    let stored = &prompts[1];
     assert_eq!(
         stored.chars().count(),
         512,
@@ -386,6 +400,109 @@ fn prompt_submit_records_a_redacted_bounded_signal_only_for_an_existing_active_t
         fixture
             .hook_event_reasons()
             .contains(&"prompt_signal_recorded".to_owned())
+    );
+}
+
+/// The stash holds two Prompts and spends neither on a slash command, and everything it holds has
+/// already been through the redactor.
+#[test]
+fn the_pending_prompt_stash_is_bounded_redacted_and_never_spent_on_a_slash_command() {
+    let fixture = Fixture::new("pending prompt stash");
+    let session = "pending-stash";
+    fixture.start_codex_session(session);
+    TaskRuntime::initialize(&fixture.root).unwrap();
+
+    for (turn, prompt) in [
+        ("turn-0", "/sctx-review"),
+        ("turn-1", "/compact please shorten the transcript"),
+    ] {
+        assert_eq!(
+            fixture.hook("codex", &fixture.codex_prompt(session, turn, prompt)),
+            json!({})
+        );
+    }
+    assert!(
+        fixture
+            .hook_event_reasons()
+            .contains(&"prompt_signal_skipped_slash_command".to_owned())
+    );
+
+    for (turn, prompt) in [
+        (
+            "turn-2",
+            format!("把 token {PROMPT_SECRET} 从搜索直播卡片里摘掉"),
+        ),
+        ("turn-3", "顺便把兜底样式也统一一下".to_owned()),
+        ("turn-4", "再补一句：别动埋点".to_owned()),
+    ] {
+        assert_eq!(
+            fixture.hook("codex", &fixture.codex_prompt(session, turn, &prompt)),
+            json!({})
+        );
+    }
+    assert!(
+        fixture
+            .hook_event_reasons()
+            .contains(&"prompt_signal_pending_full".to_owned()),
+        "the third Prompt before a Task is elaboration, and the Intent will carry it better"
+    );
+    assert!(
+        !fixture.persisted_state_text().contains(PROMPT_SECRET),
+        "a held Prompt went through the same redactor a recorded one does"
+    );
+
+    fixture.open_task("codex", session, "摘掉搜索直播卡片上的 token");
+    let prompts = fixture.active_signals("codex", session, TaskSignalKind::Prompt);
+    assert_eq!(prompts.len(), 2, "{prompts:?}");
+    assert!(prompts[0].starts_with("把 token [REDACTED:github_token]"));
+    assert_eq!(prompts[1], "顺便把兜底样式也统一一下");
+    assert!(!fixture.persisted_state_text().contains(PROMPT_SECRET));
+}
+
+/// A backfill happens once. The Task that took the pending Prompts empties the stash, so a second
+/// Task in the same Session starts from the Prompts it is actually given.
+#[test]
+fn a_backfilled_prompt_is_handed_over_once_and_the_stash_is_then_empty() {
+    let fixture = Fixture::new("prompt backfill once");
+    let session = "backfill-once";
+    fixture.start_codex_session(session);
+    TaskRuntime::initialize(&fixture.root).unwrap();
+    assert_eq!(
+        fixture.hook(
+            "codex",
+            &fixture.codex_prompt(session, "turn-0", "把地图相机重入问题查清楚")
+        ),
+        json!({})
+    );
+    fixture.open_task("codex", session, "查清地图相机重入");
+    assert_eq!(
+        fixture.active_signals("codex", session, TaskSignalKind::Prompt),
+        vec!["把地图相机重入问题查清楚".to_owned()]
+    );
+
+    let runtime = TaskRuntime::initialize(&fixture.root).unwrap();
+    let locator = ExternalSessionLocator::new("codex", session).unwrap();
+    let active = runtime.read_snapshot_by_locator(&locator).unwrap().unwrap();
+    runtime
+        .start_new_task(
+            &locator,
+            active.task_id,
+            &active
+                .current_intent_revision()
+                .unwrap()
+                .working_intent
+                .clone(),
+            Vec::new(),
+        )
+        .unwrap();
+    assert!(
+        runtime
+            .read_snapshot_by_locator(&locator)
+            .unwrap()
+            .unwrap()
+            .task_signals
+            .is_empty(),
+        "the stash was emptied by the Task that took it"
     );
 }
 

@@ -7,7 +7,7 @@
 ## 观测与诊断噪声
 
 1. **PostToolUse 双行诊断**：每次 SharedContext MCP 调用产生 `attribution_failed(neutral)` + `ok(enabled)` 两行，detail「enabled PostToolUse has no merge operation」把预期路径写成失败语气。累计 30+ 次。纯观测噪声，不影响行为。方案：SharedContext 类工具事件跳过 attribution 记录或改中性 reason。
-2. **首条 prompt 不进 TaskSignal**：`prompt_signal_skipped_no_task` —— prompt_submit 必然早于 task_intent_update。mid-session 已实证生效（d0773d8f ×1、01a060a1 ×5）；首轮语义由 Intent 本身承载，损失有限。升级条件：单轮短会话占比显著。方案方向：无 Task 时暂存一条、Task 创建时补挂。
+2. ~~**首条 prompt 不进 TaskSignal**~~ —— **2026-09-12 随 WP-G2a 修复**。原问题：`prompt_signal_skipped_no_task`，prompt_submit 必然早于 task_intent_update（d0773d8f ×1、01a060a1 ×5）。修法即当初的方案方向：`pending_prompt_signal`（runtime schema 21，无外键——正因为此刻还没有 `external_session` 行）暂存至多 2 条已脱敏截断的 prompt，`open_or_create`/`start_new_task` 在建 Task 的同一事务里排到 signal 前列（`task_signal` 无时间字段，ordinal 次序就是"更早"的全部含义）。斜杠命令不占槽；48 小时过期，256 行全局上限。**仍未覆盖**：全新安装的第一个会话——`runtime.sqlite` 尚不存在，而 prompt 不得成为创建它的那个事件，这条不变量优先级更高。
 3. **`doctor` 报 Codex trust unconfirmed 误报**：0.150.1 vs fixture 0.147.0，但同机 hook 全程工作（hook_event 为证）。诊断面与实际矛盾，属探测逻辑对新版本的误判。
 4. **startup cwd 被删时 `canonicalize` 失败记 `authorization_internal`**（一次，与清理 worktree 时间窗吻合）。环境特例。方案：canonicalize 失败时沿用租约既有决定而非 fail_open。
 
@@ -101,3 +101,11 @@
 45. **显式 context_search 成为 wire 大户**:自动包收敛到 ≤8000 tokens 后,单次 context_search 实测 65.8KB(被 Cursor 溢写成文件)。B1 解冻 Explicit 模式清点时,把显式检索纳入与 pack 相同的信封口径与降级链。
 
 46. **回放工具五项(归组)**:turn-timeout 仅在 stdout 有新行时检查(需独立看门狗);两个回放并发会让 --resume 全挂(需互斥);manifest 的模型 fidelity 与 hook payload 实测不符(auto-smart vs 宣称值,应回填);Cursor 子会话(无 sessionStart 的子 conversation)各自获发 activation marker(一次回放=三个被授权 session,授权面值得收紧);pack_deliveries 对"同批 ctx 重复投放"少计(task_injection 去重所致,跨宿主 count=pushes 的承诺不成立)。另:host/turn-N.jsonl 记录完整 MCP result,建议并回 hosts/cursor.py 作为 wire 观测源。
+
+## 2026-09-12 新增(WP-G2a 供给侧清扫发现)
+
+47. **`hook_fail_open::cursor_undecodable_payload_shapes_fail_open_with_a_neutral_output` 是既有 flake**：断言"三个不可解码 payload 各留一行 `payload_decode_failed`"，并发跑 5 次里挂 1–2 次，单独跑必过；**在本分支改动之前的 HEAD 上同样复现**（`git stash` 后连跑 5 次挂 1 次），与 WP-G2a 无关。形状与 #30 同族但不是墙钟断言，而是共享的有界诊断视图计数——并发测试写入会把目标行挤出窗口。修法方向：该断言按 reason 过滤后断言 `>= 3` 或让 harness 用独占的诊断视图。
+
+48. **pending prompt 让"未成 Task 的会话文本"首次落盘**：`pending_prompt_signal` 存的是与 Signal 完全相同的脱敏截断文本，但一个**永远不会声明 Task** 的会话，其 prompt 现在也会在磁盘上存在（此前完全不落盘）。已用两道闸收口：48 小时过期 + 全表 256 行上限，两者都在每次 stash 时清扫。代价记录在案：`codex-normal.json` 的 `raw_content_is_absent` 探针去掉了 `{"kind":"prompt","hook":"prompt"}` 一项——那条封闭断言此前之所以成立，正是因为"建 Task 前的 prompt 被丢弃"这个缺陷；prompt 侧的隐私性质改由 `hook_task_signals` 的两条 secret 断言覆盖（暂存的和记录的都断言 `PROMPT_SECRET` 不出现在持久化状态里），比 canary 探针更强，因为 canary 本就不是密钥形态。升级条件：若要恢复该探针，需要一个"raw 内容确实永不落盘"的 prompt 形态（如斜杠命令）并让 runner 支持给 canary 加前缀。
+
+49. **符号点名派生尚无真实流量基线**：`derived_from_symbol_mention` 的准确率只有 fixture 证据（276,848 文件里 `MapSceneRuntime`/`CameraController` 各唯一匹配是离线核过的，但没有跑过一次真实 Build）。每 claim 上限 3、只在零字面路径派生时开闸、每条都带 limitation，三道控噪都在，但"点名派生占最终 accepted Reference 的比例与其被采纳率"要等真实流量。升级条件：攒到 ≥20 条 `derived_from_symbol_mention` 的 accepted Reference 后统计一次；若误指率明显，先收紧到"仅当仓内该 stem 的文件扩展名属于代码类"。

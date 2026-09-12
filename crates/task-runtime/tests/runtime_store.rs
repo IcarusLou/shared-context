@@ -1166,3 +1166,138 @@ fn concurrent_agents_sharing_one_session_fork_parallel_lineages_instead_of_going
         2
     );
 }
+
+/// Held text is text on disk that no Task ever claimed, so it has a shelf life. A Session that
+/// went quiet before declaring a Task loses its Prompt; the one that comes back inside the window
+/// still gets it back.
+#[test]
+fn a_pending_prompt_no_task_ever_claimed_expires_and_a_fresh_one_does_not() {
+    let root = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(root.path()).unwrap();
+    let stale = ExternalSessionLocator::new("codex", "pending-stale").unwrap();
+    let fresh = ExternalSessionLocator::new("codex", "pending-fresh").unwrap();
+    runtime
+        .stash_pending_prompt(&stale, "查清地图相机重入")
+        .unwrap();
+
+    // Age the held Prompt past the window by exactly one second, through the same file the
+    // runtime writes, so nothing about the test depends on the wall clock advancing.
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    connection
+        .execute(
+            "UPDATE pending_prompt_signal
+             SET recorded_at_unix_seconds = recorded_at_unix_seconds - ?1",
+            [sctx_task_runtime::PENDING_PROMPT_MAX_AGE_SECONDS + 1],
+        )
+        .unwrap();
+    drop(connection);
+
+    // Any later stash is what sweeps: the expired row is gone before the new one is counted.
+    assert_eq!(
+        runtime
+            .stash_pending_prompt(&fresh, "改搜索直播卡片")
+            .unwrap(),
+        sctx_task_runtime::PendingPromptOutcome::Stashed { pending: 1 }
+    );
+    runtime
+        .open_or_create(
+            stale.clone(),
+            TaskId::new(),
+            intent(TaskId::new(), "come back much later"),
+            Vec::new(),
+        )
+        .unwrap();
+    assert!(
+        runtime
+            .read_snapshot_by_locator(&stale)
+            .unwrap()
+            .unwrap()
+            .task_signals
+            .is_empty(),
+        "a Prompt older than the window is not backfilled, because it no longer exists"
+    );
+
+    runtime
+        .open_or_create(
+            fresh.clone(),
+            TaskId::new(),
+            intent(TaskId::new(), "come back right away"),
+            Vec::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        runtime
+            .read_snapshot_by_locator(&fresh)
+            .unwrap()
+            .unwrap()
+            .task_signals,
+        vec![TaskSignal {
+            kind: TaskSignalKind::Prompt,
+            content: "改搜索直播卡片".to_owned(),
+        }]
+    );
+}
+
+/// The stash is per Session, and a Prompt offered twice is held once.
+#[test]
+fn the_pending_prompt_stash_is_per_session_and_deduplicated() {
+    let root = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(root.path()).unwrap();
+    let one = ExternalSessionLocator::new("codex", "pending-one").unwrap();
+    let two = ExternalSessionLocator::new("cursor", "pending-one").unwrap();
+    assert_eq!(
+        runtime.stash_pending_prompt(&one, "第一句").unwrap(),
+        sctx_task_runtime::PendingPromptOutcome::Stashed { pending: 1 }
+    );
+    assert_eq!(
+        runtime.stash_pending_prompt(&one, "第一句").unwrap(),
+        sctx_task_runtime::PendingPromptOutcome::AlreadyPending
+    );
+    assert_eq!(
+        runtime.stash_pending_prompt(&one, "第二句").unwrap(),
+        sctx_task_runtime::PendingPromptOutcome::Stashed { pending: 2 }
+    );
+    assert_eq!(
+        runtime.stash_pending_prompt(&one, "第三句").unwrap(),
+        sctx_task_runtime::PendingPromptOutcome::Full
+    );
+    assert_eq!(
+        runtime
+            .stash_pending_prompt(&two, "另一个宿主的第一句")
+            .unwrap(),
+        sctx_task_runtime::PendingPromptOutcome::Stashed { pending: 1 },
+        "the same Session id under another agent is another Session"
+    );
+
+    runtime
+        .open_or_create(
+            one.clone(),
+            TaskId::new(),
+            intent(TaskId::new(), "take the held prompts"),
+            vec![TaskSignal {
+                kind: TaskSignalKind::Workspace,
+                content: "Registered:src/main.rs".to_owned(),
+            }],
+        )
+        .unwrap();
+    let signals = runtime
+        .read_snapshot_by_locator(&one)
+        .unwrap()
+        .unwrap()
+        .task_signals;
+    assert_eq!(
+        signals
+            .iter()
+            .map(|signal| signal.content.as_str())
+            .collect::<Vec<_>>(),
+        vec!["第一句", "第二句", "Registered:src/main.rs"],
+        "what was said before the Task takes the lower ordinals"
+    );
+    assert_eq!(
+        runtime
+            .stash_pending_prompt(&two, "另一个宿主的第一句")
+            .unwrap(),
+        sctx_task_runtime::PendingPromptOutcome::AlreadyPending,
+        "the other Session's stash was not drained by this Task"
+    );
+}

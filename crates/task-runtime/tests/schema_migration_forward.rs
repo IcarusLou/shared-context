@@ -5,7 +5,8 @@
 //! readable as the human decision it was; version 17 -> 18 is additive (two `external_session`
 //! counters for the `TurnStop` checkpoint reminder gate, WP-V6 fix 3). Version 18 -> 19 adds relation and usage-basis audit
 //! columns; version 19 -> 20 turns the one-column Claim derivation marker into a record of what
-//! that derivation found. The seven chain, so a version 13 database reopened today lands on the
+//! that derivation found; version 20 -> 21 adds the table that holds a Prompt submitted before
+//! its Session had a Task. The eight chain, so a version 13 database reopened today lands on the
 //! current version.
 //!
 //! There is no standalone "build an old database" helper, so these construct one honestly: they
@@ -111,6 +112,7 @@ fn schema_version_13_chains_forward_in_place_and_keeps_existing_rows() {
                  ALTER TABLE checkpoint_reference_derivation
                     DROP COLUMN unresolved_sample_json;
                  ALTER TABLE checkpoint_reference_derivation DROP COLUMN reopened;
+                 DROP TABLE IF EXISTS pending_prompt_signal;
                  PRAGMA user_version = 13;",
             )
             .unwrap();
@@ -141,7 +143,7 @@ fn schema_version_13_chains_forward_in_place_and_keeps_existing_rows() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(
-        version, 20,
+        version, 21,
         "migration must chain through to the current version"
     );
     let hook_event_exists: bool = connection
@@ -310,7 +312,7 @@ fn schema_version_14_discards_the_recorded_injection_outcomes_only() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        20
+        21
     );
     assert!(
         runtime
@@ -393,7 +395,7 @@ fn schema_version_15_discards_the_recorded_omissions_and_keeps_the_proofs() {
             .unwrap()
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        20
+        21
     );
     let totals = runtime
         .context_usage_totals(&[ignored, reused, refuted])
@@ -492,7 +494,7 @@ fn schema_version_16_adds_disposition_provenance_without_rewriting_a_decision() 
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        20
+        21
     );
     let rejections_exist: bool = connection
         .query_row(
@@ -609,7 +611,7 @@ fn schema_version_17_adds_the_checkpoint_reminder_counters_at_zero() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        20,
+        21,
         "migration must chain through to the current version"
     );
     let (reminder_count, activity): (i64, i64) = connection
@@ -677,7 +679,7 @@ fn schema_migrations_are_reentrant_over_existing_columns() {
             .unwrap()
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        20
+        21
     );
     assert!(
         runtime
@@ -737,7 +739,7 @@ fn schema_version_18_adds_audit_columns_without_losing_decisions_or_usage() {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            20
+            21
         );
         let rows = connection.prepare("SELECT outcome, recorded_at_unix_seconds, basis FROM context_usage ORDER BY context_id")
             .unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)))
@@ -818,7 +820,7 @@ fn schema_version_19_records_what_the_derivation_found_and_keeps_old_markers_clo
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            20
+            21
         );
         let record = runtime
             .reference_derivation_record(episode_id)
@@ -846,6 +848,57 @@ fn schema_version_19_records_what_the_derivation_found_and_keeps_old_markers_clo
                 )
                 .is_err(),
             "the reopen flag is a flag"
+        );
+    }
+}
+
+/// Version 20 -> 21 adds the pending Prompt table, and nothing else.
+#[test]
+fn schema_version_20_adds_the_pending_prompt_table_without_touching_anything_else() {
+    let root = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(root.path()).unwrap();
+    let locator = ExternalSessionLocator::new("codex", "pending-prompt-migration").unwrap();
+    runtime
+        .open_or_create(
+            locator.clone(),
+            TaskId::new(),
+            intent("survive the pending Prompt upgrade"),
+            Vec::new(),
+        )
+        .unwrap();
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE IF EXISTS pending_prompt_signal;
+             PRAGMA user_version = 20;",
+        )
+        .unwrap();
+    drop(connection);
+
+    for _ in 0..2 {
+        let runtime = TaskRuntime::initialize(root.path()).unwrap();
+        let connection = Connection::open(runtime.database_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            21
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM pending_prompt_signal", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM task_session", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
         );
     }
 }
