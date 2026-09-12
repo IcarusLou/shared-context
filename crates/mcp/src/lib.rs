@@ -488,6 +488,11 @@ pub enum CompactSpaceRecommendation {
 }
 
 /// One compact Candidate Review row.
+///
+/// The four flags are four independent answers a triaging Agent needs on one line, and they are a
+/// published wire shape: folding them into an enum or a nested object would change the JSON for
+/// hosts that already read it, and would not make any of them fewer.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CompactCandidateReview {
     pub candidate_id: sctx_domain::CandidateId,
@@ -501,7 +506,26 @@ pub struct CompactCandidateReview {
     pub top_assessment: Option<CompactCandidateAssessment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_space_recommendation: Option<CompactSpaceRecommendation>,
+    /// Whether this row belongs in triage at all: the Review is pending, the analysis finished,
+    /// and the analysis produced a state a reviewer can act on.
+    ///
+    /// It is **not** a licence to confirm automatically, and reading it as one is what made the
+    /// two faces of this state contradict each other. It is true for `needs_space_review`,
+    /// `exact_duplicate_review` and `potential_contradiction_review` too — every state that wants
+    /// a reviewer's attention. `auto_confirmable` is the field that answers the other question.
     pub ready_for_review: bool,
+    /// The analysis verdict `candidate_confirm`'s permission surface reads. Published here because
+    /// it is the field the refusal names, and a row that omitted it could not explain itself.
+    pub candidate_status: AutomaticCandidateStatus,
+    /// Whether the server would permit `decision_source: "agent_policy"` on this row *as it
+    /// stands*: Review pending, `candidate_status` exactly `ready_for_review`, and a top relation
+    /// of `novel` or `supports`.
+    ///
+    /// Derived from the same three functions `require_auto_confirm_permitted` evaluates, so this
+    /// and the refusal cannot drift apart. The one clause it cannot answer is `edits`, which lives
+    /// in the request: send edits and the confirmation is refused however this reads. Everything
+    /// else is a promise — a `true` row confirmed with no edits is accepted.
+    pub auto_confirmable: bool,
     /// Non-blocking reminder that the knowledge base default language is Chinese. See
     /// [`language_hint`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -609,6 +633,8 @@ fn compact_candidate_review(
         top_assessment,
         primary_space_recommendation,
         ready_for_review: review.ready_for_review,
+        candidate_status: review.candidate_status,
+        auto_confirmable: auto_confirmable(review),
         language_hint: language_hint(&review.content.statement),
         applicability_inherited: APPLICABILITY_INHERITED,
         untrusted_data: review.untrusted_data,
@@ -5590,13 +5616,100 @@ const AUTO_CONFIRM_NOT_PERMITTED: &str =
 const AUTO_CONFIRM_ESCALATION: &str = "Present this Candidate to the user for review instead, and \
      confirm it without decision_source (or with decision_source human) once they have decided.";
 
+/// Clause 1 of the automatic-confirmation permission surface: the Review is still undecided.
+fn auto_confirm_replay_violation(review: &CandidateReviewView) -> Option<String> {
+    (review.review_status != CandidateReviewStatus::Pending).then(|| {
+        "its Review is no longer pending; automatic confirmation cannot replay a decision"
+            .to_owned()
+    })
+}
+
+/// Clause 2: the analysis itself found nothing that needs a human.
+///
+/// The refusal names the step that is actually missing rather than the generic three. A Candidate
+/// stuck on `needs_space_review` does not need "a judgement about Space organization, duplication
+/// or contradiction" — it needs a Primary Space and a re-analysis, and an Agent that is told the
+/// generic sentence has no way to know which of the three applies to it or what to do next.
+fn auto_confirm_status_violation(review: &CandidateReviewView) -> Option<String> {
+    if review.candidate_status == AutomaticCandidateStatus::ReadyForReview {
+        return None;
+    }
+    let missing_step = match review.candidate_status {
+        AutomaticCandidateStatus::NeedsSpaceReview => {
+            "the analysis elected no existing Primary Space for it, so it needs one: create or \
+             pick the Space (space_create, or confirm a sibling Candidate into the proposed Space \
+             so the whole Task's group resolves onto it) and run candidate_analyze again"
+        }
+        AutomaticCandidateStatus::ExactDuplicateReview => {
+            "the analysis found an exact duplicate of a still-accepted Context, and which record \
+             survives is a human decision"
+        }
+        AutomaticCandidateStatus::PotentialContradictionReview => {
+            "the analysis found a potential contradiction, and which record is right is a human \
+             decision"
+        }
+        AutomaticCandidateStatus::Draft | AutomaticCandidateStatus::NeedsEvidence => {
+            "its analysis is not finished, so there is nothing to confirm yet"
+        }
+        AutomaticCandidateStatus::ReadyForReview => unreachable!("returned above"),
+    };
+    Some(format!(
+        "its candidate_status is {} rather than ready_for_review -- {missing_step}",
+        snake_case_name(&review.candidate_status)
+    ))
+}
+
+/// Clause 4: only a Candidate that adds knowledge or agrees with knowledge may skip the human.
+fn auto_confirm_relation_violation(review: &CandidateReviewView) -> Option<String> {
+    match top_assessment_relation(review) {
+        Some(CandidateAssessmentRelation::Novel | CandidateAssessmentRelation::Supports) => None,
+        Some(relation) => Some(format!(
+            "its top assessment relation is {}, and only novel or supports may be confirmed \
+             automatically",
+            snake_case_name(&relation)
+        )),
+        None => {
+            Some("its analysis produced no assessment, so no relation could be verified".to_owned())
+        }
+    }
+}
+
+/// The same `top_assessment` selection `compact_candidate_review` makes.
+fn top_assessment_relation(review: &CandidateReviewView) -> Option<CandidateAssessmentRelation> {
+    review
+        .analysis
+        .assessments
+        .iter()
+        .max_by_key(|assessment| assessment.confidence.basis_points)
+        .map(|assessment| assessment.relation)
+}
+
+/// Whether every clause of the permission surface that does not depend on the request is satisfied.
+///
+/// This is what `candidate_list` reports as `auto_confirmable`, and
+/// [`require_auto_confirm_permitted`] evaluates the very same three functions, so the listing and
+/// the refusal cannot disagree. They used to: the compact row published only `ready_for_review`,
+/// which is a *triage-visibility* flag whose predicate deliberately includes `needs_space_review`,
+/// and an Agent reading `ready_for_review: true` was then refused with
+/// `auto_confirm_not_permitted … candidate_status is needs_space_review`. Two faces, opposite
+/// answers, about one state.
+///
+/// The one clause left out is `edits`, which belongs to the request rather than to the Review and
+/// so cannot be answered by a listing. That is stated in the field's own documentation rather than
+/// inferred.
+fn auto_confirmable(review: &CandidateReviewView) -> bool {
+    auto_confirm_replay_violation(review).is_none()
+        && auto_confirm_status_violation(review).is_none()
+        && auto_confirm_relation_violation(review).is_none()
+}
+
 /// The whole permission surface an automatic Candidate confirmation is allowed inside.
 ///
-/// Every condition is read from a value the server itself derived for this exact Review — the
-/// same `ready_for_review` and `candidate_status` a reviewer would have been shown, and the same
-/// `top_assessment` selection `compact_candidate_review` makes — so an Agent can never widen the
-/// surface by asserting something about its own request. A Candidate outside it is not downgraded
-/// to a human confirmation silently: it is refused, and the refusal names the condition it failed.
+/// Every condition is read from a value the server itself derived for this exact Review — the same
+/// `candidate_status` and the same `top_assessment` selection a reviewer would have been shown —
+/// so an Agent can never widen the surface by asserting something about its own request. A
+/// Candidate outside it is not downgraded to a human confirmation silently: it is refused, and the
+/// refusal names the condition it failed and the step that would clear it.
 ///
 /// Both Primary shapes are permitted. An existing Space and a Space recommendation the server
 /// produced are both server-owned choices; what stays a human decision is Space governance beyond
@@ -5605,43 +5718,18 @@ fn require_auto_confirm_permitted(
     review: &CandidateReviewView,
     edits: &OptionalCandidateEdits,
 ) -> Result<()> {
-    let top_relation = review
-        .analysis
-        .assessments
-        .iter()
-        .max_by_key(|assessment| assessment.confidence.basis_points)
-        .map(|assessment| assessment.relation);
-    let violation = if review.review_status != CandidateReviewStatus::Pending {
-        Some(
-            "its Review is no longer pending; automatic confirmation cannot replay a decision"
-                .to_owned(),
-        )
-    } else if review.candidate_status != AutomaticCandidateStatus::ReadyForReview {
-        Some(format!(
-            "its candidate_status is {} rather than ready_for_review, so it needs a human \
-             judgement about Space organization, duplication, or contradiction",
-            snake_case_name(&review.candidate_status)
-        ))
-    } else if !edits.is_empty() {
-        Some(
-            "the request carries edits, and rewriting a Candidate's content is a human decision"
-                .to_owned(),
-        )
-    } else {
-        match top_relation {
-            Some(CandidateAssessmentRelation::Novel | CandidateAssessmentRelation::Supports) => {
-                None
-            }
-            Some(relation) => Some(format!(
-                "its top assessment relation is {}, and only novel or supports may be confirmed \
-                 automatically",
-                snake_case_name(&relation)
-            )),
-            None => Some(
-                "its analysis produced no assessment, so no relation could be verified".to_owned(),
-            ),
-        }
-    };
+    // Order is the refusal's order, not an implementation detail: a Candidate that trips several
+    // clauses is told about the earliest one, and the earliest is the one whose resolution comes
+    // first in time.
+    let violation = auto_confirm_replay_violation(review)
+        .or_else(|| auto_confirm_status_violation(review))
+        .or_else(|| {
+            (!edits.is_empty()).then(|| {
+                "the request carries edits, and rewriting a Candidate's content is a human decision"
+                    .to_owned()
+            })
+        })
+        .or_else(|| auto_confirm_relation_violation(review));
     match violation {
         None => Ok(()),
         Some(violation) => Err(invalid(format!(
@@ -8189,7 +8277,7 @@ fn tools_list(policy: &Policy) -> Value {
         ),
         tool_schema(
             "candidate_confirm",
-            "Explicitly confirm one owned Pending Candidate Review into one atomic Context/Space fact closure. All generated identities and any proposed new Space Intent are server-owned. Send decision_source agent_policy for a confirmation you made yourself under that triage; the server accepts it only for a ready_for_review novel-or-supports Candidate confirmed without edits, and a refusal (auto_confirm_not_permitted) means present it to the user, not retry with different fields.",
+            "Explicitly confirm one owned Pending Candidate Review into one atomic Context/Space fact closure. All generated identities and any proposed new Space Intent are server-owned. Send decision_source agent_policy for a confirmation you made yourself under that triage; the server accepts it only for an auto_confirmable row confirmed without edits, and a refusal (auto_confirm_not_permitted) names the missing step and means present it to the user, not retry with different fields.",
             candidate_confirm_schema()
         ),
         tool_schema(
@@ -8739,10 +8827,12 @@ fn candidate_confirm_schema() -> Value {
             "decision_source": decision_source_schema(
                 "Who decided this confirmation. Defaults to human when omitted. agent_policy \
                  declares that you confirmed it yourself without asking the user, and the server \
-                 accepts it only when the Review is ready_for_review with candidate_status \
-                 ready_for_review, the top assessment relation is novel or supports, and the \
-                 request carries no edits; anything else is refused as auto_confirm_not_permitted \
-                 and belongs in front of the user."
+                 accepts it only for a row whose auto_confirmable is true (Review pending, \
+                 candidate_status exactly ready_for_review, top assessment relation novel or \
+                 supports) and a request carrying no edits; anything else is refused as \
+                 auto_confirm_not_permitted, whose message names the step that is missing, and \
+                 belongs in front of the user. Note that ready_for_review on a compact row means \
+                 the row wants a reviewer, not that it may be confirmed automatically."
             )
         }
     })
@@ -9066,7 +9156,7 @@ fn tool_success_with_notice(
 /// What it deliberately no longer states is *which drafts deserve which tier*. That is one team's
 /// judgement about its own knowledge base, it changes without a release, and it now arrives from
 /// `policy.md`'s `## triage` section through [`candidate_triage_text`].
-const CANDIDATE_TRIAGE_PROTOCOL: &str = "Triage each Pending Review by top_assessment.relation. Discard with candidate_discard, decision_source agent_policy, and a reason naming the ground. Confirm with candidate_confirm, decision_source agent_policy, and no edits, and only a ready_for_review novel or supports row. On auto_confirm_not_permitted, escalate; do not change fields and retry. Escalate everything else: potential_contradiction, revises, duplicates needing a supersede decision, Space governance, incomplete analysis, and uncertainty. Present only these to the user in a compact table (topic, statement, relation) with your recommendation; do not wait to be asked.";
+const CANDIDATE_TRIAGE_PROTOCOL: &str = "Triage each Pending Review by top_assessment.relation. Discard with candidate_discard, decision_source agent_policy, and a reason naming the ground. Confirm with candidate_confirm, decision_source agent_policy, and no edits, and only a row whose auto_confirmable is true: a pending Review at candidate_status ready_for_review whose top relation is novel or supports. ready_for_review means the row wants a reviewer, not that you may be one; it usually differs because candidate_status is needs_space_review, and the refusal names the missing step. On auto_confirm_not_permitted, escalate; do not change fields and retry. Escalate everything else: potential_contradiction, revises, duplicates needing a supersede decision, Space governance, incomplete analysis, and uncertainty. Present only these to the user in a compact table (topic, statement, relation) with your recommendation; do not wait to be asked.";
 
 /// The complete triage text one installation delivers: protocol, then its team's grounds.
 ///

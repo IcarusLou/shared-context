@@ -9073,6 +9073,202 @@ fn confirmation_annotations(fixture: &Fixture, context_id: ContextId) -> Value {
         .clone()
 }
 
+/// The listing and the permission surface used to give opposite answers about one state.
+///
+/// Measured on `cnd_6368c547`: `candidate_list` reported `ready_for_review: true`, and
+/// `candidate_confirm` refused the very same Candidate with `auto_confirm_not_permitted …
+/// candidate_status is needs_space_review rather than ready_for_review`. Both were correct about
+/// their own question and the row published only one of them, so the Agent was told to confirm
+/// something the server would refuse.
+#[test]
+fn the_compact_row_and_the_permission_surface_agree_about_one_candidate() {
+    let fixture = Fixture::new();
+    let session = "two-faces-of-one-state";
+    let (task, candidate_id) =
+        build_review_candidate(&fixture, session, "A Candidate with nowhere to live yet");
+    // A novel Candidate whose analysis elected no existing Primary Space -- exactly the observed
+    // shape, and the reason the second tier so rarely fires.
+    set_review_surface(
+        &fixture,
+        candidate_id,
+        sctx_domain::AutomaticCandidateStatus::NeedsSpaceReview,
+        sctx_domain::CandidateAssessmentRelation::Novel,
+    );
+
+    let row = |session: &str| {
+        let compact = candidate_list_with_detail_at_root(
+            &fixture.root,
+            &CandidateListInput {
+                scope: sctx_domain::CandidateReviewScope::Task,
+                agent_kind: "codex".to_owned(),
+                external_session_id: session.to_owned(),
+                status: CandidateReviewStatus::Pending,
+                limit: 10,
+                cursor: None,
+                token_budget: 4_096,
+            },
+            sctx_search::ContextPackDetailLevel::Compact,
+        )
+        .unwrap();
+        serde_json::to_value(
+            compact
+                .compact()
+                .reviews
+                .into_iter()
+                .find(|review| review.candidate_id == candidate_id)
+                .expect("the Candidate is listed"),
+        )
+        .unwrap()
+    };
+
+    let listed = row(session);
+    // Still true, and still meaning what it always meant: this row wants a reviewer.
+    assert_eq!(listed["ready_for_review"], json!(true));
+    // And now the row says which reviewer, in the field the refusal names.
+    assert_eq!(listed["candidate_status"], json!("needs_space_review"));
+    assert_eq!(
+        listed["auto_confirmable"],
+        json!(false),
+        "the row must not invite a confirmation the server will refuse"
+    );
+
+    let error = candidate_confirm_at_root(
+        &fixture.root,
+        &confirm_input(
+            &task,
+            session,
+            candidate_id,
+            fixture.space_id,
+            DecisionSource::AgentPolicy,
+        ),
+    )
+    .expect_err("the permission surface still refuses it");
+    let message = error.message();
+    assert!(
+        message.contains("candidate_status is needs_space_review"),
+        "{message}"
+    );
+    // The refusal has to name the step that is actually missing. "It needs a human judgement about
+    // Space organization, duplication, or contradiction" named three possibilities and no action.
+    assert!(
+        message.contains("no existing Primary Space")
+            && message.contains("space_create")
+            && message.contains("candidate_analyze"),
+        "the refusal must point at Space placement and re-analysis: {message}"
+    );
+
+    // Put the Candidate where the refusal said to put it, and both faces flip together.
+    set_review_surface(
+        &fixture,
+        candidate_id,
+        sctx_domain::AutomaticCandidateStatus::ReadyForReview,
+        sctx_domain::CandidateAssessmentRelation::Novel,
+    );
+    let placed = row(session);
+    assert_eq!(placed["candidate_status"], json!("ready_for_review"));
+    assert_eq!(placed["auto_confirmable"], json!(true));
+    candidate_confirm_at_root(
+        &fixture.root,
+        &confirm_input(
+            &task,
+            session,
+            candidate_id,
+            fixture.space_id,
+            DecisionSource::AgentPolicy,
+        ),
+    )
+    .expect("an auto_confirmable row confirmed without edits is accepted");
+}
+
+/// `auto_confirmable` answers every clause of the surface except the one that lives in the request.
+#[test]
+fn auto_confirmable_tracks_the_surface_it_cannot_be_read_off_the_triage_flag() {
+    let fixture = Fixture::new();
+    let flag = |session: &str, candidate_id: CandidateId| {
+        let compact = candidate_list_with_detail_at_root(
+            &fixture.root,
+            &CandidateListInput {
+                scope: sctx_domain::CandidateReviewScope::Task,
+                agent_kind: "codex".to_owned(),
+                external_session_id: session.to_owned(),
+                status: CandidateReviewStatus::Pending,
+                limit: 10,
+                cursor: None,
+                token_budget: 4_096,
+            },
+            sctx_search::ContextPackDetailLevel::Compact,
+        )
+        .unwrap();
+        let review = compact
+            .compact()
+            .reviews
+            .into_iter()
+            .find(|review| review.candidate_id == candidate_id)
+            .expect("the Candidate is listed");
+        (review.ready_for_review, review.auto_confirmable)
+    };
+
+    // A relation outside {novel, supports} is in triage and outside the surface.
+    let revises_session = "auto-confirmable-revises";
+    let (_, revises) = build_review_candidate(
+        &fixture,
+        revises_session,
+        "Revising an accepted Context is a person's call",
+    );
+    set_review_surface(
+        &fixture,
+        revises,
+        sctx_domain::AutomaticCandidateStatus::ReadyForReview,
+        sctx_domain::CandidateAssessmentRelation::Revises,
+    );
+    assert_eq!(flag(revises_session, revises), (true, false));
+
+    // An exact duplicate likewise: a reviewer's row, not an Agent's.
+    let duplicate_session = "auto-confirmable-duplicate";
+    let (_, duplicate) = build_review_candidate(
+        &fixture,
+        duplicate_session,
+        "Which record survives a duplicate is a person's call",
+    );
+    set_review_surface(
+        &fixture,
+        duplicate,
+        sctx_domain::AutomaticCandidateStatus::ExactDuplicateReview,
+        sctx_domain::CandidateAssessmentRelation::Supports,
+    );
+    assert_eq!(flag(duplicate_session, duplicate), (true, false));
+
+    // And the whole surface satisfied reads true on both.
+    let permitted_session = "auto-confirmable-permitted";
+    let (task, permitted) = permitted_candidate(
+        &fixture,
+        permitted_session,
+        "Inside the whole automatic permission surface",
+    );
+    assert_eq!(flag(permitted_session, permitted), (true, true));
+
+    // `edits` is the one clause a listing cannot answer, so a true row plus edits is still
+    // refused -- which is why the field's documentation states it rather than leaving it implied.
+    let error = candidate_confirm_at_root(
+        &fixture.root,
+        &CandidateConfirmInput {
+            edits: OptionalCandidateEdits {
+                statement: Some("An Agent must not rewrite what it accepts".to_owned()),
+                ..OptionalCandidateEdits::default()
+            },
+            ..confirm_input(
+                &task,
+                permitted_session,
+                permitted,
+                fixture.space_id,
+                DecisionSource::AgentPolicy,
+            )
+        },
+    )
+    .expect_err("edits are refused however auto_confirmable reads");
+    assert!(error.message().contains("the request carries edits"));
+}
+
 /// A Candidate inside the whole surface is accepted, and the acceptance records who made it.
 #[test]
 fn agent_policy_confirmation_inside_the_permission_surface_records_its_provenance() {

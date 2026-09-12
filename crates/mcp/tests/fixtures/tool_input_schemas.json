@@ -68,7 +68,7 @@
         "uniqueItems": true
       },
       "decision_source": {
-        "description": "Who decided this confirmation. Defaults to human when omitted. agent_policy declares that you confirmed it yourself without asking the user, and the server accepts it only when the Review is ready_for_review with candidate_status ready_for_review, the top assessment relation is novel or supports, and the request carries no edits; anything else is refused as auto_confirm_not_permitted and belongs in front of the user.",
+        "description": "Who decided this confirmation. Defaults to human when omitted. agent_policy declares that you confirmed it yourself without asking the user, and the server accepts it only for a row whose auto_confirmable is true (Review pending, candidate_status exactly ready_for_review, top assessment relation novel or supports) and a request carrying no edits; anything else is refused as auto_confirm_not_permitted, whose message names the step that is missing, and belongs in front of the user. Note that ready_for_review on a compact row means the row wants a reviewer, not that it may be confirmed automatically.",
         "enum": [
           "human",
           "agent_policy"

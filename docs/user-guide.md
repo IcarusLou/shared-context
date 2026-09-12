@@ -359,7 +359,7 @@ Context（长期工程知识）
 | 档位 | 谁来做 | 适用范围 |
 |---|---|---|
 | 自动丢弃 | Agent | 只是复述某条仍然 `accepted` 的旧 Context、且没带来新适用条件和新证据；或者这条 Claim 只是"我读了一遍这段代码"的过程性理解。丢弃只是本机运行时决定，不写任何 Git 事实，丢错了顶多下次重新 Checkpoint。 |
-| 自动确认 | Agent | Review 已 `ready_for_review`、最强关系是 `novel` 或 `supports`、没有任何 `edits`、Primary Space 是已有 Space 或服务端自己给的推荐——**并且这四条由服务端亲自校验**，越界一律以 `auto_confirm_not_permitted` 拒绝，不会被悄悄降级放行。 |
+| 自动确认 | Agent | 精简行的 `auto_confirmable` 为 `true`（即 Review 仍 pending、`candidate_status` 恰好是 `ready_for_review`、最强关系是 `novel` 或 `supports`）、没有任何 `edits`、Primary Space 是已有 Space 或服务端自己给的推荐——**并且这些条件由服务端亲自校验**，越界一律以 `auto_confirm_not_permitted` 拒绝，不会被悄悄降级放行。注意 `ready_for_review` 与 `auto_confirmable` 回答的不是同一个问题：前者说"这行需要人看"（`needs_space_review` 等状态也为 true），后者说"你可以当这个人"。 |
 | 升级给你 | 你 | 其余全部：`potential_contradiction` 与 `revises`、需要 supersede 决策的重复项、超出已有 Space 与服务端推荐的 Space 治理、分析不完整的 Review，以及 Agent 自己拿不准的任何一条。Agent 应当只把这些行以一张紧凑表格（主题 / 结论 / 关系 / 它的建议）交给你。 |
 
 每次确认和丢弃都会记下 `decision_source`（`human` 或 `agent_policy`），确认还会记下作者（全局 `git config user.email` 的用户名部分）。两者只存放在事件的 `annotations` 里，不进入事件正文，也不参与任何重放身份。所以自动入库是**可整批撤销**的：
@@ -716,9 +716,9 @@ Checkpoint Claim 必须严格包含 `context_kind`、`statement`、`rationale`�
 | `sctx candidate discard --candidate-id <ID> [--candidate-id <ID> ...] --reason <TEXT>` | 用户明确拒绝保留时丢弃 Candidate Review；不会发布任何 Context。重复 `--candidate-id` 原子丢弃多个自己名下的 Pending Candidate。 |
 | `sctx candidate build-closed-episode --episode-id <ID>` | 在 Episode 已关闭但 Builder 响应丢失或待恢复时重建；属于恢复命令。 |
 
-Candidate 状态支持 `pending`、`discarded`、`expired`、`confirmed`。只有完整分析且 `ready_for_review` 的 Candidate 才适合让用户决策。`potential_contradiction` 和 `unresolved_related` 是审核线索，不是已经成立的事实。
+Candidate 状态支持 `pending`、`discarded`、`expired`、`confirmed`。只有完整分析且 `ready_for_review` 的 Candidate 才适合让用户决策；能否**自动**确认看的是 `auto_confirmable`，它额外要求 `candidate_status` 恰好是 `ready_for_review`（`needs_space_review` 的行 `ready_for_review` 为 true 但 `auto_confirmable` 为 false，需要先归位到一个已有 Primary Space 再重跑 `candidate analyze`）。`potential_contradiction` 和 `unresolved_related` 是审核线索，不是已经成立的事实。
 
-`candidate list` 默认（MCP 侧）和 `--compact`（CLI 侧）返回精简三角视图：每条只有 `candidate_id`、`kind`、`statement`、置信度最高的 `top_assessment`（`relation` + `confidence_basis_points`）、`primary_space_recommendation` 和 `ready_for_review`；不含完整证据、来源和分析明细。推荐的审核顺序是：先看这份精简列表，只对 `top_assessment.relation` 为 `potential_contradiction` 或 `revises` 的 Candidate 用 `candidate get` 展开完整 Review，再决定是否用 `candidate_ids` 批量确认或丢弃其余同批次的 `supports`/`exact_duplicate`/`novel` 项，避免逐条重复展开明显不需要人工细看的 Candidate。
+`candidate list` 默认（MCP 侧）和 `--compact`（CLI 侧）返回精简三角视图：每条只有 `candidate_id`、`kind`、`statement`、置信度最高的 `top_assessment`（`relation` + `confidence_basis_points`）、`primary_space_recommendation`、`candidate_status`、`ready_for_review` 和 `auto_confirmable`；不含完整证据、来源和分析明细。推荐的审核顺序是：先看这份精简列表，只对 `top_assessment.relation` 为 `potential_contradiction` 或 `revises` 的 Candidate 用 `candidate get` 展开完整 Review，再决定是否用 `candidate_ids` 批量确认或丢弃其余同批次的 `supports`/`exact_duplicate`/`novel` 项，避免逐条重复展开明显不需要人工细看的 Candidate。
 
 同一 Task 产生多个 Claims 时，每个 Claim 仍是独立 Candidate，但它们共享一个 `ProposedSpaceGroup`（键是 `ProposedSpaceGroupKey::from_task(task_id)`，只绑 Task，不绑 Intent Revision）：建议的新 Space 标题只来自 Working Intent 的 `goal`，会移除内部 `System suggestion:` 前缀、规范空白后按字符截断到 40 个字符并加省略号（不是按词边界截断，goal 为空时用固定标题 "Task intent"）。第一个 Candidate 确认创建新 Space 后，其他待审核 Candidate 会推荐该 Existing Space；同一 Task 内推进 Intent Revision 不会换分组，只有新 Task 才会。这个机制不会按文本合并 Candidate，也不是全局 Active Space。这类系统生成的 Space 会带 `provisional` 标记，出现在 `space list`/`space get` 与候选的 Space 推荐里；当它积累的已接受 Context 达到一定数量，或出现跨 Space 的相关引用时，`candidate list` 顶层会给出合并/命名到人工 Space 的提示，人工执行一次 `space intent revise` 才会让它不再是 `provisional`。
 
