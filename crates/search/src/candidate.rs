@@ -1147,6 +1147,43 @@ fn statement_bigram_jaccard_basis_points(left: &str, right: &str) -> u64 {
     jaccard_basis_points(&left_refs, &right_refs)
 }
 
+/// The one legal representation of "retrieval returned nothing", not a proof of novelty.
+///
+/// A `Complete` analysis must carry at least one assessment (`CandidateAnalysis::validate`), and
+/// `novel` is the only relation allowed to carry no target, so a Candidate whose eight channels
+/// all came up empty can only be written down this way. The `6_000` basis points are a constant
+/// of the relation like every other rung of the ladder in [`assess_target`]; they are not a
+/// measure of how novel anything is, and they are not a token budget.
+///
+/// **`novel` is reachable.** A 2026-09-08 analysis
+/// (`docs/refactor-r1-r4/candidate-noise-plan.md`, hard finding ①) concluded it was
+/// *structurally* unreachable on any populated installation, reasoning that the `scope` channel
+/// fires on any non-empty `domains` intersection and that a Claim's `domains` are inherited from
+/// the Task Working Intent, so some neighbour always survives. That conclusion is withdrawn. It
+/// was already contradicted by the same audit's own count (one `novel` in 207 rows, via
+/// `no_sufficient_candidate`), it is asserted as a pass criterion by the paired real-host smoke
+/// (`tests/scripts/real_host_smoke_pair.py` expects `[["novel"]]` on a fresh installation), and it
+/// was observed again on 2026-09-12 with `relation: "novel"`, `paths:
+/// [no_sufficient_candidate]`, `6000bp`.
+///
+/// What the withdrawn argument missed is that the evaluation set shrank underneath it.
+/// [`current_revision_ids`] now admits one revision per Context -- the governance revision -- where
+/// every node of every revision DAG used to be its own target. The three externally-ordered
+/// channels (`bm25`, `graph`, `explicit`) attach by exact `ContextRevisionRef` lookup and drop a
+/// hit whose revision is no longer in the map, silently. BM25 is the broadest of them and searches
+/// retired statuses, so a full-text hit that landed only on an older wording now evaporates. The
+/// `scope` channel is untouched, so the argument's mechanism is still real -- it just is not
+/// exhaustive, and a Claim whose inherited `domains` intersect nothing still reaches zero
+/// neighbours.
+///
+/// The consequence for ADR-0005's second disposition tier: automatic confirmation of a `novel`
+/// Candidate is **not** a dead clause. It is narrow for a different reason than the withdrawn one.
+/// `review_status` below returns `NeedsSpaceReview` unless some recommendation is
+/// `Existing { role: Primary }`, and Primary election requires `safe_strong_target`, which a
+/// `novel` analysis cannot set through a target (it has none) and therefore only gets from a
+/// resolved `proposed_space_group_space_id`. So a `novel` Candidate reaches `ready_for_review`
+/// exactly when its Task's proposed Space group has already resolved onto a real Space -- the
+/// second gate, which that same document identified as hard finding ② without connecting it to ①.
 fn novel_assessment() -> CandidateRelationAssessment {
     CandidateRelationAssessment {
         relation: CandidateAssessmentRelation::Novel,

@@ -15,7 +15,7 @@ Shared Context · 设计方案
 推论:自动化的扩展方向是"收紧入口 + 扩大自动弃置",而不是放宽自动确认。本方案分两阶段:阶段 1 四个工作项(源头过滤改版、三档措辞补全、纯邻近标注、审计地基)全部零召回污染风险,可立即开工;阶段 2(把纯邻近纳入自动确认)只留判据,达标后再裁定。
 
 
-两个硬发现改变了问题形状:① novel 在真实装置里结构性不可达,第二档自动确认本来就是死字母;② 即使放宽 relation,7/7 条卡在 needs_space_review 第二道闸,只动 relation 的方案实效为零。
+两个硬发现改变了问题形状:① novel 在真实装置里结构性不可达,第二档自动确认本来就是死字母(**2026-09-12 撤回,见 1.2**);② 即使放宽 relation,7/7 条卡在 needs_space_review 第二道闸,只动 relation 的方案实效为零(仍然成立,且它才是第二档窄的真原因)。
 
 
 
@@ -64,13 +64,19 @@ relation 判定是七级短路梯子,第一个命中即定。关键常量:statem
 
 
 
-1.2 硬发现 ①:novel 结构性不可达
+1.2 硬发现 ①:novel 结构性不可达 —— **2026-09-12 撤回**
 
 
 novel 只在八个检索通道全空时判给。但 scope 通道的命中条件仅是 domains 有交集,而每条 Claim 的 domains 从 Task Working Intent 继承(APPLICABILITY_INHERITED = true)——只要知识库里存在任何一条同 domain 的 Context,novel 就不可达。实测 candidate 的"邻居"来源全部是 scope_overlap(search/frontend) + 单 token 全文命中(BM25 查询只取 statement 中最长的一个 token,实测恒为 ["programmed"] 或 ["position"])。
 
 
 结论:在任何持续使用的装置上,第二档"novel 可自动确认"是永远不会触发的死条款,supports(要求相似度 ≥8000,近乎复述)是唯一活路——三档设计从未真正在聚焦语料上运转过。
+
+**撤回(2026-09-12,配对回放实证)**:上面这条结论错了,novel 可达。三条证据:(a) 本轮实测 `candidate_get` 返回 `relation: "novel"`、`paths: [no_sufficient_candidate]`、6000bp;(b) 本文自己的审计计数里就有一条(207 行里 1 条 novel,走同一条 `no_sufficient_candidate`)——当时把它当成"极稀有"而非反例;(c) `tests/scripts/real_host_smoke_pair.py` 把 `candidate_relations == [["novel"]]` 当作配对冒烟的**通过判据**,结构性不可达的关系不可能是必过断言。
+
+论证漏在哪:它假设评估集不变,但评估集在 G2b(`9cfc7fe`)之后缩小了。`current_revision_ids` 现在只收每个 Context 的治理 revision,而此前revision DAG 的每个节点各自成为一个 target;`bm25` / `graph` / `explicit` 三个外部定序通道按精确 `ContextRevisionRef` 查表挂载,**命中落在已不在表里的 revision 上就被静默丢弃**——BM25 是其中最宽的一路且搜索已退休状态,所以"只命中旧措辞"的全文命中现在直接蒸发。`scope` 通道没被改动,所以原论证的机制仍然真实,只是并不穷尽:一条继承 domains 与库内无交集的 Claim 依然会落到零邻居。
+
+对第二档的影响:第二档**不再是死条款**,但它窄的原因换成了硬发现 ②。`review_status` 只在有 `Existing { role: Primary }` 推荐时才给 `ready_for_review`,Primary 选举要求 `safe_strong_target`,而 novel 分析没有 target、拿不到这个位,只能靠已解析的 `proposed_space_group_space_id`。所以 **novel 候选进第二档的条件是"来源 Task 的提议 Space 组已经落到一个真实 Space"**。机制注释见 `crates/search/src/candidate.rs::novel_assessment`。
 
 
 
