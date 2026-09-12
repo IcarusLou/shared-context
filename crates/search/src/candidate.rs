@@ -510,15 +510,15 @@ fn add_exact_channels(
                 negation_markers(&state.revision.statement) != candidate_negations;
             if state.negation_conflict {
                 // Still retrieved and ranked as a near-duplicate, but no equality path is claimed.
-                statements.push(*target);
+                statements.push((state.statement_similarity, *target));
             } else {
                 let mut aligned = revision_draft(&state.revision);
                 aligned.statement.clone_from(&candidate.statement);
                 if &aligned == candidate {
-                    canonical.push(*target);
+                    canonical.push((state.statement_similarity, *target));
                     add_path(state, CandidateAssessmentPath::CanonicalDraftEquality);
                 } else {
-                    statements.push(*target);
+                    statements.push((state.statement_similarity, *target));
                     add_path(state, CandidateAssessmentPath::StatementEquality);
                 }
             }
@@ -532,7 +532,9 @@ fn add_exact_channels(
                 .map(normalize_search_text),
         ) && &target_topic == candidate_topic
         {
-            topics.push(*target);
+            // Topic equality is a yes-or-no fact with nothing behind it to grade, so every
+            // member is measured identically and [`add_measured_channel`] gives them one rank.
+            topics.push((0, *target));
             add_path(
                 state,
                 CandidateAssessmentPath::TopicEquality {
@@ -542,7 +544,7 @@ fn add_exact_channels(
         }
         let overlap = scope_overlap(&candidate.applicability, &state.revision.applicability);
         if !overlap.domains.is_empty() {
-            scopes.push(*target);
+            scopes.push((overlap.domains.len() as u64, *target));
             add_path(
                 state,
                 CandidateAssessmentPath::ScopeOverlap {
@@ -553,10 +555,10 @@ fn add_exact_channels(
             );
         }
     }
-    add_ranked_channel(targets, "canonical", canonical);
-    add_ranked_channel(targets, "statement", statements);
-    add_ranked_channel(targets, "topic", topics);
-    add_ranked_channel(targets, "scope", scopes);
+    add_measured_channel(targets, "canonical", canonical);
+    add_measured_channel(targets, "statement", statements);
+    add_measured_channel(targets, "topic", topics);
+    add_measured_channel(targets, "scope", scopes);
 }
 
 /// Intersects the repository identifiers the Candidate and each target spell out in their prose.
@@ -590,7 +592,7 @@ fn add_identifier_channel(
             continue;
         }
         state.shared_identifiers.clone_from(&shared);
-        ranked.push(*target);
+        ranked.push((shared.len() as u64, *target));
         add_path(
             state,
             CandidateAssessmentPath::SharedIdentifier {
@@ -598,7 +600,7 @@ fn add_identifier_channel(
             },
         );
     }
-    add_ranked_channel(targets, "identifier", ranked);
+    add_measured_channel(targets, "identifier", ranked);
 }
 
 /// Free prose of one Candidate draft: statement, rationale and every Evidence text leaf.
@@ -765,6 +767,48 @@ fn add_ranked_channel(
     {
         if let Some(state) = targets.get_mut(&target) {
             state.channels.entry(channel).or_insert(rank + 1);
+        }
+    }
+}
+
+/// Ranks one *set* channel by the measurement that put each member in it.
+///
+/// [`add_ranked_channel`] hands the order to its caller, which is right for the three channels
+/// that have one — `explicit` is a caller-supplied list, `graph` a traversal order, `bm25` a
+/// relevance ranking. The five channels here have no order of their own: they are built by
+/// walking `targets`, which is a `BTreeMap` keyed by `ContextRevisionRef`, and both of its ID
+/// fields are `Uuid::new_v4`. Their iteration order is therefore sixteen random bytes, and
+/// feeding it to `add_ranked_channel` spent the channel's whole RRF spread on it — measured on
+/// the real installation, the `scope` channel's random swing (about 9,200 with eleven
+/// same-domain revisions) exceeded the full spread of `bm25`, the one channel whose order means
+/// something (about 3,400 over eight hits).
+///
+/// So each member arrives with the number that qualified it — statement similarity for
+/// `canonical`/`statement`, shared identifier count for `identifier`, overlapping domain count
+/// for `scope` — and equal measurements share one rank. Sharing is the honest half: two targets
+/// the channel cannot tell apart must not be separated by their IDs, and `topic` (a yes-or-no
+/// match with nothing behind it to grade) measures every member identically and so ranks them
+/// all first. The one remaining arbitrary choice, which of two equally scored targets is listed
+/// first, stays where it already was: the `left.0.cmp(&right.0)` tie-break on the final ranking.
+fn add_measured_channel(
+    targets: &mut BTreeMap<ContextRevisionRef, TargetState>,
+    channel: &'static str,
+    mut values: Vec<(u64, ContextRevisionRef)>,
+) {
+    values.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let mut seen = BTreeSet::new();
+    let mut rank = 0;
+    let mut previous = None;
+    for (measurement, target) in values
+        .into_iter()
+        .filter(|(_, target)| seen.insert(*target))
+    {
+        if previous != Some(measurement) {
+            rank += 1;
+            previous = Some(measurement);
+        }
+        if let Some(state) = targets.get_mut(&target) {
+            state.channels.entry(channel).or_insert(rank);
         }
     }
 }
@@ -1674,6 +1718,37 @@ mod tests {
         add_explicit_channel(&[ids[2], ids[0], ids[2], ids[1]], &mut targets);
         for (rank, id) in ids.iter().enumerate() {
             assert_eq!(targets[id].channels["explicit"], rank + 1);
+        }
+    }
+
+    #[test]
+    fn a_measured_channel_ranks_by_its_measurement_and_never_by_context_id() {
+        let mut targets = BTreeMap::from([ranked_target(), ranked_target(), ranked_target()]);
+        let ids = targets.keys().copied().collect::<Vec<_>>();
+        // Adversarial ID order: the weakest measurement carries the lowest `ContextRevisionRef`,
+        // which is the position the `BTreeMap` walk used to hand it.
+        add_measured_channel(
+            &mut targets,
+            "scope",
+            vec![(1, ids[0]), (3, ids[1]), (3, ids[2])],
+        );
+        assert_eq!(targets[&ids[1]].channels["scope"], 1);
+        assert_eq!(
+            targets[&ids[2]].channels["scope"], 1,
+            "two targets the channel measured identically share one rank"
+        );
+        assert_eq!(targets[&ids[0]].channels["scope"], 2);
+
+        // A channel with nothing to grade measures every member identically, so every member
+        // ranks first and the channel contributes its weight without ordering anything. This is
+        // the `topic` channel's shape.
+        add_measured_channel(
+            &mut targets,
+            "topic",
+            vec![(0, ids[2]), (0, ids[0]), (0, ids[1])],
+        );
+        for id in &ids {
+            assert_eq!(targets[id].channels["topic"], 1);
         }
     }
 

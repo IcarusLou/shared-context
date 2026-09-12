@@ -2085,3 +2085,88 @@ fn one_context_contributes_one_target_whatever_shape_its_revision_dag_has() {
         "only the revision governance accepted is assessed"
     );
 }
+
+/// The five set channels have no order of their own, so they must not be given a random one.
+///
+/// `canonical`, `statement`, `topic`, `scope` and `identifier` are built by walking the target
+/// map, which is keyed by two `Uuid::new_v4` values. Handing that walk to the ranking function
+/// spent each channel's whole RRF spread on sixteen random bytes — measured on the real
+/// installation, `scope`'s random swing exceeded the full spread of `bm25`, the one channel whose
+/// order means something. Here the weaker overlap deliberately carries the lower Context ID.
+#[test]
+fn a_set_channels_rank_follows_its_measurement_and_never_the_context_id() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("scope rank analysis root");
+    let store = GitStore::bootstrap_local(&root).unwrap();
+    let (space_id, _) = add_space(&store, "Scope Ranking", "scoperanking");
+    let mut narrow_content = draft(
+        None,
+        "scope overlap lane alpha only",
+        "One shared applicability domain",
+        "alpha",
+    );
+    narrow_content.applicability.domains = vec!["alpha".to_owned()];
+    let narrow = add_context_with_id(
+        &store,
+        space_id,
+        narrow_content,
+        "ctx_00000000-0000-4000-8000-000000000001",
+    );
+    let mut wide_content = draft(
+        None,
+        "scope overlap lanes alpha beta gamma",
+        "Three shared applicability domains",
+        "alpha",
+    );
+    wide_content.applicability.domains =
+        vec!["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()];
+    let wide = add_context_with_id(
+        &store,
+        space_id,
+        wide_content,
+        "ctx_ffffffff-ffff-4fff-bfff-ffffffffffff",
+    );
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+
+    let mut claim = draft(
+        None,
+        "budget ceiling ordering probe",
+        "Nothing lexical connects this claim to either target",
+        "alpha",
+    );
+    claim.applicability.domains = vec!["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()];
+    let candidate = candidate(claim);
+    let result = SearchEngine::new(index)
+        .analyze_candidate(&CandidateAnalysisRequest {
+            has_blocking_unknowns: false,
+            source_task_id: candidate.source_episode.task_id,
+            source_intent_revision_id: TaskIntentRevisionId::new(),
+            source_working_intent: source_intent(candidate.source_episode.task_id),
+            source_task_signals: Vec::new(),
+            candidate,
+            explicit_related_contexts: Vec::new(),
+            artifact_refs: Vec::new(),
+            proposed_space_group_space_id: None,
+            token_budget: 8_000,
+            top_k: 8,
+        })
+        .unwrap();
+    assert_eq!(result.analysis.assessments.len(), 2);
+    for assessment in &result.analysis.assessments {
+        assert!(
+            assessment
+                .paths
+                .iter()
+                .all(|path| matches!(path, CandidateAssessmentPath::ScopeOverlap { .. })),
+            "only the scope channel may affect this fixture's rank: {:?}",
+            assessment.paths
+        );
+    }
+    assert_eq!(
+        result.analysis.assessments[0].target,
+        Some(wide),
+        "three overlapping domains outrank one, although this target holds the highest Context ID"
+    );
+    assert_eq!(result.analysis.assessments[1].target, Some(narrow));
+}
