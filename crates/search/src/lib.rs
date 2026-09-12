@@ -4912,6 +4912,13 @@ const AUTOMATIC_RELEVANCE_FLOOR_BASIS_POINTS: u16 = 227;
 /// reader. The second copy of a constant is absorbed by [`PACK_WIRE_TOKEN_CEILING`]'s margin, which
 /// is where a fixed overhead belongs; what had to become honest is the part that scales with the
 /// Pack, and that is [`serialized_tokens`].
+///
+/// A fixed reserve can only absorb a fixed overhead, which is why the MCP response shape must not
+/// carry any payload that scales with the Pack and is not in the charged tuple. It did carry one:
+/// a top-level flattened copy of every item's `retrieval_paths`, byte-for-byte identical to what
+/// the items already held, measured at 24.7% of one real Pack's wire and charged to nobody. It
+/// was removed rather than added to the tuple, because charging a duplicate would have made the
+/// number honest about a payload that should not exist.
 const TASK_CONTEXT_ENVELOPE_TOKEN_RESERVE: usize = 128;
 
 #[allow(clippy::too_many_lines)]

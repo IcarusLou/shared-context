@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -733,12 +733,17 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
     }));
 
     let association_spaces = response_spaces(&many);
-    let flattened = many
-        .retrieval_paths
+    // One entry per (Space, Context): the Pack never lists one Context twice under one Space, so
+    // an item is addressable by that pair. This used to be asserted against a flattened top-level
+    // copy of every item's `retrieval_paths`; the copy was byte-for-byte identical to what the
+    // items already carry, cost a quarter of the wire and had no consumer, so it is gone and the
+    // property is asserted where it lives.
+    let addressed = many
+        .items
         .iter()
-        .map(|entry| ((entry.association_space_id, entry.context_id), &entry.paths))
-        .collect::<BTreeMap<_, _>>();
-    assert_eq!(flattened.len(), many.items.len());
+        .map(|item| (item.association_space_id, item.context.context_id))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(addressed.len(), many.items.len());
     for item in &many.items {
         assert_eq!(item.association_space_id, item.context.space_id);
         assert!(association_spaces.contains(&item.association_space_id));
@@ -747,10 +752,6 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
         assert!(!item.context.evidence.is_empty());
         assert!(item.context.conflicts.is_empty());
         assert!(!item.retrieval_paths.is_empty());
-        assert_eq!(
-            flattened[&(item.association_space_id, item.context.context_id)],
-            &item.retrieval_paths
-        );
         item.retrieval_paths.iter().for_each(assert_typed_m2_path);
     }
     assert!(
@@ -774,7 +775,6 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
     assert_eq!(repeated.generation, many.generation);
     assert_eq!(repeated.candidate_spaces, many.candidate_spaces);
     assert_eq!(repeated.items, many.items);
-    assert_eq!(repeated.retrieval_paths, many.retrieval_paths);
 
     // Every hazard Context is recorded against a file, and the Session opens all of them. This is
     // a stronger statement than the relevance-floor ranking it replaces: the four hazard Spaces are

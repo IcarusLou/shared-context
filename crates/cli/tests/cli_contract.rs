@@ -2066,7 +2066,7 @@ fn task_context_cli_entry_is_locator_only_and_read_only() {
     assert!(first["data"]["task_id"].as_str().is_some());
     assert!(first["data"]["candidate_spaces"].as_array().is_some());
     assert!(first["data"]["candidate_spaces"].as_array().unwrap().len() <= 1);
-    assert!(first["data"]["retrieval_paths"].as_array().is_some());
+    assert!(first["data"]["items"].as_array().is_some());
     assert_eq!(
         first["data"]["task_session_id"],
         changed["data"]["task_session_id"]
@@ -2162,7 +2162,11 @@ fn task_context_and_candidate_list_cli_entries_support_compact_detail_level() {
         session,
     ]);
     assert_eq!(full_context["data"]["detail_level"], "full");
-    assert!(full_context["data"]["retrieval_paths"].is_array());
+    // Neither shape carries a top-level `retrieval_paths` any more: it was a flattened duplicate
+    // of what every item already holds. The explainable shape is still the one with `items`
+    // carrying their own paths.
+    assert!(full_context["data"].get("retrieval_paths").is_none());
+    assert!(full_context["data"]["items"].is_array());
     assert!(full_context["data"]["candidate_spaces"].is_array());
 
     let compact_context = harness.success(&[
@@ -2175,7 +2179,6 @@ fn task_context_and_candidate_list_cli_entries_support_compact_detail_level() {
         "--compact",
     ]);
     assert_eq!(compact_context["data"]["detail_level"], "compact");
-    assert!(compact_context["data"]["retrieval_paths"].is_null());
     assert!(compact_context["data"]["candidate_spaces"].is_array());
     assert!(compact_context["data"]["items"].is_array());
     assert_eq!(

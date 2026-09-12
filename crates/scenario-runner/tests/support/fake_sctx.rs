@@ -252,10 +252,11 @@ fn serve_mcp(_client: &str) {
                 }
                 if name == "task_artifact_focus" {
                     // A Focus anchors the file its coordinate lives in; it does not consult the
-                    // Engineering Graph (ADR-0007).
+                    // Engineering Graph (ADR-0007). The path rides on the item it explains,
+                    // because that is the only place the real response carries one.
                     data.insert(
-                        "retrieval_paths".to_owned(),
-                        json!([{"source": "file_anchor"}]),
+                        "items".to_owned(),
+                        json!([{"retrieval_paths": [{"source": "file_anchor"}]}]),
                     );
                 }
                 if name == "task_context"
@@ -265,8 +266,8 @@ fn serve_mcp(_client: &str) {
                     // it produces is `file_anchor` (ADR-0007). The scenario invariant still asks
                     // the same question: the Hint reached knowledge, and no Graph path came with it.
                     data.insert(
-                        "retrieval_paths".to_owned(),
-                        json!([{"source": "file_anchor"}]),
+                        "items".to_owned(),
+                        json!([{"retrieval_paths": [{"source": "file_anchor"}]}]),
                     );
                 }
                 json!({

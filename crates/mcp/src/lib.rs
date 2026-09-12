@@ -69,7 +69,7 @@ use sctx_search::{
     MAX_CANDIDATE_ANALYSIS_TOKEN_BUDGET, MAX_CANDIDATE_ANALYSIS_TOP_K, MAX_TASK_MAX_SPACES,
     MIN_CANDIDATE_ANALYSIS_TOKEN_BUDGET, MIN_TASK_CONTEXT_TOKEN_BUDGET, ScopeFilter, SearchEngine,
     SearchFilters, SearchMatchMode, SearchRequest, SemanticChannelHandle, TaskContextItem,
-    TaskContextRequest, TaskGraphDiagnostic, TaskRetrievalPath, UsagePriorSource,
+    TaskContextRequest, TaskGraphDiagnostic, UsagePriorSource,
 };
 use sctx_task_runtime::{
     AgentCheckpointSubmission, CandidateBuildDuplicatePreparation, CandidateBuildItemPreparation,
@@ -1066,14 +1066,6 @@ impl ArtifactFocusQuery {
     }
 }
 
-/// Flattened explanation index for one returned Task Context item.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TaskContextRetrievalPaths {
-    pub association_space_id: SpaceId,
-    pub context_id: ContextId,
-    pub paths: Vec<TaskRetrievalPath>,
-}
-
 /// Session-aware Task Context result shared by MCP and the CLI test entry.
 ///
 /// The Rust entry points always build the explainable [`ContextPackDetailLevel::Full`] shape.
@@ -1093,7 +1085,6 @@ pub struct TaskContextResponse {
     /// Compact projection of the same budgeted selection; empty under `full`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compact_items: Vec<CompactTaskContextItem>,
-    pub retrieval_paths: Vec<TaskContextRetrievalPaths>,
     pub graph_diagnostics: Vec<TaskGraphDiagnostic>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_token_explanation: Option<AutomaticQueryTokenExplanation>,
@@ -6314,15 +6305,6 @@ fn build_task_context_response(
             tasks: tasks.clone(),
         }))
         .task_context_pack_with_detail(&request, detail_level)?;
-    let retrieval_paths = pack
-        .items
-        .iter()
-        .map(|item| TaskContextRetrievalPaths {
-            association_space_id: item.association_space_id,
-            context_id: item.context.context_id,
-            paths: item.retrieval_paths.clone(),
-        })
-        .collect::<Vec<_>>();
     let response = TaskContextResponse {
         task_session_id: snapshot.task_session_id,
         task_id: snapshot.task_id,
@@ -6332,7 +6314,6 @@ fn build_task_context_response(
         compact_candidate_spaces: pack.compact_associations,
         items: pack.items,
         compact_items: pack.compact_items,
-        retrieval_paths,
         graph_diagnostics: pack.graph_diagnostics,
         query_token_explanation: pack.query_token_explanation,
         task_fingerprint: pack.task_fingerprint,

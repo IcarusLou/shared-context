@@ -5879,7 +5879,6 @@ fn retrieval_tools_default_to_compact_and_expose_full_on_request() {
     let compact = &responses[1]["result"]["structuredContent"];
     assert_eq!(compact["detail_level"], "compact");
     for absent in [
-        "retrieval_paths",
         "compact_items",
         "artifact_generation",
         "graph_context_tree_oid",
@@ -5907,7 +5906,13 @@ fn retrieval_tools_default_to_compact_and_expose_full_on_request() {
 
     let full = &responses[2]["result"]["structuredContent"];
     assert_eq!(full["detail_level"], "full");
-    assert!(full["retrieval_paths"].as_array().is_some());
+    // Neither shape carries a top-level `retrieval_paths`. The full shape used to carry one: a
+    // flattened, byte-for-byte copy of what every item already holds, a quarter of the wire on
+    // the measured Pack, charged to nobody and read by nobody.
+    assert!(
+        full.get("retrieval_paths").is_none(),
+        "the explanation lives on the item it explains: {full:#}"
+    );
     assert!(
         full.get("query_token_explanation").is_none(),
         "neither shape explains a token selection any more, because neither makes one"
@@ -5925,7 +5930,6 @@ fn retrieval_tools_default_to_compact_and_expose_full_on_request() {
     assert_eq!(updated["detail_level"], "compact");
     assert!(updated["revision_status"].is_string());
     assert!(updated["active_signals"].as_array().is_some());
-    assert!(updated.get("retrieval_paths").is_none());
 
     let exact = &responses[5]["result"]["structuredContent"];
     assert_eq!(exact["match_mode"], "exact");
@@ -6684,7 +6688,7 @@ fn signal_supersede_is_cas_guarded_and_removed_from_paths_but_retained_in_histor
         ),
     )
     .unwrap();
-    let encoded_paths = serde_json::to_string(&after.context.retrieval_paths).unwrap();
+    let encoded_paths = serde_json::to_string(&after.context.items).unwrap();
     assert!(!encoded_paths.contains("MCP Contract"));
 }
 

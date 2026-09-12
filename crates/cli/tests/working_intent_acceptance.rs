@@ -193,13 +193,30 @@ fn fixed_working_intent_cross_layer_oracle() {
     assert!(
         changed
             .context
-            .retrieval_paths
+            .items
             .iter()
-            .flat_map(|item| &item.paths)
+            .flat_map(|item| &item.retrieval_paths)
             .all(|path| matches!(path, sctx_search::TaskRetrievalPath::FileAnchor { .. })),
         "a hint reaches knowledge by naming a file, and by nothing else: {:#?}",
-        changed.context.retrieval_paths
+        changed
+            .context
+            .items
+            .iter()
+            .map(|item| &item.retrieval_paths)
+            .collect::<Vec<_>>()
     );
+    // Each explanation reaches the host once. The full shape used to carry a second, flattened
+    // copy of every item's paths at the top level -- byte-for-byte identical, 24.7% of one
+    // measured Pack's wire, charged by nothing and read by nobody.
+    let body = serde_json::to_string(&changed).unwrap();
+    for item in &changed.context.items {
+        let encoded = serde_json::to_string(&item.retrieval_paths).unwrap();
+        assert_eq!(
+            body.matches(encoded.as_str()).count(),
+            1,
+            "one explanation, one copy on the wire: {encoded}"
+        );
+    }
 
     let mut equivalent = hinted.clone();
     equivalent.goal = "  IMPLEMENT   search ".to_owned();
