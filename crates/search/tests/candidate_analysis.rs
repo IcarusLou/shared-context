@@ -3,12 +3,12 @@ use std::{fs, process::Command, sync::Arc};
 use sctx_domain::{
     Applicability, ArtifactKey, ArtifactKind, ArtifactLocator, ArtifactRef,
     CandidateAssessmentPath, CandidateAssessmentRelation, CandidateSpaceRecommendation,
-    ContextCandidate, ContextKind, ContextRelation, ContextRelationKind, ContextRevisionDraft,
-    ContextRevisionRef, EngineeringArtifact, EngineeringReference, EvidenceSnapshotDraft,
-    EvidenceType, IntentSnapshot, PublicationAction, PublicationDraft, RecommendedSpaceRole,
-    ReferenceId, ReferenceRelation, RepoRelativePath, RepositoryId, RepositoryIdentity, RevisionId,
-    SpaceId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId, WorkEpisodeId,
-    WorkEpisodeRef, WorkingIntentSnapshot,
+    ContextCandidate, ContextId, ContextKind, ContextRelation, ContextRelationKind,
+    ContextRevisionDraft, ContextRevisionRef, EngineeringArtifact, EngineeringReference,
+    EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, PublicationAction, PublicationDraft,
+    PublicationId, RecommendedSpaceRole, ReferenceId, ReferenceRelation, RepoRelativePath,
+    RepositoryId, RepositoryIdentity, RevisionId, SpaceId, SubmissionId, TaskId,
+    TaskIntentRevisionId, TaskSessionId, WorkEpisodeId, WorkEpisodeRef, WorkingIntentSnapshot,
 };
 use sctx_engineering_graph::{
     ArtifactObservation, ArtifactSourceState, EngineeringProjectionStore,
@@ -1791,5 +1791,297 @@ fn shared_identifiers_across_kinds_stay_unresolved_but_name_the_shared_code() {
             && reason.contains("searchpoientranceassem")),
         "{:?}",
         assessment.reasons
+    );
+}
+
+/// Two accepted Contexts, the second retiring the first with a `Supersedes` Relation.
+///
+/// Both spell out the same three repository identifiers, so both would qualify for the strong
+/// identifier channel on wording alone. Only the successor may have it.
+struct SupersessionFixture {
+    _temporary: TempDir,
+    index: ProjectionIndex,
+    retired: ContextRevisionRef,
+    successor: ContextRevisionRef,
+}
+
+fn supersession_fixture() -> SupersessionFixture {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("supersession analysis root");
+    let store = GitStore::bootstrap_local(&root).unwrap();
+    let (space_id, _) = add_space(&store, "直播标签链路", "livetagchain");
+    let retired = add_context(
+        &store,
+        space_id,
+        identifier_draft(
+            ContextKind::Issue,
+            "supersession/retired",
+            "搜索直播标签由 SearchLiveStruct 的 ProgrammedLiveShowTag 字段决定，\
+             LiveTagResolver 仅读取该字段。",
+            "旧链路把展示判断放在结构体字段上。",
+            "livetag-domain",
+        ),
+    );
+    let mut successor_content = identifier_draft(
+        ContextKind::Issue,
+        "supersession/successor",
+        "搜索直播标签现由 LiveTagResolver 统一解析，SearchLiveStruct 的 \
+         ProgrammedLiveShowTag 字段只作为输入。",
+        "解析集中到一处之后字段本身不再决定展示。",
+        "livetag-domain",
+    );
+    successor_content.relations = vec![ContextRelation {
+        target_context_id: retired.context_id,
+        kind: ContextRelationKind::Supersedes,
+        rationale: "解析集中到 LiveTagResolver 之后，字段口径的结论不再成立。".to_owned(),
+        supports: vec!["上线后展示与字段值脱钩。".to_owned()],
+    }];
+    let successor = add_context(&store, space_id, successor_content);
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    SupersessionFixture {
+        _temporary: temporary,
+        index,
+        retired,
+        successor,
+    }
+}
+
+/// The safety verdict Candidate review draws must mean what the Pack's means.
+///
+/// `superseded_by` is derived in the index, never in Git, so the reduced domain projection cannot
+/// carry it. Candidate analysis used to read only the projection and reached the index-derived
+/// value through one late correction on the BM25 channel — which a retired Context only receives
+/// if it happens to land on the single-token FTS page. The strong identifier channel draws its
+/// line before that, so a retired Context could be promoted as a factual peer of the Claim while
+/// the very same installation refused to inject it.
+#[test]
+fn a_superseded_target_loses_the_identifier_channel_and_names_the_context_that_replaced_it() {
+    let fixture = supersession_fixture();
+    let claim = identifier_draft(
+        ContextKind::Issue,
+        "claim/livetag",
+        "The live tag in search is resolved by LiveTagResolver instead of the \
+         ProgrammedLiveShowTag field on SearchLiveStruct.",
+        "Resolution moved out of the struct field.",
+        "livetag-domain",
+    );
+    let candidate = candidate(claim);
+    let result = SearchEngine::new(fixture.index.clone())
+        .analyze_candidate(&CandidateAnalysisRequest {
+            has_blocking_unknowns: false,
+            source_task_id: candidate.source_episode.task_id,
+            source_intent_revision_id: TaskIntentRevisionId::new(),
+            source_working_intent: source_intent(candidate.source_episode.task_id),
+            source_task_signals: Vec::new(),
+            candidate,
+            explicit_related_contexts: Vec::new(),
+            artifact_refs: Vec::new(),
+            proposed_space_group_space_id: None,
+            token_budget: 8_000,
+            top_k: 8,
+        })
+        .unwrap();
+
+    // The channel itself still works: the successor holds the identifiers and the strong path.
+    let successor = assessment_for(&result, fixture.successor);
+    assert_eq!(
+        shared_identifiers(successor),
+        vec![
+            "livetagresolver".to_owned(),
+            "programmedliveshowtag".to_owned(),
+            "searchlivestruct".to_owned(),
+        ]
+    );
+    assert_eq!(successor.relation, CandidateAssessmentRelation::Supports);
+    assert!(
+        !successor
+            .paths
+            .iter()
+            .any(|path| matches!(path, CandidateAssessmentPath::SafetyDiagnostic { .. })),
+        "the surviving Context is safe: {:?}",
+        successor.paths
+    );
+
+    // The retired Context is still retrieved and still explained, and holds no strong path.
+    let retired = assessment_for(&result, fixture.retired);
+    assert!(
+        shared_identifiers(retired).is_empty(),
+        "a retired Context never enters the strong identifier channel: {:?}",
+        retired.paths
+    );
+    assert_eq!(
+        retired.relation,
+        CandidateAssessmentRelation::UnresolvedRelated
+    );
+    let reason = retired
+        .paths
+        .iter()
+        .find_map(|path| match path {
+            CandidateAssessmentPath::SafetyDiagnostic { reason } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("a retired target carries a safety diagnostic");
+    assert!(
+        reason.contains("superseded by")
+            && reason.contains(&fixture.successor.context_id.to_string()),
+        "the diagnostic names the Context that replaced it: {reason}"
+    );
+    assert_ne!(
+        result.candidate_status,
+        sctx_domain::AutomaticCandidateStatus::ExactDuplicateReview,
+        "nothing may be a duplicate of a conclusion the knowledge base retired"
+    );
+}
+
+fn publish(
+    store: &GitStore,
+    space_id: SpaceId,
+    context_id: ContextId,
+    revision_id: RevisionId,
+    previous_publication_ids: Vec<PublicationId>,
+) -> PublicationId {
+    let event = Event::publication_changed(
+        space_id,
+        context_id,
+        PublicationDraft {
+            previous_publication_ids,
+            action: PublicationAction::Publish,
+            revision_id,
+            review_event_ids: Vec::new(),
+        },
+        None,
+    )
+    .unwrap();
+    let EventPayload::ContextPublicationChanged { publication, .. } = event.payload() else {
+        unreachable!()
+    };
+    let publication_id = publication.publication_id;
+    append(store, event);
+    publication_id
+}
+
+fn revise(
+    store: &GitStore,
+    space_id: SpaceId,
+    context_id: ContextId,
+    parents: Vec<RevisionId>,
+    content: ContextRevisionDraft,
+) -> RevisionId {
+    let event = Event::context_revised(space_id, context_id, parents, content, None).unwrap();
+    let EventPayload::ContextRevisionAdded { revision, .. } = event.payload() else {
+        unreachable!()
+    };
+    let revision_id = revision.revision_id;
+    append(store, event);
+    revision_id
+}
+
+/// One Context is one retrieval target, whatever shape its revision DAG has taken.
+///
+/// Every node of the DAG used to become its own target, so a Context competed with its own
+/// history for the `top_k` slots and a reviewer saw the same conclusion twice — observed on the
+/// real installation as `ctx_68b87734` entering as both its accepted revision and a superseded
+/// one. Governance, not the DAG head, names the revision the knowledge base holds: an unpublished
+/// newer draft is a head too, and letting it displace the accepted revision would hide the
+/// accepted fact from duplicate review entirely.
+#[test]
+fn one_context_contributes_one_target_whatever_shape_its_revision_dag_has() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("revision dag analysis root");
+    let store = GitStore::bootstrap_local(&root).unwrap();
+    let (space_id, _) = add_space(&store, "Revision DAG", "revisiondag");
+    let event = Event::context_revision_added(
+        space_id,
+        draft(
+            None,
+            "The first accepted wording of one conclusion",
+            "First rationale",
+            "dag-domain",
+        ),
+        None,
+    )
+    .unwrap();
+    let EventPayload::ContextRevisionAdded {
+        context_id,
+        revision,
+        ..
+    } = event.payload()
+    else {
+        unreachable!()
+    };
+    let context_id = *context_id;
+    let first_revision = revision.revision_id;
+    append(&store, event);
+    let first_publication = publish(&store, space_id, context_id, first_revision, Vec::new());
+    let accepted = revise(
+        &store,
+        space_id,
+        context_id,
+        vec![first_revision],
+        draft(
+            None,
+            "The accepted wording of one conclusion",
+            "Accepted rationale",
+            "dag-domain",
+        ),
+    );
+    publish(
+        &store,
+        space_id,
+        context_id,
+        accepted,
+        vec![first_publication],
+    );
+    // An unpublished draft revision: a DAG head that governance has not accepted.
+    revise(
+        &store,
+        space_id,
+        context_id,
+        vec![accepted],
+        draft(
+            None,
+            "An unpublished later wording of one conclusion",
+            "Draft rationale",
+            "dag-domain",
+        ),
+    );
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+
+    let candidate = candidate(draft(
+        None,
+        "An independent claim about the same domain",
+        "Independent rationale",
+        "dag-domain",
+    ));
+    let result = SearchEngine::new(index)
+        .analyze_candidate(&CandidateAnalysisRequest {
+            has_blocking_unknowns: false,
+            source_task_id: candidate.source_episode.task_id,
+            source_intent_revision_id: TaskIntentRevisionId::new(),
+            source_working_intent: source_intent(candidate.source_episode.task_id),
+            source_task_signals: Vec::new(),
+            candidate,
+            explicit_related_contexts: Vec::new(),
+            artifact_refs: Vec::new(),
+            proposed_space_group_space_id: None,
+            token_budget: 8_000,
+            top_k: 8,
+        })
+        .unwrap();
+    let targets = result
+        .analysis
+        .assessments
+        .iter()
+        .filter_map(|assessment| assessment.target)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        targets,
+        vec![ContextRevisionRef {
+            context_id,
+            revision_id: accepted,
+        }],
+        "only the revision governance accepted is assessed"
     );
 }

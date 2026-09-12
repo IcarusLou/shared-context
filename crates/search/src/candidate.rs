@@ -4,17 +4,17 @@ use sctx_domain::{
     Applicability, ArtifactKey, ArtifactRef, AutomaticCandidateStatus, CandidateAnalysis,
     CandidateAnalysisStatus, CandidateAssessmentPath, CandidateAssessmentRelation,
     CandidateConfidence, CandidateRelationAssessment, CandidateSpaceRecommendation,
-    CandidateSpaceRecommendationPath, ContextCandidate, ContextRevision, ContextRevisionDraft,
-    ContextRevisionRef, EvidenceSnapshotDraft, IntentSnapshot, ProposedSpaceGroupKey,
-    RecommendedSpaceRole, RevisionLifecycle, SpaceId, TaskId, TaskIntentRevisionId, TaskSignal,
-    TaskSpaceAssociation, WorkingIntentSnapshot, hints,
+    CandidateSpaceRecommendationPath, ContextCandidate, ContextId, ContextRevision,
+    ContextRevisionDraft, ContextRevisionRef, EvidenceSnapshotDraft, IntentSnapshot,
+    ProposedSpaceGroupKey, RecommendedSpaceRole, RevisionId, RevisionLifecycle, SpaceId, TaskId,
+    TaskIntentRevisionId, TaskSignal, TaskSpaceAssociation, WorkingIntentSnapshot, hints,
 };
 use sctx_engineering_graph::EngineeringProjectionSnapshot;
 use sctx_index::{DomainSnapshot, normalize_search_text, search_tokens};
 
 use crate::{
-    ContextStatus, Error, ErrorKind, Result, ScopeFilter, SearchEngine, SearchFilters,
-    SearchRequest,
+    ContextStatus, ContextTtlSettings, Error, ErrorKind, Result, ScopeFilter, SearchEngine,
+    SearchFilters, SearchRequest,
 };
 
 pub const MIN_CANDIDATE_ANALYSIS_TOKEN_BUDGET: usize = 1_024;
@@ -103,11 +103,17 @@ pub struct CandidateAnalysisResult {
 struct TargetState {
     revision: ContextRevision,
     safe: bool,
-    /// True when the target revision is accepted, whatever its automatic-injection eligibility.
+    /// True when the target revision is accepted and the knowledge base still holds it.
     ///
-    /// `safe` narrows further as Graph and Space checks run; duplicate review asks only whether
-    /// the knowledge base already accepted this conclusion.
+    /// Duplicate review asks only whether the conclusion is already accepted, but a retired
+    /// Context is no longer a conclusion this installation holds: confirming a Claim against one
+    /// would send the reviewer to a fact that has a successor.
     accepted: bool,
+    /// Why this target is retired, when the local derivation retired it.
+    ///
+    /// `superseded_by` and the `[context_ttl]` verdict are derived in the index, never in Git (see
+    /// [`ContextRetirement`]), so nothing in the reduced domain projection carries them.
+    retirement_reason: Option<String>,
     space_conflicted: bool,
     channels: BTreeMap<&'static str, usize>,
     paths: Vec<CandidateAssessmentPath>,
@@ -191,7 +197,12 @@ impl SearchEngine {
         let candidate_intent = candidate_working_intent(&request.candidate.content);
         let candidate_spaces =
             self.task_space_associations(request.source_task_id, &candidate_intent, &[])?;
+        let retirements = self.context_retirements()?;
         for (tree, generation) in [
+            (
+                &retirements.metadata.indexed_tree_oid,
+                retirements.metadata.projection_generation,
+            ),
             (&bm25.indexed_tree_oid, bm25.projection_generation),
             (
                 &source_spaces.indexed_tree_oid,
@@ -212,7 +223,7 @@ impl SearchEngine {
             }
         }
 
-        let mut targets = collect_targets(&snapshot);
+        let mut targets = collect_targets(&snapshot, &retirements.data, self.context_ttl);
         add_exact_channels(&request.candidate.content, &mut targets);
         add_identifier_channel(&request.candidate.content, &mut targets);
         add_explicit_channel(&request.explicit_related_contexts, &mut targets);
@@ -283,6 +294,50 @@ impl SearchEngine {
             candidate_status,
         })
     }
+
+    /// Reads the locally derived retirement state of every projected Context.
+    ///
+    /// One statement over `context_item` rather than a per-target lookup: the evaluation set is
+    /// every Context in the projection, and the generation this read saw is checked against the
+    /// snapshot alongside every other retrieval input.
+    fn context_retirements(
+        &self,
+    ) -> Result<sctx_index::QuerySnapshot<BTreeMap<ContextId, ContextRetirement>>> {
+        self.index.query_snapshot(|connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT context_id, superseded_by, accepted_at_unix_seconds
+                     FROM context_item
+                     WHERE superseded_by IS NOT NULL OR accepted_at_unix_seconds IS NOT NULL",
+                )
+                .map_err(crate::sql_error("prepare Context retirement read"))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                })
+                .map_err(crate::sql_error("query Context retirement state"))?;
+            let mut retirements = BTreeMap::new();
+            for row in rows {
+                let (context_id, superseded_by, accepted_at_unix_seconds) =
+                    row.map_err(crate::sql_error("collect Context retirement state"))?;
+                retirements.insert(
+                    crate::parse_id::<ContextId>(&context_id)?,
+                    ContextRetirement {
+                        superseded_by: superseded_by
+                            .as_deref()
+                            .map(crate::parse_id::<ContextId>)
+                            .transpose()?,
+                        accepted_at_unix_seconds,
+                    },
+                );
+            }
+            Ok(retirements)
+        })
+    }
 }
 
 fn validate_request(request: &CandidateAnalysisRequest) -> Result<()> {
@@ -307,17 +362,93 @@ fn validate_request(request: &CandidateAnalysisRequest) -> Result<()> {
     Ok(())
 }
 
-fn collect_targets(snapshot: &DomainSnapshot) -> BTreeMap<ContextRevisionRef, TargetState> {
+/// Locally derived retirement state of one projected Context.
+///
+/// Neither field exists in Git. `superseded_by` is recomputed in the index from the `supersedes`
+/// Relations another *accepted* revision declares (`refresh_superseded_by`), and the
+/// `[context_ttl]` verdict is an evaluation of the operator's policy against the wall clock. The
+/// reduced domain projection therefore cannot carry them: `AutoInjectionEligibility` only knows
+/// the three Git-side blockers (not accepted, governance conflict, unresolved semantic conflict),
+/// and `RevisionLifecycle::Superseded` means "an older revision of this same Context", which is a
+/// different question from "another Context retired this one".
+///
+/// Retrieval elsewhere folds both into the same bit through
+/// [`ContextDerivedState::blocks_automatic_injection`](crate::ContextDerivedState::blocks_automatic_injection);
+/// Candidate analysis reads them here so its safety verdict means the same thing as the Pack's.
+#[derive(Clone, Copy, Debug, Default)]
+struct ContextRetirement {
+    superseded_by: Option<ContextId>,
+    accepted_at_unix_seconds: Option<i64>,
+}
+
+impl ContextRetirement {
+    /// Why automatic factual promotion must refuse this Context, or `None` when nothing retired it.
+    fn reason(
+        &self,
+        kind: sctx_domain::ContextKind,
+        context_ttl: ContextTtlSettings,
+    ) -> Option<String> {
+        if let Some(successor) = self.superseded_by {
+            return Some(format!(
+                "Target Context is superseded by {successor}; its conclusion has a successor"
+            ));
+        }
+        context_ttl.historical_reason(kind, self.accepted_at_unix_seconds)
+    }
+}
+
+/// The revisions of one Context that Candidate review may be shown, which is normally exactly one.
+///
+/// A Context is a revision DAG, and every node of it used to become its own retrieval target. So
+/// one Context competed with its own history for the `top_k` slots and a reviewer was shown the
+/// same conclusion twice — observed on the real installation, where `ctx_68b87734` entered the
+/// evaluation set as both its accepted revision and a superseded one, and only the superseded copy
+/// carried the safety diagnostic that explained the difference.
+///
+/// Governance names the revision the knowledge base holds, so that is the one revision to assess;
+/// it is also the revision `SAFE_ACCEPTED_CONTEXT_PREDICATE` joins on everywhere else. Reading the
+/// DAG heads instead would answer a different question — an unpublished newer draft is a head, and
+/// letting it displace the accepted revision would hide the accepted fact from duplicate review.
+/// The DAG heads are the fallback for the two states where governance names nothing: a Context
+/// that was never published, and one whose publication heads conflict (never safe either way).
+fn current_revision_ids(context: &sctx_domain::ContextProjection) -> BTreeSet<RevisionId> {
+    match context.governance {
+        sctx_domain::ContextGovernanceStatus::Accepted { revision_id, .. }
+        | sctx_domain::ContextGovernanceStatus::Deprecated { revision_id, .. } => {
+            BTreeSet::from([revision_id])
+        }
+        sctx_domain::ContextGovernanceStatus::Unpublished
+        | sctx_domain::ContextGovernanceStatus::GovernanceConflict { .. } => {
+            context.revision_heads.clone()
+        }
+    }
+}
+
+fn collect_targets(
+    snapshot: &DomainSnapshot,
+    retirements: &BTreeMap<ContextId, ContextRetirement>,
+    context_ttl: ContextTtlSettings,
+) -> BTreeMap<ContextRevisionRef, TargetState> {
     snapshot
         .projection
         .spaces
         .values()
         .flat_map(|space| {
             space.contexts.values().flat_map(move |context| {
+                let retirement = retirements
+                    .get(&context.context_id)
+                    .copied()
+                    .unwrap_or_default();
+                let current = current_revision_ids(context);
                 context
                     .revisions
                     .iter()
+                    .filter(move |(revision_id, _)| current.contains(*revision_id))
                     .map(move |(revision_id, revision)| {
+                        let retirement_reason =
+                            retirement.reason(revision.revision.kind, context_ttl);
+                        let accepted = revision.lifecycle == RevisionLifecycle::Accepted
+                            && retirement_reason.is_none();
                         (
                             ContextRevisionRef {
                                 context_id: context.context_id,
@@ -325,9 +456,9 @@ fn collect_targets(snapshot: &DomainSnapshot) -> BTreeMap<ContextRevisionRef, Ta
                             },
                             TargetState {
                                 revision: revision.revision.clone(),
-                                safe: revision.lifecycle == RevisionLifecycle::Accepted
-                                    && context.auto_injection.eligible,
-                                accepted: revision.lifecycle == RevisionLifecycle::Accepted,
+                                safe: accepted && context.auto_injection.eligible,
+                                accepted,
+                                retirement_reason,
                                 space_conflicted: space.intent.heads.len() > 1,
                                 channels: BTreeMap::new(),
                                 paths: Vec::new(),
@@ -562,9 +693,11 @@ fn add_graph_channel(
                             CandidateAssessmentPath::ContextRelationHop { relation, depth },
                         );
                     }
-                    if let Some(graph_context) = graph_contexts.get(&target) {
-                        state.safe |= graph_context.safety.automatic_injection_eligible;
-                    }
+                    // The Graph snapshot's own eligibility bit is deliberately *not* merged in
+                    // here. It maps the same three Git-side blockers the domain projection
+                    // already gave [`collect_targets`] and is blind to supersession and the
+                    // `[context_ttl]` verdict, so merging it with `|=` could only raise a
+                    // verdict the authoritative read had lowered.
                 }
                 if depth < 2
                     && let Some(context) = graph_contexts.get(&target)
@@ -607,7 +740,12 @@ fn add_bm25_channel(
                     },
                 );
             }
-            state.safe &= result.auto_injection_eligible;
+            // `result.auto_injection_eligible` is deliberately not merged in. It used to be the
+            // only place the index-derived retirement state reached the safety bit, which left
+            // `safe` meaning two different things inside one ranked list: "Git-side and not
+            // retired" for the targets that happened to land on the single-token FTS page, and
+            // "Git-side only" for every other target. [`collect_targets`] now computes the
+            // authoritative value for all of them, before any channel draws a line.
         }
     }
     add_ranked_channel(targets, "bm25", ranked);
@@ -813,7 +951,9 @@ fn assess_target(
         format!("Path: retrieval proximity only, statement similarity {similarity} basis points")
     };
     if !state.safe {
-        let reason = if state.space_conflicted {
+        let reason = if let Some(retirement_reason) = state.retirement_reason.clone() {
+            retirement_reason
+        } else if state.space_conflicted {
             "Target Space Intent is conflicted; no winner was selected".to_owned()
         } else {
             "Target Context is not safe for automatic factual promotion".to_owned()
@@ -1505,6 +1645,7 @@ mod tests {
                 revision,
                 safe: true,
                 accepted: true,
+                retirement_reason: None,
                 space_conflicted: false,
                 channels: BTreeMap::new(),
                 paths: Vec::new(),
