@@ -30,7 +30,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, OnceLock, RwLock,
+        Arc, Condvar, Mutex, OnceLock, RwLock,
         mpsc::{RecvTimeoutError, sync_channel},
     },
     time::{Duration, Instant, UNIX_EPOCH},
@@ -1754,6 +1754,22 @@ pub fn load_onnx_provider(
 #[derive(Clone, Default)]
 pub struct SemanticChannelHandle {
     inner: Arc<RwLock<Option<Arc<dyn SemanticChannel>>>>,
+    backfill: Arc<BackfillRequests>,
+}
+
+/// Most revisions this queue will name before it stops recording names.
+///
+/// The queue is a wake-up call, not a work list: whoever answers it recomputes the whole missing
+/// set from the projection, so a name dropped here is still embedded. The bound exists because an
+/// installation whose model failed to load has nobody answering, and an unbounded set of revision
+/// ids would then grow for the life of the process.
+const MAX_PENDING_BACKFILL_REVISIONS: usize = 1_024;
+
+/// Revisions accepted since the corpus was last filled, and a way to wake whoever fills it.
+#[derive(Default)]
+struct BackfillRequests {
+    pending: Mutex<BTreeSet<RevisionId>>,
+    woken: Condvar,
 }
 
 impl SemanticChannelHandle {
@@ -1775,6 +1791,65 @@ impl SemanticChannelHandle {
     #[must_use]
     pub fn is_ready(&self) -> bool {
         self.inner.read().is_ok_and(|slot| slot.is_some())
+    }
+
+    /// Asks for these newly accepted revisions to be embedded, and wakes the filler.
+    ///
+    /// The corpus backfill runs at model-load time, so a Context accepted *during* a `serve`
+    /// process had no vector and no path to one: the loader had already finished its pass. A
+    /// session's own knowledge was therefore invisible to Lane B for the rest of that process --
+    /// measured on a real 21.8-hour Session, where all three Contexts it produced were missing
+    /// from `revision_vector` while every older revision was present.
+    ///
+    /// Advisory in both directions. A handle nobody is filling (no model, or a failed load) only
+    /// accumulates up to [`MAX_PENDING_BACKFILL_REVISIONS`] names, and a caller never learns
+    /// whether the work happened -- writing knowledge must not wait on, or fail because of, a
+    /// discardable cache.
+    pub fn request_backfill(&self, revisions: impl IntoIterator<Item = RevisionId>) {
+        let Ok(mut pending) = self.backfill.pending.lock() else {
+            return;
+        };
+        let mut requested = false;
+        for revision_id in revisions {
+            if pending.len() >= MAX_PENDING_BACKFILL_REVISIONS {
+                break;
+            }
+            requested |= pending.insert(revision_id);
+        }
+        if requested {
+            self.backfill.woken.notify_all();
+        }
+    }
+
+    /// The revisions currently waiting for a vector.
+    #[must_use]
+    pub fn pending_backfill(&self) -> BTreeSet<RevisionId> {
+        self.backfill
+            .pending
+            .lock()
+            .map(|pending| pending.clone())
+            .unwrap_or_default()
+    }
+
+    /// Blocks until at least one revision is waiting, then takes the whole set.
+    ///
+    /// Taking the set before the work rather than after is deliberate: whoever fills the corpus
+    /// recomputes the missing set from the projection anyway, so a revision requested *during* a
+    /// fill must wake the next one rather than being swallowed by the current one.
+    #[must_use]
+    pub fn take_backfill_requests(&self) -> BTreeSet<RevisionId> {
+        let Ok(mut pending) = self.backfill.pending.lock() else {
+            return BTreeSet::new();
+        };
+        loop {
+            if !pending.is_empty() {
+                return std::mem::take(&mut *pending);
+            }
+            let Ok(next) = self.backfill.woken.wait(pending) else {
+                return BTreeSet::new();
+            };
+            pending = next;
+        }
     }
 
     fn channel(&self) -> Option<Arc<dyn SemanticChannel>> {

@@ -1713,9 +1713,20 @@ struct RuntimeOpenParts {
 
 impl Runtime {
     fn open(root: &Path) -> Result<Self> {
+        Self::open_with_semantic(root, None)
+    }
+
+    fn open_with_semantic(root: &Path, semantic: Option<SemanticChannelHandle>) -> Result<Self> {
         let _store = GitStore::open_existing(root)?;
         let catalog = UserConfigStore::open_existing(root)?.repository_catalog_wait()?;
-        Self::open_with_catalog(root, catalog, RuntimeOpenParts::default())
+        Self::open_with_catalog(
+            root,
+            catalog,
+            RuntimeOpenParts {
+                semantic,
+                ..RuntimeOpenParts::default()
+            },
+        )
     }
 
     /// Opens business state against the exact Catalog snapshot that authorized
@@ -3655,6 +3666,18 @@ impl Runtime {
             self.auto_scan_engineering_graph()
         };
         let snapshot = self.snapshot()?;
+        // The revision this Confirmation just accepted has no vector, and until now nothing would
+        // ever have given it one: the corpus backfill runs once, at model-load time, so every
+        // Context a session produces was invisible to Lane B for the rest of that process. Asked
+        // after the Snapshot on purpose -- the Snapshot is what synchronizes the projection, so
+        // the filler reading `embeddable_revisions` now sees what was just accepted.
+        if let Some(semantic) = self.semantic.as_ref() {
+            semantic.request_backfill(
+                reserved
+                    .iter()
+                    .map(|reserved| reserved.plan.result_revision.revision_id),
+            );
+        }
         Ok(reserved
             .into_iter()
             .zip(written)
@@ -6023,6 +6046,24 @@ pub fn candidate_confirm_at_root(
     input: &CandidateConfirmInput,
 ) -> Result<CandidateConfirmResponse> {
     Runtime::open(root.as_ref())?.candidate_confirm(input)
+}
+
+/// Confirms one Candidate against an already-built embedding channel handle.
+///
+/// Separate entry point for the same reason [`McpServer::set_semantic_channel`] exists: the handle
+/// is owned by a `serve` process, and a test that needs to observe what a Confirmation asks of it
+/// has no `serve` process and no ONNX model on disk.
+///
+/// # Errors
+///
+/// Identical to [`candidate_confirm_at_root`].
+#[doc(hidden)]
+pub fn candidate_confirm_at_root_with_semantic_channel(
+    root: impl AsRef<Path>,
+    input: &CandidateConfirmInput,
+    semantic: SemanticChannelHandle,
+) -> Result<CandidateConfirmResponse> {
+    Runtime::open_with_semantic(root.as_ref(), Some(semantic))?.candidate_confirm(input)
 }
 
 /// Confirms several owned Pending Candidates under one Space organization.

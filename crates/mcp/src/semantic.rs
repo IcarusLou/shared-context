@@ -56,12 +56,18 @@ pub(crate) fn spawn_semantic_loader(root: &Path) -> Option<SemanticChannelHandle
     Some(handle)
 }
 
-/// Loads the model, publishes whatever is already cached, then fills in what is missing.
+/// Loads the model, publishes whatever is already cached, fills in what is missing, then stays.
 ///
 /// The two publishes are deliberate. The first makes a restarted server useful within milliseconds
 /// of the model load on a corpus it has already embedded once; the second widens the snapshot to
 /// include revisions accepted since. Without the first, every restart would spend the whole
 /// backfill answering `embedding_unavailable` over vectors it already had on disk.
+///
+/// Staying is what makes the corpus keep up with the session. This pass used to be the only one a
+/// process ever ran, so a Context accepted *after* it -- which is every Context the session
+/// itself produces -- had no vector and no way to get one until the next restart. The thread now
+/// parks on [`SemanticChannelHandle::take_backfill_requests`] and repeats the same fill whenever
+/// a Confirmation asks it to.
 fn load_and_backfill(
     root: &Path,
     model_path: &Path,
@@ -82,18 +88,11 @@ fn load_and_backfill(
     // publish, and doing it here means the first snapshot a restarted server answers from is
     // already free of vectors for revisions the projection has since retired.
     let engine = SearchEngine::new(open_index(root));
-    let embeddable = engine.embeddable_revisions()?;
-    let _retired = cache.retain_revisions(
-        &key,
-        &embeddable
-            .iter()
-            .map(|(revision_id, _)| *revision_id)
-            .collect(),
-    )?;
+    let embeddable = current_corpus(&engine, &cache, &key)?;
 
-    // Both publishes carry the same budget and the same recorder, and share one query vector cache
-    // through `from_cache`, so the second one inherits the first one's warmth instead of resetting
-    // a session back to a cold encode.
+    // Every publish carries the same budget and the same recorder, and shares one query vector
+    // cache through `from_cache`, so a later one inherits the earlier one's warmth instead of
+    // resetting a session back to a cold encode.
     let build = |provider: Arc<dyn sctx_search::EmbeddingProvider>| {
         let channel = EmbeddingSemanticChannel::from_cache(provider, &cache, &key)?
             .with_encode_recorder(Arc::clone(&cache) as Arc<dyn EncodeSampleRecorder>);
@@ -105,7 +104,67 @@ fn load_and_backfill(
 
     handle.publish(Arc::new(build(Arc::clone(&provider))?));
 
-    let cached = cache.cached_revisions(&key)?;
+    if fill_missing_vectors(&provider, &cache, &key, embeddable)? {
+        handle.publish(Arc::new(build(Arc::clone(&provider))?));
+    }
+
+    // From here the thread exists only to answer Confirmations. It parks, so it costs nothing
+    // until one arrives; a process whose installation never confirms a Candidate parks forever.
+    loop {
+        let requested = handle.take_backfill_requests();
+        if requested.is_empty() {
+            // Only a poisoned queue answers empty, and nothing will wake this thread again.
+            return Ok(());
+        }
+        // Recomputed, not trusted: the request names what prompted the pass, and the projection
+        // names what the corpus is actually missing. Those differ whenever a request arrived
+        // while the previous pass was running, or was dropped at the queue's bound.
+        let embeddable = match current_corpus(&engine, &cache, &key)
+            .and_then(|embeddable| fill_missing_vectors(&provider, &cache, &key, embeddable))
+        {
+            Ok(wrote) => wrote,
+            Err(error) => {
+                eprintln!(
+                    "sctx: embedding backfill for {} accepted revision(s) failed: {error}",
+                    requested.len()
+                );
+                continue;
+            }
+        };
+        if embeddable {
+            handle.publish(Arc::new(build(Arc::clone(&provider))?));
+        }
+    }
+}
+
+/// Reads the accepted corpus and drops the vectors of revisions that have left it.
+///
+/// The reclaim belongs with the read because it is derived from it: a vector whose revision is no
+/// longer accepted is filed under an unchanged cache key, so nothing else will ever drop it.
+fn current_corpus(
+    engine: &SearchEngine,
+    cache: &SemanticVectorCache,
+    key: &SemanticCacheKey,
+) -> sctx_search::Result<Vec<(sctx_domain::RevisionId, String)>> {
+    let embeddable = engine.embeddable_revisions()?;
+    let _retired = cache.retain_revisions(
+        key,
+        &embeddable
+            .iter()
+            .map(|(revision_id, _)| *revision_id)
+            .collect(),
+    )?;
+    Ok(embeddable)
+}
+
+/// Embeds every accepted revision the cache does not hold, and reports whether it wrote any.
+fn fill_missing_vectors(
+    provider: &Arc<dyn sctx_search::EmbeddingProvider>,
+    cache: &SemanticVectorCache,
+    key: &SemanticCacheKey,
+    embeddable: Vec<(sctx_domain::RevisionId, String)>,
+) -> sctx_search::Result<bool> {
+    let cached = cache.cached_revisions(key)?;
     let mut wrote = false;
     for (revision_id, text) in embeddable {
         if cached.contains(&revision_id) {
@@ -122,14 +181,11 @@ fn load_and_backfill(
         let Ok(vector) = provider.encode_bulk(&text) else {
             continue;
         };
-        if cache.store(&key, revision_id, &vector).is_ok() {
+        if cache.store(key, revision_id, &vector).is_ok() {
             wrote = true;
         }
     }
-    if wrote {
-        handle.publish(Arc::new(build(provider)?));
-    }
-    Ok(())
+    Ok(wrote)
 }
 
 fn open_index(root: &Path) -> ProjectionIndex {
@@ -169,36 +225,16 @@ pub fn warm_semantic_cache_at_root(root: &Path) -> sctx_search::Result<SemanticW
     let key = SemanticCacheKey::new(model_fingerprint(&model_path)?, SEARCH_RANKING_VERSION);
     let cache = SemanticVectorCache::open_at_root(root)?;
     let _pruned = cache.prune_superseded(&key)?;
-    let embeddable = SearchEngine::new(open_index(root)).embeddable_revisions()?;
-    // Same reclaim as the background loader, for the same reason: a vector whose revision left the
-    // accepted set is filed under an unchanged key and nothing else will ever drop it.
-    let _retired = cache.retain_revisions(
-        &key,
-        &embeddable
-            .iter()
-            .map(|(revision_id, _)| *revision_id)
-            .collect(),
-    )?;
-    let cached = cache.cached_revisions(&key)?;
-    let mut embedded = 0;
-    for (revision_id, text) in embeddable {
-        if cached.contains(&revision_id) {
-            continue;
-        }
-        // Corpus priority here too, for the same reason it is corpus priority in the background
-        // loader: nothing is waiting on these vectors. This process serves no queries, so the
-        // priority never costs anything -- it only keeps the two backfill paths saying the same
-        // thing about what corpus work is.
-        let Ok(vector) = provider.encode_bulk(&text) else {
-            continue;
-        };
-        if cache.store(&key, revision_id, &vector).is_ok() {
-            embedded += 1;
-        }
-    }
+    // The same corpus read, the same reclaim and the same fill the background loader runs, so
+    // the two paths cannot drift on what corpus work is. Corpus priority costs nothing here:
+    // this process serves no queries.
+    let embeddable = current_corpus(&SearchEngine::new(open_index(root)), &cache, &key)?;
+    let before = cache.cached_revisions(&key)?.len();
+    let _wrote = fill_missing_vectors(&provider, &cache, &key, embeddable)?;
+    let cached = cache.cached_revisions(&key)?.len();
     Ok(SemanticWarmReport {
         configured: true,
-        embedded,
-        cached: cache.cached_revisions(&key)?.len(),
+        embedded: cached.saturating_sub(before),
+        cached,
     })
 }

@@ -1239,6 +1239,52 @@ fn an_unfilled_handle_is_unavailable_and_becomes_usable_the_moment_it_is_publish
     assert_eq!(hits[0].revision_id, revisions[0]);
 }
 
+/// The handle is also the queue of revisions still owed a vector, and it blocks the filler.
+///
+/// The corpus is filled once per process at model-load time, so the knowledge a session writes
+/// arrives after the only pass that would have embedded it. The handle carries the ask because it
+/// is the one object the loader thread and the request path already share; it must park rather
+/// than spin, and a request that arrives while a fill is running must wake the next pass instead
+/// of being swallowed by the current one.
+#[test]
+fn the_handle_carries_what_the_corpus_still_owes_and_parks_until_something_owes_it() {
+    let handle = SemanticChannelHandle::new();
+    assert!(handle.pending_backfill().is_empty());
+
+    let first = RevisionId::new();
+    let second = RevisionId::new();
+    handle.request_backfill([first]);
+    handle.request_backfill([first, second]);
+    assert_eq!(
+        handle.pending_backfill(),
+        std::collections::BTreeSet::from([first, second]),
+        "asking twice for the same revision owes it once"
+    );
+    assert_eq!(
+        handle.take_backfill_requests(),
+        std::collections::BTreeSet::from([first, second])
+    );
+    assert!(handle.pending_backfill().is_empty());
+
+    // A filler with nothing to do waits, and is woken by the ask rather than by a poll.
+    let filler = handle.clone();
+    let waiting = std::thread::spawn(move || filler.take_backfill_requests());
+    let third = RevisionId::new();
+    // The wait is a condvar, so the request may land before or after the thread parks; both must
+    // deliver it.
+    loop {
+        handle.request_backfill([third]);
+        if waiting.is_finished() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        waiting.join().unwrap(),
+        std::collections::BTreeSet::from([third])
+    );
+}
+
 #[test]
 fn the_query_encode_costs_exactly_one_model_call() {
     let provider = Arc::new(HashProvider::new());

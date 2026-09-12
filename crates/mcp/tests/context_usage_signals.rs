@@ -24,7 +24,7 @@ use sctx_mcp::{
     engineering_reference_record_at_root, task_checkpoint_at_root,
     task_context_readonly_with_detail_at_root, task_intent_update_at_root,
 };
-use sctx_search::ContextPackDetailLevel;
+use sctx_search::{ContextPackDetailLevel, SemanticChannelHandle};
 use sctx_task_runtime::{ContextInjectionSource, ContextUsageTotals, TaskRuntime};
 
 const REUSED_STATEMENT: &str =
@@ -975,4 +975,82 @@ fn an_injected_neighbour_the_analysis_never_relates_to_stays_an_omission() {
         },
         "sharing a Space with a credited Context proves nothing about this one"
     );
+}
+
+/// A Confirmation asks for a vector for the knowledge it just accepted.
+///
+/// The corpus backfill runs once per `serve` process, at model-load time, so until now every
+/// Context a session produced was invisible to the semantic lane for the rest of that process.
+/// Measured on a real 21.8-hour Session: `index.context_revision` held 32 rows and
+/// `semantic.revision_vector` held 28, and the four missing ones were exactly the accepted
+/// revisions of the three Contexts that Session had just written.
+///
+/// The channel handle is the queue, because it is the one object the loader thread and the request
+/// path already share. The ask is advisory in both directions -- a handle nobody is filling only
+/// records names, and the Confirmation neither waits for nor fails on a discardable cache.
+#[test]
+fn confirming_a_candidate_asks_the_semantic_corpus_for_the_revision_it_just_accepted() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("semantic backfill root");
+    let (space_id, _, _) = accepted_context(&root, REUSED_STATEMENT);
+    let session = "semantic-backfill";
+
+    let task = intent_update(&root, session);
+    checkpoint(&root, session, IGNORED_STATEMENT, &[]);
+    let candidate_id: CandidateId = candidate_list_at_root(
+        &root,
+        &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            status: sctx_domain::CandidateReviewStatus::Pending,
+            limit: 10,
+            cursor: None,
+            token_budget: 8_192,
+        },
+    )
+    .unwrap()
+    .reviews
+    .first()
+    .expect("the Checkpoint produced one Candidate")
+    .0
+    .candidate_id;
+
+    let semantic = SemanticChannelHandle::new();
+    assert!(
+        semantic.pending_backfill().is_empty(),
+        "nothing is owed before a Confirmation"
+    );
+    let confirmed = sctx_mcp::candidate_confirm_at_root_with_semantic_channel(
+        &root,
+        &CandidateConfirmInput {
+            decision_source: DecisionSource::Human,
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            expected_task_id: task.context.task_id.to_string(),
+            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
+            candidate_id: candidate_id.to_string(),
+            expected_review_version: 1,
+            primary: CandidateConfirmPrimaryInput::Existing(ExistingCandidatePrimaryInput {
+                existing_space_id: space_id.to_string(),
+            }),
+            related_space_ids: Vec::new(),
+            edits: OptionalCandidateEdits::default(),
+        },
+        semantic.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        semantic.pending_backfill(),
+        std::collections::BTreeSet::from([confirmed.revision_id]),
+        "the accepted revision, and only it, is what the corpus is missing"
+    );
+    // Taking the set is what a filler does, and it leaves nothing behind: a revision requested
+    // while a fill is running has to wake the next pass, not be swallowed by the current one.
+    assert_eq!(
+        semantic.take_backfill_requests(),
+        std::collections::BTreeSet::from([confirmed.revision_id])
+    );
+    assert!(semantic.pending_backfill().is_empty());
 }
