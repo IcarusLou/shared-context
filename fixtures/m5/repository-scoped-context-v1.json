@@ -4,10 +4,10 @@
   "session_policy": "Stored text is Chinese, with identifiers, paths, commands, and error codes in their original spelling, and every version, commit, and date written absolutely.\nRecord one `progress` summary per task boundary, never per turn.",
   "source_assets": {
     "gate_bytes": 2396,
-    "workflow_bytes": 14346,
+    "workflow_bytes": 14773,
     "metadata_bytes": 263,
     "review_gate_bytes": 2895,
-    "review_reference_bytes": 14532,
+    "review_reference_bytes": 14866,
     "review_metadata_bytes": 278
   },
   "token_proxy": {
