@@ -1,103 +1,67 @@
-//! ADR-0004 acceptance: the extended probe set with a real embedding model attached.
+//! The same document-space separation as the default export's suite, over whichever export the
+//! operator names. This is the arm a model swap is argued on.
 //!
-//! This test is `#[ignore]`d because it needs roughly 2.1 GB of model weights and an ONNX Runtime
-//! shared library that this repository deliberately does not ship. Point it at both and run it:
+//! It was bge-m3's arm of ADR-0004's acceptance, back when the acceptance was a fused hit count and
+//! bge-m3 was the default. Both of those are gone -- see
+//! `association_probe_ext_semantic_f2llm`'s module docs for the assertion-by-assertion disposition,
+//! which applies here unchanged -- and what is left is the one question a second encoder is still
+//! asked: *on the corpus production actually writes vectors for, does this export separate what
+//! belongs together from what does not, and how does that compare with the installed one?*
 //!
 //! ```text
-//! SCTX_PROBE_EMBEDDING_MODEL=/path/to/bge-m3-onnx \
-//! SCTX_PROBE_EMBEDDING_RUNTIME=/path/to/libonnxruntime.dylib \
-//!   cargo test --locked -p sctx-cli --test association_probe_ext_semantic -- --ignored --nocapture
+//! SCTX_PROBE_EMBEDDING_MODEL=/path/to/some-onnx-export \
+//! SCTX_PROBE_EMBEDDING_RUNTIME=~/.shared-context/embedding/runtime/libonnxruntime.dylib \
+//!   cargo test --release --locked -p sctx-cli --test association_probe_ext_semantic -- \
+//!     --ignored --nocapture
 //! ```
 //!
-//! The model must be bge-m3 specifically, even though `sctx embedding install` now defaults to a
-//! different export. [`SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`] was calibrated against bge-m3's
-//! score distribution on this very fixture, and the noise-ceiling assertion below is a statement
-//! about *that* distribution: pointed at another export this test would be comparing a floor to
-//! scores it was never derived from, and would prove nothing either way. The new default has its
-//! own suite -- `association_probe_ext_semantic_f2llm`, over its own floor -- and the two share
-//! everything but the model through `association_probe_harness::semantic`, so their per-category
-//! numbers are comparable.
+//! ## Why this arm carries no ratchet
 //!
-//! ## Why this runs in-process instead of through the probe binary
+//! The default export's suite pins four numbers because those are readings of the encoder this
+//! repository installs, taken on the machine that installs it. This one pins none, deliberately.
 //!
-//! [`association_probe_harness::run_probes`] spawns a fresh `sctx mcp serve` for every single
-//! call. That is the right shape for the lexical suites and the wrong shape for this one: the
-//! embedding channel loads its model on a background thread precisely so a session never waits
-//! 9--12 seconds for it, and a process that answers one request and exits is killed long before
-//! that thread publishes anything. Measured through the probe binary the channel would report
-//! `embedding_unavailable` on all 39 probes and prove nothing.
+//! Its old constant (`SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`, then a local 5200 with a 5095 noise
+//! ceiling and a 5640 weakest positive beside it) is a reading of bge-m3 in a corpus space that no
+//! longer exists: `SEMANTIC_CORPUS_VERSION` went from `"1"` to `"2"` on 2026-09-11, which stopped
+//! the corpus text being `normalize_search_text` shrapnel and made it the revision fields as
+//! written -- for a Chinese fixture, a different text space rather than a lightly different string.
+//! Nobody has re-run bge-m3 since, and nobody can: there are no bge-m3 weights on the machine that
+//! installs F2LLM by default. Carrying those numbers forward as a ratchet would be pinning a
+//! measurement of a space the suite no longer runs in, which is exactly the defect this pass
+//! exists to clear.
 //!
-//! So the corpus is still built by the real harness -- the same Git store, the same public MCP
-//! confirmation chain, the same projection -- and only the *query* half runs in-process against
-//! one loaded model. Both arms of the comparison run through that same in-process path, so the
-//! per-category deltas below are measured against their own control and never against a number
-//! produced by a different runner.
+//! So what it asserts is the structural claim, which is model-independent and still sharp: the
+//! positives and the noise do not overlap. What it *reports* is the whole table, which is the
+//! comparison. Pointing it at an export and reading the printed spread against the constants in
+//! the F2LLM suite is the model-selection procedure; see `docs/dual-lane/plan.md`, the real-model
+//! manual checklist, for the exact commands and which three suites a selection has to agree on.
 //!
-//! The in-process control lands one probe below the 27/39 the blocking suite measures through the
-//! binary, and the difference is known rather than mysterious: `Runtime` attaches a
-//! `RuntimeUsagePrior` read from `runtime.sqlite`, which this runner has no public way to build.
-//! The harness clears `context_usage` before every probe, so the prior is near-neutral, but
-//! "near-neutral" still breaks one tie differently. The test pins that gap to at most one probe:
-//! if the in-process runner ever drifts further from the real one, it fails before reporting a
-//! single embedding number.
+//! One caution about reading the two tables side by side: the family decides whether the document
+//! role is even distinguishable. F2LLM (Qwen3) prepends an instruction to queries and nothing to
+//! documents, so its query and document spaces differ; bge-m3 and most encoder-style exports use
+//! one text path for both, so for them `encode_bulk` and `encode` return the same vector and this
+//! suite's move to the document role changes nothing about their numbers. A cosine is still not
+//! portable between two exports' spaces -- the margin is, which is why the margin is what the
+//! comparison is read off.
 
 mod association_probe_harness;
 
-use std::{
-    fs,
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{fs, path::PathBuf};
 
 use association_probe_harness::{
-    Harness, build_harness,
-    semantic::{
-        Run, category_hits, embed_corpus, engine, installation_root, percentile,
-        print_category_comparison, print_similarity_separation, run_suite,
-    },
+    build_harness,
+    semantic::{document_space_separation, embed_corpus, engine, installation_root},
 };
-use sctx_search::{EmbeddingProvider, EmbeddingSemanticChannel, SearchEngine, SemanticChannel};
-
-/// Highest score any noise probe of this fixture may reach, in basis points.
-///
-/// It was `SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`, a production constant, until ADR-0007 retired
-/// the query path that read it; the number itself is a measurement of *this fixture against this
-/// encoder* and is kept where that measurement is taken. T5a's run: the highest-scoring noise
-/// query reaches 5095 and the lowest-scoring cross-lingual positive 5640, so 5200 sits 105 basis
-/// points above the noise ceiling and 440 below the weakest positive. What it guards is unchanged
-/// -- that this encoder separates this fixture's noise from its positives at all -- and it no
-/// longer claims to govern anything in production.
-const BGE_NOISE_CEILING_BASIS_POINTS: u16 = 5_200;
+use sctx_search::EmbeddingSemanticChannel;
 use serde_json::Value;
 
 const PROBE_FIXTURE: &str = include_str!("../../../fixtures/association/probe-ext-v1.json");
 
-/// What the blocking ext suite measures for `task_intent_update` through the real binary.
-/// Re-measured 2026-09-03 over the 39-probe fixture (`long_intent` added by T5d).
-const LEXICAL_INTENT_HITS: usize = 27;
-/// How far the in-process control may sit below it before the substitution stops being honest.
-/// One probe, for the usage prior this runner cannot build; see the module docs.
-const LEXICAL_CONTROL_TOLERANCE: usize = 1;
-
-/// ADR-0004's latency budget, which now applies to the case it can actually hold for: a query
-/// whose vector the process has already encoded once.
-///
-/// The original clause budgeted a 100 ms p95 increment with no qualifier, and it was measured
-/// against probe queries 15--40 characters long. That is not what an automatic retrieval submits.
-/// A real Working Intent flattens to a few hundred characters and its *first* encode costs
-/// hundreds of milliseconds on current hardware, which is the whole reason the 200 ms encode
-/// budget silently disabled the channel in every real session. See the 2026-09-03 revision in
-/// `docs/adr/0004-embedding-retrieval-channel.md`.
-const REPEATED_P95_INCREMENT_BUDGET: Duration = Duration::from_millis(100);
-
-/// What one *first* encode of a real-length Working Intent may add to `task_context` p95.
-///
-/// Measured at 235 ms p95 for a 283-character query (`crates/search/tests/embedding_encode_latency.rs`);
-/// 400 ms is that plus fusion and headroom. This number is the honest cost of the channel's first
-/// look at a new Intent, and stating it is the point: the previous budget hid it by never paying
-/// it at all.
-const FIRST_P95_INCREMENT_BUDGET: Duration = Duration::from_millis(400);
+/// Accepted revisions the harness leaves behind for the backfill to embed. Eleven rather than the
+/// fixture's twelve Contexts, because one is superseded and `embeddable_revisions` returns current
+/// accepted revisions only. Pinned so a fixture that grew a Context is not read as an export that
+/// separates differently.
+const CORPUS_REVISIONS: usize = 11;
 
 fn model_paths() -> Option<(PathBuf, PathBuf)> {
     let model = std::env::var_os("SCTX_PROBE_EMBEDDING_MODEL")?;
@@ -106,8 +70,8 @@ fn model_paths() -> Option<(PathBuf, PathBuf)> {
 }
 
 #[test]
-#[ignore = "requires a locally downloaded bge-m3 ONNX export and an ONNX Runtime library"]
-fn the_embedding_channel_lifts_paraphrase_and_cross_lingual_without_costing_identifiers() {
+#[ignore = "requires a locally downloaded ONNX export and an ONNX Runtime library"]
+fn a_named_export_separates_this_corpus_in_the_document_space() {
     let Some((model, runtime)) = model_paths() else {
         panic!(
             "set SCTX_PROBE_EMBEDDING_MODEL and SCTX_PROBE_EMBEDDING_RUNTIME; see the module docs"
@@ -118,138 +82,39 @@ fn the_embedding_channel_lifts_paraphrase_and_cross_lingual_without_costing_iden
     let root = installation_root(&harness);
     let engine = engine(&root);
 
-    // 1. The lexical baseline, through the same in-process path the embedding run will use. This
-    //    is the control that makes every number below comparable to the blocking suite.
-    let lexical = run_suite(&harness, &engine, &fixture);
-    let total = fixture["probes"].as_array().unwrap().len();
-    println!(
-        "\n--- lexical control (in-process) --- {}/{total} (binary measures \
-         {LEXICAL_INTENT_HITS}/{total})",
-        lexical.hits
-    );
-    assert!(
-        lexical.hits + LEXICAL_CONTROL_TOLERANCE >= LEXICAL_INTENT_HITS,
-        "the in-process control drifted to {}/{total}, more than {LEXICAL_CONTROL_TOLERANCE} \
-         probe(s) below the {LEXICAL_INTENT_HITS}/{total} the blocking suite measures; its \
-         embedding numbers would not be comparable",
-        lexical.hits
-    );
-    assert_eq!(
-        lexical.noise_leaks, 0,
-        "the control must reject every noise probe, or the fused run has nothing to hold to"
-    );
-
-    // 2. Load the model once and embed the whole accepted corpus.
-    let load_started = Instant::now();
     let provider = sctx_search::load_onnx_provider(&model, &runtime)
         .expect("the configured model and runtime must load");
-    println!("model load {:?}", load_started.elapsed());
-    let provider = provider as Arc<dyn EmbeddingProvider>;
+    // Named in the output rather than asserted: the whole point of this arm is that the export is
+    // the operator's choice, and a comparison table that does not say which encoder produced it is
+    // not a comparison. The width comes off the provider's own probe, so it is what the session
+    // returns rather than what the directory claims.
+    println!(
+        "export {} -- {} dimensions",
+        model.display(),
+        provider.dimensions()
+    );
     let fingerprint = sctx_search::model_fingerprint(&model).unwrap();
     let (cache, key, embeddable) = embed_corpus(&engine, &provider, &root, &fingerprint);
+    assert_eq!(
+        embeddable, CORPUS_REVISIONS,
+        "the harness left {embeddable} embeddable revision(s) rather than {CORPUS_REVISIONS}; the \
+         fixture changed shape and this table is not comparable with the other arm's"
+    );
 
     let corpus = cache.load(&key).unwrap();
-    let channel = Arc::new(EmbeddingSemanticChannel::from_cache(&cache, &key).unwrap());
+    let channel = EmbeddingSemanticChannel::from_cache(&cache, &key).unwrap();
     assert_eq!(channel.corpus_size(), embeddable);
 
-    let (_worst_positive, best_noise) = print_similarity_separation(&fixture, &provider, &corpus);
+    let separation = document_space_separation(&fixture, &provider, &corpus);
     assert!(
-        best_noise < BGE_NOISE_CEILING_BASIS_POINTS,
-        "this encoder must separate the fixture's noise from its positives: best noise \
-         {best_noise}, measured ceiling {BGE_NOISE_CEILING_BASIS_POINTS}"
-    );
-
-    let semantic_engine = engine
-        .clone()
-        .with_semantic_channel(Arc::clone(&channel) as Arc<dyn SemanticChannel>);
-
-    // 3. The same 39 probes, now with the channel fused in.
-    let fused = run_suite(&harness, &semantic_engine, &fixture);
-    println!("--- with embedding channel --- {}/{total}", fused.hits);
-    print_category_comparison(&lexical, &fused);
-
-    // ADR-0004's acceptance, verbatim.
-    let paraphrase_delta = i64::try_from(category_hits(&fused, "paraphrase")).unwrap()
-        - i64::try_from(category_hits(&lexical, "paraphrase")).unwrap();
-    let cross_lingual_delta = i64::try_from(category_hits(&fused, "cross_lingual")).unwrap()
-        - i64::try_from(category_hits(&lexical, "cross_lingual")).unwrap();
-    assert!(
-        paraphrase_delta + cross_lingual_delta > 0,
-        "ADR-0004 requires a net gain across paraphrase and cross_lingual, got \
-         {paraphrase_delta:+} and {cross_lingual_delta:+}"
-    );
-    assert!(
-        category_hits(&fused, "identifier") >= category_hits(&lexical, "identifier"),
-        "identifier recall must not regress"
-    );
-    assert_eq!(
-        fused.noise_leaks, 0,
-        "the channel must not leak a single noise probe"
-    );
-
-    // 4. Latency, with the model already loaded.
-    assert_latency_budgets(
-        &harness,
-        &semantic_engine,
-        &fixture,
-        &lexical,
-        &fused,
-        total,
-    );
-}
-
-/// Grades the two latency clauses ADR-0004 was split into on 2026-09-03.
-///
-/// Both are measured on the `long_intent` probes alone. The whole-suite p95 is printed for
-/// continuity with the T5b baseline and asserted on nothing: it is dominated by 15--40 character
-/// probes, and taking an acceptance number from it is precisely the mistake that let a 200 ms
-/// encode budget ship while making the channel unusable in every real session.
-fn assert_latency_budgets(
-    harness: &Harness,
-    semantic_engine: &SearchEngine,
-    fixture: &Value,
-    lexical: &Run,
-    fused: &Run,
-    total: usize,
-) {
-    let lexical_p95 = percentile(lexical.latencies.clone(), 95);
-    let fused_p95 = percentile(fused.latencies.clone(), 95);
-    println!(
-        "\ntask_context p95 over all {total} probes: lexical {lexical_p95:?}, fused {fused_p95:?} \
-         (short-probe dominated, not an acceptance number)"
-    );
-
-    let lexical_long_p95 = percentile(lexical.long_latencies.clone(), 95);
-    let first_long_p95 = percentile(fused.long_latencies.clone(), 95);
-    let first_increment = first_long_p95.saturating_sub(lexical_long_p95);
-    println!(
-        "long_intent p95 (first encode): lexical {lexical_long_p95:?}, fused {first_long_p95:?}, \
-         increment {first_increment:?}"
-    );
-    assert!(
-        first_increment <= FIRST_P95_INCREMENT_BUDGET,
-        "a first encode of a real-length Working Intent may add {FIRST_P95_INCREMENT_BUDGET:?} to \
-         task_context p95, measured {first_increment:?}"
-    );
-
-    // The same long queries again. Nothing on this path encodes any more -- ADR-0007 retired the
-    // query side, so a repeat read costs whatever the first one did -- and the assertion below is
-    // now about reproducibility rather than about a cache.
-    let repeated = run_suite(harness, semantic_engine, fixture);
-    let repeated_long_p95 = percentile(repeated.long_latencies.clone(), 95);
-    let repeated_increment = repeated_long_p95.saturating_sub(lexical_long_p95);
-    println!(
-        "long_intent p95 (cached encode): fused {repeated_long_p95:?}, increment \
-         {repeated_increment:?}"
-    );
-    assert!(
-        repeated_increment <= REPEATED_P95_INCREMENT_BUDGET,
-        "a repeated retrieval over one Working Intent must stay inside ADR-0004's \
-         {REPEATED_P95_INCREMENT_BUDGET:?} p95 increment, measured {repeated_increment:?}"
-    );
-    assert_eq!(
-        repeated.hits, fused.hits,
-        "two identical runs over one corpus must retrieve identically"
+        separation.margin() > 0,
+        "this export does not separate the fixture at all: worst positive {} ({}) is at or below \
+         best noise {} ({}). Whatever else the table says, an admission decision cannot be built \
+         on it",
+        separation.worst_positive,
+        separation.worst_positive_probe,
+        separation.best_noise,
+        separation.best_noise_probe
     );
 }
 

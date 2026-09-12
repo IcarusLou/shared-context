@@ -81,9 +81,14 @@ fn provider_paths() -> Option<(PathBuf, PathBuf)> {
     Some((PathBuf::from(model), PathBuf::from(runtime)))
 }
 
-/// Builds text of roughly `length` characters in the shape retrieval actually submits, salted with
-/// `salt` so no two queries in one run are the same string. The salt matters: the channel's query
-/// vector cache would otherwise serve every query after the first for free and measure nothing.
+/// Builds text of roughly `length` characters in the shape a real Intent has, salted with `salt` so
+/// no two texts in one run are the same string.
+///
+/// The salt was load-bearing when a process-lifetime query vector cache existed: it would otherwise
+/// have served every encode after the first for free and measured nothing. ADR-0007's amendment
+/// removed that cache with the rest of the query path, so what the salt buys now is only that the
+/// backfill loop keeps re-tokenizing fresh text rather than the same one, which is what a real
+/// corpus pass does.
 fn intent_text(length: usize, salt: usize) -> String {
     const PHRASES: &[&str] = &[
         "把嵌入通道的编码预算按真实 Intent 长度重新标定",
@@ -216,21 +221,26 @@ fn report(name: &str, phase: &Phase) {
 }
 
 #[test]
-#[ignore = "needs a real bge-m3 export; see the module docs"]
+#[ignore = "needs a real model export; see the module docs"]
 fn a_backfill_and_a_query_each_get_what_they_need() {
     let Some((model, runtime)) = provider_paths() else {
         panic!("set SCTX_PROBE_EMBEDDING_MODEL and SCTX_PROBE_EMBEDDING_RUNTIME; see module docs");
     };
-    let provider = load_onnx_provider(&model, &runtime).expect("load the configured bge-m3 export");
+    let provider =
+        load_onnx_provider(&model, &runtime).expect("load the export named by the environment");
 
     // Warm-up: the first encode of a session and the first encode at each sequence length pay
-    // one-time ORT costs no steady-state query pays.
-    for length in [QUERY_CHARS, CORPUS_CHARS] {
-        for salt in 0..2 {
-            provider
-                .encode(&intent_text(length, salt))
-                .expect("warm-up encode");
-        }
+    // one-time ORT costs no steady-state encode pays. Each length is warmed through the entry point
+    // that will use it -- on a Qwen3-family export the query role prepends an instruction, so
+    // warming the corpus length through `encode` would shape the graph for a sequence the backfill
+    // never submits and leave its first real encode cold.
+    for salt in 0..2 {
+        provider
+            .encode(&intent_text(QUERY_CHARS, salt))
+            .expect("warm-up interactive encode");
+        provider
+            .encode_bulk(&intent_text(CORPUS_CHARS, salt))
+            .expect("warm-up corpus encode");
     }
 
     let contended = run_phase(&provider, CONTENDED_QUERIES, CONTENDED_INTERVAL, 0);

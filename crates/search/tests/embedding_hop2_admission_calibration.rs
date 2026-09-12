@@ -76,8 +76,8 @@ const MEASURED_AUC_BASIS_POINTS: u16 = 9_090;
 /// How far above the highest cross-topic pair the floor must sit.
 ///
 /// A threshold defended by a handful of basis points is an overfit to one fixture row -- the
-/// reasoning that gave up two positives when [`QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`] was
-/// set, and it applies here unchanged. This is the margin, not the raw gap to the next positive
+/// reasoning that gave up two positives when the retired query-side floor for this family (2800)
+/// was set, and it applies here unchanged. This is the margin, not the raw gap to the next positive
 /// above the ceiling: in a dense distribution that gap is a few basis points wide by construction
 /// (9 here, 60 on the device corpus) and says nothing about robustness.
 const MINIMUM_CEILING_MARGIN_BASIS_POINTS: u16 = 100;

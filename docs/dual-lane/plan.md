@@ -108,3 +108,20 @@ S2-1 → S2-2 → S2-3 可流水(2 依赖 1 的种子形态,3 依赖 1+2);S2-4 �
 合并门七项:workspace 1081/0、fmt/clippy 零、hop2_ratchet 13/18/0、lane_probes 9/0/0/0、三套空包断言、红线零 diff、回放通过——全绿。
 
 两项非阻断观察(入 deferred):#44 锚点的分支/时间耦合(FE 回放前 4 轮空包成因:2 个锚点文件在回放基线 commit 不存在;与 #41 relocation-aware 同方向);#45 显式 context_search 成为新 wire 大户(单次 65.8KB,B1 解冻时纳入同一信封口径)。回放工具自身问题(turn-timeout 无看门狗、不可并发、manifest 模型 fidelity 失真、子会话各拿 marker、pack_deliveries 对重复投放少计)归组记录,修复随回放工具线。
+
+## G3 真模型套件重基线(2026-09-12,record)
+
+S2-4 的"三棘轮重基线"只覆盖了进门禁的那三套词法探针;**`--ignored` 真模型套件从来不在 `cargo test --workspace` 的范围里,于是 S2-4 之后没有人跑过它们**。2026-09-12 逐个盘点的结果:`association_probe_ext_semantic` 与 `..._f2llm` 两套的全部断言(词法对照 27/39、融合 32/39、ADR-0004 的 paraphrase/cross_lingual 增益、noise_leaks、p95 增量)测的是两条已不存在的路径——查询编码(ADR-0007 修正案)与融合 pack(S2-4);实测在场证据是 in-process 词法对照跌到 5/39,即 39 条探针里只有 5 条 noise 因"正确返回空"而计分,两臂完全相同。
+
+处置(与 S2-4 同一条原则:断言里自己写明替代物):
+
+- 两套改为**文档空间分离度**实测——语料侧本就是 `encode_bulk`(生产回填角色),探针侧一并改成 Document 角色,因为余弦只在同一总体内有意义,而生产唯一还在比的总体是文档×文档(径 B 第二跳)。`f2llm` 臂带四个棘轮(worst positive 4080 / best noise 1990 / cross_lingual 5210 / paraphrase 4090,均按 hop2 标定的惯例向外取整到十位),另一臂改为"任意导出"的选型对照臂,只断言正负样本不重叠。
+- 退役的每条断言在模块 doc 里列了去向表(`context_search` 30/39 归 `association_probe_ext_workflow`、空包与零噪声归三套词法探针的 `assert_every_automatic_pack_is_empty`、编码耗时归 `embedding_encode_latency`),并注明退役依据是 ADR-0007 修正案与信号污染审计。
+- 共享 harness 删掉 `run_suite`/`automatic_top1`/`print_category_comparison`/`Run`/`percentile`(整套只服务已退役的"意图文本 → 自动包命中率"测量,约 130 行)。
+- `embedding_encode_latency` 的阶梯从 `encode` 改为 `encode_bulk`:模块 doc 在 ADR-0007 之后已改写成"回填一条语料要多久",却还在计查询侧编码——F2LLM 家族的查询角色固定多 19 个指令 token,计的是回填从不支付的序列。旁边保留一行 283 字符交互编码,因为 `status --verify` 是 `encode` 唯一的生产调用者。
+- 两处"bge-m3"措辞作废:装机默认导出已是 F2LLM,`SCTX_PROBE_EMBEDDING_MODEL` 指向 `~/.shared-context/embedding/model` 时这两套(耗时阶梯、回填争用)加载到的是 F2LLM,而错误信息仍说 bge-m3。改为"环境变量指名的导出"。
+- 不动:`embedding_f2llm_contract`(编码器契约)、`embedding_hop2_admission_calibration`、`lanes::hop2_ratchet`、`embedding_install_workflow`,以及三个与检索无关的手动套件。
+
+新读数、完整命令、何时必须跑、以及 P3 的 F2LLM vs arctic 选型对照口径,都在 `DEVELOPMENT.md` 的"真模型套件手动清单"一节(它同时是"S2-4 后没人跑过"这条教训的落点)。回归验证:`hop2_ratchet` 13/18/0 不动,hop2 标定 AUC 9097 / 0-of-191 不动,workspace 非 ignored 不回退。
+
+一条空间差异务必读清楚,不要当成退步:旧的查询×文档空间上 F2LLM 的噪声全部被夹到 0(余弦为负),于是"margin"看起来有 4553;新的文档×文档空间里每一条分数都更高,噪声顶到 1980,margin 2101。两个数字不可相减比较——有意义的是新读数第一次与生产真正使用的常量落在同一量级:噪声天花板 1980 远在 `SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS`(5200)之下,而 `cross_lingual` 整段 5213–6964 跨在它之上。查询空间的读数从来没有这个性质,这就是 ADR-0007 那句诊断的一行实证。

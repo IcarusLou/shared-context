@@ -167,6 +167,72 @@ cargo test --locked -p sctx-cli --test association_probe_ext_workflow
 cargo test --locked -p sctx-cli --test association_probe_lane_workflow
 ```
 
+### 真模型套件手动清单（`--ignored`，不进 CI）
+
+下面这些套件需要 2.4GB 模型权重与 ONNX Runtime 动态库，本仓库不打包它们，`cargo test --workspace` 也不跑 `--ignored`——**所以它们只能靠人跑，而"没人跑"是已经发生过的事故**：ADR-0007 退役查询侧、S2-4 把自动注入换成两径之后，四个月里没有人跑过 `association_probe_ext_semantic*`，直到 2026-09-12 才发现它整套断言（词法对照 27/39、融合 32/39、ADR-0004 的 paraphrase/cross_lingual 增益）测的是两条已经不存在的路径：查询编码与融合 pack。**改动下列任何一项，就必须跑完本清单并把新读数写回各自的常量 doc**：embedding provider / 编码角色（`encode` 与 `encode_bulk`）、语料口径（`embeddable_revisions`、`SEMANTIC_CORPUS_VERSION`）、两径检索（`crates/search/src/lanes.rs`）、hop2 floor、默认模型导出。
+
+前置：`SCTX_MODEL=~/.shared-context/embedding/model`、`SCTX_ORT=~/.shared-context/embedding/runtime/libonnxruntime.dylib`（下面直接写全路径形式）。装机默认导出即 F2LLM-v2-0.6B，其目录布局与 Hugging Face snapshot 通用，两个变量可指同一目录。
+
+```bash
+# 1. 文档空间分离度（默认导出）——本仓库唯一带棘轮的真模型探针套件
+SCTX_PROBE_F2LLM_MODEL=~/.shared-context/embedding/model \
+SCTX_PROBE_EMBEDDING_RUNTIME=~/.shared-context/embedding/runtime/libonnxruntime.dylib \
+  cargo test --release --locked -p sctx-cli --test association_probe_ext_semantic_f2llm -- --ignored --nocapture
+
+# 2. 同一测量，换任意导出（选型对照臂，只断言"正负样本不重叠"，数字靠打印表读）
+SCTX_PROBE_EMBEDDING_MODEL=<某个 onnx 导出目录> \
+SCTX_PROBE_EMBEDDING_RUNTIME=~/.shared-context/embedding/runtime/libonnxruntime.dylib \
+  cargo test --release --locked -p sctx-cli --test association_probe_ext_semantic -- --ignored --nocapture
+
+# 3. hop2 准入 floor 标定（hard-negative-v1，24 Context 四组配对）
+SCTX_PROBE_F2LLM_MODEL=~/.shared-context/embedding/model \
+SCTX_PROBE_EMBEDDING_RUNTIME=~/.shared-context/embedding/runtime/libonnxruntime.dylib \
+  cargo test --release --locked -p sctx-search --test embedding_hop2_admission_calibration -- --ignored --nocapture
+
+# 4. 径 B 端到端棘轮（自动注入侧唯一需要真模型的正向棘轮）
+SCTX_PROBE_F2LLM_MODEL=~/.shared-context/embedding/model \
+SCTX_PROBE_EMBEDDING_RUNTIME=~/.shared-context/embedding/runtime/libonnxruntime.dylib \
+  cargo test --release --locked -p sctx-search --all-features --lib -- --ignored --nocapture hop2_ratchet
+
+# 5. 编码器契约（golden token 序列 + 参考向量 + 查询指令只出现在查询侧）
+SCTX_PROBE_F2LLM_MODEL=~/.shared-context/embedding/model \
+SCTX_PROBE_EMBEDDING_RUNTIME=~/.shared-context/embedding/runtime/libonnxruntime.dylib \
+  cargo test --release --locked -p sctx-search --all-features --test embedding_f2llm_contract -- --ignored --nocapture
+
+# 6. 回填编码耗时阶梯 + 加载时间 + RSS（报告型，不断言数字）
+SCTX_PROBE_F2LLM_MODEL=~/.shared-context/embedding/model \
+SCTX_PROBE_EMBEDDING_MODEL=~/.shared-context/embedding/model \
+SCTX_PROBE_EMBEDDING_RUNTIME=~/.shared-context/embedding/runtime/libonnxruntime.dylib \
+  cargo test --release --locked -p sctx-search --all-features --test embedding_encode_latency -- --ignored --nocapture --test-threads=1
+# 两个 ladder 各自加载一份 2.4GB 权重，同进程跑会同时驻留约 3.7GB；内存紧时按测试名分两次跑
+
+# 7. 回填与交互编码互不饿死（SessionGate 抢占，报告型 + 两条性质断言）
+SCTX_PROBE_EMBEDDING_MODEL=~/.shared-context/embedding/model \
+SCTX_PROBE_EMBEDDING_RUNTIME=~/.shared-context/embedding/runtime/libonnxruntime.dylib \
+  cargo test --release --locked -p sctx-search --all-features --test embedding_backfill_contention -- --ignored --nocapture
+
+# 8. embedding install/status/remove 端到端（搬 2.3–2.4GB，需本地权重与 runtime 归档）
+SCTX_EMBEDDING_MODEL_SOURCE=<本地权重目录> SCTX_EMBEDDING_RUNTIME_ARCHIVE=<本地 runtime tarball> \
+  cargo test --release --locked -p sctx-cli --test embedding_install_workflow -- --ignored --nocapture
+```
+
+**当前基线（2026-09-12，Apple Silicon / macOS 24.6.0 / ONNX Runtime 1.28.1 / release / F2LLM-v2-0.6B）**：
+
+| 套件 | 读数 | 三次一致 |
+|---|---|---|
+| 1 文档空间分离度 | 11 条语料；有答案的 34 条探针 top-1 落在 4081–8388，5 条 noise 落在 503–1980；worst positive 4081（`id-02`）、best noise 1980（`noise-05`）、margin 2101；`cross_lingual` 5213–6964、`paraphrase` 4091–7834 | 逐字节一致 ×3 |
+| 2 对照臂（指向同一 F2LLM 时） | 与 1 逐字节相同——证明两臂之差是模型之差而不是 runner 之差 | ×1（交叉校验） |
+| 3 hop2 标定 | cross-topic 天花板 5045、下一条同主题 5054（干净带 9bp）、AUC 9097；floor 5200 下 cross-repo/same-topic 13/47、same-repo/same-topic 18/38、跨主题假阳 0/191 | 与 ADR-0007 记录一致 |
+| 4 `hop2_ratchet` | floor 5200 下 13 跨仓 / 18 同仓 / **0 跨主题** | 与 S2-3 记录一致 |
+| 5 编码器契约 | 3 测全绿 | — |
+| 6 编码耗时（`encode_bulk`/Document 角色） | 283 字符 p95 190–238ms；512-token 截断上限 p95 1024ms；冷启动首编码 365–404ms；加载 1.7s（页缓存热）、RSS +1825MB；查询指令在该家族固定多 19 token（283 字符：113 → 132），交互编码 283 字符 p95 222–233ms | 报告型 |
+| 7 回填/交互争用 | contended（150ms 一发）16/16 成功、p95 254ms、回填过 1 条；realistic（1.5s 一发）5/5 成功、p95 251ms、回填过 6 条 | 报告型 |
+| 8 install 工作流 | 本轮未跑（只搬字节与校验摘要，不受检索改动影响） | — |
+
+`--ignored` 里还有三个与检索无关的手动套件，改检索时不必跑：`dynamic_scenarios::dynamic_suite_is_reproducible_across_representative_seeds`、`replay_report::phase_one_replay_runs_all_six_scenarios_twenty_times`（同一批断言的非 ignored 版本在 `replay_phase_one_contract` 里进门禁）、`sctx-search` 的 `warm_search_benchmark_baseline`（10 万行 `search_in_snapshot` 基准，测的是显式搜索这条仍在走的路）。
+
+**P3 选型对照口径**。F2LLM vs arctic / bge-m3 的正确基准是**文档空间三套件**——上表的 1（分离度与 margin）、3（hop2 floor 能否在该空间找到零假阳的带）、4（该 floor 下的跨仓召回条数）。理由是这三者都只在 `encode_bulk` 写出的文档向量上比较，也就是生产唯一还在比的那个总体；任何"查询→语料命中率"的对照都已经没有对应的生产路径，不作为选型依据。指标取：`margin = worst_positive − best_noise`、`cross_lingual` 与 `paraphrase` 的类内最低分、hop2 的 cross-topic 天花板与零假阳带宽、该 floor 下 cross-repo/same-topic 的保留条数。**余弦绝对值不可跨导出比较，margin 与保留条数可以。** 换导出时把命令 2 指向新目录跑分离度表，再把 3/4 的 `SCTX_PROBE_F2LLM_MODEL` 指向新目录跑标定与棘轮（两者读的是同一个环境变量，与模型家族无关）；arctic / bge-m3 需要先下载权重，属用户决策，本仓库不代为下载。
+
 关联召回的具体数字以四个 blocking 测试断言的为准，文档其余处的召回描述都只是转述。`association_probe_workflow` / `association_probe_zh_workflow` / `association_probe_ext_workflow` 测显式 `context_search` 的命中率，并在自动注入一侧断言「每个包为空 + 零噪声」（ADR-0007 之后这套语料无锚点可给）；`association_probe_lane_workflow` 是自动注入一侧唯一的**正向**棘轮，按径 A / 扩展 / 径 B / 噪声分开计数。四套都在 `[retrieval]` 未配置（即 embedding 通道关闭）的默认状态下测量，因此径 B 在其中恒为 0，它自己的端到端棘轮是 `sctx-search` 的 `lanes::hop2_ratchet`（需真实模型）。
 
 提交 `Cargo.lock`，确保 CLI workspace 的本地与 CI 构建使用相同依赖解析结果。

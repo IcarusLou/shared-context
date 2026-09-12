@@ -13,21 +13,39 @@
 //! runs; and how much memory and load time does the export cost, which is what
 //! `docs/user-guide.md` quotes to someone deciding whether to install it at all.
 //!
-//! Both are `#[ignore]`d because they need the operator's own model export:
+//! ## Which entry point the ladders time, and why that changed on 2026-09-12
+//!
+//! The ladders are `encode_bulk` -- the Document role, the call the corpus backfill makes for every
+//! revision. They used to be `encode`, the Query role, which was the right choice while the query
+//! path existed and the wrong one the moment the module's own purpose became the backfill's cost:
+//! for a Qwen3-family export the two are not the same encode at all, because the query role
+//! prepends an instruction and therefore tokens the backfill never pays for. Timing `encode` while
+//! claiming to answer "how long does a first backfill run" overstated the answer by whatever that
+//! prefix costs.
+//!
+//! One interactive reading is kept beside each ladder, at the 283-character length every earlier
+//! number in `docs/user-guide.md` is quoted at. `EmbeddingProvider::encode` still has exactly one
+//! production caller -- `sctx embedding status --verify` -- and ADR-0007's amendment keeps it
+//! deliberately, so what it costs is still worth one line.
+//!
+//! Both tests are `#[ignore]`d because they need a real model export:
 //!
 //! ```text
 //! SCTX_PROBE_EMBEDDING_MODEL=~/.shared-context/embedding/model \
 //! SCTX_PROBE_EMBEDDING_RUNTIME=~/.shared-context/embedding/runtime/libonnxruntime.dylib \
 //!   cargo test --release -p sctx-search --test embedding_encode_latency -- --ignored --nocapture
 //!
-//! SCTX_PROBE_F2LLM_MODEL=~/.cache/huggingface/hub/models--codefuse-ai--F2LLM-v2-0.6B/snapshots/<sha> \
+//! SCTX_PROBE_F2LLM_MODEL=~/.shared-context/embedding/model \
 //! SCTX_PROBE_EMBEDDING_RUNTIME=~/.shared-context/embedding/runtime/libonnxruntime.dylib \
 //!   cargo test --release -p sctx-search --test embedding_encode_latency -- --ignored --nocapture
 //! ```
 //!
-//! One ladder per family, over the same lengths, because the two encoders do not cost the same
-//! and an operator choosing between them is choosing between these two tables. The F2LLM ladder
-//! additionally reports the model load and the process's resident size.
+//! Two ladders over the same lengths: one for whatever export `SCTX_PROBE_EMBEDDING_MODEL` names,
+//! which is how an operator measures the model they have installed, and one for an F2LLM snapshot
+//! reached through `SCTX_PROBE_F2LLM_MODEL`, which additionally reports the model load, the token
+//! ladder and the process's resident size. Pointing both variables at one directory runs both over
+//! one export, which is a cross-check rather than a comparison; two different exports is the
+//! comparison, and the encoders do not cost the same.
 
 #![cfg(feature = "embedding-onnx")]
 
@@ -91,18 +109,46 @@ fn percentile(sorted: &[Duration], fraction: f64) -> Duration {
     sorted[rank.min(sorted.len() - 1)]
 }
 
+/// Which of the provider's two entry points is being timed.
+///
+/// Not a `TextRole`: the role is the provider's internal business, and what a caller picks is a
+/// method. Keeping the distinction at the method is what makes this a measurement of a production
+/// path rather than of a parameter -- `encode_bulk` is what the backfill calls, prefix or no
+/// prefix, and a family that stops distinguishing the two would make these two rows agree by
+/// itself.
+#[derive(Clone, Copy)]
+enum Entry {
+    /// `encode_bulk`, the Document role: every revision the corpus backfill writes.
+    Backfill,
+    /// `encode`, the Query role: `sctx embedding status --verify` and the calibration suites.
+    Interactive,
+}
+
+impl Entry {
+    fn encode(self, provider: &dyn EmbeddingProvider, text: &str) {
+        match self {
+            Self::Backfill => provider.encode_bulk(text).expect("corpus encode"),
+            Self::Interactive => provider.encode(text).expect("interactive encode"),
+        };
+    }
+}
+
 /// Encodes one text `SAMPLES` times after a short per-length warm-up, returning p50, p95 and max.
 ///
 /// The warm-up is per length rather than per run: the graph is re-shaped for each sequence length,
-/// so the first encode at a new length pays a cost no steady-state query at that length pays.
-fn measure(provider: &dyn EmbeddingProvider, text: &str) -> (Duration, Duration, Duration) {
+/// so the first encode at a new length pays a cost no steady-state encode at that length pays.
+fn measure(
+    provider: &dyn EmbeddingProvider,
+    text: &str,
+    entry: Entry,
+) -> (Duration, Duration, Duration) {
     for _ in 0..2 {
-        provider.encode(text).expect("per-length warm-up encode");
+        entry.encode(provider, text);
     }
     let mut samples = Vec::with_capacity(SAMPLES);
     for _ in 0..SAMPLES {
         let started = Instant::now();
-        provider.encode(text).expect("measured encode");
+        entry.encode(provider, text);
         samples.push(started.elapsed());
     }
     samples.sort_unstable();
@@ -113,12 +159,13 @@ fn measure(provider: &dyn EmbeddingProvider, text: &str) -> (Duration, Duration,
     )
 }
 
-/// Runs the ladder against one loaded provider and returns the p95 of the real-Intent length.
+/// Runs the backfill ladder against one loaded provider and returns the p95 of the real-Intent
+/// length, having also printed what one interactive encode of that same text costs.
 fn ladder(provider: &dyn EmbeddingProvider) -> Duration {
     // Warm-up. The first encode of a session pays one-time ORT graph and allocator costs that no
-    // steady-state query pays, and folding it into the sample would inflate every percentile.
+    // steady-state encode pays, and folding it into the sample would inflate every percentile.
     let cold = Instant::now();
-    provider.encode(&intent_query(283)).expect("warm-up encode");
+    Entry::Backfill.encode(provider, &intent_query(283));
     let cold = cold.elapsed();
     println!("\ncold first encode (283 chars): {} ms", cold.as_millis());
     println!();
@@ -130,7 +177,7 @@ fn ladder(provider: &dyn EmbeddingProvider) -> Duration {
     let mut worst_real_intent = Duration::ZERO;
     for &length in LENGTHS {
         let text = intent_query(length);
-        let (p50, p95, max) = measure(provider, &text);
+        let (p50, p95, max) = measure(provider, &text, Entry::Backfill);
         println!(
             "{length:>7}  {:>8}  {:>8}  {:>8}",
             p50.as_millis(),
@@ -141,17 +188,37 @@ fn ladder(provider: &dyn EmbeddingProvider) -> Duration {
             worst_real_intent = p95;
         }
     }
+
+    // The one surviving interactive caller, at the one length every earlier reading is quoted at.
+    // Printed beside the ladder rather than as a ladder of its own: what it is for is telling an
+    // operator whether `status --verify` is instant, and the difference between the two rows is
+    // what the query instruction costs on this family.
+    let (p50, p95, max) = measure(provider, &intent_query(283), Entry::Interactive);
+    println!(
+        "\ninteractive encode (283 chars, `status --verify`): p50 {} ms, p95 {} ms, max {} ms",
+        p50.as_millis(),
+        p95.as_millis(),
+        max.as_millis()
+    );
     println!();
     worst_real_intent
 }
 
+/// The ladder for whatever export `SCTX_PROBE_EMBEDDING_MODEL` names, which is how an operator
+/// measures the model they have actually installed.
 #[test]
-#[ignore = "needs a real bge-m3 export; see the module docs"]
-fn warm_encode_latency_by_query_length() {
+#[ignore = "needs a real model export; see the module docs"]
+fn warm_encode_latency_by_text_length() {
     let Some((model, runtime)) = provider_paths() else {
         panic!("set SCTX_PROBE_EMBEDDING_MODEL and SCTX_PROBE_EMBEDDING_RUNTIME; see module docs");
     };
-    let provider = load_onnx_provider(&model, &runtime).expect("load the configured bge-m3 export");
+    let provider =
+        load_onnx_provider(&model, &runtime).expect("load the export named by the environment");
+    println!(
+        "export {} -- {} dimensions",
+        model.display(),
+        provider.dimensions()
+    );
 
     let worst_real_intent = ladder(provider.as_ref());
     println!("283-character p95: {} ms", worst_real_intent.as_millis());
@@ -162,7 +229,7 @@ fn warm_encode_latency_by_query_length() {
 #[cfg(unix)]
 #[test]
 #[ignore = "needs a real F2LLM-v2-0.6B snapshot; see the module docs"]
-fn warm_f2llm_encode_latency_by_query_length() {
+fn warm_f2llm_encode_latency_by_text_length() {
     let before = resident_kilobytes();
     let loading = Instant::now();
     let provider = f2llm_snapshot::provider();
@@ -182,33 +249,41 @@ fn warm_f2llm_encode_latency_by_query_length() {
         _ => println!("process RSS: unavailable on this platform"),
     }
 
-    // Where the ladder's lengths actually land in tokens, because the budget's ceiling is a token
-    // count and the two are not the same conversion for two tokenizers. bge-m3's XLM-R vocabulary
-    // reaches [`SEMANTIC_MAX_TOKENS`] inside 1400 characters of this text; a byte-level BPE over
-    // the same characters need not, and a ladder that stops short of the cap would report a
-    // "ceiling" the constant can still be asked to beat.
-    println!("\n{:>7}  {:>8}", "chars", "tokens");
+    // Where the ladder's lengths actually land in tokens, because [`SEMANTIC_MAX_TOKENS`] is a
+    // token count and the conversion is not the same for two tokenizers. bge-m3's XLM-R vocabulary
+    // reaches the cap inside 1400 characters of this text; a byte-level BPE over the same
+    // characters need not, and a ladder that stops short of the cap would report a "ceiling" that
+    // is really the end of the table. Both roles, because on this family they differ by the
+    // instruction prefix and the ladder below pays only the document one.
+    println!(
+        "\n{:>7}  {:>10}  {:>10}",
+        "chars", "doc tokens", "qry tokens"
+    );
     for &length in LENGTHS {
-        let ids = provider
-            .input_ids(&intent_query(length), TextRole::Query)
-            .expect("tokenize a ladder query");
-        println!("{length:>7}  {:>8}", ids.len());
+        let text = intent_query(length);
+        let document = provider
+            .input_ids(&text, TextRole::Document)
+            .expect("tokenize a ladder text as a document");
+        let query = provider
+            .input_ids(&text, TextRole::Query)
+            .expect("tokenize a ladder text as a query");
+        println!("{length:>7}  {:>10}  {:>10}", document.len(), query.len());
     }
 
     let worst_real_intent = ladder(provider.as_ref());
 
-    // The real ceiling: a query long enough that truncation is what decides the sequence length, so
-    // this is the most expensive encode the budget can ever be asked for on this machine.
+    // The real ceiling: a text long enough that truncation is what decides the sequence length, so
+    // this is the most expensive encode the backfill can ever be asked for on this machine.
     let capped = intent_query(6_000);
     let ids = provider
-        .input_ids(&capped, TextRole::Query)
-        .expect("tokenize a query past the cap");
+        .input_ids(&capped, TextRole::Document)
+        .expect("tokenize a text past the cap");
     assert_eq!(
         ids.len(),
         SEMANTIC_MAX_TOKENS,
         "the ceiling sample must actually be truncated, or it is measuring something shorter"
     );
-    let (p50, p95, max) = measure(provider.as_ref(), &capped);
+    let (p50, p95, max) = measure(provider.as_ref(), &capped, Entry::Backfill);
     println!(
         "\ntruncation ceiling ({SEMANTIC_MAX_TOKENS} tokens): p50 {} ms, p95 {} ms, max {} ms",
         p50.as_millis(),

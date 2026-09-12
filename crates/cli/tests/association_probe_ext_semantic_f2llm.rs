@@ -1,35 +1,53 @@
-//! ADR-0004 acceptance for the default export: the extended probe set fused with F2LLM-v2-0.6B.
+//! What the default export's embedding space does to the extended probe corpus.
 //!
-//! `association_probe_ext_semantic` is the same acceptance over bge-m3, and it stays that way:
-//! `SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS` is a statement about bge-m3's score distribution on
-//! this fixture and cannot be pointed at another export. This file is the recalibrated twin, over
-//! [`QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`] and the model `sctx embedding install` now
-//! installs by default. Everything except the model, the floor and the ratchets is shared through
-//! `association_probe_harness::semantic`, so the per-category numbers below are comparable to the
-//! bge-m3 run rather than to a second runner's idea of the same measurement.
+//! The model is F2LLM-v2-0.6B, the one `sctx embedding install` installs, and the corpus is built
+//! by the real harness -- the same Git store, the same public MCP confirmation chain, the same
+//! projection -- so the text encoded here is the text the production backfill encodes. What is
+//! measured is one number pair: the lowest score any probe with an answer reaches against that
+//! corpus, and the highest any probe without one reaches. Everything except the model and those
+//! numbers is shared with `association_probe_ext_semantic` through
+//! `association_probe_harness::semantic`.
 //!
 //! `#[ignore]`d because it needs roughly 2.4 GB of weights this repository deliberately does not
-//! ship. Point it at an unmodified Hugging Face snapshot and the ONNX Runtime library:
+//! ship. Point it at an unmodified Hugging Face snapshot -- or at the installed model directory,
+//! whose layout is the same flat one -- and at the ONNX Runtime library:
 //!
 //! ```text
-//! SCTX_PROBE_F2LLM_MODEL=~/.cache/huggingface/hub/models--codefuse-ai--F2LLM-v2-0.6B/snapshots/<sha> \
+//! SCTX_PROBE_F2LLM_MODEL=~/.shared-context/embedding/model \
 //! SCTX_PROBE_EMBEDDING_RUNTIME=~/.shared-context/embedding/runtime/libonnxruntime.dylib \
 //!   cargo test --release --locked -p sctx-cli --test association_probe_ext_semantic_f2llm -- \
 //!     --ignored --nocapture
 //! ```
 //!
-//! ## What is ratcheted, and against what
+//! ## What this suite stopped asserting on 2026-09-12, and where each assertion went
 //!
-//! ADR-0004's acceptance is a set of *relative* clauses -- `paraphrase` and `cross_lingual` must
-//! gain, `identifier` and `noise` must not regress -- and every one of them is asserted here
-//! against this run's own lexical control, exactly as the bge-m3 suite asserts them against its.
-//! On top of that, the two categories the channel exists for are held to the numbers the *bge-m3*
-//! arm reaches, because a default model swap that quietly costs cross-lingual recall is the failure
-//! this file is here to catch and no self-referential comparison would see it.
+//! It was ADR-0004's acceptance: run the 39 probes lexically, run them again with a semantic
+//! channel fused in, and require `paraphrase` and `cross_lingual` to gain while `identifier` and
+//! `noise` did not regress. Every clause of that has lost its subject, and the replacement for each
+//! is named here so the next reader does not have to reconstruct it.
 //!
-//! The total is pinned too. It is a ratchet, not a target: it is what this fixture measured on the
-//! day the floor was calibrated, and its job is to make a silent regression noisy. Moving it down
-//! deliberately means saying why in the same commit.
+//! | retired assertion | why | what covers it now |
+//! |---|---|---|
+//! | in-process lexical control at 27/39, `long_intent` at 3/3 | the automatic Pack it measured is Lane A plus Lane B (S2-4), and this fixture's probes carry no file footprint, so the control now measures 5/39 -- the five noise probes returning nothing | `association_probe_ext_workflow`'s `context_search` ratchet at 30/39, through the binary, which is the entry point that still ranks lexically |
+//! | `paraphrase`/`cross_lingual` net gain, `identifier` no regression, fused total at 32/39 | there is no fused Pack. ADR-0007's amendment retired the query path; `SemanticChannel` has no query method, and Lane B never runs without a Lane A seed | the per-category *spread* below, in the document space, which is the only form of the claim a document-to-document architecture can make |
+//! | `noise_leaks == 0` on both arms | every automatic Pack in this fixture is empty, so there is nothing to leak | `assert_every_automatic_pack_is_empty` in the three lexical suites, and `association_probe_lane_workflow`'s noise count on a fixture that does have footprints |
+//! | `long_intent` p95 increment, first encode against cached encode | nothing on the retrieval path encodes any more, so the increment is zero by construction rather than by measurement | `embedding_encode_latency`, which measures the backfill's own encode cost by length |
+//!
+//! What survives is the half of the old run that was always a property of the encoder rather than
+//! of the retrieval code: `print_similarity_separation`, which scored the provider directly against
+//! the cached corpus. It is now `document_space_separation` and encodes the probe side through the
+//! Document role too, because that is the population production compares in. See its doc comment
+//! for what a probe-as-document does and does not claim.
+//!
+//! ## Why the numbers below are not the numbers this file used to hold
+//!
+//! They are readings of a different space. The corpus side moved on 2026-09-12, when `embed_corpus`
+//! stopped calling `encode` -- whose F2LLM path prepends the query instruction -- and started
+//! calling `encode_bulk` like the backfill does; the probe side moved with it. Every number the
+//! fused era recorded (a 4553 worst positive against a noise ceiling of 0, a 2800 "noise ceiling"
+//! constant whose doc described a distribution belonging to the deleted
+//! `embedding_qwen3_floor_calibration`) is a reading of a query x query space this repository never
+//! ran in production. They are not comparable to these and are not carried forward.
 
 #![cfg(unix)]
 
@@ -45,103 +63,80 @@ mod f2llm_snapshot;
 use std::{sync::Arc, time::Instant};
 
 use association_probe_harness::{
-    Harness, build_harness,
-    semantic::{
-        Run, category_hits, embed_corpus, engine, installation_root, percentile,
-        print_category_comparison, print_similarity_separation, run_suite,
-    },
+    build_harness,
+    semantic::{document_space_separation, embed_corpus, engine, installation_root},
 };
 use sctx_search::{
-    EmbeddingProvider, EmbeddingSemanticChannel, SearchEngine, SemanticChannel,
+    EmbeddingProvider, EmbeddingSemanticChannel, SemanticChannel,
     embedding::onnx::OnnxEmbeddingProvider,
 };
-
-/// Highest score any noise probe of this fixture may reach against this encoder, in basis points.
-///
-/// It was `QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`, a production constant, until ADR-0007
-/// retired the query path that read it; the number is a measurement of *this fixture against this
-/// encoder* and is kept where that measurement is taken. The 2026-09-07 run separates into eight
-/// noise queries at 303--2070, two outlying positives at 2403 and 2447, and the other 75
-/// positives at 3217--8588, so 2800 sits 730 basis points above every noise query and 417 below
-/// the main mass of positives. Cosine floors are not portable between embedding spaces -- this
-/// family's noise ceiling is more than three thousand basis points below bge-m3's -- which is why
-/// this is its own number and not a second opinion about the bge-m3 suite's.
-const F2LLM_NOISE_CEILING_BASIS_POINTS: u16 = 2_800;
 use serde_json::Value;
 
 const PROBE_FIXTURE: &str = include_str!("../../../fixtures/association/probe-ext-v1.json");
 
-/// What the blocking ext suite measures for `task_intent_update` through the real binary, and how
-/// far the in-process control may sit below it. Both are the bge-m3 suite's, unchanged: they
-/// describe the lexical channels, which no embedding model touches.
-const LEXICAL_INTENT_HITS: usize = 27;
-const LEXICAL_CONTROL_TOLERANCE: usize = 1;
-
-/// R1-3 keeps answerable words ahead of absent terms at the automatic token budget boundary.
-/// Three release runs on 2026-09-09 improved this control from 1 to 3/3 long intents (27 to 29/39
-/// overall), while fused recall remained 32/39. Pin the lexical gain where it was measured.
-const LEXICAL_LONG_INTENT_HITS: usize = 3;
-
-/// Fused hits this fixture reaches with F2LLM at the calibrated floor.
+/// Accepted revisions the harness leaves behind for the backfill to embed.
 ///
-/// Measured 2026-09-07 on the run recorded in
-/// [`QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`]'s doc comment.
+/// Eleven, not the fixture's twelve Contexts: one of them is superseded by another -- the rounding
+/// fix supersedes the original drift, which is what the `multi_hop` probes are built on -- and
+/// `embeddable_revisions` returns current accepted revisions only, so the superseded one is not in
+/// the corpus production would compare against either.
 ///
-/// Re-measured 2026-09-11, when the corpus join fix (`SEMANTIC_CORPUS_VERSION` `"1"` -> `"2"`)
-/// changed every vector this suite encodes: the corpus text stopped being `normalize_search_text`
-/// output and became the revision fields as written, which for this Chinese fixture is a different
-/// text space, not a lightly different string. Three release runs, all 29/39 lexical control and
-/// 32/39 fused, per-category identical to the line above. What did move is the margin the floor
-/// cuts: the worst-scoring positive went from 4127 to 4553 basis points against an unchanged noise
-/// ceiling of 0. So the ratchet stays where it is on purpose -- the fix bought separation on this
-/// fixture rather than hits, and pinning 32 keeps the next regression noisy.
-const FUSED_HITS: usize = 32;
+/// Pinned for the same reason the hop-2 calibration pins its Context count: the separation below is
+/// a statement about a top-1 score over *this* corpus, and a corpus that grew a Context is a corpus
+/// the ratchets were not measured on.
+const CORPUS_REVISIONS: usize = 11;
 
-/// What the bge-m3 arm of this acceptance reaches, per category, on the same fixture through the
-/// same in-process runner (measured 2026-09-07, release, `association_probe_ext_semantic`).
+/// Lowest document-space top-1 score any probe with an answer reached, in basis points.
 ///
-/// Only the two categories ADR-0004 requires a *gain* in are held to these. The rest are compared
-/// against this run's own lexical control, because a model may legitimately trade a near-duplicate
-/// tie for a paraphrase and the ADR says which of those it cares about.
-const BGE_CROSS_LINGUAL_HITS: usize = 2;
-const BGE_PARAPHRASE_HITS: usize = 8;
+/// A ratchet, not a target: it is what three release runs measured on 2026-09-12, and its job is to
+/// make a silent regression noisy. Lowering it deliberately means saying why in the same commit.
+///
+/// The run: 34 probes with an answer span 4081--8388, the 5 noise probes 503--1980. The floor is
+/// `id-02`, a bare dotted config key, and the ceiling of the noise side is `noise-05`. Rounded
+/// outward to the nearest ten, following the hop-2 calibration's convention -- pinning a
+/// float-derived basis point exactly would make a last-bit difference in one cosine a failure, and
+/// this measurement is not that sharp.
+const F2LLM_WORST_POSITIVE_BASIS_POINTS: u16 = 4_080;
+
+/// Highest document-space top-1 score any probe with no answer reached, in basis points.
+///
+/// Ratcheted from above, and the more load-bearing of the two: a noise probe that climbs into the
+/// positives' band is the failure mode a document-to-document admission decision cannot survive.
+/// Measured 1980; see the constant above for the rounding.
+///
+/// Worth reading beside `SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS` (5200), which governs the one
+/// production comparison in this space: unrelated text tops out more than three thousand basis
+/// points below that floor here, while the positives straddle it. That is the first time a probe
+/// suite's numbers have been in the same neighbourhood as the constant production actually uses --
+/// the query-space readings this file used to hold never were, which is the whole of ADR-0007's
+/// diagnosis in one line.
+const F2LLM_BEST_NOISE_BASIS_POINTS: u16 = 1_990;
+
+/// The two categories ADR-0004 added the channel for, held at their measured floor.
+///
+/// This is the ADR's per-category clause in the only form the document space can state it. The old
+/// form compared a fused hit count against a lexical one; there is no fused Pack to count. What is
+/// still true and still worth guarding is that an English query about a Chinese Context, and a
+/// paraphrase that shares no wording with one, land near that Context in this space -- the property
+/// the lexical channel cannot have and the reason an encoder is installed at all.
+///
+/// Measured: `cross_lingual` 5213--6964 over 5 probes, `paraphrase` 4091--7834 over 9. Both floors
+/// sit above the noise ceiling by more than three thousand basis points, and `cross_lingual`'s
+/// whole span sits above the hop-2 admission floor -- the category the lexical channel resolves
+/// 1/5 of is the one this space places highest.
+const F2LLM_CROSS_LINGUAL_LOWEST_BASIS_POINTS: u16 = 5_210;
+const F2LLM_PARAPHRASE_LOWEST_BASIS_POINTS: u16 = 4_090;
 
 #[test]
 #[ignore = "needs a real F2LLM-v2-0.6B snapshot; see the module docs"]
-fn the_f2llm_channel_holds_cross_lingual_and_paraphrase_at_the_calibrated_floor() {
+fn the_default_export_separates_this_corpus_in_the_document_space() {
     let fixture = serde_json::from_str::<Value>(PROBE_FIXTURE).unwrap();
     let harness = build_harness(&fixture);
     let root = installation_root(&harness);
     let engine = engine(&root);
 
-    // 1. The lexical baseline, through the same in-process path the fused run will use.
-    let lexical = run_suite(&harness, &engine, &fixture);
-    let total = fixture["probes"].as_array().unwrap().len();
-    println!(
-        "\n--- lexical control (in-process) --- {}/{total} (binary measures \
-         {LEXICAL_INTENT_HITS}/{total})",
-        lexical.hits
-    );
-    assert!(
-        lexical.hits + LEXICAL_CONTROL_TOLERANCE >= LEXICAL_INTENT_HITS,
-        "the in-process control drifted to {}/{total}, more than {LEXICAL_CONTROL_TOLERANCE} \
-         probe(s) below the {LEXICAL_INTENT_HITS}/{total} the blocking suite measures; its \
-         embedding numbers would not be comparable",
-        lexical.hits
-    );
-    assert_eq!(
-        category_hits(&lexical, "long_intent"),
-        LEXICAL_LONG_INTENT_HITS,
-        "answerable words must survive absent-token pressure in every long intent"
-    );
-    assert_eq!(
-        lexical.noise_leaks, 0,
-        "the control must reject every noise probe, or the fused run has nothing to hold to"
-    );
-
-    // 2. Load the model once and embed the whole accepted corpus. The load covers reshaping the
-    //    snapshot and initialising the runtime as well as the session, which is what an operator
-    //    waits for on the first `sctx mcp serve` too.
+    // Load the model once. The load covers reshaping the snapshot and initialising the runtime as
+    // well as the session, which is what an operator waits for on the first `sctx mcp serve` too.
     let load_started = Instant::now();
     let provider = f2llm_snapshot::provider();
     println!(
@@ -155,99 +150,65 @@ fn the_f2llm_channel_holds_cross_lingual_and_paraphrase_at_the_calibrated_floor(
     // holding no files and refuses. Nothing about that is load-bearing here: the fingerprint only
     // has to be stable for the length of one run, because the cache lives in a temporary home.
     let (cache, key, embeddable) = embed_corpus(&engine, &provider, &root, "f2llm-probe-snapshot");
+    assert_eq!(
+        embeddable, CORPUS_REVISIONS,
+        "the harness left {embeddable} embeddable revision(s) rather than {CORPUS_REVISIONS}; the \
+         fixture changed shape and the ratchets below are no longer comparable"
+    );
 
     let corpus = cache.load(&key).unwrap();
+    // The channel is built and read through the face Lane B reads, rather than just asserted to
+    // hold the right count: `document_vectors` is the one method the trait still has, and a channel
+    // that published nothing would make the second hop silently unavailable in production while
+    // this suite's own arithmetic went on working off `cache.load`.
     let channel = Arc::new(EmbeddingSemanticChannel::from_cache(&cache, &key).unwrap());
     assert_eq!(channel.corpus_size(), embeddable);
-
-    let (_worst_positive, best_noise) = print_similarity_separation(&fixture, &provider, &corpus);
-    assert!(
-        best_noise < F2LLM_NOISE_CEILING_BASIS_POINTS,
-        "this encoder must separate the fixture's noise from its positives: best noise \
-         {best_noise}, measured ceiling {F2LLM_NOISE_CEILING_BASIS_POINTS}"
-    );
-
-    let semantic_engine = engine
-        .clone()
-        .with_semantic_channel(Arc::clone(&channel) as Arc<dyn SemanticChannel>);
-
-    // 3. The same 39 probes, now with the channel fused in.
-    let fused = run_suite(&harness, &semantic_engine, &fixture);
-    println!("--- with embedding channel --- {}/{total}", fused.hits);
-    print_category_comparison(&lexical, &fused);
-
-    // ADR-0004's acceptance, against this run's own control.
-    let paraphrase_delta = i64::try_from(category_hits(&fused, "paraphrase")).unwrap()
-        - i64::try_from(category_hits(&lexical, "paraphrase")).unwrap();
-    let cross_lingual_delta = i64::try_from(category_hits(&fused, "cross_lingual")).unwrap()
-        - i64::try_from(category_hits(&lexical, "cross_lingual")).unwrap();
-    assert!(
-        paraphrase_delta + cross_lingual_delta > 0,
-        "ADR-0004 requires a net gain across paraphrase and cross_lingual, got \
-         {paraphrase_delta:+} and {cross_lingual_delta:+}"
-    );
-    assert!(
-        category_hits(&fused, "identifier") >= category_hits(&lexical, "identifier"),
-        "identifier recall must not regress"
-    );
+    let published = (Arc::clone(&channel) as Arc<dyn SemanticChannel>)
+        .document_vectors()
+        .expect("a channel over a filled cache publishes its document vectors");
     assert_eq!(
-        fused.noise_leaks, 0,
-        "the channel must not leak a single noise probe"
+        published.len(),
+        embeddable,
+        "the snapshot Lane B would read holds {} of {embeddable} corpus vector(s)",
+        published.len()
     );
 
-    // And against the model it replaced as the default.
-    assert!(
-        category_hits(&fused, "cross_lingual") >= BGE_CROSS_LINGUAL_HITS,
-        "cross_lingual fell to {} against bge-m3's {BGE_CROSS_LINGUAL_HITS} on this fixture; the \
-         default export must not cost the category the channel exists for",
-        category_hits(&fused, "cross_lingual")
-    );
-    assert!(
-        category_hits(&fused, "paraphrase") >= BGE_PARAPHRASE_HITS,
-        "paraphrase fell to {} against bge-m3's {BGE_PARAPHRASE_HITS} on this fixture",
-        category_hits(&fused, "paraphrase")
-    );
-    assert!(
-        fused.hits >= FUSED_HITS,
-        "fused recall fell to {}/{total} against the {FUSED_HITS}/{total} this fixture measured \
-         at the calibrated floor",
-        fused.hits
-    );
+    let separation = document_space_separation(&fixture, &provider, &corpus);
 
-    // 4. Latency, model already loaded.
-    report_latency(&harness, &semantic_engine, &fixture, &lexical, &fused);
-}
-
-/// Reports what the channel costs a `long_intent` retrieval, and asserts the one part of that which
-/// is a property of this code.
-///
-/// Nothing here is graded against the bge-m3 suite's budgets: those are that model's measured cost
-/// plus headroom, and this family's own ladder is measured in
-/// `crates/search/tests/embedding_encode_latency.rs`. Reproducibility is different -- it is the
-/// same code whichever model is loaded, and two identical runs that retrieved differently would be
-/// a defect rather than a slower model.
-fn report_latency(
-    harness: &Harness,
-    semantic_engine: &SearchEngine,
-    fixture: &Value,
-    lexical: &Run,
-    fused: &Run,
-) {
-    let lexical_long_p95 = percentile(lexical.long_latencies.clone(), 95);
-    let first_long_p95 = percentile(fused.long_latencies.clone(), 95);
-    println!(
-        "\nlong_intent p95: lexical {lexical_long_p95:?}, first encode {first_long_p95:?}, \
-         increment {:?}",
-        first_long_p95.saturating_sub(lexical_long_p95)
+    // The structural claim first, because it is the one that is true or false rather than high or
+    // low: the two populations do not overlap at all on this fixture. A model swap that inverted
+    // them would fail here even if both ratchets below had been re-measured around it.
+    assert!(
+        separation.margin() > 0,
+        "the populations overlap: worst positive {} ({}) is at or below best noise {} ({})",
+        separation.worst_positive,
+        separation.worst_positive_probe,
+        separation.best_noise,
+        separation.best_noise_probe
     );
-    let repeated = run_suite(harness, semantic_engine, fixture);
-    let repeated_long_p95 = percentile(repeated.long_latencies.clone(), 95);
-    println!(
-        "long_intent p95 (cached encode): {repeated_long_p95:?}, increment {:?}",
-        repeated_long_p95.saturating_sub(lexical_long_p95)
+    assert!(
+        separation.worst_positive >= F2LLM_WORST_POSITIVE_BASIS_POINTS,
+        "the weakest positive fell to {} ({}) against the measured \
+         {F2LLM_WORST_POSITIVE_BASIS_POINTS}",
+        separation.worst_positive,
+        separation.worst_positive_probe
     );
-    assert_eq!(
-        repeated.hits, fused.hits,
-        "two identical runs over one corpus must retrieve identically"
+    assert!(
+        separation.best_noise <= F2LLM_BEST_NOISE_BASIS_POINTS,
+        "unrelated text climbed to {} ({}) against the measured {F2LLM_BEST_NOISE_BASIS_POINTS}",
+        separation.best_noise,
+        separation.best_noise_probe
+    );
+    assert!(
+        separation.lowest_in("cross_lingual") >= F2LLM_CROSS_LINGUAL_LOWEST_BASIS_POINTS,
+        "the weakest cross-lingual probe fell to {} against the measured \
+         {F2LLM_CROSS_LINGUAL_LOWEST_BASIS_POINTS}",
+        separation.lowest_in("cross_lingual")
+    );
+    assert!(
+        separation.lowest_in("paraphrase") >= F2LLM_PARAPHRASE_LOWEST_BASIS_POINTS,
+        "the weakest paraphrase probe fell to {} against the measured \
+         {F2LLM_PARAPHRASE_LOWEST_BASIS_POINTS}",
+        separation.lowest_in("paraphrase")
     );
 }

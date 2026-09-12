@@ -1,40 +1,58 @@
 //! The half of the embedding acceptance runs that is the same for every model family.
 //!
-//! Two suites use it: `association_probe_ext_semantic` (bge-m3, whose floor the extended fixture
-//! calibrated) and `association_probe_ext_semantic_f2llm` (the F2LLM default). What they share is
-//! everything except the model: the same corpus, the same lexical control, the same in-process
-//! retrieval path, the same percentile arithmetic. Keeping that in one place is what makes the two
-//! runs comparable at all -- a per-category delta measured by one runner against a number produced
-//! by a slightly different one would be a comparison of runners, which is the mistake the module
-//! docs of the bge-m3 suite spend three paragraphs guarding against.
+//! Two suites use it: `association_probe_ext_semantic` (an export named by the operator, the arm a
+//! model swap is compared on) and `association_probe_ext_semantic_f2llm` (the export `sctx
+//! embedding install` actually installs, the arm that carries the ratchet). What they share is
+//! everything except the model: the same corpus, built by the same public confirmation chain, the
+//! same document-role encode, the same separation arithmetic. Keeping that in one place is what
+//! makes the two runs comparable at all -- a per-category number measured by one runner against a
+//! number produced by a slightly different one would be a comparison of runners.
 //!
-//! What stays in each suite is what genuinely differs: how the model is loaded, which floor its
-//! space is calibrated to, and which numbers are ratcheted.
+//! What stays in each suite is what genuinely differs: how the model is loaded, and which numbers
+//! that model's space is ratcheted at.
+//!
+//! ## What this module stopped measuring on 2026-09-12
+//!
+//! It used to run the 39 probes twice -- once lexically, once with a semantic channel fused in --
+//! and read ADR-0004's per-category acceptance off the difference. There is no such difference to
+//! read any more, and the reason is architectural rather than numerical:
+//!
+//! * ADR-0007's amendment retired the query path. `SemanticChannel` has no query method; nothing
+//!   in production encodes a Working Intent, so "how many probes does the embedding channel lift"
+//!   names a mechanism that does not exist.
+//! * The dual-lane rebuild (`docs/dual-lane/plan.md`, S2-4) made automatic injection Lane A plus
+//!   Lane B and nothing else. `probe-ext-v1`'s 39 probes carry no file footprint, so Lane A seeds
+//!   nothing, so Lane B never runs, so every automatic Pack is empty with or without a model
+//!   attached. The `run_suite`/`automatic_top1`/`print_category_comparison` machinery measured
+//!   5/39 on both arms -- the five noise probes, scored for correctly returning nothing -- and the
+//!   ADR-0004 delta assertions could no longer be satisfied by any model.
+//!
+//! The three lexical probe suites hold the surviving hit-rate numbers: `context_search` at 30/39
+//! (`association_probe_ext_workflow`) and the empty-Pack statement beside it, with
+//! `association_probe_lane_workflow` as automatic injection's one positive ratchet. This module
+//! does not re-measure any of them. What it measures instead is the one thing a real model is still
+//! needed for here: whether this encoder separates this corpus from unrelated text *in the space
+//! production writes vectors in*.
 
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
-use sctx_domain::{TaskId, WorkingIntentSnapshot};
 use sctx_engineering_graph::EngineeringProjectionStore;
 use sctx_index::{ProjectionIndex, SEARCH_RANKING_VERSION};
 use sctx_search::{
-    ContextPackMode, EmbeddingProvider, SearchEngine, SemanticCacheKey, SemanticVectorCache,
-    TaskContextRequest, embedding::cosine_similarity,
+    EmbeddingProvider, SearchEngine, SemanticCacheKey, SemanticVectorCache,
+    embedding::cosine_similarity,
 };
 use serde_json::Value;
 
-use super::{Harness, reset_context_usage, top_index};
+use super::Harness;
 
-/// The `task_intent_update` defaults the real automatic path uses (`crates/mcp/src/lib.rs`).
-pub const AUTOMATIC_TOKEN_BUDGET: usize = 8_000;
-pub const AUTOMATIC_MAX_SPACES: usize = 8;
-
-/// The probe category whose queries are the length a real automatic retrieval submits.
-pub const LONG_INTENT_CATEGORY: &str = "long_intent";
+/// The category whose probes have no answer, and whose scores are therefore the noise ceiling.
+pub const NOISE_CATEGORY: &str = "noise";
 
 pub fn installation_root(harness: &Harness) -> PathBuf {
     harness.home.join(".shared-context")
@@ -46,117 +64,6 @@ pub fn engine(root: &Path) -> SearchEngine {
     match EngineeringProjectionStore::initialize(root) {
         Ok(graph) => SearchEngine::with_engineering_graph(index, graph),
         Err(_) => SearchEngine::new(index),
-    }
-}
-
-/// One automatic retrieval, shaped exactly like the one `task_intent_update` performs.
-pub fn automatic_top1(engine: &SearchEngine, query: &str) -> (Option<String>, usize, Duration) {
-    let mut request = TaskContextRequest::automatic(
-        TaskId::new(),
-        WorkingIntentSnapshot {
-            goal: query.to_owned(),
-            current_direction: None,
-            in_scope: Vec::new(),
-            out_of_scope: Vec::new(),
-            domains: Vec::new(),
-            platforms: Vec::new(),
-            constraints: Vec::new(),
-            acceptance_conditions: Vec::new(),
-            artifact_hints: Vec::new(),
-            interface_hints: Vec::new(),
-            open_questions: Vec::new(),
-        },
-        Vec::new(),
-        AUTOMATIC_TOKEN_BUDGET,
-    );
-    request.mode = ContextPackMode::AutomaticInjection;
-    request.max_spaces = AUTOMATIC_MAX_SPACES;
-    let started = Instant::now();
-    let pack = engine.task_context_pack(&request).unwrap();
-    let elapsed = started.elapsed();
-    (
-        pack.items
-            .first()
-            .map(|item| item.context.context_id.to_string()),
-        pack.items.len(),
-        elapsed,
-    )
-}
-
-pub struct Run {
-    pub hits: usize,
-    pub by_category: BTreeMap<String, (usize, usize)>,
-    pub latencies: Vec<Duration>,
-    /// Latencies of the `long_intent` probes alone. The suite average is dominated by 15--40
-    /// character probes that no automatic retrieval ever submits, and a p95 taken over it is the
-    /// measurement that let a 200 ms encode budget look adequate.
-    pub long_latencies: Vec<Duration>,
-    pub noise_leaks: usize,
-}
-
-pub fn run_suite(harness: &Harness, engine: &SearchEngine, fixture: &Value) -> Run {
-    let mut run = Run {
-        hits: 0,
-        by_category: BTreeMap::new(),
-        latencies: Vec::new(),
-        long_latencies: Vec::new(),
-        noise_leaks: 0,
-    };
-    for probe in fixture["probes"].as_array().unwrap() {
-        reset_context_usage(&harness.home);
-        let query = probe["query"].as_str().unwrap();
-        let category = probe["category"].as_str().unwrap().to_owned();
-        let expected = probe["expected"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|value| value.as_u64().unwrap())
-            .collect::<Vec<_>>();
-
-        let (top1, count, elapsed) = automatic_top1(engine, query);
-        run.latencies.push(elapsed);
-        if category == LONG_INTENT_CATEGORY {
-            run.long_latencies.push(elapsed);
-        }
-        let index = top_index(harness, top1.as_deref());
-        let hit = if expected.is_empty() {
-            if count > 0 {
-                run.noise_leaks += 1;
-            }
-            count == 0
-        } else {
-            index.is_some_and(|index| expected.contains(&index))
-        };
-        run.hits += usize::from(hit);
-        let entry = run.by_category.entry(category).or_default();
-        entry.0 += 1;
-        entry.1 += usize::from(hit);
-    }
-    run
-}
-
-pub fn percentile(mut samples: Vec<Duration>, percent: usize) -> Duration {
-    assert!(!samples.is_empty());
-    samples.sort_unstable();
-    let index = (samples.len() * percent).div_ceil(100).saturating_sub(1);
-    samples[index.min(samples.len() - 1)]
-}
-
-pub fn category_hits(run: &Run, category: &str) -> usize {
-    run.by_category.get(category).map_or(0, |entry| entry.1)
-}
-
-/// Prints the per-category lexical/fused comparison ADR-0004's acceptance is read off.
-pub fn print_category_comparison(lexical: &Run, fused: &Run) {
-    println!("\n--- ADR-0004 per-category comparison (task_intent_update) ---");
-    println!(
-        "{:<16} {:>6} {:>10} {:>10} {:>8}",
-        "category", "count", "lexical", "fused", "delta"
-    );
-    for (category, (count, lexical_hits)) in &lexical.by_category {
-        let fused_hits = category_hits(fused, category);
-        let delta = i64::try_from(fused_hits).unwrap() - i64::try_from(*lexical_hits).unwrap();
-        println!("{category:<16} {count:>6} {lexical_hits:>10} {fused_hits:>10} {delta:>+8}");
     }
 }
 
@@ -176,7 +83,15 @@ pub fn embed_corpus(
     let embeddable = engine.embeddable_revisions().unwrap();
     let started = Instant::now();
     for (revision_id, text) in &embeddable {
-        let vector = provider.encode(text).expect("every corpus text encodes");
+        // Corpus texts are documents: `encode_bulk` takes the Document role, matching what the
+        // production backfill (`fill_missing_vectors`) and the hop-2 calibration encode. Until
+        // 2026-09-12 this called `encode`, whose F2LLM path prepends the query instruction -- so
+        // the ADR-0004 F2LLM arm was accepted in a query x query space production never uses. The
+        // signal-pollution audit confirmed the mismatch; every fused number measured before this
+        // line changed belongs to that other space.
+        let vector = provider
+            .encode_bulk(text)
+            .expect("every corpus text encodes");
         cache.store(&key, *revision_id, &vector).unwrap();
     }
     println!(
@@ -187,48 +102,148 @@ pub fn embed_corpus(
     (cache, key, embeddable.len())
 }
 
-/// Prints the raw separation this encoder achieves on the fixture, and returns the two numbers
-/// that bound it: the lowest-scoring positive and the highest-scoring noise query.
+/// The span of top-1 scores one probe category reached, in basis points.
+pub struct CategorySpread {
+    pub count: usize,
+    /// The category's worst probe. For a positive category this is what a floor would have to
+    /// clear from below; for `noise` it says nothing and is printed for completeness.
+    pub lowest: u16,
+    /// The category's best probe. For `noise` this is the number that matters.
+    pub highest: u16,
+}
+
+/// One encoder's separation on one fixture, measured entirely in the document space.
+pub struct Separation {
+    /// Lowest top-1 score any probe with an answer reached, and which probe reached it.
+    pub worst_positive: u16,
+    pub worst_positive_probe: String,
+    /// Highest top-1 score any probe with no answer reached, and which probe reached it.
+    pub best_noise: u16,
+    pub best_noise_probe: String,
+    pub by_category: BTreeMap<String, CategorySpread>,
+}
+
+impl Separation {
+    /// The gap the two distributions leave between them. Negative gaps are the interesting ones,
+    /// which is why this is signed rather than a `saturating_sub`.
+    pub fn margin(&self) -> i32 {
+        i32::from(self.worst_positive) - i32::from(self.best_noise)
+    }
+
+    pub fn lowest_in(&self, category: &str) -> u16 {
+        self.by_category
+            .get(category)
+            .map_or(0, |spread| spread.lowest)
+    }
+}
+
+/// Scores every probe text against the cached corpus **with both sides in the document role**, and
+/// returns the two numbers that bound the result.
 ///
-/// ADR-0004 set a provisional 0.50 from a prototype on the two older fixtures and deferred the
-/// final value to this set. Printing the distribution means the next person to question a
-/// threshold re-reads a table instead of re-deriving one.
+/// ## Why both sides are documents
 ///
-/// It scores the provider against the cached corpus directly. It used to go through the channel's
-/// `similar_revisions`, which applied the model family's floor and returned a truncated ranking;
-/// ADR-0007 retired that path, and going through it was the wrong shape for this measurement
-/// anyway -- a separation is a property of the raw score distribution, and reading it through the
-/// threshold it is supposed to justify hides exactly the values that would move one.
-pub fn print_similarity_separation(
+/// The corpus half is not a choice: `embed_corpus` writes exactly what the production backfill
+/// writes, and that is `encode_bulk`, the Document role. The probe half is the change ADR-0007's
+/// amendment forces. A cosine is only meaningful between two vectors of one population, and the
+/// population production compares in is document against document -- Lane B's second hop takes a
+/// seed Context's stored vector and a candidate Context's stored vector, and no query is encoded
+/// anywhere on the path. Encoding the probe text as a query would measure the space that was
+/// retired, which for F2LLM is a genuinely different space: the query role prepends an instruction
+/// this family was trained to see in front of questions and never in front of corpus text.
+///
+/// ## What it therefore does and does not claim
+///
+/// A probe text encoded as a document is a *proxy* for a stored Context, not one: it is 15--356
+/// characters of paraphrase rather than a `statement` and `rationale` written by a Checkpoint. So
+/// this is a measurement of the **space** -- does this encoder put text about the dedupe window
+/// near the Context about the dedupe window, and unrelated text nowhere near it -- and not of the
+/// lane. The lane itself is measured where it lives, against Contexts on both sides:
+/// `embedding_hop2_admission_calibration` and `lanes::hop2_ratchet` in `sctx-search`.
+///
+/// Top-1 over the whole corpus rather than the score against the probe's own expected Context, for
+/// the same reason the measurement it replaced used top-1: a separation is a statement about which
+/// scores the two populations can reach at all, and scoring only the intended pair would hide the
+/// unrelated Context that outscored it.
+pub fn document_space_separation(
     fixture: &Value,
     provider: &Arc<dyn EmbeddingProvider>,
     corpus: &[(sctx_domain::RevisionId, Vec<f32>)],
-) -> (u16, u16) {
-    println!("\n--- top similarity per probe (basis points) ---");
-    let mut worst_positive = u16::MAX;
-    let mut best_noise = 0_u16;
+) -> Separation {
+    assert!(!corpus.is_empty(), "an empty corpus separates nothing");
+    println!("\n--- document-space top-1 per probe (basis points) ---");
+    let mut separation = Separation {
+        worst_positive: u16::MAX,
+        worst_positive_probe: String::new(),
+        best_noise: 0,
+        best_noise_probe: String::new(),
+        by_category: BTreeMap::new(),
+    };
     for probe in fixture["probes"].as_array().unwrap() {
+        let id = probe["id"].as_str().unwrap();
+        let category = probe["category"].as_str().unwrap();
         let query = probe["query"].as_str().unwrap();
         let is_noise = probe["expected"].as_array().unwrap().is_empty();
-        let vector = provider.encode(query).expect("every probe query encodes");
+        assert_eq!(
+            is_noise,
+            category == NOISE_CATEGORY,
+            "probe {id} is tagged {category} but its expected set says otherwise; the two \
+             populations below would be built from the wrong rows"
+        );
+        let vector = provider
+            .encode_bulk(query)
+            .expect("every probe text encodes");
         let top = corpus
             .iter()
             .map(|(_, candidate)| basis_points(cosine_similarity(&vector, candidate)))
             .max()
-            .unwrap_or(0);
+            .expect("the corpus is not empty");
         if is_noise {
-            best_noise = best_noise.max(top);
-        } else if top > 0 {
-            worst_positive = worst_positive.min(top);
+            if top > separation.best_noise || separation.best_noise_probe.is_empty() {
+                separation.best_noise = top;
+                id.clone_into(&mut separation.best_noise_probe);
+            }
+        } else if top < separation.worst_positive {
+            separation.worst_positive = top;
+            id.clone_into(&mut separation.worst_positive_probe);
         }
+        let spread = separation
+            .by_category
+            .entry(category.to_owned())
+            .or_insert(CategorySpread {
+                count: 0,
+                lowest: u16::MAX,
+                highest: 0,
+            });
+        spread.count += 1;
+        spread.lowest = spread.lowest.min(top);
+        spread.highest = spread.highest.max(top);
+        println!("{id:<10} {category:<16} {top:>6}");
+    }
+    assert!(
+        separation.worst_positive != u16::MAX,
+        "the fixture holds no probe with an answer; there is no positive population to separate"
+    );
+
+    println!("\n--- document-space spread per category (basis points) ---");
+    println!(
+        "{:<16} {:>6} {:>10} {:>10}",
+        "category", "count", "lowest", "highest"
+    );
+    for (category, spread) in &separation.by_category {
         println!(
-            "{:<10} {:<16} {top:>6}",
-            probe["id"].as_str().unwrap(),
-            probe["category"].as_str().unwrap()
+            "{category:<16} {:>6} {:>10} {:>10}",
+            spread.count, spread.lowest, spread.highest
         );
     }
-    println!("worst scoring positive {worst_positive}, best scoring noise {best_noise}");
-    (worst_positive, best_noise)
+    println!(
+        "\nworst positive {} ({}), best noise {} ({}), margin {}",
+        separation.worst_positive,
+        separation.worst_positive_probe,
+        separation.best_noise,
+        separation.best_noise_probe,
+        separation.margin()
+    );
+    separation
 }
 
 /// Cosine to basis points, clamped, by the same rounding every recorded score uses.

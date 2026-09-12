@@ -91,9 +91,10 @@ pub mod onnx;
 /// same 13 of 47. Erring high is the standing rule: a Context nobody asked for is worse than no
 /// Context.
 ///
-/// Its numerical equality with [`SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`] is a coincidence of two
-/// unrelated measurements in two unrelated embedding spaces. Neither is evidence about the other
-/// and they must not be merged.
+/// Its numerical equality with the retired query-side floor bge-m3 was calibrated to (also 5200,
+/// now a local constant of `association_probe_ext_semantic`'s module docs rather than a production
+/// threshold) is a coincidence of two unrelated measurements in two unrelated embedding spaces.
+/// Neither is evidence about the other and they must not be merged.
 ///
 /// ## Recall differs between the two corpora, and that is a property of the corpora
 ///
@@ -640,11 +641,12 @@ impl SemanticVectorCache {
     /// ineligible for automatic injection keeps its vector forever otherwise, because the key it
     /// is filed under never changes. Measured at 5 of 28 rows (18%) on one real installation.
     ///
-    /// A dead vector cannot resurrect its Context: `apply_semantic_context_evidence` re-checks the
-    /// safety predicate on every hit. What it can do is take one of the channel's
-    /// [`SEMANTIC_CHANNEL_LIMIT`] slots and be discarded after the fact, so the cost is recall, not
-    /// correctness. `keep` is the accepted set the backfill just read, which makes this the same
-    /// snapshot the next encode pass works from.
+    /// A dead vector cannot resurrect its Context: the second hop filters its candidates through
+    /// the accepted-and-safe predicate, so a vector whose Context has gone is scored and then
+    /// dropped. What it costs is the work of scoring it and, before ADR-0007, one of the retired
+    /// query channel's ranked slots -- recall rather than correctness either way. `keep` is the
+    /// accepted set the backfill just read, which makes this the same snapshot the next encode pass
+    /// works from.
     ///
     /// # Errors
     ///
