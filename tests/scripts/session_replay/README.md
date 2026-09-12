@@ -14,6 +14,33 @@ does not branch on host. What it *does* have to read is the digest's
 than a Codex rollout (no tool results, no injections, no token usage) and an
 absence there is a missing record, not a finding.
 
+### Capability matrix: what each host's replay path can actually verify
+
+Measured, not intended. The Cursor column is about `cursor-agent --print`,
+which is the only headless entry point there is; an interactive Cursor session
+does fire the events it says "never" to, so this is a property of the *replay
+path*, not of Cursor.
+
+| What an audit wants to check | Codex (`codex app-server`) | Cursor (`cursor-agent --print`) |
+|---|---|---|
+| `SessionStart` / `sessionStart` | yes, once per replay | yes, once per `--print` invocation |
+| Prompt-side hooks (`UserPromptSubmit` / `beforeSubmitPrompt`) | yes, once per turn | **never fires** — 0 payloads in 5 replays |
+| `PostToolUse` / `postToolUse` | yes | yes (66 payloads measured) |
+| Turn-end hooks (`Stop` / `stop`) | yes, once per turn | **never fires** — 0 payloads in 5 replays |
+| `PreCompact` / `preCompact` | yes when compaction happens | never observed |
+| `SessionEnd` / `sessionEnd` | yes, once per replay | yes, but once *per invocation* (2 for a 2-turn run) |
+| Tool results / arguments on the wire | yes (`host/turn-<n>.jsonl`) | no — the transcript records neither |
+| Injected context (`<shared-context-active>`, packs) | yes | marker only, no pack body |
+| Token usage | yes | no |
+| Per-turn identity | `turn_id` from the protocol | none; one conversation id per invocation |
+
+The load-bearing consequence: **a Cursor replay structurally cannot verify any
+TurnStop behaviour or any prompt-side behaviour.** Every acceptance criterion
+about the TurnStop reminder, its cap, its revival after a close-type
+Checkpoint, or anything keyed on prompt submission **must be run on a Codex
+host.** A zero on the Cursor side is the absence of a mechanism to observe it,
+never evidence that the feature did not fire. Recorded as deferred issue #46.
+
 ## bundle
 
 `bundle.py` builds the bundle:
@@ -275,8 +302,51 @@ mirror is written into the manifest under `deviations` and `warnings`.
 python3 tests/scripts/session_replay/replay.py --session <thread_id> \
   [--turns N|all] [--audit-root ~/.shared-context-audit] \
   [--checkout worktree|inplace] [--codex-home isolated|real] [--sctx-bin PATH] \
-  [--driver app-server|exec-resume] [--on-question stop|next-prompt] [--dry-run]
+  [--driver app-server|exec-resume] [--on-question stop|next-prompt] \
+  [--proxy URL | --no-proxy] [--max-stream-interruptions N] [--dry-run]
 ```
+
+### The proxy will decide whether the replay runs at all
+
+**Read this before the first replay.** The Codex child inherits the calling
+shell's environment, proxy variables included, and Codex's app-server talks to
+the model over a long-lived stream. A proxy that serves ordinary HTTP perfectly
+well can still reset that stream on every turn — measured with a local proxy on
+`127.0.0.1:17890`: three prompts, three turns of nothing, and (before this was
+fixed) a manifest that described three replayed turns.
+
+- On this machine the value that works is `--proxy http://127.0.0.1:7897`.
+  Under a wrapper that exports a different one (`cac` exports
+  `127.0.0.1:17890`), pass `--proxy` explicitly rather than inheriting.
+- `--no-proxy` strips every proxy variable and sets `NO_PROXY=*`.
+- Omitting both inherits, which is still the default, but now prints a warning
+  naming what was inherited.
+- Either way `manifest.environment.proxy` records `source`
+  (`inherited` / `--proxy` / `--no-proxy`) and the effective values, so an
+  audit can tell a network failure from a behavioural one.
+
+`--max-stream-interruptions N` (default 3, `0` disables) aborts the run after N
+`responseStreamDisconnected`/`Reconnecting` events inside one turn, instead of
+burning the turn budget and continuing into turns that will fail identically.
+
+### The run has a verdict, and the exit code carries it
+
+`manifest.run` is the run-level answer that used to be missing:
+
+```
+run.status                  completed | partial | failed | no_turns
+                            | stopped_on_question | incomplete
+run.turns_attempted         how many turns were started
+run.turns_failed            how many exited non-zero or reported an error
+run.failed_turn_indexes     which ones
+run.stream_interruptions    disconnects/reconnects across the whole run
+```
+
+Each row in `turns[]` also carries `failed`, `turn_id` (the host's per-turn
+identity — `thread_id` is the *thread's*, and is the same for every turn by
+design) and `stream_interruptions`. `replay.py` exits non-zero when
+`run.status` is `failed` or `no_turns`, so a wrapper cannot mistake a replay
+that never reached the model for one worth auditing.
 
 `--dry-run` resolves the original and prints the plan (commit, branch, model,
 sandbox, approval policy, prompt count and per-prompt length) without running
@@ -294,7 +364,9 @@ host/turn-<n>.jsonl    the raw `codex exec --json` stream for each turn
 host/turn-<n>.stderr
 ```
 
-and one detached worktree at `<audit-root>/worktrees/<replay-id>`.
+and one worktree at `<audit-root>/worktrees/<replay-id>`, attached to a
+`replay/<original branch>` branch (see "Isolation model" for what happens when
+that branch cannot be created).
 
 ### Driver: one app-server process, not one `codex exec` per turn
 
@@ -408,13 +480,21 @@ replay that writes into it would corrupt the very state the audit measures.
   named `replay/<original branch>` (`--checkout worktree`, the default). A
   *detached* worktree reports `git_branch` as `-`, which propagates into the
   replayed session's metadata and into every hook that reads it, so the replay
-  stops being comparable on a field the audit reads; if the branch name is taken
-  the replay id is appended, and if the branch cannot be created at all the
-  worktree falls back to detached with a warning. The repository under replay is
+  stops being comparable on a field the audit reads — and worse, a replayed
+  agent reads `-` as a fact about the repository and writes it into its own
+  knowledge. The chain is therefore: try `replay/<branch>`; if that name is
+  already a ref, try `replay/<branch>-<replay-id>`; only if *both* fail fall
+  back to `--detach`. Every failed attempt keeps git's own stderr, in
+  `manifest.checkout.attempts` and in a warning, so an audit can tell "the host
+  would not give us a branch" apart from "the replay never asked for one".
+  `manifest.checkout.branch_mode` is `created`, `created_after_collision`,
+  `detached`, `inplace` or `inplace_detached`. The repository under replay is
   never written to — only `git worktree add`/`remove` touch it. If the commit is not
   present locally the run fails and names the commit and branch to fetch.
   `--checkout inplace` runs in the original directory instead and prints a loud
-  warning; it does not stash, reset or restore anything.
+  warning; it does not stash, reset or restore anything, and if the original
+  directory is itself a detached checkout it now says so rather than reporting
+  `git_branch: '-'` in silence.
 - **The Repository registration.** Shared Context authorizes a session by
   longest-prefix match of its startup directory against the registered checkout
   paths, so a worktree at a brand-new path would activate nothing. `replay.py`
@@ -750,6 +830,22 @@ existing in the snapshot and absent from the operator's real installation.
   `<shared-context-active>` marker and `marker_names_replayed_conversation` is
   `true`. So the hooks ran, sctx activated, and it activated *for this
   conversation* — with no trust handshake of any kind.
+- **And the structural gap**: `beforeSubmitPrompt`, `stop` and `preCompact` are
+  all registered by `build_cursor_home` and **none of them fired**. Confirmed
+  across five replays: zero `stop`, zero `beforeSubmitPrompt`. The same events
+  do fire in an interactive Cursor session — `hook-diagnostics.json` from real
+  sessions shows `turn_stop` counts of 5, 6 and 11 — so this is a property of
+  `cursor-agent --print`, not of Cursor, and not of our registration. Note also
+  that `sessionEnd` is 2 for a 2-turn run: one per `--print` invocation.
+
+  The consequence is not a measurement to improve but a boundary to respect:
+  **the Cursor replay path cannot verify any TurnStop or prompt-side behaviour
+  at all.** Reminder revival, the reminder cap, the `## stop` policy channel,
+  anything keyed on prompt submission — all of it must be accepted on a Codex
+  host. A zero here is an absent instrument. Deliberately not worked around:
+  driving Cursor interactively is out of scope for a headless audit, and a
+  synthetic `stop` would prove only that we can call our own hook. See the
+  capability matrix at the top of this file, and deferred issue #46.
 - `real_shared_context_unchanged: true` (identical row-count fingerprint before
   and after across all 9 tracked tables), `real_cursor_unchanged: true`
   (627 → 627 transcripts, `real_cursor_new_transcripts: []`).

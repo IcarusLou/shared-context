@@ -100,7 +100,7 @@
 
 45. **显式 context_search 成为 wire 大户**:自动包收敛到 ≤8000 tokens 后,单次 context_search 实测 65.8KB(被 Cursor 溢写成文件)。B1 解冻 Explicit 模式清点时,把显式检索纳入与 pack 相同的信封口径与降级链。
 
-46. **回放工具五项(归组)**:turn-timeout 仅在 stdout 有新行时检查(需独立看门狗);两个回放并发会让 --resume 全挂(需互斥);manifest 的模型 fidelity 与 hook payload 实测不符(auto-smart vs 宣称值,应回填);Cursor 子会话(无 sessionStart 的子 conversation)各自获发 activation marker(一次回放=三个被授权 session,授权面值得收紧);pack_deliveries 对"同批 ctx 重复投放"少计(task_injection 去重所致,跨宿主 count=pushes 的承诺不成立)。另:host/turn-N.jsonl 记录完整 MCP result,建议并回 hosts/cursor.py 作为 wire 观测源。
+46. **回放工具五项(归组)**:turn-timeout 仅在 stdout 有新行时检查(需独立看门狗);两个回放并发会让 --resume 全挂(需互斥);manifest 的模型 fidelity 与 hook payload 实测不符(auto-smart vs 宣称值,应回填);Cursor 子会话(无 sessionStart 的子 conversation)各自获发 activation marker(一次回放=三个被授权 session,授权面值得收紧);pack_deliveries 对"同批 ctx 重复投放"少计(task_injection 去重所致,跨宿主 count=pushes 的承诺不成立)。另:host/turn-N.jsonl 记录完整 MCP result,建议并回 hosts/cursor.py 作为 wire 观测源。**2026-09-12 追加(配对回放实证)**:三项已修(代理透传无记录、turn 失败仍写"完成"的 manifest、worktree detached 静默降级——见 `manifest.environment` / `manifest.run` / `manifest.checkout.branch_mode`);新增一条**结构性缺陷,记档不修**:`cursor-agent --print` 只触发 sessionStart/postToolUse/sessionEnd,五次回放**零 stop、零 beforeSubmitPrompt、零 preCompact**(且 sessionEnd 按 --print 调用次数计,2 turn = 2 次),而真实交互 Cursor 会发(hook-diagnostics 实测 turn_stop 5/6/11)。含义:**Cursor 回放路径结构上无法验证任何 TurnStop 与 prompt 侧行为**——提醒复活、提醒 cap、`## stop` 策略段通道等验收一律必须用 Codex host;Cursor 侧的零是"仪器缺席"而非"功能没跑"。不修的理由:交互式驱动 Cursor 超出无头审计范围,合成 stop 只能证明我们能调自己的 hook。能力矩阵见 `tests/scripts/session_replay/README.md` 顶部。升级条件:Cursor 给出无头的 turn 边界事件,或出现只能在 Cursor 复现的 TurnStop 缺陷。
 
 ## 2026-09-12 新增(WP-G2a 供给侧清扫发现)
 

@@ -18,7 +18,16 @@ Usage::
 
 Nothing here writes into the repository under replay, into ``~/.shared-context``
 or into ``~/.codex``: the replay's whole footprint is the audit root plus one
-detached ``git worktree``.
+``git worktree``, attached to a fresh ``replay/<branch>`` so the replayed session
+reports the same ``git_branch`` shape the original did.
+
+Two environment facts are load-bearing and are recorded in the manifest rather
+than assumed. A proxy exported by the calling shell is inherited by the Codex
+child, and a proxy that serves ordinary HTTP can still reset the app-server's
+stream -- measured: three prompts, zero output, and a manifest that described
+three replayed turns. Use ``--proxy``/``--no-proxy`` to decide it deliberately;
+``manifest.environment.proxy`` says what was in force, and ``manifest.run``
+carries the run's verdict instead of leaving it to be inferred from warnings.
 """
 
 from __future__ import annotations
@@ -369,6 +378,72 @@ def git_output(args: list[str]) -> str:
     return completed.stdout.strip()
 
 
+PROXY_VARIABLES = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+
+# Codex's app-server talks to the model over a long-lived stream. A proxy that serves ordinary
+# HTTP perfectly well can still reset that stream, and Codex's own recovery text is the only
+# signal: it reconnects, silently, until the turn's budget runs out. Matched on the raw line
+# rather than on parsed JSON, because the same text reaches the replay on stderr too.
+STREAM_INTERRUPTION = re.compile(r"responseStreamDisconnected|Reconnecting", re.IGNORECASE)
+
+
+def count_stream_interruptions(text: str) -> int:
+    return len(STREAM_INTERRUPTION.findall(text))
+
+
+def apply_proxy_policy(
+    environment: dict[str, str],
+    proxy: str | None,
+    no_proxy: bool,
+    warnings: list[str],
+) -> dict[str, Any]:
+    """Settles the Codex child's proxy variables and returns what the manifest must record.
+
+    The replay used to hand the child a plain copy of the caller's environment, which meant the
+    proxy was whatever the operator's shell happened to export -- measured: a local proxy on
+    127.0.0.1:17890 reset the app-server's websocket on every turn, all three prompts produced
+    nothing, and the manifest still described three replayed turns. An environment that decides
+    whether a replay can run at all belongs in the record.
+    """
+    record: dict[str, Any] = {
+        "home": environment.get("HOME"),
+        "codex_home": environment.get("CODEX_HOME"),
+        "cleared": ["SCTX_LOGS_ROOT"],
+    }
+    if no_proxy:
+        removed = sorted(name for name in PROXY_VARIABLES if name in environment)
+        for name in PROXY_VARIABLES:
+            environment.pop(name, None)
+        environment["NO_PROXY"] = "*"
+        environment["no_proxy"] = "*"
+        record["proxy"] = {"source": "--no-proxy", "removed": removed, "values": {}}
+        return record
+    if proxy is not None:
+        for name in PROXY_VARIABLES:
+            environment[name] = proxy
+        record["proxy"] = {"source": "--proxy", "values": {name: proxy for name in PROXY_VARIABLES}}
+        return record
+    inherited = {name: environment[name] for name in PROXY_VARIABLES if name in environment}
+    record["proxy"] = {"source": "inherited", "values": inherited}
+    if inherited:
+        warn(
+            warnings,
+            "the Codex child inherited a proxy from the calling shell "
+            f"({', '.join(f'{name}={value}' for name, value in sorted(inherited.items()))}); "
+            "a proxy that resets the app-server's stream makes every turn fail with no output. "
+            "Pass --proxy or --no-proxy to decide this deliberately",
+        )
+    record["no_proxy"] = environment.get("NO_PROXY") or environment.get("no_proxy")
+    return record
+
+
 def replay_branch_name(original: Original, replay_id: str) -> str:
     """`replay/<original branch>`, unique per replay when that name is taken.
 
@@ -384,9 +459,21 @@ def replay_branch_name(original: Original, replay_id: str) -> str:
 
 
 def prepare_worktree(
-    original: Original, worktree: pathlib.Path, replay_id: str = ""
-) -> tuple[str, str | None]:
-    """Adds a worktree at the original commit on a `replay/...` branch."""
+    original: Original, worktree: pathlib.Path, replay_id: str = "", warnings: list[str] | None = None
+) -> tuple[str, str | None, dict[str, Any]]:
+    """Adds a worktree at the original commit on a `replay/...` branch.
+
+    Returns `(head commit, branch or None, a record of how the branch was obtained)`.
+
+    The detached fallback used to swallow the real failure: any non-zero exit from the ``-b`` form
+    -- a branch already checked out in another worktree, a path that exists, a stale worktree
+    registration, a permissions problem -- landed silently on ``--detach``, and the only trace was
+    one warning saying "detached". A replayed agent then read ``git_branch: '-'`` and wrote it into
+    its own knowledge as a fact about the repository. So the chain is now: try the name, and if
+    that fails, say *why* and try a uniquified name before giving up on a branch at all. The
+    record goes into ``manifest.checkout`` so the audit can tell "the host would not give us a
+    branch" apart from "the replay never asked for one".
+    """
     if not original.commit:
         raise ReplayError(
             f"session {original.thread_id} does not record a git commit; rerun with "
@@ -407,41 +494,68 @@ def prepare_worktree(
             f"{original.branch or original.commit}`"
         )
     worktree.parent.mkdir(parents=True, exist_ok=True)
-    branch = replay_branch_name(original, replay_id)
-    existing = subprocess.run(
-        ["git", "-C", str(original.cwd), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if existing.returncode == 0 and replay_id:
-        branch = f"{branch}-{replay_id}"
-    log(f"creating worktree at {worktree} (branch {branch} at {original.commit[:12]}) -- this can "
-        "take minutes on a large repository")
-    started = time.monotonic()
-    completed = subprocess.run(
-        ["git", "-C", str(original.cwd), "worktree", "add", "-b", branch, str(worktree),
-         original.commit],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        # A branch is a nicety; a checkout at the right commit is the requirement.
-        detached = subprocess.run(
-            ["git", "-C", str(original.cwd), "worktree", "add", "--detach", str(worktree),
+
+    def branch_exists(name: str) -> bool:
+        return (
+            subprocess.run(
+                ["git", "-C", str(original.cwd), "rev-parse", "--verify", "--quiet",
+                 f"refs/heads/{name}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).returncode
+            == 0
+        )
+
+    def add(*extra: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(original.cwd), "worktree", "add", *extra, str(worktree),
              original.commit],
             capture_output=True,
             text=True,
             check=False,
         )
+
+    def failure_text(completed: subprocess.CompletedProcess[str]) -> str:
+        return (completed.stderr.strip() or completed.stdout.strip())[:400]
+
+    base = replay_branch_name(original, replay_id)
+    # `replay_id` is normally set; when it is not, a suffix from the clock still beats colliding.
+    unique_suffix = replay_id or dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    candidates = [base] if not branch_exists(base) else []
+    candidates.append(f"{base}-{unique_suffix}")
+
+    log(f"creating worktree at {worktree} (branch {candidates[0]} at {original.commit[:12]}) -- "
+        "this can take minutes on a large repository")
+    started = time.monotonic()
+    record: dict[str, Any] = {"branch_mode": "created", "attempts": []}
+    branch: str | None = None
+    for candidate in candidates:
+        completed = add("-b", candidate)
+        if completed.returncode == 0:
+            branch = candidate
+            break
+        record["attempts"].append({"branch": candidate, "error": failure_text(completed)})
+        if warnings is not None:
+            warn(
+                warnings,
+                f"`git worktree add -b {candidate}` failed: {failure_text(completed)}",
+            )
+    if branch is None:
+        # A branch is a nicety; a checkout at the right commit is the requirement. But an audit
+        # that cannot see why it lost the branch is an audit that will mistake the loss for a fact
+        # about the original repository.
+        detached = add("--detach")
         if detached.returncode != 0:
             raise ReplayError(
-                f"git worktree add failed: {completed.stderr.strip() or completed.stdout.strip()}"
+                "git worktree add failed for every branch name and for --detach: "
+                + failure_text(detached)
             )
-        branch = None
+        record["branch_mode"] = "detached"
+    elif branch != base:
+        record["branch_mode"] = "created_after_collision"
     log(f"worktree ready in {time.monotonic() - started:.1f}s")
-    return git_output(["-C", str(worktree), "rev-parse", "HEAD"]), branch
+    return git_output(["-C", str(worktree), "rev-parse", "HEAD"]), branch, record
 
 
 # --------------------------------------------------------------------------
@@ -1136,6 +1250,29 @@ def question_from_item(item: dict[str, Any]) -> str | None:
     return None
 
 
+def read_from(path: pathlib.Path, offset: int) -> str:
+    """Whatever was appended to `path` after `offset`, or `""` if it cannot be read."""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(offset)
+            return handle.read()
+    except OSError:
+        return ""
+
+
+@dataclass
+class TurnOutcome:
+    """What one turn produced, as the driver saw it."""
+
+    usage: dict[str, Any] | None
+    question: str | None
+    tool_calls: int
+    errors: list[str]
+    turn_id: str | None = None
+    stream_interruptions: int = 0
+    aborted: bool = False
+
+
 @dataclass
 class TurnResult:
     prompt_index: int
@@ -1143,6 +1280,8 @@ class TurnResult:
     started: str
     finished: str
     exit_code: int
+    # The *thread's* id, which is the same for every turn of a replay by design -- the app-server
+    # keeps one thread across turns. `turn_id` is the per-turn identity.
     thread_id: str | None
     usage: dict[str, Any] | None
     waited_for_turn_stop: bool
@@ -1152,6 +1291,11 @@ class TurnResult:
     question: str | None = None
     answered_with_next_prompt: bool = False
     tool_calls: int = 0
+    turn_id: str | None = None
+    stream_interruptions: int = 0
+    # A turn that exited non-zero or reported an error produced nothing worth auditing. The
+    # manifest used to describe such a turn exactly like a good one.
+    failed: bool = False
 
 
 def toml_string(value: str) -> str:
@@ -1325,6 +1469,10 @@ class AppServerDriver:
         self.pending_answer: str | None = None
         self.questions: list[str] = []
         self.stderr_path = transcript.with_suffix(".stderr")
+        # Stream disconnects and reconnects seen since the current turn started. Counted from the
+        # raw line, because the recovery text is not always well-formed JSON and reaches the
+        # replay on stderr as well.
+        self.stream_interruptions = 0
 
     # -- plumbing ---------------------------------------------------------
     def _send(self, payload: dict[str, Any]) -> None:
@@ -1391,6 +1539,10 @@ class AppServerDriver:
             line = line.strip()
             if not line:
                 continue
+            interruptions = count_stream_interruptions(line)
+            if interruptions:
+                with self._lock:
+                    self.stream_interruptions += interruptions
             try:
                 message = json.loads(line)
             except json.JSONDecodeError:
@@ -1453,10 +1605,17 @@ class AppServerDriver:
         return str(thread_id)
 
     def run_turn(
-        self, thread_id: str, prompt: str, stream_path: pathlib.Path, timeout: int
-    ) -> tuple[dict[str, Any] | None, str | None, int, list[str]]:
+        self,
+        thread_id: str,
+        prompt: str,
+        stream_path: pathlib.Path,
+        timeout: int,
+        max_interruptions: int = 0,
+    ) -> TurnOutcome:
         with self._lock:
             self._sink = []
+            self.stream_interruptions = 0
+        stderr_offset = self.stderr_path.stat().st_size if self.stderr_path.exists() else 0
         errors: list[str] = []
         request_id = self._request(
             "turn/start",
@@ -1466,13 +1625,16 @@ class AppServerDriver:
             errors.append("codex app-server did not acknowledge `turn/start`")
         usage: dict[str, Any] | None = None
         question: str | None = None
+        turn_id: str | None = None
         tool_calls = 0
+        interrupted = False
         deadline = time.monotonic() + timeout
         seen = 0
         while time.monotonic() < deadline:
             with self._lock:
                 batch = list(self._sink or [])[seen:]
                 seen += len(batch)
+                interruptions = self.stream_interruptions
             finished = False
             for message in batch:
                 method = message.get("method")
@@ -1487,13 +1649,26 @@ class AppServerDriver:
                     # the running total does, and the last one before completion is
                     # the turn's.
                     usage = (params.get("tokenUsage") or {}).get("total") or usage
-                elif method == "turn/completed":
-                    usage = (params.get("turn") or {}).get("usage") or usage
-                    finished = True
+                elif method in {"turn/started", "turn/completed"}:
+                    turn = params.get("turn") or {}
+                    # The protocol does carry a per-turn identity; the replay used to discard it
+                    # and label every turn with the thread id, so a three-turn manifest read as
+                    # three records of one turn.
+                    turn_id = turn.get("id") or turn.get("turnId") or turn_id
+                    if method == "turn/completed":
+                        usage = turn.get("usage") or usage
+                        finished = True
                 elif method in {"turn/failed", "error"}:
                     errors.append(json.dumps(params, ensure_ascii=False)[:400])
                     finished = True
             if finished:
+                break
+            if 0 < max_interruptions <= interruptions:
+                errors.append(
+                    f"the model stream disconnected or reconnected {interruptions} times in this "
+                    "turn; aborting rather than producing an empty turn that looks replayed"
+                )
+                interrupted = True
                 break
             if self.process is not None and self.process.poll() is not None:
                 errors.append("codex app-server exited mid-turn")
@@ -1504,12 +1679,28 @@ class AppServerDriver:
         with self._lock:
             batch = list(self._sink or [])
             self._sink = None
+            interruptions = self.stream_interruptions
+        # Codex writes its retry text to stderr too, and stderr is not read during the turn.
+        interruptions += count_stream_interruptions(read_from(self.stderr_path, stderr_offset))
+        if 0 < max_interruptions <= interruptions and not interrupted:
+            errors.append(
+                f"the model stream disconnected or reconnected {interruptions} times in this turn"
+            )
+            interrupted = True
         with stream_path.open("w", encoding="utf-8") as handle:
             for message in batch:
                 handle.write(json.dumps(message, ensure_ascii=False) + "\n")
         if self.questions and question is None:
             question = self.questions[-1]
-        return usage, question, tool_calls, errors
+        return TurnOutcome(
+            usage=usage,
+            question=question,
+            tool_calls=tool_calls,
+            errors=errors,
+            turn_id=turn_id,
+            stream_interruptions=interruptions,
+            aborted=interrupted,
+        )
 
     def close(self) -> None:
         if self.process is None:
@@ -1748,6 +1939,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=120,
         help="seconds to wait for the Stop hook's turn_stop row between turns",
     )
+    proxy = parser.add_mutually_exclusive_group()
+    proxy.add_argument(
+        "--proxy",
+        default=None,
+        metavar="URL",
+        help="proxy for the Codex child process (sets HTTP_PROXY/HTTPS_PROXY/ALL_PROXY and their "
+        "lowercase twins). Omitted, whatever proxy the calling shell exports is inherited -- "
+        "which is how a replay silently fails: a proxy that serves HTTP fine can reset the "
+        "app-server's websocket on every turn. Whatever is in force is recorded in "
+        "manifest.environment.proxy.",
+    )
+    proxy.add_argument(
+        "--no-proxy",
+        action="store_true",
+        help="strip every proxy variable from the Codex child's environment",
+    )
+    parser.add_argument(
+        "--max-stream-interruptions",
+        type=int,
+        default=3,
+        help="abort the run after this many stream disconnects or reconnects inside one turn "
+        "(0 disables). A wedged connection otherwise produces a full set of empty turns and a "
+        "manifest that looks like a completed replay",
+    )
     parser.add_argument("--dry-run", action="store_true", help="print the plan and exit")
     return parser
 
@@ -1873,10 +2088,27 @@ def main(argv: list[str] | None = None) -> int:
             )
         checkout_commit = head
         checkout_branch = git_output(["-C", str(original.cwd), "branch", "--show-current"]) or None
-    else:
-        checkout_commit, checkout_branch = prepare_worktree(original, checkout, replay_id)
+        checkout_record = {
+            "branch_mode": "inplace" if checkout_branch else "inplace_detached",
+            "attempts": [],
+        }
         if checkout_branch is None:
-            warn(warnings, "the worktree is detached; the replay records git_branch as '-'")
+            # The in-place path used to reach `git_branch: '-'` without saying anything at all.
+            warn(
+                warnings,
+                f"{original.cwd} is a detached checkout; the replay records git_branch as '-', "
+                "which is not what the original session saw",
+            )
+    else:
+        checkout_commit, checkout_branch, checkout_record = prepare_worktree(
+            original, checkout, replay_id, warnings
+        )
+        if checkout_branch is None:
+            warn(
+                warnings,
+                "no branch could be created for the worktree, so it is detached and the replay "
+                "records git_branch as '-'; see manifest.checkout.attempts for git's own reason",
+            )
 
     real_home = pathlib.Path(os.path.expanduser("~"))
     home = replay_dir / "home"
@@ -1923,6 +2155,7 @@ def main(argv: list[str] | None = None) -> int:
     environment["CODEX_HOME"] = str(effective_codex_home)
     environment["NO_COLOR"] = "1"
     environment.pop("SCTX_LOGS_ROOT", None)
+    environment_record = apply_proxy_policy(environment, args.proxy, args.no_proxy, warnings)
 
     collector = start_log_collector(
         binary if sctx_bin is not None else real_home / ".shared-context" / SCTX_BIN_RELATIVE,
@@ -1957,13 +2190,29 @@ def main(argv: list[str] | None = None) -> int:
             stderr_path = host_dir / f"turn-{index}.stderr"
             started = dt.datetime.now(dt.timezone.utc).isoformat()
             answered = False
+            turn_id: str | None = None
+            interruptions = 0
+            aborted = False
             if driver is not None:
                 assert replayed_thread is not None
                 if args.on_question == "next-prompt" and index < len(prompts):
                     driver.pending_answer = prompts[index]
-                usage, question, tool_calls, errors = driver.run_turn(
-                    replayed_thread, prompt, stream_path, args.turn_timeout
+                outcome = driver.run_turn(
+                    replayed_thread,
+                    prompt,
+                    stream_path,
+                    args.turn_timeout,
+                    args.max_stream_interruptions,
                 )
+                usage, question, tool_calls, errors = (
+                    outcome.usage,
+                    outcome.question,
+                    outcome.tool_calls,
+                    outcome.errors,
+                )
+                turn_id = outcome.turn_id
+                interruptions = outcome.stream_interruptions
+                aborted = outcome.aborted
                 answered = bool(question) and driver.pending_answer is not None
                 driver.pending_answer = None
                 status = 0 if not errors else 1
@@ -1976,6 +2225,15 @@ def main(argv: list[str] | None = None) -> int:
                 status, thread_id, usage, errors, question, tool_calls = run_turn(
                     command, environment, checkout, stream_path, stderr_path, args.turn_timeout
                 )
+                interruptions = count_stream_interruptions(read_from(stderr_path, 0))
+                if 0 < args.max_stream_interruptions <= interruptions:
+                    errors = [
+                        *errors,
+                        "the model stream disconnected or reconnected "
+                        f"{interruptions} times in this turn",
+                    ]
+                    status = status or 1
+                    aborted = True
             finished = dt.datetime.now(dt.timezone.utc).isoformat()
             if thread_id and replayed_thread is None:
                 replayed_thread = thread_id
@@ -1983,6 +2241,7 @@ def main(argv: list[str] | None = None) -> int:
                 warn(warnings, f"turn {index} exited {status}; see {stderr_path}")
             for error in errors:
                 warn(warnings, f"turn {index}: {error}")
+            failed = status != 0 or bool(errors)
 
             waited = False
             if replayed_thread and hook_event_table_live and index < len(prompts):
@@ -2013,8 +2272,20 @@ def main(argv: list[str] | None = None) -> int:
                     question=question,
                     answered_with_next_prompt=answered,
                     tool_calls=tool_calls,
+                    turn_id=turn_id,
+                    stream_interruptions=interruptions,
+                    failed=failed,
                 )
             )
+            if aborted:
+                # Every later turn would fail the same way and the manifest would describe a full
+                # replay that produced nothing. Stop while the record still says what happened.
+                warn(
+                    warnings,
+                    f"aborting after turn {index}: the model stream was interrupted "
+                    f"{interruptions} times (see --max-stream-interruptions)",
+                )
+                break
             if replayed_thread is None:
                 warn(warnings, "no thread id was reported; stopping before the resume turns")
                 break
@@ -2100,10 +2371,38 @@ def main(argv: list[str] | None = None) -> int:
             "nobody was there to answer"
         )
 
+    # A run-level verdict, because there was none: three turns that all failed used to produce the
+    # same manifest shape and the same exit code 0 as three clean ones, and the only difference
+    # was buried in `warnings`.
+    failed_turns = [result.prompt_index for result in results if result.failed]
+    if not results:
+        run_status = "no_turns"
+    elif len(failed_turns) == len(results):
+        run_status = "failed"
+    elif failed_turns:
+        run_status = "partial"
+    elif stopped_on_question:
+        run_status = "stopped_on_question"
+    elif args.turns is None and len(results) < len(original.prompts):
+        run_status = "incomplete"
+    else:
+        run_status = "completed"
+
     manifest = {
         "agent": "codex",
         "replay_id": replay_id,
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "run": {
+            "status": run_status,
+            "prompts_selected": len(prompts),
+            "turns_attempted": len(results),
+            "turns_failed": len(failed_turns),
+            "failed_turn_indexes": failed_turns,
+            "stream_interruptions": sum(result.stream_interruptions for result in results),
+        },
+        # The environment decides whether a replay can run at all -- a proxy that resets the
+        # app-server's stream makes every turn produce nothing -- so it is part of the record.
+        "environment": environment_record,
         "original": {
             "thread_id": original.thread_id,
             "rollout_path": str(original.rollout_path),
@@ -2132,6 +2431,7 @@ def main(argv: list[str] | None = None) -> int:
             "branch": checkout_branch,
             "shared_context_repository_id": registration["repository_id"],
             "registered_path": registration["registered_path"],
+            **checkout_record,
         },
         "codex_home": {
             "mode": args.codex_home,
@@ -2144,7 +2444,9 @@ def main(argv: list[str] | None = None) -> int:
             "driver": args.driver,
             "on_question": args.on_question,
             "turns_requested": "all" if args.turns is None else args.turns,
+            # Attempted, not succeeded. `run.turns_failed` is the other half.
             "turns_replayed": len(results),
+            "max_stream_interruptions": args.max_stream_interruptions,
             "turn_timeout_seconds": args.turn_timeout,
             "turn_stop_timeout_seconds": args.turn_stop_timeout,
             "sandbox": sandbox_flag(original),
@@ -2187,7 +2489,11 @@ def main(argv: list[str] | None = None) -> int:
     log(f"manifest {manifest_path}")
     if replayed_rollout:
         log(f"rollout  {replayed_rollout}")
-    return 0
+    log(f"run      {run_status} ({len(failed_turns)}/{len(results)} turns failed)")
+    # A non-zero exit for a run that produced nothing. `main` used to return 0 unconditionally, so
+    # a caller had no way to tell a replay worth auditing from a replay that never reached the
+    # model.
+    return 1 if run_status in {"failed", "no_turns"} else 0
 
 
 if __name__ == "__main__":

@@ -110,6 +110,11 @@ session_digest 过滤到本会话）：看事件序列是否完整（session_sta
    `cli_version`、轮数、一段话摘要（这段摘要本身也不能超出下面表格能支撑的范围）。真实会话（无 `--replay-id`）
    产出的 bundle 通常没有 `manifest.json`，`facts.json` 和 `sctx/*.json` 也可能不携带 sctx 自身版本号——找不到就
    在 Header 里写「未能判断」，只报告确实能读到的 `cli_version`，不要因为字段名相近就把 sctx 版本和宿主 CLI 版本混写成一个数字。
+   **回放 bundle 先看 `manifest.run.status`**：只有 `completed` 的回放能支撑行为结论。`failed` / `partial` /
+   `no_turns` 意味着那些轮次根本没到模型（常见根因是代理重置了 app-server 的流，见 `manifest.run.stream_interruptions`
+   与 `manifest.environment.proxy`），此时回放侧的一切「零」都是仪器缺席，必须写进第 4 节「未能判断」，不得当成
+   「功能没跑」的证据。同理，Cursor 回放（`manifest.agent == "cursor"`）**结构上没有** TurnStop 与 prompt 侧事件
+   （零 `stop`、零 `beforeSubmitPrompt`），任何关于提醒/TurnStop 的方向在 Cursor bundle 上只能写「未能判断」。
 2. 一张表：
 
    `| # | 方向 | 结论 | 引用 | 严重度 | 已知项 |`
